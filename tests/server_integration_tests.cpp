@@ -33,6 +33,7 @@
 #include "../src/change_feed.hpp"
 #include "../src/proxy_protocol.hpp"
 #include "../src/slot_watch.hpp"
+#include "../src/server_socket.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -63,7 +64,7 @@ void SetServerTimeoutConfigFailpointForTests(
     std::size_t recv_failures) noexcept;
 void ResetServerTimeoutConfigCountersForTests() noexcept;
 std::uint64_t ServerRecvTimeoutConfigCallsForTests() noexcept;
-int FeedDeliveryTestAccess::SetActiveClientSendBuffer(ChunkServer& server, int bytes) {
+std::size_t FeedDeliveryTestAccess::FillActiveClientSendQueue(ChunkServer& server, int bytes) {
     std::lock_guard lock(server.active_clients_mutex_);
     assert(server.active_clients_.size() == 1U);
     const auto socket = static_cast<
@@ -81,7 +82,29 @@ int FeedDeliveryTestAccess::SetActiveClientSendBuffer(ChunkServer& server, int b
     socklen_t length = sizeof(actual);
 #endif
     assert(getsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&actual), &length) == 0);
-    return actual;
+    assert(actual > 0);
+    std::string error;
+    assert(server_detail::SetSocketNonBlocking(socket, true, &error));
+    const std::vector<char> filler(16U * 1024U * 1024U, 'x');
+    std::size_t filled = 0U;
+    bool blocked = false;
+    while (filled < 4U * filler.size()) {
+        const auto sent = send(socket, filler.data(), static_cast<int>(filler.size()), 0);
+        if (sent > 0) { filled += static_cast<std::size_t>(sent); continue; }
+        const auto code = server_detail::CurrentSocketErrorCode();
+        if (sent < 0 && server_detail::IsSocketInterruptedError(code)) continue;
+#ifdef _WIN32
+        blocked = sent < 0 && code == WSAEWOULDBLOCK;
+#else
+        blocked = sent < 0 && (code == EAGAIN || code == EWOULDBLOCK);
+#endif
+        assert(blocked);
+        break;
+    }
+    assert(blocked && filled > 0U);
+    assert(server_detail::SetSocketNonBlocking(socket, false, &error));
+    std::cout << "steady slow reader: send_buffer=" << actual << " prefilled=" << filled << '\n' << std::flush;
+    return filled;
 }
 }
 
@@ -3509,8 +3532,30 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     assert(response == "%14\r\n");
 }
 
-void TestSteadySlowReaderHitsReplyWriteDeadline() {
+void TestSteadySlowReaderHitsReplyWriteDeadline(bool fail_before_read = false) {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+    struct QueueHook final : chunkdb::FeedDeliveryTestHook {
+        chunkdb::ChunkServer* server = nullptr;
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool ready = false, released = false;
+        void Run(Point point, std::size_t completed) override {
+            if (point != Point::kAfterClientRead || completed != 1U) return;
+            (void)chunkdb::FeedDeliveryTestAccess::FillActiveClientSendQueue(*server, 65536);
+            std::unique_lock lock(mutex);
+            ready = true;
+            changed.notify_all();
+            changed.wait(lock, [&] { return released; });
+        }
+        bool Wait() {
+            std::unique_lock lock(mutex);
+            return changed.wait_for(lock, std::chrono::seconds(10), [&] { return ready; });
+        }
+        void Release() {
+            { std::lock_guard lock(mutex); released = true; }
+            changed.notify_all();
+        }
+    } hook;
 
     // The reply must remain in flight while the client steadily drains it.
     auto store_cfg = BaseStoreConfig();
@@ -3531,6 +3576,10 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     server_cfg.idle_connection_timeout_ms = 10000;
 
     ServerHarness harness("steady-slow-reader-deadline", store_cfg, engine_cfg, server_cfg);
+    struct ReleaseHook {
+        QueueHook& hook;
+        ~ReleaseHook() { hook.Release(); }
+    } release{hook};
     {
         auto lease = harness.catalog->Find("default")->Acquire();
         lease->store().SetBlockBits(0, 0, std::string(512, '0'));
@@ -3538,20 +3587,18 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     RawClient slow("127.0.0.1", harness.port);
     slow.SetReceiveBuffer(65536);
     slow.Hello();
-    const auto send_buffer = chunkdb::FeedDeliveryTestAccess::SetActiveClientSendBuffer(*harness.server, 65536);
-    const auto request_started = std::chrono::steady_clock::now();
-    // Windows may accept an entire first reply into its transport buffers.
-    // A second reply must then encounter the outstanding slow-reader backlog.
-    slow.SendBytes("GET CHUNK 0 0 FROM default\r\nGET CHUNK 0 0 FROM default\r\n");
-    // Encoding the largest form is outside the reply write phase and can
-    // outlast the write deadline in an unoptimized build.
-    // The bulk header proves that the server has started writing the reply.
-    std::string header;
-    assert(slow.ReadLineWithin(std::chrono::seconds(30), &header));
-    assert(header.starts_with('$'));
-    std::cout << "steady slow reader: send_buffer=" << send_buffer << " reply header after "
-              << std::chrono::duration_cast<std::chrono::milliseconds>(
-                     std::chrono::steady_clock::now() - request_started).count() << " ms\n" << std::flush;
+    hook.server = harness.server.get();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    slow.SendBytes("GET CHUNK 0 0 FROM default\r\n");
+    assert(hook.Wait());
+    if (fail_before_read) throw std::runtime_error("injected first read failure");
+    // The worker is paused after reading the request, with its send queue
+    // filled to would-block. Start draining those fixture bytes before GET
+    // begins executing, so a timeout exercises an active continuous reader.
+    std::size_t first_read = 0U;
+    const bool first_closed = slow.ReadSomeWithin(std::chrono::seconds(1), 4096, &first_read) && first_read == 0U;
+    hook.Release();
+    assert(!first_closed && first_read > 0U);
 
     // The client keeps reading about 1 MiB/s, fast enough to reopen the TCP
     // window well within the send timeout, so a send that blocks until the
@@ -3560,7 +3607,7 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     const auto start = std::chrono::steady_clock::now();
     bool terminated = false;
     bool closed = false;
-    std::size_t received = 0U;
+    std::size_t received = first_read;
     while (!terminated && !closed && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
         for (int read = 0; read < 16 && !closed; ++read) {
             std::size_t bytes_read = 0;
@@ -3572,7 +3619,7 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     }
     const bool logged = logs.WaitContains("connection terminated", std::chrono::seconds(1));
     std::cout << "steady slow reader: logged=" << logged << " closed=" << closed
-              << " received=" << received << " header=" << header << '\n' << std::flush;
+              << " received=" << received << '\n' << std::flush;
     assert(logged);
     assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(4));
     assert(logs.Contains("phase=write"));
@@ -5686,7 +5733,15 @@ int main(int argc, char** argv) {
         run("TestLongIdleConnectionTimeoutReleasesWorker", TestLongIdleConnectionTimeoutReleasesWorker);
         run("TestPendingQueueWaitTimeoutClosesQueuedSocket", TestPendingQueueWaitTimeoutClosesQueuedSocket);
         run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
-        run("TestSteadySlowReaderHitsReplyWriteDeadline", TestSteadySlowReaderHitsReplyWriteDeadline);
+        run("TestSteadySlowReaderHitsReplyWriteDeadline", [] { TestSteadySlowReaderHitsReplyWriteDeadline(); });
+        run("TestSteadySlowReaderReadFailureTeardown", [] {
+            bool failed = false;
+            try { TestSteadySlowReaderHitsReplyWriteDeadline(true); }
+            catch (const std::runtime_error& error) {
+                failed = std::string_view(error.what()) == "injected first read failure";
+            }
+            assert(failed);
+        });
         run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);
         run("TestPendingQueueSaturationRejectsNewConnections", TestPendingQueueSaturationRejectsNewConnections);
         run("TestReadinessLogLineExists", TestReadinessLogLineExists);

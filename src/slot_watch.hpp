@@ -26,7 +26,7 @@ struct FeedDeliveryTestHook {
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
 struct FeedDeliveryTestAccess {
-    static int SetActiveClientSendBuffer(ChunkServer& server, int bytes);
+    static std::size_t FillActiveClientSendQueue(ChunkServer& server, int bytes);
     static void SetHook(ChunkServer& server, FeedDeliveryTestHook* hook);
     // Observe existing scheduling without adding a wake before shutdown.
     static void SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
