@@ -364,5 +364,6 @@ int main(int argc, char** argv) {
         TransactionForms();
         ScanHistoryLoss();
         RetainedIdentityPermissionsAndAudit();
+        ThreeDimensions();
     }
 }
