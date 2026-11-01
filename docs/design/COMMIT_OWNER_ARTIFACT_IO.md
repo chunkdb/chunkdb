@@ -28,6 +28,7 @@ Windows root opening uses OPEN_REPARSE_POINT and BACKUP_SEMANTICS and refuses re
 Child directory and file opens use NtCreateFile with the pinned directory as RootDirectory, one fixed or digest-derived relative leaf and native no-reparse/type admission.
 Object-directory handles deny delete sharing while a view uses them, and all publication remains relative to those exact native directory objects.
 Child file handles allow read, write and delete sharing and validate the opened native regular-file object before reading.
+Windows native identity comparisons use FileIdInfo's complete 128-bit file ID and 64-bit volume serial; unavailable identity capability refuses before writer namespace creation without a 64-bit fallback.
 NtSetInformationFile performs no-replace publication from the exact temporary handle with a relative destination in its pinned directory.
 These documented native OS entrypoints are resolved from the already loaded ntdll module and require no additional package or link dependency; unavailable capability refuses before mutation without a pathname fallback.
 No final-path reconstruction or check after an outside write substitutes for handle-relative admission.
@@ -122,4 +123,5 @@ An independent native-inode substitution gate replaces a synced POSIX temporary 
 Crashes cover directory creation, marker file and name sync, object temporary write, file sync, no-replace publication and directory sync, with exact old or complete new immutable bytes afterward.
 A first directory-sync failure followed by exact-object reuse must perform the required sync before reporting durability.
 Isolated omission controls target no-follow and native type admission, digest and measured-length checks, namespace scope, correct writer ownership and publication ordering.
+Pure identity checks distinguish equal low 64-bit IDs with different upper halves, and native Windows hard links and distinct files validate the full identity query.
 Native and GCC focused tests precede platform CI, including actual Windows sharing and reparse behavior; no local speed measurements are involved.
