@@ -552,6 +552,20 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
     }
     backup_detail::WalkDirectory(root, [&](const auto& entry) {
         const auto relative = entry.path().lexically_relative(root).generic_string();
+#ifdef _WIN32
+        if (relative.empty()) {
+            const auto describe = [](const std::filesystem::path& path) {
+                const auto parsed = SplitBackupWindowsPath(path.native());
+                auto text = "native=[" + path.string() + "] standard-root=[" + path.root_path().string() +
+                    "] parsed-root=[" + std::filesystem::path(parsed.root).string() + "] components=";
+                for (const auto& component : parsed.components)
+                    text += "[" + std::filesystem::path(component).string() + "]";
+                return text;
+            };
+            throw std::runtime_error("backup entry has no relative name; root " + describe(root) +
+                "; entry " + describe(entry.path()));
+        }
+#endif
         const auto type = entry.symlink_status().type();
         if (type == std::filesystem::file_type::directory) {
             if (!expected_dirs.erase(relative)) throw std::runtime_error("unexpected backup directory: " + relative);
