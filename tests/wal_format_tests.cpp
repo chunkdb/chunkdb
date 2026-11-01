@@ -636,10 +636,19 @@ void TestDamageBeforeTheEndFailsClosed(const std::string& verify) {
             read();
         } catch (const std::exception& e) {
             refused = std::string(e.what()).find(text) != std::string::npos;
+            if (!refused) std::fprintf(stderr, "damaged WAL refusal: expected %s, got %s\n", text, e.what());
         }
         assert(refused);
         assert(ReadFile(wal_path) == wal);
     };
+    // Exercise read-only replay before a failed writer admission leaves the
+    // snapshot generation fenced for recovery.
+    expect_refused([&] {
+        auto read_only = config;
+        read_only.access_mode = chunkdb::AccessMode::kReadOnly;
+        chunkdb::ChunkStore store(read_only);
+        (void)store.GetBlockBits(1, 0);
+    }, "rejected WAL");
     expect_refused([&] {
         chunkdb::ChunkStore store(config);
         (void)store.GetBlockBits(1, 0);
@@ -647,13 +656,7 @@ void TestDamageBeforeTheEndFailsClosed(const std::string& verify) {
     expect_refused([&] {
         chunkdb::ChunkStore store(config);
         (void)store.ScanPopulatedChunks(false, {}, 10);
-    }, "cannot be replayed");
-    expect_refused([&] {
-        auto read_only = config;
-        read_only.access_mode = chunkdb::AccessMode::kReadOnly;
-        chunkdb::ChunkStore store(read_only);
-        (void)store.GetBlockBits(1, 0);
-    }, "rejected WAL");
+    }, "damaged before its end");
 
     std::string output;
     assert(RunVerify(verify, dir.path(), &output) == 1);
@@ -758,7 +761,7 @@ void TestHeaderWithoutCommitHasNoReadVersion() {
 }
 
 // A WAL that is not a crash artifact (damaged header, frames without a
-// header) fails the chunk load and is left as it is.
+// header) fails startup admission and is left as it is.
 void TestDamagedWalFailsTheLoad() {
     for (const bool strip_header : {false, true}) {
         ScopedTempDir dir("chunkdb-wal-damaged-header");
@@ -775,14 +778,18 @@ void TestDamagedWalFailsTheLoad() {
             wal[30] ^= 0x01U;  // inside the store id
         }
         WriteFile(wal_path, wal);
-        bool refused = false;
+        bool opened = false;
+        std::string refusal;
         try {
             chunkdb::ChunkStore store(config);
+            opened = true;
             (void)store.GetBlockBits(0, 0);
         } catch (const std::exception& e) {
-            refused = std::string(e.what()).find("cannot be replayed") != std::string::npos;
+            refusal = e.what();
         }
-        assert(refused);
+        const auto expected = strip_header ? "WAL file too small" : "chunk file header checksum mismatch";
+        if (refusal != expected) std::fprintf(stderr, "damaged WAL startup refusal: %s (bytes=%zu)\n", refusal.c_str(), wal.size());
+        assert(!opened && refusal == expected);
         assert(ReadFile(wal_path) == wal);
     }
 }
