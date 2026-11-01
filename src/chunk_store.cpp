@@ -153,12 +153,6 @@ std::optional<StoreManifest> ReadManifestOrRequireNewStore(
 // so a refused open leaves the data directory exactly as it was. The writer
 // lock is not held yet; InitializeStoreManifest repeats the check under it.
 Geometry OpenStoreGeometry(const StoreConfig& config) {
-    // The current persistent codecs encode two axes only. Keep standalone
-    // geometry support separate until the dimension-aware format is complete.
-    if (config.geometry.dims != 2 || config.geometry.chunk_depth_blocks != 1 ||
-        config.geometry.large_chunk_depth_chunks != 1) {
-        throw std::invalid_argument("persistent chunk formats do not support 3D geometry");
-    }
     if (config.data_dir.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
@@ -218,8 +212,6 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
             "settings or pass the stored values");
     }
     auto geometry = Geometry(stored, manifest->schema, *manifest->chunk_schema);
-    if (stored.dims != 2)
-        throw std::invalid_argument("persistent chunk model support is incomplete");
     return geometry;
 }
 }  // namespace

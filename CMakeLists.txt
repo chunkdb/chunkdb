@@ -313,7 +313,7 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME geometry_bit COMMAND chunkdb_geometry_bit_test)
 
-    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model)
+    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -321,7 +321,11 @@ if(CHUNKDB_BUILD_TESTS)
         set_tests_properties(${format} PROPERTIES TIMEOUT 60 LABELS "smoke")
     endforeach()
 
-    foreach(verifier IN ITEMS verify_index verify_memory)
+    add_test(NAME cql_chunk_model_3d COMMAND chunkdb_cql_chunk_model_test --3d)
+    add_test(NAME feed_chunk_model_3d COMMAND chunkdb_feed_chunk_model_test --3d)
+    set_tests_properties(cql_chunk_model_3d feed_chunk_model_3d PROPERTIES TIMEOUT 60 LABELS "smoke")
+
+    foreach(verifier IN ITEMS verify_index verify_memory chunk_model_persistence_3d)
         add_executable(chunkdb_${verifier}_test tests/${verifier}_tests.cpp)
         target_link_libraries(chunkdb_${verifier}_test PRIVATE chunkdb_tools)
         target_include_directories(chunkdb_${verifier}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -889,6 +893,9 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_rollback_preflight_test
         chunkdb_table_tombstones_test
         chunkdb_cql_chunk_model_test
+        chunkdb_feed_chunk_model_test
+        chunkdb_feed_chunk_protocol_test
+        chunkdb_chunk_model_persistence_3d_test
         chunkdb_verify_index_test
         chunkdb_verify_memory_test
         chunkdb_storage_test
@@ -1028,6 +1035,9 @@ if(CHUNKDB_BUILD_TESTS)
         rollback_preflight
         table_tombstones
         cql_chunk_model
+        feed_chunk_model
+        feed_chunk_protocol
+        chunk_model_persistence_3d
         verify_index
         verify_memory
         storage

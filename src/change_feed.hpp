@@ -67,6 +67,8 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
         std::vector<std::uint8_t> presence;
         std::vector<std::uint8_t> vars;
         std::vector<std::uint8_t> wal;
+        std::vector<std::uint8_t> chunk_columns;
+        bool written = false;
     };
     struct RawWrite {
         RawWrite* next = nullptr;
@@ -201,13 +203,15 @@ class FeedWriteGuard {
     FeedWriteGuard(const FeedWriteGuard&) = delete;
     FeedWriteGuard& operator=(const FeedWriteGuard&) = delete;
     void Before(ChunkCoord coord, const std::vector<std::uint8_t>& payload,
-                const std::vector<std::uint8_t>& presence, const ChunkVars& vars) {
-        if (state_ != nullptr && !state_->dropped) CopyBefore(coord, payload, presence, vars.Encode());
+                const std::vector<std::uint8_t>& presence, const ChunkVars& vars,
+                const ChunkColumnState* chunk_columns = nullptr, bool written = false) {
+        if (state_ != nullptr && !state_->dropped) CopyBefore(coord, payload, presence, vars.Encode(), chunk_columns, written);
     }
     void BeforeBlock(ChunkCoord coord, const std::vector<std::uint8_t>& payload,
                      const std::vector<std::uint8_t>& presence, const ChunkVars& vars,
-                     const ChunkLayout& layout, std::size_t block) {
-        if (state_ != nullptr && !state_->dropped) CopyBlock(coord, payload, presence, vars, layout, block);
+                     const ChunkLayout& layout, std::size_t block,
+                     const ChunkColumnState* chunk_columns = nullptr, bool written = false) {
+        if (state_ != nullptr && !state_->dropped) CopyBlock(coord, payload, presence, vars, layout, block, chunk_columns, written);
     }
     void Version(std::uint64_t revision) {
         if (auto* hook = producer_->hook) hook->Run(FeedTestHook::Point::kAfterVersion, revision);
@@ -237,13 +241,15 @@ class FeedWriteGuard {
     void Start(ChangeFeed& feed, std::atomic<std::uint64_t>& clock);
     void Finish() noexcept;
     void CopyBefore(ChunkCoord coord, const std::vector<std::uint8_t>& payload,
-                    const std::vector<std::uint8_t>& presence, const std::vector<std::uint8_t>& vars);
+                    const std::vector<std::uint8_t>& presence, const std::vector<std::uint8_t>& vars,
+                    const ChunkColumnState* chunk_columns, bool written);
     void CopyFrame(const std::vector<std::uint8_t>& batch, std::size_t frame_bytes);
     bool Charge(std::size_t bytes) noexcept;
     ChangeFeed::RawFrame* NewFrame(ChunkCoord coord);
     void CopyBlock(ChunkCoord coord, const std::vector<std::uint8_t>& payload,
                    const std::vector<std::uint8_t>& presence, const ChunkVars& vars,
-                   const ChunkLayout& layout, std::size_t block);
+                   const ChunkLayout& layout, std::size_t block,
+                   const ChunkColumnState* chunk_columns, bool written);
     bool ResizeBuffer(std::vector<std::uint8_t>& target, std::size_t size);
     bool CopyBuffer(std::vector<std::uint8_t>& target, std::span<const std::uint8_t> source);
     void Publish() noexcept;

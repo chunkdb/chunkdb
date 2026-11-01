@@ -191,6 +191,13 @@ FeedSlots::FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::mill
         Retain();
     }
 }
+
+void FeedSlotTestAccess::EnableChunkForms(FeedArchiveReader& reader, std::size_t budget) {
+    reader.EnableChunkForms(budget);
+}
+void FeedSlotTestAccess::SetEntryBudget(FeedArchiveReader& reader, std::size_t budget) {
+    reader.SetEntryBudget(budget);
+}
 FeedSlots::~FeedSlots() { Stop(); }
 bool FeedSlots::active() const noexcept { return store_.feed_slots_active_.load(std::memory_order_acquire); }
 bool FeedSlots::ArchiveRequired() const noexcept {
