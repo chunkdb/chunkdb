@@ -229,7 +229,7 @@ void TestRadiusReads() {
     }
 
     // Negative radius is rejected; an over-large radius is rejected before any
-    // read (disc would exceed 256 chunks).
+    // read (disc would exceed the configured chunk bound).
     bool neg_threw = false;
     try {
         (void)store.ReadChunkRadius(0, 0, -1);

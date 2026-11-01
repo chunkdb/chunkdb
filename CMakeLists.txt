@@ -319,13 +319,34 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME geometry_bit COMMAND chunkdb_geometry_bit_test)
 
-    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_group_owner_format commit_request_fingerprint wal_group_frame catalog_txn_snapshot ordinary_write_failure chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input wal_durability_pin chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol)
+    foreach(format IN ITEMS area_cursor sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_group_owner_format commit_request_fingerprint wal_group_frame catalog_txn_snapshot ordinary_write_failure chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input wal_durability_pin chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         add_test(NAME ${format} COMMAND chunkdb_${format}_test)
         set_tests_properties(${format} PROPERTIES TIMEOUT 60 LABELS "smoke")
     endforeach()
+
+    add_executable(chunkdb_area_paging_test tests/area_paging_tests.cpp)
+    target_link_libraries(chunkdb_area_paging_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_area_paging_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME area_paging COMMAND chunkdb_area_paging_test)
+    set_tests_properties(area_paging PROPERTIES TIMEOUT 60 LABELS "smoke")
+
+    add_executable(chunkdb_query_limits_test tests/query_limits_tests.cpp)
+    target_link_libraries(chunkdb_query_limits_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_query_limits_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME query_limits COMMAND chunkdb_query_limits_test)
+    set_tests_properties(query_limits PROPERTIES TIMEOUT 60 LABELS "smoke")
+
+    add_executable(chunkdb_typed_chunk_form_size_test tests/typed_chunk_form_size_tests.cpp)
+    target_link_libraries(chunkdb_typed_chunk_form_size_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_typed_chunk_form_size_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME typed_chunk_form_size COMMAND chunkdb_typed_chunk_form_size_test)
+    set_tests_properties(typed_chunk_form_size PROPERTIES TIMEOUT 60 LABELS "smoke")
+    if(MINGW)
+        target_link_options(chunkdb_typed_chunk_form_size_test PRIVATE -static-libstdc++ -static-libgcc)
+    endif()
 
     add_test(NAME cql_chunk_model_3d COMMAND chunkdb_cql_chunk_model_test --3d)
     add_test(NAME feed_chunk_model_3d COMMAND chunkdb_feed_chunk_model_test --3d)
@@ -907,6 +928,10 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_chunk_coordinate_index_test
         chunkdb_table_chunk_columns_test
         chunkdb_world_coordinates_3d_test
+        chunkdb_area_cursor_test
+        chunkdb_area_paging_test
+        chunkdb_query_limits_test
+        chunkdb_typed_chunk_form_size_test
         chunkdb_feed_archive_base_test
         chunkdb_feed_alias_recovery_test
         chunkdb_chunk_mutation_model_test

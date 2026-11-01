@@ -28,6 +28,7 @@
 
 #include "chunkdb/chunk_vars.hpp"
 #include "chunkdb/backup_gate.hpp"
+#include "chunkdb/area_selector.hpp"
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/server_defaults.hpp"
@@ -275,9 +276,8 @@ struct StoreConfig {
 inline constexpr std::size_t kMaxChunkRangeChunks = QueryLimits{}.max_area_chunks;
 inline constexpr std::size_t kMaxChunkScanLimit = 1024;
 inline constexpr std::size_t kMaxChunkBatchOps = 1024;
-// Hard byte budget for one CHUNKRANGE/CHUNKRADIUS response body. Enforced
-// before per-chunk state strings are extracted so a request over a large
-// geometry fails with a bounded error instead of allocating the response.
+// Default byte budget; area admission uses QueryLimits and scan admission
+// retains this bound independently.
 inline constexpr std::size_t kMaxChunkRangeResponseBytes = QueryLimits{}.max_area_response_bytes;
 // Legacy test-policy constants retained for source compatibility. Snapshot
 // publications now close synchronously when the last active writer finishes.
@@ -301,6 +301,16 @@ struct ChunkRangeEntry {
     std::uint64_t commit_time_ms = 0U;
     std::shared_ptr<const ChunkColumnState> chunk_columns{};
 };
+
+struct ChunkAreaPage {
+    // Requested cells remain, whether populated or empty.
+    bool has_more = false;
+    // Last admitted cell when more remain; otherwise null.
+    std::optional<ChunkCoord> after{};
+};
+
+// The final argument reports whether the selector has any following cell.
+using ChunkAreaVisitor = std::function<bool(const ChunkCoord&, std::optional<ChunkRangeEntry>&&, bool)>;
 
 // A chunk's whole state: what GET CHUNK and SET CHUNK carry
 // (docs/CQL.md).
@@ -636,6 +646,15 @@ class ChunkStore {
         std::int64_t radius_chunks,
         bool with_vars = false);
 
+    // Visits requested cells, including empty cells; the caller owns encoding.
+    // A false result leaves that cell beyond the returned continuation cursor.
+    // txn_read.covered records observed candidates; publish it only after a
+    // complete successful reply, including when the last candidate was refused.
+    [[nodiscard]] ChunkAreaPage VisitChunkArea(
+        const ChunkAreaSelector& selector, std::optional<ChunkCoord> after, std::size_t limit,
+        const ChunkAreaVisitor& visitor, bool with_vars = true,
+        const TxnSnapshot* snapshot = nullptr, const TxnAreaRead& txn_read = {});
+
     // Explicit three-axis area reads require a three-dimensional table,
     // including when every z coordinate is zero.
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange3D(
@@ -765,7 +784,7 @@ class ChunkStore {
     // be unchanged since the snapshot. Returns the version every changed
     // chunk now has, or 0 when no write changes its chunk (without writes
     // the snapshot only has to be still registered). Throws
-    // std::invalid_argument past kMaxTxnWrittenChunks or kMaxTxnReadChunks
+    // std::invalid_argument past query_limits()'s written/read chunk bounds
     // or for an invalid state, leaving the snapshot registered; otherwise
     // the snapshot ends whatever happens. Throws TransactionConflictError
     // when a chunk changed or a limit unregistered the snapshot, and other
@@ -1694,6 +1713,9 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         bool with_vars,
         ChunkRangeEntry* entry);
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkAreaEntriesImpl(
+        const ChunkAreaSelector& selector, bool with_vars,
+        const TxnSnapshot* snapshot, const TxnAreaRead* txn_read);
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRangeImpl(
         const TxnSnapshot* snapshot,
         const TxnAreaRead* txn_read,

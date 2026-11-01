@@ -21,6 +21,7 @@
 #include "txn_history.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "shared_file_input.hpp"
+#include "area_cursor.hpp"
 
 namespace chunkdb {
 
@@ -760,20 +761,20 @@ void ChunkStore::AppendPopulatedChunkRangeEntry(
     std::vector<ChunkRangeEntry>* entries,
     const TxnSnapshot* snapshot,
     const TxnAreaRead* txn_read) {
-    const auto too_large = [operation_name] {
+    const auto budget = query_limits_.max_area_response_bytes;
+    const auto too_large = [operation_name, budget] {
         return std::out_of_range(
-            std::string(operation_name) + " response exceeds the " + std::to_string(kMaxChunkRangeResponseBytes) +
+            std::string(operation_name) + " response exceeds the " + std::to_string(budget) +
             "-byte limit; request fewer chunks");
     };
     const auto charge = [&](const ChunkRangeEntry& entry) {
         auto variable = with_vars ? entry.vars.encoded_size() : 0U;
         const auto metadata = entry.chunk_columns ? entry.chunk_columns->variable_bytes : 0U;
-        if (variable > kMaxChunkRangeResponseBytes || metadata > kMaxChunkRangeResponseBytes - variable)
+        if (variable > budget || metadata > budget - variable)
             throw too_large();
         variable += metadata;
         const auto fixed = (entries->size() + 1U) * ChunkRangeEntryCostBytes();
-        if (*vars_bytes > kMaxChunkRangeResponseBytes - fixed ||
-            variable > kMaxChunkRangeResponseBytes - fixed - *vars_bytes) throw too_large();
+        if (*vars_bytes > budget - fixed || variable > budget - fixed - *vars_bytes) throw too_large();
         *vars_bytes += variable;
     };
     if (txn_read != nullptr) {
@@ -820,6 +821,65 @@ void ChunkStore::AppendPopulatedChunkRangeEntry(
     }
 }
 
+ChunkAreaPage ChunkStore::VisitChunkArea(
+    const ChunkAreaSelector& selector, std::optional<ChunkCoord> after, std::size_t limit,
+    const ChunkAreaVisitor& visitor, bool with_vars, const TxnSnapshot* snapshot, const TxnAreaRead& txn_read) {
+    if (selector.dims != geometry_.dims()) throw std::invalid_argument("area dimensions must match the table");
+    if (limit == 0U || limit > query_limits_.max_area_chunks)
+        throw std::invalid_argument("area page limit is outside the configured chunk bound");
+    if (!visitor) throw std::invalid_argument("area page visitor is missing");
+    if (snapshot != nullptr) RequireOwnTxnSnapshot(*snapshot);
+    const detail::AreaCursor cursor(selector);
+    if (after && !cursor.Contains(*after)) throw std::invalid_argument("area cursor is outside its selector");
+    auto current = after ? cursor.Next(*after) : std::optional{cursor.First()};
+    auto admitted = after;
+    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
+    for (std::size_t visited = 0U; current && visited < limit; ++visited) {
+        const auto next = cursor.Next(*current);
+        if (txn_read.covered != nullptr) txn_read.covered->push_back(*current);
+        std::optional<ChunkRangeEntry> entry;
+        const auto* own = txn_read.overlay ? txn_read.overlay(*current) : nullptr;
+        if (own != nullptr) {
+            if (ChunkPopulated(geometry_, own->presence_bitmap, own->chunk_columns.get())) {
+                entry.emplace(ChunkRangeEntry{.coord = *current, .payload = own->payload,
+                    .presence_bitmap = own->presence_bitmap, .version = own->version,
+                    .vars = with_vars ? own->vars : ChunkVars{}, .commit_time_ms = own->commit_time_ms,
+                    .chunk_columns = own->chunk_columns});
+            }
+        } else if (!index || index->IsPopulationCandidate(*current)) {
+            ChunkRangeEntry candidate; candidate.coord = *current;
+            if (ReadPopulatedChunkStateNoCache(*current, &candidate, with_vars, snapshot))
+                entry.emplace(std::move(candidate));
+        }
+        if (!visitor(*current, std::move(entry), next.has_value())) {
+            if (admitted == after) throw std::out_of_range("an area entry cannot fit one page");
+            return {.has_more = true, .after = admitted};
+        }
+        admitted = current;
+        current = next;
+    }
+    return {.has_more = current.has_value(), .after = current ? admitted : std::nullopt};
+}
+
+std::vector<ChunkRangeEntry> ChunkStore::ReadChunkAreaEntriesImpl(
+    const ChunkAreaSelector& selector, bool with_vars,
+    const TxnSnapshot* snapshot, const TxnAreaRead* txn_read) {
+    if (selector.dims != geometry_.dims()) throw std::invalid_argument("area dimensions must match the table");
+    if (detail::AreaRequestedExceeds(selector, query_limits_.max_area_chunks))
+        throw std::invalid_argument("chunk area must cover at most " + std::to_string(query_limits_.max_area_chunks) + " chunks");
+    const detail::AreaCursor cursor(selector);
+    const auto max_entries = query_limits_.max_area_response_bytes / ChunkRangeEntryCostBytes();
+    std::vector<ChunkRangeEntry> entries;
+    std::size_t variable_bytes = 0U;
+    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
+    for (auto current = std::optional{cursor.First()}; current; current = cursor.Next(*current)) {
+        if (!index || index->IsPopulationCandidate(*current))
+            AppendPopulatedChunkRangeEntry(*current, max_entries, "GET AREA", with_vars,
+                &variable_bytes, &entries, snapshot, txn_read);
+    }
+    return entries;
+}
+
 std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRange(
     std::int64_t chunk_x0,
     std::int64_t chunk_y0,
@@ -850,41 +910,8 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRangeImpl(
     std::int64_t chunk_y1,
     bool with_vars) {
     if (geometry_.dims() != 2U) throw std::invalid_argument("chunk coordinates require 3 axes");
-    if (chunk_x0 > chunk_x1 || chunk_y0 > chunk_y1) {
-        throw std::invalid_argument("chunk range corners must satisfy x0<=x1 and y0<=y1");
-    }
-    // Spans are computed corner-minus-corner in unsigned arithmetic, which
-    // is exact for the full int64 domain; comparing the span (width - 1)
-    // against the limit avoids the +1 wrap-around at the extreme corners.
-    const std::uint64_t span_x =
-        static_cast<std::uint64_t>(chunk_x1) - static_cast<std::uint64_t>(chunk_x0);
-    const std::uint64_t span_y =
-        static_cast<std::uint64_t>(chunk_y1) - static_cast<std::uint64_t>(chunk_y0);
-    if (span_x >= kMaxChunkRangeChunks || span_y >= kMaxChunkRangeChunks ||
-        (span_x + 1U) * (span_y + 1U) > kMaxChunkRangeChunks) {
-        throw std::invalid_argument(
-            "chunk range must cover at most " + std::to_string(kMaxChunkRangeChunks) + " chunks");
-    }
-    const std::size_t max_entries = kMaxChunkRangeResponseBytes / ChunkRangeEntryCostBytes();
-
-    std::vector<ChunkRangeEntry> entries;
-    std::size_t vars_bytes = 0;
-    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
-    for (std::int64_t chunk_x = chunk_x0;; ++chunk_x) {
-        for (std::int64_t chunk_y = chunk_y0;; ++chunk_y) {
-            const ChunkCoord coord{chunk_x, chunk_y};
-            if (!index || index->IsPopulationCandidate(coord))
-                AppendPopulatedChunkRangeEntry(
-                    coord, max_entries, "GET AREA", with_vars, &vars_bytes, &entries, snapshot, txn_read);
-            if (chunk_y == chunk_y1) {
-                break;
-            }
-        }
-        if (chunk_x == chunk_x1) {
-            break;
-        }
-    }
-    return entries;
+    return ReadChunkAreaEntriesImpl({.dims = 2U, .first = {chunk_x0, chunk_y0},
+        .last = {chunk_x1, chunk_y1}}, with_vars, snapshot, txn_read);
 }
 
 std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadius(
@@ -914,71 +941,8 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadiusImpl(
     std::int64_t radius_chunks,
     bool with_vars) {
     if (geometry_.dims() != 2U) throw std::invalid_argument("chunk coordinates require 3 axes");
-    if (radius_chunks < 0) {
-        throw std::invalid_argument("chunk radius must be >= 0");
-    }
-    if (radius_chunks >= static_cast<std::int64_t>(kMaxChunkRangeChunks)) {
-        throw std::invalid_argument(
-            "chunk radius too large: the covered disc must contain at most " +
-            std::to_string(kMaxChunkRangeChunks) + " chunks");
-    }
-
-    // Count the disc cells first so oversized requests fail before any read.
-    const std::uint64_t radius_sq =
-        static_cast<std::uint64_t>(radius_chunks) * static_cast<std::uint64_t>(radius_chunks);
-    std::uint64_t disc_cells = 0;
-    std::vector<std::int64_t> half_widths(static_cast<std::size_t>(radius_chunks) + 1U, 0);
-    for (std::int64_t dy = 0; dy <= radius_chunks; ++dy) {
-        const std::uint64_t dy_sq = static_cast<std::uint64_t>(dy) * static_cast<std::uint64_t>(dy);
-        std::int64_t half_width = 0;
-        while (static_cast<std::uint64_t>(half_width + 1) *
-                       static_cast<std::uint64_t>(half_width + 1) +
-                   dy_sq <=
-               radius_sq) {
-            ++half_width;
-        }
-        half_widths[static_cast<std::size_t>(dy)] = half_width;
-        const std::uint64_t row_cells = 2U * static_cast<std::uint64_t>(half_width) + 1U;
-        disc_cells += dy == 0 ? row_cells : 2U * row_cells;
-    }
-    if (disc_cells > kMaxChunkRangeChunks) {
-        throw std::invalid_argument(
-            "chunk radius covers " + std::to_string(disc_cells) +
-            " chunks; the limit is " + std::to_string(kMaxChunkRangeChunks));
-    }
-    const std::size_t max_entries = kMaxChunkRangeResponseBytes / ChunkRangeEntryCostBytes();
-
-    // Iterate in ascending (cx, cy) order. Cells whose coordinates would
-    // fall outside the int64 domain do not exist and are skipped.
-    std::vector<ChunkRangeEntry> entries;
-    std::size_t vars_bytes = 0;
-    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
-    for (std::int64_t dx = -radius_chunks; dx <= radius_chunks; ++dx) {
-        if (dx < 0 && center_x < std::numeric_limits<std::int64_t>::min() - dx) {
-            continue;
-        }
-        if (dx > 0 && center_x > std::numeric_limits<std::int64_t>::max() - dx) {
-            break;
-        }
-        const std::int64_t chunk_x = center_x + dx;
-        const std::int64_t abs_dx = dx < 0 ? -dx : dx;
-        // Largest |dy| with dx^2 + dy^2 <= r^2 equals the half width of the
-        // perpendicular row, by symmetry of the disc.
-        const std::int64_t dy_limit = half_widths[static_cast<std::size_t>(abs_dx)];
-        for (std::int64_t dy = -dy_limit; dy <= dy_limit; ++dy) {
-            if (dy < 0 && center_y < std::numeric_limits<std::int64_t>::min() - dy) {
-                continue;
-            }
-            if (dy > 0 && center_y > std::numeric_limits<std::int64_t>::max() - dy) {
-                break;
-            }
-            const ChunkCoord coord{chunk_x, center_y + dy};
-            if (!index || index->IsPopulationCandidate(coord))
-                AppendPopulatedChunkRangeEntry(
-                    coord, max_entries, "GET AREA AROUND", with_vars, &vars_bytes, &entries, snapshot, txn_read);
-        }
-    }
-    return entries;
+    return ReadChunkAreaEntriesImpl({.dims = 2U, .first = {center_x, center_y},
+        .around = true, .radius = radius_chunks}, with_vars, snapshot, txn_read);
 }
 
 }  // namespace chunkdb
