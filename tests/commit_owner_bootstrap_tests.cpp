@@ -368,9 +368,17 @@ void UnclaimedOwnersRefuseEverySurface() {
     auto record = ReadBackupRecord(backup);
     record.files.push_back(InspectBackupFile(backup, "chunkdb.groups.owner"));
     Save(backup / kBackupMarkerName, SerializeBackupRecord(record));
-    Reject([&] { ValidateBackupInventory(backup, record); });
+    const auto reject_unclaimed_owner = [](auto action) {
+        bool rejected = false;
+        try { action(); } catch (const std::exception& error) {
+            assert(std::string_view(error.what()) == "unclaimed canonical commit owner exists");
+            rejected = true;
+        }
+        assert(rejected);
+    };
+    reject_unclaimed_owner([&] { ValidateBackupInventory(backup, record); });
     const auto destination = temporary.path() / "refused-restore";
-    Reject([&] { RestoreBackup(backup, destination); });
+    reject_unclaimed_owner([&] { RestoreBackup(backup, destination); });
     assert(!std::filesystem::exists(destination));
     assert(LoadFile(backup / "chunkdb.groups.owner") == Bytes(root_bytes.begin(), root_bytes.end()));
 }
