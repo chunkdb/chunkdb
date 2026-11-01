@@ -440,7 +440,7 @@ ChunkStore::ChunkStore(StoreConfig config)
             snapshot_generation_mapping_ =
                 std::make_unique<SnapshotGenerationMapping>(data_dir_);
         }
-        // The manifest precedes every other data artifact a store writes.
+        // Initialize the checked inventory and manifest before chunk data.
         InitializeStoreManifest();
         // Slots refuse multi-process writers before recovery can change any
         // artifact. Read-only opening only inspects their checked metadata.
