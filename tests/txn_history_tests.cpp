@@ -268,7 +268,8 @@ void TestIntentRecord() {
     assert(chunkdb::IsTxnIntentArtifactName("txn-17.rollback.tmp.1.2.3.4"));
     assert(chunkdb::TxnIntentPath("/d", 17).filename() == "txn-17.rollback");
 
-    // A read-only load uses the smallest pending rollback boundary.
+    // Pending rollback decisions must agree; committed cleanup does not
+    // impose a rollback boundary on a later mutation.
     chunkdb::TxnIntent other{
         .state = chunkdb::TxnIntentState::kRollback,
         .version = 9,
@@ -278,6 +279,14 @@ void TestIntentRecord() {
         {chunkdb::SerializeTxnIntent(other, 2U, epoch), bytes, committed},
         ChunkCoord{1LL << 40, -(1LL << 40)}, geometry, epoch);
     assert(boundary.has_value() && *boundary == 4242U);
+    bool disagreed = false;
+    try { (void)chunkdb::TxnRollbackBoundaryForChunk(
+        {chunkdb::SerializeTxnIntent(other, 2U, epoch), bytes}, ChunkCoord{-5, 7}, geometry, epoch); }
+    catch (const std::runtime_error& error) {
+        disagreed = std::string(error.what()).find("conflicting pending rollback boundaries") != std::string::npos;
+    }
+    assert(disagreed);
+    other.entries.front().wal_boundary = 0U;
     const auto both = chunkdb::TxnRollbackBoundaryForChunk(
         {chunkdb::SerializeTxnIntent(other, 2U, epoch), bytes}, ChunkCoord{-5, 7}, geometry, epoch);
     assert(both.has_value() && *both == 0U);

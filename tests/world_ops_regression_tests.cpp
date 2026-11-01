@@ -349,7 +349,7 @@ void TestVersionMonotonicAcrossManyReloads() {
 
 // A pre-2.0 artifact inside a store can only be damage or a copied file: the
 // engine reads only the current format and fails the load instead of
-// interpreting it (the offline converter reads old formats).
+// interpreting it.
 void TestPre20ArtifactsAreRejected() {
     chunkdb::test::ScopedTempDir dir("chunkdb-reg-pre20-image");
     auto config = BaseConfig(dir.path());
@@ -365,14 +365,16 @@ void TestPre20ArtifactsAreRejected() {
     const std::string pre20_magic = "CHKDATA1";  // images of 1.x and 2.0 development builds
     std::copy(pre20_magic.begin(), pre20_magic.end(), image.begin());
     WriteFileBytes(image_path, image);
+    const auto clock_before = ReadFileBytes(dir.path() / "chunkdb.version");
     bool rejected = false;
     try {
         chunkdb::ChunkStore store(config);
         (void)store.GetBlockBits(0, 0);
     } catch (const std::exception& e) {
-        rejected = std::string(e.what()).find("not a 2.0 chunk image") != std::string::npos;
+        rejected = std::string(e.what()).find("chunk file header magic mismatch") != std::string::npos;
     }
     assert(rejected);
+    assert(ReadFileBytes(image_path) == image && ReadFileBytes(dir.path() / "chunkdb.version") == clock_before);
 
     // The 8-byte clock ceiling of development builds before the checked record.
     chunkdb::test::ScopedTempDir clock_dir("chunkdb-reg-pre20-clock");
@@ -488,6 +490,11 @@ void TestStartupInventoryErrorRefusesWithoutPublication() {
     assert(std::filesystem::remove(dir.path() / ".chunkdb.initialized"));
     bool refused = false;
     try { chunkdb::ChunkStore writer(config); }
+    catch (const std::filesystem::filesystem_error& error) {
+        // Complete coordinate admission now detects this unavailable shard
+        // before revision bookkeeping can publish a replacement clock.
+        refused = error.code() == std::errc::permission_denied;
+    }
     catch (const std::runtime_error& error) {
         const std::string message = error.what();
         refused = message.find("startup inventory is unavailable") != std::string::npos &&
@@ -2006,7 +2013,7 @@ void TestRevisionSurvivesCheckpointImage() {
     }
 }
 
-// The v4 image header CRC covers the revision, so a flip there is rejected
+// The image header CRC covers the revision, so a flip there is rejected
 // instead of handing out a corrupted CHUNKVER token.
 void TestImageHeaderCrcCorruptionRejected() {
     chunkdb::test::ScopedTempDir dir("chunkdb-reg-image-header-crc");
@@ -2020,12 +2027,15 @@ void TestImageHeaderCrcCorruptionRejected() {
         store.SetBlockBits(0, 0, "10101");
     }
     const auto image = ReadFileBytes(image_path);
-    // Fixed header: revision at 56..64, commit time at 64..72; the two-entry
-    // section directory at 72..104; the header CRC over [0, 104) at 104..108.
-    assert(image.size() > 108U);
-    assert(image[8] == 1U && image[9] == 0U);  // image format version 1
+    const auto count = static_cast<std::uint16_t>(image[10U] | (static_cast<unsigned>(image[11U]) << 8U));
+    const auto crc_at = chunkdb::ChunkImageHeaderBytes(geometry.dims(), count) - 4U;
+    const auto revision_at = 44U + 8U * geometry.dims();
+    const auto time_at = 52U + 8U * geometry.dims();
+    assert(image.size() > crc_at + 4U);
+    assert(image[8] == 2U && image[9] == 0U);
 
-    for (const std::size_t offset : {56U, 63U, 64U, 80U, 104U}) {
+    for (const std::size_t offset : {static_cast<std::size_t>(revision_at), static_cast<std::size_t>(revision_at + 7U),
+             static_cast<std::size_t>(time_at), chunkdb::ChunkImageFixedHeaderBytes(geometry.dims()), crc_at}) {
         auto corrupt = image;
         corrupt[offset] ^= 0x01U;
         WriteFileBytes(image_path, corrupt);
