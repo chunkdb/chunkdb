@@ -81,4 +81,12 @@ enum class ChunkFormReadMode { kRead, kMutation };
 [[nodiscard]] std::vector<ChunkFormChunkColumn> ParseChunkFormChunkColumns(
     const ChunkFormSections& form);
 
+// Complete borrowed-directory admission without constructing a descriptor vector.
+// An empty raw metadata body represents an empty schema; a transport section
+// still distinguishes an omitted section from a truncated present one.
+[[nodiscard]] std::size_t ValidateChunkColumnDirectory(std::span<const std::uint8_t> body);
+// Call only after directory admission and with index below its returned count.
+[[nodiscard]] ChunkFormChunkColumn ChunkColumnDirectoryEntry(
+    std::span<const std::uint8_t> body, std::size_t index) noexcept;
+
 }  // namespace chunkdb

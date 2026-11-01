@@ -86,7 +86,7 @@ void MaskUnusedPresenceBits(const Geometry& geometry, std::vector<std::uint8_t>*
 }
 
 [[nodiscard]] bool BlockPresent(
-    const std::vector<std::uint8_t>& presence_bitmap,
+    std::span<const std::uint8_t> presence_bitmap,
     std::size_t block_index) {
     const std::size_t byte_index = block_index / 8U;
     const std::uint8_t bit_mask = static_cast<std::uint8_t>(1U << (block_index % 8U));

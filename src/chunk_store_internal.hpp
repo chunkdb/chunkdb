@@ -146,7 +146,7 @@ void WriteLe64(std::vector<std::uint8_t>& out, std::uint64_t value);
 void MaskUnusedPresenceBits(const Geometry& geometry, std::vector<std::uint8_t>* presence_bitmap);
 void MaskUnusedPayloadBits(const Geometry& geometry, std::vector<std::uint8_t>* payload);
 [[nodiscard]] std::vector<std::uint8_t> FullPresenceBitmap(const Geometry& geometry);
-[[nodiscard]] bool BlockPresent(const std::vector<std::uint8_t>& presence_bitmap, std::size_t block_index);
+[[nodiscard]] bool BlockPresent(std::span<const std::uint8_t> presence_bitmap, std::size_t block_index);
 void SetBlockPresent(std::vector<std::uint8_t>* presence_bitmap, std::size_t block_index, bool present);
 [[nodiscard]] bool ChunkPresent(const std::vector<std::uint8_t>& presence_bitmap) noexcept;
 [[nodiscard]] std::size_t PresentBlockCount(const std::vector<std::uint8_t>& presence_bitmap) noexcept;
@@ -303,7 +303,7 @@ bool ApplyRetainedEmptyBase(const Geometry& geometry, const ChunkIndexRecord& bo
 // column in schema order; the block must be present.
 [[nodiscard]] std::vector<ColumnValue> DecodeBlockColumns(
     const ChunkLayout& layout,
-    const std::vector<std::uint8_t>& payload,
+    std::span<const std::uint8_t> payload,
     const ChunkVars& vars,
     std::size_t block_index,
     std::vector<std::uint8_t>* scratch = nullptr);
