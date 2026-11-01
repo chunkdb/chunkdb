@@ -36,7 +36,7 @@ Collection preserves that initialized identity until explicit tombstone compacti
 
 ## Format boundaries
 
-The directory and table envelopes own incompatibility bit 32, named `chunk_model`.
+The directory and table envelopes own incompatibility mask `0x20`, named `chunk_model`.
 New tables publish complete geometry, both schema histories and an empty checked index inventory before catalog visibility.
 Images and WAL headers include dims, active coordinates, table identity, feature sets and a header checksum.
 The table manifest places `dims:u8` and three zero reserved bytes before its six `u32` geometry sides, then the table identity, bounded options, and independently length-delimited block and chunk schema histories.
