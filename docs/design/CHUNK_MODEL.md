@@ -86,6 +86,10 @@ Each large directory with retained index decisions has a checked streaming `CKIX
 The inventory lists these logs rather than every directory containing a live image or WAL; recovery discovers live artifacts once and builds the ordered in-memory candidate index.
 Records carry coordinates, producing revision, time and schema, with exact lengths, checksums and placement validation.
 The checked `CKII` inventory lists sorted unique large coordinates, each log's committed byte boundary, and compaction decision fields.
+Its independently checksummed fixed header includes a nonzero monotonic inventory generation, advanced by each inventory publication and never reused within a table identity.
+Read-only point reads may reuse a completely admitted retained-boundary index only when that header's identity and generation still match inside the same stable snapshot bracket as their image and WAL.
+An ordinary block write changes the table snapshot generation without changing the inventory generation, so refreshing a point does not rebuild every retained shard after unrelated writes.
+Read-only scans rebuild their complete live-coordinate candidate index when the table snapshot generation changes and publish it only after one unchanged equal-even whole-index observation.
 Every listed boundary covers a complete header and whole records; a listed log shorter than that boundary is damage.
 Recovery validates complete inventory and logs before mutating artifacts, resolves rollback intents, then reconciles committed image and WAL state.
 Live hints do not fabricate data or suppress newer committed WAL state.
