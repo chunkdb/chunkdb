@@ -583,6 +583,24 @@ class ChunkStore {
         std::int64_t radius_chunks,
         bool with_vars = false);
 
+    // Explicit three-axis area reads require a three-dimensional table,
+    // including when every z coordinate is zero.
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange3D(
+        std::int64_t x0, std::int64_t y0, std::int64_t z0,
+        std::int64_t x1, std::int64_t y1, std::int64_t z1, bool with_vars = false);
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRadius3D(
+        std::int64_t cx, std::int64_t cy, std::int64_t cz,
+        std::int64_t radius_chunks, bool with_vars = false);
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange3DAt(
+        const TxnSnapshot& snapshot,
+        std::int64_t x0, std::int64_t y0, std::int64_t z0,
+        std::int64_t x1, std::int64_t y1, std::int64_t z1,
+        bool with_vars = false, const TxnAreaRead& txn_read = {});
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRadius3DAt(
+        const TxnSnapshot& snapshot,
+        std::int64_t cx, std::int64_t cy, std::int64_t cz,
+        std::int64_t radius_chunks, bool with_vars = false, const TxnAreaRead& txn_read = {});
+
     // The chunk's state read under one lock. A chunk without blocks has an
     // empty presence bitmap and still a version, which a conditional write
     // that creates it compares against.
@@ -1609,6 +1627,14 @@ class ChunkStore {
         std::int64_t center_y,
         std::int64_t radius_chunks,
         bool with_vars);
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange3DImpl(
+        const TxnSnapshot* snapshot, const TxnAreaRead* txn_read,
+        std::int64_t x0, std::int64_t y0, std::int64_t z0,
+        std::int64_t x1, std::int64_t y1, std::int64_t z1, bool with_vars);
+    [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRadius3DImpl(
+        const TxnSnapshot* snapshot, const TxnAreaRead* txn_read,
+        std::int64_t cx, std::int64_t cy, std::int64_t cz,
+        std::int64_t radius_chunks, bool with_vars);
     // Commit helper (txn_commit.cpp), called with the chunk's lock held.
     // Appends `bytes` (a frame, after a WAL header when `new_wal`) to the
     // chunk's WAL through a stream of its own, syncs and closes it.
