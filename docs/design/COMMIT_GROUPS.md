@@ -158,6 +158,9 @@ BEGIN alone neither certifies a matching body nor returns an earlier transaction
 A duplicate BEGIN opens a private validation session; its statements cannot publish writes outside that session.
 Read replies are evaluated against that session's current snapshot and are not retained or replayed as idempotency results.
 Transcript recording continues through a private statement failure, so ignored follow-up statements cannot evade comparison.
+Well-framed statements refused during payload admission also belong to the transcript; discarded parameter bodies are hashed in bounded pieces while they are drained.
+The streaming fingerprint uses the same NULL markers, declared lengths and ordered bytes as complete parameter frames, and cannot finish while a declared parameter or statement count remains incomplete.
+A framing misuse invalidates that transcript instead of permitting a shortened hash, and malformed protocol termination cannot compare or publish an incomplete request.
 COMMIT compares the complete transcript before any new commit admission, including when private validation has already failed.
 For a known matching outcome it discards private state and returns the retained repeated result; a different transcript returns `INVALID_ARGUMENT reason=id_reused` without mutation.
 An in-flight duplicate waits at COMMIT without table leases or chunk locks until its owner has a checked outcome.
