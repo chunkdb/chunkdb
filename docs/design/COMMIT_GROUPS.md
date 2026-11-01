@@ -23,6 +23,7 @@ Syncing a decision or durability receipt precedes atomically publishing and sync
 Bytes at or below that cut are never reclassified as an interrupted append, including a damaged last length field or a truncated final certified record.
 Certifying journal bytes does not certify the members of an earlier relaxed group without that group's durability receipt.
 Compaction writes and syncs a distinct journal generation, publishes its checked inventory reference, and only then retires the old generation.
+The staged generation's file and parent directory are both durable before any inventory reference can name it.
 Counts are admitted against the complete record extent with checked arithmetic before allocation.
 Recovery codecs do not impose the current session's chunk-count limits on an earlier valid record.
 
@@ -80,6 +81,7 @@ Only durable published coverage can replace a frame during group admission.
 Live journal records can retire after all members have published coverage.
 Their immutable group seals remain while current checkpoint provenance, retained feed history or bounded idempotency records reference them.
 A seal records member epochs and coordinates, visible transaction identity and tag without storing metadata per block.
+A newly referenced seal and its parent directory are durable before publishing a reference or retiring its journal source.
 Unreferenced seals are collected after their checked reference cut is durable.
 Recovery admits the complete reference cut before deleting a journal record or seal.
 
@@ -155,6 +157,7 @@ Recovery first resolves group outcomes, restores only admitted live inventory bi
 If a newer relaxed incarnation is absent or rolled back after a crash, lookup remains empty rather than falling back to the retired older incarnation.
 The inventory and pending reservations obey the byte bound even when old seals remain needed by feed readers.
 Inventory replacement keeps the old checked generation until the new generation and its publication are durable.
+Every separately named new inventory object and its parent directory are synced before publishing a reference to that generation.
 
 A tag is at most 256 bytes and an explicit tag overrides the HELLO default.
 The checked group decision owns the tag and catch-up obtains it from the retained group seal.
