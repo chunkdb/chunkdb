@@ -299,7 +299,8 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             if (!input) throw std::runtime_error("failed to read pinned backup WAL");
             std::vector<WalFrameBoundary> boundaries;
             const auto replay = ReplayWalStream(input, file.observed, geometry, coord, manifest.store_id, manifest.features,
-                base, schema, &payload, &presence, &vars, &boundaries, &chunk_columns);
+                base, schema, &payload, &presence, &vars, &boundaries, &chunk_columns,
+                [&] { hook(BackupTestHook::Point::kBeforeWalReplayRead, table_name, table_cut->revision); });
             if (!replay.torn_creation && (!replay.replayable ||
                 (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty()))
                 throw std::runtime_error("backup WAL cannot be replayed: " + replay.stop_reason + " " + replay.vars_problem);

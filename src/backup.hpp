@@ -43,7 +43,7 @@ struct BackupResult {
 };
 // Deterministic pin/copy boundaries, following the storage test-hook pattern.
 struct BackupTestHook {
-    enum class Point { kBeforeTargetCreate, kBeforeCopyCreate, kBeforeStagingCreate, kAfterTargetGuard, kBeforeTablePin, kBeforeLargeChunkPin, kBeforeMaintenanceWait, kAfterCut, kWaitingForCompletion, kAfterFlush, kAfterPin, kBeforeCopy, kAfterCopy, kBeforePublish };
+    enum class Point { kBeforeTargetCreate, kBeforeCopyCreate, kBeforeStagingCreate, kAfterTargetGuard, kBeforeTablePin, kBeforeLargeChunkPin, kBeforeMaintenanceWait, kAfterCut, kWaitingForCompletion, kAfterFlush, kAfterPin, kBeforeCopy, kAfterCopy, kBeforePublish, kBeforeWalReplayRead };
     virtual ~BackupTestHook() = default;
     virtual void Run(Point point, std::string_view table, std::uint64_t revision) = 0;
 };
