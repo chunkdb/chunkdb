@@ -2,12 +2,14 @@
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "eviction.hpp"
 #include "feed_slots.hpp"
 #include "process_lock.hpp"
 #include "wal_replay.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
+#include "shared_file_input.hpp"
 
 #include <algorithm>
 #include <array>
@@ -100,17 +102,19 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             }
             auto loaded = read_only_load.has_value() ? std::move(*read_only_load) : LoadChunkPayload(chunk_coord, true);
             // An image without a WAL may be of an earlier schema version.
+            BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);
             BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
             selected = std::make_shared<RegularChunk>(
                 std::move(loaded.payload), std::move(loaded.presence_bitmap));
             selected->vars = std::move(loaded.vars);
+            selected->chunk_columns = std::move(loaded.chunk_columns);
             // The persisted revision survives eviction and restart, so
-            // CHUNKVER tokens do not change on reload. A chunk with no
-            // artifact (revision zero) takes a fresh token for this load.
+            // versions do not change on reload. A chunk without a producing
+            // commit keeps revision zero and consumes no write reservation.
             if (loaded.revision != 0) {
                 RaiseVersionClockAbove(loaded.revision);
             }
-            selected->version = loaded.revision != 0 ? loaded.revision : NextChunkVersion();
+            selected->version = loaded.revision;
             // A surviving header or interrupted creation is not a committed mutation.
             selected->written = loaded.revision != 0;
             selected->commit_time_ms = loaded.commit_time_ms;
@@ -196,6 +200,7 @@ void ChunkStore::RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChun
         }
     }
     auto loaded = LoadChunkPayload(chunk_coord);
+    BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);
     BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
     std::unique_lock lock(chunk.mutex);
     // Generations only grow, so a copy another read loaded later is kept.
@@ -204,9 +209,11 @@ void ChunkStore::RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChun
     }
     chunk.payload = std::move(loaded.payload);
     chunk.presence_bitmap = std::move(loaded.presence_bitmap);
+    chunk.present_blocks = PresentBlockCount(chunk.presence_bitmap);
     chunk.vars = std::move(loaded.vars);
-    chunk.version = loaded.revision != 0 ? loaded.revision : NextChunkVersion();
-    chunk.written = loaded.revision != 0 || loaded.schema_version != 0 || loaded.wal_header_written;
+    chunk.chunk_columns = std::move(loaded.chunk_columns);
+    chunk.version = loaded.revision;
+    chunk.written = loaded.revision != 0;
     chunk.commit_time_ms = loaded.commit_time_ms;
     chunk.wal_bytes = loaded.wal_bytes;
     chunk.wal_header_written = loaded.wal_header_written;
@@ -222,7 +229,8 @@ std::vector<std::uint8_t> ChunkStore::EmptyPresenceBitmap() const {
     return std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry_), 0U);
 }
 
-ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix) {
+ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix,
+    const std::shared_ptr<ChunkCoordinateIndex>& recovery_index) {
     std::vector<WalFrameBoundary> boundaries;
     // A read-only store archives nothing, so it keeps no WAL prefixes.
     const bool track_prefix =
@@ -246,6 +254,22 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         .wal_header_written = false,
         .wal_path = {},
     };
+    auto retained_index = recovery_index ? recovery_index : (writable ? coordinate_index_ : nullptr);
+    std::optional<ChunkIndexRecord> retained_boundary;
+    const auto apply_boundary = [&] {
+        if (retained_index) retained_boundary = retained_index->EmptyBoundary(chunk_coord);
+        if (retained_boundary)
+            (void)ApplyRetainedEmptyBase(geometry_, *retained_boundary, loaded.revision, loaded.commit_time_ms,
+                loaded.schema_version, loaded.payload, loaded.presence_bitmap, loaded.vars, loaded.chunk_columns);
+    };
+    const auto finish = [&] {
+        if (retained_boundary && retained_boundary->kind == ChunkIndexKind::kForget &&
+            loaded.revision == retained_boundary->revision) {
+            loaded.revision = 0U;
+            loaded.commit_time_ms = 0U;
+        }
+        seed();
+    };
     if (!writable) {
         const auto snapshot =
             LoadStableReadOnlyChunkDiskSnapshot(
@@ -256,13 +280,22 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 snapshot_generation_path_,
                 snapshot_generation_record_seen_,
                 chunk_coord,
+                [this, chunk_coord](const std::filesystem::path& path) {
+                    return LoadChunkImageFile(path, geometry_, chunk_coord, store_id_, features_);
+                },
                 [this](
                     std::size_t collection,
                     ReadOnlySnapshotArtifact artifact) {
                     PauseReadOnlySnapshotForTests(
                         collection, artifact);
-                });
+                },
+                [&] { if (!recovery_index) retained_index = RetainedIndexForSnapshot(); });
         loaded.read_only_generation = snapshot.generation;
+        if (!recovery_index && retained_index) {
+            std::lock_guard lock(coordinate_index_refresh_mutex_);
+            if (!read_only_retained_index_ || read_only_retained_index_->inventory_generation() < retained_index->inventory_generation())
+                read_only_retained_index_ = retained_index;
+        }
 
         // An image or a WAL names its store; an absent chunk does not, so a
         // table dropped and created again would read as empty.
@@ -275,10 +308,12 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             loaded.payload = std::move(image.payload);
             loaded.presence_bitmap = std::move(image.presence_bitmap);
             loaded.vars = std::move(image.vars);
+            loaded.chunk_columns = std::move(image.chunk_columns);
             loaded.schema_version = image.schema_version;
             loaded.revision = image.revision;
             loaded.commit_time_ms = image.commit_time_ms;
         }
+        apply_boundary();
 
         std::vector<std::uint8_t> replay_bytes;
         ConditionalIntentState intent_state =
@@ -304,7 +339,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         for (const auto& txn_intent : snapshot.txn_intents) {
             txn_intents.push_back(txn_intent.bytes);
         }
-        const auto txn_boundary = TxnRollbackBoundaryForChunk(txn_intents, chunk_coord);
+        const auto txn_boundary = TxnRollbackBoundaryForChunk(txn_intents, chunk_coord, geometry_, store_id_);
         bool rollback_boundary = snapshot.intent.present && intent_state == ConditionalIntentState::kRollback;
         if (txn_boundary.has_value()) {
             committed_wal_size = rollback_boundary ? std::min(committed_wal_size, *txn_boundary) : *txn_boundary;
@@ -351,7 +386,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 &loaded.payload,
                 &loaded.presence_bitmap,
                 &loaded.vars,
-                track_prefix ? &boundaries : nullptr);
+                track_prefix ? &boundaries : nullptr,
+                &loaded.chunk_columns, loaded.commit_time_ms);
             loaded.schema_version = geometry_.layout().schema().version;
             if (replay.torn_creation) {
                 // An interrupted creation holds no mutation, and names no
@@ -359,7 +395,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 if (!snapshot.image.present) {
                     RequireStoreStillOnDisk();
                 }
-                seed();
+                finish();
                 return loaded;
             }
             // A crash-shaped tail ends the WAL here as it does for a
@@ -387,7 +423,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 loaded.commit_time_ms = replay.commit_time_ms;
             }
         }
-        seed();
+        finish();
         return loaded;
     }
 
@@ -397,12 +433,13 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
     if (std::filesystem::exists(data_path)) {
         try {
             FeedWalPrefixTestAccess::Run(FeedWalPrefixTestHook::Point::kImageRead, chunk_coord);
-            const auto data_bytes = LoadFile(data_path);
+            const auto data_bytes = LoadChunkImageFile(data_path, geometry_, chunk_coord, store_id_, features_);
             auto image =
                 ParseChunkImage(data_bytes, geometry_, chunk_coord, store_id_, features_);
             loaded.payload = std::move(image.payload);
             loaded.presence_bitmap = std::move(image.presence_bitmap);
             loaded.vars = std::move(image.vars);
+            loaded.chunk_columns = std::move(image.chunk_columns);
             loaded.schema_version = image.schema_version;
             loaded.revision = image.revision;
             loaded.commit_time_ms = image.commit_time_ms;
@@ -415,27 +452,34 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             loaded.payload = EmptyPayload();
             loaded.presence_bitmap = EmptyPresenceBitmap();
             loaded.vars = ChunkVars{};
+            loaded.chunk_columns.reset();
             loaded.schema_version = 0;
             loaded.revision = 0;
             loaded.commit_time_ms = 0;
         }
     }
 
+    apply_boundary();
     if (std::filesystem::exists(wal_path)) {
-        std::vector<std::uint8_t> wal_bytes;
+        std::optional<SharedFileInput> opened;
         try {
-            wal_bytes = LoadFile(wal_path);
-        } catch (...) {
-            // WAL can be removed concurrently by checkpoint cleanup.
-            // If it no longer exists, treat as already checkpointed.
+            opened.emplace(wal_path);
+        } catch (const std::system_error&) {
             if (std::filesystem::exists(wal_path)) {
                 throw;
             }
-            seed();
+            finish();
             return loaded;
         }
-
-        const auto replay = ReplayWal(
+        auto& wal_input = *opened;
+        wal_input.seekg(0, std::ios::end);
+        const auto measured = wal_input.tellg();
+        if (measured < 0) throw std::runtime_error("failed to measure WAL " + wal_path.string());
+        const auto wal_bytes = static_cast<std::uint64_t>(measured);
+        wal_input.seekg(0);
+        if (!wal_input) throw std::runtime_error("failed to rewind WAL " + wal_path.string());
+        const auto replay = ReplayWalStream(
+            wal_input,
             wal_bytes,
             geometry_,
             chunk_coord,
@@ -446,7 +490,9 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             &loaded.payload,
             &loaded.presence_bitmap,
             &loaded.vars,
-            track_prefix ? &boundaries : nullptr);
+            track_prefix ? &boundaries : nullptr,
+            &loaded.chunk_columns, {}, loaded.commit_time_ms);
+        wal_input.close();
         loaded.schema_version = geometry_.layout().schema().version;
         if (replay.torn_creation) {
             LogMessage(
@@ -456,12 +502,12 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 {
                     {"chunk_x", std::to_string(chunk_coord.x)},
                     {"chunk_y", std::to_string(chunk_coord.y)},
-                    {"bytes", std::to_string(wal_bytes.size())},
+                    {"bytes", std::to_string(wal_bytes)},
                 });
             if (writable) {
                 TrimWalForAppend(chunk_coord, wal_path, 0U);
             }
-            seed();
+            finish();
             return loaded;
         }
         if (!replay.replayable) {
@@ -481,7 +527,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             throw std::runtime_error(
                 "WAL " + wal_path.string() + " is damaged before its end (" + replay.stop_reason +
                 " at byte " + std::to_string(replay.valid_end) + " of " +
-                std::to_string(wal_bytes.size()) + "); refusing to load chunk (" +
+                std::to_string(wal_bytes) + "); refusing to load chunk (" +
                 std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) + ")");
         }
         if (!replay.vars_problem.empty()) {
@@ -524,7 +570,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         }
     }
 
-    seed();
+    finish();
     return loaded;
 }
 

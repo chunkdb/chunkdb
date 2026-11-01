@@ -64,7 +64,8 @@ TxnHistory::~TxnHistory() {
 
 TxnHistory::Reservation TxnHistory::Reserve(const ChunkCoord& coord, std::uint64_t tag, ChunkState state) {
     const std::size_t bytes =
-        state.payload.size() + state.presence_bitmap.size() + state.vars.encoded_size() + kKeptStateOverheadBytes;
+        state.payload.size() + state.presence_bitmap.size() + state.vars.encoded_size() +
+        (state.chunk_columns ? state.chunk_columns->bytes.size() : 0U) + kKeptStateOverheadBytes;
     KeptByChunk staging;
     const auto it = staging.emplace(
         coord,
@@ -83,7 +84,7 @@ void TxnHistory::Fill(Reservation& reservation, ChunkState&& state) noexcept {
     auto& kept = reservation.mapped();
     kept.state = std::move(state);
     kept.bytes = kept.state.payload.size() + kept.state.presence_bitmap.size() + kept.state.vars.encoded_size() +
-                 kKeptStateOverheadBytes;
+                 (kept.state.chunk_columns ? kept.state.chunk_columns->bytes.size() : 0U) + kKeptStateOverheadBytes;
 }
 
 void TxnHistory::Publish(Reservation& reservation) noexcept {
