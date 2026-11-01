@@ -45,7 +45,7 @@ class TxnBlockDeltas {
         TxnBlockDeltas* owner_;
         std::uint64_t generation_;
         TxnBlockKey key_;
-        Rows node_;
+        Rows::node_type node_;
         TxnBlockAction action_ = TxnBlockAction::kObserve;
         TxnBlockRow after_;
         bool changes_ = false;
@@ -61,7 +61,7 @@ class TxnBlockDeltas {
         explicit Promotion(TxnBlockDeltas* owner);
         TxnBlockDeltas* owner_;
         std::uint64_t generation_;
-        Promotions node_;
+        Promotions::node_type node_;
     };
 
     TxnBlockDeltas(StoreId table_id, const ChunkLayout& layout, std::pmr::memory_resource* resource);

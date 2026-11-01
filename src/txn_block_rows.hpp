@@ -5,7 +5,7 @@
 #include <span>
 
 #include "chunkdb/chunk_layout.hpp"
-#include "chunkdb/chunk_store.hpp"
+#include "chunkdb/chunk_vars.hpp"
 #include "chunkdb/txn_block_row.hpp"
 
 namespace chunkdb {

@@ -1,6 +1,10 @@
 #include <cassert>
+#include <atomic>
 #include <chrono>
+#include <cstdint>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "chunkdb/chunk_store.hpp"
 #include "txn_block_memory.hpp"

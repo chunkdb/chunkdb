@@ -45,9 +45,9 @@ void Add(std::size_t& total, std::size_t amount) {
 }  // namespace
 
 TxnBlockDeltas::Edit::Edit(TxnBlockDeltas* owner, TxnBlockKey key)
-    : owner_(owner), generation_(owner->generation_), key_(key), node_(owner->resource()), after_(owner->resource()) {}
+    : owner_(owner), generation_(owner->generation_), key_(key), after_(owner->resource()) {}
 TxnBlockDeltas::Promotion::Promotion(TxnBlockDeltas* owner)
-    : owner_(owner), generation_(owner->generation_), node_(owner->resource()) {}
+    : owner_(owner), generation_(owner->generation_) {}
 TxnBlockDeltas::Edit::Edit(Edit&& other) noexcept
     : owner_(std::exchange(other.owner_, nullptr)), generation_(other.generation_), key_(other.key_),
       node_(std::move(other.node_)), action_(other.action_), after_(std::move(other.after_)), changes_(other.changes_) {}
@@ -90,7 +90,8 @@ TxnBlockDeltas::Edit TxnBlockDeltas::Prepare(TxnBlockKey key, const TxnBlockSnap
             (first->second.before.version != snapshot.version || first->second.before.commit_time_ms != snapshot.commit_time_ms ||
                 first->second.before.written != snapshot.written))
             throw std::invalid_argument("transaction block observations disagree on their chunk snapshot");
-        auto inserted = edit.node_.try_emplace(key, resource()).first;
+        Rows staged(resource());
+        auto inserted = staged.try_emplace(key, resource()).first;
         auto& entry = inserted->second;
         CopySnapshot(entry.before, snapshot); entry.action = action;
         entry.after.schema_version = layout_.schema().version;
@@ -98,6 +99,7 @@ TxnBlockDeltas::Edit TxnBlockDeltas::Prepare(TxnBlockKey key, const TxnBlockSnap
             auto row = CloneTxnBlockRow(*replacement, resource());
             SwapRows(entry.after, row);
         }
+        edit.node_ = staged.extract(inserted);
         edit.changes_ = true;
     } else if (action != TxnBlockAction::kObserve) {
         edit.after_.schema_version = layout_.schema().version;
@@ -115,7 +117,7 @@ void TxnBlockDeltas::Publish(Edit edit) {
         throw std::invalid_argument("transaction block edit is stale or belongs to another journal");
     if (!edit.changes_) return;
     CanEdit();
-    if (!edit.node_.empty()) rows_.insert(edit.node_.extract(edit.node_.begin()));
+    if (!edit.node_.empty()) rows_.insert(std::move(edit.node_));
     else {
         auto& entry = rows_.find(edit.key_)->second;
         SwapRows(entry.after, edit.after_); entry.action = edit.action_;
@@ -130,7 +132,9 @@ TxnBlockDeltas::Promotion TxnBlockDeltas::PreparePromotion(ChunkCoord coord, std
         if (key.chunk == coord && entry.before.version != snapshot_version)
             throw std::invalid_argument("transaction promotion has a different snapshot revision");
     Promotion promotion(this);
-    promotion.node_.emplace(coord, snapshot_version);
+    Promotions staged(resource());
+    const auto inserted = staged.emplace(coord, snapshot_version).first;
+    promotion.node_ = staged.extract(inserted);
     return promotion;
 }
 
@@ -138,8 +142,8 @@ void TxnBlockDeltas::Publish(Promotion promotion) {
     if (promotion.owner_ != this || promotion.generation_ != generation_ || promotion.node_.empty())
         throw std::invalid_argument("transaction promotion is stale or belongs to another journal");
     CanEdit();
-    const auto coord = promotion.node_.begin()->first;
-    promotions_.insert(promotion.node_.extract(promotion.node_.begin()));
+    const auto coord = promotion.node_.key();
+    promotions_.insert(std::move(promotion.node_));
     for (auto it = rows_.begin(); it != rows_.end();)
         if (it->first.chunk == coord) it = rows_.erase(it); else ++it;
     ++generation_;
@@ -218,7 +222,7 @@ TxnBlockRebasePlan PlanTxnBlockRebase(const TxnBlockDeltas& deltas,
             throw std::invalid_argument("transaction removed variable bytes exceed their current section");
         chunk.resulting_variable_bytes -= chunk.removed_variable_bytes;
         Add(chunk.resulting_variable_bytes, chunk.added_variable_bytes);
-        const auto metadata_before = before.chunk_columns ? before.chunk_columns->variable_bytes : 0U;
+        const auto metadata_before = before.written && before.chunk_columns ? before.chunk_columns->variable_bytes : 0U;
         if (chunk.resulting_variable_bytes > kVarMaxChunkBytesLimit ||
             chunk.resulting_metadata_variable_bytes > kVarMaxChunkBytesLimit - chunk.resulting_variable_bytes)
             throw std::invalid_argument("transaction block and chunk values exceed the combined variable-byte limit");
