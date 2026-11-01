@@ -92,7 +92,8 @@ It waits for leases before taking operations or resource-publication locks, and 
 The feature journal becomes CKFA tag 2: its existing 32-byte header is followed by a fixed 40-byte scope and the existing target-name/epoch records and final CRC32.
 For bit 64 the scope is the chosen nonzero catalog scope matching the journal directory identity; every other feature requires those 40 bytes to be zero.
 The minimum extent is 76 bytes and the existing measured byte and inventory bounds remain enforced.
-Earlier activation tags refuse rather than activating bit 64 without its recorded owner identity.
+CKFA tag 1 retains its historical layout and recovery for known features other than bit 64, with no journal-owned scope and preservation of any independently admitted manifest scope.
+Tag 1 claiming bit 64 refuses; only tag 2 can authorize its recorded owner binding.
 No new standalone activation command is introduced: an existing unowned standalone store remains usable for ordinary operations and refuses grouped operations until an explicit checked activation interface admits it.
 
 Before its decision, activation admits every current participant and reserves its completion bookkeeping.
@@ -140,6 +141,7 @@ Crash children cover every decision, inventory, inactive-root, manifest and deci
 Restart retains the exact recorded IDs, admits only complete claimed ownership and exposes no table lease during incomplete activation.
 Wrong later participants, duplicate epochs, changed scopes, missing roots and conflicting decisions refuse before any earlier manifest, root, index or chunk is changed.
 Tests cover both coordinate dimensions, read-only isolation, explicit borrowed/bootstrap locks, fresh shared-writer initialization, default masks, CREATE, MIGRATE, option/schema/lineage rewrites and no-op activation.
+An interrupted tag-1 non-group activation recovers on writer restart and remains inspectable without repair by the verifier; read-only startup retains its existing pending-decision refusal.
 INACTIVE backup/restore tests retain data, producing identities and epochs while rewriting the complete scope; missing root inventory entries and an activation between the two capture observations refuse.
 Sparse and checksum-valid oversized decisions fail before body allocation, and native reparse/generation substitution preserves unrelated bytes.
 Isolated controls remove owner-root-before-manifest sync, recorded-ID reuse, context injection, all-participant preflight and upper identity checks and must fail the corresponding exact-byte or admission assertions.
