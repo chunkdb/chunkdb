@@ -684,6 +684,47 @@ bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
 }  // namespace
 #endif
 
+#ifdef _WIN32
+void SyncOwnerFileHandle(void* handle, const std::filesystem::path& label) {
+    FlushHandleChecked(static_cast<HANDLE>(handle), label, "failed to sync owner object");
+    NoteFileSynced(label);
+}
+void SyncOwnerDirectoryHandle(void* handle, const std::filesystem::path& label) {
+    DWORD error = ERROR_SUCCESS;
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WINDOWS_DIRECTORY_SYNC_CAPABILITY_ERROR_ONCE")) {
+        error = ERROR_INVALID_FUNCTION;
+    } else if (FlushFileBuffers(static_cast<HANDLE>(handle)) == 0) {
+        error = GetLastError();
+    }
+    if (error != ERROR_SUCCESS) {
+        throw BuildWin32Error("strict durability requires owner directory sync capability", label, error);
+    }
+    NoteDirectorySynced(label);
+}
+#else
+void SyncOwnerFileDescriptor(int fd, const std::filesystem::path& label) {
+    SyncFdDurably(fd, label, true);
+    NoteFileSynced(label);
+}
+void SyncOwnerDirectoryDescriptor(int fd, const std::filesystem::path& label) {
+#if defined(__APPLE__)
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE")) {
+        throw BuildErrnoError("failed to F_FULLFSYNC owner directory", label, EIO);
+    }
+    if (::fcntl(fd, F_FULLFSYNC, 0) != 0) {
+        const int error = errno;
+        if (error != EINVAL && error != ENOTSUP && error != ENOTTY) {
+            throw BuildErrnoError("failed to F_FULLFSYNC owner directory", label, error);
+        }
+        if (::fsync(fd) != 0) throw BuildErrnoError("failed to sync owner directory", label, errno);
+    }
+#else
+    if (::fsync(fd) != 0) throw BuildErrnoError("failed to sync owner directory", label, errno);
+#endif
+    NoteDirectorySynced(label);
+}
+#endif
+
 void SyncFilePath(const std::filesystem::path& path) {
     (void)SyncFileAt(path, false);
 }
