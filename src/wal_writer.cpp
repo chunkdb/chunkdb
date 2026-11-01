@@ -5,6 +5,7 @@
 #include <cerrno>
 #include <cstring>
 #include <fstream>
+#include <functional>
 #include <limits>
 #include <new>
 #include <stdexcept>
@@ -124,6 +125,54 @@ WalFrameBuilder::WalFrameBuilder(
         tlv_size_ = static_cast<std::uint16_t>(tlv_size_ + kWalTlvHeaderSize + user_size);
     }
     // The header CRC slot follows the TLV area.
+    batch_->resize(batch_->size() + kWalFrameHeaderCrcSize, 0U);
+    records_begin_ = batch_->size();
+}
+
+namespace {
+std::vector<std::uint8_t>* PrepareGroupedBatch(std::vector<std::uint8_t>* batch,
+    std::uint64_t schema_version, const std::vector<std::uint8_t>& tag,
+    std::optional<std::string_view> user, const WalGroupRef& group) {
+    if (batch == nullptr) throw std::invalid_argument("WAL batch must not be null");
+    if (&tag == batch) throw std::invalid_argument("grouped WAL tag must not alias its staging batch");
+    (void)SerializeWalGroupRef(group);
+    if (tag.size() > std::numeric_limits<std::uint16_t>::max() - 2U * kWalTlvHeaderSize - 8U)
+        throw std::invalid_argument("WAL frame tag is too long");
+    const auto user_size = user ? user->size() : 0U;
+    if (user_size > std::numeric_limits<std::uint16_t>::max())
+        throw std::invalid_argument("WAL frame user is too long");
+    if (user_size != 0U && !batch->empty()) {
+        const auto* first = reinterpret_cast<const std::uint8_t*>(user->data());
+        const auto* end = first + user_size;
+        const auto* batch_end = batch->data() + batch->size();
+        const std::less<const std::uint8_t*> before;
+        if (before(first, batch_end) && before(batch->data(), end))
+            throw std::invalid_argument("grouped WAL user must not alias its staging batch");
+    }
+    const auto tlv_bytes = (tag.empty() ? 0U : kWalTlvHeaderSize + tag.size()) +
+        (schema_version > 1U ? kWalTlvHeaderSize + 8U : 0U) +
+        (user_size == 0U ? 0U : kWalTlvHeaderSize + user_size) + kWalTlvHeaderSize + kWalGroupRefBytes;
+    if (tlv_bytes > std::numeric_limits<std::uint16_t>::max())
+        throw std::invalid_argument("WAL frame TLV area is too long");
+    const auto header_bytes = kWalFrameFixedHeaderSize + tlv_bytes + kWalFrameHeaderCrcSize;
+    if (header_bytes > batch->max_size() - batch->size())
+        throw std::length_error("WAL batch header exceeds its byte limit");
+    // Allocate before even the ordinary constructor can mutate this batch.
+    batch->reserve(batch->size() + header_bytes);
+    return batch;
+}
+}  // namespace
+
+WalFrameBuilder::WalFrameBuilder(std::vector<std::uint8_t>* batch, std::uint64_t schema_version,
+    const std::vector<std::uint8_t>& tag, std::optional<std::string_view> user,
+    bool gc, const WalGroupRef& group)
+    : WalFrameBuilder(PrepareGroupedBatch(batch, schema_version, tag, user, group), schema_version, tag, user, gc) {
+    const auto bytes = SerializeWalGroupRef(group);
+    batch_->resize(records_begin_ - kWalFrameHeaderCrcSize);
+    WriteLe16(*batch_, kWalTlvGroup);
+    WriteLe16(*batch_, static_cast<std::uint16_t>(bytes.size()));
+    batch_->insert(batch_->end(), bytes.begin(), bytes.end());
+    tlv_size_ = static_cast<std::uint16_t>(tlv_size_ + kWalTlvHeaderSize + bytes.size());
     batch_->resize(batch_->size() + kWalFrameHeaderCrcSize, 0U);
     records_begin_ = batch_->size();
 }

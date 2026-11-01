@@ -103,6 +103,7 @@ inline constexpr std::uint16_t kWalTlvTag = 1U;
 // frames of tables past version 1.
 inline constexpr std::uint16_t kWalTlvSchema = 2U;
 inline constexpr std::uint16_t kWalTlvUser = 3U;
+inline constexpr std::uint16_t kWalTlvGroup = 4U;
 inline constexpr std::uint64_t kWriterHeartbeatIntervalMs = 250;
 inline constexpr std::uint64_t kWriterStaleThresholdMs = 5000;
 inline constexpr std::uint64_t kAtomicTmpCurrentPidCleanupMinAgeMs = 500;

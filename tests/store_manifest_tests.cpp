@@ -184,7 +184,7 @@ void TestNewStoreRecordsGeometryAndId() {
     std::vector<std::string_view> enabled;
     for (const auto& feature : chunkdb::kFeatureRegistry)
         if ((manifest.features.incompat & feature.incompat) != 0U) enabled.push_back(feature.name);
-    assert(enabled == (std::vector<std::string_view>{"feed_slots", "table_lineage", "slot_filters", "chunk_model"}));
+    assert(enabled == (std::vector<std::string_view>{"feed_slots", "table_lineage", "slot_filters", "chunk_model", "commit_groups"}));
     // Every option is recorded, as the store was opened with it.
     const auto config = Config(data_dir, geometry);
     assert(manifest.options == chunkdb::EncodeTableOptions(chunkdb::TableOptions{
@@ -496,7 +496,7 @@ void RewriteManifest(
 // An unknown incompat bit refuses every open, an unknown ro_compat bit
 // refuses writing but allows reading, an unknown compat bit is ignored.
 void TestUnknownFeatureFlags(const std::string& server, const std::string& verify) {
-    const chunkdb::FeatureFlags incompat{.incompat = 1U << 6U, .ro_compat = 0, .compat = 0};
+    const chunkdb::FeatureFlags incompat{.incompat = 1U << 30U, .ro_compat = 0, .compat = 0};
     const chunkdb::FeatureFlags ro_compat{.incompat = 0, .ro_compat = 1U << 3U, .compat = 0};
     const chunkdb::FeatureFlags compat{.incompat = 0, .ro_compat = 0, .compat = 1U << 9U};
     // An option owned by the unknown feature: skipped, not corruption.
@@ -519,7 +519,7 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
             config = ReadOnly(config);
         }
         const auto message = ExpectRefused([&] { chunkdb::ChunkStore store(config); });
-        assert(Contains(message, "does not support (unknown incompat=0x40"));
+        assert(Contains(message, "does not support (unknown incompat=0x40000000"));
         assert(Tree(data_dir) == before);
     }
     assert(Run(verify, "--data-dir \"" + data_dir.string() + "\"", log, &output) == 1);
@@ -1024,7 +1024,7 @@ void TestNamedFeatureRegistry() {
     const chunkdb::FeatureFlags future{.incompat = bits | (1U << 30U), .ro_compat = 3, .compat = 7};
     const auto table = chunkdb::TableScopedFeatures(future);
     assert(table.incompat == chunkdb::kTableBaselineFeatures.incompat);
-    assert(table.incompat == 45U);
+    assert(table.incompat == 109U);
     assert(table.ro_compat == 0U && table.compat == 0U);
     assert(chunkdb::UnknownFeatures(future).incompat == (1U << 30U));
 }

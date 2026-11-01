@@ -227,6 +227,7 @@ class Table : public std::enable_shared_from_this<Table> {
     friend struct FeedTestAccess;
     friend struct BackupTestAccess;
     friend struct FeatureActivationTestAccess;
+    friend struct CatalogTxnTestAccess;
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);
     [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name, const FeedOptions& options,
         bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner);
@@ -253,6 +254,24 @@ class Table : public std::enable_shared_from_this<Table> {
     void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options,
                       bool check_feed_error = false);
     void ReleaseLease() noexcept;
+    // Snapshot capture drains ordinary admission without detaching the feed,
+    // closing the store or changing its maintenance owner.
+    class AdmissionPause {
+      public:
+        AdmissionPause(AdmissionPause&& other) noexcept;
+        AdmissionPause(const AdmissionPause&) = delete;
+        AdmissionPause& operator=(const AdmissionPause&) = delete;
+        ~AdmissionPause();
+        [[nodiscard]] ChunkStore& store() const noexcept { return *store_; }
+      private:
+        friend class Table;
+        AdmissionPause(std::shared_ptr<Table> table, std::shared_ptr<ChunkStore> store) noexcept;
+        std::shared_ptr<Table> table_;
+        std::shared_ptr<ChunkStore> store_;
+    };
+    [[nodiscard]] AdmissionPause PauseAdmission(
+        std::chrono::steady_clock::time_point deadline, std::stop_token cancelled);
+    void ResumeAdmission() noexcept;
     void FailFeed(std::exception_ptr error);
     class BackupPin {
       public:
@@ -329,11 +348,17 @@ class Table : public std::enable_shared_from_this<Table> {
     std::shared_ptr<std::atomic<std::size_t>> slot_output_bytes_ = std::make_shared<std::atomic<std::size_t>>(0U);
 };
 
+struct CatalogTxnSnapshot {
+    std::shared_ptr<Table> table;
+    std::unique_ptr<TxnSnapshot> snapshot;
+};
+
 // The tables of one data directory (docs/STORAGE_FORMAT.md Section 1):
 // `chunkdb.manifest`, the writer lock, and one store per `tables/<name>/`.
 // Tables share one StoreResources, so the cache and WAL-stream budgets cover
 // all of them.
 class TableCatalog {
+    friend struct CatalogTxnTestAccess;
   public:
     // Opens (a writer creates when new) the data directory and every table
     // in it; a writer that finds no table creates `default`.
@@ -356,6 +381,11 @@ class TableCatalog {
 
     // nullptr when there is no such table.
     [[nodiscard]] std::shared_ptr<Table> Find(std::string_view name) const;
+    // Captures one common directory boundary before the first transaction
+    // statement. Callers hold no table lease; later reads use these original
+    // snapshots even when they first touch a table in a later statement.
+    [[nodiscard]] std::vector<CatalogTxnSnapshot> CaptureTxnSnapshots(
+        std::chrono::milliseconds max_duration, std::stop_token cancelled = {});
     // Sorted by name.
     [[nodiscard]] std::vector<TableInfo> List() const;
     [[nodiscard]] std::size_t TableCount() const;

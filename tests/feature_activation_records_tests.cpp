@@ -138,6 +138,37 @@ void RuntimeActivation() {
     }
 }
 
+void CommitGroupOwnership() {
+    test::ScopedTempDir dir("chunkdb-commit-group-feature");
+    (void)Seed(dir.path());
+    const auto before_directory = *ReadDataDirManifest(dir.path());
+    const auto before_alpha = *ReadStoreManifest(dir.path() / "tables/alpha");
+    const auto before_beta = *ReadStoreManifest(dir.path() / "tables/beta");
+    CatalogConfig config; config.data_dir = dir.path();
+    {
+        TableCatalog catalog(config);
+        assert(catalog.EnableFeature("commit_groups"));
+        assert(!catalog.EnableFeature("commit_groups"));
+        for (const auto& name : {"alpha", "beta"}) {
+            const auto lease = catalog.Find(name)->Acquire();
+            assert((lease->store().features().incompat & kFeatureCommitGroups) != 0U);
+        }
+        const auto created = catalog.Create("gamma", {1U, 1U, 2U, 2U, 8U}, config.default_options);
+        assert((created->Acquire()->store().features().incompat & kFeatureCommitGroups) != 0U);
+    }
+    const auto directory = *ReadDataDirManifest(dir.path());
+    assert(directory.data_dir_id == before_directory.data_dir_id);
+    assert(directory.features.incompat == (before_directory.features.incompat | kFeatureCommitGroups));
+    assert(directory.features.compat == before_directory.features.compat);
+    for (const auto& [name, before] : {std::pair{"alpha", before_alpha}, std::pair{"beta", before_beta}}) {
+        const auto after = *ReadStoreManifest(dir.path() / "tables" / name);
+        assert(after.store_id == before.store_id && after.options == before.options);
+        assert(after.features.incompat == (before.features.incompat | kFeatureCommitGroups));
+        assert(after.features.compat == before.features.compat);
+    }
+    assert(!ReadFeatureActivationJournal(dir.path()));
+}
+
 void RuntimeAdmissionAndRecovery() {
     test::ScopedTempDir dir("chunkdb-feature-admission");
     auto journal = Seed(dir.path());
@@ -436,5 +467,5 @@ int main(int argc, char** argv) {
         return 3;
     }
     assert(argc == 1);
-    RuntimeActivation(); RuntimeAdmissionAndRecovery(); RuntimePublishedFailure(); MetadataAdmission(); Codec(); ValidationBeforePublication(); RecoveryPreservesCurrentMetadata(); DirectoryOnlyActivation(); BootstrapCrashRecovery(argv[0]); CrashRecovery(argv[0]);
+    RuntimeActivation(); CommitGroupOwnership(); RuntimeAdmissionAndRecovery(); RuntimePublishedFailure(); MetadataAdmission(); Codec(); ValidationBeforePublication(); RecoveryPreservesCurrentMetadata(); DirectoryOnlyActivation(); BootstrapCrashRecovery(argv[0]); CrashRecovery(argv[0]);
 }

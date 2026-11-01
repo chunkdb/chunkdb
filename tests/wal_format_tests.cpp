@@ -917,6 +917,76 @@ void TestSlotFrameGuards() {
     assert(largest_info.user == valid_user);
 }
 
+void TestGroupFrameAdmission() {
+    const chunkdb::FeatureFlags groups{.incompat = chunkdb::kFeatureChunkModel | chunkdb::kFeatureCommitGroups};
+    const chunkdb::WalGroupRef reference{kStoreId, UINT64_MAX, UINT64_MAX - 1U};
+    const auto encoded = chunkdb::SerializeWalGroupRef(reference);
+    const auto group_tlv = Tlv(chunkdb::kWalTlvGroup, Bytes(encoded.begin(), encoded.end()));
+    const auto frame = BuildFrame(7U, 99U, group_tlv, {Span(0U, {0xAA})});
+    const auto info = chunkdb::InspectFeedFrame(frame, kGeometry, groups);
+    assert(info.group == reference && info.revision == 7U && info.commit_time_ms == 99U);
+    Bytes built;
+    chunkdb::WalFrameBuilder builder(&built, 1U, {}, {}, false, reference);
+    const std::uint8_t value = 0xAA;
+    builder.AppendSpan(0U, &value, 1U);
+    (void)builder.Finish(7U, 99U);
+    assert(built == frame);
+
+    const auto refuse_replay = [&](const Bytes& candidate, chunkdb::FeatureFlags features, std::string_view reason) {
+        // A group appended to an older WAL is admitted by its owning table's
+        // current feature mask rather than silently skipped as an extension.
+        auto wal = Header();
+        Append(&wal, candidate);
+        Bytes payload;
+        Bytes presence;
+        const auto result = Replay(wal, &payload, &presence, features);
+        assert(result.applied_frames == 0U && result.skipped_frames == 0U && result.stop_reason == reason);
+        assert(result.valid_end == chunkdb::kWalHeaderSize && !result.stopped_at_crash_tail);
+        assert(payload == Bytes(kPayloadBytes, 0U) && presence == Bytes(kPresenceBytes, 0U));
+    };
+    refuse_replay(frame, groups, "frame_group_unresolved");
+    refuse_replay(frame, kBaseFeatures, "tlv_group_without_feature");
+    auto unknown_owner = kBaseFeatures;
+    unknown_owner.compat = 1U << 31U;
+    refuse_replay(frame, unknown_owner, "tlv_group_without_feature");
+
+    auto duplicate = group_tlv;
+    Append(&duplicate, group_tlv);
+    refuse_replay(BuildFrame(7U, 99U, duplicate, {Span(0U, {0xAA})}), groups, "tlv_duplicate_group");
+    for (const auto length : {0U, 31U, 33U}) {
+        refuse_replay(BuildFrame(7U, 99U, Tlv(chunkdb::kWalTlvGroup, Bytes(length, 1U)),
+            {Span(0U, {0xAA})}), groups, "tlv_group_invalid");
+    }
+    for (const auto& invalid : {chunkdb::WalGroupRef{}, chunkdb::WalGroupRef{kStoreId, 0U, 0U},
+            chunkdb::WalGroupRef{kStoreId, 2U, 2U}}) {
+        Bytes batch{1U, 2U};
+        const auto before = batch;
+        bool rejected = false;
+        try { chunkdb::WalFrameBuilder bad(&batch, 1U, {}, {}, false, invalid); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        assert(rejected && batch == before);
+    }
+    Bytes batch{1U, 2U};
+    const auto before = batch;
+    bool rejected = false;
+    try {
+        // The user alone fits, but adding the group must fail before changing
+        // the caller's already staged bytes.
+        const std::string user(65531U, 'a');
+        chunkdb::WalFrameBuilder too_long(&batch, 1U, {}, user, false, reference);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected && batch == before);
+
+    chunkdb::ChunkState state;
+    state.payload.assign(kPayloadBytes, 0U);
+    state.presence_bitmap.assign(kPresenceBytes, 0U);
+    const auto state_before = state.payload;
+    rejected = false;
+    try { (void)chunkdb::ReplayFeedFrame(frame, kGeometry, &state, groups); }
+    catch (const std::runtime_error&) { rejected = true; }
+    assert(rejected && state.payload == state_before && !state.written && state.version == 0U);
+}
+
 void TestCommitTimeSurvivesReload() {
     ScopedTempDir dir("chunkdb-wal-commit-time");
     const auto config = StoreConfig(dir.path(), chunkdb::DurabilityMode::kFsyncWal);
@@ -993,5 +1063,6 @@ int main(int argc, char** argv) {
     TestSlotFrameMetadata();
     TestSlotCollectionCannotDeletePresentState();
     TestSlotFrameGuards();
+    TestGroupFrameAdmission();
     return 0;
 }

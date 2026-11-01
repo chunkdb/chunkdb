@@ -61,7 +61,7 @@ inline constexpr std::uint16_t kOptionParentEpoch = 10;            // 16-byte st
 inline constexpr std::uint16_t kOptionForkRevision = 11;           // u64, including zero
 
 struct StoreManifest {
-    FeatureFlags features{.incompat = kFeatureChunkModel};
+    FeatureFlags features{.incompat = kFeatureChunkModel | kFeatureCommitGroups};
     // block_bits is the schema's fixed bits per block; ParseStoreManifest
     // fills it in and SerializeStoreManifest requires it to match.
     GeometryConfig geometry;
@@ -134,7 +134,7 @@ inline constexpr std::size_t kDataDirManifestMinSize = 44;
 inline constexpr std::size_t kDataDirManifestMaxSize = 64U * 1024U;
 
 struct DataDirManifest {
-    FeatureFlags features{.incompat = kFeatureChunkModel};
+    FeatureFlags features{.incompat = kFeatureChunkModel | kFeatureCommitGroups};
     StoreId data_dir_id{};
     std::vector<std::uint8_t> options;
 };

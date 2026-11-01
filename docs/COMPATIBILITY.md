@@ -47,6 +47,7 @@ Later 2.x servers still open valid 2.0 data.
 | `slot_filters` | Tables: stable projection IDs and persisted filters. | Before bit `0x8` was enabled. |
 | `feature_activation` | Directory: checked activation decisions. | Before bit `0x10` was enabled. |
 | `chunk_model` | Directory and tables: dimensional geometry, both column domains, sectioned forms, and retained coordinate decisions. | No conversion to an earlier development layout. |
+| `commit_groups` | Directory and tables: checked group decisions, grouped WAL frames, durability receipts and retained result identities. | A build without this feature refuses both the directory and affected tables. |
 
 A reader or writer must support every recorded incompatibility bit, even when its owned records are absent.
 To use a binary lacking a feature, restore the whole consistent backup identified above.

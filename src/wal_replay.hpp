@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "chunk_store_internal.hpp"
+#include "commit_group_identity.hpp"
 
 namespace chunkdb {
 
@@ -57,6 +58,7 @@ struct FeedFrameInfo {
     std::uint64_t schema_version;
     std::optional<std::string> user{};
     bool gc = false;
+    std::optional<WalGroupRef> group{};
 };
 // Validates the whole frame's framing and records without applying state.
 [[nodiscard]] FeedFrameInfo InspectFeedFrame(
