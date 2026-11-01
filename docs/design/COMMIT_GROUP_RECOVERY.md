@@ -44,6 +44,8 @@ Group preparation reserves reference-storage bytes before mutation and refuses a
 One checkpoint writes its changed leaf pages and ancestor paths, rather than rewriting every table's coverage.
 Object traversal detects duplicate keys, cycles, missing pages, invalid child ranges and counts inconsistent with measured extents before publishing owned state.
 The exact page codec and its sparse oversized-file tests precede owner implementation.
+The owner-state codec additionally requires a nonzero matching directory and owner identity, a nonzero generation, no selected objects or pending plan in INACTIVE, and complete selected contexts in ACTIVE.
+Its transition validator refuses owner changes, generation reuse, ACTIVE-to-INACTIVE replacement and an incompatible pending predecessor before publication.
 
 ## First use and complete discovery
 
@@ -242,6 +244,11 @@ An expired, evicted or split binding remains absent even if its source seal is r
 
 ## Required failure checks
 
+Bootstrap tests crash around inactive-root name sync and CREATE or ENABLE FEATURE manifest publication, then verify that no table lease can observe a missing claimed owner.
+First-use tests hold a direct conditional table lease while catalog exclusive admission waits, activate through the independent owner root, and prove that no reverse catalog-lock acquisition occurs.
+Activation tests crash before and after ACTIVE publication and its directory sync, assert that no GROUP frame precedes confirmed activation, and retain lazy startup for an unused INACTIVE root.
+Concurrent checkpoint and ID-generation updates stage from the same root, then prove that only one pending continuation owns installation and the other re-admits rather than losing either leaf.
+Buffer tests retain real user-space buffered bytes, then require their flush before relaxed decision publication and their exact writable native generation during settlement after canonical replacement.
 Discovery tests crash after different-table member appends and a newly orphaned coordinate but before any decision, then prove that all discovery and validation precedes every repair.
 Journal tests crash after selecting the new generation and before the ID cursor alias is installed, then require one matching context without reviving an expired or rolled-back incarnation.
 Checkpoint tests crash before and after staged-name sync, pending root, each artifact replacement, final root and reclamation, including a member superseded by an ordinary write before restart.
