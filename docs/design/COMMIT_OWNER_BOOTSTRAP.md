@@ -71,6 +71,14 @@ An existing unpublished empty inventory fixes the standalone epoch and must agre
 An owner root without a matching creation decision and manifest is damage, not an alternative source of fresh identities.
 Unrelated foreign entries retain the existing ignore rules and remain untouched.
 
+A matching pending decision also owns interrupted native publication staging for its exact manifest target, and, for standalone creation only, the checked empty CKII target derived from that manifest's epoch and dimensions.
+Only the established `target.tmp.pid.thread.time.sequence` spelling with four canonical bounded decimal components is admitted for those two fixed target families.
+Each candidate is opened relative to the pinned native root without following a leaf link or reparse point; it must be plain, no longer than its exact target, and byte-for-byte equal to a prefix of that target, including a zero-length interrupted creation.
+Wrong complete bytes, a wrong prefix, an unrelated temporary family, or unsafe native admission refuses before any publication or cleanup.
+Temporary bytes never select identities or state: recovery recreates targets only from the checked decision and its derived empty inventory.
+All temporary, manifest, root and inventory sources are admitted before mutation; existing stale-temporary cleanup may run only after this complete admission and must not remove an unadmitted candidate through a generic prefix rule.
+The crash matrix includes the existing before/after manifest-publication cuts, empty-inventory temporary file sync, exact and partial prefixes, wrong-byte and unsafe-leaf refusal, and a later invalid root leaving every earlier candidate unchanged.
+
 Creation publishes in this order while no store or table lease can escape:
 
 1. Validate the complete plan and current owned namespace, then durably publish the decision file and its parent name.
