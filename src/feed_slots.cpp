@@ -1,22 +1,21 @@
 #include "feed_slots.hpp"
 
 #include <algorithm>
+#include <charconv>
 #include <limits>
-#include <fstream>
 #include <map>
-#include <regex>
-#include <cstring>
 
 #include "change_feed.hpp"
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/file_layout.hpp"
-#include "chunkdb/crc32.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
 #include "feed_archive.hpp"
 #include "wal_replay.hpp"
+#include "chunk_coordinate_index.hpp"
+#include "shared_file_input.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -33,28 +32,55 @@ struct Segment {
     std::uint64_t bytes;
     ChunkCoord coord;
     std::uint64_t first;
+    std::filesystem::path descriptor;
 };
-std::vector<Segment> Segments(const std::filesystem::path& root) {
+bool Number(std::string_view text, std::uint64_t* value) {
+    if (text.empty()) return false;
+    const auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), *value);
+    return error == std::errc{} && end == text.data() + text.size();
+}
+std::optional<std::pair<ChunkCoord, std::uint64_t>> BaseName(std::string_view name, std::uint8_t dims) {
+    if (name.ends_with(".base")) {
+        ChunkCoord coord;
+        std::uint64_t first = 0U;
+        if (!ParseArchiveBaseFileName(name, dims, &coord, &first)) return std::nullopt;
+        return std::make_pair(coord, first);
+    }
+    if (!name.ends_with(".chk")) return std::nullopt;
+    name.remove_suffix(4U);
+    const auto dot = name.find('.');
+    ChunkCoord coord;
+    std::uint64_t first = 0U;
+    if (dot == std::string_view::npos || !ParseChunkFileStem(name.substr(0U, dot), dims, &coord) ||
+        !Number(name.substr(dot + 1U), &first) || first == 0U) return std::nullopt;
+    return std::make_pair(coord, first);
+}
+std::vector<Segment> Segments(const std::filesystem::path& root, std::uint8_t dims) {
     const auto directory = root / kFeedArchiveDirName;
     if (!std::filesystem::exists(directory)) return {};
-    static const std::regex pattern(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.([0-9]+)-([0-9]+)\.wal$)");
     std::vector<Segment> result;
     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-        std::smatch match;
-        const auto name = entry.path().filename().string();
-        if (!std::regex_match(name, match, pattern)) continue;
-        const auto first = std::stoull(match[3].str()), last = std::stoull(match[4].str());
+        auto name = entry.path().filename().string();
+        if (!name.ends_with(".wal")) continue;
+        name.resize(name.size() - 4U);
+        const auto dot = name.find('.'), dash = name.find('-', dot);
+        ChunkCoord coord;
+        std::uint64_t first = 0U, last = 0U;
+        if (dot == std::string::npos || dash == std::string::npos ||
+            !ParseChunkFileStem(std::string_view(name).substr(0U, dot), dims, &coord) ||
+            !Number(std::string_view(name).substr(dot + 1U, dash - dot - 1U), &first) ||
+            !Number(std::string_view(name).substr(dash + 1U), &last)) continue;
         if (first == 0U || last < first) throw std::runtime_error("invalid archived WAL range: " + name);
-        const auto base = directory / ("C_" + match[1].str() + "_" + match[2].str() + "." + match[3].str() + ".chk");
+        const auto base = directory / (ChunkFileStem(coord, dims) + "." + std::to_string(first) + ".chk");
+        const auto descriptor = directory / ArchiveBaseFileName(coord, dims, first);
         auto bytes = std::filesystem::file_size(entry.path());
-        if (std::filesystem::exists(base)) {
-            const auto base_bytes = std::filesystem::file_size(base);
+        for (const auto& artifact : {base, descriptor}) if (std::filesystem::exists(artifact)) {
+            const auto base_bytes = std::filesystem::file_size(artifact);
             if (base_bytes > std::numeric_limits<std::uint64_t>::max() - bytes)
                 throw std::runtime_error("feed archive size overflow");
             bytes += base_bytes;
         }
-        result.push_back({entry.path(), base, last, bytes,
-                          {std::stoll(match[1].str()), std::stoll(match[2].str())}, first});
+        result.push_back({entry.path(), base, last, bytes, coord, first, descriptor});
     }
     return result;
 }
@@ -130,7 +156,8 @@ void FeedSlotTestAccess::SetHook(Table& table, FeedSlotTestHook* hook) {
 
 FeedSlots::FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::milliseconds interval)
     : store_(store), max_bytes_(max_bytes), interval_(interval),
-      records_(ReadFeedSlotRecords(store.data_dir_, store.store_id_).value_or(FeedSlotRecords{store.store_id_, 0U, {}})),
+      records_(ReadFeedSlotRecords(store.data_dir_, store.store_id_, store.geometry_.dims()).value_or(
+          FeedSlotRecords{store.store_id_, 0U, {}, false, store.geometry_.dims()})),
       readers_(ReaderPins(store.store_id_)) {
     if (max_bytes_ == 0U || interval_.count() <= 0)
         throw std::invalid_argument("slot limits and sync interval must be positive");
@@ -161,61 +188,66 @@ FeedSlots::FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::mill
         Retain();
     }
 }
+
+void FeedSlotTestAccess::EnableChunkForms(FeedArchiveReader& reader, std::size_t budget) {
+    reader.EnableChunkForms(budget);
+}
+void FeedSlotTestAccess::SetEntryBudget(FeedArchiveReader& reader, std::size_t budget) {
+    reader.SetEntryBudget(budget);
+}
 FeedSlots::~FeedSlots() { Stop(); }
 bool FeedSlots::active() const noexcept { return store_.feed_slots_active_.load(std::memory_order_acquire); }
 bool FeedSlots::ArchiveRequired() const noexcept {
     return active() || readers_->load(std::memory_order_acquire) != 0U;
 }
-void FeedSlots::RecoverAliases() {
-    for (const auto& segment : Segments(store_.data_dir_)) {
-        const auto live = ChunkWalPath(store_.data_dir_, store_.geometry_, segment.coord);
-        if (!std::filesystem::exists(live)) continue;
-        if (!std::filesystem::equivalent(live, segment.wal)) {
-            std::ifstream file(live, std::ios::binary);
-            if (!file) throw std::runtime_error("cannot inspect live archive segment " + live.string());
-            const auto live_bytes = LoadFile(live);
-            if (live_bytes.size() >= kWalHeaderSize + kWalFrameFixedHeaderSize) {
-                ValidateWalHeader(live_bytes, segment.coord, store_.store_id_, store_.features_);
-                const auto at = kWalHeaderSize;
-                const std::uint64_t header_size = kWalFrameFixedHeaderSize + static_cast<std::uint64_t>(ReadLe16(live_bytes, at + 22U)) + kWalFrameHeaderCrcSize;
-                const std::uint64_t size = header_size + ReadLe32(live_bytes, at + 28U) + kWalFrameTrailerSize;
-                // Trust a revision only after both checksums prove a complete
-                // first frame. Incomplete/cut first appends remain under the
-                // ordinary recovery parser's crash-tail policy.
-                if (size > live_bytes.size() - at ||
-                    std::memcmp(live_bytes.data() + at, kWalFrameMagic, kWalFrameMagicSize) != 0 ||
-                    Crc32(live_bytes.data() + at + kWalFrameMagicSize, static_cast<std::size_t>(header_size) - kWalFrameMagicSize - kWalFrameHeaderCrcSize) !=
-                        ReadLe32(live_bytes, at + static_cast<std::size_t>(header_size) - kWalFrameHeaderCrcSize) ||
-                    Crc32(live_bytes.data() + at + static_cast<std::size_t>(header_size), ReadLe32(live_bytes, at + 28U)) !=
-                        ReadLe32(live_bytes, at + static_cast<std::size_t>(size) - kWalFrameTrailerSize)) continue;
-                const std::vector<std::uint8_t> frame(live_bytes.begin() + static_cast<std::ptrdiff_t>(at),
-                    live_bytes.begin() + static_cast<std::ptrdiff_t>(at + size));
-                if (InspectFeedFrame(frame, store_.geometry_, store_.features_).revision <= segment.last)
+void FeedSlots::ValidateRecoveryAliases(const ChunkStore& store) {
+    auto segments = Segments(store.data_dir(), store.geometry().dims());
+    std::sort(segments.begin(), segments.end(), [](const auto& first, const auto& second) {
+        return first.coord < second.coord || (first.coord == second.coord && first.first < second.first);
+    });
+    for (std::size_t i = 0U; i < segments.size(); ++i) {
+        const auto& segment = segments[i];
+        SharedFileInput file(segment.wal);
+        file.seekg(0, std::ios::end);
+        const auto measured = file.tellg();
+        if (!file || measured < 0) throw std::runtime_error("cannot measure aliased archive WAL");
+        const auto info = InspectWalStream(file, static_cast<std::uint64_t>(measured), store.geometry(), segment.coord,
+            store.store_id(), store.features());
+        if (info.first != segment.first || info.last != segment.last)
+            throw std::runtime_error("aliased archive WAL range disagrees with its name");
+        if (i != 0U && segments[i - 1U].coord == segment.coord && segments[i - 1U].last >= segment.first)
+            throw std::runtime_error("archived WAL ranges overlap");
+    }
+    for (std::size_t begin = 0U; begin < segments.size();) {
+        auto end = begin + 1U;
+        while (end < segments.size() && segments[end].coord == segments[begin].coord) ++end;
+        const auto live = ChunkWalPath(store.data_dir(), store.geometry(), segments[begin].coord);
+        if (std::filesystem::exists(live)) {
+            bool alias = false;
+            for (auto at = begin; at < end; ++at)
+                if (std::filesystem::equivalent(live, segments[at].wal)) { alias = true; break; }
+            if (!alias) {
+                SharedFileInput file(live);
+                file.seekg(0, std::ios::end);
+                const auto measured = file.tellg();
+                if (!file || measured < 0) throw std::runtime_error("cannot inspect live archive segment " + live.string());
+                const auto first = InspectFirstWalFrameStream(file, static_cast<std::uint64_t>(measured), store.geometry(),
+                    segments[begin].coord, store.store_id(), store.features());
+                if (first && first->revision <= segments[end - 1U].last)
                     throw std::runtime_error("independent live WAL overlaps an archived segment");
             }
-            continue;
         }
-        // A power loss during the cross-directory rename may preserve both
-        // hard-linked names. Validate the immutable archive's declared range
-        // before dropping the live alias; an append must never modify it.
-        const auto bytes = LoadFile(segment.wal);
-        ValidateWalHeader(bytes, segment.coord, store_.store_id_, store_.features_);
-        std::uint64_t first = 0U, last = 0U;
-        for (std::size_t at = kWalHeaderSize; at < bytes.size();) {
-            if (bytes.size() - at < kWalFrameFixedHeaderSize) throw std::runtime_error("partial aliased archive WAL");
-            const std::uint64_t size = kWalFrameFixedHeaderSize + static_cast<std::uint64_t>(ReadLe16(bytes, at + 22U)) +
-                kWalFrameHeaderCrcSize + ReadLe32(bytes, at + 28U) + kWalFrameTrailerSize;
-            if (size > bytes.size() - at) throw std::runtime_error("partial aliased archive WAL");
-            const std::vector<std::uint8_t> frame(bytes.begin() + static_cast<std::ptrdiff_t>(at),
-                bytes.begin() + static_cast<std::ptrdiff_t>(at + size));
-            const auto info = InspectFeedFrame(frame, store_.geometry_, store_.features_);
-            if (info.revision <= last) throw std::runtime_error("aliased archive WAL revisions do not increase");
-            if (first == 0U) first = info.revision;
-            last = info.revision;
-            at += static_cast<std::size_t>(size);
-        }
-        if (first != segment.first || last != segment.last)
-            throw std::runtime_error("aliased archive WAL range disagrees with its name");
+        begin = end;
+    }
+}
+
+void FeedSlots::RecoverAliases() {
+    ValidateRecoveryAliases(store_);
+    for (const auto& segment : Segments(store_.data_dir_, store_.geometry_.dims())) {
+        const auto live = ChunkWalPath(store_.data_dir_, store_.geometry_, segment.coord);
+        if (!std::filesystem::exists(live) || !std::filesystem::equivalent(live, segment.wal)) continue;
+        // Complete admission precedes every removal, including when one live
+        // name aliases an earlier member of a multi-segment archive.
         ChunkStore::SnapshotGenerationWriteGuard generation(&store_);
         std::filesystem::remove(live);
         SyncDirectoryPath(live.parent_path());
@@ -391,18 +423,17 @@ std::vector<std::uint64_t> FeedSlots::RetainedBytes(const std::vector<std::uint6
     constexpr auto kMax = std::numeric_limits<std::uint64_t>::max();
     const auto add = [](std::uint64_t bytes, std::uint64_t more) { return more > kMax - bytes ? kMax : bytes + more; };
     // One listing serves every slot; the publish and records locks keep it current.
-    const auto segments = Segments(store_.data_dir_);
+    const auto segments = Segments(store_.data_dir_, store_.geometry_.dims());
     // A base linked for a live WAL that is not archived yet counts for every position.
     std::uint64_t bases = 0U;
     const auto directory = store_.data_dir_ / kFeedArchiveDirName;
     if (std::filesystem::exists(directory)) {
-        static const std::regex base_name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.([0-9]+)\.chk$)");
         for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-            std::smatch match;
-            const auto name = entry.path().filename().string();
-            if (!std::regex_match(name, match, base_name) ||
-                std::any_of(segments.begin(), segments.end(), [&](const auto& segment) { return segment.base == entry.path(); })) continue;
-            const ChunkCoord coord{std::stoll(match[1].str()), std::stoll(match[2].str())};
+            const auto base = BaseName(entry.path().filename().string(), store_.geometry_.dims());
+            if (!base ||
+                std::any_of(segments.begin(), segments.end(), [&](const auto& segment) {
+                    return segment.base == entry.path() || segment.descriptor == entry.path(); })) continue;
+            const auto coord = base->first;
             if (!std::filesystem::exists(ChunkWalPath(store_.data_dir_, store_.geometry_, coord))) continue;
             bases = add(bases, std::filesystem::file_size(entry.path()));
         }
@@ -480,6 +511,8 @@ FeedArchiveReader FeedSlots::ReaderCompletedPrefix(std::string_view slot_name, F
     {
         std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
         prefixes = prefix_index_.Capture(through);
+        for (auto& prefix : prefixes)
+            prefix.retained_empty = store_.RetainedEmptyBoundaryForArchive(prefix.coord);
     }
     std::erase_if(prefixes, [&](const auto& prefix) { return prefix.last <= after.revision; });
     // The caller holds a shared table lease, so geometry/store identity remain
@@ -584,23 +617,23 @@ void FeedSlots::Retain() {
     std::uint64_t minimum = std::numeric_limits<std::uint64_t>::max();
     for (const auto& slot : records_.slots) if (!slot.lost) minimum = std::min(minimum, slot.written);
     bool removed = false;
-    for (const auto& segment : Segments(store_.data_dir_)) {
+    for (const auto& segment : Segments(store_.data_dir_, store_.geometry_.dims())) {
         if (segment.last > minimum) continue;
         std::filesystem::remove(segment.wal);
         std::filesystem::remove(segment.base);
+        std::filesystem::remove(segment.descriptor);
         removed = true;
     }
     const auto directory = store_.data_dir_ / kFeedArchiveDirName;
     if (std::filesystem::exists(directory)) {
-        static const std::regex base_name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.([0-9]+)\.chk$)");
-        const auto retained = Segments(store_.data_dir_);
+        const auto retained = Segments(store_.data_dir_, store_.geometry_.dims());
         for (const auto& entry : std::filesystem::directory_iterator(directory)) {
-            std::smatch match;
-            const auto name = entry.path().filename().string();
-            if (!std::regex_match(name, match, base_name)) continue;
-            const auto first = std::stoull(match[3].str());
-            if (first > minimum || std::any_of(retained.begin(), retained.end(), [&](const auto& segment) { return segment.base == entry.path(); })) continue;
-            const ChunkCoord coord{std::stoll(match[1].str()), std::stoll(match[2].str())};
+            const auto base = BaseName(entry.path().filename().string(), store_.geometry_.dims());
+            if (!base) continue;
+            const auto first = base->second;
+            if (first > minimum || std::any_of(retained.begin(), retained.end(), [&](const auto& segment) {
+                    return segment.base == entry.path() || segment.descriptor == entry.path(); })) continue;
+            const auto coord = base->first;
             // A linked base can precede its WAL archive after a crash. Keep it
             // while any live WAL for this chunk might still require it.
             if (std::filesystem::exists(ChunkWalPath(store_.data_dir_, store_.geometry_, coord))) continue;
@@ -614,22 +647,13 @@ void FeedSlots::Retain() {
 std::filesystem::path FeedSlots::PrepareArchive(ChunkCoord coord) {
     const auto wal_path = ChunkWalPath(store_.data_dir_, store_.geometry_, coord);
     if (!std::filesystem::exists(wal_path)) return {};
-    const auto wal = LoadFile(wal_path);
-    ValidateWalHeader(wal, coord, store_.store_id_, store_.features_);
-    std::uint64_t first = 0U, last = 0U;
-    for (std::size_t at = kWalHeaderSize; at < wal.size();) {
-        if (wal.size() - at < kWalFrameFixedHeaderSize) throw std::runtime_error("partial WAL cannot be archived");
-        const std::uint64_t size = kWalFrameFixedHeaderSize + static_cast<std::uint64_t>(ReadLe16(wal, at + 22U)) +
-                                   kWalFrameHeaderCrcSize + ReadLe32(wal, at + 28U) + kWalFrameTrailerSize;
-        if (size > wal.size() - at) throw std::runtime_error("partial WAL cannot be archived");
-        const std::vector<std::uint8_t> frame(wal.begin() + static_cast<std::ptrdiff_t>(at),
-            wal.begin() + static_cast<std::ptrdiff_t>(at + size));
-        const auto info = InspectFeedFrame(frame, store_.geometry_, store_.features_);
-        if (info.revision <= last) throw std::runtime_error("archive WAL revisions do not increase");
-        if (first == 0U) first = info.revision;
-        last = info.revision;
-        at += static_cast<std::size_t>(size);
-    }
+    SharedFileInput wal(wal_path);
+    wal.seekg(0, std::ios::end);
+    const auto measured = wal.tellg();
+    if (!wal || measured < 0) throw std::runtime_error("cannot measure archive WAL");
+    const auto info = InspectWalStream(wal, static_cast<std::uint64_t>(measured), store_.geometry_, coord,
+        store_.store_id_, store_.features_);
+    const auto [first, last, first_schema] = info;
     if (first == 0U) return {};
     const auto directory = store_.data_dir_ / kFeedArchiveDirName;
     if (!archive_dir_prepared_.load(std::memory_order_acquire)) {
@@ -642,24 +666,75 @@ std::filesystem::path FeedSlots::PrepareArchive(ChunkCoord coord) {
         }
         archive_dir_prepared_.store(true, std::memory_order_release);
     }
-    const auto stem = "C_" + std::to_string(coord.x) + "_" + std::to_string(coord.y) + "." + std::to_string(first);
+    const auto stem = ChunkFileStem(coord, store_.geometry_.dims()) + "." + std::to_string(first);
     const auto base = directory / (stem + ".chk");
+    const auto descriptor_path = directory / ArchiveBaseFileName(coord, store_.geometry_.dims(), first);
     const auto image = ChunkDataPath(store_.data_dir_, store_.geometry_, coord);
-    if (!std::filesystem::exists(base) && std::filesystem::exists(image)) {
-        const auto state = ParseChunkImage(LoadFile(image), store_.geometry_, coord, store_.store_id_, store_.features_);
-        // On retry a published image already contains this WAL. The original
-        // base was absent, so this newer image must never become its base.
-        if (state.revision < first) {
+    if (const auto existing = ReadFeedArchiveBaseDescriptor(descriptor_path, store_.geometry_, store_.store_id_, coord, first)) {
+        if (existing->base_schema > first_schema) throw std::runtime_error("archive base schema exceeds its first frame");
+        if (existing->kind == ArchiveBaseKind::kImage) {
+            (void)ReadPinnedFeedArchiveBase(base, store_.geometry_, store_.store_id_, coord, store_.features_, *existing);
+            SyncFilePath(base);
+        }
+        else if (std::filesystem::exists(base)) throw std::runtime_error("non-image archive base has an unexpected pinned image");
+        // A failed atomic rename can leave a visible descriptor whose
+        // directory sync is still owed. Repay it before replacing its base.
+        SyncFilePath(descriptor_path);
+        SyncDirectoryPath(directory);
+    } else {
+        ArchiveBaseDescriptor descriptor{.dims = store_.geometry_.dims(), .epoch = store_.store_id_,
+            .coord = coord, .first = first, .base_schema = first_schema};
+        std::optional<ChunkStateImage> original;
+        std::vector<std::uint8_t> original_bytes;
+        bool covered = false;
+        const bool pinned = std::filesystem::exists(base);
+        const auto source = pinned ? base : image;
+        if (std::filesystem::exists(source)) {
+            auto bytes = LoadChunkImageFile(source, store_.geometry_, coord, store_.store_id_, store_.features_);
+            auto state = ParseChunkImage(bytes, store_.geometry_, coord, store_.store_id_, store_.features_);
+            if (state.revision < first) { original = std::move(state); original_bytes = std::move(bytes); }
+            else covered = true;
+        }
+        if (pinned) {
+            if (!original || !std::filesystem::exists(image))
+                throw std::runtime_error("staged archive image has no original live image");
+            const auto current = LoadChunkImageFile(image, store_.geometry_, coord, store_.store_id_, store_.features_);
+            if (current != original_bytes)
+                throw std::runtime_error("staged archive image differs from the original live image");
+        }
+        const auto retained = store_.RetainedEmptyBoundaryForArchive(coord);
+        if (retained && retained->revision >= first) covered = true;
+        if (retained && retained->revision < first && (!original || retained->revision >= original->revision)) {
+            if (pinned) throw std::runtime_error("staged archive image precedes its retained empty base");
+            descriptor.kind = ArchiveBaseKind::kRetainedEmpty;
+            descriptor.base_revision = retained->revision;
+            descriptor.base_time_ms = retained->commit_time_ms;
+            descriptor.base_schema = retained->schema_version;
+        } else if (original) {
+            descriptor.kind = ArchiveBaseKind::kImage;
+            descriptor.base_revision = original->revision;
+            descriptor.base_time_ms = original->commit_time_ms;
+            descriptor.base_schema = original->schema_version;
+            descriptor.image_length = original_bytes.size();
+            descriptor.image_sha256 = crypto::Sha256Of(original_bytes);
+            if (!pinned) {
 #ifdef _WIN32
-            if (!CreateHardLinkW(base.c_str(), image.c_str(), nullptr))
-                throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "archive base hard link");
+                if (!CreateHardLinkW(base.c_str(), image.c_str(), nullptr))
+                    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "archive base hard link");
 #else
-            if (::link(image.c_str(), base.c_str()) != 0)
-                throw std::system_error(errno, std::generic_category(), "archive base hard link");
+                if (::link(image.c_str(), base.c_str()) != 0)
+                    throw std::system_error(errno, std::generic_category(), "archive base hard link");
 #endif
+            }
+            (void)ReadPinnedFeedArchiveBase(base, store_.geometry_, store_.store_id_, coord, store_.features_, descriptor);
             SyncFilePath(base);
             SyncDirectoryPath(directory);
+        } else if (covered || pinned) {
+            throw std::runtime_error("original archive base is missing after its WAL was covered");
         }
+        if (descriptor.base_schema > first_schema) throw std::runtime_error("archive base schema exceeds its first frame");
+        AtomicWrite(descriptor_path, SerializeArchiveBaseDescriptor(descriptor, kMaxChunkImageFileBytes), true, true,
+            nullptr, "CHUNKDB_FAILPOINT_FEED_BASE_AFTER_RENAME_ONCE");
     }
     SyncFilePath(wal_path);
     SyncDirectoryPath(wal_path.parent_path());

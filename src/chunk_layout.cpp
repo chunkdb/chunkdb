@@ -50,8 +50,17 @@ void ClearTail(std::uint8_t* data, std::size_t begin, std::size_t bytes, std::si
 }  // namespace
 
 ChunkLayout::ChunkLayout(TableSchema schema, std::size_t block_count, std::size_t max_payload_bytes)
+    : ChunkLayout(std::move(schema), block_count, max_payload_bytes, ColumnDomain::kBlock) {}
+
+ChunkLayout::ChunkLayout(
+    TableSchema schema, std::size_t block_count, std::size_t max_payload_bytes, ColumnDomain domain)
     : schema_(std::move(schema)), block_count_(block_count), payload_bytes_limit_(max_payload_bytes) {
-    ValidateTableSchema(schema_);
+    if (domain == ColumnDomain::kChunk) {
+        if (block_count != 1U) throw std::invalid_argument("chunk columns require exactly one row");
+        ValidateChunkSchema(schema_);
+    }
+    else if (domain == ColumnDomain::kBlock) ValidateTableSchema(schema_);
+    else throw std::invalid_argument("unknown column domain");
     fixed_index_.assign(schema_.columns.size(), std::string_view::npos);
     std::size_t offset = 0;
     for (std::size_t i = 0; i < schema_.columns.size(); ++i) {

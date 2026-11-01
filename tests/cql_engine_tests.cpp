@@ -22,6 +22,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
 #include "../src/store_manifest.hpp"
+#include "../src/sectioned_chunk_form.hpp"
 #include "test_utils.hpp"
 
 namespace {
@@ -508,21 +509,43 @@ std::uint64_t LoadLittleEndian(const std::string& bytes, std::size_t offset, std
     return value;
 }
 
+chunkdb::ChunkFormSections FormSections(const std::string& bytes) {
+    return chunkdb::ParseChunkFormSections({reinterpret_cast<const std::uint8_t*>(bytes.data()), bytes.size()},
+        UINT32_MAX, chunkdb::ChunkFormReadMode::kRead);
+}
+std::string FormSection(const std::string& bytes, chunkdb::ChunkFormSectionKind kind) {
+    for (const auto& section : FormSections(bytes).sections)
+        if (section.kind == static_cast<unsigned>(kind))
+            return {reinterpret_cast<const char*>(section.body.data()), section.body.size()};
+    return {};
+}
+void SetFormPresence(std::string* bytes, std::uint8_t value) {
+    for (const auto& section : FormSections(*bytes).sections)
+        if (section.kind == static_cast<unsigned>(chunkdb::ChunkFormSectionKind::kPresence)) {
+            (*bytes)[static_cast<std::size_t>(section.body.data() - reinterpret_cast<const std::uint8_t*>(bytes->data()))] =
+                static_cast<char>(value);
+            return;
+        }
+    assert(false);
+}
+
 void TestChunkStatements() {
     Fixture f;
     const auto geometry = f.catalog->Find("world")->geometry();
-    const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
+    std::size_t fixed_values_bytes = 0U;
+    for (const auto& column : geometry.layout().fixed_columns())
+        fixed_values_bytes += (column.width * geometry.ChunkBlockCount() + 7U) / 8U;
     const std::size_t presence_bytes = 2;
     // A written chunk whose last block was deleted retains a form/version.
     (void)VersionOf(f.Run("SET BLOCK 8 8 IN world id = 1"));
     (void)VersionOf(f.Run("DELETE BLOCK 8 8 FROM world"));
     const std::string empty = BulkOf(f.Run("GET CHUNK 2 2 FROM world"));
-    assert(empty.size() == 16 + presence_bytes + payload_bytes);
-    assert(LoadLittleEndian(empty, 8, 8) == 1U);
-    assert(empty[16] == 0 && empty[17] == 0);
-    const std::uint64_t empty_version = LoadLittleEndian(empty, 0, 8);
+    assert(FormSection(empty, chunkdb::ChunkFormSectionKind::kFixedValues).size() == fixed_values_bytes);
+    assert(FormSections(empty).header.schema_version == 1U);
+    assert(FormSection(empty, chunkdb::ChunkFormSectionKind::kPresence) == std::string(presence_bytes, '\0'));
+    const std::uint64_t empty_version = FormSections(empty).header.chunk_version;
     std::string one_block = empty;
-    one_block[16] = '\x01';
+    SetFormPresence(&one_block, 1U);
     const std::uint64_t created = VersionOf(
         f.Run("SET CHUNK 2 2 IN world $1 IF VERSION " + std::to_string(empty_version), Parameters{one_block}));
     assert(created != empty_version);
@@ -536,13 +559,14 @@ void TestChunkStatements() {
     // version, schema version, presence (blocks 0 and 1), payload, then the
     // VARS entries:
     // name and blob of block 0, 12 bytes of header each.
-    assert(form.size() == 16 + presence_bytes + payload_bytes + (12 + 2) + (12 + 1));
-    assert(LoadLittleEndian(form, 0, 8) == version);
-    assert(static_cast<std::uint8_t>(form[16]) == 0x03 && form[17] == 0);
+    assert(FormSection(form, chunkdb::ChunkFormSectionKind::kFixedValues).size() == fixed_values_bytes);
+    assert(FormSection(form, chunkdb::ChunkFormSectionKind::kVariableValues).size() == (12U + 2U) + (12U + 1U));
+    assert(FormSections(form).header.chunk_version == version);
+    assert(FormSection(form, chunkdb::ChunkFormSectionKind::kPresence) == std::string("\x03\0", 2U));
 
     // The same state into another chunk; the version is not read.
     std::string copy = form;
-    copy[0] = '\x7f';
+    copy[8] = '\x7f';
     const std::uint64_t written = VersionOf(f.Run("SET CHUNK 1 1 IN world $1", Parameters{copy}));
     ExpectReply(f.Run("GET BLOCK 4 4 FROM world COLUMNS id, name, blob"), "*3\r\n:3\r\n$2\r\nab\r\n$1\r\n\x01\r\n");
     ExpectReply(f.Run("GET BLOCK 5 4 FROM world COLUMNS id, temp, mask, name"), "*4\r\n:4\r\n:-1\r\n$1\r\n\x07\r\n_\r\n");
@@ -550,29 +574,34 @@ void TestChunkStatements() {
         f.Run("SET CHUNK 1 1 IN world $1 IF VERSION " + std::to_string(written + 1), Parameters{copy}),
         "VERSION_MISMATCH current=" + std::to_string(written));
     // A state with no values for text and bytes removes them.
-    const std::string bare = form.substr(0, 16 + presence_bytes + payload_bytes);
+    auto bare_sections = FormSections(form);
+    for (auto& section : bare_sections.sections)
+        if (section.kind == static_cast<unsigned>(chunkdb::ChunkFormSectionKind::kVariableValues)) section.body = {};
+    const auto bare_bytes = chunkdb::SerializeChunkFormSections(bare_sections.header, bare_sections.sections, UINT32_MAX);
+    const std::string bare(bare_bytes.begin(), bare_bytes.end());
     (void)VersionOf(f.Run("SET CHUNK 1 1 IN world $1 IF VERSION " + std::to_string(written), Parameters{bare}));
     ExpectReply(f.Run("GET BLOCK 4 4 FROM world COLUMNS id, name, blob"), "*3\r\n:3\r\n_\r\n$0\r\n\r\n");
 
     // COLUMNS: the sections of the named columns, then their values.
     const std::string id_only = BulkOf(f.Run("GET CHUNK 0 0 FROM world COLUMNS id"));
-    assert(id_only.size() == 16 + presence_bytes + 20);
-    assert(id_only.substr(18) == form.substr(18, 20));
+    assert(FormSection(id_only, chunkdb::ChunkFormSectionKind::kFixedValues).size() == 20U);
+    assert(FormSection(id_only, chunkdb::ChunkFormSectionKind::kFixedValues) ==
+        FormSection(form, chunkdb::ChunkFormSectionKind::kFixedValues).substr(0U, 20U));
     const std::string name_only = BulkOf(f.Run("GET CHUNK 0 0 FROM world COLUMNS name"));
-    assert(name_only.size() == 16 + presence_bytes + 12 + 2);
-    assert(name_only.substr(18 + 12) == "ab");
+    assert(FormSection(name_only, chunkdb::ChunkFormSectionKind::kFixedValues).empty());
+    assert(FormSection(name_only, chunkdb::ChunkFormSectionKind::kVariableValues).substr(12U) == "ab");
 
-    ExpectError(f.Run("SET CHUNK 1 1 IN world $1", Parameters{form.substr(0, 20)}), "INVALID_ARGUMENT the chunk takes at least");
+    ExpectError(f.Run("SET CHUNK 1 1 IN world $1", Parameters{form.substr(0, 20)}), "INVALID_ARGUMENT chunk form header is truncated");
     ExpectError(f.Run("SET CHUNK 1 1 IN world $1", Parameters{std::nullopt}), "the chunk cannot be NULL");
     std::string absent = form;
-    absent[16] = '\x02';  // block 0, which has values, absent
+    SetFormPresence(&absent, 2U);  // block 0, which has variable values, absent
     ExpectError(f.Run("SET CHUNK 1 1 IN world $1", Parameters{absent}), "a value of an absent block");
     ExpectReply(f.Run("GET BLOCK 4 4 FROM world COLUMNS id"), "*1\r\n:3\r\n");
 
     auto plan = f.engine->PlanPayload(f.session, "SET CHUNK 0 0 IN world $1\r\n");
     assert(plan.plan == CommandEngine::PayloadPlan::kParameters);
-    assert((plan.parameter_limits ==
-            std::vector<std::size_t>{16 + presence_bytes + payload_bytes + chunkdb::kDefaultVarMaxChunkBytes}));
+    assert(plan.parameter_limits.size() == 1U && plan.parameter_limits.front() > chunkdb::kVarMaxChunkBytesLimit &&
+        plan.parameter_limits.front() < chunkdb::kVarMaxChunkBytesLimit + 1048576U);
 
     // A form encoded for another schema version is refused: its bytes would
     // land in the wrong columns.
@@ -584,7 +613,7 @@ void TestChunkStatements() {
         "use DESCRIBE world and encode the chunk again with the current columns");
     ExpectReply(f.Run("GET BLOCK 4 4 FROM world COLUMNS id"), "*1\r\n:3\r\n");
     const std::string current = BulkOf(f.Run("GET CHUNK 1 1 FROM world"));
-    assert(LoadLittleEndian(current, 8, 8) == 2U);
+    assert(FormSections(current).header.schema_version == 2U);
     (void)VersionOf(f.Run("SET CHUNK 1 1 IN world $1", Parameters{current}));
 }
 
@@ -594,7 +623,7 @@ void TestUnwrittenChunk() {
     ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
     ExpectReply(f.Run("GET CHUNK 9 9 FROM world COLUMNS id"), "_\r\n");
     ExpectReply(f.Run("GET AREA 9 9 TO 9 9 FROM world"), "*0\r\n");
-    ExpectReply(f.Run("SCAN CHUNKS FROM world"), "%2\r\n$6\r\nchunks\r\n*0\r\n$4\r\nmore\r\n#f\r\n");
+    assert(f.Run("SCAN CHUNKS FROM world").find("$6\r\nchunks\r\n*0\r\n$4\r\nmore\r\n#f\r\n") != std::string::npos);
     const auto table = f.catalog->Find("world");
     {
         auto lease = table->Acquire();
@@ -613,7 +642,8 @@ void TestUnwrittenChunk() {
     ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
     const auto deleted = VersionOf(f.Run("DELETE BLOCK 36 36 FROM world"));
     const auto empty = BulkOf(f.Run("GET CHUNK 9 9 FROM world"));
-    assert(LoadLittleEndian(empty, 0, 8) == deleted && empty[16] == 0 && empty[17] == 0);
+    assert(FormSections(empty).header.chunk_version == deleted &&
+        FormSection(empty, chunkdb::ChunkFormSectionKind::kPresence) == std::string(2U, '\0'));
     ExpectReply(f.Run("ALTER TABLE world SET checkpoint_updates = 999999"), "+OK\r\n");
     assert(BulkOf(f.Run("GET CHUNK 9 9 FROM world")) == empty);
     {
@@ -623,14 +653,14 @@ void TestUnwrittenChunk() {
     // Collection removed the artifacts but the cached tombstone still exists.
     assert(BulkOf(f.Run("GET CHUNK 9 9 FROM world")) == empty);
     ExpectReply(f.Run("ALTER TABLE world SET checkpoint_updates = 999998"), "+OK\r\n");
-    ExpectReply(f.Run("GET CHUNK 9 9 FROM world"), "_\r\n");
+    assert(BulkOf(f.Run("GET CHUNK 9 9 FROM world")) == empty);
     ExpectReply(f.Run("GET AREA 9 9 TO 9 9 FROM world"), "*0\r\n");
     ExpectReply(f.Run("BEGIN"), "+OK\r\n");
     ExpectReply(f.Run("GET CHUNK 10 10 FROM world"), "_\r\n");
     ExpectReply(f.Run("DELETE BLOCK 40 40 FROM world"), "_\r\n");
     ExpectReply(f.Run("GET CHUNK 10 10 FROM world"), "_\r\n");
     ExpectReply(f.Run("SET BLOCK 40 40 IN world id = 8"), "_\r\n");
-    assert(BulkOf(f.Run("GET CHUNK 10 10 FROM world"))[16] == 1);
+    assert(FormSection(BulkOf(f.Run("GET CHUNK 10 10 FROM world")), chunkdb::ChunkFormSectionKind::kPresence)[0] == 1);
     ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
     ExpectReply(f.Run("GET CHUNK 10 10 FROM world"), "_\r\n");
 }
@@ -649,10 +679,11 @@ void TestAreaStatements() {
     const std::string box = f.Run("GET AREA -1 -1 TO 2 0 FROM world COLUMNS name");
     // Chunks (0, 0) and (2, -1), in ascending x then y.
     assert(box.rfind("*2\r\n*3\r\n:0\r\n:0\r\n$", 0) == 0);
-    const std::string second = "*3\r\n:2\r\n:-1\r\n$18\r\n";
+    const auto projected = BulkOf(f.Run("GET CHUNK 2 -1 FROM world COLUMNS name"));
+    const std::string second = "*3\r\n:2\r\n:-1\r\n$" + std::to_string(projected.size()) + "\r\n";
     assert(box.find(second) != std::string::npos);
     const std::size_t at = box.find(second) + second.size();
-    assert(LoadLittleEndian(box, at, 8) == far);
+    assert(LoadLittleEndian(box, at + 8U, 8) == far);
     ExpectReply(f.Run("GET AREA 5 5 TO 6 6 FROM world"), "*0\r\n");
     const std::string around = f.Run("GET AREA AROUND 1 0 RADIUS 1 FROM world COLUMNS id");
     assert(around.rfind("*1\r\n*3\r\n:0\r\n:0\r\n$", 0) == 0);
@@ -815,7 +846,7 @@ void TestConcurrentConditionalCreate() {
 
 // The chunk coordinates of a SCAN CHUNKS reply, and whether more follow.
 std::pair<std::vector<std::pair<std::int64_t, std::int64_t>>, bool> ScanOf(const std::string& reply) {
-    const std::string head = "%2\r\n$6\r\nchunks\r\n*";
+    const std::string head = "%5\r\n$6\r\nchunks\r\n*";
     assert(reply.rfind(head, 0) == 0);
     std::size_t at = head.size();
     const auto line = [&reply, &at] {
@@ -827,13 +858,20 @@ std::pair<std::vector<std::pair<std::int64_t, std::int64_t>>, bool> ScanOf(const
     const std::size_t count = std::stoull(line());
     std::vector<std::pair<std::int64_t, std::int64_t>> chunks;
     for (std::size_t i = 0; i < count; ++i) {
-        assert(line() == "*2");
+        assert(line() == "*3");
         const std::int64_t x = std::stoll(line().substr(1));
         chunks.emplace_back(x, std::stoll(line().substr(1)));
+        const auto version = line();
+        assert(!version.empty() && (version.front() == ':' || version.front() == '('));
     }
     assert(line() == "$4" && line() == "more");
     const std::string more = line();
     assert(more == "#t" || more == "#f");
+    assert(line() == "$5" && line() == "epoch" && line() == "$32" && line().size() == 32U);
+    assert(line() == "$8" && line() == "position");
+    const auto position = line();
+    assert(!position.empty() && (position.front() == ':' || position.front() == '('));
+    assert(line() == "$23" && line() == "retained_deletion_floor" && line() == ":0");
     assert(at == reply.size());
     return {chunks, more == "#t"};
 }

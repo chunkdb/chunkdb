@@ -16,12 +16,13 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/types.hpp"
+#include "chunk_coordinate_index.hpp"
 
 namespace chunkdb {
 
 struct TxnCoordLess {
     bool operator()(const ChunkCoord& lhs, const ChunkCoord& rhs) const noexcept {
-        return lhs.x != rhs.x ? lhs.x < rhs.x : lhs.y < rhs.y;
+        return lhs < rhs;
     }
 };
 
@@ -168,6 +169,7 @@ class TxnHistory {
 // What a write keeps for open transactions (ChunkStore::PrepareTxnKeepLocked).
 struct TxnKeep {
     TxnHistory::Reservation node;
+    CoordinateReservation coordinate;
 };
 
 // The chunk locks this thread holds beyond the one a plain operation holds:
@@ -200,19 +202,21 @@ struct TxnIntent {
 inline constexpr std::string_view kTxnIntentPrefix = "txn-";
 inline constexpr std::string_view kTxnIntentSuffix = ".rollback";
 
-[[nodiscard]] std::vector<std::uint8_t> SerializeTxnIntent(const TxnIntent& intent);
+[[nodiscard]] std::vector<std::uint8_t> SerializeTxnIntent(
+    const TxnIntent& intent, std::uint8_t dims, const StoreId& table_id);
 // False for anything but a well-formed record.
-[[nodiscard]] bool TryParseTxnIntent(const std::vector<std::uint8_t>& bytes, TxnIntent* out);
+[[nodiscard]] bool TryParseTxnIntent(const std::vector<std::uint8_t>& bytes, TxnIntent* out,
+    std::uint8_t dims, const StoreId& table_id);
 [[nodiscard]] std::filesystem::path TxnIntentPath(const std::filesystem::path& data_dir, std::uint64_t version);
 // A transaction intent's file name (not one of its temporary files).
 [[nodiscard]] bool IsTxnIntentFileName(std::string_view name) noexcept;
 // A transaction intent's name or one of its temporary files.
 [[nodiscard]] bool IsTxnIntentArtifactName(std::string_view name) noexcept;
-// For a read-only load: the WAL boundary that pending CKTB intents set for
+// For a read-only load: the WAL boundary that pending rollback intents set for
 // `coord` (the smallest when several list it), from the intents' bytes.
 // Throws std::runtime_error for a malformed intent.
 [[nodiscard]] std::optional<std::uint64_t> TxnRollbackBoundaryForChunk(
     const std::vector<std::vector<std::uint8_t>>& intents,
-    const ChunkCoord& coord);
+    const ChunkCoord& coord, const Geometry& geometry, const StoreId& table_id);
 
 }  // namespace chunkdb

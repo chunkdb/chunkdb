@@ -7,6 +7,7 @@
 #include "feature_flags.hpp"
 #include "feature_activation_records.hpp"
 #include "feed_slot_records.hpp"
+#include "archive_base_format.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
 #include "catalog_test_utils.hpp"
@@ -142,6 +143,9 @@ void FilterOwnership() {
 
 void ArchiveValidation() {
     Fixture fixture;
+    const auto descriptor = fixture.table / kFeedArchiveDirName / ArchiveBaseFileName({0, 0}, 2U, 2U);
+    Save(descriptor, SerializeArchiveBaseDescriptor({.dims = 2U, .kind = ArchiveBaseKind::kNeverWritten,
+        .epoch = fixture.manifest.store_id, .coord = {0, 0}, .first = 2U, .base_schema = 1U}, kMaxChunkImageFileBytes));
     const auto bytes = fixture.Archive();
     Save(fixture.Wal(), bytes);
     auto [counts, output] = fixture.Verify();
@@ -163,10 +167,12 @@ void ArchiveValidation() {
     std::filesystem::rename(fixture.Wal(), fixture.Wal("C_0_0.0-4.wal"));
     assert(fixture.Verify().second.find("feed_archive_name_invalid") != std::string::npos);
     std::filesystem::remove(fixture.Wal("C_0_0.0-4.wal"));
+    std::filesystem::remove(descriptor);
     // A linked base before WAL rename is an accepted checkpoint crash state.
     const auto image = SerializeChunkImage(fixture.geometry, {0, 0}, {7U, 0U}, {1U},
         CheckpointCompression::kNone, 1U, 10U, fixture.manifest.store_id);
     Save(fixture.Base(), image);
+    Save(ChunkDataPath(fixture.table, fixture.geometry, {0, 0}), image);
     assert(fixture.Verify().first.errors == 0U);
     auto bad_base = image;
     bad_base.back() ^= 1U;

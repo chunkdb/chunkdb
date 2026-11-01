@@ -1,6 +1,8 @@
 #include "backup.hpp"
 
 #include <algorithm>
+#include <array>
+#include <fstream>
 #include <limits>
 #include <sstream>
 #include <system_error>
@@ -14,6 +16,8 @@
 #include "verify.hpp"
 #include "migrations_records.hpp"
 #include "wal_replay.hpp"
+#include "chunk_coordinate_index.hpp"
+#include "shared_file_input.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -45,31 +49,103 @@ void ExclusiveMove(const std::filesystem::path& from, const std::filesystem::pat
     throw std::runtime_error("restore requires atomic exclusive directory rename support");
 #endif
 }
-ChunkCoord Coordinate(const std::filesystem::path& path) {
-    const auto stem = path.stem().string(); const auto separator = stem.find('_', 2U);
+ChunkCoord Coordinate(const std::filesystem::path& path, const Geometry& geometry) {
     ChunkCoord coord{};
-    if (stem.rfind("C_", 0U) != 0U || separator == std::string::npos ||
-        !TryParseInt64(stem.substr(2U, separator - 2U), &coord.x) || !TryParseInt64(stem.substr(separator + 1U), &coord.y))
+    if (!ParseChunkFilePath(path, geometry, &coord))
         throw std::runtime_error("invalid restored chunk name");
     return coord;
 }
 std::vector<std::uint8_t> RecoverWal(const std::filesystem::path& path, const Geometry& geometry,
-    ChunkCoord coord, const StoreId& epoch, FeatureFlags features) {
+    ChunkCoord coord, const StoreId& epoch, FeatureFlags features, const ChunkCoordinateIndex& retained) {
     std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U), presence(ChunkPresenceBitmapBytes(geometry), 0U);
-    ChunkVars vars; std::uint64_t revision = 0U, schema = 0U;
+    ChunkVars vars; std::uint64_t revision = 0U, schema = 0U, time = 0U;
+    std::shared_ptr<const ChunkColumnState> chunk_columns;
     auto image_path = path; image_path.replace_extension(".chk");
     if (std::filesystem::exists(image_path)) {
-        auto image = ParseChunkImage(LoadFile(image_path), geometry, coord, epoch, features);
-        revision = image.revision; schema = image.schema_version;
+        auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, coord, epoch, features),
+            geometry, coord, epoch, features);
+        revision = image.revision; schema = image.schema_version; time = image.commit_time_ms;
         payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
+        chunk_columns = std::move(image.chunk_columns);
     }
+    const auto boundary = retained.EmptyBoundary(coord);
+    if (boundary)
+        (void)ApplyRetainedEmptyBase(geometry, *boundary, revision, time, schema,
+            payload, presence, vars, chunk_columns);
     auto bytes = LoadFile(path);
-    const auto replay = ReplayWal(bytes, geometry, coord, epoch, features, revision, schema, &payload, &presence, &vars);
+    const auto replay = ReplayWal(bytes, geometry, coord, epoch, features, revision, schema,
+        &payload, &presence, &vars, nullptr, &chunk_columns, time,
+        boundary ? std::optional{WalKnownIdentity{boundary->revision, boundary->commit_time_ms}} : std::nullopt);
     if (replay.torn_creation) return {};
     if (!replay.replayable || (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty())
         throw std::runtime_error("restored WAL is damaged: " + path.string());
     if (replay.tail_truncated_or_corrupt) bytes.resize(replay.valid_end);
     return bytes;
+}
+
+class SinkBuffer final : public std::streambuf {
+  public:
+    explicit SinkBuffer(const AtomicFileSink& sink) : sink_(sink) {}
+  private:
+    std::streamsize xsputn(const char* data, std::streamsize count) override {
+        sink_(std::span(reinterpret_cast<const std::uint8_t*>(data), static_cast<std::size_t>(count)));
+        return count;
+    }
+    int_type overflow(int_type value) override {
+        if (traits_type::eq_int_type(value, traits_type::eof())) return traits_type::not_eof(value);
+        const auto byte = static_cast<std::uint8_t>(traits_type::to_char_type(value));
+        sink_(std::span(&byte, 1U));
+        return value;
+    }
+    const AtomicFileSink& sink_;
+};
+
+void RewriteRetainedIndex(const std::filesystem::path& directory, const Geometry& geometry,
+    const StoreId& old_epoch, const StoreId& new_epoch) {
+    const auto inventory_path = directory / kChunkIndexFileName;
+    SharedFileInput inventory(inventory_path);
+    if (!inventory) throw std::runtime_error("restored coordinate inventory is missing");
+    std::vector<IndexInventoryEntry> entries;
+    auto header = ReadIndexInventory(inventory, std::filesystem::file_size(inventory_path), geometry, old_epoch,
+        [&](const auto& entry) { entries.push_back(entry); });
+    inventory.close();
+    if (header.compaction_pending) throw std::runtime_error("restored coordinate compaction is pending");
+    for (const auto& entry : entries) {
+        const auto path = LargeChunkDirectory(directory, entry.coord, geometry.dims()) / kChunkIndexFileName;
+        {
+            SharedFileInput input(path);
+            if (!input) throw std::runtime_error("restored coordinate log is missing");
+            (void)ReadChunkIndexLog(input, std::filesystem::file_size(path), geometry, old_epoch,
+                entry.coord, entry.committed_bytes);
+        }
+        const auto log_header = SerializeChunkIndexHeader({new_epoch, geometry.dims(), entry.coord});
+        AtomicWriteStream(path, [&](const AtomicFileSink& sink) {
+            SharedFileInput input(path);
+            if (!input) throw std::runtime_error("failed to reopen restored coordinate log");
+            input.seekg(static_cast<std::streamoff>(log_header.size()));
+            if (!input) throw std::runtime_error("failed to seek restored coordinate log");
+            sink(log_header);
+            std::array<std::uint8_t, 65536> bytes;
+            auto remaining = entry.committed_bytes - log_header.size();
+            while (remaining != 0U) {
+                const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, bytes.size()));
+                input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(count));
+                if (input.gcount() != static_cast<std::streamsize>(count))
+                    throw std::runtime_error("restored coordinate log changed during identity rewrite");
+                sink(std::span(bytes.data(), count));
+                remaining -= count;
+            }
+        }, true, true);
+        Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_INDEX_LOG_ONCE");
+    }
+    header.table_id = new_epoch;
+    AtomicWriteStream(inventory_path, [&](const AtomicFileSink& sink) {
+        SinkBuffer buffer(sink);
+        std::ostream output(&buffer);
+        WriteIndexInventory(output, header, entries);
+        if (!output) throw std::runtime_error("failed to rewrite restored coordinate inventory");
+    }, true, true);
+    Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_INDEX_ONCE");
 }
 } // namespace
 void RestoreBackup(const std::filesystem::path& source, const std::filesystem::path& destination) {
@@ -126,10 +202,11 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
             const auto directory = temporary / "tables" / cut.name;
             auto manifest = *ReadStoreManifest(directory);
             RequireOpenableFeatures(manifest.features, AccessMode::kReadWrite);
-            Geometry geometry(manifest.geometry, manifest.schema);
+            Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
             const auto old_epoch = cut.epoch; const auto new_epoch = NewStoreId();
             if (new_epoch == old_epoch) throw std::runtime_error("restore generated an existing epoch");
             const auto prefix = std::filesystem::path("tables") / cut.name;
+            ChunkCoordinateIndex retained(directory, geometry, old_epoch, true);
             // Normalize crash-consistent WAL tails while the checkpoint still has
             // its old epoch, then rewrite the identity without changing history.
             for (const auto& file : record.files) {
@@ -137,13 +214,14 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
                 if (std::distance(relative.begin(), relative.end()) != 2 || relative.begin()->string() == "..") continue;
                 const auto path = temporary / file.relative_path;
                 if (relative.extension() == ".wal") {
-                    const auto coord = Coordinate(relative);
-                    auto bytes = RecoverWal(path, geometry, coord, old_epoch, manifest.features);
+                    const auto coord = Coordinate(relative, geometry);
+                    auto bytes = RecoverWal(path, geometry, coord, old_epoch, manifest.features, retained);
                     if (bytes.empty()) {
                         std::filesystem::remove(path);
                         if (std::filesystem::is_empty(path.parent_path())) std::filesystem::remove(path.parent_path());
                     } else {
-                        bytes = RewriteWalStoreId(std::move(bytes), coord, old_epoch, new_epoch, manifest.features);
+                        bytes = RewriteWalStoreId(std::move(bytes), coord, old_epoch, new_epoch,
+                            manifest.features, geometry.dims());
                         AtomicWrite(path, bytes, true, true);
                     }
                 }
@@ -153,12 +231,13 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
                 if (std::distance(relative.begin(), relative.end()) != 2 || relative.begin()->string() == "..") continue;
                 const auto path = temporary / file.relative_path;
                 if (relative.extension() == ".chk") {
-                    auto bytes = RewriteChunkImageStoreId(LoadFile(path), geometry, Coordinate(relative), old_epoch, new_epoch, manifest.features);
+                    auto bytes = RewriteChunkImageStoreId(LoadFile(path), geometry, Coordinate(relative, geometry), old_epoch, new_epoch, manifest.features);
                     AtomicWrite(path, bytes, true, true);
                 }
                 Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_FILE_ONCE");
             }
-            if (auto slots = ReadFeedSlotRecords(directory, old_epoch)) {
+            RewriteRetainedIndex(directory, geometry, old_epoch, new_epoch);
+            if (auto slots = ReadFeedSlotRecords(directory, old_epoch, geometry.dims())) {
                 slots->epoch = new_epoch; slots->durable_watermark = cut.revision;
                 for (auto& slot : slots->slots) { slot.written = cut.revision; slot.lost = slot.schema_filter_lost; }
                 WriteFeedSlotRecords(directory, *slots);

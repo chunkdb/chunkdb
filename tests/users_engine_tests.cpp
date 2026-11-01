@@ -190,7 +190,9 @@ void TestRights() {
     ExpectError(server.Run(bot, "CREATE SLOT 'mine' ON world"), "PERMISSION_DENIED ADMIN on world");
     ExpectError(server.Run(bot, "DROP SLOT 'consumer' ON world"), "PERMISSION_DENIED ADMIN on world");
     assert(server.Run(bot, "DESCRIBE world").rfind("%10\r\n", 0) == 0);
-    assert(server.Run(bot, "SCAN CHUNKS FROM world").rfind("%2", 0) == 0);
+    const auto scan = server.Run(bot, "SCAN CHUNKS FROM world");
+    assert(scan.starts_with("%5\r\n$6\r\nchunks\r\n*0\r\n$4\r\nmore\r\n#f\r\n$5\r\nepoch\r\n$32\r\n"));
+    assert(scan.ends_with("\r\n$8\r\nposition\r\n:0\r\n$23\r\nretained_deletion_floor\r\n:0\r\n"));
     ExpectError(server.Run(bot, "SET BLOCK 0 0 IN world bits = b'1010'"), "PERMISSION_DENIED WRITE on world");
     ExpectError(server.Run(bot, "SET BLOCK 0 0 IN world bits = b'1010'"), "ask an administrator to grant this right");
     ExpectError(server.Run(bot, "FLUSH WAL"), "PERMISSION_DENIED WRITE on a table");
