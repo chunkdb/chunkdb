@@ -5,8 +5,11 @@
 #include <cassert>
 #include <limits>
 #include <memory_resource>
+#include <memory>
 #include <stdexcept>
+#include <string>
 #include <thread>
+#include <vector>
 
 #include "txn_block_deltas.hpp"
 #include "txn_block_memory.hpp"
@@ -257,6 +260,8 @@ void InitializationAndDelete() {
     auto row = Row(geometry, 3U);
     journal.Publish(journal.Prepare({{}, 0U}, snapshot, TxnBlockAction::kReplace, &row));
     Reject([&] { (void)PlanTxnBlockRebase(journal, StoreId{1U}, geometry, std::array{state.View()}, 50U); });
+    state.metadata = geometry.default_chunk_columns();
+    Reject([&] { (void)PlanTxnBlockRebase(journal, StoreId{1U}, geometry, std::array{state.View()}, 50U); });
     auto plan = PlanTxnBlockRebase(journal, StoreId{1U}, geometry, std::array{state.View()}, 1024U);
     assert(plan.rows.size() == 1U && plan.chunks[0].resulting_metadata_variable_bytes == geometry.default_chunk_columns()->variable_bytes);
     auto required_metadata = metadata; required_metadata.columns[0].required = true;
@@ -280,8 +285,23 @@ void InitializationAndDelete() {
     const std::array<ColumnAssignment, 1U> supplied{{{"n", std::uint64_t{3U}}}};
     assert(AssignTxnBlockRow(required_layout, absent, supplied, absent.resource()).present);
 }
+void PreparedOwnershipMoves() {
+    const auto geometry = MakeGeometry(); State state(geometry); auto row = Row(geometry, 1U); state.Put(geometry, 0U, row);
+    auto snapshot = Capture(geometry, state, 0U);
+    TxnBlockDeltas journal(StoreId{1U}, geometry.layout(), std::pmr::get_default_resource());
+    auto prepared = journal.Prepare({{}, 0U}, snapshot, TxnBlockAction::kObserve);
+    auto transferred = std::move(prepared);
+    Reject([&] { journal.Publish(std::move(prepared)); });
+    assert(journal.rows().empty());
+    journal.Publish(std::move(transferred)); assert(journal.rows().size() == 1U);
+    auto promotion = journal.PreparePromotion({}, snapshot.version);
+    auto moved_promotion = std::move(promotion);
+    Reject([&] { journal.Publish(std::move(promotion)); });
+    assert(journal.rows().size() == 1U && journal.promotions().empty());
+    journal.Publish(std::move(moved_promotion)); assert(journal.rows().empty() && journal.promotions().size() == 1U);
+}
 }  // namespace
 
 int main() {
-    RowsPreserveRawBits(); JournalAndRebase(); Accounting(); FailedEditsAndLateConflict(); WideVariablesStayBorrowed(); InitializationAndDelete();
+    RowsPreserveRawBits(); JournalAndRebase(); Accounting(); FailedEditsAndLateConflict(); WideVariablesStayBorrowed(); InitializationAndDelete(); PreparedOwnershipMoves();
 }
