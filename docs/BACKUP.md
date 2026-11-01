@@ -22,9 +22,9 @@ cuts:
 ```
 
 The destination is relative to `--backup-dir` and must be absent or empty, outside the live data directory.
-Use `/` separators; rooted paths, backslashes, `..` components, and symlinks below the resolved backup directory are refused.
+Use `/` separators; rooted paths, backslashes, `..` components, and symbolic links or Windows reparse points below the resolved backup directory are refused.
 Missing parents are created.
-The configured backup and data directories themselves may use symlinked paths.
+The configured backup and data directories themselves may use symbolic links or Windows directory junctions.
 
 Writes continue during copying.
 Each table has its own cut, a revision through which all its committed changes are included.

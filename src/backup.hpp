@@ -8,6 +8,7 @@
 #include <stop_token>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
@@ -43,7 +44,7 @@ struct BackupResult {
 };
 // Deterministic pin/copy boundaries, following the storage test-hook pattern.
 struct BackupTestHook {
-    enum class Point { kBeforeTargetCreate, kBeforeCopyCreate, kBeforeStagingCreate, kAfterTargetGuard, kBeforeTablePin, kBeforeLargeChunkPin, kBeforeMaintenanceWait, kAfterCut, kWaitingForCompletion, kAfterFlush, kAfterPin, kBeforeCopy, kAfterCopy, kBeforePublish, kBeforeWalReplayRead };
+    enum class Point { kBeforeTargetCreate, kBeforeCopyCreate, kBeforeStagingCreate, kAfterTargetGuard, kBeforeTablePin, kBeforeLargeChunkPin, kBeforeMaintenanceWait, kAfterCut, kWaitingForCompletion, kAfterFlush, kAfterPin, kBeforeCopy, kAfterCopy, kBeforePublish, kBeforeWalReplayRead, kAfterTargetValidation, kBeforeSourceDirectoryOpen };
     virtual ~BackupTestHook() = default;
     virtual void Run(Point point, std::string_view table, std::uint64_t revision) = 0;
 };
@@ -70,6 +71,8 @@ void WriteBackupStagingOwner(const std::filesystem::path& staging, const StoreId
 // A failed removal is logged as a warning and leaves the directory for the
 // next backup or writer start.
 void RemoveBackupStaging(const std::filesystem::path& staging) noexcept;
+// Removes a private temporary tree without following descendant aliases.
+[[nodiscard]] std::error_code RemoveBackupTemporaryTree(const std::filesystem::path& root);
 // Removes staging left by failed or interrupted backups of this catalog,
 // following a configured staging root alias. The caller holds the writer lock
 // and either the backup guard or a catalog open that no backup can enter yet,
@@ -79,8 +82,10 @@ void RemoveOrphanedBackupStaging(const std::filesystem::path& data_dir, const St
 
 // Validate an absent/empty destination outside the source, then durably
 // establish its incomplete guard before any backup contents are copied.
+// Resolve configured aliases at the boundary; descendant walks stay no-follow.
+[[nodiscard]] std::filesystem::path CanonicalBackupPath(const std::filesystem::path& path);
 [[nodiscard]] std::filesystem::path ResolveBackupTarget(const std::filesystem::path& backup_directory,
-    const std::filesystem::path& requested);
+    const std::filesystem::path& requested, BackupTestHook* hook = nullptr);
 void RequireBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target);
 void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target, BackupTestHook* hook = nullptr);
 void EnsureBackupDirectory(const std::filesystem::path& path);

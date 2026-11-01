@@ -291,6 +291,7 @@ jobs:
         run: |
           grep -F 'steady reader: complete=' build/Testing/Temporary/LastTest.log
           grep -F 'steady slow reader: ' build/Testing/Temporary/LastTest.log
+          grep -F 'directory ancestor ' build/Testing/Temporary/LastTest.log
 
       - name: Benchmark Snapshot (Windows)
         shell: msys2 {0}
@@ -369,6 +370,7 @@ jobs:
         run: |
           grep -F 'steady reader: complete=' build-tls/Testing/Temporary/LastTest.log
           grep -F 'steady slow reader: ' build-tls/Testing/Temporary/LastTest.log
+          grep -F 'directory ancestor ' build-tls/Testing/Temporary/LastTest.log
 
       - name: Verify OpenSSL Was Linked
         shell: msys2 {0}

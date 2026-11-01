@@ -1,8 +1,13 @@
 #include <iostream>
 #include <stop_token>
+#include "feed_phase_watchdog.hpp"
 #include "backup_restore_test_utils.hpp"
+
+#include <cstdlib>
 #include "slot_watch.hpp"
 #include "txn_test_utils.hpp"
+#include "directory_alias_test_utils.hpp"
+#include "backup_directory.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -11,6 +16,11 @@ void Records() {
     Fixture fixture;
     const auto bytes = SerializeBackupRecord(fixture.record);
     const auto record = ParseBackupRecord(bytes);
+    assert(SerializeBackupRecord(record) == bytes);
+#ifdef _WIN32
+    for (const auto& file : record.files)
+        assert(file.relative_path.native().find(L'/') == std::wstring::npos);
+#endif
     assert(record.tables.size() == 1U && record.tables[0].epoch == fixture.manifest.store_id && record.tables[0].revision == 3U);
     assert(record.files.size() == fixture.record.files.size());
     auto bad = bytes; bad.back() ^= 1U; Throws([&] { (void)ParseBackupRecord(bad); });
@@ -251,6 +261,7 @@ void CompletionFailures() {
 }
 void RestoreTemporaryCleanup() {
     for (unsigned failure = 0; failure != 3U; ++failure) {
+        test::FeedPhaseWatchdog::Phase("restore temporary cleanup: prepare refusal " + std::to_string(failure));
         Fixture fixture;
         const auto target = fixture.root / "restore";
         if (failure == 0U) {
@@ -276,12 +287,82 @@ void RestoreTemporaryCleanup() {
             txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_RESTORE_COPY_FAIL_ONCE", "1");
             Throws([&] { RestoreBackup(fixture.backup, target); });
         }
+        test::FeedPhaseWatchdog::Phase("restore temporary cleanup: check private staging removal");
         assert(!std::filesystem::exists(target));
         for (const auto& entry : std::filesystem::directory_iterator(fixture.root))
             assert(entry.path().filename().string().rfind(".chunkdb.restore.", 0U) != 0U);
+        test::FeedPhaseWatchdog::Phase("restore temporary cleanup: restore after refusal");
         RestoreBackup(fixture.backup, target);
         assert(Verify(target).errors == 0U);
     }
+}
+void RestoreCleanupRefusalPreservesFailure() {
+    if (!kFailpointsCompiled) return;
+    {
+        test::ScopedTempDir missing("chunkdb-missing-restore-cleanup");
+        assert(!RemoveBackupTemporaryTree(missing.path() / "missing"));
+        assert(!RemoveBackupTemporaryTree(missing.path() / "missing-parent/missing"));
+    }
+    for (const auto* point : {"CHUNKDB_FAILPOINT_BACKUP_TEMPORARY_CLEANUP_INVALID_PATH_ONCE",
+             "CHUNKDB_FAILPOINT_BACKUP_TEMPORARY_CLEANUP_OPEN_FAIL_ONCE"}) {
+        Fixture fixture;
+        const auto target = fixture.root / "restore";
+        txn_test::ScopedEnv copy_failure("CHUNKDB_FAILPOINT_RESTORE_COPY_FAIL_ONCE", "1");
+        txn_test::ScopedEnv cleanup_failure(point, "1");
+        std::string message;
+        try { RestoreBackup(fixture.backup, target); }
+        catch (const std::exception& failure) { message = failure.what(); }
+        assert(message.find("injected restore copy failure") != std::string::npos);
+        assert(message.find("restore temporary cleanup failed") != std::string::npos);
+        assert(!std::filesystem::exists(target));
+        std::size_t remaining = 0U;
+        for (const auto& entry : backup_detail::DirectoryEntries(fixture.root)) {
+            if (!entry.path().filename().string().starts_with(".chunkdb.restore.")) continue;
+            assert(std::filesystem::exists(entry.path() / kRestoreIncompleteName));
+            ++remaining;
+            assert(!RemoveBackupTemporaryTree(entry.path()));
+        }
+        assert(remaining == 1U);
+        assert(Verify(fixture.backup).errors == 0U);
+    }
+}
+void RestoreCleanupRefusesReplacedParent() {
+#ifdef _WIN32
+    Fixture fixture;
+    const auto parent = fixture.root / "restore-parent", moved = fixture.root / "moved-parent";
+    const auto outside = fixture.root / "outside";
+    std::filesystem::create_directory(parent);
+    std::filesystem::create_directory(outside);
+    Save(outside / "sentinel", Bytes{'s'});
+    std::unique_ptr<test::ScopedDirectoryAlias> alias;
+    std::string message;
+    {
+        struct ResetObserver { ~ResetObserver() { SetDirectorySyncObserverForTests({}); } } reset;
+        SetDirectorySyncObserverForTests([&](const auto& directory) {
+            if (directory != parent || alias) return;
+            std::filesystem::rename(parent, moved);
+            alias = std::make_unique<test::ScopedDirectoryAlias>(outside, parent);
+            throw std::runtime_error("injected restore parent replacement");
+        });
+        try { RestoreBackup(fixture.backup, parent / "restored"); }
+        catch (const std::exception& failure) { message = failure.what(); }
+    }
+    assert(alias);
+    assert(message.find("injected restore parent replacement") != std::string::npos);
+    assert(message.find("restore temporary cleanup failed") != std::string::npos);
+    assert(LoadFile(outside / "sentinel") == Bytes{'s'});
+    for (const auto& entry : backup_detail::DirectoryEntries(outside)) assert(entry.path().filename() == "sentinel");
+    assert(!alias->Remove());
+    std::filesystem::rename(moved, parent);
+    std::size_t remaining = 0U;
+    for (const auto& entry : backup_detail::DirectoryEntries(parent)) {
+        assert(entry.path().filename().string().starts_with(".chunkdb.restore."));
+        assert(std::filesystem::exists(entry.path() / kRestoreIncompleteName));
+        ++remaining;
+        assert(!RemoveBackupTemporaryTree(entry.path()));
+    }
+    assert(remaining == 1U);
+#endif
 }
 void CrashConsistentWal() {
     for (unsigned defect = 0; defect != 3U; ++defect) {
@@ -309,19 +390,17 @@ void CrashConsistentWal() {
     }
 }
 void SymlinkedRootsAndStaging() {
-#ifndef _WIN32
     Fixture fixture;
     const auto alias = fixture.root / "alias";
-    std::filesystem::create_directory_symlink(fixture.backup, alias);
+    test::ScopedDirectoryAlias backup_alias(fixture.backup, alias);
     assert(Verify(alias).errors == 0U);
     RestoreBackup(alias, fixture.root / "restored");
     const auto source_alias = fixture.root / "source-alias";
-    std::filesystem::create_directory_symlink(fixture.source, source_alias);
+    test::ScopedDirectoryAlias source_link(fixture.source, source_alias);
     PrepareBackupTarget(source_alias, fixture.root / "second-backup");
     const auto parent_alias = fixture.root / "parent-alias";
-    std::filesystem::create_directory_symlink(fixture.root, parent_alias);
+    test::ScopedDirectoryAlias parent_link(fixture.root, parent_alias);
     RestoreBackup(alias, parent_alias / "another-restored");
-#endif
     Fixture staging;
     std::filesystem::remove(staging.backup / kBackupMarkerName);
     const auto prior = Verify(staging.backup);
@@ -391,32 +470,263 @@ void RootedTargets() {
 #ifdef _WIN32
     for (const auto* name : {"C:daily", "C:/daily", "/daily", "\\daily", "\\\\server\\share\\daily"}) rejected(name);
 #endif
-#ifndef _WIN32
     std::filesystem::create_directory(root / "inside");
-    std::filesystem::create_directory_symlink(root / "inside", root / "linked-inside");
-    std::filesystem::create_directory_symlink(fixture.source, root / "linked-outside");
+    test::ScopedDirectoryAlias inside_link(root / "inside", root / "linked-inside");
+    test::ScopedDirectoryAlias outside_link(fixture.source, root / "linked-outside");
     for (const auto* name : {"linked-inside", "linked-inside/child", "linked-outside/child"})
         Throws<std::invalid_argument>([&] { (void)ResolveBackupTarget(root, name); });
     const auto alias = fixture.root / "destinations-alias";
-    std::filesystem::create_directory_symlink(root, alias);
+    test::ScopedDirectoryAlias root_link(root, alias);
     assert(ResolveBackupTarget(alias, "daily") == root / "daily");
+}
+void ReparseInventoryAndRestore() {
+    Fixture fixture;
+    const auto original = fixture.root / "original-table";
+    const auto marker = LoadFile(fixture.backup / kBackupMarkerName);
+    std::filesystem::rename(fixture.Table(), original);
+    test::ScopedDirectoryAlias inventory_link(original, fixture.Table());
+    // A canonicalized root alias is permitted, but an inventory descendant
+    // must never redirect verification or restore outside the backup.
+    assert(Verify(fixture.backup).errors > 0U);
+    const auto target = fixture.root / "refused-restore";
+    Throws([&] { RestoreBackup(fixture.backup, target); });
+    assert(!std::filesystem::exists(target));
+    assert(LoadFile(fixture.backup / kBackupMarkerName) == marker);
+    assert(ReadStoreManifest(original)->store_id == fixture.manifest.store_id);
+    assert(!inventory_link.Remove());
+    std::filesystem::rename(original, fixture.Table());
+    assert(Verify(fixture.backup).errors == 0U);
+}
+void BackupSourceDirectoryReplacement() {
+#ifdef _WIN32
+    Fixture fixture;
+    const auto source = fixture.root / "live-source", target = fixture.root / "source-swap-backup";
+    RestoreBackup(fixture.backup, source);
+    const auto outside = fixture.root / "source-swap-outside", moved = fixture.root / "source-swap-moved";
+    std::filesystem::create_directory(outside);
+    Save(outside / "sentinel", Bytes{'s'});
+    const auto shard = source / "tables/default/L_0_0";
+    struct Replace final : BackupTestHook {
+        std::filesystem::path shard, moved, outside;
+        std::unique_ptr<test::ScopedDirectoryAlias> alias;
+        void Run(Point point, std::string_view, std::uint64_t) override {
+            if (point != Point::kBeforeSourceDirectoryOpen || alias) return;
+            std::filesystem::rename(shard, moved);
+            alias = std::make_unique<test::ScopedDirectoryAlias>(outside, shard);
+        }
+    } replace;
+    replace.shard = shard; replace.moved = moved; replace.outside = outside;
+    CatalogConfig config; config.data_dir = source; config.background_maintenance = false;
+    TableCatalog catalog(config);
+    catalog.SetBackupHookForTests(&replace);
+    bool refused = false;
+    try { (void)catalog.BackupTo(target, {}); }
+    catch (const std::filesystem::filesystem_error& failure) { refused = failure.path1() == shard; }
+    catalog.SetBackupHookForTests(nullptr);
+    assert(replace.alias && refused);
+    assert(!std::filesystem::exists(target / kBackupMarkerName));
+    assert(std::filesystem::exists(target / kBackupIncompleteName));
+    assert(LoadFile(outside / "sentinel") == Bytes{'s'});
+    for (const auto& entry : backup_detail::DirectoryEntries(outside)) assert(entry.path().filename() == "sentinel");
+    assert(!replace.alias->Remove());
+    std::filesystem::rename(moved, shard);
+    const auto recovered = fixture.root / "source-swap-recovered";
+    (void)catalog.BackupTo(recovered, {});
+    assert(Verify(recovered).errors == 0U);
+#endif
+}
+void DirectoryAncestorReplacement() {
+#ifdef _WIN32
+    test::ScopedTempDir temporary("chunkdb-directory-ancestor-race");
+    const auto root = std::filesystem::canonical(temporary.path());
+    const auto ancestor = root / "ancestor", moved = root / "moved", outside = root / "outside";
+    const auto relative = std::filesystem::path("source/L_0_0/C_0_0.chk");
+    const auto original = ancestor / relative, foreign = outside / relative;
+    Geometry geometry{{1U, 1U, 2U, 1U, 8U}};
+    const auto epoch = NewStoreId();
+    const auto own_bytes = SerializeChunkImage(geometry, {0, 0}, Bytes{7U, 0U}, Bytes{1U},
+        CheckpointCompression::kNone, 2U, 20U, epoch);
+    const auto foreign_bytes = SerializeChunkImage(geometry, {0, 0}, Bytes{9U, 0U}, Bytes{1U},
+        CheckpointCompression::kNone, 2U, 20U, epoch);
+    Save(original, own_bytes); Save(foreign, foreign_bytes); Save(outside / "sentinel", Bytes{'s'});
+    struct Facts {
+        BY_HANDLE_FILE_INFORMATION info{};
+        Bytes bytes;
+        DWORD error = ERROR_SUCCESS;
+    };
+    const auto facts = [](const std::filesystem::path& path) {
+        Facts result;
+        const auto handle = CreateFileW(path.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) { result.error = GetLastError(); return result; }
+        if (!GetFileInformationByHandle(handle, &result.info)) result.error = GetLastError();
+        else {
+            assert(result.info.nFileSizeHigh == 0U && result.info.nFileSizeLow <= 4096U);
+            result.bytes.resize(result.info.nFileSizeLow);
+            DWORD read = 0U;
+            if (!ReadFile(handle, result.bytes.data(), static_cast<DWORD>(result.bytes.size()), &read, nullptr))
+                result.error = GetLastError();
+            else if (read != result.bytes.size()) result.error = ERROR_HANDLE_EOF;
+        }
+        assert(CloseHandle(handle) != 0);
+        return result;
+    };
+    const auto same = [](const Facts& left, const Facts& right) {
+        return left.error == ERROR_SUCCESS && right.error == ERROR_SUCCESS &&
+            left.info.dwVolumeSerialNumber == right.info.dwVolumeSerialNumber &&
+            left.info.nFileIndexHigh == right.info.nFileIndexHigh && left.info.nFileIndexLow == right.info.nFileIndexLow;
+    };
+    const auto report = [](const char* name, const Facts& value) {
+        std::cerr << name << " error=" << value.error << " volume=" << value.info.dwVolumeSerialNumber
+                  << " index_high=" << value.info.nFileIndexHigh << " index_low=" << value.info.nFileIndexLow
+                  << " bytes=" << value.bytes.size() << " crc32=" << Crc32(value.bytes) << '\n';
+    };
+    const auto before = facts(original), foreign_before = facts(foreign);
+    assert(before.error == ERROR_SUCCESS && before.bytes == own_bytes);
+    assert(foreign_before.error == ERROR_SUCCESS && foreign_before.bytes == foreign_bytes && !same(before, foreign_before));
+    assert(MoveFileExW(ancestor.c_str(), moved.c_str(), MOVEFILE_WRITE_THROUGH) != 0);
+    assert(MoveFileExW(moved.c_str(), ancestor.c_str(), MOVEFILE_WRITE_THROUGH) != 0);
+    Facts consumed;
+    bool renamed = false, safe = false;
+    {
+        backup_detail::DirectoryEntries entries(original.parent_path(), true);
+        assert(entries != backup_detail::DirectoryEntries{});
+        const auto entry = *entries;
+        assert(entry.path() == original && entry.is_regular_file());
+        renamed = MoveFileExW(ancestor.c_str(), moved.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+        const auto rename_error = renamed ? ERROR_SUCCESS : GetLastError();
+        std::cerr << "directory ancestor rename error=" << rename_error << " cached_regular=" << entry.is_regular_file() << '\n';
+        if (!renamed) {
+            assert(rename_error == ERROR_SHARING_VIOLATION || rename_error == ERROR_ACCESS_DENIED);
+            consumed = facts(entry.path());
+            safe = same(consumed, before) && consumed.bytes == own_bytes;
+        } else {
+            const auto retained = facts(moved / relative);
+            assert(same(retained, before) && retained.bytes == own_bytes);
+            test::ScopedDirectoryAlias alias(outside, ancestor);
+            consumed = facts(entry.path());
+            const bool refused = consumed.error == ERROR_FILE_NOT_FOUND || consumed.error == ERROR_PATH_NOT_FOUND ||
+                consumed.error == ERROR_ACCESS_DENIED || consumed.error == ERROR_SHARING_VIOLATION;
+            safe = refused || (same(consumed, before) && consumed.bytes == own_bytes);
+        }
+        report("directory ancestor original", before);
+        report("directory ancestor foreign", foreign_before);
+        report("directory ancestor consumed", consumed);
+    }
+    if (renamed) {
+        const auto restored = MoveFileExW(moved.c_str(), ancestor.c_str(), MOVEFILE_WRITE_THROUGH);
+        if (!restored) std::cerr << "directory ancestor restore error=" << GetLastError() << '\n';
+        assert(restored != 0);
+    }
+    const auto original_after = facts(original), foreign_after = facts(foreign);
+    assert(same(original_after, before) && original_after.bytes == own_bytes);
+    assert(same(foreign_after, foreign_before) && foreign_after.bytes == foreign_bytes);
+    assert(LoadFile(outside / "sentinel") == Bytes{'s'});
+    assert(safe && "a pinned directory consumer reached a replaced ancestor's foreign file");
+#endif
+}
+void ExtendedRootPaths() {
+#ifdef _WIN32
+    Fixture fixture;
+    const auto extended = std::filesystem::path(L"\\\\?\\" + fixture.root.wstring());
+    const auto top = extended / "extended-root";
+    auto root = top;
+    for (unsigned i = 0U; i < 3U; ++i) root /= std::string(100U, 'x') + std::to_string(i);
+    std::filesystem::create_directories(root);
+    assert(root.native().size() > 260U);
+    assert(CanonicalBackupPath(root).native().starts_with(L"\\\\?\\"));
+    const auto target = ResolveBackupTarget(root, "daily");
+    test::FeedPhaseWatchdog::Phase("extended roots: prepare target " + target.string());
+    PrepareBackupTarget(fixture.source, target);
+    assert(std::filesystem::exists(target / kBackupIncompleteName));
+    const auto restored = root / "restored";
+    test::FeedPhaseWatchdog::Phase("extended roots: validate restore target");
+    RequireBackupTarget(fixture.backup, restored);
+    test::FeedPhaseWatchdog::Phase("extended roots: resolve restore target");
+    assert(CanonicalBackupPath(restored).native().starts_with(L"\\\\?\\"));
+    test::FeedPhaseWatchdog::Phase("extended roots: enumerate restore parent");
+    std::size_t children = 0U;
+    for (const auto& entry : backup_detail::DirectoryEntries(root)) {
+        assert(entry.path().filename() == "daily");
+        ++children;
+    }
+    assert(children == 1U);
+    struct SyncTrace {
+        SyncTrace() {
+            SetDirectorySyncObserverForTests([](const auto& directory) {
+                test::FeedPhaseWatchdog::Phase("extended roots: sync directory " + directory.string());
+            });
+            SetFileSyncObserverForTests([](const auto& file) {
+                test::FeedPhaseWatchdog::Phase("extended roots: sync file " + file.string());
+            });
+        }
+        ~SyncTrace() {
+            SetFileSyncObserverForTests({});
+            SetDirectorySyncObserverForTests({});
+        }
+    } sync_trace;
+    test::FeedPhaseWatchdog::Phase("extended roots: restore " + restored.string());
+    RestoreBackup(fixture.backup, restored);
+    test::FeedPhaseWatchdog::Phase("extended roots: verify");
+    assert(Verify(restored).errors == 0U);
+    const auto copied = root / "completed-source";
+    test::FeedPhaseWatchdog::Phase("extended roots: copy completed source");
+    PrepareBackupTarget(fixture.source, copied);
+    for (const auto& file : fixture.record.files) {
+        const auto copy = CopyBackupFile(fixture.backup / file.relative_path, copied, file.relative_path, file.size);
+        assert(copy.crc32 == file.crc32);
+    }
+    CompleteBackup(copied, fixture.record);
+    assert(Verify(copied).errors == 0U);
+    const auto from_extended = root / "restored-from-extended-source";
+    test::FeedPhaseWatchdog::Phase("extended roots: restore completed source");
+    RestoreBackup(copied, from_extended);
+    assert(Verify(from_extended).errors == 0U);
+    auto overlap = std::filesystem::path(L"\\\\?\\" + fixture.source.wstring());
+    overlap /= std::string(200U, 'y');
+    Throws<std::invalid_argument>([&] { RequireBackupTarget(fixture.source, overlap); });
+    test::FeedPhaseWatchdog::Phase("extended roots: cleanup");
+    RemoveBackupStaging(top);
+    assert(!std::filesystem::exists(top));
 #endif
 }
 } // namespace
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    _set_error_mode(_OUT_TO_STDERR);
+#endif
     if (argc == 2) {
         const std::string_view name(argv[1]);
+        test::FeedPhaseWatchdog watchdog("backup restore " + std::string(name));
         if (name == "filters") FilteredSlots();
         else if (name == "identity") EpochAndHistory();
         else if (name == "lineage") LineageContinuation();
         else if (name == "cleanup") RestoreTemporaryCleanup();
+        else if (name == "cleanup-refusal") { RestoreCleanupRefusalPreservesFailure(); RestoreCleanupRefusesReplacedParent(); }
         else if (name == "cold") CrashConsistentWal();
         else if (name == "symlinks") SymlinkedRootsAndStaging();
         else if (name == "roots") { RootedTargets(); InventoryPathSpellings(); }
+        else if (name == "reparse") ReparseInventoryAndRestore();
+        else if (name == "source-reparse") BackupSourceDirectoryReplacement();
+        else if (name == "ancestor-reparse") DirectoryAncestorReplacement();
+        else if (name == "extended") ExtendedRootPaths();
         else return 2;
         return 0;
     }
-    FilteredSlots(); Records(); EpochAndHistory(); LineageContinuation(); StrictInventory(); TargetsAndCopies(); CompletionFailures();
-    RestoreTemporaryCleanup(); CrashConsistentWal(); SymlinkedRootsAndStaging(); RootedTargets(); InventoryPathSpellings();
-    std::cout << "12 backup restore groups passed\n";
+    const auto run = [](std::string_view name, const auto& group) {
+        test::FeedPhaseWatchdog watchdog("backup restore " + std::string(name));
+        group();
+    };
+    run("filtered slots", FilteredSlots); run("records", Records); run("identity", EpochAndHistory);
+    run("lineage", LineageContinuation); run("inventory", StrictInventory); run("targets and copies", TargetsAndCopies);
+    run("cleanup refusal", RestoreCleanupRefusalPreservesFailure); run("cleanup parent replacement", RestoreCleanupRefusesReplacedParent);
+    run("completion failures", CompletionFailures); run("temporary cleanup", RestoreTemporaryCleanup);
+    run("cold WAL", CrashConsistentWal); run("root aliases", SymlinkedRootsAndStaging);
+    run("rooted targets", RootedTargets); run("inventory paths", InventoryPathSpellings);
+    run("inventory reparse", ReparseInventoryAndRestore); run("source directory replacement", BackupSourceDirectoryReplacement);
+    run("directory ancestor replacement", DirectoryAncestorReplacement);
+    run("extended roots", ExtendedRootPaths);
+    std::cout << "18 backup restore groups passed\n";
 }
