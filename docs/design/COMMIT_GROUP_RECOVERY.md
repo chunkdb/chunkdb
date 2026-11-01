@@ -135,7 +135,9 @@ The same selected-root rule applies to ID eviction and ordinary certified-cut ad
 One owner-transition continuation serializes all pending root updates through their final publication, including checkpoints, group-reference updates, journal and ID switches, lifecycle changes and restore.
 The owner-transition permit is separate from the short directory visibility gate and can remain owned during file sync without holding that visibility gate.
 Every updater acquires or drains its table admission, pins its coordinate checkpoint ownership and finishes all required chunk-lock acquisition before requesting the permit.
-It releases chunk mutexes before waiting for the permit, and no permit holder waits for a table lease, chunk mutex, catalog operation or another owner transition.
+Group dependency settlement and other work requiring a separate owner transition also finish before requesting the permit.
+An updater may retain already owned chunk locks while waiting for the permit, but no permit holder waits for a table lease, new chunk mutex, catalog operation, group settlement or another owner transition.
+This preserves the group's validated write set through its decision without introducing a permit-to-chunk acquisition edge.
 Prepared ownership pins keep its exact selected artifacts and generations available while it waits.
 Reversible staging captures an expected root generation; after receiving the permit it must re-admit against the current root and rebuild or rebase changed paths if another updater advanced it.
 No updater may publish a pending plan derived from an obsolete root or replace another updater's pending plan.
