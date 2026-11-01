@@ -175,6 +175,14 @@ std::optional<ChunkIndexRecord> ChunkStore::RetainedEmptyBoundaryForArchive(cons
     return std::nullopt;
 }
 
+std::uint64_t ChunkStore::RetainedTombstoneCount() {
+    return CoordinateIndexForScan()->tombstone_count();
+}
+
+std::uint64_t ChunkStore::RetainedDeletionFloor() {
+    return CoordinateIndexForScan()->retained_deletion_floor();
+}
+
 std::shared_ptr<ChunkCoordinateIndex> ChunkStore::CoordinateIndexForScan() {
     if (access_mode_ != AccessMode::kReadOnly) return coordinate_index_;
     std::lock_guard refresh(coordinate_index_refresh_mutex_);

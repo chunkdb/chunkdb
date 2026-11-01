@@ -342,7 +342,9 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         const auto txn_boundary = TxnRollbackBoundaryForChunk(txn_intents, chunk_coord, geometry_, store_id_);
         bool rollback_boundary = snapshot.intent.present && intent_state == ConditionalIntentState::kRollback;
         if (txn_boundary.has_value()) {
-            committed_wal_size = rollback_boundary ? std::min(committed_wal_size, *txn_boundary) : *txn_boundary;
+            if (rollback_boundary && committed_wal_size != *txn_boundary)
+                throw std::runtime_error("conflicting pending rollback boundaries for one chunk");
+            committed_wal_size = *txn_boundary;
             rollback_boundary = true;
         }
 
@@ -387,7 +389,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 &loaded.presence_bitmap,
                 &loaded.vars,
                 track_prefix ? &boundaries : nullptr,
-                &loaded.chunk_columns);
+                &loaded.chunk_columns, loaded.commit_time_ms);
             loaded.schema_version = geometry_.layout().schema().version;
             if (replay.torn_creation) {
                 // An interrupted creation holds no mutation, and names no
@@ -491,7 +493,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             &loaded.presence_bitmap,
             &loaded.vars,
             track_prefix ? &boundaries : nullptr,
-            &loaded.chunk_columns);
+            &loaded.chunk_columns, {}, loaded.commit_time_ms);
         wal_input.close();
         loaded.schema_version = geometry_.layout().schema().version;
         if (replay.torn_creation) {

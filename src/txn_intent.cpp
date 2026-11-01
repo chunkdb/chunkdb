@@ -20,6 +20,7 @@
 #include "txn_history.hpp"
 #include "txn_intent_format.hpp"
 #include "wal_replay.hpp"
+#include "chunk_coordinate_index.hpp"
 
 namespace chunkdb {
 
@@ -29,43 +30,6 @@ void CrashAtRecoveryFailpoint(const char* key) {
     if (ConsumeFailpointEnv(key)) {
         std::_Exit(86);
     }
-}
-
-void ValidateRollbackMember(const std::filesystem::path& data_dir, const Geometry& geometry,
-    const StoreId& table_id, FeatureFlags features, const TxnIntentEntry& entry) {
-    const auto wal_path = ChunkWalPath(data_dir, geometry, entry.coord);
-    std::error_code ec;
-    const auto status = std::filesystem::symlink_status(wal_path, ec);
-    if (ec && ec != std::errc::no_such_file_or_directory)
-        throw std::runtime_error("failed to inspect rollback WAL " + wal_path.string() + ": " + ec.message());
-    if (!std::filesystem::exists(status)) {
-        if (entry.wal_boundary != 0U)
-            throw std::runtime_error("missing rollback WAL " + wal_path.string());
-        return;
-    }
-    if (!std::filesystem::is_regular_file(status))
-        throw std::runtime_error("rollback WAL is not a regular file: " + wal_path.string());
-    const auto size = std::filesystem::file_size(wal_path, ec);
-    if (ec || size < entry.wal_boundary)
-        throw std::runtime_error("rollback WAL is shorter than its committed boundary: " + wal_path.string());
-    if (entry.wal_boundary == 0U) return;
-    std::ifstream file(wal_path, std::ios::binary);
-    if (!file) throw std::runtime_error("failed to open rollback WAL " + wal_path.string());
-    ChunkState state;
-    std::uint64_t schema = 0U;
-    const auto image_path = ChunkDataPath(data_dir, geometry, entry.coord);
-    if (std::filesystem::exists(image_path)) {
-        auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, entry.coord, table_id, features),
-            geometry, entry.coord, table_id, features);
-        schema = image.schema_version;
-        state.version = image.revision;
-        state.written = image.revision != 0U;
-        state.payload = std::move(image.payload);
-        state.presence_bitmap = std::move(image.presence_bitmap);
-        state.vars = std::move(image.vars);
-        state.chunk_columns = std::move(image.chunk_columns);
-    }
-    ValidateWalPrefix(file, entry.wal_boundary, geometry, entry.coord, table_id, features, std::move(state), schema);
 }
 
 }  // namespace
@@ -119,7 +83,9 @@ std::optional<std::uint64_t> TxnRollbackBoundaryForChunk(
         }
         for (const auto& entry : intent.entries) {
             if (entry.coord == coord) {
-                boundary = std::min(boundary.value_or(entry.wal_boundary), entry.wal_boundary);
+                if (boundary && *boundary != entry.wal_boundary)
+                    throw std::runtime_error("conflicting pending rollback boundaries for one chunk");
+                boundary = entry.wal_boundary;
             }
         }
     }
@@ -187,14 +153,17 @@ void ChunkStore::RecoverTransactionIntents(bool validate_only) {
     std::vector<TxnIntent> parsed(intents.size());
     for (std::size_t i = 0; i < intents.size(); ++i) {
         const auto& [version, path] = intents[i];
-        if (!TryParseTxnIntent(LoadFile(path), &parsed[i], geometry_.dims(), store_id_) || parsed[i].version != version) {
+        if (!TryParseTxnIntent(LoadRecoveryTxnIntent(path), &parsed[i], geometry_.dims(), store_id_) || parsed[i].version != version) {
             throw std::runtime_error("invalid transaction intent: " + path.string());
         }
     }
     for (const auto& intent : parsed) {
         if (intent.state != TxnIntentState::kRollback) continue;
-        for (const auto& entry : intent.entries)
-            ValidateRollbackMember(data_dir_, geometry_, store_id_, features_, entry);
+        for (const auto& entry : intent.entries) {
+            const auto retained = coordinate_index_->EmptyBoundary(entry.coord);
+            ValidateRollbackWalBoundary(data_dir_, geometry_, store_id_, features_, entry.coord,
+                entry.wal_boundary, retained ? &*retained : nullptr);
+        }
     }
     if (validate_only) return;
 

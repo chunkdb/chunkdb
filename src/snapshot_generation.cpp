@@ -453,8 +453,9 @@ void CrashAtSnapshotFailpoint(const char* key) {
     }
     std::sort(names.begin(), names.end());
     std::vector<ReadOnlyArtifactSnapshot> intents;
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)> read_intent = LoadRecoveryTxnIntent;
     for (const auto& name : names) {
-        auto intent = ReadArtifactForSnapshot(intent_dir / name);
+        auto intent = ReadArtifactForSnapshot(intent_dir / name, &read_intent);
         if (intent.present) {
             intents.push_back(std::move(intent));
         }

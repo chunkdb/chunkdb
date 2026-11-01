@@ -614,6 +614,8 @@ bool ApplyRetainedEmptyBase(const Geometry& geometry, const ChunkIndexRecord& bo
         throw std::invalid_argument("retained replay base is not an empty boundary");
     if (revision > boundary.revision) return false;
     if (revision == boundary.revision) {
+        if (commit_time_ms != boundary.commit_time_ms)
+            throw std::runtime_error("retained empty boundary conflicts with an equal-version producing time");
         auto current_columns = chunk_columns;
         BringChunkColumnsToSchema(geometry, schema_version, geometry.chunk_schema().version, &current_columns);
         if (ChunkPopulated(geometry, presence, current_columns.get()))

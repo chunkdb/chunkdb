@@ -74,6 +74,7 @@ add_library(chunkdb_core STATIC
     src/chunk_scan.cpp
     src/chunk_store.cpp
     src/conditional_intent.cpp
+    src/rollback_preflight.cpp
     src/crc32.cpp
     src/crc32_armv8.cpp
     src/crc32_clmul.cpp
@@ -110,6 +111,7 @@ add_library(chunkdb_core STATIC
     src/store_resources.cpp
     src/table_catalog.cpp
     src/table_chunk_columns.cpp
+    src/table_tombstones.cpp
     src/table_catalog_migrations.cpp
     src/migrations_records.cpp
     src/migrations_apply.cpp
@@ -311,7 +313,7 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME geometry_bit COMMAND chunkdb_geometry_bit_test)
 
-    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base chunk_mutation_model chunk_identity_scan)
+    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -876,6 +878,8 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_feed_archive_base_test
         chunkdb_chunk_mutation_model_test
         chunkdb_chunk_identity_scan_test
+        chunkdb_rollback_preflight_test
+        chunkdb_table_tombstones_test
         chunkdb_storage_test
         chunkdb_store_manifest_test
         chunkdb_chunk_vars_test
@@ -1010,6 +1014,8 @@ if(CHUNKDB_BUILD_TESTS)
         feed_archive_base
         chunk_mutation_model
         chunk_identity_scan
+        rollback_preflight
+        table_tombstones
         storage
         store_manifest
         chunk_vars

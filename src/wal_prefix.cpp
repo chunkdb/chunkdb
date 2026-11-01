@@ -51,6 +51,8 @@ void ValidateWalPrefix(std::istream& input, std::uint64_t prefix_bytes, const Ge
             throw std::runtime_error("rollback WAL frame revisions do not increase");
         previous = info.revision;
         position += frame_bytes;
+        if (info.revision == base && state.written && info.commit_time_ms != state.commit_time_ms)
+            throw std::runtime_error("rollback WAL producing time conflicts with its replay base");
         if (info.revision <= base) continue;
         if (info.schema_version < schema_version)
             throw std::runtime_error("rollback WAL frame schemas move backwards");

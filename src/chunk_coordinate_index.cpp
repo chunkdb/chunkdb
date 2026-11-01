@@ -605,4 +605,17 @@ void ChunkCoordinateIndex::Compact(std::uint64_t before, std::uint64_t completed
     } catch (const std::exception&) { failed_.store(true, std::memory_order_release); throw; }
 }
 
+std::uint64_t ChunkCoordinateIndex::tombstone_count() const {
+    Check();
+    std::lock_guard lock(mutex_);
+    std::uint64_t count = 0U;
+    for (const auto& [coord, node] : coordinates_) {
+        (void)coord;
+        if (node.retained_empty && node.retained_empty->kind == ChunkIndexKind::kDeleted &&
+            !node.populated.load(std::memory_order_acquire) &&
+            node.revision.load(std::memory_order_acquire) == node.retained_empty->revision) ++count;
+    }
+    return count;
+}
+
 }  // namespace chunkdb

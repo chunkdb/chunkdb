@@ -667,6 +667,8 @@ class ChunkStore {
     // Completed commit frontier, including terminal reservation gaps. A
     // read-only process cannot establish the writer's frontier and returns null.
     [[nodiscard]] std::optional<std::uint64_t> CompletedRevision() const;
+    [[nodiscard]] std::uint64_t RetainedTombstoneCount();
+    [[nodiscard]] std::uint64_t RetainedDeletionFloor();
     [[nodiscard]] bool HasWrittenChunkIdentities() const;
     [[nodiscard]] ChunkMutationResult CasChunkState(
         std::int64_t chunk_x,
@@ -1435,7 +1437,7 @@ class ChunkStore {
     // tokens issued from now on are above every revision the store holds even
     // when the clock bookkeeping was lost and restarted low.
     void RaiseVersionClockAbove(std::uint64_t revision);
-    void RecoverConditionalRollbackIntents();
+    void RecoverConditionalRollbackIntents(bool validate_only = false);
     // Creates the manifest of a new store, or confirms the existing one
     // still records the geometry this store opened with.
     void InitializeStoreManifest();

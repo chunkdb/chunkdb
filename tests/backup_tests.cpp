@@ -228,6 +228,55 @@ void FailedIndexRefusesBackup() {
     assert(Error([&] { (void)catalog.BackupTo(root / "backup", {}); }).find("failed coordinate index") != std::string::npos);
     assert(!std::filesystem::exists(root / "backup" / kBackupMarkerName));
 }
+
+void CancelBetweenBoundedWalReplayReads() {
+    ScopedTempDir temporary("chunkdb-backup-cancel-streaming-wal");
+    const auto root = std::filesystem::canonical(temporary.path());
+    TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
+    catalog.ChangeColumns("default", [](const TableSchema& schema) {
+        return AddColumn(schema, {.id = 0U, .name = "data", .type = {ColumnKind::kBytes, 1024U * 1024U},
+            .nullable = true, .default_value = {}});
+    });
+    {
+        auto lease = catalog.Find("default")->Acquire();
+        (void)lease->store().SetBlock(0, 0, {{"data", BytesValue{std::vector<std::uint8_t>(512U * 1024U, 7U)}}}, {});
+    }
+    class ReadPause final : public BackupTestHook {
+      public:
+        void Run(Point point, std::string_view, std::uint64_t) override {
+            if (point != Point::kBeforeWalReplayRead) return;
+            std::unique_lock lock(mutex_);
+            if (++reads_ != 8U) return;
+            entered_ = true;
+            condition_.notify_all();
+            condition_.wait(lock, [&] { return released_; });
+        }
+        void Wait() {
+            std::unique_lock lock(mutex_);
+            assert(condition_.wait_for(lock, 10s, [&] { return entered_; }));
+        }
+        void Release() { std::lock_guard lock(mutex_); released_ = true; condition_.notify_all(); }
+        std::size_t reads() { std::lock_guard lock(mutex_); return reads_; }
+      private:
+        std::mutex mutex_;
+        std::condition_variable condition_;
+        std::size_t reads_ = 0U;
+        bool entered_ = false, released_ = false;
+    } pause;
+    std::stop_source cancellation;
+    catalog.SetBackupHookForTests(&pause);
+    auto backup = std::async(std::launch::async, [&] {
+        return Error([&] { (void)catalog.BackupTo(root / "backup", {.cancelled = cancellation.get_token()}); });
+    });
+    pause.Wait();
+    assert(cancellation.request_stop());
+    pause.Release();
+    assert(backup.get().find("backup cancelled") != std::string::npos);
+    catalog.SetBackupHookForTests(nullptr);
+    assert(pause.reads() == 8U);
+    assert(!std::filesystem::exists(root / "backup" / kBackupMarkerName));
+}
 void CutAndProgress(DurabilityMode mode) {
     ScopedTempDir temp("chunkdb-backup-cut");
     const auto root = std::filesystem::canonical(temp.path());
@@ -1057,6 +1106,7 @@ void CancelCatalogWaitAndRestrictions() {
 }
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--retained-index") { RetainedIdentityCutAndRestore(); FailedIndexRefusesBackup(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--cancel-wal-replay") { CancelBetweenBoundedWalReplayReads(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--batched-eviction") { BatchedEvictionDuringPin(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--waiting-maintenance") { WaitingBackupDefersCheckpoints(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--dropped-table") { DroppedSnapshotTableSkipped(); return 0; }
@@ -1083,6 +1133,7 @@ int main(int argc, char** argv) {
     CrcChunks();
     RetainedIdentityCutAndRestore();
     FailedIndexRefusesBackup();
+    CancelBetweenBoundedWalReplayReads();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint}) { CutAndProgress(mode); AcknowledgedLoad(mode); }
     CopyReleasesHoldsAndBusy(); TargetAndCancellation(); CompletionAndPoison(); FailedGenerationAndEmptyCatalog(); CancelCatalogWaitAndRestrictions();
     for (unsigned defect = 0; defect < 5U; ++defect) ColdRecovery(defect);
