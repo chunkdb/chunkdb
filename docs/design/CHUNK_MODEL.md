@@ -71,6 +71,10 @@ One ordered coordinate index per table serves bounded scan pages without walking
 Ordinary writes update membership only on population transitions, with no index I/O for updates to an already populated chunk.
 A new coordinate reserves its in-memory map node before the write can commit, and ordinary writes publish no persistent live hint before their commit decision.
 Each stable coordinate node carries atomic producing identity and population state; writes to an existing node publish those fields before completing their producer bound without taking the ordered-map mutex.
+These atomics are candidate hints, not a coherent returned chunk image; forms, producing revision and time are revalidated together under the chunk lock or obtained from a checked retained tombstone.
+`SCAN SINCE` uses only the node's acquire-loaded producing revision for its lower-bound prefilter and never excludes an entry because of its population flag or a revision above the captured completed frontier.
+The completed-frontier capture acquires the publication ordering of every producer it covers, so a node revision at or below the promised position cannot remain unpublished to that scan.
+Ordinary scans may use a false population hint to omit a coordinate at that concurrent committed transition; every included coordinate is revalidated before output.
 The chunk cache retains only a borrowed node pointer owned by its table index, and failed first-write reservations remove their unpublished node while still holding that chunk's lock and clear that cached pointer.
 A reservation cannot outlive its pinned chunk, and compaction reopens the table after exclusive admission before removing nodes whose cached pointers could otherwise remain.
 A committed empty identity remains an in-memory scan deletion while its image or WAL still holds it; collection makes that identity a durable index tombstone.
