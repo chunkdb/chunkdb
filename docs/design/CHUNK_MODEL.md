@@ -128,9 +128,11 @@ For `BEFORE n`, the operation floor is `min(n - 1, completed_frontier)`; zero is
 A durable pending inventory decision precedes every shard replacement.
 Before that decision, each shard's filtered replacement is written and synced under its owned staging name.
 Every staged image's parent directory is synced before the pending inventory decision can name it.
-Each pending inventory entry binds the old committed cut and the exact replacement length and whole-file checksum.
+Each pending inventory entry binds the old committed cut, exact replacement length and SHA-256 digest of every replacement file byte.
+The existing streaming SHA-256 implementation supplies this binding without adding a dependency.
+Whole-file CRCs cannot identify replacement content when complete headers and records already contain trailing CRCs, because valid equal-length files may share a fixed residue.
 That decision publishes the cumulative refusal floor before any deletion disappears, and pending compaction fences read-only opening until recovery completes it.
-Recovery accepts an installed replacement only when its exact length, checksum and complete record validation match the pending entry; otherwise it redoes that shard from its checked staged image.
+Recovery accepts an installed replacement only when its exact length, SHA-256 digest and complete record validation match the pending entry; otherwise it redoes that shard from its checked staged image.
 A decided shorter replacement is never judged against the old committed cut alone, and a missing required staged image is damage unless the installed replacement already matches.
 After every replacement and directory is durable, the final inventory publishes all replacement cuts, clears its decision fields, and only then permits staged-image cleanup.
 Before a decision exists, unreferenced compaction staging is unpublished and cannot authorize discarding any live log or tombstone.
@@ -140,7 +142,7 @@ A decided failure fences serving with an unknown outcome.
 
 An archived WAL retains its original pre-segment base, including schema and metadata, with base revision strictly below the first frame.
 A checked `CKFB` descriptor binds epoch, dims, coordinates, first revision and the exact image or retained-empty base.
-Image length and checksum bind a pinned original image; a missing base is damage.
+Image length and SHA-256 digest bind every byte of a pinned original image, including its checked header and opaque sections; a missing base is damage.
 The original base and descriptor become durable before collection or WAL rename can remove their live prerequisites.
 A resurrection segment uses its own retained-empty base and cannot replace a previous segment's nonempty base.
 Rejected or undecided transaction frames never enter sealed archives.
