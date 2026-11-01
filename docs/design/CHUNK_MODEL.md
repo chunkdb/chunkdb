@@ -90,6 +90,8 @@ Its independently checksummed fixed header includes a nonzero monotonic inventor
 Read-only point reads may reuse a completely admitted retained-boundary index only when that header's identity and generation still match inside the same stable snapshot bracket as their image and WAL.
 An ordinary block write changes the table snapshot generation without changing the inventory generation, so refreshing a point does not rebuild every retained shard after unrelated writes.
 Read-only scans rebuild their complete live-coordinate candidate index when the table snapshot generation changes and publish it only after one unchanged equal-even whole-index observation.
+That private candidate index also includes producing revision and population copied under the locks of point-cache entries admitted at the same generation, preserving their existing cache authority until the generation changes.
+Cache ownership is pinned before taking individual chunk locks, and the published candidate contains scalar hints rather than borrowed cache pointers.
 Every listed boundary covers a complete header and whole records; a listed log shorter than that boundary is damage.
 Recovery validates complete inventory and logs before mutating artifacts, resolves rollback intents, then reconciles committed image and WAL state.
 Conditional intent names encode exactly the table's dimensions and canonical shard placement.
