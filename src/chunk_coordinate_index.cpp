@@ -369,6 +369,12 @@ ChunkCoordinateNode* ChunkCoordinateIndex::Find(const ChunkCoord& coord) {
     return at == coordinates_.end() ? nullptr : &at->second;
 }
 
+bool ChunkCoordinateIndex::IsPopulationCandidate(const ChunkCoord& coord) const {
+    Check();
+    std::lock_guard lock(mutex_);
+    return populated_.contains(coord);
+}
+
 CoordinateReservation ChunkCoordinateIndex::Prepare(const ChunkCoord& coord, ChunkCoordinateNode** cache_slot) {
     Check();
     CoordinateReservation reservation;

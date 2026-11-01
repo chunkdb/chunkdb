@@ -460,20 +460,21 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
 
     apply_boundary();
     if (std::filesystem::exists(wal_path)) {
-        std::vector<std::uint8_t> wal_bytes;
-        try {
-            wal_bytes = LoadFile(wal_path);
-        } catch (...) {
-            // WAL can be removed concurrently by checkpoint cleanup.
-            // If it no longer exists, treat as already checkpointed.
+        std::ifstream wal_input(wal_path, std::ios::binary | std::ios::ate);
+        if (!wal_input) {
             if (std::filesystem::exists(wal_path)) {
-                throw;
+                throw std::runtime_error("failed to open WAL " + wal_path.string());
             }
             finish();
             return loaded;
         }
-
-        const auto replay = ReplayWal(
+        const auto measured = wal_input.tellg();
+        if (measured < 0) throw std::runtime_error("failed to measure WAL " + wal_path.string());
+        const auto wal_bytes = static_cast<std::uint64_t>(measured);
+        wal_input.seekg(0);
+        if (!wal_input) throw std::runtime_error("failed to rewind WAL " + wal_path.string());
+        const auto replay = ReplayWalStream(
+            wal_input,
             wal_bytes,
             geometry_,
             chunk_coord,
@@ -486,6 +487,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             &loaded.vars,
             track_prefix ? &boundaries : nullptr,
             &loaded.chunk_columns);
+        wal_input.close();
         loaded.schema_version = geometry_.layout().schema().version;
         if (replay.torn_creation) {
             LogMessage(
@@ -495,7 +497,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 {
                     {"chunk_x", std::to_string(chunk_coord.x)},
                     {"chunk_y", std::to_string(chunk_coord.y)},
-                    {"bytes", std::to_string(wal_bytes.size())},
+                    {"bytes", std::to_string(wal_bytes)},
                 });
             if (writable) {
                 TrimWalForAppend(chunk_coord, wal_path, 0U);
@@ -520,7 +522,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             throw std::runtime_error(
                 "WAL " + wal_path.string() + " is damaged before its end (" + replay.stop_reason +
                 " at byte " + std::to_string(replay.valid_end) + " of " +
-                std::to_string(wal_bytes.size()) + "); refusing to load chunk (" +
+                std::to_string(wal_bytes) + "); refusing to load chunk (" +
                 std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) + ")");
         }
         if (!replay.vars_problem.empty()) {

@@ -14,6 +14,13 @@ namespace chunkdb {
 
 inline constexpr std::string_view kChunkIndexFileName = "chunkdb.index";
 
+class CoordinateArtifactTestHook {
+  public:
+    virtual ~CoordinateArtifactTestHook() = default;
+    virtual void BeforeStatus(const std::filesystem::path& path) = 0;
+};
+void SetCoordinateArtifactTestHook(CoordinateArtifactTestHook* hook) noexcept;
+
 struct ChunkCoordinateNode {
     std::atomic<std::uint64_t> revision{0U};
     std::atomic<bool> populated{false};
@@ -68,6 +75,7 @@ class ChunkCoordinateIndex {
     void ObserveRecovered(const ChunkCoord& coord, const ChunkState& state);
     // A borrowed node is used only under its canonical chunk's exclusive lock.
     [[nodiscard]] ChunkCoordinateNode* Find(const ChunkCoord& coord);
+    [[nodiscard]] bool IsPopulationCandidate(const ChunkCoord& coord) const;
     [[nodiscard]] CoordinateReservation Prepare(const ChunkCoord& coord, ChunkCoordinateNode** cache_slot);
     [[nodiscard]] CoordinatePage Page(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
         std::optional<std::uint64_t> since = {}) const;

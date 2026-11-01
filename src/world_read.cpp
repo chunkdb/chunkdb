@@ -817,6 +817,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRangeImpl(
     std::int64_t chunk_x1,
     std::int64_t chunk_y1,
     bool with_vars) {
+    if (geometry_.dims() != 2U) throw std::invalid_argument("chunk coordinates require 3 axes");
     if (chunk_x0 > chunk_x1 || chunk_y0 > chunk_y1) {
         throw std::invalid_argument("chunk range corners must satisfy x0<=x1 and y0<=y1");
     }
@@ -836,11 +837,13 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRangeImpl(
 
     std::vector<ChunkRangeEntry> entries;
     std::size_t vars_bytes = 0;
+    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
     for (std::int64_t chunk_x = chunk_x0;; ++chunk_x) {
         for (std::int64_t chunk_y = chunk_y0;; ++chunk_y) {
-            AppendPopulatedChunkRangeEntry(
-                ChunkCoord{chunk_x, chunk_y}, max_entries, "GET AREA", with_vars, &vars_bytes, &entries, snapshot,
-                txn_read);
+            const ChunkCoord coord{chunk_x, chunk_y};
+            if (!index || index->IsPopulationCandidate(coord))
+                AppendPopulatedChunkRangeEntry(
+                    coord, max_entries, "GET AREA", with_vars, &vars_bytes, &entries, snapshot, txn_read);
             if (chunk_y == chunk_y1) {
                 break;
             }
@@ -878,6 +881,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadiusImpl(
     std::int64_t center_y,
     std::int64_t radius_chunks,
     bool with_vars) {
+    if (geometry_.dims() != 2U) throw std::invalid_argument("chunk coordinates require 3 axes");
     if (radius_chunks < 0) {
         throw std::invalid_argument("chunk radius must be >= 0");
     }
@@ -916,6 +920,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadiusImpl(
     // fall outside the int64 domain do not exist and are skipped.
     std::vector<ChunkRangeEntry> entries;
     std::size_t vars_bytes = 0;
+    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
     for (std::int64_t dx = -radius_chunks; dx <= radius_chunks; ++dx) {
         if (dx < 0 && center_x < std::numeric_limits<std::int64_t>::min() - dx) {
             continue;
@@ -935,9 +940,10 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadiusImpl(
             if (dy > 0 && center_y > std::numeric_limits<std::int64_t>::max() - dy) {
                 break;
             }
-            AppendPopulatedChunkRangeEntry(
-                ChunkCoord{chunk_x, center_y + dy}, max_entries, "GET AREA AROUND", with_vars, &vars_bytes, &entries,
-                snapshot, txn_read);
+            const ChunkCoord coord{chunk_x, center_y + dy};
+            if (!index || index->IsPopulationCandidate(coord))
+                AppendPopulatedChunkRangeEntry(
+                    coord, max_entries, "GET AREA AROUND", with_vars, &vars_bytes, &entries, snapshot, txn_read);
         }
     }
     return entries;
