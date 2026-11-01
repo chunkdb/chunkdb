@@ -535,6 +535,97 @@ void BackupSourceDirectoryReplacement() {
     assert(Verify(recovered).errors == 0U);
 #endif
 }
+void DirectoryAncestorReplacement() {
+#ifdef _WIN32
+    test::ScopedTempDir temporary("chunkdb-directory-ancestor-race");
+    const auto root = std::filesystem::canonical(temporary.path());
+    const auto ancestor = root / "ancestor", moved = root / "moved", outside = root / "outside";
+    const auto relative = std::filesystem::path("source/L_0_0/C_0_0.chk");
+    const auto original = ancestor / relative, foreign = outside / relative;
+    Geometry geometry{{1U, 1U, 2U, 1U, 8U}};
+    const auto epoch = NewStoreId();
+    const auto own_bytes = SerializeChunkImage(geometry, {0, 0}, Bytes{7U, 0U}, Bytes{1U},
+        CheckpointCompression::kNone, 2U, 20U, epoch);
+    const auto foreign_bytes = SerializeChunkImage(geometry, {0, 0}, Bytes{9U, 0U}, Bytes{1U},
+        CheckpointCompression::kNone, 2U, 20U, epoch);
+    Save(original, own_bytes); Save(foreign, foreign_bytes); Save(outside / "sentinel", Bytes{'s'});
+    struct Facts {
+        BY_HANDLE_FILE_INFORMATION info{};
+        Bytes bytes;
+        DWORD error = ERROR_SUCCESS;
+    };
+    const auto facts = [](const std::filesystem::path& path) {
+        Facts result;
+        const auto handle = CreateFileW(path.c_str(), GENERIC_READ | FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) { result.error = GetLastError(); return result; }
+        if (!GetFileInformationByHandle(handle, &result.info)) result.error = GetLastError();
+        else {
+            assert(result.info.nFileSizeHigh == 0U && result.info.nFileSizeLow <= 4096U);
+            result.bytes.resize(result.info.nFileSizeLow);
+            DWORD read = 0U;
+            if (!ReadFile(handle, result.bytes.data(), static_cast<DWORD>(result.bytes.size()), &read, nullptr))
+                result.error = GetLastError();
+            else if (read != result.bytes.size()) result.error = ERROR_HANDLE_EOF;
+        }
+        assert(CloseHandle(handle) != 0);
+        return result;
+    };
+    const auto same = [](const Facts& left, const Facts& right) {
+        return left.error == ERROR_SUCCESS && right.error == ERROR_SUCCESS &&
+            left.info.dwVolumeSerialNumber == right.info.dwVolumeSerialNumber &&
+            left.info.nFileIndexHigh == right.info.nFileIndexHigh && left.info.nFileIndexLow == right.info.nFileIndexLow;
+    };
+    const auto report = [](const char* name, const Facts& value) {
+        std::cerr << name << " error=" << value.error << " volume=" << value.info.dwVolumeSerialNumber
+                  << " index_high=" << value.info.nFileIndexHigh << " index_low=" << value.info.nFileIndexLow
+                  << " bytes=" << value.bytes.size() << " crc32=" << Crc32(value.bytes) << '\n';
+    };
+    const auto before = facts(original), foreign_before = facts(foreign);
+    assert(before.error == ERROR_SUCCESS && before.bytes == own_bytes);
+    assert(foreign_before.error == ERROR_SUCCESS && foreign_before.bytes == foreign_bytes && !same(before, foreign_before));
+    assert(MoveFileExW(ancestor.c_str(), moved.c_str(), MOVEFILE_WRITE_THROUGH) != 0);
+    assert(MoveFileExW(moved.c_str(), ancestor.c_str(), MOVEFILE_WRITE_THROUGH) != 0);
+    Facts consumed;
+    bool renamed = false, safe = false;
+    {
+        backup_detail::DirectoryEntries entries(original.parent_path(), true);
+        assert(entries != backup_detail::DirectoryEntries{});
+        const auto entry = *entries;
+        assert(entry.path() == original && entry.is_regular_file());
+        renamed = MoveFileExW(ancestor.c_str(), moved.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+        const auto rename_error = renamed ? ERROR_SUCCESS : GetLastError();
+        std::cerr << "directory ancestor rename error=" << rename_error << " cached_regular=" << entry.is_regular_file() << '\n';
+        if (!renamed) {
+            assert(rename_error == ERROR_SHARING_VIOLATION || rename_error == ERROR_ACCESS_DENIED);
+            consumed = facts(entry.path());
+            safe = same(consumed, before) && consumed.bytes == own_bytes;
+        } else {
+            const auto retained = facts(moved / relative);
+            assert(same(retained, before) && retained.bytes == own_bytes);
+            test::ScopedDirectoryAlias alias(outside, ancestor);
+            consumed = facts(entry.path());
+            const bool refused = consumed.error == ERROR_FILE_NOT_FOUND || consumed.error == ERROR_PATH_NOT_FOUND ||
+                consumed.error == ERROR_ACCESS_DENIED || consumed.error == ERROR_SHARING_VIOLATION;
+            safe = refused || (same(consumed, before) && consumed.bytes == own_bytes);
+        }
+        report("directory ancestor original", before);
+        report("directory ancestor foreign", foreign_before);
+        report("directory ancestor consumed", consumed);
+    }
+    if (renamed) {
+        const auto restored = MoveFileExW(moved.c_str(), ancestor.c_str(), MOVEFILE_WRITE_THROUGH);
+        if (!restored) std::cerr << "directory ancestor restore error=" << GetLastError() << '\n';
+        assert(restored != 0);
+    }
+    const auto original_after = facts(original), foreign_after = facts(foreign);
+    assert(same(original_after, before) && original_after.bytes == own_bytes);
+    assert(same(foreign_after, foreign_before) && foreign_after.bytes == foreign_bytes);
+    assert(LoadFile(outside / "sentinel") == Bytes{'s'});
+    assert(safe && "a pinned directory consumer reached a replaced ancestor's foreign file");
+#endif
+}
 void ExtendedRootPaths() {
 #ifdef _WIN32
     Fixture fixture;
@@ -619,6 +710,7 @@ int main(int argc, char** argv) {
         else if (name == "roots") { RootedTargets(); InventoryPathSpellings(); }
         else if (name == "reparse") ReparseInventoryAndRestore();
         else if (name == "source-reparse") BackupSourceDirectoryReplacement();
+        else if (name == "ancestor-reparse") DirectoryAncestorReplacement();
         else if (name == "extended") ExtendedRootPaths();
         else return 2;
         return 0;
@@ -634,6 +726,7 @@ int main(int argc, char** argv) {
     run("cold WAL", CrashConsistentWal); run("root aliases", SymlinkedRootsAndStaging);
     run("rooted targets", RootedTargets); run("inventory paths", InventoryPathSpellings);
     run("inventory reparse", ReparseInventoryAndRestore); run("source directory replacement", BackupSourceDirectoryReplacement);
+    run("directory ancestor replacement", DirectoryAncestorReplacement);
     run("extended roots", ExtendedRootPaths);
-    std::cout << "17 backup restore groups passed\n";
+    std::cout << "18 backup restore groups passed\n";
 }
