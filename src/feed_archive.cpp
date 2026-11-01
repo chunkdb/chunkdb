@@ -30,6 +30,7 @@
 #include "snapshot_generation.hpp"
 #include "txn_history.hpp"
 #include "wal_replay.hpp"
+#include "chunk_coordinate_index.hpp"
 
 namespace chunkdb {
 namespace {
@@ -190,6 +191,7 @@ struct Cursor {
     bool movable = false;
     bool completed_prefix = false;
     bool loaded = false;
+    std::optional<ChunkIndexRecord> retained_empty{};
     std::uint64_t schema_version = 0;
     ChunkState state;
 };
@@ -231,6 +233,40 @@ std::vector<std::uint8_t> ReadFeedSnapshotFile(const std::filesystem::path& path
     return file.At(0U, static_cast<std::size_t>(size));
 }
 
+std::optional<ArchiveBaseDescriptor> ReadFeedArchiveBaseDescriptor(
+    const std::filesystem::path& path, const Geometry& geometry, const StoreId& epoch,
+    ChunkCoord coord, std::uint64_t first) {
+    try {
+        ReadFile file(path);
+        const auto length = ArchiveBaseDescriptorBytes(geometry.dims());
+        if (file.Size() != length) throw std::runtime_error("feed archive base descriptor has wrong length");
+        try {
+            auto descriptor = ParseArchiveBaseDescriptor(file.At(0U, length), geometry.dims(), epoch,
+                coord, first, kMaxChunkImageFileBytes);
+            (void)geometry.LayoutAt(descriptor.base_schema);
+            return descriptor;
+        } catch (const std::invalid_argument& error) {
+            throw std::runtime_error("invalid feed archive base descriptor: " + std::string(error.what()));
+        }
+    } catch (const std::system_error& error) {
+        if (error.code() == std::errc::no_such_file_or_directory) return std::nullopt;
+        throw;
+    }
+}
+
+ChunkStateImage ReadPinnedFeedArchiveBase(const std::filesystem::path& path,
+    const Geometry& geometry, const StoreId& epoch, ChunkCoord coord, FeatureFlags features,
+    const ArchiveBaseDescriptor& descriptor) {
+    ReadFile file(path);
+    const auto bytes = file.Image(geometry, coord, epoch, features);
+    auto image = ParseChunkImage(bytes, geometry, coord, epoch, features);
+    ValidatePinnedArchiveBaseImage(descriptor,
+        {.dims = geometry.dims(), .epoch = epoch, .coord = coord, .revision = image.revision,
+            .commit_time_ms = image.commit_time_ms, .schema_version = image.schema_version},
+        bytes, kMaxChunkImageFileBytes);
+    return image;
+}
+
 struct FeedArchiveReader::Impl {
     std::filesystem::path root;
     Geometry geometry;
@@ -259,6 +295,7 @@ struct FeedArchiveReader::Impl {
         const bool generation_required = std::filesystem::exists(generation_path);
         const auto generation = ReadSnapshotGenerationForScan(generation_path, generation_required);
         if ((generation.second & 1U) != 0U) throw std::runtime_error("feed archive snapshot is being modified");
+        ChunkCoordinateIndex retained_index(root, geometry, epoch, true);
 
         std::vector<std::vector<std::uint8_t>> transactions;
         const auto intent_dir = ConditionalIntentDirectory(root);
@@ -333,6 +370,7 @@ struct FeedArchiveReader::Impl {
                 if (cursor.done || cursor.next > through) continue;
                 cursor.had_current_base = HasOriginalBase(ChunkDataPath(root, geometry, cursor.coord), cursor.coord,
                     epoch, features, cursor.first, geometry.dims());
+                cursor.retained_empty = retained_index.EmptyBoundary(cursor.coord);
                 const auto duplicate = std::find_if(cursors.begin(), cursors.end(), [&](const auto& archived) {
                     return archived.coord == cursor.coord && archived.first == cursor.first;
                 });
@@ -386,6 +424,7 @@ struct FeedArchiveReader::Impl {
                 archived->last = prefix.last;
                 archived->limit = prefix.limit;
                 archived->completed_prefix = true;
+                archived->retained_empty = prefix.retained_empty;
                 continue;
             }
             Cursor cursor;
@@ -397,6 +436,7 @@ struct FeedArchiveReader::Impl {
             cursor.next = prefix.first;
             cursor.movable = true;
             cursor.completed_prefix = true;
+            cursor.retained_empty = prefix.retained_empty;
             cursors.push_back(std::move(cursor));
         }
         std::sort(cursors.begin(), cursors.end(), [](const auto& a, const auto& b) {
@@ -512,56 +552,67 @@ struct FeedArchiveReader::Impl {
 
     void LoadBase(Cursor& cursor, std::uint64_t first_schema, bool still_live) {
         if (cursor.loaded) return;
-        cursor.loaded = true;
         const auto linked = root / kFeedArchiveDirName / (ChunkFileStem(cursor.coord, geometry.dims()) + "." + std::to_string(cursor.first) + ".chk");
+        const auto descriptor_path = root / kFeedArchiveDirName / ArchiveBaseFileName(cursor.coord, geometry.dims(), cursor.first);
         const auto current = ChunkDataPath(root, geometry, cursor.coord);
-        const auto read_image = [&](const std::filesystem::path& path, bool check_link = false) -> std::optional<ChunkStateImage> {
-            try {
-                ReadFile file(path);
-                // A linked base is published before replacing the live image.
-                // Recheck after opening: a handle to a newer schema's image
-                // must not be parsed with this reader's captured geometry.
-                if (check_link && std::filesystem::exists(linked)) return std::nullopt;
-                return ParseChunkImage(file.Image(geometry, cursor.coord, epoch, features), geometry,
-                    cursor.coord, epoch, features);
-            } catch (const std::system_error& error) {
-                if (error.code() != std::errc::no_such_file_or_directory) throw;
-                return std::nullopt;
+        const auto read_descriptor = [&] {
+            return ReadFeedArchiveBaseDescriptor(descriptor_path, geometry, epoch, cursor.coord, cursor.first);
+        };
+        const auto use_image = [&](ChunkStateImage image) {
+            if (image.revision >= cursor.first || image.schema_version > first_schema)
+                throw std::runtime_error("feed archive base overlaps its WAL");
+            cursor.state = {.version = image.revision, .payload = std::move(image.payload),
+                .presence_bitmap = std::move(image.presence_bitmap), .vars = std::move(image.vars),
+                .written = true, .commit_time_ms = image.commit_time_ms, .chunk_columns = std::move(image.chunk_columns)};
+            cursor.schema_version = image.schema_version;
+            cursor.loaded = true;
+        };
+        const auto use_empty = [&](std::uint64_t schema, std::uint64_t revision, std::uint64_t time) {
+            if (schema > first_schema || revision >= cursor.first)
+                throw std::runtime_error("feed archive empty base overlaps its WAL");
+            cursor.schema_version = schema;
+            cursor.state.payload.assign(geometry.LayoutAt(schema).payload_bytes(), 0U);
+            cursor.state.presence_bitmap.assign(ChunkPresenceBitmapBytes(geometry), 0U);
+            cursor.state.version = revision;
+            cursor.state.commit_time_ms = time;
+            cursor.state.written = revision != 0U;
+            if (cursor.state.written) cursor.state.chunk_columns = DefaultChunkColumnsAt(geometry, schema);
+            cursor.loaded = true;
+        };
+        const auto use_descriptor = [&](const ArchiveBaseDescriptor& descriptor) {
+            if (descriptor.kind == ArchiveBaseKind::kImage) {
+                use_image(ReadPinnedFeedArchiveBase(linked, geometry, epoch, cursor.coord, features, descriptor));
+            } else {
+                if (std::filesystem::exists(linked)) throw std::runtime_error("non-image archive base has an unexpected pinned image");
+                use_empty(descriptor.base_schema, descriptor.base_revision, descriptor.base_time_ms);
             }
         };
-        auto image = read_image(linked);
-        bool has_link = image.has_value();
-        if (!image && still_live && cursor.completed_prefix) {
-            try { cursor.had_current_base = HasOriginalBase(current, cursor.coord, epoch, features, cursor.first, geometry.dims()); }
-            catch (const std::system_error& error) {
-                if (error.code() != std::errc::no_such_file_or_directory) throw;
-            }
-            image = read_image(linked);
-            has_link = image.has_value();
+        if (const auto descriptor = read_descriptor()) { use_descriptor(*descriptor); return; }
+        if (!still_live) throw std::runtime_error("feed archive base descriptor is missing");
+        std::optional<ChunkStateImage> image;
+        try {
+            ReadFile file(current);
+            // A descriptor is durable before replacing this filename. Check
+            // after opening, before parsing a possibly newer schema's image.
+            if (const auto descriptor = read_descriptor()) { use_descriptor(*descriptor); return; }
+            image = ParseChunkImage(file.Image(geometry, cursor.coord, epoch, features), geometry, cursor.coord, epoch, features);
+        } catch (const std::system_error& error) {
+            if (error.code() != std::errc::no_such_file_or_directory) throw;
         }
-        if (!image && still_live && cursor.had_current_base) {
-            image = read_image(current, true);
-            if (!image || image->revision >= cursor.first) {
-                // Checkpoint may have linked the base after our first lookup,
-                // then published/replaced or collected the current image.
-                image = read_image(linked);
-                has_link = image.has_value();
-            }
-        }
-        if (image) {
-            if (has_link && image->revision >= cursor.first)
-                throw std::runtime_error("feed archive base overlaps its WAL");
-            cursor.state = {.version = image->revision, .payload = std::move(image->payload),
-                .presence_bitmap = std::move(image->presence_bitmap), .vars = std::move(image->vars),
-                .written = true, .commit_time_ms = image->commit_time_ms, .chunk_columns = std::move(image->chunk_columns)};
-            cursor.schema_version = image->schema_version;
+        if (const auto descriptor = read_descriptor()) { use_descriptor(*descriptor); return; }
+        auto retained = cursor.retained_empty;
+        if (retained && retained->kind != ChunkIndexKind::kDeleted) retained.reset();
+        if (retained && (retained->coord != cursor.coord || retained->revision == 0U || retained->schema_version == 0U))
+            throw std::runtime_error("invalid retained feed archive base");
+        if (retained && retained->revision < cursor.first &&
+            (!image || image->revision >= cursor.first || retained->revision >= image->revision)) {
+            use_empty(retained->schema_version, retained->revision, retained->commit_time_ms);
             return;
         }
-        // No original image existed: the WAL began with an empty chunk,
-        // even if a crash left its newly published image at the live name.
-        cursor.schema_version = first_schema;
-        cursor.state.payload.assign(geometry.LayoutAt(first_schema).payload_bytes(), 0U);
-        cursor.state.presence_bitmap.assign(ChunkPresenceBitmapBytes(geometry), 0U);
+        if (image && image->revision < cursor.first) { use_image(std::move(*image)); return; }
+        if (image || (retained && retained->revision >= cursor.first))
+            throw std::runtime_error("original live feed base is missing after its WAL was covered");
+        use_empty(first_schema, 0U, 0U);
     }
 
     bool Apply(Cursor& cursor, FeedEntry* entry) {
