@@ -28,12 +28,14 @@ The vector owns snapshot history registrations rather than long-lived table leas
 Every table statement resolves its original vector entry before obtaining its command lease.
 The acquired store must own that exact snapshot, including after an ALTER that retains the table epoch but replaces the store.
 Rights are checked for the statement and again for each written table at commit.
-Commit takes shared feature metadata admission and the catalog operations mutex before checking identities and acquiring all touched table leases in epoch order.
-DDL also takes shared feature admission, so that gate alone cannot exclude a SWAP that pauses one table while waiting for another table's active leases.
-The operations mutex covers the entire lease cohort and is released before loading chunks, taking chunk locks or performing group I/O.
-The operations owner provides a condition-based deadline and cancellation wait, rather than polling a mutex or adding a sleep.
+Commit takes exclusive feature metadata admission before checking identities and acquiring all touched table leases in epoch order.
+Catalog DDL owns shared feature admission, so existing DDL completes before the group obtains its first lease and another DDL cannot interleave between its lease acquisitions.
+The group releases feature admission before loading chunks, taking chunk locks or performing group I/O.
+It never waits for table admission while holding the catalog operations mutex, because an already admitted exclusive table operation can need that mutex to finish.
+The admission gate provides a condition-based deadline and cancellation wait, rather than polling a mutex or adding a sleep.
 The existing single-table lease path remains unchanged; group admission uses a separate deadline-aware lease overload while a table is temporarily busy.
 An empty cohort, missing original owner, duplicate epoch or expired admission is refused before returning any lease.
+An executing group already owns its complete lease cohort and cannot re-enter table-cohort admission or snapshot capture.
 It validates every touched identity before preparing a group and takes chunk locks in epoch and coordinate order.
 An identity or read conflict cannot commit a subset of tables.
 
