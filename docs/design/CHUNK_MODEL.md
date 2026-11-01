@@ -151,6 +151,8 @@ Image length and SHA-256 digest bind every byte of a pinned original image, incl
 The original base and descriptor become durable before collection or WAL rename can remove their live prerequisites.
 A resurrection segment uses its own retained-empty base and cannot replace a previous segment's nonempty base.
 Rejected or undecided transaction frames never enter sealed archives.
+Writer recovery admits every sealed archive range and independent live first-frame overlap before repairing a live WAL tail or removing an alias name.
+This is a complete read-only pass over all candidates, so a corrupt later archive cannot leave an earlier alias or live prefix partially repaired.
 
 Backup pins the complete inventory, index logs and committed image/WAL prefixes at one table cut under maintenance admission.
 The maintenance pin excludes collection until immutable inventory bytes and every listed committed log prefix have been linked into private staging.
