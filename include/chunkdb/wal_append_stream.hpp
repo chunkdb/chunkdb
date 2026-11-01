@@ -4,6 +4,8 @@
 #include <filesystem>
 #include <fstream>
 
+#include "chunkdb/wal_durability_pin.hpp"
+
 namespace chunkdb {
 
 // Append-only owner-private file. Windows handles have delete sharing so a
@@ -28,6 +30,8 @@ class WalAppendStream {
     [[nodiscard]] int error() const noexcept { return error_; }
     WalAppendStream& write(const char* bytes, std::streamsize size);
     WalAppendStream& flush() noexcept;
+    // Flush this stream's own buffer and retain its native writable generation.
+    [[nodiscard]] WalDurabilityPin FlushAndPin();
 
     // Streams of this process with an open file, and the most there were at
     // once since the last reset.
