@@ -232,6 +232,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 add_file(std::string(kDataDirManifestFileName), SerializeDataDirManifest(floor));
             } else if (request.kind == MigrationRequest::Kind::kAlter) {
                 const auto previous_schema = manifest->schema;
+                const auto previous_chunk_schema = *manifest->chunk_schema;
                 if (request.narrowing) {
                     const auto& [column_name, type] = *request.narrowing;
                     const auto at = std::find_if(manifest->schema.columns.begin(), manifest->schema.columns.end(),
@@ -245,10 +246,11 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                         manifest->schema = NarrowColumnType(pending, column_name, type);
                     }
                 } else request.alter(*manifest);
+                AlignManifestSchemaDomains(&*manifest, previous_schema, previous_chunk_schema);
                 RequireCompatibleColumnAdditions(previous_schema, manifest->schema, *store);
                 if (const auto reason = UnsupportedSchemaReason(manifest->schema); !reason.empty()) throw std::invalid_argument(reason);
                 manifest->geometry.block_bits = FixedBitsPerBlock(manifest->schema);
-                (void)Geometry(manifest->geometry, manifest->schema);
+                (void)Geometry(manifest->geometry, manifest->schema, *manifest->chunk_schema);
                 next_options = DecodeTableOptions(manifest->options);
                 RequireValidTableOptions(next_options);
                 add_file("tables/" + request.table + "/" + std::string(kStoreManifestFileName), SerializeStoreManifest(*manifest));

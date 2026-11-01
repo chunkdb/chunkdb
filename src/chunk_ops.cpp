@@ -27,11 +27,20 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     const std::shared_ptr<RegularChunk>& chunk,
     std::vector<std::uint8_t> new_payload,
     std::vector<std::uint8_t> new_presence,
-    VarUpdate var_update) {
+    VarUpdate var_update,
+    std::shared_ptr<const ChunkColumnState> chunk_columns, bool force_write) {
+    const bool supplied_chunk_columns = chunk_columns != nullptr;
+    if (!chunk_columns) chunk_columns = chunk->chunk_columns ? chunk->chunk_columns : geometry_.default_chunk_columns();
+    if (!chunk->written && geometry_.chunk_columns_require_initialization() && !supplied_chunk_columns)
+        throw std::invalid_argument("a first write must supply the REQUIRED chunk columns");
+    const bool metadata_changed = chunk_columns ?
+        !chunk->chunk_columns || chunk_columns->bytes != chunk->chunk_columns->bytes : chunk->chunk_columns != nullptr;
     if (new_payload == chunk->payload && new_presence == chunk->presence_bitmap &&
-        var_update.empty()) {
+        var_update.empty() && !metadata_changed && (!force_write || chunk->written)) {
         return false;
     }
+    RequireVarWrite(chunk->vars, var_update, chunk_columns ? chunk_columns->variable_bytes : 0U,
+        chunk->chunk_columns ? chunk->chunk_columns->variable_bytes : 0U);
     RequirePendingFits(new_payload, new_presence);
     // A WAL whose failed write or transaction could not be repaired takes
     // nothing more until a restart repairs it.
@@ -65,7 +74,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     feed.Version(reserved_version);
     const std::uint64_t commit_time_ms = NextCommitTimeMs(*chunk);
     // The state this write replaces, while a transaction is open.
-    TxnKeep keep = PrepareTxnKeepLocked(chunk_coord, *chunk, reserved_version);
+    TxnKeep keep = PrepareTxnKeepLocked(chunk_coord, *chunk, reserved_version, supplied_chunk_columns);
 
     // Snapshot every component needed for a full rollback. CurrentWalFileSize
     // throws on an inspection error rather than reporting an empty WAL, so a
@@ -74,6 +83,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     const bool sync_required = durability_mode_ != DurabilityMode::kRelaxed;
     const auto previous_payload = chunk->payload;
     const auto previous_presence = chunk->presence_bitmap;
+    const auto previous_chunk_columns = chunk->chunk_columns;
     const auto saved_wal_batch = chunk->wal_batch;
     const auto saved_pending_updates = chunk->pending_updates;
     const auto saved_wal_bytes = chunk->wal_bytes;
@@ -92,6 +102,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     // Intent establishment completed. Only now may the live vectors change.
     chunk->payload = std::move(new_payload);
     chunk->presence_bitmap = std::move(new_presence);
+    chunk->chunk_columns = std::move(chunk_columns);
 
     bool commit_record_durable = false;
     VarUndo var_undo;
@@ -114,6 +125,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
             chunk->presence_bitmap.data(),
             chunk->presence_bitmap.size());
         frame.AppendVarUpdate(chunk->vars, var_undo);
+        if (metadata_changed && chunk->chunk_columns) frame.AppendChunkColumns(*chunk->chunk_columns);
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         feed.Capture(chunk->wal_batch, appended_bytes);
 
@@ -146,6 +158,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         // repair before replay and the live store is poisoned.
         chunk->payload = previous_payload;
         chunk->presence_bitmap = previous_presence;
+        chunk->chunk_columns = previous_chunk_columns;
         UndoVarUpdate(&chunk->vars, std::move(var_undo));
         chunk->wal_batch = saved_wal_batch;
         chunk->pending_updates = saved_pending_updates;
@@ -190,6 +203,9 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     chunk->version = reserved_version;
     chunk->written = true;
     chunk->commit_time_ms = commit_time_ms;
+    chunk->present_blocks = PresentBlockCount(chunk->presence_bitmap);
+    keep.coordinate.Publish(chunk->present_blocks != 0U || ChunkColumnsPopulated(geometry_, chunk->chunk_columns.get()),
+        reserved_version);
     // Still under the chunk's lock, so no read sees the new state without
     // the kept one.
     txn_history_->Publish(keep.node);
@@ -401,7 +417,12 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
 }
 
 ChunkState ChunkStore::ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y) {
-    const auto regular_chunk = GetOrLoadRegularChunk(ChunkCoord{chunk_x, chunk_y});
+    if (geometry_.dims() != 2) throw std::invalid_argument("chunk coordinates require 3 axes");
+    return ReadChunkState(ChunkCoord{chunk_x, chunk_y});
+}
+
+ChunkState ChunkStore::ReadChunkState(const ChunkCoord& chunk_coord) {
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
     return ChunkState{
         .version = regular_chunk->version,
@@ -409,6 +430,8 @@ ChunkState ChunkStore::ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y
         .presence_bitmap = regular_chunk->presence_bitmap,
         .vars = regular_chunk->vars,
         .written = regular_chunk->written,
+        .commit_time_ms = regular_chunk->commit_time_ms,
+        .chunk_columns = regular_chunk->chunk_columns,
     };
 }
 
@@ -417,6 +440,12 @@ ChunkMutationResult ChunkStore::WriteChunkState(
     std::int64_t chunk_y,
     ChunkState state,
     std::optional<std::uint64_t> expected_version) {
+    if (geometry_.dims() != 2) throw std::invalid_argument("chunk coordinates require 3 axes");
+    return WriteChunkState(ChunkCoord{chunk_x, chunk_y}, std::move(state), expected_version);
+}
+
+ChunkMutationResult ChunkStore::WriteChunkState(const ChunkCoord& chunk_coord, ChunkState state,
+    std::optional<std::uint64_t> expected_version, bool if_absent) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
@@ -433,26 +462,39 @@ ChunkMutationResult ChunkStore::WriteChunkState(
     // Every value is checked before the chunk is touched.
     geometry_.layout().RequireValidVars(state.vars, state.presence_bitmap);
     RequirePendingFits(state.payload, state.presence_bitmap, &state.vars);
+    if (state.chunk_columns) {
+        const auto variable_bytes = ValidateChunkColumns(geometry_.chunk_schema(), state.chunk_columns->bytes);
+        if (geometry_.chunk_schema().columns.empty()) state.chunk_columns.reset();
+        else if (state.chunk_columns->variable_bytes != variable_bytes)
+            state.chunk_columns = std::make_shared<const ChunkColumnState>(ChunkColumnState{
+                .bytes = state.chunk_columns->bytes, .variable_bytes = variable_bytes});
+    }
 
-    const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
     if (expected_version.has_value() && regular_chunk->version != *expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
     }
+    if (if_absent && ChunkPopulated(geometry_, regular_chunk->presence_bitmap, regular_chunk->chunk_columns.get()))
+        return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+    if (!state.chunk_columns && !regular_chunk->written && geometry_.chunk_columns_require_initialization())
+        throw std::invalid_argument("a first write must supply the REQUIRED chunk columns");
+    if (!state.chunk_columns) state.chunk_columns = geometry_.default_chunk_columns();
     VarUpdate var_update;
     if (state.vars.Encode() != regular_chunk->vars.Encode()) {
         var_update.replace = std::move(state.vars);
     }
-    RequireVarWrite(regular_chunk->vars, var_update);
-    if (expected_version.has_value()) {
+    RequireVarWrite(regular_chunk->vars, var_update,
+        state.chunk_columns ? state.chunk_columns->variable_bytes : 0U,
+        regular_chunk->chunk_columns ? regular_chunk->chunk_columns->variable_bytes : 0U);
+    if (expected_version.has_value() || geometry_.has_chunk_column_history() || !regular_chunk->written) {
         // As CHUNKPUT IF: the conditional write path (docs/DURABILITY_CONTRACT.md).
         (void)ApplyFullChunkStateLocked(
             chunk_coord,
             regular_chunk,
             std::move(state.payload),
             std::move(state.presence_bitmap),
-            std::move(var_update));
+            std::move(var_update), std::move(state.chunk_columns), true);
         return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
     }
     const std::uint64_t version = ApplyChunkStateLocked(

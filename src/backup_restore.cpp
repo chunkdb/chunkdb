@@ -57,14 +57,18 @@ std::vector<std::uint8_t> RecoverWal(const std::filesystem::path& path, const Ge
     ChunkCoord coord, const StoreId& epoch, FeatureFlags features) {
     std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U), presence(ChunkPresenceBitmapBytes(geometry), 0U);
     ChunkVars vars; std::uint64_t revision = 0U, schema = 0U;
+    std::shared_ptr<const ChunkColumnState> chunk_columns;
     auto image_path = path; image_path.replace_extension(".chk");
     if (std::filesystem::exists(image_path)) {
-        auto image = ParseChunkImage(LoadFile(image_path), geometry, coord, epoch, features);
+        auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, coord, epoch, features),
+            geometry, coord, epoch, features);
         revision = image.revision; schema = image.schema_version;
         payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
+        chunk_columns = std::move(image.chunk_columns);
     }
     auto bytes = LoadFile(path);
-    const auto replay = ReplayWal(bytes, geometry, coord, epoch, features, revision, schema, &payload, &presence, &vars);
+    const auto replay = ReplayWal(bytes, geometry, coord, epoch, features, revision, schema,
+        &payload, &presence, &vars, nullptr, &chunk_columns);
     if (replay.torn_creation) return {};
     if (!replay.replayable || (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty())
         throw std::runtime_error("restored WAL is damaged: " + path.string());
@@ -126,7 +130,7 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
             const auto directory = temporary / "tables" / cut.name;
             auto manifest = *ReadStoreManifest(directory);
             RequireOpenableFeatures(manifest.features, AccessMode::kReadWrite);
-            Geometry geometry(manifest.geometry, manifest.schema);
+            Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
             const auto old_epoch = cut.epoch; const auto new_epoch = NewStoreId();
             if (new_epoch == old_epoch) throw std::runtime_error("restore generated an existing epoch");
             const auto prefix = std::filesystem::path("tables") / cut.name;
@@ -143,7 +147,8 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
                         std::filesystem::remove(path);
                         if (std::filesystem::is_empty(path.parent_path())) std::filesystem::remove(path.parent_path());
                     } else {
-                        bytes = RewriteWalStoreId(std::move(bytes), coord, old_epoch, new_epoch, manifest.features);
+                        bytes = RewriteWalStoreId(std::move(bytes), coord, old_epoch, new_epoch,
+                            manifest.features, geometry.dims());
                         AtomicWrite(path, bytes, true, true);
                     }
                 }

@@ -69,11 +69,11 @@ void EpochAndHistory() {
         assert(Verify(first).errors == 0U && Verify(second).errors == 0U);
         auto image = LoadFile(ChunkDataPath(first / "tables/default", fixture.old_geometry, {0, 0}));
         const auto crc_at = kImageFixedHeaderSize + static_cast<std::size_t>(ReadLe16(image, 10U)) * kImageSectionEntrySize;
-        std::copy(source_image.begin() + 24U, source_image.begin() + 40U, image.begin() + 24U);
+        std::copy(source_image.begin() + 28U, source_image.begin() + 44U, image.begin() + 28U);
         std::copy(source_image.begin() + static_cast<std::ptrdiff_t>(crc_at), source_image.begin() + static_cast<std::ptrdiff_t>(crc_at + 4U), image.begin() + static_cast<std::ptrdiff_t>(crc_at));
         assert(image == source_image); // Compression, old layout and optional section preserved.
         auto wal = LoadFile(ChunkWalPath(first / "tables/default", fixture.old_geometry, {0, 0}));
-        assert(ReadLe32(wal, 12U) == 0U && ReadLe32(wal, 20U) == 0U);
+        assert(wal[12U] == 2U && ReadLe32(wal, 16U) == kFeatureChunkModel && ReadLe32(wal, 24U) == 0U);
         assert(std::equal(wal.begin() + kWalHeaderSize, wal.end(), source_wal.begin() + kWalHeaderSize));
         auto slots = *ReadFeedSlotRecords(first / "tables/default", one.store_id);
         assert(slots.durable_watermark == 3U && slots.slots.size() == 2U);
@@ -172,7 +172,7 @@ void StrictInventory() {
     check([](auto& f) { Save(f.Table() / "chunkdb.snapshot", SerializeSnapshotGenerationRecord(1U)); });
     check([](auto& f) { Save(f.backup / kUsersFileName, Bytes{1U, 2U}); });
     check([](auto& f) { WriteFeedSlotRecords(f.Table(), {f.manifest.store_id, 4U, {{"consumer", 4U, false}}}); });
-    check([](auto& f) { auto wal = BuildWalHeader({0, 0}, f.manifest.store_id, {}); auto frame = f.Frame(4U); wal.insert(wal.end(), frame.begin(), frame.end()); Save(ChunkWalPath(f.Table(), f.old_geometry, {0, 0}), wal); });
+    check([](auto& f) { auto wal = BuildWalHeader({0, 0}, f.manifest.store_id, {.incompat = kFeatureChunkModel}); auto frame = f.Frame(4U); wal.insert(wal.end(), frame.begin(), frame.end()); Save(ChunkWalPath(f.Table(), f.old_geometry, {0, 0}), wal); });
     check([](auto& f) { std::filesystem::rename(ChunkDataPath(f.Table(), f.old_geometry, {0, 0}), f.Table() / "L_0_0/C_-0_0.chk"); });
     check([](auto& f) { Save(f.Table() / ".chunkdb.intents/txn-3.rollback", Bytes{1U}); });
     check([](auto& f) { Save(f.Table() / ".chunkdb.feed/C_0_0.1-3.wal", Bytes{1U}); });

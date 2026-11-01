@@ -97,6 +97,26 @@ class ReadFile {
         bytes.resize(used);
         return bytes;
     }
+    std::vector<std::uint8_t> Image(const Geometry& geometry, ChunkCoord coord,
+        const StoreId& epoch, FeatureFlags features) {
+        const auto size = Size();
+        const auto prefix = At(0U, 12U);
+        if (prefix.size() != 12U || ReadLe16(prefix, 10U) > kImageMaxSections)
+            throw std::runtime_error("feed image directory is truncated or oversized");
+        const auto header_size = ChunkImageHeaderBytes(geometry.dims(), ReadLe16(prefix, 10U));
+        const auto header = At(0U, header_size);
+        try {
+            (void)ParseChunkImageHeader(header, size,
+                {.dims = geometry.dims(), .epoch = epoch, .coord = coord, .admitted_features = features},
+                {.max_file_bytes = kMaxChunkImageFileBytes, .max_section_stored_bytes = kMaxChunkImageFileBytes,
+                    .max_section_raw_bytes = kMaxChunkImageRawBytes, .max_total_raw_bytes = kMaxChunkImageRawBytes});
+        } catch (const std::invalid_argument& error) {
+            throw std::runtime_error(error.what());
+        }
+        auto bytes = At(0U, static_cast<std::size_t>(size));
+        if (bytes.size() != size) throw std::runtime_error("feed image is truncated");
+        return bytes;
+    }
   private:
     [[noreturn]] void Fail(std::string_view operation) const {
 #ifdef _WIN32
@@ -121,35 +141,24 @@ bool Number(std::string_view text, T* value) {
     return ec == std::errc{} && end == text.data() + text.size();
 }
 
-bool ChunkName(std::string_view name, ChunkCoord* coord) {
-    if (!name.starts_with("C_")) return false;
-    const auto separator = name.find('_', 2U);
-    return separator != std::string_view::npos &&
-        Number(name.substr(2U, separator - 2U), &coord->x) && Number(name.substr(separator + 1U), &coord->y);
-}
-
 struct ArchiveName {
     ChunkCoord coord;
     std::uint64_t first = 0;
     std::uint64_t last = 0;
 };
 
-std::optional<ArchiveName> ParseArchiveName(std::string_view name) {
+std::optional<ArchiveName> ParseArchiveName(std::string_view name, std::uint8_t dims) {
     if (!name.ends_with(".wal")) return std::nullopt;
     name.remove_suffix(4U);
     const auto dot = name.find('.');
     if (dot == std::string_view::npos) return std::nullopt;
     const auto dash = name.find('-', dot + 1U);
     ArchiveName result;
-    if (dash == std::string_view::npos || !ChunkName(name.substr(0U, dot), &result.coord) ||
+    if (dash == std::string_view::npos || !ParseChunkFileStem(name.substr(0U, dot), dims, &result.coord) ||
         !Number(name.substr(dot + 1U, dash - dot - 1U), &result.first) ||
         !Number(name.substr(dash + 1U), &result.last) || result.first == 0U || result.last < result.first)
         throw std::runtime_error("invalid feed archive name " + std::string(name));
     return result;
-}
-
-std::string ChunkStem(ChunkCoord coord) {
-    return "C_" + std::to_string(coord.x) + "_" + std::to_string(coord.y);
 }
 
 std::optional<std::int64_t> Absolute(std::int64_t chunk, std::uint32_t width, std::size_t local) {
@@ -171,7 +180,7 @@ struct Cursor {
     std::uint64_t first = 0;
     std::uint64_t last = 0;  // Zero for the captured prefix of a live WAL.
     std::uint64_t limit = 0;
-    std::uint64_t offset = kWalHeaderSize;
+    std::uint64_t offset = 0U;
     std::uint64_t previous = 0;
     std::uint64_t next = 0;
     std::size_t frame_size = 0;
@@ -189,23 +198,27 @@ struct Cursor {
 // and its directory protect the revision; body/state validation remains lazy
 // in ParseChunkImage when the image is actually used as a base.
 bool HasOriginalBase(const std::filesystem::path& path, ChunkCoord coord, const StoreId& epoch,
-                     FeatureFlags features, std::uint64_t first) {
+                     FeatureFlags features, std::uint64_t first, std::uint8_t dims) {
     if (!std::filesystem::exists(path)) return false;
     ReadFile file(path);
-    const auto fixed = file.At(0U, kImageFixedHeaderSize);
-    if (fixed.size() != kImageFixedHeaderSize || std::memcmp(fixed.data(), kImageMagic, kImageMagicSize) != 0 ||
+    const auto fixed_size = ChunkImageFixedHeaderBytes(dims);
+    const auto fixed = file.At(0U, fixed_size);
+    if (fixed.size() != fixed_size || std::memcmp(fixed.data(), kImageMagic, kImageMagicSize) != 0 ||
         ReadLe16(fixed, 8U) != kImageFormatVersion || ReadLe16(fixed, 10U) > kImageMaxSections)
         throw std::runtime_error("feed archive current image header is invalid");
-    const auto directory_end = kImageFixedHeaderSize + static_cast<std::size_t>(ReadLe16(fixed, 10U)) * kImageSectionEntrySize;
+    const auto directory_end = fixed_size + static_cast<std::size_t>(ReadLe16(fixed, 10U)) * kImageSectionEntrySize;
     const auto header = file.At(0U, directory_end + 4U);
-    if (header.size() != directory_end + 4U || ReadLe32(header, directory_end) != Crc32(header.data(), directory_end))
-        throw std::runtime_error("feed archive current image header checksum mismatch");
-    const FeatureFlags image_features{ReadLe32(header, 12U), ReadLe32(header, 16U), ReadLe32(header, 20U)};
-    if (!IsSubsetOf(image_features, features) || !std::equal(epoch.begin(), epoch.end(), header.begin() + 24U) ||
-        std::bit_cast<std::int64_t>(ReadLe64(header, 40U)) != coord.x ||
-        std::bit_cast<std::int64_t>(ReadLe64(header, 48U)) != coord.y || ReadLe64(header, 56U) == 0U)
-        throw std::runtime_error("feed archive current image metadata is invalid");
-    return ReadLe64(header, 56U) < first;
+    try {
+        const auto checked = ParseChunkImageHeader(header, file.Size(),
+            ChunkFileContext{.dims = dims, .epoch = epoch, .coord = coord, .admitted_features = features},
+            ChunkImageHeaderLimits{.max_file_bytes = kMaxChunkImageFileBytes,
+                .max_section_stored_bytes = kMaxChunkImageFileBytes,
+                .max_section_raw_bytes = kMaxChunkImageRawBytes,
+                .max_total_raw_bytes = kMaxChunkImageRawBytes});
+        return checked.info.revision < first;
+    } catch (const std::invalid_argument& error) {
+        throw std::runtime_error("feed archive current image metadata is invalid: " + std::string(error.what()));
+    }
 }
 
 }  // namespace
@@ -254,7 +267,7 @@ struct FeedArchiveReader::Impl {
             if (IsTxnIntentFileName(name)) {
                 auto bytes = LoadFile(item.path());
                 TxnIntent intent;
-                if (!TryParseTxnIntent(bytes, &intent)) throw std::runtime_error("malformed feed transaction intent");
+                if (!TryParseTxnIntent(bytes, &intent, geometry.dims(), epoch)) throw std::runtime_error("malformed feed transaction intent");
                 if (intent.state == TxnIntentState::kRollback) through = std::min(through, intent.version - 1U);
                 transactions.push_back(std::move(bytes));
             } else if (name.ends_with(".rollback")) {
@@ -268,12 +281,12 @@ struct FeedArchiveReader::Impl {
             }
         }
         // Validate even an intent whose chunk has no WAL in the listing.
-        (void)TxnRollbackBoundaryForChunk(transactions, {});
+        (void)TxnRollbackBoundaryForChunk(transactions, {}, geometry, epoch);
 
         const auto archives = root / kFeedArchiveDirName;
         if (std::filesystem::exists(archives)) for (const auto& item : std::filesystem::directory_iterator(archives)) {
             if (!item.is_regular_file()) continue;
-            const auto name = ParseArchiveName(item.path().filename().string());
+            const auto name = ParseArchiveName(item.path().filename().string(), geometry.dims());
             if (!name || name->last <= from.revision || name->first > through) continue;
             Cursor cursor;
             cursor.coord = name->coord;
@@ -287,8 +300,7 @@ struct FeedArchiveReader::Impl {
             cursors.push_back(std::move(cursor));
         }
         std::sort(cursors.begin(), cursors.end(), [](const auto& a, const auto& b) {
-            if (a.coord.x != b.coord.x) return a.coord.x < b.coord.x;
-            if (a.coord.y != b.coord.y) return a.coord.y < b.coord.y;
+            if (a.coord != b.coord) return a.coord < b.coord;
             return a.first < b.first;
         });
         for (std::size_t i = 1U; i < cursors.size(); ++i) if (cursors[i - 1U].coord == cursors[i].coord &&
@@ -301,10 +313,10 @@ struct FeedArchiveReader::Impl {
                 const auto filename = item.path().filename().string();
                 if (!filename.ends_with(".wal")) continue;
                 Cursor cursor;
-                if (!ChunkName(std::string_view(filename).substr(0U, filename.size() - 4U), &cursor.coord)) continue;
+                if (!ParseChunkFileStem(std::string_view(filename).substr(0U, filename.size() - 4U), geometry.dims(), &cursor.coord)) continue;
                 cursor.path = item.path();
                 cursor.limit = std::filesystem::file_size(cursor.path);
-                auto boundary = TxnRollbackBoundaryForChunk(transactions, cursor.coord);
+                auto boundary = TxnRollbackBoundaryForChunk(transactions, cursor.coord, geometry, epoch);
                 const auto intent_path = ConditionalIntentPathForWal(root, cursor.path);
                 if (std::filesystem::exists(intent_path)) {
                     ConditionalIntentState state;
@@ -320,7 +332,7 @@ struct FeedArchiveReader::Impl {
                 Initialize(cursor);
                 if (cursor.done || cursor.next > through) continue;
                 cursor.had_current_base = HasOriginalBase(ChunkDataPath(root, geometry, cursor.coord), cursor.coord,
-                    epoch, features, cursor.first);
+                    epoch, features, cursor.first, geometry.dims());
                 const auto duplicate = std::find_if(cursors.begin(), cursors.end(), [&](const auto& archived) {
                     return archived.coord == cursor.coord && archived.first == cursor.first;
                 });
@@ -335,7 +347,7 @@ struct FeedArchiveReader::Impl {
         // Missing WALs named by nonzero rollback boundaries are damage.
         for (const auto& bytes : transactions) {
             TxnIntent intent;
-            if (!TryParseTxnIntent(bytes, &intent)) throw std::runtime_error("malformed feed transaction intent");
+            if (!TryParseTxnIntent(bytes, &intent, geometry.dims(), epoch)) throw std::runtime_error("malformed feed transaction intent");
             if (intent.state != TxnIntentState::kRollback) continue;
             for (const auto& entry : intent.entries) if (entry.wal_boundary != 0U &&
                 !std::filesystem::exists(ChunkWalPath(root, geometry, entry.coord)))
@@ -349,7 +361,7 @@ struct FeedArchiveReader::Impl {
         const auto directory = root / kFeedArchiveDirName;
         if (std::filesystem::exists(directory)) for (const auto& item : std::filesystem::directory_iterator(directory)) {
             if (!item.is_regular_file()) continue;
-            const auto name = ParseArchiveName(item.path().filename().string());
+            const auto name = ParseArchiveName(item.path().filename().string(), geometry.dims());
             if (!name || name->last <= position.revision || name->first > through) continue;
             Cursor cursor;
             cursor.coord = name->coord;
@@ -361,7 +373,8 @@ struct FeedArchiveReader::Impl {
             cursors.push_back(std::move(cursor));
         }
         for (const auto& prefix : prefixes) {
-            if (prefix.first == 0U || prefix.last < prefix.first || prefix.last > through || prefix.limit <= kWalHeaderSize)
+            if (prefix.first == 0U || prefix.last < prefix.first || prefix.last > through ||
+                prefix.limit <= ChunkWalHeaderBytes(geometry.dims()))
                 throw std::invalid_argument("invalid completed feed WAL prefix");
             if (prefix.last <= position.revision) continue;
             const auto archived = std::find_if(cursors.begin(), cursors.end(), [&](const auto& cursor) {
@@ -387,8 +400,7 @@ struct FeedArchiveReader::Impl {
             cursors.push_back(std::move(cursor));
         }
         std::sort(cursors.begin(), cursors.end(), [](const auto& a, const auto& b) {
-            if (a.coord.x != b.coord.x) return a.coord.x < b.coord.x;
-            if (a.coord.y != b.coord.y) return a.coord.y < b.coord.y;
+            if (a.coord != b.coord) return a.coord < b.coord;
             return a.first < b.first;
         });
         for (std::size_t i = 1U; i < cursors.size(); ++i) if (cursors[i - 1U].coord == cursors[i].coord &&
@@ -400,7 +412,7 @@ struct FeedArchiveReader::Impl {
         if (cursor.last != 0U && !cursor.movable) return cursor.path;
         const auto directory = root / kFeedArchiveDirName;
         if (std::filesystem::exists(directory)) for (const auto& item : std::filesystem::directory_iterator(directory)) {
-            const auto name = ParseArchiveName(item.path().filename().string());
+            const auto name = ParseArchiveName(item.path().filename().string(), geometry.dims());
             if (name && name->coord == cursor.coord && name->first == cursor.first) return item.path();
         }
         return cursor.path;
@@ -436,17 +448,19 @@ struct FeedArchiveReader::Impl {
         cursor.initialized = true;
         auto [path, file] = Open(cursor);
         (void)path;
-        const auto header = file->At(0U, static_cast<std::size_t>(std::min<std::uint64_t>(cursor.limit, kWalHeaderSize)));
-        if (header.size() < kWalHeaderSize) {
+        const auto header_size = ChunkWalHeaderBytes(geometry.dims());
+        cursor.offset = header_size;
+        const auto header = file->At(0U, static_cast<std::size_t>(std::min<std::uint64_t>(cursor.limit, header_size)));
+        if (header.size() < header_size) {
             if (cursor.completed_prefix || cursor.last != 0U) throw std::runtime_error("completed feed WAL prefix has a partial header");
-            const auto expected = BuildWalHeader(cursor.coord, epoch, features);
+            const auto expected = BuildWalHeader(cursor.coord, epoch, features, geometry.dims());
             const bool zero = std::all_of(header.begin(), header.end(), [](auto byte) { return byte == 0U; });
             if (!zero && !std::equal(header.begin(), header.end(), expected.begin()))
                 throw std::runtime_error("feed archive has a damaged partial WAL header");
             cursor.done = true;
             return;
         }
-        ValidateWalHeader(header, cursor.coord, epoch, features);
+        ValidateWalHeader(header, cursor.coord, epoch, features, geometry.dims());
         Peek(cursor, *file);
         if (!cursor.done) {
             if (cursor.first != 0U && cursor.first != cursor.next)
@@ -481,6 +495,8 @@ struct FeedArchiveReader::Impl {
         if (ReadLe32(header, header_size - 4U) != Crc32(header.data() + kWalFrameMagicSize, header_size - 8U))
             throw std::runtime_error("feed archive frame header checksum mismatch");
         const auto frame_size = static_cast<std::uint64_t>(header_size) + ReadLe32(fixed, 28U) + kWalFrameTrailerSize;
+        if (frame_size > kMaxWalFrameBytes)
+            throw std::runtime_error("feed archive frame exceeds its byte limit");
         if (frame_size > remaining) {
             if (cursor.completed_prefix || cursor.last != 0U) throw std::runtime_error("completed feed WAL prefix ends inside a frame");
             cursor.done = true; return;
@@ -497,7 +513,7 @@ struct FeedArchiveReader::Impl {
     void LoadBase(Cursor& cursor, std::uint64_t first_schema, bool still_live) {
         if (cursor.loaded) return;
         cursor.loaded = true;
-        const auto linked = root / kFeedArchiveDirName / (ChunkStem(cursor.coord) + "." + std::to_string(cursor.first) + ".chk");
+        const auto linked = root / kFeedArchiveDirName / (ChunkFileStem(cursor.coord, geometry.dims()) + "." + std::to_string(cursor.first) + ".chk");
         const auto current = ChunkDataPath(root, geometry, cursor.coord);
         const auto read_image = [&](const std::filesystem::path& path, bool check_link = false) -> std::optional<ChunkStateImage> {
             try {
@@ -506,8 +522,8 @@ struct FeedArchiveReader::Impl {
                 // Recheck after opening: a handle to a newer schema's image
                 // must not be parsed with this reader's captured geometry.
                 if (check_link && std::filesystem::exists(linked)) return std::nullopt;
-                const auto size = file.Size();
-                return ParseChunkImage(file.At(0U, static_cast<std::size_t>(size)), geometry, cursor.coord, epoch, features);
+                return ParseChunkImage(file.Image(geometry, cursor.coord, epoch, features), geometry,
+                    cursor.coord, epoch, features);
             } catch (const std::system_error& error) {
                 if (error.code() != std::errc::no_such_file_or_directory) throw;
                 return std::nullopt;
@@ -516,7 +532,7 @@ struct FeedArchiveReader::Impl {
         auto image = read_image(linked);
         bool has_link = image.has_value();
         if (!image && still_live && cursor.completed_prefix) {
-            try { cursor.had_current_base = HasOriginalBase(current, cursor.coord, epoch, features, cursor.first); }
+            try { cursor.had_current_base = HasOriginalBase(current, cursor.coord, epoch, features, cursor.first, geometry.dims()); }
             catch (const std::system_error& error) {
                 if (error.code() != std::errc::no_such_file_or_directory) throw;
             }
@@ -535,7 +551,9 @@ struct FeedArchiveReader::Impl {
         if (image) {
             if (has_link && image->revision >= cursor.first)
                 throw std::runtime_error("feed archive base overlaps its WAL");
-            cursor.state = {image->revision, std::move(image->payload), std::move(image->presence_bitmap), std::move(image->vars)};
+            cursor.state = {.version = image->revision, .payload = std::move(image->payload),
+                .presence_bitmap = std::move(image->presence_bitmap), .vars = std::move(image->vars),
+                .written = true, .commit_time_ms = image->commit_time_ms, .chunk_columns = std::move(image->chunk_columns)};
             cursor.schema_version = image->schema_version;
             return;
         }
@@ -559,6 +577,8 @@ struct FeedArchiveReader::Impl {
         LoadBase(cursor, info.schema_version, path == cursor.path && (cursor.last == 0U || cursor.movable));
         if (info.schema_version < cursor.schema_version) throw std::runtime_error("feed archive schema versions do not increase");
         while (cursor.schema_version < info.schema_version) {
+            BringChunkColumnsToSchema(geometry, cursor.state.written ? cursor.schema_version : 0U,
+                cursor.schema_version + 1U, &cursor.state.chunk_columns);
             TranslateChunk(geometry.LayoutAt(cursor.schema_version), geometry.LayoutAt(cursor.schema_version + 1U),
                 cursor.state.presence_bitmap, &cursor.state.payload, &cursor.state.vars);
             ++cursor.schema_version;

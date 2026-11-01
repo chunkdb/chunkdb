@@ -12,6 +12,7 @@
 #include "chunk_store_internal.hpp"
 #include "checkpoint.hpp"
 #include "change_feed.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/crc32.hpp"
@@ -385,10 +386,17 @@ std::uint64_t ChunkStore::ChunkCommitTimeForTests(std::int64_t chunk_x, std::int
 }
 
 std::uint64_t ChunkStore::GetChunkVersion(std::int64_t chunk_x, std::int64_t chunk_y) {
+    if (geometry_.dims() != 2U) throw std::invalid_argument("chunk coordinates must match the table dimensions");
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
     return regular_chunk->version;
+}
+
+bool ChunkStore::HasWrittenChunkIdentities() const {
+    const auto index = const_cast<ChunkStore*>(this)->CoordinateIndexForScan();
+    if (!index) throw std::runtime_error("coordinate index is not initialized");
+    return index->has_written_identities();
 }
 
 }  // namespace chunkdb
