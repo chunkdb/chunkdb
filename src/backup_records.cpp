@@ -8,6 +8,7 @@
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
+#include <cwchar>
 #ifdef _WIN32
 #include <windows.h>
 #else
@@ -62,6 +63,32 @@ std::filesystem::path AbsoluteWindowsBackupPath(const std::filesystem::path& pat
     native.resize(length);
     return std::filesystem::path(BackupWindowsApiName(SplitBackupWindowsPath(native).Name(),
         path.native().starts_with(L"\\\\?\\")));
+}
+
+bool WindowsBackupDirectoryEmpty(const std::filesystem::path& path) {
+    auto pattern = path.native();
+    if (pattern.empty() || (pattern.back() != L'\\' && pattern.back() != L'/')) pattern += L'\\';
+    pattern += L'*';
+    WIN32_FIND_DATAW entry{};
+    const auto search = FindFirstFileW(pattern.c_str(), &entry);
+    if (search == INVALID_HANDLE_VALUE) {
+        const auto error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND) return true;
+        throw std::filesystem::filesystem_error("cannot list backup directory", path,
+            std::error_code(static_cast<int>(error), std::system_category()));
+    }
+    struct FindCloseGuard {
+        HANDLE handle;
+        ~FindCloseGuard() { FindClose(handle); }
+    } guard{search};
+    for (;;) {
+        if (std::wcscmp(entry.cFileName, L".") != 0 && std::wcscmp(entry.cFileName, L"..") != 0) return false;
+        if (FindNextFileW(search, &entry) != 0) continue;
+        const auto error = GetLastError();
+        if (error == ERROR_NO_MORE_FILES) return true;
+        throw std::filesystem::filesystem_error("cannot continue backup directory listing", path,
+            std::error_code(static_cast<int>(error), std::system_category()));
+    }
 }
 #endif
 void SafeDescendants(const std::filesystem::path& root, const std::filesystem::path& relative) {
@@ -244,7 +271,7 @@ class SafeDirectory {
     }
     bool Empty() const {
 #ifdef _WIN32
-        return std::filesystem::is_empty(path_);
+        return WindowsBackupDirectoryEmpty(path_);
 #else
         const int copy = ::dup(fd_);
         if (copy < 0) throw std::runtime_error("cannot inspect backup directory");
@@ -816,7 +843,12 @@ void RequireBackupTarget(const std::filesystem::path& source, const std::filesys
     RequirePath(source); RequirePath(target);
     const auto source_path = CanonicalBackupPath(source), target_path = CanonicalBackupPath(target);
     if (Within(source_path, target_path) || Within(target_path, source_path)) throw std::invalid_argument("backup and source directories overlap");
-    if (Present(target) && (!std::filesystem::is_directory(target) || !std::filesystem::is_empty(target)))
+    if (Present(target) && (!std::filesystem::is_directory(target) ||
+#ifdef _WIN32
+            !WindowsBackupDirectoryEmpty(AbsoluteWindowsBackupPath(target))))
+#else
+            !std::filesystem::is_empty(target)))
+#endif
         throw std::invalid_argument("backup destination must be absent or empty");
 }
 void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target, BackupTestHook* hook) {

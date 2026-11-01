@@ -434,14 +434,18 @@ void ExtendedRootPaths() {
     assert(root.native().size() > 260U);
     assert(CanonicalBackupPath(root).native().starts_with(L"\\\\?\\"));
     const auto target = ResolveBackupTarget(root, "daily");
+    test::FeedPhaseWatchdog::Phase("extended roots: prepare target " + target.string());
     PrepareBackupTarget(fixture.source, target);
     assert(std::filesystem::exists(target / kBackupIncompleteName));
     const auto restored = root / "restored";
+    test::FeedPhaseWatchdog::Phase("extended roots: restore " + restored.string());
     RestoreBackup(fixture.backup, restored);
+    test::FeedPhaseWatchdog::Phase("extended roots: verify");
     assert(Verify(restored).errors == 0U);
     auto overlap = std::filesystem::path(L"\\\\?\\" + fixture.source.wstring());
     overlap /= std::string(200U, 'y');
     Throws<std::invalid_argument>([&] { RequireBackupTarget(fixture.source, overlap); });
+    test::FeedPhaseWatchdog::Phase("extended roots: cleanup");
     std::filesystem::remove_all(top);
 #endif
 }
