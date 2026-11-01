@@ -340,6 +340,20 @@ void MemberCapsules() {
 }
 void MemberBindings() {
     MemberFixture fixture;
+    auto wrong_key = CommitOwnerMemberKey{fixture.value.group_id, fixture.value.ordinal}; ++wrong_key.group_id[0U];
+    Reject([&] { ValidateCommitOwnerMemberBinding(fixture.value, wrong_key, fixture.value.coverage,
+        fixture.decision, fixture.value.decision_sha256); });
+    wrong_key = {fixture.value.group_id, 0U};
+    Reject([&] { ValidateCommitOwnerMemberBinding(fixture.value, wrong_key, fixture.value.coverage,
+        fixture.decision, fixture.value.decision_sha256); });
+    for (unsigned field = 0U; field < 3U; ++field) {
+        auto wrong_coverage = fixture.value.coverage;
+        if (field == 0U) ++wrong_coverage.coord.x;
+        else if (field == 1U) ++wrong_coverage.table_epoch[0U];
+        else wrong_coverage.dims = 3U;
+        Reject([&] { ValidateCommitOwnerMemberBinding(fixture.value, {fixture.value.group_id, fixture.value.ordinal},
+            wrong_coverage, fixture.decision, fixture.value.decision_sha256); });
+    }
     auto altered = fixture.value; ++altered.group_id[0U]; Reject([&] { fixture.Bind(altered); });
     altered = fixture.value; altered.ordinal = 0U; Reject([&] { fixture.Bind(altered); });
     altered = fixture.value; ++altered.coverage.coord.x; Reject([&] { fixture.Bind(altered); });
