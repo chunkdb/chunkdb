@@ -24,8 +24,11 @@ Table names are inventory labels; neither the scope nor an owner record supplies
 An opaque checked context owns the admitted directory scope and pinned canonical root observation.
 Only complete directory admission constructs it; a public scope value or a caller callback cannot construct catalog authority.
 TableCatalog injects that context through StoreConfig before geometry admission, recovery, narrowing cleanup or lease publication.
-A store-specific context pins its admitted table-directory generation and epoch; an identically scoped copy outside that managed generation receives no authority.
+A single-use store-admission ticket pins its admitted table-directory generation and epoch; an identically scoped copy outside that managed generation receives no authority.
 Existing-table pins are opened relative to the admitted native directory and fixed tables namespace, and staged CREATE/MIGRATE pins follow their checked publication into that namespace.
+Construction consumes the ticket into an RAII admission owner before geometry selection; failure releases the pin, and a successful constructor releases it before returning while retaining only the shared directory owner context.
+A consumed ticket cannot open another store, so a closed native pin is never reused as authority through a saved inode number or copied StoreConfig.
+The root context is shared by the catalog tables and table pins do not become one persistent directory descriptor per table; Windows admission pins allow delete sharing so admitted DDL renames remain possible.
 A catalog-owned table opened directly, including read-only open, refuses without the matching checked context.
 It never bootstraps a standalone owner as fallback, even after every grouped WAL has retired.
 All existing table scopes and epoch uniqueness are checked before any table's pending narrowing or storage recovery can mutate data.
