@@ -19,6 +19,7 @@
 #include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "store_manifest.hpp"
+#include "feature_flags.hpp"
 #include "chunk_store_internal.hpp"
 #include "test_utils.hpp"
 #include "catalog_test_utils.hpp"
@@ -478,10 +479,10 @@ void TestDirectoryRules() {
         assert(Names(dir.path()) == (std::vector<std::string>{"L_0_0"}));
     }
     {
-        // A single store of a 2.0 development build before tables.
+        // A former single-store layout must be recreated.
         chunkdb::test::ScopedTempDir dir("chunkdb-catalog-single-store");
         chunkdb::StoreManifest manifest{
-            .features = {},
+            .features = {.incompat = chunkdb::kFeatureChunkModel},
             .geometry = kDefaultGeometry,
             .store_id = chunkdb::NewStoreId(),
             .options = {},
@@ -492,7 +493,8 @@ void TestDirectoryRules() {
             .write(reinterpret_cast<const char*>(bytes.data()),
                    static_cast<std::streamsize>(bytes.size()));
         const auto error = ErrorOf([&] { TableCatalog catalog(Config(dir.path())); });
-        assert(Contains(error, "single-store data directory"));
+        assert(Contains(error, "earlier development build"));
+        assert(Contains(error, "recreate the data directory"));
     }
     {
         // Entries chunkdb never creates are not chunkdb's.
