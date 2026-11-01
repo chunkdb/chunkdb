@@ -90,6 +90,7 @@ An ACTIVE root can instead become PENDING at the next generation, with a previou
 PENDING can only finish as the exact ACTIVE target bound by its checked replacement plan at the following generation.
 It cannot be overwritten by another pending plan, republished as INACTIVE or abandoned for an old selected context.
 The pure validator checks supplied fully admitted plan facts; it does not certify file sync or decide whether a runtime operation needs a pending plan.
+Those facts include both complete admitted predecessor and target roots, not their digests alone, so finish admission checks that PENDING still carries the predecessor's exact old selected context.
 An already installed exact final target is recognized by its raw digest without publishing another successor.
 
 ## Ordered tree keys
