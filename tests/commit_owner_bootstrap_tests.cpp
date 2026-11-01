@@ -276,6 +276,23 @@ void ReusedOwnerMustBeDurableBeforeManifest() {
     }
 }
 
+void WrongPendingRootRefusesBeforeInventory() {
+    test::ScopedTempDir temporary("chunkdb-owner-pending-wrong-root");
+    const auto target = StandaloneManifest();
+    const auto decision = SerializeCommitOwnerBootstrapDecision(
+        {CommitOwnerBootstrapKind::kStandalone, SerializeStoreManifest(target)});
+    Save(temporary.path() / kCommitOwnerBootstrapName, decision);
+    CommitOwnerRoot later; later.scope = *target.commit_owner; later.generation = 2U;
+    const auto bytes = SerializeCommitOwnerRoot(later);
+    Save(temporary.path() / "chunkdb.groups.owner", bytes);
+    StoreConfig config; config.data_dir = temporary.path(); config.background_maintenance = false;
+    Reject([&] { ChunkStore refused(config); });
+    assert(!std::filesystem::exists(temporary.path() / "chunkdb.index"));
+    assert(!std::filesystem::exists(StoreManifestPath(temporary.path())));
+    assert(LoadFile(temporary.path() / "chunkdb.groups.owner") == Bytes(bytes.begin(), bytes.end()));
+    assert(LoadFile(temporary.path() / kCommitOwnerBootstrapName) == decision);
+}
+
 int RunChild(const std::string& executable, const char* mode, const std::filesystem::path& directory, const char* point) {
     const auto command = "\"" + executable + "\" \"" + mode + "\" \"" + directory.string() + "\" \"" + point + "\"";
 #ifdef _WIN32
@@ -485,6 +502,7 @@ int main(int argc, char** argv) {
     CatalogContextsAndSingleUse(); PendingCreationKeepsIdentity();
     HistoricalActivationRecoversWithoutOwner(); SparseDecisionAdmission();
     ReusedOwnerMustBeDurableBeforeManifest();
+    WrongPendingRootRefusesBeforeInventory();
     CreationCrashBoundaries(argv[0]);
     InactiveBackupRestore(argv[0]);
 }

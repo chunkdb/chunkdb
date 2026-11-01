@@ -50,6 +50,16 @@ void FinishDecision(const std::filesystem::path& directory) {
     SyncDirectoryPath(directory);
     Crash("CHUNKDB_FAILPOINT_CRASH_OWNER_BOOTSTRAP_AFTER_PENDING_REMOVE_ONCE");
 }
+
+void RequireInitialRoot(const std::optional<CommitOwnerRootArtifact>& selected, const CommitOwnerScope& scope,
+    bool claimed) {
+    if (!selected) {
+        if (claimed) Bad("committed creation lost its canonical owner");
+        return;
+    }
+    CommitOwnerRoot expected; expected.scope = scope;
+    if (selected->value != expected) Bad("canonical owner is not initial INACTIVE generation one");
+}
 }  // namespace
 
 std::optional<CommitOwnerBootstrapDecision> CommitOwnerBootstrap::ReadPending(const std::filesystem::path& directory) {
@@ -94,7 +104,7 @@ StoreManifest CommitOwnerBootstrap::InitializeStandalone(const std::filesystem::
     CheckCreationNamespace(directory, decision.kind, pending.has_value(), existing.has_value());
     CommitOwnerArtifactIo writer(directory, *target.commit_owner, lock, false);
     CheckEmptyInventory(writer.ReadEmptyInventoryBytes(), geometry, target.store_id, existing.has_value());
-    if (existing && !writer.ReadCanonicalRoot()) Bad("committed creation lost its canonical owner");
+    RequireInitialRoot(writer.ReadCanonicalRoot(), *target.commit_owner, existing.has_value());
     if (!pending) {
         Crash("CHUNKDB_FAILPOINT_CRASH_OWNER_BOOTSTRAP_BEFORE_DECISION_ONCE");
     }
@@ -148,7 +158,7 @@ DataDirManifest CommitOwnerBootstrap::InitializeDirectory(const std::filesystem:
     if (existing && SerializeDataDirManifest(*existing) != decision.manifest) Bad("manifest differs from creation decision");
     CheckCreationNamespace(directory, decision.kind, pending.has_value(), existing.has_value());
     CommitOwnerArtifactIo writer(directory, *target.commit_owner, lock, false);
-    if (existing && !writer.ReadCanonicalRoot()) Bad("committed creation lost its canonical owner");
+    RequireInitialRoot(writer.ReadCanonicalRoot(), *target.commit_owner, existing.has_value());
     if (!pending) {
         Crash("CHUNKDB_FAILPOINT_CRASH_OWNER_BOOTSTRAP_BEFORE_DECISION_ONCE");
     }
