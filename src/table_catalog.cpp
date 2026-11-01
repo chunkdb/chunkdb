@@ -18,6 +18,7 @@
 #include "change_feed.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/logging.hpp"
+#include "chunkdb/file_layout.hpp"
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
 #include "feature_activation_records.hpp"
@@ -587,37 +588,41 @@ void Table::PrepareFeedSlotBaseline(ChunkStore& store) {
         // A pre-slot WAL may outlive a checkpoint whose image also contains
         // staged frames absent from that WAL. Normalize this baseline before
         // promising history, so every future segment has an exact old image.
-        std::set<std::pair<std::int64_t, std::int64_t>> coordinates;
+        std::set<ChunkCoord> coordinates;
         {
             std::lock_guard chunks_lock(store.large_chunks_mutex_);
             for (const auto& [_, large] : store.large_chunks_) {
                 std::lock_guard large_lock(large->mutex);
                 for (const auto& [coord, chunk] : large->chunks)
                     if (!chunk->wal_batch.empty() || chunk->wal_bytes != 0U)
-                        coordinates.emplace(coord.x, coord.y);
+                        coordinates.insert(coord);
             }
         }
-        static const std::regex wal_name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.wal$)");
         for (const auto& directory : std::filesystem::directory_iterator(dir_)) {
             if (!directory.is_directory() || directory.path().filename().string().rfind("L_", 0U) != 0U) continue;
             for (const auto& file : std::filesystem::directory_iterator(directory.path())) {
-                std::smatch match;
-                const auto filename = file.path().filename().string();
-                if (std::regex_match(filename, match, wal_name))
-                    coordinates.emplace(std::stoll(match[1].str()), std::stoll(match[2].str()));
+                if (file.path().extension() != ".wal") continue;
+                ChunkCoord coord;
+                if (!ParseChunkFilePath(file.path().lexically_relative(dir_), store.geometry_, &coord))
+                    throw std::runtime_error("pre-slot WAL has noncanonical coordinate placement: " + file.path().string());
+                coordinates.insert(coord);
             }
         }
-        for (const auto& [x, y] : coordinates) {
-            const ChunkCoord coord{x, y};
+        for (const auto& coord : coordinates) {
             auto chunk = store.TryGetLoadedChunk(coord);
             if (!chunk) {
                 // A temporary off-cache state avoids cache admission invoking
                 // the global evictor whose registry is quiesced here.
                 auto loaded = store.LoadChunkPayload(coord, true);
+                if (loaded.revision == 0U) continue;
+                BringChunkColumnsToSchema(store.geometry_, loaded.schema_version,
+                    store.geometry_.chunk_schema().version, &loaded.chunk_columns);
                 BringToCurrentSchema(store.geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
                 chunk = std::make_shared<ChunkStore::RegularChunk>(std::move(loaded.payload), std::move(loaded.presence_bitmap));
                 chunk->vars = std::move(loaded.vars);
-                chunk->version = loaded.revision != 0U ? loaded.revision : store.NextChunkVersion();
+                chunk->chunk_columns = std::move(loaded.chunk_columns);
+                chunk->version = loaded.revision;
+                chunk->written = loaded.revision != 0U;
                 chunk->commit_time_ms = loaded.commit_time_ms;
                 chunk->wal_bytes = loaded.wal_bytes;
                 chunk->wal_header_written = loaded.wal_header_written;
@@ -625,6 +630,7 @@ void Table::PrepareFeedSlotBaseline(ChunkStore& store) {
                 if (loaded.revision != 0U) store.RaiseVersionClockAbove(loaded.revision);
             }
             std::unique_lock chunk_lock(chunk->mutex);
+            if (!chunk->written) continue;
             store.CheckpointChunk(coord, chunk);
         }
         store.feed_slots_->prefix_index().Clear();

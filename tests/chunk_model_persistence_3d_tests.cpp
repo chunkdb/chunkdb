@@ -1,5 +1,6 @@
 #include <cassert>
 #include <charconv>
+#include <fstream>
 #include <iostream>
 #include <sstream>
 
@@ -16,6 +17,7 @@
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
 #include "verify.hpp"
+#include "wal_writer.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -200,10 +202,106 @@ void Persistence(DurabilityMode mode, bool required) {
     }
     Verify(restored);
 }
+
+std::string Coordinates(ChunkCoord coord, unsigned dims, std::int64_t scale = 1) {
+    return std::to_string(coord.x * scale) + " " + std::to_string(coord.y * scale) +
+        (dims == 3U ? " " + std::to_string(coord.z * scale) : "");
 }
 
-int main() {
+void LateSlotBaseline(DurabilityMode mode, unsigned dims, bool required, bool cold) {
+    test::ScopedTempDir temporary("chunkdb-late-slot-baseline");
+    const auto root = std::filesystem::canonical(temporary.path());
+    auto config = Config(root, mode);
+    config.max_loaded_chunks = cold ? 1U : 16U;
+    config.default_options.checkpoint_update_interval = 10000U;
+    config.default_options.wal_group_commit_updates = 1000U;
+    const std::array<ChunkCoord, 3> coords = dims == 3U ?
+        std::array<ChunkCoord, 3>{{{0, 0, -2}, {0, 0, 2}, {2, -1, 3}}} :
+        std::array<ChunkCoord, 3>{{{0, -2}, {0, 2}, {2, -1}}};
+    std::array<ChunkState, 3> states;
+    {
+        auto catalog = std::make_shared<TableCatalog>(config);
+        Commands commands(catalog);
+        commands.Run(std::string("CREATE TABLE t (value u8 DEFAULT 0) CHUNK 2 x 2") +
+            (dims == 3U ? " x 2" : "") + " LARGE 2 x 2" + (dims == 3U ? " x 2" : "") +
+            " CHUNK COLUMNS (owner u8 " + (required ? "REQUIRED)" : "DEFAULT 0)"));
+        for (std::size_t i = 0; i < coords.size(); ++i) {
+            commands.Write("SET CHUNK " + Coordinates(coords[i], dims) + " IN t META owner=" +
+                (required ? "0" : "5"));
+            if (i != 2U) commands.Write("SET BLOCK " + Coordinates(coords[i], dims, 2) +
+                " IN t value=" + std::to_string(7U + i));
+            states[i] = State(*catalog, coords[i]);
+        }
+        const auto table = catalog->Require("t");
+        const ChunkCoord never{10, 10, dims == 3U ? -10 : 0};
+        std::uint64_t completed;
+        {
+            auto lease = table->Acquire();
+            auto& store = lease->store();
+            completed = *store.CompletedRevision();
+            if (cold) {
+                (void)store.ReadChunkState(ChunkCoord{100, 100, dims == 3U ? 100 : 0});
+                assert(store.ApproxLoadedChunkCount() == 1U && store.RuntimeStats().evictions >= coords.size());
+            }
+            for (const auto& coord : coords)
+                assert(std::filesystem::exists(ChunkWalPath(root / "tables/t", store.geometry(), coord)) || !cold);
+            const auto unfinished = ChunkWalPath(root / "tables/t", store.geometry(), never);
+            std::filesystem::create_directories(unfinished.parent_path());
+            const auto header = BuildWalHeader(never, table->store_id(), store.features(), store.geometry().dims());
+            std::ofstream output(unfinished, std::ios::binary);
+            output.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+            assert(output.good());
+        }
+        const auto slot = table->CreateFeedSlot("consumer");
+        assert(slot.position.revision == completed);
+        {
+            auto lease = table->Acquire();
+            assert(lease->store().CompletedRevision() == completed);
+            for (const auto& coord : coords)
+                assert(!std::filesystem::exists(ChunkWalPath(root / "tables/t", lease->store().geometry(), coord)));
+            const auto absent = lease->store().ReadChunkState(never);
+            assert(!absent.written && absent.version == 0U && absent.commit_time_ms == 0U);
+            assert(lease->store().CompletedRevision() == completed);
+            const auto page = lease->store().ScanChunkIdentities(false, {}, 10U, 0U, false);
+            assert(page.entries.size() == coords.size() && !page.has_more && page.position == completed &&
+                page.retained_deletion_floor == 0U);
+            for (std::size_t i = 0; i < coords.size(); ++i)
+                assert(page.entries[i].coord == coords[i] && page.entries[i].version == states[i].version);
+        }
+        for (std::size_t i = 0; i < coords.size(); ++i) Identity(State(*catalog, coords[i]), states[i]);
+        auto empty = table->ReadFeedArchive(slot.position);
+        assert(!empty.Next());
+        const auto revision = commands.Write("SET CHUNK " + Coordinates(coords[2], dims) + " IN t META owner=9");
+        FeedSlotTestAccess::Sync(*table);
+        auto reader = table->ReadFeedArchive(slot.position);
+        const auto change = reader.Next();
+        assert(change && change->dims == dims && change->position.revision == revision && change->blocks.empty() &&
+            change->chunk_changes.size() == 1U && change->chunk_changes.front().chunk == coords[2]);
+        const auto& row = change->chunk_changes.front();
+        assert(row.before && std::get<std::uint64_t>(row.before->front()) == (required ? 0U : 5U));
+        assert(row.after && std::get<std::uint64_t>(row.after->front()) == 9U && !reader.Next());
+        states[2] = State(*catalog, coords[2]);
+    }
+    Verify(root);
+    TableCatalog reopened(config);
+    for (std::size_t i = 0; i < coords.size(); ++i) Identity(State(reopened, coords[i]), states[i]);
+}
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--late-slot-only") {
+        for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal})
+            for (const unsigned dims : {2U, 3U}) for (const bool required : {false, true})
+                for (const bool cold : {false, true}) LateSlotBaseline(mode, dims, required, cold);
+        std::cout << "16 late-slot baseline combinations passed\n";
+        return 0;
+    }
+    assert(argc == 1);
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal})
         for (const auto required : {false, true}) Persistence(mode, required);
     std::cout << "4 dimensional persistence combinations passed\n";
+    for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal})
+        for (const unsigned dims : {2U, 3U}) for (const bool required : {false, true})
+            for (const bool cold : {false, true}) LateSlotBaseline(mode, dims, required, cold);
+    std::cout << "16 late-slot baseline combinations passed\n";
 }
