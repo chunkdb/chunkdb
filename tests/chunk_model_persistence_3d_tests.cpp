@@ -121,9 +121,10 @@ void Archive(TableCatalog& catalog, const std::filesystem::path& table_root, con
 
 void Persistence(DurabilityMode mode, bool required) {
     test::ScopedTempDir temporary("chunkdb-persistence-3d");
-    const auto source = temporary.path() / "source";
-    const auto backup = temporary.path() / "backup";
-    const auto restored = temporary.path() / "restored";
+    const auto root = std::filesystem::canonical(temporary.path());
+    const auto source = root / "source";
+    const auto backup = root / "backup";
+    const auto restored = root / "restored";
     const auto config = Config(source, mode);
     const auto table_root = source / "tables/t";
     StoreId epoch{};
