@@ -12,6 +12,7 @@ Object names are derived from their complete raw SHA-256, and references additio
 Every object binds the directory identity and has a checked header, exact extent, reserved-zero fields and complete-record checksum.
 The root binds its nonwrapping generation, the coverage-tree root, retained-group reference-tree root, selected certified journal inventory and selected retained-ID inventory by identity, generation, exact length and raw SHA-256.
 It also binds the counter owner and minimum required reservation ceiling; the independently admitted current ceiling cannot be lower.
+A checked INACTIVE root instead has zero selected-object references and certifies that grouped frames have never been authorized; ACTIVE roots contain the complete selected contexts and never revert to INACTIVE.
 A pending root additionally binds the exact previous root and a complete replacement plan; a final root has no pending plan.
 An unknown tag, changed referenced byte, missing required object or generation overflow refuses admission before repair.
 New object files and every newly created parent name are durable before a root can reference them.
@@ -46,14 +47,20 @@ The exact page codec and its sparse oversized-file tests precede owner implement
 
 ## First use and complete discovery
 
-The checked directory or standalone manifest has an optional nonzero group-owner identity, admitted only with the `commit_groups` feature.
-A missing identity proves that grouped artifacts have never been authorized in that directory; enabling the feature alone does not create a runtime coordinator.
-First use stages and syncs empty owner, journal, coverage, reference and ID roots and every parent name, then atomically publishes and syncs the manifest's owner identity before any GROUP frame can be appended.
-That claim is never cleared, including after the last group retires, and a claimed missing or incompatible owner is damage.
-A crash before the claim can leave only checked empty staged objects, because no grouped frame is permitted before its durable publication.
+The checked directory or standalone manifest has a stable nonzero group-owner identity whenever the `commit_groups` feature is enabled.
+Fresh creation stages and syncs the checked INACTIVE root and its parent names before publishing that manifest; ENABLE FEATURE does the same under its existing checked activation decision before exposing the feature.
+Standalone construction completes this publication before exposing the store, and catalog construction or feature activation completes it before exposing any table lease.
+A committed feature-enabled manifest without its matching checked owner is damage, not permission for late catalog initialization.
+The runtime coordinator remains lazy, and an INACTIVE root lets startup omit grouped-WAL discovery because no GROUP frame has ever been authorized.
+
+First grouped use stages and syncs empty journal, coverage, reference and ID objects and their parent names, then atomically publishes and syncs an ACTIVE root before appending any GROUP frame.
+This transition uses only the independent owner-transition serialization and pinned file I/O; it never acquires catalog operations, feature metadata admission or another table lease.
+It is therefore admissible from an existing direct C++ conditional operation already owning a table lease, and from a standalone store.
+An ACTIVE owner never reverts, including after its last group retires, and a missing selected object is damage.
+A failed activation publishes no grouped frame; an uncertain ACTIVE publication fences the coordinator until checked admission resolves it.
 This is a once-per-directory boundary and adds no sync or journal lookup to unused ordinary writes.
 
-When the claim exists, startup enumerates every managed table's WAL namespace, including canonical orphan coordinates not yet represented by the live coordinate index.
+When the owner is ACTIVE, startup enumerates every managed table's WAL namespace, including canonical orphan coordinates not yet represented by the live coordinate index.
 It also enumerates the history-only epochs admitted by the selected owner roots and refuses an unclaimed owned epoch rather than repairing it independently.
 It streams every complete available WAL frame to collect group identities, claimed counts, actual ordinals, table contexts and first group offsets before a table constructor can trim anything.
 Canonical placement, dimensional arity, checked headers, frame limits, checksums and schema contexts are admitted during this pass.
@@ -68,7 +75,6 @@ All found members, overlapping later groups and their transitive rollback cuts a
 A crash after different-table member appends but before decision append therefore cannot leave one table repaired while another still exposes the group.
 
 ## Relaxed anchors and dependency settlement
-
 
 A changed member's rollback anchor is the decision's earlier durable image, retained-empty identity or never-written state.
 The live group owner pins that exact image or retained record and its original WAL generation before appending any grouped member.
@@ -91,6 +97,11 @@ An observed zero identity needs no file, has zero time and schema, and cannot ac
 The observation-capsule layout is an additional checked codec prerequisite; the decision encoding remains unchanged.
 
 A group owner stores its pinned native handles and dependency edges independently of resident chunk mutexes.
+Before any group decision is appended, every changed frame and required observed prefix is appended and flushed out of its user-space staging batch and WalAppendStream buffer into the exact pinned native generation.
+This buffer flush is required even for relaxed publication and is distinct from a durability sync.
+The owner verifies the complete native extent before exposing its frame or prefix digest; syncing a second handle cannot substitute for flushing the first handle's buffers.
+Settlement pins have real sync rights, such as a duplicated writable native writer handle on Windows or a writable file descriptor on POSIX, with the existing sharing and no-follow admission.
+A read-only SharedFileInput handle cannot serve as that Windows settlement handle, and settlement never reopens a canonical pathname that might now name another generation.
 Settling a group copies and pins its complete member handles and earlier dependency edges under the short group-owner mutex, then releases that mutex.
 It settles the transitive earlier groups before its own receipt, in admitted decision order, and syncs member handles in table-epoch and coordinate order.
 Dependency edges always point to earlier admitted decisions; a repeated identity or cycle is damage rather than a wait graph to execute.
@@ -121,6 +132,14 @@ The same selected-root rule applies to ID eviction and ordinary certified-cut ad
 
 ## Checkpoint transition and supersession
 
+One owner-transition continuation serializes all pending root updates through their final publication, including checkpoints, group-reference updates, journal and ID switches, lifecycle changes and restore.
+The owner-transition permit is separate from the short directory visibility gate and can remain owned during file sync without holding that visibility gate.
+Every updater acquires or drains its table admission, pins its coordinate checkpoint ownership and finishes all required chunk-lock acquisition before requesting the permit.
+It releases chunk mutexes before waiting for the permit, and no permit holder waits for a table lease, chunk mutex, catalog operation or another owner transition.
+Prepared ownership pins keep its exact selected artifacts and generations available while it waits.
+Reversible staging captures an expected root generation; after receiving the permit it must re-admit against the current root and rebuild or rebase changed paths if another updater advanced it.
+No updater may publish a pending plan derived from an obsolete root or replace another updater's pending plan.
+After pending publication, the same continuation alone completes every installation and final root; failure leaves that exact pending plan fenced for recovery instead of allowing another update to overwrite it.
 
 Before publishing a checkpoint, settle every group whose effects or observed state the checkpoint will cover.
 Collect the complete checked state and its existing covered set under the normal checkpoint ownership and chunk lock.
