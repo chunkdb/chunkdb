@@ -7,7 +7,9 @@
 #include <string>
 
 #include "chunk_store_internal.hpp"
+#include "checkpoint.hpp"
 #include "chunkdb/chunk_store.hpp"
+#include "store_manifest.hpp"
 #include "test_utils.hpp"
 
 namespace {
@@ -162,10 +164,46 @@ void TransactionPublishesMetadataRowsTogether() {
     ExpectMetadata(first, 3, "after first");
     ExpectMetadata(second, 4, "after second");
 }
+
+void ColdPopulationUsesTheTranslatedMetadataBaseline() {
+    for (const bool add_default : {false, true}) {
+        test::ScopedTempDir directory("chunkdb-cold-metadata-baseline");
+        auto config = Config(directory.path());
+        {
+            ChunkStore store(config);
+            assert(store.WriteChunkState({0, 0}, Changed(store, {0, 0}, 7U, {}), {}).ok);
+            store.CheckpointForTests(0, 0);
+        }
+        auto manifest = *ReadStoreManifest(directory.path());
+        manifest.chunk_schema = DropChunkColumn(*manifest.chunk_schema, "owner");
+        manifest.schema = AdvanceOtherDomain(manifest.schema, ColumnDomain::kBlock);
+        if (add_default) {
+            Column score;
+            score.name = "score";
+            score.type = {ColumnKind::kUnsigned, 8U};
+            score.has_default = true;
+            score.default_value = EncodeColumnValue(score, ColumnValue{std::uint64_t{5U}});
+            manifest.chunk_schema = AddChunkColumn(*manifest.chunk_schema, score);
+            manifest.schema = AdvanceOtherDomain(manifest.schema, ColumnDomain::kBlock);
+        }
+        AtomicWrite(StoreManifestPath(directory.path()), SerializeStoreManifest(manifest), true, true);
+        config.schema = manifest.schema;
+        config.chunk_schema = manifest.chunk_schema;
+        ChunkStore store(config);
+        assert(!store.IsChunkLoadedForTests(0, 0));
+        assert(store.ScanPopulatedChunks(false, {}, 10U).coords.empty());
+        assert(store.ReadChunkRange(0, 0, 0, 0, true).empty());
+        assert(!store.IsChunkLoadedForTests(0, 0));
+        const auto state = store.ReadChunkState(0, 0);
+        assert(state.written && !ChunkPopulated(store.geometry(), state.presence_bitmap, state.chunk_columns.get()));
+        assert(store.ScanPopulatedChunks(false, {}, 10U).coords.empty());
+    }
+}
 }
 
 int main() {
     MetadataSurvivesWalImageEvictionAndRefresh();
     CombinedQuotaAllowsShrinkingAfterLimitReduction();
     TransactionPublishesMetadataRowsTogether();
+    ColdPopulationUsesTheTranslatedMetadataBaseline();
 }

@@ -464,11 +464,11 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         }
     }
 
+    BringChunkColumnsToSchema(geometry_, schema_version, geometry_.chunk_schema().version, &chunk_columns);
+    BringToCurrentSchema(geometry_, schema_version, presence, &payload, &vars);
     if (!ChunkPopulated(geometry_, presence, chunk_columns.get())) {
         return false;
     }
-    BringChunkColumnsToSchema(geometry_, schema_version, geometry_.chunk_schema().version, &chunk_columns);
-    BringToCurrentSchema(geometry_, schema_version, presence, &payload, &vars);
     if (out != nullptr) {
         out->payload = std::move(payload);
         out->presence_bitmap = std::move(presence);
