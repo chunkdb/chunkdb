@@ -16,6 +16,8 @@
 #include "catalog_test_utils.hpp"
 #include "chunkdb/engine.hpp"
 #include "login_helpers.hpp"
+#include "../src/sectioned_chunk_form.hpp"
+#include "../src/typed_chunk_form.hpp"
 
 namespace {
 
@@ -164,39 +166,52 @@ int main() {
         assert(unset_ok.rfind(":", 0) == 0);
         assert(engine.Execute(session, "GET BLOCK 0 0 FROM default\r\n") == "_\r\n");
 
-        // Chunks: 4x4 blocks of 4 bits, 8 payload bytes and 2 presence bytes.
-        // The chunk form is the version and the schema version (u64 LE
-        // each), presence, then payload.
+        const auto lease = catalog->Find("default")->Acquire();
+        const auto& geometry = lease->store().geometry();
+        const auto form_of = [&](const std::string& reply) {
+            const auto header_end = reply.find("\r\n");
+            assert(reply.starts_with('$') && header_end != std::string::npos);
+            const auto length = std::stoull(reply.substr(1U, header_end - 1U));
+            assert(reply.size() == header_end + 2U + length + 2U && reply.ends_with("\r\n"));
+            return std::span(reinterpret_cast<const std::uint8_t*>(reply.data() + header_end + 2U), length);
+        };
+        // Checked forms preserve the 4x4 blocks, opaque fixed bits and identity.
         const auto chunk_of = [&](const std::string& reply) {
-            assert(reply.rfind("$26\r\n", 0) == 0 && reply.size() == 5 + 26 + 2);
-            return reply.substr(5 + 16, 10);
+            const auto state = chunkdb::DecodeSectionedChunkState(geometry, form_of(reply), chunkdb::kVarMaxChunkBytesLimit);
+            assert(state.presence_bitmap.size() == 2U && state.payload.size() == 8U);
+            return std::string(state.presence_bitmap.begin(), state.presence_bitmap.end()) +
+                std::string(state.payload.begin(), state.payload.end());
         };
-        const auto version_of = [&](const std::string& reply) {
-            std::uint64_t version = 0;
-            for (std::size_t i = 0; i < 8; ++i) {
-                version |= static_cast<std::uint64_t>(static_cast<unsigned char>(reply[5 + i])) << (8U * i);
-            }
-            return std::to_string(version);
+        const auto header_of = [&](const std::string& reply) {
+            const auto bytes = form_of(reply);
+            return chunkdb::ParseChunkFormSections(bytes, bytes.size(), chunkdb::ChunkFormReadMode::kRead).header;
         };
-        // Version (not read) and schema version 1.
-        const std::string header = std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8);
+        const auto encode = [&](const std::string& presence, const std::string& payload) {
+            chunkdb::ChunkState state;
+            state.presence_bitmap.assign(presence.begin(), presence.end());
+            state.payload.assign(payload.begin(), payload.end());
+            const auto bytes = chunkdb::EncodeSectionedChunkState(geometry, state, chunkdb::kVarMaxChunkBytesLimit);
+            return std::string(bytes.begin(), bytes.end());
+        };
         const std::string zero_payload(8, '\0');
         const std::string no_blocks(2, '\0');
         assert(chunk_of(engine.Execute(session, "GET CHUNK 0 0 FROM default\r\n")) == no_blocks + zero_payload);
         const std::string all_blocks("\xff\xff", 2);
         const std::string put_ok = engine.Execute(
-            session, "SET CHUNK 0 0 IN default $1\r\n", Parameters{header + all_blocks + zero_payload});
+            session, "SET CHUNK 0 0 IN default $1\r\n", Parameters{encode(all_blocks, zero_payload)});
         assert(put_ok.rfind(":", 0) == 0);
         const std::string chunk_ok = engine.Execute(session, "GET CHUNK 0 0 FROM default\r\n");
         assert(chunk_of(chunk_ok) == all_blocks + zero_payload);
-        assert(put_ok == ":" + version_of(chunk_ok) + "\r\n");
+        const auto identity = header_of(chunk_ok);
+        assert(put_ok == ":" + std::to_string(identity.chunk_version) + "\r\n");
+        assert(identity.schema_version == 1U && identity.commit_time_ms > 0U && identity.flags == 0U);
         assert(engine.Execute(session, "GET BLOCK 0 0 FROM default\r\n") == std::string("*1\r\n$1\r\n\0\r\n", 11));
 
         // Blocks 0 and 15 present: presence bit i is byte i/8, 1 << (i % 8).
         const std::string sparse_presence("\x01\x80", 2);
         const std::string sparse_payload = std::string("\x0f", 1) + std::string(7, '\0');
         assert(engine.Execute(
-                   session, "SET CHUNK 1 0 IN default $1\r\n", Parameters{header + sparse_presence + sparse_payload})
+                   session, "SET CHUNK 1 0 IN default $1\r\n", Parameters{encode(sparse_presence, sparse_payload)})
                    .rfind(":", 0) == 0);
         assert(chunk_of(engine.Execute(session, "GET CHUNK 1 0 FROM default\r\n")) == sparse_presence + sparse_payload);
         assert(engine.Execute(session, "GET BLOCK 4 0 FROM default\r\n") == "*1\r\n$1\r\n\x0f\r\n");

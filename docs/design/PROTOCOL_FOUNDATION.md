@@ -137,7 +137,8 @@ Manifest-only initialization remains valid, and read-only inspection keeps its u
 
 Row, version and schema metadata are captured under the same table lease and chunk read/snapshot boundary.
 An absent block with a retained committed chunk version still returns that version.
-The version is null when no committed version remains retained, including never-written chunks and collected empty chunks.
+The version is null when no committed version remains retained, including never-written chunks and identities forgotten by tombstone compaction.
+Collection itself preserves the producing version and time in a retained tombstone.
 An empty or torn WAL header alone is not a committed version.
 Persistent versions for collected chunks belong to task 52's tombstones.
 For transaction-private modified chunks the version is null, because no commit produced those private values yet; the committed snapshot version remains available before modification.

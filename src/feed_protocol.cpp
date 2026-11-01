@@ -3,6 +3,8 @@
 #include "store_manifest.hpp"
 #include "chunkdb/feed_slots.hpp"
 #include "chunk_store_internal.hpp"
+#include "typed_chunk_form.hpp"
+#include "sectioned_chunk_form.hpp"
 #include <algorithm>
 #include <charconv>
 #include <stdexcept>
@@ -10,6 +12,26 @@
 #include <type_traits>
 namespace chunkdb {
 namespace {
+void ValidateDims(std::uint8_t dims) {
+    if (dims != 2U && dims != 3U) throw std::logic_error("feed entry has invalid dimensions");
+}
+void ValidateArea(std::uint8_t dims, const std::optional<FeedArea>& area) {
+    ValidateDims(dims);
+    if (!area) return;
+    if (area->dims != dims || (dims == 2U && (area->first.z != 0 || area->last.z != 0)))
+        throw std::invalid_argument("feed area dimensions differ from entry");
+    if (area->first.x > area->last.x || area->first.y > area->last.y ||
+        (dims == 3U && area->first.z > area->last.z)) throw std::invalid_argument("feed area is reversed");
+}
+bool InArea(ChunkCoord coord, std::uint8_t dims, const std::optional<FeedArea>& area) {
+    return !area || (coord.x >= area->first.x && coord.x <= area->last.x &&
+        coord.y >= area->first.y && coord.y <= area->last.y &&
+        (dims != 3U || (coord.z >= area->first.z && coord.z <= area->last.z)));
+}
+void ValidateCoord(ChunkCoord coord, std::uint8_t dims) {
+    if (dims == 2U && coord.z != 0) throw std::logic_error("feed entry has an inactive chunk coordinate");
+}
+
 template <class Integer>
 void Number(std::string& out, char prefix, Integer value) {
     static_assert(sizeof(Integer) <= sizeof(std::uint64_t));
@@ -156,32 +178,48 @@ std::shared_ptr<const FeedEntry> ChunkFeedEntry(const std::shared_ptr<const Feed
     const Geometry& geometry, const std::optional<FeedArea>& area,
     const std::optional<std::vector<std::uint32_t>>& ids) {
     if (entry->kind != FeedEntry::Kind::kChange && entry->kind != FeedEntry::Kind::kChunks) return entry;
+    ValidateArea(entry->dims, area);
+    if (entry->dims != geometry.dims()) throw std::logic_error("feed entry dimensions differ from table");
+    if (ids && ids->empty()) throw std::invalid_argument("feed projection must not be empty");
     if (!entry->chunk_forms_complete) throw std::logic_error("chunk feed requires a complete preimage");
     auto result = std::make_shared<FeedEntry>();
     result->chunk_forms_complete = true;
     result->kind = FeedEntry::Kind::kChunks; result->position = entry->position;
     result->schema_version = entry->schema_version; result->commit_time_ms = entry->commit_time_ms; result->user = entry->user;
+    result->dims = entry->dims;
+    result->chunk_columns = entry->chunk_columns;
     const auto& layout = geometry.LayoutAt(entry->schema_version);
     std::vector<std::size_t> selected;
     if (ids) for (const auto id : *ids) {
         const auto& columns = layout.schema().columns;
         const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
         if (at == columns.end()) throw FeedSlotLostError("feed projected column was dropped", "schema_filter");
-        selected.push_back(static_cast<std::size_t>(at - columns.begin()));
+        const auto index = static_cast<std::size_t>(at - columns.begin());
+        if (std::find(selected.begin(), selected.end(), index) != selected.end())
+            throw std::invalid_argument("duplicate feed projection column");
+        selected.push_back(index);
     }
+    std::optional<Geometry> historical;
     for (auto chunk : entry->chunk_forms) {
-        if (area && (chunk.chunk.x < area->first.x || chunk.chunk.x > area->last.x ||
-                     chunk.chunk.y < area->first.y || chunk.chunk.y > area->last.y)) continue;
+        ValidateCoord(chunk.chunk, entry->dims);
+        if (!InArea(chunk.chunk, entry->dims, area)) continue;
         if (ids && chunk.form) {
             const auto& form = *chunk.form;
-            const auto presence_size = ChunkPresenceBitmapBytes(geometry);
-            const auto fixed_size = 16U + presence_size + layout.payload_bytes();
-            if (form.size() < fixed_size) throw std::logic_error("captured chunk form is truncated");
-            std::vector<std::uint8_t> presence(form.begin() + 16U, form.begin() + static_cast<std::ptrdiff_t>(16U + presence_size));
-            std::vector<std::uint8_t> payload(form.begin() + static_cast<std::ptrdiff_t>(16U + presence_size), form.begin() + static_cast<std::ptrdiff_t>(fixed_size));
-            const auto vars = ChunkVars::Decode(reinterpret_cast<const std::uint8_t*>(form.data()) + fixed_size,
-                form.size() - fixed_size, geometry.ChunkBlockCount());
-            chunk.form = std::make_shared<const std::string>(EncodeChunkForm(layout, chunk.version, payload, presence, vars, selected));
+            if (!historical) {
+                auto config = geometry.config();
+                config.block_bits = FixedBitsPerBlock(layout.schema());
+                historical.emplace(config, layout.schema(), SchemaAtVersion(geometry.chunk_schema(), entry->schema_version));
+            }
+            const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(form.data()), form.size());
+            const auto header = ParseChunkFormSections(bytes, bytes.size(), ChunkFormReadMode::kMutation).header;
+            if (header.chunk_version != chunk.version || header.schema_version != entry->schema_version ||
+                (header.flags & kChunkFormPrivate) != 0U) throw std::logic_error("captured chunk form identity mismatch");
+            auto state = DecodeSectionedChunkState(*historical, bytes, kVarMaxChunkBytesLimit);
+            state.version = header.chunk_version;
+            state.commit_time_ms = header.commit_time_ms;
+            state.written = true;
+            const auto projected = EncodeSectionedChunkState(*historical, state, kVarMaxChunkBytesLimit, selected);
+            chunk.form = std::make_shared<const std::string>(reinterpret_cast<const char*>(projected.data()), projected.size());
         }
         result->chunk_forms.push_back(std::move(chunk));
     }
@@ -192,18 +230,24 @@ std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const Fee
     const std::optional<FeedArea>& area, const std::optional<std::vector<std::uint32_t>>& ids,
     bool no_before, const std::vector<Column>& columns) {
     if (entry->kind != FeedEntry::Kind::kChange && entry->kind != FeedEntry::Kind::kSchema) return entry;
+    ValidateArea(entry->dims, area);
+    if (ids && ids->empty()) throw std::invalid_argument("feed projection must not be empty");
     if (!area && !ids && !no_before) return entry;
     if (entry->kind == FeedEntry::Kind::kSchema && !ids) return entry;
     if (entry->kind == FeedEntry::Kind::kChange && area && !ids && !no_before &&
         std::all_of(entry->blocks.begin(), entry->blocks.end(), [&](const auto& block) {
-            return block.chunk.x >= area->first.x && block.chunk.x <= area->last.x &&
-                   block.chunk.y >= area->first.y && block.chunk.y <= area->last.y;
-        })) return entry->blocks.empty() ? nullptr : entry;
+            return InArea(block.chunk, entry->dims, area);
+        }) && std::all_of(entry->chunk_changes.begin(), entry->chunk_changes.end(), [&](const auto& change) {
+            return InArea(change.chunk, entry->dims, area);
+        })) return entry->blocks.empty() && entry->chunk_changes.empty() ? nullptr : entry;
     std::vector<std::size_t> selected;
     if (ids) for (const auto id : *ids) {
         const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
         if (at == columns.end()) throw FeedSlotLostError("feed projected column was dropped", "schema_filter");
-        selected.push_back(static_cast<std::size_t>(at - columns.begin()));
+        const auto index = static_cast<std::size_t>(at - columns.begin());
+        if (std::find(selected.begin(), selected.end(), index) != selected.end())
+            throw std::invalid_argument("duplicate feed projection column");
+        selected.push_back(index);
     }
     auto filtered = std::make_shared<FeedEntry>(*entry);
     filtered->protocol_frame.reset();
@@ -215,10 +259,12 @@ std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const Fee
         return filtered;
     }
     if (area) std::erase_if(filtered->blocks, [&](const auto& block) {
-        return block.chunk.x < area->first.x || block.chunk.x > area->last.x ||
-               block.chunk.y < area->first.y || block.chunk.y > area->last.y;
+        return !InArea(block.chunk, entry->dims, area);
     });
-    if (filtered->blocks.empty()) return nullptr;
+    if (area) std::erase_if(filtered->chunk_changes, [&](const auto& change) {
+        return !InArea(change.chunk, entry->dims, area);
+    });
+    if (filtered->blocks.empty() && filtered->chunk_changes.empty()) return nullptr;
     const auto project = [&](auto& row) {
         if (!row || !ids) return;
         if (row->size() != columns.size()) throw std::logic_error("feed row does not match its historical schema");
@@ -230,12 +276,14 @@ std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const Fee
         if (no_before) block.before.reset(); else project(block.before);
         project(block.after);
     }
+    if (no_before) for (auto& change : filtered->chunk_changes) change.before.reset();
     return filtered;
 }
 
 std::string EncodeFeedEntry(const FeedEntry& entry) {
     if (entry.kind == FeedEntry::Kind::kEnd) return Protocol::Error("NO_TABLE", "watched table was dropped");
     if (entry.kind == FeedEntry::Kind::kResync) return EncodeFeedResync(entry.position, std::nullopt);
+    if (entry.kind != FeedEntry::Kind::kProgress) ValidateDims(entry.dims);
     std::string out;
     if (entry.kind == FeedEntry::Kind::kSchema) {
         out = ">2\r\n";
@@ -248,11 +296,11 @@ std::string EncodeFeedEntry(const FeedEntry& entry) {
         Protocol::AppendBulk(out, "schema_version");
         Number(out, ':', entry.schema_version);
         Protocol::AppendBulk(out, "dims");
-        Number(out, ':', std::uint64_t{2});
+        Number(out, ':', entry.dims);
         Protocol::AppendBulk(out, "columns");
         Protocol::AppendColumns(out, entry.columns);
         Protocol::AppendBulk(out, "chunk_columns");
-        Protocol::AppendArrayHeader(out, 0U);
+        Protocol::AppendColumns(out, entry.chunk_columns);
         return out;
     }
     if (entry.kind == FeedEntry::Kind::kProgress) {
@@ -269,13 +317,17 @@ std::string EncodeFeedEntry(const FeedEntry& entry) {
         if (entry.user) Protocol::AppendBulk(out, *entry.user); else Protocol::AppendNull(out);
         Number(out, ':', entry.schema_version); Protocol::AppendArrayHeader(out, entry.chunk_forms.size());
         for (const auto& chunk : entry.chunk_forms) {
-            Protocol::AppendArrayHeader(out, 4U); Number(out, ':', chunk.chunk.x); Number(out, ':', chunk.chunk.y);
+            ValidateCoord(chunk.chunk, entry.dims);
+            Protocol::AppendArrayHeader(out, static_cast<std::size_t>(entry.dims) + 2U);
+            Number(out, ':', chunk.chunk.x); Number(out, ':', chunk.chunk.y);
+            if (entry.dims == 3U) Number(out, ':', chunk.chunk.z);
             Number(out, ':', chunk.version);
             if (chunk.form) Protocol::AppendBulk(out, *chunk.form); else Protocol::AppendNull(out);
         }
         out += "_\r\n_\r\n";
         return out;
     }
+    if (entry.kind != FeedEntry::Kind::kChange) throw std::logic_error("unknown feed entry kind");
     out = ">10\r\n";
     Protocol::AppendBulk(out, "change");
     Protocol::AppendBulk(out, StoreIdHex(entry.position.epoch));
@@ -285,16 +337,81 @@ std::string EncodeFeedEntry(const FeedEntry& entry) {
     Number(out, ':', entry.schema_version);
     Number(out, '*', entry.blocks.size());
     RowEncoding before, after;
-    CoordinateEncoding x, y;
+    CoordinateEncoding x, y, z;
     for (const auto& block : entry.blocks) {
-        out += "*4\r\n";
+        ValidateCoord(block.chunk, entry.dims);
+        if (entry.dims == 2U && (block.z.value_or(0) != 0 || block.local_z != 0U))
+            throw std::logic_error("feed entry has an inactive block coordinate");
+        Number(out, '*', static_cast<std::size_t>(entry.dims) + 2U);
         x.Append(out, block.x, block.chunk.x, block.local_x);
         y.Append(out, block.y, block.chunk.y, block.local_y);
+        if (entry.dims == 3U) z.Append(out, block.z, block.chunk.z, block.local_z);
         before.Append(out, block.before);
         after.Append(out, block.after);
     }
-    out += "_\r\n_\r\n*0\r\n";  // Reserved tag, transaction id and chunk-column changes.
+    out += "_\r\n_\r\n";  // Reserved tag and transaction id.
+    Number(out, '*', entry.chunk_changes.size());
+    for (const auto& change : entry.chunk_changes) {
+        ValidateCoord(change.chunk, entry.dims);
+        Number(out, '*', static_cast<std::size_t>(entry.dims) + 2U);
+        Number(out, ':', change.chunk.x); Number(out, ':', change.chunk.y);
+        if (entry.dims == 3U) Number(out, ':', change.chunk.z);
+        before.Append(out, change.before);
+        after.Append(out, change.after);
+    }
     return out;
+}
+
+namespace {
+struct RetainedBytes {
+    std::size_t total = 0U;
+    void Add(std::size_t part) {
+        if (part > std::numeric_limits<std::size_t>::max() - total)
+            throw std::length_error("feed retained byte count overflows");
+        total += part;
+    }
+    void Storage(std::size_t count, std::size_t width) {
+        if (count > std::numeric_limits<std::size_t>::max() / width)
+            throw std::length_error("feed retained storage size overflows");
+        Add(count * width);
+    }
+};
+}
+
+std::size_t FeedRowRetainedBytes(const std::optional<std::vector<ColumnValue>>& row) {
+    RetainedBytes bytes;
+    if (row) {
+        bytes.Storage(row->capacity(), sizeof(ColumnValue));
+        for (const auto& value : *row) bytes.Add(std::visit([](const auto& v) -> std::size_t {
+            using T = std::decay_t<decltype(v)>;
+            if constexpr (std::is_same_v<T, std::string>) return v.capacity();
+            else if constexpr (std::is_same_v<T, BitsValue>) return v.digits.capacity();
+            else if constexpr (std::is_same_v<T, BytesValue>) return v.bytes.capacity();
+            else return 0U;
+        }, value));
+    }
+    return bytes.total;
+}
+
+std::size_t FeedEntryRetainedBytes(const FeedEntry& entry) {
+    RetainedBytes bytes;
+    const auto columns = [&](const std::vector<Column>& list) {
+        bytes.Storage(list.capacity(), sizeof(Column));
+        for (const auto& column : list) { bytes.Add(column.name.capacity()); bytes.Add(column.default_value.capacity()); }
+    };
+    bytes.Add(sizeof(FeedEntry)); bytes.Add(2U * sizeof(void*));
+    if (entry.protocol_frame) { bytes.Add(entry.protocol_frame->capacity()); bytes.Add(sizeof(std::string)); bytes.Add(2U * sizeof(void*)); }
+    if (entry.user) bytes.Add(entry.user->capacity());
+    bytes.Storage(entry.blocks.capacity(), sizeof(FeedBlockChange));
+    for (const auto& block : entry.blocks) { bytes.Add(FeedRowRetainedBytes(block.before)); bytes.Add(FeedRowRetainedBytes(block.after)); }
+    bytes.Storage(entry.chunk_changes.capacity(), sizeof(FeedChunkChange));
+    for (const auto& change : entry.chunk_changes) { bytes.Add(FeedRowRetainedBytes(change.before)); bytes.Add(FeedRowRetainedBytes(change.after)); }
+    bytes.Storage(entry.chunk_forms.capacity(), sizeof(FeedChunkForm));
+    for (const auto& chunk : entry.chunk_forms) if (chunk.form) {
+        bytes.Add(chunk.form->capacity()); bytes.Add(sizeof(std::string)); bytes.Add(2U * sizeof(void*));
+    }
+    columns(entry.columns); columns(entry.chunk_columns);
+    return bytes.total;
 }
 std::string EncodeFeedResync(FeedPosition position, const std::optional<TableLineage>& lineage) {
     std::string out = ">5\r\n";

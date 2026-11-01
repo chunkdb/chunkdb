@@ -1,5 +1,5 @@
 # Transaction snapshots and commits
-The [transaction guide](../TRANSACTIONS.md) defines statements and limits; [storage](../STORAGE_FORMAT.md) defines CKTB and CKTC.
+The [transaction guide](../TRANSACTIONS.md) defines statements and limits; [storage](../STORAGE_FORMAT.md) defines checked transaction intents.
 
 ## Snapshot history
 
@@ -14,9 +14,9 @@ The aborted state remains on the connection until COMMIT or ROLLBACK so pipeline
 
 Commit loads and pins all read/written chunks and locks them in coordinate order, with read-only chunks shared.
 It rechecks snapshot registration and conflicts, establishes durable previous WAL boundaries, and reserves one revision/time for changed chunks.
-Synced CKTB lists those boundaries before any new frame is appended.
-Every changed chunk receives one synced frame; publishing synced CKTC commits them all before memory swaps expose their new states.
-Rollback truncates to CKTB boundaries; failed repair pins affected chunks and fences writes until RECOVER TABLE or a restart.
+A synced rollback intent lists those boundaries before any new frame is appended.
+Every changed chunk receives one synced frame; publishing a synced committed intent commits them all before memory swaps expose their new states.
+Rollback truncates to the recorded boundaries; failed repair pins affected chunks and fences writes until RECOVER TABLE or a restart.
 Cleanup after durable commit cannot turn success into rejection; an ambiguous durability decision reports an unknown outcome.
 Recovery is idempotent and read-only observers obey the decision without modifying files.
 Feed publication groups the frames under one revision and completes postcommit bookkeeping before releasing its producer bound.

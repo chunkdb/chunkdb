@@ -1,4 +1,5 @@
 #include <array>
+#include <algorithm>
 #include <atomic>
 #include <future>
 #include <cassert>
@@ -9,6 +10,7 @@
 
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/crc32.hpp"
+#include "archive_base_format.hpp"
 #include "feed_archive.hpp"
 #include "feed_prefix.hpp"
 #include "feed_protocol.hpp"
@@ -50,7 +52,7 @@ struct Fixture {
         return bytes;
     }
     std::vector<std::uint8_t> Wal(ChunkCoord coord, const std::vector<std::vector<std::uint8_t>>& frames) {
-        auto wal = BuildWalHeader(coord, epoch, {});
+        auto wal = BuildWalHeader(coord, epoch, {.incompat = kFeatureChunkModel});
         for (const auto& frame : frames) wal.insert(wal.end(), frame.begin(), frame.end());
         return wal;
     }
@@ -59,9 +61,28 @@ struct Fixture {
         return directory.path() / ".chunkdb.feed" / ("C_" + std::to_string(coord.x) + "_" + std::to_string(coord.y) + "." +
             std::to_string(first) + "-" + std::to_string(last) + ".wal");
     }
+    void NeverWritten(ChunkCoord coord = {}, std::uint64_t first = 2U) {
+        Save(directory.path() / ".chunkdb.feed" / ArchiveBaseFileName(coord, geometry.dims(), first),
+            SerializeArchiveBaseDescriptor({.dims = geometry.dims(), .kind = ArchiveBaseKind::kNeverWritten,
+                .epoch = epoch, .coord = coord, .first = first, .base_schema = 1U}, kVarMaxChunkBytesLimit));
+    }
+    void ImageBase(ChunkCoord coord, std::uint64_t first, const std::vector<std::uint8_t>& bytes,
+        std::uint64_t revision, std::uint64_t time) {
+        const auto stem = "C_" + std::to_string(coord.x) + "_" + std::to_string(coord.y) + "." + std::to_string(first);
+        const auto linked = directory.path() / ".chunkdb.feed" / (stem + ".chk");
+        std::filesystem::create_directories(linked.parent_path());
+        std::filesystem::create_hard_link(ChunkDataPath(directory.path(), geometry, coord), linked);
+        assert(LoadFile(linked) == bytes);
+        Save(directory.path() / ".chunkdb.feed" / ArchiveBaseFileName(coord, geometry.dims(), first),
+            SerializeArchiveBaseDescriptor({.dims = geometry.dims(), .kind = ArchiveBaseKind::kImage,
+                .epoch = epoch, .coord = coord, .first = first, .base_revision = revision,
+                .base_time_ms = time, .base_schema = 1U, .image_length = bytes.size(),
+                .image_sha256 = crypto::Sha256Of(bytes)}, kVarMaxChunkBytesLimit));
+    }
     FeedArchiveReader Reader(const std::vector<FeedWalPrefix>& prefixes, std::uint64_t through, std::uint64_t from = 0U,
         std::shared_ptr<void> pin = {}) {
-        return FeedArchiveAccess::CreateCompletedPrefix(directory.path(), geometry, epoch, {epoch, from}, through, std::move(pin), prefixes);
+        return FeedArchiveAccess::CreateCompletedPrefix(directory.path(), geometry, epoch, {epoch, from}, through, std::move(pin), prefixes,
+            {.incompat = kFeatureChunkModel});
     }
 };
 void Value(const std::optional<std::vector<ColumnValue>>& row, std::uint8_t value) {
@@ -72,6 +93,7 @@ void Value(const std::optional<std::vector<ColumnValue>>& row, std::uint8_t valu
 }
 void MutableTailIsNeverRead() {
     Fixture fixture;
+    fixture.NeverWritten();
     const auto first = fixture.Frame(2U, 8U);
     auto future = fixture.Frame(3U, 9U);
     future[4U] ^= 1U; // A future header's checksum is intentionally invalid.
@@ -93,8 +115,12 @@ void RenameAndReusedPartialLive(bool had_base) {
     Save(fixture.Live(), wal);
     const auto current = ChunkDataPath(fixture.directory.path(), fixture.geometry, {});
     const auto linked = fixture.directory.path() / ".chunkdb.feed" / "C_0_0.2.chk";
-    if (had_base) Save(current, SerializeChunkImage(fixture.geometry, {}, {7U, 0U}, {1U},
-        CheckpointCompression::kNone, 1U, 10U, fixture.epoch));
+    if (had_base) {
+        const auto image = SerializeChunkImage(fixture.geometry, {}, {7U, 0U}, {1U},
+            CheckpointCompression::kNone, 1U, 10U, fixture.epoch);
+        Save(current, image);
+        fixture.ImageBase({}, 2U, image, 1U, 10U);
+    } else fixture.NeverWritten();
     auto pin = std::make_shared<int>(1);
     std::weak_ptr<int> weak = pin;
     {
@@ -102,7 +128,7 @@ void RenameAndReusedPartialLive(bool had_base) {
         assert(!weak.expired());
         std::filesystem::create_directories(linked.parent_path());
         if (had_base) {
-            std::filesystem::create_hard_link(current, linked);
+            assert(LoadFile(current) == LoadFile(linked));
             std::filesystem::remove(current); // Replacing the image preserves its immutable linked inode.
         }
         Save(current, SerializeChunkImage(fixture.geometry, {}, {99U, 0U}, {1U},
@@ -124,6 +150,7 @@ void CurrentOriginalBase() {
     const auto current = ChunkDataPath(fixture.directory.path(), fixture.geometry, {});
     Save(current, SerializeChunkImage(fixture.geometry, {}, {7U, 0U}, {1U},
         CheckpointCompression::kNone, 1U, 10U, fixture.epoch));
+    fixture.ImageBase({}, 2U, LoadFile(current), 1U, 10U);
     const auto wal = fixture.Wal({}, {fixture.Frame(2U, 8U)}); Save(fixture.Live(), wal);
     auto reader = fixture.Reader({{{0, 0}, 2U, 2U, wal.size()}}, 2U);
     const auto entry = reader.Next(); assert(entry && entry->position.revision == 2U);
@@ -131,6 +158,7 @@ void CurrentOriginalBase() {
 }
 void TransactionAcrossPrefixes() {
     Fixture fixture;
+    fixture.NeverWritten(); fixture.NeverWritten({1, 0});
     const auto a = fixture.Wal({}, {fixture.Frame(2U, 8U)});
     const auto b = fixture.Wal({1, 0}, {fixture.Frame(2U, 9U)});
     Save(fixture.Live(), a); Save(fixture.Archive({1, 0}, 2U, 2U), b);
@@ -143,6 +171,7 @@ void CompletedPrefixDamageIsTerminal() {
     for (const bool archived : {false, true}) {
         for (const unsigned torn : {0U, 1U, 2U, 3U}) {
             Fixture fixture;
+            fixture.NeverWritten();
             const auto wal = fixture.Wal({}, {fixture.Frame(2U, 8U)});
             const auto path = archived ? fixture.Archive({}, 2U, 2U) : fixture.Live();
             Save(path, wal);
@@ -208,7 +237,7 @@ void IndexSeedAndVariableHeaders() {
     const auto first = fixture.Frame(2U, 7U), second = fixture.Frame(4U, 8U);
     auto partial = fixture.Frame(5U, 9U); partial.pop_back();
     Save(fixture.Live(), fixture.Wal({}, {first, second, partial}));
-    FeedWalPrefixIndex index; index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, {});
+    FeedWalPrefixIndex index; index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, {.incompat = kFeatureChunkModel});
     const auto captured = index.Capture(UINT64_MAX); assert(captured.size() == 1U);
     assert(captured[0].first == 2U && captured[0].last == 4U);
     assert(captured[0].limit == kWalHeaderSize + first.size() + second.size());
@@ -216,17 +245,18 @@ void IndexSeedAndVariableHeaders() {
     WalFrameBuilder builder(&frame, 1U, {0x01U, 0x02U}, "writer");
     const std::array<std::uint8_t, 3> state{10U, 0U, 1U};
     builder.AppendSpan(0U, state.data(), state.size()); (void)builder.Finish(7U, 70U);
-    auto extended = BuildWalHeader({}, fixture.epoch, {.incompat = kFeatureFeedSlots});
+    auto extended = BuildWalHeader({}, fixture.epoch, {.incompat = kFeatureFeedSlots | kFeatureChunkModel});
     extended.insert(extended.end(), frame.begin(), frame.end());
     index.Truncate({}, 0U); index.Commit(index.Prepare({}, 0U, extended));
     const auto with_tlv = index.Capture(7U); assert(with_tlv.size() == 1U && with_tlv[0].first == 7U);
     assert(with_tlv[0].last == 7U && with_tlv[0].limit == extended.size());
-    Save(fixture.Live(), extended); index.Clear(); index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, {.incompat = kFeatureFeedSlots});
+    Save(fixture.Live(), extended); index.Clear(); index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, {.incompat = kFeatureFeedSlots | kFeatureChunkModel});
     const auto reopened = index.Capture(7U); assert(reopened.size() == 1U && reopened[0].limit == extended.size());
 }
 void IndexSeedCrashTails() {
     for (const unsigned defect : {0U, 1U, 2U, 3U}) {
         Fixture fixture;
+        fixture.NeverWritten();
         const auto first = fixture.Frame(2U, 7U);
         auto tail = fixture.Frame(4U, 8U);
         if (defect == 0U) tail[tail.size() - 5U] ^= 1U; // Intact header, torn payload with full extent.
@@ -234,7 +264,7 @@ void IndexSeedCrashTails() {
         if (defect == 2U) tail.resize(10U); // Cut inside the fixed header.
         if (defect == 3U) tail.pop_back(); // Cut inside the frame body/trailer.
         Save(fixture.Live(), fixture.Wal({}, {first, tail}));
-        FeedWalPrefixIndex index; index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, {});
+        FeedWalPrefixIndex index; index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, {.incompat = kFeatureChunkModel});
         const auto captured = index.Capture(UINT64_MAX);
         assert(captured.size() == 1U && captured[0].first == 2U && captured[0].last == 2U);
         assert(captured[0].limit == kWalHeaderSize + first.size());
@@ -258,13 +288,13 @@ void IndexSeedDamageFailsClosed() {
         }
         Save(fixture.Live(), fixture.Wal({}, defect == 2U ? std::vector<std::vector<std::uint8_t>>{damaged} :
             std::vector<std::vector<std::uint8_t>>{damaged, fixture.Frame(4U, 9U)}));
-        FeedWalPrefixIndex index; index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, {});
+        FeedWalPrefixIndex index; index.SeedFile(fixture.directory.path(), fixture.geometry, {}, fixture.epoch, {.incompat = kFeatureChunkModel});
         Reject([&] { (void)index.Capture(UINT64_MAX); });
     }
 }
 void IndexSeedUsesImageState() {
     Fixture fixture;
-    const FeatureFlags features{.incompat = kFeatureFeedSlots};
+    const FeatureFlags features{.incompat = kFeatureFeedSlots | kFeatureChunkModel};
     std::vector<std::uint8_t> gc;
     WalFrameBuilder builder(&gc, 1U, {}, std::nullopt, true);
     const std::array<std::uint8_t, 2U> payload{};
@@ -350,11 +380,16 @@ void MakeCold(const std::string& executable, const std::filesystem::path& path) 
 }
 struct PrefixHook : FeedWalPrefixTestHook {
     std::atomic<unsigned> images{0};
+    std::array<std::atomic<unsigned>, kColdChunks> coordinate_images{};
     std::mutex mutex;
     std::condition_variable cv;
     bool pause = false, entered = false, released = false;
     void Run(Point point, ChunkCoord coord) override {
-        if (point == Point::kImageRead) ++images;
+        if (point == Point::kImageRead) {
+            assert(coord.x >= 0 && coord.x < kColdChunks && coord.y == 0 && coord.z == 0);
+            ++images;
+            ++coordinate_images[static_cast<std::size_t>(coord.x)];
+        }
         if (point != Point::kBeforeCatchUpSeed || coord != ChunkCoord{} || !pause) return;
         std::unique_lock lock(mutex);
         if (entered) return;
@@ -403,17 +438,34 @@ void OpenAndColdCatchUp(const std::string& executable, bool load_first) {
         TableCatalog catalog(CrashConfig(directory.path(), DurabilityMode::kRelaxed));
         auto table = catalog.Find("default");
         const auto start = table->ListFeedSlots()[0].position;
-        assert(hook.images == 0U); // Observe actual image reads, including off-cache seed reads.
+        // Coordinate recovery validates each image before the feed prefix
+        // manager exists, without retaining regular chunk cache entries.
+        assert(hook.images == kColdChunks);
+        for (const auto& reads : hook.coordinate_images) assert(reads == 1U);
+        const auto lease = table->Acquire();
+        auto& store = lease->store();
+        assert(store.ApproxLoadedChunkCount() == 0U && store.RuntimeStats().unique_loaded_chunks == 0U);
         if (load_first) {
-            auto lease = table->Acquire();
-            assert(txn_test::ReadCounter(lease->store(), {}) == 20U);
-            assert(hook.images == 1U);
+            assert(txn_test::ReadCounter(store, {}) == 20U);
+            assert(hook.images == kColdChunks + 1U);
+            assert(hook.coordinate_images[0] == 2U);
+            for (std::size_t i = 1U; i < hook.coordinate_images.size(); ++i)
+                assert(hook.coordinate_images[i] == 1U);
         }
+        const auto resident = load_first ? 1U : 0U;
+        assert(store.ApproxLoadedChunkCount() == resident && store.RuntimeStats().unique_loaded_chunks == resident);
+        const auto before_capture = hook.images.load();
         auto reader = FeedSlotTestAccess::CompletedPrefix(*table, "consumer", start);
-        assert(hook.images == kColdChunks); // Loaded chunk reuses its replay; cold chunks each read once.
-        std::cout << "cold index: open image reads=0, capture image reads=" << hook.images
+        assert(hook.images - before_capture == kColdChunks - resident);
+        assert(hook.images == 2U * kColdChunks);
+        for (const auto& reads : hook.coordinate_images) assert(reads == 2U);
+        assert(store.ApproxLoadedChunkCount() == resident && store.RuntimeStats().unique_loaded_chunks == resident);
+        std::cout << "cold index: open image reads=" << kColdChunks << ", capture image reads="
+                  << hook.images - before_capture
                   << ", load first=" << load_first << "\n";
         CheckColdChanges(reader);
+        assert(hook.images == 2U * kColdChunks);
+        assert(store.ApproxLoadedChunkCount() == resident && store.RuntimeStats().unique_loaded_chunks == resident);
         FeedWalPrefixTestAccess::SetHook(nullptr);
     }
 }
@@ -472,12 +524,12 @@ void SeedRetirementAndDirectoryRace() {
     hook.directory = fixture.Live().parent_path();
     FeedWalPrefixTestAccess::SetHook(&hook);
     std::mutex publication;
-    index.SeedMissing(fixture.directory.path(), fixture.geometry, fixture.epoch, {}, publication);
+    index.SeedMissing(fixture.directory.path(), fixture.geometry, fixture.epoch, {.incompat = kFeatureChunkModel}, publication);
     FeedWalPrefixTestAccess::SetHook(nullptr);
     assert(index.Capture(UINT64_MAX).empty());
     const auto misplaced = fixture.directory.path() / "L_99_99" / fixture.Live().filename();
     Save(misplaced, fixture.Wal({}, {fixture.Frame(2U, 7U)}));
-    Reject([&] { index.SeedMissing(fixture.directory.path(), fixture.geometry, fixture.epoch, {}, publication); });
+    Reject([&] { index.SeedMissing(fixture.directory.path(), fixture.geometry, fixture.epoch, {.incompat = kFeatureChunkModel}, publication); });
 }
 void RecoveryTrimKeepsCapturedPrefix(const std::string& executable) {
     test::ScopedTempDir directory("chunkdb-lazy-prefix-trim");
@@ -496,6 +548,8 @@ void RecoveryTrimKeepsCapturedPrefix(const std::string& executable) {
     const auto status = std::system(command.c_str());
     assert(WIFEXITED(status) && WEXITSTATUS(status) == kCrashExit);
 #endif
+    const auto wal_path = ChunkWalPath(directory.path() / "tables" / "default", Geometry{{2U, 2U, 4U, 4U, 32U}}, {});
+    const auto torn = LoadFile(wal_path);
     struct TrimPause : FeedWalPrefixTestHook {
         std::mutex mutex;
         std::condition_variable cv;
@@ -518,10 +572,19 @@ void RecoveryTrimKeepsCapturedPrefix(const std::string& executable) {
             (trim ? trim_released : cold_released) = true; cv.notify_all();
         }
     } hook;
-    FeedWalPrefixTestAccess::SetHook(&hook);
     {
         TableCatalog catalog(config);
         auto table = catalog.Find("default");
+        const auto repaired = LoadFile(wal_path);
+        assert(repaired.size() < torn.size() && std::equal(repaired.begin(), repaired.end(), torn.begin()));
+        {
+            const auto lease = table->Acquire();
+            assert(lease->store().ApproxLoadedChunkCount() == 0U);
+        }
+        // Startup already repaired this crash tail. Reinstall its exact
+        // bytes to exercise load-time retirement against a cold seed token.
+        Save(wal_path, torn);
+        FeedWalPrefixTestAccess::SetHook(&hook);
         auto capture = std::async(std::launch::async, [&] {
             return FeedSlotTestAccess::CompletedPrefix(*table, "consumer", start);
         });

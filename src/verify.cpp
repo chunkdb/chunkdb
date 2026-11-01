@@ -9,8 +9,10 @@
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <ostream>
 #include <optional>
+#include <set>
 #include <string>
 #include <utility>
 #include <vector>
@@ -28,6 +30,18 @@
 #include "store_manifest.hpp"
 #include "txn_history.hpp"
 #include "wal_replay.hpp"
+#include "populated_index_format.hpp"
+#include "chunk_coordinate_index.hpp"
+#include "archive_base_format.hpp"
+#include "txn_intent_format.hpp"
+#include "shared_file_input.hpp"
+
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#endif
 
 namespace {
 
@@ -120,47 +134,246 @@ void ReportFeatures(VerifyCounters* counters, const std::filesystem::path& path,
     ReportInfo(counters, "features", path, chunkdb::DescribeFeatures(flags) + " enabled=[" + names + "]");
 }
 
-[[nodiscard]] bool ParseCoordSuffix(
-    const std::string& stem,
-    const std::string& prefix,
-    std::int64_t* out_x,
-    std::int64_t* out_y) {
-    if (stem.rfind(prefix, 0) != 0) {
-        return false;
-    }
-    const std::string rest = stem.substr(prefix.size());
-    const std::size_t separator = rest.find('_');
-    if (separator == std::string::npos) {
-        return false;
-    }
-    return chunkdb::TryParseInt64(rest.substr(0, separator), out_x) &&
-           chunkdb::TryParseInt64(rest.substr(separator + 1), out_y);
-}
-
 [[nodiscard]] bool IsTmpArtifactName(const std::string& name) {
     return name.find(".tmp.") != std::string::npos;
 }
 
+struct CheckedIndex {
+    struct Artifact { std::uint64_t revision, time; bool populated; };
+    chunkdb::IndexInventoryHeader inventory;
+    std::map<chunkdb::ChunkCoord, chunkdb::ChunkIndexRecord> retained;
+    std::map<chunkdb::ChunkCoord, chunkdb::ChunkIndexRecord> unpublished;
+    std::map<chunkdb::ChunkCoord, Artifact> artifacts;
+    std::map<chunkdb::ChunkCoord, std::uint64_t> wal_cuts;
+};
 
-void VerifyChunkFile(
-    const chunkdb::Geometry& geometry,
-    const chunkdb::StoreManifest& manifest,
-    const std::filesystem::path& path,
-    const chunkdb::ChunkCoord& coord,
-    std::vector<std::uint8_t>* payload_out,
-    std::vector<std::uint8_t>* presence_out,
-    bool* image_ok,
-    VerifyCounters* counters) {
-    *image_ok = false;
+void RequirePlain(const std::filesystem::path& path, bool directory = false) {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error || (directory ? !std::filesystem::is_directory(status) : !std::filesystem::is_regular_file(status)))
+        throw std::runtime_error("missing or non-plain checked path " + path.string());
+#ifdef _WIN32
+    const auto attributes = GetFileAttributesW(path.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U)
+        throw std::runtime_error("checked path is a reparse point " + path.string());
+#endif
+}
+
+std::vector<std::uint8_t> ReadSmallRecord(const std::filesystem::path& path, std::size_t limit) {
+    RequirePlain(path);
+    chunkdb::SharedFileInput input(path);
+    if (!input) throw std::runtime_error("cannot open checked record " + path.string());
+    std::vector<std::uint8_t> bytes(limit + 1U);
+    input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    const auto count = input.gcount();
+    if (input.bad() || count > static_cast<std::streamsize>(limit))
+        throw std::runtime_error("checked record exceeds its format bound " + path.string());
+    bytes.resize(static_cast<std::size_t>(count));
+    return bytes;
+}
+
+std::uint64_t Measure(std::istream& input, const std::filesystem::path& path) {
+    input.seekg(0, std::ios::end);
+    const auto size = input.tellg();
+    if (size < 0) throw std::runtime_error("cannot measure " + path.string());
+    input.seekg(0);
+    if (!input) throw std::runtime_error("cannot rewind " + path.string());
+    return static_cast<std::uint64_t>(size);
+}
+
+bool MatchesReplacement(const std::filesystem::path& path, const chunkdb::IndexInventoryEntry& entry) {
+    std::error_code error;
+    const auto status = std::filesystem::symlink_status(path, error);
+    if (error == std::errc::no_such_file_or_directory || (!error && !std::filesystem::exists(status))) return false;
+    if (error || !std::filesystem::is_regular_file(status))
+        throw std::runtime_error("invalid compaction replacement " + path.string());
+    chunkdb::SharedFileInput input(path);
+    if (!input) throw std::runtime_error("cannot open " + path.string());
+    const auto bytes = Measure(input, path);
+    return bytes == entry.replacement_bytes && chunkdb::IndexFileDigest(input, bytes) == entry.replacement_sha256;
+}
+
+CheckedIndex VerifyIndex(const std::filesystem::path& root, const chunkdb::Geometry& geometry,
+    const chunkdb::StoreManifest& manifest, VerifyCounters* counters) {
+    CheckedIndex result;
+    std::map<chunkdb::LargeChunkCoord, chunkdb::IndexInventoryEntry> entries;
+    const auto path = root / chunkdb::kChunkIndexFileName;
+    ++counters->checked;
+    RequirePlain(path);
+    chunkdb::SharedFileInput inventory(path);
+    if (!inventory) throw std::runtime_error("missing or unreadable coordinate inventory");
+    result.inventory = chunkdb::ReadIndexInventory(inventory, Measure(inventory, path), geometry,
+        manifest.store_id, [&](const auto& entry) { entries.emplace(entry.coord, entry); });
+    const auto read_log = [&](const std::filesystem::path& log_path, const chunkdb::LargeChunkCoord& large,
+        std::optional<std::uint64_t> cut, bool listed) {
+        ++counters->checked;
+        RequirePlain(log_path);
+        chunkdb::SharedFileInput input(log_path);
+        if (!input) throw std::runtime_error("missing or unreadable coordinate log " + log_path.string());
+        const auto size = Measure(input, log_path);
+        const auto checked = chunkdb::ReadChunkIndexLog(input, size, geometry, manifest.store_id, large, cut);
+        if (size > checked.valid_bytes)
+            Report(counters, false, "index_log_unpublished_suffix", log_path,
+                "published_bytes=" + std::to_string(checked.valid_bytes));
+        for (const auto& [coord, record] : checked.latest) {
+            (void)coord;
+            (void)geometry.LayoutAt(record.schema_version);
+        }
+        for (const auto& [coord, boundary] : checked.empty_boundaries) {
+            if (boundary.kind == chunkdb::ChunkIndexKind::kForget &&
+                (!listed || boundary.revision > result.inventory.retained_deletion_floor))
+                throw std::runtime_error("coordinate forget record has no matching inventory floor");
+            (listed ? result.retained : result.unpublished).emplace(coord, boundary);
+        }
+    };
+    for (const auto& [large, entry] : entries) {
+        auto selected = chunkdb::LargeChunkDirectory(root, large, geometry.dims()) / chunkdb::kChunkIndexFileName;
+        RequirePlain(selected.parent_path(), true);
+        auto cut = entry.committed_bytes;
+        if (result.inventory.compaction_pending) {
+            if (!MatchesReplacement(selected, entry)) {
+                selected += ".compact";
+                if (!MatchesReplacement(selected, entry))
+                    throw std::runtime_error("missing or corrupt decided compaction replacement " + selected.string());
+            }
+            cut = entry.replacement_bytes;
+        }
+        read_log(selected, large, cut, true);
+    }
+    for (const auto& directory : std::filesystem::directory_iterator(root)) {
+        chunkdb::LargeChunkCoord large{};
+        if (!chunkdb::ParseLargeChunkName(directory.path().filename().string(), geometry.dims(), &large)) continue;
+        RequirePlain(directory.path(), true);
+        if (entries.contains(large)) continue;
+        const auto log = directory.path() / chunkdb::kChunkIndexFileName;
+        if (!std::filesystem::exists(log)) continue;
+        read_log(log, large, {}, false);
+        Report(counters, false, "index_log_unlisted", log, "requires writer admission before authorizing collection");
+    }
+    if (result.inventory.compaction_pending)
+        Report(counters, false, "index_compaction_pending", path, "requires writer recovery; no files were changed");
+    return result;
+}
+
+std::map<chunkdb::ChunkCoord, std::uint64_t> VisibilityCuts(const std::filesystem::path& root,
+    const chunkdb::Geometry& geometry, const chunkdb::StoreManifest& manifest) {
+    std::map<chunkdb::ChunkCoord, std::uint64_t> cuts;
+    const auto directory = chunkdb::ConditionalIntentDirectory(root);
+    if (!std::filesystem::exists(directory)) return cuts;
+    const auto admit_cut = [&](const chunkdb::ChunkCoord& coord, std::uint64_t cut) {
+        const auto path = chunkdb::ChunkWalPath(root, geometry, coord);
+        if (cut != 0U) {
+            RequirePlain(path);
+            if (std::filesystem::file_size(path) < cut) throw std::runtime_error("rollback WAL is shorter than its committed cut");
+        }
+        const auto [at, inserted] = cuts.emplace(coord, cut);
+        if (!inserted && at->second != cut)
+            throw std::runtime_error("conflicting pending rollback boundaries for one chunk");
+    };
+    for (const auto& file : std::filesystem::directory_iterator(directory)) {
+        const auto name = file.path().filename().string();
+        if (IsTmpArtifactName(name) || file.path().extension() != ".rollback") continue;
+        RequirePlain(file.path());
+        const bool transaction = chunkdb::IsTxnIntentArtifactName(name);
+        const auto limit = transaction ? 40U + chunkdb::kMaxTxnWrittenChunks * (8U * geometry.dims() + 8U) : 16U;
+        const auto bytes = ReadSmallRecord(file.path(), limit);
+        if (transaction) {
+            chunkdb::TxnIntent intent;
+            if (!chunkdb::IsTxnIntentFileName(name) || !chunkdb::TryParseTxnIntent(bytes, &intent, geometry.dims(), manifest.store_id) ||
+                file.path().filename() != chunkdb::TxnIntentPath(root, intent.version).filename())
+                throw std::runtime_error("malformed transaction visibility record");
+            if (intent.state == chunkdb::TxnIntentState::kRollback)
+                for (const auto& member : intent.entries) admit_cut(member.coord, member.wal_boundary);
+        } else {
+            chunkdb::ConditionalIntentState state;
+            std::uint64_t cut;
+            chunkdb::ChunkCoord coord;
+            if (!chunkdb::TryParseConditionalIntent(bytes, &state, &cut) ||
+                !chunkdb::ParseConditionalIntentFileName(name, geometry, &coord))
+                throw std::runtime_error("malformed conditional visibility record");
+            if (state == chunkdb::ConditionalIntentState::kRollback) admit_cut(coord, cut);
+        }
+    }
+    return cuts;
+}
+
+void ApplyBoundary(const chunkdb::Geometry& geometry, const chunkdb::ChunkIndexRecord& boundary,
+    std::uint64_t& revision, std::uint64_t& time, std::uint64_t& schema,
+    std::vector<std::uint8_t>& payload, std::vector<std::uint8_t>& presence,
+    chunkdb::ChunkVars& vars, std::shared_ptr<const chunkdb::ChunkColumnState>& columns) {
+    if (revision == boundary.revision && revision != 0U && time != boundary.commit_time_ms)
+        throw std::runtime_error("retained boundary commit time differs from equal-version artifact");
+    (void)chunkdb::ApplyRetainedEmptyBase(geometry, boundary, revision, time, schema,
+        payload, presence, vars, columns);
+}
+
+
+void VerifyChunkArtifacts(const std::filesystem::path& root, const chunkdb::Geometry& geometry,
+    const chunkdb::StoreManifest& manifest, const chunkdb::ChunkCoord& coord,
+    CheckedIndex* index, VerifyCounters* counters) {
+    const auto image_path = chunkdb::ChunkDataPath(root, geometry, coord);
+    const auto wal_path = chunkdb::ChunkWalPath(root, geometry, coord);
+    std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U);
+    std::vector<std::uint8_t> presence(chunkdb::ChunkPresenceBitmapBytes(geometry), 0U);
+    chunkdb::ChunkVars vars;
+    std::shared_ptr<const chunkdb::ChunkColumnState> columns;
+    std::uint64_t revision = 0U, time = 0U, schema = 0U;
+    if (std::filesystem::exists(image_path)) {
+        ++counters->checked;
+        try {
+            auto image = chunkdb::ParseChunkImage(chunkdb::LoadChunkImageFile(image_path, geometry,
+                coord, manifest.store_id, manifest.features), geometry, coord, manifest.store_id, manifest.features);
+            payload = std::move(image.payload); presence = std::move(image.presence_bitmap);
+            vars = std::move(image.vars); columns = std::move(image.chunk_columns);
+            revision = image.revision; time = image.commit_time_ms; schema = image.schema_version;
+        } catch (const std::exception& error) {
+            Report(counters, true, "chunk_image_invalid", image_path, error.what());
+            return; // An invalid image grants no empty replay base.
+        }
+    }
+    if (index == nullptr) return; // Retained-base admission failed independently.
     try {
-        const auto bytes = chunkdb::LoadFile(path);
-        auto image = chunkdb::ParseChunkImage(
-            bytes, geometry, coord, manifest.store_id, manifest.features);
-        *payload_out = std::move(image.payload);
-        *presence_out = std::move(image.presence_bitmap);
-        *image_ok = true;
-    } catch (const std::exception& e) {
-        Report(counters, true, "chunk_image_invalid", path, e.what());
+        if (const auto boundary = index->retained.find(coord); boundary != index->retained.end())
+            ApplyBoundary(geometry, boundary->second, revision, time, schema, payload, presence, vars, columns);
+        if (std::filesystem::exists(wal_path)) {
+            ++counters->checked;
+            const auto cut = index->wal_cuts.find(coord);
+            RequirePlain(wal_path);
+            chunkdb::SharedFileInput input(wal_path);
+            const auto measured = Measure(input, wal_path);
+            const auto admitted = cut == index->wal_cuts.end() ? measured : cut->second;
+            if (admitted > measured) throw std::runtime_error("rollback WAL shortened before verification");
+            const auto retained = index->retained.find(coord);
+            if (admitted != 0U || cut == index->wal_cuts.end()) {
+                const auto replay = chunkdb::ReplayWalStream(input, admitted, geometry, coord, manifest.store_id, manifest.features,
+                    revision, schema, &payload, &presence, &vars, nullptr, &columns, {}, time, retained != index->retained.end() ?
+                        std::optional{chunkdb::WalKnownIdentity{retained->second.revision, retained->second.commit_time_ms}} : std::nullopt);
+                if (replay.torn_creation) {
+                    Report(counters, cut != index->wal_cuts.end(), cut == index->wal_cuts.end() ? "wal_torn_creation" : "wal_damaged",
+                        wal_path, "interrupted creation holds no mutation");
+                    if (cut != index->wal_cuts.end()) return;
+                } else if (!replay.replayable) {
+                    Report(counters, true, "wal_not_replayable", wal_path, replay.stop_reason);
+                    return;
+                } else if (replay.tail_truncated_or_corrupt) {
+                    Report(counters, !replay.stopped_at_crash_tail || cut != index->wal_cuts.end(),
+                        replay.stopped_at_crash_tail && cut == index->wal_cuts.end() ? "wal_tail_truncated" : "wal_damaged", wal_path,
+                        replay.stop_reason + " at byte " + std::to_string(replay.valid_end));
+                    if (!replay.stopped_at_crash_tail || cut != index->wal_cuts.end()) return;
+                }
+                if (!replay.vars_problem.empty()) {
+                    Report(counters, true, "wal_vars_inconsistent", wal_path, replay.vars_problem);
+                    return;
+                }
+                if (replay.applied_frames != 0U) { revision = replay.revision; time = replay.commit_time_ms; }
+                if (revision != 0U) schema = geometry.layout().schema().version;
+            }
+        }
+        chunkdb::BringChunkColumnsToSchema(geometry, schema, geometry.chunk_schema().version, &columns);
+        if (index->unpublished.contains(coord)) index->artifacts.emplace(coord, CheckedIndex::Artifact{
+            revision, time, chunkdb::ChunkPopulated(geometry, presence, columns.get())});
+    } catch (const std::exception& error) {
+        Report(counters, true, "chunk_state_invalid", wal_path, error.what());
     }
 }
 
@@ -171,6 +384,35 @@ template <typename T>
     return error == std::errc{} && end == text.data() + text.size();
 }
 
+struct ArchiveBase {
+    chunkdb::ArchiveBaseDescriptor descriptor;
+    std::optional<chunkdb::ChunkStateImage> image;
+};
+
+ArchiveBase ReadArchiveBase(const std::filesystem::path& directory, const chunkdb::Geometry& geometry,
+    const chunkdb::StoreManifest& manifest, chunkdb::ChunkCoord coord, std::uint64_t first) {
+    const auto path = directory / chunkdb::ArchiveBaseFileName(coord, geometry.dims(), first);
+    const auto size = chunkdb::ArchiveBaseDescriptorBytes(geometry.dims());
+    const auto bytes = ReadSmallRecord(path, size);
+    if (bytes.size() != size)
+        throw std::runtime_error("archive base descriptor has wrong length");
+    ArchiveBase result{.descriptor = chunkdb::ParseArchiveBaseDescriptor(bytes, geometry.dims(), manifest.store_id,
+        coord, first, chunkdb::kMaxChunkImageFileBytes), .image = {}};
+    (void)geometry.LayoutAt(result.descriptor.base_schema);
+    const auto linked = directory / (chunkdb::ChunkFileStem(coord, geometry.dims()) + "." + std::to_string(first) + ".chk");
+    if (result.descriptor.kind == chunkdb::ArchiveBaseKind::kImage) {
+        const auto raw = chunkdb::LoadChunkImageFile(linked, geometry, coord, manifest.store_id, manifest.features);
+        auto image = chunkdb::ParseChunkImage(raw, geometry, coord, manifest.store_id, manifest.features);
+        chunkdb::ValidatePinnedArchiveBaseImage(result.descriptor, {.dims = geometry.dims(), .epoch = manifest.store_id,
+            .coord = coord, .revision = image.revision, .commit_time_ms = image.commit_time_ms,
+            .schema_version = image.schema_version}, raw, chunkdb::kMaxChunkImageFileBytes);
+        result.image = std::move(image);
+    } else if (std::filesystem::exists(linked)) {
+        throw std::runtime_error("non-image archive base has an unexpected pinned image");
+    }
+    return result;
+}
+
 void VerifyFeedArtifacts(
     const std::filesystem::path& root,
     const chunkdb::Geometry& geometry,
@@ -179,7 +421,7 @@ void VerifyFeedArtifacts(
     const bool enabled = (manifest.features.incompat & chunkdb::kFeatureFeedSlots) != 0U;
     const auto records_path = root / chunkdb::kFeedSlotsFileName;
     try {
-        const auto records = chunkdb::ReadFeedSlotRecords(root, manifest.store_id);
+        const auto records = chunkdb::ReadFeedSlotRecords(root, manifest.store_id, geometry.dims());
         if (records) {
             ++counters->checked;
             if (!enabled) Report(counters, true, "feed_slots_without_feature", records_path, "feed slots feature is absent");
@@ -217,20 +459,37 @@ void VerifyFeedArtifacts(
             std::string_view(name).substr(dot + 1U, name.size() - dot - 1U - extension.size());
         const auto dash = range.find('-');
         const bool base = extension == ".chk";
+        const bool descriptor = extension == ".base";
         if (dot == std::string::npos ||
-            !ParseCoordSuffix(name.substr(0U, dot), "C_", &coord.x, &coord.y) ||
-            (base ? !ParseNumber(range, &first) :
+            !chunkdb::ParseChunkFileStem(name.substr(0U, dot), geometry.dims(), &coord) ||
+            ((base || descriptor) ? !ParseNumber(range, &first) :
                 extension != ".wal" || dash == std::string_view::npos ||
                 !ParseNumber(range.substr(0U, dash), &first) ||
-                !ParseNumber(range.substr(dash + 1U), &last) || last < first) || first == 0U) {
+                !ParseNumber(range.substr(dash + 1U), &last) || last < first) || first == 0U ||
+            range != ((base || descriptor) ? std::to_string(first) : std::to_string(first) + "-" + std::to_string(last))) {
             Report(counters, true, "feed_archive_name_invalid", file.path(), "");
             continue;
         }
         try {
+            if (descriptor) {
+                (void)ReadArchiveBase(directory, geometry, manifest, coord, first);
+                continue;
+            }
             if (base) {
-                const auto image = chunkdb::ParseChunkImage(chunkdb::LoadFile(file.path()), geometry,
+                const auto image = chunkdb::ParseChunkImage(chunkdb::LoadChunkImageFile(file.path(), geometry,
+                    coord, manifest.store_id, manifest.features), geometry,
                     coord, manifest.store_id, manifest.features);
                 if (image.revision >= first) throw std::runtime_error("base revision overlaps the archive WAL");
+                const auto descriptor_path = directory / chunkdb::ArchiveBaseFileName(coord, geometry.dims(), first);
+                if (std::filesystem::exists(descriptor_path)) {
+                    (void)ReadArchiveBase(directory, geometry, manifest, coord, first);
+                } else {
+                    const auto current = chunkdb::ChunkDataPath(root, geometry, coord);
+                    if (!std::filesystem::exists(current) ||
+                        chunkdb::LoadChunkImageFile(current, geometry, coord, manifest.store_id, manifest.features) !=
+                            chunkdb::LoadChunkImageFile(file.path(), geometry, coord, manifest.store_id, manifest.features))
+                        throw std::runtime_error("staged archive image has no matching original live image");
+                }
                 // A base without an archive is valid after a crash before the
                 // WAL rename, or during deletion of an acknowledged segment.
                 continue;
@@ -239,28 +498,39 @@ void VerifyFeedArtifacts(
             auto payload = std::vector<std::uint8_t>(geometry.ChunkPayloadBytes(), 0U);
             auto presence = std::vector<std::uint8_t>(chunkdb::ChunkPresenceBitmapBytes(geometry), 0U);
             chunkdb::ChunkVars vars;
-            std::uint64_t base_revision = 0U, base_schema = 0U;
-            const auto linked = directory / (name.substr(0U, dot + 1U) + std::to_string(first) + ".chk");
-            if (std::filesystem::exists(linked)) {
-                auto image = chunkdb::ParseChunkImage(chunkdb::LoadFile(linked), geometry,
-                    coord, manifest.store_id, manifest.features);
-                if (image.revision >= first) throw std::runtime_error("base revision overlaps the archive WAL");
-                base_revision = image.revision;
-                base_schema = image.schema_version;
+            std::shared_ptr<const chunkdb::ChunkColumnState> chunk_columns;
+            auto binding = ReadArchiveBase(directory, geometry, manifest, coord, first);
+            const auto base_revision = binding.descriptor.base_revision;
+            const auto base_schema = binding.descriptor.base_schema;
+            if (binding.image) {
+                auto image = std::move(*binding.image);
                 payload = std::move(image.payload);
                 presence = std::move(image.presence_bitmap);
                 vars = std::move(image.vars);
+                chunk_columns = std::move(image.chunk_columns);
+            } else {
+                payload.assign(geometry.LayoutAt(base_schema).payload_bytes(), 0U);
+                if (base_revision != 0U) chunk_columns = chunkdb::DefaultChunkColumnsAt(geometry, base_schema);
             }
-            const auto bytes = chunkdb::LoadFile(file.path());
-            const auto replay = chunkdb::ReplayWal(bytes, geometry, coord, manifest.store_id,
-                manifest.features, base_revision, base_schema, &payload, &presence, &vars);
+            chunkdb::SharedFileInput input(file.path());
+            const auto extent = Measure(input, file.path());
+            const auto header_size = chunkdb::ChunkWalHeaderBytes(geometry.dims());
+            if (extent < header_size + 12U) throw std::runtime_error("archive WAL has no producing frame");
+            std::vector<std::uint8_t> first_revision(8U);
+            input.seekg(static_cast<std::streamoff>(header_size + 4U));
+            input.read(reinterpret_cast<char*>(first_revision.data()), static_cast<std::streamsize>(first_revision.size()));
+            if (input.gcount() != static_cast<std::streamsize>(first_revision.size()))
+                throw std::runtime_error("archive first revision read failed");
+            input.seekg(0);
+            const auto replay = chunkdb::ReplayWalStream(input, extent, geometry, coord, manifest.store_id,
+                manifest.features, base_revision, base_schema, &payload, &presence, &vars, nullptr, &chunk_columns,
+                {}, binding.descriptor.base_time_ms);
             if (!replay.replayable || replay.tail_truncated_or_corrupt || !replay.vars_problem.empty())
                 throw std::runtime_error("archive WAL is damaged: " + replay.stop_reason + " " + replay.vars_problem);
-            if (replay.applied_frames == 0U || bytes.size() < chunkdb::kWalHeaderSize + 12U ||
-                chunkdb::ReadLe64(bytes, chunkdb::kWalHeaderSize + 4U) != first || replay.revision != last)
+            if (replay.applied_frames == 0U || chunkdb::ReadLe64(first_revision, 0U) != first || replay.revision != last)
                 throw std::runtime_error("archive revision range disagrees with its name");
         } catch (const std::exception& error) {
-            Report(counters, true, base ? "feed_archive_base_invalid" : "feed_archive_wal_invalid", file.path(), error.what());
+            Report(counters, true, base || descriptor ? "feed_archive_base_invalid" : "feed_archive_wal_invalid", file.path(), error.what());
         }
     }
     if (has_archive) {
@@ -313,7 +583,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                         "unknown " + chunkdb::DescribeFeatures(unknown) +
                             "; data owned by those features was not checked");
                 }
-                store_geometry.emplace(manifest->geometry, manifest->schema);
+                store_geometry.emplace(manifest->geometry, manifest->schema, *manifest->chunk_schema);
                 store_manifest = manifest;
             }
         } else {
@@ -333,7 +603,19 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
             std::string(e.what()) + "; chunk artifacts were not checked");
     }
 
+    std::optional<CheckedIndex> index;
     if (store_geometry && store_manifest) {
+        try { index = VerifyIndex(data_dir, *store_geometry, *store_manifest, counters); }
+        catch (const std::exception& error) {
+            Report(counters, true, "coordinate_index_invalid", data_dir / chunkdb::kChunkIndexFileName, error.what());
+        }
+        if (index) {
+            try { index->wal_cuts = VisibilityCuts(data_dir, *store_geometry, *store_manifest); }
+            catch (const std::exception& error) {
+                Report(counters, true, "rollback_visibility_invalid", chunkdb::ConditionalIntentDirectory(data_dir), error.what());
+                index.reset();
+            }
+        }
         VerifyFeedArtifacts(data_dir, *store_geometry, *store_manifest, counters);
     }
 
@@ -462,6 +744,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
             initialized_exists_ec.message());
     }
 
+    std::set<chunkdb::ChunkCoord> checked_coords;
     for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
         const auto name = entry.path().filename().string();
 
@@ -481,7 +764,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
             const auto ext = entry.path().extension();
             if (ext == ".chk" || ext == ".wal" || ext == ".rgn" || ext == ".rollback") {
                 // Chunk data outside any chunk directory is never read.
-                Report(counters, false, "unexpected_file", entry.path(), "");
+                Report(counters, name.starts_with("C_"), "unexpected_file", entry.path(), "");
             } else {
                 ReportInfo(counters, "foreign_entry", entry.path(), "not chunkdb data; ignored");
             }
@@ -489,17 +772,27 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
         }
 
         if (!entry.is_directory()) {
+            if (name.starts_with("L_")) Report(counters, true, "large_chunk_path_invalid", entry.path(), "expected a plain directory");
             continue;
         }
 
-        std::int64_t large_x = 0;
-        std::int64_t large_y = 0;
-        if (!ParseCoordSuffix(name, "L_", &large_x, &large_y)) {
+        if (!store_geometry) {
+            has_storage_artifacts = has_storage_artifacts || name.starts_with("L_");
+            continue;
+        }
+        chunkdb::LargeChunkCoord large{};
+        if (!chunkdb::ParseLargeChunkName(name, store_geometry->dims(), &large)) {
+            if (name.starts_with("L_")) {
+                Report(counters, true, "large_chunk_name_invalid", entry.path(), "noncanonical or wrong-dimensional coordinate");
+                continue;
+            }
             ReportInfo(counters, "foreign_entry", entry.path(), "not chunkdb data; ignored");
             continue;
         }
         has_storage_artifacts = true;
-        if (!store_geometry.has_value()) {
+        try { RequirePlain(entry.path(), true); }
+        catch (const std::exception& error) {
+            Report(counters, true, "large_chunk_path_invalid", entry.path(), error.what());
             continue;
         }
         const chunkdb::Geometry& geometry = *store_geometry;
@@ -507,7 +800,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
         for (const auto& file : std::filesystem::directory_iterator(entry.path())) {
             const auto file_name = file.path().filename().string();
             if (!file.is_regular_file()) {
-                Report(counters, false, "unexpected_entry", file.path(), "");
+                Report(counters, file_name.starts_with("C_"), "unexpected_entry", file.path(), "");
                 continue;
             }
             if (IsTmpArtifactName(file_name)) {
@@ -515,112 +808,33 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                 continue;
             }
             const auto ext = file.path().extension();
-            std::int64_t chunk_x = 0;
-            std::int64_t chunk_y = 0;
+            chunkdb::ChunkCoord coord{};
             const bool coord_ok =
-                ParseCoordSuffix(file.path().stem().string(), "C_", &chunk_x, &chunk_y);
+                chunkdb::ParseChunkFileStem(file.path().stem().string(), geometry.dims(), &coord);
 
-            if (ext == ".chk") {
-                ++counters->checked;
+            if (ext == ".chk" || ext == ".wal") {
+                try { RequirePlain(file.path()); }
+                catch (const std::exception& error) {
+                    Report(counters, true, "chunk_path_invalid", file.path(), error.what());
+                    continue;
+                }
                 if (!coord_ok) {
-                    Report(counters, true, "chunk_name_invalid", file.path(), "");
+                    ++counters->checked;
+                    Report(counters, true, ext == ".chk" ? "chunk_name_invalid" : "wal_name_invalid", file.path(), "noncanonical or wrong-dimensional coordinate");
                     continue;
                 }
-                const chunkdb::ChunkCoord coord{chunk_x, chunk_y};
-                const auto expected_large = geometry.ChunkToLarge(coord);
-                if (expected_large.x != large_x || expected_large.y != large_y) {
-                    Report(
-                        counters, true, "chunk_misplaced", file.path(),
-                        "expected_dir=L_" + std::to_string(expected_large.x) + "_" +
-                            std::to_string(expected_large.y));
+                const auto expected = geometry.ChunkToLarge(coord);
+                if (expected != large) {
+                    ++counters->checked;
+                    Report(counters, true, ext == ".chk" ? "chunk_misplaced" : "wal_misplaced", file.path(),
+                        "expected_dir=" + chunkdb::LargeChunkDirectory({}, expected, geometry.dims()).string());
                     continue;
                 }
-                std::vector<std::uint8_t> payload;
-                std::vector<std::uint8_t> presence;
-                bool image_ok = false;
-                VerifyChunkFile(
-                    geometry, *store_manifest, file.path(), coord, &payload, &presence, &image_ok,
-                    counters);
-            } else if (ext == ".wal") {
-                ++counters->checked;
-                if (!coord_ok) {
-                    Report(counters, true, "wal_name_invalid", file.path(), "");
-                    continue;
-                }
-                const chunkdb::ChunkCoord coord{chunk_x, chunk_y};
-                const auto expected_large = geometry.ChunkToLarge(coord);
-                if (expected_large.x != large_x || expected_large.y != large_y) {
-                    Report(
-                        counters, true, "wal_misplaced", file.path(),
-                        "expected_dir=L_" + std::to_string(expected_large.x) + "_" +
-                            std::to_string(expected_large.y));
-                    continue;
-                }
-                try {
-                    const auto wal_bytes = chunkdb::LoadFile(file.path());
-                    std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U);
-                    std::vector<std::uint8_t> presence(
-                        (geometry.ChunkBlockCount() + 7U) / 8U, 0U);
-                    chunkdb::ChunkVars vars;
-                    // Seed replay from the checkpoint image when present.
-                    bool base_ok = true;
-                    std::uint64_t base_revision = 0;
-                    std::uint64_t base_schema_version = 0;
-                    const auto image_path =
-                        chunkdb::ChunkDataPath(data_dir, geometry, coord);
-                    if (std::filesystem::exists(image_path)) {
-                        try {
-                            const auto image_bytes = chunkdb::LoadFile(image_path);
-                            auto image =
-                                chunkdb::ParseChunkImage(
-                                    image_bytes, geometry, coord, store_manifest->store_id,
-                                    store_manifest->features);
-                            payload = std::move(image.payload);
-                            presence = std::move(image.presence_bitmap);
-                            vars = std::move(image.vars);
-                            base_revision = image.revision;
-                            base_schema_version = image.schema_version;
-                        } catch (...) {
-                            // Reported separately when the .chk file is
-                            // visited; replay from an empty base here.
-                            base_ok = false;
-                        }
-                    }
-                    const auto replay = chunkdb::ReplayWal(
-                        wal_bytes, geometry, coord, store_manifest->store_id,
-                        store_manifest->features, base_revision, base_schema_version, &payload, &presence, &vars);
-                    if (replay.torn_creation) {
-                        Report(
-                            counters, false, "wal_torn_creation", file.path(),
-                            "left by an interrupted creation; holds no mutation and is "
-                            "removed by the next read-write load of the chunk");
-                    } else if (!replay.replayable) {
-                        Report(
-                            counters, true, "wal_not_replayable", file.path(),
-                            replay.stop_reason);
-                    } else if (
-                        replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) {
-                        Report(
-                            counters, true, "wal_damaged", file.path(),
-                            replay.stop_reason + " at byte " +
-                                std::to_string(replay.valid_end) + " with bytes after it; "
-                                "a read-write load refuses this chunk");
-                    } else if (replay.tail_truncated_or_corrupt) {
-                        Report(
-                            counters, false, "wal_tail_truncated", file.path(),
-                            "applied_records=" + std::to_string(replay.applied_records) +
-                                " reason=" + replay.stop_reason);
-                    }
-                    // Over a damaged image the base is wrong, so only the
-                    // image's own finding counts.
-                    if (replay.replayable && base_ok && !replay.vars_problem.empty()) {
-                        Report(
-                            counters, true, "wal_vars_inconsistent", file.path(),
-                            replay.vars_problem + "; a load refuses this chunk");
-                    }
-                } catch (const std::exception& e) {
-                    Report(counters, true, "wal_unreadable", file.path(), e.what());
-                }
+                if (checked_coords.insert(coord).second)
+                    VerifyChunkArtifacts(data_dir, geometry, *store_manifest, coord, index ? &*index : nullptr, counters);
+            } else if (file_name == chunkdb::kChunkIndexFileName || file_name == std::string(chunkdb::kChunkIndexFileName) + ".compact") {
+                if (file_name.ends_with(".compact") && index && !index->inventory.compaction_pending)
+                    Report(counters, false, "index_compaction_staging_unpublished", file.path(), "no pending inventory decision");
             } else if (ext == ".rollback") {
                 // Conditional intents live in `.chunkdb.intents/`;
                 // startup recovery no longer scans chunk directories
@@ -637,6 +851,16 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                 Report(counters, false, "unexpected_file", file.path(), "");
             }
         }
+    }
+    if (index && store_geometry) for (const auto& [coord, boundary] : index->unpublished) {
+        const auto artifact = index->artifacts.find(coord);
+        bool valid = artifact != index->artifacts.end() && artifact->second.revision >= boundary.revision;
+        if (valid && artifact->second.revision == boundary.revision) {
+            valid = artifact->second.time == boundary.commit_time_ms && !artifact->second.populated;
+        }
+        if (!valid) Report(counters, true, "index_unpublished_boundary_without_artifact",
+            chunkdb::LargeChunkDirectory(data_dir, store_geometry->ChunkToLarge(coord), store_geometry->dims()) /
+                chunkdb::kChunkIndexFileName, "unlisted empty boundary has no matching committed artifact");
     }
     // Conditional-intent artifacts live in one dedicated shallow
     // directory; validate each record and surface pending recovery work.
@@ -658,20 +882,26 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                 continue;
             }
             if (chunkdb::IsTxnIntentArtifactName(file_name)) {
-                // A transaction intent (CKTB or CKTC) the next writer start
+                // A checked transaction intent the next writer start
                 // resolves.
                 ++counters->checked;
+                if (!store_manifest) {
+                    Report(counters, true, "txn_intent_uncheckable", file.path(), "table manifest was not admitted");
+                    continue;
+                }
                 try {
                     chunkdb::TxnIntent intent;
                     if (!chunkdb::IsTxnIntentFileName(file_name) ||
-                        !chunkdb::TryParseTxnIntent(chunkdb::LoadFile(file.path()), &intent) ||
+                        !chunkdb::TryParseTxnIntent(ReadSmallRecord(file.path(),
+                            40U + chunkdb::kMaxTxnWrittenChunks * (8U * store_manifest->geometry.dims + 8U)), &intent,
+                            store_manifest->geometry.dims, store_manifest->store_id) ||
                         file_name != chunkdb::TxnIntentPath(data_dir, intent.version).filename().string()) {
                         Report(
                             counters,
                             true,
                             "txn_intent_invalid",
                             file.path(),
-                            "expected a CKTB-or-CKTC record named txn-<version>.rollback");
+                            "expected a checked transaction intent named txn-<version>.rollback");
                         continue;
                     }
                     Report(
@@ -692,7 +922,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
             }
             ++counters->checked;
             try {
-                const auto intent_bytes = chunkdb::LoadFile(file.path());
+                const auto intent_bytes = ReadSmallRecord(file.path(), 16U);
                 std::uint64_t committed_wal_size = 0;
                 chunkdb::ConditionalIntentState intent_state =
                     chunkdb::ConditionalIntentState::kRollback;
