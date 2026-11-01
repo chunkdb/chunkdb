@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "checkpoint.hpp"
+#include "statement_control.hpp"
 #include "file_permissions.hpp"
 #include "change_feed.hpp"
 #include "chunk_store_internal.hpp"
@@ -501,6 +502,20 @@ void Table::ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed) {
     }
 }
 
+std::shared_lock<BackupMaintenanceGate> TableCatalog::LockFeatureMetadataShared() {
+    if (!feature_metadata_gate_.lock_shared(StatementStopToken())) CheckStatementCancellation();
+    std::shared_lock lock(feature_metadata_gate_, std::adopt_lock);
+    CheckStatementCancellation();
+    return lock;
+}
+
+std::unique_lock<BackupMaintenanceGate> TableCatalog::LockFeatureMetadata() {
+    if (!feature_metadata_gate_.lock(StatementStopToken())) CheckStatementCancellation();
+    std::unique_lock lock(feature_metadata_gate_, std::adopt_lock);
+    CheckStatementCancellation();
+    return lock;
+}
+
 void Table::StopFeed() {
     std::lock_guard timer_control(feed_timer_control_mutex_);
     StopFeedLingerTimer();
@@ -720,6 +735,9 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
             owner = old->owner.lock();
             if (!owner || !owner->io_ready_.load(std::memory_order_acquire))
                 throw FeedSlotBusyError("feed slot owner is attaching or returning", "takeover_pending");
+            if (auto* hook = owner->hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeTakeoverReservation, 0U);
+            EnterStatementDecision();
             old->takeover_pending.store(true, std::memory_order_release);
         }
     }
@@ -864,6 +882,7 @@ bool Table::ServesUnfenced() const {
 
 std::optional<Table::Lease> Table::Acquire() {
     while (true) {
+        CheckStatementCancellation();
         migration_health_->Check();
         active_leases_.fetch_add(1, std::memory_order_seq_cst);
         const State state = state_.load(std::memory_order_seq_cst);
@@ -882,9 +901,10 @@ std::optional<Table::Lease> Table::Acquire() {
         if (state == State::kFailed || feed_cleanup_failed_.load(std::memory_order_acquire))
             throw FeedRecoveryRequiredError();
         std::unique_lock lock(mutex_);
-        cv_.wait(lock, [this]() {
+        const bool ready = cv_.wait(lock, StatementStopToken(), [this]() {
             return state_.load(std::memory_order_seq_cst) != State::kBusy || feed_cleanup_failed_.load(std::memory_order_acquire);
         });
+        if (!ready) CheckStatementCancellation();
     }
 }
 
@@ -923,6 +943,9 @@ void Table::ReleaseBackupPin() noexcept {
 }
 
 std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing, std::stop_token cancelled, bool* admitted) {
+    const bool statement_wait = !closing && !cancelled.stop_possible();
+    if (statement_wait) cancelled = StatementStopToken();
+    if (statement_wait) CheckStatementCancellation();
     if (admitted) *admitted = false;
     if (!closing) {
         migration_health_->Check();
@@ -934,7 +957,10 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing, std::stop_token 
         return (state_.load(std::memory_order_seq_cst) != State::kBusy && backup_pins_ == 0U) ||
             (!closing && feed_cleanup_failed_.load(std::memory_order_acquire));
     }) ||
-        cancelled.stop_requested()) return nullptr;
+        cancelled.stop_requested()) {
+        if (statement_wait) CheckStatementCancellation();
+        return nullptr;
+    }
     if (!closing) migration_health_->Check();
     if (!closing && feed_cleanup_failed_.load(std::memory_order_acquire)) throw FeedRecoveryRequiredError();
     if (state_.load(std::memory_order_seq_cst) == State::kGone) return nullptr;
@@ -951,6 +977,7 @@ std::shared_ptr<ChunkStore> Table::BeginExclusive(bool closing, std::stop_token 
     if (!drained) {
         state_.store(feed_cleanup_failed_.load(std::memory_order_acquire) ? State::kFailed : State::kOpen, std::memory_order_seq_cst);
         cv_.notify_all();
+        if (statement_wait) CheckStatementCancellation();
         return nullptr;
     }
     if (admitted) *admitted = true;
@@ -1034,6 +1061,8 @@ TableCatalog::TableCatalog(CatalogConfig config)
         throw std::invalid_argument("data_dir must not be empty");
     }
     config_.data_dir = std::filesystem::weakly_canonical(config_.data_dir);
+    // Read-only admission must precede any writer-lock or recovery records.
+    (void)ReadUsersFile(config_.data_dir);
     if (config_.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be positive");
     if (config_.slot_max_bytes == 0U) throw std::invalid_argument("slot_max_bytes must be positive");
     if (config_.feed_linger.count() < 0 || config_.feed_linger.count() > std::numeric_limits<std::int32_t>::max())
@@ -1526,16 +1555,17 @@ void TableCatalog::RecoverTable(std::string_view name, std::stop_token cancelled
     if (table && table->ServesUnfenced()) throw not_fenced();
     // The admission of table DDL: no command runs on the table from here on.
     // Closing admission, which a table whose feed cleanup failed also gives.
-    std::unique_lock<std::mutex> ddl;
+    std::unique_lock<Table::DdlMutex> ddl;
     std::shared_ptr<ChunkStore> store;
     TableOptions options;
     if (table) {
         ddl = std::unique_lock(table->ddl_mutex_);
         options = table->Info().options;
-        store = table->BeginExclusive(/*closing=*/true);
+        store = table->BeginExclusive(/*closing=*/true, cancelled);
     }
     ScopeExit serving([&] { table->EndExclusive(std::move(store), options); });
     if (!store) serving.Dismiss();
+    CheckStatementCancellation();
     std::lock_guard operations(operations_mutex_);
     if (migration_health_->failed.load(std::memory_order_acquire)) {
         // A pending migration decision fences the whole catalog; only a
@@ -1570,6 +1600,7 @@ void TableCatalog::RecoverTable(std::string_view name, std::stop_token cancelled
     // Made now, so that neither fencing again nor publishing allocates.
     auto fence = PrepareFence(table, table_name, kFenceRecovery);
     auto entry = PrepareServed(table_name);
+    EnterStatementDecision();
     serving.Dismiss();
     // Closed as a server shutdown closes it.
     store.reset();
@@ -1662,7 +1693,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     std::string_view name, const std::function<TableDefinition()>& definition,
     bool if_not_exists) {
     RequireWritable("CREATE TABLE");
-    std::shared_lock metadata(feature_metadata_gate_);
+    auto metadata = LockFeatureMetadataShared();
     RequireValidTableName(name);
     const std::string table_name(name);
     std::lock_guard operations(operations_mutex_);
@@ -1706,6 +1737,7 @@ std::shared_ptr<Table> TableCatalog::Create(
             throw std::runtime_error("table manifest appeared in " + staging.string());
         }
         CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_TABLE_CREATE_BEFORE_PUBLISH_ONCE");
+        EnterStatementDecision();
         const auto moved = MoveDirectoryNoReplace(staging, target);
         if (moved == std::errc::file_exists) {
             throw TableExistsError(
@@ -1777,6 +1809,7 @@ std::shared_ptr<Table> TableCatalog::Create(
 void TableCatalog::MoveToDropped(const std::filesystem::path& dir, const std::string& name) {
     EnsureDirectoryPathExists(DroppedDir(), /*durable_sync=*/true);
     const auto dropped = DroppedDir() / UniqueOperationName(name);
+    EnterStatementDecision();
     const auto moved = MoveDirectoryNoReplace(dir, dropped);
     if (moved) {
         throw std::runtime_error(
@@ -1826,7 +1859,7 @@ void TableCatalog::Drop(std::string_view name, bool if_exists) {
 
 void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exists) {
     RequireWritable("DROP TABLE");
-    std::shared_lock metadata(feature_metadata_gate_);
+    auto metadata = LockFeatureMetadataShared();
     auto table = Find(name);
     if (!table && if_exists) {
         RequireValidTableName(name);
@@ -1951,7 +1984,7 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptions& options
 
 void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& update) {
     RequireWritable("ALTER TABLE ... SET");
-    std::shared_lock metadata(feature_metadata_gate_);
+    auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = update.ApplyTo(table->Info().options);
@@ -1984,7 +2017,7 @@ bool TableCatalog::ChangeColumnsIfNeeded(
     std::string_view name,
     const std::function<std::optional<TableSchema>(const TableSchema&)>& change) {
     RequireWritable("ALTER TABLE");
-    std::shared_lock metadata(feature_metadata_gate_);
+    auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
     std::optional<TableSchema> changed;
@@ -2023,7 +2056,7 @@ bool TableCatalog::ChangeColumnsIfNeeded(
 
 void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
     RequireWritable("ALTER TABLE");
-    std::shared_lock metadata(feature_metadata_gate_);
+    auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = table->Info().options;
@@ -2132,7 +2165,7 @@ void TableCatalog::RewriteManifest(
             /*fsync_directory=*/true,
             &replaced,
             dir_sync_failpoint,
-            /*enable_generic_failpoints=*/false);
+            /*enable_generic_failpoints=*/false, EnterStatementDecision);
     } catch (...) {
         if (!replaced) {
             throw;
@@ -2241,7 +2274,7 @@ bool TableCatalog::EnableFeature(std::string_view name) {
         throw std::invalid_argument("ENABLE FEATURE requires a single-process catalog");
     const auto* feature = FindFeature(name);
     if (!feature) throw FeatureAdmissionError("unknown_feature", std::string(name), "unknown feature name");
-    std::unique_lock metadata(feature_metadata_gate_);
+    auto metadata = LockFeatureMetadata();
     migration_health_->Check();
     auto directory = ReadDataDirManifest(config_.data_dir);
     if (!directory) throw std::runtime_error("data directory manifest disappeared");
@@ -2309,7 +2342,7 @@ bool TableCatalog::EnableFeature(std::string_view name) {
             directory->features.incompat |= kFeatureActivation;
             CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_FEATURE_ACTIVATION_BEFORE_PUBLISH_ONCE");
             AtomicWrite(DataDirManifestPath(config_.data_dir), SerializeDataDirManifest(*directory), true, true, &published,
-                "CHUNKDB_FAILPOINT_FEATURE_ACTIVATION_SYNC_FAIL_ONCE");
+                "CHUNKDB_FAILPOINT_FEATURE_ACTIVATION_SYNC_FAIL_ONCE", true, EnterStatementDecision);
             CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_FEATURE_ACTIVATION_AFTER_PUBLISH_ONCE");
         } else {
             WriteFeatureActivationJournal(config_.data_dir, journal, &published);
@@ -2331,7 +2364,7 @@ bool TableCatalog::EnableFeature(std::string_view name) {
 }
 
 CatalogFeatureStatus TableCatalog::FeatureStatus() {
-    std::unique_lock metadata(feature_metadata_gate_);
+    auto metadata = LockFeatureMetadata();
     migration_health_->Check();
     std::vector<std::shared_ptr<Table>> tables;
     {

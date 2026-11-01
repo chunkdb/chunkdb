@@ -20,6 +20,7 @@
 #include <set>
 
 #include "checkpoint.hpp"
+#include "statement_control.hpp"
 #include "file_permissions.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/logging.hpp"
@@ -749,6 +750,7 @@ void CompleteBackup(const std::filesystem::path& root, const BackupRecord& recor
     ReplaceSafeFile(directory, kBackupMarkerName, SerializeBackupRecord(record));
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_MARKER_ONCE");
     Cancelled(cancelled);
+    EnterStatementDecision();
     CompleteBackupGuard(root, kBackupIncompleteName, "BACKUP");
 }
 } // namespace chunkdb

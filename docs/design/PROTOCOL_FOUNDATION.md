@@ -61,7 +61,8 @@ The initial capability names are `protocol_foundation`, `ordered_versions`, `rea
 `statement_timeout`, `write_tags`, `returning`, `expressions`, `watch_catalog`, and `feed_coalescing` appear only when their actual implementation is available.
 Task 51 stores negotiated session options in a session structure that task 54 can move off the worker stack.
 Applying a timeout requires task 54's cancellation-before-commit rules; applying a default tag requires task 53's durable commit-group path.
-Stored timeout/tag values remain in `not_applied` with `reason=implementation_pending` until their semantic owners activate them.
+The connection model applies the statement timeout and reports its effective value in `options`.
+Stored tag values remain in `not_applied` with `reason=implementation_pending`.
 
 ## Grammar-independent framing (A3)
 
@@ -299,7 +300,7 @@ Rollback to a build lacking an enabled incompatibility feature requires an expli
 
 ## Session and lineage handoffs
 
-1. **A2 applied keys.** The foundation parses/stores all three keys, applies client_name, and reports timeout/tag in `not_applied` with `reason=implementation_pending`.
+1. **A2 applied keys.** Session negotiation applies client_name and statement_timeout_ms and reports default_tag in `not_applied` with `reason=implementation_pending`.
    Timeout cancellation activates `statement_timeout_ms`; durable commit groups activate `default_tag`.
    Each activation moves the key into `options` and adds its capability to `features`, preserving the HELLO reply shape.
    A retained value never appears as applied before real semantics exist; activation does not require another handshake.

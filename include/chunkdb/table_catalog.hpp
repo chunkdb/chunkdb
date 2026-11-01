@@ -23,6 +23,7 @@
 #include "chunkdb/feed_slots.hpp"
 #include "chunkdb/migration_health.hpp"
 #include "chunkdb/geometry.hpp"
+#include "chunkdb/statement_mutex.hpp"
 
 namespace chunkdb {
 
@@ -312,7 +313,8 @@ class Table : public std::enable_shared_from_this<Table> {
     // a reopen to finish. Also guards options_.
     mutable std::mutex mutex_;
     std::condition_variable_any cv_;
-    std::mutex ddl_mutex_;
+    using DdlMutex = StatementMutex;
+    DdlMutex ddl_mutex_;
     std::size_t backup_pins_ = 0;
     std::size_t backup_pin_waiters_ = 0;
     // Written only while state_ is kBusy and no lease is active.
@@ -508,7 +510,9 @@ class TableCatalog {
     std::shared_ptr<StoreResources> resources_;
     std::unique_ptr<ProcessLock> process_lock_;
     // Serializes Create, Drop and SetOptions.
-    mutable std::mutex operations_mutex_;
+    mutable Table::DdlMutex operations_mutex_;
+    [[nodiscard]] std::shared_lock<BackupMaintenanceGate> LockFeatureMetadataShared();
+    [[nodiscard]] std::unique_lock<BackupMaintenanceGate> LockFeatureMetadata();
     std::mutex backup_mutex_;
     // Slow metadata admission only; ordinary read/write leases do not take it.
     BackupMaintenanceGate feature_metadata_gate_;

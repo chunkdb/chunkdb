@@ -9,6 +9,7 @@
 #include <system_error>
 
 #include "checkpoint.hpp"
+#include "statement_control.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/table_catalog.hpp"
@@ -172,7 +173,7 @@ void WriteFeatureActivationJournal(const std::filesystem::path& root, const Feat
     if (ReadFeatureActivationJournal(root)) Bad("a decision is already pending");
     Crash("CHUNKDB_FAILPOINT_CRASH_FEATURE_BEFORE_DECISION_ONCE");
     AtomicWrite(root / kFeaturePendingFileName, EncodeFeatureActivationJournal(journal), true, true,
-        published, "CHUNKDB_FAILPOINT_FEATURE_DECISION_SYNC_FAIL_ONCE", false);
+        published, "CHUNKDB_FAILPOINT_FEATURE_DECISION_SYNC_FAIL_ONCE", false, EnterStatementDecision);
     Crash("CHUNKDB_FAILPOINT_CRASH_FEATURE_AFTER_DECISION_ONCE");
 }
 

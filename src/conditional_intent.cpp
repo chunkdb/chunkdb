@@ -11,6 +11,7 @@
 
 #include "chunk_store_internal.hpp"
 #include "checkpoint.hpp"
+#include "statement_control.hpp"
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/crc32.hpp"
@@ -426,7 +427,7 @@ bool ChunkStore::PublishConditionalCommitIntent(
             /*fsync_file=*/true,
             /*fsync_directory=*/true,
             &replaced,
-            "CHUNKDB_FAILPOINT_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+            "CHUNKDB_FAILPOINT_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", true, EnterStatementDecision);
     } catch (...) {
         if (!replaced) {
             throw;

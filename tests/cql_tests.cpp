@@ -333,6 +333,14 @@ void TestAlterAndOtherStatements() {
     assert(rekey.verifier.has_value() && !rekey.manages_users.has_value());
     assert(Get<cql::AlterUser>("ALTER USER bot NO MANAGES USERS").manages_users == false);
     assert(Get<cql::AlterUser>("ALTER USER bot MANAGES USERS").manages_users == true);
+    const auto limits = Get<cql::AlterUser>("ALTER USER bot LIMIT max_connections = 18446744073709551615, statements_per_sec = 65536");
+    assert(limits.max_connections == std::numeric_limits<std::uint64_t>::max() && limits.statements_per_sec == 65536U);
+    assert(Get<cql::AlterUser>("ALTER USER bot LIMIT statements_per_sec = 0").statements_per_sec == 0U);
+    for (const auto line : {"ALTER USER bot LIMIT", "ALTER USER bot LIMIT max_connections = -1",
+        "ALTER USER bot LIMIT statements_per_sec = 65537", "ALTER USER bot LIMIT max_connections = 18446744073709551616",
+        "ALTER USER bot LIMIT max_connections = 0, max_connections = 1",
+        "ALTER USER bot LIMIT statements_per_sec = 0, statements_per_sec = 1", "ALTER USER bot LIMIT unknown = 1"})
+        ExpectError(line, "");
     assert(Get<cql::DropUser>("DROP USER bot").user == "bot");
     const auto grant = Get<cql::GrantRight>("GRANT WRITE ON world TO bot");
     assert(!grant.revoke && grant.right == chunkdb::Right::kWrite && grant.table == "world" && grant.user == "bot");
@@ -434,7 +442,7 @@ void TestErrors() {
     ExpectError("SET BLOCK 0 0 IN t a = 1 IF 3", "expected VERSION");
     ExpectError("DROP t", "expected TABLE");
     ExpectError("FLUSH", "expected WAL");
-    ExpectError("SHOW GRANTS", "expected TABLES, METRICS, STATUS, MIGRATIONS, USERS or SLOTS");
+    ExpectError("SHOW GRANTS", "expected TABLES, METRICS, STATUS, CONNECTIONS, MIGRATIONS, USERS or SLOTS");
 }
 
 }  // namespace
@@ -454,6 +462,15 @@ void TestHelloOptions() {
 }
 
 int main() {
+    assert(Get<cql::Cancel>("CANCEL 18446744073709551615").id == UINT64_MAX);
+    assert(Get<cql::KillConnection>("KILL CONNECTION 0").id == 0U);
+    (void)Get<cql::ShowConnections>("SHOW CONNECTIONS");
+    for (const auto* line : {"CANCEL -1", "CANCEL 18446744073709551616", "CANCEL $1", "CANCEL 1 extra",
+                             "KILL 1", "KILL CONNECTION -1", "SHOW CONNECTIONS extra"}) {
+        bool refused = false;
+        try { (void)cql::Parse(line); } catch (const cql::ParseError&) { refused = true; }
+        assert(refused);
+    }
     TestHelloOptions();
     TestDefaultChunkGeometry();
     TestRightsLists();

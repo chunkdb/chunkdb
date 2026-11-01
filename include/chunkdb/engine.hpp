@@ -21,6 +21,7 @@
 #include "chunkdb/change_feed.hpp"
 #include "chunkdb/metrics.hpp"
 #include "chunkdb/protocol.hpp"
+#include "chunkdb/reply.hpp"
 #include "chunkdb/table_catalog.hpp"
 
 namespace chunkdb {
@@ -31,6 +32,7 @@ inline constexpr int kProtocolVersion = 3;
 
 // docs/design/USERS_DESIGN.md; defined in src/.
 class UserRegistry;
+class UserConnectionTicket;
 class AuditLog;
 class SlotWatch;
 struct User;
@@ -91,6 +93,7 @@ struct StatementLogInfo {
     std::string migration;
     // The chunks the statement read or wrote, where the engine knows.
     std::optional<std::size_t> chunks;
+    std::optional<std::uint64_t> target_connection;
 };
 
 // Orders chunk coordinates (x, then y).
@@ -137,6 +140,8 @@ struct SessionTransaction {
     }
 };
 
+inline constexpr std::uint64_t kMaxStatementTimeoutMs = 86400000U;
+
 struct SessionHelloOptions {
     std::optional<std::string> client_name;
     std::optional<std::uint64_t> statement_timeout_ms;
@@ -148,11 +153,36 @@ struct SessionHelloOptions {
 // and the engine.
 [[nodiscard]] std::uint64_t NewConnectionId();
 
+struct SessionControlAccess {
+    std::uint64_t requester_connection_id = 0U;
+    std::uint64_t user_incarnation = 0U;
+    bool admin_all = false;
+};
+
+struct ConnectionInfo {
+    std::uint64_t id = 0U;
+    std::string user, peer, state, statement;
+};
+
+struct SessionControlCallbacks {
+    std::size_t max_response_bytes = kMaxChunkRangeResponseBytes;
+    // Synchronous enumeration; visitor exceptions propagate without truncation.
+    std::function<void(const SessionControlAccess&, const std::function<void(const ConnectionInfo&)>&)> enumerate;
+    std::function<bool(const SessionControlAccess&, std::uint64_t)> cancel;
+    std::function<bool(const SessionControlAccess&, std::uint64_t)> kill;
+};
+
 struct SessionState {
+    // Transport schedules delayed authentication replies without sleeping.
+    std::chrono::steady_clock::time_point reply_not_before{};
+    std::shared_ptr<const SessionControlCallbacks> connection_controls;
+    // The transport counted this complete request before queue admission.
+    bool request_admitted = false;
     // Identifies the connection in HELLO replies and the audit log; unique
     // within the process (NewConnectionId).
     std::uint64_t connection_id = 0U;
     std::size_t idle_timeout_ms = 60000U;
+    std::uint64_t default_statement_timeout_ms = 0U;
     std::size_t max_watches = 64U;
     SessionHelloOptions hello_options;
     std::unique_ptr<FeedSubscription> watch;
@@ -169,6 +199,8 @@ struct SessionState {
     bool greeted = false;
     // The logged-in user; empty when logins need no user.
     std::string user;
+    std::uint64_t user_incarnation = 0U;
+    std::shared_ptr<UserConnectionTicket> user_ticket;
     // That user as of `user_generation` of the registry; null once dropped.
     std::shared_ptr<const User> user_rights;
     std::uint64_t user_generation = 0;
@@ -188,6 +220,9 @@ class CommandEngine {
         EngineConfig config,
         std::shared_ptr<TableCatalog> catalog,
         std::shared_ptr<MetricsRegistry> metrics = nullptr);
+
+    // One admission for a complete post-HELLO request, including a drained rejection.
+    [[nodiscard]] std::optional<std::string> AdmitUserStatement(SessionState& session, std::string_view line) const;
 
     // A statement with parameters ($1 ... $n) is followed by n frames
     // (`$<length>` or `$-1`, then the bytes). PlanPayload tells the
@@ -217,7 +252,9 @@ class CommandEngine {
     [[nodiscard]] std::string Execute(
         SessionState& session,
         std::string_view line,
-        std::span<const std::optional<std::string>> parameters = {});
+        std::span<const std::optional<std::string>> parameters = {},
+        std::unique_ptr<ReplyContinuation>* continuation = nullptr,
+        const std::function<void(std::size_t)>* reserve_reply = nullptr);
     [[nodiscard]] std::string RejectPayload(SessionState& session, std::string_view line, std::string response);
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
@@ -262,7 +299,9 @@ class CommandEngine {
         std::string_view line,
         std::span<const std::optional<std::string>> parameters,
         MetricsRegistry::CommandClass& command_class,
-        StatementLogInfo* info);
+        StatementLogInfo* info,
+        std::unique_ptr<ReplyContinuation>* continuation,
+        const std::function<void(std::size_t)>* reserve_reply);
     // Writes the audit and slow-statement lines of a finished statement.
     void LogStatement(
         const SessionState& session,
@@ -300,6 +339,9 @@ class CommandEngine {
     // names do not leak, and PermissionDeniedError when the right is lower
     // than `needed`.
     [[nodiscard]] const User* CurrentUser(SessionState& session) const;
+    [[nodiscard]] SessionControlAccess ControlAccess(SessionState& session) const;
+    [[nodiscard]] std::string ListConnections(SessionState& session) const;
+    [[nodiscard]] std::string ControlConnection(SessionState& session, std::uint64_t id, bool kill) const;
     [[nodiscard]] std::optional<Right> RightOnTable(SessionState& session, const std::string& table) const;
     void RequireRight(SessionState& session, const std::string& table, Right needed) const;
     void RequireRightOnEveryTable(SessionState& session, Right needed) const;

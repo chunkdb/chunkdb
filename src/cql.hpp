@@ -212,6 +212,9 @@ struct Backup {
 };
 struct ShowMetrics {};
 struct ShowStatus {};
+struct ShowConnections {};
+struct Cancel { std::uint64_t id = 0U; };
+struct KillConnection { std::uint64_t id = 0U; };
 struct EnableFeature { std::string name; };
 // Loads the TLS certificate and key again from the configured files.
 struct ReloadTls {};
@@ -244,6 +247,8 @@ struct AlterUser {
     std::string user;
     std::optional<Literal> verifier;
     std::optional<bool> manages_users;
+    std::optional<std::uint64_t> max_connections{};
+    std::optional<std::uint64_t> statements_per_sec{};
 };
 struct DropUser {
     std::string user;
@@ -293,6 +298,9 @@ using Statement = std::variant<
     Backup,
     ShowMetrics,
     ShowStatus,
+    ShowConnections,
+    Cancel,
+    KillConnection,
     EnableFeature,
     ReloadTls,
     Ping,

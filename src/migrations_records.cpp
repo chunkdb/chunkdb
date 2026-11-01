@@ -9,6 +9,7 @@
 #include <type_traits>
 
 #include "checkpoint.hpp"
+#include "statement_control.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/schema.hpp"
@@ -400,7 +401,7 @@ std::optional<MigrationJournal> ReadMigrationJournal(const std::filesystem::path
 
 void WriteMigrationJournal(const std::filesystem::path& root, const MigrationJournal& journal, bool* published) {
     AtomicWrite(root / kMigrationPendingFileName, EncodeMigrationJournal(journal), true, true, published,
-                "CHUNKDB_FAILPOINT_MIGRATION_DECISION_SYNC_FAIL_ONCE", false);
+                "CHUNKDB_FAILPOINT_MIGRATION_DECISION_SYNC_FAIL_ONCE", false, EnterStatementDecision);
 }
 
 void ValidateMigrationJournal(const std::filesystem::path& root, const MigrationJournal& journal) {

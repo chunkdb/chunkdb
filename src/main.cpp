@@ -120,6 +120,7 @@ void PrintUsage() {
         << "  --workers <n>\n"
         << "  --client-io-timeout-ms <ms>\n"
         << "  --idle-connection-timeout-ms <ms>\n"
+        << "  --statement-timeout-ms <ms>\n"
         << "  --max-pending-clients <n>\n"
         << "  --max-handshakes-per-ip <n>\n"
         << "  --max-line-bytes <n>\n"
@@ -235,6 +236,8 @@ int main(int argc, char** argv) {
             } else if (arg == "--idle-connection-timeout-ms") {
                 server_config.idle_connection_timeout_ms =
                     ParseSize(require_value("--idle-connection-timeout-ms"), "idle-connection-timeout-ms");
+            } else if (arg == "--statement-timeout-ms") {
+                server_config.statement_timeout_ms = ParseSize(require_value("--statement-timeout-ms"), "statement-timeout-ms");
             } else if (arg == "--max-pending-clients") {
                 server_config.max_pending_clients =
                     ParseSize(require_value("--max-pending-clients"), "max-pending-clients");

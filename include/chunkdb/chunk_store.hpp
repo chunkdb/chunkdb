@@ -15,6 +15,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -41,24 +42,72 @@ class SnapshotGenerationMapping;
     (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
 // MinGW winpthreads shared_mutex has shown unstable lock assertions under high contention
 // in CI; fallback preserves correctness by serializing shared/exclusive access on Windows+MinGW.
-class RegularChunkMutex {
-  public:
-    void lock() { mutex_.lock(); }
-    bool try_lock() { return mutex_.try_lock(); }
-    void unlock() { mutex_.unlock(); }
-
-    void lock_shared() { mutex_.lock(); }
-    bool try_lock_shared() { return mutex_.try_lock(); }
-    void unlock_shared() { mutex_.unlock(); }
-
-  private:
-    std::mutex mutex_;
-};
+inline constexpr bool kSerialChunkReaders = true;
 inline constexpr const char* kChunkLockModeName = "serial-mutex";
 #else
-using RegularChunkMutex = std::shared_mutex;
+inline constexpr bool kSerialChunkReaders = false;
 inline constexpr const char* kChunkLockModeName = "shared-mutex";
 #endif
+
+class RegularChunkMutex {
+  public:
+    void lock() { (void)lock(std::stop_token{}); }
+    [[nodiscard]] bool lock(std::stop_token cancelled) {
+        std::unique_lock lock(mutex_);
+        WriterWaiter waiter(*this);
+        const auto ready = [this] { return !exclusive_ && readers_ == 0U; };
+        if (!ready() && !changed_.wait(lock, cancelled, ready)) return false;
+        if (cancelled.stop_requested()) return false;
+        exclusive_ = true;
+        return true;
+    }
+    bool try_lock() {
+        std::lock_guard lock(mutex_);
+        if (exclusive_ || readers_ != 0U) return false;
+        exclusive_ = true;
+        return true;
+    }
+    void unlock() {
+        std::lock_guard lock(mutex_);
+        exclusive_ = false;
+        changed_.notify_all();
+    }
+    void lock_shared() { (void)lock_shared(std::stop_token{}); }
+    [[nodiscard]] bool lock_shared(std::stop_token cancelled) {
+        std::unique_lock lock(mutex_);
+        const auto ready = [this] { return CanRead(); };
+        if (!ready() && !changed_.wait(lock, cancelled, ready)) return false;
+        if (cancelled.stop_requested()) return false;
+        ++readers_;
+        return true;
+    }
+    bool try_lock_shared() {
+        std::lock_guard lock(mutex_);
+        if (!CanRead()) return false;
+        ++readers_;
+        return true;
+    }
+    void unlock_shared() {
+        std::lock_guard lock(mutex_);
+        --readers_;
+        if (readers_ == 0U) changed_.notify_all();
+    }
+  private:
+    friend struct StatementChunkLockTestAccess;
+    struct WriterWaiter {
+        explicit WriterWaiter(RegularChunkMutex& mutex) : owner(mutex) {
+            ++owner.writers_;
+            owner.changed_.notify_all();
+        }
+        ~WriterWaiter() { --owner.writers_; owner.changed_.notify_all(); }
+        RegularChunkMutex& owner;
+    };
+    bool CanRead() const { return !exclusive_ && writers_ == 0U && (!kSerialChunkReaders || readers_ == 0U); }
+    std::mutex mutex_;
+    std::condition_variable_any changed_;
+    std::size_t readers_ = 0U, writers_ = 0U;
+    bool exclusive_ = false;
+};
 
 [[nodiscard]] inline constexpr const char* ChunkLockModeName() noexcept {
     return kChunkLockModeName;

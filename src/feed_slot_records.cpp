@@ -9,6 +9,7 @@
 
 #include "chunk_store_internal.hpp"
 #include "checkpoint.hpp"
+#include "statement_control.hpp"
 #include "chunkdb/crc32.hpp"
 
 namespace chunkdb {
@@ -154,7 +155,8 @@ std::optional<FeedSlotRecords> ReadFeedSlotRecords(const std::filesystem::path& 
 }
 
 void WriteFeedSlotRecords(const std::filesystem::path& dir, const FeedSlotRecords& records, bool* published) {
-    AtomicWrite(dir / kFeedSlotsFileName, SerializeFeedSlotRecords(records), true, true, published);
+    AtomicWrite(dir / kFeedSlotsFileName, SerializeFeedSlotRecords(records), true, true, published, nullptr, true,
+        EnterStatementDecision);
 }
 
 }  // namespace chunkdb

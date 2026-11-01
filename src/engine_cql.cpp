@@ -28,6 +28,8 @@
 #include "table_options_text.hpp"
 #include "user_registry.hpp"
 #include "migrations.hpp"
+#include "reply_stream.hpp"
+#include "statement_control.hpp"
 
 namespace chunkdb {
 
@@ -224,6 +226,20 @@ constexpr std::size_t kMaxStatementParameterBytes =
 
 void AppendValue(std::string& out, const Column&, const ColumnValue& value) {
     Protocol::AppendValue(out, value);
+}
+
+std::size_t ValueReplyBytes(const ColumnValue& value) {
+    std::optional<std::size_t> bulk;
+    if (const auto* text = std::get_if<std::string>(&value)) bulk = text->size();
+    else if (const auto* bytes = std::get_if<BytesValue>(&value)) bulk = bytes->bytes.size();
+    else if (const auto* bits = std::get_if<BitsValue>(&value)) bulk = (bits->digits.size() + 7U) / 8U;
+    if (bulk) {
+        if (*bulk > kMaxChunkRangeResponseBytes) return kMaxChunkRangeResponseBytes + 1U;
+        return *bulk + std::to_string(*bulk).size() + 5U;
+    }
+    std::string scalar;
+    Protocol::AppendValue(scalar, value);
+    return scalar.size();
 }
 
 [[nodiscard]] std::size_t RequireColumn(const ChunkLayout& layout, std::string_view name) {
@@ -429,7 +445,13 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
     }
 }
 
+[[nodiscard]] bool SessionControl(const cql::Statement& statement) {
+    return std::holds_alternative<cql::ShowConnections>(statement) ||
+           std::holds_alternative<cql::Cancel>(statement) || std::holds_alternative<cql::KillConnection>(statement);
+}
+
 [[nodiscard]] bool AllowedInTransaction(const cql::Statement& statement) {
+    if (SessionControl(statement)) return true;
     return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::SetBlock>(statement) ||
            std::holds_alternative<cql::DeleteBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
            std::holds_alternative<cql::SetChunk>(statement) || std::holds_alternative<cql::GetArea>(statement) ||
@@ -442,6 +464,7 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
 // listings. Every other statement would change data, schema, users, rights or
 // slots, or needs a writer (WATCH, BEGIN, FLUSH WAL, BACKUP).
 [[nodiscard]] bool AvailableReadOnly(const cql::Statement& statement) {
+    if (SessionControl(statement)) return true;
     return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
            std::holds_alternative<cql::GetArea>(statement) || std::holds_alternative<cql::ScanChunks>(statement) ||
            std::holds_alternative<cql::ShowTables>(statement) || std::holds_alternative<cql::Describe>(statement) ||
@@ -467,7 +490,7 @@ const User* CommandEngine::CurrentUser(SessionState& session) const {
     // read again.
     const std::uint64_t generation = config_.users->Generation();
     if (session.user_generation != generation) {
-        auto found = config_.users->Find(session.user);
+        auto found = config_.users->FindForConnection(session.user, session.user_ticket);
         session.user_rights = found.has_value() ? std::make_shared<const User>(std::move(*found)) : nullptr;
         session.user_generation = generation;
     }
@@ -528,6 +551,13 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::ShowMetrics&) { info.verb = "SHOW METRICS"; },
             [&](const cql::ReloadTls&) { info.verb = "RELOAD TLS"; info.audit_event = "reload_tls"; },
             [&](const cql::ShowStatus&) { info.verb = "SHOW STATUS"; },
+            [&](const cql::ShowConnections&) { info.verb = "SHOW CONNECTIONS"; },
+            [&](const cql::Cancel& cancel) {
+                info.verb = "CANCEL"; info.audit_event = "cancel"; info.target_connection = cancel.id;
+            },
+            [&](const cql::KillConnection& kill) {
+                info.verb = "KILL CONNECTION"; info.audit_event = "kill_connection"; info.target_connection = kill.id;
+            },
             [&](const cql::EnableFeature&) { info.verb = "ENABLE FEATURE"; info.audit_event = "enable_feature"; },
             [&](const cql::Ping&) { info.verb = "PING"; },
             [&](const cql::CreateUser& create) {
@@ -746,8 +776,11 @@ std::string CommandEngine::ExecuteStatement(
     std::string_view line,
     std::span<const std::optional<std::string>> parameters,
     MetricsRegistry::CommandClass& command_class,
-    StatementLogInfo* info) {
+    StatementLogInfo* info,
+    std::unique_ptr<ReplyContinuation>* continuation,
+    const std::function<void(std::size_t)>* reserve_reply) {
     try {
+        CheckStatementCancellation();
         cql::Parsed parsed;
         try {
             parsed = cql::Parse(StatementOf(line));
@@ -775,7 +808,7 @@ std::string CommandEngine::ExecuteStatement(
                 "INVALID_ARGUMENT",
                 std::string(described.verb) + " is not available: the server opened its data directory read-only");
         }
-        if (session.transaction != nullptr && session.transaction->aborted.has_value()) {
+        if (session.transaction != nullptr && session.transaction->aborted.has_value() && !SessionControl(parsed.statement)) {
             // Ended by a conflict: only COMMIT or ROLLBACK closes it.
             std::string reply = *session.transaction->aborted;
             if (std::holds_alternative<cql::Rollback>(parsed.statement)) {
@@ -783,6 +816,7 @@ std::string CommandEngine::ExecuteStatement(
             }
             if (std::holds_alternative<cql::Rollback>(parsed.statement) ||
                 std::holds_alternative<cql::Commit>(parsed.statement)) {
+                EnterStatementDecision();
                 session.transaction.reset();
             }
             return reply;
@@ -794,10 +828,26 @@ std::string CommandEngine::ExecuteStatement(
         }
         return std::visit(
             Overloaded{
+                [&](const cql::ShowConnections&) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    return ListConnections(session);
+                },
+                [&](const cql::Cancel& cancel) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    return ControlConnection(session, cancel.id, false);
+                },
+                [&](const cql::KillConnection& kill) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    return ControlConnection(session, kill.id, true);
+                },
                 [&](const cql::Migrate& migration) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     MigrationRequest request;
-                    request.cancelled = session.backup_cancelled;
+                    std::stop_source cancelled;
+                    const auto request_stop = [&] { cancelled.request_stop(); };
+                    std::stop_callback shutdown(session.backup_cancelled, request_stop);
+                    std::stop_callback statement(StatementStopToken(), request_stop);
+                    request.cancelled = cancelled.get_token();
                     request.record = {migration.name, 0U, config_.require_auth ? session.user : std::string{}, migration.text};
                     std::visit(Overloaded{
                         [&](const cql::CreateTable& create) {
@@ -1015,6 +1065,7 @@ std::string CommandEngine::ExecuteStatement(
                         }
                     }
                     std::optional<std::vector<ColumnValue>> values;
+                    if (reserve_reply) (*reserve_reply)(BlockReplyCaptureBound(layout, columns));
                     std::optional<std::uint64_t> version;
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
@@ -1044,6 +1095,15 @@ std::string CommandEngine::ExecuteStatement(
                     if (!values) Protocol::AppendNull(reply);
                     else {
                         Protocol::AppendArrayHeader(reply, columns.size());
+                        auto response_bytes = reply.size();
+                        for (const auto index : columns) {
+                            CheckStatementCancellation();
+                            const auto bytes = ValueReplyBytes((*values)[index]);
+                            if (bytes > kMaxChunkRangeResponseBytes - response_bytes)
+                                throw std::out_of_range("GET BLOCK response exceeds the response byte limit; request fewer columns");
+                            response_bytes += bytes;
+                        }
+                        reply.reserve(response_bytes);
                         for (const std::size_t index : columns)
                             AppendValue(reply, layout.schema().columns[index], (*values)[index]);
                     }
@@ -1103,6 +1163,9 @@ std::string CommandEngine::ExecuteStatement(
                     const auto& layout = store.geometry().layout();
                     const auto columns = ColumnsOf(layout, get.columns);
                     ChunkState state;
+                    if (reserve_reply) (*reserve_reply)(ChunkReplyCaptureBound(layout,
+                        store.geometry().ChunkPayloadBytes() + ChunkPresenceBitmapBytes(store.geometry()) +
+                        (layout.has_var_columns() ? kVarMaxChunkBytesLimit : 0U)));
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
                         const ChunkCoord coord{get.chunk_x, get.chunk_y};
@@ -1114,6 +1177,16 @@ std::string CommandEngine::ExecuteStatement(
                         state = store.ReadChunkState(get.chunk_x, get.chunk_y);
                     }
                     if (!state.written) return NullReply();
+                    if (continuation) {
+                        std::vector<ChunkRangeEntry> entries;
+                        entries.push_back({.coord = {get.chunk_x, get.chunk_y}, .payload = std::move(state.payload),
+                            .presence_bitmap = std::move(state.presence_bitmap), .version = state.version,
+                            .vars = std::move(state.vars)});
+                        *continuation = ChunkReply(layout, std::move(entries), columns, false, false,
+                            64U + store.geometry().ChunkPayloadBytes() + ChunkPresenceBitmapBytes(store.geometry()) +
+                                (layout.has_var_columns() ? kVarMaxChunkBytesLimit : 0U));
+                        return std::string{};
+                    }
                     std::string reply;
                     Protocol::AppendBulk(
                         reply,
@@ -1167,6 +1240,27 @@ std::string CommandEngine::ExecuteStatement(
                     const auto& layout = store.geometry().layout();
                     const auto columns = ColumnsOf(layout, get.columns);
                     std::vector<ChunkRangeEntry> entries;
+                    if (reserve_reply) {
+                        const auto extent = [](std::int64_t first, std::int64_t last) {
+                            if (last < first) return kMaxChunkRangeChunks;
+                            const auto delta = static_cast<std::uint64_t>(last) - static_cast<std::uint64_t>(first);
+                            return delta >= kMaxChunkRangeChunks ? kMaxChunkRangeChunks : static_cast<std::size_t>(delta + 1U);
+                        };
+                        auto count = kMaxChunkRangeChunks;
+                        if (!get.around) {
+                            const auto width = extent(get.x0, get.x1), height = extent(get.y0, get.y1);
+                            count = width > kMaxChunkRangeChunks / height ? kMaxChunkRangeChunks : width * height;
+                        } else if (get.radius >= 0 && static_cast<std::uint64_t>(get.radius) < kMaxChunkRangeChunks / 2U) {
+                            const auto diameter = static_cast<std::size_t>(get.radius) * 2U + 1U;
+                            count = diameter > kMaxChunkRangeChunks / diameter ? kMaxChunkRangeChunks : diameter * diameter;
+                        }
+                        const auto chunk_bytes = std::min<std::size_t>(kMaxChunkRangeResponseBytes,
+                            96U + store.geometry().ChunkPayloadBytes() + ChunkPresenceBitmapBytes(store.geometry()) +
+                            (layout.has_var_columns() ? kVarMaxChunkBytesLimit : 0U));
+                        const auto state_bytes = count > kMaxChunkRangeResponseBytes / chunk_bytes ?
+                            kMaxChunkRangeResponseBytes : count * chunk_bytes;
+                        (*reserve_reply)(ChunkReplyCaptureBound(layout, state_bytes));
+                    }
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
                         std::vector<ChunkCoord> covered;
@@ -1186,6 +1280,11 @@ std::string CommandEngine::ExecuteStatement(
                                              : store.ReadChunkRange(get.x0, get.y0, get.x1, get.y1, true);
                     }
                     if (info != nullptr) info->chunks = entries.size();
+                    if (continuation) {
+                        *continuation = ChunkReply(layout, std::move(entries), columns, true, get.with_schema,
+                            kMaxChunkRangeResponseBytes);
+                        return std::string{};
+                    }
                     std::string reply;
                     if (get.with_schema) {
                         Protocol::AppendArrayHeader(reply, 2U);
@@ -1270,7 +1369,11 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::RecoverTable& recover) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, recover.table, Right::kAdmin);
-                    catalog_->RecoverTable(recover.table, session.backup_cancelled);
+                    std::stop_source cancelled;
+                    const auto request_stop = [&] { cancelled.request_stop(); };
+                    std::stop_callback shutdown(session.backup_cancelled, request_stop);
+                    std::stop_callback statement(StatementStopToken(), request_stop);
+                    catalog_->RecoverTable(recover.table, cancelled.get_token());
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::ShowTables&) {
@@ -1332,9 +1435,18 @@ std::string CommandEngine::ExecuteStatement(
                         throw std::invalid_argument("BACKUP is disabled: set --backup-dir <path>");
                     const auto target = ResolveBackupTarget(config_.backup_dir, backup.path);
                     BackupOptions options;
-                    options.cancelled = session.backup_cancelled;
+                    std::stop_source cancelled;
+                    const auto request_stop = [&] { cancelled.request_stop(); };
+                    std::stop_callback shutdown(session.backup_cancelled, request_stop);
+                    std::stop_callback statement(StatementStopToken(), request_stop);
+                    options.cancelled = cancelled.get_token();
                     std::string reply;
                     options.before_publish = [&](const BackupResult& result) {
+                        if (reserve_reply) {
+                            if (result.tables.size() > (std::numeric_limits<std::size_t>::max() - 1024U) / 512U)
+                                throw ReplyAdmissionError("backup reply bound overflows");
+                            (*reserve_reply)(1024U + 512U * result.tables.size());
+                        }
                         Protocol::AppendMapHeader(reply, 4);
                         Protocol::AppendBulk(reply, "tables");
                         Protocol::AppendInteger(reply, static_cast<std::uint64_t>(result.tables.size()));
@@ -1373,6 +1485,7 @@ std::string CommandEngine::ExecuteStatement(
                     return TxnCommit(session);
                 },
                 [&](const cql::Rollback&) {
+                    EnterStatementDecision();
                     session.transaction.reset();
                     return Protocol::SimpleString("OK");
                 },
@@ -1424,6 +1537,9 @@ std::string CommandEngine::ExecuteStatement(
                             throw std::invalid_argument("this server runs without users (--auth none)");
                         }
                         config_.users->SetVerifier(alter.user, VerifierFrom(*alter.verifier, parameters));
+                    } else if (alter.max_connections || alter.statements_per_sec) {
+                        RequireManagesUsers(session);
+                        config_.users->SetLimits(alter.user, alter.max_connections, alter.statements_per_sec);
                     } else {
                         RequireManagesUsers(session);
                         config_.users->SetManagesUsers(alter.user, *alter.manages_users);
@@ -1536,7 +1652,9 @@ std::string CommandEngine::TxnBegin(SessionState& session) {
     if (session.transaction != nullptr) {
         throw std::invalid_argument("a transaction is already open; COMMIT or ROLLBACK it first");
     }
-    session.transaction = std::make_unique<SessionTransaction>(&txn_total_bytes_, std::chrono::steady_clock::now());
+    auto transaction = std::make_unique<SessionTransaction>(&txn_total_bytes_, std::chrono::steady_clock::now());
+    EnterStatementDecision();
+    session.transaction = std::move(transaction);
     return Protocol::SimpleString("OK");
 }
 
@@ -1616,6 +1734,7 @@ void CommandEngine::TxnWrite(
         }
     };
     try {
+        EnterStatementDecision();
         change(state);
         state.written = was_written || std::any_of(state.presence_bitmap.begin(), state.presence_bitmap.end(),
                                                   [](std::uint8_t byte) { return byte != 0; });

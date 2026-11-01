@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "chunkdb/change_feed.hpp"
@@ -23,6 +24,7 @@
 #include "feature_flags.hpp"
 #include "scram.hpp"
 #include "user_registry.hpp"
+#include "statement_control.hpp"
 #include "table_options_text.hpp"
 
 #ifdef _WIN32
@@ -149,6 +151,7 @@ SessionHelloOptions ParseHelloOptions(
                 if (integer == nullptr || integer->negative) invalid();
                 value = integer->magnitude;
             }
+            if (value > kMaxStatementTimeoutMs) invalid();
             result.statement_timeout_ms = value;
             continue;
         }
@@ -265,6 +268,7 @@ struct PendingLogin {
     std::string user;
     // An unknown user runs against a decoy and always fails.
     bool known = false;
+    std::optional<UserAuthenticationSnapshot> identity;
     scram::ServerExchange exchange;
     SessionHelloOptions options;
 };
@@ -272,7 +276,12 @@ struct PendingLogin {
 std::string CommandEngine::Execute(
     SessionState& session,
     std::string_view line,
-    std::span<const std::optional<std::string>> parameters) {
+    std::span<const std::optional<std::string>> parameters,
+    std::unique_ptr<ReplyContinuation>* continuation,
+    const std::function<void(std::size_t)>* reserve_reply) {
+    if (continuation) continuation->reset();
+    if (!std::exchange(session.request_admitted, false))
+        if (auto refused = AdmitUserStatement(session, line)) return std::move(*refused);
     const auto command_name = ExtractCommandName(line);
     const auto started = std::chrono::steady_clock::now();
     const bool hello = Protocol::CommandEquals(command_name, "HELLO");
@@ -322,7 +331,7 @@ std::string CommandEngine::Execute(
         // counts itself). Known option validation is not an auth failure;
         // the transport handshake deadline still bounds ungreeted peers.
         if (count_failure && !session.greeted && !response.empty() && response[0] == '-' &&
-            response.rfind("-ERR AUTH_FAILED", 0) != 0 && !session.close_after_reply) {
+            response.rfind("-ERR AUTH_FAILED", 0) != 0 && response.rfind("-ERR RATE_LIMITED", 0) != 0 && !session.close_after_reply) {
             ++session.failed_auth_attempts;
             if (session.failed_auth_attempts >= config_.max_auth_failures) {
                 session.close_after_reply = true;
@@ -344,7 +353,8 @@ std::string CommandEngine::Execute(
     // Neither log costs anything while both are off.
     const bool logged = config_.audit != nullptr || config_.slow_statement_ms != 0U;
     StatementLogInfo info;
-    std::string response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr);
+    std::string response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr,
+        continuation, reserve_reply);
     ObserveReply(command_class, started, response);
     if (logged && info.verb != nullptr) {
         LogStatement(session, info, started, response);
@@ -353,6 +363,8 @@ std::string CommandEngine::Execute(
 }
 
 std::string CommandEngine::RejectPayload(SessionState& session, std::string_view line, std::string response) {
+    if (!std::exchange(session.request_admitted, false))
+        if (auto refused = AdmitUserStatement(session, line)) return std::move(*refused);
     const auto started = std::chrono::steady_clock::now();
     const auto name = ExtractCommandName(line);
     const bool auth = Protocol::CommandEquals(name, "HELLO") || (!session.greeted && Protocol::CommandEquals(name, "AUTH"));
@@ -399,6 +411,7 @@ void CommandEngine::LogStatement(
             .target_user = info.target_user,
             .slot = info.slot,
             .migration = info.migration,
+            .target_connection = info.target_connection,
         });
     }
     if (config_.slow_statement_ms != 0U) {
@@ -502,10 +515,11 @@ std::string CommandEngine::AuthBanReply(SessionState& session) {
     }
     session.close_after_reply = true;
     if (config_.auth_failure_delay_ms > 0) {
-        std::this_thread::sleep_for(std::chrono::milliseconds(config_.auth_failure_delay_ms));
+        session.reply_not_before = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(config_.auth_failure_delay_ms);
     }
     const auto remaining = std::max<std::int64_t>(0, std::chrono::ceil<std::chrono::milliseconds>(
-        until - std::chrono::steady_clock::now()).count());
+        until - std::max(std::chrono::steady_clock::now(), session.reply_not_before)).count());
     return Protocol::Error("RATE_LIMITED", "temporary auth ban", {
         {"reason", "auth_ban"}, {"retry_after_ms", std::to_string(remaining)}});
 }
@@ -578,7 +592,7 @@ std::string CommandEngine::RecordAuthFailure(SessionState& session) {
         }
     }
     if (auth_failure_delay.count() > 0) {
-        std::this_thread::sleep_for(auth_failure_delay);
+        session.reply_not_before = std::chrono::steady_clock::now() + auth_failure_delay;
     }
     return Protocol::Error("AUTH_FAILED", "invalid user or password; check the username and password in your connection URI");
 }
@@ -645,6 +659,10 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
 }
 
 std::string CommandEngine::ErrorReply(const std::exception& error) {
+    if (dynamic_cast<const ReplyAdmissionError*>(&error))
+        return Protocol::Error("BUSY", error.what(), {{"reason", "reply_budget"}});
+    if (const auto* stopped = dynamic_cast<const StatementStoppedError*>(&error))
+        return StatementStoppedReply(stopped->reason());
     // In the order a catch chain would test them: the first matching type
     // decides.
     if (const auto* option = dynamic_cast<const HelloOptionError*>(&error))
@@ -708,6 +726,8 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (dynamic_cast<const std::out_of_range*>(&error) != nullptr) {
         return Protocol::Error("OUT_OF_RANGE", error.what());
     }
+    if (dynamic_cast<const UsersOutcomeUnknownError*>(&error))
+        return Protocol::Error("OUTCOME_UNKNOWN", error.what(), {{"stage", "users_record"}});
     if (const auto* outcome = dynamic_cast<const WriteOutcomeUnknownError*>(&error)) {
         LogMessage(
             LogLevel::kError,
@@ -767,12 +787,13 @@ std::string CommandEngine::HandleHello(
     if (first.user != user) {
         throw std::invalid_argument("the SCRAM client-first message names another user than HELLO");
     }
-    const auto found = config_.users->Find(user);
+    const auto found = config_.users->AuthenticationSnapshot(user);
     const auto secret = config_.users->Secret();
-    scram::Verifier verifier = found.has_value() ? found->verifier : scram::DecoyVerifier(secret, user);
+    scram::Verifier verifier = found.has_value() ? found->user.verifier : scram::DecoyVerifier(secret, user);
     session.pending_login = std::make_shared<PendingLogin>(PendingLogin{
         .user = user,
         .known = found.has_value(),
+        .identity = found,
         .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce()),
         .options = std::move(options),
     });
@@ -796,15 +817,43 @@ std::string CommandEngine::HandleAuth(
     if (std::string banned = AuthBanReply(session); !banned.empty()) {
         return banned;
     }
+    const auto stale = [] {
+        return Protocol::Error("AUTH_FAILED", "login context changed; start HELLO again", {{"reason", "stale_login"}});
+    };
+    if (pending->identity && !config_.users->AuthenticationCurrent(*pending->identity)) return stale();
     const auto server_final = pending->exchange.Finish(*parameters[0]);
     if (!server_final.has_value() || !pending->known) {
         return RecordAuthFailure(session);
     }
-    RecordAuthSuccess(session);
-    session.greeted = true;
-    session.user = pending->user;
+    auto admission = config_.users->AcquireConnection(*pending->identity);
+    if (admission.status == UserAdmissionStatus::kStale) return stale();
+    if (admission.status == UserAdmissionStatus::kConnectionLimit)
+        return Protocol::Error("RATE_LIMITED", "the user's connection limit is reached",
+            {{"reason", "max_connections"}, {"retry_after_ms", std::to_string(admission.retry_after_ms)}});
+    std::string authenticated_user = pending->user;
     session.hello_options = std::move(pending->options);
-    return HelloReply(session, *server_final);
+    auto reply = HelloReply(session, *server_final);
+    RecordAuthSuccess(session);
+    session.user = std::move(authenticated_user);
+    session.user_ticket = std::move(admission.ticket);
+    session.user_incarnation = session.user_ticket->incarnation();
+    session.greeted = true;
+    return reply;
+}
+
+std::optional<std::string> CommandEngine::AdmitUserStatement(SessionState& session, std::string_view line) const {
+    if (!session.greeted || !config_.require_auth) return std::nullopt;
+    const auto start = line.find_first_not_of(" \t\r\n");
+    const auto end = start == std::string_view::npos ? start : line.find_first_of(" \t\r\n", start);
+    const auto verb = start == std::string_view::npos ? std::string_view{} : line.substr(start, end - start);
+    if (Protocol::CommandEquals(verb, "CANCEL") || Protocol::CommandEquals(verb, "KILL") ||
+        Protocol::CommandEquals(verb, "ROLLBACK")) return std::nullopt;
+    const auto result = config_.users->AdmitStatement(session.user_ticket);
+    if (result.status == UserAdmissionStatus::kAllowed) return std::nullopt;
+    if (result.status == UserAdmissionStatus::kStale)
+        return Protocol::Error("AUTH_REQUIRED", "the authenticated user no longer exists", {{"reason", "user_incarnation"}});
+    return Protocol::Error("RATE_LIMITED", "the user's statement limit is reached",
+        {{"reason", "statements_per_sec"}, {"retry_after_ms", std::to_string(result.retry_after_ms)}});
 }
 
 std::string CommandEngine::HelloReply(const SessionState& session, std::string_view server_signature) const {
@@ -831,7 +880,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 7);
+    Protocol::AppendArrayHeader(reply, 9);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -839,22 +888,24 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "slot_filters");
     Protocol::AppendBulk(reply, "slot_takeover");
     Protocol::AppendBulk(reply, "lineage");
+    Protocol::AppendBulk(reply, "connection_controls");
+    Protocol::AppendBulk(reply, "statement_timeout");
     Protocol::AppendBulk(reply, "options");
-    Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 1U : 0U);
+    Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 2U : 1U);
+    entry("statement_timeout_ms", session.hello_options.statement_timeout_ms.value_or(session.default_statement_timeout_ms));
     if (session.hello_options.client_name) {
         Protocol::AppendBulk(reply, "client_name");
         Protocol::AppendBulk(reply, *session.hello_options.client_name);
     }
     Protocol::AppendBulk(reply, "not_applied");
     Protocol::AppendMapHeader(reply, session.hello_options.unknown_options.size() +
-        (session.hello_options.statement_timeout_ms ? 1U : 0U) + (session.hello_options.default_tag ? 1U : 0U));
+        (session.hello_options.default_tag ? 1U : 0U));
     const auto deferred = [&reply](std::string_view name, std::string_view reason) {
         Protocol::AppendBulk(reply, name);
         Protocol::AppendMapHeader(reply, 1);
         Protocol::AppendBulk(reply, "reason");
         Protocol::AppendBulk(reply, reason);
     };
-    if (session.hello_options.statement_timeout_ms) deferred("statement_timeout_ms", "implementation_pending");
     if (session.hello_options.default_tag) deferred("default_tag", "implementation_pending");
     for (const auto& name : session.hello_options.unknown_options) deferred(name, "unknown_option");
     entry("idle_timeout_ms", session.idle_timeout_ms);

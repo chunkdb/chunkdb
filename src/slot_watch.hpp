@@ -11,6 +11,7 @@
 
 namespace chunkdb {
 class ChunkServer;
+class StatementControl;
 
 // Isolated delivery schedule hook. Install before test writes and retain it
 // until the server stops; callbacks never change delivery decisions.
@@ -21,7 +22,12 @@ struct FeedDeliveryTestHook {
         kWorkerReady, kAfterPendingWait, kBeforeWorkerHandle, kAfterWorkerHandle,
         kBeforeWorkerClose, kAfterWorkerClose, kBeforeClientRead, kAfterClientRead,
         kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kAfterProgressAdmission, kAfterPartialFeedWrite, kAfterBlockedFeedWrite, kAfterAckTimeoutClose, kBeforeSlotAck, kAfterSlotFinish, kBeforeReturnClient,
-        kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept, kAfterTakeoverFence, kAfterTakeoverClose, kAfterSlotAck, kAfterTakeoverReserved };
+        kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept, kAfterTakeoverFence, kAfterTakeoverClose, kAfterSlotAck, kAfterTakeoverReserved, kBeforeResumedClientQueue, kIdleQueueBackpressure,
+        kBeforeQueuedStopScan, kAfterQueuedStopClaim, kBeforeStatementStart, kAfterStatementStartRefused,
+        kAfterStatementQueued, kAfterFeedReplyQueue, kFeedInputBackpressure, kAfterRunningStopPublication,
+        kBeforeReplyBufferWrite, kAfterReplyBufferWrite, kAfterBlockedReplyWrite, kAfterAuthReplyScheduled,
+        kAfterPayloadCreditQueued, kAfterPayloadCreditGranted, kAfterStatementTrackerScan,
+        kBeforeBufferedStatementPublication, kBeforeTakeoverReservation };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
@@ -31,6 +37,10 @@ struct FeedDeliveryTestAccess {
     // Observe existing scheduling without adding a wake before shutdown.
     static void SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
     static void SetPendingObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
+    static std::shared_ptr<StatementControl> CurrentStatement(ChunkServer& server, std::uint64_t id);
+    static bool ConnectionStillOwned(ChunkServer& server, std::uint64_t id);
+    static void WakeTransport(ChunkServer& server);
+    static std::shared_ptr<void> ReserveReplyCredit(ChunkServer& server, std::size_t bytes);
   private:
     static void InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake);
 };

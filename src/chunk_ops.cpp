@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "chunk_store_internal.hpp"
+#include "statement_control.hpp"
 #include "checkpoint.hpp"
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
@@ -326,7 +327,7 @@ ChunkMutationResult ChunkStore::CasChunkStateBytes(
 
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::unique_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunk(regular_chunk->mutex);
 
     if (regular_chunk->version != expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
@@ -378,7 +379,7 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
     }
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::unique_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunk(regular_chunk->mutex);
 
     if (has_expected_version && regular_chunk->version != expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
@@ -402,7 +403,7 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
 
 ChunkState ChunkStore::ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y) {
     const auto regular_chunk = GetOrLoadRegularChunk(ChunkCoord{chunk_x, chunk_y});
-    std::shared_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunkShared(regular_chunk->mutex);
     return ChunkState{
         .version = regular_chunk->version,
         .payload = regular_chunk->payload,
@@ -436,7 +437,7 @@ ChunkMutationResult ChunkStore::WriteChunkState(
 
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::unique_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunk(regular_chunk->mutex);
     if (expected_version.has_value() && regular_chunk->version != *expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
     }

@@ -11,11 +11,12 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--host` | `127.0.0.1` | Bind address. |
 | `--port` | `4242` | TCP port, 1–65535. |
 | `--listen-uri` | unset | `chunk://host:port/` or `chunks://host:port/`; sets address, port and TLS at this point in argument order; a username is refused. |
-| `--workers` | CPU thread count, or 4 | Connections served at once; a connection holds a worker until it closes or reaches the idle timeout, and a WATCH releases it. |
-| `--client-io-timeout-ms` | `5000` | 1–86400000 ms for handshake, HELLO, an active request or a complete reply write. |
+| `--workers` | CPU thread count, or 4 | Concurrent statement execution; idle input, partial frames, TLS, authentication and output wait on I/O pollers. |
+| `--client-io-timeout-ms` | `5000` | 1–86400000 ms for handshake, HELLO and partial requests; reply writes close after this interval without output progress. |
 | `--idle-connection-timeout-ms` | `60000` | 1–86400000 ms between requests; before HELLO the smaller I/O/idle timeout applies. |
-| `--max-pending-clients` | `1024` | Accepted clients waiting for a worker; overflow is refused. |
-| `--max-handshakes-per-ip` | `64` | Connections from an IPv4 address or IPv6 /64 occupying workers before HELLO; exceeding the limit is refused. `0` disables the limit. |
+| `--statement-timeout-ms` | `0` | 0–86400000 ms from complete request admission through queue wait and cancellable execution; zero disables it and HELLO may override it. |
+| `--max-pending-clients` | `1024` | Complete statements queued for a worker; additional ready statements wait for queue credit while HELLO and session controls remain available. |
+| `--max-handshakes-per-ip` | `64` | Connections from an IPv4 address or IPv6 /64 before HELLO; exceeding the limit is refused. `0` disables the limit. |
 | `--max-line-bytes` | `65536` | Request line limit including terminator; parameter frames are bounded separately by column/chunk size. |
 | `--max-unparsed-parameter-bytes` | `1048576` | Payload bytes drained after a statement cannot parse or its parameter types cannot resolve; excess closes with PROTOCOL. |
 | `--log-level` | `info` | `info`, `warn`, `error`. |
@@ -61,7 +62,8 @@ The header comes before the TLS handshake on a `chunks://` listener.
 Its source address replaces the socket's peer for login bans, the handshake limit, the audit log and connection logs.
 A LOCAL header, or one with an unspecified address family, keeps the socket's peer.
 A connection without a valid header within `--client-io-timeout-ms` is closed without a reply; headers longer than 1040 bytes are refused.
-While the header is read, the connection counts toward `--max-handshakes-per-ip` for the socket's peer, so a host that reaches the port directly holds at most that many workers this way; the proxy sends its header at once, so its connections hold that slot only briefly.
+While the header is read, the connection counts toward `--max-handshakes-per-ip` for the socket's peer.
+After a valid header, the source it carries holds the handshake slot until HELLO succeeds or the connection closes.
 The first refused header is logged; later ones are counted as rejected connections.
 Only TCP over IPv4 and IPv6 is accepted.
 With `off`, the server never reads a header, so a client cannot claim another address; listen only where the proxy can reach the server when you use `v2`.
