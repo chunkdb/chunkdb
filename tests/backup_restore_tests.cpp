@@ -7,6 +7,7 @@
 #include "slot_watch.hpp"
 #include "txn_test_utils.hpp"
 #include "directory_alias_test_utils.hpp"
+#include "backup_directory.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -290,6 +291,74 @@ void RestoreTemporaryCleanup() {
         assert(Verify(target).errors == 0U);
     }
 }
+void RestoreCleanupRefusalPreservesFailure() {
+    if (!kFailpointsCompiled) return;
+    {
+        test::ScopedTempDir missing("chunkdb-missing-restore-cleanup");
+        assert(!RemoveBackupTemporaryTree(missing.path() / "missing"));
+        assert(!RemoveBackupTemporaryTree(missing.path() / "missing-parent/missing"));
+    }
+    for (const auto* point : {"CHUNKDB_FAILPOINT_BACKUP_TEMPORARY_CLEANUP_INVALID_PATH_ONCE",
+             "CHUNKDB_FAILPOINT_BACKUP_TEMPORARY_CLEANUP_OPEN_FAIL_ONCE"}) {
+        Fixture fixture;
+        const auto target = fixture.root / "restore";
+        txn_test::ScopedEnv copy_failure("CHUNKDB_FAILPOINT_RESTORE_COPY_FAIL_ONCE", "1");
+        txn_test::ScopedEnv cleanup_failure(point, "1");
+        std::string message;
+        try { RestoreBackup(fixture.backup, target); }
+        catch (const std::exception& failure) { message = failure.what(); }
+        assert(message.find("injected restore copy failure") != std::string::npos);
+        assert(message.find("restore temporary cleanup failed") != std::string::npos);
+        assert(!std::filesystem::exists(target));
+        std::size_t remaining = 0U;
+        for (const auto& entry : backup_detail::DirectoryEntries(fixture.root)) {
+            if (!entry.path().filename().string().starts_with(".chunkdb.restore.")) continue;
+            assert(std::filesystem::exists(entry.path() / kRestoreIncompleteName));
+            ++remaining;
+            assert(!RemoveBackupTemporaryTree(entry.path()));
+        }
+        assert(remaining == 1U);
+        assert(Verify(fixture.backup).errors == 0U);
+    }
+}
+void RestoreCleanupRefusesReplacedParent() {
+#ifdef _WIN32
+    Fixture fixture;
+    const auto parent = fixture.root / "restore-parent", moved = fixture.root / "moved-parent";
+    const auto outside = fixture.root / "outside";
+    std::filesystem::create_directory(parent);
+    std::filesystem::create_directory(outside);
+    Save(outside / "sentinel", Bytes{'s'});
+    std::unique_ptr<test::ScopedDirectoryAlias> alias;
+    std::string message;
+    {
+        struct ResetObserver { ~ResetObserver() { SetDirectorySyncObserverForTests({}); } } reset;
+        SetDirectorySyncObserverForTests([&](const auto& directory) {
+            if (directory != parent || alias) return;
+            std::filesystem::rename(parent, moved);
+            alias = std::make_unique<test::ScopedDirectoryAlias>(outside, parent);
+            throw std::runtime_error("injected restore parent replacement");
+        });
+        try { RestoreBackup(fixture.backup, parent / "restored"); }
+        catch (const std::exception& failure) { message = failure.what(); }
+    }
+    assert(alias);
+    assert(message.find("injected restore parent replacement") != std::string::npos);
+    assert(message.find("restore temporary cleanup failed") != std::string::npos);
+    assert(LoadFile(outside / "sentinel") == Bytes{'s'});
+    for (const auto& entry : backup_detail::DirectoryEntries(outside)) assert(entry.path().filename() == "sentinel");
+    assert(!alias->Remove());
+    std::filesystem::rename(moved, parent);
+    std::size_t remaining = 0U;
+    for (const auto& entry : backup_detail::DirectoryEntries(parent)) {
+        assert(entry.path().filename().string().starts_with(".chunkdb.restore."));
+        assert(std::filesystem::exists(entry.path() / kRestoreIncompleteName));
+        ++remaining;
+        assert(!RemoveBackupTemporaryTree(entry.path()));
+    }
+    assert(remaining == 1U);
+#endif
+}
 void CrashConsistentWal() {
     for (unsigned defect = 0; defect != 3U; ++defect) {
         Fixture fixture;
@@ -443,8 +512,12 @@ void ExtendedRootPaths() {
     test::FeedPhaseWatchdog::Phase("extended roots: resolve restore target");
     assert(CanonicalBackupPath(restored).native().starts_with(L"\\\\?\\"));
     test::FeedPhaseWatchdog::Phase("extended roots: enumerate restore parent");
-    for (const auto& entry : std::filesystem::directory_iterator(root))
+    std::size_t children = 0U;
+    for (const auto& entry : backup_detail::DirectoryEntries(root)) {
         assert(entry.path().filename() == "daily");
+        ++children;
+    }
+    assert(children == 1U);
     struct SyncTrace {
         SyncTrace() {
             SetDirectorySyncObserverForTests([](const auto& directory) {
@@ -467,7 +540,8 @@ void ExtendedRootPaths() {
     overlap /= std::string(200U, 'y');
     Throws<std::invalid_argument>([&] { RequireBackupTarget(fixture.source, overlap); });
     test::FeedPhaseWatchdog::Phase("extended roots: cleanup");
-    std::filesystem::remove_all(top);
+    RemoveBackupStaging(top);
+    assert(!std::filesystem::exists(top));
 #endif
 }
 } // namespace
@@ -483,6 +557,7 @@ int main(int argc, char** argv) {
         else if (name == "identity") EpochAndHistory();
         else if (name == "lineage") LineageContinuation();
         else if (name == "cleanup") RestoreTemporaryCleanup();
+        else if (name == "cleanup-refusal") { RestoreCleanupRefusalPreservesFailure(); RestoreCleanupRefusesReplacedParent(); }
         else if (name == "cold") CrashConsistentWal();
         else if (name == "symlinks") SymlinkedRootsAndStaging();
         else if (name == "roots") { RootedTargets(); InventoryPathSpellings(); }
@@ -497,6 +572,7 @@ int main(int argc, char** argv) {
     };
     run("filtered slots", FilteredSlots); run("records", Records); run("identity", EpochAndHistory);
     run("lineage", LineageContinuation); run("inventory", StrictInventory); run("targets and copies", TargetsAndCopies);
+    run("cleanup refusal", RestoreCleanupRefusalPreservesFailure); run("cleanup parent replacement", RestoreCleanupRefusesReplacedParent);
     run("completion failures", CompletionFailures); run("temporary cleanup", RestoreTemporaryCleanup);
     run("cold WAL", CrashConsistentWal); run("root aliases", SymlinkedRootsAndStaging);
     run("rooted targets", RootedTargets); run("inventory paths", InventoryPathSpellings);

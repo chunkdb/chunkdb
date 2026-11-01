@@ -1,4 +1,5 @@
 #include "backup.hpp"
+#include "backup_directory.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -91,7 +92,7 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
     if (verified.errors != 0U) throw std::runtime_error("backup storage verification failed: " + findings.str());
     Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_VERIFY_ONCE");
     EnsureDirectoryPathExists(target.parent_path(), true);
-    for (const auto& entry : std::filesystem::directory_iterator(target.parent_path()))
+    for (const auto& entry : backup_detail::DirectoryEntries(target.parent_path()))
         if (entry.path().filename().string().rfind(".chunkdb.restore.", 0U) == 0U)
             throw std::runtime_error("an interrupted restore temporary copy remains: " + entry.path().string());
     const auto temporary = target.parent_path() / (".chunkdb.restore." + StoreIdHex(NewStoreId()));
@@ -141,7 +142,8 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
                     auto bytes = RecoverWal(path, geometry, coord, old_epoch, manifest.features);
                     if (bytes.empty()) {
                         std::filesystem::remove(path);
-                        if (std::filesystem::is_empty(path.parent_path())) std::filesystem::remove(path.parent_path());
+                        if (backup_detail::DirectoryEntries(path.parent_path()) == backup_detail::DirectoryEntries{})
+                            std::filesystem::remove(path.parent_path());
                     } else {
                         bytes = RewriteWalStoreId(std::move(bytes), coord, old_epoch, new_epoch, manifest.features);
                         AtomicWrite(path, bytes, true, true);
@@ -193,8 +195,7 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         // No cleanup or fallible callback follows the completion point.
     } catch (const std::exception& failure) {
         if (!moved) {
-            std::error_code error;
-            std::filesystem::remove_all(temporary, error);
+            const auto error = RemoveBackupTemporaryTree(temporary);
             if (error) throw std::runtime_error(std::string(failure.what()) + "; restore temporary cleanup failed: " + temporary.string() + ": " + error.message());
         }
         throw;
