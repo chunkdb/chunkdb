@@ -146,6 +146,11 @@ An unconditional ordinary write to a chunk with no live group dependency or reta
 
 The owner root is authoritative for the matching journal and retained-ID contexts; conventional filenames are not an independent selection mechanism.
 A journal compaction first closes group and ID publication admission before chunk locks or table leases are acquired, drains already registered publishers and captures one complete old journal cut.
+The closed gate refuses new group registrations, not the completion of an already registered publisher or a durability receipt for an earlier group.
+Those continuations use independent owner-transition serialization without re-entering closed group admission, acquiring another table lease or waiting for another member chunk lock.
+A publisher retains its original registration through its decision and final logical publication instead of dropping it and requesting fresh admission.
+While a compactor drains or stages reversibly it holds no owner-transition permit; a receipt can advance the current journal and root, requiring the compactor to re-admit and rebase its capture before pending publication.
+Once a compactor owns the irreversible transition permit it waits for no chunk or group settlement, and later receipts select the admitted final journal generation after that continuation completes.
 Ordinary ungrouped writes keep their existing admission and continue independently.
 The compactor rebuilds the live ID set from the admitted old inventory, its exact newer decision suffix and durable retirement cuts, while keeping in-flight reservations distinct from completed bindings.
 It writes a new journal generation and an ID inventory whose cursor is the end of its fully processed new generation, preserving live incarnations through exact decision or seal bindings.
@@ -300,6 +305,7 @@ Valid same-length replacement images, retained records and seals with different 
 Relaxed tests lose only an uncertified preceding suffix, lose a certified prefix, damage an interior frame and roll back transitive groups before asserting that every original file is unchanged on refusal.
 Observed members, never-written anchors and header-only WALs must not create revisions or retain invented metadata.
 Dependency tests hold one member lock while another settles the group and prove settlement takes no second chunk lock.
+A three-party barrier test registers a publisher waiting for a checkpoint-owned chunk, makes that checkpoint wait for an earlier group's receipt, then closes compaction admission and proves that the receipt and original publisher still finish before the captured cut is re-admitted.
 Reference tests keep a seal through one current producer, then through a feed slot and an ID, and collect it only after all checked owners retire.
 Restore tests cover negative XYZ, reordered new epochs, root and subset counters, selected and omitted members, split reports, principal ownership and absent-versus-empty tags and IDs.
 Sparse oversized objects, cyclic trees and count/extent mismatches fail before large allocations, and no test substitutes a full WAL buffer for bounded admission.
