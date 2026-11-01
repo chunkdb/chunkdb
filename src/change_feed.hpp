@@ -154,9 +154,6 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     std::atomic<std::uint64_t>* ceiling_clock_ = nullptr;
     std::optional<Geometry> geometry_;
     std::optional<TableLineage> lineage_;
-    // A verified restored cut had no issued post-fork token at attachment.
-    // The normal ring/loss bounds still govern its retained continuation.
-    bool initial_fork_proven_ = false;
     FeatureFlags features_{};
     mutable std::mutex mutex_;
     std::condition_variable cv_;
@@ -167,7 +164,6 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     std::uint64_t reset_ = 0;
     bool closed_ = false;
     const char* ended_ = nullptr;
-    bool subscribed_ = false;
     std::exception_ptr error_;
     mutable ChunkState before_scratch_, after_scratch_;
     mutable std::vector<std::uint8_t> value_scratch_;

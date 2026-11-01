@@ -177,10 +177,62 @@ void ThreeDimensionalBlockCoordinates() {
     assert(block.x == -1 && block.y == 8 && block.z == -5);
     assert(block.local_x == 3U && block.local_y == 0U && block.local_z == 1U);
 }
+void ScanCutContinuesFirstWatch() {
+    for (const bool restart : {false, true}) for (const bool retained : {false, true}) for (const bool gap : {false, true}) {
+        test::ScopedTempDir directory("chunkdb-scan-first-watch");
+        const auto config = feed_test::Config(directory.path());
+        auto catalog = std::make_shared<TableCatalog>(config);
+        auto table = Create(*catalog);
+        if (retained) {
+            auto lease = table->Acquire();
+            lease->store().SetBlockBits(0, 0, "10000000");
+            lease->store().UnsetBlock(0, 0);
+            lease->store().CheckpointForTests(0, 0);
+        }
+        std::optional<FeedPosition> old_position;
+        if (restart) {
+            { auto lease = table->Acquire(); old_position = FeedPosition{table->store_id(), *lease->store().CompletedRevision()}; }
+            table.reset(); catalog.reset(); catalog = std::make_shared<TableCatalog>(config); table = catalog->Require("t");
+        }
+        FeedPosition position;
+        {
+            auto lease = table->Acquire();
+            const auto page = lease->store().ScanChunkIdentities(false, {}, 10U, 0U, true);
+            assert(page.position && !page.has_more && page.entries.size() == (retained ? 1U : 0U));
+            if (retained) assert(page.entries.front().version != 0U && !page.entries.front().data);
+            position = {table->store_id(), *page.position};
+        }
+        if (gap) {
+            auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, "00100000");
+        }
+        auto watch = table->SubscribeFeed({.after = position});
+        if (gap) assert(feed_test::Next(*watch)->kind == FeedEntry::Kind::kResync);
+        else assert(watch->Progress() == std::optional<FeedPosition>(position));
+        {
+            auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, "01000000");
+        }
+        const auto entry = feed_test::Next(*watch);
+        assert(entry->kind == FeedEntry::Kind::kChange && entry->position.revision > position.revision);
+        auto wrong = position; wrong.epoch[0] ^= 1U;
+        auto epoch = table->SubscribeFeed({.after = wrong});
+        assert(feed_test::Next(*epoch)->kind == FeedEntry::Kind::kResync);
+        auto future = table->SubscribeFeed({.after = FeedPosition{position.epoch, UINT64_MAX}});
+        assert(feed_test::Next(*future)->kind == FeedEntry::Kind::kResync);
+        if (position.revision != 0U) {
+            auto stale = table->SubscribeFeed({.after = FeedPosition{position.epoch, 0U}});
+            assert(feed_test::Next(*stale)->kind == FeedEntry::Kind::kResync);
+        }
+        if (old_position && old_position->revision < position.revision) {
+            auto old = table->SubscribeFeed({.after = old_position});
+            assert(feed_test::Next(*old)->kind == FeedEntry::Kind::kResync);
+        }
+    }
+}
 }
 int main(int argc, char** argv) {
     if (argc > 1) {
         if (std::string_view(argv[1]) == "--archive-budget") ArchiveEnforcesDecodedEntryBudget();
+        else if (std::string_view(argv[1]) == "--scan-continuation") ScanCutContinuesFirstWatch();
         else ThreeDimensionalBlockCoordinates();
         return 0;
     }
@@ -188,4 +240,5 @@ int main(int argc, char** argv) {
     ArchivePreservesMetadataRowsAndForms();
     BaselineInitializationAndSchemaRows();
     ArchiveEnforcesDecodedEntryBudget();
+    ScanCutContinuesFirstWatch();
 }

@@ -322,8 +322,6 @@ void ChangeFeed::ResumeImpl(ChunkStore& store) {
         watermark_ = floor_;
         drained_watermark_ = floor_;
         lineage_ = store.lineage();
-        initial_fork_proven_ = lineage_ && lineage_->fork_revision != UINT64_MAX &&
-            clock == lineage_->fork_revision + 1U && ceiling_ == clock;
     } else if (geometry_->layout().schema().version != store.geometry().layout().schema().version) {
         auto schema = std::make_shared<FeedEntry>();
         schema->kind = FeedEntry::Kind::kSchema;
@@ -741,16 +739,13 @@ std::unique_ptr<FeedSubscription> ChangeFeed::Subscribe(std::weak_ptr<Table> tab
     result->position_ = options.after.value_or(FeedPosition{epoch_, Watermark()});
     if (lineage_ && result->position_.epoch == lineage_->parent_epoch &&
         result->position_.revision <= lineage_->fork_revision) result->position_.epoch = epoch_;
-    const bool initial_fork = initial_fork_proven_ && result->position_.epoch == epoch_ &&
-        result->position_.revision == lineage_->fork_revision;
     result->reset_ = reset_;
-    result->invalid_ = (options.after.has_value() && !subscribed_ && !initial_fork) || result->position_.epoch != epoch_ || result->position_.revision >= ceiling_clock_->load(std::memory_order_acquire) ||
+    result->invalid_ = result->position_.epoch != epoch_ || result->position_.revision >= ceiling_clock_->load(std::memory_order_acquire) ||
         result->position_.revision < floor_ || result->position_.revision > Watermark();
     if (options.notify) {
         result->notify_ = std::make_shared<const std::function<void()>>(options.notify);
         notifications_.push_back(result->notify_);
     }
-    subscribed_ = true;
     result->chunks_ = options.chunks;
     if (options.chunks) chunk_watchers_.fetch_add(1U, std::memory_order_acq_rel);
     result->table_ = std::move(table);
