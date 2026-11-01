@@ -8,6 +8,7 @@
 #include <stdexcept>
 #include <string>
 
+#include "chunkdb/transaction_memory.hpp"
 #include "txn_block_stage.hpp"
 #include "txn_block_stage_allocation_guard.hpp"
 
@@ -490,6 +491,67 @@ void HistoryOutlivesTheTransactionAccount(bool retain) {
     scenario.first.state.vars.Assign({4U, 2U}, std::array<std::uint8_t, 1U>{9U});
 }
 
+void OwnedBudgetHistoryHandoff() {
+    for (const bool three : {false, true}) {
+        const auto geometry = Shape(three);
+        State state(geometry, {1, -2, three ? 3 : 0});
+        state.Put(geometry, 0U, Row(geometry, 1U, "original", true));
+        const auto before = state.Snapshot(geometry);
+        const auto metadata = state.state.chunk_columns->bytes;
+        const auto after = Row(geometry, 2U, "replacement", true);
+        TxnBlockDeltas journal(StoreId{1U}, geometry.layout(), std::pmr::get_default_resource());
+        journal.Publish(journal.Prepare({state.coord, 0U}, before, TxnBlockAction::kReplace, &after));
+        auto global = std::make_shared<TxnMemoryGlobal>(std::numeric_limits<std::size_t>::max());
+        auto budget = TxnMemoryBudget::Create(global, std::numeric_limits<std::size_t>::max());
+        const auto self = budget->bytes();
+        auto account = MakeTxnStorageAccount(budget);
+        const auto controls = budget->bytes();
+        assert(controls > self);
+        std::weak_ptr<ChunkStorageAccount> account_lifetime = account;
+        std::weak_ptr<TxnMemoryGlobal> global_lifetime = global;
+        auto history = std::make_shared<TxnHistory>(1024U * 1024U);
+        std::atomic<std::uint64_t> clock{8U};
+        auto snapshot = history->Register(history, clock, std::chrono::steady_clock::now() + std::chrono::minutes(1));
+        {
+            const std::array views{state.View()};
+            auto stage = PreparedTxnBlockStage::Prepare(journal, StoreId{1U}, geometry, views,
+                history, account, kVarMaxChunkBytesLimit);
+            assert(budget->bytes() > controls && global->bytes() == budget->bytes());
+            stage.BindHistoryTag(8U);
+            txn_block_allocation::Guard disabled(0U);
+            stage.Apply();
+            state.state.version = 8U;
+            state.state.commit_time_ms = 101U;
+            stage.Commit();
+        }
+        // Only the measured source ledger and shared-account control remain.
+        assert(budget->bytes() == controls && global->bytes() == controls);
+        assert(history->KeptCount() == 1U && history->KeptBytes() != 0U);
+        const auto retained = history->KeptBytes();
+        account.reset(); budget = {}; global.reset();
+        assert(account_lifetime.expired());
+        // A weak observer keeps the source shared control allocated, not the account object.
+        account_lifetime.reset();
+        assert(global_lifetime.expired());
+        {
+            txn_block_allocation::Guard disabled(0U);
+            assert(history->VisitAt(*snapshot, state.coord, [&](const TxnKeptState& kept) {
+                const auto view = kept.View();
+                assert(kept.physical && kept.bytes == retained);
+                assert(view.version == before.version && view.commit_time_ms == before.commit_time_ms && view.written == before.written);
+                assert(MatchesTxnBlockRow(geometry.layout(), view.payload, view.presence_bitmap, view.vars, 0U, before.row));
+                assert(view.metadata_bytes.size() == metadata.size() &&
+                    std::equal(view.metadata_bytes.begin(), view.metadata_bytes.end(), metadata.begin()));
+            }));
+            history->End(*snapshot);
+            assert(history->KeptCount() == 0U && history->KeptBytes() == 0U);
+        }
+        // Installed regular buffers still work after every source accounting owner ended.
+        assert(MatchesTxnBlockRow(geometry.layout(), state.state.payload, state.state.presence_bitmap, state.state.vars, 0U, after));
+        state.state.vars.Assign({4U, 2U}, std::array<std::uint8_t, 1U>{9U});
+    }
+}
+
 enum class MixedHistoryMode { kMeasure, kExact, kOneByteShort };
 std::array<std::size_t, 3U> MixedHistory(std::size_t limit, MixedHistoryMode mode) {
     const auto geometry = Shape(); State state(geometry);
@@ -745,6 +807,7 @@ int main() {
     ActualUpstreamAdmissionAndFailures(); SharedGlobalExactAdmission();
     PreparationFailureMatrix(); NonallocatingApplyAndReverseUndo();
     HistoryOutlivesTheTransactionAccount(true); HistoryOutlivesTheTransactionAccount(false);
+    OwnedBudgetHistoryHandoff();
     MixedLegacyAndPhysicalHistory();
     InitializationAndConflicts(); SparseDeleteAndCoalescedNulls(); HistoryTagAndOwnerBinding(); OriginalPolicyAdmission();
 }
