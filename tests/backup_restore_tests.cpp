@@ -16,6 +16,11 @@ void Records() {
     Fixture fixture;
     const auto bytes = SerializeBackupRecord(fixture.record);
     const auto record = ParseBackupRecord(bytes);
+    assert(SerializeBackupRecord(record) == bytes);
+#ifdef _WIN32
+    for (const auto& file : record.files)
+        assert(file.relative_path.native().find(L'/') == std::wstring::npos);
+#endif
     assert(record.tables.size() == 1U && record.tables[0].epoch == fixture.manifest.store_id && record.tables[0].revision == 3U);
     assert(record.files.size() == fixture.record.files.size());
     auto bad = bytes; bad.back() ^= 1U; Throws([&] { (void)ParseBackupRecord(bad); });

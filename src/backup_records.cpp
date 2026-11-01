@@ -148,10 +148,11 @@ std::filesystem::path ParseInventoryPath(const std::string& spelling) {
     // Check the marker's spelling before Windows converts native separators.
     if (spelling.find('\\') != std::string::npos || spelling.find('\0') != std::string::npos)
         throw std::runtime_error("invalid backup inventory path spelling");
-    const std::filesystem::path path(spelling);
+    std::filesystem::path path(spelling);
     RequireRelative(path);
     if (path.generic_string() != spelling)
         throw std::runtime_error("invalid backup inventory path spelling");
+    path.make_preferred();
     return path;
 }
 void ValidateRecord(const BackupRecord& record) {
