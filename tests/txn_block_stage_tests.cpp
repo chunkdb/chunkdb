@@ -54,6 +54,15 @@ struct Account final : ChunkStorageAccount {
     }
     ~Account() override { assert(bytes == 0U); }
 };
+struct ForeignUpstream final : std::pmr::memory_resource {
+    void* do_allocate(std::size_t bytes, std::size_t alignment) override {
+        return std::pmr::new_delete_resource()->allocate(bytes, alignment);
+    }
+    void do_deallocate(void* memory, std::size_t bytes, std::size_t alignment) override {
+        std::pmr::new_delete_resource()->deallocate(memory, bytes, alignment);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override { return this == &other; }
+};
 
 TableSchema BlockSchema() {
     TableSchema schema;
@@ -267,7 +276,10 @@ void ActualUpstreamAdmissionAndFailures() {
         assert(history->KeptBytes() == retained);
     }
     assert(account->bytes == 0U && account->global->bytes == 0U);
-    history->End(*snapshot); assert(history->KeptBytes() == 0U);
+    history->End(*snapshot);
+    assert(history->KeptBytes() == ChunkStoragePolicyAccess::ControlBytes());
+    original_policy = {};
+    assert(history->KeptBytes() == 0U);
     // End this observation; installed regular buffers retain normal ownership.
     requests.live = 0U;
 }
@@ -575,6 +587,7 @@ void MixedLegacyAndPhysicalHistory() {
 
 void InitializationAndConflicts() {
     auto geometry = Shape(); State state(geometry, {}, false);
+    state.state.chunk_columns.reset();
     auto before = state.Snapshot(geometry);
     auto replacement = Row(geometry, 3U, "first", true);
     TxnBlockDeltas journal(StoreId{1U}, geometry.layout(), std::pmr::get_default_resource());
@@ -654,10 +667,40 @@ void SparseDeleteAndCoalescedNulls() {
     }
 }
 
+void HistoryTagAndOwnerBinding() {
+    Scenario scenario;
+    Saved first(scenario.first), second(scenario.second);
+    auto account = std::make_shared<Account>(); auto history = std::make_shared<TxnHistory>(1024U * 1024U);
+    {
+        auto stage = scenario.Prepare(account, history);
+        const auto reject = [&](std::uint64_t tag) {
+            bool refused = false;
+            try { stage.BindHistoryTag(tag); } catch (const std::invalid_argument&) { refused = true; }
+            assert(refused);
+        };
+        reject(0U); reject(7U);
+        ++scenario.second.state.commit_time_ms;
+        reject(8U);
+        --scenario.second.state.commit_time_ms;
+        stage.BindHistoryTag(8U); reject(9U);
+    }
+    first.Same(scenario.first); second.Same(scenario.second);
+    assert(account->bytes == 0U && account->global->bytes == 0U);
+}
+
 void OriginalPolicyAdmission() {
     auto geometry = Shape(); State state(geometry);
     state.Put(geometry, 0U, Row(geometry, 1U, "a"));
     auto account = std::make_shared<Account>();
+    {
+        ForeignUpstream foreign;
+        auto foreign_policy = ChunkStoragePolicy::Create(account, &foreign);
+        auto foreign_vars = ChunkVarsStorageAccess::Clone(state.state.vars, foreign_policy);
+        foreign_policy->TransferToRegularStorage();
+        bool rejected = false;
+        try { TxnOriginalVariables::Validate(foreign_vars); } catch (const std::invalid_argument&) { rejected = true; }
+        assert(rejected && account->bytes == 0U);
+    }
     {
         auto empty_policy = ChunkStoragePolicy::Create(account);
         auto empty = ChunkVarsStorageAccess::Clone(ChunkVars{}, empty_policy);
@@ -703,5 +746,5 @@ int main() {
     PreparationFailureMatrix(); NonallocatingApplyAndReverseUndo();
     HistoryOutlivesTheTransactionAccount(true); HistoryOutlivesTheTransactionAccount(false);
     MixedLegacyAndPhysicalHistory();
-    InitializationAndConflicts(); SparseDeleteAndCoalescedNulls(); OriginalPolicyAdmission();
+    InitializationAndConflicts(); SparseDeleteAndCoalescedNulls(); HistoryTagAndOwnerBinding(); OriginalPolicyAdmission();
 }
