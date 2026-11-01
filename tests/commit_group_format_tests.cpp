@@ -23,6 +23,9 @@ namespace allocation {
 std::atomic<bool> active{false};
 std::atomic<std::size_t> limit{65536U}, largest{0U};
 }
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
 void* operator new(std::size_t bytes) {
     if (allocation::active.load(std::memory_order_relaxed)) {
         auto previous = allocation::largest.load(std::memory_order_relaxed);
