@@ -48,23 +48,12 @@ std::uint64_t StreamBytes(std::istream& input, const std::filesystem::path& path
     return static_cast<std::uint64_t>(size);
 }
 
-struct FileChecksum { std::uint64_t bytes; std::uint32_t crc; };
+struct FileChecksum { std::uint64_t bytes; crypto::Sha256Digest digest; };
 FileChecksum ChecksumFile(const std::filesystem::path& path) {
     SharedFileInput input(path);
     if (!input) throw std::runtime_error("failed to open index file " + path.string());
     const auto bytes = StreamBytes(input, path);
-    std::array<std::uint8_t, 4096U> buffer{};
-    auto remaining = bytes;
-    std::uint32_t crc = Crc32(nullptr, 0U);
-    while (remaining != 0U) {
-        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, buffer.size()));
-        input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(count));
-        if (input.gcount() != static_cast<std::streamsize>(count))
-            throw std::runtime_error("failed to read index checksum " + path.string());
-        crc = Crc32Extend(crc, buffer.data(), count);
-        remaining -= count;
-    }
-    return {bytes, crc};
+    return {bytes, IndexFileDigest(input, bytes)};
 }
 
 bool MatchesReplacement(const std::filesystem::path& path, const IndexInventoryEntry& entry) {
@@ -74,7 +63,7 @@ bool MatchesReplacement(const std::filesystem::path& path, const IndexInventoryE
     if (ec || !std::filesystem::is_regular_file(status))
         throw std::runtime_error("invalid compaction index file " + path.string());
     const auto file = ChecksumFile(path);
-    return file.bytes == entry.replacement_bytes && file.crc == entry.replacement_crc32;
+    return file.bytes == entry.replacement_bytes && file.digest == entry.replacement_sha256;
 }
 
 void CopyPrefix(std::istream& input, std::uint64_t size, const AtomicFileSink& sink) {
@@ -277,7 +266,7 @@ void ChunkCoordinateIndex::CompleteRecovery() {
                 SyncDirectoryPath(LogPath(coord).parent_path());
                 entry.committed_bytes = entry.replacement_bytes;
                 entry.replacement_bytes = 0U;
-                entry.replacement_crc32 = 0U;
+                entry.replacement_sha256 = {};
             } else if (shard.observed_bytes > entry.committed_bytes) {
                 RewritePrefix(LogPath(coord), entry.committed_bytes);
                 shard.observed_bytes = entry.committed_bytes;
@@ -580,7 +569,7 @@ void ChunkCoordinateIndex::Compact(std::uint64_t before, std::uint64_t completed
             SyncDirectoryPath(StagePath(coord).parent_path());
             const auto checksum = ChecksumFile(StagePath(coord));
             shard.inventory.replacement_bytes = checksum.bytes;
-            shard.inventory.replacement_crc32 = checksum.crc;
+            shard.inventory.replacement_sha256 = checksum.digest;
         }
         Crash("CHUNKDB_FAILPOINT_CRASH_INDEX_COMPACTION_AFTER_STAGE_DIRECTORY_SYNC_ONCE");
         std::vector<IndexInventoryEntry> entries;
@@ -597,7 +586,7 @@ void ChunkCoordinateIndex::Compact(std::uint64_t before, std::uint64_t completed
             SyncDirectoryPath(LogPath(coord).parent_path());
             shard.inventory.committed_bytes = shard.inventory.replacement_bytes;
             shard.inventory.replacement_bytes = 0U;
-            shard.inventory.replacement_crc32 = 0U;
+            shard.inventory.replacement_sha256 = {};
         }
         Crash("CHUNKDB_FAILPOINT_CRASH_INDEX_COMPACTION_AFTER_DIRECTORY_SYNC_ONCE");
         entries.clear();

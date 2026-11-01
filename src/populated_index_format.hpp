@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "crypto.hpp"
 
 namespace chunkdb {
 
@@ -72,8 +73,12 @@ struct IndexInventoryEntry {
     std::uint64_t committed_bytes = 0;
     // Nonzero only in a pending compaction; binds the complete staged image.
     std::uint64_t replacement_bytes = 0;
-    std::uint32_t replacement_crc32 = 0;
+    crypto::Sha256Digest replacement_sha256{};
 };
+
+// Hash exact borrowed bytes with fixed storage; structure/context admission is
+// separate. The stream starts at zero and must end at the measured extent.
+[[nodiscard]] crypto::Sha256Digest IndexFileDigest(std::istream& input, std::uint64_t file_bytes);
 
 // Count is a u64, with no fixed shard-count ceiling. Reject length overflow
 // before reading/allocating coordinate entries.

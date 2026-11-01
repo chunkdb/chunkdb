@@ -84,7 +84,10 @@ void RequireInventoryEntry(const IndexInventoryHeader& header, const IndexInvent
     if (header.compaction_pending) {
         if (!whole_log(entry.replacement_bytes))
             throw std::invalid_argument("index inventory replacement boundary is not a whole log");
-    } else if (entry.replacement_bytes != 0U || entry.replacement_crc32 != 0U) {
+        if (std::all_of(entry.replacement_sha256.begin(), entry.replacement_sha256.end(), [](auto byte) { return byte == 0U; }))
+            throw std::invalid_argument("index inventory replacement digest is missing");
+    } else if (entry.replacement_bytes != 0U ||
+        std::any_of(entry.replacement_sha256.begin(), entry.replacement_sha256.end(), [](auto byte) { return byte != 0U; })) {
         throw std::invalid_argument("index inventory has an undecided replacement");
     }
 }
@@ -261,9 +264,24 @@ CheckedChunkIndexLog ReadChunkIndexLog(
     return log;
 }
 
+crypto::Sha256Digest IndexFileDigest(std::istream& input, std::uint64_t file_bytes) {
+    if (file_bytes > std::numeric_limits<std::uint64_t>::max() / 8U)
+        throw std::invalid_argument("index file exceeds the SHA-256 message length");
+    crypto::Sha256 digest;
+    std::array<std::uint8_t, 65536> bytes{};
+    while (file_bytes != 0U) {
+        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(file_bytes, bytes.size()));
+        ReadExact(input, std::span(bytes).first(count));
+        digest.Update(std::span(bytes).first(count));
+        file_bytes -= count;
+    }
+    RequireEnd(input);
+    return digest.Finish();
+}
+
 std::uint64_t IndexInventoryFileBytes(const IndexInventoryHeader& header) {
     RequireInventory(header);
-    const auto entry_bytes = static_cast<std::uint64_t>(8U * header.dims + 24U);
+    const auto entry_bytes = static_cast<std::uint64_t>(8U * header.dims + 48U);
     if (header.count > (std::numeric_limits<std::uint64_t>::max() - 64U) / entry_bytes)
         throw std::invalid_argument("index inventory length overflows");
     return 64U + header.count * entry_bytes;
@@ -275,7 +293,7 @@ IndexInventoryHeader ParseInventoryHeader(std::span<const std::uint8_t> fixed,
     if (file_bytes < 64U) throw std::invalid_argument("index inventory is truncated");
     if (fixed[0] != 'C' || fixed[1] != 'K' || fixed[2] != 'I' || fixed[3] != 'I')
         throw std::invalid_argument("not a CKII index inventory");
-    if (ReadLe(fixed.data() + 4, 2) != 3) throw std::invalid_argument("unsupported index inventory version");
+    if (ReadLe(fixed.data() + 4, 2) != 4) throw std::invalid_argument("unsupported index inventory version");
     if (fixed[6] != geometry.dims() || fixed[7] > 1)
         throw std::invalid_argument("index inventory dimensions or flags are invalid");
     if (!std::equal(table_id.begin(), table_id.end(), fixed.begin() + 8))
@@ -308,20 +326,18 @@ IndexInventoryHeader ReadIndexInventory(
     const auto header = ParseInventoryHeader(fixed, file_bytes, geometry, table_id);
     auto crc = Crc32(fixed.data(), fixed.size());
     LargeChunkCoord previous;
-    std::array<std::uint8_t, 48> entry{};
+    std::array<std::uint8_t, 72> entry{};
     const auto fields = 8U * header.dims;
-    const auto active_entry = std::span(entry).first(fields + 24U);
+    const auto active_entry = std::span(entry).first(fields + 48U);
     for (std::uint64_t i = 0; i < header.count; ++i) {
         ReadExact(input, active_entry);
         crc = Crc32Extend(crc, active_entry.data(), active_entry.size());
         const auto coord = ReadCoord(entry.data(), header.dims);
         if (i != 0 && !(previous < coord))
             throw std::invalid_argument("index inventory coordinates must be unique and increasing");
-        if (ReadLe(entry.data() + fields + 20U, 4) != 0U)
-            throw std::invalid_argument("index inventory entry reserved field is nonzero");
-        const IndexInventoryEntry parsed{coord, ReadLe(entry.data() + fields, 8),
-            ReadLe(entry.data() + fields + 8U, 8),
-            static_cast<std::uint32_t>(ReadLe(entry.data() + fields + 16U, 4))};
+        IndexInventoryEntry parsed{coord, ReadLe(entry.data() + fields, 8), ReadLe(entry.data() + fields + 8U, 8)};
+        std::copy_n(entry.begin() + static_cast<std::ptrdiff_t>(fields + 16U), parsed.replacement_sha256.size(),
+            parsed.replacement_sha256.begin());
         RequireInventoryEntry(header, parsed);
         if (candidate) candidate(parsed);
         previous = coord;
@@ -353,7 +369,7 @@ void WriteIndexInventory(
     std::vector<std::uint8_t> fixed;
     fixed.reserve(60);
     fixed.insert(fixed.end(), {'C', 'K', 'I', 'I'});
-    WriteLe(&fixed, 3, 2);
+    WriteLe(&fixed, 4, 2);
     fixed.push_back(header.dims);
     fixed.push_back(header.compaction_pending ? 1 : 0);
     fixed.insert(fixed.end(), header.table_id.begin(), header.table_id.end());
@@ -365,14 +381,13 @@ void WriteIndexInventory(
     auto crc = Crc32(fixed);
     WriteExact(output, fixed);
     std::vector<std::uint8_t> entry;
-    entry.reserve(48);
+    entry.reserve(72);
     for (const auto& shard : entries) {
         entry.clear();
         WriteCoord(&entry, shard.coord, header.dims);
         WriteLe(&entry, shard.committed_bytes, 8);
         WriteLe(&entry, shard.replacement_bytes, 8);
-        WriteLe(&entry, shard.replacement_crc32, 4);
-        WriteLe(&entry, 0, 4);
+        entry.insert(entry.end(), shard.replacement_sha256.begin(), shard.replacement_sha256.end());
         crc = Crc32Extend(crc, entry.data(), entry.size());
         WriteExact(output, entry);
     }
