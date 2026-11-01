@@ -141,7 +141,11 @@ A resurrection segment uses its own retained-empty base and cannot replace a pre
 Rejected or undecided transaction frames never enter sealed archives.
 
 Backup pins the complete inventory, index logs and committed image/WAL prefixes at one table cut under maintenance admission.
+The maintenance pin excludes collection until immutable inventory bytes and every listed committed log prefix have been linked into private staging.
+Unpublished log suffixes are excluded, pending compaction is refused, and every retained producing revision must be at or below the table cut.
+Private validation replays WALs over their checked image or retained-empty baseline, including chunk-column schema history.
 Restore validates the complete backup before publication and rewrites identities and checksums while preserving producing versions and times.
+The restored inventory and every listed log receive the new table identity before the table manifest is published, preserving deletion floors and committed boundaries.
 The restored clock exceeds every recovered image, WAL and tombstone revision.
 Verification independently checks dimensions, placement, identities, schemas, checksums, index transitions, tombstone overlaps and backup cuts without repairing data.
 
