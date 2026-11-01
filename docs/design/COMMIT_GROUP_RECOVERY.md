@@ -11,6 +11,7 @@ The directory owns `chunkdb.groups.owner`, a checked publication root, and immut
 Object names are derived from their complete raw SHA-256, and references additionally bind the exact byte length and object kind.
 Every object binds the directory identity and has a checked header, exact extent, reserved-zero fields and complete-record checksum.
 The root binds its nonwrapping generation, the coverage-tree root, retained-group reference-tree root, selected certified journal inventory and selected retained-ID inventory by identity, generation, exact length and raw SHA-256.
+The reference-tree checkpoint also binds its own complete journal replay cursor and raw-prefix proof, independently of the possibly later certified cut.
 It also binds the counter owner and minimum required reservation ceiling; the independently admitted current ceiling cannot be lower.
 A checked INACTIVE root instead has zero selected-object references and certifies that grouped frames have never been authorized; ACTIVE roots contain the complete selected contexts and never revert to INACTIVE.
 A pending root additionally binds the exact previous root and a complete replacement plan; a final root has no pending plan.
@@ -90,7 +91,8 @@ Its logical states and prepared live references are published together under the
 The coordinator's admitted complete decision suffix and pinned native generations own these references until a later durable cut captures or retires them.
 Neither registering that live group nor retaining its volatile ID outcome forces a new owner or reference-root transition.
 
-Startup first admits selected durable roots, then streams the complete checked journal suffix and globally discovered WAL members into its private plan before reconstructing live references.
+Startup first admits selected durable roots, then streams every not-yet-retired checked decision and globally discovered WAL member into its private plan before reconstructing live references.
+Decisions after the reference-tree replay cursor remain implicit live owners even when a later certificate already covers their journal bytes.
 An uncertified complete decision contributes only after its whole group passes admission; an absent or crash-shaped incomplete relaxed outcome instead removes its entire dependent live ownership through the global rollback plan.
 A newer lost or rolled-back ID incarnation leaves the retired earlier incarnation absent.
 Durable metadata cuts may include a relaxed decision without a member-durability receipt, so a retained reference alone is never a durable-member proof.
@@ -145,7 +147,7 @@ It writes a new journal generation and an ID inventory whose cursor is the end o
 It cannot copy an old cursor numerically into a different generation or replay an old retired incarnation to fill an absent key.
 
 All new journal bytes, certified inventory, rewritten ID inventory and names are durable before publishing a pending owner root.
-The pending plan binds the complete old and new selected journal and ID contexts together, including their prefix digests and last complete record identities.
+The pending plan binds the complete old and new selected journal, ID and reference-tree replay contexts together, including their prefix digests and last complete record identities.
 While pending, new group publication and ID mutation remain excluded and readers cannot choose a mixture of old and new roots.
 Recovery admits both complete contexts and the exact transition before completing installation of the new owner root.
 It never passes an old ID context to the new journal's cursor validator or treats an old pinned file as permission to fall back.
@@ -210,6 +212,7 @@ A live journal decision can retire only after all changed and observed members h
 Current producer references keep that group and its full membership available even if another member has since been overwritten.
 After all current producer, feed, ID, rollback and transition owners are gone, its covered references can be removed from leaves in a checked batch.
 The final batch publishes a reference root that no longer names the incarnation before deleting its seal, capsules or last journal source.
+Reclamation never passes that reference checkpoint's admitted replay cursor or omits an implicit owner from a newer complete decision.
 A bounded streamed mark plan prepares those changed paths; deleting a seal never discovers or rewrites the directory opportunistically.
 An interrupted cleanup resumes from the exact admitted cut and cannot fall back to an older ID generation or revive a retired group.
 
