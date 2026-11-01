@@ -492,6 +492,44 @@ void ReparseInventoryAndRestore() {
     std::filesystem::rename(original, fixture.Table());
     assert(Verify(fixture.backup).errors == 0U);
 }
+void BackupSourceDirectoryReplacement() {
+#ifdef _WIN32
+    Fixture fixture;
+    const auto source = fixture.root / "live-source", target = fixture.root / "source-swap-backup";
+    RestoreBackup(fixture.backup, source);
+    const auto outside = fixture.root / "source-swap-outside", moved = fixture.root / "source-swap-moved";
+    std::filesystem::create_directory(outside);
+    Save(outside / "sentinel", Bytes{'s'});
+    const auto shard = source / "tables/default/L_0_0";
+    struct Replace final : BackupTestHook {
+        std::filesystem::path shard, moved, outside;
+        std::unique_ptr<test::ScopedDirectoryAlias> alias;
+        void Run(Point point, std::string_view, std::uint64_t) override {
+            if (point != Point::kBeforeSourceDirectoryOpen || alias) return;
+            std::filesystem::rename(shard, moved);
+            alias = std::make_unique<test::ScopedDirectoryAlias>(outside, shard);
+        }
+    } replace;
+    replace.shard = shard; replace.moved = moved; replace.outside = outside;
+    CatalogConfig config; config.data_dir = source; config.background_maintenance = false;
+    TableCatalog catalog(config);
+    catalog.SetBackupHookForTests(&replace);
+    bool refused = false;
+    try { (void)catalog.BackupTo(target, {}); }
+    catch (const std::filesystem::filesystem_error& failure) { refused = failure.path1() == shard; }
+    catalog.SetBackupHookForTests(nullptr);
+    assert(replace.alias && refused);
+    assert(!std::filesystem::exists(target / kBackupMarkerName));
+    assert(std::filesystem::exists(target / kBackupIncompleteName));
+    assert(LoadFile(outside / "sentinel") == Bytes{'s'});
+    for (const auto& entry : backup_detail::DirectoryEntries(outside)) assert(entry.path().filename() == "sentinel");
+    assert(!replace.alias->Remove());
+    std::filesystem::rename(moved, shard);
+    const auto recovered = fixture.root / "source-swap-recovered";
+    (void)catalog.BackupTo(recovered, {});
+    assert(Verify(recovered).errors == 0U);
+#endif
+}
 void ExtendedRootPaths() {
 #ifdef _WIN32
     Fixture fixture;
@@ -575,6 +613,7 @@ int main(int argc, char** argv) {
         else if (name == "symlinks") SymlinkedRootsAndStaging();
         else if (name == "roots") { RootedTargets(); InventoryPathSpellings(); }
         else if (name == "reparse") ReparseInventoryAndRestore();
+        else if (name == "source-reparse") BackupSourceDirectoryReplacement();
         else if (name == "extended") ExtendedRootPaths();
         else return 2;
         return 0;
@@ -589,6 +628,7 @@ int main(int argc, char** argv) {
     run("completion failures", CompletionFailures); run("temporary cleanup", RestoreTemporaryCleanup);
     run("cold WAL", CrashConsistentWal); run("root aliases", SymlinkedRootsAndStaging);
     run("rooted targets", RootedTargets); run("inventory paths", InventoryPathSpellings);
-    run("inventory reparse", ReparseInventoryAndRestore); run("extended roots", ExtendedRootPaths);
-    std::cout << "14 backup restore groups passed\n";
+    run("inventory reparse", ReparseInventoryAndRestore); run("source directory replacement", BackupSourceDirectoryReplacement);
+    run("extended roots", ExtendedRootPaths);
+    std::cout << "17 backup restore groups passed\n";
 }
