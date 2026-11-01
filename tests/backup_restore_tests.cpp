@@ -536,6 +536,19 @@ void ExtendedRootPaths() {
     RestoreBackup(fixture.backup, restored);
     test::FeedPhaseWatchdog::Phase("extended roots: verify");
     assert(Verify(restored).errors == 0U);
+    const auto copied = root / "completed-source";
+    test::FeedPhaseWatchdog::Phase("extended roots: copy completed source");
+    PrepareBackupTarget(fixture.source, copied);
+    for (const auto& file : fixture.record.files) {
+        const auto copy = CopyBackupFile(fixture.backup / file.relative_path, copied, file.relative_path, file.size);
+        assert(copy.crc32 == file.crc32);
+    }
+    CompleteBackup(copied, fixture.record);
+    assert(Verify(copied).errors == 0U);
+    const auto from_extended = root / "restored-from-extended-source";
+    test::FeedPhaseWatchdog::Phase("extended roots: restore completed source");
+    RestoreBackup(copied, from_extended);
+    assert(Verify(from_extended).errors == 0U);
     auto overlap = std::filesystem::path(L"\\\\?\\" + fixture.source.wstring());
     overlap /= std::string(200U, 'y');
     Throws<std::invalid_argument>([&] { RequireBackupTarget(fixture.source, overlap); });

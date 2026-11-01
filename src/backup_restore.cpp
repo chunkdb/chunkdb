@@ -75,7 +75,11 @@ std::vector<std::uint8_t> RecoverWal(const std::filesystem::path& path, const Ge
 } // namespace
 void RestoreBackup(const std::filesystem::path& source, const std::filesystem::path& destination) {
     RequireBackupTarget(source, destination);
+#ifdef _WIN32
+    const auto backup = CanonicalBackupPath(source);
+#else
     const auto backup = std::filesystem::canonical(source);
+#endif
     const auto target = CanonicalBackupPath(destination);
     auto record = ReadBackupRecord(backup);
     ValidateBackupInventory(backup, record);

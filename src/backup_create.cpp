@@ -1,4 +1,5 @@
 #include "backup.hpp"
+#include "backup_directory.hpp"
 
 #include <chrono>
 #include <fstream>
@@ -144,7 +145,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             }
             static const std::regex large_name(R"(^L_(-?[0-9]+)_(-?[0-9]+)$)");
             static const std::regex chunk_name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.(chk|wal)$)");
-            for (const auto& large : std::filesystem::directory_iterator(store.data_dir_)) {
+            for (const auto& large : backup_detail::DirectoryEntries(store.data_dir_)) {
                 std::smatch match;
                 const auto name = large.path().filename().string();
                 if (!std::regex_match(name, match, large_name)) continue;
@@ -178,7 +179,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                 if (std::filesystem::exists(directory)) {
                     if (!std::filesystem::is_directory(std::filesystem::symlink_status(directory)))
                         throw std::runtime_error("unsafe backup chunk directory: " + directory.string());
-                    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+                    for (const auto& entry : backup_detail::DirectoryEntries(directory)) {
                         std::smatch match;
                         const auto name = entry.path().filename().string();
                         if (!std::regex_match(name, match, chunk_name)) continue;
@@ -210,7 +211,11 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                                             ChunkWalPath(store.data_dir_, store.geometry_, coord)}) {
                         if (!std::filesystem::exists(path)) continue;
                         const auto bytes = std::filesystem::file_size(path);
+#ifdef _WIN32
+                        link(path, table_root / path.lexically_relative(store.data_dir_), bytes, bytes);
+#else
                         link(path, table_root / std::filesystem::relative(path, store.data_dir_), bytes, bytes);
+#endif
                     }
                 }
             }
