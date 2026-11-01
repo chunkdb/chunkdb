@@ -81,6 +81,7 @@ void Ref(const CommitOwnerObjectRef& ref) {
     switch (ref.kind) {
         case CommitOwnerObjectKind::kRoot: low = high = kCommitOwnerRootBytes; break;
         case CommitOwnerObjectKind::kPage: low = kCommitOwnerEmptyPageBytes; break;
+        case CommitOwnerObjectKind::kMemberValue: low = high = kCommitOwnerMemberBytes; break;
         case CommitOwnerObjectKind::kJournalInventory: low = high = kCommitJournalInventoryBytes; break;
         case CommitOwnerObjectKind::kIdInventory: low = 164U; high = kMaxCommitIdInventoryBytes; break;
         default: break;
@@ -202,6 +203,19 @@ void CounterSuccessor(const CommitOwnerRoot& before, const CommitOwnerRoot& afte
     if ((!Zero(before.counter_owner) && before.counter_owner != after.counter_owner) ||
         after.counter_ceiling < before.counter_ceiling) Bad("counter ownership regression");
 }
+void MemberValue(const CommitOwnerMemberValue& value) {
+    Scope(value.scope); Identity(value.group_id); Identity(value.coverage.table_epoch);
+    if (value.generation == 0U || Zero(value.decision_sha256) || value.member_count == 0U ||
+        value.ordinal >= value.member_count) Bad("covered member identity or ordinal");
+    if ((value.coverage.dims != 2U && value.coverage.dims != 3U) ||
+        (value.coverage.dims == 2U && value.coverage.coord.z != 0)) Bad("covered member dimensions");
+    if (value.kind == CommitGroupMemberKind::kChanged) {
+        if (value.revision == 0U || value.schema_version == 0U) Bad("covered changed identity");
+    } else if (value.kind == CommitGroupMemberKind::kObserved) {
+        if (value.revision == 0U ? value.commit_time_ms != 0U || value.schema_version != 0U :
+            value.schema_version == 0U) Bad("covered observed identity");
+    } else Bad("covered member kind");
+}
 void Plan(const CommitOwnerPlanProof& plan, const CommitOwnerScope& scope) {
     Scope(plan.scope); Root(plan.previous); Root(plan.target);
     Kind(plan.plan, CommitOwnerObjectKind::kReplacementPlan); Kind(plan.previous_root, CommitOwnerObjectKind::kRoot);
@@ -257,6 +271,8 @@ CommitOwnerHeader InspectCommitOwnerHeader(Bytes bytes, const CommitOwnerScope& 
         if (header.bytes != kCommitOwnerRootBytes) Bad("root extent");
     } else if (header.kind == CommitOwnerObjectKind::kPage) {
         if (header.bytes < kCommitOwnerEmptyPageBytes || header.bytes > kMaxCommitOwnerPageBytes) Bad("page extent");
+    } else if (header.kind == CommitOwnerObjectKind::kMemberValue) {
+        if (header.bytes != kCommitOwnerMemberBytes) Bad("covered member extent");
     } else Bad("unsupported owner envelope kind");
     return header;
 }
@@ -417,5 +433,50 @@ CommitOwnerMemberKey DecodeCommitOwnerMemberKey(Bytes bytes) {
     if (bytes.size() != 24U) Bad("member key extent");
     CommitOwnerMemberKey key;
     std::copy_n(bytes.begin(), 16U, key.group_id.begin()); Identity(key.group_id); key.ordinal = BigEndian(bytes.subspan(16U)); return key;
+}
+std::array<std::uint8_t, kCommitOwnerMemberBytes> SerializeCommitOwnerMember(const CommitOwnerMemberValue& value) {
+    MemberValue(value);
+    std::array<std::uint8_t, kCommitOwnerMemberBytes> bytes{}; Writer writer(bytes);
+    Header(writer, CommitOwnerObjectKind::kMemberValue, value.scope, value.generation, bytes.size());
+    writer.Put(value.group_id); writer.Put(value.decision_sha256);
+    writer.UInt(value.ordinal, 8U); writer.UInt(value.member_count, 8U); writer.Put(value.coverage.table_epoch);
+    writer.UInt(value.coverage.dims, 1U); writer.UInt(static_cast<std::uint8_t>(value.kind), 1U); writer.Zeros(6U);
+    for (const auto coordinate : {value.coverage.coord.x, value.coverage.coord.y, value.coverage.coord.z})
+        writer.UInt(std::bit_cast<std::uint64_t>(coordinate), 8U);
+    writer.UInt(value.revision, 8U); writer.UInt(value.commit_time_ms, 8U); writer.UInt(value.schema_version, 8U);
+    Crc(bytes, 60U); Crc(bytes, bytes.size() - 4U); return bytes;
+}
+CommitOwnerMemberValue ParseCommitOwnerMember(Bytes bytes, const CommitOwnerScope& scope,
+    std::uint64_t selecting_generation) {
+    if (bytes.size() != kCommitOwnerMemberBytes) Bad("covered member extent");
+    const auto header = InspectCommitOwnerHeader(bytes.first(kCommitOwnerHeaderBytes), scope,
+        CommitOwnerObjectKind::kMemberValue, selecting_generation);
+    CheckCrc(bytes, bytes.size() - 4U); Reader reader(bytes.subspan(kCommitOwnerHeaderBytes));
+    CommitOwnerMemberValue value; value.scope = header.scope; value.generation = header.generation;
+    value.group_id = reader.Array<16U>(); value.decision_sha256 = reader.Array<32U>();
+    value.ordinal = reader.UInt(8U); value.member_count = reader.UInt(8U); value.coverage.table_epoch = reader.Array<16U>();
+    value.coverage.dims = static_cast<std::uint8_t>(reader.UInt(1U));
+    value.kind = static_cast<CommitGroupMemberKind>(reader.UInt(1U)); reader.Zeros(6U);
+    value.coverage.coord.x = std::bit_cast<std::int64_t>(reader.UInt(8U));
+    value.coverage.coord.y = std::bit_cast<std::int64_t>(reader.UInt(8U));
+    value.coverage.coord.z = std::bit_cast<std::int64_t>(reader.UInt(8U));
+    value.revision = reader.UInt(8U); value.commit_time_ms = reader.UInt(8U); value.schema_version = reader.UInt(8U);
+    MemberValue(value); return value;
+}
+void ValidateCommitOwnerMemberBinding(const CommitOwnerMemberValue& value, const CommitOwnerMemberKey& key,
+    const CommitOwnerCoverageKey& coverage, const CommitGroupDecision& decision,
+    const crypto::Sha256Digest& measured_decision_sha256) {
+    MemberValue(value);
+    (void)EncodeCommitOwnerMemberKey(key); (void)EncodeCommitOwnerCoverageKey(coverage);
+    if (key.group_id != value.group_id || key.ordinal != value.ordinal || coverage != value.coverage)
+        Bad("covered member key binding");
+    if (decision.directory_id != value.scope.directory_id || decision.id != value.group_id ||
+        measured_decision_sha256 != value.decision_sha256 || decision.members.size() != value.member_count)
+        Bad("covered member decision binding");
+    const auto& member = decision.members[static_cast<std::size_t>(value.ordinal)];
+    if (member.table_epoch != value.coverage.table_epoch || member.dims != value.coverage.dims ||
+        member.coord != value.coverage.coord || member.kind != value.kind || member.revision != value.revision ||
+        member.commit_time_ms != value.commit_time_ms || member.schema_version != value.schema_version)
+        Bad("covered member producing binding");
 }
 }  // namespace chunkdb
