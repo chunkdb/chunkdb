@@ -2,6 +2,7 @@
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <mutex>
@@ -24,6 +25,8 @@
 #include "store_manifest.hpp"
 #include "wal_replay.hpp"
 #include "verify.hpp"
+#include "directory_alias_test_utils.hpp"
+#include "backup_windows_path.hpp"
 
 namespace chunkdb {
 struct BackupTestAccess {
@@ -518,10 +521,8 @@ void ColdPinAndStagingAlias() {
         }
     }
     TableCatalog catalog(Config(source));
-#ifndef _WIN32
     std::filesystem::create_directory(root / "stage");
-    std::filesystem::create_directory_symlink(root / "stage", source / kBackupStagingName);
-#endif
+    test::CreateDirectoryAlias(root / "stage", source / kBackupStagingName);
     auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
     const auto loaded = store.RuntimeStats().unique_loaded_chunks;
     const auto registered = BackupTestAccess::LargeRegistrySize(store);
@@ -603,10 +604,8 @@ void CleanupWarningAndAliasRestart() {
     {
         TableCatalog catalog(Config(source));
         (void)feed_test::CreateDefault(catalog);
-#ifndef _WIN32
         std::filesystem::create_directory(root / "stage");
-        std::filesystem::create_directory_symlink(root / "stage", source / kBackupStagingName);
-#endif
+        test::CreateDirectoryAlias(root / "stage", source / kBackupStagingName);
         std::filesystem::create_directories(source / kBackupStagingName);
         std::ofstream(source / kBackupStagingName / "foreign") << "retain";
         { auto lease = catalog.Find("default")->Acquire(); WriteCounter(lease->store(), {0, 0}, 11); }
@@ -626,6 +625,62 @@ void CleanupWarningAndAliasRestart() {
         auto lease = catalog.Find("default")->Acquire(); assert(ReadCounter(lease->store(), {0, 0}) == 11U);
     }
 }
+void StagingCleanupAliasReplacement() {
+    ScopedTempDir temp("chunkdb-backup-staging-cleanup-alias");
+    const auto root = std::filesystem::canonical(temp.path());
+    const auto source = root / "source";
+    const auto identity = NewStoreId();
+    const auto stage = source / kBackupStagingName / (StoreIdHex(identity) + "." + StoreIdHex(NewStoreId()));
+    const auto retained = root / "retained";
+    const auto outside = root / "outside";
+    SaveBytes(stage / "keep", {'s'});
+    SaveBytes(outside / "keep", {'o'});
+    bool replaced = false;
+    struct ResetLog { ~ResetLog() { ResetLogSinkForTests(); } } reset;
+    SetLogSinkForTests([&](const std::string& line) {
+        if (!replaced && line.find("removing interrupted backup staging") != std::string::npos) {
+            std::filesystem::rename(stage, retained);
+            test::CreateDirectoryAlias(outside, stage);
+            replaced = true;
+        }
+    });
+    RemoveOrphanedBackupStaging(source, identity);
+    ResetLogSinkForTests();
+    assert(replaced);
+    assert(LoadFile(outside / "keep") == std::vector<std::uint8_t>{'o'});
+    assert(LoadFile(retained / "keep") == std::vector<std::uint8_t>{'s'});
+}
+
+void StagingCleanupRootReplacement() {
+#ifdef _WIN32
+    ScopedTempDir temp("chunkdb-backup-staging-cleanup-root");
+    const auto root = std::filesystem::canonical(temp.path());
+    const auto source = root / "source";
+    const auto staging = source / kBackupStagingName;
+    const auto identity = NewStoreId();
+    const auto name = StoreIdHex(identity) + "." + StoreIdHex(NewStoreId());
+    const auto retained = root / "retained";
+    const auto outside = root / "outside";
+    SaveBytes(staging / name / "keep", {'s'});
+    SaveBytes(outside / name / "keep", {'o'});
+    bool attempted = false, replaced = false;
+    struct ResetLog { ~ResetLog() { ResetLogSinkForTests(); } } reset;
+    SetLogSinkForTests([&](const std::string& line) {
+        if (!attempted && line.find("removing interrupted backup staging") != std::string::npos) {
+            attempted = true;
+            std::error_code error;
+            std::filesystem::rename(staging, retained, error);
+            if (!error) { test::CreateDirectoryAlias(outside, staging); replaced = true; }
+        }
+    });
+    RemoveOrphanedBackupStaging(source, identity);
+    ResetLogSinkForTests();
+    assert(attempted);
+    assert(LoadFile(outside / name / "keep") == std::vector<std::uint8_t>{'o'});
+    if (replaced) assert(LoadFile(retained / name / "keep") == std::vector<std::uint8_t>{'s'});
+#endif
+}
+
 void OrphanedStagingCleanup() {
     ScopedTempDir temp("chunkdb-backup-orphaned-staging");
     const auto root = std::filesystem::canonical(temp.path());
@@ -657,9 +712,7 @@ void OrphanedStagingCleanup() {
         SaveBytes(staging / "foreign" / "keep", {'f'});
         published = owned(); SaveBytes(published / kBackupMarkerName, {'p'});
         guarded = owned(); SaveBytes(guarded / kBackupIncompleteName, {'C', 'K', 'B', 'I'});
-#ifndef _WIN32
-        std::filesystem::create_directory_symlink(root / "outside", owned());
-#endif
+        test::CreateDirectoryAlias(root / "outside", owned());
         kept = entries();
         struct Interrupt final : BackupTestHook {
             void Run(Point point, std::string_view, std::uint64_t) override {
@@ -714,7 +767,47 @@ void OrphanedStagingCleanup() {
     assert(std::filesystem::exists(published / kBackupMarkerName) && std::filesystem::exists(guarded / kBackupIncompleteName));
 }
 void TargetComponentReplacement() {
-#ifndef _WIN32
+    const std::wstring long_name = L"C:\\root\\" + std::wstring(300U, L'x');
+    const auto extended = L"\\\\?\\" + long_name;
+    assert(BackupWindowsApiName(extended, true) == extended);
+    assert(BackupWindowsApiName(long_name, false) == extended);
+    assert(BackupWindowsComparisonName(extended) == long_name);
+    assert(BackupWindowsApiName(L"\\\\?\\C:\\short", true) == L"\\\\?\\C:\\short");
+    assert(BackupWindowsApiName(L"\\\\?\\C:\\short", false) == L"C:\\short");
+    assert(BackupWindowsApiName(L"\\\\?\\UNC\\server\\share\\folder", true) == L"\\\\?\\UNC\\server\\share\\folder");
+    for (const auto* spelling : {L"\\\\server\\share\\folder\\..\\child", L"\\\\?\\UNC\\server\\share\\child",
+        L"//server/share/./child/"}) {
+        const auto parts = SplitBackupWindowsPath(spelling);
+        assert(parts.root == L"\\\\server\\share\\");
+        assert(parts.components == std::vector<std::wstring>{L"child"});
+        assert(parts.Name() == L"\\\\server\\share\\child");
+    }
+    assert(SplitBackupWindowsPath(L"\\\\server\\share").components.empty());
+    assert(SplitBackupWindowsPath(L"\\\\?\\C:\\root\\..\\leaf").Name() == L"C:\\leaf");
+    assert(SplitBackupWindowsPath(L"C:/../../leaf").Name() == L"C:\\leaf");
+    assert(BackupWindowsParentApiName(L"\\\\?\\C:\\root\\leaf") == L"\\\\?\\C:\\root");
+    assert(BackupWindowsParentApiName(L"\\\\?\\C:\\leaf") == L"\\\\?\\C:\\");
+    assert(BackupWindowsParentApiName(L"\\\\?\\C:\\") == L"\\\\?\\C:\\");
+    assert(BackupWindowsParentApiName(L"\\\\?\\UNC\\server\\share\\leaf") == L"\\\\?\\UNC\\server\\share\\");
+    assert(BackupWindowsParentApiName(L"\\\\server\\share\\leaf") == L"\\\\server\\share\\");
+    assert(BackupWindowsParentApiName(L"\\\\server\\share") == L"\\\\server\\share\\");
+    assert(BackupWindowsRelativeName(L"\\\\?\\C:\\root\\nested\\leaf", L"\\\\?\\C:\\root") == L"nested\\leaf");
+    assert(BackupWindowsRelativeName(L"\\\\?\\UNC\\server\\share\\root\\leaf", L"\\\\?\\UNC\\server\\share\\root") == L"leaf");
+    assert(BackupWindowsRelativeName(L"\\\\server\\share\\root/leaf", L"\\\\?\\UNC\\server\\share\\root\\") == L"leaf");
+    assert(BackupWindowsRelativeName(L"\\\\?\\C:\\leaf", L"C:\\") == L"leaf");
+    for (const auto* spelling : {L"\\\\?\\D:\\root\\leaf", L"\\\\?\\C:\\root-other\\leaf",
+             L"\\\\?\\C:\\other\\leaf", L"\\\\?\\C:\\root", L"\\\\?\\C:\\root\\..\\leaf"}) {
+        bool refused = false;
+        try { (void)BackupWindowsRelativeName(spelling, L"\\\\?\\C:\\root"); }
+        catch (const std::invalid_argument&) { refused = true; }
+        assert(refused);
+    }
+    for (const auto* spelling : {L"\\\\server", L"\\\\server\\", L"C:relative", L"\\relative"}) {
+        bool refused = false;
+        try { (void)SplitBackupWindowsPath(spelling); }
+        catch (const std::invalid_argument&) { refused = true; }
+        assert(refused);
+    }
     ScopedTempDir temp("chunkdb-backup-path-races");
     const auto root = std::filesystem::canonical(temp.path());
     const auto source = root / "source";
@@ -728,7 +821,7 @@ void TargetComponentReplacement() {
         void Run(Point point, std::string_view, std::uint64_t) override {
             if (point != expected) return;
             std::filesystem::rename(component, retained);
-            std::filesystem::create_directory_symlink(outside, component);
+            test::CreateDirectoryAlias(outside, component);
         }
     };
     for (unsigned scenario = 0; scenario < 3U; ++scenario) {
@@ -750,7 +843,27 @@ void TargetComponentReplacement() {
         assert(std::filesystem::is_empty(outside));
         assert(!error.empty());
     }
-#endif
+    const auto base = root / "before-admission";
+    const auto component = base / "component";
+    const auto outside = root / "outside-admission";
+    std::filesystem::create_directories(component);
+    std::filesystem::create_directory(outside);
+    TableCatalog catalog(Config(root / "catalog"));
+    const auto target = ResolveBackupTarget(base, "component/new/backup");
+    std::filesystem::rename(component, base / "retained");
+    test::CreateDirectoryAlias(outside, component);
+    const auto error = Error([&] { (void)catalog.BackupTo(target, {}); });
+    assert(!error.empty() && std::filesystem::is_empty(outside));
+    const auto inner_base = root / "inside-resolution";
+    const auto inner_component = inner_base / "component";
+    const auto other_inside = inner_base / "other";
+    std::filesystem::create_directories(inner_component);
+    std::filesystem::create_directory(other_inside);
+    Replace during_resolution(inner_component, inner_base / "retained", other_inside,
+        BackupTestHook::Point::kAfterTargetValidation);
+    const auto inner_target = ResolveBackupTarget(inner_base, "component/new/backup", &during_resolution);
+    const auto inner_error = Error([&] { (void)catalog.BackupTo(inner_target, {}); });
+    assert(!inner_error.empty() && std::filesystem::is_empty(other_inside));
 }
 void PathDurabilityFailuresRemainGuarded() {
 #ifdef __APPLE__
@@ -831,12 +944,10 @@ void StagingOwnerValidation() {
     assert(IsOwnedBackupStaging(pre_guard, identity));
     const auto malformed = root / (StoreIdHex(identity) + ".not-a-nonce");
     std::filesystem::create_directory(malformed); assert(!IsOwnedBackupStaging(malformed, identity));
-#ifndef _WIN32
     const auto alias = root / StoreIdHex(NewStoreId());
-    std::filesystem::create_directory_symlink(stage, alias); assert(!IsOwnedBackupStaging(alias, identity));
+    test::CreateDirectoryAlias(stage, alias); assert(!IsOwnedBackupStaging(alias, identity));
     const auto named_alias = root / (StoreIdHex(identity) + "." + StoreIdHex(NewStoreId()));
-    std::filesystem::create_directory_symlink(stage, named_alias); assert(!IsOwnedBackupStaging(named_alias, identity));
-#endif
+    test::CreateDirectoryAlias(stage, named_alias); assert(!IsOwnedBackupStaging(named_alias, identity));
 }
 void BatchedEvictionDuringPin() {
     ScopedTempDir temp("chunkdb-backup-batched-eviction");
@@ -956,6 +1067,10 @@ void CancelCatalogWaitAndRestrictions() {
 }
 }
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    _set_error_mode(_OUT_TO_STDERR);
+#endif
     if (argc == 2 && std::string_view(argv[1]) == "--batched-eviction") { BatchedEvictionDuringPin(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--waiting-maintenance") { WaitingBackupDefersCheckpoints(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--dropped-table") { DroppedSnapshotTableSkipped(); return 0; }
@@ -965,6 +1080,8 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-collision-regression") { StagingCollisionRetainsExistingEntry(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-owner-regression") { StagingOwnerValidation(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--staging-cleanup-alias") { StagingCleanupAliasReplacement(); StagingCleanupRootReplacement(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--staging-cleanup-root") { StagingCleanupRootReplacement(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--orphaned-staging") { OrphanedStagingCleanup(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--path-regressions") { TargetComponentReplacement(); StagingOwnerValidation(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); return 0; }
     TargetComponentReplacement(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded();
@@ -978,7 +1095,7 @@ int main(int argc, char** argv) {
     PlainWriterBounds(true); PlainWriterBounds(false); EndedFeedDoesNotClearNewProducers();
     BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); DroppedSnapshotTableSkipped();
     PerTableDdlProgress(); ColdPinAndStagingAlias(); ColdTailRepairPreservesPinnedInode();
-    ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); OrphanedStagingCleanup(); StagingOwnerValidation();
+    ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); OrphanedStagingCleanup(); StagingOwnerValidation(); StagingCleanupAliasReplacement(); StagingCleanupRootReplacement();
     CrcChunks();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint}) { CutAndProgress(mode); AcknowledgedLoad(mode); }
     CopyReleasesHoldsAndBusy(); TargetAndCancellation(); CompletionAndPoison(); FailedGenerationAndEmptyCatalog(); CancelCatalogWaitAndRestrictions();

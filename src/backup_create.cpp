@@ -1,4 +1,6 @@
 #include "backup.hpp"
+#include "backup_directory.hpp"
+#include "backup_windows_path.hpp"
 
 #include <chrono>
 #include <fstream>
@@ -69,7 +71,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     RemoveOrphanedBackupStaging(config_.data_dir, source_manifest->data_dir_id);
     const auto stage_alias = config_.data_dir / kBackupStagingName;
     // Staging roots intentionally allow a configured directory alias.
-    const auto stage_parent = std::filesystem::weakly_canonical(stage_alias);
+    const auto stage_parent = CanonicalBackupPath(stage_alias);
     EnsureDirectoryPathExists(stage_parent, false);
     const auto stage_path = stage_parent / (StoreIdHex(source_manifest->data_dir_id) + "." + StoreIdHex(NewStoreId()));
     hook(BackupTestHook::Point::kBeforeStagingCreate, stage_path.filename().string());
@@ -144,7 +146,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             }
             static const std::regex large_name(R"(^L_(-?[0-9]+)_(-?[0-9]+)$)");
             static const std::regex chunk_name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.(chk|wal)$)");
-            for (const auto& large : std::filesystem::directory_iterator(store.data_dir_)) {
+            for (const auto& large : backup_detail::DirectoryEntries(store.data_dir_)) {
                 std::smatch match;
                 const auto name = large.path().filename().string();
                 if (!std::regex_match(name, match, large_name)) continue;
@@ -178,7 +180,8 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                 if (std::filesystem::exists(directory)) {
                     if (!std::filesystem::is_directory(std::filesystem::symlink_status(directory)))
                         throw std::runtime_error("unsafe backup chunk directory: " + directory.string());
-                    for (const auto& entry : std::filesystem::directory_iterator(directory)) {
+                    hook(BackupTestHook::Point::kBeforeSourceDirectoryOpen, table->name(), cut);
+                    for (const auto& entry : backup_detail::OpenDirectory(directory, true)) {
                         std::smatch match;
                         const auto name = entry.path().filename().string();
                         if (!std::regex_match(name, match, chunk_name)) continue;
@@ -210,7 +213,14 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                                             ChunkWalPath(store.data_dir_, store.geometry_, coord)}) {
                         if (!std::filesystem::exists(path)) continue;
                         const auto bytes = std::filesystem::file_size(path);
+#ifdef _WIN32
+                        const auto relative = store.data_dir_.native().starts_with(L"\\\\?\\")
+                            ? std::filesystem::path(BackupWindowsRelativeName(path.native(), store.data_dir_.native()))
+                            : path.lexically_relative(store.data_dir_);
+                        link(path, table_root / relative, bytes, bytes);
+#else
                         link(path, table_root / std::filesystem::relative(path, store.data_dir_), bytes, bytes);
+#endif
                     }
                 }
             }

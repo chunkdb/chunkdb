@@ -3,6 +3,7 @@
 
 #include "verify.hpp"
 #include "backup.hpp"
+#include "backup_directory.hpp"
 
 #include <algorithm>
 #include <charconv>
@@ -198,7 +199,7 @@ void VerifyFeedArtifacts(
         return;
     }
     bool has_archive = false;
-    for (const auto& file : std::filesystem::directory_iterator(directory)) {
+    for (const auto& file : chunkdb::backup_detail::DirectoryEntries(directory)) {
         const auto name = file.path().filename().string();
         if (!file.is_regular_file()) {
             Report(counters, false, "unexpected_entry", file.path(), "");
@@ -462,7 +463,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
             initialized_exists_ec.message());
     }
 
-    for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
+    for (const auto& entry : chunkdb::backup_detail::DirectoryEntries(data_dir)) {
         const auto name = entry.path().filename().string();
 
         // Process-lock artifacts and OS metadata are not storage state.
@@ -504,7 +505,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
         }
         const chunkdb::Geometry& geometry = *store_geometry;
 
-        for (const auto& file : std::filesystem::directory_iterator(entry.path())) {
+        for (const auto& file : chunkdb::backup_detail::DirectoryEntries(entry.path())) {
             const auto file_name = file.path().filename().string();
             if (!file.is_regular_file()) {
                 Report(counters, false, "unexpected_entry", file.path(), "");
@@ -643,7 +644,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
     const auto intent_dir = chunkdb::ConditionalIntentDirectory(data_dir);
     std::error_code intent_dir_ec;
     if (std::filesystem::exists(intent_dir, intent_dir_ec) && !intent_dir_ec) {
-        for (const auto& file : std::filesystem::directory_iterator(intent_dir)) {
+        for (const auto& file : chunkdb::backup_detail::DirectoryEntries(intent_dir)) {
             const auto file_name = file.path().filename().string();
             if (!file.is_regular_file()) {
                 Report(counters, false, "unexpected_entry", file.path(), "");
@@ -832,7 +833,7 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         Report(counters, true, "feature_pending_invalid", data_dir / chunkdb::kFeaturePendingFileName, error.what());
     }
 
-    for (const auto& entry : std::filesystem::directory_iterator(data_dir)) {
+    for (const auto& entry : chunkdb::backup_detail::DirectoryEntries(data_dir)) {
         const auto name = entry.path().filename().string();
         if (name == chunkdb::kDataDirManifestFileName || name == chunkdb::kBackupMarkerName || name == "tables" ||
             name == chunkdb::kMigrationsFileName || name == chunkdb::kMigrationPendingFileName || name == chunkdb::kFeaturePendingFileName ||
@@ -853,7 +854,7 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         if (name == ".chunkdb.staging" || name == ".chunkdb.dropped" || name == chunkdb::kBackupStagingName) {
             const bool staging = name == ".chunkdb.staging";
             const bool backup = name == chunkdb::kBackupStagingName;
-            for (const auto& leftover : std::filesystem::directory_iterator(entry.path())) {
+            for (const auto& leftover : chunkdb::backup_detail::DirectoryEntries(entry.path())) {
                 Report(
                     counters, false,
                     backup ? "interrupted_backup" : staging ? "interrupted_table_create" : "interrupted_table_drop",
@@ -884,7 +885,7 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         return;
     }
     std::vector<std::filesystem::path> tables;
-    for (const auto& entry : std::filesystem::directory_iterator(tables_dir)) {
+    for (const auto& entry : chunkdb::backup_detail::DirectoryEntries(tables_dir)) {
         const auto name = entry.path().filename().string();
         if (!chunkdb::IsValidTableName(name) || !entry.is_directory()) {
             ReportInfo(counters, "foreign_entry", entry.path(), "not a table; ignored");
