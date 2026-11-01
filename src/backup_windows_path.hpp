@@ -1,5 +1,6 @@
 #pragma once
 
+#include <algorithm>
 #include <string>
 #include <string_view>
 #include <stdexcept>
@@ -77,6 +78,20 @@ inline std::wstring BackupWindowsParentApiName(std::wstring_view absolute) {
     auto parts = SplitBackupWindowsPath(absolute);
     if (!parts.components.empty()) parts.components.pop_back();
     return BackupWindowsApiName(parts.Name(), absolute.starts_with(L"\\\\?\\"));
+}
+
+inline std::wstring BackupWindowsRelativeName(std::wstring_view absolute, std::wstring_view root) {
+    const auto child = SplitBackupWindowsPath(absolute);
+    const auto parent = SplitBackupWindowsPath(root);
+    if (child.root != parent.root || child.components.size() <= parent.components.size() ||
+        !std::equal(parent.components.begin(), parent.components.end(), child.components.begin()))
+        throw std::invalid_argument("backup path is not a descendant of its admitted root");
+    std::wstring relative;
+    for (std::size_t i = parent.components.size(); i < child.components.size(); ++i) {
+        if (!relative.empty()) relative += L'\\';
+        relative += child.components[i];
+    }
+    return relative;
 }
 
 }  // namespace chunkdb

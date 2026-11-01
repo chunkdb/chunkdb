@@ -1,5 +1,6 @@
 #include "backup.hpp"
 #include "backup_directory.hpp"
+#include "backup_windows_path.hpp"
 
 #include <chrono>
 #include <fstream>
@@ -213,7 +214,10 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                         if (!std::filesystem::exists(path)) continue;
                         const auto bytes = std::filesystem::file_size(path);
 #ifdef _WIN32
-                        link(path, table_root / path.lexically_relative(store.data_dir_), bytes, bytes);
+                        const auto relative = store.data_dir_.native().starts_with(L"\\\\?\\")
+                            ? std::filesystem::path(BackupWindowsRelativeName(path.native(), store.data_dir_.native()))
+                            : path.lexically_relative(store.data_dir_);
+                        link(path, table_root / relative, bytes, bytes);
 #else
                         link(path, table_root / std::filesystem::relative(path, store.data_dir_), bytes, bytes);
 #endif

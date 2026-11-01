@@ -791,6 +791,17 @@ void TargetComponentReplacement() {
     assert(BackupWindowsParentApiName(L"\\\\?\\UNC\\server\\share\\leaf") == L"\\\\?\\UNC\\server\\share\\");
     assert(BackupWindowsParentApiName(L"\\\\server\\share\\leaf") == L"\\\\server\\share\\");
     assert(BackupWindowsParentApiName(L"\\\\server\\share") == L"\\\\server\\share\\");
+    assert(BackupWindowsRelativeName(L"\\\\?\\C:\\root\\nested\\leaf", L"\\\\?\\C:\\root") == L"nested\\leaf");
+    assert(BackupWindowsRelativeName(L"\\\\?\\UNC\\server\\share\\root\\leaf", L"\\\\?\\UNC\\server\\share\\root") == L"leaf");
+    assert(BackupWindowsRelativeName(L"\\\\server\\share\\root/leaf", L"\\\\?\\UNC\\server\\share\\root\\") == L"leaf");
+    assert(BackupWindowsRelativeName(L"\\\\?\\C:\\leaf", L"C:\\") == L"leaf");
+    for (const auto* spelling : {L"\\\\?\\D:\\root\\leaf", L"\\\\?\\C:\\root-other\\leaf",
+             L"\\\\?\\C:\\other\\leaf", L"\\\\?\\C:\\root", L"\\\\?\\C:\\root\\..\\leaf"}) {
+        bool refused = false;
+        try { (void)BackupWindowsRelativeName(spelling, L"\\\\?\\C:\\root"); }
+        catch (const std::invalid_argument&) { refused = true; }
+        assert(refused);
+    }
     for (const auto* spelling : {L"\\\\server", L"\\\\server\\", L"C:relative", L"\\relative"}) {
         bool refused = false;
         try { (void)SplitBackupWindowsPath(spelling); }
