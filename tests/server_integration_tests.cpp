@@ -33,6 +33,7 @@
 #include "../src/change_feed.hpp"
 #include "../src/proxy_protocol.hpp"
 #include "../src/slot_watch.hpp"
+#include "../src/server_socket.hpp"
 #include "../src/statement_control.hpp"
 #include "../src/user_registry.hpp"
 
@@ -65,7 +66,7 @@ void SetServerSocketConfigFailpointForTests(
     std::size_t nonblocking_failures) noexcept;
 void ResetServerTimeoutConfigCountersForTests() noexcept;
 std::uint64_t ServerRecvTimeoutConfigCallsForTests() noexcept;
-int FeedDeliveryTestAccess::SetActiveClientSendBuffer(ChunkServer& server, int bytes) {
+std::size_t FeedDeliveryTestAccess::FillActiveClientSendQueue(ChunkServer& server, int bytes) {
     std::lock_guard lock(server.active_clients_mutex_);
     assert(server.active_clients_.size() == 1U);
     const auto socket = static_cast<
@@ -83,7 +84,28 @@ int FeedDeliveryTestAccess::SetActiveClientSendBuffer(ChunkServer& server, int b
     socklen_t length = sizeof(actual);
 #endif
     assert(getsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&actual), &length) == 0);
-    return actual;
+    assert(actual > 0);
+    std::string error;
+    assert(server_detail::SetSocketNonBlocking(socket, true, &error));
+    const std::vector<char> filler(16U * 1024U * 1024U, 'x');
+    std::size_t filled = 0U;
+    bool blocked = false;
+    while (filled < 4U * filler.size()) {
+        const auto sent = send(socket, filler.data(), static_cast<int>(filler.size()), 0);
+        if (sent > 0) { filled += static_cast<std::size_t>(sent); continue; }
+        const auto code = server_detail::CurrentSocketErrorCode();
+        if (sent < 0 && server_detail::IsSocketInterruptedError(code)) continue;
+#ifdef _WIN32
+        blocked = sent < 0 && code == WSAEWOULDBLOCK;
+#else
+        blocked = sent < 0 && (code == EAGAIN || code == EWOULDBLOCK);
+#endif
+        assert(blocked);
+        break;
+    }
+    assert(blocked && filled > 0U);
+    std::cout << "steady reader: send_buffer=" << actual << " prefilled=" << filled << '\n' << std::flush;
+    return filled;
 }
 }
 
@@ -1337,6 +1359,14 @@ class ScopedLogCapture {
             }
         }
         return count;
+    }
+
+    [[nodiscard]] std::string FirstContaining(std::string_view needle) const {
+        std::lock_guard lock(lines_mutex_);
+        for (const auto& line : lines_) {
+            if (line.find(needle) != std::string::npos) return line;
+        }
+        return {};
     }
 
     [[nodiscard]] std::size_t IndexOf(std::string_view needle) const {
@@ -4258,8 +4288,40 @@ void TestReplyAdmissionPrecedesMutation() {
     assert(lease->store().GetBlockBits(0, 0) == "1000");
 }
 
-void TestSteadyReaderRenewsReplyProgressDeadline() {
+void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false) {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+    struct QueueHook final : chunkdb::FeedDeliveryTestHook {
+        chunkdb::ChunkServer* server = nullptr;
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool ready = false, released = false;
+        std::size_t filled = 0U, reads = 0U, prefills = 0U;
+        void Run(Point point, std::size_t completed) override {
+            if (point != Point::kAfterClientRead || completed != 1U) return;
+            std::unique_lock lock(mutex);
+            ++reads;
+            changed.notify_all();
+            if (ready) return;
+            filled = chunkdb::FeedDeliveryTestAccess::FillActiveClientSendQueue(*server, 65536);
+            ++prefills;
+            ready = true;
+            changed.notify_all();
+            changed.wait(lock, [&] { return released; });
+        }
+        bool Wait() {
+            std::unique_lock lock(mutex);
+            return changed.wait_for(lock, std::chrono::seconds(10), [&] { return ready; });
+        }
+        void CheckSecondRead() {
+            std::unique_lock lock(mutex);
+            assert(changed.wait_for(lock, std::chrono::seconds(10), [&] { return reads >= 2U; }));
+            assert(prefills == 1U);
+        }
+        void Release() {
+            { std::lock_guard lock(mutex); released = true; }
+            changed.notify_all();
+        }
+    } hook;
 
     // This response remains in progress across several transport intervals.
     auto store_cfg = BaseStoreConfig();
@@ -4280,6 +4342,10 @@ void TestSteadyReaderRenewsReplyProgressDeadline() {
     server_cfg.idle_connection_timeout_ms = 10000;
 
     ServerHarness harness("steady-slow-reader-deadline", store_cfg, engine_cfg, server_cfg);
+    struct ReleaseHook {
+        QueueHook& hook;
+        ~ReleaseHook() { hook.Release(); }
+    } release{hook};
     {
         auto lease = harness.catalog->Find("default")->Acquire();
         lease->store().SetBlockBits(0, 0, std::string(512, '0'));
@@ -4287,8 +4353,25 @@ void TestSteadyReaderRenewsReplyProgressDeadline() {
     RawClient slow("127.0.0.1", harness.port);
     slow.SetReceiveBuffer(1048576);
     slow.Hello();
-    assert(chunkdb::FeedDeliveryTestAccess::SetActiveClientSendBuffer(*harness.server, 65536) > 0);
-    slow.SendBytes("GET CHUNK 0 0 FROM default\r\nGET CHUNK 0 0 FROM default\r\n");
+    hook.server = harness.server.get();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    slow.SendBytes("GET CH");
+    assert(hook.Wait());
+    if (fail_before_read) throw std::runtime_error("injected first read failure");
+    std::size_t first_read = 0U;
+    assert(slow.ReadSomeWithin(std::chrono::seconds(1), 4096U, &first_read) && first_read != 0U);
+    hook.Release();
+    slow.SendBytes("UNK 0 0 FROM default\r\nGET CHUNK 0 0 FROM default\r\n");
+    hook.CheckSecondRead();
+    // Discard exactly the fixture bytes before interpreting the actual reply.
+    // The filled queue proves backpressure without exposing its bytes as CQL.
+    assert(first_read <= hook.filled);
+    for (auto remaining = hook.filled - first_read; remaining != 0U;) {
+        std::size_t bytes_read = 0U;
+        assert(slow.ReadSomeWithin(std::chrono::seconds(1), std::min<std::size_t>(remaining, 1048576U),
+            &bytes_read) && bytes_read != 0U);
+        remaining -= bytes_read;
+    }
     assert(slow.ReadLine().starts_with('$'));
     const auto start = Clock::now();
     std::mutex cadence_mutex;
@@ -6406,7 +6489,15 @@ int main(int argc, char** argv) {
         run("TestKillDecidedCommitPreservesOutcomeTls", [] { TestKillDecidedCommitPreservesOutcome<TlsClient>(true); });
 #endif
         run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
-        run("TestSteadyReaderRenewsReplyProgressDeadline", TestSteadyReaderRenewsReplyProgressDeadline);
+        run("TestSteadyReaderRenewsReplyProgressDeadline", [] { TestSteadyReaderRenewsReplyProgressDeadline(); });
+        run("TestSteadyReaderFirstReadFailureTeardown", [] {
+            bool failed = false;
+            try { TestSteadyReaderRenewsReplyProgressDeadline(true); }
+            catch (const std::runtime_error& error) {
+                failed = std::string_view(error.what()) == "injected first read failure";
+            }
+            assert(failed);
+        });
         run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);
         run("TestPendingStatementQueueKeepsHelloAvailable", TestPendingStatementQueueKeepsHelloAvailable);
         run("TestReadinessLogLineExists", TestReadinessLogLineExists);

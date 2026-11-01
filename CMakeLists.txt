@@ -612,7 +612,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME server_poller COMMAND chunkdb_server_poller_test)
     set_tests_properties(server_poller PROPERTIES TIMEOUT 30 LABELS "smoke")
 
-    add_executable(chunkdb_server_socket_test tests/server_socket_tests.cpp src/server_socket.cpp)
+    add_executable(chunkdb_server_socket_test tests/server_socket_tests.cpp src/server_socket.cpp src/server_io.cpp)
     target_link_libraries(chunkdb_server_socket_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_socket_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME server_socket COMMAND chunkdb_server_socket_test)
