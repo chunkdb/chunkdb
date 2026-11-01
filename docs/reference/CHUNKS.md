@@ -174,5 +174,26 @@ AFTER must have the table's exact coordinate arity and lie inside the requested 
 An empty page can advance across an empty region, and the response-byte bound can end a page before its requested cell count.
 A single populated chunk that cannot fit a complete page is refused; request fewer columns or use GET CHUNK.
 Independent pages can observe intervening writes; pages inside a transaction share its snapshot and private writes.
+
+An empty page still provides a continuation when requested cells remain:
+
+```cql docs-check
+CREATE TABLE page_demo (kind u8) CHUNK 2 x 2
+GET AREA 0 0 TO 2 0 FROM page_demo LIMIT 2 WITH SCHEMA
+GET AREA 0 0 TO 2 0 FROM page_demo AFTER 1 0 LIMIT 2 WITH SCHEMA
+```
+
+```output
+OK
+schema_version = 1
+more = true
+after = [1, 0]
+(empty)
+schema_version = 1
+more = false
+after = NULL
+(empty)
+```
+
 SCAN CHUNKS returns at most 1024 identities and at most 67108864 encoded bytes per page.
 Chunk values follow [Tables](TABLES.md#limits) and [Server flags](../SERVER_FLAGS.md).
