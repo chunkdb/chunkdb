@@ -605,7 +605,7 @@ if(CHUNKDB_BUILD_TESTS)
         COMMAND chunkdb_security_regression_test
     )
 
-    add_executable(chunkdb_server_socket_test tests/server_socket_tests.cpp src/server_socket.cpp)
+    add_executable(chunkdb_server_socket_test tests/server_socket_tests.cpp src/server_socket.cpp src/server_io.cpp)
     target_link_libraries(chunkdb_server_socket_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_socket_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME server_socket COMMAND chunkdb_server_socket_test)
@@ -705,7 +705,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME backup_protocol COMMAND chunkdb_server_backup_protocol_test)
     set_tests_properties(backup_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
 
-    add_executable(chunkdb_server_slots_process_test tests/server_slots_process_tests.cpp)
+    add_executable(chunkdb_server_slots_process_test tests/server_slots_process_tests.cpp src/server_socket.cpp)
     target_link_libraries(chunkdb_server_slots_process_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_slots_process_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     if(WIN32)

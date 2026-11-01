@@ -32,6 +32,7 @@
 #include "feed_test_utils.hpp"
 #include "feed_phase_watchdog.hpp"
 #include "login_helpers.hpp"
+#include "server_socket.hpp"
 
 namespace chunkdb::slot_socket_test {
 using namespace std::chrono_literals;
@@ -41,7 +42,7 @@ using Socket = SOCKET;
 inline constexpr Socket kInvalid = INVALID_SOCKET;
 inline void CloseSocket(Socket socket) { closesocket(socket); }
 inline int ClientSocketError() { return WSAGetLastError(); }
-inline bool WouldBlock() { return WSAGetLastError() == WSAETIMEDOUT || WSAGetLastError() == WSAEWOULDBLOCK; }
+inline bool WouldBlock(int error) { return error == WSAEWOULDBLOCK || error == WSAEINTR; }
 inline void InitializeSockets() {
     static const int initialized = [] { WSADATA data{}; return WSAStartup(MAKEWORD(2, 2), &data); }();
     assert(initialized == 0);
@@ -51,7 +52,7 @@ using Socket = int;
 inline constexpr Socket kInvalid = -1;
 inline void CloseSocket(Socket socket) { close(socket); }
 inline int ClientSocketError() { return errno; }
-inline bool WouldBlock() { return errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR; }
+inline bool WouldBlock(int error) { return error == EAGAIN || error == EWOULDBLOCK || error == EINTR; }
 inline void InitializeSockets() {}
 #endif
 inline sockaddr_in Address(std::uint16_t port) {
@@ -104,8 +105,8 @@ inline bool Boolean(const Reply& reply) {
     return reply.value == "t";
 }
 
-// A real blocking loopback connection. Short socket timeouts let the parser
-// impose one deadline over the entire reply, including TLS WANT_READ retries.
+// A real nonblocking loopback connection. Readiness waits share one parser
+// deadline over the entire reply, including TLS WANT_READ retries.
 class Client {
   public:
     explicit Client(std::uint16_t port, bool tls = false) {
@@ -128,14 +129,9 @@ class Client {
         if (getsockname(socket_, reinterpret_cast<sockaddr*>(&local), &local_length) == 0)
             endpoint_ = "127.0.0.1:" + std::to_string(ntohs(local.sin_port));
         try {
-#ifdef _WIN32
-            const DWORD timeout = 50;
-            setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-            setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, reinterpret_cast<const char*>(&timeout), sizeof(timeout));
-#else
-            const timeval timeout{0, 50'000};
-            setsockopt(socket_, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout));
-            setsockopt(socket_, SOL_SOCKET, SO_SNDTIMEO, &timeout, sizeof(timeout));
+            std::string error;
+            if (!server_detail::SetSocketNonBlocking(socket_, true, &error)) Fail(error);
+#ifndef _WIN32
 #ifdef SO_NOSIGPIPE
             const int no_sigpipe = 1;
             setsockopt(socket_, SOL_SOCKET, SO_NOSIGPIPE, &no_sigpipe, sizeof(no_sigpipe));
@@ -152,7 +148,7 @@ class Client {
                     ERR_clear_error(); errno = 0;
                     const int result = SSL_connect(ssl_);
                     if (result == 1) break;
-                    if (!RetryTls(result) || Clock::now() >= deadline) Fail("TLS handshake failed");
+                    if (!RetryTls(result, deadline)) Fail("TLS handshake failed");
                 }
             }
 #else
@@ -178,7 +174,7 @@ class Client {
             ERR_clear_error(); errno = 0;
             const int result = SSL_shutdown(ssl_);
             if (result >= 0) return;
-            if (!RetryTls(result) || Clock::now() >= deadline)
+            if (!RetryTls(result, deadline))
                 throw std::runtime_error("TLS close notification failed");
         }
     }
@@ -208,7 +204,7 @@ class Client {
             if (ssl_) {
                 ERR_clear_error(); errno = 0;
                 count = SSL_write(ssl_, bytes.data() + offset, static_cast<int>(bytes.size() - offset));
-                if (count <= 0 && RetryTls(count) && Clock::now() < deadline) continue;
+                if (count <= 0 && RetryTls(count, deadline)) continue;
             } else
 #endif
             {
@@ -219,7 +215,8 @@ class Client {
 #endif
                 count = static_cast<int>(send(socket_, bytes.data() + offset,
                     static_cast<int>(bytes.size() - offset), flags));
-                if (count < 0 && WouldBlock() && Clock::now() < deadline) continue;
+                socket_error_ = count < 0 ? ClientSocketError() : 0;
+                if (count < 0 && WouldBlock(socket_error_) && Wait(deadline, false, true)) continue;
             }
             if (count <= 0) Fail("socket write failed");
             offset += static_cast<std::size_t>(count);
@@ -253,13 +250,25 @@ class Client {
         assert(Field(hello, "server_signature").value == auth.server_signature);
     }
   private:
+    bool Wait(Clock::time_point deadline, bool read, bool write) {
+        wait_expired_ = false;
+        const auto now = Clock::now();
+        if (now >= deadline) { wait_expired_ = true; return false; }
+        const auto result = server_detail::WaitForSocketReady(socket_, read, write,
+            std::chrono::ceil<std::chrono::milliseconds>(deadline - now), &socket_error_);
+        if (result == server_detail::SocketWaitResult::kError) Fail("socket readiness failed");
+        wait_expired_ = result == server_detail::SocketWaitResult::kTimeout || Clock::now() >= deadline;
+        return !wait_expired_;
+    }
 #ifdef CHUNKDB_WITH_OPENSSL
-    bool RetryTls(int result) {
+    bool RetryTls(int result, Clock::time_point deadline) {
         socket_error_ = ClientSocketError();
         const int error = SSL_get_error(ssl_, result);
         tls_error_ = error;
-        return error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE ||
-            (error == SSL_ERROR_SYSCALL && WouldBlock());
+        if (error == SSL_ERROR_WANT_READ || error == SSL_ERROR_WANT_WRITE)
+            return Wait(deadline, error == SSL_ERROR_WANT_READ, error == SSL_ERROR_WANT_WRITE);
+        return error == SSL_ERROR_SYSCALL && WouldBlock(socket_error_) &&
+            Wait(deadline, SSL_want_write(ssl_) == 0, SSL_want_write(ssl_) != 0);
     }
     SSL_CTX* context_ = nullptr;
     SSL* ssl_ = nullptr;
@@ -275,12 +284,14 @@ class Client {
     }
     std::string endpoint_ = "unbound", peer_ = "unknown", last_request_ = "connect";
     int socket_error_ = 0;
+    bool wait_expired_ = false;
 #ifdef CHUNKDB_WITH_OPENSSL
     int tls_error_ = 0;
 #endif
     Socket socket_ = kInvalid;
     std::string pending_;
     bool Fetch(Clock::time_point deadline) {
+        wait_expired_ = false;
         do {
             char bytes[4096];
             int count = 0;
@@ -289,13 +300,17 @@ class Client {
             if (ssl_) {
                 ERR_clear_error(); errno = 0;
                 count = SSL_read(ssl_, bytes, sizeof(bytes));
-                retry = count <= 0 && RetryTls(count);
+                retry = count <= 0 && RetryTls(count, deadline);
+                if (wait_expired_) return false;
             } else
 #endif
             {
                 count = static_cast<int>(recv(socket_, bytes, sizeof(bytes), 0));
                 socket_error_ = count < 0 ? ClientSocketError() : 0;
-                retry = count < 0 && WouldBlock();
+                if (count < 0 && WouldBlock(socket_error_)) {
+                    if (!Wait(deadline, true, false)) return false;
+                    retry = true;
+                }
             }
             if (count > 0) { pending_.append(bytes, static_cast<std::size_t>(count)); return true; }
             if (!retry) Fail("socket closed while reading");
