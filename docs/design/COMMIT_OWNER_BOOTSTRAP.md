@@ -77,6 +77,8 @@ Each candidate is opened relative to the pinned native root without following a 
 Wrong complete bytes, a wrong prefix, an unrelated temporary family, or unsafe native admission refuses before any publication or cleanup.
 Temporary bytes never select identities or state: recovery recreates targets only from the checked decision and its derived empty inventory.
 All temporary, manifest, root and inventory sources are admitted before mutation; existing stale-temporary cleanup may run only after this complete admission and must not remove an unadmitted candidate through a generic prefix rule.
+An unmanifested root without a checked CKGB cannot become fresh by deleting manifest or index temporary candidates: it refuses with those bytes unchanged.
+Initialized-store manifest cleanup follows actual scope admission; unused empty-inventory staging may remain unselected and is never a canonical inventory or recovery cut.
 The crash matrix includes the existing before/after manifest-publication cuts, empty-inventory temporary file sync, exact and partial prefixes, wrong-byte and unsafe-leaf refusal, and a later invalid root leaving every earlier candidate unchanged.
 
 Creation publishes in this order while no store or table lease can escape:
