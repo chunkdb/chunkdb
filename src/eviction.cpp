@@ -319,7 +319,7 @@ bool ChunkStore::TryEvictCandidate(
         if (regular_chunk.use_count() != 2) {
             return false;
         }
-        if (regular_chunk->written && !ChunkPresent(regular_chunk->presence_bitmap) &&
+        if (regular_chunk->written && !ChunkPopulated(geometry_, regular_chunk->presence_bitmap, regular_chunk->chunk_columns.get()) &&
             !std::filesystem::exists(ChunkDataPath(data_dir_, geometry_, candidate.chunk_coord)) &&
             !std::filesystem::exists(ChunkWalPath(data_dir_, geometry_, candidate.chunk_coord))) {
             // Retiring a collected tombstone changes GET CHUNK to NULL.

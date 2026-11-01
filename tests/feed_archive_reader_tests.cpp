@@ -43,7 +43,8 @@ struct Fixture {
             "." + std::to_string(first) + ".chk");
     }
     FeedArchiveReader Reader(std::uint64_t from, std::uint64_t through, std::shared_ptr<void> pin = {}) {
-        return FeedArchiveAccess::Create(directory.path(), geometry, epoch, {epoch, from}, through, std::move(pin));
+        return FeedArchiveAccess::Create(directory.path(), geometry, epoch, {epoch, from}, through,
+            std::move(pin), {.incompat = kFeatureChunkModel});
     }
     std::vector<std::uint8_t> Frame(std::uint64_t revision, std::uint8_t value, bool present = true) const {
         std::vector<std::uint8_t> bytes;
@@ -54,7 +55,7 @@ struct Fixture {
         return bytes;
     }
     std::vector<std::uint8_t> Wal(ChunkCoord coord, const std::vector<std::vector<std::uint8_t>>& frames) const {
-        auto result = BuildWalHeader(coord, epoch, {});
+        auto result = BuildWalHeader(coord, epoch, {.incompat = kFeatureChunkModel});
         for (const auto& frame : frames) result.insert(result.end(), frame.begin(), frame.end());
         return result;
     }
@@ -153,17 +154,21 @@ void PartialAndBoundaries() {
     assert(LoadFile(live) == before);
     Save(live, fixture.Wal(coord, {first, second}));
     const auto boundary = kWalHeaderSize + first.size();
-    Save(TxnIntentPath(fixture.directory.path(), 3U), SerializeTxnIntent({TxnIntentState::kRollback, 3U, {{coord, boundary}}}));
+    Save(TxnIntentPath(fixture.directory.path(), 3U), SerializeTxnIntent(
+        {TxnIntentState::kRollback, 3U, {{coord, boundary}}}, fixture.geometry.dims(), fixture.epoch));
     auto rollback = fixture.Reader(0U, 3U);
     assert(rollback.Next()->position.revision == 2U && !rollback.Next());
     assert(LoadFile(live) == fixture.Wal(coord, {first, second}));
-    Save(TxnIntentPath(fixture.directory.path(), 3U), SerializeTxnIntent({TxnIntentState::kCommitted, 3U, {{coord, boundary}}}));
+    Save(TxnIntentPath(fixture.directory.path(), 3U), SerializeTxnIntent(
+        {TxnIntentState::kCommitted, 3U, {{coord, boundary}}}, fixture.geometry.dims(), fixture.epoch));
     auto committed = fixture.Reader(0U, 3U);
     assert(committed.Next()->position.revision == 2U && committed.Next()->position.revision == 3U && !committed.Next());
-    Save(TxnIntentPath(fixture.directory.path(), 3U), SerializeTxnIntent({TxnIntentState::kRollback, 3U, {{coord, 0U}}}));
+    Save(TxnIntentPath(fixture.directory.path(), 3U), SerializeTxnIntent(
+        {TxnIntentState::kRollback, 3U, {{coord, 0U}}}, fixture.geometry.dims(), fixture.epoch));
     auto zero = fixture.Reader(0U, 3U);
     assert(!zero.Next());
-    Save(TxnIntentPath(fixture.directory.path(), 3U), SerializeTxnIntent({TxnIntentState::kRollback, 3U, {{coord, 999999U}}}));
+    Save(TxnIntentPath(fixture.directory.path(), 3U), SerializeTxnIntent(
+        {TxnIntentState::kRollback, 3U, {{coord, 999999U}}}, fixture.geometry.dims(), fixture.epoch));
     Reject([&] { (void)fixture.Reader(0U, 3U); });
 }
 
@@ -183,7 +188,8 @@ void ConditionalBoundaries() {
     save_intent(false, kWalHeaderSize + a.size());
     auto rollback = fixture.Reader(0U, 3U);
     assert(rollback.Next()->position.revision == 2U && !rollback.Next());
-    Save(TxnIntentPath(fixture.directory.path(), 4U), SerializeTxnIntent({TxnIntentState::kRollback, 4U, {{coord, 0U}}}));
+    Save(TxnIntentPath(fixture.directory.path(), 4U), SerializeTxnIntent(
+        {TxnIntentState::kRollback, 4U, {{coord, 0U}}}, fixture.geometry.dims(), fixture.epoch));
     auto smaller = fixture.Reader(0U, 3U);
     assert(!smaller.Next());
     std::filesystem::remove(TxnIntentPath(fixture.directory.path(), 4U));
@@ -200,7 +206,7 @@ void ConditionalBoundaries() {
 
 void UserCollectionAndCoordinates() {
     Fixture fixture;
-    const FeatureFlags features{.incompat = kFeatureFeedSlots};
+    const FeatureFlags features{.incompat = kFeatureFeedSlots | kFeatureChunkModel};
     const ChunkCoord coord{std::numeric_limits<std::int64_t>::max(), std::numeric_limits<std::int64_t>::min()};
     auto make = [&](std::uint64_t revision, bool present, bool gc, std::optional<std::string_view> user) {
         std::vector<std::uint8_t> bytes;

@@ -18,20 +18,20 @@ SCAN CHUNKS FROM chunk_demo LIMIT 1
 
 ```output
 OK
-2
-version = 2
+1
+version = 1
 schema_version = 1
 present = 1 of 4 blocks
 block 0 0
   kind = 1
 chunk 0 0
-  version = 2
+  version = 1
   schema_version = 1
   present = 1 of 4 blocks
   block 0 0
     kind = 1
 chunk 0 0
-  version = 2
+  version = 1
   schema_version = 1
   present = 1 of 4 blocks
 chunks:
@@ -48,7 +48,7 @@ chunk-cli --uri "$CHUNKDB_URI" --in "$EXAMPLE_DIR/chunk.bin" 'SET CHUNK 1 0 IN c
 
 ```output
 wrote 21 bytes to <example-dir>/chunk.bin
-4
+2
 ```
 
 `EXAMPLE_DIR` is a writable directory you choose.

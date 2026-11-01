@@ -1,4 +1,5 @@
 #include "wal_replay.hpp"
+#include "wal_replay_source.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -9,6 +10,7 @@
 
 #include "chunkdb/crc32.hpp"
 #include "feature_flags.hpp"
+#include "store_manifest.hpp"
 
 namespace chunkdb {
 
@@ -16,39 +18,22 @@ void ValidateWalHeader(
     const std::vector<std::uint8_t>& bytes,
     const ChunkCoord& expected_chunk_coord,
     const StoreId& store_id,
-    const FeatureFlags& store_features) {
-    if (bytes.size() < kWalHeaderSize) {
+    const FeatureFlags& store_features,
+    std::uint8_t dims) {
+    if (bytes.size() >= 10U && ReadLe16(bytes, 8U) == 1U) {
+        throw EarlierDevelopmentFormatError();
+    }
+    const auto header_size = ChunkWalHeaderBytes(dims);
+    if (bytes.size() < header_size) {
         throw std::runtime_error("WAL file too small");
     }
-    if (std::memcmp(bytes.data(), kWalMagic, kWalMagicSize) != 0) {
-        throw std::runtime_error("not a 2.0 WAL (bad magic)");
-    }
-    if (ReadLe32(bytes, kWalHeaderSize - 4U) != Crc32(bytes.data(), kWalHeaderSize - 4U)) {
-        throw std::runtime_error("WAL header checksum mismatch");
-    }
-    const std::uint16_t version = ReadLe16(bytes, 8U);
-    if (version != kWalFormatVersion) {
-        throw std::runtime_error("unsupported WAL version " + std::to_string(version));
-    }
-    if (ReadLe16(bytes, 10U) != 0U) {
-        throw std::runtime_error("WAL header reserved field is not zero");
-    }
-    const FeatureFlags features{
-        .incompat = ReadLe32(bytes, 12U),
-        .ro_compat = ReadLe32(bytes, 16U),
-        .compat = ReadLe32(bytes, 20U),
-    };
-    if (!IsSubsetOf(features, store_features)) {
-        throw std::runtime_error(
-            "WAL uses features the store does not (" + DescribeFeatures(features) + ")");
-    }
-    if (!std::equal(store_id.begin(), store_id.end(), bytes.begin() + 24)) {
-        throw std::runtime_error("WAL belongs to another store");
-    }
-    const auto chunk_x = static_cast<std::int64_t>(ReadLe64(bytes, 40U));
-    const auto chunk_y = static_cast<std::int64_t>(ReadLe64(bytes, 48U));
-    if (chunk_x != expected_chunk_coord.x || chunk_y != expected_chunk_coord.y) {
-        throw std::runtime_error("WAL chunk coordinate mismatch");
+    try {
+        (void)ParseChunkWalHeader(
+            std::span(bytes).first(header_size),
+            ChunkFileContext{.dims = dims, .epoch = store_id, .coord = expected_chunk_coord,
+                .admitted_features = store_features});
+    } catch (const std::invalid_argument& error) {
+        throw std::runtime_error(error.what());
     }
 }
 
@@ -95,6 +80,7 @@ struct ParsedFrame {
     std::vector<PendingVar> var_ops;
     std::optional<ChunkVars> var_replace;
     std::size_t record_count = 0;
+    std::shared_ptr<const ChunkColumnState> chunk_columns{};
 };
 
 struct FrameShape {
@@ -169,7 +155,8 @@ struct FrameShape {
     ParsedFrame* frame,
     std::string* stop_reason,
     bool* reaches_end,
-    bool* intact) {
+    bool* intact,
+    std::optional<std::uint64_t> file_remaining = std::nullopt) {
     // Set when the failing frame provably extends to the end of the file.
     *reaches_end = false;
     // Set once the whole frame is present and both CRCs match: a frame a
@@ -206,10 +193,12 @@ struct FrameShape {
     // In 64 bits, so no platform can wrap the declared frame size.
     const std::uint64_t total64 =
         static_cast<std::uint64_t>(header_size) + body_size + kWalFrameTrailerSize;
+    if (total64 > kMaxWalFrameBytes)
+        throw std::runtime_error("WAL frame exceeds its byte limit");
     // The header is CRC-valid, so its declared extent can be trusted from
     // here on: any later failure is in a frame that ends at or past EOF
     // exactly when this holds.
-    *reaches_end = total64 >= remaining;
+    *reaches_end = total64 >= file_remaining.value_or(remaining);
     if (total64 > remaining) {
         // A crash inside one mutation's append: the frame is torn and is
         // ignored as a whole, which is what makes mutations all-or-nothing.
@@ -299,6 +288,7 @@ struct FrameShape {
     frame->spans.clear();
     frame->var_ops.clear();
     frame->var_replace.reset();
+    frame->chunk_columns.reset();
     std::size_t at = records_begin;
     for (std::uint32_t i = 0; i < record_count; ++i) {
         if (records_end - at < kWalRecordHeaderSize) {
@@ -335,6 +325,22 @@ struct FrameShape {
                 *stop_reason = std::move(reason);
                 return false;
             }
+        } else if (type == kWalRecordChunkColumns) {
+            if (frame->chunk_columns || size > kMaxChunkColumnsSectionBytes || !geometry.has_chunk_column_history()) {
+                *stop_reason = "record_chunk_columns_invalid";
+                return false;
+            }
+            try {
+                const auto& schema = geometry.ChunkColumnsLayoutAt(frame->schema_version).schema();
+                if (schema.columns.empty()) throw std::invalid_argument("metadata schema is empty");
+                const auto bytes = std::span(wal).subspan(body_at, size);
+                const auto variable_bytes = ValidateChunkColumns(schema, bytes);
+                frame->chunk_columns = std::make_shared<const ChunkColumnState>(ChunkColumnState{
+                    .bytes = std::vector<std::uint8_t>(bytes.begin(), bytes.end()), .variable_bytes = variable_bytes});
+            } catch (const std::invalid_argument&) {
+                *stop_reason = "record_chunk_columns_invalid";
+                return false;
+            }
         } else if (!may_skip_unknown) {
             *stop_reason = "record_unknown_type";
             return false;
@@ -348,7 +354,7 @@ struct FrameShape {
     if (frame->gc) {
         // A collection marker may only reset the complete state to empty.
         // Otherwise suppressing it in catch-up would hide a user mutation.
-        bool empty_reset = !have_tag && frame->spans.size() == 2U && frame->var_ops.empty() &&
+        bool empty_reset = !have_tag && !frame->chunk_columns && frame->spans.size() == 2U && frame->var_ops.empty() &&
             record_count == (shape.vars_enabled ? 3U : 2U) &&
             (shape.vars_enabled ? frame->var_replace.has_value() && frame->var_replace->empty()
                                 : !frame->var_replace.has_value());
@@ -418,23 +424,26 @@ void ApplyFrameVars(
 // A crash while the file was created (its header is written in the first
 // append) leaves a prefix of the header and, on filesystems that expose
 // unwritten blocks, zeros after it. The prefix is compared outside the
-// feature flags (bytes 12..24), which depend on the writer's build; the
-// header CRC (56..60) may be partly written; everything after must be zero.
+// feature flags, which depend on the writer's build; the header CRC may be
+// partly written; everything after must be zero.
 [[nodiscard]] bool IsInterruptedCreation(
     const std::vector<std::uint8_t>& wal,
     const ChunkCoord& chunk_coord,
-    const StoreId& store_id) {
-    const auto expected = BuildWalHeader(chunk_coord, store_id, FeatureFlags{});
-    constexpr std::size_t kComparedEnd = kWalHeaderSize - 4U;
+    const StoreId& store_id,
+    std::uint8_t dims) {
+    const auto expected = BuildWalHeader(chunk_coord, store_id,
+        FeatureFlags{.incompat = kFeatureChunkModel}, dims);
+    const auto header_size = expected.size();
+    const auto compared_end = header_size - 4U;
     std::size_t matched = 0;
-    while (matched < wal.size() && matched < kComparedEnd &&
-           ((matched >= 12U && matched < 24U) || wal[matched] == expected[matched])) {
+    while (matched < wal.size() && matched < compared_end &&
+           ((matched >= 16U && matched < 28U) || wal[matched] == expected[matched])) {
         ++matched;
     }
-    if (matched == kComparedEnd) {
+    if (matched == compared_end) {
         // Everything but the CRC matched: whatever part of the CRC was
         // written, no frame can follow a header whose CRC never completed.
-        matched = std::min(wal.size(), kWalHeaderSize);
+        matched = std::min(wal.size(), header_size);
     }
     return std::all_of(
         wal.begin() + static_cast<std::ptrdiff_t>(matched), wal.end(),
@@ -465,6 +474,11 @@ void ApplyFrameVars(
 }
 
 }  // namespace
+
+bool IsInterruptedWalCreation(const std::vector<std::uint8_t>& bytes,
+    const ChunkCoord& coord, const StoreId& table_id, std::uint8_t dims) {
+    return IsInterruptedCreation(bytes, coord, table_id, dims);
+}
 
 FeedFrameInfo ReplayFeedFrame(
     const std::vector<std::uint8_t>& bytes, const Geometry& geometry, ChunkState* state,
@@ -498,8 +512,23 @@ FeedFrameInfo ReplayFeedFrame(
         }
     }
     ApplyFrameVars(bytes, &frame, &state->vars);
+    if (frame.chunk_columns) state->chunk_columns = std::move(frame.chunk_columns);
+    else if (!state->written) {
+        if (geometry.has_chunk_column_history()) {
+            const auto& chunks = geometry.ChunkColumnsLayoutAt(frame.schema_version).schema();
+            if (std::any_of(chunks.columns.begin(), chunks.columns.end(), [](const Column& column) {
+                    return column.required && !column.has_default;
+                })) throw std::runtime_error("captured feed frame omits REQUIRED chunk columns");
+        }
+        state->chunk_columns = DefaultChunkColumnsAt(geometry, frame.schema_version);
+    }
     layout.RequireValidVars(state->vars, state->presence_bitmap);
+    if (state->vars.encoded_size() > kVarMaxChunkBytesLimit ||
+        (state->chunk_columns && state->chunk_columns->variable_bytes > kVarMaxChunkBytesLimit - state->vars.encoded_size()))
+        throw std::runtime_error("captured feed frame exceeds the combined variable-byte limit");
     state->version = frame.revision;
+    state->commit_time_ms = frame.commit_time_ms;
+    state->written = true;
     return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc};
 }
 
@@ -517,8 +546,8 @@ FeedFrameInfo InspectFeedFrame(
     return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc};
 }
 
-WalReplayResult ReplayWal(
-    const std::vector<std::uint8_t>& wal_bytes,
+WalReplayResult wal_detail::ReplayFromSource(
+    ReplaySource& source,
     const Geometry& geometry,
     const ChunkCoord& chunk_coord,
     const StoreId& store_id,
@@ -528,7 +557,9 @@ WalReplayResult ReplayWal(
     std::vector<std::uint8_t>* payload,
     std::vector<std::uint8_t>* presence_bitmap,
     ChunkVars* vars,
-    std::vector<WalFrameBoundary>* boundaries) {
+    std::vector<WalFrameBoundary>* boundaries,
+    std::shared_ptr<const ChunkColumnState>* chunk_columns) {
+    const auto& wal_bytes = source.Header();
     WalReplayResult result;
     if (boundaries != nullptr) boundaries->clear();
     if (payload == nullptr || presence_bitmap == nullptr) {
@@ -538,13 +569,19 @@ WalReplayResult ReplayWal(
     if (vars == nullptr) {
         vars = &discarded_vars;
     }
+    std::shared_ptr<const ChunkColumnState> discarded_chunk_columns;
+    if (chunk_columns == nullptr) chunk_columns = &discarded_chunk_columns;
 
+    if (wal_bytes.size() >= 10U && ReadLe16(wal_bytes, 8U) == 1U) {
+        throw EarlierDevelopmentFormatError();
+    }
+    const auto header_size = ChunkWalHeaderBytes(geometry.dims());
     std::string header_error;
-    if (wal_bytes.size() < kWalHeaderSize) {
+    if (wal_bytes.size() < header_size) {
         header_error = "WAL file too small";
     } else {
         try {
-            ValidateWalHeader(wal_bytes, chunk_coord, store_id, store_features);
+            ValidateWalHeader(wal_bytes, chunk_coord, store_id, store_features, geometry.dims());
         } catch (const std::exception& e) {
             header_error = e.what();
         }
@@ -552,7 +589,8 @@ WalReplayResult ReplayWal(
     if (!header_error.empty()) {
         // Nothing applies; the state still ends at the current version.
         BringToCurrentSchema(geometry, base_schema_version, *presence_bitmap, payload, vars);
-        if (IsInterruptedCreation(wal_bytes, chunk_coord, store_id)) {
+        BringChunkColumnsToSchema(geometry, base_schema_version, geometry.chunk_schema().version, chunk_columns);
+        if (IsInterruptedCreation(wal_bytes, chunk_coord, store_id, geometry.dims()) && source.AllZeroAfterHeader()) {
             result.torn_creation = true;
             result.stop_reason = "torn_creation";
         } else {
@@ -562,9 +600,9 @@ WalReplayResult ReplayWal(
     }
     result.replayable = true;
     const FeatureFlags file_features{
-        .incompat = ReadLe32(wal_bytes, 12U),
-        .ro_compat = ReadLe32(wal_bytes, 16U),
-        .compat = ReadLe32(wal_bytes, 20U),
+        .incompat = ReadLe32(wal_bytes, 16U),
+        .ro_compat = ReadLe32(wal_bytes, 20U),
+        .compat = ReadLe32(wal_bytes, 24U),
     };
     const bool may_skip_unknown = MaySkipUnknownTypes(UnionFeatures(file_features, store_features));
     const std::uint64_t current_version = geometry.layout().schema().version;
@@ -594,6 +632,7 @@ WalReplayResult ReplayWal(
             }
             set_state(state_payload, presence);
         }
+        BringChunkColumnsToSchema(geometry, state_version, version, chunk_columns);
         state_version = version;
     };
     if (state_version != 0U) {
@@ -604,23 +643,25 @@ WalReplayResult ReplayWal(
         set_state(*payload, *presence_bitmap);
     }
 
-    std::size_t cursor = kWalHeaderSize;
+    std::size_t cursor = header_size;
     ParsedFrame frame;
     std::uint64_t previous_revision = 0;
-    while (cursor < wal_bytes.size()) {
+    while (cursor < source.Size()) {
+        const auto window = source.Frame(cursor);
+        const auto& frame_bytes = window.bytes;
         std::string stop_reason;
         bool reaches_end = false;
         bool intact = false;
         bool parsed =
-            ParseFrame(wal_bytes, cursor, geometry, may_skip_unknown,
+            ParseFrame(frame_bytes, window.offset, geometry, may_skip_unknown,
                        (store_features.incompat & kFeatureFeedSlots) != 0U,
-                       &frame, &stop_reason, &reaches_end, &intact);
+                       &frame, &stop_reason, &reaches_end, &intact, source.Size() - cursor);
         // Every mutation reserves a higher revision than the one before it
         // (under the chunk lock), so a frame that does not is damage.
         if (parsed && frame.revision <= previous_revision) {
             parsed = false;
             stop_reason = "frame_revision_order";
-            reaches_end = frame.size >= wal_bytes.size() - cursor;
+            reaches_end = frame.size >= source.Size() - cursor;
         }
         if (!parsed) {
             result.tail_truncated_or_corrupt = true;
@@ -629,7 +670,7 @@ WalReplayResult ReplayWal(
             // failure is damage (a writer bug, or a file from elsewhere) even
             // as the last frame; trimming it would drop a mutation silently.
             result.stopped_at_crash_tail =
-                !intact && (reaches_end || !HasValidFrameHeaderAfter(wal_bytes, cursor));
+                !intact && (reaches_end || !source.HasLaterFrameHeader(cursor));
             break;
         }
         previous_revision = frame.revision;
@@ -658,13 +699,27 @@ WalReplayResult ReplayWal(
             result.stopped_at_crash_tail = false;
             break;
         }
+        if (frame.chunk_columns) *chunk_columns = std::move(frame.chunk_columns);
+        else if (base_revision == 0U && result.applied_frames == 0U) {
+            if (geometry.has_chunk_column_history()) {
+                const auto& chunks = geometry.ChunkColumnsLayoutAt(frame.schema_version).schema();
+                if (std::any_of(chunks.columns.begin(), chunks.columns.end(), [](const Column& column) {
+                        return column.required && !column.has_default;
+                    })) {
+                    result.tail_truncated_or_corrupt = true;
+                    result.stop_reason = "record_chunk_columns_required";
+                    break;
+                }
+            }
+            *chunk_columns = DefaultChunkColumnsAt(geometry, frame.schema_version);
+        }
         if (!frame.var_ops.empty() || frame.var_replace.has_value()) {
-            ApplyFrameVars(wal_bytes, &frame, vars);
+            ApplyFrameVars(frame_bytes, &frame, vars);
         }
         for (const auto& span : frame.spans) {
             std::copy(
-                wal_bytes.data() + span.source,
-                wal_bytes.data() + span.source + span.size,
+                frame_bytes.data() + span.source,
+                frame_bytes.data() + span.source + span.size,
                 state.begin() + static_cast<std::ptrdiff_t>(span.offset));
         }
         result.applied_records += frame.record_count;
@@ -685,6 +740,8 @@ WalReplayResult ReplayWal(
     if (vars->encoded_size() > kVarMaxChunkBytesLimit) {
         result.vars_problem = "values take " + std::to_string(vars->encoded_size()) + " bytes, more than " +
                               std::to_string(kVarMaxChunkBytesLimit);
+    } else if (*chunk_columns && (*chunk_columns)->variable_bytes > kVarMaxChunkBytesLimit - vars->encoded_size()) {
+        result.vars_problem = "block and chunk values exceed the combined variable-byte limit";
     } else {
         try {
             geometry.layout().RequireValidVars(*vars, *presence_bitmap);
@@ -693,6 +750,26 @@ WalReplayResult ReplayWal(
         }
     }
     return result;
+}
+
+WalReplayResult ReplayWal(const std::vector<std::uint8_t>& bytes, const Geometry& geometry,
+    const ChunkCoord& coord, const StoreId& table_id, const FeatureFlags& features,
+    std::uint64_t base_revision, std::uint64_t base_schema_version,
+    std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence, ChunkVars* vars,
+    std::vector<WalFrameBoundary>* boundaries, std::shared_ptr<const ChunkColumnState>* chunk_columns) {
+    class MemorySource final : public wal_detail::ReplaySource {
+      public:
+        explicit MemorySource(const std::vector<std::uint8_t>& value) : bytes_(value) {}
+        std::size_t Size() const override { return bytes_.size(); }
+        const std::vector<std::uint8_t>& Header() const override { return bytes_; }
+        wal_detail::FrameWindow Frame(std::size_t position) override { return {bytes_, position}; }
+        bool AllZeroAfterHeader() override { return true; }
+        bool HasLaterFrameHeader(std::size_t position) override { return HasValidFrameHeaderAfter(bytes_, position); }
+      private:
+        const std::vector<std::uint8_t>& bytes_;
+    } source(bytes);
+    return wal_detail::ReplayFromSource(source, geometry, coord, table_id, features,
+        base_revision, base_schema_version, payload, presence, vars, boundaries, chunk_columns);
 }
 
 }  // namespace chunkdb

@@ -22,12 +22,15 @@
 #include "checkpoint.hpp"
 #include "file_permissions.hpp"
 #include "chunkdb/crc32.hpp"
+#include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
 #include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
 #include "wal_replay.hpp"
+#include "chunk_coordinate_index.hpp"
+#include "shared_file_input.hpp"
 
 namespace chunkdb {
 namespace {
@@ -413,7 +416,7 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
         const auto manifest = ReadStoreManifest(dir);
         if (!manifest || manifest->store_id != cut.epoch) throw std::runtime_error("backup table epoch mismatch: " + cut.name);
         RequireOpenableFeatures(manifest->features, AccessMode::kReadOnly);
-        Geometry geometry(manifest->geometry, manifest->schema);
+        Geometry geometry(manifest->geometry, manifest->schema, *manifest->chunk_schema);
         std::uint64_t ceiling = 0U, generation = 0U;
         if (!TryParseVersionClockRecord(LoadFile(dir / "chunkdb.version"), &ceiling) || ceiling <= cut.revision)
             throw std::runtime_error("backup clock is not above its cut");
@@ -428,41 +431,57 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
             for (const auto& slot : slots->slots) if (slot.written > cut.revision) throw std::runtime_error("backup slot exceeds cut");
         }
         const auto prefix = "tables/" + cut.name + "/";
-        for (const auto* name : {"table.manifest", "chunkdb.version", "chunkdb.snapshot", ".chunkdb.initialized", "chunkdb.slots"})
+        for (const auto* name : {"table.manifest", "chunkdb.version", "chunkdb.snapshot", ".chunkdb.initialized", "chunkdb.slots", "chunkdb.index"})
             allowed.insert(prefix + name);
+        ChunkCoordinateIndex retained(dir, geometry, cut.epoch, true);
+        if (retained.maximum_recovered_revision() > cut.revision || retained.retained_deletion_floor() > cut.revision)
+            throw std::runtime_error("backup retained identity exceeds cut");
+        SharedFileInput inventory(dir / kChunkIndexFileName);
+        if (!inventory) throw std::runtime_error("backup coordinate inventory is missing");
+        const auto index_header = ReadIndexInventory(inventory, std::filesystem::file_size(dir / kChunkIndexFileName),
+            geometry, cut.epoch, [&](const IndexInventoryEntry& entry) {
+                const auto local = LargeChunkDirectory({}, entry.coord, geometry.dims()) / kChunkIndexFileName;
+                if (std::filesystem::file_size(dir / local) != entry.committed_bytes)
+                    throw std::runtime_error("backup retained log contains an unpublished suffix");
+                allowed.insert(prefix + local.generic_string());
+            });
+        if (index_header.compaction_pending) throw std::runtime_error("backup contains pending coordinate compaction");
         for (const auto& file : record.files) {
             Cancelled(cancelled);
             const auto relative = file.relative_path.generic_string();
             if (relative.rfind(prefix, 0U) != 0U || allowed.contains(relative)) continue;
             const auto local = file.relative_path.lexically_relative(std::filesystem::path("tables") / cut.name);
             if (std::distance(local.begin(), local.end()) != 2) throw std::runtime_error("unknown backup table artifact: " + relative);
-            const auto filename = local.filename().string();
             const auto stem = local.stem().string();
-            std::int64_t x = 0, y = 0;
-            const auto separator = stem.find('_', 2U);
-            if (stem.rfind("C_", 0U) != 0U || separator == std::string::npos ||
-                !TryParseInt64(stem.substr(2U, separator - 2U), &x) || !TryParseInt64(stem.substr(separator + 1U), &y))
-                throw std::runtime_error("invalid backup chunk name: " + filename);
-            if (stem != "C_" + std::to_string(x) + "_" + std::to_string(y)) throw std::runtime_error("noncanonical backup chunk name");
-            const ChunkCoord coord{x, y};
-            const auto large = geometry.ChunkToLarge(coord);
-            if (local.parent_path().string() != "L_" + std::to_string(large.x) + "_" + std::to_string(large.y))
-                throw std::runtime_error("misplaced backup chunk");
+            ChunkCoord coord;
+            if (!ParseChunkFilePath(local, geometry, &coord)) throw std::runtime_error("noncanonical backup chunk path");
             const auto full = root / file.relative_path;
             if (local.extension() == ".chk") {
-                auto image = ParseChunkImage(LoadFile(full), geometry, coord, cut.epoch, manifest->features);
+                auto image = ParseChunkImage(LoadChunkImageFile(full, geometry, coord, cut.epoch, manifest->features),
+                    geometry, coord, cut.epoch, manifest->features);
                 if (image.revision > cut.revision) throw std::runtime_error("backup image exceeds cut");
+                if (const auto boundary = retained.EmptyBoundary(coord))
+                    (void)ApplyRetainedEmptyBase(geometry, *boundary, image.revision, image.commit_time_ms,
+                        image.schema_version, image.payload, image.presence_bitmap, image.vars, image.chunk_columns);
             } else if (local.extension() == ".wal") {
                 std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U), presence(ChunkPresenceBitmapBytes(geometry), 0U);
                 ChunkVars vars; std::uint64_t base = 0U, schema = 0U;
+                std::shared_ptr<const ChunkColumnState> chunk_columns;
                 const auto image_path = full.parent_path() / (stem + ".chk");
                 if (Present(image_path)) {
-                    auto image = ParseChunkImage(LoadFile(image_path), geometry, coord, cut.epoch, manifest->features);
+                    auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, coord, cut.epoch, manifest->features),
+                        geometry, coord, cut.epoch, manifest->features);
                     base = image.revision; schema = image.schema_version;
                     payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
+                    chunk_columns = std::move(image.chunk_columns);
                 }
+                std::uint64_t time = 0U;
+                if (const auto boundary = retained.EmptyBoundary(coord))
+                    (void)ApplyRetainedEmptyBase(geometry, *boundary, base, time, schema,
+                        payload, presence, vars, chunk_columns);
                 std::vector<WalFrameBoundary> boundaries;
-                auto replay = ReplayWal(LoadFile(full), geometry, coord, cut.epoch, manifest->features, base, schema, &payload, &presence, &vars, &boundaries);
+                auto replay = ReplayWal(LoadFile(full), geometry, coord, cut.epoch, manifest->features, base, schema,
+                    &payload, &presence, &vars, &boundaries, &chunk_columns);
                 if ((!replay.replayable && !replay.torn_creation) ||
                     (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty() ||
                     (!boundaries.empty() && boundaries.back().revision > cut.revision)) throw std::runtime_error("backup WAL is damaged or exceeds cut");

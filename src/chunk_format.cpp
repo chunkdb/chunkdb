@@ -2,8 +2,11 @@
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
+#include "shared_file_input.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
+#include "populated_index_format.hpp"
+#include "store_manifest.hpp"
 #include "wal_replay.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
@@ -46,6 +49,8 @@
 #endif
 
 namespace chunkdb {
+
+static_assert(kFeatureChunkModel == kChunkModelFormatBit);
 
 [[nodiscard]] std::size_t ChunkPresenceBitmapBytes(const Geometry& geometry) noexcept {
     return (geometry.ChunkBlockCount() + 7U) / 8U;
@@ -106,6 +111,22 @@ void SetBlockPresent(
         presence_bitmap.begin(),
         presence_bitmap.end(),
         [](std::uint8_t byte) { return byte != 0U; });
+}
+
+std::size_t PresentBlockCount(const std::vector<std::uint8_t>& presence_bitmap) noexcept {
+    std::size_t count = 0U;
+    for (const auto byte : presence_bitmap) count += std::popcount(byte);
+    return count;
+}
+
+bool ChunkPopulated(const Geometry& geometry, const std::vector<std::uint8_t>& presence_bitmap,
+    const ChunkColumnState* chunk_columns) noexcept {
+    return ChunkPresent(presence_bitmap) || ChunkColumnsPopulated(geometry, chunk_columns);
+}
+
+bool ChunkColumnsPopulated(const Geometry& geometry, const ChunkColumnState* chunk_columns) noexcept {
+    const auto& baseline = geometry.default_chunk_columns();
+    return chunk_columns != nullptr && (baseline == nullptr || chunk_columns->bytes != baseline->bytes);
 }
 
 [[nodiscard]] std::string PresenceBitsText(
@@ -206,6 +227,16 @@ namespace {
 // payload or a VARS section can ever be.
 constexpr std::uint32_t kMaxImageSectionRawBytes = 64U * 1024U * 1024U;
 
+ChunkImageHeaderLimits ImageHeaderLimits() noexcept {
+    // A metadata row adds its scalar directory to the shared variable-byte
+    // budget. Unknown sections remain bounded again by the typed body reader.
+    constexpr std::uint64_t section_limit = kMaxChunkColumnsSectionBytes;
+    return {.max_file_bytes = kMaxChunkImageFileBytes,
+            .max_section_stored_bytes = section_limit + kZrleMaxOverheadBytes,
+            .max_section_raw_bytes = section_limit,
+            .max_total_raw_bytes = kMaxChunkImageRawBytes};
+}
+
 struct ImageSectionEntry {
     std::uint16_t type = 0;
     std::uint16_t flags = 0;
@@ -255,7 +286,8 @@ std::vector<std::uint8_t> SerializeChunkImage(
     std::uint64_t revision,
     std::uint64_t commit_time_ms,
     const StoreId& store_id,
-    const ChunkVars* vars) {
+    const ChunkVars* vars,
+    const ChunkColumnState* chunk_columns) {
     if (payload.size() != geometry.ChunkPayloadBytes() ||
         presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry)) {
         throw std::invalid_argument("chunk state size does not match geometry");
@@ -264,6 +296,20 @@ std::vector<std::uint8_t> SerializeChunkImage(
         throw std::invalid_argument("chunk image revision must not be zero");
     }
     const bool has_vars = vars != nullptr && !vars->empty();
+    if (vars != nullptr && vars->encoded_size() > kVarMaxChunkBytesLimit)
+        throw std::invalid_argument("chunk image VARS exceeds byte limit");
+    if (geometry.chunk_schema().columns.empty()) {
+        if (chunk_columns != nullptr && !chunk_columns->bytes.empty())
+            throw std::invalid_argument("chunk image has metadata without chunk columns");
+    } else {
+        if (chunk_columns == nullptr) throw std::invalid_argument("chunk image is missing its chunk columns");
+        const auto variable_bytes = ValidateChunkColumns(geometry.chunk_schema(), chunk_columns->bytes);
+        if (variable_bytes > kVarMaxChunkBytesLimit - (vars == nullptr ? 0U : vars->encoded_size()))
+            throw std::invalid_argument("chunk image exceeds the combined variable-byte limit");
+    }
+    if (has_vars) {
+        geometry.layout().RequireValidVars(*vars, presence_bitmap);
+    }
     std::vector<std::uint8_t> directory;
     std::vector<std::uint8_t> bodies;
     AppendSection(&directory, &bodies, kImageSectionPayload, payload, compression);
@@ -279,22 +325,19 @@ std::vector<std::uint8_t> SerializeChunkImage(
         WriteLe64(version_bytes, schema_version);
         AppendSection(&directory, &bodies, kImageSectionSchema, version_bytes, CheckpointCompression::kNone);
     }
+    if (chunk_columns != nullptr && !chunk_columns->bytes.empty())
+        AppendSection(&directory, &bodies, kImageSectionChunkColumns, chunk_columns->bytes, compression);
 
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(kImageFixedHeaderSize + directory.size() + 4U + bodies.size());
-    bytes.insert(bytes.end(), kImageMagic, kImageMagic + kImageMagicSize);
-    WriteLe16(bytes, kImageFormatVersion);
-    WriteLe16(bytes, static_cast<std::uint16_t>(2U + (has_vars ? 1U : 0U) + (has_schema ? 1U : 0U)));
-    WriteLe32(bytes, 0U);
-    WriteLe32(bytes, 0U);
-    WriteLe32(bytes, 0U);
-    bytes.insert(bytes.end(), store_id.begin(), store_id.end());
-    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.x));
-    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.y));
-    WriteLe64(bytes, revision);
-    WriteLe64(bytes, commit_time_ms);
-    bytes.insert(bytes.end(), directory.begin(), directory.end());
-    WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
+    std::vector<ChunkImageSectionDescriptor> sections;
+    sections.reserve(directory.size() / kImageSectionEntrySize);
+    for (std::size_t at = 0; at < directory.size(); at += kImageSectionEntrySize)
+        sections.push_back({.kind = ReadLe16(directory, at), .flags = ReadLe16(directory, at + 2U),
+            .stored_size = ReadLe32(directory, at + 4U), .raw_size = ReadLe32(directory, at + 8U),
+            .raw_crc32 = ReadLe32(directory, at + 12U)});
+    const ChunkFileContext context{.dims = geometry.dims(), .epoch = store_id, .coord = chunk_coord};
+    auto bytes = SerializeChunkImageHeader(context,
+        {.features = context.admitted_features, .revision = revision, .commit_time_ms = commit_time_ms},
+        sections, ImageHeaderLimits());
     bytes.insert(bytes.end(), bodies.begin(), bodies.end());
     return bytes;
 }
@@ -302,20 +345,9 @@ std::vector<std::uint8_t> SerializeChunkImage(
 std::vector<std::uint8_t> BuildWalHeader(
     const ChunkCoord& chunk_coord,
     const StoreId& store_id,
-    const FeatureFlags& features) {
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(kWalHeaderSize);
-    bytes.insert(bytes.end(), kWalMagic, kWalMagic + kWalMagicSize);
-    WriteLe16(bytes, kWalFormatVersion);
-    WriteLe16(bytes, 0U);
-    WriteLe32(bytes, features.incompat);
-    WriteLe32(bytes, features.ro_compat);
-    WriteLe32(bytes, features.compat);
-    bytes.insert(bytes.end(), store_id.begin(), store_id.end());
-    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.x));
-    WriteLe64(bytes, static_cast<std::uint64_t>(chunk_coord.y));
-    WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
-    return bytes;
+    const FeatureFlags& features, std::uint8_t dims) {
+    return SerializeChunkWalHeader(
+        {.dims = dims, .epoch = store_id, .coord = chunk_coord, .admitted_features = features}, features);
 }
 
 ChunkStateImage ParseChunkImage(
@@ -324,13 +356,14 @@ ChunkStateImage ParseChunkImage(
     const ChunkCoord& expected_chunk_coord,
     const StoreId& store_id,
     const FeatureFlags& store_features) {
-    if (bytes.size() < kImageFixedHeaderSize + 4U) {
+    if (bytes.size() < 12U) {
         throw std::runtime_error("chunk image too small");
     }
     if (std::memcmp(bytes.data(), kImageMagic, kImageMagicSize) != 0) {
         throw std::runtime_error("not a 2.0 chunk image (bad magic)");
     }
     const std::uint16_t version = ReadLe16(bytes, 8U);
+    if (version == 1U) throw EarlierDevelopmentFormatError();
     if (version != kImageFormatVersion) {
         throw std::runtime_error("unsupported chunk image version " + std::to_string(version));
     }
@@ -338,39 +371,21 @@ ChunkStateImage ParseChunkImage(
     if (section_count > kImageMaxSections) {
         throw std::runtime_error("chunk image has too many sections");
     }
-    const std::size_t directory_end =
-        kImageFixedHeaderSize + static_cast<std::size_t>(section_count) * kImageSectionEntrySize;
+    const auto fixed_header = ChunkImageFixedHeaderBytes(geometry.dims());
+    const std::size_t directory_end = fixed_header + static_cast<std::size_t>(section_count) * kImageSectionEntrySize;
     if (bytes.size() < directory_end + 4U) {
         throw std::runtime_error("chunk image too small for its section directory");
     }
-    if (ReadLe32(bytes, directory_end) != Crc32(bytes.data(), directory_end)) {
-        throw std::runtime_error("chunk image header checksum mismatch");
-    }
-
+    CheckedChunkImageHeader checked;
+    try {
+        checked = ParseChunkImageHeader(std::span(bytes).first(directory_end + 4U), bytes.size(),
+            {.dims = geometry.dims(), .epoch = store_id, .coord = expected_chunk_coord, .admitted_features = store_features},
+            ImageHeaderLimits());
+    } catch (const std::invalid_argument& error) { throw std::runtime_error(error.what()); }
     ChunkStateImage image;
-    image.features = FeatureFlags{
-        .incompat = ReadLe32(bytes, 12U),
-        .ro_compat = ReadLe32(bytes, 16U),
-        .compat = ReadLe32(bytes, 20U),
-    };
-    if (!IsSubsetOf(image.features, store_features)) {
-        throw std::runtime_error(
-            "chunk image uses features the store does not (" +
-            DescribeFeatures(image.features) + ")");
-    }
-    if (!std::equal(store_id.begin(), store_id.end(), bytes.begin() + 24)) {
-        throw std::runtime_error("chunk image belongs to another store");
-    }
-    const auto chunk_x = static_cast<std::int64_t>(ReadLe64(bytes, 40U));
-    const auto chunk_y = static_cast<std::int64_t>(ReadLe64(bytes, 48U));
-    if (chunk_x != expected_chunk_coord.x || chunk_y != expected_chunk_coord.y) {
-        throw std::runtime_error("chunk coordinate mismatch");
-    }
-    image.revision = ReadLe64(bytes, 56U);
-    if (image.revision == 0U) {
-        throw std::runtime_error("chunk image revision is zero");
-    }
-    image.commit_time_ms = ReadLe64(bytes, 64U);
+    image.features = checked.info.features;
+    image.revision = checked.info.revision;
+    image.commit_time_ms = checked.info.commit_time_ms;
 
     // An image is rewritten whole at every checkpoint with the features it
     // uses, so its own flags name every feature its sections belong to.
@@ -379,7 +394,7 @@ ChunkStateImage ParseChunkImage(
     // The schema version sizes the other sections, so it is read first.
     std::uint64_t schema_version = 1;
     for (std::size_t i = 0, offset = directory_end + 4U; i < section_count; ++i) {
-        const std::size_t at = kImageFixedHeaderSize + i * kImageSectionEntrySize;
+        const std::size_t at = fixed_header + i * kImageSectionEntrySize;
         const std::uint32_t stored_size = ReadLe32(bytes, at + 4U);
         if (bytes.size() - offset < stored_size) {
             break;  // the loop below reports it
@@ -411,7 +426,7 @@ ChunkStateImage ParseChunkImage(
     std::vector<std::uint8_t> vars_section;
     bool have_vars = false;
     for (std::uint16_t i = 0; i < section_count; ++i) {
-        const std::size_t at = kImageFixedHeaderSize + static_cast<std::size_t>(i) * kImageSectionEntrySize;
+        const std::size_t at = fixed_header + static_cast<std::size_t>(i) * kImageSectionEntrySize;
         const ImageSectionEntry entry{
             .type = ReadLe16(bytes, at),
             .flags = ReadLe16(bytes, at + 2U),
@@ -437,7 +452,8 @@ ChunkStateImage ParseChunkImage(
         const bool fixed_size =
             entry.type == kImageSectionPayload || entry.type == kImageSectionPresence;
         const bool known =
-            fixed_size || entry.type == kImageSectionVars || entry.type == kImageSectionSchema;
+            fixed_size || entry.type == kImageSectionVars || entry.type == kImageSectionSchema ||
+            entry.type == kImageSectionChunkColumns;
         if (!known && !may_skip_unknown) {
             throw std::runtime_error("unknown " + name);
         }
@@ -446,10 +462,12 @@ ChunkStateImage ParseChunkImage(
         // known type pins down -- one owned by a feature this build does not
         // know -- could otherwise ask for gigabytes from a few stored bytes.
         // No section a known type owns reaches this size.
-        if (entry.raw_size > kMaxImageSectionRawBytes) {
+        const auto section_limit = entry.type == kImageSectionChunkColumns ?
+            kMaxChunkColumnsSectionBytes : kMaxImageSectionRawBytes;
+        if (entry.raw_size > section_limit) {
             throw std::runtime_error(
                 name + " declares " + std::to_string(entry.raw_size) + " raw bytes, more than " +
-                std::to_string(kMaxImageSectionRawBytes));
+                std::to_string(section_limit));
         }
         if (fixed_size && entry.raw_size != KnownSectionRawSize(geometry, layout, entry.type)) {
             throw std::runtime_error(name + " has the wrong size for the store geometry");
@@ -479,6 +497,18 @@ ChunkStateImage ParseChunkImage(
         } else if (entry.type == kImageSectionVars) {
             vars_section = std::move(raw);
             have_vars = true;
+        } else if (entry.type == kImageSectionChunkColumns) {
+            if (!geometry.has_chunk_column_history())
+                throw std::runtime_error("chunk image has metadata without chunk columns");
+            try {
+                const auto& schema = geometry.ChunkColumnsLayoutAt(schema_version).schema();
+                if (schema.columns.empty()) throw std::invalid_argument("metadata schema is empty");
+                const auto variable_bytes = ValidateChunkColumns(schema, raw);
+                image.chunk_columns = std::make_shared<const ChunkColumnState>(
+                    ChunkColumnState{.bytes = std::move(raw), .variable_bytes = variable_bytes});
+            } catch (const std::invalid_argument& error) {
+                throw std::runtime_error("chunk image metadata is damaged: " + std::string(error.what()));
+            }
         }
         body_at += entry.stored_size;
     }
@@ -496,9 +526,108 @@ ChunkStateImage ParseChunkImage(
             throw std::runtime_error(std::string("chunk image VARS section is damaged: ") + e.what());
         }
     }
+    if (geometry.has_chunk_column_history() &&
+        !geometry.ChunkColumnsLayoutAt(schema_version).schema().columns.empty() && !image.chunk_columns)
+        throw std::runtime_error("chunk image is missing its chunk columns");
+    if (image.chunk_columns && image.chunk_columns->variable_bytes > kVarMaxChunkBytesLimit - image.vars.encoded_size())
+        throw std::runtime_error("chunk image exceeds the combined variable-byte limit");
     return image;
 }
 
+
+std::vector<std::uint8_t> LoadChunkImageFile(
+    const std::filesystem::path& path, const Geometry& geometry, ChunkCoord coord,
+    const StoreId& store_id, FeatureFlags store_features) {
+    SharedFileInput input(path);
+    if (!input) throw std::runtime_error("failed to open chunk image: " + path.string());
+    input.seekg(0, std::ios::end);
+    const auto end = input.tellg();
+    if (end < 0) throw std::runtime_error("failed to measure chunk image: " + path.string());
+    const auto file_size = static_cast<std::uint64_t>(end);
+    if (file_size < 12U) throw std::runtime_error("chunk image too small: " + path.string());
+    input.seekg(0, std::ios::beg);
+    const auto read_exact = [&](std::uint8_t* bytes, std::size_t count) {
+        input.read(reinterpret_cast<char*>(bytes), static_cast<std::streamsize>(count));
+        if (input.gcount() != static_cast<std::streamsize>(count))
+            throw std::runtime_error("short read of chunk image: " + path.string());
+    };
+    std::vector<std::uint8_t> bytes(12U);
+    read_exact(bytes.data(), bytes.size());
+    if (std::memcmp(bytes.data(), kImageMagic, kImageMagicSize) != 0)
+        throw std::runtime_error("chunk image magic mismatch: " + path.string());
+    if (ReadLe16(bytes, 8U) == 1U) throw EarlierDevelopmentFormatError();
+    if (ReadLe16(bytes, 8U) != kImageFormatVersion)
+        throw std::runtime_error("unsupported chunk image version: " + path.string());
+    if (file_size > kMaxChunkImageFileBytes)
+        throw std::runtime_error("chunk image exceeds file byte limit: " + path.string());
+    const auto count = ReadLe16(bytes, 10U);
+    if (count > kImageMaxSections) throw std::runtime_error("chunk image has too many sections");
+    const auto header_size = ChunkImageHeaderBytes(geometry.dims(), count);
+    if (file_size < header_size) throw std::runtime_error("chunk image directory is truncated");
+    bytes.resize(header_size);
+    read_exact(bytes.data() + 12U, header_size - 12U);
+    try {
+        (void)ParseChunkImageHeader(bytes, file_size,
+            {.dims = geometry.dims(), .epoch = store_id, .coord = coord, .admitted_features = store_features},
+            ImageHeaderLimits());
+    } catch (const std::invalid_argument& error) {
+        throw std::runtime_error(error.what());
+    }
+    bytes.resize(static_cast<std::size_t>(file_size));
+    read_exact(bytes.data() + header_size, bytes.size() - header_size);
+    return bytes;
+}
+
+std::shared_ptr<const ChunkColumnState> DefaultChunkColumnsAt(const Geometry& geometry, std::uint64_t version) {
+    if (version == 0U || !geometry.has_chunk_column_history()) return {};
+    if (version == geometry.chunk_schema().version) return geometry.default_chunk_columns();
+    const auto& schema = geometry.ChunkColumnsLayoutAt(version).schema();
+    if (schema.columns.empty()) return {};
+    return std::make_shared<const ChunkColumnState>(DefaultChunkColumns(schema));
+}
+
+void BringChunkColumnsToSchema(const Geometry& geometry, std::uint64_t from_version, std::uint64_t to_version,
+    std::shared_ptr<const ChunkColumnState>* state) {
+    if (from_version == 0U || !geometry.has_chunk_column_history()) { state->reset(); return; }
+    if (to_version < from_version || to_version > geometry.chunk_schema().version)
+        throw std::invalid_argument("chunk column schema version is out of range");
+    const auto& from = geometry.ChunkColumnsLayoutAt(from_version).schema();
+    (void)ValidateChunkColumns(from, *state ? std::span<const std::uint8_t>((*state)->bytes) :
+        std::span<const std::uint8_t>{});
+    auto next = *state;
+    for (auto version = from_version + 1U; version <= to_version; ++version) {
+        const auto& before = geometry.ChunkColumnsLayoutAt(version - 1U).schema();
+        const auto& after = geometry.ChunkColumnsLayoutAt(version).schema();
+        if (before.columns == after.columns) continue;
+        auto changed = TranslateChunkColumns(before, after, next ? *next : ChunkColumnState{});
+        if (after.columns.empty()) next.reset();
+        else next = std::make_shared<const ChunkColumnState>(std::move(changed));
+    }
+    *state = std::move(next);
+}
+
+bool ApplyRetainedEmptyBase(const Geometry& geometry, const ChunkIndexRecord& boundary,
+    std::uint64_t& revision, std::uint64_t& commit_time_ms, std::uint64_t& schema_version,
+    std::vector<std::uint8_t>& payload, std::vector<std::uint8_t>& presence, ChunkVars& vars,
+    std::shared_ptr<const ChunkColumnState>& chunk_columns) {
+    if (boundary.kind != ChunkIndexKind::kDeleted && boundary.kind != ChunkIndexKind::kForget)
+        throw std::invalid_argument("retained replay base is not an empty boundary");
+    if (revision > boundary.revision) return false;
+    if (revision == boundary.revision) {
+        auto current_columns = chunk_columns;
+        BringChunkColumnsToSchema(geometry, schema_version, geometry.chunk_schema().version, &current_columns);
+        if (ChunkPopulated(geometry, presence, current_columns.get()))
+            throw std::runtime_error("retained empty boundary conflicts with a populated equal-version image");
+    }
+    payload.assign(geometry.LayoutAt(boundary.schema_version).payload_bytes(), 0U);
+    presence.assign(ChunkPresenceBitmapBytes(geometry), 0U);
+    vars = ChunkVars{};
+    chunk_columns = DefaultChunkColumnsAt(geometry, boundary.schema_version);
+    schema_version = boundary.schema_version;
+    revision = boundary.revision;
+    commit_time_ms = boundary.commit_time_ms;
+    return true;
+}
 
 void BringToCurrentSchema(
     const Geometry& geometry,
