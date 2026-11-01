@@ -156,12 +156,15 @@ The restored inventory and every listed log receive the new table identity befor
 The restored clock exceeds every recovered image, WAL and tombstone revision.
 Verification independently checks dimensions, placement, identities, schemas, checksums, index transitions, tombstone overlaps and backup cuts without repairing data.
 
-## Validation
+## Feed rows
 
 Feed entries carry the table dimensionality and both schema domains, and every block, chunk form and chunk-column change uses that many coordinate axes.
 A chunk-column change contains the complete before and after rows, with a null before row only when the chunk had no producing identity, and is emitted when those rows differ.
+An empty chunk-column schema allocates and emits no chunk-column change rows.
 Block-column projections preserve the complete chunk-column row, and `NOBEFORE` removes both kinds of before rows.
 Chunk-form events carry checked forms with each chunk's producing revision and time, and use a null form only when neither present blocks nor non-default chunk columns remain.
+
+## Validation
 
 Tests cover negative boundaries, coordinate extremes, dimension mismatches, x-fastest indexing, checked products and canonical path round trips.
 Format tests cover every truncated boundary, corrupt identity or checksum, reserved field, directory overlap, unknown section and unknown fixed type between known neighbours.
