@@ -454,7 +454,8 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
 }
 
 [[nodiscard]] std::size_t StateBytes(const ChunkState& state) {
-    return state.payload.size() + state.presence_bitmap.size() + state.vars.encoded_size();
+    return state.payload.size() + state.presence_bitmap.size() + state.vars.encoded_size() +
+        (state.chunk_columns ? state.chunk_columns->bytes.size() : 0U);
 }
 
 }  // namespace
@@ -1148,7 +1149,7 @@ std::string CommandEngine::ExecuteStatement(
                         TxnWrite(
                             *session.transaction, store, ChunkCoord{set.chunk_x, set.chunk_y},
                             [&](ChunkState& state) {
-                                store.PrepareTxnChunkState(next, state.vars);
+                                store.PrepareTxnChunkState(next, state.vars, state.chunk_columns.get());
                                 // The version stays the snapshot's until COMMIT.
                                 next.version = state.version;
                                 state = std::move(next);
@@ -1598,7 +1599,7 @@ void CommandEngine::TxnWrite(
             throw std::invalid_argument(
                 "a transaction writes at most " + std::to_string(kMaxTxnWrittenChunks) + " chunks");
         }
-        own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord.x, coord.y)).first;
+        own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord)).first;
     }
     ChunkState& state = own->second;
     const bool was_written = state.written;
@@ -1617,8 +1618,8 @@ void CommandEngine::TxnWrite(
     };
     try {
         change(state);
-        state.written = was_written || std::any_of(state.presence_bitmap.begin(), state.presence_bitmap.end(),
-                                                  [](std::uint8_t byte) { return byte != 0; });
+        state.written = state.written || was_written ||
+            ChunkPopulated(store.geometry(), state.presence_bitmap, state.chunk_columns.get());
         const std::size_t after = StateBytes(state);
         if (txn.bytes - before + after > config_.txn_max_bytes) {
             throw std::invalid_argument(

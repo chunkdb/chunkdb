@@ -250,7 +250,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             const auto table_cut = std::find_if(record.tables.begin(), record.tables.end(), [&](const auto& cut) { return cut.name == table_name; });
             const auto table_dir = staging.path / "tables" / table_name;
             const auto manifest = *ReadStoreManifest(table_dir);
-            const Geometry geometry(manifest.geometry, manifest.schema);
+            const Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
             std::smatch match;
             const auto name = file.relative.filename().string();
             static const std::regex wal_name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.wal$)");
@@ -259,18 +259,21 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             auto payload = std::vector<std::uint8_t>(geometry.ChunkPayloadBytes(), 0U);
             auto presence = std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry), 0U);
             ChunkVars vars;
+            std::shared_ptr<const ChunkColumnState> chunk_columns;
             std::uint64_t base = 0, schema = 0;
             const auto image_path = ChunkDataPath(table_dir, geometry, coord);
             if (std::filesystem::exists(image_path)) {
-                auto image = ParseChunkImage(ReadBackupFile(image_path, std::filesystem::file_size(image_path), options.cancelled), geometry, coord, manifest.store_id, manifest.features);
+                auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, coord,
+                    manifest.store_id, manifest.features), geometry, coord, manifest.store_id, manifest.features);
                 base = image.revision; schema = image.schema_version;
                 if (base > table_cut->revision) throw std::runtime_error("backup image exceeds its revision cut");
                 payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
+                chunk_columns = std::move(image.chunk_columns);
             }
             const auto bytes = ReadBackupFile(staging.path / file.relative, file.observed, options.cancelled);
             std::vector<WalFrameBoundary> boundaries;
             const auto replay = ReplayWal(bytes, geometry, coord, manifest.store_id, manifest.features,
-                base, schema, &payload, &presence, &vars, &boundaries);
+                base, schema, &payload, &presence, &vars, &boundaries, &chunk_columns);
             if (!replay.torn_creation && (!replay.replayable ||
                 (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty()))
                 throw std::runtime_error("backup WAL cannot be replayed: " + replay.stop_reason + " " + replay.vars_problem);

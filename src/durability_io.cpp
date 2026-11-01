@@ -40,6 +40,12 @@
 
 namespace chunkdb {
 
+void WriteAtomicTempFile(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes,
+    bool durable_sync, bool enable_generic_failpoints) {
+    const AtomicFileProducer produce = [&](const AtomicFileSink& sink) { sink(bytes); };
+    WriteAtomicTempFile(path, produce, durable_sync, enable_generic_failpoints);
+}
+
 namespace {
 std::atomic<bool> g_directory_sync_observed{false};
 std::mutex g_directory_sync_observer_mutex;
@@ -149,7 +155,7 @@ void FlushHandleChecked(HANDLE handle, const std::filesystem::path& path, const 
 
 void WriteAtomicTempFile(
     const std::filesystem::path& tmp_path,
-    const std::vector<std::uint8_t>& bytes,
+    const AtomicFileProducer& produce,
     bool durable_sync,
     bool enable_generic_failpoints) {
     OwnerOnlySecurity security(tmp_path);
@@ -175,22 +181,24 @@ void WriteAtomicTempFile(
             throw std::runtime_error(
                 "injected temporary file write failure: " + tmp_path.string());
         }
-        std::size_t offset = 0;
-        while (offset < bytes.size()) {
-            const std::size_t remaining = bytes.size() - offset;
-            const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(remaining, 1U << 20U));
-            DWORD written = 0;
-            const BOOL ok = WriteFile(
-                handle,
-                bytes.data() + offset,
-                chunk,
-                &written,
-                nullptr);
-            if (ok == 0 || written != chunk) {
-                throw BuildWin32Error("failed to write temporary file", tmp_path, GetLastError());
+        produce([&](std::span<const std::uint8_t> bytes) {
+            std::size_t offset = 0;
+            while (offset < bytes.size()) {
+                const std::size_t remaining = bytes.size() - offset;
+                const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(remaining, 1U << 20U));
+                DWORD written = 0;
+                const BOOL ok = WriteFile(
+                    handle,
+                    bytes.data() + offset,
+                    chunk,
+                    &written,
+                    nullptr);
+                if (ok == 0 || written != chunk) {
+                    throw BuildWin32Error("failed to write temporary file", tmp_path, GetLastError());
+                }
+                offset += written;
             }
-            offset += written;
-        }
+        });
 
         if (durable_sync) {
             if (enable_generic_failpoints &&
@@ -425,7 +433,7 @@ void SyncFdDurably(int fd, const std::filesystem::path& path, bool full_sync) {
 
 void WriteAtomicTempFile(
     const std::filesystem::path& tmp_path,
-    const std::vector<std::uint8_t>& bytes,
+    const AtomicFileProducer& produce,
     bool durable_sync,
     bool enable_generic_failpoints) {
     // O_EXCL: BuildAtomicTmpPath already makes the name unique per attempt, so an
@@ -446,22 +454,24 @@ void WriteAtomicTempFile(
             throw std::runtime_error(
                 "injected temporary file write failure: " + tmp_path.string());
         }
-        std::size_t offset = 0;
-        while (offset < bytes.size()) {
-            const std::size_t remaining = bytes.size() - offset;
-            const ssize_t written = ::write(fd, bytes.data() + offset, remaining);
-            if (written < 0) {
-                if (errno == EINTR) {
-                    continue;
+        produce([&](std::span<const std::uint8_t> bytes) {
+            std::size_t offset = 0;
+            while (offset < bytes.size()) {
+                const std::size_t remaining = bytes.size() - offset;
+                const ssize_t written = ::write(fd, bytes.data() + offset, remaining);
+                if (written < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    throw BuildErrnoError("failed to write temporary file", tmp_path, errno);
                 }
-                throw BuildErrnoError("failed to write temporary file", tmp_path, errno);
+                if (written == 0) {
+                    throw std::runtime_error(
+                        "short write while writing temporary file: " + tmp_path.string());
+                }
+                offset += static_cast<std::size_t>(written);
             }
-            if (written == 0) {
-                throw std::runtime_error(
-                    "short write while writing temporary file: " + tmp_path.string());
-            }
-            offset += static_cast<std::size_t>(written);
-        }
+        });
 
         if (durable_sync) {
             if (enable_generic_failpoints &&

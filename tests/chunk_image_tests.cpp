@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "chunk_store_internal.hpp"
+#include "chunk_file_header.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
@@ -35,7 +36,7 @@ const chunkdb::Geometry kGeometry(chunkdb::GeometryConfig{
 constexpr std::size_t kPayloadBytes = 10;
 constexpr std::size_t kPresenceBytes = 2;
 const chunkdb::StoreId kStoreId = {1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16};
-const chunkdb::FeatureFlags kNoFeatures{.incompat = 0, .ro_compat = 0, .compat = 0};
+const chunkdb::FeatureFlags kBaseFeatures{.incompat = chunkdb::kChunkModelFormatBit, .ro_compat = 0, .compat = 0};
 const chunkdb::ChunkCoord kCoord{-3, 7};
 
 void Le16(Bytes* out, std::uint16_t v) {
@@ -61,7 +62,7 @@ Section Raw(std::uint16_t type, const Bytes& raw) {
 }
 
 struct Header {
-    chunkdb::FeatureFlags features = kNoFeatures;
+    chunkdb::FeatureFlags features = kBaseFeatures;
     chunkdb::StoreId store_id = kStoreId;
     chunkdb::ChunkCoord coord = kCoord;
     std::uint64_t revision = 42;
@@ -77,8 +78,9 @@ Header HeaderWith(const std::function<void(Header&)>& change) {
 // Builds an image with any directory, so every malformed layout can be made.
 Bytes BuildImage(const Header& header, const std::vector<Section>& sections) {
     Bytes bytes = {'C', 'H', 'K', 'I', 'M', 'A', 'G', 'E'};
-    Le16(&bytes, 1);
+    Le16(&bytes, 2);
     Le16(&bytes, static_cast<std::uint16_t>(sections.size()));
+    bytes.insert(bytes.end(), {2U, 0U, 0U, 0U}); // Two active axes and reserved bytes.
     Le32(&bytes, header.features.incompat);
     Le32(&bytes, header.features.ro_compat);
     Le32(&bytes, header.features.compat);
@@ -112,12 +114,12 @@ const Bytes kPresence = {0xA5, 0x3C};
 
 chunkdb::ChunkStateImage Parse(
     const Bytes& bytes,
-    const chunkdb::FeatureFlags& store_features = kNoFeatures) {
+    const chunkdb::FeatureFlags& store_features = kBaseFeatures) {
     return chunkdb::ParseChunkImage(bytes, kGeometry, kCoord, kStoreId, store_features);
 }
 
 void ExpectRejected(const Bytes& bytes, const std::string& reason,
-                    const chunkdb::FeatureFlags& store_features = kNoFeatures) {
+                    const chunkdb::FeatureFlags& store_features = kBaseFeatures) {
     try {
         (void)Parse(bytes, store_features);
     } catch (const std::runtime_error& e) {
@@ -143,13 +145,13 @@ void TestRoundTripWithAndWithoutCompression() {
         assert(image.revision == 42U);
         assert(image.commit_time_ms == 1727786400123ULL);
         // Section flags say how each body is stored.
-        const std::uint16_t flags = static_cast<std::uint16_t>(bytes[74] | (bytes[75] << 8));
+        const std::uint16_t flags = static_cast<std::uint16_t>(bytes[78] | (bytes[79] << 8));
         assert(flags == (compression == chunkdb::CheckpointCompression::kZrle ? 1U : 0U));
     }
-    // The format as specified: 108 header bytes for two sections, then bodies.
+    // The format as specified: 112 header bytes for two sections, then bodies.
     const auto raw = chunkdb::SerializeChunkImage(
         kGeometry, kCoord, payload, kPresence, chunkdb::CheckpointCompression::kNone, 42, 0, kStoreId);
-    assert(raw.size() == 108U + kPayloadBytes + kPresenceBytes);
+    assert(raw.size() == 112U + kPayloadBytes + kPresenceBytes);
     assert(raw == BuildImage(HeaderWith([&](Header& h) { h.commit_time_ms = 0; }), {Raw(1, payload), Raw(2, kPresence)}));
 }
 
@@ -165,8 +167,8 @@ void TestMalformedImagesRejected() {
     }
     {
         auto bytes = good;
-        bytes[8] = 2;
-        ExpectRejected(bytes, "unsupported chunk image version 2");
+        bytes[8] = 3;
+        ExpectRejected(bytes, "unsupported chunk image version 3");
     }
     ExpectRejected(Bytes(good.begin(), good.begin() + 60), "too small");
     {
@@ -187,22 +189,22 @@ void TestMalformedImagesRejected() {
     {
         auto section = Raw(2, kPresence);
         section.flags = 0x0004;
-        ExpectRejected(BuildImage(Header{}, {Raw(1, payload), section}), "unknown flags");
+        ExpectRejected(BuildImage(Header{}, {Raw(1, payload), section}), "section flags are invalid");
     }
     ExpectRejected(BuildImage(Header{}, {Raw(1, Bytes(kPayloadBytes + 1, 0)), Raw(2, kPresence)}),
                    "wrong size for the store geometry");
     {
         auto section = Raw(2, kPresence);
         section.raw_size = 3;
-        ExpectRejected(BuildImage(Header{}, {Raw(1, payload), section}), "stored and raw sizes differ");
+        ExpectRejected(BuildImage(Header{}, {Raw(1, payload), section}), "uncompressed chunk image section sizes differ");
     }
     {
         auto bytes = good;
         bytes.pop_back();
-        ExpectRejected(bytes, "extends past the end");
+        ExpectRejected(bytes, "sections do not fill complete file");
         bytes = good;
         bytes.push_back(0);
-        ExpectRejected(bytes, "bytes after its last section");
+        ExpectRejected(bytes, "sections do not fill complete file");
     }
     {
         // A compressed body that decodes to the wrong size.
@@ -217,10 +219,10 @@ void TestMalformedImagesRejected() {
         auto other = kStoreId;
         other[0] ^= 0xFFU;
         ExpectRejected(BuildImage(HeaderWith([&](Header& h) { h.store_id = other; }), {Raw(1, payload), Raw(2, kPresence)}),
-                       "belongs to another store");
+                       "belongs to another epoch");
     }
     ExpectRejected(BuildImage(HeaderWith([&](Header& h) { h.coord = {0, 0}; }), {Raw(1, payload), Raw(2, kPresence)}),
-                   "coordinate mismatch");
+                   "belongs to another chunk");
     ExpectRejected(BuildImage(HeaderWith([&](Header& h) { h.revision = 0; }), {Raw(1, payload), Raw(2, kPresence)}),
                    "revision is zero");
     {
@@ -231,12 +233,12 @@ void TestMalformedImagesRejected() {
 
 void TestFeatureFlagsInImages() {
     const auto payload = SamplePayload();
-    const chunkdb::FeatureFlags compat{.incompat = 0, .ro_compat = 0, .compat = 1U << 4U};
+    const chunkdb::FeatureFlags compat{.incompat = chunkdb::kChunkModelFormatBit, .ro_compat = 0, .compat = 1U << 4U};
     const auto with_extra = BuildImage(
         HeaderWith([&](Header& h) { h.features = compat; }), {Raw(1, payload), Raw(2, kPresence), Raw(7, {9, 9, 9})});
 
     // The image may not use a feature the store does not record.
-    ExpectRejected(with_extra, "uses features the store does not");
+    ExpectRejected(with_extra, "features exceed table envelope");
     // When the store has it and this build does not know it, the section it
     // owns is checked and skipped; the known state still loads.
     const auto image = Parse(with_extra, compat);
@@ -256,7 +258,7 @@ void TestFeatureFlagsInImages() {
     ExpectRejected(
         BuildImage(HeaderWith([&](Header& h) { h.features = compat; }),
                    {Raw(1, payload), Raw(2, kPresence), huge}),
-        "more than 67108864", compat);
+        "exceeds section byte limit", compat);
 }
 
 std::uint64_t NowMs() {

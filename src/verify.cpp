@@ -153,7 +153,7 @@ void VerifyChunkFile(
     VerifyCounters* counters) {
     *image_ok = false;
     try {
-        const auto bytes = chunkdb::LoadFile(path);
+        const auto bytes = chunkdb::LoadChunkImageFile(path, geometry, coord, manifest.store_id, manifest.features);
         auto image = chunkdb::ParseChunkImage(
             bytes, geometry, coord, manifest.store_id, manifest.features);
         *payload_out = std::move(image.payload);
@@ -228,7 +228,8 @@ void VerifyFeedArtifacts(
         }
         try {
             if (base) {
-                const auto image = chunkdb::ParseChunkImage(chunkdb::LoadFile(file.path()), geometry,
+                const auto image = chunkdb::ParseChunkImage(chunkdb::LoadChunkImageFile(file.path(), geometry,
+                    coord, manifest.store_id, manifest.features), geometry,
                     coord, manifest.store_id, manifest.features);
                 if (image.revision >= first) throw std::runtime_error("base revision overlaps the archive WAL");
                 // A base without an archive is valid after a crash before the
@@ -239,10 +240,12 @@ void VerifyFeedArtifacts(
             auto payload = std::vector<std::uint8_t>(geometry.ChunkPayloadBytes(), 0U);
             auto presence = std::vector<std::uint8_t>(chunkdb::ChunkPresenceBitmapBytes(geometry), 0U);
             chunkdb::ChunkVars vars;
+            std::shared_ptr<const chunkdb::ChunkColumnState> chunk_columns;
             std::uint64_t base_revision = 0U, base_schema = 0U;
             const auto linked = directory / (name.substr(0U, dot + 1U) + std::to_string(first) + ".chk");
             if (std::filesystem::exists(linked)) {
-                auto image = chunkdb::ParseChunkImage(chunkdb::LoadFile(linked), geometry,
+                auto image = chunkdb::ParseChunkImage(chunkdb::LoadChunkImageFile(linked, geometry,
+                    coord, manifest.store_id, manifest.features), geometry,
                     coord, manifest.store_id, manifest.features);
                 if (image.revision >= first) throw std::runtime_error("base revision overlaps the archive WAL");
                 base_revision = image.revision;
@@ -250,14 +253,16 @@ void VerifyFeedArtifacts(
                 payload = std::move(image.payload);
                 presence = std::move(image.presence_bitmap);
                 vars = std::move(image.vars);
+                chunk_columns = std::move(image.chunk_columns);
             }
             const auto bytes = chunkdb::LoadFile(file.path());
             const auto replay = chunkdb::ReplayWal(bytes, geometry, coord, manifest.store_id,
-                manifest.features, base_revision, base_schema, &payload, &presence, &vars);
+                manifest.features, base_revision, base_schema, &payload, &presence, &vars, nullptr, &chunk_columns);
             if (!replay.replayable || replay.tail_truncated_or_corrupt || !replay.vars_problem.empty())
                 throw std::runtime_error("archive WAL is damaged: " + replay.stop_reason + " " + replay.vars_problem);
-            if (replay.applied_frames == 0U || bytes.size() < chunkdb::kWalHeaderSize + 12U ||
-                chunkdb::ReadLe64(bytes, chunkdb::kWalHeaderSize + 4U) != first || replay.revision != last)
+            const auto header_size = chunkdb::ChunkWalHeaderBytes(geometry.dims());
+            if (replay.applied_frames == 0U || bytes.size() < header_size + 12U ||
+                chunkdb::ReadLe64(bytes, header_size + 4U) != first || replay.revision != last)
                 throw std::runtime_error("archive revision range disagrees with its name");
         } catch (const std::exception& error) {
             Report(counters, true, base ? "feed_archive_base_invalid" : "feed_archive_wal_invalid", file.path(), error.what());
@@ -313,7 +318,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                         "unknown " + chunkdb::DescribeFeatures(unknown) +
                             "; data owned by those features was not checked");
                 }
-                store_geometry.emplace(manifest->geometry, manifest->schema);
+                store_geometry.emplace(manifest->geometry, manifest->schema, *manifest->chunk_schema);
                 store_manifest = manifest;
             }
         } else {
@@ -562,6 +567,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                     std::vector<std::uint8_t> presence(
                         (geometry.ChunkBlockCount() + 7U) / 8U, 0U);
                     chunkdb::ChunkVars vars;
+                    std::shared_ptr<const chunkdb::ChunkColumnState> chunk_columns;
                     // Seed replay from the checkpoint image when present.
                     bool base_ok = true;
                     std::uint64_t base_revision = 0;
@@ -570,7 +576,8 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                         chunkdb::ChunkDataPath(data_dir, geometry, coord);
                     if (std::filesystem::exists(image_path)) {
                         try {
-                            const auto image_bytes = chunkdb::LoadFile(image_path);
+                            const auto image_bytes = chunkdb::LoadChunkImageFile(image_path, geometry, coord,
+                                store_manifest->store_id, store_manifest->features);
                             auto image =
                                 chunkdb::ParseChunkImage(
                                     image_bytes, geometry, coord, store_manifest->store_id,
@@ -578,6 +585,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                             payload = std::move(image.payload);
                             presence = std::move(image.presence_bitmap);
                             vars = std::move(image.vars);
+                            chunk_columns = std::move(image.chunk_columns);
                             base_revision = image.revision;
                             base_schema_version = image.schema_version;
                         } catch (...) {
@@ -588,7 +596,8 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                     }
                     const auto replay = chunkdb::ReplayWal(
                         wal_bytes, geometry, coord, store_manifest->store_id,
-                        store_manifest->features, base_revision, base_schema_version, &payload, &presence, &vars);
+                        store_manifest->features, base_revision, base_schema_version, &payload, &presence, &vars,
+                        nullptr, &chunk_columns);
                     if (replay.torn_creation) {
                         Report(
                             counters, false, "wal_torn_creation", file.path(),
@@ -658,20 +667,21 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                 continue;
             }
             if (chunkdb::IsTxnIntentArtifactName(file_name)) {
-                // A transaction intent (CKTB or CKTC) the next writer start
+                // A checked transaction intent the next writer start
                 // resolves.
                 ++counters->checked;
                 try {
                     chunkdb::TxnIntent intent;
                     if (!chunkdb::IsTxnIntentFileName(file_name) ||
-                        !chunkdb::TryParseTxnIntent(chunkdb::LoadFile(file.path()), &intent) ||
+                        !chunkdb::TryParseTxnIntent(chunkdb::LoadFile(file.path()), &intent,
+                            store_manifest->geometry.dims, store_manifest->store_id) ||
                         file_name != chunkdb::TxnIntentPath(data_dir, intent.version).filename().string()) {
                         Report(
                             counters,
                             true,
                             "txn_intent_invalid",
                             file.path(),
-                            "expected a CKTB-or-CKTC record named txn-<version>.rollback");
+                            "expected a checked transaction intent named txn-<version>.rollback");
                         continue;
                     }
                     Report(
