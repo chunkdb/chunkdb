@@ -518,55 +518,69 @@ class AdmissionSchedule : public FeedDeliveryTestHook {
   public:
     void Run(Point point, std::size_t bytes) override {
         std::unique_lock lock(mutex_);
-        if (point == Point::kBeforeIoScan && !entered_) {
+        if (point == Point::kBeforeIoScan && armed_ && !entered_) {
             entered_ = true; cv_.notify_all();
             cv_.wait(lock, [&] { return released_; });
         } else if (point == Point::kAfterAdmission) {
             admitted_ = bytes; cv_.notify_all();
         } else if (point == Point::kAfterIoAdd) {
-            added_ = true; cv_.notify_all();
+            ++added_; cv_.notify_all();
         }
+    }
+    void Arm() {
+        std::unique_lock lock(mutex_);
+        assert(cv_.wait_for(lock, 10s, [&] { return added_ == 1U && admitted_ != 0U; }));
+        added_ = 0U; admitted_ = 0U; armed_ = true;
     }
     void WaitForScan() { std::unique_lock lock(mutex_); assert(cv_.wait_for(lock, 10s, [&] { return entered_; })); }
     std::size_t WaitForAdmission() {
         std::unique_lock lock(mutex_); assert(cv_.wait_for(lock, 10s, [&] { return admitted_ != 0U; }));
         return admitted_;
     }
-    void WaitForJoin() { std::unique_lock lock(mutex_); assert(cv_.wait_for(lock, 10s, [&] { return added_; })); }
+    void WaitForJoin(std::size_t count) { std::unique_lock lock(mutex_); assert(cv_.wait_for(lock, 10s, [&] { return added_ >= count; })); }
     void Release() { std::lock_guard lock(mutex_); released_ = true; cv_.notify_all(); }
   private:
     std::mutex mutex_; std::condition_variable cv_;
-    bool entered_ = false, released_ = false, added_ = false;
-    std::size_t admitted_ = 0U;
+    bool armed_ = false, entered_ = false, released_ = false;
+    std::size_t admitted_ = 0U, added_ = 0U;
 };
 void AdmittedChangeSurvivesShareShrink(bool tls) {
     AdmissionSchedule schedule; // Outlives both delivery threads.
-    constexpr std::size_t budget = 1536U;
+    constexpr std::size_t budget = 32768U;
+    constexpr std::size_t ordinary_count = 3U;
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
-    auto writer = harness.Connect(); Create(*writer);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label text(4096)) CHUNK 4 x 4");
+    writer->Ok("CREATE SLOT 'consumer' ON t");
     auto table = harness.catalog->Find("t");
+    FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    Cleanup cleanup([&] { schedule.Release(); FeedDeliveryTestAccess::SetHook(harness.server(), nullptr); });
     auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
     // First delivery establishes activation, schema and the full initial quota.
     const auto first = Set(*writer, 1); FeedSlotTestAccess::Sync(*table);
     assert(Change(NextChange(*watch)) == first);
-    FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
-    Cleanup cleanup([&] { schedule.Release(); FeedDeliveryTestAccess::SetHook(harness.server(), nullptr); });
+    schedule.Arm(); // Initial publication callbacks must finish before counting new joins.
+    FeedDeliveryTestAccess::SetHook(harness.server(), &schedule); // Wake the armed I/O scan.
     schedule.WaitForScan(); // Hold I/O before its next incoming-watch/quota scan.
     writer->Ok("BEGIN");
     for (unsigned x = 0U; x < 6U; ++x)
         assert(writer->Command("SET BLOCK " + std::to_string(x % 4U) + " " + std::to_string(x / 4U) +
-            " IN t label = '" + std::string(110U, 'x') + "'").type == '_');
+            " IN t label = '" + std::string(1500U, 'x') + "'").type == '_');
     const auto revision = Number(writer->Command("COMMIT"));
     FeedSlotTestAccess::Sync(*table);
     const auto admitted = schedule.WaitForAdmission();
-    assert(admitted > budget / 2U && admitted <= budget - 128U);
-    auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t"));
-    schedule.WaitForJoin(); // Plain WATCH is really handed to the I/O thread.
-    schedule.Release(); // The scan now halves the slot share before taking its accepted output.
+    assert(admitted > budget / (ordinary_count + 1U) && admitted <= budget - 128U);
+    std::vector<std::unique_ptr<Client>> ordinary;
+    for (std::size_t i = 0U; i < ordinary_count; ++i) {
+        ordinary.push_back(harness.Connect());
+        (void)Start(ordinary.back()->Command("WATCH t"));
+    }
+    schedule.WaitForJoin(ordinary_count); // Every plain WATCH is handed to the I/O thread.
+    schedule.Release(); // The scan reduces the slot share below its accepted output.
     const auto change = watch->Read(); assert(Change(change, 6U) == revision);
     watch->Line("ACK " + std::to_string(revision)); Unwatch(*watch);
     assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == revision);
-    Unwatch(*ordinary);
+    for (auto& client : ordinary) Unwatch(*client);
 }
 
 void LostAndDrop(bool tls) {
