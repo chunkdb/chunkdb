@@ -101,6 +101,7 @@ struct CatalogConfig {
     std::chrono::milliseconds slot_sync_interval = kDefaultSlotSyncInterval;
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::chrono::milliseconds feed_linger{30000};
+    QueryLimits query_limits{};
 };
 
 // A catalog configuration whose new-table options and shared budgets come
@@ -372,6 +373,7 @@ class TableCatalog {
         return config_.data_dir;
     }
     [[nodiscard]] AccessMode access_mode() const noexcept { return config_.access_mode; }
+    [[nodiscard]] const QueryLimits& query_limits() const noexcept { return config_.query_limits; }
     [[nodiscard]] const TableOptions& default_options() const noexcept {
         return config_.default_options;
     }
