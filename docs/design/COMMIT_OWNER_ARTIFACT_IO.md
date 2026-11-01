@@ -18,7 +18,7 @@ A writer additionally borrows an existing exclusive ProcessLock for its entire l
 The fixed `.chunkdb.lock` directory is itself opened relative to the pinned root with no-follow directory admission; matching a lock-file hard link under a different root is insufficient.
 A lock for another directory, a missing lock, read-only access or an incompatible shared-writer context cannot create an artifact writer.
 ProcessLock retains an actual root-directory native owner captured during acquisition before opening pathname-based lock children; inode numbers without a retained owner cannot protect against directory deletion and reuse.
-Post-acquisition admission binds the fixed lock child under that pinned root to the acquired native lock before initialization is reported.
+Post-acquisition artifact admission binds the fixed lock child under that pinned root to the acquired native lock before an initialized artifact lease is reported.
 The root owner is close-on-exec or noninheritable, receives failure cleanup and outlives artifact borrowers; this adds startup ownership without ordinary request-path operations or a claim about existing heartbeat pathname races.
 The caller retains the real lock until all artifact writers are destroyed; the foundation neither takes over nor releases that lock.
 
