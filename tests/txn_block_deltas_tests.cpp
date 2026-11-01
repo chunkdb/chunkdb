@@ -122,7 +122,12 @@ void JournalAndRebase() {
             journal.Publish(journal.Prepare(key, snapshot, TxnBlockAction::kObserve));
             auto replacement = Row(geometry, 8U);
             journal.Publish(journal.Prepare(key, snapshot, TxnBlockAction::kReplace, &replacement));
-            journal.Publish(journal.Prepare(key, snapshot, TxnBlockAction::kObserve));
+            TxnBlockSnapshot private_observation;
+            private_observation.row = CloneTxnBlockRow(replacement, private_observation.row.resource());
+            private_observation.version = snapshot.version; private_observation.commit_time_ms = snapshot.commit_time_ms;
+            private_observation.written = snapshot.written;
+            journal.Publish(journal.Prepare(key, private_observation, TxnBlockAction::kReplace, &replacement));
+            journal.Publish(journal.Prepare(key, private_observation, TxnBlockAction::kObserve));
             assert(journal.rows().begin()->second.before.row == original);
             assert(*journal.Read(key) == replacement);
             auto late = journal.Prepare(key, snapshot, TxnBlockAction::kDelete);
@@ -156,7 +161,7 @@ class FailingResource final : public std::pmr::memory_resource {
 };
 void Accounting() {
     std::size_t local = 0U; std::atomic<std::size_t> global{0U};
-    TxnBlockMemoryResource memory(local, global, 100U, 100U);
+    TxnBlockMemoryResource memory(local, global, 100U, 200U);
     auto* allocation = memory.allocate(100U);
     assert(local == 100U && global == 100U);
     Reject([&] { (void)memory.allocate(1U); });
