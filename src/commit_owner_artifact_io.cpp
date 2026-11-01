@@ -619,23 +619,28 @@ void CommitOwnerArtifactIo::RequireRestoreGuard() const {
 void CommitOwnerArtifactIo::RequireRestoreDirectory() const {
     bool matches = false;
     try { matches = MatchesDirectory(impl_->directory); }
-    catch (const std::runtime_error& error) { throw CommitOwnerRestoreOwnershipError(error.what()); }
+    catch (const std::exception& error) { throw CommitOwnerRestoreOwnershipError(error.what()); }
     if (!matches) throw CommitOwnerRestoreOwnershipError("native directory generation changed");
 }
 
 void CommitOwnerArtifactIo::RewriteRestoredInactive(const CommitOwnerScope& source_scope,
     const CommitOwnerScope& destination_scope) {
-    RequireRestoreGuard();
     RequireRestoreDirectory();
-    auto writable_root = OpenRoot(impl_->directory, true);
-    if (!SameObject(writable_root.get(), impl_->root.get()))
-        throw CommitOwnerRestoreOwnershipError("writable native directory generation changed");
-    CheckCreationCapability(writable_root); SyncDirectory(writable_root, impl_->directory);
-    auto previous = OpenChild(writable_root, kRoot, false, false, false, false, impl_->directory / kRoot);
+    RequireRestoreGuard();
+    auto previous = OpenChild(impl_->root, kRoot, false, true, false, false, impl_->directory / kRoot);
     CommitOwnerRoot source; source.scope = source_scope;
     const auto old_bytes = SerializeCommitOwnerRoot(source);
     if (ReadChecked(previous, source_scope, CommitOwnerObjectKind::kRoot) !=
         std::vector<std::uint8_t>(old_bytes.begin(), old_bytes.end())) Damage("copied source owner is not initial INACTIVE");
+    SyncFile(previous, impl_->directory / kRoot);
+    Native writable_root;
+    bool matches = false;
+    try {
+        writable_root = OpenRoot(impl_->directory, true);
+        matches = SameObject(writable_root.get(), impl_->root.get());
+    } catch (const std::exception& error) { throw CommitOwnerRestoreOwnershipError(error.what()); }
+    if (!matches) throw CommitOwnerRestoreOwnershipError("writable native directory generation changed");
+    CheckCreationCapability(writable_root); SyncDirectory(writable_root, impl_->directory);
     CommitOwnerRoot destination; destination.scope = destination_scope;
     const auto bytes = SerializeCommitOwnerRoot(destination);
     const auto temporary = std::string(".owner-restore-") + Hex(crypto::RandomBytes(16U));

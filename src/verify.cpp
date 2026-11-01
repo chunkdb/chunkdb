@@ -26,6 +26,7 @@
 #include "feature_flags.hpp"
 #include "feature_activation_records.hpp"
 #include "feed_archive.hpp"
+#include "feed_prefix.hpp"
 #include "feed_slot_records.hpp"
 #include "migrations_records.hpp"
 #include "store_manifest.hpp"
@@ -324,6 +325,7 @@ void VerifyChunkArtifacts(const std::filesystem::path& root, const chunkdb::Geom
     if (std::filesystem::exists(image_path)) {
         ++counters->checked;
         try {
+            chunkdb::FeedWalPrefixTestAccess::Run(chunkdb::FeedWalPrefixTestHook::Point::kImageRead, coord);
             auto image = chunkdb::ParseChunkImage(chunkdb::LoadChunkImageFile(image_path, geometry,
                 coord, manifest.store_id, manifest.features), geometry, coord, manifest.store_id, manifest.features);
             payload = std::move(image.payload); presence = std::move(image.presence_bitmap);
@@ -1032,6 +1034,13 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         } else {
             owner_scope = manifest->commit_owner;
             if (owner_scope) (void)chunkdb::CommitOwnerBootstrap::ReadInactiveRoot(data_dir, *owner_scope);
+            else if (std::filesystem::symlink_status(data_dir / "chunkdb.groups.owner").type() != std::filesystem::file_type::not_found) {
+                const auto pending = chunkdb::ReadFeatureActivationJournal(data_dir);
+                if (!pending || pending->feature != chunkdb::kFeatureCommitGroups || !pending->commit_owner)
+                    throw std::runtime_error("unclaimed canonical commit owner exists");
+                chunkdb::ValidateFeatureActivationJournal(data_dir, *pending);
+                (void)chunkdb::CommitOwnerBootstrap::ReadInactiveRoot(data_dir, *pending->commit_owner);
+            }
             ReportFeatures(counters, manifest_path, manifest->features);
             const auto unknown = chunkdb::UnknownFeatures(manifest->features);
             if (unknown.incompat != 0U) {

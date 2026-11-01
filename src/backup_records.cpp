@@ -581,7 +581,7 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
     if (directory_manifest.commit_owner) {
         (void)CommitOwnerBootstrap::ReadInactiveRoot(root, *directory_manifest.commit_owner);
         allowed.insert("chunkdb.groups.owner");
-    }
+    } else if (Present(root / "chunkdb.groups.owner")) throw std::runtime_error("unclaimed canonical commit owner exists");
     std::set<StoreId> epochs;
     for (const auto& cut : record.tables) {
         Cancelled(cancelled);

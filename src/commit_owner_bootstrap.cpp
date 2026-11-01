@@ -191,13 +191,16 @@ void CommitOwnerBootstrap::CompleteFeatureOwner(const std::filesystem::path& dir
 
 DataDirManifest CommitOwnerBootstrap::RewriteInactiveRestore(const std::filesystem::path& private_copy,
     const BackupRecord& admitted_backup) {
-    const auto name = private_copy.filename().string();
-    constexpr std::string_view prefix = ".chunkdb.restore.";
-    if (!name.starts_with(prefix) || name.size() != prefix.size() + 32U ||
-        !std::all_of(name.begin() + static_cast<std::ptrdiff_t>(prefix.size()), name.end(), [](char byte) {
-            return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
-        })) Bad("restore copy has no private operation name");
-    auto pinned = CommitOwnerArtifactIo::OpenBootstrapDirectory(private_copy);
+    std::shared_ptr<CommitOwnerArtifactIo> pinned;
+    try {
+        const auto name = private_copy.filename().string();
+        constexpr std::string_view prefix = ".chunkdb.restore.";
+        if (!name.starts_with(prefix) || name.size() != prefix.size() + 32U ||
+            !std::all_of(name.begin() + static_cast<std::ptrdiff_t>(prefix.size()), name.end(), [](char byte) {
+                return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+            })) Bad("restore copy has no private operation name");
+        pinned = CommitOwnerArtifactIo::OpenBootstrapDirectory(private_copy);
+    } catch (const std::exception& error) { throw CommitOwnerRestoreOwnershipError(error.what()); }
     pinned->RequireRestoreGuard();
     ValidateBackupContents(private_copy, admitted_backup);
     const auto bytes = pinned->ReadManifestBytes(true);

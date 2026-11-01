@@ -78,6 +78,8 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_TARGET_GUARD_ONCE");
     const auto source_manifest = ReadDataDirManifest(config_.data_dir);
     if (!source_manifest) throw std::runtime_error("backup source catalog manifest disappeared");
+    if (!source_manifest->commit_owner && std::filesystem::symlink_status(config_.data_dir / "chunkdb.groups.owner").type() !=
+            std::filesystem::file_type::not_found) throw std::runtime_error("unclaimed canonical commit owner exists");
     const auto owner_bytes = source_manifest->commit_owner ?
         CommitOwnerBootstrap::ReadInactiveRoot(config_.data_dir, *source_manifest->commit_owner) : std::vector<std::uint8_t>{};
     // The writer lock and backup guard exclude every other backup of this

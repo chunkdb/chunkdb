@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
+#include <type_traits>
 
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/table_catalog.hpp"
@@ -12,6 +13,7 @@
 #include "checkpoint.hpp"
 #include "commit_owner_bootstrap.hpp"
 #include "feature_activation_records.hpp"
+#include "feed_prefix.hpp"
 #include "process_lock.hpp"
 #include "test_utils.hpp"
 #include "verify.hpp"
@@ -293,6 +295,86 @@ void WrongPendingRootRefusesBeforeInventory() {
     assert(LoadFile(temporary.path() / kCommitOwnerBootstrapName) == decision);
 }
 
+void OwnerAdmissionPrecedesChunkReads() {
+    test::ScopedTempDir temporary("chunkdb-owner-verify-read-admission");
+    CatalogConfig config; config.data_dir = temporary.path(); config.background_maintenance = false;
+    {
+        TableCatalog catalog(config);
+        auto table = catalog.Create("alpha", {1U, 1U, 2U, 2U, 8U}, config.default_options);
+        auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, "10000000");
+        lease->store().CheckpointForTests(0, 0);
+    }
+    struct Reads : FeedWalPrefixTestHook {
+        std::size_t images = 0U;
+        void Run(Point point, ChunkCoord) override { if (point == Point::kImageRead) ++images; }
+        ~Reads() override { FeedWalPrefixTestAccess::SetHook(nullptr); }
+    } reads;
+    FeedWalPrefixTestAccess::SetHook(&reads);
+    std::ostringstream findings;
+    assert(VerifyDataDirectory(temporary.path(), findings).errors == 0U && reads.images > 0U);
+    const auto source = LoadFile(temporary.path() / "chunkdb.groups.owner");
+    const auto scope = *ReadDataDirManifest(temporary.path())->commit_owner;
+    for (const auto* damage : {"missing", "generation", "active", "pending"}) {
+        if (std::string_view(damage) == "missing") {
+            std::filesystem::remove(temporary.path() / "chunkdb.groups.owner");
+        } else {
+            CommitOwnerRoot root; root.scope = scope; root.generation = 2U;
+            if (std::string_view(damage) != "generation") {
+                root.state = CommitOwnerState::kActive;
+                root.coverage_tree = {CommitOwnerObjectKind::kPage, 92U, {1U}};
+                root.group_tree = {CommitOwnerObjectKind::kPage, 92U, {2U}};
+                root.journal_inventory = {CommitOwnerObjectKind::kJournalInventory, 128U, {3U}};
+                root.id_inventory = {CommitOwnerObjectKind::kIdInventory, 164U, {4U}};
+                root.reference_context = {scope.directory_id, {7U}, 1U};
+                root.reference_replay.bytes = 64U; root.reference_replay.sha256 = {8U};
+                if (std::string_view(damage) == "pending") {
+                    root.state = CommitOwnerState::kPending; root.generation = 3U;
+                    root.replacement_plan = {CommitOwnerObjectKind::kReplacementPlan, 68U, {5U}};
+                    root.previous_root = {CommitOwnerObjectKind::kRoot, 512U, {6U}};
+                }
+            }
+            Save(temporary.path() / "chunkdb.groups.owner", SerializeCommitOwnerRoot(root));
+        }
+        reads.images = 0U; findings.str(""); findings.clear();
+        assert(VerifyDataDirectory(temporary.path(), findings).errors > 0U);
+        assert(reads.images == 0U);
+        Save(temporary.path() / "chunkdb.groups.owner", source);
+    }
+}
+
+void UnclaimedOwnersRefuseEverySurface() {
+    test::ScopedTempDir temporary("chunkdb-owner-unclaimed-surfaces");
+    const auto source = temporary.path() / "source", backup = temporary.path() / "backup";
+    std::filesystem::create_directories(source / "tables");
+    DataDirManifest manifest{.features = {.incompat = kFeatureChunkModel}, .data_dir_id = NewStoreId(), .options = {}};
+    Save(DataDirManifestPath(source), SerializeDataDirManifest(manifest));
+    CommitOwnerRoot unclaimed; unclaimed.scope = {manifest.data_dir_id, NewStoreId(), CommitOwnerRole::kCatalog};
+    const auto root_bytes = SerializeCommitOwnerRoot(unclaimed);
+    {
+        CatalogConfig config; config.data_dir = source; config.background_maintenance = false;
+        TableCatalog catalog(config);
+        (void)catalog.BackupTo(backup, {});
+        Save(source / "chunkdb.groups.owner", root_bytes);
+        std::ostringstream findings;
+        assert(VerifyDataDirectory(source, findings).errors > 0U);
+        assert(findings.str().find("unclaimed canonical commit owner") != std::string::npos);
+        Reject([&] { (void)CommitOwnerBootstrap::AdmitDirectory(source); });
+        const auto refused = temporary.path() / "refused-backup";
+        Reject([&] { (void)catalog.BackupTo(refused, {}); });
+        assert(!std::filesystem::exists(refused / kBackupMarkerName));
+        assert(LoadFile(source / "chunkdb.groups.owner") == Bytes(root_bytes.begin(), root_bytes.end()));
+    }
+    Save(backup / "chunkdb.groups.owner", root_bytes);
+    auto record = ReadBackupRecord(backup);
+    record.files.push_back(InspectBackupFile(backup, "chunkdb.groups.owner"));
+    Save(backup / kBackupMarkerName, SerializeBackupRecord(record));
+    Reject([&] { ValidateBackupInventory(backup, record); });
+    const auto destination = temporary.path() / "refused-restore";
+    Reject([&] { RestoreBackup(backup, destination); });
+    assert(!std::filesystem::exists(destination));
+    assert(LoadFile(backup / "chunkdb.groups.owner") == Bytes(root_bytes.begin(), root_bytes.end()));
+}
+
 int RunChild(const std::string& executable, const char* mode, const std::filesystem::path& directory, const char* point) {
     const auto command = "\"" + executable + "\" \"" + mode + "\" \"" + directory.string() + "\" \"" + point + "\"";
 #ifdef _WIN32
@@ -439,6 +521,42 @@ void InactiveBackupRestore(const std::string& executable) {
         assert(LoadFile(backup / "chunkdb.groups.owner") == source_root);
         std::filesystem::remove_all(substituted); std::filesystem::remove_all(held);
     }
+    for (const bool deny_diagnostics : {false, true}) {
+        const auto parent = std::filesystem::canonical(temporary.path());
+        const auto held = parent / (deny_diagnostics ? "held-reopen-allocation" : "held-reopen-failure");
+        const auto target = parent / (deny_diagnostics ? "reopen-allocation-target" : "reopen-failure-target");
+        std::filesystem::path substituted;
+        std::optional<owner_artifact_allocation::Guard> allocation;
+        const auto denied = owner_artifact_allocation::denied.load();
+        struct Observer { ~Observer() { SetFileSyncObserverForTests({}); } } observer;
+        SetFileSyncObserverForTests([&](const auto& path) {
+            if (!substituted.empty() || path.filename() != "chunkdb.groups.owner" ||
+                !path.parent_path().filename().string().starts_with(".chunkdb.restore.") ||
+                path.parent_path().parent_path() != parent) return;
+            substituted = path.parent_path();
+            std::filesystem::rename(substituted, held);
+            Save(substituted, Bytes{'k', 'e', 'e', 'p'});  // A regular leaf, not another openable directory.
+            if (deny_diagnostics) allocation.emplace(0U);
+        });
+        bool classified = false, escaped = false;
+        try { RestoreBackup(backup, target); }
+        catch (const CommitOwnerRestoreOwnershipError& error) {
+            static_assert(std::is_nothrow_copy_constructible_v<CommitOwnerRestoreOwnershipError>);
+            static_assert(noexcept(error.what()));
+            const auto copied = error;
+            classified = std::string_view(copied.what()) == error.what() &&
+                std::string_view(copied.what()).find("restore private directory ownership is uncertain:") == 0U;
+        } catch (const std::exception&) { escaped = true; }
+        allocation.reset(); SetFileSyncObserverForTests({});
+        assert(classified && !escaped && !substituted.empty());
+        if (deny_diagnostics) assert(owner_artifact_allocation::denied.load() > denied);
+        assert(!std::filesystem::exists(target));
+        assert(std::filesystem::is_regular_file(substituted));
+        assert(LoadFile(substituted) == (Bytes{'k', 'e', 'e', 'p'}));
+        assert(LoadFile(held / kRestoreIncompleteName) == (Bytes{'C', 'K', 'R', 'I'}));
+        assert(LoadFile(backup / "chunkdb.groups.owner") == source_root);
+        std::filesystem::remove(substituted); std::filesystem::remove_all(held);
+    }
     const auto private_copy = temporary.path() / (".chunkdb.restore." + StoreIdHex(NewStoreId()));
     std::filesystem::copy(backup, private_copy, std::filesystem::copy_options::recursive);
     Save(private_copy / kRestoreIncompleteName, Bytes{'C', 'K', 'R', 'I'});
@@ -503,6 +621,7 @@ int main(int argc, char** argv) {
     HistoricalActivationRecoversWithoutOwner(); SparseDecisionAdmission();
     ReusedOwnerMustBeDurableBeforeManifest();
     WrongPendingRootRefusesBeforeInventory();
+    OwnerAdmissionPrecedesChunkReads(); UnclaimedOwnersRefuseEverySurface();
     CreationCrashBoundaries(argv[0]);
     InactiveBackupRestore(argv[0]);
 }

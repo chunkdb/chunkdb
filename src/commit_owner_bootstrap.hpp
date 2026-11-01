@@ -1,6 +1,8 @@
 #pragma once
 
 #include <filesystem>
+#include <array>
+#include <exception>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -19,12 +21,23 @@ class CommitOwnerStoreAdmission;
 class CommitOwnerDirectoryContext;
 struct BackupRecord;
 
-class CommitOwnerRestoreOwnershipError final : public std::runtime_error {
+class CommitOwnerRestoreOwnershipError final : public std::exception {
+  public:
+    CommitOwnerRestoreOwnershipError(const CommitOwnerRestoreOwnershipError&) noexcept = default;
+    CommitOwnerRestoreOwnershipError& operator=(const CommitOwnerRestoreOwnershipError&) noexcept = default;
+    [[nodiscard]] const char* what() const noexcept override { return diagnostic_.data(); }
   private:
     friend class CommitOwnerArtifactIo;
     friend class CommitOwnerBootstrap;
-    explicit CommitOwnerRestoreOwnershipError(const char* reason)
-        : std::runtime_error(std::string("restore private directory ownership is uncertain: ") + reason) {}
+    explicit CommitOwnerRestoreOwnershipError(const char* reason) noexcept {
+        std::size_t at = 0U;
+        const auto append = [&](const char* text) {
+            if (!text) return;
+            while (*text != '\0' && at + 1U < diagnostic_.size()) diagnostic_[at++] = *text++;
+        };
+        append("restore private directory ownership is uncertain: "); append(reason);
+    }
+    std::array<char, 512U> diagnostic_{};
 };
 
 inline constexpr std::string_view kCommitOwnerBootstrapName = "chunkdb.bootstrap.pending";
