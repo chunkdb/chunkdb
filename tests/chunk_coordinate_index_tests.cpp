@@ -2,12 +2,18 @@
 #include <cstdlib>
 #include <fstream>
 #include <functional>
+#include <iostream>
 #include <limits>
 #include <sstream>
 #include <string>
 #include <string_view>
 
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <sys/wait.h>
 #endif
 
@@ -131,8 +137,41 @@ void DurableCutsAndOrphanAdmission() {
     {
         ChunkCoordinateIndex owner(directory.path(), geometry, kTable, false);
         assert(owner.EmptyBoundary(coord)->revision == 2U && LoadFile(path) == with_suffix);
+#ifdef _WIN32
+        const auto original_link = path.parent_path() / "prefix-source";
+        std::filesystem::create_hard_link(path, original_link);
+        unsigned observed = 0U;
+        struct ResetObserver {
+            ~ResetObserver() { SetDirectorySyncObserverForTests({}); }
+        } reset_observer;
+        SetDirectorySyncObserverForTests([&](const std::filesystem::path& synced) {
+            if (synced != path.parent_path()) return;
+            // The replacement has published, but RewritePrefix has not yet
+            // returned. Its own reader must no longer pin the old inode.
+            const auto handle = CreateFileW(original_link.c_str(), GENERIC_READ, 0U,
+                nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            if (handle == INVALID_HANDLE_VALUE)
+                std::cerr << "prefix source still has a native reader: " << GetLastError() << '\n';
+            assert(handle != INVALID_HANDLE_VALUE);
+            assert(CloseHandle(handle) != 0);
+            ++observed;
+        });
+        if (kFailpointsCompiled) {
+            assert(_putenv_s("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE", "1") == 0);
+            const auto* armed = std::getenv("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE");
+            assert(armed != nullptr && armed[0] == '1');
+        }
+#endif
         owner.CompleteRecovery();
+#ifdef _WIN32
+        if (kFailpointsCompiled) {
+            const auto* remaining = std::getenv("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE");
+            assert(remaining == nullptr || remaining[0] == '\0');
+        }
+        assert(observed == 1U && LoadFile(original_link) == with_suffix);
+#endif
         assert(LoadFile(path) == bytes);
+        assert(owner.EmptyBoundary(coord)->revision == 2U && owner.EmptyBoundary(coord)->commit_time_ms == 20U);
     }
     auto damaged = bytes; damaged.back() ^= 1U;
     AtomicWrite(path, damaged, true, true);
