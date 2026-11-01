@@ -774,15 +774,40 @@ Value ProfileSettings(const Value& profile) {
     return settings;
 }
 
+namespace {
+std::string CanonicalWatch(std::string watch) {
+    const bool slots = watch.ends_with(":slots");
+    if (slots) watch.resize(watch.size() - 6U);
+    std::uint64_t count = 1U;
+    if (const auto colon = watch.find(':'); colon != std::string::npos) {
+        const auto text = std::string_view(watch).substr(colon + 1U);
+        const auto parsed = std::from_chars(text.data(), text.data() + text.size(), count);
+        if (parsed.ec != std::errc() || parsed.ptr != text.data() + text.size() || count == 0U)
+            Fail(ErrorKind::kValue, "Invalid subscriber count");
+        watch.resize(colon);
+    }
+    if (count != 1U || slots) watch += ":" + std::to_string(count);
+    if (slots) watch += ":slots";
+    return watch;
+}
+}  // namespace
+
 Value SummarizeProfile(const Value& name, const Value& mode, const Value& requests, const Value& clients,
                        const Value& keyspace, const Value& gates, const Value& samples, const Value& budget,
-                       const Value& watch) {
+                       const Value& watch, bool watch_both) {
     if (!samples.IsObject()) {
         Fail(ErrorKind::kAttribute, "'" + TypeName(samples) + "' object has no attribute 'items'");
     }
     Value builds = Value::Object();
     std::vector<Value> observations;
     for (const Member& member : samples.Members()) {
+        if (watch_both) {
+            const auto expected_watch = Value::Str(CanonicalWatch(watch.AsString()));
+            for (const auto& sample : member.value.Items()) {
+                if (!PyEqual(GetOr(GetItem(sample, "report"), "watch"), expected_watch))
+                    Fail(ErrorKind::kValue, "Subscriber settings do not match the raw benchmark report");
+            }
+        }
         const Value first = GetIndex(member.value, 0);
         Value build = Value::Object();
         for (const std::string_view field : kBuildFields) {
@@ -872,7 +897,7 @@ Value SummarizeProfile(const Value& name, const Value& mode, const Value& reques
     profile.Set("io_timeout_ms", I(kIoTimeoutMs));
     profile.Set("keyspace_blocks_per_axis", keyspace);
     profile.Set("runs_per_build", I(static_cast<std::int64_t>(Len(GetItem(samples, "before")))));
-    profile.Set("watch_before", Value());
+    profile.Set("watch_before", watch_both ? watch : Value());
     profile.Set("watch_after", watch);
     profile.Set("gates", gates);
     profile.Set("budget_percent", budget);
@@ -1035,7 +1060,8 @@ Value ReadNoiseReference(const std::string& filename, const std::string& window_
         const Value recomputed = SummarizeProfile(
             GetItem(profile, "name"), GetItem(profile, "durability_mode"), GetItem(profile, "requests_per_run"),
             GetItem(profile, "clients"), GetItem(profile, "keyspace_blocks_per_axis"), GetItem(profile, "gates"),
-            GetItem(profile, "samples"), GetItem(profile, "budget_percent"), Value());
+            GetItem(profile, "samples"), GetItem(profile, "budget_percent"), GetItem(profile, "watch_after"),
+            !GetItem(profile, "watch_before").IsNull());
         if (!SameProfile(recomputed, profile)) {
             Fail(ErrorKind::kValue, "Noise reference summaries/provenance do not match raw samples");
         }
@@ -1739,7 +1765,7 @@ struct UsageError {
 
 constexpr std::string_view kUsage =
     "usage: chunkdb_budget_compare [-h] [--runs RUNS] [--budget BUDGET] [--profiles PROFILES]\n"
-    "                              [--watch WATCH] [--json [FILE]] [--markdown [FILE]]\n"
+    "                              [--watch WATCH | --watch-both WATCH] [--json [FILE]] [--markdown [FILE]]\n"
     "                              [--noise-floor] --window-id WINDOW_ID\n"
     "                              [--noise-reference NOISE_REFERENCE]\n"
     "                              [--relaxed-concurrency {4,8,16}]\n"
@@ -1771,6 +1797,7 @@ constexpr std::string_view kHelp =
     "  --budget BUDGET       paired CI regression threshold (default 5%)\n"
     "  --profiles PROFILES\n"
     "  --watch WATCH         attach a WATCH only to the after build (table name)\n"
+    "  --watch-both WATCH    attach TABLE[:N][:slots] watches to both builds\n"
     "  --json [FILE]         write full artifact JSON; omit FILE for stdout\n"
     "  --markdown [FILE]     write pasteable Markdown; omit FILE for stdout\n"
     "  --noise-floor         same-binary window-start calibration without older reference\n"
@@ -1788,6 +1815,7 @@ struct Options {
     double budget = 5.0;
     std::string profiles = "relaxed,fsync-wal";
     std::optional<std::string> watch;
+    std::optional<std::string> watch_both;
     std::optional<std::string> json;
     std::optional<std::string> markdown;
     bool noise_floor = false;
@@ -1804,12 +1832,13 @@ struct OptionSpec {
     Arity arity;
 };
 
-constexpr std::array<OptionSpec, 11> kOptionSpecs = {{
+constexpr std::array<OptionSpec, 12> kOptionSpecs = {{
     {"--help", Arity::kHelp},
     {"--runs", Arity::kOne},
     {"--budget", Arity::kOne},
     {"--profiles", Arity::kOne},
     {"--watch", Arity::kOne},
+    {"--watch-both", Arity::kOne},
     {"--json", Arity::kOptional},
     {"--markdown", Arity::kOptional},
     {"--noise-floor", Arity::kFlag},
@@ -2008,6 +2037,8 @@ void ApplyValue(Options& options, std::string_view name, const std::string& valu
         options.profiles = value;
     } else if (name == "--watch") {
         options.watch = value;
+    } else if (name == "--watch-both") {
+        options.watch_both = value;
     } else if (name == "--json") {
         options.json = value;
     } else if (name == "--markdown") {
@@ -2234,10 +2265,18 @@ int Main(const std::vector<std::string>& args, const Hooks& hooks, std::ostream&
         *options.json != "-" && *options.markdown != "-" && RealPath(*options.json) == RealPath(*options.markdown)) {
         return usage_error("JSON and Markdown require different output filenames");
     }
+    if (options.watch && options.watch_both) {
+        return usage_error("--watch and --watch-both are mutually exclusive");
+    }
+    if (options.watch_both && options.watch_both->empty()) {
+        return usage_error("--watch-both requires TABLE[:N][:slots]");
+    }
+    const bool watch_both = options.watch_both.has_value();
+    if (watch_both) options.watch = options.watch_both;
     const bool watch_set = options.watch && !options.watch->empty();
     const bool reference_set = options.noise_reference && !options.noise_reference->empty();
-    if (StripText(*options.window_id).empty() || (options.noise_floor && (watch_set || reference_set))) {
-        return usage_error("window ID required; noise-floor cannot attach WATCH or another reference");
+    if (StripText(*options.window_id).empty() || (options.noise_floor && ((watch_set && !watch_both) || reference_set))) {
+        return usage_error("window ID required; noise-floor requires symmetric WATCH settings and no reference");
     }
     if (!options.noise_floor && !reference_set) {
         return usage_error("source comparisons require --noise-reference");
@@ -2278,8 +2317,9 @@ int Main(const std::vector<std::string>& args, const Hooks& hooks, std::ostream&
                 entry.Set("io_timeout_ms", I(kIoTimeoutMs));
                 entry.Set("keyspace_blocks_per_axis", I(profile.keyspace));
                 entry.Set("runs_per_build", I(*runs));
-                entry.Set("watch_before", Value());
-                entry.Set("watch_after", Value());
+                const Value control_watch = watch_both ? Value::Str(*options.watch) : Value();
+                entry.Set("watch_before", control_watch);
+                entry.Set("watch_after", control_watch);
                 settings.Set(std::string(profile.name), std::move(entry));
             }
             reference = ReadNoiseReference(*options.noise_reference, *options.window_id, settings, started);
@@ -2328,7 +2368,7 @@ int Main(const std::vector<std::string>& args, const Hooks& hooks, std::ostream&
                     request.clients = profile.clients;
                     request.keyspace = profile.keyspace;
                     request.seed = 1337 + run;
-                    if (side == "after") {
+                    if (side == "after" || watch_both) {
                         request.watch = options.watch;
                     }
                     request.record_prefix =
@@ -2342,7 +2382,7 @@ int Main(const std::vector<std::string>& args, const Hooks& hooks, std::ostream&
             report.Find("profiles")->Append(SummarizeProfile(S(profile.name), S(profile.mode), I(profile.requests),
                                                              I(profile.clients), I(profile.keyspace),
                                                              Value::Bool(profile.gates), samples,
-                                                             Value::Float(options.budget), watch));
+                                                             Value::Float(options.budget), watch, watch_both));
         }
         if (options.noise_floor) {
             std::vector<std::string_view> fields(kBuildFields.begin(), kBuildFields.end());
