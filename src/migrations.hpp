@@ -32,6 +32,7 @@ struct MigrationRequest {
     bool if_exists = false;
     std::function<TableDefinition()> definition;
     std::function<bool(const TableSchema&)> columns_if_needed;
+    bool chunk_column = false;
 };
 
 }  // namespace chunkdb

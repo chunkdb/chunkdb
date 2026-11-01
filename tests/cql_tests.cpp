@@ -129,6 +129,12 @@ void TestChunkModelScan() {
     ExpectError("SCAN CHUNKS FROM t WITH DATA WITH DATA", "given twice");
     ExpectError("SCAN CHUNKS FROM t COLUMNS a", "requires WITH DATA");
     ExpectError("SCAN CHUNKS FROM t SINCE -1", "a revision must be between 0");
+    const auto compact = Get<cql::CompactTombstones>("COMPACT TOMBSTONES t BEFORE 18446744073709551615");
+    assert(compact.table == "t" && compact.before == std::numeric_limits<std::uint64_t>::max());
+    assert(Get<cql::CompactTombstones>("COMPACT TOMBSTONES t BEFORE 0").before == 0U);
+    assert(Get<cql::ShowTableStats>("SHOW TABLE STATS t").table == "t");
+    ExpectError("COMPACT TOMBSTONES t BEFORE -1", "a revision must be between 0");
+    ExpectError("MIGRATE 'compact' COMPACT TOMBSTONES t BEFORE 1", "one schema statement");
 }
 
 void TestConditionalObjects() {

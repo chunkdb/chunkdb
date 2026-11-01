@@ -559,7 +559,7 @@ WalReplayResult wal_detail::ReplayFromSource(
     ChunkVars* vars,
     std::vector<WalFrameBoundary>* boundaries,
     std::shared_ptr<const ChunkColumnState>* chunk_columns,
-    std::optional<std::uint64_t> base_commit_time_ms) {
+    std::optional<std::uint64_t> base_commit_time_ms, std::optional<WalKnownIdentity> retained_identity) {
     const auto& wal_bytes = source.Header();
     WalReplayResult result;
     if (boundaries != nullptr) boundaries->clear();
@@ -682,6 +682,13 @@ WalReplayResult wal_detail::ReplayFromSource(
             result.stopped_at_crash_tail = false;
             break;
         }
+        if (retained_identity && frame.revision == retained_identity->revision &&
+            frame.commit_time_ms != retained_identity->commit_time_ms) {
+            result.tail_truncated_or_corrupt = true;
+            result.stop_reason = "frame_retained_commit_time_mismatch";
+            result.stopped_at_crash_tail = false;
+            break;
+        }
         if (frame.revision <= base_revision) {
             result.skipped_frames += 1;
             cursor += frame.size;
@@ -774,7 +781,7 @@ WalReplayResult ReplayWal(const std::vector<std::uint8_t>& bytes, const Geometry
     std::uint64_t base_revision, std::uint64_t base_schema_version,
     std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence, ChunkVars* vars,
     std::vector<WalFrameBoundary>* boundaries, std::shared_ptr<const ChunkColumnState>* chunk_columns,
-    std::optional<std::uint64_t> base_commit_time_ms) {
+    std::optional<std::uint64_t> base_commit_time_ms, std::optional<WalKnownIdentity> retained_identity) {
     class MemorySource final : public wal_detail::ReplaySource {
       public:
         explicit MemorySource(const std::vector<std::uint8_t>& value) : bytes_(value) {}
@@ -787,7 +794,7 @@ WalReplayResult ReplayWal(const std::vector<std::uint8_t>& bytes, const Geometry
         const std::vector<std::uint8_t>& bytes_;
     } source(bytes);
     return wal_detail::ReplayFromSource(source, geometry, coord, table_id, features,
-        base_revision, base_schema_version, payload, presence, vars, boundaries, chunk_columns, base_commit_time_ms);
+        base_revision, base_schema_version, payload, presence, vars, boundaries, chunk_columns, base_commit_time_ms, retained_identity);
 }
 
 }  // namespace chunkdb
