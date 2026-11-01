@@ -164,6 +164,13 @@ An empty chunk-column schema allocates and emits no chunk-column change rows.
 Block-column projections preserve the complete chunk-column row, and `NOBEFORE` removes both kinds of before rows.
 Chunk-form events carry checked forms with each chunk's producing revision and time, and use a null form only when neither present blocks nor non-default chunk columns remain.
 
+## Durable slot filters
+
+The checked `CKSL` record uses format tag 3, a table dimensionality byte of 2 or 3 at offset 6, and a flags byte at offset 7 whose only defined bit preserves the filtered-record capability.
+The epoch, durable watermark, slot count, per-slot flags and projection IDs retain their checked meanings, and an AREA stores signed little-endian first coordinates followed by last coordinates for every active axis.
+Every AREA must match the record dimensionality, have ordered endpoints on all active axes, and have zero inactive coordinates; decoding with a known table dimensionality refuses a mismatch before returning records.
+The complete CRC, slot and byte limits are checked before publication, truncated or malformed records are refused without mutation, and earlier record tags require explicit recreation rather than a dimensionality fallback.
+
 ## Validation
 
 Tests cover negative boundaries, coordinate extremes, dimension mismatches, x-fastest indexing, checked products and canonical path round trips.
