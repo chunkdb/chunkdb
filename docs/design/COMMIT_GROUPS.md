@@ -22,6 +22,7 @@ Frame and record identities include the data-directory identity, table epoch, di
 Paths are derived from admitted identities rather than accepted from a journal as filesystem instructions.
 
 The group record names each member's WAL boundary, exact frame extent and SHA-256 digest.
+The pre-group WAL end and frame offset are separate fields, because a newly created WAL can place its first frame after a header while its original rollback end was zero.
 Length and digest bind the entire frame, including its checked header and group identity.
 The journal has a checked directory-bound header and length-delimited, checksummed records.
 An independently published journal inventory binds the journal identity, generation, certified byte cut, last record identity and SHA-256 digest of the complete certified prefix.
@@ -72,10 +73,17 @@ Failures preserve the existing durability contract and never fall back to a weak
 
 Read all group decisions and required member contexts into a private recovery plan before any member repair.
 Validate complete member framing, exact digests, original replay bases, retained identities, schema histories and applicable rollback decisions before changing files.
+Each changed member binds its checked earlier durable image, retained-empty identity or never-written anchor independently of its volatile pre-group WAL end.
+An image anchor binds exact image length and SHA-256; every anchor includes its producing revision, time and schema where a producing state exists.
+The group owns that original anchor until complete durability or checked checkpoint coverage removes the rollback dependency.
+Recovery validates the surviving pre-group prefix over that anchor and preserves all complete available frames before the group.
+A crash-shaped loss of an earlier relaxed suffix can move the rollback cut back to its last complete frame, but never below a certified durable prefix or through interior damage.
+It does not make every relaxed group sync its entire pre-group volatile prefix merely to manufacture a rollback point.
 A table constructor cannot independently trim an unresolved group member.
 An absent decision rolls every surviving member back at its first group frame.
 A fully checked relaxed decision without a certified durability receipt whose members are missing or crash-shaped incomplete also rolls back the whole group.
 Its surviving members and later dependent relaxed suffixes are discarded together after every rollback base passes admission.
+If such a suffix contains a later group's member, the recovery plan includes that complete dependent group and computes the transitive closure before changing any member.
 Rollback never guesses or silently replaces an invalid preceding prefix.
 A checked synced decision or durability receipt with a missing required member is damage rather than an undecided crash tail.
 An incomplete final append wholly above the certified cut is unpublished.
