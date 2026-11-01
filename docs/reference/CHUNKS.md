@@ -84,8 +84,8 @@ The metadata write populates the chunk before any block exists.
 GET CHUNK cx cy [cz] FROM table [COLUMNS column, ...]
 SET CHUNK cx cy [cz] IN table [COLUMNS column, ...] $1 [IF VERSION version | IF ABSENT]
 SET CHUNK cx cy [cz] IN table META column = value [, ...] [IF VERSION version | IF ABSENT]
-GET AREA cx0 cy0 [cz0] TO cx1 cy1 [cz1] FROM table [COLUMNS column, ...] [WITH SCHEMA]
-GET AREA AROUND cx cy [cz] RADIUS radius FROM table [COLUMNS column, ...] [WITH SCHEMA]
+GET AREA cx0 cy0 [cz0] TO cx1 cy1 [cz1] FROM table [COLUMNS column, ...] [WITH SCHEMA] [LIMIT n] [AFTER cx cy [cz]]
+GET AREA AROUND cx cy [cz] RADIUS radius FROM table [COLUMNS column, ...] [WITH SCHEMA] [LIMIT n] [AFTER cx cy [cz]]
 SCAN CHUNKS FROM table [AFTER cx cy [cz]] [LIMIT count] [SINCE revision] [WITH DATA] [COLUMNS column, ...]
 COMPACT TOMBSTONES table BEFORE revision
 SHOW TABLE STATS table
@@ -103,8 +103,8 @@ SHOW TABLE STATS table
 - `IF VERSION`: an equality check against the destination chunk's current version.
 - `IF ABSENT`: require an unpopulated destination, including a retained empty chunk; conditions are unavailable inside transactions.
 - `META`: update named chunk columns atomically, preserving blocks and unnamed metadata.
-- `AFTER`: exclude this position and all earlier positions in scan order.
-- `LIMIT`: maximum positions per scan page; default and maximum are 1024.
+- `AFTER`: exclude this position and all earlier positions in coordinate order.
+- `LIMIT`: requested cells per area page, or maximum positions per scan page; scans default to at most 1024.
 - `SINCE`: include current identities with producing revisions greater than this value, including retained deletions.
 - `WITH DATA`: append a complete form for populated chunks and null for deletions; required with scan COLUMNS.
 
@@ -162,7 +162,17 @@ Compaction does not discard a durable slot's independently retained history.
 
 ## Limits
 
-GET AREA covers at most 256 chunks and returns at most 67108864 encoded bytes.
-The chunk limit bounds the AROUND radius at 9 in two dimensions and 3 in three dimensions.
+GET AREA defaults to at most 4096 requested chunk cells and 67108864 encoded response bytes.
+Configure these positive bounds with `--max-area-chunks` and `--max-area-response-bytes`; HELLO reports their effective values.
+Without LIMIT or AFTER, a larger selector or response is refused.
+LIMIT or AFTER returns a map with `chunks`, `more` and `after` instead of the plain chunk array.
+WITH SCHEMA wraps that map as `[schema_version, page]`.
+The page visits at most LIMIT requested cells, including empty cells, and returns only populated chunks.
+An omitted LIMIT uses `max_area_chunks`; an explicit limit must be positive and no greater than that value.
+When `more` is true, resume the same selector strictly AFTER the returned coordinate; when it is false, `after` is null.
+AFTER must have the table's exact coordinate arity and lie inside the requested range or Euclidean ball.
+An empty page can advance across an empty region, and the response-byte bound can end a page before its requested cell count.
+A single populated chunk that cannot fit a complete page is refused; request fewer columns or use GET CHUNK.
+Independent pages can observe intervening writes; pages inside a transaction share its snapshot and private writes.
 SCAN CHUNKS returns at most 1024 identities and at most 67108864 encoded bytes per page.
 Chunk values follow [Tables](TABLES.md#limits) and [Server flags](../SERVER_FLAGS.md).

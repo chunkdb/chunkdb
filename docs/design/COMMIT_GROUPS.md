@@ -105,6 +105,7 @@ Recovery admits the complete reference cut before deleting a journal record or s
 
 ## Snapshots and table lifecycle
 
+Session ownership and complete table admission are specified in [Transaction snapshot vectors](TRANSACTION_SNAPSHOT_VECTOR.md).
 The first transaction statement registers one completed-revision cut for each table in its directory snapshot vector.
 Later access to a table uses that original cut rather than taking a new snapshot after a cross-table group.
 Tables created after the cut cannot silently join that transaction.

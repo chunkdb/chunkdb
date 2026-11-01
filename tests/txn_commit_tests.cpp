@@ -340,10 +340,13 @@ void TestWriteSkewRefused() {
 
 void TestLimits() {
     ScopedTempDir dir("chunkdb-txn-commit-limits");
-    ChunkStore store(Config(dir.path()));
+    auto config = Config(dir.path());
+    config.query_limits.txn_max_written_chunks = chunkdb::kMaxTxnWrittenChunks + 1U;
+    config.max_loaded_chunks = config.query_limits.txn_max_read_chunks + config.query_limits.txn_max_written_chunks + 1U;
+    ChunkStore store(config);
     auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
     std::vector<std::pair<ChunkCoord, std::uint32_t>> many;
-    for (std::int64_t x = 0; x <= static_cast<std::int64_t>(chunkdb::kMaxTxnWrittenChunks); ++x) {
+    for (std::int64_t x = 0; x <= static_cast<std::int64_t>(config.query_limits.txn_max_written_chunks); ++x) {
         many.emplace_back(ChunkCoord{x, 5}, 1);
     }
     assert(ThrowsAs<std::invalid_argument>(

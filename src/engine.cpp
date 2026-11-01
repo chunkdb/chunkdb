@@ -809,6 +809,7 @@ std::string CommandEngine::HandleAuth(
 
 std::string CommandEngine::HelloReply(const SessionState& session, std::string_view server_signature) const {
     std::string reply;
+    const auto& limits = catalog_->query_limits();
     const auto entry = [&reply](std::string_view key, std::uint64_t value) {
         Protocol::AppendBulk(reply, key);
         Protocol::AppendInteger(reply, value);
@@ -819,8 +820,8 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, config_.server_version);
     entry("max_line_bytes", config_.max_line_bytes);
     entry("max_parameters", cql::kMaxParameters);
-    entry("max_area_chunks", kMaxChunkRangeChunks);
-    entry("max_response_bytes", kMaxChunkRangeResponseBytes);
+    entry("max_area_chunks", limits.max_area_chunks);
+    entry("max_response_bytes", limits.max_area_response_bytes);
     entry("max_scan_limit", kMaxChunkScanLimit);
     // The client checks it to know the server holds the user's verifier.
     Protocol::AppendBulk(reply, "server_signature");
@@ -831,7 +832,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 7);
+    Protocol::AppendArrayHeader(reply, 8);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -839,6 +840,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "slot_filters");
     Protocol::AppendBulk(reply, "slot_takeover");
     Protocol::AppendBulk(reply, "lineage");
+    Protocol::AppendBulk(reply, "area_paging");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 1U : 0U);
     if (session.hello_options.client_name) {
@@ -860,10 +862,10 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     entry("idle_timeout_ms", session.idle_timeout_ms);
     Protocol::AppendBulk(reply, "limits");
     Protocol::AppendMapHeader(reply, 7);
-    entry("max_area_chunks", kMaxChunkRangeChunks);
-    entry("max_area_response_bytes", kMaxChunkRangeResponseBytes);
-    entry("txn_max_written_chunks", kMaxTxnWrittenChunks);
-    entry("txn_max_read_chunks", kMaxTxnReadChunks);
+    entry("max_area_chunks", limits.max_area_chunks);
+    entry("max_area_response_bytes", limits.max_area_response_bytes);
+    entry("txn_max_written_chunks", limits.txn_max_written_chunks);
+    entry("txn_max_read_chunks", limits.txn_max_read_chunks);
     entry("max_watches", session.max_watches);
     entry("max_returning_rows", 65536U);
     entry("max_expression_nodes", 256U);

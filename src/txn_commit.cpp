@@ -362,16 +362,16 @@ std::uint64_t ChunkStore::CommitTransaction(
     }
 
     // Everything the caller passed is checked before any chunk is touched.
-    if (writes.size() > kMaxTxnWrittenChunks) {
+    if (writes.size() > query_limits_.txn_max_written_chunks) {
         throw std::invalid_argument(
-            "a transaction writes at most " + std::to_string(kMaxTxnWrittenChunks) + " chunks");
+            "a transaction writes at most " + std::to_string(query_limits_.txn_max_written_chunks) + " chunks");
     }
     std::vector<ChunkCoord> reads = read_set;
     std::sort(reads.begin(), reads.end(), TxnCoordLess{});
     reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
-    if (reads.size() > kMaxTxnReadChunks) {
+    if (reads.size() > query_limits_.txn_max_read_chunks) {
         throw std::invalid_argument(
-            "a transaction reads at most " + std::to_string(kMaxTxnReadChunks) + " chunks");
+            "a transaction reads at most " + std::to_string(query_limits_.txn_max_read_chunks) + " chunks");
     }
     std::sort(writes.begin(), writes.end(), [](const TxnChunkWrite& lhs, const TxnChunkWrite& rhs) {
         return TxnCoordLess{}(lhs.coord, rhs.coord);
@@ -631,9 +631,9 @@ std::uint64_t ChunkStore::CommitTransaction(
     }
     const auto intent_path = TxnIntentPath(data_dir_, version);
     const auto intent_dir = intent_path.parent_path();
-    const auto rollback_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_);
+    const auto rollback_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, query_limits_.txn_max_written_chunks);
     intent.state = TxnIntentState::kCommitted;
-    const auto commit_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_);
+    const auto commit_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, query_limits_.txn_max_written_chunks);
 
     // From the intent to its commit form, read-only processes do not take
     // these chunks.

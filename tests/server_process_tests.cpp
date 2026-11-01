@@ -13,6 +13,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -136,7 +137,7 @@ std::size_t HelloReplySize(const std::string& all) {
 // The reply to one statement on a fresh connection: the client sends HELLO 3
 // and the statement, then closes its side, and the server closes after
 // answering.
-std::string Command(int port, const std::string& line) {
+std::string Command(int port, const std::string& line, std::string* hello = nullptr) {
     const int fd = Connect(port);
     assert(fd >= 0);
     SendAll(fd, "HELLO 3\r\n" + line + "\r\n");
@@ -151,7 +152,9 @@ std::string Command(int port, const std::string& line) {
         all.append(buffer, static_cast<std::size_t>(n));
     }
     close(fd);
-    return all.substr(HelloReplySize(all));
+    const auto hello_size = HelloReplySize(all);
+    if (hello != nullptr) *hello = all.substr(0U, hello_size);
+    return all.substr(hello_size);
 }
 
 class ServerProcess {
@@ -419,6 +422,38 @@ void TestFeedLingerFlag(const std::string& binary) {
         const int status = server.Terminate();
         assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
     }
+}
+
+void TestQueryLimitFlags(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-query-limits");
+    const auto log = dir.path() / "server.log";
+    const auto help = StartupFailure(binary, log, {"--help"}, 0);
+    for (const std::string flag : {"--max-area-chunks", "--max-area-response-bytes",
+                                 "--txn-max-written-chunks", "--txn-max-read-chunks"}) {
+        assert(help.find(flag) != std::string::npos);
+        const auto data = dir.path() / flag.substr(2U);
+        for (const char* value : {"0", "-1", "+1", "1x", "18446744073709551616", ""}) {
+            const auto error = StartupFailure(binary, log, {"--data-dir", data.string(), "--auth", "none", flag, value});
+            assert(error.find("invalid " + flag) != std::string::npos);
+            assert(!std::filesystem::exists(data));
+        }
+        const auto missing = StartupFailure(binary, log, {"--data-dir", data.string(), "--auth", "none", flag});
+        assert(missing.find("missing value for " + flag) != std::string::npos);
+        assert(!std::filesystem::exists(data));
+    }
+    ServerProcess server(binary, dir.path() / "positive", {"--auth", "none", "--max-area-chunks", "2",
+        "--max-area-response-bytes", "12345", "--txn-max-written-chunks", "3", "--txn-max-read-chunks", "5"});
+    std::string hello;
+    assert(Command(server.port(), "PING", &hello) == "+PONG\r\n");
+    for (const auto& [name, value] : {std::pair{"max_area_chunks", "2"},
+        {"max_response_bytes", "12345"}, {"max_area_response_bytes", "12345"},
+        {"txn_max_written_chunks", "3"}, {"txn_max_read_chunks", "5"}}) {
+        const auto field = "$" + std::to_string(std::string_view(name).size()) + "\r\n" + name + "\r\n:" + value + "\r\n";
+        assert(hello.find(field) != std::string::npos);
+    }
+    assert(Command(server.port(), "CREATE TABLE t (v u8) CHUNK 1 x 1") == "+OK\r\n");
+    assert(Command(server.port(), "GET AREA 0 0 TO 2 0 FROM t").starts_with("-ERR INVALID_ARGUMENT "));
+    assert(Command(server.port(), "GET AREA 0 0 TO 1 0 FROM t") == "*0\r\n");
 }
 
 // SIGHUP reopens the audit log at its path, so a renamed file stops
@@ -888,6 +923,7 @@ int main(int argc, char** argv) {
     TestStartupDiagnostics(argv[1]);
     TestListenWarnings(argv[1]);
     TestFeedLingerFlag(argv[1]);
+    TestQueryLimitFlags(argv[1]);
     TestRemovedServerFlags(argv[1]);
     TestPersistedUsersIgnoreBootstrap(argv[1]);
     TestLogAndLimitFlagsAreValidated(argv[1]);
