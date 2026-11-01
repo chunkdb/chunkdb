@@ -324,6 +324,7 @@ ChunkMutationResult ChunkStore::CasChunkStateBytes(
     std::uint64_t expected_version,
     const std::vector<std::uint8_t>& payload,
     const std::vector<std::uint8_t>& presence_bitmap) {
+    if (geometry_.dims() != 2U) throw std::invalid_argument("chunk coordinates must match the table dimensions");
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
@@ -364,6 +365,7 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
     bool has_expected_version,
     std::uint64_t expected_version,
     const std::vector<ChunkBatchOp>& ops) {
+    if (geometry_.dims() != 2U) throw std::invalid_argument("chunk coordinates must match the table dimensions");
     RequireBitStringBlocks();
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");

@@ -249,8 +249,12 @@ BlockReadMetadata ChunkStore::GetBlockWithVersionAt(
 }
 
 bool ChunkStore::ChunkChangedSince(const TxnSnapshot& snapshot, std::int64_t chunk_x, std::int64_t chunk_y) {
+    if (geometry_.dims() != 2U) throw std::invalid_argument("chunk coordinates must match the table dimensions");
+    return ChunkChangedSince(snapshot, ChunkCoord{chunk_x, chunk_y});
+}
+
+bool ChunkStore::ChunkChangedSince(const TxnSnapshot& snapshot, const ChunkCoord& chunk_coord) {
     RequireOwnTxnSnapshot(snapshot);
-    const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     // A write keeps its chunk's state before it releases the chunk's lock.
     std::shared_lock lock(regular_chunk->mutex);

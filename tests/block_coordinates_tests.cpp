@@ -86,10 +86,17 @@ void ThreeDimensionalPoints() {
         assert(store.ReadChunkState(ChunkCoord{0, 0, 0}).presence_bitmap.front() == 16U);
         const auto before = store.GetBlockWithVersion3D(-1, -1, -1);
         auto snapshot = store.BeginTxnSnapshot(std::chrono::seconds(30));
+        RefusesCoordinateArity([&] { (void)store.ChunkChangedSince(*snapshot, -1, -1); });
+        assert(!store.ChunkChangedSince(*snapshot, ChunkCoord{-1, -1, -1}));
+        assert(!store.ChunkChangedSince(*snapshot, ChunkCoord{-1, -1, 0}));
         const auto mismatch = store.SetBlock3D(-1, -1, -1, eight, *before.version + 1U);
         assert(!mismatch.ok && mismatch.version == *before.version);
         const auto changed = store.SetBlock3D(-1, -1, -1, eight, before.version);
         assert(changed.ok && changed.version > *before.version);
+        assert(store.ChunkChangedSince(*snapshot, ChunkCoord{-1, -1, -1}));
+        assert(!store.ChunkChangedSince(*snapshot, ChunkCoord{-1, -1, 0}));
+        store.SetBlock3D(-1, -1, 3, seven);
+        assert(store.ChunkChangedSince(*snapshot, ChunkCoord{-1, -1, 1}));
         assert(store.GetBlock3DAt(*snapshot, -1, -1, -1) == before.values);
         assert(store.GetBlockWithVersion3DAt(*snapshot, -1, -1, -1).version == before.version);
         auto state = store.ReadChunkState(ChunkCoord{-1, -1, -1});
@@ -116,6 +123,15 @@ void ThreeDimensionalPoints() {
     bits.SetBlockBits3D(-1, -1, 0, "00001000");
     assert(bits.ReadBlockBits3D(-1, -1, -1) == "00000111");
     assert(bits.GetBlockBits3D(-1, -1, 0) == "00001000");
+    const auto state = bits.ReadChunkState(ChunkCoord{-1, -1, 0});
+    RefusesCoordinateArity([&] {
+        (void)bits.CasChunkStateBytes(-1, -1, state.version, state.payload, state.presence_bitmap);
+    });
+    RefusesCoordinateArity([&] {
+        (void)bits.ApplyChunkBatch(-1, -1, false, 0U,
+            {ChunkBatchOp{.set = true, .x = -1, .y = -1, .bits = "11111111"}});
+    });
+    assert(bits.ReadChunkState(ChunkCoord{-1, -1, 0}).version == state.version);
     bits.UnsetBlock3D(-1, -1, -1);
     assert(!bits.ReadBlockBits3D(-1, -1, -1));
     assert(bits.GetBlockBits3D(-1, -1, -1) == "00000000");

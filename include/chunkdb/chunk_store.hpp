@@ -740,6 +740,7 @@ class ChunkStore {
         const TxnAreaRead& txn_read = {});
     // Whether a write changed the chunk after the snapshot.
     [[nodiscard]] bool ChunkChangedSince(const TxnSnapshot& snapshot, std::int64_t chunk_x, std::int64_t chunk_y);
+    [[nodiscard]] bool ChunkChangedSince(const TxnSnapshot& snapshot, const ChunkCoord& chunk_coord);
     // Commits a transaction: `writes` (each chunk once) apply all together
     // or not at all, also across a crash, and are durable when this returns
     // in every durability mode. Every chunk in `read_set` and `writes` must
