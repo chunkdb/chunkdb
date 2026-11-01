@@ -66,7 +66,9 @@ An observed zero identity needs no file, has zero time and schema, and cannot ac
 The observation-capsule layout is an additional checked codec prerequisite; the decision encoding remains unchanged.
 
 A group owner stores its pinned native handles and dependency edges independently of resident chunk mutexes.
-Settling a group copies and pins its complete member handles under the short group-owner mutex, releases that mutex, and syncs them in table-epoch and coordinate order.
+Settling a group copies and pins its complete member handles and earlier dependency edges under the short group-owner mutex, then releases that mutex.
+It settles the transitive earlier groups before its own receipt, in admitted decision order, and syncs member handles in table-epoch and coordinate order.
+Dependency edges always point to earlier admitted decisions; a repeated identity or cycle is damage rather than a wait graph to execute.
 It takes no member chunk mutex, table admission or directory publication gate during those syncs.
 Only after all required bytes and parent names are durable does it sync the exact decision's durability receipt and publish the certified journal cut.
 Concurrent settlers share one completion state; waiting for that state cannot require a mutex held by a settler.
