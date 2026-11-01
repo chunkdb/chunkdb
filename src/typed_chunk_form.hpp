@@ -10,6 +10,11 @@
 
 namespace chunkdb {
 
+// Validate the same section plan as the encoder without allocating bodies.
+[[nodiscard]] std::size_t SectionedChunkStateBytes(
+    const Geometry& geometry, const ChunkState& state, std::size_t max_variable_bytes,
+    std::span<const std::size_t> projection = {});
+
 // An empty projection means the full block schema; a nonempty projection
 // retains its requested order, even when it names every block column.
 // Reads use the hard variable-byte bound so lowering a table's write quota

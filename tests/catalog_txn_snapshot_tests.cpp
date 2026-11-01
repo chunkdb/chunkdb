@@ -32,6 +32,12 @@ struct CatalogTxnTestAccess {
     static std::shared_lock<BackupMaintenanceGate> Metadata(TableCatalog& catalog) {
         return std::shared_lock(catalog.feature_metadata_gate_);
     }
+    static auto Pause(Table& table) {
+        return table.PauseAdmission(std::chrono::steady_clock::now() + std::chrono::seconds{10}, {});
+    }
+    static std::size_t ActiveLeases(const Table& table) {
+        return table.active_leases_.load(std::memory_order_seq_cst);
+    }
 };
 }  // namespace chunkdb
 
@@ -179,6 +185,157 @@ void FinalRegistrationChecks(bool cancel) {
     auto current = table->Acquire();
     assert(current && current->store().TxnRegisteredCountForTests() == 0U);
 }
+
+void CohortOrderAndOriginalOwners() {
+    test::ScopedTempDir directory("chunkdb-catalog-cohort");
+    TableCatalog catalog(Config(directory.path()));
+    for (const char* name : {"a", "b", "untouched"})
+        (void)catalog.Create(name, {1U, 1U, 2U, 2U, 8U}, catalog.default_options());
+    auto snapshots = catalog.CaptureTxnSnapshots(60s);
+    std::vector<CatalogTxnParticipant> participants;
+    for (const auto& entry : snapshots)
+        if (entry.table->name() != "untouched") participants.push_back({entry.table, entry.snapshot.get()});
+    std::reverse(participants.begin(), participants.end());
+    auto changed_options = catalog.default_options();
+    changed_options.checkpoint_update_interval = 2'000'000U;
+    catalog.SetOptions("untouched", changed_options);
+    {
+        auto leases = catalog.AcquireTxnTables(participants, std::chrono::milliseconds::max());
+        assert(leases.size() == 2U && leases[0].table->store_id() < leases[1].table->store_id());
+        for (const auto& lease : leases) {
+            assert(CatalogTxnTestAccess::ActiveLeases(*lease.table) == 1U);
+            const auto original = std::find_if(snapshots.begin(), snapshots.end(), [&](const auto& entry) {
+                return entry.table == lease.table;
+            });
+            assert(original != snapshots.end() && lease.lease.store().OwnsTxnSnapshot(*original->snapshot));
+        }
+    }
+    for (const auto& entry : participants) assert(CatalogTxnTestAccess::ActiveLeases(*entry.table) == 0U);
+    // ALTER keeps the Table and epoch but replaces its history owner.
+    const auto original = participants.front().table;
+    catalog.SetOptions(original->name(), changed_options);
+    assert(catalog.Find(original->name()) == original);
+    bool refused = false;
+    try { (void)catalog.AcquireTxnTables(participants, 60s); }
+    catch (const TransactionConflictError& error) { refused = error.reason() == TxnConflictReason::kTableChanged; }
+    assert(refused);
+    for (const auto& entry : participants) assert(CatalogTxnTestAccess::ActiveLeases(*entry.table) == 0U);
+    // A new table under an old name cannot join an original cohort.
+    const auto old_name = original->name();
+    catalog.Drop(old_name);
+    (void)catalog.Create(old_name, {1U, 1U, 2U, 2U, 8U}, catalog.default_options());
+    refused = false;
+    try { (void)catalog.AcquireTxnTables(participants, 60s); }
+    catch (const TransactionConflictError& error) { refused = error.reason() == TxnConflictReason::kTableChanged; }
+    assert(refused && CatalogTxnTestAccess::ActiveLeases(*original) == 0U);
+}
+
+void CohortWaitsAndRefusals() {
+    test::ScopedTempDir directory("chunkdb-catalog-cohort-refusals");
+    TableCatalog catalog(Config(directory.path()));
+    std::vector<CatalogTxnParticipant> participants;
+    for (const char* name : {"a", "b"})
+        participants.push_back({catalog.Create(name, {1U, 1U, 2U, 2U, 8U}, catalog.default_options()), nullptr});
+    std::sort(participants.begin(), participants.end(), [](const auto& left, const auto& right) {
+        return left.table->store_id() < right.table->store_id();
+    });
+    const auto invalid = [&](std::span<const CatalogTxnParticipant> entries, std::chrono::milliseconds duration) {
+        bool refused = false;
+        try { (void)catalog.AcquireTxnTables(entries, duration); }
+        catch (const std::invalid_argument&) { refused = true; }
+        assert(refused);
+    };
+    invalid({}, 60s);
+    invalid(participants, 0ms);
+    const std::array<CatalogTxnParticipant, 1U> missing{{{nullptr, nullptr}}};
+    invalid(missing, 60s);
+    const std::array duplicates{participants[0], participants[0]};
+    invalid(duplicates, 60s);
+    {
+        test::ScopedTempDir foreign_directory("chunkdb-catalog-cohort-foreign");
+        TableCatalog foreign(Config(foreign_directory.path()));
+        const std::array<CatalogTxnParticipant, 1U> foreign_owner{{{
+            foreign.Create("a", {1U, 1U, 2U, 2U, 8U}, foreign.default_options()), nullptr}}};
+        bool refused = false;
+        try { (void)catalog.AcquireTxnTables(foreign_owner, 60s); }
+        catch (const TransactionConflictError& error) { refused = error.reason() == TxnConflictReason::kTableChanged; }
+        assert(refused && CatalogTxnTestAccess::ActiveLeases(*foreign_owner[0].table) == 0U);
+    }
+    {
+        // A shared metadata owner can be an earlier DDL operation.
+        auto metadata = CatalogTxnTestAccess::Metadata(catalog);
+        bool expired = false;
+        try { (void)catalog.AcquireTxnTables(participants, 100ms); }
+        catch (const TransactionConflictError& error) { expired = error.reason() == TxnConflictReason::kDuration; }
+        assert(expired);
+        std::stop_source stop;
+        stop.request_stop();
+        bool cancelled = false;
+        try { (void)catalog.AcquireTxnTables(participants, 60s, stop.get_token()); }
+        catch (const std::runtime_error& error) {
+            cancelled = std::string_view(error.what()).find("cancelled") != std::string_view::npos;
+        }
+        assert(cancelled);
+    }
+    {
+        // An independent table control can remain busy without catalog admission.
+        auto paused = CatalogTxnTestAccess::Pause(*participants.back().table);
+        bool expired = false;
+        try { (void)catalog.AcquireTxnTables(participants, 100ms); }
+        catch (const TransactionConflictError& error) { expired = error.reason() == TxnConflictReason::kDuration; }
+        assert(expired);
+        for (const auto& entry : participants) assert(CatalogTxnTestAccess::ActiveLeases(*entry.table) == 0U);
+    }
+    auto leases = catalog.AcquireTxnTables(participants, 60s);
+    assert(leases.size() == participants.size());
+}
+
+struct CohortPause final : MigrationTestHook {
+    Point point;
+    std::promise<void> entered;
+    std::shared_future<void> resume;
+    CohortPause(Point at, std::shared_future<void> resumed) : point(at), resume(std::move(resumed)) {}
+    void Run(Point at, std::string_view) override {
+        if (at != point) return;
+        entered.set_value();
+        resume.wait();
+    }
+};
+
+void CohortCancellationAfterAdmission(bool busy) {
+    test::ScopedTempDir directory("chunkdb-catalog-cohort-cancel");
+    TableCatalog catalog(Config(directory.path()));
+    std::vector<CatalogTxnParticipant> participants;
+    for (const char* name : {"a", "b"})
+        participants.push_back({catalog.Create(name, {1U, 1U, 2U, 2U, 8U}, catalog.default_options()), nullptr});
+    std::sort(participants.begin(), participants.end(), [](const auto& left, const auto& right) {
+        return left.table->store_id() < right.table->store_id();
+    });
+    std::promise<void> resume;
+    CohortPause hook(busy ? MigrationTestHook::Point::kBeforeTxnLeaseWait :
+        MigrationTestHook::Point::kBeforeTxnCohortPublication, resume.get_future().share());
+    auto entered = hook.entered.get_future();
+    // The pause type is private to Table; an optional preserves its lifetime
+    // while allowing the final-publication case to keep both tables open.
+    auto paused = busy ? std::optional{CatalogTxnTestAccess::Pause(*participants.back().table)} : std::nullopt;
+    catalog.SetMigrationTestHook(&hook);
+    std::stop_source stop;
+    auto capture = std::async(std::launch::async, [&] {
+        try { (void)catalog.AcquireTxnTables(participants, 60s, stop.get_token()); }
+        catch (const std::runtime_error& error) {
+            return std::string_view(error.what()).find("cancelled") != std::string_view::npos;
+        }
+        return false;
+    });
+    assert(entered.wait_for(10s) == std::future_status::ready);
+    assert(CatalogTxnTestAccess::ActiveLeases(*participants.front().table) == 1U);
+    assert(CatalogTxnTestAccess::ActiveLeases(*participants.back().table) == static_cast<std::size_t>(!busy));
+    stop.request_stop();
+    resume.set_value();
+    assert(capture.wait_for(10s) == std::future_status::ready && capture.get());
+    catalog.SetMigrationTestHook(nullptr);
+    for (const auto& entry : participants) assert(CatalogTxnTestAccess::ActiveLeases(*entry.table) == 0U);
+}
 }  // namespace
 
 int main() {
@@ -189,4 +346,8 @@ int main() {
     DurationBoundsAdmissionWaits(true);
     FinalRegistrationChecks(true);
     FinalRegistrationChecks(false);
+    CohortOrderAndOriginalOwners();
+    CohortWaitsAndRefusals();
+    CohortCancellationAfterAdmission(true);
+    CohortCancellationAfterAdmission(false);
 }

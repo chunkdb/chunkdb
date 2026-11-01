@@ -40,13 +40,13 @@ A read-only transaction can commit while its snapshot remains valid.
 | Limit | Default or maximum |
 | --- | --- |
 | Duration from BEGIN | 5000 ms, `--txn-max-duration-ms` |
-| Written chunks | 64 |
-| Read chunks | 1024 |
+| Written chunks | 1024, `--txn-max-written-chunks` |
+| Read chunks | 8192, `--txn-max-read-chunks` |
 | Private written chunks per transaction | 16777216 bytes, `--txn-max-bytes` |
 | Private written chunks across transactions | 268435456 bytes, `--txn-total-bytes` |
 | Earlier chunk states per table | 67108864 bytes, `--txn-history-bytes` |
 
-Exceeding a write-memory limit rejects the statement and leaves the transaction open.
+Exceeding a chunk-count, area-response or write-memory limit rejects the statement and leaves the transaction open without adding its reads or writes.
 History pressure ends the oldest transactions with CONFLICT.
 A table change or expired duration also ends the transaction's work.
 

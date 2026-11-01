@@ -124,6 +124,10 @@ void PrintUsage() {
         << "  --max-handshakes-per-ip <n>\n"
         << "  --max-line-bytes <n>\n"
         << "  --max-unparsed-parameter-bytes <n>\n"
+        << "  --max-area-chunks <n>\n"
+        << "  --max-area-response-bytes <n>\n"
+        << "  --txn-max-written-chunks <n>\n"
+        << "  --txn-max-read-chunks <n>\n"
         << "  --txn-max-duration-ms <ms>\n"
         << "  --txn-max-bytes <n>\n"
         << "  --txn-total-bytes <n>\n"
@@ -285,6 +289,17 @@ int main(int argc, char** argv) {
             } else if (arg == "--max-unparsed-parameter-bytes") {
                 server_config.max_unparsed_parameter_bytes =
                     ParseSize(require_value("--max-unparsed-parameter-bytes"), "max-unparsed-parameter-bytes");
+            } else if (arg == "--max-area-chunks" || arg == "--max-area-response-bytes" ||
+                       arg == "--txn-max-written-chunks" || arg == "--txn-max-read-chunks") {
+                const auto value = require_value(arg.c_str());
+                std::size_t parsed = 0U;
+                const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
+                if (result.ec != std::errc() || result.ptr != value.data() + value.size() || parsed == 0U)
+                    throw std::invalid_argument("invalid " + arg + ": " + value);
+                if (arg == "--max-area-chunks") store_config.query_limits.max_area_chunks = parsed;
+                else if (arg == "--max-area-response-bytes") store_config.query_limits.max_area_response_bytes = parsed;
+                else if (arg == "--txn-max-written-chunks") store_config.query_limits.txn_max_written_chunks = parsed;
+                else store_config.query_limits.txn_max_read_chunks = parsed;
             } else if (arg == "--txn-max-duration-ms") {
                 engine_config.txn_max_duration = std::chrono::milliseconds(
                     ParseSize(require_value("--txn-max-duration-ms"), "txn-max-duration-ms"));

@@ -916,6 +916,8 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                                   " WALs to their boundaries"
                             : "startup will keep the committed frames of " + std::to_string(intent.entries.size()) +
                                   " chunks and remove the marker");
+                } catch (const std::invalid_argument& e) {
+                    Report(counters, true, "txn_intent_invalid", file.path(), e.what());
                 } catch (const std::exception& e) {
                     Report(counters, true, "txn_intent_unreadable", file.path(), e.what());
                 }
