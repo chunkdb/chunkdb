@@ -24,10 +24,12 @@ enum class CommitOwnerRole : std::uint8_t { kStandalone = 1U, kCatalog = 2U };
 enum class CommitOwnerObjectKind : std::uint8_t {
     kNone = 0U, kRoot = 1U, kPage = 2U, kCoverageValue = 3U, kGroupValue = 4U,
     kMemberValue = 5U, kObservation = 6U, kReplacementPlan = 7U, kRestoreProvenance = 8U,
-    kJournalInventory = 9U, kIdInventory = 10U
+    kJournalInventory = 9U, kIdInventory = 10U, kOwnerEdge = 11U
 };
 enum class CommitOwnerState : std::uint8_t { kInactive = 0U, kActive = 1U, kPending = 2U };
-enum class CommitOwnerTreeKind : std::uint8_t { kCoverage = 1U, kGroups = 2U, kMembers = 3U };
+enum class CommitOwnerTreeKind : std::uint8_t {
+    kCoverage = 1U, kGroups = 2U, kMembers = 3U, kOwnerEdges = 4U, kObservations = 5U
+};
 enum class CommitOwnerNodeKind : std::uint8_t { kEmpty = 0U, kLeaf = 1U, kBranch = 2U };
 
 struct CommitOwnerScope {
