@@ -86,6 +86,8 @@ struct GetBlock {
     std::vector<std::string> columns;  // empty: every column
     bool with_version = false;
     bool with_schema = false;
+    std::int64_t z = 0;
+    std::uint8_t dims = 2;
 };
 struct SetBlock {
     std::int64_t x = 0;
@@ -93,18 +95,24 @@ struct SetBlock {
     std::string table;
     std::vector<Assignment> values;
     std::optional<std::uint64_t> if_version;
+    std::int64_t z = 0;
+    std::uint8_t dims = 2;
 };
 struct DeleteBlock {
     std::int64_t x = 0;
     std::int64_t y = 0;
     std::string table;
     std::optional<std::uint64_t> if_version;
+    std::int64_t z = 0;
+    std::uint8_t dims = 2;
 };
 struct GetChunk {
     std::int64_t chunk_x = 0;
     std::int64_t chunk_y = 0;
     std::string table;
     std::vector<std::string> columns;
+    std::int64_t chunk_z = 0;
+    std::uint8_t dims = 2;
 };
 struct SetChunk {
     std::int64_t chunk_x = 0;
@@ -112,8 +120,13 @@ struct SetChunk {
     std::string table;
     Parameter state;
     std::optional<std::uint64_t> if_version;
+    std::int64_t chunk_z = 0;
+    std::uint8_t dims = 2;
+    std::optional<std::vector<Assignment>> metadata;
+    std::vector<std::string> columns;
+    bool if_absent = false;
 };
-// Blocks from (x0, y0) to (x1, y1), or within `radius` of (x0, y0).
+// A chunk range or ball; dims selects whether z0 and z1 participate.
 struct GetArea {
     bool around = false;
     std::int64_t x0 = 0;
@@ -124,6 +137,11 @@ struct GetArea {
     std::string table;
     std::vector<std::string> columns;
     bool with_schema = false;
+    std::int64_t z0 = 0;
+    std::int64_t z1 = 0;
+    std::uint8_t dims = 2;
+    std::optional<std::uint64_t> limit;
+    std::optional<ChunkCoord> after;
 };
 
 struct ColumnDefinition {
@@ -151,18 +169,25 @@ struct CreateTable {
     std::optional<std::pair<std::uint32_t, std::uint32_t>> large;
     std::vector<Option> options;
     bool if_not_exists = false;
+    std::uint32_t chunk_depth = 1;
+    std::uint32_t large_depth = 1;
+    std::uint8_t dims = 2;
+    std::vector<ColumnDefinition> chunk_columns;
 };
 struct AddColumn {
     ColumnDefinition column;
     bool if_not_exists = false;
+    bool chunk_column = false;
 };
 struct DropColumn {
     std::string column;
     bool if_exists = false;
+    bool chunk_column = false;
 };
 struct RenameColumn {
     std::string column;
     std::string new_name;
+    bool chunk_column = false;
 };
 struct AlterColumnType {
     std::string column;
@@ -264,17 +289,26 @@ struct ShowUsers {};
 struct Begin {};
 struct Commit {};
 struct Rollback {};
-// The populated chunks of `table` after (`after_x`, `after_y`) in scan
-// order, at most `limit` of them.
+// The populated chunks of table, ordered by every active coordinate axis.
 struct ScanChunks {
     std::string table;
     std::optional<std::pair<std::int64_t, std::int64_t>> after;
     std::optional<std::uint64_t> limit;
+    std::int64_t after_z = 0;
+    std::uint8_t dims = 2;
+    std::optional<std::uint64_t> since;
+    bool with_data = false;
+    std::vector<std::string> columns;
 };
 
 using MigrationStatement = std::variant<CreateTable, AlterTable, DropTable, GrantRight, CreateSlot, DropSlot>;
 struct Migrate { std::string name; std::string text; MigrationStatement statement; };
 struct ShowMigrations {};
+struct CompactTombstones {
+    std::string table;
+    std::uint64_t before = 0U;
+};
+struct ShowTableStats { std::string table; };
 
 using Statement = std::variant<
     GetBlock,
@@ -312,7 +346,9 @@ using Statement = std::variant<
     ShowSlots,
     Ack,
     Migrate,
-    ShowMigrations>;
+    ShowMigrations,
+    CompactTombstones,
+    ShowTableStats>;
 
 struct Parsed {
     Statement statement;

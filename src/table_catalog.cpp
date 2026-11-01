@@ -13,10 +13,12 @@
 #include <utility>
 
 #include "checkpoint.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "file_permissions.hpp"
 #include "change_feed.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/logging.hpp"
+#include "chunkdb/file_layout.hpp"
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
 #include "feature_activation_records.hpp"
@@ -222,6 +224,7 @@ CatalogConfig CatalogConfigFromStoreConfig(
     catalog.txn_history_bytes = config.txn_history_bytes;
     catalog.slot_max_bytes = config.slot_max_bytes;
     catalog.slot_sync_interval = config.slot_sync_interval;
+    catalog.query_limits = config.query_limits;
     return catalog;
 }
 
@@ -426,6 +429,14 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
     auto store = BeginExclusive();
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    if (options.area) {
+        if (options.area->dims != store->geometry_.dims())
+            throw std::invalid_argument("feed area dimensionality differs from table");
+        (void)store->geometry_.ChunkToLarge(options.area->first);
+        (void)store->geometry_.ChunkToLarge(options.area->last);
+        if (options.area->dims == 3U && options.area->first.z > options.area->last.z)
+            throw std::invalid_argument("feed area bounds are reversed");
+    }
     if (store->access_mode_ == AccessMode::kReadOnly || store->allow_multiple_processes_)
         throw std::invalid_argument("feed requires a single-process read-write table");
     if (options.column_ids) {
@@ -548,7 +559,8 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     RequireFeature(store->features(), *FindFeature("feed_slots"));
     if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
     // Validate the complete filter before baseline, feature or record publication.
-    (void)SerializeFeedSlotRecords(FeedSlotRecords{store_id_, 0U, {{std::string(name), 0U, false, filters}}});
+    (void)SerializeFeedSlotRecords(FeedSlotRecords{store_id_, 0U, {{std::string(name), 0U, false, filters}},
+        false, store->geometry_.dims()});
     if (filters.column_ids) {
         const auto& columns = store->geometry_.layout().schema().columns;
         for (const auto id : *filters.column_ids)
@@ -577,37 +589,41 @@ void Table::PrepareFeedSlotBaseline(ChunkStore& store) {
         // A pre-slot WAL may outlive a checkpoint whose image also contains
         // staged frames absent from that WAL. Normalize this baseline before
         // promising history, so every future segment has an exact old image.
-        std::set<std::pair<std::int64_t, std::int64_t>> coordinates;
+        std::set<ChunkCoord> coordinates;
         {
             std::lock_guard chunks_lock(store.large_chunks_mutex_);
             for (const auto& [_, large] : store.large_chunks_) {
                 std::lock_guard large_lock(large->mutex);
                 for (const auto& [coord, chunk] : large->chunks)
                     if (!chunk->wal_batch.empty() || chunk->wal_bytes != 0U)
-                        coordinates.emplace(coord.x, coord.y);
+                        coordinates.insert(coord);
             }
         }
-        static const std::regex wal_name(R"(^C_(-?[0-9]+)_(-?[0-9]+)\.wal$)");
         for (const auto& directory : std::filesystem::directory_iterator(dir_)) {
             if (!directory.is_directory() || directory.path().filename().string().rfind("L_", 0U) != 0U) continue;
             for (const auto& file : std::filesystem::directory_iterator(directory.path())) {
-                std::smatch match;
-                const auto filename = file.path().filename().string();
-                if (std::regex_match(filename, match, wal_name))
-                    coordinates.emplace(std::stoll(match[1].str()), std::stoll(match[2].str()));
+                if (file.path().extension() != ".wal") continue;
+                ChunkCoord coord;
+                if (!ParseChunkFilePath(file.path().lexically_relative(dir_), store.geometry_, &coord))
+                    throw std::runtime_error("pre-slot WAL has noncanonical coordinate placement: " + file.path().string());
+                coordinates.insert(coord);
             }
         }
-        for (const auto& [x, y] : coordinates) {
-            const ChunkCoord coord{x, y};
+        for (const auto& coord : coordinates) {
             auto chunk = store.TryGetLoadedChunk(coord);
             if (!chunk) {
                 // A temporary off-cache state avoids cache admission invoking
                 // the global evictor whose registry is quiesced here.
                 auto loaded = store.LoadChunkPayload(coord, true);
+                if (loaded.revision == 0U) continue;
+                BringChunkColumnsToSchema(store.geometry_, loaded.schema_version,
+                    store.geometry_.chunk_schema().version, &loaded.chunk_columns);
                 BringToCurrentSchema(store.geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
                 chunk = std::make_shared<ChunkStore::RegularChunk>(std::move(loaded.payload), std::move(loaded.presence_bitmap));
                 chunk->vars = std::move(loaded.vars);
-                chunk->version = loaded.revision != 0U ? loaded.revision : store.NextChunkVersion();
+                chunk->chunk_columns = std::move(loaded.chunk_columns);
+                chunk->version = loaded.revision;
+                chunk->written = loaded.revision != 0U;
                 chunk->commit_time_ms = loaded.commit_time_ms;
                 chunk->wal_bytes = loaded.wal_bytes;
                 chunk->wal_header_written = loaded.wal_header_written;
@@ -615,6 +631,7 @@ void Table::PrepareFeedSlotBaseline(ChunkStore& store) {
                 if (loaded.revision != 0U) store.RaiseVersionClockAbove(loaded.revision);
             }
             std::unique_lock chunk_lock(chunk->mutex);
+            if (!chunk->written) continue;
             store.CheckpointChunk(coord, chunk);
         }
         store.feed_slots_->prefix_index().Clear();
@@ -840,6 +857,7 @@ TableInfo Table::Info() const {
         .options = options_,
         .feed_buffer_bytes = FeedBufferBytes(),
         .slot_max_bytes = slot_max_bytes_,
+        .chunk_schema = geometry_.chunk_schema(),
     };
 }
 
@@ -1030,6 +1048,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
 
 TableCatalog::TableCatalog(CatalogConfig config)
     : config_(std::move(config)) {
+    RequireValidQueryLimits(config_.query_limits);
     if (config_.data_dir.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
@@ -1342,6 +1361,7 @@ std::shared_ptr<ChunkStore> TableCatalog::OpenStore(
     std::uint32_t geometry_fields,
     const TableOptions& options) {
     StoreConfig store_config;
+    store_config.query_limits = config_.query_limits;
     store_config.geometry = geometry;
     store_config.geometry_fields = geometry_fields;
     store_config.data_dir = dir;
@@ -1679,7 +1699,8 @@ std::shared_ptr<Table> TableCatalog::Create(
     if (const auto reason = UnsupportedSchemaReason(table_schema); !reason.empty()) {
         throw std::invalid_argument(reason);
     }
-    const Geometry table_geometry(geometry, table_schema);
+    const Geometry table_geometry = prepared.chunk_schema ? Geometry(geometry, table_schema, *prepared.chunk_schema) :
+                                                           Geometry(geometry, table_schema);
     RequireValidTableOptions(options);
     if (existing != nullptr) {
         throw TableExistsError("table '" + table_name + "' already exists");
@@ -1700,8 +1721,11 @@ std::shared_ptr<Table> TableCatalog::Create(
         .store_id = NewStoreId(),
         .options = EncodeTableOptions(options),
         .schema = table_schema,
+        .chunk_schema = table_geometry.chunk_schema(),
     };
     try {
+        if (!ChunkCoordinateIndex::InitializeEmpty(staging, table_geometry, manifest.store_id))
+            throw std::runtime_error("coordinate inventory appeared in table staging");
         if (!PublishNewFile(StoreManifestPath(staging), SerializeStoreManifest(manifest))) {
             throw std::runtime_error("table manifest appeared in " + staging.string());
         }
@@ -2009,7 +2033,6 @@ bool TableCatalog::ChangeColumnsIfNeeded(
                 throw std::invalid_argument(reason);
             }
             manifest->geometry.block_bits = FixedBitsPerBlock(*changed);
-            (void)Geometry(manifest->geometry, *changed);
             manifest->schema = *changed;
         },
         "CHUNKDB_FAILPOINT_ALTER_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
@@ -2091,7 +2114,8 @@ void TableCatalog::RewriteManifest(
     Table& table,
     const TableOptions& options,
     const std::function<void(StoreManifest*)>& change,
-    const char* dir_sync_failpoint) {
+    const char* dir_sync_failpoint,
+    const std::optional<TableSchema>& chunk_schema) {
     const TableOptions previous = table.Info().options;
     auto store = table.BeginExclusive();
     if (!store) throw TableNotFoundError("table was dropped");
@@ -2123,8 +2147,20 @@ void TableCatalog::RewriteManifest(
             throw std::runtime_error("table manifest of '" + table.name_ + "' disappeared");
         }
         const auto previous_schema = manifest->schema;
+        const auto previous_chunk_schema = *manifest->chunk_schema;
         change(&*manifest);
+        if (chunk_schema) manifest->chunk_schema = *chunk_schema;
+        AlignManifestSchemaDomains(&*manifest, previous_schema, previous_chunk_schema);
         RequireCompatibleColumnAdditions(previous_schema, manifest->schema, *store);
+        for (const auto& column : manifest->chunk_schema->columns) {
+            if (!column.required || column.has_default ||
+                std::any_of(previous_chunk_schema.columns.begin(), previous_chunk_schema.columns.end(),
+                    [&](const auto& old) { return old.id == column.id; })) continue;
+            if (store->HasWrittenChunkIdentities())
+                throw std::invalid_argument("chunk column " + column.name +
+                    ": a REQUIRED column added to a table needs a DEFAULT for its written chunk identities");
+            break;
+        }
         AtomicWrite(
             StoreManifestPath(table.dir_),
             SerializeStoreManifest(*manifest),

@@ -59,6 +59,84 @@ cql::Literal ValueOf(const std::string& literal) {
     return set.values[0].value;
 }
 
+void TestChunkModelCoordinates() {
+    const auto read = Get<cql::GetBlock>("GET BLOCK -1 2 -3 FROM t COLUMNS a WITH VERSION WITH SCHEMA");
+    assert(read.dims == 3U && read.x == -1 && read.y == 2 && read.z == -3 && read.with_version && read.with_schema);
+    const auto write = Get<cql::SetBlock>("SET BLOCK 1 2 3 IN t a=$1 IF VERSION 8", 1);
+    assert(write.dims == 3U && write.z == 3 && write.if_version == 8U);
+    const auto remove = Get<cql::DeleteBlock>("DELETE BLOCK 1 2 -9223372036854775808 FROM t");
+    assert(remove.dims == 3U && remove.z == std::numeric_limits<std::int64_t>::min());
+    const auto chunk = Get<cql::GetChunk>("GET CHUNK 1 2 0 FROM t");
+    assert(chunk.dims == 3U && chunk.chunk_z == 0);
+    assert(Get<cql::GetChunk>("GET CHUNK 1 2 FROM t").dims == 2U);
+    const auto box = Get<cql::GetArea>("GET AREA -1 -2 -3 TO 4 5 6 FROM t WITH SCHEMA");
+    assert(box.dims == 3U && box.z0 == -3 && box.z1 == 6 && box.with_schema);
+    const auto ball = Get<cql::GetArea>("GET AREA AROUND 1 2 3 RADIUS 4 FROM t");
+    assert(ball.dims == 3U && ball.around && ball.z0 == 3 && ball.radius == 4);
+    const auto watch = Get<cql::Watch>("WATCH t AREA -1 -2 -3 TO 4 5 6");
+    assert(watch.area && watch.area->dims == 3U && watch.area->first.z == -3 && watch.area->last.z == 6);
+    const auto slot = Get<cql::CreateSlot>("CREATE SLOT 's' ON t AREA 1 2 0 TO 3 4 0");
+    assert(slot.area && slot.area->dims == 3U && slot.area->first.z == 0);
+    ExpectError("GET BLOCK 1 2 9223372036854775808 FROM t", "z is out of range");
+    ExpectError("GET CHUNK 1 2 3 4 FROM t", "expected FROM");
+    ExpectError("GET AREA 1 2 TO 3 4 5 FROM t", "different dimensions");
+    ExpectError("GET AREA 1 2 3 TO 4 5 FROM t", "different dimensions");
+    ExpectError("WATCH t AREA 1 2 3 TO 4 5", "different dimensions");
+    ExpectError("CREATE SLOT 's' ON t AREA 1 2 4 TO 3 4 3", "bounds are reversed");
+}
+
+void TestChunkModelSchemaAndWrites() {
+    for (const auto* geometry : {"2 x 3 x 4", "2x3x4", "2x3 x4", "2 X 3X4"}) {
+        const auto create = Get<cql::CreateTable>(std::string("CREATE TABLE t (v u8) CHUNK ") + geometry +
+            " CHUNK COLUMNS (title text(8) NULL DEFAULT 'base') LARGE 5 x 6 x 7");
+        assert(create.dims == 3U && create.chunk_width == 2 && create.chunk_height == 3 && create.chunk_depth == 4);
+        assert(create.large && create.large->first == 5 && create.large->second == 6 && create.large_depth == 7);
+        assert(create.chunk_columns.size() == 1U && create.chunk_columns[0].name == "title" && create.chunk_columns[0].nullable);
+    }
+    const auto reordered = Get<cql::CreateTable>("CREATE TABLE t (v u8) LARGE 5x6x7 CHUNK COLUMNS (v u10) CHUNK 2x3x4");
+    assert(reordered.dims == 3U && reordered.chunk_columns[0].name == "v");
+    const auto add = std::get<cql::AddColumn>(Get<cql::AlterTable>("ALTER TABLE t ADD CHUNK COLUMN IF NOT EXISTS a u8").change);
+    const auto drop = std::get<cql::DropColumn>(Get<cql::AlterTable>("ALTER TABLE t DROP CHUNK COLUMN IF EXISTS a").change);
+    const auto rename = std::get<cql::RenameColumn>(Get<cql::AlterTable>("ALTER TABLE t RENAME CHUNK COLUMN a TO b").change);
+    assert(add.chunk_column && add.if_not_exists && drop.chunk_column && drop.if_exists && rename.chunk_column && rename.new_name == "b");
+    const auto meta = Get<cql::SetChunk>("SET CHUNK 1 2 3 IN t META title=$1,v=8 IF ABSENT", 1);
+    assert(meta.dims == 3U && meta.chunk_z == 3 && meta.metadata && meta.metadata->size() == 2U);
+    assert(meta.state.index == 0U && meta.if_absent && !meta.if_version && meta.columns.empty());
+    const auto projected = Get<cql::SetChunk>("SET CHUNK 1 2 IN t COLUMNS b,a $1 IF VERSION 18446744073709551615", 1);
+    assert(projected.dims == 2U && projected.columns == (std::vector<std::string>{"b", "a"}));
+    assert(projected.state.index == 1U && !projected.metadata && projected.if_version == std::numeric_limits<std::uint64_t>::max());
+    assert(Get<cql::SetChunk>("SET CHUNK 1 2 IN t $1 IF ABSENT", 1).if_absent);
+    const auto migration = Get<cql::Migrate>("MIGRATE 'm' ALTER TABLE t ADD CHUNK COLUMN a u8");
+    assert(std::get<cql::AddColumn>(std::get<cql::AlterTable>(migration.statement).change).chunk_column);
+    ExpectError("CREATE TABLE t (v u8) CHUNK 2x3x4 LARGE 5x6", "different dimensions");
+    ExpectError("CREATE TABLE t (v u8) LARGE 5x6x7", "different dimensions");
+    ExpectError("CREATE TABLE t (v u8) CHUNK 2x3x4x5", "more than three dimensions");
+    ExpectError("CREATE TABLE t (v u8) CHUNK 2x3x4294967296", "out of range");
+    ExpectError("CREATE TABLE t (v u8) CHUNK COLUMNS (a u8) CHUNK COLUMNS (b u8)", "given twice");
+    ExpectError("SET CHUNK 1 2 IN t META a=$1 $2", "expected the end");
+    ExpectError("SET CHUNK 1 2 IN t COLUMNS a META a=$1", "expected a value");
+    ExpectError("SET CHUNK 1 2 IN t $1 IF ABSENT IF VERSION 1", "expected the end");
+    ExpectError("SET CHUNK 1 2 IN t META a=$1 IF VERSION 1 IF ABSENT", "expected the end");
+}
+
+void TestChunkModelScan() {
+    const auto scan = Get<cql::ScanChunks>("SCAN CHUNKS FROM t AFTER -1 2 -3 SINCE 18446744073709551615 LIMIT 9 WITH DATA COLUMNS (b,a)");
+    assert(scan.after && scan.after->first == -1 && scan.after->second == 2 && scan.after_z == -3 && scan.dims == 3U);
+    assert(scan.since == std::numeric_limits<std::uint64_t>::max() && scan.limit == 9U && scan.with_data);
+    assert(scan.columns == (std::vector<std::string>{"b", "a"}));
+    assert(Get<cql::ScanChunks>("SCAN CHUNKS FROM t SINCE 0").since == 0U);
+    ExpectError("SCAN CHUNKS FROM t SINCE 0 SINCE 1", "given twice");
+    ExpectError("SCAN CHUNKS FROM t WITH DATA WITH DATA", "given twice");
+    ExpectError("SCAN CHUNKS FROM t COLUMNS a", "requires WITH DATA");
+    ExpectError("SCAN CHUNKS FROM t SINCE -1", "a revision must be between 0");
+    const auto compact = Get<cql::CompactTombstones>("COMPACT TOMBSTONES t BEFORE 18446744073709551615");
+    assert(compact.table == "t" && compact.before == std::numeric_limits<std::uint64_t>::max());
+    assert(Get<cql::CompactTombstones>("COMPACT TOMBSTONES t BEFORE 0").before == 0U);
+    assert(Get<cql::ShowTableStats>("SHOW TABLE STATS t").table == "t");
+    ExpectError("COMPACT TOMBSTONES t BEFORE -1", "a revision must be between 0");
+    ExpectError("MIGRATE 'compact' COMPACT TOMBSTONES t BEFORE 1", "one schema statement");
+}
+
 void TestConditionalObjects() {
     assert(Get<cql::CreateTable>("CREATE TABLE IF NOT EXISTS t (a u8) CHUNK 4 x 4").if_not_exists);
     assert(Get<cql::DropTable>("DROP TABLE IF EXISTS t").if_exists);
@@ -188,9 +266,23 @@ void TestChunkAndAreaStatements() {
     assert(around.columns.size() == 2);
     assert(Get<cql::GetArea>("GET AREA 0 0 TO 2 2 FROM t WITH SCHEMA").with_schema);
     assert(Get<cql::GetArea>("GET AREA AROUND 0 0 RADIUS 1 FROM t COLUMNS a WITH SCHEMA").with_schema);
-    ExpectError("GET AREA 0 0 TO 2 2 FROM t WITH SCHEMA WITH SCHEMA", "expected the end");
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t WITH SCHEMA WITH SCHEMA", "WITH SCHEMA is given twice");
     ExpectError("GET AREA 0 0 TO 2 2 FROM t WITH VERSION", "expected SCHEMA");
     ExpectError("GET AREA AROUND 0 0 RADIUS -1 FROM t", "a radius must be between 0");
+
+    const auto page = Get<cql::GetArea>("GET AREA -2 -2 TO 5 6 FROM after COLUMNS limit, after LIMIT 7 AFTER -1 3 WITH SCHEMA");
+    assert(page.limit == 7U && page.after == (chunkdb::ChunkCoord{-1, 3}) && page.with_schema);
+    assert(page.table == "after" && page.columns == (std::vector<std::string>{"limit", "after"}));
+    const auto page3 = Get<cql::GetArea>("GET AREA AROUND -1 2 0 RADIUS 8 FROM t AFTER 0 2 0 LIMIT 18446744073709551615");
+    assert(page3.dims == 3U && page3.after == (chunkdb::ChunkCoord{0, 2, 0}));
+    assert(page3.limit == std::numeric_limits<std::uint64_t>::max());
+    assert(Get<cql::GetArea>("GET AREA 0 0 TO 2 2 FROM t AFTER 0 0").after.has_value());
+    assert(Get<cql::GetArea>("GET AREA 0 0 TO 2 2 FROM t LIMIT 0").limit == 0U);
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t LIMIT 1 LIMIT 2", "LIMIT is given twice");
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t AFTER 0 0 AFTER 1 1", "AFTER is given twice");
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t AFTER 0 0 0", "cursor has different dimensions");
+    ExpectError("GET AREA 0 0 0 TO 2 2 0 FROM t AFTER 0 0", "cursor has different dimensions");
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t LIMIT -1", "a limit must be between 0");
 }
 
 void TestLiterals() {
@@ -454,6 +546,9 @@ void TestHelloOptions() {
 }
 
 int main() {
+    TestChunkModelCoordinates();
+    TestChunkModelSchemaAndWrites();
+    TestChunkModelScan();
     TestHelloOptions();
     TestDefaultChunkGeometry();
     TestRightsLists();

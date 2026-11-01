@@ -50,8 +50,17 @@ void ClearTail(std::uint8_t* data, std::size_t begin, std::size_t bytes, std::si
 }  // namespace
 
 ChunkLayout::ChunkLayout(TableSchema schema, std::size_t block_count, std::size_t max_payload_bytes)
+    : ChunkLayout(std::move(schema), block_count, max_payload_bytes, ColumnDomain::kBlock) {}
+
+ChunkLayout::ChunkLayout(
+    TableSchema schema, std::size_t block_count, std::size_t max_payload_bytes, ColumnDomain domain)
     : schema_(std::move(schema)), block_count_(block_count), payload_bytes_limit_(max_payload_bytes) {
-    ValidateTableSchema(schema_);
+    if (domain == ColumnDomain::kChunk) {
+        if (block_count != 1U) throw std::invalid_argument("chunk columns require exactly one row");
+        ValidateChunkSchema(schema_);
+    }
+    else if (domain == ColumnDomain::kBlock) ValidateTableSchema(schema_);
+    else throw std::invalid_argument("unknown column domain");
     fixed_index_.assign(schema_.columns.size(), std::string_view::npos);
     std::size_t offset = 0;
     for (std::size_t i = 0; i < schema_.columns.size(); ++i) {
@@ -93,24 +102,32 @@ const Column* ChunkLayout::VarColumn(std::uint32_t column_id) const noexcept {
 }
 
 void ChunkLayout::RequireValidVars(const ChunkVars& vars, const std::vector<std::uint8_t>& presence) const {
+    RequireValidVarsView(vars, presence);
+}
+
+void ChunkLayout::RequireValidVarsView(const ChunkVars& vars, std::span<const std::uint8_t> presence) const {
+    if (presence.size() != (block_count_ + 7U) / 8U)
+        throw std::invalid_argument("variable values require the complete presence bitmap");
     for (const auto entry : vars) {
-        const auto where = "column " + std::to_string(entry.key.column_id) + " block " +
-                           std::to_string(entry.key.block_index);
+        const auto fail = [&](std::string reason) {
+            throw std::invalid_argument("column " + std::to_string(entry.key.column_id) + " block " +
+                std::to_string(entry.key.block_index) + ": " + reason);
+        };
         const Column* column = VarColumn(entry.key.column_id);
         if (column == nullptr) {
-            throw std::invalid_argument(where + ": no text or bytes column has this id");
+            fail("no text or bytes column has this id");
         }
         if (entry.key.block_index >= block_count_ || !GetBit(presence.data(), entry.key.block_index)) {
-            throw std::invalid_argument(where + ": a value of an absent block");
+            fail("a value of an absent block");
         }
         if (entry.value.size() > column->type.size) {
-            throw std::invalid_argument(where + ": longer than " + ColumnTypeName(column->type));
+            fail("longer than " + ColumnTypeName(column->type));
         }
         if (entry.value.empty() && !column->nullable) {
-            throw std::invalid_argument(where + ": an empty value stored in a column that cannot be NULL");
+            fail("an empty value stored in a column that cannot be NULL");
         }
         if (column->type.kind == ColumnKind::kText && !IsUtf8(entry.value)) {
-            throw std::invalid_argument(where + ": text that is not UTF-8");
+            fail("text that is not UTF-8");
         }
     }
 }

@@ -40,6 +40,12 @@
 
 namespace chunkdb {
 
+void WriteAtomicTempFile(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes,
+    bool durable_sync, bool enable_generic_failpoints) {
+    const AtomicFileProducer produce = [&](const AtomicFileSink& sink) { sink(bytes); };
+    WriteAtomicTempFile(path, produce, durable_sync, enable_generic_failpoints);
+}
+
 namespace {
 std::atomic<bool> g_directory_sync_observed{false};
 std::mutex g_directory_sync_observer_mutex;
@@ -149,7 +155,7 @@ void FlushHandleChecked(HANDLE handle, const std::filesystem::path& path, const 
 
 void WriteAtomicTempFile(
     const std::filesystem::path& tmp_path,
-    const std::vector<std::uint8_t>& bytes,
+    const AtomicFileProducer& produce,
     bool durable_sync,
     bool enable_generic_failpoints) {
     OwnerOnlySecurity security(tmp_path);
@@ -175,22 +181,24 @@ void WriteAtomicTempFile(
             throw std::runtime_error(
                 "injected temporary file write failure: " + tmp_path.string());
         }
-        std::size_t offset = 0;
-        while (offset < bytes.size()) {
-            const std::size_t remaining = bytes.size() - offset;
-            const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(remaining, 1U << 20U));
-            DWORD written = 0;
-            const BOOL ok = WriteFile(
-                handle,
-                bytes.data() + offset,
-                chunk,
-                &written,
-                nullptr);
-            if (ok == 0 || written != chunk) {
-                throw BuildWin32Error("failed to write temporary file", tmp_path, GetLastError());
+        produce([&](std::span<const std::uint8_t> bytes) {
+            std::size_t offset = 0;
+            while (offset < bytes.size()) {
+                const std::size_t remaining = bytes.size() - offset;
+                const DWORD chunk = static_cast<DWORD>(std::min<std::size_t>(remaining, 1U << 20U));
+                DWORD written = 0;
+                const BOOL ok = WriteFile(
+                    handle,
+                    bytes.data() + offset,
+                    chunk,
+                    &written,
+                    nullptr);
+                if (ok == 0 || written != chunk) {
+                    throw BuildWin32Error("failed to write temporary file", tmp_path, GetLastError());
+                }
+                offset += written;
             }
-            offset += written;
-        }
+        });
 
         if (durable_sync) {
             if (enable_generic_failpoints &&
@@ -247,12 +255,38 @@ std::error_code RenameByHandle(
     rename_info->FileNameLength = static_cast<DWORD>(target_w.size() * sizeof(wchar_t));
     std::memcpy(rename_info->FileName, target_w.data(), rename_info->FileNameLength);
 
-    const BOOL rename_ok = SetFileInformationByHandle(
-        tmp_handle,
-        FileRenameInfo,
-        rename_info,
-        static_cast<DWORD>(rename_bytes.size()));
-    const DWORD rename_error = rename_ok != 0 ? ERROR_SUCCESS : GetLastError();
+    // The extended information class uses a DWORD in the same first four
+    // bytes and can replace a target whose readers share delete access.
+    // Keep the ABI values usable with headers predating their symbolic names.
+    constexpr auto rename_info_ex = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
+    constexpr DWORD replace_with_posix_semantics = 0x00000001U | 0x00000002U;
+    if (replace_if_exists)
+        std::memcpy(rename_bytes.data(), &replace_with_posix_semantics, sizeof(DWORD));
+    BOOL rename_ok = FALSE;
+    DWORD rename_error = ERROR_SUCCESS;
+    if (replace_if_exists && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE")) {
+        rename_error = ERROR_INVALID_PARAMETER;
+    } else {
+        rename_ok = SetFileInformationByHandle(
+            tmp_handle,
+            replace_if_exists ? rename_info_ex : FileRenameInfo,
+            rename_info,
+            static_cast<DWORD>(rename_bytes.size()));
+        rename_error = rename_ok != 0 ? ERROR_SUCCESS : GetLastError();
+    }
+    // Older kernels retain their original atomic rename path. An ordinary
+    // access/sharing error must not trigger a different publication strategy.
+    if (!rename_ok && replace_if_exists &&
+        (rename_error == ERROR_INVALID_PARAMETER || rename_error == ERROR_NOT_SUPPORTED ||
+         rename_error == ERROR_INVALID_FUNCTION)) {
+        rename_info->ReplaceIfExists = TRUE;
+        rename_ok = SetFileInformationByHandle(
+            tmp_handle,
+            FileRenameInfo,
+            rename_info,
+            static_cast<DWORD>(rename_bytes.size()));
+        rename_error = rename_ok != 0 ? ERROR_SUCCESS : GetLastError();
+    }
 
     const BOOL close_ok = CloseHandle(tmp_handle);
     const DWORD close_error = close_ok != 0 ? ERROR_SUCCESS : GetLastError();
@@ -425,7 +459,7 @@ void SyncFdDurably(int fd, const std::filesystem::path& path, bool full_sync) {
 
 void WriteAtomicTempFile(
     const std::filesystem::path& tmp_path,
-    const std::vector<std::uint8_t>& bytes,
+    const AtomicFileProducer& produce,
     bool durable_sync,
     bool enable_generic_failpoints) {
     // O_EXCL: BuildAtomicTmpPath already makes the name unique per attempt, so an
@@ -446,22 +480,24 @@ void WriteAtomicTempFile(
             throw std::runtime_error(
                 "injected temporary file write failure: " + tmp_path.string());
         }
-        std::size_t offset = 0;
-        while (offset < bytes.size()) {
-            const std::size_t remaining = bytes.size() - offset;
-            const ssize_t written = ::write(fd, bytes.data() + offset, remaining);
-            if (written < 0) {
-                if (errno == EINTR) {
-                    continue;
+        produce([&](std::span<const std::uint8_t> bytes) {
+            std::size_t offset = 0;
+            while (offset < bytes.size()) {
+                const std::size_t remaining = bytes.size() - offset;
+                const ssize_t written = ::write(fd, bytes.data() + offset, remaining);
+                if (written < 0) {
+                    if (errno == EINTR) {
+                        continue;
+                    }
+                    throw BuildErrnoError("failed to write temporary file", tmp_path, errno);
                 }
-                throw BuildErrnoError("failed to write temporary file", tmp_path, errno);
+                if (written == 0) {
+                    throw std::runtime_error(
+                        "short write while writing temporary file: " + tmp_path.string());
+                }
+                offset += static_cast<std::size_t>(written);
             }
-            if (written == 0) {
-                throw std::runtime_error(
-                    "short write while writing temporary file: " + tmp_path.string());
-            }
-            offset += static_cast<std::size_t>(written);
-        }
+        });
 
         if (durable_sync) {
             if (enable_generic_failpoints &&
@@ -646,6 +682,47 @@ bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
     return true;
 }
 }  // namespace
+#endif
+
+#ifdef _WIN32
+void SyncOwnerFileHandle(void* handle, const std::filesystem::path& label) {
+    FlushHandleChecked(static_cast<HANDLE>(handle), label, "failed to sync owner object");
+    NoteFileSynced(label);
+}
+void SyncOwnerDirectoryHandle(void* handle, const std::filesystem::path& label) {
+    DWORD error = ERROR_SUCCESS;
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WINDOWS_DIRECTORY_SYNC_CAPABILITY_ERROR_ONCE")) {
+        error = ERROR_INVALID_FUNCTION;
+    } else if (FlushFileBuffers(static_cast<HANDLE>(handle)) == 0) {
+        error = GetLastError();
+    }
+    if (error != ERROR_SUCCESS) {
+        throw BuildWin32Error("strict durability requires owner directory sync capability", label, error);
+    }
+    NoteDirectorySynced(label);
+}
+#else
+void SyncOwnerFileDescriptor(int fd, const std::filesystem::path& label) {
+    SyncFdDurably(fd, label, true);
+    NoteFileSynced(label);
+}
+void SyncOwnerDirectoryDescriptor(int fd, const std::filesystem::path& label) {
+#if defined(__APPLE__)
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE")) {
+        throw BuildErrnoError("failed to F_FULLFSYNC owner directory", label, EIO);
+    }
+    if (::fcntl(fd, F_FULLFSYNC, 0) != 0) {
+        const int error = errno;
+        if (error != EINVAL && error != ENOTSUP && error != ENOTTY) {
+            throw BuildErrnoError("failed to F_FULLFSYNC owner directory", label, error);
+        }
+        if (::fsync(fd) != 0) throw BuildErrnoError("failed to sync owner directory", label, errno);
+    }
+#else
+    if (::fsync(fd) != 0) throw BuildErrnoError("failed to sync owner directory", label, errno);
+#endif
+    NoteDirectorySynced(label);
+}
 #endif
 
 void SyncFilePath(const std::filesystem::path& path) {

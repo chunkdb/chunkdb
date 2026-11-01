@@ -5,9 +5,9 @@
 chunkdb stores grid data in tables of chunks of typed blocks.
 
 A **block** is one grid cell with named columns, such as `kind` and `name`.
-A **chunk** groups a fixed rectangle of blocks.
+A **chunk** groups a fixed rectangle or cuboid of blocks and can carry its own typed metadata.
 A **table** defines their column types and chunk size.
-An **area** selects a rectangle of chunks.
+An **area** selects a rectangle or cuboid of chunks.
 
 After [Quick start](docs/QUICK_START.md), use your CLI shell to create a separate example table:
 
@@ -19,7 +19,7 @@ GET BLOCK 0 0 FROM example_grid
 
 ```output
 OK
-2
+1
 kind = 1
 name = 'grass'
 ```

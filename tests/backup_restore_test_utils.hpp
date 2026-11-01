@@ -5,6 +5,7 @@
 #include <sstream>
 #include "backup.hpp"
 #include "checkpoint.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
@@ -76,9 +77,9 @@ struct Fixture {
     explicit Fixture(DurabilityMode mode = DurabilityMode::kRelaxed) {
         std::filesystem::create_directory(source);
         PrepareBackupTarget(source, backup);
-        Save(backup / kDataDirManifestFileName, SerializeDataDirManifest({{}, NewStoreId(), {}}));
+        Save(backup / kDataDirManifestFileName, SerializeDataDirManifest({{kFeatureChunkModel, 0U, 0U}, NewStoreId(), {}}));
         manifest.geometry = old_geometry.config(); manifest.store_id = NewStoreId();
-        manifest.features = {kFeatureFeedSlots | kFeatureTableLineage, 0U, 1U};
+        manifest.features = {kFeatureFeedSlots | kFeatureTableLineage | kFeatureChunkModel, 0U, 1U};
         TableOptions options; options.durability_mode = mode;
         manifest.options = EncodeTableOptions(options);
         Column extra; extra.name = "extra"; extra.type = {ColumnKind::kUnsigned, 8U}; extra.has_default = true; extra.default_value = {9U};
@@ -86,6 +87,7 @@ struct Fixture {
         manifest.geometry.block_bits = FixedBitsPerBlock(manifest.schema);
         const auto table = backup / "tables/default";
         Save(StoreManifestPath(table), SerializeStoreManifest(manifest));
+        assert(ChunkCoordinateIndex::InitializeEmpty(table, Geometry(manifest.geometry, manifest.schema), manifest.store_id));
         Save(table / "chunkdb.version", SerializeVersionClockRecord(100U));
         Save(table / "chunkdb.snapshot", SerializeSnapshotGenerationRecord(0U));
         Bytes initialized{'C', 'K', 'I', 'D'}; WriteLe64(initialized, 1U); WriteLe32(initialized, Crc32(initialized));
@@ -94,14 +96,14 @@ struct Fixture {
         auto image = SerializeChunkImage(old_geometry, {0, 0}, {7U, 0U}, {1U}, CheckpointCompression::kZrle, 2U, 20U, manifest.store_id);
         const auto old_crc = kImageFixedHeaderSize + 2U * kImageSectionEntrySize;
         Bytes extended(image.begin(), image.begin() + static_cast<std::ptrdiff_t>(old_crc));
-        extended[10U] = 3U; extended[20U] = 1U;
+        extended[10U] = 3U; extended[24U] = 1U;
         const Bytes optional{'o', 'p', 'q'};
         WriteLe16(extended, 99U); WriteLe16(extended, 0U); WriteLe32(extended, optional.size()); WriteLe32(extended, optional.size()); WriteLe32(extended, Crc32(optional));
         WriteLe32(extended, Crc32(extended));
         extended.insert(extended.end(), image.begin() + static_cast<std::ptrdiff_t>(old_crc + 4U), image.end());
         extended.insert(extended.end(), optional.begin(), optional.end());
         Save(ChunkDataPath(table, old_geometry, {0, 0}), extended);
-        auto wal = BuildWalHeader({0, 0}, manifest.store_id, {});
+        auto wal = BuildWalHeader({0, 0}, manifest.store_id, {.incompat = kFeatureChunkModel});
         const auto frame = Frame(3U);
         wal.insert(wal.end(), frame.begin(), frame.end());
         Save(ChunkWalPath(table, old_geometry, {0, 0}), wal);

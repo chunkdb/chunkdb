@@ -46,12 +46,12 @@ Unknown options are lexically parsed, accepted and reported as not applied; they
 Parameters in WITH follow the same framing rules as all other parameters, independently of SCRAM's authentication parameter.
 Unset options use server defaults; explicit per-statement TAG overrides `default_tag`, including an empty tag.
 
-| Limit key | Task 51 value and ownership |
+| Limit key | Value and ownership |
 | --- | --- |
-| `max_area_chunks` | 256, currently enforced by `kMaxChunkRangeChunks`; task 53 replaces the constant with its configured limit. |
-| `max_area_response_bytes` | 67108864, currently enforced; report the effective value after flags exist. |
-| `txn_max_written_chunks` | 64, currently enforced in statement, commit and intent decoding paths; task 53 changes all three together. |
-| `txn_max_read_chunks` | 1024, currently enforced; task 53 supplies the configured limit. |
+| `max_area_chunks` | Configured requested-cell limit per area/page, default 4096. |
+| `max_area_response_bytes` | Configured complete response-byte limit, default 67108864. |
+| `txn_max_written_chunks` | Configured statement/commit admission, default 1024; historical intent decoding validates its checked extent independently. |
+| `txn_max_read_chunks` | Configured statement/commit admission, default 8192. |
 | `max_watches` | Effective server configuration; current default 64. |
 | `max_returning_rows` | 65536, the declared ceiling from E3; RETURNING remains unavailable until task 55. |
 | `max_expression_nodes` | 256, the declared ceiling from E1; expressions remain unavailable until task 55. |
@@ -137,7 +137,8 @@ Manifest-only initialization remains valid, and read-only inspection keeps its u
 
 Row, version and schema metadata are captured under the same table lease and chunk read/snapshot boundary.
 An absent block with a retained committed chunk version still returns that version.
-The version is null when no committed version remains retained, including never-written chunks and collected empty chunks.
+The version is null when no committed version remains retained, including never-written chunks and identities forgotten by tombstone compaction.
+Collection itself preserves the producing version and time in a retained tombstone.
 An empty or torn WAL header alone is not a committed version.
 Persistent versions for collected chunks belong to task 52's tombstones.
 For transaction-private modified chunks the version is null, because no commit produced those private values yet; the committed snapshot version remains available before modification.

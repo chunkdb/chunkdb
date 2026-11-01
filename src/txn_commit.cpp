@@ -19,6 +19,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
 #include "txn_history.hpp"
+#include "txn_block_rows.hpp"
 #include "wal_writer.hpp"
 #include "change_feed.hpp"
 #include "feed_prefix.hpp"
@@ -167,18 +168,25 @@ void ChunkStore::ApplyTxnHistory(
     bool with_vars,
     ChunkRangeEntry* entry) {
     (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) {
-        entry->payload = kept.state.payload;
-        entry->presence_bitmap = kept.state.presence_bitmap;
-        entry->version = kept.state.version;
+        const auto state = kept.View();
+        entry->payload.assign(state.payload.begin(), state.payload.end());
+        entry->presence_bitmap.assign(state.presence_bitmap.begin(), state.presence_bitmap.end());
+        entry->version = state.version;
+        entry->commit_time_ms = state.commit_time_ms;
+        entry->chunk_columns = state.CopyMetadata();
         if (with_vars) {
-            entry->vars = kept.state.vars;
+            entry->vars = state.vars;
         }
     });
 }
 
 ChunkState ChunkStore::ReadChunkStateAt(const TxnSnapshot& snapshot, std::int64_t chunk_x, std::int64_t chunk_y) {
+    if (geometry_.dims() != 2) throw std::invalid_argument("chunk coordinates require 3 axes");
+    return ReadChunkStateAt(snapshot, ChunkCoord{chunk_x, chunk_y});
+}
+
+ChunkState ChunkStore::ReadChunkStateAt(const TxnSnapshot& snapshot, const ChunkCoord& chunk_coord) {
     RequireOwnTxnSnapshot(snapshot);
-    const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     ChunkState state;
     {
@@ -188,9 +196,35 @@ ChunkState ChunkStore::ReadChunkStateAt(const TxnSnapshot& snapshot, std::int64_
         state.version = regular_chunk->version;
         state.vars = regular_chunk->vars;
         state.written = regular_chunk->written;
+        state.commit_time_ms = regular_chunk->commit_time_ms;
+        state.chunk_columns = regular_chunk->chunk_columns;
     }
-    (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) { state = kept.state; });
+    (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) { state = kept.View().CopyState(); });
     return state;
+}
+
+TxnBlockSnapshot ChunkStore::ReadBlockAtSnapshot(const TxnSnapshot& snapshot,
+    const ChunkCoord& chunk_coord, std::size_t block_index, std::pmr::memory_resource* resource) {
+    RequireOwnTxnSnapshot(snapshot);
+    (void)geometry_.ChunkToLarge(chunk_coord);
+    if (block_index >= geometry_.layout().block_count())
+        throw std::invalid_argument("transaction block index is outside its chunk");
+    TxnBlockSnapshot result(resource);
+    const auto capture = [&](const auto& state) {
+        result.row = CaptureTxnBlockRow(geometry_.layout(), state.payload, state.presence_bitmap,
+            state.vars, block_index, resource);
+        result.version = state.version;
+        result.commit_time_ms = state.commit_time_ms;
+        result.written = state.written;
+    };
+    const auto chunk = GetOrLoadRegularChunk(chunk_coord);
+    // The same chunk-to-history order is used when publishing kept states.
+    // Select the source before allocating so a newer large row cannot consume
+    // the budget of a small historical observation.
+    std::shared_lock lock(chunk->mutex);
+    if (!txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) { capture(kept.View()); }))
+        capture(*chunk);
+    return result;
 }
 
 std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAt(
@@ -201,8 +235,8 @@ std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAt(
     const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
-    const auto decode = [&](const std::vector<std::uint8_t>& payload,
-                            const std::vector<std::uint8_t>& presence,
+    const auto decode = [&](std::span<const std::uint8_t> payload,
+                            std::span<const std::uint8_t> presence,
                             const ChunkVars& vars) -> std::optional<std::vector<ColumnValue>> {
         if (!BlockPresent(presence, block_index)) {
             return std::nullopt;
@@ -217,7 +251,8 @@ std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAt(
         values = decode(regular_chunk->payload, regular_chunk->presence_bitmap, regular_chunk->vars);
     }
     (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) {
-        values = decode(kept.state.payload, kept.state.presence_bitmap, kept.state.vars);
+        const auto state = kept.View();
+        values = decode(state.payload, state.presence_bitmap, state.vars);
     });
     return values;
 }
@@ -236,13 +271,17 @@ BlockReadMetadata ChunkStore::GetBlockWithVersionAt(
     };
     const auto chunk = GetOrLoadRegularChunk(coord);
     { std::shared_lock lock(chunk->mutex); capture(*chunk); }
-    (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.state); });
+    (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.View()); });
     return result;
 }
 
 bool ChunkStore::ChunkChangedSince(const TxnSnapshot& snapshot, std::int64_t chunk_x, std::int64_t chunk_y) {
+    if (geometry_.dims() != 2U) throw std::invalid_argument("chunk coordinates must match the table dimensions");
+    return ChunkChangedSince(snapshot, ChunkCoord{chunk_x, chunk_y});
+}
+
+bool ChunkStore::ChunkChangedSince(const TxnSnapshot& snapshot, const ChunkCoord& chunk_coord) {
     RequireOwnTxnSnapshot(snapshot);
-    const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     // A write keeps its chunk's state before it releases the chunk's lock.
     std::shared_lock lock(regular_chunk->mutex);
@@ -325,16 +364,16 @@ std::uint64_t ChunkStore::CommitTransaction(
     }
 
     // Everything the caller passed is checked before any chunk is touched.
-    if (writes.size() > kMaxTxnWrittenChunks) {
+    if (writes.size() > query_limits_.txn_max_written_chunks) {
         throw std::invalid_argument(
-            "a transaction writes at most " + std::to_string(kMaxTxnWrittenChunks) + " chunks");
+            "a transaction writes at most " + std::to_string(query_limits_.txn_max_written_chunks) + " chunks");
     }
     std::vector<ChunkCoord> reads = read_set;
     std::sort(reads.begin(), reads.end(), TxnCoordLess{});
     reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
-    if (reads.size() > kMaxTxnReadChunks) {
+    if (reads.size() > query_limits_.txn_max_read_chunks) {
         throw std::invalid_argument(
-            "a transaction reads at most " + std::to_string(kMaxTxnReadChunks) + " chunks");
+            "a transaction reads at most " + std::to_string(query_limits_.txn_max_read_chunks) + " chunks");
     }
     std::sort(writes.begin(), writes.end(), [](const TxnChunkWrite& lhs, const TxnChunkWrite& rhs) {
         return TxnCoordLess{}(lhs.coord, rhs.coord);
@@ -355,6 +394,12 @@ std::uint64_t ChunkStore::CommitTransaction(
         CanonicalizeAbsentBlocks(geometry_, state.presence_bitmap, &state.payload);
         geometry_.layout().RequireValidVars(state.vars, state.presence_bitmap);
         RequirePendingFits(state.payload, state.presence_bitmap, &state.vars);
+        if (state.chunk_columns) {
+            const auto variable_bytes = ValidateChunkColumns(geometry_.chunk_schema(), state.chunk_columns->bytes);
+            if (state.chunk_columns->variable_bytes != variable_bytes)
+                state.chunk_columns = std::make_shared<const ChunkColumnState>(ChunkColumnState{
+                    .bytes = state.chunk_columns->bytes, .variable_bytes = variable_bytes});
+        }
     }
 
     // From here the transaction ends whatever happens, except for an invalid
@@ -460,15 +505,21 @@ std::uint64_t ChunkStore::CommitTransaction(
         if (target.write == kNoWrite) {
             continue;
         }
-        const auto& vars = writes[target.write].state.vars;
-        const std::size_t after = vars.encoded_size();
-        // A chunk already over a lowered limit may still shrink.
-        if (after > var_max_chunk_bytes_ && after > target.chunk->vars.encoded_size()) {
+        auto& state = writes[target.write].state;
+        if (!state.chunk_columns && !target.chunk->written && geometry_.chunk_columns_require_initialization()) {
             end_snapshot.Disarm();
-            throw std::invalid_argument(
-                "the text and bytes values of chunk " + CoordText(target.coord) + " would take " +
-                std::to_string(after) + " bytes, more than var_max_chunk_bytes (" +
-                std::to_string(var_max_chunk_bytes_) + ")");
+            throw std::invalid_argument("a first write must supply the REQUIRED chunk columns");
+        }
+        if (!state.chunk_columns && (state.written || ChunkPresent(state.presence_bitmap)))
+            state.chunk_columns = geometry_.default_chunk_columns();
+        VarUpdate replace;
+        replace.replace = state.vars;
+        try {
+            RequireVarWrite(target.chunk->vars, replace, state.chunk_columns ? state.chunk_columns->variable_bytes : 0U,
+                target.chunk->written && target.chunk->chunk_columns ? target.chunk->chunk_columns->variable_bytes : 0U);
+        } catch (const std::invalid_argument&) {
+            end_snapshot.Disarm();
+            throw;
         }
     }
 
@@ -502,8 +553,10 @@ std::uint64_t ChunkStore::CommitTransaction(
         }
         auto& write = writes[target.write];
         const auto& chunk = *target.chunk;
+        const bool same_metadata = write.state.chunk_columns ? chunk.chunk_columns &&
+            write.state.chunk_columns->bytes == chunk.chunk_columns->bytes : !chunk.chunk_columns;
         if (write.state.payload == chunk.payload && write.state.presence_bitmap == chunk.presence_bitmap &&
-            write.state.vars == chunk.vars) {
+            write.state.vars == chunk.vars && same_metadata && (!write.state.written || chunk.written)) {
             continue;
         }
         changes.push_back(Change{.target = &target, .write = &write});
@@ -554,17 +607,24 @@ std::uint64_t ChunkStore::CommitTransaction(
     for (auto& change : changes) {
         const auto& chunk = *change.target->chunk;
         const auto& state = change.write->state;
+        change.keep.coordinate = coordinate_index_->Prepare(change.target->coord, &change.target->chunk->coordinate_node);
         if (change.new_wal) {
-            change.bytes = BuildWalHeader(change.target->coord, store_id_, features_);
+            change.bytes = BuildWalHeader(change.target->coord, store_id_, features_, geometry_.dims());
         }
-        feed.Before(change.target->coord, chunk.payload, chunk.presence_bitmap, chunk.vars);
+        feed.Before(change.target->coord, chunk.payload, chunk.presence_bitmap, chunk.vars, chunk.chunk_columns.get(), chunk.written);
         WalFrameBuilder frame(&change.bytes, geometry_.layout().schema().version, {}, SlotWriteUser());
         AppendDiffSpans(&frame, 0U, chunk.payload, state.payload);
         AppendDiffSpans(&frame, geometry_.ChunkPayloadBytes(), chunk.presence_bitmap, state.presence_bitmap);
         AppendVarDiff(&frame, chunk.vars, state.vars);
+        if (state.chunk_columns && (!chunk.chunk_columns || state.chunk_columns->bytes != chunk.chunk_columns->bytes))
+            frame.AppendChunkColumns(*state.chunk_columns);
+        if (frame.record_count() == 0U)
+            frame.AppendSpan(static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()),
+                state.presence_bitmap.data(), state.presence_bitmap.size());
         const auto frame_bytes = frame.Finish(version, commit_time_ms);
         if (feed_slots_ && feed_slots_->ArchiveRequired())
-            change.prefix.emplace(feed_slots_->prefix_index().Prepare(change.target->coord, change.boundary, change.bytes));
+            change.prefix.emplace(feed_slots_->prefix_index().Prepare(change.target->coord, change.boundary,
+                change.bytes, geometry_.dims()));
         feed.Capture(change.bytes, frame_bytes);
         if (keep_states) {
             change.keep.node = TxnHistory::Reserve(change.target->coord, version, ChunkState{});
@@ -573,9 +633,9 @@ std::uint64_t ChunkStore::CommitTransaction(
     }
     const auto intent_path = TxnIntentPath(data_dir_, version);
     const auto intent_dir = intent_path.parent_path();
-    const auto rollback_record = SerializeTxnIntent(intent);
+    const auto rollback_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, query_limits_.txn_max_written_chunks);
     intent.state = TxnIntentState::kCommitted;
-    const auto commit_record = SerializeTxnIntent(intent);
+    const auto commit_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, query_limits_.txn_max_written_chunks);
 
     // From the intent to its commit form, read-only processes do not take
     // these chunks.
@@ -743,13 +803,18 @@ std::uint64_t ChunkStore::CommitTransaction(
             .presence_bitmap = std::move(chunk.presence_bitmap),
             .vars = std::move(chunk.vars),
             .written = chunk.written,
+            .commit_time_ms = chunk.commit_time_ms,
+            .chunk_columns = chunk.chunk_columns,
         };
         chunk.payload = std::move(change.write->state.payload);
         chunk.presence_bitmap = std::move(change.write->state.presence_bitmap);
         chunk.vars = std::move(change.write->state.vars);
+        chunk.chunk_columns = std::move(change.write->state.chunk_columns);
         chunk.version = version;
         chunk.written = true;
         chunk.commit_time_ms = commit_time_ms;
+        chunk.present_blocks = PresentBlockCount(chunk.presence_bitmap);
+        change.keep.coordinate.Publish(chunk.present_blocks != 0U || ChunkColumnsPopulated(geometry_, chunk.chunk_columns.get()), version);
         chunk.pending_updates += 1;
         chunk.wal_bytes += change.bytes.size();
         if (!change.keep.node.empty()) {

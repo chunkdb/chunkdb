@@ -76,12 +76,12 @@ FeatureActivationJournal Seed(const std::filesystem::path& root) {
         (void)catalog.Create("beta", geometry, config.default_options);
     }
     auto directory = *ReadDataDirManifest(root);
-    directory.features = {.incompat = kFeatureActivation, .compat = 1U << 30U};
+    directory.features = {.incompat = kFeatureActivation | kFeatureChunkModel, .compat = 1U << 30U};
     Save(DataDirManifestPath(root), SerializeDataDirManifest(directory));
     FeatureActivationJournal journal{directory.data_dir_id, kFeatureSlotFilters, {}};
     for (const char* name : {"alpha", "beta"}) {
         auto manifest = *ReadStoreManifest(root / "tables" / name);
-        manifest.features = {.incompat = kFeatureFeedSlots, .compat = 1U << 29U};
+        manifest.features = {.incompat = kFeatureFeedSlots | kFeatureChunkModel, .compat = 1U << 29U};
         manifest.options.insert(manifest.options.end(), {99, 0, 1, 0, 0xAC});
         Save(StoreManifestPath(root / "tables" / name), SerializeStoreManifest(manifest));
         journal.tables.push_back({name, manifest.store_id});
@@ -138,10 +138,41 @@ void RuntimeActivation() {
     }
 }
 
+void CommitGroupOwnership() {
+    test::ScopedTempDir dir("chunkdb-commit-group-feature");
+    (void)Seed(dir.path());
+    const auto before_directory = *ReadDataDirManifest(dir.path());
+    const auto before_alpha = *ReadStoreManifest(dir.path() / "tables/alpha");
+    const auto before_beta = *ReadStoreManifest(dir.path() / "tables/beta");
+    CatalogConfig config; config.data_dir = dir.path();
+    {
+        TableCatalog catalog(config);
+        assert(catalog.EnableFeature("commit_groups"));
+        assert(!catalog.EnableFeature("commit_groups"));
+        for (const auto& name : {"alpha", "beta"}) {
+            const auto lease = catalog.Find(name)->Acquire();
+            assert((lease->store().features().incompat & kFeatureCommitGroups) != 0U);
+        }
+        const auto created = catalog.Create("gamma", {1U, 1U, 2U, 2U, 8U}, config.default_options);
+        assert((created->Acquire()->store().features().incompat & kFeatureCommitGroups) != 0U);
+    }
+    const auto directory = *ReadDataDirManifest(dir.path());
+    assert(directory.data_dir_id == before_directory.data_dir_id);
+    assert(directory.features.incompat == (before_directory.features.incompat | kFeatureCommitGroups));
+    assert(directory.features.compat == before_directory.features.compat);
+    for (const auto& [name, before] : {std::pair{"alpha", before_alpha}, std::pair{"beta", before_beta}}) {
+        const auto after = *ReadStoreManifest(dir.path() / "tables" / name);
+        assert(after.store_id == before.store_id && after.options == before.options);
+        assert(after.features.incompat == (before.features.incompat | kFeatureCommitGroups));
+        assert(after.features.compat == before.features.compat);
+    }
+    assert(!ReadFeatureActivationJournal(dir.path()));
+}
+
 void RuntimeAdmissionAndRecovery() {
     test::ScopedTempDir dir("chunkdb-feature-admission");
     auto journal = Seed(dir.path());
-    auto table = *ReadStoreManifest(dir.path() / "tables/alpha"); table.features.incompat = 0U;
+    auto table = *ReadStoreManifest(dir.path() / "tables/alpha"); table.features.incompat = kFeatureChunkModel;
     Save(StoreManifestPath(dir.path() / "tables/alpha"), SerializeStoreManifest(table));
     CatalogConfig config; config.data_dir = dir.path();
     {
@@ -270,7 +301,7 @@ void ValidationBeforePublication() {
         else if (std::string_view(damage) == "table_id") journal.tables.back().table_id = NewStoreId();
         else if (std::string_view(damage) == "inventory") journal.tables.pop_back();
         else if (std::string_view(damage) == "owner") {
-            auto root = *ReadDataDirManifest(dir.path()); root.features.incompat = 0U;
+            auto root = *ReadDataDirManifest(dir.path()); root.features.incompat = kFeatureChunkModel;
             Save(DataDirManifestPath(dir.path()), SerializeDataDirManifest(root));
         } else if (std::string_view(damage) == "missing") std::filesystem::remove(StoreManifestPath(table_path));
         else if (std::string_view(damage) == "conflict") Save(dir.path() / "chunkdb.migration.pending", {1});
@@ -308,14 +339,15 @@ void RecoveryPreservesCurrentMetadata() {
     auto options = DecodeTableOptions(table.options); options.checkpoint_update_interval = 17U;
     ReplaceTableOptions(&table, options);
     table.schema = RenameColumn(table.schema, table.schema.columns.front().name, "renamed");
+    table.chunk_schema = AdvanceOtherDomain(*table.chunk_schema, ColumnDomain::kChunk);
     Save(StoreManifestPath(dir.path() / "tables" / "beta"), SerializeStoreManifest(table));
     RecoverFeatureActivation(dir.path(), AccessMode::kReadWrite);
     assert(!ReadFeatureActivationJournal(dir.path()));
     const auto root = *ReadDataDirManifest(dir.path());
-    assert(root.features.incompat == (kFeatureActivation | kFeatureSlotFilters));
+    assert(root.features.incompat == (kFeatureActivation | kFeatureSlotFilters | kFeatureChunkModel));
     assert(root.features.compat == (1U << 30U));
     const auto restored = *ReadStoreManifest(dir.path() / "tables" / "beta");
-    assert(restored.features.incompat == (kFeatureFeedSlots | kFeatureSlotFilters));
+    assert(restored.features.incompat == (kFeatureFeedSlots | kFeatureSlotFilters | kFeatureChunkModel));
     assert(restored.features.compat == table.features.compat);
     assert(restored.options == table.options && restored.schema == table.schema);
     const auto complete = Tree(dir.path());
@@ -336,7 +368,7 @@ void DirectoryOnlyActivation() {
     auto after = Tree(dir.path()); after.erase(std::string(kDataDirManifestFileName));
     assert(after == before);
     const auto directory = *ReadDataDirManifest(dir.path());
-    assert(directory.features.incompat == (kFeatureActivation | kFeatureMigrations));
+    assert(directory.features.incompat == (kFeatureActivation | kFeatureMigrations | kFeatureChunkModel));
     assert(directory.features.compat == (1U << 30U));
     // Root-only activation still refuses a missing target before any publication.
     journal.tables.pop_back();
@@ -360,7 +392,7 @@ void BootstrapCrashRecovery(const std::string& executable) {
     for (const char* point : {"CHUNKDB_FAILPOINT_CRASH_FEATURE_ACTIVATION_BEFORE_PUBLISH_ONCE",
         "CHUNKDB_FAILPOINT_CRASH_FEATURE_ACTIVATION_AFTER_PUBLISH_ONCE", "CHUNKDB_FAILPOINT_FEATURE_ACTIVATION_SYNC_FAIL_ONCE"}) {
         test::ScopedTempDir dir("chunkdb-feature-bootstrap-crash"); (void)Seed(dir.path());
-        auto root = *ReadDataDirManifest(dir.path()); root.features.incompat = 0U;
+        auto root = *ReadDataDirManifest(dir.path()); root.features.incompat = kFeatureChunkModel;
         Save(DataDirManifestPath(dir.path()), SerializeDataDirManifest(root));
         const auto table = LoadFile(StoreManifestPath(dir.path() / "tables/alpha"));
         assert(RunChild(executable, dir.path(), point, false, true) == 86);
@@ -401,7 +433,7 @@ void CrashRecovery(const std::string& executable) {
     assert(RunChild(executable, dir.path(), points[7], true) == 86);
     RecoverFeatureActivation(dir.path(), AccessMode::kReadWrite);
     assert(!ReadFeatureActivationJournal(dir.path()));
-    assert(ReadDataDirManifest(dir.path())->features.incompat == (kFeatureActivation | kFeatureSlotFilters));
+    assert(ReadDataDirManifest(dir.path())->features.incompat == (kFeatureActivation | kFeatureSlotFilters | kFeatureChunkModel));
 }
 }  // namespace
 
@@ -435,5 +467,5 @@ int main(int argc, char** argv) {
         return 3;
     }
     assert(argc == 1);
-    RuntimeActivation(); RuntimeAdmissionAndRecovery(); RuntimePublishedFailure(); MetadataAdmission(); Codec(); ValidationBeforePublication(); RecoveryPreservesCurrentMetadata(); DirectoryOnlyActivation(); BootstrapCrashRecovery(argv[0]); CrashRecovery(argv[0]);
+    RuntimeActivation(); CommitGroupOwnership(); RuntimeAdmissionAndRecovery(); RuntimePublishedFailure(); MetadataAdmission(); Codec(); ValidationBeforePublication(); RecoveryPreservesCurrentMetadata(); DirectoryOnlyActivation(); BootstrapCrashRecovery(argv[0]); CrashRecovery(argv[0]);
 }

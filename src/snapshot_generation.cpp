@@ -380,7 +380,8 @@ void CrashAtSnapshotFailpoint(const char* key) {
 }
 
 [[nodiscard]] ReadOnlyArtifactSnapshot ReadArtifactForSnapshot(
-    const std::filesystem::path& path) {
+    const std::filesystem::path& path,
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>* reader = nullptr) {
     std::error_code status_ec;
     const auto status = std::filesystem::symlink_status(path, status_ec);
     if (status_ec == std::errc::no_such_file_or_directory ||
@@ -400,7 +401,7 @@ void CrashAtSnapshotFailpoint(const char* key) {
     try {
         return {
             .present = true,
-            .bytes = LoadFile(path),
+            .bytes = reader == nullptr ? LoadFile(path) : (*reader)(path),
         };
     } catch (const std::exception& load_error) {
         // An atomic replacement/removal between status and open is namespace
@@ -428,7 +429,8 @@ void CrashAtSnapshotFailpoint(const char* key) {
 // The table's pending transaction intents, in name order. They are rare
 // and short-lived, so listing them costs little.
 [[nodiscard]] std::vector<ReadOnlyArtifactSnapshot> ReadTxnIntentsForSnapshot(
-    const std::filesystem::path& intent_dir) {
+    const std::filesystem::path& intent_dir,
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& read_intent) {
     std::error_code list_ec;
     std::filesystem::directory_iterator iterator(intent_dir, list_ec);
     if (list_ec == std::errc::no_such_file_or_directory) {
@@ -453,7 +455,7 @@ void CrashAtSnapshotFailpoint(const char* key) {
     std::sort(names.begin(), names.end());
     std::vector<ReadOnlyArtifactSnapshot> intents;
     for (const auto& name : names) {
-        auto intent = ReadArtifactForSnapshot(intent_dir / name);
+        auto intent = ReadArtifactForSnapshot(intent_dir / name, &read_intent);
         if (intent.present) {
             intents.push_back(std::move(intent));
         }
@@ -467,16 +469,18 @@ void CrashAtSnapshotFailpoint(const char* key) {
     const std::filesystem::path& intent_path,
     const std::filesystem::path& txn_intent_dir,
     std::size_t collection,
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& image_reader,
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& txn_intent_reader,
     const std::function<void(
         std::size_t,
         ReadOnlySnapshotArtifact)>& observation) {
     ReadOnlyChunkDiskSnapshot snapshot;
-    snapshot.image = ReadArtifactForSnapshot(data_path);
+    snapshot.image = ReadArtifactForSnapshot(data_path, &image_reader);
     observation(collection, ReadOnlySnapshotArtifact::kImage);
     snapshot.wal = ReadArtifactForSnapshot(wal_path);
     observation(collection, ReadOnlySnapshotArtifact::kWal);
     snapshot.intent = ReadArtifactForSnapshot(intent_path);
-    snapshot.txn_intents = ReadTxnIntentsForSnapshot(txn_intent_dir);
+    snapshot.txn_intents = ReadTxnIntentsForSnapshot(txn_intent_dir, txn_intent_reader);
     observation(collection, ReadOnlySnapshotArtifact::kIntent);
     return snapshot;
 }
@@ -548,7 +552,7 @@ void SnapshotGenerationMapping::Initialize(std::uint64_t session) {
     WriteLe64(record, session);
     WriteLe32(record, Crc32(record));
     WriteLe32(record, 0U);
-    WriteLe64(record, kGenerationOdd);
+    WriteLe64(record, kGenerationOdd | kGenerationCountOne);
     const auto path = impl_->directory / kSnapshotLiveFile;
     CleanupAtomicTmpArtifacts(path);
     AtomicWrite(path, record, /*fsync_file=*/false, /*fsync_directory=*/false,
@@ -593,9 +597,12 @@ std::optional<SnapshotGenerationObservation> StableSnapshotGeneration(
     const std::filesystem::path& generation_path,
     bool generation_record_required,
     const ChunkCoord& chunk_coord,
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& image_reader,
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& txn_intent_reader,
     const std::function<void(
         std::size_t,
-        ReadOnlySnapshotArtifact)>& observation) {
+        ReadOnlySnapshotArtifact)>& observation,
+    const std::function<void()>& index_reader) {
     // Bounded backoff, not an unbounded wait: the reader still fails closed,
     // it just stops treating a normal-length writer bracket as damage.
     const auto backoff_budget =
@@ -609,8 +616,14 @@ std::optional<SnapshotGenerationObservation> StableSnapshotGeneration(
         try {
             const auto before =
                 ReadSnapshotGeneration(generation_path, generation_record_required);
+            if (index_reader) {
+                try { index_reader(); }
+                catch (const std::exception& error) {
+                    throw SnapshotArtifactUnstable("read-only retained index observation failed: " + std::string(error.what()));
+                }
+            }
             auto snapshot = CollectReadOnlyChunkDiskSnapshot(
-                data_path, wal_path, intent_path, txn_intent_dir, attempt, observation);
+                data_path, wal_path, intent_path, txn_intent_dir, attempt, image_reader, txn_intent_reader, observation);
             const auto after =
                 ReadSnapshotGeneration(generation_path, generation_record_required);
             if ((before.second & 1U) == 0U && before == after &&
@@ -824,7 +837,7 @@ void ChunkStore::FinishSnapshotGenerationRecovery() {
         "CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_BEFORE_END_ONCE");
     // Recovery has completed all artifact mutations. The durable session
     // remains odd until clean shutdown; live readers use this mapped bracket.
-    auto expected = kGenerationOdd;
+    auto expected = kGenerationOdd | kGenerationCountOne;
     if (!snapshot_generation_mapping_->CompareExchange(expected, kGenerationEpochStep)) {
         throw std::logic_error("snapshot recovery counter was modified");
     }

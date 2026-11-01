@@ -27,6 +27,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "txn_history.hpp"
+#include "store_manifest.hpp"
 #include "txn_test_utils.hpp"
 #include "verify.hpp"
 
@@ -339,10 +340,13 @@ void TestWriteSkewRefused() {
 
 void TestLimits() {
     ScopedTempDir dir("chunkdb-txn-commit-limits");
-    ChunkStore store(Config(dir.path()));
+    auto config = Config(dir.path());
+    config.query_limits.txn_max_written_chunks = chunkdb::kMaxTxnWrittenChunks + 1U;
+    config.max_loaded_chunks = config.query_limits.txn_max_read_chunks + config.query_limits.txn_max_written_chunks + 1U;
+    ChunkStore store(config);
     auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
     std::vector<std::pair<ChunkCoord, std::uint32_t>> many;
-    for (std::int64_t x = 0; x <= static_cast<std::int64_t>(chunkdb::kMaxTxnWrittenChunks); ++x) {
+    for (std::int64_t x = 0; x <= static_cast<std::int64_t>(config.query_limits.txn_max_written_chunks); ++x) {
         many.emplace_back(ChunkCoord{x, 5}, 1);
     }
     assert(ThrowsAs<std::invalid_argument>(
@@ -741,6 +745,7 @@ void TestIntentsOnDisk() {
         WriteCounter(store, kC, 30);
     }
     const auto intent_path = chunkdb::TxnIntentPath(table_dir, 999);
+    const auto table_id = chunkdb::ReadStoreManifest(table_dir)->store_id;
     chunkdb::TxnIntent intent{
         .state = chunkdb::TxnIntentState::kRollback,
         .version = 999,
@@ -758,7 +763,7 @@ void TestIntentsOnDisk() {
     // fine.
     intent.state = chunkdb::TxnIntentState::kCommitted;
     intent.entries.push_back({.coord = kD, .wal_boundary = 77});
-    WriteFile(intent_path, chunkdb::SerializeTxnIntent(intent));
+    WriteFile(intent_path, chunkdb::SerializeTxnIntent(intent, config.geometry.dims, table_id));
     {
         ChunkStore reader(read_only());
         assert(ReadCounter(reader, kA) == 10U && ReadCounter(reader, kC) == 30U);
@@ -769,7 +774,7 @@ void TestIntentsOnDisk() {
     // The rollback form: the WALs end at their boundaries.
     intent.state = chunkdb::TxnIntentState::kRollback;
     intent.entries.pop_back();
-    WriteFile(intent_path, chunkdb::SerializeTxnIntent(intent));
+    WriteFile(intent_path, chunkdb::SerializeTxnIntent(intent, config.geometry.dims, table_id));
     const auto wal_bytes = FileSizeOr(wal_a, 0);
     {
         ChunkStore reader(read_only());
@@ -780,9 +785,21 @@ void TestIntentsOnDisk() {
     assert(std::filesystem::exists(intent_path));
     assert(FileSizeOr(wal_a, 0) == wal_bytes);
     assert(VerifyOutput(root.path()).find("txn_rollback_pending") != std::string::npos);
+    // No earlier member is repaired before every later boundary is checked.
+    for (unsigned defect = 0; defect < 3U; ++defect) {
+        auto invalid = intent;
+        if (defect == 0U) invalid.entries.push_back({.coord = kD, .wal_boundary = 77U});
+        if (defect == 1U) invalid.entries.back().wal_boundary = FileSizeOr(wal_c, 0) + 1U;
+        if (defect == 2U) invalid.entries.back().wal_boundary = 1U;
+        WriteFile(intent_path, chunkdb::SerializeTxnIntent(invalid, config.geometry.dims, table_id));
+        assert(Throws([&] { ChunkStore writer(config); }));
+        assert(FileSizeOr(wal_a, 0) == wal_bytes);
+        assert(std::filesystem::exists(wal_c) && std::filesystem::exists(intent_path));
+    }
+    WriteFile(intent_path, chunkdb::SerializeTxnIntent(intent, config.geometry.dims, table_id));
     // A damaged intent is an error for chunkdb_verify and for a writer.
     {
-        auto damaged = chunkdb::SerializeTxnIntent(intent);
+        auto damaged = chunkdb::SerializeTxnIntent(intent, config.geometry.dims, table_id);
         damaged[10] ^= 1U;
         const auto damaged_path = chunkdb::TxnIntentPath(table_dir, 1000);
         WriteFile(damaged_path, damaged);

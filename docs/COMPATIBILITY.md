@@ -12,7 +12,8 @@ Later 2.x servers may add commands, optional clauses and map keys; clients must 
 A connection begins with `HELLO 3`; another version is refused without executing statements.
 Committed chunk versions are producing commit revisions, ordered only within the same table epoch.
 DESCRIBE exposes that epoch and a completed revision frontier; read-only mode returns null for an unknown frontier.
-GET BLOCK WITH VERSION returns null when no committed version remains retained, including collected empty chunks.
+GET BLOCK WITH VERSION returns null when no committed version remains retained, including identities forgotten by tombstone compaction.
+Collection retains an empty chunk's producing version and time across eviction and restart.
 Versions retain their meaning across eviction and restart while their committed state remains retained.
 
 The Go, JavaScript and CLI packages version independently.
@@ -45,6 +46,8 @@ Later 2.x servers still open valid 2.0 data.
 | `table_lineage` | Tables: parent epoch and fork revision. | Before bit `0x4` was enabled. |
 | `slot_filters` | Tables: stable projection IDs and persisted filters. | Before bit `0x8` was enabled. |
 | `feature_activation` | Directory: checked activation decisions. | Before bit `0x10` was enabled. |
+| `chunk_model` | Directory and tables: dimensional geometry, both column domains, sectioned forms, and retained coordinate decisions. | No conversion to an earlier development layout. |
+| `commit_groups` | Directory and tables: checked group decisions, grouped WAL frames, durability receipts and retained result identities. | A build without this feature refuses both the directory and affected tables. |
 
 A reader or writer must support every recorded incompatibility bit, even when its owned records are absent.
 To use a binary lacking a feature, restore the whole consistent backup identified above.
@@ -62,10 +65,16 @@ Table geometry is immutable and validated against its manifest.
 Keep manifests, revision clocks, initialized markers and all other required artifacts together in a consistent backup.
 2.0 accepts only its documented directory and file layouts.
 It does not import superseded development layouts.
+Development directories using earlier manifest, image, WAL, slot, or index envelopes must be recreated; opening refuses them before changing artifacts.
 
 An unsupported layout is refused, rather than converted in place.
 
 ## Boundaries
+
+The C++ `ChunkVars::Encode()` accessor returns `const ChunkVars::EncodedStorage&`, an allocator-aware vector reference.
+Code using `auto` retains owning-copy, capacity and equality behavior.
+Code requiring `std::vector<std::uint8_t>` explicitly must use the alias, `EncodedBytes()` for a byte view, or an iterator-range copy.
+This representation change permits transaction storage allocations to be admitted before allocation; it does not change encoded bytes, protocol or storage formats.
 
 The durability modes and `FLUSH WAL` preserve their documented guarantees throughout 2.x.
 

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cstdint>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -24,6 +25,9 @@ class ProcessLock {
     ProcessLock& operator=(const ProcessLock&) = delete;
 
   private:
+    friend class CommitOwnerArtifactIo;
+    struct RootDirectoryOwner;
+    [[nodiscard]] std::intptr_t NativeRootForArtifacts() const noexcept;
     [[nodiscard]] std::string BuildWriterMetadata() const;
     void WriteWriterMetadata();
     void StartWriterHeartbeat();
@@ -31,6 +35,7 @@ class ProcessLock {
     void Release() noexcept;
 
     std::filesystem::path data_dir_;
+    std::unique_ptr<RootDirectoryOwner> root_directory_;
 #ifdef _WIN32
     void* lock_handle_ = nullptr;
 #else

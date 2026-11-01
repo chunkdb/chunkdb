@@ -184,7 +184,7 @@ void TestNewStoreRecordsGeometryAndId() {
     std::vector<std::string_view> enabled;
     for (const auto& feature : chunkdb::kFeatureRegistry)
         if ((manifest.features.incompat & feature.incompat) != 0U) enabled.push_back(feature.name);
-    assert(enabled == (std::vector<std::string_view>{"feed_slots", "table_lineage", "slot_filters"}));
+    assert(enabled == (std::vector<std::string_view>{"feed_slots", "table_lineage", "slot_filters", "chunk_model", "commit_groups"}));
     // Every option is recorded, as the store was opened with it.
     const auto config = Config(data_dir, geometry);
     assert(manifest.options == chunkdb::EncodeTableOptions(chunkdb::TableOptions{
@@ -198,7 +198,8 @@ void TestNewStoreRecordsGeometryAndId() {
     // A table created with a block width is one column bits(block_bits).
     assert(manifest.schema == chunkdb::SingleBitsColumnSchema(7));
     assert(bytes.size() == chunkdb::kStoreManifestMinSize + manifest.options.size() +
-                               chunkdb::EncodeTableSchema(manifest.schema).size());
+                               chunkdb::EncodeTableSchema(manifest.schema).size() +
+                               chunkdb::EncodeChunkSchema(*manifest.chunk_schema).size());
     const auto options = chunkdb::DecodeTableOptions(manifest.options);
     assert(options.durability_mode == chunkdb::DurabilityMode::kFsyncWal);
     assert(options.checkpoint_update_interval == config.checkpoint_update_interval);
@@ -326,9 +327,9 @@ void TestDamagedManifestRefused() {
         std::vector<std::uint8_t> bytes;
         const char* reason;
     };
-    // Field offsets: version 4, reserved 6, flags 8..20, geometry 20..36
-    // (chunk_height 32..36), store id 36..52, options size 52, options, schema
-    // size, schema, CRC at the end.
+    // Field offsets: version 4, reserved 6, flags 8..20, dimensions 20,
+    // geometry 24..48 (chunk_height 40..44), store id 48..64, options size 64,
+    // options, block schema size/body, chunk schema size/body, final CRC.
     std::vector<Damage> damages;
     damages.push_back({"truncated", {good.begin(), good.begin() + 63}, "size is 63 bytes"});
     damages.push_back({"cut", {good.begin(), good.end() - 1}, "checksum mismatch"});
@@ -344,33 +345,38 @@ void TestDamagedManifestRefused() {
     }
     {
         auto bytes = good;
-        bytes[36] ^= 0x01U;  // a store id byte, CRC left stale
+        bytes[48] ^= 0x01U;  // a store id byte, CRC left stale
         damages.push_back({"crc", bytes, "checksum mismatch"});
     }
     {
         auto bytes = good;
-        bytes[4] = 5;
-        damages.push_back({"version", WithCrc(bytes), "unsupported manifest version 5"});
+        bytes[4] = 6;
+        damages.push_back({"version", WithCrc(bytes), "unsupported manifest version 6"});
     }
     {
         // The #38 manifest layout, written by development builds.
         auto bytes = good;
         bytes[4] = 1;
         bytes.resize(46);
-        damages.push_back({"version 1", bytes, "manifest version 1 was written by a 2.0 development"});
+        damages.push_back({"version 1", bytes, "earlier development build"});
     }
     {
         // The manifest before typed columns, written by development builds.
         auto bytes = good;
         bytes[4] = 2;
-        damages.push_back({"version 2", WithCrc(bytes), "manifest version 2 was written by a 2.0 development"});
+        damages.push_back({"version 2", WithCrc(bytes), "earlier development build"});
     }
     {
         // The manifest before text and bytes columns, written by development
         // builds.
         auto bytes = good;
         bytes[4] = 3;
-        damages.push_back({"version 3", WithCrc(bytes), "manifest version 3 was written by a 2.0 development"});
+        damages.push_back({"version 3", WithCrc(bytes), "earlier development build"});
+    }
+    {
+        auto bytes = good;
+        bytes[4] = 4;
+        damages.push_back({"version 4", WithCrc(bytes), "earlier development build"});
     }
     {
         auto bytes = good;
@@ -379,14 +385,14 @@ void TestDamagedManifestRefused() {
     }
     {
         auto bytes = good;
-        for (std::size_t i = 32; i < 36; ++i) {
+        for (std::size_t i = 40; i < 44; ++i) {
             bytes[i] = 0;  // chunk_height = 0
         }
         damages.push_back({"geometry", WithCrc(bytes), "invalid geometry"});
     }
     {
         auto bytes = good;
-        for (std::size_t i = 36; i < 52; ++i) {
+        for (std::size_t i = 48; i < 64; ++i) {
             bytes[i] = 0;
         }
         damages.push_back({"store id", WithCrc(bytes), "store id is zero"});
@@ -428,7 +434,8 @@ void TestDamagedManifestRefused() {
         // A schema area whose column count is zero: the schema starts after
         // the options and its size, with version (8) and next id (4) first.
         auto bytes = good;
-        const std::size_t schema_at = 56U + chunkdb::ParseStoreManifest(good).options.size() + 4U;
+        const auto manifest = chunkdb::ParseStoreManifest(good);
+        const std::size_t schema_at = 68U + manifest.options.size() + 4U;
         for (std::size_t i = schema_at + 12U; i < schema_at + 16U; ++i) {
             bytes[i] = 0;
         }
@@ -437,6 +444,9 @@ void TestDamagedManifestRefused() {
         for (std::size_t i = 0; i < 4U; ++i) {
             bytes[schema_at - 4U + i] = static_cast<std::uint8_t>((schema_size >> (8U * i)) & 0xFFU);
         }
+        const auto chunks = chunkdb::EncodeChunkSchema(*manifest.chunk_schema);
+        chunkdb::WriteLe32(bytes, static_cast<std::uint32_t>(chunks.size()));
+        bytes.insert(bytes.end(), chunks.begin(), chunks.end());
         bytes.resize(bytes.size() + 4U);
         damages.push_back({"schema", WithCrc(bytes), "invalid schema: a table needs at least one column"});
     }
@@ -451,7 +461,10 @@ void TestDamagedManifestRefused() {
                 config = ReadOnly(config);
             }
             const auto message = ExpectRefused([&] { chunkdb::ChunkStore store(config); });
-            assert(Contains(message, "table manifest"));
+            if (Contains(damage.reason, "earlier development build"))
+                assert(Contains(message, "recreate the data directory"));
+            else
+                assert(Contains(message, "table manifest"));
             assert(Contains(message, damage.reason));
             assert(Tree(dir.path()) == before);
         }
@@ -483,7 +496,7 @@ void RewriteManifest(
 // An unknown incompat bit refuses every open, an unknown ro_compat bit
 // refuses writing but allows reading, an unknown compat bit is ignored.
 void TestUnknownFeatureFlags(const std::string& server, const std::string& verify) {
-    const chunkdb::FeatureFlags incompat{.incompat = 1U << 5U, .ro_compat = 0, .compat = 0};
+    const chunkdb::FeatureFlags incompat{.incompat = 1U << 30U, .ro_compat = 0, .compat = 0};
     const chunkdb::FeatureFlags ro_compat{.incompat = 0, .ro_compat = 1U << 3U, .compat = 0};
     const chunkdb::FeatureFlags compat{.incompat = 0, .ro_compat = 0, .compat = 1U << 9U};
     // An option owned by the unknown feature: skipped, not corruption.
@@ -506,7 +519,7 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
             config = ReadOnly(config);
         }
         const auto message = ExpectRefused([&] { chunkdb::ChunkStore store(config); });
-        assert(Contains(message, "does not support (unknown incompat=0x20"));
+        assert(Contains(message, "does not support (unknown incompat=0x40000000"));
         assert(Tree(data_dir) == before);
     }
     assert(Run(verify, "--data-dir \"" + data_dir.string() + "\"", log, &output) == 1);
@@ -571,7 +584,8 @@ void TestDirectoryWithoutManifestRefused() {
                 config = ReadOnly(config);
             }
             const auto message = ExpectRefused([&] { chunkdb::ChunkStore store(config); });
-            assert(Contains(message, "has no table.manifest"));
+            assert(Contains(message, read_only ? "has no table.manifest" :
+                "unpublished inventory has other owned storage: "));
             assert(Tree(dir.path()) == before);
         }
     }
@@ -609,6 +623,7 @@ void TestDirectoryWithoutManifestRefused() {
             store.SetBlockBits(0, 0, "1111000011110000");
         }
         assert(ReadBytes(dir.path() / ".DS_Store") == (std::vector<std::uint8_t>{'h', 'i'}));
+        assert(ReadBytes(dir.path() / "L_notes") == (std::vector<std::uint8_t>{'x'}));
         assert(std::filesystem::is_directory(dir.path() / "lost+found"));
         chunkdb::ChunkStore reopened(Config(dir.path()));
         assert(reopened.GetBlockBits(0, 0) == "1111000011110000");
@@ -635,7 +650,7 @@ void TestInterruptedInitializationStartsOver() {
     WriteBytes(
         stale_tmp,
         chunkdb::SerializeStoreManifest(
-            {.features = {}, .geometry = kDefaultGeometry, .store_id = chunkdb::NewStoreId(),
+            {.features = {.incompat = chunkdb::kFeatureChunkModel}, .geometry = kDefaultGeometry, .store_id = chunkdb::NewStoreId(),
              .options = {}, .schema = chunkdb::SingleBitsColumnSchema(kDefaultGeometry.block_bits)}));
 
     auto geometry = kDefaultGeometry;
@@ -726,7 +741,7 @@ void TestInterruptedRecordReplacementsAreRemoved() {
 // The data-directory manifest's version_floor option round-trips; a wrong
 // length or a second entry is damage.
 void TestDataDirVersionFloorOption() {
-    chunkdb::DataDirManifest manifest{.features = {}, .data_dir_id = chunkdb::NewStoreId(), .options = {}};
+    chunkdb::DataDirManifest manifest{.features = {.incompat = chunkdb::kFeatureChunkModel}, .data_dir_id = chunkdb::NewStoreId(), .options = {}};
     assert(chunkdb::DataDirVersionFloor(manifest) == 0U);
     chunkdb::SetDataDirVersionFloor(&manifest, 16385);
     chunkdb::SetDataDirVersionFloor(&manifest, 32769);
@@ -849,10 +864,11 @@ void TestVerifyUsesManifestGeometry(const std::string& verify) {
     std::filesystem::remove(root_manifest);
     assert(Run(verify, args, log, &output) == 1);
     assert(Contains(output, "VERIFY error data_dir_manifest_missing"));
-    // A single store of a 2.0 development build before tables.
+    // A former single-store layout must be recreated.
     WriteBytes(root_manifest, good);
     assert(Run(verify, args, log, &output) == 1);
-    assert(Contains(output, "single-store data directory"));
+    assert(Contains(output, "earlier development build"));
+    assert(Contains(output, "recreate the data directory"));
     WriteBytes(root_manifest, root_good);
 
     // Leftovers of interrupted table operations and store state outside a
@@ -915,7 +931,7 @@ void TestLineageManifestCodec() {
     const auto parent = chunkdb::NewStoreId();
     assert(parent != epoch);
     chunkdb::StoreManifest manifest{
-        .features = {.incompat = chunkdb::kFeatureTableLineage},
+        .features = {.incompat = chunkdb::kFeatureTableLineage | chunkdb::kFeatureChunkModel},
         .geometry = kDefaultGeometry, .store_id = epoch,
         .options = chunkdb::EncodeTableOptions({}),
         .schema = chunkdb::SingleBitsColumnSchema(kDefaultGeometry.block_bits),
@@ -955,7 +971,7 @@ void TestLineageManifestCodec() {
                             std::uint32_t features = chunkdb::kFeatureTableLineage) {
         auto damaged = manifest;
         damaged.lineage.reset();
-        damaged.features.incompat = features;
+        damaged.features.incompat = features | chunkdb::kFeatureChunkModel;
         damaged.options = std::move(raw);
         const auto bytes = chunkdb::SerializeStoreManifest(damaged);
         assert(Contains(ExpectRefused([&] { (void)chunkdb::ParseStoreManifest(bytes); }), reason));
@@ -1008,7 +1024,7 @@ void TestNamedFeatureRegistry() {
     const chunkdb::FeatureFlags future{.incompat = bits | (1U << 30U), .ro_compat = 3, .compat = 7};
     const auto table = chunkdb::TableScopedFeatures(future);
     assert(table.incompat == chunkdb::kTableBaselineFeatures.incompat);
-    assert(table.incompat == 13U);
+    assert(table.incompat == 109U);
     assert(table.ro_compat == 0U && table.compat == 0U);
     assert(chunkdb::UnknownFeatures(future).incompat == (1U << 30U));
 }

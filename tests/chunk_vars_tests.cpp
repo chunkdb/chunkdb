@@ -20,6 +20,7 @@
 #include <vector>
 
 #include "chunk_store_internal.hpp"
+#include "feature_flags.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/chunk_vars.hpp"
 #include "chunkdb/crc32.hpp"
@@ -307,6 +308,22 @@ void TestValidityRules() {
 
 // --- image -----------------------------------------------------------------
 
+Bytes AppendUncheckedImageVars(const Bytes& empty, std::span<const std::uint8_t> section) {
+    // Append a raw VARS descriptor independently of the validating writer.
+    assert(chunkdb::ReadLe16(empty, 10U) == 2U);
+    constexpr std::size_t directory_end = 76U + 2U * 16U;
+    Bytes bytes(empty.begin(), empty.begin() + directory_end);
+    bytes[10] = 3U;
+    Le16(&bytes, 3U); Le16(&bytes, 0U);
+    Le32(&bytes, static_cast<std::uint32_t>(section.size()));
+    Le32(&bytes, static_cast<std::uint32_t>(section.size()));
+    Le32(&bytes, chunkdb::Crc32(section.data(), section.size()));
+    Le32(&bytes, chunkdb::Crc32(bytes));
+    bytes.insert(bytes.end(), empty.begin() + directory_end + 4U, empty.end());
+    bytes.insert(bytes.end(), section.begin(), section.end());
+    return bytes;
+}
+
 void TestImageSection() {
     ChunkVars vars;
     vars.Assign({.column_id = 2, .block_index = 1}, B("sign"));
@@ -316,28 +333,28 @@ void TestImageSection() {
     for (const auto compression : {chunkdb::CheckpointCompression::kNone, chunkdb::CheckpointCompression::kZrle}) {
         const auto bytes =
             chunkdb::SerializeChunkImage(kSmall, kCoord, payload, presence, compression, 42, 1000, kStoreId, &vars);
-        const auto image = chunkdb::ParseChunkImage(bytes, kSmall, kCoord, kStoreId, {});
+        const auto image = chunkdb::ParseChunkImage(bytes, kSmall, kCoord, kStoreId, {.incompat = chunkdb::kFeatureChunkModel});
         assert(image.vars == vars && image.payload == payload && image.presence_bitmap == presence);
         // Without values there is no VARS section.
         const ChunkVars none;
         const auto plain =
             chunkdb::SerializeChunkImage(kSmall, kCoord, payload, presence, compression, 42, 1000, kStoreId, &none);
         assert(plain.size() < bytes.size());
-        assert(chunkdb::ParseChunkImage(plain, kSmall, kCoord, kStoreId, {}).vars.empty());
+        assert(chunkdb::ParseChunkImage(plain, kSmall, kCoord, kStoreId, {.incompat = chunkdb::kFeatureChunkModel}).vars.empty());
     }
     // A section that breaks the table's rules is damage.
     const auto with_section = [&](const Bytes& section) {
-        auto decoded = ChunkVars::Decode(section.data(), section.size(), 16);
-        return chunkdb::SerializeChunkImage(
-            kSmall, kCoord, payload, presence, chunkdb::CheckpointCompression::kNone, 42, 1000, kStoreId, &decoded);
+        const auto empty = chunkdb::SerializeChunkImage(
+            kSmall, kCoord, payload, presence, chunkdb::CheckpointCompression::kNone, 42, 1000, kStoreId);
+        return AppendUncheckedImageVars(empty, section);
     };
     ExpectThrow<std::runtime_error>(
-        [&] { (void)chunkdb::ParseChunkImage(with_section(Entry(2, 5, B("x"))), kSmall, kCoord, kStoreId, {}); },
+        [&] { (void)chunkdb::ParseChunkImage(with_section(Entry(2, 5, B("x"))), kSmall, kCoord, kStoreId, {.incompat = chunkdb::kFeatureChunkModel}); },
         "chunk image VARS section is damaged: column 2 block 5: a value of an absent block");
     auto damaged = with_section(Entry(2, 1, B("x")));
     damaged.back() ^= 0x01U;
     ExpectThrow<std::runtime_error>(
-        [&] { (void)chunkdb::ParseChunkImage(damaged, kSmall, kCoord, kStoreId, {}); }, "section 3 checksum mismatch");
+        [&] { (void)chunkdb::ParseChunkImage(damaged, kSmall, kCoord, kStoreId, {.incompat = chunkdb::kFeatureChunkModel}); }, "section 3 checksum mismatch");
 }
 
 // --- WAL -------------------------------------------------------------------
@@ -390,12 +407,12 @@ Replayed Replay(const Bytes& wal, const chunkdb::Geometry& geometry = kSmall) {
     Replayed out;
     out.payload.assign(geometry.ChunkPayloadBytes(), 0U);
     out.presence.assign(2, 0U);
-    out.result = chunkdb::ReplayWal(wal, geometry, kCoord, kStoreId, {}, 0, 1, &out.payload, &out.presence, &out.vars);
+    out.result = chunkdb::ReplayWal(wal, geometry, kCoord, kStoreId, {.incompat = chunkdb::kFeatureChunkModel}, 0, 1, &out.payload, &out.presence, &out.vars);
     return out;
 }
 
 Bytes Wal(const std::vector<Bytes>& frames) {
-    auto wal = chunkdb::BuildWalHeader(kCoord, kStoreId, {});
+    auto wal = chunkdb::BuildWalHeader(kCoord, kStoreId, {.incompat = chunkdb::kFeatureChunkModel});
     for (const auto& frame : frames) {
         wal.insert(wal.end(), frame.begin(), frame.end());
     }
@@ -415,7 +432,8 @@ void TestWalRecords() {
          {chunkdb::kWalRecordVarPut, Entry(4, 0, B("hi"))}});
     const auto f2 =
         RawFrame(2, {{chunkdb::kWalRecordVarDel, DelBody(2, 0)}, {chunkdb::kWalRecordVarPut, Entry(2, 1, B("cd"))}});
-    const auto f3 = RawFrame(3, {{chunkdb::kWalRecordVarReplace, replacement.Encode()}});
+    const auto f3 = RawFrame(3, {{chunkdb::kWalRecordVarReplace,
+        Bytes(replacement.Encode().begin(), replacement.Encode().end())}});
     const auto good = Wal({f1, f2, f3});
     {
         const auto r = Replay(good);
@@ -719,9 +737,9 @@ void TestVerifyFindsDamagedValues() {
     damaged.Assign({.column_id = 2, .block_index = 9}, B("x"));
     WriteFile(
         image_path,
-        chunkdb::SerializeChunkImage(
+        AppendUncheckedImageVars(chunkdb::SerializeChunkImage(
             kSmall, {0, 0}, image.payload, image.presence_bitmap, chunkdb::CheckpointCompression::kNone,
-            image.revision, image.commit_time_ms, manifest->store_id, &damaged));
+            image.revision, image.commit_time_ms, manifest->store_id), damaged.Encode()));
     const auto [counters, out] = run_verify();
     assert(counters.errors != 0U);
     if (!Contains(out, "a value of an absent block")) {

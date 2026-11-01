@@ -50,7 +50,7 @@ const chunkdb::Geometry kGeometry(kGeometryConfig);
 constexpr std::size_t kPayloadBytes = 16;
 constexpr std::size_t kPresenceBytes = 2;
 const chunkdb::StoreId kStoreId = {9, 8, 7, 6, 5, 4, 3, 2, 1, 1, 2, 3, 4, 5, 6, 7};
-const chunkdb::FeatureFlags kNoFeatures{.incompat = 0, .ro_compat = 0, .compat = 0};
+const chunkdb::FeatureFlags kBaseFeatures{.incompat = chunkdb::kFeatureChunkModel, .ro_compat = 0, .compat = 0};
 const chunkdb::ChunkCoord kCoord{0, 0};
 constexpr std::size_t kFrameHeader = chunkdb::kWalFrameFixedHeaderSize + chunkdb::kWalFrameHeaderCrcSize;
 
@@ -115,7 +115,7 @@ Bytes Tlv(std::uint16_t type, const Bytes& value) {
     return tlv;
 }
 
-Bytes Header(const chunkdb::FeatureFlags& features = kNoFeatures) {
+Bytes Header(const chunkdb::FeatureFlags& features = kBaseFeatures) {
     return chunkdb::BuildWalHeader(kCoord, kStoreId, features);
 }
 
@@ -123,7 +123,7 @@ chunkdb::WalReplayResult Replay(
     const Bytes& wal,
     Bytes* payload,
     Bytes* presence,
-    const chunkdb::FeatureFlags& store_features = kNoFeatures) {
+    const chunkdb::FeatureFlags& store_features = kBaseFeatures) {
     payload->assign(kPayloadBytes, 0U);
     presence->assign(kPresenceBytes, 0U);
     return chunkdb::ReplayWal(
@@ -170,11 +170,11 @@ void TestRevisionOrderAndBaseSkip() {
     Append(&wal, BuildFrame(6, 3, {}, {Span(1, Bytes{0x33})}));
     payload.assign(kPayloadBytes, 0x99U);
     presence.assign(kPresenceBytes, 0U);
-    auto r = chunkdb::ReplayWal(wal, kGeometry, kCoord, kStoreId, kNoFeatures, 4, 1, &payload, &presence, nullptr);
+    auto r = chunkdb::ReplayWal(wal, kGeometry, kCoord, kStoreId, kBaseFeatures, 4, 1, &payload, &presence, nullptr);
     assert(!r.tail_truncated_or_corrupt && r.skipped_frames == 2U && r.applied_frames == 1U);
     assert(r.revision == 6U && payload[0] == 0x99U && payload[1] == 0x33U);
     payload.assign(kPayloadBytes, 0x99U);
-    r = chunkdb::ReplayWal(wal, kGeometry, kCoord, kStoreId, kNoFeatures, 6, 1, &payload, &presence, nullptr);
+    r = chunkdb::ReplayWal(wal, kGeometry, kCoord, kStoreId, kBaseFeatures, 6, 1, &payload, &presence, nullptr);
     assert(r.skipped_frames == 3U && r.applied_frames == 0U && r.revision == 0U && r.valid_end == wal.size());
     assert(payload == Bytes(kPayloadBytes, 0x99U));
 }
@@ -358,7 +358,7 @@ void TestFrameFieldGuards() {
 }
 
 void TestUnknownTypesOwnedByUnknownFeatures() {
-    const chunkdb::FeatureFlags compat{.incompat = 0, .ro_compat = 0, .compat = 1U << 6U};
+    const chunkdb::FeatureFlags compat{.incompat = chunkdb::kFeatureChunkModel, .ro_compat = 0, .compat = 1U << 6U};
     Bytes wal = Header(compat);
     Append(&wal, BuildFrame(
                      5, 50, Tlv(42, {1, 2}),
@@ -369,7 +369,7 @@ void TestUnknownTypesOwnedByUnknownFeatures() {
     {
         const auto result = Replay(wal, &payload, &presence);
         assert(!result.replayable);
-        assert(result.stop_reason.find("uses features the store does not") != std::string::npos);
+        assert(result.stop_reason.find("features exceed table envelope") != std::string::npos);
     }
     // With it, the TLV field and the record it owns are skipped.
     const auto result = Replay(wal, &payload, &presence, compat);
@@ -396,13 +396,13 @@ void TestHeaderChecks() {
         // A 2.0 development WAL (version 4) starts with another magic.
         Bytes old = {'C', 'H', 'K', 'W', 'A', 'L', '0', '2'};
         old.resize(chunkdb::kWalHeaderSize, 0);
-        expect_invalid(old, "not a 2.0 WAL");
+        expect_invalid(old, "header magic mismatch");
     }
     for (const auto& [offset, reason] : std::vector<std::pair<std::size_t, const char*>>{
-             {8, "checksum mismatch"},    // version
-             {24, "checksum mismatch"},   // store id
-             {40, "checksum mismatch"},   // chunk_x
-             {56, "checksum mismatch"}}) {  // the CRC itself
+             {8, "unsupported chunk file header version"}, // version
+             {28, "checksum mismatch"},   // epoch
+             {44, "checksum mismatch"},   // chunk_x
+             {60, "checksum mismatch"}}) { // the CRC itself
         auto header = Header();
         header[offset] ^= 0x01U;
         expect_invalid(header, reason);
@@ -410,8 +410,8 @@ void TestHeaderChecks() {
     {
         auto other = kStoreId;
         other[3] ^= 0xFFU;
-        expect_invalid(chunkdb::BuildWalHeader(kCoord, other, kNoFeatures), "belongs to another store");
-        expect_invalid(chunkdb::BuildWalHeader({1, 0}, kStoreId, kNoFeatures), "coordinate mismatch");
+        expect_invalid(chunkdb::BuildWalHeader(kCoord, other, kBaseFeatures), "belongs to another epoch");
+        expect_invalid(chunkdb::BuildWalHeader({1, 0}, kStoreId, kBaseFeatures), "belongs to another chunk");
     }
     // Frames without a header are not replayed.
     {
@@ -636,10 +636,19 @@ void TestDamageBeforeTheEndFailsClosed(const std::string& verify) {
             read();
         } catch (const std::exception& e) {
             refused = std::string(e.what()).find(text) != std::string::npos;
+            if (!refused) std::fprintf(stderr, "damaged WAL refusal: expected %s, got %s\n", text, e.what());
         }
         assert(refused);
         assert(ReadFile(wal_path) == wal);
     };
+    // Exercise read-only replay before a failed writer admission leaves the
+    // snapshot generation fenced for recovery.
+    expect_refused([&] {
+        auto read_only = config;
+        read_only.access_mode = chunkdb::AccessMode::kReadOnly;
+        chunkdb::ChunkStore store(read_only);
+        (void)store.GetBlockBits(1, 0);
+    }, "rejected WAL");
     expect_refused([&] {
         chunkdb::ChunkStore store(config);
         (void)store.GetBlockBits(1, 0);
@@ -647,13 +656,7 @@ void TestDamageBeforeTheEndFailsClosed(const std::string& verify) {
     expect_refused([&] {
         chunkdb::ChunkStore store(config);
         (void)store.ScanPopulatedChunks(false, {}, 10);
-    }, "cannot be replayed");
-    expect_refused([&] {
-        auto read_only = config;
-        read_only.access_mode = chunkdb::AccessMode::kReadOnly;
-        chunkdb::ChunkStore store(read_only);
-        (void)store.GetBlockBits(1, 0);
-    }, "rejected WAL");
+    }, "damaged before its end");
 
     std::string output;
     assert(RunVerify(verify, dir.path(), &output) == 1);
@@ -758,7 +761,7 @@ void TestHeaderWithoutCommitHasNoReadVersion() {
 }
 
 // A WAL that is not a crash artifact (damaged header, frames without a
-// header) fails the chunk load and is left as it is.
+// header) fails startup admission and is left as it is.
 void TestDamagedWalFailsTheLoad() {
     for (const bool strip_header : {false, true}) {
         ScopedTempDir dir("chunkdb-wal-damaged-header");
@@ -775,14 +778,18 @@ void TestDamagedWalFailsTheLoad() {
             wal[30] ^= 0x01U;  // inside the store id
         }
         WriteFile(wal_path, wal);
-        bool refused = false;
+        bool opened = false;
+        std::string refusal;
         try {
             chunkdb::ChunkStore store(config);
+            opened = true;
             (void)store.GetBlockBits(0, 0);
         } catch (const std::exception& e) {
-            refused = std::string(e.what()).find("cannot be replayed") != std::string::npos;
+            refusal = e.what();
         }
-        assert(refused);
+        const auto expected = strip_header ? "WAL file too small" : "chunk file header checksum mismatch";
+        if (refusal != expected) std::fprintf(stderr, "damaged WAL startup refusal: %s (bytes=%zu)\n", refusal.c_str(), wal.size());
+        assert(!opened && refusal == expected);
         assert(ReadFile(wal_path) == wal);
     }
 }
@@ -796,7 +803,7 @@ std::uint64_t NowMs() {
 
 // Each frame carries its commit time, and a reload takes it from the WAL.
 void TestSlotFrameMetadata() {
-    const chunkdb::FeatureFlags slots{.incompat = chunkdb::kFeatureFeedSlots};
+    const chunkdb::FeatureFlags slots{.incompat = chunkdb::kFeatureChunkModel | chunkdb::kFeatureFeedSlots};
     const Bytes tag{'t'};
     const Bytes user{'a', 'l', 'i', 'c', 'e'};
     auto metadata = Tlv(chunkdb::kWalTlvTag, tag);
@@ -831,7 +838,7 @@ void TestSlotFrameMetadata() {
 }
 
 void TestSlotCollectionCannotDeletePresentState() {
-    const chunkdb::FeatureFlags slots{.incompat = chunkdb::kFeatureFeedSlots};
+    const chunkdb::FeatureFlags slots{.incompat = chunkdb::kFeatureChunkModel | chunkdb::kFeatureFeedSlots};
     const auto first = BuildFrame(7U, 99U, {}, {Span(0U, {0xAA}), Span(kPayloadBytes, {1U})});
     const auto gc = BuildFrame(8U, 100U, {},
         {Span(0U, Bytes(kPayloadBytes, 0U)), Span(kPayloadBytes, Bytes(kPresenceBytes, 0U))},
@@ -853,7 +860,7 @@ void TestSlotCollectionCannotDeletePresentState() {
 }
 
 void TestSlotFrameGuards() {
-    const chunkdb::FeatureFlags slots{.incompat = chunkdb::kFeatureFeedSlots};
+    const chunkdb::FeatureFlags slots{.incompat = chunkdb::kFeatureChunkModel | chunkdb::kFeatureFeedSlots};
     const auto first = BuildFrame(7U, 99U, {}, {Span(0U, {0xAA})});
     auto duplicate = Tlv(chunkdb::kWalTlvUser, {'a'});
     Append(&duplicate, Tlv(chunkdb::kWalTlvUser, {'b'}));
@@ -908,6 +915,76 @@ void TestSlotFrameGuards() {
     (void)boundary.Finish(7U, 99U);
     const auto largest_info = chunkdb::InspectFeedFrame(largest, kGeometry, slots);
     assert(largest_info.user == valid_user);
+}
+
+void TestGroupFrameAdmission() {
+    const chunkdb::FeatureFlags groups{.incompat = chunkdb::kFeatureChunkModel | chunkdb::kFeatureCommitGroups};
+    const chunkdb::WalGroupRef reference{kStoreId, UINT64_MAX, UINT64_MAX - 1U};
+    const auto encoded = chunkdb::SerializeWalGroupRef(reference);
+    const auto group_tlv = Tlv(chunkdb::kWalTlvGroup, Bytes(encoded.begin(), encoded.end()));
+    const auto frame = BuildFrame(7U, 99U, group_tlv, {Span(0U, {0xAA})});
+    const auto info = chunkdb::InspectFeedFrame(frame, kGeometry, groups);
+    assert(info.group == reference && info.revision == 7U && info.commit_time_ms == 99U);
+    Bytes built;
+    chunkdb::WalFrameBuilder builder(&built, 1U, {}, {}, false, reference);
+    const std::uint8_t value = 0xAA;
+    builder.AppendSpan(0U, &value, 1U);
+    (void)builder.Finish(7U, 99U);
+    assert(built == frame);
+
+    const auto refuse_replay = [&](const Bytes& candidate, chunkdb::FeatureFlags features, std::string_view reason) {
+        // A group appended to an older WAL is admitted by its owning table's
+        // current feature mask rather than silently skipped as an extension.
+        auto wal = Header();
+        Append(&wal, candidate);
+        Bytes payload;
+        Bytes presence;
+        const auto result = Replay(wal, &payload, &presence, features);
+        assert(result.applied_frames == 0U && result.skipped_frames == 0U && result.stop_reason == reason);
+        assert(result.valid_end == chunkdb::kWalHeaderSize && !result.stopped_at_crash_tail);
+        assert(payload == Bytes(kPayloadBytes, 0U) && presence == Bytes(kPresenceBytes, 0U));
+    };
+    refuse_replay(frame, groups, "frame_group_unresolved");
+    refuse_replay(frame, kBaseFeatures, "tlv_group_without_feature");
+    auto unknown_owner = kBaseFeatures;
+    unknown_owner.compat = 1U << 31U;
+    refuse_replay(frame, unknown_owner, "tlv_group_without_feature");
+
+    auto duplicate = group_tlv;
+    Append(&duplicate, group_tlv);
+    refuse_replay(BuildFrame(7U, 99U, duplicate, {Span(0U, {0xAA})}), groups, "tlv_duplicate_group");
+    for (const auto length : {0U, 31U, 33U}) {
+        refuse_replay(BuildFrame(7U, 99U, Tlv(chunkdb::kWalTlvGroup, Bytes(length, 1U)),
+            {Span(0U, {0xAA})}), groups, "tlv_group_invalid");
+    }
+    for (const auto& invalid : {chunkdb::WalGroupRef{}, chunkdb::WalGroupRef{kStoreId, 0U, 0U},
+            chunkdb::WalGroupRef{kStoreId, 2U, 2U}}) {
+        Bytes batch{1U, 2U};
+        const auto before = batch;
+        bool rejected = false;
+        try { chunkdb::WalFrameBuilder bad(&batch, 1U, {}, {}, false, invalid); }
+        catch (const std::invalid_argument&) { rejected = true; }
+        assert(rejected && batch == before);
+    }
+    Bytes batch{1U, 2U};
+    const auto before = batch;
+    bool rejected = false;
+    try {
+        // The user alone fits, but adding the group must fail before changing
+        // the caller's already staged bytes.
+        const std::string user(65531U, 'a');
+        chunkdb::WalFrameBuilder too_long(&batch, 1U, {}, user, false, reference);
+    } catch (const std::invalid_argument&) { rejected = true; }
+    assert(rejected && batch == before);
+
+    chunkdb::ChunkState state;
+    state.payload.assign(kPayloadBytes, 0U);
+    state.presence_bitmap.assign(kPresenceBytes, 0U);
+    const auto state_before = state.payload;
+    rejected = false;
+    try { (void)chunkdb::ReplayFeedFrame(frame, kGeometry, &state, groups); }
+    catch (const std::runtime_error&) { rejected = true; }
+    assert(rejected && state.payload == state_before && !state.written && state.version == 0U);
 }
 
 void TestCommitTimeSurvivesReload() {
@@ -986,5 +1063,6 @@ int main(int argc, char** argv) {
     TestSlotFrameMetadata();
     TestSlotCollectionCannotDeletePresentState();
     TestSlotFrameGuards();
+    TestGroupFrameAdmission();
     return 0;
 }

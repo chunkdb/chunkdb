@@ -20,6 +20,10 @@ inline constexpr std::uint32_t kFeatureTableLineage = 4U;
 inline constexpr std::uint32_t kFeatureSlotFilters = 8U;
 // Checked multi-manifest activation decisions; belongs only to the directory.
 inline constexpr std::uint32_t kFeatureActivation = 16U;
+// Dimension-aware chunk files, chunk columns and retained empty identities.
+inline constexpr std::uint32_t kFeatureChunkModel = 32U;
+// Directory commit decisions and the grouped WAL metadata they authorize.
+inline constexpr std::uint32_t kFeatureCommitGroups = 64U;
 
 struct FeatureDefinition {
     std::string_view name;
@@ -27,15 +31,17 @@ struct FeatureDefinition {
     bool table_scoped;
     std::string_view ownership;
 };
-inline constexpr std::array<FeatureDefinition, 5> kFeatureRegistry{{
+inline constexpr std::array<FeatureDefinition, 7> kFeatureRegistry{{
     {"feed_slots", kFeatureFeedSlots, true, "slot records, feed archive and USER WAL metadata"},
     {"migrations", kFeatureMigrations, false, "migration ledger and redo decisions"},
     {"table_lineage", kFeatureTableLineage, true, "table parent-epoch and fork-revision TLVs"},
     {"slot_filters", kFeatureSlotFilters, true, "slot filter records and stable projection IDs"},
     {"feature_activation", kFeatureActivation, false, "directory feature activation decisions"},
+    {"chunk_model", kFeatureChunkModel, true, "dimension-aware chunks, chunk metadata and coordinate indexes"},
+    {"commit_groups", kFeatureCommitGroups, true, "directory commit decisions and grouped table artifacts"},
 }};
 inline constexpr FeatureFlags kKnownFeatures{.incompat = kFeatureFeedSlots | kFeatureMigrations |
-    kFeatureTableLineage | kFeatureSlotFilters | kFeatureActivation};
+    kFeatureTableLineage | kFeatureSlotFilters | kFeatureActivation | kFeatureChunkModel | kFeatureCommitGroups};
 [[nodiscard]] constexpr FeatureFlags RegisteredTableFeatures() noexcept {
     FeatureFlags flags;
     for (const auto& feature : kFeatureRegistry) {
