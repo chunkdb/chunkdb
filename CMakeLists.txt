@@ -332,6 +332,11 @@ if(CHUNKDB_BUILD_TESTS)
         add_test(NAME ${verifier} COMMAND chunkdb_${verifier}_test)
         set_tests_properties(${verifier} PROPERTIES TIMEOUT 60 LABELS "smoke")
     endforeach()
+    if(MINGW)
+        # The allocation counter replaces new/delete as one matched family.
+        # A shared C++ runtime can free its prefixed pointers through DLL delete.
+        target_link_options(chunkdb_verify_memory_test PRIVATE -static-libstdc++ -static-libgcc)
+    endif()
 
     add_executable(chunkdb_storage_test tests/storage_tests.cpp)
     target_link_libraries(chunkdb_storage_test PRIVATE chunkdb_core)

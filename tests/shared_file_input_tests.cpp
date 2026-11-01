@@ -1,4 +1,5 @@
 #include "shared_file_input.hpp"
+#include "checkpoint.hpp"
 #include "test_utils.hpp"
 
 #include <array>
@@ -169,6 +170,43 @@ void PinnedReplacement(const std::filesystem::path& directory) {
     assert(Read(replacement, 12U) == "replacement!");
 }
 
+void AtomicPinnedReplacement(const std::filesystem::path& directory) {
+    const auto path = directory / "atomic-live";
+    Save(path, "original contents");
+    SharedFileInput original(path);
+    assert(Read(original, 2U) == "or");
+    const std::string contents = "atomic replacement";
+    chunkdb::AtomicWrite(path, std::vector<std::uint8_t>(contents.begin(), contents.end()), true, true);
+    SharedFileInput current(path);
+    assert(Read(current, contents.size()) == contents);
+    original.seekg(0);
+    assert(Read(original, 17U) == "original contents");
+}
+
+#ifdef _WIN32
+void LegacyAtomicReplacement(const std::filesystem::path& directory) {
+    if (!chunkdb::kFailpointsCompiled) return;
+    const auto path = directory / "legacy-atomic-live";
+    Save(path, "original contents");
+    const std::string contents = "legacy replacement";
+    _putenv_s("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE", "1");
+    chunkdb::AtomicWrite(path, std::vector<std::uint8_t>(contents.begin(), contents.end()), true, true);
+    _putenv_s("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE", "");
+    SharedFileInput current(path);
+    assert(Read(current, contents.size()) == contents);
+    _putenv_s("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE", "1");
+    Reject([&] {
+        const std::string refused = "must not remove the pinned target";
+        chunkdb::AtomicWrite(path, std::vector<std::uint8_t>(refused.begin(), refused.end()), true, true);
+    });
+    _putenv_s("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE", "");
+    SharedFileInput unchanged(path);
+    assert(Read(unchanged, contents.size()) == contents);
+    current.seekg(0);
+    assert(Read(current, contents.size()) == contents);
+}
+#endif
+
 void PlainLeafAdmission(const std::filesystem::path& directory) {
     Reject([&] { SharedFileInput missing(directory / "missing"); });
     Reject([&] { SharedFileInput folder(directory); });
@@ -198,5 +236,9 @@ int main() {
     SeekAndShortRead(directory.path());
     SparseSeek(directory.path());
     PinnedReplacement(directory.path());
+    AtomicPinnedReplacement(directory.path());
+#ifdef _WIN32
+    LegacyAtomicReplacement(directory.path());
+#endif
     PlainLeafAdmission(directory.path());
 }
