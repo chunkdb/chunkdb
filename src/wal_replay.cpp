@@ -191,6 +191,8 @@ struct FrameShape {
     // In 64 bits, so no platform can wrap the declared frame size.
     const std::uint64_t total64 =
         static_cast<std::uint64_t>(header_size) + body_size + kWalFrameTrailerSize;
+    if (total64 > kMaxWalFrameBytes)
+        throw std::runtime_error("WAL frame exceeds its byte limit");
     // The header is CRC-valid, so its declared extent can be trusted from
     // here on: any later failure is in a frame that ends at or past EOF
     // exactly when this holds.

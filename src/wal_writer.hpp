@@ -56,6 +56,7 @@ class WalFrameBuilder {
     [[nodiscard]] std::size_t record_count() const noexcept { return record_count_; }
 
   private:
+    void RequireRecordSize(std::size_t body_size) const;
     void BeginRecord(std::uint8_t type, std::size_t body_size);
     void RequireVarOrder(VarKey key);
 

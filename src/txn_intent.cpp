@@ -4,7 +4,6 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <limits>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -50,36 +49,23 @@ void ValidateRollbackMember(const std::filesystem::path& data_dir, const Geometr
     if (ec || size < entry.wal_boundary)
         throw std::runtime_error("rollback WAL is shorter than its committed boundary: " + wal_path.string());
     if (entry.wal_boundary == 0U) return;
-    if (entry.wal_boundary > std::numeric_limits<std::size_t>::max() ||
-        entry.wal_boundary > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
-        throw std::runtime_error("rollback WAL boundary exceeds addressable input: " + wal_path.string());
     std::ifstream file(wal_path, std::ios::binary);
     if (!file) throw std::runtime_error("failed to open rollback WAL " + wal_path.string());
-    std::vector<std::uint8_t> prefix(static_cast<std::size_t>(entry.wal_boundary));
-    file.read(reinterpret_cast<char*>(prefix.data()), static_cast<std::streamsize>(prefix.size()));
-    if (file.gcount() != static_cast<std::streamsize>(prefix.size()))
-        throw std::runtime_error("failed to read rollback WAL boundary: " + wal_path.string());
-    auto payload = std::vector<std::uint8_t>(geometry.ChunkPayloadBytes(), 0U);
-    auto presence = std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry), 0U);
-    ChunkVars vars;
-    std::shared_ptr<const ChunkColumnState> chunk_columns;
-    std::uint64_t base = 0U, schema = 0U;
+    ChunkState state;
+    std::uint64_t schema = 0U;
     const auto image_path = ChunkDataPath(data_dir, geometry, entry.coord);
     if (std::filesystem::exists(image_path)) {
         auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, entry.coord, table_id, features),
             geometry, entry.coord, table_id, features);
-        base = image.revision;
         schema = image.schema_version;
-        payload = std::move(image.payload);
-        presence = std::move(image.presence_bitmap);
-        vars = std::move(image.vars);
-        chunk_columns = std::move(image.chunk_columns);
+        state.version = image.revision;
+        state.written = image.revision != 0U;
+        state.payload = std::move(image.payload);
+        state.presence_bitmap = std::move(image.presence_bitmap);
+        state.vars = std::move(image.vars);
+        state.chunk_columns = std::move(image.chunk_columns);
     }
-    const auto replay = ReplayWal(prefix, geometry, entry.coord, table_id, features,
-        base, schema, &payload, &presence, &vars, nullptr, &chunk_columns);
-    if (!replay.replayable || replay.tail_truncated_or_corrupt ||
-        replay.valid_end != prefix.size() || !replay.vars_problem.empty())
-        throw std::runtime_error("rollback WAL boundary is not a complete committed prefix: " + wal_path.string());
+    ValidateWalPrefix(file, entry.wal_boundary, geometry, entry.coord, table_id, features, std::move(state), schema);
 }
 
 }  // namespace

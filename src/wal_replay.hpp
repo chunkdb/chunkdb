@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstddef>
+#include <istream>
 #include <optional>
 #include <string>
 #include <vector>
@@ -72,6 +73,13 @@ void ValidateWalHeader(
     const StoreId& store_id,
     const FeatureFlags& store_features,
     std::uint8_t dims = 2U);
+
+// Validates an acknowledged exact prefix without retaining the whole WAL.
+// The borrowed stream starts at byte zero and may contain an ignored suffix.
+// State is private scratch initialized from the owning image when present.
+void ValidateWalPrefix(std::istream& input, std::uint64_t prefix_bytes, const Geometry& geometry,
+    const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
+    ChunkState state = {}, std::uint64_t schema_version = 0U);
 
 // Replays the frames of a WAL onto `payload`, `presence_bitmap` and `vars`
 // (the chunk's state from its image, whose revision is `base_revision`; 0

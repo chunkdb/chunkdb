@@ -495,6 +495,8 @@ struct FeedArchiveReader::Impl {
         if (ReadLe32(header, header_size - 4U) != Crc32(header.data() + kWalFrameMagicSize, header_size - 8U))
             throw std::runtime_error("feed archive frame header checksum mismatch");
         const auto frame_size = static_cast<std::uint64_t>(header_size) + ReadLe32(fixed, 28U) + kWalFrameTrailerSize;
+        if (frame_size > kMaxWalFrameBytes)
+            throw std::runtime_error("feed archive frame exceeds its byte limit");
         if (frame_size > remaining) {
             if (cursor.completed_prefix || cursor.last != 0U) throw std::runtime_error("completed feed WAL prefix ends inside a frame");
             cursor.done = true; return;

@@ -142,18 +142,14 @@ void WalFrameBuilder::AppendSpan(
         size > std::numeric_limits<std::uint32_t>::max() - byte_offset) {
         throw std::invalid_argument("WAL span too large");
     }
-    if (record_count_ >= std::numeric_limits<std::uint32_t>::max()) {
-        throw std::invalid_argument("WAL frame record count overflow");
-    }
+    RequireRecordSize(kWalSpanOffsetSize + size);
     batch_->reserve(batch_->size() + kWalRecordHeaderSize + kWalSpanOffsetSize + size);
-    batch_->push_back(kWalRecordSpan);
-    WriteLe32(*batch_, static_cast<std::uint32_t>(kWalSpanOffsetSize + size));
+    BeginRecord(kWalRecordSpan, kWalSpanOffsetSize + size);
     WriteLe32(*batch_, byte_offset);
     batch_->insert(batch_->end(), bytes, bytes + size);
-    record_count_ += 1;
 }
 
-void WalFrameBuilder::BeginRecord(std::uint8_t type, std::size_t body_size) {
+void WalFrameBuilder::RequireRecordSize(std::size_t body_size) const {
     if (finished_) {
         throw std::logic_error("WAL frame already finished");
     }
@@ -163,6 +159,14 @@ void WalFrameBuilder::BeginRecord(std::uint8_t type, std::size_t body_size) {
     if (record_count_ >= std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("WAL frame record count overflow");
     }
+    const auto held = batch_->size() - header_index_;
+    if (held > kMaxWalFrameBytes - kWalRecordHeaderSize - kWalFrameTrailerSize ||
+        body_size > kMaxWalFrameBytes - kWalRecordHeaderSize - kWalFrameTrailerSize - held)
+        throw std::invalid_argument("WAL frame exceeds its byte limit");
+}
+
+void WalFrameBuilder::BeginRecord(std::uint8_t type, std::size_t body_size) {
+    RequireRecordSize(body_size);
     batch_->push_back(type);
     WriteLe32(*batch_, static_cast<std::uint32_t>(body_size));
     record_count_ += 1;
@@ -212,6 +216,10 @@ void WalFrameBuilder::AppendVarUpdate(const ChunkVars& vars, const VarUndo& undo
         const auto value = vars.Find(key);
         bytes += kWalRecordHeaderSize + (value.has_value() ? kVarEntryHeaderBytes + value->size() : 8U);
     }
+    const auto held = batch_->size() - header_index_;
+    if (held > kMaxWalFrameBytes - kWalFrameTrailerSize ||
+        bytes > kMaxWalFrameBytes - kWalFrameTrailerSize - held)
+        throw std::invalid_argument("WAL frame exceeds its byte limit");
     batch_->reserve(batch_->size() + bytes);
     for (const auto key : undo.keys) {
         if (const auto value = vars.Find(key); value.has_value()) {
@@ -239,6 +247,8 @@ std::size_t WalFrameBuilder::Finish(std::uint64_t revision, std::uint64_t commit
         throw std::invalid_argument("WAL frame must contain at least one record");
     }
     const std::size_t body_size = batch_->size() - records_begin_;
+    if (batch_->size() - header_index_ > kMaxWalFrameBytes - kWalFrameTrailerSize)
+        throw std::invalid_argument("WAL frame exceeds its byte limit");
     if (body_size > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("WAL frame body too large");
     }

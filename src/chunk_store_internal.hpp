@@ -62,6 +62,7 @@ inline constexpr std::uint16_t kWalFormatVersion = 2;
 inline constexpr std::size_t kWalHeaderSize = 64U;
 inline constexpr std::uint64_t kMaxChunkImageFileBytes = 256ULL * 1024ULL * 1024ULL;
 inline constexpr std::uint64_t kMaxChunkImageRawBytes = 256ULL * 1024ULL * 1024ULL;
+inline constexpr std::uint64_t kMaxWalFrameBytes = 256ULL * 1024ULL * 1024ULL;
 inline constexpr std::uint64_t kMaxChunkColumnsSectionBytes = kVarMaxChunkBytesLimit + 4ULL +
     static_cast<std::uint64_t>(kMaxColumnsPerTable) * (16ULL + (kMaxFixedBitsPerBlock + 7ULL) / 8ULL);
 inline constexpr std::size_t kWalFrameMagicSize = 4;
