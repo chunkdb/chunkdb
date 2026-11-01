@@ -775,6 +775,22 @@ void TargetComponentReplacement() {
     assert(BackupWindowsApiName(L"\\\\?\\C:\\short", true) == L"\\\\?\\C:\\short");
     assert(BackupWindowsApiName(L"\\\\?\\C:\\short", false) == L"C:\\short");
     assert(BackupWindowsApiName(L"\\\\?\\UNC\\server\\share\\folder", true) == L"\\\\?\\UNC\\server\\share\\folder");
+    for (const auto* spelling : {L"\\\\server\\share\\folder\\..\\child", L"\\\\?\\UNC\\server\\share\\child",
+        L"//server/share/./child/"}) {
+        const auto parts = SplitBackupWindowsPath(spelling);
+        assert(parts.root == L"\\\\server\\share\\");
+        assert(parts.components == std::vector<std::wstring>{L"child"});
+        assert(parts.Name() == L"\\\\server\\share\\child");
+    }
+    assert(SplitBackupWindowsPath(L"\\\\server\\share").components.empty());
+    assert(SplitBackupWindowsPath(L"\\\\?\\C:\\root\\..\\leaf").Name() == L"C:\\leaf");
+    assert(SplitBackupWindowsPath(L"C:/../../leaf").Name() == L"C:\\leaf");
+    for (const auto* spelling : {L"\\\\server", L"\\\\server\\", L"C:relative", L"\\relative"}) {
+        bool refused = false;
+        try { (void)SplitBackupWindowsPath(spelling); }
+        catch (const std::invalid_argument&) { refused = true; }
+        assert(refused);
+    }
     ScopedTempDir temp("chunkdb-backup-path-races");
     const auto root = std::filesystem::canonical(temp.path());
     const auto source = root / "source";
