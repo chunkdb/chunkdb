@@ -1942,6 +1942,44 @@ void TestKillReadReplyReleasesCredit(bool tls) {
     assert(returned);
 }
 
+class BufferedPublicationHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        if (point != Point::kBeforeBufferedStatementPublication) return;
+        std::unique_lock lock(mutex_);
+        entered_ = true; changed_.notify_all();
+        changed_.wait(lock, [&] { return released_; });
+    }
+    void Wait() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(5), [&] { return entered_; }));
+    }
+    void Release() { { std::lock_guard lock(mutex_); released_ = true; } changed_.notify_all(); }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, released_ = false;
+};
+void TestKilledBufferedStatementCannotPublish() {
+    BufferedPublicationHook hook;
+    auto config = BaseServerConfig(); config.worker_threads = 1U;
+    ServerHarness harness("kill-buffered-publication", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { BufferedPublicationHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient target("127.0.0.1", harness.port); target.SetReadDeadline(std::chrono::seconds(10)); target.SendLine("HELLO 3");
+    const auto id = std::stoull(ReadHelloReply(target).at("connection_id"));
+    RawClient controller("127.0.0.1", harness.port); controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    target.SendBytes("PING\r\nSET BLOCK 0 0 IN default bits = b'1000'\r\n");
+    hook.Wait();
+    assert(target.ReadLine() == "+PONG\r\n");
+    controller.SendLine("KILL CONNECTION " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    hook.Release();
+    assert(target.WaitForClose(std::chrono::seconds(5)));
+    auto lease = harness.catalog->Require("default")->Acquire();
+    assert(!lease->store().GetBlock(0, 0));
+}
+
 class BufferedWorkerHook : public chunkdb::FeedDeliveryTestHook {
   public:
     void Run(Point point, std::size_t) override { if (point == Point::kBeforeWorkerHandle) ++turns; }
@@ -6236,6 +6274,7 @@ int main(int argc, char** argv) {
         run("TestExpiredQueueRetainsTransportOwner", TestExpiredQueueRetainsTransportOwner);
         run("TestStopDoesNotCloseQueuedReplyOwner", TestStopDoesNotCloseQueuedReplyOwner);
         run("TestBufferedRequestsRetainWorker", TestBufferedRequestsRetainWorker);
+        run("TestKilledBufferedStatementCannotPublish", TestKilledBufferedStatementCannotPublish);
         run("TestProgressiveChunkReplyOwnsSnapshot", [] { TestProgressiveReplyOwnsSnapshot<RawClient>(false, false); });
         run("TestProgressiveAreaReplyOwnsSnapshot", [] { TestProgressiveReplyOwnsSnapshot<RawClient>(false, true); });
         run("TestKillReadReplyReleasesCredit", [] { TestKillReadReplyReleasesCredit<RawClient>(false); });

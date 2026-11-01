@@ -14,10 +14,10 @@ ChunkLayout Layout() {
     TableSchema schema;
     schema.next_column_id = 5U;
     schema.columns = {
-        {.id = 1U, .name = "count", .type = {ColumnKind::kUnsigned, 8U}, .required = true},
-        {.id = 2U, .name = "data", .type = {ColumnKind::kBytes, 200000U}, .nullable = true},
-        {.id = 3U, .name = "other", .type = {ColumnKind::kBytes, 100U}, .nullable = true},
-        {.id = 4U, .name = "optional", .type = {ColumnKind::kUnsigned, 3U}, .nullable = true},
+        {.id = 1U, .name = "count", .type = {ColumnKind::kUnsigned, 8U}, .required = true, .default_value = {}},
+        {.id = 2U, .name = "data", .type = {ColumnKind::kBytes, 200000U}, .nullable = true, .default_value = {}},
+        {.id = 3U, .name = "other", .type = {ColumnKind::kBytes, 100U}, .nullable = true, .default_value = {}},
+        {.id = 4U, .name = "optional", .type = {ColumnKind::kUnsigned, 3U}, .nullable = true, .default_value = {}},
     };
     return ChunkLayout(std::move(schema), 16U, 1024U);
 }
@@ -128,10 +128,10 @@ void CaptureCreditPrecedesLoadingAndOwnsSnapshot() {
 }
 void WideNullableSchemaHasAnObtainableCaptureBound() {
     TableSchema schema;
-    schema.columns.push_back({.id = 1U, .name = "fixed", .type = {ColumnKind::kUnsigned, 8U}, .required = true});
+    schema.columns.push_back({.id = 1U, .name = "fixed", .type = {ColumnKind::kUnsigned, 8U}, .required = true, .default_value = {}});
     for (std::uint32_t id = 2U; id <= 33U; ++id)
         schema.columns.push_back({.id = id, .name = "v" + std::to_string(id),
-            .type = {ColumnKind::kBytes, kMaxVariableValueBytes}, .nullable = true});
+            .type = {ColumnKind::kBytes, kMaxVariableValueBytes}, .nullable = true, .default_value = {}});
     schema.next_column_id = 34U;
     const ChunkLayout layout(std::move(schema), 1U, 1024U);
     const std::vector<std::size_t> fixed{0U};

@@ -394,11 +394,19 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
                 Wake();
             }
         } else statements_.push_back({connection.shared_from_this(), control});
-        std::lock_guard lock(connection.record->mutex);
-        connection.record->state = worker ? "running" : "queued";
-        connection.record->verb = connection.request_line.substr(0U,
-            std::min<std::size_t>(32U, connection.request_line.find_first_of(" \t\r\n")));
-        connection.record->statement = std::move(control);
+        if (worker)
+            if (auto* hook = server_.delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeBufferedStatementPublication, connection.session.connection_id);
+        std::shared_ptr<StatementControl> killed_statement;
+        {
+            std::lock_guard lock(connection.record->mutex);
+            connection.record->state = worker ? "running" : "queued";
+            connection.record->verb = connection.request_line.substr(0U,
+                std::min<std::size_t>(32U, connection.request_line.find_first_of(" \t\r\n")));
+            connection.record->statement = std::move(control);
+            if (connection.record->killed.load()) killed_statement = connection.record->statement;
+        }
+        if (killed_statement) (void)killed_statement->RequestStop(StatementStopReason::kKilled);
     }
     return true;
 }
