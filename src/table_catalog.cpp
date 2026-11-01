@@ -224,6 +224,7 @@ CatalogConfig CatalogConfigFromStoreConfig(
     catalog.txn_history_bytes = config.txn_history_bytes;
     catalog.slot_max_bytes = config.slot_max_bytes;
     catalog.slot_sync_interval = config.slot_sync_interval;
+    catalog.query_limits = config.query_limits;
     return catalog;
 }
 
@@ -1047,6 +1048,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
 
 TableCatalog::TableCatalog(CatalogConfig config)
     : config_(std::move(config)) {
+    RequireValidQueryLimits(config_.query_limits);
     if (config_.data_dir.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
@@ -1359,6 +1361,7 @@ std::shared_ptr<ChunkStore> TableCatalog::OpenStore(
     std::uint32_t geometry_fields,
     const TableOptions& options) {
     StoreConfig store_config;
+    store_config.query_limits = config_.query_limits;
     store_config.geometry = geometry;
     store_config.geometry_fields = geometry_fields;
     store_config.data_dir = dir;
