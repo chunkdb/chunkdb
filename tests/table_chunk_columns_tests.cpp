@@ -6,6 +6,7 @@
 #include <string>
 
 #include "chunkdb/chunk_columns.hpp"
+#include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
@@ -129,6 +130,11 @@ void RequiredIncludesTombstones() {
             lease->store().SetBlockBits(0, 0, "0011");
             lease->store().UnsetBlock(0, 0);
             assert(!lease->store().HasPresentBlocks());
+            lease->store().CheckpointForTests(0, 0);
+            const auto table_directory = directory.path() / "tables/tombstone";
+            const auto& geometry = lease->store().geometry();
+            assert(!std::filesystem::exists(ChunkDataPath(table_directory, geometry, {0, 0})));
+            assert(!std::filesystem::exists(ChunkWalPath(table_directory, geometry, {0, 0})));
             assert(lease->store().HasWrittenChunkIdentities());
         }
         Reject([&] { catalog.ChangeChunkColumns("tombstone", [](const auto& schema) {
