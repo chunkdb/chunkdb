@@ -160,5 +160,7 @@ Inventory replacement keeps the old checked generation until the new generation 
 Every separately named new inventory object and its parent directory are synced before publishing a reference to that generation.
 
 A tag is at most 256 bytes and an explicit tag overrides the HELLO default.
+BEGIN captures the session default, and explicit tags on BEGIN or successful transactional writes must agree byte-for-byte for the entire group.
+The first explicit tag can replace the captured default; a conflicting explicit tag refuses that statement without changing private data or the chosen group tag.
 The checked group decision owns the tag and catch-up obtains it from the retained group seal.
 Admission, rollback, uncertain outcomes, crash recovery and split restore receive independent failure tests.
