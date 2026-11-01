@@ -60,8 +60,9 @@ void IdentityPagesIncludeRetainedDeletions() {
 }
 void CandidateChangedDuringDiskRead() {
     test::ScopedTempDir directory("chunkdb-scan-changing-candidate");
-    auto config = txn_test::Config(directory.path(), DurabilityMode::kFsyncWal, 8U);
+    auto config = txn_test::Config(directory.path(), DurabilityMode::kRelaxed, 8U);
     config.background_maintenance = false;
+    config.wal_group_commit_updates = 1000U;
     {
         ChunkStore store(config);
         store.SetBlockBits(0, 0, "10000000");

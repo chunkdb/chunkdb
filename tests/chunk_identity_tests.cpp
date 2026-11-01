@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "chunk_store_internal.hpp"
+#include "checkpoint.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
