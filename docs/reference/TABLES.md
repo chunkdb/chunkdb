@@ -55,10 +55,14 @@ SHOW TABLES also lists any other tables you have created.
 
 ```text
 CREATE TABLE [IF NOT EXISTS] table (column type [NULL] [REQUIRED] [DEFAULT value], ...)
-  [CHUNK width x height] [LARGE width x height] [WITH option = value, ...]
+  [CHUNK width x height [x depth]] [LARGE width x height [x depth]]
+  [CHUNK COLUMNS (column type [NULL] [REQUIRED] [DEFAULT value], ...)] [WITH option = value, ...]
 ALTER TABLE table ADD COLUMN [IF NOT EXISTS] column type [NULL] [REQUIRED] [DEFAULT value]
 ALTER TABLE table DROP COLUMN [IF EXISTS] column
 ALTER TABLE table RENAME COLUMN column TO name
+ALTER TABLE table ADD CHUNK COLUMN [IF NOT EXISTS] column type [NULL] [REQUIRED] [DEFAULT value]
+ALTER TABLE table DROP CHUNK COLUMN [IF EXISTS] column
+ALTER TABLE table RENAME CHUNK COLUMN column TO name
 ALTER TABLE table ALTER COLUMN column TYPE type [USING CLAMP | DEFAULT | TRUNCATE]
 ALTER TABLE table SET option = value
 DROP TABLE [IF EXISTS] table
@@ -76,8 +80,9 @@ ENABLE FEATURE 'name'
 - `NULL`: the column accepts a missing value, distinct from an absent block.
 - `REQUIRED`: new blocks must provide this column unless it has a default.
 - `DEFAULT`: the value used for an omitted column in a new block.
-- `CHUNK`: blocks per chunk, default `16 x 16`; fixed after creation.
-- `LARGE`: chunks per disk file group, default `8 x 8`; fixed after creation.
+- `CHUNK`: blocks per chunk, default `16 x 16`; a third side selects a three-dimensional table, and geometry is fixed after creation.
+- `LARGE`: chunks per disk file group, default 8 on each active axis; its dimensions must match CHUNK.
+- `CHUNK COLUMNS`: one metadata row per chunk, with an independent column namespace and stable IDs.
 - `IF NOT EXISTS` and `IF EXISTS`: skip an existing or absent object without comparing its definition; usual rights still apply.
 - `USING CLAMP`: narrow numeric values to the nearest supported value.
 - `USING DEFAULT`: replace values that do not fit with the column's default.
@@ -123,7 +128,8 @@ The `version` field describes the schema; `revision` describes the completed com
 The frontier can include terminal gaps from abandoned reservations and recovery.
 Read-only servers return null for revision because they cannot establish the writer's completed frontier.
 A fenced table also returns null for revision.
-Current tables have `dims = 2` and an empty `chunk_columns` list.
+The `dims` field is 2 or 3 and determines coordinate and geometry tuple lengths.
+The `chunk_columns` list uses the same column-description maps as `columns`.
 
 ## Errors
 
@@ -145,6 +151,10 @@ Changing columns immediately publishes a new schema version; older chunks conver
 Types can change only within their family: integers, floats, text, bytes, or bits.
 Narrowing without USING checks every stored value and refuses the first value that does not fit.
 You can add REQUIRED without DEFAULT only when no block is present.
+For chunk columns, adding REQUIRED without DEFAULT requires no written chunk identity, including retained tombstones.
+Block and chunk columns share the table's schema version; changing either domain advances it once.
+Chunk metadata uses DEFAULT, otherwise NULL for nullable columns, otherwise zero or empty as its baseline.
+A chunk with metadata differing from that baseline is populated even when it has no blocks.
 
 At least one fixed-width column must remain.
 A text-only application can use `kind u1 DEFAULT 0` alongside its text column.
@@ -170,7 +180,7 @@ The variable-value budget includes 12 bytes of metadata per value.
 The var_max_chunk_bytes option ranges from 13 through 67108864 bytes.
 After reducing this limit, existing oversized chunks can still shrink.
 There is no configured table-count limit; storage and memory still bound the count.
-Chunk dimensions are 1 through 4096 blocks; their product is at most 1048576 blocks.
+Each active chunk dimension is 1 through 4096 blocks; their product is at most 1048576 blocks.
 
 Large-chunk dimensions are 1 through 1000000 chunks.
 Fixed chunk payload is at most 67108864 bytes, including nullable-column validity bits.
@@ -182,7 +192,7 @@ See [Server flags](../SERVER_FLAGS.md#table-geometry).
 Its protected snapshot refuses unhealthy serving state instead of guessing whether activation completed.
 `ENABLE FEATURE 'name'` requires the same right and returns OK for an already enabled feature.
 
-New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, and `feature_activation`.
+New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, `feature_activation`, and `chunk_model`.
 Existing directories retain their recorded bits; enable `feature_activation` before another missing feature.
 Activation validates every table before recording its durable decision, then updates only that feature's registered owners.
 A fenced table refuses activation with its fenced message until RECOVER TABLE.

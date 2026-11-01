@@ -51,6 +51,8 @@ It marks a sender-drained revision; slot progress also stays within the durable 
 ## Guarantees
 
 - One committed transaction produces one change containing all its affected blocks.
+- Chunk metadata changes carry complete before and after rows, including changes with no affected blocks.
+- Every coordinate has exactly the table's active axes, and block-column projections preserve chunk metadata.
 - Schema descriptions precede changes that need their columns.
 - An ordinary watch starts after currently completed writes unless you supply AFTER.
 - A durable slot retains a saved consumer position across server restarts.
