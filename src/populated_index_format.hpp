@@ -64,6 +64,7 @@ struct IndexInventoryHeader {
     std::uint64_t retained_deletion_floor = 0;
     std::uint64_t compaction_through = 0;
     std::uint64_t count = 0;
+    std::uint64_t generation = 1U;
 };
 
 struct IndexInventoryEntry {
@@ -77,6 +78,12 @@ struct IndexInventoryEntry {
 // Count is a u64, with no fixed shard-count ceiling. Reject length overflow
 // before reading/allocating coordinate entries.
 [[nodiscard]] std::uint64_t IndexInventoryFileBytes(const IndexInventoryHeader& header);
+
+// The independently checked fixed header is a cache identity only: reuse
+// requires an already completely admitted matching epoch/generation inside
+// the caller's stable snapshot bracket. It grants no new entry ownership.
+[[nodiscard]] IndexInventoryHeader ReadIndexInventoryHeader(
+    std::istream& input, std::uint64_t file_bytes, const Geometry& geometry, const StoreId& table_id);
 
 // Validate the whole borrowed stream using fixed-size buffers, returning no
 // coordinate list. The stream must start at its header. Callers retain their

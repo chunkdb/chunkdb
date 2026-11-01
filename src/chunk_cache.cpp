@@ -2,6 +2,7 @@
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "eviction.hpp"
 #include "feed_slots.hpp"
 #include "process_lock.hpp"
@@ -207,6 +208,7 @@ void ChunkStore::RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChun
     }
     chunk.payload = std::move(loaded.payload);
     chunk.presence_bitmap = std::move(loaded.presence_bitmap);
+    chunk.present_blocks = PresentBlockCount(chunk.presence_bitmap);
     chunk.vars = std::move(loaded.vars);
     chunk.chunk_columns = std::move(loaded.chunk_columns);
     chunk.version = loaded.revision;
@@ -226,7 +228,8 @@ std::vector<std::uint8_t> ChunkStore::EmptyPresenceBitmap() const {
     return std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry_), 0U);
 }
 
-ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix) {
+ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix,
+    const std::shared_ptr<ChunkCoordinateIndex>& recovery_index) {
     std::vector<WalFrameBoundary> boundaries;
     // A read-only store archives nothing, so it keeps no WAL prefixes.
     const bool track_prefix =
@@ -250,6 +253,22 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         .wal_header_written = false,
         .wal_path = {},
     };
+    auto retained_index = recovery_index ? recovery_index : (writable ? coordinate_index_ : nullptr);
+    std::optional<ChunkIndexRecord> retained_boundary;
+    const auto apply_boundary = [&] {
+        if (retained_index) retained_boundary = retained_index->EmptyBoundary(chunk_coord);
+        if (retained_boundary)
+            (void)ApplyRetainedEmptyBase(geometry_, *retained_boundary, loaded.revision, loaded.commit_time_ms,
+                loaded.schema_version, loaded.payload, loaded.presence_bitmap, loaded.vars, loaded.chunk_columns);
+    };
+    const auto finish = [&] {
+        if (retained_boundary && retained_boundary->kind == ChunkIndexKind::kForget &&
+            loaded.revision == retained_boundary->revision) {
+            loaded.revision = 0U;
+            loaded.commit_time_ms = 0U;
+        }
+        seed();
+    };
     if (!writable) {
         const auto snapshot =
             LoadStableReadOnlyChunkDiskSnapshot(
@@ -268,8 +287,14 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                     ReadOnlySnapshotArtifact artifact) {
                     PauseReadOnlySnapshotForTests(
                         collection, artifact);
-                });
+                },
+                [&] { if (!recovery_index) retained_index = RetainedIndexForSnapshot(); });
         loaded.read_only_generation = snapshot.generation;
+        if (!recovery_index && retained_index) {
+            std::lock_guard lock(coordinate_index_refresh_mutex_);
+            if (!read_only_retained_index_ || read_only_retained_index_->inventory_generation() < retained_index->inventory_generation())
+                read_only_retained_index_ = retained_index;
+        }
 
         // An image or a WAL names its store; an absent chunk does not, so a
         // table dropped and created again would read as empty.
@@ -287,6 +312,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             loaded.revision = image.revision;
             loaded.commit_time_ms = image.commit_time_ms;
         }
+        apply_boundary();
 
         std::vector<std::uint8_t> replay_bytes;
         ConditionalIntentState intent_state =
@@ -368,7 +394,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 if (!snapshot.image.present) {
                     RequireStoreStillOnDisk();
                 }
-                seed();
+                finish();
                 return loaded;
             }
             // A crash-shaped tail ends the WAL here as it does for a
@@ -396,7 +422,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 loaded.commit_time_ms = replay.commit_time_ms;
             }
         }
-        seed();
+        finish();
         return loaded;
     }
 
@@ -432,6 +458,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         }
     }
 
+    apply_boundary();
     if (std::filesystem::exists(wal_path)) {
         std::vector<std::uint8_t> wal_bytes;
         try {
@@ -442,7 +469,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             if (std::filesystem::exists(wal_path)) {
                 throw;
             }
-            seed();
+            finish();
             return loaded;
         }
 
@@ -473,7 +500,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             if (writable) {
                 TrimWalForAppend(chunk_coord, wal_path, 0U);
             }
-            seed();
+            finish();
             return loaded;
         }
         if (!replay.replayable) {
@@ -536,7 +563,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         }
     }
 
-    seed();
+    finish();
     return loaded;
 }
 

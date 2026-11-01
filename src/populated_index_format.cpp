@@ -64,6 +64,9 @@ void RequireRecord(const ChunkIndexRecord& record, const Geometry& geometry, con
 
 void RequireInventory(const IndexInventoryHeader& header) {
     RequireDimensions(header.dims);
+    if (header.generation == 0U || (header.compaction_pending &&
+        header.generation == std::numeric_limits<std::uint64_t>::max()))
+        throw std::invalid_argument("index inventory generation cannot advance");
     if ((!header.compaction_pending && header.compaction_through != 0) ||
         header.compaction_through > header.retained_deletion_floor)
         throw std::invalid_argument("index inventory compaction bounds are invalid");
@@ -261,31 +264,48 @@ CheckedChunkIndexLog ReadChunkIndexLog(
 std::uint64_t IndexInventoryFileBytes(const IndexInventoryHeader& header) {
     RequireInventory(header);
     const auto entry_bytes = static_cast<std::uint64_t>(8U * header.dims + 24U);
-    if (header.count > (std::numeric_limits<std::uint64_t>::max() - 52U) / entry_bytes)
+    if (header.count > (std::numeric_limits<std::uint64_t>::max() - 64U) / entry_bytes)
         throw std::invalid_argument("index inventory length overflows");
-    return 52U + header.count * entry_bytes;
+    return 64U + header.count * entry_bytes;
+}
+
+namespace {
+IndexInventoryHeader ParseInventoryHeader(std::span<const std::uint8_t> fixed,
+    std::uint64_t file_bytes, const Geometry& geometry, const StoreId& table_id) {
+    if (file_bytes < 64U) throw std::invalid_argument("index inventory is truncated");
+    if (fixed[0] != 'C' || fixed[1] != 'K' || fixed[2] != 'I' || fixed[3] != 'I')
+        throw std::invalid_argument("not a CKII index inventory");
+    if (ReadLe(fixed.data() + 4, 2) != 3) throw std::invalid_argument("unsupported index inventory version");
+    if (fixed[6] != geometry.dims() || fixed[7] > 1)
+        throw std::invalid_argument("index inventory dimensions or flags are invalid");
+    if (!std::equal(table_id.begin(), table_id.end(), fixed.begin() + 8))
+        throw std::invalid_argument("index inventory belongs to another table");
+    RequireChecksum(fixed);
+    IndexInventoryHeader header{
+        .table_id = table_id, .dims = fixed[6], .compaction_pending = fixed[7] != 0,
+        .retained_deletion_floor = ReadLe(fixed.data() + 24, 8),
+        .compaction_through = ReadLe(fixed.data() + 32, 8), .count = ReadLe(fixed.data() + 40, 8),
+        .generation = ReadLe(fixed.data() + 48, 8),
+    };
+    if (file_bytes != IndexInventoryFileBytes(header))
+        throw std::invalid_argument("index inventory has wrong length");
+    return header;
+}
+}  // namespace
+
+IndexInventoryHeader ReadIndexInventoryHeader(std::istream& input, std::uint64_t file_bytes,
+    const Geometry& geometry, const StoreId& table_id) {
+    std::array<std::uint8_t, 60> fixed{};
+    ReadExact(input, fixed);
+    return ParseInventoryHeader(fixed, file_bytes, geometry, table_id);
 }
 
 IndexInventoryHeader ReadIndexInventory(
     std::istream& input, std::uint64_t file_bytes, const Geometry& geometry, const StoreId& table_id,
     const std::function<void(const IndexInventoryEntry&)>& candidate) {
-    if (file_bytes < 52U) throw std::invalid_argument("index inventory is truncated");
-    std::array<std::uint8_t, 48> fixed{};
+    std::array<std::uint8_t, 60> fixed{};
     ReadExact(input, fixed);
-    if (fixed[0] != 'C' || fixed[1] != 'K' || fixed[2] != 'I' || fixed[3] != 'I')
-        throw std::invalid_argument("not a CKII index inventory");
-    if (ReadLe(fixed.data() + 4, 2) != 2) throw std::invalid_argument("unsupported index inventory version");
-    if (fixed[6] != geometry.dims() || fixed[7] > 1)
-        throw std::invalid_argument("index inventory dimensions or flags are invalid");
-    if (!std::equal(table_id.begin(), table_id.end(), fixed.begin() + 8))
-        throw std::invalid_argument("index inventory belongs to another table");
-    IndexInventoryHeader header{
-        .table_id = table_id, .dims = fixed[6], .compaction_pending = fixed[7] != 0,
-        .retained_deletion_floor = ReadLe(fixed.data() + 24, 8),
-        .compaction_through = ReadLe(fixed.data() + 32, 8), .count = ReadLe(fixed.data() + 40, 8),
-    };
-    if (file_bytes != IndexInventoryFileBytes(header))
-        throw std::invalid_argument("index inventory has wrong length");
+    const auto header = ParseInventoryHeader(fixed, file_bytes, geometry, table_id);
     auto crc = Crc32(fixed.data(), fixed.size());
     LargeChunkCoord previous;
     std::array<std::uint8_t, 48> entry{};
@@ -331,15 +351,17 @@ void WriteIndexInventory(
             throw std::invalid_argument("index inventory coordinates must be unique and increasing");
     }
     std::vector<std::uint8_t> fixed;
-    fixed.reserve(48);
+    fixed.reserve(60);
     fixed.insert(fixed.end(), {'C', 'K', 'I', 'I'});
-    WriteLe(&fixed, 2, 2);
+    WriteLe(&fixed, 3, 2);
     fixed.push_back(header.dims);
     fixed.push_back(header.compaction_pending ? 1 : 0);
     fixed.insert(fixed.end(), header.table_id.begin(), header.table_id.end());
     WriteLe(&fixed, header.retained_deletion_floor, 8);
     WriteLe(&fixed, header.compaction_through, 8);
     WriteLe(&fixed, header.count, 8);
+    WriteLe(&fixed, header.generation, 8);
+    AddChecksum(&fixed);
     auto crc = Crc32(fixed);
     WriteExact(output, fixed);
     std::vector<std::uint8_t> entry;

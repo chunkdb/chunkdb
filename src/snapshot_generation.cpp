@@ -550,7 +550,7 @@ void SnapshotGenerationMapping::Initialize(std::uint64_t session) {
     WriteLe64(record, session);
     WriteLe32(record, Crc32(record));
     WriteLe32(record, 0U);
-    WriteLe64(record, kGenerationOdd);
+    WriteLe64(record, kGenerationOdd | kGenerationCountOne);
     const auto path = impl_->directory / kSnapshotLiveFile;
     CleanupAtomicTmpArtifacts(path);
     AtomicWrite(path, record, /*fsync_file=*/false, /*fsync_directory=*/false,
@@ -598,7 +598,8 @@ std::optional<SnapshotGenerationObservation> StableSnapshotGeneration(
     const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& image_reader,
     const std::function<void(
         std::size_t,
-        ReadOnlySnapshotArtifact)>& observation) {
+        ReadOnlySnapshotArtifact)>& observation,
+    const std::function<void()>& index_reader) {
     // Bounded backoff, not an unbounded wait: the reader still fails closed,
     // it just stops treating a normal-length writer bracket as damage.
     const auto backoff_budget =
@@ -612,6 +613,12 @@ std::optional<SnapshotGenerationObservation> StableSnapshotGeneration(
         try {
             const auto before =
                 ReadSnapshotGeneration(generation_path, generation_record_required);
+            if (index_reader) {
+                try { index_reader(); }
+                catch (const std::exception& error) {
+                    throw SnapshotArtifactUnstable("read-only retained index observation failed: " + std::string(error.what()));
+                }
+            }
             auto snapshot = CollectReadOnlyChunkDiskSnapshot(
                 data_path, wal_path, intent_path, txn_intent_dir, attempt, image_reader, observation);
             const auto after =
@@ -827,7 +834,7 @@ void ChunkStore::FinishSnapshotGenerationRecovery() {
         "CHUNKDB_FAILPOINT_CRASH_SNAPSHOT_GENERATION_BEFORE_END_ONCE");
     // Recovery has completed all artifact mutations. The durable session
     // remains odd until clean shutdown; live readers use this mapped bracket.
-    auto expected = kGenerationOdd;
+    auto expected = kGenerationOdd | kGenerationCountOne;
     if (!snapshot_generation_mapping_->CompareExchange(expected, kGenerationEpochStep)) {
         throw std::logic_error("snapshot recovery counter was modified");
     }

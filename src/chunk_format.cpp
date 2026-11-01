@@ -4,6 +4,7 @@
 #include "chunk_store_internal.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
+#include "populated_index_format.hpp"
 #include "store_manifest.hpp"
 #include "wal_replay.hpp"
 #include "wal_stream_pool.hpp"
@@ -111,9 +112,18 @@ void SetBlockPresent(
         [](std::uint8_t byte) { return byte != 0U; });
 }
 
+std::size_t PresentBlockCount(const std::vector<std::uint8_t>& presence_bitmap) noexcept {
+    std::size_t count = 0U;
+    for (const auto byte : presence_bitmap) count += std::popcount(byte);
+    return count;
+}
+
 bool ChunkPopulated(const Geometry& geometry, const std::vector<std::uint8_t>& presence_bitmap,
     const ChunkColumnState* chunk_columns) noexcept {
-    if (ChunkPresent(presence_bitmap)) return true;
+    return ChunkPresent(presence_bitmap) || ChunkColumnsPopulated(geometry, chunk_columns);
+}
+
+bool ChunkColumnsPopulated(const Geometry& geometry, const ChunkColumnState* chunk_columns) noexcept {
     const auto& baseline = geometry.default_chunk_columns();
     return chunk_columns != nullptr && (baseline == nullptr || chunk_columns->bytes != baseline->bytes);
 }
@@ -593,6 +603,29 @@ void BringChunkColumnsToSchema(const Geometry& geometry, std::uint64_t from_vers
         else next = std::make_shared<const ChunkColumnState>(std::move(changed));
     }
     *state = std::move(next);
+}
+
+bool ApplyRetainedEmptyBase(const Geometry& geometry, const ChunkIndexRecord& boundary,
+    std::uint64_t& revision, std::uint64_t& commit_time_ms, std::uint64_t& schema_version,
+    std::vector<std::uint8_t>& payload, std::vector<std::uint8_t>& presence, ChunkVars& vars,
+    std::shared_ptr<const ChunkColumnState>& chunk_columns) {
+    if (boundary.kind != ChunkIndexKind::kDeleted && boundary.kind != ChunkIndexKind::kForget)
+        throw std::invalid_argument("retained replay base is not an empty boundary");
+    if (revision > boundary.revision) return false;
+    if (revision == boundary.revision) {
+        auto current_columns = chunk_columns;
+        BringChunkColumnsToSchema(geometry, schema_version, geometry.chunk_schema().version, &current_columns);
+        if (ChunkPopulated(geometry, presence, current_columns.get()))
+            throw std::runtime_error("retained empty boundary conflicts with a populated equal-version image");
+    }
+    payload.assign(geometry.LayoutAt(boundary.schema_version).payload_bytes(), 0U);
+    presence.assign(ChunkPresenceBitmapBytes(geometry), 0U);
+    vars = ChunkVars{};
+    chunk_columns = DefaultChunkColumnsAt(geometry, boundary.schema_version);
+    schema_version = boundary.schema_version;
+    revision = boundary.revision;
+    commit_time_ms = boundary.commit_time_ms;
+    return true;
 }
 
 void BringToCurrentSchema(

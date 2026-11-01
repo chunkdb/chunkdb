@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "checkpoint.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "file_permissions.hpp"
 #include "change_feed.hpp"
 #include "chunk_store_internal.hpp"
@@ -1707,6 +1708,8 @@ std::shared_ptr<Table> TableCatalog::Create(
         .chunk_schema = table_geometry.chunk_schema(),
     };
     try {
+        if (!ChunkCoordinateIndex::InitializeEmpty(staging, table_geometry, manifest.store_id))
+            throw std::runtime_error("coordinate inventory appeared in table staging");
         if (!PublishNewFile(StoreManifestPath(staging), SerializeStoreManifest(manifest))) {
             throw std::runtime_error("table manifest appeared in " + staging.string());
         }

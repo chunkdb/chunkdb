@@ -125,7 +125,7 @@ std::optional<std::string> ChunkStore::ReadBlockBitsAtAddress(const ChunkCoord& 
 
 TxnKeep ChunkStore::PrepareTxnKeepLocked(
     const ChunkCoord& chunk_coord,
-    const RegularChunk& chunk,
+    RegularChunk& chunk,
     std::uint64_t version, bool supplies_chunk_columns) {
     if (!chunk.written && !supplies_chunk_columns) {
         if (geometry_.chunk_columns_require_initialization())
@@ -133,9 +133,10 @@ TxnKeep ChunkStore::PrepareTxnKeepLocked(
         if (const auto& baseline = geometry_.default_chunk_columns())
             RequireVarWrite(chunk.vars, {}, baseline->variable_bytes, 0U);
     }
+    auto coordinate = coordinate_index_->Prepare(chunk_coord, &chunk.coordinate_node);
     // Loaded after the version was taken (txn_history.hpp).
     if (txn_history_->OpenCount() == 0U) {
-        return TxnKeep{};
+        return TxnKeep{.node = {}, .coordinate = std::move(coordinate)};
     }
     txn_history_->PauseForTests(TxnPausePoint::kWriteAfterOpenCount);
     return TxnKeep{
@@ -151,6 +152,7 @@ TxnKeep ChunkStore::PrepareTxnKeepLocked(
                 .commit_time_ms = chunk.commit_time_ms,
                 .chunk_columns = chunk.chunk_columns,
             }),
+        .coordinate = std::move(coordinate),
     };
 }
 
@@ -160,7 +162,8 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     std::size_t appended_bytes,
     std::uint64_t reserved_version,
     std::uint64_t commit_time_ms,
-    TxnKeep* keep) {
+    TxnKeep* keep,
+    std::optional<std::size_t> next_present_blocks) {
     // A WAL whose failed write or transaction could not be repaired takes
     // nothing more until a restart repairs it.
     if (chunk->wal_repair_failed) {
@@ -191,6 +194,10 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     chunk->version = reserved_version;
     chunk->written = true;
     chunk->commit_time_ms = commit_time_ms;
+    chunk->present_blocks = next_present_blocks ? *next_present_blocks : PresentBlockCount(chunk->presence_bitmap);
+    if (keep != nullptr)
+        keep->coordinate.Publish(chunk->present_blocks != 0U ||
+            ChunkColumnsPopulated(geometry_, chunk->chunk_columns.get()), reserved_version);
     if (!chunk->chunk_columns) chunk->chunk_columns = geometry_.default_chunk_columns();
     // Still under the chunk's lock, so no read sees the new state without
     // the kept one.
@@ -328,7 +335,8 @@ void ChunkStore::WriteBlockBitsLocked(
             appended_bytes,
             reserved_version,
             commit_time_ms,
-            &keep);
+            &keep, presence_changed ? (present ? regular_chunk->present_blocks + 1U : regular_chunk->present_blocks - 1U) :
+                regular_chunk->present_blocks);
         feed.Commit();
     } catch (...) {
         std::copy(
@@ -1015,7 +1023,8 @@ void ChunkStore::WriteBlockColumnsLocked(
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         feed.Capture(chunk->wal_batch, appended_bytes);
 
-        FinishOrdinaryMutationLocked(chunk_coord, chunk, appended_bytes, reserved_version, commit_time_ms, &keep);
+        FinishOrdinaryMutationLocked(chunk_coord, chunk, appended_bytes, reserved_version, commit_time_ms, &keep,
+            presence_changed ? (present ? chunk->present_blocks + 1U : chunk->present_blocks - 1U) : chunk->present_blocks);
         feed.Commit();
     } catch (...) {
         restore();

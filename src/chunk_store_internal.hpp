@@ -17,6 +17,7 @@
 #include "chunk_file_header.hpp"
 
 namespace chunkdb {
+struct ChunkIndexRecord;
 
 struct StartupRecoveryScan {
     std::uint64_t wal_files = 0;
@@ -139,8 +140,10 @@ void MaskUnusedPayloadBits(const Geometry& geometry, std::vector<std::uint8_t>* 
 [[nodiscard]] bool BlockPresent(const std::vector<std::uint8_t>& presence_bitmap, std::size_t block_index);
 void SetBlockPresent(std::vector<std::uint8_t>* presence_bitmap, std::size_t block_index, bool present);
 [[nodiscard]] bool ChunkPresent(const std::vector<std::uint8_t>& presence_bitmap) noexcept;
+[[nodiscard]] std::size_t PresentBlockCount(const std::vector<std::uint8_t>& presence_bitmap) noexcept;
 [[nodiscard]] bool ChunkPopulated(const Geometry& geometry, const std::vector<std::uint8_t>& presence_bitmap,
     const ChunkColumnState* chunk_columns) noexcept;
+[[nodiscard]] bool ChunkColumnsPopulated(const Geometry& geometry, const ChunkColumnState* chunk_columns) noexcept;
 [[nodiscard]] std::string PresenceBitsText(
     const Geometry& geometry,
     const std::vector<std::uint8_t>& presence_bitmap);
@@ -263,6 +266,13 @@ void BringToCurrentSchema(
 void BringChunkColumnsToSchema(
     const Geometry& geometry, std::uint64_t from_version, std::uint64_t to_version,
     std::shared_ptr<const ChunkColumnState>* state);
+// Seed replay at a checked committed-empty boundary rather than applying a
+// resurrection over a stale pre-deletion image. Equal-version artifacts must
+// be empty under the current schema; older artifacts cannot override the cut.
+bool ApplyRetainedEmptyBase(const Geometry& geometry, const ChunkIndexRecord& boundary,
+    std::uint64_t& revision, std::uint64_t& commit_time_ms, std::uint64_t& schema_version,
+    std::vector<std::uint8_t>& payload, std::vector<std::uint8_t>& presence, ChunkVars& vars,
+    std::shared_ptr<const ChunkColumnState>& chunk_columns);
 // The state comes back laid out by the image's own schema version
 // (ChunkStateImage::schema_version); ReplayWal or BringToCurrentSchema moves
 // it to the current one.

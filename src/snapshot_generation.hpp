@@ -75,6 +75,7 @@ struct ReadOnlyChunkDiskSnapshot {
     const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& image_reader,
     const std::function<void(
         std::size_t,
-        ReadOnlySnapshotArtifact)>& observation);
+        ReadOnlySnapshotArtifact)>& observation,
+    const std::function<void()>& index_reader = {});
 
 }  // namespace chunkdb

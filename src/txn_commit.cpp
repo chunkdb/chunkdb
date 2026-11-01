@@ -576,6 +576,7 @@ std::uint64_t ChunkStore::CommitTransaction(
     for (auto& change : changes) {
         const auto& chunk = *change.target->chunk;
         const auto& state = change.write->state;
+        change.keep.coordinate = coordinate_index_->Prepare(change.target->coord, &change.target->chunk->coordinate_node);
         if (change.new_wal) {
             change.bytes = BuildWalHeader(change.target->coord, store_id_, features_, geometry_.dims());
         }
@@ -781,6 +782,8 @@ std::uint64_t ChunkStore::CommitTransaction(
         chunk.version = version;
         chunk.written = true;
         chunk.commit_time_ms = commit_time_ms;
+        chunk.present_blocks = PresentBlockCount(chunk.presence_bitmap);
+        change.keep.coordinate.Publish(chunk.present_blocks != 0U || ChunkColumnsPopulated(geometry_, chunk.chunk_columns.get()), version);
         chunk.pending_updates += 1;
         chunk.wal_bytes += change.bytes.size();
         if (!change.keep.node.empty()) {

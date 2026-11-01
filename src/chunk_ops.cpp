@@ -203,6 +203,9 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     chunk->version = reserved_version;
     chunk->written = true;
     chunk->commit_time_ms = commit_time_ms;
+    chunk->present_blocks = PresentBlockCount(chunk->presence_bitmap);
+    keep.coordinate.Publish(chunk->present_blocks != 0U || ChunkColumnsPopulated(geometry_, chunk->chunk_columns.get()),
+        reserved_version);
     // Still under the chunk's lock, so no read sees the new state without
     // the kept one.
     txn_history_->Publish(keep.node);

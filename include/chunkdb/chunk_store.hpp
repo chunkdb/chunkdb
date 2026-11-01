@@ -2,6 +2,7 @@
 
 #include <array>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -36,6 +37,9 @@
 namespace chunkdb {
 
 class SnapshotGenerationMapping;
+class ChunkCoordinateIndex;
+struct ChunkCoordinateNode;
+struct ChunkIndexRecord;
 
 #if defined(__MINGW32__) && \
     (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
@@ -935,13 +939,17 @@ class ChunkStore {
             std::vector<std::uint8_t> payload_bytes,
             std::vector<std::uint8_t> presence_bytes)
             : payload(std::move(payload_bytes)),
-              presence_bitmap(std::move(presence_bytes)) {}
+              presence_bitmap(std::move(presence_bytes)) {
+            for (const auto byte : presence_bitmap) present_blocks += std::popcount(byte);
+        }
 
         std::vector<std::uint8_t> payload;
         std::vector<std::uint8_t> presence_bitmap;
         // Values of text and bytes columns (ChunkLayout::RequireValidVars).
         ChunkVars vars;
         std::shared_ptr<const ChunkColumnState> chunk_columns{};
+        std::size_t present_blocks = 0U;
+        ChunkCoordinateNode* coordinate_node = nullptr;
         std::size_t pending_updates = 0;
         std::size_t wal_bytes = 0;
         bool checkpoint_due_armed = false;
@@ -1012,6 +1020,13 @@ class ChunkStore {
     };
 
     Geometry geometry_;
+    // Declared before the cache so borrowed node pointers outlive cached chunks.
+    std::shared_ptr<ChunkCoordinateIndex> coordinate_index_;
+    std::shared_ptr<ChunkCoordinateIndex> read_only_retained_index_;
+    std::mutex coordinate_index_refresh_mutex_;
+    std::pair<std::uint64_t, std::uint64_t> coordinate_index_generation_{};
+    bool coordinate_index_complete_ = false;
+    std::vector<ChunkCoord> coordinate_startup_candidates_;
     std::filesystem::path data_dir_;
     DurabilityMode durability_mode_;
     AccessMode access_mode_;
@@ -1289,7 +1304,14 @@ class ChunkStore {
     // limit may still shrink.
     void RequireVarWrite(const ChunkVars& current, const VarUpdate& update,
         std::size_t chunk_variable_bytes = 0U, std::size_t previous_chunk_variable_bytes = 0U) const;
-    [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix = false);
+    [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix = false,
+        const std::shared_ptr<ChunkCoordinateIndex>& recovery_index = {});
+    [[nodiscard]] std::vector<ChunkCoord> AdmitCoordinateArtifacts(ChunkCoordinateIndex& index);
+    void PrepareCoordinateIndex();
+    void InitializeCoordinateIndex();
+    [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> CoordinateIndexForScan();
+    [[nodiscard]] std::optional<ChunkIndexRecord> RetainedEmptyBoundaryForArchive(const ChunkCoord& coord);
+    [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> RetainedIndexForSnapshot();
     // Before a loaded chunk can append, drops what replay could not use: the
     // bytes after the last valid frame, or (`keep_bytes` zero) a WAL left by
     // an interrupted creation. Appending after them would put new frames
@@ -1592,14 +1614,15 @@ class ChunkStore {
         std::size_t appended_bytes,
         std::uint64_t reserved_version,
         std::uint64_t commit_time_ms,
-        TxnKeep* keep);
+        TxnKeep* keep,
+        std::optional<std::size_t> next_present_blocks = {});
     // Called by a write under its chunk's exclusive lock after it took
     // `version` and before it changes the chunk: while a transaction is open,
     // a copy of the chunk's state to keep, tagged `version`; otherwise empty
     // (one atomic load).
     [[nodiscard]] TxnKeep PrepareTxnKeepLocked(
         const ChunkCoord& chunk_coord,
-        const RegularChunk& chunk,
+        RegularChunk& chunk,
         std::uint64_t version, bool supplies_chunk_columns = false);
     // Resolves the transaction intents a crash left (writer open).
     void RecoverTransactionIntents(bool validate_only = false);

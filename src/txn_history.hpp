@@ -16,6 +16,7 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/types.hpp"
+#include "chunk_coordinate_index.hpp"
 
 namespace chunkdb {
 
@@ -168,6 +169,7 @@ class TxnHistory {
 // What a write keeps for open transactions (ChunkStore::PrepareTxnKeepLocked).
 struct TxnKeep {
     TxnHistory::Reservation node;
+    CoordinateReservation coordinate;
 };
 
 // The chunk locks this thread holds beyond the one a plain operation holds:

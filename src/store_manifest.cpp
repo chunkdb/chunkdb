@@ -173,7 +173,8 @@ std::optional<std::vector<std::uint8_t>> ReadManifestFile(
 
 bool IsStoreEntryName(const std::string& name) {
     if (StartsWith(name, ".chunkdb.lock") ||
-        StartsWith(name, std::string(kStoreManifestFileName) + ".tmp.")) {
+        StartsWith(name, std::string(kStoreManifestFileName) + ".tmp.") ||
+        StartsWith(name, "chunkdb.index.tmp.")) {
         return false;
     }
     if (name == kStoreManifestFileName || StartsWith(name, "chunkdb.") ||

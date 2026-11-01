@@ -19,6 +19,7 @@
 #include "wal_replay.hpp"
 #include "snapshot_generation.hpp"
 #include "txn_history.hpp"
+#include "chunk_coordinate_index.hpp"
 
 namespace chunkdb {
 
@@ -430,6 +431,11 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         }
     }
 
+    if (const auto boundary = coordinate_index_->EmptyBoundary(chunk_coord)) {
+        (void)ApplyRetainedEmptyBase(geometry_, *boundary, revision, commit_time_ms, schema_version,
+            payload, presence, vars, chunk_columns);
+        base_revision = revision;
+    }
     PauseCacheForTests(CachePausePoint::kNoCacheReadBeforeWal, chunk_coord);
     if (std::filesystem::exists(wal_path)) {
         std::vector<std::uint8_t> wal_bytes;
@@ -671,22 +677,16 @@ ChunkScanPage ChunkStore::ScanPopulatedChunks(
         return std::move(result);
     };
 
-    // Candidate collection is bounded to the page size: each pass keeps only
-    // the smallest limit+1 distinct coordinates after the cursor. Candidates
-    // that turn out unpopulated (stale artifacts, cached-but-empty chunks)
-    // shrink a pass below the page size; when that happens and the pass
-    // overflowed its window, resume the walk after the window instead of
-    // giving up, so large dirty worlds stay fully enumerable.
+    // Taking the frontier acquires every covered producer's index publication.
+    // Candidates remain hints; each returned coordinate is checked again.
+    (void)CompletedRevision();
+    const auto index = CoordinateIndexForScan();
     ChunkScanPage page;
     bool pass_has_cursor = has_cursor;
     ChunkCoord pass_cursor = cursor;
     while (page.coords.size() <= limit) {
-        ScanCandidateAccumulator candidates(
-            pass_has_cursor, pass_cursor, limit + 1U - page.coords.size());
-        CollectScanCandidates(&candidates);
-
-        const bool overflowed = candidates.overflowed();
-        const auto pass_coords = candidates.TakeSorted();
+        const auto candidates = index->Page(pass_has_cursor, pass_cursor, limit + 1U - page.coords.size());
+        const auto& pass_coords = candidates.coords;
         for (const auto& coord : pass_coords) {
             if (!ReadPopulatedChunkStateNoCache(coord, nullptr, false)) {
                 continue;
@@ -697,7 +697,7 @@ ChunkScanPage ChunkStore::ScanPopulatedChunks(
             }
             page.coords.push_back(coord);
         }
-        if (!overflowed) {
+        if (!candidates.more) {
             break;
         }
         pass_has_cursor = true;

@@ -53,6 +53,8 @@ add_library(chunkdb_core STATIC
     src/block_ops.cpp
     src/checkpoint.cpp
     src/chunk_cache.cpp
+    src/chunk_coordinate_index.cpp
+    src/coordinate_index_store.cpp
     src/chunk_format.cpp
     src/chunk_form.cpp
     src/typed_chunk_form.cpp
@@ -105,6 +107,7 @@ add_library(chunkdb_core STATIC
     src/schema.cpp
     src/store_resources.cpp
     src/table_catalog.cpp
+    src/table_chunk_columns.cpp
     src/table_catalog_migrations.cpp
     src/migrations_records.cpp
     src/migrations_apply.cpp
@@ -114,10 +117,12 @@ add_library(chunkdb_core STATIC
     src/txn_intent.cpp
     src/version_clock.cpp
     src/wal_replay.cpp
+    src/wal_stream_replay.cpp
     src/wal_prefix.cpp
     src/wal_stream_pool.cpp
     src/wal_writer.cpp
     src/world_read.cpp
+    src/world_read_3d.cpp
     src/zrle.cpp
 )
 
@@ -304,7 +309,7 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME geometry_bit COMMAND chunkdb_geometry_bit_test)
 
-    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix)
+    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay chunk_coordinate_index table_chunk_columns world_coordinates_3d)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -861,6 +866,10 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_atomic_stream_test
         chunkdb_block_coordinates_test
         chunkdb_wal_prefix_test
+        chunkdb_wal_stream_replay_test
+        chunkdb_chunk_coordinate_index_test
+        chunkdb_table_chunk_columns_test
+        chunkdb_world_coordinates_3d_test
         chunkdb_storage_test
         chunkdb_store_manifest_test
         chunkdb_chunk_vars_test
@@ -987,6 +996,10 @@ if(CHUNKDB_BUILD_TESTS)
         atomic_stream
         block_coordinates
         wal_prefix
+        wal_stream_replay
+        chunk_coordinate_index
+        table_chunk_columns
+        world_coordinates_3d
         storage
         store_manifest
         chunk_vars

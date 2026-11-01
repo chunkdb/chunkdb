@@ -26,6 +26,7 @@
 #include "feed_prefix.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
+#include "chunk_coordinate_index.hpp"
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -150,35 +151,9 @@ bool ChunkStore::CheckpointChunk(
     // The image and the WAL change, in relaxed mode without a sync.
     chunk->wal_boundary_durable = false;
     if (!ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get())) {
-        // Empty-chunk collection removes the image before the WAL, and a
-        // crash or failure between the two replays the WAL over no image.
-        // That must end in the empty state. A WAL that outlived an earlier
-        // checkpoint is only right over that image: replay skips its older
-        // frames, and frames the image took from the batch may never have
-        // reached it. A last frame that sets the whole state to empty makes
-        // such a WAL end empty on its own. The batch (with that frame) is
-        // flushed before the publish lock, which the barrier takes after the
-        // flush path's own locks.
-        if (std::filesystem::exists(ChunkDataPath(data_dir_, geometry_, chunk_coord))) {
-            const std::vector<std::uint8_t> payload(chunk->payload.size(), 0U);
-            const std::vector<std::uint8_t> presence(chunk->presence_bitmap.size(), 0U);
-            WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser(),
-                                  feed_slots_->ArchiveRequired());
-            frame.AppendSpan(0U, payload.data(), payload.size());
-            frame.AppendSpan(
-                static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()), presence.data(), presence.size());
-            if (geometry_.layout().has_var_columns()) {
-                frame.AppendVarReplace(ChunkVars{});
-            }
-            const std::size_t appended_bytes = frame.Finish(NextChunkVersion(), NextCommitTimeMs(*chunk));
-            chunk->pending_wal_flush_updates += 1;
-            chunk->wal_bytes += appended_bytes;
-        }
-        FlushWalBatch(
-            chunk_coord,
-            chunk,
-            durability_mode_ != DurabilityMode::kRelaxed ||
-                barrier_durability_floor_.load(std::memory_order_acquire));
+        // The retained producing boundary replaces the image as replay base.
+        // Make the producing WAL durable before publishing that authority.
+        FlushWalBatch(chunk_coord, chunk, true);
     }
     if (feed_slots_->ArchiveRequired()) {
         // Nonempty checkpoints must not publish an image ahead of staged
@@ -221,6 +196,12 @@ bool ChunkStore::CheckpointChunk(
             barrier_durability_floor_.load(std::memory_order_acquire) || archive_enabled;
         const bool chunk_populated = ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get());
         if (!chunk_populated) {
+            if (chunk->version != 0U) {
+                if (std::filesystem::exists(wal_path)) SyncFilePath(wal_path);
+                coordinate_index_->PublishTombstone({.kind = ChunkIndexKind::kDeleted, .coord = chunk_coord,
+                    .revision = chunk->version, .commit_time_ms = chunk->commit_time_ms,
+                    .schema_version = geometry_.chunk_schema().version});
+            }
             // Empty-chunk garbage collection: a chunk with no present blocks
             // is observably identical to an absent chunk, so its storage
             // artifacts are reclaimed instead of writing an empty image. The

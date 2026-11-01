@@ -103,6 +103,82 @@ void TestReadOnlyRefreshDoesNotInventIdentity() {
     assert(Read(wal_path) == header);
 }
 
+void TestCollectedIdentitySurvivesRestart() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-collected-producing-identity");
+    const auto config = Config(dir.path());
+    const chunkdb::ChunkCoord coord{-3, 7};
+    std::uint64_t revision = 0U, time = 0U;
+    {
+        chunkdb::ChunkStore writer(config);
+        writer.SetBlockBits(-12, 28, "10101");
+        writer.CheckpointForTests(coord.x, coord.y);
+        writer.UnsetBlock(-12, 28);
+        const auto empty = writer.ReadChunkState(coord);
+        revision = empty.version;
+        time = empty.commit_time_ms;
+        assert(revision != 0U && time != 0U && empty.written);
+        const auto frontier = writer.CompletedRevision();
+        auto read_config = config;
+        read_config.access_mode = chunkdb::AccessMode::kReadOnly;
+        chunkdb::ChunkStore reader(read_config);
+        assert(reader.ReadChunkState(coord).version == revision);
+        writer.CheckpointForTests(coord.x, coord.y);
+        assert(writer.CompletedRevision() == frontier);
+        assert(!std::filesystem::exists(chunkdb::ChunkDataPath(dir.path(), writer.geometry(), coord)));
+        assert(!std::filesystem::exists(chunkdb::ChunkWalPath(dir.path(), writer.geometry(), coord)));
+        const auto refreshed = reader.ReadChunkState(coord);
+        assert(refreshed.written && refreshed.version == revision && refreshed.commit_time_ms == time);
+        assert(reader.ScanPopulatedChunks(false, {}, 1024U).coords.empty());
+        assert(writer.ScanPopulatedChunks(false, {}, 1024U).coords.empty());
+        assert(writer.ScanCatalogBuildsForTests() == 0U);
+        assert(writer.ScanCachedLargeChunksMergedForTests() == 0U);
+    }
+    {
+        chunkdb::ChunkStore store(config);
+        const auto empty = store.ReadChunkState(coord);
+        assert(empty.written && empty.version == revision && empty.commit_time_ms == time);
+        assert(store.HasWrittenChunkIdentities());
+        store.SetBlockBits(-12, 28, "11001");
+        assert(store.GetBlockBits(-12, 28) == "11001");
+        assert(store.ReadChunkState(coord).version > revision);
+        assert(store.ScanPopulatedChunks(false, {}, 1024U).coords == std::vector{coord});
+        assert(store.ScanCatalogBuildsForTests() == 0U);
+    }
+}
+
+void TestTornHeaderAdmissionChecksCompleteSuffix() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-index-torn-header-admission");
+    const auto config = Config(dir.path());
+    std::vector<std::uint8_t> bytes;
+    std::filesystem::path wal;
+    {
+        chunkdb::ChunkStore store(config);
+        wal = chunkdb::ChunkWalPath(dir.path(), store.geometry(), {0, 0});
+        bytes = chunkdb::BuildWalHeader({0, 0}, store.store_id(), store.features());
+    }
+    const auto generation = Read(dir.path() / "chunkdb.snapshot");
+    const auto version = Read(dir.path() / "chunkdb.version");
+    bytes.back() ^= 1U;
+    bytes.resize(128U * 1024U, 0U);
+    bytes.back() = 1U;
+    std::filesystem::create_directories(wal.parent_path());
+    {
+        std::ofstream output(wal, std::ios::binary);
+        output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        output.close();
+        assert(output.good());
+    }
+    bool refused = false;
+    try { chunkdb::ChunkStore store(config); }
+    catch (const std::runtime_error& error) {
+        refused = std::string(error.what()).find("nonzero suffix") != std::string::npos;
+    }
+    assert(refused);
+    assert(Read(wal) == bytes);
+    assert(Read(dir.path() / "chunkdb.snapshot") == generation);
+    assert(Read(dir.path() / "chunkdb.version") == version);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -110,4 +186,6 @@ int main(int argc, char** argv) {
     if (selected == "all" || selected == "identity") TestNeverWrittenIdentity();
     if (selected == "all" || selected == "reservation") TestReadDoesNotReserveRevision();
     if (selected == "all" || selected == "refresh") TestReadOnlyRefreshDoesNotInventIdentity();
+    if (selected == "all" || selected == "collection") TestCollectedIdentitySurvivesRestart();
+    if (selected == "all" || selected == "admission") TestTornHeaderAdmissionChecksCompleteSuffix();
 }
