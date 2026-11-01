@@ -9,6 +9,7 @@
 #include "slot_watch.hpp"
 #include "server_feed.hpp"
 #include "feed_slot_records.hpp"
+#include "statement_control.hpp"
 
 namespace chunkdb {
 struct SlotAckDeadlineTestAccess {
@@ -207,6 +208,84 @@ void TakeoverUnwatchReturn(bool tls) {
     assert(Start(replacement->Read()).second == first);
     assert(Change(NextChange(*replacement)) == second);
     Unwatch(*replacement);
+}
+
+void TakeoverCancellation(bool tls) {
+    for (const bool before : {true, false}) {
+        for (const bool timeout : {false, true}) {
+            struct Reservation : FeedDeliveryTestHook {
+                explicit Reservation(bool before) : selected(before ? Point::kBeforeTakeoverReservation :
+                    Point::kAfterTakeoverReserved) {}
+                const Point selected;
+                std::mutex mutex;
+                std::condition_variable changed;
+                bool reached = false, released = false;
+                void Run(Point point, std::size_t) override {
+                    if (point != selected) return;
+                    std::unique_lock lock(mutex);
+                    reached = true;
+                    changed.notify_all();
+                    changed.wait(lock, [&] { return released; });
+                }
+                void Wait() {
+                    std::unique_lock lock(mutex);
+                    assert(changed.wait_for(lock, 10s, [&] { return reached; }));
+                }
+                void Release() { std::lock_guard lock(mutex); released = true; changed.notify_all(); }
+            } reservation(before);
+            Harness harness(tls);
+            auto writer = harness.Connect(); Create(*writer);
+            auto old = harness.Connect(); (void)Start(old->Command("WATCH t SLOT 'consumer'"));
+            const auto first = Set(*writer, 7);
+            assert(Change(NextChange(*old)) == first);
+            auto replacement = std::make_unique<Client>(harness.port, tls);
+            const auto id = Number(Field(replacement->Command(timeout ?
+                "HELLO 3 WITH statement_timeout_ms=1000" : "HELLO 3"), "connection_id"));
+            FeedDeliveryTestAccess::SetObserverHook(harness.server(), &reservation);
+            Cleanup clear([&] { reservation.Release(); FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+            replacement->Line("WATCH t SLOT 'consumer' TAKEOVER");
+            reservation.Wait();
+            if (timeout) {
+                const auto statement = FeedDeliveryTestAccess::CurrentStatement(harness.server(), id);
+                assert(statement && statement->deadline());
+                const auto token = statement->StopToken();
+                std::mutex timer_mutex;
+                std::condition_variable timer;
+                std::stop_callback stopped(token, [&] { std::lock_guard lock(timer_mutex); timer.notify_all(); });
+                std::unique_lock lock(timer_mutex);
+                if (before) {
+                    assert(timer.wait_until(lock, *statement->deadline() + 5s, [&] { return token.stop_requested(); }));
+                } else {
+                    assert(!timer.wait_until(lock, *statement->deadline(), [&] { return token.stop_requested(); }));
+                    assert(!statement->RequestStop(StatementStopReason::kTimeout));
+                }
+            } else {
+                const auto reply = writer->Command("CANCEL " + std::to_string(id));
+                assert(Boolean(Field(reply, "cancelled")) == before);
+            }
+            if (!before) {
+                old->Line("ACK " + std::to_string(first));
+                WaitAck(*writer, "t", "consumer", first);
+            }
+            reservation.Release();
+            if (before) {
+                const auto stopped = replacement->Read();
+                Error(stopped, timeout ? "TIMEOUT" : "CANCELLED");
+                assert(stopped.value.find("applied=false") != std::string::npos);
+                const auto next = Set(*writer, 8);
+                assert(Change(NextChange(*old)) == next);
+                old->Line("ACK " + std::to_string(next));
+                Unwatch(*old);
+                const auto pong = replacement->Command("PING");
+                assert(pong.type == '+' && pong.value == "PONG");
+            } else {
+                assert(Start(replacement->Read()).second == first);
+                Error(old->Read(), "KILLED");
+                Closed(*old);
+                Unwatch(*replacement);
+            }
+        }
+    }
 }
 
 void SlotRecordOutcome(bool tls) {
@@ -1477,6 +1556,7 @@ int main(int argc, char** argv) {
         run("conditional-objects", ConditionalObjects);
         run("slot-record-outcome", SlotRecordOutcome);
         run("takeover-fence", TakeoverFence); run("takeover", Takeover); run("takeover-rights", TakeoverRights); run("takeover-UNWATCH-return", TakeoverUnwatchReturn); run("takeover-stalled-socket", TakeoverStalledSocket);
+        run("takeover-cancellation", TakeoverCancellation);
         run("lifecycle", Lifecycle); run("rights", Rights); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("terminal-ACK", TerminalErrorBeforeAck);

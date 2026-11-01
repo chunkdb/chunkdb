@@ -735,6 +735,9 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
             owner = old->owner.lock();
             if (!owner || !owner->io_ready_.load(std::memory_order_acquire))
                 throw FeedSlotBusyError("feed slot owner is attaching or returning", "takeover_pending");
+            if (auto* hook = owner->hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeTakeoverReservation, 0U);
+            EnterStatementDecision();
             old->takeover_pending.store(true, std::memory_order_release);
         }
     }

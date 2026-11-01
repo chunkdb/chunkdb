@@ -27,7 +27,7 @@ struct FeedDeliveryTestHook {
         kAfterStatementQueued, kAfterFeedReplyQueue, kFeedInputBackpressure, kAfterRunningStopPublication,
         kBeforeReplyBufferWrite, kAfterReplyBufferWrite, kAfterBlockedReplyWrite, kAfterAuthReplyScheduled,
         kAfterPayloadCreditQueued, kAfterPayloadCreditGranted, kAfterStatementTrackerScan,
-        kBeforeBufferedStatementPublication };
+        kBeforeBufferedStatementPublication, kBeforeTakeoverReservation };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
 };

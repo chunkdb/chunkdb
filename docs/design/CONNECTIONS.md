@@ -81,6 +81,7 @@ Authorization uses currently published rights at control admission.
 Self-CANCEL returns false and self-KILL sends its control reply before closing.
 KILL discards a pending read-only reply and releases its retained state immediately; only an irreversible outcome and the self-KILL acknowledgement retain output ownership until their reply ends.
 WATCH has completed its initiating statement, so CANCEL returns false and KILL uses the existing accepted-ACK teardown.
+A slot takeover enters its irreversible decision before publishing its ownership reservation, because that reservation changes how the old owner can return its connection.
 Kill, cancel and feature activation emit audit events without statement parameters or credentials.
 
 ## User limits
