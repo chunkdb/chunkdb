@@ -15,8 +15,8 @@ BACKUP TO 'snapshot'
 OK
 1
 tables = 1
-files = 7
-bytes = 515
+files = 8
+bytes = 615
 cuts:
   1) table = world, epoch = <epoch>, revision = 1
 ```
@@ -42,6 +42,7 @@ chunkdb_server --data-dir /var/lib/chunkdb/restored
 ```
 
 Verification checks inventory, checksums, table cuts, and storage integrity without modifying the backup.
+The backup includes both column domains, coordinate-index boundaries, retained tombstones, and their deletion floors.
 Restore needs an absent or empty destination outside the backup directory.
 Stop any server intended to use that destination first.
 A server started without `--read-only` refuses a backup directory.
@@ -55,6 +56,7 @@ Earlier positions need their retained replay prefix; an unrelated epoch or unava
 Users retain passwords and rights; completed migrations retain names, text, and order.
 
 Restore publishes a checked successor clock before exposing the new epoch; it preserves committed chunk revisions.
+It also preserves chunk commit times and deletion floors while rebinding every index and log to the new table identity.
 After later crashes or restarts, missing chunk files cannot prove that no history was lost.
 Without durable proof, an exact-cut request also resyncs.
 Existing backed-up tables need `table_lineage` enabled on the source before creating their backup.

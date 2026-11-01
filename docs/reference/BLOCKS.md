@@ -29,14 +29,15 @@ NULL
 ## Syntax
 
 ```text
-GET BLOCK x y FROM table [COLUMNS column, ...] [WITH VERSION] [WITH SCHEMA]
-SET BLOCK x y IN table column = value [, ...] [IF VERSION version]
-DELETE BLOCK x y FROM table [IF VERSION version]
+GET BLOCK x y [z] FROM table [COLUMNS column, ...] [WITH VERSION] [WITH SCHEMA]
+SET BLOCK x y [z] IN table column = value [, ...] [IF VERSION version]
+DELETE BLOCK x y [z] FROM table [IF VERSION version]
 ```
 
 ## Arguments
 
-- `x`, `y`: signed block coordinates, from -9223372036854775808 to 9223372036854775807.
+- `x`, `y`, `z`: signed block coordinates, from -9223372036854775808 to 9223372036854775807.
+- Supply exactly two coordinates for a two-dimensional table and three for a three-dimensional table, including when `z` is zero.
 - `table`: the table containing the block.
 - `COLUMNS`: returned columns, in your requested order; omitting it uses schema order.
 - `WITH VERSION`: include the containing chunk's committed version with the row.
@@ -56,7 +57,8 @@ The metadata describes the returned row, including transaction snapshot reads.
 Transaction-private modified chunks have null versions until COMMIT.
 
 An absent block retains a version when its containing chunk retains a committed version.
-Never-written chunks and collected empty chunks have null versions.
+Collection preserves an empty chunk's producing version and time in a tombstone.
+Never-written chunks and chunks forgotten by [tombstone compaction](CHUNKS.md#tombstones) have null versions.
 The schema version is present even when the row is absent.
 
 ## Errors
@@ -74,6 +76,7 @@ The schema version is present even when the row is absent.
 
 A new block uses each omitted column's default, then NULL if allowed, then zero or empty.
 A REQUIRED column without a default must be supplied.
+A REQUIRED chunk column without a default must be initialized by a complete chunk form or `SET CHUNK ... META` before the first block write.
 Absent blocks differ from present blocks whose values are zero or NULL.
 A rejected value changes nothing.
 
