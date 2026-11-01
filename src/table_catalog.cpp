@@ -2095,7 +2095,8 @@ void TableCatalog::RewriteManifest(
     Table& table,
     const TableOptions& options,
     const std::function<void(StoreManifest*)>& change,
-    const char* dir_sync_failpoint) {
+    const char* dir_sync_failpoint,
+    const std::optional<TableSchema>& chunk_schema) {
     const TableOptions previous = table.Info().options;
     auto store = table.BeginExclusive();
     if (!store) throw TableNotFoundError("table was dropped");
@@ -2129,8 +2130,18 @@ void TableCatalog::RewriteManifest(
         const auto previous_schema = manifest->schema;
         const auto previous_chunk_schema = *manifest->chunk_schema;
         change(&*manifest);
+        if (chunk_schema) manifest->chunk_schema = *chunk_schema;
         AlignManifestSchemaDomains(&*manifest, previous_schema, previous_chunk_schema);
         RequireCompatibleColumnAdditions(previous_schema, manifest->schema, *store);
+        for (const auto& column : manifest->chunk_schema->columns) {
+            if (!column.required || column.has_default ||
+                std::any_of(previous_chunk_schema.columns.begin(), previous_chunk_schema.columns.end(),
+                    [&](const auto& old) { return old.id == column.id; })) continue;
+            if (store->HasWrittenChunkIdentities())
+                throw std::invalid_argument("chunk column " + column.name +
+                    ": a REQUIRED column added to a table needs a DEFAULT for its written chunk identities");
+            break;
+        }
         AtomicWrite(
             StoreManifestPath(table.dir_),
             SerializeStoreManifest(*manifest),
