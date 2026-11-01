@@ -1,4 +1,5 @@
 #include "wal_replay.hpp"
+#include "wal_replay_source.hpp"
 
 #include <algorithm>
 #include <cstring>
@@ -154,7 +155,8 @@ struct FrameShape {
     ParsedFrame* frame,
     std::string* stop_reason,
     bool* reaches_end,
-    bool* intact) {
+    bool* intact,
+    std::optional<std::uint64_t> file_remaining = std::nullopt) {
     // Set when the failing frame provably extends to the end of the file.
     *reaches_end = false;
     // Set once the whole frame is present and both CRCs match: a frame a
@@ -196,7 +198,7 @@ struct FrameShape {
     // The header is CRC-valid, so its declared extent can be trusted from
     // here on: any later failure is in a frame that ends at or past EOF
     // exactly when this holds.
-    *reaches_end = total64 >= remaining;
+    *reaches_end = total64 >= file_remaining.value_or(remaining);
     if (total64 > remaining) {
         // A crash inside one mutation's append: the frame is torn and is
         // ignored as a whole, which is what makes mutations all-or-nothing.
@@ -544,8 +546,8 @@ FeedFrameInfo InspectFeedFrame(
     return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc};
 }
 
-WalReplayResult ReplayWal(
-    const std::vector<std::uint8_t>& wal_bytes,
+WalReplayResult wal_detail::ReplayFromSource(
+    ReplaySource& source,
     const Geometry& geometry,
     const ChunkCoord& chunk_coord,
     const StoreId& store_id,
@@ -557,6 +559,7 @@ WalReplayResult ReplayWal(
     ChunkVars* vars,
     std::vector<WalFrameBoundary>* boundaries,
     std::shared_ptr<const ChunkColumnState>* chunk_columns) {
+    const auto& wal_bytes = source.Header();
     WalReplayResult result;
     if (boundaries != nullptr) boundaries->clear();
     if (payload == nullptr || presence_bitmap == nullptr) {
@@ -587,7 +590,7 @@ WalReplayResult ReplayWal(
         // Nothing applies; the state still ends at the current version.
         BringToCurrentSchema(geometry, base_schema_version, *presence_bitmap, payload, vars);
         BringChunkColumnsToSchema(geometry, base_schema_version, geometry.chunk_schema().version, chunk_columns);
-        if (IsInterruptedCreation(wal_bytes, chunk_coord, store_id, geometry.dims())) {
+        if (IsInterruptedCreation(wal_bytes, chunk_coord, store_id, geometry.dims()) && source.AllZeroAfterHeader()) {
             result.torn_creation = true;
             result.stop_reason = "torn_creation";
         } else {
@@ -643,20 +646,22 @@ WalReplayResult ReplayWal(
     std::size_t cursor = header_size;
     ParsedFrame frame;
     std::uint64_t previous_revision = 0;
-    while (cursor < wal_bytes.size()) {
+    while (cursor < source.Size()) {
+        const auto window = source.Frame(cursor);
+        const auto& frame_bytes = window.bytes;
         std::string stop_reason;
         bool reaches_end = false;
         bool intact = false;
         bool parsed =
-            ParseFrame(wal_bytes, cursor, geometry, may_skip_unknown,
+            ParseFrame(frame_bytes, window.offset, geometry, may_skip_unknown,
                        (store_features.incompat & kFeatureFeedSlots) != 0U,
-                       &frame, &stop_reason, &reaches_end, &intact);
+                       &frame, &stop_reason, &reaches_end, &intact, source.Size() - cursor);
         // Every mutation reserves a higher revision than the one before it
         // (under the chunk lock), so a frame that does not is damage.
         if (parsed && frame.revision <= previous_revision) {
             parsed = false;
             stop_reason = "frame_revision_order";
-            reaches_end = frame.size >= wal_bytes.size() - cursor;
+            reaches_end = frame.size >= source.Size() - cursor;
         }
         if (!parsed) {
             result.tail_truncated_or_corrupt = true;
@@ -665,7 +670,7 @@ WalReplayResult ReplayWal(
             // failure is damage (a writer bug, or a file from elsewhere) even
             // as the last frame; trimming it would drop a mutation silently.
             result.stopped_at_crash_tail =
-                !intact && (reaches_end || !HasValidFrameHeaderAfter(wal_bytes, cursor));
+                !intact && (reaches_end || !source.HasLaterFrameHeader(cursor));
             break;
         }
         previous_revision = frame.revision;
@@ -709,12 +714,12 @@ WalReplayResult ReplayWal(
             *chunk_columns = DefaultChunkColumnsAt(geometry, frame.schema_version);
         }
         if (!frame.var_ops.empty() || frame.var_replace.has_value()) {
-            ApplyFrameVars(wal_bytes, &frame, vars);
+            ApplyFrameVars(frame_bytes, &frame, vars);
         }
         for (const auto& span : frame.spans) {
             std::copy(
-                wal_bytes.data() + span.source,
-                wal_bytes.data() + span.source + span.size,
+                frame_bytes.data() + span.source,
+                frame_bytes.data() + span.source + span.size,
                 state.begin() + static_cast<std::ptrdiff_t>(span.offset));
         }
         result.applied_records += frame.record_count;
@@ -745,6 +750,26 @@ WalReplayResult ReplayWal(
         }
     }
     return result;
+}
+
+WalReplayResult ReplayWal(const std::vector<std::uint8_t>& bytes, const Geometry& geometry,
+    const ChunkCoord& coord, const StoreId& table_id, const FeatureFlags& features,
+    std::uint64_t base_revision, std::uint64_t base_schema_version,
+    std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence, ChunkVars* vars,
+    std::vector<WalFrameBoundary>* boundaries, std::shared_ptr<const ChunkColumnState>* chunk_columns) {
+    class MemorySource final : public wal_detail::ReplaySource {
+      public:
+        explicit MemorySource(const std::vector<std::uint8_t>& value) : bytes_(value) {}
+        std::size_t Size() const override { return bytes_.size(); }
+        const std::vector<std::uint8_t>& Header() const override { return bytes_; }
+        wal_detail::FrameWindow Frame(std::size_t position) override { return {bytes_, position}; }
+        bool AllZeroAfterHeader() override { return true; }
+        bool HasLaterFrameHeader(std::size_t position) override { return HasValidFrameHeaderAfter(bytes_, position); }
+      private:
+        const std::vector<std::uint8_t>& bytes_;
+    } source(bytes);
+    return wal_detail::ReplayFromSource(source, geometry, coord, table_id, features,
+        base_revision, base_schema_version, payload, presence, vars, boundaries, chunk_columns);
 }
 
 }  // namespace chunkdb
