@@ -14,6 +14,7 @@
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/schema.hpp"
 #include "feature_flags.hpp"
+#include "commit_group_owner_format.hpp"
 
 namespace chunkdb {
 
@@ -59,6 +60,7 @@ inline constexpr std::uint16_t kOptionFeedBufferBytes = 8;         // u64, > 0
 inline constexpr std::uint16_t kOptionSlotMaxBytes = 9;            // u64, > 0
 inline constexpr std::uint16_t kOptionParentEpoch = 10;            // 16-byte store id
 inline constexpr std::uint16_t kOptionForkRevision = 11;           // u64, including zero
+inline constexpr std::uint16_t kOptionCommitOwnerScope = 12;        // checked 40-byte immutable scope
 
 struct StoreManifest {
     FeatureFlags features{.incompat = kFeatureChunkModel | kFeatureCommitGroups};
@@ -75,6 +77,7 @@ struct StoreManifest {
     // Omitted only by block-only construction APIs; the encoded envelope
     // always contains its complete companion domain and shared history.
     std::optional<TableSchema> chunk_schema{};
+    std::optional<CommitOwnerScope> commit_owner{};
 };
 
 // Options area holding every option of `options`.
@@ -137,6 +140,7 @@ struct DataDirManifest {
     FeatureFlags features{.incompat = kFeatureChunkModel | kFeatureCommitGroups};
     StoreId data_dir_id{};
     std::vector<std::uint8_t> options;
+    std::optional<CommitOwnerScope> commit_owner{};
 };
 
 // Every version token a table of the directory issued is below the
@@ -144,6 +148,7 @@ struct DataDirManifest {
 // clock starts there, so a table dropped and created again under the same
 // name never reuses a token. 0 when the option is absent.
 inline constexpr std::uint16_t kDataDirOptionVersionFloor = 1;
+inline constexpr std::uint16_t kDataDirOptionCommitOwnerScope = 2;
 [[nodiscard]] std::uint64_t DataDirVersionFloor(const DataDirManifest& manifest);
 void SetDataDirVersionFloor(DataDirManifest* manifest, std::uint64_t floor);
 

@@ -13,6 +13,7 @@
 #include "feature_flags.hpp"
 #include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
+#include "commit_owner_bootstrap.hpp"
 #include "verify.hpp"
 #include "migrations_records.hpp"
 #include "wal_replay.hpp"
@@ -193,7 +194,9 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         RequireOpenableFeatures(directory_manifest.features, AccessMode::kReadWrite);
         const auto old_directory_id = directory_manifest.data_dir_id;
         const auto migrations = ReadMigrationRecords(temporary);
-        directory_manifest.data_dir_id = NewStoreId();
+        if (directory_manifest.commit_owner)
+            directory_manifest = CommitOwnerBootstrap::RewriteInactiveRestore(temporary, record);
+        else directory_manifest.data_dir_id = NewStoreId();
         if (directory_manifest.data_dir_id == old_directory_id) throw std::runtime_error("restore generated an existing data-directory id");
         AtomicWrite(DataDirManifestPath(temporary), SerializeDataDirManifest(directory_manifest), true, true);
         if (std::filesystem::exists(temporary / kMigrationsFileName))
@@ -248,6 +251,7 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
             AtomicWrite(directory / "chunkdb.version", SerializeVersionClockRecord(cut.revision + 1U), true, true);
             Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_FORK_CLOCK_ONCE");
             manifest.store_id = new_epoch;
+            manifest.commit_owner = directory_manifest.commit_owner;
             manifest.lineage = TableLineage{old_epoch, cut.revision};
             AtomicWrite(StoreManifestPath(directory), SerializeStoreManifest(manifest), true, true);
             cut.epoch = new_epoch;

@@ -5,6 +5,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <map>
+#include <set>
 #include <stdexcept>
 #include <system_error>
 
@@ -14,6 +15,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
 #include "store_manifest.hpp"
+#include "commit_owner_bootstrap.hpp"
 
 namespace chunkdb {
 namespace {
@@ -28,12 +30,19 @@ void ValidateStructure(const FeatureActivationJournal& journal) {
     const auto known = std::find_if(kFeatureRegistry.begin(), kFeatureRegistry.end(),
         [&](const auto& entry) { return entry.incompat == journal.feature && entry.incompat != kFeatureActivation; });
     if (known == kFeatureRegistry.end()) Bad("unknown or directory-only feature");
+    if (journal.feature == kFeatureCommitGroups) {
+        if (!journal.commit_owner || journal.commit_owner->role != CommitOwnerRole::kCatalog ||
+            journal.commit_owner->directory_id != journal.data_dir_id) Bad("missing or incompatible group owner scope");
+        (void)SerializeCommitOwnerScope(*journal.commit_owner);
+    } else if (journal.commit_owner) Bad("owner scope on a nongroup decision");
     if (journal.tables.size() > kMaxFeatureJournalTables) Bad("too many tables");
     std::string_view previous;
+    std::set<StoreId> epochs;
     for (const auto& target : journal.tables) {
         if (!IsValidTableName(target.name)) Bad("invalid table name");
         if (!previous.empty() && previous >= target.name) Bad("tables are duplicated or unordered");
         if (target.table_id == StoreId{}) Bad("zero table identity");
+        if (!epochs.insert(target.table_id).second) Bad("duplicate table epoch");
         previous = target.name;
     }
 }
@@ -43,12 +52,24 @@ class Reader {
     explicit Reader(const std::vector<std::uint8_t>& bytes) : bytes_(bytes) {
         if (bytes.size() < 36U || bytes.size() > kMaxFeatureJournalBytes) Bad("file size");
         end_ = bytes.size() - 4U;
+        version_ = ReadLe16(bytes, 4U);
         if (!std::equal(kMagic.begin(), kMagic.end(), bytes.begin()) ||
-            ReadLe16(bytes, 4U) != 1U || ReadLe16(bytes, 6U) != 0U)
+            (version_ != 1U && version_ != 2U) || ReadLe16(bytes, 6U) != 0U)
             Bad("magic, version or reserved field");
         if (ReadLe32(bytes, end_) != Crc32(bytes.data(), end_)) Bad("checksum");
     }
     std::uint32_t U32() { Need(4U); auto value = ReadLe32(bytes_, at_); at_ += 4U; return value; }
+    std::optional<CommitOwnerScope> Scope(std::uint32_t feature) {
+        if (version_ == 1U) {
+            if (feature == kFeatureCommitGroups) Bad("historical journal cannot own commit_groups");
+            return {};
+        }
+        Need(kCommitOwnerScopeBytes);
+        const auto bytes = std::span(bytes_).subspan(at_, kCommitOwnerScopeBytes); at_ += kCommitOwnerScopeBytes;
+        if (feature == kFeatureCommitGroups) return ParseCommitOwnerScope(bytes);
+        if (!std::all_of(bytes.begin(), bytes.end(), [](auto byte) { return byte == 0U; })) Bad("nongroup scope is not zero");
+        return {};
+    }
     StoreId Id() {
         Need(16U); StoreId id;
         std::copy_n(bytes_.begin() + static_cast<std::ptrdiff_t>(at_), id.size(), id.begin());
@@ -61,10 +82,12 @@ class Reader {
         at_ += length; return value;
     }
     void End() const { if (at_ != end_) Bad("trailing bytes"); }
+    std::size_t Remaining() const noexcept { return end_ - at_; }
   private:
     void Need(std::size_t count) const { if (count > end_ - at_) Bad("truncated field"); }
     const std::vector<std::uint8_t>& bytes_;
     std::size_t at_ = 8U, end_ = 0U;
+    std::uint16_t version_ = 0U;
 };
 
 struct Participants {
@@ -77,6 +100,20 @@ Participants ValidateParticipants(const std::filesystem::path& root, const Featu
     const auto directory = ReadDataDirManifest(root);
     if (!directory || directory->data_dir_id != journal.data_dir_id) Bad("data-directory identity changed");
     RequireOpenableFeatures(directory->features, AccessMode::kReadWrite);
+    if (journal.feature == kFeatureCommitGroups && directory->commit_owner && directory->commit_owner != journal.commit_owner)
+        Bad("directory owner differs from activation decision");
+    const auto owner_scope = directory->commit_owner ? directory->commit_owner : journal.commit_owner;
+    if (owner_scope) {
+        CommitOwnerArtifactIo owner(root, *owner_scope);
+        const auto selected = owner.ReadCanonicalRoot();
+        CommitOwnerRoot inactive; inactive.scope = *owner_scope;
+        if (selected && selected->value != inactive) Bad("owner is not the initial INACTIVE state");
+        if (directory->commit_owner && !selected) Bad("claimed canonical owner is missing");
+        if (!directory->commit_owner && selected && ReadFeatureActivationJournal(root) != std::optional(journal))
+            Bad("unclaimed canonical owner has no matching persisted activation");
+    } else if (std::filesystem::symlink_status(root / "chunkdb.groups.owner").type() != std::filesystem::file_type::not_found) {
+        Bad("unclaimed canonical owner exists");
+    }
     if (require_activation && (directory->features.incompat & kFeatureActivation) == 0U) Bad("missing feature_activation ownership");
     std::error_code pending_error;
     const auto migration = std::filesystem::symlink_status(root / "chunkdb.migration.pending", pending_error);
@@ -107,6 +144,10 @@ Participants ValidateParticipants(const std::filesystem::path& root, const Featu
         if (!manifest || manifest->store_id != target.table_id) Bad("table identity changed: " + target.name);
         RequireOpenableFeatures(manifest->features, AccessMode::kReadWrite);
         if ((manifest->features.incompat & kFeatureActivation) != 0U) Bad("directory-only feature on table: " + target.name);
+        if (journal.feature == kFeatureCommitGroups) {
+            if (manifest->commit_owner && manifest->commit_owner != journal.commit_owner) Bad("table owner differs from activation decision");
+            if (manifest->commit_owner && !directory->commit_owner) Bad("table owner was published before the directory owner");
+        } else if (manifest->commit_owner != directory->commit_owner) Bad("existing table owner differs from its directory");
         result.tables.push_back(std::move(*manifest)); ++found;
     }
     return result;
@@ -116,9 +157,13 @@ Participants ValidateParticipants(const std::filesystem::path& root, const Featu
 std::vector<std::uint8_t> EncodeFeatureActivationJournal(const FeatureActivationJournal& journal) {
     ValidateStructure(journal);
     std::vector<std::uint8_t> bytes(kMagic.begin(), kMagic.end());
-    WriteLe16(bytes, 1U); WriteLe16(bytes, 0U);
+    WriteLe16(bytes, 2U); WriteLe16(bytes, 0U);
     bytes.insert(bytes.end(), journal.data_dir_id.begin(), journal.data_dir_id.end());
     WriteLe32(bytes, journal.feature); WriteLe32(bytes, static_cast<std::uint32_t>(journal.tables.size()));
+    if (journal.commit_owner) {
+        const auto scope = SerializeCommitOwnerScope(*journal.commit_owner);
+        bytes.insert(bytes.end(), scope.begin(), scope.end());
+    } else bytes.resize(bytes.size() + kCommitOwnerScopeBytes, 0U);
     for (const auto& target : journal.tables) {
         bytes.push_back(static_cast<std::uint8_t>(target.name.size()));
         bytes.insert(bytes.end(), target.name.begin(), target.name.end());
@@ -133,7 +178,8 @@ FeatureActivationJournal DecodeFeatureActivationJournal(const std::vector<std::u
     FeatureActivationJournal journal;
     journal.data_dir_id = reader.Id(); journal.feature = reader.U32();
     const auto count = reader.U32();
-    if (count > kMaxFeatureJournalTables || count > (bytes.size() - 36U) / 18U) Bad("table count");
+    journal.commit_owner = reader.Scope(journal.feature);
+    if (count > kMaxFeatureJournalTables || count > reader.Remaining() / 18U) Bad("table count");
     journal.tables.reserve(count);
     for (std::uint32_t i = 0; i < count; ++i) journal.tables.push_back({reader.Name(), reader.Id()});
     reader.End(); ValidateStructure(journal); return journal;
@@ -176,10 +222,16 @@ void WriteFeatureActivationJournal(const std::filesystem::path& root, const Feat
     Crash("CHUNKDB_FAILPOINT_CRASH_FEATURE_AFTER_DECISION_ONCE");
 }
 
-void CompleteFeatureActivationJournal(const std::filesystem::path& root, const FeatureActivationJournal& journal) {
+void CompleteFeatureActivationJournal(const std::filesystem::path& root, const FeatureActivationJournal& journal,
+    const ProcessLock* exclusive_lock) {
     auto participants = ValidateParticipants(root, journal);
     const auto decision = ReadFeatureActivationJournal(root);
     if (!decision || *decision != journal) Bad("decision identity changed");
+    if (journal.feature == kFeatureCommitGroups) {
+        if (!exclusive_lock) Bad("group activation requires its native exclusive owner");
+        CommitOwnerBootstrap::CompleteFeatureOwner(root, *exclusive_lock);
+        participants.directory.commit_owner = journal.commit_owner;
+    }
     participants.directory.features.incompat |= journal.feature;
     Crash("CHUNKDB_FAILPOINT_CRASH_FEATURE_ROOT_BEFORE_PUBLISH_ONCE");
     AtomicWrite(DataDirManifestPath(root), SerializeDataDirManifest(participants.directory), true, true,
@@ -188,6 +240,7 @@ void CompleteFeatureActivationJournal(const std::filesystem::path& root, const F
     const bool table_scoped = (journal.feature & kTableBaselineFeatures.incompat) != 0U;
     for (std::size_t i = 0; table_scoped && i < journal.tables.size(); ++i) {
         participants.tables[i].features.incompat |= journal.feature;
+        if (journal.feature == kFeatureCommitGroups) participants.tables[i].commit_owner = journal.commit_owner;
         const auto prefix = "CHUNKDB_FAILPOINT_FEATURE_TABLE_" + std::to_string(i);
         Crash((prefix + "_BEFORE_PUBLISH_ONCE").c_str());
         const auto failure = prefix + "_SYNC_FAIL_ONCE";
@@ -203,12 +256,12 @@ void CompleteFeatureActivationJournal(const std::filesystem::path& root, const F
     Crash("CHUNKDB_FAILPOINT_CRASH_FEATURE_AFTER_PENDING_REMOVE_ONCE");
 }
 
-void RecoverFeatureActivation(const std::filesystem::path& root, AccessMode access_mode) {
+void RecoverFeatureActivation(const std::filesystem::path& root, AccessMode access_mode, const ProcessLock* exclusive_lock) {
     if (const auto journal = ReadFeatureActivationJournal(root)) {
         ValidateFeatureActivationJournal(root, *journal);
         if (access_mode == AccessMode::kReadOnly)
             throw std::runtime_error("feature activation recovery requires a read-write open");
-        CompleteFeatureActivationJournal(root, *journal);
+        CompleteFeatureActivationJournal(root, *journal, exclusive_lock);
     }
     if (access_mode == AccessMode::kReadWrite) CleanupAtomicTmpArtifacts(root / kFeaturePendingFileName);
 }

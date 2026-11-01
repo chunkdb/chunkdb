@@ -44,7 +44,8 @@ struct Fixture {
     explicit Fixture(std::uint8_t dims = 2U, bool required = false)
         : config(Shape(dims)), manifest(Manifest(config, required)),
           geometry(config, manifest.schema, *manifest.chunk_schema) {
-        Save(DataDirManifestPath(directory.path()), SerializeDataDirManifest({.data_dir_id = StoreId{9U}, .options = {}}));
+        Save(DataDirManifestPath(directory.path()), SerializeDataDirManifest({.features = {.incompat = kFeatureChunkModel},
+            .data_dir_id = StoreId{9U}, .options = {}}));
         Save(StoreManifestPath(root), SerializeStoreManifest(manifest));
         Save(root / "chunkdb.version", SerializeVersionClockRecord(1000U));
         Inventory({});
@@ -57,7 +58,7 @@ struct Fixture {
         return shape;
     }
     static StoreManifest Manifest(const GeometryConfig& shape, bool required) {
-        StoreManifest value{.geometry = shape, .store_id = StoreId{1U},
+        StoreManifest value{.features = {.incompat = kFeatureChunkModel}, .geometry = shape, .store_id = StoreId{1U},
             .options = EncodeTableOptions(TableOptions{}), .schema = SingleBitsColumnSchema(8U),
             .chunk_schema = TableSchema{}};
         if (required) {

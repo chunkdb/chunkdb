@@ -28,6 +28,7 @@
 #include "feed_slot_records.hpp"
 #include "migrations_records.hpp"
 #include "store_manifest.hpp"
+#include "commit_owner_bootstrap.hpp"
 #include "txn_history.hpp"
 #include "wal_replay.hpp"
 #include "populated_index_format.hpp"
@@ -547,7 +548,8 @@ void VerifyFeedArtifacts(
 
 // Verifies one table directory (a store): its manifest, bookkeeping, chunk
 // images, WALs and conditional intents.
-void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters) {
+void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters,
+    const std::optional<chunkdb::CommitOwnerScope>& owner_scope) {
     bool initialized_marker_present = false;
     bool has_storage_artifacts = false;
 
@@ -560,6 +562,8 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
     try {
         const auto manifest = chunkdb::ReadStoreManifest(data_dir);
         if (manifest.has_value()) {
+            if (manifest->commit_owner != owner_scope)
+                throw std::runtime_error("table owner scope differs from its admitted catalog");
             ReportFeatures(counters, manifest_path, manifest->features);
             if ((manifest->features.incompat & chunkdb::kFeatureActivation) != 0U ||
                 (manifest->features.incompat & chunkdb::kFeatureMigrations) != 0U)
@@ -1002,6 +1006,21 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
 void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounters* counters) {
     const auto manifest_path = chunkdb::DataDirManifestPath(data_dir);
     bool check_tables = false;
+    std::optional<chunkdb::CommitOwnerScope> owner_scope;
+    try {
+        if (const auto pending = chunkdb::CommitOwnerBootstrap::ReadPending(data_dir)) {
+            if (pending->kind != chunkdb::CommitOwnerBootstrapKind::kDirectory)
+                throw std::runtime_error("standalone creation decision is not a catalog decision");
+            const auto existing = chunkdb::ReadDataDirManifest(data_dir);
+            if (existing && chunkdb::SerializeDataDirManifest(*existing) != pending->manifest)
+                throw std::runtime_error("manifest differs from creation decision");
+            Report(counters, false, "owner_bootstrap_pending", data_dir / chunkdb::kCommitOwnerBootstrapName,
+                "initial owner publication requires a read-write open");
+            if (!existing) return;
+        }
+    } catch (const std::exception& error) {
+        Report(counters, true, "owner_bootstrap_invalid", data_dir, error.what()); return;
+    }
     ++counters->checked;
     try {
         const auto manifest = chunkdb::ReadDataDirManifest(data_dir);
@@ -1010,6 +1029,8 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
                 counters, true, "data_dir_manifest_missing", manifest_path,
                 "not an initialized chunkdb data directory; tables were not checked");
         } else {
+            owner_scope = manifest->commit_owner;
+            if (owner_scope) (void)chunkdb::CommitOwnerBootstrap::ReadInactiveRoot(data_dir, *owner_scope);
             ReportFeatures(counters, manifest_path, manifest->features);
             const auto unknown = chunkdb::UnknownFeatures(manifest->features);
             if (unknown.incompat != 0U) {
@@ -1053,11 +1074,13 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
     }
 
     std::uint32_t pending_feature = 0U;
+    std::optional<chunkdb::CommitOwnerScope> pending_owner;
     ++counters->checked;
     try {
         if (const auto journal = chunkdb::ReadFeatureActivationJournal(data_dir)) {
             chunkdb::ValidateFeatureActivationJournal(data_dir, *journal);
             pending_feature = journal->feature;
+            pending_owner = journal->commit_owner;
             Report(counters, false, "feature_recovery_pending", data_dir / chunkdb::kFeaturePendingFileName,
                 "activation decision requires a read-write start to finish publication");
         }
@@ -1069,6 +1092,7 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         const auto name = entry.path().filename().string();
         if (name == chunkdb::kDataDirManifestFileName || name == chunkdb::kBackupMarkerName || name == "tables" ||
             name == chunkdb::kMigrationsFileName || name == chunkdb::kMigrationPendingFileName || name == chunkdb::kFeaturePendingFileName ||
+            name == "chunkdb.groups.owner" || name == chunkdb::kCommitOwnerBootstrapName ||
             name.rfind(".chunkdb.lock", 0) == 0) {
             continue;
         }
@@ -1126,8 +1150,25 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         tables.push_back(entry.path());
     }
     std::sort(tables.begin(), tables.end());
+    std::set<chunkdb::StoreId> epochs;
+    bool scopes_valid = true;
     for (const auto& table : tables) {
-        VerifyTable(table, counters);
+        try {
+            const auto manifest = chunkdb::ReadStoreManifest(table);
+            if (!manifest || !epochs.insert(manifest->store_id).second) throw std::runtime_error("missing manifest or duplicate table epoch");
+            const auto expected = pending_owner ? pending_owner : owner_scope;
+            if (manifest->commit_owner != expected && !(pending_owner && !manifest->commit_owner))
+                throw std::runtime_error("table owner scope differs from its admitted catalog");
+        } catch (const std::exception& error) {
+            scopes_valid = false;
+            Report(counters, true, "feature_ownership_invalid", table, error.what());
+        }
+    }
+    if (!scopes_valid) return;
+    for (const auto& table : tables) {
+        const auto table_manifest = chunkdb::ReadStoreManifest(table);
+        VerifyTable(table, counters, table_manifest->commit_owner ? (pending_owner ? pending_owner : owner_scope) :
+            std::optional<chunkdb::CommitOwnerScope>{});
         if (check_tables) {
             try {
                 const auto root = chunkdb::ReadDataDirManifest(data_dir);

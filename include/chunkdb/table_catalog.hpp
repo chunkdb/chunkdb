@@ -36,6 +36,8 @@ struct MigrationRecord;
 class UserRegistry;
 
 class ProcessLock;
+class CommitOwnerDirectoryContext;
+class CommitOwnerContext;
 class SlotWatch;
 struct FeedSlotClaim;
 struct FeedSlotAckState;
@@ -527,7 +529,8 @@ class TableCatalog {
         const std::filesystem::path& dir,
         const GeometryConfig& geometry,
         std::uint32_t geometry_fields,
-        const TableOptions& options);
+        const TableOptions& options,
+        std::shared_ptr<const CommitOwnerContext> owner_admission = {});
     // " --flag value (table 'name' stores value)" for every option named in
     // default_option_fields that differs from `stored`; empty when none.
     [[nodiscard]] std::string OptionFlagMismatches(
@@ -570,6 +573,7 @@ class TableCatalog {
     CatalogConfig config_;
     std::shared_ptr<StoreResources> resources_;
     std::unique_ptr<ProcessLock> process_lock_;
+    std::shared_ptr<const CommitOwnerDirectoryContext> commit_owner_context_;
     // Serializes Create, Drop and SetOptions.
     mutable std::mutex operations_mutex_;
     std::mutex backup_mutex_;

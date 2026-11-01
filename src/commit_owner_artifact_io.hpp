@@ -3,12 +3,19 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <span>
+#include <string>
+#include <vector>
 
 #include "commit_group_owner_format.hpp"
 
 namespace chunkdb {
 
 class ProcessLock;
+class CommitOwnerContext;
+class CommitOwnerDirectoryContext;
+class CommitOwnerBootstrap;
+class CommitOwnerStoreAdmission;
 
 struct CommitOwnerRootArtifact {
     CommitOwnerObjectRef reference;
@@ -44,7 +51,25 @@ class CommitOwnerArtifactIo {
     [[nodiscard]] CommitOwnerStagedArtifact StagePage(const CommitOwnerPage& value);
 
   private:
+    friend class CommitOwnerContext;
+    friend class CommitOwnerDirectoryContext;
+    friend class CommitOwnerBootstrap;
+    friend class CommitOwnerStoreAdmission;
     struct Impl;
+    explicit CommitOwnerArtifactIo(std::unique_ptr<Impl> impl);
+    [[nodiscard]] std::shared_ptr<CommitOwnerArtifactIo> PinDirectories(std::span<const std::string> names) const;
+    [[nodiscard]] bool MatchesDirectory(const std::filesystem::path& directory) const;
+    [[nodiscard]] std::vector<std::string> CatalogTableNames() const;
+    [[nodiscard]] std::optional<std::vector<std::uint8_t>> ReadManifestBytes(bool directory) const;
+    [[nodiscard]] static std::shared_ptr<CommitOwnerArtifactIo> OpenBootstrapDirectory(const std::filesystem::path& directory);
+    [[nodiscard]] std::optional<std::vector<std::uint8_t>> ReadBootstrapBytes() const;
+    void PublishBootstrapBytes(std::span<const std::uint8_t> bytes);
+    void SyncFeatureDecision(std::span<const std::uint8_t> bytes);
+    void PublishInactive();
+    void RequireRestoreGuard() const;
+    void RewriteRestoredInactive(const CommitOwnerScope& source_scope, const CommitOwnerScope& destination_scope);
+    [[nodiscard]] std::optional<std::vector<std::uint8_t>> ReadEmptyInventoryBytes() const;
+    void RequireNoPendingMetadata() const;
     std::unique_ptr<Impl> impl_;
 };
 

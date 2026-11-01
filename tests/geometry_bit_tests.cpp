@@ -81,6 +81,7 @@ int main() {
         assert(decoded.payload == payload && decoded.presence_bitmap == presence && decoded.revision == 1U);
         ExpectThrows<std::invalid_argument>([&] { (void)chunkdb::BuildWalHeader({0, 0, 1}, id, {}); });
         chunkdb::StoreManifest manifest;
+        manifest.features = {.incompat = chunkdb::kFeatureChunkModel};
         manifest.geometry = config;
         manifest.schema = chunkdb::SingleBitsColumnSchema(config.block_bits);
         manifest.store_id = id;

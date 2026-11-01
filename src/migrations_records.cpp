@@ -317,12 +317,14 @@ void ValidateStructure(const MigrationJournal& journal) {
         Bad("ledger is not the exact next append");
 }
 
-void CheckDirectory(const std::filesystem::path& path, const StoreId& id) {
+void CheckDirectory(const std::filesystem::path& path, const StoreId& id, const std::optional<CommitOwnerScope>& scope) {
     std::error_code error;
     const auto status = std::filesystem::symlink_status(path, error);
     if (error || status.type() != std::filesystem::file_type::directory) Bad("missing or invalid table directory: " + path.string());
     const auto image = ReadBytes(path / kStoreManifestFileName, kStoreManifestMaxSize);
-    if (!image || ParseStoreManifest(*image).store_id != id) Bad("directory table identity: " + path.string());
+    if (!image) Bad("directory table manifest: " + path.string());
+    const auto manifest = ParseStoreManifest(*image);
+    if (manifest.store_id != id || manifest.commit_owner != scope) Bad("directory table identity or owner: " + path.string());
 }
 bool Present(const std::filesystem::path& path) {
     std::error_code error;
@@ -437,11 +439,28 @@ void ValidateMigrationJournal(const std::filesystem::path& root, const Migration
     if (!manifest || manifest->data_dir_id != journal.data_dir_id ||
         (manifest->features.incompat & kFeatureMigrations) == 0U) Bad("source data-directory identity or feature");
     RequireOpenableFeatures(manifest->features, AccessMode::kReadWrite);
+    if (journal.directory_action == MigrationDirectoryAction::kCreate) {
+        for (const auto& entry : std::filesystem::directory_iterator(root / "tables")) {
+            const auto name = entry.path().filename().string();
+            if (!IsValidTableName(name) || name == journal.table ||
+                entry.symlink_status().type() != std::filesystem::file_type::directory) continue;
+            const auto other = ReadStoreManifest(entry.path());
+            if (!other || other->store_id == journal.table_id) Bad("created table epoch collides with the existing inventory");
+        }
+    }
     if (journal.directory_action == MigrationDirectoryAction::kDrop && Present(root / kUsersFileName) &&
         std::none_of(journal.files.begin(), journal.files.end(), [](const auto& file) { return file.path == kUsersFileName; }))
         Bad("dropped table users participant is missing");
     for (const auto& file : journal.files) {
         SafePath(root, file.path);
+        const auto validate_scope = [&](const Bytes& bytes) {
+            if (file.path == kDataDirManifestFileName && ParseDataDirManifest(bytes).commit_owner != manifest->commit_owner)
+                Bad("directory participant changes owner scope");
+            if (file.path == "tables/" + journal.table + "/" + std::string(kStoreManifestFileName) &&
+                ParseStoreManifest(bytes).commit_owner != manifest->commit_owner) Bad("table participant changes owner scope");
+        };
+        if (file.before) validate_scope(*file.before);
+        validate_scope(file.after);
         if (file.path == "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName)) {
             SafePath(root, "tables/" + journal.table + "/" + std::string(kStoreManifestFileName));
             const auto table = ReadStoreManifest(root / "tables" / journal.table);
@@ -464,7 +483,7 @@ void ValidateMigrationJournal(const std::filesystem::path& root, const Migration
         const auto target = "tables/" + journal.table;
         SafePath(root, target);
         if (journal.directory_action == MigrationDirectoryAction::kNone) {
-            CheckDirectory(root / target, journal.table_id);
+            CheckDirectory(root / target, journal.table_id, manifest->commit_owner);
         } else {
             const auto operation = std::string(journal.directory_action == MigrationDirectoryAction::kCreate ?
                                                ".chunkdb.staging/" : ".chunkdb.dropped/") + journal.operation_name;
@@ -472,7 +491,7 @@ void ValidateMigrationJournal(const std::filesystem::path& root, const Migration
             const bool table_present = Present(root / target);
             const bool operation_present = Present(root / operation);
             if (table_present == operation_present) Bad("ambiguous directory operation");
-            CheckDirectory(root / (table_present ? target : operation), journal.table_id);
+            CheckDirectory(root / (table_present ? target : operation), journal.table_id, manifest->commit_owner);
         }
     }
     if (LedgerOnly(journal)) {

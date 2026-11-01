@@ -28,6 +28,7 @@
 #include "feature_flags.hpp"
 #include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
+#include "commit_owner_bootstrap.hpp"
 #include "wal_replay.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "shared_file_input.hpp"
@@ -410,11 +411,18 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
     if (Present(root / kUsersFileName)) (void)DecodeUsers(LoadFile(root / kUsersFileName));
     (void)ReadMigrationRecords(root);
     std::set<std::string> allowed{"chunkdb.manifest", "chunkdb.users", std::string(kMigrationsFileName)};
+    if (directory_manifest.commit_owner) {
+        (void)CommitOwnerBootstrap::ReadInactiveRoot(root, *directory_manifest.commit_owner);
+        allowed.insert("chunkdb.groups.owner");
+    }
+    std::set<StoreId> epochs;
     for (const auto& cut : record.tables) {
         Cancelled(cancelled);
         const auto dir = root / "tables" / cut.name;
         const auto manifest = ReadStoreManifest(dir);
         if (!manifest || manifest->store_id != cut.epoch) throw std::runtime_error("backup table epoch mismatch: " + cut.name);
+        if (manifest->commit_owner != directory_manifest.commit_owner) throw std::runtime_error("backup table owner scope mismatch");
+        if (!epochs.insert(manifest->store_id).second) throw std::runtime_error("backup contains duplicate table epochs");
         RequireOpenableFeatures(manifest->features, AccessMode::kReadOnly);
         Geometry geometry(manifest->geometry, manifest->schema, *manifest->chunk_schema);
         std::uint64_t ceiling = 0U, generation = 0U;

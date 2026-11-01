@@ -77,11 +77,14 @@ FeatureActivationJournal Seed(const std::filesystem::path& root) {
     }
     auto directory = *ReadDataDirManifest(root);
     directory.features = {.incompat = kFeatureActivation | kFeatureChunkModel, .compat = 1U << 30U};
+    directory.commit_owner.reset();
     Save(DataDirManifestPath(root), SerializeDataDirManifest(directory));
+    assert(std::filesystem::remove(root / "chunkdb.groups.owner"));
     FeatureActivationJournal journal{directory.data_dir_id, kFeatureSlotFilters, {}};
     for (const char* name : {"alpha", "beta"}) {
         auto manifest = *ReadStoreManifest(root / "tables" / name);
         manifest.features = {.incompat = kFeatureFeedSlots | kFeatureChunkModel, .compat = 1U << 29U};
+        manifest.commit_owner.reset();
         manifest.options.insert(manifest.options.end(), {99, 0, 1, 0, 0xAC});
         Save(StoreManifestPath(root / "tables" / name), SerializeStoreManifest(manifest));
         journal.tables.push_back({name, manifest.store_id});
@@ -267,7 +270,7 @@ void Codec() {
     const auto good = EncodeFeatureActivationJournal(journal);
     assert(DecodeFeatureActivationJournal(good) == journal);
     auto bad = good; bad[0] ^= 1U; Reject([&] { (void)DecodeFeatureActivationJournal(Checksum(bad)); }, "magic");
-    bad = good; bad[4] = 2; Reject([&] { (void)DecodeFeatureActivationJournal(Checksum(bad)); }, "version");
+    bad = good; bad[4] = 3; Reject([&] { (void)DecodeFeatureActivationJournal(Checksum(bad)); }, "version");
     bad = good; bad[6] = 1; Reject([&] { (void)DecodeFeatureActivationJournal(Checksum(bad)); }, "reserved");
     bad = good; bad[10] ^= 1U; Reject([&] { (void)DecodeFeatureActivationJournal(bad); }, "checksum");
     bad = good; bad.insert(bad.end() - 4, 0); Reject([&] { (void)DecodeFeatureActivationJournal(Checksum(bad)); }, "trailing");

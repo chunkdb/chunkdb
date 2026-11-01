@@ -64,7 +64,7 @@ void ManifestDomainsAndAdmission() {
         status.type = {ColumnKind::kUnsigned, 8};
         chunks = AddChunkColumn(chunks, status);
         blocks = AdvanceOtherDomain(blocks, ColumnDomain::kBlock);
-        const StoreManifest manifest{.geometry = geometry.config(), .store_id = kEpoch, .options = {},
+        const StoreManifest manifest{.features = kFeatures, .geometry = geometry.config(), .store_id = kEpoch, .options = {},
             .schema = blocks, .chunk_schema = chunks};
         const auto bytes = SerializeStoreManifest(manifest);
         assert(ReadLe16(bytes, 4U) == 5 && bytes[20] == dims);
@@ -96,7 +96,8 @@ void ManifestDomainsAndAdmission() {
         misaligned.chunk_schema = TableSchema{};
         Reject([&] { (void)SerializeStoreManifest(misaligned); }, "revisions differ");
     }
-    const DataDirManifest directory{.data_dir_id = kEpoch, .options = {}};
+    const DataDirManifest directory{.data_dir_id = kEpoch, .options = {},
+        .commit_owner = CommitOwnerScope{kEpoch, {2U}, CommitOwnerRole::kCatalog}};
     auto bytes = SerializeDataDirManifest(directory);
     assert(ReadLe16(bytes, 4U) == 2U && ReadLe32(bytes, 8U) == (kChunkModelFormatBit | kFeatureCommitGroups));
     assert(ParseDataDirManifest(bytes).data_dir_id == kEpoch);

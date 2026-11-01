@@ -118,8 +118,10 @@ int main() {
     const auto root = directory.path() / "tables/t";
     const Geometry geometry({2U, 2U, 256U, 256U, 8U});
     const StoreId id{1U};
-    Save(DataDirManifestPath(directory.path()), SerializeDataDirManifest({.data_dir_id = StoreId{9U}, .options = {}}));
-    Save(StoreManifestPath(root), SerializeStoreManifest({.geometry = geometry.config(), .store_id = id,
+    Save(DataDirManifestPath(directory.path()), SerializeDataDirManifest({.features = {.incompat = kFeatureChunkModel},
+        .data_dir_id = StoreId{9U}, .options = {}}));
+    Save(StoreManifestPath(root), SerializeStoreManifest({.features = {.incompat = kFeatureChunkModel},
+        .geometry = geometry.config(), .store_id = id,
         .options = EncodeTableOptions(TableOptions{}), .schema = geometry.layout().schema()}));
     std::ostringstream inventory;
     WriteIndexInventory(inventory, {.table_id = id}, {});

@@ -15,6 +15,10 @@
 #include "commit_owner_artifact_identity.hpp"
 #include "file_permissions.hpp"
 #include "process_lock.hpp"
+#include "chunkdb/table_catalog.hpp"
+#include "store_manifest.hpp"
+#include "commit_owner_bootstrap.hpp"
+#include "populated_index_format.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -170,7 +174,8 @@ Native OpenRoot(const std::filesystem::path& path, bool writable) {
 }
 // Every name supplied here is fixed or locally derived, never persisted text.
 Native OpenChild(const Native& parent, const std::string& name, bool directory, bool writable,
-    bool create, bool missing_ok, const std::filesystem::path& label, bool metadata_only = false) {
+    bool create, bool missing_ok, const std::filesystem::path& label, bool metadata_only = false,
+    bool directory_rename = false) {
     if (name.empty() || name.find_first_of("/\\") != std::string::npos || name == "." || name == "..")
         Damage("invalid internal leaf name");
 #ifdef _WIN32
@@ -189,7 +194,7 @@ Native OpenChild(const Native& parent, const std::string& name, bool directory, 
     if (!metadata_only) access |= GENERIC_READ;
     if (writable) access |= GENERIC_WRITE;
     if (create && !directory) access |= DELETE;
-    const ULONG share = FILE_SHARE_READ | FILE_SHARE_WRITE | (directory ? 0U : FILE_SHARE_DELETE);
+    const ULONG share = FILE_SHARE_READ | FILE_SHARE_WRITE | (directory && !directory_rename ? 0U : FILE_SHARE_DELETE);
     constexpr ULONG open_reparse = 0x00200000U, synchronous = 0x20U;
     HANDLE handle = INVALID_HANDLE_VALUE; IO_STATUS_BLOCK status{};
     const auto result = api.create(&handle, access, &attributes, &status, nullptr, FILE_ATTRIBUTE_NORMAL,
@@ -202,6 +207,7 @@ Native OpenChild(const Native& parent, const std::string& name, bool directory, 
     Native file(handle);
 #else
     (void)metadata_only;
+    (void)directory_rename;
     int flags = (writable && !directory ? O_RDWR : O_RDONLY) | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK;
     if (directory) flags |= O_DIRECTORY;
     if (create && directory) {
@@ -289,15 +295,15 @@ void SyncDirectory(const Native& directory, const std::filesystem::path& label) 
 #endif
 }
 bool Publish(const Native& directory, const Native& source, const std::string& temporary, const std::string& leaf,
-    const std::filesystem::path& label) {
+    const std::filesystem::path& label, bool replace = false, bool sync_source = true) {
 #ifdef _WIN32
     (void)temporary;
-    SyncFile(source, label);
+    if (sync_source) SyncFile(source, label);
     struct Rename { BOOLEAN replace; HANDLE root; ULONG bytes; WCHAR name[1]; };
     const std::wstring wide(leaf.begin(), leaf.end());
     std::vector<std::uint8_t> storage(offsetof(Rename, name) + wide.size() * sizeof(WCHAR));
     auto* rename = reinterpret_cast<Rename*>(storage.data());
-    rename->replace = FALSE; rename->root = directory.get();
+    rename->replace = replace ? TRUE : FALSE; rename->root = directory.get();
     rename->bytes = static_cast<ULONG>(wide.size() * sizeof(WCHAR));
     std::memcpy(rename->name, wide.data(), rename->bytes);
     IO_STATUS_BLOCK status{};
@@ -310,7 +316,11 @@ bool Publish(const Native& directory, const Native& source, const std::string& t
 #else
     const auto named = OpenChild(directory, temporary, false, false, false, false, label);
     if (!SameObject(named.get(), source.get())) Damage("temporary native generation changed");
-    SyncFile(source, label);
+    if (sync_source) SyncFile(source, label);
+    if (replace) {
+        if (::renameat(directory.get(), temporary.c_str(), directory.get(), leaf.c_str()) == 0) return true;
+        NativeError("replace private restored owner");
+    }
 #if defined(__APPLE__)
     if (::renameatx_np(directory.get(), temporary.c_str(), directory.get(), leaf.c_str(), RENAME_EXCL) == 0) return true;
     if (errno == EEXIST) return false;
@@ -411,6 +421,9 @@ struct CommitOwnerArtifactIo::Impl {
         : directory(path), scope(expected), root(OpenRoot(path, write)), writable(write) {
         (void)SerializeCommitOwnerScope(scope);
     }
+    Impl(const std::filesystem::path& path, const CommitOwnerScope& expected, Native pin)
+        : directory(path), scope(expected), root(std::move(pin)) {}
+    explicit Impl(const std::filesystem::path& path) : directory(path), root(OpenRoot(path, false)) {}
     Native ObjectDirectory() const {
         auto opened = OpenChild(root, kObjects, true, writable, false, false, directory / kObjects);
         auto marker = OpenChild(opened, kMarker, false, false, false, false, directory / kObjects / kMarker);
@@ -504,6 +517,244 @@ CommitOwnerArtifactIo::CommitOwnerArtifactIo(const std::filesystem::path& direct
     impl_ = std::move(owned);
 }
 CommitOwnerArtifactIo::~CommitOwnerArtifactIo() = default;
+CommitOwnerArtifactIo::CommitOwnerArtifactIo(std::unique_ptr<Impl> impl) : impl_(std::move(impl)) {}
+
+std::shared_ptr<CommitOwnerArtifactIo> CommitOwnerArtifactIo::OpenBootstrapDirectory(const std::filesystem::path& directory) {
+    return std::shared_ptr<CommitOwnerArtifactIo>(new CommitOwnerArtifactIo(std::make_unique<Impl>(directory)));
+}
+
+std::optional<std::vector<std::uint8_t>> CommitOwnerArtifactIo::ReadBootstrapBytes() const {
+    const auto name = std::string(kCommitOwnerBootstrapName);
+    auto file = OpenChild(impl_->root, name, false, false, false, true, impl_->directory / name);
+    if (!file) return {};
+    const auto extent = Extent(file);
+    if (extent < 68U || extent > kMaxCommitOwnerBootstrapBytes) Damage("bootstrap measured extent");
+    std::array<std::uint8_t, kCommitOwnerBootstrapHeaderBytes> header{}; ReadAt(file, 0U, header);
+    const auto admitted = InspectCommitOwnerBootstrapHeader(header);
+    if (extent != admitted.bytes) Damage("bootstrap declared extent mismatch");
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(extent));
+    std::copy(header.begin(), header.end(), bytes.begin());
+    ReadAt(file, header.size(), std::span(bytes).subspan(header.size()));
+    if (Extent(file) != extent) Damage("bootstrap extent changed during read");
+    return bytes;
+}
+
+std::optional<std::vector<std::uint8_t>> CommitOwnerArtifactIo::ReadEmptyInventoryBytes() const {
+    const auto name = std::string("chunkdb.index");
+    auto file = OpenChild(impl_->root, name, false, false, false, true, impl_->directory / name);
+    if (!file) return {};
+    const auto extent = Extent(file);
+    const auto expected = IndexInventoryFileBytes(IndexInventoryHeader{});
+    if (extent != expected) Damage("creation inventory is not the exact empty extent");
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(extent)); ReadAt(file, 0U, bytes);
+    if (Extent(file) != extent) Damage("creation inventory extent changed during read");
+    return bytes;
+}
+
+void CommitOwnerArtifactIo::PublishBootstrapBytes(std::span<const std::uint8_t> bytes) {
+    if (!impl_->writable) Damage("bootstrap publication requires an exclusive writer");
+    const auto decision = ParseCommitOwnerBootstrapDecision(bytes);
+    const auto scope = decision.kind == CommitOwnerBootstrapKind::kDirectory ?
+        ParseDataDirManifest(decision.manifest).commit_owner : ParseStoreManifest(decision.manifest).commit_owner;
+    if (!scope || *scope != impl_->scope) Damage("bootstrap publication scope mismatch");
+    const auto leaf = std::string(kCommitOwnerBootstrapName);
+    auto existing = OpenChild(impl_->root, leaf, false, true, false, true, impl_->directory / leaf);
+    if (!existing) {
+        const auto temporary = std::string(".owner-bootstrap-") + Hex(crypto::RandomBytes(16U));
+        auto source = OpenChild(impl_->root, temporary, false, true, true, false, impl_->directory / temporary);
+        WriteAll(source, bytes);
+        const auto installed = Publish(impl_->root, source, temporary, leaf, impl_->directory / temporary);
+        existing = OpenChild(impl_->root, leaf, false, true, false, false, impl_->directory / leaf);
+        if (installed && !SameObject(source.get(), existing.get())) Damage("bootstrap native generation substituted");
+    }
+    if (Extent(existing) != bytes.size()) Damage("bootstrap decision already differs");
+    std::vector<std::uint8_t> actual(bytes.size()); ReadAt(existing, 0U, actual);
+    if (Extent(existing) != bytes.size() || !std::equal(actual.begin(), actual.end(), bytes.begin(), bytes.end()))
+        Damage("bootstrap decision already differs");
+    SyncFile(existing, impl_->directory / leaf);
+    SyncDirectory(impl_->root, impl_->directory);
+}
+
+void CommitOwnerArtifactIo::SyncFeatureDecision(std::span<const std::uint8_t> bytes) {
+    if (!impl_->writable) Damage("feature decision durability requires its exclusive writer");
+    auto file = OpenChild(impl_->root, "chunkdb.feature.pending", false, true, false, false,
+        impl_->directory / "chunkdb.feature.pending");
+    if (Extent(file) != bytes.size()) Damage("feature decision extent changed");
+    std::vector<std::uint8_t> actual(bytes.size()); ReadAt(file, 0U, actual);
+    if (Extent(file) != bytes.size() || !std::equal(actual.begin(), actual.end(), bytes.begin(), bytes.end()))
+        Damage("feature decision changed before owner publication");
+    SyncFile(file, impl_->directory / "chunkdb.feature.pending");
+    SyncDirectory(impl_->root, impl_->directory);
+}
+
+// Only bootstrap admission can call this; no caller supplies a root body.
+void CommitOwnerArtifactIo::PublishInactive() {
+    if (!impl_->writable) Damage("initial owner publication requires an exclusive writer");
+    CommitOwnerRoot inactive; inactive.scope = impl_->scope;
+    const auto bytes = SerializeCommitOwnerRoot(inactive);
+    auto existing = OpenChild(impl_->root, kRoot, false, true, false, true, impl_->directory / kRoot);
+    if (!existing) {
+        const auto temporary = std::string(".owner-initial-") + Hex(crypto::RandomBytes(16U));
+        auto source = OpenChild(impl_->root, temporary, false, true, true, false, impl_->directory / temporary);
+        WriteAll(source, bytes);
+        const auto installed = Publish(impl_->root, source, temporary, kRoot, impl_->directory / temporary);
+        existing = OpenChild(impl_->root, kRoot, false, true, false, false, impl_->directory / kRoot);
+        if (installed && !SameObject(source.get(), existing.get())) Damage("initial owner native generation substituted");
+    }
+    const auto actual = ReadChecked(existing, impl_->scope, CommitOwnerObjectKind::kRoot);
+    if (actual != bytes) Damage("canonical owner differs from initial INACTIVE state");
+    SyncFile(existing, impl_->directory / kRoot);
+    SyncDirectory(impl_->root, impl_->directory);
+}
+
+void CommitOwnerArtifactIo::RequireRestoreGuard() const {
+    constexpr std::array<std::uint8_t, 4U> expected{'C', 'K', 'R', 'I'};
+    const auto label = impl_->directory / ".chunkdb.restore.incomplete";
+    auto guard = OpenChild(impl_->root, ".chunkdb.restore.incomplete", false, false, false, false, label);
+    if (Extent(guard) != expected.size()) Damage("restore guard extent");
+    std::array<std::uint8_t, 4U> bytes{}; ReadAt(guard, 0U, bytes);
+    if (bytes != expected || Extent(guard) != expected.size()) Damage("restore guard changed");
+}
+
+void CommitOwnerArtifactIo::RewriteRestoredInactive(const CommitOwnerScope& source_scope,
+    const CommitOwnerScope& destination_scope) {
+    RequireRestoreGuard();
+    auto writable_root = OpenRoot(impl_->directory, true);
+    if (!SameObject(writable_root.get(), impl_->root.get())) Damage("private restore directory generation changed");
+    CheckCreationCapability(writable_root); SyncDirectory(writable_root, impl_->directory);
+    auto previous = OpenChild(writable_root, kRoot, false, false, false, false, impl_->directory / kRoot);
+    CommitOwnerRoot source; source.scope = source_scope;
+    const auto old_bytes = SerializeCommitOwnerRoot(source);
+    if (ReadChecked(previous, source_scope, CommitOwnerObjectKind::kRoot) !=
+        std::vector<std::uint8_t>(old_bytes.begin(), old_bytes.end())) Damage("copied source owner is not initial INACTIVE");
+    CommitOwnerRoot destination; destination.scope = destination_scope;
+    const auto bytes = SerializeCommitOwnerRoot(destination);
+    const auto temporary = std::string(".owner-restore-") + Hex(crypto::RandomBytes(16U));
+    auto staged = OpenChild(writable_root, temporary, false, true, true, false, impl_->directory / temporary);
+    WriteAll(staged, bytes); SyncFile(staged, impl_->directory / temporary);
+    RequireRestoreGuard();
+    if (!MatchesDirectory(impl_->directory)) Damage("private restore directory generation changed");
+    auto current = OpenChild(writable_root, kRoot, false, false, false, false, impl_->directory / kRoot);
+    if (!SameObject(current.get(), previous.get()) || ReadChecked(current, source_scope, CommitOwnerObjectKind::kRoot) !=
+        std::vector<std::uint8_t>(old_bytes.begin(), old_bytes.end())) Damage("copied source owner changed before publication");
+    // The guarded copy has no serving reader; release our consumed source
+    // handles before classic native replacement while retaining its directory.
+    current.CloseChecked(); previous.CloseChecked();
+    if (!Publish(writable_root, staged, temporary, kRoot, impl_->directory / temporary, true, false))
+        Damage("private restored owner was not replaced");
+    const auto installed = OpenChild(writable_root, kRoot, false, true, false, false, impl_->directory / kRoot);
+    if (!SameObject(installed.get(), staged.get())) Damage("private restored owner generation substituted");
+    const auto actual = ReadChecked(installed, destination_scope, CommitOwnerObjectKind::kRoot);
+    if (!std::equal(actual.begin(), actual.end(), bytes.begin(), bytes.end())) Damage("private restored owner differs");
+    SyncFile(installed, impl_->directory / kRoot);
+    SyncDirectory(writable_root, impl_->directory);
+}
+
+std::shared_ptr<CommitOwnerArtifactIo> CommitOwnerArtifactIo::PinDirectories(std::span<const std::string> names) const {
+    if (names.empty()) Damage("empty directory pin chain");
+    const Native* parent = &impl_->root;
+    Native current;
+    auto label = impl_->directory;
+    for (const auto& name : names) {
+        label /= name;
+        auto next = OpenChild(*parent, name, true, false, false, false, label, false, true);
+        current = std::move(next); parent = &current;
+    }
+    return std::shared_ptr<CommitOwnerArtifactIo>(new CommitOwnerArtifactIo(
+        std::make_unique<Impl>(label, impl_->scope, std::move(current))));
+}
+
+bool CommitOwnerArtifactIo::MatchesDirectory(const std::filesystem::path& directory) const {
+    const auto current = OpenRoot(directory, false);
+    return SameObject(impl_->root.get(), current.get());
+}
+
+void CommitOwnerArtifactIo::RequireNoPendingMetadata() const {
+    for (const auto* name : {"chunkdb.bootstrap.pending", "chunkdb.feature.pending", "chunkdb.migration.pending",
+            ".chunkdb.restore.incomplete", ".chunkdb.backup.incomplete"}) {
+        const auto pending = OpenChild(impl_->root, name, false, false, false, true, impl_->directory / name);
+        if (pending) Damage("pending metadata requires completed writer recovery");
+    }
+}
+
+std::optional<std::vector<std::uint8_t>> CommitOwnerArtifactIo::ReadManifestBytes(bool directory) const {
+    const auto name = std::string(directory ? kDataDirManifestFileName : kStoreManifestFileName);
+    auto file = OpenChild(impl_->root, name, false, false, false, true, impl_->directory / name);
+    if (!file) return {};
+    const auto extent = Extent(file);
+    const auto maximum = directory ? kDataDirManifestMaxSize : kStoreManifestMaxSize;
+    if (extent > maximum) Damage("manifest extent exceeds its format ceiling");
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(extent));
+    ReadAt(file, 0U, bytes);
+    if (Extent(file) != extent) Damage("manifest extent changed during admission");
+    return bytes;
+}
+
+std::vector<std::string> CommitOwnerArtifactIo::CatalogTableNames() const {
+    auto tables = OpenChild(impl_->root, "tables", true, false, false, true, impl_->directory / "tables", false, true);
+    if (!tables) return {};
+    std::vector<std::string> names;
+#ifdef _WIN32
+    alignas(8) std::array<std::uint8_t, 64U * 1024U> buffer{};
+    bool first = true;
+    for (;;) {
+        if (!GetFileInformationByHandleEx(tables.get(), first ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo,
+                buffer.data(), static_cast<DWORD>(buffer.size()))) {
+            const auto error = GetLastError();
+            if (error == ERROR_NO_MORE_FILES) break;
+            NativeError("enumerate pinned catalog tables", error);
+        }
+        first = false;
+        std::size_t at = 0U;
+        for (;;) {
+            constexpr auto fixed = offsetof(FILE_ID_BOTH_DIR_INFO, FileName);
+            if (at > buffer.size() - fixed) Damage("invalid native table entry");
+            const auto* entry = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(buffer.data() + at);
+            const auto length = static_cast<std::size_t>(entry->FileNameLength);
+            if (length % sizeof(WCHAR) != 0U || length > buffer.size() - at - fixed)
+                Damage("invalid native table name extent");
+            std::string name;
+            bool ascii = true;
+            for (std::size_t i = 0U; i < length / sizeof(WCHAR); ++i) {
+                if (entry->FileName[i] > 127U) { ascii = false; break; }
+                name.push_back(static_cast<char>(entry->FileName[i]));
+            }
+            if (ascii && IsValidTableName(name)) {
+                if ((entry->FileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U)
+                    Damage("redirected managed table directory");
+                if ((entry->FileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0U) names.push_back(std::move(name));
+            }
+            if (entry->NextEntryOffset == 0U) break;
+            const auto next = static_cast<std::size_t>(entry->NextEntryOffset);
+            if (next % 8U != 0U || next < fixed + length || next > buffer.size() - at - fixed)
+                Damage("invalid native table continuation");
+            at += next;
+        }
+    }
+#else
+    const auto fd = ::openat(tables.get(), ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) NativeError("open pinned catalog enumeration");
+    auto* stream = ::fdopendir(fd);
+    if (!stream) { const auto error = errno; (void)::close(fd); NativeError("enumerate pinned catalog tables", error); }
+    struct CloseDirectory { void operator()(DIR* value) const noexcept { (void)::closedir(value); } };
+    const std::unique_ptr<DIR, CloseDirectory> owned(stream);
+    for (;;) {
+        errno = 0;
+        const auto* entry = ::readdir(stream);
+        if (!entry) { if (errno != 0) NativeError("read pinned catalog tables"); break; }
+        const std::string name(entry->d_name);
+        if (!IsValidTableName(name)) continue;
+        struct stat status{};
+        if (::fstatat(tables.get(), name.c_str(), &status, AT_SYMLINK_NOFOLLOW) != 0)
+            NativeError("inspect pinned catalog table");
+        if (S_ISLNK(status.st_mode)) Damage("redirected managed table directory");
+        if (S_ISDIR(status.st_mode)) names.push_back(name);
+    }
+#endif
+    std::sort(names.begin(), names.end());
+    if (std::adjacent_find(names.begin(), names.end()) != names.end()) Damage("catalog inventory changed during enumeration");
+    return names;
+}
 
 std::optional<CommitOwnerRootArtifact> CommitOwnerArtifactIo::ReadCanonicalRoot() const {
     auto file = OpenChild(impl_->root, kRoot, false, false, false, true, impl_->directory / kRoot);
