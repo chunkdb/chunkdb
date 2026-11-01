@@ -117,6 +117,8 @@ Read-only readers rebuild on a changed equal-even snapshot generation and publis
 
 Collection durably publishes the emptying commit's tombstone and any new inventory entry before removing image or WAL files.
 The tombstone preserves the producing revision and time and records the schema of the retained empty baseline; collection allocates no user revision.
+Evicting that cached empty state changes no logical identity, allocates no user revision and publishes no synthetic transaction history.
+Snapshots resolve the same retained boundary until a producing mutation requires its ordinary before-state history.
 Later schema translation or repeated collection of that same producing identity reuses its existing checked tombstone rather than appending a conflicting schema at the same revision.
 A failure before tombstone publication leaves the original artifacts intact.
 Uncertain publication or removal fences serving until recovery completes the decision idempotently.
