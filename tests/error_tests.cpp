@@ -17,6 +17,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "catalog_test_utils.hpp"
 #include "chunkdb/engine.hpp"
+#include "../src/typed_chunk_form.hpp"
 
 namespace {
 
@@ -124,13 +125,19 @@ int main() {
             return reply.starts_with("-ERR " + std::string(expected.substr(0U, space)) + " ") &&
                 (space == std::string_view::npos || reply.find(expected.substr(space + 1U)) != std::string::npos);
         };
-        // The chunk form of the default table: version, schema version, 2
-        // presence bytes and 8 payload bytes (4x4 blocks of 4 bits).
+        const auto lease = catalog->Find("default")->Acquire();
+        const auto& geometry = lease->store().geometry();
+        // Checked forms retain 2 presence bytes and 8 payload bytes.
         const auto chunk_of = [&](std::uint32_t cx, std::uint32_t cy) {
             const std::string reply = engine.Execute(
                 session, "GET CHUNK " + std::to_string(cx) + " " + std::to_string(cy) + " FROM default\r\n");
-            assert(reply.rfind("$26\r\n", 0) == 0 && reply.size() == 5 + 26 + 2);
-            return reply.substr(5 + 16, 10);
+            const auto body = ExtractBulkPayload(reply);
+            const auto state = chunkdb::DecodeSectionedChunkState(geometry,
+                std::span(reinterpret_cast<const std::uint8_t*>(body.data()), body.size()),
+                chunkdb::kVarMaxChunkBytesLimit);
+            assert(state.presence_bitmap.size() == 2U && state.payload.size() == 8U);
+            return std::string(state.presence_bitmap.begin(), state.presence_bitmap.end()) +
+                std::string(state.payload.begin(), state.payload.end());
         };
 
         // HELLO is HELLO 3 or HELLO 3 USER <name> $1; the token option is
@@ -219,11 +226,16 @@ int main() {
         assert(err("GET CHUNK 0 0 FROM default COLUMNS nope", "INVALID_ARGUMENT"));
         assert(err("GET CHUNK x 0 FROM default", "SYNTAX"));
 
-        // Chunk writes: the form is version, schema version, presence,
-        // payload, then VARS.
+        // Chunk writes admit checked forms and refuse the former envelope.
         const std::string version = std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8);
         const std::string payload(8, '\x11');
-        const std::string state = version + std::string("\xff\xff", 2) + payload;
+        chunkdb::ChunkState chunk_state;
+        chunk_state.presence_bitmap.assign(2U, 0xFFU);
+        chunk_state.payload.assign(payload.begin(), payload.end());
+        const auto encoded = chunkdb::EncodeSectionedChunkState(geometry, chunk_state, chunkdb::kVarMaxChunkBytesLimit);
+        const std::string state(encoded.begin(), encoded.end());
+        assert(err("SET CHUNK 0 0 IN default $1", "INVALID_ARGUMENT",
+                   Parameters{version + std::string("\xff\xff", 2) + payload}));
         assert(err("SET CHUNK 0 0 IN default $1", "INVALID_ARGUMENT", Parameters{std::string(4, '\0')}));
         assert(err("SET CHUNK 0 0 IN default $1", "INVALID_ARGUMENT", Parameters{version + payload}));
         assert(err("SET CHUNK 0 0 IN default $1", "INVALID_ARGUMENT", Parameters{state + std::string(3, '\0')}));
@@ -244,8 +256,14 @@ int main() {
             const auto block = engine.PlanPayload(session, "SET BLOCK 0 0 IN default bits = $1\r\n");
             assert(block.plan == Plan::kParameters && block.parameter_limits == std::vector<std::size_t>{1});
             const auto chunk = engine.PlanPayload(session, "SET CHUNK 0 0 IN default $1\r\n");
-            assert(chunk.plan == Plan::kParameters &&
-                   chunk.parameter_limits == std::vector<std::size_t>{26 + chunkdb::kDefaultVarMaxChunkBytes});
+            // Header, six directory entries, descriptor, fixed/presence
+            // arrays and empty metadata envelope, plus the hard VARS cap.
+            constexpr std::size_t form_limit = 36U + 6U * 12U + 4U + 24U + 2U + 8U + 4U +
+                chunkdb::kVarMaxChunkBytesLimit;
+            assert(chunk.plan == Plan::kParameters && chunk.parameter_limits == std::vector<std::size_t>{form_limit});
+            const auto projected = engine.PlanPayload(session, "SET CHUNK 0 0 IN default COLUMNS bits $1\r\n");
+            assert(projected.plan == Plan::kParameters &&
+                   projected.parameter_limits == std::vector<std::size_t>{form_limit + chunkdb::kVarMaxChunkBytesLimit});
             assert(engine.PlanPayload(session, "GET CHUNK 0 0 FROM default\r\n").plan == Plan::kNone);
             const auto bad = engine.PlanPayload(session, "SET CHUNK 0 0 IN default $x\r\n");
             assert(bad.plan == Plan::kNone);

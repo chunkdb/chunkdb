@@ -20,6 +20,8 @@ struct FeedSlotTestHook {
 struct FeedSlotTestAccess {
     static void Sync(Table& table);
     static FeedArchiveReader CompletedPrefix(Table& table, std::string_view name, FeedPosition after);
+    static void EnableChunkForms(FeedArchiveReader& reader, std::size_t budget);
+    static void SetEntryBudget(FeedArchiveReader& reader, std::size_t budget);
     static void Retain(Table& table);
     static void SetHook(Table& table, FeedSlotTestHook* hook);
     static void StageAck(Table& table, std::string_view name, FeedPosition position);
@@ -39,6 +41,8 @@ struct FeedSlotAckState {
 class FeedSlots {
   public:
     FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::milliseconds interval);
+    // Read-only admission before rollback/tail repair or alias removal.
+    static void ValidateRecoveryAliases(const ChunkStore& store);
     ~FeedSlots();
     void Start(std::shared_ptr<ChangeFeed> feed);
     void Stop();

@@ -17,6 +17,9 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
 #include "checkpoint.hpp"
+#include "chunk_coordinate_index.hpp"
+#include "populated_index_format.hpp"
+#include "store_manifest.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -1059,8 +1062,8 @@ void TestConditionalIntentCrashBoundaries(const std::string& executable) {
     }
 }
 
-// The manifest is the first artifact of a new store, and a crash before it is
-// durable leaves a directory that initializes again from scratch.
+// The empty checked inventory precedes manifest publication and preserves the
+// table identity if initialization restarts before the manifest is published.
 void TestManifestCrashBoundaries(const std::string& executable) {
     const auto run_child = [&](const std::filesystem::path& data_dir, const char* failpoint) {
         std::string command =
@@ -1079,23 +1082,42 @@ void TestManifestCrashBoundaries(const std::string& executable) {
         }
         return entries;
     };
+    const auto empty_inventory = [](const std::filesystem::path& data_dir,
+        const chunkdb::StoreManifest& manifest) {
+        const auto path = data_dir / chunkdb::kChunkIndexFileName;
+        std::ifstream input(path, std::ios::binary);
+        assert(input);
+        assert(manifest.chunk_schema);
+        const chunkdb::Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
+        unsigned entries = 0;
+        const auto header = chunkdb::ReadIndexInventory(input, std::filesystem::file_size(path),
+            geometry, manifest.store_id, [&](const auto&) { ++entries; });
+        assert(header.table_id == manifest.store_id && header.dims == geometry.dims() &&
+            header.generation == 1U && header.count == 0U && entries == 0U &&
+            header.retained_deletion_floor == 0U && !header.compaction_pending &&
+            header.compaction_through == 0U);
+    };
 
     {
         const auto data_dir = TempDataDir("manifest-crash-before-publish");
         run_child(data_dir, "CHUNKDB_FAILPOINT_CRASH_MANIFEST_BEFORE_PUBLISH_ONCE");
-        // Only the synced, unpublished manifest exists: no store artifact
-        // was written before it. The writer's lock directory is coordination,
-        // not a store artifact (snapshot ownership is taken before initializing).
+        // Both synced initialization artifacts are present; neither owns any
+        // populated chunk or retained deletion decision.
         auto entries = names(data_dir);
         std::erase(entries, std::string(".chunkdb.lock"));
-        assert(entries.size() == 1U);
+        assert(entries.size() == 2U);
+        assert(std::erase(entries, std::string(chunkdb::kChunkIndexFileName)) == 1U);
         assert(entries[0].rfind("table.manifest.tmp.", 0) == 0);
+        const auto unpublished = chunkdb::ParseStoreManifest(chunkdb::LoadFile(data_dir / entries[0]));
+        empty_inventory(data_dir, unpublished);
 
         // Never initialized, so any geometry may create the store now.
         auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
         config.geometry.block_bits = 11;
         {
             chunkdb::ChunkStore store(config);
+            assert(store.store_id() == unpublished.store_id);
+            empty_inventory(data_dir, *chunkdb::ReadStoreManifest(data_dir));
             store.SetBlockBits(0, 0, "10101010101");
         }
         for (const auto& name : names(data_dir)) {
@@ -1113,12 +1135,15 @@ void TestManifestCrashBoundaries(const std::string& executable) {
     {
         const auto data_dir = TempDataDir("manifest-crash-after-publish");
         run_child(data_dir, "CHUNKDB_FAILPOINT_CRASH_MANIFEST_AFTER_PUBLISH_ONCE");
-        // The published manifest is the only artifact (the lock directory is
-        // coordination, not a store artifact).
+        // The published manifest and checked empty inventory share identity.
         auto entries = names(data_dir);
         std::erase(entries, std::string(".chunkdb.lock"));
-        assert(entries.size() == 1U);
+        assert(entries.size() == 2U);
+        assert(std::erase(entries, std::string(chunkdb::kChunkIndexFileName)) == 1U);
         assert(entries[0] == "table.manifest");
+        const auto manifest_bytes = chunkdb::LoadFile(data_dir / "table.manifest");
+        const auto index_bytes = chunkdb::LoadFile(data_dir / chunkdb::kChunkIndexFileName);
+        empty_inventory(data_dir, chunkdb::ParseStoreManifest(manifest_bytes));
 
         auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
         config.geometry.block_bits = 11;
@@ -1129,6 +1154,8 @@ void TestManifestCrashBoundaries(const std::string& executable) {
             refused = std::string(e.what()).find("block_bits 11 (stored 9)") != std::string::npos;
         }
         assert(refused);
+        assert(chunkdb::LoadFile(data_dir / "table.manifest") == manifest_bytes);
+        assert(chunkdb::LoadFile(data_dir / chunkdb::kChunkIndexFileName) == index_bytes);
 
         config.geometry_fields = 0;
         {
@@ -1155,6 +1182,10 @@ int main(int argc, char** argv) {
     }
     if (argc == 4 && std::string(argv[1]) == "--manifest-crash-child") {
         return RunManifestCrashChild(argv[2], argv[3]);
+    }
+    if (argc == 2 && std::string(argv[1]) == "--manifest-boundaries-only") {
+        TestManifestCrashBoundaries(argv[0]);
+        return 0;
     }
     TestCrashPointAfterTempFlushBeforeRename();
     TestCrashPointAfterRenameBeforeDirSync();

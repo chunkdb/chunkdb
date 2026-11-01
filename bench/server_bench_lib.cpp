@@ -40,6 +40,7 @@
 #include "crypto.hpp"
 #include "scram.hpp"
 #include "user_registry.hpp"
+#include "sectioned_chunk_form.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -604,15 +605,8 @@ struct GeometryInfo {
     std::size_t presence_bytes = 0;
     // The schema version a chunk form must be encoded for.
     std::uint64_t schema_version = 1;
+    std::uint32_t column_id = 1U;
 };
-
-[[nodiscard]] std::string LittleEndian64(std::uint64_t value) {
-    std::string out(8, '\0');
-    for (std::size_t i = 0; i < 8; ++i) {
-        out[i] = static_cast<char>((value >> (8U * i)) & 0xffU);
-    }
-    return out;
-}
 
 void ReadReplyScalars(Client& client, std::vector<std::string>* out);
 void ValidateHelloReply(Client& client, const std::string& expected_signature);
@@ -967,6 +961,10 @@ class WatchingClient {
     GeometryInfo geometry;
     geometry.block_bits = std::stoull(type.substr(5));
     geometry.schema_version = std::stoull(after("version", 1));
+    const auto column_id = std::stoull(after("id", 1));
+    if (column_id == 0U || column_id > std::numeric_limits<std::uint32_t>::max())
+        throw std::runtime_error("DESCRIBE default has an invalid block column ID");
+    geometry.column_id = static_cast<std::uint32_t>(column_id);
     geometry.chunk_width_blocks = std::stoull(after("chunk", 1));
     geometry.chunk_height_blocks = std::stoull(after("chunk", 2));
     geometry.chunk_bits =
@@ -1071,22 +1069,33 @@ struct ScenarioRegion {
     };
 }
 
-// The chunk form (docs/CQL.md) of a bits table: version, schema version,
-// presence, payload.
+// A nonnullable bits column uses presence, fixed values and one descriptor.
 [[nodiscard]] std::size_t ChunkFormBytes(const GeometryInfo& geometry) {
-    return 16U + geometry.presence_bytes + geometry.chunk_bytes;
+    return 36U + 3U * 12U + 4U + 24U + geometry.presence_bytes + geometry.chunk_bytes;
 }
 
 [[nodiscard]] RequestPlan ChunkPutPlan(std::int64_t cx, std::int64_t cy, const GeometryInfo& geometry, std::uint8_t fill) {
-    // The state is payload then presence; the form is presence then payload,
-    // after a version SET CHUNK does not read.
     const std::string state = FullChunkState(geometry, fill);
-    const std::string form =
-        std::string(8, '\0') + LittleEndian64(geometry.schema_version) + state.substr(geometry.chunk_bytes) +
-        state.substr(0, geometry.chunk_bytes);
+    const auto* data = reinterpret_cast<const std::uint8_t*>(state.data());
+    std::vector<std::uint8_t> descriptor;
+    const auto append32 = [&descriptor](std::uint32_t value) {
+        for (unsigned shift = 0U; shift != 32U; shift += 8U)
+            descriptor.push_back(static_cast<std::uint8_t>(value >> shift));
+    };
+    append32(1U); append32(geometry.column_id); append32(static_cast<std::uint32_t>(geometry.block_bits));
+    append32(0U); append32(static_cast<std::uint32_t>(geometry.chunk_bytes)); append32(0U); append32(0U);
+    const std::array<ChunkFormSection, 3> sections{{
+        {static_cast<std::uint16_t>(ChunkFormSectionKind::kPresence), {data + geometry.chunk_bytes, geometry.presence_bytes}},
+        {static_cast<std::uint16_t>(ChunkFormSectionKind::kFixedValues), {data, geometry.chunk_bytes}},
+        {static_cast<std::uint16_t>(ChunkFormSectionKind::kBlockSpans), descriptor},
+    }};
+    const auto form = SerializeChunkFormSections({.schema_version = geometry.schema_version}, sections,
+        std::numeric_limits<std::uint32_t>::max());
+    std::string frame = "$" + std::to_string(form.size()) + "\r\n";
+    frame.append(reinterpret_cast<const char*>(form.data()), form.size());
     return RequestPlan{
         .command = "SET CHUNK " + std::to_string(cx) + " " + std::to_string(cy) + " IN default $1",
-        .payload = "$" + std::to_string(form.size()) + "\r\n" + form,
+        .payload = std::move(frame),
         .expected = IntegerExpected(),
         .kind = RequestKind::kSetChunk,
     };

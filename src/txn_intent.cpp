@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -17,18 +18,13 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
 #include "txn_history.hpp"
+#include "txn_intent_format.hpp"
+#include "wal_replay.hpp"
+#include "chunk_coordinate_index.hpp"
 
 namespace chunkdb {
 
-// Transaction intent record: magic "CKTB" (rollback) or "CKTC" (committed),
-// version u64, chunk_count u32, per chunk chunk_x i64, chunk_y i64 and
-// wal_boundary u64, then CRC32 over every preceding byte; little-endian.
 namespace {
-
-constexpr std::array<std::uint8_t, 4> kTxnRollbackMagic = {'C', 'K', 'T', 'B'};
-constexpr std::array<std::uint8_t, 4> kTxnCommittedMagic = {'C', 'K', 'T', 'C'};
-constexpr std::size_t kTxnIntentFixedBytes = 4U + 8U + 4U + 4U;
-constexpr std::size_t kTxnIntentEntryBytes = 24U;
 
 void CrashAtRecoveryFailpoint(const char* key) {
     if (ConsumeFailpointEnv(key)) {
@@ -38,53 +34,20 @@ void CrashAtRecoveryFailpoint(const char* key) {
 
 }  // namespace
 
-std::vector<std::uint8_t> SerializeTxnIntent(const TxnIntent& intent) {
-    std::vector<std::uint8_t> bytes;
-    bytes.reserve(kTxnIntentFixedBytes + kTxnIntentEntryBytes * intent.entries.size());
-    const auto& magic = intent.state == TxnIntentState::kRollback ? kTxnRollbackMagic : kTxnCommittedMagic;
-    bytes.insert(bytes.end(), magic.begin(), magic.end());
-    WriteLe64(bytes, intent.version);
-    WriteLe32(bytes, static_cast<std::uint32_t>(intent.entries.size()));
-    for (const auto& entry : intent.entries) {
-        WriteLe64(bytes, static_cast<std::uint64_t>(entry.coord.x));
-        WriteLe64(bytes, static_cast<std::uint64_t>(entry.coord.y));
-        WriteLe64(bytes, entry.wal_boundary);
-    }
-    WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
-    return bytes;
+std::vector<std::uint8_t> SerializeTxnIntent(const TxnIntent& intent, std::uint8_t dims, const StoreId& table_id) {
+    return SerializeTxnIntent(intent, dims, table_id, kMaxTxnWrittenChunks);
 }
 
-bool TryParseTxnIntent(const std::vector<std::uint8_t>& bytes, TxnIntent* out) {
-    if (bytes.size() < kTxnIntentFixedBytes) {
-        return false;
-    }
-    const std::size_t count = ReadLe32(bytes, 12U);
-    if (count == 0U || count > kMaxTxnWrittenChunks ||
-        bytes.size() != kTxnIntentFixedBytes + kTxnIntentEntryBytes * count ||
-        ReadLe32(bytes, bytes.size() - 4U) != Crc32(bytes.data(), bytes.size() - 4U)) {
-        return false;
-    }
-    TxnIntent intent;
-    if (std::equal(kTxnRollbackMagic.begin(), kTxnRollbackMagic.end(), bytes.begin())) {
-        intent.state = TxnIntentState::kRollback;
-    } else if (std::equal(kTxnCommittedMagic.begin(), kTxnCommittedMagic.end(), bytes.begin())) {
-        intent.state = TxnIntentState::kCommitted;
-    } else {
-        return false;
-    }
-    intent.version = ReadLe64(bytes, 4U);
-    intent.entries.reserve(count);
-    for (std::size_t i = 0; i < count; ++i) {
-        const std::size_t at = 16U + kTxnIntentEntryBytes * i;
-        intent.entries.push_back(TxnIntentEntry{
-            .coord = ChunkCoord{
-                .x = static_cast<std::int64_t>(ReadLe64(bytes, at)),
-                .y = static_cast<std::int64_t>(ReadLe64(bytes, at + 8U)),
-            },
-            .wal_boundary = ReadLe64(bytes, at + 16U),
-        });
-    }
-    *out = std::move(intent);
+std::vector<std::uint8_t> SerializeTxnIntent(const TxnIntent& intent, std::uint8_t dims, const StoreId& table_id,
+    std::size_t written_chunk_limit) {
+    return SerializeCheckedTxnIntent(intent, dims, table_id, written_chunk_limit);
+}
+
+bool TryParseTxnIntent(const std::vector<std::uint8_t>& bytes, TxnIntent* out,
+    std::uint8_t dims, const StoreId& table_id) {
+    if (out == nullptr) return false;
+    try { *out = ParseCheckedTxnIntent(bytes, dims, table_id); }
+    catch (const std::invalid_argument&) { return false; }
     return true;
 }
 
@@ -100,7 +63,8 @@ bool IsTxnIntentFileName(std::string_view name) noexcept {
     }
     const auto digits =
         name.substr(kTxnIntentPrefix.size(), name.size() - kTxnIntentPrefix.size() - kTxnIntentSuffix.size());
-    return std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; });
+    return digits.front() != '0' &&
+        std::all_of(digits.begin(), digits.end(), [](char c) { return c >= '0' && c <= '9'; });
 }
 
 bool IsTxnIntentArtifactName(std::string_view name) noexcept {
@@ -110,11 +74,11 @@ bool IsTxnIntentArtifactName(std::string_view name) noexcept {
 
 std::optional<std::uint64_t> TxnRollbackBoundaryForChunk(
     const std::vector<std::vector<std::uint8_t>>& intents,
-    const ChunkCoord& coord) {
+    const ChunkCoord& coord, const Geometry& geometry, const StoreId& table_id) {
     std::optional<std::uint64_t> boundary;
     for (const auto& bytes : intents) {
         TxnIntent intent;
-        if (!TryParseTxnIntent(bytes, &intent)) {
+        if (!TryParseTxnIntent(bytes, &intent, geometry.dims(), table_id)) {
             throw std::runtime_error(
                 "read-only chunk snapshot contains a malformed transaction intent for chunk (" +
                 std::to_string(coord.x) + "," + std::to_string(coord.y) + ")");
@@ -124,14 +88,16 @@ std::optional<std::uint64_t> TxnRollbackBoundaryForChunk(
         }
         for (const auto& entry : intent.entries) {
             if (entry.coord == coord) {
-                boundary = std::min(boundary.value_or(entry.wal_boundary), entry.wal_boundary);
+                if (boundary && *boundary != entry.wal_boundary)
+                    throw std::runtime_error("conflicting pending rollback boundaries for one chunk");
+                boundary = entry.wal_boundary;
             }
         }
     }
     return boundary;
 }
 
-void ChunkStore::RecoverTransactionIntents() {
+void ChunkStore::RecoverTransactionIntents(bool validate_only) {
     if (access_mode_ == AccessMode::kReadOnly) {
         return;
     }
@@ -188,14 +154,23 @@ void ChunkStore::RecoverTransactionIntents() {
     }
     std::sort(intents.begin(), intents.end());
 
-    // Every intent is checked before any WAL changes.
+    // Every intent and member is checked before any WAL changes.
     std::vector<TxnIntent> parsed(intents.size());
     for (std::size_t i = 0; i < intents.size(); ++i) {
         const auto& [version, path] = intents[i];
-        if (!TryParseTxnIntent(LoadFile(path), &parsed[i]) || parsed[i].version != version) {
+        if (!TryParseTxnIntent(LoadRecoveryTxnIntent(path, geometry_.dims(), store_id_), &parsed[i], geometry_.dims(), store_id_) || parsed[i].version != version) {
             throw std::runtime_error("invalid transaction intent: " + path.string());
         }
     }
+    for (const auto& intent : parsed) {
+        if (intent.state != TxnIntentState::kRollback) continue;
+        for (const auto& entry : intent.entries) {
+            const auto retained = coordinate_index_->EmptyBoundary(entry.coord);
+            ValidateRollbackWalBoundary(data_dir_, geometry_, store_id_, features_, entry.coord,
+                entry.wal_boundary, retained ? &*retained : nullptr);
+        }
+    }
+    if (validate_only) return;
 
     for (std::size_t i = 0; i < intents.size(); ++i) {
         const auto& path = intents[i].second;
@@ -263,7 +238,7 @@ void ChunkStore::RecoverTransactionIntents() {
                 CrashAtRecoveryFailpoint("CHUNKDB_FAILPOINT_CRASH_TXN_RECOVERY_AFTER_TRUNCATE_ONCE");
             }
         }
-        // CKTC: the frames are committed; a WAL checkpointed away since is fine.
+        // Committed frames remain valid if a checkpoint has removed their WAL.
         std::error_code remove_ec;
         std::filesystem::remove(path, remove_ec);
         if (remove_ec) {
