@@ -158,6 +158,11 @@ Verification independently checks dimensions, placement, identities, schemas, ch
 
 ## Validation
 
+Feed entries carry the table dimensionality and both schema domains, and every block, chunk form and chunk-column change uses that many coordinate axes.
+A chunk-column change contains the complete before and after rows, with a null before row only when the chunk had no producing identity, and is emitted when those rows differ.
+Block-column projections preserve the complete chunk-column row, and `NOBEFORE` removes both kinds of before rows.
+Chunk-form events carry checked forms with each chunk's producing revision and time, and use a null form only when neither present blocks nor non-default chunk columns remain.
+
 Tests cover negative boundaries, coordinate extremes, dimension mismatches, x-fastest indexing, checked products and canonical path round trips.
 Format tests cover every truncated boundary, corrupt identity or checksum, reserved field, directory overlap, unknown section and unknown fixed type between known neighbours.
 Crash tests interrupt index publication, tombstone sync, image removal, archive-base publication, WAL rename, intent repair, compaction, backup and restore.
