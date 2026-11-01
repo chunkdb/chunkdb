@@ -616,11 +616,20 @@ void CommitOwnerArtifactIo::RequireRestoreGuard() const {
     if (bytes != expected || Extent(guard) != expected.size()) Damage("restore guard changed");
 }
 
+void CommitOwnerArtifactIo::RequireRestoreDirectory() const {
+    bool matches = false;
+    try { matches = MatchesDirectory(impl_->directory); }
+    catch (const std::runtime_error& error) { throw CommitOwnerRestoreOwnershipError(error.what()); }
+    if (!matches) throw CommitOwnerRestoreOwnershipError("native directory generation changed");
+}
+
 void CommitOwnerArtifactIo::RewriteRestoredInactive(const CommitOwnerScope& source_scope,
     const CommitOwnerScope& destination_scope) {
     RequireRestoreGuard();
+    RequireRestoreDirectory();
     auto writable_root = OpenRoot(impl_->directory, true);
-    if (!SameObject(writable_root.get(), impl_->root.get())) Damage("private restore directory generation changed");
+    if (!SameObject(writable_root.get(), impl_->root.get()))
+        throw CommitOwnerRestoreOwnershipError("writable native directory generation changed");
     CheckCreationCapability(writable_root); SyncDirectory(writable_root, impl_->directory);
     auto previous = OpenChild(writable_root, kRoot, false, false, false, false, impl_->directory / kRoot);
     CommitOwnerRoot source; source.scope = source_scope;
@@ -633,7 +642,7 @@ void CommitOwnerArtifactIo::RewriteRestoredInactive(const CommitOwnerScope& sour
     auto staged = OpenChild(writable_root, temporary, false, true, true, false, impl_->directory / temporary);
     WriteAll(staged, bytes); SyncFile(staged, impl_->directory / temporary);
     RequireRestoreGuard();
-    if (!MatchesDirectory(impl_->directory)) Damage("private restore directory generation changed");
+    RequireRestoreDirectory();
     auto current = OpenChild(writable_root, kRoot, false, false, false, false, impl_->directory / kRoot);
     if (!SameObject(current.get(), previous.get()) || ReadChecked(current, source_scope, CommitOwnerObjectKind::kRoot) !=
         std::vector<std::uint8_t>(old_bytes.begin(), old_bytes.end())) Damage("copied source owner changed before publication");

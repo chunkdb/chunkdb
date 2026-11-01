@@ -97,6 +97,7 @@ struct Participants {
 
 Participants ValidateParticipants(const std::filesystem::path& root, const FeatureActivationJournal& journal, bool require_activation = true) {
     ValidateStructure(journal);
+    CommitOwnerBootstrap::ValidateManagedDirectories(root);
     const auto directory = ReadDataDirManifest(root);
     if (!directory || directory->data_dir_id != journal.data_dir_id) Bad("data-directory identity changed");
     RequireOpenableFeatures(directory->features, AccessMode::kReadWrite);

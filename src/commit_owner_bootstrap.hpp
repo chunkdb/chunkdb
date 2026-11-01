@@ -5,6 +5,7 @@
 #include <mutex>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -17,6 +18,14 @@ class TableCatalog;
 class CommitOwnerStoreAdmission;
 class CommitOwnerDirectoryContext;
 struct BackupRecord;
+
+class CommitOwnerRestoreOwnershipError final : public std::runtime_error {
+  private:
+    friend class CommitOwnerArtifactIo;
+    friend class CommitOwnerBootstrap;
+    explicit CommitOwnerRestoreOwnershipError(const char* reason)
+        : std::runtime_error(std::string("restore private directory ownership is uncertain: ") + reason) {}
+};
 
 inline constexpr std::string_view kCommitOwnerBootstrapName = "chunkdb.bootstrap.pending";
 inline constexpr std::size_t kCommitOwnerBootstrapHeaderBytes = 64U;
@@ -100,6 +109,7 @@ class CommitOwnerBootstrap {
     // Read-only facts for metadata preflight; never returns a serving ticket.
     static void ValidateDirectoryScopes(const std::filesystem::path& directory,
         AccessMode access_mode = AccessMode::kReadOnly);
+    static void ValidateManagedDirectories(const std::filesystem::path& directory);
     [[nodiscard]] static std::vector<std::uint8_t> ReadInactiveRoot(const std::filesystem::path& directory,
         const CommitOwnerScope& scope);
     [[nodiscard]] static DataDirManifest RewriteInactiveRestore(const std::filesystem::path& private_copy,

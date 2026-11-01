@@ -97,14 +97,17 @@ std::shared_ptr<const CommitOwnerDirectoryContext> CommitOwnerBootstrap::AdmitDi
     if (!Grouped(initial->features)) {
         if (std::filesystem::symlink_status(path / "chunkdb.groups.owner").type() != std::filesystem::file_type::not_found)
             Bad("unclaimed canonical owner exists");
-        const auto tables = path / "tables";
-        if (std::filesystem::is_directory(tables)) {
-            for (const auto& entry : std::filesystem::directory_iterator(tables)) {
-                if (!IsValidTableName(entry.path().filename().string()) || !entry.is_directory()) continue;
-                const auto manifest = ReadStoreManifest(entry.path());
-                if (!manifest || Grouped(manifest->features)) Bad("table claims an owner absent from its directory");
-                RequireOpenableFeatures(manifest->features, access_mode);
-            }
+        const auto view = CommitOwnerArtifactIo::OpenBootstrapDirectory(path);
+        std::set<StoreId> epochs;
+        for (const auto& name : view->CatalogTableNames()) {
+            const std::array<std::string, 2U> components{"tables", name};
+            const auto table = view->PinDirectories(components);
+            const auto bytes = table->ReadManifestBytes(false);
+            if (!bytes) Bad("managed table manifest is missing");
+            const auto manifest = ParseStoreManifest(*bytes);
+            if (Grouped(manifest.features)) Bad("table claims an owner absent from its directory");
+            if (!epochs.insert(manifest.store_id).second) Bad("duplicate table epoch in catalog inventory");
+            RequireOpenableFeatures(manifest.features, access_mode);
         }
         return {};
     }
@@ -128,6 +131,11 @@ std::shared_ptr<const CommitOwnerDirectoryContext> CommitOwnerBootstrap::AdmitDi
     }
     context->RequireInactive();
     return context;
+}
+
+void CommitOwnerBootstrap::ValidateManagedDirectories(const std::filesystem::path& directory) {
+    const auto view = CommitOwnerArtifactIo::OpenBootstrapDirectory(std::filesystem::weakly_canonical(directory));
+    (void)view->CatalogTableNames();
 }
 
 void CommitOwnerBootstrap::ValidateDirectoryScopes(const std::filesystem::path& directory, AccessMode access_mode) {

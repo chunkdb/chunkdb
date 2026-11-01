@@ -67,6 +67,7 @@ class CommitOwnerArtifactIo {
     void SyncFeatureDecision(std::span<const std::uint8_t> bytes);
     void PublishInactive();
     void RequireRestoreGuard() const;
+    void RequireRestoreDirectory() const;
     void RewriteRestoredInactive(const CommitOwnerScope& source_scope, const CommitOwnerScope& destination_scope);
     [[nodiscard]] std::optional<std::vector<std::uint8_t>> ReadEmptyInventoryBytes() const;
     void RequireNoPendingMetadata() const;

@@ -197,13 +197,13 @@ DataDirManifest CommitOwnerBootstrap::RewriteInactiveRestore(const std::filesyst
         Bad("inactive owner restore requires an admitted catalog scope");
     const auto source_scope = *manifest.commit_owner;
     (void)ReadInactiveRoot(private_copy, source_scope);
-    if (!pinned->MatchesDirectory(private_copy)) Bad("restore copy changed during complete admission");
+    pinned->RequireRestoreDirectory();
     manifest.data_dir_id = NewStoreId();
     if (manifest.data_dir_id == source_scope.directory_id) Bad("restored directory identity collided");
     manifest.commit_owner = CommitOwnerScope{manifest.data_dir_id, NewStoreId(), CommitOwnerRole::kCatalog};
     if (manifest.commit_owner->owner_id == source_scope.owner_id) Bad("restored owner identity collided");
     pinned->RewriteRestoredInactive(source_scope, *manifest.commit_owner);
-    if (!pinned->MatchesDirectory(private_copy)) Bad("restore copy changed during root publication");
+    pinned->RequireRestoreDirectory();
     Crash("CHUNKDB_FAILPOINT_CRASH_OWNER_RESTORE_AFTER_PRIVATE_ROOT_ONCE");
     return manifest;
 }

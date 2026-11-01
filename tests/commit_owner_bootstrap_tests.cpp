@@ -398,6 +398,30 @@ void InactiveBackupRestore(const std::string& executable) {
         assert(LoadFile(backup / "chunkdb.groups.owner") == source_root);
         std::filesystem::remove_all(named); std::filesystem::remove_all(held);
     }
+    {
+        const auto parent = std::filesystem::canonical(temporary.path());
+        const auto held = parent / "held-restore-caller-generation", target = parent / "uncertain-target";
+        std::filesystem::path substituted;
+        struct Observer { ~Observer() { SetFileSyncObserverForTests({}); } } observer;
+        SetFileSyncObserverForTests([&](const auto& path) {
+            if (!substituted.empty() || !path.filename().string().starts_with(".owner-restore-") ||
+                path.parent_path().parent_path() != parent) return;
+            substituted = path.parent_path();
+            std::filesystem::rename(substituted, held); std::filesystem::create_directory(substituted);
+            Save(substituted / "unrelated", Bytes{'k', 'e', 'e', 'p'});
+        });
+        bool refused = false;
+        try { RestoreBackup(backup, target); }
+        catch (const CommitOwnerRestoreOwnershipError& error) {
+            refused = std::string_view(error.what()).find("native directory generation changed") != std::string_view::npos;
+        }
+        SetFileSyncObserverForTests({});
+        assert(refused && !substituted.empty() && !std::filesystem::exists(target));
+        assert(LoadFile(substituted / "unrelated") == (Bytes{'k', 'e', 'e', 'p'}));
+        assert(LoadFile(held / kRestoreIncompleteName) == (Bytes{'C', 'K', 'R', 'I'}));
+        assert(LoadFile(backup / "chunkdb.groups.owner") == source_root);
+        std::filesystem::remove_all(substituted); std::filesystem::remove_all(held);
+    }
     const auto private_copy = temporary.path() / (".chunkdb.restore." + StoreIdHex(NewStoreId()));
     std::filesystem::copy(backup, private_copy, std::filesystem::copy_options::recursive);
     Save(private_copy / kRestoreIncompleteName, Bytes{'C', 'K', 'R', 'I'});

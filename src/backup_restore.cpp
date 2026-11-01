@@ -280,6 +280,10 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_PARENT_SYNC_ONCE");
         CompleteBackupGuard(target, kRestoreIncompleteName, "RESTORE");
         // No cleanup or fallible callback follows the completion point.
+    } catch (const CommitOwnerRestoreOwnershipError&) {
+        // The detected replacement is not our private tree to clean up.
+        // Retain the guard/name and preserve the original ownership failure.
+        throw;
     } catch (const std::exception& failure) {
         if (!moved) {
             const auto error = RemoveBackupTemporaryTree(temporary);
