@@ -6,8 +6,10 @@
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
+#include <shared_mutex>
 
 namespace chunkdb {
+class RegularChunkMutex;
 enum class StatementStopReason { kNone, kCancelled, kKilled, kTimeout };
 
 class StatementStoppedError : public std::runtime_error {
@@ -61,5 +63,8 @@ class ScopedStatementControl {
 
 void CheckStatementCancellation();
 void EnterStatementDecision();
+[[nodiscard]] std::string StatementStoppedReply(StatementStopReason reason);
 [[nodiscard]] std::stop_token StatementStopToken();
+[[nodiscard]] std::unique_lock<RegularChunkMutex> LockStatementChunk(RegularChunkMutex& mutex);
+[[nodiscard]] std::shared_lock<RegularChunkMutex> LockStatementChunkShared(RegularChunkMutex& mutex);
 }  // namespace chunkdb

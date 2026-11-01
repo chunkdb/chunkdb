@@ -297,7 +297,7 @@ void TestRights() {
 
     // A dropped user keeps no right in a session still open.
     ExpectReply(server.Run(admin, "DROP USER bot"), "+OK\r\n");
-    ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM world"), "NO_TABLE");
+    ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM world"), "AUTH_REQUIRED reason=user_incarnation");
     SessionState gone;
     ExpectError(server.Login(gone, "bot", "new"), "AUTH_FAILED");
 }

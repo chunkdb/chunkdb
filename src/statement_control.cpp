@@ -1,4 +1,7 @@
 #include "statement_control.hpp"
+#include "chunkdb/protocol.hpp"
+#include "chunkdb/chunk_store.hpp"
+#include "chunkdb/statement_mutex.hpp"
 
 namespace chunkdb {
 namespace {
@@ -157,5 +160,36 @@ void CheckStatementCancellation() { if (current_statement) current_statement->Ch
 void EnterStatementDecision() { if (current_statement) current_statement->EnterDecision(); }
 std::stop_token StatementStopToken() {
     return current_statement ? current_statement->StopToken() : std::stop_token{};
+}
+void StatementMutex::lock() {
+    std::unique_lock lock(mutex_);
+    const auto stopped = StatementStopToken();
+    if (!changed_.wait(lock, stopped, [this] { return !locked_; })) {
+        changed_.notify_all();
+        CheckStatementCancellation();
+    }
+    try { CheckStatementCancellation(); }
+    catch (const StatementStoppedError&) { changed_.notify_all(); throw; }
+    locked_ = true;
+}
+void StatementMutex::unlock() noexcept {
+    { std::lock_guard lock(mutex_); locked_ = false; }
+    changed_.notify_all();
+}
+std::unique_lock<RegularChunkMutex> LockStatementChunk(RegularChunkMutex& mutex) {
+    if (!mutex.try_lock() && !mutex.lock(StatementStopToken())) CheckStatementCancellation();
+    std::unique_lock lock(mutex, std::adopt_lock);
+    CheckStatementCancellation();
+    return lock;
+}
+std::shared_lock<RegularChunkMutex> LockStatementChunkShared(RegularChunkMutex& mutex) {
+    if (!mutex.try_lock_shared() && !mutex.lock_shared(StatementStopToken())) CheckStatementCancellation();
+    std::shared_lock lock(mutex, std::adopt_lock);
+    CheckStatementCancellation();
+    return lock;
+}
+std::string StatementStoppedReply(StatementStopReason reason) {
+    const auto code = reason == StatementStopReason::kTimeout ? "TIMEOUT" : "CANCELLED";
+    return Protocol::Error(code, StopMessage(reason), {{"applied", "false"}});
 }
 }  // namespace chunkdb

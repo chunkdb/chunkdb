@@ -1,8 +1,12 @@
 #include "server_io.hpp"
+#include "server_credit.hpp"
 
 #include <array>
 #include <cassert>
 #include <functional>
+#include <atomic>
+#include <barrier>
+#include <thread>
 #include <stdexcept>
 
 namespace {
@@ -108,6 +112,38 @@ void RejectedOptionsDrainWithoutLosingFollowingFrames() {
     assert(nullable.complete() && !nullable.TakeParameters()[0]);
     assert(pending.extract_line(&next, 1024U) && next == "PING\r\n");
 }
+
+void AggregateCreditIsBoundedAndReturnedOnce() {
+    std::atomic<std::size_t> returned{0U};
+    auto data = std::make_shared<ConnectionByteBudget>(10U, [&] { ++returned; });
+    auto controls = std::make_shared<ConnectionByteBudget>(5U, [] {});
+    auto first = data->TryAcquire(7U);
+    auto second = data->TryAcquire(3U);
+    assert(first && second && !data->TryAcquire(1U));
+    assert(controls->TryAcquire(5U));
+    auto copy = first;
+    first.reset();
+    assert(returned.load() == 0U && !data->TryAcquire(1U));
+    copy.reset();
+    assert(returned.load() == 1U && data->TryAcquire(7U));
+    Reject([&] { (void)data->TryAcquire(11U); });
+    second.reset();
+    std::atomic<std::size_t> admitted{0U};
+    auto one = std::make_shared<ConnectionByteBudget>(1U, [] {});
+    std::barrier acquired(9), release(9);
+    std::vector<std::thread> workers;
+    for (std::size_t i = 0U; i < 8U; ++i) workers.emplace_back([&] {
+        auto credit = one->TryAcquire(1U);
+        if (credit) ++admitted;
+        acquired.arrive_and_wait();
+        release.arrive_and_wait();
+    });
+    acquired.arrive_and_wait();
+    assert(admitted.load() == 1U);
+    release.arrive_and_wait();
+    for (auto& worker : workers) worker.join();
+    assert(one->TryAcquire(1U));
+}
 }  // namespace
 
 int main() {
@@ -115,4 +151,5 @@ int main() {
     TruncatedInputStaysIncomplete();
     BoundsAndDiscard();
     RejectedOptionsDrainWithoutLosingFollowingFrames();
+    AggregateCreditIsBoundedAndReturnedOnce();
 }

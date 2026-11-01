@@ -14,6 +14,7 @@
 #include "chunk_store_internal.hpp"
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
+#include "statement_control.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/zrle.hpp"
 #include "wal_replay.hpp"
@@ -238,7 +239,7 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
             return ReadPopulatedChunkStateFromDisk(chunk_coord, out, with_vars, nullptr);
         }
         const auto chunk = GetOrLoadRegularChunk(chunk_coord);
-        std::shared_lock lock(chunk->mutex);
+        auto lock = LockStatementChunkShared(chunk->mutex);
         if (!ChunkPresent(chunk->presence_bitmap)) {
             return false;
         }
@@ -271,13 +272,13 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
         if (const auto loaded = TryGetLoadedChunk(chunk_coord); loaded != nullptr) {
             if (snapshot != nullptr) {
                 {
-                    std::shared_lock lock(loaded->mutex);
+                    auto lock = LockStatementChunkShared(loaded->mutex);
                     copy_cached(*loaded, target);
                 }
                 TouchChunk(loaded);
                 return finish_snapshot_read();
             }
-            std::shared_lock lock(loaded->mutex);
+            auto lock = LockStatementChunkShared(loaded->mutex);
             if (!ChunkPresent(loaded->presence_bitmap)) {
                 return false;
             }
@@ -340,12 +341,12 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     if (snapshot != nullptr) {
         {
-            std::shared_lock lock(regular_chunk->mutex);
+            auto lock = LockStatementChunkShared(regular_chunk->mutex);
             copy_cached(*regular_chunk, target);
         }
         return finish_snapshot_read();
     }
-    std::shared_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunkShared(regular_chunk->mutex);
     if (!ChunkPresent(regular_chunk->presence_bitmap)) {
         return false;
     }
@@ -614,6 +615,7 @@ void ChunkStore::CollectScanCandidates(ScanCandidateAccumulator* candidates) con
         }
         stats_scan_large_dirs_listed_.fetch_add(1, std::memory_order_relaxed);
         for (; it != end; it.increment(ec)) {
+            CheckStatementCancellation();
             if (ec) {
                 throw std::filesystem::filesystem_error("scan directory", path, ec);
             }
@@ -668,6 +670,7 @@ ChunkScanPage ChunkStore::ScanPopulatedChunks(
     bool pass_has_cursor = has_cursor;
     ChunkCoord pass_cursor = cursor;
     while (page.coords.size() <= limit) {
+        CheckStatementCancellation();
         ScanCandidateAccumulator candidates(
             pass_has_cursor, pass_cursor, limit + 1U - page.coords.size());
         CollectScanCandidates(&candidates);
@@ -815,7 +818,9 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRangeImpl(
     std::vector<ChunkRangeEntry> entries;
     std::size_t vars_bytes = 0;
     for (std::int64_t chunk_x = chunk_x0;; ++chunk_x) {
+        CheckStatementCancellation();
         for (std::int64_t chunk_y = chunk_y0;; ++chunk_y) {
+            CheckStatementCancellation();
             AppendPopulatedChunkRangeEntry(
                 ChunkCoord{chunk_x, chunk_y}, max_entries, "GET AREA", with_vars, &vars_bytes, &entries, snapshot,
                 txn_read);
@@ -895,6 +900,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadiusImpl(
     std::vector<ChunkRangeEntry> entries;
     std::size_t vars_bytes = 0;
     for (std::int64_t dx = -radius_chunks; dx <= radius_chunks; ++dx) {
+        CheckStatementCancellation();
         if (dx < 0 && center_x < std::numeric_limits<std::int64_t>::min() - dx) {
             continue;
         }
@@ -907,6 +913,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadiusImpl(
         // perpendicular row, by symmetry of the disc.
         const std::int64_t dy_limit = half_widths[static_cast<std::size_t>(abs_dx)];
         for (std::int64_t dy = -dy_limit; dy <= dy_limit; ++dy) {
+            CheckStatementCancellation();
             if (dy < 0 && center_y < std::numeric_limits<std::int64_t>::min() - dy) {
                 continue;
             }

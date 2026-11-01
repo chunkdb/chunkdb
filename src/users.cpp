@@ -5,6 +5,7 @@
 #include <stdexcept>
 
 #include "checkpoint.hpp"
+#include "statement_control.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/crc32.hpp"
 
@@ -253,7 +254,7 @@ void WriteUsersFile(const std::filesystem::path& data_dir, const Users& users, b
     AtomicWrite(
         data_dir / kUsersFileName, bytes, /*fsync_file=*/true, /*fsync_directory=*/true,
         out_replaced, /*after_rename_failpoint=*/nullptr,
-        /*enable_generic_failpoints=*/true);
+        /*enable_generic_failpoints=*/true, EnterStatementDecision);
 }
 
 }  // namespace chunkdb

@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "checkpoint.hpp"
+#include "statement_control.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
@@ -182,7 +183,7 @@ ChunkState ChunkStore::ReadChunkStateAt(const TxnSnapshot& snapshot, std::int64_
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     ChunkState state;
     {
-        std::shared_lock lock(regular_chunk->mutex);
+        auto lock = LockStatementChunkShared(regular_chunk->mutex);
         state.payload = regular_chunk->payload;
         state.presence_bitmap = regular_chunk->presence_bitmap;
         state.version = regular_chunk->version;
@@ -213,7 +214,7 @@ std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAt(
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::optional<std::vector<ColumnValue>> values;
     {
-        std::shared_lock lock(regular_chunk->mutex);
+        auto lock = LockStatementChunkShared(regular_chunk->mutex);
         values = decode(regular_chunk->payload, regular_chunk->presence_bitmap, regular_chunk->vars);
     }
     (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) {
@@ -235,7 +236,7 @@ BlockReadMetadata ChunkStore::GetBlockWithVersionAt(
             std::optional(DecodeBlockColumns(geometry_.layout(), chunk.payload, chunk.vars, index)) : std::nullopt;
     };
     const auto chunk = GetOrLoadRegularChunk(coord);
-    { std::shared_lock lock(chunk->mutex); capture(*chunk); }
+    { auto lock = LockStatementChunkShared(chunk->mutex); capture(*chunk); }
     (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.state); });
     return result;
 }
@@ -245,7 +246,7 @@ bool ChunkStore::ChunkChangedSince(const TxnSnapshot& snapshot, std::int64_t chu
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     // A write keeps its chunk's state before it releases the chunk's lock.
-    std::shared_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunkShared(regular_chunk->mutex);
     return txn_history_->ChangedSince(snapshot, chunk_coord);
 }
 
@@ -440,9 +441,9 @@ std::uint64_t ChunkStore::CommitTransaction(
     for (const auto& target : targets) {
         const bool exclusive = target.write != kNoWrite;
         if (exclusive) {
-            target.chunk->mutex.lock();
+            (void)LockStatementChunk(target.chunk->mutex).release();
         } else {
-            target.chunk->mutex.lock_shared();
+            (void)LockStatementChunkShared(target.chunk->mutex).release();
         }
         locks.held.emplace_back(target.chunk.get(), exclusive);
         NoteThreadHoldsChunkLock(target.chunk.get());
@@ -650,7 +651,7 @@ std::uint64_t ChunkStore::CommitTransaction(
                 /*fsync_file=*/true,
                 /*fsync_directory=*/true,
                 &replaced,
-                "CHUNKDB_FAILPOINT_TXN_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+                "CHUNKDB_FAILPOINT_TXN_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", true, EnterStatementDecision);
         } catch (...) {
             if (!replaced) {
                 throw;

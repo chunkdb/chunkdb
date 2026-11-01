@@ -14,6 +14,7 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "chunkdb/change_feed.hpp"
@@ -23,6 +24,7 @@
 #include "feature_flags.hpp"
 #include "scram.hpp"
 #include "user_registry.hpp"
+#include "statement_control.hpp"
 #include "table_options_text.hpp"
 
 #ifdef _WIN32
@@ -275,8 +277,11 @@ std::string CommandEngine::Execute(
     SessionState& session,
     std::string_view line,
     std::span<const std::optional<std::string>> parameters,
-    std::unique_ptr<ReplyContinuation>* continuation) {
+    std::unique_ptr<ReplyContinuation>* continuation,
+    const std::function<void(std::size_t)>* reserve_reply) {
     if (continuation) continuation->reset();
+    if (!std::exchange(session.request_admitted, false))
+        if (auto refused = AdmitUserStatement(session, line)) return std::move(*refused);
     const auto command_name = ExtractCommandName(line);
     const auto started = std::chrono::steady_clock::now();
     const bool hello = Protocol::CommandEquals(command_name, "HELLO");
@@ -348,7 +353,8 @@ std::string CommandEngine::Execute(
     // Neither log costs anything while both are off.
     const bool logged = config_.audit != nullptr || config_.slow_statement_ms != 0U;
     StatementLogInfo info;
-    std::string response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr, continuation);
+    std::string response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr,
+        continuation, reserve_reply);
     ObserveReply(command_class, started, response);
     if (logged && info.verb != nullptr) {
         LogStatement(session, info, started, response);
@@ -357,6 +363,8 @@ std::string CommandEngine::Execute(
 }
 
 std::string CommandEngine::RejectPayload(SessionState& session, std::string_view line, std::string response) {
+    if (!std::exchange(session.request_admitted, false))
+        if (auto refused = AdmitUserStatement(session, line)) return std::move(*refused);
     const auto started = std::chrono::steady_clock::now();
     const auto name = ExtractCommandName(line);
     const bool auth = Protocol::CommandEquals(name, "HELLO") || (!session.greeted && Protocol::CommandEquals(name, "AUTH"));
@@ -511,7 +519,7 @@ std::string CommandEngine::AuthBanReply(SessionState& session) {
             std::chrono::milliseconds(config_.auth_failure_delay_ms);
     }
     const auto remaining = std::max<std::int64_t>(0, std::chrono::ceil<std::chrono::milliseconds>(
-        until - std::chrono::steady_clock::now()).count());
+        until - std::max(std::chrono::steady_clock::now(), session.reply_not_before)).count());
     return Protocol::Error("RATE_LIMITED", "temporary auth ban", {
         {"reason", "auth_ban"}, {"retry_after_ms", std::to_string(remaining)}});
 }
@@ -651,6 +659,10 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
 }
 
 std::string CommandEngine::ErrorReply(const std::exception& error) {
+    if (dynamic_cast<const ReplyAdmissionError*>(&error))
+        return Protocol::Error("BUSY", error.what(), {{"reason", "reply_budget"}});
+    if (const auto* stopped = dynamic_cast<const StatementStoppedError*>(&error))
+        return StatementStoppedReply(stopped->reason());
     // In the order a catch chain would test them: the first matching type
     // decides.
     if (const auto* option = dynamic_cast<const HelloOptionError*>(&error))
@@ -868,7 +880,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 7);
+    Protocol::AppendArrayHeader(reply, 9);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -876,22 +888,24 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "slot_filters");
     Protocol::AppendBulk(reply, "slot_takeover");
     Protocol::AppendBulk(reply, "lineage");
+    Protocol::AppendBulk(reply, "connection_controls");
+    Protocol::AppendBulk(reply, "statement_timeout");
     Protocol::AppendBulk(reply, "options");
-    Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 1U : 0U);
+    Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 2U : 1U);
+    entry("statement_timeout_ms", session.hello_options.statement_timeout_ms.value_or(session.default_statement_timeout_ms));
     if (session.hello_options.client_name) {
         Protocol::AppendBulk(reply, "client_name");
         Protocol::AppendBulk(reply, *session.hello_options.client_name);
     }
     Protocol::AppendBulk(reply, "not_applied");
     Protocol::AppendMapHeader(reply, session.hello_options.unknown_options.size() +
-        (session.hello_options.statement_timeout_ms ? 1U : 0U) + (session.hello_options.default_tag ? 1U : 0U));
+        (session.hello_options.default_tag ? 1U : 0U));
     const auto deferred = [&reply](std::string_view name, std::string_view reason) {
         Protocol::AppendBulk(reply, name);
         Protocol::AppendMapHeader(reply, 1);
         Protocol::AppendBulk(reply, "reason");
         Protocol::AppendBulk(reply, reason);
     };
-    if (session.hello_options.statement_timeout_ms) deferred("statement_timeout_ms", "implementation_pending");
     if (session.hello_options.default_tag) deferred("default_tag", "implementation_pending");
     for (const auto& name : session.hello_options.unknown_options) deferred(name, "unknown_option");
     entry("idle_timeout_ms", session.idle_timeout_ms);

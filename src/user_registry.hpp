@@ -9,6 +9,7 @@
 #include <mutex>
 #include <memory>
 #include "chunkdb/migration_health.hpp"
+#include "chunkdb/statement_mutex.hpp"
 #include <optional>
 #include <string>
 #include <string_view>
@@ -79,6 +80,7 @@ class UserRegistry {
 
   private:
     friend class TableCatalog;
+    friend struct UserRegistryTestAccess;
     std::atomic<MigrationTestHook*> test_hook_{nullptr};
     std::shared_ptr<MigrationHealth> migration_health_;
     // Applies `change` to a copy, writes it, then publishes it.
@@ -94,7 +96,7 @@ class UserRegistry {
     const std::filesystem::path data_dir_;
     const bool read_only_;
     const UserAdmissionClock admission_clock_;
-    mutable std::mutex mutex_;
+    mutable StatementMutex mutex_;
     Users users_;
     std::exception_ptr publication_unknown_;
     // Readers use one published image while the serialized writer performs I/O.

@@ -1,4 +1,5 @@
 #include "server_feed.hpp"
+#include "server_idle.hpp"
 #include "server_tls.hpp"
 #include "feed_protocol.hpp"
 #include "cql.hpp"
@@ -37,6 +38,23 @@ void FeedDeliveryTestAccess::SetPendingObserverHook(ChunkServer& server, FeedDel
         server.delivery_test_hook_.store(hook, std::memory_order_release);
     }
     server.pending_clients_cv_.notify_all();
+}
+std::shared_ptr<StatementControl> FeedDeliveryTestAccess::CurrentStatement(ChunkServer& server, std::uint64_t id) {
+    std::lock_guard lock(server.connections_mutex_);
+    const auto found = server.connections_.find(id);
+    if (found == server.connections_.end()) return {};
+    const auto connection = found->second.lock();
+    if (!connection) return {};
+    std::lock_guard state_lock(connection->record->mutex);
+    return connection->record->statement;
+}
+bool FeedDeliveryTestAccess::ConnectionStillOwned(ChunkServer& server, std::uint64_t id) {
+    std::lock_guard lock(server.connections_mutex_);
+    const auto found = server.connections_.find(id);
+    return found != server.connections_.end() && !found->second.expired();
+}
+void FeedDeliveryTestAccess::WakeTransport(ChunkServer& server) {
+    if (auto io = server.IdleIoHandle()) io->Wake();
 }
 void FeedDeliveryTestAccess::InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake) {
     auto io = server.FeedIoHandle();
@@ -227,8 +245,10 @@ void FeedIo::Read(Watch& watch) {
     for (std::size_t i = 0; i < 64U; ++i) {
         // Reserve room for a bounded invalid-ACK reply before accepting more
         // input. Pausing POLLIN lets output drain without a busy poll loop.
-        if (connection.session.slot_watch && watch.bytes > std::max<std::size_t>(watch.share, 128U) - 128U) {
+        if (watch.bytes > std::max<std::size_t>(watch.share, 128U) - 128U) {
             watch.read_paused = true;
+            if (auto* hook = hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kFeedInputBackpressure, watch.bytes);
             return;
         }
         watch.read_paused = false;
@@ -237,6 +257,12 @@ void FeedIo::Read(Watch& watch) {
         try { has_line = connection.pending.extract_line(&line, server_.config_.max_line_bytes); }
         catch (const std::runtime_error& error) { Reject(watch, error.what()); return; }
         if (has_line) {
+            if (auto refused = server_.engine_->AdmitUserStatement(connection.session, line)) {
+                Queue(watch, std::make_shared<const std::string>(std::move(*refused)));
+                if (auto* hook = hook_.load(std::memory_order_acquire))
+                    hook->Run(FeedDeliveryTestHook::Point::kAfterFeedReplyQueue, watch.bytes);
+                continue;
+            }
             try {
                 auto parsed = cql::Parse(line.substr(0, line.find_first_of("\r\n")));
                 if (const auto* ack = std::get_if<cql::Ack>(&parsed.statement); ack && connection.session.slot_watch) {
@@ -430,9 +456,16 @@ void FeedIo::Run() {
             for (const auto& watch : watches) if (watch.connection->session.slot_watch)
                 if (watch.connection->session.slot_watch->Activate()) WakeCatchUp();
             for (auto& watch : watches) {
+                if (watch.connection->record->killed.load()) {
+                    if (const auto& slot = watch.connection->session.slot_watch) {
+                        slot->Cancel();
+                        if (slot->Finished()) watch.dead = true;
+                        else WakeCatchUp();
+                    } else watch.dead = true;
+                }
                 if (!watch.dead) {
                     // A TLS write WANT_* must finish before another TLS operation.
-                    if (!watch.connection->tls || watch.write_size == 0) Read(watch);
+                    if (!watch.connection->record->killed.load() && (!watch.connection->tls || watch.write_size == 0)) Read(watch);
                     const auto feed_error = [&](const std::exception& error) {
                         LogMessage(LogLevel::kError, LogComponent::kServer, "watch feed terminated", {{"error", error.what()}});
                         watch.close = true;
@@ -454,10 +487,7 @@ void FeedIo::Run() {
                     if (!watch.dead && !watch.close && watch.unwatch && watch.return_ready && server_.running_.load()) {
                         if (auto* hook = hook_.load(std::memory_order_acquire))
                             hook->Run(FeedDeliveryTestHook::Point::kBeforeReturnClient, 0U);
-                        std::string error;
-                        if (SetSocketNonBlocking(watch.connection->socket, false, &error)) {
-                            server_.ReturnClient(watch.connection); returned = true;
-                        }
+                        server_.ReturnClient(watch.connection); returned = true;
                     }
                     const bool ack_timeout_closed = watch.connection->session.slot_watch &&
                         watch.connection->session.slot_watch->AckTimedOut();
@@ -537,6 +567,13 @@ void ChunkServer::ReturnClient(std::shared_ptr<ServerConnection> connection) {
 }
 void ChunkServer::CloseClient(ServerConnection& connection) {
     if (connection.socket == kInvalidSocket) return;
+    std::shared_ptr<StatementControl> statement;
+    {
+        std::lock_guard lock(connection.record->mutex);
+        statement = connection.record->statement;
+        connection.record->state = "closing";
+    }
+    if (statement) (void)statement->Complete();
     if (connection.handshake_slot) {
         ReleaseHandshake(connection.handshake_source);
         connection.handshake_slot = false;
@@ -547,11 +584,25 @@ void ChunkServer::CloseClient(ServerConnection& connection) {
     if (connection.session.slot_watch) connection.session.slot_watch->Cancel();
     connection.session.slot_watch.reset();
     connection.session.transaction.reset();
+    connection.session.user_ticket.reset();
+    connection.session.pending_login.reset();
+    connection.session.user_rights.reset();
+    connection.session.table.reset();
+    {
+        std::lock_guard lock(connections_mutex_);
+        connections_.erase(connection.session.connection_id);
+    }
     connection.parameters.clear();
     connection.frames.reset();
     connection.reply_continuation.reset();
+    std::string{}.swap(connection.response);
+    std::string{}.swap(connection.request_line);
+    std::string{}.swap(connection.pending.bytes);
+    connection.pending.cursor = 0U;
+    connection.payload = {};
     connection.payload_credit.reset();
     connection.line_credit.reset();
+    connection.reply_credit.reset();
 #ifdef CHUNKDB_WITH_OPENSSL
     if (connection.tls) { SSL_free(connection.tls); connection.tls = nullptr; }
 #endif

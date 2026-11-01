@@ -94,8 +94,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
     bool table_admitted = false;
     bool no_op = false;
     TableDefinition definition{request.geometry, request.options, request.schema};
-    std::unique_lock<std::mutex> ddl;
-    std::unique_lock<std::mutex> user_lock;
+    std::unique_lock<Table::DdlMutex> ddl;
+    std::unique_lock<StatementMutex> user_lock;
     try {
         if (request.kind != MigrationRequest::Kind::kCreate && request.kind != MigrationRequest::Kind::kGrant) {
             table = Find(request.table);

@@ -176,10 +176,13 @@ struct SessionState {
     // Transport schedules delayed authentication replies without sleeping.
     std::chrono::steady_clock::time_point reply_not_before{};
     std::shared_ptr<const SessionControlCallbacks> connection_controls;
+    // The transport counted this complete request before queue admission.
+    bool request_admitted = false;
     // Identifies the connection in HELLO replies and the audit log; unique
     // within the process (NewConnectionId).
     std::uint64_t connection_id = 0U;
     std::size_t idle_timeout_ms = 60000U;
+    std::uint64_t default_statement_timeout_ms = 0U;
     std::size_t max_watches = 64U;
     SessionHelloOptions hello_options;
     std::unique_ptr<FeedSubscription> watch;
@@ -250,7 +253,8 @@ class CommandEngine {
         SessionState& session,
         std::string_view line,
         std::span<const std::optional<std::string>> parameters = {},
-        std::unique_ptr<ReplyContinuation>* continuation = nullptr);
+        std::unique_ptr<ReplyContinuation>* continuation = nullptr,
+        const std::function<void(std::size_t)>* reserve_reply = nullptr);
     [[nodiscard]] std::string RejectPayload(SessionState& session, std::string_view line, std::string response);
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
@@ -296,7 +300,8 @@ class CommandEngine {
         std::span<const std::optional<std::string>> parameters,
         MetricsRegistry::CommandClass& command_class,
         StatementLogInfo* info,
-        std::unique_ptr<ReplyContinuation>* continuation);
+        std::unique_ptr<ReplyContinuation>* continuation,
+        const std::function<void(std::size_t)>* reserve_reply);
     // Writes the audit and slow-statement lines of a finished statement.
     void LogStatement(
         const SessionState& session,

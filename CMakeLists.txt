@@ -588,6 +588,12 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME statement_control COMMAND chunkdb_statement_control_test)
     set_tests_properties(statement_control PROPERTIES TIMEOUT 30 LABELS "smoke")
 
+    add_executable(chunkdb_statement_store_test tests/statement_store_tests.cpp)
+    target_link_libraries(chunkdb_statement_store_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_statement_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME statement_store COMMAND chunkdb_statement_store_test)
+    set_tests_properties(statement_store PROPERTIES TIMEOUT 120 LABELS "smoke")
+
     add_executable(chunkdb_reply_stream_test tests/reply_stream_tests.cpp)
     target_link_libraries(chunkdb_reply_stream_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_reply_stream_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -924,6 +930,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_wal_group_commit_test
         chunkdb_security_regression_test
         chunkdb_statement_control_test
+        chunkdb_statement_store_test
         chunkdb_reply_stream_test
         chunkdb_server_framing_test
         chunkdb_server_poller_test
@@ -977,6 +984,7 @@ if(CHUNKDB_BUILD_TESTS)
 
     set(CHUNKDB_SMOKE_TESTS
         statement_control
+        statement_store
         reply_stream
         server_framing
         server_poller

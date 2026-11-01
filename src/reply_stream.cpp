@@ -10,6 +10,21 @@
 
 namespace chunkdb {
 namespace {
+void AddCapture(std::size_t& total, std::size_t bytes) {
+    if (bytes > std::numeric_limits<std::size_t>::max() - total)
+        throw ReplyAdmissionError("reply capture bound overflows");
+    total += bytes;
+}
+std::size_t CaptureWithBuffers(std::size_t bytes) {
+    if (bytes > (std::numeric_limits<std::size_t>::max() - 65536U) / 4U)
+        throw ReplyAdmissionError("reply capture bound overflows");
+    return bytes * 4U + 65536U;
+}
+void AddColumnCapture(std::size_t& bytes, const Column& column) {
+    AddCapture(bytes, sizeof(Column) + 256U);
+    AddCapture(bytes, column.name.size());
+    AddCapture(bytes, column.default_value.size());
+}
 class ChunkContinuation final : public ReplyContinuation {
   public:
     ChunkContinuation(ChunkLayout layout, std::vector<ChunkRangeEntry> entries,
@@ -36,6 +51,7 @@ class ChunkContinuation final : public ReplyContinuation {
         }
         AddSize(header_.size(), max_bytes);
         for (const auto& entry : entries_) {
+            selected_vars_.emplace_back();
             CheckStatementCancellation();
             std::size_t size = 16U + entry.presence_bitmap.size();
             const auto add = [&](std::size_t bytes) {
@@ -50,9 +66,14 @@ class ChunkContinuation final : public ReplyContinuation {
                         throw std::logic_error("reply snapshot does not match its layout");
                     add(bytes);
                 }
+                std::size_t index = 0U;
                 for (const auto value : entry.vars) {
                     CheckStatementCancellation();
-                    if (variable_ids_.contains(value.key.column_id)) add(kVarEntryHeaderBytes + value.value.size());
+                    if (variable_ids_.contains(value.key.column_id)) {
+                        add(kVarEntryHeaderBytes + value.value.size());
+                        selected_vars_.back().push_back(index);
+                    }
+                    ++index;
                 }
             }
             forms_.push_back(size);
@@ -129,9 +150,8 @@ class ChunkContinuation final : public ReplyContinuation {
         }
         if (stage_ == Stage::kVars) {
             if (all_) { stage_ = Stage::kTerminator; return Bytes(entry.vars.Encode()); }
-            while (variable_ < entry.vars.size()) {
-                const auto value = entry.vars.entry(variable_);
-                if (!variable_ids_.contains(value.key.column_id)) { ++variable_; continue; }
+            if (variable_ < selected_vars_[entry_].size()) {
+                const auto value = entry.vars.entry(selected_vars_[entry_][variable_]);
                 header_.clear();
                 Little(value.key.column_id, 4U); Little(value.key.block_index, 4U); Little(value.value.size(), 4U);
                 stage_ = Stage::kVarValue;
@@ -140,7 +160,7 @@ class ChunkContinuation final : public ReplyContinuation {
             stage_ = Stage::kTerminator;
         }
         if (stage_ == Stage::kVarValue) {
-            const auto value = entry.vars.entry(variable_++);
+            const auto value = entry.vars.entry(selected_vars_[entry_][variable_++]);
             stage_ = Stage::kVars;
             return {reinterpret_cast<const char*>(value.value.data()), value.value.size()};
         }
@@ -152,12 +172,46 @@ class ChunkContinuation final : public ReplyContinuation {
     const bool all_, area_;
     std::vector<std::pair<std::size_t, std::size_t>> sections_;
     std::unordered_set<std::uint32_t> variable_ids_;
+    std::vector<std::vector<std::size_t>> selected_vars_;
     std::vector<std::size_t> forms_;
     std::size_t size_ = 0U, entry_ = 0U, section_ = 0U, variable_ = 0U;
     Stage stage_ = Stage::kEntry;
     std::string header_;
     std::string_view current_;
 };
+}
+std::size_t ChunkReplyCaptureBound(const ChunkLayout& layout, std::size_t state_bytes) {
+    auto bytes = state_bytes;
+    AddCapture(bytes, sizeof(ChunkLayout));
+    for (const auto& column : layout.schema().columns) AddColumnCapture(bytes, column);
+    for (const auto& step : layout.schema().history) {
+        AddCapture(bytes, sizeof(SchemaStep));
+        for (const auto& change : step.changes) {
+            AddCapture(bytes, sizeof(SchemaChange));
+            AddCapture(bytes, change.old_name.size());
+            AddColumnCapture(bytes, change.column);
+            AddColumnCapture(bytes, change.previous);
+        }
+    }
+    return CaptureWithBuffers(bytes);
+}
+std::size_t BlockReplyCaptureBound(const ChunkLayout& layout, std::span<const std::size_t> columns) {
+    std::size_t bytes = 1024U;
+    std::size_t variable = 0U;
+    for (const auto& column : layout.schema().columns) {
+        AddCapture(bytes, sizeof(ColumnValue) + 64U);
+        if (IsFixedWidth(column.type.kind)) AddCapture(bytes, std::max<std::size_t>(32U, column.type.size));
+        else variable += std::min<std::size_t>(column.type.size, kVarMaxChunkBytesLimit - variable);
+    }
+    AddCapture(bytes, variable);
+    std::size_t encoded = 0U;
+    for (const auto index : columns) {
+        AddCapture(bytes, 64U);
+        const auto& type = layout.schema().columns.at(index).type;
+        encoded += std::min<std::size_t>(std::max<std::size_t>(32U, type.size), kMaxChunkRangeResponseBytes - encoded);
+    }
+    AddCapture(bytes, encoded);
+    return CaptureWithBuffers(bytes);
 }
 std::unique_ptr<ReplyContinuation> ChunkReply(ChunkLayout layout, std::vector<ChunkRangeEntry> entries,
     std::vector<std::size_t> columns, bool area, bool with_schema, std::size_t max_bytes) {

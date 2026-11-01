@@ -3,11 +3,19 @@
 #include "server_io.hpp"
 #include "server_poller.hpp"
 #include "server_credit.hpp"
+#include "statement_control.hpp"
 #include "slot_watch.hpp"
 #include <deque>
 #include <type_traits>
 struct ssl_st;
 namespace chunkdb {
+struct ConnectionRecord {
+    std::mutex mutex;
+    std::uint64_t incarnation = 0U;
+    std::string user, peer, state = "handshake", verb;
+    std::shared_ptr<StatementControl> statement;
+    std::atomic<bool> killed{false};
+};
 struct ServerConnection : public std::enable_shared_from_this<ServerConnection> {
     server_detail::SocketHandle socket = server_detail::kInvalidSocket;
     ssl_st* tls = nullptr;
@@ -35,8 +43,12 @@ struct ServerConnection : public std::enable_shared_from_this<ServerConnection> 
     int response_write_size = 0;
     std::unique_ptr<ReplyContinuation> reply_continuation;
     std::shared_ptr<server_detail::ConnectionByteBudget::Credit> line_credit, payload_credit;
+    std::shared_ptr<server_detail::ConnectionByteBudget::Credit> reply_credit;
+    std::size_t reply_credit_bytes = 0U;
     bool waiting_credit = false, waiting_line_credit = false, control_request = false, framing_started = false;
     std::size_t payload_credit_bytes = 0U;
+    std::shared_ptr<ConnectionRecord> record = std::make_shared<ConnectionRecord>();
+    bool worker_queued = false;
     // The client's address and "[address]:port": the socket's peer, or the
     // source a PROXY header carried. Set when the connection starts.
     std::string peer_address;

@@ -2,8 +2,13 @@
 
 #include <cstddef>
 #include <string>
+#include <stdexcept>
 
 namespace chunkdb {
+class ReplyAdmissionError : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
 // Owns the immutable result until a transport has consumed every byte.
 class ReplyContinuation {
   public:

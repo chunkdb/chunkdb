@@ -29,6 +29,7 @@
 #include "user_registry.hpp"
 #include "migrations.hpp"
 #include "reply_stream.hpp"
+#include "statement_control.hpp"
 
 namespace chunkdb {
 
@@ -225,6 +226,20 @@ constexpr std::size_t kMaxStatementParameterBytes =
 
 void AppendValue(std::string& out, const Column&, const ColumnValue& value) {
     Protocol::AppendValue(out, value);
+}
+
+std::size_t ValueReplyBytes(const ColumnValue& value) {
+    std::optional<std::size_t> bulk;
+    if (const auto* text = std::get_if<std::string>(&value)) bulk = text->size();
+    else if (const auto* bytes = std::get_if<BytesValue>(&value)) bulk = bytes->bytes.size();
+    else if (const auto* bits = std::get_if<BitsValue>(&value)) bulk = (bits->digits.size() + 7U) / 8U;
+    if (bulk) {
+        if (*bulk > kMaxChunkRangeResponseBytes) return kMaxChunkRangeResponseBytes + 1U;
+        return *bulk + std::to_string(*bulk).size() + 5U;
+    }
+    std::string scalar;
+    Protocol::AppendValue(scalar, value);
+    return scalar.size();
 }
 
 [[nodiscard]] std::size_t RequireColumn(const ChunkLayout& layout, std::string_view name) {
@@ -762,8 +777,10 @@ std::string CommandEngine::ExecuteStatement(
     std::span<const std::optional<std::string>> parameters,
     MetricsRegistry::CommandClass& command_class,
     StatementLogInfo* info,
-    std::unique_ptr<ReplyContinuation>* continuation) {
+    std::unique_ptr<ReplyContinuation>* continuation,
+    const std::function<void(std::size_t)>* reserve_reply) {
     try {
+        CheckStatementCancellation();
         cql::Parsed parsed;
         try {
             parsed = cql::Parse(StatementOf(line));
@@ -799,6 +816,7 @@ std::string CommandEngine::ExecuteStatement(
             }
             if (std::holds_alternative<cql::Rollback>(parsed.statement) ||
                 std::holds_alternative<cql::Commit>(parsed.statement)) {
+                EnterStatementDecision();
                 session.transaction.reset();
             }
             return reply;
@@ -825,7 +843,11 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::Migrate& migration) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     MigrationRequest request;
-                    request.cancelled = session.backup_cancelled;
+                    std::stop_source cancelled;
+                    const auto request_stop = [&] { cancelled.request_stop(); };
+                    std::stop_callback shutdown(session.backup_cancelled, request_stop);
+                    std::stop_callback statement(StatementStopToken(), request_stop);
+                    request.cancelled = cancelled.get_token();
                     request.record = {migration.name, 0U, config_.require_auth ? session.user : std::string{}, migration.text};
                     std::visit(Overloaded{
                         [&](const cql::CreateTable& create) {
@@ -1043,6 +1065,7 @@ std::string CommandEngine::ExecuteStatement(
                         }
                     }
                     std::optional<std::vector<ColumnValue>> values;
+                    if (reserve_reply) (*reserve_reply)(BlockReplyCaptureBound(layout, columns));
                     std::optional<std::uint64_t> version;
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
@@ -1072,6 +1095,15 @@ std::string CommandEngine::ExecuteStatement(
                     if (!values) Protocol::AppendNull(reply);
                     else {
                         Protocol::AppendArrayHeader(reply, columns.size());
+                        auto response_bytes = reply.size();
+                        for (const auto index : columns) {
+                            CheckStatementCancellation();
+                            const auto bytes = ValueReplyBytes((*values)[index]);
+                            if (bytes > kMaxChunkRangeResponseBytes - response_bytes)
+                                throw std::out_of_range("GET BLOCK response exceeds the response byte limit; request fewer columns");
+                            response_bytes += bytes;
+                        }
+                        reply.reserve(response_bytes);
                         for (const std::size_t index : columns)
                             AppendValue(reply, layout.schema().columns[index], (*values)[index]);
                     }
@@ -1131,6 +1163,9 @@ std::string CommandEngine::ExecuteStatement(
                     const auto& layout = store.geometry().layout();
                     const auto columns = ColumnsOf(layout, get.columns);
                     ChunkState state;
+                    if (reserve_reply) (*reserve_reply)(ChunkReplyCaptureBound(layout,
+                        store.geometry().ChunkPayloadBytes() + ChunkPresenceBitmapBytes(store.geometry()) +
+                        (layout.has_var_columns() ? kVarMaxChunkBytesLimit : 0U)));
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
                         const ChunkCoord coord{get.chunk_x, get.chunk_y};
@@ -1148,7 +1183,8 @@ std::string CommandEngine::ExecuteStatement(
                             .presence_bitmap = std::move(state.presence_bitmap), .version = state.version,
                             .vars = std::move(state.vars)});
                         *continuation = ChunkReply(layout, std::move(entries), columns, false, false,
-                            std::numeric_limits<std::size_t>::max());
+                            64U + store.geometry().ChunkPayloadBytes() + ChunkPresenceBitmapBytes(store.geometry()) +
+                                (layout.has_var_columns() ? kVarMaxChunkBytesLimit : 0U));
                         return std::string{};
                     }
                     std::string reply;
@@ -1204,6 +1240,27 @@ std::string CommandEngine::ExecuteStatement(
                     const auto& layout = store.geometry().layout();
                     const auto columns = ColumnsOf(layout, get.columns);
                     std::vector<ChunkRangeEntry> entries;
+                    if (reserve_reply) {
+                        const auto extent = [](std::int64_t first, std::int64_t last) {
+                            if (last < first) return kMaxChunkRangeChunks;
+                            const auto delta = static_cast<std::uint64_t>(last) - static_cast<std::uint64_t>(first);
+                            return delta >= kMaxChunkRangeChunks ? kMaxChunkRangeChunks : static_cast<std::size_t>(delta + 1U);
+                        };
+                        auto count = kMaxChunkRangeChunks;
+                        if (!get.around) {
+                            const auto width = extent(get.x0, get.x1), height = extent(get.y0, get.y1);
+                            count = width > kMaxChunkRangeChunks / height ? kMaxChunkRangeChunks : width * height;
+                        } else if (get.radius >= 0 && static_cast<std::uint64_t>(get.radius) < kMaxChunkRangeChunks / 2U) {
+                            const auto diameter = static_cast<std::size_t>(get.radius) * 2U + 1U;
+                            count = diameter > kMaxChunkRangeChunks / diameter ? kMaxChunkRangeChunks : diameter * diameter;
+                        }
+                        const auto chunk_bytes = std::min<std::size_t>(kMaxChunkRangeResponseBytes,
+                            96U + store.geometry().ChunkPayloadBytes() + ChunkPresenceBitmapBytes(store.geometry()) +
+                            (layout.has_var_columns() ? kVarMaxChunkBytesLimit : 0U));
+                        const auto state_bytes = count > kMaxChunkRangeResponseBytes / chunk_bytes ?
+                            kMaxChunkRangeResponseBytes : count * chunk_bytes;
+                        (*reserve_reply)(ChunkReplyCaptureBound(layout, state_bytes));
+                    }
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
                         std::vector<ChunkCoord> covered;
@@ -1312,7 +1369,11 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::RecoverTable& recover) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, recover.table, Right::kAdmin);
-                    catalog_->RecoverTable(recover.table, session.backup_cancelled);
+                    std::stop_source cancelled;
+                    const auto request_stop = [&] { cancelled.request_stop(); };
+                    std::stop_callback shutdown(session.backup_cancelled, request_stop);
+                    std::stop_callback statement(StatementStopToken(), request_stop);
+                    catalog_->RecoverTable(recover.table, cancelled.get_token());
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::ShowTables&) {
@@ -1374,7 +1435,11 @@ std::string CommandEngine::ExecuteStatement(
                         throw std::invalid_argument("BACKUP is disabled: set --backup-dir <path>");
                     const auto target = ResolveBackupTarget(config_.backup_dir, backup.path);
                     BackupOptions options;
-                    options.cancelled = session.backup_cancelled;
+                    std::stop_source cancelled;
+                    const auto request_stop = [&] { cancelled.request_stop(); };
+                    std::stop_callback shutdown(session.backup_cancelled, request_stop);
+                    std::stop_callback statement(StatementStopToken(), request_stop);
+                    options.cancelled = cancelled.get_token();
                     std::string reply;
                     options.before_publish = [&](const BackupResult& result) {
                         Protocol::AppendMapHeader(reply, 4);
@@ -1415,6 +1480,7 @@ std::string CommandEngine::ExecuteStatement(
                     return TxnCommit(session);
                 },
                 [&](const cql::Rollback&) {
+                    EnterStatementDecision();
                     session.transaction.reset();
                     return Protocol::SimpleString("OK");
                 },
@@ -1581,7 +1647,9 @@ std::string CommandEngine::TxnBegin(SessionState& session) {
     if (session.transaction != nullptr) {
         throw std::invalid_argument("a transaction is already open; COMMIT or ROLLBACK it first");
     }
-    session.transaction = std::make_unique<SessionTransaction>(&txn_total_bytes_, std::chrono::steady_clock::now());
+    auto transaction = std::make_unique<SessionTransaction>(&txn_total_bytes_, std::chrono::steady_clock::now());
+    EnterStatementDecision();
+    session.transaction = std::move(transaction);
     return Protocol::SimpleString("OK");
 }
 
@@ -1661,6 +1729,7 @@ void CommandEngine::TxnWrite(
         }
     };
     try {
+        EnterStatementDecision();
         change(state);
         state.written = was_written || std::any_of(state.presence_bitmap.begin(), state.presence_bitmap.end(),
                                                   [](std::uint8_t byte) { return byte != 0; });

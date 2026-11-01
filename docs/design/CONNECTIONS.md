@@ -33,6 +33,13 @@ Reserving a complete request prevents multiple incomplete bodies from exhausting
 Credits remain charged while a worker owns the parameters and are released once on completion, refusal or final close.
 Request-line buffers obey their negotiated line bound and a separate aggregate byte bound; reserved control capacity remains available while data framing is paused.
 Unclassified request lines use reserved line credit, so data-only credit cannot prevent receiving a new HELLO or control line.
+Replies charge their retained immutable state and encoded buffers against 2147483648 bytes of shared output credit.
+Authentication and control replies use a separate 16777216-byte output reserve.
+Execution reserves a checked conservative state, schema and encoding bound before collecting a large result snapshot.
+The connection retains that reservation through the final encoded buffer even when the continuation has already finished.
+SHOW CONNECTIONS reserves its complete response ceiling before enumeration and refuses a listing exceeding that ceiling.
+An ordinary result that cannot obtain output credit refuses snapshot capture and returns BUSY before any response byte.
+Unclassified and reserved control line limits grow only when a larger configured per-line limit requires it.
 
 ## Cancellation and deadlines
 
@@ -44,6 +51,11 @@ Every durable mutation checks cancellation before its first irreversible decisio
 Decision-entered work completes with its real result, including existing ambiguous-outcome errors.
 No cancellation check follows an irreversible decision merely to replace its result.
 Read-only work checks cancellation at bounded traversal and lock-admission boundaries.
+Chunk admission keeps explicit reader, exclusive-owner and queued-writer state under one mutex and waits on a stop-aware condition.
+An uncontended acquisition checks that state before registering any stop callback; queued writers prevent new readers from overtaking them.
+Wait registration, predicate evaluation and ownership release share that mutex, so sleeping cannot lose a release notification or depend on a spurious native try-lock failure.
+Statement admission uses cancellable overloads and adopts ownership only after checking the accepted stop; cancellation releases any concurrently acquired ownership before returning a not-applied result.
+Cleanup and background paths keep uncancellable lock operations, and the Windows serial-reader configuration continues to exclude simultaneous readers.
 Cancelling one request never carries over to the next request on that connection.
 
 `--statement-timeout-ms` defaults to zero, which disables the timeout.
