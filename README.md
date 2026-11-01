@@ -19,7 +19,7 @@ GET BLOCK 0 0 FROM example_grid
 
 ```output
 OK
-2
+1
 kind = 1
 name = 'grass'
 ```

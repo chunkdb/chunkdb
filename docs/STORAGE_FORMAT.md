@@ -387,16 +387,18 @@ Older readers that do not understand the live counter conservatively reject an o
 Intents live under `.chunkdb.intents/`; their publication and removal are file/directory synced in every durability mode.
 A conditional intent is named from its WAL's relative path with `/` replaced by `__`, plus `.rollback`, for example `L_0_0__C_0_0.wal.rollback`.
 Its exact 16-byte record is `CKRB` (rollback) or `CKRC` (committed), pre-command WAL byte length `u64`, then CRC32 over the first 12 bytes.
-A transaction intent is `txn-<decimal revision>.rollback` and has `20 + 24 * count` bytes:
+A transaction intent is `txn-<canonical nonzero decimal revision>.rollback` and has `40 + (8 * dims + 8) * count` bytes:
 
-1. `CKTB` (rollback) or `CKTC` (committed), transaction revision `u64`, written-chunk count `u32` (1–64).
-2. Per chunk: x/y `i64`, pre-commit WAL byte length `u64`; zero means no preceding WAL.
-3. CRC32 over all preceding bytes.
+1. `CKTI`, format `u16` equal to 2, state `u8` (0 rollback, 1 committed), and table dimension count `u8`.
+2. Table identity (16 bytes), transaction revision `u64`, and written-chunk count `u32` (1–64).
+3. Per chunk in strictly increasing coordinate order: each active coordinate `i64`, then pre-commit WAL byte length `u64`; zero means no preceding WAL.
+4. CRC32 over all preceding bytes.
 
 Before mutation, writers establish a durable baseline and publish the rollback intent.
-After syncing the new WAL frames, atomic synced replacement with CKRC/CKTC commits the operation.
+After syncing the new WAL frames, atomic synced replacement with a committed intent commits the operation.
 Every changed transaction chunk uses the same revision and commit time.
-Recovery validates all transaction intents before changing WALs, resolves conditional intents first, then transaction intents.
+Recovery validates all transaction intents and each rollback member's complete retained prefix before changing any WAL.
+It resolves conditional intents first, then transaction intents.
 
 Rollback truncates/removes each WAL to its recorded boundary; a missing or shorter nonzero prefix is damage.
 Committed intents preserve WAL effects, including WALs subsequently checkpointed away; removal and directory sync finish recovery idempotently.

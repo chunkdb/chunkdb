@@ -380,7 +380,8 @@ void CrashAtSnapshotFailpoint(const char* key) {
 }
 
 [[nodiscard]] ReadOnlyArtifactSnapshot ReadArtifactForSnapshot(
-    const std::filesystem::path& path) {
+    const std::filesystem::path& path,
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>* reader = nullptr) {
     std::error_code status_ec;
     const auto status = std::filesystem::symlink_status(path, status_ec);
     if (status_ec == std::errc::no_such_file_or_directory ||
@@ -400,7 +401,7 @@ void CrashAtSnapshotFailpoint(const char* key) {
     try {
         return {
             .present = true,
-            .bytes = LoadFile(path),
+            .bytes = reader == nullptr ? LoadFile(path) : (*reader)(path),
         };
     } catch (const std::exception& load_error) {
         // An atomic replacement/removal between status and open is namespace
@@ -467,11 +468,12 @@ void CrashAtSnapshotFailpoint(const char* key) {
     const std::filesystem::path& intent_path,
     const std::filesystem::path& txn_intent_dir,
     std::size_t collection,
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& image_reader,
     const std::function<void(
         std::size_t,
         ReadOnlySnapshotArtifact)>& observation) {
     ReadOnlyChunkDiskSnapshot snapshot;
-    snapshot.image = ReadArtifactForSnapshot(data_path);
+    snapshot.image = ReadArtifactForSnapshot(data_path, &image_reader);
     observation(collection, ReadOnlySnapshotArtifact::kImage);
     snapshot.wal = ReadArtifactForSnapshot(wal_path);
     observation(collection, ReadOnlySnapshotArtifact::kWal);
@@ -593,6 +595,7 @@ std::optional<SnapshotGenerationObservation> StableSnapshotGeneration(
     const std::filesystem::path& generation_path,
     bool generation_record_required,
     const ChunkCoord& chunk_coord,
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& image_reader,
     const std::function<void(
         std::size_t,
         ReadOnlySnapshotArtifact)>& observation) {
@@ -610,7 +613,7 @@ std::optional<SnapshotGenerationObservation> StableSnapshotGeneration(
             const auto before =
                 ReadSnapshotGeneration(generation_path, generation_record_required);
             auto snapshot = CollectReadOnlyChunkDiskSnapshot(
-                data_path, wal_path, intent_path, txn_intent_dir, attempt, observation);
+                data_path, wal_path, intent_path, txn_intent_dir, attempt, image_reader, observation);
             const auto after =
                 ReadSnapshotGeneration(generation_path, generation_record_required);
             if ((before.second & 1U) == 0U && before == after &&

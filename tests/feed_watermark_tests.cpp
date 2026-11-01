@@ -195,7 +195,24 @@ void ResumeAtReservationGap() {
     assert(Next(*feed)->position.revision == first); // Ring admission signal.
     {
         auto lease = table->Acquire();
-        gap = lease->store().GetChunkVersion(1, 0); // Cold cache reservation, no mutation.
+        assert(lease->store().GetChunkVersion(1, 0) == 0);
+        struct FailedReservation : FeedTestHook {
+            std::uint64_t reserved = 0;
+            void Run(Point point, std::uint64_t revision) override {
+                if (point != Point::kAfterVersion) return;
+                reserved = revision;
+                throw std::runtime_error("resume-gap rejected before publication");
+            }
+        } failed;
+        FeedTestAccess::SetWriteHook(*table, &failed);
+        bool rejected = false;
+        try { lease->store().SetBlockBits(4, 0, Bits(3)); }
+        catch (const std::runtime_error& error) {
+            rejected = std::string(error.what()) == "resume-gap rejected before publication";
+        }
+        FeedTestAccess::SetWriteHook(*table, nullptr);
+        assert(rejected);
+        gap = failed.reserved;
         assert(!lease->store().GetBlockWithVersion(4, 0).version);
         lease->store().SetBlockBits(0, 0, Bits(2));
         later = lease->store().GetChunkVersion(0, 0);
