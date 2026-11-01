@@ -126,7 +126,7 @@ void Rights(bool tls) {
     auto admin = harness.Connect();
     admin->Ok("CREATE TABLE hidden (n u8) CHUNK 2 x 2");
     const std::array<std::uint8_t, 16> salt{};
-    const auto verifier = scram::FormatVerifier(scram::MakeVerifier("pw", salt, scram::kMinIterations));
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
     admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
     admin->Ok("GRANT ADMIN ON * TO reader");
     Client reader(harness.port, tls); reader.Login("reader", "pw");

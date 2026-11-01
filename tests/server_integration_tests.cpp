@@ -346,7 +346,7 @@ std::string LoginReply(Client& client, const std::string& user, const std::strin
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
-    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive AUTH response");
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: build prepared AUTH response");
     const auto step = chunkdb::test::AuthBytes(login, password, first);
     client.SendBytes(step.bytes);
     const auto fields = ReadHelloReply(client);
@@ -358,15 +358,17 @@ std::string LoginReply(Client& client, const std::string& user, const std::strin
 
 // A login with a wrong password: the error line.
 template <typename Client>
-std::string FailedLoginReply(Client& client, const std::string& user, const std::string& password) {
+std::string FailedLoginReply(Client& client, const std::string& user, const std::string& /*password*/) {
     const auto login = chunkdb::scram::StartClientLogin(user, chunkdb::scram::NewNonce());
     client.SendBytes(chunkdb::test::HelloUserBytes(login, user));
     const std::string first = client.ReadLine();
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
-    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive rejected AUTH response");
-    client.SendBytes(chunkdb::test::AuthBytes(login, password, first).bytes);
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: send rejected AUTH response");
+    // Wrong-password cryptography is covered by the RFC exchange tests.
+    // The timed socket fixture needs an invalid proof without key derivation.
+    client.SendBytes(chunkdb::test::WrongAuthBytes(first));
     return client.ReadLine();
 }
 
@@ -3103,7 +3105,7 @@ void TestTlsReload() {
 
     // READ on a table is not enough.
     const std::array<std::uint8_t, 16> salt{};
-    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
     open.SendLine("CREATE USER reader VERIFIER '" + verifier + "'");
     assert(open.ReadLine() == "+OK\r\n");
     open.SendLine("GRANT READ ON default TO reader");
@@ -4368,7 +4370,7 @@ void TestWatchPositionsAndRights() {
     ServerHarness harness("watch-positions", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
     RawClient writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
     const std::array<std::uint8_t, 16> salt{};
-    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
     writer.SetReadDeadline(std::chrono::seconds(15));
     writer.SendLine("CREATE USER reader VERIFIER '" + verifier + "'"); assert(writer.ReadLine() == "+OK\r\n");
     RawClient reader("127.0.0.1", harness.port); reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login("reader", "pw");
