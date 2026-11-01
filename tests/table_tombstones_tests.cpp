@@ -33,6 +33,8 @@ void operator delete[](void* pointer) noexcept { ::operator delete(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
 void operator delete[](void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
 
+#include "aligned_allocation_replacement.hpp"
+
 namespace chunkdb {
 struct FeatureActivationTestAccess {
     static void ReleaseGeometryCopyStorage(Table& table) {
@@ -295,6 +297,9 @@ void CrashRequiredResurrection(const char* executable) {
 }
 }
 int main(int argc, char** argv) {
+    allocation::fail_next = true;
+    assert(aligned_allocation_test::Refused(1024U) && !allocation::fail_next);
+    aligned_allocation_test::Succeeds(1024U);
     if (argc > 1 && std::string_view(argv[1]) == "--repeat") { RepeatedCompactionRetainsCurrentState(); return 0; }
     if (argc == 6 && std::string_view(argv[1]) == "--compaction-crash") {
         const auto root = std::filesystem::path(argv[2]);
