@@ -1442,6 +1442,11 @@ std::string CommandEngine::ExecuteStatement(
                     options.cancelled = cancelled.get_token();
                     std::string reply;
                     options.before_publish = [&](const BackupResult& result) {
+                        if (reserve_reply) {
+                            if (result.tables.size() > (std::numeric_limits<std::size_t>::max() - 1024U) / 512U)
+                                throw ReplyAdmissionError("backup reply bound overflows");
+                            (*reserve_reply)(1024U + 512U * result.tables.size());
+                        }
                         Protocol::AppendMapHeader(reply, 4);
                         Protocol::AppendBulk(reply, "tables");
                         Protocol::AppendInteger(reply, static_cast<std::uint64_t>(result.tables.size()));

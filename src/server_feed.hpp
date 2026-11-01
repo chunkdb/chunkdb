@@ -15,6 +15,7 @@ struct ConnectionRecord {
     std::string user, peer, state = "handshake", verb;
     std::shared_ptr<StatementControl> statement;
     std::atomic<bool> killed{false};
+    std::atomic<bool> self_kill_reply{false};
 };
 struct ServerConnection : public std::enable_shared_from_this<ServerConnection> {
     server_detail::SocketHandle socket = server_detail::kInvalidSocket;
@@ -49,6 +50,7 @@ struct ServerConnection : public std::enable_shared_from_this<ServerConnection> 
     std::size_t payload_credit_bytes = 0U;
     std::shared_ptr<ConnectionRecord> record = std::make_shared<ConnectionRecord>();
     bool worker_queued = false;
+    bool irreversible_reply = false;
     // The client's address and "[address]:port": the socket's peer, or the
     // source a PROXY header carried. Set when the connection starts.
     std::string peer_address;

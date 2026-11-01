@@ -26,11 +26,12 @@ struct FeedDeliveryTestHook {
         kBeforeQueuedStopScan, kAfterQueuedStopClaim, kBeforeStatementStart, kAfterStatementStartRefused,
         kAfterStatementQueued, kAfterFeedReplyQueue, kFeedInputBackpressure, kAfterRunningStopPublication,
         kBeforeReplyBufferWrite, kAfterReplyBufferWrite, kAfterBlockedReplyWrite, kAfterAuthReplyScheduled,
-        kAfterPayloadCreditQueued, kAfterPayloadCreditGranted };
+        kAfterPayloadCreditQueued, kAfterPayloadCreditGranted, kAfterStatementTrackerScan };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
 struct FeedDeliveryTestAccess {
+    static int SetActiveClientSendBuffer(ChunkServer& server, int bytes);
     static void SetHook(ChunkServer& server, FeedDeliveryTestHook* hook);
     // Observe existing scheduling without adding a wake before shutdown.
     static void SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
@@ -38,6 +39,7 @@ struct FeedDeliveryTestAccess {
     static std::shared_ptr<StatementControl> CurrentStatement(ChunkServer& server, std::uint64_t id);
     static bool ConnectionStillOwned(ChunkServer& server, std::uint64_t id);
     static void WakeTransport(ChunkServer& server);
+    static std::shared_ptr<void> ReserveReplyCredit(ChunkServer& server, std::size_t bytes);
   private:
     static void InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake);
 };

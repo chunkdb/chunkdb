@@ -29,6 +29,14 @@ bool ChunkServer::HandleClient(
                 connection->record->state = "running";
             }
             connection->worker_queued = false;
+            if (!io->ReserveReply(*connection, 65536U, false)) {
+                const auto stopped = control->Complete();
+                connection->parameters.clear();
+                connection->payload_credit.reset();
+                io->Reply(*connection, stopped ? StatementStoppedReply(*stopped) :
+                    Protocol::Error("BUSY", "reply admission budget is full", {{"reason", "reply_budget"}}));
+                return ParkClient(connection);
+            }
             {
                 ScopedStatementControl context(control.get());
                 const std::function<void(std::size_t)> reserve_reply = [&](std::size_t bytes) {
@@ -49,15 +57,15 @@ bool ChunkServer::HandleClient(
                     if (session.slot_watch) session.slot_watch->Cancel();
                     session.slot_watch.reset();
                 }
+                connection->irreversible_reply = control->decision_entered();
             }
             connection->parameters.clear();
             connection->payload_credit.reset();
-            if (connection->response.starts_with('-')) {
-                connection->reply_credit.reset();
-                connection->reply_credit_bytes = 0U;
-            }
             const auto encoded_buffer = connection->response.capacity() + (connection->reply_continuation ? 65536U : 0U);
+            if (connection->record->killed.load() && !connection->irreversible_reply) return false;
             if (!io->ReserveReply(*connection, encoded_buffer, false)) {
+                // A lost reply after an irreversible decision is ambiguous, never a retryable refusal.
+                if (control->decision_entered()) return false;
                 connection->reply_continuation.reset();
                 std::string{}.swap(connection->response);
                 io->Reply(*connection, Protocol::Error("BUSY", "reply capture budget is full", {{"reason", "reply_budget"}}));

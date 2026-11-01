@@ -37,6 +37,7 @@ class StatementControl {
     // Result admission must observe any accepted pre-decision stop.
     std::optional<StatementStopReason> Complete();
     [[nodiscard]] Phase phase() const;
+    [[nodiscard]] bool decision_entered() const;
     [[nodiscard]] std::optional<Clock::time_point> deadline() const noexcept { return deadline_; }
     [[nodiscard]] std::stop_token StopToken();
   private:
@@ -48,6 +49,7 @@ class StatementControl {
     mutable std::mutex mutex_;
     Phase phase_ = Phase::kQueued;
     StatementStopReason reason_ = StatementStopReason::kNone;
+    bool decision_entered_ = false;
     std::stop_source stop_{std::nostopstate};
 };
 

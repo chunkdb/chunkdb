@@ -128,6 +128,17 @@ void AggregateCreditIsBoundedAndReturnedOnce() {
     assert(returned.load() == 1U && data->TryAcquire(7U));
     Reject([&] { (void)data->TryAcquire(11U); });
     second.reset();
+    auto growing = data->TryAcquire(4U);
+    auto remainder = data->TryAcquire(6U);
+    assert(growing && remainder && !data->TryResize(growing, 5U));
+    assert(!controls->TryResize(growing, 5U));
+    remainder.reset();
+    assert(data->TryResize(growing, 10U) && !data->TryAcquire(1U));
+    assert(data->TryResize(growing, 3U));
+    auto rest = data->TryAcquire(7U);
+    assert(rest && !data->TryAcquire(1U));
+    rest.reset(); growing.reset();
+    assert(data->TryAcquire(10U));
     std::atomic<std::size_t> admitted{0U};
     auto one = std::make_shared<ConnectionByteBudget>(1U, [] {});
     std::barrier acquired(9), release(9);

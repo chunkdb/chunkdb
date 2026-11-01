@@ -116,7 +116,10 @@ void StatementControl::EnterDecision() {
         if (phase_ == Phase::kQueued) throw std::logic_error("queued statement cannot enter a decision");
         if (ExpireLocked()) stop = stop_;
         reason = reason_;
-        if (reason == StatementStopReason::kNone) phase_ = Phase::kDecisionEntered;
+        if (reason == StatementStopReason::kNone) {
+            phase_ = Phase::kDecisionEntered;
+            decision_entered_ = true;
+        }
     }
     stop.request_stop();
     if (reason != StatementStopReason::kNone) throw StatementStoppedError(reason);
@@ -138,6 +141,10 @@ std::optional<StatementStopReason> StatementControl::Complete() {
 StatementControl::Phase StatementControl::phase() const {
     std::lock_guard lock(mutex_);
     return phase_;
+}
+bool StatementControl::decision_entered() const {
+    std::lock_guard lock(mutex_);
+    return decision_entered_;
 }
 
 std::stop_token StatementControl::StopToken() {

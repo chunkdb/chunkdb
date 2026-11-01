@@ -36,6 +36,8 @@ Unclassified request lines use reserved line credit, so data-only credit cannot 
 Replies charge their retained immutable state and encoded buffers against 2147483648 bytes of shared output credit.
 Authentication and control replies use a separate 16777216-byte output reserve.
 Execution reserves a checked conservative state, schema and encoding bound before collecting a large result snapshot.
+Every statement reserves its bounded ordinary reply before execution and may upgrade that reservation before large snapshot capture or backup publication.
+Credit refusal before execution returns BUSY; a reply lost after an irreversible decision closes the connection as an ambiguous outcome instead of claiming a retryable refusal.
 The connection retains that reservation through the final encoded buffer even when the continuation has already finished.
 SHOW CONNECTIONS reserves its complete response ceiling before enumeration and refuses a listing exceeding that ceiling.
 An ordinary result that cannot obtain output credit refuses snapshot capture and returns BUSY before any response byte.
@@ -77,6 +79,7 @@ Authorization uses currently published rights at control admission.
 `CANCEL id` returns `{cancelled: bool}`; missing, idle and decision-entered targets return false.
 `KILL CONNECTION id` returns `{killed: bool}` and requests closure without discarding a decision-entered result.
 Self-CANCEL returns false and self-KILL sends its control reply before closing.
+KILL discards a pending read-only reply and releases its retained state immediately; only an irreversible outcome and the self-KILL acknowledgement retain output ownership until their reply ends.
 WATCH has completed its initiating statement, so CANCEL returns false and KILL uses the existing accepted-ACK teardown.
 Kill, cancel and feature activation emit audit events without statement parameters or credentials.
 

@@ -56,6 +56,10 @@ bool FeedDeliveryTestAccess::ConnectionStillOwned(ChunkServer& server, std::uint
 void FeedDeliveryTestAccess::WakeTransport(ChunkServer& server) {
     if (auto io = server.IdleIoHandle()) io->Wake();
 }
+std::shared_ptr<void> FeedDeliveryTestAccess::ReserveReplyCredit(ChunkServer& server, std::size_t bytes) {
+    if (auto io = server.IdleIoHandle()) return io->data_output_credit_->TryAcquire(bytes);
+    return {};
+}
 void FeedDeliveryTestAccess::InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake) {
     auto io = server.FeedIoHandle();
     server.delivery_test_hook_.store(hook, std::memory_order_release);

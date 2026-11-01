@@ -65,6 +65,26 @@ void SetServerSocketConfigFailpointForTests(
     std::size_t nonblocking_failures) noexcept;
 void ResetServerTimeoutConfigCountersForTests() noexcept;
 std::uint64_t ServerRecvTimeoutConfigCallsForTests() noexcept;
+int FeedDeliveryTestAccess::SetActiveClientSendBuffer(ChunkServer& server, int bytes) {
+    std::lock_guard lock(server.active_clients_mutex_);
+    assert(server.active_clients_.size() == 1U);
+    const auto socket = static_cast<
+#ifdef _WIN32
+        SOCKET
+#else
+        int
+#endif
+    >(server.active_clients_.front());
+    assert(setsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
+    int actual = 0;
+#ifdef _WIN32
+    int length = sizeof(actual);
+#else
+    socklen_t length = sizeof(actual);
+#endif
+    assert(getsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&actual), &length) == 0);
+    return actual;
+}
 }
 
 namespace {
@@ -1171,6 +1191,8 @@ class TlsClient {
         return false;
     }
 
+    const std::string& Received() const noexcept { return pending_; }
+
   private:
     std::string host_;
     std::uint16_t port_ = 0;
@@ -1883,6 +1905,41 @@ void TestProgressiveReplyOwnsSnapshot(bool tls, bool area) {
     hook.Release();
     assert(reader.ReadReply() == expected);
     reader.SendLine("PING"); assert(reader.ReadLine() == "+PONG\r\n");
+}
+
+template <typename Client>
+void TestKillReadReplyReleasesCredit(bool tls) {
+    ProgressiveReplyHook hook;
+    auto store = BaseStoreConfig();
+    store.geometry.chunk_width_blocks = 256U;
+    store.geometry.chunk_height_blocks = 256U;
+    store.geometry.block_bits = 16U;
+    auto config = BaseServerConfig(); config.tls_enabled = tls; config.worker_threads = 1U;
+    config.client_io_timeout_ms = 30000U;
+    ServerHarness harness("kill-read-reply", store, chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { ProgressiveReplyHook& hook; ~Release() { hook.Release(); } } release{hook};
+    {
+        auto lease = harness.catalog->Require("default")->Acquire();
+        lease->store().SetBlockBits(0, 0, "1000000000000000");
+    }
+    Client reader("127.0.0.1", harness.port); reader.SetReadDeadline(std::chrono::seconds(10));
+    reader.SendLine("HELLO 3");
+    const auto id = std::stoull(ReadHelloReply(reader).at("connection_id"));
+    Client controller("127.0.0.1", harness.port); controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    reader.SendLine("GET CHUNK 0 0 FROM default");
+    hook.Wait();
+    controller.SendLine("KILL CONNECTION " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    hook.Release();
+    const auto header = reader.ReadLine();
+    assert(header.starts_with('$'));
+    const auto expected_body = std::stoull(header.substr(1)) + 2U;
+    assert(reader.WaitForClose(std::chrono::seconds(5)));
+    assert(reader.Received().size() < expected_body);
+    assert(!chunkdb::FeedDeliveryTestAccess::ConnectionStillOwned(*harness.server, id));
+    auto returned = chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, 2147483648ULL);
+    assert(returned);
 }
 
 class BufferedWorkerHook : public chunkdb::FeedDeliveryTestHook {
@@ -4102,6 +4159,38 @@ void TestWideNullableReadHasBoundedReplyAdmission() {
     assert(client.ReadLine().starts_with("-ERR OUT_OF_RANGE"));
     client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
 }
+class StatementTrackerHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t count) override {
+        if (point != Point::kAfterStatementTrackerScan) return;
+        last.store(count);
+        maximum.store(std::max(maximum.load(), count));
+    }
+    std::atomic<std::size_t> last{0U}, maximum{0U};
+};
+void TestReplyAdmissionPrecedesMutation() {
+    StatementTrackerHook hook;
+    ServerHarness harness("reply-credit-before-write", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port); client.SetReadDeadline(std::chrono::seconds(5)); client.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    auto credit = chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, 2147483648ULL);
+    assert(credit);
+    for (std::size_t i = 0U; i < 8U; ++i) {
+        client.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
+        assert(client.ReadLine().starts_with("-ERR BUSY reason=reply_budget"));
+    }
+    client.SendLine("SHOW CONNECTIONS");
+    assert(client.ReadReply().starts_with('*'));
+    assert(hook.last.load() == 0U && hook.maximum.load() <= 1U);
+    {
+        auto lease = harness.catalog->Require("default")->Acquire();
+        assert(!lease->store().GetBlock(0, 0).has_value());
+    }
+    credit.reset();
+    client.SendLine("SET BLOCK 0 0 IN default bits = b'1000'"); (void)ReadVersion(client);
+    auto lease = harness.catalog->Require("default")->Acquire();
+    assert(lease->store().GetBlockBits(0, 0) == "1000");
+}
 
 void TestSteadyReaderRenewsReplyProgressDeadline() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
@@ -4132,6 +4221,7 @@ void TestSteadyReaderRenewsReplyProgressDeadline() {
     RawClient slow("127.0.0.1", harness.port);
     slow.SetReceiveBuffer(1048576);
     slow.Hello();
+    assert(chunkdb::FeedDeliveryTestAccess::SetActiveClientSendBuffer(*harness.server, 65536) > 0);
     slow.SendBytes("GET CHUNK 0 0 FROM default\r\nGET CHUNK 0 0 FROM default\r\n");
     assert(slow.ReadLine().starts_with('$'));
     const auto start = Clock::now();
@@ -6148,12 +6238,14 @@ int main(int argc, char** argv) {
         run("TestBufferedRequestsRetainWorker", TestBufferedRequestsRetainWorker);
         run("TestProgressiveChunkReplyOwnsSnapshot", [] { TestProgressiveReplyOwnsSnapshot<RawClient>(false, false); });
         run("TestProgressiveAreaReplyOwnsSnapshot", [] { TestProgressiveReplyOwnsSnapshot<RawClient>(false, true); });
+        run("TestKillReadReplyReleasesCredit", [] { TestKillReadReplyReleasesCredit<RawClient>(false); });
         run("TestHelloIndependentOfStatementWorkers", [] { TestHelloIndependentOfStatementWorkers<RawClient>(false); });
         run("TestPartialInputDoesNotHoldWorker", [] { TestPartialInputDoesNotHoldWorker<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestIdleConnectionsReleaseWorkerTls", [] { TestIdleConnectionsReleaseWorker<TlsClient>(true); });
         run("TestProgressiveChunkReplyOwnsSnapshotTls", [] { TestProgressiveReplyOwnsSnapshot<TlsClient>(true, false); });
         run("TestProgressiveAreaReplyOwnsSnapshotTls", [] { TestProgressiveReplyOwnsSnapshot<TlsClient>(true, true); });
+        run("TestKillReadReplyReleasesCreditTls", [] { TestKillReadReplyReleasesCredit<TlsClient>(true); });
         run("TestHelloIndependentOfStatementWorkersTls", [] { TestHelloIndependentOfStatementWorkers<TlsClient>(true); });
         run("TestPartialInputDoesNotHoldWorkerTls", [] { TestPartialInputDoesNotHoldWorker<TlsClient>(true); });
 #endif
@@ -6211,6 +6303,7 @@ int main(int argc, char** argv) {
         run("TestBeforeHelloIdleDeadlineRemainsBounded", [] { TestLongIdleConnectionTimeoutReleasesWorker(false); });
         run("TestQueuedStatementTimeoutPreservesConnection", TestQueuedStatementTimeoutPreservesConnection);
         run("TestWideNullableReadHasBoundedReplyAdmission", TestWideNullableReadHasBoundedReplyAdmission);
+        run("TestReplyAdmissionPrecedesMutation", TestReplyAdmissionPrecedesMutation);
         run("TestRemovingCreditHeadAdmitsNextWaiter", TestRemovingCreditHeadAdmitsNextWaiter);
         run("TestKillIdleTransactionReleasesHistory", [] { TestKillIdleTransactionReleasesHistory<RawClient>(false); });
         run("TestKillDecidedCommitPreservesOutcome", [] { TestKillDecidedCommitPreservesOutcome<RawClient>(false); });

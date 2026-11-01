@@ -42,6 +42,28 @@ class ConnectionByteBudget : public std::enable_shared_from_this<ConnectionByteB
         credit->held_ = true;
         return credit;
     }
+    [[nodiscard]] bool Owns(const std::shared_ptr<Credit>& credit) const noexcept {
+        return credit && credit->pool_.get() == this;
+    }
+    [[nodiscard]] bool TryResize(const std::shared_ptr<Credit>& credit, std::size_t bytes) {
+        if (!Owns(credit) || bytes > limit_) return false;
+        bool released = false;
+        {
+            std::lock_guard lock(mutex_);
+            if (!credit->held_) return false;
+            if (bytes > credit->bytes_) {
+                const auto extra = bytes - credit->bytes_;
+                if (extra > limit_ - used_) return false;
+                used_ += extra;
+            } else {
+                used_ -= credit->bytes_ - bytes;
+                released = bytes != credit->bytes_;
+            }
+            credit->bytes_ = bytes;
+        }
+        if (released) wake_();
+        return true;
+    }
   private:
     const std::size_t limit_;
     std::function<void()> wake_;

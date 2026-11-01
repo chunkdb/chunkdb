@@ -61,7 +61,6 @@ bool IdleIo::Add(std::shared_ptr<ServerConnection> connection) {
 
 void IdleIo::Reply(ServerConnection& connection, std::string response) {
     connection.response = std::move(response);
-    if (connection.response.starts_with('-')) connection.reply_credit.reset();
     if (!ReserveReply(connection, connection.response.capacity(), true)) {
         connection.session.close_after_reply = true;
         std::string{}.swap(connection.response);
@@ -85,10 +84,16 @@ void IdleIo::Reply(ServerConnection& connection, std::string response) {
 }
 
 bool IdleIo::ReserveReply(ServerConnection& connection, std::size_t bytes, bool control) {
-    if (connection.reply_credit) return bytes <= connection.reply_credit_bytes;
+    if (connection.reply_credit && bytes <= connection.reply_credit_bytes) return true;
     const auto limit = control ? 16777216ULL : 2147483648ULL;
     if (bytes > limit) return false;
-    auto credit = (control ? control_output_credit_ : data_output_credit_)->TryAcquire(bytes);
+    const auto& pool = control ? control_output_credit_ : data_output_credit_;
+    if (pool->Owns(connection.reply_credit)) {
+        if (!pool->TryResize(connection.reply_credit, bytes)) return false;
+        connection.reply_credit_bytes = bytes;
+        return true;
+    }
+    auto credit = pool->TryAcquire(bytes);
     if (!credit) return false;
     connection.reply_credit = std::move(credit);
     connection.reply_credit_bytes = bytes;
@@ -188,6 +193,7 @@ bool IdleIo::Initialize(ServerConnection& connection) {
     controls->kill = [this, lookup](const SessionControlAccess& access, std::uint64_t id) {
         const auto target = lookup(access, id);
         if (!target) return false;
+        if (id == access.requester_connection_id) target->record->self_kill_reply.store(true);
         const bool killed = !target->record->killed.exchange(true);
         std::shared_ptr<StatementControl> statement;
         { std::lock_guard lock(target->record->mutex); statement = target->record->statement; }
@@ -423,6 +429,8 @@ void IdleIo::CheckStatements() {
         }
     }
     std::erase_if(statements_, [](const auto& tracked) { return !tracked.statement; });
+    if (auto* hook = server_.delivery_test_hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterStatementTrackerScan, statements_.size());
 }
 
 void IdleIo::PumpCredits() {
@@ -521,6 +529,7 @@ bool IdleIo::Write(ServerConnection& connection) {
     connection.output_deadline.reset();
     connection.session.reply_not_before = {};
     connection.session.request_admitted = false;
+    connection.irreversible_reply = false;
     {
         std::lock_guard lock(connection.record->mutex);
         connection.record->user = connection.session.user;
@@ -657,8 +666,9 @@ void IdleIo::Run() {
             PumpCredits();
             for (auto& connection : clients) {
                 bool alive = true;
-                if (connection->record->killed.load() && connection->phase != ServerConnection::Phase::kReply)
-                    alive = false;
+                if (connection->record->killed.load() &&
+                    (connection->phase != ServerConnection::Phase::kReply ||
+                     (!connection->irreversible_reply && !connection->record->self_kill_reply.load()))) alive = false;
                 try { if (alive) alive = Progress(*connection); }
                 catch (const std::invalid_argument& error) {
                     alive = RejectProtocol(*connection, error);

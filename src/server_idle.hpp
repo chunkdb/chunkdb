@@ -27,6 +27,7 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
 
   private:
     friend class ChunkServer;
+    friend struct FeedDeliveryTestAccess;
     void Run();
     bool Initialize(ServerConnection& connection);
     bool Progress(ServerConnection& connection);

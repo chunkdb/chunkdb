@@ -84,6 +84,7 @@ Missing, idle, decision-entered and self targets return false.
 An accepted cancellation ends that statement with `CANCELLED applied=false` and leaves the connection available for its next request.
 `KILL CONNECTION id` returns `{killed: bool}` and closes the target after any decision-entered statement completes.
 Self-KILL sends its reply before closing.
+KILL closes a pending read-only reply immediately and releases its retained state.
 WATCH has completed its initiating statement, so CANCEL returns false and KILL releases its subscription and slot ownership.
 
 ## Parameters

@@ -3,6 +3,7 @@
 #include "user_registry.hpp"
 #include "test_utils.hpp"
 #include "catalog_test_utils.hpp"
+#include "backup.hpp"
 
 #include <cassert>
 #include <chrono>
@@ -14,6 +15,7 @@ namespace chunkdb {
 struct FeatureActivationTestAccess {
     static auto Metadata(TableCatalog& catalog) { return std::unique_lock(catalog.feature_metadata_gate_); }
     static auto Operations(TableCatalog& catalog) { return std::unique_lock(catalog.operations_mutex_); }
+    static auto Resident(ChunkStore& store) { return store.GetOrLoadRegularChunk({0, 0}); }
 };
 struct StatementChunkLockTestAccess {
     static void WaitWriter(RegularChunkMutex& mutex) {
@@ -303,6 +305,85 @@ void CancellationRacesChunkAdmissionRelease() {
         assert(mutex.try_lock()); mutex.unlock();
     }
 }
+class BackupAdmissionGate final : public BackupTestHook {
+  public:
+    explicit BackupAdmissionGate(Point point) : point_(point) {}
+    void Run(Point point, std::string_view, std::uint64_t) override {
+        if (point != point_) return;
+        std::unique_lock lock(mutex_);
+        if (entered_) return;
+        entered_ = true; changed_.notify_all();
+        changed_.wait(lock, [&] { return released_; });
+    }
+    void Wait(std::future<bool>& command) {
+        std::unique_lock lock(mutex_);
+        const bool entered = changed_.wait_for(lock, 5s, [&] { return entered_; });
+        if (!entered && command.wait_for(0s) == std::future_status::ready) (void)command.get();
+        assert(entered);
+    }
+    void Release() { { std::lock_guard lock(mutex_); released_ = true; } changed_.notify_all(); }
+  private:
+    const Point point_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, released_ = false;
+};
+void CancellationInterruptsBackupAdmission() {
+    for (const bool resident_wait : {false, true}) {
+        test::ScopedTempDir dir("chunkdb-cancel-backup-admission");
+        const auto root = std::filesystem::canonical(dir.path());
+        const auto config = Config(root / "source", DurabilityMode::kFsyncWal);
+        TableCatalog catalog(CatalogConfigFromStoreConfig(config));
+        auto table = test::CreateBitsTable(catalog, config.geometry);
+        auto lease = table->Acquire();
+        auto& store = lease->store();
+        store.SetBlockBits(0, 0, "1000");
+        const auto resident = FeatureActivationTestAccess::Resident(store);
+        auto next = store.ReadChunkState(0, 0);
+        const auto version = next.version;
+        next.payload[0] = 2U;
+        BackupAdmissionGate gate(resident_wait ? BackupTestHook::Point::kAfterCut : BackupTestHook::Point::kWaitingForCompletion);
+        catalog.SetBackupHookForTests(&gate);
+        StatementControl control(StatementControl::Clock::now(), 0U);
+        assert(control.Start());
+        const auto backup = [&] {
+            return std::async(std::launch::async, [&] {
+                ScopedStatementControl context(&control);
+                BackupOptions options{.cancelled = StatementStopToken()};
+                try { (void)catalog.BackupTo(root / "backup", options); }
+                catch (const std::exception&) {
+                    if (control.Complete() == StatementStopReason::kCancelled) return true;
+                    throw;
+                }
+                return false;
+            });
+        };
+        std::future<bool> command;
+        if (resident_wait) { command = backup(); gate.Wait(command); }
+        store.ArmConditionalMutationPauseForTests(ConditionalMutationPausePoint::kAfterWalAppend);
+        auto writer = std::async(std::launch::async, [&] { return store.WriteChunkState(0, 0, std::move(next), version); });
+        struct ResumeWriter {
+            ChunkStore& store;
+            bool armed = true;
+            ~ResumeWriter() { if (armed) store.ResumeConditionalMutationForTests(); }
+        } resume{store};
+        assert(store.WaitForConditionalMutationPauseForTests());
+        if (resident_wait) {
+            gate.Release();
+            StatementChunkLockTestAccess::WaitWriter(resident->mutex);
+        } else { command = backup(); gate.Wait(command); }
+        assert(control.RequestStop(StatementStopReason::kCancelled));
+        gate.Release();
+        const bool interrupted = command.wait_for(2s) == std::future_status::ready;
+        store.ResumeConditionalMutationForTests();
+        resume.armed = false;
+        assert(writer.get().ok);
+        assert(interrupted && command.get());
+        assert(!std::filesystem::exists(root / "backup" / kBackupMarkerName));
+        assert(store.GetBlockBits(0, 0) == "0100");
+        catalog.SetBackupHookForTests(nullptr);
+    }
+}
 }
 int main(int argc, char** argv) {
     CancelledWriterReopensReadAdmission();
@@ -316,4 +397,5 @@ int main(int argc, char** argv) {
     CancellationInterruptsUserReplacementAdmission();
     CancellationInterruptsContendedChunkAdmission();
     CancellationRacesChunkAdmissionRelease();
+    CancellationInterruptsBackupAdmission();
 }
