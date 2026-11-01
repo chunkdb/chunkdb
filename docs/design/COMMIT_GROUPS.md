@@ -1,0 +1,132 @@
+# Commit groups
+
+This contract covers [#136](https://github.com/chunkdb/chunkdb/issues/136) and builds on the [chunk model](CHUNK_MODEL.md).
+The user-visible guarantees are in [Durability](../DURABILITY_CONTRACT.md).
+
+## Ownership and identities
+
+A data directory owns one group journal and one checked counter for externally visible transaction IDs.
+Standalone stores use the same coordinator with their store root as the directory scope.
+The coordinator is created lazily and unconditional single-chunk writes without IDs or tags perform no journal or directory coordination.
+
+Each group has an independent random internal identity, an exact member count and a member ordinal on each WAL frame.
+A visible `txn` is a nonzero unsigned directory counter allocated only for cross-table groups and groups carrying an idempotency ID.
+Its durable reservation ceiling precedes exposing a counter range, so restarting cannot reuse an exposed ID.
+Frame and record identities include the data-directory identity, table epoch, dimensions, coordinates, producing revision and producing time.
+Paths are derived from admitted identities rather than accepted from a journal as filesystem instructions.
+
+The group record names each member's WAL boundary, exact frame extent and SHA-256 digest.
+Length and digest bind the entire frame, including its checked header and group identity.
+The journal has a checked directory-bound header and length-delimited, checksummed records.
+Counts are admitted against the complete record extent with checked arithmetic before allocation.
+Recovery codecs do not impose the current session's chunk-count limits on an earlier valid record.
+
+## Admission and publication
+
+Prepare the complete write set, decoded values, conditions, history reservations, coordinate reservations, feed rows and group record before the decision.
+No member becomes visible while validation or allocation can still reject another member.
+Take table admission in stable table-identity order and exclusive chunk locks in table-identity then coordinate order.
+Evaluate conditions and rebase deltas while those locks protect the current states.
+Single-block constant encoding remains before its chunk lock.
+
+Append all member frames before the group record.
+Relaxed groups hold their chunk locks until the record is appended and then publish all prepared states without allocation.
+Synced groups first sync every member and its required directory entries, then append and sync the group decision before publishing or acknowledging.
+Transactions use the synced rule even when every table is relaxed.
+The directory publication gate protects the short cross-table visibility step, not frame encoding or filesystem sync.
+The result publishes per-table revisions and a shared visible transaction ID when one was allocated.
+Value-equal targets retain their producing identities and bind observed members rather than inventing mutation frames.
+A durable decision first makes any observed producing state it relies on durable.
+An empty ID outcome can retain its result without allocating a table revision or emitting a feed mutation.
+
+Cancellation or a deadline can reject the group before its decision.
+After that decision, the owner completes the checked outcome instead of returning a successful cancellation that implies no write.
+Rollback or decision uncertainty fences the affected tables until group-aware recovery establishes the outcome.
+
+## Durability dependencies
+
+A published relaxed group retains ownership of its member WAL extents until the complete group is durable.
+Checkpointing, table-mode changes, barriers and later synced mutations first satisfy any group dependency they would otherwise cross.
+Making a group durable syncs every member before recording and syncing its durability receipt.
+A later synced group record does not implicitly certify unrelated earlier relaxed groups.
+Durability receipts identify exactly the group decisions they certify.
+
+Dependency syncing does not acquire another chunk lock while holding a member's chunk lock.
+Member ownership prevents checkpoint removal or truncation below the recorded extent until that dependency is satisfied.
+DDL and shutdown drain such dependencies before retiring stores or releasing directory ownership.
+Failures preserve the existing durability contract and never fall back to a weaker mode.
+
+## Recovery and checkpoints
+
+Read all group decisions and required member contexts into a private recovery plan before any member repair.
+Validate complete member framing, exact digests, original replay bases, retained identities, schema histories and applicable rollback decisions before changing files.
+A table constructor cannot independently trim an unresolved group member.
+An absent decision rolls every surviving member back at its first group frame.
+A relaxed undecided group can also discard later relaxed frames on those members.
+A checked synced decision or durability receipt with a missing required member is damage rather than an undecided crash tail.
+An incomplete final journal append is unpublished; interior corruption and conflicting decisions refuse recovery.
+
+A checkpoint makes the decisions of all groups it includes durable before publishing its image.
+Checked image and tombstone provenance identifies a covered group member after its WAL frame is retired.
+Only durable published coverage can replace a frame during group admission.
+Live journal records can retire after all members have published coverage.
+Their immutable group seals remain while current checkpoint provenance, retained feed history or bounded idempotency records reference them.
+A seal records member epochs and coordinates, visible transaction identity and tag without storing metadata per block.
+Unreferenced seals are collected after their checked reference cut is durable.
+Recovery admits the complete reference cut before deleting a journal record or seal.
+
+## Snapshots and table lifecycle
+
+The first transaction statement registers one completed-revision cut for each table in its directory snapshot vector.
+Later access to a table uses that original cut rather than taking a new snapshot after a cross-table group.
+Tables created after the cut cannot silently join that transaction.
+Only touched table identities are required to remain valid at commit.
+
+Snapshot registration briefly drains existing table mutation admission in stable table order and then captures the vector under the directory publication gate.
+This admission pause keeps the same store owner and leaves feed senders attached; it does not use the DDL path that stops or replaces a store.
+It registers history before producers resume, so a completed cut never relies on a discarded before-state.
+Metadata admission excludes concurrent multi-table lease acquisition while that ordered drain runs.
+No directory publication gate is held while waiting for table leases to drain.
+Ordinary single-table writes use their existing table admission and do not acquire the directory gate.
+Snapshot registration cost is measured separately from the unused single-write path.
+
+DROP, SWAP, RENAME and restore admission wait for open groups touching their table identities.
+They settle durability dependencies and publish lifecycle changes before releasing admission.
+An old transaction's later statement or commit detects the changed identity instead of applying to a replacement table.
+A multi-table backup pins a single directory group boundary and includes its admitted decisions and referenced seals.
+Subset restore checks the backup's current and retained group membership against the selected epochs.
+Without `--allow-split` it refuses an incomplete membership set; with that flag it reports the affected visible transaction IDs.
+
+## Block deltas
+
+Block reads and writes retain canonical row preimages and row deltas rather than private whole-chunk copies.
+Comparison includes presence, validity, fixed bits and variable values; unchanged floating-point bits remain equal, including NaN payloads.
+At commit, a changed observed row conflicts and an equal row permits ABA.
+Apply accepted deltas to the current chunk, preserving unrelated rows and chunk-column changes.
+Explicit chunk and area operations promote their affected chunks to whole-chunk version validation.
+A private chunk read incorporates earlier block deltas and keeps the private form's zero revision and time.
+REQUIRED initialization and variable-byte admission still apply to the complete resulting state.
+Read preimages, deltas and promoted copies count toward the existing per-transaction and total byte bounds.
+Admission publishes prepared state and byte reservations atomically on statement success.
+
+## Limits and request metadata
+
+HELLO reports the configured area chunk and response-byte bounds and transaction read and write chunk bounds.
+The defaults are 4096 requested area chunks, 64 MiB of area response, 1024 written transaction chunks and 8192 read transaction chunks.
+Unpaged GET AREA retains its existing array reply and refuses a request beyond its configured bounds.
+An explicit LIMIT selects a page reply, and AFTER resumes that page in coordinate order.
+Pages bound both visited requested cells and encoded reply bytes, and one chunk that cannot fit produces an error rather than an empty advancing loop.
+Paging does not imply an unchanged snapshot across independent requests.
+
+An ID is at most 64 bytes and is scoped to the authenticated user.
+Its fingerprint binds the command text, length-framed parameter bytes and effective tag, so a different payload cannot reuse a known ID.
+A duplicate in flight waits for that owner; canceling the waiter does not cancel the original group.
+A completed duplicate returns the retained transaction and table versions without replaying RETURNING rows.
+SHOW COMMIT reports retained versions and whether the complete group is durable.
+Expiration or oldest-first byte eviction can remove that record, so absence is a bounded-retention result.
+The default retention window is 600000 ms and its byte bound is 64 MiB.
+A new record larger than its bound is refused before changing data.
+
+A tag is at most 256 bytes and an explicit tag overrides the HELLO default.
+The checked group decision owns the tag and catch-up obtains it from the retained group seal.
+Admission, rollback, uncertain outcomes, crash recovery and split restore receive independent failure tests.

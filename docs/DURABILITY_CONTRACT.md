@@ -19,7 +19,30 @@ Committed revisions keep their values; missing chunks after a later crash do not
 
 The **WAL**, or write-ahead log, records changes used during recovery.
 A **checkpoint** saves a chunk image so recovery can discard earlier log records safely.
-Ordinary writes to several chunks are not atomic together; use [Transactions](TRANSACTIONS.md).
+Separate write statements are not atomic together; use [Transactions](TRANSACTIONS.md).
+
+## Commit group contract
+
+A statement changing several chunks, a conditional chunk mutation, or a write carrying an idempotency ID or tag is one commit group.
+A transaction commits one group across all tables it changes and remains durable in every table mode.
+An ordinary group follows its table mode, and a group spanning tables uses their strongest mode.
+Unconditional single-chunk writes without IDs or tags retain their direct path.
+
+Recovery publishes a complete group or rolls back its undecided members together.
+A checked durable decision with a missing or damaged required member is damage and refuses recovery.
+A flush, checkpoint or later synced write cannot make an earlier relaxed group durable in only one table.
+Named table operations wait for groups using that table, and a multi-table backup takes one group boundary.
+Restoring a subset that splits a recorded cross-table group requires explicit permission and reports the affected transaction IDs.
+
+A transaction captures a vector of completed table revisions at its first statement.
+Block statements compare the blocks they read or changed and rebase their deltas over unrelated block changes at commit.
+Equal canonical block values permit ABA; chunk and area statements retain whole-chunk version conflicts.
+An altered, renamed, swapped, restored or dropped touched table causes `CONFLICT reason=table_changed`.
+
+Idempotency records share their write's durability and are bounded by the configured retention window and byte limit.
+A missing retained ID does not prove that an older write was never applied.
+Tags describe a group and its change-feed entries rather than individual blocks.
+The [commit group design](design/COMMIT_GROUPS.md) specifies publication, recovery and retention invariants.
 
 ## Make earlier writes durable
 
