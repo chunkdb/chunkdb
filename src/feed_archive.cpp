@@ -302,7 +302,7 @@ struct FeedArchiveReader::Impl {
         if (std::filesystem::exists(intent_dir)) for (const auto& item : std::filesystem::directory_iterator(intent_dir)) {
             const auto name = item.path().filename().string();
             if (IsTxnIntentFileName(name)) {
-                auto bytes = LoadFile(item.path());
+                auto bytes = LoadRecoveryTxnIntent(item.path());
                 TxnIntent intent;
                 if (!TryParseTxnIntent(bytes, &intent, geometry.dims(), epoch)) throw std::runtime_error("malformed feed transaction intent");
                 if (intent.state == TxnIntentState::kRollback) through = std::min(through, intent.version - 1U);

@@ -423,7 +423,7 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
         if (!TryParseSnapshotGenerationRecord(LoadFile(dir / "chunkdb.snapshot"), &generation) || (generation & 1U) != 0U)
             throw std::runtime_error("backup snapshot generation is not stable");
         if (!IsValidInitializedStoreMarker(LoadFile(dir / ".chunkdb.initialized"))) throw std::runtime_error("invalid backup initialized marker");
-        if (auto slots = ReadFeedSlotRecords(dir, cut.epoch)) {
+        if (auto slots = ReadFeedSlotRecords(dir, cut.epoch, geometry.dims())) {
             if ((manifest->features.incompat & kFeatureFeedSlots) == 0U || slots->durable_watermark > cut.revision)
                 throw std::runtime_error("backup slot frontier exceeds cut or has no feature");
             if (slots->filter_format && (manifest->features.incompat & kFeatureSlotFilters) == 0U)
@@ -460,7 +460,8 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
                 auto image = ParseChunkImage(LoadChunkImageFile(full, geometry, coord, cut.epoch, manifest->features),
                     geometry, coord, cut.epoch, manifest->features);
                 if (image.revision > cut.revision) throw std::runtime_error("backup image exceeds cut");
-                if (const auto boundary = retained.EmptyBoundary(coord))
+                const auto boundary = retained.EmptyBoundary(coord);
+                if (boundary)
                     (void)ApplyRetainedEmptyBase(geometry, *boundary, image.revision, image.commit_time_ms,
                         image.schema_version, image.payload, image.presence_bitmap, image.vars, image.chunk_columns);
             } else if (local.extension() == ".wal") {
@@ -475,12 +476,14 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
                     payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
                     chunk_columns = std::move(image.chunk_columns);
                 }
-                if (const auto boundary = retained.EmptyBoundary(coord))
+                const auto boundary = retained.EmptyBoundary(coord);
+                if (boundary)
                     (void)ApplyRetainedEmptyBase(geometry, *boundary, base, time, schema,
                         payload, presence, vars, chunk_columns);
                 std::vector<WalFrameBoundary> boundaries;
                 auto replay = ReplayWal(LoadFile(full), geometry, coord, cut.epoch, manifest->features, base, schema,
-                    &payload, &presence, &vars, &boundaries, &chunk_columns, time);
+                    &payload, &presence, &vars, &boundaries, &chunk_columns, time,
+                    boundary ? std::optional{WalKnownIdentity{boundary->revision, boundary->commit_time_ms}} : std::nullopt);
                 if ((!replay.replayable && !replay.torn_creation) ||
                     (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty() ||
                     (!boundaries.empty() && boundaries.back().revision > cut.revision)) throw std::runtime_error("backup WAL is damaged or exceeds cut");

@@ -64,7 +64,7 @@ void ValidateRollbackWalBoundary(const std::filesystem::path& data_dir, const Ge
             state.payload, state.presence_bitmap, state.vars, state.chunk_columns);
         state.written = state.version != 0U;
     }
-    ValidateWalPrefix(input, boundary, geometry, coord, table_id, features, std::move(state), schema);
+    ValidateWalPrefix(input, boundary, geometry, coord, table_id, features, std::move(state), schema, retained);
 }
 
 }  // namespace chunkdb

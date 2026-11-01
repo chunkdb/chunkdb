@@ -549,7 +549,8 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     RequireFeature(store->features(), *FindFeature("feed_slots"));
     if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
     // Validate the complete filter before baseline, feature or record publication.
-    (void)SerializeFeedSlotRecords(FeedSlotRecords{store_id_, 0U, {{std::string(name), 0U, false, filters}}});
+    (void)SerializeFeedSlotRecords(FeedSlotRecords{store_id_, 0U, {{std::string(name), 0U, false, filters}},
+        false, store->geometry_.dims()});
     if (filters.column_ids) {
         const auto& columns = store->geometry_.layout().schema().columns;
         for (const auto id : *filters.column_ids)

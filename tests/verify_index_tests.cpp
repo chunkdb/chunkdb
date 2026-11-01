@@ -199,8 +199,46 @@ void RetainedOverlapAndResurrection() {
         WalFrameBuilder frame(&wrong_time, 1U);
         Bytes state(fixture.geometry.ChunkPayloadBytes()+ChunkPresenceBitmapBytes(fixture.geometry), 0U);
         frame.AppendSpan(0U, state.data(), state.size()); (void)frame.Finish(10U, 101U);
-        Save(path, wrong_time); fixture.Check(true, "equal-version WAL frame");
+        Save(path, wrong_time); fixture.Check(true, "frame_base_commit_time_mismatch");
+        fixture.Image(coord, 20U, true);
+        fixture.Check(true, "frame_retained_commit_time_mismatch");
+        std::filesystem::remove(ChunkDataPath(fixture.root, fixture.geometry, coord));
         fixture.Wal(coord, 10U, false); fixture.Check();
+    }
+}
+
+void ImageBaseTimeAndConflictingVisibilityCuts() {
+    for (const auto dims : {std::uint8_t{2}, std::uint8_t{3}}) {
+        Fixture fixture(dims);
+        const auto coord = fixture.Coord();
+        fixture.Image(coord, 10U, true);
+        auto bytes = BuildWalHeader(coord, fixture.manifest.store_id, fixture.manifest.features, dims);
+        WalFrameBuilder frame(&bytes, 1U);
+        Bytes state(fixture.geometry.ChunkPayloadBytes() + ChunkPresenceBitmapBytes(fixture.geometry), 0U);
+        state[0] = 7U; state[fixture.geometry.ChunkPayloadBytes()] = 1U;
+        frame.AppendSpan(0U, state.data(), state.size()); (void)frame.Finish(10U, 101U);
+        const auto wal = ChunkWalPath(fixture.root, fixture.geometry, coord);
+        Save(wal, bytes); fixture.Check(true, "frame_base_commit_time_mismatch");
+        fixture.Wal(coord, 10U, true); fixture.Check();
+        fixture.Image(coord, 9U, true); fixture.Wal(coord, 10U, false);
+        const auto full = std::filesystem::file_size(wal);
+        const auto header = ChunkWalHeaderBytes(dims);
+        const auto conditional = ConditionalIntentDirectory(fixture.root) / CanonicalConditionalIntentFileName(fixture.geometry, coord);
+        const auto put_conditional = [&](bool committed, std::uint64_t cut) {
+            Bytes marker{'C', 'K', 'R', static_cast<std::uint8_t>(committed ? 'C' : 'B')};
+            WriteLe64(marker, cut); WriteLe32(marker, Crc32(marker)); Save(conditional, marker);
+        };
+        const auto put_transaction = [&](std::uint64_t revision, std::uint64_t cut) {
+            Save(TxnIntentPath(fixture.root, revision), SerializeTxnIntent({TxnIntentState::kRollback,
+                revision, {{coord, cut}}}, dims, fixture.manifest.store_id));
+        };
+        put_conditional(false, header); put_transaction(11U, full);
+        fixture.Check(true, "conflicting pending rollback boundaries");
+        put_conditional(false, full); fixture.Check();
+        put_conditional(true, header); fixture.Check();
+        std::filesystem::remove(conditional);
+        put_transaction(12U, header); fixture.Check(true, "conflicting pending rollback boundaries");
+        put_transaction(12U, full); fixture.Check();
     }
 }
 
@@ -348,4 +386,5 @@ int main(int argc, char** argv) {
     run("compaction", CompactionDecisions); run("bindings", CheckedBindings); run("archive", ArchiveDescriptors);
     run("rollback", RollbackVisibility);
     run("aliases", ManagedAliases);
+    run("identity-cuts", ImageBaseTimeAndConflictingVisibilityCuts);
 }

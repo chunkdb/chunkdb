@@ -374,4 +374,19 @@ int main() {
         if (time != 70U) assert(result.stop_reason == "frame_base_commit_time_mismatch");
         else assert(result.skipped_frames == 1U);
     }
+    Append(bytes, Frame(9U));
+    for (bool streamed : {false, true}) for (const auto retained_time : {70U, 71U}) {
+        Bytes payload(geometry.ChunkPayloadBytes(), 0U), presence(ChunkPresenceBitmapBytes(geometry), 0U);
+        ChunkVars vars;
+        WalReplayResult result;
+        if (streamed) {
+            std::istringstream input(std::string(bytes.begin(), bytes.end()), std::ios::binary);
+            result = ReplayWalStream(input, bytes.size(), geometry, {0, 0}, kId, kFeatures,
+                9U, 1U, &payload, &presence, &vars, nullptr, nullptr, {}, 90U, WalKnownIdentity{7U, retained_time});
+        } else result = ReplayWal(bytes, geometry, {0, 0}, kId, kFeatures,
+            9U, 1U, &payload, &presence, &vars, nullptr, nullptr, 90U, WalKnownIdentity{7U, retained_time});
+        assert(result.tail_truncated_or_corrupt == (retained_time != 70U) && !result.stopped_at_crash_tail);
+        if (retained_time != 70U) assert(result.stop_reason == "frame_retained_commit_time_mismatch");
+        else assert(result.skipped_frames == 2U);
+    }
 }

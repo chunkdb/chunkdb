@@ -15,6 +15,7 @@
 #include "chunk_coordinate_index.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
+#include "wal_writer.hpp"
 
 namespace allocation {
 std::atomic<bool> measuring{false};
@@ -90,6 +91,14 @@ int main() {
         const auto record = SerializeChunkIndexRecord({ChunkIndexKind::kDeleted, coord, 10U, 100U, 1U}, geometry, large);
         bytes.insert(bytes.end(), record.begin(), record.end()); Save(path, bytes);
     }
+    // A measured WAL remains bounded by one frame even with many frames.
+    auto wal = BuildWalHeader({0, 0}, id, ReadStoreManifest(root)->features);
+    for (std::uint64_t revision = 11U; revision < 139U; ++revision) {
+        WalFrameBuilder frame(&wal, 1U);
+        frame.AppendSpan(0U, payload.data(), payload.size());
+        (void)frame.Finish(revision, revision * 10U);
+    }
+    Save(ChunkWalPath(root, geometry, {0, 0}), wal);
     const auto before = Snapshot(directory.path());
     std::ostringstream findings;
     allocation::measuring.store(true, std::memory_order_relaxed);

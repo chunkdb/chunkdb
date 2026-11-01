@@ -313,12 +313,20 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME geometry_bit COMMAND chunkdb_geometry_bit_test)
 
-    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones)
+    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         add_test(NAME ${format} COMMAND chunkdb_${format}_test)
         set_tests_properties(${format} PROPERTIES TIMEOUT 60 LABELS "smoke")
+    endforeach()
+
+    foreach(verifier IN ITEMS verify_index verify_memory)
+        add_executable(chunkdb_${verifier}_test tests/${verifier}_tests.cpp)
+        target_link_libraries(chunkdb_${verifier}_test PRIVATE chunkdb_tools)
+        target_include_directories(chunkdb_${verifier}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME ${verifier} COMMAND chunkdb_${verifier}_test)
+        set_tests_properties(${verifier} PROPERTIES TIMEOUT 60 LABELS "smoke")
     endforeach()
 
     add_executable(chunkdb_storage_test tests/storage_tests.cpp)
@@ -880,6 +888,9 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_chunk_identity_scan_test
         chunkdb_rollback_preflight_test
         chunkdb_table_tombstones_test
+        chunkdb_cql_chunk_model_test
+        chunkdb_verify_index_test
+        chunkdb_verify_memory_test
         chunkdb_storage_test
         chunkdb_store_manifest_test
         chunkdb_chunk_vars_test
@@ -1016,6 +1027,9 @@ if(CHUNKDB_BUILD_TESTS)
         chunk_identity_scan
         rollback_preflight
         table_tombstones
+        cql_chunk_model
+        verify_index
+        verify_memory
         storage
         store_manifest
         chunk_vars

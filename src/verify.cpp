@@ -267,7 +267,8 @@ std::map<chunkdb::ChunkCoord, std::uint64_t> VisibilityCuts(const std::filesyste
             if (std::filesystem::file_size(path) < cut) throw std::runtime_error("rollback WAL is shorter than its committed cut");
         }
         const auto [at, inserted] = cuts.emplace(coord, cut);
-        if (!inserted) at->second = std::min(at->second, cut);
+        if (!inserted && at->second != cut)
+            throw std::runtime_error("conflicting pending rollback boundaries for one chunk");
     };
     for (const auto& file : std::filesystem::directory_iterator(directory)) {
         const auto name = file.path().filename().string();
@@ -337,21 +338,16 @@ void VerifyChunkArtifacts(const std::filesystem::path& root, const chunkdb::Geom
         if (std::filesystem::exists(wal_path)) {
             ++counters->checked;
             const auto cut = index->wal_cuts.find(coord);
-            std::vector<std::uint8_t> wal;
-            if (cut != index->wal_cuts.end()) {
-                if (cut->second > wal.max_size() || cut->second > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
-                    throw std::runtime_error("rollback WAL cut exceeds addressable bytes");
-                RequirePlain(wal_path);
-                chunkdb::SharedFileInput input(wal_path);
-                if (!input || cut->second > Measure(input, wal_path)) throw std::runtime_error("rollback WAL shortened before verification");
-                wal.resize(static_cast<std::size_t>(cut->second));
-                input.read(reinterpret_cast<char*>(wal.data()), static_cast<std::streamsize>(wal.size()));
-                if (input.gcount() != static_cast<std::streamsize>(wal.size()) || input.bad())
-                    throw std::runtime_error("rollback WAL prefix read failed");
-            } else wal = chunkdb::LoadFile(wal_path);
-            if (!wal.empty() || cut == index->wal_cuts.end()) {
-                const auto replay = chunkdb::ReplayWal(wal, geometry, coord, manifest.store_id, manifest.features,
-                    revision, schema, &payload, &presence, &vars, nullptr, &columns);
+            RequirePlain(wal_path);
+            chunkdb::SharedFileInput input(wal_path);
+            const auto measured = Measure(input, wal_path);
+            const auto admitted = cut == index->wal_cuts.end() ? measured : cut->second;
+            if (admitted > measured) throw std::runtime_error("rollback WAL shortened before verification");
+            const auto retained = index->retained.find(coord);
+            if (admitted != 0U || cut == index->wal_cuts.end()) {
+                const auto replay = chunkdb::ReplayWalStream(input, admitted, geometry, coord, manifest.store_id, manifest.features,
+                    revision, schema, &payload, &presence, &vars, nullptr, &columns, {}, time, retained != index->retained.end() ?
+                        std::optional{chunkdb::WalKnownIdentity{retained->second.revision, retained->second.commit_time_ms}} : std::nullopt);
                 if (replay.torn_creation) {
                     Report(counters, cut != index->wal_cuts.end(), cut == index->wal_cuts.end() ? "wal_torn_creation" : "wal_damaged",
                         wal_path, "interrupted creation holds no mutation");
@@ -364,15 +360,6 @@ void VerifyChunkArtifacts(const std::filesystem::path& root, const chunkdb::Geom
                         replay.stopped_at_crash_tail && cut == index->wal_cuts.end() ? "wal_tail_truncated" : "wal_damaged", wal_path,
                         replay.stop_reason + " at byte " + std::to_string(replay.valid_end));
                     if (!replay.stopped_at_crash_tail || cut != index->wal_cuts.end()) return;
-                }
-                if (const auto boundary = index->retained.find(coord); boundary != index->retained.end()) {
-                    for (auto at = chunkdb::ChunkWalHeaderBytes(geometry.dims()); at < replay.valid_end;) {
-                        if (chunkdb::ReadLe64(wal, at + 4U) == boundary->second.revision &&
-                            chunkdb::ReadLe64(wal, at + 12U) != boundary->second.commit_time_ms)
-                            throw std::runtime_error("retained boundary commit time differs from equal-version WAL frame");
-                        at += chunkdb::kWalFrameFixedHeaderSize + chunkdb::ReadLe16(wal, at + 22U) +
-                            chunkdb::kWalFrameHeaderCrcSize + chunkdb::ReadLe32(wal, at + 28U) + chunkdb::kWalFrameTrailerSize;
-                    }
                 }
                 if (!replay.vars_problem.empty()) {
                     Report(counters, true, "wal_vars_inconsistent", wal_path, replay.vars_problem);
@@ -434,7 +421,7 @@ void VerifyFeedArtifacts(
     const bool enabled = (manifest.features.incompat & chunkdb::kFeatureFeedSlots) != 0U;
     const auto records_path = root / chunkdb::kFeedSlotsFileName;
     try {
-        const auto records = chunkdb::ReadFeedSlotRecords(root, manifest.store_id);
+        const auto records = chunkdb::ReadFeedSlotRecords(root, manifest.store_id, geometry.dims());
         if (records) {
             ++counters->checked;
             if (!enabled) Report(counters, true, "feed_slots_without_feature", records_path, "feed slots feature is absent");
@@ -525,14 +512,22 @@ void VerifyFeedArtifacts(
                 payload.assign(geometry.LayoutAt(base_schema).payload_bytes(), 0U);
                 if (base_revision != 0U) chunk_columns = chunkdb::DefaultChunkColumnsAt(geometry, base_schema);
             }
-            const auto bytes = chunkdb::LoadFile(file.path());
-            const auto replay = chunkdb::ReplayWal(bytes, geometry, coord, manifest.store_id,
-                manifest.features, base_revision, base_schema, &payload, &presence, &vars, nullptr, &chunk_columns);
+            chunkdb::SharedFileInput input(file.path());
+            const auto extent = Measure(input, file.path());
+            const auto header_size = chunkdb::ChunkWalHeaderBytes(geometry.dims());
+            if (extent < header_size + 12U) throw std::runtime_error("archive WAL has no producing frame");
+            std::vector<std::uint8_t> first_revision(8U);
+            input.seekg(static_cast<std::streamoff>(header_size + 4U));
+            input.read(reinterpret_cast<char*>(first_revision.data()), static_cast<std::streamsize>(first_revision.size()));
+            if (input.gcount() != static_cast<std::streamsize>(first_revision.size()))
+                throw std::runtime_error("archive first revision read failed");
+            input.seekg(0);
+            const auto replay = chunkdb::ReplayWalStream(input, extent, geometry, coord, manifest.store_id,
+                manifest.features, base_revision, base_schema, &payload, &presence, &vars, nullptr, &chunk_columns,
+                {}, binding.descriptor.base_time_ms);
             if (!replay.replayable || replay.tail_truncated_or_corrupt || !replay.vars_problem.empty())
                 throw std::runtime_error("archive WAL is damaged: " + replay.stop_reason + " " + replay.vars_problem);
-            const auto header_size = chunkdb::ChunkWalHeaderBytes(geometry.dims());
-            if (replay.applied_frames == 0U || bytes.size() < header_size + 12U ||
-                chunkdb::ReadLe64(bytes, header_size + 4U) != first || replay.revision != last)
+            if (replay.applied_frames == 0U || chunkdb::ReadLe64(first_revision, 0U) != first || replay.revision != last)
                 throw std::runtime_error("archive revision range disagrees with its name");
         } catch (const std::exception& error) {
             Report(counters, true, base || descriptor ? "feed_archive_base_invalid" : "feed_archive_wal_invalid", file.path(), error.what());

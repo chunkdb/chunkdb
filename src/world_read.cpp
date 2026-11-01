@@ -20,6 +20,7 @@
 #include "snapshot_generation.hpp"
 #include "txn_history.hpp"
 #include "chunk_coordinate_index.hpp"
+#include "shared_file_input.hpp"
 
 namespace chunkdb {
 
@@ -453,20 +454,24 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
     }
     PauseCacheForTests(CachePausePoint::kNoCacheReadBeforeWal, chunk_coord);
     if (std::filesystem::exists(wal_path)) {
-        std::vector<std::uint8_t> wal_bytes;
-        bool have_wal = true;
+        std::optional<SharedFileInput> input;
         try {
-            wal_bytes = LoadFile(wal_path);
-        } catch (...) {
+            input.emplace(wal_path);
+        } catch (const std::system_error&) {
             if (std::filesystem::exists(wal_path)) {
                 throw;
             }
-            have_wal = false;
         }
-        if (have_wal) {
-            const auto replay = ReplayWal(
-                wal_bytes, geometry_, chunk_coord, store_id_, features_, base_revision, schema_version, &payload,
-                &presence, &vars, nullptr, &chunk_columns, commit_time_ms);
+        if (input) {
+            input->seekg(0, std::ios::end);
+            const auto measured = input->tellg();
+            if (measured < 0) throw std::runtime_error("failed to measure WAL " + wal_path.string());
+            input->seekg(0);
+            if (!*input) throw std::runtime_error("failed to rewind WAL " + wal_path.string());
+            const auto replay = ReplayWalStream(
+                *input, static_cast<std::uint64_t>(measured), geometry_, chunk_coord, store_id_, features_, base_revision, schema_version, &payload,
+                &presence, &vars, nullptr, &chunk_columns, {}, commit_time_ms, retained ?
+                    std::optional{WalKnownIdentity{retained->revision, retained->commit_time_ms}} : std::nullopt);
             schema_version = geometry_.layout().schema().version;
             if (replay.applied_frames > 0) {
                 revision = replay.revision;
