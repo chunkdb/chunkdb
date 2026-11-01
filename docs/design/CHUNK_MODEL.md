@@ -104,7 +104,8 @@ Owned temporary files from that unpublished initialization may then be removed; 
 Read-only readers rebuild on a changed equal-even snapshot generation and publish no partial index.
 
 Collection durably publishes the emptying commit's tombstone and any new inventory entry before removing image or WAL files.
-The tombstone preserves the producing revision, time and schema; collection allocates no user revision.
+The tombstone preserves the producing revision and time and records the schema of the retained empty baseline; collection allocates no user revision.
+Later schema translation or repeated collection of that same producing identity reuses its existing checked tombstone rather than appending a conflicting schema at the same revision.
 A failure before tombstone publication leaves the original artifacts intact.
 Uncertain publication or removal fences serving until recovery completes the decision idempotently.
 A newer committed artifact resurrects a chunk; equal or older artifacts are suppressed only by a validated committed-empty boundary.
