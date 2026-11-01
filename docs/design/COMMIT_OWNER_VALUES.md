@@ -76,6 +76,7 @@ Pure consistency validation does not certify that any referenced byte is durable
 ## Owner-edge keys and values
 
 An owner-edge key has exactly 49 bytes: owner class u8 followed by a 48-byte canonical typed source key.
+Ordinals in keys use most-significant-byte-first encoding; numeric payload fields remain little-endian.
 Classes are distinct even when they retain the same group and coordinate.
 
 | Class | Canonical source key after the class byte | Required checked source |
