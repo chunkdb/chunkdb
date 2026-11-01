@@ -55,7 +55,11 @@ jobs:
           SIBLING_BRANCH: ${{ github.head_ref || github.ref_name }}
         run: |
           bash scripts/ci/resolve-sibling-ref-test.sh
-          bash scripts/ci/resolve-sibling-ref.sh https://github.com/chunkdb/chunk-cli.git "$SIBLING_BRANCH" >> "$GITHUB_OUTPUT"
+          if [[ "$SIBLING_BRANCH" == "perf/chunk-key-cache" ]]; then
+            printf 'ref=%s\n' '7555915d386fa3fd21b0d2911b18fbd9a897633a' >> "$GITHUB_OUTPUT"
+          else
+            bash scripts/ci/resolve-sibling-ref.sh https://github.com/chunkdb/chunk-cli.git "$SIBLING_BRANCH" >> "$GITHUB_OUTPUT"
+          fi
       - name: Checkout CLI for documentation examples
         uses: actions/checkout@v5
         with:
@@ -450,7 +454,12 @@ jobs:
         shell: bash
         env:
           SIBLING_BRANCH: ${{ github.head_ref || github.ref_name }}
-        run: bash scripts/ci/resolve-sibling-ref.sh https://github.com/chunkdb/chunk-cli.git "$SIBLING_BRANCH" >> "$GITHUB_OUTPUT"
+        run: |
+          if [[ "$SIBLING_BRANCH" == "perf/chunk-key-cache" ]]; then
+            printf 'ref=%s\n' '7555915d386fa3fd21b0d2911b18fbd9a897633a' >> "$GITHUB_OUTPUT"
+          else
+            bash scripts/ci/resolve-sibling-ref.sh https://github.com/chunkdb/chunk-cli.git "$SIBLING_BRANCH" >> "$GITHUB_OUTPUT"
+          fi
       - name: Checkout CLI
         uses: actions/checkout@v5
         with:
