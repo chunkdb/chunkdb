@@ -2,6 +2,7 @@
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
+#include "shared_file_input.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
 #include "populated_index_format.hpp"
@@ -537,7 +538,7 @@ ChunkStateImage ParseChunkImage(
 std::vector<std::uint8_t> LoadChunkImageFile(
     const std::filesystem::path& path, const Geometry& geometry, ChunkCoord coord,
     const StoreId& store_id, FeatureFlags store_features) {
-    std::ifstream input(path, std::ios::binary);
+    SharedFileInput input(path);
     if (!input) throw std::runtime_error("failed to open chunk image: " + path.string());
     input.seekg(0, std::ios::end);
     const auto end = input.tellg();

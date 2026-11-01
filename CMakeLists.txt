@@ -98,6 +98,7 @@ add_library(chunkdb_core STATIC
     src/process_lock.cpp
     src/protocol.cpp
     src/snapshot_generation.cpp
+    src/shared_file_input.cpp
     src/store_manifest.cpp
     src/chunk_layout.cpp
     src/chunk_columns.cpp
@@ -309,7 +310,7 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME geometry_bit COMMAND chunkdb_geometry_bit_test)
 
-    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay chunk_coordinate_index table_chunk_columns world_coordinates_3d)
+    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index table_chunk_columns world_coordinates_3d)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -867,6 +868,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_block_coordinates_test
         chunkdb_wal_prefix_test
         chunkdb_wal_stream_replay_test
+        chunkdb_shared_file_input_test
         chunkdb_chunk_coordinate_index_test
         chunkdb_table_chunk_columns_test
         chunkdb_world_coordinates_3d_test
@@ -997,6 +999,7 @@ if(CHUNKDB_BUILD_TESTS)
         block_coordinates
         wal_prefix
         wal_stream_replay
+        shared_file_input
         chunk_coordinate_index
         table_chunk_columns
         world_coordinates_3d
