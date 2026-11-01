@@ -92,6 +92,7 @@ An ordinary block write changes the table snapshot generation without changing t
 Read-only scans rebuild their complete live-coordinate candidate index when the table snapshot generation changes and publish it only after one unchanged equal-even whole-index observation.
 Every listed boundary covers a complete header and whole records; a listed log shorter than that boundary is damage.
 Recovery validates complete inventory and logs before mutating artifacts, resolves rollback intents, then reconciles committed image and WAL state.
+The durable startup snapshot fence owns one live publication count until this reconciliation and index repair finish, so nested normal WAL-tail repair cannot close or reject the enclosing recovery bracket.
 Live hints do not fabricate data or suppress newer committed WAL state.
 Listed missing or corrupt logs are damage; missing inventory is damage.
 Without an independently durable boundary, only a shorter final record prefix may be treated as an interrupted append; a complete invalid record is damage.
