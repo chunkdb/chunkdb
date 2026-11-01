@@ -473,6 +473,11 @@ void ApplyFrameVars(
 
 }  // namespace
 
+bool IsInterruptedWalCreation(const std::vector<std::uint8_t>& bytes,
+    const ChunkCoord& coord, const StoreId& table_id, std::uint8_t dims) {
+    return IsInterruptedCreation(bytes, coord, table_id, dims);
+}
+
 FeedFrameInfo ReplayFeedFrame(
     const std::vector<std::uint8_t>& bytes, const Geometry& geometry, ChunkState* state,
     FeatureFlags features) {

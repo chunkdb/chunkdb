@@ -74,6 +74,9 @@ void ValidateWalHeader(
     const FeatureFlags& store_features,
     std::uint8_t dims = 2U);
 
+[[nodiscard]] bool IsInterruptedWalCreation(const std::vector<std::uint8_t>& bytes,
+    const ChunkCoord& coord, const StoreId& table_id, std::uint8_t dims = 2U);
+
 // Validates an acknowledged exact prefix without retaining the whole WAL.
 // The borrowed stream starts at byte zero and may contain an ignored suffix.
 // State is private scratch initialized from the owning image when present.
