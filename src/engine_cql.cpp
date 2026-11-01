@@ -438,6 +438,37 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
            std::holds_alternative<cql::Commit>(statement) || std::holds_alternative<cql::Rollback>(statement);
 }
 
+[[nodiscard]] bool NeedsChunkModelExecution(const cql::Statement& statement) {
+    return std::visit(Overloaded{
+        [](const cql::GetBlock& value) { return value.dims != 2U; },
+        [](const cql::SetBlock& value) { return value.dims != 2U; },
+        [](const cql::DeleteBlock& value) { return value.dims != 2U; },
+        [](const cql::GetChunk& value) { return value.dims != 2U; },
+        [](const cql::GetArea& value) { return value.dims != 2U; },
+        [](const cql::SetChunk& value) {
+            return value.dims != 2U || value.metadata.has_value() || !value.columns.empty() || value.if_absent;
+        },
+        [](const cql::CreateTable& value) { return value.dims != 2U || !value.chunk_columns.empty(); },
+        [](const cql::AlterTable& value) {
+            return std::visit(Overloaded{
+                [](const cql::AddColumn& change) { return change.chunk_column; },
+                [](const cql::DropColumn& change) { return change.chunk_column; },
+                [](const cql::RenameColumn& change) { return change.chunk_column; },
+                [](const auto&) { return false; },
+            }, value.change);
+        },
+        [](const cql::ScanChunks& value) {
+            return value.dims != 2U || value.since.has_value() || value.with_data || !value.columns.empty();
+        },
+        [](const cql::Watch& value) { return value.area && value.area->dims != 2U; },
+        [](const cql::CreateSlot& value) { return value.area && value.area->dims != 2U; },
+        [](const cql::Migrate& value) {
+            return std::visit([](const auto& inner) { return NeedsChunkModelExecution(cql::Statement(inner)); }, value.statement);
+        },
+        [](const auto&) { return false; },
+    }, statement);
+}
+
 // What a server that opened its data directory read-only runs: reads and
 // listings. Every other statement would change data, schema, users, rights or
 // slots, or needs a writer (WATCH, BEGIN, FLUSH WAL, BACKUP).
@@ -454,7 +485,8 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
 }
 
 [[nodiscard]] std::size_t StateBytes(const ChunkState& state) {
-    return state.payload.size() + state.presence_bitmap.size() + state.vars.encoded_size();
+    return state.payload.size() + state.presence_bitmap.size() + state.vars.encoded_size() +
+        (state.chunk_columns ? state.chunk_columns->bytes.size() : 0U);
 }
 
 }  // namespace
@@ -668,6 +700,8 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
     } catch (const cql::ParseError& e) {
         return reject(Protocol::Error("SYNTAX", e.what()));
     }
+    if (NeedsChunkModelExecution(parsed.statement))
+        return reject(Protocol::Error("INVALID_ARGUMENT", "chunk model execution is not enabled"));
     if (parsed.parameters == 0) {
         return request;
     }
@@ -756,6 +790,8 @@ std::string CommandEngine::ExecuteStatement(
         } catch (const cql::ParseError& e) {
             return Protocol::Error("SYNTAX", e.what());
         }
+        if (NeedsChunkModelExecution(parsed.statement))
+            return Protocol::Error("INVALID_ARGUMENT", "chunk model execution is not enabled");
         // Described before the health check, so a statement refused because
         // migrations need recovery is still audited.
         if (info != nullptr) {
@@ -1148,7 +1184,7 @@ std::string CommandEngine::ExecuteStatement(
                         TxnWrite(
                             *session.transaction, store, ChunkCoord{set.chunk_x, set.chunk_y},
                             [&](ChunkState& state) {
-                                store.PrepareTxnChunkState(next, state.vars);
+                                store.PrepareTxnChunkState(next, state.vars, state.chunk_columns.get());
                                 // The version stays the snapshot's until COMMIT.
                                 next.version = state.version;
                                 state = std::move(next);
@@ -1598,7 +1634,7 @@ void CommandEngine::TxnWrite(
             throw std::invalid_argument(
                 "a transaction writes at most " + std::to_string(kMaxTxnWrittenChunks) + " chunks");
         }
-        own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord.x, coord.y)).first;
+        own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord)).first;
     }
     ChunkState& state = own->second;
     const bool was_written = state.written;
@@ -1617,8 +1653,8 @@ void CommandEngine::TxnWrite(
     };
     try {
         change(state);
-        state.written = was_written || std::any_of(state.presence_bitmap.begin(), state.presence_bitmap.end(),
-                                                  [](std::uint8_t byte) { return byte != 0; });
+        state.written = state.written || was_written ||
+            ChunkPopulated(store.geometry(), state.presence_bitmap, state.chunk_columns.get());
         const std::size_t after = StateBytes(state);
         if (txn.bytes - before + after > config_.txn_max_bytes) {
             throw std::invalid_argument(

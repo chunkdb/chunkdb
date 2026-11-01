@@ -47,6 +47,7 @@ class WalFrameBuilder {
     // The records of an applied value update: `vars` is the chunk's values
     // afterwards, `undo` what ApplyVarUpdate returned.
     void AppendVarUpdate(const ChunkVars& vars, const VarUndo& undo);
+    void AppendChunkColumns(const ChunkColumnState& state);
 
     // Writes the frame header and trailer; returns the total bytes the frame
     // added to the batch. Requires at least one record.
@@ -55,6 +56,7 @@ class WalFrameBuilder {
     [[nodiscard]] std::size_t record_count() const noexcept { return record_count_; }
 
   private:
+    void RequireRecordSize(std::size_t body_size) const;
     void BeginRecord(std::uint8_t type, std::size_t body_size);
     void RequireVarOrder(VarKey key);
 
@@ -66,6 +68,7 @@ class WalFrameBuilder {
     std::size_t record_count_ = 0;
     bool finished_ = false;
     bool has_var_replace_ = false;
+    bool has_chunk_columns_ = false;
     std::optional<VarKey> last_var_key_;
 };
 

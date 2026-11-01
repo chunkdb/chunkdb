@@ -4,6 +4,7 @@
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
 #include "snapshot_generation.hpp"
@@ -120,7 +121,7 @@ namespace {
 // manifest, or when read-only mode finds no manifest.
 std::optional<StoreManifest> ReadManifestOrRequireNewStore(
     const std::filesystem::path& data_dir,
-    AccessMode access_mode) {
+    AccessMode access_mode, std::uint8_t dims) {
     auto manifest = ReadStoreManifest(data_dir);
     if (manifest.has_value()) {
         return manifest;
@@ -138,6 +139,7 @@ std::optional<StoreManifest> ReadManifestOrRequireNewStore(
         if (manifest.has_value()) {
             return manifest;
         }
+        if (ChunkCoordinateIndex::UnpublishedEmptyIdentity(data_dir, dims)) return {};
         throw std::runtime_error(
             "store directory " + data_dir.string() + " has no " +
             std::string(kStoreManifestFileName) + " but holds chunkdb data (found '" +
@@ -151,19 +153,25 @@ std::optional<StoreManifest> ReadManifestOrRequireNewStore(
 // so a refused open leaves the data directory exactly as it was. The writer
 // lock is not held yet; InitializeStoreManifest repeats the check under it.
 Geometry OpenStoreGeometry(const StoreConfig& config) {
+    // The current persistent codecs encode two axes only. Keep standalone
+    // geometry support separate until the dimension-aware format is complete.
+    if (config.geometry.dims != 2 || config.geometry.chunk_depth_blocks != 1 ||
+        config.geometry.large_chunk_depth_chunks != 1) {
+        throw std::invalid_argument("persistent chunk formats do not support 3D geometry");
+    }
     if (config.data_dir.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
     RequireNotBackupDirectory(config.data_dir, config.access_mode);
-    const auto manifest = ReadManifestOrRequireNewStore(config.data_dir, config.access_mode);
+    const auto manifest = ReadManifestOrRequireNewStore(config.data_dir, config.access_mode, config.geometry.dims);
     if (!manifest.has_value()) {
-        if (!config.schema.has_value()) {
-            return Geometry(config.geometry);
-        }
-        if (const auto reason = UnsupportedSchemaReason(*config.schema); !reason.empty()) {
+        const auto schema = config.schema ? *config.schema : SingleBitsColumnSchema(config.geometry.block_bits);
+        if (const auto reason = UnsupportedSchemaReason(schema); !reason.empty()) {
             throw std::invalid_argument(reason);
         }
-        return Geometry(config.geometry, *config.schema);
+        auto geometry = config.chunk_schema ? Geometry(config.geometry, schema, *config.chunk_schema) :
+                                              Geometry(config.geometry, schema);
+        return geometry;
     }
     RequireOpenableFeatures(manifest->features, config.access_mode);
     if (const auto reason = UnsupportedSchemaReason(manifest->schema); !reason.empty()) {
@@ -174,6 +182,8 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
             "data directory " + config.data_dir.string() +
             " was created with different columns; omit the schema or pass the stored one");
     }
+    if (config.chunk_schema && *config.chunk_schema != *manifest->chunk_schema)
+        throw std::runtime_error("data directory was created with different chunk columns");
 
     const auto& stored = manifest->geometry;
     const auto& requested = config.geometry;
@@ -196,6 +206,9 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
     check(kGeometryChunkHeight, "chunk_height",
           stored.chunk_height_blocks, requested.chunk_height_blocks);
     check(kGeometryBlockBits, "block_bits", stored.block_bits, requested.block_bits);
+    check(kGeometryDimensions, "dims", stored.dims, requested.dims);
+    check(kGeometryLargeChunkDepth, "large_chunk_depth", stored.large_chunk_depth_chunks, requested.large_chunk_depth_chunks);
+    check(kGeometryChunkDepth, "chunk_depth", stored.chunk_depth_blocks, requested.chunk_depth_blocks);
     if (!mismatches.empty()) {
         throw std::runtime_error(
             "data directory " + config.data_dir.string() +
@@ -204,7 +217,10 @@ Geometry OpenStoreGeometry(const StoreConfig& config) {
             ". Geometry is fixed when a store is created: omit the geometry "
             "settings or pass the stored values");
     }
-    return Geometry(stored, manifest->schema);
+    auto geometry = Geometry(stored, manifest->schema, *manifest->chunk_schema);
+    if (stored.dims != 2)
+        throw std::invalid_argument("persistent chunk model support is incomplete");
+    return geometry;
 }
 }  // namespace
 
@@ -444,8 +460,11 @@ ChunkStore::ChunkStore(StoreConfig config)
         if (config.allow_multiple_processes && slots &&
             std::any_of(slots->slots.begin(), slots->slots.end(), [](const auto& slot) { return !slot.lost; }))
             throw std::invalid_argument("feed slots require a single-process table");
+        PrepareCoordinateIndex();
         // Refuse damaged revision bookkeeping before publishing an odd
         // recovery generation, so a refused writer leaves read-only inspection usable.
+        RecoverTransactionIntents(true);
+        RecoverConditionalRollbackIntents(true);
         InitializeVersionClock(store_preexisting, startup_scan.scan_error);
         InitializeSnapshotGeneration(store_preexisting);
         if (access_mode_ == AccessMode::kReadWrite && store_preexisting) {
@@ -457,6 +476,7 @@ ChunkStore::ChunkStore(StoreConfig config)
         }
         RecoverConditionalRollbackIntents();
         RecoverTransactionIntents();
+        InitializeCoordinateIndex();
         FinishSnapshotGenerationRecovery();
         feed_slots_ = std::make_shared<FeedSlots>(*this, config.slot_max_bytes, config.slot_sync_interval);
     } catch (...) {
@@ -511,13 +531,15 @@ ChunkStore::ChunkStore(StoreConfig config)
 
 void ChunkStore::InitializeStoreManifest() {
     const auto manifest_path = StoreManifestPath(data_dir_);
-    auto manifest = ReadManifestOrRequireNewStore(data_dir_, access_mode_);
+    auto manifest = ReadManifestOrRequireNewStore(data_dir_, access_mode_, geometry_.dims());
     if (access_mode_ != AccessMode::kReadOnly) {
         // Stale temp files of an initialization that crashed before
         // publishing (or, on POSIX, before dropping the temp name).
         CleanupAtomicTmpArtifacts(manifest_path);
     }
     if (!manifest.has_value()) {
+        CleanupAtomicTmpArtifacts(data_dir_ / kChunkIndexFileName);
+        const auto unpublished_id = ChunkCoordinateIndex::UnpublishedEmptyIdentity(data_dir_, geometry_.dims());
         const TableOptions options{
             .durability_mode = durability_mode_,
             .checkpoint_update_interval = checkpoint_update_interval_,
@@ -529,10 +551,13 @@ void ChunkStore::InitializeStoreManifest() {
         const StoreManifest created{
             .features = kTableBaselineFeatures,
             .geometry = geometry_.config(),
-            .store_id = NewStoreId(),
+            .store_id = unpublished_id ? *unpublished_id : NewStoreId(),
             .options = EncodeTableOptions(options),
             .schema = geometry_.layout().schema(),
+            .chunk_schema = geometry_.chunk_schema(),
         };
+        if (!unpublished_id && !ChunkCoordinateIndex::InitializeEmpty(data_dir_, geometry_, created.store_id))
+            throw std::runtime_error("coordinate inventory appeared while initializing the table");
         if (PublishNewFile(
                 manifest_path,
                 SerializeStoreManifest(created),
@@ -568,7 +593,7 @@ void ChunkStore::InitializeStoreManifest() {
             DescribeGeometry(manifest->geometry) + ", the store opened with " +
             DescribeGeometry(geometry_.config()));
     }
-    if (manifest->schema != geometry_.layout().schema()) {
+    if (manifest->schema != geometry_.layout().schema() || *manifest->chunk_schema != geometry_.chunk_schema()) {
         throw std::runtime_error(
             "store manifest " + manifest_path.string() + " changed its columns while the store was opening");
     }

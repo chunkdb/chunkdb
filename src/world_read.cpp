@@ -19,6 +19,7 @@
 #include "wal_replay.hpp"
 #include "snapshot_generation.hpp"
 #include "txn_history.hpp"
+#include "chunk_coordinate_index.hpp"
 
 namespace chunkdb {
 
@@ -219,11 +220,20 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
     const ChunkCoord& chunk_coord,
     ChunkRangeEntry* out,
     bool with_vars,
-    const TxnSnapshot* snapshot) {
-    const auto copy_cached = [with_vars](const RegularChunk& chunk, ChunkRangeEntry* entry) {
+    const TxnSnapshot* snapshot, bool include_empty, bool identity_only) {
+    const auto include_cached = [&](const RegularChunk& chunk) {
+        return include_empty ? chunk.written : ChunkPopulated(geometry_, chunk.presence_bitmap, chunk.chunk_columns.get());
+    };
+    const auto copy_cached = [&, with_vars](const RegularChunk& chunk, ChunkRangeEntry* entry) {
+        entry->version = chunk.version;
+        entry->commit_time_ms = chunk.commit_time_ms;
+        if (identity_only || (include_empty && !ChunkPopulated(geometry_, chunk.presence_bitmap, chunk.chunk_columns.get()))) {
+            entry->payload.clear(); entry->presence_bitmap.clear(); entry->vars = {}; entry->chunk_columns.reset();
+            return;
+        }
         entry->payload = chunk.payload;
         entry->presence_bitmap = chunk.presence_bitmap;
-        entry->version = chunk.version;
+        entry->chunk_columns = chunk.chunk_columns;
         if (with_vars) {
             entry->vars = chunk.vars;
         }
@@ -235,11 +245,11 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
         // does not hold, so an area or a scan over empty chunks does not fill
         // the cache.
         if (TryGetLoadedChunk(chunk_coord) == nullptr) {
-            return ReadPopulatedChunkStateFromDisk(chunk_coord, out, with_vars, nullptr);
+            return ReadPopulatedChunkStateFromDisk(chunk_coord, out, with_vars, nullptr, include_empty, identity_only);
         }
         const auto chunk = GetOrLoadRegularChunk(chunk_coord);
         std::shared_lock lock(chunk->mutex);
-        if (!ChunkPresent(chunk->presence_bitmap)) {
+        if (!include_cached(*chunk)) {
             return false;
         }
         if (out != nullptr) {
@@ -253,7 +263,7 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
     ChunkRangeEntry* const target = snapshot != nullptr && out == nullptr ? &snapshot_entry : out;
     const auto finish_snapshot_read = [&]() {
         ApplyTxnHistory(*snapshot, chunk_coord, with_vars, target);
-        return ChunkPresent(target->presence_bitmap);
+        return ChunkPopulated(geometry_, target->presence_bitmap, target->chunk_columns.get());
     };
     // Per-chunk consistency protocol: a cached chunk is authoritative (its
     // in-memory state includes acknowledged mutations whose WAL batch has
@@ -278,7 +288,7 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
                 return finish_snapshot_read();
             }
             std::shared_lock lock(loaded->mutex);
-            if (!ChunkPresent(loaded->presence_bitmap)) {
+            if (!include_cached(*loaded)) {
                 return false;
             }
             if (out != nullptr) {
@@ -308,7 +318,7 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
             target->version = 0;
             target->vars = ChunkVars{};
         }
-        const bool populated = ReadPopulatedChunkStateFromDisk(chunk_coord, target, with_vars, &vars_problem);
+        const bool populated = ReadPopulatedChunkStateFromDisk(chunk_coord, target, with_vars, &vars_problem, include_empty, identity_only);
         if (TryGetLoadedChunk(chunk_coord) == nullptr &&
             eviction_removals_.load(std::memory_order_acquire) == eviction_removals_before) {
             if (!vars_problem.empty()) {
@@ -346,7 +356,7 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
         return finish_snapshot_read();
     }
     std::shared_lock lock(regular_chunk->mutex);
-    if (!ChunkPresent(regular_chunk->presence_bitmap)) {
+    if (!include_cached(*regular_chunk)) {
         return false;
     }
     if (out != nullptr) {
@@ -359,20 +369,30 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
     const ChunkCoord& chunk_coord,
     ChunkRangeEntry* out,
     bool with_vars,
-    std::string* vars_problem) {
+    std::string* vars_problem, bool include_empty, bool identity_only) {
     if (access_mode_ == AccessMode::kReadOnly) {
         // A writer in another process changes these files at any time: only
         // the snapshot-bracketed load pairs an image and a WAL that existed
         // together, and it also hides a frame a rollback intent rejects.
         auto loaded = LoadChunkPayload(chunk_coord);
+        BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);
         BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
-        if (!ChunkPresent(loaded.presence_bitmap)) {
+        const bool populated = ChunkPopulated(geometry_, loaded.presence_bitmap, loaded.chunk_columns.get());
+        if (include_empty ? loaded.revision == 0U : !populated) {
             return false;
         }
         if (out != nullptr) {
+            out->version = loaded.revision;
+            out->commit_time_ms = loaded.commit_time_ms;
+            if (identity_only || (include_empty && !populated)) {
+                out->payload.clear(); out->presence_bitmap.clear(); out->vars = {}; out->chunk_columns.reset();
+                return true;
+            }
             out->payload = std::move(loaded.payload);
             out->presence_bitmap = std::move(loaded.presence_bitmap);
             out->version = loaded.revision;
+            out->commit_time_ms = loaded.commit_time_ms;
+            out->chunk_columns = std::move(loaded.chunk_columns);
             if (with_vars) {
                 out->vars = std::move(loaded.vars);
             }
@@ -392,18 +412,22 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
     std::uint64_t base_revision = 0;
     // The chunk version a load would give it.
     std::uint64_t revision = 0;
+    std::uint64_t commit_time_ms = 0;
+    std::shared_ptr<const ChunkColumnState> chunk_columns;
     // The schema version of the state; 0 while it is the empty state.
     std::uint64_t schema_version = 0;
 
     if (std::filesystem::exists(data_path)) {
         try {
-            const auto bytes = LoadFile(data_path);
+            const auto bytes = LoadChunkImageFile(data_path, geometry_, chunk_coord, store_id_, features_);
             auto image = ParseChunkImage(bytes, geometry_, chunk_coord, store_id_, features_);
             payload = std::move(image.payload);
             presence = std::move(image.presence_bitmap);
             vars = std::move(image.vars);
             base_revision = image.revision;
             revision = image.revision;
+            commit_time_ms = image.commit_time_ms;
+            chunk_columns = std::move(image.chunk_columns);
             schema_version = image.schema_version;
         } catch (...) {
             // The image can be replaced or garbage-collected concurrently by
@@ -421,6 +445,12 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         }
     }
 
+    const auto retained = coordinate_index_->EmptyBoundary(chunk_coord);
+    if (retained) {
+        (void)ApplyRetainedEmptyBase(geometry_, *retained, revision, commit_time_ms, schema_version,
+            payload, presence, vars, chunk_columns);
+        base_revision = revision;
+    }
     PauseCacheForTests(CachePausePoint::kNoCacheReadBeforeWal, chunk_coord);
     if (std::filesystem::exists(wal_path)) {
         std::vector<std::uint8_t> wal_bytes;
@@ -436,10 +466,11 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         if (have_wal) {
             const auto replay = ReplayWal(
                 wal_bytes, geometry_, chunk_coord, store_id_, features_, base_revision, schema_version, &payload,
-                &presence, &vars);
+                &presence, &vars, nullptr, &chunk_columns, commit_time_ms);
             schema_version = geometry_.layout().schema().version;
             if (replay.applied_frames > 0) {
                 revision = replay.revision;
+                commit_time_ms = replay.commit_time_ms;
             }
             if ((!replay.replayable && !replay.torn_creation) ||
                 (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail)) {
@@ -454,14 +485,28 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         }
     }
 
-    if (!ChunkPresent(presence)) {
+    if (retained && retained->kind == ChunkIndexKind::kForget && revision == retained->revision) {
+        revision = 0U;
+        commit_time_ms = 0U;
+    }
+    BringChunkColumnsToSchema(geometry_, schema_version, geometry_.chunk_schema().version, &chunk_columns);
+    BringToCurrentSchema(geometry_, schema_version, presence, &payload, &vars);
+    const bool populated = ChunkPopulated(geometry_, presence, chunk_columns.get());
+    if (include_empty ? revision == 0U : !populated) {
         return false;
     }
-    BringToCurrentSchema(geometry_, schema_version, presence, &payload, &vars);
     if (out != nullptr) {
+        out->version = revision;
+        out->commit_time_ms = commit_time_ms;
+        if (identity_only || (include_empty && !populated)) {
+            out->payload.clear(); out->presence_bitmap.clear(); out->vars = {}; out->chunk_columns.reset();
+            return true;
+        }
         out->payload = std::move(payload);
         out->presence_bitmap = std::move(presence);
         out->version = revision;
+        out->commit_time_ms = commit_time_ms;
+        out->chunk_columns = std::move(chunk_columns);
         if (with_vars) {
             out->vars = std::move(vars);
         }
@@ -658,22 +703,16 @@ ChunkScanPage ChunkStore::ScanPopulatedChunks(
         return std::move(result);
     };
 
-    // Candidate collection is bounded to the page size: each pass keeps only
-    // the smallest limit+1 distinct coordinates after the cursor. Candidates
-    // that turn out unpopulated (stale artifacts, cached-but-empty chunks)
-    // shrink a pass below the page size; when that happens and the pass
-    // overflowed its window, resume the walk after the window instead of
-    // giving up, so large dirty worlds stay fully enumerable.
+    // Taking the frontier acquires every covered producer's index publication.
+    // Candidates remain hints; each returned coordinate is checked again.
+    (void)CompletedRevision();
+    const auto index = CoordinateIndexForScan();
     ChunkScanPage page;
     bool pass_has_cursor = has_cursor;
     ChunkCoord pass_cursor = cursor;
     while (page.coords.size() <= limit) {
-        ScanCandidateAccumulator candidates(
-            pass_has_cursor, pass_cursor, limit + 1U - page.coords.size());
-        CollectScanCandidates(&candidates);
-
-        const bool overflowed = candidates.overflowed();
-        const auto pass_coords = candidates.TakeSorted();
+        const auto candidates = index->Page(pass_has_cursor, pass_cursor, limit + 1U - page.coords.size());
+        const auto& pass_coords = candidates.coords;
         for (const auto& coord : pass_coords) {
             if (!ReadPopulatedChunkStateNoCache(coord, nullptr, false)) {
                 continue;
@@ -684,7 +723,7 @@ ChunkScanPage ChunkStore::ScanPopulatedChunks(
             }
             page.coords.push_back(coord);
         }
-        if (!overflowed) {
+        if (!candidates.more) {
             break;
         }
         pass_has_cursor = true;
@@ -694,12 +733,16 @@ ChunkScanPage ChunkStore::ScanPopulatedChunks(
 }
 
 std::size_t ChunkStore::ChunkRangeEntryCostBytes() const noexcept {
-    // Upper bound of one response entry: the "<cx> <cy>" item with two signed
-    // 64-bit decimal coordinates and its framing (at most 48 bytes), then the
-    // chunk bytes with their framing (at most 25 bytes) and, in the ZRLE
-    // form, the codec overhead (at most kZrleMaxOverheadBytes = 11).
-    static_assert(48U + 25U + kZrleMaxOverheadBytes <= 96U);
-    return 96U + geometry_.ChunkPayloadBytes() + ChunkPresenceBitmapBytes(geometry_);
+    // Three signed coordinates, protocol framing and CKCF's fixed header fit
+    // in 128 bytes; six section descriptors and fixed-array spans follow.
+    std::size_t cost = 128U + 6U * 12U + 4U + geometry_.layout().fixed_columns().size() * 24U +
+        geometry_.ChunkPayloadBytes() + ChunkPresenceBitmapBytes(geometry_);
+    if (!geometry_.chunk_schema().columns.empty()) {
+        cost += 4U + 16U * geometry_.chunk_schema().columns.size();
+        for (const auto& column : geometry_.chunk_schema().columns)
+            cost += (FixedWidthBits(column.type) + 7U) / 8U;
+    }
+    return cost;
 }
 
 void ChunkStore::AppendPopulatedChunkRangeEntry(
@@ -716,13 +759,24 @@ void ChunkStore::AppendPopulatedChunkRangeEntry(
             std::string(operation_name) + " response exceeds the " + std::to_string(kMaxChunkRangeResponseBytes) +
             "-byte limit; request fewer chunks");
     };
+    const auto charge = [&](const ChunkRangeEntry& entry) {
+        auto variable = with_vars ? entry.vars.encoded_size() : 0U;
+        const auto metadata = entry.chunk_columns ? entry.chunk_columns->variable_bytes : 0U;
+        if (variable > kMaxChunkRangeResponseBytes || metadata > kMaxChunkRangeResponseBytes - variable)
+            throw too_large();
+        variable += metadata;
+        const auto fixed = (entries->size() + 1U) * ChunkRangeEntryCostBytes();
+        if (*vars_bytes > kMaxChunkRangeResponseBytes - fixed ||
+            variable > kMaxChunkRangeResponseBytes - fixed - *vars_bytes) throw too_large();
+        *vars_bytes += variable;
+    };
     if (txn_read != nullptr) {
         if (txn_read->covered != nullptr) {
             txn_read->covered->push_back(coord);
         }
         // The transaction's own copy of the chunk, when it wrote it.
         if (const ChunkState* own = txn_read->overlay ? txn_read->overlay(coord) : nullptr; own != nullptr) {
-            if (!ChunkPresent(own->presence_bitmap)) {
+            if (!ChunkPopulated(geometry_, own->presence_bitmap, own->chunk_columns.get())) {
                 return;
             }
             if (entries->size() >= max_entries) {
@@ -733,14 +787,13 @@ void ChunkStore::AppendPopulatedChunkRangeEntry(
                 .payload = own->payload,
                 .presence_bitmap = own->presence_bitmap,
                 .version = own->version,
+                .commit_time_ms = own->commit_time_ms,
+                .chunk_columns = own->chunk_columns,
             };
             if (with_vars) {
                 entry.vars = own->vars;
-                *vars_bytes += entry.vars.encoded_size();
-                if ((entries->size() + 1U) * ChunkRangeEntryCostBytes() + *vars_bytes > kMaxChunkRangeResponseBytes) {
-                    throw too_large();
-                }
             }
+            charge(entry);
             entries->push_back(std::move(entry));
             return;
         }
@@ -749,12 +802,7 @@ void ChunkStore::AppendPopulatedChunkRangeEntry(
         ChunkRangeEntry entry;
         entry.coord = coord;
         if (ReadPopulatedChunkStateNoCache(entry.coord, &entry, with_vars, snapshot)) {
-            if (with_vars) {
-                *vars_bytes += entry.vars.encoded_size();
-                if ((entries->size() + 1U) * ChunkRangeEntryCostBytes() + *vars_bytes > kMaxChunkRangeResponseBytes) {
-                    throw too_large();
-                }
-            }
+            charge(entry);
             entries->push_back(std::move(entry));
         }
         return;
@@ -795,6 +843,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRangeImpl(
     std::int64_t chunk_x1,
     std::int64_t chunk_y1,
     bool with_vars) {
+    if (geometry_.dims() != 2U) throw std::invalid_argument("chunk coordinates require 3 axes");
     if (chunk_x0 > chunk_x1 || chunk_y0 > chunk_y1) {
         throw std::invalid_argument("chunk range corners must satisfy x0<=x1 and y0<=y1");
     }
@@ -814,11 +863,13 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRangeImpl(
 
     std::vector<ChunkRangeEntry> entries;
     std::size_t vars_bytes = 0;
+    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
     for (std::int64_t chunk_x = chunk_x0;; ++chunk_x) {
         for (std::int64_t chunk_y = chunk_y0;; ++chunk_y) {
-            AppendPopulatedChunkRangeEntry(
-                ChunkCoord{chunk_x, chunk_y}, max_entries, "GET AREA", with_vars, &vars_bytes, &entries, snapshot,
-                txn_read);
+            const ChunkCoord coord{chunk_x, chunk_y};
+            if (!index || index->IsPopulationCandidate(coord))
+                AppendPopulatedChunkRangeEntry(
+                    coord, max_entries, "GET AREA", with_vars, &vars_bytes, &entries, snapshot, txn_read);
             if (chunk_y == chunk_y1) {
                 break;
             }
@@ -856,6 +907,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadiusImpl(
     std::int64_t center_y,
     std::int64_t radius_chunks,
     bool with_vars) {
+    if (geometry_.dims() != 2U) throw std::invalid_argument("chunk coordinates require 3 axes");
     if (radius_chunks < 0) {
         throw std::invalid_argument("chunk radius must be >= 0");
     }
@@ -894,6 +946,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadiusImpl(
     // fall outside the int64 domain do not exist and are skipped.
     std::vector<ChunkRangeEntry> entries;
     std::size_t vars_bytes = 0;
+    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
     for (std::int64_t dx = -radius_chunks; dx <= radius_chunks; ++dx) {
         if (dx < 0 && center_x < std::numeric_limits<std::int64_t>::min() - dx) {
             continue;
@@ -913,9 +966,10 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadiusImpl(
             if (dy > 0 && center_y > std::numeric_limits<std::int64_t>::max() - dy) {
                 break;
             }
-            AppendPopulatedChunkRangeEntry(
-                ChunkCoord{chunk_x, center_y + dy}, max_entries, "GET AREA AROUND", with_vars, &vars_bytes, &entries,
-                snapshot, txn_read);
+            const ChunkCoord coord{chunk_x, center_y + dy};
+            if (!index || index->IsPopulationCandidate(coord))
+                AppendPopulatedChunkRangeEntry(
+                    coord, max_entries, "GET AREA AROUND", with_vars, &vars_bytes, &entries, snapshot, txn_read);
         }
     }
     return entries;
