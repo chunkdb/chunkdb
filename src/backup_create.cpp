@@ -180,7 +180,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                     if (!std::filesystem::is_directory(std::filesystem::symlink_status(directory)))
                         throw std::runtime_error("unsafe backup chunk directory: " + directory.string());
                     hook(BackupTestHook::Point::kBeforeSourceDirectoryOpen, table->name(), cut);
-                    for (const auto& entry : backup_detail::DirectoryEntries(directory)) {
+                    for (const auto& entry : backup_detail::OpenDirectory(directory, true)) {
                         std::smatch match;
                         const auto name = entry.path().filename().string();
                         if (!std::regex_match(name, match, chunk_name)) continue;
