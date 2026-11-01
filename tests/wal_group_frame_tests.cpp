@@ -36,7 +36,12 @@ void operator delete[](void* memory) noexcept { ::operator delete(memory); }
 void operator delete(void* memory, std::size_t) noexcept { ::operator delete(memory); }
 void operator delete[](void* memory, std::size_t) noexcept { ::operator delete(memory); }
 
+#include "aligned_allocation_replacement.hpp"
+
 int main() {
+    remaining_allocations = 0U; fail_allocation = true;
+    assert(aligned_allocation_test::Refused(1024U) && !fail_allocation.load());
+    aligned_allocation_test::Succeeds(1024U);
     const chunkdb::WalGroupRef group{{1U}, 2U, 0U};
     std::size_t failed = 0U;
     std::size_t succeeded = 0U;

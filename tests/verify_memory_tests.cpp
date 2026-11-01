@@ -23,10 +23,12 @@
 namespace allocation {
 std::atomic<bool> measuring{false};
 std::atomic<std::size_t> live{0U}, peak{0U};
+std::atomic<std::size_t> limit{std::numeric_limits<std::size_t>::max()};
 struct alignas(std::max_align_t) Header { std::size_t counted; };
 }
 
 void* operator new(std::size_t bytes) {
+    if (bytes > allocation::limit.load(std::memory_order_relaxed)) throw std::bad_alloc();
     if (bytes > std::numeric_limits<std::size_t>::max() - sizeof(allocation::Header)) throw std::bad_alloc();
     auto* block = static_cast<allocation::Header*>(std::malloc(sizeof(allocation::Header) + (bytes == 0U ? 1U : bytes)));
     if (block == nullptr) throw std::bad_alloc();
@@ -52,6 +54,8 @@ void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
 void operator delete[](void* pointer) noexcept { ::operator delete(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
 void operator delete[](void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
+
+#include "aligned_allocation_replacement.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -113,6 +117,14 @@ void IntentBodiesAreAdmittedBeforeAllocation() {
 }
 
 int main() {
+    allocation::measuring = true; allocation::limit = 128U;
+    assert(aligned_allocation_test::Refused(65536U));
+    allocation::limit = std::numeric_limits<std::size_t>::max();
+    aligned_allocation_test::Succeeds(65536U);
+    assert(allocation::peak >= 65536U && allocation::live == 0U);
+    allocation::measuring = false; allocation::peak = 0U;
+    aligned_allocation_test::Succeeds(65536U);
+    assert(allocation::peak == 0U && allocation::live == 0U);
     IntentBodiesAreAdmittedBeforeAllocation();
     test::ScopedTempDir directory("chunkdb-verify-memory");
     const auto root = directory.path() / "tables/t";

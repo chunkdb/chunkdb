@@ -263,15 +263,15 @@ void AppendSection(
     std::vector<std::uint8_t>* directory,
     std::vector<std::uint8_t>* bodies,
     std::uint16_t type,
-    const std::vector<std::uint8_t>& raw,
+    std::span<const std::uint8_t> raw,
     CheckpointCompression compression) {
     const bool compressed = compression == CheckpointCompression::kZrle;
-    const auto stored = compressed ? ZrleCompress(raw) : raw;
+    const auto stored = compressed ? ZrleCompressBytes(raw) : std::vector<std::uint8_t>(raw.begin(), raw.end());
     WriteLe16(*directory, type);
     WriteLe16(*directory, compressed ? kImageSectionFlagZrle : 0U);
     WriteLe32(*directory, static_cast<std::uint32_t>(stored.size()));
     WriteLe32(*directory, static_cast<std::uint32_t>(raw.size()));
-    WriteLe32(*directory, Crc32(raw));
+    WriteLe32(*directory, Crc32(raw.data(), raw.size()));
     bodies->insert(bodies->end(), stored.begin(), stored.end());
 }
 
@@ -315,7 +315,7 @@ std::vector<std::uint8_t> SerializeChunkImage(
     AppendSection(&directory, &bodies, kImageSectionPayload, payload, compression);
     AppendSection(&directory, &bodies, kImageSectionPresence, presence_bitmap, compression);
     if (has_vars) {
-        AppendSection(&directory, &bodies, kImageSectionVars, vars->Encode(), compression);
+        AppendSection(&directory, &bodies, kImageSectionVars, vars->EncodedBytes(), compression);
     }
     // Images of a table that never changed its columns stay as they were.
     const std::uint64_t schema_version = geometry.layout().schema().version;

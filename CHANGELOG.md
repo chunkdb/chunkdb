@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Add configurable area and transaction chunk limits, exact area-response byte admission, and cursor paging for GET AREA (#136).
+- Add configurable area and transaction chunk limits, exact area-response byte admission, and cursor paging for GET AREA; expose allocator-aware variable storage through `ChunkVars::Encode()` (#136).
 - Add three-dimensional tables, typed chunk columns, checked sectioned chunk forms, atomic metadata and projected writes, and retained tombstone identities with incremental scans and explicit compaction (#133).
 - Resolve configured Windows directory junction roots and extended paths for backup and restore while refusing descendant reparse points (#150).
 - Add matched-subscriber budget comparisons with `chunkdb_budget_compare --watch-both TABLE[:N][:slots]` and require a control with the same subscriber settings (#140).

@@ -23,6 +23,9 @@ namespace allocation {
 std::atomic<bool> active{false};
 std::atomic<std::size_t> limit{65536U}, largest{0U};
 }
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
 void* operator new(std::size_t bytes) {
     if (allocation::active.load(std::memory_order_relaxed)) {
         auto previous = allocation::largest.load(std::memory_order_relaxed);
@@ -40,6 +43,8 @@ void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
 void operator delete[](void* pointer) noexcept { ::operator delete(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
 void operator delete[](void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
+
+#include "aligned_allocation_replacement.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -247,5 +252,10 @@ void AllocationAndSparseHeader() {
 }  // namespace
 
 int main() {
+    allocation::limit = 128U; allocation::active = true;
+    assert(aligned_allocation_test::Refused(1024U));
+    allocation::active = false;
+    aligned_allocation_test::Succeeds(1024U);
+    allocation::limit = 65536U; allocation::largest = 0U;
     GoldenDecision(); MembersAndPresence(); ExactBindings(); JournalAndIdSnapshots(); AllocationAndSparseHeader();
 }

@@ -498,6 +498,7 @@ void CrashBoundaries(const std::filesystem::path& executable) {
 }  // namespace
 
 int main(int argc, char** argv) {
+    owner_artifact_allocation::CalibrateAligned();
     if (argc == 4 && std::string(argv[1]) == "--crash") { Crash(static_cast<unsigned>(std::stoul(argv[3])), argv[2]); return 2; }
     using Case = std::pair<std::string_view, void(*)()>;
     const std::array cases{

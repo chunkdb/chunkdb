@@ -911,7 +911,7 @@ ChangeFeed::RawFrame* FeedWriteGuard::NewFrame(ChunkCoord coord) {
     return &frame;
 }
 void FeedWriteGuard::CopyBefore(ChunkCoord coord, const std::vector<std::uint8_t>& payload,
-                               const std::vector<std::uint8_t>& presence, const std::vector<std::uint8_t>& vars,
+                               const std::vector<std::uint8_t>& presence, std::span<const std::uint8_t> vars,
                                const ChunkColumnState* chunk_columns, bool written) {
     auto* captured = NewFrame(coord);
     if (!captured) return;
@@ -928,7 +928,7 @@ void FeedWriteGuard::CopyBlock(ChunkCoord coord, const std::vector<std::uint8_t>
                               const ChunkLayout& layout, std::size_t block,
                               const ChunkColumnState* chunk_columns, bool written) {
     if (state_->feed->chunk_watchers_.load(std::memory_order_acquire) != 0U) {
-        CopyBefore(coord, payload, presence, vars.Encode(), chunk_columns, written);
+        CopyBefore(coord, payload, presence, vars.EncodedBytes(), chunk_columns, written);
         return;
     }
     auto* captured = NewFrame(coord);

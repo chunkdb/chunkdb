@@ -105,6 +105,23 @@ An ordinal's decision bounds are validated by the covered-member value codec, no
 Tree kinds coverage 1, retained groups 2 and covered members 3 require key widths 41, 16 and 24 respectively.
 Leaf value references have the corresponding kinds coverage value 3, retained-group value 4 and covered-member value 5.
 
+## Covered-member capsules
+
+A covered-member value has the checked CKGO header, object kind 5, a fixed 136-byte payload and final CRC32, for exactly 204 bytes.
+It binds one membership fact rather than a whole group or permission to replay an artifact.
+The payload contains group identity 16, exact decision SHA-256 32, ordinal u64, member count u64, table epoch 16, dimensions u8, changed-or-observed kind u8, six zero bytes, signed X/Y/Z as three little-endian u64 bit patterns, and producing revision, time and schema as u64 fields.
+Group and table identities and the decision digest are nonzero, count is positive and ordinal is below count.
+Dimensions are two or three with zero Z in two dimensions.
+A changed member has nonzero revision and schema; an observed zero revision requires zero time and schema, while an observed nonzero revision requires a nonzero schema.
+The creating generation is positive and does not exceed the selecting owner generation.
+Header inspection refuses any other complete extent before a reader allocates its body.
+
+Pure binding validation compares the capsule's group and ordinal to its exact leaf key and its table epoch, dimensions and coordinate to the owning coverage key.
+It also compares the admitted decision's directory, identity, measured raw digest and actual member-vector count, then every retained producing field and member kind at that ordinal.
+The caller supplies a completely admitted decision and its independently measured raw digest; the validator does not convert caller-constructed facts into publication authority.
+A matching capsule cannot certify image or retained-record contents, observation durability, complete membership discovery, or a missing decision or seal.
+Those checks remain obligations of the complete native reference and recovery owner.
+
 ## Compressed radix pages
 
 A page payload begins with tree kind u8, node kind u8, key width u8, prefix length u8, entry count u16, zero u16, subtree key count u64 and subtree owned bytes u64.
