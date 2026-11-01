@@ -5,11 +5,17 @@ The user-visible guarantees are in [Durability](../DURABILITY_CONTRACT.md).
 
 ## Ownership and identities
 
+The `commit_groups` incompat feature owns the directory journal and grouped table artifacts.
+New directory and table defaults enable it; existing roots use the checked ENABLE FEATURE publication before grouped operations are admitted.
+The existing activation decision covers both the directory and every table owner, so an older writer cannot accept only part of the new ownership.
 A data directory owns one group journal and one checked counter for externally visible transaction IDs.
 Standalone stores use the same coordinator with their store root as the directory scope.
 The coordinator is created lazily and unconditional single-chunk writes without IDs or tags perform no journal or directory coordination.
 
 Each group has an independent random internal identity, an exact member count and a member ordinal on each WAL frame.
+The GROUP WAL TLV body is exactly 32 bytes: 16 raw identity bytes, a little-endian unsigned 64-bit member count and a little-endian unsigned 64-bit ordinal.
+The identity is nonzero, the count is nonzero and the ordinal is strictly below that count.
+Its enclosing frame header checksum protects the complete TLV, and decoding its shape alone does not authorize replay without the admitted directory decision.
 A visible `txn` is a nonzero unsigned directory counter allocated only for cross-table groups and groups carrying an idempotency ID.
 Its durable reservation ceiling precedes exposing a counter range, so restarting cannot reuse an exposed ID.
 Frame and record identities include the data-directory identity, table epoch, dimensions, coordinates, producing revision and producing time.
