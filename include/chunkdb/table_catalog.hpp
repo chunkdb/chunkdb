@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -272,6 +273,8 @@ class Table : public std::enable_shared_from_this<Table> {
     };
     [[nodiscard]] AdmissionPause PauseAdmission(
         std::chrono::steady_clock::time_point deadline, std::stop_token cancelled);
+    [[nodiscard]] std::optional<Lease> AcquireUntil(
+        std::chrono::steady_clock::time_point deadline, std::stop_token cancelled);
     void ResumeAdmission() noexcept;
     void FailFeed(std::exception_ptr error);
     class BackupPin {
@@ -354,6 +357,17 @@ struct CatalogTxnSnapshot {
     std::unique_ptr<TxnSnapshot> snapshot;
 };
 
+struct CatalogTxnParticipant {
+    std::shared_ptr<Table> table;
+    const TxnSnapshot* snapshot = nullptr;
+};
+
+struct CatalogTxnLease {
+    // The lease releases before its table owner is destroyed.
+    std::shared_ptr<Table> table;
+    Table::Lease lease;
+};
+
 // The tables of one data directory (docs/STORAGE_FORMAT.md Section 1):
 // `chunkdb.manifest`, the writer lock, and one store per `tables/<name>/`.
 // Tables share one StoreResources, so the cache and WAL-stream budgets cover
@@ -387,6 +401,12 @@ class TableCatalog {
     // statement. Callers hold no table lease; later reads use these original
     // snapshots even when they first touch a table in a later statement.
     [[nodiscard]] std::vector<CatalogTxnSnapshot> CaptureTxnSnapshots(
+        std::chrono::milliseconds max_duration, std::stop_token cancelled = {});
+    // Admits a complete original table cohort in epoch order. Callers hold
+    // no table lease and must not re-enter cohort admission while it lives.
+    // An optional snapshot must belong to that exact store owner.
+    [[nodiscard]] std::vector<CatalogTxnLease> AcquireTxnTables(
+        std::span<const CatalogTxnParticipant> participants,
         std::chrono::milliseconds max_duration, std::stop_token cancelled = {});
     // Sorted by name.
     [[nodiscard]] std::vector<TableInfo> List() const;
