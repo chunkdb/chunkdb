@@ -28,7 +28,9 @@ The vector owns snapshot history registrations rather than long-lived table leas
 Every table statement resolves its original vector entry before obtaining its command lease.
 The acquired store must own that exact snapshot, including after an ALTER that retains the table epoch but replaces the store.
 Rights are checked for the statement and again for each written table at commit.
-Commit acquires all touched table leases under shared metadata admission, in epoch order, before loading or locking any chunks.
+Commit takes shared feature metadata admission and the catalog operations mutex before checking identities and acquiring all touched table leases in epoch order.
+DDL also takes shared feature admission, so that gate alone cannot exclude a SWAP that pauses one table while waiting for another table's active leases.
+The operations mutex covers the entire lease cohort and is released before loading chunks, taking chunk locks or performing group I/O.
 It validates every touched identity before preparing a group and takes chunk locks in epoch and coordinate order.
 An identity or read conflict cannot commit a subset of tables.
 
