@@ -149,6 +149,8 @@ A decided failure fences serving with an unknown outcome.
 
 ## Feed, backup and verification
 
+Creating the first slot normalizes every pre-slot WAL using the table's complete coordinate key.
+Resident and off-cache checkpoints preserve the producing revision, time, written state and chunk columns; baseline preparation allocates no user revision.
 An archived WAL retains its original pre-segment base, including schema and metadata, with base revision strictly below the first frame.
 A checked `CKFB` descriptor binds epoch, dims, coordinates, first revision and the exact image or retained-empty base.
 Image length and SHA-256 digest bind every byte of a pinned original image, including its checked header and opaque sections; a missing base is damage.
