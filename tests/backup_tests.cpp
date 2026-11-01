@@ -1048,6 +1048,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--staging-collision-regression") { StagingCollisionRetainsExistingEntry(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-owner-regression") { StagingOwnerValidation(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-cleanup-alias") { StagingCleanupAliasReplacement(); StagingCleanupRootReplacement(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--staging-cleanup-root") { StagingCleanupRootReplacement(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--orphaned-staging") { OrphanedStagingCleanup(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--path-regressions") { TargetComponentReplacement(); StagingOwnerValidation(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); return 0; }
     TargetComponentReplacement(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded();
