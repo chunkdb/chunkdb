@@ -1,7 +1,7 @@
 # Prepared physical block staging
 
 This design specifies prepared physical block staging for [#136](https://github.com/chunkdb/chunkdb/issues/136).
-The initial implementation isolates allocation-aware variable storage; physical stage and history integration follow separately.
+The implementation includes allocation-aware variable storage, prepared physical block stages and charged retained history.
 It follows [block observations and deltas](TRANSACTION_BLOCK_DELTAS.md).
 It does not allocate revisions, append WAL, publish groups or activate session block deltas.
 
