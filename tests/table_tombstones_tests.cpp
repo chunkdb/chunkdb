@@ -16,6 +16,9 @@
 #endif
 
 namespace allocation { thread_local bool fail_next = false; }
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
 void* operator new(std::size_t bytes) {
     if (allocation::fail_next) { allocation::fail_next = false; throw std::bad_alloc(); }
     if (auto* memory = std::malloc(bytes == 0U ? 1U : bytes)) return memory;
