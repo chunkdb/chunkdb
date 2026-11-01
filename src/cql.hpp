@@ -302,6 +302,11 @@ struct ScanChunks {
 using MigrationStatement = std::variant<CreateTable, AlterTable, DropTable, GrantRight, CreateSlot, DropSlot>;
 struct Migrate { std::string name; std::string text; MigrationStatement statement; };
 struct ShowMigrations {};
+struct CompactTombstones {
+    std::string table;
+    std::uint64_t before = 0U;
+};
+struct ShowTableStats { std::string table; };
 
 using Statement = std::variant<
     GetBlock,
@@ -339,7 +344,9 @@ using Statement = std::variant<
     ShowSlots,
     Ack,
     Migrate,
-    ShowMigrations>;
+    ShowMigrations,
+    CompactTombstones,
+    ShowTableStats>;
 
 struct Parsed {
     Statement statement;
