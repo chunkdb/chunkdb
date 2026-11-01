@@ -105,6 +105,7 @@ int main() {
     const auto checked = VerifyDataDirectory(directory.path(), findings);
     allocation::measuring.store(false, std::memory_order_relaxed);
     const auto peak = allocation::peak.load(std::memory_order_relaxed);
+    assert(peak >= geometry.ChunkPayloadBytes());
     if (checked.errors != 0U) std::cerr << findings.str();
     assert(checked.errors == 0U);
     if (peak > 2U*1024U*1024U) {
