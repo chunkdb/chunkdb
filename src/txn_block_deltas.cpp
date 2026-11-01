@@ -44,6 +44,15 @@ void Add(std::size_t& total, std::size_t amount) {
 }
 }  // namespace
 
+TxnBlockPlannedVariable& TxnBlockPlannedVariable::operator=(TxnBlockPlannedVariable&& other) {
+    if (this == &other) return *this;
+    if (value.get_allocator().resource() != other.value.get_allocator().resource())
+        throw std::invalid_argument("transaction variable plans cannot move between memory resources");
+    value = std::move(other.value);
+    key = other.key; removed = other.removed;
+    return *this;
+}
+
 TxnBlockDeltas::Edit::Edit(TxnBlockDeltas* owner, TxnBlockKey key)
     : owner_(owner), generation_(owner->generation_), key_(key), after_(owner->resource()) {}
 TxnBlockDeltas::Promotion::Promotion(TxnBlockDeltas* owner)
@@ -99,7 +108,7 @@ TxnBlockDeltas::Edit TxnBlockDeltas::Prepare(TxnBlockKey key, const TxnBlockSnap
             auto row = CloneTxnBlockRow(*replacement, resource());
             SwapRows(entry.after, row);
         }
-        edit.node_ = staged.extract(inserted);
+        edit.node_.emplace(staged.extract(inserted));
         edit.changes_ = true;
     } else if (action != TxnBlockAction::kObserve) {
         edit.after_.schema_version = layout_.schema().version;
@@ -117,7 +126,7 @@ void TxnBlockDeltas::Publish(Edit edit) {
         throw std::invalid_argument("transaction block edit is stale or belongs to another journal");
     if (!edit.changes_) return;
     CanEdit();
-    if (!edit.node_.empty()) rows_.insert(std::move(edit.node_));
+    if (edit.node_) rows_.insert(std::move(*edit.node_));
     else {
         auto& entry = rows_.find(edit.key_)->second;
         SwapRows(entry.after, edit.after_); entry.action = edit.action_;
@@ -134,16 +143,16 @@ TxnBlockDeltas::Promotion TxnBlockDeltas::PreparePromotion(ChunkCoord coord, std
     Promotion promotion(this);
     Promotions staged(resource());
     const auto inserted = staged.emplace(coord, snapshot_version).first;
-    promotion.node_ = staged.extract(inserted);
+    promotion.node_.emplace(staged.extract(inserted));
     return promotion;
 }
 
 void TxnBlockDeltas::Publish(Promotion promotion) {
-    if (promotion.owner_ != this || promotion.generation_ != generation_ || promotion.node_.empty())
+    if (promotion.owner_ != this || promotion.generation_ != generation_ || !promotion.node_ || promotion.node_->empty())
         throw std::invalid_argument("transaction promotion is stale or belongs to another journal");
     CanEdit();
-    const auto coord = promotion.node_.key();
-    promotions_.insert(std::move(promotion.node_));
+    const auto coord = promotion.node_->key();
+    promotions_.insert(std::move(*promotion.node_));
     for (auto it = rows_.begin(); it != rows_.end();)
         if (it->first.chunk == coord) it = rows_.erase(it); else ++it;
     ++generation_;

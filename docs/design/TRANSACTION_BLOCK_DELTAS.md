@@ -32,6 +32,8 @@ It checks overflow and the existing per-transaction bound, then reserves the exi
 Deallocation returns exactly those charges, and staging remains charged while it coexists with the published private state.
 The budget borrows the transaction's private byte count and the engine's global count, and its owner must outlive every row, journal and prepared edit using it.
 The same resource reaches every nested cell and value container, including failed or still-staged records.
+Move assignment between rows, cells, snapshots or variable plans with different resources refuses before transferring any bytes, flags or charges; explicit cloning selects a new resource instead.
+Compound journal and rebase-plan owners support move construction but delete assignment, so partial allocator migration cannot publish through a wrapper.
 Session integration must destroy or clear these allocated records before the existing transaction byte-counter teardown, so a charge is returned once.
 No new process-wide quota or counter is introduced.
 
