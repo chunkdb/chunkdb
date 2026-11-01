@@ -85,7 +85,7 @@ Windows reuse obtains writable sync rights by reopening the already opened nativ
 A conflicting or redirected existing entry refuses without replacement.
 Publication uncertainty records whether this invocation installed the immutable name; a directory-sync failure does not report a durable stage even if the new object is readable.
 An exact later retry must re-admit and sync that name before returning success, so a prior failed directory sync cannot disappear as unrecorded debt.
-A write, close, sync or publication failure removes only the private temporary name created by that invocation when it remains safely unpublished.
+A write, close, sync or publication failure can clean only its own unpublished native generation through a deletion operation that cannot remove a substituted file; otherwise it retains the uncertain name.
 An already published immutable object remains available for checked reuse and is not deleted as cleanup after uncertainty.
 
 POSIX publication retains the original temporary descriptor through final-name admission.
