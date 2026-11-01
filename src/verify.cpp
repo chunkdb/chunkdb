@@ -275,8 +275,9 @@ std::map<chunkdb::ChunkCoord, std::uint64_t> VisibilityCuts(const std::filesyste
         if (IsTmpArtifactName(name) || file.path().extension() != ".rollback") continue;
         RequirePlain(file.path());
         const bool transaction = chunkdb::IsTxnIntentArtifactName(name);
-        const auto limit = transaction ? 40U + chunkdb::kMaxTxnWrittenChunks * (8U * geometry.dims() + 8U) : 16U;
-        const auto bytes = ReadSmallRecord(file.path(), limit);
+        const auto bytes = transaction
+            ? chunkdb::LoadRecoveryTxnIntent(file.path(), geometry.dims(), manifest.store_id)
+            : ReadSmallRecord(file.path(), 16U);
         if (transaction) {
             chunkdb::TxnIntent intent;
             if (!chunkdb::IsTxnIntentFileName(name) || !chunkdb::TryParseTxnIntent(bytes, &intent, geometry.dims(), manifest.store_id) ||
@@ -892,8 +893,8 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                 try {
                     chunkdb::TxnIntent intent;
                     if (!chunkdb::IsTxnIntentFileName(file_name) ||
-                        !chunkdb::TryParseTxnIntent(ReadSmallRecord(file.path(),
-                            40U + chunkdb::kMaxTxnWrittenChunks * (8U * store_manifest->geometry.dims + 8U)), &intent,
+                        !chunkdb::TryParseTxnIntent(chunkdb::LoadRecoveryTxnIntent(file.path(),
+                            store_manifest->geometry.dims, store_manifest->store_id), &intent,
                             store_manifest->geometry.dims, store_manifest->store_id) ||
                         file_name != chunkdb::TxnIntentPath(data_dir, intent.version).filename().string()) {
                         Report(

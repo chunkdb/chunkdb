@@ -41,7 +41,7 @@ std::vector<std::uint8_t> SerializeTxnIntent(const TxnIntent& intent, std::uint8
 bool TryParseTxnIntent(const std::vector<std::uint8_t>& bytes, TxnIntent* out,
     std::uint8_t dims, const StoreId& table_id) {
     if (out == nullptr) return false;
-    try { *out = ParseCheckedTxnIntent(bytes, dims, table_id, kMaxTxnWrittenChunks); }
+    try { *out = ParseCheckedTxnIntent(bytes, dims, table_id); }
     catch (const std::invalid_argument&) { return false; }
     return true;
 }
@@ -153,7 +153,7 @@ void ChunkStore::RecoverTransactionIntents(bool validate_only) {
     std::vector<TxnIntent> parsed(intents.size());
     for (std::size_t i = 0; i < intents.size(); ++i) {
         const auto& [version, path] = intents[i];
-        if (!TryParseTxnIntent(LoadRecoveryTxnIntent(path), &parsed[i], geometry_.dims(), store_id_) || parsed[i].version != version) {
+        if (!TryParseTxnIntent(LoadRecoveryTxnIntent(path, geometry_.dims(), store_id_), &parsed[i], geometry_.dims(), store_id_) || parsed[i].version != version) {
             throw std::runtime_error("invalid transaction intent: " + path.string());
         }
     }
