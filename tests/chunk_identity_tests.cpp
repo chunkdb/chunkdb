@@ -13,6 +13,7 @@
 #include "chunk_coordinate_index.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "wal_writer.hpp"
 #include "test_utils.hpp"
 
 namespace {
@@ -253,6 +254,50 @@ void TestAreaSkipsMissingCoordinatesBeforeDiskReads() {
     assert(status == std::future_status::ready);
 }
 
+void TestRetainedBoundaryRejectsEqualWalTimeConflict() {
+    chunkdb::test::ScopedTempDir directory("chunkdb-retained-wal-time");
+    const auto config = Config(directory.path());
+    std::filesystem::path wal;
+    std::vector<std::uint8_t> bytes;
+    {
+        chunkdb::ChunkStore writer(config);
+        writer.SetBlockBits(0, 0, "10000");
+        writer.UnsetBlock(0, 0);
+        const auto empty = writer.ReadChunkState(0, 0);
+        writer.CheckpointForTests(0, 0);
+        (void)writer.ReadChunkState(2, 0);
+        assert(!writer.IsChunkLoadedForTests(0, 0));
+        wal = chunkdb::ChunkWalPath(directory.path(), writer.geometry(), {0, 0});
+        bytes = chunkdb::BuildWalHeader({0, 0}, writer.store_id(), writer.features());
+        chunkdb::WalFrameBuilder frame(&bytes, writer.geometry().layout().schema().version);
+        const std::vector<std::uint8_t> zeros(writer.geometry().ChunkPayloadBytes() +
+            chunkdb::ChunkPresenceBitmapBytes(writer.geometry()), 0U);
+        frame.AppendSpan(0U, zeros.data(), zeros.size());
+        (void)frame.Finish(empty.version, empty.commit_time_ms + 1U);
+        chunkdb::AtomicWrite(wal, bytes, true, true);
+        bool refused = false;
+        try { (void)writer.ScanChunkIdentities(false, {}, 10U, 0U, true); }
+        catch (const std::runtime_error& error) {
+            refused = std::string(error.what()).find("frame_base_commit_time_mismatch") != std::string::npos;
+        }
+        assert(refused && Read(wal) == bytes);
+        auto readonly = config; readonly.access_mode = chunkdb::AccessMode::kReadOnly;
+        chunkdb::ChunkStore reader(readonly);
+        refused = false;
+        try { (void)reader.ReadChunkState(0, 0); }
+        catch (const std::runtime_error& error) {
+            refused = std::string(error.what()).find("frame_base_commit_time_mismatch") != std::string::npos;
+        }
+        assert(refused && Read(wal) == bytes);
+    }
+    bool refused = false;
+    try { chunkdb::ChunkStore writer(config); }
+    catch (const std::runtime_error& error) {
+        refused = std::string(error.what()).find("frame_base_commit_time_mismatch") != std::string::npos;
+    }
+    assert(refused && Read(wal) == bytes);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -265,4 +310,5 @@ int main(int argc, char** argv) {
     if (selected == "all" || selected == "repair") TestStartupTailRepairRetainsSnapshotOwner();
     if (selected == "all" || selected == "readonly-admission") TestReadOnlyStartupDoesNotWalkLiveArtifacts();
     if (selected == "all" || selected == "area-index") TestAreaSkipsMissingCoordinatesBeforeDiskReads();
+    if (selected == "all" || selected == "retained-time") TestRetainedBoundaryRejectsEqualWalTimeConflict();
 }

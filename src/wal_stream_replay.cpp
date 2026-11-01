@@ -123,9 +123,19 @@ WalReplayResult ReplayWalStream(std::istream& input, std::uint64_t measured_byte
     std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence, ChunkVars* vars,
     std::vector<WalFrameBoundary>* boundaries, std::shared_ptr<const ChunkColumnState>* chunk_columns,
     const std::function<void()>& read_checkpoint) {
+    return ReplayWalStream(input, measured_bytes, geometry, coord, table_id, features,
+        base_revision, base_schema_version, payload, presence, vars, boundaries, chunk_columns, read_checkpoint, {});
+}
+
+WalReplayResult ReplayWalStream(std::istream& input, std::uint64_t measured_bytes,
+    const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
+    std::uint64_t base_revision, std::uint64_t base_schema_version,
+    std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence, ChunkVars* vars,
+    std::vector<WalFrameBoundary>* boundaries, std::shared_ptr<const ChunkColumnState>* chunk_columns,
+    const std::function<void()>& read_checkpoint, std::optional<std::uint64_t> base_commit_time_ms) {
     StreamSource source(input, measured_bytes, geometry.dims(), read_checkpoint);
     return wal_detail::ReplayFromSource(source, geometry, coord, table_id, features,
-        base_revision, base_schema_version, payload, presence, vars, boundaries, chunk_columns);
+        base_revision, base_schema_version, payload, presence, vars, boundaries, chunk_columns, base_commit_time_ms);
 }
 
 WalStreamInfo InspectWalStream(std::istream& input, std::uint64_t measured_bytes,

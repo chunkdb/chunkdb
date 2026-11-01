@@ -465,23 +465,22 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
                         image.schema_version, image.payload, image.presence_bitmap, image.vars, image.chunk_columns);
             } else if (local.extension() == ".wal") {
                 std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U), presence(ChunkPresenceBitmapBytes(geometry), 0U);
-                ChunkVars vars; std::uint64_t base = 0U, schema = 0U;
+                ChunkVars vars; std::uint64_t base = 0U, schema = 0U, time = 0U;
                 std::shared_ptr<const ChunkColumnState> chunk_columns;
                 const auto image_path = full.parent_path() / (stem + ".chk");
                 if (Present(image_path)) {
                     auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, coord, cut.epoch, manifest->features),
                         geometry, coord, cut.epoch, manifest->features);
-                    base = image.revision; schema = image.schema_version;
+                    base = image.revision; schema = image.schema_version; time = image.commit_time_ms;
                     payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
                     chunk_columns = std::move(image.chunk_columns);
                 }
-                std::uint64_t time = 0U;
                 if (const auto boundary = retained.EmptyBoundary(coord))
                     (void)ApplyRetainedEmptyBase(geometry, *boundary, base, time, schema,
                         payload, presence, vars, chunk_columns);
                 std::vector<WalFrameBoundary> boundaries;
                 auto replay = ReplayWal(LoadFile(full), geometry, coord, cut.epoch, manifest->features, base, schema,
-                    &payload, &presence, &vars, &boundaries, &chunk_columns);
+                    &payload, &presence, &vars, &boundaries, &chunk_columns, time);
                 if ((!replay.replayable && !replay.torn_creation) ||
                     (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty() ||
                     (!boundaries.empty() && boundaries.back().revision > cut.revision)) throw std::runtime_error("backup WAL is damaged or exceeds cut");

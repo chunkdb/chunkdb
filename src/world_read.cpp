@@ -466,7 +466,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         if (have_wal) {
             const auto replay = ReplayWal(
                 wal_bytes, geometry_, chunk_coord, store_id_, features_, base_revision, schema_version, &payload,
-                &presence, &vars, nullptr, &chunk_columns);
+                &presence, &vars, nullptr, &chunk_columns, commit_time_ms);
             schema_version = geometry_.layout().schema().version;
             if (replay.applied_frames > 0) {
                 revision = replay.revision;

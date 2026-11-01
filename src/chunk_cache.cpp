@@ -387,7 +387,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 &loaded.presence_bitmap,
                 &loaded.vars,
                 track_prefix ? &boundaries : nullptr,
-                &loaded.chunk_columns);
+                &loaded.chunk_columns, loaded.commit_time_ms);
             loaded.schema_version = geometry_.layout().schema().version;
             if (replay.torn_creation) {
                 // An interrupted creation holds no mutation, and names no
@@ -491,7 +491,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             &loaded.presence_bitmap,
             &loaded.vars,
             track_prefix ? &boundaries : nullptr,
-            &loaded.chunk_columns);
+            &loaded.chunk_columns, {}, loaded.commit_time_ms);
         wal_input.close();
         loaded.schema_version = geometry_.layout().schema().version;
         if (replay.torn_creation) {

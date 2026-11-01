@@ -357,4 +357,21 @@ int main() {
     SchemaMetadataAndFinalInvariants();
     BoundedReadsAndExtent();
     InspectionAndCancellation();
+    const auto geometry = MakeGeometry();
+    auto bytes = Header(); Append(bytes, Frame(7U));
+    for (bool streamed : {false, true}) for (const auto time : {70U, 71U}) {
+        Bytes payload(geometry.ChunkPayloadBytes(), 0U), presence(ChunkPresenceBitmapBytes(geometry), 0U);
+        ChunkVars vars;
+        WalReplayResult result;
+        if (streamed) {
+            std::istringstream input(std::string(bytes.begin(), bytes.end()), std::ios::binary);
+            result = ReplayWalStream(input, bytes.size(), geometry, {0, 0}, kId, kFeatures,
+                7U, 1U, &payload, &presence, &vars, nullptr, nullptr, {}, time);
+        } else result = ReplayWal(bytes, geometry, {0, 0}, kId, kFeatures,
+            7U, 1U, &payload, &presence, &vars, nullptr, nullptr, time);
+        assert(result.tail_truncated_or_corrupt == (time != 70U));
+        assert(!result.stopped_at_crash_tail);
+        if (time != 70U) assert(result.stop_reason == "frame_base_commit_time_mismatch");
+        else assert(result.skipped_frames == 1U);
+    }
 }

@@ -125,6 +125,21 @@ void ValidateWalPrefix(std::istream& input, std::uint64_t prefix_bytes, const Ge
     std::shared_ptr<const ChunkColumnState>* chunk_columns = nullptr,
     const std::function<void()>& read_checkpoint = {});
 
+// A known producing identity also binds any checksum-valid equal-revision
+// frame that would otherwise be skipped below the replay base.
+[[nodiscard]] WalReplayResult ReplayWal(
+    const std::vector<std::uint8_t>& bytes, const Geometry& geometry, const ChunkCoord& coord,
+    const StoreId& table_id, const FeatureFlags& features, std::uint64_t base_revision,
+    std::uint64_t base_schema_version, std::vector<std::uint8_t>* payload,
+    std::vector<std::uint8_t>* presence, ChunkVars* vars, std::vector<WalFrameBoundary>* boundaries,
+    std::shared_ptr<const ChunkColumnState>* chunk_columns, std::optional<std::uint64_t> base_commit_time_ms);
+[[nodiscard]] WalReplayResult ReplayWalStream(std::istream& input, std::uint64_t measured_bytes,
+    const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id,
+    FeatureFlags features, std::uint64_t base_revision, std::uint64_t base_schema_version,
+    std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence, ChunkVars* vars,
+    std::vector<WalFrameBoundary>* boundaries, std::shared_ptr<const ChunkColumnState>* chunk_columns,
+    const std::function<void()>& read_checkpoint, std::optional<std::uint64_t> base_commit_time_ms);
+
 struct WalStreamInfo {
     std::uint64_t first = 0U, last = 0U, first_schema = 0U;
 };

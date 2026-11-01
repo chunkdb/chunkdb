@@ -58,23 +58,22 @@ ChunkCoord Coordinate(const std::filesystem::path& path, const Geometry& geometr
 std::vector<std::uint8_t> RecoverWal(const std::filesystem::path& path, const Geometry& geometry,
     ChunkCoord coord, const StoreId& epoch, FeatureFlags features, const ChunkCoordinateIndex& retained) {
     std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U), presence(ChunkPresenceBitmapBytes(geometry), 0U);
-    ChunkVars vars; std::uint64_t revision = 0U, schema = 0U;
+    ChunkVars vars; std::uint64_t revision = 0U, schema = 0U, time = 0U;
     std::shared_ptr<const ChunkColumnState> chunk_columns;
     auto image_path = path; image_path.replace_extension(".chk");
     if (std::filesystem::exists(image_path)) {
         auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, coord, epoch, features),
             geometry, coord, epoch, features);
-        revision = image.revision; schema = image.schema_version;
+        revision = image.revision; schema = image.schema_version; time = image.commit_time_ms;
         payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
         chunk_columns = std::move(image.chunk_columns);
     }
-    std::uint64_t time = 0U;
     if (const auto boundary = retained.EmptyBoundary(coord))
         (void)ApplyRetainedEmptyBase(geometry, *boundary, revision, time, schema,
             payload, presence, vars, chunk_columns);
     auto bytes = LoadFile(path);
     const auto replay = ReplayWal(bytes, geometry, coord, epoch, features, revision, schema,
-        &payload, &presence, &vars, nullptr, &chunk_columns);
+        &payload, &presence, &vars, nullptr, &chunk_columns, time);
     if (replay.torn_creation) return {};
     if (!replay.replayable || (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty())
         throw std::runtime_error("restored WAL is damaged: " + path.string());
