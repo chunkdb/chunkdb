@@ -29,6 +29,8 @@ A leaf contains a canonical set of covered member references, each containing gr
 The referenced checked decision or seal must agree with every field, table epoch, dimensions and coordinate.
 A separate optional producer reference identifies the changed group member that produced the leaf's current identity; observed members never become producer references.
 A later ordinary producing mutation clears that producer reference, while preserving covered references that still have another owner.
+For a volatile WAL mutation this clears only the live replay reference; the durable leaf retains its earlier producer owner until the superseding state has complete durable coverage.
+Retirement cannot use a merely later relaxed revision to discard that owner, because losing its suffix could make the earlier group producer current again.
 No metadata is stored per block.
 
 Coverage objects explicitly certify that their bound artifact contains the effects of their listed members after complete replay and schema admission.
