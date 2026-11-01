@@ -150,6 +150,13 @@ struct WalStreamInfo {
     std::uint64_t first = 0U, last = 0U, first_schema = 0U;
 };
 
+// Inspect only a complete checksum-valid first frame. A cut or corrupt first
+// append remains subject to ordinary recovery's tail policy; a complete frame
+// with invalid records is refused. Retains at most one bounded frame.
+[[nodiscard]] std::optional<FeedFrameInfo> InspectFirstWalFrameStream(std::istream& input,
+    std::uint64_t measured_bytes, const Geometry& geometry, const ChunkCoord& coord,
+    const StoreId& table_id, FeatureFlags features);
+
 // Validate every whole frame in a measured WAL without retaining the file
 // or constructing chunk state. Empty WALs have zero first/last revisions.
 [[nodiscard]] WalStreamInfo InspectWalStream(std::istream& input, std::uint64_t measured_bytes,

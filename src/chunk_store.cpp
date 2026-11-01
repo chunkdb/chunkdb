@@ -460,6 +460,7 @@ ChunkStore::ChunkStore(StoreConfig config)
         if (config.allow_multiple_processes && slots &&
             std::any_of(slots->slots.begin(), slots->slots.end(), [](const auto& slot) { return !slot.lost; }))
             throw std::invalid_argument("feed slots require a single-process table");
+        if (access_mode_ == AccessMode::kReadWrite) FeedSlots::ValidateRecoveryAliases(*this);
         PrepareCoordinateIndex();
         // Refuse damaged revision bookkeeping before publishing an odd
         // recovery generation, so a refused writer leaves read-only inspection usable.
