@@ -24,7 +24,7 @@ void Record(const Reply& record, std::string_view name, std::string_view user, s
 }
 void CreateUser(Client& admin, std::string_view name) {
     const std::array<std::uint8_t, 16> salt{};
-    const auto verifier = scram::FormatVerifier(scram::MakeVerifier("pw", salt, scram::kMinIterations));
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
     admin.Ok("CREATE USER " + std::string(name) + " VERIFIER '" + verifier + "'");
 }
 void AppliedSkippedConflict(bool tls) {
