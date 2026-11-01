@@ -33,6 +33,7 @@
 #include "chunkdb/schema.hpp"
 #include "chunkdb/server_defaults.hpp"
 #include "chunkdb/types.hpp"
+#include "chunkdb/txn_block_row.hpp"
 #include "chunkdb/wal_append_stream.hpp"
 
 namespace chunkdb {
@@ -750,6 +751,11 @@ class ChunkStore {
     // snapshot.
     [[nodiscard]] ChunkState ReadChunkStateAt(const TxnSnapshot& snapshot, std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] ChunkState ReadChunkStateAt(const TxnSnapshot& snapshot, const ChunkCoord& chunk_coord);
+    // Owns only the selected row; the allocation-only resource outlives it
+    // and must not re-enter storage while snapshot locks are held.
+    [[nodiscard]] TxnBlockSnapshot ReadBlockAtSnapshot(const TxnSnapshot& snapshot,
+        const ChunkCoord& chunk_coord, std::size_t block_index,
+        std::pmr::memory_resource* resource = std::pmr::get_default_resource());
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlockAt(
         const TxnSnapshot& snapshot,
         std::int64_t block_x,
