@@ -85,7 +85,7 @@ void TestReadOnlyRefreshDoesNotInventIdentity() {
     const chunkdb::ChunkCoord missing{-4, -3};
     const auto wal_path = chunkdb::ChunkWalPath(dir.path(), writer.geometry(), missing);
     std::filesystem::create_directories(wal_path.parent_path());
-    const auto header = chunkdb::BuildWalHeader(missing, writer.store_id(), {});
+    const auto header = chunkdb::BuildWalHeader(missing, writer.store_id(), writer.features());
     {
         std::ofstream output(wal_path, std::ios::binary);
         output.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));

@@ -180,6 +180,7 @@ void TestUnsupportedSchemaIsRefused() {
     auto supported_geometry = geometry;
     supported_geometry.block_bits = 8;
     auto manifest = chunkdb::SerializeStoreManifest(chunkdb::StoreManifest{
+        .features = {.incompat = chunkdb::kChunkModelFormatBit},
         .geometry = supported_geometry,
         .store_id = chunkdb::NewStoreId(),
         .options = {},
