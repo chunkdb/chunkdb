@@ -148,9 +148,12 @@ Logical entry and byte totals are checked against the sparse plan and the existi
 
 Original variable owners also need explicit admission rather than an assumption that their memory is free.
 Preparation reserves their recorded buffer and policy-control extents through the supplied owning account.
+An empty section can still retain allocator controls; those controls require the same ownership validation and admission even when no buffer request remains.
 An existing regular-storage policy is admitted temporarily and restored to regular ownership if preparation fails or application is undone.
 For an ordinary buffer with no policy, preparation creates a charged policy and reserves the original request privately; application attaches that policy to the original prefix without allocation.
 The original complete section then moves into the prepared history owner, and undo restores the same buffers through nonthrowing swaps.
+Undo detaches a policy created for a formerly ordinary prefix and destroys that private control through its original transaction account.
+It restores an existing regular policy's original account state without leaving a new control allocation behind on a failed write.
 No previous allocation is truncated, copied through an uncharged default vector or assigned a guessed capacity bound.
 The caller exclusively owns each original section and its allocation policies throughout this operation; another live section cannot share one of those policies outside the locked cohort.
 Before any adoption, validation refuses an already charged policy, a foreign upstream domain or recorded outstanding buffers outside the exact locked section.
