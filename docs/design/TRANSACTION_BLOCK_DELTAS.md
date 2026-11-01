@@ -15,6 +15,7 @@ Chunk producing revision, time and written status are returned separately and do
 It validates active dimensionality, block bounds and snapshot ownership before row access.
 It selects history or current state under the existing chunk-to-history lock order and copies only the selected row while that source remains owned.
 The history mutex remains innermost, and row capture performs no table admission, chunk load or callback acquiring another storage lock while holding it.
+An optional memory resource must provide allocation-only, non-reentrant operations that never enter storage or acquire a storage lock during capture or deallocation.
 This preserves snapshot expiration and eviction fences without copying a chunk or first allocating a larger current row that the historical row replaces.
 The existing typed block read APIs and ordinary write paths remain unchanged.
 
@@ -40,16 +41,21 @@ A prepared edit cannot publish after another edit changes its journal generation
 
 ## Commit rebasing and promotion
 
-The caller owns every participating current chunk in canonical commit-lock order before validation or application.
-Validation compares every observed or written row with its original canonical preimage before changing any chunk, and equal values permit ABA.
-Accepted replacements apply to the current chunk rather than the snapshot chunk, preserving every unrelated block and the current chunk columns.
-All row shapes, REQUIRED initialization and combined variable-byte growth are admitted before application.
-Any current-chunk before state required by registered snapshots is captured and reserved in the existing history before the first in-place row edit.
-Prepared row edits and the existing variable-update undo mechanism provide reversible application without cloning the fixed payload or presence arrays.
-An application failure restores every earlier applied row and variable update before the caller releases any commit lock.
-Once application starts, prepared fixed-byte and presence backups and `VarUndo` make all undo nonallocating and nonthrowing; a missing guarantee requires a different preparation plan rather than catching an undo failure.
-The prepared owner does not allocate producing revisions, append WAL, publish a group or claim durable completion.
-Existing snapshot history copies and bounded variable-section mutation staging retain their established ownership and are not private whole-chunk transaction copies.
+The caller owns every participating current chunk in canonical commit-lock order before constructing a rebase plan.
+Validation compares every observed or written row with its original canonical preimage before returning any plan, and equal values permit ABA.
+Accepted replacement rows and variable changes are prepared against the current chunk rather than the snapshot chunk, preserving every unrelated block and the current chunk columns.
+The plan admits row shapes, REQUIRED initialization and combined logical variable-byte growth without modifying current storage.
+It owns its prepared sparse data through the same charged resource and records exact per-chunk changed variable keys, values, logical entry counts and encoded-byte totals.
+It records the current variable-data capacity exposed by `ChunkVars::Encode`, but does not invent the hidden offset-vector capacity or a complete physical staging peak.
+An unavailable exact capacity or materialization bound is represented explicitly and cannot authorize physical mutation admission.
+The planner never calls `ChunkVars::Merge` or `ApplyVarUpdate`, clones a fixed payload or presence array, allocates a producing revision, appends WAL or publishes a group.
+
+Physical application is separate required coordinator work before runtime activation of these deltas.
+That owner must reserve and charge every variable-section materialization and retained undo buffer before allocation, including whole-section copies made by multi-value `ApplyVarUpdate`.
+It must retain those charges until the corresponding prepared or undo memory is released, rather than exempting it as existing storage.
+It also captures and reserves any current-chunk before state required by registered snapshots before the first in-place edit.
+All fixed-byte, presence and variable undo must then be prepared, nonallocating and nonthrowing, and failure must restore every earlier applied row before releasing any commit lock.
+No physical application API is exposed by this foundation, so a valid sparse plan cannot stand in for that missing admission and rollback owner.
 
 An explicit chunk or area operation promotes its affected chunks to the snapshot's whole producing-revision dependency.
 Promotion prepares a charged marker and incorporates earlier row deltas into the caller's admitted whole-chunk private state before removing sparse entries.
@@ -59,8 +65,9 @@ Promoted chunks require exact whole-revision validation even when a later state 
 ## Failure checks
 
 Tests cover disjoint rows, changed rows, restored-value ABA, repeated writes, read-only observations, deletes, NULL versus empty values, raw NaN and signed-zero bits, and metadata preservation.
-They cover late conflicts across multiple chunks before any mutation, application undo, promotion failure and whole-revision conflicts.
+They cover late conflicts across multiple chunks without storage mutation, promotion failure and whole-revision conflicts.
 Allocation controls and exact quota boundaries exercise both private and shared counters, map nodes and failed prepared edits.
 Large fixed-payload fixtures bound row capture and sparse private allocation independently of the chunk size, including history selection after a larger concurrent row.
+Wide current variable sections with tiny row deltas retain unchanged storage and expose unavailable physical staging admission instead of bypassing the byte budget.
 Expired, evicted, ended and foreign snapshots refuse without publishing private state, and both coordinate dimensions use the same row primitives.
 Each targeted guard has an isolated omission control that must fail its corresponding regression.
