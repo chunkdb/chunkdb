@@ -14,10 +14,12 @@ Temporary names use a reserved private prefix and one generated nonce, with excl
 Only the checked root and page kinds are supported by this foundation; other reference kinds refuse rather than becoming opaque admitted payloads.
 
 Read-only opening pins the actual root directory and refuses a symbolic link or reparse point at that leaf.
-A writer additionally borrows an existing exclusive ProcessLock for its entire lifetime and verifies both its admitted canonical directory and the native identity of `root/.chunkdb.lock/writer.lock` against that lock.
+A writer additionally borrows an existing exclusive ProcessLock for its entire lifetime and verifies its admitted canonical directory, the pinned native root generation and the native identity of `root/.chunkdb.lock/writer.lock` against that lock.
 The fixed `.chunkdb.lock` directory is itself opened relative to the pinned root with no-follow directory admission; matching a lock-file hard link under a different root is insufficient.
 A lock for another directory, a missing lock, read-only access or an incompatible shared-writer context cannot create an artifact writer.
-A minimal friend declaration permits this identity comparison without changing ProcessLock fields, ordinary locking or ordinary request paths.
+ProcessLock retains an actual root-directory native owner captured during acquisition before opening pathname-based lock children; inode numbers without a retained owner cannot protect against directory deletion and reuse.
+Post-acquisition admission binds the fixed lock child under that pinned root to the acquired native lock before initialization is reported.
+The root owner is close-on-exec or noninheritable, receives failure cleanup and outlives artifact borrowers; this adds startup ownership without ordinary request-path operations or a claim about existing heartbeat pathname races.
 The caller retains the real lock until all artifact writers are destroyed; the foundation neither takes over nor releases that lock.
 
 POSIX operations use pinned directory descriptors, `openat` with no-follow and close-on-exec flags, `fstat` regular-file checks and relative native publication names.
@@ -81,7 +83,8 @@ A small internal declaration can expose those existing native helpers without ch
 
 If the digest name already exists, the writer admits that exact object and returns the existing reference only after matching its length, digest, complete typed value and context.
 Matching bytes and a visible name do not prove prior durability: this foundation always syncs that exact opened file generation and its directory before reporting durable reuse.
-Windows reuse obtains writable sync rights by reopening the already opened native object, validates that exact generation and fails closed if those rights are unavailable; it does not reopen the canonical pathname.
+Windows writer-only marker, reuse and final-object opens request native read and write rights initially, admit that exact generation and fail closed if sync rights are unavailable.
+Readers retain read-only rights, reuse never changes contents or permissions, and no canonical pathname is reopened to acquire sync rights.
 A conflicting or redirected existing entry refuses without replacement.
 Publication uncertainty records whether this invocation installed the immutable name; a directory-sync failure does not report a durable stage even if the new object is readable.
 An exact later retry must re-admit and sync that name before returning success, so a prior failed directory sync cannot disappear as unrecorded debt.
@@ -111,6 +114,7 @@ Grouping stays unused while complete directory recovery and those authorizations
 
 Tests preserve the exact canonical-root bytes and unrelated sentinels through every rejected stage and malformed read.
 They exercise wrong scopes and roles, absent or conflicting namespace markers, object-directory aliases, reparse leaves, hard links, regular-file substitution and mismatching writer leases.
+Replacing a renamed root at its old spelling with a hard link to its original writer lock must still refuse because the retained root generation differs; failed acquisition and borrower destruction must release their native resources.
 A valid same-length different root or page under a claimed digest must fail the raw SHA binding independently of native format checksums.
 Sparse oversized files refuse from measured extent or fixed-header admission before a complete buffer is allocated.
 Native rename and replacement gates prove that reads stay on their opened generation and staging never follows a replaced directory name into foreign files.
