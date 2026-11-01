@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <variant>
 
 namespace chunkdb {
@@ -62,6 +63,28 @@ void SetCell(const Column& column, const ColumnValue& value, TxnBlockCell& cell)
 
 TxnBlockCell::TxnBlockCell(std::pmr::memory_resource* resource) : bytes(Resource(resource)) {}
 TxnBlockRow::TxnBlockRow(std::pmr::memory_resource* resource) : cells(Resource(resource)) {}
+TxnBlockCell& TxnBlockCell::operator=(TxnBlockCell&& other) {
+    if (this == &other) return *this;
+    if (bytes.get_allocator().resource() != other.bytes.get_allocator().resource())
+        throw std::invalid_argument("transaction cells cannot move between memory resources");
+    bytes = std::move(other.bytes);
+    column_id = other.column_id; null = other.null;
+    return *this;
+}
+TxnBlockRow& TxnBlockRow::operator=(TxnBlockRow&& other) {
+    if (this == &other) return *this;
+    if (resource() != other.resource())
+        throw std::invalid_argument("transaction rows cannot move between memory resources");
+    cells = std::move(other.cells);
+    schema_version = other.schema_version; present = other.present;
+    return *this;
+}
+TxnBlockSnapshot& TxnBlockSnapshot::operator=(TxnBlockSnapshot&& other) {
+    if (this == &other) return *this;
+    row = std::move(other.row);
+    version = other.version; commit_time_ms = other.commit_time_ms; written = other.written;
+    return *this;
+}
 
 TxnBlockRow CaptureTxnBlockRow(const ChunkLayout& layout, std::span<const std::uint8_t> payload,
     std::span<const std::uint8_t> presence, const ChunkVars& vars, std::size_t block_index,

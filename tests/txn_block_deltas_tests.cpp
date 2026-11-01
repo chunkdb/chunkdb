@@ -3,12 +3,15 @@
 #include <barrier>
 #include <bit>
 #include <cassert>
+#include <cstdio>
 #include <limits>
 #include <memory_resource>
 #include <memory>
+#include <source_location>
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <type_traits>
 #include <vector>
 
 #include "txn_block_deltas.hpp"
@@ -17,14 +20,20 @@
 
 namespace {
 using namespace chunkdb;
-template <class F> void Reject(F&& call) {
+static_assert(!std::is_move_assignable_v<TxnBlockDelta>);
+static_assert(!std::is_move_assignable_v<TxnBlockPlannedRow>);
+static_assert(!std::is_move_assignable_v<TxnBlockPlannedChunk>);
+static_assert(!std::is_move_assignable_v<TxnBlockRebasePlan>);
+template <class F> void Reject(F&& call, const std::source_location& where = std::source_location::current()) {
     bool rejected = false;
     try { call(); } catch (const std::invalid_argument&) { rejected = true; }
+    if (!rejected) std::fprintf(stderr, "missing admission refusal at %s:%u (%s)\n", where.file_name(), where.line(), where.function_name());
     assert(rejected);
 }
-template <class F> void Conflict(F&& call, TxnConflictReason expected) {
+template <class F> void Conflict(F&& call, TxnConflictReason expected, const std::source_location& where = std::source_location::current()) {
     bool rejected = false;
     try { call(); } catch (const TransactionConflictError& error) { rejected = error.reason() == expected; }
+    if (!rejected) std::fprintf(stderr, "missing %s conflict at %s:%u (%s)\n", TxnConflictReasonName(expected), where.file_name(), where.line(), where.function_name());
     assert(rejected);
 }
 TableSchema Schema() {
@@ -300,8 +309,49 @@ void PreparedOwnershipMoves() {
     assert(journal.rows().size() == 1U && journal.promotions().empty());
     journal.Publish(std::move(moved_promotion)); assert(journal.rows().empty() && journal.promotions().size() == 1U);
 }
+void ResourceOwnershipCannotBeBorrowed() {
+    const auto geometry = MakeGeometry();
+    std::size_t first_bytes = 0U, second_bytes = 0U; std::atomic<std::size_t> global{0U};
+    TxnBlockMemoryResource first(first_bytes, global, 4096U, 8192U), second(second_bytes, global, 4096U, 8192U);
+    {
+        auto left = Row(geometry, 1U, &first), right = Row(geometry, 2U, &second);
+        const auto before_left = CloneTxnBlockRow(left, std::pmr::get_default_resource());
+        const auto before_right = CloneTxnBlockRow(right, std::pmr::get_default_resource());
+        const auto charged_left = first_bytes, charged_right = second_bytes;
+        TxnBlockRow absent(&first); absent.schema_version = 1U;
+        Reject([&] { absent = std::move(right); });
+        assert(!absent.present && absent.cells.empty() && right == before_right && first_bytes == charged_left && second_bytes == charged_right);
+        Reject([&] { left = std::move(right); });
+        assert(left == before_left && right == before_right && first_bytes == charged_left && second_bytes == charged_right);
+        Reject([&] { left.cells[0] = std::move(right.cells[0]); });
+        assert(left == before_left && right == before_right && first_bytes == charged_left && second_bytes == charged_right);
+        assert(global == charged_left + charged_right);
+        TxnBlockSnapshot first_snapshot(&first), second_snapshot(&second);
+        first_snapshot.row = Row(geometry, 3U, &first); second_snapshot.row = Row(geometry, 4U, &second);
+        first_snapshot.version = 10U; second_snapshot.version = 20U;
+        first_snapshot.commit_time_ms = 30U; second_snapshot.commit_time_ms = 40U;
+        first_snapshot.written = true;
+        const auto first_snapshot_row = CloneTxnBlockRow(first_snapshot.row, std::pmr::get_default_resource());
+        const auto second_snapshot_row = CloneTxnBlockRow(second_snapshot.row, std::pmr::get_default_resource());
+        const auto snapshot_first_bytes = first_bytes, snapshot_second_bytes = second_bytes;
+        Reject([&] { first_snapshot = std::move(second_snapshot); });
+        assert(first_snapshot.row == first_snapshot_row && second_snapshot.row == second_snapshot_row);
+        assert(first_snapshot.version == 10U && second_snapshot.version == 20U);
+        assert(first_snapshot.commit_time_ms == 30U && second_snapshot.commit_time_ms == 40U);
+        assert(first_snapshot.written && !second_snapshot.written && first_bytes == snapshot_first_bytes && second_bytes == snapshot_second_bytes);
+        TxnBlockPlannedVariable first_variable(&first), second_variable(&second);
+        first_variable.key = {1U, 2U}; second_variable.key = {3U, 4U};
+        first_variable.value.push_back(9U); second_variable.value.push_back(8U); second_variable.removed = true;
+        const auto variable_first_bytes = first_bytes, variable_second_bytes = second_bytes;
+        Reject([&] { first_variable = std::move(second_variable); });
+        assert((first_variable.key == VarKey{1U, 2U}) && (second_variable.key == VarKey{3U, 4U}));
+        assert(!first_variable.removed && second_variable.removed && first_variable.value[0] == 9U && second_variable.value[0] == 8U);
+        assert(first_bytes == variable_first_bytes && second_bytes == variable_second_bytes && global == first_bytes + second_bytes);
+    }
+    assert(first_bytes == 0U && second_bytes == 0U && global == 0U);
+}
 }  // namespace
 
 int main() {
-    RowsPreserveRawBits(); JournalAndRebase(); Accounting(); FailedEditsAndLateConflict(); WideVariablesStayBorrowed(); InitializationAndDelete(); PreparedOwnershipMoves();
+    RowsPreserveRawBits(); JournalAndRebase(); Accounting(); FailedEditsAndLateConflict(); WideVariablesStayBorrowed(); InitializationAndDelete(); PreparedOwnershipMoves(); ResourceOwnershipCannotBeBorrowed();
 }

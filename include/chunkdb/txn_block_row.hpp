@@ -13,7 +13,7 @@ struct TxnBlockCell {
 
     explicit TxnBlockCell(std::pmr::memory_resource* resource);
     TxnBlockCell(TxnBlockCell&&) noexcept = default;
-    TxnBlockCell& operator=(TxnBlockCell&&) = default;
+    TxnBlockCell& operator=(TxnBlockCell&& other);
     TxnBlockCell(const TxnBlockCell&) = delete;
     TxnBlockCell& operator=(const TxnBlockCell&) = delete;
     friend bool operator==(const TxnBlockCell&, const TxnBlockCell&) = default;
@@ -28,7 +28,7 @@ struct TxnBlockRow {
 
     explicit TxnBlockRow(std::pmr::memory_resource* resource = std::pmr::get_default_resource());
     TxnBlockRow(TxnBlockRow&&) noexcept = default;
-    TxnBlockRow& operator=(TxnBlockRow&&) = default;
+    TxnBlockRow& operator=(TxnBlockRow&& other);
     TxnBlockRow(const TxnBlockRow&) = delete;
     TxnBlockRow& operator=(const TxnBlockRow&) = delete;
     [[nodiscard]] std::pmr::memory_resource* resource() const noexcept { return cells.get_allocator().resource(); }
@@ -42,6 +42,10 @@ struct TxnBlockSnapshot {
     bool written = false;
 
     explicit TxnBlockSnapshot(std::pmr::memory_resource* resource = std::pmr::get_default_resource()) : row(resource) {}
+    TxnBlockSnapshot(TxnBlockSnapshot&&) noexcept = default;
+    TxnBlockSnapshot& operator=(TxnBlockSnapshot&& other);
+    TxnBlockSnapshot(const TxnBlockSnapshot&) = delete;
+    TxnBlockSnapshot& operator=(const TxnBlockSnapshot&) = delete;
 };
 
 }  // namespace chunkdb

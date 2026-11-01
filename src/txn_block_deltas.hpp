@@ -25,6 +25,8 @@ struct TxnBlockDelta {
     TxnBlockAction action = TxnBlockAction::kObserve;
     TxnBlockRow after;
     explicit TxnBlockDelta(std::pmr::memory_resource* resource) : before(resource), after(resource) {}
+    TxnBlockDelta(TxnBlockDelta&&) noexcept = default;
+    TxnBlockDelta& operator=(TxnBlockDelta&&) = delete;
 };
 
 // Single-transaction state; the caller serializes edits and keeps its layout,
@@ -45,7 +47,7 @@ class TxnBlockDeltas {
         TxnBlockDeltas* owner_;
         std::uint64_t generation_;
         TxnBlockKey key_;
-        Rows::node_type node_;
+        std::optional<Rows::node_type> node_;
         TxnBlockAction action_ = TxnBlockAction::kObserve;
         TxnBlockRow after_;
         bool changes_ = false;
@@ -61,7 +63,7 @@ class TxnBlockDeltas {
         explicit Promotion(TxnBlockDeltas* owner);
         TxnBlockDeltas* owner_;
         std::uint64_t generation_;
-        Promotions::node_type node_;
+        std::optional<Promotions::node_type> node_;
     };
 
     TxnBlockDeltas(StoreId table_id, const ChunkLayout& layout, std::pmr::memory_resource* resource);
@@ -104,6 +106,8 @@ struct TxnBlockPlannedRow {
     TxnBlockKey key;
     TxnBlockRow after;
     explicit TxnBlockPlannedRow(TxnBlockKey value, TxnBlockRow row) : key(value), after(std::move(row)) {}
+    TxnBlockPlannedRow(TxnBlockPlannedRow&&) noexcept = default;
+    TxnBlockPlannedRow& operator=(TxnBlockPlannedRow&&) = delete;
 };
 
 struct TxnBlockPlannedVariable {
@@ -111,6 +115,8 @@ struct TxnBlockPlannedVariable {
     bool removed = false;
     std::pmr::vector<std::uint8_t> value;
     explicit TxnBlockPlannedVariable(std::pmr::memory_resource* resource) : value(resource) {}
+    TxnBlockPlannedVariable(TxnBlockPlannedVariable&&) noexcept = default;
+    TxnBlockPlannedVariable& operator=(TxnBlockPlannedVariable&& other);
 };
 
 struct TxnBlockPlannedChunk {
@@ -125,12 +131,16 @@ struct TxnBlockPlannedChunk {
     // ChunkVars does not expose offset capacity or the complete physical merge peak.
     std::optional<std::size_t> physical_staging_bytes;
     explicit TxnBlockPlannedChunk(std::pmr::memory_resource* resource) : variables(resource) {}
+    TxnBlockPlannedChunk(TxnBlockPlannedChunk&&) noexcept = default;
+    TxnBlockPlannedChunk& operator=(TxnBlockPlannedChunk&&) = delete;
 };
 
 struct TxnBlockRebasePlan {
     std::pmr::vector<TxnBlockPlannedRow> rows;
     std::pmr::vector<TxnBlockPlannedChunk> chunks;
     explicit TxnBlockRebasePlan(std::pmr::memory_resource* resource) : rows(resource), chunks(resource) {}
+    TxnBlockRebasePlan(TxnBlockRebasePlan&&) noexcept = default;
+    TxnBlockRebasePlan& operator=(TxnBlockRebasePlan&&) = delete;
 };
 
 // Validates every dependency before allocating a plan; it cannot apply one to storage.
