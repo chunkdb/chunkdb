@@ -332,24 +332,29 @@ void ChunkCoordinateIndex::AdmitUnlistedLog(const LargeChunkCoord& coord) {
 void ChunkCoordinateIndex::ObserveRecovered(const ChunkCoord& coord, const ChunkState& state) {
     if (state.written != (state.version != 0U))
         throw std::invalid_argument("recovered coordinate has an inconsistent producing identity");
+    ObserveRecoveredIdentity(coord, state.version, ChunkPopulated(geometry_, state.presence_bitmap, state.chunk_columns.get()));
+}
+
+void ChunkCoordinateIndex::ObserveRecoveredIdentity(const ChunkCoord& coord, std::uint64_t revision, bool populated) {
+    if (revision == 0U && populated)
+        throw std::invalid_argument("unwritten recovered coordinate is populated");
     std::lock_guard lock(mutex_);
     auto& node = coordinates_.try_emplace(coord).first->second;
-    if (node.retained_empty && state.version <= node.retained_empty->revision) {
-        if (state.version == node.retained_empty->revision && ChunkPopulated(geometry_, state.presence_bitmap, state.chunk_columns.get()))
+    if (node.retained_empty && revision <= node.retained_empty->revision) {
+        if (revision == node.retained_empty->revision && populated)
             throw std::runtime_error("committed empty boundary conflicts with a populated chunk");
         return;
     }
-    if (!state.written) {
+    if (revision == 0U) {
         if (!node.retained_empty) coordinates_.erase(coord);
         return;
     }
-    const bool populated = ChunkPopulated(geometry_, state.presence_bitmap, state.chunk_columns.get());
     node.populated.store(populated, std::memory_order_relaxed);
-    node.revision.store(state.version, std::memory_order_release);
+    node.revision.store(revision, std::memory_order_release);
     any_written_.store(true, std::memory_order_release);
     if (populated) populated_.insert(coord);
     else populated_.erase(coord);
-    maximum_recovered_revision_ = std::max(maximum_recovered_revision_, state.version);
+    maximum_recovered_revision_ = std::max(maximum_recovered_revision_, revision);
 }
 
 ChunkCoordinateNode* ChunkCoordinateIndex::Find(const ChunkCoord& coord) {

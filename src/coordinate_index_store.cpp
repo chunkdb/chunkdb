@@ -61,6 +61,12 @@ std::vector<ChunkCoord> ChunkStore::AdmitCoordinateArtifacts(ChunkCoordinateInde
     for (const auto& directory : std::filesystem::directory_iterator(data_dir_)) {
         const auto name = directory.path().filename().string();
         if (!name.starts_with("L_")) continue;
+        if (std::filesystem::is_regular_file(directory.symlink_status()) && name.size() > 2U) {
+            const auto first = name[2U];
+            // Foreign notes are not coordinate storage. Numeric-looking
+            // names and every directory/link still require strict admission.
+            if ((first < '0' || first > '9') && first != '-' && first != '+' && first != '_') continue;
+        }
         LargeChunkCoord large;
         if (!ParseLargeChunkName(name, geometry_.dims(), &large))
             throw std::runtime_error("coordinate directory has noncanonical dimensions or spelling: " + name);
@@ -153,6 +159,7 @@ void ChunkStore::InitializeCoordinateIndex() {
 }
 
 std::shared_ptr<ChunkCoordinateIndex> ChunkStore::RetainedIndexForSnapshot() {
+    RequireStoreStillOnDisk();
     const auto path = data_dir_ / kChunkIndexFileName;
     SharedFileInput input(path);
     if (!input) throw std::runtime_error("read-only table is missing its coordinate inventory");
@@ -185,6 +192,7 @@ std::uint64_t ChunkStore::RetainedDeletionFloor() {
 
 std::shared_ptr<ChunkCoordinateIndex> ChunkStore::CoordinateIndexForScan() {
     if (access_mode_ != AccessMode::kReadOnly) return coordinate_index_;
+    RequireStoreStillOnDisk();
     std::lock_guard refresh(coordinate_index_refresh_mutex_);
     const auto before = ReadSnapshotGenerationForScan(snapshot_generation_path_, snapshot_generation_record_seen_);
     if ((before.second & 1U) != 0U) throw std::runtime_error("read-only coordinate scan is unstable during writer publication");
@@ -206,6 +214,23 @@ std::shared_ptr<ChunkCoordinateIndex> ChunkStore::CoordinateIndexForScan() {
             .payload = std::move(loaded.payload), .presence_bitmap = std::move(loaded.presence_bitmap),
             .vars = std::move(loaded.vars), .written = loaded.revision != 0U,
             .commit_time_ms = loaded.commit_time_ms, .chunk_columns = std::move(loaded.chunk_columns)});
+    }
+    std::vector<std::pair<ChunkCoord, std::shared_ptr<RegularChunk>>> cached;
+    {
+        std::lock_guard registry(large_chunks_mutex_);
+        for (const auto& [large_coord, large] : large_chunks_) {
+            (void)large_coord;
+            std::lock_guard container(large->mutex);
+            for (const auto& entry : large->chunks) cached.emplace_back(entry.first, entry.second);
+        }
+    }
+    for (const auto& [coord, chunk] : cached) {
+        std::shared_lock lock(chunk->mutex);
+        if (chunk->read_only_generation != before) continue;
+        if (chunk->written != (chunk->version != 0U))
+            throw std::logic_error("cached coordinate has an inconsistent producing identity");
+        candidate->ObserveRecoveredIdentity(coord, chunk->version,
+            ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get()));
     }
     const auto after = ReadSnapshotGenerationForScan(snapshot_generation_path_, snapshot_generation_record_seen_);
     if (before != after || (after.second & 1U) != 0U)

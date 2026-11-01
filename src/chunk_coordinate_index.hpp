@@ -73,6 +73,7 @@ class ChunkCoordinateIndex {
     void AdmitUnlistedLog(const LargeChunkCoord& coord);
     // Candidate construction only; no request may use this owner yet.
     void ObserveRecovered(const ChunkCoord& coord, const ChunkState& state);
+    void ObserveRecoveredIdentity(const ChunkCoord& coord, std::uint64_t revision, bool populated);
     // A borrowed node is used only under its canonical chunk's exclusive lock.
     [[nodiscard]] ChunkCoordinateNode* Find(const ChunkCoord& coord);
     [[nodiscard]] bool IsPopulationCandidate(const ChunkCoord& coord) const;
