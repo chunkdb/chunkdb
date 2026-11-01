@@ -19,6 +19,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
 #include "txn_history.hpp"
+#include "txn_block_rows.hpp"
 #include "wal_writer.hpp"
 #include "change_feed.hpp"
 #include "feed_prefix.hpp"
@@ -199,6 +200,30 @@ ChunkState ChunkStore::ReadChunkStateAt(const TxnSnapshot& snapshot, const Chunk
     }
     (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) { state = kept.state; });
     return state;
+}
+
+TxnBlockSnapshot ChunkStore::ReadBlockAtSnapshot(const TxnSnapshot& snapshot,
+    const ChunkCoord& chunk_coord, std::size_t block_index, std::pmr::memory_resource* resource) {
+    RequireOwnTxnSnapshot(snapshot);
+    (void)geometry_.ChunkToLarge(chunk_coord);
+    if (block_index >= geometry_.layout().block_count())
+        throw std::invalid_argument("transaction block index is outside its chunk");
+    TxnBlockSnapshot result(resource);
+    const auto capture = [&](const auto& state) {
+        result.row = CaptureTxnBlockRow(geometry_.layout(), state.payload, state.presence_bitmap,
+            state.vars, block_index, resource);
+        result.version = state.version;
+        result.commit_time_ms = state.commit_time_ms;
+        result.written = state.written;
+    };
+    const auto chunk = GetOrLoadRegularChunk(chunk_coord);
+    // The same chunk-to-history order is used when publishing kept states.
+    // Select the source before allocating so a newer large row cannot consume
+    // the budget of a small historical observation.
+    std::shared_lock lock(chunk->mutex);
+    if (!txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) { capture(kept.state); }))
+        capture(*chunk);
+    return result;
 }
 
 std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAt(
