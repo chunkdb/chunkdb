@@ -150,8 +150,9 @@ void DurableCutsAndOrphanAdmission() {
             // returned. Its own reader must no longer pin the old inode.
             const auto handle = CreateFileW(original_link.c_str(), GENERIC_READ, 0U,
                 nullptr, OPEN_EXISTING, FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            const auto error = handle == INVALID_HANDLE_VALUE ? GetLastError() : ERROR_SUCCESS;
             if (handle == INVALID_HANDLE_VALUE)
-                std::cerr << "prefix source still has a native reader: " << GetLastError() << '\n';
+                std::cerr << "prefix source still has a native reader: " << error << '\n';
             assert(handle != INVALID_HANDLE_VALUE);
             assert(CloseHandle(handle) != 0);
             ++observed;
