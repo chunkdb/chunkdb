@@ -299,10 +299,10 @@ std::string StatementSuggestion(std::string_view word) {
         return {};
     }
     const auto lower = Lower(word);
-    const std::array<std::string_view, 23U> keywords{
+    const std::array<std::string_view, 24U> keywords{
         "get", "set", "delete", "create", "alter", "drop", "show", "describe", "grant", "revoke",
         "begin", "commit", "rollback", "ping", "flush", "watch", "unwatch", "ack", "backup", "migrate",
-        "scan", "reload", "recover"};
+        "scan", "reload", "recover", "compact"};
     std::string_view closest;
     std::size_t best = word.size() < 4U ? 2U : 3U;
     bool tied = false;
@@ -1042,6 +1042,10 @@ class Parser {
             return EnableFeature{.name = Take().text};
         }
         if (Accept("show")) {
+            if (Accept("table")) {
+                Expect("stats");
+                return ShowTableStats{.table = Name("a table name")};
+            }
             if (Accept("status")) return ShowStatus{};
             if (Accept("migrations")) return ShowMigrations{};
             if (Accept("slots")) {
@@ -1066,6 +1070,13 @@ class Parser {
         if (Accept("recover")) {
             Expect("table");
             return RecoverTable{.table = Name("a table name")};
+        }
+        if (Accept("compact")) {
+            Expect("tombstones");
+            CompactTombstones compact{.table = Name("a table name")};
+            Expect("before");
+            compact.before = Unsigned("a revision", std::numeric_limits<std::uint64_t>::max());
+            return compact;
         }
         if (Accept("flush")) {
             Expect("wal");
