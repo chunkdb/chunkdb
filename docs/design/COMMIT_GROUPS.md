@@ -138,6 +138,8 @@ Admission publishes prepared state and byte reservations atomically on statement
 ## Limits and request metadata
 
 HELLO reports the configured area chunk and response-byte bounds and transaction read and write chunk bounds.
+The server flags are `--max-area-chunks`, `--max-area-response-bytes`, `--txn-max-written-chunks` and `--txn-max-read-chunks`.
+Request admission and response decoding use the configured or negotiated bounds rather than fixed chunk-count constants.
 The defaults are 4096 requested area chunks, 64 MiB of area response, 1024 written transaction chunks and 8192 read transaction chunks.
 Unpaged GET AREA retains its existing array reply and refuses a request beyond its configured bounds.
 An explicit LIMIT selects a page reply, and AFTER resumes that page in coordinate order.
@@ -180,3 +182,11 @@ BEGIN captures the session default, and explicit tags on BEGIN or successful tra
 The first explicit tag can replace the captured default; a conflicting explicit tag refuses that statement without changing private data or the chosen group tag.
 The checked group decision owns the tag and catch-up obtains it from the retained group seal.
 Admission, rollback, uncertain outcomes, crash recovery and split restore receive independent failure tests.
+
+## Failure and acceptance checks
+
+The ordinary-write error matrix independently exercises version-clock reservation failure before SET BLOCK, DELETE BLOCK and SET CHUNK publish a mutation.
+Failed deletes and whole-chunk writes are reopened to verify the previous values, existence, producing identity and feed frontier.
+`chunkdb_verify` admits the directory journal and certified inventory, resolves every referenced complete group and validates all member or checkpoint proofs without changing files.
+The verifier refuses missing synced members, conflicting decisions, invalid certified cuts and unadmitted grouped frames rather than validating each table in isolation.
+Snapshot-vector bookkeeping has its own cost scenario, and the ordinary single-chunk hot-path budgets remain merge gates.
