@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Keep unwritten chunk identities at revision zero without reserving write revisions, preserve their absence after read-only refresh, and add checked geometry and format primitives for the chunk model (#133).
+- Add three-dimensional tables, typed chunk columns, checked sectioned chunk forms, atomic metadata and projected writes, and retained tombstone identities with incremental scans and explicit compaction (#133).
 - Add matched-subscriber budget comparisons with `chunkdb_budget_compare --watch-both TABLE[:N][:slots]` and require a control with the same subscriber settings (#140).
 - Add extensible reply metadata, exact unsigned revisions, HELLO options, persistent watch filters, ACK deadlines, takeover, lineage, and explicit feature activation (#69).
 - Keep feed subscribers off the write path: a feed wakes the slot catch-up worker only for slot watches, once per scan and when a slot watch starts, notifies watches only when a scan publishes changes, stops a slot watch's steps when one changes nothing, counts every slot's retained bytes from one archive listing, and syncs only the files written since the last durable-frontier pass after a store's first, including those a rollback boundary is still syncing; `chunkdb_server_bench --watch TABLE[:N][:slots]` opens several ordinary or slot watches for the subscriber budget (#140).
