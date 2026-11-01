@@ -27,6 +27,9 @@ The outer SHA-256 bindings always cover every raw byte, including embedded check
 | 60 | 4 | Header CRC32 |
 
 Header inspection validates its checksum, identity, kind and checked extent before the caller allocates a record buffer.
+The format-wide decision ceiling is 256 MiB, receipts are exactly 100 bytes and the seal ceiling is 256 MiB plus 108 bytes, independently of current session limits.
+Retained-ID inventories have a separate format-wide 256 MiB ceiling.
+Header inspection rejects larger declared extents before buffer allocation, and preparation and serialization apply the identical byte ceilings before any mutation.
 Complete parsing additionally checks the final checksum and every field before allocating owned member, result or string storage.
 It never classifies a malformed record as an interrupted append; only the journal owner applies the certified-cut recovery rule.
 
@@ -134,6 +137,7 @@ The owner enforces its configured retention and byte budgets before publishing t
 ## Validation boundaries
 
 Pure tests cover exact golden bytes, both dimensions, changed and observed members, empty ID and tag presence, result-only outcomes, all truncation cuts, overflowed counts, reserved bytes, checksums, context mismatches and noncanonical ordering.
+An oversized checksum-correct header on a sparse file is refused under an allocation guard before a complete-record buffer can be requested.
 Bindings are tested with distinct valid records of equal extent so checksum recomputation cannot hide a context or SHA failure.
 Journal and ID-inventory tests distinguish certified byte preservation from member durability and reject a cursor between records.
 Filesystem publication, complete group recovery, seal reference cuts, retained-ID retirement and cancellation remain coordinator responsibilities under the parent contract.
