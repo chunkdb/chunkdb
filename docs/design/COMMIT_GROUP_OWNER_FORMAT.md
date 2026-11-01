@@ -18,6 +18,9 @@ An object reference is exactly 48 bytes: kind u8, seven zero bytes, complete raw
 The absent reference has every byte zero; a present reference has a known nonzero kind, nonzero length and nonzero digest.
 Kinds are owner root 1, tree page 2, coverage value 3, retained-group value 4, covered-member value 5, observation capsule 6, replacement plan 7, restore provenance 8, certified journal inventory 9 and retained-ID inventory 10.
 A reference's allowed kind depends on its field and is checked before object admission.
+Owner-root references are exactly 512 bytes, page references are between 92 bytes and 64 KiB, certified journal inventories are exactly 128 bytes, and retained-ID inventories are between 164 bytes and 256 MiB.
+Typed value, observation, plan and provenance root references are between 68 bytes and 64 KiB; larger collections use their checked pages rather than an unbounded root object.
+Original decision, seal, image and WAL bodies keep their own typed native references and pre-allocation format bounds inside those payloads.
 The name derived from its digest is never sufficient: the owner also checks exact length, complete raw digest, native record structure and context.
 Referenced journal and ID objects retain their existing checked encodings rather than gaining an unchecked wrapper.
 
@@ -73,6 +76,7 @@ INACTIVE requires every payload byte after its state and padding to be zero.
 ACTIVE requires the four selected references with their exact field kinds and a complete nonzero replay context, and has no replacement plan or previous-root reference.
 An empty tree still has a checked empty page reference, rather than an ambiguous absent reference.
 A zero counter owner requires ceiling zero; a present counter owner is checked separately against the native counter and cannot change to another owner or decrease its required ceiling in a successor.
+A present counter owner cannot become absent even when its current required ceiling is zero.
 
 PENDING carries the complete old selected context plus a replacement-plan reference and exact previous-root reference.
 The immutable plan binds the checked previous root and complete final target root by raw length and SHA-256, and separately admits every replacement participant before installation.
@@ -105,7 +109,7 @@ Leaf value references have the corresponding kinds coverage value 3, retained-gr
 A page payload begins with tree kind u8, node kind u8, key width u8, prefix length u8, entry count u16, zero u16, subtree key count u64 and subtree owned bytes u64.
 Its 24-byte prefix is followed by exactly prefix-length key bytes and the node's entries.
 Node kinds are empty 0, leaf 1 and branch 2.
-The root's complete raw extent follows from this physical entry count and prefix length, with checked arithmetic before allocating owned vectors.
+The page's complete raw extent follows from this physical entry count and prefix length, with checked arithmetic before allocating owned vectors.
 Subtree counts and byte totals are validation claims and are never allocation sizes.
 
 An empty page has zero prefix length, zero entries and zero subtree keys, and no additional payload.
@@ -151,7 +155,7 @@ New owner runtime starts only after these codecs and the remaining typed value a
 Golden encodings pin exact scope, 512-byte roots, empty pages, both-dimensional coverage keys, negative coordinates and branch layouts.
 Every truncation cut, unsupported tag or kind, reserved byte, wrong scope or role, future generation and final checksum corruption refuses.
 Header tests use checksum-correct oversized declarations and prove refusal before a caller requests a full buffer.
-Successor tests reject owner changes, wraparound, inactive references, active-to-inactive regression, replaced pending plans and a valid same-length different final target.
+Successor tests reject owner changes, a present counter becoming absent at zero ceiling, wraparound, inactive references, active-to-inactive regression, replaced pending plans and a valid same-length different final target.
 Page tests reject mismatched physical counts, wrapped subtree sums, false owned-byte totals, duplicated edges, one-child branches, empty children, wrong prefix relations and wrong value kinds.
 Child and selection tests use different valid same-length records to prove raw SHA and context bindings rather than relying on incidental checksum failure.
 Omitting each targeted guard must make its corresponding regression fail at runtime with the production sources restored afterward.
