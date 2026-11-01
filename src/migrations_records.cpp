@@ -163,7 +163,15 @@ void ValidateImage(const MigrationJournal& journal, const std::string& path, con
         if (manifest.store_id != journal.table_id) Bad("table participant identity");
         RequireOpenableFeatures(manifest.features, AccessMode::kReadWrite);
     } else if (path == "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName)) {
-        (void)ParseFeedSlotRecords(image, journal.table_id);
+        const auto records = ParseFeedSlotRecords(image, journal.table_id);
+        const auto manifest_path = "tables/" + journal.table + "/" + std::string(kStoreManifestFileName);
+        const auto at = std::find_if(journal.files.begin(), journal.files.end(),
+            [&](const auto& file) { return file.path == manifest_path; });
+        if (at != journal.files.end()) {
+            const auto manifest = ParseStoreManifest(at->after);
+            if (manifest.store_id != journal.table_id || manifest.geometry.dims != records.dims)
+                Bad("slot participant dimensionality differs from table");
+        }
     } else if (path == "tables/" + journal.table + "/" + std::string(kChunkIndexFileName)) {
         if (journal.directory_action != MigrationDirectoryAction::kCreate) Bad("index participant outside table creation");
         const auto manifest_path = "tables/" + journal.table + "/" + std::string(kStoreManifestFileName);
@@ -434,6 +442,13 @@ void ValidateMigrationJournal(const std::filesystem::path& root, const Migration
         Bad("dropped table users participant is missing");
     for (const auto& file : journal.files) {
         SafePath(root, file.path);
+        if (file.path == "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName)) {
+            SafePath(root, "tables/" + journal.table + "/" + std::string(kStoreManifestFileName));
+            const auto table = ReadStoreManifest(root / "tables" / journal.table);
+            if (!table || table->store_id != journal.table_id) Bad("slot participant table identity");
+            if (file.before) (void)ParseFeedSlotRecords(*file.before, journal.table_id, table->geometry.dims);
+            (void)ParseFeedSlotRecords(file.after, journal.table_id, table->geometry.dims);
+        }
         const auto current = ReadBytes(root / file.path, kMaxMigrationRecordsBytes);
         if (current != file.before && (!current || *current != file.after)) Bad("participant differs from before and after: " + file.path);
         if (!current && journal.directory_action == MigrationDirectoryAction::kCreate &&
@@ -484,7 +499,10 @@ void ValidateMigrationJournal(const std::filesystem::path& root, const Migration
             const auto relative = "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName);
             SafePath(root, relative);
             const auto image = ReadBytes(root / relative, kMaxMigrationRecordsBytes);
-            const auto slots = image ? std::optional<FeedSlotRecords>(ParseFeedSlotRecords(*image, journal.table_id)) : std::nullopt;
+            const auto table = ReadStoreManifest(root / "tables" / journal.table);
+            if (!table || table->store_id != journal.table_id) Bad("conditional slot no-op table identity");
+            const auto slots = image ? std::optional<FeedSlotRecords>(ParseFeedSlotRecords(*image, journal.table_id,
+                table->geometry.dims)) : std::nullopt;
             const bool create = std::holds_alternative<cql::CreateSlot>(statement);
             const auto& name = create ? std::get<cql::CreateSlot>(statement).name : std::get<cql::DropSlot>(statement).name;
             const bool exists = slots && std::any_of(slots->slots.begin(), slots->slots.end(),

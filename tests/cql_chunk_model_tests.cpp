@@ -1,6 +1,8 @@
 #include <cassert>
 #include <charconv>
 #include <iostream>
+#include <fstream>
+#include <sstream>
 
 #include "chunkdb/chunk_columns.hpp"
 #include "chunkdb/engine.hpp"
@@ -10,6 +12,8 @@
 #include "sectioned_chunk_form.hpp"
 #include "typed_chunk_form.hpp"
 #include "test_utils.hpp"
+#include "login_helpers.hpp"
+#include "audit_log.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -283,6 +287,41 @@ void ScanHistoryLoss() {
     }
 }
 
+void RetainedIdentityPermissionsAndAudit() {
+    Fixture f;
+    Reply(f.Run("CREATE TABLE t (a u8 DEFAULT 0) CHUNK 2 x 2"), "+OK\r\n");
+    const auto users = test::MakeUsers(f.directory.path(), "admin", "admin-password");
+    users->Create("reader", test::PrepareLoginVerifier("reader-password", crypto::RandomBytes(16U),
+        scram::kMinIterations), false);
+    users->Grant("reader", "t", Right::kRead);
+    const auto audit_path = f.directory.path() / "audit.log";
+    const auto audit = std::make_shared<AuditLog>(audit_path);
+    CommandEngine engine(EngineConfig{.require_auth = true, .users = users, .audit = audit}, f.catalog);
+    SessionState reader, admin;
+    assert(test::LoginOnEngine(engine, reader, "reader", std::string("reader-password")).starts_with("%"));
+    assert(test::LoginOnEngine(engine, admin, "admin", std::string("admin-password")).starts_with("%"));
+    assert(engine.Execute(reader, "SHOW TABLE STATS t\r\n").starts_with("%5\r\n"));
+    Error(engine.Execute(reader, "COMPACT TOMBSTONES t BEFORE 1\r\n"), "PERMISSION_DENIED");
+    Reply(engine.Execute(admin, "BEGIN\r\n"), "+OK\r\n");
+    Error(engine.Execute(admin, "COMPACT TOMBSTONES t BEFORE 1\r\n"), "INVALID_ARGUMENT");
+    Reply(engine.Execute(admin, "ROLLBACK\r\n"), "+OK\r\n");
+    Reply(engine.Execute(admin, "COMPACT TOMBSTONES t BEFORE 0\r\n"), ":0\r\n");
+    std::ifstream input(audit_path);
+    std::string line;
+    bool refused = false, completed = false;
+    while (std::getline(input, line)) {
+        if (line.find("\"event\":\"compact_tombstones\"") == std::string::npos) continue;
+        assert(line.find("\"table\":\"t\"") != std::string::npos);
+        if (line.find("\"user\":\"reader\"") != std::string::npos) {
+            assert(line.find("\"error_code\":\"PERMISSION_DENIED\"") != std::string::npos);
+            refused = true;
+        }
+        if (line.find("\"user\":\"admin\"") != std::string::npos && line.find("\"ok\":true") != std::string::npos)
+            completed = true;
+    }
+    assert(refused && completed);
+}
+
 void ThreeDimensions() {
     Fixture f;
     Reply(f.Run("CREATE TABLE t (a u8 DEFAULT 0) CHUNK 2 x 2 x 2 LARGE 2 x 2 x 2"), "+OK\r\n");
@@ -316,6 +355,7 @@ int main(int argc, char** argv) {
     else if (argc == 2 && std::string_view(argv[1]) == "--migrations") MigrationDomains();
     else if (argc == 2 && std::string_view(argv[1]) == "--transactions") TransactionForms();
     else if (argc == 2 && std::string_view(argv[1]) == "--history") ScanHistoryLoss();
+    else if (argc == 2 && std::string_view(argv[1]) == "--permissions") RetainedIdentityPermissionsAndAudit();
     else {
         assert(argc == 1);
         MetadataProjectionAndTombstone();
@@ -323,5 +363,6 @@ int main(int argc, char** argv) {
         MigrationDomains();
         TransactionForms();
         ScanHistoryLoss();
+        RetainedIdentityPermissionsAndAudit();
     }
 }
