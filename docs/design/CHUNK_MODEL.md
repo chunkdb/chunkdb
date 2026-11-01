@@ -124,6 +124,11 @@ Ordinary area reads and scans omit tombstones; `SCAN SINCE` includes them and ad
 Requests below that floor fail explicitly instead of silently omitting deletions.
 
 Compaction requires exclusive mutation admission and persists its exact inclusive operation floor separately from the cumulative deletion floor.
+Shared-writer operation refuses compaction because its table admission cannot exclude another process's producers.
+Before staging any replacement, a WAL barrier establishes the checkpoint durability floor and every coordinate with a current artifact or cached state receives a complete durable checkpoint.
+This preparation removes a live WAL's dependency on an older retained empty baseline, including REQUIRED chunk columns initialized before that WAL, before the baseline can be discarded.
+Retained-only coordinates are skipped, and archive descriptors keep their independently pinned original replay bases.
+Any preparation failure preserves the existing deletion floor and follows the store's checked failure and table-fencing paths.
 For `BEFORE n`, the operation floor is `min(n - 1, completed_frontier)`; zero is a no-op.
 A durable pending inventory decision precedes every shard replacement.
 Before that decision, each shard's filtered replacement is written and synced under its owned staging name.
