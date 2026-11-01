@@ -42,7 +42,7 @@ The variable prefix stores principal bytes, ID bytes and tag bytes in that order
 The member array follows, then the result array, with no trailing bytes.
 Counts are u64 and are admitted against the checked complete extent rather than current session chunk-count settings.
 
-Each member is 208 bytes in the following order.
+Each member is 248 bytes in the following order.
 
 | Bytes | Field |
 | --- | --- |
@@ -60,6 +60,7 @@ Each member is 208 bytes in the following order.
 | 32 | SHA-256 of the exact complete frame |
 | 8 | Member ordinal, equal to its zero-based array index |
 | 72 | Durable rollback-base descriptor |
+| 40 | Certified pre-group WAL end and raw-prefix SHA-256 |
 
 Members are unique and ordered by table epoch bytes, then signed X, Y and Z, and one epoch has one dimension count.
 Two-dimensional members require Z zero.
@@ -79,6 +80,10 @@ Image and retained-empty require nonzero producing and schema revisions, with th
 Image has nonzero raw length and an exact digest; retained-empty has zero image length and digest.
 Observed members carry the unused all-zero never-written descriptor.
 The owner validates the actual checked image or retained record before using this descriptor as a rollback anchor and refuses loss below any certified durable prefix.
+The optional WAL certificate stores end u64 and digest bytes; end zero with a zero digest means absent.
+A present certificate starts at least at the dimensional WAL header size, does not exceed the original WAL end and binds every raw byte up to that end.
+Observed members require an absent certificate.
+Absence makes no durability claim about volatile pre-group WAL bytes above the admitted rollback anchor.
 
 Each result starts with table epoch bytes, result revision u64, immutable table-name length u32 and zero u32, followed by the name bytes.
 Names are nonempty result labels from commit-time admission and are never filesystem instructions or resolved through a replacement catalog entry.
