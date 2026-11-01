@@ -125,6 +125,8 @@ Each child entry is exactly 72 bytes: edge u8, seven zero bytes, subtree key cou
 Edges are strictly increasing unsigned bytes, each child's claimed key count is nonzero, and its owned bytes are at least its referenced page's raw extent.
 The branch subtree count equals the checked sum of child counts.
 Its owned bytes equal its complete page extent plus the checked sum of child owned bytes.
+Owned-byte totals count these tree pages and their directly referenced typed value capsules only.
+Native images, WALs, original decisions, seals and other artifacts referenced inside a capsule are separately charged by their owning subsystem and are not recursively counted as tree disk usage.
 Single-child branches are noncanonical and are compressed instead of adding unbounded depth.
 
 When the owner admits a child page, its scope and tree kind agree with the parent and its creating generation is not newer than the selecting root.
@@ -146,6 +148,7 @@ Readers use bounded page buffers and a bounded traversal stack, and copy-on-writ
 
 The API serializes and parses the fixed manifest scope, inspects owner headers before complete reads, serializes and parses roots and pages, and creates or decodes the three canonical key encodings.
 Separate validators bind selected journal and ID contexts, the reference replay proof, predecessor and target root facts, root page selection and parent-child relations.
+Root page selection requires the coverage field's page to have coverage-tree kind and the retained-group field's page to have retained-group kind, despite both references sharing the generic tree-page object kind.
 The caller supplies only facts obtained from complete bounded native record admission and raw digest measurement.
 The API has no filesystem access, lease acquisition, feature activation, mutable global state, publication callback or fallback replay authority.
 New owner runtime starts only after these codecs and the remaining typed value and plan codecs have independent review and regression controls.
