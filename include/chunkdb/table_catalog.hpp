@@ -418,6 +418,12 @@ class TableCatalog {
     [[nodiscard]] bool ChangeColumnsIfNeeded(
         std::string_view name,
         const std::function<std::optional<TableSchema>(const TableSchema&)>& change);
+    // Chunk-column changes share the block schema revision and the same
+    // exclusive manifest publication and recovery rules as block columns.
+    void ChangeChunkColumns(std::string_view name, const std::function<TableSchema(const TableSchema&)>& change);
+    [[nodiscard]] bool ChangeChunkColumnsIfNeeded(
+        std::string_view name,
+        const std::function<std::optional<TableSchema>(const TableSchema&)>& change);
     // Narrows column `column` to `type`, a type of its family that does not
     // hold every value of its own, after checking every stored value
     // (docs/design/COLUMNS_DESIGN.md): the manifest first records the narrowing in
@@ -485,7 +491,8 @@ class TableCatalog {
         Table& table,
         const TableOptions& options,
         const std::function<void(StoreManifest*)>& change,
-        const char* dir_sync_failpoint);
+        const char* dir_sync_failpoint,
+        const std::optional<TableSchema>& chunk_schema = std::nullopt);
     // Moves `dir` out of `tables/` into `.chunkdb.dropped/` and syncs both.
     void MoveToDropped(const std::filesystem::path& dir, const std::string& name);
     void RemoveDroppedTree(const std::filesystem::path& dropped) noexcept;

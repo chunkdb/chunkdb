@@ -627,6 +627,7 @@ class ChunkStore {
     // Completed commit frontier, including terminal reservation gaps. A
     // read-only process cannot establish the writer's frontier and returns null.
     [[nodiscard]] std::optional<std::uint64_t> CompletedRevision() const;
+    [[nodiscard]] bool HasWrittenChunkIdentities() const;
     [[nodiscard]] ChunkMutationResult CasChunkState(
         std::int64_t chunk_x,
         std::int64_t chunk_y,
