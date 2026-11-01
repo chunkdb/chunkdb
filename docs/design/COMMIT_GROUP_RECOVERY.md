@@ -266,6 +266,7 @@ Without `--allow-split`, restore refuses a selection that excludes any member of
 With that flag, a checked split capsule additionally binds the complete source membership, selected and omitted ordinal sets, full source admission proof and the rewritten selected destination decision.
 It authorizes only that recorded selection and reports the affected source visible transaction IDs and any destination mapping.
 Selected frames are rewritten to the selected count and canonical ordinals; omitted epochs never become ordinary unresolved local members.
+The rewritten split decision has no request binding; its original ID and fingerprint remain only in the source provenance capsule.
 When the selected destination result set has one table and no restored ID, its rewritten decision has transaction zero as required by the decision codec; the source transaction remains in split provenance and the reported mapping.
 Split history retains original source identity and tag as provenance and explicitly reports that the restored selection is incomplete.
 It does not recreate an ID lookup entry or imply a complete repeated outcome for the original request.
