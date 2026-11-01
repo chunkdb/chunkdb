@@ -14,6 +14,7 @@
 #include "chunk_coordinate_index.hpp"
 #include "checkpoint.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "chunkdb/crc32.hpp"
 #include "test_utils.hpp"
 
 namespace {
@@ -203,6 +204,57 @@ void ForgetRequiresItsPublishedRefusalFloor() {
     Reject([&] { ChunkCoordinateIndex owner(directory.path(), geometry, kTable, false); });
 }
 
+void ReplacementIdentityBindsValidSameLengthContent() {
+    for (const auto dims : {std::uint8_t{2U}, std::uint8_t{3U}}) {
+        test::ScopedTempDir directory("chunkdb-index-replacement-digest");
+        const auto geometry = Shape(dims);
+        const LargeChunkCoord large{};
+        const ChunkCoord kept{1, 0, dims == 3U ? 1 : 0};
+        const auto header = SerializeChunkIndexHeader({kTable, dims, large});
+        const auto live = [&](std::uint64_t revision) {
+            auto bytes = header;
+            const auto record = SerializeChunkIndexRecord(
+                {ChunkIndexKind::kLive, kept, revision, revision * 10U, 1U}, geometry, large);
+            bytes.insert(bytes.end(), record.begin(), record.end());
+            return bytes;
+        };
+        const auto expected = live(11U), wrong = live(12U);
+        assert(expected.size() == wrong.size() && Crc32(expected) == Crc32(wrong));
+        auto old = header;
+        const auto deleted = SerializeChunkIndexRecord({ChunkIndexKind::kDeleted, {}, 2U, 20U, 1U}, geometry, large);
+        old.insert(old.end(), deleted.begin(), deleted.end());
+        old.insert(old.end(), expected.begin() + static_cast<std::ptrdiff_t>(header.size()), expected.end());
+        const auto path = Log(directory.path(), geometry, {});
+        const auto stage = std::filesystem::path(path.string() + ".compact");
+        AtomicWrite(path, old, true, true);
+        AtomicWrite(stage, wrong, true, true);
+        std::istringstream expected_input(std::string(expected.begin(), expected.end()));
+        const auto digest = IndexFileDigest(expected_input, expected.size());
+        std::ostringstream output;
+        WriteIndexInventory(output, {.table_id = kTable, .dims = dims, .compaction_pending = true,
+            .retained_deletion_floor = 5U, .compaction_through = 5U, .count = 1U, .generation = 7U},
+            std::vector<IndexInventoryEntry>{{large, old.size(), expected.size(), digest}});
+        const auto text = output.str();
+        const Bytes inventory(text.begin(), text.end());
+        AtomicWrite(directory.path() / kChunkIndexFileName, inventory, true, true);
+        Reject([&] { ChunkCoordinateIndex recovered(directory.path(), geometry, kTable, false); });
+        assert(LoadFile(path) == old && LoadFile(stage) == wrong);
+        assert(LoadFile(directory.path() / kChunkIndexFileName) == inventory);
+        AtomicWrite(path, wrong, true, true);
+        std::filesystem::remove(stage);
+        Reject([&] { ChunkCoordinateIndex recovered(directory.path(), geometry, kTable, false); });
+        assert(LoadFile(path) == wrong && !std::filesystem::exists(stage));
+        assert(LoadFile(directory.path() / kChunkIndexFileName) == inventory);
+        AtomicWrite(stage, expected, true, true);
+        {
+            ChunkCoordinateIndex recovered(directory.path(), geometry, kTable, false);
+            recovered.CompleteRecovery();
+            assert(recovered.inventory_generation() == 8U && recovered.retained_deletion_floor() == 5U);
+        }
+        assert(LoadFile(path) == expected && !std::filesystem::exists(stage));
+    }
+}
+
 void SetEnv(const char* key) {
 #ifdef _WIN32
     _putenv_s(key, "1");
@@ -251,6 +303,10 @@ void CrashCompactionBoundaries(const char* executable) {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "--binding-only") {
+        ReplacementIdentityBindsValidSameLengthContent();
+        return 0;
+    }
     if (argc == 4 && std::string_view(argv[1]) == "--crash") {
         const auto geometry = Shape();
         assert(ChunkCoordinateIndex::InitializeEmpty(argv[2], geometry, kTable));
@@ -265,5 +321,6 @@ int main(int argc, char** argv) {
     CompactionDropsOnlyItsExactBound();
     InventoryGenerationNeverWraps();
     ForgetRequiresItsPublishedRefusalFloor();
+    ReplacementIdentityBindsValidSameLengthContent();
     CrashCompactionBoundaries(argv[0]);
 }

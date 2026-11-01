@@ -146,18 +146,20 @@ std::vector<chunkdb::IndexInventoryEntry> InventoryEntries(const chunkdb::IndexI
     for (std::size_t i = 0; i < coords.size(); ++i) {
         const auto header_bytes = 28U + 8U * header.dims;
         const auto record_bytes = 36U + 8U * header.dims;
+        chunkdb::crypto::Sha256Digest digest{};
+        if (header.compaction_pending)
+            for (std::size_t byte = 0U; byte < digest.size(); ++byte) digest[byte] = static_cast<std::uint8_t>(i + byte + 1U);
         result.push_back({coords[i], header_bytes + record_bytes * (i + 1U),
-            header.compaction_pending ? header_bytes + record_bytes * i : 0U,
-            header.compaction_pending ? 0x12345678U + static_cast<std::uint32_t>(i) : 0U});
+            header.compaction_pending ? header_bytes + record_bytes * i : 0U, digest});
     }
     return result;
 }
 
 Bytes InventoryFixture(const chunkdb::IndexInventoryHeader& header, const std::vector<chunkdb::LargeChunkCoord>& coords) {
-    const auto entry_bytes = 8U * header.dims + 24U;
+    const auto entry_bytes = 8U * header.dims + 48U;
     Bytes bytes(64U + entry_bytes * coords.size(), 0);
     bytes[0] = 'C'; bytes[1] = 'K'; bytes[2] = 'I'; bytes[3] = 'I';
-    At(&bytes, 4, 3, 2); bytes[6] = header.dims; bytes[7] = header.compaction_pending ? 1 : 0;
+    At(&bytes, 4, 4, 2); bytes[6] = header.dims; bytes[7] = header.compaction_pending ? 1 : 0;
     for (std::size_t i = 0; i < 16; ++i) bytes[8U + i] = header.table_id[i];
     At(&bytes, 24, header.retained_deletion_floor, 8); At(&bytes, 32, header.compaction_through, 8);
     At(&bytes, 40, header.count, 8);
@@ -170,7 +172,8 @@ Bytes InventoryFixture(const chunkdb::IndexInventoryHeader& header, const std::v
         if (header.dims == 3) At(&bytes, at + 16, std::bit_cast<std::uint64_t>(coords[i].z), 8);
         At(&bytes, at + 8U * header.dims, entries[i].committed_bytes, 8);
         At(&bytes, at + 8U * header.dims + 8U, entries[i].replacement_bytes, 8);
-        At(&bytes, at + 8U * header.dims + 16U, entries[i].replacement_crc32, 4);
+        std::copy(entries[i].replacement_sha256.begin(), entries[i].replacement_sha256.end(),
+            bytes.begin() + static_cast<std::ptrdiff_t>(at + 8U * header.dims + 16U));
     }
     Checksum(&bytes); return bytes;
 }
@@ -213,6 +216,7 @@ void TestInventory() {
     };
     corrupt(0, 'X', 1, "CKII");
     corrupt(4, 1, 2, "version");
+    corrupt(4, 3, 2, "version");
     corrupt(6, 2, 1, "dimensions");
     corrupt(7, 2, 1, "flags");
     corrupt(7, 0, 1, "compaction bounds");
@@ -223,11 +227,14 @@ void TestInventory() {
     corrupt(40, std::numeric_limits<std::uint64_t>::max(), 8, "overflows");
     corrupt(48, 0, 8, "generation");
     corrupt(48, std::numeric_limits<std::uint64_t>::max(), 8, "generation");
-    corrupt(124, std::bit_cast<std::uint64_t>(std::int64_t{-1}), 8, "unique");
-    corrupt(124, std::bit_cast<std::uint64_t>(std::int64_t{-2}), 8, "increasing");
+    corrupt(148, std::bit_cast<std::uint64_t>(std::int64_t{-1}), 8, "unique");
+    corrupt(148, std::bit_cast<std::uint64_t>(std::int64_t{-2}), 8, "increasing");
     corrupt(84, 51, 8, "committed boundary");
     corrupt(92, 0, 8, "replacement boundary");
-    corrupt(104, 1, 4, "reserved");
+    auto no_digest = good;
+    std::fill(no_digest.begin() + 100U, no_digest.begin() + 132U, 0U);
+    Checksum(&no_digest);
+    Reject([&] { (void)ReadInventory(no_digest, shape); }, "digest");
     for (std::size_t i = 0; i < good.size(); ++i) {
         auto changed = good; changed[i] ^= 1;
         Reject([&] { (void)ReadInventory(changed, shape); }, "index");
@@ -284,8 +291,8 @@ void TestInventory() {
     }
     assert(propagated);
     auto boundary = header;
-    boundary.count = (std::numeric_limits<std::uint64_t>::max() - 64U) / 48U;
-    assert(chunkdb::IndexInventoryFileBytes(boundary) == 64U + boundary.count * 48U);
+    boundary.count = (std::numeric_limits<std::uint64_t>::max() - 64U) / 72U;
+    assert(chunkdb::IndexInventoryFileBytes(boundary) == 64U + boundary.count * 72U);
     ++boundary.count;
     Reject([&] { (void)chunkdb::IndexInventoryFileBytes(boundary); }, "overflows");
 }
@@ -397,7 +404,7 @@ void TestDurableInventoryBoundaries() {
         assert(entries.size() == 1U && entries[0].coord == large);
         assert(entries[0].committed_bytes == expected[0].committed_bytes);
         assert(entries[0].replacement_bytes == expected[0].replacement_bytes);
-        assert(entries[0].replacement_crc32 == expected[0].replacement_crc32);
+        assert(entries[0].replacement_sha256 == expected[0].replacement_sha256);
         std::ostringstream output; output << "unchanged";
         auto invalid = expected; invalid[0].committed_bytes = 1U;
         Reject([&] { chunkdb::WriteIndexInventory(output, header, invalid); }, "committed boundary");
@@ -526,6 +533,29 @@ void TestCompleteDeletedBoundaryCannotBeDiscarded() {
     }
 }
 
+void TestExactFileDigest() {
+    const auto header = HeaderFixture(2U, {});
+    const auto make = [&](std::uint64_t revision) {
+        auto bytes = header;
+        const auto record = RecordFixture(2U, {chunkdb::ChunkIndexKind::kLive, {}, revision, revision * 10U, 1U});
+        bytes.insert(bytes.end(), record.begin(), record.end());
+        return bytes;
+    };
+    const auto first = make(11U), second = make(12U);
+    assert(first.size() == second.size() && chunkdb::Crc32(first) == chunkdb::Crc32(second));
+    std::istringstream original(std::string(first.begin(), first.end()));
+    const auto digest = chunkdb::IndexFileDigest(original, first.size());
+    assert(digest == chunkdb::crypto::Sha256Of(first));
+    std::istringstream changed(std::string(second.begin(), second.end()));
+    assert(chunkdb::IndexFileDigest(changed, second.size()) != digest);
+    std::istringstream short_stream(std::string(first.begin(), first.end() - 1U));
+    Reject([&] { (void)chunkdb::IndexFileDigest(short_stream, first.size()); }, "index");
+    std::istringstream extra(std::string(first.begin(), first.end()) + "x");
+    Reject([&] { (void)chunkdb::IndexFileDigest(extra, first.size()); }, "index");
+    std::istringstream oversized;
+    Reject([&] { (void)chunkdb::IndexFileDigest(oversized, std::numeric_limits<std::uint64_t>::max()); }, "SHA-256");
+}
+
 }  // namespace
 
 int main() {
@@ -536,4 +566,5 @@ int main() {
     TestInventoryHeaderCacheIdentity();
     TestCompleteDeletedBoundaryCannotBeDiscarded();
     TestLogRecovery();
+    TestExactFileDigest();
 }

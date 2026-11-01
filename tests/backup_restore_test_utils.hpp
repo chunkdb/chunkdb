@@ -5,6 +5,7 @@
 #include <sstream>
 #include "backup.hpp"
 #include "checkpoint.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
@@ -86,6 +87,7 @@ struct Fixture {
         manifest.geometry.block_bits = FixedBitsPerBlock(manifest.schema);
         const auto table = backup / "tables/default";
         Save(StoreManifestPath(table), SerializeStoreManifest(manifest));
+        assert(ChunkCoordinateIndex::InitializeEmpty(table, Geometry(manifest.geometry, manifest.schema), manifest.store_id));
         Save(table / "chunkdb.version", SerializeVersionClockRecord(100U));
         Save(table / "chunkdb.snapshot", SerializeSnapshotGenerationRecord(0U));
         Bytes initialized{'C', 'K', 'I', 'D'}; WriteLe64(initialized, 1U); WriteLe32(initialized, Crc32(initialized));

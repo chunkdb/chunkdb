@@ -17,6 +17,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "store_manifest.hpp"
 #include "wal_writer.hpp"
+#include "shared_file_input.hpp"
 
 namespace chunkdb {
 namespace {
@@ -38,7 +39,7 @@ class SinkBuffer final : public std::streambuf {
     const AtomicFileSink& sink_;
 };
 
-std::uint64_t StreamBytes(std::ifstream& input, const std::filesystem::path& path) {
+std::uint64_t StreamBytes(std::istream& input, const std::filesystem::path& path) {
     input.seekg(0, std::ios::end);
     const auto size = input.tellg();
     if (size < 0) throw std::runtime_error("failed to measure index file " + path.string());
@@ -47,23 +48,12 @@ std::uint64_t StreamBytes(std::ifstream& input, const std::filesystem::path& pat
     return static_cast<std::uint64_t>(size);
 }
 
-struct FileChecksum { std::uint64_t bytes; std::uint32_t crc; };
+struct FileChecksum { std::uint64_t bytes; crypto::Sha256Digest digest; };
 FileChecksum ChecksumFile(const std::filesystem::path& path) {
-    std::ifstream input(path, std::ios::binary);
+    SharedFileInput input(path);
     if (!input) throw std::runtime_error("failed to open index file " + path.string());
     const auto bytes = StreamBytes(input, path);
-    std::array<std::uint8_t, 4096U> buffer{};
-    auto remaining = bytes;
-    std::uint32_t crc = Crc32(nullptr, 0U);
-    while (remaining != 0U) {
-        const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, buffer.size()));
-        input.read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(count));
-        if (input.gcount() != static_cast<std::streamsize>(count))
-            throw std::runtime_error("failed to read index checksum " + path.string());
-        crc = Crc32Extend(crc, buffer.data(), count);
-        remaining -= count;
-    }
-    return {bytes, crc};
+    return {bytes, IndexFileDigest(input, bytes)};
 }
 
 bool MatchesReplacement(const std::filesystem::path& path, const IndexInventoryEntry& entry) {
@@ -73,10 +63,10 @@ bool MatchesReplacement(const std::filesystem::path& path, const IndexInventoryE
     if (ec || !std::filesystem::is_regular_file(status))
         throw std::runtime_error("invalid compaction index file " + path.string());
     const auto file = ChecksumFile(path);
-    return file.bytes == entry.replacement_bytes && file.crc == entry.replacement_crc32;
+    return file.bytes == entry.replacement_bytes && file.digest == entry.replacement_sha256;
 }
 
-void CopyPrefix(std::ifstream& input, std::uint64_t size, const AtomicFileSink& sink) {
+void CopyPrefix(std::istream& input, std::uint64_t size, const AtomicFileSink& sink) {
     std::array<std::uint8_t, 4096U> buffer{};
     while (size != 0U) {
         const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(size, buffer.size()));
@@ -89,7 +79,7 @@ void CopyPrefix(std::ifstream& input, std::uint64_t size, const AtomicFileSink& 
 }
 
 void RewritePrefix(const std::filesystem::path& path, std::uint64_t size) {
-    std::ifstream input(path, std::ios::binary);
+    SharedFileInput input(path);
     if (!input) throw std::runtime_error("failed to open index prefix " + path.string());
     AtomicWriteStream(path, [&](const AtomicFileSink& sink) { CopyPrefix(input, size, sink); },
         true, true, nullptr, nullptr, false);
@@ -143,7 +133,7 @@ ChunkCoordinateIndex::ChunkCoordinateIndex(std::filesystem::path root, const Geo
     StoreId table_id, bool read_only)
     : root_(std::move(root)), geometry_(geometry), table_id_(table_id), read_only_(read_only) {
     const auto path = root_ / kChunkIndexFileName;
-    std::ifstream input(path, std::ios::binary);
+    SharedFileInput input(path);
     if (!input) throw std::runtime_error("missing or unreadable coordinate inventory " + path.string());
     inventory_ = ReadIndexInventory(input, StreamBytes(input, path), geometry_, table_id_, [&](const auto& entry) {
         shards_.emplace(entry.coord, Shard{.inventory = entry});
@@ -166,7 +156,7 @@ ChunkCoordinateIndex::ChunkCoordinateIndex(std::filesystem::path root, const Geo
             }
             cut = shard.inventory.replacement_bytes;
         }
-        std::ifstream file(selected, std::ios::binary);
+        SharedFileInput file(selected);
         if (!file) throw std::runtime_error("missing listed coordinate log " + selected.string());
         shard.observed_bytes = StreamBytes(file, selected);
         AdmitLog(shard, selected, cut);
@@ -174,7 +164,7 @@ ChunkCoordinateIndex::ChunkCoordinateIndex(std::filesystem::path root, const Geo
 }
 
 void ChunkCoordinateIndex::AdmitLog(const Shard& shard, const std::filesystem::path& path, std::uint64_t cut) {
-    std::ifstream input(path, std::ios::binary);
+    SharedFileInput input(path);
     if (!input) throw std::runtime_error("failed to read coordinate log " + path.string());
     const auto log = ReadChunkIndexLog(input, StreamBytes(input, path), geometry_, table_id_, shard.inventory.coord, cut);
     for (const auto& [coord, record] : log.latest) {
@@ -207,7 +197,7 @@ std::optional<StoreId> ChunkCoordinateIndex::UnpublishedEmptyIdentity(const std:
     std::uint8_t dims) {
     const auto path = root / kChunkIndexFileName;
     if (!std::filesystem::exists(path)) return {};
-    std::ifstream input(path, std::ios::binary);
+    SharedFileInput input(path);
     if (!input) throw std::runtime_error("failed to read unpublished coordinate inventory");
     std::array<std::uint8_t, 24U> prefix{};
     input.read(reinterpret_cast<char*>(prefix.data()), prefix.size());
@@ -249,7 +239,7 @@ void ChunkCoordinateIndex::CompleteRecovery() {
         // Reconcile every orphan before repairing even an unrelated suffix.
         for (auto& [coord, shard] : checked_unlisted) {
             const auto path = LogPath(coord);
-            std::ifstream input(path, std::ios::binary);
+            SharedFileInput input(path);
             if (!input) throw std::runtime_error("missing unpublished coordinate log " + path.string());
             const auto log = ReadChunkIndexLog(input, StreamBytes(input, path), geometry_, table_id_, coord);
             shard.inventory.committed_bytes = log.valid_bytes;
@@ -276,7 +266,7 @@ void ChunkCoordinateIndex::CompleteRecovery() {
                 SyncDirectoryPath(LogPath(coord).parent_path());
                 entry.committed_bytes = entry.replacement_bytes;
                 entry.replacement_bytes = 0U;
-                entry.replacement_crc32 = 0U;
+                entry.replacement_sha256 = {};
             } else if (shard.observed_bytes > entry.committed_bytes) {
                 RewritePrefix(LogPath(coord), entry.committed_bytes);
                 shard.observed_bytes = entry.committed_bytes;
@@ -327,7 +317,7 @@ void ChunkCoordinateIndex::CompleteRecovery() {
 void ChunkCoordinateIndex::AdmitUnlistedLog(const LargeChunkCoord& coord) {
     if (shards_.contains(coord) || unlisted_.contains(coord)) return;
     const auto path = LogPath(coord);
-    std::ifstream input(path, std::ios::binary);
+    SharedFileInput input(path);
     if (!input) throw std::runtime_error("failed to read unpublished coordinate log " + path.string());
     const auto size = StreamBytes(input, path);
     const auto checked = ReadChunkIndexLog(input, size, geometry_, table_id_, coord);
@@ -547,7 +537,7 @@ void ChunkCoordinateIndex::Compact(std::uint64_t before, std::uint64_t completed
     try {
         for (auto& [coord, shard] : replacements) {
             const auto path = LogPath(coord);
-            std::ifstream input(path, std::ios::binary);
+            SharedFileInput input(path);
             if (!input) throw std::runtime_error("missing coordinate log before compaction " + path.string());
             const auto size = StreamBytes(input, path);
             if (size != shard.inventory.committed_bytes)
@@ -579,7 +569,7 @@ void ChunkCoordinateIndex::Compact(std::uint64_t before, std::uint64_t completed
             SyncDirectoryPath(StagePath(coord).parent_path());
             const auto checksum = ChecksumFile(StagePath(coord));
             shard.inventory.replacement_bytes = checksum.bytes;
-            shard.inventory.replacement_crc32 = checksum.crc;
+            shard.inventory.replacement_sha256 = checksum.digest;
         }
         Crash("CHUNKDB_FAILPOINT_CRASH_INDEX_COMPACTION_AFTER_STAGE_DIRECTORY_SYNC_ONCE");
         std::vector<IndexInventoryEntry> entries;
@@ -596,7 +586,7 @@ void ChunkCoordinateIndex::Compact(std::uint64_t before, std::uint64_t completed
             SyncDirectoryPath(LogPath(coord).parent_path());
             shard.inventory.committed_bytes = shard.inventory.replacement_bytes;
             shard.inventory.replacement_bytes = 0U;
-            shard.inventory.replacement_crc32 = 0U;
+            shard.inventory.replacement_sha256 = {};
         }
         Crash("CHUNKDB_FAILPOINT_CRASH_INDEX_COMPACTION_AFTER_DIRECTORY_SYNC_ONCE");
         entries.clear();

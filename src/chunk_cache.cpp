@@ -9,6 +9,7 @@
 #include "wal_replay.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
+#include "shared_file_input.hpp"
 
 #include <algorithm>
 #include <array>
@@ -460,14 +461,18 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
 
     apply_boundary();
     if (std::filesystem::exists(wal_path)) {
-        std::ifstream wal_input(wal_path, std::ios::binary | std::ios::ate);
-        if (!wal_input) {
+        std::optional<SharedFileInput> opened;
+        try {
+            opened.emplace(wal_path);
+        } catch (const std::system_error&) {
             if (std::filesystem::exists(wal_path)) {
-                throw std::runtime_error("failed to open WAL " + wal_path.string());
+                throw;
             }
             finish();
             return loaded;
         }
+        auto& wal_input = *opened;
+        wal_input.seekg(0, std::ios::end);
         const auto measured = wal_input.tellg();
         if (measured < 0) throw std::runtime_error("failed to measure WAL " + wal_path.string());
         const auto wal_bytes = static_cast<std::uint64_t>(measured);

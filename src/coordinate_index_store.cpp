@@ -12,6 +12,7 @@
 #include "snapshot_generation.hpp"
 #include "store_manifest.hpp"
 #include "wal_replay.hpp"
+#include "shared_file_input.hpp"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -24,7 +25,7 @@ namespace chunkdb {
 
 namespace {
 std::atomic<CoordinateArtifactTestHook*> artifact_hook{nullptr};
-std::uint64_t FileBytes(std::ifstream& input, const std::filesystem::path& path) {
+std::uint64_t FileBytes(std::istream& input, const std::filesystem::path& path) {
     input.seekg(0, std::ios::end);
     const auto bytes = input.tellg();
     if (bytes < 0) throw std::runtime_error("failed to measure coordinate artifact " + path.string());
@@ -32,7 +33,7 @@ std::uint64_t FileBytes(std::ifstream& input, const std::filesystem::path& path)
     if (!input) throw std::runtime_error("failed to rewind coordinate artifact " + path.string());
     return static_cast<std::uint64_t>(bytes);
 }
-std::vector<std::uint8_t> Prefix(std::ifstream& input, std::size_t count) {
+std::vector<std::uint8_t> Prefix(std::istream& input, std::size_t count) {
     std::vector<std::uint8_t> bytes(count);
     input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(count));
     if (input.gcount() != static_cast<std::streamsize>(count))
@@ -78,7 +79,7 @@ std::vector<ChunkCoord> ChunkStore::AdmitCoordinateArtifacts(ChunkCoordinateInde
                 throw std::runtime_error("coordinate artifact has noncanonical placement: " + path.string());
             if (auto* hook = artifact_hook.load(std::memory_order_acquire)) hook->BeforeStatus(path);
             RequirePlainPath(path, false);
-            std::ifstream input(path, std::ios::binary);
+            SharedFileInput input(path);
             if (!input) {
                 if (access_mode_ == AccessMode::kReadOnly && !std::filesystem::exists(path)) continue;
                 throw std::runtime_error("failed to admit coordinate artifact " + path.string());
@@ -153,7 +154,7 @@ void ChunkStore::InitializeCoordinateIndex() {
 
 std::shared_ptr<ChunkCoordinateIndex> ChunkStore::RetainedIndexForSnapshot() {
     const auto path = data_dir_ / kChunkIndexFileName;
-    std::ifstream input(path, std::ios::binary);
+    SharedFileInput input(path);
     if (!input) throw std::runtime_error("read-only table is missing its coordinate inventory");
     const auto header = ReadIndexInventoryHeader(input, FileBytes(input, path), geometry_, store_id_);
     if (header.compaction_pending) throw std::runtime_error("coordinate compaction requires writer recovery");
