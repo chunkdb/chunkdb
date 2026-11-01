@@ -73,12 +73,15 @@ class ChunkCoordinateIndex {
     void AdmitUnlistedLog(const LargeChunkCoord& coord);
     // Candidate construction only; no request may use this owner yet.
     void ObserveRecovered(const ChunkCoord& coord, const ChunkState& state);
+    void ObserveRecoveredIdentity(const ChunkCoord& coord, std::uint64_t revision, bool populated);
     // A borrowed node is used only under its canonical chunk's exclusive lock.
     [[nodiscard]] ChunkCoordinateNode* Find(const ChunkCoord& coord);
     [[nodiscard]] bool IsPopulationCandidate(const ChunkCoord& coord) const;
     [[nodiscard]] CoordinateReservation Prepare(const ChunkCoord& coord, ChunkCoordinateNode** cache_slot);
     [[nodiscard]] CoordinatePage Page(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
         std::optional<std::uint64_t> since = {}) const;
+    // Exclusive current-state preparation does not make a history promise.
+    [[nodiscard]] CoordinatePage CurrentPage(bool has_cursor, const ChunkCoord& cursor, std::size_t limit) const;
     [[nodiscard]] std::optional<ChunkIndexRecord> EmptyBoundary(const ChunkCoord& coord) const;
     [[nodiscard]] std::uint64_t maximum_recovered_revision() const noexcept { return maximum_recovered_revision_; }
     [[nodiscard]] std::uint64_t retained_deletion_floor() const noexcept { return deletion_floor_.load(std::memory_order_acquire); }

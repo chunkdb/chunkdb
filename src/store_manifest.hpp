@@ -24,9 +24,10 @@ class EarlierDevelopmentFormatError : public std::runtime_error {
 };
 
 // `table.manifest` records what a table directory (a store) is: its feature
-// flags, geometry, a random store id, options and columns. It is written
-// once, before any other artifact, and replaced atomically only to change
-// options or columns. Little-endian (docs/STORAGE_FORMAT.md Section 1.2):
+// flags, geometry, a random store id, options and columns. Direct creation
+// publishes its checked empty inventory first; both precede chunk data.
+// The manifest is replaced atomically for option or column changes.
+// Little-endian (docs/STORAGE_FORMAT.md Section 1.2):
 //   [0, 4)    magic "CKMF"
 //   [4, 6)    u16 manifest version (5)
 //   [6, 8)    u16 reserved, zero

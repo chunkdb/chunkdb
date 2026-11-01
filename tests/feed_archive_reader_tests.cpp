@@ -3,9 +3,13 @@
 #include <functional>
 #include <fstream>
 #include <limits>
+#include <sstream>
 
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/crc32.hpp"
+#include "archive_base_format.hpp"
+#include "chunk_file_header.hpp"
+#include "populated_index_format.hpp"
 #include "feed_archive.hpp"
 #include "feed_protocol.hpp"
 #include "feature_flags.hpp"
@@ -33,7 +37,12 @@ struct Fixture {
     test::ScopedTempDir directory{"chunkdb-feed-archive-reader"};
     Geometry geometry{{2U, 2U, 2U, 1U, 8U}};
     StoreId epoch{};
-    Fixture() { epoch[0] = 7U; }
+    Fixture() {
+        epoch[0] = 7U;
+        std::ofstream output(directory.path() / "chunkdb.index", std::ios::binary);
+        WriteIndexInventory(output, {.table_id = epoch, .dims = geometry.dims()}, {});
+        assert(output.good());
+    }
     std::filesystem::path Archive(ChunkCoord coord, std::uint64_t first, std::uint64_t last) const {
         return directory.path() / ".chunkdb.feed" / ("C_" + std::to_string(coord.x) + "_" + std::to_string(coord.y) +
             "." + std::to_string(first) + "-" + std::to_string(last) + ".wal");
@@ -41,6 +50,22 @@ struct Fixture {
     std::filesystem::path Base(ChunkCoord coord, std::uint64_t first) const {
         return directory.path() / ".chunkdb.feed" / ("C_" + std::to_string(coord.x) + "_" + std::to_string(coord.y) +
             "." + std::to_string(first) + ".chk");
+    }
+    void NeverWritten(ChunkCoord coord = {}, std::uint64_t first = 2U) const {
+        Save(directory.path() / ".chunkdb.feed" / ArchiveBaseFileName(coord, geometry.dims(), first),
+            SerializeArchiveBaseDescriptor({.dims = geometry.dims(), .kind = ArchiveBaseKind::kNeverWritten,
+                .epoch = epoch, .coord = coord, .first = first, .base_schema = 1U}, kVarMaxChunkBytesLimit));
+    }
+    void ImageBase(ChunkCoord coord, std::uint64_t first, std::uint64_t revision) const {
+        const auto current = ChunkDataPath(directory.path(), geometry, coord);
+        std::filesystem::create_directories(Base(coord, first).parent_path());
+        std::filesystem::create_hard_link(current, Base(coord, first));
+        const auto bytes = LoadFile(current);
+        Save(directory.path() / ".chunkdb.feed" / ArchiveBaseFileName(coord, geometry.dims(), first),
+            SerializeArchiveBaseDescriptor({.dims = geometry.dims(), .kind = ArchiveBaseKind::kImage,
+                .epoch = epoch, .coord = coord, .first = first, .base_revision = revision,
+                .base_time_ms = revision * 10U, .base_schema = 1U, .image_length = bytes.size(),
+                .image_sha256 = crypto::Sha256Of(bytes)}, kVarMaxChunkBytesLimit));
     }
     FeedArchiveReader Reader(std::uint64_t from, std::uint64_t through, std::shared_ptr<void> pin = {}) {
         return FeedArchiveAccess::Create(directory.path(), geometry, epoch, {epoch, from}, through,
@@ -75,6 +100,7 @@ void Equal(const std::optional<std::vector<ColumnValue>>& values, std::optional<
 
 void MergeAndDurability() {
     Fixture fixture;
+    fixture.NeverWritten(); fixture.NeverWritten({1, 0}, 3U);
     Save(fixture.Archive({0, 0}, 2U, 4U), fixture.Wal({0, 0}, {fixture.Frame(2U, 8U), fixture.Frame(4U, 9U)}));
     Save(ChunkWalPath(fixture.directory.path(), fixture.geometry, {1, 0}),
         fixture.Wal({1, 0}, {fixture.Frame(3U, 10U), fixture.Frame(4U, 11U), fixture.Frame(5U, 12U)}));
@@ -103,6 +129,7 @@ void LinkedBaseAndRollover() {
     const auto live = ChunkWalPath(fixture.directory.path(), fixture.geometry, coord);
     const auto current = ChunkDataPath(fixture.directory.path(), fixture.geometry, coord);
     fixture.Image(current, coord, 1U, 7U);
+    fixture.ImageBase(coord, 2U, 1U);
     Save(live, fixture.Wal(coord, {fixture.Frame(2U, 8U), fixture.Frame(3U, 9U, false)}));
     auto pin = std::make_shared<int>(42);
     std::weak_ptr<int> weak = pin;
@@ -110,10 +137,10 @@ void LinkedBaseAndRollover() {
         auto reader = fixture.Reader(1U, 3U, pin);
         pin.reset();
         assert(!weak.expired());
-        // A checkpoint after the reader captured its live cursor links the
-        // original image and publishes a new image before renaming the WAL.
+        // The original base is already pinned before capture; a checkpoint
+        // publishes a new current image before renaming the WAL.
         std::filesystem::create_directories(fixture.Base(coord, 2U).parent_path());
-        std::filesystem::create_hard_link(current, fixture.Base(coord, 2U));
+        assert(std::filesystem::equivalent(current, fixture.Base(coord, 2U)));
         std::filesystem::remove(current);
         fixture.Image(current, coord, 3U, 99U);
         auto entry = reader.Next();
@@ -131,6 +158,7 @@ void LinkedBaseAndRollover() {
     assert(weak.expired());
 
     Fixture absent;
+    absent.NeverWritten();
     Save(ChunkWalPath(absent.directory.path(), absent.geometry, coord), absent.Wal(coord, {absent.Frame(2U, 8U)}));
     absent.Image(ChunkDataPath(absent.directory.path(), absent.geometry, coord), coord, 2U, 8U);
     auto reader = absent.Reader(0U, 2U);
@@ -141,6 +169,7 @@ void LinkedBaseAndRollover() {
 
 void PartialAndBoundaries() {
     Fixture fixture;
+    fixture.NeverWritten();
     const ChunkCoord coord{0, 0};
     const auto live = ChunkWalPath(fixture.directory.path(), fixture.geometry, coord);
     const auto first = fixture.Frame(2U, 8U);
@@ -174,6 +203,7 @@ void PartialAndBoundaries() {
 
 void ConditionalBoundaries() {
     Fixture fixture;
+    fixture.NeverWritten();
     const ChunkCoord coord{0, 0};
     const auto live = ChunkWalPath(fixture.directory.path(), fixture.geometry, coord);
     const auto a = fixture.Frame(2U, 8U), b = fixture.Frame(3U, 9U);
@@ -208,6 +238,7 @@ void UserCollectionAndCoordinates() {
     Fixture fixture;
     const FeatureFlags features{.incompat = kFeatureFeedSlots | kFeatureChunkModel};
     const ChunkCoord coord{std::numeric_limits<std::int64_t>::max(), std::numeric_limits<std::int64_t>::min()};
+    fixture.NeverWritten(coord);
     auto make = [&](std::uint64_t revision, bool present, bool gc, std::optional<std::string_view> user) {
         std::vector<std::uint8_t> bytes;
         WalFrameBuilder frame(&bytes, 1U, {}, user, gc);
@@ -235,6 +266,7 @@ void UserCollectionAndCoordinates() {
     assert(!reader.Next());
 
     Fixture invalid;
+    invalid.NeverWritten(coord);
     auto damaged = BuildWalHeader(coord, invalid.epoch, features);
     for (const auto& frame : {make(2U, true, false, "alice"), make(3U, false, true, std::nullopt)})
         damaged.insert(damaged.end(), frame.begin(), frame.end());
@@ -247,6 +279,7 @@ void UserCollectionAndCoordinates() {
 
 void HistoricLayout() {
     Fixture fixture;
+    fixture.NeverWritten();
     const auto old = SingleBitsColumnSchema(8U);
     const auto changed = ChangeColumnType(old, "bits", {ColumnKind::kBits, 16U}, Conversion::kExact);
     fixture.geometry = Geometry({2U, 2U, 2U, 1U, 16U}, changed);
@@ -271,6 +304,7 @@ void HistoricLayout() {
 
 void TypedValuesAndBitEquality() {
     Fixture fixture;
+    fixture.NeverWritten();
     TableSchema schema{.version = 1U, .next_column_id = 5U,
         .columns = {{.id = 1U, .name = "small", .type = {ColumnKind::kUnsigned, 3U}, .nullable = true, .default_value = {}},
                     {.id = 2U, .name = "float", .type = {ColumnKind::kFloat32, 32U}, .default_value = {}},
@@ -324,6 +358,7 @@ void TypedValuesAndBitEquality() {
 
 void DamageAndEpoch() {
     Fixture fixture;
+    fixture.NeverWritten();
     auto wrong = fixture.epoch;
     wrong[0] ^= 1U;
     Reject([&] { (void)FeedArchiveAccess::Create(fixture.directory.path(), fixture.geometry, fixture.epoch, {wrong, 0U}, 1U, {}); });
@@ -337,6 +372,7 @@ void DamageAndEpoch() {
 
 void FailedTransactionCannotResumePartially() {
     Fixture fixture;
+    fixture.NeverWritten(); fixture.NeverWritten({1, 0});
     auto a = fixture.Frame(2U, 8U), b = fixture.Frame(2U, 9U);
     b[12U] ^= 1U;  // A second chunk claiming the same transaction with another time.
     const auto checksum = Crc32(b.data() + kWalFrameMagicSize, kWalFrameFixedHeaderSize - kWalFrameMagicSize);
@@ -353,6 +389,7 @@ void FailedTransactionCannotResumePartially() {
 
 void DuplicateSegments() {
     Fixture fixture;
+    fixture.NeverWritten();
     const ChunkCoord coord{0, 0};
     const auto archive = fixture.Archive(coord, 2U, 2U);
     const auto live = ChunkWalPath(fixture.directory.path(), fixture.geometry, coord);
@@ -371,6 +408,7 @@ void DuplicateSegments() {
 
 void ArchivesOpenOnlyWhenReached() {
     Fixture fixture;
+    fixture.NeverWritten(); fixture.NeverWritten({1, 0}, 3U);
     Save(fixture.Archive({0, 0}, 2U, 2U), fixture.Wal({0, 0}, {fixture.Frame(2U, 8U)}));
     auto later = fixture.Wal({1, 0}, {fixture.Frame(3U, 9U)});
     later[0U] ^= 1U;
@@ -384,6 +422,7 @@ void ArchivesOpenOnlyWhenReached() {
 void CapturedLiveCursorIgnoresFutureSchemaImage() {
     for (const bool already_published : {false, true}) for (const bool archived : {false, true}) {
         Fixture fixture;
+        fixture.NeverWritten();
         const ChunkCoord coord{0, 0};
         const auto live = ChunkWalPath(fixture.directory.path(), fixture.geometry, coord);
         Save(live, fixture.Wal(coord, {fixture.Frame(2U, 8U)}));
@@ -415,8 +454,9 @@ void LiveBaseClassificationValidatesHeader() {
     const auto image = ChunkDataPath(fixture.directory.path(), fixture.geometry, coord);
     fixture.Image(image, coord, 1U, 7U);
     auto bytes = LoadFile(image);
-    bytes[56U] ^= 1U;  // A forged base decision must not bypass the header CRC.
+    bytes[ChunkImageHeaderBytes(fixture.geometry.dims(), ReadLe16(bytes, 10U)) - 1U] ^= 1U;
     Save(image, bytes);
+    fixture.ImageBase(coord, 2U, 1U); // Valid outer SHA leaves the bad header CRC as the admission guard.
     Reject([&] { (void)fixture.Reader(0U, 2U); });
 }
 }  // namespace

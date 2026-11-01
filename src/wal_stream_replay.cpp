@@ -139,6 +139,39 @@ WalReplayResult ReplayWalStream(std::istream& input, std::uint64_t measured_byte
         base_revision, base_schema_version, payload, presence, vars, boundaries, chunk_columns, base_commit_time_ms, retained_identity);
 }
 
+std::optional<FeedFrameInfo> InspectFirstWalFrameStream(std::istream& input,
+    std::uint64_t measured_bytes, const Geometry& geometry, const ChunkCoord& coord,
+    const StoreId& table_id, FeatureFlags features) {
+    const auto header_bytes = ChunkWalHeaderBytes(geometry.dims());
+    if (measured_bytes < header_bytes + kWalFrameFixedHeaderSize) return std::nullopt;
+    const std::function<void()> read_checkpoint;
+    StreamSource source(input, measured_bytes, geometry.dims(), read_checkpoint);
+    ValidateWalHeader(source.Header(), coord, table_id, features, geometry.dims());
+    const auto crash_tail = [&]() -> std::optional<FeedFrameInfo> {
+        if (source.HasLaterFrameHeader(header_bytes))
+            throw std::runtime_error("invalid first WAL frame precedes a later frame header");
+        return std::nullopt;
+    };
+    const auto window = source.Frame(header_bytes);
+    const auto& frame = window.bytes;
+    if (frame.size() < kWalFrameFixedHeaderSize ||
+        std::memcmp(frame.data(), kWalFrameMagic, kWalFrameMagicSize) != 0) return crash_tail();
+    const auto header_size = kWalFrameFixedHeaderSize + static_cast<std::uint64_t>(ReadLe16(frame, 22U)) + kWalFrameHeaderCrcSize;
+    const auto size = header_size + ReadLe32(frame, 28U) + kWalFrameTrailerSize;
+    if (frame.size() < header_size) return std::nullopt;
+    if (Crc32(frame.data() + kWalFrameMagicSize, static_cast<std::size_t>(header_size) - kWalFrameMagicSize - kWalFrameHeaderCrcSize) !=
+        ReadLe32(frame, static_cast<std::size_t>(header_size) - kWalFrameHeaderCrcSize)) return crash_tail();
+    if (size > kMaxWalFrameBytes) throw std::runtime_error("first WAL frame exceeds the frame byte limit");
+    if (size > measured_bytes - header_bytes) return std::nullopt;
+    if (frame.size() != size) throw std::runtime_error("first WAL frame extent is inconsistent");
+    if (Crc32(frame.data() + static_cast<std::size_t>(header_size), ReadLe32(frame, 28U)) !=
+        ReadLe32(frame, static_cast<std::size_t>(size) - kWalFrameTrailerSize)) {
+        if (size < measured_bytes - header_bytes) return crash_tail();
+        return std::nullopt;
+    }
+    return InspectFeedFrame(frame, geometry, features);
+}
+
 WalStreamInfo InspectWalStream(std::istream& input, std::uint64_t measured_bytes,
     const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
     const std::function<void()>& read_checkpoint) {

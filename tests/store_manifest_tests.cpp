@@ -584,7 +584,8 @@ void TestDirectoryWithoutManifestRefused() {
                 config = ReadOnly(config);
             }
             const auto message = ExpectRefused([&] { chunkdb::ChunkStore store(config); });
-            assert(Contains(message, "has no table.manifest"));
+            assert(Contains(message, read_only ? "has no table.manifest" :
+                "unpublished inventory has other owned storage: "));
             assert(Tree(dir.path()) == before);
         }
     }
@@ -622,6 +623,7 @@ void TestDirectoryWithoutManifestRefused() {
             store.SetBlockBits(0, 0, "1111000011110000");
         }
         assert(ReadBytes(dir.path() / ".DS_Store") == (std::vector<std::uint8_t>{'h', 'i'}));
+        assert(ReadBytes(dir.path() / "L_notes") == (std::vector<std::uint8_t>{'x'}));
         assert(std::filesystem::is_directory(dir.path() / "lost+found"));
         chunkdb::ChunkStore reopened(Config(dir.path()));
         assert(reopened.GetBlockBits(0, 0) == "1111000011110000");

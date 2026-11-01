@@ -69,7 +69,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     // trying to obtain a token. A reserved-but-unused token is simply skipped,
     // which is harmless: the clock only has to stay monotonic.
     FeedWriteGuard feed(*this);
-    feed.Before(chunk_coord, chunk->payload, chunk->presence_bitmap, chunk->vars);
+    feed.Before(chunk_coord, chunk->payload, chunk->presence_bitmap, chunk->vars, chunk->chunk_columns.get(), chunk->written);
     const std::uint64_t reserved_version = NextChunkVersion();
     feed.Version(reserved_version);
     const std::uint64_t commit_time_ms = NextCommitTimeMs(*chunk);
