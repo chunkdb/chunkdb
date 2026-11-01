@@ -438,6 +438,27 @@ void ExtendedRootPaths() {
     PrepareBackupTarget(fixture.source, target);
     assert(std::filesystem::exists(target / kBackupIncompleteName));
     const auto restored = root / "restored";
+    test::FeedPhaseWatchdog::Phase("extended roots: validate restore target");
+    RequireBackupTarget(fixture.backup, restored);
+    test::FeedPhaseWatchdog::Phase("extended roots: resolve restore target");
+    assert(CanonicalBackupPath(restored).native().starts_with(L"\\\\?\\"));
+    test::FeedPhaseWatchdog::Phase("extended roots: enumerate restore parent");
+    for (const auto& entry : std::filesystem::directory_iterator(root))
+        assert(entry.path().filename() == "daily");
+    struct SyncTrace {
+        SyncTrace() {
+            SetDirectorySyncObserverForTests([](const auto& directory) {
+                test::FeedPhaseWatchdog::Phase("extended roots: sync directory " + directory.string());
+            });
+            SetFileSyncObserverForTests([](const auto& file) {
+                test::FeedPhaseWatchdog::Phase("extended roots: sync file " + file.string());
+            });
+        }
+        ~SyncTrace() {
+            SetFileSyncObserverForTests({});
+            SetDirectorySyncObserverForTests({});
+        }
+    } sync_trace;
     test::FeedPhaseWatchdog::Phase("extended roots: restore " + restored.string());
     RestoreBackup(fixture.backup, restored);
     test::FeedPhaseWatchdog::Phase("extended roots: verify");
