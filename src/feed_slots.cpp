@@ -17,6 +17,8 @@
 #include "feature_flags.hpp"
 #include "feed_archive.hpp"
 #include "wal_replay.hpp"
+#include "chunk_coordinate_index.hpp"
+#include "shared_file_input.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -33,6 +35,7 @@ struct Segment {
     std::uint64_t bytes;
     ChunkCoord coord;
     std::uint64_t first;
+    std::filesystem::path descriptor;
 };
 bool Number(std::string_view text, std::uint64_t* value) {
     if (text.empty()) return false;
@@ -40,6 +43,12 @@ bool Number(std::string_view text, std::uint64_t* value) {
     return error == std::errc{} && end == text.data() + text.size();
 }
 std::optional<std::pair<ChunkCoord, std::uint64_t>> BaseName(std::string_view name, std::uint8_t dims) {
+    if (name.ends_with(".base")) {
+        ChunkCoord coord;
+        std::uint64_t first = 0U;
+        if (!ParseArchiveBaseFileName(name, dims, &coord, &first)) return std::nullopt;
+        return std::make_pair(coord, first);
+    }
     if (!name.ends_with(".chk")) return std::nullopt;
     name.remove_suffix(4U);
     const auto dot = name.find('.');
@@ -66,14 +75,15 @@ std::vector<Segment> Segments(const std::filesystem::path& root, std::uint8_t di
             !Number(std::string_view(name).substr(dash + 1U), &last)) continue;
         if (first == 0U || last < first) throw std::runtime_error("invalid archived WAL range: " + name);
         const auto base = directory / (ChunkFileStem(coord, dims) + "." + std::to_string(first) + ".chk");
+        const auto descriptor = directory / ArchiveBaseFileName(coord, dims, first);
         auto bytes = std::filesystem::file_size(entry.path());
-        if (std::filesystem::exists(base)) {
-            const auto base_bytes = std::filesystem::file_size(base);
+        for (const auto& artifact : {base, descriptor}) if (std::filesystem::exists(artifact)) {
+            const auto base_bytes = std::filesystem::file_size(artifact);
             if (base_bytes > std::numeric_limits<std::uint64_t>::max() - bytes)
                 throw std::runtime_error("feed archive size overflow");
             bytes += base_bytes;
         }
-        result.push_back({entry.path(), base, last, bytes, coord, first});
+        result.push_back({entry.path(), base, last, bytes, coord, first, descriptor});
     }
     return result;
 }
@@ -418,7 +428,8 @@ std::vector<std::uint64_t> FeedSlots::RetainedBytes(const std::vector<std::uint6
         for (const auto& entry : std::filesystem::directory_iterator(directory)) {
             const auto base = BaseName(entry.path().filename().string(), store_.geometry_.dims());
             if (!base ||
-                std::any_of(segments.begin(), segments.end(), [&](const auto& segment) { return segment.base == entry.path(); })) continue;
+                std::any_of(segments.begin(), segments.end(), [&](const auto& segment) {
+                    return segment.base == entry.path() || segment.descriptor == entry.path(); })) continue;
             const auto coord = base->first;
             if (!std::filesystem::exists(ChunkWalPath(store_.data_dir_, store_.geometry_, coord))) continue;
             bases = add(bases, std::filesystem::file_size(entry.path()));
@@ -497,6 +508,8 @@ FeedArchiveReader FeedSlots::ReaderCompletedPrefix(std::string_view slot_name, F
     {
         std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
         prefixes = prefix_index_.Capture(through);
+        for (auto& prefix : prefixes)
+            prefix.retained_empty = store_.RetainedEmptyBoundaryForArchive(prefix.coord);
     }
     std::erase_if(prefixes, [&](const auto& prefix) { return prefix.last <= after.revision; });
     // The caller holds a shared table lease, so geometry/store identity remain
@@ -605,6 +618,7 @@ void FeedSlots::Retain() {
         if (segment.last > minimum) continue;
         std::filesystem::remove(segment.wal);
         std::filesystem::remove(segment.base);
+        std::filesystem::remove(segment.descriptor);
         removed = true;
     }
     const auto directory = store_.data_dir_ / kFeedArchiveDirName;
@@ -614,7 +628,8 @@ void FeedSlots::Retain() {
             const auto base = BaseName(entry.path().filename().string(), store_.geometry_.dims());
             if (!base) continue;
             const auto first = base->second;
-            if (first > minimum || std::any_of(retained.begin(), retained.end(), [&](const auto& segment) { return segment.base == entry.path(); })) continue;
+            if (first > minimum || std::any_of(retained.begin(), retained.end(), [&](const auto& segment) {
+                    return segment.base == entry.path() || segment.descriptor == entry.path(); })) continue;
             const auto coord = base->first;
             // A linked base can precede its WAL archive after a crash. Keep it
             // while any live WAL for this chunk might still require it.
@@ -629,22 +644,13 @@ void FeedSlots::Retain() {
 std::filesystem::path FeedSlots::PrepareArchive(ChunkCoord coord) {
     const auto wal_path = ChunkWalPath(store_.data_dir_, store_.geometry_, coord);
     if (!std::filesystem::exists(wal_path)) return {};
-    const auto wal = LoadFile(wal_path);
-    ValidateWalHeader(wal, coord, store_.store_id_, store_.features_, store_.geometry_.dims());
-    std::uint64_t first = 0U, last = 0U;
-    for (std::size_t at = ChunkWalHeaderBytes(store_.geometry_.dims()); at < wal.size();) {
-        if (wal.size() - at < kWalFrameFixedHeaderSize) throw std::runtime_error("partial WAL cannot be archived");
-        const std::uint64_t size = kWalFrameFixedHeaderSize + static_cast<std::uint64_t>(ReadLe16(wal, at + 22U)) +
-                                   kWalFrameHeaderCrcSize + ReadLe32(wal, at + 28U) + kWalFrameTrailerSize;
-        if (size > wal.size() - at) throw std::runtime_error("partial WAL cannot be archived");
-        const std::vector<std::uint8_t> frame(wal.begin() + static_cast<std::ptrdiff_t>(at),
-            wal.begin() + static_cast<std::ptrdiff_t>(at + size));
-        const auto info = InspectFeedFrame(frame, store_.geometry_, store_.features_);
-        if (info.revision <= last) throw std::runtime_error("archive WAL revisions do not increase");
-        if (first == 0U) first = info.revision;
-        last = info.revision;
-        at += static_cast<std::size_t>(size);
-    }
+    SharedFileInput wal(wal_path);
+    wal.seekg(0, std::ios::end);
+    const auto measured = wal.tellg();
+    if (!wal || measured < 0) throw std::runtime_error("cannot measure archive WAL");
+    const auto info = InspectWalStream(wal, static_cast<std::uint64_t>(measured), store_.geometry_, coord,
+        store_.store_id_, store_.features_);
+    const auto [first, last, first_schema] = info;
     if (first == 0U) return {};
     const auto directory = store_.data_dir_ / kFeedArchiveDirName;
     if (!archive_dir_prepared_.load(std::memory_order_acquire)) {
@@ -659,23 +665,73 @@ std::filesystem::path FeedSlots::PrepareArchive(ChunkCoord coord) {
     }
     const auto stem = ChunkFileStem(coord, store_.geometry_.dims()) + "." + std::to_string(first);
     const auto base = directory / (stem + ".chk");
+    const auto descriptor_path = directory / ArchiveBaseFileName(coord, store_.geometry_.dims(), first);
     const auto image = ChunkDataPath(store_.data_dir_, store_.geometry_, coord);
-    if (!std::filesystem::exists(base) && std::filesystem::exists(image)) {
-        const auto state = ParseChunkImage(LoadChunkImageFile(image, store_.geometry_, coord,
-            store_.store_id_, store_.features_), store_.geometry_, coord, store_.store_id_, store_.features_);
-        // On retry a published image already contains this WAL. The original
-        // base was absent, so this newer image must never become its base.
-        if (state.revision < first) {
+    if (const auto existing = ReadFeedArchiveBaseDescriptor(descriptor_path, store_.geometry_, store_.store_id_, coord, first)) {
+        if (existing->base_schema > first_schema) throw std::runtime_error("archive base schema exceeds its first frame");
+        if (existing->kind == ArchiveBaseKind::kImage) {
+            (void)ReadPinnedFeedArchiveBase(base, store_.geometry_, store_.store_id_, coord, store_.features_, *existing);
+            SyncFilePath(base);
+        }
+        else if (std::filesystem::exists(base)) throw std::runtime_error("non-image archive base has an unexpected pinned image");
+        // A failed atomic rename can leave a visible descriptor whose
+        // directory sync is still owed. Repay it before replacing its base.
+        SyncFilePath(descriptor_path);
+        SyncDirectoryPath(directory);
+    } else {
+        ArchiveBaseDescriptor descriptor{.dims = store_.geometry_.dims(), .epoch = store_.store_id_,
+            .coord = coord, .first = first, .base_schema = first_schema};
+        std::optional<ChunkStateImage> original;
+        std::vector<std::uint8_t> original_bytes;
+        bool covered = false;
+        const bool pinned = std::filesystem::exists(base);
+        const auto source = pinned ? base : image;
+        if (std::filesystem::exists(source)) {
+            auto bytes = LoadChunkImageFile(source, store_.geometry_, coord, store_.store_id_, store_.features_);
+            auto state = ParseChunkImage(bytes, store_.geometry_, coord, store_.store_id_, store_.features_);
+            if (state.revision < first) { original = std::move(state); original_bytes = std::move(bytes); }
+            else covered = true;
+        }
+        if (pinned) {
+            if (!original || !std::filesystem::exists(image))
+                throw std::runtime_error("staged archive image has no original live image");
+            const auto current = LoadChunkImageFile(image, store_.geometry_, coord, store_.store_id_, store_.features_);
+            if (current != original_bytes)
+                throw std::runtime_error("staged archive image differs from the original live image");
+        }
+        const auto retained = store_.RetainedEmptyBoundaryForArchive(coord);
+        if (retained && retained->revision >= first) covered = true;
+        if (retained && retained->revision < first && (!original || retained->revision >= original->revision)) {
+            if (pinned) throw std::runtime_error("staged archive image precedes its retained empty base");
+            descriptor.kind = ArchiveBaseKind::kRetainedEmpty;
+            descriptor.base_revision = retained->revision;
+            descriptor.base_time_ms = retained->commit_time_ms;
+            descriptor.base_schema = retained->schema_version;
+        } else if (original) {
+            descriptor.kind = ArchiveBaseKind::kImage;
+            descriptor.base_revision = original->revision;
+            descriptor.base_time_ms = original->commit_time_ms;
+            descriptor.base_schema = original->schema_version;
+            descriptor.image_length = original_bytes.size();
+            descriptor.image_sha256 = crypto::Sha256Of(original_bytes);
+            if (!pinned) {
 #ifdef _WIN32
-            if (!CreateHardLinkW(base.c_str(), image.c_str(), nullptr))
-                throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "archive base hard link");
+                if (!CreateHardLinkW(base.c_str(), image.c_str(), nullptr))
+                    throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "archive base hard link");
 #else
-            if (::link(image.c_str(), base.c_str()) != 0)
-                throw std::system_error(errno, std::generic_category(), "archive base hard link");
+                if (::link(image.c_str(), base.c_str()) != 0)
+                    throw std::system_error(errno, std::generic_category(), "archive base hard link");
 #endif
+            }
+            (void)ReadPinnedFeedArchiveBase(base, store_.geometry_, store_.store_id_, coord, store_.features_, descriptor);
             SyncFilePath(base);
             SyncDirectoryPath(directory);
+        } else if (covered || pinned) {
+            throw std::runtime_error("original archive base is missing after its WAL was covered");
         }
+        if (descriptor.base_schema > first_schema) throw std::runtime_error("archive base schema exceeds its first frame");
+        AtomicWrite(descriptor_path, SerializeArchiveBaseDescriptor(descriptor, kMaxChunkImageFileBytes), true, true,
+            nullptr, "CHUNKDB_FAILPOINT_FEED_BASE_AFTER_RENAME_ONCE");
     }
     SyncFilePath(wal_path);
     SyncDirectoryPath(wal_path.parent_path());

@@ -40,7 +40,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         return false;
     }
     RequireVarWrite(chunk->vars, var_update, chunk_columns ? chunk_columns->variable_bytes : 0U,
-        chunk->chunk_columns ? chunk->chunk_columns->variable_bytes : 0U);
+        chunk->written && chunk->chunk_columns ? chunk->chunk_columns->variable_bytes : 0U);
     RequirePendingFits(new_payload, new_presence);
     // A WAL whose failed write or transaction could not be repaired takes
     // nothing more until a restart repairs it.
@@ -486,8 +486,8 @@ ChunkMutationResult ChunkStore::WriteChunkState(const ChunkCoord& chunk_coord, C
     }
     RequireVarWrite(regular_chunk->vars, var_update,
         state.chunk_columns ? state.chunk_columns->variable_bytes : 0U,
-        regular_chunk->chunk_columns ? regular_chunk->chunk_columns->variable_bytes : 0U);
-    if (expected_version.has_value() || geometry_.has_chunk_column_history() || !regular_chunk->written) {
+        regular_chunk->written && regular_chunk->chunk_columns ? regular_chunk->chunk_columns->variable_bytes : 0U);
+    if (expected_version.has_value() || if_absent || geometry_.has_chunk_column_history() || !regular_chunk->written) {
         // As CHUNKPUT IF: the conditional write path (docs/DURABILITY_CONTRACT.md).
         (void)ApplyFullChunkStateLocked(
             chunk_coord,
@@ -504,6 +504,32 @@ ChunkMutationResult ChunkStore::WriteChunkState(const ChunkCoord& chunk_coord, C
         std::move(state.presence_bitmap),
         std::move(var_update));
     return ChunkMutationResult{.ok = true, .version = version};
+}
+
+ChunkMutationResult ChunkStore::TransformChunkState(const ChunkCoord& coord,
+    std::optional<std::uint64_t> expected_version, bool if_absent,
+    const std::function<void(ChunkState&)>& transform) {
+    if (access_mode_ == AccessMode::kReadOnly) throw std::invalid_argument("store is read-only");
+    if (!transform) throw std::invalid_argument("chunk transformation must be present");
+    ThrowIfDurabilityPoisoned();
+    const auto chunk = GetOrLoadRegularChunk(coord);
+    std::unique_lock lock(chunk->mutex);
+    if (expected_version && chunk->version != *expected_version)
+        return {.ok = false, .version = chunk->version};
+    if (if_absent && ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get()))
+        return {.ok = false, .version = chunk->version};
+    ChunkState next{.version = chunk->version, .payload = chunk->payload,
+        .presence_bitmap = chunk->presence_bitmap, .vars = chunk->vars, .written = chunk->written,
+        .commit_time_ms = chunk->commit_time_ms, .chunk_columns = chunk->chunk_columns};
+    if (!chunk->written && geometry_.chunk_columns_require_initialization()) next.chunk_columns.reset();
+    transform(next);
+    PrepareTxnChunkState(next, chunk->vars, chunk->written ? chunk->chunk_columns.get() : nullptr);
+    if (geometry_.chunk_schema().columns.empty()) next.chunk_columns.reset();
+    VarUpdate variables;
+    if (next.vars.Encode() != chunk->vars.Encode()) variables.replace = std::move(next.vars);
+    (void)ApplyFullChunkStateLocked(coord, chunk, std::move(next.payload), std::move(next.presence_bitmap),
+        std::move(variables), std::move(next.chunk_columns), true);
+    return {.ok = true, .version = chunk->version};
 }
 
 }  // namespace chunkdb

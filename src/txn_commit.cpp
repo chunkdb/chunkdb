@@ -485,7 +485,7 @@ std::uint64_t ChunkStore::CommitTransaction(
         replace.replace = state.vars;
         try {
             RequireVarWrite(target.chunk->vars, replace, state.chunk_columns ? state.chunk_columns->variable_bytes : 0U,
-                target.chunk->chunk_columns ? target.chunk->chunk_columns->variable_bytes : 0U);
+                target.chunk->written && target.chunk->chunk_columns ? target.chunk->chunk_columns->variable_bytes : 0U);
         } catch (const std::invalid_argument&) {
             end_snapshot.Disarm();
             throw;

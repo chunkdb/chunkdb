@@ -299,6 +299,34 @@ struct ChunkState {
     std::shared_ptr<const ChunkColumnState> chunk_columns{};
 };
 
+struct ChunkIdentityScanEntry {
+    ChunkCoord coord{};
+    std::uint64_t version = 0U;
+    std::uint64_t commit_time_ms = 0U;
+    // Present only for populated entries when the scan requests data.
+    std::optional<ChunkState> data{};
+};
+
+struct ChunkIdentityScanPage {
+    std::vector<ChunkIdentityScanEntry> entries;
+    bool has_more = false;
+    // A read-only process cannot establish the writer's completed frontier.
+    std::optional<std::uint64_t> position;
+    std::uint64_t retained_deletion_floor = 0U;
+};
+
+class TombstoneHistoryLostError : public std::invalid_argument {
+  public:
+    TombstoneHistoryLostError(std::uint64_t floor, std::optional<std::uint64_t> position = {})
+        : std::invalid_argument("requested revision is below the retained deletion floor"),
+          floor_(floor), position_(position) {}
+    [[nodiscard]] std::uint64_t retained_deletion_floor() const noexcept { return floor_; }
+    [[nodiscard]] std::optional<std::uint64_t> position() const noexcept { return position_; }
+  private:
+    std::uint64_t floor_;
+    std::optional<std::uint64_t> position_;
+};
+
 // A block and its producing chunk version, captured under one read boundary.
 struct BlockReadMetadata {
     std::optional<std::uint64_t> version;
@@ -569,6 +597,9 @@ class ChunkStore {
         bool has_cursor,
         ChunkCoord cursor,
         std::size_t limit);
+    [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentities(
+        bool has_cursor, ChunkCoord cursor, std::size_t limit,
+        std::optional<std::uint64_t> since = {}, bool with_data = false);
     // With `with_vars`, each entry carries its text and bytes values, and
     // they count toward the response-byte limit.
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange(
@@ -623,6 +654,11 @@ class ChunkStore {
     [[nodiscard]] ChunkMutationResult WriteChunkState(
         const ChunkCoord& chunk_coord, ChunkState state,
         std::optional<std::uint64_t> expected_version, bool if_absent = false);
+    // The callback edits an isolated copy under the chunk's exclusive lock.
+    // It must not reenter this store, and is not called after a failed condition.
+    [[nodiscard]] ChunkMutationResult TransformChunkState(
+        const ChunkCoord& chunk_coord, std::optional<std::uint64_t> expected_version,
+        bool if_absent, const std::function<void(ChunkState&)>& transform);
 
     // Committed chunk versions are producing commit revisions, ordered only
     // within this store_id. Their reservation ceiling survives restart.
@@ -1353,14 +1389,14 @@ class ChunkStore {
         const ChunkCoord& chunk_coord,
         ChunkRangeEntry* out,
         bool with_vars,
-        const TxnSnapshot* snapshot = nullptr);
+        const TxnSnapshot* snapshot = nullptr, bool include_empty = false, bool identity_only = false);
     // `vars_problem` receives WalReplayResult::vars_problem (empty when the
     // values are consistent).
     [[nodiscard]] bool ReadPopulatedChunkStateFromDisk(
         const ChunkCoord& chunk_coord,
         ChunkRangeEntry* out,
         bool with_vars,
-        std::string* vars_problem);
+        std::string* vars_problem, bool include_empty = false, bool identity_only = false);
     // Feeds `candidates` from both sources — on-disk artifacts and the
     // resident cache — visiting large chunks in scan order so the cursor and
     // the page window prune both.

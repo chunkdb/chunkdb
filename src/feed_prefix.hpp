@@ -12,6 +12,7 @@
 #include "chunkdb/types.hpp"
 #include "feature_flags.hpp"
 #include "wal_replay.hpp"
+#include "populated_index_format.hpp"
 
 namespace chunkdb {
 class Geometry;
@@ -28,6 +29,7 @@ struct FeedWalPrefixTestAccess {
 struct FeedWalPrefix {
     ChunkCoord coord;
     std::uint64_t first = 0, last = 0, limit = 0;
+    std::optional<ChunkIndexRecord> retained_empty{};
 };
 
 // Tracks complete appended frame boundaries, not durability. Capture is always
