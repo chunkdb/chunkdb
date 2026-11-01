@@ -3,15 +3,12 @@
 #include <algorithm>
 #include <charconv>
 #include <limits>
-#include <fstream>
 #include <map>
-#include <cstring>
 
 #include "change_feed.hpp"
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/file_layout.hpp"
-#include "chunkdb/crc32.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
@@ -203,56 +200,54 @@ bool FeedSlots::active() const noexcept { return store_.feed_slots_active_.load(
 bool FeedSlots::ArchiveRequired() const noexcept {
     return active() || readers_->load(std::memory_order_acquire) != 0U;
 }
-void FeedSlots::RecoverAliases() {
-    for (const auto& segment : Segments(store_.data_dir_, store_.geometry_.dims())) {
-        const auto live = ChunkWalPath(store_.data_dir_, store_.geometry_, segment.coord);
-        if (!std::filesystem::exists(live)) continue;
-        if (!std::filesystem::equivalent(live, segment.wal)) {
-            std::ifstream file(live, std::ios::binary);
-            if (!file) throw std::runtime_error("cannot inspect live archive segment " + live.string());
-            const auto live_bytes = LoadFile(live);
-            if (live_bytes.size() >= ChunkWalHeaderBytes(store_.geometry_.dims()) + kWalFrameFixedHeaderSize) {
-                ValidateWalHeader(live_bytes, segment.coord, store_.store_id_, store_.features_, store_.geometry_.dims());
-                const auto at = ChunkWalHeaderBytes(store_.geometry_.dims());
-                const std::uint64_t header_size = kWalFrameFixedHeaderSize + static_cast<std::uint64_t>(ReadLe16(live_bytes, at + 22U)) + kWalFrameHeaderCrcSize;
-                const std::uint64_t size = header_size + ReadLe32(live_bytes, at + 28U) + kWalFrameTrailerSize;
-                // Trust a revision only after both checksums prove a complete
-                // first frame. Incomplete/cut first appends remain under the
-                // ordinary recovery parser's crash-tail policy.
-                if (size > live_bytes.size() - at ||
-                    std::memcmp(live_bytes.data() + at, kWalFrameMagic, kWalFrameMagicSize) != 0 ||
-                    Crc32(live_bytes.data() + at + kWalFrameMagicSize, static_cast<std::size_t>(header_size) - kWalFrameMagicSize - kWalFrameHeaderCrcSize) !=
-                        ReadLe32(live_bytes, at + static_cast<std::size_t>(header_size) - kWalFrameHeaderCrcSize) ||
-                    Crc32(live_bytes.data() + at + static_cast<std::size_t>(header_size), ReadLe32(live_bytes, at + 28U)) !=
-                        ReadLe32(live_bytes, at + static_cast<std::size_t>(size) - kWalFrameTrailerSize)) continue;
-                const std::vector<std::uint8_t> frame(live_bytes.begin() + static_cast<std::ptrdiff_t>(at),
-                    live_bytes.begin() + static_cast<std::ptrdiff_t>(at + size));
-                if (InspectFeedFrame(frame, store_.geometry_, store_.features_).revision <= segment.last)
+void FeedSlots::ValidateRecoveryAliases(const ChunkStore& store) {
+    auto segments = Segments(store.data_dir(), store.geometry().dims());
+    std::sort(segments.begin(), segments.end(), [](const auto& first, const auto& second) {
+        return first.coord < second.coord || (first.coord == second.coord && first.first < second.first);
+    });
+    for (std::size_t i = 0U; i < segments.size(); ++i) {
+        const auto& segment = segments[i];
+        SharedFileInput file(segment.wal);
+        file.seekg(0, std::ios::end);
+        const auto measured = file.tellg();
+        if (!file || measured < 0) throw std::runtime_error("cannot measure aliased archive WAL");
+        const auto info = InspectWalStream(file, static_cast<std::uint64_t>(measured), store.geometry(), segment.coord,
+            store.store_id(), store.features());
+        if (info.first != segment.first || info.last != segment.last)
+            throw std::runtime_error("aliased archive WAL range disagrees with its name");
+        if (i != 0U && segments[i - 1U].coord == segment.coord && segments[i - 1U].last >= segment.first)
+            throw std::runtime_error("archived WAL ranges overlap");
+    }
+    for (std::size_t begin = 0U; begin < segments.size();) {
+        auto end = begin + 1U;
+        while (end < segments.size() && segments[end].coord == segments[begin].coord) ++end;
+        const auto live = ChunkWalPath(store.data_dir(), store.geometry(), segments[begin].coord);
+        if (std::filesystem::exists(live)) {
+            bool alias = false;
+            for (auto at = begin; at < end; ++at)
+                if (std::filesystem::equivalent(live, segments[at].wal)) { alias = true; break; }
+            if (!alias) {
+                SharedFileInput file(live);
+                file.seekg(0, std::ios::end);
+                const auto measured = file.tellg();
+                if (!file || measured < 0) throw std::runtime_error("cannot inspect live archive segment " + live.string());
+                const auto first = InspectFirstWalFrameStream(file, static_cast<std::uint64_t>(measured), store.geometry(),
+                    segments[begin].coord, store.store_id(), store.features());
+                if (first && first->revision <= segments[end - 1U].last)
                     throw std::runtime_error("independent live WAL overlaps an archived segment");
             }
-            continue;
         }
-        // A power loss during the cross-directory rename may preserve both
-        // hard-linked names. Validate the immutable archive's declared range
-        // before dropping the live alias; an append must never modify it.
-        const auto bytes = LoadFile(segment.wal);
-        ValidateWalHeader(bytes, segment.coord, store_.store_id_, store_.features_, store_.geometry_.dims());
-        std::uint64_t first = 0U, last = 0U;
-        for (std::size_t at = ChunkWalHeaderBytes(store_.geometry_.dims()); at < bytes.size();) {
-            if (bytes.size() - at < kWalFrameFixedHeaderSize) throw std::runtime_error("partial aliased archive WAL");
-            const std::uint64_t size = kWalFrameFixedHeaderSize + static_cast<std::uint64_t>(ReadLe16(bytes, at + 22U)) +
-                kWalFrameHeaderCrcSize + ReadLe32(bytes, at + 28U) + kWalFrameTrailerSize;
-            if (size > bytes.size() - at) throw std::runtime_error("partial aliased archive WAL");
-            const std::vector<std::uint8_t> frame(bytes.begin() + static_cast<std::ptrdiff_t>(at),
-                bytes.begin() + static_cast<std::ptrdiff_t>(at + size));
-            const auto info = InspectFeedFrame(frame, store_.geometry_, store_.features_);
-            if (info.revision <= last) throw std::runtime_error("aliased archive WAL revisions do not increase");
-            if (first == 0U) first = info.revision;
-            last = info.revision;
-            at += static_cast<std::size_t>(size);
-        }
-        if (first != segment.first || last != segment.last)
-            throw std::runtime_error("aliased archive WAL range disagrees with its name");
+        begin = end;
+    }
+}
+
+void FeedSlots::RecoverAliases() {
+    ValidateRecoveryAliases(store_);
+    for (const auto& segment : Segments(store_.data_dir_, store_.geometry_.dims())) {
+        const auto live = ChunkWalPath(store_.data_dir_, store_.geometry_, segment.coord);
+        if (!std::filesystem::exists(live) || !std::filesystem::equivalent(live, segment.wal)) continue;
+        // Complete admission precedes every removal, including when one live
+        // name aliases an earlier member of a multi-segment archive.
         ChunkStore::SnapshotGenerationWriteGuard generation(&store_);
         std::filesystem::remove(live);
         SyncDirectoryPath(live.parent_path());

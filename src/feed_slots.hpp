@@ -41,6 +41,8 @@ struct FeedSlotAckState {
 class FeedSlots {
   public:
     FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::milliseconds interval);
+    // Read-only admission before rollback/tail repair or alias removal.
+    static void ValidateRecoveryAliases(const ChunkStore& store);
     ~FeedSlots();
     void Start(std::shared_ptr<ChangeFeed> feed);
     void Stop();
