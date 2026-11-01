@@ -1013,7 +1013,7 @@ void TestScriptedWatch(const std::string& start, bool start_fails, bool run_fail
         { Owner metadata{accept_peer()}; read(metadata.fd, "HELLO 3"); send_reply(metadata.fd, hello);
           read(metadata.fd, "DESCRIBE default"); send_reply(metadata.fd,
             "%3\r\n$7\r\nversion\r\n:1\r\n$5\r\nchunk\r\n*2\r\n:1\r\n:1\r\n$7\r\ncolumns\r\n*1\r\n"
-            "%2\r\n$4\r\nname\r\n$4\r\nbits\r\n$4\r\ntype\r\n$7\r\nbits(8)\r\n"); }
+            "%3\r\n$2\r\nid\r\n:1\r\n$4\r\nname\r\n$4\r\nbits\r\n$4\r\ntype\r\n$7\r\nbits(8)\r\n"); }
         if (takeover) {
             const std::string epoch(32, 'a');
             const std::string initial = "%2\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n$8\r\nrevision\r\n:0\r\n";

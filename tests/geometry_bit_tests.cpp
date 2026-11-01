@@ -74,15 +74,20 @@ int main() {
         const std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes());
         const std::vector<std::uint8_t> presence(chunkdb::ChunkPresenceBitmapBytes(geometry));
         chunkdb::StoreId id{}; id[0] = 1;
-        ExpectThrows<std::invalid_argument>([&] {
-            (void)chunkdb::SerializeChunkImage(geometry, {0, 0, 0}, payload, presence,
-                                             chunkdb::CheckpointCompression::kNone, 1, 1, id);
-        });
+        const auto image = chunkdb::SerializeChunkImage(geometry, {0, 0, 0}, payload, presence,
+            chunkdb::CheckpointCompression::kNone, 1U, 1U, id);
+        const auto decoded = chunkdb::ParseChunkImage(image, geometry, {0, 0, 0}, id,
+            {.incompat = chunkdb::kFeatureChunkModel});
+        assert(decoded.payload == payload && decoded.presence_bitmap == presence && decoded.revision == 1U);
         ExpectThrows<std::invalid_argument>([&] { (void)chunkdb::BuildWalHeader({0, 0, 1}, id, {}); });
         chunkdb::StoreManifest manifest;
         manifest.geometry = config;
         manifest.schema = chunkdb::SingleBitsColumnSchema(config.block_bits);
         manifest.store_id = id;
+        const auto manifest_bytes = chunkdb::SerializeStoreManifest(manifest);
+        const auto decoded_manifest = chunkdb::ParseStoreManifest(manifest_bytes);
+        assert(chunkdb::SameGeometry(decoded_manifest.geometry, config));
+        manifest.features = {};
         ExpectThrows<std::invalid_argument>([&] { (void)chunkdb::SerializeStoreManifest(manifest); });
         auto different_depth = config;
         ++different_depth.chunk_depth_blocks;
@@ -185,9 +190,7 @@ int main() {
         chunkdb::test::ScopedTempDir temp("geometry-admission");
         chunkdb::StoreConfig config;
         config.data_dir = temp.path() / "new";
-        config.geometry.dims = 3;
-        config.geometry.chunk_depth_blocks = 4;
-        config.geometry.large_chunk_depth_chunks = 2;
+        config.geometry.dims = 4;
         ExpectThrows<std::invalid_argument>([&] { chunkdb::ChunkStore store(config); });
         assert(!std::filesystem::exists(config.data_dir));
         config.geometry = {};
@@ -199,7 +202,8 @@ int main() {
         const auto before = SnapshotFiles(config.data_dir);
         assert(!before.empty());
         config.geometry.dims = 3;
-        ExpectThrows<std::invalid_argument>([&] { chunkdb::ChunkStore store(config); });
+        config.geometry_fields = chunkdb::kGeometryDimensions;
+        ExpectThrows<std::runtime_error>([&] { chunkdb::ChunkStore store(config); });
         assert(SnapshotFiles(config.data_dir) == before);
     }
     {
