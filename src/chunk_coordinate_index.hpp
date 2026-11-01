@@ -85,6 +85,7 @@ class ChunkCoordinateIndex {
     [[nodiscard]] bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
     [[nodiscard]] bool has_written_identities() const noexcept { return any_written_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t inventory_generation() const noexcept { return inventory_generation_.load(std::memory_order_acquire); }
+    [[nodiscard]] std::uint64_t tombstone_count() const;
     void PublishTombstone(const ChunkIndexRecord& record);
     void Compact(std::uint64_t before, std::uint64_t completed_frontier);
 
