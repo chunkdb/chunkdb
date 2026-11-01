@@ -128,6 +128,9 @@ add_library(chunkdb_core STATIC
     src/txn_block_memory.cpp
     src/txn_block_deltas.cpp
     src/chunk_storage_allocator.cpp
+    src/txn_original_variables.cpp
+    src/txn_retained_state.cpp
+    src/txn_block_stage.cpp
     src/txn_history.cpp
     src/txn_intent.cpp
     src/version_clock.cpp
@@ -814,6 +817,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_chunk_storage_allocator_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME chunk_storage_allocator COMMAND chunkdb_chunk_storage_allocator_test)
     set_tests_properties(chunk_storage_allocator PROPERTIES TIMEOUT 60 LABELS "smoke")
+    add_executable(chunkdb_txn_block_stage_test tests/txn_block_stage_tests.cpp)
+    target_link_libraries(chunkdb_txn_block_stage_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_txn_block_stage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME txn_block_stage COMMAND chunkdb_txn_block_stage_test)
+    set_tests_properties(txn_block_stage PROPERTIES TIMEOUT 60 LABELS "smoke")
     if(MINGW)
         # PMR allocation calls and the test's aligned replacements must share one runtime.
         foreach(guard IN ITEMS commit_group_format feed_alias_recovery table_tombstones wal_group_frame)
@@ -824,6 +832,7 @@ if(CHUNKDB_BUILD_TESTS)
         # Allocation guard replacements share the C++ runtime with the library.
         target_link_options(chunkdb_txn_block_deltas_test PRIVATE -static-libgcc -static-libstdc++)
         target_link_options(chunkdb_txn_block_snapshot_test PRIVATE -static-libgcc -static-libstdc++)
+        target_link_options(chunkdb_txn_block_stage_test PRIVATE -static-libgcc -static-libstdc++)
     endif()
 
     add_executable(chunkdb_txn_commit_test tests/txn_commit_tests.cpp)
@@ -1043,6 +1052,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_txn_block_deltas_test
         chunkdb_txn_block_snapshot_test
         chunkdb_chunk_storage_allocator_test
+        chunkdb_txn_block_stage_test
         chunkdb_txn_commit_test
         chunkdb_txn_crash_test
         chunkdb_txn_kill_test
@@ -1176,6 +1186,7 @@ if(CHUNKDB_BUILD_TESTS)
         txn_block_deltas
         txn_block_snapshot
         chunk_storage_allocator
+        txn_block_stage
         txn_commit
         txn_kill
         txn_concurrency
