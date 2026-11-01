@@ -14,7 +14,8 @@ Temporary names use a reserved private prefix and one generated nonce, with excl
 Only the checked root and page kinds are supported by this foundation; other reference kinds refuse rather than becoming opaque admitted payloads.
 
 Read-only opening pins the actual root directory and refuses a symbolic link or reparse point at that leaf.
-A writer additionally borrows an existing exclusive ProcessLock for its entire lifetime and verifies that the lock's native file identity is the `writer.lock` admitted below that pinned root.
+A writer additionally borrows an existing exclusive ProcessLock for its entire lifetime and verifies both its admitted canonical directory and the native identity of `root/.chunkdb.lock/writer.lock` against that lock.
+The fixed `.chunkdb.lock` directory is itself opened relative to the pinned root with no-follow directory admission; matching a lock-file hard link under a different root is insufficient.
 A lock for another directory, a missing lock, read-only access or an incompatible shared-writer context cannot create an artifact writer.
 A minimal friend declaration permits this identity comparison without changing ProcessLock fields, ordinary locking or ordinary request paths.
 The caller retains the real lock until all artifact writers are destroyed; the foundation neither takes over nor releases that lock.
