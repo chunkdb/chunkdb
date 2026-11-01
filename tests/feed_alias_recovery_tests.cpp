@@ -216,6 +216,45 @@ void InteriorFirstFrameDamage() {
         Refuse([&] { (void)InspectFirstWalFrameStream(stream, bytes.size(), geometry, {0, 0}, epoch, features); });
     }
 }
+
+void PartialExtentMatchesReplayPolicy() {
+    const Geometry geometry({2U, 2U, 2U, 1U, 8U});
+    const StoreId epoch{1U};
+    const ChunkCoord coord{0, 0};
+    const FeatureFlags features{.incompat = kFeatureChunkModel};
+    const auto header = BuildWalHeader(coord, epoch, features);
+    Bytes frame;
+    WalFrameBuilder builder(&frame, 1U);
+    const Bytes state{7U, 0U, 1U};
+    builder.AppendSpan(0U, state.data(), state.size());
+    (void)builder.Finish(7U, 70U);
+    for (const bool partial_header : {false, true}) {
+        auto first = frame;
+        if (partial_header) {
+            first[22U] = 0U; first[23U] = 1U; // A cut 256-byte TLV area.
+        } else {
+            for (unsigned i = 0U; i < 4U; ++i) first[28U + i] = i == 1U ? 1U : 0U;
+            const auto crc = Crc32(first.data() + kWalFrameMagicSize, kWalFrameFixedHeaderSize - kWalFrameMagicSize);
+            for (unsigned i = 0U; i < 4U; ++i)
+                first[kWalFrameFixedHeaderSize + i] = static_cast<std::uint8_t>(crc >> (8U * i));
+        }
+        auto bytes = header;
+        bytes.insert(bytes.end(), first.begin(), first.end());
+        bytes.insert(bytes.end(), frame.begin(), frame.end());
+        std::istringstream inspect_stream(std::string(bytes.begin(), bytes.end()), std::ios::binary);
+        assert(!InspectFirstWalFrameStream(inspect_stream, bytes.size(), geometry, coord, epoch, features));
+        for (const bool stream : {false, true}) {
+            Bytes payload, presence(ChunkPresenceBitmapBytes(geometry), 0U);
+            ChunkVars vars;
+            std::istringstream input(std::string(bytes.begin(), bytes.end()), std::ios::binary);
+            const auto result = stream ? ReplayWalStream(input, bytes.size(), geometry, coord, epoch, features,
+                0U, 0U, &payload, &presence, &vars) : ReplayWal(bytes, geometry, coord, epoch, features,
+                0U, 0U, &payload, &presence, &vars);
+            assert(result.replayable && result.applied_frames == 0U && result.stopped_at_crash_tail);
+            assert(result.stop_reason == (partial_header ? "partial_frame_header" : "partial_frame_body"));
+        }
+    }
+}
 }
 
 int main(int argc, char** argv) {
@@ -224,10 +263,12 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--first-frame") { FirstFrameAdmission(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--multiple") { MultipleArchivesAdmittedBeforeCleanup(false); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--interior") { InteriorFirstFrameDamage(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--partial-extent") { PartialExtentMatchesReplayPolicy(); return 0; }
     BoundedReopen(false); BoundedReopen(true);
     RefusedAliasPreservesBothNames(false); RefusedAliasPreservesBothNames(true);
     FirstFrameAdmission();
     MultipleArchivesAdmittedBeforeCleanup(false); MultipleArchivesAdmittedBeforeCleanup(true);
     InteriorFirstFrameDamage();
-    std::cout << "8 bounded archive alias recovery groups passed\n";
+    PartialExtentMatchesReplayPolicy();
+    std::cout << "9 bounded archive alias recovery groups passed\n";
 }
