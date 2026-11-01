@@ -38,7 +38,7 @@ void RequireDescriptor(const ArchiveBaseDescriptor& descriptor, std::uint64_t ma
         default:
             throw std::invalid_argument("unknown archive base kind");
     }
-    if (descriptor.image_length != 0 || descriptor.image_crc32 != 0)
+    if (descriptor.image_length != 0 || descriptor.image_sha256 != crypto::Sha256Digest{})
         throw std::invalid_argument("non-image archive base contains image fields");
 }
 
@@ -58,9 +58,9 @@ std::vector<std::uint8_t> SerializeArchiveBaseDescriptor(
     const ArchiveBaseDescriptor& descriptor, std::uint64_t max_image_bytes) {
     RequireDescriptor(descriptor, max_image_bytes);
     std::vector<std::uint8_t> bytes;
-    bytes.reserve(72U + 8U * descriptor.dims);
+    bytes.reserve(ArchiveBaseDescriptorBytes(descriptor.dims));
     bytes.insert(bytes.end(), {'C', 'K', 'F', 'B'});
-    WriteLe(&bytes, 1, 2);
+    WriteLe(&bytes, 2, 2);
     bytes.push_back(descriptor.dims);
     bytes.push_back(static_cast<std::uint8_t>(descriptor.kind));
     bytes.insert(bytes.end(), descriptor.epoch.begin(), descriptor.epoch.end());
@@ -72,7 +72,7 @@ std::vector<std::uint8_t> SerializeArchiveBaseDescriptor(
     WriteLe(&bytes, descriptor.base_time_ms, 8);
     WriteLe(&bytes, descriptor.base_schema, 8);
     WriteLe(&bytes, descriptor.image_length, 8);
-    WriteLe(&bytes, descriptor.image_crc32, 4);
+    bytes.insert(bytes.end(), descriptor.image_sha256.begin(), descriptor.image_sha256.end());
     WriteLe(&bytes, Crc32(bytes), 4);
     return bytes;
 }
@@ -81,10 +81,10 @@ ArchiveBaseDescriptor ParseArchiveBaseDescriptor(
     std::span<const std::uint8_t> bytes, std::uint8_t dims, const StoreId& epoch,
     const ChunkCoord& coord, std::uint64_t first, std::uint64_t max_image_bytes) {
     RequireCoord(dims, coord);
-    if (bytes.size() != 72U + 8U * dims) throw std::invalid_argument("archive base descriptor has wrong length");
+    if (bytes.size() != ArchiveBaseDescriptorBytes(dims)) throw std::invalid_argument("archive base descriptor has wrong length");
     if (bytes[0] != 'C' || bytes[1] != 'K' || bytes[2] != 'F' || bytes[3] != 'B')
         throw std::invalid_argument("not a CKFB archive base");
-    if (ReadLe(bytes.data() + 4, 2) != 1) throw std::invalid_argument("unsupported archive base version");
+    if (ReadLe(bytes.data() + 4, 2) != 2) throw std::invalid_argument("unsupported archive base version");
     if (bytes[6] != dims) throw std::invalid_argument("archive base dimensions differ from table");
     if (ReadLe(bytes.data() + bytes.size() - 4U, 4) != Crc32(bytes.data(), bytes.size() - 4U))
         throw std::invalid_argument("archive base checksum mismatch");
@@ -103,8 +103,9 @@ ArchiveBaseDescriptor ParseArchiveBaseDescriptor(
         .base_time_ms = ReadLe(bytes.data() + fields + 16U, 8),
         .base_schema = ReadLe(bytes.data() + fields + 24U, 8),
         .image_length = ReadLe(bytes.data() + fields + 32U, 8),
-        .image_crc32 = static_cast<std::uint32_t>(ReadLe(bytes.data() + fields + 40U, 4)),
     };
+    std::copy_n(bytes.begin() + static_cast<std::ptrdiff_t>(fields + 40U), descriptor.image_sha256.size(),
+        descriptor.image_sha256.begin());
     if (descriptor.first != first) throw std::invalid_argument("archive base belongs to another segment");
     RequireDescriptor(descriptor, max_image_bytes);
     return descriptor;
@@ -119,8 +120,8 @@ void ValidatePinnedArchiveBaseImage(
         image.revision != descriptor.base_revision || image.commit_time_ms != descriptor.base_time_ms ||
         image.schema_version != descriptor.base_schema)
         throw std::invalid_argument("pinned archive base image identity mismatch");
-    if (bytes.size() != descriptor.image_length || Crc32(bytes.data(), bytes.size()) != descriptor.image_crc32)
-        throw std::invalid_argument("pinned archive base image length or checksum mismatch");
+    if (bytes.size() != descriptor.image_length || crypto::Sha256Of(bytes) != descriptor.image_sha256)
+        throw std::invalid_argument("pinned archive base image length or digest mismatch");
 }
 
 std::string ArchiveBaseFileName(const ChunkCoord& coord, std::uint8_t dims, std::uint64_t first) {
