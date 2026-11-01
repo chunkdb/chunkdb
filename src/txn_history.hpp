@@ -204,6 +204,8 @@ inline constexpr std::string_view kTxnIntentSuffix = ".rollback";
 
 [[nodiscard]] std::vector<std::uint8_t> SerializeTxnIntent(
     const TxnIntent& intent, std::uint8_t dims, const StoreId& table_id);
+[[nodiscard]] std::vector<std::uint8_t> SerializeTxnIntent(
+    const TxnIntent& intent, std::uint8_t dims, const StoreId& table_id, std::size_t written_chunk_limit);
 // False for anything but a well-formed record.
 [[nodiscard]] bool TryParseTxnIntent(const std::vector<std::uint8_t>& bytes, TxnIntent* out,
     std::uint8_t dims, const StoreId& table_id);
