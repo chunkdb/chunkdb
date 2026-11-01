@@ -62,6 +62,12 @@ An ACTIVE owner never reverts, including after its last group retires, and a mis
 A failed activation publishes no grouped frame; an uncertain ACTIVE publication fences the coordinator until checked admission resolves it.
 This is a once-per-directory boundary and adds no sync or journal lookup to unused ordinary writes.
 
+Each feature-owned table manifest binds its directory identity, stable owner identity and standalone-or-catalog role independently of whether a GROUP frame remains in its WAL.
+A standalone binding names its own root; a catalog binding requires the matching checked directory owner context injected before store admission.
+Opening a catalog-owned table in isolation, including read-only open, refuses without that context and never bootstraps a local standalone owner.
+Creation and ENABLE FEATURE publish this immutable scope with their checked manifest decision; backup preserves it as source context, restore rewrites it for the destination, and offline verification checks it against its admitted directory owner.
+No scope contains a filesystem path supplied by persisted group metadata.
+
 When the owner is ACTIVE, startup enumerates every managed table's WAL namespace, including canonical orphan coordinates not yet represented by the live coordinate index.
 It also enumerates the history-only epochs admitted by the selected owner roots and refuses an unclaimed owned epoch rather than repairing it independently.
 It streams every complete available WAL frame to collect group identities, claimed counts, actual ordinals, table contexts and first group offsets before a table constructor can trim anything.
@@ -75,6 +81,21 @@ Its first frame on every discovered coordinate is a rollback boundary, and the c
 A valid header with no preceding producing frame is an unwritten base; retaining that header after rollback does not invent a producing identity.
 All found members, overlapping later groups and their transitive rollback cuts are gathered and validated before any truncation, orphan cleanup or archive-alias normalization.
 A crash after different-table member appends but before decision append therefore cannot leave one table repaired while another still exposes the group.
+
+## Relaxed publication and durable metadata cuts
+
+Selected owner, journal, reference and ID roots describe durable metadata checkpoints, not every live relaxed decision.
+After initial ACTIVE admission, a relaxed group reserves its in-memory dependency, producer, feed and ID ownership before appending frames, flushes the required user-space buffers and appends its checked decision without a mandatory root sync.
+Its logical states and prepared live references are published together under the short directory visibility gate while all validated member locks remain owned.
+The coordinator's admitted complete decision suffix and pinned native generations own these references until a later durable cut captures or retires them.
+Neither registering that live group nor retaining its volatile ID outcome forces a new owner or reference-root transition.
+
+Startup first admits selected durable roots, then streams the complete checked journal suffix and globally discovered WAL members into its private plan before reconstructing live references.
+An uncertified complete decision contributes only after its whole group passes admission; an absent or crash-shaped incomplete relaxed outcome instead removes its entire dependent live ownership through the global rollback plan.
+A newer lost or rolled-back ID incarnation leaves the retired earlier incarnation absent.
+Durable metadata cuts may include a relaxed decision without a member-durability receipt, so a retained reference alone is never a durable-member proof.
+Checkpoint coverage, member-durability promotion, journal-generation switching, ID retirement, lifecycle publication and destructive reclamation require their checked durable owner transition.
+Their publication certifies only the explicitly bound metadata or member proofs and does not incidentally promote unrelated relaxed groups.
 
 ## Relaxed anchors and dependency settlement
 
@@ -245,10 +266,12 @@ An expired, evicted or split binding remains absent even if its source seal is r
 ## Required failure checks
 
 Bootstrap tests crash around inactive-root name sync and CREATE or ENABLE FEATURE manifest publication, then verify that no table lease can observe a missing claimed owner.
+Scope tests checkpoint every grouped WAL away, then refuse isolated catalog-table open and a mismatching injected owner before any data read or repair.
 First-use tests hold a direct conditional table lease while catalog exclusive admission waits, activate through the independent owner root, and prove that no reverse catalog-lock acquisition occurs.
 Activation tests crash before and after ACTIVE publication and its directory sync, assert that no GROUP frame precedes confirmed activation, and retain lazy startup for an unused INACTIVE root.
 Concurrent checkpoint and ID-generation updates stage from the same root, then prove that only one pending continuation owns installation and the other re-admits rather than losing either leaf.
 Buffer tests retain real user-space buffered bytes, then require their flush before relaxed decision publication and their exact writable native generation during settlement after canonical replacement.
+Relaxed tests assert no per-group owner-root sync, reconstruct a complete suffix above its selected cut, and roll back a lost suffix without reviving an older retired ID.
 Discovery tests crash after different-table member appends and a newly orphaned coordinate but before any decision, then prove that all discovery and validation precedes every repair.
 Journal tests crash after selecting the new generation and before the ID cursor alias is installed, then require one matching context without reviving an expired or rolled-back incarnation.
 Checkpoint tests crash before and after staged-name sync, pending root, each artifact replacement, final root and reclamation, including a member superseded by an ordinary write before restart.
