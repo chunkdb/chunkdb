@@ -2,7 +2,7 @@
 
 This design specifies prepared physical block staging for [#136](https://github.com/chunkdb/chunkdb/issues/136).
 The initial implementation isolates allocation-aware variable storage; physical stage and history integration follow separately.
-It follows [block observations and deltas](TRANSACTION_BLOCK_DELTAS.md) and DESIGN-2.0 D2.
+It follows [block observations and deltas](TRANSACTION_BLOCK_DELTAS.md).
 It does not allocate revisions, append WAL, publish groups or activate session block deltas.
 
 ## Existing storage constraint
@@ -42,7 +42,7 @@ An ordinary copy selects an uncharged allocator, while physical staging uses an 
 Calls using `auto`, `data`, `size`, `capacity`, iteration and equality between encoded results retain their behavior.
 Source explicitly binding `const std::vector<std::uint8_t>&` or implicitly copying to `std::vector<std::uint8_t>` requires a change to the alias, a span or an iterator-range copy.
 Functions accepting the old exact vector type must accept a span or use an explicit copy.
-This is a source and ABI change to a development C++ API; exact old return-type compatibility cannot coexist with this representation and the stated pre-allocation accounting requirement.
+This is a C++ source and ABI change; exact old return-type compatibility cannot coexist with this representation and the stated pre-allocation accounting requirement.
 The core PR must report that consequence explicitly.
 `ChunkState` payload and presence vectors, public typed block APIs, wire formats and disk formats remain unchanged.
 No compatibility cache or unconditional encoded-data duplicate is introduced.
@@ -213,7 +213,7 @@ Each guard needs an isolated omission control whose corresponding regression fai
 ## Implementation boundaries
 
 The representation is allocator-aware mutable `ChunkVars`, a const-reference allocator-aware `EncodedStorage` accessor, propagating explicit staged policies and exact allocation prefixes.
-The exact old `Encode()` type cannot be kept safely, so the development API consequence is reported to core PR review without a misleading compatibility cache.
+The exact old `Encode()` type cannot be kept safely, so the C++ API consequence is reported to core PR review without a misleading compatibility cache.
 New primary storage leaves transaction accounting only after irreversible publication establishes its existing regular-storage owner.
 Retained history transfers continuously to the existing table history-byte policy and releases its transaction counter references.
 Unconditional full history preparation is limited to the standalone foundation; runtime activation requires the revision-aware admission protocol described above.
