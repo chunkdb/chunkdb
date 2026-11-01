@@ -317,7 +317,7 @@ Bytes AppendUncheckedImageVars(const Bytes& empty, std::span<const std::uint8_t>
     Le16(&bytes, 3U); Le16(&bytes, 0U);
     Le32(&bytes, static_cast<std::uint32_t>(section.size()));
     Le32(&bytes, static_cast<std::uint32_t>(section.size()));
-    Le32(&bytes, chunkdb::Crc32(section));
+    Le32(&bytes, chunkdb::Crc32(section.data(), section.size()));
     Le32(&bytes, chunkdb::Crc32(bytes));
     bytes.insert(bytes.end(), empty.begin() + directory_end + 4U, empty.end());
     bytes.insert(bytes.end(), section.begin(), section.end());
