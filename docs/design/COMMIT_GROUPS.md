@@ -2,6 +2,7 @@
 
 This contract covers [#136](https://github.com/chunkdb/chunkdb/issues/136) and builds on the [chunk model](CHUNK_MODEL.md).
 The user-visible guarantees are in [Durability](../DURABILITY_CONTRACT.md).
+The pure checked encodings are specified in [Commit group records](COMMIT_GROUP_FORMAT.md).
 
 ## Ownership and identities
 
