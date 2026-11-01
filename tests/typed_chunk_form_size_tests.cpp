@@ -33,6 +33,8 @@ void operator delete[](void* pointer) noexcept { ::operator delete(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
 void operator delete[](void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
 
+#include "aligned_allocation_replacement.hpp"
+
 namespace {
 using namespace chunkdb;
 using Bytes = std::vector<std::uint8_t>;
@@ -106,6 +108,10 @@ void RefusalPrecedesBodyAllocation() {
 }  // namespace
 
 int main() {
+    allocation::deny_large.store(true);
+    assert(aligned_allocation_test::Refused(65536U));
+    allocation::deny_large.store(false);
+    aligned_allocation_test::Succeeds(65536U);
     ExactSharedPlans();
     RefusalPrecedesBodyAllocation();
 }

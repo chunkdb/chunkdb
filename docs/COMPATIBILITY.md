@@ -71,6 +71,11 @@ An unsupported layout is refused, rather than converted in place.
 
 ## Boundaries
 
+The development C++ `ChunkVars::Encode()` accessor returns `const ChunkVars::EncodedStorage&`, an allocator-aware vector reference.
+Code using `auto` retains owning-copy, capacity and equality behavior.
+Code requiring `std::vector<std::uint8_t>` explicitly must use the alias, `EncodedBytes()` for a byte view, or an iterator-range copy.
+This representation change permits transaction storage allocations to be admitted before allocation; it does not change encoded bytes, protocol or storage formats.
+
 The durability modes and `FLUSH WAL` preserve their documented guarantees throughout 2.x.
 
 Supported native platforms are Linux, macOS, and Windows 10 or later.

@@ -353,5 +353,6 @@ void ResourceOwnershipCannotBeBorrowed() {
 }  // namespace
 
 int main() {
+    txn_block_allocation::CalibrateAligned();
     RowsPreserveRawBits(); JournalAndRebase(); Accounting(); FailedEditsAndLateConflict(); WideVariablesStayBorrowed(); InitializationAndDelete(); PreparedOwnershipMoves(); ResourceOwnershipCannotBeBorrowed();
 }

@@ -98,4 +98,7 @@ void EvictedHistoryRefuses() {
     Refuse([&] { (void)store.ReadBlockAtSnapshot(*snapshot, {}, 0U); });
 }
 }  // namespace
-int main() { SnapshotRowsAndHistory(); LargeFixedChunkDoesNotCopy(); EvictedHistoryRefuses(); }
+int main() {
+    txn_block_allocation::CalibrateAligned();
+    SnapshotRowsAndHistory(); LargeFixedChunkDoesNotCopy(); EvictedHistoryRefuses();
+}

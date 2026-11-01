@@ -37,3 +37,16 @@ void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
 void operator delete[](void* memory) noexcept { ::operator delete(memory); }
 void operator delete(void* memory, std::size_t) noexcept { ::operator delete(memory); }
 void operator delete[](void* memory, std::size_t) noexcept { ::operator delete(memory); }
+
+#include "aligned_allocation_replacement.hpp"
+
+namespace owner_artifact_allocation {
+inline void CalibrateAligned() {
+    {
+        Guard bounded(128U);
+        const auto before = denied.load();
+        assert(aligned_allocation_test::Refused(1024U) && denied.load() > before);
+    }
+    aligned_allocation_test::Succeeds(1024U);
+}
+}

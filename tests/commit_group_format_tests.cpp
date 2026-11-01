@@ -41,6 +41,8 @@ void operator delete[](void* pointer) noexcept { ::operator delete(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
 void operator delete[](void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
 
+#include "aligned_allocation_replacement.hpp"
+
 namespace {
 using namespace chunkdb;
 using Bytes = std::vector<std::uint8_t>;
@@ -247,5 +249,10 @@ void AllocationAndSparseHeader() {
 }  // namespace
 
 int main() {
+    allocation::limit = 128U; allocation::active = true;
+    assert(aligned_allocation_test::Refused(1024U));
+    allocation::active = false;
+    aligned_allocation_test::Succeeds(1024U);
+    allocation::limit = 65536U; allocation::largest = 0U;
     GoldenDecision(); MembersAndPresence(); ExactBindings(); JournalAndIdSnapshots(); AllocationAndSparseHeader();
 }
