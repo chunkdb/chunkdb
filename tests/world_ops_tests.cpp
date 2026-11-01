@@ -1097,6 +1097,7 @@ void TestZrleCodec() {
     };
     for (const auto& original : cases) {
         const auto compressed = chunkdb::ZrleCompress(original);
+        assert(chunkdb::ZrleCompressBytes(original) == compressed);
         const auto restored = chunkdb::ZrleDecompress(compressed, original.size());
         assert(restored == original);
     }
