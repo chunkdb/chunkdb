@@ -170,6 +170,8 @@ A chunk-column change contains the complete before and after rows, with a null b
 An empty chunk-column schema allocates and emits no chunk-column change rows.
 Block-column projections preserve the complete chunk-column row, and `NOBEFORE` removes both kinds of before rows.
 Chunk-form events carry checked forms with each chunk's producing revision and time, and use a null form only when neither present blocks nor non-default chunk columns remain.
+An ordinary first subscription may resume at the admitted live-history floor, including a completed scan position, without a refusal based only on whether another subscriber existed.
+Different epochs, positions below retained history, unissued future positions and capture loss retain their existing resync checks.
 
 ## Durable slot filters
 
