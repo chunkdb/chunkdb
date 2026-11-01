@@ -2,6 +2,8 @@
 #include <chrono>
 #include <cstdlib>
 #include <functional>
+#include <fstream>
+#include <iterator>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -9,7 +11,9 @@
 #include "chunk_store_internal.hpp"
 #include "checkpoint.hpp"
 #include "chunkdb/chunk_store.hpp"
+#include "chunkdb/file_layout.hpp"
 #include "store_manifest.hpp"
+#include "wal_writer.hpp"
 #include "test_utils.hpp"
 
 namespace {
@@ -69,6 +73,63 @@ void ExpectMetadata(const ChunkState& state, std::uint64_t owner, std::optional<
     assert(std::get<std::uint64_t>(values[0]) == owner);
     if (label) assert(std::get<std::string>(values[1]) == *label);
     else assert(std::holds_alternative<std::monostate>(values[1]));
+}
+
+void HeaderOnlyWalDoesNotInitializeMetadata() {
+    for (const bool three_dimensional : {false, true}) {
+        for (const bool required : {false, true}) {
+            for (const auto mode : {AccessMode::kReadWrite, AccessMode::kReadOnly}) {
+                test::ScopedTempDir directory("chunkdb-header-only-metadata");
+                auto config = Config(directory.path());
+                config.geometry.dims = three_dimensional ? 3U : 2U;
+                config.geometry.chunk_depth_blocks = three_dimensional ? 2U : 1U;
+                config.geometry.large_chunk_depth_chunks = three_dimensional ? 2U : 1U;
+                if (!required) {
+                    config.chunk_schema->columns[0].has_default = true;
+                    config.chunk_schema->columns[0].default_value = {7U};
+                }
+                const ChunkCoord coordinate{-1, 2, three_dimensional ? -3 : 0};
+                std::filesystem::path path;
+                std::vector<std::uint8_t> header;
+                {
+                    ChunkStore store(config);
+                    path = ChunkWalPath(directory.path(), store.geometry(), coordinate);
+                    header = BuildWalHeader(coordinate, store.store_id(), store.features(), store.geometry().dims());
+                }
+                std::filesystem::create_directories(path.parent_path());
+                {
+                    std::ofstream output(path, std::ios::binary);
+                    output.write(reinterpret_cast<const char*>(header.data()), static_cast<std::streamsize>(header.size()));
+                    output.close();
+                    assert(output.good());
+                }
+                config.access_mode = mode;
+                ChunkStore reader(config);
+                const auto frontier = reader.CompletedRevision();
+                if (mode == AccessMode::kReadWrite) {
+                    auto snapshot = reader.BeginTxnSnapshot(std::chrono::seconds(30));
+                    const auto range = three_dimensional ?
+                        reader.ReadChunkRange3DAt(*snapshot, -1, 2, -3, -1, 2, -3, true) :
+                        reader.ReadChunkRangeAt(*snapshot, -1, 2, -1, 2, true);
+                    assert(range.empty());
+                }
+                const auto state = reader.ReadChunkState(coordinate);
+                assert(!state.written && state.version == 0U && state.commit_time_ms == 0U);
+                assert(!state.chunk_columns);
+                assert(reader.CompletedRevision() == frontier);
+                if (three_dimensional) {
+                    const auto block = reader.GetBlockWithVersion3D(-4, 8, -6);
+                    assert(!block.values && !block.version);
+                } else {
+                    const auto block = reader.GetBlockWithVersion(-4, 8);
+                    assert(!block.values && !block.version);
+                }
+                std::ifstream input(path, std::ios::binary);
+                const std::vector<std::uint8_t> actual(std::istreambuf_iterator<char>{input}, {});
+                assert(actual == header);
+            }
+        }
+    }
 }
 
 void MetadataSurvivesWalImageEvictionAndRefresh() {
@@ -202,6 +263,7 @@ void ColdPopulationUsesTheTranslatedMetadataBaseline() {
 }
 
 int main() {
+    HeaderOnlyWalDoesNotInitializeMetadata();
     MetadataSurvivesWalImageEvictionAndRefresh();
     CombinedQuotaAllowsShrinkingAfterLimitReduction();
     TransactionPublishesMetadataRowsTogether();

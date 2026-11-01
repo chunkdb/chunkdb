@@ -366,7 +366,7 @@ void VerifyChunkArtifacts(const std::filesystem::path& root, const chunkdb::Geom
                     return;
                 }
                 if (replay.applied_frames != 0U) { revision = replay.revision; time = replay.commit_time_ms; }
-                schema = geometry.layout().schema().version;
+                if (revision != 0U) schema = geometry.layout().schema().version;
             }
         }
         chunkdb::BringChunkColumnsToSchema(geometry, schema, geometry.chunk_schema().version, &columns);

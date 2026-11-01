@@ -124,6 +124,24 @@ struct Fixture {
     }
 };
 
+void HeaderOnlyWalMetadata() {
+    for (const auto dims : {std::uint8_t{2}, std::uint8_t{3}}) {
+        for (const bool required : {false, true}) {
+            Fixture fixture(dims, true);
+            if (!required) {
+                auto& owner = fixture.manifest.chunk_schema->columns.front();
+                owner.has_default = true;
+                owner.default_value = {7U};
+                fixture.geometry = Geometry(fixture.config, fixture.manifest.schema, *fixture.manifest.chunk_schema);
+                Save(StoreManifestPath(fixture.root), SerializeStoreManifest(fixture.manifest));
+            }
+            Save(ChunkWalPath(fixture.root, fixture.geometry, fixture.Coord()),
+                BuildWalHeader(fixture.Coord(), fixture.manifest.store_id, fixture.manifest.features, dims));
+            fixture.Check();
+        }
+    }
+}
+
 void CanonicalPaths() {
     for (const auto dims : {std::uint8_t{2}, std::uint8_t{3}}) {
         Fixture fixture(dims);
@@ -382,6 +400,7 @@ int main(int argc, char** argv) {
         if (argc == 1 || (argc == 2 && name == argv[1])) test();
     };
     run("paths", CanonicalPaths); run("index", InventoryAndCommittedCuts);
+    run("header-only", HeaderOnlyWalMetadata);
     run("retained", RetainedOverlapAndResurrection); run("unlisted", UnlistedAndForgetBindings);
     run("compaction", CompactionDecisions); run("bindings", CheckedBindings); run("archive", ArchiveDescriptors);
     run("rollback", RollbackVisibility);

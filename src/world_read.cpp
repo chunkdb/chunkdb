@@ -472,7 +472,8 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
                 *input, static_cast<std::uint64_t>(measured), geometry_, chunk_coord, store_id_, features_, base_revision, schema_version, &payload,
                 &presence, &vars, nullptr, &chunk_columns, {}, commit_time_ms, retained ?
                     std::optional{WalKnownIdentity{retained->revision, retained->commit_time_ms}} : std::nullopt);
-            schema_version = geometry_.layout().schema().version;
+            if (revision != 0U || replay.applied_frames != 0U)
+                schema_version = geometry_.layout().schema().version;
             if (replay.applied_frames > 0) {
                 revision = replay.revision;
                 commit_time_ms = replay.commit_time_ms;
