@@ -220,12 +220,19 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
     const ChunkCoord& chunk_coord,
     ChunkRangeEntry* out,
     bool with_vars,
-    const TxnSnapshot* snapshot) {
-    const auto copy_cached = [with_vars](const RegularChunk& chunk, ChunkRangeEntry* entry) {
-        entry->payload = chunk.payload;
-        entry->presence_bitmap = chunk.presence_bitmap;
+    const TxnSnapshot* snapshot, bool include_empty, bool identity_only) {
+    const auto include_cached = [&](const RegularChunk& chunk) {
+        return include_empty ? chunk.written : ChunkPopulated(geometry_, chunk.presence_bitmap, chunk.chunk_columns.get());
+    };
+    const auto copy_cached = [&, with_vars](const RegularChunk& chunk, ChunkRangeEntry* entry) {
         entry->version = chunk.version;
         entry->commit_time_ms = chunk.commit_time_ms;
+        if (identity_only || (include_empty && !ChunkPopulated(geometry_, chunk.presence_bitmap, chunk.chunk_columns.get()))) {
+            entry->payload.clear(); entry->presence_bitmap.clear(); entry->vars = {}; entry->chunk_columns.reset();
+            return;
+        }
+        entry->payload = chunk.payload;
+        entry->presence_bitmap = chunk.presence_bitmap;
         entry->chunk_columns = chunk.chunk_columns;
         if (with_vars) {
             entry->vars = chunk.vars;
@@ -238,11 +245,11 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
         // does not hold, so an area or a scan over empty chunks does not fill
         // the cache.
         if (TryGetLoadedChunk(chunk_coord) == nullptr) {
-            return ReadPopulatedChunkStateFromDisk(chunk_coord, out, with_vars, nullptr);
+            return ReadPopulatedChunkStateFromDisk(chunk_coord, out, with_vars, nullptr, include_empty, identity_only);
         }
         const auto chunk = GetOrLoadRegularChunk(chunk_coord);
         std::shared_lock lock(chunk->mutex);
-        if (!ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get())) {
+        if (!include_cached(*chunk)) {
             return false;
         }
         if (out != nullptr) {
@@ -281,7 +288,7 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
                 return finish_snapshot_read();
             }
             std::shared_lock lock(loaded->mutex);
-            if (!ChunkPopulated(geometry_, loaded->presence_bitmap, loaded->chunk_columns.get())) {
+            if (!include_cached(*loaded)) {
                 return false;
             }
             if (out != nullptr) {
@@ -311,7 +318,7 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
             target->version = 0;
             target->vars = ChunkVars{};
         }
-        const bool populated = ReadPopulatedChunkStateFromDisk(chunk_coord, target, with_vars, &vars_problem);
+        const bool populated = ReadPopulatedChunkStateFromDisk(chunk_coord, target, with_vars, &vars_problem, include_empty, identity_only);
         if (TryGetLoadedChunk(chunk_coord) == nullptr &&
             eviction_removals_.load(std::memory_order_acquire) == eviction_removals_before) {
             if (!vars_problem.empty()) {
@@ -349,7 +356,7 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
         return finish_snapshot_read();
     }
     std::shared_lock lock(regular_chunk->mutex);
-    if (!ChunkPopulated(geometry_, regular_chunk->presence_bitmap, regular_chunk->chunk_columns.get())) {
+    if (!include_cached(*regular_chunk)) {
         return false;
     }
     if (out != nullptr) {
@@ -362,7 +369,7 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
     const ChunkCoord& chunk_coord,
     ChunkRangeEntry* out,
     bool with_vars,
-    std::string* vars_problem) {
+    std::string* vars_problem, bool include_empty, bool identity_only) {
     if (access_mode_ == AccessMode::kReadOnly) {
         // A writer in another process changes these files at any time: only
         // the snapshot-bracketed load pairs an image and a WAL that existed
@@ -370,10 +377,17 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         auto loaded = LoadChunkPayload(chunk_coord);
         BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);
         BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
-        if (!ChunkPopulated(geometry_, loaded.presence_bitmap, loaded.chunk_columns.get())) {
+        const bool populated = ChunkPopulated(geometry_, loaded.presence_bitmap, loaded.chunk_columns.get());
+        if (include_empty ? loaded.revision == 0U : !populated) {
             return false;
         }
         if (out != nullptr) {
+            out->version = loaded.revision;
+            out->commit_time_ms = loaded.commit_time_ms;
+            if (identity_only || (include_empty && !populated)) {
+                out->payload.clear(); out->presence_bitmap.clear(); out->vars = {}; out->chunk_columns.reset();
+                return true;
+            }
             out->payload = std::move(loaded.payload);
             out->presence_bitmap = std::move(loaded.presence_bitmap);
             out->version = loaded.revision;
@@ -431,8 +445,9 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         }
     }
 
-    if (const auto boundary = coordinate_index_->EmptyBoundary(chunk_coord)) {
-        (void)ApplyRetainedEmptyBase(geometry_, *boundary, revision, commit_time_ms, schema_version,
+    const auto retained = coordinate_index_->EmptyBoundary(chunk_coord);
+    if (retained) {
+        (void)ApplyRetainedEmptyBase(geometry_, *retained, revision, commit_time_ms, schema_version,
             payload, presence, vars, chunk_columns);
         base_revision = revision;
     }
@@ -470,12 +485,23 @@ bool ChunkStore::ReadPopulatedChunkStateFromDisk(
         }
     }
 
+    if (retained && retained->kind == ChunkIndexKind::kForget && revision == retained->revision) {
+        revision = 0U;
+        commit_time_ms = 0U;
+    }
     BringChunkColumnsToSchema(geometry_, schema_version, geometry_.chunk_schema().version, &chunk_columns);
     BringToCurrentSchema(geometry_, schema_version, presence, &payload, &vars);
-    if (!ChunkPopulated(geometry_, presence, chunk_columns.get())) {
+    const bool populated = ChunkPopulated(geometry_, presence, chunk_columns.get());
+    if (include_empty ? revision == 0U : !populated) {
         return false;
     }
     if (out != nullptr) {
+        out->version = revision;
+        out->commit_time_ms = commit_time_ms;
+        if (identity_only || (include_empty && !populated)) {
+            out->payload.clear(); out->presence_bitmap.clear(); out->vars = {}; out->chunk_columns.reset();
+            return true;
+        }
         out->payload = std::move(payload);
         out->presence_bitmap = std::move(presence);
         out->version = revision;
