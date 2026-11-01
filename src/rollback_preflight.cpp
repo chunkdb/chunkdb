@@ -1,27 +1,35 @@
 #include "chunk_store_internal.hpp"
 
 #include <stdexcept>
+#include <limits>
 
 #include "chunk_coordinate_index.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "shared_file_input.hpp"
+#include "txn_intent_format.hpp"
 #include "wal_replay.hpp"
 
 namespace chunkdb {
 
-std::vector<std::uint8_t> LoadRecoveryTxnIntent(const std::filesystem::path& path) {
+std::vector<std::uint8_t> LoadRecoveryTxnIntent(const std::filesystem::path& path,
+    std::uint8_t expected_dims, const StoreId& expected_table_id) {
     SharedFileInput input(path);
     input.seekg(0, std::ios::end);
     const auto extent = input.tellg();
-    constexpr auto maximum = 40U + kMaxTxnWrittenChunks * 32U;
-    if (extent < 0 || static_cast<std::uint64_t>(extent) > maximum)
-        throw std::runtime_error("transaction intent exceeds its bounded record size: " + path.string());
+    if (extent < 0 || static_cast<std::uint64_t>(extent) > std::numeric_limits<std::size_t>::max() ||
+        static_cast<std::uint64_t>(extent) > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
+        throw std::runtime_error("transaction intent extent is not representable: " + path.string());
+    input.seekg(0);
+    if (!input) throw std::runtime_error("failed to rewind transaction intent: " + path.string());
+    ValidateCheckedTxnIntentStream(input, static_cast<std::uint64_t>(extent), expected_dims, expected_table_id);
+    input.clear();
     input.seekg(0);
     if (!input) throw std::runtime_error("failed to rewind transaction intent: " + path.string());
     std::vector<std::uint8_t> bytes(static_cast<std::size_t>(extent));
     input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     if (input.gcount() != static_cast<std::streamsize>(bytes.size()) || input.peek() != std::char_traits<char>::eof())
         throw std::runtime_error("transaction intent changed while being read: " + path.string());
+    ValidateCheckedTxnIntent(bytes, expected_dims, expected_table_id);
     return bytes;
 }
 

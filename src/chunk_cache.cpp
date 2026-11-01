@@ -283,6 +283,9 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 [this, chunk_coord](const std::filesystem::path& path) {
                     return LoadChunkImageFile(path, geometry_, chunk_coord, store_id_, features_);
                 },
+                [this](const std::filesystem::path& path) {
+                    return LoadRecoveryTxnIntent(path, geometry_.dims(), store_id_);
+                },
                 [this](
                     std::size_t collection,
                     ReadOnlySnapshotArtifact artifact) {

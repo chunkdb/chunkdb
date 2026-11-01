@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <cstddef>
@@ -12,10 +13,12 @@
 #include "verify.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "chunkdb/crc32.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
 #include "wal_writer.hpp"
+#include "txn_intent_format.hpp"
 
 namespace allocation {
 std::atomic<bool> measuring{false};
@@ -65,9 +68,52 @@ auto Snapshot(const std::filesystem::path& root) {
         if (file.is_regular_file()) files.emplace(file.path(), LoadFile(file.path()));
     return files;
 }
+
+void IntentBodiesAreAdmittedBeforeAllocation() {
+    test::ScopedTempDir directory("chunkdb-intent-memory");
+    const auto path = directory.path() / "intent";
+    const StoreId owner{1U}, foreign{2U};
+    TxnIntent intent{.version = 100U, .entries = {}};
+    constexpr std::size_t count = 131073U;
+    for (std::size_t i = 0U; i < count; ++i)
+        intent.entries.push_back({{static_cast<std::int64_t>(i), 0, -1}, 0U});
+    const auto valid = SerializeCheckedTxnIntent(intent, 3U, owner, count);
+    Save(path, valid);
+    const auto refuses_without_body = [&](std::uint8_t dims, const StoreId& epoch, const char* reason) {
+        assert(allocation::live.load(std::memory_order_relaxed) == 0U);
+        allocation::peak.store(0U, std::memory_order_relaxed);
+        allocation::measuring.store(true, std::memory_order_relaxed);
+        bool refused = false;
+        try { (void)LoadRecoveryTxnIntent(path, dims, epoch); }
+        catch (const std::invalid_argument& error) {
+            refused = std::string_view(error.what()).find(reason) != std::string_view::npos;
+        }
+        allocation::measuring.store(false, std::memory_order_relaxed);
+        assert(refused);
+        assert(allocation::peak.load(std::memory_order_relaxed) < 128U * 1024U);
+        assert(allocation::live.load(std::memory_order_relaxed) == 0U);
+    };
+    refuses_without_body(3U, foreign, "another table");
+    refuses_without_body(2U, owner, "dimensions differ");
+    auto corrupted = valid; corrupted.back() ^= 1U;
+    Save(path, corrupted);
+    refuses_without_body(3U, owner, "checksum mismatch");
+    auto forged = valid;
+    for (unsigned i = 0U; i < 4U; ++i) forged[32U + i] = 0xFFU;
+    Save(path, forged);
+    refuses_without_body(3U, owner, "wrong length");
+    auto unordered = valid;
+    std::copy_n(unordered.begin() + 36U, 24U, unordered.begin() + 68U);
+    const auto checksum = Crc32(unordered.data(), unordered.size() - 4U);
+    for (unsigned i = 0U; i < 4U; ++i)
+        unordered[unordered.size() - 4U + i] = static_cast<std::uint8_t>(checksum >> (8U * i));
+    Save(path, unordered);
+    refuses_without_body(3U, owner, "unique and increasing");
+}
 }
 
 int main() {
+    IntentBodiesAreAdmittedBeforeAllocation();
     test::ScopedTempDir directory("chunkdb-verify-memory");
     const auto root = directory.path() / "tables/t";
     const Geometry geometry({2U, 2U, 256U, 256U, 8U});

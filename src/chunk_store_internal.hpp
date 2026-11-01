@@ -19,8 +19,9 @@
 namespace chunkdb {
 struct ChunkIndexRecord;
 
-// The dimensional CKTI envelope has at most kMaxTxnWrittenChunks members.
-[[nodiscard]] std::vector<std::uint8_t> LoadRecoveryTxnIntent(const std::filesystem::path& path);
+// Admit expected ownership and complete streamed shape before allocating bytes.
+[[nodiscard]] std::vector<std::uint8_t> LoadRecoveryTxnIntent(const std::filesystem::path& path,
+    std::uint8_t expected_dims, const StoreId& expected_table_id);
 
 void ValidateRollbackWalBoundary(const std::filesystem::path& data_dir, const Geometry& geometry,
     const StoreId& table_id, FeatureFlags features, const ChunkCoord& coord, std::uint64_t boundary,
