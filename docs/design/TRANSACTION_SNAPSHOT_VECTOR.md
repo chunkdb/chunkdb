@@ -31,6 +31,9 @@ Rights are checked for the statement and again for each written table at commit.
 Commit takes shared feature metadata admission and the catalog operations mutex before checking identities and acquiring all touched table leases in epoch order.
 DDL also takes shared feature admission, so that gate alone cannot exclude a SWAP that pauses one table while waiting for another table's active leases.
 The operations mutex covers the entire lease cohort and is released before loading chunks, taking chunk locks or performing group I/O.
+The operations owner provides a condition-based deadline and cancellation wait, rather than polling a mutex or adding a sleep.
+The existing single-table lease path remains unchanged; group admission uses a separate deadline-aware lease overload while a table is temporarily busy.
+An empty cohort, missing original owner, duplicate epoch or expired admission is refused before returning any lease.
 It validates every touched identity before preparing a group and takes chunk locks in epoch and coordinate order.
 An identity or read conflict cannot commit a subset of tables.
 
