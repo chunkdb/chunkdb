@@ -651,6 +651,36 @@ void StagingCleanupAliasReplacement() {
     assert(LoadFile(retained / "keep") == std::vector<std::uint8_t>{'s'});
 }
 
+void StagingCleanupRootReplacement() {
+#ifdef _WIN32
+    ScopedTempDir temp("chunkdb-backup-staging-cleanup-root");
+    const auto root = std::filesystem::canonical(temp.path());
+    const auto source = root / "source";
+    const auto staging = source / kBackupStagingName;
+    const auto identity = NewStoreId();
+    const auto name = StoreIdHex(identity) + "." + StoreIdHex(NewStoreId());
+    const auto retained = root / "retained";
+    const auto outside = root / "outside";
+    SaveBytes(staging / name / "keep", {'s'});
+    SaveBytes(outside / name / "keep", {'o'});
+    bool attempted = false, replaced = false;
+    struct ResetLog { ~ResetLog() { ResetLogSinkForTests(); } } reset;
+    SetLogSinkForTests([&](const std::string& line) {
+        if (!attempted && line.find("removing interrupted backup staging") != std::string::npos) {
+            attempted = true;
+            std::error_code error;
+            std::filesystem::rename(staging, retained, error);
+            if (!error) { test::CreateDirectoryAlias(outside, staging); replaced = true; }
+        }
+    });
+    RemoveOrphanedBackupStaging(source, identity);
+    ResetLogSinkForTests();
+    assert(attempted);
+    assert(LoadFile(outside / name / "keep") == std::vector<std::uint8_t>{'o'});
+    if (replaced) assert(LoadFile(retained / name / "keep") == std::vector<std::uint8_t>{'s'});
+#endif
+}
+
 void OrphanedStagingCleanup() {
     ScopedTempDir temp("chunkdb-backup-orphaned-staging");
     const auto root = std::filesystem::canonical(temp.path());
@@ -1017,7 +1047,7 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-collision-regression") { StagingCollisionRetainsExistingEntry(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-owner-regression") { StagingOwnerValidation(); return 0; }
-    if (argc == 2 && std::string_view(argv[1]) == "--staging-cleanup-alias") { StagingCleanupAliasReplacement(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--staging-cleanup-alias") { StagingCleanupAliasReplacement(); StagingCleanupRootReplacement(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--orphaned-staging") { OrphanedStagingCleanup(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--path-regressions") { TargetComponentReplacement(); StagingOwnerValidation(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); return 0; }
     TargetComponentReplacement(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded();
@@ -1031,7 +1061,7 @@ int main(int argc, char** argv) {
     PlainWriterBounds(true); PlainWriterBounds(false); EndedFeedDoesNotClearNewProducers();
     BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); DroppedSnapshotTableSkipped();
     PerTableDdlProgress(); ColdPinAndStagingAlias(); ColdTailRepairPreservesPinnedInode();
-    ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); OrphanedStagingCleanup(); StagingOwnerValidation(); StagingCleanupAliasReplacement();
+    ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); OrphanedStagingCleanup(); StagingOwnerValidation(); StagingCleanupAliasReplacement(); StagingCleanupRootReplacement();
     CrcChunks();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint}) { CutAndProgress(mode); AcknowledgedLoad(mode); }
     CopyReleasesHoldsAndBusy(); TargetAndCancellation(); CompletionAndPoison(); FailedGenerationAndEmptyCatalog(); CancelCatalogWaitAndRestrictions();
