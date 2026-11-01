@@ -2,6 +2,7 @@
 #include <cassert>
 #include <chrono>
 #include <condition_variable>
+#include <cstdlib>
 #include <fstream>
 #include <future>
 #include <mutex>
@@ -25,6 +26,7 @@
 #include "wal_replay.hpp"
 #include "verify.hpp"
 #include "directory_alias_test_utils.hpp"
+#include "backup_windows_path.hpp"
 
 namespace chunkdb {
 struct BackupTestAccess {
@@ -709,6 +711,14 @@ void OrphanedStagingCleanup() {
     assert(std::filesystem::exists(published / kBackupMarkerName) && std::filesystem::exists(guarded / kBackupIncompleteName));
 }
 void TargetComponentReplacement() {
+    const std::wstring long_name = L"C:\\root\\" + std::wstring(300U, L'x');
+    const auto extended = L"\\\\?\\" + long_name;
+    assert(BackupWindowsApiName(extended, true) == extended);
+    assert(BackupWindowsApiName(long_name, false) == extended);
+    assert(BackupWindowsComparisonName(extended) == long_name);
+    assert(BackupWindowsApiName(L"\\\\?\\C:\\short", true) == L"\\\\?\\C:\\short");
+    assert(BackupWindowsApiName(L"\\\\?\\C:\\short", false) == L"C:\\short");
+    assert(BackupWindowsApiName(L"\\\\?\\UNC\\server\\share\\folder", true) == L"\\\\?\\UNC\\server\\share\\folder");
     ScopedTempDir temp("chunkdb-backup-path-races");
     const auto root = std::filesystem::canonical(temp.path());
     const auto source = root / "source";
@@ -744,6 +754,27 @@ void TargetComponentReplacement() {
         assert(std::filesystem::is_empty(outside));
         assert(!error.empty());
     }
+    const auto base = root / "before-admission";
+    const auto component = base / "component";
+    const auto outside = root / "outside-admission";
+    std::filesystem::create_directories(component);
+    std::filesystem::create_directory(outside);
+    TableCatalog catalog(Config(root / "catalog"));
+    const auto target = ResolveBackupTarget(base, "component/new/backup");
+    std::filesystem::rename(component, base / "retained");
+    test::CreateDirectoryAlias(outside, component);
+    const auto error = Error([&] { (void)catalog.BackupTo(target, {}); });
+    assert(!error.empty() && std::filesystem::is_empty(outside));
+    const auto inner_base = root / "inside-resolution";
+    const auto inner_component = inner_base / "component";
+    const auto other_inside = inner_base / "other";
+    std::filesystem::create_directories(inner_component);
+    std::filesystem::create_directory(other_inside);
+    Replace during_resolution(inner_component, inner_base / "retained", other_inside,
+        BackupTestHook::Point::kAfterTargetValidation);
+    const auto inner_target = ResolveBackupTarget(inner_base, "component/new/backup", &during_resolution);
+    const auto inner_error = Error([&] { (void)catalog.BackupTo(inner_target, {}); });
+    assert(!inner_error.empty() && std::filesystem::is_empty(other_inside));
 }
 void PathDurabilityFailuresRemainGuarded() {
 #ifdef __APPLE__
@@ -947,6 +978,10 @@ void CancelCatalogWaitAndRestrictions() {
 }
 }
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    _set_error_mode(_OUT_TO_STDERR);
+#endif
     if (argc == 2 && std::string_view(argv[1]) == "--batched-eviction") { BatchedEvictionDuringPin(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--waiting-maintenance") { WaitingBackupDefersCheckpoints(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--dropped-table") { DroppedSnapshotTableSkipped(); return 0; }

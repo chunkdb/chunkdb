@@ -1,4 +1,5 @@
 #include "backup.hpp"
+#include "backup_windows_path.hpp"
 #include "migrations_records.hpp"
 
 #include <algorithm>
@@ -18,6 +19,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <system_error>
 
 #include "checkpoint.hpp"
 #include "file_permissions.hpp"
@@ -45,21 +47,40 @@ void RequirePath(const std::filesystem::path& path) {
         throw std::invalid_argument("backup path contains a NUL byte");
 }
 void SafeDescendants(const std::filesystem::path& root, const std::filesystem::path& relative) {
-    auto at = std::filesystem::weakly_canonical(root);
+    auto at = CanonicalBackupPath(root);
     for (const auto& part : relative) {
         at /= part;
+#ifdef _WIN32
+        const auto attributes = GetFileAttributesW(at.c_str());
+        if (attributes == INVALID_FILE_ATTRIBUTES) {
+            const auto error = GetLastError();
+            if (error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND)
+                throw std::filesystem::filesystem_error("cannot inspect backup path", at,
+                    std::error_code(static_cast<int>(error), std::system_category()));
+        } else if ((attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) {
+            throw std::invalid_argument("backup target must not contain reparse points below --backup-dir: " + at.string());
+        }
+#else
         std::error_code error;
         const auto status = std::filesystem::symlink_status(at, error);
         if (error && error != std::errc::no_such_file_or_directory)
             throw std::filesystem::filesystem_error("cannot inspect backup path", at, error);
         if (status.type() == std::filesystem::file_type::symlink)
             throw std::invalid_argument("backup target must not contain symlinks below --backup-dir: " + at.string());
+#endif
     }
 }
 bool Within(const std::filesystem::path& path, const std::filesystem::path& root) {
-    auto p = path.begin();
-    for (auto r = root.begin(); r != root.end(); ++r, ++p)
-        if (p == path.end() || *p != *r) return false;
+#ifdef _WIN32
+    const std::filesystem::path compared_path(BackupWindowsComparisonName(path.native()));
+    const std::filesystem::path compared_root(BackupWindowsComparisonName(root.native()));
+#else
+    const auto& compared_path = path;
+    const auto& compared_root = root;
+#endif
+    auto p = compared_path.begin();
+    for (auto r = compared_root.begin(); r != compared_root.end(); ++r, ++p)
+        if (p == compared_path.end() || *p != *r) return false;
     return true;
 }
 void RequireRelative(const std::filesystem::path& path) {
@@ -516,11 +537,22 @@ bool IsOwnedBackupStaging(const std::filesystem::path& staging, const StoreId& d
     const auto name = staging.filename().string();
     const auto nonce = StagingNonce(name, data_dir_id);
     if (nonce.empty() || std::all_of(data_dir_id.begin(), data_dir_id.end(), [](auto b) { return b == 0U; })) return false;
+#ifdef _WIN32
+    const auto attributes = GetFileAttributesW(staging.c_str());
+    if (attributes == INVALID_FILE_ATTRIBUTES) {
+        const auto error = GetLastError();
+        if (error == ERROR_FILE_NOT_FOUND || error == ERROR_PATH_NOT_FOUND) return false;
+        throw std::filesystem::filesystem_error("cannot inspect backup staging", staging,
+            std::error_code(static_cast<int>(error), std::system_category()));
+    }
+    if ((attributes & FILE_ATTRIBUTE_DIRECTORY) == 0U || (attributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U) return false;
+#else
     std::error_code error;
     const auto directory = std::filesystem::symlink_status(staging, error);
     if (error && error != std::errc::no_such_file_or_directory)
         throw std::filesystem::filesystem_error("cannot inspect backup staging", staging, error);
     if (directory.type() != std::filesystem::file_type::directory) return false;
+#endif
     // Creation itself records ownership, including a crash before the guard.
     return true;
 }
@@ -577,7 +609,54 @@ void RemoveOrphanedBackupStaging(const std::filesystem::path& data_dir, const St
     }
 }
 
-std::filesystem::path ResolveBackupTarget(const std::filesystem::path& directory, const std::filesystem::path& requested) {
+std::filesystem::path CanonicalBackupPath(const std::filesystem::path& path) {
+    RequirePath(path);
+#ifdef _WIN32
+    auto ancestor = std::filesystem::absolute(path).lexically_normal();
+    std::vector<std::filesystem::path> suffix;
+    for (;;) {
+        const auto handle = CreateFileW(ancestor.c_str(), FILE_READ_ATTRIBUTES,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+        if (handle == INVALID_HANDLE_VALUE) {
+            const auto error = GetLastError();
+            const auto parent = ancestor.parent_path();
+            if ((error != ERROR_FILE_NOT_FOUND && error != ERROR_PATH_NOT_FOUND) || parent == ancestor)
+                throw std::filesystem::filesystem_error("cannot resolve backup path", ancestor,
+                    std::error_code(static_cast<int>(error), std::system_category()));
+            suffix.push_back(ancestor.filename());
+            ancestor = parent;
+            continue;
+        }
+        struct Close {
+            HANDLE handle;
+            ~Close() { CloseHandle(handle); }
+        } close{handle};
+        const auto required = GetFinalPathNameByHandleW(handle, nullptr, 0U, FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (required == 0U)
+            throw std::filesystem::filesystem_error("cannot resolve backup path", ancestor,
+                std::error_code(static_cast<int>(GetLastError()), std::system_category()));
+        if (required == std::numeric_limits<DWORD>::max()) throw std::length_error("resolved backup path is too long");
+        std::wstring native(static_cast<std::size_t>(required) + 1U, L'\0');
+        const auto length = GetFinalPathNameByHandleW(handle, native.data(), static_cast<DWORD>(native.size()),
+            FILE_NAME_NORMALIZED | VOLUME_NAME_DOS);
+        if (length == 0U)
+            throw std::filesystem::filesystem_error("cannot resolve backup path", ancestor,
+                std::error_code(static_cast<int>(GetLastError()), std::system_category()));
+        if (length >= native.size()) throw std::runtime_error("backup path changed while resolving its name");
+        native.resize(length);
+        std::filesystem::path resolved(BackupWindowsComparisonName(native));
+        for (auto part = suffix.rbegin(); part != suffix.rend(); ++part) resolved /= *part;
+        return std::filesystem::path(BackupWindowsApiName(resolved.lexically_normal().native(),
+            path.native().starts_with(L"\\\\?\\")));
+    }
+#else
+    return std::filesystem::weakly_canonical(path);
+#endif
+}
+
+std::filesystem::path ResolveBackupTarget(const std::filesystem::path& directory, const std::filesystem::path& requested,
+    BackupTestHook* hook) {
     if (directory.empty()) throw std::invalid_argument("BACKUP requires --backup-dir; set --backup-dir to a backup directory");
     RequirePath(directory); RequirePath(requested);
     if (requested.empty() || requested.is_absolute() || requested.has_root_path() ||
@@ -587,16 +666,19 @@ std::filesystem::path ResolveBackupTarget(const std::filesystem::path& directory
         if (part == "..") throw std::invalid_argument("BACKUP TO must not contain '..' components");
     const auto relative = requested.lexically_normal();
     if (relative == ".") throw std::invalid_argument("BACKUP TO requires a backup name");
-    const auto root = std::filesystem::weakly_canonical(directory);
+    const auto root = CanonicalBackupPath(directory);
     SafeDescendants(root, relative);
-    const auto target = std::filesystem::weakly_canonical(root / relative);
+    if (hook) hook->Run(BackupTestHook::Point::kAfterTargetValidation, {}, 0U);
+    // Keep descendant names for the later no-follow pin; resolving again
+    // could erase a junction inserted after SafeDescendants inspected it.
+    const auto target = (root / relative).lexically_normal();
     if (!Within(target, root) || target == root) throw std::invalid_argument("backup destination escapes --backup-dir");
     return target;
 }
 void RequireBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target) {
     if (target.empty()) throw std::invalid_argument("backup target is empty");
     RequirePath(source); RequirePath(target);
-    const auto source_path = std::filesystem::weakly_canonical(source), target_path = std::filesystem::weakly_canonical(target);
+    const auto source_path = CanonicalBackupPath(source), target_path = CanonicalBackupPath(target);
     if (Within(source_path, target_path) || Within(target_path, source_path)) throw std::invalid_argument("backup and source directories overlap");
     if (Present(target) && (!std::filesystem::is_directory(target) || !std::filesystem::is_empty(target)))
         throw std::invalid_argument("backup destination must be absent or empty");

@@ -1,6 +1,8 @@
 #include <iostream>
 #include <stop_token>
 #include "backup_restore_test_utils.hpp"
+
+#include <cstdlib>
 #include "slot_watch.hpp"
 #include "txn_test_utils.hpp"
 #include "directory_alias_test_utils.hpp"
@@ -417,8 +419,34 @@ void ReparseInventoryAndRestore() {
     std::filesystem::rename(original, fixture.Table());
     assert(Verify(fixture.backup).errors == 0U);
 }
+void ExtendedRootPaths() {
+#ifdef _WIN32
+    Fixture fixture;
+    const auto extended = std::filesystem::path(L"\\\\?\\" + fixture.root.wstring());
+    const auto top = extended / "extended-root";
+    auto root = top;
+    for (unsigned i = 0U; i < 3U; ++i) root /= std::string(100U, 'x') + std::to_string(i);
+    std::filesystem::create_directories(root);
+    assert(root.native().size() > 260U);
+    assert(CanonicalBackupPath(root).native().starts_with(L"\\\\?\\"));
+    const auto target = ResolveBackupTarget(root, "daily");
+    PrepareBackupTarget(fixture.source, target);
+    assert(std::filesystem::exists(target / kBackupIncompleteName));
+    const auto restored = root / "restored";
+    RestoreBackup(fixture.backup, restored);
+    assert(Verify(restored).errors == 0U);
+    auto overlap = std::filesystem::path(L"\\\\?\\" + fixture.source.wstring());
+    overlap /= std::string(200U, 'y');
+    Throws<std::invalid_argument>([&] { RequireBackupTarget(fixture.source, overlap); });
+    std::filesystem::remove_all(top);
+#endif
+}
 } // namespace
 int main(int argc, char** argv) {
+#ifdef _WIN32
+    SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
+    _set_error_mode(_OUT_TO_STDERR);
+#endif
     if (argc == 2) {
         const std::string_view name(argv[1]);
         if (name == "filters") FilteredSlots();
@@ -429,11 +457,13 @@ int main(int argc, char** argv) {
         else if (name == "symlinks") SymlinkedRootsAndStaging();
         else if (name == "roots") { RootedTargets(); InventoryPathSpellings(); }
         else if (name == "reparse") ReparseInventoryAndRestore();
+        else if (name == "extended") ExtendedRootPaths();
         else return 2;
         return 0;
     }
     FilteredSlots(); Records(); EpochAndHistory(); LineageContinuation(); StrictInventory(); TargetsAndCopies(); CompletionFailures();
     RestoreTemporaryCleanup(); CrashConsistentWal(); SymlinkedRootsAndStaging(); RootedTargets(); InventoryPathSpellings();
     ReparseInventoryAndRestore();
-    std::cout << "13 backup restore groups passed\n";
+    ExtendedRootPaths();
+    std::cout << "14 backup restore groups passed\n";
 }

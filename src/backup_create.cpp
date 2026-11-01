@@ -69,7 +69,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     RemoveOrphanedBackupStaging(config_.data_dir, source_manifest->data_dir_id);
     const auto stage_alias = config_.data_dir / kBackupStagingName;
     // Staging roots intentionally allow a configured directory alias.
-    const auto stage_parent = std::filesystem::weakly_canonical(stage_alias);
+    const auto stage_parent = CanonicalBackupPath(stage_alias);
     EnsureDirectoryPathExists(stage_parent, false);
     const auto stage_path = stage_parent / (StoreIdHex(source_manifest->data_dir_id) + "." + StoreIdHex(NewStoreId()));
     hook(BackupTestHook::Point::kBeforeStagingCreate, stage_path.filename().string());

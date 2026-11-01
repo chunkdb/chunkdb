@@ -75,7 +75,7 @@ std::vector<std::uint8_t> RecoverWal(const std::filesystem::path& path, const Ge
 void RestoreBackup(const std::filesystem::path& source, const std::filesystem::path& destination) {
     RequireBackupTarget(source, destination);
     const auto backup = std::filesystem::canonical(source);
-    const auto target = std::filesystem::weakly_canonical(destination);
+    const auto target = CanonicalBackupPath(destination);
     auto record = ReadBackupRecord(backup);
     ValidateBackupInventory(backup, record);
     for (const auto& cut : record.tables) {
