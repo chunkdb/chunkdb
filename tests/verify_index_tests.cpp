@@ -410,9 +410,9 @@ void HistoricalIntentCounts() {
             TxnIntent intent{.state = state, .version = 100U, .entries = {}};
             for (std::size_t i = 0U; i < count; ++i)
                 intent.entries.push_back({{static_cast<std::int64_t>(i), 0, dims == 3U ? -1 : 0}, 0U});
-            const auto bytes = SerializeCheckedTxnIntent(intent, dims, id, count);
+            const auto bytes = SerializeTxnIntent(intent, dims, id, count);
             bool lower_write_limit_refused = false;
-            try { (void)SerializeCheckedTxnIntent(intent, dims, id, 1U); }
+            try { (void)SerializeTxnIntent(intent, dims, id, 1U); }
             catch (const std::invalid_argument&) { lower_write_limit_refused = true; }
             assert(lower_write_limit_refused);
             const auto path = TxnIntentPath(config.data_dir, intent.version);

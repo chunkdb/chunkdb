@@ -35,7 +35,12 @@ void CrashAtRecoveryFailpoint(const char* key) {
 }  // namespace
 
 std::vector<std::uint8_t> SerializeTxnIntent(const TxnIntent& intent, std::uint8_t dims, const StoreId& table_id) {
-    return SerializeCheckedTxnIntent(intent, dims, table_id, kMaxTxnWrittenChunks);
+    return SerializeTxnIntent(intent, dims, table_id, kMaxTxnWrittenChunks);
+}
+
+std::vector<std::uint8_t> SerializeTxnIntent(const TxnIntent& intent, std::uint8_t dims, const StoreId& table_id,
+    std::size_t written_chunk_limit) {
+    return SerializeCheckedTxnIntent(intent, dims, table_id, written_chunk_limit);
 }
 
 bool TryParseTxnIntent(const std::vector<std::uint8_t>& bytes, TxnIntent* out,
