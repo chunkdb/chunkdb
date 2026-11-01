@@ -427,6 +427,14 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
     auto store = BeginExclusive();
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
+    if (options.area) {
+        if (options.area->dims != store->geometry_.dims())
+            throw std::invalid_argument("feed area dimensionality differs from table");
+        (void)store->geometry_.ChunkToLarge(options.area->first);
+        (void)store->geometry_.ChunkToLarge(options.area->last);
+        if (options.area->dims == 3U && options.area->first.z > options.area->last.z)
+            throw std::invalid_argument("feed area bounds are reversed");
+    }
     if (store->access_mode_ == AccessMode::kReadOnly || store->allow_multiple_processes_)
         throw std::invalid_argument("feed requires a single-process read-write table");
     if (options.column_ids) {
@@ -1684,8 +1692,6 @@ std::shared_ptr<Table> TableCatalog::Create(
     }
     const Geometry table_geometry = prepared.chunk_schema ? Geometry(geometry, table_schema, *prepared.chunk_schema) :
                                                            Geometry(geometry, table_schema);
-    if (table_geometry.dims() != 2)
-        throw std::invalid_argument("persistent chunk model support is incomplete");
     RequireValidTableOptions(options);
     if (existing != nullptr) {
         throw TableExistsError("table '" + table_name + "' already exists");

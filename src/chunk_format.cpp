@@ -586,6 +586,12 @@ std::shared_ptr<const ChunkColumnState> DefaultChunkColumnsAt(const Geometry& ge
     return std::make_shared<const ChunkColumnState>(DefaultChunkColumns(schema));
 }
 
+bool ChunkColumnsPopulatedAt(const Geometry& geometry, std::uint64_t version, const ChunkColumnState* state) {
+    if (state == nullptr) return false;
+    const auto baseline = DefaultChunkColumnsAt(geometry, version);
+    return baseline == nullptr || state->bytes != baseline->bytes;
+}
+
 void BringChunkColumnsToSchema(const Geometry& geometry, std::uint64_t from_version, std::uint64_t to_version,
     std::shared_ptr<const ChunkColumnState>* state) {
     if (from_version == 0U || !geometry.has_chunk_column_history()) { state->reset(); return; }

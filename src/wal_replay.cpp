@@ -496,7 +496,8 @@ FeedFrameInfo ReplayFeedFrame(
     if (state->payload.size() != layout.payload_bytes() || state->presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry)) {
         throw std::logic_error("captured feed state has another layout");
     }
-    if (frame.gc && ChunkPresent(state->presence_bitmap)) {
+    if (frame.gc && (ChunkPresent(state->presence_bitmap) ||
+        ChunkColumnsPopulatedAt(geometry, frame.schema_version, state->chunk_columns.get()))) {
         throw std::runtime_error("invalid captured feed frame: frame_gc_present_state");
     }
     for (const auto& span : frame.spans) {
@@ -706,9 +707,10 @@ WalReplayResult wal_detail::ReplayFromSource(
         if (frame.schema_version != state_version) {
             move_state_to(frame.schema_version);
         }
-        if (frame.gc && std::any_of(
+        if (frame.gc && (std::any_of(
                 state.begin() + static_cast<std::ptrdiff_t>(geometry.LayoutAt(state_version).payload_bytes()),
-                state.end(), [](std::uint8_t byte) { return byte != 0U; })) {
+                state.end(), [](std::uint8_t byte) { return byte != 0U; }) ||
+                ChunkColumnsPopulatedAt(geometry, state_version, chunk_columns->get()))) {
             result.tail_truncated_or_corrupt = true;
             result.stop_reason = "frame_gc_present_state";
             result.stopped_at_crash_tail = false;

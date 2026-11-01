@@ -279,19 +279,23 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 RequireValidFeedSlotName(request.slot);
                 if (store->allow_multiple_processes_) throw std::invalid_argument("feed slots require a single-process table");
                 std::unique_lock eviction(store->resources_->stores_mutex_);
-                auto slots = ReadFeedSlotRecords(table->dir_, journal.table_id).value_or(FeedSlotRecords{journal.table_id, 0U, {}});
+                const auto dims = store->geometry().dims();
+                auto slots = ReadFeedSlotRecords(table->dir_, journal.table_id, dims).value_or(
+                    FeedSlotRecords{.epoch = journal.table_id, .durable_watermark = 0U, .slots = {}, .dims = dims});
                 const auto at = std::find_if(slots.slots.begin(), slots.slots.end(), [&](const auto& slot) { return slot.name == request.slot; });
                 if (request.kind == MigrationRequest::Kind::kCreateSlot) {
                     if (at != slots.slots.end()) throw std::invalid_argument("feed slot already exists: " + request.slot);
                     const auto filters = MigrationSlotFilters(request, store->geometry());
                     // Validate every field before syncing a baseline or preparing publication.
-                    (void)SerializeFeedSlotRecords(FeedSlotRecords{journal.table_id, 0U, {{request.slot, 0U, false, filters}}});
+                    (void)SerializeFeedSlotRecords(FeedSlotRecords{.epoch = journal.table_id, .durable_watermark = 0U,
+                        .slots = {{request.slot, 0U, false, filters}}, .dims = dims});
                     RequireFeature(store->features(), *FindFeature("feed_slots"));
                     if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
                     table->PrepareFeedSlotBaseline(*store);
                     const auto completed = store->version_clock_.load(std::memory_order_seq_cst) - 1U;
                     store->feed_slots_->Sync(completed);
-                    slots = ReadFeedSlotRecords(table->dir_, journal.table_id).value_or(FeedSlotRecords{journal.table_id, completed, {}});
+                    slots = ReadFeedSlotRecords(table->dir_, journal.table_id, dims).value_or(
+                        FeedSlotRecords{.epoch = journal.table_id, .durable_watermark = completed, .slots = {}, .dims = dims});
                     slots.slots.push_back({request.slot, completed, false, filters});
                     slots.filter_format = slots.filter_format || !filters.empty();
                     // The unchanged manifest image binds redo to the participant

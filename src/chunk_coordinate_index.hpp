@@ -79,6 +79,8 @@ class ChunkCoordinateIndex {
     [[nodiscard]] CoordinateReservation Prepare(const ChunkCoord& coord, ChunkCoordinateNode** cache_slot);
     [[nodiscard]] CoordinatePage Page(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
         std::optional<std::uint64_t> since = {}) const;
+    // Exclusive current-state preparation does not make a history promise.
+    [[nodiscard]] CoordinatePage CurrentPage(bool has_cursor, const ChunkCoord& cursor, std::size_t limit) const;
     [[nodiscard]] std::optional<ChunkIndexRecord> EmptyBoundary(const ChunkCoord& coord) const;
     [[nodiscard]] std::uint64_t maximum_recovered_revision() const noexcept { return maximum_recovered_revision_; }
     [[nodiscard]] std::uint64_t retained_deletion_floor() const noexcept { return deletion_floor_.load(std::memory_order_acquire); }

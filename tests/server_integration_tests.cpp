@@ -34,6 +34,7 @@
 #include "../src/proxy_protocol.hpp"
 #include "../src/slot_watch.hpp"
 #include "../src/server_socket.hpp"
+#include "../src/sectioned_chunk_form.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -1661,8 +1662,7 @@ std::string BitsReply(std::string_view bytes) {
     return "*1\r\n$" + std::to_string(bytes.size()) + "\r\n" + std::string(bytes) + "\r\n";
 }
 
-// The chunk form of GET CHUNK and SET CHUNK: version (u64, little-endian),
-// presence bitmap, payload, then the VARS entries.
+// The checked form sections used by these one-column transport fixtures.
 struct ChunkForm {
     std::uint64_t version = 0;
     std::string presence;
@@ -1671,23 +1671,43 @@ struct ChunkForm {
 };
 
 ChunkForm ParseChunkForm(const std::string& form, std::size_t presence_bytes, std::size_t payload_bytes) {
-    if (form.size() < 16U + presence_bytes + payload_bytes) {
-        throw std::runtime_error("chunk form of " + std::to_string(form.size()) + " bytes is too short");
-    }
+    const auto bytes = std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(form.data()), form.size());
+    const auto envelope = chunkdb::ParseChunkFormSections(bytes, UINT32_MAX, chunkdb::ChunkFormReadMode::kRead);
     ChunkForm parsed;
-    for (std::size_t i = 0; i < 8; ++i) {
-        parsed.version |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(form[i])) << (8U * i);
+    parsed.version = envelope.header.chunk_version;
+    for (const auto& section : envelope.sections) {
+        const auto text = std::string(reinterpret_cast<const char*>(section.body.data()), section.body.size());
+        if (section.kind == static_cast<unsigned>(chunkdb::ChunkFormSectionKind::kPresence)) parsed.presence = text;
+        if (section.kind == static_cast<unsigned>(chunkdb::ChunkFormSectionKind::kFixedValues)) parsed.payload = text;
+        if (section.kind == static_cast<unsigned>(chunkdb::ChunkFormSectionKind::kVariableValues)) parsed.vars = text;
     }
-    parsed.presence = form.substr(16, presence_bytes);
-    parsed.payload = form.substr(16 + presence_bytes, payload_bytes);
-    parsed.vars = form.substr(16 + presence_bytes + payload_bytes);
+    assert(parsed.presence.size() == presence_bytes && parsed.payload.size() == payload_bytes);
     return parsed;
 }
 
 // A chunk form to send for a table at schema version 1; SET CHUNK does not
 // read its version.
 std::string ChunkFormOf(const std::string& presence, const std::string& payload) {
-    return std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8) + presence + payload;
+    std::vector<std::uint8_t> descriptor;
+    const auto append = [&](std::uint32_t value) {
+        for (unsigned i = 0U; i < 4U; ++i) descriptor.push_back(static_cast<std::uint8_t>(value >> (8U * i)));
+    };
+    assert(!presence.empty() && payload.size() % presence.size() == 0U);
+    append(1U); append(1U); append(static_cast<std::uint32_t>(payload.size() / presence.size()));
+    append(0U); append(static_cast<std::uint32_t>(payload.size())); append(0U); append(0U);
+    const std::array<chunkdb::ChunkFormSection, 3> sections{{
+        {1U, {reinterpret_cast<const std::uint8_t*>(presence.data()), presence.size()}},
+        {2U, {reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()}}, {6U, descriptor}}};
+    const auto bytes = chunkdb::SerializeChunkFormSections({.schema_version = 1U}, sections, UINT32_MAX);
+    return {bytes.begin(), bytes.end()};
+}
+
+std::size_t ChunkFormLimit(ServerHarness& harness, std::string_view table) {
+    chunkdb::SessionState session;
+    session.greeted = session.authenticated = true;
+    const auto plan = harness.engine->PlanPayload(session, "SET CHUNK 0 0 IN " + std::string(table) + " $1\r\n");
+    assert(plan.parameter_limits.size() == 1U);
+    return plan.parameter_limits.front();
 }
 
 // One parameter frame: `$<length>`, the bytes, an empty line.
@@ -1820,7 +1840,7 @@ void TestChunkPutWritesAndFraming() {
     assert(presence_bytes == 2);
     // A chunk frame is bounded by the chunk form and the VARS budget.
     const std::size_t frame_limit =
-        16U + presence_bytes + payload_bytes + harness.catalog->Find("default")->Info().options.var_max_chunk_bytes;
+        ChunkFormLimit(harness, "default");
     const auto read_chunk = [&](RawClient& reader, int chunk_x) {
         reader.SendLine("GET CHUNK " + std::to_string(chunk_x) + " 0 FROM default");
         return ParseChunkForm(reader.ReadBulkText(), presence_bytes, payload_bytes);
@@ -1892,7 +1912,7 @@ void TestChunkPutWritesAndFraming() {
     // A frame of the wrong size that still fits the bound is read and
     // drained, the statement fails, and the connection stays usable.
     client.SendBytes("SET CHUNK 3 0 IN default $1\r\n$2\r\n\x01\x02\r\n");
-    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT reason=invalid_argument the chunk starts with its version and schema version (16 bytes), got 2", 0) == 0);
+    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT reason=invalid_argument chunk form header is truncated", 0) == 0);
     assert(chunk_absent(3));
 
     // Invalid statements drain their lexical frame count, then preserve
@@ -2382,8 +2402,8 @@ void TestChunkGetLengthsAndForms() {
     const auto geometry = harness.geometry();
     const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
     const std::size_t presence_bytes = (geometry.ChunkBlockCount() + 7U) / 8U;
-    const std::size_t form_bytes = 16U + presence_bytes + payload_bytes;
-    assert(payload_bytes == 8U && form_bytes == 26U);
+    const std::size_t form_bytes = 100U + presence_bytes + payload_bytes;
+    assert(payload_bytes == 8U && form_bytes == 110U);
 
     // A never-written chunk is null, including a repeated cached read.
     client.SendLine("GET CHUNK 0 0 FROM default");
@@ -2404,9 +2424,9 @@ void TestChunkGetLengthsAndForms() {
 
     // COLUMNS naming the one column, and an area read, give the same form.
     client.SendLine("GET CHUNK 0 0 FROM default COLUMNS bits");
-    assert(client.ReadBulkText() == full);
+    assert(ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes).payload == zero_chunk);
     client.SendLine("GET AREA 0 0 TO 0 0 FROM default");
-    assert(client.ReadReply() == "*1\r\n*3\r\n:0\r\n:0\r\n$26\r\n" + full + "\r\n");
+    assert(client.ReadReply() == "*1\r\n*3\r\n:0\r\n:0\r\n$" + std::to_string(form_bytes) + "\r\n" + full + "\r\n");
 
     // A sparse state: blocks 0 and 15 present.
     const std::string sparse = ChunkFormOf(std::string("\x01\x80", 2), std::string("\x0f", 1) + std::string(7, '\0'));
@@ -2415,7 +2435,7 @@ void TestChunkGetLengthsAndForms() {
     client.SendLine("GET CHUNK 1 0 FROM default");
     const std::string sparse_back = client.ReadBulkText();
     assert(ParseChunkForm(sparse_back, presence_bytes, payload_bytes).version == sparse_version);
-    assert(sparse_back.substr(8) == sparse.substr(8));
+    assert(sparse_back.substr(32) == sparse.substr(32));
     client.SendLine("GET BLOCK 4 0 FROM default");
     assert(client.ReadReply() == BitsReply("\x0f"));
     client.SendLine("GET BLOCK 5 0 FROM default");
@@ -3183,11 +3203,14 @@ void TestChunkPutOverTls() {
     assert(read_back.version == version);
     assert(read_back.payload == payload);
 
-    // An empty replacement of a never-written chunk changes nothing.
+    // A successful full replacement establishes its producing identity even
+    // when the supplied state is the empty baseline.
     const std::string empty = ChunkFormOf(std::string(presence_bytes, '\x00'), payload);
     client.SendBytes("SET CHUNK 1 0 IN default $1\r\n" + Frame(empty) + "GET CHUNK 1 0 FROM default\r\n");
-    (void)ReadVersion(client);
-    assert(client.ReadLine() == "_\r\n");
+    const auto initialized = ReadVersion(client);
+    const auto baseline = ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes);
+    assert(baseline.version == initialized && baseline.presence == std::string(presence_bytes, '\0') &&
+        baseline.payload == std::string(payload_bytes, '\0'));
     // Replacing the previously written chunk retains its versioned tombstone.
     client.SendBytes("SET CHUNK 0 0 IN default $1\r\n" + Frame(empty) + "GET CHUNK 0 0 FROM default\r\n");
     const auto empty_version = ReadVersion(client);
@@ -4142,9 +4165,9 @@ void TestTablesOverProtocol() {
         // A frame of a length that a terrain chunk takes is read; the same
         // length is more than a default chunk holds and is refused unread.
         const std::size_t default_limit =
-            16U + 2U + 8U + harness.catalog->Find("default")->Info().options.var_max_chunk_bytes;
+            ChunkFormLimit(harness, "default");
         const std::size_t terrain_limit =
-            16U + 2U + 18U + harness.catalog->Find("terrain")->Info().options.var_max_chunk_bytes;
+            ChunkFormLimit(harness, "terrain");
         assert(default_limit < terrain_limit);
         const std::string long_form = form + std::string(default_limit + 1U - form.size(), '\0');
         a.SendBytes("SET CHUNK 6 6 IN terrain $1\r\n" + Frame(long_form));
@@ -4188,7 +4211,7 @@ void TestTablesOverProtocol() {
     a.SendBytes("SET CHUNK 5 5 IN terrain $1\r\n" + Frame(small));
     (void)ReadVersion(a);
     a.SendLine("GET CHUNK 5 5 FROM terrain");
-    assert(a.ReadBulkText().substr(8) == small.substr(8));
+    assert(a.ReadBulkText().substr(32) == small.substr(32));
 
     // FLUSH WAL covers every table.
     a.SendLine("FLUSH WAL");

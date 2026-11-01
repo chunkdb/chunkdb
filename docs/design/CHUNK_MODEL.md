@@ -36,7 +36,7 @@ Collection preserves that initialized identity until explicit tombstone compacti
 
 ## Format boundaries
 
-The directory and table envelopes own incompatibility bit 32, named `chunk_model`.
+The directory and table envelopes own incompatibility mask `0x20`, named `chunk_model`.
 New tables publish complete geometry, both schema histories and an empty checked index inventory before catalog visibility.
 Images and WAL headers include dims, active coordinates, table identity, feature sets and a header checksum.
 The table manifest places `dims:u8` and three zero reserved bytes before its six `u32` geometry sides, then the table identity, bounded options, and independently length-delimited block and chunk schema histories.
@@ -90,6 +90,8 @@ Its independently checksummed fixed header includes a nonzero monotonic inventor
 Read-only point reads may reuse a completely admitted retained-boundary index only when that header's identity and generation still match inside the same stable snapshot bracket as their image and WAL.
 An ordinary block write changes the table snapshot generation without changing the inventory generation, so refreshing a point does not rebuild every retained shard after unrelated writes.
 Read-only scans rebuild their complete live-coordinate candidate index when the table snapshot generation changes and publish it only after one unchanged equal-even whole-index observation.
+That private candidate index also includes producing revision and population copied under the locks of point-cache entries admitted at the same generation, preserving their existing cache authority until the generation changes.
+Cache ownership is pinned before taking individual chunk locks, and the published candidate contains scalar hints rather than borrowed cache pointers.
 Every listed boundary covers a complete header and whole records; a listed log shorter than that boundary is damage.
 Recovery validates complete inventory and logs before mutating artifacts, resolves rollback intents, then reconciles committed image and WAL state.
 Conditional intent names encode exactly the table's dimensions and canonical shard placement.
@@ -124,6 +126,11 @@ Ordinary area reads and scans omit tombstones; `SCAN SINCE` includes them and ad
 Requests below that floor fail explicitly instead of silently omitting deletions.
 
 Compaction requires exclusive mutation admission and persists its exact inclusive operation floor separately from the cumulative deletion floor.
+Shared-writer operation refuses compaction because its table admission cannot exclude another process's producers.
+Before staging any replacement, a WAL barrier establishes the checkpoint durability floor and every coordinate with a current artifact or cached state receives a complete durable checkpoint.
+This preparation removes a live WAL's dependency on an older retained empty baseline, including REQUIRED chunk columns initialized before that WAL, before the baseline can be discarded.
+Retained-only coordinates are skipped, and archive descriptors keep their independently pinned original replay bases.
+Any preparation failure preserves the existing deletion floor and follows the store's checked failure and table-fencing paths.
 For `BEFORE n`, the operation floor is `min(n - 1, completed_frontier)`; zero is a no-op.
 A durable pending inventory decision precedes every shard replacement.
 Before that decision, each shard's filtered replacement is written and synced under its owned staging name.
@@ -146,6 +153,8 @@ Image length and SHA-256 digest bind every byte of a pinned original image, incl
 The original base and descriptor become durable before collection or WAL rename can remove their live prerequisites.
 A resurrection segment uses its own retained-empty base and cannot replace a previous segment's nonempty base.
 Rejected or undecided transaction frames never enter sealed archives.
+Writer recovery admits every sealed archive range and independent live first-frame overlap before repairing a live WAL tail or removing an alias name.
+This is a complete read-only pass over all candidates, so a corrupt later archive cannot leave an earlier alias or live prefix partially repaired.
 
 Backup pins the complete inventory, index logs and committed image/WAL prefixes at one table cut under maintenance admission.
 The maintenance pin excludes collection until immutable inventory bytes and every listed committed log prefix have been linked into private staging.
@@ -163,6 +172,8 @@ A chunk-column change contains the complete before and after rows, with a null b
 An empty chunk-column schema allocates and emits no chunk-column change rows.
 Block-column projections preserve the complete chunk-column row, and `NOBEFORE` removes both kinds of before rows.
 Chunk-form events carry checked forms with each chunk's producing revision and time, and use a null form only when neither present blocks nor non-default chunk columns remain.
+An ordinary first subscription may resume at the admitted live-history floor, including a completed scan position, without a refusal based only on whether another subscriber existed.
+Different epochs, positions below retained history, unissued future positions and capture loss retain their existing resync checks.
 
 ## Durable slot filters
 

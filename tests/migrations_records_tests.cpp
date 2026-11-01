@@ -248,6 +248,30 @@ void ConditionalLedgerOnlyCodec() {
     }
 }
 
+void SlotImageDimensions() {
+    Fixture fixture;
+    fixture.table.features.incompat |= kFeatureFeedSlots;
+    fixture.before = SerializeStoreManifest(fixture.table);
+    Save(fixture.root / "tables/default/table.manifest", fixture.before);
+    FeedSlotRecords records{fixture.table.store_id, 0U, {{"first", 0U, false}}};
+    const auto before = SerializeFeedSlotRecords(records);
+    records.slots.clear(); records.dims = 3U;
+    const auto after = SerializeFeedSlotRecords(records);
+    Save(fixture.root / "tables/default/chunkdb.slots", before);
+    auto record = fixture.record; record.statement = "DROP SLOT 'first' ON default";
+    MigrationJournal journal;
+    journal.data_dir_id = fixture.data_id; journal.record = record;
+    journal.table = "default"; journal.table_id = fixture.table.store_id;
+    journal.files = {{"tables/default/chunkdb.slots", before, after},
+        {std::string(kMigrationsFileName), std::nullopt, EncodeMigrationRecords(fixture.data_id, {record})}};
+    const auto pending = EncodeMigrationJournal(journal);
+    Save(fixture.root / kMigrationPendingFileName, pending);
+    Reject([&] { CompleteMigrationJournal(fixture.root, journal); });
+    assert(LoadFile(fixture.root / "tables/default/chunkdb.slots") == before);
+    assert(LoadFile(fixture.root / kMigrationPendingFileName) == pending);
+    assert(!std::filesystem::exists(fixture.root / kMigrationsFileName));
+}
+
 void JournalStatementRestrictions() {
     Fixture fixture;
     const auto unsupported = [](auto&& call) {
@@ -422,8 +446,9 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--record-grammar") { RecordTextWithoutGrammar(); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--record-utf8") { RecordTextUtf8(); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--journal-statements") { JournalStatementRestrictions(); return 0; }
+    if (argc == 2 && std::string(argv[1]) == "--slot-dimensions") { SlotImageDimensions(); return 0; }
     RecordTextWithoutGrammar(); RecordTextUtf8();
     Records(); RecordDamage(); JournalAndVerification(); JournalDamage(); DiskIdentity(); CompletionPreflight(); DirectoryPublication(); PathAliases();
-    JournalStatementRestrictions(); ConditionalLedgerOnlyCodec();
-    std::cout << "12 migration codec and verification groups passed\n";
+    JournalStatementRestrictions(); ConditionalLedgerOnlyCodec(); SlotImageDimensions();
+    std::cout << "13 migration codec and verification groups passed\n";
 }

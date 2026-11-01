@@ -580,7 +580,7 @@ std::uint64_t ChunkStore::CommitTransaction(
         if (change.new_wal) {
             change.bytes = BuildWalHeader(change.target->coord, store_id_, features_, geometry_.dims());
         }
-        feed.Before(change.target->coord, chunk.payload, chunk.presence_bitmap, chunk.vars);
+        feed.Before(change.target->coord, chunk.payload, chunk.presence_bitmap, chunk.vars, chunk.chunk_columns.get(), chunk.written);
         WalFrameBuilder frame(&change.bytes, geometry_.layout().schema().version, {}, SlotWriteUser());
         AppendDiffSpans(&frame, 0U, chunk.payload, state.payload);
         AppendDiffSpans(&frame, geometry_.ChunkPayloadBytes(), chunk.presence_bitmap, state.presence_bitmap);
