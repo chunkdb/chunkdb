@@ -36,6 +36,7 @@ class ChunkStoragePolicyPtr {
 
   private:
     friend class ChunkStoragePolicy;
+    friend struct ChunkStoragePolicyAccess;
     explicit ChunkStoragePolicyPtr(ChunkStoragePolicy* policy) noexcept : policy_(policy) {}
     ChunkStoragePolicy* policy_ = nullptr;
 };
@@ -57,6 +58,7 @@ class ChunkStoragePolicy {
 
   private:
     friend class ChunkStoragePolicyPtr;
+    friend struct ChunkStoragePolicyAccess;
     friend void* AllocateChunkStorage(std::size_t, std::size_t, ChunkStoragePolicy*, std::pmr::memory_resource*);
     friend void DeallocateChunkStorage(void*) noexcept;
     ChunkStoragePolicy(std::shared_ptr<ChunkStorageAccount> account, std::pmr::memory_resource* upstream) noexcept;
