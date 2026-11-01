@@ -18,6 +18,11 @@ Paths are derived from admitted identities rather than accepted from a journal a
 The group record names each member's WAL boundary, exact frame extent and SHA-256 digest.
 Length and digest bind the entire frame, including its checked header and group identity.
 The journal has a checked directory-bound header and length-delimited, checksummed records.
+An independently published journal inventory binds the journal identity, generation, certified byte cut, last record identity and SHA-256 digest of the complete certified prefix.
+Syncing a decision or durability receipt precedes atomically publishing and syncing its new inventory cut; acknowledgement follows that publication.
+Bytes at or below that cut are never reclassified as an interrupted append, including a damaged last length field or a truncated final certified record.
+Certifying journal bytes does not certify the members of an earlier relaxed group without that group's durability receipt.
+Compaction writes and syncs a distinct journal generation, publishes its checked inventory reference, and only then retires the old generation.
 Counts are admitted against the complete record extent with checked arithmetic before allocation.
 Recovery codecs do not impose the current session's chunk-count limits on an earlier valid record.
 
@@ -62,9 +67,12 @@ Read all group decisions and required member contexts into a private recovery pl
 Validate complete member framing, exact digests, original replay bases, retained identities, schema histories and applicable rollback decisions before changing files.
 A table constructor cannot independently trim an unresolved group member.
 An absent decision rolls every surviving member back at its first group frame.
-A relaxed undecided group can also discard later relaxed frames on those members.
+A fully checked relaxed decision without a certified durability receipt whose members are missing or crash-shaped incomplete also rolls back the whole group.
+Its surviving members and later dependent relaxed suffixes are discarded together after every rollback base passes admission.
+Rollback never guesses or silently replaces an invalid preceding prefix.
 A checked synced decision or durability receipt with a missing required member is damage rather than an undecided crash tail.
-An incomplete final journal append is unpublished; interior corruption and conflicting decisions refuse recovery.
+An incomplete final append wholly above the certified cut is unpublished.
+A complete record with invalid checksum, identity or structure, interior corruption, a shortened certified prefix and conflicting decisions refuse recovery without repair.
 
 A checkpoint makes the decisions of all groups it includes durable before publishing its image.
 Checked image and tombstone provenance identifies a covered group member after its WAL frame is retired.
@@ -120,12 +128,33 @@ Paging does not imply an unchanged snapshot across independent requests.
 
 An ID is at most 64 bytes and is scoped to the authenticated user.
 Its fingerprint binds the command text, length-framed parameter bytes and effective tag, so a different payload cannot reuse a known ID.
+For BEGIN ID, the fingerprint covers BEGIN options and the complete ordered transactional statement transcript, including parameter bytes and statement boundaries.
+BEGIN alone neither certifies a matching body nor returns an earlier transaction as a completed duplicate.
+A duplicate BEGIN opens a private validation session; its statements cannot publish writes outside that session.
+Read replies are evaluated against that session's current snapshot and are not retained or replayed as idempotency results.
+Transcript recording continues through a private statement failure, so ignored follow-up statements cannot evade comparison.
+COMMIT compares the complete transcript before any new commit admission, including when private validation has already failed.
+For a known matching outcome it discards private state and returns the retained repeated result; a different transcript returns `INVALID_ARGUMENT reason=id_reused` without mutation.
+An in-flight duplicate waits at COMMIT without table leases or chunk locks until its owner has a checked outcome.
+If that owner is known not to have committed, the waiting session can obtain the next key reservation and undergo normal snapshot validation.
+An uncertain owner outcome requires recovery and cannot transfer write ownership to the waiter.
+Applications can use SHOW COMMIT to retrieve an earlier result without rerunning a read-dependent transaction body.
 A duplicate in flight waits for that owner; canceling the waiter does not cancel the original group.
 A completed duplicate returns the retained transaction and table versions without replaying RETURNING rows.
 SHOW COMMIT reports retained versions and whether the complete group is durable.
 Expiration or oldest-first byte eviction can remove that record, so absence is a bounded-retention result.
 The default retention window is 600000 ms and its byte bound is 64 MiB.
 A new record larger than its bound is refused before changing data.
+The retained-ID inventory is separate from group seals and binds a checked journal replay cursor and each live key's exact group incarnation.
+Only that inventory and admitted newer decisions can reconstruct the ID lookup; an older feed-referenced seal cannot resurrect an evicted binding.
+Expiration or byte eviction publishes a durable retirement cut before the same key can obtain a new write reservation.
+Publishing that cut first makes its journal cursor durable, without claiming that unrelated relaxed member frames are durable.
+ID decision publication and retention-cut capture serialize their short metadata step, so a decision cannot fall before the cursor while its binding is omitted accidentally.
+An in-flight reservation remains separately byte-charged and cannot be mistaken for an already completed binding during eviction.
+Recovery first resolves group outcomes, restores only admitted live inventory bindings, and then applies newer key incarnations in journal order.
+If a newer relaxed incarnation is absent or rolled back after a crash, lookup remains empty rather than falling back to the retired older incarnation.
+The inventory and pending reservations obey the byte bound even when old seals remain needed by feed readers.
+Inventory replacement keeps the old checked generation until the new generation and its publication are durable.
 
 A tag is at most 256 bytes and an explicit tag overrides the HELLO default.
 The checked group decision owns the tag and catch-up obtains it from the retained group seal.
