@@ -64,6 +64,9 @@ It is therefore admissible from an existing direct C++ conditional operation alr
 An ACTIVE owner never reverts, including after its last group retires, and a missing selected object is damage.
 A failed activation publishes no grouped frame; an uncertain ACTIVE publication fences the coordinator until checked admission resolves it.
 This is a once-per-directory boundary and adds no sync or journal lookup to unused ordinary writes.
+Grouped preparation, first activation, recovery and every ACTIVE-owner mutation require admitted exclusive writer ownership of the directory and participating stores.
+An incompatible `allow_multiple_processes` context refuses before group publication or owner mutation; this protocol does not add interprocess group coordination or weaken the existing shared-writer restriction.
+Read-only owners can admit a matching stable context but cannot activate, repair or collect it.
 
 Each feature-owned table manifest binds its directory identity, stable owner identity and standalone-or-catalog role independently of whether a GROUP frame remains in its WAL.
 A standalone binding names its own root; a catalog binding requires the matching checked directory owner context injected before store admission.
