@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "chunk_store_internal.hpp"
+#include "commit_group_identity.hpp"
 
 namespace chunkdb {
 
@@ -35,6 +36,9 @@ class WalFrameBuilder {
         const std::vector<std::uint8_t>& tag = {},
         std::optional<std::string_view> user = std::nullopt,
         bool gc = false);
+    WalFrameBuilder(std::vector<std::uint8_t>* batch, std::uint64_t schema_version,
+        const std::vector<std::uint8_t>& tag, std::optional<std::string_view> user,
+        bool gc, const WalGroupRef& group);
 
     // Appends one SPAN record writing `size` bytes at `byte_offset` of the
     // chunk state.

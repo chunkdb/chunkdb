@@ -2,6 +2,7 @@
 
 This contract covers [#136](https://github.com/chunkdb/chunkdb/issues/136) and builds on the [chunk model](CHUNK_MODEL.md).
 The user-visible guarantees are in [Durability](../DURABILITY_CONTRACT.md).
+The pure checked encodings are specified in [Commit group records](COMMIT_GROUP_FORMAT.md).
 
 ## Ownership and identities
 
@@ -148,7 +149,8 @@ Paging does not imply an unchanged snapshot across independent requests.
 
 An ID is at most 64 bytes and is scoped to the authenticated user.
 Its fingerprint binds the command text, length-framed parameter bytes and effective tag, so a different payload cannot reuse a known ID.
-The fingerprint hashes a fixed domain followed by ordered statement records containing little-endian unsigned 64-bit text length, exact text bytes, parameter count and each parameter's length and bytes.
+The fingerprint hashes a fixed domain followed by ordered statement records containing little-endian unsigned 64-bit text length, exact text bytes and parameter count.
+Each parameter binds a NULL-or-present marker, followed only for present values by its length and exact bytes, so NULL differs from present empty bytes.
 Its final record distinguishes an absent tag from a present empty tag and binds the complete effective tag.
 Statement and final-record kinds keep a transaction's statement boundaries distinct from concatenated text or parameter bytes.
 For BEGIN ID, the fingerprint covers BEGIN options and the complete ordered transactional statement transcript, including parameter bytes and statement boundaries.

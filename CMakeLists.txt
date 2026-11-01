@@ -63,6 +63,8 @@ add_library(chunkdb_core STATIC
     src/populated_index_format.cpp
     src/archive_base_format.cpp
     src/commit_group_identity.cpp
+    src/commit_group_format.cpp
+    src/commit_request_fingerprint.cpp
     src/chunk_file_header.cpp
     src/feed_protocol.cpp
     src/change_feed.cpp
@@ -111,6 +113,7 @@ add_library(chunkdb_core STATIC
     src/schema.cpp
     src/store_resources.cpp
     src/table_catalog.cpp
+    src/catalog_txn_snapshot.cpp
     src/table_chunk_columns.cpp
     src/table_tombstones.cpp
     src/table_catalog_migrations.cpp
@@ -314,7 +317,7 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME geometry_bit COMMAND chunkdb_geometry_bit_test)
 
-    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol)
+    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_request_fingerprint wal_group_frame catalog_txn_snapshot chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -333,6 +336,11 @@ if(CHUNKDB_BUILD_TESTS)
         add_test(NAME ${verifier} COMMAND chunkdb_${verifier}_test)
         set_tests_properties(${verifier} PROPERTIES TIMEOUT 60 LABELS "smoke")
     endforeach()
+    if(MINGW)
+        # The allocation counter replaces new/delete as one matched family.
+        # A shared C++ runtime can free its prefixed pointers through DLL delete.
+        target_link_options(chunkdb_verify_memory_test PRIVATE -static-libstdc++ -static-libgcc)
+    endif()
 
     add_executable(chunkdb_storage_test tests/storage_tests.cpp)
     target_link_libraries(chunkdb_storage_test PRIVATE chunkdb_core)
@@ -875,6 +883,10 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_populated_index_format_test
         chunkdb_archive_base_format_test
         chunkdb_commit_group_identity_test
+        chunkdb_commit_group_format_test
+        chunkdb_commit_request_fingerprint_test
+        chunkdb_wal_group_frame_test
+        chunkdb_catalog_txn_snapshot_test
         chunkdb_chunk_file_header_test
         chunkdb_chunk_identity_test
         chunkdb_chunk_schema_test
