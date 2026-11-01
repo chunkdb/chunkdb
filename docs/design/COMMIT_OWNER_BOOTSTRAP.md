@@ -144,6 +144,9 @@ It admits the source generation-one INACTIVE root and every directory/table scop
 The operation accepts no caller root, scope, callback or writer-permission flag and creates no ProcessLock artifacts in the copied inventory.
 The returned manifest's one chosen scope governs every later table and migration rewrite; a second invocation after root replacement fails source-context admission rather than creating another identity.
 Guard, copy, root-generation and extent substitution refuse without changing the external source backup or visible destination, and a crash after the private-root replacement remains guarded and cannot be opened or resumed.
+Restore cleanup retains the native no-follow safeguards of [#150](https://github.com/chunkdb/chunkdb/pull/191); this component depends on that change rather than recreating generic temporary-tree cleanup.
+A typed restore-ownership failure records that the pinned private directory no longer admits its current name, including failure to establish that native identity; the outer restore handler preserves that original error and retains the uncertain name instead of passing it to pathname cleanup.
+Other restore failures keep the existing native cleanup policy, and this boundary does not claim protection against arbitrary same-user namespace changes throughout ordinary restore I/O.
 ACTIVE/PENDING restore, grouped history, IDs, tags, split decisions and owner-reference rewriting require the separate complete recovery/restore owner and are explicitly refused by this INACTIVE-only component.
 Offline verification checks directory/root/table context before chunk replay, rejects isolated catalog-table verification without directory context and never initializes a missing owner.
 
