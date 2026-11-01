@@ -70,6 +70,9 @@ A never-written chunk remains NULL instead of receiving a version on load.
 One ordered coordinate index per table serves bounded scan pages without walking directories on each page.
 Ordinary writes update membership only on population transitions, with no index I/O for updates to an already populated chunk.
 A new coordinate reserves its in-memory map node before the write can commit, and ordinary writes publish no persistent live hint before their commit decision.
+Each stable coordinate node carries atomic producing identity and population state; writes to an existing node publish those fields before completing their producer bound without taking the ordered-map mutex.
+The chunk cache retains only a borrowed node pointer owned by its table index, and failed first-write reservations remove their unpublished node while still holding that chunk's lock and clear that cached pointer.
+A reservation cannot outlive its pinned chunk, and compaction reopens the table after exclusive admission before removing nodes whose cached pointers could otherwise remain.
 A committed empty identity remains an in-memory scan deletion while its image or WAL still holds it; collection makes that identity a durable index tombstone.
 A scan captures a coordinate page before acquiring any chunk locks.
 Publication takes the chunk lock before its short membership lock and releases membership before I/O.
