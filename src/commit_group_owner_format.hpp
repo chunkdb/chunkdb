@@ -16,6 +16,7 @@ inline constexpr std::size_t kCommitOwnerReferenceBytes = 48U;
 inline constexpr std::size_t kCommitOwnerHeaderBytes = 64U;
 inline constexpr std::size_t kCommitOwnerRootBytes = 512U;
 inline constexpr std::size_t kCommitOwnerEmptyPageBytes = 92U;
+inline constexpr std::size_t kCommitOwnerMemberBytes = 204U;
 inline constexpr std::size_t kMaxCommitOwnerPageBytes = 64U * 1024U;
 inline constexpr std::uint64_t kMaxCommitCoveredTreeBytes = 256U * 1024U * 1024U;
 
@@ -122,6 +123,21 @@ struct CommitOwnerMemberKey {
     friend bool operator==(const CommitOwnerMemberKey&, const CommitOwnerMemberKey&) = default;
 };
 
+struct CommitOwnerMemberValue {
+    CommitOwnerScope scope;
+    std::uint64_t generation = 1U;
+    CommitGroupId group_id{};
+    crypto::Sha256Digest decision_sha256{};
+    std::uint64_t ordinal = 0U;
+    std::uint64_t member_count = 0U;
+    CommitOwnerCoverageKey coverage;
+    CommitGroupMemberKind kind = CommitGroupMemberKind::kChanged;
+    std::uint64_t revision = 0U;
+    std::uint64_t commit_time_ms = 0U;
+    std::uint64_t schema_version = 0U;
+    friend bool operator==(const CommitOwnerMemberValue&, const CommitOwnerMemberValue&) = default;
+};
+
 [[nodiscard]] std::array<std::uint8_t, kCommitOwnerScopeBytes> SerializeCommitOwnerScope(const CommitOwnerScope& scope);
 [[nodiscard]] CommitOwnerScope ParseCommitOwnerScope(std::span<const std::uint8_t> bytes);
 void ValidateCommitOwnerStoreScope(const CommitOwnerScope& scope, const CommitGroupId& store_id,
@@ -154,5 +170,14 @@ void ValidateCommitOwnerChild(const CommitOwnerPage& parent, std::size_t child_i
 [[nodiscard]] CommitGroupId DecodeCommitOwnerGroupKey(std::span<const std::uint8_t> bytes);
 [[nodiscard]] std::array<std::uint8_t, 24U> EncodeCommitOwnerMemberKey(const CommitOwnerMemberKey& key);
 [[nodiscard]] CommitOwnerMemberKey DecodeCommitOwnerMemberKey(std::span<const std::uint8_t> bytes);
+
+[[nodiscard]] std::array<std::uint8_t, kCommitOwnerMemberBytes> SerializeCommitOwnerMember(
+    const CommitOwnerMemberValue& value);
+[[nodiscard]] CommitOwnerMemberValue ParseCommitOwnerMember(std::span<const std::uint8_t> bytes,
+    const CommitOwnerScope& scope, std::uint64_t selecting_generation);
+// All decision facts and the raw digest must come from complete native admission.
+void ValidateCommitOwnerMemberBinding(const CommitOwnerMemberValue& value,
+    const CommitOwnerMemberKey& key, const CommitOwnerCoverageKey& coverage,
+    const CommitGroupDecision& decision, const crypto::Sha256Digest& measured_decision_sha256);
 
 }  // namespace chunkdb

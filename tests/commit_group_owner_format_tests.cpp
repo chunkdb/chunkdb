@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <limits>
 #include <stdexcept>
+#include <utility>
 #include <vector>
 
 #include "chunkdb/crc32.hpp"
@@ -251,7 +252,132 @@ void OrderedKeysAndBounds() {
     Put(raw, 8U, 65537U, 8U); Crc(raw, true);
     Reject([&] { (void)InspectCommitOwnerHeader(std::span(raw).first(64U), kScope, CommitOwnerObjectKind::kPage); });
 }
+struct MemberFixture {
+    CommitOwnerMemberValue value;
+    CommitGroupDecision decision;
+    MemberFixture() {
+        value.scope = kScope; value.generation = 2U; value.group_id = {3U}; value.ordinal = 1U; value.member_count = 2U;
+        value.coverage = {{4U}, 2U, {-7, std::numeric_limits<std::int64_t>::max(), 0}};
+        value.revision = 10U; value.commit_time_ms = 11U; value.schema_version = 2U;
+        CommitGroupMember member;
+        member.table_epoch = value.coverage.table_epoch; member.dims = 2U; member.coord = value.coverage.coord;
+        member.revision = value.revision; member.commit_time_ms = value.commit_time_ms; member.schema_version = value.schema_version;
+        member.frame_offset = 64U; member.frame_bytes = 80U; member.frame_sha256 = {5U};
+        auto first = member; --first.coord.x;
+        decision.directory_id = kScope.directory_id; decision.id = value.group_id;
+        decision.members = {first, member}; decision.versions = {{member.table_epoch, member.revision, "world"}};
+        decision.durability = CommitGroupDurability::kSynced; decision.created_ms = 12U;
+        value.decision_sha256 = crypto::Sha256Of(SerializeCommitGroupDecision(decision));
+    }
+    void Bind(const CommitOwnerMemberValue& candidate) const {
+        ValidateCommitOwnerMemberBinding(candidate, {value.group_id, value.ordinal}, value.coverage,
+            decision, value.decision_sha256);
+    }
+};
+void MemberCapsules() {
+    MemberFixture fixture;
+    const auto& value = fixture.value;
+    const auto raw = SerializeCommitOwnerMember(value);
+    assert(raw.size() == 204U && ParseCommitOwnerMember(raw, kScope, 2U) == value);
+    std::array<std::uint8_t, 204U> golden{};
+    golden[0U] = 'C'; golden[1U] = 'K'; golden[2U] = 'G'; golden[3U] = 'O'; golden[4U] = 1U;
+    golden[6U] = 5U; golden[7U] = 2U; golden[8U] = 204U; golden[16U] = 1U; golden[32U] = 2U; golden[48U] = 2U;
+    golden[64U] = 3U; std::copy(value.decision_sha256.begin(), value.decision_sha256.end(), golden.begin() + 80);
+    golden[112U] = 1U; golden[120U] = 2U; golden[128U] = 4U; golden[144U] = 2U; golden[145U] = 1U;
+    Put(golden, 152U, std::numeric_limits<std::uint64_t>::max() - 6U, 8U);
+    Put(golden, 160U, static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()), 8U);
+    golden[176U] = 10U; golden[184U] = 11U; golden[192U] = 2U; Crc(golden, true);
+    assert(raw == golden);
+    fixture.Bind(value);
+    for (std::size_t cut = 0U; cut < raw.size(); ++cut)
+        Reject([&] { (void)ParseCommitOwnerMember(std::span(raw).first(cut), kScope, 2U); });
+    auto extended = Bytes(raw.begin(), raw.end()); extended.push_back(0U);
+    Reject([&] { (void)ParseCommitOwnerMember(extended, kScope, 2U); });
+    Reject([&] { (void)ParseCommitOwnerMember(raw, kScope, 1U); });
+    Reject([&] { (void)ParseCommitOwnerMember(raw, kScope, 0U); });
+    auto foreign_scope = kScope; ++foreign_scope.owner_id[0U];
+    Reject([&] { (void)ParseCommitOwnerMember(raw, foreign_scope, 2U); });
+    auto corrupt = raw; corrupt[80U] ^= 1U;
+    Reject([&] { (void)ParseCommitOwnerMember(corrupt, kScope, 2U); });
+    for (const auto& [offset, changed] : {std::pair<std::size_t, std::uint8_t>{144U, 4U}, {145U, 3U}, {146U, 1U}, {168U, 1U}}) {
+        corrupt = raw; corrupt[offset] = changed; Crc(corrupt);
+        Reject([&] { (void)ParseCommitOwnerMember(corrupt, kScope, 2U); });
+    }
+    corrupt = raw; Put(corrupt, 112U, 2U, 8U); Crc(corrupt);
+    Reject([&] { (void)ParseCommitOwnerMember(corrupt, kScope, 2U); });
+    auto missing = value; missing.group_id = {};
+    Reject([&] { (void)SerializeCommitOwnerMember(missing); });
+    missing = value; missing.decision_sha256 = {};
+    Reject([&] { (void)SerializeCommitOwnerMember(missing); });
+    missing = value; missing.member_count = 0U;
+    Reject([&] { (void)SerializeCommitOwnerMember(missing); });
+    missing = value; missing.revision = 0U;
+    Reject([&] { (void)SerializeCommitOwnerMember(missing); });
+    missing = value; missing.schema_version = 0U;
+    Reject([&] { (void)SerializeCommitOwnerMember(missing); });
+    auto observed = value; observed.kind = CommitGroupMemberKind::kObserved;
+    observed.revision = 0U; observed.commit_time_ms = 0U; observed.schema_version = 0U;
+    assert(ParseCommitOwnerMember(SerializeCommitOwnerMember(observed), kScope, 3U) == observed);
+    observed.commit_time_ms = 1U;
+    Reject([&] { (void)SerializeCommitOwnerMember(observed); });
+    observed.commit_time_ms = 0U; observed.schema_version = 1U;
+    Reject([&] { (void)SerializeCommitOwnerMember(observed); });
+    auto spatial = value; spatial.coverage.dims = 3U; spatial.coverage.coord.z = std::numeric_limits<std::int64_t>::min();
+    assert(ParseCommitOwnerMember(SerializeCommitOwnerMember(spatial), kScope, 2U) == spatial);
+    corrupt = raw; Put(corrupt, 8U, std::uint64_t{1U} << 40U, 8U); Crc(corrupt, true);
+    bool requested_buffer = false;
+    Reject([&] {
+        (void)InspectCommitOwnerHeader(std::span(corrupt).first(64U), kScope, CommitOwnerObjectKind::kMemberValue, 2U);
+        requested_buffer = true;
+    });
+    assert(!requested_buffer);
+    auto leaf = Empty(CommitOwnerTreeKind::kMembers); leaf.node = CommitOwnerNodeKind::kLeaf;
+    const auto key = EncodeCommitOwnerMemberKey({value.group_id, value.ordinal}); leaf.prefix.assign(key.begin(), key.end());
+    leaf.value = Ref(CommitOwnerObjectKind::kMemberValue, raw); leaf.subtree_keys = 1U; leaf.subtree_bytes = 92U + 24U + 48U + raw.size();
+    assert(ParseCommitOwnerPage(SerializeCommitOwnerPage(leaf), kScope, CommitOwnerTreeKind::kMembers, 2U) == leaf);
+    --leaf.value->bytes; --leaf.subtree_bytes;
+    Reject([&] { (void)SerializeCommitOwnerPage(leaf); });
+}
+void MemberBindings() {
+    MemberFixture fixture;
+    auto altered = fixture.value; ++altered.group_id[0U]; Reject([&] { fixture.Bind(altered); });
+    altered = fixture.value; altered.ordinal = 0U; Reject([&] { fixture.Bind(altered); });
+    altered = fixture.value; ++altered.coverage.coord.x; Reject([&] { fixture.Bind(altered); });
+    altered = fixture.value; ++altered.decision_sha256[0U]; Reject([&] { fixture.Bind(altered); });
+    altered = fixture.value; ++altered.revision; Reject([&] { fixture.Bind(altered); });
+    altered = fixture.value; ++altered.commit_time_ms; Reject([&] { fixture.Bind(altered); });
+    altered = fixture.value; ++altered.schema_version; Reject([&] { fixture.Bind(altered); });
+    auto other = fixture.decision; ++other.directory_id[0U];
+    Reject([&] { ValidateCommitOwnerMemberBinding(fixture.value, {fixture.value.group_id, 1U}, fixture.value.coverage,
+        other, fixture.value.decision_sha256); });
+    other = fixture.decision; ++other.id[0U];
+    Reject([&] { ValidateCommitOwnerMemberBinding(fixture.value, {fixture.value.group_id, 1U}, fixture.value.coverage,
+        other, fixture.value.decision_sha256); });
+    // A different fully valid decision can retain this exact ordinal but have
+    // another member count. Digest and key checks alone cannot bind its set.
+    other = fixture.decision; auto extra = other.members.back(); ++extra.coord.x; other.members.push_back(extra);
+    altered = fixture.value; altered.decision_sha256 = crypto::Sha256Of(SerializeCommitGroupDecision(other));
+    Reject([&] { ValidateCommitOwnerMemberBinding(altered, {altered.group_id, 1U}, altered.coverage,
+        other, altered.decision_sha256); });
+    for (unsigned field = 0U; field < 7U; ++field) {
+        other = fixture.decision; auto& member = other.members[1U];
+        switch (field) {
+            case 0U: ++member.table_epoch[0U]; break;
+            case 1U: member.dims = 3U; break;
+            case 2U: ++member.coord.x; break;
+            case 3U: member.kind = CommitGroupMemberKind::kObserved; break;
+            case 4U: ++member.revision; break;
+            case 5U: ++member.commit_time_ms; break;
+            case 6U: ++member.schema_version; break;
+        }
+        // Other fields here are deliberately caller facts: the binding must
+        // reject them even if the same measured digest is supplied.
+        Reject([&] { ValidateCommitOwnerMemberBinding(fixture.value, {fixture.value.group_id, 1U}, fixture.value.coverage,
+            other, fixture.value.decision_sha256); });
+    }
+}
 }
 int main() {
     ScopeAndGoldenRoot(); RootTransitionsAndCounter(); InventoryAndTreeSelections(); PageGoldenAndBindings(); OrderedKeysAndBounds();
+    MemberCapsules(); MemberBindings();
 }
