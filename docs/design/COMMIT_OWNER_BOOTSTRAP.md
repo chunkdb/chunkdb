@@ -29,6 +29,8 @@ Existing-table pins are opened relative to the admitted native directory and fix
 Construction consumes the ticket into an RAII admission owner before geometry selection; failure releases the pin, and a successful constructor releases it before returning while retaining only the shared directory owner context.
 A consumed ticket cannot open another store, so a closed native pin is never reused as authority through a saved inode number or copied StoreConfig.
 The root context is shared by the catalog tables and table pins do not become one persistent directory descriptor per table; Windows admission pins allow delete sharing so admitted DDL renames remain possible.
+These retained facts grant no later grouped-write or ACTIVE-publication permission; those operations require a live exclusive owner lease and their own participant pins.
+Admission does not claim to make existing ordinary pathname-based I/O safe against arbitrary namespace changes after the constructor returns, and a leaf pin does not imply ancestor-rename exclusion.
 A catalog-owned table opened directly, including read-only open, refuses without the matching checked context.
 It never bootstraps a standalone owner as fallback, even after every grouped WAL has retired.
 All existing table scopes and epoch uniqueness are checked before any table's pending narrowing or storage recovery can mutate data.
