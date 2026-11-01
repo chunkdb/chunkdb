@@ -257,7 +257,7 @@ void TakeoverRights(bool tls) {
     Harness harness(tls, true);
     auto admin = harness.Connect(); Create(*admin);
     const std::array<std::uint8_t, 16> salt{};
-    const auto verifier = scram::FormatVerifier(scram::MakeVerifier("pw", salt, scram::kMinIterations));
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
     for (const auto* user : {"one", "two"}) {
         admin->Ok(std::string("CREATE USER ") + user + " VERIFIER '" + verifier + "'");
         admin->Ok(std::string("GRANT READ ON t TO ") + user);
@@ -352,7 +352,7 @@ void ConditionalObjects(bool tls) {
     admin->Ok("DROP SLOT IF EXISTS 'consumer' ON t");
     assert(admin->Command("SHOW SLOTS ON t").items.empty());
     const std::array<std::uint8_t, 16> salt{};
-    const auto verifier = scram::FormatVerifier(scram::MakeVerifier("pw", salt, scram::kMinIterations));
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
     admin->Ok("CREATE USER IF NOT EXISTS reader VERIFIER '" + verifier + "'");
     admin->Ok("CREATE USER IF NOT EXISTS reader VERIFIER 'invalid' MANAGES USERS");
     Client reader(harness.port, tls); reader.Login("reader", "pw");
@@ -389,7 +389,7 @@ void Rights(bool tls) {
     admin->Ok("CREATE TABLE hidden (n u8) CHUNK 4 x 4");
     admin->Ok("CREATE SLOT 'private' ON hidden");
     const std::array<std::uint8_t, 16> salt{};
-    const auto verifier = scram::FormatVerifier(scram::MakeVerifier("pw", salt, scram::kMinIterations));
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
     admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
     Client reader(harness.port, tls); reader.Login("reader", "pw");
     assert(reader.Command("SHOW SLOTS").items.empty());

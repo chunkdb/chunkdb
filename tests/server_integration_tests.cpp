@@ -33,6 +33,8 @@
 #include "../src/change_feed.hpp"
 #include "../src/proxy_protocol.hpp"
 #include "../src/slot_watch.hpp"
+#include "../src/server_socket.hpp"
+#include "../src/sectioned_chunk_form.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -63,6 +65,48 @@ void SetServerTimeoutConfigFailpointForTests(
     std::size_t recv_failures) noexcept;
 void ResetServerTimeoutConfigCountersForTests() noexcept;
 std::uint64_t ServerRecvTimeoutConfigCallsForTests() noexcept;
+std::size_t FeedDeliveryTestAccess::FillActiveClientSendQueue(ChunkServer& server, int bytes) {
+    std::lock_guard lock(server.active_clients_mutex_);
+    assert(server.active_clients_.size() == 1U);
+    const auto socket = static_cast<
+#ifdef _WIN32
+        SOCKET
+#else
+        int
+#endif
+    >(server.active_clients_.front());
+    assert(setsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
+    int actual = 0;
+#ifdef _WIN32
+    int length = sizeof(actual);
+#else
+    socklen_t length = sizeof(actual);
+#endif
+    assert(getsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&actual), &length) == 0);
+    assert(actual > 0);
+    std::string error;
+    assert(server_detail::SetSocketNonBlocking(socket, true, &error));
+    const std::vector<char> filler(16U * 1024U * 1024U, 'x');
+    std::size_t filled = 0U;
+    bool blocked = false;
+    while (filled < 4U * filler.size()) {
+        const auto sent = send(socket, filler.data(), static_cast<int>(filler.size()), 0);
+        if (sent > 0) { filled += static_cast<std::size_t>(sent); continue; }
+        const auto code = server_detail::CurrentSocketErrorCode();
+        if (sent < 0 && server_detail::IsSocketInterruptedError(code)) continue;
+#ifdef _WIN32
+        blocked = sent < 0 && code == WSAEWOULDBLOCK;
+#else
+        blocked = sent < 0 && (code == EAGAIN || code == EWOULDBLOCK);
+#endif
+        assert(blocked);
+        break;
+    }
+    assert(blocked && filled > 0U);
+    assert(server_detail::SetSocketNonBlocking(socket, false, &error));
+    std::cout << "steady slow reader: send_buffer=" << actual << " prefilled=" << filled << '\n' << std::flush;
+    return filled;
+}
 }
 
 namespace {
@@ -303,7 +347,7 @@ std::string LoginReply(Client& client, const std::string& user, const std::strin
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
-    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive AUTH response");
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: build prepared AUTH response");
     const auto step = chunkdb::test::AuthBytes(login, password, first);
     client.SendBytes(step.bytes);
     const auto fields = ReadHelloReply(client);
@@ -315,15 +359,17 @@ std::string LoginReply(Client& client, const std::string& user, const std::strin
 
 // A login with a wrong password: the error line.
 template <typename Client>
-std::string FailedLoginReply(Client& client, const std::string& user, const std::string& password) {
+std::string FailedLoginReply(Client& client, const std::string& user, const std::string& /*password*/) {
     const auto login = chunkdb::scram::StartClientLogin(user, chunkdb::scram::NewNonce());
     client.SendBytes(chunkdb::test::HelloUserBytes(login, user));
     const std::string first = client.ReadLine();
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
-    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive rejected AUTH response");
-    client.SendBytes(chunkdb::test::AuthBytes(login, password, first).bytes);
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: send rejected AUTH response");
+    // Wrong-password cryptography is covered by the RFC exchange tests.
+    // The timed socket fixture needs an invalid proof without key derivation.
+    client.SendBytes(chunkdb::test::WrongAuthBytes(first));
     return client.ReadLine();
 }
 
@@ -1271,6 +1317,14 @@ class ScopedLogCapture {
         return count;
     }
 
+    [[nodiscard]] std::string FirstContaining(std::string_view needle) const {
+        std::lock_guard lock(lines_mutex_);
+        for (const auto& line : lines_) {
+            if (line.find(needle) != std::string::npos) return line;
+        }
+        return {};
+    }
+
     [[nodiscard]] std::size_t IndexOf(std::string_view needle) const {
         std::lock_guard lock(lines_mutex_);
         return IndexOfLocked(needle);
@@ -1608,8 +1662,7 @@ std::string BitsReply(std::string_view bytes) {
     return "*1\r\n$" + std::to_string(bytes.size()) + "\r\n" + std::string(bytes) + "\r\n";
 }
 
-// The chunk form of GET CHUNK and SET CHUNK: version (u64, little-endian),
-// presence bitmap, payload, then the VARS entries.
+// The checked form sections used by these one-column transport fixtures.
 struct ChunkForm {
     std::uint64_t version = 0;
     std::string presence;
@@ -1618,23 +1671,43 @@ struct ChunkForm {
 };
 
 ChunkForm ParseChunkForm(const std::string& form, std::size_t presence_bytes, std::size_t payload_bytes) {
-    if (form.size() < 16U + presence_bytes + payload_bytes) {
-        throw std::runtime_error("chunk form of " + std::to_string(form.size()) + " bytes is too short");
-    }
+    const auto bytes = std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(form.data()), form.size());
+    const auto envelope = chunkdb::ParseChunkFormSections(bytes, UINT32_MAX, chunkdb::ChunkFormReadMode::kRead);
     ChunkForm parsed;
-    for (std::size_t i = 0; i < 8; ++i) {
-        parsed.version |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(form[i])) << (8U * i);
+    parsed.version = envelope.header.chunk_version;
+    for (const auto& section : envelope.sections) {
+        const auto text = std::string(reinterpret_cast<const char*>(section.body.data()), section.body.size());
+        if (section.kind == static_cast<unsigned>(chunkdb::ChunkFormSectionKind::kPresence)) parsed.presence = text;
+        if (section.kind == static_cast<unsigned>(chunkdb::ChunkFormSectionKind::kFixedValues)) parsed.payload = text;
+        if (section.kind == static_cast<unsigned>(chunkdb::ChunkFormSectionKind::kVariableValues)) parsed.vars = text;
     }
-    parsed.presence = form.substr(16, presence_bytes);
-    parsed.payload = form.substr(16 + presence_bytes, payload_bytes);
-    parsed.vars = form.substr(16 + presence_bytes + payload_bytes);
+    assert(parsed.presence.size() == presence_bytes && parsed.payload.size() == payload_bytes);
     return parsed;
 }
 
 // A chunk form to send for a table at schema version 1; SET CHUNK does not
 // read its version.
 std::string ChunkFormOf(const std::string& presence, const std::string& payload) {
-    return std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8) + presence + payload;
+    std::vector<std::uint8_t> descriptor;
+    const auto append = [&](std::uint32_t value) {
+        for (unsigned i = 0U; i < 4U; ++i) descriptor.push_back(static_cast<std::uint8_t>(value >> (8U * i)));
+    };
+    assert(!presence.empty() && payload.size() % presence.size() == 0U);
+    append(1U); append(1U); append(static_cast<std::uint32_t>(payload.size() / presence.size()));
+    append(0U); append(static_cast<std::uint32_t>(payload.size())); append(0U); append(0U);
+    const std::array<chunkdb::ChunkFormSection, 3> sections{{
+        {1U, {reinterpret_cast<const std::uint8_t*>(presence.data()), presence.size()}},
+        {2U, {reinterpret_cast<const std::uint8_t*>(payload.data()), payload.size()}}, {6U, descriptor}}};
+    const auto bytes = chunkdb::SerializeChunkFormSections({.schema_version = 1U}, sections, UINT32_MAX);
+    return {bytes.begin(), bytes.end()};
+}
+
+std::size_t ChunkFormLimit(ServerHarness& harness, std::string_view table) {
+    chunkdb::SessionState session;
+    session.greeted = session.authenticated = true;
+    const auto plan = harness.engine->PlanPayload(session, "SET CHUNK 0 0 IN " + std::string(table) + " $1\r\n");
+    assert(plan.parameter_limits.size() == 1U);
+    return plan.parameter_limits.front();
 }
 
 // One parameter frame: `$<length>`, the bytes, an empty line.
@@ -1767,7 +1840,7 @@ void TestChunkPutWritesAndFraming() {
     assert(presence_bytes == 2);
     // A chunk frame is bounded by the chunk form and the VARS budget.
     const std::size_t frame_limit =
-        16U + presence_bytes + payload_bytes + harness.catalog->Find("default")->Info().options.var_max_chunk_bytes;
+        ChunkFormLimit(harness, "default");
     const auto read_chunk = [&](RawClient& reader, int chunk_x) {
         reader.SendLine("GET CHUNK " + std::to_string(chunk_x) + " 0 FROM default");
         return ParseChunkForm(reader.ReadBulkText(), presence_bytes, payload_bytes);
@@ -1839,7 +1912,7 @@ void TestChunkPutWritesAndFraming() {
     // A frame of the wrong size that still fits the bound is read and
     // drained, the statement fails, and the connection stays usable.
     client.SendBytes("SET CHUNK 3 0 IN default $1\r\n$2\r\n\x01\x02\r\n");
-    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT reason=invalid_argument the chunk starts with its version and schema version (16 bytes), got 2", 0) == 0);
+    assert(client.ReadLine().rfind("-ERR INVALID_ARGUMENT reason=invalid_argument chunk form header is truncated", 0) == 0);
     assert(chunk_absent(3));
 
     // Invalid statements drain their lexical frame count, then preserve
@@ -2329,8 +2402,8 @@ void TestChunkGetLengthsAndForms() {
     const auto geometry = harness.geometry();
     const std::size_t payload_bytes = geometry.ChunkPayloadBytes();
     const std::size_t presence_bytes = (geometry.ChunkBlockCount() + 7U) / 8U;
-    const std::size_t form_bytes = 16U + presence_bytes + payload_bytes;
-    assert(payload_bytes == 8U && form_bytes == 26U);
+    const std::size_t form_bytes = 100U + presence_bytes + payload_bytes;
+    assert(payload_bytes == 8U && form_bytes == 110U);
 
     // A never-written chunk is null, including a repeated cached read.
     client.SendLine("GET CHUNK 0 0 FROM default");
@@ -2351,9 +2424,9 @@ void TestChunkGetLengthsAndForms() {
 
     // COLUMNS naming the one column, and an area read, give the same form.
     client.SendLine("GET CHUNK 0 0 FROM default COLUMNS bits");
-    assert(client.ReadBulkText() == full);
+    assert(ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes).payload == zero_chunk);
     client.SendLine("GET AREA 0 0 TO 0 0 FROM default");
-    assert(client.ReadReply() == "*1\r\n*3\r\n:0\r\n:0\r\n$26\r\n" + full + "\r\n");
+    assert(client.ReadReply() == "*1\r\n*3\r\n:0\r\n:0\r\n$" + std::to_string(form_bytes) + "\r\n" + full + "\r\n");
 
     // A sparse state: blocks 0 and 15 present.
     const std::string sparse = ChunkFormOf(std::string("\x01\x80", 2), std::string("\x0f", 1) + std::string(7, '\0'));
@@ -2362,7 +2435,7 @@ void TestChunkGetLengthsAndForms() {
     client.SendLine("GET CHUNK 1 0 FROM default");
     const std::string sparse_back = client.ReadBulkText();
     assert(ParseChunkForm(sparse_back, presence_bytes, payload_bytes).version == sparse_version);
-    assert(sparse_back.substr(8) == sparse.substr(8));
+    assert(sparse_back.substr(32) == sparse.substr(32));
     client.SendLine("GET BLOCK 4 0 FROM default");
     assert(client.ReadReply() == BitsReply("\x0f"));
     client.SendLine("GET BLOCK 5 0 FROM default");
@@ -3052,7 +3125,7 @@ void TestTlsReload() {
 
     // READ on a table is not enough.
     const std::array<std::uint8_t, 16> salt{};
-    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
     open.SendLine("CREATE USER reader VERIFIER '" + verifier + "'");
     assert(open.ReadLine() == "+OK\r\n");
     open.SendLine("GRANT READ ON default TO reader");
@@ -3130,11 +3203,14 @@ void TestChunkPutOverTls() {
     assert(read_back.version == version);
     assert(read_back.payload == payload);
 
-    // An empty replacement of a never-written chunk changes nothing.
+    // A successful full replacement establishes its producing identity even
+    // when the supplied state is the empty baseline.
     const std::string empty = ChunkFormOf(std::string(presence_bytes, '\x00'), payload);
     client.SendBytes("SET CHUNK 1 0 IN default $1\r\n" + Frame(empty) + "GET CHUNK 1 0 FROM default\r\n");
-    (void)ReadVersion(client);
-    assert(client.ReadLine() == "_\r\n");
+    const auto initialized = ReadVersion(client);
+    const auto baseline = ParseChunkForm(client.ReadBulkText(), presence_bytes, payload_bytes);
+    assert(baseline.version == initialized && baseline.presence == std::string(presence_bytes, '\0') &&
+        baseline.payload == std::string(payload_bytes, '\0'));
     // Replacing the previously written chunk retains its versioned tombstone.
     client.SendBytes("SET CHUNK 0 0 IN default $1\r\n" + Frame(empty) + "GET CHUNK 0 0 FROM default\r\n");
     const auto empty_version = ReadVersion(client);
@@ -3481,13 +3557,32 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     assert(response == "%14\r\n");
 }
 
-#ifndef _WIN32
-// Windows CI ended no write within 6 s for this case; why is open in #180.
-void TestSteadySlowReaderHitsReplyWriteDeadline() {
+void TestSteadySlowReaderHitsReplyWriteDeadline(bool fail_before_read = false) {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+    struct QueueHook final : chunkdb::FeedDeliveryTestHook {
+        chunkdb::ChunkServer* server = nullptr;
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool ready = false, released = false;
+        void Run(Point point, std::size_t completed) override {
+            if (point != Point::kAfterClientRead || completed != 1U) return;
+            (void)chunkdb::FeedDeliveryTestAccess::FillActiveClientSendQueue(*server, 65536);
+            std::unique_lock lock(mutex);
+            ready = true;
+            changed.notify_all();
+            changed.wait(lock, [&] { return released; });
+        }
+        bool Wait() {
+            std::unique_lock lock(mutex);
+            return changed.wait_for(lock, std::chrono::seconds(10), [&] { return ready; });
+        }
+        void Release() {
+            { std::lock_guard lock(mutex); released = true; }
+            changed.notify_all();
+        }
+    } hook;
 
-    // A 64 MiB chunk reply cannot fit any socket buffer, so the server must
-    // wait for room and the reply deadline must end the write.
+    // The reply must remain in flight while the client steadily drains it.
     auto store_cfg = BaseStoreConfig();
     store_cfg.geometry = {
         .large_chunk_width_chunks = 1,
@@ -3506,13 +3601,29 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     server_cfg.idle_connection_timeout_ms = 10000;
 
     ServerHarness harness("steady-slow-reader-deadline", store_cfg, engine_cfg, server_cfg);
+    struct ReleaseHook {
+        QueueHook& hook;
+        ~ReleaseHook() { hook.Release(); }
+    } release{hook};
     {
         auto lease = harness.catalog->Find("default")->Acquire();
         lease->store().SetBlockBits(0, 0, std::string(512, '0'));
     }
     RawClient slow("127.0.0.1", harness.port);
     slow.SetReceiveBuffer(65536);
-    slow.SendBytes("HELLO 3\r\nGET CHUNK 0 0 FROM default\r\n");
+    slow.Hello();
+    hook.server = harness.server.get();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    slow.SendBytes("GET CHUNK 0 0 FROM default\r\n");
+    assert(hook.Wait());
+    if (fail_before_read) throw std::runtime_error("injected first read failure");
+    // The worker is paused after reading the request, with its send queue
+    // filled to would-block. Start draining those fixture bytes before GET
+    // begins executing, so a timeout exercises an active continuous reader.
+    std::size_t first_read = 0U;
+    const bool first_closed = slow.ReadSomeWithin(std::chrono::seconds(1), 4096, &first_read) && first_read == 0U;
+    hook.Release();
+    assert(!first_closed && first_read > 0U);
 
     // The client keeps reading about 1 MiB/s, fast enough to reopen the TCP
     // window well within the send timeout, so a send that blocks until the
@@ -3521,20 +3632,26 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     const auto start = std::chrono::steady_clock::now();
     bool terminated = false;
     bool closed = false;
+    std::size_t received = first_read;
     while (!terminated && !closed && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
         for (int read = 0; read < 16 && !closed; ++read) {
             std::size_t bytes_read = 0;
             closed = slow.ReadSomeWithin(std::chrono::milliseconds(50), 4096, &bytes_read) && bytes_read == 0;
+            received += bytes_read;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         terminated = logs.Contains("connection terminated");
     }
-    assert(logs.WaitContains("connection terminated", std::chrono::seconds(1)));
+    const bool logged = logs.WaitContains("connection terminated", std::chrono::seconds(1));
+    std::cout << "steady slow reader: logged=" << logged << " closed=" << closed
+              << " received=" << received << '\n' << std::flush;
+    assert(logged);
     assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(4));
     assert(logs.Contains("phase=write"));
     assert(logs.Contains("reason=timeout"));
+    assert(logs.Contains("reply write deadline exceeded after "));
+    std::cout << "steady slow reader: " << logs.FirstContaining("reply write deadline exceeded after ") << '\n';
 }
-#endif
 
 void TestIdlePeerCloseDoesNotLogTerminationWarning() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
@@ -4048,9 +4165,9 @@ void TestTablesOverProtocol() {
         // A frame of a length that a terrain chunk takes is read; the same
         // length is more than a default chunk holds and is refused unread.
         const std::size_t default_limit =
-            16U + 2U + 8U + harness.catalog->Find("default")->Info().options.var_max_chunk_bytes;
+            ChunkFormLimit(harness, "default");
         const std::size_t terrain_limit =
-            16U + 2U + 18U + harness.catalog->Find("terrain")->Info().options.var_max_chunk_bytes;
+            ChunkFormLimit(harness, "terrain");
         assert(default_limit < terrain_limit);
         const std::string long_form = form + std::string(default_limit + 1U - form.size(), '\0');
         a.SendBytes("SET CHUNK 6 6 IN terrain $1\r\n" + Frame(long_form));
@@ -4094,7 +4211,7 @@ void TestTablesOverProtocol() {
     a.SendBytes("SET CHUNK 5 5 IN terrain $1\r\n" + Frame(small));
     (void)ReadVersion(a);
     a.SendLine("GET CHUNK 5 5 FROM terrain");
-    assert(a.ReadBulkText().substr(8) == small.substr(8));
+    assert(a.ReadBulkText().substr(32) == small.substr(32));
 
     // FLUSH WAL covers every table.
     a.SendLine("FLUSH WAL");
@@ -4276,7 +4393,7 @@ void TestWatchPositionsAndRights() {
     ServerHarness harness("watch-positions", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
     RawClient writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
     const std::array<std::uint8_t, 16> salt{};
-    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
     writer.SetReadDeadline(std::chrono::seconds(15));
     writer.SendLine("CREATE USER reader VERIFIER '" + verifier + "'"); assert(writer.ReadLine() == "+OK\r\n");
     RawClient reader("127.0.0.1", harness.port); reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login("reader", "pw");
@@ -5641,9 +5758,15 @@ int main(int argc, char** argv) {
         run("TestLongIdleConnectionTimeoutReleasesWorker", TestLongIdleConnectionTimeoutReleasesWorker);
         run("TestPendingQueueWaitTimeoutClosesQueuedSocket", TestPendingQueueWaitTimeoutClosesQueuedSocket);
         run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
-#ifndef _WIN32
-        run("TestSteadySlowReaderHitsReplyWriteDeadline", TestSteadySlowReaderHitsReplyWriteDeadline);
-#endif
+        run("TestSteadySlowReaderHitsReplyWriteDeadline", [] { TestSteadySlowReaderHitsReplyWriteDeadline(); });
+        run("TestSteadySlowReaderReadFailureTeardown", [] {
+            bool failed = false;
+            try { TestSteadySlowReaderHitsReplyWriteDeadline(true); }
+            catch (const std::runtime_error& error) {
+                failed = std::string_view(error.what()) == "injected first read failure";
+            }
+            assert(failed);
+        });
         run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);
         run("TestPendingQueueSaturationRejectsNewConnections", TestPendingQueueSaturationRejectsNewConnections);
         run("TestReadinessLogLineExists", TestReadinessLogLineExists);

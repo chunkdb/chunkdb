@@ -299,7 +299,8 @@ void ChunkStore::WriteBlockBitsLocked(
     const auto saved_wal_bytes = regular_chunk->wal_bytes;
     const auto saved_pending_wal_flush_updates = regular_chunk->pending_wal_flush_updates;
     FeedWriteGuard feed(*this);
-    feed.BeforeBlock(chunk_coord, regular_chunk->payload, regular_chunk->presence_bitmap, regular_chunk->vars, geometry_.layout(), block_index);
+    feed.BeforeBlock(chunk_coord, regular_chunk->payload, regular_chunk->presence_bitmap, regular_chunk->vars,
+        geometry_.layout(), block_index, regular_chunk->chunk_columns.get(), regular_chunk->written);
     try {
         // Reserve the version token before any WAL staging so a
         // version-clock failure is a clean pre-WAL error.
@@ -989,7 +990,8 @@ void ChunkStore::WriteBlockColumnsLocked(
     const auto saved_pending_wal_flush_updates = chunk->pending_wal_flush_updates;
     VarUndo var_undo;
     FeedWriteGuard feed(*this);
-    feed.BeforeBlock(chunk_coord, chunk->payload, chunk->presence_bitmap, chunk->vars, geometry_.layout(), block_index);
+    feed.BeforeBlock(chunk_coord, chunk->payload, chunk->presence_bitmap, chunk->vars,
+        geometry_.layout(), block_index, chunk->chunk_columns.get(), chunk->written);
     try {
         const std::uint64_t reserved_version = NextChunkVersion();
         feed.Version(reserved_version);
@@ -1275,7 +1277,8 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
     // failure is a clean pre-WAL error and an open transaction can keep the
     // state this write replaces.
     FeedWriteGuard feed(*this);
-    feed.Before(chunk_coord, regular_chunk->payload, regular_chunk->presence_bitmap, regular_chunk->vars);
+    feed.Before(chunk_coord, regular_chunk->payload, regular_chunk->presence_bitmap, regular_chunk->vars,
+        regular_chunk->chunk_columns.get(), regular_chunk->written);
     const std::uint64_t reserved_version = NextChunkVersion();
     feed.Version(reserved_version);
     TxnKeep keep = PrepareTxnKeepLocked(chunk_coord, *regular_chunk, reserved_version);

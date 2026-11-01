@@ -5,6 +5,7 @@
 #include <string>
 
 #include "chunkdb/chunk_columns.hpp"
+#include "chunk_form.hpp"
 #include "sectioned_chunk_form.hpp"
 #include "typed_chunk_form.hpp"
 
@@ -108,6 +109,11 @@ void GoldenAndIdentity() {
     const auto decoded = DecodeSectionedChunkState(geometry, bytes, kVarMaxChunkBytesLimit);
     assert(decoded.version == 0U && decoded.commit_time_ms == 0U && !decoded.written);
     assert(decoded.payload == state.payload && decoded.presence_bitmap == state.presence_bitmap);
+    const std::string text(bytes.begin(), bytes.end());
+    assert(ChunkFormSchemaVersion(text) == 7U);
+    const auto facade = DecodeChunkForm(geometry, text);
+    assert(facade.payload == state.payload && facade.presence_bitmap == state.presence_bitmap && !facade.written);
+    Reject([&] { (void)ChunkFormSchemaVersion(std::string(16U, '\0')); });
     const auto private_bytes = EncodeSectionedChunkState(geometry, state, kVarMaxChunkBytesLimit, {}, true);
     const auto private_form = ParseChunkFormSections(private_bytes, 1024U, ChunkFormReadMode::kMutation);
     assert(private_form.header.flags == kChunkFormPrivate && private_form.header.chunk_version == 0U && private_form.header.commit_time_ms == 0U);
