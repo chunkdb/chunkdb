@@ -133,7 +133,11 @@ void ExactResponseBounds() {
             }
             const auto reply = f.Run(command);
             if (exact) assert(reply == Expected(rows, {}, 2U, false, schema));
-            else Error(reply, "OUT_OF_RANGE");
+            else {
+                Error(reply, "OUT_OF_RANGE");
+                assert(reply.find("response exceeds the " + std::to_string(limits.max_area_response_bytes) +
+                    "-byte limit") != std::string::npos);
+            }
         }
     }
     const auto one_page_bytes = Expected({{{0, 0}, wide.Run("GET CHUNK 0 0 FROM t")}}, ChunkCoord{0, 0}).size();

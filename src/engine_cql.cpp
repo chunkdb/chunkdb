@@ -1334,7 +1334,10 @@ std::string CommandEngine::ExecuteStatement(
                     if (!paged && detail::AreaRequestedExceeds(selector, limits.max_area_chunks))
                         throw std::invalid_argument("area exceeds its requested-chunk limit; use LIMIT");
                     const auto budget = limits.max_area_response_bytes;
-                    const auto too_large = [] { return std::out_of_range("area response exceeds its byte limit; request fewer chunks"); };
+                    const auto too_large = [budget] {
+                        return std::out_of_range("area response exceeds the " + std::to_string(budget) +
+                            "-byte limit; request fewer chunks");
+                    };
                     std::vector<ChunkCoord> covered;
                     TxnAreaRead read;
                     if (session.transaction != nullptr) {

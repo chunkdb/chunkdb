@@ -98,7 +98,7 @@ void ManifestDomainsAndAdmission() {
     }
     const DataDirManifest directory{.data_dir_id = kEpoch, .options = {}};
     auto bytes = SerializeDataDirManifest(directory);
-    assert(ReadLe16(bytes, 4U) == 2U && ReadLe32(bytes, 8U) == kChunkModelFormatBit);
+    assert(ReadLe16(bytes, 4U) == 2U && ReadLe32(bytes, 8U) == (kChunkModelFormatBit | kFeatureCommitGroups));
     assert(ParseDataDirManifest(bytes).data_dir_id == kEpoch);
     At(&bytes, 4U, 1U, 2U);
     Reject([&] { (void)ParseDataDirManifest(bytes); }, "earlier development build");
