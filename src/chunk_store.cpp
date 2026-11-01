@@ -463,6 +463,8 @@ ChunkStore::ChunkStore(StoreConfig config)
             owner_admission_ = CommitOwnerBootstrap::BeginStoreAdmission(owner_config);
             commit_owner_context_ = owner_admission_->owner();
         }
+        if (access_mode_ != AccessMode::kReadOnly)
+            CleanupAtomicTmpArtifacts(StoreManifestPath(data_dir_));
         // Slots refuse multi-process writers before recovery can change any
         // artifact. Read-only opening only inspects their checked metadata.
         const auto slots = ReadFeedSlotRecords(data_dir_, store_id_, geometry_.dims());
@@ -549,14 +551,8 @@ void ChunkStore::InitializeStoreManifest(const ProcessLock* bootstrap_owner) {
     const auto pending = CommitOwnerBootstrap::ReadPending(data_dir_);
     auto manifest = owner_admission_ ? std::optional<StoreManifest>(owner_admission_->ReadCurrentManifest()) :
         ReadManifestOrRequireNewStore(data_dir_, access_mode_, geometry_.dims());
-    if (access_mode_ != AccessMode::kReadOnly && !pending) {
-        // Stale temp files of an initialization that crashed before
-        // publishing (or, on POSIX, before dropping the temp name).
-        CleanupAtomicTmpArtifacts(manifest_path);
-    }
     if (!manifest.has_value() || pending) {
         if (!bootstrap_owner) throw std::runtime_error("initial owner creation requires its exclusive bootstrap lock");
-        if (!pending) CleanupAtomicTmpArtifacts(data_dir_ / kChunkIndexFileName);
         const auto unpublished_id = pending ? std::optional<StoreId>{} :
             CommitOwnerBootstrap::UnpublishedEmptyIdentity(data_dir_, geometry_.dims());
         const TableOptions options{

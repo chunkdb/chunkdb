@@ -134,6 +134,18 @@ std::vector<std::uint8_t> WithCrc(std::vector<std::uint8_t> bytes) {
     return bytes;
 }
 
+// Keep owned fields valid while bypassing writer checks for damaged-reader fixtures.
+std::vector<std::uint8_t> WithRawOptions(chunkdb::StoreManifest manifest,
+                                       const std::vector<std::uint8_t>& raw) {
+    manifest.options.clear();
+    auto bytes = chunkdb::SerializeStoreManifest(manifest);
+    const auto size = chunkdb::ReadLe32(bytes, 64U) + raw.size();
+    bytes.insert(bytes.begin() + 68U, raw.begin(), raw.end());
+    for (unsigned i = 0U; i < 4U; ++i)
+        bytes[64U + i] = static_cast<std::uint8_t>(size >> (8U * i));
+    return WithCrc(std::move(bytes));
+}
+
 int ExitCode(int status) {
 #ifdef _WIN32
     return status;
@@ -197,9 +209,10 @@ void TestNewStoreRecordsGeometryAndId() {
     assert(manifest.options.size() == 58U);
     // A table created with a block width is one column bits(block_bits).
     assert(manifest.schema == chunkdb::SingleBitsColumnSchema(7));
+    assert(manifest.commit_owner && manifest.commit_owner->role == chunkdb::CommitOwnerRole::kStandalone);
     assert(bytes.size() == chunkdb::kStoreManifestMinSize + manifest.options.size() +
                                chunkdb::EncodeTableSchema(manifest.schema).size() +
-                               chunkdb::EncodeChunkSchema(*manifest.chunk_schema).size());
+                               chunkdb::EncodeChunkSchema(*manifest.chunk_schema).size() + 44U);
     const auto options = chunkdb::DecodeTableOptions(manifest.options);
     assert(options.durability_mode == chunkdb::DurabilityMode::kFsyncWal);
     assert(options.checkpoint_update_interval == config.checkpoint_update_interval);
@@ -399,20 +412,17 @@ void TestDamagedManifestRefused() {
     }
     {
         // An option entry of a type no feature in the flags explains.
-        auto manifest = chunkdb::ParseStoreManifest(good);
-        manifest.options = {99, 0, 1, 0, 0xAB};
-        damages.push_back({"option", chunkdb::SerializeStoreManifest(manifest), "unknown option type 99"});
+        damages.push_back({"option", WithRawOptions(chunkdb::ParseStoreManifest(good), {99, 0, 1, 0, 0xAB}),
+            "unknown option type 99"});
     }
     {
-        auto manifest = chunkdb::ParseStoreManifest(good);
-        manifest.options = {99, 0, 9, 0, 0xAB};  // length 9, one byte present
-        damages.push_back({"option length", chunkdb::SerializeStoreManifest(manifest), "overruns"});
+        // Its declared length also exceeds the immutable owner-scope options.
+        damages.push_back({"option length", WithRawOptions(chunkdb::ParseStoreManifest(good),
+            {99, 0, 0xFF, 0xFF, 0xAB}), "overruns"});
     }
     // Malformed known options.
     const auto with_options = [&](std::vector<std::uint8_t> options) {
-        auto manifest = chunkdb::ParseStoreManifest(good);
-        manifest.options = std::move(options);
-        return chunkdb::SerializeStoreManifest(manifest);
+        return WithRawOptions(chunkdb::ParseStoreManifest(good), options);
     };
     damages.push_back({"durability", with_options({1, 0, 1, 0, 9}), "unknown durability mode 9"});
     damages.push_back(
@@ -435,7 +445,7 @@ void TestDamagedManifestRefused() {
         // the options and its size, with version (8) and next id (4) first.
         auto bytes = good;
         const auto manifest = chunkdb::ParseStoreManifest(good);
-        const std::size_t schema_at = 68U + manifest.options.size() + 4U;
+        const std::size_t schema_at = 68U + chunkdb::ReadLe32(good, 64U) + 4U;
         for (std::size_t i = schema_at + 12U; i < schema_at + 16U; ++i) {
             bytes[i] = 0;
         }
@@ -508,17 +518,18 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
         store.SetBlockBits(5, 5, "1100110011001100");
     });
     const auto baseline = chunkdb::ParseStoreManifest(ReadBytes(chunkdb::StoreManifestPath(table_dir))).features;
+    const auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(Config(data_dir));
     const auto log = dir.path() / "child.log";
     std::string output;
 
     RewriteManifest(table_dir, chunkdb::UnionFeatures(baseline, incompat), foreign_option);
     auto before = Tree(data_dir);
     for (const bool read_only : {false, true}) {
-        auto config = Config(table_dir);
+        auto config = catalog_config;
         if (read_only) {
-            config = ReadOnly(config);
+            config.access_mode = chunkdb::AccessMode::kReadOnly;
         }
-        const auto message = ExpectRefused([&] { chunkdb::ChunkStore store(config); });
+        const auto message = ExpectRefused([&] { chunkdb::test::OwnedTableStore store(config, "default"); });
         assert(Contains(message, "does not support (unknown incompat=0x40000000"));
         assert(Tree(data_dir) == before);
     }
@@ -529,16 +540,17 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
     before = Tree(data_dir);
     {
         const auto message =
-            ExpectRefused([&] { chunkdb::ChunkStore store(Config(table_dir)); });
+            ExpectRefused([&] { chunkdb::test::OwnedTableStore store(catalog_config, "default"); });
         assert(Contains(message, "can only be opened read-only"));
         assert(Contains(message, "ro_compat=0x8"));
         assert(Tree(data_dir) == before);
     }
     {
-        chunkdb::ChunkStore reader(ReadOnly(Config(table_dir)));
-        assert(reader.features().ro_compat == ro_compat.ro_compat);
+        auto read_only = catalog_config; read_only.access_mode = chunkdb::AccessMode::kReadOnly;
+        chunkdb::test::OwnedTableStore reader(read_only, "default");
+        assert(reader.store().features().ro_compat == ro_compat.ro_compat);
         try {
-            assert(reader.GetBlockBits(5, 5) == "1100110011001100");
+            assert(reader.store().GetBlockBits(5, 5) == "1100110011001100");
         } catch (const std::exception& error) {
             std::fprintf(stderr, "unknown-feature read rejected: %s\n", error.what());
             throw;
@@ -556,14 +568,14 @@ void TestUnknownFeatureFlags(const std::string& server, const std::string& verif
 
     RewriteManifest(table_dir, chunkdb::UnionFeatures(baseline, compat), foreign_option);
     {
-        chunkdb::ChunkStore store(Config(table_dir));
-        assert(store.features().compat == compat.compat);
-        assert(store.GetBlockBits(5, 5) == "1100110011001100");
-        store.SetBlockBits(6, 6, "0011001100110011");
+        chunkdb::test::OwnedTableStore store(catalog_config, "default");
+        assert(store.store().features().compat == compat.compat);
+        assert(store.store().GetBlockBits(5, 5) == "1100110011001100");
+        store.store().SetBlockBits(6, 6, "0011001100110011");
     }
     {
-        chunkdb::ChunkStore reopened(Config(table_dir));
-        assert(reopened.GetBlockBits(6, 6) == "0011001100110011");
+        chunkdb::test::OwnedTableStore reopened(catalog_config, "default");
+        assert(reopened.store().GetBlockBits(6, 6) == "0011001100110011");
     }
 }
 
@@ -585,7 +597,7 @@ void TestDirectoryWithoutManifestRefused() {
             }
             const auto message = ExpectRefused([&] { chunkdb::ChunkStore store(config); });
             assert(Contains(message, read_only ? "has no table.manifest" :
-                "unpublished inventory has other owned storage: "));
+                "fresh owner namespace contains other owned state"));
             assert(Tree(dir.path()) == before);
         }
     }
@@ -972,8 +984,7 @@ void TestLineageManifestCodec() {
         auto damaged = manifest;
         damaged.lineage.reset();
         damaged.features.incompat = features | chunkdb::kFeatureChunkModel;
-        damaged.options = std::move(raw);
-        const auto bytes = chunkdb::SerializeStoreManifest(damaged);
+        const auto bytes = WithRawOptions(damaged, raw);
         assert(Contains(ExpectRefused([&] { (void)chunkdb::ParseStoreManifest(bytes); }), reason));
     };
     refuse(raw_pair, "requires table_lineage", 0U);

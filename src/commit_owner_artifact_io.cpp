@@ -6,6 +6,7 @@
 #include <cstdio>
 #include <cstring>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -539,6 +540,109 @@ std::optional<std::vector<std::uint8_t>> CommitOwnerArtifactIo::ReadBootstrapByt
     return bytes;
 }
 
+void CommitOwnerArtifactIo::ValidateBootstrapTemporaries(const CommitOwnerBootstrapDecision& decision) const {
+    std::string target;
+    std::vector<std::uint8_t> empty_index;
+    if (decision.kind == CommitOwnerBootstrapKind::kDirectory) {
+        const auto manifest = ParseDataDirManifest(decision.manifest);
+        if (manifest.commit_owner != std::optional(impl_->scope)) Damage("temporary directory owner scope");
+        target = kDataDirManifestFileName;
+    } else if (decision.kind == CommitOwnerBootstrapKind::kStandalone) {
+        const auto manifest = ParseStoreManifest(decision.manifest);
+        if (manifest.commit_owner != std::optional(impl_->scope)) Damage("temporary store owner scope");
+        target = kStoreManifestFileName;
+        std::ostringstream output;
+        WriteIndexInventory(output, {.table_id = manifest.store_id, .dims = manifest.geometry.dims}, {});
+        const auto text = output.str(); empty_index.assign(text.begin(), text.end());
+    } else Damage("temporary creation kind");
+    const auto admit = [&](const std::string& name) {
+        bool candidate = false;
+        for (const auto* family : {"chunkdb.manifest.tmp.", "table.manifest.tmp.", "chunkdb.index.tmp."})
+            candidate = candidate || name.starts_with(family);
+        if (!candidate) return;
+        std::span<const std::uint8_t> expected;
+        const auto manifest_prefix = target + ".tmp.";
+        std::size_t at = 0U;
+        if (name.starts_with(manifest_prefix)) { at = manifest_prefix.size(); expected = decision.manifest; }
+        else if (!empty_index.empty() && name.starts_with("chunkdb.index.tmp.")) {
+            at = std::string_view("chunkdb.index.tmp.").size(); expected = empty_index;
+        } else Damage("temporary belongs to another creation target");
+        for (unsigned part = 0U; part < 4U; ++part) {
+            const auto end = name.find('.', at);
+            const auto length = (end == std::string::npos ? name.size() : end) - at;
+            if (length == 0U || length > 20U || (length > 1U && name[at] == '0') ||
+                ((part == 3U) != (end == std::string::npos))) Damage("invalid creation temporary spelling");
+            std::uint64_t value = 0U;
+            for (std::size_t i = at; i < at + length; ++i) {
+                if (name[i] < '0' || name[i] > '9') Damage("invalid creation temporary component");
+                const auto digit = static_cast<unsigned>(name[i] - '0');
+                if (value > (std::numeric_limits<std::uint64_t>::max() - digit) / 10U)
+                    Damage("creation temporary component overflow");
+                value = value * 10U + digit;
+            }
+            if ((part == 0U && (value == 0U || value > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()))) ||
+                (part == 3U && value == 0U)) Damage("invalid creation temporary identity");
+            if (end != std::string::npos) at = end + 1U;
+        }
+        const auto file = OpenChild(impl_->root, name, false, false, false, false, impl_->directory / name);
+        const auto extent = Extent(file);
+        if (extent > expected.size()) Damage("creation temporary exceeds its target");
+        std::array<std::uint8_t, 64U * 1024U> buffer{};
+        for (std::uint64_t offset = 0U; offset < extent;) {
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(), extent - offset));
+            ReadAt(file, offset, std::span(buffer).first(count));
+            if (!std::equal(buffer.begin(), buffer.begin() + static_cast<std::ptrdiff_t>(count),
+                    expected.begin() + static_cast<std::ptrdiff_t>(offset))) Damage("creation temporary is not its exact target prefix");
+            offset += count;
+        }
+        if (Extent(file) != extent) Damage("creation temporary extent changed");
+    };
+#ifdef _WIN32
+    alignas(8) std::array<std::uint8_t, 64U * 1024U> buffer{};
+    bool first = true;
+    for (;;) {
+        if (!GetFileInformationByHandleEx(impl_->root.get(), first ? FileIdBothDirectoryRestartInfo : FileIdBothDirectoryInfo,
+                buffer.data(), static_cast<DWORD>(buffer.size()))) {
+            const auto error = GetLastError();
+            if (error == ERROR_NO_MORE_FILES) break;
+            NativeError("enumerate pinned bootstrap temporaries", error);
+        }
+        first = false;
+        std::size_t at = 0U;
+        for (;;) {
+            constexpr auto fixed = offsetof(FILE_ID_BOTH_DIR_INFO, FileName);
+            if (at > buffer.size() - fixed) Damage("invalid bootstrap directory entry");
+            const auto* entry = reinterpret_cast<const FILE_ID_BOTH_DIR_INFO*>(buffer.data() + at);
+            const auto length = static_cast<std::size_t>(entry->FileNameLength);
+            if (length % sizeof(WCHAR) != 0U || length > buffer.size() - at - fixed)
+                Damage("invalid bootstrap directory name extent");
+            std::string name;
+            for (std::size_t i = 0U; i < length / sizeof(WCHAR); ++i)
+                name.push_back(entry->FileName[i] > 127U ? static_cast<char>(0x80U) : static_cast<char>(entry->FileName[i]));
+            admit(name);
+            if (entry->NextEntryOffset == 0U) break;
+            const auto next = static_cast<std::size_t>(entry->NextEntryOffset);
+            if (next % 8U != 0U || next < fixed + length || next > buffer.size() - at - fixed)
+                Damage("invalid bootstrap directory continuation");
+            at += next;
+        }
+    }
+#else
+    const auto fd = ::openat(impl_->root.get(), ".", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+    if (fd < 0) NativeError("open pinned bootstrap enumeration");
+    auto* stream = ::fdopendir(fd);
+    if (!stream) { const auto error = errno; (void)::close(fd); NativeError("enumerate pinned bootstrap directory", error); }
+    struct CloseDirectory { void operator()(DIR* value) const noexcept { (void)::closedir(value); } };
+    const std::unique_ptr<DIR, CloseDirectory> owned(stream);
+    for (;;) {
+        errno = 0;
+        const auto* entry = ::readdir(stream);
+        if (!entry) { if (errno != 0) NativeError("read pinned bootstrap directory"); break; }
+        admit(entry->d_name);
+    }
+#endif
+}
+
 std::optional<std::vector<std::uint8_t>> CommitOwnerArtifactIo::ReadEmptyInventoryBytes() const {
     const auto name = std::string("chunkdb.index");
     auto file = OpenChild(impl_->root, name, false, false, false, true, impl_->directory / name);
@@ -602,7 +706,8 @@ void CommitOwnerArtifactIo::PublishInactive() {
         if (installed && !SameObject(source.get(), existing.get())) Damage("initial owner native generation substituted");
     }
     const auto actual = ReadChecked(existing, impl_->scope, CommitOwnerObjectKind::kRoot);
-    if (actual != bytes) Damage("canonical owner differs from initial INACTIVE state");
+    if (!std::equal(actual.begin(), actual.end(), bytes.begin(), bytes.end()))
+        Damage("canonical owner differs from initial INACTIVE state");
     SyncFile(existing, impl_->directory / kRoot);
     SyncDirectory(impl_->root, impl_->directory);
 }

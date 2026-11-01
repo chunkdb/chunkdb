@@ -16,6 +16,7 @@ class CommitOwnerContext;
 class CommitOwnerDirectoryContext;
 class CommitOwnerBootstrap;
 class CommitOwnerStoreAdmission;
+struct CommitOwnerBootstrapDecision;
 
 struct CommitOwnerRootArtifact {
     CommitOwnerObjectRef reference;
@@ -63,6 +64,7 @@ class CommitOwnerArtifactIo {
     [[nodiscard]] std::optional<std::vector<std::uint8_t>> ReadManifestBytes(bool directory) const;
     [[nodiscard]] static std::shared_ptr<CommitOwnerArtifactIo> OpenBootstrapDirectory(const std::filesystem::path& directory);
     [[nodiscard]] std::optional<std::vector<std::uint8_t>> ReadBootstrapBytes() const;
+    void ValidateBootstrapTemporaries(const CommitOwnerBootstrapDecision& decision) const;
     void PublishBootstrapBytes(std::span<const std::uint8_t> bytes);
     void SyncFeatureDecision(std::span<const std::uint8_t> bytes);
     void PublishInactive();

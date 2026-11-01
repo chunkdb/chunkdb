@@ -17,6 +17,7 @@
 #include "feed_slot_records.hpp"
 #include "txn_intent_format.hpp"
 #include "directory_alias_test_utils.hpp"
+#include "catalog_test_utils.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -399,15 +400,19 @@ void HistoricalIntentCounts() {
     for (const auto dims : {std::uint8_t{2U}, std::uint8_t{3U}}) {
         for (const auto state : {TxnIntentState::kRollback, TxnIntentState::kCommitted}) {
             test::ScopedTempDir directory("chunkdb-historical-intent-count");
-            Save(DataDirManifestPath(directory.path()), SerializeDataDirManifest({.data_dir_id = StoreId{9U}, .options = {}}));
             StoreConfig config;
             config.data_dir = directory.path() / "tables/t";
             config.geometry = {1U, 1U, 1U, 1U, 8U};
             config.geometry.dims = dims;
             config.max_loaded_chunks = 1U;
             config.background_maintenance = false;
+            auto catalog_config = CatalogConfigFromStoreConfig(config);
+            catalog_config.data_dir = directory.path();
             StoreId id{};
-            { ChunkStore initialized(config); id = initialized.store_id(); }
+            {
+                TableCatalog initialized(catalog_config);
+                id = initialized.Create("t", config.geometry, initialized.default_options())->store_id();
+            }
             TxnIntent intent{.state = state, .version = 100U, .entries = {}};
             for (std::size_t i = 0U; i < count; ++i)
                 intent.entries.push_back({{static_cast<std::int64_t>(i), 0, dims == 3U ? -1 : 0}, 0U});
@@ -423,9 +428,9 @@ void HistoricalIntentCounts() {
             assert(TryParseTxnIntent(bytes, &decoded, dims, id));
             assert(decoded.entries.size() == count && decoded.state == state);
             {
-                auto read_only = config; read_only.access_mode = AccessMode::kReadOnly;
-                ChunkStore reader(read_only);
-                const auto unwritten = reader.ReadChunkState(intent.entries.back().coord);
+                auto read_only = catalog_config; read_only.access_mode = AccessMode::kReadOnly;
+                test::OwnedTableStore reader(read_only, "t");
+                const auto unwritten = reader.store().ReadChunkState(intent.entries.back().coord);
                 assert(!unwritten.written && unwritten.version == 0U);
                 assert(LoadFile(path) == bytes);
             }
@@ -436,9 +441,9 @@ void HistoricalIntentCounts() {
             assert(checked.errors == 0U);
             assert(Snapshot(directory.path()) == before);
             {
-                ChunkStore recovered(config);
+                test::OwnedTableStore recovered(catalog_config, "t");
                 assert(!std::filesystem::exists(path));
-                const auto unwritten = recovered.ReadChunkState(intent.entries.back().coord);
+                const auto unwritten = recovered.store().ReadChunkState(intent.entries.back().coord);
                 assert(!unwritten.written && unwritten.version == 0U);
             }
         }

@@ -23,6 +23,13 @@ void CheckCreationNamespace(const std::filesystem::path& directory, CommitOwnerB
     bool pending, bool manifested) {
     for (const auto& entry : std::filesystem::directory_iterator(directory)) {
         const auto name = entry.path().filename().string();
+        bool temporary = false;
+        for (const auto* family : {"chunkdb.manifest.tmp.", "table.manifest.tmp.", "chunkdb.index.tmp."})
+            temporary = temporary || name.starts_with(family);
+        if (temporary) {
+            if (!pending) Bad("creation temporary has no checked decision");
+            continue;  // The pinned native validator checks target, spelling and bytes below.
+        }
         if (pending && (name == kCommitOwnerBootstrapName || name == "chunkdb.groups.owner")) continue;
         if (manifested && name == (kind == CommitOwnerBootstrapKind::kDirectory ? kDataDirManifestFileName : kStoreManifestFileName)) continue;
         if (kind == CommitOwnerBootstrapKind::kStandalone && name == kChunkIndexFileName) continue;
@@ -103,6 +110,7 @@ StoreManifest CommitOwnerBootstrap::InitializeStandalone(const std::filesystem::
     if (existing && SerializeStoreManifest(*existing) != decision.manifest) Bad("manifest differs from creation decision");
     CheckCreationNamespace(directory, decision.kind, pending.has_value(), existing.has_value());
     CommitOwnerArtifactIo writer(directory, *target.commit_owner, lock, false);
+    if (pending) writer.ValidateBootstrapTemporaries(decision);
     CheckEmptyInventory(writer.ReadEmptyInventoryBytes(), geometry, target.store_id, existing.has_value());
     RequireInitialRoot(writer.ReadCanonicalRoot(), *target.commit_owner, existing.has_value());
     if (!pending) {
@@ -158,6 +166,7 @@ DataDirManifest CommitOwnerBootstrap::InitializeDirectory(const std::filesystem:
     if (existing && SerializeDataDirManifest(*existing) != decision.manifest) Bad("manifest differs from creation decision");
     CheckCreationNamespace(directory, decision.kind, pending.has_value(), existing.has_value());
     CommitOwnerArtifactIo writer(directory, *target.commit_owner, lock, false);
+    if (pending) writer.ValidateBootstrapTemporaries(decision);
     RequireInitialRoot(writer.ReadCanonicalRoot(), *target.commit_owner, existing.has_value());
     if (!pending) {
         Crash("CHUNKDB_FAILPOINT_CRASH_OWNER_BOOTSTRAP_BEFORE_DECISION_ONCE");
