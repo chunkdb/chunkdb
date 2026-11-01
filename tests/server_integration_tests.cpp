@@ -2097,6 +2097,32 @@ class RateQueueHook : public IdleQueuePressureHook {
     bool queued_ = false;
 };
 
+void TestConnectionListingTrimsStatementWhitespace() {
+    RateQueueHook hook;
+    auto config = BaseServerConfig(); config.worker_threads = 1U;
+    ServerHarness harness("connection-listing-whitespace", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { RateQueueHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient worker("127.0.0.1", harness.port); worker.Hello();
+    RawClient target("127.0.0.1", harness.port); target.SendLine("HELLO 3");
+    const auto id = std::stoull(ReadHelloReply(target).at("connection_id"));
+    RawClient controller("127.0.0.1", harness.port); controller.Hello();
+    hook.SetTarget(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    worker.SendLine("PING"); hook.WaitWorker();
+    target.SendLine("  \tPING"); hook.WaitQueued();
+    controller.SendLine("SHOW CONNECTIONS");
+    const auto listing = controller.ReadReply();
+    const auto at = listing.find("$2\r\nid\r\n:" + std::to_string(id) + "\r\n");
+    assert(at != std::string::npos);
+    const auto end = listing.find("%5\r\n", at);
+    const auto entry = listing.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    assert(entry.find("$5\r\nstate\r\n$6\r\nqueued\r\n") != std::string::npos);
+    assert(entry.find("$9\r\nstatement\r\n$4\r\nPING\r\n") != std::string::npos);
+    hook.Release();
+    assert(worker.ReadLine() == "+PONG\r\n" && target.ReadLine() == "+PONG\r\n");
+}
+
 class ShutdownPublicationHook : public RateQueueHook {
   public:
     void Run(Point point, std::size_t value) override {
@@ -5442,9 +5468,27 @@ class PolledInputShutdownHook final : public PolledPartialInputHook {
   public:
     explicit PolledInputShutdownHook(const char* case_name) : case_name_(case_name) {}
     void FailNextAccept() { fail_accept_.store(true); }
+    void ArmIdleScan() { std::lock_guard lock(scan_mutex_); scan_armed_ = true; }
+    void WaitIdleScan() {
+        std::unique_lock lock(scan_mutex_);
+        assert(scan_changed_.wait_for(lock, std::chrono::seconds(10), [&] { return scan_entered_; }));
+    }
+    void Release() {
+        { std::lock_guard lock(scan_mutex_); scan_released_ = true; }
+        scan_changed_.notify_all();
+        PolledPartialInputHook::Release();
+    }
     void Run(Point point, std::size_t value) override {
         if (point == Point::kBeforeAccept && fail_accept_.exchange(false))
             throw std::runtime_error("injected accept-loop failure");
+        if (point == Point::kBeforeQueuedStopScan) {
+            std::unique_lock lock(scan_mutex_);
+            if (scan_armed_) {
+                scan_entered_ = true;
+                scan_changed_.notify_all();
+                scan_changed_.wait(lock, [&] { return scan_released_; });
+            }
+        }
         // Stop holds active_clients_mutex_ across these two callbacks. Use only
         // nonthrowing recording/C APIs here; never close or retain for later I/O.
         if (point == Point::kBeforeClientShutdown) {
@@ -5457,8 +5501,8 @@ class PolledInputShutdownHook final : public PolledPartialInputHook {
         }
         if (point == Point::kAfterClientShutdown) {
             const auto results = shutdown_results_.fetch_add(1U);
-            if (results != 0U || shutdown_sockets_.load() != 1U) return;
-            shutdown_error_.store(value);
+            if (results == 0U && shutdown_sockets_.load() == 1U) shutdown_error_.store(value);
+            Release(); // The poller may close the socket only after native shutdown was observed.
             return;
         }
         if (point == Point::kAfterClientRead && value == 2U) read_returned_.store(true);
@@ -5478,6 +5522,9 @@ class PolledInputShutdownHook final : public PolledPartialInputHook {
     std::atomic<std::size_t> shutdown_sockets_{0U}, shutdown_results_{0U}, shutdown_error_{0U};
     std::atomic<bool> read_returned_{false};
     std::atomic<bool> fail_accept_{false};
+    std::mutex scan_mutex_;
+    std::condition_variable scan_changed_;
+    bool scan_armed_ = false, scan_entered_ = false, scan_released_ = false;
 };
 
 void TestPolledInputOwnershipWindows(bool run_error = false) {
@@ -5522,6 +5569,11 @@ void TestPolledInputOwnershipWindows(bool run_error = false) {
     client.SendBytes("PI");
     chunkdb::test::FeedPhaseWatchdog::Phase("partial-input-poll: confirm partial input returned to polling");
     hook.WaitPolledRead();
+    // Freeze the idle owner before Stop publishes running=false, so this
+    // fixture observes the native shutdown path rather than an earlier close.
+    hook.ArmIdleScan();
+    chunkdb::FeedDeliveryTestAccess::WakeTransport(*harness.server);
+    hook.WaitIdleScan();
     if (run_error) {
         chunkdb::test::FeedPhaseWatchdog::Phase("harness: fail accept loop with ongoing recv");
         hook.FailNextAccept();
@@ -6271,6 +6323,7 @@ int main(int argc, char** argv) {
         run("TestIdleDispatchFailureClosesEveryOwner", TestIdleDispatchFailureClosesEveryOwner);
         run("TestIdleDispatchRespectsQueueCredit", TestIdleDispatchRespectsQueueCredit);
         run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);
+        run("TestConnectionListingTrimsStatementWhitespace", TestConnectionListingTrimsStatementWhitespace);
         run("TestStopPublicationGapClosesQueuedOwner", TestStopPublicationGapClosesQueuedOwner);
         run("TestOrdinaryWatchRateRepliesAreBounded", TestOrdinaryWatchRateRepliesAreBounded);
         run("TestExpiredQueueRetainsTransportOwner", TestExpiredQueueRetainsTransportOwner);

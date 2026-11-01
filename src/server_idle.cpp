@@ -401,8 +401,10 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
         {
             std::lock_guard lock(connection.record->mutex);
             connection.record->state = worker ? "running" : "queued";
-            connection.record->verb = connection.request_line.substr(0U,
-                std::min<std::size_t>(32U, connection.request_line.find_first_of(" \t\r\n")));
+            const auto first = connection.request_line.find_first_not_of(" \t\r\n");
+            connection.record->verb = first == std::string::npos ? std::string{} :
+                connection.request_line.substr(first, std::min<std::size_t>(32U,
+                    connection.request_line.find_first_of(" \t\r\n", first) - first));
             connection.record->statement = std::move(control);
             if (connection.record->killed.load()) killed_statement = connection.record->statement;
         }

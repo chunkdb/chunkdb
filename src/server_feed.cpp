@@ -487,19 +487,19 @@ void FeedIo::Run() {
                         watch.read_paused = false;
                 }
                 if (watch.dead || ((watch.close || (watch.unwatch && watch.return_ready)) && watch.output.empty())) {
-                    bool returned = false;
+                    const bool ack_timeout_closed = watch.connection->session.slot_watch &&
+                        watch.connection->session.slot_watch->AckTimedOut();
                     if (!watch.dead && !watch.close && watch.unwatch && watch.return_ready && server_.running_.load()) {
                         if (auto* hook = hook_.load(std::memory_order_acquire))
                             hook->Run(FeedDeliveryTestHook::Point::kBeforeReturnClient, 0U);
-                        server_.ReturnClient(watch.connection); returned = true;
+                        server_.ReturnClient(std::move(watch.connection));
+                    } else {
+                        server_.CloseClient(*watch.connection);
+                        watch.connection.reset();
                     }
-                    const bool ack_timeout_closed = watch.connection->session.slot_watch &&
-                        watch.connection->session.slot_watch->AckTimedOut();
-                    if (!returned) server_.CloseClient(*watch.connection);
                     if (ack_timeout_closed)
                         if (auto* hook = hook_.load(std::memory_order_acquire))
                             hook->Run(FeedDeliveryTestHook::Point::kAfterAckTimeoutClose, 0U);
-                    watch.connection.reset();
                 }
             }
             std::erase_if(watches, [](const Watch& watch) { return !watch.connection; });
