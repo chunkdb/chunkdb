@@ -18,6 +18,8 @@ New object files and every newly created parent name are durable before a root c
 The coverage key is table epoch, dimensions and signed XYZ, with zero Z in two dimensions.
 A leaf binds the exact currently selected durable artifact: a checked image with producing revision, time, schema, raw length and SHA-256, or a retained-empty identity with the same producing fields and the exact checked retained-record bytes.
 A never-written leaf has no artifact and all producing fields zero.
+A forgotten-empty leaf additionally binds the admitted deletion floor and the historical retained-empty proof it superseded, but exposes no current producing identity.
+That leaf can certify retained group history without making its forgotten tombstone visible to reads or scans.
 A retained-empty proof is an owned immutable copy of the admitted record and its inventory context, so later CKIX replacement cannot invalidate the proof.
 The artifact itself must pass its native context, schema and content checks; a matching digest alone does not admit an image or tombstone.
 A leaf contains a canonical set of covered member references, each containing group identity, exact decision SHA-256, ordinal and the original member's producing revision, time and schema.
@@ -33,7 +35,8 @@ A current WAL suffix is replayed over that selected artifact, and its group fram
 
 The two trees use immutable bounded pages and checked copy-on-write paths.
 Their keys have a fixed maximum length, each page is at most 64 KiB, and a path is bounded by that key length rather than directory population.
-Leaf reference sets use separately checked immutable pages, with exact count, total bytes, page order and a complete-set digest in the leaf.
+Leaf reference sets use their own bounded copy-on-write trees, with exact count, total bytes, page order and a complete-set digest in the leaf.
+A mutation pins the existing reference-set root instead of enumerating or copying all covered members, and adding or removing one reference changes only its bounded tree path.
 A reference set has a format-wide 256 MiB ceiling and is streamed during admission; current transaction count limits are not decoder limits.
 Group preparation reserves reference-storage bytes before mutation and refuses a group that cannot retain its required proofs.
 One checkpoint writes its changed leaf pages and ancestor paths, rather than rewriting every table's coverage.
@@ -122,6 +125,9 @@ Table rename changes current catalog names but leaves epoch ownership and histor
 DROP and SWAP first drain open groups and settle dependencies, then publish their epoch transition and the corresponding reference-tree update as one checked lifecycle decision.
 A dropped epoch can remain a history-only member while a current producer in another table, a feed slot or an ID still retains the group.
 Its last required coverage, schema history and seal stay in immutable history ownership instead of becoming a path to a replacement table.
+Explicit tombstone compaction first settles dependencies and certifies the current empty identity, then publishes its deletion floor and forgotten-empty leaf in the same recoverable decision.
+It clears current producer ownership for that forgotten identity while retaining any history-only member proof still owned by another producer, feed slot or ID.
+A history-only proof never recreates the forgotten identity in the active coordinate index.
 Schema and tombstone-history retirement keep every schema or retained proof needed by a coverage leaf, rollback anchor or feed base until the same checked reference cut releases it.
 An epoch replacement never satisfies an old member merely because names or coordinates match.
 
