@@ -367,8 +367,8 @@ void MemberBindings() {
     other = fixture.decision; ++other.id[0U];
     Reject([&] { ValidateCommitOwnerMemberBinding(fixture.value, {fixture.value.group_id, 1U}, fixture.value.coverage,
         other, fixture.value.decision_sha256); });
-    // A different fully valid decision can retain this exact ordinal but have
-    // another member count. Digest and key checks alone cannot bind its set.
+    // A different fully valid decision can retain this ordinal with another member count.
+    // Digest and key checks alone cannot bind its complete set.
     other = fixture.decision; auto extra = other.members.back(); ++extra.coord.x; other.members.push_back(extra);
     altered = fixture.value; altered.decision_sha256 = crypto::Sha256Of(SerializeCommitGroupDecision(other));
     Reject([&] { ValidateCommitOwnerMemberBinding(altered, {altered.group_id, 1U}, altered.coverage,
@@ -384,8 +384,7 @@ void MemberBindings() {
             case 5U: ++member.commit_time_ms; break;
             case 6U: ++member.schema_version; break;
         }
-        // Other fields here are deliberately caller facts: the binding must
-        // reject them even if the same measured digest is supplied.
+        // The binding also rejects inconsistent caller facts supplied with the same measured digest.
         Reject([&] { ValidateCommitOwnerMemberBinding(fixture.value, {fixture.value.group_id, 1U}, fixture.value.coverage,
             other, fixture.value.decision_sha256); });
     }
