@@ -8,6 +8,8 @@
 #include <string>
 
 #include "scram.hpp"
+#include "login_helpers.hpp"
+#include "test_utils.hpp"
 
 namespace {
 
@@ -64,6 +66,58 @@ void TestWrongPassword() {
     const auto other = scram::MakeVerifier("pencils", *crypto::Base64Decode("W22ZaJ0SNY7soEsUEjb6gQ=="), 4096);
     const scram::ServerExchange exchange(first, other, kServerNonce);
     assert(!exchange.Finish(kClientFinal).has_value());
+    const scram::ServerExchange correct(first, PencilVerifier(), kServerNonce);
+    const auto login = scram::StartClientLogin("user", kClientNonce);
+    const auto wrong_client = scram::FinishClientLogin(login, "pencils", correct.ServerFirst());
+    assert(!correct.Finish(wrong_client.message));
+}
+
+void TestPreparedSocketLogin() {
+    const auto salt = *crypto::Base64Decode("W22ZaJ0SNY7soEsUEjb6gQ==");
+    const auto prepared = chunkdb::test::PrepareLoginVerifier("pencil", salt, 4096);
+    assert(prepared == PencilVerifier());
+    const auto login = scram::StartClientLogin("user", kClientNonce);
+    const scram::ServerExchange exchange(scram::ParseClientFirst(login.first), prepared, kServerNonce);
+    const auto final = chunkdb::test::AuthBytes(login, "pencil", "+SCRAM " + exchange.ServerFirst());
+    assert(final.bytes == chunkdb::test::LineWithFrame("AUTH $1", kClientFinal));
+    assert(exchange.Finish(kClientFinal) == final.server_signature);
+    // A fixture must prepare credentials before opening a connection.
+    // Falling back to PBKDF2 here reintroduces work inside the HELLO deadline.
+    bool refused = false;
+    try { (void)chunkdb::test::AuthBytes(login, "not-prepared", exchange.ServerFirst()); }
+    catch (const std::logic_error&) { refused = true; }
+    assert(refused);
+    ExpectInvalid([&] { (void)chunkdb::test::AuthBytes(login, "pencil", "r=other,s=AAAA,i=4096"); },
+                  "does not continue");
+    ExpectInvalid([&] { (void)chunkdb::test::AuthBytes(login, "pencil", "nonsense"); },
+                  "not a SCRAM server-first");
+    const auto wrong = chunkdb::test::PrepareLoginVerifier("pencils", salt, 4096);
+    assert(wrong != prepared);
+    const auto wrong_final = chunkdb::test::AuthBytes(login, "pencils", exchange.ServerFirst());
+    const auto prefix = wrong_final.bytes.find("\r\n", wrong_final.bytes.find("\r\n") + 2U) + 2U;
+    assert(!exchange.Finish(std::string_view(wrong_final.bytes).substr(prefix, wrong_final.bytes.size() - prefix - 2U)));
+}
+
+void TestPrepareExistingFixtureUser() {
+    chunkdb::test::ScopedTempDir directory("chunkdb-prepared-existing-user");
+    scram::Verifier stored;
+    {
+        const auto users = chunkdb::test::MakeUsers(directory.path(), "admin", "secret");
+        stored = users->Find("admin")->verifier;
+    }
+    // Opening the same fixture in a new process has no cached credentials.
+    {
+        std::lock_guard lock(chunkdb::test::login_detail::keys_mutex);
+        chunkdb::test::login_detail::prepared_keys.clear();
+    }
+    const auto users = chunkdb::test::MakeUsers(directory.path(), "admin", "secret");
+    assert(users->Find("admin")->verifier == stored);
+    const auto login = scram::StartClientLogin("admin", kClientNonce);
+    const scram::ServerExchange exchange(scram::ParseClientFirst(login.first), stored, kServerNonce);
+    const auto final = chunkdb::test::AuthBytes(login, "secret", exchange.ServerFirst());
+    const auto frame = final.bytes.find("\r\n", final.bytes.find("\r\n") + 2U) + 2U;
+    assert(exchange.Finish(std::string_view(final.bytes).substr(frame, final.bytes.size() - frame - 2U)) ==
+           final.server_signature);
 }
 
 void TestMalformedMessages() {
@@ -134,6 +188,8 @@ int main() {
     TestRfcExchange();
     TestClientSide();
     TestWrongPassword();
+    TestPreparedSocketLogin();
+    TestPrepareExistingFixtureUser();
     TestMalformedMessages();
     TestDecoyAndNonce();
     TestVerifierText();
