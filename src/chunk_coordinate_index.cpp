@@ -445,6 +445,21 @@ std::optional<ChunkIndexRecord> ChunkCoordinateIndex::EmptyBoundary(const ChunkC
     return at == coordinates_.end() ? std::nullopt : at->second.retained_empty;
 }
 
+CoordinatePage ChunkCoordinateIndex::CurrentPage(bool has_cursor, const ChunkCoord& cursor, std::size_t limit) const {
+    Check();
+    if (limit == 0U || limit > kMaxChunkScanLimit) throw std::invalid_argument("invalid current coordinate page limit");
+    CoordinatePage page;
+    page.coords.reserve(limit);
+    std::lock_guard lock(mutex_);
+    auto at = has_cursor ? coordinates_.upper_bound(cursor) : coordinates_.begin();
+    for (; at != coordinates_.end(); ++at) {
+        if (at->second.revision.load(std::memory_order_acquire) == 0U) continue;
+        if (page.coords.size() == limit) { page.more = true; break; }
+        page.coords.push_back(at->first);
+    }
+    return page;
+}
+
 void ChunkCoordinateIndex::PublishTombstone(const ChunkIndexRecord& record) {
     Check();
     if (read_only_ || record.kind != ChunkIndexKind::kDeleted)
