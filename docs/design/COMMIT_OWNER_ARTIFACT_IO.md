@@ -63,7 +63,7 @@ Parent-child, value payload, complete tree, journal, ID and group admission are 
 
 A canonical-root reader uses the same fixed 512-byte admission and returns the actual raw reference with the parsed root.
 INACTIVE, ACTIVE and PENDING syntax can be reported as facts, but this API cannot select one side of a pending plan, replay a group or serve a table through unadmitted references.
-The future owner supplies the directory and table generation observation bracket before using these facts.
+The admitted owner supplies the directory and table generation observation bracket before using these facts.
 
 ## Immutable staging and durability
 
@@ -88,14 +88,23 @@ An exact later retry must re-admit and sync that name before returning success, 
 A write, close, sync or publication failure removes only the private temporary name created by that invocation when it remains safely unpublished.
 An already published immutable object remains available for checked reuse and is not deleted as cleanup after uncertainty.
 
+POSIX publication retains the original temporary descriptor through final-name admission.
+It checks the source name's current native binding before an exclusive relative rename or no-replace link, but that precheck alone grants no authority.
+After publication it opens the digest leaf without following links and requires its native device and inode, complete extent, raw SHA-256 and typed value to agree with the still-open owned temporary generation before file and directory sync can report a durable result.
+A substituted generation returns an error even when the substitute is a valid same-length record, and cannot supply a selected-root reference.
+Any leftover entry is unselected namespace work requiring admitted recovery or collection, not an admitted object.
+The foundation never unlinks a POSIX replacement based on a racy pathname identity check.
+An exclusive rename consumes its original source name itself; a no-replace hard-link fallback retains its private source link for admitted collection rather than performing an unsafe name-based unlink.
+On failure, uncertain private or digest names are retained without unlink or replacement, including a substituted sentinel; this API claims no atomic unlink-if-inode operation or protection against arbitrary same-user in-place mutation.
+
 ## Publication boundary
 
 This initial API exposes native I/O facts and durable private artifacts only.
 It has no generic canonical-root write or compare-and-swap method accepting an arbitrary parsed CommitOwnerRoot.
 Canonical INACTIVE installation must join the checked creation or ENABLE FEATURE decision, including its real manifest claim and exclusive writer ownership.
 ACTIVE or PENDING publication additionally requires fully admitted typed values, exact selected reference closure and complete replacement-plan authorization.
-Those future APIs cannot be implemented as an optional callback that declares an unchecked root safe.
-The existing owner-transition and lifecycle ordering rules apply when that later publication layer is implemented.
+Canonical publication APIs cannot use an optional callback that declares an unchecked root safe.
+Canonical publication requires the existing owner-transition and lifecycle ordering rules.
 Grouping stays unused while complete directory recovery and those authorizations are absent.
 
 ## Failure checks
@@ -105,6 +114,7 @@ They exercise wrong scopes and roles, absent or conflicting namespace markers, o
 A valid same-length different root or page under a claimed digest must fail the raw SHA binding independently of native format checksums.
 Sparse oversized files refuse from measured extent or fixed-header admission before a complete buffer is allocated.
 Native rename and replacement gates prove that reads stay on their opened generation and staging never follows a replaced directory name into foreign files.
+An independent native-inode substitution gate replaces a synced POSIX temporary leaf before publication, then requires refusal, no durable reference, unchanged selected-root bytes and an untouched unrelated sentinel.
 Crashes cover directory creation, marker file and name sync, object temporary write, file sync, no-replace publication and directory sync, with exact old or complete new immutable bytes afterward.
 A first directory-sync failure followed by exact-object reuse must perform the required sync before reporting durability.
 Isolated omission controls target no-follow and native type admission, digest and measured-length checks, namespace scope, correct writer ownership and publication ordering.
