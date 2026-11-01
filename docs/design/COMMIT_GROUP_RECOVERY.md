@@ -214,6 +214,11 @@ Offline verification follows the same references without installation, cleanup o
 
 The retained-group tree is the authoritative ownership cut for decisions and seals.
 For each exact group incarnation it binds its decision digest, complete member set, durability state and references from current producer leaves, covered members, rollback anchors, feed history, retained IDs and active recovery transitions.
+The selected group-tree cut commits explicit acyclic source edges, including only pre-existing checked transition or provenance sources.
+Newer admitted journal decisions and the current checked PENDING plan remain additional implicit owners until processed or completed.
+The complete native owner is the selected cut plus every completely admitted implicit source, and reclamation must validate both directions of ownership across both sets.
+The current PENDING plan retains the old selected context and binds its complete participant/group ownership without placing a cyclic reference into its own target root.
+Neither a group value alone nor an unsupported pending plan certifies complete closure.
 An in-process reader pins its admitted generation; retirement marks an incarnation unavailable for new pins before testing that its existing pins have drained.
 Durable feed-slot and ID roots are captured under their publication ownership and remain pinned until the new reference cut is durable.
 A feed-referenced seal never reconstructs an evicted ID binding.

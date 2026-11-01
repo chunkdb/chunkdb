@@ -94,6 +94,8 @@ Native closure must prove every selected edge has its actual source and every ac
 Feed admission depends on complete checked slot records, retained archive framing and group witnesses, not a slot name or watermark alone.
 Transition/provenance admission depends on their complete checked payloads and original/destination mappings; unsupported native sources refuse.
 No source reference may form a recursive raw-hash dependency on its selecting root or containing value.
+The selected cut commits explicit acyclic edges, while newer admitted decisions and the current checked PENDING plan remain additional implicit owners until processed or completed.
+Complete bidirectional ownership admission and reclamation cover both explicit and implicit sources; a group value alone is never the complete closure.
 Pure edge parsing does not choose a pending side or certify a transition.
 
 ## Directory transaction counter
