@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <cassert>
 #include <chrono>
 #include <filesystem>
 #include <functional>
@@ -16,12 +17,14 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/change_feed.hpp"
 #include "chunkdb/metrics.hpp"
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "chunkdb/transaction_memory.hpp"
 
 namespace chunkdb {
 
@@ -72,7 +75,7 @@ struct EngineConfig {
     std::string server_version = "unknown";
     std::size_t max_line_bytes = 65536;
     // Transactions (docs/design/TRANSACTIONS_DESIGN.md): how long one may stay
-    // open, and the bytes of the private chunk copies of one and of all.
+    // open, and charged temporary storage plus logical private chunk bytes.
     std::chrono::milliseconds txn_max_duration{5000};
     std::size_t txn_max_bytes = 16ULL * 1024ULL * 1024ULL;
     std::size_t txn_total_bytes = 256ULL * 1024ULL * 1024ULL;
@@ -102,13 +105,28 @@ struct ChunkCoordLess {
 
 // A connection's open transaction (docs/design/TRANSACTIONS_DESIGN.md).
 struct SessionTransaction {
+    // Borrowed counters must outlive this transaction; no owned budget escapes.
     SessionTransaction(std::atomic<std::size_t>* total, std::chrono::steady_clock::time_point started)
-        : total_bytes(total), started(started) {}
+        : total_bytes(total), started(started) {
+        if (!total) throw std::invalid_argument("borrowed transaction accounting needs a counter");
+    }
+    SessionTransaction(TxnMemoryBudgetPtr budget, std::chrono::steady_clock::time_point started)
+        : memory_budget(std::move(budget)),
+          total_bytes(memory_budget ? &memory_budget->global_counter() : nullptr), started(started) {
+        if (!memory_budget) throw std::invalid_argument("owned transaction accounting needs a ledger");
+    }
     SessionTransaction(const SessionTransaction&) = delete;
     SessionTransaction& operator=(const SessionTransaction&) = delete;
-    ~SessionTransaction() { total_bytes->fetch_sub(bytes); }
+    ~SessionTransaction() {
+        snapshot.reset();
+        writes.clear();
+        read_set.clear();
+        ReleaseLegacyBytes();
+    }
 
-    // The engine's count of the private copies' bytes of all transactions.
+    // Declared first so all session allocation owners die before this handle.
+    TxnMemoryBudgetPtr memory_budget{};
+    // Alias to the stable global owner, or the explicitly borrowed counter.
     std::atomic<std::size_t>* total_bytes;
     std::chrono::steady_clock::time_point started;
     // The table of the first statement and the snapshot it took; empty
@@ -118,7 +136,7 @@ struct SessionTransaction {
     // The chunks read, and the private copies of the chunks written.
     std::set<ChunkCoord, ChunkCoordLess> read_set{};
     std::map<ChunkCoord, ChunkState, ChunkCoordLess> writes{};
-    // The bytes of `writes`, also counted in *total_bytes.
+    // Legacy logical bytes of `writes`, included once in the combined budget.
     std::size_t bytes = 0;
     // Set when a statement got CONFLICT: the snapshot and the writes are
     // gone, and every statement but COMMIT and ROLLBACK answers this reply,
@@ -131,9 +149,20 @@ struct SessionTransaction {
         snapshot.reset();
         writes.clear();
         read_set.clear();
-        total_bytes->fetch_sub(bytes);
-        bytes = 0;
+        ReleaseLegacyBytes();
         aborted = std::move(reply);
+    }
+
+  private:
+    void ReleaseLegacyBytes() noexcept {
+        if (bytes == 0U) return;
+        if (memory_budget) memory_budget->Release(bytes);
+        else {
+            const auto previous = total_bytes->fetch_sub(bytes, std::memory_order_acq_rel);
+            assert(previous >= bytes);
+            (void)previous;
+        }
+        bytes = 0U;
     }
 };
 
@@ -247,8 +276,8 @@ class CommandEngine {
     std::shared_ptr<MetricsRegistry> metrics_;
     std::mutex auth_failures_mutex_;
     std::unordered_map<std::string, IpAuthFailureState> auth_failures_by_ip_;
-    // The bytes of the private chunk copies of all open transactions.
-    std::atomic<std::size_t> txn_total_bytes_{0};
+    // Shared ownership survives escaped allocation domains and engine teardown.
+    std::shared_ptr<TxnMemoryGlobal> txn_total_bytes_;
     std::atomic<CommandEngineTestHook*> hook_{nullptr};
     std::mutex tls_reload_mutex_;
     std::function<void()> tls_reload_;

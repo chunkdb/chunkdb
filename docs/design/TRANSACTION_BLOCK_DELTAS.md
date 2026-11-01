@@ -28,13 +28,15 @@ Replacement rows contain complete canonical row values, including defaults when 
 
 Rows, cells, value buffers, journal nodes, promotion nodes and prepared edits use standard polymorphic allocators backed by a transaction budget resource.
 The resource charges actual requested allocation bytes, including container capacity and implementation node sizes, before upstream allocation.
+Its borrowed foundation constructor requires both counters to outlive every supplied allocation.
+The [production accounting bridge](TRANSACTION_MEMORY.md) supplies an owned ledger overload and independent allocation accounts for storage that can outlive a session or engine.
 It checks overflow and the existing per-transaction bound, then reserves the existing global transaction counter through checked compare-and-exchange without a wrapping speculative increment; upstream allocation failure releases both reservations.
 Deallocation returns exactly those charges, and staging remains charged while it coexists with the published private state.
-The budget borrows the transaction's private byte count and the engine's global count, and its owner must outlive every row, journal and prepared edit using it.
+The borrowed resource requires its private and global counters to outlive every supplied allocation; the owned resource retains the production ledger.
 The same resource reaches every nested cell and value container, including failed or still-staged records.
 Move assignment between rows, cells, snapshots or variable plans with different resources refuses before transferring any bytes, flags or charges; explicit cloning selects a new resource instead.
 Compound journal and rebase-plan owners support move construction but delete assignment, so partial allocator migration cannot publish through a wrapper.
-Session integration must destroy or clear these allocated records before the existing transaction byte-counter teardown, so a charge is returned once.
+Session-owned journal records are cleared before their resource is destroyed, while escaped physical domains retain owning accounts and return each charge once.
 No new process-wide quota or counter is introduced.
 
 A statement prepares its row, delta and map node privately and publishes through equal-resource node transfer or nonthrowing swaps after admission.

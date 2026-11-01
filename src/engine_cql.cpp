@@ -32,6 +32,7 @@
 #include "table_options_text.hpp"
 #include "user_registry.hpp"
 #include "migrations.hpp"
+#include "txn_memory_admission.hpp"
 
 namespace chunkdb {
 
@@ -1811,7 +1812,9 @@ std::string CommandEngine::TxnBegin(SessionState& session) {
     if (session.transaction != nullptr) {
         throw std::invalid_argument("a transaction is already open; COMMIT or ROLLBACK it first");
     }
-    session.transaction = std::make_unique<SessionTransaction>(&txn_total_bytes_, std::chrono::steady_clock::now());
+    const auto started = std::chrono::steady_clock::now();
+    auto memory = TxnMemoryBudget::Create(txn_total_bytes_, config_.txn_max_bytes);
+    session.transaction = std::make_unique<SessionTransaction>(std::move(memory), started);
     return Protocol::SimpleString("OK");
 }
 
@@ -1899,23 +1902,36 @@ void CommandEngine::TxnWrite(
         state.written = state.written || was_written ||
             ChunkPopulated(store.geometry(), state.presence_bitmap, state.chunk_columns.get());
         const std::size_t after = StateBytes(state);
-        if (txn.bytes - before + after > config_.txn_max_bytes) {
-            throw std::invalid_argument(
-                "the transaction's changes would take " + std::to_string(txn.bytes - before + after) +
-                " bytes, more than --txn-max-bytes (" + std::to_string(config_.txn_max_bytes) + ")");
-        }
         if (after > before) {
             const std::size_t grown = after - before;
-            if (txn_total_bytes_.fetch_add(grown) + grown > config_.txn_total_bytes) {
-                txn_total_bytes_.fetch_sub(grown);
+            try {
+                if (txn.memory_budget) txn.memory_budget->Reserve(grown);
+                else {
+                    if (txn.bytes > config_.txn_max_bytes || grown > config_.txn_max_bytes - txn.bytes)
+                        throw TxnMemoryLimitError(TxnMemoryScope::kPrivate, txn.bytes, grown, config_.txn_max_bytes);
+                    detail::ReserveTxnGlobalBytes(*txn.total_bytes, config_.txn_total_bytes, grown);
+                }
+            } catch (const TxnMemoryLimitError& error) {
+                // Reservation rollback has completed before formatting a diagnostic.
+                if (error.scope() == TxnMemoryScope::kPrivate) {
+                    const auto projected = error.requested() > std::numeric_limits<std::size_t>::max() - error.used()
+                        ? std::string("more than the size_t range")
+                        : std::to_string(error.used() + error.requested());
+                    throw std::invalid_argument(
+                        "the transaction's changes would take " + projected +
+                        " bytes, more than --txn-max-bytes (" + std::to_string(error.limit()) + ")");
+                }
                 throw std::invalid_argument(
                     "open transactions hold more than --txn-total-bytes (" +
-                    std::to_string(config_.txn_total_bytes) + ") of changes; try again later");
+                    std::to_string(error.limit()) + ") of transaction storage; try again later");
             }
+            txn.bytes += grown;
         } else {
-            txn_total_bytes_.fetch_sub(before - after);
+            const auto released = before - after;
+            if (txn.memory_budget) txn.memory_budget->Release(released);
+            else detail::ReleaseTxnGlobalBytes(*txn.total_bytes, released);
+            txn.bytes -= released;
         }
-        txn.bytes = txn.bytes - before + after;
     } catch (...) {
         undo();
         throw;

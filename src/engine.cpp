@@ -240,7 +240,8 @@ CommandEngine::CommandEngine(
     std::shared_ptr<MetricsRegistry> metrics)
     : config_(std::move(config)),
       catalog_(std::move(catalog)),
-      metrics_(metrics != nullptr ? std::move(metrics) : std::make_shared<MetricsRegistry>()) {
+      metrics_(metrics != nullptr ? std::move(metrics) : std::make_shared<MetricsRegistry>()),
+      txn_total_bytes_(std::make_shared<TxnMemoryGlobal>(config_.txn_total_bytes)) {
     if (!catalog_) {
         throw std::invalid_argument("catalog must not be null");
     }

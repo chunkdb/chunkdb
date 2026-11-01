@@ -1,4 +1,5 @@
 #include "txn_block_memory.hpp"
+#include "txn_memory_admission.hpp"
 
 #include <cassert>
 #include <stdexcept>
@@ -8,35 +9,44 @@ namespace chunkdb {
 TxnBlockMemoryResource::TxnBlockMemoryResource(std::size_t& private_bytes,
     std::atomic<std::size_t>& global_bytes, std::size_t private_limit, std::size_t global_limit,
     std::pmr::memory_resource* upstream)
-    : private_bytes_(private_bytes), global_bytes_(global_bytes), private_limit_(private_limit),
+    : private_bytes_(&private_bytes), global_bytes_(&global_bytes), private_limit_(private_limit),
       global_limit_(global_limit), upstream_(upstream) {
     if (private_limit == 0U || global_limit == 0U || !upstream || upstream == this)
         throw std::invalid_argument("invalid transaction block memory budget");
 }
 
+TxnBlockMemoryResource::TxnBlockMemoryResource(TxnMemoryBudgetPtr budget)
+    : budget_(std::move(budget)), private_limit_(budget_ ? budget_->private_limit() : 0U),
+      global_limit_(budget_ ? budget_->global_limit() : 0U),
+      upstream_(budget_ ? budget_->upstream() : nullptr) {
+    if (!budget_) throw std::invalid_argument("owned transaction memory needs an owned ledger");
+}
+
 TxnBlockMemoryResource::~TxnBlockMemoryResource() { assert(allocated_ == 0U); }
 
 void TxnBlockMemoryResource::Reserve(std::size_t bytes) {
-    if (private_bytes_ > private_limit_ || bytes > private_limit_ - private_bytes_)
-        throw std::invalid_argument("transaction block state exceeds its private byte limit");
-    auto current = global_bytes_.load(std::memory_order_acquire);
-    for (;;) {
-        if (current > global_limit_ || bytes > global_limit_ - current)
-            throw std::invalid_argument("transaction block state exceeds the global byte limit");
-        if (global_bytes_.compare_exchange_weak(current, current + bytes,
-                std::memory_order_acq_rel, std::memory_order_acquire)) break;
+    if (budget_) {
+        budget_->Reserve(bytes);
+        allocated_ += bytes;
+        return;
     }
-    private_bytes_ += bytes;
+    if (*private_bytes_ > private_limit_ || bytes > private_limit_ - *private_bytes_)
+        throw std::invalid_argument("transaction block state exceeds its private byte limit");
+    detail::ReserveTxnGlobalBytes(*global_bytes_, global_limit_, bytes);
+    *private_bytes_ += bytes;
     allocated_ += bytes;
 }
 
 void TxnBlockMemoryResource::Release(std::size_t bytes) noexcept {
-    assert(bytes <= allocated_ && bytes <= private_bytes_);
+    assert(bytes <= allocated_);
     allocated_ -= bytes;
-    private_bytes_ -= bytes;
-    const auto previous = global_bytes_.fetch_sub(bytes, std::memory_order_acq_rel);
-    assert(previous >= bytes);
-    (void)previous;
+    if (budget_) {
+        budget_->Release(bytes);
+        return;
+    }
+    assert(bytes <= *private_bytes_);
+    *private_bytes_ -= bytes;
+    detail::ReleaseTxnGlobalBytes(*global_bytes_, bytes);
 }
 
 void* TxnBlockMemoryResource::do_allocate(std::size_t bytes, std::size_t alignment) {

@@ -8,6 +8,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <memory>
+#include <limits>
 #include <optional>
 #include <string>
 #include <thread>
@@ -294,11 +295,20 @@ void TestDurationLimit() {
 void TestByteAndChunkLimits() {
     // A 4x4 chunk of u16 is 32 bytes of values, 2 of validity and 2 of
     // presence: two copies fit in 100 bytes, three do not.
-    Fixture f(chunkdb::EngineConfig{.txn_max_bytes = 100});
+    auto global = std::make_shared<chunkdb::TxnMemoryGlobal>(std::numeric_limits<std::size_t>::max());
+    auto observed = chunkdb::TxnMemoryBudget::Create(global, std::numeric_limits<std::size_t>::max());
+    const auto bookkeeping = observed->bytes();
+    observed = {};
+    assert(global->bytes() == 0U);
+    Fixture f(chunkdb::EngineConfig{.txn_max_bytes = bookkeeping + 100U});
     ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
+    assert(f.a.transaction->bytes == 0U && f.a.transaction->memory_budget->bytes() == bookkeeping);
     ExpectReply(f.Run(f.a, "SET BLOCK 0 0 IN t n = 1"), "_\r\n");
     ExpectReply(f.Run(f.a, "SET BLOCK 4 0 IN t n = 1"), "_\r\n");
+    assert(f.a.transaction->bytes == 72U);
+    assert(f.a.transaction->memory_budget->bytes() == bookkeeping + 72U);
     ExpectError(f.Run(f.a, "SET BLOCK 8 0 IN t n = 1"), "INVALID_ARGUMENT the transaction's changes would take");
+    assert(f.a.transaction->bytes == 72U && f.a.transaction->memory_budget->bytes() == bookkeeping + 72U);
     // The transaction stays open, without the refused write.
     ExpectReply(f.Run(f.a, "GET BLOCK 8 0 FROM t"), "_\r\n");
     (void)VersionOf(f.Run(f.a, "COMMIT"));
@@ -347,6 +357,63 @@ void TestByteAndChunkLimits() {
     std::puts("txn engine TSan limit cases passed");
 }
 
+void TestBeginBookkeepingBoundaries() {
+    auto global = std::make_shared<chunkdb::TxnMemoryGlobal>(std::numeric_limits<std::size_t>::max());
+    auto observed = chunkdb::TxnMemoryBudget::Create(global, std::numeric_limits<std::size_t>::max());
+    const auto self = observed->bytes();
+    observed = {};
+    assert(self > 1U && global->bytes() == 0U);
+    {
+        Fixture exact(chunkdb::EngineConfig{.txn_max_bytes = self, .txn_total_bytes = self});
+        ExpectReply(exact.Run(exact.a, "BEGIN"), "+OK\r\n");
+        assert(exact.a.transaction->memory_budget->bytes() == self);
+        assert(exact.a.transaction->snapshot == nullptr && exact.RegisteredSnapshots() == 0U);
+        auto* counter = exact.a.transaction->total_bytes;
+        ExpectError(exact.Run(exact.b, "BEGIN"), "INVALID_ARGUMENT --txn-total-bytes");
+        assert(!exact.b.transaction && counter->load() == self);
+        ExpectReply(exact.Run(exact.a, "ROLLBACK"), "+OK\r\n");
+        assert(counter->load() == 0U);
+        ExpectReply(exact.Run(exact.b, "BEGIN"), "+OK\r\n");
+        assert(exact.b.transaction->snapshot == nullptr && exact.RegisteredSnapshots() == 0U);
+        ExpectReply(exact.Run(exact.b, "ROLLBACK"), "+OK\r\n");
+        assert(counter->load() == 0U);
+    }
+    {
+        Fixture short_private(chunkdb::EngineConfig{.txn_max_bytes = self - 1U});
+        ExpectError(short_private.Run(short_private.a, "BEGIN"), "INVALID_ARGUMENT --txn-max-bytes");
+        assert(!short_private.a.transaction && short_private.RegisteredSnapshots() == 0U);
+    }
+    {
+        Fixture short_global(chunkdb::EngineConfig{.txn_total_bytes = self - 1U});
+        ExpectError(short_global.Run(short_global.a, "BEGIN"), "INVALID_ARGUMENT --txn-total-bytes");
+        assert(!short_global.a.transaction && short_global.RegisteredSnapshots() == 0U);
+    }
+}
+
+void TestOwnedStorageOutlivesSessionAndEngine() {
+    Fixture f;
+    ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
+    assert(f.a.transaction->snapshot == nullptr);
+    auto budget = f.a.transaction->memory_budget;
+    auto* global = f.a.transaction->total_bytes;
+    auto account = chunkdb::MakeTxnStorageAccount(budget);
+    auto policy = chunkdb::detail::ChunkStoragePolicy::Create(account);
+    chunkdb::detail::ChunkStorageAllocator<std::uint8_t> allocator(policy);
+    auto* bytes = allocator.allocate(31U);
+    ExpectReply(f.Run(f.a, "SET BLOCK 0 0 IN t n = 1"), "_\r\n");
+    const auto logical = f.a.transaction->bytes;
+    const auto with_logical = budget->bytes();
+    assert(logical != 0U && global->load() == with_logical);
+    f.engine.reset();
+    f.a.transaction.reset();
+    assert(budget->bytes() == with_logical - logical && global->load() == budget->bytes());
+    assert(f.RegisteredSnapshots() == 0U);
+    const auto before_free = budget->bytes();
+    const auto allocation = chunkdb::detail::ChunkStorageAllocationBytes(bytes);
+    allocator.deallocate(bytes, 31U);
+    assert(budget->bytes() == before_free - allocation && global->load() == budget->bytes());
+}
+
 // ALTER TABLE or DROP TABLE during a transaction ends it with CONFLICT.
 void TestTableChanged() {
     Fixture f;
@@ -375,6 +442,8 @@ int main() {
     TestChunkStatements();
     TestDurationLimit();
     TestByteAndChunkLimits();
+    TestBeginBookkeepingBoundaries();
+    TestOwnedStorageOutlivesSessionAndEngine();
     TestTableChanged();
     std::puts("txn engine tests passed");
     return 0;

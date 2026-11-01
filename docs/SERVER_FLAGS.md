@@ -152,8 +152,8 @@ With `--auth scram` the directory must already have users, because `--read-only`
 | `--max-area-response-bytes` | `67108864` | Complete encoded GET AREA reply, including page headers and cursor. |
 | `--txn-max-written-chunks` | `1024` | Distinct chunks written by one transaction. |
 | `--txn-max-read-chunks` | `8192` | Distinct chunks read by one transaction. |
-| `--txn-max-bytes` | `16777216` | Private written-chunk bytes for one transaction. |
-| `--txn-total-bytes` | `268435456` | Private written-chunk bytes for all open transactions. |
+| `--txn-max-bytes` | `16777216` | Charged bookkeeping, owned transaction storage and logical private written-chunk bytes for one transaction; BEGIN is refused if bookkeeping cannot fit. |
+| `--txn-total-bytes` | `268435456` | The same charged storage across transactions, including owned storage that outlives its session until released or transferred. |
 | `--txn-history-bytes` | `67108864` | Earlier chunk states retained per table; overflow cancels oldest transactions. |
 | `--feed-buffer-bytes` | `67108864` | Default live feed budget for tables without an explicit `feed_buffer_bytes` option, shared among watches. |
 | `--tcp-keepalive-ms` | `60000` | Set TCP idle and repeat probe intervals, 1–32767000 ms, for every accepted connection. |
@@ -169,6 +169,7 @@ See [Transactions](TRANSACTIONS.md) and [Change feed](CHANGE_FEED.md) for outcom
 A table without an explicit feed/slot limit uses the server defaults each time it opens.
 An explicit table limit persists; change it with ALTER TABLE SET.
 `DESCRIBE` returns the effective limits.
+Transaction byte limits include charged bookkeeping and owned storage; transient bulk-write copies are still checked after allocation, so these limits do not bound that path's peak memory.
 
 ## Persisted table options
 

@@ -8,6 +8,17 @@
 
 namespace txn_block_allocation {
 inline std::atomic<std::size_t> largest_allowed{std::numeric_limits<std::size_t>::max()};
+using Observer = void (*)(std::size_t) noexcept;
+inline std::atomic<Observer> observer{nullptr};
+class Observe {
+  public:
+    explicit Observe(Observer callback) : previous_(observer.exchange(callback)) {}
+    ~Observe() { observer.store(previous_); }
+    Observe(const Observe&) = delete;
+    Observe& operator=(const Observe&) = delete;
+  private:
+    Observer previous_;
+};
 class Guard {
   public:
     explicit Guard(std::size_t limit) : previous_(largest_allowed.exchange(limit)) {}
@@ -23,6 +34,7 @@ class Guard {
 __attribute__((noinline))
 #endif
 void* operator new(std::size_t bytes) {
+    if (const auto callback = txn_block_allocation::observer.load(std::memory_order_acquire)) callback(bytes);
     if (bytes > txn_block_allocation::largest_allowed.load(std::memory_order_relaxed)) throw std::bad_alloc();
     void* memory = std::malloc(bytes == 0U ? 1U : bytes);
     if (!memory) throw std::bad_alloc();
