@@ -255,12 +255,38 @@ std::error_code RenameByHandle(
     rename_info->FileNameLength = static_cast<DWORD>(target_w.size() * sizeof(wchar_t));
     std::memcpy(rename_info->FileName, target_w.data(), rename_info->FileNameLength);
 
-    const BOOL rename_ok = SetFileInformationByHandle(
-        tmp_handle,
-        FileRenameInfo,
-        rename_info,
-        static_cast<DWORD>(rename_bytes.size()));
-    const DWORD rename_error = rename_ok != 0 ? ERROR_SUCCESS : GetLastError();
+    // The extended information class uses a DWORD in the same first four
+    // bytes and can replace a target whose readers share delete access.
+    // Keep the ABI values usable with headers predating their symbolic names.
+    constexpr auto rename_info_ex = static_cast<FILE_INFO_BY_HANDLE_CLASS>(22);
+    constexpr DWORD replace_with_posix_semantics = 0x00000001U | 0x00000002U;
+    if (replace_if_exists)
+        std::memcpy(rename_bytes.data(), &replace_with_posix_semantics, sizeof(DWORD));
+    BOOL rename_ok = FALSE;
+    DWORD rename_error = ERROR_SUCCESS;
+    if (replace_if_exists && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE")) {
+        rename_error = ERROR_INVALID_PARAMETER;
+    } else {
+        rename_ok = SetFileInformationByHandle(
+            tmp_handle,
+            replace_if_exists ? rename_info_ex : FileRenameInfo,
+            rename_info,
+            static_cast<DWORD>(rename_bytes.size()));
+        rename_error = rename_ok != 0 ? ERROR_SUCCESS : GetLastError();
+    }
+    // Older kernels retain their original atomic rename path. An ordinary
+    // access/sharing error must not trigger a different publication strategy.
+    if (!rename_ok && replace_if_exists &&
+        (rename_error == ERROR_INVALID_PARAMETER || rename_error == ERROR_NOT_SUPPORTED ||
+         rename_error == ERROR_INVALID_FUNCTION)) {
+        rename_info->ReplaceIfExists = TRUE;
+        rename_ok = SetFileInformationByHandle(
+            tmp_handle,
+            FileRenameInfo,
+            rename_info,
+            static_cast<DWORD>(rename_bytes.size()));
+        rename_error = rename_ok != 0 ? ERROR_SUCCESS : GetLastError();
+    }
 
     const BOOL close_ok = CloseHandle(tmp_handle);
     const DWORD close_error = close_ok != 0 ? ERROR_SUCCESS : GetLastError();
