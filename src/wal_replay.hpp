@@ -113,4 +113,14 @@ void ValidateWalPrefix(std::istream& input, std::uint64_t prefix_bytes, const Ge
     std::vector<WalFrameBoundary>* boundaries = nullptr,
     std::shared_ptr<const ChunkColumnState>* chunk_columns = nullptr);
 
+// The seekable binary stream starts at byte zero; measured_bytes fixes the
+// admitted file extent. Retains one bounded frame, with the same replay and
+// corruption classification as ReplayWal. Short reads and seek errors throw.
+[[nodiscard]] WalReplayResult ReplayWalStream(std::istream& input, std::uint64_t measured_bytes,
+    const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id,
+    FeatureFlags features, std::uint64_t base_revision, std::uint64_t base_schema_version,
+    std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence,
+    ChunkVars* vars, std::vector<WalFrameBoundary>* boundaries = nullptr,
+    std::shared_ptr<const ChunkColumnState>* chunk_columns = nullptr);
+
 }  // namespace chunkdb
