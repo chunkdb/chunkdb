@@ -43,6 +43,7 @@ The marker's bytes, checksums, identities, role, inactive state and generation m
 An existing incompatible marker refuses without changing its bytes, any object or any foreign file.
 
 A writer can create the private object directory and sync its name, then exclusively publish and sync the marker and its directory before creating any digest-named object.
+An existing exact marker is likewise synced through its opened native file generation and directory before this writer first treats the namespace as durably admitted.
 An interrupted empty namespace can be completed only when its native admission finds no object or foreign entry; reserved unpublished marker temporaries can remain untouched.
 A missing marker alongside any digest-named object or foreign entry is damage rather than permission to adopt that directory.
 An INACTIVE selected root may coexist with an initialized namespace and unreferenced staged objects; those objects do not prove that grouped frames were authorized.
@@ -78,7 +79,7 @@ The implementation reuses native durability helpers on the pinned handles rather
 A small internal declaration can expose those existing native helpers without changing their bodies or ordinary call paths.
 
 If the digest name already exists, the writer admits that exact object and returns the existing reference only after matching its length, digest, complete typed value and context.
-Matching bytes and a visible name do not prove prior durability: reuse syncs that exact opened file generation and its directory before success, unless it holds an actual prior durable proof for both.
+Matching bytes and a visible name do not prove prior durability: this foundation always syncs that exact opened file generation and its directory before reporting durable reuse.
 Windows reuse obtains writable sync rights by reopening the already opened native object, validates that exact generation and fails closed if those rights are unavailable; it does not reopen the canonical pathname.
 A conflicting or redirected existing entry refuses without replacement.
 Publication uncertainty records whether this invocation installed the immutable name; a directory-sync failure does not report a durable stage even if the new object is readable.
