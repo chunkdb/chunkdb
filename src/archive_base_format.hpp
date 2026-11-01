@@ -8,6 +8,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "crypto.hpp"
 
 namespace chunkdb {
 
@@ -23,8 +24,12 @@ struct ArchiveBaseDescriptor {
     std::uint64_t base_time_ms = 0;
     std::uint64_t base_schema = 0;
     std::uint64_t image_length = 0;
-    std::uint32_t image_crc32 = 0;
+    crypto::Sha256Digest image_sha256{};
 };
+
+[[nodiscard]] constexpr std::size_t ArchiveBaseDescriptorBytes(std::uint8_t dims) noexcept {
+    return 100U + 8U * dims;
+}
 
 [[nodiscard]] std::vector<std::uint8_t> SerializeArchiveBaseDescriptor(
     const ArchiveBaseDescriptor& descriptor, std::uint64_t max_image_bytes);
