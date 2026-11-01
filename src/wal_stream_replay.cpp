@@ -6,13 +6,15 @@
 #include <stdexcept>
 
 #include "chunkdb/crc32.hpp"
+#include "feature_flags.hpp"
 
 namespace chunkdb {
 namespace {
 
 class StreamSource final : public wal_detail::ReplaySource {
   public:
-    StreamSource(std::istream& input, std::uint64_t measured_bytes, std::uint8_t dims) : input_(input) {
+    StreamSource(std::istream& input, std::uint64_t measured_bytes, std::uint8_t dims,
+        const std::function<void()>& read_checkpoint) : input_(input), read_checkpoint_(read_checkpoint) {
         if (measured_bytes > std::numeric_limits<std::size_t>::max() ||
             measured_bytes > static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max()))
             throw std::length_error("WAL extent exceeds stream position limits");
@@ -86,19 +88,31 @@ class StreamSource final : public wal_detail::ReplaySource {
 
   private:
     void ReadAt(std::size_t position, std::uint8_t* output, std::size_t count) {
+        if (read_checkpoint_) read_checkpoint_();
         if (input_.bad()) throw std::runtime_error("failed to read WAL stream");
-        input_.clear();
-        input_.seekg(static_cast<std::streamoff>(position), std::ios::beg);
-        if (!input_) throw std::runtime_error("failed to seek WAL stream");
+        if (!position_ || *position_ != position) {
+            input_.clear();
+            input_.seekg(static_cast<std::streamoff>(position), std::ios::beg);
+            if (!input_) throw std::runtime_error("failed to seek WAL stream");
+            position_ = position;
+        }
         if (count == 0U) return;
-        input_.read(reinterpret_cast<char*>(output), static_cast<std::streamsize>(count));
-        if (input_.gcount() != static_cast<std::streamsize>(count) || input_.bad())
-            throw std::runtime_error("failed to read measured WAL extent");
+        for (std::size_t used = 0U; used < count;) {
+            if (used != 0U && read_checkpoint_) read_checkpoint_();
+            const auto part = std::min(count - used, kScanBytes);
+            input_.read(reinterpret_cast<char*>(output + used), static_cast<std::streamsize>(part));
+            if (input_.gcount() != static_cast<std::streamsize>(part) || input_.bad())
+                throw std::runtime_error("failed to read measured WAL extent");
+            used += part;
+            position_ = position + used;
+        }
     }
 
     static constexpr std::size_t kScanBytes = 64U * 1024U;
     std::istream& input_;
+    const std::function<void()>& read_checkpoint_;
     std::size_t size_ = 0U;
+    std::optional<std::size_t> position_{};
     std::vector<std::uint8_t> header_, frame_;
 };
 }  // namespace
@@ -107,10 +121,31 @@ WalReplayResult ReplayWalStream(std::istream& input, std::uint64_t measured_byte
     const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
     std::uint64_t base_revision, std::uint64_t base_schema_version,
     std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence, ChunkVars* vars,
-    std::vector<WalFrameBoundary>* boundaries, std::shared_ptr<const ChunkColumnState>* chunk_columns) {
-    StreamSource source(input, measured_bytes, geometry.dims());
+    std::vector<WalFrameBoundary>* boundaries, std::shared_ptr<const ChunkColumnState>* chunk_columns,
+    const std::function<void()>& read_checkpoint) {
+    StreamSource source(input, measured_bytes, geometry.dims(), read_checkpoint);
     return wal_detail::ReplayFromSource(source, geometry, coord, table_id, features,
         base_revision, base_schema_version, payload, presence, vars, boundaries, chunk_columns);
+}
+
+WalStreamInfo InspectWalStream(std::istream& input, std::uint64_t measured_bytes,
+    const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
+    const std::function<void()>& read_checkpoint) {
+    StreamSource source(input, measured_bytes, geometry.dims(), read_checkpoint);
+    const auto& header = source.Header();
+    ValidateWalHeader(header, coord, table_id, features, geometry.dims());
+    features = UnionFeatures(features,
+        {.incompat = ReadLe32(header, 16U), .ro_compat = ReadLe32(header, 20U), .compat = ReadLe32(header, 24U)});
+    WalStreamInfo result;
+    for (auto position = ChunkWalHeaderBytes(geometry.dims()); position < source.Size();) {
+        const auto window = source.Frame(position);
+        const auto info = InspectFeedFrame(window.bytes, geometry, features);
+        if (info.revision <= result.last) throw std::runtime_error("archive WAL revisions do not increase");
+        if (result.first == 0U) { result.first = info.revision; result.first_schema = info.schema_version; }
+        result.last = info.revision;
+        position += window.bytes.size();
+    }
+    return result;
 }
 
 }  // namespace chunkdb

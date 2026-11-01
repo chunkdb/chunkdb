@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <istream>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -121,6 +122,17 @@ void ValidateWalPrefix(std::istream& input, std::uint64_t prefix_bytes, const Ge
     FeatureFlags features, std::uint64_t base_revision, std::uint64_t base_schema_version,
     std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence,
     ChunkVars* vars, std::vector<WalFrameBoundary>* boundaries = nullptr,
-    std::shared_ptr<const ChunkColumnState>* chunk_columns = nullptr);
+    std::shared_ptr<const ChunkColumnState>* chunk_columns = nullptr,
+    const std::function<void()>& read_checkpoint = {});
+
+struct WalStreamInfo {
+    std::uint64_t first = 0U, last = 0U, first_schema = 0U;
+};
+
+// Validate every whole frame in a measured WAL without retaining the file
+// or constructing chunk state. Empty WALs have zero first/last revisions.
+[[nodiscard]] WalStreamInfo InspectWalStream(std::istream& input, std::uint64_t measured_bytes,
+    const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
+    const std::function<void()>& read_checkpoint = {});
 
 }  // namespace chunkdb

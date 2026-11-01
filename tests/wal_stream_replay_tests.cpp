@@ -234,11 +234,13 @@ class LimitedBuffer final : public std::stringbuf {
     LimitedBuffer(const Bytes& bytes, std::streamsize maximum) :
         std::stringbuf(std::string(bytes.begin(), bytes.end()), std::ios::in | std::ios::binary), maximum_(maximum) {}
     std::streamsize xsgetn(char* target, std::streamsize count) override {
+        ++reads;
         if (count > maximum_) throw std::runtime_error("unbounded WAL stream read");
         largest = std::max(largest, count);
         return std::stringbuf::xsgetn(target, count);
     }
     std::streamsize largest = 0;
+    std::size_t reads = 0U;
   private:
     std::streamsize maximum_;
 };
@@ -288,6 +290,65 @@ void BoundedReadsAndExtent() {
     Check(oversized, geometry);
     assert(Run(oversized, geometry, true).error == "WAL frame exceeds its byte limit");
 }
+
+void InspectionAndCancellation() {
+    const auto geometry = MakeGeometry();
+    auto bytes = Header();
+    for (std::uint64_t revision = 1U; revision <= 4096U; ++revision) Append(bytes, Frame(revision));
+    LimitedBuffer buffer(bytes, 1024);
+    std::istream input(&buffer);
+    const auto info = InspectWalStream(input, bytes.size(), geometry, {0, 0}, kId, kFeatures);
+    assert(info.first == 1U && info.last == 4096U && info.first_schema == 1U);
+    std::istringstream empty(std::string(bytes.begin(), bytes.end()), std::ios::binary);
+    const auto none = InspectWalStream(empty, Header().size(), geometry, {0, 0}, kId, kFeatures);
+    assert(none.first == 0U && none.last == 0U && none.first_schema == 0U);
+    for (const bool order : {false, true}) {
+        auto damaged = Header();
+        Append(damaged, Frame(2U));
+        Append(damaged, Frame(order ? 1U : 3U));
+        if (!order) damaged.pop_back();
+        std::istringstream stream(std::string(damaged.begin(), damaged.end()), std::ios::binary);
+        bool refused = false;
+        try { (void)InspectWalStream(stream, damaged.size(), geometry, {0, 0}, kId, kFeatures); }
+        catch (const std::runtime_error&) { refused = true; }
+        assert(refused);
+    }
+    GeometryConfig config;
+    config.chunk_width_blocks = 1024U;
+    config.chunk_height_blocks = 128U;
+    config.block_bits = 8U;
+    const Geometry large(config);
+    bytes = Header();
+    {
+        WalFrameBuilder frame(&bytes, 1U);
+        const Bytes payload(large.ChunkPayloadBytes(), 7U);
+        frame.AppendSpan(0U, payload.data(), payload.size());
+        (void)frame.Finish(1U, 10U);
+    }
+    for (const bool inspect : {false, true}) {
+        LimitedBuffer bounded(bytes, 65536);
+        std::istream stream(&bounded);
+        std::size_t checkpoints = 0U;
+        const auto cancel = [&] {
+            if (++checkpoints == 5U) throw std::runtime_error("requested cancellation");
+        };
+        bool cancelled = false;
+        try {
+            if (inspect) (void)InspectWalStream(stream, bytes.size(), large, {0, 0}, kId, kFeatures, cancel);
+            else {
+                Bytes payload, presence(ChunkPresenceBitmapBytes(large), 0U);
+                ChunkVars vars;
+                (void)ReplayWalStream(stream, bytes.size(), large, {0, 0}, kId, kFeatures,
+                    0U, 0U, &payload, &presence, &vars, nullptr, nullptr, cancel);
+            }
+        } catch (const std::runtime_error& error) { cancelled = std::string(error.what()) == "requested cancellation"; }
+        assert(cancelled && checkpoints == 5U && bounded.reads == 4U && bounded.largest == 65536);
+    }
+    LimitedBuffer bounded(bytes, 65536);
+    std::istream stream(&bounded);
+    const auto whole = InspectWalStream(stream, bytes.size(), large, {0, 0}, kId, kFeatures);
+    assert(whole.first == 1U && whole.last == 1U && bounded.largest == 65536);
+}
 }  // namespace
 
 int main() {
@@ -295,4 +356,5 @@ int main() {
     InterruptedCreationAndInteriorSearch();
     SchemaMetadataAndFinalInvariants();
     BoundedReadsAndExtent();
+    InspectionAndCancellation();
 }
