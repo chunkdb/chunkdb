@@ -389,7 +389,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 &loaded.presence_bitmap,
                 &loaded.vars,
                 track_prefix ? &boundaries : nullptr,
-                &loaded.chunk_columns, loaded.commit_time_ms);
+                &loaded.chunk_columns, loaded.commit_time_ms, retained_boundary ?
+                    std::optional{WalKnownIdentity{retained_boundary->revision, retained_boundary->commit_time_ms}} : std::nullopt);
             loaded.schema_version = geometry_.layout().schema().version;
             if (replay.torn_creation) {
                 // An interrupted creation holds no mutation, and names no
@@ -493,7 +494,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             &loaded.presence_bitmap,
             &loaded.vars,
             track_prefix ? &boundaries : nullptr,
-            &loaded.chunk_columns, {}, loaded.commit_time_ms);
+            &loaded.chunk_columns, {}, loaded.commit_time_ms, retained_boundary ?
+                std::optional{WalKnownIdentity{retained_boundary->revision, retained_boundary->commit_time_ms}} : std::nullopt);
         wal_input.close();
         loaded.schema_version = geometry_.layout().schema().version;
         if (replay.torn_creation) {

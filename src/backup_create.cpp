@@ -245,7 +245,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             const auto initialized = LoadFile(store.data_dir_ / ".chunkdb.initialized");
             if (!IsValidInitializedStoreMarker(initialized)) throw std::runtime_error("backup initialized marker is damaged");
             save(table_root / ".chunkdb.initialized", initialized);
-            if (auto slots = ReadFeedSlotRecords(store.data_dir_, store.store_id_)) {
+            if (auto slots = ReadFeedSlotRecords(store.data_dir_, store.store_id_, store.geometry_.dims())) {
                 slots->durable_watermark = std::min(slots->durable_watermark, cut);
                 for (auto& slot : slots->slots) slot.written = std::min(slot.written, slots->durable_watermark);
                 save(table_root / kFeedSlotsFileName, SerializeFeedSlotRecords(*slots));
@@ -291,7 +291,8 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             }
             auto& retained = retained_indexes[table_name];
             if (!retained) retained = std::make_unique<RetainedBackupIndex>(table_dir, manifest);
-            if (const auto boundary = retained->index.EmptyBoundary(coord))
+            const auto boundary = retained->index.EmptyBoundary(coord);
+            if (boundary)
                 (void)ApplyRetainedEmptyBase(geometry, *boundary, base, time, schema,
                     payload, presence, vars, chunk_columns);
             SharedFileInput input(staging.path / file.relative);
@@ -299,7 +300,8 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             std::vector<WalFrameBoundary> boundaries;
             const auto replay = ReplayWalStream(input, file.observed, geometry, coord, manifest.store_id, manifest.features,
                 base, schema, &payload, &presence, &vars, &boundaries, &chunk_columns,
-                [&] { hook(BackupTestHook::Point::kBeforeWalReplayRead, table_name, table_cut->revision); }, time);
+                [&] { hook(BackupTestHook::Point::kBeforeWalReplayRead, table_name, table_cut->revision); }, time,
+                boundary ? std::optional{WalKnownIdentity{boundary->revision, boundary->commit_time_ms}} : std::nullopt);
             if (!replay.torn_creation && (!replay.replayable ||
                 (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty()))
                 throw std::runtime_error("backup WAL cannot be replayed: " + replay.stop_reason + " " + replay.vars_problem);

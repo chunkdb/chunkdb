@@ -452,7 +452,7 @@ ChunkStore::ChunkStore(StoreConfig config)
         InitializeStoreManifest();
         // Slots refuse multi-process writers before recovery can change any
         // artifact. Read-only opening only inspects their checked metadata.
-        const auto slots = ReadFeedSlotRecords(data_dir_, store_id_);
+        const auto slots = ReadFeedSlotRecords(data_dir_, store_id_, geometry_.dims());
         if ((slots || std::filesystem::exists(data_dir_ / kFeedArchiveDirName)) && (features_.incompat & kFeatureFeedSlots) == 0U)
             throw std::runtime_error("chunkdb.slots requires the feed slots storage feature");
         if (slots && slots->filter_format && (features_.incompat & kFeatureSlotFilters) == 0U)

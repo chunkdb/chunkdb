@@ -1,8 +1,36 @@
 #include <cassert>
+#include <cstdlib>
+#include <new>
 
 #include "checkpoint.hpp"
+#include "change_feed.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "test_utils.hpp"
+
+namespace allocation { thread_local bool fail_next = false; }
+void* operator new(std::size_t bytes) {
+    if (allocation::fail_next) { allocation::fail_next = false; throw std::bad_alloc(); }
+    if (auto* memory = std::malloc(bytes == 0U ? 1U : bytes)) return memory;
+    throw std::bad_alloc();
+}
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void operator delete(void* pointer) noexcept { std::free(pointer); }
+void* operator new[](std::size_t bytes) { return ::operator new(bytes); }
+void operator delete[](void* pointer) noexcept { ::operator delete(pointer); }
+void operator delete(void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
+void operator delete[](void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
+
+namespace chunkdb {
+struct FeatureActivationTestAccess {
+    static void ReleaseGeometryCopyStorage(Table& table) {
+        // No lease can observe this exclusive-owner storage. A later schema
+        // copy must allocate just as it would with exhausted vector capacity.
+        table.geometry_ = Geometry(table.geometry_.config());
+    }
+};
+}
 
 namespace {
 using namespace chunkdb;
@@ -84,5 +112,51 @@ void CompactionFailureFencesUntilRecovery() {
         assert(lease->store().RetainedDeletionFloor() == (fail_at == 1U ? 0U : deleted));
     }
 }
+void ResumeAllocationFailureDoesNotEscapeCleanup() {
+    struct Hook final : FeedTestHook {
+        Table* table = nullptr;
+        bool armed = true;
+        void Run(Point point, std::uint64_t) override {
+            if (point != Point::kAfterResume || !armed) return;
+            armed = false;
+            FeatureActivationTestAccess::ReleaseGeometryCopyStorage(*table);
+            allocation::fail_next = true;
+        }
+    } hook;
+    for (const bool compact : {false, true}) {
+        test::ScopedTempDir directory("chunkdb-compaction-resume-allocation");
+        TableCatalog catalog(Config(directory.path()));
+        const auto table = catalog.Create("t", [&] {
+            return TableDefinition{.geometry = {2U, 2U, 2U, 2U, 8U}, .options = catalog.default_options(),
+                .schema = SingleBitsColumnSchema(8U), .chunk_schema = TableSchema{
+                    .next_column_id = 2U, .columns = {{.id = 1U, .name = "owner",
+                        .type = {ColumnKind::kUnsigned, 8U}, .default_value = {}}}}};
+        });
+        std::uint64_t deleted = 0U;
+        {
+            auto lease = table->Acquire();
+            lease->store().SetBlockBits(0, 0, "10000000");
+            lease->store().UnsetBlock(0, 0);
+            deleted = lease->store().GetChunkVersion(0, 0);
+            lease->store().CheckpointForTests(0, 0);
+        }
+        auto subscription = table->SubscribeFeed();
+        hook.table = table.get(); hook.armed = true;
+        FeedTestAccess::SetHook(*table, &hook);
+        bool failed = false;
+        try { (void)catalog.CompactTombstones("t", compact ? deleted + 1U : 0U); }
+        catch (const std::bad_alloc&) { failed = true; }
+        assert(failed && !allocation::fail_next);
+        FeedTestAccess::SetHook(*table, nullptr);
+        if (compact) assert(!catalog.Find("t") && catalog.Fence("t"));
+        else {
+            auto lease = catalog.Require("t")->Acquire();
+            assert(lease && lease->store().ReadChunkState(0, 0).written);
+        }
+    }
 }
-int main() { CompactionReopensAndReportsHistoryFloor(); CompactionFailureFencesUntilRecovery(); }
+}
+int main(int argc, char**) {
+    if (argc == 1) { CompactionReopensAndReportsHistoryFloor(); CompactionFailureFencesUntilRecovery(); }
+    ResumeAllocationFailureDoesNotEscapeCleanup();
+}

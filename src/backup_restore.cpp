@@ -68,12 +68,14 @@ std::vector<std::uint8_t> RecoverWal(const std::filesystem::path& path, const Ge
         payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
         chunk_columns = std::move(image.chunk_columns);
     }
-    if (const auto boundary = retained.EmptyBoundary(coord))
+    const auto boundary = retained.EmptyBoundary(coord);
+    if (boundary)
         (void)ApplyRetainedEmptyBase(geometry, *boundary, revision, time, schema,
             payload, presence, vars, chunk_columns);
     auto bytes = LoadFile(path);
     const auto replay = ReplayWal(bytes, geometry, coord, epoch, features, revision, schema,
-        &payload, &presence, &vars, nullptr, &chunk_columns, time);
+        &payload, &presence, &vars, nullptr, &chunk_columns, time,
+        boundary ? std::optional{WalKnownIdentity{boundary->revision, boundary->commit_time_ms}} : std::nullopt);
     if (replay.torn_creation) return {};
     if (!replay.replayable || (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty())
         throw std::runtime_error("restored WAL is damaged: " + path.string());
@@ -235,7 +237,7 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
                 Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_FILE_ONCE");
             }
             RewriteRetainedIndex(directory, geometry, old_epoch, new_epoch);
-            if (auto slots = ReadFeedSlotRecords(directory, old_epoch)) {
+            if (auto slots = ReadFeedSlotRecords(directory, old_epoch, geometry.dims())) {
                 slots->epoch = new_epoch; slots->durable_watermark = cut.revision;
                 for (auto& slot : slots->slots) { slot.written = cut.revision; slot.lost = slot.schema_filter_lost; }
                 WriteFeedSlotRecords(directory, *slots);

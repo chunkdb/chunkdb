@@ -156,6 +156,14 @@ The restored inventory and every listed log receive the new table identity befor
 The restored clock exceeds every recovered image, WAL and tombstone revision.
 Verification independently checks dimensions, placement, identities, schemas, checksums, index transitions, tombstone overlaps and backup cuts without repairing data.
 
+## Feed rows
+
+Feed entries carry the table dimensionality and both schema domains, and every block, chunk form and chunk-column change uses that many coordinate axes.
+A chunk-column change contains the complete before and after rows, with a null before row only when the chunk had no producing identity, and is emitted when those rows differ.
+An empty chunk-column schema allocates and emits no chunk-column change rows.
+Block-column projections preserve the complete chunk-column row, and `NOBEFORE` removes both kinds of before rows.
+Chunk-form events carry checked forms with each chunk's producing revision and time, and use a null form only when neither present blocks nor non-default chunk columns remain.
+
 ## Durable slot filters
 
 The checked `CKSL` record uses format tag 3, a table dimensionality byte of 2 or 3 at offset 6, and a flags byte at offset 7 whose only defined bit preserves the filtered-record capability.

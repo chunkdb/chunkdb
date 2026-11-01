@@ -4,12 +4,19 @@
 #include <stdexcept>
 
 #include "chunkdb/crc32.hpp"
+#include "populated_index_format.hpp"
 
 namespace chunkdb {
 
 void ValidateWalPrefix(std::istream& input, std::uint64_t prefix_bytes, const Geometry& geometry,
     const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
     ChunkState state, std::uint64_t schema_version) {
+    ValidateWalPrefix(input, prefix_bytes, geometry, coord, table_id, features, std::move(state), schema_version, nullptr);
+}
+
+void ValidateWalPrefix(std::istream& input, std::uint64_t prefix_bytes, const Geometry& geometry,
+    const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
+    ChunkState state, std::uint64_t schema_version, const ChunkIndexRecord* retained) {
     const auto read_exact = [&](std::uint8_t* at, std::size_t count) {
         input.read(reinterpret_cast<char*>(at), static_cast<std::streamsize>(count));
         if (input.gcount() != static_cast<std::streamsize>(count))
@@ -51,6 +58,8 @@ void ValidateWalPrefix(std::istream& input, std::uint64_t prefix_bytes, const Ge
             throw std::runtime_error("rollback WAL frame revisions do not increase");
         previous = info.revision;
         position += frame_bytes;
+        if (retained && info.revision == retained->revision && info.commit_time_ms != retained->commit_time_ms)
+            throw std::runtime_error("rollback WAL producing time conflicts with its retained boundary");
         if (info.revision == base && state.written && info.commit_time_ms != state.commit_time_ms)
             throw std::runtime_error("rollback WAL producing time conflicts with its replay base");
         if (info.revision <= base) continue;
