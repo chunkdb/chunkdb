@@ -19,7 +19,7 @@ OK
 OK
 (applies at COMMIT)
 (applies at COMMIT)
-3
+1
 ```
 
 ## Guarantees

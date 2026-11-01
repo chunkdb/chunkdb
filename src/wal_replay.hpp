@@ -70,7 +70,8 @@ void ValidateWalHeader(
     const std::vector<std::uint8_t>& bytes,
     const ChunkCoord& expected_chunk_coord,
     const StoreId& store_id,
-    const FeatureFlags& store_features);
+    const FeatureFlags& store_features,
+    std::uint8_t dims = 2U);
 
 // Replays the frames of a WAL onto `payload`, `presence_bitmap` and `vars`
 // (the chunk's state from its image, whose revision is `base_revision`; 0
@@ -98,6 +99,7 @@ void ValidateWalHeader(
     ChunkVars* vars,
     // Optional accepted frame ends, including frames already held by the image.
     // A rejected frame is never added; the caller must still check the result.
-    std::vector<WalFrameBoundary>* boundaries = nullptr);
+    std::vector<WalFrameBoundary>* boundaries = nullptr,
+    std::shared_ptr<const ChunkColumnState>* chunk_columns = nullptr);
 
 }  // namespace chunkdb

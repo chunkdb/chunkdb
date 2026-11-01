@@ -40,7 +40,7 @@ chunk-cli --uri "$CHUNKDB_URI" watch feed_demo
 
 ```output
 start <epoch>:0
-change revision 2 time_ms <time-ms> user admin
+change revision 1 time_ms <time-ms> user admin
   block 0 0: (absent) -> {kind = 1}
 ```
 
@@ -51,7 +51,7 @@ SET BLOCK 0 0 IN feed_demo kind = 1
 ```
 
 ```output
-2
+1
 ```
 
 Press Ctrl-C to stop the CLI watcher; it sends UNWATCH.
@@ -63,8 +63,8 @@ chunk-cli --uri "$CHUNKDB_URI" watch feed_demo --slot consumer
 
 ```output
 start <epoch>:0
-schema <epoch>:2 version 1
-change revision 2 time_ms <time-ms> user admin
+schema <epoch>:1 version 1
+change revision 1 time_ms <time-ms> user admin
   block 0 0: (absent) -> {kind = 1}
 ```
 

@@ -408,7 +408,9 @@ void ColdRecovery(unsigned defect) {
     if (defect == 3) {
         const TxnIntent intent{.state = TxnIntentState::kRollback, .version = version,
             .entries = {{.coord = {0, 0}, .wal_boundary = boundary}}};
-        SaveBytes(TxnIntentPath(source / "tables/default", version), SerializeTxnIntent(intent));
+        const auto manifest = ReadStoreManifest(source / "tables/default");
+        SaveBytes(TxnIntentPath(source / "tables/default", version),
+            SerializeTxnIntent(intent, manifest->geometry.dims, manifest->store_id));
     }
     if (defect == 4) std::filesystem::rename(wal, wal.parent_path() / "C_00_0.wal");
     TableCatalog catalog(Config(source, DurabilityMode::kFsyncWal));

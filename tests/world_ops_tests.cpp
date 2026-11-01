@@ -856,7 +856,7 @@ void TestVersionsCasBatch() {
     const auto presence_none = std::string(store.geometry().ChunkBlockCount(), '0');
 
     const auto v1 = store.GetChunkVersion(0, 0);
-    assert(v1 != 0);
+    assert(v1 == 0);
     assert(store.GetChunkVersion(0, 0) == v1);  // reads do not change versions
 
     store.SetBlockBits(0, 0, "10101");
