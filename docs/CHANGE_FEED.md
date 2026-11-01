@@ -19,7 +19,7 @@ chunk-cli --uri "$CHUNKDB_URI" watch world
 
 ```output
 start <epoch>:0
-change revision 2 time_ms <time-ms> user admin
+change revision 1 time_ms <time-ms> user admin
   block 0 0: (absent) -> {kind = 1}
 ```
 
@@ -30,7 +30,7 @@ SET BLOCK 0 0 IN world kind = 1
 ```
 
 ```output
-2
+1
 ```
 
 The **epoch** identifies the table; it changes when the table is recreated or restored.

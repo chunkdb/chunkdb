@@ -13,6 +13,7 @@
 #include <utility>
 
 #include "checkpoint.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "file_permissions.hpp"
 #include "change_feed.hpp"
 #include "chunk_store_internal.hpp"
@@ -548,7 +549,8 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     RequireFeature(store->features(), *FindFeature("feed_slots"));
     if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
     // Validate the complete filter before baseline, feature or record publication.
-    (void)SerializeFeedSlotRecords(FeedSlotRecords{store_id_, 0U, {{std::string(name), 0U, false, filters}}});
+    (void)SerializeFeedSlotRecords(FeedSlotRecords{store_id_, 0U, {{std::string(name), 0U, false, filters}},
+        false, store->geometry_.dims()});
     if (filters.column_ids) {
         const auto& columns = store->geometry_.layout().schema().columns;
         for (const auto id : *filters.column_ids)
@@ -840,6 +842,7 @@ TableInfo Table::Info() const {
         .options = options_,
         .feed_buffer_bytes = FeedBufferBytes(),
         .slot_max_bytes = slot_max_bytes_,
+        .chunk_schema = geometry_.chunk_schema(),
     };
 }
 
@@ -1679,7 +1682,10 @@ std::shared_ptr<Table> TableCatalog::Create(
     if (const auto reason = UnsupportedSchemaReason(table_schema); !reason.empty()) {
         throw std::invalid_argument(reason);
     }
-    const Geometry table_geometry(geometry, table_schema);
+    const Geometry table_geometry = prepared.chunk_schema ? Geometry(geometry, table_schema, *prepared.chunk_schema) :
+                                                           Geometry(geometry, table_schema);
+    if (table_geometry.dims() != 2)
+        throw std::invalid_argument("persistent chunk model support is incomplete");
     RequireValidTableOptions(options);
     if (existing != nullptr) {
         throw TableExistsError("table '" + table_name + "' already exists");
@@ -1700,8 +1706,11 @@ std::shared_ptr<Table> TableCatalog::Create(
         .store_id = NewStoreId(),
         .options = EncodeTableOptions(options),
         .schema = table_schema,
+        .chunk_schema = table_geometry.chunk_schema(),
     };
     try {
+        if (!ChunkCoordinateIndex::InitializeEmpty(staging, table_geometry, manifest.store_id))
+            throw std::runtime_error("coordinate inventory appeared in table staging");
         if (!PublishNewFile(StoreManifestPath(staging), SerializeStoreManifest(manifest))) {
             throw std::runtime_error("table manifest appeared in " + staging.string());
         }
@@ -2009,7 +2018,6 @@ bool TableCatalog::ChangeColumnsIfNeeded(
                 throw std::invalid_argument(reason);
             }
             manifest->geometry.block_bits = FixedBitsPerBlock(*changed);
-            (void)Geometry(manifest->geometry, *changed);
             manifest->schema = *changed;
         },
         "CHUNKDB_FAILPOINT_ALTER_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
@@ -2091,7 +2099,8 @@ void TableCatalog::RewriteManifest(
     Table& table,
     const TableOptions& options,
     const std::function<void(StoreManifest*)>& change,
-    const char* dir_sync_failpoint) {
+    const char* dir_sync_failpoint,
+    const std::optional<TableSchema>& chunk_schema) {
     const TableOptions previous = table.Info().options;
     auto store = table.BeginExclusive();
     if (!store) throw TableNotFoundError("table was dropped");
@@ -2123,8 +2132,20 @@ void TableCatalog::RewriteManifest(
             throw std::runtime_error("table manifest of '" + table.name_ + "' disappeared");
         }
         const auto previous_schema = manifest->schema;
+        const auto previous_chunk_schema = *manifest->chunk_schema;
         change(&*manifest);
+        if (chunk_schema) manifest->chunk_schema = *chunk_schema;
+        AlignManifestSchemaDomains(&*manifest, previous_schema, previous_chunk_schema);
         RequireCompatibleColumnAdditions(previous_schema, manifest->schema, *store);
+        for (const auto& column : manifest->chunk_schema->columns) {
+            if (!column.required || column.has_default ||
+                std::any_of(previous_chunk_schema.columns.begin(), previous_chunk_schema.columns.end(),
+                    [&](const auto& old) { return old.id == column.id; })) continue;
+            if (store->HasWrittenChunkIdentities())
+                throw std::invalid_argument("chunk column " + column.name +
+                    ": a REQUIRED column added to a table needs a DEFAULT for its written chunk identities");
+            break;
+        }
         AtomicWrite(
             StoreManifestPath(table.dir_),
             SerializeStoreManifest(*manifest),

@@ -1,6 +1,8 @@
 #pragma once
 
 #include <cstddef>
+#include <istream>
+#include <functional>
 #include <optional>
 #include <string>
 #include <vector>
@@ -70,7 +72,21 @@ void ValidateWalHeader(
     const std::vector<std::uint8_t>& bytes,
     const ChunkCoord& expected_chunk_coord,
     const StoreId& store_id,
-    const FeatureFlags& store_features);
+    const FeatureFlags& store_features,
+    std::uint8_t dims = 2U);
+
+[[nodiscard]] bool IsInterruptedWalCreation(const std::vector<std::uint8_t>& bytes,
+    const ChunkCoord& coord, const StoreId& table_id, std::uint8_t dims = 2U);
+
+// Validates an acknowledged exact prefix without retaining the whole WAL.
+// The borrowed stream starts at byte zero and may contain an ignored suffix.
+// State is private scratch initialized from the owning image when present.
+void ValidateWalPrefix(std::istream& input, std::uint64_t prefix_bytes, const Geometry& geometry,
+    const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
+    ChunkState state = {}, std::uint64_t schema_version = 0U);
+void ValidateWalPrefix(std::istream& input, std::uint64_t prefix_bytes, const Geometry& geometry,
+    const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
+    ChunkState state, std::uint64_t schema_version, const ChunkIndexRecord* retained);
 
 // Replays the frames of a WAL onto `payload`, `presence_bitmap` and `vars`
 // (the chunk's state from its image, whose revision is `base_revision`; 0
@@ -98,6 +114,46 @@ void ValidateWalHeader(
     ChunkVars* vars,
     // Optional accepted frame ends, including frames already held by the image.
     // A rejected frame is never added; the caller must still check the result.
-    std::vector<WalFrameBoundary>* boundaries = nullptr);
+    std::vector<WalFrameBoundary>* boundaries = nullptr,
+    std::shared_ptr<const ChunkColumnState>* chunk_columns = nullptr);
+
+// The seekable binary stream starts at byte zero; measured_bytes fixes the
+// admitted file extent. Retains one bounded frame, with the same replay and
+// corruption classification as ReplayWal. Short reads and seek errors throw.
+[[nodiscard]] WalReplayResult ReplayWalStream(std::istream& input, std::uint64_t measured_bytes,
+    const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id,
+    FeatureFlags features, std::uint64_t base_revision, std::uint64_t base_schema_version,
+    std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence,
+    ChunkVars* vars, std::vector<WalFrameBoundary>* boundaries = nullptr,
+    std::shared_ptr<const ChunkColumnState>* chunk_columns = nullptr,
+    const std::function<void()>& read_checkpoint = {});
+
+// A known producing identity also binds any checksum-valid equal-revision
+// frame that would otherwise be skipped below the replay base.
+struct WalKnownIdentity { std::uint64_t revision, commit_time_ms; };
+[[nodiscard]] WalReplayResult ReplayWal(
+    const std::vector<std::uint8_t>& bytes, const Geometry& geometry, const ChunkCoord& coord,
+    const StoreId& table_id, const FeatureFlags& features, std::uint64_t base_revision,
+    std::uint64_t base_schema_version, std::vector<std::uint8_t>* payload,
+    std::vector<std::uint8_t>* presence, ChunkVars* vars, std::vector<WalFrameBoundary>* boundaries,
+    std::shared_ptr<const ChunkColumnState>* chunk_columns, std::optional<std::uint64_t> base_commit_time_ms,
+    std::optional<WalKnownIdentity> retained_identity = {});
+[[nodiscard]] WalReplayResult ReplayWalStream(std::istream& input, std::uint64_t measured_bytes,
+    const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id,
+    FeatureFlags features, std::uint64_t base_revision, std::uint64_t base_schema_version,
+    std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence, ChunkVars* vars,
+    std::vector<WalFrameBoundary>* boundaries, std::shared_ptr<const ChunkColumnState>* chunk_columns,
+    const std::function<void()>& read_checkpoint, std::optional<std::uint64_t> base_commit_time_ms,
+    std::optional<WalKnownIdentity> retained_identity = {});
+
+struct WalStreamInfo {
+    std::uint64_t first = 0U, last = 0U, first_schema = 0U;
+};
+
+// Validate every whole frame in a measured WAL without retaining the file
+// or constructing chunk state. Empty WALs have zero first/last revisions.
+[[nodiscard]] WalStreamInfo InspectWalStream(std::istream& input, std::uint64_t measured_bytes,
+    const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
+    const std::function<void()>& read_checkpoint = {});
 
 }  // namespace chunkdb

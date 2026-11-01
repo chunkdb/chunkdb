@@ -299,10 +299,10 @@ std::string StatementSuggestion(std::string_view word) {
         return {};
     }
     const auto lower = Lower(word);
-    const std::array<std::string_view, 23U> keywords{
+    const std::array<std::string_view, 24U> keywords{
         "get", "set", "delete", "create", "alter", "drop", "show", "describe", "grant", "revoke",
         "begin", "commit", "rollback", "ping", "flush", "watch", "unwatch", "ack", "backup", "migrate",
-        "scan", "reload", "recover"};
+        "scan", "reload", "recover", "compact"};
     std::string_view closest;
     std::size_t best = word.size() < 4U ? 2U : 3U;
     bool tied = false;
@@ -543,10 +543,11 @@ class Parser {
 
     [[nodiscard]] FeedArea FeedBounds() {
         FeedArea area;
-        area.first.x = Coordinate("a chunk x"); area.first.y = Coordinate("a chunk y");
+        area.dims = Point(area.first.x, area.first.y, area.first.z, true);
         Expect("to");
-        area.last.x = Coordinate("a chunk x"); area.last.y = Coordinate("a chunk y");
-        if (area.first.x > area.last.x || area.first.y > area.last.y) Fail(1, "AREA bounds are reversed");
+        if (Point(area.last.x, area.last.y, area.last.z, true) != area.dims) Fail(1, "AREA endpoints have different dimensions");
+        if (area.first.x > area.last.x || area.first.y > area.last.y || area.first.z > area.last.z)
+            Fail(1, "AREA bounds are reversed");
         return area;
     }
     [[nodiscard]] std::vector<std::string> FeedColumns() {
@@ -594,6 +595,29 @@ class Parser {
         }
         Expect("version");
         return Unsigned("a version", std::numeric_limits<std::uint64_t>::max());
+    }
+
+    [[nodiscard]] std::uint8_t Point(std::int64_t& x, std::int64_t& y, std::int64_t& z, bool chunk = false) {
+        x = Coordinate(chunk ? "a chunk x" : "x");
+        y = Coordinate(chunk ? "a chunk y" : "y");
+        if (Peek().kind == TokenKind::kInteger) {
+            z = Coordinate(chunk ? "a chunk z" : "z");
+            return 3;
+        }
+        z = 0;
+        return 2;
+    }
+
+    [[nodiscard]] std::vector<Assignment> Assignments() {
+        std::vector<Assignment> values;
+        do {
+            Assignment assignment;
+            assignment.column = Name("a column name");
+            ExpectToken(TokenKind::kEquals, "=");
+            assignment.value = Value(true);
+            values.push_back(std::move(assignment));
+        } while (AcceptToken(TokenKind::kComma));
+        return values;
     }
 
     [[nodiscard]] ColumnType Type() {
@@ -664,23 +688,34 @@ class Parser {
         return option;
     }
 
-    [[nodiscard]] std::pair<std::uint32_t, std::uint32_t> Dimensions() {
-        const auto width = static_cast<std::uint32_t>(Unsigned("a width", std::numeric_limits<std::uint32_t>::max()));
-        // `16 x 16`, or `16x16`, which lexes as 16 and the word x16.
-        const Token& by = Peek();
-        if (by.kind == TokenKind::kWord && by.text.size() > 1 && (by.text[0] == 'x' || by.text[0] == 'X') &&
-            std::all_of(by.text.begin() + 1, by.text.end(), [](char c) { return IsDigit(c); })) {
-            std::uint32_t height = 0;
-            const auto result = std::from_chars(by.text.data() + 1, by.text.data() + by.text.size(), height);
-            if (result.ec != std::errc()) {
-                Fail(by.column, "the height is out of range");
+    [[nodiscard]] std::vector<std::uint32_t> Dimensions() {
+        std::vector<std::uint32_t> axes{
+            static_cast<std::uint32_t>(Unsigned("a width", std::numeric_limits<std::uint32_t>::max()))};
+        // Compact forms lex as an integer followed by one word: x16x16.
+        while (true) {
+            if (Accept("x")) {
+                if (axes.size() == 3U) Fail(Peek().column, "geometry has more than three dimensions");
+                axes.push_back(static_cast<std::uint32_t>(Unsigned("a dimension", std::numeric_limits<std::uint32_t>::max())));
+                continue;
+            }
+            const auto& token = Peek();
+            if (token.kind != TokenKind::kWord || token.text.size() <= 1U ||
+                (token.text.front() != 'x' && token.text.front() != 'X')) break;
+            std::size_t at = 0U;
+            while (at < token.text.size()) {
+                if (axes.size() == 3U) Fail(token.column, "geometry has more than three dimensions");
+                if (token.text[at] != 'x' && token.text[at] != 'X') Fail(token.column, "expected X between dimensions");
+                const auto start = ++at;
+                while (at < token.text.size() && IsDigit(token.text[at])) ++at;
+                std::uint32_t axis = 0U;
+                const auto result = std::from_chars(token.text.data() + start, token.text.data() + at, axis);
+                if (start == at || result.ec != std::errc()) Fail(token.column, "the dimension is out of range");
+                axes.push_back(axis);
             }
             Take();
-            return {width, height};
         }
-        Expect("x");
-        const auto height = static_cast<std::uint32_t>(Unsigned("a height", std::numeric_limits<std::uint32_t>::max()));
-        return {width, height};
+        if (axes.size() < 2U) Fail(Peek().column, "expected X, got " + Quote(Peek()));
+        return axes;
     }
 
     // A verifier: a parameter, or a text literal.
@@ -753,8 +788,7 @@ class Parser {
         if (Accept("get")) {
             if (Accept("block")) {
                 GetBlock get;
-                get.x = Coordinate("x");
-                get.y = Coordinate("y");
+                get.dims = Point(get.x, get.y, get.z);
                 Expect("from");
                 get.table = Name("a table name");
                 get.columns = Columns();
@@ -772,8 +806,7 @@ class Parser {
             }
             if (Accept("chunk")) {
                 GetChunk get;
-                get.chunk_x = Coordinate("a chunk x");
-                get.chunk_y = Coordinate("a chunk y");
+                get.dims = Point(get.chunk_x, get.chunk_y, get.chunk_z, true);
                 Expect("from");
                 get.table = Name("a table name");
                 get.columns = Columns();
@@ -783,16 +816,13 @@ class Parser {
                 GetArea get;
                 if (Accept("around")) {
                     get.around = true;
-                    get.x0 = Coordinate("x");
-                    get.y0 = Coordinate("y");
+                    get.dims = Point(get.x0, get.y0, get.z0);
                     Expect("radius");
                     get.radius = static_cast<std::int64_t>(Unsigned("a radius", std::numeric_limits<std::int64_t>::max()));
                 } else {
-                    get.x0 = Coordinate("x");
-                    get.y0 = Coordinate("y");
+                    get.dims = Point(get.x0, get.y0, get.z0);
                     Expect("to");
-                    get.x1 = Coordinate("x");
-                    get.y1 = Coordinate("y");
+                    if (Point(get.x1, get.y1, get.z1) != get.dims) Fail(1, "AREA endpoints have different dimensions");
                 }
                 Expect("from");
                 get.table = Name("a table name");
@@ -808,33 +838,36 @@ class Parser {
         if (Accept("set")) {
             if (Accept("block")) {
                 SetBlock set;
-                set.x = Coordinate("x");
-                set.y = Coordinate("y");
+                set.dims = Point(set.x, set.y, set.z);
                 Expect("in");
                 set.table = Name("a table name");
-                do {
-                    Assignment assignment;
-                    assignment.column = Name("a column name");
-                    ExpectToken(TokenKind::kEquals, "=");
-                    assignment.value = Value(true);
-                    set.values.push_back(std::move(assignment));
-                } while (AcceptToken(TokenKind::kComma));
+                set.values = Assignments();
                 set.if_version = IfVersion();
                 return set;
             }
             if (Accept("chunk")) {
                 SetChunk set;
-                set.chunk_x = Coordinate("a chunk x");
-                set.chunk_y = Coordinate("a chunk y");
+                set.dims = Point(set.chunk_x, set.chunk_y, set.chunk_z, true);
                 Expect("in");
                 set.table = Name("a table name");
-                const std::size_t column = Peek().column;
-                const Literal state = Value(true);
-                if (!std::holds_alternative<Parameter>(state)) {
-                    Fail(column, "the chunk is sent as a parameter ($1)");
+                if (Accept("meta")) {
+                    set.metadata = Assignments();
+                } else {
+                    set.columns = Columns();
+                    const std::size_t column = Peek().column;
+                    const Literal state = Value(true);
+                    if (!std::holds_alternative<Parameter>(state)) {
+                        Fail(column, "the chunk is sent as a parameter ($1)");
+                    }
+                    set.state = std::get<Parameter>(state);
                 }
-                set.state = std::get<Parameter>(state);
-                set.if_version = IfVersion();
+                if (Accept("if")) {
+                    if (Accept("absent")) set.if_absent = true;
+                    else {
+                        Expect("version");
+                        set.if_version = Unsigned("a version", std::numeric_limits<std::uint64_t>::max());
+                    }
+                }
                 return set;
             }
             Fail(Peek().column, "expected BLOCK or CHUNK, got " + Quote(Peek()));
@@ -842,8 +875,7 @@ class Parser {
         if (Accept("delete")) {
             Expect("block");
             DeleteBlock del;
-            del.x = Coordinate("x");
-            del.y = Coordinate("y");
+            del.dims = Point(del.x, del.y, del.z);
             Expect("from");
             del.table = Name("a table name");
             del.if_version = IfVersion();
@@ -882,15 +914,32 @@ class Parser {
             ExpectToken(TokenKind::kClose, ")");
             bool chunk = false;
             bool with = false;
+            bool chunk_columns = false;
+            std::optional<std::size_t> large_dims;
             while (true) {
                 const auto column = Peek().column;
                 if (Accept("chunk")) {
-                    if (chunk) Fail(column, "CHUNK is given twice");
-                    chunk = true;
-                    std::tie(create.chunk_width, create.chunk_height) = Dimensions();
+                    if (Accept("columns")) {
+                        if (chunk_columns) Fail(column, "CHUNK COLUMNS is given twice");
+                        chunk_columns = true;
+                        ExpectToken(TokenKind::kOpen, "(");
+                        do { create.chunk_columns.push_back(Definition()); } while (AcceptToken(TokenKind::kComma));
+                        ExpectToken(TokenKind::kClose, ")");
+                    } else {
+                        if (chunk) Fail(column, "CHUNK is given twice");
+                        chunk = true;
+                        const auto axes = Dimensions();
+                        create.chunk_width = axes[0];
+                        create.chunk_height = axes[1];
+                        create.dims = static_cast<std::uint8_t>(axes.size());
+                        if (axes.size() == 3U) create.chunk_depth = axes[2];
+                    }
                 } else if (Accept("large")) {
                     if (create.large) Fail(column, "LARGE is given twice");
-                    create.large = Dimensions();
+                    const auto axes = Dimensions();
+                    create.large = std::make_pair(axes[0], axes[1]);
+                    large_dims = axes.size();
+                    if (axes.size() == 3U) create.large_depth = axes[2];
                 } else if (Accept("with")) {
                     if (with) Fail(column, "WITH is given twice");
                     with = true;
@@ -899,6 +948,7 @@ class Parser {
                     } while (AcceptToken(TokenKind::kComma));
                 } else break;
             }
+            if (large_dims && *large_dims != create.dims) Fail(1, "CHUNK and LARGE have different dimensions");
             return create;
         }
         if (Accept("alter")) {
@@ -919,16 +969,20 @@ class Parser {
             AlterTable alter;
             alter.table = Name("a table name");
             if (Accept("add")) {
+                const bool chunk_column = Accept("chunk");
                 Expect("column");
                 const bool conditional = IfNotExists();
-                alter.change = AddColumn{.column = Definition(), .if_not_exists = conditional};
+                alter.change = AddColumn{.column = Definition(), .if_not_exists = conditional, .chunk_column = chunk_column};
             } else if (Accept("drop")) {
+                const bool chunk_column = Accept("chunk");
                 Expect("column");
                 const bool conditional = IfExists();
-                alter.change = DropColumn{.column = Name("a column name"), .if_exists = conditional};
+                alter.change = DropColumn{.column = Name("a column name"), .if_exists = conditional, .chunk_column = chunk_column};
             } else if (Accept("rename")) {
+                const bool chunk_column = Accept("chunk");
                 Expect("column");
                 RenameColumn rename;
+                rename.chunk_column = chunk_column;
                 rename.column = Name("a column name");
                 Expect("to");
                 rename.new_name = Name("a column name");
@@ -988,6 +1042,10 @@ class Parser {
             return EnableFeature{.name = Take().text};
         }
         if (Accept("show")) {
+            if (Accept("table")) {
+                Expect("stats");
+                return ShowTableStats{.table = Name("a table name")};
+            }
             if (Accept("status")) return ShowStatus{};
             if (Accept("migrations")) return ShowMigrations{};
             if (Accept("slots")) {
@@ -1012,6 +1070,13 @@ class Parser {
         if (Accept("recover")) {
             Expect("table");
             return RecoverTable{.table = Name("a table name")};
+        }
+        if (Accept("compact")) {
+            Expect("tombstones");
+            CompactTombstones compact{.table = Name("a table name")};
+            Expect("before");
+            compact.before = Unsigned("a revision", std::numeric_limits<std::uint64_t>::max());
+            return compact;
         }
         if (Accept("flush")) {
             Expect("wal");
@@ -1083,13 +1148,25 @@ class Parser {
                 const auto column = Peek().column;
                 if (Accept("after")) {
                     if (scan.after) Fail(column, "AFTER is given twice");
-                    const std::int64_t x = Coordinate("a chunk x");
-                    scan.after = std::make_pair(x, Coordinate("a chunk y"));
+                    std::int64_t x = 0, y = 0;
+                    scan.dims = Point(x, y, scan.after_z, true);
+                    scan.after = std::make_pair(x, y);
                 } else if (Accept("limit")) {
                     if (scan.limit) Fail(column, "LIMIT is given twice");
                     scan.limit = Unsigned("a limit", std::numeric_limits<std::uint64_t>::max());
+                } else if (Accept("since")) {
+                    if (scan.since) Fail(column, "SINCE is given twice");
+                    scan.since = Unsigned("a revision", std::numeric_limits<std::uint64_t>::max());
+                } else if (Accept("with")) {
+                    if (scan.with_data) Fail(column, "WITH DATA is given twice");
+                    Expect("data");
+                    scan.with_data = true;
+                } else if (Accept("columns")) {
+                    if (!scan.columns.empty()) Fail(column, "COLUMNS is given twice");
+                    scan.columns = FeedColumns();
                 } else break;
             }
+            if (!scan.columns.empty() && !scan.with_data) Fail(1, "COLUMNS requires WITH DATA");
             return scan;
         }
         throw UnknownCommandError("column " + std::to_string(first.column) + ": unknown statement " +

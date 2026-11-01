@@ -2,6 +2,7 @@
 #include <array>
 #include <cstdlib>
 #include <limits>
+#include <map>
 #include <mutex>
 #include <random>
 #include <shared_mutex>
@@ -18,6 +19,9 @@
 #include "chunkdb/logging.hpp"
 #include "txn_history.hpp"
 #include "wal_writer.hpp"
+#include "chunk_coordinate_index.hpp"
+#include "shared_file_input.hpp"
+#include "txn_intent_format.hpp"
 
 namespace chunkdb {
 
@@ -166,7 +170,7 @@ bool TryParseConditionalIntent(
     return TryParseIntent(bytes, out_state, out_committed_wal_size);
 }
 
-void ChunkStore::RecoverConditionalRollbackIntents() {
+void ChunkStore::RecoverConditionalRollbackIntents(bool validate_only) {
     if (access_mode_ == AccessMode::kReadOnly) {
         return;
     }
@@ -200,9 +204,22 @@ void ChunkStore::RecoverConditionalRollbackIntents() {
     const std::filesystem::directory_iterator end;
     // Intents whose temp files a crash left behind; removed after the scan.
     std::vector<std::filesystem::path> interrupted_intents;
+    struct Pending {
+        std::filesystem::path path;
+        ChunkCoord coord;
+        ConditionalIntentState state;
+        std::uint64_t boundary;
+    };
+    std::vector<Pending> pending;
+    std::map<ChunkCoord, std::uint64_t> rollback_cuts;
+    const auto admit_cut = [&](ChunkCoord coord, std::uint64_t boundary) {
+        const auto [position, inserted] = rollback_cuts.emplace(coord, boundary);
+        if (!inserted && position->second != boundary)
+            throw std::runtime_error("conflicting pending rollback boundaries for one chunk");
+    };
     while (iterator != end) {
         std::error_code type_ec;
-        const bool regular = iterator->is_regular_file(type_ec);
+        const bool regular = std::filesystem::is_regular_file(iterator->symlink_status(type_ec));
         if (type_ec) {
             throw std::runtime_error(
                 "failed to inspect conditional rollback artifact " +
@@ -216,33 +233,57 @@ void ChunkStore::RecoverConditionalRollbackIntents() {
                 intent_dir.string() + ": " + iterator_ec.message());
         }
         if (IsTxnIntentArtifactName(intent_path.filename().string())) {
-            // Transaction intents share the directory; RecoverTransactionIntents
-            // resolves them and their temporary files.
+            const auto name = intent_path.filename().string();
+            if (name.find(".tmp.") != std::string::npos) continue;
+            TxnIntent transaction;
+            if (!regular || !IsTxnIntentFileName(name) ||
+                !TryParseTxnIntent(LoadRecoveryTxnIntent(intent_path), &transaction, geometry_.dims(), store_id_) ||
+                TxnIntentPath(data_dir_, transaction.version).filename() != intent_path.filename())
+                throw std::runtime_error("invalid transaction intent: " + intent_path.string());
+            if (transaction.state == TxnIntentState::kRollback)
+                for (const auto& member : transaction.entries) admit_cut(member.coord, member.wal_boundary);
             continue;
         }
         if (const auto name = intent_path.filename().string();
             regular && name.find(std::string(kRollbackIntentSuffix) + ".tmp.") != std::string::npos) {
-            interrupted_intents.push_back(intent_dir / name.substr(0, name.find(".tmp.")));
+            const auto base = name.substr(0, name.find(".tmp."));
+            ChunkCoord coord;
+            if (!ParseConditionalIntentFileName(base, geometry_, &coord))
+                throw std::runtime_error("invalid interrupted conditional intent name: " + name);
+            interrupted_intents.push_back(intent_dir / base);
             continue;
         }
-        if (!regular ||
-            intent_path.string().size() <= kRollbackIntentSuffix.size() ||
-            intent_path.string().substr(
-                intent_path.string().size() - kRollbackIntentSuffix.size()) !=
-                kRollbackIntentSuffix) {
+        if (!intent_path.filename().string().ends_with(kRollbackIntentSuffix)) {
             continue;
         }
-
+        ChunkCoord coord;
+        if (!regular || !ParseConditionalIntentFileName(intent_path.filename().string(), geometry_, &coord))
+            throw std::runtime_error("invalid conditional intent name: " + intent_path.string());
         std::uint64_t committed_size = 0;
         ConditionalIntentState intent_state = ConditionalIntentState::kRollback;
-        const auto bytes = LoadFile(intent_path);
+        SharedFileInput input(intent_path);
+        std::vector<std::uint8_t> bytes(kRollbackIntentRecordSize);
+        input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        if (input.gcount() != static_cast<std::streamsize>(bytes.size()) || input.peek() != std::char_traits<char>::eof())
+            throw std::runtime_error("invalid conditional rollback intent length: " + intent_path.string());
         if (!TryParseIntent(bytes, &intent_state, &committed_size)) {
             throw std::runtime_error(
                 "invalid conditional rollback intent: " + intent_path.string());
         }
-        const std::filesystem::path wal_path =
-            WalPathForConditionalIntent(data_dir_, intent_path);
-
+        if (intent_state == ConditionalIntentState::kRollback) {
+            admit_cut(coord, committed_size);
+            const auto retained = coordinate_index_->EmptyBoundary(coord);
+            ValidateRollbackWalBoundary(data_dir_, geometry_, store_id_, features_, coord,
+                committed_size, retained ? &*retained : nullptr);
+        }
+        pending.push_back({intent_path, coord, intent_state, committed_size});
+    }
+    if (validate_only) return;
+    for (const auto& action : pending) {
+        const auto& intent_path = action.path;
+        const auto wal_path = ChunkWalPath(data_dir_, geometry_, action.coord);
+        const auto intent_state = action.state;
+        const auto committed_size = action.boundary;
         if (intent_state == ConditionalIntentState::kRollback) {
             std::error_code exists_ec;
             const bool wal_present = std::filesystem::exists(wal_path, exists_ec);
