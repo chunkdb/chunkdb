@@ -21,11 +21,13 @@ The caller retains the real lock until all artifact writers are destroyed; the f
 
 POSIX operations use pinned directory descriptors, `openat` with no-follow and close-on-exec flags, `fstat` regular-file checks and relative native publication names.
 Root and object-directory opens require actual directories and refuse redirected child components.
-Windows root and object-directory handles use OPEN_REPARSE_POINT and BACKUP_SEMANTICS, refuse reparse attributes and deny delete sharing while an I/O view uses their names.
-This prevents the admitted directory names from being replaced between the native type check and child operations.
+Windows root opening uses OPEN_REPARSE_POINT and BACKUP_SEMANTICS and refuses reparse attributes.
+Child directory and file opens use NtCreateFile with the pinned directory as RootDirectory, one fixed or digest-derived relative leaf and native no-reparse/type admission.
+Object-directory handles deny delete sharing while a view uses them, and all publication remains relative to those exact native directory objects.
 Child file handles allow read, write and delete sharing and validate the opened native regular-file object before reading.
-The Windows child path is constructed only from the pinned directory's native final name and the fixed or digest-derived leaf.
-The implementation verifies that the pinned directory identity still matches that admitted name before exposing a successful stage result.
+NtSetInformationFile performs no-replace publication from the exact temporary handle with a relative destination in its pinned directory.
+These documented native OS entrypoints are resolved from the already loaded ntdll module and require no additional package or link dependency; unavailable capability refuses before mutation without a pathname fallback.
+No final-path reconstruction or check after an outside write substitutes for handle-relative admission.
 No operation follows a record-supplied path or modifies an existing file in place.
 
 Hard links to plain regular files are allowed.
@@ -68,14 +70,16 @@ An INACTIVE staging convenience constructs the fixed generation-one empty root i
 Staging a syntactically valid ACTIVE root snapshot is still private object preparation and cannot replace the canonical root.
 
 A new object is written through an exclusive owner-private temporary native handle in the admitted object directory.
-The writer completes every byte, performs actual file durability on that handle and closes it before publishing the digest name without replacement.
-It then syncs the object directory before exposing a durable result, including after discovering an existing exact matching object whose name durability was not yet established in this process.
+The writer completes every byte, performs actual file durability on that handle and publishes the digest name without replacement while retaining exact native generation ownership.
+It closes that file owner and then syncs the object directory before exposing a durable result.
 Newly created directory names and the `.scope` marker receive their own parent-directory durability before objects can be staged.
 macOS file sync preserves F_FULLFSYNC and only the existing unsupported-capability fallback; POSIX directory sync and Windows native file and directory sync preserve the established strict error contract.
 The implementation reuses native durability helpers on the pinned handles rather than reopening a canonical path to sync another generation.
 A small internal declaration can expose those existing native helpers without changing their bodies or ordinary call paths.
 
 If the digest name already exists, the writer admits that exact object and returns the existing reference only after matching its length, digest, complete typed value and context.
+Matching bytes and a visible name do not prove prior durability: reuse syncs that exact opened file generation and its directory before success, unless it holds an actual prior durable proof for both.
+Windows reuse obtains writable sync rights by reopening the already opened native object, validates that exact generation and fails closed if those rights are unavailable; it does not reopen the canonical pathname.
 A conflicting or redirected existing entry refuses without replacement.
 Publication uncertainty records whether this invocation installed the immutable name; a directory-sync failure does not report a durable stage even if the new object is readable.
 An exact later retry must re-admit and sync that name before returning success, so a prior failed directory sync cannot disappear as unrecorded debt.
