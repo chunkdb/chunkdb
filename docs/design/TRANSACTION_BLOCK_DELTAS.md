@@ -27,9 +27,10 @@ Replacement rows contain complete canonical row values, including defaults when 
 
 Rows, cells, value buffers, journal nodes, promotion nodes and prepared edits use standard polymorphic allocators backed by a transaction budget resource.
 The resource charges actual requested allocation bytes, including container capacity and implementation node sizes, before upstream allocation.
-It checks overflow and the existing per-transaction bound, then atomically reserves the existing global transaction counter; upstream allocation failure releases both reservations.
+It checks overflow and the existing per-transaction bound, then reserves the existing global transaction counter through checked compare-and-exchange without a wrapping speculative increment; upstream allocation failure releases both reservations.
 Deallocation returns exactly those charges, and staging remains charged while it coexists with the published private state.
 The budget borrows the transaction's private byte count and the engine's global count, and its owner must outlive every row, journal and prepared edit using it.
+The same resource reaches every nested cell and value container, including failed or still-staged records.
 Session integration must destroy or clear these allocated records before the existing transaction byte-counter teardown, so a charge is returned once.
 No new process-wide quota or counter is introduced.
 
@@ -43,8 +44,10 @@ The caller owns every participating current chunk in canonical commit-lock order
 Validation compares every observed or written row with its original canonical preimage before changing any chunk, and equal values permit ABA.
 Accepted replacements apply to the current chunk rather than the snapshot chunk, preserving every unrelated block and the current chunk columns.
 All row shapes, REQUIRED initialization and combined variable-byte growth are admitted before application.
+Any current-chunk before state required by registered snapshots is captured and reserved in the existing history before the first in-place row edit.
 Prepared row edits and the existing variable-update undo mechanism provide reversible application without cloning the fixed payload or presence arrays.
 An application failure restores every earlier applied row and variable update before the caller releases any commit lock.
+Once application starts, prepared fixed-byte and presence backups and `VarUndo` make all undo nonallocating and nonthrowing; a missing guarantee requires a different preparation plan rather than catching an undo failure.
 The prepared owner does not allocate producing revisions, append WAL, publish a group or claim durable completion.
 Existing snapshot history copies and bounded variable-section mutation staging retain their established ownership and are not private whole-chunk transaction copies.
 
