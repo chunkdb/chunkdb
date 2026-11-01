@@ -1,7 +1,9 @@
+#include <algorithm>
 #include <array>
 #include <cassert>
 #include <cstdint>
 #include <span>
+#include <stdexcept>
 #include <string_view>
 #include <vector>
 
@@ -40,6 +42,7 @@ void ExactFraming() {
 
 void DistinctRequests() {
     assert(Statement("SET", {{'a'}, {'b','c'}}) != Statement("SET", {{'a','b'}, {'c'}}));
+    assert(Statement("SET", {{0x11U}, {1U, 0x22U}}) != Statement("SET", {{0x11U, 1U}, {0x22U}}));
     assert(Statement("SET", {}) != Statement("SET", {{}}));
     assert(Statement("SET", {{0U, 1U}}) != Statement("SET", {{0U}, {1U}}));
     assert(Statement("SET", {{1U}}) != Statement("SET", {{1U, 0U}}));
@@ -99,6 +102,86 @@ void NullParameters() {
     null_transaction.AddStatement("COMMIT", {});
     empty_transaction.AddStatement("COMMIT", {});
     assert(null_transaction.Finish() != empty_transaction.Finish());
+    const std::vector<std::optional<std::string>> null_first{std::nullopt, std::string{}};
+    const std::vector<std::optional<std::string>> null_last{std::string{}, std::nullopt};
+    CommitRequestFingerprint first, last;
+    first.AddStatement("SET BLOCK 1 2 IN world a = $1, b = $2", null_first);
+    last.AddStatement("SET BLOCK 1 2 IN world a = $1, b = $2", null_last);
+    assert(first.Finish() != last.Finish());
+}
+
+template <typename Function> void RejectFraming(Function&& function) {
+    bool rejected = false;
+    try { function(); }
+    catch (const std::logic_error&) { rejected = true; }
+    assert(rejected);
+}
+
+void StreamedDiscardedBodies() {
+    std::string payload(65537U, '\0');
+    for (std::size_t i = 0; i < payload.size(); ++i) payload[i] = static_cast<char>(i % 251U);
+    const std::vector<std::optional<std::string>> parameters{payload, std::nullopt, std::string{}};
+    CommitRequestFingerprint complete, streamed, no_body;
+    for (auto* fingerprint : {&complete, &streamed, &no_body}) Record(*fingerprint, "BEGIN ID $1", {{7U}});
+    constexpr std::string_view text = "SET BLOCK 1 2 IN world a = $1, b = $2, c = $3";
+    complete.AddStatement(text, parameters);
+    streamed.BeginStatement(text, parameters.size());
+    RejectFraming([&] { (void)streamed.Finish(); });
+    streamed.BeginParameter(payload.size());
+    for (std::size_t at = 0; at < payload.size();) {
+        const auto bytes = std::min<std::size_t>(4096U, payload.size() - at);
+        streamed.ParameterBytes(crypto::Bytes(payload).subspan(at, bytes));
+        at += bytes;
+    }
+    RejectFraming([&] { (void)streamed.Finish(); });
+    streamed.BeginParameter(std::nullopt);
+    streamed.BeginParameter(0U);
+    streamed.ParameterBytes({});
+    for (auto* fingerprint : {&complete, &streamed, &no_body}) fingerprint->AddStatement("COMMIT", {});
+    assert(streamed.Finish() == complete.Finish());
+    assert(streamed.Finish() != no_body.Finish());
+    const Bytes tag{0U, 255U};
+    assert(streamed.Finish(tag) == complete.Finish(tag));
+}
+
+void IncompleteAndInvalidFraming() {
+    const Bytes one{1U}, two{1U, 2U};
+    CommitRequestFingerprint incomplete;
+    incomplete.BeginStatement("SET", 1U);
+    incomplete.BeginParameter(2U);
+    incomplete.ParameterBytes(one);
+    RejectFraming([&] { (void)incomplete.Finish(); });
+    incomplete.ParameterBytes(one);
+    assert(incomplete.Finish() == Statement("SET", {{1U, 1U}}));
+
+    CommitRequestFingerprint overrun;
+    overrun.BeginStatement("SET", 1U);
+    overrun.BeginParameter(1U);
+    RejectFraming([&] { overrun.ParameterBytes(two); });
+    RejectFraming([&] { overrun.ParameterBytes(one); });
+    RejectFraming([&] { overrun.AddStatement("COMMIT", {}); });
+    RejectFraming([&] { (void)overrun.Finish(); });
+
+    CommitRequestFingerprint extra;
+    extra.BeginStatement("SET", 0U);
+    RejectFraming([&] { extra.BeginParameter(std::nullopt); });
+    RejectFraming([&] { (void)extra.Finish(); });
+
+    CommitRequestFingerprint missing;
+    missing.BeginStatement("SET", 1U);
+    RejectFraming([&] { missing.BeginStatement("COMMIT", 0U); });
+    RejectFraming([&] { (void)missing.Finish(); });
+
+    CommitRequestFingerprint overlapping;
+    overlapping.BeginStatement("SET", 2U);
+    overlapping.BeginParameter(1U);
+    RejectFraming([&] { overlapping.BeginParameter(0U); });
+    RejectFraming([&] { (void)overlapping.Finish(); });
+
+    CommitRequestFingerprint suffix;
+    suffix.AddStatement("SET", {});
+    RejectFraming([&] { suffix.ParameterBytes(one); });
+    RejectFraming([&] { (void)suffix.Finish(); });
 }
 }  // namespace
 
@@ -107,4 +190,6 @@ int main() {
     DistinctRequests();
     TransactionTranscript();
     NullParameters();
+    StreamedDiscardedBodies();
+    IncompleteAndInvalidFraming();
 }
