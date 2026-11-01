@@ -14,6 +14,13 @@ namespace chunkdb {
 
 inline constexpr std::string_view kChunkIndexFileName = "chunkdb.index";
 
+class CoordinateArtifactTestHook {
+  public:
+    virtual ~CoordinateArtifactTestHook() = default;
+    virtual void BeforeStatus(const std::filesystem::path& path) = 0;
+};
+void SetCoordinateArtifactTestHook(CoordinateArtifactTestHook* hook) noexcept;
+
 struct ChunkCoordinateNode {
     std::atomic<std::uint64_t> revision{0U};
     std::atomic<bool> populated{false};
@@ -68,15 +75,19 @@ class ChunkCoordinateIndex {
     void ObserveRecovered(const ChunkCoord& coord, const ChunkState& state);
     // A borrowed node is used only under its canonical chunk's exclusive lock.
     [[nodiscard]] ChunkCoordinateNode* Find(const ChunkCoord& coord);
+    [[nodiscard]] bool IsPopulationCandidate(const ChunkCoord& coord) const;
     [[nodiscard]] CoordinateReservation Prepare(const ChunkCoord& coord, ChunkCoordinateNode** cache_slot);
     [[nodiscard]] CoordinatePage Page(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
         std::optional<std::uint64_t> since = {}) const;
+    // Exclusive current-state preparation does not make a history promise.
+    [[nodiscard]] CoordinatePage CurrentPage(bool has_cursor, const ChunkCoord& cursor, std::size_t limit) const;
     [[nodiscard]] std::optional<ChunkIndexRecord> EmptyBoundary(const ChunkCoord& coord) const;
     [[nodiscard]] std::uint64_t maximum_recovered_revision() const noexcept { return maximum_recovered_revision_; }
     [[nodiscard]] std::uint64_t retained_deletion_floor() const noexcept { return deletion_floor_.load(std::memory_order_acquire); }
     [[nodiscard]] bool failed() const noexcept { return failed_.load(std::memory_order_acquire); }
     [[nodiscard]] bool has_written_identities() const noexcept { return any_written_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t inventory_generation() const noexcept { return inventory_generation_.load(std::memory_order_acquire); }
+    [[nodiscard]] std::uint64_t tombstone_count() const;
     void PublishTombstone(const ChunkIndexRecord& record);
     void Compact(std::uint64_t before, std::uint64_t completed_frontier);
 

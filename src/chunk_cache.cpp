@@ -9,6 +9,7 @@
 #include "wal_replay.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
+#include "shared_file_input.hpp"
 
 #include <algorithm>
 #include <array>
@@ -341,7 +342,9 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         const auto txn_boundary = TxnRollbackBoundaryForChunk(txn_intents, chunk_coord, geometry_, store_id_);
         bool rollback_boundary = snapshot.intent.present && intent_state == ConditionalIntentState::kRollback;
         if (txn_boundary.has_value()) {
-            committed_wal_size = rollback_boundary ? std::min(committed_wal_size, *txn_boundary) : *txn_boundary;
+            if (rollback_boundary && committed_wal_size != *txn_boundary)
+                throw std::runtime_error("conflicting pending rollback boundaries for one chunk");
+            committed_wal_size = *txn_boundary;
             rollback_boundary = true;
         }
 
@@ -386,7 +389,8 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 &loaded.presence_bitmap,
                 &loaded.vars,
                 track_prefix ? &boundaries : nullptr,
-                &loaded.chunk_columns);
+                &loaded.chunk_columns, loaded.commit_time_ms, retained_boundary ?
+                    std::optional{WalKnownIdentity{retained_boundary->revision, retained_boundary->commit_time_ms}} : std::nullopt);
             loaded.schema_version = geometry_.layout().schema().version;
             if (replay.torn_creation) {
                 // An interrupted creation holds no mutation, and names no
@@ -460,20 +464,25 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
 
     apply_boundary();
     if (std::filesystem::exists(wal_path)) {
-        std::vector<std::uint8_t> wal_bytes;
+        std::optional<SharedFileInput> opened;
         try {
-            wal_bytes = LoadFile(wal_path);
-        } catch (...) {
-            // WAL can be removed concurrently by checkpoint cleanup.
-            // If it no longer exists, treat as already checkpointed.
+            opened.emplace(wal_path);
+        } catch (const std::system_error&) {
             if (std::filesystem::exists(wal_path)) {
                 throw;
             }
             finish();
             return loaded;
         }
-
-        const auto replay = ReplayWal(
+        auto& wal_input = *opened;
+        wal_input.seekg(0, std::ios::end);
+        const auto measured = wal_input.tellg();
+        if (measured < 0) throw std::runtime_error("failed to measure WAL " + wal_path.string());
+        const auto wal_bytes = static_cast<std::uint64_t>(measured);
+        wal_input.seekg(0);
+        if (!wal_input) throw std::runtime_error("failed to rewind WAL " + wal_path.string());
+        const auto replay = ReplayWalStream(
+            wal_input,
             wal_bytes,
             geometry_,
             chunk_coord,
@@ -485,7 +494,9 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             &loaded.presence_bitmap,
             &loaded.vars,
             track_prefix ? &boundaries : nullptr,
-            &loaded.chunk_columns);
+            &loaded.chunk_columns, {}, loaded.commit_time_ms, retained_boundary ?
+                std::optional{WalKnownIdentity{retained_boundary->revision, retained_boundary->commit_time_ms}} : std::nullopt);
+        wal_input.close();
         loaded.schema_version = geometry_.layout().schema().version;
         if (replay.torn_creation) {
             LogMessage(
@@ -495,7 +506,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
                 {
                     {"chunk_x", std::to_string(chunk_coord.x)},
                     {"chunk_y", std::to_string(chunk_coord.y)},
-                    {"bytes", std::to_string(wal_bytes.size())},
+                    {"bytes", std::to_string(wal_bytes)},
                 });
             if (writable) {
                 TrimWalForAppend(chunk_coord, wal_path, 0U);
@@ -520,7 +531,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
             throw std::runtime_error(
                 "WAL " + wal_path.string() + " is damaged before its end (" + replay.stop_reason +
                 " at byte " + std::to_string(replay.valid_end) + " of " +
-                std::to_string(wal_bytes.size()) + "); refusing to load chunk (" +
+                std::to_string(wal_bytes) + "); refusing to load chunk (" +
                 std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) + ")");
         }
         if (!replay.vars_problem.empty()) {

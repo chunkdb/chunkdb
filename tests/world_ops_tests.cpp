@@ -49,8 +49,7 @@ chunkdb::StoreConfig BaseConfig(const std::filesystem::path& data_dir) {
     };
 }
 
-// The first scan discovers cold directories once. Later pages and newly
-// loaded large chunks reuse/update the catalog, including cache-only writes.
+// Startup discovers cold artifacts; scan pages use the ordered index.
 void TestScanCatalogTracksNewDirectoriesAndEviction() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-catalog");
     auto config = BaseConfig(dir.path());
@@ -66,7 +65,7 @@ void TestScanCatalogTracksNewDirectoriesAndEviction() {
     assert(store.ScanCatalogBuildsForTests() == 0);
     const auto first = store.ScanPopulatedChunks(false, {}, 2);
     assert(first.coords.size() == 2 && first.has_more);
-    assert(store.ScanCatalogBuildsForTests() == 1);
+    assert(store.ScanCatalogBuildsForTests() == 0);
     // New directories after initialization must not be hidden by the index.
     store.SetBlockBits(4000, 0, "10001");
     store.SetBlockBits(-4000, 0, "10001");
@@ -85,7 +84,7 @@ void TestScanCatalogTracksNewDirectoriesAndEviction() {
         cursor = page.coords.back();
     }
     assert(seen == 42);  // the negative coordinate is behind the cursor
-    assert(store.ScanCatalogBuildsForTests() == 1);
+    assert(store.ScanCatalogBuildsForTests() == 0);
 }
 
 void TestReadOnlyScanCatalogRefreshesAfterWriterChanges() {
@@ -98,15 +97,15 @@ void TestReadOnlyScanCatalogRefreshesAfterWriterChanges() {
     reader_config.access_mode = chunkdb::AccessMode::kReadOnly;
     chunkdb::ChunkStore reader(reader_config);
     assert(reader.ScanPopulatedChunks(false, {}, 10).coords.size() == 1);
-    assert(reader.ScanCatalogBuildsForTests() == 1);
+    assert(reader.ScanCatalogBuildsForTests() == 0);
     assert(reader.ScanPopulatedChunks(false, {}, 10).coords.size() == 1);
-    assert(reader.ScanCatalogBuildsForTests() == 1);
+    assert(reader.ScanCatalogBuildsForTests() == 0);
     writer.SetBlockBits(4000, 0, "10001");
     writer.WalBarrier();
     const auto changed = reader.ScanPopulatedChunks(false, {}, 10);
     assert(changed.coords.size() == 2);
     assert(changed.coords.back().x == 1000);
-    assert(reader.ScanCatalogBuildsForTests() == 2);
+    assert(reader.ScanCatalogBuildsForTests() == 0);
 }
 
 void TestScanVisitsOnlyNeededLargeChunkColumns() {
@@ -155,8 +154,7 @@ void TestScanVisitsOnlyNeededLargeChunkColumns() {
     // 6 pages over 144 directories: the old walk listed all 144 per page
     // (864); the column walk lists each column at most once per page it
     // contributes to, plus the column that closes the window.
-    assert(listed_full < 6 * 144);
-    assert(listed_full <= 144 + 6 * 12);
+    assert(listed_full == 0U);
 
     // A page deep in the world skips every column before the cursor and
     // stops right after its own.
@@ -170,7 +168,7 @@ void TestScanVisitsOnlyNeededLargeChunkColumns() {
     const auto listed_page = store.ScanLargeDirsListedForTests() - before_page;
     // Columns lx=4 (cx 8..9), lx=5 (cx 10..11), and lx=6 closes the window:
     // at most 3 columns of 12 directories each.
-    assert(listed_page <= 36);
+    assert(listed_page == 0U);
 
     // The last page hits the end without a resume loop.
     const auto tail = store.ScanPopulatedChunks(true, {11, 9}, 10);
@@ -221,7 +219,7 @@ void TestScanWarmCacheMergesOnlyVisitedLargeChunks() {
     // Six pages over 144 resident large chunks: the unconditional merge cost
     // 6 * 144 = 864 large-chunk visits.
     const auto merged_full = store.ScanCachedLargeChunksMergedForTests() - merged_before_full;
-    assert(merged_full < 6 * 144);
+    assert(merged_full == 0U);
 
     // One page deep in the world touches only the large chunks around it,
     // whether their chunks come from disk or from the cache.
@@ -234,10 +232,10 @@ void TestScanWarmCacheMergesOnlyVisitedLargeChunks() {
     assert(page.coords.back().x == 10 && page.coords.back().y == -11);
     const auto dirs_page = store.ScanLargeDirsListedForTests() - dirs_before;
     const auto merged_page = store.ScanCachedLargeChunksMergedForTests() - merged_before;
-    assert(dirs_page <= 36);
+    assert(dirs_page == 0U);
     // The cache merge is bounded by the same visit set, not by the 144
     // resident large chunks.
-    assert(merged_page <= 36);
+    assert(merged_page == 0U);
 }
 
 // A world no wider than one large-chunk column has no column to skip, so the
@@ -271,8 +269,8 @@ void TestScanNarrowWorldPrunesInsideTheColumn() {
     const auto merged_page = store.ScanCachedLargeChunksMergedForTests() - merged_before;
     // Before the y-aware cut this listed and merged all 100 large chunks of
     // the column on every page.
-    assert(dirs_page <= 30);
-    assert(merged_page <= 30);
+    assert(dirs_page == 0U);
+    assert(merged_page == 0U);
 
     // Pruning must not cost coordinates: the whole column still enumerates.
     std::vector<chunkdb::ChunkCoord> seen;
@@ -973,14 +971,13 @@ void TestEmptyChunkGc() {
     store.SetBlockBits(1, 0, "11111");
     assert(std::filesystem::exists(data_path));
 
-    // Empty the chunk: the next checkpoint reclaims image, WAL, and the
-    // parent directory once it is empty.
+    // Collection reclaims image and WAL while retaining the checked identity.
     store.UnsetBlock(0, 0);
     store.UnsetBlock(1, 0);
     assert(store.RuntimeStats().empty_chunk_gcs >= 1);
     assert(!std::filesystem::exists(data_path));
     assert(!std::filesystem::exists(wal_path));
-    assert(!std::filesystem::exists(data_path.parent_path()));
+    assert(std::filesystem::exists(data_path.parent_path() / "chunkdb.index"));
 
     // Rewriting the chunk recreates storage; GC must not resurrect the old
     // data or drop the new write.

@@ -2,6 +2,7 @@
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
+#include "shared_file_input.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
 #include "populated_index_format.hpp"
@@ -537,7 +538,7 @@ ChunkStateImage ParseChunkImage(
 std::vector<std::uint8_t> LoadChunkImageFile(
     const std::filesystem::path& path, const Geometry& geometry, ChunkCoord coord,
     const StoreId& store_id, FeatureFlags store_features) {
-    std::ifstream input(path, std::ios::binary);
+    SharedFileInput input(path);
     if (!input) throw std::runtime_error("failed to open chunk image: " + path.string());
     input.seekg(0, std::ios::end);
     const auto end = input.tellg();
@@ -585,6 +586,12 @@ std::shared_ptr<const ChunkColumnState> DefaultChunkColumnsAt(const Geometry& ge
     return std::make_shared<const ChunkColumnState>(DefaultChunkColumns(schema));
 }
 
+bool ChunkColumnsPopulatedAt(const Geometry& geometry, std::uint64_t version, const ChunkColumnState* state) {
+    if (state == nullptr) return false;
+    const auto baseline = DefaultChunkColumnsAt(geometry, version);
+    return baseline == nullptr || state->bytes != baseline->bytes;
+}
+
 void BringChunkColumnsToSchema(const Geometry& geometry, std::uint64_t from_version, std::uint64_t to_version,
     std::shared_ptr<const ChunkColumnState>* state) {
     if (from_version == 0U || !geometry.has_chunk_column_history()) { state->reset(); return; }
@@ -613,6 +620,8 @@ bool ApplyRetainedEmptyBase(const Geometry& geometry, const ChunkIndexRecord& bo
         throw std::invalid_argument("retained replay base is not an empty boundary");
     if (revision > boundary.revision) return false;
     if (revision == boundary.revision) {
+        if (commit_time_ms != boundary.commit_time_ms)
+            throw std::runtime_error("retained empty boundary conflicts with an equal-version producing time");
         auto current_columns = chunk_columns;
         BringChunkColumnsToSchema(geometry, schema_version, geometry.chunk_schema().version, &current_columns);
         if (ChunkPopulated(geometry, presence, current_columns.get()))

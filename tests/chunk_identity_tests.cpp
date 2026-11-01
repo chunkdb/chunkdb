@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <future>
 #include <iterator>
 #include <stdexcept>
 #include <string>
@@ -9,8 +10,11 @@
 #include <vector>
 
 #include "chunk_store_internal.hpp"
+#include "checkpoint.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "wal_writer.hpp"
 #include "test_utils.hpp"
 
 namespace {
@@ -179,6 +183,138 @@ void TestTornHeaderAdmissionChecksCompleteSuffix() {
     assert(Read(dir.path() / "chunkdb.version") == version);
 }
 
+void TestStartupTailRepairRetainsSnapshotOwner() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-index-startup-tail-repair");
+    const auto config = Config(dir.path());
+    std::filesystem::path wal;
+    std::uint64_t revision = 0U, size = 0U;
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "10101");
+        revision = store.GetChunkVersion(0, 0);
+        wal = chunkdb::ChunkWalPath(dir.path(), store.geometry(), {0, 0});
+        size = std::filesystem::file_size(wal);
+    }
+    {
+        std::ofstream output(wal, std::ios::binary | std::ios::app);
+        output.write("partial", 7);
+        output.close();
+        assert(output.good());
+    }
+    chunkdb::ChunkStore writer(config);
+    assert(std::filesystem::file_size(wal) == size);
+    assert(writer.GetChunkVersion(0, 0) == revision);
+    assert((writer.ScanPopulatedChunks(false, {}, 10U).coords == std::vector{chunkdb::ChunkCoord{0, 0}}));
+    auto read_config = config;
+    read_config.access_mode = chunkdb::AccessMode::kReadOnly;
+    chunkdb::ChunkStore reader(read_config);
+    assert(reader.GetBlockBits(0, 0) == "10101");
+}
+
+void TestReadOnlyStartupDoesNotWalkLiveArtifacts() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-index-read-only-artifact-race");
+    auto config = Config(dir.path());
+    chunkdb::ChunkStore writer(config);
+    writer.SetBlockBits(0, 0, "10101");
+    writer.CheckpointForTests(0, 0);
+    writer.UnsetBlock(0, 0);
+    class Collect final : public chunkdb::CoordinateArtifactTestHook {
+      public:
+        explicit Collect(chunkdb::ChunkStore& writer) : writer_(writer) {}
+        void BeforeStatus(const std::filesystem::path&) override {
+            if (observed++) return;
+            writer_.CheckpointForTests(0, 0);
+        }
+        std::size_t observed = 0U;
+      private:
+        chunkdb::ChunkStore& writer_;
+    } collect(writer);
+    chunkdb::SetCoordinateArtifactTestHook(&collect);
+    config.access_mode = chunkdb::AccessMode::kReadOnly;
+    chunkdb::ChunkStore reader(config);
+    assert(collect.observed == 0U);
+    bool unstable = false;
+    try { (void)reader.ScanPopulatedChunks(false, {}, 10U); }
+    catch (const std::runtime_error& error) {
+        unstable = std::string(error.what()).find("changed during artifact admission") != std::string::npos;
+    }
+    chunkdb::SetCoordinateArtifactTestHook(nullptr);
+    assert(unstable && collect.observed != 0U);
+    assert(reader.ScanPopulatedChunks(false, {}, 10U).coords.empty());
+    assert(reader.ReadChunkState(0, 0).written);
+}
+
+void TestAreaSkipsMissingCoordinatesBeforeDiskReads() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-area-population-index");
+    chunkdb::ChunkStore store(Config(dir.path()));
+    store.ArmCachePauseForTests(chunkdb::CachePausePoint::kNoCacheReadBeforeDisk, {0, 0});
+    auto area = std::async(std::launch::async, [&] { return store.ReadChunkRange(0, 0, 1, 1); });
+    const auto status = area.wait_for(std::chrono::seconds(2));
+    store.ResumeCachePauseForTests(chunkdb::CachePausePoint::kNoCacheReadBeforeDisk);
+    assert(area.get().empty());
+    assert(status == std::future_status::ready);
+}
+
+void TestRetainedBoundaryRejectsEqualWalTimeConflict() {
+    for (const bool newer_image : {false, true}) {
+    chunkdb::test::ScopedTempDir directory("chunkdb-retained-wal-time");
+    const auto config = Config(directory.path());
+    std::filesystem::path wal;
+    std::vector<std::uint8_t> bytes;
+    const auto reason = newer_image ? "frame_retained_commit_time_mismatch" : "frame_base_commit_time_mismatch";
+    {
+        chunkdb::ChunkStore writer(config);
+        writer.SetBlockBits(0, 0, "10000");
+        writer.UnsetBlock(0, 0);
+        const auto empty = writer.ReadChunkState(0, 0);
+        writer.CheckpointForTests(0, 0);
+        (void)writer.ReadChunkState(2, 0);
+        assert(!writer.IsChunkLoadedForTests(0, 0));
+        wal = chunkdb::ChunkWalPath(directory.path(), writer.geometry(), {0, 0});
+        bytes = chunkdb::BuildWalHeader({0, 0}, writer.store_id(), writer.features());
+        chunkdb::WalFrameBuilder frame(&bytes, writer.geometry().layout().schema().version);
+        const std::vector<std::uint8_t> zeros(writer.geometry().ChunkPayloadBytes() +
+            chunkdb::ChunkPresenceBitmapBytes(writer.geometry()), 0U);
+        frame.AppendSpan(0U, zeros.data(), zeros.size());
+        (void)frame.Finish(empty.version, empty.commit_time_ms + 1U);
+        if (newer_image) {
+            auto payload = std::vector<std::uint8_t>(writer.geometry().ChunkPayloadBytes(), 0U);
+            auto presence = std::vector<std::uint8_t>(chunkdb::ChunkPresenceBitmapBytes(writer.geometry()), 0U);
+            payload[0] = 1U; presence[0] = 1U;
+            const auto image_revision = empty.version + 10U, image_time = empty.commit_time_ms + 10U;
+            chunkdb::AtomicWrite(chunkdb::ChunkDataPath(directory.path(), writer.geometry(), {0, 0}),
+                chunkdb::SerializeChunkImage(writer.geometry(), {0, 0}, payload, presence,
+                    chunkdb::CheckpointCompression::kNone, image_revision, image_time, writer.store_id()), true, true);
+            payload.insert(payload.end(), presence.begin(), presence.end());
+            chunkdb::WalFrameBuilder newer(&bytes, writer.geometry().layout().schema().version);
+            newer.AppendSpan(0U, payload.data(), payload.size());
+            (void)newer.Finish(image_revision, image_time);
+        }
+        chunkdb::AtomicWrite(wal, bytes, true, true);
+        bool refused = false;
+        try { (void)writer.ScanChunkIdentities(false, {}, 10U, 0U, true); }
+        catch (const std::runtime_error& error) {
+            refused = std::string(error.what()).find(reason) != std::string::npos;
+        }
+        assert(refused && Read(wal) == bytes);
+        auto readonly = config; readonly.access_mode = chunkdb::AccessMode::kReadOnly;
+        chunkdb::ChunkStore reader(readonly);
+        refused = false;
+        try { (void)reader.ReadChunkState(0, 0); }
+        catch (const std::runtime_error& error) {
+            refused = std::string(error.what()).find(reason) != std::string::npos;
+        }
+        assert(refused && Read(wal) == bytes);
+    }
+    bool refused = false;
+    try { chunkdb::ChunkStore writer(config); }
+    catch (const std::runtime_error& error) {
+        refused = std::string(error.what()).find(reason) != std::string::npos;
+    }
+    assert(refused && Read(wal) == bytes);
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -188,4 +324,8 @@ int main(int argc, char** argv) {
     if (selected == "all" || selected == "refresh") TestReadOnlyRefreshDoesNotInventIdentity();
     if (selected == "all" || selected == "collection") TestCollectedIdentitySurvivesRestart();
     if (selected == "all" || selected == "admission") TestTornHeaderAdmissionChecksCompleteSuffix();
+    if (selected == "all" || selected == "repair") TestStartupTailRepairRetainsSnapshotOwner();
+    if (selected == "all" || selected == "readonly-admission") TestReadOnlyStartupDoesNotWalkLiveArtifacts();
+    if (selected == "all" || selected == "area-index") TestAreaSkipsMissingCoordinatesBeforeDiskReads();
+    if (selected == "all" || selected == "retained-time") TestRetainedBoundaryRejectsEqualWalTimeConflict();
 }

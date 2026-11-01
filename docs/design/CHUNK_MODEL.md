@@ -92,6 +92,11 @@ An ordinary block write changes the table snapshot generation without changing t
 Read-only scans rebuild their complete live-coordinate candidate index when the table snapshot generation changes and publish it only after one unchanged equal-even whole-index observation.
 Every listed boundary covers a complete header and whole records; a listed log shorter than that boundary is damage.
 Recovery validates complete inventory and logs before mutating artifacts, resolves rollback intents, then reconciles committed image and WAL state.
+Conditional intent names encode exactly the table's dimensions and canonical shard placement.
+Every conditional decision and every rollback member is admitted before any intent cleanup or WAL truncation, including replay validation of its complete committed prefix over the checked image or retained-empty baseline.
+The same prefix admission serves transaction and conditional rollback recovery, and neither path may discard another member's bytes before all decisions pass validation.
+Pending rollback decisions for one coordinate must agree on their committed byte cut; conflicting cuts are damage and refuse the entire recovery before mutation.
+Committed cleanup decisions may overlap later writes or rollback decisions because they never authorize truncation.
 The durable startup snapshot fence owns one live publication count until this reconciliation and index repair finish, so nested normal WAL-tail repair cannot close or reject the enclosing recovery bracket.
 Live hints do not fabricate data or suppress newer committed WAL state.
 Listed missing or corrupt logs are damage; missing inventory is damage.
@@ -119,6 +124,11 @@ Ordinary area reads and scans omit tombstones; `SCAN SINCE` includes them and ad
 Requests below that floor fail explicitly instead of silently omitting deletions.
 
 Compaction requires exclusive mutation admission and persists its exact inclusive operation floor separately from the cumulative deletion floor.
+Shared-writer operation refuses compaction because its table admission cannot exclude another process's producers.
+Before staging any replacement, a WAL barrier establishes the checkpoint durability floor and every coordinate with a current artifact or cached state receives a complete durable checkpoint.
+This preparation removes a live WAL's dependency on an older retained empty baseline, including REQUIRED chunk columns initialized before that WAL, before the baseline can be discarded.
+Retained-only coordinates are skipped, and archive descriptors keep their independently pinned original replay bases.
+Any preparation failure preserves the existing deletion floor and follows the store's checked failure and table-fencing paths.
 For `BEFORE n`, the operation floor is `min(n - 1, completed_frontier)`; zero is a no-op.
 A durable pending inventory decision precedes every shard replacement.
 Before that decision, each shard's filtered replacement is written and synced under its owned staging name.
@@ -143,9 +153,28 @@ A resurrection segment uses its own retained-empty base and cannot replace a pre
 Rejected or undecided transaction frames never enter sealed archives.
 
 Backup pins the complete inventory, index logs and committed image/WAL prefixes at one table cut under maintenance admission.
+The maintenance pin excludes collection until immutable inventory bytes and every listed committed log prefix have been linked into private staging.
+Unpublished log suffixes are excluded, pending compaction is refused, and every retained producing revision must be at or below the table cut.
+Private validation replays WALs over their checked image or retained-empty baseline, including chunk-column schema history.
 Restore validates the complete backup before publication and rewrites identities and checksums while preserving producing versions and times.
+The restored inventory and every listed log receive the new table identity before the table manifest is published, preserving deletion floors and committed boundaries.
 The restored clock exceeds every recovered image, WAL and tombstone revision.
 Verification independently checks dimensions, placement, identities, schemas, checksums, index transitions, tombstone overlaps and backup cuts without repairing data.
+
+## Feed rows
+
+Feed entries carry the table dimensionality and both schema domains, and every block, chunk form and chunk-column change uses that many coordinate axes.
+A chunk-column change contains the complete before and after rows, with a null before row only when the chunk had no producing identity, and is emitted when those rows differ.
+An empty chunk-column schema allocates and emits no chunk-column change rows.
+Block-column projections preserve the complete chunk-column row, and `NOBEFORE` removes both kinds of before rows.
+Chunk-form events carry checked forms with each chunk's producing revision and time, and use a null form only when neither present blocks nor non-default chunk columns remain.
+
+## Durable slot filters
+
+The checked `CKSL` record uses format tag 3, a table dimensionality byte of 2 or 3 at offset 6, and a flags byte at offset 7 whose only defined bit preserves the filtered-record capability.
+The epoch, durable watermark, slot count, per-slot flags and projection IDs retain their checked meanings, and an AREA stores signed little-endian first coordinates followed by last coordinates for every active axis.
+Every AREA must match the record dimensionality, have ordered endpoints on all active axes, and have zero inactive coordinates; decoding with a known table dimensionality refuses a mismatch before returning records.
+The complete CRC, slot and byte limits are checked before publication, truncated or malformed records are refused without mutation, and earlier record tags require explicit recreation rather than a dimensionality fallback.
 
 ## Validation
 

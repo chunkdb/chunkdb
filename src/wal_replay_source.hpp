@@ -26,6 +26,7 @@ WalReplayResult ReplayFromSource(ReplaySource& source, const Geometry& geometry,
     std::uint64_t base_revision, std::uint64_t base_schema_version,
     std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence,
     ChunkVars* vars, std::vector<WalFrameBoundary>* boundaries,
-    std::shared_ptr<const ChunkColumnState>* chunk_columns);
+    std::shared_ptr<const ChunkColumnState>* chunk_columns,
+    std::optional<std::uint64_t> base_commit_time_ms = {}, std::optional<WalKnownIdentity> retained_identity = {});
 
 }  // namespace chunkdb::wal_detail

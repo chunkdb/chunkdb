@@ -159,7 +159,8 @@ void FeedSlotTestAccess::SetHook(Table& table, FeedSlotTestHook* hook) {
 
 FeedSlots::FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::milliseconds interval)
     : store_(store), max_bytes_(max_bytes), interval_(interval),
-      records_(ReadFeedSlotRecords(store.data_dir_, store.store_id_).value_or(FeedSlotRecords{store.store_id_, 0U, {}})),
+      records_(ReadFeedSlotRecords(store.data_dir_, store.store_id_, store.geometry_.dims()).value_or(
+          FeedSlotRecords{store.store_id_, 0U, {}, false, store.geometry_.dims()})),
       readers_(ReaderPins(store.store_id_)) {
     if (max_bytes_ == 0U || interval_.count() <= 0)
         throw std::invalid_argument("slot limits and sync interval must be positive");

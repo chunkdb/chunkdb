@@ -12,6 +12,7 @@
 #include "snapshot_generation.hpp"
 #include "store_manifest.hpp"
 #include "wal_replay.hpp"
+#include "shared_file_input.hpp"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -23,7 +24,8 @@
 namespace chunkdb {
 
 namespace {
-std::uint64_t FileBytes(std::ifstream& input, const std::filesystem::path& path) {
+std::atomic<CoordinateArtifactTestHook*> artifact_hook{nullptr};
+std::uint64_t FileBytes(std::istream& input, const std::filesystem::path& path) {
     input.seekg(0, std::ios::end);
     const auto bytes = input.tellg();
     if (bytes < 0) throw std::runtime_error("failed to measure coordinate artifact " + path.string());
@@ -31,7 +33,7 @@ std::uint64_t FileBytes(std::ifstream& input, const std::filesystem::path& path)
     if (!input) throw std::runtime_error("failed to rewind coordinate artifact " + path.string());
     return static_cast<std::uint64_t>(bytes);
 }
-std::vector<std::uint8_t> Prefix(std::ifstream& input, std::size_t count) {
+std::vector<std::uint8_t> Prefix(std::istream& input, std::size_t count) {
     std::vector<std::uint8_t> bytes(count);
     input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(count));
     if (input.gcount() != static_cast<std::streamsize>(count))
@@ -48,6 +50,10 @@ void RequirePlainPath(const std::filesystem::path& path, bool directory) {
         throw std::runtime_error("coordinate artifact is a reparse point: " + path.string());
 #endif
 }
+}
+
+void SetCoordinateArtifactTestHook(CoordinateArtifactTestHook* hook) noexcept {
+    artifact_hook.store(hook, std::memory_order_release);
 }
 
 std::vector<ChunkCoord> ChunkStore::AdmitCoordinateArtifacts(ChunkCoordinateIndex& index) {
@@ -71,8 +77,9 @@ std::vector<ChunkCoord> ChunkStore::AdmitCoordinateArtifacts(ChunkCoordinateInde
             ChunkCoord coord;
             if (!ParseChunkFilePath(path.lexically_relative(data_dir_), geometry_, &coord))
                 throw std::runtime_error("coordinate artifact has noncanonical placement: " + path.string());
+            if (auto* hook = artifact_hook.load(std::memory_order_acquire)) hook->BeforeStatus(path);
             RequirePlainPath(path, false);
-            std::ifstream input(path, std::ios::binary);
+            SharedFileInput input(path);
             if (!input) {
                 if (access_mode_ == AccessMode::kReadOnly && !std::filesystem::exists(path)) continue;
                 throw std::runtime_error("failed to admit coordinate artifact " + path.string());
@@ -118,7 +125,10 @@ std::vector<ChunkCoord> ChunkStore::AdmitCoordinateArtifacts(ChunkCoordinateInde
 void ChunkStore::PrepareCoordinateIndex() {
     coordinate_index_ = std::make_shared<ChunkCoordinateIndex>(data_dir_, geometry_, store_id_,
         access_mode_ == AccessMode::kReadOnly);
-    coordinate_startup_candidates_ = AdmitCoordinateArtifacts(*coordinate_index_);
+    // A live writer may remove enumerated artifacts before a read-only opener
+    // stats them; point snapshots and whole-index scans own their brackets.
+    if (access_mode_ != AccessMode::kReadOnly)
+        coordinate_startup_candidates_ = AdmitCoordinateArtifacts(*coordinate_index_);
 }
 
 void ChunkStore::InitializeCoordinateIndex() {
@@ -144,7 +154,7 @@ void ChunkStore::InitializeCoordinateIndex() {
 
 std::shared_ptr<ChunkCoordinateIndex> ChunkStore::RetainedIndexForSnapshot() {
     const auto path = data_dir_ / kChunkIndexFileName;
-    std::ifstream input(path, std::ios::binary);
+    SharedFileInput input(path);
     if (!input) throw std::runtime_error("read-only table is missing its coordinate inventory");
     const auto header = ReadIndexInventoryHeader(input, FileBytes(input, path), geometry_, store_id_);
     if (header.compaction_pending) throw std::runtime_error("coordinate compaction requires writer recovery");
@@ -165,6 +175,14 @@ std::optional<ChunkIndexRecord> ChunkStore::RetainedEmptyBoundaryForArchive(cons
     return std::nullopt;
 }
 
+std::uint64_t ChunkStore::RetainedTombstoneCount() {
+    return CoordinateIndexForScan()->tombstone_count();
+}
+
+std::uint64_t ChunkStore::RetainedDeletionFloor() {
+    return CoordinateIndexForScan()->retained_deletion_floor();
+}
+
 std::shared_ptr<ChunkCoordinateIndex> ChunkStore::CoordinateIndexForScan() {
     if (access_mode_ != AccessMode::kReadOnly) return coordinate_index_;
     std::lock_guard refresh(coordinate_index_refresh_mutex_);
@@ -172,7 +190,14 @@ std::shared_ptr<ChunkCoordinateIndex> ChunkStore::CoordinateIndexForScan() {
     if ((before.second & 1U) != 0U) throw std::runtime_error("read-only coordinate scan is unstable during writer publication");
     if (coordinate_index_complete_ && coordinate_index_generation_ == before) return coordinate_index_;
     auto candidate = std::make_shared<ChunkCoordinateIndex>(data_dir_, geometry_, store_id_, true);
-    const auto coordinates = AdmitCoordinateArtifacts(*candidate);
+    std::vector<ChunkCoord> coordinates;
+    try {
+        coordinates = AdmitCoordinateArtifacts(*candidate);
+    } catch (const std::exception&) {
+        if (ReadSnapshotGenerationForScan(snapshot_generation_path_, snapshot_generation_record_seen_) != before)
+            throw std::runtime_error("read-only coordinate index changed during artifact admission");
+        throw;
+    }
     for (const auto& coord : coordinates) {
         auto loaded = LoadChunkPayload(coord, false, candidate);
         BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);

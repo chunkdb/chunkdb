@@ -7,7 +7,8 @@
 namespace chunkdb {
 
 // Pins one regular file while its name may be replaced or removed.
-// Construction rejects a link at the leaf; parent directory aliases are allowed.
+// Construction rejects symbolic links and reparse points at the leaf.
+// Hard links and parent directory aliases are allowed.
 class SharedFileInput final : public std::istream {
   public:
     explicit SharedFileInput(const std::filesystem::path& path);

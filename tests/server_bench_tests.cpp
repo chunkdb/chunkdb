@@ -20,6 +20,7 @@
 #include "chunkdb/server.hpp"
 #include "chunkdb/server_bench.hpp"
 #include "login_helpers.hpp"
+#include "sectioned_chunk_form.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -665,6 +666,38 @@ void TestGridScenariosAgainstPaddedGeometry() {
     assert(report.results[2].name == "simulation");
 }
 
+void TestChunkFormsRetainDescribedStableColumnId() {
+    ExternalServerHarness harness("stable-column", chunkdb::GeometryConfig{
+        .large_chunk_width_chunks = 2, .large_chunk_height_chunks = 2,
+        .chunk_width_blocks = 3, .chunk_height_blocks = 3, .block_bits = 5});
+    chunkdb::SessionState session;
+    assert(harness.engine->Execute(session, "HELLO 3\n").starts_with('%'));
+    for (const auto statement : {"ALTER TABLE default ADD COLUMN next bits(5)",
+             "ALTER TABLE default DROP COLUMN bits", "ALTER TABLE default RENAME COLUMN next TO bits"})
+        assert(harness.engine->Execute(session, std::string(statement) + "\n") == "+OK\r\n");
+    const auto info = harness.catalog->Require("default")->Info();
+    assert(info.schema.version == 4U && info.schema.columns.size() == 1U && info.schema.columns[0].id == 2U);
+    const auto report = chunkdb::server_bench::Run(chunkdb::server_bench::Args{
+        .server_mode = chunkdb::server_bench::ServerMode::kExternal, .host = "127.0.0.1", .port = harness.port,
+        .clients = 1, .pipeline = 1, .requests = 4, .tests = {chunkdb::server_bench::Scenario::kSimulation},
+        .keyspace = 3, .seed = 5, .log_level = chunkdb::LogLevel::kWarn});
+    assert(report.results.size() == 1U && report.results[0].completed_requests == 4U);
+    const auto reply = harness.engine->Execute(session, "GET CHUNK 0 0 FROM default\n");
+    assert(reply.starts_with('$'));
+    const auto header_end = reply.find("\r\n");
+    const auto length = std::stoull(reply.substr(1U, header_end - 1U));
+    const auto form = chunkdb::ParseChunkFormSections(
+        {reinterpret_cast<const std::uint8_t*>(reply.data() + header_end + 2U), length}, length,
+        chunkdb::ChunkFormReadMode::kRead);
+    assert(form.header.schema_version == info.schema.version && form.header.chunk_version != 0U &&
+        form.header.commit_time_ms != 0U && form.header.flags == 0U);
+    const auto columns = chunkdb::ParseChunkFormBlockColumns(form, 9U);
+    assert(columns.size() == 1U && columns[0].column_id == 2U && columns[0].width_bits == 5U);
+    assert(columns[0].values.size() == 6U && columns[0].values.back() == 3U);
+    const auto json = chunkdb::server_bench::RenderJsonReport(report);
+    assert(json.find("\"completed_requests\":4") != std::string::npos);
+}
+
 // Eleven requests split 6/5 between clients: each begins with its area read,
 // so the observed mix is not the nominal long-run percentage. A 1x1 region
 // clips each canvas viewport to one 3x3 chunk, rather than sixteen chunks.
@@ -1109,6 +1142,13 @@ void TestCompatibleWatchReplies() {
 }
 
 int main(int argc, char** argv) {
+    if (argc == 2 && std::string(argv[1]) == "--chunk-model-forms") {
+        TestGridScenariosAgainstPaddedGeometry();
+        TestChunkFormsRetainDescribedStableColumnId();
+        TestShortGridMixAndClippedAreas();
+        TestChunkReadsCoverNullAndForms();
+        return 0;
+    }
     if (argc == 2 && std::string(argv[1]) == "--chunk-null-read") {
         TestChunkReadsCoverNullAndForms();
         return 0;
@@ -1128,6 +1168,7 @@ int main(int argc, char** argv) {
     TestIdleClientsNoteWhenRequestsLessThanClients();
     TestParseArgsGridScenariosAndDurability();
     TestGridScenariosAgainstPaddedGeometry();
+    TestChunkFormsRetainDescribedStableColumnId();
     TestChunkReadsCoverNullAndForms();
     TestSpawnModeReportsDurability();
     TestShortGridMixAndClippedAreas();

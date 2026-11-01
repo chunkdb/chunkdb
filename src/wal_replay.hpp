@@ -84,6 +84,9 @@ void ValidateWalHeader(
 void ValidateWalPrefix(std::istream& input, std::uint64_t prefix_bytes, const Geometry& geometry,
     const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
     ChunkState state = {}, std::uint64_t schema_version = 0U);
+void ValidateWalPrefix(std::istream& input, std::uint64_t prefix_bytes, const Geometry& geometry,
+    const ChunkCoord& coord, const StoreId& table_id, FeatureFlags features,
+    ChunkState state, std::uint64_t schema_version, const ChunkIndexRecord* retained);
 
 // Replays the frames of a WAL onto `payload`, `presence_bitmap` and `vars`
 // (the chunk's state from its image, whose revision is `base_revision`; 0
@@ -124,6 +127,24 @@ void ValidateWalPrefix(std::istream& input, std::uint64_t prefix_bytes, const Ge
     ChunkVars* vars, std::vector<WalFrameBoundary>* boundaries = nullptr,
     std::shared_ptr<const ChunkColumnState>* chunk_columns = nullptr,
     const std::function<void()>& read_checkpoint = {});
+
+// A known producing identity also binds any checksum-valid equal-revision
+// frame that would otherwise be skipped below the replay base.
+struct WalKnownIdentity { std::uint64_t revision, commit_time_ms; };
+[[nodiscard]] WalReplayResult ReplayWal(
+    const std::vector<std::uint8_t>& bytes, const Geometry& geometry, const ChunkCoord& coord,
+    const StoreId& table_id, const FeatureFlags& features, std::uint64_t base_revision,
+    std::uint64_t base_schema_version, std::vector<std::uint8_t>* payload,
+    std::vector<std::uint8_t>* presence, ChunkVars* vars, std::vector<WalFrameBoundary>* boundaries,
+    std::shared_ptr<const ChunkColumnState>* chunk_columns, std::optional<std::uint64_t> base_commit_time_ms,
+    std::optional<WalKnownIdentity> retained_identity = {});
+[[nodiscard]] WalReplayResult ReplayWalStream(std::istream& input, std::uint64_t measured_bytes,
+    const Geometry& geometry, const ChunkCoord& coord, const StoreId& table_id,
+    FeatureFlags features, std::uint64_t base_revision, std::uint64_t base_schema_version,
+    std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence, ChunkVars* vars,
+    std::vector<WalFrameBoundary>* boundaries, std::shared_ptr<const ChunkColumnState>* chunk_columns,
+    const std::function<void()>& read_checkpoint, std::optional<std::uint64_t> base_commit_time_ms,
+    std::optional<WalKnownIdentity> retained_identity = {});
 
 struct WalStreamInfo {
     std::uint64_t first = 0U, last = 0U, first_schema = 0U;

@@ -376,6 +376,8 @@ class TableCatalog {
     // restart recovers. After a failure the table stays fenced.
     // `cancelled` ends the wait for a running feature activation or backup.
     void RecoverTable(std::string_view name, std::stop_token cancelled = {});
+    // Drops collected deletion identities older than before and reopens the table.
+    [[nodiscard]] std::uint64_t CompactTombstones(std::string_view name, std::uint64_t before);
 
     // Each is crash-atomic: after a crash the table exists completely, with
     // the old or the new options, or not at all. Throws TableExistsError,

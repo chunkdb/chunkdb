@@ -496,7 +496,8 @@ FeedFrameInfo ReplayFeedFrame(
     if (state->payload.size() != layout.payload_bytes() || state->presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry)) {
         throw std::logic_error("captured feed state has another layout");
     }
-    if (frame.gc && ChunkPresent(state->presence_bitmap)) {
+    if (frame.gc && (ChunkPresent(state->presence_bitmap) ||
+        ChunkColumnsPopulatedAt(geometry, frame.schema_version, state->chunk_columns.get()))) {
         throw std::runtime_error("invalid captured feed frame: frame_gc_present_state");
     }
     for (const auto& span : frame.spans) {
@@ -558,7 +559,8 @@ WalReplayResult wal_detail::ReplayFromSource(
     std::vector<std::uint8_t>* presence_bitmap,
     ChunkVars* vars,
     std::vector<WalFrameBoundary>* boundaries,
-    std::shared_ptr<const ChunkColumnState>* chunk_columns) {
+    std::shared_ptr<const ChunkColumnState>* chunk_columns,
+    std::optional<std::uint64_t> base_commit_time_ms, std::optional<WalKnownIdentity> retained_identity) {
     const auto& wal_bytes = source.Header();
     WalReplayResult result;
     if (boundaries != nullptr) boundaries->clear();
@@ -674,6 +676,20 @@ WalReplayResult wal_detail::ReplayFromSource(
             break;
         }
         previous_revision = frame.revision;
+        if (frame.revision == base_revision && base_commit_time_ms &&
+            frame.commit_time_ms != *base_commit_time_ms) {
+            result.tail_truncated_or_corrupt = true;
+            result.stop_reason = "frame_base_commit_time_mismatch";
+            result.stopped_at_crash_tail = false;
+            break;
+        }
+        if (retained_identity && frame.revision == retained_identity->revision &&
+            frame.commit_time_ms != retained_identity->commit_time_ms) {
+            result.tail_truncated_or_corrupt = true;
+            result.stop_reason = "frame_retained_commit_time_mismatch";
+            result.stopped_at_crash_tail = false;
+            break;
+        }
         if (frame.revision <= base_revision) {
             result.skipped_frames += 1;
             cursor += frame.size;
@@ -691,9 +707,10 @@ WalReplayResult wal_detail::ReplayFromSource(
         if (frame.schema_version != state_version) {
             move_state_to(frame.schema_version);
         }
-        if (frame.gc && std::any_of(
+        if (frame.gc && (std::any_of(
                 state.begin() + static_cast<std::ptrdiff_t>(geometry.LayoutAt(state_version).payload_bytes()),
-                state.end(), [](std::uint8_t byte) { return byte != 0U; })) {
+                state.end(), [](std::uint8_t byte) { return byte != 0U; }) ||
+                ChunkColumnsPopulatedAt(geometry, state_version, chunk_columns->get()))) {
             result.tail_truncated_or_corrupt = true;
             result.stop_reason = "frame_gc_present_state";
             result.stopped_at_crash_tail = false;
@@ -757,6 +774,16 @@ WalReplayResult ReplayWal(const std::vector<std::uint8_t>& bytes, const Geometry
     std::uint64_t base_revision, std::uint64_t base_schema_version,
     std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence, ChunkVars* vars,
     std::vector<WalFrameBoundary>* boundaries, std::shared_ptr<const ChunkColumnState>* chunk_columns) {
+    return ReplayWal(bytes, geometry, coord, table_id, features, base_revision, base_schema_version,
+        payload, presence, vars, boundaries, chunk_columns, {});
+}
+
+WalReplayResult ReplayWal(const std::vector<std::uint8_t>& bytes, const Geometry& geometry,
+    const ChunkCoord& coord, const StoreId& table_id, const FeatureFlags& features,
+    std::uint64_t base_revision, std::uint64_t base_schema_version,
+    std::vector<std::uint8_t>* payload, std::vector<std::uint8_t>* presence, ChunkVars* vars,
+    std::vector<WalFrameBoundary>* boundaries, std::shared_ptr<const ChunkColumnState>* chunk_columns,
+    std::optional<std::uint64_t> base_commit_time_ms, std::optional<WalKnownIdentity> retained_identity) {
     class MemorySource final : public wal_detail::ReplaySource {
       public:
         explicit MemorySource(const std::vector<std::uint8_t>& value) : bytes_(value) {}
@@ -769,7 +796,7 @@ WalReplayResult ReplayWal(const std::vector<std::uint8_t>& bytes, const Geometry
         const std::vector<std::uint8_t>& bytes_;
     } source(bytes);
     return wal_detail::ReplayFromSource(source, geometry, coord, table_id, features,
-        base_revision, base_schema_version, payload, presence, vars, boundaries, chunk_columns);
+        base_revision, base_schema_version, payload, presence, vars, boundaries, chunk_columns, base_commit_time_ms, retained_identity);
 }
 
 }  // namespace chunkdb
