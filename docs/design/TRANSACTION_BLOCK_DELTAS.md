@@ -43,6 +43,7 @@ A prepared edit cannot publish after another edit changes its journal generation
 
 The caller owns every participating current chunk in canonical commit-lock order before constructing a rebase plan.
 Validation compares every observed or written row with its original canonical preimage before returning any plan, and equal values permit ABA.
+Identity or schema changes return the existing table-change transaction conflict, and row or promoted-revision mismatches return its chunk-change conflict.
 Accepted replacement rows and variable changes are prepared against the current chunk rather than the snapshot chunk, preserving every unrelated block and the current chunk columns.
 The plan admits row shapes, REQUIRED initialization and combined logical variable-byte growth without modifying current storage.
 It owns its prepared sparse data through the same charged resource and records exact per-chunk changed variable keys, values, logical entry counts and encoded-byte totals.
@@ -69,5 +70,5 @@ They cover late conflicts across multiple chunks without storage mutation, promo
 Allocation controls and exact quota boundaries exercise both private and shared counters, map nodes and failed prepared edits.
 Large fixed-payload fixtures bound row capture and sparse private allocation independently of the chunk size, including history selection after a larger concurrent row.
 Wide current variable sections with tiny row deltas retain unchanged storage and expose unavailable physical staging admission instead of bypassing the byte budget.
-Expired, evicted, ended and foreign snapshots refuse without publishing private state, and both coordinate dimensions use the same row primitives.
+The existing history expiration checks remain in force; new row fixtures directly cover evicted, ended and foreign snapshot refusal without publishing private state, and both coordinate dimensions use the same row primitives.
 Each targeted guard has an isolated omission control that must fail its corresponding regression.
