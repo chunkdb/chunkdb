@@ -84,13 +84,13 @@ That overhead is a concrete representation tradeoff requiring the existing paire
 Copy construction selects the ordinary allocator unless an explicit charged clone is requested.
 No allocator may retain a pointer to a destroyed borrowed session resource.
 
-History map nodes additionally need an aggregate retained-owner handoff because insertion does not install the node handle's allocator in the destination map.
+History map nodes additionally need retained-owner handoff because insertion does not install the node handle's allocator in the destination map.
 Use one history-owned node deallocation domain for both ordinary and charged reservations.
 Its rebound allocator adds an aligned node prefix holding the originating accounting owner and the actual upstream extent.
 The prefix and alignment padding are included in admission before the upstream allocation.
 The destination map can genuinely free any node from that domain by reading its prefix, regardless of which reservation account admitted it.
 Allocator equality compares the shared deallocation domain, rather than pretending different upstream allocators are equal.
-The node's prefix also owns the aggregate history charge released after the node itself is freed.
+The node's prefix retains its originating policy until its actual upstream node allocation is freed.
 Node bookkeeping is incurred only when the existing history path allocates a kept node.
 
 Prepared replacement buffers, sparse undo and retained old sections coexist under the transaction account until their ownership changes.
@@ -110,9 +110,11 @@ Retained history transfers to the table history account under the innermost hist
 The history node records the exact retained allocation extent, including fixed/presence requests, variable data and offsets, metadata copies, node overhead and retained control storage.
 `Publish` uses that extent for this reservation in the existing history-byte eviction policy, unregistering old snapshots and pruning before it retains a state that would exceed the limit.
 The destination history accounting increment precedes the transaction accounting decrement, and both operations are checked, nonallocating and nonthrowing.
-At transfer, individual allocation domains relinquish their transaction reservation to one aggregate retained-owner charge and keep their real upstream deallocation information.
-The aggregate charge covers the immutable reservation and is released once, rather than again from each buffer and from `EraseLocked`.
-The node prefix owns the final charge token; deallocation first destroys its retained buffers, copies that token to the deallocator's stack, frees the upstream node allocation and then returns the aggregate history charge.
+The complete extent is admitted once under the history mutex and eviction policy before any originating policy changes its target.
+Consuming that admission performs no duplicate `Reserve` callback and cannot allocate or throw after irreversible publication.
+At transfer, each originating policy changes its accounting target to the same counter-only history owner after that owner admits the complete retained extent.
+Each actual buffer, node and policy-control deallocation then returns exactly its recorded request after the upstream memory is freed.
+The complete extent is admitted once and returned incrementally with actual deallocation, rather than additionally from a second aggregate token.
 The charged-node erasure path must not also execute the legacy `kept_bytes_ -= state.bytes` subtraction.
 Legacy nodes keep their existing subtraction path.
 If no snapshot still needs the state, it remains charged to the stage until destruction instead of being transferred or released early.
@@ -121,11 +123,11 @@ Pruning destroys the retained buffers and node and subtracts the same recorded h
 Existing ordinary history reservations retain their established cost calculation; this subtask must not present that approximation as an exact physical byte measurement.
 Exact charges of the new reservations and existing legacy charges coexist explicitly in `kept_bytes_` and the same eviction policy.
 The table history object is kept alive by the prepared stage until its reservation is published or destroyed.
-After publication, the final charge token references only a separate shared `HistoryAccountingState` containing the existing kept-byte counter and accounting metadata.
+After publication, the allocation policies reference only a separate shared `HistoryAccountingState` containing the existing kept-byte counter and accounting metadata.
 Moving that counter into a stable owner does not create another table quota or independently count the same retained state twice.
 That state does not own history nodes or point back to `TxnHistory`, so the index cannot form an ownership cycle through its buffers.
 Pruning or history destruction owns the nodes and performs the final deallocation, while the counter state remains alive through that deallocation.
-Transferred domains and charge tokens hold no transaction, session or engine counter pointer.
+Transferred domains hold no transaction, session or engine counter pointer.
 Session teardown releases only legacy bulk charges and journal allocations still owned by it, and never subtracts transferred physical charges a second time.
 
 ## Prepared stage ownership
@@ -143,6 +145,17 @@ Both encoded data and offset allocations use the explicit account and the actual
 The source section remains owned and unchanged throughout this preparation.
 The stage does not invoke ordinary `ApplyVarUpdate`, whose internal staging is outside this explicit owner.
 Logical entry and byte totals are checked against the sparse plan and the existing combined block/chunk variable limits.
+
+Original variable owners also need explicit admission rather than an assumption that their memory is free.
+Preparation reserves their recorded buffer and policy-control extents through the supplied owning account.
+An existing regular-storage policy is admitted temporarily and restored to regular ownership if preparation fails or application is undone.
+For an ordinary buffer with no policy, preparation creates a charged policy and reserves the original request privately; application attaches that policy to the original prefix without allocation.
+The original complete section then moves into the prepared history owner, and undo restores the same buffers through nonthrowing swaps.
+No previous allocation is truncated, copied through an uncharged default vector or assigned a guessed capacity bound.
+The caller exclusively owns each original section and its allocation policies throughout this operation; another live section cannot share one of those policies outside the locked cohort.
+Before any adoption, validation refuses an already charged policy, a foreign upstream domain or recorded outstanding buffers outside the exact locked section.
+It compares recorded request extents with the complete owned buffers rather than using a reference-count heuristic as proof of ownership.
+Any later preparation failure restores every earlier policy's original regular account state and both transaction counters.
 
 Fixed undo retains only the original bytes touched by changed rows and validity bits, with overlapping byte positions coalesced.
 Presence undo likewise retains each touched byte once.
