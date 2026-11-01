@@ -81,7 +81,10 @@ void CopyPrefix(std::istream& input, std::uint64_t size, const AtomicFileSink& s
 void RewritePrefix(const std::filesystem::path& path, std::uint64_t size) {
     SharedFileInput input(path);
     if (!input) throw std::runtime_error("failed to open index prefix " + path.string());
-    AtomicWriteStream(path, [&](const AtomicFileSink& sink) { CopyPrefix(input, size, sink); },
+    AtomicWriteStream(path, [&](const AtomicFileSink& sink) {
+        CopyPrefix(input, size, sink);
+        input.close();
+    },
         true, true, nullptr, nullptr, false);
 }
 

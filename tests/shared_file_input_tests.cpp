@@ -4,10 +4,13 @@
 
 #include <array>
 #include <cassert>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
+#include <iostream>
 #include <limits>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #ifdef _WIN32
@@ -35,9 +38,10 @@ std::string Read(SharedFileInput& input, std::size_t bytes) {
     result.resize(static_cast<std::size_t>(input.gcount()));
     return result;
 }
-template <typename F> void Reject(F action) {
+template <typename F> void Reject(const char* context, F action) {
     bool refused = false;
     try { action(); } catch (const std::exception&) { refused = true; }
+    if (!refused) std::cerr << "expected shared input refusal: " << context << '\n';
     assert(refused);
 }
 
@@ -178,9 +182,9 @@ void AtomicPinnedReplacement(const std::filesystem::path& directory) {
     const std::string contents = "atomic replacement";
     chunkdb::AtomicWrite(path, std::vector<std::uint8_t>(contents.begin(), contents.end()), true, true);
     SharedFileInput current(path);
-    assert(Read(current, contents.size()) == contents);
+    assert(Read(current, contents.size() + 1U) == contents);
     original.seekg(0);
-    assert(Read(original, 17U) == "original contents");
+    assert(Read(original, 18U) == "original contents");
 }
 
 #ifdef _WIN32
@@ -189,33 +193,50 @@ void LegacyAtomicReplacement(const std::filesystem::path& directory) {
     const auto path = directory / "legacy-atomic-live";
     Save(path, "original contents");
     const std::string contents = "legacy replacement";
-    _putenv_s("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE", "1");
+    const auto arm = [] {
+        assert(_putenv_s("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE", "1") == 0);
+        const auto* value = std::getenv("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE");
+        assert(value != nullptr && std::strcmp(value, "1") == 0);
+    };
+    const auto consumed = [] {
+        const auto* value = std::getenv("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE");
+        assert(value == nullptr || value[0] == '\0');
+    };
+    arm();
     chunkdb::AtomicWrite(path, std::vector<std::uint8_t>(contents.begin(), contents.end()), true, true);
+    consumed();
     _putenv_s("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE", "");
     SharedFileInput current(path);
-    assert(Read(current, contents.size()) == contents);
-    _putenv_s("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE", "1");
-    Reject([&] {
-        const std::string refused = "must not remove the pinned target";
-        chunkdb::AtomicWrite(path, std::vector<std::uint8_t>(refused.begin(), refused.end()), true, true);
-    });
+    assert(Read(current, contents.size() + 1U) == contents);
+    arm();
+    const std::string next = "next atomic replacement";
+    bool replaced = false;
+    try {
+        chunkdb::AtomicWrite(path, std::vector<std::uint8_t>(next.begin(), next.end()), true, true);
+        replaced = true;
+    } catch (const std::system_error&) {
+        // Classic rename can refuse an open target without changing it.
+    }
+    consumed();
     _putenv_s("CHUNKDB_FAILPOINT_RENAME_INFO_EX_UNSUPPORTED_ONCE", "");
     SharedFileInput unchanged(path);
-    assert(Read(unchanged, contents.size()) == contents);
+    const auto& expected = replaced ? next : contents;
+    assert(Read(unchanged, expected.size() + 1U) == expected);
+    current.clear();
     current.seekg(0);
-    assert(Read(current, contents.size()) == contents);
+    assert(Read(current, contents.size() + 1U) == contents);
 }
 #endif
 
 void PlainLeafAdmission(const std::filesystem::path& directory) {
-    Reject([&] { SharedFileInput missing(directory / "missing"); });
-    Reject([&] { SharedFileInput folder(directory); });
+    Reject("missing leaf", [&] { SharedFileInput missing(directory / "missing"); });
+    Reject("directory leaf", [&] { SharedFileInput folder(directory); });
     const auto owned = directory / "owned";
     std::filesystem::create_directory(owned);
     Save(owned / "value", "owned");
     const auto alias = directory / "alias";
     DirectoryAlias(owned, alias);
-    Reject([&] { SharedFileInput leaf_alias(alias); });
+    Reject("directory alias leaf", [&] { SharedFileInput leaf_alias(alias); });
     SharedFileInput parent_alias(alias / "value");
     assert(Read(parent_alias, 5U) == "owned");
     parent_alias.close();
@@ -223,10 +244,10 @@ void PlainLeafAdmission(const std::filesystem::path& directory) {
 #ifndef _WIN32
     const auto link = directory / "file-link";
     std::filesystem::create_symlink(owned / "value", link);
-    Reject([&] { SharedFileInput leaf_link(link); });
+    Reject("symbolic link leaf", [&] { SharedFileInput leaf_link(link); });
     const auto fifo = directory / "fifo";
     assert(mkfifo(fifo.c_str(), 0600) == 0);
-    Reject([&] { SharedFileInput pipe(fifo); });
+    Reject("FIFO leaf", [&] { SharedFileInput pipe(fifo); });
 #endif
 }
 }  // namespace
