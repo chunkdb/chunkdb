@@ -625,6 +625,32 @@ void CleanupWarningAndAliasRestart() {
         auto lease = catalog.Find("default")->Acquire(); assert(ReadCounter(lease->store(), {0, 0}) == 11U);
     }
 }
+void StagingCleanupAliasReplacement() {
+    ScopedTempDir temp("chunkdb-backup-staging-cleanup-alias");
+    const auto root = std::filesystem::canonical(temp.path());
+    const auto source = root / "source";
+    const auto identity = NewStoreId();
+    const auto stage = source / kBackupStagingName / (StoreIdHex(identity) + "." + StoreIdHex(NewStoreId()));
+    const auto retained = root / "retained";
+    const auto outside = root / "outside";
+    SaveBytes(stage / "keep", {'s'});
+    SaveBytes(outside / "keep", {'o'});
+    bool replaced = false;
+    struct ResetLog { ~ResetLog() { ResetLogSinkForTests(); } } reset;
+    SetLogSinkForTests([&](const std::string& line) {
+        if (!replaced && line.find("removing interrupted backup staging") != std::string::npos) {
+            std::filesystem::rename(stage, retained);
+            test::CreateDirectoryAlias(outside, stage);
+            replaced = true;
+        }
+    });
+    RemoveOrphanedBackupStaging(source, identity);
+    ResetLogSinkForTests();
+    assert(replaced);
+    assert(LoadFile(outside / "keep") == std::vector<std::uint8_t>{'o'});
+    assert(LoadFile(retained / "keep") == std::vector<std::uint8_t>{'s'});
+}
+
 void OrphanedStagingCleanup() {
     ScopedTempDir temp("chunkdb-backup-orphaned-staging");
     const auto root = std::filesystem::canonical(temp.path());
@@ -991,6 +1017,7 @@ int main(int argc, char** argv) {
     }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-collision-regression") { StagingCollisionRetainsExistingEntry(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-owner-regression") { StagingOwnerValidation(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--staging-cleanup-alias") { StagingCleanupAliasReplacement(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--orphaned-staging") { OrphanedStagingCleanup(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--path-regressions") { TargetComponentReplacement(); StagingOwnerValidation(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); return 0; }
     TargetComponentReplacement(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded();
@@ -1004,7 +1031,7 @@ int main(int argc, char** argv) {
     PlainWriterBounds(true); PlainWriterBounds(false); EndedFeedDoesNotClearNewProducers();
     BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); DroppedSnapshotTableSkipped();
     PerTableDdlProgress(); ColdPinAndStagingAlias(); ColdTailRepairPreservesPinnedInode();
-    ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); OrphanedStagingCleanup(); StagingOwnerValidation();
+    ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); OrphanedStagingCleanup(); StagingOwnerValidation(); StagingCleanupAliasReplacement();
     CrcChunks();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint}) { CutAndProgress(mode); AcknowledgedLoad(mode); }
     CopyReleasesHoldsAndBusy(); TargetAndCancellation(); CompletionAndPoison(); FailedGenerationAndEmptyCatalog(); CancelCatalogWaitAndRestrictions();

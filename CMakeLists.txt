@@ -289,7 +289,8 @@ if(CHUNKDB_BUILD_TESTS)
         add_test(NAME backup_restore_root_reparse COMMAND chunkdb_backup_restore_test roots)
         add_test(NAME backup_restore_inventory_reparse COMMAND chunkdb_backup_restore_test reparse)
         add_test(NAME backup_restore_extended_roots COMMAND chunkdb_backup_restore_test extended)
-        set_tests_properties(backup_staging_owner_reparse backup_restore_root_reparse backup_restore_inventory_reparse backup_restore_extended_roots
+        add_test(NAME backup_staging_cleanup_reparse COMMAND chunkdb_backup_test --staging-cleanup-alias)
+        set_tests_properties(backup_staging_owner_reparse backup_restore_root_reparse backup_restore_inventory_reparse backup_restore_extended_roots backup_staging_cleanup_reparse
             PROPERTIES TIMEOUT 60 LABELS "smoke")
     endif()
 
