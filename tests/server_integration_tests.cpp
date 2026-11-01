@@ -6104,6 +6104,14 @@ void TestDelayedAuthRepliesDoNotOccupyWorkers() {
     server_cfg.worker_threads = 1;
     server_cfg.client_io_timeout_ms = 30000;
     ServerHarness harness("scheduled-auth", BaseStoreConfig(), engine_cfg, server_cfg);
+    {
+        // A listening socket can precede transport publication during startup.
+        // Complete a separate login before installing the transport observer.
+        RawClient ready("127.0.0.1", harness.port);
+        ready.SetReadDeadline(std::chrono::seconds(5));
+        ready.SendBytes(ProxyV2Header("192.0.2.250"));
+        ready.Login();
+    }
     chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
     std::vector<std::unique_ptr<RawClient>> rejected;
     for (std::size_t i = 0U; i < 8U; ++i) {
