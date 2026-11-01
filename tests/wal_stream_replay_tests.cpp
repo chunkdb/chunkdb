@@ -351,12 +351,62 @@ void InspectionAndCancellation() {
 }
 }  // namespace
 
+namespace {
+void CollectionRequiresEmptyMetadataAtFrameSchema() {
+    auto config = MakeGeometry().config();
+    const auto block_schema = SingleBitsColumnSchema(8U);
+    const TableSchema chunk_schema{.next_column_id = 2U, .columns = {
+        {.id = 1U, .name = "owner", .type = {ColumnKind::kUnsigned, 8U}, .default_value = {}}}};
+    const Geometry initial(config, block_schema, chunk_schema);
+    const Geometry later(config, AdvanceOtherDomain(block_schema, ColumnDomain::kBlock), DropChunkColumn(chunk_schema, "owner"));
+    const FeatureFlags slots{.incompat = kFeatureChunkModel | kFeatureFeedSlots};
+    Bytes frame;
+    WalFrameBuilder builder(&frame, 1U, {}, std::nullopt, true);
+    const Bytes payload(initial.ChunkPayloadBytes(), 0U), presence(ChunkPresenceBitmapBytes(initial), 0U);
+    builder.AppendSpan(0U, payload.data(), payload.size());
+    builder.AppendSpan(static_cast<std::uint32_t>(payload.size()), presence.data(), presence.size());
+    (void)builder.Finish(8U, 80U);
+    auto wal = BuildWalHeader({0, 0}, kId, slots); Append(wal, frame);
+    for (const auto* geometry : {&initial, &later}) for (const auto value : {0U, 7U}) {
+        const auto row = std::make_shared<const ChunkColumnState>(AssignChunkColumns(chunk_schema, nullptr,
+            {{"owner", std::uint64_t{value}}}, true));
+        const ChunkState seed{.version = 7U, .payload = payload, .presence_bitmap = presence,
+            .written = true, .commit_time_ms = 70U, .chunk_columns = row};
+        for (bool streamed : {false, true}) {
+            auto state = seed;
+            WalReplayResult result;
+            if (streamed) {
+                std::istringstream input(std::string(wal.begin(), wal.end()), std::ios::binary);
+                result = ReplayWalStream(input, wal.size(), *geometry, {0, 0}, kId, slots,
+                    7U, 1U, &state.payload, &state.presence_bitmap, &state.vars, nullptr, &state.chunk_columns, {}, 70U);
+            } else result = ReplayWal(wal, *geometry, {0, 0}, kId, slots, 7U, 1U,
+                &state.payload, &state.presence_bitmap, &state.vars, nullptr, &state.chunk_columns, 70U);
+            assert(result.tail_truncated_or_corrupt == (value != 0U) && !result.stopped_at_crash_tail);
+            assert(result.applied_frames == (value == 0U ? 1U : 0U));
+            if (value != 0U && geometry == &initial) assert(state.chunk_columns->bytes == row->bytes);
+        }
+        auto state = seed;
+        bool rejected = false;
+        try { (void)ReplayFeedFrame(frame, *geometry, &state, slots); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected == (value != 0U));
+        if (rejected) assert(state.version == seed.version && state.chunk_columns->bytes == row->bytes);
+        rejected = false;
+        std::istringstream prefix(std::string(wal.begin(), wal.end()), std::ios::binary);
+        try { ValidateWalPrefix(prefix, wal.size(), *geometry, {0, 0}, kId, slots, seed, 1U); }
+        catch (const std::runtime_error&) { rejected = true; }
+        assert(rejected == (value != 0U));
+    }
+}
+}
+
 int main() {
     CutsAndDamage();
     InterruptedCreationAndInteriorSearch();
     SchemaMetadataAndFinalInvariants();
     BoundedReadsAndExtent();
     InspectionAndCancellation();
+    CollectionRequiresEmptyMetadataAtFrameSchema();
     const auto geometry = MakeGeometry();
     auto bytes = Header(); Append(bytes, Frame(7U));
     for (bool streamed : {false, true}) for (const auto time : {70U, 71U}) {
