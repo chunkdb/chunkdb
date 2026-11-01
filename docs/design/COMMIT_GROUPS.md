@@ -76,6 +76,8 @@ Read all group decisions and required member contexts into a private recovery pl
 Validate complete member framing, exact digests, original replay bases, retained identities, schema histories and applicable rollback decisions before changing files.
 Each changed member binds its checked earlier durable image, retained-empty identity or never-written anchor independently of its volatile pre-group WAL end.
 An image anchor binds exact image length and SHA-256; every anchor includes its producing revision, time and schema where a producing state exists.
+A separately certified durable WAL prefix, when available, binds its byte end and SHA-256 and cannot extend beyond the recorded pre-group end.
+Absence of that certificate does not turn the volatile pre-group end into a durability claim.
 The group owns that original anchor until complete durability or checked checkpoint coverage removes the rollback dependency.
 Recovery validates the surviving pre-group prefix over that anchor and preserves all complete available frames before the group.
 A crash-shaped loss of an earlier relaxed suffix can move the rollback cut back to its last complete frame, but never below a certified durable prefix or through interior damage.
