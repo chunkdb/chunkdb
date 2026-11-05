@@ -65,6 +65,7 @@ UserRegistry::UserRegistry(
     }
     if (auto existing = ReadUsersFile(data_dir_); existing.has_value()) {
         users_ = std::move(*existing);
+        IncarnateLocked();
         return;
     }
     if (read_only_) {
@@ -85,6 +86,15 @@ UserRegistry::UserRegistry(
     };
     WriteUsersFile(data_dir_, created);
     users_ = std::move(created);
+    IncarnateLocked();
+}
+
+void UserRegistry::IncarnateLocked() {
+    std::erase_if(incarnations_, [this](const auto& entry) { return !users_.users.contains(entry.first); });
+    for (const auto& [name, user] : users_.users) {
+        (void)user;
+        if (!incarnations_.contains(name)) incarnations_.emplace(name, next_incarnation_++);
+    }
 }
 
 void UserRegistry::SetMigrationHealth(std::shared_ptr<MigrationHealth> health) {
@@ -94,6 +104,7 @@ void UserRegistry::SetMigrationHealth(std::shared_ptr<MigrationHealth> health) {
     if (!stored) throw std::runtime_error("users file disappeared while binding the catalog");
     if (users_ != *stored) {
         users_ = *stored;
+        IncarnateLocked();
         generation_.fetch_add(1, std::memory_order_acq_rel);
     }
     migration_health_ = std::move(health);
@@ -106,6 +117,15 @@ std::optional<User> UserRegistry::Find(const std::string& name) const {
         return std::nullopt;
     }
     return found->second;
+}
+
+std::optional<UserRegistry::Incarnated> UserRegistry::FindIncarnation(const std::string& name) const {
+    std::lock_guard lock(mutex_);
+    const auto found = users_.users.find(name);
+    if (found == users_.users.end()) {
+        return std::nullopt;
+    }
+    return Incarnated{.user = found->second, .incarnation = incarnations_.at(name)};
 }
 
 Users UserRegistry::Snapshot() const {
@@ -131,6 +151,7 @@ void UserRegistry::UpdateIf(Change&& change) {
     if (!change(next)) return;
     WriteUsersFile(data_dir_, next);
     users_ = std::move(next);
+    IncarnateLocked();
     generation_.fetch_add(1, std::memory_order_acq_rel);
 }
 
@@ -161,6 +182,17 @@ void UserRegistry::Create(const std::string& name, const std::function<scram::Ve
 
 void UserRegistry::SetVerifier(const std::string& name, scram::Verifier verifier) {
     Update([&](Users& users) { Existing(users, name).verifier = std::move(verifier); });
+}
+
+bool UserRegistry::SetOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier) {
+    bool current = false;
+    UpdateIf([&](Users& users) {
+        const auto found = incarnations_.find(name);
+        current = found != incarnations_.end() && found->second == incarnation;
+        if (current) Existing(users, name).verifier = std::move(verifier);
+        return current;
+    });
+    return current;
 }
 
 void UserRegistry::SetManagesUsers(const std::string& name, bool manages_users) {
@@ -216,6 +248,16 @@ void UserRegistry::ForgetTable(const std::string& table) {
             user.grants.erase(table);
         }
     });
+}
+
+ReadRightCheck::State ReadRightCheck::Recheck(std::uint64_t generation) {
+    // A change after this load bumps the generation again and is read next time.
+    generation_ = generation;
+    if (state_ != State::kHeld) return state_;
+    const auto found = users_->FindIncarnation(user_);
+    if (!found || found->incarnation != incarnation_) state_ = State::kNoUser;
+    else if (!RightOn(found->user, table_).has_value()) state_ = State::kNoRight;
+    return state_;
 }
 
 }  // namespace chunkdb

@@ -180,11 +180,13 @@ Tag and txn are null until their metadata is present.
 Slot ownership permits one watch; a competing watch receives SLOT_BUSY and a lost slot receives SLOT_LOST.
 
 DROP TABLE ends watches with NO_TABLE; a fenced or recovered table ends them with INTERNAL, and a new WATCH resumes; watches have no idle timeout.
+Losing READ on the table ends a watch with NO_TABLE; a dropped user ends it with `AUTH_REQUIRED reason=user_dropped`; see [users](USERS.md#rights).
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 
 ## Errors and URIs
 
 PROTOCOL, AUTH_REQUIRED and AUTH_FAILED describe greeting/authentication failures.
+`AUTH_REQUIRED reason=user_dropped` answers a statement on a connection whose user was dropped, and the connection closes.
 UNKNOWN_COMMAND identifies an unavailable statement.
 SYNTAX, INVALID_ARGUMENT and OUT_OF_RANGE describe parsing, validation and response/ledger limits.
 Malformed or unbounded parameter framing receives PROTOCOL and closes the connection.

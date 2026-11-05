@@ -2,6 +2,7 @@
 #include "server_tls.hpp"
 #include "feed_protocol.hpp"
 #include "cql.hpp"
+#include "user_registry.hpp"
 #include "chunkdb/logging.hpp"
 #include <algorithm>
 #include <climits>
@@ -192,6 +193,27 @@ void FeedIo::Reject(Watch& watch, std::string message) {
     watch.close = true;
     Queue(watch, std::make_shared<const std::string>(Protocol::Error("PROTOCOL", message)));
 }
+bool FeedIo::Permitted(Watch& watch) {
+    if (watch.right_lost) return false;
+    const auto& right = watch.connection->session.watch_right;
+    if (!right) return true;
+    const auto state = right->Check();
+    if (state == ReadRightCheck::State::kHeld) [[likely]] return true;
+    // Every frame pulled after the change is still queued here: drop all
+    // that the socket has not started, as on an ACK timeout. A started
+    // frame or a pinned TLS retry cannot take an error; close instead.
+    watch.right_lost = true;
+    if (watch.offset != 0U || watch.write_size != 0) { watch.dead = true; return false; }
+    if (const auto& slot = watch.connection->session.slot_watch)
+        for (const auto& output : watch.output)
+            if (output.charged) slot->Consumed(output.bytes->size());
+    watch.output.clear(); watch.bytes = 0U;
+    Queue(watch, std::make_shared<const std::string>(
+        CommandEngine::LostWatchReply(state == ReadRightCheck::State::kNoUser, right->table())));
+    watch.close = true;
+    watch.close_immediate = true; // One best-effort nonblocking terminal write, then close.
+    return false;
+}
 void FeedIo::Pull(Watch& watch, std::size_t share) {
     if (watch.close || watch.dead) return;
     if (const auto& slot = watch.connection->session.slot_watch) {
@@ -290,6 +312,8 @@ void FeedIo::Read(Watch& watch) {
             try {
                 auto parsed = cql::Parse(line.substr(0, line.find_first_of("\r\n")));
                 if (const auto* ack = std::get_if<cql::Ack>(&parsed.statement); ack && connection.session.slot_watch) {
+                    // An ACK read after the right was lost is never accepted.
+                    if (!Permitted(watch)) return;
                     if (auto* hook = hook_.load(std::memory_order_acquire))
                         hook->Run(FeedDeliveryTestHook::Point::kBeforeSlotAck, 0U);
                     try {
@@ -492,6 +516,9 @@ void FeedIo::Run() {
                         Pull(watch, watch.share);
                     } catch (const std::logic_error& error) { feed_error(error); }
                       catch (const std::runtime_error& error) { feed_error(error); }
+                    // After Pull and before Write: a frame pulled after a
+                    // rights change is never written.
+                    if (!watch.dead) (void)Permitted(watch);
                     const auto& slot = watch.connection->session.slot_watch;
                     const bool takeover_wait = slot && slot->TakingOver() && !slot->Finished();
                     if (!watch.dead && !takeover_wait && (!watch.connection->tls || watch.read_wait != POLLOUT)) Write(watch);
@@ -601,6 +628,7 @@ void ChunkServer::ReturnClient(std::shared_ptr<ServerConnection> connection) {
     if (connection->session.slot_watch) connection->session.slot_watch->Cancel();
     connection->session.slot_watch.reset();
     connection->session.watch.reset();
+    connection->session.watch_right.reset();
     connection->watch_slot = false;
     watch_count_.fetch_sub(1);
     { std::lock_guard lock(pending_clients_mutex_);

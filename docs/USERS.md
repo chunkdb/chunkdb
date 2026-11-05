@@ -53,6 +53,11 @@ Changing your own password is the exception to the user-management requirement.
 A table with no rights for your user appears absent with NO_TABLE.
 Missing rights otherwise produce PERMISSION_DENIED.
 Rights changes affect existing connections immediately.
+An open watch whose user loses READ on its table ends with NO_TABLE at its next push or ACK, and the connection closes.
+Pushes not yet written to the socket are dropped; a push already partly written closes the connection without the error.
+An ACK read after the change is not accepted.
+Dropping a user ends its connections: the next statement, push or ACK receives `AUTH_REQUIRED reason=user_dropped`, and the connection closes.
+A user created again under the same name is another user; connections of the dropped one never get its rights.
 
 Migration replay checks current rights before returning skipped or conflict.
 For repeatable lists that drop tables, use a deployment user with wildcard ADMIN.

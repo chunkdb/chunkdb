@@ -408,6 +408,65 @@ void Rights(bool tls) {
     Error(reader.Command("CREATE SLOT '../bad' ON t"), "SYNTAX");
 }
 
+// READ holds while a watch streams, not only when it opens. A REVOKE ends
+// plain and slot watches with NO_TABLE before a later change is sent, and an
+// ACK read after it is refused and not persisted. Changes to other users
+// leave the watches streaming.
+void WatchRevoke(bool tls) {
+    Harness harness(tls, true);
+    auto admin = harness.Connect(); Create(*admin);
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
+    for (const auto* user : {"reader", "other"}) admin->Ok(std::string("CREATE USER ") + user + " VERIFIER '" + verifier + "'");
+    admin->Ok("GRANT READ ON t TO reader");
+    Client plain(harness.port, tls); plain.Login("reader", "pw"); (void)Start(plain.Command("WATCH t"));
+    Client slot(harness.port, tls); slot.Login("reader", "pw"); (void)Start(slot.Command("WATCH t SLOT 'consumer'"));
+    admin->Ok("GRANT READ ON t TO other"); admin->Ok("REVOKE READ ON t FROM other");
+    admin->Ok("GRANT WRITE ON t TO reader"); admin->Ok("REVOKE WRITE ON t FROM reader"); // READ stays.
+    const auto first = Set(*admin, 7);
+    assert(Change(NextChange(plain)) == first && Change(NextChange(slot)) == first);
+    slot.Line("ACK " + std::to_string(first));
+    WaitAck(*admin, "t", "consumer", first);
+    const auto second = Set(*admin, 8);
+    assert(Change(NextChange(plain)) == second && Change(NextChange(slot)) == second);
+    admin->Ok("REVOKE READ ON t FROM reader");
+    slot.Line("ACK " + std::to_string(second));
+    Error(slot.Read(), "NO_TABLE"); Closed(slot);
+    (void)Set(*admin, 9);
+    Error(plain.Read(), "NO_TABLE"); Closed(plain);
+    assert(Number(Field(Slot(admin->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == first);
+}
+
+// DROP USER ends the watches of its sessions with AUTH_REQUIRED, even when a
+// user of the same name is created again with READ before the next change.
+void WatchDroppedUser(bool tls) {
+    Harness harness(tls, true);
+    auto admin = harness.Connect(); Create(*admin);
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
+    admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
+    admin->Ok("GRANT READ ON t TO reader");
+    Client plain(harness.port, tls); plain.Login("reader", "pw"); (void)Start(plain.Command("WATCH t"));
+    Client slot(harness.port, tls); slot.Login("reader", "pw"); (void)Start(slot.Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*admin, 7);
+    assert(Change(NextChange(plain)) == first && Change(NextChange(slot)) == first);
+    admin->Ok("DROP USER reader");
+    admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
+    admin->Ok("GRANT READ ON t TO reader");
+    (void)Set(*admin, 8);
+    const auto dropped = [](const Reply& reply) {
+        Error(reply, "AUTH_REQUIRED");
+        assert(reply.value.find("reason=user_dropped") != std::string::npos);
+    };
+    dropped(plain.Read()); Closed(plain);
+    dropped(slot.Read()); Closed(slot);
+    // The user created again watches with its own login.
+    Client again(harness.port, tls); again.Login("reader", "pw"); (void)Start(again.Command("WATCH t"));
+    const auto third = Set(*admin, 9);
+    assert(Change(NextChange(again)) == third);
+    Unwatch(again);
+}
+
 void ArchiveHandover(bool tls) {
     // Fit the two-chunk transaction's raw state; the separate held-lease test
     // forces a witnessed reset with a 4096-byte single-chunk feed.
@@ -1477,7 +1536,7 @@ int main(int argc, char** argv) {
         run("conditional-objects", ConditionalObjects);
         run("slot-record-outcome", SlotRecordOutcome);
         run("takeover-fence", TakeoverFence); run("takeover", Takeover); run("takeover-rights", TakeoverRights); run("takeover-UNWATCH-return", TakeoverUnwatchReturn); run("takeover-stalled-socket", TakeoverStalledSocket);
-        run("lifecycle", Lifecycle); run("rights", Rights); run("archive-handover", ArchiveHandover);
+        run("lifecycle", Lifecycle); run("rights", Rights); run("watch-revoke", WatchRevoke); run("watch-dropped-user", WatchDroppedUser); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);

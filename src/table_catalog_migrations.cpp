@@ -291,6 +291,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             if (!disk_users) throw std::runtime_error("migration users file disappeared");
             if (users->users_ != *disk_users) {
                 users->users_ = *disk_users;
+                users->IncarnateLocked();
                 users->generation_.fetch_add(1, std::memory_order_acq_rel);
             }
             next_users = users->users_;
@@ -335,6 +336,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
         if (next_users && users) {
             users->users_ = std::move(*next_users);
+            users->IncarnateLocked();
             users->generation_.fetch_add(1, std::memory_order_acq_rel);
         }
         if (user_lock.owns_lock()) user_lock.unlock();

@@ -252,8 +252,43 @@ void TestResetPasswordRecoversMigration() {
 
 }  // namespace
 
+// A user keeps its incarnation through changes and gets a new one when
+// created again; a check of READ for a watch notices both, and only those.
+void TestIncarnations() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-user-registry-incarnations");
+    const auto registry = std::make_shared<UserRegistry>(
+        dir.path(), std::make_pair(std::string("admin"), VerifierOf("secret")), kSecret);
+    registry->Create("bot", VerifierOf("first"), false);
+    registry->Create("other", VerifierOf("other"), false);
+    const auto first = registry->FindIncarnation("bot")->incarnation;
+    registry->Grant("bot", "world", Right::kRead);
+    assert(registry->FindIncarnation("bot")->incarnation == first);
+    chunkdb::ReadRightCheck revoked(registry, "bot", first, "world", registry->Generation());
+    chunkdb::ReadRightCheck dropped(registry, "bot", first, "world", registry->Generation());
+    registry->Grant("other", "world", Right::kRead);
+    registry->Revoke("bot", "world", Right::kWrite);
+    assert(revoked.Check() == chunkdb::ReadRightCheck::State::kHeld);
+    registry->Revoke("bot", "world", Right::kRead);
+    assert(revoked.Check() == chunkdb::ReadRightCheck::State::kNoRight);
+    registry->Grant("bot", "world", Right::kRead);
+    assert(revoked.Check() == chunkdb::ReadRightCheck::State::kNoRight); // Lost for good.
+    assert(dropped.Check() == chunkdb::ReadRightCheck::State::kHeld);
+
+    registry->Drop("bot");
+    assert(!registry->FindIncarnation("bot"));
+    registry->Create("bot", VerifierOf("second"), false);
+    registry->Grant("bot", "world", Right::kRead);
+    const auto second = registry->FindIncarnation("bot")->incarnation;
+    assert(second != first && dropped.Check() == chunkdb::ReadRightCheck::State::kNoUser);
+    assert(!registry->SetOwnVerifier("bot", first, VerifierOf("taken")));
+    assert(registry->Find("bot")->verifier == VerifierOf("second"));
+    assert(registry->SetOwnVerifier("bot", second, VerifierOf("third")));
+    assert(registry->Find("bot")->verifier == VerifierOf("third"));
+}
+
 int main() {
     TestFirstAdministrator();
+    TestIncarnations();
     TestChanges();
     TestConditionalChanges();
     TestConcurrentConditionalCreate();

@@ -42,6 +42,7 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
         std::array<char, 4096> input{};
         bool unwatch = false, return_ready = false, close = false, dead = false, read_paused = false;
         bool close_immediate = false;
+        bool right_lost = false;
         std::size_t share = 0U, buffer_bytes = 0U;
         std::chrono::steady_clock::time_point next_progress{};
     };
@@ -56,6 +57,9 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     void Advance(Watch& watch, std::size_t bytes);
     void Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision = {}, bool charged = false);
     void Reject(Watch& watch, std::string message);
+    // Whether the user still has READ on the watched table: one atomic load
+    // while the users are unchanged. A lost right ends the watch once.
+    bool Permitted(Watch& watch);
     ChunkServer& server_;
     server_detail::SocketHandle wake_read_ = server_detail::kInvalidSocket;
     server_detail::SocketHandle wake_write_ = server_detail::kInvalidSocket;
