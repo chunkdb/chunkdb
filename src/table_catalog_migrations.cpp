@@ -97,6 +97,28 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
     TableDefinition definition{request.geometry, request.options, request.schema};
     std::unique_lock<std::mutex> ddl;
     std::unique_lock<std::mutex> user_lock;
+    // A narrowing checks the stored values before catalog admission, under the
+    // table's DDL lock and a lease; the schema it recorded then is the one the
+    // decision may narrow.
+    bool narrowing_recorded = false;
+    TableSchema scanned_schema;
+    // A recorded narrowing that is not decided is dropped again, so a refused or
+    // skipped step leaves the schema as it was. A failed catalog or a fenced
+    // table drops it when it is recovered; a table whose narrowing cannot be
+    // dropped is fenced, and the step reports its own outcome.
+    const auto drop_recorded_narrowing = [&] {
+        if (!narrowing_recorded) return;
+        narrowing_recorded = false;
+        if (user_lock.owns_lock()) user_lock.unlock();
+        if (operations.owns_lock()) operations.unlock();
+        if (migration_health_->failed.load(std::memory_order_acquire) || Find(request.table) != table ||
+            !table->Info().schema.pending) return;
+        try {
+            EndNarrowing(*table, previous, [](StoreManifest* manifest) { manifest->schema = WithoutPendingNarrowing(manifest->schema); });
+        } catch (const std::exception&) {
+            // Logged by EndNarrowing, which fenced the table if needed.
+        }
+    };
     try {
         if (request.kind != MigrationRequest::Kind::kCreate && request.kind != MigrationRequest::Kind::kGrant) {
             table = Find(request.table);
@@ -142,11 +164,34 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                         throw FeedSlotFiltersError("feed slot filters differ from existing slot");
                     no_op = request.kind == MigrationRequest::Kind::kCreateSlot ? exists : !exists;
                 }
+                if (!no_op && request.kind == MigrationRequest::Kind::kAlter && request.narrowing) {
+                    const auto& [column_name, type] = *request.narrowing;
+                    const auto schema = table->Info().schema;
+                    const auto at = std::find_if(schema.columns.begin(), schema.columns.end(),
+                        [&](const auto& column) { return column.name == column_name; });
+                    if (at == schema.columns.end()) throw std::invalid_argument("the table has no column " + column_name);
+                    if (!HoldsEveryValue(at->type, type)) {
+                        operations.lock();
+                        if (already_applied()) return false;
+                        operations.unlock();
+                        narrowing_recorded = !schema.pending.has_value();
+                        RewriteManifest(
+                            *table, previous,
+                            [&](StoreManifest* manifest) { manifest->schema = WithPendingNarrowing(manifest->schema, column_name, type); },
+                            "CHUNKDB_FAILPOINT_NARROW_PENDING_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+                        scanned_schema = table->Info().schema;
+                        if (const auto misfit = ScanNarrowing(*table))
+                            throw std::invalid_argument("column " + column_name + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit + "; " + ColumnTypeRange(type));
+                    }
+                }
                 if (!no_op) {
                     store = table->BeginExclusive();
                     if (!store) {
                         operations.lock();
-                        if (already_applied()) return false;
+                        if (already_applied()) {
+                            drop_recorded_narrowing();
+                            return false;
+                        }
                         if (request.kind != MigrationRequest::Kind::kDrop || !request.if_exists || Find(request.table))
                             throw TableNotFoundError("table '" + request.table + "' was dropped");
                         table.reset();
@@ -165,6 +210,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     throw MigrationRecoveryRequiredError("cannot resume table '" + request.table + "' after migration retry: " + error.what());
                 }
             }
+            drop_recorded_narrowing();
             return false;
         }
         if (request.cancelled.stop_requested()) throw std::runtime_error("migration cancelled");
@@ -235,15 +281,18 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 const auto previous_schema = manifest->schema;
                 if (request.narrowing) {
                     const auto& [column_name, type] = *request.narrowing;
-                    const auto at = std::find_if(manifest->schema.columns.begin(), manifest->schema.columns.end(),
-                        [&](const auto& column) { return column.name == column_name; });
-                    if (at == manifest->schema.columns.end()) throw std::invalid_argument("the table has no column " + column_name);
-                    if (HoldsEveryValue(at->type, type)) manifest->schema = ChangeColumnType(manifest->schema, column_name, type, Conversion::kExact);
-                    else {
-                        const auto pending = WithPendingNarrowing(manifest->schema, column_name, type);
-                        if (const auto misfit = store->FindValueNotFitting(at->id, type))
-                            throw std::invalid_argument("column " + column_name + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit + "; " + ColumnTypeRange(type));
-                        manifest->schema = NarrowColumnType(pending, column_name, type);
+                    if (narrowing_recorded) {
+                        // The scan checked the values of this schema only.
+                        if (manifest->schema != scanned_schema)
+                            throw std::runtime_error("table '" + request.table + "' changed during the narrowing check");
+                        manifest->schema = NarrowColumnType(manifest->schema, column_name, type);
+                    } else {
+                        const auto at = std::find_if(manifest->schema.columns.begin(), manifest->schema.columns.end(),
+                            [&](const auto& column) { return column.name == column_name; });
+                        if (at == manifest->schema.columns.end()) throw std::invalid_argument("the table has no column " + column_name);
+                        if (!HoldsEveryValue(at->type, type))
+                            throw std::runtime_error("table '" + request.table + "' changed before the narrowing check");
+                        manifest->schema = ChangeColumnType(manifest->schema, column_name, type, Conversion::kExact);
                     }
                 } else request.alter(*manifest);
                 RequireCompatibleColumnAdditions(previous_schema, manifest->schema, *store);
@@ -400,6 +449,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 std::filesystem::remove_all(staging, ec);
                 if (ec) throw std::runtime_error("migration preparation failed and staging cleanup failed: " + ec.message());
             }
+            drop_recorded_narrowing();
         }
         if (decided) {
             try { std::rethrow_exception(failure); }

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Check stored values for a narrowing inside MIGRATE before catalog admission, under the table lease as plain ALTER does, so CREATE, DROP, ALTER, MIGRATE, RECOVER TABLE and SHOW MIGRATIONS of other tables no longer wait for the check; BACKUP, ENABLE FEATURE and SHOW STATUS started during the check still wait for it. Writes to the column must fit the narrower type during the check, and the step is decided only if the table schema is unchanged since the check. A refused narrowing, with or without MIGRATE, leaves no ledger record and removes its narrowing again; if that removal fails, the statement still returns its refusal and the table is fenced until RECOVER TABLE or a restart, instead of keeping the narrowing and refusing every later one.
 - A `chunks://` listener limits TLS 1.2 to ECDHE key exchange with AES-GCM or ChaCha20-Poly1305 ciphers, so every TLS 1.2 session has forward secrecy; TLS 1.3 suites and `--tls-min-version` are unchanged.
 - BACKUP TO refuses, on Linux and macOS, a `--backup-dir`, an existing directory below it or an existing destination that is not owned by the server user or root or is writable by group or others, checking each directory as it is opened, so only the server user or root can replace files in a backup.
 - `chunkdb_admin reset-password` refuses a backup or an incomplete restore directory before it takes the writer lock, with the error the server gives, so the backup stays restorable.
