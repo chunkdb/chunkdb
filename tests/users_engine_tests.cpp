@@ -407,10 +407,55 @@ void TestReadOnly() {
 #endif
 }
 
+std::string VerifierWithSalt(const std::string& password, std::size_t salt_bytes) {
+    return chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier(
+        password, std::vector<std::uint8_t>(salt_bytes, 0x5a), chunkdb::scram::kMinIterations));
+}
+
+// A verifier salt must fit the users file field in both ALTER USER forms, and
+// a grant names a table the file reads back: refused statements leave the
+// file as it was, and the server reopens it.
+void TestVerifierAndGrantBounds() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("hunter2")}), "+OK\r\n");
+    SessionState bot = server.LoggedIn("bot", "hunter2");
+    const auto users_path = server.dir.path() / chunkdb::kUsersFileName;
+    const auto before = chunkdb::LoadFile(users_path);
+
+    const std::string long_salt = VerifierWithSalt("new", chunkdb::scram::kMaxSaltBytes + 1U);
+    ExpectError(server.Run(bot, "ALTER USER bot VERIFIER $1", Parameters{long_salt}),
+                "INVALID_ARGUMENT a verifier's salt must be 16 to 256 bytes");
+    ExpectError(server.Run(bot, "ALTER USER bot VERIFIER '" + long_salt + "'"),
+                "INVALID_ARGUMENT a verifier's salt must be 16 to 256 bytes");
+    ExpectError(server.Run(admin, "CREATE USER eve VERIFIER '" + long_salt + "'"),
+                "INVALID_ARGUMENT a verifier's salt must be 16 to 256 bytes");
+    const std::string oversized = "SCRAM-SHA-256$4096:" + std::string(600, 'A') + "$x:y";
+    ExpectError(server.Run(bot, "ALTER USER bot VERIFIER '" + oversized + "'"),
+                "INVALID_ARGUMENT a verifier has at most 512 bytes");
+    ExpectError(server.Run(admin, "GRANT READ ON con TO bot"), "INVALID_ARGUMENT invalid table name 'con'");
+    ExpectError(server.Run(admin, "GRANT READ ON _hidden TO bot"), "INVALID_ARGUMENT invalid table name '_hidden'");
+    ExpectError(server.Run(admin, "GRANT READ ON " + std::string(65, 'a') + " TO bot"), "INVALID_ARGUMENT invalid table name");
+    assert(chunkdb::LoadFile(users_path) == before);
+
+    // The longest salt is kept in both forms and survives a reopen.
+    ExpectReply(server.Run(bot, "ALTER USER bot VERIFIER '" + VerifierWithSalt("literal", chunkdb::scram::kMaxSaltBytes) + "'"),
+                "+OK\r\n");
+    (void)server.LoggedIn("bot", "literal");
+    ExpectReply(server.Run(bot, "ALTER USER bot VERIFIER $1",
+                           Parameters{VerifierWithSalt("longest", chunkdb::scram::kMaxSaltBytes)}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON not_yet_created TO bot"), "+OK\r\n");
+    const auto reopened = chunkdb::ReadUsersFile(server.dir.path());
+    assert(reopened.has_value() && reopened->users.at("bot").verifier.salt.size() == chunkdb::scram::kMaxSaltBytes);
+    assert(reopened->users.at("bot").grants.at("not_yet_created") == chunkdb::Right::kRead);
+    (void)server.LoggedIn("bot", "longest");
+}
+
 }  // namespace
 
 int main() {
     TestAtomicRightsLists();
+    TestVerifierAndGrantBounds();
     TestLogin();
     TestRights();
     TestConditionalUsers();

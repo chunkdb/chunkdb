@@ -176,7 +176,13 @@ void TestVerifierText() {
     assert(scram::ParseVerifier(scram::FormatVerifier(most)).iterations == scram::kMaxIterations);
     auto short_salt = verifier;
     short_salt.salt.resize(8);
-    ExpectInvalid([&] { (void)scram::ParseVerifier(scram::FormatVerifier(short_salt)); }, "salt must be at least 16 bytes");
+    ExpectInvalid([&] { (void)scram::ParseVerifier(scram::FormatVerifier(short_salt)); }, "salt must be 16 to 256 bytes");
+    // The salt length must fit the users file field; the longest is kept.
+    auto long_salt = verifier;
+    long_salt.salt.assign(scram::kMaxSaltBytes + 1U, 0x5a);
+    ExpectInvalid([&] { (void)scram::ParseVerifier(scram::FormatVerifier(long_salt)); }, "salt must be 16 to 256 bytes");
+    long_salt.salt.resize(scram::kMaxSaltBytes);
+    assert(scram::ParseVerifier(scram::FormatVerifier(long_salt)) == long_salt);
     std::string broken = text;
     broken.back() = '!';
     ExpectInvalid([&] { (void)scram::ParseVerifier(broken); }, "ServerKey must be 32 bytes");
