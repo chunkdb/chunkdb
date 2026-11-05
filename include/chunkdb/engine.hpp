@@ -17,6 +17,8 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/change_feed.hpp"
@@ -147,15 +149,25 @@ struct SessionTransaction {
     // transaction.
     std::optional<std::string> aborted{};
 
-    // Drops the snapshot and the writes, keeping `reply` as the answer.
-    void Abort(std::string reply) {
-        snapshot.reset();
-        writes.clear();
-        read_set.clear();
+    // What Detach takes out of the transaction.
+    struct Released {
+        std::unique_ptr<TxnSnapshot> snapshot;
+        std::map<ChunkCoord, ChunkState, ChunkCoordLess> writes;
+        std::set<ChunkCoord, ChunkCoordLess> read_set;
+    };
+
+    // Ends the transaction, keeping `reply` as the answer and releasing its
+    // bytes; the snapshot and the copies are returned, so a caller holding a
+    // lock can destroy them after releasing it.
+    [[nodiscard]] Released Detach(std::string reply) {
+        Released released{std::move(snapshot), std::exchange(writes, {}), std::exchange(read_set, {})};
         budget->bytes.fetch_sub(bytes);
         bytes = 0;
         aborted = std::move(reply);
+        return released;
     }
+    // Drops the snapshot and the writes, keeping `reply` as the answer.
+    void Abort(std::string reply) { (void)Detach(std::move(reply)); }
 };
 
 struct SessionHelloOptions {
@@ -337,15 +349,21 @@ class CommandEngine {
     [[nodiscard]] std::string TxnCommit(SessionState& session);
     // The conflict a transaction past --txn-max-duration-ms ends with.
     [[nodiscard]] TransactionConflictError TxnDurationConflict() const;
+    // Whether the transaction is --txn-max-duration-ms old.
+    [[nodiscard]] bool TxnPastDuration(
+        const SessionTransaction& txn, std::chrono::steady_clock::time_point now) const;
+    // Whether it holds a snapshot and private copies that ending it releases;
+    // read under the budget's mutex unless its statement is running.
+    [[nodiscard]] static bool TxnHoldsBudget(const SessionTransaction& txn);
     // Marks the session's transaction, if any, as used by the statement
-    // starting, then ends it when it is past --txn-max-duration-ms; returns
-    // whether there was one. TxnStatementDone clears the mark when the
-    // statement left it open.
+    // starting, after ending it when it holds a snapshot and is past
+    // --txn-max-duration-ms; returns whether there was one.
+    // TxnStatementDone clears the mark when the statement left it open.
     [[nodiscard]] bool TxnStatementStart(SessionState& session);
     void TxnStatementDone(SessionState& session, bool started) noexcept;
-    // Ends every transaction past --txn-max-duration-ms that no statement is
-    // using, releasing its private copies and snapshot; its next statement
-    // answers CONFLICT reason=duration.
+    // Ends every transaction past --txn-max-duration-ms that holds a snapshot
+    // and that no statement is using, releasing its private copies and
+    // snapshot; its next statement answers CONFLICT reason=duration.
     void EndExpiredTransactions();
     // The table's lease for a statement inside the transaction. The first
     // statement binds the transaction to its table and takes the snapshot;

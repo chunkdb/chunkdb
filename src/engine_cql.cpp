@@ -1554,18 +1554,30 @@ TransactionConflictError CommandEngine::TxnDurationConflict() const {
         "the transaction ran longer than " + std::to_string(config_.txn_max_duration.count()) + " ms");
 }
 
+bool CommandEngine::TxnPastDuration(const SessionTransaction& txn, std::chrono::steady_clock::time_point now) const {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now - txn.started) >= config_.txn_max_duration;
+}
+
+bool CommandEngine::TxnHoldsBudget(const SessionTransaction& txn) {
+    // Without a snapshot it holds nothing: its next table statement or
+    // COMMIT checks the duration.
+    return txn.snapshot != nullptr && !txn.aborted.has_value();
+}
+
 bool CommandEngine::TxnStatementStart(SessionState& session) {
     SessionTransaction* const txn = session.transaction.get();
     if (txn == nullptr) {
         return false;
     }
-    const bool expired = std::chrono::steady_clock::now() - txn->started >= config_.txn_max_duration;
+    const bool expired = TxnPastDuration(*txn, std::chrono::steady_clock::now());
     std::string reply = expired ? ErrorReply(TxnDurationConflict()) : std::string{};
+    // Destroyed after the mutex is released.
+    SessionTransaction::Released released;
     // Ended under the mutex, like EndExpiredTransactions, so a write that
     // finds the budget full sees the bytes released once it holds it.
     std::lock_guard lock(txn_budget_.mutex);
-    if (expired && !txn->aborted.has_value()) {
-        txn->Abort(std::move(reply));
+    if (expired && TxnHoldsBudget(*txn)) {
+        released = txn->Detach(std::move(reply));
     }
     txn->in_statement = true;
     return true;
@@ -1582,20 +1594,19 @@ void CommandEngine::TxnStatementDone(SessionState& session, bool started) noexce
 
 void CommandEngine::EndExpiredTransactions() {
     const auto now = std::chrono::steady_clock::now();
-    std::optional<std::string> reply;
+    const std::string reply = ErrorReply(TxnDurationConflict());
+    // The snapshots and private copies of the ended transactions, destroyed
+    // after the mutex is released.
+    std::vector<SessionTransaction::Released> released;
     // While this holds the mutex no session starts a statement on its
     // transaction or destroys it.
     std::lock_guard lock(txn_budget_.mutex);
     for (SessionTransaction* txn : txn_budget_.open) {
         // A statement using the transaction changes it without the mutex:
         // check `in_statement` first.
-        if (txn->in_statement || txn->aborted.has_value() || now - txn->started < config_.txn_max_duration) {
-            continue;
+        if (!txn->in_statement && TxnHoldsBudget(*txn) && TxnPastDuration(*txn, now)) {
+            released.push_back(txn->Detach(reply));
         }
-        if (!reply.has_value()) {
-            reply = ErrorReply(TxnDurationConflict());
-        }
-        txn->Abort(*reply);
     }
 }
 
