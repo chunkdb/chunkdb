@@ -763,6 +763,32 @@ void TestTableStatements() {
     assert(plan.parameter_limits.at(0) == small + 14U);
 }
 
+// A column type is checked before its DEFAULT is read or encoded, in CREATE
+// TABLE, ADD COLUMN (also within MIGRATE) and ALTER COLUMN TYPE.
+void TestColumnTypeBeforeDefault() {
+    Fixture f;
+    const std::string u = "INVALID_ARGUMENT column a: uN takes N from 1 to 64";
+    ExpectError(f.Run("CREATE TABLE t (a u0 DEFAULT 1) CHUNK 4 x 4"), u);
+    ExpectError(f.Run("CREATE TABLE t (a u65 DEFAULT 1) CHUNK 4 x 4"), u);
+    ExpectError(f.Run("CREATE TABLE t (a u4294967295 DEFAULT 1) CHUNK 4 x 4"), u);
+    ExpectError(f.Run("CREATE TABLE t (a i65 DEFAULT -1) CHUNK 4 x 4"), "INVALID_ARGUMENT column a: iN takes N from 2 to 64");
+    // Without the check first, the default would take 512 MiB.
+    ExpectError(f.Run("CREATE TABLE t (a bits(4294967288) DEFAULT b'1') CHUNK 4 x 4"),
+                "INVALID_ARGUMENT column a: bits(N) takes N from 1 to 65535");
+    ExpectError(f.Run("MIGRATE 'wide' CREATE TABLE t (a u0 DEFAULT 1) CHUNK 4 x 4"), u);
+    ExpectError(f.Run("ALTER TABLE world ADD COLUMN a u0 DEFAULT 1"), u);
+    ExpectError(f.Run("MIGRATE 'wide' ALTER TABLE world ADD COLUMN a u0 DEFAULT 1"), u);
+    ExpectReply(f.Run("ALTER TABLE world ADD COLUMN a u4 DEFAULT 15"), "+OK\r\n");
+    ExpectError(f.Run("ALTER TABLE world ALTER COLUMN a TYPE u0 USING CLAMP"), u);
+    ExpectError(f.Run("ALTER TABLE world ALTER COLUMN a TYPE u200"), u);
+    ExpectError(f.Run("MIGRATE 'wide' ALTER TABLE world ALTER COLUMN a TYPE u0 USING CLAMP"), u);
+    ExpectReply(f.Run("SHOW TABLES"), "*2\r\n$5\r\nplain\r\n$5\r\nworld\r\n");
+    // The column count is bounded before the columns are built.
+    std::string columns = "c0 u1";
+    for (int i = 1; i <= 1024; ++i) columns += ", c" + std::to_string(i) + " u1 DEFAULT 1";
+    ExpectError(f.Run("CREATE TABLE t (" + columns + ") CHUNK 4 x 4"), "INVALID_ARGUMENT a table has at most 1024 columns");
+}
+
 void TestConditionalObjects() {
     Fixture f;
     ExpectReply(f.Run("CREATE TABLE IF NOT EXISTS repeatable (a u8) CHUNK 4 x 4"), "+OK\r\n");
@@ -1005,6 +1031,7 @@ int main(int argc, char** argv) {
     TestAreaStatements();
     TestAreaFromFiles();
     TestTableStatements();
+    TestColumnTypeBeforeDefault();
     TestConditionalObjects();
     TestConcurrentConditionalCreate();
     TestScanChunks();

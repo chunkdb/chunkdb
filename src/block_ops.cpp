@@ -940,12 +940,16 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
     }
     const Column& column = layout.schema().columns[index];
     const auto* fixed = layout.FixedColumnAt(index);
-    const auto width = static_cast<std::int64_t>(geometry_.config().chunk_width_blocks);
-    const auto height = static_cast<std::int64_t>(geometry_.config().chunk_height_blocks);
+    const std::uint32_t width = geometry_.config().chunk_width_blocks;
+    const std::uint32_t height = geometry_.config().chunk_height_blocks;
+    // An axis past int64 as [chunk, local], as WATCH reports it.
+    const auto axis = [](std::int64_t chunk, std::uint32_t blocks, std::size_t local) {
+        const auto absolute = BlockCoordinate(chunk, blocks, local);
+        return absolute.has_value() ? std::to_string(*absolute)
+                                    : "[" + std::to_string(chunk) + ", " + std::to_string(local) + "]";
+    };
     const auto describe = [&](const ChunkCoord& coord, std::size_t block, const ColumnValue& value) {
-        const auto local_x = static_cast<std::int64_t>(block) % width;
-        const auto local_y = static_cast<std::int64_t>(block) / width;
-        return "block (" + std::to_string(coord.x * width + local_x) + ", " + std::to_string(coord.y * height + local_y) +
+        return "block (" + axis(coord.x, width, block % width) + ", " + axis(coord.y, height, block / width) +
                ") holds " + DescribeValue(value);
     };
     std::vector<std::uint8_t> bytes(fixed != nullptr ? (fixed->width + 7U) / 8U : 0U);
