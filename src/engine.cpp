@@ -260,6 +260,12 @@ CommandEngine::CommandEngine(
 // The longest SCRAM message HELLO and AUTH take as a parameter frame.
 constexpr std::size_t kMaxScramMessageBytes = 1024;
 
+// The parameter frames a HELLO may carry before authentication: enough for
+// $1 of USER, every known option and eight unknown ones. A count that only
+// the line length bounds would let an unauthenticated connection hold its
+// worker for as many frame waits.
+constexpr std::size_t kMaxHelloParameterFrames = 12;
+
 // A login between HELLO 3 USER and AUTH.
 struct PendingLogin {
     std::string user;
@@ -594,6 +600,10 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
             return PayloadRequest{.plan = PayloadPlan::kDiscard, .reject_response = Protocol::Error("PROTOCOL",
                 session.greeted ? "HELLO was already sent on this connection" : "expected HELLO 3"),
                 .frame_count = session.greeted ? count : 0U};
+        if (count > kMaxHelloParameterFrames)
+            // Closed after the error, without reading the frames.
+            return PayloadRequest{.plan = PayloadPlan::kDiscard, .reject_response = Protocol::Error("PROTOCOL",
+                "HELLO takes at most " + std::to_string(kMaxHelloParameterFrames) + " parameters"), .frame_count = 0U};
         try {
             const auto hello = cql::ParseHello(line);
             ValidateHelloOptionNames(hello);

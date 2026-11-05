@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Bound everything before authentication by the HELLO deadline: HELLO, AUTH and all their parameter frames must arrive within `--client-io-timeout-ms` of the connection's start, where each frame used to start a timeout of its own; before authentication HELLO takes at most 12 parameters.
 - Bound verifier salts to 16 through 256 bytes in CREATE USER, ALTER USER and the users file, limit a quoted VERIFIER to 512 bytes like `VERIFIER $1`, refuse GRANT on a name that is not a valid table name, and refuse a users file with an out-of-range salt or an invalid user or table name instead of writing a salt length that does not fit its field.
 - Add matched-subscriber budget comparisons with `chunkdb_budget_compare --watch-both TABLE[:N][:slots]` and require a control with the same subscriber settings (#140).
 - Add extensible reply metadata, exact unsigned revisions, HELLO options, persistent watch filters, ACK deadlines, takeover, lineage, and explicit feature activation (#69).
