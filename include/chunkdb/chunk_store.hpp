@@ -497,8 +497,9 @@ class ChunkStore {
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock(std::int64_t block_x, std::int64_t block_y);
     [[nodiscard]] BlockReadMetadata GetBlockWithVersion(std::int64_t block_x, std::int64_t block_y);
     // The first stored value of column `column_id` that `type` does not
-    // hold, as "block (x, y) holds <value>", or std::nullopt when every one
-    // fits. Reads every populated chunk (TableCatalog::NarrowColumn).
+    // hold, as "block (x, y) holds <value>" (an axis past int64 as
+    // [chunk, local]), or std::nullopt when every one fits. Reads every
+    // populated chunk (TableCatalog::NarrowColumn).
     [[nodiscard]] std::optional<std::string> FindValueNotFitting(std::uint32_t column_id, const ColumnType& type);
     // Whether memory, images or WALs contain any present block. Callers that
     // use the answer to change a schema must exclude concurrent writers.
@@ -783,6 +784,15 @@ class ChunkStore {
     [[nodiscard]] std::uint64_t DuplicateChunkInstancesForTests() const noexcept {
         return stats_duplicate_chunk_instances_.load(std::memory_order_relaxed);
     }
+    // Entries in the registry behind that check; one per live instance.
+    [[nodiscard]] std::size_t LiveChunkInstanceEntriesForTests() const;
+    // Removes a never-written chunk from the cache without the eviction's
+    // check that nothing else holds it, and returns its object. Holding it
+    // keeps an instance alive past its removal, which eviction never allows,
+    // so a test can observe the duplicate-instance check. Null if the chunk
+    // is not cached.
+    [[nodiscard]] std::shared_ptr<const void> TakeChunkFromCacheForTests(
+        std::int64_t chunk_x, std::int64_t chunk_y);
 
     [[nodiscard]] bool WaitForReadOnlySnapshotPauseForTests();
     void ResumeReadOnlySnapshotForTests();
@@ -1168,9 +1178,33 @@ class ChunkStore {
     // the previous instance still alive, two objects for one chunk exist at
     // once and writes made through the older one can be discarded by whoever
     // checkpoints from the newer.
-    mutable std::mutex live_chunk_instances_mutex_;
-    std::unordered_map<ChunkCoord, std::weak_ptr<RegularChunk>, ChunkCoordHash>
-        live_chunk_instances_;
+    //
+    // An entry lives exactly as long as its instance: RegularChunkDeleter
+    // erases it when the instance dies, so the registry holds no more
+    // entries than there are live instances. `mutex` is a leaf: nothing else
+    // is locked while it is held, and no RegularChunk is released under it,
+    // so a deleter may run with any other lock held.
+    struct LiveChunkInstances {
+        struct Entry {
+            // Identifies the instance after `ref` has expired, so that a
+            // dying instance erases only its own entry, not one a newer
+            // load registered for the same coordinate.
+            const RegularChunk* instance = nullptr;
+            std::weak_ptr<RegularChunk> ref;
+        };
+        std::mutex mutex;
+        std::unordered_map<ChunkCoord, Entry, ChunkCoordHash> entries;
+    };
+    // Owns every RegularChunk the cache loads. It shares the registry rather
+    // than pointing at the store, because the WAL stream pool of another
+    // store can release an instance last, after this store is gone.
+    struct RegularChunkDeleter {
+        std::shared_ptr<LiveChunkInstances> registry;
+        ChunkCoord coord;
+        void operator()(RegularChunk* chunk) const noexcept;
+    };
+    std::shared_ptr<LiveChunkInstances> live_chunk_instances_ =
+        std::make_shared<LiveChunkInstances>();
     std::atomic<std::uint64_t> stats_duplicate_chunk_instances_{0};
     std::size_t eviction_large_chunk_cursor_ = 0;
     mutable std::mutex eviction_state_mutex_;
