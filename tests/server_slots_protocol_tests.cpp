@@ -19,6 +19,7 @@ struct SlotAckDeadlineTestAccess {
     static bool Expire(SlotWatch& watch, std::chrono::steady_clock::time_point now) { return watch.ExpireAckDeadline(now); }
     static std::size_t Count(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.receipts_.size(); }
     static std::size_t Charged(const SlotWatch& watch) { return watch.table_bytes_->load(std::memory_order_acquire); }
+    static std::size_t Excess(const SlotWatch& watch) { return watch.excess_bytes_->load(std::memory_order_acquire); }
     static void Hook(SlotWatch& watch, FeedDeliveryTestHook* hook) { watch.hook_.store(hook, std::memory_order_release); }
     static std::uint64_t Acked(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.acknowledged_; }
 };
@@ -880,6 +881,108 @@ void TinyBudgetTerminates(bool tls) {
     const auto listed = writer->Command("SHOW SLOTS ON t");
     assert(!Boolean(Field(Slot(listed, "t", "consumer"), "lost")));
 }
+// One transaction writing `blocks` fresh blocks with long labels from block row `row`.
+std::uint64_t LabelTransaction(Client& writer, unsigned blocks, unsigned row = 0U) {
+    writer.Ok("BEGIN");
+    for (unsigned i = 0U; i < blocks; ++i)
+        assert(writer.Command("SET BLOCK " + std::to_string(i % 64U) + " " + std::to_string(row + i / 64U) +
+            " IN t label = '" + std::string(120U, 'x') + "'").type == '_');
+    return Number(writer.Command("COMMIT"));
+}
+std::vector<std::unique_ptr<Client>> OrdinaryWatches(Harness& harness, std::size_t count) {
+    std::vector<std::unique_ptr<Client>> watches;
+    for (std::size_t i = 0U; i < count; ++i) {
+        watches.push_back(harness.Connect()); (void)Start(watches.back()->Command("WATCH t"));
+    }
+    return watches;
+}
+void ShareIndependentDelivery(bool tls) {
+    constexpr std::size_t budget = 16384U, kOrdinary = 31U; // A share of 512 bytes.
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    auto ordinary = OrdinaryWatches(harness, kOrdinary);
+    auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
+    // Every watch delivers a change, so the I/O thread has applied the
+    // 32-watch share to the slot before the large change is admitted.
+    const auto first = Set(*writer, 1); FeedSlotTestAccess::Sync(*table);
+    for (const auto& client : ordinary) assert(Change(NextChange(*client)) == first);
+    assert(Change(NextChange(*watch)) == first);
+    const auto large = LabelTransaction(*writer, 24U); FeedSlotTestAccess::Sync(*table);
+    const auto change = watch->Read();
+    assert(Change(change, 24U) == large); // About 4 KiB: above the share, within the table budget.
+    watch->Line("ACK " + std::to_string(large)); Unwatch(*watch);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == large);
+    for (const auto& client : ordinary) Unwatch(*client); // Ordinary watches above their share resync.
+}
+void TableBudgetStillTerminates(bool tls) {
+    constexpr std::size_t budget = 16384U;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    auto ordinary = OrdinaryWatches(harness, 7U);
+    auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*writer, 1); FeedSlotTestAccess::Sync(*table);
+    for (const auto& client : ordinary) assert(Change(NextChange(*client)) == first);
+    assert(Change(NextChange(*watch)) == first);
+    (void)LabelTransaction(*writer, 128U); FeedSlotTestAccess::Sync(*table); // About 20 KiB.
+    const auto refused = watch->Read();
+    Error(refused, "OUT_OF_RANGE"); assert(refused.value.find("table feed buffer") != std::string::npos);
+    Closed(*watch);
+    assert(!Boolean(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "lost")));
+    for (const auto& client : ordinary) Unwatch(*client);
+}
+void ExcessPoolBound(bool tls) {
+    constexpr std::size_t budget = 4096U, share = 1024U;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer);
+    for (const auto* name : {"first", "second", "third"}) writer->Ok("CREATE SLOT '" + std::string(name) + "' ON t");
+    auto table = harness.catalog->Find("t");
+    const auto initial = table->ListFeedSlots().front().position;
+    const auto small = Set(*writer, 1);
+    const auto large = LabelTransaction(*writer, 20U);
+    FeedSlotTestAccess::Sync(*table);
+    auto archive = table->ReadFeedArchive(initial);
+    const auto small_entry = archive.Next(), large_entry = archive.Next();
+    assert(small_entry && large_entry && small_entry->position.revision == small && large_entry->position.revision == large);
+    const auto take = [](SlotWatch& state) {
+        std::size_t bytes = 0U;
+        while (auto output = state.Take(budget)) bytes += output->bytes->size();
+        return bytes;
+    };
+    const auto bounded = [&](const SlotWatch& state) {
+        assert(SlotAckDeadlineTestAccess::Charged(state) <= budget && SlotAckDeadlineTestAccess::Excess(state) <= budget);
+    };
+    auto first = SlotWatch::Create(table, "first", {});
+    auto second = SlotWatch::Create(table, "second", {});
+    auto third = SlotWatch::Create(table, "third", {});
+    for (const auto& state : {first, second, third}) state->SetQuota(share);
+    // A frame above the share uses the excess pool; a second one waits for it.
+    assert(SlotAckDeadlineTestAccess::Publish(*first, large_entry));
+    const auto excess = SlotAckDeadlineTestAccess::Excess(*first);
+    assert(excess > budget / 2U && excess <= budget && SlotAckDeadlineTestAccess::Charged(*first) == 0U);
+    assert(!SlotAckDeadlineTestAccess::Publish(*second, large_entry));
+    assert(SlotAckDeadlineTestAccess::Excess(*second) == excess); bounded(*second);
+    // Output within a share does not wait for the excess pool.
+    assert(SlotAckDeadlineTestAccess::Publish(*third, small_entry));
+    const auto within = take(*third);
+    assert(within != 0U && within <= share && SlotAckDeadlineTestAccess::Charged(*third) == within); bounded(*third);
+    // The same watch queues nothing above its share while output is unsent.
+    assert(take(*first) == excess);
+    first->Consumed(excess - 1U);
+    assert(SlotAckDeadlineTestAccess::Excess(*first) == 1U && SlotAckDeadlineTestAccess::Charged(*first) == within);
+    first->Consumed(1U);
+    assert(SlotAckDeadlineTestAccess::Excess(*first) == 0U);
+    assert(SlotAckDeadlineTestAccess::Publish(*second, large_entry));
+    assert(SlotAckDeadlineTestAccess::Excess(*second) == excess); bounded(*second);
+    third->Consumed(within); // Its earlier output was sent, but the pool holds another frame.
+    assert(!SlotAckDeadlineTestAccess::Publish(*third, large_entry));
+    assert(take(*second) == excess); second->Consumed(excess);
+    assert(SlotAckDeadlineTestAccess::Publish(*third, large_entry));
+    assert(SlotAckDeadlineTestAccess::Excess(*third) > share); bounded(*third);
+    for (const auto& state : {first, second, third}) { state->Cancel(); state->WorkStep(); }
+    assert(SlotAckDeadlineTestAccess::Charged(*first) == 0U && SlotAckDeadlineTestAccess::Excess(*first) == 0U);
+}
 void LiveSchemaAcknowledgement(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect(); Create(*writer);
@@ -1484,6 +1587,8 @@ int main(int argc, char** argv) {
         run("persistent-filters", PersistentFilterDelivery);
         run("historical-schema", HistoricalSchemas); run("held-lease", ArchiveWhileLeaseHeld);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
+        run("share-independent-delivery", ShareIndependentDelivery); run("table-budget-terminates", TableBudgetStillTerminates);
+        run("excess-pool-bound", ExcessPoolBound);
         run("live-schema-ACK", LiveSchemaAcknowledgement);
         run("filtered-idle-progress", FilteredAndIdleProgress);
         run("admitted-share", AdmittedChangeSurvivesShareShrink);

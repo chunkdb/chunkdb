@@ -8,6 +8,17 @@
 #include "chunkdb/logging.hpp"
 
 namespace chunkdb {
+namespace {
+bool Charge(std::atomic<std::size_t>& counter, std::size_t bytes, std::size_t limit) {
+    if (bytes == 0U) return true;
+    if (bytes > limit) return false;
+    auto used = counter.load(std::memory_order_acquire);
+    for (;;) {
+        if (used > limit - bytes) return false;
+        if (counter.compare_exchange_weak(used, used + bytes, std::memory_order_acq_rel)) return true;
+    }
+}
+}  // namespace
 std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     std::string name, FeedOptions options, bool takeover, std::string user,
     const std::function<void(std::string_view)>& authorize_owner) {
@@ -42,9 +53,13 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
 }
 SlotWatch::SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim> claim,
     FeedPosition start, FeedOptions options, bool resync)
-    : table_(std::move(table)), claim_(std::move(claim)), generation_(claim_), table_bytes_(claim_->output_bytes), start_(start), options_(std::move(options)),
+    : table_(std::move(table)), claim_(std::move(claim)), generation_(claim_), table_bytes_(claim_->output_bytes), excess_bytes_(claim_->excess_bytes), start_(start), options_(std::move(options)),
       quota_(budget()), sent_(start.revision), acknowledged_(start.revision), written_(start.revision), resync_(resync), cursor_(start), next_progress_(std::chrono::steady_clock::now() + options_.progress_interval) {}
-SlotWatch::~SlotWatch() { table_bytes_->fetch_sub(unsent_ + receipts_.size() * kReceiptBytes, std::memory_order_acq_rel); }
+SlotWatch::~SlotWatch() { Release(unsent_ - excess_ + receipts_.size() * kReceiptBytes, excess_); }
+void SlotWatch::Release(std::size_t shared, std::size_t excess) noexcept {
+    if (shared != 0U) table_bytes_->fetch_sub(shared, std::memory_order_acq_rel);
+    if (excess != 0U) excess_bytes_->fetch_sub(excess, std::memory_order_acq_rel);
+}
 void SlotWatch::SetQuota(std::size_t bytes) { std::lock_guard lock(mutex_); quota_ = bytes; }
 std::optional<SlotWatch::Output> SlotWatch::Take(std::size_t room) {
     std::lock_guard lock(mutex_);
@@ -86,8 +101,11 @@ void SlotWatch::ClearReceipts() noexcept {
 void SlotWatch::Consumed(std::size_t bytes) {
     std::lock_guard lock(mutex_);
     if (bytes > unsent_) throw std::logic_error("slot output charge underflow");
+    // Output is consumed in order, and excess output is its front.
+    const auto excess = std::min(bytes, excess_);
     unsent_ -= bytes;
-    table_bytes_->fetch_sub(bytes, std::memory_order_acq_rel);
+    excess_ -= excess;
+    Release(bytes - excess, excess);
 }
 SlotWatch::AckResult SlotWatch::Ack(std::uint64_t revision) {
     std::lock_guard lock(mutex_);
@@ -157,8 +175,12 @@ void SlotWatch::Finish(std::optional<Output> control) {
     {
         std::lock_guard lock(mutex_);
         if (cancelled_ || ack_expired_ || takeover_) {
+            // Untaken output is the back of the unsent output.
+            const auto taken = unsent_ - bytes_;
+            const auto excess = excess_ > taken ? excess_ - taken : 0U;
             unsent_ -= bytes_;
-            table_bytes_->fetch_sub(bytes_, std::memory_order_acq_rel);
+            excess_ -= excess;
+            Release(bytes_ - excess, excess);
             output_.clear(); bytes_ = 0U;
         }
         if (!cancelled_ && !takeover_ && control) {
@@ -218,25 +240,38 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
     if (schema) next.push_back(std::move(*schema));
     const bool eligible = entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks || entry->kind == FeedEntry::Kind::kProgress;
     next.push_back({std::move(frame), eligible ? std::optional<std::uint64_t>(entry->position.revision) : std::nullopt});
+    bool refunded = false;
     {
         std::lock_guard lock(mutex_);
-        if (receipt_bytes > quota_ || size > quota_ - receipt_bytes)
-            throw std::length_error("slot change exceeds the watch buffer share");
         if (cancelled_ || unwatch_ || ack_expired_ || takeover_) return false;
-        const auto held = receipts_.size() * kReceiptBytes;
-        if (held > quota_ - size - receipt_bytes || unsent_ > quota_ - size - receipt_bytes - held) return false;
         const auto table_budget = budget();
         if (receipt_bytes > table_budget || size > table_budget - receipt_bytes)
             throw std::length_error("slot change exceeds the table feed buffer");
-        auto table_bytes = table_bytes_->load(std::memory_order_acquire);
-        for (;;) {
-            if (table_bytes > table_budget - size - receipt_bytes) return false;
-            if (table_bytes_->compare_exchange_weak(table_bytes, table_bytes + size + receipt_bytes, std::memory_order_acq_rel)) break;
+        // Unacknowledged receipts stay within the share; the first one always fits.
+        const auto held = receipts_.size() * kReceiptBytes;
+        if (held != 0U && (held > quota_ || receipt_bytes > quota_ - held)) return false;
+        // Output stays within the share. A frame that cannot fit it waits until
+        // this watch has no unsent output and is then charged to the table's
+        // excess pool, so the number of watches sharing the table never makes
+        // a change within the table budget undeliverable.
+        const auto reserved = held + receipt_bytes;
+        const bool excess = reserved > quota_ || size > quota_ - reserved || unsent_ > quota_ - reserved - size;
+        if (excess && unsent_ != 0U) return false;
+        if (!Charge(*table_bytes_, excess ? receipt_bytes : size + receipt_bytes, table_budget)) return false;
+        refunded = excess && !Charge(*excess_bytes_, size, table_budget);
+        if (refunded) Release(receipt_bytes, 0U);
+        else {
+            if (excess) excess_ = size;
+            receipts_.splice(receipts_.end(), receipt);
+            output_.swap(next);
+            bytes_ += size;
+            unsent_ += size;
         }
-        receipts_.splice(receipts_.end(), receipt);
-        output_.swap(next);
-        bytes_ += size;
-        unsent_ += size;
+    }
+    // Another watch may be waiting for the refunded receipt charge.
+    if (refunded) {
+        if (receipt_bytes != 0U && options_.notify) options_.notify();
+        return false;
     }
     if (auto* hook = hook_.load(std::memory_order_acquire))
         hook->Run(FeedDeliveryTestHook::Point::kAfterAdmission, size);

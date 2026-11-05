@@ -214,9 +214,10 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
             return;
         }
         slot->SetQuota(share > 128U ? share - 128U : share);
-        // Admission already checked the share. Keep room for an accepted
-        // frame when another watch subsequently reduces that share. Charges
-        // remain in the table budget until the socket consumes the bytes.
+        // Admission already checked the share, or charged one larger frame
+        // to the table's excess pool. Keep room for an accepted frame when
+        // another watch subsequently reduces that share. Charges remain in
+        // the table budget until the socket consumes the bytes.
         const auto capacity = std::max<std::size_t>(slot->budget(), 128U);
         for (std::size_t i = 0U; i < 64U; ++i) {
             auto entry = slot->Take(capacity - std::min(capacity, watch.bytes));

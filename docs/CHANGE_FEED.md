@@ -76,6 +76,9 @@ Store your applied position together with your output, and ignore repeated posit
 | Slot durable-frontier sync interval | 100 ms, `--slot-sync-ms` |
 
 Slow ordinary watches resync when the live history budget is exceeded.
+Each watch queues output within its share of `feed_buffer_bytes`, and slot changes larger than a share use one more table pool of that size.
+So queued output per table stays within twice `feed_buffer_bytes`, apart from frames admitted before a new watch reduced the shares.
+An ordinary watch resyncs instead of queuing a change larger than its share.
 A slot becomes lost when its retained history exceeds its limit.
 Reducing a table's limits can also trigger resync or mark existing slots lost.
 

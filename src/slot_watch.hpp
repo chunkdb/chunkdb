@@ -43,9 +43,14 @@ struct FeedSlotClaim {
     std::weak_ptr<SlotWatch> owner;
     const std::string user;
     const std::uint64_t completed;
+    // Table-wide slot output charges: output within watch shares and
+    // receipts, and output above a share. Each stays within the table budget.
     const std::shared_ptr<std::atomic<std::size_t>> output_bytes;
-    FeedSlotClaim(std::string value, std::uint64_t revision, std::shared_ptr<std::atomic<std::size_t>> bytes, std::string owner_user)
-        : name(std::move(value)), user(std::move(owner_user)), completed(revision), output_bytes(std::move(bytes)) {}
+    const std::shared_ptr<std::atomic<std::size_t>> excess_bytes;
+    FeedSlotClaim(std::string value, std::uint64_t revision, std::shared_ptr<std::atomic<std::size_t>> bytes,
+        std::shared_ptr<std::atomic<std::size_t>> excess, std::string owner_user)
+        : name(std::move(value)), user(std::move(owner_user)), completed(revision), output_bytes(std::move(bytes)),
+          excess_bytes(std::move(excess)) {}
 };
 
 // Socket operations only touch the bounded queue and control fields. A single
@@ -105,6 +110,7 @@ class SlotWatch {
     bool ExpireAckDeadline(std::chrono::steady_clock::time_point now);
     bool AckDeadlineExpiredLocked(std::chrono::steady_clock::time_point now);
     void ClearReceipts() noexcept;
+    void Release(std::size_t shared, std::size_t excess) noexcept;
     void RequestTakeoverAndWait();
     struct MutationReceipt {
         std::uint64_t revision;
@@ -116,6 +122,7 @@ class SlotWatch {
     std::shared_ptr<FeedSlotClaim> claim_;
     const std::weak_ptr<FeedSlotClaim> generation_;
     const std::shared_ptr<std::atomic<std::size_t>> table_bytes_;
+    const std::shared_ptr<std::atomic<std::size_t>> excess_bytes_;
     const FeedPosition start_;
     const FeedOptions options_;
     mutable std::mutex mutex_;
@@ -124,6 +131,9 @@ class SlotWatch {
     bool takeover_ = false, socket_closed_ = false;
     std::deque<Output> output_;
     std::size_t bytes_ = 0, unsent_ = 0;
+    // The front of the unsent output charged to excess_bytes_: one frame
+    // above the share, admitted only when nothing else was unsent.
+    std::size_t excess_ = 0;
     std::size_t quota_;
     std::uint64_t sent_, acknowledged_, written_;
     std::list<MutationReceipt> receipts_;

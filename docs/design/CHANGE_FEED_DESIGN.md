@@ -14,8 +14,10 @@ Feed recreation cannot invalidate producers still owned by the store.
 
 After WATCH admission, the socket/TLS session moves from its worker to feed I/O.
 Wakeup channels signal new changes, durable frontiers and shutdown; output does not hold request workers.
-Queues, retained changes and encoded output share a bounded table budget.
-Ordinary overflow requests resync; slot overflow catches up from archives, while an individually undeliverable event ends the watch.
+Retained changes use the table budget; queued output uses per-watch shares of it plus one table pool of the same size for slot frames above a share.
+Ordinary overflow requests resync; slot overflow catches up from archives, while an event larger than the table budget ends the watch.
+A slot frame larger than its watch share waits until that watch has no unsent output, then is charged to a separate table pool bounded by the table budget, so share size never decides deliverability.
+Within-share slot output and receipts use another table counter bounded by the budget, so a pending large frame never delays them.
 Write captures evict the oldest retained changes before they are refused, so only readers below the evicted floor resync.
 An admitted frame remains valid when output shares change, and teardown releases ownership before rewatch.
 

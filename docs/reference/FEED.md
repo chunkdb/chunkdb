@@ -123,7 +123,7 @@ UNWATCH
 | SLOT_BUSY | The slot already has an owner. | Close its existing watcher. |
 | SLOT_LOST | Retained history exceeds its limit, or a projected column was dropped. | Rebuild state and recreate the slot. |
 | INVALID_ARGUMENT reason=slot_filters | WATCH or conditional creation uses different slot filters. | Inherit its filters or create another slot. |
-| OUT_OF_RANGE | A single slot change cannot fit its output budget. | Increase feed_buffer_bytes before reconnecting. |
+| OUT_OF_RANGE | A single slot change is larger than the table's `feed_buffer_bytes`. | Increase feed_buffer_bytes before reconnecting. |
 | INVALID_ARGUMENT | ACK exceeds the last fully delivered position. | Acknowledge only processed events. |
 | INVALID_ARGUMENT | You run WATCH, CREATE SLOT or DROP SLOT on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | PROTOCOL | You send another statement while streaming. | Use a separate connection. |
@@ -152,6 +152,8 @@ Store the applied position atomically with your own output to prevent duplicate 
 ## Limits
 
 Defaults are 64 watches, 67108864 live feed bytes per table, and 1073741824 retained bytes per slot.
+Each watch queues output within its share, the table's `feed_buffer_bytes` divided among the table's watches.
+A slot change larger than its share is sent alone after the watch's earlier output, from a separate table pool of `feed_buffer_bytes`; it waits while other such changes hold that pool.
 Ordinary history lingers for 30000 ms after the last watch; slots keep history active independently.
 See [Change feed](../CHANGE_FEED.md) and [Resume a consumer](../FEED_RESUME.md) for overflow and recovery.
 

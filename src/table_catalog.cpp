@@ -709,7 +709,7 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
         if (old && old->takeover_pending.load(std::memory_order_acquire))
             throw FeedSlotBusyError("feed slot ownership handoff is pending", "takeover_pending");
         if (!old || !old->valid.load(std::memory_order_acquire)) {
-            auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, std::move(user));
+            auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_bytes_, std::move(user));
             existing = claim;
             return {std::move(slot), std::move(claim)};
         }
@@ -746,7 +746,7 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
     if (!old->valid.load(std::memory_order_acquire) || found == slot_claims_.end() || found->second.lock() != old)
         throw FeedSlotLostError("feed slot was removed during takeover");
     auto slot = validate(*store);
-    auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, std::move(user));
+    auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_bytes_, std::move(user));
     old->valid.store(false, std::memory_order_release);
     found->second = claim;
     return {std::move(slot), std::move(claim)};

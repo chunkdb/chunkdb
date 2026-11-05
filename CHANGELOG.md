@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Deliver a slot change larger than the watch's share of `feed_buffer_bytes` instead of ending the slot watch with OUT_OF_RANGE when many watches share the table: the change is sent alone after the watch's earlier output, from a separate table pool of `feed_buffer_bytes`, so queued feed output per table stays within twice that budget; only a change larger than the budget still ends the watch with OUT_OF_RANGE.
 - Keep memory bounded by `--max-loaded-chunks` when reads touch new chunks: the check for two live objects of one chunk now forgets a chunk once its object is freed, instead of keeping about 430 bytes for every chunk coordinate ever loaded.
 - Check a column type against its size range before its DEFAULT is read or encoded in CREATE TABLE, ADD COLUMN and ALTER COLUMN TYPE, so a type such as `u0` or `bits(4294967288)` is refused with its range instead of another error or a large allocation; a narrowing refused by a value names a block past the int64 range on an axis as `[chunk, local]`, as WATCH does.
 - Bound everything before authentication by the HELLO deadline: HELLO, AUTH and all their parameter frames must arrive within `--client-io-timeout-ms` of the connection's start, where each frame used to start a timeout of its own; before authentication HELLO takes at most 12 parameters.
