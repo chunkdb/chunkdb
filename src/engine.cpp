@@ -352,7 +352,17 @@ std::string CommandEngine::Execute(
     // Neither log costs anything while both are off.
     const bool logged = config_.audit != nullptr || config_.slow_statement_ms != 0U;
     StatementLogInfo info;
-    std::string response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr);
+    std::string response;
+    {
+        // The session's transaction belongs to this statement until it ends.
+        struct TxnStatement {
+            CommandEngine& engine;
+            SessionState& session;
+            bool started;
+            ~TxnStatement() { engine.TxnStatementDone(session, started); }
+        } txn_statement{*this, session, TxnStatementStart(session)};
+        response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr);
+    }
     ObserveReply(command_class, started, response);
     if (logged && info.verb != nullptr) {
         LogStatement(session, info, started, response);
