@@ -11,6 +11,10 @@
 #include "wal_writer.hpp"
 #include "txn_history.hpp"
 #include <thread>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include "backup.hpp"
 #include "change_feed.hpp"
@@ -773,27 +777,50 @@ void PathDurabilityFailuresRemainGuarded() {
     assert(!std::filesystem::exists(target / kBackupIncompleteName));
 #endif
 }
-// An existing target, or an existing parent below --backup-dir, must belong to
-// the server user and not be writable by group or others.
+// The --backup-dir root, each existing directory below it and an existing
+// target must belong to the server user or root and not be writable by group
+// or others. Directories above the root are not checked.
 void SharedTargetDirectories() {
 #ifndef _WIN32
     ScopedTempDir temp("chunkdb-backup-shared-target");
     const auto root = std::filesystem::canonical(temp.path());
     TableCatalog catalog(Config(root / "source"));
     (void)feed_test::CreateDefault(catalog);
-    const auto shared = root / "shared";
+    const auto refused = [](const std::string& error, const std::filesystem::path& directory) {
+        return error.find("not writable by group or others: " + directory.string()) != std::string::npos;
+    };
+    const auto backups = root / "backups";
+    std::filesystem::create_directory(backups);
+    const BackupOptions configured{.backup_directory = backups};
+    const auto shared = backups / "shared";
     std::filesystem::create_directory(shared);
     std::filesystem::permissions(shared, std::filesystem::perms::all);
-    assert(Error([&] { (void)catalog.BackupTo(shared, {}); }).find("not writable by group or others") != std::string::npos);
+    assert(refused(Error([&] { (void)catalog.BackupTo(shared, {}); }), shared));
+    assert(refused(Error([&] { (void)catalog.BackupTo(ResolveBackupTarget(backups, "shared/daily"), configured); }), shared));
     assert(std::filesystem::is_empty(shared));
-    assert(Error([&] { (void)ResolveBackupTarget(root, "shared/daily"); }).find("not writable by group or others") != std::string::npos);
-    assert(std::filesystem::is_empty(shared));
-    std::filesystem::permissions(shared, std::filesystem::perms::owner_all | std::filesystem::perms::group_read |
-        std::filesystem::perms::group_exec | std::filesystem::perms::others_read | std::filesystem::perms::others_exec);
-    (void)catalog.BackupTo(ResolveBackupTarget(root, "shared/daily"), {});
+    const auto readable = std::filesystem::perms::owner_all | std::filesystem::perms::group_read |
+        std::filesystem::perms::group_exec | std::filesystem::perms::others_read | std::filesystem::perms::others_exec;
+    std::filesystem::permissions(shared, readable);
+    std::filesystem::permissions(backups, std::filesystem::perms::owner_all | std::filesystem::perms::group_all);
+    assert(refused(Error([&] { (void)catalog.BackupTo(ResolveBackupTarget(backups, "shared/daily"), configured); }), backups));
+    assert(refused(Error([&] { (void)catalog.BackupTo(ResolveBackupTarget(backups, "fresh"), configured); }), backups));
+    assert(std::filesystem::is_empty(shared) && !std::filesystem::exists(backups / "fresh"));
+    std::filesystem::permissions(backups, readable);
+    (void)catalog.BackupTo(ResolveBackupTarget(backups, "shared/daily"), configured);
     std::filesystem::create_directory(shared / "existing", shared);
-    (void)catalog.BackupTo(ResolveBackupTarget(root, "shared/existing"), {});
+    (void)catalog.BackupTo(ResolveBackupTarget(backups, "shared/existing"), configured);
     assert(std::filesystem::exists(shared / "daily" / kBackupMarkerName) && std::filesystem::exists(shared / "existing" / kBackupMarkerName));
+    // A root-owned 0755 directory passes the check; without root privileges
+    // the walk then stops only because it cannot create the missing child.
+    if (::geteuid() != 0) {
+        struct stat status {};
+        if (::stat("/", &status) == 0 && status.st_uid == 0 && (status.st_mode & (S_IWGRP | S_IWOTH)) == 0) {
+            const auto error = Error([&] {
+                PrepareBackupTarget(root / "source", "/" + root.filename().string() + "/backup", nullptr, "/");
+            });
+            assert(!error.empty() && error.find("not writable by group or others") == std::string::npos);
+        }
+    }
 #endif
 }
 void StagingCollisionRetainsExistingEntry() {

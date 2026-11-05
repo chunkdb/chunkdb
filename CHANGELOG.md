@@ -3,7 +3,7 @@
 ## Unreleased
 
 - A `chunks://` listener limits TLS 1.2 to ECDHE key exchange with AES-GCM or ChaCha20-Poly1305 ciphers, so every TLS 1.2 session has forward secrecy; TLS 1.3 suites and `--tls-min-version` are unchanged.
-- BACKUP TO refuses an existing destination, or an existing parent below `--backup-dir`, that is not owned by the server user or is writable by group or others on Linux and macOS, so files in a backup can be replaced only by the server user.
+- BACKUP TO refuses, on Linux and macOS, a `--backup-dir`, an existing directory below it or an existing destination that is not owned by the server user or root or is writable by group or others, checking each directory as it is opened, so only the server user or root can replace files in a backup.
 - `chunkdb_admin reset-password` refuses a backup or an incomplete restore directory before it takes the writer lock, with the error the server gives, so the backup stays restorable.
 - Bound everything before authentication by the HELLO deadline: HELLO, AUTH and all their parameter frames must arrive within `--client-io-timeout-ms` of the connection's start, where each frame used to start a timeout of its own; before authentication HELLO takes at most 12 parameters.
 - Bound verifier salts to 16 through 256 bytes in CREATE USER, ALTER USER and the users file, limit a quoted VERIFIER to 512 bytes like `VERIFIER $1`, refuse GRANT on a name that is not a valid table name, and refuse a users file with an out-of-range salt or an invalid user or table name instead of writing a salt length that does not fit its field.

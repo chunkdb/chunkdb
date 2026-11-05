@@ -196,7 +196,7 @@ Column types are defined with `CREATE TABLE` and can be changed with `ALTER TABL
 Server-created data and backup directories permit owner-only access, mode 0700 on Linux/macOS.
 New files use mode 0600 on those platforms; Windows uses protected owner-only access control lists.
 Existing users-file permissions are tightened at startup, except with `--read-only`, which logs a warning instead.
-An existing BACKUP TO destination must be owned by the server user and not writable by group or others; see [Backup](BACKUP.md).
+`--backup-dir`, existing directories below it and an existing BACKUP TO destination must be owned by the server user or root and not writable by group or others; see [Backup](BACKUP.md).
 Bind mounts must grant access to the process owner; see [Docker](DOCKER.md).
 
 TCP keepalive applies before TLS and HELLO.

@@ -1337,6 +1337,7 @@ std::string CommandEngine::ExecuteStatement(
                     const auto target = ResolveBackupTarget(config_.backup_dir, backup.path);
                     BackupOptions options;
                     options.cancelled = session.backup_cancelled;
+                    options.backup_directory = config_.backup_dir;
                     std::string reply;
                     options.before_publish = [&](const BackupResult& result) {
                         Protocol::AppendMapHeader(reply, 4);
