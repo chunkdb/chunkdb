@@ -509,7 +509,9 @@ void FeedIo::Run() {
                             server_.ReturnClient(watch.connection); returned = true;
                         }
                     }
-                    const bool ack_timeout_closed = watch.connection->session.slot_watch &&
+                    // A returned connection belongs to a worker again, which
+                    // may already be moving its session.
+                    const bool ack_timeout_closed = !returned && watch.connection->session.slot_watch &&
                         watch.connection->session.slot_watch->AckTimedOut();
                     if (!returned) server_.CloseClient(*watch.connection);
                     if (ack_timeout_closed)
