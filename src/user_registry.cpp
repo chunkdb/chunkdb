@@ -115,14 +115,21 @@ void UserRegistry::InstallLocked(Publication publication) noexcept {
     }
 }
 
-void UserRegistry::CommitLocked(Users next, Publication publication) noexcept {
+void UserRegistry::CommitLocked(Users next, Publication publication, Wakes& wakes) noexcept {
     users_ = std::move(next);
     InstallLocked(std::move(publication));
     // The view is published before the generation moves: a reader that sees
     // the new generation reads a view at least that new.
     generation_.fetch_add(1, std::memory_order_acq_rel);
-    std::lock_guard lock(listeners_mutex_);
-    std::erase_if(listeners_, [](const auto& listener) {
+    wakes.changed_ = true;
+}
+
+UserRegistry::Wakes::~Wakes() {
+    if (!changed_ || registry_ == nullptr) return;
+    // Outside the registry lock: a callback that drops the last owner of
+    // what it wakes destroys it here, not under that lock.
+    std::lock_guard lock(registry_->listeners_mutex_);
+    std::erase_if(registry_->listeners_, [](const auto& listener) {
         const auto wake = listener.lock();
         if (wake) (*wake)();
         return !wake;
@@ -142,13 +149,14 @@ std::shared_ptr<const std::function<void()>> UserRegistry::OnChange(std::functio
 }
 
 void UserRegistry::SetMigrationHealth(std::shared_ptr<MigrationHealth> health) {
+    Wakes wakes(this);
     std::lock_guard lock(mutex_);
     health->Check();
     const auto stored = ReadUsersFile(data_dir_);
     if (!stored) throw std::runtime_error("users file disappeared while binding the catalog");
     if (users_ != *stored) {
         auto publication = PrepareLocked(*stored);
-        CommitLocked(*stored, std::move(publication));
+        CommitLocked(*stored, std::move(publication), wakes);
     }
     migration_health_ = std::move(health);
 }
@@ -188,13 +196,14 @@ void UserRegistry::UpdateIf(Change&& change) {
     if (read_only_) {
         throw std::invalid_argument("users cannot change: the data directory is open read-only");
     }
+    Wakes wakes(this);
     std::lock_guard lock(mutex_);
     if (migration_health_) migration_health_->Check();
     Users next = users_;
     if (!change(next)) return;
     auto publication = PrepareLocked(next);
     WriteUsersFile(data_dir_, next);
-    CommitLocked(std::move(next), std::move(publication));
+    CommitLocked(std::move(next), std::move(publication), wakes);
 }
 
 template <typename Change>

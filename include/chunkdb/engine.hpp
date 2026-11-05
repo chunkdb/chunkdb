@@ -183,6 +183,9 @@ struct SessionState {
     // dropped, even when a user of that name is created again.
     std::shared_ptr<const User> user_rights;
     std::uint64_t user_generation = 0;
+    // The registry generation at which the published rights view last
+    // showed that user, at that incarnation.
+    std::uint64_t user_present_generation = 0;
     // READ of that user on the table of the open watch, which the feed checks
     // while it streams; null without users.
     std::shared_ptr<ReadRightCheck> watch_right;

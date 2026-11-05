@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- Apply rights changes to open watches and to sessions of dropped users: a watch ends with NO_TABLE as soon as its user loses READ on the table, before any later push and without accepting a later ACK; a session whose user was dropped answers its next statement, push or ACK with `AUTH_REQUIRED reason=user_dropped` and closes, and a user created again under the same name gives it no rights and cannot have its password changed by it.
+- Apply rights changes to open watches and to sessions of dropped users: a watch ends as soon as its user loses READ on the table, with a best-effort NO_TABLE, before any later push and without accepting a later ACK; when a user is dropped, its open watches end at once with a best-effort `AUTH_REQUIRED reason=user_dropped`, its other sessions answer their next statement with that error, and each connection closes; a user created again under the same name gives those sessions no rights, and they cannot change its password.
 - Bound verifier salts to 16 through 256 bytes in CREATE USER, ALTER USER and the users file, limit a quoted VERIFIER to 512 bytes like `VERIFIER $1`, refuse GRANT on a name that is not a valid table name, and refuse a users file with an out-of-range salt or an invalid user or table name instead of writing a salt length that does not fit its field.
 - Add matched-subscriber budget comparisons with `chunkdb_budget_compare --watch-both TABLE[:N][:slots]` and require a control with the same subscriber settings (#140).
 - Add extensible reply metadata, exact unsigned revisions, HELLO options, persistent watch filters, ACK deadlines, takeover, lineage, and explicit feature activation (#69).

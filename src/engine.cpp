@@ -383,7 +383,17 @@ std::string CommandEngine::LostWatchReply(bool user_dropped, const std::string& 
 }
 
 std::string CommandEngine::LostUserReply(SessionState& session) const {
-    if (!config_.require_auth || !session.greeted || CurrentUser(session) != nullptr) return {};
+    if (!config_.require_auth || !session.greeted) return {};
+    // One atomic load while the users are unchanged; after a change, the
+    // published view, never the registry lock a change holds while it syncs.
+    const std::uint64_t generation = config_.users->Generation();
+    if (session.user_present_generation == generation) return {};
+    const auto rights = config_.users->Rights();
+    const auto found = rights->users.find(session.user);
+    if (found != rights->users.end() && found->second.incarnation == session.user_incarnation) {
+        session.user_present_generation = generation;
+        return {};
+    }
     session.close_after_reply = true;
     return ErrorReply(UserDroppedError());
 }

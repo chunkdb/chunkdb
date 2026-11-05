@@ -109,6 +109,9 @@ void FeedIo::WakeCatchUp() noexcept {
 }
 void FeedIo::Wake() noexcept {
     WakeCatchUp();
+    WakePoll();
+}
+void FeedIo::WakePoll() noexcept {
     if (signaled_.exchange(true, std::memory_order_acq_rel)) return;
     const char byte = 1;
     for (;;) {

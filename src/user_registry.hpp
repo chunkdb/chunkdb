@@ -65,9 +65,24 @@ class UserRegistry {
         std::map<std::string, Entry> users;
     };
     [[nodiscard]] std::shared_ptr<const RightsView> Rights() const;
-    // Runs `wake` after every change while the returned handle is held.
-    // It runs under the registry lock: it must not block or use the users.
+    // Runs `wake` after every change while the returned handle is held,
+    // once the registry lock is released. It must not block or change users.
     [[nodiscard]] std::shared_ptr<const std::function<void()>> OnChange(std::function<void()> wake);
+    // Runs the OnChange callbacks of the changes committed while it lives as
+    // it goes out of scope: declared before the registry lock is taken, it
+    // runs them after that lock is released.
+    class Wakes {
+      public:
+        explicit Wakes(UserRegistry* registry) noexcept : registry_(registry) {}
+        Wakes(const Wakes&) = delete;
+        Wakes& operator=(const Wakes&) = delete;
+        ~Wakes();
+
+      private:
+        friend class UserRegistry;
+        UserRegistry* const registry_;
+        bool changed_ = false;
+    };
 
     // Each throws std::invalid_argument for a change the rules refuse: an
     // existing or unknown user, a bad name, removing the last user who
@@ -113,9 +128,9 @@ class UserRegistry {
     };
     [[nodiscard]] Publication PrepareLocked(const Users& next) const;
     void InstallLocked(Publication publication) noexcept;
-    // Under mutex_: makes `next` current, moves the generation past it and
-    // runs every OnChange.
-    void CommitLocked(Users next, Publication publication) noexcept;
+    // Under mutex_: makes `next` current and moves the generation past it;
+    // `wakes` runs every OnChange once the lock is released.
+    void CommitLocked(Users next, Publication publication, Wakes& wakes) noexcept;
 
     const std::filesystem::path data_dir_;
     const bool read_only_;

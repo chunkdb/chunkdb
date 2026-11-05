@@ -170,7 +170,7 @@ void ChunkServer::StartWorkers() {
     { std::lock_guard lock(lifecycle_mutex_); feed_io_ = io; }
     if (const auto& users = engine_->users())
         users_changed_ = users->OnChange([weak = std::weak_ptr<FeedIo>(io)] {
-            if (auto feed = weak.lock()) feed->Wake();
+            if (auto feed = weak.lock()) feed->WakePoll();
         });
     io->Start();
     workers_.reserve(config_.worker_threads);

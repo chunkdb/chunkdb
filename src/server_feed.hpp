@@ -26,6 +26,9 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     void Start();
     void Stop();
     void Wake() noexcept;
+    // Only the poll loop, without a catch-up sweep of the slot watches: for
+    // a change that only the poll loop acts on, such as a rights change.
+    void WakePoll() noexcept;
     bool Add(std::shared_ptr<ServerConnection> connection);
     bool RegisterSlot(std::shared_ptr<SlotWatch> state);
   private:

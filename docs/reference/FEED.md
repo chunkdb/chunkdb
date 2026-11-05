@@ -127,8 +127,8 @@ UNWATCH
 | INVALID_ARGUMENT | ACK exceeds the last fully delivered position. | Acknowledge only processed events. |
 | INVALID_ARGUMENT | You run WATCH, CREATE SLOT or DROP SLOT on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | PROTOCOL | You send another statement while streaming. | Use a separate connection. |
-| NO_TABLE | The table is absent, inaccessible, or dropped, or your READ on it was revoked while watching. | Check the table and access. |
-| AUTH_REQUIRED reason=user_dropped | Your user was dropped while watching; the connection closes. | Log in again as an existing user. |
+| NO_TABLE | The table is absent, inaccessible, or dropped, or your READ on it was revoked while watching (sent best-effort before the connection closes). | Check the table and access. |
+| AUTH_REQUIRED reason=user_dropped | Your user was dropped while watching; sent best-effort, and the connection closes. | Log in again as an existing user. |
 | INTERNAL | The watched table was fenced or recovered. | Watch it again after [RECOVER TABLE](TABLES.md#notes), from your saved position. |
 
 ## Notes

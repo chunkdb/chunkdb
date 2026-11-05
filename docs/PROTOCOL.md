@@ -180,7 +180,7 @@ Tag and txn are null until their metadata is present.
 Slot ownership permits one watch; a competing watch receives SLOT_BUSY and a lost slot receives SLOT_LOST.
 
 DROP TABLE ends watches with NO_TABLE; a fenced or recovered table ends them with INTERNAL, and a new WATCH resumes; watches have no idle timeout.
-Losing READ on the table ends a watch with NO_TABLE; a dropped user ends it with `AUTH_REQUIRED reason=user_dropped`; see [users](USERS.md#rights).
+Losing READ on the table ends a watch with a best-effort NO_TABLE, and a dropped user with a best-effort `AUTH_REQUIRED reason=user_dropped`; the connection closes either way; see [users](USERS.md#rights).
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 
 ## Errors and URIs

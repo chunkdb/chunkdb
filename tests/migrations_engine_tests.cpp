@@ -459,6 +459,31 @@ void RightCheckDuringUserMigration() {
     assert(prompt && checked.get() == ReadRightCheck::State::kNoRight);
 }
 
+// Every statement checks that the session's user still exists from the
+// published rights view: a PING completes while a migration holds the
+// registry lock across its journal writes.
+void PingDuringUserMigration() {
+    test::ScopedTempDir dir("chunkdb-migrations-ping");
+    Engine e(dir.path(), true);
+    Reply(e.Run(kCreate), "+OK\r\n");
+    e.users->Create("limited", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
+    SessionState limited;
+    assert(test::LoginOnEngine(*e.engine, limited, "limited", "pw").front() == '%');
+    Reply(e.engine->Execute(limited, "PING\r\n"), "+PONG\r\n");
+    e.users->Grant("limited", "realm", Right::kRead);
+    Pause pause;
+    e.catalog->SetMigrationTestHook(&pause);
+    auto migration = std::async(std::launch::async, [&] { return e.Run("MIGRATE 'grant' GRANT WRITE ON realm TO admin"); });
+    pause.WaitPrepared();
+    auto ping = std::async(std::launch::async, [&] { return e.engine->Execute(limited, "PING\r\n"); });
+    const bool prompt = ping.wait_for(10s) == std::future_status::ready;
+    pause.Release();
+    Reply(migration.get(), "+applied\r\n");
+    e.catalog->SetMigrationTestHook(nullptr);
+    assert(prompt);
+    Reply(ping.get(), "+PONG\r\n");
+}
+
 void RebindRecoveredUsers() {
     test::ScopedTempDir dir("chunkdb-migrations-users-rebind");
     std::shared_ptr<UserRegistry> reused;
@@ -468,9 +493,11 @@ void RebindRecoveredUsers() {
         reused->Create("limited", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
         txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE", "1");
         Error(e.Run("MIGRATE 'grant' GRANT WRITE ON realm TO limited"), "OUTCOME_UNKNOWN");
+        // Decided before completion failed: memory already holds the change.
+        assert(reused->Find("limited")->grants.at("realm") == Right::kWrite);
     }
-    // Both an existing registry and one read before catalog recovery hold the
-    // previous users file. Binding must reload the committed recovery image.
+    // A registry read before catalog recovery holds the previous users file.
+    // Binding must reload the committed recovery image.
     const auto before = test::MakeUsers(dir.path(), "admin", "admin-password");
     assert(!before->Find("limited")->grants.contains("realm"));
     auto catalog = std::make_shared<TableCatalog>(Config(dir.path()));
@@ -615,6 +642,6 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
     ConditionalDdl(); ConditionalColumnsRefusePoisonedStore(); ConditionalJournalValidationAndRecovery();
-    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RightCheckDuringUserMigration(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
+    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RightCheckDuringUserMigration(); PingDuringUserMigration(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
     LedgerLimit(false); LedgerLimit(true);
 }
