@@ -370,6 +370,33 @@ void RecordedNamesFollowRights() {
 }
 
 
+// A recorded statement that no longer parses is listed and replayed only with
+// ADMIN on `*`; other callers see neither it nor its text.
+void UnparseableRecordNeedsEveryTable() {
+    test::ScopedTempDir dir("chunkdb-migrations-unparseable");
+    Engine e(dir.path(), true);
+    e.users->Create("owner", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
+    e.users->Grant("owner", "own", Right::kAdmin);
+    Reply(e.Run("MIGRATE 'create_own' CREATE TABLE own (v u8) CHUNK 2 x 2"), "+applied\r\n");
+    auto records = ReadMigrationRecords(dir.path());
+    records.push_back({"hidden", records.front().applied_ms, "admin", "ALTER TABLE own SECRET own_text"});
+    const auto bytes = EncodeMigrationRecords(ReadDataDirManifest(dir.path())->data_dir_id, records);
+    {
+        std::ofstream out(dir.path() / kMigrationsFileName, std::ios::binary | std::ios::trunc);
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    SessionState owner;
+    assert(test::LoginOnEngine(*e.engine, owner, "owner", "pw").front() == '%');
+    const auto shown = e.engine->Execute(owner, "SHOW MIGRATIONS");
+    assert(shown.rfind("*1\r\n", 0) == 0 && shown.find("own_text") == std::string::npos);
+    const auto refused = e.engine->Execute(owner, "MIGRATE 'hidden' ALTER TABLE own ADD COLUMN flag u8 NULL");
+    Error(refused, "PERMISSION_DENIED");
+    assert(refused.find("own_text") == std::string::npos);
+    assert(e.Run("SHOW MIGRATIONS").find("own_text") != std::string::npos);
+    Error(e.Run("MIGRATE 'hidden' ALTER TABLE own ADD COLUMN flag u8 NULL"), "MIGRATION_MISMATCH");
+}
+
+
 struct Pause : MigrationTestHook {
     std::mutex mutex;
     std::condition_variable cv;
@@ -643,6 +670,6 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
     ConditionalDdl(); ConditionalColumnsRefusePoisonedStore(); ConditionalJournalValidationAndRecovery();
-    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); RecordedNamesFollowRights(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
+    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); RecordedNamesFollowRights(); UnparseableRecordNeedsEveryTable(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
     LedgerLimit(false); LedgerLimit(true);
 }

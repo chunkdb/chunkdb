@@ -599,10 +599,17 @@ bool HasColumn(const TableSchema& schema, std::string_view name) {
 // A recorded migration belongs to what its statement changes: ADMIN on the
 // table it names, or MANAGES USERS for GRANT and REVOKE. Only a caller with
 // that right sees the record or learns whether its name skips or conflicts.
+// A recorded statement that no longer parses needs ADMIN on `*`.
 bool MayReplayMigration(bool require_auth, const User* user, const MigrationRecord& record) {
     if (!require_auth) return true;
     if (user == nullptr) return false;
-    const auto parsed = cql::Parse(record.statement);
+    cql::Parsed parsed;
+    try {
+        parsed = cql::Parse(record.statement);
+    } catch (const cql::ParseError&) {
+        const auto right = RightOn(*user, std::string(kEveryTable));
+        return right.has_value() && *right >= Right::kAdmin;
+    }
     if (std::holds_alternative<cql::GrantRight>(parsed.statement)) return user->manages_users;
     const auto table = std::visit([](const auto& inner) -> std::string {
         using T = std::decay_t<decltype(inner)>;

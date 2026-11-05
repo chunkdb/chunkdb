@@ -59,6 +59,7 @@ SHOW MIGRATIONS
 
 Migration names are shared by all tables and users; give each application's names a distinct prefix.
 A record is within your rights when you have ADMIN on the table its statement names, or MANAGES USERS for GRANT and REVOKE.
+A record whose statement this server cannot parse is within your rights only with ADMIN on `*`.
 Rights are checked before an existing name returns skipped or conflict.
 A name recorded outside your rights returns PERMISSION_DENIED whatever statement you submit, without its statement.
 With `--auth none`, every record is within your rights.
