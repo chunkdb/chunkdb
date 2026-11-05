@@ -57,6 +57,7 @@ std::vector<MigrationRecord> TableCatalog::Migrations() const {
 
 bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users) {
     RequireWritable("MIGRATE");
+    if (request.kind == MigrationRequest::Kind::kGrant && !request.revoke) RequireValidGrantTable(request.table);
     if (!feature_metadata_gate_.lock_shared(request.cancelled)) throw std::runtime_error("migration cancelled");
     std::shared_lock feature_metadata(feature_metadata_gate_, std::adopt_lock);
     if (config_.allow_multiple_processes) throw std::invalid_argument("MIGRATE requires a single-process catalog");

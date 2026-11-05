@@ -259,6 +259,7 @@ void UserRegistry::Drop(const std::string& name, bool if_exists) {
 }
 
 void UserRegistry::Grant(const std::string& name, const std::string& table, Right right) {
+    RequireValidGrantTable(table);
     Update([&](Users& users) {
         auto& grants = Existing(users, name).grants;
         const auto found = grants.find(table);
