@@ -981,13 +981,17 @@ class TlsClient {
             connected = SSL_connect(session_);
         } while (connected != 1 && TimedOut(connected));
         if (connected != 1) {
+            // SSL_ERROR_SSL: the handshake itself failed, such as on a TLS alert.
+            const int failure = SSL_get_error(session_, connected);
+            const char* reason = ERR_reason_error_string(ERR_peek_last_error());
             SSL_free(session_);
             session_ = nullptr;
             CloseSocket(socket_);
             socket_ = kInvalidSocket;
             SSL_CTX_free(context_);
             context_ = nullptr;
-            throw std::runtime_error("failed to complete TLS client handshake");
+            throw std::runtime_error("failed to complete TLS client handshake: ssl_error=" + std::to_string(failure) +
+                                     " " + (reason != nullptr ? reason : "unknown"));
         }
     }
 
@@ -3326,14 +3330,26 @@ void TestTls12CipherList() {
     auto server_cfg = BaseServerConfig();
     server_cfg.tls_enabled = true;
     ServerHarness harness("tls-ciphers", BaseStoreConfig(), engine_cfg, server_cfg);
-    bool refused = false;
+    // The connection must reach the handshake and fail there, not before. On
+    // a system whose crypto policy already disables static RSA key exchange,
+    // this passes without the server's cipher list.
+    std::string refusal;
     try {
         TlsClient weak("127.0.0.1", harness.port, TLS1_2_VERSION, {}, "AES128-SHA");
-    } catch (const std::runtime_error&) {
-        refused = true;
+    } catch (const std::runtime_error& error) {
+        refusal = error.what();
     }
-    assert(refused);
-    for (const auto* cipher : {"ECDHE-RSA-AES128-GCM-SHA256", "ECDHE-RSA-AES256-GCM-SHA384", "ECDHE-RSA-CHACHA20-POLY1305"}) {
+    assert(refusal.rfind("failed to complete TLS client handshake: ssl_error=" + std::to_string(SSL_ERROR_SSL) + " ", 0) == 0);
+    std::vector<std::string> ciphers{"ECDHE-RSA-AES128-GCM-SHA256", "ECDHE-RSA-AES256-GCM-SHA384"};
+    {
+        // ChaCha20-Poly1305 only where the linked OpenSSL offers it.
+        SSL_CTX* probe = SSL_CTX_new(TLS_client_method());
+        assert(probe != nullptr);
+        if (SSL_CTX_set_cipher_list(probe, "ECDHE-RSA-CHACHA20-POLY1305") == 1) ciphers.emplace_back("ECDHE-RSA-CHACHA20-POLY1305");
+        SSL_CTX_free(probe);
+        ERR_clear_error();
+    }
+    for (const auto& cipher : ciphers) {
         TlsClient client("127.0.0.1", harness.port, TLS1_2_VERSION, {}, cipher);
         assert(client.Version() == TLS1_2_VERSION && client.Cipher() == cipher);
         client.Login();
