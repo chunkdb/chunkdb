@@ -299,6 +299,12 @@ bool ChunkServer::HandleClient(
             &termination,
             set_recv_timeout);
     };
+    // Parameter frames share the deadline of their request line, so each
+    // wait for one ends by it, even with nothing buffered.
+    auto read_frame_line = [&](std::string& out) -> bool {
+        return set_recv_timeout(ReadWaitMs(&request_line_deadline, config_.client_io_timeout_ms), "partial_request") &&
+            read_line(out);
+    };
     auto write_all = [&](const std::string& data, ConnectionTermination* write_termination) -> bool {
         const PhaseDeadline write_deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(config_.client_io_timeout_ms);
@@ -414,9 +420,6 @@ bool ChunkServer::HandleClient(
             bool frame_total_too_large = false;
             const auto total_limit = discard ? config_.max_unparsed_parameter_bytes : payload_request.parameter_bytes_limit;
             try {
-                if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
-                    break;
-                }
                 const ParameterFrameRules rules{
                     .frame_count = discard ? payload_request.frame_count : payload_request.parameter_limits.size(),
                     .limits = payload_request.parameter_limits,
@@ -426,7 +429,7 @@ bool ChunkServer::HandleClient(
                     .rejections = &payload_request.parameter_rejections,
                     .opaque_limit = config_.max_unparsed_parameter_bytes,
                 };
-                frames_ok = ReadParameterFrames(rules, &parameters, read_line, read_bytes, &frame_total_too_large, &payload_rejection);
+                frames_ok = ReadParameterFrames(rules, &parameters, read_frame_line, read_bytes, &frame_total_too_large, &payload_rejection);
             } catch (const std::exception& e) {
                 reject_and_close(Protocol::Error("PROTOCOL", e.what()), e.what());
                 break;
@@ -440,11 +443,18 @@ bool ChunkServer::HandleClient(
                 break;
             }
             if (!frames_ok) {
-                (void)write_all(Protocol::Error("PROTOCOL", "incomplete parameter frame"), nullptr);
-                log_termination(termination);
+                // Before HELLO the request deadline is the HELLO deadline.
+                if (!session.greeted && termination.reason == "timeout") {
+                    refuse_late_hello();
+                } else {
+                    (void)write_all(Protocol::Error("PROTOCOL", "incomplete parameter frame"), nullptr);
+                    log_termination(termination);
+                }
                 break;
             }
         }
+        // The request is complete: the next one gets a deadline of its own.
+        request_line_deadline = std::nullopt;
 
         std::string response = discard ? engine_->RejectPayload(session, line, payload_request.reject_response) :
             !payload_rejection.empty() ? engine_->RejectPayload(session, line, std::move(payload_rejection)) :

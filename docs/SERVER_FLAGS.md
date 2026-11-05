@@ -12,7 +12,7 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--port` | `4242` | TCP port, 1–65535. |
 | `--listen-uri` | unset | `chunk://host:port/` or `chunks://host:port/`; sets address, port and TLS at this point in argument order; a username is refused. |
 | `--workers` | CPU thread count, or 4 | Connections served at once; a connection holds a worker until it closes or reaches the idle timeout, and a WATCH releases it. |
-| `--client-io-timeout-ms` | `5000` | 1–86400000 ms for handshake, HELLO, an active request or a complete reply write. |
+| `--client-io-timeout-ms` | `5000` | 1–86400000 ms for handshake, HELLO, a complete request (its line and all its parameter frames, from the first byte) or a complete reply write. |
 | `--idle-connection-timeout-ms` | `60000` | 1–86400000 ms between requests; before HELLO the smaller I/O/idle timeout applies. |
 | `--max-pending-clients` | `1024` | Accepted clients waiting for a worker; overflow is refused. |
 | `--max-handshakes-per-ip` | `64` | Connections from an IPv4 address or IPv6 /64 occupying workers before HELLO; exceeding the limit is refused. `0` disables the limit. |

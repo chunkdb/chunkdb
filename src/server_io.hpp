@@ -214,6 +214,11 @@ void SendPlainBusyResponse(
     std::size_t timeout_ms,
     std::string_view reason = "pending client queue full");
 
+// Whether `deadline` is set and has been reached.
+inline bool DeadlinePassed(const PhaseDeadline* deadline) {
+    return deadline != nullptr && deadline->has_value() && std::chrono::steady_clock::now() >= **deadline;
+}
+
 // The receive wait for the next piece of a request: `fallback_ms`, cut to
 // end at `deadline` when one is set (rounded up, at least 1 ms), so a request
 // cannot outlast its deadline by a whole wait.
@@ -238,6 +243,12 @@ inline ConnectionTermination MakeReadTimeoutTermination(
     return MakeSocketTermination("read", socket_error_code, true);
 }
 
+// Reads one LF-terminated line into `out`. `*absolute_deadline` is the
+// deadline of the request the line belongs to: set to now +
+// partial_timeout_ms when the first byte is there and the deadline is unset,
+// never cleared here, so a request line and its parameter frames share it
+// until the caller clears it after the whole request. No wait starts after
+// it; with nothing buffered the caller's receive timeout applies to the wait.
 template <typename EnsureRecvTimeoutFn>
 bool ReadLinePlain(
     SocketHandle socket_fd,
@@ -258,15 +269,19 @@ bool ReadLinePlain(
     }
 
     if (pending.extract_line(&out, max_line_bytes)) {
-        if (absolute_deadline != nullptr) {
-            *absolute_deadline = std::nullopt;
-        }
         return true;
     }
 
     std::array<char, 4096> buffer{};
     while (true) {
-        // Inside a line, each wait ends by the line's deadline.
+        // No wait starts at or after the request's deadline.
+        if (DeadlinePassed(absolute_deadline)) {
+            if (termination != nullptr) {
+                *termination = MakePhaseDeadlineTermination("read", "request line deadline exceeded");
+            }
+            return false;
+        }
+        // Inside a line, each wait ends by the request's deadline.
         if (!pending.empty() &&
             !ensure_recv_timeout(ReadWaitMs(absolute_deadline, partial_timeout_ms), "partial_request")) {
             return false;
@@ -317,27 +332,16 @@ bool ReadLinePlain(
         }
 
         if (pending.extract_line(&out, max_line_bytes)) {
-            if (absolute_deadline != nullptr) {
-                *absolute_deadline = std::nullopt;
-            }
             return true;
         }
-
-        if (absolute_deadline != nullptr && absolute_deadline->has_value() &&
-            std::chrono::steady_clock::now() >= *absolute_deadline) {
-            if (termination != nullptr) {
-                *termination = MakePhaseDeadlineTermination("read", "request line deadline exceeded");
-            }
-            return false;
-        }
-
     }
 }
 
 // Reads exactly `total` raw bytes (a CHUNKPUT payload) into `out`, first
 // draining anything already buffered from the request line read. Unlike
 // ReadLinePlain this never applies max_line_bytes: the caller has already
-// bounded `total` through CommandEngine::PlanPayload.
+// bounded `total` through CommandEngine::PlanPayload. `*absolute_deadline`
+// is shared with the request as for ReadLinePlain.
 template <typename EnsureRecvTimeoutFn>
 bool ReadBytesPlain(
     SocketHandle socket_fd,
@@ -361,6 +365,12 @@ bool ReadBytesPlain(
     (void)pending.extract_bytes(total, &out);
     std::array<char, 4096> buffer{};
     while (out.size() < total) {
+        if (DeadlinePassed(absolute_deadline)) {
+            if (termination != nullptr) {
+                *termination = MakePhaseDeadlineTermination("read", "payload deadline exceeded");
+            }
+            return false;
+        }
         if (!ensure_recv_timeout(ReadWaitMs(absolute_deadline, partial_timeout_ms), "partial_request")) {
             return false;
         }
@@ -392,19 +402,6 @@ bool ReadBytesPlain(
 
         pending.append(buffer.data(), static_cast<std::size_t>(read));
         (void)pending.extract_bytes(total - out.size(), &out);
-
-        if (absolute_deadline != nullptr && absolute_deadline->has_value() &&
-            std::chrono::steady_clock::now() >= *absolute_deadline) {
-            if (termination != nullptr) {
-                *termination = MakePhaseDeadlineTermination("read", "payload deadline exceeded");
-            }
-            return false;
-        }
-
-    }
-
-    if (absolute_deadline != nullptr) {
-        *absolute_deadline = std::nullopt;
     }
     return true;
 }

@@ -2190,6 +2190,113 @@ void TestHelloDeadlineEndsAPartialLine() {
     }
 }
 
+// `HELLO 3 WITH o1=$1,...,oN=$N`: N unknown options, each with a frame.
+std::string HelloWithOptionFrames(unsigned count) {
+    std::string line = "HELLO 3 WITH ";
+    for (unsigned i = 1U; i <= count; ++i) {
+        line += (i == 1U ? "o" : ",o") + std::to_string(i) + "=$" + std::to_string(i);
+    }
+    return line + "\r\n";
+}
+
+// A request line and its parameter frames share one deadline: frames that
+// each arrive well within the I/O timeout, but together take longer, end
+// the request. Before HELLO that deadline is the HELLO deadline. The server
+// closes while frames are still being sent, so its log tells why and when.
+template <typename Client>
+void CheckTrickledFramesAreBounded(std::uint16_t port, std::size_t io_timeout_ms) {
+    const auto trickle = [](Client& client, const std::string& frame, unsigned count) {
+        return std::thread([&client, frame, count] {
+            for (unsigned i = 0U; i < count; ++i) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                try {
+                    client.SendBytes(frame);
+                } catch (const std::exception&) {
+                    return;  // closed by the server
+                }
+            }
+        });
+    };
+    const auto io_timeout = std::chrono::milliseconds(io_timeout_ms);
+    {
+        ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+        const auto start = Clock::now();
+        Client client("127.0.0.1", port);
+        client.SendBytes(HelloWithOptionFrames(12U));
+        auto sender = trickle(client, "$-1\r\n", 12U);
+        const bool refused = logs.WaitContains("HELLO 3 was not completed within the I/O timeout", std::chrono::seconds(3));
+        const auto elapsed = Clock::now() - start;
+        sender.join();
+        assert(refused);
+        assert(elapsed >= io_timeout && elapsed < io_timeout + std::chrono::milliseconds(600));
+        // A frame that arrives as the server closes turns the close into a
+        // reset, which may discard the reply.
+        try {
+            assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol HELLO 3 was not completed within the I/O timeout\r\n");
+        } catch (const std::runtime_error&) {
+        }
+    }
+    Client client("127.0.0.1", port);
+    client.Hello();
+    client.SendLine("CREATE TABLE trickle (c1 text(8), c2 text(8), c3 text(8), c4 text(8), c5 text(8), c6 text(8), "
+                    "c7 text(8), c8 text(8), c9 text(8), c10 text(8), c11 text(8), c12 text(8), marker u8) CHUNK 4 x 4");
+    const auto created = client.ReadLine();
+    if (created != "+OK\r\n") throw std::runtime_error("create trickle table: " + created);
+    std::string set = "SET BLOCK 0 0 IN trickle ";
+    std::string frames;
+    for (unsigned i = 1U; i <= 12U; ++i) {
+        set += (i == 1U ? "c" : ", c") + std::to_string(i) + " = $" + std::to_string(i);
+        frames += "$1\r\nx\r\n";
+    }
+    set += "\r\n";
+    // Each request has a deadline of its own, however long the connection
+    // waited between requests.
+    for (int i = 0; i < 2; ++i) {
+        if (i != 0) std::this_thread::sleep_for(io_timeout * 2);
+        client.SendBytes(set + frames);
+        assert(client.ReadLine().front() == ':');
+    }
+    client.SendLine("PING");
+    assert(client.ReadLine() == "+PONG\r\n");
+    {
+        ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+        const auto start = Clock::now();
+        client.SendBytes(set);
+        auto sender = trickle(client, "$1\r\nx\r\n", 12U);
+        const bool ended = logs.WaitContains("phase=read reason=timeout", std::chrono::seconds(3));
+        const auto elapsed = Clock::now() - start;
+        sender.join();
+        assert(ended);
+        assert(elapsed >= io_timeout && elapsed < io_timeout + std::chrono::milliseconds(600));
+        try {
+            assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol incomplete parameter frame\r\n");
+        } catch (const std::runtime_error&) {
+        }
+    }
+    // The single worker is free again.
+    Client fast("127.0.0.1", port);
+    fast.Hello();
+    fast.SendLine("PING");
+    assert(fast.ReadLine() == "+PONG\r\n");
+}
+
+void TestTrickledFramesAreBounded() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 300;
+    server_cfg.idle_connection_timeout_ms = 10000;
+    {
+        ServerHarness harness("trickled-frames", BaseStoreConfig(), engine_cfg, server_cfg);
+        CheckTrickledFramesAreBounded<RawClient>(harness.port, server_cfg.client_io_timeout_ms);
+    }
+#ifdef CHUNKDB_WITH_OPENSSL
+    server_cfg.tls_enabled = true;
+    ServerHarness tls("trickled-frames-tls", BaseStoreConfig(), engine_cfg, server_cfg);
+    CheckTrickledFramesAreBounded<TlsClient>(tls.port, server_cfg.client_io_timeout_ms);
+#endif
+}
+
 // With max_handshakes_per_ip, one source holds at most that many workers
 // before HELLO; another connection gets -ERR BUSY at once, and HELLO frees
 // a slot.
@@ -2556,6 +2663,25 @@ void CheckMalformedHelloRecovery(std::uint16_t port) {
 
 template <typename Client>
 void CheckHelloNegotiation(std::uint16_t port) {
+    {
+        // Twelve parameter frames, the most HELLO carries before authentication.
+        Client most("127.0.0.1", port);
+        std::string frames;
+        for (unsigned i = 0U; i < 12U; ++i) frames += "$-1\r\n";
+        most.SendBytes(HelloWithOptionFrames(12U) + frames + "PING\r\n");
+        const auto hello = ReadHelloReply(most);
+        assert(hello.at("protocol") == "3" && hello.at("not_applied") == "%12");
+        assert(most.ReadLine() == "+PONG\r\n");
+    }
+    {
+        // One more is refused before any frame is read.
+        Client too_many("127.0.0.1", port);
+        too_many.SendBytes(HelloWithOptionFrames(13U));
+        assert(too_many.ReadLine() == "-ERR PROTOCOL reason=protocol HELLO takes at most 12 parameters\r\n");
+        if constexpr (requires { too_many.WaitForClose(std::chrono::seconds(2)); })
+            assert(too_many.WaitForClose(std::chrono::seconds(2)));
+        else assert(too_many.WaitForRawClose(std::chrono::seconds(2)));
+    }
     {
         Client known_duplicate("127.0.0.1", port);
         for (unsigned attempt = 0U; attempt < 4U; ++attempt) {
@@ -5691,6 +5817,7 @@ int main(int argc, char** argv) {
         run("TestUnterminatedLineIsNotExecuted", TestUnterminatedLineIsNotExecuted);
         run("TestHandshakeIsBounded", TestHandshakeIsBounded);
         run("TestHelloDeadlineEndsAPartialLine", TestHelloDeadlineEndsAPartialLine);
+        run("TestTrickledFramesAreBounded", TestTrickledFramesAreBounded);
         run("TestHandshakesPerIpAreLimited", TestHandshakesPerIpAreLimited);
         run("TestAreaReplyIsBounded", TestAreaReplyIsBounded);
         run("TestTimeoutsAreBounded", TestTimeoutsAreBounded);

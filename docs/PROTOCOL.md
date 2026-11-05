@@ -10,6 +10,8 @@ TCP uses `chunk://`; TLS uses `chunks://` with certificate validation in the cli
 Lines end with LF or CRLF; a line cut off at end of stream is never executed.
 The terminator counts toward `--max-line-bytes` (65536 by default); overflow sends BAD_REQUEST and closes.
 Binary parameter frames do not count toward that line limit.
+A request line and its parameter frames must arrive within `--client-io-timeout-ms` of the request's first byte, or the connection closes.
+HELLO, with AUTH and their frames, must succeed within `--client-io-timeout-ms` of the connection's start, after any TLS handshake; a later one receives PROTOCOL and closes.
 
 The first line must be HELLO 3; a different version or statement receives PROTOCOL and closes without execution.
 `HELLO 3` alone is accepted only under `--auth none`; otherwise it receives AUTH_REQUIRED.
@@ -52,6 +54,7 @@ A second HELLO receives PROTOCOL.
 Append `WITH client_name='name',statement_timeout_ms=0,default_tag=x'00'` to HELLO to request session options.
 Keys are case-insensitive; duplicates and invalid known values receive INVALID_ARGUMENT without counting as authentication failures.
 Unknown keys are accepted and reported with `reason=unknown_option`.
+Before authentication HELLO takes at most 12 parameters; a HELLO with more receives PROTOCOL and closes without its frames being read.
 
 Only `client_name` currently applies; timeout and tag values are stored with `reason=implementation_pending` until their capabilities appear.
 The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, and `lineage`.

@@ -83,9 +83,6 @@ bool ReadLineTls(
     }
 
     if (pending.extract_line(&out, max_line_bytes)) {
-        if (absolute_deadline != nullptr) {
-            *absolute_deadline = std::nullopt;
-        }
         return true;
     }
 
@@ -124,9 +121,6 @@ bool ReadLineTls(
         }
 
         if (pending.extract_line(&out, max_line_bytes)) {
-            if (absolute_deadline != nullptr) {
-                *absolute_deadline = std::nullopt;
-            }
             return true;
         }
 
@@ -198,9 +192,6 @@ bool ReadBytesTls(
         }
     }
 
-    if (absolute_deadline != nullptr) {
-        *absolute_deadline = std::nullopt;
-    }
     return true;
 }
 
