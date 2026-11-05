@@ -28,7 +28,8 @@ A connection closes after 5 failed HELLO or AUTH attempts.
 A source address is an IPv4 address or an IPv6 /64.
 After 5 AUTH_FAILED replies to one source address, that address is banned for 1 second, and each further failure from it bans it again.
 A banned address receives `RATE_LIMITED reason=auth_ban retry_after_ms=...` and its connection closes; the reply that starts a ban and replies during a ban are delayed by 50 ms.
-A successful login from the address clears its failures.
+A successful login from the address clears only the failures of its own user name; failures for other names, existing or not, stay counted.
+An address tracks failures separately for at most 8 names at a time; failures for further names are cleared by no login.
 
 A second HELLO receives PROTOCOL.
 

@@ -16,6 +16,8 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/change_feed.hpp"
@@ -238,6 +240,9 @@ class CommandEngine {
   private:
     struct IpAuthFailureState {
         std::size_t failures = 0;
+        // The part of `failures` per attempted user name; a login clears only
+        // its own name's part. Failures of other names stay counted.
+        std::vector<std::pair<std::string, std::size_t>> failures_by_user;
         std::chrono::steady_clock::time_point banned_until{};
         std::chrono::steady_clock::time_point last_update{};
     };
@@ -292,8 +297,8 @@ class CommandEngine {
     // source (empty when not banned), a failed login (AUTH_FAILED), and a
     // successful one.
     [[nodiscard]] std::string AuthBanReply(SessionState& session);
-    [[nodiscard]] std::string RecordAuthFailure(SessionState& session);
-    void RecordAuthSuccess(SessionState& session);
+    [[nodiscard]] std::string RecordAuthFailure(SessionState& session, std::string_view user);
+    void RecordAuthSuccess(SessionState& session, std::string_view user);
 
     // Rights (engine_cql.cpp, docs/design/USERS_DESIGN.md). Each throws
     // TableNotFoundError when the user has no right at all on the table, so
