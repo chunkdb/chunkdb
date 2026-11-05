@@ -585,6 +585,13 @@ std::string CommandEngine::RecordAuthFailure(SessionState& session, std::string_
             it = auth_failures_by_ip_.try_emplace(failure_key).first;
         }
         auto& ip_state = it->second;
+        // An ended ban starts a new period: the address again has the
+        // configured number of failures before it is banned again.
+        if (ip_state.banned_until != std::chrono::steady_clock::time_point{} && ip_state.banned_until <= now) {
+            ip_state.failures = 0;
+            ip_state.failures_by_user.clear();
+            ip_state.banned_until = {};
+        }
         ip_state.last_update = now;
         ++ip_state.failures;
         // A name that cannot log in, or one past the per-source bound, is
