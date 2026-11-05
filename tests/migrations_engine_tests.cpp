@@ -303,7 +303,7 @@ void RightsAndDrop() {
         e.users->Revoke("limited", "realm", Right::kAdmin);
         Error(run("MIGRATE 'add' ALTER TABLE realm ADD COLUMN extra u8 NULL"), "PERMISSION_DENIED");
         Error(run("MIGRATE 'add' ALTER TABLE realm DROP COLUMN v"), "PERMISSION_DENIED");
-        Error(run("SHOW MIGRATIONS"), "PERMISSION_DENIED");
+        Reply(run("SHOW MIGRATIONS"), "*0\r\n");
         Reply(e.Run("MIGRATE 'grant' GRANT READ ON realm TO limited"), "+applied\r\n");
         Reply(e.Run("MIGRATE 'revoke' REVOKE READ ON realm FROM limited"), "+applied\r\n");
         // A grant names a valid table name, so the users file it writes reads back.
@@ -318,6 +318,57 @@ void RightsAndDrop() {
     Reply(e.Run("MIGRATE 'drop' DROP TABLE realm"), "+skipped\r\n");
     assert(!e.catalog->Find("realm") && !e.users->Find("limited")->grants.contains("realm"));
 }
+
+// A recorded name belongs to the table its statement names (to MANAGES USERS
+// for GRANT and REVOKE): a caller without ADMIN there gets the same refusal
+// whatever statement it submits, and sees only the records it could replay.
+void RecordedNamesFollowRights() {
+    test::ScopedTempDir dir("chunkdb-migrations-name-rights");
+    Engine e(dir.path(), true);
+    const auto verifier = scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations);
+    e.users->Create("owner", verifier, false);
+    e.users->Create("keeper", verifier, true);
+    e.users->Grant("owner", "own", Right::kAdmin);
+    Reply(e.Run(std::string("MIGRATE 'create_realm' ") + kCreate), "+applied\r\n");
+    Reply(e.Run("MIGRATE 'create_own' CREATE TABLE own (v u8) CHUNK 2 x 2"), "+applied\r\n");
+    Reply(e.Run("MIGRATE 'add_flag' ALTER TABLE realm ADD COLUMN flag u8 NULL"), "+applied\r\n");
+    Reply(e.Run("MIGRATE 'grant_own' GRANT READ ON own TO keeper"), "+applied\r\n");
+    SessionState owner, keeper;
+    assert(test::LoginOnEngine(*e.engine, owner, "owner", "pw").front() == '%');
+    assert(test::LoginOnEngine(*e.engine, keeper, "keeper", "pw").front() == '%');
+    const auto as = [&](SessionState& session, const std::string& text) { return e.engine->Execute(session, text); };
+    const auto refused = as(owner, "MIGRATE 'add_flag' ALTER TABLE own ADD COLUMN flag u8 NULL");
+    Error(refused, "PERMISSION_DENIED");
+    assert(refused.find("ALTER") == std::string::npos && refused.find("realm") == std::string::npos);
+    Reply(as(owner, "MIGRATE 'add_flag' ALTER TABLE own ADD COLUMN other u8 NULL"), refused);
+    Reply(as(owner, "MIGRATE 'create_realm' DROP TABLE own"), "-ERR PERMISSION_DENIED reason=permission_denied migration name 'create_realm' is recorded for a change outside your rights; ask an administrator to grant this right\r\n");
+    assert(e.catalog->Find("own")->Info().schema.columns.size() == 1U && e.catalog->Migrations().size() == 4U);
+    Reply(as(owner, "MIGRATE 'own_flag' ALTER TABLE own ADD COLUMN flag u8 NULL"), "+applied\r\n");
+    Reply(as(owner, "MIGRATE 'own_flag' ALTER TABLE own ADD COLUMN flag u8 NULL"), "+skipped\r\n");
+    Error(as(owner, "MIGRATE 'own_flag' ALTER TABLE own ADD COLUMN extra u8 NULL"), "MIGRATION_MISMATCH");
+    Error(as(owner, "MIGRATE 'create_own' ALTER TABLE own ADD COLUMN extra u8 NULL"), "MIGRATION_MISMATCH");
+    Reply(e.Run("MIGRATE 'add_flag' ALTER TABLE realm ADD COLUMN flag u8 NULL"), "+skipped\r\n");
+    Reply(e.Run("MIGRATE 'add_more' ALTER TABLE realm ADD COLUMN more u8 NULL"), "+applied\r\n");
+    Error(e.Run("MIGRATE 'own_flag' ALTER TABLE realm ADD COLUMN extra u8 NULL"), "MIGRATION_MISMATCH");
+    // GRANT records answer to MANAGES USERS, not to ADMIN on the granted table.
+    Error(as(owner, "MIGRATE 'grant_own' ALTER TABLE own ADD COLUMN extra u8 NULL"), "PERMISSION_DENIED");
+    Reply(as(keeper, "MIGRATE 'grant_own' GRANT READ ON own TO keeper"), "+skipped\r\n");
+    Error(as(keeper, "MIGRATE 'add_flag' GRANT READ ON own TO keeper"), "PERMISSION_DENIED");
+    const auto names = [](const std::string& reply) {
+        std::string found;
+        for (std::size_t at = reply.find("$4\r\nname\r\n"); at != std::string::npos; at = reply.find("$4\r\nname\r\n", at + 1U)) {
+            const auto start = reply.find("\r\n", at + 10U) + 2U;
+            found += reply.substr(start, reply.find("\r\n", start) - start) + " ";
+        }
+        return found;
+    };
+    assert(names(as(owner, "SHOW MIGRATIONS")) == "create_own own_flag ");
+    assert(names(as(keeper, "SHOW MIGRATIONS")) == "grant_own ");
+    assert(names(e.Run("SHOW MIGRATIONS")) == "create_realm create_own add_flag grant_own own_flag add_more ");
+    e.users->Revoke("owner", "own", Right::kAdmin);
+    Reply(as(owner, "SHOW MIGRATIONS"), "*0\r\n");
+}
+
 
 struct Pause : MigrationTestHook {
     std::mutex mutex;
@@ -592,6 +643,6 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
     ConditionalDdl(); ConditionalColumnsRefusePoisonedStore(); ConditionalJournalValidationAndRecovery();
-    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
+    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); RecordedNamesFollowRights(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
     LedgerLimit(false); LedgerLimit(true);
 }

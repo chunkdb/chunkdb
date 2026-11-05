@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -594,6 +595,26 @@ bool HasColumn(const TableSchema& schema, std::string_view name) {
     return std::any_of(schema.columns.begin(), schema.columns.end(),
                        [name](const Column& column) { return column.name == name; });
 }
+
+// A recorded migration belongs to what its statement changes: ADMIN on the
+// table it names, or MANAGES USERS for GRANT and REVOKE. Only a caller with
+// that right sees the record or learns whether its name skips or conflicts.
+bool MayReplayMigration(bool require_auth, const User* user, const MigrationRecord& record) {
+    if (!require_auth) return true;
+    if (user == nullptr) return false;
+    const auto parsed = cql::Parse(record.statement);
+    if (std::holds_alternative<cql::GrantRight>(parsed.statement)) return user->manages_users;
+    const auto table = std::visit([](const auto& inner) -> std::string {
+        using T = std::decay_t<decltype(inner)>;
+        if constexpr (std::is_same_v<T, cql::CreateTable> || std::is_same_v<T, cql::AlterTable> || std::is_same_v<T, cql::DropTable> ||
+                      std::is_same_v<T, cql::CreateSlot> || std::is_same_v<T, cql::DropSlot>)
+            return inner.table;
+        return {};
+    }, parsed.statement);
+    const auto right = table.empty() ? std::nullopt : RightOn(*user, table);
+    return right.has_value() && *right >= Right::kAdmin;
+}
+
 }  // namespace
 
 void CommandEngine::RequireRight(SessionState& session, const std::string& table, Right needed) const {
@@ -862,12 +883,20 @@ std::string CommandEngine::ExecuteStatement(
                             request.kind = MigrationRequest::Kind::kDropSlot; request.table = slot.table; request.slot = slot.name; request.if_exists = slot.if_exists;
                         }
                     }, migration.statement);
+                    // The rights just checked, so the lookup reads no user state.
+                    (void)CurrentUser(session);
+                    request.require_recorded_access = [require_auth = config_.require_auth, user = session.user_rights](const MigrationRecord& record) {
+                        if (!MayReplayMigration(require_auth, user.get(), record))
+                            throw PermissionDeniedError("migration name '" + record.name + "' is recorded for a change outside your rights");
+                    };
                     return Protocol::SimpleString(catalog_->Migrate(request, config_.users.get()) ? "applied" : "skipped");
                 },
                 [&](const cql::ShowMigrations&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
-                    if (config_.require_auth) RequireManagesUsers(session);
-                    const auto records = catalog_->Migrations();
+                    const User* user = CurrentUser(session);
+                    std::vector<MigrationRecord> records;
+                    for (auto& record : catalog_->Migrations())
+                        if (MayReplayMigration(config_.require_auth, user, record)) records.push_back(std::move(record));
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, records.size());
                     for (const auto& record : records) {

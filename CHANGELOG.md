@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Scope recorded migration names to the rights of the change they record: MIGRATE under a name recorded for a table without the caller's ADMIN, or for GRANT or REVOKE without MANAGES USERS, answers PERMISSION_DENIED whatever statement it submits instead of skipped or MIGRATION_MISMATCH, and SHOW MIGRATIONS no longer requires MANAGES USERS but lists only the records within the caller's rights.
 - Bound verifier salts to 16 through 256 bytes in CREATE USER, ALTER USER and the users file, limit a quoted VERIFIER to 512 bytes like `VERIFIER $1`, refuse GRANT on a name that is not a valid table name, and refuse a users file with an out-of-range salt or an invalid user or table name instead of writing a salt length that does not fit its field.
 - Add matched-subscriber budget comparisons with `chunkdb_budget_compare --watch-both TABLE[:N][:slots]` and require a control with the same subscriber settings (#140).
 - Add extensible reply metadata, exact unsigned revisions, HELLO options, persistent watch filters, ACK deadlines, takeover, lineage, and explicit feature activation (#69).
