@@ -140,6 +140,9 @@ struct TableSchema {
 // flag combinations, defaults, the total of fixed bits, a version above 0,
 // and a history of exactly version - 1 steps that undo to valid schemas.
 void ValidateTableSchema(const TableSchema& schema);
+// Throws std::invalid_argument, as ValidateTableSchema does, when the size of
+// `column`'s type is outside the range its kind takes (uN 1 to 64, ...).
+void ValidateColumnType(const Column& column);
 // Whether this build can store a table with `schema` (it needs at least one
 // fixed-width column); empty when it can, otherwise the reason.
 [[nodiscard]] std::string UnsupportedSchemaReason(const TableSchema& schema);
