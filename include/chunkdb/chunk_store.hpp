@@ -497,8 +497,9 @@ class ChunkStore {
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock(std::int64_t block_x, std::int64_t block_y);
     [[nodiscard]] BlockReadMetadata GetBlockWithVersion(std::int64_t block_x, std::int64_t block_y);
     // The first stored value of column `column_id` that `type` does not
-    // hold, as "block (x, y) holds <value>", or std::nullopt when every one
-    // fits. Reads every populated chunk (TableCatalog::NarrowColumn).
+    // hold, as "block (x, y) holds <value>" (an axis past int64 as
+    // [chunk, local]), or std::nullopt when every one fits. Reads every
+    // populated chunk (TableCatalog::NarrowColumn).
     [[nodiscard]] std::optional<std::string> FindValueNotFitting(std::uint32_t column_id, const ColumnType& type);
     // Whether memory, images or WALs contain any present block. Callers that
     // use the answer to change a schema must exclude concurrent writers.
