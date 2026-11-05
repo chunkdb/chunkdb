@@ -1536,11 +1536,74 @@ std::string CommandEngine::ExecuteStatement(
 }
 
 
+SessionTransaction::SessionTransaction(TxnBudget* budget, std::chrono::steady_clock::time_point started)
+    : budget(budget), started(started) {
+    std::lock_guard lock(budget->mutex);
+    entry = budget->open.insert(budget->open.end(), this);
+}
+
+SessionTransaction::~SessionTransaction() {
+    std::lock_guard lock(budget->mutex);
+    budget->open.erase(entry);
+    budget->bytes.fetch_sub(bytes);
+}
+
+TransactionConflictError CommandEngine::TxnDurationConflict() const {
+    return TransactionConflictError(
+        TxnConflictReason::kDuration,
+        "the transaction ran longer than " + std::to_string(config_.txn_max_duration.count()) + " ms");
+}
+
+bool CommandEngine::TxnStatementStart(SessionState& session) {
+    SessionTransaction* const txn = session.transaction.get();
+    if (txn == nullptr) {
+        return false;
+    }
+    const bool expired = std::chrono::steady_clock::now() - txn->started >= config_.txn_max_duration;
+    std::string reply = expired ? ErrorReply(TxnDurationConflict()) : std::string{};
+    // Ended under the mutex, like EndExpiredTransactions, so a write that
+    // finds the budget full sees the bytes released once it holds it.
+    std::lock_guard lock(txn_budget_.mutex);
+    if (expired && !txn->aborted.has_value()) {
+        txn->Abort(std::move(reply));
+    }
+    txn->in_statement = true;
+    return true;
+}
+
+void CommandEngine::TxnStatementDone(SessionState& session, bool started) noexcept {
+    // COMMIT and ROLLBACK destroy the transaction, which unregisters it.
+    if (!started || session.transaction == nullptr) {
+        return;
+    }
+    std::lock_guard lock(txn_budget_.mutex);
+    session.transaction->in_statement = false;
+}
+
+void CommandEngine::EndExpiredTransactions() {
+    const auto now = std::chrono::steady_clock::now();
+    std::optional<std::string> reply;
+    // While this holds the mutex no session starts a statement on its
+    // transaction or destroys it.
+    std::lock_guard lock(txn_budget_.mutex);
+    for (SessionTransaction* txn : txn_budget_.open) {
+        // A statement using the transaction changes it without the mutex:
+        // check `in_statement` first.
+        if (txn->in_statement || txn->aborted.has_value() || now - txn->started < config_.txn_max_duration) {
+            continue;
+        }
+        if (!reply.has_value()) {
+            reply = ErrorReply(TxnDurationConflict());
+        }
+        txn->Abort(*reply);
+    }
+}
+
 std::string CommandEngine::TxnBegin(SessionState& session) {
     if (session.transaction != nullptr) {
         throw std::invalid_argument("a transaction is already open; COMMIT or ROLLBACK it first");
     }
-    session.transaction = std::make_unique<SessionTransaction>(&txn_total_bytes_, std::chrono::steady_clock::now());
+    session.transaction = std::make_unique<SessionTransaction>(&txn_budget_, std::chrono::steady_clock::now());
     return Protocol::SimpleString("OK");
 }
 
@@ -1552,9 +1615,7 @@ Table::Lease CommandEngine::TxnLease(SessionState& session, const std::string& t
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - txn.started);
     if (elapsed >= config_.txn_max_duration) {
-        throw TransactionConflictError(
-            TxnConflictReason::kDuration,
-            "the transaction ran longer than " + std::to_string(config_.txn_max_duration.count()) + " ms");
+        throw TxnDurationConflict();
     }
     if (txn.snapshot == nullptr) {
         auto lease = AcquireNamedTable(session, table);
@@ -1631,14 +1692,27 @@ void CommandEngine::TxnWrite(
         }
         if (after > before) {
             const std::size_t grown = after - before;
-            if (txn_total_bytes_.fetch_add(grown) + grown > config_.txn_total_bytes) {
-                txn_total_bytes_.fetch_sub(grown);
-                throw std::invalid_argument(
-                    "open transactions hold more than --txn-total-bytes (" +
-                    std::to_string(config_.txn_total_bytes) + ") of changes; try again later");
+            const auto charge = [&] {
+                if (txn_budget_.bytes.fetch_add(grown) + grown <= config_.txn_total_bytes) {
+                    return true;
+                }
+                txn_budget_.bytes.fetch_sub(grown);
+                return false;
+            };
+            // Transactions past their duration hold their bytes until their
+            // session's next statement; ending them may make room.
+            if (!charge()) {
+                if (auto* hook = hook_.load(std::memory_order_acquire))
+                    hook->Run(CommandEngineTestHook::Point::kBeforeTxnBudgetReclaim, txn.table);
+                EndExpiredTransactions();
+                if (!charge()) {
+                    throw std::invalid_argument(
+                        "open transactions hold more than --txn-total-bytes (" +
+                        std::to_string(config_.txn_total_bytes) + ") of changes; try again later");
+                }
             }
         } else {
-            txn_total_bytes_.fetch_sub(before - after);
+            txn_budget_.bytes.fetch_sub(before - after);
         }
         txn.bytes = txn.bytes - before + after;
     } catch (...) {
@@ -1662,9 +1736,7 @@ std::string CommandEngine::TxnCommit(SessionState& session) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - txn->started);
     if (elapsed >= config_.txn_max_duration) {
-        throw TransactionConflictError(
-            TxnConflictReason::kDuration,
-            "the transaction ran longer than " + std::to_string(config_.txn_max_duration.count()) + " ms");
+        throw TxnDurationConflict();
     }
     std::optional<Table::Lease> lease;
     const auto changed = [&txn] {

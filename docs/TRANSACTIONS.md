@@ -49,5 +49,7 @@ A read-only transaction can commit while its snapshot remains valid.
 Exceeding a write-memory limit rejects the statement and leaves the transaction open.
 History pressure ends the oldest transactions with CONFLICT.
 A table change or expired duration also ends the transaction's work.
+Past its duration, a transaction ends at the connection's next statement, including PING and DESCRIBE, or earlier when another transaction needs its share of `--txn-total-bytes`.
+An idle connection closes after `--idle-connection-timeout-ms` even with a transaction open, which rolls it back.
 
 See [Transaction statements](reference/TRANSACTION_STATEMENTS.md), [Retry a transaction](TRANSACTION_RETRY.md), and [Durability](DURABILITY_CONTRACT.md).

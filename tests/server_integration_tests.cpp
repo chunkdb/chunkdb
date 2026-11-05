@@ -3425,6 +3425,66 @@ void TestLongIdleConnectionTimeoutReleasesWorker() {
     assert(idle.WaitForClose(std::chrono::milliseconds(1500)));
 }
 
+// A transaction past --txn-max-duration-ms whose client sends nothing does
+// not keep other connections' transactional writes out of
+// --txn-total-bytes, and an idle connection with an open transaction still
+// closes at the idle timeout, releasing its bytes.
+void TestExpiredTransactionReleasesBudget() {
+    // One private copy of a chunk of t fits, two do not.
+    auto engine_cfg = chunkdb::EngineConfig{
+        .require_auth = false,
+        .max_auth_failures = 5,
+        .txn_max_duration = std::chrono::milliseconds(500),
+        .txn_total_bytes = 50,
+    };
+    {
+        ServerHarness harness("txn-expired-budget", BaseStoreConfig(), engine_cfg, BaseServerConfig());
+        RawClient holder("127.0.0.1", harness.port);
+        holder.Hello();
+        holder.SendLine("CREATE TABLE t (n u16 REQUIRED) CHUNK 4 x 4");
+        assert(holder.ReadLine() == "+OK\r\n");
+        holder.SendLine("BEGIN");
+        assert(holder.ReadLine() == "+OK\r\n");
+        holder.SendLine("SET BLOCK 0 0 IN t n = 1");
+        assert(holder.ReadLine() == "_\r\n");
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+
+        RawClient other("127.0.0.1", harness.port);
+        other.Hello();
+        other.SendLine("BEGIN");
+        assert(other.ReadLine() == "+OK\r\n");
+        other.SendLine("SET BLOCK 4 0 IN t n = 2");
+        assert(other.ReadLine() == "_\r\n");
+        holder.SendLine("PING");
+        assert(holder.ReadLine().rfind("-ERR CONFLICT reason=duration ", 0) == 0);
+        holder.SendLine("COMMIT");
+        assert(holder.ReadLine().rfind("-ERR CONFLICT reason=duration ", 0) == 0);
+        other.SendLine("COMMIT");
+        assert(other.ReadLine().rfind(":", 0) == 0);
+        other.SendLine("GET BLOCK 0 0 FROM t");
+        assert(other.ReadLine() == "_\r\n");
+    }
+    engine_cfg.txn_max_duration = std::chrono::milliseconds(60000);
+    auto server_cfg = BaseServerConfig();
+    server_cfg.idle_connection_timeout_ms = 300;
+    ServerHarness harness("txn-idle-budget", BaseStoreConfig(), engine_cfg, server_cfg);
+    RawClient idle("127.0.0.1", harness.port);
+    idle.Hello();
+    idle.SendLine("CREATE TABLE t (n u16 REQUIRED) CHUNK 4 x 4");
+    assert(idle.ReadLine() == "+OK\r\n");
+    idle.SendLine("BEGIN");
+    assert(idle.ReadLine() == "+OK\r\n");
+    idle.SendLine("SET BLOCK 0 0 IN t n = 1");
+    assert(idle.ReadLine() == "_\r\n");
+    assert(idle.WaitForClose(std::chrono::milliseconds(5000)));
+    RawClient other("127.0.0.1", harness.port);
+    other.Hello();
+    other.SendLine("BEGIN");
+    assert(other.ReadLine() == "+OK\r\n");
+    other.SendLine("SET BLOCK 4 0 IN t n = 2");
+    assert(other.ReadLine() == "_\r\n");
+}
+
 void TestPendingQueueWaitTimeoutClosesQueuedSocket() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -5733,6 +5793,7 @@ int main(int argc, char** argv) {
         run("TestIdleClientRemainsConnectedBetweenCommands", TestIdleClientRemainsConnectedBetweenCommands);
         run("TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests", TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests);
         run("TestLongIdleConnectionTimeoutReleasesWorker", TestLongIdleConnectionTimeoutReleasesWorker);
+        run("TestExpiredTransactionReleasesBudget", TestExpiredTransactionReleasesBudget);
         run("TestPendingQueueWaitTimeoutClosesQueuedSocket", TestPendingQueueWaitTimeoutClosesQueuedSocket);
         run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
         run("TestSteadySlowReaderHitsReplyWriteDeadline", [] { TestSteadySlowReaderHitsReplyWriteDeadline(); });

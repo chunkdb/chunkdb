@@ -147,9 +147,9 @@ With `--auth scram` the directory must already have users, because `--read-only`
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--txn-max-duration-ms` | `5000` | Transaction lifetime from BEGIN; expiry ends it with CONFLICT. |
+| `--txn-max-duration-ms` | `5000` | Transaction lifetime from BEGIN; expiry ends it with CONFLICT and releases its private bytes. |
 | `--txn-max-bytes` | `16777216` | Private written-chunk bytes for one transaction. |
-| `--txn-total-bytes` | `268435456` | Private written-chunk bytes for all open transactions. |
+| `--txn-total-bytes` | `268435456` | Private written-chunk bytes for all open transactions; a write that finds it full first ends the transactions past `--txn-max-duration-ms`. |
 | `--txn-history-bytes` | `67108864` | Earlier chunk states retained per table; overflow cancels oldest transactions. |
 | `--feed-buffer-bytes` | `67108864` | Default live feed budget for tables without an explicit `feed_buffer_bytes` option, shared among watches. |
 | `--tcp-keepalive-ms` | `60000` | Set TCP idle and repeat probe intervals, 1–32767000 ms, for every accepted connection. |
