@@ -44,6 +44,7 @@ Names are case-insensitive and normalized to lowercase; duplicate names are `INV
 Invalid known values are `INVALID_ARGUMENT reason=option_value option=<name>`, not authentication failures.
 Unknown options are lexically parsed, accepted and reported as not applied; they never increment authentication-failure counters.
 Parameters in WITH follow the same framing rules as all other parameters, independently of SCRAM's authentication parameter.
+Before authentication HELLO carries at most 12 parameters, enough for `$1` of USER, every known option and eight unknown ones; more receive `PROTOCOL` and close without their frames being read.
 Unset options use server defaults; explicit per-statement TAG overrides `default_tag`, including an empty tag.
 
 | Limit key | Task 51 value and ownership |
