@@ -257,6 +257,21 @@ void TestHello() {
     assert(duplicate_hello.plan == CommandEngine::PayloadPlan::kDiscard && duplicate_hello.frame_count == 2U);
     assert(engine.RejectPayload(retrying, "HELLO 3 WITH client_name=$1,CLIENT_NAME=$2", duplicate_hello.reject_response).starts_with("-ERR INVALID_ARGUMENT reason=duplicate_option "));
     assert(retrying.failed_auth_attempts == 1U && !retrying.close_after_reply);
+    // Before authentication HELLO carries at most 12 parameter frames, also
+    // when it is refused for its syntax; more are refused unread.
+    std::string twelve = "HELLO 3 USER admin $1 WITH";
+    for (unsigned i = 2U; i <= 12U; ++i) twelve += (i == 2U ? " o" : ",o") + std::to_string(i) + "=$" + std::to_string(i);
+    const auto most = engine.PlanPayload(retrying, twelve + "\r\n");
+    assert(most.plan == CommandEngine::PayloadPlan::kParameters && most.parameter_limits.size() == 12U);
+    for (const auto& line : {twelve + ",o13=$13\r\n", twelve + ",o13=$13 BOGUS\r\n", twelve + ",o2=$13\r\n"}) {
+        const auto too_many = engine.PlanPayload(retrying, line);
+        assert(too_many.plan == CommandEngine::PayloadPlan::kDiscard && too_many.frame_count == 0U);
+        assert(too_many.reject_response == "-ERR PROTOCOL reason=protocol HELLO takes at most 12 parameters\r\n");
+    }
+    chunkdb::SessionState refused;
+    assert(engine.RejectPayload(refused, twelve, "-ERR PROTOCOL reason=protocol HELLO takes at most 12 parameters\r\n")
+               .starts_with("-ERR PROTOCOL "));
+    assert(refused.close_after_reply && refused.failed_auth_attempts == 0U);
     ExpectError(engine.Execute(before, "GET BLOCK 0 0 FROM world\r\n"), "PROTOCOL expected HELLO 3");
     assert(before.close_after_reply);
 
@@ -763,6 +778,32 @@ void TestTableStatements() {
     assert(plan.parameter_limits.at(0) == small + 14U);
 }
 
+// A column type is checked before its DEFAULT is read or encoded, in CREATE
+// TABLE, ADD COLUMN (also within MIGRATE) and ALTER COLUMN TYPE.
+void TestColumnTypeBeforeDefault() {
+    Fixture f;
+    const std::string u = "INVALID_ARGUMENT column a: uN takes N from 1 to 64";
+    ExpectError(f.Run("CREATE TABLE t (a u0 DEFAULT 1) CHUNK 4 x 4"), u);
+    ExpectError(f.Run("CREATE TABLE t (a u65 DEFAULT 1) CHUNK 4 x 4"), u);
+    ExpectError(f.Run("CREATE TABLE t (a u4294967295 DEFAULT 1) CHUNK 4 x 4"), u);
+    ExpectError(f.Run("CREATE TABLE t (a i65 DEFAULT -1) CHUNK 4 x 4"), "INVALID_ARGUMENT column a: iN takes N from 2 to 64");
+    // Without the check first, the default would take 512 MiB.
+    ExpectError(f.Run("CREATE TABLE t (a bits(4294967288) DEFAULT b'1') CHUNK 4 x 4"),
+                "INVALID_ARGUMENT column a: bits(N) takes N from 1 to 65535");
+    ExpectError(f.Run("MIGRATE 'wide' CREATE TABLE t (a u0 DEFAULT 1) CHUNK 4 x 4"), u);
+    ExpectError(f.Run("ALTER TABLE world ADD COLUMN a u0 DEFAULT 1"), u);
+    ExpectError(f.Run("MIGRATE 'wide' ALTER TABLE world ADD COLUMN a u0 DEFAULT 1"), u);
+    ExpectReply(f.Run("ALTER TABLE world ADD COLUMN a u4 DEFAULT 15"), "+OK\r\n");
+    ExpectError(f.Run("ALTER TABLE world ALTER COLUMN a TYPE u0 USING CLAMP"), u);
+    ExpectError(f.Run("ALTER TABLE world ALTER COLUMN a TYPE u200"), u);
+    ExpectError(f.Run("MIGRATE 'wide' ALTER TABLE world ALTER COLUMN a TYPE u0 USING CLAMP"), u);
+    ExpectReply(f.Run("SHOW TABLES"), "*2\r\n$5\r\nplain\r\n$5\r\nworld\r\n");
+    // The column count is bounded before the columns are built.
+    std::string columns = "c0 u1";
+    for (int i = 1; i <= 1024; ++i) columns += ", c" + std::to_string(i) + " u1 DEFAULT 1";
+    ExpectError(f.Run("CREATE TABLE t (" + columns + ") CHUNK 4 x 4"), "INVALID_ARGUMENT a table has at most 1024 columns");
+}
+
 void TestConditionalObjects() {
     Fixture f;
     ExpectReply(f.Run("CREATE TABLE IF NOT EXISTS repeatable (a u8) CHUNK 4 x 4"), "+OK\r\n");
@@ -1005,6 +1046,7 @@ int main(int argc, char** argv) {
     TestAreaStatements();
     TestAreaFromFiles();
     TestTableStatements();
+    TestColumnTypeBeforeDefault();
     TestConditionalObjects();
     TestConcurrentConditionalCreate();
     TestScanChunks();

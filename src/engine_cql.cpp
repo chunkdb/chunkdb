@@ -281,6 +281,8 @@ FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement
     if (!definition.default_value.has_value()) {
         return column;
     }
+    // Before the default is read and encoded for the type.
+    ValidateColumnType(column);
     const ColumnValue value = LiteralValue(column, *definition.default_value);
     if (std::holds_alternative<std::monostate>(value)) {
         // A NULL column without a DEFAULT takes NULL.
@@ -574,6 +576,9 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
 }
 
 TableDefinition DefinitionFrom(const cql::CreateTable& create, const TableOptions& defaults) {
+    if (create.columns.size() > kMaxColumnsPerTable) {
+        throw std::invalid_argument("a table has at most " + std::to_string(kMaxColumnsPerTable) + " columns");
+    }
     TableSchema schema{
         .version = 1,
         .next_column_id = static_cast<std::uint32_t>(create.columns.size() + 1U),
