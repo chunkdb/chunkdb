@@ -1153,6 +1153,12 @@ std::string CommandEngine::ExecuteStatement(
                             {{"current", std::to_string(current)}, {"actual", std::to_string(encoded_for)}, {"table", set.table}});
                     }
                     if (session.transaction != nullptr) {
+                        // The decoded state takes the form's bytes after its
+                        // header, so the transaction's limits are checked
+                        // before the form is decoded or the chunk is read.
+                        RequireTxnRoom(
+                            *session.transaction, ChunkCoord{set.chunk_x, set.chunk_y},
+                            frame->size() - kChunkFormHeaderBytes);
                         ChunkState next = DecodeChunkForm(store.geometry(), *frame);
                         TxnWrite(
                             *session.transaction, store, ChunkCoord{set.chunk_x, set.chunk_y},
@@ -1595,6 +1601,44 @@ void CommandEngine::TxnRead(SessionTransaction& txn, std::span<const ChunkCoord>
     txn.read_set.insert(coords.begin(), coords.end());
 }
 
+namespace {
+
+[[nodiscard]] std::invalid_argument TxnWrittenChunksError() {
+    return std::invalid_argument("a transaction writes at most " + std::to_string(kMaxTxnWrittenChunks) + " chunks");
+}
+
+[[nodiscard]] std::invalid_argument TxnMaxBytesError(std::size_t bytes, std::size_t limit) {
+    return std::invalid_argument(
+        "the transaction's changes would take " + std::to_string(bytes) + " bytes, more than --txn-max-bytes (" +
+        std::to_string(limit) + ")");
+}
+
+[[nodiscard]] std::invalid_argument TxnTotalBytesError(std::size_t limit) {
+    return std::invalid_argument(
+        "open transactions hold more than --txn-total-bytes (" + std::to_string(limit) +
+        ") of changes; try again later");
+}
+
+}  // namespace
+
+void CommandEngine::RequireTxnRoom(
+    const SessionTransaction& txn,
+    const ChunkCoord& coord,
+    std::size_t after) const {
+    const auto own = txn.writes.find(coord);
+    if (own == txn.writes.end() && txn.writes.size() >= kMaxTxnWrittenChunks) {
+        throw TxnWrittenChunksError();
+    }
+    const std::size_t before = own == txn.writes.end() ? 0U : StateBytes(own->second);
+    if (txn.bytes - before + after > config_.txn_max_bytes) {
+        throw TxnMaxBytesError(txn.bytes - before + after, config_.txn_max_bytes);
+    }
+    // TxnWrite reserves the growth; this only refuses one that cannot fit now.
+    if (after > before && txn_total_bytes_.load() + (after - before) > config_.txn_total_bytes) {
+        throw TxnTotalBytesError(config_.txn_total_bytes);
+    }
+}
+
 void CommandEngine::TxnWrite(
     SessionTransaction& txn,
     ChunkStore& store,
@@ -1604,8 +1648,7 @@ void CommandEngine::TxnWrite(
     const bool created = own == txn.writes.end();
     if (created) {
         if (txn.writes.size() >= kMaxTxnWrittenChunks) {
-            throw std::invalid_argument(
-                "a transaction writes at most " + std::to_string(kMaxTxnWrittenChunks) + " chunks");
+            throw TxnWrittenChunksError();
         }
         own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord.x, coord.y)).first;
     }
@@ -1630,17 +1673,13 @@ void CommandEngine::TxnWrite(
                                                   [](std::uint8_t byte) { return byte != 0; });
         const std::size_t after = StateBytes(state);
         if (txn.bytes - before + after > config_.txn_max_bytes) {
-            throw std::invalid_argument(
-                "the transaction's changes would take " + std::to_string(txn.bytes - before + after) +
-                " bytes, more than --txn-max-bytes (" + std::to_string(config_.txn_max_bytes) + ")");
+            throw TxnMaxBytesError(txn.bytes - before + after, config_.txn_max_bytes);
         }
         if (after > before) {
             const std::size_t grown = after - before;
             if (txn_total_bytes_.fetch_add(grown) + grown > config_.txn_total_bytes) {
                 txn_total_bytes_.fetch_sub(grown);
-                throw std::invalid_argument(
-                    "open transactions hold more than --txn-total-bytes (" +
-                    std::to_string(config_.txn_total_bytes) + ") of changes; try again later");
+                throw TxnTotalBytesError(config_.txn_total_bytes);
             }
         } else {
             txn_total_bytes_.fetch_sub(before - after);

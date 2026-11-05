@@ -47,6 +47,7 @@ A read-only transaction can commit while its snapshot remains valid.
 | Earlier chunk states per table | 67108864 bytes, `--txn-history-bytes` |
 
 Exceeding a write-memory limit rejects the statement and leaves the transaction open.
+SET CHUNK is checked against these limits by its form's size before the form is decoded.
 History pressure ends the oldest transactions with CONFLICT.
 A table change or expired duration also ends the transaction's work.
 
