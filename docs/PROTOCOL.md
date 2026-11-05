@@ -10,6 +10,9 @@ TCP uses `chunk://`; TLS uses `chunks://` with certificate validation in the cli
 Lines end with LF or CRLF; a line cut off at end of stream is never executed.
 The terminator counts toward `--max-line-bytes` (65536 by default); overflow sends BAD_REQUEST and closes.
 Binary parameter frames do not count toward that line limit.
+A PROXY protocol v2 header and the TLS handshake each have their own `--client-io-timeout-ms`, in that order, before the HELLO deadline starts.
+Until authentication succeeds, HELLO, AUTH and all their parameter frames must arrive within `--client-io-timeout-ms` of that start; later ones receive PROTOCOL and close.
+After authentication, each request line and frame header must arrive within `--client-io-timeout-ms` of its first byte, and each frame body within it from when its read starts, after its header; a drained frame body is read in 4096-byte pieces, each with that timeout.
 
 The first line must be HELLO 3; a different version or statement receives PROTOCOL and closes without execution.
 `HELLO 3` alone is accepted only under `--auth none`; otherwise it receives AUTH_REQUIRED.
@@ -52,6 +55,7 @@ A second HELLO receives PROTOCOL.
 Append `WITH client_name='name',statement_timeout_ms=0,default_tag=x'00'` to HELLO to request session options.
 Keys are case-insensitive; duplicates and invalid known values receive INVALID_ARGUMENT without counting as authentication failures.
 Unknown keys are accepted and reported with `reason=unknown_option`.
+Before authentication HELLO takes at most 12 parameters; a HELLO with more receives PROTOCOL and closes without its frames being read.
 
 Only `client_name` currently applies; timeout and tag values are stored with `reason=implementation_pending` until their capabilities appear.
 The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, and `lineage`.
