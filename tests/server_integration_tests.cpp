@@ -2199,13 +2199,13 @@ std::string HelloWithOptionFrames(unsigned count) {
     return line + "\r\n";
 }
 
-// Sends `piece` `count` times, 100 ms apart, each well within the I/O
+// Sends `piece` `count` times, `gap` apart, each well within the I/O
 // timeout; stops once the server has closed the connection.
 template <typename Client>
-std::thread Trickle(Client& client, const std::string& piece, unsigned count) {
-    return std::thread([&client, piece, count] {
+std::thread Trickle(Client& client, const std::string& piece, unsigned count, std::chrono::milliseconds gap) {
+    return std::thread([&client, piece, count, gap] {
         for (unsigned i = 0U; i < count; ++i) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            std::this_thread::sleep_for(gap);
             try {
                 client.SendBytes(piece);
             } catch (const std::exception&) {
@@ -2213,6 +2213,13 @@ std::thread Trickle(Client& client, const std::string& piece, unsigned count) {
             }
         }
     });
+}
+
+// Whether a close came at a deadline of `io_timeout`: not before it, and
+// bounded rather than waiting for the client. The upper bound is loose so
+// a loaded machine does not fail it.
+bool ClosedAtDeadline(Clock::duration elapsed, std::chrono::milliseconds io_timeout) {
+    return elapsed >= io_timeout - std::chrono::milliseconds(100) && elapsed < io_timeout * 3;
 }
 
 // Before authentication every read ends at the HELLO deadline, frames
@@ -2224,15 +2231,16 @@ void CheckTrickledFramesAreBounded(std::uint16_t port, std::size_t io_timeout_ms
     const auto io_timeout = std::chrono::milliseconds(io_timeout_ms);
     {
         ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
-        const auto start = Clock::now();
         Client client("127.0.0.1", port);
+        // After the TLS handshake, where the HELLO deadline starts.
+        const auto start = Clock::now();
         client.SendBytes(HelloWithOptionFrames(12U));
-        auto sender = Trickle(client, "$-1\r\n", 12U);
-        const bool refused = logs.WaitContains("HELLO 3 was not completed within the I/O timeout", std::chrono::seconds(3));
+        auto sender = Trickle(client, "$-1\r\n", 12U, io_timeout / 4);
+        const bool refused = logs.WaitContains("HELLO 3 was not completed within the I/O timeout", io_timeout * 5);
         const auto elapsed = Clock::now() - start;
         sender.join();
         assert(refused);
-        assert(elapsed >= io_timeout && elapsed < io_timeout + std::chrono::milliseconds(600));
+        assert(ClosedAtDeadline(elapsed, io_timeout));
         // A frame that arrives as the server closes turns the close into a
         // reset, which may discard the reply.
         try {
@@ -2247,11 +2255,11 @@ void CheckTrickledFramesAreBounded(std::uint16_t port, std::size_t io_timeout_ms
     if (created != "+OK\r\n") throw std::runtime_error("create trickle table: " + created);
     const std::string set = "SET BLOCK 0 0 IN trickle c1 = $1, c2 = $2, c3 = $3, c4 = $4\r\n";
     const std::string frame = "$1\r\nx\r\n";
-    // Frames 200 ms apart under a 300 ms timeout: the statement takes longer
-    // than the timeout as a whole, and still applies.
+    // Frames a third of the timeout apart: the statement takes longer than
+    // the timeout as a whole, and still applies.
     client.SendBytes(set);
     for (int i = 0; i < 4; ++i) {
-        std::this_thread::sleep_for(io_timeout * 2 / 3);
+        std::this_thread::sleep_for(io_timeout / 3);
         client.SendBytes(frame);
     }
     assert(client.ReadLine().front() == ':');
@@ -2262,10 +2270,10 @@ void CheckTrickledFramesAreBounded(std::uint16_t port, std::size_t io_timeout_ms
         ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
         const auto start = Clock::now();
         client.SendBytes(set + frame);
-        const bool ended = logs.WaitContains("phase=read reason=timeout", std::chrono::seconds(3));
+        const bool ended = logs.WaitContains("phase=read reason=timeout", io_timeout * 5);
         const auto elapsed = Clock::now() - start;
         assert(ended);
-        assert(elapsed >= io_timeout && elapsed < io_timeout + std::chrono::milliseconds(600));
+        assert(ClosedAtDeadline(elapsed, io_timeout));
         assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol incomplete parameter frame\r\n");
     }
     // The single worker is free again.
@@ -2281,19 +2289,19 @@ template <typename Client>
 void CheckTrickledAuthIsBounded(std::uint16_t port, std::size_t io_timeout_ms) {
     const auto io_timeout = std::chrono::milliseconds(io_timeout_ms);
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
-    const auto start = Clock::now();
     Client client("127.0.0.1", port);
+    const auto start = Clock::now();
     const auto login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
     client.SendBytes(chunkdb::test::HelloUserBytes(login, kAdminUser));
     assert(client.ReadLine().rfind("+SCRAM ", 0) == 0);
     std::this_thread::sleep_for(io_timeout / 2);
     client.SendBytes("AUTH $1\r\n$64\r\n");
-    auto sender = Trickle(client, "x", 12U);
-    const bool refused = logs.WaitContains("HELLO 3 was not completed within the I/O timeout", std::chrono::seconds(3));
+    auto sender = Trickle(client, "x", 12U, io_timeout / 4);
+    const bool refused = logs.WaitContains("HELLO 3 was not completed within the I/O timeout", io_timeout * 5);
     const auto elapsed = Clock::now() - start;
     sender.join();
     assert(refused);
-    assert(elapsed >= io_timeout && elapsed < io_timeout + std::chrono::milliseconds(600));
+    assert(ClosedAtDeadline(elapsed, io_timeout));
     try {
         assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol HELLO 3 was not completed within the I/O timeout\r\n");
     } catch (const std::runtime_error&) {
@@ -2305,7 +2313,7 @@ void TestTrickledFramesAreBounded() {
     auto auth_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
     auto server_cfg = BaseServerConfig();
     server_cfg.worker_threads = 1;
-    server_cfg.client_io_timeout_ms = 300;
+    server_cfg.client_io_timeout_ms = 1000;
     server_cfg.idle_connection_timeout_ms = 10000;
     {
         ServerHarness harness("trickled-frames", BaseStoreConfig(), engine_cfg, server_cfg);

@@ -243,12 +243,12 @@ inline ConnectionTermination MakeReadTimeoutTermination(
     return MakeSocketTermination("read", socket_error_code, true);
 }
 
-// Reads one LF-terminated line into `out`. `*absolute_deadline` is the
-// deadline of the request the line belongs to: set to now +
-// partial_timeout_ms when the first byte is there and the deadline is unset,
-// never cleared here, so a request line and its parameter frames share it
-// until the caller clears it after the whole request. No wait starts after
-// it; with nothing buffered the caller's receive timeout applies to the wait.
+// Reads one LF-terminated line into `out`. `*absolute_deadline` is set to
+// now + partial_timeout_ms when the first byte is there and it is unset, and
+// is never cleared here: the caller decides how far it reaches (the whole
+// handshake before authentication, one line or frame body after it). No
+// wait starts after it; with nothing buffered the caller's receive timeout
+// applies to the wait.
 template <typename EnsureRecvTimeoutFn>
 bool ReadLinePlain(
     SocketHandle socket_fd,
@@ -341,7 +341,8 @@ bool ReadLinePlain(
 // draining anything already buffered from the request line read. Unlike
 // ReadLinePlain this never applies max_line_bytes: the caller has already
 // bounded `total` through CommandEngine::PlanPayload. `*absolute_deadline`
-// is shared with the request as for ReadLinePlain.
+// is set when the call starts if it is unset, and never cleared here, as
+// for ReadLinePlain.
 template <typename EnsureRecvTimeoutFn>
 bool ReadBytesPlain(
     SocketHandle socket_fd,
