@@ -49,6 +49,7 @@ constexpr const char* kFenceDurability = "its store is fail-closed after a durab
 constexpr const char* kFenceFeed = "its feed cleanup failed";
 constexpr const char* kFenceSnapshot = "its snapshot generation failed";
 constexpr const char* kFenceRecovery = "a recovery could not reopen it";
+constexpr const char* kFenceNarrowing = "a column narrowing could not be ended";
 
 // How watches of a table that left service end.
 constexpr const char* kWatchFenced = "watched table is fenced; watch it again after RECOVER TABLE";
@@ -2036,6 +2037,42 @@ std::optional<std::string> TableCatalog::ScanNarrowing(Table& table) {
     return lease->store().FindValueNotFitting(pending->column_id, pending->type);
 }
 
+void TableCatalog::EndNarrowing(Table& table, const TableOptions& options, const std::function<void(StoreManifest*)>& change) {
+    try {
+        RewriteManifest(
+            table, options,
+            [&](StoreManifest* manifest) {
+                if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_NARROW_END_FAIL_ONCE")) {
+                    throw std::runtime_error("injected failure ending a narrowing");
+                }
+                change(manifest);
+            },
+            "CHUNKDB_FAILPOINT_NARROW_END_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+    } catch (const std::exception& error) {
+        // Served with the narrowing still recorded, the table would keep
+        // restricting the column and refuse every later narrowing: it leaves
+        // service until RecoverTable or a restart drops the narrowing.
+        bool fenced = false;
+        if (!migration_health_->failed.load(std::memory_order_acquire) && Find(table.name_).get() == &table &&
+            table.Info().schema.pending.has_value()) {
+            if (auto store = table.BeginExclusive(/*closing=*/true)) {
+                auto fence = PrepareFence(table.shared_from_this(), table.name_, kFenceNarrowing);
+                std::lock_guard operations(operations_mutex_);
+                store.reset();
+                FenceTable(table, options, std::move(fence));
+                fenced = true;
+            }
+        }
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kStore,
+            fenced ? "a column narrowing could not be ended; the table is fenced until RECOVER TABLE or a restart"
+                   : "a column narrowing could not be ended",
+            {{"table", table.name_}, {"error", error.what()}});
+        throw;
+    }
+}
+
 void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
     RequireWritable("ALTER TABLE");
     std::shared_lock metadata(feature_metadata_gate_);
@@ -2057,16 +2094,19 @@ void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, 
     }
     // 3. The new version, or the schema as it was.
     const bool narrow = scan_failure == nullptr && !misfit.has_value();
-    RewriteManifest(
-        *table, options,
-        [&](StoreManifest* manifest) {
-            manifest->schema = narrow ? NarrowColumnType(manifest->schema, column, type)
-                                      : WithoutPendingNarrowing(manifest->schema);
-            if (narrow) {
-                manifest->geometry.block_bits = FixedBitsPerBlock(manifest->schema);
-            }
-        },
-        "CHUNKDB_FAILPOINT_NARROW_END_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+    if (narrow) {
+        EndNarrowing(*table, options, [&](StoreManifest* manifest) {
+            manifest->schema = NarrowColumnType(manifest->schema, column, type);
+            manifest->geometry.block_bits = FixedBitsPerBlock(manifest->schema);
+        });
+    } else {
+        try {
+            EndNarrowing(*table, options, [](StoreManifest* manifest) { manifest->schema = WithoutPendingNarrowing(manifest->schema); });
+        } catch (const std::exception&) {
+            // Logged, and the table is fenced if it still has the narrowing;
+            // the check's own refusal or failure is what the caller gets.
+        }
+    }
     if (scan_failure != nullptr) {
         std::rethrow_exception(scan_failure);
     }

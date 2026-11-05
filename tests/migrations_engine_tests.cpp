@@ -392,6 +392,36 @@ void NarrowingRefusalLeavesNoTrace() {
     assert(e.catalog->Find("world")->Info().schema.columns[0].type.size == 8U);
 }
 
+void NarrowingEndFailureFences() {
+    for (const bool migrate : {false, true}) {
+        test::ScopedTempDir dir("chunkdb-migrations-narrow-end");
+        Engine e(dir.path());
+        Reply(e.Run("CREATE TABLE world (v u16) CHUNK 2 x 2"), "+OK\r\n");
+        assert(e.Run("SET BLOCK 0 0 IN world v=300").front() == ':');
+        const std::string text = std::string(migrate ? "MIGRATE 'narrow' " : "") + "ALTER TABLE world ALTER COLUMN v TYPE u8";
+        {
+            // Removing the narrowing fails before its manifest is replaced.
+            txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_NARROW_END_FAIL_ONCE", "1");
+            const auto refused = e.Run(text);
+            Error(refused, "INVALID_ARGUMENT");
+            assert(refused.find("holds 300") != std::string::npos);
+        }
+        assert(!e.catalog->Find("world") && ReadStoreManifest(dir.path() / "tables" / "world")->schema.pending);
+        const auto fenced = e.Run("GET BLOCK 0 0 FROM world COLUMNS v");
+        Error(fenced, "INTERNAL");
+        assert(fenced.find("is fenced: a column narrowing could not be ended") != std::string::npos);
+        assert(e.catalog->Migrations().empty() && !ReadMigrationJournal(dir.path()));
+        Reply(e.Run("RECOVER TABLE world"), "+OK\r\n");
+        const auto schema = e.catalog->Find("world")->Info().schema;
+        assert(schema.version == 1U && !schema.pending && schema.columns[0].type.size == 16U);
+        assert(!ReadStoreManifest(dir.path() / "tables" / "world")->schema.pending);
+        Reply(e.Run("GET BLOCK 0 0 FROM world COLUMNS v"), "*1\r\n:300\r\n");
+        assert(e.Run("DELETE BLOCK 0 0 FROM world").front() == ':');
+        Reply(e.Run(text), migrate ? "+applied\r\n" : "+OK\r\n");
+        assert(e.catalog->Find("world")->Info().schema.columns[0].type.size == 8U);
+    }
+}
+
 void RightsAndDrop() {
     test::ScopedTempDir dir("chunkdb-migrations-rights");
     {
@@ -696,6 +726,6 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
     ConditionalDdl(); ConditionalColumnsRefusePoisonedStore(); ConditionalJournalValidationAndRecovery();
-    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); NarrowingScanOutsideCatalogAdmission(); NarrowingRefusalLeavesNoTrace(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
+    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); NarrowingScanOutsideCatalogAdmission(); NarrowingRefusalLeavesNoTrace(); NarrowingEndFailureFences(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
     LedgerLimit(false); LedgerLimit(true);
 }

@@ -104,7 +104,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
     TableSchema scanned_schema;
     // A recorded narrowing that is not decided is dropped again, so a refused or
     // skipped step leaves the schema as it was. A failed catalog or a fenced
-    // table drops it when it is recovered.
+    // table drops it when it is recovered; a table whose narrowing cannot be
+    // dropped is fenced, and the step reports its own outcome.
     const auto drop_recorded_narrowing = [&] {
         if (!narrowing_recorded) return;
         narrowing_recorded = false;
@@ -112,9 +113,11 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         if (operations.owns_lock()) operations.unlock();
         if (migration_health_->failed.load(std::memory_order_acquire) || Find(request.table) != table ||
             !table->Info().schema.pending) return;
-        RewriteManifest(
-            *table, previous, [](StoreManifest* manifest) { manifest->schema = WithoutPendingNarrowing(manifest->schema); },
-            "CHUNKDB_FAILPOINT_NARROW_END_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+        try {
+            EndNarrowing(*table, previous, [](StoreManifest* manifest) { manifest->schema = WithoutPendingNarrowing(manifest->schema); });
+        } catch (const std::exception&) {
+            // Logged by EndNarrowing, which fenced the table if needed.
+        }
     };
     try {
         if (request.kind != MigrationRequest::Kind::kCreate && request.kind != MigrationRequest::Kind::kGrant) {
