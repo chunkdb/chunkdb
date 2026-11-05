@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- BACKUP TO refuses an existing destination, or an existing parent below `--backup-dir`, that is not owned by the server user or is writable by group or others on Linux and macOS, so files in a backup can be replaced only by the server user.
 - `chunkdb_admin reset-password` refuses a backup or an incomplete restore directory before it takes the writer lock, with the error the server gives, so the backup stays restorable.
 - Add matched-subscriber budget comparisons with `chunkdb_budget_compare --watch-both TABLE[:N][:slots]` and require a control with the same subscriber settings (#140).
 - Add extensible reply metadata, exact unsigned revisions, HELLO options, persistent watch filters, ACK deadlines, takeover, lineage, and explicit feature activation (#69).

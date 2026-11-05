@@ -23,7 +23,8 @@ cuts:
 
 The destination is relative to `--backup-dir` and must be absent or empty, outside the live data directory.
 Use `/` separators; rooted paths, backslashes, `..` components, and symlinks below the resolved backup directory are refused.
-Missing parents are created.
+Missing parents are created with owner-only permissions.
+On Linux and macOS, an existing destination or parent below `--backup-dir` must belong to the server user and must not be writable by group or others; it is refused, not changed.
 The configured backup and data directories themselves may use symlinked paths.
 
 Writes continue during copying.
@@ -92,6 +93,7 @@ The server logs a warning for anything it cannot remove.
 - `BUSY`: wait for the existing backup to finish.
 - Missing configuration: set `--backup-dir` before starting the server.
 - Unsafe or nonempty destination: choose an empty path under the backup directory.
+- Destination not owned by the server user or writable by group or others: remove group and other write access, for example `chmod 700`, or choose another path.
 - Incomplete backup: remove that failed destination before retrying; it cannot be restored.
 - Unfinished migration recovery: restart the writer before taking another backup.
 - A fenced table: run RECOVER TABLE before taking another backup.

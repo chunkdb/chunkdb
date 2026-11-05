@@ -773,6 +773,29 @@ void PathDurabilityFailuresRemainGuarded() {
     assert(!std::filesystem::exists(target / kBackupIncompleteName));
 #endif
 }
+// An existing target, or an existing parent below --backup-dir, must belong to
+// the server user and not be writable by group or others.
+void SharedTargetDirectories() {
+#ifndef _WIN32
+    ScopedTempDir temp("chunkdb-backup-shared-target");
+    const auto root = std::filesystem::canonical(temp.path());
+    TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
+    const auto shared = root / "shared";
+    std::filesystem::create_directory(shared);
+    std::filesystem::permissions(shared, std::filesystem::perms::all);
+    assert(Error([&] { (void)catalog.BackupTo(shared, {}); }).find("not writable by group or others") != std::string::npos);
+    assert(std::filesystem::is_empty(shared));
+    assert(Error([&] { (void)ResolveBackupTarget(root, "shared/daily"); }).find("not writable by group or others") != std::string::npos);
+    assert(std::filesystem::is_empty(shared));
+    std::filesystem::permissions(shared, std::filesystem::perms::owner_all | std::filesystem::perms::group_read |
+        std::filesystem::perms::group_exec | std::filesystem::perms::others_read | std::filesystem::perms::others_exec);
+    (void)catalog.BackupTo(ResolveBackupTarget(root, "shared/daily"), {});
+    std::filesystem::create_directory(shared / "existing", shared);
+    (void)catalog.BackupTo(ResolveBackupTarget(root, "shared/existing"), {});
+    assert(std::filesystem::exists(shared / "daily" / kBackupMarkerName) && std::filesystem::exists(shared / "existing" / kBackupMarkerName));
+#endif
+}
 void StagingCollisionRetainsExistingEntry() {
     ScopedTempDir temp("chunkdb-backup-stage-collision");
     const auto root = std::filesystem::canonical(temp.path());
@@ -966,8 +989,8 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--staging-collision-regression") { StagingCollisionRetainsExistingEntry(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-owner-regression") { StagingOwnerValidation(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--orphaned-staging") { OrphanedStagingCleanup(); return 0; }
-    if (argc == 2 && std::string_view(argv[1]) == "--path-regressions") { TargetComponentReplacement(); StagingOwnerValidation(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); return 0; }
-    TargetComponentReplacement(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded();
+    if (argc == 2 && std::string_view(argv[1]) == "--path-regressions") { TargetComponentReplacement(); StagingOwnerValidation(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); SharedTargetDirectories(); return 0; }
+    TargetComponentReplacement(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); SharedTargetDirectories();
     if (argc == 2 && std::string_view(argv[1]) == "--completion") { CompletionAndPoison(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--generation") { FailedGenerationAndEmptyCatalog(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--pin-regressions") {

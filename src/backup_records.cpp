@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <array>
 #include <fstream>
+#include <iterator>
 #include <cerrno>
 #include <cstdio>
 #include <cstring>
@@ -137,6 +138,15 @@ void SyncBackupFd(int fd, bool file) {
 #endif
     if (::fsync(fd) != 0) throw std::runtime_error("backup durability sync failed");
 }
+// An existing backup directory must belong to the server user and must not be
+// writable by group or others, who could otherwise replace the files in it.
+void RequireUnsharedBackupDirectory(int fd, const std::filesystem::path& path) {
+    struct stat status {};
+    if (::fstat(fd, &status) != 0) throw std::runtime_error("cannot inspect backup directory: " + path.string());
+    if (!S_ISDIR(status.st_mode) || status.st_uid != ::geteuid() || (status.st_mode & (S_IWGRP | S_IWOTH)) != 0)
+        throw std::invalid_argument(
+            "backup directory must be owned by the server user and not writable by group or others: " + path.string());
+}
 #endif
 // Every component is opened without following links. POSIX writes use the
 // held directory descriptor; Windows keeps all parents open without delete
@@ -191,6 +201,12 @@ class SafeDirectory {
             }
             ::close(fd_); fd_ = next;
         }
+#endif
+    }
+    // Windows directories keep their existing owner-only ACL handling.
+    void RequireUnshared() const {
+#ifndef _WIN32
+        RequireUnsharedBackupDirectory(fd_, path_);
 #endif
     }
     bool Empty() const {
@@ -591,6 +607,24 @@ std::filesystem::path ResolveBackupTarget(const std::filesystem::path& directory
     SafeDescendants(root, relative);
     const auto target = std::filesystem::weakly_canonical(root / relative);
     if (!Within(target, root) || target == root) throw std::invalid_argument("backup destination escapes --backup-dir");
+#ifndef _WIN32
+    // Existing parents below --backup-dir follow the target rule; missing ones
+    // are created owner-only.
+    auto at = root;
+    for (auto part = relative.begin(); part != relative.end() && std::next(part) != relative.end(); ++part) {
+        at /= *part;
+        if (!Present(at)) break;
+        const int fd = ::open(at.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) throw std::invalid_argument("backup path component is not a safe directory: " + at.string());
+        try {
+            RequireUnsharedBackupDirectory(fd, at);
+        } catch (...) {
+            ::close(fd);
+            throw;
+        }
+        ::close(fd);
+    }
+#endif
     return target;
 }
 void RequireBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target) {
@@ -606,6 +640,7 @@ void PrepareBackupTarget(const std::filesystem::path& source, const std::filesys
     if (hook) hook->Run(BackupTestHook::Point::kBeforeTargetCreate, {}, 0U);
     SafeDirectory directory;
     directory.Open(target, true);
+    directory.RequireUnshared();
     if (!directory.Empty()) throw std::invalid_argument("backup destination must be absent or empty");
     PublishSafeFile(directory, kBackupIncompleteName, {'C', 'K', 'B', 'I'});
 }
