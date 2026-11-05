@@ -47,6 +47,8 @@ A successful login from a source address clears the failures of its own user nam
 ## TLS
 
 A `chunks://` listener accepts TLS from `--tls-min-version` up and refuses renegotiation.
+TLS 1.2 connections use ECDHE key exchange with AES-GCM or ChaCha20-Poly1305 only; a client offering no such cipher fails the handshake.
+TLS 1.3 uses the OpenSSL default cipher suites.
 The `--tls-cert` file holds the server certificate followed by any intermediate certificates, which are sent to clients; the `--tls-key` file holds an unencrypted private key.
 To renew the certificate, replace both files, then run [RELOAD TLS](reference/SERVER.md) or, on Linux and macOS, send the server SIGHUP.
 The server reads both files again and checks that the key matches the certificate.
@@ -194,6 +196,7 @@ Column types are defined with `CREATE TABLE` and can be changed with `ALTER TABL
 Server-created data and backup directories permit owner-only access, mode 0700 on Linux/macOS.
 New files use mode 0600 on those platforms; Windows uses protected owner-only access control lists.
 Existing users-file permissions are tightened at startup, except with `--read-only`, which logs a warning instead.
+`--backup-dir`, existing directories below it and an existing BACKUP TO destination must be owned by the server user or root and not writable by group or others; see [Backup](BACKUP.md).
 Bind mounts must grant access to the process owner; see [Docker](DOCKER.md).
 
 TCP keepalive applies before TLS and HELLO.
