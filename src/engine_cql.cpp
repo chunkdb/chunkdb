@@ -901,6 +901,14 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::ShowMigrations&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     const User* user = CurrentUser(session);
+                    // Without MANAGES USERS or an ADMIN grant no record is within the
+                    // caller's rights: the ledger is not read.
+                    if (config_.require_auth && (user == nullptr || (!user->manages_users &&
+                            std::none_of(user->grants.begin(), user->grants.end(), [](const auto& grant) { return grant.second >= Right::kAdmin; })))) {
+                        std::string empty;
+                        Protocol::AppendArrayHeader(empty, 0U);
+                        return empty;
+                    }
                     std::vector<MigrationRecord> records;
                     for (auto& record : catalog_->Migrations())
                         if (MayReplayMigration(config_.require_auth, user, record)) records.push_back(std::move(record));

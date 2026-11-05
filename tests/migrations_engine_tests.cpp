@@ -397,6 +397,25 @@ void UnparseableRecordNeedsEveryTable() {
 }
 
 
+// A caller with neither MANAGES USERS nor an ADMIN grant lists nothing
+// without reading the ledger.
+void ListingWithoutAdminSkipsLedger() {
+    test::ScopedTempDir dir("chunkdb-migrations-listing");
+    Engine e(dir.path(), true);
+    e.users->Create("reader", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
+    e.users->Grant("reader", "own", Right::kWrite);
+    Reply(e.Run("MIGRATE 'create_own' CREATE TABLE own (v u8) CHUNK 2 x 2"), "+applied\r\n");
+    {
+        std::ofstream out(dir.path() / kMigrationsFileName, std::ios::binary | std::ios::trunc);
+        out << "not a ledger";
+    }
+    SessionState reader;
+    assert(test::LoginOnEngine(*e.engine, reader, "reader", "pw").front() == '%');
+    Reply(e.engine->Execute(reader, "SHOW MIGRATIONS"), "*0\r\n");
+    assert(e.Run("SHOW MIGRATIONS").rfind("-ERR ", 0) == 0);
+}
+
+
 struct Pause : MigrationTestHook {
     std::mutex mutex;
     std::condition_variable cv;
@@ -670,6 +689,6 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
     ConditionalDdl(); ConditionalColumnsRefusePoisonedStore(); ConditionalJournalValidationAndRecovery();
-    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); RecordedNamesFollowRights(); UnparseableRecordNeedsEveryTable(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
+    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); RecordedNamesFollowRights(); UnparseableRecordNeedsEveryTable(); ListingWithoutAdminSkipsLedger(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
     LedgerLimit(false); LedgerLimit(true);
 }
