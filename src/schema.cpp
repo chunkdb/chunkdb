@@ -43,8 +43,9 @@ constexpr std::uint8_t kKnownFlags = kFlagNullable | kFlagRequired | kFlagHasDef
     return true;
 }
 
+}  // namespace
 
-void ValidateType(const Column& column) {
+void ValidateColumnType(const Column& column) {
     const auto& type = column.type;
     const auto bad = [&](const std::string& rule) {
         throw std::invalid_argument("column " + column.name + ": " + rule);
@@ -90,6 +91,8 @@ void ValidateType(const Column& column) {
     }
     bad("unknown type");
 }
+
+namespace {
 
 void ValidateDefault(const Column& column) {
     if (!column.has_default) {
@@ -276,7 +279,7 @@ void ValidateColumns(const TableSchema& schema) {
         if (column.id == 0U || column.id >= schema.next_column_id || !ids.insert(column.id).second) {
             throw std::invalid_argument("column " + column.name + " has an invalid id");
         }
-        ValidateType(column);
+        ValidateColumnType(column);
         if (column.nullable && column.required) {
             throw std::invalid_argument("column " + column.name + " cannot be both NULL and REQUIRED");
         }
@@ -504,7 +507,9 @@ template <typename T>
 }  // namespace
 
 std::vector<std::uint8_t> EncodeColumnValue(const Column& column, const ColumnValue& value) {
-    std::vector<std::uint8_t> bytes((FixedWidthBits(column.type) + 7U) / 8U, 0U);
+    // The type bounds the allocation.
+    ValidateColumnType(column);
+    std::vector<std::uint8_t> bytes((std::size_t{FixedWidthBits(column.type)} + 7U) / 8U, 0U);
     EncodeColumnValue(column, value, bytes.data());
     return bytes;
 }
@@ -517,7 +522,7 @@ void EncodeColumnValue(const Column& column, const ColumnValue& value, std::uint
     if (std::holds_alternative<std::monostate>(value)) {
         throw std::invalid_argument("column " + column.name + " cannot be NULL");
     }
-    std::fill_n(bytes, (width + 7U) / 8U, std::uint8_t{0});
+    std::fill_n(bytes, (std::size_t{width} + 7U) / 8U, std::uint8_t{0});
     if (column.type.kind == ColumnKind::kBits) {
         const auto& digits = ValueOf<BitsValue>(column, value).digits;
         if (digits.size() != width) {
@@ -575,7 +580,9 @@ void EncodeColumnValue(const Column& column, const ColumnValue& value, std::uint
     if (width < 64U) {
         raw &= (std::uint64_t{1} << width) - 1U;
     }
-    for (std::size_t i = 0; i < (width + 7U) / 8U; ++i) {
+    // An integer, bool or float takes at most 8 bytes.
+    const std::size_t raw_bytes = std::min<std::size_t>((std::size_t{width} + 7U) / 8U, sizeof raw);
+    for (std::size_t i = 0; i < raw_bytes; ++i) {
         bytes[i] = static_cast<std::uint8_t>(raw >> (8U * i));
     }
 }
@@ -591,7 +598,8 @@ ColumnValue DecodeColumnValue(const Column& column, const std::uint8_t* bytes) {
         return bits;
     }
     std::uint64_t raw = 0;
-    for (std::size_t i = 0; i < (width + 7U) / 8U; ++i) {
+    const std::size_t raw_bytes = std::min<std::size_t>((std::size_t{width} + 7U) / 8U, sizeof raw);
+    for (std::size_t i = 0; i < raw_bytes; ++i) {
         raw |= static_cast<std::uint64_t>(bytes[i]) << (8U * i);
     }
     switch (column.type.kind) {
@@ -1035,6 +1043,8 @@ namespace {
     TableSchema next = schema;
     Column& after = next.columns[at];
     after.type = type;
+    // Before the default is fitted to the type and encoded.
+    ValidateColumnType(after);
     if (before.has_default) {
         // The default follows the values, and must fit as they do.
         const ColumnValue value = IsFixedWidth(before.type.kind) ? DecodeColumnValue(before, before.default_value.data())
@@ -1116,7 +1126,7 @@ void ValidatePending(const TableSchema& schema) {
     narrowed.type = pending.type;
     narrowed.has_default = false;
     narrowed.default_value.clear();
-    ValidateType(narrowed);
+    ValidateColumnType(narrowed);
     if (column->has_default) {
         const ColumnValue value = IsFixedWidth(column->type.kind) ? DecodeColumnValue(*column, column->default_value.data())
                                                                   : DecodeVarValue(*column, column->default_value);
