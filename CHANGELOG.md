@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A `chunks://` listener limits TLS 1.2 to ECDHE key exchange with AES-GCM or ChaCha20-Poly1305 ciphers, so every TLS 1.2 session has forward secrecy; TLS 1.3 suites and `--tls-min-version` are unchanged.
 - BACKUP TO refuses an existing destination, or an existing parent below `--backup-dir`, that is not owned by the server user or is writable by group or others on Linux and macOS, so files in a backup can be replaced only by the server user.
 - `chunkdb_admin reset-password` refuses a backup or an incomplete restore directory before it takes the writer lock, with the error the server gives, so the backup stays restorable.
 - Add matched-subscriber budget comparisons with `chunkdb_budget_compare --watch-both TABLE[:N][:slots]` and require a control with the same subscriber settings (#140).

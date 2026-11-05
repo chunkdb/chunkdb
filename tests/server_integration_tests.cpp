@@ -928,7 +928,9 @@ class TlsClient {
     // `max_version`: the highest TLS version offered, e.g. TLS1_2_VERSION;
     // 0 offers every version the library supports. `prefix`: bytes sent in
     // the clear before the handshake, such as a PROXY protocol header.
-    TlsClient(std::string host, std::uint16_t port, int max_version = 0, const std::string& prefix = {})
+    // `ciphers`: the TLS 1.2 cipher list offered; empty keeps the default.
+    TlsClient(std::string host, std::uint16_t port, int max_version = 0, const std::string& prefix = {},
+              const std::string& ciphers = {})
         : host_(std::move(host)), port_(port) {
         SSL_load_error_strings();
         OpenSSL_add_ssl_algorithms();
@@ -941,6 +943,11 @@ class TlsClient {
             SSL_CTX_free(context_);
             context_ = nullptr;
             throw std::runtime_error("failed to set the TLS client's highest version");
+        }
+        if (!ciphers.empty() && SSL_CTX_set_cipher_list(context_, ciphers.c_str()) != 1) {
+            SSL_CTX_free(context_);
+            context_ = nullptr;
+            throw std::runtime_error("failed to set the TLS client's cipher list");
         }
         try {
             socket_ = ConnectSocket(host_, port_);
@@ -1027,6 +1034,7 @@ class TlsClient {
     }
 
     [[nodiscard]] int Version() const { return SSL_version(session_); }
+    [[nodiscard]] std::string Cipher() const { return SSL_get_cipher_name(session_); }
 
     void SendLine(const std::string& command) {
         SendBytes(command + "\r\n");
@@ -3150,6 +3158,30 @@ void TestTlsMinimumVersion() {
         }
         assert(refused_after_reload == (minimum == chunkdb::TlsMinVersion::k1_3));
     }
+}
+
+// TLS 1.2 accepts only ECDHE key exchange with AEAD ciphers: a client that
+// offers only static RSA key exchange with CBC fails the handshake.
+void TestTls12CipherList() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.tls_enabled = true;
+    ServerHarness harness("tls-ciphers", BaseStoreConfig(), engine_cfg, server_cfg);
+    bool refused = false;
+    try {
+        TlsClient weak("127.0.0.1", harness.port, TLS1_2_VERSION, {}, "AES128-SHA");
+    } catch (const std::runtime_error&) {
+        refused = true;
+    }
+    assert(refused);
+    for (const auto* cipher : {"ECDHE-RSA-AES128-GCM-SHA256", "ECDHE-RSA-AES256-GCM-SHA384", "ECDHE-RSA-CHACHA20-POLY1305"}) {
+        TlsClient client("127.0.0.1", harness.port, TLS1_2_VERSION, {}, cipher);
+        assert(client.Version() == TLS1_2_VERSION && client.Cipher() == cipher);
+        client.Login();
+    }
+    TlsClient current("127.0.0.1", harness.port);
+    assert(current.Version() == TLS1_3_VERSION);
+    current.Login();
 }
 
 void TestChunkPutOverTls() {
@@ -5716,6 +5748,7 @@ int main(int argc, char** argv) {
         run("TestChunkPutOverTls", TestChunkPutOverTls);
         run("TestTlsReload", TestTlsReload);
         run("TestTlsMinimumVersion", TestTlsMinimumVersion);
+        run("TestTls12CipherList", TestTls12CipherList);
 #endif
         run("TestReadTimeoutLogsPhaseAndReason", TestReadTimeoutLogsPhaseAndReason);
         run("TestProxyProtocolParser", TestProxyProtocolParser);

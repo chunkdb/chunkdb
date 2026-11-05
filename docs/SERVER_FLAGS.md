@@ -47,6 +47,8 @@ A successful login from a source address clears its failures.
 ## TLS
 
 A `chunks://` listener accepts TLS from `--tls-min-version` up and refuses renegotiation.
+TLS 1.2 connections use ECDHE key exchange with AES-GCM or ChaCha20-Poly1305 only; a client offering no such cipher fails the handshake.
+TLS 1.3 uses the OpenSSL default cipher suites.
 The `--tls-cert` file holds the server certificate followed by any intermediate certificates, which are sent to clients; the `--tls-key` file holds an unencrypted private key.
 To renew the certificate, replace both files, then run [RELOAD TLS](reference/SERVER.md) or, on Linux and macOS, send the server SIGHUP.
 The server reads both files again and checks that the key matches the certificate.
