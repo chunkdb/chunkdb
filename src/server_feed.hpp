@@ -34,7 +34,7 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     std::atomic<FeedDeliveryTestHook*> hook_{nullptr};
     struct Watch {
         std::shared_ptr<ServerConnection> connection;
-        struct Output { std::shared_ptr<const std::string> bytes; std::optional<std::uint64_t> revision{}; bool charged = false; };
+        struct Output { std::shared_ptr<const std::string> bytes; std::optional<std::uint64_t> revision{}; bool charged = false, excess = false; };
         std::deque<Output> output;
         std::size_t offset = 0, bytes = 0;
         int write_size = 0; // TLS retries pin the front buffer and this length.
@@ -44,6 +44,9 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
         bool close_immediate = false;
         std::size_t share = 0U, buffer_bytes = 0U;
         std::chrono::steady_clock::time_point next_progress{};
+        // Queued frames charged to the slot excess pool, and when they must be written.
+        std::size_t excess_frames = 0U;
+        std::chrono::steady_clock::time_point excess_deadline{};
     };
     void Run();
     void WakeCatchUp() noexcept;
@@ -54,7 +57,8 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     void Write(Watch& watch);
     void WritePlain(Watch& watch);
     void Advance(Watch& watch, std::size_t bytes);
-    void Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision = {}, bool charged = false);
+    void Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision = {}, bool charged = false, bool excess = false);
+    void ReleaseOutput(Watch& watch);
     void Reject(Watch& watch, std::string message);
     ChunkServer& server_;
     server_detail::SocketHandle wake_read_ = server_detail::kInvalidSocket;

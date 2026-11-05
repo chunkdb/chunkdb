@@ -169,6 +169,7 @@ void SlotWatch::Finish(std::optional<Output> control) {
     // Archive/subscription destruction can enter table control; never do it
     // on the socket thread or while holding its queue lock.
     pending_.reset();
+    prepared_.reset();
     archive_.reset();
     live_.reset();
     claim_.reset();
@@ -209,18 +210,18 @@ bool SlotWatch::FlushAck(bool force) {
     return acknowledged <= written_;
 }
 
-bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
-    { std::lock_guard lock(mutex_); if (!output_.empty()) return false; }
+SlotWatch::Prepared SlotWatch::Prepare(const std::shared_ptr<const FeedEntry>& original) const {
+    Prepared result{.original = original, .schema = schema_};
     const bool mutation = original->kind == FeedEntry::Kind::kChange || original->kind == FeedEntry::Kind::kChunks;
     std::vector<Column> columns;
     if (original->kind == FeedEntry::Kind::kSchema && options_.column_ids) columns = original->columns;
     else if (mutation && (options_.column_ids || schema_ != original->schema_version))
         columns = table_->geometry().LayoutAt(original->schema_version).schema().columns;
-    auto entry = options_.chunks && mutation
+    result.entry = options_.chunks && mutation
         ? ChunkFeedEntry(original, table_->geometry(), options_.area, options_.column_ids)
         : FilterFeedEntry(original, options_.area, options_.column_ids, options_.no_before, columns);
-    if (!entry) return true;
-    std::optional<Output> schema;
+    const auto& entry = result.entry;
+    if (!entry) return result;
     if ((entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks) && schema_ != entry->schema_version) {
         FeedEntry metadata;
         metadata.kind = FeedEntry::Kind::kSchema;
@@ -228,19 +229,24 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
         metadata.schema_version = entry->schema_version;
         metadata.columns = columns;
         auto projected = FilterFeedEntry(std::make_shared<const FeedEntry>(std::move(metadata)), {}, options_.column_ids, false, columns);
-        schema = Output{std::make_shared<const std::string>(EncodeFeedEntry(*projected))};
+        result.next.push_back(Output{std::make_shared<const std::string>(EncodeFeedEntry(*projected))});
     }
     auto frame = entry->protocol_frame ? entry->protocol_frame : std::make_shared<const std::string>(EncodeFeedEntry(*entry));
-    const auto size = frame->size() + (schema ? schema->bytes->size() : 0U);
-    std::list<MutationReceipt> receipt;
-    if (options_.ack_timeout_ms && (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks))
-        receipt.push_back({entry->position.revision, {}});
-    const auto receipt_bytes = receipt.size() * kReceiptBytes;
-    std::deque<Output> next;
-    if (schema) next.push_back(std::move(*schema));
     const bool eligible = entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks || entry->kind == FeedEntry::Kind::kProgress;
-    next.push_back({std::move(frame), eligible ? std::optional<std::uint64_t>(entry->position.revision) : std::nullopt});
-    bool refunded = false;
+    result.next.push_back({std::move(frame), eligible ? std::optional<std::uint64_t>(entry->position.revision) : std::nullopt});
+    for (const auto& output : result.next) result.size += output.bytes->size();
+    if (options_.ack_timeout_ms && (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks))
+        result.receipt.push_back({entry->position.revision, {}});
+    return result;
+}
+bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
+    { std::lock_guard lock(mutex_); if (!output_.empty()) return false; }
+    // A frame refused for room keeps its built form until the next attempt.
+    if (!prepared_ || prepared_->original != original || prepared_->schema != schema_) prepared_ = Prepare(original);
+    const auto entry = prepared_->entry;
+    if (!entry) { prepared_.reset(); return true; }
+    const auto size = prepared_->size;
+    const auto receipt_bytes = prepared_->receipt.size() * kReceiptBytes;
     {
         std::lock_guard lock(mutex_);
         if (cancelled_ || unwatch_ || ack_expired_ || takeover_) return false;
@@ -250,29 +256,29 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
         // Unacknowledged receipts stay within the share; the first one always fits.
         const auto held = receipts_.size() * kReceiptBytes;
         if (held != 0U && (held > quota_ || receipt_bytes > quota_ - held)) return false;
-        // Output stays within the share. A frame that cannot fit it waits until
-        // this watch has no unsent output and is then charged to the table's
-        // excess pool, so the number of watches sharing the table never makes
-        // a change within the table budget undeliverable.
-        const auto reserved = held + receipt_bytes;
-        const bool excess = reserved > quota_ || size > quota_ - reserved || unsent_ > quota_ - reserved - size;
-        if (excess && unsent_ != 0U) return false;
-        if (!Charge(*table_bytes_, excess ? receipt_bytes : size + receipt_bytes, table_budget)) return false;
-        refunded = excess && !Charge(*excess_bytes_, size, table_budget);
-        if (refunded) Release(receipt_bytes, 0U);
-        else {
-            if (excess) excess_ = size;
-            receipts_.splice(receipts_.end(), receipt);
-            output_.swap(next);
-            bytes_ += size;
-            unsent_ += size;
+        // Output stays within the share. A frame larger than the share waits
+        // until this watch has no unsent output and is then charged to the
+        // table's excess pool, so the number of watches sharing the table
+        // never makes a change within the table budget undeliverable.
+        const auto charge = size + receipt_bytes;
+        const bool excess = charge > quota_;
+        if (excess ? unsent_ != 0U : (held > quota_ - charge || unsent_ > quota_ - charge - held)) return false;
+        if (excess && !Charge(*excess_bytes_, size, table_budget)) return false;
+        if (!Charge(*table_bytes_, excess ? receipt_bytes : charge, table_budget)) {
+            // Only the catch-up worker charges, so no admission saw this one.
+            Release(0U, excess ? size : 0U);
+            return false;
         }
+        if (excess) {
+            excess_ = size;
+            for (auto& output : prepared_->next) output.excess = true;
+        }
+        receipts_.splice(receipts_.end(), prepared_->receipt);
+        output_.swap(prepared_->next);
+        bytes_ += size;
+        unsent_ += size;
     }
-    // Another watch may be waiting for the refunded receipt charge.
-    if (refunded) {
-        if (receipt_bytes != 0U && options_.notify) options_.notify();
-        return false;
-    }
+    prepared_.reset();
     if (auto* hook = hook_.load(std::memory_order_acquire))
         hook->Run(FeedDeliveryTestHook::Point::kAfterAdmission, size);
     if (entry->kind == FeedEntry::Kind::kProgress)

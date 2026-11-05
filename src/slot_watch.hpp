@@ -63,6 +63,8 @@ class SlotWatch {
         bool close = false;
         bool resume = false;
         bool charged = true;
+        // Charged to the table excess pool; must be written within the client I/O deadline.
+        bool excess = false;
     };
     static std::shared_ptr<SlotWatch> Create(std::shared_ptr<Table> table,
         std::string name, FeedOptions options, bool takeover = false, std::string user = {},
@@ -118,6 +120,16 @@ class SlotWatch {
     };
     // Includes the list node and allocator bookkeeping; allocation precedes admission.
     static constexpr std::size_t kReceiptBytes = sizeof(MutationReceipt) + 4U * sizeof(void*);
+    // A built frame with its receipt, kept while it waits for room.
+    struct Prepared {
+        std::shared_ptr<const FeedEntry> original;
+        std::uint64_t schema = 0;
+        std::shared_ptr<const FeedEntry> entry{};
+        std::deque<Output> next{};
+        std::size_t size = 0;
+        std::list<MutationReceipt> receipt{};
+    };
+    [[nodiscard]] Prepared Prepare(const std::shared_ptr<const FeedEntry>& original) const;
     const std::shared_ptr<Table> table_;
     std::shared_ptr<FeedSlotClaim> claim_;
     const std::weak_ptr<FeedSlotClaim> generation_;
@@ -146,6 +158,7 @@ class SlotWatch {
     std::unique_ptr<FeedSubscription> live_;
     std::optional<FeedArchiveReader> archive_;
     std::shared_ptr<const FeedEntry> pending_;
+    std::optional<Prepared> prepared_;
     std::chrono::steady_clock::time_point next_progress_;
 };
 }  // namespace chunkdb

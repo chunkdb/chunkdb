@@ -632,6 +632,8 @@ if(CHUNKDB_BUILD_TESTS)
     set_tests_properties(feed_slots_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
     add_test(NAME feed_migrations_fence COMMAND chunkdb_server_slots_protocol_test --migration-fence-only)
     set_tests_properties(feed_migrations_fence PROPERTIES TIMEOUT 90)
+    add_test(NAME feed_slots_shares COMMAND chunkdb_server_slots_protocol_test --shares-only)
+    set_tests_properties(feed_slots_shares PROPERTIES TIMEOUT 120 LABELS "smoke")
 
     add_executable(chunkdb_server_migrations_protocol_test
         tests/server_migrations_protocol_tests.cpp

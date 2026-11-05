@@ -5,6 +5,7 @@
 #include "chunkdb/logging.hpp"
 #include <algorithm>
 #include <climits>
+#include <limits>
 #include <unordered_map>
 #ifndef _WIN32
 #include <sys/uio.h>
@@ -184,9 +185,26 @@ void FeedIo::CatchUp() {
     { std::lock_guard lock(catchup_mutex_); states.swap(slots_); slot_count_.store(0U, std::memory_order_release); }
     for (const auto& state : states) { state->Cancel(); state->WorkStep(); }
 }
-void FeedIo::Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision, bool charged) {
-    watch.output.push_back({std::move(bytes), revision, charged});
+void FeedIo::Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision, bool charged, bool excess) {
+    watch.output.push_back({std::move(bytes), revision, charged, excess});
     watch.bytes += watch.output.back().bytes->size();
+    // Like a reply, a frame held in the shared excess pool must be written
+    // within the client I/O deadline, so a reader that stops cannot hold it.
+    if (excess && watch.excess_frames++ == 0U)
+        watch.excess_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
+}
+void FeedIo::ReleaseOutput(Watch& watch) {
+    // A dropped queue is never written; release its slot charges now.
+    bool released = false;
+    if (const auto& slot = watch.connection->session.slot_watch) {
+        auto offset = watch.offset;
+        for (const auto& output : watch.output) {
+            if (output.charged && output.bytes->size() > offset) { slot->Consumed(output.bytes->size() - offset); released = true; }
+            offset = 0U;
+        }
+    }
+    watch.output.clear(); watch.bytes = 0U; watch.offset = 0U; watch.excess_frames = 0U;
+    if (released) Wake();
 }
 void FeedIo::Reject(Watch& watch, std::string message) {
     watch.close = true;
@@ -201,9 +219,7 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
             // buffered mutations drain. Never inject an error inside a partial
             // RESP frame or replace SSL_write's pinned retry buffer.
             if (watch.offset != 0U || watch.write_size != 0) { watch.dead = true; return; }
-            for (const auto& output : watch.output)
-                if (output.charged) slot->Consumed(output.bytes->size());
-            watch.output.clear(); watch.bytes = 0U;
+            ReleaseOutput(watch);
             if (slot->TakingOver()) {
                 Queue(watch, std::make_shared<const std::string>(Protocol::Error("KILLED", "slot ownership was taken over",
                     {{"reason", "slot_takeover"}})), {}, false);
@@ -214,17 +230,16 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
             return;
         }
         slot->SetQuota(share > 128U ? share - 128U : share);
-        // Admission already checked the share, or charged one larger frame
-        // to the table's excess pool. Keep room for an accepted frame when
-        // another watch subsequently reduces that share. Charges remain in
-        // the table budget until the socket consumes the bytes.
-        const auto capacity = std::max<std::size_t>(slot->budget(), 128U);
+        // Admission bounds all charged output, including what this queue
+        // already holds, and frames accepted before another watch reduced the
+        // share. Take accepted output whenever it is ready; Read bounds the
+        // uncharged replies queued beside it.
         for (std::size_t i = 0U; i < 64U; ++i) {
-            auto entry = slot->Take(capacity - std::min(capacity, watch.bytes));
+            auto entry = slot->Take(std::numeric_limits<std::size_t>::max());
             if (!entry) return;
             watch.close = entry->close;
             watch.return_ready = entry->resume;
-            Queue(watch, std::move(entry->bytes), entry->revision, entry->charged);
+            Queue(watch, std::move(entry->bytes), entry->revision, entry->charged, entry->excess);
             Wake();
             if (watch.close || watch.return_ready) return;
         }
@@ -391,6 +406,7 @@ void FeedIo::Advance(Watch& watch, std::size_t bytes) {
         if (watch.offset == watch.output.front().bytes->size()) {
             if (watch.output.front().revision && watch.connection->session.slot_watch)
                 watch.connection->session.slot_watch->Sent(*watch.output.front().revision);
+            if (watch.output.front().excess) --watch.excess_frames;
             watch.output.pop_front();
             watch.offset = 0U;
         }
@@ -497,6 +513,12 @@ void FeedIo::Run() {
                     const bool takeover_wait = slot && slot->TakingOver() && !slot->Finished();
                     if (!watch.dead && !takeover_wait && (!watch.connection->tls || watch.read_wait != POLLOUT)) Write(watch);
                     if (watch.close_immediate) watch.dead = true;
+                    if (!watch.dead && watch.excess_frames != 0U && std::chrono::steady_clock::now() >= watch.excess_deadline) {
+                        LogMessage(LogLevel::kWarn, LogComponent::kServer, "slot watch write deadline exceeded",
+                            {{"unsent_bytes", std::to_string(watch.bytes)},
+                             {"timeout_ms", std::to_string(server_.config_.client_io_timeout_ms)}});
+                        watch.dead = true;
+                    }
                     if (watch.read_paused && watch.bytes <= std::max<std::size_t>(watch.share, 128U) - 128U)
                         watch.read_paused = false;
                 }
@@ -514,7 +536,7 @@ void FeedIo::Run() {
                     // may already be moving its session.
                     const bool ack_timeout_closed = !returned && watch.connection->session.slot_watch &&
                         watch.connection->session.slot_watch->AckTimedOut();
-                    if (!returned) server_.CloseClient(*watch.connection);
+                    if (!returned) { ReleaseOutput(watch); server_.CloseClient(*watch.connection); }
                     if (ack_timeout_closed)
                         if (auto* hook = hook_.load(std::memory_order_acquire))
                             hook->Run(FeedDeliveryTestHook::Point::kAfterAckTimeoutClose, 0U);
@@ -538,11 +560,13 @@ void FeedIo::Run() {
                 if (watch.connection->tls && watch.write_size != 0 &&
                     !(watch.connection->session.slot_watch && watch.connection->session.slot_watch->TakingOver())) events = watch.write_wait;
                 descriptors.push_back({watch.connection->socket, events, 0});
-                if (!watch.connection->session.slot_watch && !watch.unwatch && !watch.close && !watch.dead) {
-                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(watch.next_progress - now).count();
+                const auto wait_until = [&](std::chrono::steady_clock::time_point at) {
+                    const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(at - now).count();
                     const auto timeout = remaining < 0 ? 0 : static_cast<int>(std::min<std::int64_t>(remaining + 1, INT_MAX));
                     if (progress_timeout < 0 || timeout < progress_timeout) progress_timeout = timeout;
-                }
+                };
+                if (!watch.connection->session.slot_watch && !watch.unwatch && !watch.close && !watch.dead) wait_until(watch.next_progress);
+                if (watch.excess_frames != 0U && !watch.dead) wait_until(watch.excess_deadline);
 #ifdef CHUNKDB_WITH_OPENSSL
                 if (watch.write_size == 0 && !watch.unwatch && !watch.close && !watch.read_paused && watch.connection->tls &&
                     SSL_pending(watch.connection->tls) > 0) buffered_tls = true;

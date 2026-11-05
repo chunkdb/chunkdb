@@ -16,7 +16,10 @@ After WATCH admission, the socket/TLS session moves from its worker to feed I/O.
 Wakeup channels signal new changes, durable frontiers and shutdown; output does not hold request workers.
 Retained changes use the table budget; queued output uses per-watch shares of it plus one table pool of the same size for slot frames above a share.
 Ordinary overflow requests resync; slot overflow catches up from archives, while an event larger than the table budget ends the watch.
-A slot frame larger than its watch share waits until that watch has no unsent output, then is charged to a separate table pool bounded by the table budget, so share size never decides deliverability.
+A slot frame whose bytes and receipt exceed its watch share waits until that watch has no unsent output, then is charged to a separate table pool bounded by the table budget, so share size never decides deliverability.
+A frame that fits the share alone waits for ACKs instead when receipts fill it.
+A pool frame must be written within the client I/O deadline, or its connection closes and its charges are released at once; a watch waiting for the pool sends no progress.
+Only the catch-up worker charges either counter, and a waiting frame keeps its encoded form until it is admitted.
 Within-share slot output and receipts use another table counter bounded by the budget, so a pending large frame never delays them.
 Write captures evict the oldest retained changes before they are refused, so only readers below the evicted floor resync.
 An admitted frame remains valid when output shares change, and teardown releases ownership before rewatch.
