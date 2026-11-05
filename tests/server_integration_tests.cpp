@@ -2199,31 +2199,35 @@ std::string HelloWithOptionFrames(unsigned count) {
     return line + "\r\n";
 }
 
-// A request line and its parameter frames share one deadline: frames that
-// each arrive well within the I/O timeout, but together take longer, end
-// the request. Before HELLO that deadline is the HELLO deadline. The server
-// closes while frames are still being sent, so its log tells why and when.
+// Sends `piece` `count` times, 100 ms apart, each well within the I/O
+// timeout; stops once the server has closed the connection.
+template <typename Client>
+std::thread Trickle(Client& client, const std::string& piece, unsigned count) {
+    return std::thread([&client, piece, count] {
+        for (unsigned i = 0U; i < count; ++i) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            try {
+                client.SendBytes(piece);
+            } catch (const std::exception&) {
+                return;  // closed by the server
+            }
+        }
+    });
+}
+
+// Before authentication every read ends at the HELLO deadline, frames
+// included, however steadily they arrive. After it, each frame has the I/O
+// timeout of its own. The server closes while frames are still being sent,
+// so its log tells why and when.
 template <typename Client>
 void CheckTrickledFramesAreBounded(std::uint16_t port, std::size_t io_timeout_ms) {
-    const auto trickle = [](Client& client, const std::string& frame, unsigned count) {
-        return std::thread([&client, frame, count] {
-            for (unsigned i = 0U; i < count; ++i) {
-                std::this_thread::sleep_for(std::chrono::milliseconds(100));
-                try {
-                    client.SendBytes(frame);
-                } catch (const std::exception&) {
-                    return;  // closed by the server
-                }
-            }
-        });
-    };
     const auto io_timeout = std::chrono::milliseconds(io_timeout_ms);
     {
         ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
         const auto start = Clock::now();
         Client client("127.0.0.1", port);
         client.SendBytes(HelloWithOptionFrames(12U));
-        auto sender = trickle(client, "$-1\r\n", 12U);
+        auto sender = Trickle(client, "$-1\r\n", 12U);
         const bool refused = logs.WaitContains("HELLO 3 was not completed within the I/O timeout", std::chrono::seconds(3));
         const auto elapsed = Clock::now() - start;
         sender.join();
@@ -2238,40 +2242,31 @@ void CheckTrickledFramesAreBounded(std::uint16_t port, std::size_t io_timeout_ms
     }
     Client client("127.0.0.1", port);
     client.Hello();
-    client.SendLine("CREATE TABLE trickle (c1 text(8), c2 text(8), c3 text(8), c4 text(8), c5 text(8), c6 text(8), "
-                    "c7 text(8), c8 text(8), c9 text(8), c10 text(8), c11 text(8), c12 text(8), marker u8) CHUNK 4 x 4");
+    client.SendLine("CREATE TABLE trickle (c1 text(8), c2 text(8), c3 text(8), c4 text(8), marker u8) CHUNK 4 x 4");
     const auto created = client.ReadLine();
     if (created != "+OK\r\n") throw std::runtime_error("create trickle table: " + created);
-    std::string set = "SET BLOCK 0 0 IN trickle ";
-    std::string frames;
-    for (unsigned i = 1U; i <= 12U; ++i) {
-        set += (i == 1U ? "c" : ", c") + std::to_string(i) + " = $" + std::to_string(i);
-        frames += "$1\r\nx\r\n";
+    const std::string set = "SET BLOCK 0 0 IN trickle c1 = $1, c2 = $2, c3 = $3, c4 = $4\r\n";
+    const std::string frame = "$1\r\nx\r\n";
+    // Frames 200 ms apart under a 300 ms timeout: the statement takes longer
+    // than the timeout as a whole, and still applies.
+    client.SendBytes(set);
+    for (int i = 0; i < 4; ++i) {
+        std::this_thread::sleep_for(io_timeout * 2 / 3);
+        client.SendBytes(frame);
     }
-    set += "\r\n";
-    // Each request has a deadline of its own, however long the connection
-    // waited between requests.
-    for (int i = 0; i < 2; ++i) {
-        if (i != 0) std::this_thread::sleep_for(io_timeout * 2);
-        client.SendBytes(set + frames);
-        assert(client.ReadLine().front() == ':');
-    }
+    assert(client.ReadLine().front() == ':');
     client.SendLine("PING");
     assert(client.ReadLine() == "+PONG\r\n");
     {
+        // A gap longer than the timeout closes the connection.
         ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
         const auto start = Clock::now();
-        client.SendBytes(set);
-        auto sender = trickle(client, "$1\r\nx\r\n", 12U);
+        client.SendBytes(set + frame);
         const bool ended = logs.WaitContains("phase=read reason=timeout", std::chrono::seconds(3));
         const auto elapsed = Clock::now() - start;
-        sender.join();
         assert(ended);
         assert(elapsed >= io_timeout && elapsed < io_timeout + std::chrono::milliseconds(600));
-        try {
-            assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol incomplete parameter frame\r\n");
-        } catch (const std::runtime_error&) {
-        }
+        assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol incomplete parameter frame\r\n");
     }
     // The single worker is free again.
     Client fast("127.0.0.1", port);
@@ -2280,8 +2275,34 @@ void CheckTrickledFramesAreBounded(std::uint16_t port, std::size_t io_timeout_ms
     assert(fast.ReadLine() == "+PONG\r\n");
 }
 
+// AUTH and its frame end at the HELLO deadline too, counted from the
+// connection's start rather than from the AUTH line.
+template <typename Client>
+void CheckTrickledAuthIsBounded(std::uint16_t port, std::size_t io_timeout_ms) {
+    const auto io_timeout = std::chrono::milliseconds(io_timeout_ms);
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+    const auto start = Clock::now();
+    Client client("127.0.0.1", port);
+    const auto login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
+    client.SendBytes(chunkdb::test::HelloUserBytes(login, kAdminUser));
+    assert(client.ReadLine().rfind("+SCRAM ", 0) == 0);
+    std::this_thread::sleep_for(io_timeout / 2);
+    client.SendBytes("AUTH $1\r\n$64\r\n");
+    auto sender = Trickle(client, "x", 12U);
+    const bool refused = logs.WaitContains("HELLO 3 was not completed within the I/O timeout", std::chrono::seconds(3));
+    const auto elapsed = Clock::now() - start;
+    sender.join();
+    assert(refused);
+    assert(elapsed >= io_timeout && elapsed < io_timeout + std::chrono::milliseconds(600));
+    try {
+        assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol HELLO 3 was not completed within the I/O timeout\r\n");
+    } catch (const std::runtime_error&) {
+    }
+}
+
 void TestTrickledFramesAreBounded() {
     auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
+    auto auth_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
     auto server_cfg = BaseServerConfig();
     server_cfg.worker_threads = 1;
     server_cfg.client_io_timeout_ms = 300;
@@ -2289,11 +2310,15 @@ void TestTrickledFramesAreBounded() {
     {
         ServerHarness harness("trickled-frames", BaseStoreConfig(), engine_cfg, server_cfg);
         CheckTrickledFramesAreBounded<RawClient>(harness.port, server_cfg.client_io_timeout_ms);
+        ServerHarness auth("trickled-auth", BaseStoreConfig(), auth_cfg, server_cfg);
+        CheckTrickledAuthIsBounded<RawClient>(auth.port, server_cfg.client_io_timeout_ms);
     }
 #ifdef CHUNKDB_WITH_OPENSSL
     server_cfg.tls_enabled = true;
     ServerHarness tls("trickled-frames-tls", BaseStoreConfig(), engine_cfg, server_cfg);
     CheckTrickledFramesAreBounded<TlsClient>(tls.port, server_cfg.client_io_timeout_ms);
+    ServerHarness tls_auth("trickled-auth-tls", BaseStoreConfig(), auth_cfg, server_cfg);
+    CheckTrickledAuthIsBounded<TlsClient>(tls_auth.port, server_cfg.client_io_timeout_ms);
 #endif
 }
 

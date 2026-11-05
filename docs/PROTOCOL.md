@@ -10,8 +10,8 @@ TCP uses `chunk://`; TLS uses `chunks://` with certificate validation in the cli
 Lines end with LF or CRLF; a line cut off at end of stream is never executed.
 The terminator counts toward `--max-line-bytes` (65536 by default); overflow sends BAD_REQUEST and closes.
 Binary parameter frames do not count toward that line limit.
-A request line and its parameter frames must arrive within `--client-io-timeout-ms` of the request's first byte, or the connection closes.
-HELLO, with AUTH and their frames, must succeed within `--client-io-timeout-ms` of the connection's start, after any TLS handshake; a later one receives PROTOCOL and closes.
+Until authentication succeeds, HELLO, AUTH and all their parameter frames must arrive within `--client-io-timeout-ms` of the connection's start, after any TLS handshake; later ones receive PROTOCOL and close.
+After authentication, each request line, parameter frame header and frame body must arrive within `--client-io-timeout-ms` of its first byte.
 
 The first line must be HELLO 3; a different version or statement receives PROTOCOL and closes without execution.
 `HELLO 3` alone is accepted only under `--auth none`; otherwise it receives AUTH_REQUIRED.
