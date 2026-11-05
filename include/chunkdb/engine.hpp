@@ -240,6 +240,8 @@ class CommandEngine {
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
     }
+    // The users of the data directory; null without users.
+    [[nodiscard]] const std::shared_ptr<UserRegistry>& users() const noexcept { return config_.users; }
     // Test-only visibility into the bounded auth-failure tracking table.
     [[nodiscard]] std::size_t AuthFailureTrackedSourcesForTests();
     void SetHookForTests(CommandEngineTestHook* hook) noexcept {
@@ -294,6 +296,12 @@ class CommandEngine {
     // AUTH_REQUIRED for a session whose user was dropped, closing it after
     // the reply; empty while the user exists.
     [[nodiscard]] std::string LostUserReply(SessionState& session) const;
+    // LostUserReply, recorded in the metrics and logs as a refused statement.
+    [[nodiscard]] std::string AnswerLostUser(
+        SessionState& session, std::string_view line, std::chrono::steady_clock::time_point started);
+    // What the logs say about `line` (engine_cql.cpp); nothing when it does
+    // not parse.
+    static void DescribeLine(std::string_view line, StatementLogInfo& info);
     // The table a statement names, leased for it; the session keeps the
     // table so the next statement on it skips the catalog.
     [[nodiscard]] Table::Lease AcquireNamedTable(SessionState& session, std::string_view name) const;

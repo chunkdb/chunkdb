@@ -433,6 +433,29 @@ void OrdinaryDropGrantFencing() {
     assert(e.users->Find("limited")->grants.at("realm") == Right::kWrite);
 }
 
+// A watch rechecks READ from the published rights view: a migration holding
+// the registry lock across its journal writes does not hold up the check.
+void RightCheckDuringUserMigration() {
+    test::ScopedTempDir dir("chunkdb-migrations-right-check");
+    Engine e(dir.path(), true);
+    Reply(e.Run(kCreate), "+OK\r\n");
+    e.users->Create("limited", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
+    e.users->Grant("limited", "realm", Right::kRead);
+    ReadRightCheck check(e.users, "limited", e.users->FindIncarnation("limited")->incarnation, "realm",
+        e.users->Generation());
+    e.users->Revoke("limited", "realm", Right::kRead);
+    Pause pause;
+    e.catalog->SetMigrationTestHook(&pause);
+    auto migration = std::async(std::launch::async, [&] { return e.Run("MIGRATE 'grant' GRANT WRITE ON realm TO admin"); });
+    pause.WaitPrepared();
+    auto checked = std::async(std::launch::async, [&] { return check.Check(); });
+    const bool prompt = checked.wait_for(10s) == std::future_status::ready;
+    pause.Release();
+    Reply(migration.get(), "+applied\r\n");
+    e.catalog->SetMigrationTestHook(nullptr);
+    assert(prompt && checked.get() == ReadRightCheck::State::kNoRight);
+}
+
 void RebindRecoveredUsers() {
     test::ScopedTempDir dir("chunkdb-migrations-users-rebind");
     std::shared_ptr<UserRegistry> reused;
@@ -589,6 +612,6 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
     ConditionalDdl(); ConditionalColumnsRefusePoisonedStore(); ConditionalJournalValidationAndRecovery();
-    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
+    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RightCheckDuringUserMigration(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
     LedgerLimit(false); LedgerLimit(true);
 }

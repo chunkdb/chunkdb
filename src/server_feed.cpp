@@ -312,10 +312,11 @@ void FeedIo::Read(Watch& watch) {
             try {
                 auto parsed = cql::Parse(line.substr(0, line.find_first_of("\r\n")));
                 if (const auto* ack = std::get_if<cql::Ack>(&parsed.statement); ack && connection.session.slot_watch) {
-                    // An ACK read after the right was lost is never accepted.
-                    if (!Permitted(watch)) return;
                     if (auto* hook = hook_.load(std::memory_order_acquire))
                         hook->Run(FeedDeliveryTestHook::Point::kBeforeSlotAck, 0U);
+                    // The last check before the ACK is accepted: a change
+                    // applied before it refuses the ACK.
+                    if (!Permitted(watch)) return;
                     try {
                         // The worker may have queued a terminal error after
                         // the last change was sent. Drain that cause before

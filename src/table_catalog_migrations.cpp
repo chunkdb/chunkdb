@@ -290,9 +290,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             const auto disk_users = ReadUsersFile(config_.data_dir);
             if (!disk_users) throw std::runtime_error("migration users file disappeared");
             if (users->users_ != *disk_users) {
-                users->users_ = *disk_users;
-                users->IncarnateLocked();
-                users->generation_.fetch_add(1, std::memory_order_acq_rel);
+                auto publication = users->PrepareLocked(*disk_users);
+                users->CommitLocked(*disk_users, std::move(publication));
             }
             next_users = users->users_;
         }
@@ -313,6 +312,9 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             }
         }
         if (next_users) add_file(std::string(kUsersFileName), EncodeUsers(*next_users));
+        // Built before the decision, so publishing the users cannot fail after it.
+        std::optional<UserRegistry::Publication> users_publication;
+        if (next_users && users) users_publication = users->PrepareLocked(*next_users);
         records.push_back(journal.record);
         add_file(std::string(kMigrationsFileName), EncodeMigrationRecords(root->data_dir_id, records));
         ValidateMigrationJournal(config_.data_dir, journal);
@@ -335,9 +337,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         CompleteMigrationJournal(config_.data_dir, journal);
         version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
         if (next_users && users) {
-            users->users_ = std::move(*next_users);
-            users->IncarnateLocked();
-            users->generation_.fetch_add(1, std::memory_order_acq_rel);
+            users->CommitLocked(std::move(*next_users), std::move(*users_publication));
         }
         if (user_lock.owns_lock()) user_lock.unlock();
         if (!no_op && request.kind == MigrationRequest::Kind::kCreate) {

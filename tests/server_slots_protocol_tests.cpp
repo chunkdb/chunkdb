@@ -408,10 +408,10 @@ void Rights(bool tls) {
     Error(reader.Command("CREATE SLOT '../bad' ON t"), "SYNTAX");
 }
 
-// READ holds while a watch streams, not only when it opens. A REVOKE ends
-// plain and slot watches with NO_TABLE before a later change is sent, and an
-// ACK read after it is refused and not persisted. Changes to other users
-// leave the watches streaming.
+// READ holds while a watch streams, not only when it opens. Changes to other
+// users and to other rights leave the watches streaming; a REVOKE ends idle
+// plain and slot watches with NO_TABLE at once, without a later write, push
+// or ACK to carry it (the harness progress interval is 60 s).
 void WatchRevoke(bool tls) {
     Harness harness(tls, true);
     auto admin = harness.Connect(); Create(*admin);
@@ -425,20 +425,51 @@ void WatchRevoke(bool tls) {
     admin->Ok("GRANT WRITE ON t TO reader"); admin->Ok("REVOKE WRITE ON t FROM reader"); // READ stays.
     const auto first = Set(*admin, 7);
     assert(Change(NextChange(plain)) == first && Change(NextChange(slot)) == first);
+    admin->Ok("REVOKE READ ON t FROM reader");
+    Error(plain.Read(), "NO_TABLE"); Closed(plain);
+    Error(slot.Read(), "NO_TABLE"); Closed(slot);
+}
+
+// Applies a REVOKE when the feed has read an ACK, before it accepts it.
+class RevokeAtAck : public FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        if (point == Point::kBeforeSlotAck && users && !std::exchange(revoked, true)) users->Revoke("reader", "t", Right::kRead);
+    }
+    std::shared_ptr<UserRegistry> users;
+    bool revoked = false; // Only the feed thread runs the hook.
+};
+
+// An ACK checked after the REVOKE is applied is refused and never persisted.
+void WatchAckRevoke(bool tls) {
+    RevokeAtAck revoke;
+    Harness harness(tls, true);
+    auto admin = harness.Connect(); Create(*admin);
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
+    admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
+    admin->Ok("GRANT READ ON t TO reader");
+    Client slot(harness.port, tls); slot.Login("reader", "pw"); (void)Start(slot.Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*admin, 7);
+    assert(Change(NextChange(slot)) == first);
     slot.Line("ACK " + std::to_string(first));
     WaitAck(*admin, "t", "consumer", first);
     const auto second = Set(*admin, 8);
-    assert(Change(NextChange(plain)) == second && Change(NextChange(slot)) == second);
-    admin->Ok("REVOKE READ ON t FROM reader");
+    assert(Change(NextChange(slot)) == second);
+    revoke.users = harness.engine().users();
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &revoke);
+    Cleanup clear([&] { FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
     slot.Line("ACK " + std::to_string(second));
     Error(slot.Read(), "NO_TABLE"); Closed(slot);
-    (void)Set(*admin, 9);
-    Error(plain.Read(), "NO_TABLE"); Closed(plain);
-    assert(Number(Field(Slot(admin->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == first);
+    assert(revoke.revoked);
+    // Takeover starts from every ACK the old owner accepted.
+    auto next = harness.Connect();
+    assert(Start(next->Command("WATCH t SLOT 'consumer' TAKEOVER")).second == first);
+    Unwatch(*next);
 }
 
-// DROP USER ends the watches of its sessions with AUTH_REQUIRED, even when a
-// user of the same name is created again with READ before the next change.
+// DROP USER ends the idle watches of its sessions with AUTH_REQUIRED at once,
+// even when a user of the same name is created again with READ.
 void WatchDroppedUser(bool tls) {
     Harness harness(tls, true);
     auto admin = harness.Connect(); Create(*admin);
@@ -453,7 +484,6 @@ void WatchDroppedUser(bool tls) {
     admin->Ok("DROP USER reader");
     admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
     admin->Ok("GRANT READ ON t TO reader");
-    (void)Set(*admin, 8);
     const auto dropped = [](const Reply& reply) {
         Error(reply, "AUTH_REQUIRED");
         assert(reply.value.find("reason=user_dropped") != std::string::npos);
@@ -1536,7 +1566,7 @@ int main(int argc, char** argv) {
         run("conditional-objects", ConditionalObjects);
         run("slot-record-outcome", SlotRecordOutcome);
         run("takeover-fence", TakeoverFence); run("takeover", Takeover); run("takeover-rights", TakeoverRights); run("takeover-UNWATCH-return", TakeoverUnwatchReturn); run("takeover-stalled-socket", TakeoverStalledSocket);
-        run("lifecycle", Lifecycle); run("rights", Rights); run("watch-revoke", WatchRevoke); run("watch-dropped-user", WatchDroppedUser); run("archive-handover", ArchiveHandover);
+        run("lifecycle", Lifecycle); run("rights", Rights); run("watch-revoke", WatchRevoke); run("watch-ACK-revoke", WatchAckRevoke); run("watch-dropped-user", WatchDroppedUser); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);

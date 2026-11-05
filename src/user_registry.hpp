@@ -54,6 +54,20 @@ class UserRegistry {
     // Grows with every change, so a connection can tell its copy of its
     // user is stale with one atomic read.
     [[nodiscard]] std::uint64_t Generation() const noexcept { return generation_.load(std::memory_order_acquire); }
+    // The rights and incarnations of every user as of the latest change,
+    // published before Generation() moves past it. Reading it never waits
+    // for the registry lock, which a change holds while it syncs the file.
+    struct RightsView {
+        struct Entry {
+            std::uint64_t incarnation = 0;
+            std::map<std::string, Right> grants;
+        };
+        std::map<std::string, Entry> users;
+    };
+    [[nodiscard]] std::shared_ptr<const RightsView> Rights() const;
+    // Runs `wake` after every change while the returned handle is held.
+    // It runs under the registry lock: it must not block or use the users.
+    [[nodiscard]] std::shared_ptr<const std::function<void()>> OnChange(std::function<void()> wake);
 
     // Each throws std::invalid_argument for a change the rules refuse: an
     // existing or unknown user, a bad name, removing the last user who
@@ -88,9 +102,20 @@ class UserRegistry {
     void Update(Change&& change);
     template <typename Change>
     void UpdateIf(Change&& change);
-    // Under mutex_, after users_ changed: a user no longer present retires
-    // its incarnation, a new one gets the next.
-    void IncarnateLocked();
+    // What committing `next` publishes besides it: a user no longer present
+    // retires its incarnation, a new one gets the next, and the rights view
+    // is built again. Prepared under mutex_ before anything changes, so a
+    // failure to build it leaves users, file and view as they were.
+    struct Publication {
+        std::map<std::string, std::uint64_t> incarnations;
+        std::uint64_t next_incarnation = 1;
+        std::shared_ptr<const RightsView> rights;
+    };
+    [[nodiscard]] Publication PrepareLocked(const Users& next) const;
+    void InstallLocked(Publication publication) noexcept;
+    // Under mutex_: makes `next` current, moves the generation past it and
+    // runs every OnChange.
+    void CommitLocked(Users next, Publication publication) noexcept;
 
     const std::filesystem::path data_dir_;
     const bool read_only_;
@@ -99,12 +124,18 @@ class UserRegistry {
     std::map<std::string, std::uint64_t> incarnations_;
     std::uint64_t next_incarnation_ = 1;
     std::atomic<std::uint64_t> generation_{1};
+    // Guards only the pointer: held for a copy, never across I/O or another lock.
+    mutable std::mutex rights_mutex_;
+    std::shared_ptr<const RightsView> rights_;
+    std::mutex listeners_mutex_;
+    std::vector<std::weak_ptr<const std::function<void()>>> listeners_;
 };
 
 // Whether one logged-in user still has READ on one table, for a watch that
 // outlives the statement that checked it. While the users are unchanged a
-// check is one atomic load and compare; after a change it reads the user
-// again. A lost right or user stays lost. One thread checks.
+// check is one atomic load and compare; after a change it looks up that
+// user and table in the published rights view, without the registry lock.
+// A lost right or user stays lost. One thread checks.
 class ReadRightCheck {
   public:
     enum class State : std::uint8_t { kHeld, kNoRight, kNoUser };

@@ -46,6 +46,8 @@ struct Users {
 
 // The highest right `user` has on `table`, from a grant on it or on `*`.
 [[nodiscard]] std::optional<Right> RightOn(const User& user, const std::string& table);
+// The same from grants alone.
+[[nodiscard]] std::optional<Right> RightOn(const std::map<std::string, Right>& grants, const std::string& table);
 
 [[nodiscard]] std::vector<std::uint8_t> EncodeUsers(const Users& users);
 // Throws std::invalid_argument naming the defect: a damaged, truncated or

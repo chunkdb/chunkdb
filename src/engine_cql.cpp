@@ -594,6 +594,16 @@ bool HasColumn(const TableSchema& schema, std::string_view name) {
 }
 }  // namespace
 
+void CommandEngine::DescribeLine(std::string_view line, StatementLogInfo& info) {
+    cql::Parsed parsed;
+    try {
+        parsed = cql::Parse(StatementOf(line));
+    } catch (const cql::ParseError&) {
+        return;  // As in ExecuteStatement: a statement that does not parse is not logged.
+    }
+    DescribeStatement(parsed.statement, info);
+}
+
 void CommandEngine::RequireRight(SessionState& session, const std::string& table, Right needed) const {
     const auto right = RightOnTable(session, table);
     if (!right.has_value()) {
@@ -882,9 +892,11 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::Watch& watch) {
                     RequireRight(session, watch.table, Right::kRead);
-                    // The generation READ was confirmed at; a later look at
-                    // the user must not move it past a change the watch missed.
-                    const std::uint64_t read_generation = session.user_generation;
+                    // The feed ends the watch once the right or user is gone,
+                    // checking from the generation READ was confirmed at. Set
+                    // before subscribing: no watch exists without its check.
+                    session.watch_right = config_.require_auth ? std::make_shared<ReadRightCheck>(config_.users,
+                        session.user, session.user_incarnation, watch.table, session.user_generation) : nullptr;
                     auto table = catalog_->Require(watch.table);
                     const auto filters = SlotFilters(table, watch);
                     FeedOptions options{
@@ -911,9 +923,6 @@ std::string CommandEngine::ExecuteStatement(
                             return Protocol::Error("BUSY", "maximum slot catch-up workers reached", {{"reason", "slot_worker_limit"}, {"table", watch.table}});
                         session.slot_watch = std::move(state);
                     } else session.watch = table->SubscribeFeed(options);
-                    // The feed ends the watch once the right or user is gone.
-                    session.watch_right = config_.require_auth ? std::make_shared<ReadRightCheck>(config_.users,
-                        session.user, session.user_incarnation, watch.table, read_generation) : nullptr;
                     session.table = std::move(table);
                     const auto position = session.slot_watch ? session.slot_watch->position() : session.watch->position();
                     std::string reply;

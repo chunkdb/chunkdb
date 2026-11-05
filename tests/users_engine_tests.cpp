@@ -252,6 +252,8 @@ void TestRecreatedUser() {
     auto statement = server.LoggedIn("bot", "old");
     auto alter = server.LoggedIn("bot", "old");
     auto frames = server.LoggedIn("bot", "old");
+    auto hello = server.LoggedIn("bot", "old");
+    auto hello_frames = server.LoggedIn("bot", "old");
     auto bystander = server.LoggedIn("other", "other");
     ExpectReply(server.Run(statement, "GET BLOCK 0 0 FROM default"), "_\r\n");
 
@@ -269,6 +271,14 @@ void TestRecreatedUser() {
     const auto plan = server.engine->PlanPayload(frames, "SET BLOCK 0 0 IN default bits = $1\r\n");
     assert(plan.plan == CommandEngine::PayloadPlan::kDiscard && frames.close_after_reply);
     ExpectError(plan.reject_response, "AUTH_REQUIRED reason=user_dropped");
+    ExpectError(server.Run(hello, "HELLO 3"), "AUTH_REQUIRED reason=user_dropped");
+    assert(hello.close_after_reply);
+    const std::string hello_line = "HELLO 3 USER bot $1\r\n";
+    const auto hello_plan = server.engine->PlanPayload(hello_frames, hello_line);
+    assert(hello_plan.plan == CommandEngine::PayloadPlan::kDiscard);
+    ExpectError(server.engine->RejectPayload(hello_frames, hello_line, hello_plan.reject_response),
+                "AUTH_REQUIRED reason=user_dropped");
+    assert(hello_frames.close_after_reply);
 
     // The new user logs in with its own password; others are unaffected by
     // changes to users they are not.

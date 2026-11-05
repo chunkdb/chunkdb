@@ -278,6 +278,9 @@ std::string CommandEngine::Execute(
     const auto command_name = ExtractCommandName(line);
     const auto started = std::chrono::steady_clock::now();
     const bool hello = Protocol::CommandEquals(command_name, "HELLO");
+    // Before parsing: every line of a connection that lost its user, HELLO
+    // or one that would not parse too, gets the same reply and closes it.
+    if (std::string lost = AnswerLostUser(session, line, started); !lost.empty()) return lost;
     if (hello || (!session.greeted && Protocol::CommandEquals(command_name, "AUTH"))) {
         // The user a login names, for the audit log: from HELLO 3 USER, or
         // the pending login AUTH finishes.
@@ -341,12 +344,6 @@ std::string CommandEngine::Execute(
         ObserveReply(MetricsRegistry::CommandClass::kOther, started, response);
         return response;
     }
-    // Before parsing: every statement of a connection that lost its user,
-    // even one that would not parse, gets the same reply and closes it.
-    if (std::string lost = LostUserReply(session); !lost.empty()) {
-        ObserveReply(MetricsRegistry::CommandClass::kAuth, started, lost);
-        return lost;
-    }
     auto command_class = MetricsRegistry::CommandClass::kOther;
     ScopedWriteUser write_user(config_.require_auth ? std::string_view(session.user) : std::string_view{});
     // Neither log costs anything while both are off.
@@ -362,6 +359,9 @@ std::string CommandEngine::Execute(
 
 std::string CommandEngine::RejectPayload(SessionState& session, std::string_view line, std::string response) {
     const auto started = std::chrono::steady_clock::now();
+    // Whatever the planned rejection, a connection that lost its user gets
+    // the same reply as from Execute.
+    if (std::string lost = AnswerLostUser(session, line, started); !lost.empty()) return lost;
     const auto name = ExtractCommandName(line);
     const bool auth = Protocol::CommandEquals(name, "HELLO") || (!session.greeted && Protocol::CommandEquals(name, "AUTH"));
     if (!session.greeted) {
@@ -386,6 +386,20 @@ std::string CommandEngine::LostUserReply(SessionState& session) const {
     if (!config_.require_auth || !session.greeted || CurrentUser(session) != nullptr) return {};
     session.close_after_reply = true;
     return ErrorReply(UserDroppedError());
+}
+
+std::string CommandEngine::AnswerLostUser(
+    SessionState& session, std::string_view line, std::chrono::steady_clock::time_point started) {
+    std::string lost = LostUserReply(session);
+    if (lost.empty()) return lost;
+    ObserveReply(MetricsRegistry::CommandClass::kAuth, started, lost);
+    // Logged as other refused statements are; a line that does not parse is not.
+    if (config_.audit != nullptr || config_.slow_statement_ms != 0U) {
+        StatementLogInfo info;
+        DescribeLine(line, info);
+        if (info.verb != nullptr) LogStatement(session, info, started, lost);
+    }
+    return lost;
 }
 
 namespace {
