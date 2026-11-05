@@ -198,7 +198,7 @@ Undoing steps reconstructs and validates every earlier schema used by stored chu
 An optional final 10-byte narrowing suffix is `1:u8, column_id:u32, target_kind:u8, target_size:u32`; without pending narrowing there is no suffix.
 
 While this suffix exists, writes to that column must fit both types; writer startup and RECOVER TABLE remove interrupted narrowing before opening the table.
-Named migrations validate narrowing under exclusive admission before deciding and do not depend on this suffix for redo.
+Named migrations also record this suffix while they check stored values, and decide only if the table schema is unchanged since the check; redo does not depend on the suffix.
 
 ## Packed chunk state
 

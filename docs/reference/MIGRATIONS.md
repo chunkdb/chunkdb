@@ -63,6 +63,7 @@ Keyword case and internal whitespace remain part of the statement identity.
 Separating and trailing spaces or tabs are removed.
 
 Concurrent requests for the same name wait, then compare text.
+A narrowing ALTER COLUMN ... TYPE checks stored values without holding up statements on other tables; meanwhile writes to that column must fit the new type, and a refused step changes nothing.
 Completed records survive restart, backup, and restore together with their changes.
 A migration with an unknown outcome fences every table, because its decision can include the ledger, users and the root manifest.
 A table out of service after an ordinary failure fences only that table; a new migration naming it is refused until RECOVER TABLE recovers it, while an applied name still answers skipped.

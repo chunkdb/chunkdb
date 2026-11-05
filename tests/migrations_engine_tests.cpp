@@ -288,6 +288,110 @@ void NarrowingAndSlots() {
     assert(table->ListFeedSlots().size() == 1U);
 }
 
+struct PauseNarrowingScan : MigrationTestHook {
+    std::mutex mutex;
+    std::condition_variable cv;
+    bool scanning = false, release = false, rewrite = false, rewritten = false;
+    std::filesystem::path table_dir;
+    void Run(Point point, std::string_view) override {
+        std::unique_lock lock(mutex);
+        if (point == Point::kBeforeNarrowingScan && !rewrite) {
+            scanning = true; cv.notify_all(); cv.wait(lock, [&] { return release; });
+        }
+        if (point == Point::kBeforeNarrowingScan) scanning = true;
+        // Between the scan and the migration's exclusive admission of the
+        // table, the manifest changes under it.
+        if (point == Point::kBeforeTableExclusive && rewrite && scanning && !rewritten) {
+            auto manifest = *ReadStoreManifest(table_dir);
+            const auto pending = manifest.schema.pending;
+            manifest.schema = RenameColumn(WithoutPendingNarrowing(manifest.schema), "w", "renamed");
+            manifest.schema.pending = pending;
+            const auto bytes = SerializeStoreManifest(manifest);
+            std::ofstream out(StoreManifestPath(table_dir), std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+            assert(out);
+            rewritten = true;
+        }
+    }
+    void WaitScanning() { std::unique_lock lock(mutex); assert(cv.wait_for(lock, 10s, [&] { return scanning; })); }
+    void Release() { std::lock_guard lock(mutex); release = true; cv.notify_all(); }
+};
+
+void NarrowingScanOutsideCatalogAdmission() {
+    test::ScopedTempDir dir("chunkdb-migrations-narrow-scan");
+    Engine e(dir.path());
+    Reply(e.Run(kCreate), "+OK\r\n");
+    Reply(e.Run("CREATE TABLE other (v u16) CHUNK 2 x 2"), "+OK\r\n");
+    assert(e.Run("SET BLOCK 0 0 IN realm v=3").front() == ':');
+    PauseNarrowingScan pause;
+    e.catalog->SetMigrationTestHook(&pause);
+    auto narrow = std::async(std::launch::async, [&] { return e.Run("MIGRATE 'narrow' ALTER TABLE realm ALTER COLUMN v TYPE u8"); });
+    pause.WaitScanning();
+    assert(e.catalog->Find("realm")->Info().schema.pending);
+    SessionState second;
+    assert(e.engine->Execute(second, "HELLO 3").front() == '%');
+    // Other tables' DDL, migrations and SHOW MIGRATIONS do not wait for the scan.
+    auto others = std::async(std::launch::async, [&] {
+        Reply(e.engine->Execute(second, "CREATE TABLE fresh (v u8) CHUNK 2 x 2"), "+OK\r\n");
+        Reply(e.engine->Execute(second, "ALTER TABLE other ADD COLUMN extra u8 NULL"), "+OK\r\n");
+        Reply(e.engine->Execute(second, "MIGRATE 'drop_fresh' DROP TABLE fresh"), "+applied\r\n");
+        Reply(e.engine->Execute(second, "DROP TABLE other"), "+OK\r\n");
+        assert(e.catalog->Migrations().size() == 1U);
+        // Writes to the column must fit the narrower type while it is checked.
+        const auto refused = e.engine->Execute(second, "SET BLOCK 0 0 IN realm v=300");
+        assert(refused.starts_with("-ERR INVALID_ARGUMENT ") && refused.find("being narrowed to u8") != std::string::npos);
+        assert(e.engine->Execute(second, "SET BLOCK 1 0 IN realm v=200").front() == ':');
+    });
+    assert(others.wait_for(10s) == std::future_status::ready);
+    others.get();
+    pause.Release();
+    Reply(narrow.get(), "+applied\r\n");
+    e.catalog->SetMigrationTestHook(nullptr);
+    const auto records = e.catalog->Migrations();
+    assert(records.size() == 2U && records[0].name == "drop_fresh" && records[1].name == "narrow");
+    const auto schema = e.catalog->Find("realm")->Info().schema;
+    assert(schema.version == 2U && !schema.pending && schema.columns[0].type.size == 8U);
+    assert(!ReadMigrationJournal(dir.path()) && !ReadStoreManifest(dir.path() / "tables" / "realm")->schema.pending);
+    Reply(e.Run("GET BLOCK 0 0 FROM realm COLUMNS v"), "*1\r\n:3\r\n");
+    Reply(e.Run("GET BLOCK 1 0 FROM realm COLUMNS v"), "*1\r\n:200\r\n");
+}
+
+void NarrowingRefusalLeavesNoTrace() {
+    test::ScopedTempDir dir("chunkdb-migrations-narrow-refused");
+    Engine e(dir.path());
+    Reply(e.Run("CREATE TABLE world (v u16, w u8) CHUNK 2 x 2"), "+OK\r\n");
+    assert(e.Run("SET BLOCK 0 0 IN world v=3").front() == ':');
+    const auto table_dir = dir.path() / "tables" / "world";
+    const auto untouched = [&](std::uint64_t version) {
+        const auto schema = e.catalog->Find("world")->Info().schema;
+        assert(schema.version == version && !schema.pending && schema.columns[0].type.size == 16U);
+        assert(ReadStoreManifest(table_dir)->schema == schema);
+        assert(e.catalog->Migrations().empty() && !ReadMigrationJournal(dir.path()));
+    };
+    const std::string text = "MIGRATE 'narrow' ALTER TABLE world ALTER COLUMN v TYPE u8";
+    assert(e.Run("SET BLOCK 1 0 IN world v=300").front() == ':');
+    Error(e.Run(text), "INVALID_ARGUMENT");
+    untouched(1U);
+    assert(e.Run("DELETE BLOCK 1 0 FROM world").front() == ':');
+    {
+        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_NARROW_SCAN_FAIL_ONCE", "1");
+        Error(e.Run(text), "INTERNAL");
+    }
+    untouched(1U);
+    // The schema the scan checked changes before the decision.
+    PauseNarrowingScan changed;
+    changed.rewrite = true;
+    changed.table_dir = table_dir;
+    e.catalog->SetMigrationTestHook(&changed);
+    Error(e.Run(text), "INTERNAL");
+    e.catalog->SetMigrationTestHook(nullptr);
+    assert(changed.rewritten);
+    untouched(2U);
+    assert(e.catalog->Find("world")->Info().schema.columns[1].name == "renamed");
+    Reply(e.Run(text), "+applied\r\n");
+    assert(e.catalog->Find("world")->Info().schema.columns[0].type.size == 8U);
+}
+
 void RightsAndDrop() {
     test::ScopedTempDir dir("chunkdb-migrations-rights");
     {
@@ -589,6 +693,6 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
     ConditionalDdl(); ConditionalColumnsRefusePoisonedStore(); ConditionalJournalValidationAndRecovery();
-    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
+    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); NarrowingScanOutsideCatalogAdmission(); NarrowingRefusalLeavesNoTrace(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
     LedgerLimit(false); LedgerLimit(true);
 }

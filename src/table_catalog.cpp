@@ -2021,6 +2021,21 @@ bool TableCatalog::ChangeColumnsIfNeeded(
     return true;
 }
 
+std::optional<std::string> TableCatalog::ScanNarrowing(Table& table) {
+    const auto pending = table.Info().schema.pending;
+    if (!pending.has_value()) throw std::logic_error("no narrowing of table '" + table.name_ + "' is in progress");
+    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kBeforeNarrowingScan, table.name_);
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_NARROW_SCAN_FAIL_ONCE")) {
+        throw std::runtime_error("injected failure reading the table");
+    }
+    auto lease = table.Acquire();
+    if (!lease.has_value()) {
+        throw TableNotFoundError("table '" + table.name_ + "' is unavailable");
+    }
+    return lease->store().FindValueNotFitting(pending->column_id, pending->type);
+}
+
 void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
     RequireWritable("ALTER TABLE");
     std::shared_lock metadata(feature_metadata_gate_);
@@ -2032,21 +2047,11 @@ void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, 
         *table, options,
         [&](StoreManifest* manifest) { manifest->schema = WithPendingNarrowing(manifest->schema, column, type); },
         "CHUNKDB_FAILPOINT_NARROW_PENDING_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
-    const std::uint32_t column_id = table->Info().schema.pending->column_id;
-    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
-        hook->Run(MigrationTestHook::Point::kBeforeNarrowingScan, name);
     // 2. Every value already stored.
     std::optional<std::string> misfit;
     std::exception_ptr scan_failure;
     try {
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_NARROW_SCAN_FAIL_ONCE")) {
-            throw std::runtime_error("injected failure reading the table");
-        }
-        auto lease = table->Acquire();
-        if (!lease.has_value()) {
-            throw TableNotFoundError("table '" + std::string(name) + "' is unavailable");
-        }
-        misfit = lease->store().FindValueNotFitting(column_id, type);
+        misfit = ScanNarrowing(*table);
     } catch (...) {
         scan_failure = std::current_exception();
     }
