@@ -181,7 +181,8 @@ Each chunk is `[cx,cy,version,form_or_null]`; a null form represents deletion.
 Forms match GET CHUNK for that exact commit and projection; later writes cannot change queued bytes.
 Tag and txn are null until their metadata is present.
 
-Slot ownership permits one watch; a competing watch receives SLOT_BUSY and a lost slot receives SLOT_LOST.
+A slot permits one watch at a time; a competing watch receives SLOT_BUSY and a lost slot receives SLOT_LOST.
+A slot belongs to its owner; another user needs ADMIN on `*` to watch it, see [feed statements](reference/FEED.md#arguments).
 
 DROP TABLE ends watches with NO_TABLE; a fenced or recovered table ends them with INTERNAL, and a new WATCH resumes; watches have no idle timeout.
 Losing READ on the table ends a watch with a best-effort NO_TABLE, and a dropped user with a best-effort `AUTH_REQUIRED reason=user_dropped`; the connection closes either way; see [users](USERS.md#rights).
@@ -214,7 +215,7 @@ Clients classify errors by code, never diagnostic text, and preserve unknown key
 MIGRATION_MISMATCH identifies different text under a recorded migration name.
 SLOT_BUSY identifies an attached slot; SLOT_LOST identifies unavailable retained history or a dropped projected column.
 `reason=schema_filter` identifies a lost stable-ID projection; `reason=retention_limit` identifies retained-history overflow.
-SHOW SLOTS adds `lost_reason` (null while healthy) and a `filters` map.
+SHOW SLOTS adds `lost_reason` (null while healthy), a `filters` map, and `owner` (null for a slot without a recorded owner).
 Its keys are `area`, `columns`, `column_ids`, `no_before`, and `chunks`.
 
 Unfiltered area and projection fields are null; projected names and IDs are aligned arrays in declared order.
@@ -234,8 +235,8 @@ Client URIs use `chunk://user:password@host:4242/` or `chunks://user:password@ho
 A URI path selects a client's default table; wire statements still name the table explicitly.
 
 Slot takeover fences old ACK validation, persists the accepted ACK, and closes the old socket before publishing its replacement claim.
-The old owner receives best-effort `KILLED reason=slot_takeover`; partial or pinned TLS output closes without an injected error.
+The replaced watch receives best-effort `KILLED reason=slot_takeover`; partial or pinned TLS output closes without an injected error.
 Concurrent handoffs receive `SLOT_BUSY reason=takeover_pending`.
 
 An ambiguous durable-slot metadata publication reports `OUTCOME_UNKNOWN stage=slot_records` and fences table writes until recovery.
-Takeover propagates this outcome to the replacement instead of installing a new owner after failed ACK publication.
+Takeover propagates this outcome to the replacement instead of installing a new watch after failed ACK publication.

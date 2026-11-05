@@ -10,6 +10,7 @@
 #include "chunk_store_internal.hpp"
 #include "feed_slot_records.hpp"
 #include "feed_test_utils.hpp"
+#include "slot_watch.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "wal_writer.hpp"
 #include "store_manifest.hpp"
@@ -659,9 +660,54 @@ void PersistentFilters() {
     }
 }
 
+// A slot record without an owner, as written before owners were recorded,
+// still opens; its first attach that names a user records that user before
+// the claim is granted, and the owner survives a restart.
+void LegacyOwnerAtFirstAttach() {
+    ScopedTempDir dir("chunkdb-feed-slots-legacy-owner");
+    const auto config = SlotsConfig(dir.path());
+    const auto root = dir.path() / "tables" / "default";
+    StoreId epoch{};
+    {
+        TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
+        auto table = catalog.Find("default");
+        epoch = table->store_id();
+        (void)table->CreateFeedSlot("legacy");
+        (void)table->CreateFeedSlot("anonymous");
+        assert(ReadLe16(LoadFile(root / kFeedSlotsFileName), 4U) == 1U);
+    }
+    const auto only = [](std::string user) {
+        return [user = std::move(user)](std::string_view owner) {
+            if (owner != user) throw std::invalid_argument("slot belongs to " + std::string(owner));
+        };
+    };
+    const auto close = [](std::shared_ptr<SlotWatch> watch) { watch->Cancel(); watch->WorkStep(); };
+    {
+        TableCatalog catalog(config); auto table = catalog.Find("default");
+        const auto listed = table->ListFeedSlots();
+        assert(listed.size() == 2U && !listed[0].owner && !listed[1].owner);
+        close(SlotWatch::Create(table, "anonymous", {})); // No user: nothing to record.
+        assert(!ReadFeedSlotRecords(root, epoch)->slots[1].owner);
+        close(SlotWatch::Create(table, "legacy", {}, false, "alice", only("bob")));
+        const auto records = ReadFeedSlotRecords(root, epoch);
+        assert(ReadLe16(LoadFile(root / kFeedSlotsFileName), 4U) == 3U);
+        assert(records->slots[0].owner == "alice" && !records->slots[1].owner);
+        assert(table->ListFeedSlots().front().owner == "alice");
+        assert(txn_test::Throws([&] { (void)SlotWatch::Create(table, "legacy", {}, false, "bob", only("bob")); }));
+    }
+    TableCatalog catalog(config); auto table = catalog.Find("default");
+    assert(table->ListFeedSlots().front().owner == "alice");
+    assert(txn_test::Throws([&] { (void)SlotWatch::Create(table, "legacy", {}, false, "bob", only("bob")); }));
+    close(SlotWatch::Create(table, "legacy", {}, false, "alice", only("alice")));
+    close(SlotWatch::Create(table, "legacy", {}, false, "admin", [](std::string_view) {})); // An allowed other user.
+    assert(ReadFeedSlotRecords(root, epoch)->slots[0].owner == "alice");
+}
+
 }  // namespace
 
 int main() {
+    LegacyOwnerAtFirstAttach();
     PersistentFilters();
     ConditionalSlotChanges();
     ConcurrentConditionalSlots();

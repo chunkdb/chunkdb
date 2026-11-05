@@ -59,6 +59,9 @@ class SlotWatch {
         bool resume = false;
         bool charged = true;
     };
+    // `authorize_owner` throws to refuse a user name: the slot's recorded
+    // owner, and on takeover the user of the replaced watch. A slot without an
+    // owner records a nonempty `user` before the claim is granted.
     static std::shared_ptr<SlotWatch> Create(std::shared_ptr<Table> table,
         std::string name, FeedOptions options, bool takeover = false, std::string user = {},
         const std::function<void(std::string_view)>& authorize_owner = {});

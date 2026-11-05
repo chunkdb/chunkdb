@@ -255,7 +255,7 @@ void SlotRecordOutcome(bool tls) {
 
 void TakeoverRights(bool tls) {
     Harness harness(tls, true);
-    auto admin = harness.Connect(); Create(*admin);
+    auto admin = harness.Connect(); Create(*admin, " OWNER one");
     const std::array<std::uint8_t, 16> salt{};
     const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
     for (const auto* user : {"one", "two"}) {
@@ -285,7 +285,7 @@ void Lifecycle(bool tls) {
     const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
     auto listed = writer->Command("SHOW SLOTS ON t");
     const auto& slot = Slot(listed, "t", "consumer");
-    assert(slot.items.size() == 16U && Field(slot, "epoch").value == initial.first);
+    assert(slot.items.size() == 18U && Field(slot, "epoch").value == initial.first);
     assert(Number(Field(slot, "acked")) == initial.second && !Boolean(Field(slot, "lost")));
     auto second = harness.Connect();
     Error(second->Command("WATCH t SLOT 'consumer'"), "SLOT_BUSY");
@@ -400,7 +400,7 @@ void Rights(bool tls) {
     assert(visible.items.size() == 1U && Field(visible.items[0], "table").value == "t");
     Error(reader.Command("CREATE SLOT 'other' ON t"), "PERMISSION_DENIED");
     Error(reader.Command("DROP SLOT 'consumer' ON t"), "PERMISSION_DENIED");
-    (void)Start(reader.Command("WATCH t SLOT 'consumer'")); Unwatch(reader);
+    Error(reader.Command("WATCH t SLOT 'consumer'"), "PERMISSION_DENIED"); // The slot belongs to admin.
     admin->Ok("GRANT WRITE ON t TO reader");
     Error(reader.Command("CREATE SLOT 'other' ON t"), "PERMISSION_DENIED");
     admin->Ok("GRANT ADMIN ON t TO reader");
@@ -414,7 +414,7 @@ void Rights(bool tls) {
 // or ACK to carry it (the harness progress interval is 60 s).
 void WatchRevoke(bool tls) {
     Harness harness(tls, true);
-    auto admin = harness.Connect(); Create(*admin);
+    auto admin = harness.Connect(); Create(*admin, " OWNER reader");
     const std::array<std::uint8_t, 16> salt{};
     const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
     for (const auto* user : {"reader", "other"}) admin->Ok(std::string("CREATE USER ") + user + " VERIFIER '" + verifier + "'");
@@ -444,7 +444,7 @@ class RevokeAtAck : public FeedDeliveryTestHook {
 void WatchAckRevoke(bool tls) {
     RevokeAtAck revoke;
     Harness harness(tls, true);
-    auto admin = harness.Connect(); Create(*admin);
+    auto admin = harness.Connect(); Create(*admin, " OWNER reader");
     const std::array<std::uint8_t, 16> salt{};
     const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
     admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
@@ -472,7 +472,7 @@ void WatchAckRevoke(bool tls) {
 // even when a user of the same name is created again with READ.
 void WatchDroppedUser(bool tls) {
     Harness harness(tls, true);
-    auto admin = harness.Connect(); Create(*admin);
+    auto admin = harness.Connect(); Create(*admin, " OWNER reader");
     const std::array<std::uint8_t, 16> salt{};
     const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
     admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
@@ -495,6 +495,60 @@ void WatchDroppedUser(bool tls) {
     const auto third = Set(*admin, 9);
     assert(Change(NextChange(again)) == third);
     Unwatch(again);
+}
+
+// A slot belongs to its owner: another user with READ cannot attach to it,
+// even idle, and its saved position stays where the owner acknowledged it.
+// ADMIN on `*` attaches to any slot. Dropping the owner leaves the slot to
+// ADMIN on `*` until a user of that name exists again.
+void SlotOwners(bool tls) {
+    Harness harness(tls, true);
+    auto admin = harness.Connect(); Create(*admin, " OWNER reader");
+    admin->Ok("CREATE SLOT 'implicit' ON t");
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
+    for (const auto* user : {"reader", "other"}) {
+        admin->Ok(std::string("CREATE USER ") + user + " VERIFIER '" + verifier + "'");
+        admin->Ok(std::string("GRANT READ ON t TO ") + user);
+    }
+    const auto slots = admin->Command("SHOW SLOTS ON t");
+    assert(Field(Slot(slots, "t", "consumer"), "owner").value == "reader");
+    assert(Field(Slot(slots, "t", "implicit"), "owner").value == "admin");
+    Client owner(harness.port, tls); owner.Login("reader", "pw");
+    const auto start = Start(owner.Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*admin, 7);
+    assert(Change(NextChange(owner)) == first);
+    owner.Line("ACK " + std::to_string(first));
+    WaitAck(*admin, "t", "consumer", first);
+    Unwatch(owner);
+    const auto second = Set(*admin, 8);
+    Client other(harness.port, tls); other.Login("other", "pw");
+    for (const auto& watch : {std::string("WATCH t SLOT 'consumer'"), std::string("WATCH t SLOT 'consumer' TAKEOVER"),
+                              "WATCH t SLOT 'consumer' AFTER " + start.first + " 0", std::string("WATCH t SLOT 'implicit'")})
+        Error(other.Command(watch), "PERMISSION_DENIED");
+    admin->Ok("GRANT ADMIN ON t TO other"); // Table ADMIN is not enough.
+    Error(other.Command("WATCH t SLOT 'consumer'"), "PERMISSION_DENIED");
+    assert(Number(Field(Slot(admin->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == first);
+    assert(Start(owner.Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(owner);
+    auto any = harness.Connect(); // admin has ADMIN on *.
+    assert(Start(any->Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(*any);
+    admin->Ok("GRANT ADMIN ON * TO other");
+    assert(Start(other.Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(other);
+    admin->Ok("REVOKE ADMIN ON * FROM other");
+    // The owner takes over a watch of its own.
+    (void)Start(owner.Command("WATCH t SLOT 'consumer'"));
+    assert(Change(NextChange(owner)) == second); // Delivered before the handoff.
+    Client again(harness.port, tls); again.Login("reader", "pw");
+    (void)Start(again.Command("WATCH t SLOT 'consumer' TAKEOVER"));
+    Error(owner.Read(), "KILLED"); Closed(owner); Unwatch(again); again.Close();
+    admin->Ok("DROP USER reader");
+    assert(Field(Slot(admin->Command("SHOW SLOTS ON t"), "t", "consumer"), "owner").value == "reader");
+    Error(other.Command("WATCH t SLOT 'consumer'"), "PERMISSION_DENIED");
+    (void)Start(any->Command("WATCH t SLOT 'consumer'")); Unwatch(*any);
+    admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
+    admin->Ok("GRANT READ ON t TO reader");
+    Client created(harness.port, tls); created.Login("reader", "pw");
+    assert(Start(created.Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(created);
 }
 
 void ArchiveHandover(bool tls) {
@@ -1566,7 +1620,7 @@ int main(int argc, char** argv) {
         run("conditional-objects", ConditionalObjects);
         run("slot-record-outcome", SlotRecordOutcome);
         run("takeover-fence", TakeoverFence); run("takeover", Takeover); run("takeover-rights", TakeoverRights); run("takeover-UNWATCH-return", TakeoverUnwatchReturn); run("takeover-stalled-socket", TakeoverStalledSocket);
-        run("lifecycle", Lifecycle); run("rights", Rights); run("watch-revoke", WatchRevoke); run("watch-ACK-revoke", WatchAckRevoke); run("watch-dropped-user", WatchDroppedUser); run("archive-handover", ArchiveHandover);
+        run("lifecycle", Lifecycle); run("rights", Rights); run("watch-revoke", WatchRevoke); run("watch-ACK-revoke", WatchAckRevoke); run("watch-dropped-user", WatchDroppedUser); run("slot-owners", SlotOwners); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);

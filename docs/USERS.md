@@ -39,6 +39,7 @@ Dropping a table removes its specific grants.
 | Statement | Required right |
 | --- | --- |
 | GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, DESCRIBE, WATCH | READ on the table |
+| WATCH SLOT on a slot another user owns | READ on the table and ADMIN on all tables |
 | SET BLOCK, DELETE BLOCK, SET CHUNK | WRITE on the table |
 | ALTER TABLE, DROP TABLE, RECOVER TABLE, CREATE SLOT, DROP SLOT | ADMIN on the table |
 | CREATE TABLE, SHOW METRICS, RELOAD TLS | ADMIN on all tables |
@@ -58,7 +59,7 @@ Pushes not yet written to the socket are dropped; a push already partly written,
 An ACK the server processes after the change is applied is refused; one processed at the same moment may still be accepted.
 Dropping a user ends its connections: an open watch ends at once with a best-effort `AUTH_REQUIRED reason=user_dropped`, any other connection receives it on its next statement, and the connection closes.
 Connections of a dropped user never get the rights of a user created again under the same name, nor change its password.
-Slot ownership is matched by user name: a user created again under that name can take over a slot the dropped one watched without ADMIN on `*`.
+A slot belongs to the user named as its owner, matched by name; DROP USER leaves slots unchanged, so a dropped owner's slot can be attached only with ADMIN on `*` until a user of that name exists again.
 Changing a user's password, by the user or an administrator, does not end that user's open connections or watches.
 
 Migration replay checks current rights before returning skipped or conflict.

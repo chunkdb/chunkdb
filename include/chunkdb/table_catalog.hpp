@@ -208,7 +208,10 @@ class Table : public std::enable_shared_from_this<Table> {
     // Create, drop, advance and archive-reader creation require exclusive table
     // access; callers must not hold a Lease. Listing may hold a Lease.
     // Positions are persisted atomically and synced.
-    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name, bool if_not_exists = false, const FeedSlotFilters& filters = {});
+    // `owner` is recorded with the slot; a slot created without one records
+    // the user of its first attach that names a user.
+    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name, bool if_not_exists = false, const FeedSlotFilters& filters = {},
+        std::optional<std::string> owner = std::nullopt);
     void DropFeedSlot(std::string_view name, bool if_exists = false);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(bool include_lost = false);
     [[nodiscard]] std::vector<std::uint32_t> ResolveFeedColumns(const std::vector<std::string>& names);

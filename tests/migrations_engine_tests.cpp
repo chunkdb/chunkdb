@@ -288,6 +288,30 @@ void NarrowingAndSlots() {
     assert(table->ListFeedSlots().size() == 1U);
 }
 
+// CREATE SLOT in a migration records its caller, or OWNER; the same
+// migration run again by another user is skipped and keeps that owner.
+void SlotOwnersInMigrations() {
+    test::ScopedTempDir dir("chunkdb-migrations-slot-owner");
+    {
+        Engine e(dir.path(), true);
+        e.users->Create("limited", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
+        e.users->Grant("limited", "realm", Right::kAdmin);
+        Reply(e.Run(std::string("MIGRATE 'create_realm' ") + kCreate), "+applied\r\n");
+        SessionState limited;
+        assert(test::LoginOnEngine(*e.engine, limited, "limited", "pw").front() == '%');
+        const auto run = [&](const std::string& text) { return e.engine->Execute(limited, text); };
+        Reply(run("MIGRATE 'caller' CREATE SLOT 'caller' ON realm"), "+applied\r\n");
+        Reply(run("MIGRATE 'named' CREATE SLOT 'named' ON realm OWNER bot"), "+applied\r\n");
+        Reply(e.Run("MIGRATE 'caller' CREATE SLOT 'caller' ON realm"), "+skipped\r\n");
+        const auto slots = e.catalog->Find("realm")->ListFeedSlots();
+        assert(slots.size() == 2U && slots[0].owner == "limited" && slots[1].owner == "bot");
+    }
+    Engine e(dir.path(), true);
+    Reply(e.Run("MIGRATE 'named' CREATE SLOT 'named' ON realm OWNER bot"), "+skipped\r\n");
+    const auto slots = e.catalog->Find("realm")->ListFeedSlots();
+    assert(slots.size() == 2U && slots[0].owner == "limited" && slots[1].owner == "bot");
+}
+
 void RightsAndDrop() {
     test::ScopedTempDir dir("chunkdb-migrations-rights");
     {
@@ -642,6 +666,6 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
     ConditionalDdl(); ConditionalColumnsRefusePoisonedStore(); ConditionalJournalValidationAndRecovery();
-    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RightCheckDuringUserMigration(); PingDuringUserMigration(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
+    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); SlotOwnersInMigrations(); RightsAndDrop(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RightCheckDuringUserMigration(); PingDuringUserMigration(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
     LedgerLimit(false); LedgerLimit(true);
 }

@@ -28,6 +28,7 @@ struct MigrationRequest {
     std::string slot;
     FeedSlotFilters slot_filters{};
     std::optional<std::vector<std::string>> slot_columns{};
+    std::optional<std::string> slot_owner{};
     bool if_not_exists = false;
     bool if_exists = false;
     std::function<TableDefinition()> definition;

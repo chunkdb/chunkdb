@@ -270,6 +270,12 @@ FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement
     return filters;
 }
 
+// OWNER, else the user running CREATE SLOT; none without authentication.
+std::optional<std::string> SlotOwner(const cql::CreateSlot& create, bool require_auth, const std::string& user) {
+    if (create.owner) return create.owner;
+    return require_auth ? std::optional<std::string>(user) : std::nullopt;
+}
+
 // A column of CREATE TABLE or ADD COLUMN; `id` is replaced by AddColumn.
 [[nodiscard]] Column ColumnFrom(const cql::ColumnDefinition& definition, std::uint32_t id) {
     Column column;
@@ -876,6 +882,7 @@ std::string CommandEngine::ExecuteStatement(
                             request.kind = MigrationRequest::Kind::kCreateSlot; request.table = slot.table; request.slot = slot.name; request.if_not_exists = slot.if_not_exists;
                             request.slot_filters = {.area = slot.area, .no_before = slot.no_before, .chunks = slot.chunks};
                             request.slot_columns = slot.columns;
+                            request.slot_owner = SlotOwner(slot, config_.require_auth, session.user);
                         },
                         [&](const cql::DropSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
@@ -948,7 +955,8 @@ std::string CommandEngine::ExecuteStatement(
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, create.table, Right::kAdmin);
                     const auto table = catalog_->Require(create.table);
-                    (void)table->CreateFeedSlot(create.name, create.if_not_exists, SlotFilters(table, create));
+                    (void)table->CreateFeedSlot(create.name, create.if_not_exists, SlotFilters(table, create),
+                        SlotOwner(create, config_.require_auth, session.user));
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::DropSlot& drop) {
@@ -989,7 +997,7 @@ std::string CommandEngine::ExecuteStatement(
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, slots.size());
                     for (const auto& [name, slot] : slots) {
-                        Protocol::AppendMapHeader(reply, 8);
+                        Protocol::AppendMapHeader(reply, 9);
                         Protocol::AppendBulk(reply, "table");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "name");
@@ -1026,6 +1034,8 @@ std::string CommandEngine::ExecuteStatement(
                         } else Protocol::AppendNull(reply);
                         Protocol::AppendBulk(reply, "no_before"); reply += slot.filters.no_before ? "#t\r\n" : "#f\r\n";
                         Protocol::AppendBulk(reply, "chunks"); reply += slot.filters.chunks ? "#t\r\n" : "#f\r\n";
+                        Protocol::AppendBulk(reply, "owner");
+                        if (slot.owner) Protocol::AppendBulk(reply, *slot.owner); else Protocol::AppendNull(reply);
                     }
                     return reply;
                 },

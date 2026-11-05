@@ -265,14 +265,15 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     if (at != slots.slots.end()) throw std::invalid_argument("feed slot already exists: " + request.slot);
                     const auto filters = MigrationSlotFilters(request, store->geometry().layout().schema());
                     // Validate every field before syncing a baseline or preparing publication.
-                    (void)SerializeFeedSlotRecords(FeedSlotRecords{journal.table_id, 0U, {{request.slot, 0U, false, filters}}});
+                    if (request.slot_owner) RequireValidFeedSlotOwner(*request.slot_owner);
+                    (void)SerializeFeedSlotRecords(FeedSlotRecords{journal.table_id, 0U, {{request.slot, 0U, false, filters, false, request.slot_owner}}});
                     RequireFeature(store->features(), *FindFeature("feed_slots"));
                     if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
                     table->PrepareFeedSlotBaseline(*store);
                     const auto completed = store->version_clock_.load(std::memory_order_seq_cst) - 1U;
                     store->feed_slots_->Sync(completed);
                     slots = ReadFeedSlotRecords(table->dir_, journal.table_id).value_or(FeedSlotRecords{journal.table_id, completed, {}});
-                    slots.slots.push_back({request.slot, completed, false, filters});
+                    slots.slots.push_back({request.slot, completed, false, filters, false, request.slot_owner});
                     slots.filter_format = slots.filter_format || !filters.empty();
                     // The unchanged manifest image binds redo to the participant
                     // identity; slot creation must not enable missing bits.

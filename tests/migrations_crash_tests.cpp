@@ -35,6 +35,7 @@ const Operation kOperations[] = {
     {"grant", "GRANT WRITE ON realm TO limited", 2U, false},
     {"revoke", "REVOKE READ ON realm FROM limited", 2U, false},
     {"create_slot", "CREATE SLOT 'second' ON realm", 3U, false},
+    {"create_slot_owner", "CREATE SLOT 'second' ON realm OWNER limited", 3U, false},
     {"drop_slot", "DROP SLOT 'second' ON realm", 2U, false},
 };
 
@@ -146,8 +147,10 @@ void Check(const std::filesystem::path& root, const Operation& operation, const 
         assert(e.users->Find("limited")->grants.contains("realm") != applied);
     } else {
         const auto slots = table->ListFeedSlots();
-        const auto expected = name == "create_slot" ? (applied ? 2U : 1U) : (applied ? 1U : 2U);
-        assert(slots.size() == expected && slots[0].name == "first");
+        const auto expected = name.starts_with("create_slot") ? (applied ? 2U : 1U) : (applied ? 1U : 2U);
+        assert(slots.size() == expected && slots[0].name == "first" && slots[0].owner == "admin");
+        // Recovery publishes the owner the migration decided: its caller or OWNER.
+        if (slots.size() == 2U) assert(slots[1].owner == (name == "create_slot_owner" ? "limited" : "admin"));
     }
     const auto read = e.Run(name == "rename" && applied ? "GET BLOCK 0 0 FROM realm COLUMNS renamed" : "GET BLOCK 0 0 FROM realm COLUMNS v");
     const auto value = name == "clamp" ? (applied ? 255U : 300U) : 7U;
