@@ -73,6 +73,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         migration_health_->Check();
         for (const auto& record : ReadMigrationRecords(config_.data_dir)) {
             if (record.name != request.record.name) continue;
+            if (request.require_recorded_access) request.require_recorded_access(record);
             if (record.statement != request.record.statement)
                 throw MigrationConflictError("migration '" + record.name + "' has a different statement");
             return true;

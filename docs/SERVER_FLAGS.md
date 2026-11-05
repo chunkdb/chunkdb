@@ -24,7 +24,7 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--admin-password-file` | unset | First administrator's password from the first line of this file. |
 | `--auth-max-failures-per-connection` | `5` | 1–1000 failed HELLO or AUTH attempts that close a connection. |
 | `--auth-ban-failures` | `5` | 0–1000000 failed logins from one source address that ban it; `0` disables bans. |
-| `--auth-ban-ms` | `1000` | 1–86400000 ms a source address stays banned; each later failure from it bans it again. |
+| `--auth-ban-ms` | `1000` | 1–86400000 ms a source address stays banned; when the ban ends, its failures are reset. |
 | `--proxy-protocol` | `off` | `off` or `v2`; with `v2` every connection starts with a PROXY protocol v2 header. |
 | `--audit-log` | unset | File receiving the audit log; see [Logs](#logs). |
 | `--slow-statement-ms` | `0` | 0–86400000 ms; statements taking at least this long are logged at WARN; `0` logs none. |
@@ -42,7 +42,7 @@ Existing users are loaded on later starts; bootstrap settings do not change thei
 Use [Users and rights](USERS.md) for password changes and offline recovery.
 
 A source address is an IPv4 address or an IPv6 /64.
-A successful login from a source address clears its failures.
+A successful login from a source address clears the failures of its own user name only.
 
 ## TLS
 

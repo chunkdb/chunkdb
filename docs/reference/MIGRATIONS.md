@@ -22,7 +22,7 @@ applied
 2) name = migration_demo_label, applied_ms = <time-ms>, user = admin, statement = ALTER TABLE migration_demo ADD COLUMN label text(16) NULL
 ```
 
-SHOW MIGRATIONS also lists any other migrations you have applied.
+SHOW MIGRATIONS also lists the other recorded migrations within your rights.
 
 ## Syntax
 
@@ -41,14 +41,14 @@ SHOW MIGRATIONS
 
 - New name: `applied`, including when the inner statement does nothing.
 - Same name and statement: `skipped`.
-- SHOW MIGRATIONS: name, application timestamp, applying user, and statement, in applied order.
+- SHOW MIGRATIONS: name, application timestamp, applying user, and statement, in applied order, for records within your rights; the applying user is null without MANAGES USERS.
 
 ## Errors
 
 | Error | When | What to do |
 | --- | --- | --- |
 | MIGRATION_MISMATCH | A recorded name has different statement text. | Use a new name for the new change. |
-| PERMISSION_DENIED | You lack the inner statement's rights, or MANAGES USERS for SHOW. | Request access. |
+| PERMISSION_DENIED | You lack the inner statement's rights, or the name is recorded for a change outside your rights. | Request access, or use another name. |
 | INVALID_ARGUMENT | You run MIGRATE inside a transaction or submit an unsupported statement. | Run the allowed statement outside a transaction. |
 | INVALID_ARGUMENT | You run MIGRATE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | OUT_OF_RANGE | The ledger exceeds 16384 records or 16777216 bytes. | Stop adding new migration names. |
@@ -57,8 +57,13 @@ SHOW MIGRATIONS
 
 ## Notes
 
+Migration names are shared by all tables and users; give each application's names a distinct prefix.
+A record is within your rights when you have ADMIN on the table its statement names, or MANAGES USERS for GRANT and REVOKE.
+A record whose statement this server cannot parse is within your rights only with ADMIN on `*`.
+Records name tables by name: after a table is dropped and created again, its earlier records belong to whoever administers the new table.
 Rights are checked before an existing name returns skipped or conflict.
-A conflict can reveal an existing name to a user allowed to run the submitted statement.
+A name recorded outside your rights returns PERMISSION_DENIED whatever statement you submit, without its statement.
+With `--auth none`, every record is within your rights.
 Keyword case and internal whitespace remain part of the statement identity.
 Separating and trailing spaces or tabs are removed.
 

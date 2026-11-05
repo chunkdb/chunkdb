@@ -385,6 +385,87 @@ int main() {
             assert(victim.close_after_reply);
         }
 
+        // A login clears only the failures of its own name from its source:
+        // logins under one account between wrong passwords for another name,
+        // existing or not, leave those failures counted toward the ban.
+        users->Create("guest", chunkdb::scram::MakeVerifier("guest-pw", chunkdb::crypto::RandomBytes(16),
+                                                            chunkdb::scram::kMinIterations), false);
+        for (const std::string target : {"admin", "nobody"}) {
+            chunkdb::CommandEngine shared_engine(
+                chunkdb::EngineConfig{
+                    .require_auth = true,
+                    .users = users,
+                    .max_auth_failures = 10,
+                    .max_auth_failures_per_ip = 3,
+                    .auth_failure_delay_ms = 0,
+                    .auth_failure_ban_ms = 600'000,
+                },
+                catalog);
+            for (int i = 0; i < 3; ++i) {
+                chunkdb::SessionState guessing;
+                guessing.remote_address = "198.51.100.50";
+                assert(FailedLoginOnEngine(shared_engine, guessing, target).rfind("-ERR AUTH_FAILED", 0) == 0);
+                if (i == 2) break;
+                chunkdb::SessionState own;
+                own.remote_address = "198.51.100.50";
+                assert(LoginOnEngine(shared_engine, own, "guest", "guest-pw").rfind("%14\r\n", 0) == 0);
+            }
+            chunkdb::SessionState after;
+            after.remote_address = "198.51.100.50";
+            assert(LoginOnEngine(shared_engine, after, "guest", "guest-pw").starts_with(
+                "-ERR RATE_LIMITED reason=auth_ban retry_after_ms="));
+        }
+        {
+            // A login still clears its own name's failures.
+            chunkdb::CommandEngine own_engine(
+                chunkdb::EngineConfig{
+                    .require_auth = true,
+                    .users = users,
+                    .max_auth_failures = 10,
+                    .max_auth_failures_per_ip = 3,
+                    .auth_failure_delay_ms = 0,
+                    .auth_failure_ban_ms = 600'000,
+                },
+                catalog);
+            const auto attempt = [&](const std::optional<std::string>& password) {
+                chunkdb::SessionState session;
+                session.remote_address = "198.51.100.60";
+                return LoginOnEngine(own_engine, session, "guest", password);
+            };
+            for (int round = 0; round < 3; ++round) {
+                assert(attempt(std::nullopt).rfind("-ERR AUTH_FAILED", 0) == 0);
+                assert(attempt(std::nullopt).rfind("-ERR AUTH_FAILED", 0) == 0);
+                assert(attempt("guest-pw").rfind("%14\r\n", 0) == 0);
+            }
+            assert(own_engine.AuthFailureTrackedSourcesForTests() == 0U);
+        }
+
+        {
+            // An ended ban resets the source's failures: one later failure
+            // does not ban it again.
+            chunkdb::CommandEngine period_engine(
+                chunkdb::EngineConfig{
+                    .require_auth = true,
+                    .users = users,
+                    .max_auth_failures = 10,
+                    .max_auth_failures_per_ip = 2,
+                    .auth_failure_delay_ms = 0,
+                    .auth_failure_ban_ms = 50,
+                },
+                catalog);
+            const auto attempt = [&](const std::optional<std::string>& password) {
+                chunkdb::SessionState session;
+                session.remote_address = "198.51.100.70";
+                return LoginOnEngine(period_engine, session, "guest", password);
+            };
+            assert(attempt(std::nullopt).rfind("-ERR AUTH_FAILED", 0) == 0);
+            assert(attempt(std::nullopt).rfind("-ERR AUTH_FAILED", 0) == 0);
+            assert(attempt("guest-pw").starts_with("-ERR RATE_LIMITED reason=auth_ban retry_after_ms="));
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+            assert(attempt(std::nullopt).rfind("-ERR AUTH_FAILED", 0) == 0);
+            assert(attempt("guest-pw").rfind("%14\r\n", 0) == 0);
+        }
+
         // --auth none: HELLO 3 logs in without a user; HELLO 3 USER is refused.
         chunkdb::CommandEngine open_engine(chunkdb::EngineConfig{.require_auth = false}, catalog);
         {
