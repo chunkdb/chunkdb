@@ -6,6 +6,7 @@
 #include <map>
 #include <optional>
 #include <string>
+#include <string_view>
 #include <vector>
 
 #include "scram.hpp"
@@ -44,12 +45,22 @@ struct Users {
     friend bool operator==(const Users&, const Users&) = default;
 };
 
+// Whether a grant can name `table`: kEveryTable or a valid table name, also
+// one not yet created.
+[[nodiscard]] bool IsValidGrantTable(std::string_view table) noexcept;
+// Throws std::invalid_argument when IsValidGrantTable(table) is false.
+void RequireValidGrantTable(std::string_view table);
+
 // The highest right `user` has on `table`, from a grant on it or on `*`.
 [[nodiscard]] std::optional<Right> RightOn(const User& user, const std::string& table);
 
+// Throws std::invalid_argument for a field that does not fit the file: a
+// verifier salt outside scram::kMinSaltBytes..scram::kMaxSaltBytes, a name
+// over 65535 bytes, or a count over 2^32 - 1.
 [[nodiscard]] std::vector<std::uint8_t> EncodeUsers(const Users& users);
 // Throws std::invalid_argument naming the defect: a damaged, truncated or
-// unknown file.
+// unknown file, or a user name, grant table name, iteration count or salt
+// length outside what CREATE USER, ALTER USER and GRANT accept.
 [[nodiscard]] Users DecodeUsers(const std::vector<std::uint8_t>& bytes);
 
 // std::nullopt when the file does not exist.

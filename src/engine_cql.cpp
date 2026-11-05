@@ -389,7 +389,7 @@ FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement
     return "?";
 }
 
-// The most bytes of a verifier sent as a parameter.
+// The most bytes of a verifier, sent as a parameter or a text literal.
 constexpr std::size_t kMaxVerifierBytes = 512;
 
 // The verifier of CREATE USER or ALTER USER: a parameter frame or a text
@@ -404,7 +404,11 @@ constexpr std::size_t kMaxVerifierBytes = 512;
         }
         return scram::ParseVerifier(*frame);
     }
-    return scram::ParseVerifier(std::get<cql::Text>(value).value);
+    const auto& text = std::get<cql::Text>(value).value;
+    if (text.size() > kMaxVerifierBytes) {
+        throw std::invalid_argument("a verifier has at most " + std::to_string(kMaxVerifierBytes) + " bytes");
+    }
+    return scram::ParseVerifier(text);
 }
 
 [[nodiscard]] std::string VersionReply(const ChunkMutationResult& result) {
