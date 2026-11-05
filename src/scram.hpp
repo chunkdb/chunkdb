@@ -1,5 +1,6 @@
 #pragma once
 
+#include <cstddef>
 #include <cstdint>
 #include <optional>
 #include <span>
@@ -19,6 +20,10 @@ inline constexpr std::uint32_t kMinIterations = 4096;
 // Bounded so a verifier cannot make logging in as that user arbitrarily
 // expensive.
 inline constexpr std::uint32_t kMaxIterations = 1'000'000;
+// A verifier's salt length: at least 16 bytes, and bounded so it fits the
+// users file and the server-first message stays small.
+inline constexpr std::size_t kMinSaltBytes = 16;
+inline constexpr std::size_t kMaxSaltBytes = 256;
 
 // What the server stores for a user instead of the password.
 struct Verifier {
@@ -46,8 +51,9 @@ struct Verifier {
 // `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>`, base64
 // parts: the form CREATE USER and ALTER USER take.
 [[nodiscard]] std::string FormatVerifier(const Verifier& verifier);
-// Throws std::invalid_argument naming what is wrong, also for fewer than
-// kMinIterations iterations.
+// Throws std::invalid_argument naming what is wrong, also for an iteration
+// count outside kMinIterations..kMaxIterations or a salt length outside
+// kMinSaltBytes..kMaxSaltBytes.
 [[nodiscard]] Verifier ParseVerifier(std::string_view text);
 
 // `n,,n=<user>,r=<nonce>`.

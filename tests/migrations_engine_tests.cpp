@@ -306,6 +306,9 @@ void RightsAndDrop() {
         Error(run("SHOW MIGRATIONS"), "PERMISSION_DENIED");
         Reply(e.Run("MIGRATE 'grant' GRANT READ ON realm TO limited"), "+applied\r\n");
         Reply(e.Run("MIGRATE 'revoke' REVOKE READ ON realm FROM limited"), "+applied\r\n");
+        // A grant names a valid table name, so the users file it writes reads back.
+        Error(e.Run("MIGRATE 'grant_con' GRANT READ ON con TO limited"), "INVALID_ARGUMENT");
+        assert(e.catalog->Migrations().size() == 4U);
         e.users->Grant("limited", "realm", Right::kRead);
         Reply(e.Run("MIGRATE 'drop' DROP TABLE realm"), "+applied\r\n");
         assert(!e.users->Find("limited")->grants.contains("realm"));
