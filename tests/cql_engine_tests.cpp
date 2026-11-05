@@ -257,6 +257,21 @@ void TestHello() {
     assert(duplicate_hello.plan == CommandEngine::PayloadPlan::kDiscard && duplicate_hello.frame_count == 2U);
     assert(engine.RejectPayload(retrying, "HELLO 3 WITH client_name=$1,CLIENT_NAME=$2", duplicate_hello.reject_response).starts_with("-ERR INVALID_ARGUMENT reason=duplicate_option "));
     assert(retrying.failed_auth_attempts == 1U && !retrying.close_after_reply);
+    // Before authentication HELLO carries at most 12 parameter frames, also
+    // when it is refused for its syntax; more are refused unread.
+    std::string twelve = "HELLO 3 USER admin $1 WITH";
+    for (unsigned i = 2U; i <= 12U; ++i) twelve += (i == 2U ? " o" : ",o") + std::to_string(i) + "=$" + std::to_string(i);
+    const auto most = engine.PlanPayload(retrying, twelve + "\r\n");
+    assert(most.plan == CommandEngine::PayloadPlan::kParameters && most.parameter_limits.size() == 12U);
+    for (const auto& line : {twelve + ",o13=$13\r\n", twelve + ",o13=$13 BOGUS\r\n", twelve + ",o2=$13\r\n"}) {
+        const auto too_many = engine.PlanPayload(retrying, line);
+        assert(too_many.plan == CommandEngine::PayloadPlan::kDiscard && too_many.frame_count == 0U);
+        assert(too_many.reject_response == "-ERR PROTOCOL reason=protocol HELLO takes at most 12 parameters\r\n");
+    }
+    chunkdb::SessionState refused;
+    assert(engine.RejectPayload(refused, twelve, "-ERR PROTOCOL reason=protocol HELLO takes at most 12 parameters\r\n")
+               .starts_with("-ERR PROTOCOL "));
+    assert(refused.close_after_reply && refused.failed_auth_attempts == 0U);
     ExpectError(engine.Execute(before, "GET BLOCK 0 0 FROM world\r\n"), "PROTOCOL expected HELLO 3");
     assert(before.close_after_reply);
 

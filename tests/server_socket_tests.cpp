@@ -188,9 +188,46 @@ void SteadyReaderWriteDeadline() {
     assert(termination.error.starts_with("reply write deadline exceeded after "));
     assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(2));
 }
+// A request line and its parameter frames share one deadline: a complete
+// line or payload keeps it for the next read, and no read waits once it has
+// passed, even with bytes waiting on the socket.
+void RequestDeadlineSpansFrames() {
+    Loopback connection;
+    std::string error; int code = 0;
+    const auto ensure = [&](std::size_t timeout_ms, std::string_view) {
+        return ConfigureSocketRecvTimeout(connection.accepted, timeout_ms, &error, &code);
+    };
+    assert(ensure(5000U, "partial_request"));
+    PendingLineBuffer pending;
+    PhaseDeadline deadline;
+    ConnectionTermination termination;
+    std::string read;
+    const std::string request = "SET $1 $2\n$-1\n$3\nabc\n";
+    assert(static_cast<long long>(send(connection.client, request.data(), static_cast<int>(request.size()), 0)) ==
+           static_cast<long long>(request.size()));
+    assert(ReadLinePlain(connection.accepted, read, pending, 1024U, 5000U, &deadline, &termination, ensure));
+    assert(read == "SET $1 $2\n" && deadline.has_value());
+    const auto started = *deadline;
+    for (const std::string_view expected : {"$-1\n", "$3\n"}) {
+        assert(ReadLinePlain(connection.accepted, read, pending, 1024U, 5000U, &deadline, &termination, ensure));
+        assert(read == expected && deadline == started);
+    }
+    assert(ReadBytesPlain(connection.accepted, read, 3U, pending, 5000U, &deadline, &termination, ensure));
+    assert(read == "abc" && deadline == started);
+    assert(ReadLinePlain(connection.accepted, read, pending, 1024U, 5000U, &deadline, &termination, ensure));
+    assert(read == "\n" && deadline == started && pending.empty());
+
+    deadline = std::chrono::steady_clock::now() - std::chrono::milliseconds(1);
+    assert(send(connection.client, "$-1\n", 4, 0) == 4);
+    assert(WaitForSocketReady(connection.accepted, true, false, std::chrono::seconds(5), &code) == SocketWaitResult::kReady);
+    assert(!ReadLinePlain(connection.accepted, read, pending, 1024U, 5000U, &deadline, &termination, ensure));
+    assert(termination.phase == "read" && termination.reason == "timeout" && pending.empty());
+    assert(!ReadBytesPlain(connection.accepted, read, 4U, pending, 5000U, &deadline, &termination, ensure));
+    assert(termination.reason == "timeout" && read.empty() && pending.empty());
+}
 }
 int main() {
     Keepalive(); LiveClientAndPendingData(); ClosedPeer(false); ClosedPeer(true); InvalidDescriptorRemainsFailure();
-    SteadyReaderWriteDeadline();
+    SteadyReaderWriteDeadline(); RequestDeadlineSpansFrames();
     std::puts("socket timeout passed: live, pending data, FIN, reset, invalid descriptor");
 }
