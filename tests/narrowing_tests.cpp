@@ -233,6 +233,9 @@ void TestMisfitAtInt64Edge() {
         std::fprintf(stderr, "misfit: %s\n", misfit.value_or("none").c_str());
         assert(false);
     }
+    // The type is checked before any value is fitted to it.
+    ExpectThrow<std::invalid_argument>([&] { (void)store.FindValueNotFitting(1, Type(ColumnKind::kUnsigned, 200)); },
+                                       "uN takes N from 1 to 64");
 }
 
 void TestNarrowTable() {

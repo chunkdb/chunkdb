@@ -939,6 +939,10 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
         throw std::invalid_argument("the table has no column with id " + std::to_string(column_id));
     }
     const Column& column = layout.schema().columns[index];
+    Column target = column;
+    target.type = type;
+    // Before any value is fitted to the type.
+    ValidateColumnType(target);
     const auto* fixed = layout.FixedColumnAt(index);
     const std::uint32_t width = geometry_.config().chunk_width_blocks;
     const std::uint32_t height = geometry_.config().chunk_height_blocks;
