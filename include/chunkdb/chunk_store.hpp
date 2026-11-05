@@ -785,6 +785,13 @@ class ChunkStore {
     }
     // Entries in the registry behind that check; one per live instance.
     [[nodiscard]] std::size_t LiveChunkInstanceEntriesForTests() const;
+    // Removes a never-written chunk from the cache without the eviction's
+    // check that nothing else holds it, and returns its object. Holding it
+    // keeps an instance alive past its removal, which eviction never allows,
+    // so a test can observe the duplicate-instance check. Null if the chunk
+    // is not cached.
+    [[nodiscard]] std::shared_ptr<const void> TakeChunkFromCacheForTests(
+        std::int64_t chunk_x, std::int64_t chunk_y);
 
     [[nodiscard]] bool WaitForReadOnlySnapshotPauseForTests();
     void ResumeReadOnlySnapshotForTests();

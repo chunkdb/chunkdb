@@ -88,6 +88,38 @@ std::size_t ChunkStore::LiveChunkInstanceEntriesForTests() const {
     return live_chunk_instances_->entries.size();
 }
 
+std::shared_ptr<const void> ChunkStore::TakeChunkFromCacheForTests(std::int64_t chunk_x, std::int64_t chunk_y) {
+    const ChunkCoord chunk_coord{chunk_x, chunk_y};
+    std::shared_ptr<LargeChunk> large_chunk;
+    {
+        std::lock_guard global_lock(large_chunks_mutex_);
+        const auto it = large_chunks_.find(geometry_.ChunkToLarge(chunk_coord));
+        if (it == large_chunks_.end()) {
+            return nullptr;
+        }
+        large_chunk = it->second;
+    }
+    std::shared_ptr<RegularChunk> chunk;
+    {
+        std::lock_guard large_lock(large_chunk->mutex);
+        const auto it = large_chunk->chunks.find(chunk_coord);
+        if (it == large_chunk->chunks.end()) {
+            return nullptr;
+        }
+        {
+            std::shared_lock chunk_lock(it->second->mutex);
+            if (it->second->written) {
+                throw std::logic_error("TakeChunkFromCacheForTests takes only a never-written chunk");
+            }
+        }
+        chunk = std::move(it->second);
+        large_chunk->chunks.erase(it);
+    }
+    loaded_chunk_count_.fetch_sub(1, std::memory_order_relaxed);
+    resources_->loaded_chunks_.fetch_sub(1, std::memory_order_relaxed);
+    return chunk;
+}
+
 std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(const ChunkCoord& chunk_coord) {
     const LargeChunkCoord large_coord = geometry_.ChunkToLarge(chunk_coord);
 
@@ -125,8 +157,9 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             auto loaded = read_only_load.has_value() ? std::move(*read_only_load) : LoadChunkPayload(chunk_coord, true);
             // An image without a WAL may be of an earlier schema version.
             BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
-            // Not make_shared: a weak_ptr outliving the instance (the WAL
-            // stream pool keeps them) would keep the whole object's memory.
+            // Not make_shared, which cannot take the deleter; as a result a
+            // weak_ptr that outlives the instance (the WAL stream pool keeps
+            // them) keeps only the control block, not the object's storage.
             selected = std::shared_ptr<RegularChunk>(
                 new RegularChunk(std::move(loaded.payload), std::move(loaded.presence_bitmap)),
                 RegularChunkDeleter{live_chunk_instances_, chunk_coord});

@@ -482,6 +482,32 @@ void TestChunkInstanceRegistryHoldsOnlyLiveInstances() {
         assert(store.GetBlockBits(0, 0) == "1010");
         assert(store.DuplicateChunkInstancesForTests() == 0U);
         assert(store.LiveChunkInstanceEntriesForTests() <= config.max_loaded_chunks + 2);
+
+        // An instance held past its removal from the cache keeps its entry,
+        // through evictions of other chunks, so a load of that chunk while
+        // it is held is counted as a duplicate. The entry then belongs to
+        // the new instance, and releasing the old one leaves it in place.
+        (void)store.GetChunkVersion(0, 100);
+        auto held = store.TakeChunkFromCacheForTests(0, 100);
+        assert(held != nullptr);
+        assert(!store.IsChunkLoadedForTests(0, 100));
+        for (int i = 0; i < 8; ++i) {
+            (void)store.GetChunkVersion(2000 + 4 * i, 0);
+        }
+        assert(store.LiveChunkInstanceEntriesForTests() == store.ApproxLoadedChunkCount() + 1);
+        (void)store.GetChunkVersion(0, 100);
+        assert(store.DuplicateChunkInstancesForTests() == 1U);
+        assert(store.LiveChunkInstanceEntriesForTests() == store.ApproxLoadedChunkCount());
+        held.reset();
+        assert(store.IsChunkLoadedForTests(0, 100));
+        assert(store.LiveChunkInstanceEntriesForTests() == store.ApproxLoadedChunkCount());
+        // Once the old instance is gone, reloading is not a duplicate.
+        held = store.TakeChunkFromCacheForTests(0, 100);
+        held.reset();
+        assert(store.LiveChunkInstanceEntriesForTests() == store.ApproxLoadedChunkCount());
+        (void)store.GetChunkVersion(0, 100);
+        assert(store.DuplicateChunkInstancesForTests() == 1U);
+        assert(store.LiveChunkInstanceEntriesForTests() == store.ApproxLoadedChunkCount());
     }
     if (!RemoveAllWithRetry(data_dir)) {
         throw std::runtime_error("failed to remove temp dir: " + data_dir.string());
