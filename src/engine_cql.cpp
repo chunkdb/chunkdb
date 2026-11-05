@@ -912,13 +912,17 @@ std::string CommandEngine::ExecuteStatement(
                     std::vector<MigrationRecord> records;
                     for (auto& record : catalog_->Migrations())
                         if (MayReplayMigration(config_.require_auth, user, record)) records.push_back(std::move(record));
+                    // Who applied a record is user information: MANAGES USERS shows it.
+                    const bool show_user = !config_.require_auth || user->manages_users;
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, records.size());
                     for (const auto& record : records) {
                         Protocol::AppendMapHeader(reply, 4);
                         Protocol::AppendBulk(reply, "name"); Protocol::AppendBulk(reply, record.name);
                         Protocol::AppendBulk(reply, "applied_ms"); Protocol::AppendInteger(reply, record.applied_ms);
-                        Protocol::AppendBulk(reply, "user"); Protocol::AppendBulk(reply, record.user);
+                        Protocol::AppendBulk(reply, "user");
+                        if (show_user) Protocol::AppendBulk(reply, record.user);
+                        else Protocol::AppendNull(reply);
                         Protocol::AppendBulk(reply, "statement"); Protocol::AppendBulk(reply, record.statement);
                     }
                     return reply;

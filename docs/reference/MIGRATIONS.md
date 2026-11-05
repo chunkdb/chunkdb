@@ -41,7 +41,7 @@ SHOW MIGRATIONS
 
 - New name: `applied`, including when the inner statement does nothing.
 - Same name and statement: `skipped`.
-- SHOW MIGRATIONS: name, application timestamp, applying user, and statement, in applied order, for records within your rights.
+- SHOW MIGRATIONS: name, application timestamp, applying user, and statement, in applied order, for records within your rights; the applying user is null without MANAGES USERS.
 
 ## Errors
 
@@ -60,6 +60,7 @@ SHOW MIGRATIONS
 Migration names are shared by all tables and users; give each application's names a distinct prefix.
 A record is within your rights when you have ADMIN on the table its statement names, or MANAGES USERS for GRANT and REVOKE.
 A record whose statement this server cannot parse is within your rights only with ADMIN on `*`.
+Records name tables by name: after a table is dropped and created again, its earlier records belong to whoever administers the new table.
 Rights are checked before an existing name returns skipped or conflict.
 A name recorded outside your rights returns PERMISSION_DENIED whatever statement you submit, without its statement.
 With `--auth none`, every record is within your rights.

@@ -362,7 +362,11 @@ void RecordedNamesFollowRights() {
         }
         return found;
     };
-    assert(names(as(owner, "SHOW MIGRATIONS")) == "create_own own_flag ");
+    const auto owner_listing = as(owner, "SHOW MIGRATIONS");
+    assert(names(owner_listing) == "create_own own_flag ");
+    // The applying user shows only with MANAGES USERS.
+    assert(owner_listing.find("$4\r\nuser\r\n_\r\n") != std::string::npos && owner_listing.find("owner") == std::string::npos);
+    assert(e.Run("SHOW MIGRATIONS").find("$4\r\nuser\r\n$5\r\nowner\r\n") != std::string::npos);
     assert(names(as(keeper, "SHOW MIGRATIONS")) == "grant_own ");
     assert(names(e.Run("SHOW MIGRATIONS")) == "create_realm create_own add_flag grant_own own_flag add_more ");
     e.users->Revoke("owner", "own", Right::kAdmin);

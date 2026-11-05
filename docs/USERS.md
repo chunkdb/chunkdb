@@ -44,7 +44,7 @@ Dropping a table removes its specific grants.
 | CREATE TABLE, SHOW METRICS, RELOAD TLS | ADMIN on all tables |
 | FLUSH WAL | WRITE on at least one table |
 | SHOW TABLES, SHOW SLOTS | None; results include accessible tables only |
-| SHOW MIGRATIONS | None; results include records on tables with ADMIN, and GRANT and REVOKE records with MANAGES USERS |
+| SHOW MIGRATIONS | None; results include records on tables with ADMIN, and GRANT and REVOKE records with MANAGES USERS; applying users show with MANAGES USERS |
 | ACK | An open slot watch |
 | PING | None |
 | User management, GRANT, REVOKE, BACKUP TO | MANAGES USERS |
