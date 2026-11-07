@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <functional>
 #include <limits>
+#include <list>
 #include <map>
 #include <memory>
 #include <mutex>
@@ -16,6 +17,8 @@
 #include <string>
 #include <string_view>
 #include <unordered_map>
+#include <utility>
+#include <vector>
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/change_feed.hpp"
@@ -34,12 +37,13 @@ class UserRegistry;
 class AuditLog;
 class SlotWatch;
 struct User;
+class ReadRightCheck;
 struct PendingLogin;
 enum class Right : std::uint8_t;
 
 // Deterministic command interleavings, following the feed hooks.
 struct CommandEngineTestHook {
-    enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted };
+    enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted, kBeforeTxnBudgetReclaim };
     virtual ~CommandEngineTestHook() = default;
     virtual void Run(Point point, std::string_view table) = 0;
 };
@@ -48,6 +52,13 @@ struct CommandEngineTestHook {
 class PermissionDeniedError : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
+};
+
+// The user a connection logged in as was dropped, perhaps created again:
+// AUTH_REQUIRED, and the connection closes.
+class UserDroppedError : public std::runtime_error {
+  public:
+    UserDroppedError() : std::runtime_error("the user of this connection was dropped; log in again") {}
 };
 
 struct EngineConfig {
@@ -100,16 +111,36 @@ struct ChunkCoordLess {
     }
 };
 
+struct SessionTransaction;
+
+// An engine's open transactions and the bytes of their private copies.
+struct TxnBudget {
+    // The bytes of the private copies of all open transactions
+    // (--txn-total-bytes).
+    std::atomic<std::size_t> bytes{0};
+    // Guards `open` and each open transaction's `in_statement`.
+    std::mutex mutex;
+    std::list<SessionTransaction*> open;
+};
+
 // A connection's open transaction (docs/design/TRANSACTIONS_DESIGN.md).
+// While `in_statement` is set only its session's statement uses it; while
+// it is clear, the engine may end it under the budget's mutex once it is
+// past --txn-max-duration-ms, so its bytes do not wait for the client.
 struct SessionTransaction {
-    SessionTransaction(std::atomic<std::size_t>* total, std::chrono::steady_clock::time_point started)
-        : total_bytes(total), started(started) {}
+    // Registers the transaction in `budget`.
+    SessionTransaction(TxnBudget* budget, std::chrono::steady_clock::time_point started);
     SessionTransaction(const SessionTransaction&) = delete;
     SessionTransaction& operator=(const SessionTransaction&) = delete;
-    ~SessionTransaction() { total_bytes->fetch_sub(bytes); }
+    // Unregisters it and releases its bytes.
+    ~SessionTransaction();
 
-    // The engine's count of the private copies' bytes of all transactions.
-    std::atomic<std::size_t>* total_bytes;
+    TxnBudget* budget;
+    // This transaction in budget->open.
+    std::list<SessionTransaction*>::iterator entry{};
+    // A statement of the session is using the transaction; guarded by
+    // budget->mutex.
+    bool in_statement = false;
     std::chrono::steady_clock::time_point started;
     // The table of the first statement and the snapshot it took; empty
     // before.
@@ -118,7 +149,7 @@ struct SessionTransaction {
     // The chunks read, and the private copies of the chunks written.
     std::set<ChunkCoord, ChunkCoordLess> read_set{};
     std::map<ChunkCoord, ChunkState, ChunkCoordLess> writes{};
-    // The bytes of `writes`, also counted in *total_bytes.
+    // The bytes of `writes`, also counted in budget->bytes.
     std::size_t bytes = 0;
     // Set when a statement got CONFLICT: the snapshot and the writes are
     // gone, and every statement but COMMIT and ROLLBACK answers this reply,
@@ -126,15 +157,25 @@ struct SessionTransaction {
     // transaction.
     std::optional<std::string> aborted{};
 
-    // Drops the snapshot and the writes, keeping `reply` as the answer.
-    void Abort(std::string reply) {
-        snapshot.reset();
-        writes.clear();
-        read_set.clear();
-        total_bytes->fetch_sub(bytes);
+    // What Detach takes out of the transaction.
+    struct Released {
+        std::unique_ptr<TxnSnapshot> snapshot;
+        std::map<ChunkCoord, ChunkState, ChunkCoordLess> writes;
+        std::set<ChunkCoord, ChunkCoordLess> read_set;
+    };
+
+    // Ends the transaction, keeping `reply` as the answer and releasing its
+    // bytes; the snapshot and the copies are returned, so a caller holding a
+    // lock can destroy them after releasing it.
+    [[nodiscard]] Released Detach(std::string reply) {
+        Released released{std::move(snapshot), std::exchange(writes, {}), std::exchange(read_set, {})};
+        budget->bytes.fetch_sub(bytes);
         bytes = 0;
         aborted = std::move(reply);
+        return released;
     }
+    // Drops the snapshot and the writes, keeping `reply` as the answer.
+    void Abort(std::string reply) { (void)Detach(std::move(reply)); }
 };
 
 struct SessionHelloOptions {
@@ -169,9 +210,18 @@ struct SessionState {
     bool greeted = false;
     // The logged-in user; empty when logins need no user.
     std::string user;
-    // That user as of `user_generation` of the registry; null once dropped.
+    // The incarnation of that user at login (UserRegistry::FindIncarnation).
+    std::uint64_t user_incarnation = 0;
+    // That user as of `user_generation` of the registry; null for good once
+    // dropped, even when a user of that name is created again.
     std::shared_ptr<const User> user_rights;
     std::uint64_t user_generation = 0;
+    // The registry generation at which the published rights view last
+    // showed that user, at that incarnation.
+    std::uint64_t user_present_generation = 0;
+    // READ of that user on the table of the open watch, which the feed checks
+    // while it streams; null without users.
+    std::shared_ptr<ReadRightCheck> watch_right;
     // Between HELLO 3 USER and AUTH: the SCRAM exchange in progress.
     std::shared_ptr<PendingLogin> pending_login;
     // The table the last statement named, kept so the next statement on it
@@ -219,9 +269,15 @@ class CommandEngine {
         std::string_view line,
         std::span<const std::optional<std::string>> parameters = {});
     [[nodiscard]] std::string RejectPayload(SessionState& session, std::string_view line, std::string response);
+    // The error that ends a watch whose user lost READ on `table`: NO_TABLE,
+    // as a statement on a table the user cannot see gets, or AUTH_REQUIRED
+    // once the user was dropped.
+    [[nodiscard]] static std::string LostWatchReply(bool user_dropped, const std::string& table);
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
     }
+    // The users of the data directory; null without users.
+    [[nodiscard]] const std::shared_ptr<UserRegistry>& users() const noexcept { return config_.users; }
     // Test-only visibility into the bounded auth-failure tracking table.
     [[nodiscard]] std::size_t AuthFailureTrackedSourcesForTests();
     void SetHookForTests(CommandEngineTestHook* hook) noexcept {
@@ -238,6 +294,9 @@ class CommandEngine {
   private:
     struct IpAuthFailureState {
         std::size_t failures = 0;
+        // The part of `failures` per attempted user name; a login clears only
+        // its own name's part. Failures of other names stay counted.
+        std::vector<std::pair<std::string, std::size_t>> failures_by_user;
         std::chrono::steady_clock::time_point banned_until{};
         std::chrono::steady_clock::time_point last_update{};
     };
@@ -247,8 +306,8 @@ class CommandEngine {
     std::shared_ptr<MetricsRegistry> metrics_;
     std::mutex auth_failures_mutex_;
     std::unordered_map<std::string, IpAuthFailureState> auth_failures_by_ip_;
-    // The bytes of the private chunk copies of all open transactions.
-    std::atomic<std::size_t> txn_total_bytes_{0};
+    // The open transactions and their bytes.
+    TxnBudget txn_budget_;
     std::atomic<CommandEngineTestHook*> hook_{nullptr};
     std::mutex tls_reload_mutex_;
     std::function<void()> tls_reload_;
@@ -273,6 +332,15 @@ class CommandEngine {
     void AuditLogin(const SessionState& session, std::string_view user, bool known_user, bool succeeded,
                     const std::string& response) const;
     [[nodiscard]] PayloadRequest PlanParameters(SessionState& session, std::string_view line) const;
+    // AUTH_REQUIRED for a session whose user was dropped, closing it after
+    // the reply; empty while the user exists.
+    [[nodiscard]] std::string LostUserReply(SessionState& session) const;
+    // LostUserReply, recorded in the metrics and logs as a refused statement.
+    [[nodiscard]] std::string AnswerLostUser(
+        SessionState& session, std::string_view line, std::chrono::steady_clock::time_point started);
+    // What the logs say about `line` (engine_cql.cpp); nothing when it does
+    // not parse.
+    static void DescribeLine(std::string_view line, StatementLogInfo& info);
     // The table a statement names, leased for it; the session keeps the
     // table so the next statement on it skips the catalog.
     [[nodiscard]] Table::Lease AcquireNamedTable(SessionState& session, std::string_view name) const;
@@ -292,8 +360,8 @@ class CommandEngine {
     // source (empty when not banned), a failed login (AUTH_FAILED), and a
     // successful one.
     [[nodiscard]] std::string AuthBanReply(SessionState& session);
-    [[nodiscard]] std::string RecordAuthFailure(SessionState& session);
-    void RecordAuthSuccess(SessionState& session);
+    [[nodiscard]] std::string RecordAuthFailure(SessionState& session, std::string_view user);
+    void RecordAuthSuccess(SessionState& session, std::string_view user);
 
     // Rights (engine_cql.cpp, docs/design/USERS_DESIGN.md). Each throws
     // TableNotFoundError when the user has no right at all on the table, so
@@ -314,6 +382,24 @@ class CommandEngine {
     // Transactions (engine_cql.cpp, docs/design/TRANSACTIONS_DESIGN.md).
     [[nodiscard]] std::string TxnBegin(SessionState& session);
     [[nodiscard]] std::string TxnCommit(SessionState& session);
+    // The conflict a transaction past --txn-max-duration-ms ends with.
+    [[nodiscard]] TransactionConflictError TxnDurationConflict() const;
+    // Whether the transaction is --txn-max-duration-ms old.
+    [[nodiscard]] bool TxnPastDuration(
+        const SessionTransaction& txn, std::chrono::steady_clock::time_point now) const;
+    // Whether it holds a snapshot and private copies that ending it releases;
+    // read under the budget's mutex unless its statement is running.
+    [[nodiscard]] static bool TxnHoldsBudget(const SessionTransaction& txn);
+    // Marks the session's transaction, if any, as used by the statement
+    // starting, after ending it when it holds a snapshot and is past
+    // --txn-max-duration-ms; returns whether there was one.
+    // TxnStatementDone clears the mark when the statement left it open.
+    [[nodiscard]] bool TxnStatementStart(SessionState& session);
+    void TxnStatementDone(SessionState& session, bool started) noexcept;
+    // Ends every transaction past --txn-max-duration-ms that holds a snapshot
+    // and that no statement is using, releasing its private copies and
+    // snapshot; its next statement answers CONFLICT reason=duration.
+    void EndExpiredTransactions();
     // The table's lease for a statement inside the transaction. The first
     // statement binds the transaction to its table and takes the snapshot;
     // a later one on another table is refused, and a table altered or

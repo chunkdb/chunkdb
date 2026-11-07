@@ -1,5 +1,7 @@
 # chunkdb
 
+[![CI](https://github.com/chunkdb/chunkdb/actions/workflows/ci.yml/badge.svg)](https://github.com/chunkdb/chunkdb/actions/workflows/ci.yml)
+
 chunkdb stores grid data in tables of chunks of typed blocks.
 
 A **block** is one grid cell with named columns, such as `kind` and `name`.

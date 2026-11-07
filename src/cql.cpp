@@ -856,7 +856,13 @@ class Parser {
                 create.name = SlotName();
                 Expect("on");
                 create.table = Name("a table name");
-                while (FeedFilter(create)) {}
+                while (true) {
+                    const auto column = Peek().column;
+                    if (Accept("owner")) {
+                        if (create.owner) Fail(column, "OWNER is given twice");
+                        create.owner = Name("a user name");
+                    } else if (!FeedFilter(create)) break;
+                }
                 return create;
             }
             if (Accept("user")) {

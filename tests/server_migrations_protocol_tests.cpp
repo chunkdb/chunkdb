@@ -1,6 +1,7 @@
 #include <array>
 #include <barrier>
 #include <iostream>
+#include <optional>
 
 #include "server_slots_test_utils.hpp"
 
@@ -15,16 +16,17 @@ void Result(const Reply& reply, std::string_view expected) {
 std::string Command(std::string_view name, std::string_view statement) {
     return "MIGRATE '" + std::string(name) + "' " + std::string(statement);
 }
-void Record(const Reply& record, std::string_view name, std::string_view user, std::string_view statement) {
+void Record(const Reply& record, std::string_view name, std::optional<std::string_view> user, std::string_view statement) {
     assert(record.type == '%' && record.items.size() == 8U);
     assert(Field(record, "name").type == '$' && Field(record, "name").value == name);
     assert(Number(Field(record, "applied_ms")) > 0U);
-    assert(Field(record, "user").type == '$' && Field(record, "user").value == user);
+    if (user) assert(Field(record, "user").type == '$' && Field(record, "user").value == *user);
+    else assert(Field(record, "user").type == '_'); // Shown only with MANAGES USERS.
     assert(Field(record, "statement").type == '$' && Field(record, "statement").value == statement);
 }
 void CreateUser(Client& admin, std::string_view name) {
     const std::array<std::uint8_t, 16> salt{};
-    const auto verifier = scram::FormatVerifier(scram::MakeVerifier("pw", salt, scram::kMinIterations));
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
     admin.Ok("CREATE USER " + std::string(name) + " VERIFIER '" + verifier + "'");
 }
 void AppliedSkippedConflict(bool tls) {
@@ -110,21 +112,24 @@ void RightsAndTransactions(bool tls) {
     Error(limited.Command(Command("alter", "ALTER TABLE realm ADD COLUMN forbidden u8 NULL")), "PERMISSION_DENIED");
     Error(limited.Command(Command("grant_denied", "GRANT READ ON realm TO limited")), "PERMISSION_DENIED");
     Error(limited.Command(Command("revoke_denied", "REVOKE READ ON realm FROM limited")), "PERMISSION_DENIED");
-    Error(limited.Command("SHOW MIGRATIONS"), "PERMISSION_DENIED");
+    const auto none = limited.Command("SHOW MIGRATIONS");
+    assert(none.type == '*' && none.items.empty()); // Only records on tables you administer are listed.
     admin->Ok("GRANT ADMIN ON * TO limited");
-    Error(limited.Command("SHOW MIGRATIONS"), "PERMISSION_DENIED"); // MANAGES USERS is the listing right.
-    admin->Ok("ALTER USER limited MANAGES USERS");
     const auto listed = limited.Command("SHOW MIGRATIONS");
     assert(listed.type == '*' && listed.items.size() == 1U);
-    Record(listed.items[0], "alter", "limited", alter);
+    Record(listed.items[0], "alter", std::nullopt, alter);
+    admin->Ok("ALTER USER limited MANAGES USERS");
+    const auto managed = limited.Command("SHOW MIGRATIONS");
+    assert(managed.items.size() == 1U);
+    Record(managed.items[0], "alter", "limited", alter);
     admin->Ok("REVOKE READ ON * FROM limited");
     admin->Ok("REVOKE READ ON realm FROM limited");
-    assert(limited.Command("SHOW MIGRATIONS") == listed); // Managing users alone suffices.
+    assert(limited.Command("SHOW MIGRATIONS") == none); // MANAGES USERS lists only GRANT and REVOKE records.
     admin->Ok("BEGIN");
     Error(admin->Command(Command("alter", alter)), "INVALID_ARGUMENT");
     Error(admin->Command(Command("txn_denied", "ALTER TABLE realm ADD COLUMN forbidden u8 NULL")), "INVALID_ARGUMENT");
     admin->Ok("ROLLBACK");
-    assert(admin->Command("SHOW MIGRATIONS") == listed);
+    assert(admin->Command("SHOW MIGRATIONS") == managed);
     assert(Field(admin->Command("DESCRIBE realm"), "columns").items.size() == 2U);
 }
 void ConcurrentRequests(bool tls) {

@@ -40,6 +40,8 @@ namespace {
 // full, the least-recently-updated entry is evicted so an address spray
 // cannot grow memory without bound.
 constexpr std::size_t kMaxTrackedAuthFailureSources = 4096;
+// Hard bound on the user names whose failures one source tracks separately.
+constexpr std::size_t kMaxTrackedAuthFailureNamesPerSource = 8;
 
 [[nodiscard]] std::string_view ExtractCommandName(std::string_view line) noexcept {
     while (!line.empty() && (line.back() == '\n' || line.back() == '\r')) {
@@ -260,11 +262,19 @@ CommandEngine::CommandEngine(
 // The longest SCRAM message HELLO and AUTH take as a parameter frame.
 constexpr std::size_t kMaxScramMessageBytes = 1024;
 
+// The parameter frames a HELLO may carry before authentication: enough for
+// $1 of USER, every known option and eight unknown ones. A count that only
+// the line length bounds would let an unauthenticated connection hold its
+// worker for as many frame waits.
+constexpr std::size_t kMaxHelloParameterFrames = 12;
+
 // A login between HELLO 3 USER and AUTH.
 struct PendingLogin {
     std::string user;
     // An unknown user runs against a decoy and always fails.
     bool known = false;
+    // The incarnation of the user HELLO found; the session keeps it.
+    std::uint64_t incarnation = 0;
     scram::ServerExchange exchange;
     SessionHelloOptions options;
 };
@@ -276,6 +286,9 @@ std::string CommandEngine::Execute(
     const auto command_name = ExtractCommandName(line);
     const auto started = std::chrono::steady_clock::now();
     const bool hello = Protocol::CommandEquals(command_name, "HELLO");
+    // Before parsing: every line of a connection that lost its user, HELLO
+    // or one that would not parse too, gets the same reply and closes it.
+    if (std::string lost = AnswerLostUser(session, line, started); !lost.empty()) return lost;
     if (hello || (!session.greeted && Protocol::CommandEquals(command_name, "AUTH"))) {
         // The user a login names, for the audit log: from HELLO 3 USER, or
         // the pending login AUTH finishes.
@@ -344,7 +357,17 @@ std::string CommandEngine::Execute(
     // Neither log costs anything while both are off.
     const bool logged = config_.audit != nullptr || config_.slow_statement_ms != 0U;
     StatementLogInfo info;
-    std::string response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr);
+    std::string response;
+    {
+        // The session's transaction belongs to this statement until it ends.
+        struct TxnStatement {
+            CommandEngine& engine;
+            SessionState& session;
+            bool started;
+            ~TxnStatement() { engine.TxnStatementDone(session, started); }
+        } txn_statement{*this, session, TxnStatementStart(session)};
+        response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr);
+    }
     ObserveReply(command_class, started, response);
     if (logged && info.verb != nullptr) {
         LogStatement(session, info, started, response);
@@ -354,6 +377,9 @@ std::string CommandEngine::Execute(
 
 std::string CommandEngine::RejectPayload(SessionState& session, std::string_view line, std::string response) {
     const auto started = std::chrono::steady_clock::now();
+    // Whatever the planned rejection, a connection that lost its user gets
+    // the same reply as from Execute.
+    if (std::string lost = AnswerLostUser(session, line, started); !lost.empty()) return lost;
     const auto name = ExtractCommandName(line);
     const bool auth = Protocol::CommandEquals(name, "HELLO") || (!session.greeted && Protocol::CommandEquals(name, "AUTH"));
     if (!session.greeted) {
@@ -367,6 +393,41 @@ std::string CommandEngine::RejectPayload(SessionState& session, std::string_view
     }
     ObserveReply(auth ? MetricsRegistry::CommandClass::kAuth : MetricsRegistry::CommandClass::kOther, started, response);
     return response;
+}
+
+std::string CommandEngine::LostWatchReply(bool user_dropped, const std::string& table) {
+    if (user_dropped) return ErrorReply(UserDroppedError());
+    return ErrorReply(TableNotFoundError("table '" + table + "' does not exist"));
+}
+
+std::string CommandEngine::LostUserReply(SessionState& session) const {
+    if (!config_.require_auth || !session.greeted) return {};
+    // One atomic load while the users are unchanged; after a change, the
+    // published view, never the registry lock a change holds while it syncs.
+    const std::uint64_t generation = config_.users->Generation();
+    if (session.user_present_generation == generation) return {};
+    const auto rights = config_.users->Rights();
+    const auto found = rights->users.find(session.user);
+    if (found != rights->users.end() && found->second.incarnation == session.user_incarnation) {
+        session.user_present_generation = generation;
+        return {};
+    }
+    session.close_after_reply = true;
+    return ErrorReply(UserDroppedError());
+}
+
+std::string CommandEngine::AnswerLostUser(
+    SessionState& session, std::string_view line, std::chrono::steady_clock::time_point started) {
+    std::string lost = LostUserReply(session);
+    if (lost.empty()) return lost;
+    ObserveReply(MetricsRegistry::CommandClass::kAuth, started, lost);
+    // Logged as other refused statements are; a line that does not parse is not.
+    if (config_.audit != nullptr || config_.slow_statement_ms != 0U) {
+        StatementLogInfo info;
+        DescribeLine(line, info);
+        if (info.verb != nullptr) LogStatement(session, info, started, lost);
+    }
+    return lost;
 }
 
 namespace {
@@ -510,16 +571,27 @@ std::string CommandEngine::AuthBanReply(SessionState& session) {
         {"reason", "auth_ban"}, {"retry_after_ms", std::to_string(remaining)}});
 }
 
-void CommandEngine::RecordAuthSuccess(SessionState& session) {
+void CommandEngine::RecordAuthSuccess(SessionState& session, std::string_view user) {
     session.authenticated = true;
     session.failed_auth_attempts = 0;
-    if (!session.remote_address.empty() && config_.max_auth_failures_per_ip > 0) {
+    if (!session.remote_address.empty() && config_.max_auth_failures_per_ip > 0 && !user.empty()) {
+        // Only the failures of the name that logged in are cleared: a login
+        // under one account does not reset guesses for another from the same
+        // source, and an active ban stays.
         std::lock_guard lock(auth_failures_mutex_);
-        auth_failures_by_ip_.erase(SourceAddressKey(session.remote_address));
+        const auto it = auth_failures_by_ip_.find(SourceAddressKey(session.remote_address));
+        if (it == auth_failures_by_ip_.end()) return;
+        auto& by_user = it->second.failures_by_user;
+        const auto own = std::find_if(by_user.begin(), by_user.end(), [&](const auto& entry) { return entry.first == user; });
+        if (own == by_user.end()) return;
+        it->second.failures -= own->second;
+        by_user.erase(own);
+        if (it->second.failures == 0 && it->second.banned_until <= std::chrono::steady_clock::now())
+            auth_failures_by_ip_.erase(it);
     }
 }
 
-std::string CommandEngine::RecordAuthFailure(SessionState& session) {
+std::string CommandEngine::RecordAuthFailure(SessionState& session, std::string_view user) {
     const bool track_remote_ip = !session.remote_address.empty() && config_.max_auth_failures_per_ip > 0;
     const std::string failure_key = track_remote_ip ? SourceAddressKey(session.remote_address) : std::string();
     const auto now = std::chrono::steady_clock::now();
@@ -566,8 +638,23 @@ std::string CommandEngine::RecordAuthFailure(SessionState& session) {
             it = auth_failures_by_ip_.try_emplace(failure_key).first;
         }
         auto& ip_state = it->second;
+        // An ended ban starts a new period: the address again has the
+        // configured number of failures before it is banned again.
+        if (ip_state.banned_until != std::chrono::steady_clock::time_point{} && ip_state.banned_until <= now) {
+            ip_state.failures = 0;
+            ip_state.failures_by_user.clear();
+            ip_state.banned_until = {};
+        }
         ip_state.last_update = now;
         ++ip_state.failures;
+        // A name that cannot log in, or one past the per-source bound, is
+        // counted but never cleared by a login.
+        if (IsValidUserName(user)) {
+            auto& by_user = ip_state.failures_by_user;
+            const auto own = std::find_if(by_user.begin(), by_user.end(), [&](const auto& entry) { return entry.first == user; });
+            if (own != by_user.end()) ++own->second;
+            else if (by_user.size() < kMaxTrackedAuthFailureNamesPerSource) by_user.emplace_back(std::string(user), 1U);
+        }
         if (ip_state.failures >= config_.max_auth_failures_per_ip) {
             if (config_.auth_failure_ban_ms > 0) {
                 ip_state.banned_until = now + std::chrono::milliseconds(config_.auth_failure_ban_ms);
@@ -594,6 +681,10 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
             return PayloadRequest{.plan = PayloadPlan::kDiscard, .reject_response = Protocol::Error("PROTOCOL",
                 session.greeted ? "HELLO was already sent on this connection" : "expected HELLO 3"),
                 .frame_count = session.greeted ? count : 0U};
+        if (count > kMaxHelloParameterFrames)
+            // Closed after the error, without reading the frames.
+            return PayloadRequest{.plan = PayloadPlan::kDiscard, .reject_response = Protocol::Error("PROTOCOL",
+                "HELLO takes at most " + std::to_string(kMaxHelloParameterFrames) + " parameters"), .frame_count = 0U};
         try {
             const auto hello = cql::ParseHello(line);
             ValidateHelloOptionNames(hello);
@@ -694,6 +785,9 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (dynamic_cast<const PermissionDeniedError*>(&error) != nullptr) {
         return Protocol::Error("PERMISSION_DENIED", std::string(error.what()) + "; ask an administrator to grant this right");
     }
+    if (dynamic_cast<const UserDroppedError*>(&error) != nullptr) {
+        return Protocol::Error("AUTH_REQUIRED", error.what(), {{"reason", "user_dropped"}});
+    }
     if (dynamic_cast<const TableExistsError*>(&error) != nullptr) {
         return Protocol::Error("TABLE_EXISTS", error.what());
     }
@@ -750,7 +844,7 @@ std::string CommandEngine::HandleHello(
         if (config_.require_auth) {
             return Protocol::Error("AUTH_REQUIRED", "use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message; set the username and password in your client connection URI");
         }
-        RecordAuthSuccess(session);
+        RecordAuthSuccess(session, {});
         session.hello_options = std::move(options);
         session.greeted = true;
         return HelloReply(session, {});
@@ -767,12 +861,13 @@ std::string CommandEngine::HandleHello(
     if (first.user != user) {
         throw std::invalid_argument("the SCRAM client-first message names another user than HELLO");
     }
-    const auto found = config_.users->Find(user);
+    const auto found = config_.users->FindIncarnation(user);
     const auto secret = config_.users->Secret();
-    scram::Verifier verifier = found.has_value() ? found->verifier : scram::DecoyVerifier(secret, user);
+    scram::Verifier verifier = found.has_value() ? found->user.verifier : scram::DecoyVerifier(secret, user);
     session.pending_login = std::make_shared<PendingLogin>(PendingLogin{
         .user = user,
         .known = found.has_value(),
+        .incarnation = found.has_value() ? found->incarnation : 0U,
         .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce()),
         .options = std::move(options),
     });
@@ -798,11 +893,12 @@ std::string CommandEngine::HandleAuth(
     }
     const auto server_final = pending->exchange.Finish(*parameters[0]);
     if (!server_final.has_value() || !pending->known) {
-        return RecordAuthFailure(session);
+        return RecordAuthFailure(session, pending->user);
     }
-    RecordAuthSuccess(session);
+    RecordAuthSuccess(session, pending->user);
     session.greeted = true;
     session.user = pending->user;
+    session.user_incarnation = pending->incarnation;
     session.hello_options = std::move(pending->options);
     return HelloReply(session, *server_final);
 }

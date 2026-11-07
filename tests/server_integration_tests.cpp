@@ -33,6 +33,7 @@
 #include "../src/change_feed.hpp"
 #include "../src/proxy_protocol.hpp"
 #include "../src/slot_watch.hpp"
+#include "../src/server_socket.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -63,6 +64,48 @@ void SetServerTimeoutConfigFailpointForTests(
     std::size_t recv_failures) noexcept;
 void ResetServerTimeoutConfigCountersForTests() noexcept;
 std::uint64_t ServerRecvTimeoutConfigCallsForTests() noexcept;
+std::size_t FeedDeliveryTestAccess::FillActiveClientSendQueue(ChunkServer& server, int bytes) {
+    std::lock_guard lock(server.active_clients_mutex_);
+    assert(server.active_clients_.size() == 1U);
+    const auto socket = static_cast<
+#ifdef _WIN32
+        SOCKET
+#else
+        int
+#endif
+    >(server.active_clients_.front());
+    assert(setsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
+    int actual = 0;
+#ifdef _WIN32
+    int length = sizeof(actual);
+#else
+    socklen_t length = sizeof(actual);
+#endif
+    assert(getsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&actual), &length) == 0);
+    assert(actual > 0);
+    std::string error;
+    assert(server_detail::SetSocketNonBlocking(socket, true, &error));
+    const std::vector<char> filler(16U * 1024U * 1024U, 'x');
+    std::size_t filled = 0U;
+    bool blocked = false;
+    while (filled < 4U * filler.size()) {
+        const auto sent = send(socket, filler.data(), static_cast<int>(filler.size()), 0);
+        if (sent > 0) { filled += static_cast<std::size_t>(sent); continue; }
+        const auto code = server_detail::CurrentSocketErrorCode();
+        if (sent < 0 && server_detail::IsSocketInterruptedError(code)) continue;
+#ifdef _WIN32
+        blocked = sent < 0 && code == WSAEWOULDBLOCK;
+#else
+        blocked = sent < 0 && (code == EAGAIN || code == EWOULDBLOCK);
+#endif
+        assert(blocked);
+        break;
+    }
+    assert(blocked && filled > 0U);
+    assert(server_detail::SetSocketNonBlocking(socket, false, &error));
+    std::cout << "steady slow reader: send_buffer=" << actual << " prefilled=" << filled << '\n' << std::flush;
+    return filled;
+}
 }
 
 namespace {
@@ -303,7 +346,7 @@ std::string LoginReply(Client& client, const std::string& user, const std::strin
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
-    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive AUTH response");
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: build prepared AUTH response");
     const auto step = chunkdb::test::AuthBytes(login, password, first);
     client.SendBytes(step.bytes);
     const auto fields = ReadHelloReply(client);
@@ -315,15 +358,17 @@ std::string LoginReply(Client& client, const std::string& user, const std::strin
 
 // A login with a wrong password: the error line.
 template <typename Client>
-std::string FailedLoginReply(Client& client, const std::string& user, const std::string& password) {
+std::string FailedLoginReply(Client& client, const std::string& user, const std::string& /*password*/) {
     const auto login = chunkdb::scram::StartClientLogin(user, chunkdb::scram::NewNonce());
     client.SendBytes(chunkdb::test::HelloUserBytes(login, user));
     const std::string first = client.ReadLine();
     if (first.rfind("+SCRAM ", 0) != 0) {
         return first;
     }
-    chunkdb::test::FeedPhaseWatchdog::Phase("client: derive rejected AUTH response");
-    client.SendBytes(chunkdb::test::AuthBytes(login, password, first).bytes);
+    chunkdb::test::FeedPhaseWatchdog::Phase("client: send rejected AUTH response");
+    // Wrong-password cryptography is covered by the RFC exchange tests.
+    // The timed socket fixture needs an invalid proof without key derivation.
+    client.SendBytes(chunkdb::test::WrongAuthBytes(first));
     return client.ReadLine();
 }
 
@@ -883,7 +928,9 @@ class TlsClient {
     // `max_version`: the highest TLS version offered, e.g. TLS1_2_VERSION;
     // 0 offers every version the library supports. `prefix`: bytes sent in
     // the clear before the handshake, such as a PROXY protocol header.
-    TlsClient(std::string host, std::uint16_t port, int max_version = 0, const std::string& prefix = {})
+    // `ciphers`: the TLS 1.2 cipher list offered; empty keeps the default.
+    TlsClient(std::string host, std::uint16_t port, int max_version = 0, const std::string& prefix = {},
+              const std::string& ciphers = {})
         : host_(std::move(host)), port_(port) {
         SSL_load_error_strings();
         OpenSSL_add_ssl_algorithms();
@@ -896,6 +943,11 @@ class TlsClient {
             SSL_CTX_free(context_);
             context_ = nullptr;
             throw std::runtime_error("failed to set the TLS client's highest version");
+        }
+        if (!ciphers.empty() && SSL_CTX_set_cipher_list(context_, ciphers.c_str()) != 1) {
+            SSL_CTX_free(context_);
+            context_ = nullptr;
+            throw std::runtime_error("failed to set the TLS client's cipher list");
         }
         try {
             socket_ = ConnectSocket(host_, port_);
@@ -929,13 +981,17 @@ class TlsClient {
             connected = SSL_connect(session_);
         } while (connected != 1 && TimedOut(connected));
         if (connected != 1) {
+            // SSL_ERROR_SSL: the handshake itself failed, such as on a TLS alert.
+            const int failure = SSL_get_error(session_, connected);
+            const char* reason = ERR_reason_error_string(ERR_peek_last_error());
             SSL_free(session_);
             session_ = nullptr;
             CloseSocket(socket_);
             socket_ = kInvalidSocket;
             SSL_CTX_free(context_);
             context_ = nullptr;
-            throw std::runtime_error("failed to complete TLS client handshake");
+            throw std::runtime_error("failed to complete TLS client handshake: ssl_error=" + std::to_string(failure) +
+                                     " " + (reason != nullptr ? reason : "unknown"));
         }
     }
 
@@ -982,6 +1038,7 @@ class TlsClient {
     }
 
     [[nodiscard]] int Version() const { return SSL_version(session_); }
+    [[nodiscard]] std::string Cipher() const { return SSL_get_cipher_name(session_); }
 
     void SendLine(const std::string& command) {
         SendBytes(command + "\r\n");
@@ -1269,6 +1326,14 @@ class ScopedLogCapture {
             }
         }
         return count;
+    }
+
+    [[nodiscard]] std::string FirstContaining(std::string_view needle) const {
+        std::lock_guard lock(lines_mutex_);
+        for (const auto& line : lines_) {
+            if (line.find(needle) != std::string::npos) return line;
+        }
+        return {};
     }
 
     [[nodiscard]] std::size_t IndexOf(std::string_view needle) const {
@@ -2137,6 +2202,146 @@ void TestHelloDeadlineEndsAPartialLine() {
     }
 }
 
+// `HELLO 3 WITH o1=$1,...,oN=$N`: N unknown options, each with a frame.
+std::string HelloWithOptionFrames(unsigned count) {
+    std::string line = "HELLO 3 WITH ";
+    for (unsigned i = 1U; i <= count; ++i) {
+        line += (i == 1U ? "o" : ",o") + std::to_string(i) + "=$" + std::to_string(i);
+    }
+    return line + "\r\n";
+}
+
+// Sends `piece` `count` times, `gap` apart, each well within the I/O
+// timeout; stops once the server has closed the connection.
+template <typename Client>
+std::thread Trickle(Client& client, const std::string& piece, unsigned count, std::chrono::milliseconds gap) {
+    return std::thread([&client, piece, count, gap] {
+        for (unsigned i = 0U; i < count; ++i) {
+            std::this_thread::sleep_for(gap);
+            try {
+                client.SendBytes(piece);
+            } catch (const std::exception&) {
+                return;  // closed by the server
+            }
+        }
+    });
+}
+
+// Whether a close came at a deadline of `io_timeout`: not before it, and
+// bounded rather than waiting for the client. The upper bound is loose so
+// a loaded machine does not fail it.
+bool ClosedAtDeadline(Clock::duration elapsed, std::chrono::milliseconds io_timeout) {
+    return elapsed >= io_timeout - std::chrono::milliseconds(100) && elapsed < io_timeout * 3;
+}
+
+// Before authentication every read ends at the HELLO deadline, frames
+// included, however steadily they arrive. After it, each frame has the I/O
+// timeout of its own. The server closes while frames are still being sent,
+// so its log tells why and when.
+template <typename Client>
+void CheckTrickledFramesAreBounded(std::uint16_t port, std::size_t io_timeout_ms) {
+    const auto io_timeout = std::chrono::milliseconds(io_timeout_ms);
+    {
+        ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+        Client client("127.0.0.1", port);
+        // After the TLS handshake, where the HELLO deadline starts.
+        const auto start = Clock::now();
+        client.SendBytes(HelloWithOptionFrames(12U));
+        auto sender = Trickle(client, "$-1\r\n", 12U, io_timeout / 4);
+        const bool refused = logs.WaitContains("HELLO 3 was not completed within the I/O timeout", io_timeout * 5);
+        const auto elapsed = Clock::now() - start;
+        sender.join();
+        assert(refused);
+        assert(ClosedAtDeadline(elapsed, io_timeout));
+        // A frame that arrives as the server closes turns the close into a
+        // reset, which may discard the reply.
+        try {
+            assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol HELLO 3 was not completed within the I/O timeout\r\n");
+        } catch (const std::runtime_error&) {
+        }
+    }
+    Client client("127.0.0.1", port);
+    client.Hello();
+    client.SendLine("CREATE TABLE trickle (c1 text(8), c2 text(8), c3 text(8), c4 text(8), marker u8) CHUNK 4 x 4");
+    const auto created = client.ReadLine();
+    if (created != "+OK\r\n") throw std::runtime_error("create trickle table: " + created);
+    const std::string set = "SET BLOCK 0 0 IN trickle c1 = $1, c2 = $2, c3 = $3, c4 = $4\r\n";
+    const std::string frame = "$1\r\nx\r\n";
+    // Frames a third of the timeout apart: the statement takes longer than
+    // the timeout as a whole, and still applies.
+    client.SendBytes(set);
+    for (int i = 0; i < 4; ++i) {
+        std::this_thread::sleep_for(io_timeout / 3);
+        client.SendBytes(frame);
+    }
+    assert(client.ReadLine().front() == ':');
+    client.SendLine("PING");
+    assert(client.ReadLine() == "+PONG\r\n");
+    {
+        // A gap longer than the timeout closes the connection.
+        ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+        const auto start = Clock::now();
+        client.SendBytes(set + frame);
+        const bool ended = logs.WaitContains("phase=read reason=timeout", io_timeout * 5);
+        const auto elapsed = Clock::now() - start;
+        assert(ended);
+        assert(ClosedAtDeadline(elapsed, io_timeout));
+        assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol incomplete parameter frame\r\n");
+    }
+    // The single worker is free again.
+    Client fast("127.0.0.1", port);
+    fast.Hello();
+    fast.SendLine("PING");
+    assert(fast.ReadLine() == "+PONG\r\n");
+}
+
+// AUTH and its frame end at the HELLO deadline too, counted from the
+// connection's start rather than from the AUTH line.
+template <typename Client>
+void CheckTrickledAuthIsBounded(std::uint16_t port, std::size_t io_timeout_ms) {
+    const auto io_timeout = std::chrono::milliseconds(io_timeout_ms);
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+    Client client("127.0.0.1", port);
+    const auto start = Clock::now();
+    const auto login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
+    client.SendBytes(chunkdb::test::HelloUserBytes(login, kAdminUser));
+    assert(client.ReadLine().rfind("+SCRAM ", 0) == 0);
+    std::this_thread::sleep_for(io_timeout / 2);
+    client.SendBytes("AUTH $1\r\n$64\r\n");
+    auto sender = Trickle(client, "x", 12U, io_timeout / 4);
+    const bool refused = logs.WaitContains("HELLO 3 was not completed within the I/O timeout", io_timeout * 5);
+    const auto elapsed = Clock::now() - start;
+    sender.join();
+    assert(refused);
+    assert(ClosedAtDeadline(elapsed, io_timeout));
+    try {
+        assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol HELLO 3 was not completed within the I/O timeout\r\n");
+    } catch (const std::runtime_error&) {
+    }
+}
+
+void TestTrickledFramesAreBounded() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
+    auto auth_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 1000;
+    server_cfg.idle_connection_timeout_ms = 10000;
+    {
+        ServerHarness harness("trickled-frames", BaseStoreConfig(), engine_cfg, server_cfg);
+        CheckTrickledFramesAreBounded<RawClient>(harness.port, server_cfg.client_io_timeout_ms);
+        ServerHarness auth("trickled-auth", BaseStoreConfig(), auth_cfg, server_cfg);
+        CheckTrickledAuthIsBounded<RawClient>(auth.port, server_cfg.client_io_timeout_ms);
+    }
+#ifdef CHUNKDB_WITH_OPENSSL
+    server_cfg.tls_enabled = true;
+    ServerHarness tls("trickled-frames-tls", BaseStoreConfig(), engine_cfg, server_cfg);
+    CheckTrickledFramesAreBounded<TlsClient>(tls.port, server_cfg.client_io_timeout_ms);
+    ServerHarness tls_auth("trickled-auth-tls", BaseStoreConfig(), auth_cfg, server_cfg);
+    CheckTrickledAuthIsBounded<TlsClient>(tls_auth.port, server_cfg.client_io_timeout_ms);
+#endif
+}
+
 // With max_handshakes_per_ip, one source holds at most that many workers
 // before HELLO; another connection gets -ERR BUSY at once, and HELLO frees
 // a slot.
@@ -2503,6 +2708,25 @@ void CheckMalformedHelloRecovery(std::uint16_t port) {
 
 template <typename Client>
 void CheckHelloNegotiation(std::uint16_t port) {
+    {
+        // Twelve parameter frames, the most HELLO carries before authentication.
+        Client most("127.0.0.1", port);
+        std::string frames;
+        for (unsigned i = 0U; i < 12U; ++i) frames += "$-1\r\n";
+        most.SendBytes(HelloWithOptionFrames(12U) + frames + "PING\r\n");
+        const auto hello = ReadHelloReply(most);
+        assert(hello.at("protocol") == "3" && hello.at("not_applied") == "%12");
+        assert(most.ReadLine() == "+PONG\r\n");
+    }
+    {
+        // One more is refused before any frame is read.
+        Client too_many("127.0.0.1", port);
+        too_many.SendBytes(HelloWithOptionFrames(13U));
+        assert(too_many.ReadLine() == "-ERR PROTOCOL reason=protocol HELLO takes at most 12 parameters\r\n");
+        if constexpr (requires { too_many.WaitForClose(std::chrono::seconds(2)); })
+            assert(too_many.WaitForClose(std::chrono::seconds(2)));
+        else assert(too_many.WaitForRawClose(std::chrono::seconds(2)));
+    }
     {
         Client known_duplicate("127.0.0.1", port);
         for (unsigned attempt = 0U; attempt < 4U; ++attempt) {
@@ -3052,7 +3276,7 @@ void TestTlsReload() {
 
     // READ on a table is not enough.
     const std::array<std::uint8_t, 16> salt{};
-    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
     open.SendLine("CREATE USER reader VERIFIER '" + verifier + "'");
     assert(open.ReadLine() == "+OK\r\n");
     open.SendLine("GRANT READ ON default TO reader");
@@ -3097,6 +3321,42 @@ void TestTlsMinimumVersion() {
         }
         assert(refused_after_reload == (minimum == chunkdb::TlsMinVersion::k1_3));
     }
+}
+
+// TLS 1.2 accepts only ECDHE key exchange with AEAD ciphers: a client that
+// offers only static RSA key exchange with CBC fails the handshake.
+void TestTls12CipherList() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.tls_enabled = true;
+    ServerHarness harness("tls-ciphers", BaseStoreConfig(), engine_cfg, server_cfg);
+    // The connection must reach the handshake and fail there, not before. On
+    // a system whose crypto policy already disables static RSA key exchange,
+    // this passes without the server's cipher list.
+    std::string refusal;
+    try {
+        TlsClient weak("127.0.0.1", harness.port, TLS1_2_VERSION, {}, "AES128-SHA");
+    } catch (const std::runtime_error& error) {
+        refusal = error.what();
+    }
+    assert(refusal.rfind("failed to complete TLS client handshake: ssl_error=" + std::to_string(SSL_ERROR_SSL) + " ", 0) == 0);
+    std::vector<std::string> ciphers{"ECDHE-RSA-AES128-GCM-SHA256", "ECDHE-RSA-AES256-GCM-SHA384"};
+    {
+        // ChaCha20-Poly1305 only where the linked OpenSSL offers it.
+        SSL_CTX* probe = SSL_CTX_new(TLS_client_method());
+        assert(probe != nullptr);
+        if (SSL_CTX_set_cipher_list(probe, "ECDHE-RSA-CHACHA20-POLY1305") == 1) ciphers.emplace_back("ECDHE-RSA-CHACHA20-POLY1305");
+        SSL_CTX_free(probe);
+        ERR_clear_error();
+    }
+    for (const auto& cipher : ciphers) {
+        TlsClient client("127.0.0.1", harness.port, TLS1_2_VERSION, {}, cipher);
+        assert(client.Version() == TLS1_2_VERSION && client.Cipher() == cipher);
+        client.Login();
+    }
+    TlsClient current("127.0.0.1", harness.port);
+    assert(current.Version() == TLS1_3_VERSION);
+    current.Login();
 }
 
 void TestChunkPutOverTls() {
@@ -3372,6 +3632,66 @@ void TestLongIdleConnectionTimeoutReleasesWorker() {
     assert(idle.WaitForClose(std::chrono::milliseconds(1500)));
 }
 
+// A transaction past --txn-max-duration-ms whose client sends nothing does
+// not keep other connections' transactional writes out of
+// --txn-total-bytes, and an idle connection with an open transaction still
+// closes at the idle timeout, releasing its bytes.
+void TestExpiredTransactionReleasesBudget() {
+    // One private copy of a chunk of t fits, two do not.
+    auto engine_cfg = chunkdb::EngineConfig{
+        .require_auth = false,
+        .max_auth_failures = 5,
+        .txn_max_duration = std::chrono::milliseconds(500),
+        .txn_total_bytes = 50,
+    };
+    {
+        ServerHarness harness("txn-expired-budget", BaseStoreConfig(), engine_cfg, BaseServerConfig());
+        RawClient holder("127.0.0.1", harness.port);
+        holder.Hello();
+        holder.SendLine("CREATE TABLE t (n u16 REQUIRED) CHUNK 4 x 4");
+        assert(holder.ReadLine() == "+OK\r\n");
+        holder.SendLine("BEGIN");
+        assert(holder.ReadLine() == "+OK\r\n");
+        holder.SendLine("SET BLOCK 0 0 IN t n = 1");
+        assert(holder.ReadLine() == "_\r\n");
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+
+        RawClient other("127.0.0.1", harness.port);
+        other.Hello();
+        other.SendLine("BEGIN");
+        assert(other.ReadLine() == "+OK\r\n");
+        other.SendLine("SET BLOCK 4 0 IN t n = 2");
+        assert(other.ReadLine() == "_\r\n");
+        holder.SendLine("PING");
+        assert(holder.ReadLine().rfind("-ERR CONFLICT reason=duration ", 0) == 0);
+        holder.SendLine("COMMIT");
+        assert(holder.ReadLine().rfind("-ERR CONFLICT reason=duration ", 0) == 0);
+        other.SendLine("COMMIT");
+        assert(other.ReadLine().rfind(":", 0) == 0);
+        other.SendLine("GET BLOCK 0 0 FROM t");
+        assert(other.ReadLine() == "_\r\n");
+    }
+    engine_cfg.txn_max_duration = std::chrono::milliseconds(60000);
+    auto server_cfg = BaseServerConfig();
+    server_cfg.idle_connection_timeout_ms = 300;
+    ServerHarness harness("txn-idle-budget", BaseStoreConfig(), engine_cfg, server_cfg);
+    RawClient idle("127.0.0.1", harness.port);
+    idle.Hello();
+    idle.SendLine("CREATE TABLE t (n u16 REQUIRED) CHUNK 4 x 4");
+    assert(idle.ReadLine() == "+OK\r\n");
+    idle.SendLine("BEGIN");
+    assert(idle.ReadLine() == "+OK\r\n");
+    idle.SendLine("SET BLOCK 0 0 IN t n = 1");
+    assert(idle.ReadLine() == "_\r\n");
+    assert(idle.WaitForClose(std::chrono::milliseconds(5000)));
+    RawClient other("127.0.0.1", harness.port);
+    other.Hello();
+    other.SendLine("BEGIN");
+    assert(other.ReadLine() == "+OK\r\n");
+    other.SendLine("SET BLOCK 4 0 IN t n = 2");
+    assert(other.ReadLine() == "_\r\n");
+}
+
 void TestPendingQueueWaitTimeoutClosesQueuedSocket() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -3481,13 +3801,32 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     assert(response == "%14\r\n");
 }
 
-#ifndef _WIN32
-// Windows CI ended no write within 6 s for this case; why is open in #180.
-void TestSteadySlowReaderHitsReplyWriteDeadline() {
+void TestSteadySlowReaderHitsReplyWriteDeadline(bool fail_before_read = false) {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+    struct QueueHook final : chunkdb::FeedDeliveryTestHook {
+        chunkdb::ChunkServer* server = nullptr;
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool ready = false, released = false;
+        void Run(Point point, std::size_t completed) override {
+            if (point != Point::kAfterClientRead || completed != 1U) return;
+            (void)chunkdb::FeedDeliveryTestAccess::FillActiveClientSendQueue(*server, 65536);
+            std::unique_lock lock(mutex);
+            ready = true;
+            changed.notify_all();
+            changed.wait(lock, [&] { return released; });
+        }
+        bool Wait() {
+            std::unique_lock lock(mutex);
+            return changed.wait_for(lock, std::chrono::seconds(10), [&] { return ready; });
+        }
+        void Release() {
+            { std::lock_guard lock(mutex); released = true; }
+            changed.notify_all();
+        }
+    } hook;
 
-    // A 64 MiB chunk reply cannot fit any socket buffer, so the server must
-    // wait for room and the reply deadline must end the write.
+    // The reply must remain in flight while the client steadily drains it.
     auto store_cfg = BaseStoreConfig();
     store_cfg.geometry = {
         .large_chunk_width_chunks = 1,
@@ -3506,13 +3845,29 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     server_cfg.idle_connection_timeout_ms = 10000;
 
     ServerHarness harness("steady-slow-reader-deadline", store_cfg, engine_cfg, server_cfg);
+    struct ReleaseHook {
+        QueueHook& hook;
+        ~ReleaseHook() { hook.Release(); }
+    } release{hook};
     {
         auto lease = harness.catalog->Find("default")->Acquire();
         lease->store().SetBlockBits(0, 0, std::string(512, '0'));
     }
     RawClient slow("127.0.0.1", harness.port);
     slow.SetReceiveBuffer(65536);
-    slow.SendBytes("HELLO 3\r\nGET CHUNK 0 0 FROM default\r\n");
+    slow.Hello();
+    hook.server = harness.server.get();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    slow.SendBytes("GET CHUNK 0 0 FROM default\r\n");
+    assert(hook.Wait());
+    if (fail_before_read) throw std::runtime_error("injected first read failure");
+    // The worker is paused after reading the request, with its send queue
+    // filled to would-block. Start draining those fixture bytes before GET
+    // begins executing, so a timeout exercises an active continuous reader.
+    std::size_t first_read = 0U;
+    const bool first_closed = slow.ReadSomeWithin(std::chrono::seconds(1), 4096, &first_read) && first_read == 0U;
+    hook.Release();
+    assert(!first_closed && first_read > 0U);
 
     // The client keeps reading about 1 MiB/s, fast enough to reopen the TCP
     // window well within the send timeout, so a send that blocks until the
@@ -3521,20 +3876,26 @@ void TestSteadySlowReaderHitsReplyWriteDeadline() {
     const auto start = std::chrono::steady_clock::now();
     bool terminated = false;
     bool closed = false;
+    std::size_t received = first_read;
     while (!terminated && !closed && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
         for (int read = 0; read < 16 && !closed; ++read) {
             std::size_t bytes_read = 0;
             closed = slow.ReadSomeWithin(std::chrono::milliseconds(50), 4096, &bytes_read) && bytes_read == 0;
+            received += bytes_read;
         }
         std::this_thread::sleep_for(std::chrono::milliseconds(50));
         terminated = logs.Contains("connection terminated");
     }
-    assert(logs.WaitContains("connection terminated", std::chrono::seconds(1)));
+    const bool logged = logs.WaitContains("connection terminated", std::chrono::seconds(1));
+    std::cout << "steady slow reader: logged=" << logged << " closed=" << closed
+              << " received=" << received << '\n' << std::flush;
+    assert(logged);
     assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(4));
     assert(logs.Contains("phase=write"));
     assert(logs.Contains("reason=timeout"));
+    assert(logs.Contains("reply write deadline exceeded after "));
+    std::cout << "steady slow reader: " << logs.FirstContaining("reply write deadline exceeded after ") << '\n';
 }
-#endif
 
 void TestIdlePeerCloseDoesNotLogTerminationWarning() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
@@ -4276,7 +4637,7 @@ void TestWatchPositionsAndRights() {
     ServerHarness harness("watch-positions", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
     RawClient writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
     const std::array<std::uint8_t, 16> salt{};
-    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
     writer.SetReadDeadline(std::chrono::seconds(15));
     writer.SendLine("CREATE USER reader VERIFIER '" + verifier + "'"); assert(writer.ReadLine() == "+OK\r\n");
     RawClient reader("127.0.0.1", harness.port); reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login("reader", "pw");
@@ -5597,6 +5958,7 @@ int main(int argc, char** argv) {
         run("TestUnterminatedLineIsNotExecuted", TestUnterminatedLineIsNotExecuted);
         run("TestHandshakeIsBounded", TestHandshakeIsBounded);
         run("TestHelloDeadlineEndsAPartialLine", TestHelloDeadlineEndsAPartialLine);
+        run("TestTrickledFramesAreBounded", TestTrickledFramesAreBounded);
         run("TestHandshakesPerIpAreLimited", TestHandshakesPerIpAreLimited);
         run("TestAreaReplyIsBounded", TestAreaReplyIsBounded);
         run("TestTimeoutsAreBounded", TestTimeoutsAreBounded);
@@ -5622,6 +5984,7 @@ int main(int argc, char** argv) {
         run("TestChunkPutOverTls", TestChunkPutOverTls);
         run("TestTlsReload", TestTlsReload);
         run("TestTlsMinimumVersion", TestTlsMinimumVersion);
+        run("TestTls12CipherList", TestTls12CipherList);
 #endif
         run("TestReadTimeoutLogsPhaseAndReason", TestReadTimeoutLogsPhaseAndReason);
         run("TestProxyProtocolParser", TestProxyProtocolParser);
@@ -5639,11 +6002,18 @@ int main(int argc, char** argv) {
         run("TestIdleClientRemainsConnectedBetweenCommands", TestIdleClientRemainsConnectedBetweenCommands);
         run("TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests", TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests);
         run("TestLongIdleConnectionTimeoutReleasesWorker", TestLongIdleConnectionTimeoutReleasesWorker);
+        run("TestExpiredTransactionReleasesBudget", TestExpiredTransactionReleasesBudget);
         run("TestPendingQueueWaitTimeoutClosesQueuedSocket", TestPendingQueueWaitTimeoutClosesQueuedSocket);
         run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
-#ifndef _WIN32
-        run("TestSteadySlowReaderHitsReplyWriteDeadline", TestSteadySlowReaderHitsReplyWriteDeadline);
-#endif
+        run("TestSteadySlowReaderHitsReplyWriteDeadline", [] { TestSteadySlowReaderHitsReplyWriteDeadline(); });
+        run("TestSteadySlowReaderReadFailureTeardown", [] {
+            bool failed = false;
+            try { TestSteadySlowReaderHitsReplyWriteDeadline(true); }
+            catch (const std::runtime_error& error) {
+                failed = std::string_view(error.what()) == "injected first read failure";
+            }
+            assert(failed);
+        });
         run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);
         run("TestPendingQueueSaturationRejectsNewConnections", TestPendingQueueSaturationRejectsNewConnections);
         run("TestReadinessLogLineExists", TestReadinessLogLineExists);

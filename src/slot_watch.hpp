@@ -26,12 +26,21 @@ struct FeedDeliveryTestHook {
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
 struct FeedDeliveryTestAccess {
+    static std::size_t FillActiveClientSendQueue(ChunkServer& server, int bytes);
     static void SetHook(ChunkServer& server, FeedDeliveryTestHook* hook);
     // Observe existing scheduling without adding a wake before shutdown.
     static void SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
     static void SetPendingObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
   private:
     static void InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake);
+};
+
+// Table-wide pool for slot frames above their watch share. Waiters are
+// admitted in arrival order; only the catch-up worker charges the pool.
+struct FeedExcessPool {
+    std::atomic<std::size_t> bytes{0U};
+    std::mutex mutex;
+    std::deque<const SlotWatch*> waiters;  // Guarded by mutex.
 };
 
 struct FeedSlotClaim {
@@ -42,9 +51,14 @@ struct FeedSlotClaim {
     std::weak_ptr<SlotWatch> owner;
     const std::string user;
     const std::uint64_t completed;
+    // Table-wide slot output charges: output within watch shares and
+    // receipts, and output above a share. Each stays within the table budget.
     const std::shared_ptr<std::atomic<std::size_t>> output_bytes;
-    FeedSlotClaim(std::string value, std::uint64_t revision, std::shared_ptr<std::atomic<std::size_t>> bytes, std::string owner_user)
-        : name(std::move(value)), user(std::move(owner_user)), completed(revision), output_bytes(std::move(bytes)) {}
+    const std::shared_ptr<FeedExcessPool> excess;
+    FeedSlotClaim(std::string value, std::uint64_t revision, std::shared_ptr<std::atomic<std::size_t>> bytes,
+        std::shared_ptr<FeedExcessPool> pool, std::string owner_user)
+        : name(std::move(value)), user(std::move(owner_user)), completed(revision), output_bytes(std::move(bytes)),
+          excess(std::move(pool)) {}
 };
 
 // Socket operations only touch the bounded queue and control fields. A single
@@ -57,12 +71,23 @@ class SlotWatch {
         bool close = false;
         bool resume = false;
         bool charged = true;
+        // Charged to the table excess pool; must be written within the client I/O deadline.
+        bool excess = false;
     };
+    // `authorize_owner` throws to refuse a user name: the slot's recorded
+    // owner, and on takeover the user of the replaced watch. `user` is the
+    // claim's user; claiming never records an owner.
     static std::shared_ptr<SlotWatch> Create(std::shared_ptr<Table> table,
         std::string name, FeedOptions options, bool takeover = false, std::string user = {},
         const std::function<void(std::string_view)>& authorize_owner = {});
     ~SlotWatch();
     [[nodiscard]] FeedPosition position() const noexcept { return start_; }
+    // The slot's owner when it was claimed, or as BindOwner recorded it.
+    [[nodiscard]] const std::optional<std::string>& owner() const noexcept { return slot_owner_; }
+    // Records `user` as the owner of a slot claimed without one, before the
+    // watch is activated. A failure ends this watch; it records nothing
+    // unless the outcome of the write is unknown, which fences the store.
+    void BindOwner(const std::string& user);
     [[nodiscard]] std::size_t budget() const noexcept { return options_.buffer_bytes.value_or(table_->FeedBufferBytes()); }
     [[nodiscard]] std::optional<Output> Take(std::size_t room);
     void SetQuota(std::size_t bytes);
@@ -104,6 +129,7 @@ class SlotWatch {
     bool ExpireAckDeadline(std::chrono::steady_clock::time_point now);
     bool AckDeadlineExpiredLocked(std::chrono::steady_clock::time_point now);
     void ClearReceipts() noexcept;
+    void Release(std::size_t shared, std::size_t excess) noexcept;
     void RequestTakeoverAndWait();
     struct MutationReceipt {
         std::uint64_t revision;
@@ -111,10 +137,34 @@ class SlotWatch {
     };
     // Includes the list node and allocator bookkeeping; allocation precedes admission.
     static constexpr std::size_t kReceiptBytes = sizeof(MutationReceipt) + 4U * sizeof(void*);
+    // The next frame while it waits for room. Its built form is kept within
+    // the share and at the head of the pool queue, and dropped otherwise.
+    // No default member initializers: the type must be default-constructible
+    // while SlotWatch is incomplete, and emplace() value-initializes it.
+    struct Prepared {
+        std::shared_ptr<const FeedEntry> original;
+        std::uint64_t schema;
+        bool send, built;
+        FeedEntry::Kind kind;
+        std::uint64_t schema_version;
+        std::size_t size, receipt_bytes;
+        std::shared_ptr<const FeedEntry> entry;
+        std::deque<Output> next;
+        std::list<MutationReceipt> receipt;
+        void Drop() noexcept { built = false; entry.reset(); next.clear(); receipt.clear(); }
+    };
+    void Build(Prepared& prepared) const;
+    enum class Admission { kAdmitted, kWait, kBuild };
+    // Sets left_head when this watch gave up the head of the pool queue.
+    Admission Admit(Prepared& prepared, bool& left_head);
+    // True when this watch was at the head of the pool queue.
+    bool LeaveExcessQueue() noexcept;
     const std::shared_ptr<Table> table_;
     std::shared_ptr<FeedSlotClaim> claim_;
+    std::optional<std::string> slot_owner_;
     const std::weak_ptr<FeedSlotClaim> generation_;
     const std::shared_ptr<std::atomic<std::size_t>> table_bytes_;
+    const std::shared_ptr<FeedExcessPool> pool_;
     const FeedPosition start_;
     const FeedOptions options_;
     mutable std::mutex mutex_;
@@ -123,6 +173,10 @@ class SlotWatch {
     bool takeover_ = false, socket_closed_ = false;
     std::deque<Output> output_;
     std::size_t bytes_ = 0, unsent_ = 0;
+    // The front of the unsent output charged to the pool: one frame above
+    // the share, admitted only when nothing else was unsent.
+    std::size_t excess_ = 0;
+    bool queued_ = false;  // Worker-only; pool_->waiters itself is guarded by pool_->mutex.
     std::size_t quota_;
     std::uint64_t sent_, acknowledged_, written_;
     std::list<MutationReceipt> receipts_;
@@ -135,6 +189,7 @@ class SlotWatch {
     std::unique_ptr<FeedSubscription> live_;
     std::optional<FeedArchiveReader> archive_;
     std::shared_ptr<const FeedEntry> pending_;
+    std::optional<Prepared> prepared_;
     std::chrono::steady_clock::time_point next_progress_;
 };
 }  // namespace chunkdb

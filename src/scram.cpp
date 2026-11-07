@@ -54,7 +54,7 @@ Verifier DecoyVerifier(std::span<const std::uint8_t> secret, std::string_view na
     const auto salt = derive("salt:");
     return Verifier{
         .iterations = kMinIterations,
-        .salt = std::vector<std::uint8_t>(salt.begin(), salt.begin() + 16),
+        .salt = std::vector<std::uint8_t>(salt.begin(), salt.begin() + kMinSaltBytes),
         .stored_key = derive("stored:"),
         .server_key = derive("server:"),
     };
@@ -100,8 +100,10 @@ Verifier ParseVerifier(std::string_view text) {
             " iterations");
     }
     const auto salt = crypto::Base64Decode(text.substr(colon + 1, dollar - colon - 1));
-    if (!salt.has_value() || salt->size() < 16U) {
-        throw std::invalid_argument("a verifier's salt must be at least 16 bytes in base64");
+    if (!salt.has_value() || salt->size() < kMinSaltBytes || salt->size() > kMaxSaltBytes) {
+        throw std::invalid_argument(
+            "a verifier's salt must be " + std::to_string(kMinSaltBytes) + " to " + std::to_string(kMaxSaltBytes) +
+            " bytes in base64");
     }
     verifier.salt = *salt;
     verifier.stored_key = DigestOf(keys.substr(0, key_colon), "StoredKey");

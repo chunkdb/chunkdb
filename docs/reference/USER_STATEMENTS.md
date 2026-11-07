@@ -67,10 +67,11 @@ See [Protocol](../PROTOCOL.md) for authentication encoding.
 ## Arguments
 
 - `user`: `[a-z_][a-z0-9_]*`, from 1 through 63 bytes.
+- `verifier`: `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` with base64 parts, 4096 through 1000000 iterations, a salt of 16 through 256 bytes, and at most 512 bytes in all.
 - `right`: READ, WRITE, or ADMIN; ADMIN includes WRITE, and WRITE includes READ.
-- `table`: a specific table, including one not yet created.
+- `table`: a valid table name, including one not yet created.
 - `*`: all tables, including tables created later.
-- `MANAGES USERS`: permission to manage users, rights, migration listing, and backups.
+- `MANAGES USERS`: permission to manage users, rights, and backups, and to list GRANT and REVOKE migrations.
 - Conditional clauses: skip an existing or absent user without changing it; normal rights still apply.
 
 ## Returns
