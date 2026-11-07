@@ -136,6 +136,8 @@ void Check(const std::filesystem::path& root, const Operation& operation, const 
         if (name == "add") assert(info.schema.columns.size() == (applied ? 2U : 1U));
         if (name == "rename") assert(info.schema.columns.front().name == (applied ? "renamed" : "v"));
         if (name == "narrow" || name == "clamp") assert(info.schema.columns.front().type.size == (applied ? 8U : 16U));
+        if (name == "narrow" || name == "clamp")
+            assert(!info.schema.pending && !ReadStoreManifest(root / "tables" / "realm")->schema.pending);
     } else if (name == "drop_column") {
         assert(info.schema.version == (applied ? 3U : 2U));
         assert(info.schema.columns.size() == (applied ? 1U : 2U));
