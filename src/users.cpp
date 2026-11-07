@@ -105,9 +105,13 @@ void RequireValidGrantTable(std::string_view table) {
 }
 
 std::optional<Right> RightOn(const User& user, const std::string& table) {
+    return RightOn(user.grants, table);
+}
+
+std::optional<Right> RightOn(const std::map<std::string, Right>& grants, const std::string& table) {
     std::optional<Right> best;
     for (const auto& name : {table, std::string(kEveryTable)}) {
-        if (const auto found = user.grants.find(name); found != user.grants.end()) {
+        if (const auto found = grants.find(name); found != grants.end()) {
             if (!best.has_value() || found->second > *best) {
                 best = found->second;
             }

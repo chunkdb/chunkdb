@@ -273,6 +273,8 @@ struct PendingLogin {
     std::string user;
     // An unknown user runs against a decoy and always fails.
     bool known = false;
+    // The incarnation of the user HELLO found; the session keeps it.
+    std::uint64_t incarnation = 0;
     scram::ServerExchange exchange;
     SessionHelloOptions options;
 };
@@ -284,6 +286,9 @@ std::string CommandEngine::Execute(
     const auto command_name = ExtractCommandName(line);
     const auto started = std::chrono::steady_clock::now();
     const bool hello = Protocol::CommandEquals(command_name, "HELLO");
+    // Before parsing: every line of a connection that lost its user, HELLO
+    // or one that would not parse too, gets the same reply and closes it.
+    if (std::string lost = AnswerLostUser(session, line, started); !lost.empty()) return lost;
     if (hello || (!session.greeted && Protocol::CommandEquals(command_name, "AUTH"))) {
         // The user a login names, for the audit log: from HELLO 3 USER, or
         // the pending login AUTH finishes.
@@ -372,6 +377,9 @@ std::string CommandEngine::Execute(
 
 std::string CommandEngine::RejectPayload(SessionState& session, std::string_view line, std::string response) {
     const auto started = std::chrono::steady_clock::now();
+    // Whatever the planned rejection, a connection that lost its user gets
+    // the same reply as from Execute.
+    if (std::string lost = AnswerLostUser(session, line, started); !lost.empty()) return lost;
     const auto name = ExtractCommandName(line);
     const bool auth = Protocol::CommandEquals(name, "HELLO") || (!session.greeted && Protocol::CommandEquals(name, "AUTH"));
     if (!session.greeted) {
@@ -385,6 +393,41 @@ std::string CommandEngine::RejectPayload(SessionState& session, std::string_view
     }
     ObserveReply(auth ? MetricsRegistry::CommandClass::kAuth : MetricsRegistry::CommandClass::kOther, started, response);
     return response;
+}
+
+std::string CommandEngine::LostWatchReply(bool user_dropped, const std::string& table) {
+    if (user_dropped) return ErrorReply(UserDroppedError());
+    return ErrorReply(TableNotFoundError("table '" + table + "' does not exist"));
+}
+
+std::string CommandEngine::LostUserReply(SessionState& session) const {
+    if (!config_.require_auth || !session.greeted) return {};
+    // One atomic load while the users are unchanged; after a change, the
+    // published view, never the registry lock a change holds while it syncs.
+    const std::uint64_t generation = config_.users->Generation();
+    if (session.user_present_generation == generation) return {};
+    const auto rights = config_.users->Rights();
+    const auto found = rights->users.find(session.user);
+    if (found != rights->users.end() && found->second.incarnation == session.user_incarnation) {
+        session.user_present_generation = generation;
+        return {};
+    }
+    session.close_after_reply = true;
+    return ErrorReply(UserDroppedError());
+}
+
+std::string CommandEngine::AnswerLostUser(
+    SessionState& session, std::string_view line, std::chrono::steady_clock::time_point started) {
+    std::string lost = LostUserReply(session);
+    if (lost.empty()) return lost;
+    ObserveReply(MetricsRegistry::CommandClass::kAuth, started, lost);
+    // Logged as other refused statements are; a line that does not parse is not.
+    if (config_.audit != nullptr || config_.slow_statement_ms != 0U) {
+        StatementLogInfo info;
+        DescribeLine(line, info);
+        if (info.verb != nullptr) LogStatement(session, info, started, lost);
+    }
+    return lost;
 }
 
 namespace {
@@ -742,6 +785,9 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (dynamic_cast<const PermissionDeniedError*>(&error) != nullptr) {
         return Protocol::Error("PERMISSION_DENIED", std::string(error.what()) + "; ask an administrator to grant this right");
     }
+    if (dynamic_cast<const UserDroppedError*>(&error) != nullptr) {
+        return Protocol::Error("AUTH_REQUIRED", error.what(), {{"reason", "user_dropped"}});
+    }
     if (dynamic_cast<const TableExistsError*>(&error) != nullptr) {
         return Protocol::Error("TABLE_EXISTS", error.what());
     }
@@ -815,12 +861,13 @@ std::string CommandEngine::HandleHello(
     if (first.user != user) {
         throw std::invalid_argument("the SCRAM client-first message names another user than HELLO");
     }
-    const auto found = config_.users->Find(user);
+    const auto found = config_.users->FindIncarnation(user);
     const auto secret = config_.users->Secret();
-    scram::Verifier verifier = found.has_value() ? found->verifier : scram::DecoyVerifier(secret, user);
+    scram::Verifier verifier = found.has_value() ? found->user.verifier : scram::DecoyVerifier(secret, user);
     session.pending_login = std::make_shared<PendingLogin>(PendingLogin{
         .user = user,
         .known = found.has_value(),
+        .incarnation = found.has_value() ? found->incarnation : 0U,
         .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce()),
         .options = std::move(options),
     });
@@ -851,6 +898,7 @@ std::string CommandEngine::HandleAuth(
     RecordAuthSuccess(session, pending->user);
     session.greeted = true;
     session.user = pending->user;
+    session.user_incarnation = pending->incarnation;
     session.hello_options = std::move(pending->options);
     return HelloReply(session, *server_final);
 }
