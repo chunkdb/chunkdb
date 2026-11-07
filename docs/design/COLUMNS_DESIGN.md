@@ -34,7 +34,8 @@ The benchmark fails a run in which a timed operation loaded, evicted, checkpoint
 Runs alternate which side goes first; the result is the median, minimum and maximum over 15 runs, and the same of the per-run difference between many chunks and one chunk.
 In the store that difference also includes reaching the chunk's object and arrays outside the CPU caches, and for writes appending to 16,384 WAL batches instead of one, so the lookups timed alone give the share of the maps.
 The numbers hold for `ChunkCoordHash` as of the measured commit.
-Measured on TBD (machine, commit, 15 runs, artifact in `bench/artifacts/manual-runs/`): a read takes TBD ns across many chunks and TBD ns in one chunk, a write TBD ns and TBD ns, and the two lookups alone TBD ns and TBD ns.
+Measured on an AMD Ryzen 5 4600H (Linux 7.0, ext4, GCC 15.2 Release) at b2f1d2b, 15 runs, output in `bench/artifacts/manual-runs/chunk-map-20261108-linux.txt`: a read takes 564.6 ns across many chunks and 140.1 ns in one chunk, a write 2450.7 ns and 1822.4 ns, and the two lookups alone 269.1 ns and 48.8 ns (medians).
+So the two maps account for about 220 ns of the 423 ns a read gains across many chunks, and of the 630 ns a write gains; the rest is reaching the chunk and its arrays outside the CPU caches and, for writes, the WAL batches.
 
 ## Schema evolution
 
