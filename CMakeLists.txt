@@ -321,6 +321,11 @@ if(CHUNKDB_BUILD_TESTS)
         set_tests_properties(${format} PROPERTIES TIMEOUT 60 LABELS "smoke")
     endforeach()
 
+    # Crash children of the coordinate index and tombstone compaction run in the crash label.
+    add_test(NAME chunk_coordinate_index_crash COMMAND chunkdb_chunk_coordinate_index_test --crash-boundaries)
+    add_test(NAME table_tombstones_crash COMMAND chunkdb_table_tombstones_test --crash-children)
+    set_tests_properties(chunk_coordinate_index_crash table_tombstones_crash PROPERTIES TIMEOUT 300)
+
     add_test(NAME cql_chunk_model_3d COMMAND chunkdb_cql_chunk_model_test --3d)
     add_test(NAME feed_chunk_model_3d COMMAND chunkdb_feed_chunk_model_test --3d)
     set_tests_properties(cql_chunk_model_3d feed_chunk_model_3d PROPERTIES TIMEOUT 60 LABELS "smoke")
@@ -1121,6 +1126,8 @@ if(CHUNKDB_BUILD_TESTS)
         durability_crash_hardening
         snapshot_generation_linger
         txn_crash
+        chunk_coordinate_index_crash
+        table_tombstones_crash
     )
 
     if(TARGET chunkdb_server_tls_error_queue_test)
