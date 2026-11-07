@@ -17,8 +17,10 @@
 - **Table-wide rights:** you cannot grant access to only part of an area; see [Users and rights](USERS.md).
 - **Read-only view at startup:** a `--read-only` server reads the tables, columns and users that exist when it starts, and its reads can fail while the writer changes a table without pause; see [Server flags](SERVER_FLAGS.md#read-only).
 - **Metadata waits:** ALTER waits for running statements; a failure leaving the table unavailable fences it until RECOVER TABLE or a restart.
-- **Chunk-count cache:** max-loaded-chunks counts chunks, not bytes, and is a soft limit: chunks in use are not evicted, so the cache can briefly exceed it; larger geometry and variable values consume more memory; see [Server flags](SERVER_FLAGS.md).
-- **Filesystem entries:** populated chunks and WALs consume separate filesystem entries.
+- **Chunk-count cache:** max-loaded-chunks counts chunks, not bytes, and is a soft limit: chunks in use are not evicted, so the cache can briefly exceed it; larger geometry and variable values consume more memory; measure the memory per chunk as described in [Server flags](SERVER_FLAGS.md#directory-and-shared-resources).
+- **No chunk-count limit:** chunkdb does not cap the chunks of a table; files, directories and the scan catalog grow with the world.
+- **Filesystem entries:** a chunk with data has a checkpoint image, a WAL, or both, in the directory of its large chunk, so a default 8x8 large chunk holds up to 128 files; a checkpoint removes the WAL, or moves it to `.chunkdb.feed/` when the table has feed slots; each small file takes at least one filesystem block; see [Storage format](STORAGE_FORMAT.md#directory-layout).
+- **Open cost:** opening a table counts at most 100000 of its files and replays a chunk's WAL when that chunk is first loaded, apart from WALs named by [recovery intents](STORAGE_FORMAT.md#conditional-and-transaction-intents); with a feed slot, the first slot sync after opening syncs every image and WAL of the table; at the default log level each table logs `startup recovery summary` with `elapsed_ms`.
 - **Scan catalog memory:** the first scan builds an in-memory large-chunk catalog; each visited large-chunk directory is listed in full.
 - **Background threads:** maintenance uses a thread per table; FLUSH WAL visits tables in turn.
 - **Authenticated metrics:** SHOW METRICS provides Prometheus text; there is no native HTTP scrape endpoint.
