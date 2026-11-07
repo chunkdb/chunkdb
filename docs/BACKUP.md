@@ -23,8 +23,10 @@ cuts:
 
 The destination is relative to `--backup-dir` and must be absent or empty, outside the live data directory.
 Use `/` separators; rooted paths, backslashes, `..` components, and symbolic links or Windows reparse points below the resolved backup directory are refused.
-Missing parents are created.
-The configured backup and data directories themselves may use symbolic links or Windows directory junctions.
+Missing parents are created with owner-only permissions.
+On Linux and macOS, `--backup-dir` itself, every existing directory below it and an existing destination must belong to the server user or root and must not be writable by group or others.
+Such a directory is refused, not changed; directories above `--backup-dir` are not checked.
+The configured backup and data directories themselves may use symbolic links, Windows directory junctions or extended-length (`\\?\`) paths.
 
 Writes continue during copying.
 Each table has its own cut, a revision through which all its committed changes are included.
@@ -92,6 +94,7 @@ The server logs a warning for anything it cannot remove.
 - `BUSY`: wait for the existing backup to finish.
 - Missing configuration: set `--backup-dir` before starting the server.
 - Unsafe or nonempty destination: choose an empty path under the backup directory.
+- Backup directory not owned by the server user or root, or writable by group or others: the error names it; remove group and other write access, for example `chmod 755`, or choose another path.
 - Incomplete backup: remove that failed destination before retrying; it cannot be restored.
 - Unfinished migration recovery: restart the writer before taking another backup.
 - A fenced table: run RECOVER TABLE before taking another backup.

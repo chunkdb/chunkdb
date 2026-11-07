@@ -38,6 +38,7 @@
 #include "server_io.hpp"
 #include "server_tls.hpp"
 #include "server_feed.hpp"
+#include "user_registry.hpp"
 
 namespace chunkdb {
 
@@ -167,6 +168,10 @@ std::shared_ptr<FeedIo> ChunkServer::FeedIoHandle() {
 void ChunkServer::StartWorkers() {
     auto io = std::make_shared<FeedIo>(*this);
     { std::lock_guard lock(lifecycle_mutex_); feed_io_ = io; }
+    if (const auto& users = engine_->users())
+        users_changed_ = users->OnChange([weak = std::weak_ptr<FeedIo>(io)] {
+            if (auto feed = weak.lock()) feed->WakePoll();
+        });
     io->Start();
     workers_.reserve(config_.worker_threads);
     for (std::size_t i = 0; i < config_.worker_threads; ++i) {
@@ -187,6 +192,7 @@ void ChunkServer::JoinWorkers() {
         }
     }
     workers_.clear();
+    users_changed_.reset();
     { std::lock_guard lock(lifecycle_mutex_); feed_io_.reset(); }
 }
 

@@ -214,6 +214,20 @@ void TestStatementEvents() {
     assert(!Contains(text, "SET BLOCK") && !Contains(text, "GET BLOCK"));
 }
 
+// A statement of a connection whose user was dropped is audited as refused.
+void TestDroppedUserEvents() {
+    Engine e;
+    auto admin = e.Admin(3);
+    assert(e.Run(admin, "CREATE USER bot VERIFIER $1 MANAGES USERS", {Verifier("bot-password")}) == "+OK\r\n");
+    auto bot = e.Session(4);
+    assert(e.Login(bot, "bot", std::string("bot-password")).rfind("%", 0) == 0);
+    assert(e.Run(admin, "DROP USER bot") == "+OK\r\n");
+    assert(e.Run(bot, "CREATE TABLE t (kind u8)").rfind("-ERR AUTH_REQUIRED reason=user_dropped", 0) == 0);
+    assert(bot.close_after_reply);
+    LineWith(Lines(e.audit_path), {"\"event\":\"create_table\"", "\"connection\":4", "\"user\":\"bot\"",
+                                   "\"ok\":false", "\"error_code\":\"AUTH_REQUIRED\""});
+}
+
 // The file is private, and Reopen (SIGHUP) moves later lines to a new file
 // at the path, leaving a renamed file as it was.
 void TestFileAndReopen() {
@@ -398,6 +412,7 @@ void TestLoginLimits() {
 int main() {
     TestLoginEvents();
     TestStatementEvents();
+    TestDroppedUserEvents();
     TestFileAndReopen();
     TestJsonEscaping();
     TestInvalidUserNames();

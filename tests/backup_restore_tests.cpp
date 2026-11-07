@@ -1,6 +1,8 @@
 #include <iostream>
+#include <map>
 #include <stop_token>
 #include "feed_phase_watchdog.hpp"
+#include "admin.hpp"
 #include "backup_restore_test_utils.hpp"
 
 #include <cstdlib>
@@ -691,6 +693,25 @@ void ExtendedRootPaths() {
     assert(!std::filesystem::exists(top));
 #endif
 }
+// The offline password reset refuses a backup before it locks or writes
+// anything, so the backup still restores.
+void ResetPasswordRefusesBackup() {
+    Fixture fixture;
+    const auto snapshot = [&] {
+        std::map<std::string, Bytes> files;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(fixture.backup))
+            files[entry.path().generic_string()] = entry.is_regular_file() ? LoadFile(entry.path()) : Bytes{};
+        return files;
+    };
+    const auto before = snapshot();
+    std::string error;
+    try { ResetPassword(fixture.backup, "admin", "new-password"); }
+    catch (const std::exception& failure) { error = failure.what(); }
+    assert(error.find("backup or incomplete restore directory cannot be opened") != std::string::npos);
+    assert(snapshot() == before);
+    RestoreBackup(fixture.backup, fixture.root / "restored");
+    assert(Verify(fixture.root / "restored").errors == 0U);
+}
 } // namespace
 int main(int argc, char** argv) {
 #ifdef _WIN32
@@ -727,6 +748,6 @@ int main(int argc, char** argv) {
     run("rooted targets", RootedTargets); run("inventory paths", InventoryPathSpellings);
     run("inventory reparse", ReparseInventoryAndRestore); run("source directory replacement", BackupSourceDirectoryReplacement);
     run("directory ancestor replacement", DirectoryAncestorReplacement);
-    run("extended roots", ExtendedRootPaths);
-    std::cout << "18 backup restore groups passed\n";
+    run("extended roots", ExtendedRootPaths); run("reset password refusal", ResetPasswordRefusesBackup);
+    std::cout << "19 backup restore groups passed\n";
 }

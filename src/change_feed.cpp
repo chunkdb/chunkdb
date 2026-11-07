@@ -55,24 +55,6 @@ bool SameValues(const std::optional<std::vector<ColumnValue>>& a,
     return SameFeedValues(*a, *b);
 }
 
-std::optional<std::int64_t> BlockCoordinate(std::int64_t chunk, std::uint32_t width, std::size_t local) {
-    const auto factor = static_cast<std::uint64_t>(width);
-    const auto offset = static_cast<std::uint64_t>(local);
-    if (chunk >= 0) {
-        const auto limit = static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - offset;
-        if (static_cast<std::uint64_t>(chunk) > limit / factor)
-            return std::nullopt;
-        return static_cast<std::int64_t>(static_cast<std::uint64_t>(chunk) * factor + offset);
-    }
-    // The first block of the chunk containing INT64_MIN can lie below it
-    // for a non-power-of-two width; add the local offset before converting.
-    const auto magnitude = 0ULL - static_cast<std::uint64_t>(chunk);
-    const auto limit = (1ULL << 63U) + offset;
-    if (magnitude > limit / factor)
-        return std::nullopt;
-    return std::bit_cast<std::int64_t>(std::uint64_t{0} - (magnitude * factor - offset));
-}
-
 }  // namespace
 
 ScopedWriteUser::ScopedWriteUser(std::string_view user) noexcept : previous_(g_write_user) { g_write_user = user; }

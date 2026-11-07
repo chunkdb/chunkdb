@@ -54,6 +54,8 @@ struct BackupOptions {
     // Prepare the caller's reply and do its last fallible work before the
     // durable completion point; no callback runs after publication commits.
     std::function<void(const BackupResult&)> before_publish{};
+    // The configured --backup-dir the target lies under; see PrepareBackupTarget.
+    std::filesystem::path backup_directory{};
 };
 class BackupBusyError : public std::runtime_error {
   public:
@@ -87,7 +89,11 @@ void RemoveOrphanedBackupStaging(const std::filesystem::path& data_dir, const St
 [[nodiscard]] std::filesystem::path ResolveBackupTarget(const std::filesystem::path& backup_directory,
     const std::filesystem::path& requested, BackupTestHook* hook = nullptr);
 void RequireBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target);
-void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target, BackupTestHook* hook = nullptr);
+// With `backup_directory`, it and every existing directory from it down to the
+// target must be owned by the server user or root and not writable by group or
+// others; the target itself is always checked.
+void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target, BackupTestHook* hook = nullptr,
+    const std::filesystem::path& backup_directory = {});
 void EnsureBackupDirectory(const std::filesystem::path& path);
 // Also checks the enclosing catalog when opening a table directory directly.
 // This must run before a store/catalog creates directories or lock artifacts.

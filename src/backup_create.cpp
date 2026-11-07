@@ -56,7 +56,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     std::unique_lock backup_lock(backup_mutex_, std::try_to_lock);
     if (!backup_lock.owns_lock()) throw BackupBusyError("another backup is running");
     CheckCancelled(options.cancelled);
-    PrepareBackupTarget(config_.data_dir, target, backup_hook_.load(std::memory_order_acquire));
+    PrepareBackupTarget(config_.data_dir, target, backup_hook_.load(std::memory_order_acquire), options.backup_directory);
     EnsureBackupDirectory(target / "tables");
     const auto hook = [&](BackupTestHook::Point point, std::string_view table = {}, std::uint64_t revision = 0) {
         if (auto* current = backup_hook_.load(std::memory_order_acquire)) current->Run(point, table, revision);
