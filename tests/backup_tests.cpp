@@ -7,6 +7,7 @@
 #include <mutex>
 #include <sstream>
 #include <map>
+#include <memory>
 #include <set>
 #include "wal_writer.hpp"
 #include "txn_history.hpp"
@@ -672,7 +673,8 @@ void OrphanedStagingCleanup() {
                 if (point == Point::kBeforeCopy) throw std::runtime_error("interrupted backup");
             }
         } interrupt;
-        Log log;
+        // On the heap: freeing it ends its mutex for ThreadSanitizer, which a stack slot reused by a later object does not.
+        const auto log = std::make_unique<Log>();
         // An interrupted backup whose own cleanup fails leaves its staging behind.
         catalog.SetBackupHookForTests(&interrupt);
         {
@@ -680,13 +682,13 @@ void OrphanedStagingCleanup() {
             assert(Error([&] { (void)catalog.BackupTo(root / "interrupted", {}); }) == "interrupted backup");
         }
         catalog.SetBackupHookForTests(nullptr);
-        assert(log.Has("backup staging cleanup failed") && entries().size() == kept.size() + 1U);
+        assert(log->Has("backup staging cleanup failed") && entries().size() == kept.size() + 1U);
         assert(std::filesystem::exists(root / "interrupted" / kBackupIncompleteName));
         // The next backup removes it before staging its own files.
         (void)catalog.BackupTo(root / "next", {});
         ValidateBackupInventory(root / "next", ReadBackupRecord(root / "next"));
         assert(entries() == kept);
-        assert(log.Has("unowned backup staging entry retained") && log.Has("backup destination in backup staging retained"));
+        assert(log->Has("unowned backup staging entry retained") && log->Has("backup destination in backup staging retained"));
         // A running backup keeps its staging while another one is refused.
         Pause pause(BackupTestHook::Point::kBeforeCopy); catalog.SetBackupHookForTests(&pause);
         auto running = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "running", {}); });
@@ -708,10 +710,10 @@ void OrphanedStagingCleanup() {
     }
     {
         // A writer start keeps what it cannot remove, with a warning, and opens normally.
-        Log log;
+        const auto log = std::make_unique<Log>();
         ScopedEnv fail("CHUNKDB_FAILPOINT_BACKUP_STAGING_CLEANUP_FAIL_ONCE", "1");
         TableCatalog catalog(Config(source));
-        assert(log.Has("backup staging cleanup failed") && std::filesystem::exists(left));
+        assert(log->Has("backup staging cleanup failed") && std::filesystem::exists(left));
         auto lease = catalog.Find("default")->Acquire(); assert(ReadCounter(lease->store(), {0, 0}) == 11U);
     }
     { TableCatalog catalog(Config(source)); assert(entries() == kept); }
