@@ -146,8 +146,9 @@ class UserRegistry {
     std::vector<std::weak_ptr<const std::function<void()>>> listeners_;
 };
 
-// Whether one logged-in user still has READ on one table, for a watch that
-// outlives the statement that checked it. While the users are unchanged a
+// Whether one logged-in user still has READ on one table, and ADMIN on `*`
+// when the watch needs it, for a watch that outlives the statement that
+// checked it. While the users are unchanged a
 // check is one atomic load and compare; after a change it looks up that
 // user and table in the published rights view, without the registry lock.
 // A lost right or user stays lost. One thread checks.
@@ -165,6 +166,9 @@ class ReadRightCheck {
         return Recheck(generation);
     }
     [[nodiscard]] const std::string& table() const noexcept { return table_; }
+    // Also requires ADMIN on `*` from now on: a watch of a slot another user
+    // owns. Set by the statement thread before the watch reaches the feed.
+    void RequireEveryTableAdmin() noexcept { every_table_admin_ = true; }
 
   private:
     State Recheck(std::uint64_t generation);
@@ -174,6 +178,7 @@ class ReadRightCheck {
     const std::uint64_t incarnation_;
     std::uint64_t generation_;
     State state_ = State::kHeld;
+    bool every_table_admin_ = false;
 };
 
 }  // namespace chunkdb

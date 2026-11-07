@@ -208,7 +208,10 @@ class Table : public std::enable_shared_from_this<Table> {
     // Create, drop, advance and archive-reader creation require exclusive table
     // access; callers must not hold a Lease. Listing may hold a Lease.
     // Positions are persisted atomically and synced.
-    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name, bool if_not_exists = false, const FeedSlotFilters& filters = {});
+    // `owner` is recorded with a new slot. With `owner_given`, an existing
+    // slot that IF NOT EXISTS keeps must have that owner too.
+    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name, bool if_not_exists = false, const FeedSlotFilters& filters = {},
+        std::optional<std::string> owner = std::nullopt, bool owner_given = false);
     void DropFeedSlot(std::string_view name, bool if_exists = false);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(bool include_lost = false);
     [[nodiscard]] std::vector<std::uint32_t> ResolveFeedColumns(const std::vector<std::string>& names);
@@ -229,6 +232,8 @@ class Table : public std::enable_shared_from_this<Table> {
     [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name, const FeedOptions& options,
         bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner);
     [[nodiscard]] FeedSlot ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
+    // Records `owner` for the claimed slot when it has none.
+    void BindClaimedFeedSlotOwner(const std::shared_ptr<FeedSlotClaim>& claim, const std::string& owner);
     void StageClaimedFeedSlotAck(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition position);
     void FlushClaimedFeedSlotAcks(const std::shared_ptr<FeedSlotClaim>& claim, bool force);
     void SyncClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);

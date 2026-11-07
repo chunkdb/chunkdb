@@ -517,8 +517,10 @@ void Table::StopFeed() {
         feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
 }
 
-FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const FeedSlotFilters& filters) {
+FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const FeedSlotFilters& filters,
+    std::optional<std::string> owner, bool owner_given) {
     RequireValidFeedSlotName(name);
+    if (owner) RequireValidFeedSlotOwner(*owner);
     std::lock_guard ddl(ddl_mutex_);
     if (if_not_exists) {
         auto lease = Acquire();
@@ -531,6 +533,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
         const auto existing = std::find_if(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; });
         if (existing != slots.end()) {
             if (existing->filters != filters) throw FeedSlotFiltersError("feed slot filters differ from existing slot");
+            if (owner_given && existing->owner != owner) throw FeedSlotFiltersError("feed slot owner differs from existing slot");
             return *existing;
         }
     }
@@ -549,7 +552,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     RequireFeature(store->features(), *FindFeature("feed_slots"));
     if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
     // Validate the complete filter before baseline, feature or record publication.
-    (void)SerializeFeedSlotRecords(FeedSlotRecords{store_id_, 0U, {{std::string(name), 0U, false, filters}}});
+    (void)SerializeFeedSlotRecords(FeedSlotRecords{store_id_, 0U, {{std::string(name), 0U, false, filters, false, owner}}});
     if (filters.column_ids) {
         const auto& columns = store->geometry_.layout().schema().columns;
         for (const auto id : *filters.column_ids)
@@ -570,7 +573,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     });
     std::unique_lock eviction_lock(store->resources_->stores_mutex_);
     PrepareFeedSlotBaseline(*store);
-    return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U, false, filters);
+    return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U, false, filters, std::move(owner));
 }
 
 void Table::PrepareFeedSlotBaseline(ChunkStore& store) {
@@ -692,6 +695,7 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
         if (store.access_mode_ != AccessMode::kReadWrite || store.allow_multiple_processes_)
             throw std::invalid_argument("feed slots require a single-process read-write table");
         auto slot = store.feed_slots_->Get(name);
+        if (slot.owner && authorize_owner) authorize_owner(*slot.owner);
         if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
             slot.schema_filter_lost ? "schema_filter" : "retention_limit");
         if ((options.area && options.area != slot.filters.area) ||
@@ -751,6 +755,13 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
     old->valid.store(false, std::memory_order_release);
     found->second = claim;
     return {std::move(slot), std::move(claim)};
+}
+
+void Table::BindClaimedFeedSlotOwner(const std::shared_ptr<FeedSlotClaim>& claim, const std::string& owner) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
+    lease->store().feed_slots_->BindOwner(claim->name, owner);
 }
 
 FeedSlot Table::ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim) {
