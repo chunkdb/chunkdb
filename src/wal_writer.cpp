@@ -128,6 +128,32 @@ WalFrameBuilder::WalFrameBuilder(
     records_begin_ = batch_->size();
 }
 
+void WalFrameBuilder::Reserve(std::size_t record_bytes) {
+    if (finished_) {
+        throw std::logic_error("WAL frame already finished");
+    }
+    if (record_bytes > batch_->max_size() - batch_->size() - kWalFrameTrailerSize) {
+        throw std::invalid_argument("WAL frame too large");
+    }
+    batch_->reserve(batch_->size() + record_bytes + kWalFrameTrailerSize);
+}
+
+std::size_t WalFrameBuilder::SpanRecordBytes(std::size_t size) noexcept {
+    return kWalRecordHeaderSize + kWalSpanOffsetSize + size;
+}
+
+std::size_t WalFrameBuilder::VarUpdateRecordBytes(const ChunkVars& vars, const VarUndo& undo) {
+    if (undo.replaced) {
+        return kWalRecordHeaderSize + vars.encoded_size();
+    }
+    std::size_t bytes = 0;
+    for (const auto key : undo.keys) {
+        const auto value = vars.Find(key);
+        bytes += kWalRecordHeaderSize + (value.has_value() ? kVarEntryHeaderBytes + value->size() : 8U);
+    }
+    return bytes;
+}
+
 void WalFrameBuilder::AppendSpan(
     std::uint32_t byte_offset,
     const std::uint8_t* bytes,
@@ -207,12 +233,7 @@ void WalFrameBuilder::AppendVarUpdate(const ChunkVars& vars, const VarUndo& undo
     }
     // One reservation for all records, so a large update does not copy the
     // batch once per record.
-    std::size_t bytes = 0;
-    for (const auto key : undo.keys) {
-        const auto value = vars.Find(key);
-        bytes += kWalRecordHeaderSize + (value.has_value() ? kVarEntryHeaderBytes + value->size() : 8U);
-    }
-    batch_->reserve(batch_->size() + bytes);
+    batch_->reserve(batch_->size() + VarUpdateRecordBytes(vars, undo));
     for (const auto key : undo.keys) {
         if (const auto value = vars.Find(key); value.has_value()) {
             AppendVarPut(key, *value);
