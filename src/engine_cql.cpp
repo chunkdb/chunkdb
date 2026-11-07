@@ -471,11 +471,13 @@ const User* CommandEngine::CurrentUser(SessionState& session) const {
         return nullptr;
     }
     // One atomic read while nothing changed; a changed or dropped user is
-    // read again.
+    // read again. Another incarnation is another user: one dropped and
+    // created again under the same name gives this session nothing.
     const std::uint64_t generation = config_.users->Generation();
     if (session.user_generation != generation) {
-        auto found = config_.users->Find(session.user);
-        session.user_rights = found.has_value() ? std::make_shared<const User>(std::move(*found)) : nullptr;
+        auto found = config_.users->FindIncarnation(session.user);
+        session.user_rights = found.has_value() && found->incarnation == session.user_incarnation
+            ? std::make_shared<const User>(std::move(found->user)) : nullptr;
         session.user_generation = generation;
     }
     return session.user_rights.get();
@@ -629,6 +631,16 @@ bool MayReplayMigration(bool require_auth, const User* user, const MigrationReco
 
 }  // namespace
 
+void CommandEngine::DescribeLine(std::string_view line, StatementLogInfo& info) {
+    cql::Parsed parsed;
+    try {
+        parsed = cql::Parse(StatementOf(line));
+    } catch (const cql::ParseError&) {
+        return;  // As in ExecuteStatement: a statement that does not parse is not logged.
+    }
+    DescribeStatement(parsed.statement, info);
+}
+
 void CommandEngine::RequireRight(SessionState& session, const std::string& table, Right needed) const {
     const auto right = RightOnTable(session, table);
     if (!right.has_value()) {
@@ -697,6 +709,9 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
         request.reject_response = std::move(response);
         return request;
     };
+    // A session without its user drains the frames and closes, as Execute
+    // answers it.
+    if (std::string lost = LostUserReply(session); !lost.empty()) return reject(std::move(lost));
     cql::Parsed parsed;
     try {
         parsed = cql::Parse(StatementOf(line));
@@ -934,6 +949,11 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::Watch& watch) {
                     RequireRight(session, watch.table, Right::kRead);
+                    // The feed ends the watch once the right or user is gone,
+                    // checking from the generation READ was confirmed at. Set
+                    // before subscribing: no watch exists without its check.
+                    session.watch_right = config_.require_auth ? std::make_shared<ReadRightCheck>(config_.users,
+                        session.user, session.user_incarnation, watch.table, session.user_generation) : nullptr;
                     auto table = catalog_->Require(watch.table);
                     const auto filters = SlotFilters(table, watch);
                     FeedOptions options{
@@ -1474,10 +1494,17 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::AlterUser& alter) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     if (alter.verifier.has_value()) {
-                        // A user may change their own password.
-                        if (!(config_.require_auth && alter.user == session.user)) {
-                            RequireManagesUsers(session);
+                        // A user may change their own password: the incarnation
+                        // it logged in as, not a user created again under its name.
+                        if (config_.require_auth && alter.user == session.user) {
+                            if (!config_.users->SetOwnVerifier(alter.user, session.user_incarnation,
+                                    VerifierFrom(*alter.verifier, parameters))) {
+                                session.close_after_reply = true;
+                                throw UserDroppedError();
+                            }
+                            return Protocol::SimpleString("OK");
                         }
+                        RequireManagesUsers(session);
                         if (config_.users == nullptr) {
                             throw std::invalid_argument("this server runs without users (--auth none)");
                         }

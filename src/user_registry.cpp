@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
+#include <utility>
 
 #include "file_permissions.hpp"
 #include "chunkdb/logging.hpp"
@@ -65,6 +66,7 @@ UserRegistry::UserRegistry(
     }
     if (auto existing = ReadUsersFile(data_dir_); existing.has_value()) {
         users_ = std::move(*existing);
+        InstallLocked(PrepareLocked(users_));
         return;
     }
     if (read_only_) {
@@ -83,18 +85,78 @@ UserRegistry::UserRegistry(
         .manages_users = true,
         .grants = {{kEveryTable, Right::kAdmin}},
     };
+    auto publication = PrepareLocked(created);
     WriteUsersFile(data_dir_, created);
     users_ = std::move(created);
+    InstallLocked(std::move(publication));
+}
+
+UserRegistry::Publication UserRegistry::PrepareLocked(const Users& next) const {
+    Publication publication{.incarnations = {}, .next_incarnation = next_incarnation_, .rights = nullptr};
+    auto rights = std::make_shared<RightsView>();
+    for (const auto& [name, user] : next.users) {
+        const auto kept = incarnations_.find(name);
+        const std::uint64_t incarnation = kept != incarnations_.end() ? kept->second : publication.next_incarnation++;
+        publication.incarnations.emplace(name, incarnation);
+        rights->users.emplace(name, RightsView::Entry{.incarnation = incarnation, .grants = user.grants});
+    }
+    publication.rights = std::move(rights);
+    return publication;
+}
+
+void UserRegistry::InstallLocked(Publication publication) noexcept {
+    incarnations_ = std::move(publication.incarnations);
+    next_incarnation_ = publication.next_incarnation;
+    // The previous view is freed after the lock, never while a reader waits.
+    std::shared_ptr<const RightsView> previous;
+    {
+        std::lock_guard lock(rights_mutex_);
+        previous = std::exchange(rights_, std::move(publication.rights));
+    }
+}
+
+void UserRegistry::CommitLocked(Users next, Publication publication, Wakes& wakes) noexcept {
+    users_ = std::move(next);
+    InstallLocked(std::move(publication));
+    // The view is published before the generation moves: a reader that sees
+    // the new generation reads a view at least that new.
+    generation_.fetch_add(1, std::memory_order_acq_rel);
+    wakes.changed_ = true;
+}
+
+UserRegistry::Wakes::~Wakes() {
+    if (!changed_ || registry_ == nullptr) return;
+    // Outside the registry lock: a callback that drops the last owner of
+    // what it wakes destroys it here, not under that lock.
+    std::lock_guard lock(registry_->listeners_mutex_);
+    std::erase_if(registry_->listeners_, [](const auto& listener) {
+        const auto wake = listener.lock();
+        if (wake) (*wake)();
+        return !wake;
+    });
+}
+
+std::shared_ptr<const UserRegistry::RightsView> UserRegistry::Rights() const {
+    std::lock_guard lock(rights_mutex_);
+    return rights_;
+}
+
+std::shared_ptr<const std::function<void()>> UserRegistry::OnChange(std::function<void()> wake) {
+    auto handle = std::make_shared<const std::function<void()>>(std::move(wake));
+    std::lock_guard lock(listeners_mutex_);
+    listeners_.push_back(handle);
+    return handle;
 }
 
 void UserRegistry::SetMigrationHealth(std::shared_ptr<MigrationHealth> health) {
+    Wakes wakes(this);
     std::lock_guard lock(mutex_);
     health->Check();
     const auto stored = ReadUsersFile(data_dir_);
     if (!stored) throw std::runtime_error("users file disappeared while binding the catalog");
     if (users_ != *stored) {
-        users_ = *stored;
-        generation_.fetch_add(1, std::memory_order_acq_rel);
+        auto publication = PrepareLocked(*stored);
+        CommitLocked(*stored, std::move(publication), wakes);
     }
     migration_health_ = std::move(health);
 }
@@ -106,6 +168,15 @@ std::optional<User> UserRegistry::Find(const std::string& name) const {
         return std::nullopt;
     }
     return found->second;
+}
+
+std::optional<UserRegistry::Incarnated> UserRegistry::FindIncarnation(const std::string& name) const {
+    std::lock_guard lock(mutex_);
+    const auto found = users_.users.find(name);
+    if (found == users_.users.end()) {
+        return std::nullopt;
+    }
+    return Incarnated{.user = found->second, .incarnation = incarnations_.at(name)};
 }
 
 Users UserRegistry::Snapshot() const {
@@ -125,13 +196,14 @@ void UserRegistry::UpdateIf(Change&& change) {
     if (read_only_) {
         throw std::invalid_argument("users cannot change: the data directory is open read-only");
     }
+    Wakes wakes(this);
     std::lock_guard lock(mutex_);
     if (migration_health_) migration_health_->Check();
     Users next = users_;
     if (!change(next)) return;
+    auto publication = PrepareLocked(next);
     WriteUsersFile(data_dir_, next);
-    users_ = std::move(next);
-    generation_.fetch_add(1, std::memory_order_acq_rel);
+    CommitLocked(std::move(next), std::move(publication), wakes);
 }
 
 template <typename Change>
@@ -161,6 +233,17 @@ void UserRegistry::Create(const std::string& name, const std::function<scram::Ve
 
 void UserRegistry::SetVerifier(const std::string& name, scram::Verifier verifier) {
     Update([&](Users& users) { Existing(users, name).verifier = std::move(verifier); });
+}
+
+bool UserRegistry::SetOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier) {
+    bool current = false;
+    UpdateIf([&](Users& users) {
+        const auto found = incarnations_.find(name);
+        current = found != incarnations_.end() && found->second == incarnation;
+        if (current) Existing(users, name).verifier = std::move(verifier);
+        return current;
+    });
+    return current;
 }
 
 void UserRegistry::SetManagesUsers(const std::string& name, bool manages_users) {
@@ -217,6 +300,17 @@ void UserRegistry::ForgetTable(const std::string& table) {
             user.grants.erase(table);
         }
     });
+}
+
+ReadRightCheck::State ReadRightCheck::Recheck(std::uint64_t generation) {
+    // A change after this load bumps the generation again and is read next time.
+    generation_ = generation;
+    if (state_ != State::kHeld) return state_;
+    const auto rights = users_->Rights();
+    const auto found = rights->users.find(user_);
+    if (found == rights->users.end() || found->second.incarnation != incarnation_) state_ = State::kNoUser;
+    else if (!RightOn(found->second.grants, table_).has_value()) state_ = State::kNoRight;
+    return state_;
 }
 
 }  // namespace chunkdb

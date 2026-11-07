@@ -37,6 +37,7 @@ class UserRegistry;
 class AuditLog;
 class SlotWatch;
 struct User;
+class ReadRightCheck;
 struct PendingLogin;
 enum class Right : std::uint8_t;
 
@@ -51,6 +52,13 @@ struct CommandEngineTestHook {
 class PermissionDeniedError : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
+};
+
+// The user a connection logged in as was dropped, perhaps created again:
+// AUTH_REQUIRED, and the connection closes.
+class UserDroppedError : public std::runtime_error {
+  public:
+    UserDroppedError() : std::runtime_error("the user of this connection was dropped; log in again") {}
 };
 
 struct EngineConfig {
@@ -202,9 +210,18 @@ struct SessionState {
     bool greeted = false;
     // The logged-in user; empty when logins need no user.
     std::string user;
-    // That user as of `user_generation` of the registry; null once dropped.
+    // The incarnation of that user at login (UserRegistry::FindIncarnation).
+    std::uint64_t user_incarnation = 0;
+    // That user as of `user_generation` of the registry; null for good once
+    // dropped, even when a user of that name is created again.
     std::shared_ptr<const User> user_rights;
     std::uint64_t user_generation = 0;
+    // The registry generation at which the published rights view last
+    // showed that user, at that incarnation.
+    std::uint64_t user_present_generation = 0;
+    // READ of that user on the table of the open watch, which the feed checks
+    // while it streams; null without users.
+    std::shared_ptr<ReadRightCheck> watch_right;
     // Between HELLO 3 USER and AUTH: the SCRAM exchange in progress.
     std::shared_ptr<PendingLogin> pending_login;
     // The table the last statement named, kept so the next statement on it
@@ -252,9 +269,15 @@ class CommandEngine {
         std::string_view line,
         std::span<const std::optional<std::string>> parameters = {});
     [[nodiscard]] std::string RejectPayload(SessionState& session, std::string_view line, std::string response);
+    // The error that ends a watch whose user lost READ on `table`: NO_TABLE,
+    // as a statement on a table the user cannot see gets, or AUTH_REQUIRED
+    // once the user was dropped.
+    [[nodiscard]] static std::string LostWatchReply(bool user_dropped, const std::string& table);
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
     }
+    // The users of the data directory; null without users.
+    [[nodiscard]] const std::shared_ptr<UserRegistry>& users() const noexcept { return config_.users; }
     // Test-only visibility into the bounded auth-failure tracking table.
     [[nodiscard]] std::size_t AuthFailureTrackedSourcesForTests();
     void SetHookForTests(CommandEngineTestHook* hook) noexcept {
@@ -309,6 +332,15 @@ class CommandEngine {
     void AuditLogin(const SessionState& session, std::string_view user, bool known_user, bool succeeded,
                     const std::string& response) const;
     [[nodiscard]] PayloadRequest PlanParameters(SessionState& session, std::string_view line) const;
+    // AUTH_REQUIRED for a session whose user was dropped, closing it after
+    // the reply; empty while the user exists.
+    [[nodiscard]] std::string LostUserReply(SessionState& session) const;
+    // LostUserReply, recorded in the metrics and logs as a refused statement.
+    [[nodiscard]] std::string AnswerLostUser(
+        SessionState& session, std::string_view line, std::chrono::steady_clock::time_point started);
+    // What the logs say about `line` (engine_cql.cpp); nothing when it does
+    // not parse.
+    static void DescribeLine(std::string_view line, StatementLogInfo& info);
     // The table a statement names, leased for it; the session keeps the
     // table so the next statement on it skips the catalog.
     [[nodiscard]] Table::Lease AcquireNamedTable(SessionState& session, std::string_view name) const;

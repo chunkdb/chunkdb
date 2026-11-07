@@ -97,6 +97,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
     bool no_op = false;
     TableDefinition definition{request.geometry, request.options, request.schema};
     std::unique_lock<std::mutex> ddl;
+    // Declared before user_lock: runs the users' OnChange after it is released.
+    UserRegistry::Wakes users_changed(users);
     std::unique_lock<std::mutex> user_lock;
     // A narrowing checks the stored values before catalog admission, under the
     // table's DDL lock and a lease; the schema it recorded then is the one the
@@ -341,8 +343,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             const auto disk_users = ReadUsersFile(config_.data_dir);
             if (!disk_users) throw std::runtime_error("migration users file disappeared");
             if (users->users_ != *disk_users) {
-                users->users_ = *disk_users;
-                users->generation_.fetch_add(1, std::memory_order_acq_rel);
+                auto publication = users->PrepareLocked(*disk_users);
+                users->CommitLocked(*disk_users, std::move(publication), users_changed);
             }
             next_users = users->users_;
         }
@@ -363,6 +365,9 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             }
         }
         if (next_users) add_file(std::string(kUsersFileName), EncodeUsers(*next_users));
+        // Built before the decision, so publishing the users cannot fail after it.
+        std::optional<UserRegistry::Publication> users_publication;
+        if (next_users && users) users_publication = users->PrepareLocked(*next_users);
         records.push_back(journal.record);
         add_file(std::string(kMigrationsFileName), EncodeMigrationRecords(root->data_dir_id, records));
         ValidateMigrationJournal(config_.data_dir, journal);
@@ -370,6 +375,9 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_MIGRATION_BEFORE_DECISION_ONCE");
         WriteMigrationJournal(config_.data_dir, journal, &decided);
         decided = true;
+        // The decision makes the users change durable: publish it now, as a
+        // later completion failure must not leave memory behind the decision.
+        if (next_users && users) users->CommitLocked(std::move(*next_users), std::move(*users_publication), users_changed);
         if (auto* hook = migration_health_->hook.load(std::memory_order_acquire)) hook->Run(MigrationTestHook::Point::kAfterDecision, request.record.name);
         CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_MIGRATION_AFTER_DECISION_ONCE");
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE"))
@@ -384,10 +392,6 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         }
         CompleteMigrationJournal(config_.data_dir, journal);
         version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
-        if (next_users && users) {
-            users->users_ = std::move(*next_users);
-            users->generation_.fetch_add(1, std::memory_order_acq_rel);
-        }
         if (user_lock.owns_lock()) user_lock.unlock();
         if (!no_op && request.kind == MigrationRequest::Kind::kCreate) {
             auto opened = OpenStore(request.table, TablesDir() / request.table, definition.geometry, kAllGeometryFields, definition.options);
