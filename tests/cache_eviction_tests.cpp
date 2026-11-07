@@ -613,7 +613,7 @@ int main() {
         {
             chunkdb::ChunkStore store(bounded);
             const auto blocks_per_chunk =
-                static_cast<int>(store.geometry().config().chunk_width_blocks);
+                static_cast<std::int64_t>(store.geometry().config().chunk_width_blocks);
             constexpr std::uint64_t kDistinctLargeChunksTouched = 20;
 
             for (int i = 0; i < 4; ++i) {
