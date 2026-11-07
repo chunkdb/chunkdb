@@ -266,10 +266,11 @@ SlotWatch::Admission SlotWatch::Admit(Prepared& prepared, bool& left_head) {
     // the queue, and joins at the back when it needs the pool again.
     const auto charge = size + receipt_bytes;
     const bool excess = charge > quota_;
-    const bool data = prepared.kind == FeedEntry::Kind::kChange || prepared.kind == FeedEntry::Kind::kChunks;
+    // Changes and schema frames queue; progress and resync frames never do.
+    const bool queues = prepared.kind != FeedEntry::Kind::kProgress && prepared.kind != FeedEntry::Kind::kResync;
     const auto wait_elsewhere = [&] {
         if (LeaveExcessQueue()) left_head = true;
-        if (excess && data) prepared.Drop(); // Only the head keeps a change above the share built.
+        if (excess && queues) prepared.Drop(); // Only the head keeps a frame above the share built.
         return Admission::kWait;
     };
     // Unacknowledged receipts stay within the share; the first one always fits.
@@ -279,18 +280,18 @@ SlotWatch::Admission SlotWatch::Admit(Prepared& prepared, bool& left_head) {
         if (held > quota_ - charge || unsent_ > quota_ - charge - held) return wait_elsewhere();
         if (!prepared.built) return Admission::kBuild;
         if (!Charge(*table_bytes_, charge, table_budget)) return wait_elsewhere();
-    } else if (!data) {
-        // Progress, resync and schema frames are a few bytes and are rebuilt
-        // for each attempt, so they never queue: they use the pool whenever
-        // this watch has no unsent output and the pool has room.
+    } else if (!queues) {
+        // Progress and resync frames are a few bytes and are rebuilt for each
+        // attempt, so they never queue: they use the pool whenever this watch
+        // has no unsent output and the pool has room.
         if (unsent_ != 0U || !Charge(pool_->bytes, size, table_budget)) return Admission::kWait;
         excess_ = size;
         for (auto& output : prepared.next) output.excess = true;
     } else {
-        // A change larger than the share waits until this watch has no
-        // unsent output, then for its turn in the table's pool queue. Only
-        // the head keeps its built form, so the waiting changes held outside
-        // the counters are at most one per table.
+        // A change or schema frame larger than the share waits until this
+        // watch has no unsent output, then for its turn in the table's pool
+        // queue. Only the head keeps its built form, so the waiting frames
+        // held outside the counters are at most one per table.
         if (unsent_ != 0U) { prepared.Drop(); return Admission::kWait; }
         std::lock_guard pool_lock(pool_->mutex);
         auto& waiters = pool_->waiters;
@@ -300,7 +301,13 @@ SlotWatch::Admission SlotWatch::Admit(Prepared& prepared, bool& left_head) {
         if (!prepared.built) return Admission::kBuild;
         // Only the catch-up worker charges, so no admission saw a refund.
         if (!Charge(pool_->bytes, size, table_budget)) return Admission::kWait;
-        if (!Charge(*table_bytes_, receipt_bytes, table_budget)) { Release(0U, size); return Admission::kWait; }
+        if (!Charge(*table_bytes_, receipt_bytes, table_budget)) {
+            // It waits for table room, not its turn: leave like any other such wait.
+            Release(0U, size);
+            waiters.pop_front(); queued_ = false; left_head = true;
+            prepared.Drop();
+            return Admission::kWait;
+        }
         waiters.pop_front(); queued_ = false;
         excess_ = size;
         for (auto& output : prepared.next) output.excess = true;

@@ -80,7 +80,7 @@ Store your applied position together with your output, and ignore repeated posit
 Slow ordinary watches resync when the live history budget is exceeded.
 Each watch queues output within its share of `feed_buffer_bytes`, and slot changes larger than a share use one more table pool of that size.
 So queued output per table stays within twice `feed_buffer_bytes`, apart from frames admitted before a new watch reduced the shares.
-A waiting slot watch keeps its encoded change only while it fits the share or is next for the pool, so at most one waiting change larger than a share per table is held outside these limits.
+A waiting slot watch keeps its encoded change or schema event only while it fits the share or is next for the pool, so at most one waiting change or schema event larger than a share per table is held outside these limits.
 An ordinary watch resyncs instead of queuing a change larger than its share.
 A slot becomes lost when its retained history exceeds its limit.
 Reducing a table's limits can also trigger resync or mark existing slots lost.

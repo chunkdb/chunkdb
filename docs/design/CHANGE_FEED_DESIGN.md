@@ -18,7 +18,8 @@ Retained changes use the table budget; queued output uses per-watch shares of it
 Ordinary overflow requests resync; slot overflow catches up from archives, while an event larger than the table budget ends the watch.
 A slot frame whose bytes and receipt exceed its watch share waits until that watch has no unsent output, then queues in arrival order for a separate table pool bounded by the table budget.
 A watch waiting for anything but its turn, such as its own ACKs, leaves that queue and joins at the back when it needs the pool again.
-Progress, resync and schema frames are a few bytes and never queue; above a share they use the pool whenever their watch has no unsent output and the pool has room.
+Schema frames queue like changes; progress and resync frames are a few bytes and never queue, and above a share they use the pool whenever their watch has no unsent output and the pool has room.
+Those can delay a queued head only while slow readers hold them at shares under about 180 bytes.
 A frame that fits the share alone waits for ACKs instead when receipts fill it.
 Its connection closes, releasing its charges at once, when no byte of its queued output is written for the client I/O timeout; TLS writes one record per call, so every completed call is progress.
 A watch waiting for the pool sends no progress, and reads no ACK while more than its share of a pool frame is unsent.

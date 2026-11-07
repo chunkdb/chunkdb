@@ -27,6 +27,10 @@ struct SlotAckDeadlineTestAccess {
     static std::size_t Charged(const SlotWatch& watch) { return watch.table_bytes_->load(std::memory_order_acquire); }
     static std::size_t Excess(const SlotWatch& watch) { return watch.pool_->bytes.load(std::memory_order_acquire); }
     static constexpr std::size_t kReceipt = SlotWatch::kReceiptBytes;
+    static std::size_t PreparedSize(const SlotWatch& watch) { return watch.prepared_ ? watch.prepared_->size : 0U; }
+    // Stands in for other output charged to the table's within-share counter.
+    static void ChargeTable(SlotWatch& watch, std::size_t bytes) { watch.table_bytes_->fetch_add(bytes, std::memory_order_acq_rel); }
+    static void ReleaseTable(SlotWatch& watch, std::size_t bytes) { watch.table_bytes_->fetch_sub(bytes, std::memory_order_acq_rel); }
     static std::shared_ptr<const std::string> Prepared(const SlotWatch& watch) {
         return watch.prepared_ && watch.prepared_->built ? watch.prepared_->next.back().bytes : nullptr;
     }
@@ -1342,7 +1346,8 @@ void ExcessPoolControlFrames(bool tls) {
     (void)drain(*holder);
     assert(SlotAckDeadlineTestAccess::Publish(*waiter, one_entry)); (void)drain(*waiter);
     // A head that must wait for its own ACKs gives up its place to the next waiter.
-    FeedOptions options; options.ack_timeout_ms = 600000U;
+    std::atomic<std::size_t> woken{0U};
+    FeedOptions options; options.ack_timeout_ms = 600000U; options.notify = [&] { woken.fetch_add(1U); };
     auto acker = SlotWatch::Create(table, "acker", options);
     acker->SetQuota(share);
     assert(SlotAckDeadlineTestAccess::Publish(*acker, small_entry)); (void)drain(*acker); // One receipt held.
@@ -1352,14 +1357,94 @@ void ExcessPoolControlFrames(bool tls) {
     (void)drain(*holder);
     assert(SlotAckDeadlineTestAccess::Prepared(*acker)); // The head keeps its built change.
     acker->SetQuota(receipt); // A smaller share: its receipt now leaves no room.
+    const auto before = woken.load();
     assert(!SlotAckDeadlineTestAccess::Publish(*acker, one_entry));
-    assert(!SlotAckDeadlineTestAccess::Prepared(*acker));
+    assert(!SlotAckDeadlineTestAccess::Prepared(*acker) && woken.load() > before); // It woke the next waiter.
     assert(SlotAckDeadlineTestAccess::Publish(*waiter, two_entry)); (void)drain(*waiter);
     // After its ACK it queues again at the back.
     assert(acker->Ack(small) == SlotWatch::AckResult::kAccepted);
     acker->SetQuota(share);
     assert(SlotAckDeadlineTestAccess::Publish(*acker, one_entry)); (void)drain(*acker);
     for (const auto& state : {holder, waiter, first, second, acker}) { state->Cancel(); state->WorkStep(); }
+    assert(SlotAckDeadlineTestAccess::Charged(*holder) == 0U && SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
+}
+void ExcessPoolLeave(bool tls) {
+    constexpr std::size_t budget = 4096U, share = 1024U, receipt = SlotAckDeadlineTestAccess::kReceipt;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer);
+    for (const auto* name : {"holder", "leaver", "middle", "last", "schema"}) writer->Ok("CREATE SLOT '" + std::string(name) + "' ON t");
+    auto table = harness.catalog->Find("t");
+    const auto initial = table->ListFeedSlots().front().position;
+    const auto small = Set(*writer, 1);
+    const auto one = LabelTransaction(*writer, 20U), two = LabelTransaction(*writer, 20U, 1U);
+    FeedSlotTestAccess::Sync(*table);
+    auto archive = table->ReadFeedArchive(initial);
+    const auto small_entry = archive.Next(), one_entry = archive.Next(), two_entry = archive.Next();
+    assert(small_entry && small_entry->position.revision == small && one_entry && one_entry->position.revision == one);
+    assert(two_entry && two_entry->position.revision == two);
+    const auto drain = [](SlotWatch& state) {
+        std::size_t bytes = 0U;
+        while (auto output = state.Take(std::numeric_limits<std::size_t>::max())) {
+            bytes += output->bytes->size(); state.Consumed(output->bytes->size());
+            if (output->revision) state.Sent(*output->revision);
+        }
+        return bytes;
+    };
+    std::atomic<std::size_t> woken{0U};
+    FeedOptions timed; timed.ack_timeout_ms = 600000U; timed.notify = [&] { woken.fetch_add(1U); };
+    auto holder = SlotWatch::Create(table, "holder", {});
+    auto leaver = SlotWatch::Create(table, "leaver", timed);
+    auto middle = SlotWatch::Create(table, "middle", {});
+    auto last = SlotWatch::Create(table, "last", {});
+    auto schema_watch = SlotWatch::Create(table, "schema", {});
+    for (const auto& state : {holder, leaver, middle, last}) state->SetQuota(share);
+    assert(SlotAckDeadlineTestAccess::Publish(*leaver, small_entry)); (void)drain(*leaver); // One receipt held.
+    assert(SlotAckDeadlineTestAccess::Publish(*holder, two_entry));
+    assert(!SlotAckDeadlineTestAccess::Publish(*leaver, one_entry)); // Queue: leaver, middle, last.
+    assert(!SlotAckDeadlineTestAccess::Publish(*middle, one_entry));
+    assert(!SlotAckDeadlineTestAccess::Publish(*last, one_entry));
+    (void)drain(*holder);
+    // A larger share fits the change, but not beside the held receipt: the head leaves.
+    leaver->SetQuota(SlotAckDeadlineTestAccess::PreparedSize(*leaver) + receipt + receipt / 2U);
+    auto before = woken.load();
+    assert(!SlotAckDeadlineTestAccess::Publish(*leaver, one_entry));
+    assert(woken.load() > before && SlotAckDeadlineTestAccess::Prepared(*leaver)); // Within its share it stays built.
+    assert(SlotAckDeadlineTestAccess::Publish(*middle, one_entry));
+    // Rejoining puts it behind the watch that waited meanwhile.
+    assert(leaver->Ack(small) == SlotWatch::AckResult::kAccepted);
+    leaver->SetQuota(share);
+    assert(!SlotAckDeadlineTestAccess::Publish(*leaver, one_entry));
+    (void)drain(*middle);
+    assert(!SlotAckDeadlineTestAccess::Publish(*leaver, one_entry));
+    assert(SlotAckDeadlineTestAccess::Publish(*last, one_entry)); (void)drain(*last);
+    assert(SlotAckDeadlineTestAccess::Publish(*leaver, one_entry)); (void)drain(*leaver);
+    // A head whose receipt finds the table counter full waits for table room, so it leaves too.
+    assert(SlotAckDeadlineTestAccess::Publish(*holder, one_entry));
+    assert(!SlotAckDeadlineTestAccess::Publish(*leaver, two_entry));
+    assert(!SlotAckDeadlineTestAccess::Publish(*middle, two_entry));
+    (void)drain(*holder);
+    const auto filler = budget - SlotAckDeadlineTestAccess::Charged(*leaver) - receipt + 1U;
+    SlotAckDeadlineTestAccess::ChargeTable(*leaver, filler);
+    before = woken.load();
+    assert(!SlotAckDeadlineTestAccess::Publish(*leaver, two_entry));
+    assert(woken.load() > before && !SlotAckDeadlineTestAccess::Prepared(*leaver) && SlotAckDeadlineTestAccess::Excess(*leaver) == 0U);
+    SlotAckDeadlineTestAccess::ReleaseTable(*leaver, filler);
+    assert(SlotAckDeadlineTestAccess::Publish(*middle, two_entry)); (void)drain(*middle);
+    assert(SlotAckDeadlineTestAccess::Publish(*leaver, two_entry)); (void)drain(*leaver);
+    // A schema frame above its share queues like a change and keeps nothing built behind the head.
+    auto schema_entry = std::make_shared<FeedEntry>();
+    schema_entry->kind = FeedEntry::Kind::kSchema; schema_entry->position = small_entry->position;
+    schema_entry->schema_version = small_entry->schema_version;
+    schema_entry->columns = table->geometry().LayoutAt(schema_entry->schema_version).schema().columns;
+    schema_watch->SetQuota(16U);
+    assert(SlotAckDeadlineTestAccess::Publish(*holder, two_entry));
+    assert(!SlotAckDeadlineTestAccess::Publish(*last, two_entry)); // Head: no room beside the holder.
+    assert(!SlotAckDeadlineTestAccess::Publish(*schema_watch, schema_entry)); // The pool has room, but not its turn.
+    assert(!SlotAckDeadlineTestAccess::Prepared(*schema_watch) && SlotAckDeadlineTestAccess::PreparedSize(*schema_watch) > 16U);
+    (void)drain(*holder);
+    assert(SlotAckDeadlineTestAccess::Publish(*last, two_entry)); (void)drain(*last);
+    assert(SlotAckDeadlineTestAccess::Publish(*schema_watch, schema_entry)); (void)drain(*schema_watch);
+    for (const auto& state : {holder, leaver, middle, last, schema_watch}) { state->Cancel(); state->WorkStep(); }
     assert(SlotAckDeadlineTestAccess::Charged(*holder) == 0U && SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
 }
 void LiveSchemaAcknowledgement(bool tls) {
@@ -1958,6 +2043,7 @@ int main(int argc, char** argv) {
             run("excess-pool-bound", ExcessPoolBound); run("excess-pool-receipts", ExcessPoolReceipts);
             run("excess-stalled-holder", ExcessStalledHolder); run("excess-slow-reader", ExcessSlowReader);
             run("excess-pool-FIFO", ExcessPoolFifo); run("excess-pool-control", ExcessPoolControlFrames);
+            run("excess-pool-leave", ExcessPoolLeave);
         }
         if (shares_only) {
             std::cout << (tls ? "TLS" : "plain") << ": " << passed << "/" << executed << " feed share groups passed\n";
