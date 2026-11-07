@@ -235,11 +235,61 @@ void TestRights() {
     assert(users.rfind("*2\r\n", 0) == 0 && Contains(users, "$5\r\nadmin\r\n") && Contains(users, "$1\r\n*\r\n$4\r\nREAD\r\n"));
     ExpectError(server.Run(admin, "ALTER USER admin NO MANAGES USERS"), "the last user who manages users");
 
-    // A dropped user keeps no right in a session still open.
+    // A session whose user was dropped has no user any more and closes.
     ExpectReply(server.Run(admin, "DROP USER bot"), "+OK\r\n");
-    ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM world"), "NO_TABLE");
+    ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM world"), "AUTH_REQUIRED reason=user_dropped");
+    assert(bot.close_after_reply);
     SessionState gone;
     ExpectError(server.Login(gone, "bot", "new"), "AUTH_FAILED");
+}
+
+void TestRecreatedUser() {
+    Server server;
+    auto admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("old")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE USER other VERIFIER $1", Parameters{VerifierText("other")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON default TO bot"), "+OK\r\n");
+    auto statement = server.LoggedIn("bot", "old");
+    auto alter = server.LoggedIn("bot", "old");
+    auto frames = server.LoggedIn("bot", "old");
+    auto hello = server.LoggedIn("bot", "old");
+    auto hello_frames = server.LoggedIn("bot", "old");
+    auto bystander = server.LoggedIn("other", "other");
+    ExpectReply(server.Run(statement, "GET BLOCK 0 0 FROM default"), "_\r\n");
+
+    // Another user under the same name, with more rights: the old sessions
+    // get none of them.
+    ExpectReply(server.Run(admin, "DROP USER bot"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("new")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT ADMIN ON * TO bot"), "+OK\r\n");
+    ExpectError(server.Run(statement, "GET BLOCK 0 0 FROM default"), "AUTH_REQUIRED reason=user_dropped");
+    assert(statement.close_after_reply);
+    const auto verifier = server.users->Find("bot")->verifier;
+    ExpectError(server.Run(alter, "ALTER USER bot VERIFIER $1", Parameters{VerifierText("taken")}),
+                "AUTH_REQUIRED reason=user_dropped");
+    assert(alter.close_after_reply && server.users->Find("bot")->verifier == verifier);
+    const auto plan = server.engine->PlanPayload(frames, "SET BLOCK 0 0 IN default bits = $1\r\n");
+    assert(plan.plan == CommandEngine::PayloadPlan::kDiscard && frames.close_after_reply);
+    ExpectError(plan.reject_response, "AUTH_REQUIRED reason=user_dropped");
+    ExpectError(server.Run(hello, "HELLO 3"), "AUTH_REQUIRED reason=user_dropped");
+    assert(hello.close_after_reply);
+    const std::string hello_line = "HELLO 3 USER bot $1\r\n";
+    const auto hello_plan = server.engine->PlanPayload(hello_frames, hello_line);
+    assert(hello_plan.plan == CommandEngine::PayloadPlan::kDiscard);
+    ExpectError(server.engine->RejectPayload(hello_frames, hello_line, hello_plan.reject_response),
+                "AUTH_REQUIRED reason=user_dropped");
+    assert(hello_frames.close_after_reply);
+
+    // The new user logs in with its own password; others are unaffected by
+    // changes to users they are not.
+    auto current = server.LoggedIn("bot", "new");
+    ExpectReply(server.Run(current, "GET BLOCK 0 0 FROM default"), "_\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON default TO other"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "REVOKE WRITE ON default FROM bot"), "+OK\r\n");
+    ExpectReply(server.Run(bystander, "GET BLOCK 0 0 FROM default"), "_\r\n");
+    ExpectReply(server.Run(current, "ALTER USER bot VERIFIER $1", Parameters{VerifierText("newer")}), "+OK\r\n");
+    assert(!bystander.close_after_reply && !current.close_after_reply && !admin.close_after_reply);
+    (void)server.LoggedIn("bot", "newer");
 }
 
 void TestAtomicRightsLists() {
@@ -458,6 +508,7 @@ int main() {
     TestVerifierAndGrantBounds();
     TestLogin();
     TestRights();
+    TestRecreatedUser();
     TestConditionalUsers();
     TestConcurrentConditionalUsers();
     TestWithoutUsers();

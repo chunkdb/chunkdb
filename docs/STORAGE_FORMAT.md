@@ -198,7 +198,7 @@ Undoing steps reconstructs and validates every earlier schema used by stored chu
 An optional final 10-byte narrowing suffix is `1:u8, column_id:u32, target_kind:u8, target_size:u32`; without pending narrowing there is no suffix.
 
 While this suffix exists, writes to that column must fit both types; writer startup and RECOVER TABLE remove interrupted narrowing before opening the table.
-Named migrations validate narrowing under exclusive admission before deciding and do not depend on this suffix for redo.
+Named migrations also record this suffix while they check stored values, and decide only if the table schema is unchanged since the check; redo does not depend on the suffix.
 
 ## Packed chunk state
 
@@ -406,12 +406,19 @@ Failure repairing an uncommitted operation fences the affected store until recov
 
 `chunkdb.slots` is at most 1 MiB, atomically replaced and file/directory synced in every durability mode:
 
-1. `CKSL`, version `1:u16`, reserved zero `u16`, table epoch (16 bytes).
+1. `CKSL`, version `u16` (1, 2 or 3), header flags `u16`, table epoch (16 bytes).
 2. Durable watermark `u64`, slot count `u32` (at most 1024).
-3. Per slot: name length `u8`, lost flag `u8` (0/1), reserved zero `u16`, written revision `u64`, name bytes.
+3. Per slot: name length `u8`, slot flags `u8`, projection count `u16`, written revision `u64`, name bytes, then the parts its flags select: area (four `i64`: x0, y0, x1, y1), projection IDs (`u32` each), and owner length `u8` with owner bytes.
 4. CRC32 over all preceding bytes.
 
+Slot flags are `0x1` lost, `0x2` area, `0x4` projection, `0x8` NO BEFORE, `0x10` CHUNKS, `0x20` lost by a dropped projected column, and `0x40` owner; the projection count is nonzero exactly with `0x4`.
+Version 1 allows only `0x1`; version 2 adds the filter flags `0x2` through `0x20`; version 3 adds `0x40`, and its header flag `0x1` permits the filter flags.
+Versions 1 and 2 have zero header flags; version 2, or version 3 with header flag `0x1`, is the filter format and requires `slot_filters`.
+A writer uses version 3 only while a slot has an owner and otherwise version 1 or 2; it keeps the filter format once written.
+Version 3 needs no feature bit; a server that does not know version 3 refuses the table.
+
 Names are unique, 1–63 bytes matching `[a-z_][a-z0-9_]*`; every written revision is at or below the watermark, and epoch matches the table StoreId.
+Owners are user names with the same rule; a slot without an owner records the user of its first granted attach without ADMIN on `*`.
 Lost records remain visible with their loss flag; advancing/watching a lost slot refuses it, and explicit DROP removes it.
 The first slot activation quiesces writers/maintenance/eviction and checkpoints preceding WALs before selecting a durable frontier.
 Checkpoint archives use `.chunkdb.feed/C_<cx>_<cy>.<first>.chk` for the hard-linked old base image, when one existed, and `C_<cx>_<cy>.<first>-<last>.wal` for a closed WAL range.

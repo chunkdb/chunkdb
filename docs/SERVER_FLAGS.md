@@ -12,7 +12,7 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--port` | `4242` | TCP port, 1–65535. |
 | `--listen-uri` | unset | `chunk://host:port/` or `chunks://host:port/`; sets address, port and TLS at this point in argument order; a username is refused. |
 | `--workers` | CPU thread count, or 4 | Connections served at once; a connection holds a worker until it closes or reaches the idle timeout, and a WATCH releases it. |
-| `--client-io-timeout-ms` | `5000` | 1–86400000 ms each for the PROXY header, the TLS handshake, HELLO and AUTH with all their parameter frames (after those two), each later request line or frame header (from its first byte) or frame body (from the end of its header), and a complete reply write. |
+| `--client-io-timeout-ms` | `5000` | 1–86400000 ms each for the PROXY header, the TLS handshake, HELLO and AUTH with all their parameter frames (after those two), each later request line or frame header (from its first byte) or frame body (from the end of its header), and a complete reply write; a slot watch sending any frame above its feed share is closed when no byte of its output is written for this long, where on TLS each completed record of up to 16 KiB counts. |
 | `--idle-connection-timeout-ms` | `60000` | 1–86400000 ms between requests; before HELLO the smaller I/O/idle timeout applies. |
 | `--max-pending-clients` | `1024` | Accepted clients waiting for a worker; overflow is refused. |
 | `--max-handshakes-per-ip` | `64` | Connections from an IPv4 address or IPv6 /64 occupying workers before HELLO; exceeding the limit is refused. `0` disables the limit. |
@@ -24,7 +24,7 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--admin-password-file` | unset | First administrator's password from the first line of this file. |
 | `--auth-max-failures-per-connection` | `5` | 1–1000 failed HELLO or AUTH attempts that close a connection. |
 | `--auth-ban-failures` | `5` | 0–1000000 failed logins from one source address that ban it; `0` disables bans. |
-| `--auth-ban-ms` | `1000` | 1–86400000 ms a source address stays banned; each later failure from it bans it again. |
+| `--auth-ban-ms` | `1000` | 1–86400000 ms a source address stays banned; when the ban ends, its failures are reset. |
 | `--proxy-protocol` | `off` | `off` or `v2`; with `v2` every connection starts with a PROXY protocol v2 header. |
 | `--audit-log` | unset | File receiving the audit log; see [Logs](#logs). |
 | `--slow-statement-ms` | `0` | 0–86400000 ms; statements taking at least this long are logged at WARN; `0` logs none. |
@@ -42,11 +42,13 @@ Existing users are loaded on later starts; bootstrap settings do not change thei
 Use [Users and rights](USERS.md) for password changes and offline recovery.
 
 A source address is an IPv4 address or an IPv6 /64.
-A successful login from a source address clears its failures.
+A successful login from a source address clears the failures of its own user name only.
 
 ## TLS
 
 A `chunks://` listener accepts TLS from `--tls-min-version` up and refuses renegotiation.
+TLS 1.2 connections use ECDHE key exchange with AES-GCM or ChaCha20-Poly1305 only; a client offering no such cipher fails the handshake.
+TLS 1.3 uses the OpenSSL default cipher suites.
 The `--tls-cert` file holds the server certificate followed by any intermediate certificates, which are sent to clients; the `--tls-key` file holds an unencrypted private key.
 To renew the certificate, replace both files, then run [RELOAD TLS](reference/SERVER.md) or, on Linux and macOS, send the server SIGHUP.
 The server reads both files again and checks that the key matches the certificate.
@@ -147,9 +149,9 @@ With `--auth scram` the directory must already have users, because `--read-only`
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--txn-max-duration-ms` | `5000` | Transaction lifetime from BEGIN; expiry ends it with CONFLICT. |
+| `--txn-max-duration-ms` | `5000` | Transaction lifetime from BEGIN; expiry ends it with CONFLICT and releases its private bytes. |
 | `--txn-max-bytes` | `16777216` | Private written-chunk bytes for one transaction. |
-| `--txn-total-bytes` | `268435456` | Private written-chunk bytes for all open transactions. |
+| `--txn-total-bytes` | `268435456` | Private written-chunk bytes for all open transactions; a write that finds it full first ends the transactions past `--txn-max-duration-ms`. |
 | `--txn-history-bytes` | `67108864` | Earlier chunk states retained per table; overflow cancels oldest transactions. |
 | `--feed-buffer-bytes` | `67108864` | Default live feed budget for tables without an explicit `feed_buffer_bytes` option, shared among watches. |
 | `--tcp-keepalive-ms` | `60000` | Set TCP idle and repeat probe intervals, 1–32767000 ms, for every accepted connection. |
@@ -194,6 +196,7 @@ Column types are defined with `CREATE TABLE` and can be changed with `ALTER TABL
 Server-created data and backup directories permit owner-only access, mode 0700 on Linux/macOS.
 New files use mode 0600 on those platforms; Windows uses protected owner-only access control lists.
 Existing users-file permissions are tightened at startup, except with `--read-only`, which logs a warning instead.
+`--backup-dir`, existing directories below it and an existing BACKUP TO destination must be owned by the server user or root and not writable by group or others; see [Backup](BACKUP.md).
 Bind mounts must grant access to the process owner; see [Docker](DOCKER.md).
 
 TCP keepalive applies before TLS and HELLO.

@@ -53,6 +53,8 @@ void RequireValidGrantTable(std::string_view table);
 
 // The highest right `user` has on `table`, from a grant on it or on `*`.
 [[nodiscard]] std::optional<Right> RightOn(const User& user, const std::string& table);
+// The same from grants alone.
+[[nodiscard]] std::optional<Right> RightOn(const std::map<std::string, Right>& grants, const std::string& table);
 
 // Throws std::invalid_argument for a field that does not fit the file: a
 // verifier salt outside scram::kMinSaltBytes..scram::kMaxSaltBytes, a name

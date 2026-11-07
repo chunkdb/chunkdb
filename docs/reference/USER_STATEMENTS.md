@@ -71,7 +71,7 @@ See [Protocol](../PROTOCOL.md) for authentication encoding.
 - `right`: READ, WRITE, or ADMIN; ADMIN includes WRITE, and WRITE includes READ.
 - `table`: a valid table name, including one not yet created.
 - `*`: all tables, including tables created later.
-- `MANAGES USERS`: permission to manage users, rights, migration listing, and backups.
+- `MANAGES USERS`: permission to manage users, rights, and backups, and to list GRANT and REVOKE migrations.
 - Conditional clauses: skip an existing or absent user without changing it; normal rights still apply.
 
 ## Returns
