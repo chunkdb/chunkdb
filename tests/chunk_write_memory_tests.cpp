@@ -20,32 +20,60 @@
 #include "chunkdb/table_catalog.hpp"
 #include "test_utils.hpp"
 
+// Not on MinGW: there the C++ runtime DLL allocates through its own
+// operator new, which this binary's replacement does not reach.
+#if !defined(__MINGW32__)
+#define CHUNKDB_COUNTS_HEAP 1
+#if defined(__APPLE__)
+// From <malloc/malloc.h>, whose Mach headers GCC does not parse; not
+// const, as GCC would take the block for one whose bytes are read.
+extern "C" std::size_t malloc_size(void* pointer);
+#else
+#include <malloc.h>
+#endif
+#endif
+
+#if defined(CHUNKDB_COUNTS_HEAP)
 namespace {
 
+// Live bytes as the C allocator sizes its blocks: the block size is read
+// back on release, so no header changes the alignment malloc gives.
 std::atomic<std::size_t> g_live_bytes{0};
 std::atomic<std::size_t> g_peak_bytes{0};
-// Room for the size in front of each block, keeping the block aligned.
-constexpr std::size_t kSizeHeader = alignof(std::max_align_t);
+
+std::size_t BlockBytes(void* block) noexcept {
+#if defined(__APPLE__)
+    return malloc_size(block);
+#elif defined(_WIN32)
+    return _msize(block);
+#else
+    return malloc_usable_size(block);
+#endif
+}
 
 void* CountedAllocate(std::size_t size) {
-    void* block = std::malloc(size + kSizeHeader);
+    void* block = std::malloc(size == 0U ? 1U : size);
     if (block == nullptr) {
         throw std::bad_alloc();
     }
-    *static_cast<std::size_t*>(block) = size;
-    const std::size_t live = g_live_bytes.fetch_add(size) + size;
+    // operator new must return memory aligned for any ordinary type.
+    if (reinterpret_cast<std::uintptr_t>(block) % __STDCPP_DEFAULT_NEW_ALIGNMENT__ != 0U) {
+        std::fprintf(stderr, "malloc returned a block below the default new alignment\n");
+        std::abort();
+    }
+    const std::size_t bytes = BlockBytes(block);
+    const std::size_t live = g_live_bytes.fetch_add(bytes) + bytes;
     std::size_t peak = g_peak_bytes.load();
     while (live > peak && !g_peak_bytes.compare_exchange_weak(peak, live)) {
     }
-    return static_cast<unsigned char*>(block) + kSizeHeader;
+    return block;
 }
 
-void CountedRelease(void* pointer) noexcept {
-    if (pointer == nullptr) {
+void CountedRelease(void* block) noexcept {
+    if (block == nullptr) {
         return;
     }
-    void* block = static_cast<unsigned char*>(pointer) - kSizeHeader;
-    g_live_bytes.fetch_sub(*static_cast<std::size_t*>(block));
+    g_live_bytes.fetch_sub(BlockBytes(block));
     std::free(block);
 }
 
@@ -53,10 +81,26 @@ void CountedRelease(void* pointer) noexcept {
 
 void* operator new(std::size_t size) { return CountedAllocate(size); }
 void* operator new[](std::size_t size) { return CountedAllocate(size); }
+void* operator new(std::size_t size, const std::nothrow_t&) noexcept {
+    try {
+        return CountedAllocate(size);
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
+}
+void* operator new[](std::size_t size, const std::nothrow_t&) noexcept {
+    try {
+        return CountedAllocate(size);
+    } catch (const std::bad_alloc&) {
+        return nullptr;
+    }
+}
 void operator delete(void* pointer) noexcept { CountedRelease(pointer); }
 void operator delete[](void* pointer) noexcept { CountedRelease(pointer); }
 void operator delete(void* pointer, std::size_t) noexcept { CountedRelease(pointer); }
 void operator delete[](void* pointer, std::size_t) noexcept { CountedRelease(pointer); }
+void operator delete(void* pointer, const std::nothrow_t&) noexcept { CountedRelease(pointer); }
+void operator delete[](void* pointer, const std::nothrow_t&) noexcept { CountedRelease(pointer); }
 
 namespace {
 
@@ -184,11 +228,17 @@ void TestTxnLimitRefusesBeforeDecoding() {
 }
 
 }  // namespace
+#endif
 
 int main() {
+#if !defined(CHUNKDB_COUNTS_HEAP)
+    std::fprintf(stderr, "skipped: this platform's C++ runtime allocates outside the counted operator new\n");
+    return 77;
+#else
     TestSetChunkHoldsThreeStates();
     TestSetChunkKeepsWithoutCopy(false);
     TestSetChunkKeepsWithoutCopy(true);
     TestTxnLimitRefusesBeforeDecoding();
     return 0;
+#endif
 }

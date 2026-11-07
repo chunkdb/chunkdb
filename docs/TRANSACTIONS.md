@@ -48,6 +48,7 @@ A read-only transaction can commit while its snapshot remains valid.
 
 Exceeding a write-memory limit rejects the statement and leaves the transaction open.
 SET CHUNK is checked against these limits by its form's size before the form is decoded.
+A form over a limit receives INVALID_ARGUMENT for that limit, even when it is also malformed.
 History pressure ends the oldest transactions with CONFLICT.
 A table change or expired duration also ends the transaction's work.
 Past its duration, a transaction that has run a table statement ends with the next statement the connection runs, PING and DESCRIBE included, or earlier when another transaction needs its share of `--txn-total-bytes`.

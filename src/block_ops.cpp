@@ -1164,6 +1164,9 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         feed.Capture(regular_chunk->wal_batch, appended_bytes);
 
+        // Last in the try: it throws only before its commit point, and only
+        // after that point does it take the replaced vectors, so the catch
+        // below always restores them intact.
         FinishOrdinaryMutationLocked(
             chunk_coord,
             regular_chunk,
@@ -1173,7 +1176,6 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
             &keep,
             &previous_payload,
             &previous_presence);
-        feed.Commit();
     } catch (...) {
         regular_chunk->payload = std::move(previous_payload);
         regular_chunk->presence_bitmap = std::move(previous_presence);
@@ -1188,6 +1190,7 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
         regular_chunk->pending_wal_flush_updates = saved_pending_wal_flush_updates;
         throw;
     }
+    feed.Commit();
     return regular_chunk->version;
 }
 
