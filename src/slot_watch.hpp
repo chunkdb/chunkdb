@@ -21,18 +21,29 @@ struct FeedDeliveryTestHook {
         kWorkerReady, kAfterPendingWait, kBeforeWorkerHandle, kAfterWorkerHandle,
         kBeforeWorkerClose, kAfterWorkerClose, kBeforeClientRead, kAfterClientRead,
         kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kAfterProgressAdmission, kAfterPartialFeedWrite, kAfterBlockedFeedWrite, kAfterAckTimeoutClose, kBeforeSlotAck, kAfterSlotFinish, kBeforeReturnClient,
-        kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept, kAfterTakeoverFence, kAfterTakeoverClose, kAfterSlotAck, kAfterTakeoverReserved };
+        kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept, kAfterTakeoverFence, kAfterTakeoverClose, kAfterSlotAck, kAfterTakeoverReserved,
+        kAfterWriteDeadlineClose };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
 struct FeedDeliveryTestAccess {
     static std::size_t FillActiveClientSendQueue(ChunkServer& server, int bytes);
+    // Sets SO_SNDBUF on every connection the server has open.
+    static void LimitActiveSendBuffers(ChunkServer& server, int bytes);
     static void SetHook(ChunkServer& server, FeedDeliveryTestHook* hook);
     // Observe existing scheduling without adding a wake before shutdown.
     static void SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
     static void SetPendingObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
   private:
     static void InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake);
+};
+
+// Table-wide pool for slot frames above their watch share. Waiters are
+// admitted in arrival order; only the catch-up worker charges the pool.
+struct FeedExcessPool {
+    std::atomic<std::size_t> bytes{0U};
+    std::mutex mutex;
+    std::deque<const SlotWatch*> waiters;  // Guarded by mutex.
 };
 
 struct FeedSlotClaim {
@@ -46,11 +57,11 @@ struct FeedSlotClaim {
     // Table-wide slot output charges: output within watch shares and
     // receipts, and output above a share. Each stays within the table budget.
     const std::shared_ptr<std::atomic<std::size_t>> output_bytes;
-    const std::shared_ptr<std::atomic<std::size_t>> excess_bytes;
+    const std::shared_ptr<FeedExcessPool> excess;
     FeedSlotClaim(std::string value, std::uint64_t revision, std::shared_ptr<std::atomic<std::size_t>> bytes,
-        std::shared_ptr<std::atomic<std::size_t>> excess, std::string owner_user)
+        std::shared_ptr<FeedExcessPool> pool, std::string owner_user)
         : name(std::move(value)), user(std::move(owner_user)), completed(revision), output_bytes(std::move(bytes)),
-          excess_bytes(std::move(excess)) {}
+          excess(std::move(pool)) {}
 };
 
 // Socket operations only touch the bounded queue and control fields. A single
@@ -120,21 +131,30 @@ class SlotWatch {
     };
     // Includes the list node and allocator bookkeeping; allocation precedes admission.
     static constexpr std::size_t kReceiptBytes = sizeof(MutationReceipt) + 4U * sizeof(void*);
-    // A built frame with its receipt, kept while it waits for room.
+    // The next frame while it waits for room. Its built form is kept within
+    // the share and at the head of the pool queue, and dropped otherwise.
     struct Prepared {
         std::shared_ptr<const FeedEntry> original;
         std::uint64_t schema = 0;
+        bool send = false, built = false;
+        FeedEntry::Kind kind = FeedEntry::Kind::kChange;
+        std::uint64_t schema_version = 0;
+        std::size_t size = 0, receipt_bytes = 0;
         std::shared_ptr<const FeedEntry> entry{};
         std::deque<Output> next{};
-        std::size_t size = 0;
         std::list<MutationReceipt> receipt{};
+        void Drop() noexcept { built = false; entry.reset(); next.clear(); receipt.clear(); }
     };
-    [[nodiscard]] Prepared Prepare(const std::shared_ptr<const FeedEntry>& original) const;
+    void Build(Prepared& prepared) const;
+    enum class Admission { kAdmitted, kWait, kBuild };
+    Admission Admit(Prepared& prepared);
+    // True when this watch was at the head of the pool queue.
+    bool LeaveExcessQueue() noexcept;
     const std::shared_ptr<Table> table_;
     std::shared_ptr<FeedSlotClaim> claim_;
     const std::weak_ptr<FeedSlotClaim> generation_;
     const std::shared_ptr<std::atomic<std::size_t>> table_bytes_;
-    const std::shared_ptr<std::atomic<std::size_t>> excess_bytes_;
+    const std::shared_ptr<FeedExcessPool> pool_;
     const FeedPosition start_;
     const FeedOptions options_;
     mutable std::mutex mutex_;
@@ -143,9 +163,10 @@ class SlotWatch {
     bool takeover_ = false, socket_closed_ = false;
     std::deque<Output> output_;
     std::size_t bytes_ = 0, unsent_ = 0;
-    // The front of the unsent output charged to excess_bytes_: one frame
-    // above the share, admitted only when nothing else was unsent.
+    // The front of the unsent output charged to the pool: one frame above
+    // the share, admitted only when nothing else was unsent.
     std::size_t excess_ = 0;
+    bool queued_ = false;  // Worker-only; pool_->waiters itself is guarded by pool_->mutex.
     std::size_t quota_;
     std::uint64_t sent_, acknowledged_, written_;
     std::list<MutationReceipt> receipts_;

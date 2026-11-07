@@ -12,6 +12,11 @@
 #include "feed_slot_records.hpp"
 
 namespace chunkdb {
+void FeedDeliveryTestAccess::LimitActiveSendBuffers(ChunkServer& server, int bytes) {
+    std::lock_guard lock(server.active_clients_mutex_);
+    for (const auto socket : server.active_clients_)
+        assert(setsockopt(static_cast<server_detail::SocketHandle>(socket), SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
+}
 struct SlotAckDeadlineTestAccess {
     static bool Publish(SlotWatch& watch, const std::shared_ptr<const FeedEntry>& entry) { return watch.Publish(entry); }
     static void Sent(SlotWatch& watch, std::uint64_t revision, std::chrono::steady_clock::time_point now) {
@@ -20,9 +25,11 @@ struct SlotAckDeadlineTestAccess {
     static bool Expire(SlotWatch& watch, std::chrono::steady_clock::time_point now) { return watch.ExpireAckDeadline(now); }
     static std::size_t Count(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.receipts_.size(); }
     static std::size_t Charged(const SlotWatch& watch) { return watch.table_bytes_->load(std::memory_order_acquire); }
-    static std::size_t Excess(const SlotWatch& watch) { return watch.excess_bytes_->load(std::memory_order_acquire); }
+    static std::size_t Excess(const SlotWatch& watch) { return watch.pool_->bytes.load(std::memory_order_acquire); }
     static constexpr std::size_t kReceipt = SlotWatch::kReceiptBytes;
-    static std::shared_ptr<const std::string> Prepared(const SlotWatch& watch) { return watch.prepared_ ? watch.prepared_->next.back().bytes : nullptr; }
+    static std::shared_ptr<const std::string> Prepared(const SlotWatch& watch) {
+        return watch.prepared_ && watch.prepared_->built ? watch.prepared_->next.back().bytes : nullptr;
+    }
     static void Hook(SlotWatch& watch, FeedDeliveryTestHook* hook) { watch.hook_.store(hook, std::memory_order_release); }
     static std::uint64_t Acked(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.acknowledged_; }
 };
@@ -56,7 +63,7 @@ struct AckDeadlineIoTestAccess {
         io.Pull(watch, 1024U);
         assert(!state->Take(std::numeric_limits<std::size_t>::max())); // The whole accepted batch was taken.
         assert(watch.output.size() >= 2U && watch.excess_frames == watch.output.size() - 1U);
-        assert(watch.excess_deadline > before); // The client I/O deadline started.
+        assert(watch.excess_progress >= before); // The no-progress clock started.
         // A partly written batch dropped with its connection releases the pool at once.
         io.Advance(watch, reply + 1U);
         assert(SlotAckDeadlineTestAccess::Excess(*state) == size - 1U);
@@ -1084,53 +1091,120 @@ void ExcessPoolReceipts(bool tls) {
     AckDeadlineIoTestAccess::ExcessQueue(harness.server(), queue, SlotAckDeadlineTestAccess::Excess(*queue), budget);
     queue->Cancel(); queue->WorkStep();
 }
+void CreateLargeTable(Client& writer, std::initializer_list<const char*> slots) {
+    writer.Ok("CREATE TABLE t (n u8, label bytes(1048576)) CHUNK 4 x 4");
+    writer.Ok("ALTER TABLE t SET var_max_chunk_bytes = 16777216");
+    for (const auto* slot : slots) writer.Ok("CREATE SLOT '" + std::string(slot) + "' ON t");
+}
+// One transaction of `blocks` 1 MiB values.
+std::uint64_t MebibyteTransaction(Client& writer, int blocks) {
+    const std::string payload(1024U * 1024U, 'x');
+    writer.Ok("BEGIN");
+    for (int x = 0; x < blocks; ++x) {
+        writer.Line("SET BLOCK " + std::to_string(x) + " 0 IN t label = $1");
+        writer.Send("$" + std::to_string(payload.size()) + "\r\n" + payload + "\r\n");
+        const auto reply = writer.Read();
+        if (reply.type == '-') throw std::runtime_error("large transaction write failed: " + reply.value);
+    }
+    return Number(writer.Command("COMMIT"));
+}
 void ExcessStalledHolder(bool tls) {
     struct Observer : FeedDeliveryTestHook {
         std::mutex mutex;
         std::condition_variable changed;
-        std::size_t largest = 0U;
+        std::string events; // A: a 5 MiB admission, C: a no-progress close.
         void Run(Point point, std::size_t bytes) override {
-            if (point != Point::kAfterAdmission) return;
-            std::lock_guard lock(mutex); largest = std::max(largest, bytes); changed.notify_all();
+            if (point != Point::kAfterWriteDeadlineClose && !(point == Point::kAfterAdmission && bytes >= 5U * 1024U * 1024U)) return;
+            std::lock_guard lock(mutex); events += point == Point::kAfterAdmission ? 'A' : 'C'; changed.notify_all();
         }
-        void WaitAdmission(std::size_t bytes) {
+        std::string Wait(std::size_t count) {
             std::unique_lock lock(mutex);
-            if (!changed.wait_for(lock, 10s, [&] { return largest >= bytes; }))
-                throw std::runtime_error("the holder did not admit the large change");
+            if (!changed.wait_for(lock, 30s, [&] { return events.size() >= count; }))
+                throw std::runtime_error("delivery events: " + events);
+            return events;
         }
     } observer; // Outlives all server observers.
-    constexpr std::size_t budget = 8U * 1024U * 1024U;
-    Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, budget, {}, 60000ms, 1500ms);
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, 8U * 1024U * 1024U, {}, 60000ms, 3000ms);
     FeedDeliveryTestAccess::SetObserverHook(harness.server(), &observer);
     Cleanup clear([&] { FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
-    auto writer = harness.Connect();
-    writer->Ok("CREATE TABLE t (n u8, label bytes(1048576)) CHUNK 4 x 4");
-    writer->Ok("ALTER TABLE t SET var_max_chunk_bytes = 16777216");
-    writer->Ok("CREATE SLOT 'holder' ON t"); writer->Ok("CREATE SLOT 'waiter' ON t");
+    auto writer = harness.Connect(); CreateLargeTable(*writer, {"holder", "waiter"});
     auto ordinary = OrdinaryWatches(harness, 2U);
     auto holder = harness.Connect(); holder->SetReceiveBuffer(4096);
     (void)Start(holder->Command("WATCH t SLOT 'holder'"));
     const auto first = Set(*writer, 1);
     for (const auto& client : ordinary) assert(Change(NextChange(*client)) == first);
     assert(Change(NextChange(*holder)) == first);
+    // Small socket buffers on both ends: no host buffer can take the whole frame.
+    FeedDeliveryTestAccess::LimitActiveSendBuffers(harness.server(), 4096);
     // The holder stops reading. Five 1 MiB blocks exceed every share but fit the budget.
-    const std::string payload(1024U * 1024U, 'x');
-    writer->Ok("BEGIN");
-    for (int x = 0; x < 5; ++x) {
-        writer->Line("SET BLOCK " + std::to_string(x) + " 0 IN t label = $1");
-        writer->Send("$" + std::to_string(payload.size()) + "\r\n" + payload + "\r\n");
-        const auto reply = writer->Read();
-        if (reply.type == '-') throw std::runtime_error("large transaction write failed: " + reply.value);
-    }
-    const auto large = Number(writer->Command("COMMIT"));
-    observer.WaitAdmission(5U * payload.size());
-    // The pool cannot also hold the waiter's copy until the holder misses its write deadline.
+    const auto large = MebibyteTransaction(*writer, 5);
+    assert(observer.Wait(1U) == "A");
+    // The pool cannot also hold the waiter's copy until the holder's write stalls for the timeout.
     auto waiter = harness.Connect(); (void)Start(waiter->Command("WATCH t SLOT 'waiter'"));
     assert(Change(NextChange(*waiter)) == first);
-    assert(Change(waiter->Read(20s), 5U) == large);
+    assert(Change(waiter->Read(30s), 5U) == large);
+    assert(observer.Wait(3U) == "ACA"); // Closed before the waiter was admitted, and only the holder.
     waiter->Line("ACK " + std::to_string(large)); Unwatch(*waiter);
     assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "holder"), "acked")) < large);
     for (const auto& client : ordinary) Unwatch(*client);
+}
+void ExcessSlowReader(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, 8U * 1024U * 1024U, {}, 60000ms, 1000ms);
+    auto writer = harness.Connect(); CreateLargeTable(*writer, {"consumer"});
+    auto ordinary = OrdinaryWatches(harness, 1U); // Halves the slot share.
+    auto watch = harness.Connect(); watch->SetReceiveBuffer(16384);
+    (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*writer, 1);
+    assert(Change(NextChange(*ordinary.front())) == first);
+    assert(Change(NextChange(*watch)) == first);
+    FeedDeliveryTestAccess::LimitActiveSendBuffers(harness.server(), 16384);
+    const auto large = MebibyteTransaction(*writer, 5);
+    // About 1.6 MB/s: the transfer takes several timeouts, but every write makes progress.
+    watch->ReadPaced(5U * 1024U * 1024U, 32U * 1024U, 20ms);
+    assert(Change(watch->Read(), 5U) == large);
+    watch->Line("ACK " + std::to_string(large)); Unwatch(*watch);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == large);
+    Unwatch(*ordinary.front());
+}
+void ExcessPoolFifo(bool tls) {
+    constexpr std::size_t budget = 4096U, share = 1024U;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer);
+    for (const auto* name : {"first", "second", "third"}) writer->Ok("CREATE SLOT '" + std::string(name) + "' ON t");
+    auto table = harness.catalog->Find("t");
+    const auto initial = table->ListFeedSlots().front().position;
+    const auto one = LabelTransaction(*writer, 20U), two = LabelTransaction(*writer, 20U, 1U);
+    FeedSlotTestAccess::Sync(*table);
+    auto archive = table->ReadFeedArchive(initial);
+    const auto one_entry = archive.Next(), two_entry = archive.Next();
+    assert(one_entry && one_entry->position.revision == one && two_entry && two_entry->position.revision == two);
+    const auto drain = [](SlotWatch& state) {
+        std::size_t bytes = 0U;
+        while (auto output = state.Take(std::numeric_limits<std::size_t>::max())) {
+            bytes += output->bytes->size(); state.Consumed(output->bytes->size());
+        }
+        return bytes;
+    };
+    auto first = SlotWatch::Create(table, "first", {});
+    auto second = SlotWatch::Create(table, "second", {});
+    auto third = SlotWatch::Create(table, "third", {});
+    for (const auto& state : {first, second, third}) state->SetQuota(share);
+    assert(SlotAckDeadlineTestAccess::Publish(*first, one_entry));
+    assert(SlotAckDeadlineTestAccess::Excess(*first) > budget / 2U);
+    // Waiters queue in arrival order; only the head keeps its built frame.
+    assert(!SlotAckDeadlineTestAccess::Publish(*second, one_entry) && SlotAckDeadlineTestAccess::Prepared(*second));
+    assert(!SlotAckDeadlineTestAccess::Publish(*third, one_entry) && !SlotAckDeadlineTestAccess::Prepared(*third));
+    // A watch with unsent output does not queue and keeps nothing built.
+    assert(!SlotAckDeadlineTestAccess::Publish(*first, two_entry) && !SlotAckDeadlineTestAccess::Prepared(*first));
+    assert(drain(*first) > budget / 2U && SlotAckDeadlineTestAccess::Excess(*first) == 0U);
+    // The free pool goes to the earlier waiters, not to the first watch's next large frame.
+    assert(!SlotAckDeadlineTestAccess::Publish(*first, two_entry));
+    assert(SlotAckDeadlineTestAccess::Publish(*second, one_entry)); (void)drain(*second);
+    assert(!SlotAckDeadlineTestAccess::Publish(*first, two_entry));
+    assert(SlotAckDeadlineTestAccess::Publish(*third, one_entry)); (void)drain(*third); // Rebuilt at its turn.
+    assert(SlotAckDeadlineTestAccess::Publish(*first, two_entry)); (void)drain(*first);
+    for (const auto& state : {first, second, third}) { state->Cancel(); state->WorkStep(); }
+    assert(SlotAckDeadlineTestAccess::Charged(*first) == 0U && SlotAckDeadlineTestAccess::Excess(*first) == 0U);
 }
 void LiveSchemaAcknowledgement(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
@@ -1726,7 +1800,8 @@ int main(int argc, char** argv) {
         if (shares_only || !selected.empty()) {
             run("share-independent-delivery", ShareIndependentDelivery); run("table-budget-terminates", TableBudgetStillTerminates);
             run("excess-pool-bound", ExcessPoolBound); run("excess-pool-receipts", ExcessPoolReceipts);
-            run("excess-stalled-holder", ExcessStalledHolder);
+            run("excess-stalled-holder", ExcessStalledHolder); run("excess-slow-reader", ExcessSlowReader);
+            run("excess-pool-FIFO", ExcessPoolFifo);
         }
         if (shares_only) {
             std::cout << (tls ? "TLS" : "plain") << ": " << passed << "/" << executed << " feed share groups passed\n";

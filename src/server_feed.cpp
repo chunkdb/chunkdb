@@ -188,10 +188,10 @@ void FeedIo::CatchUp() {
 void FeedIo::Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision, bool charged, bool excess) {
     watch.output.push_back({std::move(bytes), revision, charged, excess});
     watch.bytes += watch.output.back().bytes->size();
-    // Like a reply, a frame held in the shared excess pool must be written
-    // within the client I/O deadline, so a reader that stops cannot hold it.
-    if (excess && watch.excess_frames++ == 0U)
-        watch.excess_deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
+    // While this queue holds frames from the shared excess pool, it must make
+    // write progress at least once per client I/O timeout, so a reader that
+    // stops cannot hold the pool. Earlier charged output was already sent.
+    if (excess && watch.excess_frames++ == 0U) watch.excess_progress = std::chrono::steady_clock::now();
 }
 void FeedIo::ReleaseOutput(Watch& watch) {
     // A dropped queue is never written; release its slot charges now.
@@ -371,7 +371,8 @@ void FeedIo::Write(Watch& watch) {
     if (!watch.connection->tls) { WritePlain(watch); return; }
     for (std::size_t i = 0; i < 64U && !watch.output.empty(); ++i) {
         const auto& bytes = *watch.output.front().bytes;
-        if (watch.write_size == 0) watch.write_size = static_cast<int>(std::min<std::size_t>(bytes.size() - watch.offset, INT_MAX));
+        // One TLS record per call: every completed call is write progress.
+        if (watch.write_size == 0) watch.write_size = static_cast<int>(std::min<std::size_t>(bytes.size() - watch.offset, 16384U));
         ERR_clear_error();
         const auto result = SSL_write(watch.connection->tls, bytes.data() + watch.offset, watch.write_size);
         if (result <= 0) {
@@ -395,6 +396,7 @@ void FeedIo::Write(Watch& watch) {
 }
 void FeedIo::Advance(Watch& watch, std::size_t bytes) {
     watch.bytes -= bytes;
+    if (watch.excess_frames != 0U) watch.excess_progress = std::chrono::steady_clock::now();
     while (bytes != 0U) {
         const auto take = std::min(bytes, watch.output.front().bytes->size() - watch.offset);
         if (watch.output.front().charged && watch.connection->session.slot_watch) {
@@ -513,11 +515,12 @@ void FeedIo::Run() {
                     const bool takeover_wait = slot && slot->TakingOver() && !slot->Finished();
                     if (!watch.dead && !takeover_wait && (!watch.connection->tls || watch.read_wait != POLLOUT)) Write(watch);
                     if (watch.close_immediate) watch.dead = true;
-                    if (!watch.dead && watch.excess_frames != 0U && std::chrono::steady_clock::now() >= watch.excess_deadline) {
-                        LogMessage(LogLevel::kWarn, LogComponent::kServer, "slot watch write deadline exceeded",
+                    if (!watch.dead && watch.excess_frames != 0U && std::chrono::steady_clock::now() >= watch.excess_progress +
+                            std::chrono::milliseconds(server_.config_.client_io_timeout_ms)) {
+                        LogMessage(LogLevel::kWarn, LogComponent::kServer, "slot watch made no write progress",
                             {{"unsent_bytes", std::to_string(watch.bytes)},
                              {"timeout_ms", std::to_string(server_.config_.client_io_timeout_ms)}});
-                        watch.dead = true;
+                        watch.dead = true; watch.deadline_closed = true;
                     }
                     if (watch.read_paused && watch.bytes <= std::max<std::size_t>(watch.share, 128U) - 128U)
                         watch.read_paused = false;
@@ -540,6 +543,9 @@ void FeedIo::Run() {
                     if (ack_timeout_closed)
                         if (auto* hook = hook_.load(std::memory_order_acquire))
                             hook->Run(FeedDeliveryTestHook::Point::kAfterAckTimeoutClose, 0U);
+                    if (watch.deadline_closed)
+                        if (auto* hook = hook_.load(std::memory_order_acquire))
+                            hook->Run(FeedDeliveryTestHook::Point::kAfterWriteDeadlineClose, 0U);
                     watch.connection.reset();
                 }
             }
@@ -566,7 +572,7 @@ void FeedIo::Run() {
                     if (progress_timeout < 0 || timeout < progress_timeout) progress_timeout = timeout;
                 };
                 if (!watch.connection->session.slot_watch && !watch.unwatch && !watch.close && !watch.dead) wait_until(watch.next_progress);
-                if (watch.excess_frames != 0U && !watch.dead) wait_until(watch.excess_deadline);
+                if (watch.excess_frames != 0U && !watch.dead) wait_until(watch.excess_progress + std::chrono::milliseconds(server_.config_.client_io_timeout_ms));
 #ifdef CHUNKDB_WITH_OPENSSL
                 if (watch.write_size == 0 && !watch.unwatch && !watch.close && !watch.read_paused && watch.connection->tls &&
                     SSL_pending(watch.connection->tls) > 0) buffered_tls = true;

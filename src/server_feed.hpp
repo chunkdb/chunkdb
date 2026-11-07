@@ -44,9 +44,11 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
         bool close_immediate = false;
         std::size_t share = 0U, buffer_bytes = 0U;
         std::chrono::steady_clock::time_point next_progress{};
-        // Queued frames charged to the slot excess pool, and when they must be written.
+        // Queued frames charged to the slot excess pool, and when this queue
+        // last made write progress while holding them.
         std::size_t excess_frames = 0U;
-        std::chrono::steady_clock::time_point excess_deadline{};
+        std::chrono::steady_clock::time_point excess_progress{};
+        bool deadline_closed = false;
     };
     void Run();
     void WakeCatchUp() noexcept;

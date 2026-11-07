@@ -153,9 +153,10 @@ Store the applied position atomically with your own output to prevent duplicate 
 
 Defaults are 64 watches, 67108864 live feed bytes per table, and 1073741824 retained bytes per slot.
 Each watch queues output within its share, the table's `feed_buffer_bytes` divided among the table's watches.
-A slot change larger than its share waits until the watch has sent its earlier output, then is queued from a separate table pool of `feed_buffer_bytes`.
-While other such changes hold that pool it waits, and the watch sends no progress events.
-A change queued from the pool must be written within `--client-io-timeout-ms`, or the server closes that connection and frees its part of the pool.
+A slot change larger than its share waits until the watch has sent its earlier output, then takes its turn, in arrival order, for a separate table pool of `feed_buffer_bytes`.
+While it waits, the watch sends no progress events.
+The server closes a connection when no byte of such a change is written for `--client-io-timeout-ms`, which frees the pool.
+It reads no ACK until less than the watch's share of that change is unsent, so set ACK TIMEOUT above the time your connection needs to receive `feed_buffer_bytes`.
 Ordinary history lingers for 30000 ms after the last watch; slots keep history active independently.
 See [Change feed](../CHANGE_FEED.md) and [Resume a consumer](../FEED_RESUME.md) for overflow and recovery.
 
