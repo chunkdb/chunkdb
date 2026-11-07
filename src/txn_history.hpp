@@ -78,6 +78,11 @@ class TxnHistory {
     // Moves `state` into a reservation made with an empty one. Never
     // allocates.
     static void Fill(Reservation& reservation, ChunkState&& state) noexcept;
+    // Moves the payload and presence a whole-chunk write replaced into a
+    // reservation made without them (ChunkStore::PrepareTxnKeepLocked).
+    // Never allocates.
+    static void FillPayload(
+        Reservation& reservation, std::vector<std::uint8_t>&& payload, std::vector<std::uint8_t>&& presence) noexcept;
     // Keeps the reserved state when a registered snapshot needs it, under the
     // keep rule above; past the byte limit unregisters the oldest snapshots
     // until it fits. Never allocates and never fails; a state not kept stays

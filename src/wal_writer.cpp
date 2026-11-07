@@ -128,6 +128,38 @@ WalFrameBuilder::WalFrameBuilder(
     records_begin_ = batch_->size();
 }
 
+void WalFrameBuilder::Reserve(std::size_t record_bytes) {
+    if (finished_) {
+        throw std::logic_error("WAL frame already finished");
+    }
+    // The records would be refused once appended; nothing is reserved for them.
+    const auto held = batch_->size() - header_index_;
+    if (held > kMaxWalFrameBytes - kWalFrameTrailerSize ||
+        record_bytes > kMaxWalFrameBytes - kWalFrameTrailerSize - held)
+        throw std::invalid_argument("WAL frame exceeds its byte limit");
+    batch_->reserve(batch_->size() + record_bytes + kWalFrameTrailerSize);
+}
+
+std::size_t WalFrameBuilder::SpanRecordBytes(std::size_t size) noexcept {
+    return kWalRecordHeaderSize + kWalSpanOffsetSize + size;
+}
+
+std::size_t WalFrameBuilder::ChunkColumnsRecordBytes(const ChunkColumnState& state) noexcept {
+    return kWalRecordHeaderSize + state.bytes.size();
+}
+
+std::size_t WalFrameBuilder::VarUpdateRecordBytes(const ChunkVars& vars, const VarUndo& undo) {
+    if (undo.replaced) {
+        return kWalRecordHeaderSize + vars.encoded_size();
+    }
+    std::size_t bytes = 0;
+    for (const auto key : undo.keys) {
+        const auto value = vars.Find(key);
+        bytes += kWalRecordHeaderSize + (value.has_value() ? kVarEntryHeaderBytes + value->size() : 8U);
+    }
+    return bytes;
+}
+
 void WalFrameBuilder::AppendSpan(
     std::uint32_t byte_offset,
     const std::uint8_t* bytes,
@@ -211,11 +243,7 @@ void WalFrameBuilder::AppendVarUpdate(const ChunkVars& vars, const VarUndo& undo
     }
     // One reservation for all records, so a large update does not copy the
     // batch once per record.
-    std::size_t bytes = 0;
-    for (const auto key : undo.keys) {
-        const auto value = vars.Find(key);
-        bytes += kWalRecordHeaderSize + (value.has_value() ? kVarEntryHeaderBytes + value->size() : 8U);
-    }
+    const std::size_t bytes = VarUpdateRecordBytes(vars, undo);
     const auto held = batch_->size() - header_index_;
     if (held > kMaxWalFrameBytes - kWalFrameTrailerSize ||
         bytes > kMaxWalFrameBytes - kWalFrameTrailerSize - held)

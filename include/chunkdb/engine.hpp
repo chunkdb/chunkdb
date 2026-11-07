@@ -408,6 +408,9 @@ class CommandEngine {
     // Adds chunks to the transaction's read set, or throws past its limit
     // leaving it as it was.
     static void TxnRead(SessionTransaction& txn, std::span<const ChunkCoord> coords);
+    // Throws as TxnWrite would for a change that leaves the chunk's private
+    // copy at `after` bytes, before that change is built or the chunk read.
+    void RequireTxnRoom(const SessionTransaction& txn, const ChunkCoord& coord, std::size_t after);
     // Applies `change` to the transaction's private copy of the chunk, made
     // from the snapshot when it has none. The copy is unchanged when
     // `change` or a limit throws.

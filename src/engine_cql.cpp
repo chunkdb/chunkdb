@@ -495,6 +495,22 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
         (state.chunk_columns ? state.chunk_columns->bytes.size() : 0U);
 }
 
+// The fewest StateBytes of the state `form` decodes to: the chunk's payload
+// and presence, and for a full form its values and metadata row as well. A
+// projected form's values merge with the chunk's, so they are not counted.
+[[nodiscard]] std::size_t DecodedStateBytesAtLeast(
+    const Geometry& geometry, const ChunkFormSections& form, bool projected) {
+    std::size_t bytes = geometry.ChunkPayloadBytes() + ChunkPresenceBitmapBytes(geometry);
+    if (projected) return bytes;
+    for (const auto& section : form.sections) {
+        if (section.kind == static_cast<std::uint16_t>(ChunkFormSectionKind::kVariableValues) ||
+            (section.kind == static_cast<std::uint16_t>(ChunkFormSectionKind::kChunkColumns) &&
+                !geometry.chunk_schema().columns.empty()))
+            bytes += section.body.size();
+    }
+    return bytes;
+}
+
 }  // namespace
 
 const User* CommandEngine::CurrentUser(SessionState& session) const {
@@ -1357,8 +1373,8 @@ std::string CommandEngine::ExecuteStatement(
                     const auto columns = ColumnsOf(geometry.layout(), set.columns);
                     const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(frame->data()), frame->size());
                     const auto limit = ChunkFormBytes(geometry, !columns.empty());
-                    const auto header = ParseChunkFormSections(bytes, limit, ChunkFormReadMode::kMutation).header;
-                    const std::uint64_t encoded_for = header.schema_version;
+                    const auto form = ParseChunkFormSections(bytes, limit, ChunkFormReadMode::kMutation);
+                    const std::uint64_t encoded_for = form.header.schema_version;
                     const std::uint64_t current = geometry.layout().schema().version;
                     if (encoded_for != current) {
                         return Protocol::Error(
@@ -1367,18 +1383,24 @@ std::string CommandEngine::ExecuteStatement(
                                 "; use DESCRIBE " + set.table + " and encode the chunk again with the current columns",
                             {{"current", std::to_string(current)}, {"actual", std::to_string(encoded_for)}, {"table", set.table}});
                     }
-                    const auto next = DecodeSectionedChunkState(geometry, bytes, kVarMaxChunkBytesLimit, columns, limit);
+                    if (session.transaction != nullptr) {
+                        // The transaction's limits are checked by the fewest
+                        // bytes the decoded state takes, before the form is
+                        // decoded or the chunk is read.
+                        RequireTxnRoom(*session.transaction, coord, DecodedStateBytesAtLeast(geometry, form, !columns.empty()));
+                    }
+                    auto next = DecodeSectionedChunkState(geometry, bytes, kVarMaxChunkBytesLimit, columns, limit);
                     if (!columns.empty()) return change([&](ChunkState& state) {
                         if (!state.written && geometry.chunk_columns_require_initialization())
                             throw std::invalid_argument("a first write must supply the REQUIRED chunk columns");
                         state = MergeProjectedChunkState(geometry, state, next, columns, store.var_max_chunk_bytes());
                     });
                     if (session.transaction == nullptr)
-                        return VersionReply(store.WriteChunkState(coord, next, set.if_version, set.if_absent));
+                        return VersionReply(store.WriteChunkState(coord, std::move(next), set.if_version, set.if_absent));
                     return change([&](ChunkState& state) {
                         const auto version = state.version;
                         const auto time = state.commit_time_ms;
-                        state = next;
+                        state = std::move(next);
                         state.version = version;
                         state.commit_time_ms = time;
                     });
@@ -1979,6 +2001,51 @@ void CommandEngine::TxnRead(SessionTransaction& txn, std::span<const ChunkCoord>
     txn.read_set.insert(coords.begin(), coords.end());
 }
 
+namespace {
+
+[[nodiscard]] std::invalid_argument TxnWrittenChunksError() {
+    return std::invalid_argument("a transaction writes at most " + std::to_string(kMaxTxnWrittenChunks) + " chunks");
+}
+
+[[nodiscard]] std::invalid_argument TxnMaxBytesError(std::size_t bytes, std::size_t limit) {
+    return std::invalid_argument(
+        "the transaction's changes would take " + std::to_string(bytes) + " bytes, more than --txn-max-bytes (" +
+        std::to_string(limit) + ")");
+}
+
+[[nodiscard]] std::invalid_argument TxnTotalBytesError(std::size_t limit) {
+    return std::invalid_argument(
+        "open transactions hold more than --txn-total-bytes (" + std::to_string(limit) +
+        ") of changes; try again later");
+}
+
+}  // namespace
+
+void CommandEngine::RequireTxnRoom(
+    const SessionTransaction& txn,
+    const ChunkCoord& coord,
+    std::size_t after) {
+    const auto own = txn.writes.find(coord);
+    if (own == txn.writes.end() && txn.writes.size() >= kMaxTxnWrittenChunks) {
+        throw TxnWrittenChunksError();
+    }
+    const std::size_t before = own == txn.writes.end() ? 0U : StateBytes(own->second);
+    if (txn.bytes - before + after > config_.txn_max_bytes) {
+        throw TxnMaxBytesError(txn.bytes - before + after, config_.txn_max_bytes);
+    }
+    // TxnWrite reserves the growth; this only refuses one that cannot fit
+    // now, after ending expired transactions as TxnWrite does.
+    if (after > before) {
+        const auto fits = [&] { return txn_budget_.bytes.load() + (after - before) <= config_.txn_total_bytes; };
+        if (!fits()) {
+            EndExpiredTransactions();
+            if (!fits()) {
+                throw TxnTotalBytesError(config_.txn_total_bytes);
+            }
+        }
+    }
+}
+
 void CommandEngine::TxnWrite(
     SessionTransaction& txn,
     ChunkStore& store,
@@ -1988,8 +2055,7 @@ void CommandEngine::TxnWrite(
     const bool created = own == txn.writes.end();
     if (created) {
         if (txn.writes.size() >= kMaxTxnWrittenChunks) {
-            throw std::invalid_argument(
-                "a transaction writes at most " + std::to_string(kMaxTxnWrittenChunks) + " chunks");
+            throw TxnWrittenChunksError();
         }
         own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord)).first;
     }
@@ -2014,9 +2080,7 @@ void CommandEngine::TxnWrite(
             ChunkPopulated(store.geometry(), state.presence_bitmap, state.chunk_columns.get());
         const std::size_t after = StateBytes(state);
         if (txn.bytes - before + after > config_.txn_max_bytes) {
-            throw std::invalid_argument(
-                "the transaction's changes would take " + std::to_string(txn.bytes - before + after) +
-                " bytes, more than --txn-max-bytes (" + std::to_string(config_.txn_max_bytes) + ")");
+            throw TxnMaxBytesError(txn.bytes - before + after, config_.txn_max_bytes);
         }
         if (after > before) {
             const std::size_t grown = after - before;
@@ -2034,9 +2098,7 @@ void CommandEngine::TxnWrite(
                     hook->Run(CommandEngineTestHook::Point::kBeforeTxnBudgetReclaim, txn.table);
                 EndExpiredTransactions();
                 if (!charge()) {
-                    throw std::invalid_argument(
-                        "open transactions hold more than --txn-total-bytes (" +
-                        std::to_string(config_.txn_total_bytes) + ") of changes; try again later");
+                    throw TxnTotalBytesError(config_.txn_total_bytes);
                 }
             }
         } else {

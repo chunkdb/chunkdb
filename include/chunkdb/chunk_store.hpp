@@ -1652,7 +1652,9 @@ class ChunkStore {
         const std::vector<std::uint8_t>& presence,
         const ChunkVars* vars = nullptr) const;
     // `keep`, when it holds a state, is published to the transaction
-    // history once the commit point passed.
+    // history once the commit point passed. A whole-chunk write passes the
+    // payload and presence it replaced: at the commit point they move into
+    // `keep`, or are freed, before the inline checkpoint.
     void FinishOrdinaryMutationLocked(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
@@ -1660,15 +1662,20 @@ class ChunkStore {
         std::uint64_t reserved_version,
         std::uint64_t commit_time_ms,
         TxnKeep* keep,
-        std::optional<std::size_t> next_present_blocks = {});
+        std::optional<std::size_t> next_present_blocks = {},
+        std::vector<std::uint8_t>* replaced_payload = nullptr,
+        std::vector<std::uint8_t>* replaced_presence = nullptr);
     // Called by a write under its chunk's exclusive lock after it took
     // `version` and before it changes the chunk: while a transaction is open,
     // a copy of the chunk's state to keep, tagged `version`; otherwise empty
-    // (one atomic load).
+    // (one atomic load). A whole-chunk write (`whole_chunk`) keeps the
+    // payload and presence it replaces without a copy: they are moved in
+    // with TxnHistory::FillPayload once the write is committed.
     [[nodiscard]] TxnKeep PrepareTxnKeepLocked(
         const ChunkCoord& chunk_coord,
         RegularChunk& chunk,
-        std::uint64_t version, bool supplies_chunk_columns = false);
+        std::uint64_t version, bool supplies_chunk_columns = false,
+        bool whole_chunk = false);
     // Resolves the transaction intents a crash left (writer open).
     void RecoverTransactionIntents(bool validate_only = false);
     // Throws std::invalid_argument unless `snapshot` is of this store.

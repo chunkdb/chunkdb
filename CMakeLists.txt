@@ -528,6 +528,12 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_txn_engine_test PRIVATE chunkdb_core)
     add_test(NAME txn_engine COMMAND chunkdb_txn_engine_test)
 
+    add_executable(chunkdb_chunk_write_memory_test tests/chunk_write_memory_tests.cpp)
+    target_link_libraries(chunkdb_chunk_write_memory_test PRIVATE chunkdb_core)
+    add_test(NAME chunk_write_memory COMMAND chunkdb_chunk_write_memory_test)
+    # 77: skipped where the counting allocator cannot see every allocation.
+    set_tests_properties(chunk_write_memory PROPERTIES SKIP_RETURN_CODE 77)
+
     add_executable(chunkdb_typed_columns_test tests/typed_columns_tests.cpp)
     target_link_libraries(chunkdb_typed_columns_test PRIVATE chunkdb_core)
     add_test(NAME typed_columns COMMAND chunkdb_typed_columns_test)
@@ -938,6 +944,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_migrations_records_test
         chunkdb_feature_activation_records_test
         chunkdb_txn_engine_test
+        chunkdb_chunk_write_memory_test
         chunkdb_crypto_test
         chunkdb_scram_test
         chunkdb_users_file_test
@@ -1076,6 +1083,7 @@ if(CHUNKDB_BUILD_TESTS)
         expr
         cql_engine
         txn_engine
+        chunk_write_memory
         crypto
         scram
         users_file
