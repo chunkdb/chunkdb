@@ -147,7 +147,8 @@ class SlotWatch {
     };
     void Build(Prepared& prepared) const;
     enum class Admission { kAdmitted, kWait, kBuild };
-    Admission Admit(Prepared& prepared);
+    // Sets left_head when this watch gave up the head of the pool queue.
+    Admission Admit(Prepared& prepared, bool& left_head);
     // True when this watch was at the head of the pool queue.
     bool LeaveExcessQueue() noexcept;
     const std::shared_ptr<Table> table_;

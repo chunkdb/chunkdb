@@ -255,30 +255,45 @@ void SlotWatch::Build(Prepared& prepared) const {
     if (options_.ack_timeout_ms && data) prepared.receipt.push_back({entry->position.revision, {}});
     prepared.receipt_bytes = prepared.receipt.size() * kReceiptBytes;
 }
-SlotWatch::Admission SlotWatch::Admit(Prepared& prepared) {
+SlotWatch::Admission SlotWatch::Admit(Prepared& prepared, bool& left_head) {
     std::lock_guard lock(mutex_);
     if (cancelled_ || unwatch_ || ack_expired_ || takeover_) return Admission::kWait;
     const auto size = prepared.size, receipt_bytes = prepared.receipt_bytes;
     const auto table_budget = budget();
     if (receipt_bytes > table_budget || size > table_budget - receipt_bytes)
         throw std::length_error("slot change exceeds the table feed buffer");
-    // Unacknowledged receipts stay within the share; the first one always fits.
-    const auto held = receipts_.size() * kReceiptBytes;
-    if (held != 0U && (held > quota_ || receipt_bytes > quota_ - held)) return Admission::kWait;
+    // A watch waiting for anything but its pool turn gives up its place in
+    // the queue, and joins at the back when it needs the pool again.
     const auto charge = size + receipt_bytes;
     const bool excess = charge > quota_;
+    const bool data = prepared.kind == FeedEntry::Kind::kChange || prepared.kind == FeedEntry::Kind::kChunks;
+    const auto wait_elsewhere = [&] {
+        if (LeaveExcessQueue()) left_head = true;
+        if (excess && data) prepared.Drop(); // Only the head keeps a change above the share built.
+        return Admission::kWait;
+    };
+    // Unacknowledged receipts stay within the share; the first one always fits.
+    const auto held = receipts_.size() * kReceiptBytes;
+    if (held != 0U && (held > quota_ || receipt_bytes > quota_ - held)) return wait_elsewhere();
     if (!excess) {
-        if (held > quota_ - charge || unsent_ > quota_ - charge - held) return Admission::kWait;
+        if (held > quota_ - charge || unsent_ > quota_ - charge - held) return wait_elsewhere();
         if (!prepared.built) return Admission::kBuild;
-        if (!Charge(*table_bytes_, charge, table_budget)) return Admission::kWait;
+        if (!Charge(*table_bytes_, charge, table_budget)) return wait_elsewhere();
+    } else if (!data) {
+        // Progress, resync and schema frames are a few bytes and are rebuilt
+        // for each attempt, so they never queue: they use the pool whenever
+        // this watch has no unsent output and the pool has room.
+        if (unsent_ != 0U || !Charge(pool_->bytes, size, table_budget)) return Admission::kWait;
+        excess_ = size;
+        for (auto& output : prepared.next) output.excess = true;
     } else {
-        // A frame larger than the share waits until this watch has no unsent
-        // output, then for its turn in the table's pool queue. Only the head
-        // keeps its built form, so the waiting frames held outside the
-        // counters are at most one per table.
+        // A change larger than the share waits until this watch has no
+        // unsent output, then for its turn in the table's pool queue. Only
+        // the head keeps its built form, so the waiting changes held outside
+        // the counters are at most one per table.
+        if (unsent_ != 0U) { prepared.Drop(); return Admission::kWait; }
         std::lock_guard pool_lock(pool_->mutex);
         auto& waiters = pool_->waiters;
-        if (unsent_ != 0U) { prepared.Drop(); return Admission::kWait; }
         if (!queued_) { waiters.push_back(this); queued_ = true; }
         if (waiters.front() != this) { prepared.Drop(); return Admission::kWait; }
         if (size > table_budget - std::min(table_budget, pool_->bytes.load(std::memory_order_acquire))) return Admission::kWait;
@@ -308,7 +323,9 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
     }
     if (!prepared_->send) { prepared_.reset(); return true; }
     for (;;) {
-        const auto admission = Admit(*prepared_);
+        bool left_head = false;
+        const auto admission = Admit(*prepared_, left_head);
+        if (left_head && options_.notify) options_.notify(); // The next waiter may proceed.
         if (admission == Admission::kAdmitted) break;
         if (admission == Admission::kWait) return false;
         Build(*prepared_);

@@ -193,10 +193,10 @@ void FeedIo::Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::
     // stops cannot hold the pool. Earlier charged output was already sent.
     if (excess && watch.excess_frames++ == 0U) watch.excess_progress = std::chrono::steady_clock::now();
 }
-void FeedIo::ReleaseOutput(Watch& watch) {
+void FeedIo::ReleaseOutput(Watch& watch, const std::shared_ptr<SlotWatch>& slot) {
     // A dropped queue is never written; release its slot charges now.
     bool released = false;
-    if (const auto& slot = watch.connection->session.slot_watch) {
+    if (slot) {
         auto offset = watch.offset;
         for (const auto& output : watch.output) {
             if (output.charged && output.bytes->size() > offset) { slot->Consumed(output.bytes->size() - offset); released = true; }
@@ -219,7 +219,7 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
             // buffered mutations drain. Never inject an error inside a partial
             // RESP frame or replace SSL_write's pinned retry buffer.
             if (watch.offset != 0U || watch.write_size != 0) { watch.dead = true; return; }
-            ReleaseOutput(watch);
+            ReleaseOutput(watch, slot);
             if (slot->TakingOver()) {
                 Queue(watch, std::make_shared<const std::string>(Protocol::Error("KILLED", "slot ownership was taken over",
                     {{"reason", "slot_takeover"}})), {}, false);
@@ -539,13 +539,18 @@ void FeedIo::Run() {
                     // may already be moving its session.
                     const bool ack_timeout_closed = !returned && watch.connection->session.slot_watch &&
                         watch.connection->session.slot_watch->AckTimedOut();
-                    if (!returned) { ReleaseOutput(watch); server_.CloseClient(*watch.connection); }
+                    if (!returned) {
+                        // The socket closes before its unwritten charges are released.
+                        const auto slot = watch.connection->session.slot_watch;
+                        server_.CloseClient(*watch.connection);
+                        if (watch.deadline_closed)
+                            if (auto* hook = hook_.load(std::memory_order_acquire))
+                                hook->Run(FeedDeliveryTestHook::Point::kAfterWriteDeadlineClose, 0U);
+                        ReleaseOutput(watch, slot);
+                    }
                     if (ack_timeout_closed)
                         if (auto* hook = hook_.load(std::memory_order_acquire))
                             hook->Run(FeedDeliveryTestHook::Point::kAfterAckTimeoutClose, 0U);
-                    if (watch.deadline_closed)
-                        if (auto* hook = hook_.load(std::memory_order_acquire))
-                            hook->Run(FeedDeliveryTestHook::Point::kAfterWriteDeadlineClose, 0U);
                     watch.connection.reset();
                 }
             }

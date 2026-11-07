@@ -60,7 +60,7 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     void WritePlain(Watch& watch);
     void Advance(Watch& watch, std::size_t bytes);
     void Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision = {}, bool charged = false, bool excess = false);
-    void ReleaseOutput(Watch& watch);
+    void ReleaseOutput(Watch& watch, const std::shared_ptr<SlotWatch>& slot);
     void Reject(Watch& watch, std::string message);
     ChunkServer& server_;
     server_detail::SocketHandle wake_read_ = server_detail::kInvalidSocket;
