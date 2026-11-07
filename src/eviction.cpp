@@ -569,7 +569,7 @@ void ChunkStore::RequestEviction() {
         return;
     }
 
-    // Backpressure: while the maintenance thread catches up, the cache may
+    // Backpressure: while background maintenance catches up, the cache may
     // exceed the configured bound by at most one hysteresis band. Beyond
     // that, the loading thread evicts inline to preserve the hard bound.
     const std::size_t max_loaded_chunks = resources_->max_loaded_chunks_;

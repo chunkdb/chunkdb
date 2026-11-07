@@ -10,6 +10,7 @@
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <memory>
 #include <iostream>
 #include <string>
 #include <thread>
@@ -22,6 +23,7 @@
 #include "chunk_store_internal.hpp"
 #include "test_utils.hpp"
 #include "catalog_test_utils.hpp"
+#include "maintenance_pool.hpp"
 
 namespace {
 
@@ -905,6 +907,61 @@ void TestParallelBarrierFailureStillFlushesOtherTables() {
     assert(barriers() == 3U);
 }
 
+// Holds the single maintenance worker after the next turn it ends.
+std::atomic<bool> turn_end_pause_armed{false};
+std::promise<void> turn_end_paused;
+std::shared_future<void> turn_end_released;
+
+void PauseAfterTurnEnd() {
+    if (!turn_end_pause_armed.exchange(false)) return;
+    turn_end_paused.set_value();
+    turn_end_released.wait();
+}
+
+// A table dropped during FLUSH WAL belongs to its last owner once the barrier
+// returns: the worker that ran its barrier keeps no reference to it, and the
+// catalog can then close while that worker is still busy.
+void TestWalBarrierLeavesNoDroppedTableOnWorker() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-barrier-drop-close");
+    auto config = Config(dir.path());
+    config.maintenance_workers = 1U;
+    config.background_maintenance = true;
+    auto catalog = std::make_unique<TableCatalog>(config);
+    catalog->Create("alpha", kDefaultGeometry, {});
+    auto beta = catalog->Create("beta", kDefaultGeometry, {});
+    WriteBits(*catalog, "alpha", 0, 0, "1111");
+    WriteBits(*catalog, "beta", 0, 0, "1001");
+    const std::weak_ptr<chunkdb::Table> dropped = beta;
+    chunkdb::ChunkStore* store = nullptr;
+    {
+        auto lease = beta->Acquire();
+        store = &lease->store();
+        store->ArmBarrierBeforeDrainPauseForTests();
+    }
+    std::promise<void> release;
+    turn_end_paused = std::promise<void>();
+    turn_end_released = release.get_future().share();
+    chunkdb::MaintenancePool::SetTurnEndHookForTests(&PauseAfterTurnEnd);
+    // One worker runs alpha's barrier and then beta's, which pauses.
+    auto flush = std::async(std::launch::async, [&] { catalog->WalBarrier(); });
+    assert(store->WaitForBarrierBeforeDrainForTests());
+    turn_end_pause_armed = true;
+    auto drop = std::async(std::launch::async, [&] { catalog->Drop("beta"); });
+    store->ResumeBarrierBeforeDrainForTests();
+    assert(turn_end_paused.get_future().wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    assert(flush.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    flush.get();
+    assert(drop.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    drop.get();
+    beta.reset();
+    assert(dropped.expired());
+    auto close = std::async(std::launch::async, [&] { catalog.reset(); });
+    release.set_value();
+    assert(close.wait_for(std::chrono::seconds(5)) == std::future_status::ready);
+    close.get();
+    chunkdb::MaintenancePool::SetTurnEndHookForTests(nullptr);
+}
+
 // TABLESET and a failed TABLEDROP replace the table's store. Acknowledged
 // writes still in a group-commit batch are flushed first (a failure fails
 // TABLESET and leaves the table as it was), and what the old store wrote
@@ -1120,6 +1177,7 @@ int main(int argc, char** argv) {
     TestWalBarrierCoversAllTables();
     TestWalBarriersRunInParallelAndReleaseFinishedLeases();
     TestParallelBarrierFailureStillFlushesOtherTables();
+    TestWalBarrierLeavesNoDroppedTableOnWorker();
     TestReopenKeepsAcknowledgedWrites();
     TestSetOptionsRefusesFailClosedTable();
     TestRecreatedTableNeverReusesVersionTokens();

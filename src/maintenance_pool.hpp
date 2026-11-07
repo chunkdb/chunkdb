@@ -27,6 +27,7 @@ class MaintenanceTask {
 
 // A callback completes one bounded turn and returns whether work remains.
 // Callers close their own admission before Wait and retain callback owners.
+// A worker drops its task reference before waiters can see the turn end.
 class MaintenancePool {
   public:
     explicit MaintenancePool(std::size_t workers);
@@ -37,6 +38,10 @@ class MaintenancePool {
     [[nodiscard]] std::shared_ptr<MaintenanceTask> MakeTask(std::function<bool()> step);
     [[nodiscard]] bool Notify(const std::shared_ptr<MaintenanceTask>& task);
     [[nodiscard]] std::exception_ptr Wait(const std::shared_ptr<MaintenanceTask>& task);
+#ifdef CHUNKDB_FAILPOINTS
+    // Runs on a worker after waiters can see the end of a turn.
+    static void SetTurnEndHookForTests(void (*hook)()) noexcept;
+#endif
 
   private:
     void Enqueue(const std::shared_ptr<MaintenanceTask>& task);

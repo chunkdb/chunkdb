@@ -27,7 +27,9 @@ Pool destruction drains accepted jobs and joins its workers.
 
 `FLUSH WAL` snapshots the catalog and acquires each table lease before submitting its barrier.
 A worker never waits to acquire a table lease, which avoids occupying the pool behind a schema operation that is itself draining maintenance.
-Each submitted barrier owns its lease and table until its WAL barrier finishes.
+Each submitted barrier owns only its table lease and releases it within its turn.
+The caller keeps its catalog snapshot until every submitted barrier ends, so a table dropped meanwhile is destroyed by the caller or the drop, never on a worker.
+A worker releases its reference to a job before waiters can see the end of the turn.
 All submitted tables are awaited, including when one barrier fails.
 The first failure in catalog order is returned after the other submitted barriers finish.
 The per-store barrier and directory-sync rules remain unchanged.
@@ -35,7 +37,8 @@ The per-store barrier and directory-sync rules remain unchanged.
 ## Validation
 
 Deterministic scheduler gates cover FIFO fairness, worker concurrency, coalesced notification, drain and shutdown.
-Catalog tests cover simultaneous table barriers, failure propagation and dropping or reopening a table while a barrier holds its lease.
+Catalog tests cover simultaneous table barriers, failure propagation, and dropping or reopening a table while a barrier holds its lease.
+A catalog test with one worker drops a table during its barrier and closes the catalog while that worker is still between turns.
 Existing checkpoint, eviction, backup, migration, feature-activation and crash suites cover the store lifecycle boundaries.
 Measurements use 1, 100 and 1,000 tables and record process threads, memory, barrier latency and write throughput on the benchmark server.
 The hot-path budget window is required before this change is ready for review.

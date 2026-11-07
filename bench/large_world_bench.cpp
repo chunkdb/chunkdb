@@ -35,7 +35,7 @@
 // than a cold one (issue #26).
 //
 // A third scenario (`--scenario evict-load`) measures cold loads of chunks
-// while the maintenance thread evicts and checkpoints other chunks of the
+// while background maintenance evicts and checkpoints other chunks of the
 // same large chunks, and reports the load latency percentiles (issue #143).
 //
 // A fourth scenario (`--scenario flush`) prices the durability barrier on a

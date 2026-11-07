@@ -13,9 +13,8 @@ namespace chunkdb {
 namespace {
 
 // Runs a best-effort logging action, containing any exception (e.g. bad_alloc
-// while formatting). Used on the background maintenance thread, where an
-// escaping exception — including from a noexcept function — would
-// std::terminate the server.
+// while formatting). Used on a maintenance worker, where an exception escaping
+// a noexcept function would std::terminate the server.
 template <typename LogAction>
 void LogBestEffort(LogAction&& action) noexcept {
     try {
@@ -82,12 +81,12 @@ bool ChunkStore::MaintenanceStep() {
     } else if (run_eviction) {
         // MaybeEvictChunks flushes/checkpoints dirty chunks and can throw
         // on a transient I/O error or when the store is already fail-closed
-        // (odd snapshot generation). This is the std::thread entry path, so
-        // an escaping exception would std::terminate the whole server. A
+        // (odd snapshot generation). An exception escaping a pool turn would
+        // end background maintenance for this store. A
         // failed background eviction is survivable — the request path
         // re-evicts inline under backpressure — so log and continue. The
         // whole block (including the best-effort logging, which can throw
-        // under memory pressure) is contained so nothing escapes the thread.
+        // under memory pressure) is contained so nothing escapes the turn.
         try {
             MaybeEvictChunks();
         } catch (const std::exception& e) {

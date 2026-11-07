@@ -1,10 +1,21 @@
 #include "maintenance_pool.hpp"
 #include "chunk_store_internal.hpp"
 
+#include <atomic>
 #include <stdexcept>
 #include <system_error>
 
 namespace chunkdb {
+#ifdef CHUNKDB_FAILPOINTS
+namespace {
+std::atomic<void (*)()> turn_end_hook_for_tests{nullptr};
+}  // namespace
+
+void MaintenancePool::SetTurnEndHookForTests(void (*hook)()) noexcept {
+    turn_end_hook_for_tests.store(hook, std::memory_order_release);
+}
+#endif
+
 MaintenancePool::MaintenancePool(std::size_t workers) {
     if (workers == 0U) throw std::invalid_argument("maintenance_workers must be positive");
     workers_.reserve(workers);
@@ -83,8 +94,14 @@ void MaintenancePool::Run() {
             task->running_ = false;
             task->failure_ = failure;
             if (!failure && (more || task->again_)) Enqueue(task);
+            // A waiter may release the last owner reference once it sees the
+            // turn end, so the worker never destroys the callback state.
+            task.reset();
         }
         cv_.notify_all();
+#ifdef CHUNKDB_FAILPOINTS
+        if (auto* hook = turn_end_hook_for_tests.load(std::memory_order_acquire)) hook();
+#endif
     }
 }
 }  // namespace chunkdb

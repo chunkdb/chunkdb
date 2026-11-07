@@ -2253,8 +2253,11 @@ void TableCatalog::WalBarrier() {
             // catalog operation that is itself draining maintenance.
             auto lease = table->Acquire();
             if (!lease) continue;
+            // `tables` keeps each table alive until every barrier ends. The
+            // task holds only the lease and releases it within its turn, so a
+            // dropped table is never destroyed on a maintenance worker.
             auto held = std::make_shared<std::optional<Table::Lease>>(std::move(lease));
-            auto barrier = pool->MakeTask([table, held] {
+            auto barrier = pool->MakeTask([held] {
                 auto lease = std::move(**held);
                 held->reset();
                 lease.store().WalBarrier();
