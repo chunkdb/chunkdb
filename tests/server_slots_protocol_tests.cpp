@@ -10,13 +10,12 @@
 #include "slot_watch.hpp"
 #include "server_feed.hpp"
 #include "feed_slot_records.hpp"
+#ifdef CHUNKDB_WITH_OPENSSL
+#include <openssl/bio.h>
+#include <openssl/pem.h>
+#endif
 
 namespace chunkdb {
-void FeedDeliveryTestAccess::LimitActiveSendBuffers(ChunkServer& server, int bytes) {
-    std::lock_guard lock(server.active_clients_mutex_);
-    for (const auto socket : server.active_clients_)
-        assert(setsockopt(static_cast<server_detail::SocketHandle>(socket), SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
-}
 struct SlotAckDeadlineTestAccess {
     static bool Publish(SlotWatch& watch, const std::shared_ptr<const FeedEntry>& entry) { return watch.Publish(entry); }
     static void Sent(SlotWatch& watch, std::uint64_t revision, std::chrono::steady_clock::time_point now) {
@@ -64,12 +63,16 @@ struct AckDeadlineIoTestAccess {
         watch.connection = std::make_shared<ServerConnection>(); watch.connection->session.slot_watch = holder;
         io.Pull(watch, 1024U);
         assert(watch.excess_frames != 0U);
-        // A batch queued long ago: one written byte restarts its clock.
-        watch.excess_progress -= std::chrono::hours(1);
-        const auto before = steady_clock::now();
-        io.Advance(watch, 1U);
+        // Writes spaced half a timeout apart, simulated by moving the last progress
+        // back: together they span two timeouts, and each restarts the clock.
+        for (int write = 0; write < 4; ++write) {
+            watch.excess_progress -= timeout / 2;
+            assert(!io.ExpireStalledWrite(watch, steady_clock::now()));
+            const auto before = steady_clock::now();
+            io.Advance(watch, 1U);
+            assert(watch.excess_progress >= before);
+        }
         const auto progress = watch.excess_progress;
-        assert(progress >= before);
         assert(!io.ExpireStalledWrite(watch, progress + timeout - std::chrono::milliseconds(1)) && !watch.dead);
         assert(!SlotAckDeadlineTestAccess::Publish(*waiter, entry)); // The pool is still held.
         // No progress for the whole timeout: the watch is closed once.
@@ -79,6 +82,68 @@ struct AckDeadlineIoTestAccess {
         assert(SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
         assert(SlotAckDeadlineTestAccess::Publish(*waiter, entry));
     }
+#ifdef CHUNKDB_WITH_OPENSSL
+    // A server TLS session whose peer is a memory pipe smaller than one record,
+    // so SSL_write blocks without any socket or reader scheduling.
+    static void TlsWriteCap(ChunkServer& server) {
+        auto* server_context = SSL_CTX_new(TLS_server_method());
+        auto* client_context = SSL_CTX_new(TLS_client_method());
+        const auto& cert_pem = slot_socket_test::kTestTlsCertPem;
+        const auto& key_pem = slot_socket_test::kTestTlsKeyPem;
+        auto* cert_bio = BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size()));
+        auto* key_bio = BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size()));
+        auto* cert = PEM_read_bio_X509(cert_bio, nullptr, nullptr, nullptr);
+        auto* key = PEM_read_bio_PrivateKey(key_bio, nullptr, nullptr, nullptr);
+        assert(server_context && client_context && cert && key);
+        assert(SSL_CTX_use_certificate(server_context, cert) == 1 && SSL_CTX_use_PrivateKey(server_context, key) == 1);
+        auto* server_tls = SSL_new(server_context);
+        auto* client_tls = SSL_new(client_context);
+        BIO* server_bio = nullptr;
+        BIO* client_bio = nullptr;
+        assert(BIO_new_bio_pair(&server_bio, 8192, &client_bio, 8192) == 1);
+        SSL_set_bio(server_tls, server_bio, server_bio);
+        SSL_set_bio(client_tls, client_bio, client_bio);
+        SSL_set_accept_state(server_tls); SSL_set_connect_state(client_tls);
+        for (int step = 0; step < 100 && !(SSL_is_init_finished(server_tls) && SSL_is_init_finished(client_tls)); ++step) {
+            (void)SSL_do_handshake(client_tls); (void)SSL_do_handshake(server_tls);
+        }
+        assert(SSL_is_init_finished(server_tls) && SSL_is_init_finished(client_tls));
+        std::string received;
+        const auto drain = [&] {
+            std::array<char, 4096> buffer{};
+            for (;;) {
+                const auto count = SSL_read(client_tls, buffer.data(), static_cast<int>(buffer.size()));
+                if (count <= 0) { ERR_clear_error(); return; }
+                received.append(buffer.data(), static_cast<std::size_t>(count));
+            }
+        };
+        {
+            FeedIo io(server);
+            FeedIo::Watch watch;
+            watch.connection = std::make_shared<ServerConnection>(); watch.connection->tls = server_tls;
+            const auto frame = std::make_shared<const std::string>(64U * 1024U, 'x');
+            io.Queue(watch, frame);
+            io.Write(watch);
+            // The first call passed one record and blocked with that length pinned.
+            assert(!watch.dead && watch.offset == 0U && watch.write_size == 16384 && watch.write_wait == POLLOUT);
+            for (int round = 0; round < 64 && !watch.output.empty(); ++round) {
+                const auto offset = watch.offset;
+                drain();
+                // OpenSSL refuses a retry with another buffer or length, so success proves both are reused.
+                io.Write(watch);
+                assert(!watch.dead);
+                const auto written = (watch.output.empty() ? frame->size() : watch.offset) - offset;
+                assert(written <= 16384U && (watch.output.empty() || watch.write_size == 0 || watch.write_size <= 16384));
+            }
+            drain();
+            assert(watch.output.empty() && received == *frame);
+            watch.connection->tls = nullptr;
+        }
+        SSL_free(server_tls); SSL_free(client_tls);
+        SSL_CTX_free(server_context); SSL_CTX_free(client_context);
+        X509_free(cert); EVP_PKEY_free(key); BIO_free(cert_bio); BIO_free(key_bio);
+    }
+#endif
     // `state` holds one admitted excess-pool batch of `size` bytes, nothing else.
     static void ExcessQueue(ChunkServer& server, const std::shared_ptr<SlotWatch>& state, std::size_t size, std::size_t budget) {
         FeedIo io(server);
@@ -1311,23 +1376,6 @@ void ExcessPoolReceipts(bool tls) {
     AckDeadlineIoTestAccess::ExcessQueue(harness.server(), queue, SlotAckDeadlineTestAccess::Excess(*queue), budget);
     queue->Cancel(); queue->WorkStep();
 }
-void CreateLargeTable(Client& writer, std::initializer_list<const char*> slots) {
-    writer.Ok("CREATE TABLE t (n u8, label bytes(1048576)) CHUNK 4 x 4");
-    writer.Ok("ALTER TABLE t SET var_max_chunk_bytes = 16777216");
-    for (const auto* slot : slots) writer.Ok("CREATE SLOT '" + std::string(slot) + "' ON t");
-}
-// One transaction of `blocks` 1 MiB values.
-std::uint64_t MebibyteTransaction(Client& writer, int blocks) {
-    const std::string payload(1024U * 1024U, 'x');
-    writer.Ok("BEGIN");
-    for (int x = 0; x < blocks; ++x) {
-        writer.Line("SET BLOCK " + std::to_string(x) + " 0 IN t label = $1");
-        writer.Send("$" + std::to_string(payload.size()) + "\r\n" + payload + "\r\n");
-        const auto reply = writer.Read();
-        if (reply.type == '-') throw std::runtime_error("large transaction write failed: " + reply.value);
-    }
-    return Number(writer.Command("COMMIT"));
-}
 void ExcessStalledHolder(bool tls) {
     // Driven through the I/O watch state, so no host's socket buffering decides when the holder stalls.
     constexpr std::size_t budget = 4096U, share = 1024U;
@@ -1354,24 +1402,14 @@ void ExcessStalledHolder(bool tls) {
     }
     assert(SlotAckDeadlineTestAccess::Charged(*holder) == 0U && SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
 }
-void ExcessSlowReader(bool tls) {
-    // A 2 MiB change above a 1.5 MiB share, read at about 270 KB/s: the transfer takes about
-    // twice the 4 s timeout, while the reader writes progress every 30 ms.
-    Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, 3U * 1024U * 1024U, {}, 60000ms, 4000ms);
-    auto writer = harness.Connect(); CreateLargeTable(*writer, {"consumer"});
-    auto ordinary = OrdinaryWatches(harness, 1U); // Halves the slot share.
-    auto watch = harness.Connect(); watch->SetReceiveBuffer(32768);
-    (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
-    const auto first = Set(*writer, 1);
-    assert(Change(NextChange(*ordinary.front())) == first);
-    assert(Change(NextChange(*watch)) == first);
-    FeedDeliveryTestAccess::LimitActiveSendBuffers(harness.server(), 32768);
-    const auto large = MebibyteTransaction(*writer, 2);
-    watch->ReadPaced(2U * 1024U * 1024U, 8U * 1024U, 30ms);
-    assert(Change(watch->Read(), 2U) == large);
-    watch->Line("ACK " + std::to_string(large)); Unwatch(*watch);
-    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == large);
-    Unwatch(*ordinary.front());
+void TlsWriteCap(bool tls) {
+#ifdef CHUNKDB_WITH_OPENSSL
+    if (!tls) return; // Independent of the transport: runs once, with the TLS groups.
+    Harness harness(tls);
+    AckDeadlineIoTestAccess::TlsWriteCap(harness.server());
+#else
+    (void)tls;
+#endif
 }
 void ExcessPoolFifo(bool tls) {
     constexpr std::size_t budget = 4096U, share = 1024U;
@@ -2155,7 +2193,7 @@ int main(int argc, char** argv) {
         if (shares_only || !selected.empty()) {
             run("share-independent-delivery", ShareIndependentDelivery); run("table-budget-terminates", TableBudgetStillTerminates);
             run("excess-pool-bound", ExcessPoolBound); run("excess-pool-receipts", ExcessPoolReceipts);
-            run("excess-stalled-holder", ExcessStalledHolder); run("excess-slow-reader", ExcessSlowReader);
+            run("excess-stalled-holder", ExcessStalledHolder); run("TLS-write-cap", TlsWriteCap);
             run("excess-pool-FIFO", ExcessPoolFifo); run("excess-pool-control", ExcessPoolControlFrames);
             run("excess-pool-leave", ExcessPoolLeave);
         }

@@ -27,8 +27,6 @@ struct FeedDeliveryTestHook {
 };
 struct FeedDeliveryTestAccess {
     static std::size_t FillActiveClientSendQueue(ChunkServer& server, int bytes);
-    // Sets SO_SNDBUF on every connection the server has open.
-    static void LimitActiveSendBuffers(ChunkServer& server, int bytes);
     static void SetHook(ChunkServer& server, FeedDeliveryTestHook* hook);
     // Observe existing scheduling without adding a wake before shutdown.
     static void SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);

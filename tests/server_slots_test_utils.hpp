@@ -225,16 +225,6 @@ class Client {
     void Line(std::string_view line) { test::FeedPhaseWatchdog::Command("client: send", line); last_request_ = std::string(line.substr(0U, 80U)); Send(std::string(line) + "\r\n"); }
     Reply Read(std::chrono::milliseconds timeout = 10s) { test::FeedPhaseWatchdog::Command("client: read reply after", last_request_); return ReadAt(Clock::now() + timeout); }
     Reply Command(std::string_view line) { Line(line); return Read(); }
-    // A slow consumer: buffers `total` bytes, at most about `step` bytes per `pause`.
-    void ReadPaced(std::size_t total, std::size_t step, std::chrono::milliseconds pause, std::chrono::milliseconds timeout = 60s) {
-        const auto deadline = Clock::now() + timeout;
-        while (pending_.size() < total) {
-            const auto target = std::min(total, pending_.size() + step);
-            while (pending_.size() < target)
-                if (!Fetch(deadline)) Fail("paced read timed out");
-            std::this_thread::sleep_for(pause); // Paces the reader; no ordering depends on it.
-        }
-    }
     void Ok(std::string_view line) {
         const auto reply = Command(line);
         if (reply.type != '+' || reply.value != "OK") throw std::runtime_error("expected OK for " + std::string(line) + ": " + reply.value);
