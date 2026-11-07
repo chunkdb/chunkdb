@@ -44,9 +44,10 @@ Dropping a table removes its specific grants.
 | CREATE TABLE, SHOW METRICS, RELOAD TLS | ADMIN on all tables |
 | FLUSH WAL | WRITE on at least one table |
 | SHOW TABLES, SHOW SLOTS | None; results include accessible tables only |
+| SHOW MIGRATIONS | None; results include records on tables with ADMIN, and GRANT and REVOKE records with MANAGES USERS; applying users show with MANAGES USERS |
 | ACK | An open slot watch |
 | PING | None |
-| User management, GRANT, REVOKE, BACKUP TO, SHOW MIGRATIONS | MANAGES USERS |
+| User management, GRANT, REVOKE, BACKUP TO | MANAGES USERS |
 | MIGRATE | The inner statement's rights |
 
 Changing your own password is the exception to the user-management requirement.
@@ -62,6 +63,7 @@ Slot ownership is matched by user name: a user created again under that name can
 Changing a user's password, by the user or an administrator, does not end that user's open connections or watches.
 
 Migration replay checks current rights before returning skipped or conflict.
+A name recorded for a table without your ADMIN, or for GRANT or REVOKE without MANAGES USERS, returns PERMISSION_DENIED.
 For repeatable lists that drop tables, use a deployment user with wildcard ADMIN.
 This grant survives table removal; table-specific ADMIN does not.
 

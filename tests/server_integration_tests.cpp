@@ -928,7 +928,9 @@ class TlsClient {
     // `max_version`: the highest TLS version offered, e.g. TLS1_2_VERSION;
     // 0 offers every version the library supports. `prefix`: bytes sent in
     // the clear before the handshake, such as a PROXY protocol header.
-    TlsClient(std::string host, std::uint16_t port, int max_version = 0, const std::string& prefix = {})
+    // `ciphers`: the TLS 1.2 cipher list offered; empty keeps the default.
+    TlsClient(std::string host, std::uint16_t port, int max_version = 0, const std::string& prefix = {},
+              const std::string& ciphers = {})
         : host_(std::move(host)), port_(port) {
         SSL_load_error_strings();
         OpenSSL_add_ssl_algorithms();
@@ -941,6 +943,11 @@ class TlsClient {
             SSL_CTX_free(context_);
             context_ = nullptr;
             throw std::runtime_error("failed to set the TLS client's highest version");
+        }
+        if (!ciphers.empty() && SSL_CTX_set_cipher_list(context_, ciphers.c_str()) != 1) {
+            SSL_CTX_free(context_);
+            context_ = nullptr;
+            throw std::runtime_error("failed to set the TLS client's cipher list");
         }
         try {
             socket_ = ConnectSocket(host_, port_);
@@ -974,13 +981,17 @@ class TlsClient {
             connected = SSL_connect(session_);
         } while (connected != 1 && TimedOut(connected));
         if (connected != 1) {
+            // SSL_ERROR_SSL: the handshake itself failed, such as on a TLS alert.
+            const int failure = SSL_get_error(session_, connected);
+            const char* reason = ERR_reason_error_string(ERR_peek_last_error());
             SSL_free(session_);
             session_ = nullptr;
             CloseSocket(socket_);
             socket_ = kInvalidSocket;
             SSL_CTX_free(context_);
             context_ = nullptr;
-            throw std::runtime_error("failed to complete TLS client handshake");
+            throw std::runtime_error("failed to complete TLS client handshake: ssl_error=" + std::to_string(failure) +
+                                     " " + (reason != nullptr ? reason : "unknown"));
         }
     }
 
@@ -1027,6 +1038,7 @@ class TlsClient {
     }
 
     [[nodiscard]] int Version() const { return SSL_version(session_); }
+    [[nodiscard]] std::string Cipher() const { return SSL_get_cipher_name(session_); }
 
     void SendLine(const std::string& command) {
         SendBytes(command + "\r\n");
@@ -3311,6 +3323,42 @@ void TestTlsMinimumVersion() {
     }
 }
 
+// TLS 1.2 accepts only ECDHE key exchange with AEAD ciphers: a client that
+// offers only static RSA key exchange with CBC fails the handshake.
+void TestTls12CipherList() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.tls_enabled = true;
+    ServerHarness harness("tls-ciphers", BaseStoreConfig(), engine_cfg, server_cfg);
+    // The connection must reach the handshake and fail there, not before. On
+    // a system whose crypto policy already disables static RSA key exchange,
+    // this passes without the server's cipher list.
+    std::string refusal;
+    try {
+        TlsClient weak("127.0.0.1", harness.port, TLS1_2_VERSION, {}, "AES128-SHA");
+    } catch (const std::runtime_error& error) {
+        refusal = error.what();
+    }
+    assert(refusal.rfind("failed to complete TLS client handshake: ssl_error=" + std::to_string(SSL_ERROR_SSL) + " ", 0) == 0);
+    std::vector<std::string> ciphers{"ECDHE-RSA-AES128-GCM-SHA256", "ECDHE-RSA-AES256-GCM-SHA384"};
+    {
+        // ChaCha20-Poly1305 only where the linked OpenSSL offers it.
+        SSL_CTX* probe = SSL_CTX_new(TLS_client_method());
+        assert(probe != nullptr);
+        if (SSL_CTX_set_cipher_list(probe, "ECDHE-RSA-CHACHA20-POLY1305") == 1) ciphers.emplace_back("ECDHE-RSA-CHACHA20-POLY1305");
+        SSL_CTX_free(probe);
+        ERR_clear_error();
+    }
+    for (const auto& cipher : ciphers) {
+        TlsClient client("127.0.0.1", harness.port, TLS1_2_VERSION, {}, cipher);
+        assert(client.Version() == TLS1_2_VERSION && client.Cipher() == cipher);
+        client.Login();
+    }
+    TlsClient current("127.0.0.1", harness.port);
+    assert(current.Version() == TLS1_3_VERSION);
+    current.Login();
+}
+
 void TestChunkPutOverTls() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -3582,6 +3630,66 @@ void TestLongIdleConnectionTimeoutReleasesWorker() {
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
     assert(response == "%14\r\n");
     assert(idle.WaitForClose(std::chrono::milliseconds(1500)));
+}
+
+// A transaction past --txn-max-duration-ms whose client sends nothing does
+// not keep other connections' transactional writes out of
+// --txn-total-bytes, and an idle connection with an open transaction still
+// closes at the idle timeout, releasing its bytes.
+void TestExpiredTransactionReleasesBudget() {
+    // One private copy of a chunk of t fits, two do not.
+    auto engine_cfg = chunkdb::EngineConfig{
+        .require_auth = false,
+        .max_auth_failures = 5,
+        .txn_max_duration = std::chrono::milliseconds(500),
+        .txn_total_bytes = 50,
+    };
+    {
+        ServerHarness harness("txn-expired-budget", BaseStoreConfig(), engine_cfg, BaseServerConfig());
+        RawClient holder("127.0.0.1", harness.port);
+        holder.Hello();
+        holder.SendLine("CREATE TABLE t (n u16 REQUIRED) CHUNK 4 x 4");
+        assert(holder.ReadLine() == "+OK\r\n");
+        holder.SendLine("BEGIN");
+        assert(holder.ReadLine() == "+OK\r\n");
+        holder.SendLine("SET BLOCK 0 0 IN t n = 1");
+        assert(holder.ReadLine() == "_\r\n");
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+
+        RawClient other("127.0.0.1", harness.port);
+        other.Hello();
+        other.SendLine("BEGIN");
+        assert(other.ReadLine() == "+OK\r\n");
+        other.SendLine("SET BLOCK 4 0 IN t n = 2");
+        assert(other.ReadLine() == "_\r\n");
+        holder.SendLine("PING");
+        assert(holder.ReadLine().rfind("-ERR CONFLICT reason=duration ", 0) == 0);
+        holder.SendLine("COMMIT");
+        assert(holder.ReadLine().rfind("-ERR CONFLICT reason=duration ", 0) == 0);
+        other.SendLine("COMMIT");
+        assert(other.ReadLine().rfind(":", 0) == 0);
+        other.SendLine("GET BLOCK 0 0 FROM t");
+        assert(other.ReadLine() == "_\r\n");
+    }
+    engine_cfg.txn_max_duration = std::chrono::milliseconds(60000);
+    auto server_cfg = BaseServerConfig();
+    server_cfg.idle_connection_timeout_ms = 300;
+    ServerHarness harness("txn-idle-budget", BaseStoreConfig(), engine_cfg, server_cfg);
+    RawClient idle("127.0.0.1", harness.port);
+    idle.Hello();
+    idle.SendLine("CREATE TABLE t (n u16 REQUIRED) CHUNK 4 x 4");
+    assert(idle.ReadLine() == "+OK\r\n");
+    idle.SendLine("BEGIN");
+    assert(idle.ReadLine() == "+OK\r\n");
+    idle.SendLine("SET BLOCK 0 0 IN t n = 1");
+    assert(idle.ReadLine() == "_\r\n");
+    assert(idle.WaitForClose(std::chrono::milliseconds(5000)));
+    RawClient other("127.0.0.1", harness.port);
+    other.Hello();
+    other.SendLine("BEGIN");
+    assert(other.ReadLine() == "+OK\r\n");
+    other.SendLine("SET BLOCK 4 0 IN t n = 2");
+    assert(other.ReadLine() == "_\r\n");
 }
 
 void TestPendingQueueWaitTimeoutClosesQueuedSocket() {
@@ -5876,6 +5984,7 @@ int main(int argc, char** argv) {
         run("TestChunkPutOverTls", TestChunkPutOverTls);
         run("TestTlsReload", TestTlsReload);
         run("TestTlsMinimumVersion", TestTlsMinimumVersion);
+        run("TestTls12CipherList", TestTls12CipherList);
 #endif
         run("TestReadTimeoutLogsPhaseAndReason", TestReadTimeoutLogsPhaseAndReason);
         run("TestProxyProtocolParser", TestProxyProtocolParser);
@@ -5893,6 +6002,7 @@ int main(int argc, char** argv) {
         run("TestIdleClientRemainsConnectedBetweenCommands", TestIdleClientRemainsConnectedBetweenCommands);
         run("TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests", TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests);
         run("TestLongIdleConnectionTimeoutReleasesWorker", TestLongIdleConnectionTimeoutReleasesWorker);
+        run("TestExpiredTransactionReleasesBudget", TestExpiredTransactionReleasesBudget);
         run("TestPendingQueueWaitTimeoutClosesQueuedSocket", TestPendingQueueWaitTimeoutClosesQueuedSocket);
         run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
         run("TestSteadySlowReaderHitsReplyWriteDeadline", [] { TestSteadySlowReaderHitsReplyWriteDeadline(); });
