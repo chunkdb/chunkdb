@@ -181,7 +181,8 @@ Different epochs, positions below retained history, unissued future positions an
 
 ## Durable slot filters
 
-The checked `CKSL` record uses format tag 3, a table dimensionality byte of 2 or 3 at offset 6, and a flags byte at offset 7 whose only defined bit preserves the filtered-record capability.
+The checked `CKSL` record uses format tag 4, a table dimensionality byte of 2 or 3 at offset 6, and a flags byte at offset 7 whose only defined bit preserves the filtered-record capability.
+Each slot may also carry an owner, selected by slot flag `0x40`.
 The epoch, durable watermark, slot count, per-slot flags and projection IDs retain their checked meanings, and an AREA stores signed little-endian first coordinates followed by last coordinates for every active axis.
 Every AREA must match the record dimensionality, have ordered endpoints on all active axes, and have zero inactive coordinates; decoding with a known table dimensionality refuses a mismatch before returning records.
 The complete CRC, slot and byte limits are checked before publication, truncated or malformed records are refused without mutation, and earlier record tags require explicit recreation rather than a dimensionality fallback.

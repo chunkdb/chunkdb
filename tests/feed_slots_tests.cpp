@@ -10,6 +10,7 @@
 #include "chunk_store_internal.hpp"
 #include "feed_slot_records.hpp"
 #include "feed_test_utils.hpp"
+#include "slot_watch.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "wal_writer.hpp"
 #include "store_manifest.hpp"
@@ -659,9 +660,70 @@ void PersistentFilters() {
     }
 }
 
+// A slot record without an owner, as CREATE SLOT writes without
+// authentication, still opens. Claiming it records nothing; BindOwner, run
+// once an attach is granted, records its user, and the owner survives a restart.
+// A failed owner write changes neither the file nor memory and frees the slot.
+void UnownedSlotBindsAtFirstAttach() {
+    ScopedTempDir dir("chunkdb-feed-slots-unowned");
+    const auto config = SlotsConfig(dir.path());
+    const auto root = dir.path() / "tables" / "default";
+    StoreId epoch{};
+    {
+        TableCatalog catalog(config);
+        (void)feed_test::CreateDefault(catalog);
+        auto table = catalog.Find("default");
+        epoch = table->store_id();
+        (void)table->CreateFeedSlot("legacy");
+        (void)table->CreateFeedSlot("anonymous");
+        assert(ReadLe16(LoadFile(root / kFeedSlotsFileName), 4U) == 4U);
+    }
+    const auto only = [](std::string user) {
+        return [user = std::move(user)](std::string_view owner) {
+            if (owner != user) throw std::invalid_argument("slot belongs to " + std::string(owner));
+        };
+    };
+    const auto close = [](const std::shared_ptr<SlotWatch>& watch) { watch->Cancel(); watch->WorkStep(); };
+    {
+        TableCatalog catalog(config); auto table = catalog.Find("default");
+        const auto listed = table->ListFeedSlots();
+        assert(listed.size() == 2U && !listed[0].owner && !listed[1].owner);
+        close(SlotWatch::Create(table, "anonymous", {})); // No user: nothing to record.
+        const auto unowned_bytes = LoadFile(root / kFeedSlotsFileName);
+        {
+            auto watch = SlotWatch::Create(table, "legacy", {}, false, "alice", only("bob"));
+            assert(!watch->owner() && LoadFile(root / kFeedSlotsFileName) == unowned_bytes); // Claiming records nothing.
+            {
+                txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_TEMP_FLUSH_ONCE", "1");
+                assert(txn_test::Throws([&] { watch->BindOwner("alice"); }));
+            }
+            assert(!watch->owner() && LoadFile(root / kFeedSlotsFileName) == unowned_bytes);
+            assert(!table->ListFeedSlots().front().owner);
+            auto again = SlotWatch::Create(table, "legacy", {}, false, "alice", only("bob")); // The slot is free.
+            again->BindOwner("alice");
+            assert(again->owner() == "alice");
+            close(again); close(watch);
+        }
+        const auto records = ReadFeedSlotRecords(root, epoch);
+        assert(ReadLe16(LoadFile(root / kFeedSlotsFileName), 4U) == 4U && records->slots.size() == 2U);
+        assert(records->slots[0].owner == "alice" && !records->slots[1].owner);
+        assert(table->ListFeedSlots().front().owner == "alice");
+        assert(txn_test::Throws([&] { (void)SlotWatch::Create(table, "legacy", {}, false, "bob", only("bob")); }));
+    }
+    TableCatalog catalog(config); auto table = catalog.Find("default");
+    assert(table->ListFeedSlots().front().owner == "alice");
+    assert(txn_test::Throws([&] { (void)SlotWatch::Create(table, "legacy", {}, false, "bob", only("bob")); }));
+    auto owner = SlotWatch::Create(table, "legacy", {}, false, "alice", only("alice"));
+    owner->BindOwner("bob"); // A recorded owner never changes.
+    assert(owner->owner() == "alice"); close(owner);
+    close(SlotWatch::Create(table, "legacy", {}, false, "admin", [](std::string_view) {})); // An allowed other user.
+    assert(ReadFeedSlotRecords(root, epoch)->slots[0].owner == "alice");
+}
+
 }  // namespace
 
 int main() {
+    UnownedSlotBindsAtFirstAttach();
     PersistentFilters();
     ConditionalSlotChanges();
     ConcurrentConditionalSlots();

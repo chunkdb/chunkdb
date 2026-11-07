@@ -10,6 +10,9 @@ TCP uses `chunk://`; TLS uses `chunks://` with certificate validation in the cli
 Lines end with LF or CRLF; a line cut off at end of stream is never executed.
 The terminator counts toward `--max-line-bytes` (65536 by default); overflow sends BAD_REQUEST and closes.
 Binary parameter frames do not count toward that line limit.
+A PROXY protocol v2 header and the TLS handshake each have their own `--client-io-timeout-ms`, in that order, before the HELLO deadline starts.
+Until authentication succeeds, HELLO, AUTH and all their parameter frames must arrive within `--client-io-timeout-ms` of that start; later ones receive PROTOCOL and close.
+After authentication, each request line and frame header must arrive within `--client-io-timeout-ms` of its first byte, and each frame body within it from when its read starts, after its header; a drained frame body is read in 4096-byte pieces, each with that timeout.
 
 The first line must be HELLO 3; a different version or statement receives PROTOCOL and closes without execution.
 `HELLO 3` alone is accepted only under `--auth none`; otherwise it receives AUTH_REQUIRED.
@@ -26,9 +29,11 @@ The client verifies the server-final signature before accepting the session.
 Wrong passwords and unknown names receive AUTH_FAILED with the same message.
 A connection closes after 5 failed HELLO or AUTH attempts.
 A source address is an IPv4 address or an IPv6 /64.
-After 5 AUTH_FAILED replies to one source address, that address is banned for 1 second, and each further failure from it bans it again.
+After 5 AUTH_FAILED replies to one source address, that address is banned for 1 second.
+When a ban ends, the address's failures are reset, so it again has 5 failures before the next ban.
 A banned address receives `RATE_LIMITED reason=auth_ban retry_after_ms=...` and its connection closes; the reply that starts a ban and replies during a ban are delayed by 50 ms.
-A successful login from the address clears its failures.
+A successful login from the address clears only the failures of its own user name; failures for other names, existing or not, stay counted.
+An address tracks failures separately for at most 8 names at a time; failures for further names are cleared by no login.
 
 A second HELLO receives PROTOCOL.
 
@@ -52,6 +57,7 @@ A second HELLO receives PROTOCOL.
 Append `WITH client_name='name',statement_timeout_ms=0,default_tag=x'00'` to HELLO to request session options.
 Keys are case-insensitive; duplicates and invalid known values receive INVALID_ARGUMENT without counting as authentication failures.
 Unknown keys are accepted and reported with `reason=unknown_option`.
+Before authentication HELLO takes at most 12 parameters; a HELLO with more receives PROTOCOL and closes without its frames being read.
 
 Only `client_name` currently applies; timeout and tag values are stored with `reason=implementation_pending` until their capabilities appear.
 The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, and `lineage`.
@@ -208,14 +214,17 @@ A null before row means no prior written identity, and NO BEFORE removes both bl
 Block projections preserve all metadata columns; empty metadata domains emit no metadata-change rows.
 Tag and txn are null until their metadata is present.
 
-Slot ownership permits one watch; a competing watch receives SLOT_BUSY and a lost slot receives SLOT_LOST.
+A slot permits one watch at a time; a competing watch receives SLOT_BUSY and a lost slot receives SLOT_LOST.
+A slot belongs to its owner; another user needs ADMIN on `*` to watch it, see [feed statements](reference/FEED.md#arguments).
 
 DROP TABLE ends watches with NO_TABLE; a fenced or recovered table ends them with INTERNAL, and a new WATCH resumes; watches have no idle timeout.
+Losing READ on the table ends a watch with a best-effort NO_TABLE, as losing ADMIN on `*` ends a watch of a slot its user does not own, and a dropped user with a best-effort `AUTH_REQUIRED reason=user_dropped`; the connection closes either way; see [users](USERS.md#rights).
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 
 ## Errors and URIs
 
 PROTOCOL, AUTH_REQUIRED and AUTH_FAILED describe greeting/authentication failures.
+`AUTH_REQUIRED reason=user_dropped` answers a statement on a connection whose user was dropped, and the connection closes.
 UNKNOWN_COMMAND identifies an unavailable statement.
 SYNTAX, INVALID_ARGUMENT and OUT_OF_RANGE describe parsing, validation and response/ledger limits.
 Malformed or unbounded parameter framing receives PROTOCOL and closes the connection.
@@ -239,7 +248,7 @@ Clients classify errors by code, never diagnostic text, and preserve unknown key
 MIGRATION_MISMATCH identifies different text under a recorded migration name.
 SLOT_BUSY identifies an attached slot; SLOT_LOST identifies unavailable retained history or a dropped projected column.
 `reason=schema_filter` identifies a lost stable-ID projection; `reason=retention_limit` identifies retained-history overflow.
-SHOW SLOTS adds `lost_reason` (null while healthy) and a `filters` map.
+SHOW SLOTS adds `lost_reason` (null while healthy), a `filters` map, and `owner` (shown to that user and to MANAGES USERS; null otherwise or for a slot without a recorded owner).
 Its keys are `area`, `columns`, `column_ids`, `no_before`, and `chunks`.
 
 Unfiltered area and projection fields are null; projected names and IDs are aligned arrays in declared order.
@@ -259,8 +268,8 @@ Client URIs use `chunk://user:password@host:4242/` or `chunks://user:password@ho
 A URI path selects a client's default table; wire statements still name the table explicitly.
 
 Slot takeover fences old ACK validation, persists the accepted ACK, and closes the old socket before publishing its replacement claim.
-The old owner receives best-effort `KILLED reason=slot_takeover`; partial or pinned TLS output closes without an injected error.
+The replaced watch receives best-effort `KILLED reason=slot_takeover`; partial or pinned TLS output closes without an injected error.
 Concurrent handoffs receive `SLOT_BUSY reason=takeover_pending`.
 
 An ambiguous durable-slot metadata publication reports `OUTCOME_UNKNOWN stage=slot_records` and fences table writes until recovery.
-Takeover propagates this outcome to the replacement instead of installing a new owner after failed ACK publication.
+Takeover propagates this outcome to the replacement instead of installing a new watch after failed ACK publication.

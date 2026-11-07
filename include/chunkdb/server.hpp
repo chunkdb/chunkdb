@@ -5,6 +5,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <mutex>
 #include <queue>
@@ -149,6 +150,9 @@ class ChunkServer {
     void CloseClient(ServerConnection& connection);
     std::shared_ptr<FeedIo> feed_io_;
     std::shared_ptr<FeedIo> FeedIoHandle();
+    // Wakes the feed on every change of the users, so a watch whose user
+    // lost READ ends without waiting for its next push; held while it runs.
+    std::shared_ptr<const std::function<void()>> users_changed_;
     std::atomic<std::size_t> watch_count_{0};
 };
 

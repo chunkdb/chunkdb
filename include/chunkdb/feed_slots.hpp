@@ -32,6 +32,8 @@ struct FeedSlot {
     bool lost = false;
     FeedSlotFilters filters{};
     bool schema_filter_lost = false;
+    // Absent for a slot recorded without one, until an attach by a user records it.
+    std::optional<std::string> owner{};
     // Filled by a table listing under the same lease as its live schema.
     std::vector<std::optional<std::string>> column_names{};
 };

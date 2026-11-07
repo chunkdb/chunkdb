@@ -12,6 +12,8 @@ Passwords use UTF-8 bytes without SASLprep normalization.
 chunkdb.users is checksummed and atomically replaced with file/directory syncs.
 It stores users, verifier data, management capability, grants and the unknown-user secret.
 Existing sessions consult current rights on each statement, so changes take effect without reconnecting.
+Every change of the users wakes the feed, and open watches recheck READ on their table from a published view of the rights, without the registry lock.
+Each user has an in-memory incarnation, assigned at creation or load; a session whose user was dropped, or dropped and created again, has no user and closes.
 Rights form READ < WRITE < ADMIN and wildcard grants cover future tables.
 Dropping a table removes its specific grants.
 

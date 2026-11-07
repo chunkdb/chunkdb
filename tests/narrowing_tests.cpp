@@ -6,6 +6,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <future>
+#include <limits>
 #include <mutex>
 #include <cstdint>
 #include <cstdio>
@@ -203,6 +204,38 @@ void TestWritesWhilePending() {
     chunkdb::ChunkStore bits(bits_config);
     bits.SetBlockBits(0, 0, "1100");
     ExpectThrow<std::invalid_argument>([&] { bits.SetBlockBits(1, 0, "1110"); }, "being narrowed to bits(2)");
+}
+
+// A value that does not fit names its block on each axis: the absolute
+// coordinate when it fits int64, otherwise [chunk, local] as WATCH tells it.
+void TestMisfitAtInt64Edge() {
+    constexpr auto kMax = std::numeric_limits<std::int64_t>::max();
+    constexpr auto kMin = std::numeric_limits<std::int64_t>::min();
+    ScopedTempDir dir("chunkdb-narrowing-edge");
+    chunkdb::StoreConfig config;
+    config.data_dir = dir.path();
+    config.schema = Initial();
+    config.geometry = GeometryFor(Initial());
+    chunkdb::ChunkStore store(config);
+    const auto u8 = Type(ColumnKind::kUnsigned, 8);
+    // The last block of each axis.
+    store.SetBlock(kMax, kMin, {{"id", std::uint64_t{700}}});
+    assert(store.FindValueNotFitting(1, u8) == "block (9223372036854775807, -9223372036854775808) holds 700");
+    store.SetBlock(kMax, kMin, {{"id", std::uint64_t{7}}});
+    assert(!store.FindValueNotFitting(1, u8).has_value());
+    // Block 0 of chunk (INT64_MAX, INT64_MIN), past int64 on both axes.
+    auto payload = store.GetChunkPayloadBytes(kMax, kMin);
+    payload[0] = 0xBC;
+    payload[1] = 0x02;  // id of block 0 = 700
+    (void)store.SetChunkStateBytes(kMax, kMin, payload, std::vector<std::uint8_t>{0x01, 0x00});
+    const auto misfit = store.FindValueNotFitting(1, u8);
+    if (misfit != "block ([9223372036854775807, 0], [-9223372036854775808, 0]) holds 700") {
+        std::fprintf(stderr, "misfit: %s\n", misfit.value_or("none").c_str());
+        assert(false);
+    }
+    // The type is checked before any value is fitted to it.
+    ExpectThrow<std::invalid_argument>([&] { (void)store.FindValueNotFitting(1, Type(ColumnKind::kUnsigned, 200)); },
+                                       "uN takes N from 1 to 64");
 }
 
 void TestNarrowTable() {
@@ -508,6 +541,7 @@ int main(int argc, char** argv) {
     TestConcurrentNarrowingWriter(); TestNarrowingRangeFamilies(); TestEngineDefaultAndTruncate();
     TestRules();
     TestWritesWhilePending();
+    TestMisfitAtInt64Edge();
     TestNarrowTable();
     TestInterruptedNarrowing();
     return 0;

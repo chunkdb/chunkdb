@@ -432,9 +432,15 @@ void TestAlterAndOtherStatements() {
 void TestWatch() {
     const auto filtered_create = Get<cql::CreateSlot>("CREATE SLOT IF NOT EXISTS 's' ON t CHUNKS COLUMNS (b,a) NO BEFORE AREA -4 -3 TO 2 9");
     assert(filtered_create.if_not_exists && filtered_create.chunks && filtered_create.no_before && filtered_create.columns->at(0) == "b" && filtered_create.area->first.x == -4);
+    assert(!filtered_create.owner);
+    const auto owned = Get<cql::CreateSlot>("CREATE SLOT 's' ON t CHUNKS OWNER bot NO BEFORE");
+    assert(owned.owner == "bot" && owned.chunks && owned.no_before);
+    assert(Get<cql::CreateSlot>("CREATE SLOT 's' ON t OWNER bot").owner == "bot");
+    const auto migrate = cql::Parse("MIGRATE 'm' CREATE SLOT 's' ON t OWNER bot");
+    assert(std::get<cql::CreateSlot>(std::get<cql::Migrate>(migrate.statement).statement).owner == "bot");
     const auto filters = Get<cql::Watch>("WATCH t COLUMNS b,a NO BEFORE AREA 0 0 TO 1 1 SLOT 's' CHUNKS ACK TIMEOUT 9");
     assert(filters.columns->size() == 2U && filters.no_before && filters.chunks && filters.ack_timeout_ms == 9U);
-    for (const auto suffix : {"AREA 0 0 TO 1 1 AREA 0 0 TO 1 1", "COLUMNS a COLUMNS b", "NO BEFORE NO BEFORE", "CHUNKS CHUNKS", "COLUMNS ()", "AREA 1 0 TO 0 1"}) {
+    for (const auto suffix : {"AREA 0 0 TO 1 1 AREA 0 0 TO 1 1", "COLUMNS a COLUMNS b", "NO BEFORE NO BEFORE", "CHUNKS CHUNKS", "COLUMNS ()", "AREA 1 0 TO 0 1", "OWNER bot OWNER bot", "OWNER", "OWNER Bot", "OWNER 'bot'"}) {
         const auto statement = std::string("CREATE SLOT 's' ON t ") + suffix;
         bool rejected = false; try { (void)cql::Parse(statement); } catch (const cql::ParseError&) { rejected = true; }
         assert(rejected);

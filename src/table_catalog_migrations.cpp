@@ -61,6 +61,7 @@ std::vector<MigrationRecord> TableCatalog::Migrations() const {
 
 bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users) {
     RequireWritable("MIGRATE");
+    if (request.kind == MigrationRequest::Kind::kGrant && !request.revoke) RequireValidGrantTable(request.table);
     if (!feature_metadata_gate_.lock_shared(request.cancelled)) throw std::runtime_error("migration cancelled");
     std::shared_lock feature_metadata(feature_metadata_gate_, std::adopt_lock);
     if (config_.allow_multiple_processes) throw std::invalid_argument("MIGRATE requires a single-process catalog");
@@ -76,6 +77,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         migration_health_->Check();
         for (const auto& record : ReadMigrationRecords(config_.data_dir)) {
             if (record.name != request.record.name) continue;
+            if (request.require_recorded_access) request.require_recorded_access(record);
             if (record.statement != request.record.statement)
                 throw MigrationConflictError("migration '" + record.name + "' has a different statement");
             return true;
@@ -99,7 +101,31 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
     bool no_op = false;
     TableDefinition definition{request.geometry, request.options, request.schema};
     std::unique_lock<std::mutex> ddl;
+    // Declared before user_lock: runs the users' OnChange after it is released.
+    UserRegistry::Wakes users_changed(users);
     std::unique_lock<std::mutex> user_lock;
+    // A narrowing checks the stored values before catalog admission, under the
+    // table's DDL lock and a lease; the schema it recorded then is the one the
+    // decision may narrow.
+    bool narrowing_recorded = false;
+    TableSchema scanned_schema;
+    // A recorded narrowing that is not decided is dropped again, so a refused or
+    // skipped step leaves the schema as it was. A failed catalog or a fenced
+    // table drops it when it is recovered; a table whose narrowing cannot be
+    // dropped is fenced, and the step reports its own outcome.
+    const auto drop_recorded_narrowing = [&] {
+        if (!narrowing_recorded) return;
+        narrowing_recorded = false;
+        if (user_lock.owns_lock()) user_lock.unlock();
+        if (operations.owns_lock()) operations.unlock();
+        if (migration_health_->failed.load(std::memory_order_acquire) || Find(request.table) != table ||
+            !table->Info().schema.pending) return;
+        try {
+            EndNarrowing(*table, previous, [](StoreManifest* manifest) { manifest->schema = WithoutPendingNarrowing(manifest->schema); });
+        } catch (const std::exception&) {
+            // Logged by EndNarrowing, which fenced the table if needed.
+        }
+    };
     try {
         if (request.kind != MigrationRequest::Kind::kCreate && request.kind != MigrationRequest::Kind::kGrant) {
             table = Find(request.table);
@@ -116,6 +142,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             if (table) {
                 ddl = std::unique_lock(table->ddl_mutex_);
                 if (request.kind == MigrationRequest::Kind::kCreateSlot) {
+                    // Checked before any outcome is recorded, a conditional no-op included.
+                    if (request.slot_owner) RequireValidFeedSlotOwner(*request.slot_owner);
                     const auto lease = table->Acquire();
                     if (!lease) throw TableNotFoundError("table was dropped");
                     RequireFeature(lease->store().features(), *FindFeature("feed_slots"));
@@ -144,13 +172,39 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     if (request.kind == MigrationRequest::Kind::kCreateSlot && exists &&
                         existing->filters != MigrationSlotFilters(request, lease->store().geometry()))
                         throw FeedSlotFiltersError("feed slot filters differ from existing slot");
+                    if (request.kind == MigrationRequest::Kind::kCreateSlot && exists && request.slot_owner_given &&
+                        existing->owner != request.slot_owner)
+                        throw FeedSlotFiltersError("feed slot owner differs from existing slot");
                     no_op = request.kind == MigrationRequest::Kind::kCreateSlot ? exists : !exists;
+                }
+                if (!no_op && request.kind == MigrationRequest::Kind::kAlter && request.narrowing) {
+                    const auto& [column_name, type] = *request.narrowing;
+                    const auto schema = table->Info().schema;
+                    const auto at = std::find_if(schema.columns.begin(), schema.columns.end(),
+                        [&](const auto& column) { return column.name == column_name; });
+                    if (at == schema.columns.end()) throw std::invalid_argument("the table has no column " + column_name);
+                    if (!HoldsEveryValue(at->type, type)) {
+                        operations.lock();
+                        if (already_applied()) return false;
+                        operations.unlock();
+                        narrowing_recorded = !schema.pending.has_value();
+                        RewriteManifest(
+                            *table, previous,
+                            [&](StoreManifest* manifest) { manifest->schema = WithPendingNarrowing(manifest->schema, column_name, type); },
+                            "CHUNKDB_FAILPOINT_NARROW_PENDING_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+                        scanned_schema = table->Info().schema;
+                        if (const auto misfit = ScanNarrowing(*table))
+                            throw std::invalid_argument("column " + column_name + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit + "; " + ColumnTypeRange(type));
+                    }
                 }
                 if (!no_op) {
                     store = table->BeginExclusive();
                     if (!store) {
                         operations.lock();
-                        if (already_applied()) return false;
+                        if (already_applied()) {
+                            drop_recorded_narrowing();
+                            return false;
+                        }
                         if (request.kind != MigrationRequest::Kind::kDrop || !request.if_exists || Find(request.table))
                             throw TableNotFoundError("table '" + request.table + "' was dropped");
                         table.reset();
@@ -169,6 +223,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     throw MigrationRecoveryRequiredError("cannot resume table '" + request.table + "' after migration retry: " + error.what());
                 }
             }
+            drop_recorded_narrowing();
             return false;
         }
         if (request.cancelled.stop_requested()) throw std::runtime_error("migration cancelled");
@@ -247,15 +302,18 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 const auto previous_chunk_schema = *manifest->chunk_schema;
                 if (request.narrowing) {
                     const auto& [column_name, type] = *request.narrowing;
-                    const auto at = std::find_if(manifest->schema.columns.begin(), manifest->schema.columns.end(),
-                        [&](const auto& column) { return column.name == column_name; });
-                    if (at == manifest->schema.columns.end()) throw std::invalid_argument("the table has no column " + column_name);
-                    if (HoldsEveryValue(at->type, type)) manifest->schema = ChangeColumnType(manifest->schema, column_name, type, Conversion::kExact);
-                    else {
-                        const auto pending = WithPendingNarrowing(manifest->schema, column_name, type);
-                        if (const auto misfit = store->FindValueNotFitting(at->id, type))
-                            throw std::invalid_argument("column " + column_name + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit + "; " + ColumnTypeRange(type));
-                        manifest->schema = NarrowColumnType(pending, column_name, type);
+                    if (narrowing_recorded) {
+                        // The scan checked the values of this schema only.
+                        if (manifest->schema != scanned_schema)
+                            throw std::runtime_error("table '" + request.table + "' changed during the narrowing check");
+                        manifest->schema = NarrowColumnType(manifest->schema, column_name, type);
+                    } else {
+                        const auto at = std::find_if(manifest->schema.columns.begin(), manifest->schema.columns.end(),
+                            [&](const auto& column) { return column.name == column_name; });
+                        if (at == manifest->schema.columns.end()) throw std::invalid_argument("the table has no column " + column_name);
+                        if (!HoldsEveryValue(at->type, type))
+                            throw std::runtime_error("table '" + request.table + "' changed before the narrowing check");
+                        manifest->schema = ChangeColumnType(manifest->schema, column_name, type, Conversion::kExact);
                     }
                 } else request.alter(*manifest);
                 AlignManifestSchemaDomains(&*manifest, previous_schema, previous_chunk_schema);
@@ -287,8 +345,9 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     if (at != slots.slots.end()) throw std::invalid_argument("feed slot already exists: " + request.slot);
                     const auto filters = MigrationSlotFilters(request, store->geometry());
                     // Validate every field before syncing a baseline or preparing publication.
+                    if (request.slot_owner) RequireValidFeedSlotOwner(*request.slot_owner);
                     (void)SerializeFeedSlotRecords(FeedSlotRecords{.epoch = journal.table_id, .durable_watermark = 0U,
-                        .slots = {{request.slot, 0U, false, filters}}, .dims = dims});
+                        .slots = {{request.slot, 0U, false, filters, false, request.slot_owner}}, .dims = dims});
                     RequireFeature(store->features(), *FindFeature("feed_slots"));
                     if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
                     table->PrepareFeedSlotBaseline(*store);
@@ -296,7 +355,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     store->feed_slots_->Sync(completed);
                     slots = ReadFeedSlotRecords(table->dir_, journal.table_id, dims).value_or(
                         FeedSlotRecords{.epoch = journal.table_id, .durable_watermark = completed, .slots = {}, .dims = dims});
-                    slots.slots.push_back({request.slot, completed, false, filters});
+                    slots.slots.push_back({request.slot, completed, false, filters, false, request.slot_owner});
                     slots.filter_format = slots.filter_format || !filters.empty();
                     // The unchanged manifest image binds redo to the participant
                     // identity; slot creation must not enable missing bits.
@@ -317,8 +376,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             const auto disk_users = ReadUsersFile(config_.data_dir);
             if (!disk_users) throw std::runtime_error("migration users file disappeared");
             if (users->users_ != *disk_users) {
-                users->users_ = *disk_users;
-                users->generation_.fetch_add(1, std::memory_order_acq_rel);
+                auto publication = users->PrepareLocked(*disk_users);
+                users->CommitLocked(*disk_users, std::move(publication), users_changed);
             }
             next_users = users->users_;
         }
@@ -339,6 +398,9 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             }
         }
         if (next_users) add_file(std::string(kUsersFileName), EncodeUsers(*next_users));
+        // Built before the decision, so publishing the users cannot fail after it.
+        std::optional<UserRegistry::Publication> users_publication;
+        if (next_users && users) users_publication = users->PrepareLocked(*next_users);
         records.push_back(journal.record);
         add_file(std::string(kMigrationsFileName), EncodeMigrationRecords(root->data_dir_id, records));
         ValidateMigrationJournal(config_.data_dir, journal);
@@ -346,6 +408,9 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_MIGRATION_BEFORE_DECISION_ONCE");
         WriteMigrationJournal(config_.data_dir, journal, &decided);
         decided = true;
+        // The decision makes the users change durable: publish it now, as a
+        // later completion failure must not leave memory behind the decision.
+        if (next_users && users) users->CommitLocked(std::move(*next_users), std::move(*users_publication), users_changed);
         if (auto* hook = migration_health_->hook.load(std::memory_order_acquire)) hook->Run(MigrationTestHook::Point::kAfterDecision, request.record.name);
         CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_MIGRATION_AFTER_DECISION_ONCE");
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_MIGRATION_AFTER_DECISION_FAIL_ONCE"))
@@ -360,10 +425,6 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         }
         CompleteMigrationJournal(config_.data_dir, journal);
         version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
-        if (next_users && users) {
-            users->users_ = std::move(*next_users);
-            users->generation_.fetch_add(1, std::memory_order_acq_rel);
-        }
         if (user_lock.owns_lock()) user_lock.unlock();
         if (!no_op && request.kind == MigrationRequest::Kind::kCreate) {
             auto opened = OpenStore(request.table, TablesDir() / request.table, definition.geometry, kAllGeometryFields, definition.options);
@@ -426,6 +487,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 std::filesystem::remove_all(staging, ec);
                 if (ec) throw std::runtime_error("migration preparation failed and staging cleanup failed: " + ec.message());
             }
+            drop_recorded_narrowing();
         }
         if (decided) {
             try { std::rethrow_exception(failure); }

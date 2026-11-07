@@ -217,6 +217,7 @@ struct CreateSlot {
     std::optional<std::vector<std::string>> columns{};
     bool no_before = false;
     bool chunks = false;
+    std::optional<std::string> owner{};
 };
 struct DropSlot {
     std::string name;
