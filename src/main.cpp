@@ -174,6 +174,7 @@ void PrintUsage() {
         << "  --max-loaded-chunks <n>\n"
         << "  --max-open-wal-streams <n>\n"
         << "  --background-maintenance\n"
+        << "  --maintenance-workers <n>\n"
         << "  --background-checkpoint-queue-limit <n>\n"
         << "  --listen-uri <chunk://host:port/>\n"
         << "  --tls-cert <path-to-cert.pem>\n"
@@ -359,6 +360,8 @@ int main(int argc, char** argv) {
                 option_fields |= chunkdb::kOptionFieldCheckpointCompression;
             } else if (arg == "--background-maintenance") {
                 store_config.background_maintenance = true;
+            } else if (arg == "--maintenance-workers") {
+                store_config.maintenance_workers = ParseSize(require_value("--maintenance-workers"), "maintenance-workers");
             } else if (arg == "--background-checkpoint-queue-limit") {
                 store_config.background_checkpoint_queue_limit = ParseSize(
                     require_value("--background-checkpoint-queue-limit"),
