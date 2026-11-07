@@ -89,9 +89,10 @@ void RemoveOrphanedBackupStaging(const std::filesystem::path& data_dir, const St
 [[nodiscard]] std::filesystem::path ResolveBackupTarget(const std::filesystem::path& backup_directory,
     const std::filesystem::path& requested, BackupTestHook* hook = nullptr);
 void RequireBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target);
-// With `backup_directory`, it and every existing directory from it down to the
-// target must be owned by the server user or root and not writable by group or
-// others; the target itself is always checked.
+// With `backup_directory`, resolved as ResolveBackupTarget resolves it, the
+// target must lie under it. On Linux and macOS, it and every existing directory
+// from it down to the target must be owned by the server user or root and not
+// writable by group or others; the target itself is always checked there.
 void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target, BackupTestHook* hook = nullptr,
     const std::filesystem::path& backup_directory = {});
 void EnsureBackupDirectory(const std::filesystem::path& path);

@@ -234,16 +234,23 @@ class SafeDirectory {
 #endif
     }
     // With `missing_ok`, a missing component ends the walk and Open returns
-    // false. With `unshared_from`, that directory and every directory below it
-    // on the path are checked through the descriptor that is walked, so no
-    // checked component can be replaced before its child is opened. Windows
-    // keeps its existing owner-only ACL handling.
+    // false. With `unshared_from`, the target must lie under that directory,
+    // compared in the same native spelling as the target; on Linux and macOS
+    // it and every directory below it on the path are checked through the
+    // descriptor that is walked, so no checked component can be replaced
+    // before its child is opened. Windows keeps its existing owner-only ACL
+    // handling. Callers pass `unshared_from` through CanonicalBackupPath.
     bool Open(const std::filesystem::path& path, bool create, bool missing_ok = false,
         const std::filesystem::path& unshared_from = {}) {
-        const auto unshared = unshared_from.empty() ? unshared_from : std::filesystem::absolute(unshared_from).lexically_normal();
 #ifdef _WIN32
         path_ = AbsoluteWindowsBackupPath(path);
+        const auto unshared = unshared_from.empty() ? unshared_from : AbsoluteWindowsBackupPath(unshared_from);
+#else
+        path_ = std::filesystem::absolute(path).lexically_normal();
+        const auto unshared = unshared_from.empty() ? unshared_from : std::filesystem::absolute(unshared_from).lexically_normal();
+#endif
         if (!unshared.empty() && !Within(path_, unshared)) throw std::invalid_argument("backup destination escapes --backup-dir");
+#ifdef _WIN32
         const auto components = SplitBackupWindowsPath(path_.native());
         auto at = components.root;
         const auto api_name = [&](const auto& component) {
@@ -259,9 +266,7 @@ class SafeDirectory {
         }
 #else
         (void)missing_ok;
-        path_ = std::filesystem::absolute(path).lexically_normal();
-        if (!unshared.empty() && !Within(path_, unshared)) throw std::invalid_argument("backup destination escapes --backup-dir");
-        fd_ =::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        fd_ = ::open("/", O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (fd_ < 0) throw std::runtime_error("cannot open backup path root");
         auto at = path_.root_path();
         if (!unshared.empty() && Within(at, unshared)) RequireUnsharedBackupDirectory(fd_, at);
@@ -934,7 +939,7 @@ void PrepareBackupTarget(const std::filesystem::path& source, const std::filesys
     if (hook) hook->Run(BackupTestHook::Point::kBeforeTargetCreate, {}, 0U);
     SafeDirectory directory;
     directory.Open(target, true, false,
-        backup_directory.empty() ? backup_directory : std::filesystem::weakly_canonical(backup_directory));
+        backup_directory.empty() ? backup_directory : CanonicalBackupPath(backup_directory));
     directory.RequireUnshared();
     if (!directory.Empty()) throw std::invalid_argument("backup destination must be absent or empty");
     PublishSafeFile(directory, kBackupIncompleteName, {'C', 'K', 'B', 'I'});
