@@ -18,6 +18,7 @@
 #include <functional>
 #include <limits>
 #include <random>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <system_error>
@@ -228,20 +229,32 @@ struct ImageSectionEntry {
     }
 }
 
+// One image section: its directory entry, and the body that follows the
+// directory. An uncompressed body is the caller's bytes, not a copy.
+struct ImageSection {
+    std::span<const std::uint8_t> body;
+    std::vector<std::uint8_t> compressed;
+};
+
 void AppendSection(
     std::vector<std::uint8_t>* directory,
-    std::vector<std::uint8_t>* bodies,
+    std::vector<ImageSection>* sections,
     std::uint16_t type,
     const std::vector<std::uint8_t>& raw,
     CheckpointCompression compression) {
     const bool compressed = compression == CheckpointCompression::kZrle;
-    const auto stored = compressed ? ZrleCompress(raw) : raw;
+    auto& section = sections->emplace_back();
+    if (compressed) {
+        section.compressed = ZrleCompress(raw);
+        section.body = section.compressed;
+    } else {
+        section.body = raw;
+    }
     WriteLe16(*directory, type);
     WriteLe16(*directory, compressed ? kImageSectionFlagZrle : 0U);
-    WriteLe32(*directory, static_cast<std::uint32_t>(stored.size()));
+    WriteLe32(*directory, static_cast<std::uint32_t>(section.body.size()));
     WriteLe32(*directory, static_cast<std::uint32_t>(raw.size()));
     WriteLe32(*directory, Crc32(raw));
-    bodies->insert(bodies->end(), stored.begin(), stored.end());
 }
 
 }  // namespace
@@ -265,23 +278,30 @@ std::vector<std::uint8_t> SerializeChunkImage(
     }
     const bool has_vars = vars != nullptr && !vars->empty();
     std::vector<std::uint8_t> directory;
-    std::vector<std::uint8_t> bodies;
-    AppendSection(&directory, &bodies, kImageSectionPayload, payload, compression);
-    AppendSection(&directory, &bodies, kImageSectionPresence, presence_bitmap, compression);
+    // At most four sections.
+    std::vector<ImageSection> sections;
+    sections.reserve(4U);
+    AppendSection(&directory, &sections, kImageSectionPayload, payload, compression);
+    AppendSection(&directory, &sections, kImageSectionPresence, presence_bitmap, compression);
     if (has_vars) {
-        AppendSection(&directory, &bodies, kImageSectionVars, vars->Encode(), compression);
+        AppendSection(&directory, &sections, kImageSectionVars, vars->Encode(), compression);
     }
     // Images of a table that never changed its columns stay as they were.
     const std::uint64_t schema_version = geometry.layout().schema().version;
     const bool has_schema = schema_version > 1U;
+    // A section body refers to it until the bodies are copied below.
+    std::vector<std::uint8_t> version_bytes;
     if (has_schema) {
-        std::vector<std::uint8_t> version_bytes;
         WriteLe64(version_bytes, schema_version);
-        AppendSection(&directory, &bodies, kImageSectionSchema, version_bytes, CheckpointCompression::kNone);
+        AppendSection(&directory, &sections, kImageSectionSchema, version_bytes, CheckpointCompression::kNone);
     }
 
+    std::size_t body_bytes = 0;
+    for (const auto& section : sections) {
+        body_bytes += section.body.size();
+    }
     std::vector<std::uint8_t> bytes;
-    bytes.reserve(kImageFixedHeaderSize + directory.size() + 4U + bodies.size());
+    bytes.reserve(kImageFixedHeaderSize + directory.size() + 4U + body_bytes);
     bytes.insert(bytes.end(), kImageMagic, kImageMagic + kImageMagicSize);
     WriteLe16(bytes, kImageFormatVersion);
     WriteLe16(bytes, static_cast<std::uint16_t>(2U + (has_vars ? 1U : 0U) + (has_schema ? 1U : 0U)));
@@ -295,7 +315,9 @@ std::vector<std::uint8_t> SerializeChunkImage(
     WriteLe64(bytes, commit_time_ms);
     bytes.insert(bytes.end(), directory.begin(), directory.end());
     WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
-    bytes.insert(bytes.end(), bodies.begin(), bodies.end());
+    for (const auto& section : sections) {
+        bytes.insert(bytes.end(), section.body.begin(), section.body.end());
+    }
     return bytes;
 }
 

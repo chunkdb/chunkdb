@@ -36,6 +36,15 @@ class WalFrameBuilder {
         std::optional<std::string_view> user = std::nullopt,
         bool gc = false);
 
+    // Makes room for records of `record_bytes` together and the frame
+    // trailer, so a frame whose size is known is staged without growing
+    // (and copying) the batch once per record.
+    void Reserve(std::size_t record_bytes);
+    // The bytes of one SPAN record of `size` bytes.
+    [[nodiscard]] static std::size_t SpanRecordBytes(std::size_t size) noexcept;
+    // The bytes of the records AppendVarUpdate(vars, undo) appends.
+    [[nodiscard]] static std::size_t VarUpdateRecordBytes(const ChunkVars& vars, const VarUndo& undo);
+
     // Appends one SPAN record writing `size` bytes at `byte_offset` of the
     // chunk state.
     void AppendSpan(std::uint32_t byte_offset, const std::uint8_t* bytes, std::size_t size);
