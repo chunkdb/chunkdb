@@ -55,6 +55,30 @@ struct AckDeadlineIoTestAccess {
         assert(watch.output.front().bytes->starts_with("-ERR TIMEOUT reason=ack_timeout"));
         state->Consumed(watch.output.front().bytes->size());
     }
+    // `holder` holds an admitted pool batch; `waiter` waits for the pool with `entry`.
+    static void StalledWrite(ChunkServer& server, const std::shared_ptr<SlotWatch>& holder, const std::shared_ptr<SlotWatch>& waiter,
+        const std::shared_ptr<const FeedEntry>& entry, std::chrono::milliseconds timeout) {
+        using std::chrono::steady_clock;
+        FeedIo io(server);
+        FeedIo::Watch watch;
+        watch.connection = std::make_shared<ServerConnection>(); watch.connection->session.slot_watch = holder;
+        io.Pull(watch, 1024U);
+        assert(watch.excess_frames != 0U);
+        // A batch queued long ago: one written byte restarts its clock.
+        watch.excess_progress -= std::chrono::hours(1);
+        const auto before = steady_clock::now();
+        io.Advance(watch, 1U);
+        const auto progress = watch.excess_progress;
+        assert(progress >= before);
+        assert(!io.ExpireStalledWrite(watch, progress + timeout - std::chrono::milliseconds(1)) && !watch.dead);
+        assert(!SlotAckDeadlineTestAccess::Publish(*waiter, entry)); // The pool is still held.
+        // No progress for the whole timeout: the watch is closed once.
+        assert(io.ExpireStalledWrite(watch, progress + timeout) && watch.dead);
+        assert(!io.ExpireStalledWrite(watch, progress + 2 * timeout));
+        io.ReleaseOutput(watch, holder); // As the close path does.
+        assert(SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
+        assert(SlotAckDeadlineTestAccess::Publish(*waiter, entry));
+    }
     // `state` holds one admitted excess-pool batch of `size` bytes, nothing else.
     static void ExcessQueue(ChunkServer& server, const std::shared_ptr<SlotWatch>& state, std::size_t size, std::size_t budget) {
         FeedIo io(server);
@@ -1202,59 +1226,46 @@ std::uint64_t MebibyteTransaction(Client& writer, int blocks) {
     return Number(writer.Command("COMMIT"));
 }
 void ExcessStalledHolder(bool tls) {
-    struct Observer : FeedDeliveryTestHook {
-        std::mutex mutex;
-        std::condition_variable changed;
-        std::string events; // A: a 5 MiB admission, C: a no-progress close.
-        void Run(Point point, std::size_t bytes) override {
-            if (point != Point::kAfterWriteDeadlineClose && !(point == Point::kAfterAdmission && bytes >= 5U * 1024U * 1024U)) return;
-            std::lock_guard lock(mutex); events += point == Point::kAfterAdmission ? 'A' : 'C'; changed.notify_all();
-        }
-        std::string Wait(std::size_t count) {
-            std::unique_lock lock(mutex);
-            if (!changed.wait_for(lock, 30s, [&] { return events.size() >= count; }))
-                throw std::runtime_error("delivery events: " + events);
-            return events;
-        }
-    } observer; // Outlives all server observers.
-    Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, 8U * 1024U * 1024U, {}, 60000ms, 3000ms);
-    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &observer);
-    Cleanup clear([&] { FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
-    auto writer = harness.Connect(); CreateLargeTable(*writer, {"holder", "waiter"});
-    auto ordinary = OrdinaryWatches(harness, 2U);
-    auto holder = harness.Connect(); holder->SetReceiveBuffer(4096);
-    (void)Start(holder->Command("WATCH t SLOT 'holder'"));
-    const auto first = Set(*writer, 1);
-    for (const auto& client : ordinary) assert(Change(NextChange(*client)) == first);
-    assert(Change(NextChange(*holder)) == first);
-    // Small socket buffers on both ends: no host buffer can take the whole frame.
-    FeedDeliveryTestAccess::LimitActiveSendBuffers(harness.server(), 4096);
-    // The holder stops reading. Five 1 MiB blocks exceed every share but fit the budget.
-    const auto large = MebibyteTransaction(*writer, 5);
-    assert(observer.Wait(1U) == "A");
-    // The pool cannot also hold the waiter's copy until the holder's write stalls for the timeout.
-    auto waiter = harness.Connect(); (void)Start(waiter->Command("WATCH t SLOT 'waiter'"));
-    assert(Change(NextChange(*waiter)) == first);
-    assert(Change(waiter->Read(30s), 5U) == large);
-    assert(observer.Wait(3U) == "ACA"); // Closed before the waiter was admitted, and only the holder.
-    waiter->Line("ACK " + std::to_string(large)); Unwatch(*waiter);
-    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "holder"), "acked")) < large);
-    for (const auto& client : ordinary) Unwatch(*client);
+    // Driven through the I/O watch state, so no host's socket buffering decides when the holder stalls.
+    constexpr std::size_t budget = 4096U, share = 1024U;
+    constexpr auto timeout = 3000ms;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget, {}, 60000ms, timeout);
+    auto writer = harness.Connect(); Create(*writer);
+    for (const auto* name : {"holder", "waiter"}) writer->Ok("CREATE SLOT '" + std::string(name) + "' ON t");
+    auto table = harness.catalog->Find("t");
+    const auto initial = table->ListFeedSlots().front().position;
+    const auto large = LabelTransaction(*writer, 20U);
+    FeedSlotTestAccess::Sync(*table);
+    auto archive = table->ReadFeedArchive(initial);
+    const auto entry = archive.Next();
+    assert(entry && entry->position.revision == large);
+    auto holder = SlotWatch::Create(table, "holder", {});
+    auto waiter = SlotWatch::Create(table, "waiter", {});
+    holder->SetQuota(share); waiter->SetQuota(share);
+    assert(SlotAckDeadlineTestAccess::Publish(*holder, entry) && SlotAckDeadlineTestAccess::Excess(*holder) > budget / 2U);
+    assert(!SlotAckDeadlineTestAccess::Publish(*waiter, entry));
+    AckDeadlineIoTestAccess::StalledWrite(harness.server(), holder, waiter, entry, timeout);
+    for (const auto& state : {holder, waiter}) {
+        while (auto output = state->Take(std::numeric_limits<std::size_t>::max())) state->Consumed(output->bytes->size());
+        state->Cancel(); state->WorkStep();
+    }
+    assert(SlotAckDeadlineTestAccess::Charged(*holder) == 0U && SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
 }
 void ExcessSlowReader(bool tls) {
-    Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, 8U * 1024U * 1024U, {}, 60000ms, 1000ms);
+    // A 2 MiB change above a 1.5 MiB share, read at about 270 KB/s: the transfer takes about
+    // twice the 4 s timeout, while the reader writes progress every 30 ms.
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, 3U * 1024U * 1024U, {}, 60000ms, 4000ms);
     auto writer = harness.Connect(); CreateLargeTable(*writer, {"consumer"});
     auto ordinary = OrdinaryWatches(harness, 1U); // Halves the slot share.
-    auto watch = harness.Connect(); watch->SetReceiveBuffer(16384);
+    auto watch = harness.Connect(); watch->SetReceiveBuffer(32768);
     (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
     const auto first = Set(*writer, 1);
     assert(Change(NextChange(*ordinary.front())) == first);
     assert(Change(NextChange(*watch)) == first);
-    FeedDeliveryTestAccess::LimitActiveSendBuffers(harness.server(), 16384);
-    const auto large = MebibyteTransaction(*writer, 5);
-    // About 1.6 MB/s: the transfer takes several timeouts, but every write makes progress.
-    watch->ReadPaced(5U * 1024U * 1024U, 32U * 1024U, 20ms);
-    assert(Change(watch->Read(), 5U) == large);
+    FeedDeliveryTestAccess::LimitActiveSendBuffers(harness.server(), 32768);
+    const auto large = MebibyteTransaction(*writer, 2);
+    watch->ReadPaced(2U * 1024U * 1024U, 8U * 1024U, 30ms);
+    assert(Change(watch->Read(), 2U) == large);
     watch->Line("ACK " + std::to_string(large)); Unwatch(*watch);
     assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == large);
     Unwatch(*ordinary.front());

@@ -197,6 +197,14 @@ void FeedIo::Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::
     // stops cannot hold the pool. Earlier charged output was already sent.
     if (excess && watch.excess_frames++ == 0U) watch.excess_progress = std::chrono::steady_clock::now();
 }
+bool FeedIo::ExpireStalledWrite(Watch& watch, std::chrono::steady_clock::time_point now) {
+    const auto timeout = std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
+    if (watch.dead || watch.excess_frames == 0U || now < watch.excess_progress + timeout) return false;
+    LogMessage(LogLevel::kWarn, LogComponent::kServer, "slot watch made no write progress",
+        {{"unsent_bytes", std::to_string(watch.bytes)}, {"timeout_ms", std::to_string(timeout.count())}});
+    watch.dead = true;
+    return true;
+}
 void FeedIo::ReleaseOutput(Watch& watch, const std::shared_ptr<SlotWatch>& slot) {
     // A dropped queue is never written; release its slot charges now.
     bool released = false;
@@ -546,13 +554,7 @@ void FeedIo::Run() {
                     const bool takeover_wait = slot && slot->TakingOver() && !slot->Finished();
                     if (!watch.dead && !takeover_wait && (!watch.connection->tls || watch.read_wait != POLLOUT)) Write(watch);
                     if (watch.close_immediate) watch.dead = true;
-                    if (!watch.dead && watch.excess_frames != 0U && std::chrono::steady_clock::now() >= watch.excess_progress +
-                            std::chrono::milliseconds(server_.config_.client_io_timeout_ms)) {
-                        LogMessage(LogLevel::kWarn, LogComponent::kServer, "slot watch made no write progress",
-                            {{"unsent_bytes", std::to_string(watch.bytes)},
-                             {"timeout_ms", std::to_string(server_.config_.client_io_timeout_ms)}});
-                        watch.dead = true; watch.deadline_closed = true;
-                    }
+                    (void)ExpireStalledWrite(watch, std::chrono::steady_clock::now());
                     if (watch.read_paused && watch.bytes <= std::max<std::size_t>(watch.share, 128U) - 128U)
                         watch.read_paused = false;
                 }
@@ -574,9 +576,6 @@ void FeedIo::Run() {
                         // The socket closes before its unwritten charges are released.
                         const auto slot = watch.connection->session.slot_watch;
                         server_.CloseClient(*watch.connection);
-                        if (watch.deadline_closed)
-                            if (auto* hook = hook_.load(std::memory_order_acquire))
-                                hook->Run(FeedDeliveryTestHook::Point::kAfterWriteDeadlineClose, 0U);
                         ReleaseOutput(watch, slot);
                     }
                     if (ack_timeout_closed)

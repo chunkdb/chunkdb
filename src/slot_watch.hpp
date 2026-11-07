@@ -21,8 +21,7 @@ struct FeedDeliveryTestHook {
         kWorkerReady, kAfterPendingWait, kBeforeWorkerHandle, kAfterWorkerHandle,
         kBeforeWorkerClose, kAfterWorkerClose, kBeforeClientRead, kAfterClientRead,
         kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kAfterProgressAdmission, kAfterPartialFeedWrite, kAfterBlockedFeedWrite, kAfterAckTimeoutClose, kBeforeSlotAck, kAfterSlotFinish, kBeforeReturnClient,
-        kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept, kAfterTakeoverFence, kAfterTakeoverClose, kAfterSlotAck, kAfterTakeoverReserved,
-        kAfterWriteDeadlineClose };
+        kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept, kAfterTakeoverFence, kAfterTakeoverClose, kAfterSlotAck, kAfterTakeoverReserved };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
@@ -133,16 +132,18 @@ class SlotWatch {
     static constexpr std::size_t kReceiptBytes = sizeof(MutationReceipt) + 4U * sizeof(void*);
     // The next frame while it waits for room. Its built form is kept within
     // the share and at the head of the pool queue, and dropped otherwise.
+    // No default member initializers: the type must be default-constructible
+    // while SlotWatch is incomplete, and emplace() value-initializes it.
     struct Prepared {
         std::shared_ptr<const FeedEntry> original;
-        std::uint64_t schema = 0;
-        bool send = false, built = false;
-        FeedEntry::Kind kind = FeedEntry::Kind::kChange;
-        std::uint64_t schema_version = 0;
-        std::size_t size = 0, receipt_bytes = 0;
-        std::shared_ptr<const FeedEntry> entry{};
-        std::deque<Output> next{};
-        std::list<MutationReceipt> receipt{};
+        std::uint64_t schema;
+        bool send, built;
+        FeedEntry::Kind kind;
+        std::uint64_t schema_version;
+        std::size_t size, receipt_bytes;
+        std::shared_ptr<const FeedEntry> entry;
+        std::deque<Output> next;
+        std::list<MutationReceipt> receipt;
         void Drop() noexcept { built = false; entry.reset(); next.clear(); receipt.clear(); }
     };
     void Build(Prepared& prepared) const;
