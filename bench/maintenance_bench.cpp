@@ -91,6 +91,18 @@ void PrintStat(const char* name, const std::optional<ProcessStats>& stats, std::
     if (stats) std::cout << (*stats).*field; else std::cout << "null";
 }
 
+// Checkpoints of every table so far, and how many ran on maintenance workers.
+struct CheckpointCounts { std::uint64_t total = 0U, background = 0U; };
+CheckpointCounts Checkpoints(const std::vector<std::shared_ptr<chunkdb::Table>>& tables) {
+    CheckpointCounts counts;
+    for (const auto& table : tables) {
+        const auto stats = table->Acquire()->store().RuntimeStats();
+        counts.total += stats.checkpoints;
+        counts.background += stats.background_checkpoints;
+    }
+    return counts;
+}
+
 void PrintSamples(const char* name, const std::vector<double>& samples) {
     std::cout << ",\"" << name << "_p50\":" << Percentile(samples, 0.50)
         << ",\"" << name << "_p99\":" << Percentile(samples, 0.99)
@@ -125,9 +137,11 @@ void Measure(const std::filesystem::path& directory, std::size_t count, const Op
         auto lease = tables[table]->Acquire();
         lease->store().SetBlockBits(0, 0, (written++ / count) % 2U == 0U ? "10000000" : "01000000");
     };
+    const auto checkpoints_before = Checkpoints(tables);
     const auto started = Clock::now();
     for (std::size_t i = 0U; i < options.requests; ++i) write(i % count);
     const auto finished = Clock::now();
+    const auto checkpoints_after = Checkpoints(tables);
     const auto stats = CurrentStats();
     const double flush_ms = TimedBarrier(catalog);
     // Each dirty barrier follows one write to every table; idle barriers
@@ -150,6 +164,10 @@ void Measure(const std::filesystem::path& directory, std::size_t count, const Op
     PrintStat("peak_rss_bytes", after, &ProcessStats::peak_rss_bytes);
     std::cout << ",\"write_seconds\":" << seconds
         << ",\"write_ops_per_second\":" << static_cast<double>(options.requests) / seconds
+        << ",\"write_checkpoints\":" << checkpoints_after.total - checkpoints_before.total
+        << ",\"write_inline_checkpoints\":"
+        << (checkpoints_after.total - checkpoints_before.total) -
+               (checkpoints_after.background - checkpoints_before.background)
         << ",\"flush_ms\":" << flush_ms << ",\"flushes\":" << options.flushes;
     PrintSamples("dirty_flush_ms", dirty);
     PrintSamples("idle_flush_ms", idle);

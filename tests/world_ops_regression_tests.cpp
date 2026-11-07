@@ -1799,6 +1799,80 @@ void TestBackgroundCheckpointFailureRetriesAndRecovers() {
 
 // ---- Empty-chunk GC failpoint ordering -------------------------------------
 
+// A relaxed write to a chunk whose background checkpoint is syncing its files
+// returns without waiting for those syncs, up to the deferred-checkpoint hard
+// bound, and every write made meanwhile survives a reopen.
+void TestWritesDoNotWaitForBackgroundCheckpointSyncs() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-bg-sync");
+    auto config = BaseConfig(dir.path());
+    config.checkpoint_update_interval = 1;
+    config.background_maintenance = true;
+    {
+        chunkdb::ChunkStore store(config);
+        // The barrier's floor makes every later checkpoint sync its files.
+        store.WalBarrier();
+        store.ArmCheckpointBeforeWalRemovalPauseForTests();
+        store.SetBlockBits(0, 0, "10101");
+        assert(store.WaitForCheckpointBeforeWalRemovalForTests());
+
+        // The hard bound is 4 x checkpoint_update_interval writes since the
+        // paused checkpoint took its image.
+        auto writes = std::async(std::launch::async, [&] {
+            store.SetBlockBits(1, 0, "01010");
+            store.SetBlockBits(2, 0, "11100");
+            store.UnsetBlock(1, 0);
+            store.SetBlockBits(3, 0, "00111");
+        });
+        const bool writes_returned = writes.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        auto bounded = std::async(std::launch::async, [&] { store.SetBlockBits(0, 1, "11011"); });
+        const bool bounded_waited = bounded.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready;
+        store.ResumeCheckpointBeforeWalRemovalForTests();
+        writes.get();
+        bounded.get();
+        assert(writes_returned);
+        assert(bounded_waited);
+        assert(store.GetBlockBits(2, 0) == "11100");
+        assert(!store.BlockExists(1, 0));
+        store.WalBarrier();
+    }
+    config.background_maintenance = false;
+    chunkdb::ChunkStore reopened(config);
+    assert(reopened.GetBlockBits(0, 0) == "10101");
+    assert(!reopened.BlockExists(1, 0));
+    assert(reopened.GetBlockBits(2, 0) == "11100");
+    assert(reopened.GetBlockBits(3, 0) == "00111");
+    assert(reopened.GetBlockBits(0, 1) == "11011");
+}
+
+// Checkpoints that run beside a writer keep each write, whether its frame
+// was absorbed into the image or written to the next WAL.
+void TestBackgroundCheckpointsKeepConcurrentWrites() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-bg-concurrent");
+    auto config = BaseConfig(dir.path());
+    config.checkpoint_update_interval = 3;
+    config.wal_group_commit_updates = 2;
+    config.background_maintenance = true;
+    std::vector<std::string> expected(32);
+    {
+        chunkdb::ChunkStore store(config);
+        store.WalBarrier();
+        for (std::size_t i = 0U; i < 1500U; ++i) {
+            const std::size_t block = (i * 7U) % expected.size();
+            std::string bits(5, '0');
+            for (std::size_t b = 0U; b < bits.size(); ++b) bits[b] = ((i >> b) & 1U) != 0U ? '1' : '0';
+            store.SetBlockBits(static_cast<std::int64_t>(block % 8U), static_cast<std::int64_t>(block / 8U), bits);
+            expected[block] = bits;
+        }
+        store.WalBarrier();
+    }
+    config.background_maintenance = false;
+    chunkdb::ChunkStore reopened(config);
+    for (std::size_t block = 0U; block < expected.size(); ++block) {
+        assert(reopened.GetBlockBits(static_cast<std::int64_t>(block % 8U), static_cast<std::int64_t>(block / 8U)) ==
+               expected[block]);
+    }
+}
+
 void TestEmptyChunkGcOrderingAndRecovery() {
     for (const char* failpoint :
          {"CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_IMAGE_REMOVE_ONCE",
@@ -2105,6 +2179,8 @@ int main() {
     TestEvictionKeepsRecentlyUsedResident();
     TestScanContentionFallbackCachesTheChunk();
     TestBackgroundCheckpointFailureRetriesAndRecovers();
+    TestWritesDoNotWaitForBackgroundCheckpointSyncs();
+    TestBackgroundCheckpointsKeepConcurrentWrites();
     TestEmptyChunkGcOrderingAndRecovery();
     TestLargeGeometryConditionalMutationIsAtomic();
     TestTornFrameIsIgnoredAsAWhole();

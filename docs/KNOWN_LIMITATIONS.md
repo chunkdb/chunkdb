@@ -21,6 +21,7 @@
 - **Filesystem entries:** populated chunks and WALs consume separate filesystem entries.
 - **Scan catalog memory:** the first scan builds an in-memory large-chunk catalog; each visited large-chunk directory is listed in full.
 - **Background threads:** maintenance and FLUSH WAL share `--maintenance-workers` threads, but a table with watches or slots still runs its own feed sender and slot worker threads, and a timer thread while `--feed-linger-ms` keeps its feed after the last watch; see [Server flags](SERVER_FLAGS.md).
+- **Background checkpoint syncs:** at most `--maintenance-workers` background checkpoints sync at once per data directory; when writes make checkpoints due faster than those workers finish them, a write waits for or runs its chunk's checkpoint once the chunk holds four checkpoint intervals of deferred updates.
 - **Authenticated metrics:** SHOW METRICS provides Prometheus text; there is no native HTTP scrape endpoint.
 - **Audit log durability:** audit lines are flushed but not synced, so a power loss can drop the latest ones; a line that cannot be written does not fail its statement; on Windows a rotated audit log is reopened only by a restart; see [Server flags](SERVER_FLAGS.md#logs).
 - **PROXY protocol version 2 only:** the text header of version 1 is not accepted.

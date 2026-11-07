@@ -269,6 +269,7 @@ bool ChunkStore::TryEvictCandidate(
 
     {
         std::unique_lock chunk_lock(regular_chunk->mutex);
+        AwaitChunkFilesLocked(chunk_lock, *regular_chunk);
         // Its WAL past the last good point is not committed state, so memory
         // is the only right copy until a restart repairs the WAL.
         if (regular_chunk->wal_repair_failed) {
@@ -312,6 +313,7 @@ bool ChunkStore::TryEvictCandidate(
     }
     {
         std::unique_lock chunk_lock(regular_chunk->mutex);
+        AwaitChunkFilesLocked(chunk_lock, *regular_chunk);
         if (regular_chunk->wal_repair_failed || !regular_chunk->wal_batch.empty()) {
             return false;
         }

@@ -203,6 +203,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
                         const auto resident = large->chunks.find(coord);
                         if (resident != large->chunks.end()) {
                             chunk_lock = std::unique_lock(resident->second->mutex);
+                            store.AwaitChunkFilesLocked(chunk_lock, *resident->second);
                             if (resident->second->wal_repair_failed) throw std::runtime_error("backup refuses an unrepaired WAL");
                             store.FlushWalBatch(coord, resident->second, false);
                         }

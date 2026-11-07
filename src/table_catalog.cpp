@@ -622,6 +622,7 @@ void Table::PrepareFeedSlotBaseline(ChunkStore& store) {
                 if (loaded.revision != 0U) store.RaiseVersionClockAbove(loaded.revision);
             }
             std::unique_lock chunk_lock(chunk->mutex);
+            store.AwaitChunkFilesLocked(chunk_lock, *chunk);
             store.CheckpointChunk(coord, chunk);
         }
         store.feed_slots_->prefix_index().Clear();

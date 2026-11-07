@@ -186,6 +186,7 @@ void ChunkStore::RunBackgroundCheckpoint(const ChunkCoord& chunk_coord) noexcept
     }
 
     std::unique_lock lock(chunk->mutex);
+    AwaitChunkFilesLocked(lock, *chunk);
     const bool eligible = chunk->pending_updates >= checkpoint_update_interval_ ||
                           chunk->wal_bytes >= checkpoint_wal_bytes_ ||
                           chunk->deferred_wal_compaction;
@@ -194,9 +195,32 @@ void ChunkStore::RunBackgroundCheckpoint(const ChunkCoord& chunk_coord) noexcept
     }
 
     try {
-        if (!CheckpointChunk(chunk_coord, chunk)) return;
+        // Writes go on while the files are replaced, so the writer that
+        // revisits this chunk does not wait out the checkpoint's syncs.
+        if (!CheckpointChunk(chunk_coord, chunk, nullptr, &lock)) return;
         chunk->background_checkpoint_failed = false;
         stats_background_checkpoints_.fetch_add(1, std::memory_order_relaxed);
+        // Those writes held back their group-commit flush and their
+        // checkpoint check (MaybeCheckpointChunk); both happen here. A failed
+        // flush keeps the batch, and the chunk's next write retries it.
+        if (chunk->pending_wal_flush_updates >= wal_group_commit_updates_) {
+            try {
+                FlushWalBatch(chunk_coord, chunk, false);
+            } catch (const std::exception& flush_error) {
+                LogBestEffort([&]() {
+                    LogMessage(
+                        LogLevel::kError,
+                        LogComponent::kStore,
+                        "WAL flush after a background checkpoint failed; next write retries",
+                        {
+                            {"chunk_x", std::to_string(chunk_coord.x)},
+                            {"chunk_y", std::to_string(chunk_coord.y)},
+                            {"error", flush_error.what()},
+                        });
+                });
+            }
+        }
+        if (IsCheckpointDue(chunk)) (void)EnqueueBackgroundCheckpoint(chunk_coord);
     } catch (const std::exception& e) {
         stats_background_checkpoint_failures_.fetch_add(1, std::memory_order_relaxed);
         // The next eligible write to this chunk retries the checkpoint

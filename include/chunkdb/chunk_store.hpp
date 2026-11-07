@@ -910,6 +910,13 @@ class ChunkStore {
         // when unknown.
         std::uint64_t commit_time_ms = 0;
         bool background_checkpoint_failed = false;
+        // A background checkpoint is replacing this chunk's image and WAL
+        // without holding `mutex` (CheckpointChunk). Until it ends, ordinary
+        // writes change only memory and the batch, and every other change
+        // waits (AwaitChunkFilesLocked). The counters hold what it absorbs.
+        bool checkpoint_io = false;
+        std::size_t checkpoint_io_updates = 0;
+        std::size_t checkpoint_io_wal_bytes = 0;
         // Read-only stores: the stable snapshot generation this copy was read
         // at (LoadedChunkPayload::read_only_generation).
         std::pair<std::uint64_t, std::uint64_t> read_only_generation{};
@@ -1160,6 +1167,8 @@ class ChunkStore {
     bool maintenance_stop_ = false;
     std::shared_ptr<MaintenancePool> maintenance_pool_;
     std::shared_ptr<MaintenanceTask> maintenance_task_;
+    // Notified when a background checkpoint stops owning a chunk's files.
+    std::condition_variable_any checkpoint_io_cv_;
 
     mutable std::mutex wal_parent_cache_mutex_;
     std::condition_variable wal_parent_cache_cv_;
@@ -1395,6 +1404,13 @@ class ChunkStore {
     bool MaintenanceStep();
     [[nodiscard]] bool EnqueueBackgroundCheckpoint(const ChunkCoord& chunk_coord);
     void RunBackgroundCheckpoint(const ChunkCoord& chunk_coord) noexcept;
+    // Waits, releasing `lock`, while a background checkpoint owns the
+    // chunk's files.
+    void AwaitChunkFilesLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk);
+    // Waits only while an ordinary write would also pass the hard bound of
+    // deferred checkpoints (MaybeCheckpointChunk).
+    void AwaitChunkBacklogLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk);
+    [[nodiscard]] bool CheckpointHardBoundReached(std::size_t updates, std::size_t wal_bytes) const noexcept;
     // Before a synced checkpoint publishes an image into `directory`. A
     // chunk directory this store has not prepared itself may have been made
     // by a preparation that failed before its parent was synced, here or in
@@ -1619,10 +1635,14 @@ class ChunkStore {
     // reflects the checkpoint's target state, so a caller whose atomicity
     // depends on the image can distinguish a pre-replace failure (nothing
     // committed, safe to roll back) from a post-replace durability failure.
+    // Given `release`, the chunk's lock, a relaxed checkpoint of a populated
+    // chunk without a feed archive writes and syncs the files with it
+    // unlocked (RegularChunk::checkpoint_io) and returns with it locked.
     bool CheckpointChunk(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
-        bool* out_image_committed = nullptr);
+        bool* out_image_committed = nullptr,
+        std::unique_lock<RegularChunkMutex>* release = nullptr);
 
     void AcquireProcessLock(bool allow_multiple_processes);
     void ReleaseProcessLock() noexcept;
