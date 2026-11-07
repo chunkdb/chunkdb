@@ -31,7 +31,8 @@ inline constexpr char kUsage[] =
     "  --ops N          operations per timed window, a multiple of 1024 (default 204800)\n"
     "  --runs N         runs, each on a fresh store (default 15)\n"
     "  --data-dir PATH  where the run-N store directories are made; a run-N that exists stops the benchmark,\n"
-    "                   and PATH itself is removed only if the benchmark made it and it is empty at the end\n"
+    "                   and PATH itself, not parents made on the way, is removed only if the benchmark made it\n"
+    "                   and it is empty at the end\n"
     "                   (default: a new directory under the temp dir)\n"
     "  --keep-data      do not delete the directories the benchmark made\n";
 

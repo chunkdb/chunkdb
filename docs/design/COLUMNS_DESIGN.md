@@ -19,7 +19,7 @@ The cost is that a loaded chunk holds full arrays even when few of its blocks ar
 Maps exist only at chunk level: the chunks of a large chunk, the large chunks of a table and the cache of loaded chunks, each keyed by chunk coordinates.
 On every operation, a point read or write of a loaded chunk does two hash lookups by chunk coordinates, each under its own mutex: its large chunk in the table's map, then the chunk in that large chunk's map; the third map is used only when a chunk is loaded or its object is freed.
 A write that flushes its chunk's WAL batch, in relaxed mode once per `wal_group_commit_updates` writes to the chunk and in the synced modes on every write, does more lookups.
-It finds the chunk's stream in the process's open WAL streams, keyed by the chunk object's address, and in relaxed mode it adds the WAL file's path, hashed as a string, to the store's set of unsynced files, first looking up the file's directory once that tracking has grown past its limit and tracks large-chunk directories instead of their files.
+It finds the chunk's stream in the process's open WAL streams, keyed by the chunk object's address, and in relaxed mode it adds the WAL file's path, hashed as a string, to the store's set of unsynced files; once tracking past its limit tracks some large-chunk directories instead of their files, it first looks up the file's directory and adds nothing if that directory is tracked, and once tracking falls back to the whole data directory it does neither.
 Opening a WAL stream, a checkpoint, an open transaction and a change feed's archive do further lookups, keyed by paths or chunk coordinates.
 
 `chunkdb_chunk_map_bench` measures what the two per-operation lookups cost on a warm cache.

@@ -705,11 +705,7 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_chunk_map_bench_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
     add_test(NAME chunk_map_bench_args COMMAND chunkdb_chunk_map_bench_test)
 
-    add_test(
-        NAME chunk_map_bench_smoke
-        COMMAND chunkdb_chunk_map_bench --chunks 256 --ops 2048 --runs 2
-            --data-dir "${CMAKE_CURRENT_BINARY_DIR}/chunk-map-bench-smoke"
-    )
+    add_test(NAME chunk_map_bench_smoke COMMAND chunkdb_chunk_map_bench --chunks 256 --ops 2048 --runs 2)
 
     add_executable(chunkdb_budget_compare_test tests/budget_compare_tests.cpp)
     target_link_libraries(chunkdb_budget_compare_test PRIVATE chunkdb_budget_compare_lib)
