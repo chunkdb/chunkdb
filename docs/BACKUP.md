@@ -22,11 +22,11 @@ cuts:
 ```
 
 The destination is relative to `--backup-dir` and must be absent or empty, outside the live data directory.
-Use `/` separators; rooted paths, backslashes, `..` components, and symlinks below the resolved backup directory are refused.
+Use `/` separators; rooted paths, backslashes, `..` components, and symbolic links or Windows reparse points below the resolved backup directory are refused.
 Missing parents are created with owner-only permissions.
 On Linux and macOS, `--backup-dir` itself, every existing directory below it and an existing destination must belong to the server user or root and must not be writable by group or others.
 Such a directory is refused, not changed; directories above `--backup-dir` are not checked.
-The configured backup and data directories themselves may use symlinked paths.
+The configured backup and data directories themselves may use symbolic links, Windows directory junctions or extended-length (`\\?\`) paths.
 
 Writes continue during copying.
 Each table has its own cut, a revision through which all its committed changes are included.
