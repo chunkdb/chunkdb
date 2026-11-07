@@ -1,4 +1,3 @@
-| `owner` | Bulk user name, shown to that user and to MANAGES USERS; null otherwise or for a slot without a recorded owner. |
 # Protocol foundation: reply shapes and compatibility
 
 This defines the A1–A9 and G7 protocol contracts for the protocol foundation.
@@ -206,6 +205,7 @@ SHOW SLOTS retains `table`, `name`, `epoch`, `acked`, `retained_bytes` and `lost
 | `filters.no_before` | Boolean; false by default. |
 | `filters.chunks` | Boolean; false by default. |
 | `lost_reason` | Null for a live slot; `retention_limit` or `schema_filter` for a persisted loss. |
+| `owner` | Bulk user name, shown to that user and to MANAGES USERS; null otherwise or for a slot without a recorded owner. |
 
 Area arrays contain `2*d` values; the current 2D order is `[x0,y0,x1,y1]`, and clients do not hard-code four entries.
 A rename changes only the display name; a dropped ID retains its position with a null display name.

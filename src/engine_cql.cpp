@@ -977,6 +977,8 @@ std::string CommandEngine::ExecuteStatement(
                     };
                     if (watch.slot) {
                         const auto* user = config_.require_auth ? CurrentUser(session) : nullptr;
+                        // A user dropped since the right check must not become an owner.
+                        if (config_.require_auth && !user) throw UserDroppedError();
                         const bool admin_all = !config_.require_auth || (user && user->grants.contains(kEveryTable) &&
                             user->grants.at(kEveryTable) >= Right::kAdmin);
                         auto state = SlotWatch::Create(table, *watch.slot, options, watch.takeover,

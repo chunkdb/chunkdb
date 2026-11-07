@@ -112,7 +112,7 @@ UNWATCH
 ## Returns
 
 - CREATE and DROP SLOT: `OK`, including authorized conditional no-ops.
-- SHOW SLOTS: visible table, name, epoch, saved `acked` revision, retained bytes, lost state, filters, loss reason, and owner; the owner is shown to that user and to MANAGES USERS, and is null otherwise.
+- SHOW SLOTS: visible table, name, epoch, saved `acked` revision, retained bytes, lost state, filters, loss reason, and owner; the owner is shown to that user and to MANAGES USERS, and is null otherwise; a table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
 - WATCH: start position, followed by change or chunks, schema, progress, or resync events.
 - ACK: no success reply; it is accepted only inside a slot watch.
 - UNWATCH: `OK` after the last push; ordinary statements can then resume.

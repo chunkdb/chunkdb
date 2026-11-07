@@ -70,7 +70,8 @@ class SlotWatch {
     // The slot's owner when it was claimed, or as BindOwner recorded it.
     [[nodiscard]] const std::optional<std::string>& owner() const noexcept { return slot_owner_; }
     // Records `user` as the owner of a slot claimed without one, before the
-    // watch is activated. A failure records nothing and ends this watch.
+    // watch is activated. A failure ends this watch; it records nothing
+    // unless the outcome of the write is unknown, which fences the store.
     void BindOwner(const std::string& user);
     [[nodiscard]] std::size_t budget() const noexcept { return options_.buffer_bytes.value_or(table_->FeedBufferBytes()); }
     [[nodiscard]] std::optional<Output> Take(std::size_t room);
