@@ -27,7 +27,7 @@ Pool destruction drains accepted jobs and joins its workers.
 
 In relaxed mode a background checkpoint writes and syncs the chunk image and removes the WAL without holding the chunk lock.
 It takes the image, closes the WAL stream and marks the chunk under the lock, and clears the mark when it has retaken the lock.
-While the mark is set, an ordinary write changes only memory and the batch.
+While the mark is set, an ordinary block write changes only memory and the batch; SET CHUNK waits for the mark.
 Its group-commit flush and checkpoint check wait for the checkpoint, which runs both when it ends.
 A write waits for the checkpoint once the writes since the image reach the hard bound of four checkpoint intervals or four WAL thresholds.
 Transactions, conditional writes, barriers, eviction, backup and feed-slot preparation wait for the mark before they touch the chunk's files.
