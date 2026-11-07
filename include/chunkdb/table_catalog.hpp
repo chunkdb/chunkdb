@@ -37,6 +37,7 @@ class UserRegistry;
 class ProcessLock;
 class SlotWatch;
 struct FeedSlotClaim;
+struct FeedExcessPool;
 struct FeedSlotAckState;
 
 // Conventional table name for callers that explicitly create it.
@@ -330,6 +331,7 @@ class Table : public std::enable_shared_from_this<Table> {
     std::map<std::string, std::weak_ptr<FeedSlotClaim>> slot_claims_;
     std::shared_ptr<FeedSlotAckState> slot_ack_state_;
     std::shared_ptr<std::atomic<std::size_t>> slot_output_bytes_ = std::make_shared<std::atomic<std::size_t>>(0U);
+    std::shared_ptr<FeedExcessPool> slot_excess_;
 };
 
 // The tables of one data directory (docs/STORAGE_FORMAT.md Section 1):

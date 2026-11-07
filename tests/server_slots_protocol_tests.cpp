@@ -1,6 +1,7 @@
 #include <atomic>
 #include <condition_variable>
 #include <iostream>
+#include <limits>
 #include <future>
 #include <map>
 
@@ -9,6 +10,10 @@
 #include "slot_watch.hpp"
 #include "server_feed.hpp"
 #include "feed_slot_records.hpp"
+#ifdef CHUNKDB_WITH_OPENSSL
+#include <openssl/bio.h>
+#include <openssl/pem.h>
+#endif
 
 namespace chunkdb {
 struct SlotAckDeadlineTestAccess {
@@ -19,6 +24,15 @@ struct SlotAckDeadlineTestAccess {
     static bool Expire(SlotWatch& watch, std::chrono::steady_clock::time_point now) { return watch.ExpireAckDeadline(now); }
     static std::size_t Count(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.receipts_.size(); }
     static std::size_t Charged(const SlotWatch& watch) { return watch.table_bytes_->load(std::memory_order_acquire); }
+    static std::size_t Excess(const SlotWatch& watch) { return watch.pool_->bytes.load(std::memory_order_acquire); }
+    static constexpr std::size_t kReceipt = SlotWatch::kReceiptBytes;
+    static std::size_t PreparedSize(const SlotWatch& watch) { return watch.prepared_ ? watch.prepared_->size : 0U; }
+    // Stands in for other output charged to the table's within-share counter.
+    static void ChargeTable(SlotWatch& watch, std::size_t bytes) { watch.table_bytes_->fetch_add(bytes, std::memory_order_acq_rel); }
+    static void ReleaseTable(SlotWatch& watch, std::size_t bytes) { watch.table_bytes_->fetch_sub(bytes, std::memory_order_acq_rel); }
+    static std::shared_ptr<const std::string> Prepared(const SlotWatch& watch) {
+        return watch.prepared_ && watch.prepared_->built ? watch.prepared_->next.back().bytes : nullptr;
+    }
     static void Hook(SlotWatch& watch, FeedDeliveryTestHook* hook) { watch.hook_.store(hook, std::memory_order_release); }
     static std::uint64_t Acked(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.acknowledged_; }
 };
@@ -39,6 +53,116 @@ struct AckDeadlineIoTestAccess {
         assert(watch.close && watch.close_immediate && watch.output.size() == 1U);
         assert(watch.output.front().bytes->starts_with("-ERR TIMEOUT reason=ack_timeout"));
         state->Consumed(watch.output.front().bytes->size());
+    }
+    // `holder` holds an admitted pool batch; `waiter` waits for the pool with `entry`.
+    static void StalledWrite(ChunkServer& server, const std::shared_ptr<SlotWatch>& holder, const std::shared_ptr<SlotWatch>& waiter,
+        const std::shared_ptr<const FeedEntry>& entry, std::chrono::milliseconds timeout) {
+        using std::chrono::steady_clock;
+        FeedIo io(server);
+        FeedIo::Watch watch;
+        watch.connection = std::make_shared<ServerConnection>(); watch.connection->session.slot_watch = holder;
+        io.Pull(watch, 1024U);
+        assert(watch.excess_frames != 0U);
+        // Writes spaced half a timeout apart, simulated by moving the last progress
+        // back: together they span two timeouts, and each restarts the clock.
+        for (int write = 0; write < 4; ++write) {
+            watch.excess_progress -= timeout / 2;
+            assert(!io.ExpireStalledWrite(watch, steady_clock::now()));
+            const auto before = steady_clock::now();
+            io.Advance(watch, 1U);
+            assert(watch.excess_progress >= before);
+        }
+        const auto progress = watch.excess_progress;
+        assert(!io.ExpireStalledWrite(watch, progress + timeout - std::chrono::milliseconds(1)) && !watch.dead);
+        assert(!SlotAckDeadlineTestAccess::Publish(*waiter, entry)); // The pool is still held.
+        // No progress for the whole timeout: the watch is closed once.
+        assert(io.ExpireStalledWrite(watch, progress + timeout) && watch.dead);
+        assert(!io.ExpireStalledWrite(watch, progress + 2 * timeout));
+        io.ReleaseOutput(watch, holder); // As the close path does.
+        assert(SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
+        assert(SlotAckDeadlineTestAccess::Publish(*waiter, entry));
+    }
+#ifdef CHUNKDB_WITH_OPENSSL
+    // A server TLS session whose peer is a memory pipe smaller than one record,
+    // so SSL_write blocks without any socket or reader scheduling.
+    static void TlsWriteCap(ChunkServer& server) {
+        auto* server_context = SSL_CTX_new(TLS_server_method());
+        auto* client_context = SSL_CTX_new(TLS_client_method());
+        const auto& cert_pem = slot_socket_test::kTestTlsCertPem;
+        const auto& key_pem = slot_socket_test::kTestTlsKeyPem;
+        auto* cert_bio = BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size()));
+        auto* key_bio = BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size()));
+        auto* cert = PEM_read_bio_X509(cert_bio, nullptr, nullptr, nullptr);
+        auto* key = PEM_read_bio_PrivateKey(key_bio, nullptr, nullptr, nullptr);
+        assert(server_context && client_context && cert && key);
+        assert(SSL_CTX_use_certificate(server_context, cert) == 1 && SSL_CTX_use_PrivateKey(server_context, key) == 1);
+        auto* server_tls = SSL_new(server_context);
+        auto* client_tls = SSL_new(client_context);
+        BIO* server_bio = nullptr;
+        BIO* client_bio = nullptr;
+        assert(BIO_new_bio_pair(&server_bio, 8192, &client_bio, 8192) == 1);
+        SSL_set_bio(server_tls, server_bio, server_bio);
+        SSL_set_bio(client_tls, client_bio, client_bio);
+        SSL_set_accept_state(server_tls); SSL_set_connect_state(client_tls);
+        for (int step = 0; step < 100 && !(SSL_is_init_finished(server_tls) && SSL_is_init_finished(client_tls)); ++step) {
+            (void)SSL_do_handshake(client_tls); (void)SSL_do_handshake(server_tls);
+        }
+        assert(SSL_is_init_finished(server_tls) && SSL_is_init_finished(client_tls));
+        std::string received;
+        const auto drain = [&] {
+            std::array<char, 4096> buffer{};
+            for (;;) {
+                const auto count = SSL_read(client_tls, buffer.data(), static_cast<int>(buffer.size()));
+                if (count <= 0) { ERR_clear_error(); return; }
+                received.append(buffer.data(), static_cast<std::size_t>(count));
+            }
+        };
+        {
+            FeedIo io(server);
+            FeedIo::Watch watch;
+            watch.connection = std::make_shared<ServerConnection>(); watch.connection->tls = server_tls;
+            const auto frame = std::make_shared<const std::string>(64U * 1024U, 'x');
+            io.Queue(watch, frame);
+            io.Write(watch);
+            // The first call passed one record and blocked with that length pinned.
+            assert(!watch.dead && watch.offset == 0U && watch.write_size == 16384 && watch.write_wait == POLLOUT);
+            for (int round = 0; round < 64 && !watch.output.empty(); ++round) {
+                const auto offset = watch.offset;
+                drain();
+                // OpenSSL refuses a retry with another buffer or length, so success proves both are reused.
+                io.Write(watch);
+                assert(!watch.dead);
+                const auto written = (watch.output.empty() ? frame->size() : watch.offset) - offset;
+                assert(written <= 16384U && (watch.output.empty() || watch.write_size == 0 || watch.write_size <= 16384));
+            }
+            drain();
+            assert(watch.output.empty() && received == *frame);
+            watch.connection->tls = nullptr;
+        }
+        SSL_free(server_tls); SSL_free(client_tls);
+        SSL_CTX_free(server_context); SSL_CTX_free(client_context);
+        X509_free(cert); EVP_PKEY_free(key); BIO_free(cert_bio); BIO_free(key_bio);
+    }
+#endif
+    // `state` holds one admitted excess-pool batch of `size` bytes, nothing else.
+    static void ExcessQueue(ChunkServer& server, const std::shared_ptr<SlotWatch>& state, std::size_t size, std::size_t budget) {
+        FeedIo io(server);
+        FeedIo::Watch watch;
+        watch.connection = std::make_shared<ServerConnection>(); watch.connection->session.slot_watch = state;
+        // Uncharged replies leave less than the batch of the budget's room.
+        const auto reply = budget - size + 1U;
+        io.Queue(watch, std::make_shared<const std::string>(reply, 'x'));
+        const auto before = std::chrono::steady_clock::now();
+        io.Pull(watch, 1024U);
+        assert(!state->Take(std::numeric_limits<std::size_t>::max())); // The whole accepted batch was taken.
+        assert(watch.output.size() >= 2U && watch.excess_frames == watch.output.size() - 1U);
+        assert(watch.excess_progress >= before); // The no-progress clock started.
+        // A partly written batch dropped with its connection releases the pool at once.
+        io.Advance(watch, reply + 1U);
+        assert(SlotAckDeadlineTestAccess::Excess(*state) == size - 1U);
+        io.ReleaseOutput(watch, state);
+        assert(watch.output.empty() && watch.excess_frames == 0U);
+        assert(SlotAckDeadlineTestAccess::Excess(*state) == 0U && SlotAckDeadlineTestAccess::Charged(*state) == 0U);
     }
 };
 }
@@ -1072,6 +1196,409 @@ void TinyBudgetTerminates(bool tls) {
     const auto listed = writer->Command("SHOW SLOTS ON t");
     assert(!Boolean(Field(Slot(listed, "t", "consumer"), "lost")));
 }
+// One transaction writing `blocks` fresh blocks with long labels from block row `row`.
+std::uint64_t LabelTransaction(Client& writer, unsigned blocks, unsigned row = 0U) {
+    writer.Ok("BEGIN");
+    for (unsigned i = 0U; i < blocks; ++i)
+        assert(writer.Command("SET BLOCK " + std::to_string(i % 64U) + " " + std::to_string(row + i / 64U) +
+            " IN t label = '" + std::string(120U, 'x') + "'").type == '_');
+    return Number(writer.Command("COMMIT"));
+}
+std::vector<std::unique_ptr<Client>> OrdinaryWatches(Harness& harness, std::size_t count) {
+    std::vector<std::unique_ptr<Client>> watches;
+    for (std::size_t i = 0U; i < count; ++i) {
+        watches.push_back(harness.Connect()); (void)Start(watches.back()->Command("WATCH t"));
+    }
+    return watches;
+}
+void ShareIndependentDelivery(bool tls) {
+    constexpr std::size_t budget = 16384U, kOrdinary = 31U; // A share of 512 bytes.
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    auto ordinary = OrdinaryWatches(harness, kOrdinary);
+    auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
+    // Every watch delivers a change, so the I/O thread has applied the
+    // 32-watch share to the slot before the large change is admitted.
+    const auto first = Set(*writer, 1); FeedSlotTestAccess::Sync(*table);
+    for (const auto& client : ordinary) assert(Change(NextChange(*client)) == first);
+    assert(Change(NextChange(*watch)) == first);
+    const auto large = LabelTransaction(*writer, 24U); FeedSlotTestAccess::Sync(*table);
+    const auto change = watch->Read();
+    assert(Change(change, 24U) == large); // About 4 KiB: above the share, within the table budget.
+    watch->Line("ACK " + std::to_string(large)); Unwatch(*watch);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == large);
+    for (const auto& client : ordinary) Unwatch(*client); // Ordinary watches above their share resync.
+}
+void TableBudgetStillTerminates(bool tls) {
+    constexpr std::size_t budget = 16384U;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    auto ordinary = OrdinaryWatches(harness, 7U);
+    auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
+    const auto first = Set(*writer, 1); FeedSlotTestAccess::Sync(*table);
+    for (const auto& client : ordinary) assert(Change(NextChange(*client)) == first);
+    assert(Change(NextChange(*watch)) == first);
+    (void)LabelTransaction(*writer, 128U); FeedSlotTestAccess::Sync(*table); // About 20 KiB.
+    const auto refused = watch->Read();
+    Error(refused, "OUT_OF_RANGE"); assert(refused.value.find("table feed buffer") != std::string::npos);
+    Closed(*watch);
+    assert(!Boolean(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "lost")));
+    for (const auto& client : ordinary) Unwatch(*client);
+}
+void ExcessPoolBound(bool tls) {
+    constexpr std::size_t budget = 4096U, share = 1024U;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer);
+    for (const auto* name : {"first", "second", "third"}) writer->Ok("CREATE SLOT '" + std::string(name) + "' ON t");
+    auto table = harness.catalog->Find("t");
+    const auto initial = table->ListFeedSlots().front().position;
+    const auto small = Set(*writer, 1);
+    const auto large = LabelTransaction(*writer, 20U);
+    FeedSlotTestAccess::Sync(*table);
+    auto archive = table->ReadFeedArchive(initial);
+    const auto small_entry = archive.Next(), large_entry = archive.Next();
+    assert(small_entry && large_entry && small_entry->position.revision == small && large_entry->position.revision == large);
+    const auto take = [](SlotWatch& state) {
+        std::size_t bytes = 0U;
+        while (auto output = state.Take(budget)) bytes += output->bytes->size();
+        return bytes;
+    };
+    const auto bounded = [&](const SlotWatch& state) {
+        assert(SlotAckDeadlineTestAccess::Charged(state) <= budget && SlotAckDeadlineTestAccess::Excess(state) <= budget);
+    };
+    auto first = SlotWatch::Create(table, "first", {});
+    auto second = SlotWatch::Create(table, "second", {});
+    auto third = SlotWatch::Create(table, "third", {});
+    for (const auto& state : {first, second, third}) state->SetQuota(share);
+    // A frame above the share uses the excess pool; a second one waits for it.
+    assert(SlotAckDeadlineTestAccess::Publish(*first, large_entry));
+    const auto excess = SlotAckDeadlineTestAccess::Excess(*first);
+    assert(excess > budget / 2U && excess <= budget && SlotAckDeadlineTestAccess::Charged(*first) == 0U);
+    assert(!SlotAckDeadlineTestAccess::Publish(*second, large_entry));
+    assert(SlotAckDeadlineTestAccess::Excess(*second) == excess); bounded(*second);
+    // Output within a share does not wait for the excess pool.
+    assert(SlotAckDeadlineTestAccess::Publish(*third, small_entry));
+    const auto within = take(*third);
+    assert(within != 0U && within <= share && SlotAckDeadlineTestAccess::Charged(*third) == within); bounded(*third);
+    // The same watch queues nothing above its share while output is unsent.
+    assert(take(*first) == excess);
+    first->Consumed(excess - 1U);
+    assert(SlotAckDeadlineTestAccess::Excess(*first) == 1U && SlotAckDeadlineTestAccess::Charged(*first) == within);
+    first->Consumed(1U);
+    assert(SlotAckDeadlineTestAccess::Excess(*first) == 0U);
+    assert(SlotAckDeadlineTestAccess::Publish(*second, large_entry));
+    assert(SlotAckDeadlineTestAccess::Excess(*second) == excess); bounded(*second);
+    third->Consumed(within); // Its earlier output was sent, but the pool holds another frame.
+    assert(!SlotAckDeadlineTestAccess::Publish(*third, large_entry));
+    assert(take(*second) == excess); second->Consumed(excess);
+    assert(SlotAckDeadlineTestAccess::Publish(*third, large_entry));
+    assert(SlotAckDeadlineTestAccess::Excess(*third) > share); bounded(*third);
+    for (const auto& state : {first, second, third}) { state->Cancel(); state->WorkStep(); }
+    assert(SlotAckDeadlineTestAccess::Charged(*first) == 0U && SlotAckDeadlineTestAccess::Excess(*first) == 0U);
+}
+void ExcessPoolReceipts(bool tls) {
+    constexpr std::size_t budget = 4096U, share = 1024U, receipt = SlotAckDeadlineTestAccess::kReceipt;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer);
+    for (const auto* name : {"acker", "holder", "waiter", "queue"}) writer->Ok("CREATE SLOT '" + std::string(name) + "' ON t");
+    auto table = harness.catalog->Find("t");
+    const auto initial = table->ListFeedSlots().front().position;
+    const auto small = Set(*writer, 1), second = Set(*writer, 2), third = Set(*writer, 3);
+    const auto large = LabelTransaction(*writer, 20U);
+    FeedSlotTestAccess::Sync(*table);
+    auto archive = table->ReadFeedArchive(initial);
+    const auto small_entry = archive.Next(), second_entry = archive.Next(), third_entry = archive.Next(), large_entry = archive.Next();
+    assert(small_entry && small_entry->position.revision == small && second_entry && second_entry->position.revision == second);
+    assert(third_entry && third_entry->position.revision == third && large_entry && large_entry->position.revision == large);
+    std::atomic<std::size_t> notified{0U};
+    FeedOptions options; options.ack_timeout_ms = 600000U; options.notify = [&] { notified.fetch_add(1U); };
+    const auto drain = [](SlotWatch& state) {
+        std::size_t bytes = 0U;
+        while (auto output = state.Take(std::numeric_limits<std::size_t>::max())) {
+            bytes += output->bytes->size(); state.Consumed(output->bytes->size());
+            if (output->revision) state.Sent(*output->revision);
+        }
+        return bytes;
+    };
+    {
+        // Receipts filling the share make a frame wait for ACK; they never move it to the pool.
+        auto acker = SlotWatch::Create(table, "acker", options);
+        acker->SetQuota(share);
+        assert(SlotAckDeadlineTestAccess::Publish(*acker, small_entry)); (void)drain(*acker);
+        assert(SlotAckDeadlineTestAccess::Publish(*acker, second_entry));
+        const auto frame = drain(*acker);
+        assert(SlotAckDeadlineTestAccess::Count(*acker) == 2U);
+        acker->SetQuota(2U * receipt + frame + receipt / 2U); // The next frame fits alone, not beside two receipts.
+        assert(!SlotAckDeadlineTestAccess::Publish(*acker, third_entry));
+        assert(SlotAckDeadlineTestAccess::Excess(*acker) == 0U);
+        assert(acker->Ack(second) == SlotWatch::AckResult::kAccepted);
+        assert(SlotAckDeadlineTestAccess::Publish(*acker, third_entry) && SlotAckDeadlineTestAccess::Excess(*acker) == 0U);
+        (void)drain(*acker);
+        acker->Cancel(); acker->WorkStep();
+    }
+    auto holder = SlotWatch::Create(table, "holder", options);
+    auto waiter = SlotWatch::Create(table, "waiter", options);
+    holder->SetQuota(share); waiter->SetQuota(share);
+    assert(SlotAckDeadlineTestAccess::Publish(*holder, large_entry));
+    const auto size = SlotAckDeadlineTestAccess::Excess(*holder);
+    assert(size > budget / 2U && size <= budget - receipt);
+    // A refused pool frame neither keeps a receipt charge nor wakes the worker
+    // into an immediate retry, and it is built only once.
+    auto unframed = std::make_shared<FeedEntry>(*large_entry); unframed->protocol_frame.reset(); // Encoded per build.
+    const auto charged = SlotAckDeadlineTestAccess::Charged(*waiter);
+    const auto wakes = notified.load();
+    assert(!SlotAckDeadlineTestAccess::Publish(*waiter, unframed));
+    const auto prepared = SlotAckDeadlineTestAccess::Prepared(*waiter); // Held: its address is not reused.
+    assert(prepared != nullptr);
+    for (int retry = 0; retry < 3; ++retry) assert(!SlotAckDeadlineTestAccess::Publish(*waiter, unframed));
+    assert(notified.load() == wakes && SlotAckDeadlineTestAccess::Charged(*waiter) == charged);
+    assert(SlotAckDeadlineTestAccess::Excess(*waiter) == size && SlotAckDeadlineTestAccess::Prepared(*waiter) == prepared);
+    (void)drain(*holder);
+    assert(SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
+    assert(SlotAckDeadlineTestAccess::Publish(*waiter, unframed) && SlotAckDeadlineTestAccess::Prepared(*waiter) == nullptr);
+    const auto schema = waiter->Take(std::numeric_limits<std::size_t>::max());
+    const auto data = waiter->Take(std::numeric_limits<std::size_t>::max());
+    assert(schema && data && schema->excess && data->excess && data->bytes == prepared);
+    // Cancelling keeps the taken, unconsumed part charged until its socket queue is dropped.
+    waiter->Consumed(schema->bytes->size() + 1U);
+    waiter->Cancel(); waiter->WorkStep();
+    assert(SlotAckDeadlineTestAccess::Excess(*waiter) == data->bytes->size() - 1U);
+    waiter->Consumed(data->bytes->size() - 1U);
+    assert(SlotAckDeadlineTestAccess::Excess(*waiter) == 0U);
+    holder->Cancel(); holder->WorkStep();
+    assert(SlotAckDeadlineTestAccess::Charged(*holder) == 0U);
+    // The I/O side takes a pool batch beside uncharged replies and releases a dropped queue.
+    auto queue = SlotWatch::Create(table, "queue", {});
+    queue->SetQuota(share);
+    assert(SlotAckDeadlineTestAccess::Publish(*queue, large_entry));
+    AckDeadlineIoTestAccess::ExcessQueue(harness.server(), queue, SlotAckDeadlineTestAccess::Excess(*queue), budget);
+    queue->Cancel(); queue->WorkStep();
+}
+void ExcessStalledHolder(bool tls) {
+    // Driven through the I/O watch state, so no host's socket buffering decides when the holder stalls.
+    constexpr std::size_t budget = 4096U, share = 1024U;
+    constexpr auto timeout = 3000ms;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget, {}, 60000ms, timeout);
+    auto writer = harness.Connect(); Create(*writer);
+    for (const auto* name : {"holder", "waiter"}) writer->Ok("CREATE SLOT '" + std::string(name) + "' ON t");
+    auto table = harness.catalog->Find("t");
+    const auto initial = table->ListFeedSlots().front().position;
+    const auto large = LabelTransaction(*writer, 20U);
+    FeedSlotTestAccess::Sync(*table);
+    auto archive = table->ReadFeedArchive(initial);
+    const auto entry = archive.Next();
+    assert(entry && entry->position.revision == large);
+    auto holder = SlotWatch::Create(table, "holder", {});
+    auto waiter = SlotWatch::Create(table, "waiter", {});
+    holder->SetQuota(share); waiter->SetQuota(share);
+    assert(SlotAckDeadlineTestAccess::Publish(*holder, entry) && SlotAckDeadlineTestAccess::Excess(*holder) > budget / 2U);
+    assert(!SlotAckDeadlineTestAccess::Publish(*waiter, entry));
+    AckDeadlineIoTestAccess::StalledWrite(harness.server(), holder, waiter, entry, timeout);
+    for (const auto& state : {holder, waiter}) {
+        while (auto output = state->Take(std::numeric_limits<std::size_t>::max())) state->Consumed(output->bytes->size());
+        state->Cancel(); state->WorkStep();
+    }
+    assert(SlotAckDeadlineTestAccess::Charged(*holder) == 0U && SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
+}
+void TlsWriteCap(bool tls) {
+#ifdef CHUNKDB_WITH_OPENSSL
+    if (!tls) return; // Independent of the transport: runs once, with the TLS groups.
+    Harness harness(tls);
+    AckDeadlineIoTestAccess::TlsWriteCap(harness.server());
+#else
+    (void)tls;
+#endif
+}
+void ExcessPoolFifo(bool tls) {
+    constexpr std::size_t budget = 4096U, share = 1024U;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer);
+    for (const auto* name : {"first", "second", "third"}) writer->Ok("CREATE SLOT '" + std::string(name) + "' ON t");
+    auto table = harness.catalog->Find("t");
+    const auto initial = table->ListFeedSlots().front().position;
+    const auto one = LabelTransaction(*writer, 20U), two = LabelTransaction(*writer, 20U, 1U);
+    FeedSlotTestAccess::Sync(*table);
+    auto archive = table->ReadFeedArchive(initial);
+    const auto one_entry = archive.Next(), two_entry = archive.Next();
+    assert(one_entry && one_entry->position.revision == one && two_entry && two_entry->position.revision == two);
+    const auto drain = [](SlotWatch& state) {
+        std::size_t bytes = 0U;
+        while (auto output = state.Take(std::numeric_limits<std::size_t>::max())) {
+            bytes += output->bytes->size(); state.Consumed(output->bytes->size());
+        }
+        return bytes;
+    };
+    auto first = SlotWatch::Create(table, "first", {});
+    auto second = SlotWatch::Create(table, "second", {});
+    auto third = SlotWatch::Create(table, "third", {});
+    for (const auto& state : {first, second, third}) state->SetQuota(share);
+    assert(SlotAckDeadlineTestAccess::Publish(*first, one_entry));
+    assert(SlotAckDeadlineTestAccess::Excess(*first) > budget / 2U);
+    // Waiters queue in arrival order; only the head keeps its built frame.
+    assert(!SlotAckDeadlineTestAccess::Publish(*second, one_entry) && SlotAckDeadlineTestAccess::Prepared(*second));
+    assert(!SlotAckDeadlineTestAccess::Publish(*third, one_entry) && !SlotAckDeadlineTestAccess::Prepared(*third));
+    // A watch with unsent output does not queue and keeps nothing built.
+    assert(!SlotAckDeadlineTestAccess::Publish(*first, two_entry) && !SlotAckDeadlineTestAccess::Prepared(*first));
+    assert(drain(*first) > budget / 2U && SlotAckDeadlineTestAccess::Excess(*first) == 0U);
+    // The free pool goes to the earlier waiters, not to the first watch's next large frame.
+    assert(!SlotAckDeadlineTestAccess::Publish(*first, two_entry));
+    assert(SlotAckDeadlineTestAccess::Publish(*second, one_entry)); (void)drain(*second);
+    assert(!SlotAckDeadlineTestAccess::Publish(*first, two_entry));
+    assert(SlotAckDeadlineTestAccess::Publish(*third, one_entry)); (void)drain(*third); // Rebuilt at its turn.
+    assert(SlotAckDeadlineTestAccess::Publish(*first, two_entry)); (void)drain(*first);
+    for (const auto& state : {first, second, third}) { state->Cancel(); state->WorkStep(); }
+    assert(SlotAckDeadlineTestAccess::Charged(*first) == 0U && SlotAckDeadlineTestAccess::Excess(*first) == 0U);
+}
+void ExcessPoolControlFrames(bool tls) {
+    constexpr std::size_t budget = 4096U, share = 1024U, receipt = SlotAckDeadlineTestAccess::kReceipt;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer);
+    for (const auto* name : {"holder", "waiter", "first", "second", "acker"}) writer->Ok("CREATE SLOT '" + std::string(name) + "' ON t");
+    auto table = harness.catalog->Find("t");
+    const auto initial = table->ListFeedSlots().front().position;
+    const auto small = Set(*writer, 1);
+    const auto one = LabelTransaction(*writer, 20U), two = LabelTransaction(*writer, 20U, 1U);
+    FeedSlotTestAccess::Sync(*table);
+    auto archive = table->ReadFeedArchive(initial);
+    const auto small_entry = archive.Next(), one_entry = archive.Next(), two_entry = archive.Next();
+    assert(small_entry && small_entry->position.revision == small && one_entry && one_entry->position.revision == one);
+    assert(two_entry && two_entry->position.revision == two);
+    const auto drain = [](SlotWatch& state) {
+        std::size_t bytes = 0U;
+        while (auto output = state.Take(std::numeric_limits<std::size_t>::max())) {
+            bytes += output->bytes->size(); state.Consumed(output->bytes->size());
+            if (output->revision) state.Sent(*output->revision);
+        }
+        return bytes;
+    };
+    const auto progress = [&] {
+        auto entry = std::make_shared<FeedEntry>(); // A new object for every attempt, as Progress builds it.
+        entry->kind = FeedEntry::Kind::kProgress; entry->position = small_entry->position;
+        return entry;
+    };
+    auto holder = SlotWatch::Create(table, "holder", {});
+    auto waiter = SlotWatch::Create(table, "waiter", {});
+    auto first = SlotWatch::Create(table, "first", {});
+    auto second = SlotWatch::Create(table, "second", {});
+    holder->SetQuota(share); waiter->SetQuota(share);
+    first->SetQuota(16U); second->SetQuota(16U); // Smaller than a progress frame.
+    assert(SlotAckDeadlineTestAccess::Publish(*holder, one_entry));
+    assert(!SlotAckDeadlineTestAccess::Publish(*waiter, one_entry)); // Heads the queue: the pool lacks room for it.
+    const auto held = SlotAckDeadlineTestAccess::Excess(*holder);
+    // Progress frames above a share never queue behind the waiter, nor swap places with each other.
+    for (int round = 0; round < 3; ++round) {
+        assert(SlotAckDeadlineTestAccess::Publish(*first, progress()));
+        assert(SlotAckDeadlineTestAccess::Publish(*second, progress()));
+        assert(SlotAckDeadlineTestAccess::Excess(*holder) > held);
+        assert(drain(*first) != 0U && drain(*second) != 0U);
+        assert(SlotAckDeadlineTestAccess::Excess(*holder) == held);
+    }
+    (void)drain(*holder);
+    assert(SlotAckDeadlineTestAccess::Publish(*waiter, one_entry)); (void)drain(*waiter);
+    // A head that must wait for its own ACKs gives up its place to the next waiter.
+    std::atomic<std::size_t> woken{0U};
+    FeedOptions options; options.ack_timeout_ms = 600000U; options.notify = [&] { woken.fetch_add(1U); };
+    auto acker = SlotWatch::Create(table, "acker", options);
+    acker->SetQuota(share);
+    assert(SlotAckDeadlineTestAccess::Publish(*acker, small_entry)); (void)drain(*acker); // One receipt held.
+    assert(SlotAckDeadlineTestAccess::Publish(*holder, two_entry));
+    assert(!SlotAckDeadlineTestAccess::Publish(*acker, one_entry));  // Head of the queue.
+    assert(!SlotAckDeadlineTestAccess::Publish(*waiter, two_entry)); // Behind it.
+    (void)drain(*holder);
+    assert(SlotAckDeadlineTestAccess::Prepared(*acker)); // The head keeps its built change.
+    acker->SetQuota(receipt); // A smaller share: its receipt now leaves no room.
+    const auto before = woken.load();
+    assert(!SlotAckDeadlineTestAccess::Publish(*acker, one_entry));
+    assert(!SlotAckDeadlineTestAccess::Prepared(*acker) && woken.load() > before); // It woke the next waiter.
+    assert(SlotAckDeadlineTestAccess::Publish(*waiter, two_entry)); (void)drain(*waiter);
+    // After its ACK it queues again at the back.
+    assert(acker->Ack(small) == SlotWatch::AckResult::kAccepted);
+    acker->SetQuota(share);
+    assert(SlotAckDeadlineTestAccess::Publish(*acker, one_entry)); (void)drain(*acker);
+    for (const auto& state : {holder, waiter, first, second, acker}) { state->Cancel(); state->WorkStep(); }
+    assert(SlotAckDeadlineTestAccess::Charged(*holder) == 0U && SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
+}
+void ExcessPoolLeave(bool tls) {
+    constexpr std::size_t budget = 4096U, share = 1024U, receipt = SlotAckDeadlineTestAccess::kReceipt;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer);
+    for (const auto* name : {"holder", "leaver", "middle", "last", "schema"}) writer->Ok("CREATE SLOT '" + std::string(name) + "' ON t");
+    auto table = harness.catalog->Find("t");
+    const auto initial = table->ListFeedSlots().front().position;
+    const auto small = Set(*writer, 1);
+    const auto one = LabelTransaction(*writer, 20U), two = LabelTransaction(*writer, 20U, 1U);
+    FeedSlotTestAccess::Sync(*table);
+    auto archive = table->ReadFeedArchive(initial);
+    const auto small_entry = archive.Next(), one_entry = archive.Next(), two_entry = archive.Next();
+    assert(small_entry && small_entry->position.revision == small && one_entry && one_entry->position.revision == one);
+    assert(two_entry && two_entry->position.revision == two);
+    const auto drain = [](SlotWatch& state) {
+        std::size_t bytes = 0U;
+        while (auto output = state.Take(std::numeric_limits<std::size_t>::max())) {
+            bytes += output->bytes->size(); state.Consumed(output->bytes->size());
+            if (output->revision) state.Sent(*output->revision);
+        }
+        return bytes;
+    };
+    std::atomic<std::size_t> woken{0U};
+    FeedOptions timed; timed.ack_timeout_ms = 600000U; timed.notify = [&] { woken.fetch_add(1U); };
+    auto holder = SlotWatch::Create(table, "holder", {});
+    auto leaver = SlotWatch::Create(table, "leaver", timed);
+    auto middle = SlotWatch::Create(table, "middle", {});
+    auto last = SlotWatch::Create(table, "last", {});
+    auto schema_watch = SlotWatch::Create(table, "schema", {});
+    for (const auto& state : {holder, leaver, middle, last}) state->SetQuota(share);
+    assert(SlotAckDeadlineTestAccess::Publish(*leaver, small_entry)); (void)drain(*leaver); // One receipt held.
+    assert(SlotAckDeadlineTestAccess::Publish(*holder, two_entry));
+    assert(!SlotAckDeadlineTestAccess::Publish(*leaver, one_entry)); // Queue: leaver, middle, last.
+    assert(!SlotAckDeadlineTestAccess::Publish(*middle, one_entry));
+    assert(!SlotAckDeadlineTestAccess::Publish(*last, one_entry));
+    (void)drain(*holder);
+    // A larger share fits the change, but not beside the held receipt: the head leaves.
+    leaver->SetQuota(SlotAckDeadlineTestAccess::PreparedSize(*leaver) + receipt + receipt / 2U);
+    auto before = woken.load();
+    assert(!SlotAckDeadlineTestAccess::Publish(*leaver, one_entry));
+    assert(woken.load() > before && SlotAckDeadlineTestAccess::Prepared(*leaver)); // Within its share it stays built.
+    assert(SlotAckDeadlineTestAccess::Publish(*middle, one_entry));
+    // Rejoining puts it behind the watch that waited meanwhile.
+    assert(leaver->Ack(small) == SlotWatch::AckResult::kAccepted);
+    leaver->SetQuota(share);
+    assert(!SlotAckDeadlineTestAccess::Publish(*leaver, one_entry));
+    (void)drain(*middle);
+    assert(!SlotAckDeadlineTestAccess::Publish(*leaver, one_entry));
+    assert(SlotAckDeadlineTestAccess::Publish(*last, one_entry)); (void)drain(*last);
+    assert(SlotAckDeadlineTestAccess::Publish(*leaver, one_entry)); (void)drain(*leaver);
+    // A head whose receipt finds the table counter full waits for table room, so it leaves too.
+    assert(SlotAckDeadlineTestAccess::Publish(*holder, one_entry));
+    assert(!SlotAckDeadlineTestAccess::Publish(*leaver, two_entry));
+    assert(!SlotAckDeadlineTestAccess::Publish(*middle, two_entry));
+    (void)drain(*holder);
+    const auto filler = budget - SlotAckDeadlineTestAccess::Charged(*leaver) - receipt + 1U;
+    SlotAckDeadlineTestAccess::ChargeTable(*leaver, filler);
+    before = woken.load();
+    assert(!SlotAckDeadlineTestAccess::Publish(*leaver, two_entry));
+    assert(woken.load() > before && !SlotAckDeadlineTestAccess::Prepared(*leaver) && SlotAckDeadlineTestAccess::Excess(*leaver) == 0U);
+    SlotAckDeadlineTestAccess::ReleaseTable(*leaver, filler);
+    assert(SlotAckDeadlineTestAccess::Publish(*middle, two_entry)); (void)drain(*middle);
+    assert(SlotAckDeadlineTestAccess::Publish(*leaver, two_entry)); (void)drain(*leaver);
+    // A schema frame above its share queues like a change and keeps nothing built behind the head.
+    auto schema_entry = std::make_shared<FeedEntry>();
+    schema_entry->kind = FeedEntry::Kind::kSchema; schema_entry->position = small_entry->position;
+    schema_entry->schema_version = small_entry->schema_version;
+    schema_entry->columns = table->geometry().LayoutAt(schema_entry->schema_version).schema().columns;
+    schema_watch->SetQuota(16U);
+    assert(SlotAckDeadlineTestAccess::Publish(*holder, two_entry));
+    assert(!SlotAckDeadlineTestAccess::Publish(*last, two_entry)); // Head: no room beside the holder.
+    assert(!SlotAckDeadlineTestAccess::Publish(*schema_watch, schema_entry)); // The pool has room, but not its turn.
+    assert(!SlotAckDeadlineTestAccess::Prepared(*schema_watch) && SlotAckDeadlineTestAccess::PreparedSize(*schema_watch) > 16U);
+    (void)drain(*holder);
+    assert(SlotAckDeadlineTestAccess::Publish(*last, two_entry)); (void)drain(*last);
+    assert(SlotAckDeadlineTestAccess::Publish(*schema_watch, schema_entry)); (void)drain(*schema_watch);
+    for (const auto& state : {holder, leaver, middle, last, schema_watch}) { state->Cancel(); state->WorkStep(); }
+    assert(SlotAckDeadlineTestAccess::Charged(*holder) == 0U && SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
+}
 void LiveSchemaAcknowledgement(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect(); Create(*writer);
@@ -1635,12 +2162,13 @@ int main(int argc, char** argv) {
     test::FeedPhaseWatchdog::SuppressWindowsDialogs();
     std::string_view selected;
     std::optional<bool> transport;
-    bool fence_only = false;
+    bool fence_only = false, shares_only = false;
     for (int argument = 1; argument < argc; ++argument) {
         const std::string_view option(argv[argument]);
         if (option == "--tls") transport = true;
         else if (option == "--plain") transport = false;
         else if (option == "--migration-fence-only") fence_only = true;
+        else if (option == "--shares-only") shares_only = true;
         else if (option == "--group" && argument + 1 < argc) selected = argv[++argument];
         else { std::cerr << "unknown test option: " << option << '\n'; return 2; }
     }
@@ -1661,6 +2189,18 @@ int main(int argc, char** argv) {
         if (selected == "client-exception") run("client-exception", [](bool use_tls) {
             Harness harness(use_tls); auto client = harness.Connect(); client->Close(); (void)client->Read();
         });
+        // Feed share and excess-pool groups run as their own ctest entry.
+        if (shares_only || !selected.empty()) {
+            run("share-independent-delivery", ShareIndependentDelivery); run("table-budget-terminates", TableBudgetStillTerminates);
+            run("excess-pool-bound", ExcessPoolBound); run("excess-pool-receipts", ExcessPoolReceipts);
+            run("excess-stalled-holder", ExcessStalledHolder); run("TLS-write-cap", TlsWriteCap);
+            run("excess-pool-FIFO", ExcessPoolFifo); run("excess-pool-control", ExcessPoolControlFrames);
+            run("excess-pool-leave", ExcessPoolLeave);
+        }
+        if (shares_only) {
+            std::cout << (tls ? "TLS" : "plain") << ": " << passed << "/" << executed << " feed share groups passed\n";
+            continue;
+        }
         run("migration-fence-watch", FencedWatch); run("migration-fence-cancelled-ACK", FencedCancelledAck);
         if (fence_only) {
             std::cout << (tls ? "TLS" : "plain") << ": " << passed << "/" << executed << " migration fence groups passed\n";

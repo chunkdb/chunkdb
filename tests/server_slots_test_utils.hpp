@@ -411,7 +411,8 @@ class Harness {
     bool tls;
     bool auth;
     Harness(bool use_tls, bool use_auth = false, std::size_t max_bytes = kDefaultSlotMaxBytes,
-            std::chrono::milliseconds sync = 100ms, std::size_t feed_bytes = kDefaultFeedBufferBytes, std::filesystem::path backup_dir = {}, std::chrono::milliseconds progress = 60000ms)
+            std::chrono::milliseconds sync = 100ms, std::size_t feed_bytes = kDefaultFeedBufferBytes, std::filesystem::path backup_dir = {}, std::chrono::milliseconds progress = 60000ms,
+            std::chrono::milliseconds io_timeout = 0ms)
         : tls(use_tls), auth(use_auth) {
         test::FeedPhaseWatchdog::Phase("harness: constructor");
         auto config = feed_test::Config(std::filesystem::canonical(directory.path()));
@@ -436,6 +437,7 @@ class Harness {
         // Data/terminal fixtures isolate their push sequence from periodic progress.
         // Dedicated progress fixtures use a short interval and read every frame.
         server_config.feed_progress_ms = static_cast<std::size_t>(progress.count());
+        if (io_timeout.count() != 0) server_config.client_io_timeout_ms = static_cast<std::size_t>(io_timeout.count());
         server_config.tls_enabled = tls;
 #ifdef CHUNKDB_WITH_OPENSSL
         if (tls) {

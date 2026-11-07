@@ -37,7 +37,7 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     std::atomic<FeedDeliveryTestHook*> hook_{nullptr};
     struct Watch {
         std::shared_ptr<ServerConnection> connection;
-        struct Output { std::shared_ptr<const std::string> bytes; std::optional<std::uint64_t> revision{}; bool charged = false; };
+        struct Output { std::shared_ptr<const std::string> bytes; std::optional<std::uint64_t> revision{}; bool charged = false, excess = false; };
         std::deque<Output> output;
         std::size_t offset = 0, bytes = 0;
         int write_size = 0; // TLS retries pin the front buffer and this length.
@@ -48,6 +48,10 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
         bool right_lost = false;
         std::size_t share = 0U, buffer_bytes = 0U;
         std::chrono::steady_clock::time_point next_progress{};
+        // Queued frames charged to the slot excess pool, and when this queue
+        // last made write progress while holding them.
+        std::size_t excess_frames = 0U;
+        std::chrono::steady_clock::time_point excess_progress{};
     };
     void Run();
     void WakeCatchUp() noexcept;
@@ -58,7 +62,10 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     void Write(Watch& watch);
     void WritePlain(Watch& watch);
     void Advance(Watch& watch, std::size_t bytes);
-    void Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision = {}, bool charged = false);
+    void Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision = {}, bool charged = false, bool excess = false);
+    void ReleaseOutput(Watch& watch, const std::shared_ptr<SlotWatch>& slot);
+    // Marks a watch dead when its excess-pool output made no write progress for the client I/O timeout.
+    bool ExpireStalledWrite(Watch& watch, std::chrono::steady_clock::time_point now);
     void Reject(Watch& watch, std::string message);
     // Whether the user still has READ on the watched table: one atomic load
     // while the users are unchanged. A lost right ends the watch once.
