@@ -72,9 +72,10 @@ The examples use `admin` and its password file; replace them with your credentia
 ./build/chunkdb_bench --ops 20000
 ```
 
-## Latest Committed Benchmark Snapshot (2026-03-19)
+## Sparse Low-Cache Protocol Snapshot (2026-03-19)
 
-Latest committed sparse low-cache 5x protocol benchmark snapshot (`relaxed` mode):
+This snapshot predates the eviction changes of September 2026 and the 2.0 storage format.
+Sparse low-cache 5x protocol benchmark snapshot (`relaxed` mode):
 - macOS (Apple M1 Pro, 32 GB):
   - [server-sparse-low-cache-set-20260319-macos-5x-summary.txt](../../bench/artifacts/manual-runs/server-sparse-low-cache-set-20260319-macos-5x-summary.txt)
   - [server-sparse-low-cache-set-20260319-macos-5x.csv](../../bench/artifacts/manual-runs/server-sparse-low-cache-set-20260319-macos-5x.csv)
@@ -259,7 +260,80 @@ Two further methodology points, both deliberate:
   flushes every resident dirty chunk, i.e. `O(max_loaded_chunks)` more of the
   same brackets the measured window already prices.
 
-### Measured Snapshot (2026-09-05, macOS/APFS)
+### Recorded for the 2.0 engine (2026-10-06, macOS/APFS)
+
+The latest large-world record is the run at `13c91c2`, the commit that completed the 2.0 storage format.
+Host: Apple M1 Pro, 32 GB RAM, macOS 27.0, APFS on the internal SSD, `F_FULLFSYNC` honored; Apple clang 21.0.0, Release.
+`--scenario sparse-writes --cache 16384 --threads 1 --durability relaxed`, 10 repeats: median 6438 ops/s, 0.1515 ms per eviction, 1.025 evictions per write.
+Artifacts: [summary](../../bench/artifacts/manual-runs/format-2.0-20261006-macos-summary.txt), [rows](../../bench/artifacts/manual-runs/format-2.0-20261006-macos-large-world-sparse.csv), [metadata](../../bench/artifacts/manual-runs/format-2.0-20261006-macos-metadata.txt).
+Later engine changes are not reflected, among them the bounded FLUSH WAL and shutdown time (`aa44899`) and eviction outside the large-chunk lock (`02387dd`).
+
+Not recorded on this host for the 2.0 engine: writer scaling, durability modes other than `relaxed`, open time on a large world and the CHUNKSCAN page cost; the [Linux record](#recorded-for-the-20-engine-2026-11-08-linuxext4) has them.
+The macOS writer-scaling table below and the [CHUNKSCAN record](../../bench/artifacts/manual-runs/chunkscan-warm-vs-cold-20260907-macos-summary.txt) describe earlier engines.
+
+#### Resident memory per chunk
+
+In the same run, current RSS growth over the warm-up divided by the 16384 chunks it loaded (`rss_bytes_per_warm_chunk`) was 1332 and 1338 B on the first repeat of each `13c91c2` process and 1196 to 1261 B on later repeats.
+That is the default geometry (16x16 blocks of 16 bits, 544 B of chunk state), so a full 16384-chunk cache took about 21 MiB.
+The figure includes heap freed but not returned to the operating system; use it for capacity planning, not as the size of the chunk structures.
+To measure it on another host, read `rss_bytes_per_warm_chunk` of the first repeat:
+
+```bash
+./build-bench/chunkdb_large_world_bench --scenario sparse-writes --cache 16384 --repeats 5 \
+    --durability relaxed --output csv --data-dir "$TMPDIR/chunkdb-lw"
+```
+
+For another geometry or with variable values, measure the server as described in [Server flags](../SERVER_FLAGS.md#directory-and-shared-resources).
+
+### Recorded for the 2.0 engine (2026-11-08, Linux/ext4)
+
+Run at main `0645b43` with `chunkdb_large_world_bench`, the default geometry and `--cache 16384` unless stated.
+Host: AMD Ryzen 5 4600H (6 cores, 12 threads), 14.49 GiB RAM, Linux 7.0, ext4 on a SATA SSD, durable sync `fdatasync` (median 1.1–1.2 ms); GCC 15.2.0, Release.
+Artifacts: [rows](../../bench/artifacts/manual-runs/large-world-20261108-linux-rows.txt), [metadata and commands](../../bench/artifacts/manual-runs/large-world-20261108-linux-metadata.txt).
+
+Single writer, `--chunks 5000`, 5 repeats (medians):
+
+| Durability | ops/s | ms per eviction | RSS per warm chunk, first repeat |
+| --- | --- | --- | --- |
+| `relaxed` | 17358 | 0.056 | 1380 B |
+| `fsync-wal` | 650 | 1.501 | 2390 B |
+
+Writer scaling, `relaxed`, `--chunks 15000`, 5 repeats (median, range):
+
+| Writers | ops/s |
+| --- | --- |
+| 1 | 17019 (16803–17170) |
+| 4 | 18881 (6117–31379) |
+| 8 | 39779 (7428–40889) |
+| 16 | 50269 (44686–50865) |
+| 32 | 38609 (38005–41152) |
+| 64 | 31753 (24750–33125) |
+
+Throughput peaks at 16 writers on this 12-thread host; at 4 and 8 writers single repeats fell to a third of the median.
+
+FLUSH WAL of 65536 dirty chunks (`--scenario flush --cache 65536 --threads 8`, 3 repeats): 11.6, 14.3 and 14.3 s; closing the store afterwards took 6.6–7.1 s.
+
+Cold loads after eviction (`--scenario evict-load --chunks 50000`, 3 repeats): p50 113 and 113 µs, p99 312 and 318 µs in two repeats; the third, slower throughout, gave p50 476 µs and p99 1018 µs.
+
+CHUNKSCAN over the whole world (`--scenario chunkscan --cache 65536 --threads 8 --scan-limit 1024`, 1024 coordinates per page):
+
+| World chunks | Pages | Cold scan | Warm scan | Large-chunk directories listed |
+| --- | --- | --- | --- | --- |
+| 20000 | 20 | 0.39–0.41 s | 0.048–0.050 s | 437 |
+| 200000 | 196 | 5.58–5.96 s | 2.93–3.03 s | 7525 |
+| 1000000 (1 repeat) | 977 | 269.3 s | 223.4 s | 120566 |
+
+The cold cost per page grows with the world: about 20 ms at 20000 chunks, 30 ms at 200000 and 276 ms at 1000000, while the 15625 large-chunk directories of the 1000000-chunk world were listed 120566 times in one scan.
+
+Opening a table (the `startup recovery summary` log line on reopen): 37–38 ms for 20000 WAL files; with 200000 and 1000000 chunks the startup scan stopped at its 100000-file cap (`scan_capped=true`) after 158–162 ms and 324 ms.
+
+Not recorded for the 2.0 engine: Windows.
+
+
+### Measured Snapshot (2026-09-05, macOS/APFS, before 2.0)
+
+> This snapshot predates the eviction-bracket coalescing (`e19b062`), the lazily created per-chunk WAL stream (`aa265ac`) and the 2.0 storage format.
+> Its per-eviction cost, memory per chunk and writer-scaling table describe the engine at `3c14ec3`; for the 2.0 engine see [Recorded for the 2.0 engine](#recorded-for-the-20-engine-2026-10-06-macosapfs).
 
 Host: Apple M1 Pro (arm64), 32 GB RAM, macOS 26.6.2, APFS on the internal SSD.
 `F_FULLFSYNC` confirmed honored by that filesystem (the benchmark probes it and

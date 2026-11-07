@@ -2,6 +2,13 @@
 
 This folder stores real measured benchmark outputs captured directly from local runs.
 
+## Run: 2026-11-08 (AMD Ryzen 5 4600H, Linux 7.0, ext4) — large world on the 2.0 engine
+
+`chunkdb_large_world_bench` at main `0645b43`: sparse writes in `relaxed` and `fsync-wal`, writer scaling 1 to 64, FLUSH WAL of 65536 dirty chunks, cold loads, CHUNKSCAN up to 1000000 chunks and open time (issue #27).
+
+- [Environment and commands](large-world-20261108-linux-metadata.txt)
+- [Rows](large-world-20261108-linux-rows.txt)
+
 ## Run: 2026-11-08 (AMD Ryzen 5 4600H, Linux 7.0, ext4) — chunk-map lookups
 
 Point reads and writes on a warm cache across 16,384 loaded chunks and inside one chunk, and the two chunk-level map lookups alone (`chunkdb_chunk_map_bench`, 15 runs; issue #135).
