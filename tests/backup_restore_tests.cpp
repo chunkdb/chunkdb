@@ -693,6 +693,48 @@ void ExtendedRootPaths() {
     assert(!std::filesystem::exists(top));
 #endif
 }
+// BACKUP TO names its target under the resolved --backup-dir and checks it
+// against the same resolved root, so a directory alias or an extended-length
+// --backup-dir is accepted and a target outside it is still refused.
+void ConfiguredBackupDirectoryRoots() {
+    Fixture fixture;
+    const auto source = fixture.root / "configured-source";
+    RestoreBackup(fixture.backup, source);
+    CatalogConfig config; config.data_dir = source; config.background_maintenance = false;
+    TableCatalog catalog(config);
+    const auto backup_to = [&](const std::filesystem::path& directory, const std::filesystem::path& target) {
+        BackupOptions options; options.backup_directory = directory;
+        std::string error;
+        try { (void)catalog.BackupTo(target, options); }
+        catch (const std::exception& failure) { error = failure.what(); }
+        return error;
+    };
+    const auto backups = fixture.root / "configured-backups";
+    std::filesystem::create_directory(backups);
+    const auto alias = fixture.root / "configured-alias";
+    test::ScopedDirectoryAlias backups_link(backups, alias);
+    assert(backup_to(alias, ResolveBackupTarget(alias, "daily/alias")).empty());
+    assert(Verify(backups / "daily/alias").errors == 0U);
+    const auto outside = fixture.root / "configured-outside";
+    std::filesystem::create_directory(outside);
+    assert(backup_to(alias, ResolveBackupTarget(outside, "escaped")).find("escapes --backup-dir") != std::string::npos);
+    assert(!std::filesystem::exists(outside / "escaped"));
+#ifdef _WIN32
+    auto extended = std::filesystem::path(L"\\\\?\\" + backups.wstring());
+    for (unsigned i = 0U; i < 2U; ++i) extended /= std::string(100U, 'z') + std::to_string(i);
+    std::filesystem::create_directories(extended);
+    assert(extended.native().size() > 260U);
+    const auto target = ResolveBackupTarget(extended, "daily/extended");
+    assert(target.native().starts_with(L"\\\\?\\"));
+    assert(backup_to(extended, target).empty());
+    assert(Verify(target).errors == 0U);
+    assert(backup_to(extended, ResolveBackupTarget(outside, "escaped-extended")).find("escapes --backup-dir") != std::string::npos);
+    assert(!std::filesystem::exists(outside / "escaped-extended"));
+    const auto long_top = std::filesystem::path(L"\\\\?\\" + backups.wstring()) / (std::string(100U, 'z') + "0");
+    RemoveBackupStaging(long_top);
+    assert(!std::filesystem::exists(long_top));
+#endif
+}
 // The offline password reset refuses a backup before it locks or writes
 // anything, so the backup still restores.
 void ResetPasswordRefusesBackup() {
@@ -733,6 +775,7 @@ int main(int argc, char** argv) {
         else if (name == "source-reparse") BackupSourceDirectoryReplacement();
         else if (name == "ancestor-reparse") DirectoryAncestorReplacement();
         else if (name == "extended") ExtendedRootPaths();
+        else if (name == "configured-roots") ConfiguredBackupDirectoryRoots();
         else return 2;
         return 0;
     }
@@ -748,6 +791,7 @@ int main(int argc, char** argv) {
     run("rooted targets", RootedTargets); run("inventory paths", InventoryPathSpellings);
     run("inventory reparse", ReparseInventoryAndRestore); run("source directory replacement", BackupSourceDirectoryReplacement);
     run("directory ancestor replacement", DirectoryAncestorReplacement);
-    run("extended roots", ExtendedRootPaths); run("reset password refusal", ResetPasswordRefusesBackup);
-    std::cout << "19 backup restore groups passed\n";
+    run("extended roots", ExtendedRootPaths); run("configured backup roots", ConfiguredBackupDirectoryRoots);
+    run("reset password refusal", ResetPasswordRefusesBackup);
+    std::cout << "20 backup restore groups passed\n";
 }
