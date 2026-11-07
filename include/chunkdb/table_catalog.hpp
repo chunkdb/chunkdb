@@ -485,6 +485,16 @@ class TableCatalog {
         const TableOptions& options,
         const std::function<void(StoreManifest*)>& change,
         const char* dir_sync_failpoint);
+    // Reads every stored value of the column the table's recorded narrowing
+    // names, under a lease and without catalog admission; the narrowing keeps
+    // writes from adding values that do not fit meanwhile. Returns the first
+    // value that does not fit the narrower type.
+    [[nodiscard]] std::optional<std::string> ScanNarrowing(Table& table);
+    // Ends a narrowing check with `change` under the table's DDL lock. When
+    // the manifest cannot be rewritten and the table still serves the
+    // narrowing, the failure is logged and the table is fenced, so that
+    // RecoverTable or a restart drops the narrowing; the failure is rethrown.
+    void EndNarrowing(Table& table, const TableOptions& options, const std::function<void(StoreManifest*)>& change);
     // Moves `dir` out of `tables/` into `.chunkdb.dropped/` and syncs both.
     void MoveToDropped(const std::filesystem::path& dir, const std::string& name);
     void RemoveDroppedTree(const std::filesystem::path& dropped) noexcept;
