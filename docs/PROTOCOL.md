@@ -187,7 +187,7 @@ A slot permits one watch at a time; a competing watch receives SLOT_BUSY and a l
 A slot belongs to its owner; another user needs ADMIN on `*` to watch it, see [feed statements](reference/FEED.md#arguments).
 
 DROP TABLE ends watches with NO_TABLE; a fenced or recovered table ends them with INTERNAL, and a new WATCH resumes; watches have no idle timeout.
-Losing READ on the table ends a watch with a best-effort NO_TABLE, and a dropped user with a best-effort `AUTH_REQUIRED reason=user_dropped`; the connection closes either way; see [users](USERS.md#rights).
+Losing READ on the table ends a watch with a best-effort NO_TABLE, as losing ADMIN on `*` ends a watch of a slot its user does not own, and a dropped user with a best-effort `AUTH_REQUIRED reason=user_dropped`; the connection closes either way; see [users](USERS.md#rights).
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 
 ## Errors and URIs
@@ -217,7 +217,7 @@ Clients classify errors by code, never diagnostic text, and preserve unknown key
 MIGRATION_MISMATCH identifies different text under a recorded migration name.
 SLOT_BUSY identifies an attached slot; SLOT_LOST identifies unavailable retained history or a dropped projected column.
 `reason=schema_filter` identifies a lost stable-ID projection; `reason=retention_limit` identifies retained-history overflow.
-SHOW SLOTS adds `lost_reason` (null while healthy), a `filters` map, and `owner` (null for a slot without a recorded owner).
+SHOW SLOTS adds `lost_reason` (null while healthy), a `filters` map, and `owner` (shown to that user and to MANAGES USERS; null otherwise or for a slot without a recorded owner).
 Its keys are `area`, `columns`, `column_ids`, `no_before`, and `chunks`.
 
 Unfiltered area and projection fields are null; projected names and IDs are aligned arrays in declared order.

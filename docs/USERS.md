@@ -56,6 +56,7 @@ A table with no rights for your user appears absent with NO_TABLE.
 Missing rights otherwise produce PERMISSION_DENIED.
 Rights changes affect existing connections immediately.
 An open watch whose user loses READ on its table ends as soon as the change is applied: the server sends NO_TABLE best-effort and closes the connection.
+A watch of a slot its user does not own ends the same way when that user loses ADMIN on `*`.
 Pushes not yet written to the socket are dropped; a push already partly written, or a socket that cannot take more, closes the connection without the error.
 An ACK the server processes after the change is applied is refused; one processed at the same moment may still be accepted.
 Dropping a user ends its connections: an open watch ends at once with a best-effort `AUTH_REQUIRED reason=user_dropped`, any other connection receives it on its next statement, and the connection closes.

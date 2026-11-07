@@ -107,12 +107,12 @@ UNWATCH
   The owner replacing its own watch needs READ; replacing another user additionally needs ADMIN on `*`.
 - `ACK TIMEOUT`: positive milliseconds for a slot watch; closes the connection when its oldest fully sent, unacknowledged mutation expires.
 - `SLOT`: retain history for this named consumer across restarts; only one watcher can hold a slot at a time.
-  Its owner needs READ; another user also needs ADMIN on `*`, with or without AFTER or TAKEOVER.
+  Its owner needs READ; another user also needs ADMIN on `*`, with or without AFTER or TAKEOVER, for as long as the watch lasts.
 
 ## Returns
 
 - CREATE and DROP SLOT: `OK`, including authorized conditional no-ops.
-- SHOW SLOTS: visible table, name, epoch, saved `acked` revision, retained bytes, lost state, filters, loss reason, and owner.
+- SHOW SLOTS: visible table, name, epoch, saved `acked` revision, retained bytes, lost state, filters, loss reason, and owner; the owner is shown to that user and to MANAGES USERS, and is null otherwise.
 - WATCH: start position, followed by change or chunks, schema, progress, or resync events.
 - ACK: no success reply; it is accepted only inside a slot watch.
 - UNWATCH: `OK` after the last push; ordinary statements can then resume.
@@ -125,12 +125,12 @@ UNWATCH
 | BUSY | A watcher or catch-up worker limit is reached. | Close another watcher or retry later. |
 | SLOT_BUSY | The slot already has a watcher. | Close its existing watcher. |
 | SLOT_LOST | Retained history exceeds its limit, or a projected column was dropped. | Rebuild state and recreate the slot. |
-| INVALID_ARGUMENT reason=slot_filters | WATCH or conditional creation uses different slot filters. | Inherit its filters or create another slot. |
+| INVALID_ARGUMENT reason=slot_filters | WATCH or conditional creation uses different slot filters, or conditional creation gives another OWNER. | Inherit its filters or create another slot. |
 | OUT_OF_RANGE | A single slot change cannot fit its output budget. | Increase feed_buffer_bytes before reconnecting. |
 | INVALID_ARGUMENT | ACK exceeds the last fully delivered position. | Acknowledge only processed events. |
 | INVALID_ARGUMENT | You run WATCH, CREATE SLOT or DROP SLOT on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | PROTOCOL | You send another statement while streaming. | Use a separate connection. |
-| NO_TABLE | The table is absent, inaccessible, or dropped, or your READ on it was revoked while watching (sent best-effort before the connection closes). | Check the table and access. |
+| NO_TABLE | The table is absent, inaccessible, or dropped, or while watching you lost READ on it, or ADMIN on `*` that your watch of a slot you do not own needs (sent best-effort before the connection closes). | Check the table and access. |
 | AUTH_REQUIRED reason=user_dropped | Your user was dropped while watching; sent best-effort, and the connection closes. | Log in again as an existing user. |
 | INTERNAL | The watched table was fenced or recovered. | Watch it again after [RECOVER TABLE](TABLES.md#notes), from your saved position. |
 
@@ -138,9 +138,10 @@ UNWATCH
 
 CREATE SLOT accepts AREA, COLUMNS, NO BEFORE, CHUNKS, and OWNER once each, in any order after ON.
 COLUMNS also accepts parentheses around its names.
-A slot without a recorded owner, created before slots recorded owners or under `--auth none`, takes the user of its first authenticated attach as its owner, saved before that watch starts.
+Under `--auth none`, CREATE SLOT without OWNER records no owner.
+A slot without a recorded owner takes the user of its first granted attach without ADMIN on `*`, saved before that watch starts; an attach with ADMIN on `*` records nobody.
 
-Conditional slot creation preserves an existing position, owner and lost state when its filters match.
+Conditional slot creation preserves an existing position, owner and lost state when its filters match, and its OWNER when given.
 WATCH inherits omitted slot filters and rejects supplied filters that differ.
 A dropped projected column makes the slot lost with `reason=schema_filter`.
 SHOW SLOTS preserves its IDs and uses null for names that no longer exist.

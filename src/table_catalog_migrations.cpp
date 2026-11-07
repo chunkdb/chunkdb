@@ -138,6 +138,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             if (table) {
                 ddl = std::unique_lock(table->ddl_mutex_);
                 if (request.kind == MigrationRequest::Kind::kCreateSlot) {
+                    // Checked before any outcome is recorded, a conditional no-op included.
+                    if (request.slot_owner) RequireValidFeedSlotOwner(*request.slot_owner);
                     const auto lease = table->Acquire();
                     if (!lease) throw TableNotFoundError("table was dropped");
                     RequireFeature(lease->store().features(), *FindFeature("feed_slots"));
@@ -165,6 +167,9 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     if (request.kind == MigrationRequest::Kind::kCreateSlot && exists &&
                         existing->filters != MigrationSlotFilters(request, lease->store().geometry().layout().schema()))
                         throw FeedSlotFiltersError("feed slot filters differ from existing slot");
+                    if (request.kind == MigrationRequest::Kind::kCreateSlot && exists && request.slot_owner_given &&
+                        existing->owner != request.slot_owner)
+                        throw FeedSlotFiltersError("feed slot owner differs from existing slot");
                     no_op = request.kind == MigrationRequest::Kind::kCreateSlot ? exists : !exists;
                 }
                 if (!no_op && request.kind == MigrationRequest::Kind::kAlter && request.narrowing) {

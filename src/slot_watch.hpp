@@ -60,13 +60,18 @@ class SlotWatch {
         bool charged = true;
     };
     // `authorize_owner` throws to refuse a user name: the slot's recorded
-    // owner, and on takeover the user of the replaced watch. A slot without an
-    // owner records a nonempty `user` before the claim is granted.
+    // owner, and on takeover the user of the replaced watch. `user` is the
+    // claim's user; claiming never records an owner.
     static std::shared_ptr<SlotWatch> Create(std::shared_ptr<Table> table,
         std::string name, FeedOptions options, bool takeover = false, std::string user = {},
         const std::function<void(std::string_view)>& authorize_owner = {});
     ~SlotWatch();
     [[nodiscard]] FeedPosition position() const noexcept { return start_; }
+    // The slot's owner when it was claimed, or as BindOwner recorded it.
+    [[nodiscard]] const std::optional<std::string>& owner() const noexcept { return slot_owner_; }
+    // Records `user` as the owner of a slot claimed without one, before the
+    // watch is activated. A failure records nothing and ends this watch.
+    void BindOwner(const std::string& user);
     [[nodiscard]] std::size_t budget() const noexcept { return options_.buffer_bytes.value_or(table_->FeedBufferBytes()); }
     [[nodiscard]] std::optional<Output> Take(std::size_t room);
     void SetQuota(std::size_t bytes);
@@ -117,6 +122,7 @@ class SlotWatch {
     static constexpr std::size_t kReceiptBytes = sizeof(MutationReceipt) + 4U * sizeof(void*);
     const std::shared_ptr<Table> table_;
     std::shared_ptr<FeedSlotClaim> claim_;
+    std::optional<std::string> slot_owner_;
     const std::weak_ptr<FeedSlotClaim> generation_;
     const std::shared_ptr<std::atomic<std::size_t>> table_bytes_;
     const FeedPosition start_;

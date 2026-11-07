@@ -911,6 +911,7 @@ std::string CommandEngine::ExecuteStatement(
                             request.slot_filters = {.area = slot.area, .no_before = slot.no_before, .chunks = slot.chunks};
                             request.slot_columns = slot.columns;
                             request.slot_owner = SlotOwner(slot, config_.require_auth, session.user);
+                            request.slot_owner_given = slot.owner.has_value();
                         },
                         [&](const cql::DropSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
@@ -985,6 +986,11 @@ std::string CommandEngine::ExecuteStatement(
                             });
                         if (session.register_slot_watch && !session.register_slot_watch(state))
                             return Protocol::Error("BUSY", "maximum slot catch-up workers reached", {{"reason", "slot_worker_limit"}, {"table", watch.table}});
+                        // A slot without an owner takes the user of its first
+                        // granted attach; one by ADMIN on * records nobody.
+                        if (config_.require_auth && !admin_all && !state->owner()) state->BindOwner(session.user);
+                        // A watch that ADMIN on * allows ends once that right is gone.
+                        if (session.watch_right && state->owner() != session.user) session.watch_right->RequireEveryTableAdmin();
                         session.slot_watch = std::move(state);
                     } else session.watch = table->SubscribeFeed(options);
                     session.table = std::move(table);
@@ -1004,7 +1010,7 @@ std::string CommandEngine::ExecuteStatement(
                     RequireRight(session, create.table, Right::kAdmin);
                     const auto table = catalog_->Require(create.table);
                     (void)table->CreateFeedSlot(create.name, create.if_not_exists, SlotFilters(table, create),
-                        SlotOwner(create, config_.require_auth, session.user));
+                        SlotOwner(create, config_.require_auth, session.user), create.owner.has_value());
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::DropSlot& drop) {
@@ -1043,6 +1049,9 @@ std::string CommandEngine::ExecuteStatement(
                         }
                     }
                     std::string reply;
+                    // An owner is user information: the owner itself or MANAGES USERS sees it.
+                    const auto* viewer = CurrentUser(session);
+                    const bool show_owners = !config_.require_auth || (viewer != nullptr && viewer->manages_users);
                     Protocol::AppendArrayHeader(reply, slots.size());
                     for (const auto& [name, slot] : slots) {
                         Protocol::AppendMapHeader(reply, 9);
@@ -1083,7 +1092,8 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendBulk(reply, "no_before"); reply += slot.filters.no_before ? "#t\r\n" : "#f\r\n";
                         Protocol::AppendBulk(reply, "chunks"); reply += slot.filters.chunks ? "#t\r\n" : "#f\r\n";
                         Protocol::AppendBulk(reply, "owner");
-                        if (slot.owner) Protocol::AppendBulk(reply, *slot.owner); else Protocol::AppendNull(reply);
+                        if (slot.owner && (show_owners || (viewer != nullptr && *slot.owner == session.user))) Protocol::AppendBulk(reply, *slot.owner);
+                        else Protocol::AppendNull(reply);
                     }
                     return reply;
                 },

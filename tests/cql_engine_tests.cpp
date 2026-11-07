@@ -21,6 +21,7 @@
 #include "chunkdb/schema.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
+#include "../src/chunk_store_internal.hpp"
 #include "../src/store_manifest.hpp"
 #include "test_utils.hpp"
 
@@ -905,6 +906,32 @@ void TestScanChunks() {
     ExpectError(f.Run("SCAN CHUNKS FROM nowhere"), "NO_TABLE");
 }
 
+// A server that opened its data directory read-only refuses WATCH, so a slot
+// without an owner stays without one there.
+void TestReadOnlySlotWithoutOwner() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-cql-read-only-slot");
+    chunkdb::CatalogConfig config;
+    config.data_dir = dir.path();
+    {
+        chunkdb::TableCatalog catalog(config);
+        (void)catalog.Create("world", kWorldGeometry, chunkdb::TableOptions{}, World());
+        (void)catalog.Find("world")->CreateFeedSlot("legacy");
+    }
+    const auto users = chunkdb::test::MakeUsers(dir.path(), "admin", "secret");
+    users->Create("reader", chunkdb::scram::MakeVerifier("pw", chunkdb::crypto::RandomBytes(16), chunkdb::scram::kMinIterations), false);
+    users->Grant("reader", "world", chunkdb::Right::kRead);
+    const auto slots_file = dir.path() / "tables" / "world" / "chunkdb.slots";
+    const auto before = chunkdb::LoadFile(slots_file);
+    config.access_mode = chunkdb::AccessMode::kReadOnly;
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+    CommandEngine engine(chunkdb::EngineConfig{.require_auth = true, .users = users}, catalog);
+    chunkdb::SessionState session;
+    assert(chunkdb::test::LoginOnEngine(engine, session, "reader", "pw").front() == '%');
+    ExpectError(engine.Execute(session, "WATCH world SLOT 'legacy'\r\n"), "INVALID_ARGUMENT");
+    assert(Contains(engine.Execute(session, "SHOW SLOTS ON world\r\n"), "$5\r\nowner\r\n_\r\n"));
+    assert(chunkdb::LoadFile(slots_file) == before);
+}
+
 void TestSlotStatements() {
     Fixture f;
     ExpectReply(f.Run("SHOW SLOTS"), "*0\r\n");
@@ -921,6 +948,13 @@ void TestSlotStatements() {
     assert(f.Run("SHOW SLOTS ON plain").find("$5\r\nowner\r\n$3\r\nbot\r\n") != std::string::npos);
     ExpectError(f.Run("CREATE SLOT 'twice' ON plain OWNER bot OWNER bot"), "SYNTAX");
     ExpectError(f.Run("CREATE SLOT 'long' ON plain OWNER " + std::string(64U, 'a')), "INVALID_ARGUMENT");
+    // IF NOT EXISTS keeps an existing slot only when a given OWNER matches it.
+    ExpectReply(f.Run("CREATE SLOT IF NOT EXISTS 'owned' ON plain OWNER bot NO BEFORE"), "+OK\r\n");
+    ExpectReply(f.Run("CREATE SLOT IF NOT EXISTS 'owned' ON plain NO BEFORE"), "+OK\r\n");
+    ExpectError(f.Run("CREATE SLOT IF NOT EXISTS 'owned' ON plain OWNER other NO BEFORE"), "INVALID_ARGUMENT reason=slot_filters");
+    ExpectError(f.Run("CREATE SLOT IF NOT EXISTS 'consumer' ON world OWNER bot"), "INVALID_ARGUMENT reason=slot_filters");
+    ExpectReply(f.Run("CREATE SLOT IF NOT EXISTS 'consumer' ON world"), "+OK\r\n");
+    assert(!f.catalog->Find("world")->ListFeedSlots().front().owner);
     assert(f.Run("SHOW SLOTS").starts_with("*3\r\n"));
     ExpectError(f.Run("CREATE SLOT 'consumer' ON world"), "INVALID_ARGUMENT");
     ExpectError(f.Run("DROP SLOT 'missing' ON world"), "INVALID_ARGUMENT");
@@ -1055,6 +1089,7 @@ int main(int argc, char** argv) {
     TestConcurrentConditionalCreate();
     TestScanChunks();
     TestSlotStatements();
+    TestReadOnlySlotWithoutOwner();
     TestSlotListingDuringDrop();
     TestStructuredStorageErrors();
     return 0;

@@ -529,26 +529,71 @@ void SlotOwners(bool tls) {
     admin->Ok("GRANT ADMIN ON t TO other"); // Table ADMIN is not enough.
     Error(other.Command("WATCH t SLOT 'consumer'"), "PERMISSION_DENIED");
     assert(Number(Field(Slot(admin->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == first);
+    // An owner is shown to the owner itself and to MANAGES USERS only.
+    const auto theirs = other.Command("SHOW SLOTS ON t");
+    assert(Field(Slot(theirs, "t", "consumer"), "owner").type == '_' && Field(Slot(theirs, "t", "implicit"), "owner").type == '_');
+    const auto mine = owner.Command("SHOW SLOTS ON t");
+    assert(Field(Slot(mine, "t", "consumer"), "owner").value == "reader" && Field(Slot(mine, "t", "implicit"), "owner").type == '_');
     assert(Start(owner.Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(owner);
     auto any = harness.Connect(); // admin has ADMIN on *.
     assert(Start(any->Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(*any);
     admin->Ok("GRANT ADMIN ON * TO other");
-    assert(Start(other.Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(other);
+    assert(Start(other.Command("WATCH t SLOT 'consumer'")).second == first);
+    assert(Change(NextChange(other)) == second);
+    // That watch needs ADMIN on * as long as it lasts; READ on t remains.
     admin->Ok("REVOKE ADMIN ON * FROM other");
+    Error(other.Read(), "NO_TABLE"); Closed(other);
     // The owner takes over a watch of its own.
     (void)Start(owner.Command("WATCH t SLOT 'consumer'"));
+    admin->Ok("GRANT ADMIN ON * TO reader"); admin->Ok("REVOKE ADMIN ON * FROM reader"); // The owner's watch stays.
     assert(Change(NextChange(owner)) == second); // Delivered before the handoff.
     Client again(harness.port, tls); again.Login("reader", "pw");
     (void)Start(again.Command("WATCH t SLOT 'consumer' TAKEOVER"));
     Error(owner.Read(), "KILLED"); Closed(owner); Unwatch(again); again.Close();
     admin->Ok("DROP USER reader");
     assert(Field(Slot(admin->Command("SHOW SLOTS ON t"), "t", "consumer"), "owner").value == "reader");
-    Error(other.Command("WATCH t SLOT 'consumer'"), "PERMISSION_DENIED");
+    Client later(harness.port, tls); later.Login("other", "pw");
+    Error(later.Command("WATCH t SLOT 'consumer'"), "PERMISSION_DENIED");
     (void)Start(any->Command("WATCH t SLOT 'consumer'")); Unwatch(*any);
     admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
     admin->Ok("GRANT READ ON t TO reader");
     Client created(harness.port, tls); created.Login("reader", "pw");
     assert(Start(created.Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(created);
+}
+
+// A slot without a recorded owner, as from before owners were recorded, takes
+// the user of its first granted attach that ADMIN on * does not allow. A
+// failed owner write starts no watch and records nothing.
+void FirstAttachOwner(bool tls) {
+    Harness harness(tls, true);
+    auto admin = harness.Connect(); Create(*admin);
+    (void)harness.catalog->Find("t")->CreateFeedSlot("legacy");
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
+    for (const auto* user : {"reader", "other"}) {
+        admin->Ok(std::string("CREATE USER ") + user + " VERIFIER '" + verifier + "'");
+        admin->Ok(std::string("GRANT READ ON t TO ") + user);
+    }
+    const auto owner = [&] { return Field(Slot(admin->Command("SHOW SLOTS ON t"), "t", "legacy"), "owner"); };
+    assert(owner().type == '_');
+    (void)Start(admin->Command("WATCH t SLOT 'legacy'")); Unwatch(*admin);
+    assert(owner().type == '_'); // ADMIN on * inspects the slot without taking it.
+    const auto file = harness.directory.path() / "tables" / "t" / kFeedSlotsFileName;
+    const auto before = LoadFile(file);
+    Client reader(harness.port, tls); reader.Login("reader", "pw");
+    {
+        txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_TEMP_FLUSH_ONCE", "1");
+        Error(reader.Command("WATCH t SLOT 'legacy'"), "INTERNAL");
+    }
+    assert(reader.Command("PING").value == "PONG"); // No watch started.
+    assert(owner().type == '_' && LoadFile(file) == before);
+    const auto first = Set(*admin, 7);
+    (void)Start(reader.Command("WATCH t SLOT 'legacy'"));
+    assert(owner().value == "reader");
+    assert(Change(NextChange(reader)) == first); // The watch streams as any other.
+    Unwatch(reader);
+    Client other(harness.port, tls); other.Login("other", "pw");
+    Error(other.Command("WATCH t SLOT 'legacy'"), "PERMISSION_DENIED");
 }
 
 void ArchiveHandover(bool tls) {
@@ -1620,7 +1665,7 @@ int main(int argc, char** argv) {
         run("conditional-objects", ConditionalObjects);
         run("slot-record-outcome", SlotRecordOutcome);
         run("takeover-fence", TakeoverFence); run("takeover", Takeover); run("takeover-rights", TakeoverRights); run("takeover-UNWATCH-return", TakeoverUnwatchReturn); run("takeover-stalled-socket", TakeoverStalledSocket);
-        run("lifecycle", Lifecycle); run("rights", Rights); run("watch-revoke", WatchRevoke); run("watch-ACK-revoke", WatchAckRevoke); run("watch-dropped-user", WatchDroppedUser); run("slot-owners", SlotOwners); run("archive-handover", ArchiveHandover);
+        run("lifecycle", Lifecycle); run("rights", Rights); run("watch-revoke", WatchRevoke); run("watch-ACK-revoke", WatchAckRevoke); run("watch-dropped-user", WatchDroppedUser); run("slot-owners", SlotOwners); run("first-attach-owner", FirstAttachOwner); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);

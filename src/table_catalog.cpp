@@ -518,7 +518,7 @@ void Table::StopFeed() {
 }
 
 FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const FeedSlotFilters& filters,
-    std::optional<std::string> owner) {
+    std::optional<std::string> owner, bool owner_given) {
     RequireValidFeedSlotName(name);
     if (owner) RequireValidFeedSlotOwner(*owner);
     std::lock_guard ddl(ddl_mutex_);
@@ -533,6 +533,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
         const auto existing = std::find_if(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; });
         if (existing != slots.end()) {
             if (existing->filters != filters) throw FeedSlotFiltersError("feed slot filters differ from existing slot");
+            if (owner_given && existing->owner != owner) throw FeedSlotFiltersError("feed slot owner differs from existing slot");
             return *existing;
         }
     }
@@ -703,13 +704,6 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
             throw FeedSlotFiltersError("feed slot filters differ from WATCH filters");
         return slot;
     };
-    // A slot recorded without an owner belongs to the user of its first
-    // attach, persisted before that attach is granted.
-    const auto bind = [&](ChunkStore& store, FeedSlot& slot) {
-        if (slot.owner || user.empty()) return;
-        store.feed_slots_->BindOwner(name, user);
-        slot.owner = user;
-    };
     {
         auto store = BeginExclusive();
         if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
@@ -720,7 +714,6 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
         if (old && old->takeover_pending.load(std::memory_order_acquire))
             throw FeedSlotBusyError("feed slot ownership handoff is pending", "takeover_pending");
         if (!old || !old->valid.load(std::memory_order_acquire)) {
-            bind(*store, slot);
             auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, std::move(user));
             existing = claim;
             return {std::move(slot), std::move(claim)};
@@ -758,11 +751,17 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
     if (!old->valid.load(std::memory_order_acquire) || found == slot_claims_.end() || found->second.lock() != old)
         throw FeedSlotLostError("feed slot was removed during takeover");
     auto slot = validate(*store);
-    bind(*store, slot);
     auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, std::move(user));
     old->valid.store(false, std::memory_order_release);
     found->second = claim;
     return {std::move(slot), std::move(claim)};
+}
+
+void Table::BindClaimedFeedSlotOwner(const std::shared_ptr<FeedSlotClaim>& claim, const std::string& owner) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
+    lease->store().feed_slots_->BindOwner(claim->name, owner);
 }
 
 FeedSlot Table::ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim) {

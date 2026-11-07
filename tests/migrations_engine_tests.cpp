@@ -310,6 +310,16 @@ void SlotOwnersInMigrations() {
     Reply(e.Run("MIGRATE 'named' CREATE SLOT 'named' ON realm OWNER bot"), "+skipped\r\n");
     const auto slots = e.catalog->Find("realm")->ListFeedSlots();
     assert(slots.size() == 2U && slots[0].owner == "limited" && slots[1].owner == "bot");
+    // IF NOT EXISTS with OWNER is a no-op only for that owner, and is checked
+    // before a no-op is recorded.
+    const auto records = e.catalog->Migrations().size();
+    Error(e.Run("MIGRATE 'other' CREATE SLOT IF NOT EXISTS 'named' ON realm OWNER limited"), "INVALID_ARGUMENT reason=slot_filters");
+    const auto long_owner = e.Run("MIGRATE 'long' CREATE SLOT IF NOT EXISTS 'named' ON realm OWNER " + std::string(64U, 'a'));
+    Error(long_owner, "INVALID_ARGUMENT"); assert(long_owner.find("slot owners are user names") != std::string::npos);
+    assert(e.catalog->Migrations().size() == records);
+    Reply(e.Run("MIGRATE 'same' CREATE SLOT IF NOT EXISTS 'named' ON realm OWNER bot"), "+applied\r\n");
+    Reply(e.Run("MIGRATE 'implicit' CREATE SLOT IF NOT EXISTS 'named' ON realm"), "+applied\r\n");
+    assert(e.catalog->Migrations().size() == records + 2U && e.catalog->Find("realm")->ListFeedSlots()[1].owner == "bot");
 }
 
 struct PauseNarrowingScan : MigrationTestHook {
