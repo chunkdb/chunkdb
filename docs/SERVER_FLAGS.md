@@ -122,6 +122,9 @@ On Windows, rename the file and restart the server; until then it keeps writing 
 | `--maintenance-workers` | `2` | Positive worker count shared by background maintenance and parallel per-table `FLUSH WAL` barriers. |
 | `--background-checkpoint-queue-limit` | `4096` | Per-table queue; overflow and excessive WAL growth force inline checkpointing. |
 
+To size `--max-loaded-chunks`, divide the server's resident memory growth after a warm-up with your own data by `chunkdb_loaded_chunks` from SHOW METRICS.
+The recorded figure, for the default chunk size with one 16-bit column, is in [Resident memory per chunk](releases/PERFORMANCE_HISTORY.md#resident-memory-per-chunk); larger chunks, more or wider columns and variable values use more.
+
 ## Read-only
 
 `--read-only` serves a data directory, or a completed [backup](BACKUP.md#3-inspect-a-backup), without writing to its files.
