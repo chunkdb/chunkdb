@@ -24,8 +24,8 @@ struct TlsPair {
         assert(server_context && client_context);
         SSL_CTX_set_verify(client_context, SSL_VERIFY_NONE, nullptr);
         // Reuse the protocol fixture's certificate, without its Client or Harness.
-        const auto cert_text = chunkdb::slot_socket_test::kTestTlsCertPem;
-        const auto key_text = chunkdb::slot_socket_test::kTestTlsKeyPem;
+        const auto& cert_text = chunkdb::test::TestTls().cert_pem;
+        const auto& key_text = chunkdb::test::TestTls().key_pem;
         auto* cert_bio = BIO_new_mem_buf(cert_text.data(), static_cast<int>(cert_text.size()));
         auto* key_bio = BIO_new_mem_buf(key_text.data(), static_cast<int>(key_text.size()));
         assert(cert_bio && key_bio);
