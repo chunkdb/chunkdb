@@ -106,6 +106,56 @@ void Filters() {
     Reject([&] { (void)SerializeFeedSlotRecords(records); });
 }
 
+// Owners need version 3; files without an owner keep the version older
+// readers know, and their slots read back without one.
+void Owners() {
+    StoreId epoch{}; epoch[0] = 5U;
+    FeedSlotRecords records{epoch, 10U, {{"owned", 4U, false}, {"legacy", 5U, false}}};
+    records.slots[0].owner = "alice";
+    const auto bytes = SerializeFeedSlotRecords(records);
+    assert(ReadLe16(bytes, 4U) == 3U && ReadLe16(bytes, 6U) == 0U);
+    const auto parsed = ParseFeedSlotRecords(bytes, epoch);
+    assert(!parsed.filter_format && parsed.slots[0].owner == "alice" && !parsed.slots[1].owner);
+    assert(parsed.slots[0].written == 4U && parsed.slots[1].written == 5U);
+    for (std::size_t at = 0; at < bytes.size(); ++at) {
+        auto partial = bytes; partial.resize(at);
+        Reject([&] { (void)ParseFeedSlotRecords(partial, epoch); });
+        auto corrupt = bytes; corrupt[at] ^= 1U;
+        Reject([&] { (void)ParseFeedSlotRecords(corrupt, epoch); });
+    }
+    const auto reject_checked = [&](std::vector<std::uint8_t> changed) {
+        const auto crc = changed.size() - 4U;
+        changed.resize(crc); WriteLe32(changed, Crc32(changed.data(), changed.size()));
+        Reject([&] { (void)ParseFeedSlotRecords(changed, epoch); });
+    };
+    auto malformed = bytes; malformed[6U] = 2U; reject_checked(malformed); // unknown header flag
+    malformed = bytes; malformed[37U] |= 8U; reject_checked(malformed); // filter without the filter format
+    malformed = bytes; malformed[36U + 12U + 5U] = 0U; reject_checked(malformed); // empty owner
+    malformed = bytes; malformed[36U + 12U + 5U + 1U] = 'A'; reject_checked(malformed); // not a user name
+    malformed = bytes; malformed[4U] = 2U; reject_checked(malformed); // owner flag before version 3
+    malformed = bytes; malformed[4U] = 4U; reject_checked(malformed);
+
+    records.slots[1].filters.no_before = true;
+    const auto filtered = SerializeFeedSlotRecords(records);
+    assert(ReadLe16(filtered, 4U) == 3U && ReadLe16(filtered, 6U) == 1U);
+    const auto both = ParseFeedSlotRecords(filtered, epoch);
+    assert(both.filter_format && both.slots[0].owner == "alice" && both.slots[1].filters.no_before);
+    auto unowned = both; unowned.slots.erase(unowned.slots.begin());
+    assert(ReadLe16(SerializeFeedSlotRecords(unowned), 4U) == 2U); // the filter format stays
+    unowned = parsed; unowned.slots.erase(unowned.slots.begin());
+    const auto legacy = SerializeFeedSlotRecords(unowned);
+    assert(ReadLe16(legacy, 4U) == 1U && !ParseFeedSlotRecords(legacy, epoch).slots[0].owner);
+
+    for (const auto owner : {"", "Alice", "1user", "a-b"}) {
+        records.slots[0].owner = owner;
+        Reject([&] { (void)SerializeFeedSlotRecords(records); });
+        Reject([&] { RequireValidFeedSlotOwner(owner); });
+    }
+    records.slots[0].owner = std::string(64U, 'a'); Reject([&] { (void)SerializeFeedSlotRecords(records); });
+    records.slots[0].owner = std::string(63U, 'a');
+    assert(ParseFeedSlotRecords(SerializeFeedSlotRecords(records), epoch).slots[0].owner->size() == 63U);
+}
+
 }  // namespace
 
-int main() { Records(); Filters(); }
+int main() { Records(); Filters(); Owners(); }

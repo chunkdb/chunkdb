@@ -271,6 +271,12 @@ FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement
     return filters;
 }
 
+// OWNER, else the user running CREATE SLOT; none without authentication.
+std::optional<std::string> SlotOwner(const cql::CreateSlot& create, bool require_auth, const std::string& user) {
+    if (create.owner) return create.owner;
+    return require_auth ? std::optional<std::string>(user) : std::nullopt;
+}
+
 // A column of CREATE TABLE or ADD COLUMN; `id` is replaced by AddColumn.
 [[nodiscard]] Column ColumnFrom(const cql::ColumnDefinition& definition, std::uint32_t id) {
     Column column;
@@ -904,6 +910,8 @@ std::string CommandEngine::ExecuteStatement(
                             request.kind = MigrationRequest::Kind::kCreateSlot; request.table = slot.table; request.slot = slot.name; request.if_not_exists = slot.if_not_exists;
                             request.slot_filters = {.area = slot.area, .no_before = slot.no_before, .chunks = slot.chunks};
                             request.slot_columns = slot.columns;
+                            request.slot_owner = SlotOwner(slot, config_.require_auth, session.user);
+                            request.slot_owner_given = slot.owner.has_value();
                         },
                         [&](const cql::DropSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
@@ -969,6 +977,8 @@ std::string CommandEngine::ExecuteStatement(
                     };
                     if (watch.slot) {
                         const auto* user = config_.require_auth ? CurrentUser(session) : nullptr;
+                        // A user dropped since the right check must not become an owner.
+                        if (config_.require_auth && !user) throw UserDroppedError();
                         const bool admin_all = !config_.require_auth || (user && user->grants.contains(kEveryTable) &&
                             user->grants.at(kEveryTable) >= Right::kAdmin);
                         auto state = SlotWatch::Create(table, *watch.slot, options, watch.takeover,
@@ -978,6 +988,11 @@ std::string CommandEngine::ExecuteStatement(
                             });
                         if (session.register_slot_watch && !session.register_slot_watch(state))
                             return Protocol::Error("BUSY", "maximum slot catch-up workers reached", {{"reason", "slot_worker_limit"}, {"table", watch.table}});
+                        // A slot without an owner takes the user of its first
+                        // granted attach; one by ADMIN on * records nobody.
+                        if (config_.require_auth && !admin_all && !state->owner()) state->BindOwner(session.user);
+                        // A watch that ADMIN on * allows ends once that right is gone.
+                        if (session.watch_right && state->owner() != session.user) session.watch_right->RequireEveryTableAdmin();
                         session.slot_watch = std::move(state);
                     } else session.watch = table->SubscribeFeed(options);
                     session.table = std::move(table);
@@ -996,7 +1011,8 @@ std::string CommandEngine::ExecuteStatement(
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, create.table, Right::kAdmin);
                     const auto table = catalog_->Require(create.table);
-                    (void)table->CreateFeedSlot(create.name, create.if_not_exists, SlotFilters(table, create));
+                    (void)table->CreateFeedSlot(create.name, create.if_not_exists, SlotFilters(table, create),
+                        SlotOwner(create, config_.require_auth, session.user), create.owner.has_value());
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::DropSlot& drop) {
@@ -1035,9 +1051,12 @@ std::string CommandEngine::ExecuteStatement(
                         }
                     }
                     std::string reply;
+                    // An owner is user information: the owner itself or MANAGES USERS sees it.
+                    const auto* viewer = CurrentUser(session);
+                    const bool show_owners = !config_.require_auth || (viewer != nullptr && viewer->manages_users);
                     Protocol::AppendArrayHeader(reply, slots.size());
                     for (const auto& [name, slot] : slots) {
-                        Protocol::AppendMapHeader(reply, 8);
+                        Protocol::AppendMapHeader(reply, 9);
                         Protocol::AppendBulk(reply, "table");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "name");
@@ -1074,6 +1093,9 @@ std::string CommandEngine::ExecuteStatement(
                         } else Protocol::AppendNull(reply);
                         Protocol::AppendBulk(reply, "no_before"); reply += slot.filters.no_before ? "#t\r\n" : "#f\r\n";
                         Protocol::AppendBulk(reply, "chunks"); reply += slot.filters.chunks ? "#t\r\n" : "#f\r\n";
+                        Protocol::AppendBulk(reply, "owner");
+                        if (slot.owner && (show_owners || (viewer != nullptr && *slot.owner == session.user))) Protocol::AppendBulk(reply, *slot.owner);
+                        else Protocol::AppendNull(reply);
                     }
                     return reply;
                 },

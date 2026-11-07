@@ -38,6 +38,7 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     const bool resync = options.after && (options.after->epoch != start.epoch || options.after->revision > claim->completed);
     if (options.after && !resync) start.revision = std::max(start.revision, options.after->revision);
     auto result = std::shared_ptr<SlotWatch>(new SlotWatch(std::move(table), std::move(claim), start, std::move(options), resync));
+    result->slot_owner_ = slot.owner;
     result->acknowledged_ = slot.position.revision;
     result->written_ = slot.position.revision;
     FeedOptions live_options = result->options_;
@@ -50,6 +51,18 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     result->joined_ = start.revision >= result->join_;
     { std::lock_guard lock(result->claim_->owner_mutex); result->claim_->owner = result; }
     return result;
+}
+void SlotWatch::BindOwner(const std::string& user) {
+    if (slot_owner_) return;
+    try { table_->BindClaimedFeedSlotOwner(claim_, user); }
+    catch (const std::exception&) {
+        // The attach was never granted: free the slot now, not when the
+        // catch-up worker drops this watch.
+        claim_->valid.store(false, std::memory_order_release);
+        Cancel();
+        throw;
+    }
+    slot_owner_ = user;
 }
 SlotWatch::SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim> claim,
     FeedPosition start, FeedOptions options, bool resync)

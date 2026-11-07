@@ -310,6 +310,10 @@ ReadRightCheck::State ReadRightCheck::Recheck(std::uint64_t generation) {
     const auto found = rights->users.find(user_);
     if (found == rights->users.end() || found->second.incarnation != incarnation_) state_ = State::kNoUser;
     else if (!RightOn(found->second.grants, table_).has_value()) state_ = State::kNoRight;
+    else if (every_table_admin_) {
+        const auto every = found->second.grants.find(kEveryTable);
+        if (every == found->second.grants.end() || every->second < Right::kAdmin) state_ = State::kNoRight;
+    }
     return state_;
 }
 

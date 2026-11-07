@@ -146,7 +146,7 @@ void CutAndProgress(DurabilityMode mode) {
     TableCatalog catalog(Config(source, mode));
     (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
-    const auto slot = table->CreateFeedSlot("reader");
+    const auto slot = table->CreateFeedSlot("reader", false, {}, "alice");
     auto lease = table->Acquire();
     auto& store = lease->store();
     WriteCounter(store, {0, 0}, 11); store.CheckpointForTests(0, 0);
@@ -171,6 +171,7 @@ void CutAndProgress(DurabilityMode mode) {
     assert(txn_test::CounterOf(ReadBackup(target, "default", {2, 0})) == 0U);
     const auto slots = *ReadFeedSlotRecords(target / "tables/default", slot.position.epoch);
     assert(slots.slots.size() == 1U && slots.slots[0].name == "reader" && slots.durable_watermark <= cut);
+    assert(slots.slots[0].owner == "alice");
     assert(!std::filesystem::exists(target / "tables/default" / kFeedArchiveDirName));
     // A later checkpoint retries the deferred image replacement and preserves the live write.
     store.CheckpointForTests(0, 0);
@@ -185,6 +186,7 @@ void CutAndProgress(DurabilityMode mode) {
     TableCatalog restored(Config(root / "restored", mode));
     auto restored_table = restored.Find("default");
     assert(restored_table->Info().store_id != slot.position.epoch);
+    assert(restored_table->ListFeedSlots().front().owner == "alice"); // The slot keeps its owner.
     auto restored_lease = restored_table->Acquire();
     assert(ReadCounter(restored_lease->store(), {0, 0}) == 11U);
     assert(ReadCounter(restored_lease->store(), {1, 0}) == 22U);
