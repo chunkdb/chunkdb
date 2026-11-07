@@ -503,7 +503,9 @@ class Harness {
     std::exception_ptr error_;
 };
 inline std::pair<std::string, std::uint64_t> Start(const Reply& reply) {
-    assert(reply.type == '%');
+    // Name the reply, so a refused WATCH explains itself in a CI log.
+    if (reply.type != '%')
+        throw std::runtime_error(std::string("WATCH did not start: reply type '") + reply.type + "': " + reply.value);
     const auto& epoch = Field(reply, "epoch");
     assert(epoch.type == '$' && epoch.value.size() == 32U);
     return {epoch.value, Number(Field(reply, "revision"))};

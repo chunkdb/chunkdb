@@ -537,12 +537,7 @@ void SlotOwners(bool tls) {
     assert(Start(owner.Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(owner);
     auto any = harness.Connect(); // admin has ADMIN on *.
     assert(Start(any->Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(*any);
-    admin->Ok("GRANT ADMIN ON * TO other");
-    assert(Start(other.Command("WATCH t SLOT 'consumer'")).second == first);
-    assert(Change(NextChange(other)) == second);
-    // That watch needs ADMIN on * as long as it lasts; READ on t remains.
-    admin->Ok("REVOKE ADMIN ON * FROM other");
-    Error(other.Read(), "NO_TABLE"); Closed(other);
+    other.Close();
     // The owner takes over a watch of its own.
     (void)Start(owner.Command("WATCH t SLOT 'consumer'"));
     admin->Ok("GRANT ADMIN ON * TO reader"); admin->Ok("REVOKE ADMIN ON * FROM reader"); // The owner's watch stays.
@@ -559,6 +554,15 @@ void SlotOwners(bool tls) {
     admin->Ok("GRANT READ ON t TO reader");
     Client created(harness.port, tls); created.Login("reader", "pw");
     assert(Start(created.Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(created);
+    // ADMIN on * attaches to another user's slot, and the watch needs that
+    // right as long as it lasts; READ on t remains. This comes last: its
+    // connection closes before the catch-up worker finishes the watch and
+    // frees the slot, so an attach right after it can still be SLOT_BUSY.
+    admin->Ok("GRANT ADMIN ON * TO other");
+    assert(Start(later.Command("WATCH t SLOT 'consumer'")).second == first);
+    assert(Change(NextChange(later)) == second);
+    admin->Ok("REVOKE ADMIN ON * FROM other");
+    Error(later.Read(), "NO_TABLE"); Closed(later);
 }
 
 // A slot without a recorded owner, as from before owners were recorded, takes
