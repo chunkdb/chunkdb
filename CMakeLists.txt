@@ -213,6 +213,15 @@ target_include_directories(chunkdb_server_bench_lib PRIVATE "${CMAKE_CURRENT_BIN
 target_compile_definitions(chunkdb_server_bench_lib PRIVATE
     CHUNKDB_BENCH_BUILD_TYPE="$<IF:$<BOOL:$<CONFIG>>,$<CONFIG>,unknown>")
 
+# Prices the chunk-level map lookups of point reads and writes
+# (docs/design/COLUMNS_DESIGN.md, "Positions instead of keys").
+add_executable(chunkdb_chunk_map_bench bench/chunk_map_bench.cpp)
+target_link_libraries(chunkdb_chunk_map_bench PRIVATE chunkdb_core)
+add_dependencies(chunkdb_chunk_map_bench chunkdb_bench_metadata)
+target_include_directories(chunkdb_chunk_map_bench PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_compile_definitions(chunkdb_chunk_map_bench PRIVATE
+    CHUNKDB_BENCH_BUILD_TYPE="$<IF:$<BOOL:$<CONFIG>>,$<CONFIG>,unknown>")
+
 
 add_executable(chunkdb_server_bench
     bench/chunkdb_server_bench.cpp
@@ -686,6 +695,12 @@ if(CHUNKDB_BUILD_TESTS)
     endif()
     add_test(NAME server_bench COMMAND chunkdb_server_bench_test)
 
+    add_test(
+        NAME chunk_map_bench_smoke
+        COMMAND chunkdb_chunk_map_bench --chunks 256 --ops 2048 --runs 2
+            --data-dir "${CMAKE_CURRENT_BINARY_DIR}/chunk-map-bench-smoke"
+    )
+
     add_executable(chunkdb_budget_compare_test tests/budget_compare_tests.cpp)
     target_link_libraries(chunkdb_budget_compare_test PRIVATE chunkdb_budget_compare_lib)
     add_test(NAME budget_compare COMMAND chunkdb_budget_compare_test)
@@ -987,6 +1002,7 @@ if(CHUNKDB_BUILD_TESTS)
         security_regression
         server_integration
         server_bench
+        chunk_map_bench_smoke
         budget_compare
         txn_history
         txn_snapshot
