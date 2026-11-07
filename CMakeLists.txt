@@ -22,6 +22,13 @@ option(
     ON
 )
 option(CHUNKDB_ENABLE_PACKAGING "Enable CPack archive packaging configuration" ON)
+# Benchmark builds only: every commit takes a fixed time per chunk instead of
+# the wall clock, so a paired budget run measures the commit-time bookkeeping.
+option(CHUNKDB_BENCH_CONSTANT_COMMIT_TIME "Benchmark only: fixed commit times, not for serving data" OFF)
+if(CHUNKDB_BENCH_CONSTANT_COMMIT_TIME)
+    message(WARNING "CHUNKDB_BENCH_CONSTANT_COMMIT_TIME is for benchmark comparisons only: commit times are not wall-clock times")
+    add_compile_definitions(CHUNKDB_BENCH_CONSTANT_COMMIT_TIME=1)
+endif()
 # Failure injection read from CHUNKDB_FAILPOINT_* environment variables, used
 # by the tests; without it the engine never reads them.
 option(CHUNKDB_FAILPOINTS "Compile test failure injection into the engine" ${CHUNKDB_BUILD_TESTS})
