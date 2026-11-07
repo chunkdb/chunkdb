@@ -695,6 +695,10 @@ if(CHUNKDB_BUILD_TESTS)
     endif()
     add_test(NAME server_bench COMMAND chunkdb_server_bench_test)
 
+    add_executable(chunkdb_chunk_map_bench_test tests/chunk_map_bench_tests.cpp)
+    target_include_directories(chunkdb_chunk_map_bench_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+    add_test(NAME chunk_map_bench_args COMMAND chunkdb_chunk_map_bench_test)
+
     add_test(
         NAME chunk_map_bench_smoke
         COMMAND chunkdb_chunk_map_bench --chunks 256 --ops 2048 --runs 2
@@ -902,6 +906,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_server_migrations_protocol_test
         chunkdb_server_slots_process_test
         chunkdb_server_bench_test
+        chunkdb_chunk_map_bench_test
         chunkdb_budget_compare_test
         chunkdb_durability_crash_hardening_test
         chunkdb_snapshot_generation_linger_test
@@ -1003,6 +1008,7 @@ if(CHUNKDB_BUILD_TESTS)
         server_integration
         server_bench
         chunk_map_bench_smoke
+        chunk_map_bench_args
         budget_compare
         txn_history
         txn_snapshot

@@ -55,6 +55,7 @@
 #include <sys/sysctl.h>
 #endif
 
+#include "chunk_map_bench_args.hpp"
 #include "chunkdb/bench_build.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/logging.hpp"
@@ -62,8 +63,11 @@
 namespace {
 
 using Clock = std::chrono::steady_clock;
+using chunkdb::chunk_map_bench::Args;
+using chunkdb::chunk_map_bench::DataDirs;
+using chunkdb::chunk_map_bench::kSegmentOps;
+using chunkdb::chunk_map_bench::RunDir;
 
-constexpr std::size_t kSegmentOps = 1024;
 constexpr std::uint64_t kSeed = 135;
 // Chunks per world row: 16 large chunks of 8x8 chunks.
 constexpr std::int64_t kGridWidthChunks = 128;
@@ -71,71 +75,20 @@ constexpr std::int64_t kChunkSide = 16;
 constexpr std::size_t kBlocksPerChunk = static_cast<std::size_t>(kChunkSide * kChunkSide);
 // Above any number of updates or WAL bytes one run gives a chunk.
 constexpr std::size_t kNoThreshold = std::size_t{1} << 40;
+// Test failure injection compiled into the engine (CHUNKDB_FAILPOINTS) reads
+// the environment on every write; a published run is built without it.
+#ifdef CHUNKDB_FAILPOINTS
+constexpr const char* kFailpoints = "on";
+#else
+constexpr const char* kFailpoints = "off";
+#endif
 
-// Value 0 and value 1 differ in their first bit.
-constexpr std::string_view kBits[2] = {"0101010101010101", "1010101010101010"};
-
-struct Args {
-    std::size_t chunks = 16384;
-    std::size_t ops = 200 * kSegmentOps;
-    std::size_t runs = 15;
-    std::filesystem::path data_dir;
-    bool keep_data = false;
-};
-
-constexpr char kUsage[] =
-    "Usage: chunkdb_chunk_map_bench [options]\n"
-    "  --chunks N       loaded chunks the many side spreads over, at least 2 (default 16384)\n"
-    "  --ops N          operations per timed window, a multiple of 1024 (default 204800)\n"
-    "  --runs N         runs, each on a fresh store (default 15)\n"
-    "  --data-dir PATH  parent directory for the per-run data dirs (default: temp dir)\n"
-    "  --keep-data      do not delete the data directories afterwards\n";
-
-Args ParseArgs(int argc, char** argv) {
-    Args args;
-    args.data_dir = std::filesystem::temp_directory_path() / "chunkdb-chunk-map-bench";
-    for (int i = 1; i < argc; ++i) {
-        const std::string_view arg = argv[i];
-        auto require_value = [&](const char* name) {
-            if (i + 1 >= argc) {
-                throw std::invalid_argument(std::string("missing value for ") + name);
-            }
-            ++i;
-            return std::string(argv[i]);
-        };
-        auto parse_size = [](const std::string& value, const char* name) {
-            std::size_t consumed = 0;
-            const auto parsed = std::stoull(value, &consumed, 10);
-            if (consumed != value.size() || parsed == 0) {
-                throw std::invalid_argument(std::string("invalid ") + name + " value: " + value);
-            }
-            return static_cast<std::size_t>(parsed);
-        };
-        if (arg == "--chunks") {
-            args.chunks = parse_size(require_value("--chunks"), "--chunks");
-            if (args.chunks < 2 || args.chunks > (std::size_t{1} << 24)) {
-                throw std::invalid_argument("--chunks must be between 2 and 16777216");
-            }
-        } else if (arg == "--ops") {
-            args.ops = parse_size(require_value("--ops"), "--ops");
-            if (args.ops % kSegmentOps != 0) {
-                throw std::invalid_argument("--ops must be a multiple of 1024");
-            }
-        } else if (arg == "--runs") {
-            args.runs = parse_size(require_value("--runs"), "--runs");
-        } else if (arg == "--data-dir") {
-            args.data_dir = require_value("--data-dir");
-        } else if (arg == "--keep-data") {
-            args.keep_data = true;
-        } else if (arg == "--help" || arg == "-h") {
-            std::cout << kUsage;
-            std::exit(0);
-        } else {
-            throw std::invalid_argument("unknown argument: " + std::string(arg));
-        }
-    }
-    return args;
-}
+// 15 bits, so the std::string a read returns fits the small-string buffer of
+// libstdc++ and libc++ and no timed read allocates.
+constexpr std::uint32_t kBlockBits = 15;
+// Value 0 and value 1 differ in every bit.
+constexpr std::string_view kBits[2] = {"010101010101010", "101010101010101"};
+static_assert(kBits[0].size() == kBlockBits && kBits[1].size() == kBlockBits);
 
 chunkdb::StoreConfig BuildStoreConfig(const std::filesystem::path& data_dir, std::size_t chunks) {
     return chunkdb::StoreConfig{
@@ -144,7 +97,7 @@ chunkdb::StoreConfig BuildStoreConfig(const std::filesystem::path& data_dir, std
             .large_chunk_height_chunks = 8,
             .chunk_width_blocks = static_cast<std::uint32_t>(kChunkSide),
             .chunk_height_blocks = static_cast<std::uint32_t>(kChunkSide),
-            .block_bits = 16,
+            .block_bits = kBlockBits,
         },
         .data_dir = data_dir,
         .durability_mode = chunkdb::DurabilityMode::kRelaxed,
@@ -270,13 +223,13 @@ class Shadow {
         return written;
     }
 
-    // How many reads of `sequence` find value 1.
-    [[nodiscard]] std::uint64_t ExpectedOnes(const Sequence& sequence) const {
-        std::uint64_t ones = 0;
-        for (std::size_t i = 0; i < sequence.chunk.size(); ++i) {
-            ones += values_[Index(sequence, i)];
+    // The value each read of `sequence` finds.
+    [[nodiscard]] std::vector<std::uint8_t> Values(const Sequence& sequence) const {
+        std::vector<std::uint8_t> values(sequence.chunk.size());
+        for (std::size_t i = 0; i < values.size(); ++i) {
+            values[i] = values_[Index(sequence, i)];
         }
-        return ones;
+        return values;
     }
 
   private:
@@ -392,11 +345,11 @@ struct World {
 };
 
 void ReadWindow(World& world, const Sequence& sequence, bool timed, WindowTiming* timing) {
-    const std::uint64_t expected = world.shadow.ExpectedOnes(sequence);
-    std::uint64_t ones = 0;
+    const std::vector<std::uint8_t> expected = world.shadow.Values(sequence);
+    std::uint64_t mismatches = 0;
     auto op = [&](std::size_t i) {
         const std::string bits = world.store->GetBlockBits(sequence.block_x[i], sequence.block_y[i]);
-        ones += bits[0] == '1' ? 1U : 0U;
+        mismatches += bits == kBits[expected[i]] ? 0U : 1U;
     };
     if (timed) {
         *timing = TimeWindow(sequence.chunk.size(), op);
@@ -405,7 +358,7 @@ void ReadWindow(World& world, const Sequence& sequence, bool timed, WindowTiming
             op(i);
         }
     }
-    if (ones != expected) {
+    if (mismatches != 0) {
         throw std::runtime_error("point reads returned values other than the ones written");
     }
 }
@@ -452,12 +405,14 @@ void RequireUnchanged(const chunkdb::StoreRuntimeStats& before, const chunkdb::S
     }
 }
 
-RunTimings RunOnce(const Args& args, std::size_t run, const Sequence (&sequences)[kSideCount]) {
-    const std::filesystem::path dir = args.data_dir / ("run-" + std::to_string(run));
-    std::filesystem::remove_all(dir);
+RunTimings RunOnce(
+    const Args& args, const DataDirs& data_dirs, std::size_t run, const Sequence (&sequences)[kSideCount]) {
+    // Declared before the store, so the store is closed before its
+    // directory is deleted.
+    const RunDir dir(data_dirs, run);
 
     World world{
-        .store = std::make_unique<chunkdb::ChunkStore>(BuildStoreConfig(dir, args.chunks)),
+        .store = std::make_unique<chunkdb::ChunkStore>(BuildStoreConfig(dir.path(), args.chunks)),
         .shadow = Shadow(args.chunks),
         .replica = {},
     };
@@ -502,10 +457,6 @@ RunTimings RunOnce(const Args& args, std::size_t run, const Sequence (&sequences
     }
     RequireUnchanged(before, world.store->RuntimeStats());
 
-    world.store.reset();
-    if (!args.keep_data) {
-        std::filesystem::remove_all(dir);
-    }
     return timings;
 }
 
@@ -533,7 +484,11 @@ void PrintSpread(const char* metric, const char* side, std::size_t runs, const S
 
 int main(int argc, char** argv) {
     try {
-        const Args args = ParseArgs(argc, argv);
+        const Args args = chunkdb::chunk_map_bench::ParseArgs(argc, argv);
+        if (args.help) {
+            std::cout << chunkdb::chunk_map_bench::kUsage;
+            return 0;
+        }
         chunkdb::SetLogLevel(chunkdb::LogLevel::kWarn);
 
         // One sequence of block positions for both sides; the many side
@@ -564,14 +519,16 @@ int main(int argc, char** argv) {
             const auto coord = ChunkOf(index);
             large_chunks.emplace(coord.x / 8, coord.y / 8);
         }
-        std::cout << "profile geometry=8x8x16x16x16 chunks=" << args.chunks
+        std::cout << "profile geometry=8x8x" << kChunkSide << "x" << kChunkSide << "x" << kBlockBits << " chunks=" << args.chunks
                   << " large_chunks=" << large_chunks.size() << " grid_width_chunks=" << kGridWidthChunks
                   << " ops=" << args.ops << " segment_ops=" << kSegmentOps << " runs=" << args.runs
                   << " seed=" << kSeed << " durability=relaxed max_loaded_chunks=" << args.chunks * 2
                   << " wal_group_commit_updates=" << kNoThreshold << " checkpoints=off"
-                  << " chunk_lock_mode=" << chunkdb::ChunkLockModeName() << '\n';
+                  << " chunk_lock_mode=" << chunkdb::ChunkLockModeName()
+                  << " failpoints=" << kFailpoints << '\n';
+        const DataDirs data_dirs(args.data_dir, args.keep_data);
         for (std::size_t run = 0; run < args.runs; ++run) {
-            const RunTimings timings = RunOnce(args, run, sequences);
+            const RunTimings timings = RunOnce(args, data_dirs, run, sequences);
             for (int metric = 0; metric < kMetricCount; ++metric) {
                 for (int side = 0; side < kSideCount; ++side) {
                     const auto& timing = timings[metric][side];
@@ -591,9 +548,6 @@ int main(int argc, char** argv) {
                 PrintSpread(kMetricNames[metric], kSideNames[side], args.runs, SpreadOf(values[metric][side]));
             }
             PrintSpread(kMetricNames[metric], "many-minus-one", args.runs, SpreadOf(values[metric][kSideCount]));
-        }
-        if (!args.keep_data) {
-            std::filesystem::remove_all(args.data_dir);
         }
         return 0;
     } catch (const std::exception& e) {
