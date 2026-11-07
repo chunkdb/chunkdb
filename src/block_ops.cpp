@@ -97,7 +97,8 @@ std::optional<std::string> ChunkStore::ReadBlockBits(
 TxnKeep ChunkStore::PrepareTxnKeepLocked(
     const ChunkCoord& chunk_coord,
     const RegularChunk& chunk,
-    std::uint64_t version) {
+    std::uint64_t version,
+    bool whole_chunk) {
     // Loaded after the version was taken (txn_history.hpp).
     if (txn_history_->OpenCount() == 0U) {
         return TxnKeep{};
@@ -109,8 +110,8 @@ TxnKeep ChunkStore::PrepareTxnKeepLocked(
             version,
             ChunkState{
                 .version = chunk.version,
-                .payload = chunk.payload,
-                .presence_bitmap = chunk.presence_bitmap,
+                .payload = whole_chunk ? std::vector<std::uint8_t>{} : chunk.payload,
+                .presence_bitmap = whole_chunk ? std::vector<std::uint8_t>{} : chunk.presence_bitmap,
                 .vars = chunk.vars,
                 .written = chunk.written,
             }),
@@ -123,7 +124,9 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     std::size_t appended_bytes,
     std::uint64_t reserved_version,
     std::uint64_t commit_time_ms,
-    TxnKeep* keep) {
+    TxnKeep* keep,
+    std::vector<std::uint8_t>* replaced_payload,
+    std::vector<std::uint8_t>* replaced_presence) {
     // A WAL whose failed write or transaction could not be repaired takes
     // nothing more until a restart repairs it.
     if (chunk->wal_repair_failed) {
@@ -157,7 +160,19 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     // Still under the chunk's lock, so no read sees the new state without
     // the kept one.
     if (keep != nullptr && !keep->node.empty()) {
+        if (replaced_payload != nullptr) {
+            TxnHistory::FillPayload(keep->node, std::move(*replaced_payload), std::move(*replaced_presence));
+        }
         txn_history_->Publish(keep->node);
+    }
+    if (replaced_payload != nullptr) {
+        // No rollback needs the replaced state any more: it is freed before
+        // the checkpoint serializes the new one. Moves and frees only.
+        std::vector<std::uint8_t>().swap(*replaced_payload);
+        std::vector<std::uint8_t>().swap(*replaced_presence);
+        if (keep != nullptr) {
+            keep->node = TxnHistory::Reservation{};
+        }
     }
     try {
         MaybeCheckpointChunk(chunk_coord, chunk);
@@ -1111,7 +1126,7 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
     feed.Before(chunk_coord, regular_chunk->payload, regular_chunk->presence_bitmap, regular_chunk->vars);
     const std::uint64_t reserved_version = NextChunkVersion();
     feed.Version(reserved_version);
-    TxnKeep keep = PrepareTxnKeepLocked(chunk_coord, *regular_chunk, reserved_version);
+    TxnKeep keep = PrepareTxnKeepLocked(chunk_coord, *regular_chunk, reserved_version, /*whole_chunk=*/true);
 
     auto previous_payload = std::exchange(regular_chunk->payload, std::move(payload));
     auto previous_presence = std::exchange(regular_chunk->presence_bitmap, std::move(presence_bitmap));
@@ -1131,6 +1146,11 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
         // A full-chunk replace can span several records; the frame makes the
         // whole replace atomic across crash recovery.
         WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
+        // Sized once, so a large state is not copied again as the batch grows.
+        frame.Reserve(
+            (payload_changed ? WalFrameBuilder::SpanRecordBytes(regular_chunk->payload.size()) : 0U) +
+            (presence_changed ? WalFrameBuilder::SpanRecordBytes(regular_chunk->presence_bitmap.size()) : 0U) +
+            WalFrameBuilder::VarUpdateRecordBytes(regular_chunk->vars, var_undo));
         if (payload_changed) {
             frame.AppendSpan(0U, regular_chunk->payload.data(), regular_chunk->payload.size());
         }
@@ -1144,14 +1164,18 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         feed.Capture(regular_chunk->wal_batch, appended_bytes);
 
+        // Last in the try: it throws only before its commit point, and only
+        // after that point does it take the replaced vectors, so the catch
+        // below always restores them intact.
         FinishOrdinaryMutationLocked(
             chunk_coord,
             regular_chunk,
             appended_bytes,
             reserved_version,
             commit_time_ms,
-            &keep);
-        feed.Commit();
+            &keep,
+            &previous_payload,
+            &previous_presence);
     } catch (...) {
         regular_chunk->payload = std::move(previous_payload);
         regular_chunk->presence_bitmap = std::move(previous_presence);
@@ -1166,6 +1190,7 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
         regular_chunk->pending_wal_flush_updates = saved_pending_wal_flush_updates;
         throw;
     }
+    feed.Commit();
     return regular_chunk->version;
 }
 
