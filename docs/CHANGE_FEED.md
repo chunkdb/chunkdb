@@ -96,6 +96,7 @@ Consume and acknowledge progress as well as mutations, or raise `slot_max_bytes`
 SHOW SLOTS reports each slot's retained bytes.
 
 See [Feed statements](reference/FEED.md), [Resume a consumer](FEED_RESUME.md), and [Users and rights](USERS.md).
+To keep a history of every change, see [Event journal](EVENT_JOURNAL.md).
 
 A `chunks` push carries mutations exactly like `change`, so a fully written `chunks` frame delivered to the application is ACK-eligible and starts (or keeps) the deadline of the oldest unacknowledged mutation; progress stays ACK-eligible but never starts or extends the timeout; schema, resync and unknown pushes move nothing.
 
