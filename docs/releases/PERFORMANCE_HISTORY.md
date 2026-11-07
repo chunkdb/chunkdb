@@ -258,7 +258,7 @@ Two further methodology points, both deliberate:
 
 ### Recorded for the 2.0 engine (2026-10-06, macOS/APFS)
 
-The latest large-world record is the run at `13c91c2`, the commit that introduced the 2.0 storage format.
+The latest large-world record is the run at `13c91c2`, the commit that completed the 2.0 storage format.
 Host: Apple M1 Pro, 32 GB RAM, macOS 27.0, APFS on the internal SSD, `F_FULLFSYNC` honored; Apple clang 21.0.0, Release.
 `--scenario sparse-writes --cache 16384 --threads 1 --durability relaxed`, 10 repeats: median 6438 ops/s, 0.1515 ms per eviction, 1.025 evictions per write.
 Artifacts: [summary](../../bench/artifacts/manual-runs/format-2.0-20261006-macos-summary.txt), [rows](../../bench/artifacts/manual-runs/format-2.0-20261006-macos-large-world-sparse.csv), [metadata](../../bench/artifacts/manual-runs/format-2.0-20261006-macos-metadata.txt).
@@ -269,7 +269,7 @@ The writer-scaling table below and the [CHUNKSCAN record](../../bench/artifacts/
 
 #### Resident memory per chunk
 
-In the same run, current RSS growth over the warm-up divided by the 16384 chunks it loaded (`rss_bytes_per_warm_chunk`) was 1332 and 1338 B on the first repeat of each process and 1196 to 1261 B on later repeats.
+In the same run, current RSS growth over the warm-up divided by the 16384 chunks it loaded (`rss_bytes_per_warm_chunk`) was 1332 and 1338 B on the first repeat of each `13c91c2` process and 1196 to 1261 B on later repeats.
 That is the default geometry (16x16 blocks of 16 bits, 544 B of chunk state), so a full 16384-chunk cache took about 21 MiB.
 The figure includes heap freed but not returned to the operating system; use it for capacity planning, not as the size of the chunk structures.
 To measure it on another host, read `rss_bytes_per_warm_chunk` of the first repeat:
