@@ -22,6 +22,7 @@ struct FeedSlotTestAccess {
     static FeedArchiveReader CompletedPrefix(Table& table, std::string_view name, FeedPosition after);
     static void EnableChunkForms(FeedArchiveReader& reader, std::size_t budget);
     static void SetEntryBudget(FeedArchiveReader& reader, std::size_t budget);
+    static void Filter(FeedArchiveReader& reader, const FeedSlotFilters& filters);
     static void Retain(Table& table);
     static void SetHook(Table& table, FeedSlotTestHook* hook);
     static void StageAck(Table& table, std::string_view name, FeedPosition position);

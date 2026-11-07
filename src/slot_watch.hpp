@@ -119,7 +119,12 @@ class SlotWatch {
     std::atomic<bool> io_ready_{false};
     SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim> claim,
         FeedPosition start, FeedOptions options, bool resync);
-    bool Publish(const std::shared_ptr<const FeedEntry>& entry);
+    // `filtered`: the archive reader already kept only what this watch sends.
+    bool Publish(const std::shared_ptr<const FeedEntry>& entry, bool filtered = false);
+    // True when the slot has filters (FeedSlotFilters::empty).
+    [[nodiscard]] bool Filtered() const noexcept {
+        return options_.area || options_.column_ids || options_.no_before || options_.chunks;
+    }
     void Finish(std::optional<Output> control);
     bool Work();
     bool FlushAck(bool force);
@@ -144,7 +149,7 @@ class SlotWatch {
     struct Prepared {
         std::shared_ptr<const FeedEntry> original;
         std::uint64_t schema;
-        bool send, built;
+        bool send, built, filtered;
         FeedEntry::Kind kind;
         std::uint64_t schema_version;
         std::size_t size, receipt_bytes;

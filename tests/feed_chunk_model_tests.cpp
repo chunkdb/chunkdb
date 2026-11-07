@@ -1,5 +1,6 @@
 #include <cassert>
 
+#include "chunkdb/engine.hpp"
 #include "feed_archive.hpp"
 #include "feed_slots.hpp"
 #include "feed_protocol.hpp"
@@ -205,6 +206,63 @@ void ArchiveDeliversChangeWhoseFrameFitsTheBudget() {
         }
     }
 }
+// A reader given a slot's filters returns, for each archived change, the
+// frame the watch sends: what FilterFeedEntry or ChunkFeedEntry keep of the
+// unfiltered change, and no frame when they keep nothing.
+void ArchiveFilterMatchesTheWatchFilter() {
+    test::ScopedTempDir directory("chunkdb-archive-filter");
+    auto catalog = std::make_shared<TableCatalog>(feed_test::Config(directory.path()));
+    CommandEngine engine({.require_auth = false}, catalog);
+    SessionState session;
+    (void)engine.Execute(session, "HELLO 3\r\n");
+    const auto run = [&](const std::string& statement) {
+        const auto reply = engine.Execute(session, statement + "\r\n");
+        assert(reply[0] != '-');
+    };
+    run("CREATE TABLE t (n u8, label text(128) NULL) CHUNK 4 x 4 CHUNK COLUMNS (owner u8 NULL)");
+    const auto table = catalog->Find("t");
+    const auto slot = table->CreateFeedSlot("all");
+    run("SET BLOCK 0 0 IN t n = 1, label = 'a'");
+    run("BEGIN");
+    run("SET BLOCK 1 1 IN t n = 2, label = 'b'");
+    run("SET BLOCK 5 0 IN t n = 3, label = 'c'");
+    run("COMMIT");
+    run("SET BLOCK 0 0 IN t n = 1, label = 'd'");
+    run("SET CHUNK 0 0 IN t META owner = 4");
+    run("SET CHUNK 1 0 IN t META owner = 5");
+    run("DELETE BLOCK 0 0 FROM t");
+    run("SET BLOCK 4 4 IN t n = 9");
+    FeedSlotTestAccess::Sync(*table);
+    const auto geometry = table->geometry();
+    const auto n = geometry.layout().schema().columns[0].id, label = geometry.layout().schema().columns[1].id;
+    const FeedArea area{{0, 0}, {0, 0}};
+    const std::vector<FeedSlotFilters> cases{
+        {.area = area}, {.column_ids = std::vector<std::uint32_t>{n}}, {.column_ids = std::vector<std::uint32_t>{label, n}},
+        {.no_before = true}, {.area = area, .column_ids = std::vector<std::uint32_t>{label}, .no_before = true},
+        {.chunks = true}, {.area = area, .chunks = true}, {.area = area, .column_ids = std::vector<std::uint32_t>{n}, .chunks = true}};
+    for (const auto& filters : cases) {
+        auto whole = table->ReadFeedArchive(slot.position);
+        if (filters.chunks) FeedSlotTestAccess::EnableChunkForms(whole, kDefaultFeedBufferBytes);
+        auto filtered = table->ReadFeedArchive(slot.position);
+        FeedSlotTestAccess::Filter(filtered, filters);
+        std::size_t sent = 0U, skipped = 0U;
+        for (auto change = whole.Next(); change; change = whole.Next()) {
+            const auto columns = geometry.LayoutAt(change->schema_version).schema().columns;
+            const auto expected = filters.chunks ? ChunkFeedEntry(change, geometry, filters.area, filters.column_ids)
+                : FilterFeedEntry(change, filters.area, filters.column_ids, filters.no_before, columns);
+            const auto got = filtered.Next();
+            assert(got && got->position == change->position);
+            if (!expected) {
+                assert(!got->protocol_frame && got->blocks.empty() && got->chunk_changes.empty() && got->chunk_forms.empty());
+                ++skipped;
+                continue;
+            }
+            assert(got->protocol_frame && *got->protocol_frame == EncodeFeedEntry(*expected));
+            ++sent;
+        }
+        assert(!filtered.Next() && sent != 0U && (skipped != 0U) == filters.area.has_value());
+    }
+}
 // Each lower bound stays at or below the bytes the encoder writes.
 void MinimumEncodedBytesStayBelowTheFrame() {
     const std::vector<std::optional<std::vector<ColumnValue>>> rows{std::nullopt, std::vector<ColumnValue>{},
@@ -220,6 +278,15 @@ void MinimumEncodedBytesStayBelowTheFrame() {
         entry.chunk_changes.push_back({ChunkCoord{-3, 4, dims == 3U ? 5 : 0}, before, after});
         const auto change = EncodeFeedEntry(entry).size() - empty;
         assert(FeedChangeItemMinimumEncodedBytes(dims, before, after) <= change);
+    }
+    const std::vector<std::shared_ptr<const std::string>> forms{
+        nullptr, std::make_shared<const std::string>(), std::make_shared<const std::string>(70000U, 'f')};
+    for (const std::uint8_t dims : {std::uint8_t{2U}, std::uint8_t{3U}}) for (const auto& form : forms) {
+        FeedEntry entry; entry.kind = FeedEntry::Kind::kChunks; entry.dims = dims; entry.schema_version = 1U;
+        entry.chunk_forms_complete = true;
+        const auto empty = EncodeFeedEntry(entry).size();
+        entry.chunk_forms.push_back({ChunkCoord{-3, 4, dims == 3U ? 5 : 0}, 0U, form});
+        assert(FeedChunkFormMinimumEncodedBytes(dims, form) <= EncodeFeedEntry(entry).size() - empty);
     }
 }
 void ThreeDimensionalBlockCoordinates() {
@@ -293,6 +360,7 @@ int main(int argc, char** argv) {
     if (argc > 1) {
         if (std::string_view(argv[1]) == "--archive-budget") {
             ArchiveEnforcesDecodedEntryBudget(); ArchiveDeliversChangeWhoseFrameFitsTheBudget(); MinimumEncodedBytesStayBelowTheFrame();
+            ArchiveFilterMatchesTheWatchFilter();
         }
         else if (std::string_view(argv[1]) == "--scan-continuation") ScanCutContinuesFirstWatch();
         else ThreeDimensionalBlockCoordinates();
@@ -304,5 +372,6 @@ int main(int argc, char** argv) {
     ArchiveEnforcesDecodedEntryBudget();
     ArchiveDeliversChangeWhoseFrameFitsTheBudget();
     MinimumEncodedBytesStayBelowTheFrame();
+    ArchiveFilterMatchesTheWatchFilter();
     ScanCutContinuesFirstWatch();
 }

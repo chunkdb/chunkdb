@@ -195,6 +195,9 @@ void FeedSlotTestAccess::EnableChunkForms(FeedArchiveReader& reader, std::size_t
 void FeedSlotTestAccess::SetEntryBudget(FeedArchiveReader& reader, std::size_t budget) {
     reader.SetEntryBudget(budget);
 }
+void FeedSlotTestAccess::Filter(FeedArchiveReader& reader, const FeedSlotFilters& filters) {
+    reader.Filter(filters);
+}
 FeedSlots::~FeedSlots() { Stop(); }
 bool FeedSlots::active() const noexcept { return store_.feed_slots_active_.load(std::memory_order_acquire); }
 bool FeedSlots::ArchiveRequired() const noexcept {

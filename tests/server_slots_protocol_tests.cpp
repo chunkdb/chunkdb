@@ -1336,6 +1336,55 @@ void TableBudgetStillTerminates(bool tls) {
     assert(!Boolean(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "lost")));
     for (const auto& client : ordinary) Unwatch(*client);
 }
+// A filtered slot reading from the archive is measured by the frame it
+// sends. One transaction writes about 19 KiB of labels outside chunk (0,0)
+// and n = 1 at block (0,0); the slot 'consumer' with `filters` reads it back
+// within a 16 KiB table budget, and `check` receives its first data frame.
+constexpr unsigned kArchivedLabels = 128U;
+template <typename Check> void FilteredArchiveChange(bool tls, std::string_view filters, Check check) {
+    constexpr std::size_t budget = 16384U;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer, filters);
+    auto table = harness.catalog->Find("t");
+    writer->Ok("BEGIN");
+    for (unsigned i = 0U; i < kArchivedLabels; ++i)
+        assert(writer->Command("SET BLOCK " + std::to_string(i % 64U) + " " + std::to_string(4U + i / 64U) +
+            " IN t n = 2, label = '" + std::string(120U, 'x') + "'").type == '_');
+    assert(writer->Command("SET BLOCK 0 0 IN t n = 1").type == '_');
+    const auto transaction = Number(writer->Command("COMMIT"));
+    FeedSlotTestAccess::Sync(*table);
+    // The unfiltered change does not fit the budget.
+    auto archive = table->ReadFeedArchive(table->ListFeedSlots().front().position);
+    const auto whole = archive.Next();
+    assert(whole && whole->position.revision == transaction && whole->protocol_frame->size() > budget);
+    auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
+    auto reply = watch->Read();
+    while (reply.type == '>' && !reply.items.empty() && reply.items[0].value == "schema") reply = watch->Read();
+    if (reply.type != '>') throw std::runtime_error("expected the filtered change, got " + reply.value);
+    assert(Number(reply.items[2]) == transaction);
+    check(reply);
+    watch->Line("ACK " + std::to_string(transaction)); Unwatch(*watch);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == transaction);
+}
+void FilteredArchiveArea(bool tls) {
+    FilteredArchiveChange(tls, " AREA 0 0 TO 0 0", [](const Reply& change) {
+        (void)Change(change);
+        const auto& block = change.items[6].items[0];
+        assert(Number(block.items[0]) == 0 && Number(block.items[1]) == 0 && Number(block.items[3].items[0]) == 1U);
+    });
+}
+void FilteredArchiveColumns(bool tls) {
+    FilteredArchiveChange(tls, " COLUMNS n", [](const Reply& change) {
+        (void)Change(change, kArchivedLabels + 1U);
+        for (const auto& block : change.items[6].items) assert(block.items[3].items.size() == 1U);
+    });
+}
+void FilteredArchiveChunks(bool tls) {
+    FilteredArchiveChange(tls, " CHUNKS AREA 0 0 TO 0 0", [](const Reply& chunks) {
+        assert(chunks.items[0].value == "chunks" && chunks.items[6].items.size() == 1U);
+        assert(Number(chunks.items[6].items[0].items[0]) == 0 && Number(chunks.items[6].items[0].items[1]) == 0);
+    });
+}
 void ExcessPoolBound(bool tls) {
     constexpr std::size_t budget = 4096U, share = 1024U;
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
@@ -2281,6 +2330,8 @@ int main(int argc, char** argv) {
         // Feed share and excess-pool groups run as their own ctest entry.
         if (shares_only || !selected.empty()) {
             run("share-independent-delivery", ShareIndependentDelivery); run("share-metadata-delivery", ShareMetadataDelivery); run("table-budget-terminates", TableBudgetStillTerminates);
+            run("filtered-archive-area", FilteredArchiveArea); run("filtered-archive-columns", FilteredArchiveColumns);
+            run("filtered-archive-chunks", FilteredArchiveChunks);
             run("excess-pool-bound", ExcessPoolBound); run("excess-pool-receipts", ExcessPoolReceipts);
             run("excess-stalled-holder", ExcessStalledHolder); run("TLS-write-cap", TlsWriteCap);
             run("excess-pool-FIFO", ExcessPoolFifo); run("excess-pool-control", ExcessPoolControlFrames);
