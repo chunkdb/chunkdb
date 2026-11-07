@@ -9,6 +9,13 @@ This folder stores real measured benchmark outputs captured directly from local 
 - [Environment and commands](large-world-20261108-linux-metadata.txt)
 - [Rows](large-world-20261108-linux-rows.txt)
 
+## Run: 2026-11-08 (AMD Ryzen 5 4600H, Linux 7.0, ext4) — chunk-map lookups
+
+Point reads and writes on a warm cache across 16,384 loaded chunks and inside one chunk, and the two chunk-level map lookups alone (`chunkdb_chunk_map_bench`, 15 runs; issue #135).
+
+- [Environment and command](chunk-map-20261108-linux-metadata.txt)
+- [Output](chunk-map-20261108-linux.txt)
+
 ## Run: 2026-10-07 (Apple M1 Pro, macOS 27.0, APFS) — hot-path budget baseline
 
 The baseline of the `world`, `canvas` and `simulation` scenarios, measured by comparing one build with itself (`scripts/bench/compare_budgets.py`, 15 alternating runs per side), which also gives the noise floor of the budget check.

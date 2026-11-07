@@ -19,6 +19,10 @@ This suite is intended for transparency and reproducibility of `chunkdb` behavio
    `chunkdb_large_world_bench` — measures the steady-state cost of one cache
    eviction with a pre-filled cache, see
    [Sparse / Large-World Writes](#sparse--large-world-writes-eviction-normalized)
+4. Chunk-map lookup benchmark (internal engine path):
+   `chunkdb_chunk_map_bench` — times point reads and writes across many
+   loaded chunks and inside one chunk, and the two chunk-map lookups alone,
+   see [Positions instead of keys](../design/COLUMNS_DESIGN.md#positions-instead-of-keys)
 
 ## Benchmark Quick Start
 
