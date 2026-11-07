@@ -1,0 +1,8 @@
+date=2026-11-08
+machine=AMD Ryzen 5 4600H (6 cores, 12 threads), 14.49 GiB RAM, CPU governor performance during the run
+os=Ubuntu, Linux 7.0.0-38-generic, ext4 on LVM
+compiler=GCC 15.2.0
+source=chunkdb b2f1d2b (head of PR #213, clean checkout)
+build=cmake -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WERROR=ON -DCHUNKDB_BUILD_TESTS=OFF -DCHUNKDB_FAILPOINTS=OFF; target chunkdb_chunk_map_bench
+command=taskset -c 2 chunkdb_chunk_map_bench --chunks 16384 --ops 204800 --runs 15 --data-dir <ext4 directory>
+load=other services on the host used 119% CPU on average (peak 254%, sampled every 5 s); no other benchmark or test ran

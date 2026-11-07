@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `chunkdb_chunk_map_bench`, which times point reads and writes across many loaded chunks and inside one chunk, and the two chunk-map lookups alone, on a warm cache; docs/design/COLUMNS_DESIGN.md states the method (#135).
 - Resolve configured Windows directory junction roots and extended paths for backup and restore while refusing descendant reparse points (#150).
 - Add the event journal guide, docs/EVENT_JOURNAL.md: keep every change from a durable slot in your own store, acknowledging only after the store syncs, rebuild the world at a revision or commit time from a base snapshot, render a timelapse, retain segments and snapshots, and resume after a crash (#153).
 - Lower the peak memory of SET CHUNK: a whole-chunk write moves the state it replaces into the transaction history instead of copying it and frees it before an inline checkpoint, stages its WAL frame in one buffer sized once, and builds the checkpoint image without intermediate copies; in a transaction, the written-chunk limit, `--txn-max-bytes` and `--txn-total-bytes` are checked by the form's size before the form is decoded or the chunk is read.
