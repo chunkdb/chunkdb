@@ -348,9 +348,6 @@ struct ChunkMutationResult {
     std::uint64_t version = 0;
 };
 
-// Bounded scan-candidate accumulator; defined in world_read.cpp.
-class ScanCandidateAccumulator;
-
 // A write failed after a point where it may already be applied, for
 // example its WAL bytes could not be removed after a failed append. The
 // store is fail-closed until restart; the caller must treat the outcome as
@@ -795,15 +792,6 @@ class ChunkStore {
     [[nodiscard]] std::uint64_t OpenWalStreamCountForTests() const noexcept;
     [[nodiscard]] std::size_t MaxOpenWalStreamsForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionSnapshotBuildCountForTests() const noexcept;
-    // Number of L_<lx>_<ly> directories whose files were listed by CHUNKSCAN
-    // candidate collection (cumulative). Lets tests prove a page only visits
-    // the large-chunk columns it needs.
-    [[nodiscard]] std::uint64_t ScanLargeDirsListedForTests() const noexcept;
-    [[nodiscard]] std::uint64_t ScanCatalogBuildsForTests() const noexcept;
-    // Number of resident large chunks whose cached chunks were merged into
-    // CHUNKSCAN candidate collection (cumulative). Lets tests prove a page
-    // merges only the large chunks it visits instead of the whole cache.
-    [[nodiscard]] std::uint64_t ScanCachedLargeChunksMergedForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionRefillLargeChunkScanCountForTests() const noexcept;
     [[nodiscard]] std::size_t EvictionLargeChunkRingSizeForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionPostPassLargeChunkCheckCountForTests() const noexcept;
@@ -1129,9 +1117,6 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_with_data_{0};
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_empty_batch_{0};
     std::atomic<std::uint64_t> stats_eviction_refill_large_chunk_scans_{0};
-    mutable std::atomic<std::uint64_t> stats_scan_large_dirs_listed_{0};
-    mutable std::atomic<std::uint64_t> stats_scan_catalog_builds_{0};
-    mutable std::atomic<std::uint64_t> stats_scan_cached_large_chunks_merged_{0};
     std::atomic<std::uint64_t> stats_wal_parent_prepare_calls_{0};
     std::atomic<std::uint64_t> stats_eviction_recency_skips_{0};
     std::atomic<std::uint64_t> stats_empty_chunk_gcs_{0};
@@ -1279,11 +1264,6 @@ class ChunkStore {
 
     mutable std::mutex large_chunks_mutex_;
     std::unordered_map<LargeChunkCoord, std::shared_ptr<LargeChunk>, LargeChunkCoordHash> large_chunks_;
-    // Lazy union of disk directories and resident large chunks. Protected by
-    // large_chunks_mutex_; no full registry copy or directory listing per page.
-    mutable std::map<std::pair<std::int64_t, std::int64_t>, std::filesystem::path> scan_catalog_;
-    mutable bool scan_catalog_ready_ = false;
-    mutable std::pair<std::uint64_t, std::uint64_t> scan_catalog_generation_{};
     std::vector<LargeChunkCoord> eviction_large_chunk_ring_;
     // The last RegularChunk handed out per coordinate. If a fresh load finds
     // the previous instance still alive, two objects for one chunk exist at
@@ -1434,14 +1414,6 @@ class ChunkStore {
         ChunkRangeEntry* out,
         bool with_vars,
         std::string* vars_problem, bool include_empty = false, bool identity_only = false);
-    // Feeds `candidates` from both sources — on-disk artifacts and the
-    // resident cache — visiting large chunks in scan order so the cursor and
-    // the page window prune both.
-    void CollectScanCandidates(ScanCandidateAccumulator* candidates) const;
-    void EnsureScanCatalog() const;
-    void MergeCachedCandidates(
-        const std::shared_ptr<LargeChunk>& large_chunk,
-        ScanCandidateAccumulator* candidates) const;
     [[nodiscard]] std::size_t ChunkRangeEntryCostBytes() const noexcept;
     // Adds the chunk when populated. `vars_bytes` counts the values read so
     // far with `with_vars`; they and max_entries entries share the
