@@ -3,6 +3,9 @@ name: Windows Sparse Low-Cache Benchmark
 on:
   workflow_dispatch:
 
+permissions:
+  contents: read
+
 jobs:
   sparse-low-cache-single:
     name: Sparse Low-Cache run=${{ matrix.run_id }} (windows-latest)
