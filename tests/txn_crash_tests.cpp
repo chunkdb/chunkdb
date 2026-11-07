@@ -303,6 +303,7 @@ void TestDimensionalMetadataCrash(const std::string& executable) {
     const std::vector<std::pair<const char*, const char*>> before = {
         {"CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_INTENT_PUBLISH_ONCE", "1"},
         {"CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_FRAMES", "0"},
+        {"CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_FRAMES", "1"},
         {"CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_FRAMES", "2"},
         {"CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_FRAMES", "3"},
         {"CHUNKDB_FAILPOINT_CRASH_TXN_BEFORE_COMMIT_PUBLISH_ONCE", "1"},
@@ -328,6 +329,52 @@ void TestDimensionalMetadataCrash(const std::string& executable) {
     }
 }
 
+// One write outside a transaction changes blocks and metadata of a 3D chunk under its rollback intent.
+int RunAutocommit3DChild(const std::filesystem::path& dir, DurabilityMode mode, const char* failpoint) {
+    ChunkStore store(Crash3DConfig(dir, mode));
+    chunkdb::txn_test::ScopedEnv armed(failpoint, "1");
+    (void)store.TransformChunkState(kA3, std::nullopt, false, [&](chunkdb::ChunkState& state) {
+        SetCounter(&state, 10);
+        state.chunk_columns = std::make_shared<const chunkdb::ChunkColumnState>(chunkdb::AssignChunkColumns(
+            store.geometry().chunk_schema(), state.chunk_columns.get(), {{"tag", std::uint64_t{11U}}}, !state.written));
+    });
+    return 3;
+}
+
+bool HasRollbackIntent(const std::filesystem::path& dir) {
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(dir))
+        if (entry.is_regular_file() && entry.path().extension() == ".rollback") return true;
+    return false;
+}
+
+void TestDimensionalAutocommitMetadataCrash(const std::string& executable) {
+    const std::vector<std::pair<const char*, bool>> boundaries = {
+        {"CHUNKDB_FAILPOINT_CRASH_CONDITIONAL_BEFORE_INTENT_PUBLISH_ONCE", false},
+        {"CHUNKDB_FAILPOINT_CRASH_CONDITIONAL_AFTER_INTENT_PUBLISH_ONCE", false},
+        {"CHUNKDB_FAILPOINT_CRASH_CONDITIONAL_BEFORE_COMMIT_PUBLISH_ONCE", false},
+        {"CHUNKDB_FAILPOINT_CRASH_CONDITIONAL_AFTER_COMMIT_PUBLISH_ONCE", true},
+        {"CHUNKDB_FAILPOINT_CRASH_CONDITIONAL_BEFORE_INTENT_CLEAR_ONCE", true},
+        {"CHUNKDB_FAILPOINT_CRASH_CONDITIONAL_AFTER_INTENT_UNLINK_ONCE", true},
+    };
+    for (const auto& [failpoint, committed] : boundaries) {
+        ScopedTempDir dir("chunkdb-autocommit-crash-3d");
+        Seed3D(dir.path(), DurabilityMode::kFsyncWal);
+        const int code = RunChild(executable,
+            {"--autocommit-crash-3d-child", dir.path().string(), ModeArg(DurabilityMode::kFsyncWal), failpoint});
+        if (code != kCrashExit) {
+            std::fprintf(stderr, "3D autocommit child for %s exited with %d\n", failpoint, code);
+            assert(false);
+        }
+        ChunkStore store(Crash3DConfig(dir.path(), DurabilityMode::kFsyncWal));
+        assert(!HasRollbackIntent(dir.path()));
+        assert(Counter3D(store, kA3) == (committed ? 10U : 1U));
+        assert(Tag(store, kA3) == (committed ? std::optional<std::uint64_t>{11U} : std::nullopt));
+        assert(Counter3D(store, kB3) == 2U);
+        store.SetBlockBits3D(kA3.x * 4, kA3.y * 4, kA3.z * 2, chunkdb::txn_test::CounterBits(77));
+        assert(Counter3D(store, kA3) == 77U && Tag(store, kA3) == (committed ? std::optional<std::uint64_t>{11U} : std::nullopt));
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -337,11 +384,15 @@ int main(int argc, char** argv) {
     if (argc == 6 && std::string(argv[1]) == "--commit-crash-3d-child") {
         return RunCommit3DChild(argv[2], ParseMode(argv[3]), argv[4], argv[5]);
     }
+    if (argc == 5 && std::string(argv[1]) == "--autocommit-crash-3d-child") {
+        return RunAutocommit3DChild(argv[2], ParseMode(argv[3]), argv[4]);
+    }
     if (argc == 4 && std::string(argv[1]) == "--recovery-crash-child") {
         return RunRecoveryChild(argv[2], ParseMode(argv[3]));
     }
     TestCrashAtEveryFailpoint(argv[0]);
     TestCrashDuringRecovery(argv[0]);
     TestDimensionalMetadataCrash(argv[0]);
+    TestDimensionalAutocommitMetadataCrash(argv[0]);
     return 0;
 }

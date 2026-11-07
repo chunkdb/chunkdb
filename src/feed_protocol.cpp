@@ -393,6 +393,24 @@ std::size_t FeedRowRetainedBytes(const std::optional<std::vector<ColumnValue>>& 
     return bytes.total;
 }
 
+std::size_t FeedRowMinimumEncodedBytes(const std::optional<std::vector<ColumnValue>>& row) {
+    // Each RESP element takes at least three bytes; bulk values add their bytes and framing.
+    if (!row) return 3U;
+    std::size_t bytes = 4U;
+    for (const auto& value : *row) bytes += std::visit([](const auto& v) -> std::size_t {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, std::string>) return v.size() + 5U;
+        else if constexpr (std::is_same_v<T, BitsValue>) return (v.digits.size() + 7U) / 8U + 5U;
+        else if constexpr (std::is_same_v<T, BytesValue>) return v.bytes.size() + 5U;
+        else return 3U;
+    }, value);
+    return bytes;
+}
+std::size_t FeedChangeItemMinimumEncodedBytes(std::uint8_t dims,
+    const std::optional<std::vector<ColumnValue>>& before, const std::optional<std::vector<ColumnValue>>& after) {
+    return 4U + 4U * static_cast<std::size_t>(dims) + FeedRowMinimumEncodedBytes(before) + FeedRowMinimumEncodedBytes(after);
+}
+
 std::size_t FeedEntryRetainedBytes(const FeedEntry& entry) {
     RetainedBytes bytes;
     const auto columns = [&](const std::vector<Column>& list) {

@@ -441,9 +441,8 @@ bool SlotWatch::Work() {
         if (!archive_) {
             if (slot.durable_watermark <= cursor_.revision) return Progress(slot) || changed;
             archive_.emplace(table_->ReadClaimedFeedArchive(claim_, cursor_));
-            // The table budget applies to the encoded frame when it is admitted;
-            // decoding an archived change keeps the reader's own memory bound.
-            archive_->SetEntryBudget(std::max(budget(), kDefaultFeedBufferBytes));
+            // Decoding stops once the encoded frame of an archived change would exceed the table budget.
+            archive_->SetEntryBudget(budget());
             if (options_.chunks) archive_->EnableChunkForms(budget());
             changed = true;
         }

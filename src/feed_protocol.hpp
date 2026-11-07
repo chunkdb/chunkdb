@@ -32,5 +32,9 @@ std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const Fee
 std::string EncodeFeedEntry(const FeedEntry& entry);
 std::size_t FeedEntryRetainedBytes(const FeedEntry& entry);
 std::size_t FeedRowRetainedBytes(const std::optional<std::vector<ColumnValue>>& row);
+// Lower bounds of the bytes EncodeFeedEntry writes for one row and for one block or chunk change.
+std::size_t FeedRowMinimumEncodedBytes(const std::optional<std::vector<ColumnValue>>& row);
+std::size_t FeedChangeItemMinimumEncodedBytes(std::uint8_t dims,
+    const std::optional<std::vector<ColumnValue>>& before, const std::optional<std::vector<ColumnValue>>& after);
 std::string EncodeFeedResync(FeedPosition position, const std::optional<TableLineage>& lineage);
 }

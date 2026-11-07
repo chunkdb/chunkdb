@@ -52,8 +52,8 @@ chunkdb::StoreConfig BaseConfig(const std::filesystem::path& data_dir) {
     };
 }
 
-// Startup discovers cold artifacts; scan pages use the ordered index.
-void TestScanCatalogTracksNewDirectoriesAndEviction() {
+// Scan pages list chunks written before the start and chunks written, emptied and rewritten after it under eviction.
+void TestScanPagesSeeWritesAfterStartAndEviction() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-catalog");
     auto config = BaseConfig(dir.path());
     config.max_loaded_chunks = 1;
@@ -67,12 +67,12 @@ void TestScanCatalogTracksNewDirectoriesAndEviction() {
     chunkdb::ChunkStore store(config);
     const auto first = store.ScanPopulatedChunks(false, {}, 2);
     assert(first.coords.size() == 2 && first.has_more);
-    // New directories after initialization must not be hidden by the index.
+    // Chunks first written after the start are listed.
     store.SetBlockBits(4000, 0, "10001");
     store.SetBlockBits(-4000, 0, "10001");
     store.UnsetBlock(4000, 0);
     store.SetBlockBits(8000, 0, "10001");
-    // Re-create a directory removed by empty-chunk GC and eviction.
+    // A chunk emptied and written again under eviction is listed once.
     store.SetBlockBits(4000, 0, "11011");
     std::size_t seen = first.coords.size();
     auto cursor = first.coords.back();
@@ -87,7 +87,8 @@ void TestScanCatalogTracksNewDirectoriesAndEviction() {
     assert(seen == 42);  // the negative coordinate is behind the cursor
 }
 
-void TestReadOnlyScanCatalogRefreshesAfterWriterChanges() {
+// A read-only store lists chunks a writer adds after the reader opened.
+void TestReadOnlyScanSeesWriterChanges() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-catalog-reader");
     auto config = BaseConfig(dir.path());
     chunkdb::ChunkStore writer(config);
@@ -105,11 +106,10 @@ void TestReadOnlyScanCatalogRefreshesAfterWriterChanges() {
     assert(changed.coords.back().x == 1000);
 }
 
-void TestScanVisitsOnlyNeededLargeChunkColumns() {
-    // Large chunks are 2x2 regular chunks (BaseConfig), so a 24x24 chunk
-    // world spans 144 L_ directories in 12 columns. Every page must list only
-    // the columns it needs, and pagination must still enumerate everything in
-    // ascending (cx, cy) order, negatives included.
+void TestScanPagesWalkAColdWorldInOrder() {
+    // A 24x24 chunk world kept mostly on disk: pagination enumerates every
+    // chunk in ascending (cx, cy) order, negatives included, and a page deep
+    // in the world starts right after its cursor.
     chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-columns");
     auto config = BaseConfig(dir.path());
     config.max_loaded_chunks = 8;  // keep the world on disk, not in cache
@@ -163,11 +163,9 @@ void TestScanVisitsOnlyNeededLargeChunkColumns() {
     assert(tail.coords[1].x == 11 && tail.coords[1].y == 11);
 }
 
-// A fully resident world must not make a page more expensive than a cold one:
-// the cached chunks are merged per visited large chunk, under the same cursor
-// and page-window pruning as the on-disk artifacts, instead of being poured
-// into every pass wholesale.
-void TestScanWarmCacheMergesOnlyVisitedLargeChunks() {
+// A fully resident world pages exactly like a cold one: every chunk once, in
+// order, and a page deep in the world starts right after its cursor.
+void TestScanPagesWalkAResidentWorldInOrder() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-warm");
     auto config = BaseConfig(dir.path());
     config.max_loaded_chunks = 4096;  // the whole world stays resident
@@ -201,8 +199,7 @@ void TestScanWarmCacheMergesOnlyVisitedLargeChunks() {
         assert(seen[i].x == expected[i].x && seen[i].y == expected[i].y);
     }
 
-    // One page deep in the world touches only the large chunks around it,
-    // whether their chunks come from disk or from the cache.
+    // One page deep in the world starts after the cursor and crosses into the next column.
     const auto page = store.ScanPopulatedChunks(true, {9, 3}, 10);
     assert(page.has_more);
     assert(page.coords.size() == 10);
@@ -210,11 +207,10 @@ void TestScanWarmCacheMergesOnlyVisitedLargeChunks() {
     assert(page.coords.back().x == 10 && page.coords.back().y == -11);
 }
 
-// A world no wider than one large-chunk column has no column to skip, so the
-// only available cut is inside the column: large chunks whose lowest
-// coordinate after the cursor already sorts beyond the page window are not
-// listed and not merged.
-void TestScanNarrowWorldPrunesInsideTheColumn() {
+// A world no wider than one large-chunk column: a page from a cursor inside
+// the column returns the next chunks of that column, and a full walk returns
+// every chunk once, in order.
+void TestScanPagesInsideOneLargeChunkColumn() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-narrow");
     auto config = BaseConfig(dir.path());
     config.max_loaded_chunks = 4096;
@@ -236,7 +232,7 @@ void TestScanNarrowWorldPrunesInsideTheColumn() {
         assert(page.coords[i].y == 101 + static_cast<std::int64_t>(i));
     }
 
-    // Pruning must not cost coordinates: the whole column still enumerates.
+    // The whole column still enumerates.
     std::vector<chunkdb::ChunkCoord> seen;
     bool has_cursor = false;
     chunkdb::ChunkCoord cursor{};
@@ -1481,11 +1477,11 @@ void TestEngineCommands() {
 }  // namespace
 
 int main() {
-    TestScanCatalogTracksNewDirectoriesAndEviction();
-    TestReadOnlyScanCatalogRefreshesAfterWriterChanges();
-    TestScanVisitsOnlyNeededLargeChunkColumns();
-    TestScanWarmCacheMergesOnlyVisitedLargeChunks();
-    TestScanNarrowWorldPrunesInsideTheColumn();
+    TestScanPagesSeeWritesAfterStartAndEviction();
+    TestReadOnlyScanSeesWriterChanges();
+    TestScanPagesWalkAColdWorldInOrder();
+    TestScanPagesWalkAResidentWorldInOrder();
+    TestScanPagesInsideOneLargeChunkColumn();
     TestScanEnumeratesCacheOnlyChunks();
     TestScanMutationsBetweenPagesPreserveTheContract();
     TestScanMergesCacheEvenWhereADirectoryExists();

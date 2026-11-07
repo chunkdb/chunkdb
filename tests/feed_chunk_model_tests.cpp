@@ -162,6 +162,66 @@ void ArchiveEnforcesDecodedEntryBudget() {
     assert(entry && entry->chunk_changes.size() == 1U);
     assert(FeedEntryRetainedBytes(*entry) > 131072U && FeedEntryRetainedBytes(*entry) <= 1048576U);
 }
+// The budget bounds the encoded frame only: decoded rows and the frame together may take more memory.
+void ArchiveDeliversChangeWhoseFrameFitsTheBudget() {
+    for (const std::uint8_t dims : {std::uint8_t{2U}, std::uint8_t{3U}}) {
+        test::ScopedTempDir directory("chunkdb-archive-frame-budget");
+        TableCatalog catalog(feed_test::Config(directory.path()));
+        const auto table = Create(catalog, dims);
+        catalog.ChangeChunkColumns("t", [](const auto& schema) {
+            return AddChunkColumn(schema, Column{.name = "label", .type = {ColumnKind::kText, 262144U},
+                .nullable = true, .default_value = {}});
+        });
+        const auto slot = table->CreateFeedSlot("budget");
+        {
+            auto lease = table->Acquire();
+            (void)lease->store().TransformChunkState({0, 0, 0}, {}, false, [&](ChunkState& state) {
+                state.chunk_columns = std::make_shared<const ChunkColumnState>(AssignChunkColumns(
+                    lease->store().geometry().chunk_schema(), state.chunk_columns.get(),
+                    {{"label", std::string(131072U, 'x')}}, true));
+            });
+            if (dims == 3U) lease->store().SetBlockBits3D(1, 2, 3, "10000000");
+            else lease->store().SetBlockBits(1, 2, "10000000");
+            lease->store().CheckpointForTests(0, 0);
+        }
+        FeedSlotTestAccess::Sync(*table);
+        std::vector<std::shared_ptr<const FeedEntry>> entries;
+        for (auto reader = table->ReadFeedArchive(slot.position); auto next = reader.Next();) entries.push_back(next);
+        assert(entries.size() == 2U && entries[0]->chunk_changes.size() == 1U && entries[1]->blocks.size() == 1U);
+        auto after = slot.position;
+        for (const auto& expected : entries) {
+            const auto frame = expected->protocol_frame->size();
+            assert(FeedEntryRetainedBytes(*expected) > frame);
+            auto exact = table->ReadFeedArchive(after);
+            FeedSlotTestAccess::SetEntryBudget(exact, frame);
+            const auto delivered = exact.Next();
+            assert(delivered && delivered->position == expected->position && *delivered->protocol_frame == *expected->protocol_frame);
+            auto smaller = table->ReadFeedArchive(after);
+            FeedSlotTestAccess::SetEntryBudget(smaller, frame - 1U);
+            bool rejected = false;
+            try { (void)smaller.Next(); } catch (const std::length_error&) { rejected = true; }
+            assert(rejected);
+            after = expected->position;
+        }
+    }
+}
+// Each lower bound stays at or below the bytes the encoder writes.
+void MinimumEncodedBytesStayBelowTheFrame() {
+    const std::vector<std::optional<std::vector<ColumnValue>>> rows{std::nullopt, std::vector<ColumnValue>{},
+        std::vector<ColumnValue>{std::monostate{}, true, std::int64_t{0}, std::uint64_t{18446744073709551615ULL}, 1.5, 0.5F,
+            std::string{}, std::string(70000U, 'y'), BytesValue{{1U, 2U}}, BitsValue{"1"}, BitsValue{std::string(17U, '0')}}};
+    for (const std::uint8_t dims : {std::uint8_t{2U}, std::uint8_t{3U}}) for (const auto& before : rows) for (const auto& after : rows) {
+        FeedEntry entry; entry.kind = FeedEntry::Kind::kChange; entry.dims = dims; entry.schema_version = 1U;
+        const auto empty = EncodeFeedEntry(entry).size();
+        entry.blocks.push_back({ChunkCoord{0, 0, 0}, std::nullopt, std::nullopt, before, after, 0U, 0U, std::nullopt, 0U});
+        const auto block = EncodeFeedEntry(entry).size() - empty;
+        assert(FeedChangeItemMinimumEncodedBytes(dims, before, after) <= block);
+        entry.blocks.clear();
+        entry.chunk_changes.push_back({ChunkCoord{-3, 4, dims == 3U ? 5 : 0}, before, after});
+        const auto change = EncodeFeedEntry(entry).size() - empty;
+        assert(FeedChangeItemMinimumEncodedBytes(dims, before, after) <= change);
+    }
+}
 void ThreeDimensionalBlockCoordinates() {
     test::ScopedTempDir directory("chunkdb-feed-three-dimensional");
     TableCatalog catalog(feed_test::Config(directory.path()));
@@ -231,7 +291,9 @@ void ScanCutContinuesFirstWatch() {
 }
 int main(int argc, char** argv) {
     if (argc > 1) {
-        if (std::string_view(argv[1]) == "--archive-budget") ArchiveEnforcesDecodedEntryBudget();
+        if (std::string_view(argv[1]) == "--archive-budget") {
+            ArchiveEnforcesDecodedEntryBudget(); ArchiveDeliversChangeWhoseFrameFitsTheBudget(); MinimumEncodedBytesStayBelowTheFrame();
+        }
         else if (std::string_view(argv[1]) == "--scan-continuation") ScanCutContinuesFirstWatch();
         else ThreeDimensionalBlockCoordinates();
         return 0;
@@ -240,5 +302,7 @@ int main(int argc, char** argv) {
     ArchivePreservesMetadataRowsAndForms();
     BaselineInitializationAndSchemaRows();
     ArchiveEnforcesDecodedEntryBudget();
+    ArchiveDeliversChangeWhoseFrameFitsTheBudget();
+    MinimumEncodedBytesStayBelowTheFrame();
     ScanCutContinuesFirstWatch();
 }
