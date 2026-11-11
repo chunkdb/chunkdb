@@ -7,6 +7,7 @@
 #include <chrono>
 #include <cstdint>
 #include <cstdio>
+#include <limits>
 #include <memory>
 #include <optional>
 #include <string>
@@ -258,11 +259,22 @@ void TestChunkStatements() {
     ExpectReply(f.Run(f.b, "GET BLOCK 1 0 FROM t"), "_\r\n");
 }
 
+// A short --txn-max-duration-ms, and a wait well past it.
+constexpr std::chrono::milliseconds kShortDuration{200};
+constexpr std::chrono::milliseconds kPastShortDuration{400};
+
 void TestDurationLimit() {
-    Fixture f(chunkdb::EngineConfig{.txn_max_duration = std::chrono::milliseconds(1000)});
+    Fixture f(chunkdb::EngineConfig{.txn_max_duration = kShortDuration});
+    // Before its first table statement a transaction holds nothing: only
+    // that statement or COMMIT checks the duration.
+    ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
+    std::this_thread::sleep_for(kPastShortDuration);
+    ExpectReply(f.Run(f.a, "PING"), "+PONG\r\n");
+    ExpectError(f.Run(f.a, "BEGIN"), "INVALID_ARGUMENT a transaction is already open");
+    ExpectReply(f.Run(f.a, "COMMIT"), "_\r\n");
     // The limit counts from BEGIN.
     ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
-    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    std::this_thread::sleep_for(kPastShortDuration);
     ExpectError(f.Run(f.a, "GET BLOCK 0 0 FROM t"), "CONFLICT reason=duration");
     // Ended: every statement answers the conflict, and none runs outside
     // the transaction, until ROLLBACK or COMMIT closes it.
@@ -276,10 +288,128 @@ void TestDurationLimit() {
 
     ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
     ExpectReply(f.Run(f.a, "SET BLOCK 0 0 IN t n = 3"), "_\r\n");
-    std::this_thread::sleep_for(std::chrono::milliseconds(1200));
+    std::this_thread::sleep_for(kPastShortDuration);
     ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT reason=duration");
     ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), Value(2));
     assert(f.RegisteredSnapshots() == 0);
+}
+
+// --txn-total-bytes that holds one private copy of a chunk of t, not two.
+chunkdb::EngineConfig OneCopyBudget(std::chrono::milliseconds duration = kShortDuration) {
+    return chunkdb::EngineConfig{.txn_max_duration = duration, .txn_total_bytes = 50};
+}
+
+// Counts the writes that found --txn-total-bytes full.
+struct CountReclaims final : chunkdb::CommandEngineTestHook {
+    int reclaims = 0;
+    void Run(Point point, std::string_view) override {
+        reclaims += point == Point::kBeforeTxnBudgetReclaim ? 1 : 0;
+    }
+};
+
+// A transaction within its duration keeps its share of --txn-total-bytes,
+// also with the largest duration.
+void TestUnexpiredTransactionKeepsBudget() {
+    Fixture f(OneCopyBudget(std::chrono::milliseconds(std::numeric_limits<std::int64_t>::max())));
+    ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run(f.a, "SET BLOCK 0 0 IN t n = 1"), "_\r\n");
+    ExpectReply(f.Run(f.b, "BEGIN"), "+OK\r\n");
+    ExpectError(f.Run(f.b, "SET BLOCK 4 0 IN t n = 2"), "INVALID_ARGUMENT open transactions hold more than --txn-total-bytes");
+    ExpectReply(f.Run(f.b, "ROLLBACK"), "+OK\r\n");
+    ExpectReply(f.Run(f.a, "PING"), "+PONG\r\n");
+    (void)VersionOf(f.Run(f.a, "COMMIT"));
+    ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), Value(1));
+}
+
+// A transaction past its duration stops holding --txn-total-bytes without
+// waiting for its client.
+void TestExpiredTransactionReleasesBudget() {
+    Fixture f(OneCopyBudget());
+    ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run(f.a, "SET BLOCK 0 0 IN t n = 1"), "_\r\n");
+    // a sends nothing after its duration; b's write ends a's transaction.
+    std::this_thread::sleep_for(kPastShortDuration);
+    ExpectReply(f.Run(f.b, "BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run(f.b, "SET BLOCK 4 0 IN t n = 2"), "_\r\n");
+    assert(f.RegisteredSnapshots() == 1);
+    ExpectError(f.Run(f.a, "PING"), "CONFLICT reason=duration");
+    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT reason=duration");
+    ExpectReply(f.Run(f.b, "ROLLBACK"), "+OK\r\n");
+    ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), "_\r\n");
+    assert(f.RegisteredSnapshots() == 0);
+
+    // Any statement of the session past the duration ends its transaction,
+    // before another write needs the bytes.
+    CountReclaims hook;
+    f.engine->SetHookForTests(&hook);
+    for (const char* statement : {"PING", "DESCRIBE t", "BEGIN", "ACK 1"}) {
+        ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
+        ExpectReply(f.Run(f.a, "SET BLOCK 0 0 IN t n = 3"), "_\r\n");
+        std::this_thread::sleep_for(kPastShortDuration);
+        ExpectError(f.Run(f.a, statement), "CONFLICT reason=duration");
+        assert(f.RegisteredSnapshots() == 0);
+        ExpectReply(f.Run(f.b, "BEGIN"), "+OK\r\n");
+        ExpectReply(f.Run(f.b, "SET BLOCK 4 0 IN t n = 4"), "_\r\n");
+        assert(hook.reclaims == 0);
+        ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT reason=duration");
+        ExpectReply(f.Run(f.b, "ROLLBACK"), "+OK\r\n");
+    }
+    f.engine->SetHookForTests(nullptr);
+    ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), "_\r\n");
+}
+
+// A session that closes, or runs a statement, while another session's write
+// ends expired transactions: the write gets the bytes in every order, and
+// the expired transaction applies nothing.
+void TestExpiredTransactionEndsDuringSessionClose() {
+    enum class Holder { kClosesFirst, kClosesConcurrently, kPingsConcurrently };
+    struct OnReclaim final : chunkdb::CommandEngineTestHook {
+        Holder mode{};
+        CommandEngine* engine = nullptr;
+        std::optional<chunkdb::SessionState>* holder = nullptr;
+        std::thread other;
+        std::string ping;
+        void Run(Point point, std::string_view) override {
+            if (point != Point::kBeforeTxnBudgetReclaim || !holder->has_value() || other.joinable()) return;
+            switch (mode) {
+                case Holder::kClosesFirst:
+                    holder->reset();
+                    break;
+                case Holder::kClosesConcurrently:
+                    other = std::thread([this] { holder->reset(); });
+                    break;
+                case Holder::kPingsConcurrently:
+                    other = std::thread([this] { ping = engine->Execute(**holder, "PING\r\n"); });
+                    break;
+            }
+        }
+    };
+    for (const Holder mode : {Holder::kClosesFirst, Holder::kClosesConcurrently, Holder::kPingsConcurrently}) {
+        Fixture f(OneCopyBudget());
+        std::optional<chunkdb::SessionState> holder(std::in_place);
+        assert(f.engine->Execute(*holder, "HELLO 3\r\n").rfind("%14\r\n", 0) == 0);
+        ExpectReply(f.Run(*holder, "BEGIN"), "+OK\r\n");
+        ExpectReply(f.Run(*holder, "SET BLOCK 0 0 IN t n = 1"), "_\r\n");
+        std::this_thread::sleep_for(kPastShortDuration);
+
+        OnReclaim hook;
+        hook.mode = mode;
+        hook.engine = f.engine.get();
+        hook.holder = &holder;
+        f.engine->SetHookForTests(&hook);
+        ExpectReply(f.Run(f.b, "BEGIN"), "+OK\r\n");
+        ExpectReply(f.Run(f.b, "SET BLOCK 4 0 IN t n = 2"), "_\r\n");
+        if (hook.other.joinable()) hook.other.join();
+        f.engine->SetHookForTests(nullptr);
+        if (mode == Holder::kPingsConcurrently) {
+            ExpectError(hook.ping, "CONFLICT reason=duration");
+            ExpectError(f.Run(*holder, "COMMIT"), "CONFLICT reason=duration");
+        }
+        assert(mode == Holder::kPingsConcurrently || !holder.has_value());
+        ExpectReply(f.Run(f.b, "ROLLBACK"), "+OK\r\n");
+        ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), "_\r\n");
+        assert(f.RegisteredSnapshots() == 0);
+    }
 }
 
 void TestByteAndChunkLimits() {
@@ -365,6 +495,9 @@ int main() {
     TestRollbackAndStatements();
     TestChunkStatements();
     TestDurationLimit();
+    TestUnexpiredTransactionKeepsBudget();
+    TestExpiredTransactionReleasesBudget();
+    TestExpiredTransactionEndsDuringSessionClose();
     TestByteAndChunkLimits();
     TestTableChanged();
     std::puts("txn engine tests passed");

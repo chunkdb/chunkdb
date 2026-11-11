@@ -20,6 +20,9 @@ struct FeedSlotRecord {
     bool lost = false;
     FeedSlotFilters filters{};
     bool schema_filter_lost = false;
+    // The user name the slot belongs to. Records written before owners were
+    // recorded have none; such a slot takes the user of its first attach.
+    std::optional<std::string> owner{};
 };
 
 struct FeedSlotRecords {
@@ -30,6 +33,8 @@ struct FeedSlotRecords {
 };
 
 void RequireValidFeedSlotName(std::string_view name);
+// Owners are user names; the user need not exist.
+void RequireValidFeedSlotOwner(std::string_view owner);
 [[nodiscard]] std::vector<std::uint8_t> SerializeFeedSlotRecords(const FeedSlotRecords& records);
 [[nodiscard]] FeedSlotRecords ParseFeedSlotRecords(const std::vector<std::uint8_t>& bytes, const StoreId& epoch);
 [[nodiscard]] std::optional<FeedSlotRecords> ReadFeedSlotRecords(const std::filesystem::path& dir, const StoreId& epoch);

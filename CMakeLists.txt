@@ -222,6 +222,15 @@ target_include_directories(chunkdb_server_bench_lib PRIVATE "${CMAKE_CURRENT_BIN
 target_compile_definitions(chunkdb_server_bench_lib PRIVATE
     CHUNKDB_BENCH_BUILD_TYPE="$<IF:$<BOOL:$<CONFIG>>,$<CONFIG>,unknown>")
 
+# Prices the chunk-level map lookups of point reads and writes
+# (docs/design/COLUMNS_DESIGN.md, "Positions instead of keys").
+add_executable(chunkdb_chunk_map_bench bench/chunk_map_bench.cpp)
+target_link_libraries(chunkdb_chunk_map_bench PRIVATE chunkdb_core)
+add_dependencies(chunkdb_chunk_map_bench chunkdb_bench_metadata)
+target_include_directories(chunkdb_chunk_map_bench PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/generated")
+target_compile_definitions(chunkdb_chunk_map_bench PRIVATE
+    CHUNKDB_BENCH_BUILD_TYPE="$<IF:$<BOOL:$<CONFIG>>,$<CONFIG>,unknown>")
+
 
 add_executable(chunkdb_server_bench
     bench/chunkdb_server_bench.cpp
@@ -293,6 +302,19 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_backup_restore_test PRIVATE chunkdb_tools)
     add_test(NAME backup_restore COMMAND chunkdb_backup_restore_test)
     set_tests_properties(backup_restore PROPERTIES TIMEOUT 180 LABELS "smoke")
+    if(WIN32)
+        add_test(NAME backup_staging_owner_reparse COMMAND chunkdb_backup_test --staging-owner-regression)
+        add_test(NAME backup_restore_root_reparse COMMAND chunkdb_backup_restore_test roots)
+        add_test(NAME backup_restore_inventory_reparse COMMAND chunkdb_backup_restore_test reparse)
+        add_test(NAME backup_restore_extended_roots COMMAND chunkdb_backup_restore_test extended)
+        add_test(NAME backup_configured_root_reparse COMMAND chunkdb_backup_restore_test configured-roots)
+        add_test(NAME backup_source_reparse_race COMMAND chunkdb_backup_restore_test source-reparse)
+        add_test(NAME backup_directory_ancestor_race COMMAND chunkdb_backup_restore_test ancestor-reparse)
+        add_test(NAME backup_staging_cleanup_reparse COMMAND chunkdb_backup_test --staging-cleanup-alias)
+        add_test(NAME backup_staging_cleanup_root_reparse COMMAND chunkdb_backup_test --staging-cleanup-root)
+        set_tests_properties(backup_staging_owner_reparse backup_restore_root_reparse backup_restore_inventory_reparse backup_restore_extended_roots backup_configured_root_reparse backup_source_reparse_race backup_directory_ancestor_race backup_staging_cleanup_reparse backup_staging_cleanup_root_reparse
+            PROPERTIES TIMEOUT 60 LABELS "smoke")
+    endif()
 
     add_executable(chunkdb_restore_crash_test tests/restore_crash_tests.cpp)
     target_link_libraries(chunkdb_restore_crash_test PRIVATE chunkdb_tools)
@@ -488,6 +510,12 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_txn_engine_test PRIVATE chunkdb_core)
     add_test(NAME txn_engine COMMAND chunkdb_txn_engine_test)
 
+    add_executable(chunkdb_chunk_write_memory_test tests/chunk_write_memory_tests.cpp)
+    target_link_libraries(chunkdb_chunk_write_memory_test PRIVATE chunkdb_core)
+    add_test(NAME chunk_write_memory COMMAND chunkdb_chunk_write_memory_test)
+    # 77: skipped where the counting allocator cannot see every allocation.
+    set_tests_properties(chunk_write_memory PROPERTIES SKIP_RETURN_CODE 77)
+
     add_executable(chunkdb_typed_columns_test tests/typed_columns_tests.cpp)
     target_link_libraries(chunkdb_typed_columns_test PRIVATE chunkdb_core)
     add_test(NAME typed_columns COMMAND chunkdb_typed_columns_test)
@@ -680,6 +708,26 @@ if(CHUNKDB_BUILD_TESTS)
     set_tests_properties(feed_slots_protocol PROPERTIES TIMEOUT 180 LABELS "smoke")
     add_test(NAME feed_migrations_fence COMMAND chunkdb_server_slots_protocol_test --migration-fence-only)
     set_tests_properties(feed_migrations_fence PROPERTIES TIMEOUT 90)
+    add_test(NAME feed_slots_shares COMMAND chunkdb_server_slots_protocol_test --shares-only)
+    set_tests_properties(feed_slots_shares PROPERTIES TIMEOUT 120 LABELS "smoke")
+
+    add_executable(chunkdb_server_channel_binding_test
+        tests/server_channel_binding_tests.cpp
+        src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
+        src/server_poller.cpp
+        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+    )
+    target_link_libraries(chunkdb_server_channel_binding_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_server_channel_binding_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(chunkdb_server_channel_binding_test PRIVATE ws2_32)
+    endif()
+    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+        target_link_libraries(chunkdb_server_channel_binding_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_server_channel_binding_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+    endif()
+    add_test(NAME server_channel_binding COMMAND chunkdb_server_channel_binding_test)
+    set_tests_properties(server_channel_binding PROPERTIES TIMEOUT 120 LABELS "smoke")
 
     add_executable(chunkdb_server_migrations_protocol_test
         tests/server_migrations_protocol_tests.cpp
@@ -733,6 +781,12 @@ if(CHUNKDB_BUILD_TESTS)
         target_link_libraries(chunkdb_server_bench_test PRIVATE ws2_32)
     endif()
     add_test(NAME server_bench COMMAND chunkdb_server_bench_test)
+
+    add_executable(chunkdb_chunk_map_bench_test tests/chunk_map_bench_tests.cpp)
+    target_include_directories(chunkdb_chunk_map_bench_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/bench)
+    add_test(NAME chunk_map_bench_args COMMAND chunkdb_chunk_map_bench_test)
+
+    add_test(NAME chunk_map_bench_smoke COMMAND chunkdb_chunk_map_bench --chunks 256 --ops 2048 --runs 2)
 
     add_executable(chunkdb_budget_compare_test tests/budget_compare_tests.cpp)
     target_link_libraries(chunkdb_budget_compare_test PRIVATE chunkdb_budget_compare_lib)
@@ -900,6 +954,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_migrations_records_test
         chunkdb_feature_activation_records_test
         chunkdb_txn_engine_test
+        chunkdb_chunk_write_memory_test
         chunkdb_crypto_test
         chunkdb_scram_test
         chunkdb_users_file_test
@@ -938,9 +993,11 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_server_integration_test
         chunkdb_feed_completed_prefix_reader_test
         chunkdb_server_slots_protocol_test
+        chunkdb_server_channel_binding_test
         chunkdb_server_migrations_protocol_test
         chunkdb_server_slots_process_test
         chunkdb_server_bench_test
+        chunkdb_chunk_map_bench_test
         chunkdb_budget_compare_test
         chunkdb_durability_crash_hardening_test
         chunkdb_snapshot_generation_linger_test
@@ -1017,6 +1074,7 @@ if(CHUNKDB_BUILD_TESTS)
         expr
         cql_engine
         txn_engine
+        chunk_write_memory
         crypto
         scram
         users_file
@@ -1046,6 +1104,8 @@ if(CHUNKDB_BUILD_TESTS)
         security_regression
         server_integration
         server_bench
+        chunk_map_bench_smoke
+        chunk_map_bench_args
         budget_compare
         txn_history
         txn_snapshot

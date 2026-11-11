@@ -429,9 +429,95 @@ void TestNoCacheReadAfterEvictionWithConcurrentCheckpoint() {
     }
 }
 
+// The duplicate-instance registry holds one entry per live chunk instance.
+// Reads of never-written chunks load and evict a new instance each, and the
+// registry stays at the cache's size instead of growing with every
+// coordinate ever read. An instance an eviction still holds keeps its entry
+// until the eviction drops it, and the next load of that chunk is not a
+// duplicate.
+void TestChunkInstanceRegistryHoldsOnlyLiveInstances() {
+    const auto data_dir = TempDataDir();
+    const chunkdb::StoreConfig config{
+        .geometry = {
+            .large_chunk_width_chunks = 2,
+            .large_chunk_height_chunks = 2,
+            .chunk_width_blocks = 4,
+            .chunk_height_blocks = 4,
+            .block_bits = 4,
+        },
+        .data_dir = data_dir,
+        .durability_mode = chunkdb::DurabilityMode::kRelaxed,
+        .checkpoint_update_interval = 10'000,
+        .checkpoint_wal_bytes = 10'000'000,
+        .max_loaded_chunks = 4,
+        .allow_multiple_processes = false,
+    };
+    using chunkdb::CachePausePoint;
+    {
+        chunkdb::ChunkStore store(config);
+        for (int i = 0; i < 2000; ++i) {
+            (void)store.GetBlockBits(4 * (i % 50), 4 * (i / 50) + 4);
+            assert(store.LiveChunkInstanceEntriesForTests() <= config.max_loaded_chunks + 2);
+        }
+        assert(store.RuntimeStats().evictions >= 1900U);
+
+        // An eviction of (0,0) stops before removing it, still holding the
+        // instance; the entry stays while the instance is alive.
+        store.SetBlockBits(0, 0, "1010");
+        store.ArmCachePauseForTests(CachePausePoint::kEvictionBeforeRemoval, chunkdb::ChunkCoord{0, 0});
+        auto evictor = std::async(std::launch::async, [&] {
+            for (int i = 0; i < 8; ++i) {
+                (void)store.GetChunkVersion(1000 + 4 * i, 0);
+            }
+        });
+        assert(store.WaitForCachePauseForTests(CachePausePoint::kEvictionBeforeRemoval));
+        assert(store.IsChunkLoadedForTests(0, 0));
+        const auto entries_while_held = store.LiveChunkInstanceEntriesForTests();
+        assert(entries_while_held == store.ApproxLoadedChunkCount());
+        store.ResumeCachePauseForTests(CachePausePoint::kEvictionBeforeRemoval);
+        evictor.get();
+        assert(!store.IsChunkLoadedForTests(0, 0));
+        assert(store.LiveChunkInstanceEntriesForTests() <= config.max_loaded_chunks + 2);
+
+        assert(store.GetBlockBits(0, 0) == "1010");
+        assert(store.DuplicateChunkInstancesForTests() == 0U);
+        assert(store.LiveChunkInstanceEntriesForTests() <= config.max_loaded_chunks + 2);
+
+        // An instance held past its removal from the cache keeps its entry,
+        // through evictions of other chunks, so a load of that chunk while
+        // it is held is counted as a duplicate. The entry then belongs to
+        // the new instance, and releasing the old one leaves it in place.
+        (void)store.GetChunkVersion(0, 100);
+        auto held = store.TakeChunkFromCacheForTests(0, 100);
+        assert(held != nullptr);
+        assert(!store.IsChunkLoadedForTests(0, 100));
+        for (int i = 0; i < 8; ++i) {
+            (void)store.GetChunkVersion(2000 + 4 * i, 0);
+        }
+        assert(store.LiveChunkInstanceEntriesForTests() == store.ApproxLoadedChunkCount() + 1);
+        (void)store.GetChunkVersion(0, 100);
+        assert(store.DuplicateChunkInstancesForTests() == 1U);
+        assert(store.LiveChunkInstanceEntriesForTests() == store.ApproxLoadedChunkCount());
+        held.reset();
+        assert(store.IsChunkLoadedForTests(0, 100));
+        assert(store.LiveChunkInstanceEntriesForTests() == store.ApproxLoadedChunkCount());
+        // Once the old instance is gone, reloading is not a duplicate.
+        held = store.TakeChunkFromCacheForTests(0, 100);
+        held.reset();
+        assert(store.LiveChunkInstanceEntriesForTests() == store.ApproxLoadedChunkCount());
+        (void)store.GetChunkVersion(0, 100);
+        assert(store.DuplicateChunkInstancesForTests() == 1U);
+        assert(store.LiveChunkInstanceEntriesForTests() == store.ApproxLoadedChunkCount());
+    }
+    if (!RemoveAllWithRetry(data_dir)) {
+        throw std::runtime_error("failed to remove temp dir: " + data_dir.string());
+    }
+}
+
 }  // namespace
 
 int main() {
+    TestChunkInstanceRegistryHoldsOnlyLiveInstances();
     TestNoCacheReadAfterEvictionWithConcurrentCheckpoint();
     TestSiblingLoadsWhileEvictionCheckpoints(chunkdb::DurabilityMode::kRelaxed);
     TestSiblingLoadsWhileEvictionCheckpoints(chunkdb::DurabilityMode::kFsyncWal);
@@ -527,7 +613,7 @@ int main() {
         {
             chunkdb::ChunkStore store(bounded);
             const auto blocks_per_chunk =
-                static_cast<int>(store.geometry().config().chunk_width_blocks);
+                static_cast<std::int64_t>(store.geometry().config().chunk_width_blocks);
             constexpr std::uint64_t kDistinctLargeChunksTouched = 20;
 
             for (int i = 0; i < 4; ++i) {

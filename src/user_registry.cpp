@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
+#include <utility>
 
 #include "file_permissions.hpp"
 #include "chunkdb/logging.hpp"
@@ -96,20 +97,50 @@ UserRegistry::UserRegistry(
     Publish(std::move(published));
 }
 
+UserRegistry::Wakes::~Wakes() {
+    if (!changed_ || registry_ == nullptr) return;
+    // Outside the registry lock: a callback that drops the last owner of
+    // what it wakes destroys it here, not under that lock.
+    std::lock_guard lock(registry_->listeners_mutex_);
+    std::erase_if(registry_->listeners_, [](const auto& listener) {
+        const auto wake = listener.lock();
+        if (wake) (*wake)();
+        return !wake;
+    });
+}
+
+std::shared_ptr<const UserRegistry::RightsView> UserRegistry::Rights() const {
+    std::lock_guard lock(rights_mutex_);
+    return rights_;
+}
+
+std::shared_ptr<const std::function<void()>> UserRegistry::OnChange(std::function<void()> wake) {
+    auto handle = std::make_shared<const std::function<void()>>(std::move(wake));
+    std::lock_guard lock(listeners_mutex_);
+    listeners_.push_back(handle);
+    return handle;
+}
+
 void UserRegistry::SetMigrationHealth(std::shared_ptr<MigrationHealth> health) {
+    Wakes wakes(this);
     std::lock_guard lock(mutex_);
     health->Check();
     ConfirmPublication();
     const auto stored = ReadUsersFile(data_dir_);
     if (!stored) throw std::runtime_error("users file disappeared while binding the catalog");
     if (users_ != *stored) {
-        auto replacement = *stored;
-        auto published = PreparePublication(std::make_shared<const Users>(replacement));
-        users_ = std::move(replacement);
-        Publish(std::move(published));
-        generation_.fetch_add(1, std::memory_order_acq_rel);
+        CommitPublication(*stored, PreparePublication(std::make_shared<const Users>(*stored)), wakes);
     }
     migration_health_ = std::move(health);
+}
+
+void UserRegistry::CommitPublication(Users next, UserPublication publication, Wakes& wakes) {
+    users_ = std::move(next);
+    Publish(std::move(publication));
+    // The view is published before the generation moves: a reader that sees
+    // the new generation reads a view at least that new.
+    generation_.fetch_add(1, std::memory_order_acq_rel);
+    wakes.changed_ = true;
 }
 
 std::optional<User> UserRegistry::Find(const std::string& name) const {
@@ -119,6 +150,19 @@ std::optional<User> UserRegistry::Find(const std::string& name) const {
         return std::nullopt;
     }
     return found->second;
+}
+
+std::optional<UserRegistry::Incarnated> UserRegistry::FindIncarnation(const std::string& name) const {
+    std::shared_ptr<const Users> users;
+    std::uint64_t incarnation = 0U;
+    {
+        std::lock_guard lock(published_mutex_);
+        const auto found = admissions_->find(name);
+        if (found == admissions_->end()) return std::nullopt;
+        incarnation = found->second.state->incarnation;
+        users = published_;
+    }
+    return Incarnated{.user = users->users.at(name), .incarnation = incarnation};
 }
 
 Users UserRegistry::Snapshot() const {
@@ -148,6 +192,7 @@ void UserRegistry::UpdateIf(Change&& change) {
     if (read_only_) {
         throw std::invalid_argument("users cannot change: the data directory is open read-only");
     }
+    Wakes wakes(this);
     std::lock_guard lock(mutex_);
     if (migration_health_) migration_health_->Check();
     ConfirmPublication();
@@ -162,17 +207,13 @@ void UserRegistry::UpdateIf(Change&& change) {
     try { WriteUsersFile(data_dir_, next, &replaced); }
     catch (const std::exception&) {
         if (!replaced) throw;
-        users_ = std::move(next);
-        Publish(std::move(published));
+        CommitPublication(std::move(next), std::move(published), wakes);
         publication_unknown_ = unknown;
-        generation_.fetch_add(1, std::memory_order_acq_rel);
         std::rethrow_exception(unknown);
     }
     if (auto* hook = test_hook_.load(std::memory_order_acquire))
         hook->Run(MigrationTestHook::Point::kBeforeUserPublication, {});
-    users_ = std::move(next);
-    Publish(std::move(published));
-    generation_.fetch_add(1, std::memory_order_acq_rel);
+    CommitPublication(std::move(next), std::move(published), wakes);
 }
 
 template <typename Change>
@@ -183,25 +224,42 @@ void UserRegistry::Update(Change&& change) {
     });
 }
 
-void UserRegistry::Create(const std::string& name, scram::Verifier verifier, bool manages_users, bool if_not_exists) {
-    Create(name, [&] { return std::move(verifier); }, manages_users, if_not_exists);
+void UserRegistry::Create(const std::string& name, scram::Verifier verifier, bool manages_users, bool if_not_exists,
+    bool requires_channel_binding) {
+    Create(name, [&] { return std::move(verifier); }, manages_users, if_not_exists, requires_channel_binding);
 }
 
 void UserRegistry::Create(const std::string& name, const std::function<scram::Verifier()>& make_verifier,
-    bool manages_users, bool if_not_exists) {
+    bool manages_users, bool if_not_exists, bool requires_channel_binding) {
     RequireName(name);
     UpdateIf([&](Users& users) {
         if (users.users.contains(name)) {
             if (if_not_exists) return false;
             throw std::invalid_argument("user " + name + " already exists");
         }
-        users.users.emplace(name, User{.verifier = make_verifier(), .manages_users = manages_users, .grants = {}});
+        users.users.emplace(name, User{.verifier = make_verifier(), .manages_users = manages_users,
+            .requires_channel_binding = requires_channel_binding, .grants = {}});
         return true;
     });
 }
 
 void UserRegistry::SetVerifier(const std::string& name, scram::Verifier verifier) {
     Update([&](Users& users) { Existing(users, name).verifier = std::move(verifier); });
+}
+
+bool UserRegistry::SetOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier) {
+    bool current = false;
+    UpdateIf([&](Users& users) {
+        {
+            // admissions_ changes only under mutex_, which UpdateIf holds.
+            std::lock_guard lock(published_mutex_);
+            const auto found = admissions_->find(name);
+            current = found != admissions_->end() && found->second.state->incarnation == incarnation;
+        }
+        if (current) Existing(users, name).verifier = std::move(verifier);
+        return current;
+    });
+    return current;
 }
 
 void UserRegistry::SetLimits(const std::string& name, std::optional<std::uint64_t> max_connections,
@@ -227,6 +285,10 @@ void UserRegistry::SetManagesUsers(const std::string& name, bool manages_users) 
     });
 }
 
+void UserRegistry::SetRequiresChannelBinding(const std::string& name, bool requires_channel_binding) {
+    Update([&](Users& users) { Existing(users, name).requires_channel_binding = requires_channel_binding; });
+}
+
 void UserRegistry::Drop(const std::string& name, bool if_exists) {
     RequireName(name);
     UpdateIf([&](Users& users) {
@@ -242,6 +304,7 @@ void UserRegistry::Drop(const std::string& name, bool if_exists) {
 }
 
 void UserRegistry::Grant(const std::string& name, const std::string& table, Right right) {
+    RequireValidGrantTable(table);
     Update([&](Users& users) {
         auto& grants = Existing(users, name).grants;
         const auto found = grants.find(table);
@@ -273,6 +336,21 @@ void UserRegistry::ForgetTable(const std::string& table) {
             user.grants.erase(table);
         }
     });
+}
+
+ReadRightCheck::State ReadRightCheck::Recheck(std::uint64_t generation) {
+    // A change after this load bumps the generation again and is read next time.
+    generation_ = generation;
+    if (state_ != State::kHeld) return state_;
+    const auto rights = users_->Rights();
+    const auto found = rights->users.find(user_);
+    if (found == rights->users.end() || found->second.incarnation != incarnation_) state_ = State::kNoUser;
+    else if (!RightOn(found->second.grants, table_).has_value()) state_ = State::kNoRight;
+    else if (every_table_admin_) {
+        const auto every = found->second.grants.find(kEveryTable);
+        if (every == found->second.grants.end() || every->second < Right::kAdmin) state_ = State::kNoRight;
+    }
+    return state_;
 }
 
 }  // namespace chunkdb

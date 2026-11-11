@@ -8,6 +8,8 @@
 #include "statement_control.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/crc32.hpp"
+#include "chunkdb/table_catalog.hpp"
+#include "user_registry.hpp"
 
 namespace chunkdb {
 
@@ -49,6 +51,14 @@ void ValidateShortString(const std::string& text) {
     }
 }
 
+[[nodiscard]] bool SaltLengthFits(std::size_t size) noexcept {
+    return size >= scram::kMinSaltBytes && size <= scram::kMaxSaltBytes;
+}
+
+[[nodiscard]] std::string SaltBounds() {
+    return std::to_string(scram::kMinSaltBytes) + ".." + std::to_string(scram::kMaxSaltBytes);
+}
+
 void ValidateUsers(const Users& users) {
     if (users.users.size() > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("chunkdb.users has more than 4294967295 users");
@@ -62,8 +72,10 @@ void ValidateUsers(const Users& users) {
                 " verifier iterations, outside " + std::to_string(scram::kMinIterations) + ".." +
                 std::to_string(scram::kMaxIterations));
         }
-        if (user.verifier.salt.size() > std::numeric_limits<std::uint16_t>::max()) {
-            throw std::invalid_argument("a verifier salt in chunkdb.users is longer than 65535 bytes");
+        if (!SaltLengthFits(user.verifier.salt.size())) {
+            throw std::invalid_argument(
+                "user " + name + " has a " + std::to_string(user.verifier.salt.size()) +
+                "-byte verifier salt; chunkdb.users takes " + SaltBounds() + " bytes");
         }
         if (user.grants.size() > std::numeric_limits<std::uint32_t>::max()) {
             throw std::invalid_argument("chunkdb.users has more than 4294967295 grants for user " + name);
@@ -80,6 +92,13 @@ void ValidateUsers(const Users& users) {
 void PutShortString(std::vector<std::uint8_t>* out, const std::string& text) {
     PutU16(out, static_cast<std::uint16_t>(text.size()));
     PutBytes(out, reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
+}
+
+void PutCount(std::vector<std::uint8_t>* out, std::size_t count) {
+    if (count > 0xFFFFFFFFU) {
+        throw std::invalid_argument("chunkdb.users holds at most 4294967295 users, and a user at most as many grants");
+    }
+    PutU32(out, static_cast<std::uint32_t>(count));
 }
 
 class Reader {
@@ -130,10 +149,24 @@ class Reader {
 
 }  // namespace
 
+bool IsValidGrantTable(std::string_view table) noexcept {
+    return table == kEveryTable || IsValidTableName(table);
+}
+
+void RequireValidGrantTable(std::string_view table) {
+    if (table != kEveryTable) {
+        RequireValidTableName(table);
+    }
+}
+
 std::optional<Right> RightOn(const User& user, const std::string& table) {
+    return RightOn(user.grants, table);
+}
+
+std::optional<Right> RightOn(const std::map<std::string, Right>& grants, const std::string& table) {
     std::optional<Right> best;
     for (const auto& name : {table, std::string(kEveryTable)}) {
-        if (const auto found = user.grants.find(name); found != user.grants.end()) {
+        if (const auto found = grants.find(name); found != grants.end()) {
             if (!best.has_value() || found->second > *best) {
                 best = found->second;
             }
@@ -147,16 +180,16 @@ std::vector<std::uint8_t> EncodeUsers(const Users& users) {
     std::vector<std::uint8_t> out(kMagic.begin(), kMagic.end());
     PutU32(&out, kVersion);
     PutBytes(&out, users.secret.data(), users.secret.size());
-    PutU32(&out, static_cast<std::uint32_t>(users.users.size()));
+    PutCount(&out, users.users.size());
     for (const auto& [name, user] : users.users) {
         PutShortString(&out, name);
-        out.push_back(user.manages_users ? 1U : 0U);
+        out.push_back(static_cast<std::uint8_t>((user.manages_users ? 1U : 0U) | (user.requires_channel_binding ? 2U : 0U)));
         PutU32(&out, user.verifier.iterations);
         PutU16(&out, static_cast<std::uint16_t>(user.verifier.salt.size()));
         PutBytes(&out, user.verifier.salt.data(), user.verifier.salt.size());
         PutBytes(&out, user.verifier.stored_key.data(), user.verifier.stored_key.size());
         PutBytes(&out, user.verifier.server_key.data(), user.verifier.server_key.size());
-        PutU32(&out, static_cast<std::uint32_t>(user.grants.size()));
+        PutCount(&out, user.grants.size());
         for (const auto& [table, right] : user.grants) {
             PutShortString(&out, table);
             out.push_back(static_cast<std::uint8_t>(right));
@@ -194,12 +227,16 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
     const std::uint32_t count = reader.U32();
     for (std::uint32_t i = 0; i < count; ++i) {
         std::string name = reader.ShortString();
+        if (!IsValidUserName(name)) {
+            throw std::invalid_argument("chunkdb.users has an invalid user name");
+        }
         User user;
         const std::uint8_t flags = reader.U8();
-        if ((flags & ~1U) != 0U) {
+        if ((flags & ~3U) != 0U) {
             throw std::invalid_argument("chunkdb.users has unknown flags for user " + name);
         }
         user.manages_users = (flags & 1U) != 0U;
+        user.requires_channel_binding = (flags & 2U) != 0U;
         user.verifier.iterations = reader.U32();
         if (user.verifier.iterations < scram::kMinIterations || user.verifier.iterations > scram::kMaxIterations) {
             throw std::invalid_argument(
@@ -208,6 +245,11 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
                 std::to_string(scram::kMaxIterations));
         }
         const std::uint16_t salt_size = reader.U16();
+        if (!SaltLengthFits(salt_size)) {
+            throw std::invalid_argument(
+                "chunkdb.users gives user " + name + " a " + std::to_string(salt_size) +
+                "-byte verifier salt, outside " + SaltBounds());
+        }
         const auto* salt = reader.Take(salt_size);
         user.verifier.salt.assign(salt, salt + salt_size);
         std::copy_n(reader.Take(32), 32, user.verifier.stored_key.begin());
@@ -215,6 +257,10 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
         const std::uint32_t grants = reader.U32();
         for (std::uint32_t g = 0; g < grants; ++g) {
             std::string table = reader.ShortString();
+            if (!IsValidGrantTable(table)) {
+                throw std::invalid_argument(
+                    "chunkdb.users grants user " + name + " a right on an invalid table name");
+            }
             const std::uint8_t right = reader.U8();
             if (right < static_cast<std::uint8_t>(Right::kRead) || right > static_cast<std::uint8_t>(Right::kAdmin)) {
                 throw std::invalid_argument("chunkdb.users has an unknown right for user " + name);

@@ -57,6 +57,8 @@ do not want to gate on.
   compiler warning fails CI.
 - Stress is tracked separately in the stress-flake workflow.
 - TLS build/smoke validation remains a dedicated CI job.
+- A pull request that changes only `docs/`, Markdown files or `bench/artifacts/` runs the documentation checks and the Docker quick-start page instead of the build matrix; crash, stress and fuzz workflows skip it.
+- A new push to a pull request or to `main` cancels the run still going for it.
 
 ## Scope Discipline
 
@@ -228,7 +230,7 @@ Metadata harnesses test both the raw input and a copy with its outer CRC repaire
 Storage harnesses also repair WAL header and frame checksums or the image directory checksum.
 The request harness runs the server's own `ReadParameterFrames`.
 
-CI runs every target for 30 seconds on each pull request (`fuzz.yml`) and for 25 minutes each night (`fuzz-scheduled.yml`).
+CI runs every target for 30 seconds on each pull request that changes more than documentation (`fuzz.yml`) and for 25 minutes each night (`fuzz-scheduled.yml`).
 A failing run uploads the crash inputs as an artifact.
 
 To keep a crash as a regression, fix the bug and copy the input to `fuzz/regression/NAME/`.

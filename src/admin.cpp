@@ -2,6 +2,7 @@
 
 #include <stdexcept>
 
+#include "backup.hpp"
 #include "process_lock.hpp"
 #include "migrations_records.hpp"
 #include "user_registry.hpp"
@@ -15,6 +16,9 @@ void ResetPassword(const std::filesystem::path& data_dir, const std::string& use
     const auto no_users = [&data_dir] {
         return std::invalid_argument("the data directory " + data_dir.string() + " has no users");
     };
+    // A backup is never opened as a data directory; refuse it before the lock
+    // creates anything inside it.
+    RequireNotBackupDirectory(data_dir, AccessMode::kReadWrite);
     // Checked before the lock too, so a wrong directory gets no lock file.
     if (!std::filesystem::exists(data_dir / kUsersFileName)) {
         throw no_users();

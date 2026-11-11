@@ -7,6 +7,7 @@
 #include <map>
 #include <memory>
 #include <mutex>
+#include <string>
 #include <utility>
 #include <vector>
 
@@ -55,6 +56,15 @@ struct UserAuthenticationSnapshot {
     std::uint64_t verifier_generation = 0U;
 };
 
+// The rights and incarnation of every user as of one publication.
+struct UserRightsView {
+    struct Entry {
+        std::uint64_t incarnation = 0;
+        std::map<std::string, Right> grants;
+    };
+    std::map<std::string, Entry> users;
+};
+
 struct UserAdmissionEntry {
     std::shared_ptr<UserAdmissionState> state;
     std::uint64_t verifier_generation = 1U;
@@ -75,6 +85,7 @@ struct UserPublication {
     UserPublication& operator=(UserPublication&&) = default;
     std::shared_ptr<const Users> users;
     std::shared_ptr<const UserAdmissionMap> admissions;
+    std::shared_ptr<const UserRightsView> rights;
     std::vector<UserAdmissionUpdate> updates;
 };
 }  // namespace chunkdb

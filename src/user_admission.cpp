@@ -52,7 +52,11 @@ UserPublication UserRegistry::PreparePublication(std::shared_ptr<const Users> ne
         auto state = existing->second.state;
         auto entry = existing->second;
         const auto& previous = before->users.at(name);
-        if (user.verifier == previous.verifier && user.max_connections == previous.max_connections &&
+        // A login checked against the previous verifier or binding requirement
+        // must not take a ticket after either changes.
+        const bool credentials_changed = user.verifier != previous.verifier ||
+            user.requires_channel_binding != previous.requires_channel_binding;
+        if (!credentials_changed && user.max_connections == previous.max_connections &&
             user.statements_per_sec == previous.statements_per_sec) {
             entries->emplace(name, entry);
             continue;
@@ -61,7 +65,7 @@ UserPublication UserRegistry::PreparePublication(std::shared_ptr<const Users> ne
         {
             std::lock_guard lock(state->mutex);
             update.verifier_generation = entry.verifier_generation;
-            if (user.verifier != previous.verifier) {
+            if (credentials_changed) {
                 if (update.verifier_generation == std::numeric_limits<std::uint64_t>::max())
                     throw std::runtime_error("user verifier generation space exhausted");
                 ++update.verifier_generation;
@@ -82,6 +86,12 @@ UserPublication UserRegistry::PreparePublication(std::shared_ptr<const Users> ne
     if (old) for (const auto& [name, entry] : *old) {
         if (!result.users->users.contains(name)) result.updates.push_back(UserAdmissionUpdate{.state = entry.state, .retire = true});
     }
+    auto rights = std::make_shared<UserRightsView>();
+    for (const auto& [name, user] : result.users->users) {
+        rights->users.emplace(name, UserRightsView::Entry{.incarnation = entries->at(name).state->incarnation,
+            .grants = user.grants});
+    }
+    result.rights = std::move(rights);
     return result;
 }
 
@@ -111,6 +121,13 @@ void UserRegistry::Publish(UserPublication next) {
         std::lock_guard lock(published_mutex_);
         published_.swap(next.users);
         admissions_.swap(next.admissions);
+    }
+    // Installed before the caller moves the generation: a reader that sees
+    // the new generation reads a view at least that new. The previous view
+    // is freed after the lock, never while a reader waits.
+    {
+        std::lock_guard lock(rights_mutex_);
+        rights_.swap(next.rights);
     }
 }
 

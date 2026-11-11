@@ -75,6 +75,9 @@ int main(int argc, char** argv) {
     Fixture("manifest", "directory", SerializeDataDirManifest({kKnownFeatures, fuzz::kId, {}}));
     Fixture("slots", "active-lost", SerializeFeedSlotRecords(
         {fuzz::kId, 987U, {{"consumer_1", 123U, false}, {"lost", 456U, true}}}));
+    Fixture("slots", "owned-filtered", SerializeFeedSlotRecords({fuzz::kId, 987U,
+        {{"owned", 123U, false, {.area = FeedArea{{-1, -2}, {3, 4}}, .column_ids = std::vector<std::uint32_t>{2U, 1U}}, false, "bot"},
+         {"unowned", 456U, false}}}));
     const MigrationRecord record{"set_options", 1234U, "admin", "ALTER TABLE default SET checkpoint_updates = 512"};
     const auto ledger = EncodeMigrationRecords(fuzz::kId, {record});
     Fixture("migrations", "ledger", ledger);
@@ -99,7 +102,7 @@ int main(int argc, char** argv) {
              "ALTER TABLE world RENAME COLUMN name TO label", "ALTER TABLE world SET var_max_chunk_bytes = 2097152",
              "DROP TABLE IF EXISTS world", "SET BLOCK 0 0 IN world kind = 1, name = 'grass' IF VERSION 3",
              "DELETE BLOCK 0 0 FROM world IF VERSION 3", "GET BLOCK 0 0 FROM world COLUMNS name",
-             "SCAN CHUNKS FROM world AFTER 0 0 LIMIT 10", "CREATE SLOT 'consumer' ON world", "DROP SLOT IF EXISTS 'consumer' ON world",
+             "SCAN CHUNKS FROM world AFTER 0 0 LIMIT 10", "CREATE SLOT 'consumer' ON world", "CREATE SLOT 'owned' ON world OWNER bot CHUNKS", "DROP SLOT IF EXISTS 'consumer' ON world",
              "CREATE USER bot VERIFIER  MANAGES USERS", "ALTER USER bot NO MANAGES USERS", "DROP USER IF EXISTS bot",
              "GRANT READ, WRITE ON world TO bot", "REVOKE WRITE ON world FROM bot",
              "MIGRATE 'label' ALTER TABLE world ADD COLUMN label text(16) NULL", "SET CHUNK 0 0 IN world $1",

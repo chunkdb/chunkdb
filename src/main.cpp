@@ -149,6 +149,8 @@ void PrintUsage() {
         << "  --auth-ban-ms <ms>\n"
         << "      Failed logins that close a connection (5), that ban a source address\n"
         << "      (5; 0 disables bans), and the ban length (1000 ms).\n"
+        << "  --auth-channel-binding <allow|require>\n"
+        << "      require: only logins bound to their TLS connection; allow (default): also unbound ones.\n"
         << "  --proxy-protocol <off|v2>\n"
         << "      v2: every connection starts with a PROXY protocol v2 header.\n"
         << "  --auth <scram|none>\n"
@@ -318,6 +320,12 @@ int main(int argc, char** argv) {
                 const auto mode = require_value("--proxy-protocol");
                 if (mode != "off" && mode != "v2") throw std::invalid_argument("--proxy-protocol is off or v2, got " + mode);
                 server_config.proxy_protocol_v2 = mode == "v2";
+            } else if (arg == "--auth-channel-binding") {
+                const auto mode = require_value("--auth-channel-binding");
+                if (mode != "allow" && mode != "require") {
+                    throw std::invalid_argument("--auth-channel-binding is allow or require, got " + mode);
+                }
+                engine_config.require_channel_binding = mode == "require";
             } else if (arg == "--auth") {
                 auth_mode = require_value("--auth");
                 if (auth_mode != "scram" && auth_mode != "none") {
@@ -462,6 +470,12 @@ int main(int argc, char** argv) {
                     {"host", server_config.host},
                     {"port", std::to_string(server_config.port)},
                 });
+        }
+
+        if (engine_config.require_channel_binding && (!engine_config.require_auth || !server_config.tls_enabled)) {
+            throw std::invalid_argument(
+                "--auth-channel-binding require needs users (--auth scram) and TLS (a chunks:// listen URI): a login "
+                "is bound to the TLS connection it is made on");
         }
 
         if (server_config.tls_enabled &&

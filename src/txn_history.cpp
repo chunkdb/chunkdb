@@ -86,6 +86,15 @@ void TxnHistory::Fill(Reservation& reservation, ChunkState&& state) noexcept {
                  kKeptStateOverheadBytes;
 }
 
+void TxnHistory::FillPayload(
+    Reservation& reservation, std::vector<std::uint8_t>&& payload, std::vector<std::uint8_t>&& presence) noexcept {
+    auto& kept = reservation.mapped();
+    kept.state.payload = std::move(payload);
+    kept.state.presence_bitmap = std::move(presence);
+    kept.bytes = kept.state.payload.size() + kept.state.presence_bitmap.size() + kept.state.vars.encoded_size() +
+                 kKeptStateOverheadBytes;
+}
+
 void TxnHistory::Publish(Reservation& reservation) noexcept {
     if (reservation.empty()) {
         return;

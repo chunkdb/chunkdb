@@ -17,6 +17,7 @@
 #include "users.hpp"
 #include "user_registry.hpp"
 #include "chunkdb/crc32.hpp"
+#include "chunkdb/table_catalog.hpp"
 
 #ifdef _WIN32
 #include <aclapi.h>
@@ -61,6 +62,7 @@ Users Sample() {
     users.users["nobody"] = User{
         .verifier = chunkdb::scram::MakeVerifier("x", salt, 4096),
         .manages_users = false,
+        .requires_channel_binding = true,
         .grants = {},
     };
     return users;
@@ -69,6 +71,8 @@ Users Sample() {
 void TestRoundTrip() {
     const Users users = Sample();
     assert(chunkdb::DecodeUsers(chunkdb::EncodeUsers(users)) == users);
+    assert(chunkdb::DecodeUsers(chunkdb::EncodeUsers(users)).users.at("nobody").requires_channel_binding);
+    assert(!chunkdb::DecodeUsers(chunkdb::EncodeUsers(users)).users.at("bot").requires_channel_binding);
     assert(chunkdb::DecodeUsers(chunkdb::EncodeUsers(Users{})) == Users{});
 }
 
@@ -242,13 +246,14 @@ void TestWriterValidation() {
     // Sizes and verifier bounds admitted by the decoder remain writable.
     auto extremes = good;
     auto user = good.users.at("admin");
-    user.verifier.salt.assign(65535U, 0x5a);
+    user.verifier.salt.assign(chunkdb::scram::kMaxSaltBytes, 0x5a);
     user.verifier.iterations = chunkdb::scram::kMaxIterations;
-    user.grants.emplace(std::string(65535U, 't'), Right::kRead);
+    user.grants.emplace(std::string(chunkdb::kMaxTableNameLength, 't'), Right::kRead);
     user.max_connections = std::numeric_limits<std::uint64_t>::max();
     user.statements_per_sec = chunkdb::kMaxUserStatementsPerSecond;
-    extremes.users.emplace(std::string(65535U, 'n'), user);
-    extremes.users.at("nobody").verifier.salt.clear();
+    user.requires_channel_binding = true;
+    extremes.users.emplace(std::string(63U, 'n'), user);
+    extremes.users.at("nobody").verifier.salt.assign(chunkdb::scram::kMinSaltBytes, 0x5a);
     assert(chunkdb::DecodeUsers(chunkdb::EncodeUsers(extremes)) == extremes);
     chunkdb::WriteUsersFile(dir.path(), extremes);
     assert(chunkdb::ReadUsersFile(dir.path()) == extremes);
@@ -356,6 +361,82 @@ void TestDevelopmentAdmissionIsReadOnly() {
     assert(std::filesystem::file_size(scratch) == 10U && std::filesystem::last_write_time(scratch) == scratch_time);
 }
 
+
+// One user in the users file layout, with each field as given, so a file the
+// encoder would refuse can still be read.
+struct RawUser {
+    std::string name = "bot";
+    std::size_t salt_bytes = 16;
+    std::string table = "world";
+};
+
+std::vector<std::uint8_t> RawUsersFile(const RawUser& raw) {
+    std::vector<std::uint8_t> out;
+    out.reserve(160U + raw.name.size() + raw.salt_bytes + raw.table.size());
+    for (const char c : std::string("CKDU")) out.push_back(static_cast<std::uint8_t>(c));
+    const auto u16 = [&](std::size_t value) {
+        out.push_back(static_cast<std::uint8_t>(value));
+        out.push_back(static_cast<std::uint8_t>(value >> 8U));
+    };
+    const auto u32 = [&](std::uint32_t value) {
+        for (std::size_t i = 0; i < 4; ++i) out.push_back(static_cast<std::uint8_t>(value >> (8U * i)));
+    };
+    const auto text = [&](const std::string& value) {
+        u16(value.size());
+        out.insert(out.end(), value.begin(), value.end());
+    };
+    u32(2);
+    out.insert(out.end(), 32, 0x07);
+    u32(1);
+    text(raw.name);
+    out.push_back(0);
+    u32(chunkdb::scram::kMinIterations);
+    u16(raw.salt_bytes);
+    out.insert(out.end(), raw.salt_bytes, 0x5a);
+    out.insert(out.end(), 64, 0x11);
+    u32(1);
+    text(raw.table);
+    out.push_back(static_cast<std::uint8_t>(Right::kRead));
+    out.insert(out.end(), 16, 0x00); // max_connections and statements_per_sec
+    u32(chunkdb::Crc32(out));
+    return out;
+}
+
+// A salt length, user name or grant table name the statements refuse is
+// refused by the encoder or the decoder too, so what one writes the other
+// reads back field for field.
+void TestFieldBounds() {
+    const auto valid = chunkdb::DecodeUsers(RawUsersFile({}));
+    assert(valid.users.at("bot").verifier.salt.size() == 16U && valid.users.at("bot").grants.at("world") == Right::kRead);
+    const auto longest = chunkdb::DecodeUsers(RawUsersFile({.salt_bytes = chunkdb::scram::kMaxSaltBytes}));
+    assert(chunkdb::EncodeUsers(longest) == RawUsersFile({.salt_bytes = chunkdb::scram::kMaxSaltBytes}));
+    (void)chunkdb::DecodeUsers(RawUsersFile({.table = "*"}));
+
+    ExpectInvalid([] { (void)chunkdb::DecodeUsers(RawUsersFile({.salt_bytes = 15})); }, "15-byte verifier salt, outside 16..256");
+    ExpectInvalid([] { (void)chunkdb::DecodeUsers(RawUsersFile({.salt_bytes = 257})); }, "257-byte verifier salt, outside 16..256");
+    for (const auto* name : {"", "Bot", "9bot", "bot-1", "a\nb"}) {
+        ExpectInvalid([&] { (void)chunkdb::DecodeUsers(RawUsersFile({.name = name})); }, "invalid user name");
+    }
+    ExpectInvalid([] { (void)chunkdb::DecodeUsers(RawUsersFile({.name = std::string(64, 'a')})); }, "invalid user name");
+    for (const auto* table : {"", "con", "_world", "World", "a/b", "**"}) {
+        ExpectInvalid([&] { (void)chunkdb::DecodeUsers(RawUsersFile({.table = table})); }, "invalid table name");
+    }
+    ExpectInvalid([] { (void)chunkdb::DecodeUsers(RawUsersFile({.table = std::string(65, 'a')})); }, "invalid table name");
+
+    // A salt longer than its 16-bit length field is refused, not cut short.
+    for (const std::size_t size : {std::size_t{15}, chunkdb::scram::kMaxSaltBytes + 1U, std::size_t{65536 + 16}}) {
+        Users users = Sample();
+        users.users["bot"].verifier.salt.assign(size, 0x5a);
+        ExpectInvalid([&] { (void)chunkdb::EncodeUsers(users); }, "-byte verifier salt; chunkdb.users takes 16..256 bytes");
+    }
+    Users long_name = Sample();
+    long_name.users[std::string(0x10000, 'a')] = long_name.users["bot"];
+    ExpectInvalid([&] { (void)chunkdb::EncodeUsers(long_name); }, "longer than 65535 bytes");
+    Users long_table = Sample();
+    long_table.users["bot"].grants[std::string(0x10000, 'a')] = Right::kRead;
+    ExpectInvalid([&] { (void)chunkdb::EncodeUsers(long_table); }, "longer than 65535 bytes");
+}
+
 }  // namespace
 
 int main() {
@@ -368,5 +449,6 @@ int main() {
     TestWriterValidation();
     TestLimitsAndMandatoryFields();
     TestDevelopmentAdmissionIsReadOnly();
+    TestFieldBounds();
     return 0;
 }

@@ -17,6 +17,25 @@ Reading or writing a block is arithmetic and a bit access, in constant time, wit
 Neighbouring blocks are adjacent in each column's array, so area reads and scans walk contiguous memory, and reading one column touches only that column's bytes.
 The cost is that a loaded chunk holds full arrays even when few of its blocks are present; a chunk with no present block is collected.
 Maps exist only at chunk level: the chunks of a large chunk, the large chunks of a table and the cache of loaded chunks, each keyed by chunk coordinates.
+On every operation, a point read or write of a loaded chunk does two hash lookups by chunk coordinates, each under its own mutex: its large chunk in the table's map, then the chunk in that large chunk's map; the third map is used only when a chunk is loaded or its object is freed.
+A write that flushes its chunk's WAL batch, in relaxed mode once per `wal_group_commit_updates` writes to the chunk and in the synced modes on every write, does more lookups.
+It finds the chunk's stream in the process's open WAL streams, keyed by the chunk object's address, and in relaxed mode it adds the WAL file's path, hashed as a string, to the store's set of unsynced files; once tracking past its limit tracks some large-chunk directories instead of their files, it first looks up the file's directory and adds nothing if that directory is tracked, and once tracking falls back to the whole data directory it does neither.
+Opening a WAL stream, a checkpoint, an open transaction and a change feed's archive do further lookups, keyed by paths or chunk coordinates.
+
+`chunkdb_chunk_map_bench` measures what the two per-operation lookups cost on a warm cache.
+The published run uses a build with `-DCHUNKDB_BUILD_TESTS=OFF -DCHUNKDB_FAILPOINTS=OFF`, since compiled-in test failure injection reads the environment on every write; the output's `profile` line records `failpoints=off`.
+Each run opens a fresh store in relaxed mode with 16,384 loaded chunks of 16x16 blocks of 15 bits, in 256 large chunks of 8x8 chunks, every block present and a cache of twice that.
+At 15 bits the string a read returns fits the small-string buffer of libstdc++ and libc++, so no timed read allocates.
+It times windows of 204,800 point reads (`GetBlockBits`) and point writes (`SetBlockBits`, each changing its block), once with each operation's chunk drawn uniformly from all loaded chunks and once with every operation in one chunk, both with the same sequence of block positions inside the chunk from a fixed seed.
+It also times the two lookups alone, with their mutexes, on maps of the same types, hash, keys, sizes and insertion order outside the store, over the same chunk sequences.
+Every window follows an untimed pass of the same sequence and is timed in segments of 1,024 operations; its figure is the median segment's ns per operation, which leaves out rare stalls such as the durable write of the version clock every 16,384 versions.
+A timed write's WAL frame stays in its chunk's in-memory batch: group commit and checkpoint thresholds are above anything a run writes, and the untimed pass, drained by a WAL barrier, has grown each batch, so timed writes flush no batch, do no file I/O and no WAL allocation.
+The benchmark fails a run in which a timed operation loaded, evicted, checkpointed or flushed a chunk, or a read returned another value than the last one written to its block.
+Runs alternate which side goes first; the result is the median, minimum and maximum over 15 runs, and the same of the per-run difference between many chunks and one chunk.
+In the store that difference also includes reaching the chunk's object and arrays outside the CPU caches, and for writes appending to 16,384 WAL batches instead of one, so the lookups timed alone give the share of the maps.
+The numbers hold for `ChunkCoordHash` as of the measured commit.
+Measured on an AMD Ryzen 5 4600H (Linux 7.0, ext4, GCC 15.2 Release) at b2f1d2b, 15 runs, output in `bench/artifacts/manual-runs/chunk-map-20261108-linux.txt`: a read takes 564.6 ns across many chunks and 140.1 ns in one chunk, a write 2450.7 ns and 1822.4 ns, and the two lookups alone 269.1 ns and 48.8 ns (medians).
+So the two maps account for about 220 ns of the 423 ns a read gains across many chunks, and of the 630 ns a write gains; the rest is reaching the chunk and its arrays outside the CPU caches and, for writes, the WAL batches.
 
 ## Schema evolution
 

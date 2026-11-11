@@ -100,6 +100,12 @@ bool IdleIo::ReserveReply(ServerConnection& connection, std::size_t bytes, bool 
     return true;
 }
 
+void IdleIo::RestartPieceDeadline(ServerConnection& connection) {
+    connection.input_deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
+    connection.record_deadline = false;
+}
+
 bool IdleIo::RejectProtocol(ServerConnection& connection, const std::exception& error) {
     if (connection.phase == ServerConnection::Phase::kProxy) {
         server_.engine_->metrics()->CountConnectionRejected();
@@ -276,6 +282,10 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
     if (connection.request_line.empty()) {
         connection.pending.enforce_partial_line_limit(server_.config_.max_line_bytes);
         if (!connection.pending.extract_line(&connection.request_line, server_.config_.max_line_bytes)) return true;
+        // After authentication the line had its own deadline; the frames
+        // that follow it start another. Before it, the HELLO deadline bounds
+        // the whole exchange.
+        if (connection.session.greeted) RestartPieceDeadline(connection);
         connection.payload = server_.engine_->PlanPayload(connection.session, connection.request_line);
         connection.control_request = !connection.session.greeted || ControlRequest(connection.request_line);
         if (!connection.control_request) {
@@ -339,7 +349,12 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
         }
     }
     if (connection.frames) {
-        if (!connection.frames->Consume(connection.pending, server_.config_.max_line_bytes)) return true;
+        const auto pieces = connection.frames->pieces();
+        const bool complete = connection.frames->Consume(connection.pending, server_.config_.max_line_bytes);
+        // After authentication each frame header and each frame body (from
+        // the end of its header) has the I/O timeout of its own.
+        if (connection.session.greeted && connection.frames->pieces() != pieces) RestartPieceDeadline(connection);
+        if (!complete) return true;
         if (connection.frames->total_exceeded()) {
             connection.session.close_after_reply = true;
             const auto total_limit = discard ? server_.config_.max_unparsed_parameter_bytes : plan.parameter_bytes_limit;
@@ -601,6 +616,9 @@ bool IdleIo::Progress(ServerConnection& connection) {
         }
         connection.proxy_header.clear();
         connection.phase = Phase::kTls;
+        // The TLS handshake has an interval of its own after the PROXY header.
+        connection.handshake_deadline = std::chrono::steady_clock::now() +
+            std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
     }
     if (connection.phase == Phase::kTls) {
         connection.session.remote_address = connection.peer_address;
@@ -621,6 +639,8 @@ bool IdleIo::Progress(ServerConnection& connection) {
                 connection.io_wait = error == SSL_ERROR_WANT_READ ? POLLIN : POLLOUT;
                 return true;
             }
+            // A bound login is checked against this connection's own session.
+            connection.session.channel_bindings = TlsChannelBindings(connection.tls);
         }
 #endif
         connection.phase = Phase::kInput;
@@ -697,6 +717,12 @@ void IdleIo::Run() {
                         alive = false;
                     } else if (connection->phase == Phase::kReply) alive = false;
                     else {
+                        // A slow client, not a malformed request: told why, then closed.
+                        LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
+                            {"phase", "handshake"}, {"reason", "timeout"},
+                            {"error", "HELLO 3 was not completed within the I/O timeout"},
+                            {"socket", std::to_string(connection->socket)}, {"peer", connection->peer_endpoint},
+                        });
                         connection->session.close_after_reply = true;
                         Reply(*connection, Protocol::Error("PROTOCOL", "HELLO 3 was not completed within the I/O timeout"));
                     }
@@ -710,7 +736,15 @@ void IdleIo::Run() {
                             connection->request_line.empty() ? "request line deadline exceeded" : "payload deadline exceeded"},
                         {"socket", std::to_string(connection->socket)}, {"peer", connection->peer_endpoint},
                     });
-                    alive = false;
+                    // A frame that stops arriving is told before the close;
+                    // a stalled line or reply is closed without one.
+                    if (connection->phase == Phase::kInput && !connection->output_deadline && connection->frames &&
+                        !connection->waiting_credit) {
+                        connection->frames.reset();
+                        connection->input_deadline.reset();
+                        connection->session.close_after_reply = true;
+                        Reply(*connection, Protocol::Error("PROTOCOL", "incomplete parameter frame"));
+                    } else alive = false;
                 }
                 if (!alive) {
                     connection->waiting_credit = false;

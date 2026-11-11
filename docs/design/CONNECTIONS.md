@@ -89,7 +89,7 @@ Kill, cancel and feature activation emit audit events without statement paramete
 `ALTER USER u LIMIT max_connections = n, statements_per_sec = n` accepts either key once and rejects unknown, duplicate or invalid keys before publication.
 Zero disables a limit and the maximum accepted rate is 65536 statements per second.
 Each user incarnation owns its authenticated connection count and rate history under a separate lock.
-Authentication rechecks the same live incarnation and verifier generation before taking one connection ticket.
+Authentication rechecks the same live incarnation and verifier generation before taking one connection ticket; a verifier or channel binding requirement change advances that generation.
 Every ticket is released exactly once, including failed final HELLO output and user deletion.
 Lowering a connection limit preserves existing connections and refuses new admissions until below the limit.
 A rolling one-second rate window retains unexpired admissions when a limit is lowered.

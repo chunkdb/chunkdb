@@ -75,7 +75,7 @@ struct Server {
     std::shared_ptr<chunkdb::UserRegistry> users;
     std::unique_ptr<CommandEngine> engine;
 
-    explicit Server(bool require_auth = true) {
+    explicit Server(bool require_auth = true, bool require_channel_binding = false) {
         chunkdb::CatalogConfig config;
         config.data_dir = dir.path();
         catalog = std::make_shared<chunkdb::TableCatalog>(config);
@@ -89,7 +89,13 @@ struct Server {
                 std::array<std::uint8_t, 32>{7});
         }
         engine = std::make_unique<CommandEngine>(
-            chunkdb::EngineConfig{.require_auth = require_auth, .users = users, .max_auth_failures = 5}, catalog);
+            chunkdb::EngineConfig{
+                .require_auth = require_auth,
+                .users = users,
+                .max_auth_failures = 5,
+                .require_channel_binding = require_channel_binding,
+            },
+            catalog);
     }
 
     std::string Run(SessionState& session, const std::string& line, const Parameters& parameters = {}) {
@@ -97,15 +103,21 @@ struct Server {
     }
 
     // HELLO 3 USER and AUTH; the final reply, after checking the server's
-    // signature when the login succeeds.
-    std::string Login(SessionState& session, const std::string& user, const std::string& password) {
-        const auto login = chunkdb::scram::StartClientLogin(user, chunkdb::scram::NewNonce());
+    // signature when the login succeeds. With a `binding_type` the login is
+    // bound to `binding_data`, what the client sees of its connection.
+    std::string Login(
+        SessionState& session,
+        const std::string& user,
+        const std::string& password,
+        std::string_view binding_type = {},
+        std::span<const std::uint8_t> binding_data = {}) {
+        const auto login = chunkdb::scram::StartClientLogin(user, chunkdb::scram::NewNonce(), binding_type);
         const std::string first = Run(session, "HELLO 3 USER " + user + " $1", Parameters{login.first});
         if (first.rfind("+SCRAM ", 0) != 0) {
             return first;
         }
         const std::string server_first = first.substr(7, first.size() - 9);
-        const auto final_message = chunkdb::scram::FinishClientLogin(login, password, server_first);
+        const auto final_message = chunkdb::scram::FinishClientLogin(login, password, server_first, binding_data);
         const std::string reply = Run(session, "AUTH $1", Parameters{final_message.message});
         if (reply.rfind("%14\r\n", 0) == 0) {
             assert(Contains(
@@ -142,8 +154,8 @@ void TestLogin() {
     SessionState early;
     ExpectError(server.Run(early, "AUTH $1", Parameters{std::string("c=biws,r=x,p=AAAA")}), "PROTOCOL AUTH follows HELLO 3 USER");
     assert(early.close_after_reply);
-    SessionState binding;
-    ExpectError(server.Run(binding, "HELLO 3 USER admin $1", Parameters{std::string("y,,n=admin,r=abc")}), "INVALID_ARGUMENT");
+    SessionState authzid;
+    ExpectError(server.Run(authzid, "HELLO 3 USER admin $1", Parameters{std::string("n,a=bot,n=admin,r=abc")}), "INVALID_ARGUMENT");
     SessionState other_name;
     ExpectError(
         server.Run(other_name, "HELLO 3 USER admin $1", Parameters{std::string("n,,n=bot,r=abc")}),
@@ -295,11 +307,61 @@ void TestRights() {
     assert(users.rfind("*2\r\n", 0) == 0 && Contains(users, "$5\r\nadmin\r\n") && Contains(users, "$1\r\n*\r\n$4\r\nREAD\r\n"));
     ExpectError(server.Run(admin, "ALTER USER admin NO MANAGES USERS"), "the last user who manages users");
 
-    // A dropped user keeps no right in a session still open.
+    // A session whose user was dropped has no user any more and closes.
     ExpectReply(server.Run(admin, "DROP USER bot"), "+OK\r\n");
-    ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM world"), "AUTH_REQUIRED reason=user_incarnation");
+    ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM world"), "AUTH_REQUIRED reason=user_dropped");
+    assert(bot.close_after_reply);
     SessionState gone;
     ExpectError(server.Login(gone, "bot", "new"), "AUTH_FAILED");
+}
+
+void TestRecreatedUser() {
+    Server server;
+    auto admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("old")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE USER other VERIFIER $1", Parameters{VerifierText("other")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON default TO bot"), "+OK\r\n");
+    auto statement = server.LoggedIn("bot", "old");
+    auto alter = server.LoggedIn("bot", "old");
+    auto frames = server.LoggedIn("bot", "old");
+    auto hello = server.LoggedIn("bot", "old");
+    auto hello_frames = server.LoggedIn("bot", "old");
+    auto bystander = server.LoggedIn("other", "other");
+    ExpectReply(server.Run(statement, "GET BLOCK 0 0 FROM default"), "_\r\n");
+
+    // Another user under the same name, with more rights: the old sessions
+    // get none of them.
+    ExpectReply(server.Run(admin, "DROP USER bot"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("new")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT ADMIN ON * TO bot"), "+OK\r\n");
+    ExpectError(server.Run(statement, "GET BLOCK 0 0 FROM default"), "AUTH_REQUIRED reason=user_dropped");
+    assert(statement.close_after_reply);
+    const auto verifier = server.users->Find("bot")->verifier;
+    ExpectError(server.Run(alter, "ALTER USER bot VERIFIER $1", Parameters{VerifierText("taken")}),
+                "AUTH_REQUIRED reason=user_dropped");
+    assert(alter.close_after_reply && server.users->Find("bot")->verifier == verifier);
+    const auto plan = server.engine->PlanPayload(frames, "SET BLOCK 0 0 IN default bits = $1\r\n");
+    assert(plan.plan == CommandEngine::PayloadPlan::kDiscard && frames.close_after_reply);
+    ExpectError(plan.reject_response, "AUTH_REQUIRED reason=user_dropped");
+    ExpectError(server.Run(hello, "HELLO 3"), "AUTH_REQUIRED reason=user_dropped");
+    assert(hello.close_after_reply);
+    const std::string hello_line = "HELLO 3 USER bot $1\r\n";
+    const auto hello_plan = server.engine->PlanPayload(hello_frames, hello_line);
+    assert(hello_plan.plan == CommandEngine::PayloadPlan::kDiscard);
+    ExpectError(server.engine->RejectPayload(hello_frames, hello_line, hello_plan.reject_response),
+                "AUTH_REQUIRED reason=user_dropped");
+    assert(hello_frames.close_after_reply);
+
+    // The new user logs in with its own password; others are unaffected by
+    // changes to users they are not.
+    auto current = server.LoggedIn("bot", "new");
+    ExpectReply(server.Run(current, "GET BLOCK 0 0 FROM default"), "_\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON default TO other"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "REVOKE WRITE ON default FROM bot"), "+OK\r\n");
+    ExpectReply(server.Run(bystander, "GET BLOCK 0 0 FROM default"), "_\r\n");
+    ExpectReply(server.Run(current, "ALTER USER bot VERIFIER $1", Parameters{VerifierText("newer")}), "+OK\r\n");
+    assert(!bystander.close_after_reply && !current.close_after_reply && !admin.close_after_reply);
+    (void)server.LoggedIn("bot", "newer");
 }
 
 void TestAtomicRightsLists() {
@@ -382,6 +444,132 @@ void TestConcurrentConditionalUsers() {
     assert(server.users->Generation() == generation + 1U && server.users->Snapshot().users.size() == 2U);
     const auto verifier = server.users->Find("bot")->verifier;
     assert(verifier == chunkdb::scram::ParseVerifier(verifiers[0]) || verifier == chunkdb::scram::ParseVerifier(verifiers[1]));
+}
+
+constexpr const char* kWrongLogin =
+    "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n";
+
+// A session as the server fills it after a TLS handshake; `exporter` empty
+// stands for TLS 1.2.
+SessionState TlsSession(std::vector<std::uint8_t> exporter, std::vector<std::uint8_t> end_point) {
+    SessionState session;
+    session.channel_bindings = chunkdb::ChannelBindings{
+        .tls = true, .tls_exporter = std::move(exporter), .tls_server_end_point = std::move(end_point)};
+    return session;
+}
+
+// Logins bound to their TLS connection (docs/PROTOCOL.md): both binding
+// types, a login made on another connection, and what a connection cannot
+// give.
+void TestChannelBinding() {
+    Server server;
+    const std::vector<std::uint8_t> exporter(32, 0x31);
+    const std::vector<std::uint8_t> end_point(32, 0x32);
+    const std::vector<std::uint8_t> relay(32, 0x33);
+
+    for (const auto& [type, data] :
+         {std::pair{chunkdb::scram::kTlsExporter, exporter}, std::pair{chunkdb::scram::kTlsServerEndPoint, end_point}}) {
+        SessionState bound = TlsSession(exporter, end_point);
+        const std::string reply = server.Login(bound, "admin", "secret", type, data);
+        assert(reply.rfind("%14\r\n", 0) == 0 && bound.greeted && bound.user == "admin");
+        assert(Contains(reply, "$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n"));
+
+        // The right password, bound to the connection of whoever relays it.
+        SessionState relayed = TlsSession(exporter, end_point);
+        ExpectError(
+            server.Login(relayed, "admin", "secret", type, relay),
+            "AUTH_FAILED reason=channel_binding the login is bound to another TLS connection");
+        assert(!relayed.greeted && relayed.failed_auth_attempts == 1U);
+        // An unknown user gets the same answer: it tells nothing about users.
+        SessionState ghost = TlsSession(exporter, end_point);
+        ExpectError(server.Login(ghost, "ghost", "secret", type, relay), "AUTH_FAILED reason=channel_binding");
+        SessionState bound_ghost = TlsSession(exporter, end_point);
+        ExpectReply(server.Login(bound_ghost, "ghost", "secret", type, data), kWrongLogin);
+        SessionState wrong = TlsSession(exporter, end_point);
+        ExpectReply(server.Login(wrong, "admin", "Secret", type, data), kWrongLogin);
+    }
+
+    // A login that is not bound stays possible unless something requires it.
+    SessionState unbound = TlsSession(exporter, end_point);
+    assert(server.Login(unbound, "admin", "secret").rfind("%14\r\n", 0) == 0);
+
+    // A client that could bind but was told the server cannot: refused on
+    // TLS, where this server can, and an ordinary login without TLS.
+    SessionState downgraded = TlsSession(exporter, end_point);
+    ExpectError(
+        server.Run(downgraded, "HELLO 3 USER admin $1", Parameters{std::string("y,,n=admin,r=abc")}),
+        "INVALID_ARGUMENT this server binds logins to TLS connections");
+    SessionState plain_unused;
+    assert(server.Run(plain_unused, "HELLO 3 USER admin $1", Parameters{std::string("y,,n=admin,r=abc")}).starts_with("+SCRAM "));
+
+    // What a connection cannot give.
+    SessionState plain;
+    ExpectError(
+        server.Login(plain, "admin", "secret", chunkdb::scram::kTlsExporter, exporter),
+        "INVALID_ARGUMENT channel binding needs a TLS connection that ends at this server");
+    SessionState tls12 = TlsSession({}, end_point);
+    ExpectError(
+        server.Login(tls12, "admin", "secret", chunkdb::scram::kTlsExporter, exporter),
+        "INVALID_ARGUMENT tls-exporter channel binding needs TLS 1.3");
+    assert(server.Login(tls12, "admin", "secret", chunkdb::scram::kTlsServerEndPoint, end_point).rfind("%14\r\n", 0) == 0);
+    SessionState no_hash = TlsSession(exporter, {});
+    ExpectError(
+        server.Login(no_hash, "admin", "secret", chunkdb::scram::kTlsServerEndPoint, end_point),
+        "INVALID_ARGUMENT tls-server-end-point channel binding is not defined");
+    SessionState unknown = TlsSession(exporter, end_point);
+    ExpectError(
+        server.Login(unknown, "admin", "secret", "tls-unique", exporter),
+        "INVALID_ARGUMENT unknown channel binding type");
+    assert(unknown.failed_auth_attempts == 1U && !unknown.close_after_reply);
+}
+
+// A server, and a user, that take only bound logins.
+void TestRequiredChannelBinding() {
+    const std::vector<std::uint8_t> exporter(32, 0x31);
+    const std::vector<std::uint8_t> end_point(32, 0x32);
+    {
+        Server strict(true, true);
+        SessionState unbound = TlsSession(exporter, end_point);
+        ExpectError(
+            strict.Login(unbound, "admin", "secret"),
+            "AUTH_REQUIRED reason=channel_binding this server takes only logins bound to their TLS connection");
+        // Before the user is looked up: the same for a user that does not exist.
+        SessionState ghost = TlsSession(exporter, end_point);
+        ExpectError(strict.Login(ghost, "ghost", "secret"), "AUTH_REQUIRED reason=channel_binding");
+        SessionState plain;
+        ExpectError(strict.Login(plain, "admin", "secret"), "AUTH_REQUIRED reason=channel_binding");
+        SessionState bound = TlsSession(exporter, end_point);
+        assert(strict.Login(bound, "admin", "secret", chunkdb::scram::kTlsExporter, exporter).rfind("%14\r\n", 0) == 0);
+    }
+
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    ExpectReply(
+        server.Run(admin, "CREATE USER bot VERIFIER $1 REQUIRE CHANNEL BINDING", Parameters{VerifierText("hunter2")}),
+        "+OK\r\n");
+    assert(server.users->Find("bot")->requires_channel_binding && !server.users->Find("admin")->requires_channel_binding);
+    assert(Contains(
+        server.Run(admin, "SHOW USERS"),
+        "$3\r\nbot\r\n$13\r\nmanages_users\r\n#f\r\n$24\r\nrequires_channel_binding\r\n#t\r\n"));
+
+    // An unbound login of that user fails like a wrong password, so the
+    // reply does not tell that the user exists.
+    SessionState unbound = TlsSession(exporter, end_point);
+    ExpectReply(server.Login(unbound, "bot", "hunter2"), kWrongLogin);
+    SessionState plain;
+    ExpectReply(server.Login(plain, "bot", "hunter2"), kWrongLogin);
+    assert(!unbound.greeted && !plain.greeted);
+    SessionState bound = TlsSession(exporter, end_point);
+    assert(server.Login(bound, "bot", "hunter2", chunkdb::scram::kTlsServerEndPoint, end_point).rfind("%14\r\n", 0) == 0);
+
+    ExpectError(server.Run(bound, "ALTER USER bot NO REQUIRE CHANNEL BINDING"), "PERMISSION_DENIED MANAGES USERS");
+    ExpectReply(server.Run(admin, "ALTER USER bot NO REQUIRE CHANNEL BINDING"), "+OK\r\n");
+    SessionState relaxed;
+    assert(server.Login(relaxed, "bot", "hunter2").rfind("%14\r\n", 0) == 0);
+    ExpectReply(server.Run(admin, "ALTER USER bot REQUIRE CHANNEL BINDING"), "+OK\r\n");
+    SessionState again;
+    ExpectReply(server.Login(again, "bot", "hunter2"), kWrongLogin);
+    ExpectError(server.Run(admin, "ALTER USER ghost REQUIRE CHANNEL BINDING"), "INVALID_ARGUMENT");
 }
 
 // --auth none: no users, every right.
@@ -475,6 +663,50 @@ void TestReadOnly() {
 #endif
 }
 
+std::string VerifierWithSalt(const std::string& password, std::size_t salt_bytes) {
+    return chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier(
+        password, std::vector<std::uint8_t>(salt_bytes, 0x5a), chunkdb::scram::kMinIterations));
+}
+
+// A verifier salt must fit the users file field in both ALTER USER forms, and
+// a grant names a table the file reads back: refused statements leave the
+// file as it was, and the server reopens it.
+void TestVerifierAndGrantBounds() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("hunter2")}), "+OK\r\n");
+    SessionState bot = server.LoggedIn("bot", "hunter2");
+    const auto users_path = server.dir.path() / chunkdb::kUsersFileName;
+    const auto before = chunkdb::LoadFile(users_path);
+
+    const std::string long_salt = VerifierWithSalt("new", chunkdb::scram::kMaxSaltBytes + 1U);
+    ExpectError(server.Run(bot, "ALTER USER bot VERIFIER $1", Parameters{long_salt}),
+                "INVALID_ARGUMENT a verifier's salt must be 16 to 256 bytes");
+    ExpectError(server.Run(bot, "ALTER USER bot VERIFIER '" + long_salt + "'"),
+                "INVALID_ARGUMENT a verifier's salt must be 16 to 256 bytes");
+    ExpectError(server.Run(admin, "CREATE USER eve VERIFIER '" + long_salt + "'"),
+                "INVALID_ARGUMENT a verifier's salt must be 16 to 256 bytes");
+    const std::string oversized = "SCRAM-SHA-256$4096:" + std::string(600, 'A') + "$x:y";
+    ExpectError(server.Run(bot, "ALTER USER bot VERIFIER '" + oversized + "'"),
+                "INVALID_ARGUMENT a verifier has at most 512 bytes");
+    ExpectError(server.Run(admin, "GRANT READ ON con TO bot"), "INVALID_ARGUMENT invalid table name 'con'");
+    ExpectError(server.Run(admin, "GRANT READ ON _hidden TO bot"), "INVALID_ARGUMENT invalid table name '_hidden'");
+    ExpectError(server.Run(admin, "GRANT READ ON " + std::string(65, 'a') + " TO bot"), "INVALID_ARGUMENT invalid table name");
+    assert(chunkdb::LoadFile(users_path) == before);
+
+    // The longest salt is kept in both forms and survives a reopen.
+    ExpectReply(server.Run(bot, "ALTER USER bot VERIFIER '" + VerifierWithSalt("literal", chunkdb::scram::kMaxSaltBytes) + "'"),
+                "+OK\r\n");
+    (void)server.LoggedIn("bot", "literal");
+    ExpectReply(server.Run(bot, "ALTER USER bot VERIFIER $1",
+                           Parameters{VerifierWithSalt("longest", chunkdb::scram::kMaxSaltBytes)}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON not_yet_created TO bot"), "+OK\r\n");
+    const auto reopened = chunkdb::ReadUsersFile(server.dir.path());
+    assert(reopened.has_value() && reopened->users.at("bot").verifier.salt.size() == chunkdb::scram::kMaxSaltBytes);
+    assert(reopened->users.at("bot").grants.at("not_yet_created") == chunkdb::Right::kRead);
+    (void)server.LoggedIn("bot", "longest");
+}
+
 }  // namespace
 
 void TestSessionControls() {
@@ -551,11 +783,13 @@ void TestSessionControls() {
     ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), ten);
     --callbacks->max_response_bytes;
     ExpectError(server.Run(admin, "SHOW CONNECTIONS"), "OUT_OF_RANGE reason=response_limit");
-    // Control access must stop matching a retired user, even after name reuse.
+    // Control access must stop matching a retired user, even after name reuse:
+    // the session of the dropped user controls nothing and closes.
     server.users->Drop("bot");
     server.users->Create("bot", chunkdb::scram::ParseVerifier(VerifierText("secret")), false);
-    ExpectReply(server.Run(bot, "CANCEL 71"), not_cancelled);
-    assert(!seen.admin_all && seen.user_incarnation == 0U);
+    const auto before_retired = calls;
+    ExpectError(server.Run(bot, "CANCEL 71"), "AUTH_REQUIRED reason=user_dropped");
+    assert(bot.close_after_reply && calls == before_retired);
     Server plain(false);
     SessionState anonymous;
     ExpectReply(plain.Run(anonymous, "HELLO 3").substr(0U, 1U), "%");
@@ -572,12 +806,16 @@ int main(int argc, char** argv) {
     if (argc != 1) return 2;
     TestAtomicRightsLists();
     TestSessionControls();
+    TestVerifierAndGrantBounds();
     TestLogin();
     TestStaleAuthenticationProofs();
     TestUserLimitStatementsAndAdmissionHook();
     TestRights();
+    TestRecreatedUser();
     TestConditionalUsers();
     TestConcurrentConditionalUsers();
+    TestChannelBinding();
+    TestRequiredChannelBinding();
     TestWithoutUsers();
     TestReadOnly();
     return 0;

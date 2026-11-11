@@ -18,6 +18,7 @@ void ParameterFrameDecoder::FinishFrame() {
     }
     value_.clear();
     ++frame_;
+    ++pieces_;
     phase_ = Phase::kHeader;
 }
 
@@ -30,6 +31,7 @@ bool ParameterFrameDecoder::Consume(PendingLineBuffer& pending, std::size_t max_
                 return false;
             }
             const auto length = Protocol::ParseFrameHeader(header);
+            ++pieces_;
             if (!length) {
                 if (!rules_.discard) parameters_.emplace_back(std::nullopt);
                 ++frame_;
