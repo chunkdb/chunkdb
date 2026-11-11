@@ -503,8 +503,9 @@ ChunkMutationResult ChunkStore::WriteChunkState(const ChunkCoord& chunk_coord, C
     RequireVarWrite(regular_chunk->vars, var_update,
         state.chunk_columns ? state.chunk_columns->variable_bytes : 0U,
         regular_chunk->written && regular_chunk->chunk_columns ? regular_chunk->chunk_columns->variable_bytes : 0U);
-    if (expected_version.has_value() || if_absent || geometry_.has_chunk_column_history() || !regular_chunk->written) {
-        // As CHUNKPUT IF: the conditional write path (docs/DURABILITY_CONTRACT.md).
+    if (expected_version.has_value() || if_absent) {
+        // As CHUNKPUT IF: the conditional write path (docs/design/PERSISTENCE.md).
+        // Every other write, a first write included, is an ordinary one.
         (void)ApplyFullChunkStateLocked(
             chunk_coord,
             regular_chunk,
@@ -518,7 +519,7 @@ ChunkMutationResult ChunkStore::WriteChunkState(const ChunkCoord& chunk_coord, C
         regular_chunk,
         std::move(state.payload),
         std::move(state.presence_bitmap),
-        std::move(var_update));
+        std::move(var_update), std::move(state.chunk_columns), /*force_write=*/true);
     return ChunkMutationResult{.ok = true, .version = version};
 }
 

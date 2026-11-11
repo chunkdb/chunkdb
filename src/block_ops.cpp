@@ -1288,11 +1288,23 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
     const std::shared_ptr<RegularChunk>& regular_chunk,
     std::vector<std::uint8_t> payload,
     std::vector<std::uint8_t> presence_bitmap,
-    VarUpdate var_update) {
+    VarUpdate var_update,
+    std::shared_ptr<const ChunkColumnState> chunk_columns, bool force_write) {
     const bool payload_changed = payload != regular_chunk->payload;
     const bool presence_changed = presence_bitmap != regular_chunk->presence_bitmap;
-    if (!payload_changed && !presence_changed && var_update.empty()) {
+    const bool supplied_chunk_columns = chunk_columns != nullptr;
+    const bool metadata_changed = supplied_chunk_columns &&
+        (!regular_chunk->chunk_columns || chunk_columns->bytes != regular_chunk->chunk_columns->bytes);
+    // A never-written chunk's first write commits even an unchanged state
+    // and logs the whole state, as the conditional path does: a frame needs
+    // a record.
+    const bool first_write = force_write && !regular_chunk->written;
+    if (!payload_changed && !presence_changed && var_update.empty() && !metadata_changed && !first_write) {
         return regular_chunk->version;
+    }
+    if (supplied_chunk_columns) {
+        RequireVarWrite(regular_chunk->vars, var_update, chunk_columns->variable_bytes,
+            regular_chunk->written && regular_chunk->chunk_columns ? regular_chunk->chunk_columns->variable_bytes : 0U);
     }
 
     // Reserve the version token before the chunk changes, so a version-clock
@@ -1303,11 +1315,15 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
         regular_chunk->chunk_columns.get(), regular_chunk->written);
     const std::uint64_t reserved_version = NextChunkVersion();
     feed.Version(reserved_version);
+    // Refuses a first write without its REQUIRED chunk columns before the
+    // chunk changes.
     TxnKeep keep = PrepareTxnKeepLocked(chunk_coord, *regular_chunk, reserved_version,
-        /*supplies_chunk_columns=*/false, /*whole_chunk=*/true);
+        supplied_chunk_columns, /*whole_chunk=*/true);
 
     auto previous_payload = std::exchange(regular_chunk->payload, std::move(payload));
     auto previous_presence = std::exchange(regular_chunk->presence_bitmap, std::move(presence_bitmap));
+    auto previous_chunk_columns = metadata_changed
+        ? std::exchange(regular_chunk->chunk_columns, std::move(chunk_columns)) : regular_chunk->chunk_columns;
 
     // Snapshot every component needed for a full rollback, mirroring the
     // conditional path.
@@ -1324,21 +1340,25 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
         // A full-chunk replace can span several records; the frame makes the
         // whole replace atomic across crash recovery.
         WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
+        const bool log_payload = payload_changed || first_write;
+        const bool log_presence = presence_changed || first_write;
         // Sized once, so a large state is not copied again as the batch grows.
         frame.Reserve(
-            (payload_changed ? WalFrameBuilder::SpanRecordBytes(regular_chunk->payload.size()) : 0U) +
-            (presence_changed ? WalFrameBuilder::SpanRecordBytes(regular_chunk->presence_bitmap.size()) : 0U) +
-            WalFrameBuilder::VarUpdateRecordBytes(regular_chunk->vars, var_undo));
-        if (payload_changed) {
+            (log_payload ? WalFrameBuilder::SpanRecordBytes(regular_chunk->payload.size()) : 0U) +
+            (log_presence ? WalFrameBuilder::SpanRecordBytes(regular_chunk->presence_bitmap.size()) : 0U) +
+            WalFrameBuilder::VarUpdateRecordBytes(regular_chunk->vars, var_undo) +
+            (metadata_changed ? WalFrameBuilder::ChunkColumnsRecordBytes(*regular_chunk->chunk_columns) : 0U));
+        if (log_payload) {
             frame.AppendSpan(0U, regular_chunk->payload.data(), regular_chunk->payload.size());
         }
-        if (presence_changed) {
+        if (log_presence) {
             frame.AppendSpan(
                 static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()),
                 regular_chunk->presence_bitmap.data(),
                 regular_chunk->presence_bitmap.size());
         }
         frame.AppendVarUpdate(regular_chunk->vars, var_undo);
+        if (metadata_changed) frame.AppendChunkColumns(*regular_chunk->chunk_columns);
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         feed.Capture(regular_chunk->wal_batch, appended_bytes);
 
@@ -1358,6 +1378,7 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
     } catch (...) {
         regular_chunk->payload = std::move(previous_payload);
         regular_chunk->presence_bitmap = std::move(previous_presence);
+        regular_chunk->chunk_columns = std::move(previous_chunk_columns);
         UndoVarUpdate(&regular_chunk->vars, std::move(var_undo));
         // The batch is only ever appended to within this op (a successful
         // flush clears it but then never reaches this catch), so truncating

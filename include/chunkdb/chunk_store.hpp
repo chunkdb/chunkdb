@@ -1340,13 +1340,18 @@ class ChunkStore {
         std::vector<std::uint8_t> payload,
         std::vector<std::uint8_t> presence_bitmap);
     // ApplyChunkState with the chunk's mutex held and the value changes
-    // given; returns the chunk version after it.
+    // given; returns the chunk version after it. Given chunk columns replace
+    // the chunk's, checked as ApplyFullChunkStateLocked checks them;
+    // force_write commits a never-written chunk even when the state equals
+    // the empty one it has. The ordinary write path of every unconditional
+    // whole-state SET CHUNK: no rollback boundary, no commit intent.
     std::uint64_t ApplyChunkStateLocked(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& regular_chunk,
         std::vector<std::uint8_t> payload,
         std::vector<std::uint8_t> presence_bitmap,
-        VarUpdate var_update);
+        VarUpdate var_update,
+        std::shared_ptr<const ChunkColumnState> chunk_columns = {}, bool force_write = false);
     // The value update of a full-chunk write leaving `presence`: removing the
     // values of blocks that become absent. Empty when nothing changes.
     [[nodiscard]] static VarUpdate VarUpdateForState(
@@ -1464,6 +1469,10 @@ class ChunkStore {
     void PoisonDurability(std::string reason) noexcept;
     void ThrowIfDurabilityPoisoned() const;
 
+    // The conditional write path (IF VERSION, IF ABSENT, CAS and chunk
+    // transformations): a durable rollback boundary before the change and a
+    // durable commit decision in every durability mode
+    // (docs/design/PERSISTENCE.md).
     [[nodiscard]] bool ApplyFullChunkStateLocked(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
