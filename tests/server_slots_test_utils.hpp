@@ -26,13 +26,16 @@
 #endif
 #ifdef CHUNKDB_WITH_OPENSSL
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
 #endif
 #include "chunkdb/server.hpp"
 #include "feed_test_utils.hpp"
 #include "feed_phase_watchdog.hpp"
 #include "login_helpers.hpp"
 #include "server_socket.hpp"
+#include "tls_test_utils.hpp"
 
 namespace chunkdb::slot_socket_test {
 using namespace std::chrono_literals;
@@ -109,7 +112,9 @@ inline bool Boolean(const Reply& reply) {
 // deadline over the entire reply, including TLS WANT_READ retries.
 class Client {
   public:
-    explicit Client(std::uint16_t port, bool tls = false) {
+    // `max_tls_version`: the highest TLS version offered, e.g. TLS1_2_VERSION;
+    // 0 offers every version the library supports.
+    explicit Client(std::uint16_t port, bool tls = false, [[maybe_unused]] int max_tls_version = 0) {
         InitializeSockets();
         peer_ = "127.0.0.1:" + std::to_string(port);
         socket_ = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -141,6 +146,7 @@ class Client {
             if (tls) {
                 context_ = SSL_CTX_new(TLS_client_method()); assert(context_);
                 SSL_CTX_set_verify(context_, SSL_VERIFY_NONE, nullptr);
+                if (max_tls_version != 0) assert(SSL_CTX_set_max_proto_version(context_, max_tls_version) == 1);
                 ssl_ = SSL_new(context_); assert(ssl_);
                 assert(SSL_set_fd(ssl_, static_cast<int>(socket_)) == 1);
                 const auto deadline = Clock::now() + 10s;
@@ -166,6 +172,38 @@ class Client {
         if (socket_ != kInvalid) { CloseSocket(socket_); socket_ = kInvalid; }
     }
 #ifdef CHUNKDB_WITH_OPENSSL
+    [[nodiscard]] int TlsVersion() const { return SSL_version(ssl_); }
+    // What this side of the TLS connection gives a login to bind to
+    // (RFC 9266, RFC 5929); empty when `type` is not defined for it.
+    [[nodiscard]] std::vector<std::uint8_t> ChannelBinding(std::string_view type) const {
+        if (type == scram::kTlsExporter) {
+            constexpr std::string_view kLabel = "EXPORTER-Channel-Binding";
+            std::vector<std::uint8_t> exporter(32);
+            const unsigned char no_context = 0;
+            if (SSL_version(ssl_) != TLS1_3_VERSION ||
+                SSL_export_keying_material(ssl_, exporter.data(), exporter.size(), kLabel.data(), kLabel.size(),
+                                           &no_context, 0, 1) != 1) return {};
+            return exporter;
+        }
+        assert(type == scram::kTlsServerEndPoint);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        auto* certificate = SSL_get1_peer_certificate(ssl_);
+#else
+        auto* certificate = SSL_get_peer_certificate(ssl_);
+#endif
+        assert(certificate != nullptr);
+        std::vector<std::uint8_t> hash;
+        int digest_nid = NID_undef;
+        if (X509_get_signature_info(certificate, &digest_nid, nullptr, nullptr, nullptr) == 1 && digest_nid != NID_undef) {
+            if (digest_nid == NID_md5 || digest_nid == NID_sha1) digest_nid = NID_sha256;
+            unsigned int size = 0;
+            hash.resize(EVP_MAX_MD_SIZE);
+            assert(X509_digest(certificate, EVP_get_digestbynid(digest_nid), hash.data(), &size) == 1);
+            hash.resize(size);
+        }
+        X509_free(certificate);
+        return hash;
+    }
     // Send the TLS closure alert while leaving the TCP connection open.
     void CloseTlsWrite() {
         assert(ssl_);
@@ -235,6 +273,22 @@ class Client {
     }
     void Hello() { const auto reply = Command("HELLO 3"); assert(reply.type == '%' && reply.items.size() >= 16U && reply.items.size() % 2U == 0U);
         assert(Field(reply, "protocol").type == ':' && Field(reply, "protocol").value == "3"); }
+    // HELLO 3 USER and AUTH, bound to `binding_data` when `binding_type` names
+    // a type: the reply that ends the login, the HELLO map or the error.
+    Reply LoginReply(std::string_view user, std::string_view password, std::string_view binding_type = {},
+                     std::span<const std::uint8_t> binding_data = {}) {
+        const auto login = scram::StartClientLogin(user, scram::NewNonce(), binding_type);
+        last_request_ = "HELLO USER " + std::string(user);
+        Send(test::HelloUserBytes(login, user));
+        const auto first = Read();
+        if (first.type != '+') return first;
+        const auto auth = test::AuthBytes(login, password, "+" + first.value, binding_data);
+        last_request_ = "AUTH";
+        Send(auth.bytes);
+        auto reply = Read();
+        if (reply.type == '%') assert(Field(reply, "server_signature").value == auth.server_signature);
+        return reply;
+    }
     void Login(std::string_view user = "admin", std::string_view password = "secret") {
         test::FeedPhaseWatchdog::Phase("client: HELLO USER");
         const auto login = scram::StartClientLogin(user, scram::NewNonce());
@@ -346,59 +400,6 @@ class Client {
     }
 };
 
-#ifdef CHUNKDB_WITH_OPENSSL
-constexpr std::string_view kTestTlsCertPem = R"(-----BEGIN CERTIFICATE-----
-MIICpDCCAYwCCQC4nvQC5V39WjANBgkqhkiG9w0BAQsFADAUMRIwEAYDVQQDDAkx
-MjcuMC4wLjEwHhcNMjYwMzMxMTUyNjE5WhcNMjYwNDAxMTUyNjE5WjAUMRIwEAYD
-VQQDDAkxMjcuMC4wLjEwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCY
-dAxbMYkq16iK3hDquOYqJj4zIZoCY1Zeq10DpfHB053UR1ywWyN35KG4a1XfXOVM
-W47D0CACyks0GT7ix8KM4xGMSx2b/EQ8mQrztnt3YZKuHwnDH45oiiQ+/9WW7NAY
-jPgIsCxn/P+E4M43yqvHqK4XGLLm984xFnu4n270bsqi/IHbSlWYt3B8q7rHTYmD
-BmwsXnFbxvJcmH0CQkgbU1F11g4fmVSd8Qt+R2NTSSjbGvBpupjYbhERXQQVsjP4
-sEERqPT8ocZD1MoINMKTtCmxHbez7qO9o8gAY1aVZSsslowR5WCb+d1jjsRFqk6w
-JqumPbmPFiexe73uD4CVAgMBAAEwDQYJKoZIhvcNAQELBQADggEBAIozzwqPOe6o
-Et2j696F4akvfWh9v273hkrXixrUO4Qt27nrRBrsQPn0WnrPnxsy5BCYoSBVShie
-Cj9WFl3cPinYLwiB+1MpJBUA1eTRU+m4MYsGwBnSceol966GIQ19bzBIokijKa9/
-92zdONdV7mIPc01fExygVNcGWD4+DBzf0fXw0HPJsku0rQQ1Ldp34hQ2UzmaBAJC
-BdHGFsYCRMkPinjPuNmbH3PF2y5G+0ftTFmomaHPbSmvB+I+z8mS5eH7pCbw0Dsq
-oDkiwHOE6/0jR6tQkpJScCtEvp9rNadpENvXR54mqcds1Y6JTN4El04vQqecaBHG
-eIrrOOGWhb4=
------END CERTIFICATE-----
-)";
-
-constexpr std::string_view kTestTlsKeyPem = R"(-----BEGIN PRIVATE KEY-----
-MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCYdAxbMYkq16iK
-3hDquOYqJj4zIZoCY1Zeq10DpfHB053UR1ywWyN35KG4a1XfXOVMW47D0CACyks0
-GT7ix8KM4xGMSx2b/EQ8mQrztnt3YZKuHwnDH45oiiQ+/9WW7NAYjPgIsCxn/P+E
-4M43yqvHqK4XGLLm984xFnu4n270bsqi/IHbSlWYt3B8q7rHTYmDBmwsXnFbxvJc
-mH0CQkgbU1F11g4fmVSd8Qt+R2NTSSjbGvBpupjYbhERXQQVsjP4sEERqPT8ocZD
-1MoINMKTtCmxHbez7qO9o8gAY1aVZSsslowR5WCb+d1jjsRFqk6wJqumPbmPFiex
-e73uD4CVAgMBAAECggEABXWqd52XhvRAMfDv9Cf4/itucNBUPp+mGS/T3eyUcteM
-QGzp0dsBsyp57CvT4HLoN0rUGwkaDF+IP+5jhSWYPwlmuHp8LfjjzLPCY6X2V/kj
-kp7D77vykqXX1HW/BW+nqClsPItqm7LAx9ZxLChS7IyK54LX7VOUi8d9WMhE5fX/
-nzmIeuiLiZrH1sBsDhrs7l/46qPumQ9NLrQNpKnqpU1890SVX2610V/vWO8wAN+V
-Q/dzMf5nk/JBLXRokUQ+xch4XHmkuYIcIrgMOB5C3Osvznmusve4QsUOIFNtu5yB
-Tn8rUFRPDl19/5TiGz06Htcp1ARIixhuYolUNz9VAQKBgQDHjmWRQ+qchRmCwxn7
-f2VCZyuQMc039/0mKTIRogp7+GuY28NyK/5vSXvU2HP44x/93BMH2reW4Yf+sWYQ
-1c/t6bfiCcVx7kasx2VzbfmgFgiuTRJ+pnd7bMo6VLfOmKSztlKL37/qFMnZEYy5
-PUHkAWOlg/QFXJPnYKtbQnSYwQKBgQDDkv24lmO1ybz3e83eaz/4bsNEZ/yHRUIU
-2C/z+BlU5JvGeyT5GanP1TGd9NjgV44MLU9VzcYUy9UK4V+NFNHMi53ulHyF4CA8
-2F2Q1KSc2pjAQRYcg1SOP3jshk5D633wiRVyPAEZTdz4iDs7jtyK9izc/iv5azsU
-6D3sln5o1QKBgCRGPS43w0jqZOXBI1L1KGn2qROQCfbXjFvId0J/SxqX4K8rm46A
-csK1/92D7yjZ2HHj9E2kM2Uo3/irNJtw0lgz+OoMzqhUIOK9aDKgVhUEjFVqyybc
-ibGU5/nMdpEGbEICrWShqpgZaUudBhCSEw0oN33Zy5zB5FzV1LBFFz7BAoGADxpZ
-15hdiNtUaXQ5GLUFkqTTFYRGPxf9G2j6gwekxSaGVRSLbWUq9O7MzxrqaKC6Snxx
-RPoIEvEOubFf1KBH91jM0HDNEPWW57v5tcaGE8rZwvcDwx3tOLL0HqfcgWg9KIcd
-jd3OY+rcZqD2mgnVRDHwkvxZ3wAF5v5sUcnpZyUCgYAzwEjOUbkOprGgLKO3zxOe
-5NtYWAVuizJe1TqDmZovu4w7S50S5B+NHSGhRE2cqhF6QSm/sHziyQvS/RiPOf9r
-m0/zhisrKWr8NWNfqCHKLcD7AGjSIp7m9oM3E2TwTOM4PKjoTj1tPEjAzw3uVdjC
-iEWE/lnDWlS/EM7sXfzofA==
------END PRIVATE KEY-----
-)";
-
-
-#endif
-
 inline thread_local std::exception_ptr background_server_error;
 inline void RethrowBackgroundServerError() {
     if (auto error = std::exchange(background_server_error, {})) std::rethrow_exception(error);
@@ -443,8 +444,7 @@ class Harness {
         if (tls) {
             const auto cert = directory.path() / "test-cert.pem";
             const auto key = directory.path() / "test-key.pem";
-            std::ofstream(cert) << kTestTlsCertPem;
-            std::ofstream(key) << kTestTlsKeyPem;
+            test::WriteTestTlsFiles(cert, key);
             server_config.tls_cert_path = cert.string(); server_config.tls_key_path = key.string();
         }
 #endif

@@ -30,6 +30,8 @@ inline constexpr const char* kEveryTable = "*";
 struct User {
     scram::Verifier verifier;
     bool manages_users = false;
+    // Only logins bound to their TLS connection are accepted for this user.
+    bool requires_channel_binding = false;
     // Table name, or kEveryTable, to the right granted on it.
     std::map<std::string, Right> grants;
 

@@ -25,6 +25,7 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--auth-max-failures-per-connection` | `5` | 1–1000 failed HELLO or AUTH attempts that close a connection. |
 | `--auth-ban-failures` | `5` | 0–1000000 failed logins from one source address that ban it; `0` disables bans. |
 | `--auth-ban-ms` | `1000` | 1–86400000 ms a source address stays banned; when the ban ends, its failures are reset. |
+| `--auth-channel-binding` | `allow` | `allow` or `require`; `require` refuses logins not bound to their TLS connection and needs `--auth scram` and a `chunks://` listener; see [Users and rights](USERS.md#channel-binding). |
 | `--proxy-protocol` | `off` | `off` or `v2`; with `v2` every connection starts with a PROXY protocol v2 header. |
 | `--audit-log` | unset | File receiving the audit log; see [Logs](#logs). |
 | `--slow-statement-ms` | `0` | 0–86400000 ms; statements taking at least this long are logged at WARN; `0` logs none. |
@@ -94,7 +95,7 @@ These events are recorded:
 | `create_slot`, `drop_slot` | Durable feed slot statements. |
 
 Every line has `time_ms` (UTC milliseconds since the Unix epoch), `connection` (an identifier unique within the server process), `event`, `user`, `peer` and `ok`.
-A failure adds `error_code`; a failed login adds `reason`: `wrong_password`, `unknown_user`, `banned`, `no_user`, `invalid_user_name` or `invalid_login`.
+A failure adds `error_code`; a failed login adds `reason`: `wrong_password`, `unknown_user`, `banned`, `no_user`, `invalid_user_name`, `invalid_login`, `channel_binding` (bound to another connection, or not bound on a server that requires it) or `channel_binding_required` (not bound, for a user that requires it).
 A failed login whose name could not name a user (see [Users and rights](USERS.md)) is written with an empty `user`.
 Lines add `table`, `target_user`, `slot` or `migration` when the event names them.
 Passwords, verifiers, parameter values and block data are never written.

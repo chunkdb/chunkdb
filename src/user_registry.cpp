@@ -214,19 +214,21 @@ void UserRegistry::Update(Change&& change) {
     });
 }
 
-void UserRegistry::Create(const std::string& name, scram::Verifier verifier, bool manages_users, bool if_not_exists) {
-    Create(name, [&] { return std::move(verifier); }, manages_users, if_not_exists);
+void UserRegistry::Create(const std::string& name, scram::Verifier verifier, bool manages_users, bool if_not_exists,
+    bool requires_channel_binding) {
+    Create(name, [&] { return std::move(verifier); }, manages_users, if_not_exists, requires_channel_binding);
 }
 
 void UserRegistry::Create(const std::string& name, const std::function<scram::Verifier()>& make_verifier,
-    bool manages_users, bool if_not_exists) {
+    bool manages_users, bool if_not_exists, bool requires_channel_binding) {
     RequireName(name);
     UpdateIf([&](Users& users) {
         if (users.users.contains(name)) {
             if (if_not_exists) return false;
             throw std::invalid_argument("user " + name + " already exists");
         }
-        users.users.emplace(name, User{.verifier = make_verifier(), .manages_users = manages_users, .grants = {}});
+        users.users.emplace(name, User{.verifier = make_verifier(), .manages_users = manages_users,
+            .requires_channel_binding = requires_channel_binding, .grants = {}});
         return true;
     });
 }
@@ -251,6 +253,10 @@ void UserRegistry::SetManagesUsers(const std::string& name, bool manages_users) 
         Existing(users, name).manages_users = manages_users;
         RequireUserManager(users);
     });
+}
+
+void UserRegistry::SetRequiresChannelBinding(const std::string& name, bool requires_channel_binding) {
+    Update([&](Users& users) { Existing(users, name).requires_channel_binding = requires_channel_binding; });
 }
 
 void UserRegistry::Drop(const std::string& name, bool if_exists) {

@@ -27,6 +27,7 @@
 - **Background checkpoint syncs:** at most `--maintenance-workers` background checkpoints sync at once per data directory; when writes make checkpoints due faster than those workers finish them, a write waits for or runs its chunk's checkpoint once the chunk holds four checkpoint intervals of deferred updates.
 - **Authenticated metrics:** SHOW METRICS provides Prometheus text; there is no native HTTP scrape endpoint.
 - **Audit log durability:** audit lines are flushed but not synced, so a power loss can drop the latest ones; a line that cannot be written does not fail its statement; on Windows a rotated audit log is reopened only by a restart; see [Server flags](SERVER_FLAGS.md#logs).
+- **Channel binding behind TLS termination:** a login can be bound only to TLS that ends at the server; behind a load balancer that ends TLS, clients turn channel binding off, and `--auth-channel-binding require` and REQUIRE CHANNEL BINDING cannot be used; `tls-server-end-point` is undefined for a certificate whose signature algorithm has no single hash, such as Ed25519, where clients need TLS 1.3 and `tls-exporter`.
 - **PROXY protocol version 2 only:** the text header of version 1 is not accepted.
 - **Windows toolchain:** native builds use MSYS2 UCRT64/OpenSSL on Windows 10 or later; see [Windows native](WINDOWS_NATIVE.md) for untested alternatives.
 

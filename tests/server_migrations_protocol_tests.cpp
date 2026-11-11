@@ -203,7 +203,7 @@ class PersistentServer {
 #ifdef CHUNKDB_WITH_OPENSSL
         if (tls_) {
             const auto cert = directory_ / "test-cert.pem", key = directory_ / "test-key.pem";
-            std::ofstream(cert) << kTestTlsCertPem; std::ofstream(key) << kTestTlsKeyPem;
+            test::WriteTestTlsFiles(cert, key);
             config.tls_cert_path = cert.string(); config.tls_key_path = key.string();
         }
 #endif

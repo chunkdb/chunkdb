@@ -438,7 +438,7 @@ Live-history readers capture completed byte boundaries and read only the prefix 
 2. Each user stores these fields in order:
 
 - Name length `u16` and name.
-- Flags `u8`, with bit 0 representing MANAGES USERS.
+- Flags `u8`, with bit 0 representing MANAGES USERS and bit 1 REQUIRE CHANNEL BINDING.
 - SCRAM iterations `u32` (4096 to 1000000), salt length `u16` (16 to 256), and salt.
 - Stored key (32 bytes), server key (32 bytes), and grant count `u32`.
 3. Per grant: table-name length `u16` and name, right `u8` (1 READ, 2 WRITE, 3 ADMIN); `*` names all tables.
