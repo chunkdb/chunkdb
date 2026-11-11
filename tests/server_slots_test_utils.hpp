@@ -26,7 +26,9 @@
 #endif
 #ifdef CHUNKDB_WITH_OPENSSL
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
 #endif
 #include "chunkdb/server.hpp"
 #include "feed_test_utils.hpp"
@@ -110,7 +112,9 @@ inline bool Boolean(const Reply& reply) {
 // deadline over the entire reply, including TLS WANT_READ retries.
 class Client {
   public:
-    explicit Client(std::uint16_t port, bool tls = false) {
+    // `max_tls_version`: the highest TLS version offered, e.g. TLS1_2_VERSION;
+    // 0 offers every version the library supports.
+    explicit Client(std::uint16_t port, bool tls = false, [[maybe_unused]] int max_tls_version = 0) {
         InitializeSockets();
         peer_ = "127.0.0.1:" + std::to_string(port);
         socket_ = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -142,6 +146,7 @@ class Client {
             if (tls) {
                 context_ = SSL_CTX_new(TLS_client_method()); assert(context_);
                 SSL_CTX_set_verify(context_, SSL_VERIFY_NONE, nullptr);
+                if (max_tls_version != 0) assert(SSL_CTX_set_max_proto_version(context_, max_tls_version) == 1);
                 ssl_ = SSL_new(context_); assert(ssl_);
                 assert(SSL_set_fd(ssl_, static_cast<int>(socket_)) == 1);
                 const auto deadline = Clock::now() + 10s;
@@ -167,6 +172,38 @@ class Client {
         if (socket_ != kInvalid) { CloseSocket(socket_); socket_ = kInvalid; }
     }
 #ifdef CHUNKDB_WITH_OPENSSL
+    [[nodiscard]] int TlsVersion() const { return SSL_version(ssl_); }
+    // What this side of the TLS connection gives a login to bind to
+    // (RFC 9266, RFC 5929); empty when `type` is not defined for it.
+    [[nodiscard]] std::vector<std::uint8_t> ChannelBinding(std::string_view type) const {
+        if (type == scram::kTlsExporter) {
+            constexpr std::string_view kLabel = "EXPORTER-Channel-Binding";
+            std::vector<std::uint8_t> exporter(32);
+            const unsigned char no_context = 0;
+            if (SSL_version(ssl_) != TLS1_3_VERSION ||
+                SSL_export_keying_material(ssl_, exporter.data(), exporter.size(), kLabel.data(), kLabel.size(),
+                                           &no_context, 0, 1) != 1) return {};
+            return exporter;
+        }
+        assert(type == scram::kTlsServerEndPoint);
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+        auto* certificate = SSL_get1_peer_certificate(ssl_);
+#else
+        auto* certificate = SSL_get_peer_certificate(ssl_);
+#endif
+        assert(certificate != nullptr);
+        std::vector<std::uint8_t> hash;
+        int digest_nid = NID_undef;
+        if (X509_get_signature_info(certificate, &digest_nid, nullptr, nullptr, nullptr) == 1 && digest_nid != NID_undef) {
+            if (digest_nid == NID_md5 || digest_nid == NID_sha1) digest_nid = NID_sha256;
+            unsigned int size = 0;
+            hash.resize(EVP_MAX_MD_SIZE);
+            assert(X509_digest(certificate, EVP_get_digestbynid(digest_nid), hash.data(), &size) == 1);
+            hash.resize(size);
+        }
+        X509_free(certificate);
+        return hash;
+    }
     // Send the TLS closure alert while leaving the TCP connection open.
     void CloseTlsWrite() {
         assert(ssl_);
@@ -236,6 +273,22 @@ class Client {
     }
     void Hello() { const auto reply = Command("HELLO 3"); assert(reply.type == '%' && reply.items.size() >= 16U && reply.items.size() % 2U == 0U);
         assert(Field(reply, "protocol").type == ':' && Field(reply, "protocol").value == "3"); }
+    // HELLO 3 USER and AUTH, bound to `binding_data` when `binding_type` names
+    // a type: the reply that ends the login, the HELLO map or the error.
+    Reply LoginReply(std::string_view user, std::string_view password, std::string_view binding_type = {},
+                     std::span<const std::uint8_t> binding_data = {}) {
+        const auto login = scram::StartClientLogin(user, scram::NewNonce(), binding_type);
+        last_request_ = "HELLO USER " + std::string(user);
+        Send(test::HelloUserBytes(login, user));
+        const auto first = Read();
+        if (first.type != '+') return first;
+        const auto auth = test::AuthBytes(login, password, "+" + first.value, binding_data);
+        last_request_ = "AUTH";
+        Send(auth.bytes);
+        auto reply = Read();
+        if (reply.type == '%') assert(Field(reply, "server_signature").value == auth.server_signature);
+        return reply;
+    }
     void Login(std::string_view user = "admin", std::string_view password = "secret") {
         test::FeedPhaseWatchdog::Phase("client: HELLO USER");
         const auto login = scram::StartClientLogin(user, scram::NewNonce());

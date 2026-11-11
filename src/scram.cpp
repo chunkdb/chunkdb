@@ -8,8 +8,6 @@ namespace chunkdb::scram {
 namespace {
 
 constexpr std::string_view kPrefix = "SCRAM-SHA-256$";
-// base64("n,,"): no channel binding.
-constexpr std::string_view kChannelBinding = "c=biws";
 
 [[nodiscard]] crypto::Sha256Digest DigestOf(std::string_view base64, const char* what) {
     const auto bytes = crypto::Base64Decode(base64);
@@ -35,6 +33,12 @@ constexpr std::string_view kChannelBinding = "c=biws";
 }
 
 }  // namespace
+
+std::string ChannelBindingAttribute(std::string_view gs2_header, std::span<const std::uint8_t> data) {
+    std::vector<std::uint8_t> bound(gs2_header.begin(), gs2_header.end());
+    bound.insert(bound.end(), data.begin(), data.end());
+    return "c=" + crypto::Base64Encode(bound);
+}
 
 Verifier MakeVerifier(std::string_view password, std::span<const std::uint8_t> salt, std::uint32_t iterations) {
     const auto salted = crypto::Pbkdf2Sha256(crypto::Bytes(password), salt, iterations);
@@ -112,10 +116,32 @@ Verifier ParseVerifier(std::string_view text) {
 }
 
 ClientFirst ParseClientFirst(std::string_view message) {
-    if (message.substr(0, 3) != "n,,") {
-        throw std::invalid_argument("the SCRAM client-first message starts with n,, (no channel binding)");
+    constexpr const char* kHeader =
+        "the SCRAM client-first message starts with n,, or y,, or p=<channel binding type>,,";
+    ClientFirst first;
+    std::size_t header_size = 3;
+    if (message.substr(0, 3) == "y,,") {
+        first.binding = BindingFlag::kUnused;
+    } else if (message.substr(0, 2) == "p=") {
+        // A type name is letters, digits, `.` and `-` (RFC 5056).
+        const auto end = message.find(',');
+        if (end == std::string_view::npos || end == 2U || message.substr(end, 2) != ",,") {
+            throw std::invalid_argument(kHeader);
+        }
+        const auto type = message.substr(2, end - 2);
+        for (const char c : type) {
+            const bool allowed =
+                (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || (c >= '0' && c <= '9') || c == '.' || c == '-';
+            if (!allowed) throw std::invalid_argument(kHeader);
+        }
+        first.binding = BindingFlag::kBound;
+        first.binding_type = std::string(type);
+        header_size = end + 2U;
+    } else if (message.substr(0, 3) != "n,,") {
+        throw std::invalid_argument(kHeader);
     }
-    const std::string_view bare = message.substr(3);
+    first.gs2_header = std::string(message.substr(0, header_size));
+    const std::string_view bare = message.substr(header_size);
     if (bare.substr(0, 2) != "n=") {
         throw std::invalid_argument("the SCRAM client-first message names the user (n=)");
     }
@@ -127,17 +153,24 @@ ClientFirst ParseClientFirst(std::string_view message) {
     if (!ValidNonce(nonce)) {
         throw std::invalid_argument("a SCRAM nonce is printable ASCII without commas");
     }
-    return ClientFirst{
-        .user = std::string(bare.substr(2, comma - 2)),
-        .nonce = std::string(nonce),
-        .bare = std::string(bare),
-    };
+    first.user = std::string(bare.substr(2, comma - 2));
+    first.nonce = std::string(nonce);
+    first.bare = std::string(bare);
+    return first;
 }
 
-ServerExchange::ServerExchange(ClientFirst first, Verifier verifier, std::string_view server_nonce)
+ServerExchange::ServerExchange(
+    ClientFirst first,
+    Verifier verifier,
+    std::string_view server_nonce,
+    std::span<const std::uint8_t> binding_data)
     : first_(std::move(first)),
       verifier_(std::move(verifier)),
-      nonce_(first_.nonce + std::string(server_nonce)) {
+      nonce_(first_.nonce + std::string(server_nonce)),
+      channel_binding_(ChannelBindingAttribute(first_.gs2_header, binding_data)) {
+    if ((first_.binding == BindingFlag::kBound) == binding_data.empty()) {
+        throw std::invalid_argument("a bound SCRAM login, and only one, takes channel binding data");
+    }
     if (!ValidNonce(server_nonce)) {
         throw std::invalid_argument("a SCRAM nonce is printable ASCII without commas");
     }
@@ -146,8 +179,16 @@ ServerExchange::ServerExchange(ClientFirst first, Verifier verifier, std::string
 }
 
 std::optional<std::string> ServerExchange::Finish(std::string_view client_final) const {
-    const std::string expected_start = std::string(kChannelBinding) + ",r=" + nonce_ + ",p=";
+    const std::string expected_start = channel_binding_ + ",r=" + nonce_ + ",p=";
     if (client_final.substr(0, expected_start.size()) != expected_start) {
+        // A bound login that continues this exchange with other binding
+        // data was made on another connection than this one.
+        const std::string continuation = ",r=" + nonce_ + ",p=";
+        const auto at = client_final.find(',');
+        if (first_.binding == BindingFlag::kBound && client_final.substr(0, 2) == "c=" &&
+            at != std::string_view::npos && client_final.substr(at, continuation.size()) == continuation) {
+            throw ChannelMismatchError();
+        }
         throw std::invalid_argument("the SCRAM client-final message does not continue this exchange");
     }
     const auto proof = crypto::Base64Decode(client_final.substr(expected_start.size()));
@@ -167,12 +208,17 @@ std::optional<std::string> ServerExchange::Finish(std::string_view client_final)
     return "v=" + crypto::Base64Encode(crypto::HmacSha256(verifier_.server_key, crypto::Bytes(auth_message)));
 }
 
-ClientLogin StartClientLogin(std::string_view user, std::string_view nonce) {
+ClientLogin StartClientLogin(std::string_view user, std::string_view nonce, std::string_view binding_type) {
     const std::string bare = "n=" + std::string(user) + ",r=" + std::string(nonce);
-    return ClientLogin{.first = "n,," + bare, .first_bare = bare, .nonce = std::string(nonce)};
+    const std::string header = binding_type.empty() ? std::string("n,,") : "p=" + std::string(binding_type) + ",,";
+    return ClientLogin{.first = header + bare, .first_bare = bare, .nonce = std::string(nonce), .gs2_header = header};
 }
 
-ClientFinal FinishClientLogin(const ClientLogin& login, std::string_view password, std::string_view server_first) {
+ClientFinal FinishClientLogin(
+    const ClientLogin& login,
+    std::string_view password,
+    std::string_view server_first,
+    std::span<const std::uint8_t> binding_data) {
     // r=<nonce>,s=<salt>,i=<iterations>
     const auto salt_at = server_first.find(",s=");
     const auto iterations_at = server_first.find(",i=");
@@ -195,7 +241,7 @@ ClientFinal FinishClientLogin(const ClientLogin& login, std::string_view passwor
     const auto client_key = crypto::HmacSha256(salted, crypto::Bytes("Client Key"));
     const auto stored_key = crypto::Sha256Of(client_key);
     const auto server_key = crypto::HmacSha256(salted, crypto::Bytes("Server Key"));
-    const std::string without_proof = std::string(kChannelBinding) + ",r=" + std::string(nonce);
+    const std::string without_proof = ChannelBindingAttribute(login.gs2_header, binding_data) + ",r=" + std::string(nonce);
     const std::string auth_message = login.first_bare + "," + std::string(server_first) + "," + without_proof;
     const auto signature = crypto::HmacSha256(stored_key, crypto::Bytes(auth_message));
     crypto::Sha256Digest proof{};

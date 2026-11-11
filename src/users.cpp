@@ -127,7 +127,7 @@ std::vector<std::uint8_t> EncodeUsers(const Users& users) {
     PutCount(&out, users.users.size());
     for (const auto& [name, user] : users.users) {
         PutShortString(&out, name);
-        out.push_back(user.manages_users ? 1U : 0U);
+        out.push_back(static_cast<std::uint8_t>((user.manages_users ? 1U : 0U) | (user.requires_channel_binding ? 2U : 0U)));
         PutU32(&out, user.verifier.iterations);
         if (!SaltLengthFits(user.verifier.salt.size())) {
             throw std::invalid_argument(
@@ -175,10 +175,11 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
         }
         User user;
         const std::uint8_t flags = reader.U8();
-        if ((flags & ~1U) != 0U) {
+        if ((flags & ~3U) != 0U) {
             throw std::invalid_argument("chunkdb.users has unknown flags for user " + name);
         }
         user.manages_users = (flags & 1U) != 0U;
+        user.requires_channel_binding = (flags & 2U) != 0U;
         user.verifier.iterations = reader.U32();
         if (user.verifier.iterations < scram::kMinIterations || user.verifier.iterations > scram::kMaxIterations) {
             throw std::invalid_argument(

@@ -344,6 +344,11 @@ void TestStartupDiagnostics(const std::string& binary) {
 
     message = failure(dir.path() / "tls", {"--listen-uri", "chunks://127.0.0.1:6499"});
     assert(message.find("set both flags to readable PEM") != std::string::npos);
+    message = failure(dir.path() / "binding", {"--auth-channel-binding", "on"});
+    assert(message.find("--auth-channel-binding is allow or require, got on") != std::string::npos);
+    // Requiring bound logins needs users and TLS: --auth none and a plain listener have neither.
+    message = failure(dir.path() / "binding", {"--auth-channel-binding", "require"});
+    assert(message.find("--auth-channel-binding require needs users (--auth scram) and TLS") != std::string::npos);
     for (const auto* value : {"-1", "2147483648", "no", "1ms"}) {
         message = failure(dir.path() / "linger", {"--feed-linger-ms", value});
         assert(message.find("invalid --feed-linger-ms") != std::string::npos);

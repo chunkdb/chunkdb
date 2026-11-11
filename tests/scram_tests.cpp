@@ -121,8 +121,13 @@ void TestPrepareExistingFixtureUser() {
 }
 
 void TestMalformedMessages() {
-    ExpectInvalid([] { (void)scram::ParseClientFirst("y,,n=user,r=abc"); }, "starts with n,,");
-    ExpectInvalid([] { (void)scram::ParseClientFirst("p=tls-unique,,n=user,r=abc"); }, "starts with n,,");
+    // The header: no authorization identity, a well-formed binding type.
+    ExpectInvalid([] { (void)scram::ParseClientFirst("x,,n=user,r=abc"); }, "starts with n,,");
+    ExpectInvalid([] { (void)scram::ParseClientFirst("n,a=admin,n=user,r=abc"); }, "starts with n,,");
+    ExpectInvalid([] { (void)scram::ParseClientFirst("p=,,n=user,r=abc"); }, "starts with n,,");
+    ExpectInvalid([] { (void)scram::ParseClientFirst("p=tls exporter,,n=user,r=abc"); }, "starts with n,,");
+    ExpectInvalid([] { (void)scram::ParseClientFirst("p=tls-exporter,a=admin,n=user,r=abc"); }, "starts with n,,");
+    ExpectInvalid([] { (void)scram::ParseClientFirst("p=tls-exporter"); }, "starts with n,,");
     ExpectInvalid([] { (void)scram::ParseClientFirst("n,,r=abc"); }, "names the user");
     ExpectInvalid([] { (void)scram::ParseClientFirst("n,,n=user"); }, "carries a nonce");
     ExpectInvalid([] { (void)scram::ParseClientFirst("n,,n=user,r="); }, "printable ASCII");
@@ -138,6 +143,60 @@ void TestMalformedMessages() {
     ExpectInvalid(
         [&] { (void)exchange.Finish("c=biws,r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,p=AAAA"); },
         "32 bytes");
+}
+
+// A login bound to its connection (RFC 5802 section 7): the client-final
+// message repeats the header and carries the binding data of the channel.
+void TestChannelBinding() {
+    const auto unused = scram::ParseClientFirst(std::string("y,,n=user,r=") + kClientNonce);
+    assert(unused.binding == scram::BindingFlag::kUnused && unused.gs2_header == "y,," && unused.binding_type.empty());
+    const auto plain = scram::ParseClientFirst(std::string("n,,n=user,r=") + kClientNonce);
+    assert(plain.binding == scram::BindingFlag::kNone && plain.gs2_header == "n,,");
+
+    const std::vector<std::uint8_t> channel(32, 0x11);
+    const std::vector<std::uint8_t> other_channel(32, 0x22);
+    const auto login = scram::StartClientLogin("user", kClientNonce, scram::kTlsExporter);
+    assert(login.first == std::string("p=tls-exporter,,n=user,r=") + kClientNonce);
+    const auto first = scram::ParseClientFirst(login.first);
+    assert(first.binding == scram::BindingFlag::kBound && first.binding_type == "tls-exporter");
+    assert(first.gs2_header == "p=tls-exporter,," && first.user == "user" && first.bare == login.first_bare);
+
+    const scram::ServerExchange exchange(first, PencilVerifier(), kServerNonce, channel);
+    const auto bound = scram::FinishClientLogin(login, "pencil", exchange.ServerFirst(), channel);
+    std::vector<std::uint8_t> expected(first.gs2_header.begin(), first.gs2_header.end());
+    expected.insert(expected.end(), channel.begin(), channel.end());
+    assert(bound.message.starts_with("c=" + crypto::Base64Encode(expected) + ",r="));
+    assert(exchange.Finish(bound.message) == bound.server_signature);
+    // A wrong password on the right channel is a wrong proof.
+    assert(!exchange.Finish(scram::FinishClientLogin(login, "pen", exchange.ServerFirst(), channel).message));
+
+    // The right password on another channel, or with the binding left out,
+    // is refused before the proof is looked at.
+    const auto expect_mismatch = [&](const std::string& client_final) {
+        try {
+            (void)exchange.Finish(client_final);
+        } catch (const scram::ChannelMismatchError&) {
+            return;
+        }
+        assert(false);
+    };
+    expect_mismatch(scram::FinishClientLogin(login, "pencil", exchange.ServerFirst(), other_channel).message);
+    auto stripped = login;
+    stripped.gs2_header = "n,,";
+    expect_mismatch(scram::FinishClientLogin(stripped, "pencil", exchange.ServerFirst()).message);
+    ExpectInvalid([&] { (void)exchange.Finish("c=biws,r=rOprNGfwEbeRWgbNEkqOxx,p=AAAA"); }, "does not continue");
+
+    // Binding data belongs to bound logins only.
+    ExpectInvalid([&] { (void)scram::ServerExchange(first, PencilVerifier(), kServerNonce); }, "takes channel binding data");
+    ExpectInvalid(
+        [&] { (void)scram::ServerExchange(plain, PencilVerifier(), kServerNonce, channel); }, "takes channel binding data");
+
+    // A client that could bind but does not: its header is signed too.
+    const scram::ServerExchange unused_exchange(unused, PencilVerifier(), kServerNonce);
+    auto unused_login = scram::StartClientLogin("user", kClientNonce);
+    unused_login.gs2_header = "y,,";
+    const auto unused_final = scram::FinishClientLogin(unused_login, "pencil", unused_exchange.ServerFirst());
+    assert(unused_final.message.starts_with("c=eSws,r=") && unused_exchange.Finish(unused_final.message) == unused_final.server_signature);
 }
 
 void TestDecoyAndNonce() {
@@ -197,6 +256,7 @@ int main() {
     TestPreparedSocketLogin();
     TestPrepareExistingFixtureUser();
     TestMalformedMessages();
+    TestChannelBinding();
     TestDecoyAndNonce();
     TestVerifierText();
     return 0;

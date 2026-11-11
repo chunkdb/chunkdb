@@ -6,6 +6,7 @@
 
 #include "server_io.hpp"
 
+#include "chunkdb/engine.hpp"
 #include "chunkdb/server.hpp"
 
 #include <openssl/err.h>
@@ -21,6 +22,9 @@ namespace chunkdb {
 namespace server_detail {
 
 std::string LastTlsErrorMessage();
+
+// What a login can bind to on a connection whose TLS handshake is complete.
+[[nodiscard]] ChannelBindings TlsChannelBindings(SSL* tls_session);
 
 ConnectionTermination ClassifyTlsFailure(
     SSL* tls_session,

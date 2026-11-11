@@ -52,6 +52,7 @@ Users Sample() {
     users.users["nobody"] = User{
         .verifier = chunkdb::scram::MakeVerifier("x", salt, 4096),
         .manages_users = false,
+        .requires_channel_binding = true,
         .grants = {},
     };
     return users;
@@ -60,6 +61,8 @@ Users Sample() {
 void TestRoundTrip() {
     const Users users = Sample();
     assert(chunkdb::DecodeUsers(chunkdb::EncodeUsers(users)) == users);
+    assert(chunkdb::DecodeUsers(chunkdb::EncodeUsers(users)).users.at("nobody").requires_channel_binding);
+    assert(!chunkdb::DecodeUsers(chunkdb::EncodeUsers(users)).users.at("bot").requires_channel_binding);
     assert(chunkdb::DecodeUsers(chunkdb::EncodeUsers(Users{})) == Users{});
 }
 

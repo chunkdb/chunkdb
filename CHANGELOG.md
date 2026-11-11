@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Bind SCRAM logins to their TLS connection (SCRAM-SHA-256-PLUS): a client-first message starting `p=tls-exporter,,` (RFC 9266, TLS 1.3) or `p=tls-server-end-point,,` (RFC 5929) is checked against the server side of the connection, and a login relayed by something that ends TLS fails with `AUTH_FAILED reason=channel_binding`; `--auth-channel-binding require` refuses unbound logins with `AUTH_REQUIRED reason=channel_binding`, `CREATE USER ... REQUIRE CHANNEL BINDING` and `ALTER USER ... [NO] REQUIRE CHANNEL BINDING` do it for one user, SHOW USERS adds `requires_channel_binding`, the audit log adds the login reasons `channel_binding` and `channel_binding_required`, HELLO lists the capability `channel_binding`, and `y,,` is refused on TLS and accepted without it (#162).
 - Add `chunkdb_chunk_map_bench`, which times point reads and writes across many loaded chunks and inside one chunk, and the two chunk-map lookups alone, on a warm cache; docs/design/COLUMNS_DESIGN.md states the method (#135).
 - Resolve configured Windows directory junction roots and extended paths for backup and restore while refusing descendant reparse points (#150).
 - Add the event journal guide, docs/EVENT_JOURNAL.md: keep every change from a durable slot in your own store, acknowledging only after the store syncs, rebuild the world at a revision or commit time from a base snapshot, render a timelapse, retain segments and snapshots, and resume after a crash (#153).
