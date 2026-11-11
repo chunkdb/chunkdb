@@ -292,7 +292,24 @@ void TestDurationLimit() {
     ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT reason=duration");
     ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), Value(2));
     assert(f.RegisteredSnapshots() == 0);
+
+    // A session control past the limit ends the transaction but returns its
+    // own reply; the statement after it gets the conflict, and controls keep
+    // their own reply until ROLLBACK.
+    auto controls = std::make_shared<chunkdb::SessionControlCallbacks>();
+    controls->cancel = [](const auto&, auto) { return false; };
+    f.a.connection_controls = controls;
+    const std::string not_cancelled = "%1\r\n$9\r\ncancelled\r\n#f\r\n";
+    ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run(f.a, "GET BLOCK 0 0 FROM t"), Value(2));
+    std::this_thread::sleep_for(kPastShortDuration);
+    ExpectReply(f.Run(f.a, "CANCEL 999"), not_cancelled);
+    assert(f.RegisteredSnapshots() == 0);
+    ExpectError(f.Run(f.a, "PING"), "CONFLICT reason=duration");
+    ExpectReply(f.Run(f.a, "CANCEL 999"), not_cancelled);
+    ExpectReply(f.Run(f.a, "ROLLBACK"), "+OK\r\n");
 }
+
 
 // --txn-total-bytes that holds one private copy of a chunk of t, not two.
 chunkdb::EngineConfig OneCopyBudget(std::chrono::milliseconds duration = kShortDuration) {
