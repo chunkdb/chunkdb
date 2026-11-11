@@ -20,6 +20,13 @@ bool WouldBlock(int error) {
     return error == EAGAIN || error == EWOULDBLOCK;
 #endif
 }
+// A login failure or ban reply held back by the failed-login delay. Its
+// write deadline, from the end of the delay, replaces the HELLO deadline,
+// which then ends the connection once the reply is written.
+bool DelayedLoginReply(const ServerConnection& connection) {
+    return connection.phase == ServerConnection::Phase::kReply &&
+        connection.session.reply_not_before != std::chrono::steady_clock::time_point{};
+}
 bool ControlRequest(std::string_view line) {
     const auto first = line.find_first_not_of(" \t\r\n");
     if (first == std::string_view::npos) return false;
@@ -697,7 +704,7 @@ void IdleIo::Serve(std::shared_ptr<ServerConnection>& connection) {
     }
     const auto now = std::chrono::steady_clock::now();
     using Phase = ServerConnection::Phase;
-    if (alive && !connection->session.greeted &&
+    if (alive && !connection->session.greeted && !DelayedLoginReply(*connection) &&
         now >= connection->handshake_deadline) {
         if (connection->phase == Phase::kTls || connection->phase == Phase::kProxy) {
             LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
@@ -823,7 +830,7 @@ void IdleIo::Run() {
                     static_cast<short>(connection->phase == ServerConnection::Phase::kReady || delayed ||
                         connection->waiting_credit || connection->waiting_line_credit ? 0 : connection->io_wait), 0});
                 if (delayed) wait_until(connection->session.reply_not_before);
-                if (!connection->session.greeted)
+                if (!connection->session.greeted && !DelayedLoginReply(*connection))
                     wait_until(connection->handshake_deadline);
                 if (connection->input_deadline) wait_until(*connection->input_deadline);
                 if (connection->output_deadline) wait_until(*connection->output_deadline);

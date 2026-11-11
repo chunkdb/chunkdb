@@ -6483,6 +6483,38 @@ void TestDelayedAuthRepliesDoNotOccupyWorkers() {
     assert(accepted.ReadLine() == "+PONG\r\n");
 }
 
+// A login failure or ban reply held back past the HELLO deadline by
+// --auth-failure-delay-ms is still written, then the connection closes.
+void TestDelayedAuthReplyOutlivesHelloDeadline() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    engine_cfg.max_auth_failures_per_ip = 1;
+    engine_cfg.auth_failure_delay_ms = 1500;
+    engine_cfg.auth_failure_ban_ms = 60000;
+    auto server_cfg = BaseServerConfig();
+    server_cfg.client_io_timeout_ms = 1000;
+    ServerHarness harness("delayed-auth-deadline", BaseStoreConfig(), engine_cfg, server_cfg);
+    {
+        RawClient ready("127.0.0.1", harness.port);
+        ready.SetReadDeadline(std::chrono::seconds(5));
+        ready.Login();
+    }
+    RawClient failing("127.0.0.1", harness.port);
+    failing.SetReadDeadline(std::chrono::seconds(5));
+    const auto login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
+    failing.SendBytes(chunkdb::test::HelloUserBytes(login, kAdminUser));
+    const auto challenge = failing.ReadLine();
+    assert(challenge.starts_with("+SCRAM "));
+    failing.SendBytes(chunkdb::test::WrongAuthBytes(challenge));
+    assert(failing.ReadLine().starts_with("-ERR AUTH_FAILED "));
+    assert(failing.WaitForClose(std::chrono::seconds(5)));
+    RawClient banned("127.0.0.1", harness.port);
+    banned.SetReadDeadline(std::chrono::seconds(5));
+    const auto banned_login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
+    banned.SendBytes(chunkdb::test::HelloUserBytes(banned_login, kAdminUser));
+    assert(banned.ReadLine().find("temporary auth ban") != std::string::npos);
+    assert(banned.WaitForClose(std::chrono::seconds(5)));
+}
+
 std::string ReadText(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
@@ -6820,6 +6852,7 @@ int main(int argc, char** argv) {
         run("TestProxyProtocolParser", TestProxyProtocolParser);
         run("TestProxyProtocolSourceAddress", TestProxyProtocolSourceAddress);
         run("TestDelayedAuthRepliesDoNotOccupyWorkers", TestDelayedAuthRepliesDoNotOccupyWorkers);
+        run("TestDelayedAuthReplyOutlivesHelloDeadline", TestDelayedAuthReplyOutlivesHelloDeadline);
         run("TestProxyProtocolRefusesBadHeaders", TestProxyProtocolRefusesBadHeaders);
         run("TestProxyProtocolOffIgnoresHeaders", TestProxyProtocolOffIgnoresHeaders);
 #ifdef CHUNKDB_WITH_OPENSSL
