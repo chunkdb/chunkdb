@@ -1022,13 +1022,9 @@ std::optional<std::string> CommandEngine::AdmitUserStatement(SessionState& sessi
     if (Protocol::CommandEquals(verb, "CANCEL") || Protocol::CommandEquals(verb, "KILL") ||
         Protocol::CommandEquals(verb, "ROLLBACK")) return std::nullopt;
     const auto result = config_.users->AdmitStatement(session.user_ticket);
-    if (result.status == UserAdmissionStatus::kAllowed) return std::nullopt;
-    if (result.status == UserAdmissionStatus::kStale) {
-        // A dropped user's connection gets the lost-user reply from Execute,
-        // which logs it as a refused statement and closes the connection.
-        if (session.user_ticket != nullptr) return std::nullopt;
-        return Protocol::Error("AUTH_REQUIRED", "the authenticated user no longer exists", {{"reason", "user_incarnation"}});
-    }
+    // A dropped user's connection gets the lost-user reply from Execute,
+    // which logs it as a refused statement and closes the connection.
+    if (result.status == UserAdmissionStatus::kAllowed || result.status == UserAdmissionStatus::kStale) return std::nullopt;
     return Protocol::Error("RATE_LIMITED", "the user's statement limit is reached",
         {{"reason", "statements_per_sec"}, {"retry_after_ms", std::to_string(result.retry_after_ms)}});
 }
