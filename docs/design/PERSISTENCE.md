@@ -44,7 +44,8 @@ After a crash, a new process's barrier cannot recover acknowledged writes alread
 
 ## Commit decisions and failures
 
-Conditional SET CHUNK (IF VERSION or IF ABSENT) first durably records its previous WAL boundary as CKRB, then writes the new state and commits by atomically publishing synced CKRC, in every durability mode.
+Conditional SET CHUNK (IF VERSION or IF ABSENT) first durably records its previous WAL boundary as CKRB, then writes the new state and commits by atomically publishing synced CKRC.
+In relaxed mode the new frame may stay in its group-commit batch after CKRC: the decision governs rollback, not durability, and a crash can lose the acknowledged write.
 Before commit, failure restores memory and truncates/removes the WAL to the previous boundary.
 Metadata and projected SET CHUNK always take this path; a whole-state SET CHUNK without a condition, a chunk's first write included, is an ordinary write.
 Transaction COMMIT records all changed chunks' durable boundaries as CKTB, appends and syncs one frame per changed chunk, then publishes synced CKTC before exposing the new states.

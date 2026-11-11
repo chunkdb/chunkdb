@@ -1471,8 +1471,8 @@ class ChunkStore {
 
     // The conditional write path (IF VERSION, IF ABSENT, CAS and chunk
     // transformations): a durable rollback boundary before the change and a
-    // durable commit decision in every durability mode
-    // (docs/design/PERSISTENCE.md).
+    // durable commit decision; in relaxed mode the frame may stay batched, so
+    // the decision governs rollback, not durability (docs/design/PERSISTENCE.md).
     [[nodiscard]] bool ApplyFullChunkStateLocked(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
