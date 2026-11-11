@@ -97,7 +97,7 @@ These events are recorded:
 | `create_slot`, `drop_slot` | Durable feed slot statements. |
 
 Every line has `time_ms` (UTC milliseconds since the Unix epoch), `connection` (an identifier unique within the server process), `event`, `user`, `peer` and `ok`.
-A failure adds `error_code`; a failed login adds `reason`: `wrong_password`, `unknown_user`, `banned`, `no_user`, `invalid_user_name`, `invalid_login`, `channel_binding` (bound to another connection, or not bound on a server that requires it) or `channel_binding_required` (not bound, for a user that requires it).
+A failure adds `error_code`; a failed login adds `reason`: `wrong_password`, `unknown_user`, `banned`, `no_user`, `invalid_user_name`, `invalid_login`, `channel_binding` (bound to another connection, or not bound on a server that requires it), `channel_binding_required` (not bound, for a user that requires it), `stale_login` (the user's verifier or channel binding requirement changed, or the user was dropped, between HELLO and AUTH) or `max_connections` (the user's connection limit is reached).
 A failed login whose name could not name a user (see [Users and rights](USERS.md)) is written with an empty `user`.
 Lines add `table`, `target_user`, `slot` or `migration` when the event names them.
 Passwords, verifiers, parameter values and block data are never written.

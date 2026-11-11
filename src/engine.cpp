@@ -555,6 +555,10 @@ void CommandEngine::AuditLogin(
             reason = "banned";
         } else if (response.find(" reason=channel_binding ") != std::string::npos) {
             reason = "channel_binding";
+        } else if (response.find(" reason=stale_login ") != std::string::npos) {
+            reason = "stale_login";
+        } else if (response.find(" reason=max_connections ") != std::string::npos) {
+            reason = "max_connections";
         } else if (code == "AUTH_FAILED") {
             reason = !known_user ? "unknown_user" : unbound_refused ? "channel_binding_required" : "wrong_password";
         } else if (code == "AUTH_REQUIRED") {
