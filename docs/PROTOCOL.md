@@ -13,6 +13,7 @@ Binary parameter frames do not count toward that line limit.
 A PROXY protocol v2 header and the TLS handshake each have their own `--client-io-timeout-ms`, in that order, before the HELLO deadline starts.
 Until authentication succeeds, HELLO, AUTH and all their parameter frames must arrive within `--client-io-timeout-ms` of that start; later ones receive PROTOCOL and close.
 After authentication, each request line must arrive within `--client-io-timeout-ms` of its first byte, each frame header within it of the end of the line or of the previous frame, and each frame body, kept or drained, within it of the end of its header; a frame that misses its deadline receives `PROTOCOL incomplete parameter frame` and the connection closes.
+Waiting for the server's input credit does not count: a request's frame deadline starts again when the credit is granted, and a wait longer than `--client-io-timeout-ms` receives `BUSY reason=input_budget` and the connection closes.
 
 The first line must be HELLO 3; a different version or statement receives PROTOCOL and closes without execution.
 `HELLO 3` alone is accepted only under `--auth none`; otherwise it receives AUTH_REQUIRED.

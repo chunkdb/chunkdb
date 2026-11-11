@@ -276,7 +276,8 @@ bool IdleIo::Read(ServerConnection& connection) {
 }
 
 bool IdleIo::Parse(ServerConnection& connection, bool worker) {
-    if ((!connection.pending.empty() || !connection.request_line.empty()) && !connection.input_deadline)
+    if ((!connection.pending.empty() || !connection.request_line.empty()) && !connection.input_deadline &&
+        !connection.waiting_credit)
         connection.input_deadline = std::chrono::steady_clock::now() +
             std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
     if (connection.request_line.empty()) {
@@ -332,6 +333,11 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
                     (connection.control_request ? control_waiters_ : data_waiters_).push_back(connection.weak_from_this());
                     if (!connection.control_request) data_waiter_count_.fetch_add(1U, std::memory_order_release);
                     connection.waiting_credit = true;
+                    // The server's wait is not the client's lateness: the frame
+                    // deadline starts again when the credit is granted.
+                    connection.input_deadline.reset();
+                    connection.credit_deadline = std::chrono::steady_clock::now() +
+                        std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
                     if (auto* hook = server_.delivery_test_hook_.load(std::memory_order_acquire))
                         hook->Run(FeedDeliveryTestHook::Point::kAfterPayloadCreditQueued, connection.session.connection_id);
                     return true;
@@ -478,6 +484,8 @@ void IdleIo::PumpCredits() {
             if (!credit) break;
             connection->payload_credit = std::move(credit);
             connection->waiting_credit = false;
+            connection->credit_deadline.reset();
+            RestartPieceDeadline(*connection);
             connection->read_ready = true;
             if (auto* hook = server_.delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kAfterPayloadCreditGranted, connection->session.connection_id);
@@ -708,6 +716,18 @@ void IdleIo::Serve(std::shared_ptr<ServerConnection>& connection) {
             connection->session.close_after_reply = true;
             Reply(*connection, Protocol::Error("PROTOCOL", "HELLO 3 was not completed within the I/O timeout"));
         }
+    } else if (alive && connection->waiting_credit) {
+        if (connection->credit_deadline && now >= *connection->credit_deadline) {
+            // Unread frames follow the line, so the refused request closes.
+            LogMessage(LogLevel::kWarn, LogComponent::kServer, "request refused", {
+                {"reason", "input_budget"}, {"error", "payload credit was not granted within the I/O timeout"},
+                {"socket", std::to_string(connection->socket)}, {"peer", connection->peer_endpoint},
+            });
+            connection->waiting_credit = false;
+            connection->credit_deadline.reset();
+            connection->session.close_after_reply = true;
+            Reply(*connection, Protocol::Error("BUSY", "input byte budget is full", {{"reason", "input_budget"}}));
+        }
     } else if (alive && ((connection->input_deadline && now >= *connection->input_deadline) ||
         (connection->output_deadline && now >= *connection->output_deadline) ||
         (connection->phase == Phase::kInput && !connection->input_deadline &&
@@ -807,7 +827,8 @@ void IdleIo::Run() {
                     wait_until(connection->handshake_deadline);
                 if (connection->input_deadline) wait_until(*connection->input_deadline);
                 if (connection->output_deadline) wait_until(*connection->output_deadline);
-                if (connection->phase == ServerConnection::Phase::kInput && !connection->input_deadline)
+                if (connection->waiting_credit && connection->credit_deadline) wait_until(*connection->credit_deadline);
+                else if (connection->phase == ServerConnection::Phase::kInput && !connection->input_deadline)
                     wait_until(connection->idle_deadline);
                 if (connection->read_ready && !connection->waiting_credit && connection->phase == ServerConnection::Phase::kInput) timeout = 0;
             }

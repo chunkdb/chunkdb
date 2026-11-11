@@ -32,6 +32,9 @@ struct ServerConnection : public std::enable_shared_from_this<ServerConnection> 
     short io_wait = POLLIN;
     std::chrono::steady_clock::time_point handshake_deadline{};
     server_detail::PhaseDeadline input_deadline, output_deadline;
+    // While waiting for payload credit: the frame deadline is suspended and
+    // this one bounds the wait.
+    server_detail::PhaseDeadline credit_deadline;
     bool record_deadline = false;
     std::string handshake_source, proxy_header;
     bool handshake_slot = false;

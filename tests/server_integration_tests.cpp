@@ -4497,6 +4497,86 @@ void TestRemovingCreditHeadAdmitsNextWaiter() {
     hook.Wait(small_id, true);
 }
 
+// Time spent waiting for the server's input credit is not the client's
+// lateness: the frame deadline starts when the credit is granted, and a
+// wait longer than the I/O timeout is refused with BUSY.
+void CheckPayloadCreditWait(bool granted) {
+    PayloadCreditHook hook;
+    constexpr auto io_timeout = std::chrono::milliseconds(1000);
+    auto config = BaseServerConfig(); config.client_io_timeout_ms = io_timeout.count(); config.worker_threads = 1U;
+    ServerHarness harness("payload-credit-wait", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient controller("127.0.0.1", harness.port); controller.Hello();
+    controller.SendLine("CREATE TABLE wide (v bits(512)) CHUNK 1024 x 1024");
+    assert(controller.ReadLine() == "+OK\r\n");
+    controller.SendLine("ALTER TABLE wide SET var_max_chunk_bytes = 67108864");
+    assert(controller.ReadLine() == "+OK\r\n");
+    // A paused COMMIT holds the only worker, so complete requests keep their credit in its queue.
+    RawClient owner("127.0.0.1", harness.port); owner.SetReadDeadline(std::chrono::seconds(20)); owner.Hello();
+    owner.SendLine("BEGIN"); assert(owner.ReadLine() == "+OK\r\n");
+    owner.SendLine("SET BLOCK 0 0 IN default bits = b'0100'"); assert(owner.ReadLine() == "_\r\n");
+    auto lease = harness.catalog->Require("default")->Acquire();
+    auto& store = lease->store();
+    constexpr auto point = chunkdb::TxnPausePoint::kBeforePostCommitOutcome;
+    store.ArmTxnPauseForTests(point);
+    struct Resume {
+        chunkdb::ChunkStore& store;
+        bool armed = true;
+        void operator()() { if (std::exchange(armed, false)) store.ResumeTxnForTests(point); }
+        ~Resume() { (*this)(); }
+    } resume{store};
+    owner.SendLine("COMMIT");
+    assert(store.WaitForTxnPauseForTests(point));
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    std::vector<std::unique_ptr<RawClient>> holders;
+    for (std::size_t i = 0U; i < 15U; ++i) {
+        auto client = std::make_unique<RawClient>("127.0.0.1", harness.port);
+        client->SetReadDeadline(std::chrono::seconds(20));
+        client->SendLine("HELLO 3");
+        const auto id = std::stoull(ReadHelloReply(*client).at("connection_id"));
+        client->SendBytes("SET CHUNK 0 0 IN wide $1\r\n$0\r\n\r\n");
+        hook.Wait(id, true);
+        holders.push_back(std::move(client));
+    }
+    const auto waiter = [&](RawClient& client) {
+        client.SetReadDeadline(std::chrono::seconds(20));
+        client.SendLine("HELLO 3");
+        const auto id = std::stoull(ReadHelloReply(client).at("connection_id"));
+        return id;
+    };
+    if (!granted) {
+        // Line and frame on time, and no credit within the timeout.
+        RawClient refused("127.0.0.1", harness.port);
+        const auto id = waiter(refused);
+        const auto start = Clock::now();
+        refused.SendBytes("SET CHUNK 0 0 IN wide $1\r\n$0\r\n\r\n");
+        hook.Wait(id, false);
+        assert(refused.ReadLine().starts_with("-ERR BUSY reason=input_budget "));
+        assert(ClosedAtDeadline(Clock::now() - start, io_timeout));
+        assert(refused.WaitForClose(std::chrono::seconds(5)));
+        assert(!hook.Granted(id));
+        return;
+    }
+    // Credit granted within the timeout of the wait; the frame follows more
+    // than the timeout after its line, and within it of the grant.
+    RawClient late("127.0.0.1", harness.port);
+    const auto id = waiter(late);
+    late.SendLine("SET CHUNK 0 0 IN wide $1");
+    hook.Wait(id, false);
+    std::this_thread::sleep_for(io_timeout * 6 / 10);
+    resume();
+    hook.Wait(id, true);
+    std::this_thread::sleep_for(io_timeout * 6 / 10);
+    late.SendBytes("$0\r\n\r\n");
+    const auto reply = late.ReadLine();
+    assert(!reply.starts_with("-ERR PROTOCOL"));
+    late.SendLine("PING");
+    assert(late.ReadLine() == "+PONG\r\n");
+    assert(ReadVersion(owner) != 0U);
+}
+
+void TestPayloadCreditWaitIsRefused() { CheckPayloadCreditWait(false); }
+void TestPayloadCreditGrantRestartsFrameDeadline() { CheckPayloadCreditWait(true); }
+
 void TestWideNullableReadHasBoundedReplyAdmission() {
     ServerHarness harness("wide-nullable-reply", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
     RawClient client("127.0.0.1", harness.port); client.SetReadDeadline(std::chrono::seconds(10)); client.Hello();
@@ -6758,6 +6838,8 @@ int main(int argc, char** argv) {
         run("TestWideNullableReadHasBoundedReplyAdmission", TestWideNullableReadHasBoundedReplyAdmission);
         run("TestReplyAdmissionPrecedesMutation", TestReplyAdmissionPrecedesMutation);
         run("TestRemovingCreditHeadAdmitsNextWaiter", TestRemovingCreditHeadAdmitsNextWaiter);
+        run("TestPayloadCreditWaitIsRefused", TestPayloadCreditWaitIsRefused);
+        run("TestPayloadCreditGrantRestartsFrameDeadline", TestPayloadCreditGrantRestartsFrameDeadline);
         run("TestKillIdleTransactionReleasesHistory", [] { TestKillIdleTransactionReleasesHistory<RawClient>(false); });
         run("TestKillDecidedCommitPreservesOutcome", [] { TestKillDecidedCommitPreservesOutcome<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL

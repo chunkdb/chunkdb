@@ -28,6 +28,7 @@ Data framing has 2147483648 bytes of credit and authentication/session controls 
 The reservation is the smaller of the sum of checked frame maxima and the statement-wide bound, with separately bounded opaque frames.
 Admission refuses an individual request exceeding its pool instead of waiting for credit it can never obtain.
 Ready requests wait in FIFO order for credit and reconsider admission on returned credit, a queue-head change or an absolute transport deadline.
+The wait suspends the request's frame deadline, which restarts when its credit is granted; after `--client-io-timeout-ms` of waiting it receives `BUSY reason=input_budget` and closes, because its unread frames follow the line.
 Removing a cancelled or closed waiter immediately pumps its successor even when the removed waiter held no credit.
 Reserving a complete request prevents multiple incomplete bodies from exhausting all credit while each waits for another frame.
 Credits remain charged while a worker owns the parameters and are released once on completion, refusal or final close.
