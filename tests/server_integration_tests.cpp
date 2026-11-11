@@ -2909,6 +2909,25 @@ void CheckTrickledFramesAreBounded(std::uint16_t port, std::size_t io_timeout_ms
         assert(ClosedAtDeadline(elapsed, io_timeout));
         assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol incomplete parameter frame\r\n");
     }
+    {
+        // A drained body, like a kept one, arrives whole within the timeout
+        // from the end of its header, however steadily its pieces come.
+        ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+        Client drained("127.0.0.1", port);
+        drained.Hello();
+        const auto start = Clock::now();
+        drained.SendBytes("SET BLOCK 0 0 IN missing c1 = $1\r\n$64\r\n");
+        auto sender = Trickle(drained, "xxxx", 16U, io_timeout / 4);
+        const bool ended = logs.WaitContains("payload deadline exceeded", io_timeout * 5);
+        const auto elapsed = Clock::now() - start;
+        sender.join();
+        assert(ended);
+        assert(ClosedAtDeadline(elapsed, io_timeout));
+        try {
+            assert(drained.ReadLine() == "-ERR PROTOCOL reason=protocol incomplete parameter frame\r\n");
+        } catch (const std::runtime_error&) {
+        }
+    }
     // The single worker is free again.
     Client fast("127.0.0.1", port);
     fast.Hello();
