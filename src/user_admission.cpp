@@ -95,7 +95,7 @@ UserPublication UserRegistry::PreparePublication(std::shared_ptr<const Users> ne
     return result;
 }
 
-void UserRegistry::Publish(UserPublication next) {
+void UserRegistry::Publish(UserPublication next) noexcept {
     for (auto& update : next.updates) {
         auto& state = *update.state;
         std::lock_guard lock(state.mutex);

@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #include "file_permissions.hpp"
@@ -134,7 +135,12 @@ void UserRegistry::SetMigrationHealth(std::shared_ptr<MigrationHealth> health) {
     migration_health_ = std::move(health);
 }
 
-void UserRegistry::CommitPublication(Users next, UserPublication publication, Wakes& wakes) {
+// Moving what was prepared allocates nothing and cannot throw.
+static_assert(std::is_nothrow_move_assignable_v<Users>);
+static_assert(std::is_nothrow_move_constructible_v<Users>);
+static_assert(std::is_nothrow_move_constructible_v<UserPublication>);
+
+void UserRegistry::CommitPublication(Users next, UserPublication publication, Wakes& wakes) noexcept {
     users_ = std::move(next);
     Publish(std::move(publication));
     // The view is published before the generation moves: a reader that sees

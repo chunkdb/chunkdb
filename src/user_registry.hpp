@@ -134,12 +134,13 @@ class UserRegistry {
     // they were.
     [[nodiscard]] UserPublication PreparePublication(std::shared_ptr<const Users> next) const;
     // Under mutex_: makes `next` visible. The caller moves the generation
-    // past it and marks `wakes` changed.
-    void Publish(UserPublication next);
+    // past it and marks `wakes` changed. It runs after the durable decision,
+    // so it cannot fail: PreparePublication allocated everything it needs.
+    void Publish(UserPublication next) noexcept;
     // Under mutex_: makes `next` current and visible, moves the generation
     // past it, and marks `wakes` to run every OnChange once the lock is
-    // released.
-    void CommitPublication(Users next, UserPublication publication, Wakes& wakes);
+    // released. Like Publish, it cannot fail.
+    void CommitPublication(Users next, UserPublication publication, Wakes& wakes) noexcept;
     void ConfirmPublication();
 
     const std::filesystem::path data_dir_;
