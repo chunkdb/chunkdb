@@ -458,6 +458,31 @@ SessionState TlsSession(std::vector<std::uint8_t> exporter, std::vector<std::uin
     return session;
 }
 
+// A login checked under one channel binding requirement does not finish
+// after the requirement changes, in either direction.
+void TestStaleLoginAfterBindingRequirementChange() {
+    const std::vector<std::uint8_t> exporter(32, 0x31);
+    const std::vector<std::uint8_t> end_point(32, 0x32);
+    for (const bool required_before : {false, true}) {
+        Server server;
+        server.users->Create("bot", chunkdb::scram::MakeVerifier("hunter2", std::vector<std::uint8_t>(16U, 7U),
+            chunkdb::scram::kMinIterations), false, false, required_before);
+        SessionState session = TlsSession(exporter, end_point);
+        // Bound while the user requires it, unbound while it does not: a
+        // login that would succeed if the requirement stayed.
+        const auto type = required_before ? chunkdb::scram::kTlsExporter : std::string_view{};
+        const auto client = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce(), type);
+        const auto first = server.Run(session, "HELLO 3 USER bot $1", Parameters{client.first});
+        assert(first.starts_with("+SCRAM "));
+        const auto final = chunkdb::scram::FinishClientLogin(client, "hunter2", first.substr(7, first.size() - 9),
+            required_before ? std::span<const std::uint8_t>(exporter) : std::span<const std::uint8_t>{});
+        server.users->SetRequiresChannelBinding("bot", !required_before);
+        ExpectError(server.Run(session, "AUTH $1", Parameters{final.message}), "AUTH_FAILED reason=stale_login");
+        assert(session.failed_auth_attempts == 0U && !session.greeted && !session.authenticated && !session.user_ticket);
+        assert(server.users->AuthenticationSnapshot("bot")->state->connections == 0U);
+    }
+}
+
 // Logins bound to their TLS connection (docs/PROTOCOL.md): both binding
 // types, a login made on another connection, and what a connection cannot
 // give.
@@ -561,6 +586,21 @@ void TestRequiredChannelBinding() {
     assert(!unbound.greeted && !plain.greeted);
     SessionState bound = TlsSession(exporter, end_point);
     assert(server.Login(bound, "bot", "hunter2", chunkdb::scram::kTlsServerEndPoint, end_point).rfind("%14\r\n", 0) == 0);
+
+    // At the user's connection limit, which `bound` reaches, an unbound login
+    // with the right password still fails like a wrong one, and a login
+    // bound to another connection still says so; only a valid login learns
+    // of the limit.
+    server.users->SetLimits("bot", 1U, std::nullopt);
+    SessionState limited = TlsSession(exporter, end_point);
+    ExpectReply(server.Login(limited, "bot", "hunter2"), kWrongLogin);
+    SessionState relayed = TlsSession(exporter, end_point);
+    ExpectError(server.Login(relayed, "bot", "hunter2", chunkdb::scram::kTlsExporter, std::vector<std::uint8_t>(32, 0x33)),
+        "AUTH_FAILED reason=channel_binding");
+    SessionState valid = TlsSession(exporter, end_point);
+    ExpectError(server.Login(valid, "bot", "hunter2", chunkdb::scram::kTlsExporter, exporter), "RATE_LIMITED reason=max_connections");
+    assert(!limited.greeted && !relayed.greeted && !valid.greeted && !limited.user_ticket && !relayed.user_ticket);
+    server.users->SetLimits("bot", 0U, std::nullopt);
 
     ExpectError(server.Run(bound, "ALTER USER bot NO REQUIRE CHANNEL BINDING"), "PERMISSION_DENIED MANAGES USERS");
     ExpectReply(server.Run(admin, "ALTER USER bot NO REQUIRE CHANNEL BINDING"), "+OK\r\n");
@@ -801,7 +841,7 @@ void TestSessionControls() {
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "controls") { TestSessionControls(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "read_only") { TestReadOnly(); return 0; }
-    if (argc == 2 && std::string_view(argv[1]) == "stale_auth") { TestStaleAuthenticationProofs(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "stale_auth") { TestStaleAuthenticationProofs(); TestStaleLoginAfterBindingRequirementChange(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "admission") { TestUserLimitStatementsAndAdmissionHook(); return 0; }
     if (argc != 1) return 2;
     TestAtomicRightsLists();
@@ -816,6 +856,7 @@ int main(int argc, char** argv) {
     TestConcurrentConditionalUsers();
     TestChannelBinding();
     TestRequiredChannelBinding();
+    TestStaleLoginAfterBindingRequirementChange();
     TestWithoutUsers();
     TestReadOnly();
     return 0;
