@@ -1341,7 +1341,7 @@ class ChunkStore {
         std::vector<std::uint8_t> presence_bitmap);
     // ApplyChunkState with the chunk's mutex held and the value changes
     // given; returns the chunk version after it. Given chunk columns replace
-    // the chunk's, checked as ApplyFullChunkStateLocked checks them;
+    // the chunk's; the caller has checked their variable-byte quota;
     // force_write commits a never-written chunk even when the state equals
     // the empty one it has. The ordinary write path of every unconditional
     // whole-state SET CHUNK: no rollback boundary, no commit intent.

@@ -1302,10 +1302,6 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
     if (!payload_changed && !presence_changed && var_update.empty() && !metadata_changed && !first_write) {
         return regular_chunk->version;
     }
-    if (supplied_chunk_columns) {
-        RequireVarWrite(regular_chunk->vars, var_update, chunk_columns->variable_bytes,
-            regular_chunk->written && regular_chunk->chunk_columns ? regular_chunk->chunk_columns->variable_bytes : 0U);
-    }
 
     // Reserve the version token before the chunk changes, so a version-clock
     // failure is a clean pre-WAL error and an open transaction can keep the
