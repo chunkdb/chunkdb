@@ -139,6 +139,12 @@ class SyncCount {
             return synced == path || (std::filesystem::equivalent(synced, path, ec) && !ec);
         });
     }
+    // Whether `path` was synced since the last Take, forgetting every sync.
+    [[nodiscard]] bool TakeSynced(const std::filesystem::path& path) {
+        const bool synced = Synced(path);
+        (void)Take();
+        return synced;
+    }
 
   private:
     void Note(const std::filesystem::path& path) {
@@ -200,18 +206,20 @@ void RelaxedUnconditionalWritesSyncNothing() {
         assert(syncs.Take() == 0U);
 
         // The conditional writes, and transformations (metadata and
-        // projected SET CHUNK), keep their durable decision.
+        // projected SET CHUNK), keep their durable decision: they publish an
+        // intent, and its directory is synced.
+        const auto intents = directory.path() / kConditionalIntentDirName;
         assert(store.TransformChunkState({4, 0}, {}, false, [&](ChunkState& target) {
             target.chunk_columns = Owner(store, 3U);
         }).ok);
-        assert(syncs.Take() != 0U);
+        assert(syncs.TakeSynced(intents));
         assert(store.WriteChunkState({3, 0}, state, {}, /*if_absent=*/true).ok);
-        assert(syncs.Take() != 0U);
+        assert(syncs.TakeSynced(intents));
         const auto expected = store.WriteChunkState({0, 0}, state, first);
         assert(expected.ok && expected.version == first);
         state.payload[0] = 10U;
         const auto versioned = store.WriteChunkState({0, 0}, state, first);
-        assert(versioned.ok && versioned.version > first && syncs.Take() != 0U);
+        assert(versioned.ok && versioned.version > first && syncs.TakeSynced(intents));
         first = versioned.version;
 
         // A barrier makes the first writes durable.
@@ -230,43 +238,56 @@ void RelaxedUnconditionalWritesSyncNothing() {
     assert(two.chunk_columns && two.chunk_columns->bytes == reopened.geometry().default_chunk_columns()->bytes);
 }
 // A first write that fails before its commit leaves the chunk never
-// written: no state, no chunk columns, no coordinate, nothing on disk.
+// written: no state, no chunk columns, no coordinate, no WAL, and a restart
+// finds nothing either.
 void FailedFirstWriteStaysNeverWritten() {
     test::ScopedTempDir directory("chunkdb-failed-first-write");
     auto config = Config(directory.path());
     config.chunk_schema = OwnerColumns();
-    std::uint64_t version = 0U;
+    const auto refused = [](ChunkStore& store, const std::function<void()>& write) {
+        bool failed = false;
+        {
+            txn_test::ScopedEnv failpoint("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+            try { write(); } catch (const std::runtime_error&) { failed = true; }
+        }
+        assert(failed);
+        const auto after = store.ReadChunkState(0, 0);
+        assert(!after.written && after.version == 0U && after.payload[0] == 0U);
+        assert(after.presence_bitmap[0] == 0U && after.chunk_columns == nullptr);
+        assert(store.ScanChunkIdentities(false, {}, 16U).entries.empty());
+        assert(store.ScanPopulatedChunks(false, {}, 16U).coords.empty());
+        // The refused frame left nothing a restart could replay.
+        assert(!std::filesystem::exists(ChunkWalPath(store.data_dir(), store.geometry(), {0, 0})));
+    };
     {
         ChunkStore store(config);
         auto state = store.ReadChunkState(0, 0);
         state.payload[0] = 7U;
         state.presence_bitmap[0] = 1U;
         state.chunk_columns = Owner(store, 5U);
-        const auto refused = [&](const std::function<void()>& write) {
-            bool failed = false;
-            {
-                txn_test::ScopedEnv failpoint("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
-                try { write(); } catch (const std::runtime_error&) { failed = true; }
-            }
-            assert(failed);
-            const auto after = store.ReadChunkState(0, 0);
-            assert(!after.written && after.version == 0U && after.payload[0] == 0U);
-            assert(after.presence_bitmap[0] == 0U && after.chunk_columns == nullptr);
-            assert(store.ScanChunkIdentities(false, {}, 16U).entries.empty());
-            assert(store.ScanPopulatedChunks(false, {}, 16U).coords.empty());
-        };
-        refused([&] { (void)store.WriteChunkState({0, 0}, state, {}); });
-        refused([&] { (void)store.TransformChunkState({0, 0}, {}, false, [&](ChunkState& target) { target = state; }); });
-        const auto written = store.WriteChunkState({0, 0}, state, {});
+        refused(store, [&] { (void)store.WriteChunkState({0, 0}, state, {}); });
+        refused(store, [&] { (void)store.TransformChunkState({0, 0}, {}, false, [&](ChunkState& target) { target = state; }); });
+    }
+    std::uint64_t version = 0U;
+    {
+        ChunkStore reopened(config);
+        assert(!reopened.ReadChunkState(0, 0).written);
+        assert(reopened.ScanChunkIdentities(false, {}, 16U).entries.empty());
+        // A different state, so a refused frame still on disk would show.
+        auto state = reopened.ReadChunkState(0, 0);
+        state.payload[0] = 8U;
+        state.presence_bitmap[0] = 3U;
+        state.chunk_columns = Owner(reopened, 6U);
+        const auto written = reopened.WriteChunkState({0, 0}, state, {});
         assert(written.ok && written.version != 0U);
         version = written.version;
-        const auto page = store.ScanChunkIdentities(false, {}, 16U);
+        const auto page = reopened.ScanChunkIdentities(false, {}, 16U);
         assert(page.entries.size() == 1U && page.entries[0].version == version);
     }
     ChunkStore reopened(config);
     const auto state = reopened.ReadChunkState(0, 0);
-    assert(state.written && state.version == version && state.payload[0] == 7U);
-    assert(state.chunk_columns && state.chunk_columns->bytes == Owner(reopened, 5U)->bytes);
+    assert(state.written && state.version == version && state.payload[0] == 8U && state.presence_bitmap[0] == 3U);
+    assert(state.chunk_columns && state.chunk_columns->bytes == Owner(reopened, 6U)->bytes);
 }
 }
 
