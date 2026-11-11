@@ -81,8 +81,7 @@ To refuse logins that are not bound, start the server with `--auth-channel-bindi
 ALTER USER bot REQUIRE CHANNEL BINDING
 ```
 
-Binding needs TLS that ends at the server.
-Behind a load balancer that ends TLS, turn channel binding off in the client and do not require it.
+Binding needs TLS that ends at the server: behind a load balancer that ends TLS, turn channel binding off in the client and do not require it.
 An unbound login of a user that requires binding fails with the same AUTH_FAILED as a wrong password.
 A user that requires binding cannot log in to a server without a `chunks://` listener, and a password reset keeps the requirement; start the server with TLS to log in and run `ALTER USER bot NO REQUIRE CHANNEL BINDING`.
 
