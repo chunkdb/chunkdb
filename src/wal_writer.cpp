@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -476,6 +477,14 @@ void ChunkStore::FlushWalBatch(
         // stream exists and is open.
         WalAppendStream& output = *chunk->wal_append_stream;
         batch_write_started = true;
+        // Crash tests: the process ends inside the append, with half of the
+        // batch written, or with all of it written and not yet synced.
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_BATCH_TORN_WRITE_ONCE")) {
+            output.write(reinterpret_cast<const char*>(chunk->wal_batch.data()),
+                static_cast<std::streamsize>(chunk->wal_batch.size() / 2U));
+            output.flush();
+            std::_Exit(86);
+        }
         output.write(
             reinterpret_cast<const char*>(chunk->wal_batch.data()),
             static_cast<std::streamsize>(chunk->wal_batch.size()));
@@ -483,6 +492,7 @@ void ChunkStore::FlushWalBatch(
         if (!output.good()) {
             throw std::system_error(output.error(), std::generic_category(), "failed to append WAL record batch: " + chunk->wal_path.string());
         }
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_BATCH_BEFORE_SYNC_ONCE")) std::_Exit(86);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE")) {
             throw std::runtime_error(
                 "injected WAL batch sync failure: " + chunk->wal_path.string());

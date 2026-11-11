@@ -8,6 +8,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -375,6 +376,87 @@ void TestDimensionalAutocommitMetadataCrash(const std::string& executable) {
     }
 }
 
+
+// One unconditional whole-state write of blocks and metadata, ordinary rather
+// than under a rollback intent, to a written chunk (A) or a never-written one
+// (C). The process ends inside the WAL append or after the acknowledgement.
+// Nothing else takes a version in this process, so the write reserves the
+// version after an acknowledged anchor write, recorded first.
+int RunWholeState3DChild(const std::filesystem::path& dir, DurabilityMode mode, const std::string& failpoint,
+    const std::string& target, const std::filesystem::path& record) {
+    ChunkStore store(Crash3DConfig(dir, mode));
+    auto anchor = store.ReadChunkState(kB3);
+    SetCounter(&anchor, 3);
+    const auto anchored = store.WriteChunkState(kB3, anchor, std::nullopt);
+    const auto reserved = anchored.version + 1U;
+    { std::ofstream(record) << reserved << '\n'; }
+    const auto coord = target == "a" ? kA3 : kC3;
+    auto state = store.ReadChunkState(coord);
+    SetCounter(&state, 10);
+    state.chunk_columns = std::make_shared<const chunkdb::ChunkColumnState>(chunkdb::AssignChunkColumns(
+        store.geometry().chunk_schema(), state.chunk_columns.get(), {{"tag", std::uint64_t{11U}}}, !state.written));
+    if (failpoint != "none") {
+        chunkdb::txn_test::ScopedEnv armed(failpoint.c_str(), "1");
+        (void)store.WriteChunkState(coord, state, std::nullopt);
+        return 3;
+    }
+    if (store.WriteChunkState(coord, state, std::nullopt).version != reserved) return 4;
+    std::_Exit(kCrashExit);
+}
+
+// After the restart the chunk holds its old state or all of the new one with
+// the reserved version, never a mix; an acknowledged write is always there.
+// A write whose frame reached the WAL before the process ended survives even
+// unacknowledged: the ordinary path has no intent to roll it back.
+void TestUnconditionalWholeStateCrash(const std::string& executable) {
+    const std::vector<std::pair<const char*, bool>> points = {
+        {"CHUNKDB_FAILPOINT_CRASH_WAL_BATCH_TORN_WRITE_ONCE", false},
+        {"CHUNKDB_FAILPOINT_CRASH_WAL_BATCH_BEFORE_SYNC_ONCE", true},
+        {"none", true},
+    };
+    for (const auto mode : {DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint}) {
+        for (const std::string target : {"a", "c"}) {
+            for (const auto& [failpoint, applied] : points) {
+                ScopedTempDir dir("chunkdb-whole-state-crash-3d");
+                Seed3D(dir.path(), mode);
+                const auto coord = target == "a" ? kA3 : kC3;
+                std::uint64_t seeded = 0U;
+                {
+                    ChunkStore store(Crash3DConfig(dir.path(), mode));
+                    seeded = store.ReadChunkState(coord).version;
+                }
+                const auto record = dir.path() / "reserved.txt";
+                const int code = RunChild(executable, {"--whole-state-crash-3d-child", dir.path().string(),
+                    ModeArg(mode), failpoint, target, record.string()});
+                if (code != kCrashExit) {
+                    std::fprintf(stderr, "whole-state child for %s on %s exited with %d\n", failpoint, target.c_str(), code);
+                    assert(false);
+                }
+                std::uint64_t reserved = 0U;
+                { std::ifstream(record) >> reserved; }
+                assert(reserved != 0U);
+                ChunkStore store(Crash3DConfig(dir.path(), mode));
+                assert(!HasRollbackIntent(dir.path()));
+                const auto state = store.ReadChunkState(coord);
+                if (applied) {
+                    assert(state.written && state.version == reserved);
+                    assert(Counter3D(store, coord) == 10U && Tag(store, coord) == std::optional<std::uint64_t>{11U});
+                } else if (target == "a") {
+                    assert(state.written && state.version == seeded);
+                    assert(Counter3D(store, coord) == 1U && Tag(store, coord) == std::nullopt);
+                } else {
+                    assert(!state.written && state.version == 0U && Counter3D(store, coord) == 0U);
+                }
+                assert(Counter3D(store, kB3) == 3U);
+                // The store goes on, above every version the crashed process issued.
+                auto next = store.ReadChunkState(coord);
+                SetCounter(&next, 77);
+                assert(store.WriteChunkState(coord, next, std::nullopt).version > reserved);
+            }
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -387,6 +469,9 @@ int main(int argc, char** argv) {
     if (argc == 5 && std::string(argv[1]) == "--autocommit-crash-3d-child") {
         return RunAutocommit3DChild(argv[2], ParseMode(argv[3]), argv[4]);
     }
+    if (argc == 7 && std::string(argv[1]) == "--whole-state-crash-3d-child") {
+        return RunWholeState3DChild(argv[2], ParseMode(argv[3]), argv[4], argv[5], argv[6]);
+    }
     if (argc == 4 && std::string(argv[1]) == "--recovery-crash-child") {
         return RunRecoveryChild(argv[2], ParseMode(argv[3]));
     }
@@ -394,5 +479,6 @@ int main(int argc, char** argv) {
     TestCrashDuringRecovery(argv[0]);
     TestDimensionalMetadataCrash(argv[0]);
     TestDimensionalAutocommitMetadataCrash(argv[0]);
+    TestUnconditionalWholeStateCrash(argv[0]);
     return 0;
 }
