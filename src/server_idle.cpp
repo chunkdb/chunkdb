@@ -444,13 +444,13 @@ void IdleIo::CheckStatements() {
             tracked.io_claimed = true;
             if (auto* hook = server_.delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kAfterQueuedStopClaim, connection->session.connection_id);
-            Reply(*connection, StatementStoppedReply(*stopped));
-            if (connection->record->killed.load()) connection->session.close_after_reply = true;
-            if (connection->worker_queued) {
-                connection->worker_queued = false;
-                clients_returned_.push_back(std::move(connection));
-            }
             tracked.statement.reset();
+            const bool queued = std::exchange(connection->worker_queued, false);
+            try {
+                Reply(*connection, StatementStoppedReply(*stopped));
+                if (connection->record->killed.load()) connection->session.close_after_reply = true;
+                if (queued) clients_returned_.push_back(connection);
+            } catch (const std::exception& error) { Abandon(connection, error); }
         }
     }
     std::erase_if(statements_, [](const auto& tracked) { return !tracked.statement; });
@@ -467,7 +467,14 @@ void IdleIo::PumpCredits() {
                 if (data) data_waiter_count_.fetch_sub(1U, std::memory_order_release);
                 continue;
             }
-            auto credit = pool->TryAcquire(connection->payload_credit_bytes);
+            std::shared_ptr<ConnectionByteBudget::Credit> credit;
+            try { credit = pool->TryAcquire(connection->payload_credit_bytes); }
+            catch (const std::exception& error) {
+                waiters.pop_front();
+                if (data) data_waiter_count_.fetch_sub(1U, std::memory_order_release);
+                Abandon(connection, error);
+                continue;
+            }
             if (!credit) break;
             connection->payload_credit = std::move(credit);
             connection->waiting_credit = false;
@@ -669,6 +676,84 @@ bool IdleIo::Progress(ServerConnection& connection) {
     return alive && Parse(connection);
 }
 
+void IdleIo::Serve(std::shared_ptr<ServerConnection>& connection) {
+    bool alive = true;
+    if (connection->record->killed.load() &&
+        (connection->phase != ServerConnection::Phase::kReply ||
+         (!connection->irreversible_reply && !connection->record->self_kill_reply.load()))) alive = false;
+    try { if (alive) alive = Progress(*connection); }
+    catch (const std::invalid_argument& error) {
+        alive = RejectProtocol(*connection, error);
+    } catch (const std::runtime_error& error) {
+        alive = RejectProtocol(*connection, error);
+    }
+    const auto now = std::chrono::steady_clock::now();
+    using Phase = ServerConnection::Phase;
+    if (alive && !connection->session.greeted &&
+        now >= connection->handshake_deadline) {
+        if (connection->phase == Phase::kTls || connection->phase == Phase::kProxy) {
+            LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
+                {"phase", "handshake"}, {"reason", "timeout"}, {"error", "handshake deadline exceeded"},
+                {"socket", std::to_string(connection->socket)}, {"peer", connection->peer_endpoint},
+            });
+            alive = false;
+        } else if (connection->phase == Phase::kReply) alive = false;
+        else {
+            // A slow client, not a malformed request: told why, then closed.
+            LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
+                {"phase", "handshake"}, {"reason", "timeout"},
+                {"error", "HELLO 3 was not completed within the I/O timeout"},
+                {"socket", std::to_string(connection->socket)}, {"peer", connection->peer_endpoint},
+            });
+            connection->session.close_after_reply = true;
+            Reply(*connection, Protocol::Error("PROTOCOL", "HELLO 3 was not completed within the I/O timeout"));
+        }
+    } else if (alive && ((connection->input_deadline && now >= *connection->input_deadline) ||
+        (connection->output_deadline && now >= *connection->output_deadline) ||
+        (connection->phase == Phase::kInput && !connection->input_deadline &&
+         now >= connection->idle_deadline))) {
+        LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
+            {"phase", connection->output_deadline ? "write" : "read"}, {"reason", "timeout"},
+            {"error", connection->output_deadline ? "reply progress deadline exceeded" :
+                connection->request_line.empty() ? "request line deadline exceeded" : "payload deadline exceeded"},
+            {"socket", std::to_string(connection->socket)}, {"peer", connection->peer_endpoint},
+        });
+        // A frame that stops arriving is told before the close;
+        // a stalled line or reply is closed without one.
+        if (connection->phase == Phase::kInput && !connection->output_deadline && connection->frames &&
+            !connection->waiting_credit) {
+            connection->frames.reset();
+            connection->input_deadline.reset();
+            connection->session.close_after_reply = true;
+            Reply(*connection, Protocol::Error("PROTOCOL", "incomplete parameter frame"));
+        } else alive = false;
+    }
+    if (!alive) {
+        connection->waiting_credit = false;
+        server_.CloseClient(*connection);
+        connection.reset();
+        PumpCredits();
+    } else if (connection->phase == Phase::kReady) {
+        if (server_.DispatchClient(connection)) connection.reset();
+    } else if (connection->phase == Phase::kInput &&
+        (connection->session.watch || connection->session.slot_watch)) {
+        if (server_.HandOff(connection)) connection.reset();
+        else { server_.CloseClient(*connection); connection.reset(); }
+    }
+}
+
+void IdleIo::Abandon(std::shared_ptr<ServerConnection>& connection, const std::exception& error) {
+    // Replying could need the memory that just ran out, so the client gets
+    // none. A connection a worker already received belongs to that worker.
+    if (connection && !connection->worker_queued) {
+        connection->waiting_credit = false;
+        server_.CloseClient(*connection);
+    }
+    connection.reset();
+    LogMessage(LogLevel::kError, LogComponent::kServer,
+        "connection closed after an internal error", {{"error", error.what()}});
+}
+
 void IdleIo::Run() {
     std::vector<std::shared_ptr<ServerConnection>> clients;
     std::vector<SocketInterest> interests;
@@ -695,69 +780,10 @@ void IdleIo::Run() {
             clients_returned_.clear();
             PumpCredits();
             for (auto& connection : clients) {
-                bool alive = true;
-                if (connection->record->killed.load() &&
-                    (connection->phase != ServerConnection::Phase::kReply ||
-                     (!connection->irreversible_reply && !connection->record->self_kill_reply.load()))) alive = false;
-                try { if (alive) alive = Progress(*connection); }
-                catch (const std::invalid_argument& error) {
-                    alive = RejectProtocol(*connection, error);
-                } catch (const std::runtime_error& error) {
-                    alive = RejectProtocol(*connection, error);
-                }
-                const auto now = std::chrono::steady_clock::now();
-                using Phase = ServerConnection::Phase;
-                if (alive && !connection->session.greeted &&
-                    now >= connection->handshake_deadline) {
-                    if (connection->phase == Phase::kTls || connection->phase == Phase::kProxy) {
-                        LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
-                            {"phase", "handshake"}, {"reason", "timeout"}, {"error", "handshake deadline exceeded"},
-                            {"socket", std::to_string(connection->socket)}, {"peer", connection->peer_endpoint},
-                        });
-                        alive = false;
-                    } else if (connection->phase == Phase::kReply) alive = false;
-                    else {
-                        // A slow client, not a malformed request: told why, then closed.
-                        LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
-                            {"phase", "handshake"}, {"reason", "timeout"},
-                            {"error", "HELLO 3 was not completed within the I/O timeout"},
-                            {"socket", std::to_string(connection->socket)}, {"peer", connection->peer_endpoint},
-                        });
-                        connection->session.close_after_reply = true;
-                        Reply(*connection, Protocol::Error("PROTOCOL", "HELLO 3 was not completed within the I/O timeout"));
-                    }
-                } else if (alive && ((connection->input_deadline && now >= *connection->input_deadline) ||
-                    (connection->output_deadline && now >= *connection->output_deadline) ||
-                    (connection->phase == Phase::kInput && !connection->input_deadline &&
-                     now >= connection->idle_deadline))) {
-                    LogMessage(LogLevel::kWarn, LogComponent::kServer, "connection terminated", {
-                        {"phase", connection->output_deadline ? "write" : "read"}, {"reason", "timeout"},
-                        {"error", connection->output_deadline ? "reply progress deadline exceeded" :
-                            connection->request_line.empty() ? "request line deadline exceeded" : "payload deadline exceeded"},
-                        {"socket", std::to_string(connection->socket)}, {"peer", connection->peer_endpoint},
-                    });
-                    // A frame that stops arriving is told before the close;
-                    // a stalled line or reply is closed without one.
-                    if (connection->phase == Phase::kInput && !connection->output_deadline && connection->frames &&
-                        !connection->waiting_credit) {
-                        connection->frames.reset();
-                        connection->input_deadline.reset();
-                        connection->session.close_after_reply = true;
-                        Reply(*connection, Protocol::Error("PROTOCOL", "incomplete parameter frame"));
-                    } else alive = false;
-                }
-                if (!alive) {
-                    connection->waiting_credit = false;
-                    server_.CloseClient(*connection);
-                    connection.reset();
-                    PumpCredits();
-                } else if (connection->phase == Phase::kReady) {
-                    if (server_.DispatchClient(connection)) connection.reset();
-                } else if (connection->phase == Phase::kInput &&
-                    (connection->session.watch || connection->session.slot_watch)) {
-                    if (server_.HandOff(connection)) connection.reset();
-                    else { server_.CloseClient(*connection); connection.reset(); }
-                }
+                // Closed while its stopped statement was answered.
+                if (connection->socket == kInvalidSocket) { connection.reset(); continue; }
+                try { Serve(connection); }
+                catch (const std::exception& error) { Abandon(connection, error); }
             }
             std::erase(clients, nullptr);
             PumpCredits();
@@ -792,9 +818,10 @@ void IdleIo::Run() {
             for (std::size_t i = 0U; i < clients.size(); ++i)
                 if (interests[i].ready != 0) clients[i]->read_ready = true;
         }
-    } catch (const std::bad_alloc& error) { fail(error); }
-      catch (const std::logic_error& error) { fail(error); }
-      catch (const std::runtime_error& error) { fail(error); }
+    } catch (const std::exception& error) {
+        // Only the poller, wake-ups and the scan itself fail here.
+        fail(error);
+    }
     for (const auto& connection : clients) if (connection) server_.CloseClient(*connection);
     const auto close_queued = [&](const auto& tracked) {
         if (tracked.statement) (void)tracked.statement->RequestStop(StatementStopReason::kKilled);

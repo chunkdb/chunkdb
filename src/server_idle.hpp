@@ -38,6 +38,9 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
     bool ReserveReply(ServerConnection& connection, std::size_t bytes, bool control);
     bool RejectProtocol(ServerConnection& connection, const std::exception& error);
     void RestartPieceDeadline(ServerConnection& connection);
+    // One connection's step on this thread; its failure closes only it.
+    void Serve(std::shared_ptr<ServerConnection>& connection);
+    void Abandon(std::shared_ptr<ServerConnection>& connection, const std::exception& error);
     void PumpCredits();
     void CheckStatements();
     ChunkServer& server_;

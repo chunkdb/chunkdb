@@ -2011,7 +2011,8 @@ class IdleDispatchFailureHook : public chunkdb::FeedDeliveryTestHook {
     std::promise<void> reached_;
 };
 
-void TestIdleDispatchFailureClosesEveryOwner() {
+// A failure while one connection is dispatched closes that connection only.
+void TestIdleDispatchFailureClosesItsConnection() {
     IdleDispatchFailureHook failure;
     auto config = BaseServerConfig();
     config.worker_threads = 1U;
@@ -2025,7 +2026,53 @@ void TestIdleDispatchFailureClosesEveryOwner() {
     first.SendLine("PING");
     failure.Wait();
     assert(first.WaitForClose(std::chrono::seconds(10)));
-    assert(second.WaitForClose(std::chrono::seconds(10)));
+    assert(first.Received().empty());
+    second.SendLine("PING");
+    assert(second.ReadLine() == "+PONG\r\n");
+    RawClient third("127.0.0.1", harness.port);
+    third.Hello();
+}
+
+// Throws `Error` once, from the I/O thread, when it reads a client.
+template <typename Error>
+class ClientReadFailureHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        if (point == Point::kBeforeClientRead && !failed_.exchange(true)) throw Error();
+    }
+  private:
+    std::atomic<bool> failed_{false};
+};
+
+struct InjectedOutOfRange : std::out_of_range {
+    InjectedOutOfRange() : std::out_of_range("injected out of range") {}
+};
+
+// Any exception while the I/O thread serves one connection closes that
+// connection without a reply; the others and the listener keep working.
+template <typename Error>
+void CheckClientReadFailureClosesItsConnection() {
+    ClientReadFailureHook<Error> failure;
+    ServerHarness harness("client-read-failure", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    RawClient first("127.0.0.1", harness.port);
+    first.Hello();
+    RawClient second("127.0.0.1", harness.port);
+    second.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &failure);
+    first.SendLine("PING");
+    assert(first.WaitForClose(std::chrono::seconds(10)));
+    assert(first.Received().empty());
+    second.SendLine("PING");
+    assert(second.ReadLine() == "+PONG\r\n");
+    RawClient third("127.0.0.1", harness.port);
+    third.Hello();
+}
+
+void TestClientReadFailureClosesItsConnection() {
+    CheckClientReadFailureClosesItsConnection<std::bad_alloc>();
+    CheckClientReadFailureClosesItsConnection<InjectedOutOfRange>();
+    CheckClientReadFailureClosesItsConnection<std::bad_function_call>();
 }
 
 class IdleQueuePressureHook : public chunkdb::FeedDeliveryTestHook {
@@ -6629,7 +6676,8 @@ int main(int argc, char** argv) {
 #endif
         run("TestPing", TestPing);
         run("TestIdleConnectionsReleaseWorker", [] { TestIdleConnectionsReleaseWorker<RawClient>(false); });
-        run("TestIdleDispatchFailureClosesEveryOwner", TestIdleDispatchFailureClosesEveryOwner);
+        run("TestIdleDispatchFailureClosesItsConnection", TestIdleDispatchFailureClosesItsConnection);
+        run("TestClientReadFailureClosesItsConnection", TestClientReadFailureClosesItsConnection);
         run("TestIdleDispatchRespectsQueueCredit", TestIdleDispatchRespectsQueueCredit);
         run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);
         run("TestConnectionListingTrimsStatementWhitespace", TestConnectionListingTrimsStatementWhitespace);
