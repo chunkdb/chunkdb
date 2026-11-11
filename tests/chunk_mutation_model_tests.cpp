@@ -11,6 +11,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "test_utils.hpp"
 #include "txn_test_utils.hpp"
+#include "wal_writer.hpp"
 
 namespace chunkdb {
 struct FeatureActivationTestAccess {
@@ -290,6 +291,65 @@ void FailedFirstWriteStaysNeverWritten() {
     assert(state.chunk_columns && state.chunk_columns->bytes == Owner(reopened, 6U)->bytes);
 }
 }
+// A whole-state write that changes only the chunk columns of a written chunk
+// is one frame holding only a chunk-columns record: a refused one leaves the
+// earlier columns, in memory and after a restart, and a committed one replays.
+void ChunkColumnsOnlyWriteRollsBackAndReplays() {
+    test::ScopedTempDir directory("chunkdb-chunk-columns-only-write");
+    auto config = Config(directory.path());
+    config.chunk_schema = OwnerColumns();
+    // No checkpoint: the frames stay in the WAL, which the test measures.
+    config.checkpoint_update_interval = 1000U;
+    config.checkpoint_wal_bytes = 1U << 20U;
+    std::uint64_t first = 0U;
+    const auto wal_bytes = [&](ChunkStore& store) {
+        return std::filesystem::file_size(ChunkWalPath(store.data_dir(), store.geometry(), {0, 0}));
+    };
+    {
+        ChunkStore store(config);
+        auto state = store.ReadChunkState(0, 0);
+        state.payload[0] = 7U;
+        state.presence_bitmap[0] = 1U;
+        state.chunk_columns = Owner(store, 5U);
+        first = store.WriteChunkState({0, 0}, state, {}).version;
+        assert(first != 0U);
+        const auto before = wal_bytes(store);
+        state.chunk_columns = Owner(store, 9U);
+        bool failed = false;
+        {
+            txn_test::ScopedEnv failpoint("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+            try { (void)store.WriteChunkState({0, 0}, state, {}); } catch (const std::runtime_error&) { failed = true; }
+        }
+        assert(failed);
+        const auto after = store.ReadChunkState(0, 0);
+        assert(after.version == first && after.payload[0] == 7U);
+        assert(after.chunk_columns && after.chunk_columns->bytes == Owner(store, 5U)->bytes);
+        assert(wal_bytes(store) == before);
+    }
+    std::uint64_t second = 0U;
+    {
+        ChunkStore store(config);
+        auto state = store.ReadChunkState(0, 0);
+        assert(state.version == first && state.chunk_columns->bytes == Owner(store, 5U)->bytes);
+        const auto before = wal_bytes(store);
+        state.chunk_columns = Owner(store, 9U);
+        second = store.WriteChunkState({0, 0}, state, {}).version;
+        assert(second > first);
+        const auto columns_frame = wal_bytes(store) - before;
+        // A frame changing only the payload has the same header and trailer:
+        // the two differ by one payload span against one columns record.
+        state.payload[0] = 11U;
+        const auto middle = wal_bytes(store);
+        second = store.WriteChunkState({0, 0}, state, {}).version;
+        const auto payload_frame = wal_bytes(store) - middle;
+        assert(columns_frame + WalFrameBuilder::SpanRecordBytes(state.payload.size()) ==
+            payload_frame + WalFrameBuilder::ChunkColumnsRecordBytes(*state.chunk_columns));
+    }
+    ChunkStore reopened(config);
+    const auto state = reopened.ReadChunkState(0, 0);
+    assert(state.version == second && state.payload[0] == 11U && state.presence_bitmap[0] == 1U);
+    assert(state.chunk_columns && state.chunk_columns->bytes == Owner(reopened, 9U)->bytes);
+}
 
 int main() {
     AtomicTransformOwnsWholeState();
@@ -297,4 +357,5 @@ int main() {
     NeverWrittenDefaultIsNotPriorQuota();
     RelaxedUnconditionalWritesSyncNothing();
     FailedFirstWriteStaysNeverWritten();
+    ChunkColumnsOnlyWriteRollsBackAndReplays();
 }
