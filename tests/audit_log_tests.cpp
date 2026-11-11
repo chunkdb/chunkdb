@@ -157,6 +157,54 @@ void TestLoginEvents() {
     assert(!Contains(ReadAll(e.audit_path), "SCRAM"));
 }
 
+// Logins that channel binding refuses: one bound to another connection, one
+// not bound on a server that requires it, and one not bound for a user that
+// requires it.
+void TestChannelBindingEvents() {
+    const std::vector<std::uint8_t> exporter(32, 0x31);
+    const std::vector<std::uint8_t> relay(32, 0x32);
+    const auto tls = [&](Engine& e, std::uint64_t id) {
+        auto session = e.Session(id);
+        session.channel_bindings = chunkdb::ChannelBindings{.tls = true, .tls_exporter = exporter, .tls_server_end_point = {}};
+        return session;
+    };
+    // HELLO 3 USER and AUTH of a login bound to `data`.
+    const auto bound_login = [](Engine& e, SessionState& session, const std::vector<std::uint8_t>& data) {
+        const auto login = chunkdb::scram::StartClientLogin(kAdmin, chunkdb::scram::NewNonce(), chunkdb::scram::kTlsExporter);
+        const auto first = e.Run(session, chunkdb::test::HelloUserLine(kAdmin), Parameters{login.first});
+        assert(first.rfind("+SCRAM ", 0) == 0);
+        const auto step = chunkdb::test::AuthBytes(login, kPassword, first, data);
+        // The frame of `AUTH $1`, after its length line.
+        const auto frame = step.bytes.find("\r\n", step.bytes.find("\r\n$") + 2U) + 2U;
+        return e.Run(session, "AUTH $1", Parameters{step.bytes.substr(frame, step.bytes.size() - frame - 2U)});
+    };
+    {
+        Engine e;
+        auto relayed = tls(e, 21);
+        assert(bound_login(e, relayed, relay).rfind("-ERR AUTH_FAILED reason=channel_binding ", 0) == 0);
+        auto bound = tls(e, 22);
+        assert(bound_login(e, bound, exporter).rfind("%", 0) == 0);
+        auto admin = e.Admin(23);
+        assert(e.Run(admin, "ALTER USER admin REQUIRE CHANNEL BINDING") == "+OK\r\n");
+        auto unbound = tls(e, 24);
+        assert(e.Login(unbound, kAdmin, std::string(kPassword)).rfind("-ERR AUTH_FAILED reason=auth_failed ", 0) == 0);
+
+        const auto lines = Lines(e.audit_path);
+        LineWith(lines, {"\"event\":\"login\"", "\"connection\":21", "\"user\":\"admin\"", "\"ok\":false",
+                         "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"channel_binding\""});
+        LineWith(lines, {"\"event\":\"login\"", "\"connection\":22", "\"ok\":true"});
+        LineWith(lines, {"\"event\":\"login\"", "\"connection\":24", "\"user\":\"admin\"", "\"ok\":false",
+                         "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"channel_binding_required\""});
+    }
+    chunkdb::EngineConfig config;
+    config.require_channel_binding = true;
+    Engine strict(config);
+    auto unbound = tls(strict, 31);
+    assert(strict.Login(unbound, kAdmin, std::string(kPassword)).rfind("-ERR AUTH_REQUIRED reason=channel_binding ", 0) == 0);
+    LineWith(Lines(strict.audit_path), {"\"connection\":31", "\"user\":\"admin\"", "\"ok\":false",
+                                        "\"error_code\":\"AUTH_REQUIRED\"", "\"reason\":\"channel_binding\""});
+}
+
 // Every audited statement, with the names it acts on, and a failure with its
 // code; reads and writes of blocks are not audited.
 void TestStatementEvents() {
@@ -411,6 +459,7 @@ void TestLoginLimits() {
 
 int main() {
     TestLoginEvents();
+    TestChannelBindingEvents();
     TestStatementEvents();
     TestDroppedUserEvents();
     TestFileAndReopen();

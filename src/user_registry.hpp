@@ -87,16 +87,18 @@ class UserRegistry {
     // Each throws std::invalid_argument for a change the rules refuse: an
     // existing or unknown user, a bad name, removing the last user who
     // manages users.
-    void Create(const std::string& name, scram::Verifier verifier, bool manages_users, bool if_not_exists = false);
+    void Create(const std::string& name, scram::Verifier verifier, bool manages_users, bool if_not_exists = false,
+        bool requires_channel_binding = false);
     // An existing conditional user keeps its verifier and rights; the factory
     // is evaluated only after the registry lock confirms the user is absent.
     void Create(const std::string& name, const std::function<scram::Verifier()>& make_verifier,
-        bool manages_users, bool if_not_exists = false);
+        bool manages_users, bool if_not_exists = false, bool requires_channel_binding = false);
     void SetVerifier(const std::string& name, scram::Verifier verifier);
     // Sets the verifier of `name` only while it is still `incarnation`;
     // false, changing nothing, once that user was dropped.
     [[nodiscard]] bool SetOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier);
     void SetManagesUsers(const std::string& name, bool manages_users);
+    void SetRequiresChannelBinding(const std::string& name, bool requires_channel_binding);
     void Drop(const std::string& name, bool if_exists = false);
     void Grant(const std::string& name, const std::string& table, Right right);
     // Removes `right` and those above it on `table`: a user who had ADMIN

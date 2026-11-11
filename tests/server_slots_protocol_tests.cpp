@@ -88,8 +88,8 @@ struct AckDeadlineIoTestAccess {
     static void TlsWriteCap(ChunkServer& server) {
         auto* server_context = SSL_CTX_new(TLS_server_method());
         auto* client_context = SSL_CTX_new(TLS_client_method());
-        const auto& cert_pem = slot_socket_test::kTestTlsCertPem;
-        const auto& key_pem = slot_socket_test::kTestTlsKeyPem;
+        const auto& cert_pem = test::TestTls().cert_pem;
+        const auto& key_pem = test::TestTls().key_pem;
         auto* cert_bio = BIO_new_mem_buf(cert_pem.data(), static_cast<int>(cert_pem.size()));
         auto* key_bio = BIO_new_mem_buf(key_pem.data(), static_cast<int>(key_pem.size()));
         auto* cert = PEM_read_bio_X509(cert_bio, nullptr, nullptr, nullptr);

@@ -1745,8 +1745,9 @@ std::string CommandEngine::ExecuteStatement(
                     RequireManagesUsers(session);
                     if (create.if_not_exists)
                         config_.users->Create(create.user, [&] { return VerifierFrom(create.verifier, parameters); },
-                                              create.manages_users, true);
-                    else config_.users->Create(create.user, VerifierFrom(create.verifier, parameters), create.manages_users);
+                                              create.manages_users, true, create.requires_channel_binding);
+                    else config_.users->Create(create.user, VerifierFrom(create.verifier, parameters), create.manages_users,
+                                               false, create.requires_channel_binding);
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::AlterUser& alter) {
@@ -1767,6 +1768,9 @@ std::string CommandEngine::ExecuteStatement(
                             throw std::invalid_argument("this server runs without users (--auth none)");
                         }
                         config_.users->SetVerifier(alter.user, VerifierFrom(*alter.verifier, parameters));
+                    } else if (alter.requires_channel_binding.has_value()) {
+                        RequireManagesUsers(session);
+                        config_.users->SetRequiresChannelBinding(alter.user, *alter.requires_channel_binding);
                     } else {
                         RequireManagesUsers(session);
                         config_.users->SetManagesUsers(alter.user, *alter.manages_users);
@@ -1796,11 +1800,13 @@ std::string CommandEngine::ExecuteStatement(
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, users.users.size());
                     for (const auto& [name, user] : users.users) {
-                        Protocol::AppendMapHeader(reply, 3);
+                        Protocol::AppendMapHeader(reply, 4);
                         Protocol::AppendBulk(reply, "name");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "manages_users");
                         Protocol::AppendBoolean(reply, user.manages_users);
+                        Protocol::AppendBulk(reply, "requires_channel_binding");
+                        Protocol::AppendBoolean(reply, user.requires_channel_binding);
                         Protocol::AppendBulk(reply, "grants");
                         Protocol::AppendMapHeader(reply, user.grants.size());
                         for (const auto& [table, right] : user.grants) {

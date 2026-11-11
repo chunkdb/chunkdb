@@ -24,7 +24,13 @@ AUTH $1                 # client-final SCRAM message in parameter 1
 ```
 
 The first reply is `+SCRAM <server-first>`; AUTH success is the HELLO map below.
-SCRAM-SHA-256 uses `n,,` (no channel binding), nonce/salt/iteration fields and a client proof; messages are at most 1024 bytes.
+SCRAM-SHA-256 uses a GS2 header, nonce/salt/iteration fields and a client proof; messages are at most 1024 bytes.
+The client-first message starts with `n,,` for a login that is not bound, or with `p=tls-exporter,,` or `p=tls-server-end-point,,` for a login bound to its TLS connection (SCRAM-SHA-256-PLUS).
+The client-final message of a bound login carries `c=` with the base64 of that header followed by the channel binding data: the 32-byte TLS exporter of RFC 9266 for `tls-exporter`, the server certificate hash of RFC 5929 for `tls-server-end-point`.
+`tls-exporter` needs TLS 1.3; `tls-server-end-point` works on TLS 1.2 and 1.3 unless the signature algorithm of the server certificate defines no single hash, as Ed25519 does not.
+A binding the connection cannot give receives INVALID_ARGUMENT: any type on a connection whose TLS does not end at the server, `tls-exporter` below TLS 1.3, or an unknown type; `y,,` receives it on a TLS connection.
+Binding data that differs from what the server sees receives `AUTH_FAILED reason=channel_binding`: something between the client and the server ends TLS.
+With `--auth-channel-binding require` a login that is not bound receives `AUTH_REQUIRED reason=channel_binding`; an unbound login of a user that requires binding fails like a wrong password.
 The client verifies the server-final signature before accepting the session.
 Wrong passwords and unknown names receive AUTH_FAILED with the same message.
 A connection closes after 5 failed HELLO or AUTH attempts.
@@ -60,7 +66,7 @@ Unknown keys are accepted and reported with `reason=unknown_option`.
 Before authentication HELLO takes at most 12 parameters; a HELLO with more receives PROTOCOL and closes without its frames being read.
 
 Only `client_name` currently applies; timeout and tag values are stored with `reason=implementation_pending` until their capabilities appear.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, and `lineage`.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, and `channel_binding`.
 Options become visible only after authentication succeeds.
 Returning and expression ceilings describe reserved limits; their capabilities remain unavailable.
 

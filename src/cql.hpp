@@ -262,12 +262,15 @@ struct CreateUser {
     std::string user;
     Literal verifier;
     bool manages_users = false;
+    bool requires_channel_binding = false;
     bool if_not_exists = false;
 };
+// Exactly one of the three is set.
 struct AlterUser {
     std::string user;
     std::optional<Literal> verifier;
     std::optional<bool> manages_users;
+    std::optional<bool> requires_channel_binding;
 };
 struct DropUser {
     std::string user;

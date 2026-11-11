@@ -242,6 +242,7 @@ bool ChunkServer::HandleClient(
 
             return false;
         }
+        session.channel_bindings = TlsChannelBindings(tls_session);
     }
 #endif
 

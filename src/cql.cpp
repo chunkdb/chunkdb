@@ -907,6 +907,11 @@ class Parser {
                     Expect("users");
                     create.manages_users = true;
                 }
+                if (Accept("require")) {
+                    Expect("channel");
+                    Expect("binding");
+                    create.requires_channel_binding = true;
+                }
                 return create;
             }
             Expect("table");
@@ -965,9 +970,15 @@ class Parser {
                     alter.verifier = Verifier();
                 } else {
                     const bool no = Accept("no");
-                    Expect("manages");
-                    Expect("users");
-                    alter.manages_users = !no;
+                    if (Accept("require")) {
+                        Expect("channel");
+                        Expect("binding");
+                        alter.requires_channel_binding = !no;
+                    } else {
+                        Expect("manages");
+                        Expect("users");
+                        alter.manages_users = !no;
+                    }
                 }
                 return alter;
             }

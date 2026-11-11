@@ -75,6 +75,9 @@ struct EngineConfig {
     std::size_t max_auth_failures_per_ip = 5;
     std::size_t auth_failure_delay_ms = 50;
     std::size_t auth_failure_ban_ms = 1000;
+    // Every login must be bound to its TLS connection
+    // (--auth-channel-binding require).
+    bool require_channel_binding = false;
     // Logins and administrative statements, when set (--audit-log).
     std::shared_ptr<AuditLog> audit{};
     // Statements slower than this many ms are logged at WARN; 0: none.
@@ -189,6 +192,18 @@ struct SessionHelloOptions {
 // and the engine.
 [[nodiscard]] std::uint64_t NewConnectionId();
 
+// What a login can bind to on a connection (docs/PROTOCOL.md): the server
+// fills it after the TLS handshake, and it stays empty without TLS.
+struct ChannelBindings {
+    // The connection reaches this server over TLS.
+    bool tls = false;
+    // `tls-exporter` data (RFC 9266); empty unless the connection is TLS 1.3.
+    std::vector<std::uint8_t> tls_exporter;
+    // `tls-server-end-point` data (RFC 5929), the hash of the certificate the
+    // server presented; empty when its signature algorithm defines none.
+    std::vector<std::uint8_t> tls_server_end_point;
+};
+
 struct SessionState {
     // Identifies the connection in HELLO replies and the audit log; unique
     // within the process (NewConnectionId).
@@ -210,6 +225,7 @@ struct SessionState {
     bool greeted = false;
     // The logged-in user; empty when logins need no user.
     std::string user;
+    ChannelBindings channel_bindings;
     // The incarnation of that user at login (UserRegistry::FindIncarnation).
     std::uint64_t user_incarnation = 0;
     // That user as of `user_generation` of the registry; null for good once
@@ -329,8 +345,8 @@ class CommandEngine {
         std::chrono::steady_clock::time_point started,
         const std::string& response) const;
     // Writes the audit line of a login attempt that ended with `response`.
-    void AuditLogin(const SessionState& session, std::string_view user, bool known_user, bool succeeded,
-                    const std::string& response) const;
+    void AuditLogin(const SessionState& session, std::string_view user, bool known_user, bool unbound_refused,
+                    bool succeeded, const std::string& response) const;
     [[nodiscard]] PayloadRequest PlanParameters(SessionState& session, std::string_view line) const;
     // AUTH_REQUIRED for a session whose user was dropped, closing it after
     // the reply; empty while the user exists.
@@ -360,7 +376,8 @@ class CommandEngine {
     // source (empty when not banned), a failed login (AUTH_FAILED), and a
     // successful one.
     [[nodiscard]] std::string AuthBanReply(SessionState& session);
-    [[nodiscard]] std::string RecordAuthFailure(SessionState& session, std::string_view user);
+    // `channel_mismatch`: a bound login made on another connection.
+    [[nodiscard]] std::string RecordAuthFailure(SessionState& session, std::string_view user, bool channel_mismatch = false);
     void RecordAuthSuccess(SessionState& session, std::string_view user);
 
     // Rights (engine_cql.cpp, docs/design/USERS_DESIGN.md). Each throws
