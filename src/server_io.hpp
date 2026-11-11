@@ -139,6 +139,9 @@ class ParameterFrameDecoder {
     // Grows with each frame header read and each frame finished, so a caller
     // can restart a per-piece deadline when one ends.
     [[nodiscard]] std::size_t pieces() const noexcept { return pieces_; }
+    // The bytes held for the frame being read: about twice what has
+    // arrived at most, and never more than its header gave.
+    [[nodiscard]] std::size_t retained_capacity() const noexcept { return value_.capacity(); }
   private:
     enum class Phase { kHeader, kBody, kTerminator };
     void FinishFrame();

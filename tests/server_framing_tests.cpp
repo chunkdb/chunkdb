@@ -53,6 +53,28 @@ void TruncatedInputStaysIncomplete() {
     }
 }
 
+// A frame header alone allocates no body buffer: the buffer grows with the
+// bytes that arrive and never past the length the header gave.
+void BodyBufferFollowsArrivedBytes() {
+    constexpr std::size_t length = 1048576U;
+    const std::array<std::size_t, 1> limits{length};
+    ParameterFrameDecoder decoder({.frame_count = 1U, .limits = limits});
+    PendingLineBuffer pending;
+    Feed(decoder, pending, "$" + std::to_string(length) + "\r\n", 4096U);
+    assert(!decoder.complete() && decoder.retained_capacity() < 4096U);
+    const std::string piece(4096U, 'x');
+    std::size_t sent = 0U;
+    while (sent < length) {
+        Feed(decoder, pending, piece, piece.size());
+        sent += piece.size();
+        // The string may round its capacity up by a few bytes.
+        assert(decoder.retained_capacity() >= sent && decoder.retained_capacity() <= 2U * sent + 64U);
+        assert(decoder.retained_capacity() <= length + 64U);
+    }
+    Feed(decoder, pending, "\r\n", 2U);
+    assert(decoder.complete() && decoder.TakeParameters()[0] == std::string(length, 'x'));
+}
+
 void Reject(const std::function<void()>& operation) {
     bool refused = false;
     try { operation(); }
@@ -160,6 +182,7 @@ void AggregateCreditIsBoundedAndReturnedOnce() {
 int main() {
     FragmentedFramesKeepRequestBoundary();
     TruncatedInputStaysIncomplete();
+    BodyBufferFollowsArrivedBytes();
     BoundsAndDiscard();
     RejectedOptionsDrainWithoutLosingFollowingFrames();
     AggregateCreditIsBoundedAndReturnedOnce();

@@ -55,10 +55,16 @@ bool ParameterFrameDecoder::Consume(PendingLineBuffer& pending, std::size_t max_
             }
             total_ += *length;
             remaining_ = *length;
-            if (!opaque_) value_.reserve(*length);
             phase_ = Phase::kBody;
         }
         if (phase_ == Phase::kBody) {
+            // Memory follows the bytes that arrived, doubling up to the length
+            // the header gave, so a header alone holds no body buffer.
+            if (!opaque_) {
+                const auto arrived = value_.size() + std::min(remaining_, pending.unconsumed_size());
+                if (arrived > value_.capacity())
+                    value_.reserve(std::min(value_.size() + remaining_, std::max(arrived, value_.capacity() * 2U)));
+            }
             const auto consumed = opaque_ ? pending.discard_bytes(remaining_) : pending.extract_bytes(remaining_, &value_);
             remaining_ -= consumed;
             if (remaining_ != 0U) return false;
