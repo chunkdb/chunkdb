@@ -20,6 +20,7 @@ The [Docker](DOCKER.md) entrypoint generates a password when you provide none.
 
 Clients authenticate using SCRAM-SHA-256, which proves knowledge of a password without sending the password itself.
 Use TLS when you need transport encryption; SCRAM does not encrypt queries or results.
+On TLS, clients bind the login to the connection; see [Channel binding](#channel-binding).
 You can change your own password through the CLI:
 
 ```sh
@@ -68,6 +69,22 @@ Migration replay checks current rights before returning skipped or conflict.
 A name recorded for a table without your ADMIN, or for GRANT or REVOKE without MANAGES USERS, returns PERMISSION_DENIED.
 For repeatable lists that drop tables, use a deployment user with wildcard ADMIN.
 This grant survives table removal; table-specific ADMIN does not.
+
+## Channel binding
+
+A login made over TLS can be bound to that connection.
+A bound login fails when something between the client and the server ends TLS, even if the client accepted a wrong certificate.
+The chunkdb clients bind every login made over `chunks://`.
+To refuse logins that are not bound, start the server with `--auth-channel-binding require`, or require it for single users:
+
+```cql
+ALTER USER bot REQUIRE CHANNEL BINDING
+```
+
+Binding needs TLS that ends at the server.
+Behind a load balancer that ends TLS, turn channel binding off in the client and do not require it.
+An unbound login of a user that requires binding fails with the same AUTH_FAILED as a wrong password.
+A user that requires binding cannot log in to a server without a `chunks://` listener, and a password reset keeps the requirement; start the server with TLS to log in and run `ALTER USER bot NO REQUIRE CHANNEL BINDING`.
 
 ## Password protection
 

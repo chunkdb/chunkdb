@@ -8,7 +8,9 @@
 #include "chunkdb/server.hpp"
 
 #include <openssl/err.h>
+#include <openssl/evp.h>
 #include <openssl/ssl.h>
+#include <openssl/x509.h>
 
 #include <array>
 #include <chrono>
@@ -16,6 +18,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <vector>
 
 namespace chunkdb {
 namespace server_detail {
@@ -32,6 +35,43 @@ std::string LastTlsErrorMessage() {
     std::array<char, 256> buffer{};
     ERR_error_string_n(code, buffer.data(), buffer.size());
     return std::string(buffer.data());
+}
+
+ChannelBindings TlsChannelBindings(SSL* tls_session) {
+    ChannelBindings bindings;
+    bindings.tls = true;
+    // RFC 9266: 32 bytes of the exporter under this label with an empty
+    // context, defined for TLS 1.3.
+    if (SSL_version(tls_session) == TLS1_3_VERSION) {
+        constexpr std::string_view kLabel = "EXPORTER-Channel-Binding";
+        std::vector<std::uint8_t> exporter(32);
+        const unsigned char no_context = 0;
+        if (SSL_export_keying_material(
+                tls_session, exporter.data(), exporter.size(), kLabel.data(), kLabel.size(), &no_context, 0, 1) == 1) {
+            bindings.tls_exporter = std::move(exporter);
+        } else {
+            ERR_clear_error();
+        }
+    }
+    // RFC 5929 section 4.1: the certificate the server presented, hashed
+    // with the hash of its signature algorithm, SHA-256 in place of MD5 and
+    // SHA-1. An algorithm without one hash leaves the binding undefined.
+    if (auto* certificate = SSL_get_certificate(tls_session); certificate != nullptr) {
+        int digest_nid = NID_undef;
+        if (X509_get_signature_info(certificate, &digest_nid, nullptr, nullptr, nullptr) == 1 &&
+            digest_nid != NID_undef) {
+            if (digest_nid == NID_md5 || digest_nid == NID_sha1) digest_nid = NID_sha256;
+            if (const EVP_MD* digest = EVP_get_digestbynid(digest_nid); digest != nullptr) {
+                std::array<unsigned char, EVP_MAX_MD_SIZE> hash{};
+                unsigned int size = 0;
+                if (X509_digest(certificate, digest, hash.data(), &size) == 1) {
+                    bindings.tls_server_end_point.assign(hash.begin(), hash.begin() + size);
+                }
+            }
+        }
+        ERR_clear_error();
+    }
+    return bindings;
 }
 
 ConnectionTermination ClassifyTlsFailure(

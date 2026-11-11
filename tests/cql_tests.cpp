@@ -333,6 +333,13 @@ void TestAlterAndOtherStatements() {
     assert(rekey.verifier.has_value() && !rekey.manages_users.has_value());
     assert(Get<cql::AlterUser>("ALTER USER bot NO MANAGES USERS").manages_users == false);
     assert(Get<cql::AlterUser>("ALTER USER bot MANAGES USERS").manages_users == true);
+    assert(Get<cql::CreateUser>("CREATE USER bot VERIFIER $1 REQUIRE CHANNEL BINDING", 1).requires_channel_binding);
+    const auto strict = Get<cql::CreateUser>("CREATE USER bot VERIFIER $1 MANAGES USERS REQUIRE CHANNEL BINDING", 1);
+    assert(strict.manages_users && strict.requires_channel_binding && !create.requires_channel_binding);
+    const auto require = Get<cql::AlterUser>("ALTER USER bot REQUIRE CHANNEL BINDING");
+    assert(require.requires_channel_binding == true && !require.manages_users.has_value() && !require.verifier.has_value());
+    assert(Get<cql::AlterUser>("ALTER USER bot NO REQUIRE CHANNEL BINDING").requires_channel_binding == false);
+    assert(!rekey.requires_channel_binding.has_value());
     assert(Get<cql::DropUser>("DROP USER bot").user == "bot");
     const auto grant = Get<cql::GrantRight>("GRANT WRITE ON world TO bot");
     assert(!grant.revoke && grant.right == chunkdb::Right::kWrite && grant.table == "world" && grant.user == "bot");

@@ -38,11 +38,13 @@ OK
 1)
   name = admin
   manages_users = true
+  requires_channel_binding = false
   grants:
     * = ADMIN
 2)
   name = bot
   manages_users = false
+  requires_channel_binding = false
   grants:
     world = READ
 OK
@@ -51,9 +53,10 @@ OK
 ## Syntax
 
 ```text
-CREATE USER [IF NOT EXISTS] user VERIFIER verifier [MANAGES USERS]
+CREATE USER [IF NOT EXISTS] user VERIFIER verifier [MANAGES USERS] [REQUIRE CHANNEL BINDING]
 ALTER USER user VERIFIER verifier
 ALTER USER user [NO] MANAGES USERS
+ALTER USER user [NO] REQUIRE CHANNEL BINDING
 DROP USER [IF EXISTS] user
 SHOW USERS
 GRANT right [, right ...] ON table | * TO user
@@ -72,12 +75,13 @@ See [Protocol](../PROTOCOL.md) for authentication encoding.
 - `table`: a valid table name, including one not yet created.
 - `*`: all tables, including tables created later.
 - `MANAGES USERS`: permission to manage users, rights, and backups, and to list GRANT and REVOKE migrations.
+- `REQUIRE CHANNEL BINDING`: the user logs in only with a login bound to its TLS connection; see [Channel binding](../USERS.md#channel-binding).
 - Conditional clauses: skip an existing or absent user without changing it; normal rights still apply.
 
 ## Returns
 
 - CREATE, ALTER, DROP, GRANT, and REVOKE: `OK`.
-- SHOW USERS: user names, MANAGES USERS state, and grants.
+- SHOW USERS: user names, MANAGES USERS state, REQUIRE CHANNEL BINDING state, and grants.
 
 ## Errors
 

@@ -38,5 +38,6 @@ printf 'choose-a-new-private-password\n' > ./new.password
 Restart your server and connect with the new password.
 The tool must have permission to write the data directory.
 It refuses a backup directory; restore the backup with `chunkdb_restore` first.
+The reset keeps the user's [channel binding](USERS.md#channel-binding) requirement, so such a user still needs a `chunks://` connection.
 Delete your password file after use.
 See [Users and rights](USERS.md) for changing a known password without stopping the server.

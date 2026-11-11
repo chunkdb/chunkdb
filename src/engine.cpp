@@ -277,7 +277,53 @@ struct PendingLogin {
     std::uint64_t incarnation = 0;
     scram::ServerExchange exchange;
     SessionHelloOptions options;
+    // The user takes only bound logins and this one is not: it fails like a
+    // wrong password, so the reply does not tell that the user exists.
+    bool unbound_refused = false;
 };
+
+// The data a bound login is checked against on this connection; empty for a
+// login that is not bound. Throws std::invalid_argument for a binding the
+// connection cannot give.
+std::span<const std::uint8_t> ChannelBindingData(const ChannelBindings& bindings, const scram::ClientFirst& first) {
+    switch (first.binding) {
+        case scram::BindingFlag::kNone:
+            return {};
+        case scram::BindingFlag::kUnused:
+            // RFC 5802 section 6: a client that can bind but was told the
+            // server cannot has been downgraded.
+            if (bindings.tls) {
+                throw std::invalid_argument(
+                    "this server binds logins to TLS connections: start the SCRAM client-first message with "
+                    "p=tls-exporter,, or p=tls-server-end-point,,");
+            }
+            return {};
+        case scram::BindingFlag::kBound:
+            break;
+    }
+    if (!bindings.tls) {
+        throw std::invalid_argument(
+            "channel binding needs a TLS connection that ends at this server; over plain TCP, or behind a proxy "
+            "that ends TLS, log in without it");
+    }
+    if (first.binding_type == scram::kTlsExporter) {
+        if (bindings.tls_exporter.empty()) {
+            throw std::invalid_argument(
+                "tls-exporter channel binding needs TLS 1.3; use tls-server-end-point on this connection");
+        }
+        return bindings.tls_exporter;
+    }
+    if (first.binding_type == scram::kTlsServerEndPoint) {
+        if (bindings.tls_server_end_point.empty()) {
+            throw std::invalid_argument(
+                "tls-server-end-point channel binding is not defined for the signature algorithm of this "
+                "server's certificate; use tls-exporter over TLS 1.3");
+        }
+        return bindings.tls_server_end_point;
+    }
+    throw std::invalid_argument(
+        "unknown channel binding type; this server takes tls-exporter and tls-server-end-point");
+}
 
 std::string CommandEngine::Execute(
     SessionState& session,
@@ -294,6 +340,7 @@ std::string CommandEngine::Execute(
         // the pending login AUTH finishes.
         std::string audit_user;
         bool known_user = false;
+        bool unbound_refused = false;
         const bool was_greeted = session.greeted;
         if (config_.audit != nullptr) {
             if (hello) {
@@ -302,6 +349,7 @@ std::string CommandEngine::Execute(
             } else if (session.pending_login != nullptr) {
                 audit_user = session.pending_login->user;
                 known_user = session.pending_login->known;
+                unbound_refused = session.pending_login->unbound_refused;
             }
         }
         std::string response;
@@ -328,7 +376,7 @@ std::string CommandEngine::Execute(
             // A +SCRAM reply only continues the login.
             if (succeeded || (!response.empty() && response[0] == '-')) {
                 AuditLogin(session, succeeded ? std::string_view(session.user) : std::string_view(audit_user),
-                           known_user, succeeded, response);
+                           known_user, unbound_refused, succeeded, response);
             }
         }
         // Login/grammar failures count toward max_auth_failures (AUTH_FAILED
@@ -483,6 +531,7 @@ void CommandEngine::AuditLogin(
     const SessionState& session,
     std::string_view user,
     bool known_user,
+    bool unbound_refused,
     bool succeeded,
     const std::string& response) const {
     std::string_view reason;
@@ -490,8 +539,10 @@ void CommandEngine::AuditLogin(
     if (!succeeded) {
         if (response.find("temporary auth ban") != std::string::npos) {
             reason = "banned";
+        } else if (response.find(" reason=channel_binding ") != std::string::npos) {
+            reason = "channel_binding";
         } else if (code == "AUTH_FAILED") {
-            reason = known_user ? "wrong_password" : "unknown_user";
+            reason = !known_user ? "unknown_user" : unbound_refused ? "channel_binding_required" : "wrong_password";
         } else if (code == "AUTH_REQUIRED") {
             reason = "no_user";
         } else {
@@ -591,7 +642,7 @@ void CommandEngine::RecordAuthSuccess(SessionState& session, std::string_view us
     }
 }
 
-std::string CommandEngine::RecordAuthFailure(SessionState& session, std::string_view user) {
+std::string CommandEngine::RecordAuthFailure(SessionState& session, std::string_view user, bool channel_mismatch) {
     const bool track_remote_ip = !session.remote_address.empty() && config_.max_auth_failures_per_ip > 0;
     const std::string failure_key = track_remote_ip ? SourceAddressKey(session.remote_address) : std::string();
     const auto now = std::chrono::steady_clock::now();
@@ -666,6 +717,13 @@ std::string CommandEngine::RecordAuthFailure(SessionState& session, std::string_
     }
     if (auth_failure_delay.count() > 0) {
         std::this_thread::sleep_for(auth_failure_delay);
+    }
+    if (channel_mismatch) {
+        return Protocol::Error(
+            "AUTH_FAILED",
+            "the login is bound to another TLS connection than the one this server sees: something between the "
+            "client and the server ends TLS",
+            {{"reason", "channel_binding"}});
     }
     return Protocol::Error("AUTH_FAILED", "invalid user or password; check the username and password in your connection URI");
 }
@@ -861,6 +919,14 @@ std::string CommandEngine::HandleHello(
     if (first.user != user) {
         throw std::invalid_argument("the SCRAM client-first message names another user than HELLO");
     }
+    const auto binding_data = ChannelBindingData(session.channel_bindings, first);
+    const bool bound = first.binding == scram::BindingFlag::kBound;
+    if (!bound && config_.require_channel_binding) {
+        return Protocol::Error(
+            "AUTH_REQUIRED",
+            "this server takes only logins bound to their TLS connection; use a client that supports channel binding",
+            {{"reason", "channel_binding"}});
+    }
     const auto found = config_.users->FindIncarnation(user);
     const auto secret = config_.users->Secret();
     scram::Verifier verifier = found.has_value() ? found->user.verifier : scram::DecoyVerifier(secret, user);
@@ -868,8 +934,9 @@ std::string CommandEngine::HandleHello(
         .user = user,
         .known = found.has_value(),
         .incarnation = found.has_value() ? found->incarnation : 0U,
-        .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce()),
+        .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce(), binding_data),
         .options = std::move(options),
+        .unbound_refused = !bound && found.has_value() && found->user.requires_channel_binding,
     });
     return Protocol::SimpleString("SCRAM " + session.pending_login->exchange.ServerFirst());
 }
@@ -891,8 +958,15 @@ std::string CommandEngine::HandleAuth(
     if (std::string banned = AuthBanReply(session); !banned.empty()) {
         return banned;
     }
-    const auto server_final = pending->exchange.Finish(*parameters[0]);
-    if (!server_final.has_value() || !pending->known) {
+    std::optional<std::string> server_final;
+    try {
+        server_final = pending->exchange.Finish(*parameters[0]);
+    } catch (const scram::ChannelMismatchError&) {
+        // Whoever relays this login ends TLS itself: the reply says so, and
+        // it depends on neither the user nor the password.
+        return RecordAuthFailure(session, pending->user, true);
+    }
+    if (!server_final.has_value() || !pending->known || pending->unbound_refused) {
         return RecordAuthFailure(session, pending->user);
     }
     RecordAuthSuccess(session, pending->user);
@@ -927,7 +1001,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 7);
+    Protocol::AppendArrayHeader(reply, 8);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -935,6 +1009,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "slot_filters");
     Protocol::AppendBulk(reply, "slot_takeover");
     Protocol::AppendBulk(reply, "lineage");
+    Protocol::AppendBulk(reply, "channel_binding");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 1U : 0U);
     if (session.hello_options.client_name) {
