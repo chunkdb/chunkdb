@@ -883,8 +883,10 @@ class TlsClient {
     // 0 offers every version the library supports. `prefix`: bytes sent in
     // the clear before the handshake, such as a PROXY protocol header.
     // `ciphers`: the TLS 1.2 cipher list offered; empty keeps the default.
+    // `pause`: when set, the prefix is sent in two halves this far apart, and
+    // the handshake starts this long after the prefix.
     TlsClient(std::string host, std::uint16_t port, int max_version = 0, const std::string& prefix = {},
-              const std::string& ciphers = {})
+              const std::string& ciphers = {}, std::chrono::milliseconds pause = {})
         : host_(std::move(host)), port_(port) {
         SSL_load_error_strings();
         OpenSSL_add_ssl_algorithms();
@@ -905,11 +907,15 @@ class TlsClient {
         }
         try {
             socket_ = ConnectSocket(host_, port_);
+            const auto half = pause.count() != 0 ? prefix.size() / 2U : prefix.size();
             for (std::size_t sent = 0; sent < prefix.size();) {
-                const auto n = send(socket_, prefix.data() + sent, static_cast<int>(prefix.size() - sent), 0);
+                if (sent == half) std::this_thread::sleep_for(pause);
+                const auto end = sent < half ? half : prefix.size();
+                const auto n = send(socket_, prefix.data() + sent, static_cast<int>(end - sent), 0);
                 if (n <= 0) throw std::runtime_error("failed to send bytes before the TLS handshake");
                 sent += static_cast<std::size_t>(n);
             }
+            if (pause.count() != 0) std::this_thread::sleep_for(pause);
         } catch (...) {
             // The destructor does not run for a constructor that throws.
             if (socket_ != kInvalidSocket) {
@@ -6666,6 +6672,15 @@ void TestProxyProtocolOverTls() {
             client.Login();
             client.SendLine("PING");
             assert(client.ReadLine() == "+PONG\r\n");
+        }
+        {
+            // A slow header, then a slow handshake: each within the timeout,
+            // both together longer, since the handshake has an interval of its own.
+            TlsClient slow("127.0.0.1", harness.port, 0, ProxyV2Header("198.51.100.10"), {},
+                std::chrono::milliseconds(server_cfg.client_io_timeout_ms * 6 / 10));
+            slow.Login();
+            slow.SendLine("PING");
+            assert(slow.ReadLine() == "+PONG\r\n");
         }
         bool refused = false;
         try {
