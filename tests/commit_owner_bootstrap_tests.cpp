@@ -534,6 +534,36 @@ void TemporaryCreationRecovery(const std::string& executable) {
     }
 }
 
+// Backup reads the canonical owner again after the last table capture and
+// before completion; a root changed at either point refuses the backup.
+void BackupRefusesChangedOwner() {
+    for (const auto point : {BackupTestHook::Point::kAfterPin, BackupTestHook::Point::kBeforePublish}) {
+        test::ScopedTempDir temporary("chunkdb-owner-backup-change");
+        const auto root = std::filesystem::canonical(temporary.path());
+        const auto source = root / "source", target = root / "backup";
+        CatalogConfig config; config.data_dir = source; config.background_maintenance = false;
+        TableCatalog catalog(config);
+        (void)catalog.Create("alpha", {1U, 1U, 2U, 2U, 8U}, config.default_options);
+        const auto owner_path = source / "chunkdb.groups.owner";
+        const auto original = LoadFile(owner_path);
+        CommitOwnerRoot later; later.scope = *ReadDataDirManifest(source)->commit_owner; later.generation = 2U;
+        struct ReplaceOwner final : BackupTestHook {
+            Point at; std::filesystem::path path; Bytes bytes; bool replaced = false;
+            void Run(Point point, std::string_view, std::uint64_t) override {
+                if (point != at || replaced) return;
+                replaced = true; Save(path, bytes);
+            }
+        } hook;
+        hook.at = point; hook.path = owner_path;
+        const auto later_bytes = SerializeCommitOwnerRoot(later); hook.bytes.assign(later_bytes.begin(), later_bytes.end());
+        catalog.SetBackupHookForTests(&hook);
+        Reject([&] { (void)catalog.BackupTo(target, {}); });
+        catalog.SetBackupHookForTests(nullptr);
+        assert(hook.replaced && !std::filesystem::exists(target / kBackupMarkerName));
+        Save(owner_path, original);
+    }
+}
+
 void InactiveBackupRestore(const std::string& executable) {
     test::ScopedTempDir temporary("chunkdb-owner-inactive-transfer");
     const auto root = std::filesystem::canonical(temporary.path());
@@ -736,5 +766,5 @@ int main(int argc, char** argv) {
     OwnerAdmissionPrecedesChunkReads(); UnclaimedOwnersRefuseEverySurface();
     CreationCrashBoundaries(argv[0]);
     TemporaryCreationRecovery(argv[0]);
-    InactiveBackupRestore(argv[0]);
+    InactiveBackupRestore(argv[0]); BackupRefusesChangedOwner();
 }
