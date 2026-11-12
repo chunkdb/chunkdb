@@ -126,10 +126,12 @@ class ChunkServer {
     std::mutex active_clients_mutex_;
     std::condition_variable pending_clients_cv_;
     std::vector<std::thread> workers_;
-    // Under pending_clients_mutex_: workers blocked on pending_clients_cv_
-    // and waiting workers asked to return their connection.
+    // Under pending_clients_mutex_: workers blocked on pending_clients_cv_,
+    // waiting workers asked to return their connection, and whether a
+    // dispatch was refused since the last pop.
     std::size_t idle_workers_ = 0U;
     std::size_t yielding_workers_ = 0U;
+    bool dispatch_refused_ = false;
     // One per worker; its fields are guarded by pending_clients_mutex_.
     std::vector<std::shared_ptr<WorkerWait>> worker_waits_;
     std::atomic<bool> pending_queue_overload_warned_{false};

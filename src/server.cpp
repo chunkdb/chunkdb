@@ -563,6 +563,7 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
         std::shared_ptr<ServerConnection> connection;
         std::shared_ptr<StatementControl> statement;
 
+        bool wake_io = false;
         {
             std::unique_lock lock(pending_clients_mutex_);
             ++idle_workers_;
@@ -604,18 +605,21 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
                 statement = pending_client.statement;
                 break;
             }
+            // A refused dispatch stays with the I/O owner until queue space
+            // returns; only then does a pop need to wake it.
+            wake_io = std::exchange(dispatch_refused_, false);
 
             engine_->metrics()->SetPendingConnections(pending_clients_.size());
-
-            if (client_socket == kInvalidSocket) {
-                if (!running_.load()) {
-                    return;
-                }
-                continue;
-            }
         }
 
-        if (auto io = IdleIoHandle()) io->Wake();
+        if (wake_io)
+            if (auto io = IdleIoHandle()) io->Wake();
+        if (client_socket == kInvalidSocket) {
+            if (!running_.load()) {
+                return;
+            }
+            continue;
+        }
         if (statement) {
             if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kBeforeStatementStart, connection->session.connection_id);

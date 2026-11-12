@@ -2464,6 +2464,69 @@ void TestStopWakesWaitingWorker() {
     assert(client.WaitForClose(std::chrono::seconds(5)));
 }
 
+// Holds the only worker after it hands a connection back until the I/O
+// thread has been refused queue space again, so only the following pop can
+// tell it that space returned.
+class RefusedDispatchHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kIdleQueueBackpressure) ++refusals_;
+        if (point == Point::kAfterStatementQueued) ++queued_;
+        if (point == Point::kBeforeWorkerHandle && !entered_) {
+            entered_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        }
+        if (point == Point::kAfterWorkerHandle && released_ && !held_) {
+            held_ = true;
+            refused_again_ = changed_.wait_for(lock, std::chrono::seconds(10), [&] { return refusals_ > base_; });
+        }
+        changed_.notify_all();
+    }
+    template <typename Predicate> void Wait(Predicate predicate) {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), predicate));
+    }
+    void WaitEntered() { Wait([&] { return entered_; }); }
+    void WaitQueued() { Wait([&] { return queued_ >= 2U; }); }
+    void WaitRefused() { Wait([&] { return refusals_ >= 1U; }); }
+    void Release() {
+        { std::lock_guard lock(mutex_); base_ = refusals_; released_ = true; }
+        changed_.notify_all();
+    }
+    bool RefusedAgain() { std::lock_guard lock(mutex_); return held_ && refused_again_; }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::size_t refusals_ = 0U, queued_ = 0U, base_ = 0U;
+    bool entered_ = false, released_ = false, held_ = false, refused_again_ = false;
+};
+
+void TestRefusedDispatchWakesAfterPop() {
+    RefusedDispatchHook hook;
+    auto config = OneWaitingWorkerConfig();
+    config.max_pending_clients = 1U;
+    ServerHarness harness("refused-dispatch-pop", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { RefusedDispatchHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient busy("127.0.0.1", harness.port); (void)HelloId(busy);
+    RawClient queued("127.0.0.1", harness.port); (void)HelloId(queued);
+    RawClient refused("127.0.0.1", harness.port); (void)HelloId(refused);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    busy.SendLine("PING");
+    hook.WaitEntered();
+    queued.SendLine("PING");
+    hook.WaitQueued();
+    refused.SendLine("PING");
+    hook.WaitRefused();
+    hook.Release();
+    assert(busy.ReadLine() == "+PONG\r\n");
+    assert(queued.ReadLine() == "+PONG\r\n");
+    assert(refused.ReadLine() == "+PONG\r\n");
+    assert(hook.RefusedAgain());
+}
+
 // A statement read by a waiting worker keeps its statement timeout, applies
 // nothing when it expires, and leaves the connection usable.
 void TestWaitingWorkerStatementTimesOut() {
@@ -7019,6 +7082,7 @@ int main(int argc, char** argv) {
         run("TestPartialInputLeavesWaitingWorker", TestPartialInputLeavesWaitingWorker);
         run("TestStopWakesWaitingWorker", TestStopWakesWaitingWorker);
         run("TestWaitingWorkerStatementTimesOut", TestWaitingWorkerStatementTimesOut);
+        run("TestRefusedDispatchWakesAfterPop", TestRefusedDispatchWakesAfterPop);
         run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);
         run("TestConnectionListingTrimsStatementWhitespace", TestConnectionListingTrimsStatementWhitespace);
         run("TestStopPublicationGapClosesQueuedOwner", TestStopPublicationGapClosesQueuedOwner);

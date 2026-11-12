@@ -13,6 +13,7 @@ The worker that wrote a reply waits for that connection's next request while no 
 Buffered complete requests retain their worker while bounded input and output credit remains available.
 Ownership transfers publish state before waking the receiving owner.
 Returned credit wakes the I/O owner only after a refused reservation.
+A worker wakes the I/O owner after taking a queued request only when a dispatch was refused for queue space since the previous one.
 The receiving owner drains wake notifications before scanning published state, so a coalesced wake cannot hide work.
 Descriptors stay registered until the closing owner has finished every outstanding operation.
 Queued work is discarded before execution on close; running pre-decision work accepts cancellation, while decision-entered work completes before teardown.

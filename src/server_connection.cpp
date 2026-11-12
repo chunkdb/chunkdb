@@ -203,6 +203,7 @@ bool ChunkServer::DispatchClient(const std::shared_ptr<ServerConnection>& connec
         std::lock_guard lock(pending_clients_mutex_);
         if (running_.load()) {
             if (pending_clients_.size() >= config_.max_pending_clients) {
+                dispatch_refused_ = true;
                 if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                     hook->Run(FeedDeliveryTestHook::Point::kIdleQueueBackpressure, pending_clients_.size());
                 return false;
