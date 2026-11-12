@@ -3,6 +3,7 @@
 #include <array>
 #include <set>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 #include "chunkdb/table_catalog.hpp"
@@ -16,6 +17,14 @@ bool Grouped(const FeatureFlags& features) noexcept { return (features.incompat 
 void RequireTableScope(const StoreManifest& manifest, const CommitOwnerScope& scope, const StoreId& epoch) {
     if (!Grouped(manifest.features) || !manifest.commit_owner || *manifest.commit_owner != scope || manifest.store_id != epoch)
         Bad("table scope or epoch changed");
+}
+// Names the table as opening it does, so a refusal says which table it is.
+void RequireTableFeatures(const std::string& name, const FeatureFlags& features, AccessMode access_mode) {
+    try {
+        RequireOpenableFeatures(features, access_mode);
+    } catch (const std::runtime_error& error) {
+        throw std::runtime_error("table '" + name + "': " + error.what());
+    }
 }
 }  // namespace
 
@@ -107,7 +116,7 @@ std::shared_ptr<const CommitOwnerDirectoryContext> CommitOwnerBootstrap::AdmitDi
             const auto manifest = ParseStoreManifest(*bytes);
             if (Grouped(manifest.features)) Bad("table claims an owner absent from its directory");
             if (!epochs.insert(manifest.store_id).second) Bad("duplicate table epoch in catalog inventory");
-            RequireOpenableFeatures(manifest.features, access_mode);
+            RequireTableFeatures(name, manifest.features, access_mode);
         }
         return {};
     }
@@ -126,7 +135,7 @@ std::shared_ptr<const CommitOwnerDirectoryContext> CommitOwnerBootstrap::AdmitDi
         auto ticket = context->ForTable(name);
         const auto bytes = ticket->table_->ReadManifestBytes(false);
         if (!bytes) Bad("managed table manifest disappeared during inventory admission");
-        RequireOpenableFeatures(ParseStoreManifest(*bytes).features, access_mode);
+        RequireTableFeatures(name, ParseStoreManifest(*bytes).features, access_mode);
         if (!epochs.insert(ticket->epoch_).second) Bad("duplicate table epoch in catalog inventory");
     }
     context->RequireInactive();
@@ -157,7 +166,7 @@ void CommitOwnerBootstrap::ValidateDirectoryScopes(const std::filesystem::path& 
         const auto bytes = table->ReadManifestBytes(false);
         if (!bytes) Bad("managed table manifest is missing");
         const auto manifest = ParseStoreManifest(*bytes);
-        RequireOpenableFeatures(manifest.features, access_mode);
+        RequireTableFeatures(name, manifest.features, access_mode);
         RequireTableScope(manifest, *initial->commit_owner, manifest.store_id);
         if (!epochs.insert(manifest.store_id).second) Bad("duplicate table epoch in catalog inventory");
     }
