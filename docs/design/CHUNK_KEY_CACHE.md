@@ -26,9 +26,11 @@ Capacity admission performs no directory I/O, global eviction pass or capacity w
 Drop and shutdown release ordinary ownership without resetting counters still held by in-flight readers.
 Maintenance preparation that checkpoints cold chunks uses bounded temporary off-cache state under its existing exclusive ownership and publication locks.
 In particular, tombstone compaction does not acquire new cache admission after entering its durable publication phase or fence a healthy table for this known capacity refusal.
+A background checkpoint keeps its chunk cached while it owns the chunk's files, so writes to that chunk remain container hits at the limit.
+Maintenance workers look chunks up without loading them and never create containers; a cold chunk has no running checkpoint, so its off-cache preparation needs no checkpoint mark.
 
 Fixed-seed tests cover signed extremes, zero third axes, the former two-axis collisions, three-axis collision families and bucket distribution for both key types.
-Lifecycle tests cover shared limits across tables, live and retired owners, allocation and load failure, empty-container retirement, drop and recovery, refusal identity and metrics.
+Lifecycle tests cover shared limits across tables, live and retired owners, allocation and load failure, empty-container retirement, drop and recovery, refusal identity and metrics, and a background checkpoint paused without the chunk lock at the limit.
 Each regression is checked against the corresponding broken behavior.
 Release warnings-as-errors, the full test suite, GCC compilation and independent review precede a ready pull request.
 World, canvas and simulation budgets use the existing remote measurement procedure and remain separate from functional checks.
