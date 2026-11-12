@@ -1,14 +1,14 @@
 # Commit groups
 
-This contract covers [#136](https://github.com/chunkdb/chunkdb/issues/136) and builds on the [chunk model](CHUNK_MODEL.md).
-The user-visible guarantees are in [Durability](../DURABILITY_CONTRACT.md).
+This planned contract covers [#136](https://github.com/chunkdb/chunkdb/issues/136) and builds on the [chunk model](CHUNK_MODEL.md).
+Groups are not active in this build: the `commit_groups` feature is not registered, and the current guarantees are in [Durability](../DURABILITY_CONTRACT.md).
 The pure checked encodings are specified in [Commit group records](COMMIT_GROUP_FORMAT.md).
 Recovery, checkpoint and restore ownership are specified in [Group recovery](COMMIT_GROUP_RECOVERY.md).
 
 ## Ownership and identities
 
 The `commit_groups` incompat feature owns the directory journal and grouped table artifacts.
-New directory and table defaults enable it; existing roots use the checked ENABLE FEATURE publication before grouped operations are admitted.
+Once groups are activated, new directory and table defaults enable it, and existing roots use the checked ENABLE FEATURE publication before grouped operations are admitted.
 The existing activation decision covers both the directory and every table owner, so an older writer cannot accept only part of the new ownership.
 A data directory owns one group journal and one checked counter for externally visible transaction IDs.
 Standalone stores use the same coordinator with their store root as the directory scope.

@@ -1,6 +1,7 @@
 # Commit group recovery ownership
 
 This owner contract completes the recovery, checkpoint and restore rules of [#136](https://github.com/chunkdb/chunkdb/issues/136).
+It is planned and not active in this build; recovery does not admit grouped frames.
 It uses the checked [group records](COMMIT_GROUP_FORMAT.md) and does not change the meaning of a producing revision.
 A revision greater than a group member's revision is never evidence that the member survived.
 The `commit_groups` feature owns every additional object described here.

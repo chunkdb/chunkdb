@@ -1,6 +1,7 @@
 # Transaction snapshot vectors
 
 This contract specifies session ownership for [#136](https://github.com/chunkdb/chunkdb/issues/136).
+It is planned and not active in this build; a transaction still covers one table.
 The publication and recovery rules remain in [Commit groups](COMMIT_GROUPS.md).
 
 BEGIN creates a transaction without taking table snapshots.
