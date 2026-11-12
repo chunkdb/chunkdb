@@ -534,6 +534,8 @@ ChunkMutationResult ChunkStore::TransformChunkState(const ChunkCoord& coord,
     ThrowIfDurabilityPoisoned();
     const auto chunk = GetOrLoadRegularChunk(coord);
     std::unique_lock lock(chunk->mutex);
+    // The conditional path syncs the WAL and publishes an intent naming it.
+    AwaitChunkFilesLocked(lock, *chunk);
     if (expected_version && chunk->version != *expected_version)
         return {.ok = false, .version = chunk->version};
     if (if_absent && ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get()))

@@ -1,6 +1,9 @@
 #include <algorithm>
+#include <bitset>
 #include <cassert>
+#include <chrono>
 #include <functional>
+#include <future>
 #include <mutex>
 #include <thread>
 #include <vector>
@@ -351,6 +354,113 @@ void ChunkColumnsOnlyWriteRollsBackAndReplays() {
     assert(state.chunk_columns && state.chunk_columns->bytes == Owner(reopened, 9U)->bytes);
 }
 
+namespace {
+StoreConfig BackgroundCheckpointConfig(const std::filesystem::path& path, std::uint8_t dims) {
+    auto config = Config(path);
+    config.durability_mode = DurabilityMode::kRelaxed;
+    config.chunk_schema = OwnerColumns();
+    config.background_maintenance = true;
+    config.checkpoint_update_interval = 1U;
+    config.checkpoint_wal_bytes = 1U << 20U;
+    if (dims == 3U) {
+        config.geometry.dims = 3U;
+        config.geometry.chunk_depth_blocks = 2U;
+        config.geometry.large_chunk_depth_chunks = 2U;
+    }
+    return config;
+}
+}  // namespace
+
+// While a background checkpoint writes a chunk's files without its lock,
+// every whole-state write to that chunk waits for it: metadata and projected
+// SET CHUNK, their IF VERSION and IF ABSENT forms, a plain SET CHUNK with
+// chunk columns and a transaction. An ordinary block write meanwhile returns.
+// Nothing throws, and every write survives a reopen.
+void ChunkStateWritesWaitForBackgroundCheckpointFiles() {
+    for (const std::uint8_t dims : {std::uint8_t{2U}, std::uint8_t{3U}}) {
+        test::ScopedTempDir directory("chunkdb-chunk-state-checkpoint-files");
+        auto config = BackgroundCheckpointConfig(directory.path(), dims);
+        const ChunkCoord coord{0, 0, 0};
+        const auto set_bits = [&](ChunkStore& store, std::int64_t x, std::string_view bits) {
+            if (dims == 3U) store.SetBlockBits3D(x, 0, 0, bits);
+            else store.SetBlockBits(x, 0, bits);
+        };
+        const std::vector<std::function<void(ChunkStore&)>> writes{
+            [&](ChunkStore& store) {
+                assert(store.TransformChunkState(coord, {}, false, [&](ChunkState& state) {
+                    state.chunk_columns = Owner(store, 9U);
+                }).ok);
+            },
+            [&](ChunkStore& store) {
+                const auto version = store.ReadChunkState(coord).version;
+                assert(store.TransformChunkState(coord, version, false, [](ChunkState& state) {
+                    state.payload[2] = 0x5AU;
+                    state.presence_bitmap[0] |= 4U;
+                }).ok);
+            },
+            [&](ChunkStore& store) {
+                assert(!store.TransformChunkState(coord, {}, true, [](ChunkState&) { assert(false); }).ok);
+            },
+            [&](ChunkStore& store) {
+                auto state = store.ReadChunkState(coord);
+                state.payload[3] = 0x33U;
+                state.presence_bitmap[0] |= 8U;
+                state.chunk_columns = Owner(store, 11U);
+                assert(store.WriteChunkState(coord, std::move(state), {}).ok);
+            },
+            [&](ChunkStore& store) {
+                auto state = store.ReadChunkState(coord);
+                const auto version = state.version;
+                state.chunk_columns = Owner(store, 12U);
+                assert(store.WriteChunkState(coord, std::move(state), version).ok);
+            },
+            [&](ChunkStore& store) {
+                assert(!store.WriteChunkState(coord, store.ReadChunkState(coord), {}, true).ok);
+            },
+            [&](ChunkStore& store) {
+                auto snapshot = store.BeginTxnSnapshot(std::chrono::seconds(30));
+                auto state = store.ReadChunkStateAt(*snapshot, coord);
+                state.payload[0] = 0x77U;
+                state.chunk_columns = Owner(store, 13U);
+                assert(store.CommitTransaction(*snapshot, {coord}, {{.coord = coord, .state = std::move(state)}}) != 0U);
+            },
+        };
+        ChunkState expected;
+        {
+            ChunkStore store(config);
+            // The barrier's floor makes every later checkpoint sync its files.
+            store.WalBarrier();
+            for (std::size_t round = 0U; round < writes.size(); ++round) {
+                const auto& write = writes[round];
+                // Each round changes both blocks, so each write counts.
+                const auto bits = std::bitset<8>(round + 1U).to_string();
+                store.ArmCheckpointBeforeWalRemovalPauseForTests();
+                set_bits(store, 0, bits);
+                assert(store.WaitForCheckpointBeforeWalRemovalForTests());
+                // The checkpoint runs without the chunk's lock.
+                auto ordinary = std::async(std::launch::async, [&] { set_bits(store, 1, bits); });
+                const bool unlocked = ordinary.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+                auto pending = std::async(std::launch::async, [&] { write(store); });
+                const bool waited = pending.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready;
+                store.ResumeCheckpointBeforeWalRemovalForTests();
+                ordinary.get();
+                pending.get();
+                assert(unlocked && waited);
+            }
+            expected = store.ReadChunkState(coord);
+            assert(expected.payload[0] == 0x77U && expected.payload[2] == 0x5AU && expected.payload[3] == 0x33U);
+            store.WalBarrier();
+        }
+        config.background_maintenance = false;
+        ChunkStore reopened(config);
+        const auto state = reopened.ReadChunkState(coord);
+        assert(state.written && state.version == expected.version && state.commit_time_ms == expected.commit_time_ms);
+        assert(state.payload == expected.payload && state.presence_bitmap == expected.presence_bitmap);
+        assert(state.chunk_columns && state.chunk_columns->bytes == Owner(reopened, 13U)->bytes);
+    }
+}
+
+
 int main() {
     AtomicTransformOwnsWholeState();
     RequiredMetadataMustBeExplicit();
@@ -358,4 +468,5 @@ int main() {
     RelaxedUnconditionalWritesSyncNothing();
     FailedFirstWriteStaysNeverWritten();
     ChunkColumnsOnlyWriteRollsBackAndReplays();
+    ChunkStateWritesWaitForBackgroundCheckpointFiles();
 }
