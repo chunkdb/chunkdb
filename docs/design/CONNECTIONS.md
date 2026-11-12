@@ -38,6 +38,7 @@ Credits remain charged while a worker owns the parameters and are released once 
 A worker waiting for its connection's next request keeps that connection's data line credit and ordinary 65536-byte reply reservation, and returns both when it hands the connection back with no reply or line in progress.
 Request-line buffers obey their negotiated line bound and a separate aggregate byte bound; reserved control capacity remains available while data framing is paused.
 Unclassified request lines use reserved line credit, so data-only credit cannot prevent receiving a new HELLO or control line.
+An idle connection on the I/O owner holds no line credit: a read that buffers nothing returns the credit it took, and a writable reply is not taken for input.
 Replies charge their retained immutable state and encoded buffers against 2147483648 bytes of shared output credit.
 Authentication and control replies use a separate 16777216-byte output reserve.
 Execution reserves a checked conservative state, schema and encoding bound before collecting a large result snapshot.

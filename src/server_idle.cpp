@@ -233,6 +233,11 @@ bool IdleIo::Initialize(ServerConnection& connection) {
 
 bool IdleIo::Read(ServerConnection& connection) {
     if (connection.waiting_credit) return true;
+    // Credit taken for this read is returned if it brings nothing to buffer.
+    const bool acquired = !connection.line_credit;
+    const auto unused = [&] {
+        if (acquired && connection.pending.empty() && connection.request_line.empty()) connection.line_credit.reset();
+    };
     if (!connection.line_credit) {
         if (server_.config_.max_line_bytes > std::numeric_limits<std::size_t>::max() - 4096U)
             throw std::invalid_argument("request line byte bound overflows");
@@ -258,6 +263,7 @@ bool IdleIo::Read(ServerConnection& connection) {
                 connection.input_deadline.reset();
                 connection.record_deadline = false;
             }
+            if (!in_record) unused();
             return true;
         }
     } else
@@ -266,7 +272,7 @@ bool IdleIo::Read(ServerConnection& connection) {
         read = static_cast<int>(recv(connection.socket, buffer.data(), static_cast<int>(buffer.size()), 0));
         if (read < 0) {
             const auto error = CurrentSocketErrorCode();
-            if (WouldBlock(error) || IsSocketInterruptedError(error)) return true;
+            if (WouldBlock(error) || IsSocketInterruptedError(error)) { unused(); return true; }
             return false;
         }
         if (read == 0) return false;
@@ -863,8 +869,10 @@ void IdleIo::Run() {
                 if (const auto deadline = tracked.statement->deadline(); deadline && *deadline > now) wait_until(*deadline);
             if (!server_.running_.load()) break;
             (void)poller_.Wait(interests, timeout);
+            // A writable reply is not input: Write runs in its phase regardless.
             for (std::size_t i = 0U; i < clients.size(); ++i)
-                if (interests[i].ready != 0) clients[i]->read_ready = true;
+                if (interests[i].ready != 0 && clients[i]->phase != ServerConnection::Phase::kReply)
+                    clients[i]->read_ready = true;
         }
     } catch (const std::exception& error) {
         // Only the poller, wake-ups and the scan itself fail here.

@@ -2729,6 +2729,25 @@ void TestYieldReturnsKeptReplyCredit() {
     first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
 }
 
+// An idle greeted connection holds no request line credit: with lines this
+// long the general pool holds one reservation, so a second HELLO completes
+// only if the first, answered connection holds none.
+void TestIdleConnectionsHoldNoLineCredit() {
+    auto config = BaseServerConfig();
+    config.max_line_bytes = 9U * 1048576U;
+    ServerHarness harness("idle-no-line-credit", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    std::vector<std::unique_ptr<RawClient>> clients;
+    for (std::size_t i = 0U; i < 3U; ++i) {
+        clients.push_back(std::make_unique<RawClient>("127.0.0.1", harness.port));
+        (void)HelloId(*clients.back());
+    }
+    for (const auto& client : clients) {
+        client->SendLine("PING");
+        assert(client->ReadLine() == "+PONG\r\n");
+    }
+}
+
 // Holds the only worker after it hands a connection back until the I/O
 // thread has been refused queue space again, so only the following pop can
 // tell it that space returned.
@@ -7370,6 +7389,7 @@ int main(int argc, char** argv) {
         run("TestPipelinedBurstKeepsWaitingWorker", TestPipelinedBurstKeepsWaitingWorker);
         run("TestReturningWorkerTakesQueuedRequest", TestReturningWorkerTakesQueuedRequest);
         run("TestYieldReturnsKeptReplyCredit", TestYieldReturnsKeptReplyCredit);
+        run("TestIdleConnectionsHoldNoLineCredit", TestIdleConnectionsHoldNoLineCredit);
         run("TestWaitingWorkerStatementTimesOut", TestWaitingWorkerStatementTimesOut);
         run("TestRefusedDispatchWakesAfterPop", TestRefusedDispatchWakesAfterPop);
         run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);
