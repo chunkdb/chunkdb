@@ -297,7 +297,7 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
         if (connection.session.greeted) RestartPieceDeadline(connection);
         connection.payload = server_.engine_->PlanPayload(connection.session, connection.request_line);
         connection.control_request = !connection.session.greeted || ControlRequest(connection.request_line);
-        if (!connection.control_request) {
+        if (!connection.control_request && !data_line_credit_->Owns(connection.line_credit)) {
             auto credit = data_line_credit_->TryAcquire(server_.config_.max_line_bytes + 4096U);
             if (!credit) {
                 connection.session.close_after_reply = true;
@@ -505,7 +505,7 @@ void IdleIo::PumpCredits() {
     pump(data_waiters_, data_credit_, true);
 }
 
-bool IdleIo::Write(ServerConnection& connection) {
+bool IdleIo::Write(ServerConnection& connection, bool keep) {
     if (std::chrono::steady_clock::now() < connection.session.reply_not_before) return true;
     if (connection.response_offset == connection.response.size() && connection.reply_continuation) {
         connection.response = connection.reply_continuation->Next(65536U);
@@ -561,13 +561,16 @@ bool IdleIo::Write(ServerConnection& connection) {
     }
     ++connection.completed_replies;
     std::string{}.swap(connection.response);
-    connection.reply_credit.reset();
-    connection.reply_credit_bytes = 0U;
-    std::string{}.swap(connection.request_line);
+    if (!keep || connection.reply_credit_bytes != 65536U || !data_output_credit_->Owns(connection.reply_credit)) {
+        connection.reply_credit.reset();
+        connection.reply_credit_bytes = 0U;
+    }
+    if (keep) connection.request_line.clear();
+    else std::string{}.swap(connection.request_line);
     connection.parameters.clear();
     connection.frames.reset();
     connection.payload_credit.reset();
-    if (connection.pending.empty()) {
+    if (connection.pending.empty() && !(keep && data_line_credit_->Owns(connection.line_credit))) {
         std::string{}.swap(connection.pending.bytes);
         connection.line_credit.reset();
     }
@@ -600,6 +603,18 @@ bool IdleIo::Write(ServerConnection& connection) {
     if (auto* hook = server_.delivery_test_hook_.load(std::memory_order_acquire))
         hook->Run(FeedDeliveryTestHook::Point::kBeforeClientIdleRead, connection.completed_replies);
     return true;
+}
+
+void IdleIo::ReleaseKept(ServerConnection& connection) {
+    if (connection.phase != ServerConnection::Phase::kInput) return; // A reply in flight keeps its reservation.
+    if (!connection.reply_continuation) {
+        connection.reply_credit.reset();
+        connection.reply_credit_bytes = 0U;
+    }
+    if (connection.pending.empty() && connection.request_line.empty()) {
+        std::string{}.swap(connection.pending.bytes);
+        connection.line_credit.reset();
+    }
 }
 
 bool IdleIo::Progress(ServerConnection& connection) {

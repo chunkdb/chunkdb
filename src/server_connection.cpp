@@ -23,9 +23,10 @@ bool ChunkServer::HandleClient(
     const auto io = IdleIoHandle();
     if (!io) return false;
     auto& session = connection->session;
-    // A connection handed back is the I/O thread's to dispatch: free the
-    // worker first, so that dispatch counts it.
-    const auto park = [&] { FreeWorker(wait); return ParkClient(connection); };
+    // A connection handed back is the I/O thread's to dispatch: return what
+    // its waiting worker kept, and free the worker first, so that dispatch
+    // counts it.
+    const auto park = [&] { io->ReleaseKept(*connection); FreeWorker(wait); return ParkClient(connection); };
     try {
         while (running_.load()) {
             std::shared_ptr<StatementControl> control;
@@ -94,7 +95,7 @@ bool ChunkServer::HandleClient(
             connection->io_wait = POLLOUT;
             connection->output_deadline = std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(config_.client_io_timeout_ms);
-            if (!io->Write(*connection)) return false;
+            if (!io->Write(*connection, true)) return false;
             if (connection->phase != ServerConnection::Phase::kInput || session.watch || session.slot_watch)
                 return park();
             while (connection->pending.empty()) {

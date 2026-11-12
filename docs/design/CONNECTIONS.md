@@ -35,6 +35,7 @@ The wait suspends the request's frame deadline, which restarts when its credit i
 Removing a cancelled or closed waiter immediately pumps its successor even when the removed waiter held no credit.
 Reserving a complete request prevents multiple incomplete bodies from exhausting all credit while each waits for another frame.
 Credits remain charged while a worker owns the parameters and are released once on completion, refusal or final close.
+A worker waiting for its connection's next request keeps that connection's data line credit and ordinary 65536-byte reply reservation, and returns both when it hands the connection back with no reply or line in progress.
 Request-line buffers obey their negotiated line bound and a separate aggregate byte bound; reserved control capacity remains available while data framing is paused.
 Unclassified request lines use reserved line credit, so data-only credit cannot prevent receiving a new HELLO or control line.
 Replies charge their retained immutable state and encoded buffers against 2147483648 bytes of shared output credit.

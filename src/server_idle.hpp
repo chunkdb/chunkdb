@@ -51,7 +51,11 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
     bool Progress(ServerConnection& connection);
     bool Read(ServerConnection& connection);
     bool Parse(ServerConnection& connection, bool worker = false);
-    bool Write(ServerConnection& connection);
+    // keep: the writing worker waits for this connection's next request, so
+    // its ordinary reply reservation, data line credit and buffers stay.
+    bool Write(ServerConnection& connection, bool keep = false);
+    // Returns what Write kept once no reply or line is in progress.
+    void ReleaseKept(ServerConnection& connection);
     void Reply(ServerConnection& connection, std::string response);
     bool ReserveReply(ServerConnection& connection, std::size_t bytes, bool control);
     bool RejectProtocol(ServerConnection& connection, const std::exception& error);

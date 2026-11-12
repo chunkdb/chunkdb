@@ -2704,6 +2704,31 @@ void TestReturningWorkerTakesQueuedRequest() {
     returned.SendBytes("NG\r\n"); assert(returned.ReadLine() == "+PONG\r\n");
 }
 
+// A waiting worker keeps its connection's ordinary reply reservation only
+// while it waits: a connection that yields its worker returns it.
+void TestYieldReturnsKeptReplyCredit() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("yield-returns-kept-credit", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    RawClient first("127.0.0.1", harness.port);
+    const auto first_id = HelloId(first);
+    RawClient second("127.0.0.1", harness.port);
+    const auto second_id = HelloId(second);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(first_id);
+    // Only the waiting connection holds output credit now.
+    constexpr std::size_t kPool = 2147483648ULL, kOrdinary = 65536U;
+    assert(!chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, kPool));
+    assert(chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, kPool - kOrdinary));
+    second.SendLine("PING"); assert(second.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(second_id);
+    // The first connection returned its reservation when it yielded the worker.
+    assert(chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, kPool - kOrdinary));
+    assert(!chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, kPool - kOrdinary + 1U));
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+}
+
 // Holds the only worker after it hands a connection back until the I/O
 // thread has been refused queue space again, so only the following pop can
 // tell it that space returned.
@@ -7344,6 +7369,7 @@ int main(int argc, char** argv) {
         run("TestCancelStatementReadByWaitingWorker", TestCancelStatementReadByWaitingWorker);
         run("TestPipelinedBurstKeepsWaitingWorker", TestPipelinedBurstKeepsWaitingWorker);
         run("TestReturningWorkerTakesQueuedRequest", TestReturningWorkerTakesQueuedRequest);
+        run("TestYieldReturnsKeptReplyCredit", TestYieldReturnsKeptReplyCredit);
         run("TestWaitingWorkerStatementTimesOut", TestWaitingWorkerStatementTimesOut);
         run("TestRefusedDispatchWakesAfterPop", TestRefusedDispatchWakesAfterPop);
         run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);
