@@ -653,9 +653,10 @@ void TestDirectoryWithoutManifestRefused() {
     }
 }
 
-void TestInterruptedInitializationStartsOver() {
-    // What a crash during initialization can leave: the writer lock and a
-    // manifest that was written but never published.
+void TestUndecidedCreationTemporaryRefused() {
+    // A manifest temporary that no checked creation decision owns, as an
+    // initialization without one can leave: opening refuses, and neither
+    // a writer nor a reader removes it to start over.
     ScopedTempDir dir("chunkdb-manifest-interrupted");
     std::filesystem::create_directories(dir.path() / ".chunkdb.lock");
     const auto stale_tmp = dir.path() / "table.manifest.tmp.2147483000.1.2.3";
@@ -667,14 +668,19 @@ void TestInterruptedInitializationStartsOver() {
 
     auto geometry = kDefaultGeometry;
     geometry.block_bits = 9;
-    {
-        chunkdb::ChunkStore store(Config(dir.path(), geometry));
-        store.SetBlockBits(1, 1, "101010101");
-    }
-    assert(!std::filesystem::exists(stale_tmp));
-    const auto manifest = chunkdb::ReadStoreManifest(dir.path());
-    assert(manifest.has_value());
-    assert(chunkdb::SameGeometry(manifest->geometry, geometry));
+    // Only the writer lock may add its own artifacts.
+    const auto owned = [&] {
+        auto tree = Tree(dir.path());
+        std::erase_if(tree, [](const auto& entry) { return entry.first.starts_with(".chunkdb.lock"); });
+        return tree;
+    };
+    const auto before = owned();
+    const auto message = ExpectRefused([&] { chunkdb::ChunkStore store(Config(dir.path(), geometry)); });
+    assert(Contains(message, "creation temporary has no checked decision"));
+    assert(owned() == before);
+    (void)ExpectRefused([&] { chunkdb::ChunkStore store(ReadOnly(Config(dir.path(), geometry))); });
+    assert(owned() == before);
+    assert(!chunkdb::ReadStoreManifest(dir.path()));
 }
 
 // A store at a volume root shares it with `lost+found`, which ext4 creates
@@ -1085,7 +1091,7 @@ int main(int argc, char** argv) {
     TestOmittedFieldsUseStoredGeometry();
     TestDamagedManifestRefused();
     TestDirectoryWithoutManifestRefused();
-    TestInterruptedInitializationStartsOver();
+    TestUndecidedCreationTemporaryRefused();
     TestInterruptedRecordReplacementsAreRemoved();
     TestDataDirVersionFloorOption();
     TestPublishNewFileNeverReplaces();

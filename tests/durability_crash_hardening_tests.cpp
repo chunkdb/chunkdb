@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -18,6 +19,7 @@
 #include "chunkdb/logging.hpp"
 #include "checkpoint.hpp"
 #include "chunk_coordinate_index.hpp"
+#include "commit_owner_bootstrap.hpp"
 #include "populated_index_format.hpp"
 #include "store_manifest.hpp"
 
@@ -1101,33 +1103,59 @@ void TestManifestCrashBoundaries(const std::string& executable) {
     {
         const auto data_dir = TempDataDir("manifest-crash-before-publish");
         run_child(data_dir, "CHUNKDB_FAILPOINT_CRASH_MANIFEST_BEFORE_PUBLISH_ONCE");
-        // Both synced initialization artifacts are present; neither owns any
-        // populated chunk or retained deletion decision.
+        // The creation decision, the empty inventory, the INACTIVE owner root
+        // and the unpublished manifest are present; none owns a populated
+        // chunk or retained deletion decision.
         auto entries = names(data_dir);
         std::erase(entries, std::string(".chunkdb.lock"));
-        assert(entries.size() == 2U);
+        assert(entries.size() == 4U);
         assert(std::erase(entries, std::string(chunkdb::kChunkIndexFileName)) == 1U);
+        assert(std::erase(entries, std::string(chunkdb::kCommitOwnerBootstrapName)) == 1U);
+        assert(std::erase(entries, std::string("chunkdb.groups.owner")) == 1U);
         assert(entries[0].rfind("table.manifest.tmp.", 0) == 0);
-        const auto unpublished = chunkdb::ParseStoreManifest(chunkdb::LoadFile(data_dir / entries[0]));
+        const auto decision = chunkdb::CommitOwnerBootstrap::ReadPending(data_dir);
+        assert(decision && chunkdb::LoadFile(data_dir / entries[0]) == decision->manifest);
+        const auto unpublished = chunkdb::ParseStoreManifest(decision->manifest);
+        assert(unpublished.geometry.block_bits == 9U);
         empty_inventory(data_dir, unpublished);
 
-        // Never initialized, so any geometry may create the store now.
+        // The decision fixed the geometry and identities: another geometry
+        // refuses and leaves every byte in place.
+        const auto files = [&] {
+            std::vector<std::pair<std::string, std::vector<std::uint8_t>>> bytes;
+            for (const auto& name : names(data_dir))
+                if (name != ".chunkdb.lock") bytes.emplace_back(name, chunkdb::LoadFile(data_dir / name));
+            std::sort(bytes.begin(), bytes.end());
+            return bytes;
+        };
+        const auto before = files();
         auto config = BuildConfig(data_dir, chunkdb::DurabilityMode::kFsyncWal);
         config.geometry.block_bits = 11;
+        bool refused = false;
+        try {
+            chunkdb::ChunkStore store(config);
+        } catch (const std::exception&) {
+            refused = true;
+        }
+        assert(refused && files() == before);
+
+        // Restart completes the recorded decision.
+        config.geometry_fields = 0;
         {
             chunkdb::ChunkStore store(config);
             assert(store.store_id() == unpublished.store_id);
+            assert(chunkdb::LoadFile(chunkdb::StoreManifestPath(data_dir)) == decision->manifest);
             empty_inventory(data_dir, *chunkdb::ReadStoreManifest(data_dir));
-            store.SetBlockBits(0, 0, "10101010101");
+            store.SetBlockBits(0, 0, "101010101");
         }
+        assert(!chunkdb::CommitOwnerBootstrap::ReadPending(data_dir));
         for (const auto& name : names(data_dir)) {
             assert(name.rfind("table.manifest.tmp.", 0) != 0);
         }
-        config.geometry_fields = 0;
         {
             chunkdb::ChunkStore reopened(config);
-            assert(reopened.geometry().config().block_bits == 11U);
-            assert(reopened.GetBlockBits(0, 0) == "10101010101");
+            assert(reopened.geometry().config().block_bits == 9U);
+            assert(reopened.GetBlockBits(0, 0) == "101010101");
         }
         RemoveAllWithRetry(data_dir);
     }
@@ -1135,11 +1163,14 @@ void TestManifestCrashBoundaries(const std::string& executable) {
     {
         const auto data_dir = TempDataDir("manifest-crash-after-publish");
         run_child(data_dir, "CHUNKDB_FAILPOINT_CRASH_MANIFEST_AFTER_PUBLISH_ONCE");
-        // The published manifest and checked empty inventory share identity.
+        // The published manifest and checked empty inventory share identity;
+        // the creation decision and its INACTIVE owner root remain.
         auto entries = names(data_dir);
         std::erase(entries, std::string(".chunkdb.lock"));
-        assert(entries.size() == 2U);
+        assert(entries.size() == 4U);
         assert(std::erase(entries, std::string(chunkdb::kChunkIndexFileName)) == 1U);
+        assert(std::erase(entries, std::string(chunkdb::kCommitOwnerBootstrapName)) == 1U);
+        assert(std::erase(entries, std::string("chunkdb.groups.owner")) == 1U);
         assert(entries[0] == "table.manifest");
         const auto manifest_bytes = chunkdb::LoadFile(data_dir / "table.manifest");
         const auto index_bytes = chunkdb::LoadFile(data_dir / chunkdb::kChunkIndexFileName);
@@ -1163,6 +1194,8 @@ void TestManifestCrashBoundaries(const std::string& executable) {
             assert(store.geometry().config().block_bits == 9U);
             store.SetBlockBits(0, 0, "101010101");
         }
+        assert(!chunkdb::CommitOwnerBootstrap::ReadPending(data_dir));
+        assert(chunkdb::LoadFile(data_dir / "table.manifest") == manifest_bytes);
         {
             chunkdb::ChunkStore reopened(config);
             assert(reopened.GetBlockBits(0, 0) == "101010101");
