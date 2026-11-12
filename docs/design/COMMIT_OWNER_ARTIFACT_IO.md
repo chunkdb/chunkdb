@@ -17,9 +17,10 @@ Read-only opening pins the actual root directory and refuses a symbolic link or 
 A writer additionally borrows an existing exclusive ProcessLock for its entire lifetime and verifies its admitted canonical directory, the pinned native root generation and the native identity of `root/.chunkdb.lock/writer.lock` against that lock.
 The fixed `.chunkdb.lock` directory is itself opened relative to the pinned root with no-follow directory admission; matching a lock-file hard link under a different root is insufficient.
 A lock for another directory, a missing lock, read-only access or an incompatible shared-writer context cannot create an artifact writer.
-ProcessLock retains an actual root-directory native owner captured during acquisition before opening pathname-based lock children; inode numbers without a retained owner cannot protect against directory deletion and reuse.
+A ProcessLock acquired for artifact staging retains an actual root-directory native owner, captured from the path as given before the lock directory is created; inode numbers without a retained owner cannot protect against directory deletion and reuse.
+An ordinary writer lock takes no root owner, so an artifact writer refuses it, and a refused root leaves no lock directory.
 Post-acquisition artifact admission binds the fixed lock child under that pinned root to the acquired native lock before an initialized artifact lease is reported.
-The root owner is close-on-exec or noninheritable, receives failure cleanup and outlives artifact borrowers; this adds startup ownership without ordinary request-path operations or a claim about existing heartbeat pathname races.
+The root owner is close-on-exec or noninheritable, receives failure cleanup and outlives artifact borrowers; ordinary writer starts and request paths do not take it, and it makes no claim about existing heartbeat pathname races.
 The caller retains the real lock until all artifact writers are destroyed; the foundation neither takes over nor releases that lock.
 
 POSIX operations use pinned directory descriptors, `openat` with no-follow and close-on-exec flags, `fstat` regular-file checks and relative native publication names.
