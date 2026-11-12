@@ -1,0 +1,10 @@
+date=2026-11-12
+machine=AMD Ryzen 5 4600H (6 cores, 12 threads), 14.49 GiB RAM
+os=Ubuntu, Linux 7.0.0-38-generic, ext4
+compiler=GCC 15.2.0
+source=chunkdb ddf7673 (main) and 0f63538 (clean checkouts)
+build=cmake -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WERROR=ON; target chunkdb_chunk_map_bench
+command=taskset -c 2 chunkdb_chunk_map_bench --chunks 16384 --ops 204800 --runs 15 --data-dir <ext4 directory>
+order=main, then the branch; each is one process, so one hash seed for its 15 runs
+repeat=two more processes of the branch with 9 runs each gave a one-chunk lookup median of 97.6 and 72.2 ns and a one-chunk read median of 207.6 and 176.6 ns; main gave 51.4 and 51.3 ns, and 136.4 and 135.7 ns
+load=other services ran on the machine; load average was 7 to 12 during the paired budget runs of the same window

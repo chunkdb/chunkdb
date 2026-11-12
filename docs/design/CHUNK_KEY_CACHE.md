@@ -1,0 +1,45 @@
+# Coordinate hashing and large-chunk admission
+
+Both coordinate hashers use the same nonlinear mixing function over all three signed axes, including a zero third axis.
+A process seed is obtained once from the existing operating-system random source and captured by default-constructed hashers.
+Seed initialization failure propagates before a map can use its hasher; there is no predictable fallback seed or random work during lookup.
+The mixing function accepts a seed explicitly so distribution and collision-family checks can use fixed inputs.
+Equality and coordinate ordering remain exact, and hashes are never persisted.
+
+Stores sharing `StoreResources` also share a hard large-chunk container budget.
+For regular-chunk capacity `L`, let `B = max(L - min(EvictionLowerWatermark(L), L), 1)`.
+The container limit is `L + B + 1`, with overflow rejected while constructing the resource pool.
+The final spare container allows an ordinary miss to load before regular-chunk eviction selects its victim.
+This uses the existing cache setting and introduces no additional configuration flag.
+
+Every new container reserves one place before publication in the large-chunk map or eviction ring.
+Registered, constructing and retired containers consume the same budget until their last owner releases them.
+Reservations keep their accounting owner alive and are released on allocation, load or publication failure.
+An existing container remains accessible at the limit; a new miss fails immediately with the existing `BUSY` code and `reason=large_chunk_cache_full`.
+The refusal allocates no producing revision and applies no mutation.
+Metrics expose the shared current count, limit and cumulative refusals.
+
+Registry publication rolls back as one unit if map or ring allocation fails.
+A failed first load retires an empty container under the existing registry-then-container lock order.
+A loader drops a retired owner before attempting a replacement, so it cannot block itself with its old reservation.
+Capacity admission performs no directory I/O, global eviction pass or capacity wait while holding the large-chunk registry mutex.
+Drop and shutdown release ordinary ownership without resetting counters still held by in-flight readers.
+Maintenance preparation that checkpoints cold chunks uses bounded temporary off-cache state under its existing exclusive ownership and publication locks.
+In particular, tombstone compaction does not acquire new cache admission after entering its durable publication phase or fence a healthy table for this known capacity refusal.
+A background checkpoint keeps its chunk cached while it owns the chunk's files, so writes to that chunk remain container hits at the limit.
+Maintenance workers look chunks up without loading them and never create containers; a cold chunk has no running checkpoint, so its off-cache preparation needs no checkpoint mark.
+
+Fixed-seed tests cover signed extremes, zero third axes, the former two-axis collisions, three-axis collision families and bucket distribution for both key types.
+Lifecycle tests cover shared limits across tables, live and retired owners, allocation and load failure, empty-container retirement, drop and recovery, refusal identity and metrics, and a background checkpoint paused without the chunk lock at the limit.
+Each regression is checked against the corresponding broken behavior.
+Release warnings-as-errors, the full test suite, GCC compilation and independent review precede a ready pull request.
+
+## Measurements
+
+`chunkdb_chunk_map_bench` with 16,384 loaded chunks, 15 runs each of main ddf7673 and this change at 0f63538, on Linux: AMD Ryzen 5 4600H, ext4, GCC 15.2 Release ([main](../../bench/artifacts/manual-runs/chunk-key-cache-20261112-linux-main.txt), [this change](../../bench/artifacts/manual-runs/chunk-key-cache-20261112-linux-branch.txt), [conditions](../../bench/artifacts/manual-runs/chunk-key-cache-20261112-linux-metadata.txt)).
+Across many chunks the two lookups take 261.5 ns before and 234.4 ns after, a read 555.2 and 518.7 ns, a write 2,605.0 and 2,550.1 ns.
+In one chunk the two lookups take 51.5 ns before and 111.5 ns after, a read 134.5 and 205.8 ns, a write 1,831.5 and 1,899.5 ns.
+The one-chunk cost depends on the process seed: two more processes measured 97.6 and 72.2 ns for the lookups and 207.6 and 176.6 ns for a read.
+The mixing function replaces an identity hash, and the standard library hashes again each key it passes in a bucket, so a hot chunk pays for the mixing on every lookup.
+Storing the hash code in each node was measured and not adopted: one-chunk lookups took 76.7 and 75.7 ns, lookups across many chunks 291.0 and 297.4 ns.
+The paired hot-path budget of the same window met no regression criterion: relaxed medians changed by +0.36% (world, 57,325 to 57,531 requests per second), +0.97% (canvas, 49,877 to 50,362) and +0.61% (simulation, 51,124 to 51,436), 15 pairs.

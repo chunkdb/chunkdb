@@ -342,6 +342,7 @@ void TestLimits() {
     ScopedTempDir dir("chunkdb-txn-commit-limits");
     auto config = Config(dir.path());
     config.query_limits.txn_max_written_chunks = chunkdb::kMaxTxnWrittenChunks + 1U;
+    // The full-limit commit pins both disjoint sets before locking them.
     config.max_loaded_chunks = config.query_limits.txn_max_read_chunks + config.query_limits.txn_max_written_chunks + 1U;
     ChunkStore store(config);
     auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
