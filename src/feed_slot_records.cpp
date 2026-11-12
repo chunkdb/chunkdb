@@ -11,6 +11,7 @@
 #include "checkpoint.hpp"
 #include "chunkdb/crc32.hpp"
 #include "store_manifest.hpp"
+#include "user_registry.hpp"
 
 namespace chunkdb {
 namespace {
@@ -18,6 +19,12 @@ constexpr std::array<std::uint8_t, 4> kMagic{'C', 'K', 'S', 'L'};
 constexpr std::size_t kFixedBytes = 4U + 2U + 2U + 16U + 8U + 4U + 4U;
 constexpr std::size_t kMaxRecordsBytes = 1024U * 1024U;
 constexpr std::size_t kMaxSlots = 1024U;
+// Versions 1 to 3 are earlier development layouts. Version 4 carries the table
+// dimensionality, the filter format and an optional owner for each slot.
+constexpr std::uint16_t kVersion = 4U;
+constexpr std::uint8_t kFilterHeaderFlag = 1U;
+constexpr std::uint8_t kOwnerFlag = 64U;
+constexpr unsigned kSlotFlags = 1U | 2U | 4U | 8U | 16U | 32U | kOwnerFlag;
 
 [[noreturn]] void BadRecords(const std::string& why) {
     throw std::runtime_error("invalid chunkdb.slots: " + why);
@@ -48,8 +55,9 @@ void ValidateRecords(const FeedSlotRecords& records) {
             for (const auto id : *slot.filters.column_ids)
                 if (id == 0U || !ids.insert(id).second) BadRecords("zero or duplicate projection id");
         }
+        if (slot.owner && !IsValidUserName(*slot.owner)) BadRecords("owner is not a user name");
         encoded_size += 12U + slot.name.size() + (slot.filters.area ? 16U * records.dims : 0U) +
-            (slot.filters.column_ids ? slot.filters.column_ids->size() * 4U : 0U);
+            (slot.filters.column_ids ? slot.filters.column_ids->size() * 4U : 0U) + (slot.owner ? 1U + slot.owner->size() : 0U);
         if (encoded_size > kMaxRecordsBytes) BadRecords("size");
     }
 }
@@ -64,14 +72,18 @@ void RequireValidFeedSlotName(std::string_view name) {
     }
 }
 
+void RequireValidFeedSlotOwner(std::string_view owner) {
+    if (!IsValidUserName(owner)) throw std::invalid_argument("slot owners are user names, 1 to 63 bytes: [a-z_][a-z0-9_]*");
+}
+
 std::vector<std::uint8_t> SerializeFeedSlotRecords(const FeedSlotRecords& records) {
     ValidateRecords(records);
     std::vector<std::uint8_t> bytes(kMagic.begin(), kMagic.end());
     const bool extended = records.filter_format || std::any_of(records.slots.begin(), records.slots.end(),
         [](const auto& slot) { return !slot.filters.empty() || slot.schema_filter_lost; });
-    WriteLe16(bytes, 3U);
+    WriteLe16(bytes, kVersion);
     bytes.push_back(records.dims);
-    bytes.push_back(extended ? 1U : 0U);
+    bytes.push_back(extended ? kFilterHeaderFlag : 0U);
     bytes.insert(bytes.end(), records.epoch.begin(), records.epoch.end());
     WriteLe64(bytes, records.durable_watermark);
     WriteLe32(bytes, static_cast<std::uint32_t>(records.slots.size()));
@@ -79,7 +91,7 @@ std::vector<std::uint8_t> SerializeFeedSlotRecords(const FeedSlotRecords& record
         bytes.push_back(static_cast<std::uint8_t>(slot.name.size()));
         const auto flags = (slot.lost ? 1U : 0U) | (slot.filters.area ? 2U : 0U) |
             (slot.filters.column_ids ? 4U : 0U) | (slot.filters.no_before ? 8U : 0U) |
-            (slot.filters.chunks ? 16U : 0U) | (slot.schema_filter_lost ? 32U : 0U);
+            (slot.filters.chunks ? 16U : 0U) | (slot.schema_filter_lost ? 32U : 0U) | (slot.owner ? kOwnerFlag : 0U);
         bytes.push_back(static_cast<std::uint8_t>(flags));
         WriteLe16(bytes, static_cast<std::uint16_t>(slot.filters.column_ids ? slot.filters.column_ids->size() : 0U));
         WriteLe64(bytes, slot.written);
@@ -95,6 +107,10 @@ std::vector<std::uint8_t> SerializeFeedSlotRecords(const FeedSlotRecords& record
         }
         if (slot.filters.column_ids)
             for (const auto id : *slot.filters.column_ids) WriteLe32(bytes, id);
+        if (slot.owner) {
+            bytes.push_back(static_cast<std::uint8_t>(slot.owner->size()));
+            bytes.insert(bytes.end(), slot.owner->begin(), slot.owner->end());
+        }
     }
     WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
     return bytes;
@@ -106,8 +122,8 @@ FeedSlotRecords ParseRecords(const std::vector<std::uint8_t>& bytes, const Store
     if (bytes.size() < kFixedBytes || bytes.size() > kMaxRecordsBytes) BadRecords("size");
     const auto version = ReadLe16(bytes, 4U);
     if (!std::equal(kMagic.begin(), kMagic.end(), bytes.begin())) BadRecords("magic");
-    if (version == 1U || version == 2U) throw EarlierDevelopmentFormatError();
-    if (version != 3U || (bytes[6U] != 2U && bytes[6U] != 3U) || (bytes[7U] & ~1U) != 0U)
+    if (version >= 1U && version < kVersion) throw EarlierDevelopmentFormatError();
+    if (version != kVersion || (bytes[6U] != 2U && bytes[6U] != 3U) || (bytes[7U] & ~kFilterHeaderFlag) != 0U)
         BadRecords("magic, version or reserved field");
     if (expected_dims && *expected_dims != bytes[6U]) BadRecords("dimensionality differs from table");
     const auto crc_at = bytes.size() - 4U;
@@ -116,7 +132,7 @@ FeedSlotRecords ParseRecords(const std::vector<std::uint8_t>& bytes, const Store
     std::copy_n(bytes.begin() + 8, records.epoch.size(), records.epoch.begin());
     if (records.epoch != epoch) BadRecords("epoch differs from table");
     records.durable_watermark = ReadLe64(bytes, 24U);
-    records.filter_format = (bytes[7U] & 1U) != 0U;
+    records.filter_format = (bytes[7U] & kFilterHeaderFlag) != 0U;
     records.dims = bytes[6U];
     const auto count = ReadLe32(bytes, 32U);
     if (count > kMaxSlots) BadRecords("too many slot records");
@@ -126,7 +142,7 @@ FeedSlotRecords ParseRecords(const std::vector<std::uint8_t>& bytes, const Store
         const auto length = bytes[at];
         const auto flags = bytes[at + 1U];
         const auto columns = ReadLe16(bytes, at + 2U);
-        if ((flags & ~63U) != 0U ||
+        if ((flags & ~kSlotFlags) != 0U ||
             ((flags & 4U) == 0U && columns != 0U) || ((flags & 4U) != 0U && columns == 0U) ||
             columns > kMaxColumnsPerTable) BadRecords("slot flags or projection count");
         if (crc_at - at - 12U < length) BadRecords("truncated slot name");
@@ -157,6 +173,12 @@ FeedSlotRecords ParseRecords(const std::vector<std::uint8_t>& bytes, const Store
             if (crc_at - at < static_cast<std::size_t>(columns) * 4U) BadRecords("truncated projection ids");
             slot.filters.column_ids.emplace(); slot.filters.column_ids->reserve(columns);
             for (std::uint16_t j = 0U; j < columns; ++j, at += 4U) slot.filters.column_ids->push_back(ReadLe32(bytes, at));
+        }
+        if ((flags & kOwnerFlag) != 0U) {
+            if (crc_at - at < 1U || crc_at - at - 1U < bytes[at]) BadRecords("truncated slot owner");
+            slot.owner.emplace(bytes.begin() + static_cast<std::ptrdiff_t>(at + 1U),
+                               bytes.begin() + static_cast<std::ptrdiff_t>(at + 1U + bytes[at]));
+            at += 1U + bytes[at];
         }
     }
     if (at != crc_at) BadRecords("trailing bytes");

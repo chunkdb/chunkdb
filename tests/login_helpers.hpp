@@ -120,7 +120,9 @@ struct AuthStep {
     std::string bytes;
     std::string server_signature;
 };
-inline AuthStep AuthBytes(const scram::ClientLogin& login, std::string_view password, std::string_view server_reply) {
+// `binding_data`: what the client sees of its connection, for a bound login.
+inline AuthStep AuthBytes(const scram::ClientLogin& login, std::string_view password, std::string_view server_reply,
+                          std::span<const std::uint8_t> binding_data = {}) {
     const auto first = ServerFirstOf(server_reply);
     const auto salt_at = first.find(",s=");
     if (!first.starts_with("r=") || salt_at == std::string::npos)
@@ -136,7 +138,7 @@ inline AuthStep AuthBytes(const scram::ClientLogin& login, std::string_view pass
             throw std::logic_error("prepare login credentials before opening the test connection");
         keys = found->second;
     }
-    const auto without_proof = "c=biws,r=" + std::string(nonce);
+    const auto without_proof = scram::ChannelBindingAttribute(login.gs2_header, binding_data) + ",r=" + std::string(nonce);
     const auto message = login.first_bare + "," + first + "," + without_proof;
     const auto signature = crypto::HmacSha256(crypto::Sha256Of(keys.client), crypto::Bytes(message));
     crypto::Sha256Digest proof{};

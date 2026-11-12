@@ -44,6 +44,7 @@ Names are case-insensitive and normalized to lowercase; duplicate names are `INV
 Invalid known values are `INVALID_ARGUMENT reason=option_value option=<name>`, not authentication failures.
 Unknown options are lexically parsed, accepted and reported as not applied; they never increment authentication-failure counters.
 Parameters in WITH follow the same framing rules as all other parameters, independently of SCRAM's authentication parameter.
+Before authentication HELLO carries at most 12 parameters, enough for `$1` of USER, every known option and eight unknown ones; more receive `PROTOCOL` and close without their frames being read.
 Unset options use server defaults; explicit per-statement TAG overrides `default_tag`, including an empty tag.
 
 | Limit key | Value and ownership |
@@ -140,10 +141,9 @@ An absent block with a retained committed chunk version still returns that versi
 The version is null when no committed version remains retained, including never-written chunks and identities forgotten by tombstone compaction.
 Collection itself preserves the producing version and time in a retained tombstone.
 An empty or torn WAL header alone is not a committed version.
-Persistent versions for collected chunks belong to task 52's tombstones.
 For transaction-private modified chunks the version is null, because no commit produced those private values yet; the committed snapshot version remains available before modification.
 Schema is known even when a block is absent or an area is empty; an empty area is `[]`, never a null payload.
-Task 52's 3D area entry is `[cx,cy,cz,form]`; dimensions select the coordinate prefix before trailing extensions are ignored.
+A 3D area entry is `[cx,cy,cz,form]`; dimensions select the coordinate prefix before trailing extensions are ignored.
 Area reads keep their existing consistency semantics across chunks; WITH SCHEMA does not invent an atomic multi-chunk snapshot.
 
 ## Push envelopes (A1, A8, A9)
@@ -190,9 +190,10 @@ Column projections persist stable column ids in declared order; equivalent area 
 A dropped projected column makes the slot lost with reason=schema_filter; it never silently broadens or changes the projection.
 Changing filters requires creating a different slot; IF NOT EXISTS must compare filters rather than silently accept incompatible existing state.
 Task 51 implements these fixed filters, including a CHUNKS event for each relevant committed chunk; task 56 adds lagging-consumer coalescing and multiple areas.
-Task 52 changes the form format/dimensions without changing the chunk push prefix selected by dims.
+The chunk push prefix is selected by dims and does not depend on the form format.
 
-CREATE SLOT accepts each AREA, COLUMNS, NO BEFORE and CHUNKS suffix once, in any order after `ON table`.
+CREATE SLOT accepts each AREA, COLUMNS, NO BEFORE, CHUNKS and OWNER suffix once, in any order after `ON table`.
+OWNER names the user the slot belongs to, by default the user running CREATE SLOT; IF NOT EXISTS with OWNER also requires an existing slot to have that owner, or returns INVALID_ARGUMENT reason=slot_filters.
 SHOW SLOTS retains `table`, `name`, `epoch`, `acked`, `retained_bytes` and `lost`, adding the following keys.
 
 | Key | Shape |
@@ -204,13 +205,15 @@ SHOW SLOTS retains `table`, `name`, `epoch`, `acked`, `retained_bytes` and `lost
 | `filters.no_before` | Boolean; false by default. |
 | `filters.chunks` | Boolean; false by default. |
 | `lost_reason` | Null for a live slot; `retention_limit` or `schema_filter` for a persisted loss. |
+| `owner` | Bulk user name, shown to that user and to MANAGES USERS; null otherwise or for a slot without a recorded owner. |
 
-Area arrays contain `2*d` values; the current 2D order is `[x0,y0,x1,y1]`, and clients do not hard-code four entries.
+Area arrays contain `2*d` values: `[x0,y0,x1,y1]` in 2D and `[x0,y0,z0,x1,y1,z1]` in 3D, and clients do not hard-code four entries.
 A rename changes only the display name; a dropped ID retains its position with a null display name.
 Persisted IDs determine WATCH and IF NOT EXISTS identity, rather than names that can change.
-Checked slot records use format 2 for extended filters, owned by incompatibility bit 8.
-Their flags store loss, AREA, COLUMNS, NO BEFORE, CHUNKS and schema-filter loss; projection IDs retain declared order.
-The format never downgrades after filtering metadata was recorded; unfiltered format-1 records keep their original encoding.
+Checked slot records use format 4, with the table dimensionality and a filter-format header flag owned by incompatibility bit 8.
+Their flags store loss, AREA, COLUMNS, NO BEFORE, CHUNKS, schema-filter loss and an owner; projection IDs retain declared order.
+The filter-format flag never clears after filtering metadata was recorded.
+The owner needs no feature bit; earlier development formats 1 to 3 are refused.
 Schema replacement and startup compare every live projection ID before serving, persisting schema-filter loss for a missing ID.
 Existing lost records map to `retention_limit`: `FeedSlots::Retain` currently persists loss only when retained bytes exceed the slot limit.
 `Column::id` is never reused; `RenameColumn` preserves it, while `DropColumn` removes the column from the live schema.
@@ -231,7 +234,9 @@ The replacement starts at the persisted ACK; crash before persistence can replay
 A claim generation fences late old ACKs; no two valid claims can send or update the same slot concurrently.
 Lock ordering never waits for socket drainage or worker shutdown while holding table/catalog locks.
 Concurrent ownership handoffs return SLOT_BUSY reason=takeover_pending rather than create a second owner.
-An ordinary attach needs READ; takeover of the same user's connection needs READ, and another user's connection additionally needs ADMIN on `*`, matching G2.
+An ordinary attach needs READ; a slot another user owns, or one without a recorded owner attached by ADMIN on `*`, additionally needs ADMIN on `*` for as long as the watch lasts.
+Takeover of the same user's connection needs READ, and another user's connection additionally needs ADMIN on `*`, matching G2.
+A slot without a recorded owner takes the user of its first granted attach that ADMIN on `*` does not allow, saved before the watch starts.
 
 ## Lineage and restoration (A9)
 

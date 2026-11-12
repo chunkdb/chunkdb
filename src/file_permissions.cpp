@@ -7,6 +7,7 @@
 
 #ifdef _WIN32
 #include <aclapi.h>
+#include "backup_windows_path.hpp"
 #else
 #include <fcntl.h>
 #include <sys/stat.h>
@@ -85,7 +86,9 @@ int OpenOwnerOnlyFile(const std::filesystem::path& path, int flags) {
 OwnerOnlySecurity::OwnerOnlySecurity(const std::filesystem::path& path, bool directory) {
     // Inspect the resolved parent volume before creation: FAT ignores the
     // supplied security descriptor, and a post-create check would be too late.
-    const auto parent = std::filesystem::absolute(path).parent_path();
+    const auto parent = path.native().starts_with(L"\\\\") ?
+        std::filesystem::path(BackupWindowsParentApiName(path.native())) :
+        std::filesystem::absolute(path).parent_path();
     Handle parent_handle(CreateFileW(parent.c_str(), FILE_READ_ATTRIBUTES,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING, FILE_FLAG_BACKUP_SEMANTICS, nullptr));

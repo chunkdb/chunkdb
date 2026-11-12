@@ -158,6 +158,33 @@ void TestMalformedBytes() {
                     "unknown column flags"));
 }
 
+// A default is encoded only for a type inside its kind's range, and an
+// integer value takes at most 8 bytes however wide the type.
+void TestEncodingNeedsAValidType() {
+    const std::string u = "column a: uN takes N from 1 to 64";
+    assert(ErrorOf([] { chunkdb::ValidateColumnType(Fixed(1, "a", ColumnKind::kUnsigned, 65)); }) == u);
+    assert(ErrorOf([] { chunkdb::ValidateColumnType(Fixed(1, "a", ColumnKind::kUnsigned, 64)); }).empty());
+    for (const std::uint32_t size : {0U, 65U, 4294967288U, 4294967295U}) {
+        const auto column = Fixed(1, "a", ColumnKind::kUnsigned, size);
+        assert(ErrorOf([&] { (void)chunkdb::EncodeColumnValue(column, std::uint64_t{1}); }) == u);
+    }
+    assert(Contains(ErrorOf([] {
+                        (void)chunkdb::EncodeColumnValue(Fixed(1, "a", ColumnKind::kBits, 4294967288U),
+                                                         chunkdb::BitsValue{.digits = "1"});
+                    }),
+                    "bits(N) takes N from 1 to 65535"));
+    // Changing to such a type is refused before the default is fitted to it.
+    auto schema = World();
+    assert(ErrorOf([&] {
+               (void)chunkdb::ChangeColumnType(schema, "light", ColumnType{.kind = ColumnKind::kUnsigned, .size = 0},
+                                               chunkdb::Conversion::kClamp);
+           }) == "column light: uN takes N from 1 to 64");
+    assert(ErrorOf([&] {
+               (void)chunkdb::ChangeColumnType(schema, "light", ColumnType{.kind = ColumnKind::kUnsigned, .size = 200},
+                                               chunkdb::Conversion::kExact);
+           }) == "column light: uN takes N from 1 to 64");
+}
+
 // A table needs a fixed-width column; a manifest that records none is
 // refused before the table is touched.
 void TestUnsupportedSchemaIsRefused() {
@@ -219,6 +246,7 @@ int main() {
     TestRoundTrip();
     TestTypeNames();
     TestValidationRules();
+    TestEncodingNeedsAValidType();
     TestMalformedBytes();
     TestUnsupportedSchemaIsRefused();
     return 0;

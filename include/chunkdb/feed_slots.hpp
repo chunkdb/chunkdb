@@ -32,6 +32,8 @@ struct FeedSlot {
     bool lost = false;
     FeedSlotFilters filters{};
     bool schema_filter_lost = false;
+    // Absent for a slot recorded without one, until an attach by a user records it.
+    std::optional<std::string> owner{};
     // Filled by a table listing under the same lease as its live schema.
     std::vector<std::optional<std::string>> column_names{};
 };
@@ -92,6 +94,10 @@ class FeedArchiveReader {
     struct Impl;
     explicit FeedArchiveReader(std::unique_ptr<Impl> impl);
     void EnableChunkForms(std::size_t budget);
+    // Keeps of each change only what a slot watch with `filters` sends,
+    // before the budget counts it; Next then returns the frames it sends.
+    void Filter(const FeedSlotFilters& filters);
+    // Applies to the changes read after it.
     void SetEntryBudget(std::size_t budget);
     std::unique_ptr<Impl> impl_;
 };

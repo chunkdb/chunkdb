@@ -57,6 +57,7 @@
 #include <openssl/evp.h>
 #include <openssl/pem.h>
 #include <openssl/x509.h>
+#include "tls_test_utils.hpp"
 #endif
 
 namespace chunkdb {
@@ -838,55 +839,6 @@ class RawClient {
 
 #ifdef CHUNKDB_WITH_OPENSSL
 
-constexpr std::string_view kTestTlsCertPem = R"(-----BEGIN CERTIFICATE-----
-MIICpDCCAYwCCQC4nvQC5V39WjANBgkqhkiG9w0BAQsFADAUMRIwEAYDVQQDDAkx
-MjcuMC4wLjEwHhcNMjYwMzMxMTUyNjE5WhcNMjYwNDAxMTUyNjE5WjAUMRIwEAYD
-VQQDDAkxMjcuMC4wLjEwggEiMA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQCY
-dAxbMYkq16iK3hDquOYqJj4zIZoCY1Zeq10DpfHB053UR1ywWyN35KG4a1XfXOVM
-W47D0CACyks0GT7ix8KM4xGMSx2b/EQ8mQrztnt3YZKuHwnDH45oiiQ+/9WW7NAY
-jPgIsCxn/P+E4M43yqvHqK4XGLLm984xFnu4n270bsqi/IHbSlWYt3B8q7rHTYmD
-BmwsXnFbxvJcmH0CQkgbU1F11g4fmVSd8Qt+R2NTSSjbGvBpupjYbhERXQQVsjP4
-sEERqPT8ocZD1MoINMKTtCmxHbez7qO9o8gAY1aVZSsslowR5WCb+d1jjsRFqk6w
-JqumPbmPFiexe73uD4CVAgMBAAEwDQYJKoZIhvcNAQELBQADggEBAIozzwqPOe6o
-Et2j696F4akvfWh9v273hkrXixrUO4Qt27nrRBrsQPn0WnrPnxsy5BCYoSBVShie
-Cj9WFl3cPinYLwiB+1MpJBUA1eTRU+m4MYsGwBnSceol966GIQ19bzBIokijKa9/
-92zdONdV7mIPc01fExygVNcGWD4+DBzf0fXw0HPJsku0rQQ1Ldp34hQ2UzmaBAJC
-BdHGFsYCRMkPinjPuNmbH3PF2y5G+0ftTFmomaHPbSmvB+I+z8mS5eH7pCbw0Dsq
-oDkiwHOE6/0jR6tQkpJScCtEvp9rNadpENvXR54mqcds1Y6JTN4El04vQqecaBHG
-eIrrOOGWhb4=
------END CERTIFICATE-----
-)";
-
-constexpr std::string_view kTestTlsKeyPem = R"(-----BEGIN PRIVATE KEY-----
-MIIEvAIBADANBgkqhkiG9w0BAQEFAASCBKYwggSiAgEAAoIBAQCYdAxbMYkq16iK
-3hDquOYqJj4zIZoCY1Zeq10DpfHB053UR1ywWyN35KG4a1XfXOVMW47D0CACyks0
-GT7ix8KM4xGMSx2b/EQ8mQrztnt3YZKuHwnDH45oiiQ+/9WW7NAYjPgIsCxn/P+E
-4M43yqvHqK4XGLLm984xFnu4n270bsqi/IHbSlWYt3B8q7rHTYmDBmwsXnFbxvJc
-mH0CQkgbU1F11g4fmVSd8Qt+R2NTSSjbGvBpupjYbhERXQQVsjP4sEERqPT8ocZD
-1MoINMKTtCmxHbez7qO9o8gAY1aVZSsslowR5WCb+d1jjsRFqk6wJqumPbmPFiex
-e73uD4CVAgMBAAECggEABXWqd52XhvRAMfDv9Cf4/itucNBUPp+mGS/T3eyUcteM
-QGzp0dsBsyp57CvT4HLoN0rUGwkaDF+IP+5jhSWYPwlmuHp8LfjjzLPCY6X2V/kj
-kp7D77vykqXX1HW/BW+nqClsPItqm7LAx9ZxLChS7IyK54LX7VOUi8d9WMhE5fX/
-nzmIeuiLiZrH1sBsDhrs7l/46qPumQ9NLrQNpKnqpU1890SVX2610V/vWO8wAN+V
-Q/dzMf5nk/JBLXRokUQ+xch4XHmkuYIcIrgMOB5C3Osvznmusve4QsUOIFNtu5yB
-Tn8rUFRPDl19/5TiGz06Htcp1ARIixhuYolUNz9VAQKBgQDHjmWRQ+qchRmCwxn7
-f2VCZyuQMc039/0mKTIRogp7+GuY28NyK/5vSXvU2HP44x/93BMH2reW4Yf+sWYQ
-1c/t6bfiCcVx7kasx2VzbfmgFgiuTRJ+pnd7bMo6VLfOmKSztlKL37/qFMnZEYy5
-PUHkAWOlg/QFXJPnYKtbQnSYwQKBgQDDkv24lmO1ybz3e83eaz/4bsNEZ/yHRUIU
-2C/z+BlU5JvGeyT5GanP1TGd9NjgV44MLU9VzcYUy9UK4V+NFNHMi53ulHyF4CA8
-2F2Q1KSc2pjAQRYcg1SOP3jshk5D633wiRVyPAEZTdz4iDs7jtyK9izc/iv5azsU
-6D3sln5o1QKBgCRGPS43w0jqZOXBI1L1KGn2qROQCfbXjFvId0J/SxqX4K8rm46A
-csK1/92D7yjZ2HHj9E2kM2Uo3/irNJtw0lgz+OoMzqhUIOK9aDKgVhUEjFVqyybc
-ibGU5/nMdpEGbEICrWShqpgZaUudBhCSEw0oN33Zy5zB5FzV1LBFFz7BAoGADxpZ
-15hdiNtUaXQ5GLUFkqTTFYRGPxf9G2j6gwekxSaGVRSLbWUq9O7MzxrqaKC6Snxx
-RPoIEvEOubFf1KBH91jM0HDNEPWW57v5tcaGE8rZwvcDwx3tOLL0HqfcgWg9KIcd
-jd3OY+rcZqD2mgnVRDHwkvxZ3wAF5v5sUcnpZyUCgYAzwEjOUbkOprGgLKO3zxOe
-5NtYWAVuizJe1TqDmZovu4w7S50S5B+NHSGhRE2cqhF6QSm/sHziyQvS/RiPOf9r
-m0/zhisrKWr8NWNfqCHKLcD7AGjSIp7m9oM3E2TwTOM4PKjoTj1tPEjAzw3uVdjC
-iEWE/lnDWlS/EM7sXfzofA==
------END PRIVATE KEY-----
-)";
-
 void WriteTextFile(const std::filesystem::path& path, std::string_view contents) {
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     if (!out) {
@@ -907,8 +859,7 @@ TlsTestCredentials WriteTlsTestCredentials(const std::filesystem::path& dir) {
     std::filesystem::create_directories(dir);
     const auto cert_path = dir / "test-cert.pem";
     const auto key_path = dir / "test-key.pem";
-    WriteTextFile(cert_path, kTestTlsCertPem);
-    WriteTextFile(key_path, kTestTlsKeyPem);
+    chunkdb::test::WriteTestTlsFiles(cert_path, key_path);
     return {.cert_path = cert_path, .key_path = key_path};
 }
 
@@ -929,7 +880,9 @@ class TlsClient {
     // `max_version`: the highest TLS version offered, e.g. TLS1_2_VERSION;
     // 0 offers every version the library supports. `prefix`: bytes sent in
     // the clear before the handshake, such as a PROXY protocol header.
-    TlsClient(std::string host, std::uint16_t port, int max_version = 0, const std::string& prefix = {})
+    // `ciphers`: the TLS 1.2 cipher list offered; empty keeps the default.
+    TlsClient(std::string host, std::uint16_t port, int max_version = 0, const std::string& prefix = {},
+              const std::string& ciphers = {})
         : host_(std::move(host)), port_(port) {
         SSL_load_error_strings();
         OpenSSL_add_ssl_algorithms();
@@ -942,6 +895,11 @@ class TlsClient {
             SSL_CTX_free(context_);
             context_ = nullptr;
             throw std::runtime_error("failed to set the TLS client's highest version");
+        }
+        if (!ciphers.empty() && SSL_CTX_set_cipher_list(context_, ciphers.c_str()) != 1) {
+            SSL_CTX_free(context_);
+            context_ = nullptr;
+            throw std::runtime_error("failed to set the TLS client's cipher list");
         }
         try {
             socket_ = ConnectSocket(host_, port_);
@@ -975,13 +933,17 @@ class TlsClient {
             connected = SSL_connect(session_);
         } while (connected != 1 && TimedOut(connected));
         if (connected != 1) {
+            // SSL_ERROR_SSL: the handshake itself failed, such as on a TLS alert.
+            const int failure = SSL_get_error(session_, connected);
+            const char* reason = ERR_reason_error_string(ERR_peek_last_error());
             SSL_free(session_);
             session_ = nullptr;
             CloseSocket(socket_);
             socket_ = kInvalidSocket;
             SSL_CTX_free(context_);
             context_ = nullptr;
-            throw std::runtime_error("failed to complete TLS client handshake");
+            throw std::runtime_error("failed to complete TLS client handshake: ssl_error=" + std::to_string(failure) +
+                                     " " + (reason != nullptr ? reason : "unknown"));
         }
     }
 
@@ -1028,6 +990,7 @@ class TlsClient {
     }
 
     [[nodiscard]] int Version() const { return SSL_version(session_); }
+    [[nodiscard]] std::string Cipher() const { return SSL_get_cipher_name(session_); }
 
     void SendLine(const std::string& command) {
         SendBytes(command + "\r\n");
@@ -2210,6 +2173,146 @@ void TestHelloDeadlineEndsAPartialLine() {
     }
 }
 
+// `HELLO 3 WITH o1=$1,...,oN=$N`: N unknown options, each with a frame.
+std::string HelloWithOptionFrames(unsigned count) {
+    std::string line = "HELLO 3 WITH ";
+    for (unsigned i = 1U; i <= count; ++i) {
+        line += (i == 1U ? "o" : ",o") + std::to_string(i) + "=$" + std::to_string(i);
+    }
+    return line + "\r\n";
+}
+
+// Sends `piece` `count` times, `gap` apart, each well within the I/O
+// timeout; stops once the server has closed the connection.
+template <typename Client>
+std::thread Trickle(Client& client, const std::string& piece, unsigned count, std::chrono::milliseconds gap) {
+    return std::thread([&client, piece, count, gap] {
+        for (unsigned i = 0U; i < count; ++i) {
+            std::this_thread::sleep_for(gap);
+            try {
+                client.SendBytes(piece);
+            } catch (const std::exception&) {
+                return;  // closed by the server
+            }
+        }
+    });
+}
+
+// Whether a close came at a deadline of `io_timeout`: not before it, and
+// bounded rather than waiting for the client. The upper bound is loose so
+// a loaded machine does not fail it.
+bool ClosedAtDeadline(Clock::duration elapsed, std::chrono::milliseconds io_timeout) {
+    return elapsed >= io_timeout - std::chrono::milliseconds(100) && elapsed < io_timeout * 3;
+}
+
+// Before authentication every read ends at the HELLO deadline, frames
+// included, however steadily they arrive. After it, each frame has the I/O
+// timeout of its own. The server closes while frames are still being sent,
+// so its log tells why and when.
+template <typename Client>
+void CheckTrickledFramesAreBounded(std::uint16_t port, std::size_t io_timeout_ms) {
+    const auto io_timeout = std::chrono::milliseconds(io_timeout_ms);
+    {
+        ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+        Client client("127.0.0.1", port);
+        // After the TLS handshake, where the HELLO deadline starts.
+        const auto start = Clock::now();
+        client.SendBytes(HelloWithOptionFrames(12U));
+        auto sender = Trickle(client, "$-1\r\n", 12U, io_timeout / 4);
+        const bool refused = logs.WaitContains("HELLO 3 was not completed within the I/O timeout", io_timeout * 5);
+        const auto elapsed = Clock::now() - start;
+        sender.join();
+        assert(refused);
+        assert(ClosedAtDeadline(elapsed, io_timeout));
+        // A frame that arrives as the server closes turns the close into a
+        // reset, which may discard the reply.
+        try {
+            assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol HELLO 3 was not completed within the I/O timeout\r\n");
+        } catch (const std::runtime_error&) {
+        }
+    }
+    Client client("127.0.0.1", port);
+    client.Hello();
+    client.SendLine("CREATE TABLE trickle (c1 text(8), c2 text(8), c3 text(8), c4 text(8), marker u8) CHUNK 4 x 4");
+    const auto created = client.ReadLine();
+    if (created != "+OK\r\n") throw std::runtime_error("create trickle table: " + created);
+    const std::string set = "SET BLOCK 0 0 IN trickle c1 = $1, c2 = $2, c3 = $3, c4 = $4\r\n";
+    const std::string frame = "$1\r\nx\r\n";
+    // Frames a third of the timeout apart: the statement takes longer than
+    // the timeout as a whole, and still applies.
+    client.SendBytes(set);
+    for (int i = 0; i < 4; ++i) {
+        std::this_thread::sleep_for(io_timeout / 3);
+        client.SendBytes(frame);
+    }
+    assert(client.ReadLine().front() == ':');
+    client.SendLine("PING");
+    assert(client.ReadLine() == "+PONG\r\n");
+    {
+        // A gap longer than the timeout closes the connection.
+        ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+        const auto start = Clock::now();
+        client.SendBytes(set + frame);
+        const bool ended = logs.WaitContains("phase=read reason=timeout", io_timeout * 5);
+        const auto elapsed = Clock::now() - start;
+        assert(ended);
+        assert(ClosedAtDeadline(elapsed, io_timeout));
+        assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol incomplete parameter frame\r\n");
+    }
+    // The single worker is free again.
+    Client fast("127.0.0.1", port);
+    fast.Hello();
+    fast.SendLine("PING");
+    assert(fast.ReadLine() == "+PONG\r\n");
+}
+
+// AUTH and its frame end at the HELLO deadline too, counted from the
+// connection's start rather than from the AUTH line.
+template <typename Client>
+void CheckTrickledAuthIsBounded(std::uint16_t port, std::size_t io_timeout_ms) {
+    const auto io_timeout = std::chrono::milliseconds(io_timeout_ms);
+    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+    Client client("127.0.0.1", port);
+    const auto start = Clock::now();
+    const auto login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
+    client.SendBytes(chunkdb::test::HelloUserBytes(login, kAdminUser));
+    assert(client.ReadLine().rfind("+SCRAM ", 0) == 0);
+    std::this_thread::sleep_for(io_timeout / 2);
+    client.SendBytes("AUTH $1\r\n$64\r\n");
+    auto sender = Trickle(client, "x", 12U, io_timeout / 4);
+    const bool refused = logs.WaitContains("HELLO 3 was not completed within the I/O timeout", io_timeout * 5);
+    const auto elapsed = Clock::now() - start;
+    sender.join();
+    assert(refused);
+    assert(ClosedAtDeadline(elapsed, io_timeout));
+    try {
+        assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol HELLO 3 was not completed within the I/O timeout\r\n");
+    } catch (const std::runtime_error&) {
+    }
+}
+
+void TestTrickledFramesAreBounded() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
+    auto auth_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 1000;
+    server_cfg.idle_connection_timeout_ms = 10000;
+    {
+        ServerHarness harness("trickled-frames", BaseStoreConfig(), engine_cfg, server_cfg);
+        CheckTrickledFramesAreBounded<RawClient>(harness.port, server_cfg.client_io_timeout_ms);
+        ServerHarness auth("trickled-auth", BaseStoreConfig(), auth_cfg, server_cfg);
+        CheckTrickledAuthIsBounded<RawClient>(auth.port, server_cfg.client_io_timeout_ms);
+    }
+#ifdef CHUNKDB_WITH_OPENSSL
+    server_cfg.tls_enabled = true;
+    ServerHarness tls("trickled-frames-tls", BaseStoreConfig(), engine_cfg, server_cfg);
+    CheckTrickledFramesAreBounded<TlsClient>(tls.port, server_cfg.client_io_timeout_ms);
+    ServerHarness tls_auth("trickled-auth-tls", BaseStoreConfig(), auth_cfg, server_cfg);
+    CheckTrickledAuthIsBounded<TlsClient>(tls_auth.port, server_cfg.client_io_timeout_ms);
+#endif
+}
+
 // With max_handshakes_per_ip, one source holds at most that many workers
 // before HELLO; another connection gets -ERR BUSY at once, and HELLO frees
 // a slot.
@@ -2576,6 +2679,25 @@ void CheckMalformedHelloRecovery(std::uint16_t port) {
 
 template <typename Client>
 void CheckHelloNegotiation(std::uint16_t port) {
+    {
+        // Twelve parameter frames, the most HELLO carries before authentication.
+        Client most("127.0.0.1", port);
+        std::string frames;
+        for (unsigned i = 0U; i < 12U; ++i) frames += "$-1\r\n";
+        most.SendBytes(HelloWithOptionFrames(12U) + frames + "PING\r\n");
+        const auto hello = ReadHelloReply(most);
+        assert(hello.at("protocol") == "3" && hello.at("not_applied") == "%12");
+        assert(most.ReadLine() == "+PONG\r\n");
+    }
+    {
+        // One more is refused before any frame is read.
+        Client too_many("127.0.0.1", port);
+        too_many.SendBytes(HelloWithOptionFrames(13U));
+        assert(too_many.ReadLine() == "-ERR PROTOCOL reason=protocol HELLO takes at most 12 parameters\r\n");
+        if constexpr (requires { too_many.WaitForClose(std::chrono::seconds(2)); })
+            assert(too_many.WaitForClose(std::chrono::seconds(2)));
+        else assert(too_many.WaitForRawClose(std::chrono::seconds(2)));
+    }
     {
         Client known_duplicate("127.0.0.1", port);
         for (unsigned attempt = 0U; attempt < 4U; ++attempt) {
@@ -3172,6 +3294,42 @@ void TestTlsMinimumVersion() {
     }
 }
 
+// TLS 1.2 accepts only ECDHE key exchange with AEAD ciphers: a client that
+// offers only static RSA key exchange with CBC fails the handshake.
+void TestTls12CipherList() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    server_cfg.tls_enabled = true;
+    ServerHarness harness("tls-ciphers", BaseStoreConfig(), engine_cfg, server_cfg);
+    // The connection must reach the handshake and fail there, not before. On
+    // a system whose crypto policy already disables static RSA key exchange,
+    // this passes without the server's cipher list.
+    std::string refusal;
+    try {
+        TlsClient weak("127.0.0.1", harness.port, TLS1_2_VERSION, {}, "AES128-SHA");
+    } catch (const std::runtime_error& error) {
+        refusal = error.what();
+    }
+    assert(refusal.rfind("failed to complete TLS client handshake: ssl_error=" + std::to_string(SSL_ERROR_SSL) + " ", 0) == 0);
+    std::vector<std::string> ciphers{"ECDHE-RSA-AES128-GCM-SHA256", "ECDHE-RSA-AES256-GCM-SHA384"};
+    {
+        // ChaCha20-Poly1305 only where the linked OpenSSL offers it.
+        SSL_CTX* probe = SSL_CTX_new(TLS_client_method());
+        assert(probe != nullptr);
+        if (SSL_CTX_set_cipher_list(probe, "ECDHE-RSA-CHACHA20-POLY1305") == 1) ciphers.emplace_back("ECDHE-RSA-CHACHA20-POLY1305");
+        SSL_CTX_free(probe);
+        ERR_clear_error();
+    }
+    for (const auto& cipher : ciphers) {
+        TlsClient client("127.0.0.1", harness.port, TLS1_2_VERSION, {}, cipher);
+        assert(client.Version() == TLS1_2_VERSION && client.Cipher() == cipher);
+        client.Login();
+    }
+    TlsClient current("127.0.0.1", harness.port);
+    assert(current.Version() == TLS1_3_VERSION);
+    current.Login();
+}
+
 void TestChunkPutOverTls() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -3446,6 +3604,66 @@ void TestLongIdleConnectionTimeoutReleasesWorker() {
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
     assert(response == "%14\r\n");
     assert(idle.WaitForClose(std::chrono::milliseconds(1500)));
+}
+
+// A transaction past --txn-max-duration-ms whose client sends nothing does
+// not keep other connections' transactional writes out of
+// --txn-total-bytes, and an idle connection with an open transaction still
+// closes at the idle timeout, releasing its bytes.
+void TestExpiredTransactionReleasesBudget() {
+    // One private copy of a chunk of t fits, two do not.
+    auto engine_cfg = chunkdb::EngineConfig{
+        .require_auth = false,
+        .max_auth_failures = 5,
+        .txn_max_duration = std::chrono::milliseconds(500),
+        .txn_total_bytes = 50,
+    };
+    {
+        ServerHarness harness("txn-expired-budget", BaseStoreConfig(), engine_cfg, BaseServerConfig());
+        RawClient holder("127.0.0.1", harness.port);
+        holder.Hello();
+        holder.SendLine("CREATE TABLE t (n u16 REQUIRED) CHUNK 4 x 4");
+        assert(holder.ReadLine() == "+OK\r\n");
+        holder.SendLine("BEGIN");
+        assert(holder.ReadLine() == "+OK\r\n");
+        holder.SendLine("SET BLOCK 0 0 IN t n = 1");
+        assert(holder.ReadLine() == "_\r\n");
+        std::this_thread::sleep_for(std::chrono::milliseconds(700));
+
+        RawClient other("127.0.0.1", harness.port);
+        other.Hello();
+        other.SendLine("BEGIN");
+        assert(other.ReadLine() == "+OK\r\n");
+        other.SendLine("SET BLOCK 4 0 IN t n = 2");
+        assert(other.ReadLine() == "_\r\n");
+        holder.SendLine("PING");
+        assert(holder.ReadLine().rfind("-ERR CONFLICT reason=duration ", 0) == 0);
+        holder.SendLine("COMMIT");
+        assert(holder.ReadLine().rfind("-ERR CONFLICT reason=duration ", 0) == 0);
+        other.SendLine("COMMIT");
+        assert(other.ReadLine().rfind(":", 0) == 0);
+        other.SendLine("GET BLOCK 0 0 FROM t");
+        assert(other.ReadLine() == "_\r\n");
+    }
+    engine_cfg.txn_max_duration = std::chrono::milliseconds(60000);
+    auto server_cfg = BaseServerConfig();
+    server_cfg.idle_connection_timeout_ms = 300;
+    ServerHarness harness("txn-idle-budget", BaseStoreConfig(), engine_cfg, server_cfg);
+    RawClient idle("127.0.0.1", harness.port);
+    idle.Hello();
+    idle.SendLine("CREATE TABLE t (n u16 REQUIRED) CHUNK 4 x 4");
+    assert(idle.ReadLine() == "+OK\r\n");
+    idle.SendLine("BEGIN");
+    assert(idle.ReadLine() == "+OK\r\n");
+    idle.SendLine("SET BLOCK 0 0 IN t n = 1");
+    assert(idle.ReadLine() == "_\r\n");
+    assert(idle.WaitForClose(std::chrono::milliseconds(5000)));
+    RawClient other("127.0.0.1", harness.port);
+    other.Hello();
+    other.SendLine("BEGIN");
+    assert(other.ReadLine() == "+OK\r\n");
+    other.SendLine("SET BLOCK 4 0 IN t n = 2");
+    assert(other.ReadLine() == "_\r\n");
 }
 
 void TestPendingQueueWaitTimeoutClosesQueuedSocket() {
@@ -5714,6 +5932,7 @@ int main(int argc, char** argv) {
         run("TestUnterminatedLineIsNotExecuted", TestUnterminatedLineIsNotExecuted);
         run("TestHandshakeIsBounded", TestHandshakeIsBounded);
         run("TestHelloDeadlineEndsAPartialLine", TestHelloDeadlineEndsAPartialLine);
+        run("TestTrickledFramesAreBounded", TestTrickledFramesAreBounded);
         run("TestHandshakesPerIpAreLimited", TestHandshakesPerIpAreLimited);
         run("TestAreaReplyIsBounded", TestAreaReplyIsBounded);
         run("TestTimeoutsAreBounded", TestTimeoutsAreBounded);
@@ -5739,6 +5958,7 @@ int main(int argc, char** argv) {
         run("TestChunkPutOverTls", TestChunkPutOverTls);
         run("TestTlsReload", TestTlsReload);
         run("TestTlsMinimumVersion", TestTlsMinimumVersion);
+        run("TestTls12CipherList", TestTls12CipherList);
 #endif
         run("TestReadTimeoutLogsPhaseAndReason", TestReadTimeoutLogsPhaseAndReason);
         run("TestProxyProtocolParser", TestProxyProtocolParser);
@@ -5756,6 +5976,7 @@ int main(int argc, char** argv) {
         run("TestIdleClientRemainsConnectedBetweenCommands", TestIdleClientRemainsConnectedBetweenCommands);
         run("TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests", TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests);
         run("TestLongIdleConnectionTimeoutReleasesWorker", TestLongIdleConnectionTimeoutReleasesWorker);
+        run("TestExpiredTransactionReleasesBudget", TestExpiredTransactionReleasesBudget);
         run("TestPendingQueueWaitTimeoutClosesQueuedSocket", TestPendingQueueWaitTimeoutClosesQueuedSocket);
         run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
         run("TestSteadySlowReaderHitsReplyWriteDeadline", [] { TestSteadySlowReaderHitsReplyWriteDeadline(); });

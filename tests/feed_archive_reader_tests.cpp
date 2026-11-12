@@ -94,7 +94,7 @@ void Equal(const std::optional<std::vector<ColumnValue>>& values, std::optional<
     assert(values.has_value() == value.has_value());
     if (!value) return;
     const Geometry shape({2U, 2U, 2U, 1U, 8U});
-    const auto expected = DecodeBlockColumns(shape.layout(), {*value, 0U}, {}, 0U);
+    const auto expected = DecodeBlockColumns(shape.layout(), std::vector<std::uint8_t>{*value, 0U}, {}, 0U);
     assert(SameFeedValues(*values, expected));
 }
 

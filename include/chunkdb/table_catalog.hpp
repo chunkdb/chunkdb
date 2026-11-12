@@ -38,6 +38,7 @@ class UserRegistry;
 class ProcessLock;
 class SlotWatch;
 struct FeedSlotClaim;
+struct FeedExcessPool;
 struct FeedSlotAckState;
 
 // Conventional table name for callers that explicitly create it.
@@ -212,7 +213,10 @@ class Table : public std::enable_shared_from_this<Table> {
     // Create, drop, advance and archive-reader creation require exclusive table
     // access; callers must not hold a Lease. Listing may hold a Lease.
     // Positions are persisted atomically and synced.
-    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name, bool if_not_exists = false, const FeedSlotFilters& filters = {});
+    // `owner` is recorded with a new slot. With `owner_given`, an existing
+    // slot that IF NOT EXISTS keeps must have that owner too.
+    [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name, bool if_not_exists = false, const FeedSlotFilters& filters = {},
+        std::optional<std::string> owner = std::nullopt, bool owner_given = false);
     void DropFeedSlot(std::string_view name, bool if_exists = false);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(bool include_lost = false);
     [[nodiscard]] std::vector<std::uint32_t> ResolveFeedColumns(const std::vector<std::string>& names);
@@ -234,6 +238,8 @@ class Table : public std::enable_shared_from_this<Table> {
     [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name, const FeedOptions& options,
         bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner);
     [[nodiscard]] FeedSlot ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
+    // Records `owner` for the claimed slot when it has none.
+    void BindClaimedFeedSlotOwner(const std::shared_ptr<FeedSlotClaim>& claim, const std::string& owner);
     void StageClaimedFeedSlotAck(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition position);
     void FlushClaimedFeedSlotAcks(const std::shared_ptr<FeedSlotClaim>& claim, bool force);
     void SyncClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
@@ -350,6 +356,7 @@ class Table : public std::enable_shared_from_this<Table> {
     std::map<std::string, std::weak_ptr<FeedSlotClaim>> slot_claims_;
     std::shared_ptr<FeedSlotAckState> slot_ack_state_;
     std::shared_ptr<std::atomic<std::size_t>> slot_output_bytes_ = std::make_shared<std::atomic<std::size_t>>(0U);
+    std::shared_ptr<FeedExcessPool> slot_excess_;
 };
 
 struct CatalogTxnSnapshot {
@@ -547,6 +554,16 @@ class TableCatalog {
         const std::function<void(StoreManifest*)>& change,
         const char* dir_sync_failpoint,
         const std::optional<TableSchema>& chunk_schema = std::nullopt);
+    // Reads every stored value of the column the table's recorded narrowing
+    // names, under a lease and without catalog admission; the narrowing keeps
+    // writes from adding values that do not fit meanwhile. Returns the first
+    // value that does not fit the narrower type.
+    [[nodiscard]] std::optional<std::string> ScanNarrowing(Table& table);
+    // Ends a narrowing check with `change` under the table's DDL lock. When
+    // the manifest cannot be rewritten and the table still serves the
+    // narrowing, the failure is logged and the table is fenced, so that
+    // RecoverTable or a restart drops the narrowing; the failure is rethrown.
+    void EndNarrowing(Table& table, const TableOptions& options, const std::function<void(StoreManifest*)>& change);
     // Moves `dir` out of `tables/` into `.chunkdb.dropped/` and syncs both.
     void MoveToDropped(const std::filesystem::path& dir, const std::string& name);
     void RemoveDroppedTree(const std::filesystem::path& dropped) noexcept;

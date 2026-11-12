@@ -22,7 +22,7 @@ void Records() {
     FeedSlotRecords records{epoch, 987U, {{"consumer_1", 123U, false}, {"lost", 456U, true}}};
     const auto bytes = SerializeFeedSlotRecords(records);
     const auto decoded = ParseFeedSlotRecords(bytes, epoch);
-    assert(ReadLe16(bytes, 4U) == 3U && bytes[6U] == 2U && bytes[7U] == 0U && !decoded.filter_format);
+    assert(ReadLe16(bytes, 4U) == 4U && bytes[6U] == 2U && bytes[7U] == 0U && !decoded.filter_format);
     assert(decoded.epoch == epoch && decoded.durable_watermark == 987U);
     assert(decoded.slots.size() == 2U && decoded.slots[0].name == "consumer_1");
     assert(decoded.slots[0].written == 123U && !decoded.slots[0].lost);
@@ -66,7 +66,7 @@ void Filters() {
     slot.filters = {.area = FeedArea{{INT64_MIN, -3}, {INT64_MAX, 7}},
         .column_ids = std::vector<std::uint32_t>{UINT32_MAX, 2U, 1U}, .no_before = true, .chunks = true};
     const auto bytes = SerializeFeedSlotRecords(records);
-    assert(ReadLe16(bytes, 4U) == 3U && bytes[6U] == 2U && bytes[7U] == 1U);
+    assert(ReadLe16(bytes, 4U) == 4U && bytes[6U] == 2U && bytes[7U] == 1U);
     const auto parsed = ParseFeedSlotRecords(bytes, epoch);
     assert(parsed.filter_format && parsed.slots.front().filters == slot.filters);
     assert(parsed.slots.front().written == UINT64_MAX);
@@ -81,7 +81,7 @@ void Filters() {
         changed.resize(crc); WriteLe32(changed, Crc32(changed.data(), changed.size()));
         Reject([&] { (void)ParseFeedSlotRecords(changed, epoch); });
     };
-    auto malformed = bytes; malformed[37U] |= 64U; reject_checked(malformed);
+    auto malformed = bytes; malformed[37U] |= 128U; reject_checked(malformed);
     malformed = bytes; malformed[38U] = 0U; malformed[39U] = 0U; reject_checked(malformed);
     malformed = bytes; malformed[37U] |= 32U; reject_checked(malformed); // loss reason requires lost
     const auto area_at = 36U + 12U + slot.name.size();
@@ -149,7 +149,7 @@ void Dimensions() {
         bad.begin() + static_cast<std::ptrdiff_t>(area + 24U),
         bad.begin() + static_cast<std::ptrdiff_t>(area + 40U));
     reject_checked(bad); // Z must be ordered independently of X and Y.
-    for (const auto tag : {1U, 2U}) {
+    for (const auto tag : {1U, 2U, 3U}) {
         bad = bytes; bad[4U] = static_cast<std::uint8_t>(tag); Checksum(bad);
         bool earlier = false;
         try { (void)ParseFeedSlotRecords(bad, epoch); }
@@ -204,6 +204,93 @@ void AdmissionBounds() {
     Reject([&] { (void)SerializeFeedSlotRecords(records); });
 }
 
+// Version 4 records an optional owner for each slot next to the dimensionality
+// and the filter format; a slot without an owner reads back without one.
+void Owners() {
+    StoreId epoch{}; epoch[0] = 6U;
+    FeedSlotRecords records{epoch, 10U, {{"owned", 4U, false}, {"unowned", 5U, false}}};
+    records.slots[0].owner = "alice";
+    const auto bytes = SerializeFeedSlotRecords(records);
+    assert(ReadLe16(bytes, 4U) == 4U && bytes[6U] == 2U && bytes[7U] == 0U);
+    const auto parsed = ParseFeedSlotRecords(bytes, epoch, 2U);
+    assert(!parsed.filter_format && parsed.slots[0].owner == "alice" && !parsed.slots[1].owner);
+    assert(parsed.slots[0].written == 4U && parsed.slots[1].written == 5U);
+    for (std::size_t at = 0; at < bytes.size(); ++at) {
+        auto partial = bytes; partial.resize(at);
+        Reject([&] { (void)ParseFeedSlotRecords(partial, epoch); });
+        auto corrupt = bytes; corrupt[at] ^= 1U;
+        Reject([&] { (void)ParseFeedSlotRecords(corrupt, epoch); });
+    }
+    const auto reject_checked = [&](std::vector<std::uint8_t> changed) {
+        Checksum(changed); Reject([&] { (void)ParseFeedSlotRecords(changed, epoch); });
+    };
+    const auto owner_at = 36U + 12U + records.slots[0].name.size();
+    auto malformed = bytes; malformed[7U] = 2U; reject_checked(malformed); // unknown header flag
+    malformed = bytes; malformed[37U] |= 8U; reject_checked(malformed); // filter without the filter format
+    malformed = bytes; malformed[37U] |= 128U; reject_checked(malformed); // unknown slot flag
+    malformed = bytes; malformed[owner_at] = 0U; reject_checked(malformed); // empty owner
+    malformed = bytes; malformed[owner_at + 1U] = 'A'; reject_checked(malformed); // not a user name
+    malformed = bytes; malformed[owner_at] = 64U; reject_checked(malformed); // owner past the record
+    malformed = bytes; malformed[4U] = 5U; reject_checked(malformed);
+    for (const auto tag : {1U, 2U, 3U}) {
+        malformed = bytes; malformed[4U] = static_cast<std::uint8_t>(tag); Checksum(malformed);
+        bool earlier = false;
+        try { (void)ParseFeedSlotRecords(malformed, epoch); }
+        catch (const EarlierDevelopmentFormatError&) { earlier = true; }
+        assert(earlier);
+    }
+
+    records.slots[1].filters.no_before = true;
+    const auto filtered = SerializeFeedSlotRecords(records);
+    assert(ReadLe16(filtered, 4U) == 4U && filtered[7U] == 1U);
+    const auto both = ParseFeedSlotRecords(filtered, epoch);
+    assert(both.filter_format && both.slots[0].owner == "alice" && both.slots[1].filters.no_before);
+    auto unowned = parsed; unowned.slots.erase(unowned.slots.begin());
+    const auto plain = SerializeFeedSlotRecords(unowned);
+    assert(ReadLe16(plain, 4U) == 4U && !ParseFeedSlotRecords(plain, epoch).slots[0].owner);
+
+    FeedSlotRecords space{epoch, 3U, {{"space", 3U, false}}, true, 3U};
+    space.slots[0].owner = "bob";
+    space.slots[0].filters.area = FeedArea{{-1, -2, -3}, {1, 2, 3}, 3U};
+    space.slots[0].filters.column_ids = std::vector<std::uint32_t>{2U};
+    const auto spatial = SerializeFeedSlotRecords(space);
+    assert(spatial.size() == 40U + 12U + 5U + 48U + 4U + 1U + 3U);
+    const auto spatial_parsed = ParseFeedSlotRecords(spatial, epoch, 3U);
+    assert(spatial_parsed.slots[0].owner == "bob" && spatial_parsed.slots[0].filters == space.slots[0].filters);
+    for (std::size_t size = 0U; size < spatial.size(); ++size) {
+        auto truncated = spatial; truncated.resize(size);
+        Reject([&] { (void)ParseFeedSlotRecords(truncated, epoch, 3U); });
+    }
+
+    for (const auto owner : {"", "Alice", "1user", "a-b"}) {
+        records.slots[0].owner = owner;
+        Reject([&] { (void)SerializeFeedSlotRecords(records); });
+        Reject([&] { RequireValidFeedSlotOwner(owner); });
+    }
+    records.slots[0].owner = std::string(64U, 'a'); Reject([&] { (void)SerializeFeedSlotRecords(records); });
+    records.slots[0].owner = std::string(63U, 'a');
+    assert(ParseFeedSlotRecords(SerializeFeedSlotRecords(records), epoch).slots[0].owner->size() == 63U);
+
+    // Owner bytes count toward the record size limit.
+    FeedSlotRecords large{epoch, 0U, {}};
+    for (std::size_t i = 0U; i < 1024U; ++i) {
+        FeedSlotRecord slot{"slot_" + std::to_string(i), 0U, false};
+        slot.filters.column_ids.emplace();
+        for (std::uint32_t id = 1U; id <= 239U; ++id) slot.filters.column_ids->push_back(id);
+        large.slots.push_back(std::move(slot));
+    }
+    const auto fits = SerializeFeedSlotRecords(large);
+    assert(fits.size() <= 1024U * 1024U);
+    const auto room = 1024U * 1024U - fits.size();
+    std::size_t owned = 0U;
+    for (auto& slot : large.slots) {
+        if (owned > room) break;
+        slot.owner = std::string(63U, 'o');
+        owned += 64U;
+    }
+    Reject([&] { (void)SerializeFeedSlotRecords(large); });
+}
+
 }  // namespace
 
-int main() { Records(); Filters(); Dimensions(); AdmissionBounds(); }
+int main() { Records(); Filters(); Dimensions(); AdmissionBounds(); Owners(); }

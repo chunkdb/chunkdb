@@ -230,6 +230,35 @@ void TransactionRefusalsAreAtomic() {
     assert(small.Run("GET BLOCK 0 0 FROM t") == "*1\r\n:8\r\n");
 }
 
+// SET CHUNK in a transaction meets the configured written-chunk limit before
+// its form is decoded: a form that decoding refuses gets the limit's error.
+void SetChunkMeetsConfiguredWrittenLimitBeforeDecoding() {
+    QueryLimits limits;
+    limits.txn_max_written_chunks = 1U;
+    Fixture f(limits); f.Create();
+    f.Write("2 0", 6U);
+    const auto reply = f.Run("GET CHUNK 2 0 FROM t");
+    const auto body = reply.find("\r\n") + 2U;
+    auto form = reply.substr(body, reply.size() - body - 2U);
+    // A projected form without COLUMNS: its sections parse, decoding refuses it.
+    form[6] = static_cast<char>(form[6] | static_cast<char>(kChunkFormProjected));
+    const std::vector<std::optional<std::string>> parameters{form};
+    const auto set = [&] { return f.engine->Execute(f.session, "SET CHUNK 2 0 IN t $1\r\n", parameters); };
+    const auto malformed = set();
+    Error(malformed, "INVALID_ARGUMENT");
+    assert(malformed.find("projection") != std::string::npos);
+    assert(f.Run("BEGIN") == "+OK\r\n");
+    assert(f.Run("SET BLOCK 0 0 IN t v=5") == "_\r\n");
+    const auto bytes = f.session.transaction->bytes;
+    const auto over = set();
+    Error(over, "INVALID_ARGUMENT");
+    assert(over.find("a transaction writes at most 1 chunks") != std::string::npos);
+    assert(f.session.transaction->bytes == bytes && f.session.transaction->writes.size() == 1U);
+    assert(f.Run("COMMIT").starts_with(":"));
+    assert(f.Run("GET BLOCK 0 0 FROM t") == "*1\r\n:5\r\n");
+    assert(f.Run("GET BLOCK 2 0 FROM t") == "*1\r\n:6\r\n");
+}
+
 void LargestGeometryProjection() {
     Fixture f;
     assert(f.Run("CREATE TABLE t (v u8, padding bits(504)) CHUNK 1024 x 1024") == "+OK\r\n");
@@ -248,5 +277,6 @@ int main() {
     ExactResponseBounds();
     ExtremeEmptySelectors();
     TransactionRefusalsAreAtomic();
+    SetChunkMeetsConfiguredWrittenLimitBeforeDecoding();
     LargestGeometryProjection();
 }

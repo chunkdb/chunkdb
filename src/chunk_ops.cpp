@@ -7,6 +7,7 @@
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "chunk_store_internal.hpp"
@@ -74,16 +75,14 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     feed.Version(reserved_version);
     const std::uint64_t commit_time_ms = NextCommitTimeMs(*chunk);
     // The state this write replaces, while a transaction is open.
-    TxnKeep keep = PrepareTxnKeepLocked(chunk_coord, *chunk, reserved_version, supplied_chunk_columns);
+    TxnKeep keep =
+        PrepareTxnKeepLocked(chunk_coord, *chunk, reserved_version, supplied_chunk_columns, /*whole_chunk=*/true);
 
     // Snapshot every component needed for a full rollback. CurrentWalFileSize
     // throws on an inspection error rather than reporting an empty WAL, so a
     // failed rollback can never silently drop the truncation baseline.
     const std::uint64_t committed_wal_size = CurrentWalFileSize(chunk);
     const bool sync_required = durability_mode_ != DurabilityMode::kRelaxed;
-    const auto previous_payload = chunk->payload;
-    const auto previous_presence = chunk->presence_bitmap;
-    const auto previous_chunk_columns = chunk->chunk_columns;
     const auto saved_wal_batch = chunk->wal_batch;
     const auto saved_pending_updates = chunk->pending_updates;
     const auto saved_wal_bytes = chunk->wal_bytes;
@@ -100,9 +99,10 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     }
 
     // Intent establishment completed. Only now may the live vectors change.
-    chunk->payload = std::move(new_payload);
-    chunk->presence_bitmap = std::move(new_presence);
-    chunk->chunk_columns = std::move(chunk_columns);
+    // The replaced vectors are kept for a rollback, not copied.
+    auto previous_payload = std::exchange(chunk->payload, std::move(new_payload));
+    auto previous_presence = std::exchange(chunk->presence_bitmap, std::move(new_presence));
+    auto previous_chunk_columns = std::exchange(chunk->chunk_columns, std::move(chunk_columns));
 
     bool commit_record_durable = false;
     VarUndo var_undo;
@@ -119,6 +119,13 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         // guard stays strict even when a large state splits into several
         // records. The frame keeps the whole replace atomic.
         WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
+        // Sized once, so a large state is not copied again as the batch grows.
+        frame.Reserve(
+            WalFrameBuilder::SpanRecordBytes(chunk->payload.size()) +
+            WalFrameBuilder::SpanRecordBytes(chunk->presence_bitmap.size()) +
+            WalFrameBuilder::VarUpdateRecordBytes(chunk->vars, var_undo) +
+            (metadata_changed && chunk->chunk_columns ?
+                    WalFrameBuilder::ChunkColumnsRecordBytes(*chunk->chunk_columns) : 0U));
         frame.AppendSpan(0U, chunk->payload.data(), chunk->payload.size());
         frame.AppendSpan(
             static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes()),
@@ -156,9 +163,9 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         // CKRB still owns the prior boundary, so fully roll back memory and
         // the WAL tail. If local repair cannot finish, startup repeats the
         // repair before replay and the live store is poisoned.
-        chunk->payload = previous_payload;
-        chunk->presence_bitmap = previous_presence;
-        chunk->chunk_columns = previous_chunk_columns;
+        chunk->payload = std::move(previous_payload);
+        chunk->presence_bitmap = std::move(previous_presence);
+        chunk->chunk_columns = std::move(previous_chunk_columns);
         UndoVarUpdate(&chunk->vars, std::move(var_undo));
         chunk->wal_batch = saved_wal_batch;
         chunk->pending_updates = saved_pending_updates;
@@ -207,8 +214,15 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     keep.coordinate.Publish(chunk->present_blocks != 0U || ChunkColumnsPopulated(geometry_, chunk->chunk_columns.get()),
         reserved_version);
     // Still under the chunk's lock, so no read sees the new state without
-    // the kept one.
-    txn_history_->Publish(keep.node);
+    // the kept one. No rollback needs the replaced state any more: it is
+    // freed before the checkpoint serializes the new one.
+    if (!keep.node.empty()) {
+        TxnHistory::FillPayload(keep.node, std::move(previous_payload), std::move(previous_presence));
+        txn_history_->Publish(keep.node);
+        keep.node = TxnHistory::Reservation{};
+    }
+    std::vector<std::uint8_t>().swap(previous_payload);
+    std::vector<std::uint8_t>().swap(previous_presence);
     feed.Commit();
     try {
         ClearCommittedConditionalIntent(rollback_intent_path);
@@ -489,8 +503,9 @@ ChunkMutationResult ChunkStore::WriteChunkState(const ChunkCoord& chunk_coord, C
     RequireVarWrite(regular_chunk->vars, var_update,
         state.chunk_columns ? state.chunk_columns->variable_bytes : 0U,
         regular_chunk->written && regular_chunk->chunk_columns ? regular_chunk->chunk_columns->variable_bytes : 0U);
-    if (expected_version.has_value() || if_absent || geometry_.has_chunk_column_history() || !regular_chunk->written) {
-        // As CHUNKPUT IF: the conditional write path (docs/DURABILITY_CONTRACT.md).
+    if (expected_version.has_value() || if_absent) {
+        // As CHUNKPUT IF: the conditional write path (docs/design/PERSISTENCE.md).
+        // Every other write, a first write included, is an ordinary one.
         (void)ApplyFullChunkStateLocked(
             chunk_coord,
             regular_chunk,
@@ -504,7 +519,7 @@ ChunkMutationResult ChunkStore::WriteChunkState(const ChunkCoord& chunk_coord, C
         regular_chunk,
         std::move(state.payload),
         std::move(state.presence_bitmap),
-        std::move(var_update));
+        std::move(var_update), std::move(state.chunk_columns), /*force_write=*/true);
     return ChunkMutationResult{.ok = true, .version = version};
 }
 

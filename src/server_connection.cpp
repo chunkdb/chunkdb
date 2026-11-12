@@ -242,6 +242,7 @@ bool ChunkServer::HandleClient(
 
             return false;
         }
+        session.channel_bindings = TlsChannelBindings(tls_session);
     }
 #endif
 
@@ -250,10 +251,17 @@ bool ChunkServer::HandleClient(
     session.idle_timeout_ms = config_.idle_connection_timeout_ms;
     session.max_watches = config_.max_watches;
 
+    // After authentication each line and each frame body has a deadline of
+    // its own, from its first byte. Before it, every read of the connection
+    // ends at the HELLO deadline, frames included.
+    auto end_read = [&](bool ok) {
+        if (ok && session.greeted) request_line_deadline = std::nullopt;
+        return ok;
+    };
     auto read_line = [&](std::string& out) -> bool {
 #ifdef CHUNKDB_WITH_OPENSSL
         if (config_.tls_enabled) {
-            return ReadLineTls(
+            return end_read(ReadLineTls(
                 tls_session,
                 out,
                 pending_buffer,
@@ -262,10 +270,10 @@ bool ChunkServer::HandleClient(
                 current_recv_timeout_ms.value_or(config_.client_io_timeout_ms),
                 &request_line_deadline,
                 &termination,
-                set_recv_timeout);
+                set_recv_timeout));
         }
 #endif
-        return ReadLinePlain(
+        return end_read(ReadLinePlain(
             static_cast<SocketHandle>(client_socket),
             out,
             pending_buffer,
@@ -273,12 +281,12 @@ bool ChunkServer::HandleClient(
             config_.client_io_timeout_ms,
             &request_line_deadline,
             &termination,
-            set_recv_timeout);
+            set_recv_timeout));
     };
     auto read_bytes = [&](std::string& out, std::size_t total) -> bool {
 #ifdef CHUNKDB_WITH_OPENSSL
         if (config_.tls_enabled) {
-            return ReadBytesTls(
+            return end_read(ReadBytesTls(
                 tls_session,
                 out,
                 total,
@@ -286,10 +294,10 @@ bool ChunkServer::HandleClient(
                 config_.client_io_timeout_ms,
                 &request_line_deadline,
                 &termination,
-                set_recv_timeout);
+                set_recv_timeout));
         }
 #endif
-        return ReadBytesPlain(
+        return end_read(ReadBytesPlain(
             static_cast<SocketHandle>(client_socket),
             out,
             total,
@@ -297,7 +305,13 @@ bool ChunkServer::HandleClient(
             config_.client_io_timeout_ms,
             &request_line_deadline,
             &termination,
-            set_recv_timeout);
+            set_recv_timeout));
+    };
+    // Each wait for a frame header ends by the deadline that applies (the
+    // HELLO deadline before authentication), even with nothing buffered.
+    auto read_frame_line = [&](std::string& out) -> bool {
+        return set_recv_timeout(ReadWaitMs(&request_line_deadline, config_.client_io_timeout_ms), "partial_request") &&
+            read_line(out);
     };
     auto write_all = [&](const std::string& data, ConnectionTermination* write_termination) -> bool {
         const PhaseDeadline write_deadline =
@@ -414,9 +428,6 @@ bool ChunkServer::HandleClient(
             bool frame_total_too_large = false;
             const auto total_limit = discard ? config_.max_unparsed_parameter_bytes : payload_request.parameter_bytes_limit;
             try {
-                if (!set_recv_timeout(config_.client_io_timeout_ms, "partial_request")) {
-                    break;
-                }
                 const ParameterFrameRules rules{
                     .frame_count = discard ? payload_request.frame_count : payload_request.parameter_limits.size(),
                     .limits = payload_request.parameter_limits,
@@ -426,7 +437,7 @@ bool ChunkServer::HandleClient(
                     .rejections = &payload_request.parameter_rejections,
                     .opaque_limit = config_.max_unparsed_parameter_bytes,
                 };
-                frames_ok = ReadParameterFrames(rules, &parameters, read_line, read_bytes, &frame_total_too_large, &payload_rejection);
+                frames_ok = ReadParameterFrames(rules, &parameters, read_frame_line, read_bytes, &frame_total_too_large, &payload_rejection);
             } catch (const std::exception& e) {
                 reject_and_close(Protocol::Error("PROTOCOL", e.what()), e.what());
                 break;
@@ -440,11 +451,18 @@ bool ChunkServer::HandleClient(
                 break;
             }
             if (!frames_ok) {
-                (void)write_all(Protocol::Error("PROTOCOL", "incomplete parameter frame"), nullptr);
-                log_termination(termination);
+                // Before authentication every read ends at the HELLO deadline.
+                if (!session.greeted && termination.reason == "timeout") {
+                    refuse_late_hello();
+                } else {
+                    (void)write_all(Protocol::Error("PROTOCOL", "incomplete parameter frame"), nullptr);
+                    log_termination(termination);
+                }
                 break;
             }
         }
+        // The request is complete: the next one starts without a deadline.
+        request_line_deadline = std::nullopt;
 
         std::string response = discard ? engine_->RejectPayload(session, line, payload_request.reject_response) :
             !payload_rejection.empty() ? engine_->RejectPayload(session, line, std::move(payload_rejection)) :

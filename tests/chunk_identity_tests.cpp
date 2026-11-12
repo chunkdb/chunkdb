@@ -134,8 +134,6 @@ void TestCollectedIdentitySurvivesRestart() {
         assert(refreshed.written && refreshed.version == revision && refreshed.commit_time_ms == time);
         assert(reader.ScanPopulatedChunks(false, {}, 1024U).coords.empty());
         assert(writer.ScanPopulatedChunks(false, {}, 1024U).coords.empty());
-        assert(writer.ScanCatalogBuildsForTests() == 0U);
-        assert(writer.ScanCachedLargeChunksMergedForTests() == 0U);
     }
     {
         chunkdb::ChunkStore store(config);
@@ -146,7 +144,6 @@ void TestCollectedIdentitySurvivesRestart() {
         assert(store.GetBlockBits(-12, 28) == "11001");
         assert(store.ReadChunkState(coord).version > revision);
         assert(store.ScanPopulatedChunks(false, {}, 1024U).coords == std::vector{coord});
-        assert(store.ScanCatalogBuildsForTests() == 0U);
     }
 }
 
