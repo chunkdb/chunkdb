@@ -210,7 +210,7 @@ Undoing steps reconstructs and validates every earlier schema used by stored chu
 An optional final 10-byte narrowing suffix is `1:u8, column_id:u32, target_kind:u8, target_size:u32`; without pending narrowing there is no suffix.
 
 While this suffix exists, writes to that column must fit both types; writer startup and RECOVER TABLE remove interrupted narrowing before opening the table.
-Named migrations validate narrowing under exclusive admission before deciding and do not depend on this suffix for redo.
+Named migrations also record this suffix while they check stored values, and decide only if the table schema is unchanged since the check; redo does not depend on the suffix.
 
 ## Packed chunk state
 
@@ -455,15 +455,20 @@ Failure repairing an uncommitted operation fences the affected store until recov
 
 `chunkdb.slots` is at most 1 MiB, atomically replaced and file/directory synced in every durability mode:
 
-1. `CKSL`, format tag `3:u16`, dimensions `u8`, flags `u8`, table epoch (16 bytes).
+1. `CKSL`, format tag `4:u16`, dimensions `u8`, header flags `u8`, table epoch (16 bytes).
 2. Durable watermark `u64`, slot count `u32` (at most 1024).
-3. Per slot: name length `u8`, flags `u8`, projection count `u16`, written revision `u64`, name bytes, optional AREA coordinates, then projected stable IDs (`u32` each).
+3. Per slot: name length `u8`, slot flags `u8`, projection count `u16`, written revision `u64`, name bytes, then the parts its flags select: area coordinates (`i64` each), projection IDs (`u32` each), and owner length `u8` with owner bytes.
 4. CRC32 over all preceding bytes.
 
+Slot flags are `0x1` lost, `0x2` area, `0x4` projection, `0x8` NO BEFORE, `0x10` CHUNKS, `0x20` lost by a dropped projected column, and `0x40` owner; the projection count is nonzero exactly with `0x4`.
+The only header flag, `0x1`, is the filter format; it permits the filter flags `0x2` through `0x20`, requires `slot_filters`, and stays set once written.
+The owner flag needs no header flag or feature bit.
+The dimensions byte is 2 or 3 and must match the owning table.
+AREA stores the first active signed coordinates followed by the last active coordinates (x, y and, in a three-dimensional table, z); endpoints must be ordered.
+Format tags 1 to 3 are earlier development layouts and are refused; a writer writes only tag 4.
+
 Names are unique, 1–63 bytes matching `[a-z_][a-z0-9_]*`; every written revision is at or below the watermark, and epoch matches the table StoreId.
-The header's only defined flag bit records filtered-format capability.
-Per-slot bits 0–5 mean lost, AREA present, projection present, NO BEFORE, CHUNKS, and schema-filter lost.
-AREA stores the first active signed coordinates followed by the last active coordinates; axis count must match the owning table and endpoints must be ordered.
+Owners are user names with the same rule; a slot without an owner records the user of its first granted attach without ADMIN on `*`.
 Lost records remain visible with their loss flag; advancing/watching a lost slot refuses it, and explicit DROP removes it.
 The first slot activation quiesces writers/maintenance/eviction and checkpoints preceding WALs before selecting a durable frontier.
 Checkpoint archives use `.chunkdb.feed/C_<cx>_<cy>.<first>.chk` for the hard-linked old base image, when one existed, and `C_<cx>_<cy>.<first>-<last>.wal` for a closed WAL range.
@@ -488,13 +493,14 @@ Live-history readers capture completed byte boundaries and read only the prefix 
 2. Each user stores these fields in order:
 
 - Name length `u16` and name.
-- Flags `u8`, with bit 0 representing MANAGES USERS.
-- SCRAM iterations `u32`, salt length `u16`, and salt.
+- Flags `u8`, with bit 0 representing MANAGES USERS and bit 1 REQUIRE CHANNEL BINDING.
+- SCRAM iterations `u32` (4096 to 1000000), salt length `u16` (16 to 256), and salt.
 - Stored key (32 bytes), server key (32 bytes), and grant count `u32`.
 3. Per grant: table-name length `u16` and name, right `u8` (1 READ, 2 WRITE, 3 ADMIN); `*` names all tables.
 4. CRC32 over all preceding bytes.
 
 Writer serialization orders users by name and grants by table; decoding refuses duplicate users/grants, unknown flags/rights/version, bad checksum, truncation, or trailing bytes.
+The writer refuses a salt outside that range or a name over 65535 bytes instead of shortening it; decoding also refuses user and table names that CREATE USER and GRANT refuse.
 Password verifiers contain no plaintext password; the secret derives unknown-user salts used by authentication.
 
 ## Named migrations

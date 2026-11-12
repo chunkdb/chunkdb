@@ -165,6 +165,7 @@ A failure that leaves a table out of service fences it, while other tables keep 
 Statements on that table return INTERNAL with the fenced message and its reason.
 A store that is fail-closed after a durability failure or a failed snapshot generation fences its table too: it still serves reads, and changes return INTERNAL while the server log holds the reason.
 A failed feed cleanup fences its table, whose statements return INTERNAL `feed cleanup failed`.
+A column narrowing whose last manifest change fails before it is written fences its table; a refused narrowing still returns its refusal.
 DESCRIBE of a fenced table shows the definition it served last; the change that fenced it may already be in its files.
 RECOVER TABLE does for one fenced table what a server start does for every table.
 It waits for the table's running statements and running backups, closes it, removes its interrupted creates and drops, drops an interrupted narrowing, and opens it from its files.

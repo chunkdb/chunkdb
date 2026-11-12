@@ -279,8 +279,13 @@ struct FeedArchiveReader::Impl {
     std::vector<Cursor> cursors;
     bool usable = true;
     bool started = false;
-    std::optional<std::size_t> chunk_forms_budget;
-    std::size_t entry_budget = kDefaultFeedBufferBytes;
+    bool chunk_forms = false;
+    // A slot watch's filters: each change keeps only what the watch sends
+    // (FilterFeedEntry, ChunkFeedEntry), and frames carry what it sends.
+    std::optional<FeedSlotFilters> filter;
+    // A slot watch refuses a change whose frame would exceed its table
+    // budget; other readers keep every change.
+    std::size_t entry_budget = std::numeric_limits<std::size_t>::max();
 
     Impl(const std::filesystem::path& directory, const Geometry& shape, const StoreId& store_id,
          FeedPosition from, std::uint64_t durable, std::shared_ptr<void> retention, FeatureFlags flags,
@@ -617,7 +622,7 @@ struct FeedArchiveReader::Impl {
         use_empty(first_schema, 0U, 0U);
     }
 
-    bool Apply(Cursor& cursor, FeedEntry* entry, std::size_t* retained_rows) {
+    bool Apply(Cursor& cursor, FeedEntry* entry, std::size_t* frame_bytes) {
         if (!cursor.initialized) {
             Initialize(cursor);
             if (cursor.done) return false;
@@ -657,71 +662,70 @@ struct FeedArchiveReader::Impl {
             }
             const auto& frame_geometry = historical_geometry ? *historical_geometry : geometry;
             const auto& chunk_schema = frame_geometry.chunk_schema();
-            if (!chunk_forms_budget && !chunk_schema.columns.empty()) {
+            const auto dims = geometry.dims();
+            // A filtered watch receives nothing of a chunk outside its area,
+            // and only the projected columns of its blocks.
+            const bool kept = !filter || FeedAreaHolds(filter->area, dims, cursor.coord);
+            const bool no_before = filter && filter->no_before;
+            std::vector<std::size_t> selected;
+            if (filter && filter->column_ids) selected = FeedProjectionIndexes(layout.schema().columns, *filter->column_ids);
+            // Decoding stops once the frame the watch would send is larger
+            // than its budget; each item adds a lower bound of its bytes.
+            const auto count = [&](std::size_t item) {
+                if (item > entry_budget - *frame_bytes) throw std::length_error("archived change exceeds the table feed buffer");
+                *frame_bytes += item;
+            };
+            if (kept && !chunk_forms && !chunk_schema.columns.empty()) {
                 FeedChunkChange change{.chunk = cursor.coord, .before = {}, .after = {}};
                 if (before.written) change.before = DecodeChunkColumns(chunk_schema, before.chunk_columns->bytes);
                 if (cursor.state.written) change.after = DecodeChunkColumns(chunk_schema, cursor.state.chunk_columns->bytes);
                 if (change.before.has_value() != change.after.has_value() ||
                     (change.before && !SameFeedValues(*change.before, *change.after))) {
-                    const auto old_bytes = FeedRowRetainedBytes(change.before), new_bytes = FeedRowRetainedBytes(change.after);
-                    const auto held = FeedEntryRetainedBytes(*entry);
-                    if (held > entry_budget || old_bytes > entry_budget - held || new_bytes > entry_budget - held - old_bytes)
-                        throw std::length_error("archived metadata exceeds the watch buffer");
-                    *retained_rows += old_bytes + new_bytes;
+                    if (no_before) change.before.reset();
+                    count(FeedChangeItemMinimumEncodedBytes(dims, change.before, change.after));
                     entry->chunk_changes.push_back(std::move(change));
-                    if (FeedEntryRetainedBytes(*entry) > entry_budget)
-                        throw std::length_error("archived metadata exceeds the watch buffer");
                 }
             }
-            if (chunk_forms_budget) {
-                const auto held = FeedEntryRetainedBytes(*entry);
-                const bool populated = ChunkPopulated(frame_geometry, cursor.state.presence_bitmap, cursor.state.chunk_columns.get());
-                const auto estimate = populated ? 256U + layout.fixed_columns().size() * 64U + cursor.state.presence_bitmap.size() +
-                    cursor.state.payload.size() + cursor.state.vars.encoded_size() +
-                    (cursor.state.chunk_columns ? cursor.state.chunk_columns->bytes.size() : 0U) : 128U;
-                if (estimate > *chunk_forms_budget || held > *chunk_forms_budget - estimate)
-                    throw std::length_error("archived chunks exceed the watch buffer");
-                FeedChunkForm chunk{cursor.coord, info.revision, {}};
-                if (populated) {
-                    const auto form = EncodeSectionedChunkState(frame_geometry, cursor.state, kVarMaxChunkBytesLimit);
-                    chunk.form = std::make_shared<const std::string>(form.begin(), form.end());
-                }
-                entry->chunk_forms.push_back(std::move(chunk));
+            if (chunk_forms) {
                 entry->chunk_forms_complete = true;
-                if (FeedEntryRetainedBytes(*entry) > entry_budget)
-                    throw std::length_error("archived chunks exceed the watch buffer");
+                if (kept) {
+                    FeedChunkForm chunk{cursor.coord, info.revision, {}};
+                    if (ChunkPopulated(frame_geometry, cursor.state.presence_bitmap, cursor.state.chunk_columns.get())) {
+                        const auto form = EncodeSectionedChunkState(frame_geometry, cursor.state, kVarMaxChunkBytesLimit, selected);
+                        chunk.form = std::make_shared<const std::string>(form.begin(), form.end());
+                    }
+                    count(FeedChunkFormMinimumEncodedBytes(dims, chunk.form));
+                    entry->chunk_forms.push_back(std::move(chunk));
+                }
             }
+            const auto project = [&](std::optional<std::vector<ColumnValue>>& row) {
+                if (!row || selected.empty()) return;
+                std::vector<ColumnValue> values;
+                values.reserve(selected.size());
+                for (const auto index : selected) values.push_back(std::move((*row)[index]));
+                row = std::move(values);
+            };
             const auto width = geometry.config().chunk_width_blocks;
             const auto height = geometry.config().chunk_height_blocks;
-            const auto held = FeedEntryRetainedBytes(*entry);
-            if (held > entry_budget || *retained_rows > held) throw std::length_error("archived change exceeds the watch buffer");
-            std::size_t structural = held - *retained_rows;
-            for (std::size_t b = 0U; !chunk_forms_budget && b < geometry.ChunkBlockCount(); ++b) {
+            for (std::size_t b = 0U; kept && !chunk_forms && b < geometry.ChunkBlockCount(); ++b) {
                 std::optional<std::vector<ColumnValue>> old_values, new_values;
                 if (BlockPresent(before.presence_bitmap, b)) old_values = DecodeBlockColumns(layout, before.payload, before.vars, b);
                 if (BlockPresent(cursor.state.presence_bitmap, b)) new_values = DecodeBlockColumns(layout, cursor.state.payload, cursor.state.vars, b);
                 if (old_values.has_value() == new_values.has_value() &&
                     (!old_values || SameFeedValues(*old_values, *new_values))) continue;
-                const auto old_bytes = FeedRowRetainedBytes(old_values), new_bytes = FeedRowRetainedBytes(new_values);
-                const auto available = entry_budget - structural - *retained_rows;
-                if (old_bytes > available || new_bytes > available - old_bytes)
-                    throw std::length_error("archived rows exceed the watch buffer");
-                *retained_rows += old_bytes + new_bytes;
+                if (no_before) old_values.reset();
+                project(old_values);
+                project(new_values);
+                count(FeedChangeItemMinimumEncodedBytes(dims, old_values, new_values));
                 const auto local_y = (b / width) % height;
                 const auto local_z = b / (static_cast<std::size_t>(width) * height);
-                const auto capacity = entry->blocks.capacity();
                 entry->blocks.push_back({cursor.coord,
                     Absolute(cursor.coord.x, width, b % width),
                     Absolute(cursor.coord.y, height, local_y),
                     std::move(old_values), std::move(new_values),
                     static_cast<std::uint32_t>(b % width), static_cast<std::uint32_t>(local_y),
-                    geometry.dims() == 3U ? Absolute(cursor.coord.z, geometry.config().chunk_depth_blocks, local_z) : std::nullopt,
+                    dims == 3U ? Absolute(cursor.coord.z, geometry.config().chunk_depth_blocks, local_z) : std::nullopt,
                     static_cast<std::uint32_t>(local_z)});
-                const auto growth = entry->blocks.capacity() - capacity;
-                if (growth > (entry_budget - structural) / sizeof(FeedBlockChange))
-                    throw std::length_error("archived rows exceed the watch buffer");
-                structural += growth * sizeof(FeedBlockChange);
-                if (*retained_rows > entry_budget - structural) throw std::length_error("archived rows exceed the watch buffer");
             }
         }
         cursor.previous = info.revision;
@@ -740,16 +744,21 @@ struct FeedArchiveReader::Impl {
             entry->position = {epoch, revision};
             const bool deliver = revision > position.revision;
             bool consumed = false;
-            std::size_t retained_rows = 0U;
+            std::size_t frame_bytes = 0U;
             for (auto& cursor : cursors) if (!cursor.done && cursor.next == revision)
-                consumed = Apply(cursor, deliver ? entry.get() : nullptr, &retained_rows) || consumed;
+                consumed = Apply(cursor, deliver ? entry.get() : nullptr, &frame_bytes) || consumed;
             if (!deliver) continue;
             if (entry->schema_version == 0U) {
                 if (consumed) position.revision = revision;
                 continue;  // Only the GC maintenance frame.
             }
-            if (!chunk_forms_budget) entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*entry));
-            if (FeedEntryRetainedBytes(*entry) > entry_budget) throw std::length_error("archived change exceeds the watch buffer");
+            if (filter && chunk_forms) entry->kind = FeedEntry::Kind::kChunks;
+            // A filtered watch sends nothing of a change that keeps nothing.
+            const bool sent = !filter || !entry->blocks.empty() || !entry->chunk_changes.empty() || !entry->chunk_forms.empty();
+            if ((!chunk_forms || filter) && sent) {
+                entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*entry));
+                if (entry->protocol_frame->size() > entry_budget) throw std::length_error("archived change exceeds the table feed buffer");
+            }
             position.revision = revision;
             return entry;
         }
@@ -773,11 +782,16 @@ std::shared_ptr<const FeedEntry> FeedArchiveReader::Next() {
 }
 void FeedArchiveReader::EnableChunkForms(std::size_t budget) {
     if (!impl_ || impl_->started || budget == 0U) throw std::logic_error("chunk forms must be enabled before archive reading");
-    impl_->chunk_forms_budget = budget;
+    impl_->chunk_forms = true;
     impl_->entry_budget = budget;
 }
+void FeedArchiveReader::Filter(const FeedSlotFilters& filters) {
+    if (!impl_ || impl_->started) throw std::logic_error("feed filters must be set before archive reading");
+    impl_->filter = filters;
+    if (filters.chunks) impl_->chunk_forms = true;
+}
 void FeedArchiveReader::SetEntryBudget(std::size_t budget) {
-    if (!impl_ || impl_->started || budget == 0U) throw std::logic_error("entry budget must be set before archive reading");
+    if (!impl_ || budget == 0U) throw std::logic_error("archive entry budget must be positive");
     impl_->entry_budget = budget;
 }
 FeedPosition FeedArchiveReader::position() const noexcept { return impl_ ? impl_->position : FeedPosition{}; }

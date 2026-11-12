@@ -65,6 +65,7 @@ Keep manifests, revision clocks, initialized markers and all other required arti
 2.0 accepts only its documented directory and file layouts.
 It does not import superseded development layouts.
 Development directories using earlier manifest, image, WAL, slot, or index envelopes must be recreated; opening refuses them before changing artifacts.
+Slot records use format 4, which holds the table dimensionality, persisted filters and slot owners; formats 1 to 3 are earlier development layouts.
 
 An unsupported layout is refused, rather than converted in place.
 

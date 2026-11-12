@@ -9,7 +9,8 @@ namespace chunkdb {
 // Gives `user` of the data directory a new password, offline: takes the
 // writer lock, so it fails while a server has the directory open, and writes
 // only the new verifier (docs/design/USERS_DESIGN.md). Throws std::invalid_argument
-// for a directory without users, an unknown user or an empty password.
+// for a directory without users, an unknown user or an empty password, and
+// refuses a backup or incomplete restore directory before taking the lock.
 void ResetPassword(const std::filesystem::path& data_dir, const std::string& user, std::string_view password);
 
 }  // namespace chunkdb

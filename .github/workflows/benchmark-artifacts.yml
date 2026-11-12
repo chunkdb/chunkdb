@@ -14,6 +14,9 @@ on:
   release:
     types: [published]
 
+permissions:
+  contents: read
+
 jobs:
   generate-artifacts:
     name: Generate Reproducible Benchmark Bundle

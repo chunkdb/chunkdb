@@ -217,6 +217,7 @@ struct CreateSlot {
     std::optional<std::vector<std::string>> columns{};
     bool no_before = false;
     bool chunks = false;
+    std::optional<std::string> owner{};
 };
 struct DropSlot {
     std::string name;
@@ -261,12 +262,15 @@ struct CreateUser {
     std::string user;
     Literal verifier;
     bool manages_users = false;
+    bool requires_channel_binding = false;
     bool if_not_exists = false;
 };
+// Exactly one of the three is set.
 struct AlterUser {
     std::string user;
     std::optional<Literal> verifier;
     std::optional<bool> manages_users;
+    std::optional<bool> requires_channel_binding;
 };
 struct DropUser {
     std::string user;

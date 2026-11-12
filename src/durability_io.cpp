@@ -246,7 +246,10 @@ std::error_code RenameByHandle(
         return std::error_code(static_cast<int>(GetLastError()), std::system_category());
     }
 
-    const std::wstring target_w = std::filesystem::absolute(target_path).wstring();
+    // Preserve native absolute names: CRT absolute-path normalization can
+    // damage UNC roots and extended namespace prefixes before rename.
+    const std::wstring target_w = target_path.native().starts_with(L"\\\\") ?
+        target_path.native() : std::filesystem::absolute(target_path).wstring();
     std::vector<std::uint8_t> rename_bytes(
         sizeof(FILE_RENAME_INFO) + target_w.size() * sizeof(wchar_t));
     auto* rename_info = reinterpret_cast<FILE_RENAME_INFO*>(rename_bytes.data());

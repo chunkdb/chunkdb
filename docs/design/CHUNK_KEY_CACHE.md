@@ -19,7 +19,7 @@ An existing container remains accessible at the limit; a new miss fails immediat
 The refusal allocates no producing revision and applies no mutation.
 Metrics expose the shared current count, limit and cumulative refusals.
 
-Registry publication rolls back as one unit if map, scan-catalog or ring allocation fails.
+Registry publication rolls back as one unit if map or ring allocation fails.
 A failed first load retires an empty container under the existing registry-then-container lock order.
 A loader drops a retired owner before attempting a replacement, so it cannot block itself with its old reservation.
 Capacity admission performs no directory I/O, global eviction pass or capacity wait while holding the large-chunk registry mutex.

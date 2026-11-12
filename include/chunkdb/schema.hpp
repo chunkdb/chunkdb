@@ -151,6 +151,9 @@ void ValidateChunkSchema(const TableSchema& schema);
 void ValidateSchemaDomains(const TableSchema& blocks, const TableSchema& chunks);
 // An unused chunk domain accompanying a block-only schema history.
 [[nodiscard]] TableSchema EmptyChunkSchemaFor(const TableSchema& blocks);
+// Throws std::invalid_argument, as ValidateTableSchema does, when the size of
+// `column`'s type is outside the range its kind takes (uN 1 to 64, ...).
+void ValidateColumnType(const Column& column);
 // Whether this build can store a table with `schema` (it needs at least one
 // fixed-width column); empty when it can, otherwise the reason.
 [[nodiscard]] std::string UnsupportedSchemaReason(const TableSchema& schema);

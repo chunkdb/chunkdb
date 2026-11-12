@@ -6,9 +6,72 @@ on:
   pull_request:
     branches: ["main"]
 
+permissions:
+  contents: read
+
+# A new push to a pull request or to main replaces the run still going for it.
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
 jobs:
+  changes:
+    name: Changed files
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      code: ${{ steps.classify.outputs.code }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+        with:
+          fetch-depth: 2
+      - name: Classify the change
+        id: classify
+        run: bash scripts/ci/code-changed.sh >> "$GITHUB_OUTPUT"
+
+  # A pull request that changes documentation only runs this job instead of the build matrix.
+  docs-only:
+    name: Documentation checks
+    needs: changes
+    if: needs.changes.outputs.code == 'false'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+      - name: Build documentation checks and the server
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WITH_TLS=OFF -DCHUNKDB_WERROR=ON
+          nice -n 10 cmake --build build --target chunkdb_docs_check chunkdb_docs_check_test chunkdb_server --parallel "$(nproc)"
+      - name: Resolve CLI branch for documentation examples
+        id: docs-cli-ref
+        shell: bash
+        env:
+          SIBLING_BRANCH: ${{ github.head_ref || github.ref_name }}
+        run: bash scripts/ci/resolve-sibling-ref.sh https://github.com/chunkdb/chunk-cli.git "$SIBLING_BRANCH" >> "$GITHUB_OUTPUT"
+      - name: Checkout CLI for documentation examples
+        uses: actions/checkout@v5
+        with:
+          repository: chunkdb/chunk-cli
+          ref: ${{ steps.docs-cli-ref.outputs.ref }}
+          path: docs-cli
+      - uses: actions/setup-go@v6
+        with:
+          go-version-file: docs-cli/go.mod
+      - name: Check documentation examples and links
+        run: |
+          ctest --test-dir build -R '^docs_check$' --output-on-failure
+          nice -n 10 go build -C docs-cli -o "$GITHUB_WORKSPACE/page-bin/chunk-cli" ./cmd/chunk-cli
+          build/chunkdb_docs_check image-tags
+          nice -n 10 build/chunkdb_docs_check walkthrough --cli page-bin/chunk-cli
+          nice -n 10 build/chunkdb_docs_check examples --server build/chunkdb_server --cli page-bin/chunk-cli
+          build/chunkdb_docs_check links
+
   build-and-test:
     name: Build and Test (${{ matrix.os }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ${{ matrix.os }}
     timeout-minutes: 30
     strategy:
@@ -86,6 +149,8 @@ jobs:
   # GCC reports some warnings only at -O3.
   build-and-test-release-werror:
     name: Release -Werror (ubuntu-latest, GCC)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -124,6 +189,8 @@ jobs:
 
   build-and-test-tls-ubuntu:
     name: Build and Test TLS (ubuntu-latest)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -194,6 +261,8 @@ jobs:
 
   sanitizer-asan-ubsan:
     name: ASan+UBSan (ubuntu-latest)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
     timeout-minutes: 30
 
@@ -222,6 +291,8 @@ jobs:
 
   sanitizer-tsan:
     name: TSan (Ubuntu 24.04, GCC)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
 
@@ -253,6 +324,8 @@ jobs:
 
   build-and-test-windows:
     name: Build and Test (windows-latest)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     timeout-minutes: 30
 
@@ -330,6 +403,8 @@ jobs:
 
   build-and-test-windows-tls:
     name: Build and Test TLS (windows-latest)
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
     runs-on: windows-latest
     timeout-minutes: 30
 

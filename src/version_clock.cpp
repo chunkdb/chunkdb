@@ -343,6 +343,11 @@ std::uint64_t ChunkStore::NextChunkVersion() {
 }
 
 std::uint64_t ChunkStore::NextCommitTimeMs(const RegularChunk& chunk) {
+#ifdef CHUNKDB_BENCH_CONSTANT_COMMIT_TIME
+    // Benchmark builds only: a fixed time per chunk, without the clock read
+    // and the shared monotonic step, so a paired run measures their cost.
+    return std::max<std::uint64_t>(chunk.commit_time_ms, 1U);
+#else
     const std::uint64_t floor = std::max(UnixMillisNow(), chunk.commit_time_ms);
     std::uint64_t last = last_commit_time_ms_.load(std::memory_order_relaxed);
     while (true) {
@@ -352,6 +357,7 @@ std::uint64_t ChunkStore::NextCommitTimeMs(const RegularChunk& chunk) {
             return issued;
         }
     }
+#endif
 }
 
 void ChunkStore::RaiseVersionClockAbove(std::uint64_t revision) {

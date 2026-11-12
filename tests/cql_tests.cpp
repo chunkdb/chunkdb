@@ -411,6 +411,13 @@ void TestAlterAndOtherStatements() {
     assert(rekey.verifier.has_value() && !rekey.manages_users.has_value());
     assert(Get<cql::AlterUser>("ALTER USER bot NO MANAGES USERS").manages_users == false);
     assert(Get<cql::AlterUser>("ALTER USER bot MANAGES USERS").manages_users == true);
+    assert(Get<cql::CreateUser>("CREATE USER bot VERIFIER $1 REQUIRE CHANNEL BINDING", 1).requires_channel_binding);
+    const auto strict = Get<cql::CreateUser>("CREATE USER bot VERIFIER $1 MANAGES USERS REQUIRE CHANNEL BINDING", 1);
+    assert(strict.manages_users && strict.requires_channel_binding && !create.requires_channel_binding);
+    const auto require = Get<cql::AlterUser>("ALTER USER bot REQUIRE CHANNEL BINDING");
+    assert(require.requires_channel_binding == true && !require.manages_users.has_value() && !require.verifier.has_value());
+    assert(Get<cql::AlterUser>("ALTER USER bot NO REQUIRE CHANNEL BINDING").requires_channel_binding == false);
+    assert(!rekey.requires_channel_binding.has_value());
     assert(Get<cql::DropUser>("DROP USER bot").user == "bot");
     const auto grant = Get<cql::GrantRight>("GRANT WRITE ON world TO bot");
     assert(!grant.revoke && grant.right == chunkdb::Right::kWrite && grant.table == "world" && grant.user == "bot");
@@ -432,9 +439,15 @@ void TestAlterAndOtherStatements() {
 void TestWatch() {
     const auto filtered_create = Get<cql::CreateSlot>("CREATE SLOT IF NOT EXISTS 's' ON t CHUNKS COLUMNS (b,a) NO BEFORE AREA -4 -3 TO 2 9");
     assert(filtered_create.if_not_exists && filtered_create.chunks && filtered_create.no_before && filtered_create.columns->at(0) == "b" && filtered_create.area->first.x == -4);
+    assert(!filtered_create.owner);
+    const auto owned = Get<cql::CreateSlot>("CREATE SLOT 's' ON t CHUNKS OWNER bot NO BEFORE");
+    assert(owned.owner == "bot" && owned.chunks && owned.no_before);
+    assert(Get<cql::CreateSlot>("CREATE SLOT 's' ON t OWNER bot").owner == "bot");
+    const auto migrate = cql::Parse("MIGRATE 'm' CREATE SLOT 's' ON t OWNER bot");
+    assert(std::get<cql::CreateSlot>(std::get<cql::Migrate>(migrate.statement).statement).owner == "bot");
     const auto filters = Get<cql::Watch>("WATCH t COLUMNS b,a NO BEFORE AREA 0 0 TO 1 1 SLOT 's' CHUNKS ACK TIMEOUT 9");
     assert(filters.columns->size() == 2U && filters.no_before && filters.chunks && filters.ack_timeout_ms == 9U);
-    for (const auto suffix : {"AREA 0 0 TO 1 1 AREA 0 0 TO 1 1", "COLUMNS a COLUMNS b", "NO BEFORE NO BEFORE", "CHUNKS CHUNKS", "COLUMNS ()", "AREA 1 0 TO 0 1"}) {
+    for (const auto suffix : {"AREA 0 0 TO 1 1 AREA 0 0 TO 1 1", "COLUMNS a COLUMNS b", "NO BEFORE NO BEFORE", "CHUNKS CHUNKS", "COLUMNS ()", "AREA 1 0 TO 0 1", "OWNER bot OWNER bot", "OWNER", "OWNER Bot", "OWNER 'bot'"}) {
         const auto statement = std::string("CREATE SLOT 's' ON t ") + suffix;
         bool rejected = false; try { (void)cql::Parse(statement); } catch (const cql::ParseError&) { rejected = true; }
         assert(rejected);

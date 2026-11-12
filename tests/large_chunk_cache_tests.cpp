@@ -6,6 +6,7 @@
 #include <future>
 #include <limits>
 #include <memory>
+#include <optional>
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
@@ -92,11 +93,29 @@ void SharedConstructionAndReply() {
         assert(d->store().CompletedRevision() == before && d->store().ApproxLoadedChunkCount() == 0U);
         assert(d->store().ScanChunkIdentities(false, {}, 1U).entries.empty());
         assert(resources->LargeChunkRefusals() == 2U);
+        // An unconditional whole-state SET CHUNK, here a first write, is an
+        // ordinary write: it is refused before its version, coordinate and WAL.
+        const auto whole = [] {
+            ChunkState state;
+            state.payload = {7U};
+            state.presence_bitmap = {1U};
+            return state;
+        };
+        refused = false;
+        try { (void)d->store().WriteChunkState(ChunkCoord{}, whole(), std::nullopt); }
+        catch (const ChunkCacheFullError&) { refused = true; }
+        assert(refused && d->store().CompletedRevision() == before && d->store().ApproxLoadedChunkCount() == 0U);
+        assert(!std::filesystem::exists(ChunkWalPath(d->store().data_dir(), d->store().geometry(), {})));
+        assert(d->store().ScanChunkIdentities(false, {}, 1U).entries.empty());
+        assert(resources->LargeChunkRefusals() == 3U);
         assert(!first.Get().written);
         // Existing container hits remain usable with every credit held.
         assert(engine.Execute(session, "GET CHUNK 0 0 FROM a") == "_\r\n");
         second.Release(); third.Release();
         assert(!second.Get().written && !third.Get().written);
+        assert(!d->store().ReadChunkState(ChunkCoord{}).written);
+        const auto retried = d->store().WriteChunkState(ChunkCoord{}, whole(), std::nullopt);
+        assert(retried.ok && retried.version != 0U && d->store().ReadChunkState(ChunkCoord{}).written);
         assert(resources->LargeChunkCount() <= resources->max_large_chunks());
     }
     assert(resources->LargeChunkCount() == 0U);
