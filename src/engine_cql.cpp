@@ -263,10 +263,16 @@ ChunkCoord BlockCoord(const Geometry& geometry, std::int64_t x, std::int64_t y, 
     return geometry.dims() == 3U ? geometry.BlockToChunk(x, y, z) : geometry.BlockToChunk(x, y);
 }
 
-void AppendChunkState(std::string& reply, const Geometry& geometry, const ChunkState& state,
+void AppendChunkState(ReplyParts& reply, const Geometry& geometry, const ChunkState& state,
     std::span<const std::size_t> columns, bool private_state) {
-    const auto bytes = EncodeSectionedChunkState(geometry, state, kVarMaxChunkBytesLimit, columns, private_state);
-    Protocol::AppendBulk(reply, {reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+    reply.AppendBulk(EncodeSectionedChunkState(geometry, state, kVarMaxChunkBytesLimit, columns, private_state));
+}
+
+// A large reply becomes a continuation when the caller writes one.
+[[nodiscard]] std::string FinishReply(ReplyParts reply, std::unique_ptr<ReplyContinuation>* continuation) {
+    if (continuation == nullptr) return std::move(reply).Join();
+    *continuation = std::move(reply).Continuation();
+    return std::string{};
 }
 
 // Bound admitted wire storage independently of a lowered write quota; the
@@ -1378,19 +1384,9 @@ std::string CommandEngine::ExecuteStatement(
                         state = store.ReadChunkState(coord);
                     }
                     if (!state.written) return NullReply();
-                    if (continuation) {
-                        std::vector<ChunkRangeEntry> entries;
-                        entries.push_back({.coord = coord, .payload = std::move(state.payload),
-                            .presence_bitmap = std::move(state.presence_bitmap), .version = state.version,
-                            .vars = std::move(state.vars)});
-                        *continuation = ChunkReply(layout, std::move(entries), columns, false, false,
-                            64U + store.geometry().ChunkPayloadBytes() + ChunkPresenceBitmapBytes(store.geometry()) +
-                                (layout.has_var_columns() ? kVarMaxChunkBytesLimit : 0U));
-                        return std::string{};
-                    }
-                    std::string reply;
+                    ReplyParts reply;
                     AppendChunkState(reply, store.geometry(), state, columns, private_state);
-                    return reply;
+                    return FinishReply(std::move(reply), continuation);
                 },
                 [&](const cql::SetChunk& set) {
                     command_class = set.if_version.has_value() || set.if_absent ? MetricsRegistry::CommandClass::kConditional
@@ -1534,22 +1530,18 @@ std::string CommandEngine::ExecuteStatement(
                                                   : store.ReadChunkRange(get.x0, get.y0, get.x1, get.y1, true);
                     }
                     if (info != nullptr) info->chunks = entries.size();
-                    if (continuation) {
-                        *continuation = ChunkReply(layout, std::move(entries), columns, true, get.with_schema,
-                            kMaxChunkRangeResponseBytes);
-                        return std::string{};
-                    }
-                    std::string reply;
+                    ReplyParts reply;
                     if (get.with_schema) {
-                        Protocol::AppendArrayHeader(reply, 2U);
-                        Protocol::AppendInteger(reply, layout.schema().version);
+                        Protocol::AppendArrayHeader(reply.text(), 2U);
+                        Protocol::AppendInteger(reply.text(), layout.schema().version);
                     }
-                    Protocol::AppendArrayHeader(reply, entries.size());
+                    Protocol::AppendArrayHeader(reply.text(), entries.size());
                     for (auto& entry : entries) {
-                        Protocol::AppendArrayHeader(reply, static_cast<std::size_t>(get.dims) + 1U);
-                        Protocol::AppendInteger(reply, entry.coord.x);
-                        Protocol::AppendInteger(reply, entry.coord.y);
-                        if (get.dims == 3U) Protocol::AppendInteger(reply, entry.coord.z);
+                        CheckStatementCancellation();
+                        Protocol::AppendArrayHeader(reply.text(), static_cast<std::size_t>(get.dims) + 1U);
+                        Protocol::AppendInteger(reply.text(), entry.coord.x);
+                        Protocol::AppendInteger(reply.text(), entry.coord.y);
+                        if (get.dims == 3U) Protocol::AppendInteger(reply.text(), entry.coord.z);
                         const bool private_state = session.transaction != nullptr && session.transaction->writes.contains(entry.coord);
                         AppendChunkState(reply, store.geometry(), {.version = entry.version, .payload = std::move(entry.payload),
                             .presence_bitmap = std::move(entry.presence_bitmap), .vars = std::move(entry.vars), .written = true,
@@ -1557,7 +1549,7 @@ std::string CommandEngine::ExecuteStatement(
                         if (reply.size() > kMaxChunkRangeResponseBytes)
                             throw std::invalid_argument("area response exceeds its byte limit");
                     }
-                    return reply;
+                    return FinishReply(std::move(reply), continuation);
                 },
                 [&](const cql::CreateTable& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
@@ -1825,33 +1817,34 @@ std::string CommandEngine::ExecuteStatement(
                             {{"reason", "history_lost"}, {"floor", floor}, {"epoch", epoch}});
                     }
                     if (info != nullptr) info->chunks = page.entries.size();
-                    std::string reply;
-                    Protocol::AppendMapHeader(reply, 5);
-                    Protocol::AppendBulk(reply, "chunks");
-                    Protocol::AppendArrayHeader(reply, page.entries.size());
+                    ReplyParts reply;
+                    Protocol::AppendMapHeader(reply.text(), 5);
+                    Protocol::AppendBulk(reply.text(), "chunks");
+                    Protocol::AppendArrayHeader(reply.text(), page.entries.size());
                     for (const auto& entry : page.entries) {
-                        Protocol::AppendArrayHeader(reply, static_cast<std::size_t>(geometry.dims()) + 1U + (scan.with_data ? 1U : 0U));
-                        Protocol::AppendInteger(reply, entry.coord.x);
-                        Protocol::AppendInteger(reply, entry.coord.y);
-                        if (geometry.dims() == 3U) Protocol::AppendInteger(reply, entry.coord.z);
-                        Protocol::AppendInteger(reply, entry.version);
+                        CheckStatementCancellation();
+                        Protocol::AppendArrayHeader(reply.text(), static_cast<std::size_t>(geometry.dims()) + 1U + (scan.with_data ? 1U : 0U));
+                        Protocol::AppendInteger(reply.text(), entry.coord.x);
+                        Protocol::AppendInteger(reply.text(), entry.coord.y);
+                        if (geometry.dims() == 3U) Protocol::AppendInteger(reply.text(), entry.coord.z);
+                        Protocol::AppendInteger(reply.text(), entry.version);
                         if (scan.with_data) {
                             if (entry.data) AppendChunkState(reply, geometry, *entry.data, columns, false);
-                            else Protocol::AppendNull(reply);
+                            else Protocol::AppendNull(reply.text());
                         }
                         if (reply.size() > kMaxChunkRangeResponseBytes)
                             throw std::invalid_argument("scan response exceeds its byte limit");
                     }
-                    Protocol::AppendBulk(reply, "more");
-                    Protocol::AppendBoolean(reply, page.has_more);
-                    Protocol::AppendBulk(reply, "epoch");
-                    Protocol::AppendBulk(reply, StoreIdHex(lease.store().store_id()));
-                    Protocol::AppendBulk(reply, "position");
-                    if (page.position) Protocol::AppendInteger(reply, *page.position);
-                    else Protocol::AppendNull(reply);
-                    Protocol::AppendBulk(reply, "retained_deletion_floor");
-                    Protocol::AppendInteger(reply, page.retained_deletion_floor);
-                    return reply;
+                    Protocol::AppendBulk(reply.text(), "more");
+                    Protocol::AppendBoolean(reply.text(), page.has_more);
+                    Protocol::AppendBulk(reply.text(), "epoch");
+                    Protocol::AppendBulk(reply.text(), StoreIdHex(lease.store().store_id()));
+                    Protocol::AppendBulk(reply.text(), "position");
+                    if (page.position) Protocol::AppendInteger(reply.text(), *page.position);
+                    else Protocol::AppendNull(reply.text());
+                    Protocol::AppendBulk(reply.text(), "retained_deletion_floor");
+                    Protocol::AppendInteger(reply.text(), page.retained_deletion_floor);
+                    return FinishReply(std::move(reply), continuation);
                 },
                 [&](const cql::CreateUser& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;

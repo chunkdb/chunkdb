@@ -1,5 +1,4 @@
 #include "reply_stream.hpp"
-#include "feed_protocol.hpp"
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/engine.hpp"
 #include "catalog_test_utils.hpp"
@@ -10,17 +9,6 @@
 
 namespace {
 using namespace chunkdb;
-ChunkLayout Layout() {
-    TableSchema schema;
-    schema.next_column_id = 5U;
-    schema.columns = {
-        {.id = 1U, .name = "count", .type = {ColumnKind::kUnsigned, 8U}, .required = true, .default_value = {}},
-        {.id = 2U, .name = "data", .type = {ColumnKind::kBytes, 200000U}, .nullable = true, .default_value = {}},
-        {.id = 3U, .name = "other", .type = {ColumnKind::kBytes, 100U}, .nullable = true, .default_value = {}},
-        {.id = 4U, .name = "optional", .type = {ColumnKind::kUnsigned, 3U}, .nullable = true, .default_value = {}},
-    };
-    return ChunkLayout(std::move(schema), 16U, 1024U);
-}
 std::string Collect(ReplyContinuation& reply, std::size_t credit, std::size_t consumed = 0U) {
     std::string bytes;
     while (!reply.done()) {
@@ -34,46 +22,75 @@ std::string Collect(ReplyContinuation& reply, std::size_t credit, std::size_t co
     return bytes;
 }
 void ProgressiveSnapshotsAndBounds() {
-    auto layout = Layout();
-    std::vector<ChunkRangeEntry> entries;
-    ChunkRangeEntry first{.coord = {-4, 5}, .payload = std::vector<std::uint8_t>(layout.payload_bytes(), 7U),
-        .presence_bitmap = {255U, 255U}, .version = 42U};
-    first.vars.Assign({2U, 0U}, std::vector<std::uint8_t>(131073U, 9U));
-    first.vars.Assign({3U, 15U}, std::vector<std::uint8_t>{0U, 3U});
-    entries.push_back(first);
-    entries.push_back(first);
-    entries.back().coord = {9, -10};
-    for (const auto& columns : {std::vector<std::size_t>{}, std::vector<std::size_t>{0U, 1U},
-                              std::vector<std::size_t>{2U}, std::vector<std::size_t>{1U, 0U, 2U},
-                              std::vector<std::size_t>{3U}, std::vector<std::size_t>{0U, 3U, 1U}}) {
-        std::string expected;
-        Protocol::AppendArrayHeader(expected, 2U);
-        Protocol::AppendInteger(expected, layout.schema().version);
-        Protocol::AppendArrayHeader(expected, entries.size());
-        for (const auto& entry : entries) {
-            Protocol::AppendArrayHeader(expected, 3U);
-            Protocol::AppendInteger(expected, entry.coord.x);
-            Protocol::AppendInteger(expected, entry.coord.y);
-            Protocol::AppendBulk(expected, EncodeChunkForm(layout, entry.version, entry.payload,
-                entry.presence_bitmap, entry.vars, columns));
-        }
+    std::vector<std::uint8_t> first(131073U, 9U), second{0U, 3U, 255U};
+    ReplyParts parts;
+    Protocol::AppendArrayHeader(parts.text(), 2U);
+    Protocol::AppendInteger(parts.text(), std::uint64_t{7U});
+    Protocol::AppendArrayHeader(parts.text(), 2U);
+    Protocol::AppendInteger(parts.text(), std::int64_t{-4});
+    parts.AppendBulk(first);
+    Protocol::AppendInteger(parts.text(), std::int64_t{9});
+    parts.AppendBulk(second);
+    std::string expected;
+    Protocol::AppendArrayHeader(expected, 2U);
+    Protocol::AppendInteger(expected, std::uint64_t{7U});
+    Protocol::AppendArrayHeader(expected, 2U);
+    Protocol::AppendInteger(expected, std::int64_t{-4});
+    Protocol::AppendBulk(expected, {reinterpret_cast<const char*>(first.data()), first.size()});
+    Protocol::AppendInteger(expected, std::int64_t{9});
+    Protocol::AppendBulk(expected, {reinterpret_cast<const char*>(second.data()), second.size()});
+    assert(parts.size() == expected.size());
+    for (const auto credit : {1U, 17U, 65536U}) {
+        auto copy = parts;
+        auto reply = std::move(copy).Continuation();
+        assert(Collect(*reply, credit) == expected);
+    }
+    // The parts own their bodies: the sources may change afterwards.
+    first.assign(first.size(), 1U);
+    assert(std::move(parts).Join() == expected);
+    ReplyParts empty;
+    Protocol::AppendArrayHeader(empty.text(), 0U);
+    auto reply = std::move(empty).Continuation();
+    assert(Collect(*reply, 1U) == "*0\r\n");
+}
+// A continuation writes exactly the reply of the statement: checked sectioned
+// forms with chunk columns and projections, three-axis areas with and
+// without schema, private transaction states and identity pages with data.
+void ChunkModelContinuationsMatchReplies() {
+    test::ScopedTempDir dir("chunkdb-reply-chunk-model");
+    CatalogConfig config;
+    config.data_dir = dir.path();
+    config.background_maintenance = false;
+    auto catalog = std::make_shared<TableCatalog>(config);
+    CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
+    SessionState session;
+    assert(engine.Execute(session, "HELLO 3\r\n").starts_with("%"));
+    const auto run = [&](const std::string& line, const std::vector<std::optional<std::string>>& parameters = {}) {
+        return engine.Execute(session, line + "\r\n", parameters);
+    };
+    assert(run("CREATE TABLE t (a u8 DEFAULT 0, note text(64) NULL) CHUNK 2 x 2 x 2 LARGE 2 x 2 x 2 "
+               "CHUNK COLUMNS (owner u8 DEFAULT 0, tag bytes(128) NULL)") == "+OK\r\n");
+    assert(run("SET BLOCK -1 -1 -1 IN t a=7, note='x'").starts_with(":"));
+    assert(run("SET BLOCK 0 0 0 IN t a=9").starts_with(":"));
+    assert(run("SET CHUNK -1 -1 -1 IN t META owner=3, tag=$1", {"abc"}).starts_with(":"));
+    const auto same = [&](const std::string& line) {
+        const auto expected = run(line);
+        assert(expected.size() > 64U && !expected.starts_with("-"));
         for (const auto credit : {1U, 17U, 65536U}) {
-            auto reply = ChunkReply(layout, entries, columns, true, true, expected.size());
+            std::unique_ptr<ReplyContinuation> reply;
+            assert(engine.Execute(session, line + "\r\n", {}, &reply).empty() && reply);
             assert(Collect(*reply, credit) == expected);
         }
-        bool rejected = false;
-        try { (void)ChunkReply(layout, entries, columns, true, true, expected.size() - 1U); }
-        catch (const std::out_of_range&) { rejected = true; }
-        assert(rejected);
-    }
-    auto reply = ChunkReply(layout, {first}, {}, false, false, std::numeric_limits<std::size_t>::max());
-    std::string expected;
-    Protocol::AppendBulk(expected, EncodeChunkForm(layout, first.version, first.payload, first.presence_bitmap, first.vars, {}));
-    first.payload.assign(first.payload.size(), 99U);
-    first.vars.Assign({2U, 0U}, std::vector<std::uint8_t>{1U});
-    assert(Collect(*reply, 65536U) == expected);
-    auto empty = ChunkReply(layout, {}, {}, true, false, 4U);
-    assert(Collect(*empty, 1U) == "*0\r\n");
+    };
+    for (const auto* line : {"GET CHUNK -1 -1 -1 FROM t", "GET CHUNK -1 -1 -1 FROM t COLUMNS note",
+             "GET AREA -1 -1 -1 TO 0 0 0 FROM t COLUMNS a WITH SCHEMA", "GET AREA AROUND -1 -1 -1 RADIUS 1 FROM t",
+             "SCAN CHUNKS FROM t WITH DATA", "SCAN CHUNKS FROM t LIMIT 1 WITH DATA COLUMNS (a)", "SCAN CHUNKS FROM t"})
+        same(line);
+    assert(run("BEGIN") == "+OK\r\n");
+    assert(run("SET BLOCK -1 -1 -1 IN t a=11") == "_\r\n");
+    same("GET CHUNK -1 -1 -1 FROM t");
+    same("GET AREA -1 -1 -1 TO 0 0 0 FROM t");
+    assert(run("ROLLBACK") == "+OK\r\n");
 }
 void CaptureCreditPrecedesLoadingAndOwnsSnapshot() {
     test::ScopedTempDir dir("chunkdb-reply-capture");
@@ -143,6 +160,7 @@ void WideNullableSchemaHasAnObtainableCaptureBound() {
 }
 int main() {
     ProgressiveSnapshotsAndBounds();
+    ChunkModelContinuationsMatchReplies();
     CaptureCreditPrecedesLoadingAndOwnsSnapshot();
     WideNullableSchemaHasAnObtainableCaptureBound();
 }
