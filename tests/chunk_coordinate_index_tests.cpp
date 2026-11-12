@@ -347,6 +347,10 @@ int main(int argc, char** argv) {
         ReplacementIdentityBindsValidSameLengthContent();
         return 0;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--crash-boundaries") {
+        CrashCompactionBoundaries(argv[0]);
+        return 0;
+    }
     if (argc == 4 && std::string_view(argv[1]) == "--crash") {
         const auto geometry = Shape();
         assert(ChunkCoordinateIndex::InitializeEmpty(argv[2], geometry, kTable));
@@ -362,5 +366,4 @@ int main(int argc, char** argv) {
     InventoryGenerationNeverWraps();
     ForgetRequiresItsPublishedRefusalFloor();
     ReplacementIdentityBindsValidSameLengthContent();
-    CrashCompactionBoundaries(argv[0]);
 }

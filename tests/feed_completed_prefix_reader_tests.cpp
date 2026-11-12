@@ -88,7 +88,7 @@ struct Fixture {
 void Value(const std::optional<std::vector<ColumnValue>>& row, std::uint8_t value) {
     assert(row && row->size() == 1U);
     const Geometry geometry{{2U, 2U, 2U, 1U, 8U}};
-    const auto expected = DecodeBlockColumns(geometry.layout(), {value, 0U}, {}, 0U);
+    const auto expected = DecodeBlockColumns(geometry.layout(), std::vector<std::uint8_t>{value, 0U}, {}, 0U);
     assert(SameFeedValues(*row, expected));
 }
 void MutableTailIsNeverRead() {

@@ -168,13 +168,14 @@ void ChunkStore::ApplyTxnHistory(
     bool with_vars,
     ChunkRangeEntry* entry) {
     (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) {
-        entry->payload = kept.state.payload;
-        entry->presence_bitmap = kept.state.presence_bitmap;
-        entry->version = kept.state.version;
-        entry->commit_time_ms = kept.state.commit_time_ms;
-        entry->chunk_columns = kept.state.chunk_columns;
+        const auto state = kept.View();
+        entry->payload.assign(state.payload.begin(), state.payload.end());
+        entry->presence_bitmap.assign(state.presence_bitmap.begin(), state.presence_bitmap.end());
+        entry->version = state.version;
+        entry->commit_time_ms = state.commit_time_ms;
+        entry->chunk_columns = state.CopyMetadata();
         if (with_vars) {
-            entry->vars = kept.state.vars;
+            entry->vars = state.vars;
         }
     });
 }
@@ -198,7 +199,7 @@ ChunkState ChunkStore::ReadChunkStateAt(const TxnSnapshot& snapshot, const Chunk
         state.commit_time_ms = regular_chunk->commit_time_ms;
         state.chunk_columns = regular_chunk->chunk_columns;
     }
-    (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) { state = kept.state; });
+    (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) { state = kept.View().CopyState(); });
     return state;
 }
 
@@ -221,7 +222,7 @@ TxnBlockSnapshot ChunkStore::ReadBlockAtSnapshot(const TxnSnapshot& snapshot,
     // Select the source before allocating so a newer large row cannot consume
     // the budget of a small historical observation.
     std::shared_lock lock(chunk->mutex);
-    if (!txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) { capture(kept.state); }))
+    if (!txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) { capture(kept.View()); }))
         capture(*chunk);
     return result;
 }
@@ -234,8 +235,8 @@ std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAt(
     const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
-    const auto decode = [&](const std::vector<std::uint8_t>& payload,
-                            const std::vector<std::uint8_t>& presence,
+    const auto decode = [&](std::span<const std::uint8_t> payload,
+                            std::span<const std::uint8_t> presence,
                             const ChunkVars& vars) -> std::optional<std::vector<ColumnValue>> {
         if (!BlockPresent(presence, block_index)) {
             return std::nullopt;
@@ -250,7 +251,8 @@ std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAt(
         values = decode(regular_chunk->payload, regular_chunk->presence_bitmap, regular_chunk->vars);
     }
     (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) {
-        values = decode(kept.state.payload, kept.state.presence_bitmap, kept.state.vars);
+        const auto state = kept.View();
+        values = decode(state.payload, state.presence_bitmap, state.vars);
     });
     return values;
 }
@@ -269,7 +271,7 @@ BlockReadMetadata ChunkStore::GetBlockWithVersionAt(
     };
     const auto chunk = GetOrLoadRegularChunk(coord);
     { std::shared_lock lock(chunk->mutex); capture(*chunk); }
-    (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.state); });
+    (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.View()); });
     return result;
 }
 

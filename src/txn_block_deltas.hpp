@@ -146,6 +146,7 @@ struct TxnBlockRebasePlan {
 // Validates every dependency before allocating a plan; it cannot apply one to storage.
 [[nodiscard]] TxnBlockRebasePlan PlanTxnBlockRebase(const TxnBlockDeltas& deltas,
     const StoreId& current_table_id, const Geometry& geometry,
-    std::span<const TxnBlockCurrentChunk> current, std::size_t variable_limit);
+    std::span<const TxnBlockCurrentChunk> current, std::size_t variable_limit,
+    std::pmr::memory_resource* prepared_resource = nullptr);
 
 }  // namespace chunkdb

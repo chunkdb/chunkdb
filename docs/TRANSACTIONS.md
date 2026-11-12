@@ -47,7 +47,11 @@ A read-only transaction can commit while its snapshot remains valid.
 | Earlier chunk states per table | 67108864 bytes, `--txn-history-bytes` |
 
 Exceeding a chunk-count, area-response or write-memory limit rejects the statement and leaves the transaction open without adding its reads or writes.
+SET CHUNK is checked against the written-chunk and write-memory limits before the form is decoded, by the smallest size the chunk state it writes can take.
+A form over a limit receives INVALID_ARGUMENT for that limit, even when it is also malformed.
 History pressure ends the oldest transactions with CONFLICT.
 A table change or expired duration also ends the transaction's work.
+Past its duration, a transaction that has run a table statement ends with the next statement the connection runs, PING and DESCRIBE included, or earlier when another transaction needs its share of `--txn-total-bytes`.
+An idle connection closes after `--idle-connection-timeout-ms` even with a transaction open, which rolls it back.
 
 See [Transaction statements](reference/TRANSACTION_STATEMENTS.md), [Retry a transaction](TRANSACTION_RETRY.md), and [Durability](DURABILITY_CONTRACT.md).

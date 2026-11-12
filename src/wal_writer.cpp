@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <functional>
@@ -177,6 +178,38 @@ WalFrameBuilder::WalFrameBuilder(std::vector<std::uint8_t>* batch, std::uint64_t
     records_begin_ = batch_->size();
 }
 
+void WalFrameBuilder::Reserve(std::size_t record_bytes) {
+    if (finished_) {
+        throw std::logic_error("WAL frame already finished");
+    }
+    // The records would be refused once appended; nothing is reserved for them.
+    const auto held = batch_->size() - header_index_;
+    if (held > kMaxWalFrameBytes - kWalFrameTrailerSize ||
+        record_bytes > kMaxWalFrameBytes - kWalFrameTrailerSize - held)
+        throw std::invalid_argument("WAL frame exceeds its byte limit");
+    batch_->reserve(batch_->size() + record_bytes + kWalFrameTrailerSize);
+}
+
+std::size_t WalFrameBuilder::SpanRecordBytes(std::size_t size) noexcept {
+    return kWalRecordHeaderSize + kWalSpanOffsetSize + size;
+}
+
+std::size_t WalFrameBuilder::ChunkColumnsRecordBytes(const ChunkColumnState& state) noexcept {
+    return kWalRecordHeaderSize + state.bytes.size();
+}
+
+std::size_t WalFrameBuilder::VarUpdateRecordBytes(const ChunkVars& vars, const VarUndo& undo) {
+    if (undo.replaced) {
+        return kWalRecordHeaderSize + vars.encoded_size();
+    }
+    std::size_t bytes = 0;
+    for (const auto key : undo.keys) {
+        const auto value = vars.Find(key);
+        bytes += kWalRecordHeaderSize + (value.has_value() ? kVarEntryHeaderBytes + value->size() : 8U);
+    }
+    return bytes;
+}
+
 void WalFrameBuilder::AppendSpan(
     std::uint32_t byte_offset,
     const std::uint8_t* bytes,
@@ -260,11 +293,7 @@ void WalFrameBuilder::AppendVarUpdate(const ChunkVars& vars, const VarUndo& undo
     }
     // One reservation for all records, so a large update does not copy the
     // batch once per record.
-    std::size_t bytes = 0;
-    for (const auto key : undo.keys) {
-        const auto value = vars.Find(key);
-        bytes += kWalRecordHeaderSize + (value.has_value() ? kVarEntryHeaderBytes + value->size() : 8U);
-    }
+    const std::size_t bytes = VarUpdateRecordBytes(vars, undo);
     const auto held = batch_->size() - header_index_;
     if (held > kMaxWalFrameBytes - kWalFrameTrailerSize ||
         bytes > kMaxWalFrameBytes - kWalFrameTrailerSize - held)
@@ -497,6 +526,14 @@ void ChunkStore::FlushWalBatch(
         // stream exists and is open.
         WalAppendStream& output = *chunk->wal_append_stream;
         batch_write_started = true;
+        // Crash tests: the process ends inside the append, with half of the
+        // batch written, or with all of it written and not yet synced.
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_BATCH_TORN_WRITE_ONCE")) {
+            output.write(reinterpret_cast<const char*>(chunk->wal_batch.data()),
+                static_cast<std::streamsize>(chunk->wal_batch.size() / 2U));
+            output.flush();
+            std::_Exit(86);
+        }
         output.write(
             reinterpret_cast<const char*>(chunk->wal_batch.data()),
             static_cast<std::streamsize>(chunk->wal_batch.size()));
@@ -504,6 +541,7 @@ void ChunkStore::FlushWalBatch(
         if (!output.good()) {
             throw std::system_error(output.error(), std::generic_category(), "failed to append WAL record batch: " + chunk->wal_path.string());
         }
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_BATCH_BEFORE_SYNC_ONCE")) std::_Exit(86);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE")) {
             throw std::runtime_error(
                 "injected WAL batch sync failure: " + chunk->wal_path.string());

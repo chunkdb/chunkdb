@@ -59,15 +59,62 @@ std::shared_ptr<ChunkStore::LargeChunk> ChunkStore::GetOrCreateLargeChunk(const 
         return it->second;
     }
 
-    if (scan_catalog_ready_) {
-        scan_catalog_.try_emplace(
-            std::make_pair(large_coord.x, large_coord.y),
-            LargeChunkDirectory(data_dir_, large_coord));
-    }
     auto created = std::make_shared<LargeChunk>();
     large_chunks_.emplace(large_coord, created);
     eviction_large_chunk_ring_.push_back(large_coord);
     return created;
+}
+
+// The entry goes before the memory: until then no new instance can take this
+// address, so an entry naming it is this instance's own. Erasing it drops a
+// weak_ptr to this instance, which the control block outlives: it is freed
+// only after this call returns.
+void ChunkStore::RegularChunkDeleter::operator()(RegularChunk* chunk) const noexcept {
+    {
+        std::lock_guard lock(registry->mutex);
+        const auto it = registry->entries.find(coord);
+        if (it != registry->entries.end() && it->second.instance == chunk) {
+            registry->entries.erase(it);
+        }
+    }
+    delete chunk;
+}
+
+std::size_t ChunkStore::LiveChunkInstanceEntriesForTests() const {
+    std::lock_guard lock(live_chunk_instances_->mutex);
+    return live_chunk_instances_->entries.size();
+}
+
+std::shared_ptr<const void> ChunkStore::TakeChunkFromCacheForTests(std::int64_t chunk_x, std::int64_t chunk_y) {
+    const ChunkCoord chunk_coord{chunk_x, chunk_y};
+    std::shared_ptr<LargeChunk> large_chunk;
+    {
+        std::lock_guard global_lock(large_chunks_mutex_);
+        const auto it = large_chunks_.find(geometry_.ChunkToLarge(chunk_coord));
+        if (it == large_chunks_.end()) {
+            return nullptr;
+        }
+        large_chunk = it->second;
+    }
+    std::shared_ptr<RegularChunk> chunk;
+    {
+        std::lock_guard large_lock(large_chunk->mutex);
+        const auto it = large_chunk->chunks.find(chunk_coord);
+        if (it == large_chunk->chunks.end()) {
+            return nullptr;
+        }
+        {
+            std::shared_lock chunk_lock(it->second->mutex);
+            if (it->second->written) {
+                throw std::logic_error("TakeChunkFromCacheForTests takes only a never-written chunk");
+            }
+        }
+        chunk = std::move(it->second);
+        large_chunk->chunks.erase(it);
+    }
+    loaded_chunk_count_.fetch_sub(1, std::memory_order_relaxed);
+    resources_->loaded_chunks_.fetch_sub(1, std::memory_order_relaxed);
+    return chunk;
 }
 
 std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(const ChunkCoord& chunk_coord) {
@@ -75,6 +122,10 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
 
     bool inserted = false;
     std::shared_ptr<RegularChunk> selected;
+    // Declared before every lock: if it holds the last reference, the
+    // instance's deleter takes the registry mutex, so it is released only
+    // after that mutex and the large-chunk mutex.
+    std::shared_ptr<RegularChunk> previous_instance;
     std::shared_ptr<LargeChunk> large_chunk;
     // A read-only store loads a missing chunk with the large chunk unlocked:
     // the load can wait for a writer in another process, and this process
@@ -104,8 +155,12 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             // An image without a WAL may be of an earlier schema version.
             BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);
             BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
-            selected = std::make_shared<RegularChunk>(
-                std::move(loaded.payload), std::move(loaded.presence_bitmap));
+            // Not make_shared, which cannot take the deleter; as a result a
+            // weak_ptr that outlives the instance (the WAL stream pool keeps
+            // them) keeps only the control block, not the object's storage.
+            selected = std::shared_ptr<RegularChunk>(
+                new RegularChunk(std::move(loaded.payload), std::move(loaded.presence_bitmap)),
+                RegularChunkDeleter{live_chunk_instances_, chunk_coord});
             selected->vars = std::move(loaded.vars);
             selected->chunk_columns = std::move(loaded.chunk_columns);
             // The persisted revision survives eviction and restart, so
@@ -134,24 +189,26 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             // pressure, so it is checked in every build rather than left to
             // a stress test to stumble over.
             {
-                std::lock_guard registry(live_chunk_instances_mutex_);
-                auto& slot = live_chunk_instances_[chunk_coord];
-                if (const auto previous = slot.lock(); previous != nullptr) {
-                    stats_duplicate_chunk_instances_.fetch_add(
-                        1, std::memory_order_relaxed);
-                    LogMessage(
-                        LogLevel::kError,
-                        LogComponent::kStore,
-                        "duplicate live chunk instance; writes through the "
-                        "previous object can be lost",
-                        {
-                            {"chunk_x", std::to_string(chunk_coord.x)},
-                            {"chunk_y", std::to_string(chunk_coord.y)},
-                            {"previous_pending_wal_batch",
-                             std::to_string(previous->wal_batch.size())},
-                        });
-                }
-                slot = selected;
+                std::lock_guard registry(live_chunk_instances_->mutex);
+                auto& slot = live_chunk_instances_->entries[chunk_coord];
+                previous_instance = slot.ref.lock();
+                slot.instance = selected.get();
+                slot.ref = selected;
+            }
+            if (previous_instance != nullptr) {
+                stats_duplicate_chunk_instances_.fetch_add(
+                    1, std::memory_order_relaxed);
+                LogMessage(
+                    LogLevel::kError,
+                    LogComponent::kStore,
+                    "duplicate live chunk instance; writes through the "
+                    "previous object can be lost",
+                    {
+                        {"chunk_x", std::to_string(chunk_coord.x)},
+                        {"chunk_y", std::to_string(chunk_coord.y)},
+                        {"previous_pending_wal_batch",
+                         std::to_string(previous_instance->wal_batch.size())},
+                    });
             }
         }
         break;

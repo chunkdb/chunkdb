@@ -52,6 +52,7 @@ constexpr const char* kFenceDurability = "its store is fail-closed after a durab
 constexpr const char* kFenceFeed = "its feed cleanup failed";
 constexpr const char* kFenceSnapshot = "its snapshot generation failed";
 constexpr const char* kFenceRecovery = "a recovery could not reopen it";
+constexpr const char* kFenceNarrowing = "a column narrowing could not be ended";
 
 // How watches of a table that left service end.
 constexpr const char* kWatchFenced = "watched table is fenced; watch it again after RECOVER TABLE";
@@ -264,6 +265,7 @@ Table::Table(
       geometry_(std::move(geometry)),
       store_(std::move(store)),
       options_(options) {
+    slot_excess_ = std::make_shared<FeedExcessPool>();
     slot_max_bytes_ = store_->feed_slots_->max_bytes();
     slot_ack_state_ = std::make_shared<FeedSlotAckState>();
     store_->feed_slots_->UseAckState(slot_ack_state_);
@@ -528,8 +530,10 @@ void Table::StopFeed() {
         feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
 }
 
-FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const FeedSlotFilters& filters) {
+FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const FeedSlotFilters& filters,
+    std::optional<std::string> owner, bool owner_given) {
     RequireValidFeedSlotName(name);
+    if (owner) RequireValidFeedSlotOwner(*owner);
     std::lock_guard ddl(ddl_mutex_);
     if (if_not_exists) {
         auto lease = Acquire();
@@ -542,6 +546,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
         const auto existing = std::find_if(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; });
         if (existing != slots.end()) {
             if (existing->filters != filters) throw FeedSlotFiltersError("feed slot filters differ from existing slot");
+            if (owner_given && existing->owner != owner) throw FeedSlotFiltersError("feed slot owner differs from existing slot");
             return *existing;
         }
     }
@@ -560,7 +565,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     RequireFeature(store->features(), *FindFeature("feed_slots"));
     if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
     // Validate the complete filter before baseline, feature or record publication.
-    (void)SerializeFeedSlotRecords(FeedSlotRecords{store_id_, 0U, {{std::string(name), 0U, false, filters}},
+    (void)SerializeFeedSlotRecords(FeedSlotRecords{store_id_, 0U, {{std::string(name), 0U, false, filters, false, owner}},
         false, store->geometry_.dims()});
     if (filters.column_ids) {
         const auto& columns = store->geometry_.layout().schema().columns;
@@ -582,7 +587,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     });
     std::unique_lock eviction_lock(store->resources_->stores_mutex_);
     PrepareFeedSlotBaseline(*store);
-    return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U, false, filters);
+    return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U, false, filters, std::move(owner));
 }
 
 void Table::PrepareFeedSlotBaseline(ChunkStore& store) {
@@ -709,6 +714,7 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
         if (store.access_mode_ != AccessMode::kReadWrite || store.allow_multiple_processes_)
             throw std::invalid_argument("feed slots require a single-process read-write table");
         auto slot = store.feed_slots_->Get(name);
+        if (slot.owner && authorize_owner) authorize_owner(*slot.owner);
         if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
             slot.schema_filter_lost ? "schema_filter" : "retention_limit");
         if ((options.area && options.area != slot.filters.area) ||
@@ -727,7 +733,7 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
         if (old && old->takeover_pending.load(std::memory_order_acquire))
             throw FeedSlotBusyError("feed slot ownership handoff is pending", "takeover_pending");
         if (!old || !old->valid.load(std::memory_order_acquire)) {
-            auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, std::move(user));
+            auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_, std::move(user));
             existing = claim;
             return {std::move(slot), std::move(claim)};
         }
@@ -764,10 +770,17 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
     if (!old->valid.load(std::memory_order_acquire) || found == slot_claims_.end() || found->second.lock() != old)
         throw FeedSlotLostError("feed slot was removed during takeover");
     auto slot = validate(*store);
-    auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, std::move(user));
+    auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_, std::move(user));
     old->valid.store(false, std::memory_order_release);
     found->second = claim;
     return {std::move(slot), std::move(claim)};
+}
+
+void Table::BindClaimedFeedSlotOwner(const std::shared_ptr<FeedSlotClaim>& claim, const std::string& owner) {
+    auto lease = Acquire();
+    if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
+    if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
+    lease->store().feed_slots_->BindOwner(claim->name, owner);
 }
 
 FeedSlot Table::ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim) {
@@ -2027,6 +2040,57 @@ bool TableCatalog::ChangeColumnsIfNeeded(
     return true;
 }
 
+std::optional<std::string> TableCatalog::ScanNarrowing(Table& table) {
+    const auto pending = table.Info().schema.pending;
+    if (!pending.has_value()) throw std::logic_error("no narrowing of table '" + table.name_ + "' is in progress");
+    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kBeforeNarrowingScan, table.name_);
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_NARROW_SCAN_FAIL_ONCE")) {
+        throw std::runtime_error("injected failure reading the table");
+    }
+    auto lease = table.Acquire();
+    if (!lease.has_value()) {
+        throw TableNotFoundError("table '" + table.name_ + "' is unavailable");
+    }
+    return lease->store().FindValueNotFitting(pending->column_id, pending->type);
+}
+
+void TableCatalog::EndNarrowing(Table& table, const TableOptions& options, const std::function<void(StoreManifest*)>& change) {
+    try {
+        RewriteManifest(
+            table, options,
+            [&](StoreManifest* manifest) {
+                if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_NARROW_END_FAIL_ONCE")) {
+                    throw std::runtime_error("injected failure ending a narrowing");
+                }
+                change(manifest);
+            },
+            "CHUNKDB_FAILPOINT_NARROW_END_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+    } catch (const std::exception& error) {
+        // Served with the narrowing still recorded, the table would keep
+        // restricting the column and refuse every later narrowing: it leaves
+        // service until RecoverTable or a restart drops the narrowing.
+        bool fenced = false;
+        if (!migration_health_->failed.load(std::memory_order_acquire) && Find(table.name_).get() == &table &&
+            table.Info().schema.pending.has_value()) {
+            if (auto store = table.BeginExclusive(/*closing=*/true)) {
+                auto fence = PrepareFence(table.shared_from_this(), table.name_, kFenceNarrowing);
+                std::lock_guard operations(operations_mutex_);
+                store.reset();
+                FenceTable(table, options, std::move(fence));
+                fenced = true;
+            }
+        }
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kStore,
+            fenced ? "a column narrowing could not be ended; the table is fenced until RECOVER TABLE or a restart"
+                   : "a column narrowing could not be ended",
+            {{"table", table.name_}, {"error", error.what()}});
+        throw;
+    }
+}
+
 void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
     RequireWritable("ALTER TABLE");
     std::shared_lock metadata(feature_metadata_gate_);
@@ -2038,36 +2102,29 @@ void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, 
         *table, options,
         [&](StoreManifest* manifest) { manifest->schema = WithPendingNarrowing(manifest->schema, column, type); },
         "CHUNKDB_FAILPOINT_NARROW_PENDING_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
-    const std::uint32_t column_id = table->Info().schema.pending->column_id;
-    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
-        hook->Run(MigrationTestHook::Point::kBeforeNarrowingScan, name);
     // 2. Every value already stored.
     std::optional<std::string> misfit;
     std::exception_ptr scan_failure;
     try {
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_NARROW_SCAN_FAIL_ONCE")) {
-            throw std::runtime_error("injected failure reading the table");
-        }
-        auto lease = table->Acquire();
-        if (!lease.has_value()) {
-            throw TableNotFoundError("table '" + std::string(name) + "' is unavailable");
-        }
-        misfit = lease->store().FindValueNotFitting(column_id, type);
+        misfit = ScanNarrowing(*table);
     } catch (...) {
         scan_failure = std::current_exception();
     }
     // 3. The new version, or the schema as it was.
     const bool narrow = scan_failure == nullptr && !misfit.has_value();
-    RewriteManifest(
-        *table, options,
-        [&](StoreManifest* manifest) {
-            manifest->schema = narrow ? NarrowColumnType(manifest->schema, column, type)
-                                      : WithoutPendingNarrowing(manifest->schema);
-            if (narrow) {
-                manifest->geometry.block_bits = FixedBitsPerBlock(manifest->schema);
-            }
-        },
-        "CHUNKDB_FAILPOINT_NARROW_END_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+    if (narrow) {
+        EndNarrowing(*table, options, [&](StoreManifest* manifest) {
+            manifest->schema = NarrowColumnType(manifest->schema, column, type);
+            manifest->geometry.block_bits = FixedBitsPerBlock(manifest->schema);
+        });
+    } else {
+        try {
+            EndNarrowing(*table, options, [](StoreManifest* manifest) { manifest->schema = WithoutPendingNarrowing(manifest->schema); });
+        } catch (const std::exception&) {
+            // Logged, and the table is fenced if it still has the narrowing;
+            // the check's own refusal or failure is what the caller gets.
+        }
+    }
     if (scan_failure != nullptr) {
         std::rethrow_exception(scan_failure);
     }

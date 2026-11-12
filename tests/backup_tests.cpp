@@ -12,6 +12,10 @@
 #include "wal_writer.hpp"
 #include "txn_history.hpp"
 #include <thread>
+#ifndef _WIN32
+#include <sys/stat.h>
+#include <unistd.h>
+#endif
 
 #include "backup.hpp"
 #include "change_feed.hpp"
@@ -287,7 +291,7 @@ void CutAndProgress(DurabilityMode mode) {
     TableCatalog catalog(Config(source, mode));
     (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
-    const auto slot = table->CreateFeedSlot("reader");
+    const auto slot = table->CreateFeedSlot("reader", false, {}, "alice");
     auto lease = table->Acquire();
     auto& store = lease->store();
     WriteCounter(store, {0, 0}, 11); store.CheckpointForTests(0, 0);
@@ -312,6 +316,7 @@ void CutAndProgress(DurabilityMode mode) {
     assert(txn_test::CounterOf(ReadBackup(target, "default", {2, 0})) == 0U);
     const auto slots = *ReadFeedSlotRecords(target / "tables/default", slot.position.epoch);
     assert(slots.slots.size() == 1U && slots.slots[0].name == "reader" && slots.durable_watermark <= cut);
+    assert(slots.slots[0].owner == "alice");
     assert(!std::filesystem::exists(target / "tables/default" / kFeedArchiveDirName));
     // A later checkpoint retries the deferred image replacement and preserves the live write.
     store.CheckpointForTests(0, 0);
@@ -326,6 +331,7 @@ void CutAndProgress(DurabilityMode mode) {
     TableCatalog restored(Config(root / "restored", mode));
     auto restored_table = restored.Find("default");
     assert(restored_table->Info().store_id != slot.position.epoch);
+    assert(restored_table->ListFeedSlots().front().owner == "alice"); // The slot keeps its owner.
     auto restored_lease = restored_table->Acquire();
     assert(ReadCounter(restored_lease->store(), {0, 0}) == 11U);
     assert(ReadCounter(restored_lease->store(), {1, 0}) == 22U);
@@ -1035,6 +1041,52 @@ void PathDurabilityFailuresRemainGuarded() {
     assert(!std::filesystem::exists(target / kBackupIncompleteName));
 #endif
 }
+// The --backup-dir root, each existing directory below it and an existing
+// target must belong to the server user or root and not be writable by group
+// or others. Directories above the root are not checked.
+void SharedTargetDirectories() {
+#ifndef _WIN32
+    ScopedTempDir temp("chunkdb-backup-shared-target");
+    const auto root = std::filesystem::canonical(temp.path());
+    TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
+    const auto refused = [](const std::string& error, const std::filesystem::path& directory) {
+        return error.find("not writable by group or others: " + directory.string()) != std::string::npos;
+    };
+    const auto backups = root / "backups";
+    std::filesystem::create_directory(backups);
+    const BackupOptions configured{.backup_directory = backups};
+    const auto shared = backups / "shared";
+    std::filesystem::create_directory(shared);
+    std::filesystem::permissions(shared, std::filesystem::perms::all);
+    assert(refused(Error([&] { (void)catalog.BackupTo(shared, {}); }), shared));
+    assert(refused(Error([&] { (void)catalog.BackupTo(ResolveBackupTarget(backups, "shared/daily"), configured); }), shared));
+    assert(std::filesystem::is_empty(shared));
+    const auto readable = std::filesystem::perms::owner_all | std::filesystem::perms::group_read |
+        std::filesystem::perms::group_exec | std::filesystem::perms::others_read | std::filesystem::perms::others_exec;
+    std::filesystem::permissions(shared, readable);
+    std::filesystem::permissions(backups, std::filesystem::perms::owner_all | std::filesystem::perms::group_all);
+    assert(refused(Error([&] { (void)catalog.BackupTo(ResolveBackupTarget(backups, "shared/daily"), configured); }), backups));
+    assert(refused(Error([&] { (void)catalog.BackupTo(ResolveBackupTarget(backups, "fresh"), configured); }), backups));
+    assert(std::filesystem::is_empty(shared) && !std::filesystem::exists(backups / "fresh"));
+    std::filesystem::permissions(backups, readable);
+    (void)catalog.BackupTo(ResolveBackupTarget(backups, "shared/daily"), configured);
+    std::filesystem::create_directory(shared / "existing", shared);
+    (void)catalog.BackupTo(ResolveBackupTarget(backups, "shared/existing"), configured);
+    assert(std::filesystem::exists(shared / "daily" / kBackupMarkerName) && std::filesystem::exists(shared / "existing" / kBackupMarkerName));
+    // A root-owned 0755 directory passes the check; without root privileges
+    // the walk then stops only because it cannot create the missing child.
+    if (::geteuid() != 0) {
+        struct stat status {};
+        if (::stat("/", &status) == 0 && status.st_uid == 0 && (status.st_mode & (S_IWGRP | S_IWOTH)) == 0) {
+            const auto error = Error([&] {
+                PrepareBackupTarget(root / "source", "/" + root.filename().string() + "/backup", nullptr, "/");
+            });
+            assert(!error.empty() && error.find("not writable by group or others") == std::string::npos);
+        }
+    }
+#endif
+}
 void StagingCollisionRetainsExistingEntry() {
     ScopedTempDir temp("chunkdb-backup-stage-collision");
     const auto root = std::filesystem::canonical(temp.path());
@@ -1234,8 +1286,8 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--staging-cleanup-alias") { StagingCleanupAliasReplacement(); StagingCleanupRootReplacement(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-cleanup-root") { StagingCleanupRootReplacement(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--orphaned-staging") { OrphanedStagingCleanup(); return 0; }
-    if (argc == 2 && std::string_view(argv[1]) == "--path-regressions") { TargetComponentReplacement(); StagingOwnerValidation(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); return 0; }
-    TargetComponentReplacement(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded();
+    if (argc == 2 && std::string_view(argv[1]) == "--path-regressions") { TargetComponentReplacement(); StagingOwnerValidation(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); SharedTargetDirectories(); return 0; }
+    TargetComponentReplacement(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); SharedTargetDirectories();
     if (argc == 2 && std::string_view(argv[1]) == "--completion") { CompletionAndPoison(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--generation") { FailedGenerationAndEmptyCatalog(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--pin-regressions") {

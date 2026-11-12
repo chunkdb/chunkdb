@@ -901,7 +901,13 @@ class Parser {
                 create.name = SlotName();
                 Expect("on");
                 create.table = Name("a table name");
-                while (FeedFilter(create)) {}
+                while (true) {
+                    const auto column = Peek().column;
+                    if (Accept("owner")) {
+                        if (create.owner) Fail(column, "OWNER is given twice");
+                        create.owner = Name("a user name");
+                    } else if (!FeedFilter(create)) break;
+                }
                 return create;
             }
             if (Accept("user")) {
@@ -913,6 +919,11 @@ class Parser {
                 if (Accept("manages")) {
                     Expect("users");
                     create.manages_users = true;
+                }
+                if (Accept("require")) {
+                    Expect("channel");
+                    Expect("binding");
+                    create.requires_channel_binding = true;
                 }
                 return create;
             }
@@ -972,9 +983,15 @@ class Parser {
                     alter.verifier = Verifier();
                 } else {
                     const bool no = Accept("no");
-                    Expect("manages");
-                    Expect("users");
-                    alter.manages_users = !no;
+                    if (Accept("require")) {
+                        Expect("channel");
+                        Expect("binding");
+                        alter.requires_channel_binding = !no;
+                    } else {
+                        Expect("manages");
+                        Expect("users");
+                        alter.manages_users = !no;
+                    }
                 }
                 return alter;
             }

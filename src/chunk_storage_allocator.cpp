@@ -1,4 +1,5 @@
 #include "chunkdb/chunk_storage_allocator.hpp"
+#include "chunk_storage_policy_access.hpp"
 
 #include <algorithm>
 #include <cassert>
@@ -114,5 +115,47 @@ void DeallocateChunkStorage(void* memory) noexcept {
     }
 }
 std::size_t ChunkStorageAllocationBytes(const void* memory) noexcept { return memory ? Header(memory).bytes : 0U; }
+
+ChunkStorageAllocationRecord ChunkStoragePolicyAccess::Inspect(const void* memory) noexcept {
+    if (!memory) return {};
+    const auto& header = Header(memory);
+    return {header.bytes, header.upstream, header.policy};
+}
+ChunkStoragePolicyPtr ChunkStoragePolicyAccess::Retain(ChunkStoragePolicy* policy) noexcept {
+    if (policy) policy->AddRef();
+    return ChunkStoragePolicyPtr(policy);
+}
+std::size_t ChunkStoragePolicyAccess::ControlBytes() noexcept { return sizeof(ChunkStoragePolicy); }
+bool ChunkStoragePolicyAccess::IsRegular(const ChunkStoragePolicy& policy) noexcept { return !policy.account_; }
+void ChunkStoragePolicyAccess::AdmitExisting(ChunkStoragePolicy& policy, std::shared_ptr<ChunkStorageAccount> account) {
+    if (!account || policy.account_) throw std::invalid_argument("original storage policy is already charged or lacks an account");
+    account->Reserve(policy.allocation_bytes());
+    policy.account_ = std::move(account);
+}
+void ChunkStoragePolicyAccess::ReserveExistingBuffers(ChunkStoragePolicy& policy, std::size_t bytes) {
+    policy.ReserveBuffer(bytes);
+}
+void ChunkStoragePolicyAccess::CancelExistingBuffers(ChunkStoragePolicy& policy, std::size_t bytes) noexcept {
+    policy.ReleaseBuffer(bytes);
+}
+void ChunkStoragePolicyAccess::Attach(void* memory, ChunkStoragePolicy& policy) noexcept {
+    auto& header = const_cast<Prefix&>(Header(memory));
+    assert(header.policy == nullptr && header.upstream == policy.upstream_ && header.bytes <= policy.buffer_bytes_);
+    policy.AddRef();
+    header.policy = &policy;
+}
+void ChunkStoragePolicyAccess::Detach(void* memory, ChunkStoragePolicy& policy) noexcept {
+    auto& header = const_cast<Prefix&>(Header(memory));
+    assert(header.policy == &policy);
+    header.policy = nullptr;
+    policy.ReleaseRef();
+}
+void ChunkStoragePolicyAccess::ConsumeHistoryAdmission(ChunkStoragePolicy& policy,
+    const std::shared_ptr<ChunkStorageAccount>& destination) noexcept {
+    assert(destination && policy.account_ && destination != policy.account_);
+    auto source = std::move(policy.account_);
+    policy.account_ = destination;
+    source->Release(policy.allocation_bytes());
+}
 
 }  // namespace chunkdb::detail

@@ -1,6 +1,8 @@
 #include <iostream>
+#include <map>
 #include <stop_token>
 #include "feed_phase_watchdog.hpp"
+#include "admin.hpp"
 #include "backup_restore_test_utils.hpp"
 
 #include <cstdlib>
@@ -577,53 +579,30 @@ void DirectoryAncestorReplacement() {
             left.info.dwVolumeSerialNumber == right.info.dwVolumeSerialNumber &&
             left.info.nFileIndexHigh == right.info.nFileIndexHigh && left.info.nFileIndexLow == right.info.nFileIndexLow;
     };
-    const auto report = [](const char* name, const Facts& value) {
-        std::cerr << name << " error=" << value.error << " volume=" << value.info.dwVolumeSerialNumber
-                  << " index_high=" << value.info.nFileIndexHigh << " index_low=" << value.info.nFileIndexLow
-                  << " bytes=" << value.bytes.size() << " crc32=" << Crc32(value.bytes) << '\n';
-    };
     const auto before = facts(original), foreign_before = facts(foreign);
     assert(before.error == ERROR_SUCCESS && before.bytes == own_bytes);
     assert(foreign_before.error == ERROR_SUCCESS && foreign_before.bytes == foreign_bytes && !same(before, foreign_before));
     assert(MoveFileExW(ancestor.c_str(), moved.c_str(), MOVEFILE_WRITE_THROUGH) != 0);
     assert(MoveFileExW(moved.c_str(), ancestor.c_str(), MOVEFILE_WRITE_THROUGH) != 0);
-    Facts consumed;
-    bool renamed = false, safe = false;
     {
+        // The pinned leaf denies renaming its ancestor, so the consumed path
+        // still names the original file and not the foreign one.
         backup_detail::DirectoryEntries entries(original.parent_path(), true);
         assert(entries != backup_detail::DirectoryEntries{});
         const auto entry = *entries;
         assert(entry.path() == original && entry.is_regular_file());
-        renamed = MoveFileExW(ancestor.c_str(), moved.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
+        const bool renamed = MoveFileExW(ancestor.c_str(), moved.c_str(), MOVEFILE_WRITE_THROUGH) != 0;
         const auto rename_error = renamed ? ERROR_SUCCESS : GetLastError();
-        std::cerr << "directory ancestor rename error=" << rename_error << " cached_regular=" << entry.is_regular_file() << '\n';
-        if (!renamed) {
-            assert(rename_error == ERROR_SHARING_VIOLATION || rename_error == ERROR_ACCESS_DENIED);
-            consumed = facts(entry.path());
-            safe = same(consumed, before) && consumed.bytes == own_bytes;
-        } else {
-            const auto retained = facts(moved / relative);
-            assert(same(retained, before) && retained.bytes == own_bytes);
-            test::ScopedDirectoryAlias alias(outside, ancestor);
-            consumed = facts(entry.path());
-            const bool refused = consumed.error == ERROR_FILE_NOT_FOUND || consumed.error == ERROR_PATH_NOT_FOUND ||
-                consumed.error == ERROR_ACCESS_DENIED || consumed.error == ERROR_SHARING_VIOLATION;
-            safe = refused || (same(consumed, before) && consumed.bytes == own_bytes);
-        }
-        report("directory ancestor original", before);
-        report("directory ancestor foreign", foreign_before);
-        report("directory ancestor consumed", consumed);
-    }
-    if (renamed) {
-        const auto restored = MoveFileExW(moved.c_str(), ancestor.c_str(), MOVEFILE_WRITE_THROUGH);
-        if (!restored) std::cerr << "directory ancestor restore error=" << GetLastError() << '\n';
-        assert(restored != 0);
+        assert(!renamed && (rename_error == ERROR_ACCESS_DENIED || rename_error == ERROR_SHARING_VIOLATION));
+        assert(entry.is_regular_file());
+        const auto consumed = facts(entry.path());
+        assert(same(consumed, before) && consumed.bytes == own_bytes);
+        assert(!same(consumed, foreign_before) && consumed.bytes != foreign_bytes);
     }
     const auto original_after = facts(original), foreign_after = facts(foreign);
     assert(same(original_after, before) && original_after.bytes == own_bytes);
     assert(same(foreign_after, foreign_before) && foreign_after.bytes == foreign_bytes);
     assert(LoadFile(outside / "sentinel") == Bytes{'s'});
-    assert(safe && "a pinned directory consumer reached a replaced ancestor's foreign file");
 #endif
 }
 void ExtendedRootPaths() {
@@ -691,6 +670,67 @@ void ExtendedRootPaths() {
     assert(!std::filesystem::exists(top));
 #endif
 }
+// BACKUP TO names its target under the resolved --backup-dir and checks it
+// against the same resolved root, so a directory alias or an extended-length
+// --backup-dir is accepted and a target outside it is still refused.
+void ConfiguredBackupDirectoryRoots() {
+    Fixture fixture;
+    const auto source = fixture.root / "configured-source";
+    RestoreBackup(fixture.backup, source);
+    CatalogConfig config; config.data_dir = source; config.background_maintenance = false;
+    TableCatalog catalog(config);
+    const auto backup_to = [&](const std::filesystem::path& directory, const std::filesystem::path& target) {
+        BackupOptions options; options.backup_directory = directory;
+        std::string error;
+        try { (void)catalog.BackupTo(target, options); }
+        catch (const std::exception& failure) { error = failure.what(); }
+        return error;
+    };
+    const auto backups = fixture.root / "configured-backups";
+    std::filesystem::create_directory(backups);
+    const auto alias = fixture.root / "configured-alias";
+    test::ScopedDirectoryAlias backups_link(backups, alias);
+    assert(backup_to(alias, ResolveBackupTarget(alias, "daily/alias")).empty());
+    assert(Verify(backups / "daily/alias").errors == 0U);
+    const auto outside = fixture.root / "configured-outside";
+    std::filesystem::create_directory(outside);
+    assert(backup_to(alias, ResolveBackupTarget(outside, "escaped")).find("escapes --backup-dir") != std::string::npos);
+    assert(!std::filesystem::exists(outside / "escaped"));
+#ifdef _WIN32
+    auto extended = std::filesystem::path(L"\\\\?\\" + backups.wstring());
+    for (unsigned i = 0U; i < 2U; ++i) extended /= std::string(100U, 'z') + std::to_string(i);
+    std::filesystem::create_directories(extended);
+    assert(extended.native().size() > 260U);
+    const auto target = ResolveBackupTarget(extended, "daily/extended");
+    assert(target.native().starts_with(L"\\\\?\\"));
+    assert(backup_to(extended, target).empty());
+    assert(Verify(target).errors == 0U);
+    assert(backup_to(extended, ResolveBackupTarget(outside, "escaped-extended")).find("escapes --backup-dir") != std::string::npos);
+    assert(!std::filesystem::exists(outside / "escaped-extended"));
+    const auto long_top = std::filesystem::path(L"\\\\?\\" + backups.wstring()) / (std::string(100U, 'z') + "0");
+    RemoveBackupStaging(long_top);
+    assert(!std::filesystem::exists(long_top));
+#endif
+}
+// The offline password reset refuses a backup before it locks or writes
+// anything, so the backup still restores.
+void ResetPasswordRefusesBackup() {
+    Fixture fixture;
+    const auto snapshot = [&] {
+        std::map<std::string, Bytes> files;
+        for (const auto& entry : std::filesystem::recursive_directory_iterator(fixture.backup))
+            files[entry.path().generic_string()] = entry.is_regular_file() ? LoadFile(entry.path()) : Bytes{};
+        return files;
+    };
+    const auto before = snapshot();
+    std::string error;
+    try { ResetPassword(fixture.backup, "admin", "new-password"); }
+    catch (const std::exception& failure) { error = failure.what(); }
+    assert(error.find("backup or incomplete restore directory cannot be opened") != std::string::npos);
+    assert(snapshot() == before);
+    RestoreBackup(fixture.backup, fixture.root / "restored");
+    assert(Verify(fixture.root / "restored").errors == 0U);
+}
 } // namespace
 int main(int argc, char** argv) {
 #ifdef _WIN32
@@ -712,6 +752,7 @@ int main(int argc, char** argv) {
         else if (name == "source-reparse") BackupSourceDirectoryReplacement();
         else if (name == "ancestor-reparse") DirectoryAncestorReplacement();
         else if (name == "extended") ExtendedRootPaths();
+        else if (name == "configured-roots") ConfiguredBackupDirectoryRoots();
         else return 2;
         return 0;
     }
@@ -727,6 +768,7 @@ int main(int argc, char** argv) {
     run("rooted targets", RootedTargets); run("inventory paths", InventoryPathSpellings);
     run("inventory reparse", ReparseInventoryAndRestore); run("source directory replacement", BackupSourceDirectoryReplacement);
     run("directory ancestor replacement", DirectoryAncestorReplacement);
-    run("extended roots", ExtendedRootPaths);
-    std::cout << "18 backup restore groups passed\n";
+    run("extended roots", ExtendedRootPaths); run("configured backup roots", ConfiguredBackupDirectoryRoots);
+    run("reset password refusal", ResetPasswordRefusesBackup);
+    std::cout << "20 backup restore groups passed\n";
 }

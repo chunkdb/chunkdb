@@ -166,7 +166,8 @@ const TxnBlockRow* TxnBlockDeltas::Read(TxnBlockKey key) const noexcept {
 
 TxnBlockRebasePlan PlanTxnBlockRebase(const TxnBlockDeltas& deltas,
     const StoreId& current_table_id, const Geometry& geometry,
-    std::span<const TxnBlockCurrentChunk> current, std::size_t variable_limit) {
+    std::span<const TxnBlockCurrentChunk> current, std::size_t variable_limit,
+    std::pmr::memory_resource* prepared_resource) {
     if (deltas.table_id() != current_table_id || geometry.layout().schema() != deltas.layout().schema() ||
         geometry.layout().block_count() != deltas.layout().block_count())
         throw TransactionConflictError(TxnConflictReason::kTableChanged, "transaction block rebase table or schema changed");
@@ -185,14 +186,15 @@ TxnBlockRebasePlan PlanTxnBlockRebase(const TxnBlockDeltas& deltas,
         if (FindCurrent(current, coord).version != revision)
             throw TransactionConflictError(TxnConflictReason::kChunkChanged, "transaction promoted chunk revision conflict");
 
-    TxnBlockRebasePlan plan(deltas.resource());
+    auto* resource = prepared_resource ? prepared_resource : deltas.resource();
+    TxnBlockRebasePlan plan(resource);
     for (const auto& [key, entry] : deltas.rows()) {
         if (entry.action == TxnBlockAction::kObserve) continue;
         const auto& chunk = FindCurrent(current, key.chunk);
         if (MatchesTxnBlockRow(deltas.layout(), chunk.payload, chunk.presence, *chunk.vars, key.index, entry.after)) continue;
-        plan.rows.emplace_back(key, CloneTxnBlockRow(entry.after, deltas.resource()));
+        plan.rows.emplace_back(key, CloneTxnBlockRow(entry.after, resource));
         if (plan.chunks.empty() || !(plan.chunks.back().coord == key.chunk)) {
-            plan.chunks.emplace_back(deltas.resource());
+            plan.chunks.emplace_back(resource);
             auto& output = plan.chunks.back(); output.coord = key.chunk;
             output.resulting_variable_entries = chunk.vars->size();
             output.resulting_variable_bytes = chunk.vars->encoded_size();
@@ -214,7 +216,7 @@ TxnBlockRebasePlan PlanTxnBlockRebase(const TxnBlockDeltas& deltas,
             const auto before = chunk.vars->Find(var_key);
             const auto* after = entry.after.present ? &entry.after.cells[column_index] : nullptr;
             if (EqualValue(before, column, after)) continue;
-            output.variables.emplace_back(deltas.resource());
+            output.variables.emplace_back(resource);
             auto& change = output.variables.back(); change.key = var_key; change.removed = Removed(column, after);
             if (before) { --output.resulting_variable_entries; Add(output.removed_variable_bytes, kVarEntryHeaderBytes + before->size()); }
             if (!change.removed) {

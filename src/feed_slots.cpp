@@ -195,6 +195,9 @@ void FeedSlotTestAccess::EnableChunkForms(FeedArchiveReader& reader, std::size_t
 void FeedSlotTestAccess::SetEntryBudget(FeedArchiveReader& reader, std::size_t budget) {
     reader.SetEntryBudget(budget);
 }
+void FeedSlotTestAccess::Filter(FeedArchiveReader& reader, const FeedSlotFilters& filters) {
+    reader.Filter(filters);
+}
 FeedSlots::~FeedSlots() { Stop(); }
 bool FeedSlots::active() const noexcept { return store_.feed_slots_active_.load(std::memory_order_acquire); }
 bool FeedSlots::ArchiveRequired() const noexcept {
@@ -326,7 +329,8 @@ void FeedSlots::Persist(FeedSlotRecords next) {
         std::any_of(records_.slots.begin(), records_.slots.end(), [](const auto& slot) { return !slot.lost; }),
         std::memory_order_release);
 }
-FeedSlot FeedSlots::Create(std::string_view name, std::uint64_t completed, bool if_not_exists, const FeedSlotFilters& filters) {
+FeedSlot FeedSlots::Create(std::string_view name, std::uint64_t completed, bool if_not_exists, const FeedSlotFilters& filters,
+    std::optional<std::string> owner) {
     RequireValidFeedSlotName(name);
     store_.ThrowIfDurabilityPoisoned();
     if (if_not_exists) {
@@ -335,7 +339,7 @@ FeedSlot FeedSlots::Create(std::string_view name, std::uint64_t completed, bool 
             [&](const auto& slot) { return slot.name == name; });
         if (found != records_.slots.end()) {
             if (found->filters != filters) throw FeedSlotFiltersError("feed slot filters differ from existing slot");
-            return {found->name, {records_.epoch, found->written}, records_.durable_watermark, 0U, found->lost, found->filters, found->schema_filter_lost};
+            return {found->name, {records_.epoch, found->written}, records_.durable_watermark, 0U, found->lost, found->filters, found->schema_filter_lost, found->owner};
         }
     }
     Sync(completed);
@@ -345,13 +349,13 @@ FeedSlot FeedSlots::Create(std::string_view name, std::uint64_t completed, bool 
     if (found != next.slots.end()) {
         if (if_not_exists) {
             if (found->filters != filters) throw FeedSlotFiltersError("feed slot filters differ from existing slot");
-            return {found->name, {records_.epoch, found->written}, records_.durable_watermark, 0U, found->lost, found->filters, found->schema_filter_lost};
+            return {found->name, {records_.epoch, found->written}, records_.durable_watermark, 0U, found->lost, found->filters, found->schema_filter_lost, found->owner};
         }
         throw std::invalid_argument("feed slot already exists: " + std::string(name));
     }
-    next.slots.push_back({std::string(name), completed, false, filters});
+    next.slots.push_back({std::string(name), completed, false, filters, false, owner});
     Persist(std::move(next));
-    return {std::string(name), {store_.store_id_, completed}, records_.durable_watermark, 0U, false, filters};
+    return {std::string(name), {store_.store_id_, completed}, records_.durable_watermark, 0U, false, filters, false, std::move(owner)};
 }
 void FeedSlots::Drop(std::string_view name, bool if_exists) {
     RequireValidFeedSlotName(name);
@@ -366,6 +370,17 @@ void FeedSlots::Drop(std::string_view name, bool if_exists) {
     next.slots.erase(it);
     Persist(std::move(next));
     if (pending != acknowledgements_->pending.end()) acknowledgements_->pending.erase(pending);
+}
+void FeedSlots::BindOwner(std::string_view name, const std::string& owner) {
+    RequireValidFeedSlotOwner(owner);
+    store_.ThrowIfDurabilityPoisoned();
+    std::lock_guard lock(mutex_);
+    auto next = records_;
+    const auto it = std::find_if(next.slots.begin(), next.slots.end(), [&](const auto& slot) { return slot.name == name; });
+    if (it == next.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
+    if (it->owner) return;
+    it->owner = owner;
+    Persist(std::move(next));
 }
 void FeedSlots::Advance(std::string_view name, FeedPosition position) {
     RequireValidFeedSlotName(name);
@@ -456,7 +471,7 @@ std::vector<FeedSlot> FeedSlots::List(bool include_lost) const {
     std::vector<FeedSlot> result;
     for (const auto& slot : records_.slots) {
         if (slot.lost && !include_lost) continue;
-        result.push_back({slot.name, {records_.epoch, slot.written}, records_.durable_watermark, retained[result.size()], slot.lost, slot.filters, slot.schema_filter_lost});
+        result.push_back({slot.name, {records_.epoch, slot.written}, records_.durable_watermark, retained[result.size()], slot.lost, slot.filters, slot.schema_filter_lost, slot.owner});
     }
     return result;
 }
@@ -466,7 +481,7 @@ FeedSlot FeedSlots::Get(std::string_view name) const {
     const auto it = std::find_if(records_.slots.begin(), records_.slots.end(),
         [&](const auto& slot) { return slot.name == name; });
     if (it == records_.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
-    return {it->name, {records_.epoch, it->written}, records_.durable_watermark, 0U, it->lost, it->filters, it->schema_filter_lost};
+    return {it->name, {records_.epoch, it->written}, records_.durable_watermark, 0U, it->lost, it->filters, it->schema_filter_lost, it->owner};
 }
 FeedArchiveReader FeedSlots::Reader(FeedPosition after) {
     std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);

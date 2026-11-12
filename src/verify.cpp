@@ -243,7 +243,7 @@ CheckedIndex VerifyIndex(const std::filesystem::path& root, const chunkdb::Geome
         }
         read_log(selected, large, cut, true);
     }
-    for (const auto& directory : std::filesystem::directory_iterator(root)) {
+    for (const auto& directory : chunkdb::backup_detail::DirectoryEntries(root)) {
         chunkdb::LargeChunkCoord large{};
         if (!chunkdb::ParseLargeChunkName(directory.path().filename().string(), geometry.dims(), &large)) continue;
         RequirePlain(directory.path(), true);
@@ -273,7 +273,7 @@ std::map<chunkdb::ChunkCoord, std::uint64_t> VisibilityCuts(const std::filesyste
         if (!inserted && at->second != cut)
             throw std::runtime_error("conflicting pending rollback boundaries for one chunk");
     };
-    for (const auto& file : std::filesystem::directory_iterator(directory)) {
+    for (const auto& file : chunkdb::backup_detail::DirectoryEntries(directory)) {
         const auto name = file.path().filename().string();
         if (IsTmpArtifactName(name) || file.path().extension() != ".rollback") continue;
         RequirePlain(file.path());

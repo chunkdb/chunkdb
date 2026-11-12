@@ -317,10 +317,10 @@ int main(int argc, char** argv) {
         (void)catalog.CompactTombstones("t", deleted + 1U);
         return 1;
     }
+    if (argc == 2 && std::string_view(argv[1]) == "--crash-children") { CrashRequiredResurrection(argv[0]); return 0; }
     if (argc > 1 && std::string_view(argv[1]) == "--required-replay") { RequiredResurrectionSurvivesCompaction(); return 0; }
     if (argc == 1) { CompactionReopensAndReportsHistoryFloor(); CompactionFailureFencesUntilRecovery(); }
     ResumeAllocationFailureDoesNotEscapeCleanup();
     if (argc == 1) RequiredResurrectionSurvivesCompaction();
     if (argc == 1) RepeatedCompactionRetainsCurrentState();
-    if (argc == 1) CrashRequiredResurrection(argv[0]);
 }
