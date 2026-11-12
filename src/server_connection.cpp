@@ -169,11 +169,12 @@ ChunkServer::NextRequest ChunkServer::AwaitNextRequest(WorkerWait& wait, ServerC
             if (!running_.load() || !pending_clients_.empty()) return NextRequest::kReturn;
             wait.waiting = true;
         }
-        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
-            hook->Run(FeedDeliveryTestHook::Point::kBeforeWorkerIdleWait, connection.session.connection_id);
         // A KILL published before the registration sent no wake; one after it did.
         bool ready = false;
         if (!connection.record->killed.load()) {
+            // From here on only the wake reports a yield, KILL or stop.
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeWorkerIdleWait, connection.session.connection_id);
             const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
                 connection.idle_deadline - Clock::now()).count();
             SocketInterest interest{connection.socket, POLLIN, 0};

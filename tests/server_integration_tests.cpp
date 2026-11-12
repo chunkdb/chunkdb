@@ -2313,7 +2313,16 @@ class WorkerIdleWaitHook : public chunkdb::FeedDeliveryTestHook {
   public:
     void Run(Point point, std::size_t value) override {
         std::unique_lock lock(mutex_);
-        if (point == Point::kBeforeWorkerIdleWait) ++waits_[value];
+        if (point == Point::kBeforeWorkerIdleWait) {
+            ++waits_[value];
+            if (value == hold_idle_ && !idle_held_) {
+                idle_held_ = true;
+                changed_.notify_all();
+                changed_.wait(lock, [&] { return idle_released_; });
+            }
+        }
+        if (point == Point::kAfterStatementQueued) ++queued_[value];
+        if (point == Point::kAfterRunningStopPublication) ++stop_publications_;
         if (point == Point::kBeforeWorkerClose) worker_closed_ = true;
         if (point == Point::kBeforeBufferedStatementPublication && hold_publication_ && !held_) {
             held_ = true;
@@ -2338,16 +2347,35 @@ class WorkerIdleWaitHook : public chunkdb::FeedDeliveryTestHook {
         std::unique_lock lock(mutex_);
         assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return held_; }));
     }
-    void Release() { { std::lock_guard lock(mutex_); released_ = true; } changed_.notify_all(); }
     // Closed by its worker before any client socket was shut down, if one was.
     bool ClosedBeforeShutdown() {
         std::lock_guard lock(mutex_);
         return shutdown_seen_ ? closed_before_shutdown_ : worker_closed_;
     }
+    // Holds the worker after its registration and its KILL check, just
+    // before it polls: from there only its wake reports a yield, KILL or stop.
+    void HoldIdleWait(std::uint64_t id) { std::lock_guard lock(mutex_); hold_idle_ = id; }
+    void WaitIdleHeld() { Wait([&] { return idle_held_; }); }
+    void ReleaseIdleWait() { { std::lock_guard lock(mutex_); idle_released_ = true; } changed_.notify_all(); }
+    void WaitQueued(std::uint64_t id) { Wait([&] { return queued_[id] >= 1U; }); }
+    std::size_t Queued(std::uint64_t id) { std::lock_guard lock(mutex_); return queued_[id]; }
+    // Stop and the accept loop each publish the stop and wake waiting workers.
+    void WaitStopPublished(std::size_t count) { Wait([&] { return stop_publications_ >= count; }); }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; idle_released_ = true; }
+        changed_.notify_all();
+    }
   private:
+    template <typename Predicate> void Wait(Predicate predicate) {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), predicate));
+    }
     std::mutex mutex_;
     std::condition_variable changed_;
-    std::unordered_map<std::uint64_t, std::size_t> waits_;
+    std::unordered_map<std::uint64_t, std::size_t> waits_, queued_;
+    std::uint64_t hold_idle_ = 0U;
+    std::size_t stop_publications_ = 0U;
+    bool idle_held_ = false, idle_released_ = false;
     bool worker_closed_ = false, shutdown_seen_ = false, closed_before_shutdown_ = false;
     bool hold_publication_ = false, held_ = false, released_ = false;
 };
@@ -2459,6 +2487,75 @@ void TestStopWakesWaitingWorker() {
     client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
     hook.WaitFor(id);
     harness.server->Stop();
+    harness.JoinStopped();
+    assert(hook.ClosedBeforeShutdown());
+    assert(client.WaitForClose(std::chrono::seconds(5)));
+}
+
+// A request queued while the only worker is between its registration and
+// its poll still takes that worker: the yield wake must survive until the poll.
+void TestYieldInsideIdleWaitWindow() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("yield-idle-wait-window", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient first("127.0.0.1", harness.port);
+    const auto first_id = HelloId(first);
+    RawClient second("127.0.0.1", harness.port);
+    const auto second_id = HelloId(second);
+    hook.HoldIdleWait(first_id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+    hook.WaitIdleHeld();
+    second.SendLine("PING");
+    hook.WaitQueued(second_id);
+    hook.ReleaseIdleWait();
+    assert(second.ReadLine() == "+PONG\r\n");
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+}
+
+// A KILL between the waiting worker's KILL check and its poll still closes
+// the connection at once.
+void TestKillInsideIdleWaitWindow() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("kill-idle-wait-window", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient target("127.0.0.1", harness.port);
+    const auto id = HelloId(target);
+    RawClient controller("127.0.0.1", harness.port);
+    controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    hook.HoldIdleWait(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    target.SendLine("PING"); assert(target.ReadLine() == "+PONG\r\n");
+    hook.WaitIdleHeld();
+    controller.SendLine("KILL CONNECTION " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    hook.ReleaseIdleWait();
+    assert(target.WaitForClose(std::chrono::seconds(5)));
+    controller.SendLine("PING"); assert(controller.ReadLine() == "+PONG\r\n");
+}
+
+// Stop published while the waiting worker is just before its poll still
+// returns the connection before the client sockets are shut down.
+void TestStopInsideIdleWaitWindow() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("stop-idle-wait-window", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient client("127.0.0.1", harness.port);
+    const auto id = HelloId(client);
+    hook.HoldIdleWait(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    hook.WaitIdleHeld();
+    auto stopping = std::async(std::launch::async, [&] { harness.server->Stop(); });
+    // Both stop publications precede the poll, so neither wake can stand in
+    // for the other.
+    hook.WaitStopPublished(2U);
+    hook.ReleaseIdleWait();
+    assert(stopping.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+    stopping.get();
     harness.JoinStopped();
     assert(hook.ClosedBeforeShutdown());
     assert(client.WaitForClose(std::chrono::seconds(5)));
@@ -7081,6 +7178,9 @@ int main(int argc, char** argv) {
         run("TestWaitingWorkerKeepsIdleDeadline", TestWaitingWorkerKeepsIdleDeadline);
         run("TestPartialInputLeavesWaitingWorker", TestPartialInputLeavesWaitingWorker);
         run("TestStopWakesWaitingWorker", TestStopWakesWaitingWorker);
+        run("TestYieldInsideIdleWaitWindow", TestYieldInsideIdleWaitWindow);
+        run("TestKillInsideIdleWaitWindow", TestKillInsideIdleWaitWindow);
+        run("TestStopInsideIdleWaitWindow", TestStopInsideIdleWaitWindow);
         run("TestWaitingWorkerStatementTimesOut", TestWaitingWorkerStatementTimesOut);
         run("TestRefusedDispatchWakesAfterPop", TestRefusedDispatchWakesAfterPop);
         run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);
