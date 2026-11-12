@@ -127,10 +127,12 @@ class ChunkServer {
     std::condition_variable pending_clients_cv_;
     std::vector<std::thread> workers_;
     // Under pending_clients_mutex_: workers holding no connection,
-    // waiting workers asked to return their connection, and whether a
-    // dispatch was refused since the last pop.
+    // waiting workers asked to return their connection, where the next
+    // search for one starts, and whether a dispatch was refused since the
+    // last pop.
     std::size_t free_workers_ = 0U;
     std::size_t yielding_workers_ = 0U;
+    std::size_t next_yield_ = 0U;
     bool dispatch_refused_ = false;
     // One per worker; its fields are guarded by pending_clients_mutex_.
     std::vector<std::shared_ptr<WorkerWait>> worker_waits_;
@@ -162,7 +164,7 @@ class ChunkServer {
     );
     enum class NextRequest { kRead, kReturn, kClose };
     NextRequest AwaitNextRequest(WorkerWait& wait, ServerConnection& connection);
-    void WakeWaitingWorkers();
+    void WakeWaitingWorker(const ServerConnection& connection);
     // The worker holds no connection any more: it counts for queued requests.
     void FreeWorker(WorkerWait& wait) noexcept;
     bool HandOff(const std::shared_ptr<ServerConnection>& connection);

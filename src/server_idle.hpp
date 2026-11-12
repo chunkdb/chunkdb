@@ -16,14 +16,16 @@ class StatementControl;
 struct ServerConnection;
 
 // A statement worker waiting for the next request of the idle connection it
-// just answered. Its waiting, yield and holding fields are guarded
-// by the server's pending_clients_mutex_.
+// just answered. Its waiting, yield, connection and holding fields are
+// guarded by the server's pending_clients_mutex_.
 struct WorkerWait {
     server_detail::SocketPoller poller{1U};
     // Registered: a queued request may ask this worker to yield.
     bool waiting = false;
     // Asked to return its connection to the I/O owner.
     bool yield = false;
+    // The connection it waits on, for KILL to wake only this worker.
+    const ServerConnection* connection = nullptr;
     // It holds a connection, so it is not one of the free workers.
     bool holding = false;
     // Only its worker reads or sets this: the poller failed, so this worker

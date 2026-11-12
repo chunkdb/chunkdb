@@ -164,6 +164,7 @@ ChunkServer::NextRequest ChunkServer::AwaitNextRequest(WorkerWait& wait, ServerC
                 std::lock_guard lock(server.pending_clients_mutex_);
                 if (!wait.waiting) return;
                 wait.waiting = false;
+                wait.connection = nullptr;
                 yielded = std::exchange(wait.yield, false);
                 if (yielded) --server.yielding_workers_;
             }
@@ -175,6 +176,7 @@ ChunkServer::NextRequest ChunkServer::AwaitNextRequest(WorkerWait& wait, ServerC
             if (!running_.load() || pending_clients_.size() > free_workers_ + yielding_workers_)
                 return NextRequest::kReturn;
             wait.waiting = true;
+            wait.connection = &connection;
         }
         // A KILL published before the registration sent no wake; one after it did.
         bool ready = false;
@@ -210,9 +212,10 @@ void ChunkServer::FreeWorker(WorkerWait& wait) noexcept {
     ++free_workers_;
 }
 
-void ChunkServer::WakeWaitingWorkers() {
+void ChunkServer::WakeWaitingWorker(const ServerConnection& connection) {
     std::lock_guard lock(pending_clients_mutex_);
-    for (const auto& wait : worker_waits_) if (wait->waiting) wait->poller.Wake();
+    for (const auto& wait : worker_waits_)
+        if (wait->waiting && wait->connection == &connection) wait->poller.Wake();
 }
 
 bool ChunkServer::DispatchClient(const std::shared_ptr<ServerConnection>& connection) {
@@ -235,13 +238,18 @@ bool ChunkServer::DispatchClient(const std::shared_ptr<ServerConnection>& connec
             if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kAfterStatementQueued, connection->session.connection_id);
             // A worker waiting on an idle connection returns it when no free
-            // worker or yielding one remains for this request.
+            // worker or yielding one remains for this request. The search starts
+            // after the last worker asked, so no one connection always loses its
+            // worker first.
             if (pending_clients_.size() > free_workers_ + yielding_workers_) {
-                for (const auto& wait : worker_waits_) {
-                    if (!wait->waiting || wait->yield) continue;
-                    wait->yield = true;
+                for (std::size_t k = 0U; k < worker_waits_.size(); ++k) {
+                    const auto index = (next_yield_ + k) % worker_waits_.size();
+                    auto& wait = *worker_waits_[index];
+                    if (!wait.waiting || wait.yield) continue;
+                    wait.yield = true;
                     ++yielding_workers_;
-                    wait->poller.Wake();
+                    next_yield_ = index + 1U;
+                    wait.poller.Wake();
                     break;
                 }
             }

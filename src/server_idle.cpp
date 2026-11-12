@@ -212,7 +212,7 @@ bool IdleIo::Initialize(ServerConnection& connection) {
         { std::lock_guard lock(target->record->mutex); statement = target->record->statement; }
         if (statement) (void)statement->RequestStop(StatementStopReason::kKilled);
         Wake();
-        server_.WakeWaitingWorkers();
+        server_.WakeWaitingWorker(*target);
         if (auto feed = server_.FeedIoHandle()) feed->Wake();
         return killed;
     };
