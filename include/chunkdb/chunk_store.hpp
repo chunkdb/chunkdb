@@ -215,7 +215,7 @@ struct StoreConfig {
     // When true, checkpoint compaction and cache eviction use shared workers.
     bool background_maintenance = false;
     std::size_t background_checkpoint_queue_limit = 4096;
-    std::size_t maintenance_workers = 2;
+    std::size_t maintenance_workers = 8;
 
     // Optional compression for newly written checkpoint images. Off by
     // default; images written by older versions remain readable either way.
@@ -1663,7 +1663,7 @@ class StoreResources {
   public:
     // max_open_wal_streams is lowered to fit the process file limit.
     StoreResources(std::size_t max_loaded_chunks, std::size_t max_open_wal_streams,
-                   std::size_t maintenance_workers = 2);
+                   std::size_t maintenance_workers = 8);
 
     StoreResources(const StoreResources&) = delete;
     StoreResources& operator=(const StoreResources&) = delete;

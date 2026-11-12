@@ -3,7 +3,7 @@
 Relates to #160.
 
 A data directory shares one lazily started pool through its existing `StoreResources`.
-`--maintenance-workers` selects its positive worker count, with a default of two.
+`--maintenance-workers` selects its positive worker count, with a default of eight.
 Standalone stores sharing the same resources use the same pool.
 Read-only opening starts no maintenance work.
 
@@ -56,19 +56,16 @@ A catalog test with one worker drops a table during its barrier and closes the c
 Existing checkpoint, eviction, backup, migration, feature-activation and crash suites cover the store lifecycle boundaries.
 Measurements use 1, 100 and 1,000 tables and record process threads, memory, barrier latency and write throughput on the benchmark server.
 A store regression test pauses a background checkpoint before its WAL removal and requires writes to that chunk to return, up to the hard bound, and to survive a reopen.
-The hot-path budget window is required before this change is ready for review.
 
 ## Measurements
 
-`chunkdb_maintenance_bench` with 200,000 writes, `checkpoint_update_interval` 32 and the initial barrier, so every checkpoint syncs, on an Apple M1 Pro with APFS, three runs, other load present.
-Writes per second at 100 tables: main 6,894, 7,342 and 7,370; the pool with checkpoints under the chunk lock 2,467, 4,147 and 4,038; with the file work outside the lock and two workers 6,898, 9,077 and 8,483.
-At 1,000 tables: main 7,042 and 7,515, a third run lost to a full disk; under the chunk lock 3,166 and 2,786; outside the lock 6,897, 6,848 and 8,441.
-At one table: main 7,702, under the chunk lock 6,855, outside the lock 8,708, one run each.
-Dirty FLUSH WAL p50 at 100 tables: main 863, 760 and 493 ms; under the chunk lock 589, 455 and 514; outside the lock 574, 537 and 634.
-At 1,000 tables: main 10,771 and 5,796 ms; under the chunk lock 6,673 and 5,478; outside the lock 6,948, 7,043 and 5,641.
-Four and eight workers ran 3,888 to 7,860 writes per second: more workers start checkpoints sooner, each absorbs fewer writes, and on this machine the extra syncs cost more than their overlap gained.
-The default stays at two workers.
+`chunkdb_maintenance_bench` with 200,000 writes, `checkpoint_update_interval` 32 and the initial barrier, so every checkpoint syncs; three runs of each case on a Ryzen 5 4600H with ext4 on a SATA SSD ([rows](../../bench/artifacts/manual-runs/maintenance-pool-20261112-linux-rows.txt), [conditions](../../bench/artifacts/manual-runs/maintenance-pool-20261112-linux-metadata.txt)).
+Writes per second at 100 tables: one thread per table 130,843, 131,207 and 135,005; the pool with two workers 44,922, 46,368 and 47,552; with eight workers 111,046, 116,710 and 116,894.
+At 1,000 tables: one thread per table 143,513, 148,152 and 82,565; two workers 48,518, 50,652 and 50,889; eight workers 111,105, 112,123 and 116,515.
+At one table: one thread per table 19,134, 4,795 and 5,500; two workers 32,010, 32,450 and 5,864; eight workers 28,938, 29,367 and 6,134.
+Process threads at 1,000 tables: 1,002 with one thread per table, 4 with two workers and 10 with eight; peak resident memory 51 MiB against 33 and 34 MiB.
+Dirty FLUSH WAL p50 at 1,000 tables: 1,257, 1,234 and 1,271 ms with one thread per table; 712, 707 and 705 ms with two workers; 406, 401 and 411 ms with eight.
+The paired hot-path budget of the same window met no regression criterion: relaxed medians were -1.28% to -0.24% and fsync-wal -0.10% to +1.03%.
 
-Sustained synced checkpoints are bounded by worker count divided by sync latency.
-Writes beyond what that absorbs within the hard bound wait for or run their chunk's checkpoint.
-The Linux benchmark-server rates imply about 3.7 ms per synced checkpoint, so two workers absorb about 69,000 writes per second at interval 32 and about 550,000 at the default 256.
+The default is eight workers: in this case, where every checkpoint syncs, two workers write about a third of what one thread per table writes, and eight write 78% to 89% of it with ten threads.
+Sustained synced checkpoints are bounded by worker count divided by sync latency; writes beyond what that absorbs within the hard bound wait for or run their chunk's checkpoint.
