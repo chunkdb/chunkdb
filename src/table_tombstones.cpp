@@ -82,6 +82,8 @@ std::uint64_t TableCatalog::CompactTombstones(std::string_view name, std::uint64
                     chunk->wal_path = std::move(loaded.wal_path);
                 }
                 std::unique_lock lock(chunk->mutex);
+                // Exclusive admission does not stop background checkpoints.
+                store->AwaitChunkFilesLocked(lock, *chunk);
                 if (!chunk->written) continue;
                 if (!artifact) {
                     const auto retained = store->coordinate_index_->EmptyBoundary(coord);

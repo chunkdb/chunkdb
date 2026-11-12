@@ -104,6 +104,7 @@ add_library(chunkdb_core STATIC
     src/lifecycle_log.cpp
     src/logging.cpp
     src/maintenance.cpp
+    src/maintenance_pool.cpp
     src/metrics.cpp
     src/process_lock.cpp
     src/protocol.cpp
@@ -183,6 +184,8 @@ target_link_libraries(chunkdb_bench PRIVATE chunkdb_core)
 add_executable(chunkdb_large_world_bench
     bench/large_world_bench.cpp
 )
+add_executable(chunkdb_maintenance_bench bench/maintenance_bench.cpp)
+target_link_libraries(chunkdb_maintenance_bench PRIVATE chunkdb_core)
 target_link_libraries(chunkdb_large_world_bench PRIVATE chunkdb_core)
 
 add_executable(chunkdb_compression_bench
@@ -579,6 +582,12 @@ if(CHUNKDB_BUILD_TESTS)
     )
     add_test(NAME table_catalog COMMAND chunkdb_table_catalog_test)
 
+    add_executable(chunkdb_maintenance_pool_test tests/maintenance_pool_tests.cpp)
+    target_link_libraries(chunkdb_maintenance_pool_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_maintenance_pool_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME maintenance_pool COMMAND chunkdb_maintenance_pool_test)
+    set_tests_properties(maintenance_pool PROPERTIES TIMEOUT 30)
+
     add_executable(chunkdb_chunk_vars_test tests/chunk_vars_tests.cpp)
     target_link_libraries(chunkdb_chunk_vars_test PRIVATE chunkdb_tools)
     target_include_directories(
@@ -933,6 +942,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME docs_check COMMAND chunkdb_docs_check_test ${CMAKE_CURRENT_SOURCE_DIR})
 
     set(CHUNKDB_TEST_TARGETS
+        chunkdb_maintenance_pool_test
         chunkdb_coordinate_hash_test
         chunkdb_coordinate_hash_seed_test
         chunkdb_large_chunk_cache_test

@@ -189,6 +189,8 @@ struct TableOptions {
 };
 
 class StoreResources;
+class MaintenancePool;
+class MaintenanceTask;
 
 class ChunkCacheFullError : public std::runtime_error {
   public:
@@ -223,10 +225,10 @@ struct StoreConfig {
     bool allow_multiple_processes = false;
     AccessMode access_mode = AccessMode::kReadWrite;
 
-    // When true, checkpoint compaction and cache eviction run on a dedicated
-    // maintenance thread with a bounded queue instead of on request threads.
+    // When true, checkpoint compaction and cache eviction use shared workers.
     bool background_maintenance = false;
     std::size_t background_checkpoint_queue_limit = 4096;
+    std::size_t maintenance_workers = 8;
 
     // Optional compression for newly written checkpoint images. Off by
     // default; images written by older versions remain readable either way.
@@ -239,6 +241,7 @@ struct StoreConfig {
     // process (the tables of one server). When null, the store gets budgets
     // of its own sized by max_loaded_chunks and max_open_wal_streams, which
     // are then ignored for a shared one.
+    // The maintenance worker count also belongs to the shared resources.
     std::shared_ptr<StoreResources> resources = nullptr;
     // False when the caller already holds the writer lock of the data
     // directory this store belongs to (a table of a data directory).
@@ -1008,6 +1011,13 @@ class ChunkStore {
         // when unknown.
         std::uint64_t commit_time_ms = 0;
         bool background_checkpoint_failed = false;
+        // A background checkpoint is replacing this chunk's image and WAL
+        // without holding `mutex` (CheckpointChunk). Until it ends, ordinary
+        // writes change only memory and the batch, and every other change
+        // waits (AwaitChunkFilesLocked). The counters hold what it absorbs.
+        bool checkpoint_io = false;
+        std::size_t checkpoint_io_updates = 0;
+        std::size_t checkpoint_io_wal_bytes = 0;
         // Read-only stores: the stable snapshot generation this copy was read
         // at (LoadedChunkPayload::read_only_generation).
         std::pair<std::uint64_t, std::uint64_t> read_only_generation{};
@@ -1269,12 +1279,14 @@ class ChunkStore {
     bool background_maintenance_ = false;
     std::size_t background_checkpoint_queue_limit_ = 4096;
     mutable std::mutex maintenance_mutex_;
-    std::condition_variable maintenance_cv_;
     std::vector<ChunkCoord> maintenance_checkpoint_queue_;
-    std::unordered_set<std::string> maintenance_checkpoint_queued_keys_;
+    std::unordered_set<ChunkCoord, ChunkCoordHash> maintenance_checkpoint_queued_keys_;
     bool maintenance_eviction_requested_ = false;
     bool maintenance_stop_ = false;
-    std::thread maintenance_thread_;
+    std::shared_ptr<MaintenancePool> maintenance_pool_;
+    std::shared_ptr<MaintenanceTask> maintenance_task_;
+    // Notified when a background checkpoint stops owning a chunk's files.
+    std::condition_variable_any checkpoint_io_cv_;
 
     mutable std::mutex wal_parent_cache_mutex_;
     std::condition_variable wal_parent_cache_cv_;
@@ -1513,9 +1525,16 @@ class ChunkStore {
 
     void StartMaintenanceThread();
     void StopMaintenanceThread() noexcept;
-    void MaintenanceLoop();
+    bool MaintenanceStep();
     [[nodiscard]] bool EnqueueBackgroundCheckpoint(const ChunkCoord& chunk_coord);
     void RunBackgroundCheckpoint(const ChunkCoord& chunk_coord) noexcept;
+    // Waits, releasing `lock`, while a background checkpoint owns the
+    // chunk's files.
+    void AwaitChunkFilesLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk);
+    // Waits only while an ordinary write would also pass the hard bound of
+    // deferred checkpoints (MaybeCheckpointChunk).
+    void AwaitChunkBacklogLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk);
+    [[nodiscard]] bool CheckpointHardBoundReached(std::size_t updates, std::size_t wal_bytes) const noexcept;
     // Before a synced checkpoint publishes an image into `directory`. A
     // chunk directory this store has not prepared itself may have been made
     // by a preparation that failed before its parent was synced, here or in
@@ -1761,10 +1780,14 @@ class ChunkStore {
     // reflects the checkpoint's target state, so a caller whose atomicity
     // depends on the image can distinguish a pre-replace failure (nothing
     // committed, safe to roll back) from a post-replace durability failure.
+    // Given `release`, the chunk's lock, a relaxed checkpoint of a populated
+    // chunk without a feed archive writes and syncs the files with it
+    // unlocked (RegularChunk::checkpoint_io) and returns with it locked.
     bool CheckpointChunk(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
-        bool* out_image_committed = nullptr);
+        bool* out_image_committed = nullptr,
+        std::unique_lock<RegularChunkMutex>* release = nullptr);
 
     void AcquireProcessLock(bool allow_multiple_processes);
     void ReleaseProcessLock() noexcept;
@@ -1784,7 +1807,8 @@ class ChunkStore {
 class StoreResources {
   public:
     // max_open_wal_streams is lowered to fit the process file limit.
-    StoreResources(std::size_t max_loaded_chunks, std::size_t max_open_wal_streams);
+    StoreResources(std::size_t max_loaded_chunks, std::size_t max_open_wal_streams,
+                   std::size_t maintenance_workers = 8);
 
     StoreResources(const StoreResources&) = delete;
     StoreResources& operator=(const StoreResources&) = delete;
@@ -1811,6 +1835,11 @@ class StoreResources {
     friend class ChunkStore;
     friend class Table;
     friend class TableCatalog;
+
+    [[nodiscard]] std::shared_ptr<MaintenancePool> MaintenanceWorkers();
+    const std::size_t maintenance_workers_;
+    std::mutex maintenance_pool_mutex_;
+    std::shared_ptr<MaintenancePool> maintenance_pool_;
 
     struct WalStreamState {
         std::weak_ptr<ChunkStore::RegularChunk> chunk;

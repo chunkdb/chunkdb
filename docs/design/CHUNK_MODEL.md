@@ -81,6 +81,7 @@ A committed empty identity remains an in-memory scan deletion while its image or
 A scan captures a coordinate page before acquiring any chunk locks.
 Publication takes the chunk lock before its short membership lock and releases membership before I/O.
 Checkpoint, backup and compaction retain the existing maintenance admission order.
+A relaxed background checkpoint may write a populated chunk's image and remove its WAL without the chunk lock ([maintenance pool](MAINTENANCE_POOL.md#checkpoint-file-work)); collection never does, and compaction's checkpoints and every SET CHUNK form wait for it.
 
 Each large directory with retained index decisions has a checked streaming `CKIX` log of live hints, deleted tombstones and explicit forget records.
 The inventory lists these logs rather than every directory containing a live image or WAL; recovery discovers live artifacts once and builds the ordered in-memory candidate index.

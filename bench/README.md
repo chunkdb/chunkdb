@@ -21,3 +21,20 @@ Takeover adds `report_only`, `ownership_cycles`, `ownership_cycles_s`, `latency_
 Compare matching workload settings and retain absolute requests/s, blocks/s and p50/p99 with the run count and configuration.
 
 See [artifact formats](artifacts/README.md) for stored results.
+
+## Shared maintenance
+
+`chunkdb_maintenance_bench --data-dir NEW_PATH` runs separate 1, 100 and 1,000 table cases with background maintenance enabled.
+`--tables N` selects one case, `--requests N` sets its write count, and `--maintenance-workers N` sets the shared pool size.
+`--flushes N` sets the number of timed barriers after one write to every table and of timed barriers with nothing to sync.
+`--background-maintenance off` measures the default server configuration, where only barriers use the pool.
+The defaults are 200,000 writes, 20 flushes and two workers.
+Run measurements on the benchmark server through its `measure.sh` wrapper, one `--tables` case per process so memory figures are not shared between cases.
+The executable creates only a new data-directory path and leaves its data for inspection.
+
+Each JSON row records the request count, write duration, writes per second and the duration in milliseconds of the first catalog WAL barrier after the write window.
+`write_checkpoints` counts the checkpoints finished in the write window, and `write_inline_checkpoints` those not run on a maintenance worker.
+It also records p50, p99 and maximum milliseconds of the dirty and idle barriers.
+Linux rows also report process threads and resident bytes after the write window, and threads and peak resident bytes after the barriers; other platforms report `null` for those counters.
+Table creation, initial population and the initial barrier are outside the measured windows.
+The same driver can compile against baseline public headers; `maintenance_workers: 0` identifies the earlier per-table scheduling model.

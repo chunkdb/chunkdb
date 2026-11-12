@@ -7,6 +7,7 @@
 #include <string>
 
 #include "chunk_store_internal.hpp"
+#include "maintenance_pool.hpp"
 #include "chunkdb/logging.hpp"
 #include "eviction.hpp"
 
@@ -18,10 +19,12 @@
 
 namespace chunkdb {
 
-StoreResources::StoreResources(std::size_t max_loaded_chunks, std::size_t max_open_wal_streams)
-    : max_loaded_chunks_(max_loaded_chunks),
+StoreResources::StoreResources(std::size_t max_loaded_chunks, std::size_t max_open_wal_streams,
+                               std::size_t maintenance_workers)
+    : maintenance_workers_(maintenance_workers), max_loaded_chunks_(max_loaded_chunks),
       max_large_chunks_(0U),
       max_open_wal_streams_(max_open_wal_streams) {
+    if (maintenance_workers_ == 0U) throw std::invalid_argument("maintenance_workers must be positive");
     if (max_loaded_chunks_ == 0) {
         throw std::invalid_argument("max_loaded_chunks must be > 0");
     }
@@ -94,6 +97,12 @@ StoreResources::StoreResources(std::size_t max_loaded_chunks, std::size_t max_op
     }
 #endif
 
+}
+
+std::shared_ptr<MaintenancePool> StoreResources::MaintenanceWorkers() {
+    std::lock_guard lock(maintenance_pool_mutex_);
+    if (!maintenance_pool_) maintenance_pool_ = std::make_shared<MaintenancePool>(maintenance_workers_);
+    return maintenance_pool_;
 }
 
 ChunkStore::LargeChunkReservation::LargeChunkReservation(std::shared_ptr<StoreResources> owner)

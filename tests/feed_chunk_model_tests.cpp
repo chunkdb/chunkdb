@@ -1,4 +1,7 @@
 #include <cassert>
+#include <chrono>
+#include <future>
+#include <optional>
 
 #include "chunkdb/engine.hpp"
 #include "feed_archive.hpp"
@@ -356,6 +359,69 @@ void ScanCutContinuesFirstWatch() {
     }
 }
 }
+// While a background checkpoint writes a chunk's files without its lock, a
+// chunk-form subscriber receives an ordinary write, and a metadata SET CHUNK
+// waits for the checkpoint. Creating a slot also waits for it; the archive
+// then records later changes over a base holding every earlier write.
+void BackgroundCheckpointFilesKeepFeedsAndSlots() {
+    test::ScopedTempDir directory("chunkdb-feed-checkpoint-files");
+    auto config = feed_test::Config(directory.path());
+    config.background_maintenance = true;
+    config.default_options.checkpoint_update_interval = 1U;
+    config.slot_sync_interval = std::chrono::hours(1);
+    std::optional<FeedSlot> slot;
+    {
+        TableCatalog catalog(config);
+        const auto table = Create(catalog);
+        auto chunks = table->SubscribeFeed(FeedOptions{.chunks = true});
+        ChunkStore* store = nullptr;
+        const auto paused = [&](std::string_view bits, std::uint64_t owner) {
+            auto lease = table->Acquire();
+            store = &lease->store();
+            store->WalBarrier();
+            store->ArmCheckpointBeforeWalRemovalPauseForTests();
+            store->SetBlockBits(0, 0, bits);
+            assert(store->WaitForCheckpointBeforeWalRemovalForTests());
+            CheckedForm(*table, *feed_test::Next(*chunks), owner);
+        };
+        paused("10000000", 0U);
+        {
+            auto lease = table->Acquire();
+            lease->store().SetBlockBits(1, 0, "01000000");
+        }
+        CheckedForm(*table, *feed_test::Next(*chunks), 0U);
+        auto metadata = std::async(std::launch::async, [&] { return Metadata(*table, {0, 0}, 5U); });
+        bool waited = metadata.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready;
+        store->ResumeCheckpointBeforeWalRemovalForTests();
+        assert(metadata.get() != 0U && waited);
+        CheckedForm(*table, *feed_test::Next(*chunks), 5U);
+
+        paused("11000000", 5U);
+        auto created = std::async(std::launch::async, [&] { return table->CreateFeedSlot("consumer"); });
+        waited = created.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready;
+        store->ResumeCheckpointBeforeWalRemovalForTests();
+        slot = created.get();
+        assert(waited);
+        const auto next = Metadata(*table, {0, 0}, 6U);
+        {
+            auto lease = table->Acquire();
+            lease->store().CheckpointForTests(0, 0);
+        }
+        FeedSlotTestAccess::Sync(*table);
+        auto reader = table->ReadFeedArchive(slot->position);
+        const auto change = reader.Next();
+        assert(change && change->position.revision == next && change->chunk_changes.size() == 1U);
+        Row(change->chunk_changes[0].before, 5U);
+        Row(change->chunk_changes[0].after, 6U);
+        assert(!reader.Next());
+    }
+    config.background_maintenance = false;
+    TableCatalog reopened(config);
+    auto lease = reopened.Require("t")->Acquire();
+    assert(lease->store().GetBlockBits(0, 0) == "11000000" && lease->store().GetBlockBits(1, 0) == "01000000");
+    const auto state = lease->store().ReadChunkState(0, 0);
+    Row(DecodeChunkColumns(lease->store().geometry().chunk_schema(), state.chunk_columns->bytes), 6U);
+}
 int main(int argc, char** argv) {
     if (argc > 1) {
         if (std::string_view(argv[1]) == "--archive-budget") {
@@ -374,4 +440,5 @@ int main(int argc, char** argv) {
     MinimumEncodedBytesStayBelowTheFrame();
     ArchiveFilterMatchesTheWatchFilter();
     ScanCutContinuesFirstWatch();
+    BackgroundCheckpointFilesKeepFeedsAndSlots();
 }

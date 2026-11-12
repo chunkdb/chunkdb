@@ -564,6 +564,7 @@ bool FeedSlots::SyncImpl(std::uint64_t completed) {
         }
         for (const auto& [coord, chunk] : chunks) {
             std::unique_lock lock(chunk->mutex);
+            store_.AwaitChunkFilesLocked(lock, *chunk);
             store_.FlushWalBatch(coord, chunk, false);
         }
     }
