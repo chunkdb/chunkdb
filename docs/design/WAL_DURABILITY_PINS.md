@@ -3,6 +3,7 @@
 This component supports exact-generation settlement in [#136](https://github.com/chunkdb/chunkdb/issues/136) and the [group recovery owner](COMMIT_GROUP_RECOVERY.md).
 It adds `WalAppendStream::FlushAndPin()` and a movable, noncopyable `WalDurabilityPin` without changing stream fields, ordinary opens, ordinary writes, ordinary flushes or stream counters.
 The caller owns exclusive access to the stream during pin creation and remains responsible for staged mutation vectors, WAL framing and parent-directory durability.
+A chunk's stream is closed while a background checkpoint owns the chunk's files; the caller waits for that checkpoint mark under the chunk lock before it opens or pins the stream ([checkpoint file work](MAINTENANCE_POOL.md#checkpoint-file-work)).
 It must already admit the original handle's owning WAL context and namespace, and reserve and account for required pins before mutation.
 
 The factory first refuses a closed or failed stream without clearing its existing error.

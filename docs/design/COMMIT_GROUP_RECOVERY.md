@@ -109,6 +109,7 @@ Their publication certifies only the explicitly bound metadata or member proofs 
 A changed member's rollback anchor is the decision's earlier durable image, retained-empty identity or never-written state.
 The live group owner pins that exact image or retained record and its original WAL generation before appending any grouped member.
 A pin prevents checkpoint replacement, retained-record compaction, truncation or unlink from removing a required anchor or member extent.
+A relaxed background checkpoint replaces a chunk's image and removes its WAL without the chunk lock while the chunk's checkpoint mark is set ([checkpoint file work](MAINTENANCE_POOL.md#checkpoint-file-work)); the owner waits for that mark under the chunk lock before it selects an anchor, pins a WAL generation or appends a grouped member, so the held chunk lock then excludes checkpoint replacement.
 It does not claim that the original volatile WAL end is durable.
 Existing durable images and retained records need no new pre-group WAL sync, and never-written anchors create no synthetic identity.
 
