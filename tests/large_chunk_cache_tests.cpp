@@ -232,6 +232,112 @@ void CompactionAtCapacity() {
     assert(lease->store().CompletedRevision() == completed);
 }
 
+// A background checkpoint in its unlocked window holds its chunk, so that
+// chunk and its container stay cached. With every container credit held,
+// writes to that chunk are hits and go on, a new miss is refused at once
+// without waiting for the files, and tombstone compaction prepares cold
+// chunks off-cache and waits for the window before it checkpoints the
+// cached chunk.
+void CheckpointWindowAtCapacity() {
+#ifndef _WIN32
+    // On Windows the barrier holds the publish lock through its syncs, so no
+    // checkpoint publishes inside them.
+    test::ScopedTempDir temporary("large-container-checkpoint-window");
+    CatalogConfig config;
+    config.data_dir = temporary.path();
+    config.max_loaded_chunks = 1U;
+    config.background_maintenance = false;
+    config.default_options.durability_mode = DurabilityMode::kRelaxed;
+    config.default_options.checkpoint_update_interval = 1U;
+    GeometryConfig geometry;
+    geometry.large_chunk_width_chunks = 1U;
+    geometry.large_chunk_height_chunks = 1U;
+    geometry.chunk_width_blocks = 1U;
+    geometry.chunk_height_blocks = 1U;
+    geometry.block_bits = 8U;
+    std::uint64_t deleted = 0U;
+    {
+        TableCatalog catalog(config);
+        for (const auto name : {"t", "a", "b"}) (void)catalog.Create(name, geometry, catalog.default_options());
+        auto lease = catalog.Require("t")->Acquire();
+        auto& store = lease->store();
+        store.SetBlockBits(0, 0, "10000000");
+        store.UnsetBlock(0, 0);
+        deleted = store.GetChunkVersion(0, 0);
+        store.CheckpointForTests(0, 0);
+        assert(store.RetainedTombstoneCount() == 1U);
+        store.SetBlockBits(1, 0, "00000010");
+        store.SetBlockBits(2, 0, "00000001");
+    }
+    config.background_maintenance = true;
+    {
+        TableCatalog catalog(config);
+        const auto resources = catalog.resources();
+        ChunkStore* store = nullptr;
+        {
+            auto lease = catalog.Require("t")->Acquire();
+            store = &lease->store();
+            (void)store->GetChunkVersion(1, 0);
+        }
+        assert(resources->LargeChunkCount() == 1U);
+        auto a = catalog.Require("a")->Acquire(), b = catalog.Require("b")->Acquire();
+        PausedRead first(a->store(), CachePausePoint::kLargeChunkAfterReservation); first.Wait();
+        PausedRead second(b->store(), CachePausePoint::kLargeChunkAfterReservation); second.Wait();
+        ReleaseReads release{{&first, &second, &second}};
+        assert(resources->LargeChunkCount() == resources->max_large_chunks());
+
+        store->ArmCheckpointBeforeWalRemovalPauseForTests();
+        store->SetBlockBits(1, 0, "00000100");
+        assert(store->WaitForCheckpointBeforeWalRemovalForTests());
+        auto hit = std::async(std::launch::async, [&] { store->SetBlockBits(1, 0, "00001000"); });
+        const bool hit_returned = hit.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        const auto before = store->CompletedRevision();
+        auto miss = std::async(std::launch::async, [&] {
+            try { store->SetBlockBits(3, 0, "00000001"); }
+            catch (const ChunkCacheFullError&) { return true; }
+            return false;
+        });
+        const bool miss_returned = miss.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        store->ResumeCheckpointBeforeWalRemovalForTests();
+        hit.get();
+        assert(hit_returned && miss_returned && miss.get());
+        assert(store->CompletedRevision() == before && resources->LargeChunkRefusals() == 1U);
+        assert(!std::filesystem::exists(ChunkWalPath(store->data_dir(), store->geometry(), {3, 0})));
+        // Absorb the hit's pending update, so the write below only makes a
+        // checkpoint due for a worker.
+        store->CheckpointForTests(1, 0);
+
+        store->ArmBarrierBeforeSyncPauseForTests();
+        auto compaction = std::async(std::launch::async, [&] { return catalog.CompactTombstones("t", deleted + 1U); });
+        assert(store->WaitForBarrierBeforeSyncForTests());
+        // Compaction flushed every chunk and holds the table exclusively. It
+        // reaches the cached chunk before the cold one, whose checkpoint
+        // would wait for the publish lock the window holds.
+        store->ArmCheckpointBeforeWalRemovalPauseForTests();
+        store->SetBlockBits(1, 0, "00010000");
+        assert(store->WaitForCheckpointBeforeWalRemovalForTests());
+        store->ResumeBarrierBeforeSyncForTests();
+        const bool waited = compaction.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready;
+        store->ResumeCheckpointBeforeWalRemovalForTests();
+        assert(compaction.get() == deleted);
+        assert(waited && resources->LargeChunkRefusals() == 1U);
+        assert(resources->LargeChunkCount() <= resources->max_large_chunks());
+        first.Release(); second.Release();
+        assert(!first.Get().written && !second.Get().written);
+        auto lease = catalog.Require("t")->Acquire();
+        assert(lease->store().GetBlockBits(1, 0) == "00010000");
+        lease->store().WalBarrier();
+    }
+    config.background_maintenance = false;
+    TableCatalog reopened(config);
+    auto lease = reopened.Require("t")->Acquire();
+    auto& store = lease->store();
+    assert(store.GetBlockBits(1, 0) == "00010000" && store.GetBlockBits(2, 0) == "00000001");
+    assert(!store.ReadChunkState(0, 0).written && !store.ReadChunkState(3, 0).written);
+    assert(store.RetainedTombstoneCount() == 0U && store.RetainedDeletionFloor() == deleted);
+#endif
+}
+
 void DropReleasesOwnership() {
     test::ScopedTempDir temporary("large-container-drop");
     CatalogConfig config;
@@ -253,5 +359,6 @@ int main() {
     RetiredOwnerKeepsCredit();
     AllocationRollback();
     CompactionAtCapacity();
+    CheckpointWindowAtCapacity();
     DropReleasesOwnership();
 }
