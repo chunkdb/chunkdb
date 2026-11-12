@@ -162,7 +162,7 @@ void ImageAndWalRuntimeReaders() {
 void EarlierManifestLeavesDirectoryUntouched() {
     test::ScopedTempDir directory("chunkdb-earlier-manifest");
     const auto geometry = Shape(2);
-    auto bytes = SerializeStoreManifest(StoreManifest{.geometry = geometry.config(), .store_id = kEpoch, .options = {},
+    auto bytes = SerializeStoreManifest(StoreManifest{.features = kFeatures, .geometry = geometry.config(), .store_id = kEpoch, .options = {},
         .schema = geometry.layout().schema()});
     At(&bytes, 4U, 4U, 2U);
     Save(StoreManifestPath(directory.path()), bytes);

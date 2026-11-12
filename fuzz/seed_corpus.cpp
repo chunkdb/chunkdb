@@ -70,9 +70,12 @@ int main(int argc, char** argv) {
     const auto& geometry = fuzz::Model(1U);
     StoreManifest manifest{kKnownFeatures, geometry.config(), fuzz::kId,
         EncodeTableOptions(TableOptions{}), geometry.layout().schema()};
+    // The commit_groups bit in kKnownFeatures requires the owner scope it binds.
+    const CommitOwnerScope owner{fuzz::kId, {17U}, CommitOwnerRole::kCatalog};
+    manifest.commit_owner = owner;
     const auto before = SerializeStoreManifest(manifest);
     Fixture("manifest", "table", before);
-    Fixture("manifest", "directory", SerializeDataDirManifest({kKnownFeatures, fuzz::kId, {}}));
+    Fixture("manifest", "directory", SerializeDataDirManifest({kKnownFeatures, fuzz::kId, {}, owner}));
     Fixture("slots", "active-lost", SerializeFeedSlotRecords(
         {fuzz::kId, 987U, {{"consumer_1", 123U, false}, {"lost", 456U, true}}}));
     Fixture("slots", "owned-filtered", SerializeFeedSlotRecords({fuzz::kId, 987U,
