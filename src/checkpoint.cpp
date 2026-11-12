@@ -257,6 +257,8 @@ bool ChunkStore::CheckpointChunk(
                 coordinate_index_->PublishTombstone({.kind = ChunkIndexKind::kDeleted, .coord = chunk_coord,
                     .revision = chunk->version, .commit_time_ms = chunk->commit_time_ms,
                     .schema_version = geometry_.chunk_schema().version});
+                // The tombstone is durable; the image and WAL still hold the same empty state.
+                if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_EMPTY_GC_AFTER_TOMBSTONE_ONCE")) std::_Exit(86);
             }
             // Empty-chunk garbage collection: a chunk with no present blocks
             // is observably identical to an absent chunk, so its storage

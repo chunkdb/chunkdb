@@ -364,6 +364,9 @@ if(CHUNKDB_BUILD_TESTS)
         set_tests_properties(${format} PROPERTIES TIMEOUT 60 LABELS "smoke")
     endforeach()
 
+    # Its crash children verify the recovered directory.
+    target_link_libraries(chunkdb_table_tombstones_test PRIVATE chunkdb_tools)
+
     # Crash children of the coordinate index and tombstone compaction run in the crash label.
     add_test(NAME chunk_coordinate_index_crash COMMAND chunkdb_chunk_coordinate_index_test --crash-boundaries)
     add_test(NAME table_tombstones_crash COMMAND chunkdb_table_tombstones_test --crash-children)
