@@ -184,7 +184,7 @@ void TestNewStoreRecordsGeometryAndId() {
     std::vector<std::string_view> enabled;
     for (const auto& feature : chunkdb::kFeatureRegistry)
         if ((manifest.features.incompat & feature.incompat) != 0U) enabled.push_back(feature.name);
-    assert(enabled == (std::vector<std::string_view>{"feed_slots", "table_lineage", "slot_filters", "chunk_model", "commit_groups"}));
+    assert(enabled == (std::vector<std::string_view>{"feed_slots", "table_lineage", "slot_filters", "chunk_model"}));
     // Every option is recorded, as the store was opened with it.
     const auto config = Config(data_dir, geometry);
     assert(manifest.options == chunkdb::EncodeTableOptions(chunkdb::TableOptions{
@@ -1024,7 +1024,7 @@ void TestNamedFeatureRegistry() {
     const chunkdb::FeatureFlags future{.incompat = bits | (1U << 30U), .ro_compat = 3, .compat = 7};
     const auto table = chunkdb::TableScopedFeatures(future);
     assert(table.incompat == chunkdb::kTableBaselineFeatures.incompat);
-    assert(table.incompat == 109U);
+    assert(table.incompat == 45U);
     assert(table.ro_compat == 0U && table.compat == 0U);
     assert(chunkdb::UnknownFeatures(future).incompat == (1U << 30U));
 }
