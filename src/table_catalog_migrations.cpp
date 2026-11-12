@@ -14,6 +14,7 @@
 #include "feed_slots.hpp"
 #include "slot_watch.hpp"
 #include "user_registry.hpp"
+#include "chunk_coordinate_index.hpp"
 
 namespace chunkdb {
 namespace {
@@ -27,8 +28,11 @@ void CrashAtFailpoint(const char* key) {
     if (ConsumeFailpointEnv(key)) std::_Exit(86);
 }
 
-FeedSlotFilters MigrationSlotFilters(const MigrationRequest& request, const TableSchema& schema) {
+FeedSlotFilters MigrationSlotFilters(const MigrationRequest& request, const Geometry& geometry) {
     auto filters = request.slot_filters;
+    if (filters.area && filters.area->dims != geometry.dims())
+        throw std::invalid_argument("coordinate dimensions differ from the table");
+    const auto& schema = geometry.layout().schema();
     if (request.slot_columns) {
         filters.column_ids.emplace();
         for (const auto& name : *request.slot_columns) {
@@ -152,7 +156,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     auto lease = table->Acquire();
                     if (!lease) throw TableNotFoundError("table '" + request.table + "' was dropped");
                     lease->store().ThrowIfDurabilityPoisoned();
-                    no_op = !request.columns_if_needed(table->Info().schema);
+                    const auto info = table->Info();
+                    no_op = !request.columns_if_needed(request.chunk_column ? info.chunk_schema : info.schema);
                 }
                 if ((request.kind == MigrationRequest::Kind::kCreateSlot && request.if_not_exists) ||
                     (request.kind == MigrationRequest::Kind::kDropSlot && request.if_exists)) {
@@ -165,7 +170,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     const auto existing = std::find_if(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == request.slot; });
                     const bool exists = existing != slots.end();
                     if (request.kind == MigrationRequest::Kind::kCreateSlot && exists &&
-                        existing->filters != MigrationSlotFilters(request, lease->store().geometry().layout().schema()))
+                        existing->filters != MigrationSlotFilters(request, lease->store().geometry()))
                         throw FeedSlotFiltersError("feed slot filters differ from existing slot");
                     if (request.kind == MigrationRequest::Kind::kCreateSlot && exists && request.slot_owner_given &&
                         existing->owner != request.slot_owner)
@@ -254,7 +259,9 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             RequireValidTableName(request.table);
             RequireValidTableOptions(definition.options);
             if (const auto reason = UnsupportedSchemaReason(definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits))); !reason.empty()) throw std::invalid_argument(reason);
-            (void)Geometry(definition.geometry, definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits)));
+            const auto block_schema = definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits));
+            const auto geometry = definition.chunk_schema ? Geometry(definition.geometry, block_schema, *definition.chunk_schema)
+                                                         : Geometry(definition.geometry, block_schema);
             if (Find(request.table)) throw TableExistsError("table '" + request.table + "' already exists");
             journal.directory_action = MigrationDirectoryAction::kCreate;
             journal.operation_name = OperationName(request.table);
@@ -264,11 +271,16 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             if (!CreateOwnerOnlyDirectory(staging)) throw std::runtime_error("migration stage already exists");
             staging_owned = true;
             StoreManifest manifest{.features = TableScopedFeatures(root->features), .geometry = definition.geometry, .store_id = journal.table_id,
-                                   .options = EncodeTableOptions(definition.options), .schema = definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits))};
+                                   .options = EncodeTableOptions(definition.options), .schema = block_schema,
+                                   .chunk_schema = geometry.chunk_schema()};
+            if (!ChunkCoordinateIndex::InitializeEmpty(staging, geometry, journal.table_id))
+                throw std::runtime_error("coordinate inventory appeared in migration staging");
             const auto bytes = SerializeStoreManifest(manifest);
             if (!PublishNewFile(StoreManifestPath(staging), bytes)) throw std::runtime_error("migration stage manifest already exists");
             SyncDirectoryPath(StagingDir());
             journal.files.push_back({"tables/" + request.table + "/" + std::string(kStoreManifestFileName), std::nullopt, bytes});
+            journal.files.push_back({"tables/" + request.table + "/" + std::string(kChunkIndexFileName),
+                std::nullopt, LoadFile(staging / kChunkIndexFileName)});
             next_options = definition.options;
         } else if (request.kind != MigrationRequest::Kind::kGrant) {
             store->ThrowIfDurabilityPoisoned();
@@ -287,6 +299,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 add_file(std::string(kDataDirManifestFileName), SerializeDataDirManifest(floor));
             } else if (request.kind == MigrationRequest::Kind::kAlter) {
                 const auto previous_schema = manifest->schema;
+                const auto previous_chunk_schema = *manifest->chunk_schema;
                 if (request.narrowing) {
                     const auto& [column_name, type] = *request.narrowing;
                     if (narrowing_recorded) {
@@ -303,10 +316,20 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                         manifest->schema = ChangeColumnType(manifest->schema, column_name, type, Conversion::kExact);
                     }
                 } else request.alter(*manifest);
+                AlignManifestSchemaDomains(&*manifest, previous_schema, previous_chunk_schema);
                 RequireCompatibleColumnAdditions(previous_schema, manifest->schema, *store);
+                for (const auto& column : manifest->chunk_schema->columns) {
+                    if (!column.required || column.has_default ||
+                        std::any_of(previous_chunk_schema.columns.begin(), previous_chunk_schema.columns.end(),
+                            [&](const auto& old) { return old.id == column.id; })) continue;
+                    if (store->HasWrittenChunkIdentities())
+                        throw std::invalid_argument("chunk column " + column.name +
+                            ": a REQUIRED column added to a table needs a DEFAULT for its written chunk identities");
+                    break;
+                }
                 if (const auto reason = UnsupportedSchemaReason(manifest->schema); !reason.empty()) throw std::invalid_argument(reason);
                 manifest->geometry.block_bits = FixedBitsPerBlock(manifest->schema);
-                (void)Geometry(manifest->geometry, manifest->schema);
+                (void)Geometry(manifest->geometry, manifest->schema, *manifest->chunk_schema);
                 next_options = DecodeTableOptions(manifest->options);
                 RequireValidTableOptions(next_options);
                 add_file("tables/" + request.table + "/" + std::string(kStoreManifestFileName), SerializeStoreManifest(*manifest));
@@ -314,20 +337,24 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 RequireValidFeedSlotName(request.slot);
                 if (store->allow_multiple_processes_) throw std::invalid_argument("feed slots require a single-process table");
                 std::unique_lock eviction(store->resources_->stores_mutex_);
-                auto slots = ReadFeedSlotRecords(table->dir_, journal.table_id).value_or(FeedSlotRecords{journal.table_id, 0U, {}});
+                const auto dims = store->geometry().dims();
+                auto slots = ReadFeedSlotRecords(table->dir_, journal.table_id, dims).value_or(
+                    FeedSlotRecords{.epoch = journal.table_id, .durable_watermark = 0U, .slots = {}, .dims = dims});
                 const auto at = std::find_if(slots.slots.begin(), slots.slots.end(), [&](const auto& slot) { return slot.name == request.slot; });
                 if (request.kind == MigrationRequest::Kind::kCreateSlot) {
                     if (at != slots.slots.end()) throw std::invalid_argument("feed slot already exists: " + request.slot);
-                    const auto filters = MigrationSlotFilters(request, store->geometry().layout().schema());
+                    const auto filters = MigrationSlotFilters(request, store->geometry());
                     // Validate every field before syncing a baseline or preparing publication.
                     if (request.slot_owner) RequireValidFeedSlotOwner(*request.slot_owner);
-                    (void)SerializeFeedSlotRecords(FeedSlotRecords{journal.table_id, 0U, {{request.slot, 0U, false, filters, false, request.slot_owner}}});
+                    (void)SerializeFeedSlotRecords(FeedSlotRecords{.epoch = journal.table_id, .durable_watermark = 0U,
+                        .slots = {{request.slot, 0U, false, filters, false, request.slot_owner}}, .dims = dims});
                     RequireFeature(store->features(), *FindFeature("feed_slots"));
                     if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
                     table->PrepareFeedSlotBaseline(*store);
                     const auto completed = store->version_clock_.load(std::memory_order_seq_cst) - 1U;
                     store->feed_slots_->Sync(completed);
-                    slots = ReadFeedSlotRecords(table->dir_, journal.table_id).value_or(FeedSlotRecords{journal.table_id, completed, {}});
+                    slots = ReadFeedSlotRecords(table->dir_, journal.table_id, dims).value_or(
+                        FeedSlotRecords{.epoch = journal.table_id, .durable_watermark = completed, .slots = {}, .dims = dims});
                     slots.slots.push_back({request.slot, completed, false, filters, false, request.slot_owner});
                     slots.filter_format = slots.filter_format || !filters.empty();
                     // The unchanged manifest image binds redo to the participant

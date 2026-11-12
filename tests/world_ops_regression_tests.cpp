@@ -349,7 +349,7 @@ void TestVersionMonotonicAcrossManyReloads() {
 
 // A pre-2.0 artifact inside a store can only be damage or a copied file: the
 // engine reads only the current format and fails the load instead of
-// interpreting it (the offline converter reads old formats).
+// interpreting it.
 void TestPre20ArtifactsAreRejected() {
     chunkdb::test::ScopedTempDir dir("chunkdb-reg-pre20-image");
     auto config = BaseConfig(dir.path());
@@ -365,14 +365,16 @@ void TestPre20ArtifactsAreRejected() {
     const std::string pre20_magic = "CHKDATA1";  // images of 1.x and 2.0 development builds
     std::copy(pre20_magic.begin(), pre20_magic.end(), image.begin());
     WriteFileBytes(image_path, image);
+    const auto clock_before = ReadFileBytes(dir.path() / "chunkdb.version");
     bool rejected = false;
     try {
         chunkdb::ChunkStore store(config);
         (void)store.GetBlockBits(0, 0);
     } catch (const std::exception& e) {
-        rejected = std::string(e.what()).find("not a 2.0 chunk image") != std::string::npos;
+        rejected = std::string(e.what()).find("chunk file header magic mismatch") != std::string::npos;
     }
     assert(rejected);
+    assert(ReadFileBytes(image_path) == image && ReadFileBytes(dir.path() / "chunkdb.version") == clock_before);
 
     // The 8-byte clock ceiling of development builds before the checked record.
     chunkdb::test::ScopedTempDir clock_dir("chunkdb-reg-pre20-clock");
@@ -488,6 +490,11 @@ void TestStartupInventoryErrorRefusesWithoutPublication() {
     assert(std::filesystem::remove(dir.path() / ".chunkdb.initialized"));
     bool refused = false;
     try { chunkdb::ChunkStore writer(config); }
+    catch (const std::filesystem::filesystem_error& error) {
+        // Complete coordinate admission now detects this unavailable shard
+        // before revision bookkeeping can publish a replacement clock.
+        refused = error.code() == std::errc::permission_denied;
+    }
     catch (const std::runtime_error& error) {
         const std::string message = error.what();
         refused = message.find("startup inventory is unavailable") != std::string::npos &&
@@ -1799,6 +1806,122 @@ void TestBackgroundCheckpointFailureRetriesAndRecovers() {
 
 // ---- Empty-chunk GC failpoint ordering -------------------------------------
 
+// A relaxed write to a chunk whose background checkpoint is syncing its files
+// returns without waiting for those syncs, up to the deferred-checkpoint hard
+// bound, and every write made meanwhile survives a reopen.
+void TestWritesDoNotWaitForBackgroundCheckpointSyncs() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-bg-sync");
+    auto config = BaseConfig(dir.path());
+    config.checkpoint_update_interval = 1;
+    config.background_maintenance = true;
+    {
+        chunkdb::ChunkStore store(config);
+        // The barrier's floor makes every later checkpoint sync its files.
+        store.WalBarrier();
+        store.ArmCheckpointBeforeWalRemovalPauseForTests();
+        store.SetBlockBits(0, 0, "10101");
+        assert(store.WaitForCheckpointBeforeWalRemovalForTests());
+
+        // The hard bound is 4 x checkpoint_update_interval writes since the
+        // paused checkpoint took its image.
+        auto writes = std::async(std::launch::async, [&] {
+            store.SetBlockBits(1, 0, "01010");
+            store.SetBlockBits(2, 0, "11100");
+            store.UnsetBlock(1, 0);
+            store.SetBlockBits(3, 0, "00111");
+        });
+        const bool writes_returned = writes.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        auto bounded = std::async(std::launch::async, [&] { store.SetBlockBits(0, 1, "11011"); });
+        const bool bounded_waited = bounded.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready;
+        store.ResumeCheckpointBeforeWalRemovalForTests();
+        writes.get();
+        bounded.get();
+        assert(writes_returned);
+        assert(bounded_waited);
+        assert(store.GetBlockBits(2, 0) == "11100");
+        assert(!store.BlockExists(1, 0));
+        store.WalBarrier();
+    }
+    config.background_maintenance = false;
+    chunkdb::ChunkStore reopened(config);
+    assert(reopened.GetBlockBits(0, 0) == "10101");
+    assert(!reopened.BlockExists(1, 0));
+    assert(reopened.GetBlockBits(2, 0) == "11100");
+    assert(reopened.GetBlockBits(3, 0) == "00111");
+    assert(reopened.GetBlockBits(0, 1) == "11011");
+}
+
+// A background checkpoint that fails after taking its image, with the WAL
+// kept or already removed, keeps the writes made while it synced; a barrier
+// issued meanwhile waits for it and every write survives a reopen.
+void TestBackgroundCheckpointFailureKeepsWritesMadeDuringSyncs() {
+    for (const char* failpoint :
+         {"CHUNKDB_FAILPOINT_CHECKPOINT_WAL_REMOVE_FAIL_ONCE",
+          "CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_WAL_REMOVE_ONCE"}) {
+        chunkdb::test::ScopedTempDir dir("chunkdb-reg-bg-sync-fail");
+        auto config = BaseConfig(dir.path());
+        config.checkpoint_update_interval = 1;
+        config.background_maintenance = true;
+        {
+            chunkdb::ChunkStore store(config);
+            store.WalBarrier();
+            store.ArmCheckpointBeforeWalRemovalPauseForTests();
+            store.SetBlockBits(0, 0, "10101");
+            assert(store.WaitForCheckpointBeforeWalRemovalForTests());
+            {
+                ScopedEnv fp(failpoint, "1");
+                store.SetBlockBits(1, 0, "01010");
+                store.SetBlockBits(2, 0, "11100");
+                auto barrier = std::async(std::launch::async, [&] { store.WalBarrier(); });
+                const bool barrier_waited =
+                    barrier.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready;
+                store.ResumeCheckpointBeforeWalRemovalForTests();
+                barrier.get();
+                assert(barrier_waited);
+            }
+            assert(store.RuntimeStats().background_checkpoint_failures >= 1);
+            assert(store.GetBlockBits(1, 0) == "01010");
+            store.SetBlockBits(3, 0, "00111");
+            store.WalBarrier();
+        }
+        config.background_maintenance = false;
+        chunkdb::ChunkStore reopened(config);
+        assert(reopened.GetBlockBits(0, 0) == "10101");
+        assert(reopened.GetBlockBits(1, 0) == "01010");
+        assert(reopened.GetBlockBits(2, 0) == "11100");
+        assert(reopened.GetBlockBits(3, 0) == "00111");
+    }
+}
+
+// Checkpoints that run beside a writer keep each write, whether its frame
+// was absorbed into the image or written to the next WAL.
+void TestBackgroundCheckpointsKeepConcurrentWrites() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-bg-concurrent");
+    auto config = BaseConfig(dir.path());
+    config.checkpoint_update_interval = 3;
+    config.wal_group_commit_updates = 2;
+    config.background_maintenance = true;
+    std::vector<std::string> expected(32);
+    {
+        chunkdb::ChunkStore store(config);
+        store.WalBarrier();
+        for (std::size_t i = 0U; i < 1500U; ++i) {
+            const std::size_t block = (i * 7U) % expected.size();
+            std::string bits(5, '0');
+            for (std::size_t b = 0U; b < bits.size(); ++b) bits[b] = ((i >> b) & 1U) != 0U ? '1' : '0';
+            store.SetBlockBits(static_cast<std::int64_t>(block % 8U), static_cast<std::int64_t>(block / 8U), bits);
+            expected[block] = bits;
+        }
+        store.WalBarrier();
+    }
+    config.background_maintenance = false;
+    chunkdb::ChunkStore reopened(config);
+    for (std::size_t block = 0U; block < expected.size(); ++block) {
+        assert(reopened.GetBlockBits(static_cast<std::int64_t>(block % 8U), static_cast<std::int64_t>(block / 8U)) ==
+               expected[block]);
+    }
+}
+
 void TestEmptyChunkGcOrderingAndRecovery() {
     for (const char* failpoint :
          {"CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_IMAGE_REMOVE_ONCE",
@@ -2006,7 +2129,7 @@ void TestRevisionSurvivesCheckpointImage() {
     }
 }
 
-// The v4 image header CRC covers the revision, so a flip there is rejected
+// The image header CRC covers the revision, so a flip there is rejected
 // instead of handing out a corrupted CHUNKVER token.
 void TestImageHeaderCrcCorruptionRejected() {
     chunkdb::test::ScopedTempDir dir("chunkdb-reg-image-header-crc");
@@ -2020,12 +2143,15 @@ void TestImageHeaderCrcCorruptionRejected() {
         store.SetBlockBits(0, 0, "10101");
     }
     const auto image = ReadFileBytes(image_path);
-    // Fixed header: revision at 56..64, commit time at 64..72; the two-entry
-    // section directory at 72..104; the header CRC over [0, 104) at 104..108.
-    assert(image.size() > 108U);
-    assert(image[8] == 1U && image[9] == 0U);  // image format version 1
+    const auto count = static_cast<std::uint16_t>(image[10U] | (static_cast<unsigned>(image[11U]) << 8U));
+    const auto crc_at = chunkdb::ChunkImageHeaderBytes(geometry.dims(), count) - 4U;
+    const auto revision_at = 44U + 8U * geometry.dims();
+    const auto time_at = 52U + 8U * geometry.dims();
+    assert(image.size() > crc_at + 4U);
+    assert(image[8] == 2U && image[9] == 0U);
 
-    for (const std::size_t offset : {56U, 63U, 64U, 80U, 104U}) {
+    for (const std::size_t offset : {static_cast<std::size_t>(revision_at), static_cast<std::size_t>(revision_at + 7U),
+             static_cast<std::size_t>(time_at), chunkdb::ChunkImageFixedHeaderBytes(geometry.dims()), crc_at}) {
         auto corrupt = image;
         corrupt[offset] ^= 0x01U;
         WriteFileBytes(image_path, corrupt);
@@ -2105,6 +2231,9 @@ int main() {
     TestEvictionKeepsRecentlyUsedResident();
     TestScanContentionFallbackCachesTheChunk();
     TestBackgroundCheckpointFailureRetriesAndRecovers();
+    TestWritesDoNotWaitForBackgroundCheckpointSyncs();
+    TestBackgroundCheckpointFailureKeepsWritesMadeDuringSyncs();
+    TestBackgroundCheckpointsKeepConcurrentWrites();
     TestEmptyChunkGcOrderingAndRecovery();
     TestLargeGeometryConditionalMutationIsAtomic();
     TestTornFrameIsIgnoredAsAWhole();

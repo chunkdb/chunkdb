@@ -97,6 +97,7 @@ struct CatalogConfig {
     std::size_t max_open_wal_streams = 1024;
     bool background_maintenance = false;
     std::size_t background_checkpoint_queue_limit = 4096;
+    std::size_t maintenance_workers = 8;
     // Per table: the chunk states kept for open transactions.
     std::size_t txn_history_bytes = kDefaultTxnHistoryBytes;
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
@@ -138,6 +139,7 @@ struct TableInfo {
     // Effective limits; options preserves whether each override was set.
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
+    TableSchema chunk_schema{};
 };
 
 struct CatalogFeatureStatus {
@@ -150,6 +152,7 @@ struct TableDefinition {
     GeometryConfig geometry;
     TableOptions options;
     std::optional<TableSchema> schema;
+    std::optional<TableSchema> chunk_schema{};
 };
 
 // A table that refuses its commands until TableCatalog::RecoverTable or a
@@ -383,6 +386,8 @@ class TableCatalog {
     // restart recovers. After a failure the table stays fenced.
     // `cancelled` ends the wait for a running feature activation or backup.
     void RecoverTable(std::string_view name, std::stop_token cancelled = {});
+    // Drops collected deletion identities older than before and reopens the table.
+    [[nodiscard]] std::uint64_t CompactTombstones(std::string_view name, std::uint64_t before);
 
     // Each is crash-atomic: after a crash the table exists completely, with
     // the old or the new options, or not at all. Throws TableExistsError,
@@ -423,6 +428,12 @@ class TableCatalog {
     // A null result leaves the existing schema/store/feed untouched. The
     // decision is serialized with column changes and table deletion.
     [[nodiscard]] bool ChangeColumnsIfNeeded(
+        std::string_view name,
+        const std::function<std::optional<TableSchema>(const TableSchema&)>& change);
+    // Chunk-column changes share the block schema revision and the same
+    // exclusive manifest publication and recovery rules as block columns.
+    void ChangeChunkColumns(std::string_view name, const std::function<TableSchema(const TableSchema&)>& change);
+    [[nodiscard]] bool ChangeChunkColumnsIfNeeded(
         std::string_view name,
         const std::function<std::optional<TableSchema>(const TableSchema&)>& change);
     // Narrows column `column` to `type`, a type of its family that does not
@@ -492,7 +503,8 @@ class TableCatalog {
         Table& table,
         const TableOptions& options,
         const std::function<void(StoreManifest*)>& change,
-        const char* dir_sync_failpoint);
+        const char* dir_sync_failpoint,
+        const std::optional<TableSchema>& chunk_schema = std::nullopt);
     // Reads every stored value of the column the table's recorded narrowing
     // names, under a lease and without catalog admission; the narrowing keeps
     // writes from adding values that do not fit meanwhile. Returns the first

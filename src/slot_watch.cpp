@@ -24,6 +24,10 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     const std::function<void(std::string_view)>& authorize_owner) {
     if (options.area && (options.area->first.x > options.area->last.x || options.area->first.y > options.area->last.y))
         throw std::invalid_argument("feed area bounds are reversed");
+    if (options.area && (options.area->dims != table->Info().geometry.dims ||
+        (options.area->dims == 2U && (options.area->first.z != 0 || options.area->last.z != 0)) ||
+        (options.area->dims == 3U && options.area->first.z > options.area->last.z)))
+        throw std::invalid_argument("feed area dimensionality or z bounds are invalid");
     if (options.progress_interval.count() <= 0 || options.progress_interval.count() > INT32_MAX)
         throw std::invalid_argument("feed progress interval must be between 1 and 2147483647 milliseconds");
     if (options.ack_timeout_ms && *options.ack_timeout_ms == 0U)
@@ -241,9 +245,16 @@ void SlotWatch::Build(Prepared& prepared) const {
     if (original->kind == FeedEntry::Kind::kSchema && options_.column_ids) columns = original->columns;
     else if (mutation && (options_.column_ids || prepared.schema != original->schema_version))
         columns = table_->geometry().LayoutAt(original->schema_version).schema().columns;
-    prepared.entry = options_.chunks && mutation
-        ? ChunkFeedEntry(original, table_->geometry(), options_.area, options_.column_ids)
-        : FilterFeedEntry(original, options_.area, options_.column_ids, options_.no_before, columns);
+    if (prepared.filtered && mutation) {
+        // The archive reader kept only what this watch sends; a change that
+        // keeps nothing is not sent.
+        const bool kept = !original->blocks.empty() || !original->chunk_changes.empty() || !original->chunk_forms.empty();
+        prepared.entry = kept ? original : nullptr;
+    } else {
+        prepared.entry = options_.chunks && mutation
+            ? ChunkFeedEntry(original, table_->geometry(), options_.area, options_.column_ids)
+            : FilterFeedEntry(original, options_.area, options_.column_ids, options_.no_before, columns);
+    }
     prepared.built = true;
     const auto& entry = prepared.entry;
     prepared.send = entry != nullptr;
@@ -331,7 +342,7 @@ SlotWatch::Admission SlotWatch::Admit(Prepared& prepared, bool& left_head) {
     unsent_ += size;
     return Admission::kAdmitted;
 }
-bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
+bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original, bool filtered) {
     { std::lock_guard lock(mutex_); if (!output_.empty()) return false; }
     if (!prepared_ || prepared_->original != original || prepared_->schema != schema_) {
         // A different entry gives up this watch's place in the pool queue.
@@ -339,6 +350,7 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original) {
         prepared_.emplace();
         prepared_->original = original;
         prepared_->schema = schema_;
+        prepared_->filtered = filtered;
         Build(*prepared_);
     }
     if (!prepared_->send) { prepared_.reset(); return true; }
@@ -437,12 +449,19 @@ bool SlotWatch::Work() {
         if (!archive_) {
             if (slot.durable_watermark <= cursor_.revision) return Progress(slot) || changed;
             archive_.emplace(table_->ReadClaimedFeedArchive(claim_, cursor_));
-            if (options_.chunks) archive_->EnableChunkForms(budget());
+            // The reader keeps only what this watch sends, so its budget
+            // counts the frames this watch sends.
+            if (Filtered()) archive_->Filter({options_.area, options_.column_ids, options_.no_before, options_.chunks});
             changed = true;
         }
-        if (!pending_) pending_ = archive_->Next();
+        if (!pending_) {
+            // Decoding stops once the frame of an archived change would
+            // exceed the table budget Admit applies.
+            archive_->SetEntryBudget(budget());
+            pending_ = archive_->Next();
+        }
         if (pending_) {
-            if (!Publish(pending_)) return changed;
+            if (!Publish(pending_, Filtered())) return changed;
             cursor_ = pending_->position;
             pending_.reset();
             return true;

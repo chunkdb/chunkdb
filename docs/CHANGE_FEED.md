@@ -19,7 +19,7 @@ chunk-cli --uri "$CHUNKDB_URI" watch world
 
 ```output
 start <epoch>:0
-change revision 2 time_ms <time-ms> user admin
+change revision 1 time_ms <time-ms> user admin
   block 0 0: (absent) -> {kind = 1}
 ```
 
@@ -30,7 +30,7 @@ SET BLOCK 0 0 IN world kind = 1
 ```
 
 ```output
-2
+1
 ```
 
 The **epoch** identifies the table; it changes when the table is recreated or restored.
@@ -51,6 +51,8 @@ It marks a sender-drained revision; slot progress also stays within the durable 
 ## Guarantees
 
 - One committed transaction produces one change containing all its affected blocks.
+- Chunk metadata changes carry complete before and after rows, including changes with no affected blocks.
+- Every coordinate has exactly the table's active axes, and block-column projections preserve chunk metadata.
 - Schema descriptions precede changes that need their columns.
 - An ordinary watch starts after currently completed writes unless you supply AFTER.
 - A durable slot retains a saved consumer position across server restarts.

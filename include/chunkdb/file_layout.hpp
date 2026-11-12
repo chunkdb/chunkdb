@@ -1,6 +1,8 @@
 #pragma once
 
 #include <filesystem>
+#include <string>
+#include <string_view>
 #include <vector>
 #include "chunkdb/chunk_store.hpp"
 
@@ -12,6 +14,16 @@ namespace chunkdb {
 [[nodiscard]] std::filesystem::path LargeChunkDirectory(
     const std::filesystem::path& data_dir,
     const LargeChunkCoord& large_coord);
+[[nodiscard]] std::filesystem::path LargeChunkDirectory(
+    const std::filesystem::path& data_dir,
+    const LargeChunkCoord& large_coord, std::uint8_t dims);
+[[nodiscard]] std::string ChunkFileStem(const ChunkCoord& coord, std::uint8_t dims);
+// Canonical coordinate names only; failure never changes the output coordinate.
+[[nodiscard]] bool ParseChunkFileStem(std::string_view name, std::uint8_t dims, ChunkCoord* out);
+[[nodiscard]] bool ParseLargeChunkName(std::string_view name, std::uint8_t dims, LargeChunkCoord* out);
+// No filesystem access: require exact relative placement, dimension and suffix.
+[[nodiscard]] bool ParseChunkFilePath(
+    const std::filesystem::path& relative, const Geometry& geometry, ChunkCoord* out);
 [[nodiscard]] std::filesystem::path ChunkDataPath(
     const std::filesystem::path& data_dir,
     const Geometry& geometry,
@@ -28,6 +40,7 @@ namespace chunkdb {
     const StoreId& old_id, const StoreId& new_id, FeatureFlags features);
 [[nodiscard]] std::vector<std::uint8_t> RewriteWalStoreId(
     std::vector<std::uint8_t> bytes, ChunkCoord coord,
-    const StoreId& old_id, const StoreId& new_id, FeatureFlags features);
+    const StoreId& old_id, const StoreId& new_id, FeatureFlags features,
+    std::uint8_t dims = 2U);
 
 }  // namespace chunkdb

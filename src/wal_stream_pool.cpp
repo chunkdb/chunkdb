@@ -366,7 +366,7 @@ void ChunkStore::EnsureWalAppendStream(
     }
 
     if (needs_header) {
-        const auto wal_header = BuildWalHeader(chunk_coord, store_id_, features_);
+        const auto wal_header = BuildWalHeader(chunk_coord, store_id_, features_, geometry_.dims());
         // The failpoint tears the header: half of it reaches the file.
         const bool torn = ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_HEADER_WRITE_FAIL_ONCE");
         stream.write(
@@ -465,6 +465,7 @@ void ChunkStore::CloseAllWalStreams() noexcept {
         }
         for (const auto& chunk : chunks) {
             std::unique_lock chunk_lock(chunk->mutex);
+            AwaitChunkFilesLocked(chunk_lock, *chunk);
             CloseWalAppendStream(chunk);
         }
     }

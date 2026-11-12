@@ -14,7 +14,7 @@ Generated passwords, epochs, and timestamps appear as named placeholders.
 | Reference | Statements |
 | --- | --- |
 | [Blocks](reference/BLOCKS.md) | GET BLOCK, SET BLOCK, DELETE BLOCK |
-| [Chunks and areas](reference/CHUNKS.md) | GET CHUNK, SET CHUNK, GET AREA, SCAN CHUNKS |
+| [Chunks and areas](reference/CHUNKS.md) | GET CHUNK, SET CHUNK, GET AREA, SCAN CHUNKS, COMPACT TOMBSTONES, SHOW TABLE STATS |
 | [Tables](reference/TABLES.md) | CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SHOW TABLES, DESCRIBE, SHOW STATUS, ENABLE FEATURE |
 | [Migrations](reference/MIGRATIONS.md) | MIGRATE, SHOW MIGRATIONS |
 | [Transaction statements](reference/TRANSACTION_STATEMENTS.md) | BEGIN, COMMIT, ROLLBACK |
@@ -33,7 +33,7 @@ Bytes use hexadecimal literals such as `x'0a0bff'`.
 Bits use literals such as `b'1010'`, with the first digit representing the lowest bit.
 
 Trailing keyword options can appear in any order, each at most once.
-Client APIs supply binary `$n` parameters in these places: SET BLOCK values, the SET CHUNK form, `VERIFIER $1` in CREATE USER and ALTER USER, HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
+Client APIs supply binary `$n` parameters in these places: SET BLOCK values, the SET CHUNK form or META values, `VERIFIER $1` in CREATE USER and ALTER USER, HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
 See [Protocol](PROTOCOL.md#parameters) for encoding.
 
 Committed chunk versions are producing commit revisions, ordered only within the table epoch returned by DESCRIBE.
@@ -57,7 +57,7 @@ GET BLOCK 0 0 FROM terrain
 
 ```output
 OK
-2
+1
 kind = 1
 height = 12
 ```
@@ -76,7 +76,7 @@ GET BLOCK 0 0 FROM light
 
 ```output
 OK
-2
+1
 height = 12
 level = 9
 ```
@@ -92,13 +92,13 @@ Create the derived table and a [slot](CHANGE_FEED.md), fill it from SCAN CHUNKS 
 ```cql docs-check session=main
 CREATE TABLE terrain_top (height i16, source_version u64) CHUNK 2 x 2
 CREATE SLOT 'terrain_top' ON terrain
-SET BLOCK 0 0 IN terrain_top height = 12, source_version = 2
+SET BLOCK 0 0 IN terrain_top height = 12, source_version = 1
 ```
 
 ```output
 OK
 OK
-2
+1
 ```
 
 For each change, skip the chunk if its `source_version` is not lower than the change revision; otherwise read the chunk again, write its summary, and ACK the revision after the write succeeds.

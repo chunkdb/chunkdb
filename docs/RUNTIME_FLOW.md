@@ -7,6 +7,7 @@ A table's chunk geometry determines which blocks belong together.
 
 - An absent block returns NULL; a present block follows its column types.
 - An unwritten chunk returns NULL without a version token.
+- Reading an unwritten chunk does not reserve a revision or advance the completed write frontier.
 - GET CHUNK can return a written empty chunk after its blocks are deleted.
 - GET AREA and SCAN CHUNKS include only chunks with present blocks.
 - Area reads and scan pages need a transaction to share one consistent snapshot.

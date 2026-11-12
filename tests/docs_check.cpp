@@ -321,9 +321,13 @@ Span SlotEpoch(const std::string& text, std::size_t line) {
 // [0-9a-f]{32}(?=\r?\nrevision = (?:\d+|NULL)\r?\ndims = \d+\r?\ncolumns:\r?\n)
 Span TableEpoch(const std::string& text, std::size_t line) {
     Scanner s(text, line);
+    const auto sides = [&]() {
+        if (!s.Digits() || !s.Literal(" x ") || !s.Digits()) return false;
+        return !s.Literal(" x ") || s.Digits();
+    };
     if (!s.Literal("table = ") || !s.Name(true) || !s.Newline() || !s.Literal("version = ") || !s.Digits() ||
-        !s.Newline() || !s.Literal("chunk = ") || !s.Digits() || !s.Literal(" x ") || !s.Digits() ||
-        !s.Newline() || !s.Literal("large = ") || !s.Digits() || !s.Literal(" x ") || !s.Digits() ||
+        !s.Newline() || !s.Literal("chunk = ") || !sides() ||
+        !s.Newline() || !s.Literal("large = ") || !sides() ||
         !s.Newline() || !s.Literal("epoch = ")) {
         return std::nullopt;
     }
@@ -334,6 +338,49 @@ Span TableEpoch(const std::string& text, std::size_t line) {
         !s.Literal("dims = ") || !s.Digits() || !s.Newline() || !s.Literal("columns:") || !s.Newline()) {
         return std::nullopt;
     }
+    return std::pair{begin, end};
+}
+
+Span ChunkTime(const std::string& text, std::size_t line) {
+    Scanner s(text, line);
+    s.SpacesAndTabs();
+    const auto indent = text.substr(line, s.pos() - line);
+    if (!s.Literal("version = ") || !(s.Digits() || s.Literal("NULL")) || !s.Newline() ||
+        !s.Literal(indent) || !s.Literal("schema_version = ") || !s.Digits() || !s.Newline() ||
+        !s.Literal(indent) || !s.Literal("commit_time_ms = ")) return std::nullopt;
+    const auto begin = s.pos();
+    if (!s.Digits()) return std::nullopt;
+    const auto end = s.pos();
+    if (!s.Newline() || !s.Literal(indent) || !s.Literal("present = ") || !s.Digits() ||
+        !s.Literal(" of ") || !s.Digits() || !s.Literal(" blocks") || !s.Newline()) return std::nullopt;
+    return std::pair{begin, end};
+}
+
+Span ScanEpoch(const std::string& text, std::size_t line) {
+    Scanner s(text, line);
+    if (s.Literal("chunks:")) {
+        if (!s.Newline()) return std::nullopt;
+        bool any = false;
+        while (s.Literal("  ")) {
+            if (!s.PositiveNumber() || !s.Literal(") [")) return std::nullopt;
+            std::size_t values = 0U;
+            do {
+                s.Literal("-");
+                if (!s.Digits()) return std::nullopt;
+                ++values;
+            } while (s.Literal(", "));
+            if ((values != 3U && values != 4U) || !s.Literal("]") || !s.Newline()) return std::nullopt;
+            any = true;
+        }
+        if (!any) return std::nullopt;
+    } else if (!s.Literal("chunks = []") || !s.Newline()) return std::nullopt;
+    if (!s.Literal("more = ") || !(s.Literal("true") || s.Literal("false")) ||
+        !s.Newline() || !s.Literal("epoch = ")) return std::nullopt;
+    const auto begin = s.pos();
+    if (!s.Epoch()) return std::nullopt;
+    const auto end = s.pos();
+    if (!s.Newline() || !s.Literal("position = ") || !(s.Digits() || s.Literal("NULL")) ||
+        !s.Newline() || !s.Literal("retained_deletion_floor = ") || !s.Digits() || !s.Newline()) return std::nullopt;
     return std::pair{begin, end};
 }
 
@@ -1578,6 +1625,8 @@ std::string Normalize(std::string text) {
     text = ApplyRule(text, RowEpoch, "<epoch>");
     text = ApplyRule(text, SlotEpoch, "<epoch>");
     text = ApplyRule(text, TableEpoch, "<epoch>");
+    text = ApplyRule(text, ScanEpoch, "<epoch>");
+    text = ApplyRule(text, ChunkTime, "<time-ms>");
     text = ApplyRule(text, ChangeTime, "<time-ms>");
     text = ApplyRule(text, MigrationTime, "<time-ms>");
     text = ApplyRule(text, ServerVersion, "<server-version>");

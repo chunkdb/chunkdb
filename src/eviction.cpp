@@ -15,6 +15,7 @@
 #include "txn_history.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
+#include "maintenance_pool.hpp"
 
 namespace chunkdb {
 
@@ -268,6 +269,7 @@ bool ChunkStore::TryEvictCandidate(
 
     {
         std::unique_lock chunk_lock(regular_chunk->mutex);
+        AwaitChunkFilesLocked(chunk_lock, *regular_chunk);
         // Its WAL past the last good point is not committed state, so memory
         // is the only right copy until a restart repairs the WAL.
         if (regular_chunk->wal_repair_failed) {
@@ -311,6 +313,7 @@ bool ChunkStore::TryEvictCandidate(
     }
     {
         std::unique_lock chunk_lock(regular_chunk->mutex);
+        AwaitChunkFilesLocked(chunk_lock, *regular_chunk);
         if (regular_chunk->wal_repair_failed || !regular_chunk->wal_batch.empty()) {
             return false;
         }
@@ -318,18 +321,6 @@ bool ChunkStore::TryEvictCandidate(
         CloseWalAppendStream(regular_chunk);
         if (regular_chunk.use_count() != 2) {
             return false;
-        }
-        if (regular_chunk->written && !ChunkPresent(regular_chunk->presence_bitmap) &&
-            !std::filesystem::exists(ChunkDataPath(data_dir_, geometry_, candidate.chunk_coord)) &&
-            !std::filesystem::exists(ChunkWalPath(data_dir_, geometry_, candidate.chunk_coord))) {
-            // Retiring a collected tombstone changes GET CHUNK to NULL.
-            // Order it like a write: take T before loading the open count,
-            // keep the old form tagged T, then erase under the large lock.
-            // A snapshot at or above T cannot obtain this cached object
-            // before the erase; earlier snapshots read its kept state.
-            const auto version = NextChunkVersion();
-            auto keep = PrepareTxnKeepLocked(candidate.chunk_coord, *regular_chunk, version);
-            txn_history_->Publish(keep.node);
         }
         eviction_removals_.fetch_add(1, std::memory_order_release);
     }
@@ -415,16 +406,6 @@ void ChunkStore::FinishEvictedChunks(
         if (erase_large_chunk) {
             RemoveLargeChunkFromEvictionRing(it->first);
             large_chunks_.erase(it);
-            if (scan_catalog_ready_) {
-                const auto key = std::make_pair(large_coord.x, large_coord.y);
-                const auto catalog_it = scan_catalog_.find(key);
-                if (catalog_it != scan_catalog_.end()) {
-                    std::error_code ec;
-                    if (!std::filesystem::exists(catalog_it->second, ec) && !ec) {
-                        scan_catalog_.erase(catalog_it);
-                    }
-                }
-            }
         }
     }
 }
@@ -568,7 +549,7 @@ void ChunkStore::RequestEviction() {
         return;
     }
 
-    // Backpressure: while the maintenance thread catches up, the cache may
+    // Backpressure: while background maintenance catches up, the cache may
     // exceed the configured bound by at most one hysteresis band. Beyond
     // that, the loading thread evicts inline to preserve the hard bound.
     const std::size_t max_loaded_chunks = resources_->max_loaded_chunks_;
@@ -582,9 +563,13 @@ void ChunkStore::RequestEviction() {
 
     {
         std::lock_guard lock(maintenance_mutex_);
-        maintenance_eviction_requested_ = true;
+        if (!maintenance_stop_ && maintenance_task_) {
+            maintenance_eviction_requested_ = true;
+            if (maintenance_pool_->Notify(maintenance_task_)) return;
+            maintenance_eviction_requested_ = false;
+        }
     }
-    maintenance_cv_.notify_one();
+    MaybeEvictChunks();
 }
 
 }  // namespace chunkdb

@@ -633,6 +633,40 @@ void WatchRevoke(bool tls) {
     Error(slot.Read(), "NO_TABLE"); Closed(slot);
 }
 
+// Watches of a three-dimensional table, of chunk metadata and of chunk forms
+// end with the same NO_TABLE when their user loses READ, before a later push.
+void WatchRevokeDimensional(bool tls) {
+    Harness harness(tls, true);
+    auto admin = harness.Connect();
+    admin->Ok("CREATE TABLE t (n u8) CHUNK 2 x 2 x 2 CHUNK COLUMNS (note text(64) NULL)");
+    admin->Ok("CREATE SLOT 'consumer' ON t AREA 0 0 0 TO 1 1 1 OWNER reader");
+    admin->Ok("CREATE SLOT 'forms' ON t CHUNKS OWNER reader");
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
+    admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
+    admin->Ok("GRANT READ ON t TO reader");
+    const auto next = [](Client& client) {
+        auto reply = client.Read();
+        while (reply.type == '>' && !reply.items.empty() && reply.items[0].value == "schema") reply = client.Read();
+        assert(reply.type == '>' && !reply.items.empty());
+        return reply;
+    };
+    Client plain(harness.port, tls); plain.Login("reader", "pw"); (void)Start(plain.Command("WATCH t"));
+    Client slot(harness.port, tls); slot.Login("reader", "pw"); (void)Start(slot.Command("WATCH t SLOT 'consumer'"));
+    Client forms(harness.port, tls); forms.Login("reader", "pw"); (void)Start(forms.Command("WATCH t SLOT 'forms'"));
+    const auto first = Number(admin->Command("SET CHUNK 0 0 1 IN t META note = 'first'"));
+    for (auto* client : {&plain, &slot}) {
+        const auto change = next(*client);
+        assert(change.items[0].value == "change" && Number(change.items[2]) == first && change.items[9].items.size() == 1U);
+    }
+    const auto chunk = next(forms);
+    assert(chunk.items[0].value == "chunks" && Number(chunk.items[2]) == first);
+    admin->Ok("REVOKE READ ON t FROM reader");
+    (void)admin->Command("SET CHUNK 0 0 1 IN t META note = 'second'");
+    (void)admin->Command("SET BLOCK 0 0 0 IN t n = 2");
+    for (auto* client : {&plain, &slot, &forms}) { Error(client->Read(), "NO_TABLE"); Closed(*client); }
+}
+
 // Applies a REVOKE when the feed has read an ACK, before it accepts it.
 class RevokeAtAck : public FeedDeliveryTestHook {
   public:
@@ -768,8 +802,8 @@ void SlotOwners(bool tls) {
     Error(later.Read(), "NO_TABLE"); Closed(later);
 }
 
-// A slot without a recorded owner, as from before owners were recorded, takes
-// the user of its first granted attach that ADMIN on * does not allow. A
+// A slot without a recorded owner, as CREATE SLOT makes without authentication,
+// takes the user of its first granted attach that ADMIN on * does not allow. A
 // failed owner write starts no watch and records nothing.
 void FirstAttachOwner(bool tls) {
     Harness harness(tls, true);
@@ -913,55 +947,69 @@ class AdmissionSchedule : public FeedDeliveryTestHook {
   public:
     void Run(Point point, std::size_t bytes) override {
         std::unique_lock lock(mutex_);
-        if (point == Point::kBeforeIoScan && !entered_) {
+        if (point == Point::kBeforeIoScan && armed_ && !entered_) {
             entered_ = true; cv_.notify_all();
             cv_.wait(lock, [&] { return released_; });
         } else if (point == Point::kAfterAdmission) {
             admitted_ = bytes; cv_.notify_all();
         } else if (point == Point::kAfterIoAdd) {
-            added_ = true; cv_.notify_all();
+            ++added_; cv_.notify_all();
         }
+    }
+    void Arm() {
+        std::unique_lock lock(mutex_);
+        assert(cv_.wait_for(lock, 10s, [&] { return added_ == 1U && admitted_ != 0U; }));
+        added_ = 0U; admitted_ = 0U; armed_ = true;
     }
     void WaitForScan() { std::unique_lock lock(mutex_); assert(cv_.wait_for(lock, 10s, [&] { return entered_; })); }
     std::size_t WaitForAdmission() {
         std::unique_lock lock(mutex_); assert(cv_.wait_for(lock, 10s, [&] { return admitted_ != 0U; }));
         return admitted_;
     }
-    void WaitForJoin() { std::unique_lock lock(mutex_); assert(cv_.wait_for(lock, 10s, [&] { return added_; })); }
+    void WaitForJoin(std::size_t count) { std::unique_lock lock(mutex_); assert(cv_.wait_for(lock, 10s, [&] { return added_ >= count; })); }
     void Release() { std::lock_guard lock(mutex_); released_ = true; cv_.notify_all(); }
   private:
     std::mutex mutex_; std::condition_variable cv_;
-    bool entered_ = false, released_ = false, added_ = false;
-    std::size_t admitted_ = 0U;
+    bool armed_ = false, entered_ = false, released_ = false;
+    std::size_t admitted_ = 0U, added_ = 0U;
 };
 void AdmittedChangeSurvivesShareShrink(bool tls) {
     AdmissionSchedule schedule; // Outlives both delivery threads.
-    constexpr std::size_t budget = 1536U;
+    constexpr std::size_t budget = 32768U;
+    constexpr std::size_t ordinary_count = 3U;
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
-    auto writer = harness.Connect(); Create(*writer);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label text(4096)) CHUNK 4 x 4");
+    writer->Ok("CREATE SLOT 'consumer' ON t");
     auto table = harness.catalog->Find("t");
+    FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    Cleanup cleanup([&] { schedule.Release(); FeedDeliveryTestAccess::SetHook(harness.server(), nullptr); });
     auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
     // First delivery establishes activation, schema and the full initial quota.
     const auto first = Set(*writer, 1); FeedSlotTestAccess::Sync(*table);
     assert(Change(NextChange(*watch)) == first);
-    FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
-    Cleanup cleanup([&] { schedule.Release(); FeedDeliveryTestAccess::SetHook(harness.server(), nullptr); });
+    schedule.Arm(); // Initial publication callbacks must finish before counting new joins.
+    FeedDeliveryTestAccess::SetHook(harness.server(), &schedule); // Wake the armed I/O scan.
     schedule.WaitForScan(); // Hold I/O before its next incoming-watch/quota scan.
     writer->Ok("BEGIN");
     for (unsigned x = 0U; x < 6U; ++x)
         assert(writer->Command("SET BLOCK " + std::to_string(x % 4U) + " " + std::to_string(x / 4U) +
-            " IN t label = '" + std::string(110U, 'x') + "'").type == '_');
+            " IN t label = '" + std::string(1500U, 'x') + "'").type == '_');
     const auto revision = Number(writer->Command("COMMIT"));
     FeedSlotTestAccess::Sync(*table);
     const auto admitted = schedule.WaitForAdmission();
-    assert(admitted > budget / 2U && admitted <= budget - 128U);
-    auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t"));
-    schedule.WaitForJoin(); // Plain WATCH is really handed to the I/O thread.
-    schedule.Release(); // The scan now halves the slot share before taking its accepted output.
+    assert(admitted > budget / (ordinary_count + 1U) && admitted <= budget - 128U);
+    std::vector<std::unique_ptr<Client>> ordinary;
+    for (std::size_t i = 0U; i < ordinary_count; ++i) {
+        ordinary.push_back(harness.Connect());
+        (void)Start(ordinary.back()->Command("WATCH t"));
+    }
+    schedule.WaitForJoin(ordinary_count); // Every plain WATCH is handed to the I/O thread.
+    schedule.Release(); // The scan reduces the slot share below its accepted output.
     const auto change = watch->Read(); assert(Change(change, 6U) == revision);
     watch->Line("ACK " + std::to_string(revision)); Unwatch(*watch);
     assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == revision);
-    Unwatch(*ordinary);
+    for (auto& client : ordinary) Unwatch(*client);
 }
 
 void LostAndDrop(bool tls) {
@@ -1309,6 +1357,47 @@ void ShareIndependentDelivery(bool tls) {
     assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == large);
     for (const auto& client : ordinary) Unwatch(*client); // Ordinary watches above their share resync.
 }
+// A three-dimensional chunk-column change above the watch share takes the
+// table pool like a block change, from the live feed and from the archive.
+void ShareMetadataDelivery(bool tls) {
+    constexpr std::size_t budget = 16384U, kOrdinary = 31U; // A share of 512 bytes.
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8) CHUNK 4 x 4 x 2 CHUNK COLUMNS (note text(12000) NULL)");
+    writer->Ok("CREATE SLOT 'consumer' ON t");
+    auto table = harness.catalog->Find("t");
+    const auto read_change = [](Client& client) {
+        auto reply = client.Read();
+        while (reply.type == '>' && !reply.items.empty() && reply.items[0].value == "schema") reply = client.Read();
+        if (reply.type != '>' || reply.items.size() != 10U || reply.items[0].value != "change")
+            throw std::runtime_error("expected change, got type=" + std::string(1, reply.type) + " value=" + reply.value);
+        return reply;
+    };
+    const auto meta = [&](int x, std::size_t size) {
+        return Number(writer->Command("SET CHUNK " + std::to_string(x) + " 0 0 IN t META note = '" + std::string(size, 'm') + "'"));
+    };
+    auto ordinary = OrdinaryWatches(harness, kOrdinary);
+    auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
+    const auto first = Number(writer->Command("SET BLOCK 0 0 0 IN t n = 1")); FeedSlotTestAccess::Sync(*table);
+    for (const auto& client : ordinary) assert(Number(read_change(*client).items[2]) == first);
+    assert(Number(read_change(*watch).items[2]) == first);
+    watch->Line("ACK " + std::to_string(first));
+    // About 4 KiB of chunk metadata: above the share, within the table budget.
+    const auto live = meta(1, 4000U); FeedSlotTestAccess::Sync(*table);
+    const auto change = read_change(*watch);
+    assert(Number(change.items[2]) == live && change.items[6].items.empty() && change.items[9].items.size() == 1U);
+    watch->Line("ACK " + std::to_string(live)); Unwatch(*watch);
+    for (const auto& client : ordinary) Unwatch(*client); // Ordinary watches above their share resync.
+    ordinary.clear(); watch.reset(); // Idle connections would hold the workers.
+    // A larger change read back from the archive: its decoded value and its
+    // frame together exceed the table budget, the frame alone does not.
+    const auto archived = meta(2, 8000U); FeedSlotTestAccess::Sync(*table);
+    auto replay = harness.Connect(); (void)Start(replay->Command("WATCH t SLOT 'consumer'"));
+    const auto replayed = read_change(*replay);
+    assert(Number(replayed.items[2]) == archived && replayed.items[9].items.size() == 1U);
+    replay->Line("ACK " + std::to_string(archived)); Unwatch(*replay);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == archived);
+}
 void TableBudgetStillTerminates(bool tls) {
     constexpr std::size_t budget = 16384U;
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
@@ -1325,6 +1414,55 @@ void TableBudgetStillTerminates(bool tls) {
     Closed(*watch);
     assert(!Boolean(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "lost")));
     for (const auto& client : ordinary) Unwatch(*client);
+}
+// A filtered slot reading from the archive is measured by the frame it
+// sends. One transaction writes about 19 KiB of labels outside chunk (0,0)
+// and n = 1 at block (0,0); the slot 'consumer' with `filters` reads it back
+// within a 16 KiB table budget, and `check` receives its first data frame.
+constexpr unsigned kArchivedLabels = 128U;
+template <typename Check> void FilteredArchiveChange(bool tls, std::string_view filters, Check check) {
+    constexpr std::size_t budget = 16384U;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect(); Create(*writer, filters);
+    auto table = harness.catalog->Find("t");
+    writer->Ok("BEGIN");
+    for (unsigned i = 0U; i < kArchivedLabels; ++i)
+        assert(writer->Command("SET BLOCK " + std::to_string(i % 64U) + " " + std::to_string(4U + i / 64U) +
+            " IN t n = 2, label = '" + std::string(120U, 'x') + "'").type == '_');
+    assert(writer->Command("SET BLOCK 0 0 IN t n = 1").type == '_');
+    const auto transaction = Number(writer->Command("COMMIT"));
+    FeedSlotTestAccess::Sync(*table);
+    // The unfiltered change does not fit the budget.
+    auto archive = table->ReadFeedArchive(table->ListFeedSlots().front().position);
+    const auto whole = archive.Next();
+    assert(whole && whole->position.revision == transaction && whole->protocol_frame->size() > budget);
+    auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
+    auto reply = watch->Read();
+    while (reply.type == '>' && !reply.items.empty() && reply.items[0].value == "schema") reply = watch->Read();
+    if (reply.type != '>') throw std::runtime_error("expected the filtered change, got " + reply.value);
+    assert(Number(reply.items[2]) == transaction);
+    check(reply);
+    watch->Line("ACK " + std::to_string(transaction)); Unwatch(*watch);
+    assert(Number(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "consumer"), "acked")) == transaction);
+}
+void FilteredArchiveArea(bool tls) {
+    FilteredArchiveChange(tls, " AREA 0 0 TO 0 0", [](const Reply& change) {
+        (void)Change(change);
+        const auto& block = change.items[6].items[0];
+        assert(Number(block.items[0]) == 0 && Number(block.items[1]) == 0 && Number(block.items[3].items[0]) == 1U);
+    });
+}
+void FilteredArchiveColumns(bool tls) {
+    FilteredArchiveChange(tls, " COLUMNS n", [](const Reply& change) {
+        (void)Change(change, kArchivedLabels + 1U);
+        for (const auto& block : change.items[6].items) assert(block.items[3].items.size() == 1U);
+    });
+}
+void FilteredArchiveChunks(bool tls) {
+    FilteredArchiveChange(tls, " CHUNKS AREA 0 0 TO 0 0", [](const Reply& chunks) {
+        assert(chunks.items[0].value == "chunks" && chunks.items[6].items.size() == 1U);
+        assert(Number(chunks.items[6].items[0].items[0]) == 0 && Number(chunks.items[6].items[0].items[1]) == 0);
+    });
 }
 void ExcessPoolBound(bool tls) {
     constexpr std::size_t budget = 4096U, share = 1024U;
@@ -2270,7 +2408,9 @@ int main(int argc, char** argv) {
         });
         // Feed share and excess-pool groups run as their own ctest entry.
         if (shares_only || !selected.empty()) {
-            run("share-independent-delivery", ShareIndependentDelivery); run("table-budget-terminates", TableBudgetStillTerminates);
+            run("share-independent-delivery", ShareIndependentDelivery); run("share-metadata-delivery", ShareMetadataDelivery); run("table-budget-terminates", TableBudgetStillTerminates);
+            run("filtered-archive-area", FilteredArchiveArea); run("filtered-archive-columns", FilteredArchiveColumns);
+            run("filtered-archive-chunks", FilteredArchiveChunks);
             run("excess-pool-bound", ExcessPoolBound); run("excess-pool-receipts", ExcessPoolReceipts);
             run("excess-stalled-holder", ExcessStalledHolder); run("TLS-write-cap", TlsWriteCap);
             run("excess-pool-FIFO", ExcessPoolFifo); run("excess-pool-control", ExcessPoolControlFrames);
@@ -2289,7 +2429,7 @@ int main(int argc, char** argv) {
         run("slot-record-outcome", SlotRecordOutcome);
         run("takeover-fence", TakeoverFence); run("takeover", Takeover); run("takeover-rights", TakeoverRights); run("takeover-UNWATCH-return", TakeoverUnwatchReturn); run("takeover-stalled-socket", TakeoverStalledSocket);
         run("takeover-cancellation", TakeoverCancellation);
-        run("lifecycle", Lifecycle); run("rights", Rights); run("watch-revoke", WatchRevoke); run("watch-ACK-revoke", WatchAckRevoke); run("watch-dropped-user", WatchDroppedUser); run("slot-owners", SlotOwners); run("first-attach-owner", FirstAttachOwner); run("archive-handover", ArchiveHandover);
+        run("lifecycle", Lifecycle); run("rights", Rights); run("watch-revoke", WatchRevoke); run("watch-revoke-dimensional", WatchRevokeDimensional); run("watch-ACK-revoke", WatchAckRevoke); run("watch-dropped-user", WatchDroppedUser); run("slot-owners", SlotOwners); run("first-attach-owner", FirstAttachOwner); run("archive-handover", ArchiveHandover);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);

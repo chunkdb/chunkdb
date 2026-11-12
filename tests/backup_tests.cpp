@@ -8,6 +8,7 @@
 #include <mutex>
 #include <sstream>
 #include <map>
+#include <memory>
 #include <set>
 #include "wal_writer.hpp"
 #include "txn_history.hpp"
@@ -20,6 +21,7 @@
 #include "backup.hpp"
 #include "change_feed.hpp"
 #include "checkpoint.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
@@ -141,6 +143,147 @@ void CrcChunks() {
         assert(Crc32Extend(first, nullptr, 0) == first);
         assert(Crc32Extend(first, data + split, text.size() - split) == Crc32(data, text.size()));
     }
+}
+
+void RetainedIdentityCutAndRestore() {
+    ScopedTempDir temporary("chunkdb-backup-retained-identity");
+    const auto root = std::filesystem::canonical(temporary.path());
+    TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
+    auto lease = catalog.Find("default")->Acquire();
+    auto& store = lease->store();
+    WriteCounter(store, {0, 0}, 7U);
+    store.CheckpointForTests(0, 0);
+    store.UnsetBlock(0, 0);
+    const auto retained = store.ReadChunkState(0, 0);
+    store.CheckpointForTests(0, 0);
+    assert(retained.written && retained.version != 0U && retained.commit_time_ms != 0U);
+    assert(!std::filesystem::exists(ChunkDataPath(store.data_dir(), store.geometry(), {0, 0})));
+    assert(!std::filesystem::exists(ChunkWalPath(store.data_dir(), store.geometry(), {0, 0})));
+    Pause pause(BackupTestHook::Point::kBeforeCopy);
+    catalog.SetBackupHookForTests(&pause);
+    auto backup = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "backup", {}); });
+    (void)pause.Wait();
+    WriteCounter(store, {0, 0}, 9U);
+    store.UnsetBlock(0, 0);
+    store.CheckpointForTests(0, 0);
+    const auto source_log = LargeChunkDirectory(store.data_dir(), {0, 0}) / kChunkIndexFileName;
+    const auto source_size = std::filesystem::file_size(source_log);
+    pause.Release();
+    const auto result = backup.get();
+    catalog.SetBackupHookForTests(nullptr);
+    const auto backup_table = root / "backup/tables/default";
+    const auto backup_log = LargeChunkDirectory(backup_table, {0, 0}) / kChunkIndexFileName;
+    assert(std::filesystem::file_size(backup_log) < source_size);
+    const auto record = ReadBackupRecord(root / "backup");
+    ValidateBackupInventory(root / "backup", record);
+    assert(result.tables[0].revision == retained.version);
+    RestoreBackup(root / "backup", root / "restored");
+    TableCatalog restored(Config(root / "restored"));
+    auto restored_lease = restored.Find("default")->Acquire();
+    const auto state = restored_lease->store().ReadChunkState(0, 0);
+    assert(state.written && state.version == retained.version && state.commit_time_ms == retained.commit_time_ms);
+    assert(restored_lease->store().HasWrittenChunkIdentities());
+    assert(restored_lease->store().store_id() != store.store_id());
+    restored_lease->store().SetBlockBits(0, 0, CounterBits(11U));
+    assert(ReadCounter(restored_lease->store(), {0, 0}) == 11U);
+    const auto manifest = *ReadStoreManifest(backup_table);
+    const Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
+    auto payload = std::vector<std::uint8_t>(geometry.ChunkPayloadBytes(), 0U);
+    auto presence = std::vector<std::uint8_t>(ChunkPresenceBitmapBytes(geometry), 0U);
+    payload[0] = 7U;
+    presence[0] = 1U;
+    const auto image = ChunkDataPath(backup_table, geometry, {0, 0});
+    AtomicWrite(image, SerializeChunkImage(geometry, {0, 0}, payload, presence,
+        CheckpointCompression::kNone, retained.version, retained.commit_time_ms, manifest.store_id), true, true);
+    auto overlap = record;
+    overlap.files.push_back(InspectBackupFile(root / "backup", image.lexically_relative(root / "backup")));
+    AtomicWrite(root / "backup" / kBackupMarkerName, SerializeBackupRecord(overlap), true, true);
+    assert(!Error([&] { ValidateBackupInventory(root / "backup", overlap); }).empty());
+    assert(!Error([&] { RestoreBackup(root / "backup", root / "overlap"); }).empty());
+    assert(!std::filesystem::exists(root / "overlap"));
+    std::filesystem::remove(image);
+    AtomicWrite(root / "backup" / kBackupMarkerName, SerializeBackupRecord(record), true, true);
+    auto corrupt = LoadFile(backup_log);
+    corrupt.back() ^= 1U;
+    AtomicWrite(backup_log, corrupt, true, true);
+    auto damaged = record;
+    for (auto& file : damaged.files)
+        if (file.relative_path == std::filesystem::path("tables/default/L_0_0/chunkdb.index"))
+            file = InspectBackupFile(root / "backup", file.relative_path);
+    AtomicWrite(root / "backup" / kBackupMarkerName, SerializeBackupRecord(damaged), true, true);
+    assert(!Error([&] { RestoreBackup(root / "backup", root / "damaged"); }).empty());
+    assert(!std::filesystem::exists(root / "damaged"));
+}
+
+void FailedIndexRefusesBackup() {
+    ScopedTempDir temporary("chunkdb-backup-failed-coordinate-index");
+    const auto root = std::filesystem::canonical(temporary.path());
+    TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
+    auto lease = catalog.Find("default")->Acquire();
+    auto& store = lease->store();
+    WriteCounter(store, {0, 0}, 7U);
+    store.CheckpointForTests(0, 0);
+    store.UnsetBlock(0, 0);
+    store.WalBarrier();
+    SetDirectorySyncObserverForTests([&](const auto& path) {
+        if (path == store.data_dir()) throw std::runtime_error("injected retained inventory sync outcome");
+    });
+    const auto failure = Error([&] { store.CheckpointForTests(0, 0); });
+    SetDirectorySyncObserverForTests({});
+    assert(failure.find("injected retained inventory sync outcome") != std::string::npos);
+    assert(Error([&] { (void)catalog.BackupTo(root / "backup", {}); }).find("failed coordinate index") != std::string::npos);
+    assert(!std::filesystem::exists(root / "backup" / kBackupMarkerName));
+}
+
+void CancelBetweenBoundedWalReplayReads() {
+    ScopedTempDir temporary("chunkdb-backup-cancel-streaming-wal");
+    const auto root = std::filesystem::canonical(temporary.path());
+    TableCatalog catalog(Config(root / "source"));
+    (void)feed_test::CreateDefault(catalog);
+    catalog.ChangeColumns("default", [](const TableSchema& schema) {
+        return AddColumn(schema, {.id = 0U, .name = "data", .type = {ColumnKind::kBytes, 1024U * 1024U},
+            .nullable = true, .default_value = {}});
+    });
+    {
+        auto lease = catalog.Find("default")->Acquire();
+        (void)lease->store().SetBlock(0, 0, {{"data", BytesValue{std::vector<std::uint8_t>(512U * 1024U, 7U)}}}, {});
+    }
+    class ReadPause final : public BackupTestHook {
+      public:
+        void Run(Point point, std::string_view, std::uint64_t) override {
+            if (point != Point::kBeforeWalReplayRead) return;
+            std::unique_lock lock(mutex_);
+            if (++reads_ != 8U) return;
+            entered_ = true;
+            condition_.notify_all();
+            condition_.wait(lock, [&] { return released_; });
+        }
+        void Wait() {
+            std::unique_lock lock(mutex_);
+            assert(condition_.wait_for(lock, 10s, [&] { return entered_; }));
+        }
+        void Release() { std::lock_guard lock(mutex_); released_ = true; condition_.notify_all(); }
+        std::size_t reads() { std::lock_guard lock(mutex_); return reads_; }
+      private:
+        std::mutex mutex_;
+        std::condition_variable condition_;
+        std::size_t reads_ = 0U;
+        bool entered_ = false, released_ = false;
+    } pause;
+    std::stop_source cancellation;
+    catalog.SetBackupHookForTests(&pause);
+    auto backup = std::async(std::launch::async, [&] {
+        return Error([&] { (void)catalog.BackupTo(root / "backup", {.cancelled = cancellation.get_token()}); });
+    });
+    pause.Wait();
+    assert(cancellation.request_stop());
+    pause.Release();
+    assert(backup.get().find("backup cancelled") != std::string::npos);
+    catalog.SetBackupHookForTests(nullptr);
+    assert(pause.reads() == 8U);
+    assert(!std::filesystem::exists(root / "backup" / kBackupMarkerName));
 }
 void CutAndProgress(DurabilityMode mode) {
     ScopedTempDir temp("chunkdb-backup-cut");
@@ -417,16 +560,21 @@ void ColdRecovery(unsigned defect) {
     if (defect == 3) {
         const TxnIntent intent{.state = TxnIntentState::kRollback, .version = version,
             .entries = {{.coord = {0, 0}, .wal_boundary = boundary}}};
-        SaveBytes(TxnIntentPath(source / "tables/default", version), SerializeTxnIntent(intent));
+        const auto manifest = ReadStoreManifest(source / "tables/default");
+        SaveBytes(TxnIntentPath(source / "tables/default", version),
+            SerializeTxnIntent(intent, manifest->geometry.dims, manifest->store_id));
     }
     if (defect == 4) std::filesystem::rename(wal, wal.parent_path() / "C_00_0.wal");
-    TableCatalog catalog(Config(source, DurabilityMode::kFsyncWal));
-    auto lease = catalog.Find("default")->Acquire();
-    assert(!lease->store().IsChunkLoadedForTests(0, 0));
     if (defect == 2 || defect == 4) {
-        assert(!Error([&] { (void)catalog.BackupTo(root / "backup", {}); }).empty());
+        assert(!Error([&] {
+            TableCatalog catalog(Config(source, DurabilityMode::kFsyncWal));
+            (void)catalog.BackupTo(root / "backup", {});
+        }).empty());
         assert(!std::filesystem::exists(root / "backup" / kBackupMarkerName));
     } else {
+        TableCatalog catalog(Config(source, DurabilityMode::kFsyncWal));
+        auto lease = catalog.Find("default")->Acquire();
+        assert(!lease->store().IsChunkLoadedForTests(0, 0));
         (void)catalog.BackupTo(root / "backup", {});
         assert(!lease->store().IsChunkLoadedForTests(0, 0));
         assert(txn_test::CounterOf(ReadBackup(root / "backup", "default", {0, 0})) == (defect == 1 ? 0U : 11U));
@@ -560,8 +708,10 @@ void ColdTailRepairPreservesPinnedInode() {
         wal = ChunkWalPath(lease->store().data_dir(), lease->store().geometry(), {0, 0});
     }
     const auto boundary = std::filesystem::file_size(wal);
-    { std::ofstream output(wal, std::ios::binary | std::ios::app); output.put('F'); }
     TableCatalog catalog(Config(source));
+    // Startup admits every producing identity; introduce the recoverable tail
+    // after that admission so this fixture exercises repair of a pinned inode.
+    { std::ofstream output(wal, std::ios::binary | std::ios::app); output.put('F'); }
     Pause pause(BackupTestHook::Point::kBeforeCopy); catalog.SetBackupHookForTests(&pause);
     auto backup = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "backup", {}); });
     pause.Wait();
@@ -725,7 +875,8 @@ void OrphanedStagingCleanup() {
                 if (point == Point::kBeforeCopy) throw std::runtime_error("interrupted backup");
             }
         } interrupt;
-        Log log;
+        // On the heap: freeing it ends its mutex for ThreadSanitizer, which a stack slot reused by a later object does not.
+        const auto log = std::make_unique<Log>();
         // An interrupted backup whose own cleanup fails leaves its staging behind.
         catalog.SetBackupHookForTests(&interrupt);
         {
@@ -733,13 +884,13 @@ void OrphanedStagingCleanup() {
             assert(Error([&] { (void)catalog.BackupTo(root / "interrupted", {}); }) == "interrupted backup");
         }
         catalog.SetBackupHookForTests(nullptr);
-        assert(log.Has("backup staging cleanup failed") && entries().size() == kept.size() + 1U);
+        assert(log->Has("backup staging cleanup failed") && entries().size() == kept.size() + 1U);
         assert(std::filesystem::exists(root / "interrupted" / kBackupIncompleteName));
         // The next backup removes it before staging its own files.
         (void)catalog.BackupTo(root / "next", {});
         ValidateBackupInventory(root / "next", ReadBackupRecord(root / "next"));
         assert(entries() == kept);
-        assert(log.Has("unowned backup staging entry retained") && log.Has("backup destination in backup staging retained"));
+        assert(log->Has("unowned backup staging entry retained") && log->Has("backup destination in backup staging retained"));
         // A running backup keeps its staging while another one is refused.
         Pause pause(BackupTestHook::Point::kBeforeCopy); catalog.SetBackupHookForTests(&pause);
         auto running = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "running", {}); });
@@ -761,10 +912,10 @@ void OrphanedStagingCleanup() {
     }
     {
         // A writer start keeps what it cannot remove, with a warning, and opens normally.
-        Log log;
+        const auto log = std::make_unique<Log>();
         ScopedEnv fail("CHUNKDB_FAILPOINT_BACKUP_STAGING_CLEANUP_FAIL_ONCE", "1");
         TableCatalog catalog(Config(source));
-        assert(log.Has("backup staging cleanup failed") && std::filesystem::exists(left));
+        assert(log->Has("backup staging cleanup failed") && std::filesystem::exists(left));
         auto lease = catalog.Find("default")->Acquire(); assert(ReadCounter(lease->store(), {0, 0}) == 11U);
     }
     { TableCatalog catalog(Config(source)); assert(entries() == kept); }
@@ -1118,11 +1269,44 @@ void CancelCatalogWaitAndRestrictions() {
     { TableCatalog catalog(multi); assert(!Error([&] { (void)catalog.BackupTo(root / "multi", {}); }).empty()); }
 }
 }
+// A background checkpoint that writes a chunk's files without its lock holds
+// maintenance admission, so a backup waits for it, then pins the image, the
+// WAL and the coordinate index it leaves, with the write made meanwhile.
+void BackupWaitsForBackgroundCheckpointFiles() {
+    ScopedTempDir temp("chunkdb-backup-checkpoint-files");
+    const auto root = std::filesystem::canonical(temp.path());
+    auto config = Config(root / "source");
+    config.background_maintenance = true;
+    config.default_options.checkpoint_update_interval = 1U;
+    TableCatalog catalog(config);
+    (void)feed_test::CreateDefault(catalog);
+    {
+        auto lease = catalog.Find("default")->Acquire();
+        auto& store = lease->store();
+        store.WalBarrier();
+        store.ArmCheckpointBeforeWalRemovalPauseForTests();
+        WriteCounter(store, {0, 0}, 7U);
+        assert(store.WaitForCheckpointBeforeWalRemovalForTests());
+        WriteCounter(store, {0, 0}, 8U);
+        auto backup = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "backup", {}); });
+        const bool waited = backup.wait_for(200ms) != std::future_status::ready;
+        store.ResumeCheckpointBeforeWalRemovalForTests();
+        (void)backup.get();
+        assert(waited);
+    }
+    ValidateBackupInventory(root / "backup", ReadBackupRecord(root / "backup"));
+    RestoreBackup(root / "backup", root / "restored");
+    TableCatalog restored(Config(root / "restored"));
+    auto lease = restored.Find("default")->Acquire();
+    assert(ReadCounter(lease->store(), {0, 0}) == 8U);
+}
 int main(int argc, char** argv) {
 #ifdef _WIN32
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
     _set_error_mode(_OUT_TO_STDERR);
 #endif
+    if (argc == 2 && std::string_view(argv[1]) == "--retained-index") { RetainedIdentityCutAndRestore(); FailedIndexRefusesBackup(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--cancel-wal-replay") { CancelBetweenBoundedWalReplayReads(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--batched-eviction") { BatchedEvictionDuringPin(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--waiting-maintenance") { WaitingBackupDefersCheckpoints(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--dropped-table") { DroppedSnapshotTableSkipped(); return 0; }
@@ -1145,10 +1329,13 @@ int main(int argc, char** argv) {
         ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); StagingOwnerValidation(); return 0;
     }
     PlainWriterBounds(true); PlainWriterBounds(false); EndedFeedDoesNotClearNewProducers();
-    BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); DroppedSnapshotTableSkipped();
+    BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); BackupWaitsForBackgroundCheckpointFiles(); DroppedSnapshotTableSkipped();
     PerTableDdlProgress(); ColdPinAndStagingAlias(); ColdTailRepairPreservesPinnedInode();
     ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); OrphanedStagingCleanup(); StagingOwnerValidation(); StagingCleanupAliasReplacement(); StagingCleanupRootReplacement();
     CrcChunks();
+    RetainedIdentityCutAndRestore();
+    FailedIndexRefusesBackup();
+    CancelBetweenBoundedWalReplayReads();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint}) { CutAndProgress(mode); AcknowledgedLoad(mode); }
     CopyReleasesHoldsAndBusy(); TargetAndCancellation(); CompletionAndPoison(); FailedGenerationAndEmptyCatalog(); CancelCatalogWaitAndRestrictions();
     for (unsigned defect = 0; defect < 5U; ++defect) ColdRecovery(defect);

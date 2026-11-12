@@ -41,7 +41,7 @@ chunk-cli --uri "$CHUNKDB_URI" watch feed_demo
 
 ```output
 start <epoch>:0
-change revision 2 time_ms <time-ms> user admin
+change revision 1 time_ms <time-ms> user admin
   block 0 0: (absent) -> {kind = 1}
 ```
 
@@ -52,7 +52,7 @@ SET BLOCK 0 0 IN feed_demo kind = 1
 ```
 
 ```output
-2
+1
 ```
 
 Press Ctrl-C to stop the CLI watcher; it sends UNWATCH.
@@ -64,8 +64,8 @@ chunk-cli --uri "$CHUNKDB_URI" watch feed_demo --slot consumer
 
 ```output
 start <epoch>:0
-schema <epoch>:2 version 1
-change revision 2 time_ms <time-ms> user admin
+schema <epoch>:1 version 1
+change revision 1 time_ms <time-ms> user admin
   block 0 0: (absent) -> {kind = 1}
 ```
 
@@ -95,9 +95,9 @@ UNWATCH
 ## Arguments
 
 - `name`: quoted `[a-z_][a-z0-9_]*`, 1 through 63 bytes.
-- `AREA`: inclusive chunk-coordinate rectangle; transactions are clipped to blocks inside it.
-- `COLUMNS`: project values in declared order; column IDs preserve the projection across renames.
-- `NO BEFORE`: omit previous values from mutation events.
+- `AREA`: inclusive chunk-coordinate rectangle or cuboid with exactly the table's active axes; transactions are clipped to it.
+- `COLUMNS`: project block values in declared order; column IDs preserve the projection across renames, and chunk metadata remains complete.
+- `NO BEFORE`: omit previous block and chunk-metadata rows from mutation events.
 - `CHUNKS`: receive each relevant committed chunk's version and whole form instead of block changes.
 - `OWNER`: the user the slot belongs to; it defaults to the user running CREATE SLOT, and the user need not exist yet.
 - `epoch`: the table's identity; dropping and recreating a table changes it.
@@ -126,7 +126,7 @@ UNWATCH
 | SLOT_BUSY | The slot already has a watcher. | Close its existing watcher. |
 | SLOT_LOST | Retained history exceeds its limit, or a projected column was dropped. | Rebuild state and recreate the slot. |
 | INVALID_ARGUMENT reason=slot_filters | WATCH or conditional creation uses different slot filters, or conditional creation gives another OWNER. | Inherit its filters or create another slot. |
-| OUT_OF_RANGE | A single slot change or schema event, with its ACK TIMEOUT record when set, is larger than the table's `feed_buffer_bytes`. | Increase feed_buffer_bytes before reconnecting. |
+| OUT_OF_RANGE | A single slot change or schema event, as the slot's filters send it and with its ACK TIMEOUT record when set, is larger than the table's `feed_buffer_bytes`. | Increase feed_buffer_bytes before reconnecting. |
 | INVALID_ARGUMENT | ACK exceeds the last fully delivered position. | Acknowledge only processed events. |
 | INVALID_ARGUMENT | You run WATCH, CREATE SLOT or DROP SLOT on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | PROTOCOL | You send another statement while streaming. | Use a separate connection. |
@@ -147,6 +147,9 @@ A dropped projected column makes the slot lost with `reason=schema_filter`.
 SHOW SLOTS preserves its IDs and uses null for names that no longer exist.
 
 Conditional removal still checks rights and requires an existing table.
+Change events contain complete before and after metadata rows when chunk columns change.
+A null metadata before row means the chunk had never been written.
+Metadata-only changes remain visible under block-column projections.
 Watches have no idle timeout.
 After ordinary UNWATCH, the subscription is removed and its configured history linger begins before success returns.
 

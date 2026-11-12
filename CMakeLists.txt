@@ -22,6 +22,13 @@ option(
     ON
 )
 option(CHUNKDB_ENABLE_PACKAGING "Enable CPack archive packaging configuration" ON)
+# Benchmark builds only: every commit takes a fixed time per chunk instead of
+# the wall clock, so a paired budget run measures the commit-time bookkeeping.
+option(CHUNKDB_BENCH_CONSTANT_COMMIT_TIME "Benchmark only: fixed commit times, not for serving data" OFF)
+if(CHUNKDB_BENCH_CONSTANT_COMMIT_TIME)
+    message(WARNING "CHUNKDB_BENCH_CONSTANT_COMMIT_TIME is for benchmark comparisons only: commit times are not wall-clock times")
+    add_compile_definitions(CHUNKDB_BENCH_CONSTANT_COMMIT_TIME=1)
+endif()
 # Failure injection read from CHUNKDB_FAILPOINT_* environment variables, used
 # by the tests; without it the engine never reads them.
 option(CHUNKDB_FAILPOINTS "Compile test failure injection into the engine" ${CHUNKDB_BUILD_TESTS})
@@ -53,8 +60,16 @@ add_library(chunkdb_core STATIC
     src/block_ops.cpp
     src/checkpoint.cpp
     src/chunk_cache.cpp
+    src/chunk_coordinate_index.cpp
+    src/coordinate_index_store.cpp
     src/chunk_format.cpp
     src/chunk_form.cpp
+    src/typed_chunk_form.cpp
+    src/sectioned_chunk_form.cpp
+    src/txn_intent_format.cpp
+    src/populated_index_format.cpp
+    src/archive_base_format.cpp
+    src/chunk_file_header.cpp
     src/feed_protocol.cpp
     src/change_feed.cpp
     src/feed_slot_records.cpp
@@ -63,8 +78,10 @@ add_library(chunkdb_core STATIC
     src/feed_archive.cpp
     src/feed_prefix.cpp
     src/chunk_ops.cpp
+    src/chunk_scan.cpp
     src/chunk_store.cpp
     src/conditional_intent.cpp
+    src/rollback_preflight.cpp
     src/crc32.cpp
     src/crc32_armv8.cpp
     src/crc32_clmul.cpp
@@ -88,21 +105,26 @@ add_library(chunkdb_core STATIC
     src/lifecycle_log.cpp
     src/logging.cpp
     src/maintenance.cpp
+    src/maintenance_pool.cpp
     src/metrics.cpp
     src/process_lock.cpp
     src/protocol.cpp
     src/request_framing.cpp
     src/reply_stream.cpp
     src/snapshot_generation.cpp
+    src/shared_file_input.cpp
     src/store_manifest.cpp
     src/statement_control.cpp
     src/chunk_layout.cpp
+    src/chunk_columns.cpp
     src/cql.cpp
     src/expr.cpp
     src/expr_eval.cpp
     src/schema.cpp
     src/store_resources.cpp
     src/table_catalog.cpp
+    src/table_chunk_columns.cpp
+    src/table_tombstones.cpp
     src/table_catalog_migrations.cpp
     src/migrations_records.cpp
     src/migrations_apply.cpp
@@ -112,9 +134,12 @@ add_library(chunkdb_core STATIC
     src/txn_intent.cpp
     src/version_clock.cpp
     src/wal_replay.cpp
+    src/wal_stream_replay.cpp
+    src/wal_prefix.cpp
     src/wal_stream_pool.cpp
     src/wal_writer.cpp
     src/world_read.cpp
+    src/world_read_3d.cpp
     src/zrle.cpp
 )
 
@@ -165,6 +190,8 @@ target_link_libraries(chunkdb_bench PRIVATE chunkdb_core)
 add_executable(chunkdb_large_world_bench
     bench/large_world_bench.cpp
 )
+add_executable(chunkdb_maintenance_bench bench/maintenance_bench.cpp)
+target_link_libraries(chunkdb_maintenance_bench PRIVATE chunkdb_core)
 target_link_libraries(chunkdb_large_world_bench PRIVATE chunkdb_core)
 
 add_executable(chunkdb_compression_bench
@@ -324,7 +351,38 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_geometry_bit_test tests/geometry_bit_tests.cpp)
     target_link_libraries(chunkdb_geometry_bit_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME geometry_bit COMMAND chunkdb_geometry_bit_test)
+
+    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol)
+        add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
+        target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
+        target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME ${format} COMMAND chunkdb_${format}_test)
+        set_tests_properties(${format} PROPERTIES TIMEOUT 60 LABELS "smoke")
+    endforeach()
+
+    # Crash children of the coordinate index and tombstone compaction run in the crash label.
+    add_test(NAME chunk_coordinate_index_crash COMMAND chunkdb_chunk_coordinate_index_test --crash-boundaries)
+    add_test(NAME table_tombstones_crash COMMAND chunkdb_table_tombstones_test --crash-children)
+    set_tests_properties(chunk_coordinate_index_crash table_tombstones_crash PROPERTIES TIMEOUT 300)
+
+    add_test(NAME cql_chunk_model_3d COMMAND chunkdb_cql_chunk_model_test --3d)
+    add_test(NAME feed_chunk_model_3d COMMAND chunkdb_feed_chunk_model_test --3d)
+    set_tests_properties(cql_chunk_model_3d feed_chunk_model_3d PROPERTIES TIMEOUT 60 LABELS "smoke")
+
+    foreach(verifier IN ITEMS verify_index verify_memory chunk_model_persistence_3d)
+        add_executable(chunkdb_${verifier}_test tests/${verifier}_tests.cpp)
+        target_link_libraries(chunkdb_${verifier}_test PRIVATE chunkdb_tools)
+        target_include_directories(chunkdb_${verifier}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        add_test(NAME ${verifier} COMMAND chunkdb_${verifier}_test)
+        set_tests_properties(${verifier} PROPERTIES TIMEOUT 60 LABELS "smoke")
+    endforeach()
+    if(MINGW)
+        # The allocation counter replaces new/delete as one matched family.
+        # A shared C++ runtime can free its prefixed pointers through DLL delete.
+        target_link_options(chunkdb_verify_memory_test PRIVATE -static-libstdc++ -static-libgcc)
+    endif()
 
     add_executable(chunkdb_storage_test tests/storage_tests.cpp)
     target_link_libraries(chunkdb_storage_test PRIVATE chunkdb_core)
@@ -527,6 +585,12 @@ if(CHUNKDB_BUILD_TESTS)
         PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src
     )
     add_test(NAME table_catalog COMMAND chunkdb_table_catalog_test)
+
+    add_executable(chunkdb_maintenance_pool_test tests/maintenance_pool_tests.cpp)
+    target_link_libraries(chunkdb_maintenance_pool_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_maintenance_pool_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME maintenance_pool COMMAND chunkdb_maintenance_pool_test)
+    set_tests_properties(maintenance_pool PROPERTIES TIMEOUT 30)
 
     add_executable(chunkdb_chunk_vars_test tests/chunk_vars_tests.cpp)
     target_link_libraries(chunkdb_chunk_vars_test PRIVATE chunkdb_tools)
@@ -777,6 +841,7 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_server_bench_test tests/server_bench_tests.cpp)
     target_link_libraries(chunkdb_server_bench_test PRIVATE chunkdb_server_bench_lib)
+    target_include_directories(chunkdb_server_bench_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     if(WIN32)
         target_link_libraries(chunkdb_server_bench_test PRIVATE ws2_32)
     endif()
@@ -918,6 +983,7 @@ if(CHUNKDB_BUILD_TESTS)
 
     set(CHUNKDB_TEST_TARGETS
         chunkdb_user_admission_test
+        chunkdb_maintenance_pool_test
         chunkdb_backup_migrations_test
         chunkdb_backup_test
         chunkdb_backup_crash_test
@@ -935,6 +1001,37 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_feed_lifecycle_test
         chunkdb_table_feed_limits_test
         chunkdb_geometry_bit_test
+        chunkdb_sectioned_chunk_form_test
+        chunkdb_txn_intent_format_test
+        chunkdb_populated_index_format_test
+        chunkdb_archive_base_format_test
+        chunkdb_chunk_file_header_test
+        chunkdb_chunk_identity_test
+        chunkdb_chunk_schema_test
+        chunkdb_chunk_storage_format_test
+        chunkdb_chunk_columns_test
+        chunkdb_chunk_metadata_runtime_test
+        chunkdb_typed_chunk_form_test
+        chunkdb_atomic_stream_test
+        chunkdb_block_coordinates_test
+        chunkdb_wal_prefix_test
+        chunkdb_wal_stream_replay_test
+        chunkdb_shared_file_input_test
+        chunkdb_chunk_coordinate_index_test
+        chunkdb_table_chunk_columns_test
+        chunkdb_world_coordinates_3d_test
+        chunkdb_feed_archive_base_test
+        chunkdb_feed_alias_recovery_test
+        chunkdb_chunk_mutation_model_test
+        chunkdb_chunk_identity_scan_test
+        chunkdb_rollback_preflight_test
+        chunkdb_table_tombstones_test
+        chunkdb_cql_chunk_model_test
+        chunkdb_feed_chunk_model_test
+        chunkdb_feed_chunk_protocol_test
+        chunkdb_chunk_model_persistence_3d_test
+        chunkdb_verify_index_test
+        chunkdb_verify_memory_test
         chunkdb_storage_test
         chunkdb_store_manifest_test
         chunkdb_chunk_vars_test
@@ -1060,6 +1157,37 @@ if(CHUNKDB_BUILD_TESTS)
         feed_lifecycle
         table_feed_limits
         geometry_bit
+        sectioned_chunk_form
+        txn_intent_format
+        populated_index_format
+        archive_base_format
+        chunk_file_header
+        chunk_identity
+        chunk_schema
+        chunk_storage_format
+        chunk_columns
+        chunk_metadata_runtime
+        typed_chunk_form
+        atomic_stream
+        block_coordinates
+        wal_prefix
+        wal_stream_replay
+        shared_file_input
+        chunk_coordinate_index
+        table_chunk_columns
+        world_coordinates_3d
+        feed_archive_base
+        feed_alias_recovery
+        chunk_mutation_model
+        chunk_identity_scan
+        rollback_preflight
+        table_tombstones
+        cql_chunk_model
+        feed_chunk_model
+        feed_chunk_protocol
+        chunk_model_persistence_3d
+        verify_index
+        verify_memory
         storage
         store_manifest
         chunk_vars
@@ -1134,6 +1262,8 @@ if(CHUNKDB_BUILD_TESTS)
         durability_crash_hardening
         snapshot_generation_linger
         txn_crash
+        chunk_coordinate_index_crash
+        table_tombstones_crash
     )
 
     if(TARGET chunkdb_server_tls_error_queue_test)

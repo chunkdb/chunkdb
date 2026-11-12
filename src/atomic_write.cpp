@@ -141,9 +141,11 @@ void CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path) {
         }
     }
 }
-void AtomicWrite(
+namespace {
+template <typename Data>
+void AtomicWriteImpl(
     const std::filesystem::path& path,
-    const std::vector<std::uint8_t>& bytes,
+    const Data& bytes,
     bool fsync_file,
     bool fsync_directory,
     bool* out_replaced,
@@ -223,6 +225,22 @@ void AtomicWrite(
         }
         SyncDirectoryPath(parent);
     }
+}
+
+}  // namespace
+
+void AtomicWrite(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes,
+    bool fsync_file, bool fsync_directory, bool* out_replaced, const char* after_rename_failpoint,
+    bool enable_generic_failpoints, void (*before_replace)()) {
+    AtomicWriteImpl(path, bytes, fsync_file, fsync_directory, out_replaced,
+        after_rename_failpoint, enable_generic_failpoints, before_replace);
+}
+
+void AtomicWriteStream(const std::filesystem::path& path, const AtomicFileProducer& produce,
+    bool fsync_file, bool fsync_directory, bool* out_replaced, const char* after_rename_failpoint,
+    bool enable_generic_failpoints) {
+    AtomicWriteImpl(path, produce, fsync_file, fsync_directory, out_replaced,
+        after_rename_failpoint, enable_generic_failpoints, nullptr);
 }
 
 bool PublishNewFile(

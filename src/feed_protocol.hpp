@@ -30,5 +30,18 @@ std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const Fee
     const std::optional<FeedArea>& area, const std::optional<std::vector<std::uint32_t>>& ids,
     bool no_before, const std::vector<Column>& columns);
 std::string EncodeFeedEntry(const FeedEntry& entry);
+std::size_t FeedEntryRetainedBytes(const FeedEntry& entry);
+std::size_t FeedRowRetainedBytes(const std::optional<std::vector<ColumnValue>>& row);
+// Lower bounds of the bytes EncodeFeedEntry writes for one row, for one block or chunk change, and for one chunk
+// of a chunks frame.
+std::size_t FeedRowMinimumEncodedBytes(const std::optional<std::vector<ColumnValue>>& row);
+std::size_t FeedChangeItemMinimumEncodedBytes(std::uint8_t dims,
+    const std::optional<std::vector<ColumnValue>>& before, const std::optional<std::vector<ColumnValue>>& after);
+std::size_t FeedChunkFormMinimumEncodedBytes(std::uint8_t dims, const std::shared_ptr<const std::string>& form);
+// True when `area` is unset or holds chunk `coord`.
+bool FeedAreaHolds(const std::optional<FeedArea>& area, std::uint8_t dims, ChunkCoord coord);
+// The indexes in `columns` of the projected column `ids`, in their order, as FilterFeedEntry and ChunkFeedEntry
+// project them; throws when one was dropped or repeats.
+std::vector<std::size_t> FeedProjectionIndexes(const std::vector<Column>& columns, const std::vector<std::uint32_t>& ids);
 std::string EncodeFeedResync(FeedPosition position, const std::optional<TableLineage>& lineage);
 }

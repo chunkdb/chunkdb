@@ -6,6 +6,7 @@
 
 #include "feed_test_utils.hpp"
 #include "feed_protocol.hpp"
+#include "typed_chunk_form.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -120,7 +121,8 @@ void ChunkCaptureLifetime() {
     std::string expected;
     { auto lease = table->Acquire(); auto& store = lease->store();
       store.SetBlockBits(0, 0, Bits(7)); const auto state = store.ReadChunkState(0, 0);
-      expected = EncodeChunkForm(store.geometry().layout(), state.version, state.payload, state.presence_bitmap, state.vars, {});
+      const auto form = EncodeSectionedChunkState(store.geometry(), state, kVarMaxChunkBytesLimit);
+      expected.assign(reinterpret_cast<const char*>(form.data()), form.size());
       store.SetBlockBits(0, 0, Bits(8)); }
     const auto first = Next(*chunks);
     assert(first->kind == FeedEntry::Kind::kChunks && first->chunk_forms.size() == 1U);

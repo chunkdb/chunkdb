@@ -20,8 +20,8 @@ struct FeedSlotRecord {
     bool lost = false;
     FeedSlotFilters filters{};
     bool schema_filter_lost = false;
-    // The user name the slot belongs to. Records written before owners were
-    // recorded have none; such a slot takes the user of its first attach.
+    // The user name the slot belongs to. A slot created without authentication
+    // has none; such a slot takes the user of its first granted attach.
     std::optional<std::string> owner{};
 };
 
@@ -30,6 +30,7 @@ struct FeedSlotRecords {
     std::uint64_t durable_watermark = 0;
     std::vector<FeedSlotRecord> slots;
     bool filter_format = false;
+    std::uint8_t dims = 2U;
 };
 
 void RequireValidFeedSlotName(std::string_view name);
@@ -37,7 +38,11 @@ void RequireValidFeedSlotName(std::string_view name);
 void RequireValidFeedSlotOwner(std::string_view owner);
 [[nodiscard]] std::vector<std::uint8_t> SerializeFeedSlotRecords(const FeedSlotRecords& records);
 [[nodiscard]] FeedSlotRecords ParseFeedSlotRecords(const std::vector<std::uint8_t>& bytes, const StoreId& epoch);
+[[nodiscard]] FeedSlotRecords ParseFeedSlotRecords(
+    const std::vector<std::uint8_t>& bytes, const StoreId& epoch, std::uint8_t expected_dims);
 [[nodiscard]] std::optional<FeedSlotRecords> ReadFeedSlotRecords(const std::filesystem::path& dir, const StoreId& epoch);
+[[nodiscard]] std::optional<FeedSlotRecords> ReadFeedSlotRecords(
+    const std::filesystem::path& dir, const StoreId& epoch, std::uint8_t expected_dims);
 void WriteFeedSlotRecords(const std::filesystem::path& dir, const FeedSlotRecords& records, bool* published = nullptr);
 
 }  // namespace chunkdb

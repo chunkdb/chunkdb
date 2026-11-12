@@ -35,6 +35,7 @@ struct MigrationRequest {
     bool if_exists = false;
     std::function<TableDefinition()> definition;
     std::function<bool(const TableSchema&)> columns_if_needed;
+    bool chunk_column = false;
     // Throws when the caller may not learn whether a recorded name is skipped
     // or conflicts; runs before a recorded name is compared.
     std::function<void(const MigrationRecord&)> require_recorded_access;

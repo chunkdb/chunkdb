@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <chrono>
 #include <cerrno>
+#include <cstdlib>
 #include <cstring>
 #include <fstream>
 #include <limits>
@@ -132,14 +133,20 @@ void WalFrameBuilder::Reserve(std::size_t record_bytes) {
     if (finished_) {
         throw std::logic_error("WAL frame already finished");
     }
-    if (record_bytes > batch_->max_size() - batch_->size() - kWalFrameTrailerSize) {
-        throw std::invalid_argument("WAL frame too large");
-    }
+    // The records would be refused once appended; nothing is reserved for them.
+    const auto held = batch_->size() - header_index_;
+    if (held > kMaxWalFrameBytes - kWalFrameTrailerSize ||
+        record_bytes > kMaxWalFrameBytes - kWalFrameTrailerSize - held)
+        throw std::invalid_argument("WAL frame exceeds its byte limit");
     batch_->reserve(batch_->size() + record_bytes + kWalFrameTrailerSize);
 }
 
 std::size_t WalFrameBuilder::SpanRecordBytes(std::size_t size) noexcept {
     return kWalRecordHeaderSize + kWalSpanOffsetSize + size;
+}
+
+std::size_t WalFrameBuilder::ChunkColumnsRecordBytes(const ChunkColumnState& state) noexcept {
+    return kWalRecordHeaderSize + state.bytes.size();
 }
 
 std::size_t WalFrameBuilder::VarUpdateRecordBytes(const ChunkVars& vars, const VarUndo& undo) {
@@ -168,18 +175,14 @@ void WalFrameBuilder::AppendSpan(
         size > std::numeric_limits<std::uint32_t>::max() - byte_offset) {
         throw std::invalid_argument("WAL span too large");
     }
-    if (record_count_ >= std::numeric_limits<std::uint32_t>::max()) {
-        throw std::invalid_argument("WAL frame record count overflow");
-    }
+    RequireRecordSize(kWalSpanOffsetSize + size);
     batch_->reserve(batch_->size() + kWalRecordHeaderSize + kWalSpanOffsetSize + size);
-    batch_->push_back(kWalRecordSpan);
-    WriteLe32(*batch_, static_cast<std::uint32_t>(kWalSpanOffsetSize + size));
+    BeginRecord(kWalRecordSpan, kWalSpanOffsetSize + size);
     WriteLe32(*batch_, byte_offset);
     batch_->insert(batch_->end(), bytes, bytes + size);
-    record_count_ += 1;
 }
 
-void WalFrameBuilder::BeginRecord(std::uint8_t type, std::size_t body_size) {
+void WalFrameBuilder::RequireRecordSize(std::size_t body_size) const {
     if (finished_) {
         throw std::logic_error("WAL frame already finished");
     }
@@ -189,6 +192,14 @@ void WalFrameBuilder::BeginRecord(std::uint8_t type, std::size_t body_size) {
     if (record_count_ >= std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("WAL frame record count overflow");
     }
+    const auto held = batch_->size() - header_index_;
+    if (held > kMaxWalFrameBytes - kWalRecordHeaderSize - kWalFrameTrailerSize ||
+        body_size > kMaxWalFrameBytes - kWalRecordHeaderSize - kWalFrameTrailerSize - held)
+        throw std::invalid_argument("WAL frame exceeds its byte limit");
+}
+
+void WalFrameBuilder::BeginRecord(std::uint8_t type, std::size_t body_size) {
+    RequireRecordSize(body_size);
     batch_->push_back(type);
     WriteLe32(*batch_, static_cast<std::uint32_t>(body_size));
     record_count_ += 1;
@@ -233,7 +244,12 @@ void WalFrameBuilder::AppendVarUpdate(const ChunkVars& vars, const VarUndo& undo
     }
     // One reservation for all records, so a large update does not copy the
     // batch once per record.
-    batch_->reserve(batch_->size() + VarUpdateRecordBytes(vars, undo));
+    const std::size_t bytes = VarUpdateRecordBytes(vars, undo);
+    const auto held = batch_->size() - header_index_;
+    if (held > kMaxWalFrameBytes - kWalFrameTrailerSize ||
+        bytes > kMaxWalFrameBytes - kWalFrameTrailerSize - held)
+        throw std::invalid_argument("WAL frame exceeds its byte limit");
+    batch_->reserve(batch_->size() + bytes);
     for (const auto key : undo.keys) {
         if (const auto value = vars.Find(key); value.has_value()) {
             AppendVarPut(key, *value);
@@ -241,6 +257,15 @@ void WalFrameBuilder::AppendVarUpdate(const ChunkVars& vars, const VarUndo& undo
             AppendVarDel(key);
         }
     }
+}
+
+void WalFrameBuilder::AppendChunkColumns(const ChunkColumnState& state) {
+    if (has_chunk_columns_) throw std::logic_error("a WAL frame replaces chunk columns at most once");
+    if (state.bytes.empty() || state.bytes.size() > kMaxChunkColumnsSectionBytes)
+        throw std::invalid_argument("WAL chunk columns have an invalid section size");
+    BeginRecord(kWalRecordChunkColumns, state.bytes.size());
+    batch_->insert(batch_->end(), state.bytes.begin(), state.bytes.end());
+    has_chunk_columns_ = true;
 }
 
 std::size_t WalFrameBuilder::Finish(std::uint64_t revision, std::uint64_t commit_time_ms) {
@@ -251,6 +276,8 @@ std::size_t WalFrameBuilder::Finish(std::uint64_t revision, std::uint64_t commit
         throw std::invalid_argument("WAL frame must contain at least one record");
     }
     const std::size_t body_size = batch_->size() - records_begin_;
+    if (batch_->size() - header_index_ > kMaxWalFrameBytes - kWalFrameTrailerSize)
+        throw std::invalid_argument("WAL frame exceeds its byte limit");
     if (body_size > std::numeric_limits<std::uint32_t>::max()) {
         throw std::invalid_argument("WAL frame body too large");
     }
@@ -318,6 +345,9 @@ void ChunkStore::TruncateWalTail(
     const std::shared_ptr<RegularChunk>& chunk,
     std::uint64_t committed_size,
     bool force_sync) {
+    if (chunk->checkpoint_io) {
+        throw std::logic_error("chunk files are owned by a running background checkpoint");
+    }
     SnapshotGenerationWriteGuard snapshot_write(this);
     if (chunk->wal_path.empty()) {
         chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
@@ -395,7 +425,7 @@ void ChunkStore::TruncateWalTail(
             NoteUnsyncedDir(chunk->wal_path.parent_path());
         }
     }
-    chunk->wal_header_written = committed_size >= kWalHeaderSize;
+    chunk->wal_header_written = committed_size >= ChunkWalHeaderBytes(geometry_.dims());
     if (force_sync) {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE")) {
             throw std::runtime_error(
@@ -416,6 +446,9 @@ void ChunkStore::FlushWalBatch(
     if (chunk->wal_batch.empty()) {
         return;
     }
+    if (chunk->checkpoint_io) {
+        throw std::logic_error("chunk files are owned by a running background checkpoint");
+    }
 
     // Captured before any file mutation: on a failed or torn append the WAL
     // is truncated back to this boundary, so a later retry of the retained
@@ -425,7 +458,7 @@ void ChunkStore::FlushWalBatch(
 
     std::optional<FeedWalPrefixIndex::Prepared> prefix;
     if (feed_slots_ && feed_slots_->ArchiveRequired())
-        prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch));
+        prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch, geometry_.dims()));
 
     SnapshotGenerationWriteGuard snapshot_write(this);
     bool first_create = false;
@@ -450,6 +483,14 @@ void ChunkStore::FlushWalBatch(
         // stream exists and is open.
         WalAppendStream& output = *chunk->wal_append_stream;
         batch_write_started = true;
+        // Crash tests: the process ends inside the append, with half of the
+        // batch written, or with all of it written and not yet synced.
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_BATCH_TORN_WRITE_ONCE")) {
+            output.write(reinterpret_cast<const char*>(chunk->wal_batch.data()),
+                static_cast<std::streamsize>(chunk->wal_batch.size() / 2U));
+            output.flush();
+            std::_Exit(86);
+        }
         output.write(
             reinterpret_cast<const char*>(chunk->wal_batch.data()),
             static_cast<std::streamsize>(chunk->wal_batch.size()));
@@ -457,6 +498,7 @@ void ChunkStore::FlushWalBatch(
         if (!output.good()) {
             throw std::system_error(output.error(), std::generic_category(), "failed to append WAL record batch: " + chunk->wal_path.string());
         }
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_BATCH_BEFORE_SYNC_ONCE")) std::_Exit(86);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE")) {
             throw std::runtime_error(
                 "injected WAL batch sync failure: " + chunk->wal_path.string());
@@ -695,6 +737,9 @@ void ChunkStore::FlushWalBatchForEviction(
     if (chunk->wal_batch.empty()) {
         return;
     }
+    if (chunk->checkpoint_io) {
+        throw std::logic_error("chunk files are owned by a running background checkpoint");
+    }
 
     // On eviction, bypass WAL stream-cache tracking when no stream is currently open.
     // This avoids extra map/mutex churn for streams that will be closed immediately.
@@ -709,7 +754,7 @@ void ChunkStore::FlushWalBatchForEviction(
         const std::uint64_t pre_flush_size = CurrentWalFileSize(chunk);
         std::optional<FeedWalPrefixIndex::Prepared> prefix;
         if (feed_slots_ && feed_slots_->ArchiveRequired())
-            prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch));
+            prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch, geometry_.dims()));
         SnapshotGenerationWriteGuard snapshot_write(this);
         bool file_write_started = false;
         try {
@@ -742,7 +787,7 @@ void ChunkStore::FlushWalBatchForEviction(
             file_write_started = true;
 
             if (needs_header) {
-                const auto wal_header = BuildWalHeader(chunk_coord, store_id_, features_);
+                const auto wal_header = BuildWalHeader(chunk_coord, store_id_, features_, geometry_.dims());
                 out.write(
                     reinterpret_cast<const char*>(wal_header.data()),
                     static_cast<std::streamsize>(wal_header.size()));
@@ -849,6 +894,7 @@ void ChunkStore::FlushWalBatchesForReopen() {
         }
         for (const auto& [coord, chunk] : chunks) {
             std::unique_lock chunk_lock(chunk->mutex);
+            AwaitChunkFilesLocked(chunk_lock, *chunk);
             FlushWalBatch(coord, chunk, durability_mode_ != DurabilityMode::kRelaxed);
         }
     }
@@ -876,6 +922,7 @@ void ChunkStore::FlushAllPendingWalBatches() noexcept {
 
         for (const auto& [coord, chunk] : chunks) {
             std::unique_lock chunk_lock(chunk->mutex);
+            AwaitChunkFilesLocked(chunk_lock, *chunk);
             try {
                 FlushWalBatch(
                     coord,

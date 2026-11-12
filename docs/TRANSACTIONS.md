@@ -19,7 +19,7 @@ OK
 OK
 (applies at COMMIT)
 (applies at COMMIT)
-3
+1
 ```
 
 ## Guarantees
@@ -47,7 +47,7 @@ A read-only transaction can commit while its snapshot remains valid.
 | Earlier chunk states per table | 67108864 bytes, `--txn-history-bytes` |
 
 Exceeding a write-memory limit rejects the statement and leaves the transaction open.
-SET CHUNK is checked against these limits by its form's size before the form is decoded.
+SET CHUNK is checked against these limits before the form is decoded, by the smallest size the chunk state it writes can take.
 A form over a limit receives INVALID_ARGUMENT for that limit, even when it is also malformed.
 History pressure ends the oldest transactions with CONFLICT.
 A table change or expired duration also ends the transaction's work.

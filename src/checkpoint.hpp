@@ -5,6 +5,7 @@
 #include <vector>
 
 #include "chunk_store_internal.hpp"
+#include "durability_io.hpp"
 
 namespace chunkdb {
 
@@ -41,6 +42,10 @@ void AtomicWrite(
     const char* after_rename_failpoint = nullptr,
     bool enable_generic_failpoints = true,
     void (*before_replace)() = nullptr);
+void AtomicWriteStream(
+    const std::filesystem::path& path, const AtomicFileProducer& produce,
+    bool fsync_file, bool fsync_directory, bool* out_replaced = nullptr,
+    const char* after_rename_failpoint = nullptr, bool enable_generic_failpoints = true);
 // Durably creates `path` with `bytes` unless it already exists: the bytes are
 // written and synced under a temporary name, published only if `path` is
 // still free, and the directory entry is synced. Returns false, leaving the
