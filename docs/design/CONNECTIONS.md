@@ -68,6 +68,7 @@ Chunk admission keeps explicit reader, exclusive-owner and queued-writer state u
 An uncontended acquisition checks that state before registering any stop callback; queued writers prevent new readers from overtaking them.
 Wait registration, predicate evaluation and ownership release share that mutex, so sleeping cannot lose a release notification or depend on a spurious native try-lock failure.
 A release notifies only while a thread waits; that count changes under the same mutex.
+A statement waiting for a background checkpoint to release a chunk's files uses the same stop for that wait and for retaking the chunk lock after it.
 Statement admission uses cancellable overloads and adopts ownership only after checking the accepted stop; cancellation releases any concurrently acquired ownership before returning a not-applied result.
 Cleanup and background paths keep uncancellable lock operations, and the Windows serial-reader configuration continues to exclude simultaneous readers.
 Cancelling one request never carries over to the next request on that connection.

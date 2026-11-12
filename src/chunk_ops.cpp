@@ -359,7 +359,7 @@ ChunkMutationResult ChunkStore::CasChunkStateBytes(
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     auto lock = LockStatementChunk(regular_chunk->mutex);
-    AwaitChunkFilesLocked(lock, *regular_chunk);
+    AwaitStatementChunkFilesLocked(lock, *regular_chunk);
 
     if (regular_chunk->version != expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
@@ -413,7 +413,7 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     auto lock = LockStatementChunk(regular_chunk->mutex);
-    AwaitChunkFilesLocked(lock, *regular_chunk);
+    AwaitStatementChunkFilesLocked(lock, *regular_chunk);
 
     if (has_expected_version && regular_chunk->version != expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
@@ -491,7 +491,7 @@ ChunkMutationResult ChunkStore::WriteChunkState(const ChunkCoord& chunk_coord, C
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     auto lock = LockStatementChunk(regular_chunk->mutex);
-    AwaitChunkFilesLocked(lock, *regular_chunk);
+    AwaitStatementChunkFilesLocked(lock, *regular_chunk);
     if (expected_version.has_value() && regular_chunk->version != *expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
     }
@@ -536,7 +536,7 @@ ChunkMutationResult ChunkStore::TransformChunkState(const ChunkCoord& coord,
     const auto chunk = GetOrLoadRegularChunk(coord);
     std::unique_lock lock(chunk->mutex);
     // The conditional path syncs the WAL and publishes an intent naming it.
-    AwaitChunkFilesLocked(lock, *chunk);
+    AwaitStatementChunkFilesLocked(lock, *chunk);
     if (expected_version && chunk->version != *expected_version)
         return {.ok = false, .version = chunk->version};
     if (if_absent && ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get()))

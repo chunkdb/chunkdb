@@ -5,6 +5,7 @@
 #include "catalog_test_utils.hpp"
 #include "backup.hpp"
 
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <exception>
@@ -426,6 +427,115 @@ void CancellationInterruptsBackupAdmission() {
         catalog.SetBackupHookForTests(nullptr);
     }
 }
+std::atomic<std::int64_t> fake_clock_ms{0};
+StatementControl::Clock::time_point FakeNow() noexcept {
+    return StatementControl::Clock::time_point(std::chrono::milliseconds(fake_clock_ms.load()));
+}
+// Leaves chunk (0, 0) of a relaxed store with background maintenance in a
+// checkpoint that writes and syncs its files without the chunk lock, so
+// its mark stays set until ResumeCheckpointBeforeWalRemovalForTests.
+StoreConfig MarkedCheckpointConfig(const std::filesystem::path& dir) {
+    auto config = Config(dir, DurabilityMode::kRelaxed);
+    config.checkpoint_update_interval = 1U;
+    config.background_maintenance = true;
+    return config;
+}
+void HoldCheckpointMark(ChunkStore& store) {
+    // The barrier's floor makes the next checkpoint sync its files.
+    store.WalBarrier();
+    store.ArmCheckpointBeforeWalRemovalPauseForTests();
+    store.SetBlockBits(0, 0, "1000");
+    assert(store.WaitForCheckpointBeforeWalRemovalForTests());
+}
+// A statement that waits for a background checkpoint's files stops with its
+// cancellation or deadline while the checkpoint still owns them, and its
+// write is not applied.
+void CheckpointFilesWaitStops() {
+    enum class Operation { kConditional, kTransform, kCommit };
+    for (const auto operation : {Operation::kConditional, Operation::kTransform, Operation::kCommit}) {
+        for (const auto reason : {StatementStopReason::kCancelled, StatementStopReason::kTimeout}) {
+            test::ScopedTempDir dir("chunkdb-cancel-checkpoint-files");
+            const auto config = MarkedCheckpointConfig(dir.path());
+            {
+                ChunkStore store(config);
+                HoldCheckpointMark(store);
+                auto snapshot = store.BeginTxnSnapshot(10s);
+                struct Resume {
+                    ChunkStore& store;
+                    ~Resume() { store.ResumeCheckpointBeforeWalRemovalForTests(); }
+                } resume{store};
+                auto next = store.ReadChunkStateAt(*snapshot, 0, 0);
+                const auto version = next.version;
+                next.payload[0] = 2U;
+                StatementControl control(FakeNow(), reason == StatementStopReason::kTimeout ? 1000U : 0U, &FakeNow);
+                assert(control.Start());
+                auto write = std::async(std::launch::async, [&] {
+                    ScopedStatementControl scope(&control);
+                    try {
+                        if (operation == Operation::kConditional) (void)store.WriteChunkState(0, 0, std::move(next), version);
+                        else if (operation == Operation::kTransform)
+                            (void)store.TransformChunkState({0, 0}, std::nullopt, false, [](ChunkState& state) { state.payload[0] = 2U; });
+                        else (void)store.CommitTransaction(*snapshot, {}, {{{0, 0}, std::move(next)}});
+                    } catch (const StatementStoppedError& stopped) { return stopped.reason(); }
+                    return StatementStopReason::kNone;
+                });
+                assert(write.wait_for(200ms) == std::future_status::timeout);
+                if (reason == StatementStopReason::kTimeout) fake_clock_ms += 1000;
+                assert(control.RequestStop(reason));
+                assert(write.wait_for(5s) == std::future_status::ready && write.get() == reason);
+                assert(store.GetBlockBits(0, 0) == "1000");
+            }
+            ChunkStore reopened(config);
+            assert(reopened.GetBlockBits(0, 0) == "1000");
+        }
+    }
+}
+// Ordinary writes past the deferred-checkpoint hard bound wait for the mark:
+// a statement's stop ends its wait without the write, and the checkpoint's
+// end wakes every other waiter, with or without a statement.
+void CheckpointBacklogWaitStopsOrResumes() {
+    for (const bool stop : {true, false}) {
+        test::ScopedTempDir dir("chunkdb-cancel-checkpoint-backlog");
+        const auto config = MarkedCheckpointConfig(dir.path());
+        {
+            ChunkStore store(config);
+            HoldCheckpointMark(store);
+            struct Resume {
+                ChunkStore& store;
+                ~Resume() { store.ResumeCheckpointBeforeWalRemovalForTests(); }
+            } resume{store};
+            // The hard bound is four checkpoint intervals since the image.
+            for (const auto x : {1, 2, 3, 0}) store.SetBlockBits(x, 1, "0001");
+            StatementControl control(StatementControl::Clock::now(), 0U);
+            assert(control.Start());
+            auto bounded = std::async(std::launch::async, [&] {
+                ScopedStatementControl scope(&control);
+                try { store.SetBlockBits(0, 2, "0011"); }
+                catch (const StatementStoppedError&) { return false; }
+                return true;
+            });
+            auto plain = std::async(std::launch::async, [&] { store.SetBlockBits(1, 2, "0110"); });
+            assert(bounded.wait_for(200ms) == std::future_status::timeout);
+            assert(plain.wait_for(0ms) == std::future_status::timeout);
+            if (stop) {
+                assert(control.RequestStop(StatementStopReason::kCancelled));
+                assert(bounded.wait_for(5s) == std::future_status::ready && !bounded.get());
+                assert(plain.wait_for(0ms) == std::future_status::timeout);
+            }
+            store.ResumeCheckpointBeforeWalRemovalForTests();
+            assert(plain.wait_for(5s) == std::future_status::ready);
+            plain.get();
+            if (!stop) assert(bounded.wait_for(5s) == std::future_status::ready && bounded.get());
+            assert(store.BlockExists(0, 2) == !stop && store.GetBlockBits(1, 2) == "0110");
+            store.WalBarrier();
+        }
+        auto reopened_config = config;
+        reopened_config.background_maintenance = false;
+        ChunkStore reopened(reopened_config);
+        assert(reopened.BlockExists(0, 2) == !stop && reopened.GetBlockBits(1, 2) == "0110");
+        assert(reopened.GetBlockBits(0, 1) == "0001" && reopened.GetBlockBits(0, 0) == "1000");
+    }
+}
 }
 int main(int argc, char** argv) {
     CancelledWriterReopensReadAdmission();
@@ -441,4 +551,6 @@ int main(int argc, char** argv) {
     CancellationInterruptsContendedChunkAdmission();
     CancellationRacesChunkAdmissionRelease();
     CancellationInterruptsBackupAdmission();
+    CheckpointFilesWaitStops();
+    CheckpointBacklogWaitStopsOrResumes();
 }

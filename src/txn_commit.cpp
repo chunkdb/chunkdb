@@ -461,7 +461,7 @@ std::uint64_t ChunkStore::CommitTransaction(
         if (exclusive) {
             auto files = LockStatementChunk(target.chunk->mutex);
             // A transaction writes the chunk's WAL itself.
-            AwaitChunkFilesLocked(files, *target.chunk);
+            AwaitStatementChunkFilesLocked(files, *target.chunk);
             (void)files.release();
         } else {
             (void)LockStatementChunkShared(target.chunk->mutex).release();

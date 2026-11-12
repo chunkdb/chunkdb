@@ -1563,11 +1563,18 @@ class ChunkStore {
     [[nodiscard]] bool EnqueueBackgroundCheckpoint(const ChunkCoord& chunk_coord);
     void RunBackgroundCheckpoint(const ChunkCoord& chunk_coord) noexcept;
     // Waits, releasing `lock`, while a background checkpoint owns the
-    // chunk's files.
+    // chunk's files. Cleanup and background paths wait without a stop.
     void AwaitChunkFilesLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk);
+    // The same wait for a statement before its decision: a stop ends it and
+    // the chunk lock's retaking after it, and throws StatementStoppedError
+    // with `lock` released.
+    void AwaitStatementChunkFilesLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk);
     // Waits only while an ordinary write would also pass the hard bound of
-    // deferred checkpoints (MaybeCheckpointChunk).
+    // deferred checkpoints (MaybeCheckpointChunk); a statement's stop ends it
+    // like AwaitStatementChunkFilesLocked.
     void AwaitChunkBacklogLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk);
+    template <typename Ready>
+    void AwaitStatementCheckpointIoLocked(std::unique_lock<RegularChunkMutex>& lock, Ready ready);
     [[nodiscard]] bool CheckpointHardBoundReached(std::size_t updates, std::size_t wal_bytes) const noexcept;
     // Before a synced checkpoint publishes an image into `directory`. A
     // chunk directory this store has not prepared itself may have been made
