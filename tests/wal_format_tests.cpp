@@ -923,8 +923,12 @@ void TestGroupFrameAdmission() {
     const auto encoded = chunkdb::SerializeWalGroupRef(reference);
     const auto group_tlv = Tlv(chunkdb::kWalTlvGroup, Bytes(encoded.begin(), encoded.end()));
     const auto frame = BuildFrame(7U, 99U, group_tlv, {Span(0U, {0xAA})});
-    const auto info = chunkdb::InspectFeedFrame(frame, kGeometry, groups);
-    assert(info.group == reference && info.revision == 7U && info.commit_time_ms == 99U);
+    assert(chunkdb::ParseWalGroupRef(encoded) == reference);
+    // Inspection refuses the frame: no caller admits group members yet.
+    std::string inspected;
+    try { (void)chunkdb::InspectFeedFrame(frame, kGeometry, groups); }
+    catch (const std::runtime_error& error) { inspected = error.what(); }
+    assert(inspected == "WAL group frame requires directory admission");
     Bytes built;
     chunkdb::WalFrameBuilder builder(&built, 1U, {}, {}, false, reference);
     const std::uint8_t value = 0xAA;

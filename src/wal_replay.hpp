@@ -8,7 +8,6 @@
 #include <vector>
 
 #include "chunk_store_internal.hpp"
-#include "commit_group_identity.hpp"
 
 namespace chunkdb {
 
@@ -58,9 +57,9 @@ struct FeedFrameInfo {
     std::uint64_t schema_version;
     std::optional<std::string> user{};
     bool gc = false;
-    std::optional<WalGroupRef> group{};
 };
 // Validates the whole frame's framing and records without applying state.
+// A GROUP frame is refused: no caller admits group members yet.
 [[nodiscard]] FeedFrameInfo InspectFeedFrame(
     const std::vector<std::uint8_t>& frame, const Geometry& geometry, FeatureFlags features = {});
 // One captured, headerless frame; validated with the same parser as recovery.

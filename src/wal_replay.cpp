@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "chunkdb/crc32.hpp"
+#include "commit_group_identity.hpp"
 #include "feature_flags.hpp"
 #include "store_manifest.hpp"
 
@@ -546,7 +547,7 @@ FeedFrameInfo ReplayFeedFrame(
     state->version = frame.revision;
     state->commit_time_ms = frame.commit_time_ms;
     state->written = true;
-    return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc, frame.group};
+    return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc};
 }
 
 FeedFrameInfo InspectFeedFrame(
@@ -561,7 +562,8 @@ FeedFrameInfo InspectFeedFrame(
         frame.size != bytes.size()) {
         throw std::runtime_error("invalid feed archive frame: " + reason);
     }
-    return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc, frame.group};
+    if (frame.group) throw std::runtime_error("WAL group frame requires directory admission");
+    return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc};
 }
 
 WalReplayResult wal_detail::ReplayFromSource(
