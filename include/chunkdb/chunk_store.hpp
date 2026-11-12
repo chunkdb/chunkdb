@@ -56,7 +56,7 @@ class RegularChunkMutex {
         std::unique_lock lock(mutex_);
         WriterWaiter waiter(*this);
         const auto ready = [this] { return !exclusive_ && readers_ == 0U; };
-        if (!ready() && !changed_.wait(lock, cancelled, ready)) return false;
+        if (!ready() && !Wait(lock, cancelled, ready)) return false;
         if (cancelled.stop_requested()) return false;
         exclusive_ = true;
         return true;
@@ -70,13 +70,13 @@ class RegularChunkMutex {
     void unlock() {
         std::lock_guard lock(mutex_);
         exclusive_ = false;
-        changed_.notify_all();
+        Notify();
     }
     void lock_shared() { (void)lock_shared(std::stop_token{}); }
     [[nodiscard]] bool lock_shared(std::stop_token cancelled) {
         std::unique_lock lock(mutex_);
         const auto ready = [this] { return CanRead(); };
-        if (!ready() && !changed_.wait(lock, cancelled, ready)) return false;
+        if (!ready() && !Wait(lock, cancelled, ready)) return false;
         if (cancelled.stop_requested()) return false;
         ++readers_;
         return true;
@@ -90,22 +90,30 @@ class RegularChunkMutex {
     void unlock_shared() {
         std::lock_guard lock(mutex_);
         --readers_;
-        if (readers_ == 0U) changed_.notify_all();
+        if (readers_ == 0U) Notify();
     }
   private:
     friend struct StatementChunkLockTestAccess;
     struct WriterWaiter {
         explicit WriterWaiter(RegularChunkMutex& mutex) : owner(mutex) {
             ++owner.writers_;
-            owner.changed_.notify_all();
+            owner.Notify();
         }
-        ~WriterWaiter() { --owner.writers_; owner.changed_.notify_all(); }
+        ~WriterWaiter() { --owner.writers_; owner.Notify(); }
         RegularChunkMutex& owner;
     };
+    // Every state change and every wait happen under mutex_, so a change with
+    // no thread inside a wait has no one to wake.
+    void Notify() { if (waiters_ != 0U) changed_.notify_all(); }
+    template <typename Ready> bool Wait(std::unique_lock<std::mutex>& lock, std::stop_token cancelled, Ready ready) {
+        ++waiters_;
+        struct Leave { std::size_t& count; ~Leave() { --count; } } leave{waiters_};
+        return changed_.wait(lock, std::move(cancelled), ready);
+    }
     bool CanRead() const { return !exclusive_ && writers_ == 0U && (!kSerialChunkReaders || readers_ == 0U); }
     std::mutex mutex_;
     std::condition_variable_any changed_;
-    std::size_t readers_ = 0U, writers_ = 0U;
+    std::size_t readers_ = 0U, writers_ = 0U, waiters_ = 0U;
     bool exclusive_ = false;
 };
 

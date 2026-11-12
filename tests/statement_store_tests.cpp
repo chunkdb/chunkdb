@@ -20,7 +20,21 @@ struct FeatureActivationTestAccess {
 struct StatementChunkLockTestAccess {
     static void WaitWriter(RegularChunkMutex& mutex) {
         std::unique_lock lock(mutex.mutex_);
-        assert(mutex.changed_.wait_for(lock, std::chrono::seconds(5), [&] { return mutex.writers_ != 0U; }));
+        ++mutex.waiters_; // Counted like the lock's own waits, so a writer's arrival wakes it.
+        const bool arrived = mutex.changed_.wait_for(lock, std::chrono::seconds(5), [&] { return mutex.writers_ != 0U; });
+        --mutex.waiters_;
+        assert(arrived);
+    }
+    // Until a thread blocks inside one of the lock's waits.
+    static void WaitBlocked(RegularChunkMutex& mutex, std::size_t count) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(5);
+        std::unique_lock lock(mutex.mutex_);
+        while (mutex.waiters_ < count) {
+            assert(std::chrono::steady_clock::now() < deadline);
+            lock.unlock();
+            std::this_thread::yield();
+            lock.lock();
+        }
     }
 };
 struct UserRegistryTestAccess {
@@ -211,6 +225,34 @@ void CancellationInterruptsCatalogAdmission() {
         assert(!catalog.Find("default"));
     }
 }
+// Each release wakes the waiters its change admits, with no stop requested:
+// the last reader admits a writer, a writer admits a reader, and a reader
+// queued behind a waiting writer follows that writer.
+void ReleaseAdmitsBlockedLockers() {
+    RegularChunkMutex mutex;
+    const auto admitted = [](std::future<bool>& locker) {
+        return locker.wait_for(std::chrono::seconds(5)) == std::future_status::ready && locker.get();
+    };
+    mutex.lock_shared();
+    auto writer = std::async(std::launch::async, [&] { return mutex.lock(std::stop_token{}); });
+    StatementChunkLockTestAccess::WaitBlocked(mutex, 1U);
+    mutex.unlock_shared();
+    assert(admitted(writer));
+    auto reader = std::async(std::launch::async, [&] { return mutex.lock_shared(std::stop_token{}); });
+    StatementChunkLockTestAccess::WaitBlocked(mutex, 1U);
+    mutex.unlock();
+    assert(admitted(reader));
+    auto queued_writer = std::async(std::launch::async, [&] { return mutex.lock(std::stop_token{}); });
+    StatementChunkLockTestAccess::WaitBlocked(mutex, 1U);
+    auto queued_reader = std::async(std::launch::async, [&] { return mutex.lock_shared(std::stop_token{}); });
+    StatementChunkLockTestAccess::WaitBlocked(mutex, 2U);
+    mutex.unlock_shared();
+    assert(admitted(queued_writer));
+    mutex.unlock();
+    assert(admitted(queued_reader));
+    mutex.unlock_shared();
+    assert(mutex.try_lock()); mutex.unlock();
+}
 void CancelledWriterReopensReadAdmission() {
     RegularChunkMutex mutex;
     mutex.lock_shared();
@@ -387,6 +429,7 @@ void CancellationInterruptsBackupAdmission() {
 }
 int main(int argc, char** argv) {
     CancelledWriterReopensReadAdmission();
+    ReleaseAdmitsBlockedLockers();
     if (argc == 2 && std::string_view(argv[1]) == "--chunk-mutex-only") return 0;
     OrdinaryCancellationRollsBack();
     ConditionalDecisionArbitrates();

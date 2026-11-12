@@ -62,6 +62,7 @@ Read-only work checks cancellation at bounded traversal and lock-admission bound
 Chunk admission keeps explicit reader, exclusive-owner and queued-writer state under one mutex and waits on a stop-aware condition.
 An uncontended acquisition checks that state before registering any stop callback; queued writers prevent new readers from overtaking them.
 Wait registration, predicate evaluation and ownership release share that mutex, so sleeping cannot lose a release notification or depend on a spurious native try-lock failure.
+A release notifies only while a thread waits; that count changes under the same mutex.
 Statement admission uses cancellable overloads and adopts ownership only after checking the accepted stop; cancellation releases any concurrently acquired ownership before returning a not-applied result.
 Cleanup and background paths keep uncancellable lock operations, and the Windows serial-reader configuration continues to exclude simultaneous readers.
 Cancelling one request never carries over to the next request on that connection.
