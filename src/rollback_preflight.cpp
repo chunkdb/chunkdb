@@ -21,7 +21,14 @@ std::vector<std::uint8_t> LoadRecoveryTxnIntent(const std::filesystem::path& pat
         throw std::runtime_error("transaction intent extent is not representable: " + path.string());
     input.seekg(0);
     if (!input) throw std::runtime_error("failed to rewind transaction intent: " + path.string());
-    ValidateCheckedTxnIntentStream(input, static_cast<std::uint64_t>(extent), expected_dims, expected_table_id);
+    // The checks name the defect; recovery reports it with the file it is in.
+    const auto checked = [&](auto&& validate) {
+        try { validate(); }
+        catch (const std::invalid_argument& error) {
+            throw std::invalid_argument("invalid transaction intent: " + path.string() + ": " + error.what());
+        }
+    };
+    checked([&] { ValidateCheckedTxnIntentStream(input, static_cast<std::uint64_t>(extent), expected_dims, expected_table_id); });
     input.clear();
     input.seekg(0);
     if (!input) throw std::runtime_error("failed to rewind transaction intent: " + path.string());
@@ -29,7 +36,7 @@ std::vector<std::uint8_t> LoadRecoveryTxnIntent(const std::filesystem::path& pat
     input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     if (input.gcount() != static_cast<std::streamsize>(bytes.size()) || input.peek() != std::char_traits<char>::eof())
         throw std::runtime_error("transaction intent changed while being read: " + path.string());
-    ValidateCheckedTxnIntent(bytes, expected_dims, expected_table_id);
+    checked([&] { ValidateCheckedTxnIntent(bytes, expected_dims, expected_table_id); });
     return bytes;
 }
 

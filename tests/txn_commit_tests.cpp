@@ -804,7 +804,12 @@ void TestIntentsOnDisk() {
         const auto damaged_path = chunkdb::TxnIntentPath(table_dir, 1000);
         WriteFile(damaged_path, damaged);
         assert(VerifyOutput(root.path()).find("txn_intent_invalid") != std::string::npos);
-        assert(Throws([&] { ChunkStore writer(config); }));
+        // Startup names the damaged file and the defect.
+        std::string refused;
+        try { ChunkStore writer(config); } catch (const std::exception& error) { refused = error.what(); }
+        const auto named = (damaged_path.parent_path().filename() / damaged_path.filename()).string();
+        assert(refused.starts_with("invalid transaction intent: ") && refused.find(named) != std::string::npos);
+        assert(refused.find("belongs to another table") != std::string::npos);
         std::filesystem::remove(damaged_path);
     }
     // A writer's open truncates, removes the intent and the temporary files
