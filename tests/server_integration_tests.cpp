@@ -34,6 +34,9 @@
 #include "../src/proxy_protocol.hpp"
 #include "../src/slot_watch.hpp"
 #include "../src/server_socket.hpp"
+#include "../src/server_idle.hpp"
+#include "../src/statement_control.hpp"
+#include "../src/user_registry.hpp"
 #include "../src/sectioned_chunk_form.hpp"
 
 #ifdef _WIN32
@@ -61,9 +64,9 @@
 #endif
 
 namespace chunkdb {
-void SetServerTimeoutConfigFailpointForTests(
+void SetServerSocketConfigFailpointForTests(
     std::size_t send_failures,
-    std::size_t recv_failures) noexcept;
+    std::size_t nonblocking_failures) noexcept;
 void ResetServerTimeoutConfigCountersForTests() noexcept;
 std::uint64_t ServerRecvTimeoutConfigCallsForTests() noexcept;
 std::size_t FeedDeliveryTestAccess::FillActiveClientSendQueue(ChunkServer& server, int bytes) {
@@ -104,8 +107,7 @@ std::size_t FeedDeliveryTestAccess::FillActiveClientSendQueue(ChunkServer& serve
         break;
     }
     assert(blocked && filled > 0U);
-    assert(server_detail::SetSocketNonBlocking(socket, false, &error));
-    std::cout << "steady slow reader: send_buffer=" << actual << " prefilled=" << filled << '\n' << std::flush;
+    std::cout << "steady reader: send_buffer=" << actual << " prefilled=" << filled << '\n' << std::flush;
     return filled;
 }
 }
@@ -150,14 +152,14 @@ void ConfigureSocketNoSigPipe(SocketHandle socket) {
 #endif
 }
 
-class ScopedServerTimeoutFailpoint {
+class ScopedServerSocketFailpoint {
   public:
-    ScopedServerTimeoutFailpoint(std::size_t send_failures, std::size_t recv_failures) {
-        chunkdb::SetServerTimeoutConfigFailpointForTests(send_failures, recv_failures);
+    ScopedServerSocketFailpoint(std::size_t send_failures, std::size_t nonblocking_failures) {
+        chunkdb::SetServerSocketConfigFailpointForTests(send_failures, nonblocking_failures);
     }
 
-    ~ScopedServerTimeoutFailpoint() {
-        chunkdb::SetServerTimeoutConfigFailpointForTests(0, 0);
+    ~ScopedServerSocketFailpoint() {
+        chunkdb::SetServerSocketConfigFailpointForTests(0, 0);
     }
 };
 
@@ -341,7 +343,8 @@ std::unordered_map<std::string, std::string> ReadHelloReply(Client& client) {
 // the reply that ends the login: the first line of the HELLO map, or the
 // error. A successful login's map is read and its server signature checked.
 template <typename Client>
-std::string LoginReply(Client& client, const std::string& user, const std::string& password) {
+std::string LoginReply(Client& client, const std::string& user, const std::string& password,
+    std::uint64_t* connection_id = nullptr) {
     const auto login = chunkdb::scram::StartClientLogin(user, chunkdb::scram::NewNonce());
     client.SendBytes(chunkdb::test::HelloUserBytes(login, user));
     const std::string first = client.ReadLine();
@@ -355,6 +358,7 @@ std::string LoginReply(Client& client, const std::string& user, const std::strin
     if (fields.at("protocol") != "3" || fields.at("server_signature") != step.server_signature) {
         throw std::runtime_error("unexpected HELLO reply after AUTH");
     }
+    if (connection_id) *connection_id = std::stoull(fields.at("connection_id"));
     return "%14\r\n";
 }
 
@@ -881,8 +885,10 @@ class TlsClient {
     // 0 offers every version the library supports. `prefix`: bytes sent in
     // the clear before the handshake, such as a PROXY protocol header.
     // `ciphers`: the TLS 1.2 cipher list offered; empty keeps the default.
+    // `pause`: when set, the prefix is sent in two halves this far apart, and
+    // the handshake starts this long after the prefix.
     TlsClient(std::string host, std::uint16_t port, int max_version = 0, const std::string& prefix = {},
-              const std::string& ciphers = {})
+              const std::string& ciphers = {}, std::chrono::milliseconds pause = {})
         : host_(std::move(host)), port_(port) {
         SSL_load_error_strings();
         OpenSSL_add_ssl_algorithms();
@@ -903,11 +909,15 @@ class TlsClient {
         }
         try {
             socket_ = ConnectSocket(host_, port_);
+            const auto half = pause.count() != 0 ? prefix.size() / 2U : prefix.size();
             for (std::size_t sent = 0; sent < prefix.size();) {
-                const auto n = send(socket_, prefix.data() + sent, static_cast<int>(prefix.size() - sent), 0);
+                if (sent == half) std::this_thread::sleep_for(pause);
+                const auto end = sent < half ? half : prefix.size();
+                const auto n = send(socket_, prefix.data() + sent, static_cast<int>(end - sent), 0);
                 if (n <= 0) throw std::runtime_error("failed to send bytes before the TLS handshake");
                 sent += static_cast<std::size_t>(n);
             }
+            if (pause.count() != 0) std::this_thread::sleep_for(pause);
         } catch (...) {
             // The destructor does not run for a constructor that throws.
             if (socket_ != kInvalidSocket) {
@@ -1143,6 +1153,41 @@ class TlsClient {
         return body;
     }
 
+    std::string ReadReply() {
+        const auto header = ReadLine();
+        std::string reply = header;
+        if (header.starts_with('$')) {
+            const auto length = std::stoull(header.substr(1));
+            std::array<char, 4096> buffer{};
+            while (pending_.size() < length + 2U) {
+                const auto read = Read(buffer.data(), static_cast<int>(buffer.size()));
+                if (read <= 0) throw std::runtime_error("TLS socket closed inside reply body");
+                pending_.append(buffer.data(), static_cast<std::size_t>(read));
+            }
+            if (pending_.compare(length, 2U, "\r\n") != 0U)
+                throw std::runtime_error("TLS bulk body is not terminated by CRLF");
+            reply.append(pending_.data(), length + 2U);
+            pending_.erase(0U, length + 2U);
+        } else if (header.starts_with('*') || header.starts_with('%')) {
+            const auto count = std::stoull(header.substr(1)) * (header[0] == '%' ? 2U : 1U);
+            for (std::size_t i = 0U; i < count; ++i) reply += ReadReply();
+        }
+        return reply;
+    }
+
+    bool WaitForClose(std::chrono::milliseconds timeout) {
+        test_read_deadline_ = Clock::now() + timeout;
+        std::array<char, 4096> buffer{};
+        while (Clock::now() < *test_read_deadline_) {
+            const auto count = Read(buffer.data(), static_cast<int>(buffer.size()));
+            if (count <= 0) return true;
+            pending_.append(buffer.data(), static_cast<std::size_t>(count));
+        }
+        return false;
+    }
+
+    const std::string& Received() const noexcept { return pending_; }
+
   private:
     std::string host_;
     std::uint16_t port_ = 0;
@@ -1267,6 +1312,13 @@ class ScopedLogCapture {
             }
         }
         return false;
+    }
+
+    [[nodiscard]] std::string Text() const {
+        std::lock_guard lock(lines_mutex_);
+        std::string text;
+        for (const auto& line : lines_) text += line + '\n';
+        return text;
     }
 
     [[nodiscard]] std::size_t CountContains(std::string_view needle) const {
@@ -1701,6 +1753,1419 @@ void TestPing() {
     client.Hello();
     client.SendLine("PING");
     assert(client.ReadLine() == "+PONG\r\n");
+}
+
+template <typename Client>
+void TestIdleConnectionsReleaseWorker(bool tls) {
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    config.tls_enabled = tls;
+    ServerHarness harness(tls ? "idle-worker-tls" : "idle-worker-plain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    std::vector<std::unique_ptr<Client>> clients;
+    for (std::size_t i = 0U; i < 8U; ++i) {
+        auto client = std::make_unique<Client>("127.0.0.1", harness.port);
+        client->SetReadDeadline(std::chrono::seconds(10));
+        client->Hello();
+        clients.push_back(std::move(client));
+    }
+    auto& transaction = *clients.front();
+    transaction.SendLine("BEGIN");
+    assert(transaction.ReadLine() == "+OK\r\n");
+    transaction.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
+    assert(transaction.ReadLine() == "_\r\n");
+    for (std::size_t i = 1U; i < clients.size(); ++i) {
+        clients[i]->SendBytes("PING\r\nPING\r\nPING\r\n");
+        for (std::size_t reply = 0U; reply < 3U; ++reply)
+            assert(clients[i]->ReadLine() == "+PONG\r\n");
+    }
+    transaction.SendLine("GET BLOCK 0 0 FROM default");
+    assert(transaction.ReadLine() == "*1\r\n");
+    assert(transaction.ReadLine() == "$1\r\n");
+    assert(transaction.ReadLine() == "\x01\r\n");
+    transaction.SendLine("COMMIT");
+    (void)ReadVersion(transaction);
+    clients.back()->SendLine("GET BLOCK 0 0 FROM default");
+    assert(clients.back()->ReadLine() == "*1\r\n");
+    assert(clients.back()->ReadLine() == "$1\r\n");
+    assert(clients.back()->ReadLine() == "\x01\r\n");
+}
+
+class QueuedOwnershipHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    explicit QueuedOwnershipHook(bool pause_scan) : pause_scan_(pause_scan) {}
+    void Run(Point point, std::size_t value) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforeStatementStart && !worker_) {
+            worker_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return release_worker_; });
+        }
+        if (pause_scan_ && point == Point::kBeforeQueuedStopScan && value != 0U && !io_) {
+            io_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return release_io_; });
+        }
+        if (!pause_scan_ && point == Point::kAfterQueuedStopClaim && value == target_id_) {
+            io_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return release_io_; });
+        }
+        if (point == Point::kAfterStatementStartRefused) { refused_ = true; changed_.notify_all(); }
+        if (point == Point::kWorkerReady && refused_) { drained_ = true; changed_.notify_all(); }
+    }
+    void WaitWorker() { Wait([&] { return worker_; }); }
+    void WaitIo() { Wait([&] { return io_; }); }
+    void WaitRefused() { Wait([&] { return drained_; }); }
+    void SetTarget(std::uint64_t id) { std::lock_guard lock(mutex_); target_id_ = id; }
+    void ReleaseWorker() { { std::lock_guard lock(mutex_); release_worker_ = true; } changed_.notify_all(); }
+    void ReleaseIo() { { std::lock_guard lock(mutex_); release_io_ = true; } changed_.notify_all(); }
+  private:
+    template <typename Predicate> void Wait(Predicate predicate) {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), predicate));
+    }
+    bool pause_scan_, worker_ = false, io_ = false, refused_ = false, drained_ = false, release_worker_ = false, release_io_ = false;
+    std::uint64_t target_id_ = 0U;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+};
+
+void TestExpiredQueueRetainsTransportOwner() {
+    QueuedOwnershipHook hook(true);
+    auto config = BaseServerConfig(); config.worker_threads = 1U;
+    ServerHarness harness("expired-queue-owner", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient target("127.0.0.1", harness.port);
+    target.SetReadDeadline(std::chrono::seconds(10));
+    target.SendLine("HELLO 3 WITH statement_timeout_ms=1000");
+    const auto hello = ReadHelloReply(target);
+    const auto id = std::stoull(hello.at("connection_id"));
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    target.SendLine("PING");
+    hook.WaitWorker(); hook.WaitIo();
+    const auto statement = chunkdb::FeedDeliveryTestAccess::CurrentStatement(*harness.server, id);
+    assert(statement && statement->deadline());
+    std::mutex deadline_mutex;
+    std::condition_variable deadline_wait;
+    std::unique_lock deadline_lock(deadline_mutex);
+    (void)deadline_wait.wait_until(deadline_lock, *statement->deadline(), [] { return false; });
+    hook.ReleaseWorker(); hook.WaitRefused();
+    assert(chunkdb::FeedDeliveryTestAccess::ConnectionStillOwned(*harness.server, id));
+    hook.ReleaseIo();
+    assert(target.ReadLine().starts_with("-ERR TIMEOUT applied=false"));
+    target.SendLine("PING");
+    assert(target.ReadLine() == "+PONG\r\n");
+}
+
+void TestStopDoesNotCloseQueuedReplyOwner() {
+    QueuedOwnershipHook hook(false);
+    auto config = BaseServerConfig(); config.worker_threads = 1U;
+    ServerHarness harness("stop-queued-reply", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient worker("127.0.0.1", harness.port); worker.Hello();
+    RawClient target("127.0.0.1", harness.port);
+    target.SendLine("HELLO 3");
+    const auto id = std::stoull(ReadHelloReply(target).at("connection_id"));
+    RawClient controller("127.0.0.1", harness.port); controller.Hello();
+    hook.SetTarget(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    worker.SendLine("PING"); hook.WaitWorker();
+    target.SendLine("PING");
+    controller.SendLine("CANCEL " + std::to_string(id));
+    hook.WaitIo();
+    harness.server->Stop();
+    assert(chunkdb::FeedDeliveryTestAccess::ConnectionStillOwned(*harness.server, id));
+    hook.ReleaseIo(); hook.ReleaseWorker();
+    harness.JoinStopped();
+    assert(target.WaitForClose(std::chrono::seconds(10)));
+    assert(!chunkdb::FeedDeliveryTestAccess::ConnectionStillOwned(*harness.server, id));
+}
+
+class ProgressiveReplyHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t bytes) override {
+        if (point == Point::kBeforeReplyBufferWrite) assert(bytes <= 65536U);
+        if (point == Point::kAfterReplyBufferWrite && bytes == 65536U) {
+            std::unique_lock lock(mutex_);
+            if (entered_) return;
+            entered_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        }
+    }
+    void Wait() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return entered_; }));
+    }
+    void Release() { { std::lock_guard lock(mutex_); released_ = true; } changed_.notify_all(); }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, released_ = false;
+};
+
+template <typename Client>
+void TestProgressiveReplyOwnsSnapshot(bool tls, bool area) {
+    ProgressiveReplyHook hook;
+    auto store = BaseStoreConfig();
+    store.geometry.chunk_width_blocks = 256U;
+    store.geometry.chunk_height_blocks = 256U;
+    store.geometry.block_bits = 16U;
+    auto config = BaseServerConfig(); config.tls_enabled = tls; config.client_io_timeout_ms = 30000U;
+    ServerHarness harness("progressive-snapshot", store, chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { ProgressiveReplyHook& hook; ~Release() { hook.Release(); } } release{hook};
+    chunkdb::SessionState writer;
+    (void)harness.engine->Execute(writer, "HELLO 3");
+    assert(!harness.engine->Execute(writer, "SET BLOCK 0 0 IN default bits = b'1000000000000000'").starts_with('-'));
+    const std::string query = area ? "GET AREA 0 0 TO 0 0 FROM default" : "GET CHUNK 0 0 FROM default";
+    const auto expected = harness.engine->Execute(writer, query);
+    Client reader("127.0.0.1", harness.port); reader.SetReadDeadline(std::chrono::seconds(20)); reader.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    reader.SendLine(query);
+    hook.Wait();
+    auto changed = std::async(std::launch::async, [&] {
+        assert(!harness.engine->Execute(writer, "SET BLOCK 0 0 IN default bits = b'0100000000000000'").starts_with('-'));
+        assert(harness.engine->Execute(writer, "ALTER TABLE default ADD COLUMN light u8") == "+OK\r\n");
+    });
+    assert(changed.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    changed.get();
+    hook.Release();
+    assert(reader.ReadReply() == expected);
+    reader.SendLine("PING"); assert(reader.ReadLine() == "+PONG\r\n");
+}
+
+template <typename Client>
+void TestKillReadReplyReleasesCredit(bool tls) {
+    ProgressiveReplyHook hook;
+    auto store = BaseStoreConfig();
+    store.geometry.chunk_width_blocks = 256U;
+    store.geometry.chunk_height_blocks = 256U;
+    store.geometry.block_bits = 16U;
+    auto config = BaseServerConfig(); config.tls_enabled = tls; config.worker_threads = 1U;
+    config.client_io_timeout_ms = 30000U;
+    ServerHarness harness("kill-read-reply", store, chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { ProgressiveReplyHook& hook; ~Release() { hook.Release(); } } release{hook};
+    {
+        auto lease = harness.catalog->Require("default")->Acquire();
+        lease->store().SetBlockBits(0, 0, "1000000000000000");
+    }
+    Client reader("127.0.0.1", harness.port); reader.SetReadDeadline(std::chrono::seconds(10));
+    reader.SendLine("HELLO 3");
+    const auto id = std::stoull(ReadHelloReply(reader).at("connection_id"));
+    Client controller("127.0.0.1", harness.port); controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    reader.SendLine("GET CHUNK 0 0 FROM default");
+    hook.Wait();
+    controller.SendLine("KILL CONNECTION " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    hook.Release();
+    const auto header = reader.ReadLine();
+    assert(header.starts_with('$'));
+    const auto expected_body = std::stoull(header.substr(1)) + 2U;
+    assert(reader.WaitForClose(std::chrono::seconds(5)));
+    assert(reader.Received().size() < expected_body);
+    assert(!chunkdb::FeedDeliveryTestAccess::ConnectionStillOwned(*harness.server, id));
+    auto returned = chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, 2147483648ULL);
+    assert(returned);
+}
+
+class BufferedPublicationHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        if (point != Point::kBeforeBufferedStatementPublication) return;
+        std::unique_lock lock(mutex_);
+        entered_ = true; changed_.notify_all();
+        changed_.wait(lock, [&] { return released_; });
+    }
+    void Wait() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(5), [&] { return entered_; }));
+    }
+    void Release() { { std::lock_guard lock(mutex_); released_ = true; } changed_.notify_all(); }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, released_ = false;
+};
+void TestKilledBufferedStatementCannotPublish() {
+    BufferedPublicationHook hook;
+    auto config = BaseServerConfig(); config.worker_threads = 1U;
+    ServerHarness harness("kill-buffered-publication", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { BufferedPublicationHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient target("127.0.0.1", harness.port); target.SetReadDeadline(std::chrono::seconds(10)); target.SendLine("HELLO 3");
+    const auto id = std::stoull(ReadHelloReply(target).at("connection_id"));
+    RawClient controller("127.0.0.1", harness.port); controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    target.SendBytes("PING\r\nSET BLOCK 0 0 IN default bits = b'1000'\r\n");
+    hook.Wait();
+    assert(target.ReadLine() == "+PONG\r\n");
+    controller.SendLine("KILL CONNECTION " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    hook.Release();
+    assert(target.WaitForClose(std::chrono::seconds(5)));
+    auto lease = harness.catalog->Require("default")->Acquire();
+    assert(!lease->store().GetBlock(0, 0));
+}
+
+class BufferedWorkerHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override { if (point == Point::kBeforeWorkerHandle) ++turns; }
+    std::atomic<std::size_t> turns{0U};
+};
+
+void TestBufferedRequestsRetainWorker() {
+    BufferedWorkerHook hook;
+    auto config = BaseServerConfig(); config.worker_threads = 1U;
+    ServerHarness harness("buffered-worker", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient client("127.0.0.1", harness.port); client.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    client.SendBytes("SET BLOCK 0 0 IN default bits = $1\r\n$1\r\n\x01\r\nPING\r\nPING\r\n");
+    (void)ReadVersion(client);
+    assert(client.ReadLine() == "+PONG\r\n");
+    assert(client.ReadLine() == "+PONG\r\n");
+    assert(hook.turns.load() == 1U);
+}
+
+class IdleDispatchFailureHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        if (point == Point::kBeforeResumedClientQueue && !failed_.exchange(true)) {
+            reached_.set_value();
+            throw std::bad_alloc();
+        }
+    }
+    void Wait() {
+        auto reached = reached_.get_future();
+        assert(reached.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    }
+  private:
+    std::atomic<bool> failed_{false};
+    std::promise<void> reached_;
+};
+
+// A failure while one connection is dispatched closes that connection only.
+void TestIdleDispatchFailureClosesItsConnection() {
+    IdleDispatchFailureHook failure;
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    ServerHarness harness("idle-dispatch-failure", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient first("127.0.0.1", harness.port);
+    first.Hello();
+    RawClient second("127.0.0.1", harness.port);
+    second.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &failure);
+    first.SendLine("PING");
+    failure.Wait();
+    assert(first.WaitForClose(std::chrono::seconds(10)));
+    assert(first.Received().empty());
+    second.SendLine("PING");
+    assert(second.ReadLine() == "+PONG\r\n");
+    RawClient third("127.0.0.1", harness.port);
+    third.Hello();
+}
+
+// Throws `Error` once, from the I/O thread, when it reads a client.
+template <typename Error>
+class ClientReadFailureHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        if (point == Point::kBeforeClientRead && !failed_.exchange(true)) throw Error();
+    }
+  private:
+    std::atomic<bool> failed_{false};
+};
+
+struct InjectedOutOfRange : std::out_of_range {
+    InjectedOutOfRange() : std::out_of_range("injected out of range") {}
+};
+
+// Any exception while the I/O thread serves one connection closes that
+// connection without a reply; the others and the listener keep working.
+template <typename Error>
+void CheckClientReadFailureClosesItsConnection() {
+    ClientReadFailureHook<Error> failure;
+    ServerHarness harness("client-read-failure", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    RawClient first("127.0.0.1", harness.port);
+    first.Hello();
+    RawClient second("127.0.0.1", harness.port);
+    second.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &failure);
+    first.SendLine("PING");
+    assert(first.WaitForClose(std::chrono::seconds(10)));
+    assert(first.Received().empty());
+    second.SendLine("PING");
+    assert(second.ReadLine() == "+PONG\r\n");
+    RawClient third("127.0.0.1", harness.port);
+    third.Hello();
+}
+
+void TestClientReadFailureClosesItsConnection() {
+    CheckClientReadFailureClosesItsConnection<std::bad_alloc>();
+    CheckClientReadFailureClosesItsConnection<InjectedOutOfRange>();
+    CheckClientReadFailureClosesItsConnection<std::bad_function_call>();
+}
+
+class IdleQueuePressureHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t value) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforeWorkerHandle && !entered_) {
+            entered_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        }
+        if (point == Point::kIdleQueueBackpressure) {
+            assert(value == 1U);
+            backpressure_ = true;
+            changed_.notify_all();
+        }
+    }
+    void WaitWorker() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return entered_; }));
+    }
+    void WaitBackpressure() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return backpressure_; }));
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, released_ = false, backpressure_ = false;
+};
+
+void FreezeUserAdmission(ServerHarness& harness) {
+    harness.server->Stop();
+    harness.JoinStopped();
+    harness.saved_engine_config.users = std::make_shared<chunkdb::UserRegistry>(harness.data_dir, std::nullopt,
+        std::array<std::uint8_t, 32>{}, false, [] { return chunkdb::UserAdmissionTime{}; });
+    harness.Restart();
+}
+
+class RateQueueHook : public IdleQueuePressureHook {
+  public:
+    void SetTarget(std::uint64_t target) { target_ = target; }
+    void Run(Point point, std::size_t value) override {
+        IdleQueuePressureHook::Run(point, value);
+        if (point == Point::kAfterStatementQueued && value == target_) {
+            { std::lock_guard lock(mutex_); queued_ = true; }
+            changed_.notify_all();
+        }
+    }
+    void WaitQueued() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return queued_; }));
+    }
+  private:
+    std::uint64_t target_ = 0U;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool queued_ = false;
+};
+
+void TestConnectionListingTrimsStatementWhitespace() {
+    RateQueueHook hook;
+    auto config = BaseServerConfig(); config.worker_threads = 1U;
+    ServerHarness harness("connection-listing-whitespace", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { RateQueueHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient worker("127.0.0.1", harness.port); worker.Hello();
+    RawClient target("127.0.0.1", harness.port); target.SendLine("HELLO 3");
+    const auto id = std::stoull(ReadHelloReply(target).at("connection_id"));
+    RawClient controller("127.0.0.1", harness.port); controller.Hello();
+    hook.SetTarget(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    worker.SendLine("PING"); hook.WaitWorker();
+    target.SendLine("  \tPING"); hook.WaitQueued();
+    controller.SendLine("SHOW CONNECTIONS");
+    const auto listing = controller.ReadReply();
+    const auto at = listing.find("$2\r\nid\r\n:" + std::to_string(id) + "\r\n");
+    assert(at != std::string::npos);
+    const auto end = listing.find("%5\r\n", at);
+    const auto entry = listing.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    assert(entry.find("$5\r\nstate\r\n$6\r\nqueued\r\n") != std::string::npos);
+    assert(entry.find("$9\r\nstatement\r\n$4\r\nPING\r\n") != std::string::npos);
+    hook.Release();
+    assert(worker.ReadLine() == "+PONG\r\n" && target.ReadLine() == "+PONG\r\n");
+}
+
+class ShutdownPublicationHook : public RateQueueHook {
+  public:
+    void Run(Point point, std::size_t value) override {
+        RateQueueHook::Run(point, value);
+        if (point == Point::kAfterRunningStopPublication && value != 0U) {
+            std::unique_lock lock(mutex_);
+            stopped_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        }
+    }
+    void WaitPublication() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return stopped_; }));
+    }
+    void ReleasePublication() { { std::lock_guard lock(mutex_); released_ = true; } changed_.notify_all(); }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool stopped_ = false, released_ = false;
+};
+
+void TestStopPublicationGapClosesQueuedOwner() {
+    ShutdownPublicationHook hook;
+    auto config = BaseServerConfig(); config.worker_threads = 1U;
+    ServerHarness harness("stop-publication-gap", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient worker("127.0.0.1", harness.port); worker.Hello();
+    RawClient target("127.0.0.1", harness.port); target.SendLine("HELLO 3");
+    const auto id = std::stoull(ReadHelloReply(target).at("connection_id"));
+    hook.SetTarget(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    worker.SendLine("PING"); hook.WaitWorker();
+    target.SendLine("PING"); hook.WaitQueued();
+    auto stopping = std::async(std::launch::async, [&] { harness.server->Stop(); });
+    hook.WaitPublication();
+    chunkdb::FeedDeliveryTestAccess::WakeTransport(*harness.server);
+    assert(target.WaitForClose(std::chrono::seconds(10)));
+    assert(!chunkdb::FeedDeliveryTestAccess::ConnectionStillOwned(*harness.server, id));
+    hook.ReleasePublication(); hook.Release();
+    stopping.get();
+    harness.JoinStopped();
+}
+
+void TestQueuedCancellationConsumesUserRate() {
+    RateQueueHook hook;
+    auto config = BaseServerConfig(); config.worker_threads = 1U;
+    ServerHarness harness("queue-cancel-rate", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = true}, config);
+    FreezeUserAdmission(harness);
+    RawClient worker("127.0.0.1", harness.port); worker.Login();
+    RawClient target("127.0.0.1", harness.port); target.SetReadDeadline(std::chrono::seconds(10));
+    std::uint64_t id = 0U;
+    assert(LoginReply(target, kAdminUser, kAdminPassword, &id) == "%14\r\n");
+    assert(id != 0U);
+    RawClient controller("127.0.0.1", harness.port); controller.Login();
+    hook.SetTarget(id);
+    struct Release { RateQueueHook& hook; ~Release() { hook.Release(); } } release{hook};
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    worker.SendLine("PING"); hook.WaitWorker();
+    harness.saved_engine_config.users->SetLimits(kAdminUser, std::nullopt, 1U);
+    target.SendLine("PING"); hook.WaitQueued();
+    controller.SendLine("CANCEL " + std::to_string(id));
+    assert(controller.ReadLine() == "%1\r\n");
+    assert(controller.ReadLine() == "$9\r\n");
+    assert(controller.ReadLine() == "cancelled\r\n");
+    assert(controller.ReadLine() == "#t\r\n");
+    assert(target.ReadLine().starts_with("-ERR CANCELLED applied=false"));
+    target.SendLine("PING");
+    assert(target.ReadLine().starts_with("-ERR RATE_LIMITED reason=statements_per_sec"));
+    hook.Release();
+    assert(worker.ReadLine() == "+PONG\r\n");
+}
+
+class RateFeedPressureHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t bytes) override {
+        if (point == Point::kAfterFeedReplyQueue) assert(bytes <= 512U);
+        if (point == Point::kFeedInputBackpressure) {
+            { std::lock_guard lock(mutex_); paused_ = true; }
+            changed_.notify_all();
+        }
+    }
+    void WaitPaused() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return paused_; }));
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool paused_ = false;
+};
+
+void TestOrdinaryWatchRateRepliesAreBounded() {
+    RateFeedPressureHook hook;
+    auto config = BaseServerConfig(); config.feed_buffer_bytes = 512U; config.max_watches = 1U;
+    ServerHarness harness("watch-rate-bound", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = true}, config);
+    FreezeUserAdmission(harness);
+    RawClient watch("127.0.0.1", harness.port); watch.Login();
+    RawClient caller("127.0.0.1", harness.port); caller.Login();
+    caller.SendLine("ALTER TABLE default SET feed_buffer_bytes = 512");
+    assert(caller.ReadLine() == "+OK\r\n");
+    watch.SendLine("WATCH default");
+    assert(watch.ReadReply().starts_with('%'));
+    harness.saved_engine_config.users->SetLimits(kAdminUser, std::nullopt, 1U);
+    caller.SendLine("PING"); assert(caller.ReadLine() == "+PONG\r\n");
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    std::string flood;
+    for (std::size_t i = 0U; i < 64U; ++i) flood += "UNWATCH\r\n";
+    watch.SendBytes(flood);
+    hook.WaitPaused();
+}
+
+void TestIdleDispatchRespectsQueueCredit() {
+    IdleQueuePressureHook hook;
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    config.max_pending_clients = 1U;
+    ServerHarness harness("idle-dispatch-credit", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { IdleQueuePressureHook& hook; ~Release() { hook.Release(); } } release{hook};
+    // Its first statement is dispatched; a later one would be read by the
+    // worker that answered the previous one.
+    RawClient worker("127.0.0.1", harness.port);
+    worker.Hello();
+    std::vector<std::unique_ptr<RawClient>> idle;
+    for (std::size_t i = 0U; i < 3U; ++i) {
+        auto client = std::make_unique<RawClient>("127.0.0.1", harness.port);
+        client->SetReadDeadline(std::chrono::seconds(20));
+        client->Hello();
+        idle.push_back(std::move(client));
+    }
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    worker.SendLine("PING");
+    hook.WaitWorker();
+    for (const auto& client : idle) client->SendLine("PING");
+    hook.WaitBackpressure();
+    hook.Release();
+    assert(worker.ReadLine() == "+PONG\r\n");
+    for (const auto& client : idle) assert(client->ReadLine() == "+PONG\r\n");
+}
+
+// Observes a worker waiting for the next request of a connection it answered.
+class WorkerIdleWaitHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t value) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforeWorkerIdleWait) {
+            ++waits_[value];
+            if (value == hold_idle_ && !idle_held_) {
+                idle_held_ = true;
+                changed_.notify_all();
+                changed_.wait(lock, [&] { return idle_released_; });
+            }
+        }
+        if (point == Point::kBeforeWorkerReceive) {
+            ++receives_[value];
+            if (value == hold_receive_ && !receive_held_) {
+                receive_held_ = true;
+                changed_.notify_all();
+                changed_.wait(lock, [&] { return receive_released_; });
+            }
+        }
+        if (point == Point::kBeforeReplyBufferWrite && value >= 65536U) large_write_ = true;
+        if (point == Point::kAfterStatementQueued) ++queued_[value];
+        if (point == Point::kAfterRunningStopPublication) ++stop_publications_;
+        if (point == Point::kBeforeWorkerClose) worker_closed_ = true;
+        if (point == Point::kAfterWorkerHandle && hold_after_handle_ && !after_handle_held_) {
+            after_handle_held_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return idle_released_; });
+        }
+        if (point == Point::kBeforeBufferedStatementPublication && hold_publication_ && !held_) {
+            held_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        }
+        // Stop holds the active client lock here; a worker reaches its close
+        // trace without it.
+        if (point == Point::kBeforeClientShutdown && !shutdown_seen_) {
+            shutdown_seen_ = true;
+            closed_before_shutdown_ = changed_.wait_for(lock, std::chrono::seconds(10), [&] { return worker_closed_; });
+        }
+        changed_.notify_all();
+    }
+    void WaitFor(std::uint64_t id, std::size_t count = 1U) {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return waits_[id] >= count; }));
+    }
+    std::size_t Waits(std::uint64_t id) { std::lock_guard lock(mutex_); return waits_[id]; }
+    void HoldPublication() { std::lock_guard lock(mutex_); hold_publication_ = true; }
+    void WaitHeld() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return held_; }));
+    }
+    // Closed by its worker before any client socket was shut down, if one was.
+    bool ClosedBeforeShutdown() {
+        std::lock_guard lock(mutex_);
+        return shutdown_seen_ ? closed_before_shutdown_ : worker_closed_;
+    }
+    // Holds the worker after its registration and its KILL check, just
+    // before it polls: from there only its wake reports a yield, KILL or stop.
+    // Holds the worker just before its bounded receive on id.
+    void HoldReceive(std::uint64_t id) { std::lock_guard lock(mutex_); hold_receive_ = id; }
+    void WaitReceiveHeld() { Wait([&] { return receive_held_; }); }
+    void ReleaseReceive() { { std::lock_guard lock(mutex_); receive_released_ = true; } changed_.notify_all(); }
+    void WaitReceive(std::uint64_t id) { Wait([&] { return receives_[id] >= 1U; }); }
+    void WaitLargeWrite() { Wait([&] { return large_write_; }); }
+    void HoldIdleWait(std::uint64_t id) { std::lock_guard lock(mutex_); hold_idle_ = id; }
+    // Holds the next worker that returns from a connection, before it waits for another.
+    void HoldAfterHandle() { std::lock_guard lock(mutex_); hold_after_handle_ = true; }
+    void WaitAfterHandleHeld() { Wait([&] { return after_handle_held_; }); }
+    void WaitIdleHeld() { Wait([&] { return idle_held_; }); }
+    void ReleaseIdleWait() { { std::lock_guard lock(mutex_); idle_released_ = true; } changed_.notify_all(); }
+    void WaitQueued(std::uint64_t id) { Wait([&] { return queued_[id] >= 1U; }); }
+    std::size_t Queued(std::uint64_t id) { std::lock_guard lock(mutex_); return queued_[id]; }
+    // Stop and the accept loop each publish the stop and wake waiting workers.
+    void WaitStopPublished(std::size_t count) { Wait([&] { return stop_publications_ >= count; }); }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; idle_released_ = true; receive_released_ = true; }
+        changed_.notify_all();
+    }
+  private:
+    template <typename Predicate> void Wait(Predicate predicate) {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), predicate));
+    }
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::unordered_map<std::uint64_t, std::size_t> waits_, queued_;
+    std::uint64_t hold_idle_ = 0U;
+    std::unordered_map<std::uint64_t, std::size_t> receives_;
+    std::uint64_t hold_receive_ = 0U;
+    bool receive_held_ = false, receive_released_ = false, large_write_ = false;
+    std::size_t stop_publications_ = 0U;
+    bool idle_held_ = false, idle_released_ = false;
+    bool hold_after_handle_ = false, after_handle_held_ = false;
+    bool worker_closed_ = false, shutdown_seen_ = false, closed_before_shutdown_ = false;
+    bool hold_publication_ = false, held_ = false, released_ = false;
+};
+
+chunkdb::ServerConfig OneWaitingWorkerConfig() {
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    config.idle_connection_timeout_ms = 120000U; // Longer than every wait below.
+    return config;
+}
+
+std::uint64_t HelloId(RawClient& client) {
+    client.SetReadDeadline(std::chrono::seconds(10));
+    client.SendLine("HELLO 3");
+    return std::stoull(ReadHelloReply(client).at("connection_id"));
+}
+
+// A request queued for the only worker takes it from the idle connection
+// that worker waits on; that connection keeps working through the I/O thread.
+void TestWaitingWorkerYieldsToQueuedRequest() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("waiting-worker-yields", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    RawClient first("127.0.0.1", harness.port);
+    const auto first_id = HelloId(first);
+    RawClient second("127.0.0.1", harness.port);
+    const auto second_id = HelloId(second);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    constexpr std::size_t kLongLine = 60000U;
+    first.SendLine("PING" + std::string(kLongLine, ' ')); assert(first.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(first_id);
+    // The worker keeps the connection with the buffer of its last line.
+    assert(chunkdb::FeedDeliveryTestAccess::RequestLineCapacity(*harness.server, first_id).value() >= kLongLine);
+    second.SendLine("PING"); assert(second.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(second_id);
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(first_id, 2U);
+    second.SendLine("PING"); assert(second.ReadLine() == "+PONG\r\n");
+}
+
+// KILL closes an idle connection that a worker waits on without waiting for
+// the idle deadline, and frees that worker.
+void TestKillClosesWaitingWorkerConnection() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("kill-waiting-worker", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    RawClient target("127.0.0.1", harness.port);
+    const auto id = HelloId(target);
+    RawClient controller("127.0.0.1", harness.port);
+    controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    target.SendLine("PING"); assert(target.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id);
+    controller.SendLine("KILL CONNECTION " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    assert(target.WaitForClose(std::chrono::seconds(5)));
+    assert(!chunkdb::FeedDeliveryTestAccess::ConnectionStillOwned(*harness.server, id));
+    controller.SendLine("PING"); assert(controller.ReadLine() == "+PONG\r\n");
+}
+
+// The idle deadline still closes a connection while a worker waits on it.
+void TestWaitingWorkerKeepsIdleDeadline() {
+    WorkerIdleWaitHook hook;
+    auto config = OneWaitingWorkerConfig();
+    config.idle_connection_timeout_ms = 300U;
+    ServerHarness harness("waiting-worker-idle-deadline", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient client("127.0.0.1", harness.port);
+    const auto id = HelloId(client);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    // The idle deadline starts when the reply is written, after this.
+    const auto sent = std::chrono::steady_clock::now();
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id);
+    assert(client.WaitForClose(std::chrono::seconds(10)));
+    assert(std::chrono::steady_clock::now() - sent >= std::chrono::milliseconds(300));
+    RawClient next("127.0.0.1", harness.port);
+    (void)HelloId(next);
+    next.SendLine("PING"); assert(next.ReadLine() == "+PONG\r\n");
+}
+
+// Part of a request returns the connection to the I/O thread, whose request
+// line deadline closes it; the worker serves other connections meanwhile.
+void TestPartialInputLeavesWaitingWorker() {
+    WorkerIdleWaitHook hook;
+    auto config = OneWaitingWorkerConfig();
+    config.client_io_timeout_ms = 300U;
+    ServerHarness harness("waiting-worker-partial-input", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient slow("127.0.0.1", harness.port);
+    const auto id = HelloId(slow);
+    RawClient other("127.0.0.1", harness.port);
+    (void)HelloId(other);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    slow.SendLine("PING"); assert(slow.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id);
+    slow.SendBytes("PI");
+    assert(slow.WaitForClose(std::chrono::seconds(10)));
+    assert(slow.Received().empty());
+    assert(hook.Waits(id) == 1U);
+    other.SendLine("PING"); assert(other.ReadLine() == "+PONG\r\n");
+}
+
+// Stop wakes a worker waiting on an idle connection before it shuts the
+// client sockets down.
+void TestStopWakesWaitingWorker() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("stop-waiting-worker", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    const auto id = HelloId(client);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id);
+    harness.server->Stop();
+    harness.JoinStopped();
+    assert(hook.ClosedBeforeShutdown());
+    assert(client.WaitForClose(std::chrono::seconds(5)));
+}
+
+// A FLUSH WAL whose barrier runs on a shared maintenance worker when the
+// server stops ends before the server's workers are joined, and the stopped
+// server leaves the maintenance workers to the catalog that owns them.
+void TestStopDuringPooledWalBarrier() {
+    auto store_config = BaseStoreConfig();
+    store_config.background_maintenance = true;
+    ServerHarness harness("stop-pooled-barrier", store_config,
+        chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    client.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
+    assert(client.ReadLine().starts_with(":"));
+    auto lease = harness.catalog->Require("default")->Acquire();
+    assert(lease);
+    auto& store = lease->store();
+    store.ArmBarrierBeforeSyncPauseForTests();
+    struct Resume {
+        chunkdb::ChunkStore& store;
+        ~Resume() { store.ResumeBarrierBeforeSyncForTests(); }
+    } resume{store};
+    client.SendLine("FLUSH WAL");
+    assert(store.WaitForBarrierBeforeSyncForTests());
+    harness.server->Stop();
+    auto stopped = std::async(std::launch::async, [&] { harness.JoinStopped(); });
+    assert(stopped.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout);
+    store.ResumeBarrierBeforeSyncForTests();
+    assert(stopped.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    stopped.get();
+    // The barrier ended; the shutdown may have closed the connection first.
+    try {
+        const auto reply = client.ReadLine();
+        assert(reply == "+OK\r\n" || reply.starts_with("-ERR CANCELLED"));
+    } catch (const std::runtime_error&) {}
+    store.SetBlockBits(1, 0, "0100");
+    lease.reset();
+    harness.catalog->WalBarrier();
+}
+
+// A request queued while the only worker is between its registration and
+// its poll still takes that worker: the yield wake must survive until the poll.
+void TestYieldInsideIdleWaitWindow() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("yield-idle-wait-window", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient first("127.0.0.1", harness.port);
+    const auto first_id = HelloId(first);
+    RawClient second("127.0.0.1", harness.port);
+    const auto second_id = HelloId(second);
+    hook.HoldIdleWait(first_id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+    hook.WaitIdleHeld();
+    second.SendLine("PING");
+    hook.WaitQueued(second_id);
+    hook.ReleaseIdleWait();
+    assert(second.ReadLine() == "+PONG\r\n");
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+}
+
+// A KILL between the waiting worker's KILL check and its poll still closes
+// the connection at once.
+void TestKillInsideIdleWaitWindow() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("kill-idle-wait-window", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient target("127.0.0.1", harness.port);
+    const auto id = HelloId(target);
+    RawClient controller("127.0.0.1", harness.port);
+    controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    hook.HoldIdleWait(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    target.SendLine("PING"); assert(target.ReadLine() == "+PONG\r\n");
+    hook.WaitIdleHeld();
+    controller.SendLine("KILL CONNECTION " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    hook.ReleaseIdleWait();
+    assert(target.WaitForClose(std::chrono::seconds(5)));
+    controller.SendLine("PING"); assert(controller.ReadLine() == "+PONG\r\n");
+}
+
+// Stop published while the waiting worker is just before its poll still
+// returns the connection before the client sockets are shut down.
+void TestStopInsideIdleWaitWindow() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("stop-idle-wait-window", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient client("127.0.0.1", harness.port);
+    const auto id = HelloId(client);
+    hook.HoldIdleWait(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    hook.WaitIdleHeld();
+    auto stopping = std::async(std::launch::async, [&] { harness.server->Stop(); });
+    // Both stop publications precede the poll, so neither wake can stand in
+    // for the other.
+    hook.WaitStopPublished(2U);
+    hook.ReleaseIdleWait();
+    assert(stopping.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+    stopping.get();
+    harness.JoinStopped();
+    assert(hook.ClosedBeforeShutdown());
+    assert(client.WaitForClose(std::chrono::seconds(5)));
+}
+
+// A request that arrived while the worker was held before its poll is
+// served after the idle deadline passes, as the I/O thread would serve it.
+void TestRequestAtIdleDeadlineIsServed() {
+    WorkerIdleWaitHook hook;
+    auto config = OneWaitingWorkerConfig();
+    config.idle_connection_timeout_ms = 300U;
+    ServerHarness harness("request-at-idle-deadline", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient client("127.0.0.1", harness.port);
+    const auto id = HelloId(client);
+    hook.HoldIdleWait(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    // The reply was written, and its idle deadline set, before it was read.
+    const auto expired = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+    hook.WaitIdleHeld();
+    client.SendLine("PING");
+    std::mutex deadline_mutex;
+    std::condition_variable deadline_wait;
+    std::unique_lock deadline_lock(deadline_mutex);
+    (void)deadline_wait.wait_until(deadline_lock, expired, [] { return false; });
+    hook.ReleaseIdleWait();
+    assert(client.ReadLine() == "+PONG\r\n");
+}
+
+// Holds a named migration after it is prepared, before its decision.
+class PreparedMigrationPause : public chunkdb::MigrationTestHook {
+  public:
+    void Run(Point point, std::string_view) override {
+        if (point != Point::kPrepared) return;
+        std::unique_lock lock(mutex_);
+        entered_ = true;
+        changed_.notify_all();
+        changed_.wait(lock, [&] { return released_; });
+    }
+    void Wait() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return entered_; }));
+    }
+    void Release() { { std::lock_guard lock(mutex_); released_ = true; } changed_.notify_all(); }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, released_ = false;
+};
+
+// A statement that the waiting worker read is published to CANCEL: cancelled
+// before its decision, it applies nothing and the connection stays usable.
+void TestCancelStatementReadByWaitingWorker() {
+    WorkerIdleWaitHook hook;
+    PreparedMigrationPause pause;
+    ServerHarness harness("cancel-waiting-worker-read", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release {
+        ServerHarness& harness; PreparedMigrationPause& pause; WorkerIdleWaitHook& hook;
+        ~Release() { pause.Release(); hook.Release(); harness.catalog->SetMigrationTestHook(nullptr); }
+    } release{harness, pause, hook};
+    RawClient target("127.0.0.1", harness.port);
+    const auto id = HelloId(target);
+    RawClient controller("127.0.0.1", harness.port);
+    controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    target.SendLine("PING"); assert(target.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id);
+    harness.catalog->SetMigrationTestHook(&pause);
+    const auto queued = hook.Queued(id);
+    target.SendLine("MIGRATE 'add_light' ALTER TABLE default ADD COLUMN light u8 NULL");
+    pause.Wait();
+    assert(hook.Queued(id) == queued); // Read by the waiting worker, never queued.
+    controller.SendLine("CANCEL " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    pause.Release();
+    assert(target.ReadLine().starts_with("-ERR CANCELLED applied=false"));
+    harness.catalog->SetMigrationTestHook(nullptr);
+    target.SendLine("MIGRATE 'add_light' ALTER TABLE default ADD COLUMN light u8 NULL");
+    assert(target.ReadLine() == "+applied\r\n");
+}
+
+// After a pipelined burst the worker keeps waiting on its connection: the
+// next request is read by that worker, not queued by the I/O thread.
+void TestPipelinedBurstKeepsWaitingWorker() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("pipelined-burst-waiting-worker", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    const auto id = HelloId(client);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    client.SendBytes("PING\r\nPING\r\n");
+    assert(client.ReadLine() == "+PONG\r\n");
+    assert(client.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id);
+    const auto queued = hook.Queued(id);
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id, 2U);
+    assert(hook.Queued(id) == queued);
+}
+
+
+// A worker that has handed its connection back counts as free before it waits
+// again: a request queued meanwhile is left to it, and no worker waiting on
+// another connection is asked to yield.
+void TestReturningWorkerTakesQueuedRequest() {
+    WorkerIdleWaitHook hook;
+    auto config = OneWaitingWorkerConfig();
+    config.worker_threads = 2U;
+    ServerHarness harness("returning-worker-takes-request", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient kept("127.0.0.1", harness.port);
+    const auto kept_id = HelloId(kept);
+    RawClient returned("127.0.0.1", harness.port);
+    const auto returned_id = HelloId(returned);
+    RawClient queued("127.0.0.1", harness.port);
+    const auto queued_id = HelloId(queued);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    kept.SendLine("PING"); assert(kept.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(kept_id);
+    returned.SendLine("PING"); assert(returned.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(returned_id);
+    hook.HoldAfterHandle();
+    returned.SendBytes("PI"); // Part of a line: its worker hands the connection back.
+    hook.WaitAfterHandleHeld();
+    const auto kept_queued = hook.Queued(kept_id);
+    queued.SendLine("PING");
+    hook.WaitQueued(queued_id);
+    hook.ReleaseIdleWait();
+    assert(queued.ReadLine() == "+PONG\r\n");
+    kept.SendLine("PING"); assert(kept.ReadLine() == "+PONG\r\n");
+    assert(hook.Queued(kept_id) == kept_queued);
+    returned.SendBytes("NG\r\n"); assert(returned.ReadLine() == "+PONG\r\n");
+}
+
+// A waiting worker keeps its connection's ordinary reply reservation only
+// while it waits: a connection that yields its worker returns it.
+void TestYieldReturnsKeptReplyCredit() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("yield-returns-kept-credit", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    RawClient first("127.0.0.1", harness.port);
+    const auto first_id = HelloId(first);
+    RawClient second("127.0.0.1", harness.port);
+    const auto second_id = HelloId(second);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    constexpr std::size_t kLongLine = 60000U;
+    first.SendLine("PING" + std::string(kLongLine, ' ')); assert(first.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(first_id);
+    // The worker keeps the connection with the buffer of its last line.
+    assert(chunkdb::FeedDeliveryTestAccess::RequestLineCapacity(*harness.server, first_id).value() >= kLongLine);
+    // Only the waiting connection holds output credit now.
+    constexpr std::size_t kPool = 2147483648ULL, kOrdinary = 65536U;
+    assert(!chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, kPool));
+    assert(chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, kPool - kOrdinary));
+    second.SendLine("PING"); assert(second.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(second_id);
+    // The first connection returned its reservation when it yielded the worker.
+    assert(chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, kPool - kOrdinary));
+    assert(!chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, kPool - kOrdinary + 1U));
+    // It gave back the line buffer together with the line credit.
+    assert(chunkdb::FeedDeliveryTestAccess::RequestLineCapacity(*harness.server, first_id).value() < kLongLine);
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+}
+
+// An idle greeted connection holds no request line credit: with lines this
+// long the general pool holds one reservation, so a second HELLO completes
+// only if the first, answered connection holds none.
+void TestIdleConnectionsHoldNoLineCredit() {
+    auto config = BaseServerConfig();
+    config.max_line_bytes = 9U * 1048576U;
+    ServerHarness harness("idle-no-line-credit", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    std::vector<std::unique_ptr<RawClient>> clients;
+    for (std::size_t i = 0U; i < 3U; ++i) {
+        clients.push_back(std::make_unique<RawClient>("127.0.0.1", harness.port));
+        (void)HelloId(*clients.back());
+    }
+    for (const auto& client : clients) {
+        client->SendLine("PING");
+        assert(client->ReadLine() == "+PONG\r\n");
+    }
+}
+
+#ifndef _WIN32 // Windows workers wait only on the poller.
+// A request queued while the only worker is inside its bounded receive gets
+// that worker once the receive ends; no wake reaches the receive.
+void TestQueuedRequestTakesWorkerAfterReceive() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("queued-after-receive", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient first("127.0.0.1", harness.port);
+    const auto first_id = HelloId(first);
+    RawClient second("127.0.0.1", harness.port);
+    const auto second_id = HelloId(second);
+    hook.HoldReceive(first_id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+    hook.WaitReceiveHeld();
+    second.SendLine("PING");
+    hook.WaitQueued(second_id);
+    hook.ReleaseReceive();
+    assert(second.ReadLine() == "+PONG\r\n");
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+}
+
+// KILL of a connection whose worker is inside its bounded receive closes it
+// when that receive ends.
+void TestKillDuringWorkerReceive() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("kill-during-receive", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient target("127.0.0.1", harness.port);
+    const auto id = HelloId(target);
+    RawClient controller("127.0.0.1", harness.port);
+    controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    hook.HoldReceive(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    target.SendLine("PING"); assert(target.ReadLine() == "+PONG\r\n");
+    hook.WaitReceiveHeld();
+    controller.SendLine("KILL CONNECTION " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    hook.ReleaseReceive();
+    assert(target.WaitForClose(std::chrono::seconds(5)));
+    controller.SendLine("PING"); assert(controller.ReadLine() == "+PONG\r\n");
+}
+
+// Stop published while the worker is inside its bounded receive returns the
+// connection when that receive ends, before the client sockets are shut down.
+void TestStopDuringWorkerReceive() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("stop-during-receive", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient client("127.0.0.1", harness.port);
+    const auto id = HelloId(client);
+    hook.HoldReceive(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    hook.WaitReceiveHeld();
+    auto stopping = std::async(std::launch::async, [&] { harness.server->Stop(); });
+    hook.WaitStopPublished(1U);
+    hook.ReleaseReceive();
+    assert(stopping.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+    stopping.get();
+    harness.JoinStopped();
+    assert(hook.ClosedBeforeShutdown());
+    assert(client.WaitForClose(std::chrono::seconds(5)));
+}
+
+// A client socket whose 1024-byte receive buffer is set before it connects,
+// so the window it advertises stays that small; it sends and never reads.
+struct StalledSocket {
+    int fd = -1;
+    explicit StalledSocket(std::uint16_t port) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        assert(fd >= 0);
+        const int small = 1024;
+        assert(setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(port);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        assert(connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    }
+    ~StalledSocket() { if (fd >= 0) close(fd); }
+    void Send(std::string_view bytes) const {
+        assert(send(fd, bytes.data(), bytes.size(), 0) == static_cast<ssize_t>(bytes.size()));
+    }
+    // Reads one whole reply, however the transport splits it.
+    std::string ReadReply() const {
+        std::string reply;
+        while (!Complete(reply)) {
+            char buffer[4096];
+            const auto read = recv(fd, buffer, sizeof(buffer), 0);
+            assert(read > 0);
+            reply.append(buffer, static_cast<std::size_t>(read));
+        }
+        return reply;
+    }
+    // True when `reply` holds exactly one protocol value with all its members.
+    static bool Complete(std::string_view reply) {
+        std::size_t at = 0U;
+        return Skip(reply, at) && at == reply.size();
+    }
+    static bool Skip(std::string_view reply, std::size_t& at) {
+        const auto end = reply.find("\r\n", at);
+        if (end == std::string_view::npos) return false;
+        const char type = reply[at];
+        const auto line = std::string(reply.substr(at + 1U, end - at - 1U));
+        at = end + 2U;
+        if (type == '$' || type == '=' || type == '!') {
+            const auto bytes = std::stoull(line) + 2U;
+            if (reply.size() - at < bytes) return false;
+            at += bytes;
+            return true;
+        }
+        if (type != '*' && type != '%' && type != '~' && type != '>') return true;
+        auto members = std::stoull(line);
+        if (type == '%') members *= 2U;
+        for (; members != 0U; --members)
+            if (!Skip(reply, at)) return false;
+        return true;
+    }
+    std::uint64_t Hello() const {
+        Send("HELLO 3\r\n");
+        const auto reply = ReadReply();
+        const auto at = reply.find("connection_id\r\n:");
+        assert(at != std::string::npos);
+        return std::stoull(reply.substr(at + 16U));
+    }
+};
+
+// A client that stops reading a large reply begun by the worker that kept its
+// connection holds that worker for one bounded send at most, and the I/O
+// thread that takes the reply over still serves other connections.
+void TestStalledReaderLeavesWorkerAfterReceive() {
+    WorkerIdleWaitHook hook;
+    auto store_cfg = BaseStoreConfig();
+    store_cfg.geometry.chunk_width_blocks = 512;
+    store_cfg.geometry.chunk_height_blocks = 512;
+    store_cfg.geometry.block_bits = 32;
+    ServerHarness harness("stalled-reader-after-receive", store_cfg,
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    {
+        auto lease = harness.catalog->Find("default")->Acquire();
+        lease->store().SetBlockBits(0, 0, std::string(32, '0'));
+    }
+    StalledSocket stalled(harness.port);
+    const auto id = stalled.Hello();
+    RawClient other("127.0.0.1", harness.port);
+    (void)HelloId(other);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    stalled.Send("PING\r\n");
+    assert(stalled.ReadReply() == "+PONG\r\n");
+    hook.WaitReceive(id);
+    // Smaller than one 65536-byte reply piece, so the first send cannot finish.
+    assert(chunkdb::FeedDeliveryTestAccess::SetSendBuffer(*harness.server, id, 4096));
+    stalled.Send("GET CHUNK 0 0 FROM default\r\n"); // About 1 MiB, never read.
+    hook.WaitLargeWrite();
+    other.SendLine("PING"); assert(other.ReadLine() == "+PONG\r\n");
+    RawClient late("127.0.0.1", harness.port);
+    (void)HelloId(late);
+    late.SendLine("PING"); assert(late.ReadLine() == "+PONG\r\n");
+}
+#endif
+
+// A connection that its worker kept with a blocking socket goes back to the
+// I/O thread nonblocking.
+void TestHandedBackSocketIsNonblocking() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("handed-back-nonblocking", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    RawClient first("127.0.0.1", harness.port);
+    const auto first_id = HelloId(first);
+    RawClient second("127.0.0.1", harness.port);
+    const auto second_id = HelloId(second);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(first_id); // Past its bounded receive, waiting on the poller.
+    const auto kept = chunkdb::FeedDeliveryTestAccess::SocketNonBlocking(*harness.server, first_id);
+    const auto timeouts = chunkdb::FeedDeliveryTestAccess::SocketTimeouts(*harness.server, first_id);
+    second.SendLine("PING"); assert(second.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(second_id);
+    const auto returned = chunkdb::FeedDeliveryTestAccess::SocketNonBlocking(*harness.server, first_id);
+#ifdef _WIN32
+    (void)kept; (void)timeouts; // Windows workers wait only on the poller.
+#else
+    assert(kept && !*kept); // Plain POSIX sockets wait with a blocking receive.
+    // Its receive and each of its sends are bounded while the worker keeps it.
+    assert(timeouts && timeouts->first == static_cast<long>(chunkdb::kWorkerReceiveWaitMs) &&
+        timeouts->second == static_cast<long>(chunkdb::kWorkerReceiveWaitMs));
+#endif
+    if (returned) assert(*returned);
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+}
+
+// Holds the only worker after it hands a connection back until the I/O
+// thread has been refused queue space again, so only the following pop can
+// tell it that space returned.
+class RefusedDispatchHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kIdleQueueBackpressure) ++refusals_;
+        if (point == Point::kAfterStatementQueued) ++queued_;
+        if (point == Point::kBeforeWorkerHandle && !entered_) {
+            entered_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        }
+        if (point == Point::kAfterWorkerHandle && released_ && !held_) {
+            held_ = true;
+            refused_again_ = changed_.wait_for(lock, std::chrono::seconds(10), [&] { return refusals_ > base_; });
+        }
+        changed_.notify_all();
+    }
+    template <typename Predicate> void Wait(Predicate predicate) {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), predicate));
+    }
+    void WaitEntered() { Wait([&] { return entered_; }); }
+    void WaitQueued() { Wait([&] { return queued_ >= 2U; }); }
+    void WaitRefused() { Wait([&] { return refusals_ >= 1U; }); }
+    void Release() {
+        { std::lock_guard lock(mutex_); base_ = refusals_; released_ = true; }
+        changed_.notify_all();
+    }
+    bool RefusedAgain() { std::lock_guard lock(mutex_); return held_ && refused_again_; }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::size_t refusals_ = 0U, queued_ = 0U, base_ = 0U;
+    bool entered_ = false, released_ = false, held_ = false, refused_again_ = false;
+};
+
+void TestRefusedDispatchWakesAfterPop() {
+    RefusedDispatchHook hook;
+    auto config = OneWaitingWorkerConfig();
+    config.max_pending_clients = 1U;
+    ServerHarness harness("refused-dispatch-pop", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { RefusedDispatchHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient busy("127.0.0.1", harness.port); (void)HelloId(busy);
+    RawClient queued("127.0.0.1", harness.port); (void)HelloId(queued);
+    RawClient refused("127.0.0.1", harness.port); (void)HelloId(refused);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    busy.SendLine("PING");
+    hook.WaitEntered();
+    queued.SendLine("PING");
+    hook.WaitQueued();
+    refused.SendLine("PING");
+    hook.WaitRefused();
+    hook.Release();
+    assert(busy.ReadLine() == "+PONG\r\n");
+    assert(queued.ReadLine() == "+PONG\r\n");
+    assert(refused.ReadLine() == "+PONG\r\n");
+    assert(hook.RefusedAgain());
+}
+
+// A statement read by a waiting worker keeps its statement timeout, applies
+// nothing when it expires, and leaves the connection usable.
+void TestWaitingWorkerStatementTimesOut() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("waiting-worker-statement-timeout", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient target("127.0.0.1", harness.port);
+    target.SetReadDeadline(std::chrono::seconds(10));
+    target.SendLine("HELLO 3 WITH statement_timeout_ms=200");
+    const auto id = std::stoull(ReadHelloReply(target).at("connection_id"));
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    target.SendLine("PING"); assert(target.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id);
+    hook.HoldPublication();
+    target.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
+    hook.WaitHeld();
+    // Admission preceded the hold, so its deadline has passed 300 ms later.
+    const auto expired = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    std::mutex deadline_mutex;
+    std::condition_variable deadline_wait;
+    std::unique_lock deadline_lock(deadline_mutex);
+    (void)deadline_wait.wait_until(deadline_lock, expired, [] { return false; });
+    hook.Release();
+    assert(target.ReadLine().starts_with("-ERR TIMEOUT applied=false"));
+    {
+        auto lease = harness.catalog->Require("default")->Acquire();
+        assert(!lease->store().GetBlock(0, 0));
+    }
+    target.SendLine("PING"); assert(target.ReadLine() == "+PONG\r\n");
+}
+
+template <typename Client>
+void TestHelloIndependentOfStatementWorkers(bool tls) {
+    IdleQueuePressureHook hook;
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    config.tls_enabled = tls;
+    ServerHarness harness(tls ? "hello-busy-tls" : "hello-busy-plain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { IdleQueuePressureHook& hook; ~Release() { hook.Release(); } } release{hook};
+    Client worker("127.0.0.1", harness.port);
+    worker.SetReadDeadline(std::chrono::seconds(10));
+    worker.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    worker.SendLine("PING");
+    hook.WaitWorker();
+    Client newcomer("127.0.0.1", harness.port);
+    newcomer.SetReadDeadline(std::chrono::seconds(10));
+    newcomer.Hello();
+    hook.Release();
+    assert(worker.ReadLine() == "+PONG\r\n");
+    newcomer.SendLine("PING");
+    assert(newcomer.ReadLine() == "+PONG\r\n");
+}
+
+template <typename Client>
+void TestPartialInputDoesNotHoldWorker(bool tls) {
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    config.tls_enabled = tls;
+    ServerHarness harness(tls ? "partial-worker-tls" : "partial-worker-plain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    Client partial("127.0.0.1", harness.port);
+    partial.SetReadDeadline(std::chrono::seconds(10));
+    partial.Hello();
+    partial.SendBytes("SET BLOCK 0 0 IN default bits = $1\r\n$1\r\n");
+    Client ready("127.0.0.1", harness.port);
+    ready.SetReadDeadline(std::chrono::seconds(10));
+    ready.Hello();
+    ready.SendLine("PING");
+    assert(ready.ReadLine() == "+PONG\r\n");
+    partial.SendBytes("\x01\r\nPING\r\n");
+    (void)ReadVersion(partial);
+    assert(partial.ReadLine() == "+PONG\r\n");
 }
 
 // A client of protocol 1 or 2 fails at once with a clear error, and so does
@@ -2259,6 +3724,25 @@ void CheckTrickledFramesAreBounded(std::uint16_t port, std::size_t io_timeout_ms
         assert(ClosedAtDeadline(elapsed, io_timeout));
         assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol incomplete parameter frame\r\n");
     }
+    {
+        // A drained body, like a kept one, arrives whole within the timeout
+        // from the end of its header, however steadily its pieces come.
+        ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
+        Client drained("127.0.0.1", port);
+        drained.Hello();
+        const auto start = Clock::now();
+        drained.SendBytes("SET BLOCK 0 0 IN missing c1 = $1\r\n$64\r\n");
+        auto sender = Trickle(drained, "xxxx", 16U, io_timeout / 4);
+        const bool ended = logs.WaitContains("payload deadline exceeded", io_timeout * 5);
+        const auto elapsed = Clock::now() - start;
+        sender.join();
+        assert(ended);
+        assert(ClosedAtDeadline(elapsed, io_timeout));
+        try {
+            assert(drained.ReadLine() == "-ERR PROTOCOL reason=protocol incomplete parameter frame\r\n");
+        } catch (const std::runtime_error&) {
+        }
+    }
     // The single worker is free again.
     Client fast("127.0.0.1", port);
     fast.Hello();
@@ -2722,7 +4206,7 @@ void CheckHelloNegotiation(std::uint16_t port) {
         client.SendBytes("HELLO 3 WITH future=$1,CLIENT_NAME=$2,statement_timeout_ms=0,default_tag=x'00'\r\n$8\r\nPING\r\nxx\r\n$3\r\napp\r\nPING\r\n");
         const auto hello = ReadHelloReply(client);
         assert(hello.at("protocol") == "3" && std::stoull(hello.at("connection_id")) != 0U);
-        assert(hello.at("options") == "%1" && hello.at("not_applied") == "%3");
+        assert(hello.at("options") == "%2" && hello.at("not_applied") == "%2");
         assert(hello.at("idle_timeout_ms") == "1234");
         assert(client.ReadLine() == "+PONG\r\n");
     }
@@ -3446,7 +4930,7 @@ void TestSendTimeoutSetupFailureClosesConnection() {
 
     ServerHarness harness("send-timeout-setup-failure", store_cfg, engine_cfg, server_cfg);
     {
-        ScopedServerTimeoutFailpoint failpoint(2, 0);
+        ScopedServerSocketFailpoint failpoint(2, 0);
         RawClient client("127.0.0.1", harness.port);
         client.SendLine("PING");
         assert(logs.WaitContains(
@@ -3461,7 +4945,7 @@ void TestSendTimeoutSetupFailureClosesConnection() {
     assert(ok.ReadLine() == "+PONG\r\n");
 }
 
-void TestReceiveTimeoutSetupFailureClosesConnection() {
+void TestNonblockingSetupFailureClosesConnection() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
 
     auto store_cfg = BaseStoreConfig();
@@ -3471,19 +4955,18 @@ void TestReceiveTimeoutSetupFailureClosesConnection() {
     };
     auto server_cfg = BaseServerConfig();
 
-    ServerHarness harness("recv-timeout-setup-failure", store_cfg, engine_cfg, server_cfg);
+    ServerHarness harness("nonblocking-setup-failure", store_cfg, engine_cfg, server_cfg);
     {
-        ScopedServerTimeoutFailpoint failpoint(0, 2);
+        ScopedServerSocketFailpoint failpoint(0, 2);
         RawClient client("127.0.0.1", harness.port);
         assert(logs.WaitContains(
-            "failed to configure client receive timeout; closing connection",
+            "failed to configure nonblocking client I/O; closing connection",
             std::chrono::seconds(2)));
         client.SendLine("PING");
         assert(client.WaitForClose(std::chrono::milliseconds(1500)));
     }
 
-    // Before HELLO the wait is bounded by the handshake deadline, not idle.
-    assert(logs.Contains("phase=handshake_wait"));
+    assert(logs.Contains("phase=handshake"));
 
     RawClient ok("127.0.0.1", harness.port);
     ok.Hello();
@@ -3573,16 +5056,22 @@ void TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests() {
     for (std::size_t i = 0; i < kRequests; ++i) {
         assert(client.ReadLine() == "+PONG\r\n");
     }
+    // Requests sent one by one each start with the worker's bounded receive.
+    for (std::size_t i = 0; i < kRequests; ++i) {
+        client.SendLine("PING");
+        assert(client.ReadLine() == "+PONG\r\n");
+    }
 
+    // The receive timeout belongs to the connection, set once at most.
     const std::uint64_t recv_timeout_calls = chunkdb::ServerRecvTimeoutConfigCallsForTests();
-    if (recv_timeout_calls >= kRequests / 2) {
+    if (recv_timeout_calls > 1U) {
         throw std::runtime_error(
-            "recv timeout was reconfigured too often for pipelined keep-alive requests: calls=" +
+            "requests reconfigured the receive timeout: calls=" +
             std::to_string(recv_timeout_calls));
     }
 }
 
-void TestLongIdleConnectionTimeoutReleasesWorker() {
+void TestLongIdleConnectionTimeoutReleasesWorker(bool greeted = true) {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
         .require_auth = false,
@@ -3594,16 +5083,32 @@ void TestLongIdleConnectionTimeoutReleasesWorker() {
 
     ServerHarness harness("long-idle-timeout", store_cfg, engine_cfg, server_cfg);
     RawClient idle("127.0.0.1", harness.port);
-
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
+    if (greeted) idle.Hello();
 
     RawClient fast("127.0.0.1", harness.port);
     fast.SendLine("HELLO 3");
 
-    std::string response;
-    assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
-    assert(response == "%14\r\n");
+    fast.SetReadDeadline(std::chrono::milliseconds(1500));
+    assert(ReadHelloReply(fast).at("protocol") == "3");
     assert(idle.WaitForClose(std::chrono::milliseconds(1500)));
+}
+
+void TestQueuedStatementTimeoutPreservesConnection() {
+    IdleQueuePressureHook hook;
+    auto config = BaseServerConfig(); config.worker_threads = 1U;
+    ServerHarness harness("queued-statement-timeout", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { IdleQueuePressureHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient worker("127.0.0.1", harness.port); worker.Hello();
+    RawClient queued("127.0.0.1", harness.port); queued.SetReadDeadline(std::chrono::seconds(10));
+    queued.SendLine("HELLO 3 WITH statement_timeout_ms=1000");
+    assert(ReadHelloReply(queued).at("protocol") == "3");
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    worker.SendLine("PING"); hook.WaitWorker();
+    queued.SendLine("PING");
+    assert(queued.ReadLine().starts_with("-ERR TIMEOUT applied=false"));
+    hook.Release();
+    assert(worker.ReadLine() == "+PONG\r\n");
+    queued.SendLine("PING"); assert(queued.ReadLine() == "+PONG\r\n");
 }
 
 // A transaction past --txn-max-duration-ms whose client sends nothing does
@@ -3666,52 +5171,6 @@ void TestExpiredTransactionReleasesBudget() {
     assert(other.ReadLine() == "_\r\n");
 }
 
-void TestPendingQueueWaitTimeoutClosesQueuedSocket() {
-    auto store_cfg = BaseStoreConfig();
-    auto engine_cfg = chunkdb::EngineConfig{
-        .require_auth = false,
-        .max_auth_failures = 5,
-    };
-    auto server_cfg = BaseServerConfig();
-    server_cfg.worker_threads = 1;
-    server_cfg.client_io_timeout_ms = 300;
-    server_cfg.idle_connection_timeout_ms = 150;
-    server_cfg.max_pending_clients = 2;
-
-    ServerHarness harness("pending-queue-wait-timeout", store_cfg, engine_cfg, server_cfg);
-
-    RawClient stalled("127.0.0.1", harness.port);
-    stalled.SendBytes("PING");
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
-
-    RawClient queued("127.0.0.1", harness.port);
-    std::this_thread::sleep_for(std::chrono::milliseconds(220));
-
-    assert(stalled.WaitForClose(std::chrono::milliseconds(1500)));
-    assert(queued.WaitForClose(std::chrono::milliseconds(1500)));
-
-    const auto recovery_deadline = Clock::now() + std::chrono::seconds(2);
-    bool recovered = false;
-    while (!recovered && Clock::now() < recovery_deadline) {
-        try {
-            RawClient recovery("127.0.0.1", harness.port);
-            recovery.SendLine("HELLO 3");
-
-            std::string response;
-            recovered =
-                recovery.ReadLineWithin(std::chrono::milliseconds(500), &response) &&
-                response == "%14\r\n";
-        } catch (const std::runtime_error&) {
-            recovered = false;
-        }
-
-        if (!recovered) {
-            std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        }
-    }
-    assert(recovered);
-}
-
 void TestSlowResponseDrainDeadlineReleasesWorker() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
 
@@ -3764,7 +5223,7 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     assert(logs.Contains("phase=write") || logs.Contains("phase=read"));
     assert(logs.Contains("reason=timeout"));
     // A write deadline says how much of the reply the socket took.
-    assert(!logs.Contains("phase=write") || logs.Contains("reply write deadline exceeded after "));
+    assert(!logs.Contains("phase=write") || logs.Contains("reply progress deadline exceeded"));
 
     // After the slow connection is terminated, the single worker must be able
     // to serve a new client.
@@ -3775,17 +5234,270 @@ void TestSlowResponseDrainDeadlineReleasesWorker() {
     assert(response == "%14\r\n");
 }
 
-void TestSteadySlowReaderHitsReplyWriteDeadline(bool fail_before_read = false) {
+class PayloadCreditHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t id) override {
+        if (point != Point::kAfterPayloadCreditQueued && point != Point::kAfterPayloadCreditGranted) return;
+        { std::lock_guard lock(mutex_); (point == Point::kAfterPayloadCreditQueued ? queued_ : granted_).push_back(id); }
+        changed_.notify_all();
+    }
+    void Wait(std::uint64_t id, bool granted) {
+        std::unique_lock lock(mutex_);
+        const auto& entries = granted ? granted_ : queued_;
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] {
+            return std::find(entries.begin(), entries.end(), id) != entries.end();
+        }));
+    }
+    bool Granted(std::uint64_t id) {
+        std::lock_guard lock(mutex_);
+        return std::find(granted_.begin(), granted_.end(), id) != granted_.end();
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::vector<std::uint64_t> queued_, granted_;
+};
+
+template <typename Client>
+void TestKillIdleTransactionReleasesHistory(bool tls) {
+    auto config = BaseServerConfig(); config.tls_enabled = tls; config.worker_threads = 1U;
+    ServerHarness harness(tls ? "kill-idle-txn-tls" : "kill-idle-txn", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    Client owner("127.0.0.1", harness.port); owner.SendLine("HELLO 3");
+    const auto id = std::stoull(ReadHelloReply(owner).at("connection_id"));
+    Client controller("127.0.0.1", harness.port); controller.Hello();
+    controller.SendLine("SET BLOCK 0 0 IN default bits = b'1000'"); (void)ReadVersion(controller);
+    owner.SendLine("BEGIN"); assert(owner.ReadLine() == "+OK\r\n");
+    owner.SendLine("SET BLOCK 0 0 IN default bits = b'0100'"); assert(owner.ReadLine() == "_\r\n");
+    controller.SendLine("SET BLOCK 0 0 IN default bits = b'0010'"); (void)ReadVersion(controller);
+    auto lease = harness.catalog->Require("default")->Acquire();
+    assert(lease->store().TxnRegisteredCountForTests() == 1U);
+    assert(lease->store().TxnKeptStateCountForTests() == 1U);
+    controller.SendLine("KILL CONNECTION " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    assert(owner.WaitForClose(std::chrono::seconds(5)));
+    assert(lease->store().TxnRegisteredCountForTests() == 0U);
+    assert(lease->store().TxnKeptStateCountForTests() == 0U);
+    assert(lease->store().GetBlockBits(0, 0) == "0010");
+}
+
+template <typename Client>
+void TestKillDecidedCommitPreservesOutcome(bool tls) {
+    auto config = BaseServerConfig(); config.tls_enabled = tls; config.worker_threads = 1U;
+    ServerHarness harness(tls ? "kill-decided-commit-tls" : "kill-decided-commit", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    Client owner("127.0.0.1", harness.port); owner.SetReadDeadline(std::chrono::seconds(10));
+    owner.SendLine("HELLO 3");
+    const auto id = std::stoull(ReadHelloReply(owner).at("connection_id"));
+    Client controller("127.0.0.1", harness.port); controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    owner.SendLine("BEGIN"); assert(owner.ReadLine() == "+OK\r\n");
+    owner.SendLine("SET BLOCK 0 0 IN default bits = b'0100'"); assert(owner.ReadLine() == "_\r\n");
+    auto lease = harness.catalog->Require("default")->Acquire();
+    auto& store = lease->store();
+    constexpr auto point = chunkdb::TxnPausePoint::kBeforePostCommitOutcome;
+    store.ArmTxnPauseForTests(point);
+    struct Resume {
+        chunkdb::ChunkStore& store;
+        bool armed = true;
+        ~Resume() { if (armed) store.ResumeTxnForTests(point); }
+    } resume{store};
+    owner.SendLine("COMMIT");
+    assert(store.WaitForTxnPauseForTests(point));
+    controller.SendLine("KILL CONNECTION " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    store.ResumeTxnForTests(point); resume.armed = false;
+    assert(ReadVersion(owner) != 0U);
+    assert(owner.WaitForClose(std::chrono::seconds(5)));
+    assert(store.GetBlockBits(0, 0) == "0100");
+    assert(store.TxnRegisteredCountForTests() == 0U);
+}
+
+void TestRemovingCreditHeadAdmitsNextWaiter() {
+    PayloadCreditHook hook;
+    auto config = BaseServerConfig(); config.client_io_timeout_ms = 30000;
+    ServerHarness harness("payload-credit-head", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient controller("127.0.0.1", harness.port); controller.Hello();
+    controller.SendLine("CREATE TABLE wide (v bits(512)) CHUNK 1024 x 1024");
+    assert(controller.ReadLine() == "+OK\r\n");
+    controller.SendLine("ALTER TABLE wide SET var_max_chunk_bytes = 67108864");
+    assert(controller.ReadLine() == "+OK\r\n");
+    controller.SendLine("CREATE TABLE small (f u8 REQUIRED, v bytes(16777216) NULL) CHUNK 1 x 1");
+    assert(controller.ReadLine() == "+OK\r\n");
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    std::vector<std::unique_ptr<RawClient>> owners;
+    std::uint64_t head_id = 0U;
+    for (std::size_t i = 0U; i < 16U; ++i) {
+        auto client = std::make_unique<RawClient>("127.0.0.1", harness.port);
+        client->SendLine("HELLO 3");
+        const auto id = std::stoull(ReadHelloReply(*client).at("connection_id"));
+        client->SendLine("SET CHUNK 0 0 IN wide $1");
+        hook.Wait(id, i < 15U);
+        if (i == 15U) { head_id = id; assert(!hook.Granted(id)); }
+        owners.push_back(std::move(client));
+    }
+    RawClient small("127.0.0.1", harness.port); small.SendLine("HELLO 3");
+    const auto small_id = std::stoull(ReadHelloReply(small).at("connection_id"));
+    small.SendLine("SET BLOCK 0 0 IN small v = $1");
+    hook.Wait(small_id, false);
+    assert(!hook.Granted(small_id));
+    // The removed head owns no payload reservation, so its removal returns no bytes.
+    controller.SendLine("KILL CONNECTION " + std::to_string(head_id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    hook.Wait(small_id, true);
+}
+
+// Time spent waiting for the server's input credit is not the client's
+// lateness: the frame deadline starts when the credit is granted, and a
+// wait longer than the I/O timeout is refused with BUSY.
+void CheckPayloadCreditWait(bool granted) {
+    PayloadCreditHook hook;
+    constexpr auto io_timeout = std::chrono::milliseconds(1000);
+    auto config = BaseServerConfig(); config.client_io_timeout_ms = io_timeout.count(); config.worker_threads = 1U;
+    ServerHarness harness("payload-credit-wait", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient controller("127.0.0.1", harness.port); controller.Hello();
+    controller.SendLine("CREATE TABLE wide (v bits(512)) CHUNK 1024 x 1024");
+    assert(controller.ReadLine() == "+OK\r\n");
+    controller.SendLine("ALTER TABLE wide SET var_max_chunk_bytes = 67108864");
+    assert(controller.ReadLine() == "+OK\r\n");
+    // A paused COMMIT holds the only worker, so complete requests keep their credit in its queue.
+    RawClient owner("127.0.0.1", harness.port); owner.SetReadDeadline(std::chrono::seconds(20)); owner.Hello();
+    owner.SendLine("BEGIN"); assert(owner.ReadLine() == "+OK\r\n");
+    owner.SendLine("SET BLOCK 0 0 IN default bits = b'0100'"); assert(owner.ReadLine() == "_\r\n");
+    auto lease = harness.catalog->Require("default")->Acquire();
+    auto& store = lease->store();
+    constexpr auto point = chunkdb::TxnPausePoint::kBeforePostCommitOutcome;
+    store.ArmTxnPauseForTests(point);
+    struct Resume {
+        chunkdb::ChunkStore& store;
+        bool armed = true;
+        void operator()() { if (std::exchange(armed, false)) store.ResumeTxnForTests(point); }
+        ~Resume() { (*this)(); }
+    } resume{store};
+    owner.SendLine("COMMIT");
+    assert(store.WaitForTxnPauseForTests(point));
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    std::vector<std::unique_ptr<RawClient>> holders;
+    for (std::size_t i = 0U; i < 15U; ++i) {
+        auto client = std::make_unique<RawClient>("127.0.0.1", harness.port);
+        client->SetReadDeadline(std::chrono::seconds(20));
+        client->SendLine("HELLO 3");
+        const auto id = std::stoull(ReadHelloReply(*client).at("connection_id"));
+        client->SendBytes("SET CHUNK 0 0 IN wide $1\r\n$0\r\n\r\n");
+        hook.Wait(id, true);
+        holders.push_back(std::move(client));
+    }
+    const auto waiter = [&](RawClient& client) {
+        client.SetReadDeadline(std::chrono::seconds(20));
+        client.SendLine("HELLO 3");
+        const auto id = std::stoull(ReadHelloReply(client).at("connection_id"));
+        return id;
+    };
+    if (!granted) {
+        // Line and frame on time, and no credit within the timeout.
+        RawClient refused("127.0.0.1", harness.port);
+        const auto id = waiter(refused);
+        const auto start = Clock::now();
+        refused.SendBytes("SET CHUNK 0 0 IN wide $1\r\n$0\r\n\r\n");
+        hook.Wait(id, false);
+        assert(refused.ReadLine().starts_with("-ERR BUSY reason=input_budget "));
+        assert(ClosedAtDeadline(Clock::now() - start, io_timeout));
+        assert(refused.WaitForClose(std::chrono::seconds(5)));
+        assert(!hook.Granted(id));
+        return;
+    }
+    // Credit granted within the timeout of the wait; the frame follows more
+    // than the timeout after its line, and within it of the grant.
+    RawClient late("127.0.0.1", harness.port);
+    const auto id = waiter(late);
+    late.SendLine("SET CHUNK 0 0 IN wide $1");
+    hook.Wait(id, false);
+    std::this_thread::sleep_for(io_timeout * 6 / 10);
+    resume();
+    hook.Wait(id, true);
+    std::this_thread::sleep_for(io_timeout * 6 / 10);
+    late.SendBytes("$0\r\n\r\n");
+    const auto reply = late.ReadLine();
+    assert(!reply.starts_with("-ERR PROTOCOL"));
+    late.SendLine("PING");
+    assert(late.ReadLine() == "+PONG\r\n");
+    assert(ReadVersion(owner) != 0U);
+}
+
+void TestPayloadCreditWaitIsRefused() { CheckPayloadCreditWait(false); }
+void TestPayloadCreditGrantRestartsFrameDeadline() { CheckPayloadCreditWait(true); }
+
+void TestWideNullableReadHasBoundedReplyAdmission() {
+    ServerHarness harness("wide-nullable-reply", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port); client.SetReadDeadline(std::chrono::seconds(10)); client.Hello();
+    std::string create = "CREATE TABLE wide (f u8 REQUIRED";
+    for (std::size_t i = 0U; i < 32U; ++i) create += ",b" + std::to_string(i) + " bytes(16777216) NULL";
+    client.SendLine(create + ") CHUNK 1 x 1"); assert(client.ReadLine() == "+OK\r\n");
+    client.SendLine("SET BLOCK 0 0 IN wide f = 1"); (void)ReadVersion(client);
+    client.SendLine("GET BLOCK 0 0 FROM wide COLUMNS f");
+    assert(client.ReadReply() == "*1\r\n:1\r\n");
+    client.SendLine("GET BLOCK 0 0 FROM wide");
+    std::string expected = "*33\r\n:1\r\n";
+    for (std::size_t i = 0U; i < 32U; ++i) expected += "_\r\n";
+    assert(client.ReadReply() == expected);
+    chunkdb::SessionState writer;
+    (void)harness.engine->Execute(writer, "HELLO 3");
+    const std::vector<std::optional<std::string>> parameters{std::string(1048564U, 'x')};
+    assert(!harness.engine->Execute(writer, "SET BLOCK 0 0 IN wide f = 1, b0 = $1", parameters).starts_with('-'));
+    std::string repeated = "GET BLOCK 0 0 FROM wide COLUMNS b0";
+    for (std::size_t i = 1U; i < 65U; ++i) repeated += ",b0";
+    client.SendLine(repeated);
+    assert(client.ReadLine().starts_with("-ERR OUT_OF_RANGE"));
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+}
+class StatementTrackerHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t count) override {
+        if (point != Point::kAfterStatementTrackerScan) return;
+        last.store(count);
+        maximum.store(std::max(maximum.load(), count));
+    }
+    std::atomic<std::size_t> last{0U}, maximum{0U};
+};
+void TestReplyAdmissionPrecedesMutation() {
+    StatementTrackerHook hook;
+    ServerHarness harness("reply-credit-before-write", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port); client.SetReadDeadline(std::chrono::seconds(5)); client.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    auto credit = chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, 2147483648ULL);
+    assert(credit);
+    for (std::size_t i = 0U; i < 8U; ++i) {
+        client.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
+        assert(client.ReadLine().starts_with("-ERR BUSY reason=reply_budget"));
+    }
+    client.SendLine("SHOW CONNECTIONS");
+    assert(client.ReadReply().starts_with('*'));
+    assert(hook.last.load() == 0U && hook.maximum.load() <= 1U);
+    {
+        auto lease = harness.catalog->Require("default")->Acquire();
+        assert(!lease->store().GetBlock(0, 0).has_value());
+    }
+    credit.reset();
+    client.SendLine("SET BLOCK 0 0 IN default bits = b'1000'"); (void)ReadVersion(client);
+    auto lease = harness.catalog->Require("default")->Acquire();
+    assert(lease->store().GetBlockBits(0, 0) == "1000");
+}
+
+void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false) {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
     struct QueueHook final : chunkdb::FeedDeliveryTestHook {
         chunkdb::ChunkServer* server = nullptr;
         std::mutex mutex;
         std::condition_variable changed;
         bool ready = false, released = false;
+        std::size_t filled = 0U, reads = 0U, prefills = 0U;
         void Run(Point point, std::size_t completed) override {
             if (point != Point::kAfterClientRead || completed != 1U) return;
-            (void)chunkdb::FeedDeliveryTestAccess::FillActiveClientSendQueue(*server, 65536);
             std::unique_lock lock(mutex);
+            ++reads;
+            changed.notify_all();
+            if (ready) return;
+            filled = chunkdb::FeedDeliveryTestAccess::FillActiveClientSendQueue(*server, 65536);
+            ++prefills;
             ready = true;
             changed.notify_all();
             changed.wait(lock, [&] { return released; });
@@ -3794,13 +5506,18 @@ void TestSteadySlowReaderHitsReplyWriteDeadline(bool fail_before_read = false) {
             std::unique_lock lock(mutex);
             return changed.wait_for(lock, std::chrono::seconds(10), [&] { return ready; });
         }
+        void CheckSecondRead() {
+            std::unique_lock lock(mutex);
+            assert(changed.wait_for(lock, std::chrono::seconds(10), [&] { return reads >= 2U; }));
+            assert(prefills == 1U);
+        }
         void Release() {
             { std::lock_guard lock(mutex); released = true; }
             changed.notify_all();
         }
     } hook;
 
-    // The reply must remain in flight while the client steadily drains it.
+    // This response remains in progress across several transport intervals.
     auto store_cfg = BaseStoreConfig();
     store_cfg.geometry = {
         .large_chunk_width_chunks = 1,
@@ -3815,7 +5532,7 @@ void TestSteadySlowReaderHitsReplyWriteDeadline(bool fail_before_read = false) {
     };
     auto server_cfg = BaseServerConfig();
     server_cfg.worker_threads = 1;
-    server_cfg.client_io_timeout_ms = 300;
+    server_cfg.client_io_timeout_ms = 600;
     server_cfg.idle_connection_timeout_ms = 10000;
 
     ServerHarness harness("steady-slow-reader-deadline", store_cfg, engine_cfg, server_cfg);
@@ -3828,47 +5545,44 @@ void TestSteadySlowReaderHitsReplyWriteDeadline(bool fail_before_read = false) {
         lease->store().SetBlockBits(0, 0, std::string(512, '0'));
     }
     RawClient slow("127.0.0.1", harness.port);
-    slow.SetReceiveBuffer(65536);
+    slow.SetReceiveBuffer(1048576);
     slow.Hello();
     hook.server = harness.server.get();
     chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
-    slow.SendBytes("GET CHUNK 0 0 FROM default\r\n");
+    slow.SendBytes("GET CH");
     assert(hook.Wait());
     if (fail_before_read) throw std::runtime_error("injected first read failure");
-    // The worker is paused after reading the request, with its send queue
-    // filled to would-block. Start draining those fixture bytes before GET
-    // begins executing, so a timeout exercises an active continuous reader.
     std::size_t first_read = 0U;
-    const bool first_closed = slow.ReadSomeWithin(std::chrono::seconds(1), 4096, &first_read) && first_read == 0U;
+    assert(slow.ReadSomeWithin(std::chrono::seconds(1), 4096U, &first_read) && first_read != 0U);
     hook.Release();
-    assert(!first_closed && first_read > 0U);
-
-    // The client keeps reading about 1 MiB/s, fast enough to reopen the TCP
-    // window well within the send timeout, so a send that blocks until the
-    // buffer has room never times out by itself; only the reply deadline can
-    // end the write before the 64 MiB are delivered.
-    const auto start = std::chrono::steady_clock::now();
-    bool terminated = false;
-    bool closed = false;
-    std::size_t received = first_read;
-    while (!terminated && !closed && std::chrono::steady_clock::now() - start < std::chrono::seconds(5)) {
-        for (int read = 0; read < 16 && !closed; ++read) {
-            std::size_t bytes_read = 0;
-            closed = slow.ReadSomeWithin(std::chrono::milliseconds(50), 4096, &bytes_read) && bytes_read == 0;
-            received += bytes_read;
-        }
-        std::this_thread::sleep_for(std::chrono::milliseconds(50));
-        terminated = logs.Contains("connection terminated");
+    slow.SendBytes("UNK 0 0 FROM default\r\nGET CHUNK 0 0 FROM default\r\n");
+    hook.CheckSecondRead();
+    // Discard exactly the fixture bytes before interpreting the actual reply.
+    // The filled queue proves backpressure without exposing its bytes as CQL.
+    assert(first_read <= hook.filled);
+    for (auto remaining = hook.filled - first_read; remaining != 0U;) {
+        std::size_t bytes_read = 0U;
+        assert(slow.ReadSomeWithin(std::chrono::seconds(1), std::min<std::size_t>(remaining, 1048576U),
+            &bytes_read) && bytes_read != 0U);
+        remaining -= bytes_read;
     }
-    const bool logged = logs.WaitContains("connection terminated", std::chrono::seconds(1));
-    std::cout << "steady slow reader: logged=" << logged << " closed=" << closed
-              << " received=" << received << '\n' << std::flush;
-    assert(logged);
-    assert(std::chrono::steady_clock::now() - start < std::chrono::seconds(4));
+    assert(slow.ReadLine().starts_with('$'));
+    const auto start = Clock::now();
+    std::mutex cadence_mutex;
+    std::condition_variable cadence;
+    std::unique_lock cadence_lock(cadence_mutex);
+    for (std::size_t tick = 1U; tick <= 32U; ++tick) {
+        for (int read = 0; read < 256; ++read) {
+            std::size_t bytes_read = 0;
+            assert(slow.ReadSomeWithin(std::chrono::milliseconds(200), 4096, &bytes_read) && bytes_read != 0U);
+        }
+        (void)cadence.wait_until(cadence_lock, start + std::chrono::milliseconds(50U * tick), [] { return false; });
+        if (logs.Contains("connection terminated")) throw std::runtime_error(logs.Text());
+    }
+    // No further reads return window credit, so output must now stop progressing.
+    assert(logs.WaitContains("reply progress deadline exceeded", std::chrono::seconds(6)));
     assert(logs.Contains("phase=write"));
     assert(logs.Contains("reason=timeout"));
-    assert(logs.Contains("reply write deadline exceeded after "));
-    std::cout << "steady slow reader: " << logs.FirstContaining("reply write deadline exceeded after ") << '\n';
 }
 
 void TestIdlePeerCloseDoesNotLogTerminationWarning() {
@@ -3893,124 +5607,24 @@ void TestIdlePeerCloseDoesNotLogTerminationWarning() {
     assert(!logs.Contains("connection terminated"));
 }
 
-void TestPendingQueueSaturationRejectsNewConnections() {
-    ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
-
-    auto store_cfg = BaseStoreConfig();
-    auto engine_cfg = chunkdb::EngineConfig{
-        .require_auth = false,
-        .max_auth_failures = 5,
-    };
-    auto server_cfg = BaseServerConfig();
-    server_cfg.worker_threads = 1;
-    server_cfg.client_io_timeout_ms = 10000;
-    server_cfg.max_pending_clients = 1;
-
-    ServerHarness harness("pending-queue-saturation", store_cfg, engine_cfg, server_cfg);
-
-    auto try_connect = [&](const std::string& host, std::uint16_t port) -> std::unique_ptr<RawClient> {
-        try {
-            return std::make_unique<RawClient>(host, port);
-        } catch (const std::runtime_error&) {
-            return nullptr;
-        }
-    };
-
-    // Helper: send tolerantly. In a saturation scenario the server may legitimately
-    // reset a connection at a moment the test cannot precisely predict (scheduling
-    // of the single worker vs. the accept loop varies across platforms/core counts).
-    // A reset here is not a failure of the invariant under test, so swallow it.
-    auto try_send_line = [](RawClient& c, const std::string& s) -> bool {
-        try {
-            c.SendLine(s);
-            return true;
-        } catch (const std::runtime_error&) {
-            return false;
-        }
-    };
-
-    RawClient stalled("127.0.0.1", harness.port);
-    stalled.SendBytes("HELLO 3");
-    std::this_thread::sleep_for(std::chrono::milliseconds(40));
-
-    auto queued = try_connect("127.0.0.1", harness.port);
-    auto rejected1 = try_connect("127.0.0.1", harness.port);
-    auto rejected2 = try_connect("127.0.0.1", harness.port);
-
-    // At least one rejection must be logged. We do NOT assert an exact count:
-    // the warn fires once per overload episode, and if the single worker drains
-    // the pending slot between rejections the queue re-saturates and warns again.
-    // How many episodes occur depends on worker/accept-loop scheduling.
-    assert(logs.WaitContains(
-        "pending client queue full; rejecting new connections",
-        std::chrono::seconds(2)));
-    assert(logs.CountContains("pending client queue full; rejecting new connections") >= 1);
-
-    // Completing stalled's request is best-effort: if the worker already cycled
-    // past it and the server reset the connection, the worker is still proven
-    // free by the recovery client at the end of the test.
-    if (try_send_line(stalled, "")) {
-        std::string stalled_reply;
-        if (stalled.ReadLineWithin(std::chrono::seconds(2), &stalled_reply) &&
-            stalled_reply == "%14\r\n") {
-            stalled.ShutdownWrite();
-            (void)stalled.WaitForClose(std::chrono::milliseconds(800));
-        }
-    }
-    (void)stalled.WaitForClose(std::chrono::milliseconds(800));
-
-    std::size_t served_count = 0;
-    std::size_t not_served_count = 0;
-    std::size_t busy_count = 0;
-    for (const auto& client_ptr :
-         std::array<const std::unique_ptr<RawClient>*, 3>{&queued, &rejected1, &rejected2}) {
-        RawClient* client = client_ptr->get();
-        if (client == nullptr) {
-            // connect() was refused outright (no backlog slot).
-            not_served_count += 1;
-            continue;
-        }
-
-        std::string line;
-        bool got_line = false;
-        try {
-            client->SendLine("HELLO 3");
-            got_line = client->ReadLineWithin(std::chrono::seconds(2), &line);
-        } catch (const std::runtime_error&) {
-            got_line = false;
-        }
-        if (got_line) {
-            if (line.rfind("-ERR BUSY", 0) == 0) {
-                busy_count += 1;
-                not_served_count += 1;
-                (void)client->WaitForClose(std::chrono::seconds(2));
-                continue;
-            }
-            assert(line == "%14\r\n");
-            client->ShutdownWrite();
-            (void)client->WaitForClose(std::chrono::seconds(2));
-            served_count += 1;
-            continue;
-        }
-
-        (void)client->WaitForClose(std::chrono::seconds(2));
-        not_served_count += 1;
-    }
-
-    // Exactly which of the three excess connections is served vs. rejected
-    // depends on how the single worker and the accept loop interleave, which
-    // varies by platform and core count. The robust invariants are: every
-    // connection was accounted for, and the queue could not serve all of them
-    // (at least one was rejected/reset).
-    assert(served_count + not_served_count == 3);
-    assert(not_served_count >= 1);
-    assert(busy_count >= 1 || logs.CountContains("pending client queue full; rejecting new connections") >= 1);
-
-    // The server must remain usable after the saturation burst.
-    RawClient recovery("127.0.0.1", harness.port);
-    recovery.Hello();
-    recovery.SendLine("PING");
-    assert(recovery.ReadLine() == "+PONG\r\n");
+void TestPendingStatementQueueKeepsHelloAvailable() {
+    IdleQueuePressureHook hook;
+    auto config = BaseServerConfig(); config.worker_threads = 1U; config.max_pending_clients = 1U;
+    ServerHarness harness("pending-queue-hello", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { IdleQueuePressureHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient partial("127.0.0.1", harness.port); partial.SendBytes("HELLO 3");
+    RawClient worker("127.0.0.1", harness.port); worker.Hello();
+    RawClient queued("127.0.0.1", harness.port); queued.Hello();
+    RawClient waiting("127.0.0.1", harness.port); waiting.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    worker.SendLine("PING"); hook.WaitWorker();
+    queued.SendLine("PING"); waiting.SendLine("PING"); hook.WaitBackpressure();
+    RawClient newcomer("127.0.0.1", harness.port); newcomer.SetReadDeadline(std::chrono::seconds(10)); newcomer.Hello();
+    partial.SendBytes("\r\n");
+    assert(ReadHelloReply(partial).at("protocol") == "3");
+    hook.Release();
+    for (auto* client : {&worker, &queued, &waiting}) assert(client->ReadLine() == "+PONG\r\n");
+    newcomer.SendLine("PING"); assert(newcomer.ReadLine() == "+PONG\r\n");
 }
 
 void TestReadinessLogLineExists() {
@@ -4981,7 +6595,7 @@ void TestStopConnectedIdleClient() {
     hook.WaitIdle();
     chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop with connected idle client");
     harness.server->Stop();
-    hook.Release(); // Enter the pending read only after Stop has shut down it.
+    hook.Release(); // Release the handler only after Stop requested closure.
     harness.JoinStopped(); // Keep the client alive and supply no second Stop.
     assert(hook.JoinedWorkers() == config.worker_threads);
 }
@@ -5051,16 +6665,24 @@ class ScopedWindowsHandle {
     HANDLE handle_;
 };
 
-class BlockingIdleReadHook : public ShutdownTraceHook {
+class PolledPartialInputHook : public ShutdownTraceHook {
   public:
-    BlockingIdleReadHook()
-        : alertable_(CreateEvent(nullptr, TRUE, FALSE, nullptr)),
-          release_(CreateEvent(nullptr, TRUE, FALSE, nullptr)) {
-        if (alertable_.Get() == nullptr || release_.Get() == nullptr)
-            throw std::runtime_error("recv-alertable-wait: CreateEvent failed");
+    PolledPartialInputHook()
+        : release_(CreateEvent(nullptr, TRUE, FALSE, nullptr)) {
+        if (release_.Get() == nullptr)
+            throw std::runtime_error("partial-input-poll: CreateEvent failed");
     }
     void Run(Point point, std::size_t ordinal) override {
         ShutdownTraceHook::Run(point, ordinal);
+        if (point == Point::kAfterClientRead && ordinal >= 2U) {
+            { std::lock_guard lock(mutex_); returned_ = true; }
+            changed_.notify_all();
+        }
+        // The worker that read the partial line has handed it to the I/O thread.
+        if (point == Point::kAfterWorkerHandle) {
+            { std::lock_guard lock(mutex_); if (returned_) handed_back_ = true; }
+            changed_.notify_all();
+        }
         if (point != Point::kBeforeClientRead || ordinal < 2U) return;
         bool block = false;
         {
@@ -5074,47 +6696,42 @@ class BlockingIdleReadHook : public ShutdownTraceHook {
         // Use the documented nonalertable native wait, independent of the
         // C++ library's condition-variable implementation on Windows.
         if (block && WaitForSingleObject(release_.Get(), INFINITE) != WAIT_OBJECT_0)
-            throw std::runtime_error("recv-alertable-wait: idle barrier wait failed");
+            throw std::runtime_error("partial-input-poll: idle barrier wait failed");
     }
     void Release() { (void)SetEvent(release_.Get()); }
-    void WaitAlertableRecv() {
-        DWORD thread_id;
+    void WaitPolledRead() {
         {
             std::unique_lock lock(mutex_);
             if (!changed_.wait_for(lock, std::chrono::seconds(10), [&] { return thread_id_ != 0U; }))
-                throw std::runtime_error("recv-alertable-wait: waiting for idle read after PONG");
-            thread_id = thread_id_;
+                throw std::runtime_error("partial-input-poll: waiting for idle read after PONG");
         }
-        ScopedWindowsHandle thread(OpenThread(THREAD_SET_CONTEXT, FALSE, thread_id));
-        if (thread.Get() == nullptr)
-            throw std::runtime_error("recv-alertable-wait: OpenThread failed");
-        if (QueueUserAPC(SignalAlertable, thread.Get(), reinterpret_cast<ULONG_PTR>(alertable_.Get())) == 0U)
-            throw std::runtime_error("recv-alertable-wait: QueueUserAPC failed");
-        Release(); // Dispatch remains impossible until the ensuing recv wait.
-        // The final read observer has no other alertable wait between the hook
-        // and recv. APC dispatch therefore establishes the ongoing recv.
-        if (WaitForSingleObject(alertable_.Get(), 10000U) != WAIT_OBJECT_0)
-            throw std::runtime_error("recv-alertable-wait: waiting for APC inside blocking recv");
+        Release();
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, std::chrono::seconds(10), [&] { return returned_; }))
+            throw std::runtime_error("partial-input-poll: nonblocking read did not return");
+    }
+    void WaitHandedBack() {
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, std::chrono::seconds(10), [&] { return handed_back_; }))
+            throw std::runtime_error("partial-input-poll: worker did not hand the partial input back");
     }
   private:
-    static void CALLBACK SignalAlertable(ULONG_PTR event) {
-        // Never call Winsock from an APC interrupting a blocking Winsock call.
-        (void)SetEvent(reinterpret_cast<HANDLE>(event));
-    }
-    ScopedWindowsHandle alertable_;
     ScopedWindowsHandle release_;
     std::mutex mutex_;
     std::condition_variable changed_;
     DWORD thread_id_ = 0U;
+    bool returned_ = false;
+    bool handed_back_ = false;
 };
 
-void TestStopBlockingIdleRead() {
-    BlockingIdleReadHook hook; // Event survives any queued APC through harness join.
+void TestStopPolledPartialInputWindows() {
+    PolledPartialInputHook hook;
     auto config = BaseServerConfig();
+    config.client_io_timeout_ms = 120000U;
     config.idle_connection_timeout_ms = 120000U;
     ServerHarness harness("stop-blocking-idle-read", BaseStoreConfig(),
         chunkdb::EngineConfig{.require_auth = false}, config);
-    struct Release { BlockingIdleReadHook& hook; ~Release() { hook.Release(); } } release{hook};
+    struct Release { PolledPartialInputHook& hook; ~Release() { hook.Release(); } } release{hook};
     {
         RawClient probe("127.0.0.1", harness.port);
         probe.Hello(); // FeedIo is published before observer installation.
@@ -5124,82 +6741,86 @@ void TestStopBlockingIdleRead() {
     client.SetReadDeadline(std::chrono::seconds(15));
     client.Hello();
     client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
-    chunkdb::test::FeedPhaseWatchdog::Phase("recv-alertable-wait: confirm ongoing recv after PONG");
-    hook.WaitAlertableRecv();
+    // The worker that answered PING waits for the next request and reads the
+    // partial one; it returns the connection to the I/O thread's poller
+    // instead of entering a blocking receive.
+    client.SendBytes("PI");
+    chunkdb::test::FeedPhaseWatchdog::Phase("partial-input-poll: confirm ongoing partial-line recv");
+    hook.WaitPolledRead();
+    hook.WaitHandedBack();
     chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop with ongoing recv");
     harness.server->Stop();
     harness.JoinStopped(); // Keep client alive; no second Stop or disconnect.
+    assert(client.WaitForClose(std::chrono::seconds(5)));
     assert(hook.JoinedWorkers() == config.worker_threads);
 }
 
-class CancelBlockingIdleReadHook final : public BlockingIdleReadHook {
+class PolledInputShutdownHook final : public PolledPartialInputHook {
   public:
-    explicit CancelBlockingIdleReadHook(const char* case_name) : case_name_(case_name) {}
+    explicit PolledInputShutdownHook(const char* case_name) : case_name_(case_name) {}
     void FailNextAccept() { fail_accept_.store(true); }
+    void ArmIdleScan() { std::lock_guard lock(scan_mutex_); scan_armed_ = true; }
+    void WaitIdleScan() {
+        std::unique_lock lock(scan_mutex_);
+        assert(scan_changed_.wait_for(lock, std::chrono::seconds(10), [&] { return scan_entered_; }));
+    }
+    void Release() {
+        { std::lock_guard lock(scan_mutex_); scan_released_ = true; }
+        scan_changed_.notify_all();
+        PolledPartialInputHook::Release();
+    }
     void Run(Point point, std::size_t value) override {
         if (point == Point::kBeforeAccept && fail_accept_.exchange(false))
             throw std::runtime_error("injected accept-loop failure");
+        if (point == Point::kBeforeQueuedStopScan) {
+            std::unique_lock lock(scan_mutex_);
+            if (scan_armed_) {
+                scan_entered_ = true;
+                scan_changed_.notify_all();
+                scan_changed_.wait(lock, [&] { return scan_released_; });
+            }
+        }
         // Stop holds active_clients_mutex_ across these two callbacks. Use only
         // nonthrowing recording/C APIs here; never close or retain for later I/O.
         if (point == Point::kBeforeClientShutdown) {
             if (shutdown_sockets_.fetch_add(1U) == 0U) socket_.store(static_cast<SOCKET>(value));
             else {
-                std::fprintf(stderr, "FAIL CancelIoEx fixture: unexpected extra shutdown socket=%zu\n", value);
+                std::fprintf(stderr, "FAIL partial-input fixture: unexpected extra shutdown socket=%zu\n", value);
                 std::fflush(stderr);
             }
             return;
         }
         if (point == Point::kAfterClientShutdown) {
             const auto results = shutdown_results_.fetch_add(1U);
-            if (results != 0U || shutdown_sockets_.load() != 1U) return;
-            shutdown_error_.store(value);
+            if (results == 0U && shutdown_sockets_.load() == 1U) shutdown_error_.store(value);
+            Release(); // The poller may close the socket only after native shutdown was observed.
             return;
         }
-        if (point == Point::kAfterClientIoCancel) {
-            const DWORD error = static_cast<DWORD>(value);
-            requested_.store(error == ERROR_SUCCESS);
-            cancel_error_.store(error);
-            std::fprintf(stderr,
-                "CANCEL pid=%lu case=%s socket=%llu shutdown_error=%zu result=%s error=%lu\n",
-                GetCurrentProcessId(), case_name_, static_cast<unsigned long long>(socket_.load()), shutdown_error_.load(),
-                error == ERROR_SUCCESS ? "REQUESTED" : (error == ERROR_NOT_FOUND ? "NOT_FOUND" : "FAILED"), error);
-            std::fflush(stderr);
-            return;
-        }
-        // Record before the base's final barrier: after it returns there must
-        // still be no alertable call between the queued APC and the plain recv.
-        if (point == Point::kBeforeClientRead && value == 2U) target_thread_.store(GetCurrentThreadId());
-        if (GetCurrentThreadId() == target_thread_.load()) {
-            if (point == Point::kAfterClientRead && value == 2U) read_returned_.store(true);
-            if (point == Point::kAfterWorkerHandle) handled_.store(true);
-            if (point == Point::kBeforeWorkerClose) closing_.store(true);
-            if (point == Point::kAfterWorkerClose) closed_.store(true);
-        }
-        BlockingIdleReadHook::Run(point, value);
+        if (point == Point::kAfterClientRead && value == 2U) read_returned_.store(true);
+        PolledPartialInputHook::Run(point, value);
     }
     void CheckCompleted(std::size_t workers) {
         assert(shutdown_sockets_.load() == 1U && shutdown_results_.load() == 1U);
         assert(shutdown_error_.load() == 0U);
-        assert(read_returned_.load() && handled_.load() && closing_.load() && closed_.load());
+        assert(read_returned_.load());
         assert(JoinedWorkers() == workers);
-        if (!requested_.load()) {
-            if (cancel_error_.load() == ERROR_NOT_FOUND)
-                throw std::runtime_error("CancelIoEx NOT_FOUND: recv completed, but cancellation of a pending recv was not proven");
-            throw std::runtime_error("CancelIoEx FAILED error=" + std::to_string(cancel_error_.load()));
-        }
+        std::fprintf(stderr, "POLLED completed pid=%lu case=%s socket=%llu\n", GetCurrentProcessId(), case_name_,
+            static_cast<unsigned long long>(socket_.load()));
     }
   private:
     const char* case_name_;
     std::atomic<SOCKET> socket_{INVALID_SOCKET};
     std::atomic<std::size_t> shutdown_sockets_{0U}, shutdown_results_{0U}, shutdown_error_{0U};
-    std::atomic<DWORD> target_thread_{0U}, cancel_error_{ERROR_SUCCESS};
-    std::atomic<bool> requested_{false}, read_returned_{false}, handled_{false}, closing_{false}, closed_{false};
+    std::atomic<bool> read_returned_{false};
     std::atomic<bool> fail_accept_{false};
+    std::mutex scan_mutex_;
+    std::condition_variable scan_changed_;
+    bool scan_armed_ = false, scan_entered_ = false, scan_released_ = false;
 };
 
-void TestCancelBlockingIdleReadWindows(bool run_error = false) {
-    const char* case_name = run_error ? "TestRunErrorBlockingIdleReadWindows" : "TestCancelBlockingIdleReadWindows";
-    CancelBlockingIdleReadHook hook(case_name); // Own events through every queued APC/worker callback.
+void TestPolledInputOwnershipWindows(bool run_error = false) {
+    const char* case_name = run_error ? "TestRunErrorPolledInputWindows" : "TestPolledInputOwnershipWindows";
+    PolledInputShutdownHook hook(case_name);
     struct TerminationTrace {
         chunkdb::LogLevel previous = chunkdb::GetLogLevel();
         std::atomic<bool> observed{false};
@@ -5218,10 +6839,11 @@ void TestCancelBlockingIdleReadWindows(bool run_error = false) {
         }
     } termination; // Survives harness join, including exception cleanup.
     auto config = BaseServerConfig();
+    config.client_io_timeout_ms = 120000U;
     config.idle_connection_timeout_ms = 120000U;
     ServerHarness harness("cancel-blocking-idle-read", BaseStoreConfig(),
         chunkdb::EngineConfig{.require_auth = false}, config);
-    struct Release { CancelBlockingIdleReadHook& hook; ~Release() { hook.Release(); } } release{hook};
+    struct Release { PolledInputShutdownHook& hook; ~Release() { hook.Release(); } } release{hook};
     {
         RawClient probe("127.0.0.1", harness.port);
         probe.Hello();
@@ -5232,10 +6854,19 @@ void TestCancelBlockingIdleReadWindows(bool run_error = false) {
     chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
     RawClient client("127.0.0.1", harness.port);
     client.SetReadDeadline(std::chrono::seconds(15));
-    client.Hello();
+    client.SendLine("HELLO 3");
+    const auto connection_id = std::stoull(ReadHelloReply(client).at("connection_id"));
     client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
-    chunkdb::test::FeedPhaseWatchdog::Phase("recv-alertable-wait: confirm ongoing recv for CancelIoEx");
-    hook.WaitAlertableRecv();
+    client.SendBytes("PI");
+    chunkdb::test::FeedPhaseWatchdog::Phase("partial-input-poll: confirm partial input returned to polling");
+    hook.WaitPolledRead();
+    // The worker read it; Stop must find the connection with the I/O thread.
+    hook.WaitHandedBack();
+    // Freeze the idle owner before Stop publishes running=false, so this
+    // fixture observes the native shutdown path rather than an earlier close.
+    hook.ArmIdleScan();
+    chunkdb::FeedDeliveryTestAccess::WakeTransport(*harness.server);
+    hook.WaitIdleScan();
     if (run_error) {
         chunkdb::test::FeedPhaseWatchdog::Phase("harness: fail accept loop with ongoing recv");
         hook.FailNextAccept();
@@ -5250,6 +6881,8 @@ void TestCancelBlockingIdleReadWindows(bool run_error = false) {
                  GetCurrentProcessId(), case_name, termination.observed.load() ? "present" : "absent");
     std::fflush(stderr); // recv==0 has no WARN; do not invent its termination error.
     hook.CheckCompleted(config.worker_threads);
+    assert(client.WaitForClose(std::chrono::seconds(5)));
+    assert(!chunkdb::FeedDeliveryTestAccess::ConnectionStillOwned(*harness.server, connection_id));
 }
 #endif
 
@@ -5415,8 +7048,8 @@ void TestFeedIoStopAfterDrain() {
 // A phase-watchdog exit must end only this case, never leave its server threads
 // alive in the process that will run the next case.
 bool IsIsolatedShutdownCase(std::string_view name) {
-    return name == "TestCancelBlockingIdleReadWindows" || name == "TestStopBlockingIdleRead" ||
-           name == "TestRunErrorBlockingIdleReadWindows" ||
+    return name == "TestPolledInputOwnershipWindows" || name == "TestStopPolledPartialInputWindows" ||
+           name == "TestRunErrorPolledInputWindows" ||
            name == "TestLingerFailureFenceFalse" || name == "TestLingerFailureFenceTrue";
 }
 
@@ -5533,9 +7166,9 @@ void TestFeedWatch() {
     run("TestStopConnectedIdleClient", TestStopConnectedIdleClient);
     run("TestStopDequeuedClient", TestStopDequeuedClient);
 #ifdef _WIN32
-    run("TestCancelBlockingIdleReadWindows", [] { TestCancelBlockingIdleReadWindows(); });
-    run("TestRunErrorBlockingIdleReadWindows", [] { TestCancelBlockingIdleReadWindows(true); });
-    run("TestStopBlockingIdleRead", TestStopBlockingIdleRead);
+    run("TestPolledInputOwnershipWindows", [] { TestPolledInputOwnershipWindows(); });
+    run("TestRunErrorPolledInputWindows", [] { TestPolledInputOwnershipWindows(true); });
+    run("TestStopPolledPartialInputWindows", TestStopPolledPartialInputWindows);
 #endif
     run("TestStopWaitingWorker", TestStopWaitingWorker);
     run("TestUnwatchReleaseBeforeReply<RawClient>(false)", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
@@ -5654,6 +7287,99 @@ chunkdb::ServerConfig ProxyServerConfig(bool tls) {
     return config;
 }
 
+class ScheduledAuthHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        if (point != Point::kAfterAuthReplyScheduled) return;
+        { std::lock_guard lock(mutex_); ++scheduled_; }
+        changed_.notify_all();
+    }
+    void Wait(std::size_t count) {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(5), [&] { return scheduled_ >= count; }));
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::size_t scheduled_ = 0U;
+};
+
+void TestDelayedAuthRepliesDoNotOccupyWorkers() {
+    ScheduledAuthHook hook;
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    engine_cfg.max_auth_failures_per_ip = 1;
+    engine_cfg.auth_failure_delay_ms = 20000;
+    engine_cfg.auth_failure_ban_ms = 20000;
+    auto server_cfg = ProxyServerConfig(false);
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 30000;
+    ServerHarness harness("scheduled-auth", BaseStoreConfig(), engine_cfg, server_cfg);
+    {
+        // A listening socket can precede transport publication during startup.
+        // Complete a separate login before installing the transport observer.
+        RawClient ready("127.0.0.1", harness.port);
+        ready.SetReadDeadline(std::chrono::seconds(5));
+        ready.SendBytes(ProxyV2Header("192.0.2.250"));
+        ready.Login();
+    }
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    std::vector<std::unique_ptr<RawClient>> rejected;
+    for (std::size_t i = 0U; i < 8U; ++i) {
+        auto client = std::make_unique<RawClient>("127.0.0.1", harness.port);
+        client->SetReadDeadline(std::chrono::seconds(5));
+        client->SendBytes(ProxyV2Header("198.51.100." + std::to_string(i + 1U)));
+        const auto login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
+        client->SendBytes(chunkdb::test::HelloUserBytes(login, kAdminUser));
+        const auto challenge = client->ReadLine();
+        assert(challenge.starts_with("+SCRAM "));
+        client->SendBytes(chunkdb::test::WrongAuthBytes(challenge));
+        hook.Wait(i + 1U);
+        rejected.push_back(std::move(client));
+    }
+    RawClient banned("127.0.0.1", harness.port);
+    const auto banned_login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
+    banned.SendBytes(ProxyV2Header("198.51.100.1") + chunkdb::test::HelloUserBytes(banned_login, kAdminUser));
+    hook.Wait(9U);
+    RawClient accepted("127.0.0.1", harness.port);
+    accepted.SetReadDeadline(std::chrono::seconds(5));
+    accepted.SendBytes(ProxyV2Header("203.0.113.20"));
+    accepted.Login();
+    accepted.SendLine("PING");
+    assert(accepted.ReadLine() == "+PONG\r\n");
+}
+
+// A login failure or ban reply held back past the HELLO deadline by
+// --auth-failure-delay-ms is still written, then the connection closes.
+void TestDelayedAuthReplyOutlivesHelloDeadline() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    engine_cfg.max_auth_failures_per_ip = 1;
+    engine_cfg.auth_failure_delay_ms = 1500;
+    engine_cfg.auth_failure_ban_ms = 60000;
+    auto server_cfg = BaseServerConfig();
+    server_cfg.client_io_timeout_ms = 1000;
+    ServerHarness harness("delayed-auth-deadline", BaseStoreConfig(), engine_cfg, server_cfg);
+    {
+        RawClient ready("127.0.0.1", harness.port);
+        ready.SetReadDeadline(std::chrono::seconds(5));
+        ready.Login();
+    }
+    RawClient failing("127.0.0.1", harness.port);
+    failing.SetReadDeadline(std::chrono::seconds(5));
+    const auto login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
+    failing.SendBytes(chunkdb::test::HelloUserBytes(login, kAdminUser));
+    const auto challenge = failing.ReadLine();
+    assert(challenge.starts_with("+SCRAM "));
+    failing.SendBytes(chunkdb::test::WrongAuthBytes(challenge));
+    assert(failing.ReadLine().starts_with("-ERR AUTH_FAILED "));
+    assert(failing.WaitForClose(std::chrono::seconds(5)));
+    RawClient banned("127.0.0.1", harness.port);
+    banned.SetReadDeadline(std::chrono::seconds(5));
+    const auto banned_login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
+    banned.SendBytes(chunkdb::test::HelloUserBytes(banned_login, kAdminUser));
+    assert(banned.ReadLine().find("temporary auth ban") != std::string::npos);
+    assert(banned.WaitForClose(std::chrono::seconds(5)));
+}
+
 std::string ReadText(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
@@ -5680,7 +7406,9 @@ void TestProxyProtocolSourceAddress() {
         {
             RawClient failing("127.0.0.1", harness.port);
             failing.SendBytes(ProxyV2Header("198.51.100.7"));
-            assert(FailedLoginReply(failing, kAdminUser, "wrong-1").rfind("-ERR AUTH_FAILED", 0) == 0);
+            const auto first_failure = FailedLoginReply(failing, kAdminUser, "wrong-1");
+            if (!first_failure.starts_with("-ERR AUTH_FAILED")) std::cerr << "unexpected login refusal: " << first_failure;
+            assert(first_failure.rfind("-ERR AUTH_FAILED", 0) == 0);
             assert(FailedLoginReply(failing, kAdminUser, "wrong-2").rfind("-ERR AUTH_FAILED", 0) == 0);
         }
         {
@@ -5804,6 +7532,15 @@ void TestProxyProtocolOverTls() {
             client.SendLine("PING");
             assert(client.ReadLine() == "+PONG\r\n");
         }
+        {
+            // A slow header, then a slow handshake: each within the timeout,
+            // both together longer, since the handshake has an interval of its own.
+            TlsClient slow("127.0.0.1", harness.port, 0, ProxyV2Header("198.51.100.10"), {},
+                std::chrono::milliseconds(server_cfg.client_io_timeout_ms * 6 / 10));
+            slow.Login();
+            slow.SendLine("PING");
+            assert(slow.ReadLine() == "+PONG\r\n");
+        }
         bool refused = false;
         try {
             TlsClient missing("127.0.0.1", harness.port);
@@ -5908,9 +7645,9 @@ int main(int argc, char** argv) {
         run("TestStopConnectedIdleClient", TestStopConnectedIdleClient);
         run("TestStopDequeuedClient", TestStopDequeuedClient);
 #ifdef _WIN32
-        run("TestCancelBlockingIdleReadWindows", [] { TestCancelBlockingIdleReadWindows(); });
-        run("TestRunErrorBlockingIdleReadWindows", [] { TestCancelBlockingIdleReadWindows(true); });
-        run("TestStopBlockingIdleRead", TestStopBlockingIdleRead);
+        run("TestPolledInputOwnershipWindows", [] { TestPolledInputOwnershipWindows(); });
+        run("TestRunErrorPolledInputWindows", [] { TestPolledInputOwnershipWindows(true); });
+        run("TestStopPolledPartialInputWindows", TestStopPolledPartialInputWindows);
 #endif
         run("TestStopWaitingWorker", TestStopWaitingWorker);
         run("TestLingerFailureFenceFalse", [] { TestLingerFailureFence(false); });
@@ -5924,6 +7661,55 @@ int main(int argc, char** argv) {
         run("TestWatchDefaultProgressTls", [] { TestWatchDefaultProgress<TlsClient>(true); });
 #endif
         run("TestPing", TestPing);
+        run("TestIdleConnectionsReleaseWorker", [] { TestIdleConnectionsReleaseWorker<RawClient>(false); });
+        run("TestIdleDispatchFailureClosesItsConnection", TestIdleDispatchFailureClosesItsConnection);
+        run("TestClientReadFailureClosesItsConnection", TestClientReadFailureClosesItsConnection);
+        run("TestIdleDispatchRespectsQueueCredit", TestIdleDispatchRespectsQueueCredit);
+        run("TestWaitingWorkerYieldsToQueuedRequest", TestWaitingWorkerYieldsToQueuedRequest);
+        run("TestKillClosesWaitingWorkerConnection", TestKillClosesWaitingWorkerConnection);
+        run("TestWaitingWorkerKeepsIdleDeadline", TestWaitingWorkerKeepsIdleDeadline);
+        run("TestPartialInputLeavesWaitingWorker", TestPartialInputLeavesWaitingWorker);
+        run("TestStopWakesWaitingWorker", TestStopWakesWaitingWorker);
+        run("TestStopDuringPooledWalBarrier", TestStopDuringPooledWalBarrier);
+        run("TestYieldInsideIdleWaitWindow", TestYieldInsideIdleWaitWindow);
+        run("TestKillInsideIdleWaitWindow", TestKillInsideIdleWaitWindow);
+        run("TestStopInsideIdleWaitWindow", TestStopInsideIdleWaitWindow);
+        run("TestRequestAtIdleDeadlineIsServed", TestRequestAtIdleDeadlineIsServed);
+        run("TestCancelStatementReadByWaitingWorker", TestCancelStatementReadByWaitingWorker);
+        run("TestPipelinedBurstKeepsWaitingWorker", TestPipelinedBurstKeepsWaitingWorker);
+        run("TestReturningWorkerTakesQueuedRequest", TestReturningWorkerTakesQueuedRequest);
+        run("TestYieldReturnsKeptReplyCredit", TestYieldReturnsKeptReplyCredit);
+        run("TestIdleConnectionsHoldNoLineCredit", TestIdleConnectionsHoldNoLineCredit);
+#ifndef _WIN32
+        run("TestQueuedRequestTakesWorkerAfterReceive", TestQueuedRequestTakesWorkerAfterReceive);
+        run("TestKillDuringWorkerReceive", TestKillDuringWorkerReceive);
+        run("TestStopDuringWorkerReceive", TestStopDuringWorkerReceive);
+        run("TestStalledReaderLeavesWorkerAfterReceive", TestStalledReaderLeavesWorkerAfterReceive);
+#endif
+        run("TestHandedBackSocketIsNonblocking", TestHandedBackSocketIsNonblocking);
+        run("TestWaitingWorkerStatementTimesOut", TestWaitingWorkerStatementTimesOut);
+        run("TestRefusedDispatchWakesAfterPop", TestRefusedDispatchWakesAfterPop);
+        run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);
+        run("TestConnectionListingTrimsStatementWhitespace", TestConnectionListingTrimsStatementWhitespace);
+        run("TestStopPublicationGapClosesQueuedOwner", TestStopPublicationGapClosesQueuedOwner);
+        run("TestOrdinaryWatchRateRepliesAreBounded", TestOrdinaryWatchRateRepliesAreBounded);
+        run("TestExpiredQueueRetainsTransportOwner", TestExpiredQueueRetainsTransportOwner);
+        run("TestStopDoesNotCloseQueuedReplyOwner", TestStopDoesNotCloseQueuedReplyOwner);
+        run("TestBufferedRequestsRetainWorker", TestBufferedRequestsRetainWorker);
+        run("TestKilledBufferedStatementCannotPublish", TestKilledBufferedStatementCannotPublish);
+        run("TestProgressiveChunkReplyOwnsSnapshot", [] { TestProgressiveReplyOwnsSnapshot<RawClient>(false, false); });
+        run("TestProgressiveAreaReplyOwnsSnapshot", [] { TestProgressiveReplyOwnsSnapshot<RawClient>(false, true); });
+        run("TestKillReadReplyReleasesCredit", [] { TestKillReadReplyReleasesCredit<RawClient>(false); });
+        run("TestHelloIndependentOfStatementWorkers", [] { TestHelloIndependentOfStatementWorkers<RawClient>(false); });
+        run("TestPartialInputDoesNotHoldWorker", [] { TestPartialInputDoesNotHoldWorker<RawClient>(false); });
+#ifdef CHUNKDB_WITH_OPENSSL
+        run("TestIdleConnectionsReleaseWorkerTls", [] { TestIdleConnectionsReleaseWorker<TlsClient>(true); });
+        run("TestProgressiveChunkReplyOwnsSnapshotTls", [] { TestProgressiveReplyOwnsSnapshot<TlsClient>(true, false); });
+        run("TestProgressiveAreaReplyOwnsSnapshotTls", [] { TestProgressiveReplyOwnsSnapshot<TlsClient>(true, true); });
+        run("TestKillReadReplyReleasesCreditTls", [] { TestKillReadReplyReleasesCredit<TlsClient>(true); });
+        run("TestHelloIndependentOfStatementWorkersTls", [] { TestHelloIndependentOfStatementWorkers<TlsClient>(true); });
+        run("TestPartialInputDoesNotHoldWorkerTls", [] { TestPartialInputDoesNotHoldWorker<TlsClient>(true); });
+#endif
         run("TestProtocolOneClientIsRefused", TestProtocolOneClientIsRefused);
         run("TestAuthAndSetGet", TestAuthAndSetGet);
         run("TestChunkGetLengthsAndForms", TestChunkGetLengthsAndForms);
@@ -5963,6 +7749,8 @@ int main(int argc, char** argv) {
         run("TestReadTimeoutLogsPhaseAndReason", TestReadTimeoutLogsPhaseAndReason);
         run("TestProxyProtocolParser", TestProxyProtocolParser);
         run("TestProxyProtocolSourceAddress", TestProxyProtocolSourceAddress);
+        run("TestDelayedAuthRepliesDoNotOccupyWorkers", TestDelayedAuthRepliesDoNotOccupyWorkers);
+        run("TestDelayedAuthReplyOutlivesHelloDeadline", TestDelayedAuthReplyOutlivesHelloDeadline);
         run("TestProxyProtocolRefusesBadHeaders", TestProxyProtocolRefusesBadHeaders);
         run("TestProxyProtocolOffIgnoresHeaders", TestProxyProtocolOffIgnoresHeaders);
 #ifdef CHUNKDB_WITH_OPENSSL
@@ -5971,25 +7759,37 @@ int main(int argc, char** argv) {
         run("TestReloadTlsWithoutTls", TestReloadTlsWithoutTls);
         run("TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe", TestSendAfterTimedOutCloseReturnsErrorInsteadOfSigpipe);
         run("TestSendTimeoutSetupFailureClosesConnection", TestSendTimeoutSetupFailureClosesConnection);
-        run("TestReceiveTimeoutSetupFailureClosesConnection", TestReceiveTimeoutSetupFailureClosesConnection);
+        run("TestNonblockingSetupFailureClosesConnection", TestNonblockingSetupFailureClosesConnection);
         run("TestSlowRequestDribbleDeadlineReleasesWorker", TestSlowRequestDribbleDeadlineReleasesWorker);
         run("TestIdleClientRemainsConnectedBetweenCommands", TestIdleClientRemainsConnectedBetweenCommands);
         run("TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests", TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests);
-        run("TestLongIdleConnectionTimeoutReleasesWorker", TestLongIdleConnectionTimeoutReleasesWorker);
+        run("TestLongIdleConnectionTimeoutReleasesWorker", [] { TestLongIdleConnectionTimeoutReleasesWorker(); });
+        run("TestBeforeHelloIdleDeadlineRemainsBounded", [] { TestLongIdleConnectionTimeoutReleasesWorker(false); });
+        run("TestQueuedStatementTimeoutPreservesConnection", TestQueuedStatementTimeoutPreservesConnection);
+        run("TestWideNullableReadHasBoundedReplyAdmission", TestWideNullableReadHasBoundedReplyAdmission);
+        run("TestReplyAdmissionPrecedesMutation", TestReplyAdmissionPrecedesMutation);
+        run("TestRemovingCreditHeadAdmitsNextWaiter", TestRemovingCreditHeadAdmitsNextWaiter);
+        run("TestPayloadCreditWaitIsRefused", TestPayloadCreditWaitIsRefused);
+        run("TestPayloadCreditGrantRestartsFrameDeadline", TestPayloadCreditGrantRestartsFrameDeadline);
+        run("TestKillIdleTransactionReleasesHistory", [] { TestKillIdleTransactionReleasesHistory<RawClient>(false); });
+        run("TestKillDecidedCommitPreservesOutcome", [] { TestKillDecidedCommitPreservesOutcome<RawClient>(false); });
+#ifdef CHUNKDB_WITH_OPENSSL
+        run("TestKillIdleTransactionReleasesHistoryTls", [] { TestKillIdleTransactionReleasesHistory<TlsClient>(true); });
+        run("TestKillDecidedCommitPreservesOutcomeTls", [] { TestKillDecidedCommitPreservesOutcome<TlsClient>(true); });
+#endif
         run("TestExpiredTransactionReleasesBudget", TestExpiredTransactionReleasesBudget);
-        run("TestPendingQueueWaitTimeoutClosesQueuedSocket", TestPendingQueueWaitTimeoutClosesQueuedSocket);
         run("TestSlowResponseDrainDeadlineReleasesWorker", TestSlowResponseDrainDeadlineReleasesWorker);
-        run("TestSteadySlowReaderHitsReplyWriteDeadline", [] { TestSteadySlowReaderHitsReplyWriteDeadline(); });
-        run("TestSteadySlowReaderReadFailureTeardown", [] {
+        run("TestSteadyReaderRenewsReplyProgressDeadline", [] { TestSteadyReaderRenewsReplyProgressDeadline(); });
+        run("TestSteadyReaderFirstReadFailureTeardown", [] {
             bool failed = false;
-            try { TestSteadySlowReaderHitsReplyWriteDeadline(true); }
+            try { TestSteadyReaderRenewsReplyProgressDeadline(true); }
             catch (const std::runtime_error& error) {
                 failed = std::string_view(error.what()) == "injected first read failure";
             }
             assert(failed);
         });
         run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);
-        run("TestPendingQueueSaturationRejectsNewConnections", TestPendingQueueSaturationRejectsNewConnections);
+        run("TestPendingStatementQueueKeepsHelloAvailable", TestPendingStatementQueueKeepsHelloAvailable);
         run("TestReadinessLogLineExists", TestReadinessLogLineExists);
         run("TestWarnLineOnBadRequest", TestWarnLineOnBadRequest);
         run("TestErrorLineOnListenFailure", TestErrorLineOnListenFailure);

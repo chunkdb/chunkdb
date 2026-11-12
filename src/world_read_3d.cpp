@@ -1,5 +1,6 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunk_coordinate_index.hpp"
+#include "statement_control.hpp"
 
 #include <cstdint>
 #include <limits>
@@ -88,6 +89,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRange3DImpl(
     for (auto x = x0;; ++x) {
         for (auto y = y0;; ++y) {
             for (auto z = z0;; ++z) {
+                CheckStatementCancellation();
                 const ChunkCoord coord{x, y, z};
                 if (!index || index->IsPopulationCandidate(coord))
                     AppendPopulatedChunkRangeEntry(coord, max_entries, "GET AREA", with_vars,
@@ -136,6 +138,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadius3DImpl(
         std::int64_t x = 0, y = 0;
         if (!AddOffset(cx, dx, &x) || !AddOffset(cy, dy, &y)) return;
         for (auto dz = -half_z; dz <= half_z; ++dz) {
+            CheckStatementCancellation();
             std::int64_t z = 0;
             if (!AddOffset(cz, dz, &z)) continue;
             const ChunkCoord coord{x, y, z};

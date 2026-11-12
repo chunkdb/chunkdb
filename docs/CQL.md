@@ -20,7 +20,7 @@ Generated passwords, epochs, and timestamps appear as named placeholders.
 | [Transaction statements](reference/TRANSACTION_STATEMENTS.md) | BEGIN, COMMIT, ROLLBACK |
 | [Feed statements](reference/FEED.md) | WATCH, ACK, UNWATCH, CREATE SLOT, DROP SLOT, SHOW SLOTS |
 | [User statements](reference/USER_STATEMENTS.md) | CREATE USER, ALTER USER, DROP USER, GRANT, REVOKE, SHOW USERS |
-| [Server statements](reference/SERVER.md) | PING, FLUSH WAL, SHOW METRICS, BACKUP TO, RELOAD TLS |
+| [Server statements](reference/SERVER.md) | PING, FLUSH WAL, SHOW METRICS, BACKUP TO, RELOAD TLS, SHOW CONNECTIONS, CANCEL, KILL CONNECTION |
 
 ## Names and values
 

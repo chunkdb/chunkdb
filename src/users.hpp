@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <map>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -16,6 +17,12 @@
 namespace chunkdb {
 
 inline constexpr const char* kUsersFileName = "chunkdb.users";
+inline constexpr std::uint64_t kMaxUserStatementsPerSecond = 65536U;
+
+class UsersOutcomeUnknownError : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
 
 // Ordered: each right includes the ones before it.
 enum class Right : std::uint8_t {
@@ -34,6 +41,9 @@ struct User {
     bool requires_channel_binding = false;
     // Table name, or kEveryTable, to the right granted on it.
     std::map<std::string, Right> grants;
+    // Zero disables either limit. The runtime enforces them at admission.
+    std::uint64_t max_connections = 0U;
+    std::uint64_t statements_per_sec = 0U;
 
     friend bool operator==(const User&, const User&) = default;
 };
@@ -71,6 +81,6 @@ void RequireValidGrantTable(std::string_view table);
 [[nodiscard]] std::optional<Users> ReadUsersFile(const std::filesystem::path& data_dir);
 // Replaces the file atomically, the file and its directory synced: a crash
 // leaves the old or the new file.
-void WriteUsersFile(const std::filesystem::path& data_dir, const Users& users);
+void WriteUsersFile(const std::filesystem::path& data_dir, const Users& users, bool* out_replaced = nullptr);
 
 }  // namespace chunkdb

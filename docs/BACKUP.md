@@ -16,7 +16,7 @@ OK
 1
 tables = 1
 files = 8
-bytes = 615
+bytes = 631
 cuts:
   1) table = world, epoch = <epoch>, revision = 1
 ```

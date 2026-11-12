@@ -34,6 +34,9 @@ FLUSH WAL
 SHOW METRICS
 BACKUP TO 'destination'
 RELOAD TLS
+SHOW CONNECTIONS
+CANCEL id
+KILL CONNECTION id
 ```
 
 ## Arguments
@@ -48,6 +51,9 @@ RELOAD TLS
 - SHOW METRICS: Prometheus text, obtained through an authenticated connection.
 - BACKUP: table count, inventoried files and bytes, and per-table epoch/revision cuts.
 - RELOAD TLS: `OK` once connections that start from then on use the certificate and key read again from the `--tls-cert` and `--tls-key` files.
+- SHOW CONNECTIONS: an array of maps with `id`, `user`, `peer`, `state`, and `statement`.
+- CANCEL: `{cancelled: bool}`, indicating whether cancellation was accepted before the target statement's decision boundary.
+- KILL CONNECTION: `{killed: bool}`, indicating whether closure was requested for the target connection.
 
 ## Errors
 
@@ -72,6 +78,16 @@ Read-only inspection remains available with an unknown completed revision; see [
 
 RELOAD TLS replaces the certificate for new connections only; open connections keep their session.
 Replace the certificate and key files first, then run it; SIGHUP does the same on Linux and macOS.
+
+Connection identifiers are exact unsigned integers scoped to the server process.
+A user may list and control connections of the same live user incarnation; ADMIN on `*` permits access to all connections.
+Dropping and recreating a user does not grant the replacement user access to the previous user's connections.
+An empty user or statement is null in SHOW CONNECTIONS, and `statement` contains only the statement verb.
+A listing that exceeds the response limit returns OUT_OF_RANGE without a partial listing.
+Missing, idle, self-cancelled, and decision-entered statements return `cancelled: false`.
+Killing a connection preserves the real outcome of a statement that already entered its decision boundary.
+Self-KILL returns its reply before closing the connection.
+These statements also run inside an open or aborted transaction and on a read-only server.
 
 ## Limits
 

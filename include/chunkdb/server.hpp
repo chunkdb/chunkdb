@@ -8,6 +8,7 @@
 #include <functional>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <queue>
 #include <string>
 #include <unordered_map>
@@ -23,6 +24,9 @@ struct ssl_ctx_st;
 namespace chunkdb {
 struct ServerConnection;
 class FeedIo;
+class IdleIo;
+struct WorkerWait;
+class StatementControl;
 struct FeedDeliveryTestHook;
 
 // The lowest TLS version a chunks:// listener accepts.
@@ -36,10 +40,11 @@ struct ServerConfig {
     std::size_t worker_threads = 4;
     std::size_t client_io_timeout_ms = 5000;
     std::size_t idle_connection_timeout_ms = 60000;
+    std::uint64_t statement_timeout_ms = 0U;
     std::size_t tcp_keepalive_ms = 60000;
     std::size_t max_pending_clients = 1024;
     // Connections from one source (an IPv4 address, an IPv6 /64) that may
-    // hold a worker at once before HELLO succeeds (TLS handshake included);
+    // remain before HELLO succeeds (TLS handshake included);
     // more get -ERR BUSY. 0: no limit.
     std::size_t max_handshakes_per_ip = 64;
     // Every connection starts with a PROXY protocol v2 header, whose source
@@ -72,15 +77,17 @@ class ChunkServer {
     // the current context, when TLS is off or the files are refused.
     void ReloadTls();
 
-    // Connections from `source` (a SourceAddressKey) that hold a worker
+    // Connections from `source` (a SourceAddressKey) admitted
     // before HELLO, counted while max_handshakes_per_ip is set.
     [[nodiscard]] std::size_t HandshakesInProgressForTests(const std::string& source);
 
   private:
     friend class FeedIo;
+    friend class IdleIo;
     friend struct FeedDeliveryTestAccess;
     struct PendingClient {
         std::shared_ptr<ServerConnection> resumed{};
+        std::shared_ptr<StatementControl> statement{};
 #ifdef _WIN32
         std::uintptr_t socket = 0;
 #else
@@ -120,8 +127,18 @@ class ChunkServer {
     std::mutex active_clients_mutex_;
     std::condition_variable pending_clients_cv_;
     std::vector<std::thread> workers_;
+    // Under pending_clients_mutex_: workers holding no connection,
+    // waiting workers asked to return their connection, where the next
+    // search for one starts, and whether a dispatch was refused since the
+    // last pop.
+    std::size_t free_workers_ = 0U;
+    std::size_t yielding_workers_ = 0U;
+    std::size_t next_yield_ = 0U;
+    bool dispatch_refused_ = false;
+    // One per worker; its fields are guarded by pending_clients_mutex_.
+    std::vector<std::shared_ptr<WorkerWait>> worker_waits_;
     std::atomic<bool> pending_queue_overload_warned_{false};
-    // Workers held by connections before HELLO, by source address key.
+    // Connections before HELLO, by source address key.
     std::mutex handshakes_mutex_;
     std::unordered_map<std::string, std::size_t> handshakes_;
     std::atomic<bool> handshake_limit_warned_{false};
@@ -143,17 +160,32 @@ class ChunkServer {
 #else
         int client_socket
 #endif
-        , ServerConnection& connection
+        , const std::shared_ptr<ServerConnection>& connection
+        , WorkerWait& wait
     );
-    bool HandOff(ServerConnection& connection);
+    enum class NextRequest { kRead, kReturn, kClose };
+    NextRequest AwaitNextRequest(WorkerWait& wait, ServerConnection& connection);
+    // The bounded blocking receive that precedes AwaitNextRequest, or nothing
+    // where only the poller may wait.
+    std::optional<NextRequest> AwaitReceive(ServerConnection& connection);
+    void WakeWaitingWorker(const ServerConnection& connection);
+    // The worker holds no connection any more: it counts for queued requests.
+    void FreeWorker(WorkerWait& wait) noexcept;
+    bool HandOff(const std::shared_ptr<ServerConnection>& connection);
+    bool ParkClient(const std::shared_ptr<ServerConnection>& connection);
+    bool DispatchClient(const std::shared_ptr<ServerConnection>& connection);
     void ReturnClient(std::shared_ptr<ServerConnection> connection);
     void CloseClient(ServerConnection& connection);
     std::shared_ptr<FeedIo> feed_io_;
+    std::shared_ptr<IdleIo> idle_io_;
     std::shared_ptr<FeedIo> FeedIoHandle();
+    std::shared_ptr<IdleIo> IdleIoHandle();
     // Wakes the feed on every change of the users, so a watch whose user
     // lost READ ends without waiting for its next push; held while it runs.
     std::shared_ptr<const std::function<void()>> users_changed_;
     std::atomic<std::size_t> watch_count_{0};
+    std::mutex connections_mutex_;
+    std::unordered_map<std::uint64_t, std::weak_ptr<ServerConnection>> connections_;
 };
 
 }  // namespace chunkdb

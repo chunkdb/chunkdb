@@ -16,6 +16,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -45,24 +46,80 @@ struct ChunkIndexRecord;
     (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
 // MinGW winpthreads shared_mutex has shown unstable lock assertions under high contention
 // in CI; fallback preserves correctness by serializing shared/exclusive access on Windows+MinGW.
-class RegularChunkMutex {
-  public:
-    void lock() { mutex_.lock(); }
-    bool try_lock() { return mutex_.try_lock(); }
-    void unlock() { mutex_.unlock(); }
-
-    void lock_shared() { mutex_.lock(); }
-    bool try_lock_shared() { return mutex_.try_lock(); }
-    void unlock_shared() { mutex_.unlock(); }
-
-  private:
-    std::mutex mutex_;
-};
+inline constexpr bool kSerialChunkReaders = true;
 inline constexpr const char* kChunkLockModeName = "serial-mutex";
 #else
-using RegularChunkMutex = std::shared_mutex;
+inline constexpr bool kSerialChunkReaders = false;
 inline constexpr const char* kChunkLockModeName = "shared-mutex";
 #endif
+
+class RegularChunkMutex {
+  public:
+    void lock() { (void)lock(std::stop_token{}); }
+    [[nodiscard]] bool lock(std::stop_token cancelled) {
+        std::unique_lock lock(mutex_);
+        WriterWaiter waiter(*this);
+        const auto ready = [this] { return !exclusive_ && readers_ == 0U; };
+        if (!ready() && !Wait(lock, cancelled, ready)) return false;
+        if (cancelled.stop_requested()) return false;
+        exclusive_ = true;
+        return true;
+    }
+    bool try_lock() {
+        std::lock_guard lock(mutex_);
+        if (exclusive_ || readers_ != 0U) return false;
+        exclusive_ = true;
+        return true;
+    }
+    void unlock() {
+        std::lock_guard lock(mutex_);
+        exclusive_ = false;
+        Notify();
+    }
+    void lock_shared() { (void)lock_shared(std::stop_token{}); }
+    [[nodiscard]] bool lock_shared(std::stop_token cancelled) {
+        std::unique_lock lock(mutex_);
+        const auto ready = [this] { return CanRead(); };
+        if (!ready() && !Wait(lock, cancelled, ready)) return false;
+        if (cancelled.stop_requested()) return false;
+        ++readers_;
+        return true;
+    }
+    bool try_lock_shared() {
+        std::lock_guard lock(mutex_);
+        if (!CanRead()) return false;
+        ++readers_;
+        return true;
+    }
+    void unlock_shared() {
+        std::lock_guard lock(mutex_);
+        --readers_;
+        if (readers_ == 0U) Notify();
+    }
+  private:
+    friend struct StatementChunkLockTestAccess;
+    struct WriterWaiter {
+        explicit WriterWaiter(RegularChunkMutex& mutex) : owner(mutex) {
+            ++owner.writers_;
+            owner.Notify();
+        }
+        ~WriterWaiter() { --owner.writers_; owner.Notify(); }
+        RegularChunkMutex& owner;
+    };
+    // Every state change and every wait happen under mutex_, so a change with
+    // no thread inside a wait has no one to wake.
+    void Notify() { if (waiters_ != 0U) changed_.notify_all(); }
+    template <typename Ready> bool Wait(std::unique_lock<std::mutex>& lock, std::stop_token cancelled, Ready ready) {
+        ++waiters_;
+        struct Leave { std::size_t& count; ~Leave() { --count; } } leave{waiters_};
+        return changed_.wait(lock, std::move(cancelled), ready);
+    }
+    bool CanRead() const { return !exclusive_ && writers_ == 0U && (!kSerialChunkReaders || readers_ == 0U); }
+    std::mutex mutex_;
+    std::condition_variable_any changed_;
+    std::size_t readers_ = 0U, writers_ = 0U, waiters_ = 0U;
+    bool exclusive_ = false;
+};
 
 [[nodiscard]] inline constexpr const char* ChunkLockModeName() noexcept {
     return kChunkLockModeName;
@@ -1506,11 +1563,18 @@ class ChunkStore {
     [[nodiscard]] bool EnqueueBackgroundCheckpoint(const ChunkCoord& chunk_coord);
     void RunBackgroundCheckpoint(const ChunkCoord& chunk_coord) noexcept;
     // Waits, releasing `lock`, while a background checkpoint owns the
-    // chunk's files.
+    // chunk's files. Cleanup and background paths wait without a stop.
     void AwaitChunkFilesLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk);
+    // The same wait for a statement before its decision: a stop ends it and
+    // the chunk lock's retaking after it, and throws StatementStoppedError
+    // with `lock` released.
+    void AwaitStatementChunkFilesLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk);
     // Waits only while an ordinary write would also pass the hard bound of
-    // deferred checkpoints (MaybeCheckpointChunk).
+    // deferred checkpoints (MaybeCheckpointChunk); a statement's stop ends it
+    // like AwaitStatementChunkFilesLocked.
     void AwaitChunkBacklogLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk);
+    template <typename Ready>
+    void AwaitStatementCheckpointIoLocked(std::unique_lock<RegularChunkMutex>& lock, Ready ready);
     [[nodiscard]] bool CheckpointHardBoundReached(std::size_t updates, std::size_t wal_bytes) const noexcept;
     // Before a synced checkpoint publishes an image into `directory`. A
     // chunk directory this store has not prepared itself may have been made

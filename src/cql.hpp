@@ -236,6 +236,9 @@ struct Backup {
 };
 struct ShowMetrics {};
 struct ShowStatus {};
+struct ShowConnections {};
+struct Cancel { std::uint64_t id = 0U; };
+struct KillConnection { std::uint64_t id = 0U; };
 struct EnableFeature { std::string name; };
 // Loads the TLS certificate and key again from the configured files.
 struct ReloadTls {};
@@ -265,11 +268,14 @@ struct CreateUser {
     bool requires_channel_binding = false;
     bool if_not_exists = false;
 };
-// Exactly one of the three is set.
+// Exactly one change is set: the verifier, manages_users, the limits or
+// requires_channel_binding.
 struct AlterUser {
     std::string user;
     std::optional<Literal> verifier;
     std::optional<bool> manages_users;
+    std::optional<std::uint64_t> max_connections{};
+    std::optional<std::uint64_t> statements_per_sec{};
     std::optional<bool> requires_channel_binding;
 };
 struct DropUser {
@@ -329,6 +335,9 @@ using Statement = std::variant<
     Backup,
     ShowMetrics,
     ShowStatus,
+    ShowConnections,
+    Cancel,
+    KillConnection,
     EnableFeature,
     ReloadTls,
     Ping,

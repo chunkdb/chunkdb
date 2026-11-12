@@ -12,7 +12,8 @@ The terminator counts toward `--max-line-bytes` (65536 by default); overflow sen
 Binary parameter frames do not count toward that line limit.
 A PROXY protocol v2 header and the TLS handshake each have their own `--client-io-timeout-ms`, in that order, before the HELLO deadline starts.
 Until authentication succeeds, HELLO, AUTH and all their parameter frames must arrive within `--client-io-timeout-ms` of that start; later ones receive PROTOCOL and close.
-After authentication, each request line and frame header must arrive within `--client-io-timeout-ms` of its first byte, and each frame body within it from when its read starts, after its header; a drained frame body is read in 4096-byte pieces, each with that timeout.
+After authentication, each request line must arrive within `--client-io-timeout-ms` of its first byte, each frame header within it of the end of the line or of the previous frame, and each frame body, kept or drained, within it of the end of its header; a frame that misses its deadline receives `PROTOCOL incomplete parameter frame` and the connection closes.
+Waiting for the server's input credit does not count: a request's frame deadline starts again when the credit is granted, and a wait longer than `--client-io-timeout-ms` receives `BUSY reason=input_budget` and the connection closes.
 
 The first line must be HELLO 3; a different version or statement receives PROTOCOL and closes without execution.
 `HELLO 3` alone is accepted only under `--auth none`; otherwise it receives AUTH_REQUIRED.
@@ -60,17 +61,43 @@ A second HELLO receives PROTOCOL.
 | `idle_timeout_ms` | Configured idle timeout in milliseconds. |
 | `limits` | Map of area, transaction, watch, returning and expression ceilings. |
 
+An idle authenticated connection keeps its session and open transaction until its next request or until it closes.
+
 Append `WITH client_name='name',statement_timeout_ms=0,default_tag=x'00'` to HELLO to request session options.
 Keys are case-insensitive; duplicates and invalid known values receive INVALID_ARGUMENT without counting as authentication failures.
+`statement_timeout_ms` accepts an unsigned integer from zero through 86400000, including an eight-byte little-endian parameter.
 Unknown keys are accepted and reported with `reason=unknown_option`.
 Before authentication HELLO takes at most 12 parameters; a HELLO with more receives PROTOCOL and closes without its frames being read.
 
-Only `client_name` currently applies; timeout and tag values are stored with `reason=implementation_pending` until their capabilities appear.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, and `channel_binding`.
+`client_name` and `statement_timeout_ms` apply; `default_tag` is stored with `reason=implementation_pending`.
+The effective statement timeout appears in `options`, including the server default when HELLO omits it.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, and `channel_binding`.
 Options become visible only after authentication succeeds.
 Returning and expression ceilings describe reserved limits; their capabilities remain unavailable.
 
+The statement timeout starts after the complete request is framed and includes queue wait.
+`CANCELLED` and statement `TIMEOUT` carry `applied=false` and mean that the statement did not apply.
+An operation admitted to its irreversible decision completes with its real result.
+Transport timeouts remain independent and close the connection.
+Large chunk and area replies retain their schema, projection and immutable state while bounded output continuations drain.
+Output progress renews the reply deadline; a stalled writer closes the connection.
+
 See [session negotiation](design/PROTOCOL_FOUNDATION.md#handshake-and-session-ownership-a2) for the complete option and limit contract.
+
+## Session controls
+
+`SHOW CONNECTIONS` returns an array of maps containing `id`, `user`, `peer`, `state`, and `statement`.
+An unauthenticated user or an idle statement is represented by NULL in its field.
+The reply includes every authorized connection or fails with `OUT_OF_RANGE reason=response_limit`; it never truncates the listing.
+Users control sessions belonging to their current user incarnation; ADMIN on `*` may control every session.
+
+`CANCEL id` returns `{cancelled: bool}` and accepts cancellation only before the target statement enters its irreversible decision.
+Missing, idle, decision-entered and self targets return false.
+An accepted cancellation ends that statement with `CANCELLED applied=false` and leaves the connection available for its next request.
+`KILL CONNECTION id` returns `{killed: bool}` and closes the target after any decision-entered statement completes.
+Self-KILL sends its reply before closing.
+KILL closes a pending read-only reply immediately and releases its retained state.
+WATCH has completed its initiating statement, so CANCEL returns false and KILL releases its subscription and slot ownership.
 
 ## Parameters
 

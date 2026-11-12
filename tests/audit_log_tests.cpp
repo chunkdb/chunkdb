@@ -205,6 +205,33 @@ void TestChannelBindingEvents() {
                                         "\"error_code\":\"AUTH_REQUIRED\"", "\"reason\":\"channel_binding\""});
 }
 
+// Logins that user admission refuses: one whose user changed between HELLO
+// and AUTH, and one past the user's connection limit.
+void TestAdmissionLoginEvents() {
+    Engine e;
+    auto admin = e.Admin(40);
+    assert(e.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{Verifier("pw")}) == "+OK\r\n");
+    auto stale = e.Session(41);
+    const auto login = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce());
+    const auto first = e.Run(stale, chunkdb::test::HelloUserLine("bot"), Parameters{login.first});
+    assert(first.rfind("+SCRAM ", 0) == 0);
+    const auto final = chunkdb::scram::FinishClientLogin(login, "pw", first.substr(7, first.size() - 9));
+    assert(e.Run(admin, "ALTER USER bot REQUIRE CHANNEL BINDING") == "+OK\r\n");
+    assert(e.Run(stale, "AUTH $1", Parameters{final.message}).rfind("-ERR AUTH_FAILED reason=stale_login ", 0) == 0);
+    assert(e.Run(admin, "ALTER USER bot NO REQUIRE CHANNEL BINDING") == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot LIMIT max_connections = 1") == "+OK\r\n");
+    auto holding = e.Session(42);
+    assert(e.Login(holding, "bot", std::string("pw")).rfind("%", 0) == 0);
+    auto limited = e.Session(43);
+    assert(e.Login(limited, "bot", std::string("pw")).rfind("-ERR RATE_LIMITED reason=max_connections ", 0) == 0);
+
+    const auto lines = Lines(e.audit_path);
+    LineWith(lines, {"\"event\":\"login\"", "\"connection\":41", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"stale_login\""});
+    LineWith(lines, {"\"event\":\"login\"", "\"connection\":43", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"RATE_LIMITED\"", "\"reason\":\"max_connections\""});
+}
+
 // Every audited statement, with the names it acts on, and a failure with its
 // code; reads and writes of blocks are not audited.
 void TestStatementEvents() {
@@ -458,8 +485,23 @@ void TestLoginLimits() {
 }  // namespace
 
 int main() {
+    {
+        Engine e;
+        auto session = e.Admin(42U);
+        auto callbacks = std::make_shared<chunkdb::SessionControlCallbacks>();
+        callbacks->cancel = [](const auto&, auto) { return true; };
+        callbacks->kill = [](const auto&, auto) { return false; };
+        session.connection_controls = callbacks;
+        assert(e.Run(session, "CANCEL 18446744073709551615").find("#t") != std::string::npos);
+        assert(e.Run(session, "KILL CONNECTION 10").find("#f") != std::string::npos);
+        const auto lines = Lines(e.audit_path);
+        (void)LineWith(lines, {"\"event\":\"cancel\"", "\"target_connection\":18446744073709551615", "\"connection\":42", "\"ok\":true"});
+        (void)LineWith(lines, {"\"event\":\"kill_connection\"", "\"target_connection\":10", "\"ok\":true"});
+        assert(!Contains(ReadAll(e.audit_path), kPassword));
+    }
     TestLoginEvents();
     TestChannelBindingEvents();
+    TestAdmissionLoginEvents();
     TestStatementEvents();
     TestDroppedUserEvents();
     TestFileAndReopen();

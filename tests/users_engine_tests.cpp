@@ -22,6 +22,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "catalog_test_utils.hpp"
 #include "checkpoint.hpp"
+#include "audit_log.hpp"
 #include "scram.hpp"
 #include "test_utils.hpp"
 #include "txn_test_utils.hpp"
@@ -171,6 +172,65 @@ void TestLogin() {
     SessionState idle;
     ExpectError(server.Run(idle, "GET BLOCK 0 0 FROM default"), "PROTOCOL expected HELLO 3");
     assert(idle.close_after_reply);
+}
+
+void TestStaleAuthenticationProofs() {
+    for (const bool recreate : {false, true}) {
+        Server server;
+        const auto verifier = chunkdb::scram::MakeVerifier("original", std::vector<std::uint8_t>(16U, 7U), chunkdb::scram::kMinIterations);
+        server.users->Create("bot", verifier, false);
+        SessionState session;
+        const auto client = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce());
+        const auto first = server.Run(session, "HELLO 3 USER bot $1", Parameters{client.first});
+        assert(first.starts_with("+SCRAM "));
+        const auto final = chunkdb::scram::FinishClientLogin(client, "original", first.substr(7, first.size() - 9));
+        if (recreate) {
+            server.users->Drop("bot");
+            server.users->Create("bot", verifier, false);
+        } else {
+            server.users->SetVerifier("bot", chunkdb::scram::MakeVerifier("replacement", std::vector<std::uint8_t>(16U, 8U), chunkdb::scram::kMinIterations));
+        }
+        ExpectError(server.Run(session, "AUTH $1", Parameters{final.message}), "AUTH_FAILED reason=stale_login");
+        assert(session.failed_auth_attempts == 0U && !session.greeted && !session.authenticated && !session.user_ticket);
+        assert(server.users->AuthenticationSnapshot("bot")->state->connections == 0U);
+    }
+}
+
+void TestUserLimitStatementsAndAdmissionHook() {
+    Server server;
+    auto admin = server.LoggedIn("admin", "secret");
+    server.users->Create("bot", chunkdb::scram::MakeVerifier("secret", std::vector<std::uint8_t>(16U, 7U), chunkdb::scram::kMinIterations), false);
+    server.users->Grant("bot", "default", chunkdb::Right::kRead);
+    ExpectReply(server.Run(admin, "ALTER USER bot LIMIT max_connections = 1"), "+OK\r\n");
+    auto bot = server.LoggedIn("bot", "secret");
+    assert(bot.user_ticket && bot.user_incarnation != 0U);
+    SessionState refused;
+    ExpectError(server.Login(refused, "bot", "secret"), "RATE_LIMITED reason=max_connections");
+    assert(!refused.greeted && !refused.user_ticket && refused.failed_auth_attempts == 0U);
+    ExpectReply(server.Run(bot, "BEGIN"), "+OK\r\n");
+    auto* transaction = bot.transaction.get();
+    server.users->SetLimits("bot", std::nullopt, 1U);
+    assert(!server.engine->AdmitUserStatement(bot, "PING"));
+    const auto limited = server.engine->AdmitUserStatement(bot, "SET BLOCK 0 0 IN default bits = b'1000'");
+    assert(limited && limited->starts_with("-ERR RATE_LIMITED reason=statements_per_sec "));
+    assert(bot.transaction.get() == transaction);
+    for (const auto line : {"CANCEL 1", "kill connection 1", " \tROLLBACK\t", "cancel\t1"})
+        assert(!server.engine->AdmitUserStatement(bot, line));
+    ExpectReply(server.Run(bot, "ROLLBACK"), "+OK\r\n");
+    server.users->SetLimits("bot", std::nullopt, 0U);
+    ExpectError(server.Run(bot, "ALTER USER bot LIMIT max_connections = 4"), "PERMISSION_DENIED");
+    const auto before = server.users->Snapshot();
+    ExpectError(server.Run(admin, "ALTER USER bot LIMIT max_connections = 0, max_connections = 2"), "SYNTAX");
+    assert(server.users->Snapshot() == before);
+    const auto old_incarnation = bot.user_incarnation;
+    server.users->Drop("bot");
+    server.users->Create("bot", chunkdb::scram::MakeVerifier("secret", std::vector<std::uint8_t>(16U, 7U), chunkdb::scram::kMinIterations), false);
+    server.users->Grant("bot", "default", chunkdb::Right::kAdmin);
+    const auto stale = server.Run(bot, "GET BLOCK 0 0 FROM default");
+    assert(stale.starts_with("-ERR NO_TABLE ") || stale.starts_with("-ERR AUTH_REQUIRED "));
+    auto replacement = server.LoggedIn("bot", "secret");
+    assert(replacement.user_incarnation > old_incarnation);
+    ExpectReply(server.Run(replacement, "GET BLOCK 0 0 FROM default"), "_\r\n");
 }
 
 void TestRights() {
@@ -400,6 +460,31 @@ SessionState TlsSession(std::vector<std::uint8_t> exporter, std::vector<std::uin
     return session;
 }
 
+// A login checked under one channel binding requirement does not finish
+// after the requirement changes, in either direction.
+void TestStaleLoginAfterBindingRequirementChange() {
+    const std::vector<std::uint8_t> exporter(32, 0x31);
+    const std::vector<std::uint8_t> end_point(32, 0x32);
+    for (const bool required_before : {false, true}) {
+        Server server;
+        server.users->Create("bot", chunkdb::scram::MakeVerifier("hunter2", std::vector<std::uint8_t>(16U, 7U),
+            chunkdb::scram::kMinIterations), false, false, required_before);
+        SessionState session = TlsSession(exporter, end_point);
+        // Bound while the user requires it, unbound while it does not: a
+        // login that would succeed if the requirement stayed.
+        const auto type = required_before ? chunkdb::scram::kTlsExporter : std::string_view{};
+        const auto client = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce(), type);
+        const auto first = server.Run(session, "HELLO 3 USER bot $1", Parameters{client.first});
+        assert(first.starts_with("+SCRAM "));
+        const auto final = chunkdb::scram::FinishClientLogin(client, "hunter2", first.substr(7, first.size() - 9),
+            required_before ? std::span<const std::uint8_t>(exporter) : std::span<const std::uint8_t>{});
+        server.users->SetRequiresChannelBinding("bot", !required_before);
+        ExpectError(server.Run(session, "AUTH $1", Parameters{final.message}), "AUTH_FAILED reason=stale_login");
+        assert(session.failed_auth_attempts == 0U && !session.greeted && !session.authenticated && !session.user_ticket);
+        assert(server.users->AuthenticationSnapshot("bot")->state->connections == 0U);
+    }
+}
+
 // Logins bound to their TLS connection (docs/PROTOCOL.md): both binding
 // types, a login made on another connection, and what a connection cannot
 // give.
@@ -414,7 +499,7 @@ void TestChannelBinding() {
         SessionState bound = TlsSession(exporter, end_point);
         const std::string reply = server.Login(bound, "admin", "secret", type, data);
         assert(reply.rfind("%14\r\n", 0) == 0 && bound.greeted && bound.user == "admin");
-        assert(Contains(reply, "$7\r\nlineage\r\n$15\r\nchannel_binding\r\n"));
+        assert(Contains(reply, "$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n"));
 
         // The right password, bound to the connection of whoever relays it.
         SessionState relayed = TlsSession(exporter, end_point);
@@ -504,6 +589,21 @@ void TestRequiredChannelBinding() {
     SessionState bound = TlsSession(exporter, end_point);
     assert(server.Login(bound, "bot", "hunter2", chunkdb::scram::kTlsServerEndPoint, end_point).rfind("%14\r\n", 0) == 0);
 
+    // At the user's connection limit, which `bound` reaches, an unbound login
+    // with the right password still fails like a wrong one, and a login
+    // bound to another connection still says so; only a valid login learns
+    // of the limit.
+    server.users->SetLimits("bot", 1U, std::nullopt);
+    SessionState limited = TlsSession(exporter, end_point);
+    ExpectReply(server.Login(limited, "bot", "hunter2"), kWrongLogin);
+    SessionState relayed = TlsSession(exporter, end_point);
+    ExpectError(server.Login(relayed, "bot", "hunter2", chunkdb::scram::kTlsExporter, std::vector<std::uint8_t>(32, 0x33)),
+        "AUTH_FAILED reason=channel_binding");
+    SessionState valid = TlsSession(exporter, end_point);
+    ExpectError(server.Login(valid, "bot", "hunter2", chunkdb::scram::kTlsExporter, exporter), "RATE_LIMITED reason=max_connections");
+    assert(!limited.greeted && !relayed.greeted && !valid.greeted && !limited.user_ticket && !relayed.user_ticket);
+    server.users->SetLimits("bot", 0U, std::nullopt);
+
     ExpectError(server.Run(bound, "ALTER USER bot NO REQUIRE CHANNEL BINDING"), "PERMISSION_DENIED MANAGES USERS");
     ExpectReply(server.Run(admin, "ALTER USER bot NO REQUIRE CHANNEL BINDING"), "+OK\r\n");
     SessionState relaxed;
@@ -560,6 +660,14 @@ void TestReadOnly() {
 
     SessionState admin = server.LoggedIn("admin", "secret");
     SessionState bot = server.LoggedIn("bot", "pw");
+    auto controls = std::make_shared<chunkdb::SessionControlCallbacks>();
+    controls->enumerate = [](const auto&, const auto&) {};
+    controls->cancel = [](const auto&, auto) { return false; };
+    controls->kill = [](const auto&, auto) { return false; };
+    admin.connection_controls = controls;
+    ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), "*0\r\n");
+    ExpectReply(server.Run(admin, "CANCEL 0"), "%1\r\n$9\r\ncancelled\r\n#f\r\n");
+    ExpectReply(server.Run(admin, "KILL CONNECTION 0"), "%1\r\n$6\r\nkilled\r\n#f\r\n");
     const auto refused = [&](SessionState& session, const std::string& line, const Parameters& parameters = {}) {
         ExpectError(server.Run(session, line, parameters),
                     "INVALID_ARGUMENT " + line.substr(0, line.find(' ', line.find(' ') + 1U)) +
@@ -643,16 +751,114 @@ void TestVerifierAndGrantBounds() {
 
 }  // namespace
 
-int main() {
+void TestSessionControls() {
+    Server server;
+    auto admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", {VerifierText("secret")}), "+OK\r\n");
+    auto bot = server.LoggedIn("bot", "secret");
+    ExpectError(server.Run(admin, "SHOW CONNECTIONS"), "INVALID_ARGUMENT");
+    auto callbacks = std::make_shared<chunkdb::SessionControlCallbacks>();
+    chunkdb::SessionControlAccess seen;
+    bool accept = true;
+    unsigned calls = 0U;
+    callbacks->cancel = [&](const auto& access, std::uint64_t id) { seen = access; assert(id == 71U); ++calls; return accept; };
+    callbacks->kill = [&](const auto& access, std::uint64_t id) { seen = access; assert(id == 71U); ++calls; return accept; };
+    admin.connection_controls = callbacks;
+    bot.connection_controls = callbacks;
+    const auto cancelled = "%1\r\n$9\r\ncancelled\r\n#t\r\n";
+    const auto not_cancelled = "%1\r\n$9\r\ncancelled\r\n#f\r\n";
+    ExpectReply(server.Run(admin, "CANCEL 71"), cancelled);
+    assert(seen.admin_all && seen.requester_connection_id == admin.connection_id);
+    ExpectReply(server.Run(bot, "CANCEL 71"), cancelled);
+    assert(!seen.admin_all && seen.user_incarnation == bot.user_incarnation);
+    server.users->Grant("bot", "default", chunkdb::Right::kAdmin);
+    ExpectReply(server.Run(bot, "CANCEL 71"), cancelled);
+    assert(!seen.admin_all);
+    server.users->Grant("bot", "*", chunkdb::Right::kAdmin);
+    ExpectReply(server.Run(bot, "CANCEL 71"), cancelled);
+    assert(seen.admin_all);
+    server.users->Revoke("bot", "*", chunkdb::Right::kAdmin);
+    ExpectReply(server.Run(bot, "CANCEL 71"), cancelled);
+    assert(!seen.admin_all);
+    const auto previous = calls;
+    ExpectReply(server.Run(bot, "CANCEL " + std::to_string(bot.connection_id)), not_cancelled);
+    assert(calls == previous);
+    accept = false;
+    ExpectReply(server.Run(admin, "CANCEL 71"), not_cancelled);
+    ExpectReply(server.Run(admin, "KILL CONNECTION 71"), "%1\r\n$6\r\nkilled\r\n#f\r\n");
+    assert(!admin.close_after_reply);
+    callbacks->kill = [&](const auto&, std::uint64_t id) { assert(id == bot.connection_id); return true; };
+    ExpectReply(server.Run(bot, "KILL CONNECTION " + std::to_string(bot.connection_id)), "%1\r\n$6\r\nkilled\r\n#t\r\n");
+    assert(bot.close_after_reply);
+    bot.close_after_reply = false;
+    callbacks->enumerate = [&](const auto& access, const auto& visitor) {
+        seen = access;
+        visitor(chunkdb::ConnectionInfo{.id = UINT64_MAX, .user = "bot", .peer = "127.0.0.1", .state = "idle", .statement = ""});
+        visitor(chunkdb::ConnectionInfo{.id = 1U, .user = "", .peer = "local", .state = "running", .statement = "PING"});
+    };
+    const std::string expected = "*2\r\n%5\r\n$2\r\nid\r\n(18446744073709551615\r\n$4\r\nuser\r\n$3\r\nbot\r\n$4\r\npeer\r\n$9\r\n127.0.0.1\r\n$5\r\nstate\r\n$4\r\nidle\r\n$9\r\nstatement\r\n_\r\n%5\r\n$2\r\nid\r\n:1\r\n$4\r\nuser\r\n_\r\n$4\r\npeer\r\n$5\r\nlocal\r\n$5\r\nstate\r\n$7\r\nrunning\r\n$9\r\nstatement\r\n$4\r\nPING\r\n";
+    callbacks->max_response_bytes = expected.size();
+    ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), expected);
+    --callbacks->max_response_bytes;
+    ExpectError(server.Run(admin, "SHOW CONNECTIONS"), "OUT_OF_RANGE reason=response_limit");
+    callbacks->max_response_bytes = expected.size();
+    ExpectReply(server.Run(admin, "BEGIN"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), expected);
+    admin.transaction->Abort("-ERR CONFLICT reason=test\r\n");
+    ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), expected);
+    ExpectReply(server.Run(admin, "CANCEL 71"), not_cancelled);
+    assert(admin.transaction && admin.transaction->aborted);
+    ExpectReply(server.Run(admin, "ROLLBACK"), "+OK\r\n");
+    callbacks->enumerate = [](const auto&, const auto&) {};
+    callbacks->max_response_bytes = 4U;
+    ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), "*0\r\n");
+    callbacks->max_response_bytes = 3U;
+    ExpectError(server.Run(admin, "SHOW CONNECTIONS"), "OUT_OF_RANGE reason=response_limit");
+    callbacks->enumerate = [](const auto&, const auto& visitor) {
+        for (unsigned i = 0U; i < 10U; ++i)
+            visitor(chunkdb::ConnectionInfo{.id = i, .user = "", .peer = "", .state = "idle", .statement = ""});
+    };
+    callbacks->max_response_bytes = 10000U;
+    const auto ten = server.Run(admin, "SHOW CONNECTIONS");
+    assert(ten.starts_with("*10\r\n"));
+    callbacks->max_response_bytes = ten.size();
+    ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), ten);
+    --callbacks->max_response_bytes;
+    ExpectError(server.Run(admin, "SHOW CONNECTIONS"), "OUT_OF_RANGE reason=response_limit");
+    // Control access must stop matching a retired user, even after name reuse:
+    // the session of the dropped user controls nothing and closes.
+    server.users->Drop("bot");
+    server.users->Create("bot", chunkdb::scram::ParseVerifier(VerifierText("secret")), false);
+    const auto before_retired = calls;
+    ExpectError(server.Run(bot, "CANCEL 71"), "AUTH_REQUIRED reason=user_dropped");
+    assert(bot.close_after_reply && calls == before_retired);
+    Server plain(false);
+    SessionState anonymous;
+    ExpectReply(plain.Run(anonymous, "HELLO 3").substr(0U, 1U), "%");
+    anonymous.connection_controls = callbacks;
+    ExpectReply(plain.Run(anonymous, "CANCEL 71"), not_cancelled);
+    assert(seen.admin_all);
+}
+
+int main(int argc, char** argv) {
+    if (argc == 2 && std::string_view(argv[1]) == "controls") { TestSessionControls(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "read_only") { TestReadOnly(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "stale_auth") { TestStaleAuthenticationProofs(); TestStaleLoginAfterBindingRequirementChange(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "admission") { TestUserLimitStatementsAndAdmissionHook(); return 0; }
+    if (argc != 1) return 2;
     TestAtomicRightsLists();
+    TestSessionControls();
     TestVerifierAndGrantBounds();
     TestLogin();
+    TestStaleAuthenticationProofs();
+    TestUserLimitStatementsAndAdmissionHook();
     TestRights();
     TestRecreatedUser();
     TestConditionalUsers();
     TestConcurrentConditionalUsers();
     TestChannelBinding();
     TestRequiredChannelBinding();
+    TestStaleLoginAfterBindingRequirementChange();
     TestWithoutUsers();
     TestReadOnly();
     return 0;

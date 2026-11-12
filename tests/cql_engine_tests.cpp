@@ -307,8 +307,9 @@ void TestHello() {
     assert(session.greeted);
     assert(Contains(hello, "$14\r\nmax_scan_limit\r\n:1024\r\n"));
     assert(Contains(hello, "$16\r\nserver_signature\r\n$"));
-    assert(Contains(hello, "$8\r\nfeatures\r\n*8\r\n$19\r\nprotocol_foundation\r\n"));
-    assert(Contains(hello, "$12\r\nslot_filters\r\n$13\r\nslot_takeover\r\n$7\r\nlineage\r\n$15\r\nchannel_binding\r\n"));
+    assert(Contains(hello, "$8\r\nfeatures\r\n*10\r\n$19\r\nprotocol_foundation\r\n"));
+    assert(Contains(hello, "$12\r\nslot_filters\r\n$13\r\nslot_takeover\r\n$7\r\nlineage\r\n"));
+    assert(Contains(hello, "$19\r\nconnection_controls\r\n$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n"));
     ExpectError(engine.Execute(session, "HELLO 3\r\n"), "PROTOCOL HELLO was already sent");
     ExpectReply(engine.Execute(session, "PING\r\n"), "+PONG\r\n");
     // Commands of the retired protocol 2 are not statements.

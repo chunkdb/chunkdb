@@ -89,11 +89,13 @@ add_library(chunkdb_core STATIC
     src/scram.cpp
     src/users.cpp
     src/user_registry.cpp
+    src/user_admission.cpp
     src/durability_io.cpp
     src/file_permissions.cpp
     src/audit_log.cpp
     src/engine.cpp
     src/engine_cql.cpp
+    src/engine_sessions.cpp
     src/eviction.cpp
     src/chunk_vars.cpp
     src/feature_flags.cpp
@@ -107,9 +109,12 @@ add_library(chunkdb_core STATIC
     src/metrics.cpp
     src/process_lock.cpp
     src/protocol.cpp
+    src/request_framing.cpp
+    src/reply_stream.cpp
     src/snapshot_generation.cpp
     src/shared_file_input.cpp
     src/store_manifest.cpp
+    src/statement_control.cpp
     src/chunk_layout.cpp
     src/chunk_columns.cpp
     src/cql.cpp
@@ -163,6 +168,8 @@ add_executable(chunkdb_server
     src/server_socket.cpp
     src/server_io.cpp
     src/server_tls.cpp
+    src/server_poller.cpp
+    src/server_idle.cpp
     src/server_feed.cpp
     src/server_connection.cpp src/proxy_protocol.cpp
 )
@@ -222,6 +229,8 @@ add_library(chunkdb_server_bench_lib STATIC
     src/server_socket.cpp
     src/server_io.cpp
     src/server_tls.cpp
+    src/server_poller.cpp
+    src/server_idle.cpp
     src/server_feed.cpp
     src/server_connection.cpp src/proxy_protocol.cpp
 )
@@ -519,6 +528,12 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_user_registry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME user_registry COMMAND chunkdb_user_registry_test)
 
+    add_executable(chunkdb_user_admission_test tests/user_admission_tests.cpp)
+    target_link_libraries(chunkdb_user_admission_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_user_admission_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME user_admission COMMAND chunkdb_user_admission_test)
+    set_tests_properties(user_admission PROPERTIES TIMEOUT 60)
+
     add_executable(chunkdb_users_engine_test tests/users_engine_tests.cpp)
     target_link_libraries(chunkdb_users_engine_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_users_engine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -662,6 +677,36 @@ if(CHUNKDB_BUILD_TESTS)
         COMMAND chunkdb_security_regression_test
     )
 
+    add_executable(chunkdb_statement_control_test tests/statement_control_tests.cpp)
+    target_link_libraries(chunkdb_statement_control_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_statement_control_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME statement_control COMMAND chunkdb_statement_control_test)
+    set_tests_properties(statement_control PROPERTIES TIMEOUT 30 LABELS "smoke")
+
+    add_executable(chunkdb_statement_store_test tests/statement_store_tests.cpp)
+    target_link_libraries(chunkdb_statement_store_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_statement_store_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME statement_store COMMAND chunkdb_statement_store_test)
+    set_tests_properties(statement_store PROPERTIES TIMEOUT 120 LABELS "smoke")
+
+    add_executable(chunkdb_reply_stream_test tests/reply_stream_tests.cpp)
+    target_link_libraries(chunkdb_reply_stream_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_reply_stream_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME reply_stream COMMAND chunkdb_reply_stream_test)
+    set_tests_properties(reply_stream PROPERTIES TIMEOUT 30 LABELS "smoke")
+
+    add_executable(chunkdb_server_framing_test tests/server_framing_tests.cpp)
+    target_link_libraries(chunkdb_server_framing_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_server_framing_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME server_framing COMMAND chunkdb_server_framing_test)
+    set_tests_properties(server_framing PROPERTIES TIMEOUT 30 LABELS "smoke")
+
+    add_executable(chunkdb_server_poller_test tests/server_poller_tests.cpp src/server_poller.cpp src/server_socket.cpp)
+    target_link_libraries(chunkdb_server_poller_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_server_poller_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME server_poller COMMAND chunkdb_server_poller_test)
+    set_tests_properties(server_poller PROPERTIES TIMEOUT 30 LABELS "smoke")
+
     add_executable(chunkdb_server_socket_test tests/server_socket_tests.cpp src/server_socket.cpp src/server_io.cpp)
     target_link_libraries(chunkdb_server_socket_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_socket_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -684,6 +729,8 @@ if(CHUNKDB_BUILD_TESTS)
         src/server_socket.cpp
         src/server_io.cpp
         src/server_tls.cpp
+        src/server_poller.cpp
+        src/server_idle.cpp
         src/server_feed.cpp
         src/server_connection.cpp src/proxy_protocol.cpp
     )
@@ -712,7 +759,8 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_server_slots_protocol_test
         tests/server_slots_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
-        src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+        src/server_poller.cpp
+        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
     )
     target_link_libraries(chunkdb_server_slots_protocol_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_slots_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -733,7 +781,8 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_server_channel_binding_test
         tests/server_channel_binding_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
-        src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+        src/server_poller.cpp
+        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
     )
     target_link_libraries(chunkdb_server_channel_binding_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_channel_binding_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -750,7 +799,8 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_server_migrations_protocol_test
         tests/server_migrations_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
-        src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+        src/server_poller.cpp
+        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
     )
     target_link_libraries(chunkdb_server_migrations_protocol_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_migrations_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -767,7 +817,8 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_server_backup_protocol_test
         tests/server_backup_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
-        src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+        src/server_poller.cpp
+        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
     )
     target_link_libraries(chunkdb_server_backup_protocol_test PRIVATE chunkdb_tools)
     target_include_directories(chunkdb_server_backup_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -934,6 +985,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME docs_check COMMAND chunkdb_docs_check_test ${CMAKE_CURRENT_SOURCE_DIR})
 
     set(CHUNKDB_TEST_TARGETS
+        chunkdb_user_admission_test
         chunkdb_maintenance_pool_test
         chunkdb_backup_migrations_test
         chunkdb_backup_test
@@ -1032,6 +1084,11 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_read_only_intent_replay_test
         chunkdb_wal_group_commit_test
         chunkdb_security_regression_test
+        chunkdb_statement_control_test
+        chunkdb_statement_store_test
+        chunkdb_reply_stream_test
+        chunkdb_server_framing_test
+        chunkdb_server_poller_test
         chunkdb_server_socket_test
         chunkdb_server_integration_test
         chunkdb_feed_completed_prefix_reader_test
@@ -1083,6 +1140,11 @@ if(CHUNKDB_BUILD_TESTS)
     endforeach()
 
     set(CHUNKDB_SMOKE_TESTS
+        statement_control
+        statement_store
+        reply_stream
+        server_framing
+        server_poller
         server_socket
         feed_migrations_fence
         migrations_records

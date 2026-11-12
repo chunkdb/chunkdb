@@ -32,6 +32,8 @@
 #include "table_options_text.hpp"
 #include "user_registry.hpp"
 #include "migrations.hpp"
+#include "reply_stream.hpp"
+#include "statement_control.hpp"
 
 namespace chunkdb {
 
@@ -230,6 +232,20 @@ void AppendValue(std::string& out, const Column&, const ColumnValue& value) {
     Protocol::AppendValue(out, value);
 }
 
+std::size_t ValueReplyBytes(const ColumnValue& value) {
+    std::optional<std::size_t> bulk;
+    if (const auto* text = std::get_if<std::string>(&value)) bulk = text->size();
+    else if (const auto* bytes = std::get_if<BytesValue>(&value)) bulk = bytes->bytes.size();
+    else if (const auto* bits = std::get_if<BitsValue>(&value)) bulk = (bits->digits.size() + 7U) / 8U;
+    if (bulk) {
+        if (*bulk > kMaxChunkRangeResponseBytes) return kMaxChunkRangeResponseBytes + 1U;
+        return *bulk + std::to_string(*bulk).size() + 5U;
+    }
+    std::string scalar;
+    Protocol::AppendValue(scalar, value);
+    return scalar.size();
+}
+
 [[nodiscard]] std::size_t RequireColumn(const ChunkLayout& layout, std::string_view name) {
     const std::size_t index = layout.FindColumn(name);
     if (index == std::string_view::npos) {
@@ -247,10 +263,16 @@ ChunkCoord BlockCoord(const Geometry& geometry, std::int64_t x, std::int64_t y, 
     return geometry.dims() == 3U ? geometry.BlockToChunk(x, y, z) : geometry.BlockToChunk(x, y);
 }
 
-void AppendChunkState(std::string& reply, const Geometry& geometry, const ChunkState& state,
+void AppendChunkState(ReplyParts& reply, const Geometry& geometry, const ChunkState& state,
     std::span<const std::size_t> columns, bool private_state) {
-    const auto bytes = EncodeSectionedChunkState(geometry, state, kVarMaxChunkBytesLimit, columns, private_state);
-    Protocol::AppendBulk(reply, {reinterpret_cast<const char*>(bytes.data()), bytes.size()});
+    reply.AppendBulk(EncodeSectionedChunkState(geometry, state, kVarMaxChunkBytesLimit, columns, private_state));
+}
+
+// A large reply becomes a continuation when the caller writes one.
+[[nodiscard]] std::string FinishReply(ReplyParts reply, std::unique_ptr<ReplyContinuation>* continuation) {
+    if (continuation == nullptr) return std::move(reply).Join();
+    *continuation = std::move(reply).Continuation();
+    return std::string{};
 }
 
 // Bound admitted wire storage independently of a lowered write quota; the
@@ -262,6 +284,23 @@ void AppendChunkState(std::string& reply, const Geometry& geometry, const ChunkS
     return 36U + 6U * 12U + 4U + 24U * geometry.layout().schema().columns.size() +
         ChunkPresenceBitmapBytes(geometry) + geometry.ChunkPayloadBytes() + metadata +
         kVarMaxChunkBytesLimit * (projected ? 2U : 1U);
+}
+
+// The most one encoded chunk form of the table takes in a reply, with the
+// variable byte bound only where a block or chunk column is variable.
+[[nodiscard]] std::size_t ChunkReplyFormBytes(const Geometry& geometry) {
+    const auto& chunk_columns = geometry.chunk_schema().columns;
+    const bool variable = geometry.layout().has_var_columns() ||
+        std::any_of(chunk_columns.begin(), chunk_columns.end(),
+            [](const Column& column) { return !IsFixedWidth(column.type.kind); });
+    return ChunkFormBytes(geometry, false) - (variable ? 0U : kVarMaxChunkBytesLimit);
+}
+
+// Retained state of `count` chunk forms, each with `framing` bytes, within
+// the response byte limit.
+[[nodiscard]] std::size_t ChunkReplyStateBytes(const Geometry& geometry, std::size_t count, std::size_t framing) {
+    const auto chunk_bytes = std::min<std::size_t>(kMaxChunkRangeResponseBytes, framing + ChunkReplyFormBytes(geometry));
+    return count > kMaxChunkRangeResponseBytes / chunk_bytes ? kMaxChunkRangeResponseBytes : count * chunk_bytes;
 }
 
 // Schema indexes of `names`, or empty for every column.
@@ -465,7 +504,13 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
     }
 }
 
+[[nodiscard]] bool SessionControl(const cql::Statement& statement) {
+    return std::holds_alternative<cql::ShowConnections>(statement) ||
+           std::holds_alternative<cql::Cancel>(statement) || std::holds_alternative<cql::KillConnection>(statement);
+}
+
 [[nodiscard]] bool AllowedInTransaction(const cql::Statement& statement) {
+    if (SessionControl(statement)) return true;
     return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::SetBlock>(statement) ||
            std::holds_alternative<cql::DeleteBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
            std::holds_alternative<cql::SetChunk>(statement) || std::holds_alternative<cql::GetArea>(statement) ||
@@ -478,6 +523,7 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
 // listings. Every other statement would change data, schema, users, rights or
 // slots, or needs a writer (WATCH, BEGIN, FLUSH WAL, BACKUP).
 [[nodiscard]] bool AvailableReadOnly(const cql::Statement& statement) {
+    if (SessionControl(statement)) return true;
     return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
            std::holds_alternative<cql::GetArea>(statement) || std::holds_alternative<cql::ScanChunks>(statement) ||
            std::holds_alternative<cql::ShowTableStats>(statement) ||
@@ -522,9 +568,9 @@ const User* CommandEngine::CurrentUser(SessionState& session) const {
     // created again under the same name gives this session nothing.
     const std::uint64_t generation = config_.users->Generation();
     if (session.user_generation != generation) {
-        auto found = config_.users->FindIncarnation(session.user);
-        session.user_rights = found.has_value() && found->incarnation == session.user_incarnation
-            ? std::make_shared<const User>(std::move(found->user)) : nullptr;
+        // The ticket names the incarnation this session logged in as.
+        auto found = config_.users->FindForConnection(session.user, session.user_ticket);
+        session.user_rights = found.has_value() ? std::make_shared<const User>(std::move(*found)) : nullptr;
         session.user_generation = generation;
     }
     return session.user_rights.get();
@@ -586,6 +632,13 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::ShowMetrics&) { info.verb = "SHOW METRICS"; },
             [&](const cql::ReloadTls&) { info.verb = "RELOAD TLS"; info.audit_event = "reload_tls"; },
             [&](const cql::ShowStatus&) { info.verb = "SHOW STATUS"; },
+            [&](const cql::ShowConnections&) { info.verb = "SHOW CONNECTIONS"; },
+            [&](const cql::Cancel& cancel) {
+                info.verb = "CANCEL"; info.audit_event = "cancel"; info.target_connection = cancel.id;
+            },
+            [&](const cql::KillConnection& kill) {
+                info.verb = "KILL CONNECTION"; info.audit_event = "kill_connection"; info.target_connection = kill.id;
+            },
             [&](const cql::EnableFeature&) { info.verb = "ENABLE FEATURE"; info.audit_event = "enable_feature"; },
             [&](const cql::Ping&) { info.verb = "PING"; },
             [&](const cql::CreateUser& create) {
@@ -866,8 +919,11 @@ std::string CommandEngine::ExecuteStatement(
     std::string_view line,
     std::span<const std::optional<std::string>> parameters,
     MetricsRegistry::CommandClass& command_class,
-    StatementLogInfo* info) {
+    StatementLogInfo* info,
+    std::unique_ptr<ReplyContinuation>* continuation,
+    const std::function<void(std::size_t)>* reserve_reply) {
     try {
+        CheckStatementCancellation();
         cql::Parsed parsed;
         try {
             parsed = cql::Parse(StatementOf(line));
@@ -895,7 +951,7 @@ std::string CommandEngine::ExecuteStatement(
                 "INVALID_ARGUMENT",
                 std::string(described.verb) + " is not available: the server opened its data directory read-only");
         }
-        if (session.transaction != nullptr && session.transaction->aborted.has_value()) {
+        if (session.transaction != nullptr && session.transaction->aborted.has_value() && !SessionControl(parsed.statement)) {
             // Ended by a conflict: only COMMIT or ROLLBACK closes it.
             std::string reply = *session.transaction->aborted;
             if (std::holds_alternative<cql::Rollback>(parsed.statement)) {
@@ -903,6 +959,7 @@ std::string CommandEngine::ExecuteStatement(
             }
             if (std::holds_alternative<cql::Rollback>(parsed.statement) ||
                 std::holds_alternative<cql::Commit>(parsed.statement)) {
+                EnterStatementDecision();
                 session.transaction.reset();
             }
             return reply;
@@ -914,10 +971,26 @@ std::string CommandEngine::ExecuteStatement(
         }
         return std::visit(
             Overloaded{
+                [&](const cql::ShowConnections&) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    return ListConnections(session);
+                },
+                [&](const cql::Cancel& cancel) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    return ControlConnection(session, cancel.id, false);
+                },
+                [&](const cql::KillConnection& kill) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    return ControlConnection(session, kill.id, true);
+                },
                 [&](const cql::Migrate& migration) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     MigrationRequest request;
-                    request.cancelled = session.backup_cancelled;
+                    std::stop_source cancelled;
+                    const auto request_stop = [&] { cancelled.request_stop(); };
+                    std::stop_callback shutdown(session.backup_cancelled, request_stop);
+                    std::stop_callback statement(StatementStopToken(), request_stop);
+                    request.cancelled = cancelled.get_token();
                     request.record = {migration.name, 0U, config_.require_auth ? session.user : std::string{}, migration.text};
                     std::visit(Overloaded{
                         [&](const cql::CreateTable& create) {
@@ -1195,6 +1268,7 @@ std::string CommandEngine::ExecuteStatement(
                         }
                     }
                     std::optional<std::vector<ColumnValue>> values;
+                    if (reserve_reply) (*reserve_reply)(BlockReplyCaptureBound(layout, columns));
                     std::optional<std::uint64_t> version;
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
@@ -1230,6 +1304,15 @@ std::string CommandEngine::ExecuteStatement(
                     if (!values) Protocol::AppendNull(reply);
                     else {
                         Protocol::AppendArrayHeader(reply, columns.size());
+                        auto response_bytes = reply.size();
+                        for (const auto index : columns) {
+                            CheckStatementCancellation();
+                            const auto bytes = ValueReplyBytes((*values)[index]);
+                            if (bytes > kMaxChunkRangeResponseBytes - response_bytes)
+                                throw std::out_of_range("GET BLOCK response exceeds the response byte limit; request fewer columns");
+                            response_bytes += bytes;
+                        }
+                        reply.reserve(response_bytes);
                         for (const std::size_t index : columns)
                             AppendValue(reply, layout.schema().columns[index], (*values)[index]);
                     }
@@ -1304,6 +1387,8 @@ std::string CommandEngine::ExecuteStatement(
                     ChunkState state;
                     bool private_state = false;
                     const ChunkCoord coord{get.chunk_x, get.chunk_y, get.chunk_z};
+                    if (reserve_reply)
+                        (*reserve_reply)(ChunkReplyCaptureBound(layout, ChunkReplyStateBytes(store.geometry(), 1U, 64U)));
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
                         TxnRead(txn, std::span<const ChunkCoord>(&coord, 1));
@@ -1315,9 +1400,9 @@ std::string CommandEngine::ExecuteStatement(
                         state = store.ReadChunkState(coord);
                     }
                     if (!state.written) return NullReply();
-                    std::string reply;
+                    ReplyParts reply;
                     AppendChunkState(reply, store.geometry(), state, columns, private_state);
-                    return reply;
+                    return FinishReply(std::move(reply), continuation);
                 },
                 [&](const cql::SetChunk& set) {
                     command_class = set.if_version.has_value() || set.if_absent ? MetricsRegistry::CommandClass::kConditional
@@ -1415,6 +1500,28 @@ std::string CommandEngine::ExecuteStatement(
                     const auto& layout = store.geometry().layout();
                     const auto columns = ColumnsOf(layout, get.columns);
                     std::vector<ChunkRangeEntry> entries;
+                    if (reserve_reply) {
+                        const auto extent = [](std::int64_t first, std::int64_t last) {
+                            if (last < first) return kMaxChunkRangeChunks;
+                            const auto delta = static_cast<std::uint64_t>(last) - static_cast<std::uint64_t>(first);
+                            return delta >= kMaxChunkRangeChunks ? kMaxChunkRangeChunks : static_cast<std::size_t>(delta + 1U);
+                        };
+                        // Each axis multiplies the count, which never exceeds
+                        // the chunks an area may return.
+                        const auto times = [](std::size_t count, std::size_t axis) {
+                            return axis > kMaxChunkRangeChunks / count ? kMaxChunkRangeChunks : count * axis;
+                        };
+                        auto count = kMaxChunkRangeChunks;
+                        if (!get.around) {
+                            count = times(extent(get.x0, get.x1), extent(get.y0, get.y1));
+                            if (get.dims == 3U) count = times(count, extent(get.z0, get.z1));
+                        } else if (get.radius >= 0 && static_cast<std::uint64_t>(get.radius) < kMaxChunkRangeChunks / 2U) {
+                            const auto diameter = static_cast<std::size_t>(get.radius) * 2U + 1U;
+                            count = times(diameter, diameter);
+                            if (get.dims == 3U) count = times(count, diameter);
+                        }
+                        (*reserve_reply)(ChunkReplyCaptureBound(layout, ChunkReplyStateBytes(store.geometry(), count, 96U)));
+                    }
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
                         std::vector<ChunkCoord> covered;
@@ -1440,17 +1547,18 @@ std::string CommandEngine::ExecuteStatement(
                                                   : store.ReadChunkRange(get.x0, get.y0, get.x1, get.y1, true);
                     }
                     if (info != nullptr) info->chunks = entries.size();
-                    std::string reply;
+                    ReplyParts reply;
                     if (get.with_schema) {
-                        Protocol::AppendArrayHeader(reply, 2U);
-                        Protocol::AppendInteger(reply, layout.schema().version);
+                        Protocol::AppendArrayHeader(reply.text(), 2U);
+                        Protocol::AppendInteger(reply.text(), layout.schema().version);
                     }
-                    Protocol::AppendArrayHeader(reply, entries.size());
+                    Protocol::AppendArrayHeader(reply.text(), entries.size());
                     for (auto& entry : entries) {
-                        Protocol::AppendArrayHeader(reply, static_cast<std::size_t>(get.dims) + 1U);
-                        Protocol::AppendInteger(reply, entry.coord.x);
-                        Protocol::AppendInteger(reply, entry.coord.y);
-                        if (get.dims == 3U) Protocol::AppendInteger(reply, entry.coord.z);
+                        CheckStatementCancellation();
+                        Protocol::AppendArrayHeader(reply.text(), static_cast<std::size_t>(get.dims) + 1U);
+                        Protocol::AppendInteger(reply.text(), entry.coord.x);
+                        Protocol::AppendInteger(reply.text(), entry.coord.y);
+                        if (get.dims == 3U) Protocol::AppendInteger(reply.text(), entry.coord.z);
                         const bool private_state = session.transaction != nullptr && session.transaction->writes.contains(entry.coord);
                         AppendChunkState(reply, store.geometry(), {.version = entry.version, .payload = std::move(entry.payload),
                             .presence_bitmap = std::move(entry.presence_bitmap), .vars = std::move(entry.vars), .written = true,
@@ -1458,7 +1566,7 @@ std::string CommandEngine::ExecuteStatement(
                         if (reply.size() > kMaxChunkRangeResponseBytes)
                             throw std::invalid_argument("area response exceeds its byte limit");
                     }
-                    return reply;
+                    return FinishReply(std::move(reply), continuation);
                 },
                 [&](const cql::CreateTable& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
@@ -1548,7 +1656,11 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::RecoverTable& recover) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, recover.table, Right::kAdmin);
-                    catalog_->RecoverTable(recover.table, session.backup_cancelled);
+                    std::stop_source cancelled;
+                    const auto request_stop = [&] { cancelled.request_stop(); };
+                    std::stop_callback shutdown(session.backup_cancelled, request_stop);
+                    std::stop_callback statement(StatementStopToken(), request_stop);
+                    catalog_->RecoverTable(recover.table, cancelled.get_token());
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::CompactTombstones& compact) {
@@ -1637,10 +1749,19 @@ std::string CommandEngine::ExecuteStatement(
                         throw std::invalid_argument("BACKUP is disabled: set --backup-dir <path>");
                     const auto target = ResolveBackupTarget(config_.backup_dir, backup.path);
                     BackupOptions options;
-                    options.cancelled = session.backup_cancelled;
+                    std::stop_source cancelled;
+                    const auto request_stop = [&] { cancelled.request_stop(); };
+                    std::stop_callback shutdown(session.backup_cancelled, request_stop);
+                    std::stop_callback statement(StatementStopToken(), request_stop);
+                    options.cancelled = cancelled.get_token();
                     options.backup_directory = config_.backup_dir;
                     std::string reply;
                     options.before_publish = [&](const BackupResult& result) {
+                        if (reserve_reply) {
+                            if (result.tables.size() > (std::numeric_limits<std::size_t>::max() - 1024U) / 512U)
+                                throw ReplyAdmissionError("backup reply bound overflows");
+                            (*reserve_reply)(1024U + 512U * result.tables.size());
+                        }
                         Protocol::AppendMapHeader(reply, 4);
                         Protocol::AppendBulk(reply, "tables");
                         Protocol::AppendInteger(reply, static_cast<std::uint64_t>(result.tables.size()));
@@ -1679,6 +1800,7 @@ std::string CommandEngine::ExecuteStatement(
                     return TxnCommit(session);
                 },
                 [&](const cql::Rollback&) {
+                    EnterStatementDecision();
                     session.transaction.reset();
                     return Protocol::SimpleString("OK");
                 },
@@ -1698,6 +1820,10 @@ std::string CommandEngine::ExecuteStatement(
                     const auto columns = ColumnsOf(geometry.layout(), scan.columns);
                     const ChunkCoord cursor =
                         scan.after.has_value() ? ChunkCoord{scan.after->first, scan.after->second, scan.after_z} : ChunkCoord{};
+                    // A page with data retains chunk states up to the response byte limit.
+                    if (reserve_reply && scan.with_data)
+                        (*reserve_reply)(ChunkReplyCaptureBound(geometry.layout(),
+                            ChunkReplyStateBytes(geometry, static_cast<std::size_t>(limit), 128U)));
                     ChunkIdentityScanPage page;
                     try {
                         page = lease.store().ScanChunkIdentities(scan.after.has_value(), cursor,
@@ -1712,33 +1838,34 @@ std::string CommandEngine::ExecuteStatement(
                             {{"reason", "history_lost"}, {"floor", floor}, {"epoch", epoch}});
                     }
                     if (info != nullptr) info->chunks = page.entries.size();
-                    std::string reply;
-                    Protocol::AppendMapHeader(reply, 5);
-                    Protocol::AppendBulk(reply, "chunks");
-                    Protocol::AppendArrayHeader(reply, page.entries.size());
+                    ReplyParts reply;
+                    Protocol::AppendMapHeader(reply.text(), 5);
+                    Protocol::AppendBulk(reply.text(), "chunks");
+                    Protocol::AppendArrayHeader(reply.text(), page.entries.size());
                     for (const auto& entry : page.entries) {
-                        Protocol::AppendArrayHeader(reply, static_cast<std::size_t>(geometry.dims()) + 1U + (scan.with_data ? 1U : 0U));
-                        Protocol::AppendInteger(reply, entry.coord.x);
-                        Protocol::AppendInteger(reply, entry.coord.y);
-                        if (geometry.dims() == 3U) Protocol::AppendInteger(reply, entry.coord.z);
-                        Protocol::AppendInteger(reply, entry.version);
+                        CheckStatementCancellation();
+                        Protocol::AppendArrayHeader(reply.text(), static_cast<std::size_t>(geometry.dims()) + 1U + (scan.with_data ? 1U : 0U));
+                        Protocol::AppendInteger(reply.text(), entry.coord.x);
+                        Protocol::AppendInteger(reply.text(), entry.coord.y);
+                        if (geometry.dims() == 3U) Protocol::AppendInteger(reply.text(), entry.coord.z);
+                        Protocol::AppendInteger(reply.text(), entry.version);
                         if (scan.with_data) {
                             if (entry.data) AppendChunkState(reply, geometry, *entry.data, columns, false);
-                            else Protocol::AppendNull(reply);
+                            else Protocol::AppendNull(reply.text());
                         }
                         if (reply.size() > kMaxChunkRangeResponseBytes)
                             throw std::invalid_argument("scan response exceeds its byte limit");
                     }
-                    Protocol::AppendBulk(reply, "more");
-                    Protocol::AppendBoolean(reply, page.has_more);
-                    Protocol::AppendBulk(reply, "epoch");
-                    Protocol::AppendBulk(reply, StoreIdHex(lease.store().store_id()));
-                    Protocol::AppendBulk(reply, "position");
-                    if (page.position) Protocol::AppendInteger(reply, *page.position);
-                    else Protocol::AppendNull(reply);
-                    Protocol::AppendBulk(reply, "retained_deletion_floor");
-                    Protocol::AppendInteger(reply, page.retained_deletion_floor);
-                    return reply;
+                    Protocol::AppendBulk(reply.text(), "more");
+                    Protocol::AppendBoolean(reply.text(), page.has_more);
+                    Protocol::AppendBulk(reply.text(), "epoch");
+                    Protocol::AppendBulk(reply.text(), StoreIdHex(lease.store().store_id()));
+                    Protocol::AppendBulk(reply.text(), "position");
+                    if (page.position) Protocol::AppendInteger(reply.text(), *page.position);
+                    else Protocol::AppendNull(reply.text());
+                    Protocol::AppendBulk(reply.text(), "retained_deletion_floor");
+                    Protocol::AppendInteger(reply.text(), page.retained_deletion_floor);
+                    return FinishReply(std::move(reply), continuation);
                 },
                 [&](const cql::CreateUser& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
@@ -1768,6 +1895,9 @@ std::string CommandEngine::ExecuteStatement(
                             throw std::invalid_argument("this server runs without users (--auth none)");
                         }
                         config_.users->SetVerifier(alter.user, VerifierFrom(*alter.verifier, parameters));
+                    } else if (alter.max_connections || alter.statements_per_sec) {
+                        RequireManagesUsers(session);
+                        config_.users->SetLimits(alter.user, alter.max_connections, alter.statements_per_sec);
                     } else if (alter.requires_channel_binding.has_value()) {
                         RequireManagesUsers(session);
                         config_.users->SetRequiresChannelBinding(alter.user, *alter.requires_channel_binding);
@@ -1959,7 +2089,9 @@ std::string CommandEngine::TxnBegin(SessionState& session) {
     if (session.transaction != nullptr) {
         throw std::invalid_argument("a transaction is already open; COMMIT or ROLLBACK it first");
     }
-    session.transaction = std::make_unique<SessionTransaction>(&txn_budget_, std::chrono::steady_clock::now());
+    auto transaction = std::make_unique<SessionTransaction>(&txn_budget_, std::chrono::steady_clock::now());
+    EnterStatementDecision();
+    session.transaction = std::move(transaction);
     return Protocol::SimpleString("OK");
 }
 
@@ -2081,6 +2213,7 @@ void CommandEngine::TxnWrite(
         }
     };
     try {
+        EnterStatementDecision();
         change(state);
         state.written = state.written || was_written ||
             ChunkPopulated(store.geometry(), state.presence_bitmap, state.chunk_columns.get());

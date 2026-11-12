@@ -38,17 +38,18 @@
 #include "server_io.hpp"
 #include "server_tls.hpp"
 #include "server_feed.hpp"
+#include "server_idle.hpp"
 #include "user_registry.hpp"
 
 namespace chunkdb {
 
 using namespace server_detail;
 
-void SetServerTimeoutConfigFailpointForTests(
+void SetServerSocketConfigFailpointForTests(
     std::size_t send_failures,
-    std::size_t recv_failures) noexcept {
+    std::size_t nonblocking_failures) noexcept {
     g_test_send_timeout_config_failures.store(send_failures, std::memory_order_relaxed);
-    g_test_recv_timeout_config_failures.store(recv_failures, std::memory_order_relaxed);
+    g_test_nonblocking_config_failures.store(nonblocking_failures, std::memory_order_relaxed);
 }
 
 void ResetServerTimeoutConfigCountersForTests() noexcept {
@@ -70,6 +71,8 @@ ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> eng
     if (config_.max_line_bytes == 0) {
         throw std::invalid_argument("max_line_bytes must be > 0");
     }
+    if (config_.max_line_bytes > std::numeric_limits<std::size_t>::max() - 4096U)
+        throw std::invalid_argument("max_line_bytes exceeds the input byte budget range");
     if (config_.worker_threads == 0) {
         throw std::invalid_argument("worker_threads must be > 0");
     }
@@ -83,6 +86,8 @@ ChunkServer::ChunkServer(ServerConfig config, std::shared_ptr<CommandEngine> eng
     if (config_.idle_connection_timeout_ms == 0 || config_.idle_connection_timeout_ms > kMaxTimeoutMs) {
         throw std::invalid_argument("idle_connection_timeout_ms must be between 1 and 86400000");
     }
+    if (config_.statement_timeout_ms > StatementControl::kMaxTimeoutMs)
+        throw std::invalid_argument("statement_timeout_ms must be between 0 and 86400000");
     if (config_.feed_progress_ms == 0 || config_.feed_progress_ms > static_cast<std::size_t>(INT_MAX)) {
         throw std::invalid_argument("feed_progress_ms must be between 1 and 2147483647");
     }
@@ -165,14 +170,28 @@ std::shared_ptr<FeedIo> ChunkServer::FeedIoHandle() {
     return feed_io_;
 }
 
+std::shared_ptr<IdleIo> ChunkServer::IdleIoHandle() {
+    std::lock_guard lock(lifecycle_mutex_);
+    return idle_io_;
+}
+
 void ChunkServer::StartWorkers() {
     auto io = std::make_shared<FeedIo>(*this);
-    { std::lock_guard lock(lifecycle_mutex_); feed_io_ = io; }
+    auto idle = std::make_shared<IdleIo>(*this);
+    { std::lock_guard lock(lifecycle_mutex_); feed_io_ = io; idle_io_ = idle; }
     if (const auto& users = engine_->users())
         users_changed_ = users->OnChange([weak = std::weak_ptr<FeedIo>(io)] {
             if (auto feed = weak.lock()) feed->WakePoll();
         });
+    {
+        std::vector<std::shared_ptr<WorkerWait>> waits;
+        for (std::size_t i = 0; i < config_.worker_threads; ++i) waits.push_back(std::make_shared<WorkerWait>());
+        std::lock_guard lock(pending_clients_mutex_);
+        worker_waits_ = std::move(waits);
+        free_workers_ = config_.worker_threads;
+    }
     io->Start();
+    idle->Start();
     workers_.reserve(config_.worker_threads);
     for (std::size_t i = 0; i < config_.worker_threads; ++i) {
         workers_.emplace_back(&ChunkServer::WorkerLoop, this, i);
@@ -181,6 +200,7 @@ void ChunkServer::StartWorkers() {
 
 void ChunkServer::JoinWorkers() {
     if (auto io = FeedIoHandle()) io->Stop();
+    if (auto io = IdleIoHandle()) io->Stop();
     for (std::size_t index = 0U; index < workers_.size(); ++index) {
         auto& worker = workers_[index];
         if (worker.joinable()) {
@@ -192,8 +212,9 @@ void ChunkServer::JoinWorkers() {
         }
     }
     workers_.clear();
+    { std::lock_guard lock(pending_clients_mutex_); worker_waits_.clear(); }
     users_changed_.reset();
-    { std::lock_guard lock(lifecycle_mutex_); feed_io_.reset(); }
+    { std::lock_guard lock(lifecycle_mutex_); feed_io_.reset(); idle_io_.reset(); }
 }
 
 void ChunkServer::Run() {
@@ -334,59 +355,24 @@ void ChunkServer::Run() {
                 continue;
             }
 
-            bool enqueued = false;
-            std::size_t pending_after = 0;
-            const auto accepted_at = std::chrono::steady_clock::now();
+            struct AcceptedSocket {
+                SocketHandle socket;
+                ~AcceptedSocket() { if (socket != kInvalidSocket) CloseSocket(socket); }
+            } accepted{client_socket};
+            auto connection = std::make_shared<ServerConnection>();
+            connection->socket = client_socket;
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeWorkerRegister, 0U);
+            bool admitted = false;
             {
-                std::lock_guard lock(pending_clients_mutex_);
-                while (!pending_clients_.empty() && !pending_clients_.front().resumed &&
-                       PendingClientExpired(
-                           pending_clients_.front().accepted_at,
-                           accepted_at,
-                           config_.idle_connection_timeout_ms)) {
-                    CloseSocket(static_cast<SocketHandle>(pending_clients_.front().socket));
-                    pending_clients_.pop();
-                }
-                if (pending_clients_.size() < config_.max_pending_clients) {
-                    pending_clients_.push(
-                        PendingClient{
-                            .socket = static_cast<decltype(listen_socket_)>(client_socket),
-                            .accepted_at = accepted_at,
-                        });
-                    pending_after = pending_clients_.size();
-                    enqueued = true;
-                } else {
-                    pending_after = pending_clients_.size();
-                }
+                std::lock_guard lock(active_clients_mutex_);
+                admitted = running_.load();
+                if (admitted) active_clients_.push_back(client_socket);
             }
-            if (enqueued) {
-                engine_->metrics()->SetPendingConnections(pending_after);
-                if (pending_after < config_.max_pending_clients) {
-                    pending_queue_overload_warned_.store(false, std::memory_order_relaxed);
-                }
-                pending_clients_cv_.notify_one();
-                continue;
-            }
-
-            engine_->metrics()->CountConnectionRejected();
-#ifdef CHUNKDB_WITH_OPENSSL
-            if (!config_.tls_enabled) {
-                SendPlainBusyResponse(client_socket, config_.client_io_timeout_ms);
-            }
-#else
-            SendPlainBusyResponse(client_socket, config_.client_io_timeout_ms);
-#endif
-            CloseSocket(client_socket);
-            if (!pending_queue_overload_warned_.exchange(true, std::memory_order_relaxed)) {
-                LogMessage(
-                    LogLevel::kWarn,
-                    LogComponent::kServer,
-                    "pending client queue full; rejecting new connections",
-                    {
-                        {"max_pending_clients", std::to_string(config_.max_pending_clients)},
-                        {"pending_clients", std::to_string(pending_after)},
-                    });
-            }
+            if (!admitted) continue;
+            engine_->metrics()->IncActiveConnections();
+            accepted.socket = kInvalidSocket;
+            if (!ParkClient(connection)) CloseClient(*connection);
         }
 
         (void)StopRunning();
@@ -470,8 +456,23 @@ bool ChunkServer::StopRunning() {
         // worker can miss the notification between a false predicate and wait.
         std::lock_guard lock(pending_clients_mutex_);
         was_running = running_.exchange(false);
+        for (const auto& wait : worker_waits_) if (wait->waiting) wait->poller.Wake();
     }
+    if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterRunningStopPublication, was_running ? 1U : 0U);
     pending_clients_cv_.notify_all();
+    std::vector<std::shared_ptr<StatementControl>> statements;
+    {
+        std::lock_guard lock(connections_mutex_);
+        for (const auto& [id, weak] : connections_) {
+            (void)id;
+            if (const auto connection = weak.lock()) {
+                std::lock_guard state_lock(connection->record->mutex);
+                if (connection->record->statement) statements.push_back(connection->record->statement);
+            }
+        }
+    }
+    for (const auto& statement : statements) (void)statement->RequestStop(StatementStopReason::kKilled);
     return was_running;
 }
 
@@ -486,21 +487,6 @@ std::size_t ChunkServer::ShutdownActiveClients() {
         if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
             hook->Run(FeedDeliveryTestHook::Point::kAfterClientShutdown,
                       static_cast<std::size_t>(error));
-#ifdef _WIN32
-        // shutdown rejects future receives, but a synchronous receive already
-        // pending in Winsock also needs cancellation. The ownership lock keeps
-        // the handle valid; only CloseClient closes it after the read returns.
-        const BOOL requested = CancelIoEx(reinterpret_cast<HANDLE>(client_socket), nullptr);
-        const DWORD cancel_error = requested ? ERROR_SUCCESS : GetLastError();
-        if (!requested && cancel_error != ERROR_NOT_FOUND) {
-            LogMessage(LogLevel::kError, LogComponent::kServer, "socket I/O cancellation failed",
-                {{"socket", std::to_string(client_socket)},
-                 {"win32_error", std::to_string(cancel_error)}});
-        }
-        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
-            hook->Run(FeedDeliveryTestHook::Point::kAfterClientIoCancel,
-                      static_cast<std::size_t>(cancel_error));
-#endif
     }
     active_clients_.clear();
     return count;
@@ -530,6 +516,7 @@ void ChunkServer::Stop() {
     }
 
     if (auto io = FeedIoHandle()) io->Wake();
+    if (auto io = IdleIoHandle()) io->Wake();
 
     {
         std::lock_guard lock(pending_clients_mutex_);
@@ -537,7 +524,9 @@ void ChunkServer::Stop() {
         while (!pending_clients_.empty()) {
             auto client = std::move(pending_clients_.front());
             pending_clients_.pop();
-            if (client.resumed) CloseClient(*client.resumed);
+            // Tracked statements retain their connection until the transport
+            // claims queued cancellation or the running worker returns it.
+            if (client.resumed) continue;
             else CloseSocket(static_cast<SocketHandle>(client.socket));
         }
     }
@@ -573,7 +562,9 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
         trace(FeedDeliveryTestHook::Point::kWorkerReady);
         decltype(listen_socket_) client_socket = kInvalidSocket;
         std::shared_ptr<ServerConnection> connection;
+        std::shared_ptr<StatementControl> statement;
 
+        bool wake_io = false;
         {
             std::unique_lock lock(pending_clients_mutex_);
             pending_clients_cv_.wait(lock, [&]() {
@@ -610,22 +601,52 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
 
                 client_socket = pending_client.socket;
                 connection = pending_client.resumed;
+                statement = pending_client.statement;
+                // Holding a connection until it closes or goes back to the I/O thread.
+                worker_waits_[worker_index]->holding = true;
+                --free_workers_;
                 break;
             }
+            // A refused dispatch stays with the I/O owner until queue space
+            // returns; only then does a pop need to wake it.
+            wake_io = std::exchange(dispatch_refused_, false);
 
             engine_->metrics()->SetPendingConnections(pending_clients_.size());
+        }
 
-            if (client_socket == kInvalidSocket) {
-                if (!running_.load()) {
-                    return;
-                }
+        if (wake_io)
+            if (auto io = IdleIoHandle()) io->Wake();
+        if (client_socket == kInvalidSocket) {
+            if (!running_.load()) {
+                return;
+            }
+            continue;
+        }
+        // However this iteration ends, the worker then holds no connection.
+        struct Holding {
+            ChunkServer& server;
+            WorkerWait& wait;
+            ~Holding() { server.FreeWorker(wait); }
+        } holding{*this, *worker_waits_[worker_index]};
+        if (statement) {
+            if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeStatementStart, connection->session.connection_id);
+            if (!statement->Start()) {
+                if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                    hook->Run(FeedDeliveryTestHook::Point::kAfterStatementStartRefused, 0U);
                 continue;
             }
         }
-
-        ServerConnection initial;
         if (!connection) {
-            initial.socket = static_cast<SocketHandle>(client_socket);
+            try {
+                connection = std::make_shared<ServerConnection>();
+            } catch (const std::bad_alloc& error) {
+                CloseSocket(static_cast<SocketHandle>(client_socket));
+                LogMessage(LogLevel::kError, LogComponent::kServer,
+                    "connection allocation failed", {{"error", error.what()}});
+                continue;
+            }
+            connection->socket = static_cast<SocketHandle>(client_socket);
             trace(FeedDeliveryTestHook::Point::kBeforeWorkerRegister);
             bool admitted;
             {
@@ -639,9 +660,9 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
             }
             engine_->metrics()->IncActiveConnections();
         }
-        auto& current = connection ? *connection : initial;
+        auto& current = *connection;
         trace(FeedDeliveryTestHook::Point::kBeforeWorkerHandle);
-        const bool handed_off = HandleClient(client_socket, current);
+        const bool handed_off = HandleClient(client_socket, connection, *worker_waits_[worker_index]);
         trace(FeedDeliveryTestHook::Point::kAfterWorkerHandle);
         if (!handed_off) {
             trace(FeedDeliveryTestHook::Point::kBeforeWorkerClose);

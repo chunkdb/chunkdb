@@ -1,4 +1,5 @@
 #include "chunk_coordinate_index.hpp"
+#include "statement_control.hpp"
 
 #include <algorithm>
 #include <array>
@@ -207,6 +208,7 @@ std::shared_ptr<ChunkCoordinateIndex> ChunkStore::CoordinateIndexForScan() {
         throw;
     }
     for (const auto& coord : coordinates) {
+        CheckStatementCancellation();
         auto loaded = LoadChunkPayload(coord, false, candidate);
         BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);
         BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
@@ -225,7 +227,8 @@ std::shared_ptr<ChunkCoordinateIndex> ChunkStore::CoordinateIndexForScan() {
         }
     }
     for (const auto& [coord, chunk] : cached) {
-        std::shared_lock lock(chunk->mutex);
+        CheckStatementCancellation();
+        auto lock = LockStatementChunkShared(chunk->mutex);
         if (chunk->read_only_generation != before) continue;
         if (chunk->written != (chunk->version != 0U))
             throw std::logic_error("cached coordinate has an inconsistent producing identity");

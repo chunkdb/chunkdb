@@ -968,6 +968,21 @@ class Parser {
                 alter.user = Name("a user name");
                 if (Accept("verifier")) {
                     alter.verifier = Verifier();
+                } else if (Accept("limit")) {
+                    do {
+                        const auto column = Peek().column;
+                        const auto name = Name("a limit name");
+                        ExpectToken(TokenKind::kEquals, "=");
+                        if (name == "max_connections") {
+                            if (alter.max_connections) Fail(column, "max_connections is given twice");
+                            alter.max_connections = Unsigned("max_connections", std::numeric_limits<std::uint64_t>::max());
+                        } else if (name == "statements_per_sec") {
+                            if (alter.statements_per_sec) Fail(column, "statements_per_sec is given twice");
+                            alter.statements_per_sec = Unsigned("statements_per_sec", kMaxUserStatementsPerSecond);
+                        } else {
+                            Fail(column, "unknown user limit: " + name);
+                        }
+                    } while (AcceptToken(TokenKind::kComma));
                 } else {
                     const bool no = Accept("no");
                     if (Accept("require")) {
@@ -1059,6 +1074,7 @@ class Parser {
             return EnableFeature{.name = Take().text};
         }
         if (Accept("show")) {
+            if (Accept("connections")) return ShowConnections{};
             if (Accept("table")) {
                 Expect("stats");
                 return ShowTableStats{.table = Name("a table name")};
@@ -1079,7 +1095,12 @@ class Parser {
             if (Accept("metrics")) {
                 return ShowMetrics{};
             }
-            Fail(Peek().column, "expected TABLES, METRICS, STATUS, MIGRATIONS, USERS or SLOTS, got " + Quote(Peek()));
+            Fail(Peek().column, "expected TABLES, METRICS, STATUS, CONNECTIONS, MIGRATIONS, USERS or SLOTS, got " + Quote(Peek()));
+        }
+        if (Accept("cancel")) return Cancel{Unsigned("a connection id", std::numeric_limits<std::uint64_t>::max())};
+        if (Accept("kill")) {
+            Expect("connection");
+            return KillConnection{Unsigned("a connection id", std::numeric_limits<std::uint64_t>::max())};
         }
         if (Accept("describe")) {
             return Describe{.table = Name("a table name")};

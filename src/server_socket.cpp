@@ -25,7 +25,7 @@ namespace chunkdb {
 namespace server_detail {
 
 std::atomic<std::size_t> g_test_send_timeout_config_failures{0};
-std::atomic<std::size_t> g_test_recv_timeout_config_failures{0};
+std::atomic<std::size_t> g_test_nonblocking_config_failures{0};
 std::atomic<std::uint64_t> g_test_recv_timeout_config_calls{0};
 
 bool ConsumeTestFailureBudget(std::atomic<std::size_t>* counter) {

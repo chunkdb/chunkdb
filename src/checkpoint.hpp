@@ -40,7 +40,8 @@ void AtomicWrite(
     bool fsync_directory,
     bool* out_replaced = nullptr,
     const char* after_rename_failpoint = nullptr,
-    bool enable_generic_failpoints = true);
+    bool enable_generic_failpoints = true,
+    void (*before_replace)() = nullptr);
 void AtomicWriteStream(
     const std::filesystem::path& path, const AtomicFileProducer& produce,
     bool fsync_file, bool fsync_directory, bool* out_replaced = nullptr,

@@ -6,11 +6,13 @@
 #include <exception>
 #include <list>
 #include <mutex>
+#include <optional>
 
 #include "chunkdb/table_catalog.hpp"
 
 namespace chunkdb {
 class ChunkServer;
+class StatementControl;
 
 // Isolated delivery schedule hook. Install before test writes and retain it
 // until the server stops; callbacks never change delivery decisions.
@@ -21,7 +23,12 @@ struct FeedDeliveryTestHook {
         kWorkerReady, kAfterPendingWait, kBeforeWorkerHandle, kAfterWorkerHandle,
         kBeforeWorkerClose, kAfterWorkerClose, kBeforeClientRead, kAfterClientRead,
         kBeforeIoScan, kAfterIoAdd, kAfterAdmission, kAfterProgressAdmission, kAfterPartialFeedWrite, kAfterBlockedFeedWrite, kAfterAckTimeoutClose, kBeforeSlotAck, kAfterSlotFinish, kBeforeReturnClient,
-        kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept, kAfterTakeoverFence, kAfterTakeoverClose, kAfterSlotAck, kAfterTakeoverReserved };
+        kAfterClientIoCancel, kBeforeWorkerRegister, kBeforeAccept, kAfterTakeoverFence, kAfterTakeoverClose, kAfterSlotAck, kAfterTakeoverReserved, kBeforeResumedClientQueue, kIdleQueueBackpressure,
+        kBeforeQueuedStopScan, kAfterQueuedStopClaim, kBeforeStatementStart, kAfterStatementStartRefused,
+        kAfterStatementQueued, kAfterFeedReplyQueue, kFeedInputBackpressure, kAfterRunningStopPublication,
+        kBeforeReplyBufferWrite, kAfterReplyBufferWrite, kAfterBlockedReplyWrite, kAfterAuthReplyScheduled,
+        kAfterPayloadCreditQueued, kAfterPayloadCreditGranted, kAfterStatementTrackerScan,
+        kBeforeBufferedStatementPublication, kBeforeTakeoverReservation, kBeforeWorkerIdleWait, kBeforeWorkerReceive };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
@@ -31,6 +38,18 @@ struct FeedDeliveryTestAccess {
     // Observe existing scheduling without adding a wake before shutdown.
     static void SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
     static void SetPendingObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
+    static std::shared_ptr<StatementControl> CurrentStatement(ChunkServer& server, std::uint64_t id);
+    static bool ConnectionStillOwned(ChunkServer& server, std::uint64_t id);
+    // Whether the connection's socket is nonblocking; nothing where that cannot be read.
+    static std::optional<bool> SocketNonBlocking(ChunkServer& server, std::uint64_t id);
+    // Shrinks the server side send buffer of a connection; false where that fails.
+    static bool SetSendBuffer(ChunkServer& server, std::uint64_t id, int bytes);
+    // The receive and send timeouts of a connection's socket in milliseconds, where readable.
+    static std::optional<std::pair<long, long>> SocketTimeouts(ChunkServer& server, std::uint64_t id);
+    static void WakeTransport(ChunkServer& server);
+    static std::shared_ptr<void> ReserveReplyCredit(ChunkServer& server, std::size_t bytes);
+    // For a connection the I/O thread holds idle; nullopt when it is gone.
+    static std::optional<std::size_t> RequestLineCapacity(ChunkServer& server, std::uint64_t id);
   private:
     static void InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake);
 };
