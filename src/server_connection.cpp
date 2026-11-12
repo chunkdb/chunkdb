@@ -26,7 +26,21 @@ bool ChunkServer::HandleClient(
     // A connection handed back is the I/O thread's to dispatch: return what
     // its waiting worker kept, and free the worker first, so that dispatch
     // counts it.
-    const auto park = [&] { io->ReleaseKept(*connection); FreeWorker(wait); return ParkClient(connection); };
+    const auto park = [&] {
+        // The I/O thread needs its nonblocking socket back.
+        if (connection->worker_blocking) {
+            std::string error;
+            if (!SetSocketNonBlocking(connection->socket, true, &error)) {
+                LogMessage(LogLevel::kWarn, LogComponent::kServer,
+                    "failed to restore nonblocking client I/O; closing connection", {{"error", error}});
+                return false;
+            }
+            connection->worker_blocking = false;
+        }
+        io->ReleaseKept(*connection);
+        FreeWorker(wait);
+        return ParkClient(connection);
+    };
     try {
         while (running_.load()) {
             // A statement this worker parsed was published running already.
@@ -100,8 +114,12 @@ bool ChunkServer::HandleClient(
             if (!io->Write(*connection, true)) return false;
             if (connection->phase != ServerConnection::Phase::kInput || session.watch || session.slot_watch)
                 return park();
+            // The first wait after a reply is the bounded receive, then the poller.
+            bool receive = true;
             while (connection->pending.empty()) {
-                const auto next = AwaitNextRequest(wait, *connection);
+                const auto brief = receive ? AwaitReceive(*connection) : std::nullopt;
+                receive = false;
+                const auto next = brief ? *brief : AwaitNextRequest(wait, *connection);
                 if (next == NextRequest::kClose) return false;
                 if (next == NextRequest::kReturn) return park();
                 connection->read_ready = false;
@@ -139,6 +157,51 @@ bool ChunkServer::ParkClient(const std::shared_ptr<ServerConnection>& connection
             "connection transport hand-off failed", {{"error", error.what()}});
     }
     return false;
+}
+
+// The worker that wrote a reply first waits with one receive bounded by
+// kWorkerReceiveWaitMs, the single system call main's worker makes, while no
+// queued request needs it. A request queued meanwhile, KILL and stop take
+// effect when that receive returns; no wake reaches it.
+std::optional<ChunkServer::NextRequest> ChunkServer::AwaitReceive(ServerConnection& connection) {
+#ifdef _WIN32
+    // A Windows socket is indeterminate after a receive times out.
+    (void)connection;
+    return std::nullopt;
+#else
+    using Clock = std::chrono::steady_clock;
+    // OpenSSL keeps record state across reads; its nonblocking reads stay with the poller.
+    if (connection.tls) return std::nullopt;
+    if (connection.idle_deadline - Clock::now() <= std::chrono::milliseconds(kWorkerReceiveWaitMs)) return std::nullopt;
+    {
+        std::lock_guard lock(pending_clients_mutex_);
+        if (!running_.load() || pending_clients_.size() > free_workers_ + yielding_workers_) return NextRequest::kReturn;
+    }
+    if (connection.record->killed.load()) return NextRequest::kClose;
+    std::string error;
+    if (!connection.worker_timeouts) {
+        // Set once per connection; a nonblocking socket ignores them.
+        if (!ConfigureSocketRecvTimeout(connection.socket, kWorkerReceiveWaitMs, &error) ||
+            !ConfigureSocketSendTimeout(connection.socket, kWorkerReceiveWaitMs, &error)) {
+            LogMessage(LogLevel::kWarn, LogComponent::kServer,
+                "worker receive timeouts unavailable; waiting on the poller", {{"error", error}});
+            return std::nullopt;
+        }
+        connection.worker_timeouts = true;
+    }
+    if (!connection.worker_blocking) {
+        if (!SetSocketNonBlocking(connection.socket, false, &error)) {
+            LogMessage(LogLevel::kWarn, LogComponent::kServer,
+                "worker blocking receive unavailable; waiting on the poller", {{"error", error}});
+            return std::nullopt;
+        }
+        connection.worker_blocking = true;
+    }
+    // From here on a queued request, KILL or stop waits for the receive to end.
+    if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kBeforeWorkerReceive, connection.session.connection_id);
+    return NextRequest::kRead;
+#endif
 }
 
 // The worker that wrote a reply keeps its idle connection while no queued

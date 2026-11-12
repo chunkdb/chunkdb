@@ -56,6 +56,9 @@ struct ServerConnection : public std::enable_shared_from_this<ServerConnection> 
     bool irreversible_reply = false;
     // A statement its worker parsed, started and published; it runs next.
     std::shared_ptr<StatementControl> started_statement;
+    // Set while the worker that keeps this connection has it blocking with
+    // kWorkerReceiveWaitMs receive and send timeouts; those are set once.
+    bool worker_blocking = false, worker_timeouts = false;
     // The client's address and "[address]:port": the socket's peer, or the
     // source a PROXY header carried. Set when the connection starts.
     std::string peer_address;

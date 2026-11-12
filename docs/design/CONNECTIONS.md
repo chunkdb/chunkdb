@@ -10,6 +10,11 @@ Exactly one owner may access its socket or TLS object at a time.
 An I/O owner handles idle sockets, partial input, TLS handshakes, authentication replies and output readiness.
 A statement worker receives a fully framed request and returns the resulting output continuation.
 The worker that wrote a reply waits for that connection's next request while no queued request needs a worker; a queued request, KILL, shutdown and the idle deadline return or close the connection, and incomplete input returns it to the I/O owner.
+On a plain POSIX socket that wait starts with one blocking receive bounded by 2 ms, the single system call per request that main's worker makes; the socket stays blocking with 2 ms receive and send timeouts, set once, while the worker keeps the connection, and is nonblocking again before the I/O owner gets it back.
+No wake reaches that receive: when every worker waits on a quiet connection, a queued request waits at most 2 ms plus the kernel's timer rounding, or for the one statement such a worker has just received, and KILL and shutdown take effect within the same bound; on main a connection without a worker waits without bound.
+After the bound the worker waits on its poller, which a yield, KILL or shutdown wakes at once, so a client pausing longer than 2 ms between requests costs one timed-out receive and a poller wait.
+A send from a worker that keeps the connection blocks for at most 2 ms, and an unfinished reply continues on the I/O owner.
+TLS connections and Windows wait only on the poller: OpenSSL keeps record state across reads that a timed-out blocking read would have to resume, and a Windows socket is indeterminate after a receive times out.
 Buffered complete requests retain their worker while bounded input and output credit remains available.
 Ownership transfers publish state before waking the receiving owner.
 Returned credit wakes the I/O owner only after a refused reservation.
@@ -114,6 +119,7 @@ Deterministic ownership hooks cover worker release, cancellation/decision arbitr
 Regression tests prove both sides of every cancellation boundary and reopen durable state after failure.
 Raw and TLS tests fill statement workers while new HELLO and control requests complete, exercise partial records and pipelined parameters, and close idle transactions on shutdown.
 Waiting-worker tests cover a queued request taking the worker, KILL, shutdown, the idle deadline, partial input and statement timeouts.
+Receive tests hold the worker just before its bounded receive while a request is queued, the connection is killed or the server stops, and check the socket mode and timeouts a connection carries while kept and after it is handed back.
 Large-reply tests check exact framing, bounded encoded buffers, limit refusal before output and progress deadlines.
 Paused output races concurrent writes and ALTER to prove a fixed reply snapshot and bound.
 KILL and shutdown tests cover idle transactions and each COMMIT decision phase, verifying history and slot release without undoing a committed decision.

@@ -6,6 +6,7 @@
 #include <exception>
 #include <list>
 #include <mutex>
+#include <optional>
 
 #include "chunkdb/table_catalog.hpp"
 
@@ -27,7 +28,7 @@ struct FeedDeliveryTestHook {
         kAfterStatementQueued, kAfterFeedReplyQueue, kFeedInputBackpressure, kAfterRunningStopPublication,
         kBeforeReplyBufferWrite, kAfterReplyBufferWrite, kAfterBlockedReplyWrite, kAfterAuthReplyScheduled,
         kAfterPayloadCreditQueued, kAfterPayloadCreditGranted, kAfterStatementTrackerScan,
-        kBeforeBufferedStatementPublication, kBeforeTakeoverReservation, kBeforeWorkerIdleWait };
+        kBeforeBufferedStatementPublication, kBeforeTakeoverReservation, kBeforeWorkerIdleWait, kBeforeWorkerReceive };
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
@@ -39,6 +40,12 @@ struct FeedDeliveryTestAccess {
     static void SetPendingObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
     static std::shared_ptr<StatementControl> CurrentStatement(ChunkServer& server, std::uint64_t id);
     static bool ConnectionStillOwned(ChunkServer& server, std::uint64_t id);
+    // Whether the connection's socket is nonblocking; nothing where that cannot be read.
+    static std::optional<bool> SocketNonBlocking(ChunkServer& server, std::uint64_t id);
+    // Shrinks the server side send buffer of a connection; false where that fails.
+    static bool SetSendBuffer(ChunkServer& server, std::uint64_t id, int bytes);
+    // The receive and send timeouts of a connection's socket in milliseconds, where readable.
+    static std::optional<std::pair<long, long>> SocketTimeouts(ChunkServer& server, std::uint64_t id);
     static void WakeTransport(ChunkServer& server);
     static std::shared_ptr<void> ReserveReplyCredit(ChunkServer& server, std::size_t bytes);
   private:

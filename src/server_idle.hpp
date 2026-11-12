@@ -15,6 +15,10 @@ class ChunkServer;
 class StatementControl;
 struct ServerConnection;
 
+// The bound of a worker's first wait after a reply on a plain POSIX socket,
+// and of each of its sends while it keeps that connection.
+inline constexpr std::size_t kWorkerReceiveWaitMs = 2U;
+
 // A statement worker waiting for the next request of the idle connection it
 // just answered. Its waiting, yield, connection and holding fields are
 // guarded by the server's pending_clients_mutex_.

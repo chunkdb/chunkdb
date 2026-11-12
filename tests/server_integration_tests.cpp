@@ -34,6 +34,7 @@
 #include "../src/proxy_protocol.hpp"
 #include "../src/slot_watch.hpp"
 #include "../src/server_socket.hpp"
+#include "../src/server_idle.hpp"
 #include "../src/statement_control.hpp"
 #include "../src/user_registry.hpp"
 
@@ -2321,6 +2322,15 @@ class WorkerIdleWaitHook : public chunkdb::FeedDeliveryTestHook {
                 changed_.wait(lock, [&] { return idle_released_; });
             }
         }
+        if (point == Point::kBeforeWorkerReceive) {
+            ++receives_[value];
+            if (value == hold_receive_ && !receive_held_) {
+                receive_held_ = true;
+                changed_.notify_all();
+                changed_.wait(lock, [&] { return receive_released_; });
+            }
+        }
+        if (point == Point::kBeforeReplyBufferWrite && value >= 65536U) large_write_ = true;
         if (point == Point::kAfterStatementQueued) ++queued_[value];
         if (point == Point::kAfterRunningStopPublication) ++stop_publications_;
         if (point == Point::kBeforeWorkerClose) worker_closed_ = true;
@@ -2359,6 +2369,12 @@ class WorkerIdleWaitHook : public chunkdb::FeedDeliveryTestHook {
     }
     // Holds the worker after its registration and its KILL check, just
     // before it polls: from there only its wake reports a yield, KILL or stop.
+    // Holds the worker just before its bounded receive on id.
+    void HoldReceive(std::uint64_t id) { std::lock_guard lock(mutex_); hold_receive_ = id; }
+    void WaitReceiveHeld() { Wait([&] { return receive_held_; }); }
+    void ReleaseReceive() { { std::lock_guard lock(mutex_); receive_released_ = true; } changed_.notify_all(); }
+    void WaitReceive(std::uint64_t id) { Wait([&] { return receives_[id] >= 1U; }); }
+    void WaitLargeWrite() { Wait([&] { return large_write_; }); }
     void HoldIdleWait(std::uint64_t id) { std::lock_guard lock(mutex_); hold_idle_ = id; }
     // Holds the next worker that returns from a connection, before it waits for another.
     void HoldAfterHandle() { std::lock_guard lock(mutex_); hold_after_handle_ = true; }
@@ -2370,7 +2386,7 @@ class WorkerIdleWaitHook : public chunkdb::FeedDeliveryTestHook {
     // Stop and the accept loop each publish the stop and wake waiting workers.
     void WaitStopPublished(std::size_t count) { Wait([&] { return stop_publications_ >= count; }); }
     void Release() {
-        { std::lock_guard lock(mutex_); released_ = true; idle_released_ = true; }
+        { std::lock_guard lock(mutex_); released_ = true; idle_released_ = true; receive_released_ = true; }
         changed_.notify_all();
     }
   private:
@@ -2382,6 +2398,9 @@ class WorkerIdleWaitHook : public chunkdb::FeedDeliveryTestHook {
     std::condition_variable changed_;
     std::unordered_map<std::uint64_t, std::size_t> waits_, queued_;
     std::uint64_t hold_idle_ = 0U;
+    std::unordered_map<std::uint64_t, std::size_t> receives_;
+    std::uint64_t hold_receive_ = 0U;
+    bool receive_held_ = false, receive_released_ = false, large_write_ = false;
     std::size_t stop_publications_ = 0U;
     bool idle_held_ = false, idle_released_ = false;
     bool hold_after_handle_ = false, after_handle_held_ = false;
@@ -2746,6 +2765,173 @@ void TestIdleConnectionsHoldNoLineCredit() {
         client->SendLine("PING");
         assert(client->ReadLine() == "+PONG\r\n");
     }
+}
+
+#ifndef _WIN32 // Windows workers wait only on the poller.
+// A request queued while the only worker is inside its bounded receive gets
+// that worker once the receive ends; no wake reaches the receive.
+void TestQueuedRequestTakesWorkerAfterReceive() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("queued-after-receive", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient first("127.0.0.1", harness.port);
+    const auto first_id = HelloId(first);
+    RawClient second("127.0.0.1", harness.port);
+    const auto second_id = HelloId(second);
+    hook.HoldReceive(first_id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+    hook.WaitReceiveHeld();
+    second.SendLine("PING");
+    hook.WaitQueued(second_id);
+    hook.ReleaseReceive();
+    assert(second.ReadLine() == "+PONG\r\n");
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+}
+
+// KILL of a connection whose worker is inside its bounded receive closes it
+// when that receive ends.
+void TestKillDuringWorkerReceive() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("kill-during-receive", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient target("127.0.0.1", harness.port);
+    const auto id = HelloId(target);
+    RawClient controller("127.0.0.1", harness.port);
+    controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    hook.HoldReceive(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    target.SendLine("PING"); assert(target.ReadLine() == "+PONG\r\n");
+    hook.WaitReceiveHeld();
+    controller.SendLine("KILL CONNECTION " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    hook.ReleaseReceive();
+    assert(target.WaitForClose(std::chrono::seconds(5)));
+    controller.SendLine("PING"); assert(controller.ReadLine() == "+PONG\r\n");
+}
+
+// Stop published while the worker is inside its bounded receive returns the
+// connection when that receive ends, before the client sockets are shut down.
+void TestStopDuringWorkerReceive() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("stop-during-receive", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient client("127.0.0.1", harness.port);
+    const auto id = HelloId(client);
+    hook.HoldReceive(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    hook.WaitReceiveHeld();
+    auto stopping = std::async(std::launch::async, [&] { harness.server->Stop(); });
+    hook.WaitStopPublished(1U);
+    hook.ReleaseReceive();
+    assert(stopping.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+    stopping.get();
+    harness.JoinStopped();
+    assert(hook.ClosedBeforeShutdown());
+    assert(client.WaitForClose(std::chrono::seconds(5)));
+}
+
+// A client socket whose 1024-byte receive buffer is set before it connects,
+// so the window it advertises stays that small; it sends and never reads.
+struct StalledSocket {
+    int fd = -1;
+    explicit StalledSocket(std::uint16_t port) {
+        fd = socket(AF_INET, SOCK_STREAM, 0);
+        assert(fd >= 0);
+        const int small = 1024;
+        assert(setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0);
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_port = htons(port);
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        assert(connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
+    }
+    ~StalledSocket() { if (fd >= 0) close(fd); }
+    void Send(std::string_view bytes) const {
+        assert(send(fd, bytes.data(), bytes.size(), 0) == static_cast<ssize_t>(bytes.size()));
+    }
+    // Reads one short reply, as HELLO and PING return.
+    std::string ReadReply() const {
+        char buffer[4096];
+        const auto read = recv(fd, buffer, sizeof(buffer), 0);
+        assert(read > 0);
+        return std::string(buffer, static_cast<std::size_t>(read));
+    }
+    std::uint64_t Hello() const {
+        Send("HELLO 3\r\n");
+        const auto reply = ReadReply();
+        const auto at = reply.find("connection_id\r\n:");
+        assert(at != std::string::npos);
+        return std::stoull(reply.substr(at + 16U));
+    }
+};
+
+// A client that stops reading a large reply begun by the worker that kept its
+// connection holds that worker for one bounded send at most, and the I/O
+// thread that takes the reply over still serves other connections.
+void TestStalledReaderLeavesWorkerAfterReceive() {
+    WorkerIdleWaitHook hook;
+    auto store_cfg = BaseStoreConfig();
+    store_cfg.geometry.chunk_width_blocks = 512;
+    store_cfg.geometry.chunk_height_blocks = 512;
+    store_cfg.geometry.block_bits = 32;
+    ServerHarness harness("stalled-reader-after-receive", store_cfg,
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    {
+        auto lease = harness.catalog->Find("default")->Acquire();
+        lease->store().SetBlockBits(0, 0, std::string(32, '0'));
+    }
+    StalledSocket stalled(harness.port);
+    const auto id = stalled.Hello();
+    RawClient other("127.0.0.1", harness.port);
+    (void)HelloId(other);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    stalled.Send("PING\r\n");
+    assert(stalled.ReadReply() == "+PONG\r\n");
+    hook.WaitReceive(id);
+    // Smaller than one 65536-byte reply piece, so the first send cannot finish.
+    assert(chunkdb::FeedDeliveryTestAccess::SetSendBuffer(*harness.server, id, 4096));
+    stalled.Send("GET CHUNK 0 0 FROM default\r\n"); // About 1 MiB, never read.
+    hook.WaitLargeWrite();
+    other.SendLine("PING"); assert(other.ReadLine() == "+PONG\r\n");
+    RawClient late("127.0.0.1", harness.port);
+    (void)HelloId(late);
+    late.SendLine("PING"); assert(late.ReadLine() == "+PONG\r\n");
+}
+#endif
+
+// A connection that its worker kept with a blocking socket goes back to the
+// I/O thread nonblocking.
+void TestHandedBackSocketIsNonblocking() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("handed-back-nonblocking", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    RawClient first("127.0.0.1", harness.port);
+    const auto first_id = HelloId(first);
+    RawClient second("127.0.0.1", harness.port);
+    const auto second_id = HelloId(second);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(first_id); // Past its bounded receive, waiting on the poller.
+    const auto kept = chunkdb::FeedDeliveryTestAccess::SocketNonBlocking(*harness.server, first_id);
+    const auto timeouts = chunkdb::FeedDeliveryTestAccess::SocketTimeouts(*harness.server, first_id);
+    second.SendLine("PING"); assert(second.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(second_id);
+    const auto returned = chunkdb::FeedDeliveryTestAccess::SocketNonBlocking(*harness.server, first_id);
+#ifdef _WIN32
+    (void)kept; (void)timeouts; // Windows workers wait only on the poller.
+#else
+    assert(kept && !*kept); // Plain POSIX sockets wait with a blocking receive.
+    // Its receive and each of its sends are bounded while the worker keeps it.
+    assert(timeouts && timeouts->first == static_cast<long>(chunkdb::kWorkerReceiveWaitMs) &&
+        timeouts->second == static_cast<long>(chunkdb::kWorkerReceiveWaitMs));
+#endif
+    if (returned) assert(*returned);
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
 }
 
 // Holds the only worker after it hands a connection back until the I/O
@@ -4773,11 +4959,17 @@ void TestReceiveTimeoutIsNotReconfiguredForIdleKeepAliveRequests() {
     for (std::size_t i = 0; i < kRequests; ++i) {
         assert(client.ReadLine() == "+PONG\r\n");
     }
+    // Requests sent one by one each start with the worker's bounded receive.
+    for (std::size_t i = 0; i < kRequests; ++i) {
+        client.SendLine("PING");
+        assert(client.ReadLine() == "+PONG\r\n");
+    }
 
+    // The receive timeout belongs to the connection, set once at most.
     const std::uint64_t recv_timeout_calls = chunkdb::ServerRecvTimeoutConfigCallsForTests();
-    if (recv_timeout_calls != 0U) {
+    if (recv_timeout_calls > 1U) {
         throw std::runtime_error(
-            "polled requests configured a blocking receive timeout: calls=" +
+            "requests reconfigured the receive timeout: calls=" +
             std::to_string(recv_timeout_calls));
     }
 }
@@ -7390,6 +7582,13 @@ int main(int argc, char** argv) {
         run("TestReturningWorkerTakesQueuedRequest", TestReturningWorkerTakesQueuedRequest);
         run("TestYieldReturnsKeptReplyCredit", TestYieldReturnsKeptReplyCredit);
         run("TestIdleConnectionsHoldNoLineCredit", TestIdleConnectionsHoldNoLineCredit);
+#ifndef _WIN32
+        run("TestQueuedRequestTakesWorkerAfterReceive", TestQueuedRequestTakesWorkerAfterReceive);
+        run("TestKillDuringWorkerReceive", TestKillDuringWorkerReceive);
+        run("TestStopDuringWorkerReceive", TestStopDuringWorkerReceive);
+        run("TestStalledReaderLeavesWorkerAfterReceive", TestStalledReaderLeavesWorkerAfterReceive);
+#endif
+        run("TestHandedBackSocketIsNonblocking", TestHandedBackSocketIsNonblocking);
         run("TestWaitingWorkerStatementTimesOut", TestWaitingWorkerStatementTimesOut);
         run("TestRefusedDispatchWakesAfterPop", TestRefusedDispatchWakesAfterPop);
         run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);

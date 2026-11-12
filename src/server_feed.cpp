@@ -55,6 +55,57 @@ bool FeedDeliveryTestAccess::ConnectionStillOwned(ChunkServer& server, std::uint
     const auto found = server.connections_.find(id);
     return found != server.connections_.end() && !found->second.expired();
 }
+std::optional<bool> FeedDeliveryTestAccess::SocketNonBlocking(ChunkServer& server, std::uint64_t id) {
+#ifdef _WIN32
+    (void)server; (void)id;
+    return std::nullopt;
+#else
+    std::shared_ptr<ServerConnection> connection;
+    {
+        std::lock_guard lock(server.connections_mutex_);
+        const auto found = server.connections_.find(id);
+        if (found != server.connections_.end()) connection = found->second.lock();
+    }
+    if (!connection || connection->socket == kInvalidSocket) return std::nullopt;
+    const int flags = fcntl(connection->socket, F_GETFL, 0);
+    if (flags < 0) return std::nullopt;
+    return (flags & O_NONBLOCK) != 0;
+#endif
+}
+std::optional<std::pair<long, long>> FeedDeliveryTestAccess::SocketTimeouts(ChunkServer& server, std::uint64_t id) {
+#ifdef _WIN32
+    (void)server; (void)id;
+    return std::nullopt;
+#else
+    std::shared_ptr<ServerConnection> connection;
+    {
+        std::lock_guard lock(server.connections_mutex_);
+        const auto found = server.connections_.find(id);
+        if (found != server.connections_.end()) connection = found->second.lock();
+    }
+    if (!connection || connection->socket == kInvalidSocket) return std::nullopt;
+    const auto read = [&](int option) -> std::optional<long> {
+        timeval value{};
+        socklen_t size = sizeof(value);
+        if (getsockopt(connection->socket, SOL_SOCKET, option, &value, &size) != 0) return std::nullopt;
+        return static_cast<long>(value.tv_sec) * 1000L + static_cast<long>(value.tv_usec) / 1000L;
+    };
+    const auto receive = read(SO_RCVTIMEO), send = read(SO_SNDTIMEO);
+    if (!receive || !send) return std::nullopt;
+    return std::make_pair(*receive, *send);
+#endif
+}
+bool FeedDeliveryTestAccess::SetSendBuffer(ChunkServer& server, std::uint64_t id, int bytes) {
+    std::shared_ptr<ServerConnection> connection;
+    {
+        std::lock_guard lock(server.connections_mutex_);
+        const auto found = server.connections_.find(id);
+        if (found != server.connections_.end()) connection = found->second.lock();
+    }
+    if (!connection || connection->socket == kInvalidSocket) return false;
+    return setsockopt(connection->socket, SOL_SOCKET, SO_SNDBUF,
+        reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0;
+}
 void FeedDeliveryTestAccess::WakeTransport(ChunkServer& server) {
     if (auto io = server.IdleIoHandle()) io->Wake();
 }
