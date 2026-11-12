@@ -55,7 +55,7 @@ CommitOwnerPage Page(std::uint64_t generation = 2U) {
 struct Fixture {
     test::ScopedTempDir temporary{"chunkdb-owner-artifacts"};
     std::filesystem::path root = std::filesystem::canonical(temporary.path());
-    ProcessLock lock{root};
+    ProcessLock lock{root, ProcessLock::PinRootForArtifacts{}};
     const std::array<std::uint8_t, kCommitOwnerRootBytes> selected = SerializeCommitOwnerRoot(Inactive());
     Fixture() { Save(root / kRoot, selected); Save(root / "sentinel", Bytes{'s'}); }
     void Unchanged() const {
@@ -151,7 +151,7 @@ void WriterRootGenerationAndCleanup() {
 #ifndef _WIN32
     test::ScopedTempDir temporary("chunkdb-owner-root-lease");
     const auto directory = std::filesystem::canonical(temporary.path());
-    auto original_lock = std::make_unique<ProcessLock>(directory);
+    auto original_lock = std::make_unique<ProcessLock>(directory, ProcessLock::PinRootForArtifacts{});
     const auto selected = SerializeCommitOwnerRoot(Inactive()); Save(directory / kRoot, selected);
     const auto moved = directory.parent_path() / (directory.filename().string() + "-original");
     std::filesystem::rename(directory, moved);
@@ -165,7 +165,7 @@ void WriterRootGenerationAndCleanup() {
     original_lock.reset();
     std::filesystem::remove_all(directory);
     std::filesystem::rename(moved, directory);
-    ProcessLock stable_lock(directory);
+    ProcessLock stable_lock(directory, ProcessLock::PinRootForArtifacts{});
     const auto count_root = [&] {
         struct stat root{}; assert(::stat(directory.c_str(), &root) == 0);
         unsigned count = 0U;
@@ -465,7 +465,7 @@ int CrashChild(const std::filesystem::path& executable, const std::filesystem::p
 #endif
 }
 void Crash(unsigned point, const std::filesystem::path& root) {
-    ProcessLock lock(root);
+    ProcessLock lock(root, ProcessLock::PinRootForArtifacts{});
     CommitOwnerArtifactIo writer(root, kScope, lock, false);
     unsigned object_directories = 0U;
     SetDirectorySyncObserverForTests([&](const auto& path) {
@@ -488,12 +488,32 @@ void CrashBoundaries(const std::filesystem::path& executable) {
         const auto selected = SerializeCommitOwnerRoot(Inactive()); Save(root / kRoot, selected);
         Save(root / "sentinel", Bytes{'s'});
         assert(CrashChild(executable, root, point) == 86);
-        ProcessLock lock(root); CommitOwnerArtifactIo writer(root, kScope, lock, false);
+        ProcessLock lock(root, ProcessLock::PinRootForArtifacts{}); CommitOwnerArtifactIo writer(root, kScope, lock, false);
         const auto staged = writer.StagePage(Page());
         assert(writer.ReadPage(staged.reference, CommitOwnerTreeKind::kCoverage, 2U).value == Page());
         assert(LoadFile(root / kRoot) == Bytes(selected.begin(), selected.end()));
         assert(LoadFile(root / "sentinel") == Bytes{'s'});
     }
+}
+// Only a lock that pinned its root may stage, and the pin refuses a symlinked
+// root before the lock directory is created.
+void ExplicitRootPin() {
+    test::ScopedTempDir temporary("chunkdb-owner-explicit-pin");
+    const auto root = std::filesystem::canonical(temporary.path());
+    {
+        ProcessLock lock(root);
+        Reject([&] { CommitOwnerArtifactIo writer(root, kScope, lock, false); });
+        assert(!std::filesystem::exists(root / kObjects));
+    }
+    const auto target = root / "target";
+    const auto alias = root / "alias";
+    std::filesystem::create_directory(target);
+    std::error_code error;
+    std::filesystem::create_directory_symlink(target, alias, error);
+    if (error) return;  // Symlink creation may be blocked by policy.
+    Reject([&] { ProcessLock pinned(alias, ProcessLock::PinRootForArtifacts{}); });
+    assert(!std::filesystem::exists(target / ".chunkdb.lock"));
+    std::filesystem::remove(alias);
 }
 }  // namespace
 
@@ -508,7 +528,7 @@ int main(int argc, char** argv) {
         Case{"pinned-root", PinnedRootReadAfterRename}, Case{"types", NativeTypeAndExtentAdmission},
         Case{"reparse", ReparseAdmission}, Case{"reuse", ReuseSettlesDurability},
         Case{"sync-failure", FileSyncFailureDoesNotPublish}, Case{"substitution", TemporaryGenerationSubstitution},
-        Case{"no-replace", PublicationDoesNotReplaceAnArrival}};
+        Case{"no-replace", PublicationDoesNotReplaceAnArrival}, Case{"explicit-pin", ExplicitRootPin}};
     if (argc == 3 && std::string_view(argv[1]) == "--case") {
         for (const auto& [name, run] : cases) if (name == argv[2]) { run(); return 0; }
         if (std::string_view(argv[2]) == "crash") { CrashBoundaries(std::filesystem::absolute(argv[0])); return 0; }

@@ -19,6 +19,12 @@ class ProcessLock {
   public:
     // Throws when another process holds the lock or it cannot be created.
     explicit ProcessLock(const std::filesystem::path& data_dir);
+    // For a writer that stages commit owner artifacts: also pins `data_dir`
+    // itself as a plain directory, not a symlink or reparse point. The pin is
+    // taken before the lock directory is created, so a refused root leaves no
+    // lock directory. Writers that do not stage artifacts do not take it.
+    struct PinRootForArtifacts {};
+    ProcessLock(const std::filesystem::path& data_dir, PinRootForArtifacts);
     ~ProcessLock();
 
     ProcessLock(const ProcessLock&) = delete;
@@ -27,6 +33,7 @@ class ProcessLock {
   private:
     friend class CommitOwnerArtifactIo;
     struct RootDirectoryOwner;
+    ProcessLock(const std::filesystem::path& data_dir, bool pin_root);
     [[nodiscard]] std::intptr_t NativeRootForArtifacts() const noexcept;
     [[nodiscard]] std::string BuildWriterMetadata() const;
     void WriteWriterMetadata();

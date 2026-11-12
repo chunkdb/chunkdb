@@ -402,15 +402,20 @@ std::intptr_t ProcessLock::NativeRootForArtifacts() const noexcept {
     return root_directory_ ? root_directory_->native : -1;
 }
 
-ProcessLock::ProcessLock(const std::filesystem::path& data_dir)
+ProcessLock::ProcessLock(const std::filesystem::path& data_dir) : ProcessLock(data_dir, false) {}
+
+ProcessLock::ProcessLock(const std::filesystem::path& data_dir, PinRootForArtifacts) : ProcessLock(data_dir, true) {}
+
+ProcessLock::ProcessLock(const std::filesystem::path& data_dir, bool pin_root)
     : data_dir_(std::filesystem::weakly_canonical(data_dir)) {
     lock_dir_ = data_dir_ / std::string(kProcessLockDirName);
     lock_file_path_ = lock_dir_ / "writer.lock";
     meta_path_ = lock_dir_ / "writer.meta";
     host_ = CurrentHostName();
 
+    // The path as given, so a symlinked root is refused rather than resolved.
+    if (pin_root) root_directory_ = std::make_unique<RootDirectoryOwner>(data_dir);
     EnsureProcessLockDirectory(lock_dir_);
-    root_directory_ = std::make_unique<RootDirectoryOwner>(data_dir_);
 
 #ifdef _WIN32
     OwnerOnlySecurity security(lock_file_path_);
