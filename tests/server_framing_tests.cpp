@@ -135,6 +135,34 @@ void RejectedOptionsDrainWithoutLosingFollowingFrames() {
     assert(pending.extract_line(&next, 1024U) && next == "PING\r\n");
 }
 
+// Returned credit wakes the owner once after each refused reservation, and
+// not when nothing was refused.
+void CreditReturnWakesOnlyAfterRefusal() {
+    std::size_t wakes = 0U;
+    auto pool = std::make_shared<ConnectionByteBudget>(4U, [&] { ++wakes; });
+    auto first = pool->TryAcquire(3U);
+    first.reset();
+    assert(wakes == 0U);
+    first = pool->TryAcquire(3U);
+    assert(first && !pool->TryAcquire(2U));
+    first.reset();
+    assert(wakes == 1U);
+    first = pool->TryAcquire(3U);
+    first.reset();
+    assert(wakes == 1U);
+    auto grown = pool->TryAcquire(3U);
+    auto other = pool->TryAcquire(1U);
+    assert(grown && other && !pool->TryResize(grown, 4U) && wakes == 1U);
+    assert(pool->TryResize(grown, 2U) && wakes == 2U);
+    assert(pool->TryResize(grown, 1U) && wakes == 2U);
+    assert(!pool->TryAcquire(3U));
+    assert(pool->TryResize(grown, 1U) && wakes == 2U);
+    grown.reset();
+    assert(wakes == 3U);
+    other.reset();
+    assert(wakes == 3U);
+}
+
 void AggregateCreditIsBoundedAndReturnedOnce() {
     std::atomic<std::size_t> returned{0U};
     auto data = std::make_shared<ConnectionByteBudget>(10U, [&] { ++returned; });
@@ -180,6 +208,7 @@ void AggregateCreditIsBoundedAndReturnedOnce() {
 }  // namespace
 
 int main() {
+    CreditReturnWakesOnlyAfterRefusal();
     FragmentedFramesKeepRequestBoundary();
     TruncatedInputStaysIncomplete();
     BodyBufferFollowsArrivedBytes();

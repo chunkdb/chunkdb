@@ -11,6 +11,7 @@ An I/O owner handles idle sockets, partial input, TLS handshakes, authentication
 A statement worker receives a fully framed request and returns the resulting output continuation.
 Buffered complete requests retain their worker while bounded input and output credit remains available.
 Ownership transfers publish state before waking the receiving owner.
+Returned credit wakes the I/O owner only after a refused reservation.
 The receiving owner drains wake notifications before scanning published state, so a coalesced wake cannot hide work.
 Descriptors stay registered until the closing owner has finished every outstanding operation.
 Queued work is discarded before execution on close; running pre-decision work accepts cancellation, while decision-entered work completes before teardown.
