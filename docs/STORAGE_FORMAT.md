@@ -30,6 +30,8 @@ data_dir/
   chunkdb.users                       user verifiers and grants, when authentication is configured
   chunkdb.migrations                  completed named migration records, when present
   chunkdb.migration.pending           decided migration awaiting completion, when present
+  chunkdb.groups.owner                commit owner root, initially INACTIVE
+  chunkdb.bootstrap.pending           creation decision, until creation completes
   .chunkdb.lock/                      writer-process lock
   .chunkdb.staging/                    table creation staging
   .chunkdb.dropped/                    tables renamed out of the catalog
@@ -196,6 +198,7 @@ Initial owner creation uses the bounded `chunkdb.bootstrap.pending` CKGB decisio
 The checked empty inventory and generation-one INACTIVE owner are durable before the manifest claims them; only then is the decision removed and its directory synced.
 The owner is a 512-byte CKGO root with no selected references or counter in this initial state.
 Read-only startup refuses pending bootstrap, and recovery never recreates an owner lost after its manifest was committed.
+A manifest or inventory temporary in a directory without a manifest or a decision refuses opening and is left in place.
 The exact owner and creation envelopes are specified in [owner format](design/COMMIT_GROUP_OWNER_FORMAT.md) and [bootstrap format](design/COMMIT_OWNER_BOOTSTRAP.md).
 An interrupted replay repeats these unions without restoring stale manifest images.
 
