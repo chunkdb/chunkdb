@@ -303,9 +303,10 @@ void CrashRequiredResurrection(const char* executable) {
 // Collection of an emptied chunk publishes its tombstone, then removes the
 // image and WAL. A crash at each step keeps every acknowledged write and the
 // emptied chunk's version; the old image never resurrects its data.
-constexpr std::array<const char*, 2U> kCollectionPoints{
+constexpr std::array<const char*, 3U> kCollectionPoints{
     "CHUNKDB_FAILPOINT_CRASH_INDEX_AFTER_LOG_SYNC_ONCE",
-    "CHUNKDB_FAILPOINT_CRASH_INDEX_AFTER_INVENTORY_PUBLISH_ONCE"};
+    "CHUNKDB_FAILPOINT_CRASH_INDEX_AFTER_INVENTORY_PUBLISH_ONCE",
+    "CHUNKDB_FAILPOINT_CRASH_EMPTY_GC_AFTER_TOMBSTONE_ONCE"};
 CatalogConfig CollectionConfig(const std::filesystem::path& root, std::string_view mode) {
     auto config = Config(root / "data");
     config.default_options.durability_mode = mode == "relaxed" ? DurabilityMode::kRelaxed : DurabilityMode::kFsyncWal;
