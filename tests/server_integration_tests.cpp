@@ -2588,6 +2588,59 @@ void TestRequestAtIdleDeadlineIsServed() {
     assert(client.ReadLine() == "+PONG\r\n");
 }
 
+// Holds a named migration after it is prepared, before its decision.
+class PreparedMigrationPause : public chunkdb::MigrationTestHook {
+  public:
+    void Run(Point point, std::string_view) override {
+        if (point != Point::kPrepared) return;
+        std::unique_lock lock(mutex_);
+        entered_ = true;
+        changed_.notify_all();
+        changed_.wait(lock, [&] { return released_; });
+    }
+    void Wait() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return entered_; }));
+    }
+    void Release() { { std::lock_guard lock(mutex_); released_ = true; } changed_.notify_all(); }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool entered_ = false, released_ = false;
+};
+
+// A statement that the waiting worker read is published to CANCEL: cancelled
+// before its decision, it applies nothing and the connection stays usable.
+void TestCancelStatementReadByWaitingWorker() {
+    WorkerIdleWaitHook hook;
+    PreparedMigrationPause pause;
+    ServerHarness harness("cancel-waiting-worker-read", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release {
+        ServerHarness& harness; PreparedMigrationPause& pause; WorkerIdleWaitHook& hook;
+        ~Release() { pause.Release(); hook.Release(); harness.catalog->SetMigrationTestHook(nullptr); }
+    } release{harness, pause, hook};
+    RawClient target("127.0.0.1", harness.port);
+    const auto id = HelloId(target);
+    RawClient controller("127.0.0.1", harness.port);
+    controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    target.SendLine("PING"); assert(target.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id);
+    harness.catalog->SetMigrationTestHook(&pause);
+    const auto queued = hook.Queued(id);
+    target.SendLine("MIGRATE 'add_light' ALTER TABLE default ADD COLUMN light u8 NULL");
+    pause.Wait();
+    assert(hook.Queued(id) == queued); // Read by the waiting worker, never queued.
+    controller.SendLine("CANCEL " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    pause.Release();
+    assert(target.ReadLine().starts_with("-ERR CANCELLED applied=false"));
+    harness.catalog->SetMigrationTestHook(nullptr);
+    target.SendLine("MIGRATE 'add_light' ALTER TABLE default ADD COLUMN light u8 NULL");
+    assert(target.ReadLine() == "+applied\r\n");
+}
+
 // Holds the only worker after it hands a connection back until the I/O
 // thread has been refused queue space again, so only the following pop can
 // tell it that space returned.
@@ -7225,6 +7278,7 @@ int main(int argc, char** argv) {
         run("TestKillInsideIdleWaitWindow", TestKillInsideIdleWaitWindow);
         run("TestStopInsideIdleWaitWindow", TestStopInsideIdleWaitWindow);
         run("TestRequestAtIdleDeadlineIsServed", TestRequestAtIdleDeadlineIsServed);
+        run("TestCancelStatementReadByWaitingWorker", TestCancelStatementReadByWaitingWorker);
         run("TestWaitingWorkerStatementTimesOut", TestWaitingWorkerStatementTimesOut);
         run("TestRefusedDispatchWakesAfterPop", TestRefusedDispatchWakesAfterPop);
         run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);
