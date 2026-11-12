@@ -3,9 +3,12 @@
 #include <cassert>
 #include <chrono>
 #include <future>
+#include <optional>
+#include <string>
 #include <string_view>
 
 #include "change_feed.hpp"
+#include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "test_utils.hpp"
 
@@ -336,6 +339,73 @@ void CohortCancellationAfterAdmission(bool busy) {
     catalog.SetMigrationTestHook(nullptr);
     for (const auto& entry : participants) assert(CatalogTxnTestAccess::ActiveLeases(*entry.table) == 0U);
 }
+// A background checkpoint writes a chunk's files without its lock. Snapshot
+// cohorts, table cohorts, snapshot block reads and area pages take admission
+// or read memory, so none of them waits for it. The image it serialized
+// under the lock keeps the variable value a write replaces meanwhile.
+void CohortsDuringBackgroundCheckpointFiles() {
+    test::ScopedTempDir directory("chunkdb-catalog-snapshot-checkpoint-files");
+    auto config = Config(directory.path());
+    config.background_maintenance = true;
+    config.default_options.checkpoint_update_interval = 1U;
+    const std::string replaced = "written while the checkpoint owns the files";
+    {
+        auto catalog = std::make_shared<TableCatalog>(config);
+        CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
+        SessionState writer, reader;
+        const auto run = [&](SessionState& session, const std::string& command) {
+            return engine.Execute(session, command + "\r\n");
+        };
+        assert(run(writer, "HELLO 3").starts_with("%") && run(reader, "HELLO 3").starts_with("%"));
+        assert(run(writer, "CREATE TABLE t (n u8 DEFAULT 0, s text(64) NULL) CHUNK 1 x 1") == "+OK\r\n");
+        assert(run(writer, "CREATE TABLE u (n u8 DEFAULT 0) CHUNK 1 x 1") == "+OK\r\n");
+        ChunkStore* store = nullptr;
+        {
+            auto lease = catalog->Require("t")->Acquire();
+            store = &lease->store();
+        }
+        assert(run(writer, "SET BLOCK 0 0 IN t n = 1, s = 'before'").starts_with(":"));
+        // Absorb the pending update, so the next write only makes a
+        // checkpoint due for a worker.
+        store->CheckpointForTests(0, 0);
+        store->ArmCheckpointBeforeWalRemovalPauseForTests();
+        assert(run(writer, "SET BLOCK 0 0 IN t n = 2, s = 'serialized under the lock'").starts_with(":"));
+        assert(store->WaitForCheckpointBeforeWalRemovalForTests());
+        auto write = std::async(std::launch::async, [&] {
+            return run(writer, "SET BLOCK 0 0 IN t n = 3, s = '" + replaced + "'");
+        });
+        const bool wrote = write.wait_for(10s) == std::future_status::ready;
+        const auto version = wrote ? std::stoull(write.get().substr(1U)) : 0U;
+        auto cohort = std::async(std::launch::async, [&] {
+            auto snapshots = catalog->CaptureTxnSnapshots(10s);
+            std::vector<CatalogTxnParticipant> participants;
+            std::optional<TxnBlockSnapshot> block;
+            for (const auto& captured : snapshots) {
+                participants.push_back({captured.table, captured.snapshot.get()});
+                if (captured.table->name() == "t")
+                    block.emplace(store->ReadBlockAtSnapshot(*captured.snapshot, ChunkCoord{0, 0}, 0U));
+            }
+            const auto leases = catalog->AcquireTxnTables(participants, 10s);
+            return block && block->written && block->row.present && block->version == version &&
+                leases.size() == 2U;
+        });
+        const bool admitted = cohort.wait_for(10s) == std::future_status::ready;
+        auto page = std::async(std::launch::async, [&] { return run(reader, "GET AREA 0 0 TO 1 0 FROM t LIMIT 1"); });
+        const bool paged = page.wait_for(10s) == std::future_status::ready;
+        store->ResumeCheckpointBeforeWalRemovalForTests();
+        assert(wrote && admitted && paged);
+        assert(cohort.get());
+        const auto reply = page.get();
+        assert(reply.starts_with("%") && reply.find(replaced) != std::string::npos);
+        catalog->WalBarrier();
+    }
+    config.background_maintenance = false;
+    auto catalog = std::make_shared<TableCatalog>(config);
+    CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
+    SessionState session;
+    assert(engine.Execute(session, "HELLO 3\r\n").starts_with("%"));
+    assert(engine.Execute(session, "GET BLOCK 0 0 FROM t\r\n").find(replaced) != std::string::npos);
+}
 }  // namespace
 
 int main() {
@@ -350,4 +420,5 @@ int main() {
     CohortWaitsAndRefusals();
     CohortCancellationAfterAdmission(true);
     CohortCancellationAfterAdmission(false);
+    CohortsDuringBackgroundCheckpointFiles();
 }
