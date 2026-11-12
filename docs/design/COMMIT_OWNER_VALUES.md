@@ -139,4 +139,5 @@ Tests cover golden layouts, both dimensions and negative coordinates, every trun
 They distinguish observed from changed producers, zero from nonzero observations, retained from forgotten state, selected from merely present counters and every owner class.
 Valid different same-length source records exercise raw digest and exact incarnation checks independently of checksum refusal.
 Sparse oversized headers and allocation guards verify admission before complete-body allocation.
+Every accepted single-byte change of each golden value re-encodes to exactly the accepted bytes.
 Every targeted omitted production safeguard must compile and fail its regression assertion, followed by an independently rebuilt restored positive.
