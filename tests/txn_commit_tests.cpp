@@ -26,6 +26,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_test_utils.hpp"
 #include "txn_history.hpp"
 #include "store_manifest.hpp"
 #include "txn_test_utils.hpp"
@@ -723,16 +724,19 @@ void TestIntentsOnDisk() {
     auto config = Config(table_dir);
     config.checkpoint_update_interval = 1000;
     config.checkpoint_wal_bytes = 1U << 20U;
+    // The catalog creates the table and owns every later open of it.
+    auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(config);
+    catalog_config.data_dir = root.path();
     {
-        auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(config);
-        catalog_config.data_dir = root.path();
         chunkdb::TableCatalog catalog(catalog_config);
+        (void)chunkdb::test::CreateBitsTable(catalog, config.geometry);
     }
     std::uintmax_t boundary_a = 0;
     std::filesystem::path wal_a;
     std::filesystem::path wal_c;
     {
-        ChunkStore store(config);
+        chunkdb::test::OwnedTableStore owner(catalog_config, "default");
+        auto& store = owner.store();
         WriteCounter(store, kA, 1);
         wal_a = WalOf(store, kA);
         wal_c = WalOf(store, kC);
@@ -740,7 +744,8 @@ void TestIntentsOnDisk() {
     }
     {
         // What a commit that crashed before its commit point leaves.
-        ChunkStore store(config);
+        chunkdb::test::OwnedTableStore owner(catalog_config, "default");
+        auto& store = owner.store();
         WriteCounter(store, kA, 10);
         WriteCounter(store, kC, 30);
     }
@@ -755,7 +760,7 @@ void TestIntentsOnDisk() {
         },
     };
     const auto read_only = [&] {
-        auto read_config = config;
+        auto read_config = catalog_config;
         read_config.access_mode = chunkdb::AccessMode::kReadOnly;
         return read_config;
     };
@@ -765,7 +770,8 @@ void TestIntentsOnDisk() {
     intent.entries.push_back({.coord = kD, .wal_boundary = 77});
     WriteFile(intent_path, chunkdb::SerializeTxnIntent(intent, config.geometry.dims, table_id));
     {
-        ChunkStore reader(read_only());
+        chunkdb::test::OwnedTableStore owner(read_only(), "default");
+        auto& reader = owner.store();
         assert(ReadCounter(reader, kA) == 10U && ReadCounter(reader, kC) == 30U);
         const auto area = reader.ReadChunkRange(0, 0, 3, 0);
         assert(area.size() == 2U);
@@ -777,7 +783,8 @@ void TestIntentsOnDisk() {
     WriteFile(intent_path, chunkdb::SerializeTxnIntent(intent, config.geometry.dims, table_id));
     const auto wal_bytes = FileSizeOr(wal_a, 0);
     {
-        ChunkStore reader(read_only());
+        chunkdb::test::OwnedTableStore owner(read_only(), "default");
+        auto& reader = owner.store();
         assert(ReadCounter(reader, kA) == 1U && ReadCounter(reader, kC) == 0U);
         assert(reader.ReadChunkRange(0, 0, 3, 0).size() == 1U);
     }
@@ -792,7 +799,7 @@ void TestIntentsOnDisk() {
         if (defect == 1U) invalid.entries.back().wal_boundary = FileSizeOr(wal_c, 0) + 1U;
         if (defect == 2U) invalid.entries.back().wal_boundary = 1U;
         WriteFile(intent_path, chunkdb::SerializeTxnIntent(invalid, config.geometry.dims, table_id));
-        assert(Throws([&] { ChunkStore writer(config); }));
+        assert(Throws([&] { chunkdb::test::OwnedTableStore writer(catalog_config, "default"); }));
         assert(FileSizeOr(wal_a, 0) == wal_bytes);
         assert(std::filesystem::exists(wal_c) && std::filesystem::exists(intent_path));
     }
@@ -804,7 +811,7 @@ void TestIntentsOnDisk() {
         const auto damaged_path = chunkdb::TxnIntentPath(table_dir, 1000);
         WriteFile(damaged_path, damaged);
         assert(VerifyOutput(root.path()).find("txn_intent_invalid") != std::string::npos);
-        assert(Throws([&] { ChunkStore writer(config); }));
+        assert(Throws([&] { chunkdb::test::OwnedTableStore writer(catalog_config, "default"); }));
         std::filesystem::remove(damaged_path);
     }
     // A writer's open truncates, removes the intent and the temporary files
@@ -812,7 +819,8 @@ void TestIntentsOnDisk() {
     const auto stale = table_dir / ".chunkdb.intents" / "txn-1001.rollback.tmp.2147483000.1.2.3";
     WriteFile(stale, {1, 2, 3});
     {
-        ChunkStore writer(config);
+        chunkdb::test::OwnedTableStore owner(catalog_config, "default");
+        auto& writer = owner.store();
         assert(!std::filesystem::exists(intent_path));
         assert(!std::filesystem::exists(stale));
         assert(ReadCounter(writer, kA) == 1U && ReadCounter(writer, kC) == 0U);
@@ -820,7 +828,8 @@ void TestIntentsOnDisk() {
         assert(FileSizeOr(wal_a, 0) == boundary_a);
         (void)Transfer(writer, kA, kB, 1);
     }
-    ChunkStore again(config);
+    chunkdb::test::OwnedTableStore again_owner(catalog_config, "default");
+    auto& again = again_owner.store();
     assert(ReadCounter(again, kA) == 0U && ReadCounter(again, kB) == 1U);
     const auto output = VerifyOutput(root.path());
     assert(output.find("txn_") == std::string::npos);
