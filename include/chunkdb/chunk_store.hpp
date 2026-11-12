@@ -275,7 +275,7 @@ struct StoreConfig {
     std::optional<TableSchema> chunk_schema = std::nullopt;
     QueryLimits query_limits{};
     // Opaque catalog admission; never a caller-supplied scope value.
-    std::shared_ptr<const CommitOwnerContext> commit_owner_context;
+    std::shared_ptr<const CommitOwnerContext> commit_owner_context{};
     // Borrowed only during fresh standalone initialization when locking is delegated.
     const ProcessLock* bootstrap_process_lock = nullptr;
 };
