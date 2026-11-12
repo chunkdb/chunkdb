@@ -3,11 +3,17 @@ name: Parser fuzz smoke
 on:
   pull_request:
     branches: [main]
+    # A change to documentation only does not run this workflow.
+    paths-ignore: ["docs/**", "**.md", "bench/artifacts/**"]
   push:
     branches: [main]
 
 permissions:
   contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
 
 jobs:
   parser-fuzz:

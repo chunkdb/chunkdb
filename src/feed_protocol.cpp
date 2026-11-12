@@ -190,15 +190,7 @@ std::shared_ptr<const FeedEntry> ChunkFeedEntry(const std::shared_ptr<const Feed
     result->chunk_columns = entry->chunk_columns;
     const auto& layout = geometry.LayoutAt(entry->schema_version);
     std::vector<std::size_t> selected;
-    if (ids) for (const auto id : *ids) {
-        const auto& columns = layout.schema().columns;
-        const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
-        if (at == columns.end()) throw FeedSlotLostError("feed projected column was dropped", "schema_filter");
-        const auto index = static_cast<std::size_t>(at - columns.begin());
-        if (std::find(selected.begin(), selected.end(), index) != selected.end())
-            throw std::invalid_argument("duplicate feed projection column");
-        selected.push_back(index);
-    }
+    if (ids) selected = FeedProjectionIndexes(layout.schema().columns, *ids);
     std::optional<Geometry> historical;
     for (auto chunk : entry->chunk_forms) {
         ValidateCoord(chunk.chunk, entry->dims);
@@ -241,14 +233,7 @@ std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const Fee
             return InArea(change.chunk, entry->dims, area);
         })) return entry->blocks.empty() && entry->chunk_changes.empty() ? nullptr : entry;
     std::vector<std::size_t> selected;
-    if (ids) for (const auto id : *ids) {
-        const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
-        if (at == columns.end()) throw FeedSlotLostError("feed projected column was dropped", "schema_filter");
-        const auto index = static_cast<std::size_t>(at - columns.begin());
-        if (std::find(selected.begin(), selected.end(), index) != selected.end())
-            throw std::invalid_argument("duplicate feed projection column");
-        selected.push_back(index);
-    }
+    if (ids) selected = FeedProjectionIndexes(columns, *ids);
     auto filtered = std::make_shared<FeedEntry>(*entry);
     filtered->protocol_frame.reset();
     if (entry->kind == FeedEntry::Kind::kSchema) {
@@ -391,6 +376,45 @@ std::size_t FeedRowRetainedBytes(const std::optional<std::vector<ColumnValue>>& 
         }, value));
     }
     return bytes.total;
+}
+
+std::size_t FeedRowMinimumEncodedBytes(const std::optional<std::vector<ColumnValue>>& row) {
+    // Each RESP element takes at least three bytes; bulk values add their bytes and framing.
+    if (!row) return 3U;
+    std::size_t bytes = 4U;
+    for (const auto& value : *row) bytes += std::visit([](const auto& v) -> std::size_t {
+        using T = std::decay_t<decltype(v)>;
+        if constexpr (std::is_same_v<T, std::string>) return v.size() + 5U;
+        else if constexpr (std::is_same_v<T, BitsValue>) return (v.digits.size() + 7U) / 8U + 5U;
+        else if constexpr (std::is_same_v<T, BytesValue>) return v.bytes.size() + 5U;
+        else return 3U;
+    }, value);
+    return bytes;
+}
+std::size_t FeedChangeItemMinimumEncodedBytes(std::uint8_t dims,
+    const std::optional<std::vector<ColumnValue>>& before, const std::optional<std::vector<ColumnValue>>& after) {
+    return 4U + 4U * static_cast<std::size_t>(dims) + FeedRowMinimumEncodedBytes(before) + FeedRowMinimumEncodedBytes(after);
+}
+std::size_t FeedChunkFormMinimumEncodedBytes(std::uint8_t dims, const std::shared_ptr<const std::string>& form) {
+    // The array header, the coordinates and version, then the form as a bulk string or a null.
+    return 4U + 3U * (static_cast<std::size_t>(dims) + 1U) + (form ? form->size() + 5U : 3U);
+}
+bool FeedAreaHolds(const std::optional<FeedArea>& area, std::uint8_t dims, ChunkCoord coord) {
+    return InArea(coord, dims, area);
+}
+std::vector<std::size_t> FeedProjectionIndexes(const std::vector<Column>& columns, const std::vector<std::uint32_t>& ids) {
+    if (ids.empty()) throw std::invalid_argument("feed projection must not be empty");
+    std::vector<std::size_t> selected;
+    selected.reserve(ids.size());
+    for (const auto id : ids) {
+        const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
+        if (at == columns.end()) throw FeedSlotLostError("feed projected column was dropped", "schema_filter");
+        const auto index = static_cast<std::size_t>(at - columns.begin());
+        if (std::find(selected.begin(), selected.end(), index) != selected.end())
+            throw std::invalid_argument("duplicate feed projection column");
+        selected.push_back(index);
+    }
+    return selected;
 }
 
 std::size_t FeedEntryRetainedBytes(const FeedEntry& entry) {

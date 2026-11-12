@@ -11,6 +11,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <type_traits>
 #include <variant>
 #include <vector>
 
@@ -322,6 +323,12 @@ FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement
     return filters;
 }
 
+// OWNER, else the user running CREATE SLOT; none without authentication.
+std::optional<std::string> SlotOwner(const cql::CreateSlot& create, bool require_auth, const std::string& user) {
+    if (create.owner) return create.owner;
+    return require_auth ? std::optional<std::string>(user) : std::nullopt;
+}
+
 // A column of CREATE TABLE or ADD COLUMN; `id` is replaced by AddColumn.
 [[nodiscard]] Column ColumnFrom(const cql::ColumnDefinition& definition, std::uint32_t id) {
     Column column;
@@ -333,6 +340,8 @@ FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement
     if (!definition.default_value.has_value()) {
         return column;
     }
+    // Before the default is read and encoded for the type.
+    ValidateColumnType(column);
     const ColumnValue value = LiteralValue(column, *definition.default_value);
     if (std::holds_alternative<std::monostate>(value)) {
         // A NULL column without a DEFAULT takes NULL.
@@ -441,7 +450,7 @@ FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement
     return "?";
 }
 
-// The most bytes of a verifier sent as a parameter.
+// The most bytes of a verifier, sent as a parameter or a text literal.
 constexpr std::size_t kMaxVerifierBytes = 512;
 
 // The verifier of CREATE USER or ALTER USER: a parameter frame or a text
@@ -456,7 +465,11 @@ constexpr std::size_t kMaxVerifierBytes = 512;
         }
         return scram::ParseVerifier(*frame);
     }
-    return scram::ParseVerifier(std::get<cql::Text>(value).value);
+    const auto& text = std::get<cql::Text>(value).value;
+    if (text.size() > kMaxVerifierBytes) {
+        throw std::invalid_argument("a verifier has at most " + std::to_string(kMaxVerifierBytes) + " bytes");
+    }
+    return scram::ParseVerifier(text);
 }
 
 [[nodiscard]] std::string VersionReply(const ChunkMutationResult& result) {
@@ -513,6 +526,22 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
         (state.chunk_columns ? state.chunk_columns->bytes.size() : 0U);
 }
 
+// The fewest StateBytes of the state `form` decodes to: the chunk's payload
+// and presence, and for a full form its values and metadata row as well. A
+// projected form's values merge with the chunk's, so they are not counted.
+[[nodiscard]] std::size_t DecodedStateBytesAtLeast(
+    const Geometry& geometry, const ChunkFormSections& form, bool projected) {
+    std::size_t bytes = geometry.ChunkPayloadBytes() + ChunkPresenceBitmapBytes(geometry);
+    if (projected) return bytes;
+    for (const auto& section : form.sections) {
+        if (section.kind == static_cast<std::uint16_t>(ChunkFormSectionKind::kVariableValues) ||
+            (section.kind == static_cast<std::uint16_t>(ChunkFormSectionKind::kChunkColumns) &&
+                !geometry.chunk_schema().columns.empty()))
+            bytes += section.body.size();
+    }
+    return bytes;
+}
+
 }  // namespace
 
 const User* CommandEngine::CurrentUser(SessionState& session) const {
@@ -520,11 +549,13 @@ const User* CommandEngine::CurrentUser(SessionState& session) const {
         return nullptr;
     }
     // One atomic read while nothing changed; a changed or dropped user is
-    // read again.
+    // read again. Another incarnation is another user: one dropped and
+    // created again under the same name gives this session nothing.
     const std::uint64_t generation = config_.users->Generation();
     if (session.user_generation != generation) {
-        auto found = config_.users->Find(session.user);
-        session.user_rights = found.has_value() ? std::make_shared<const User>(std::move(*found)) : nullptr;
+        auto found = config_.users->FindIncarnation(session.user);
+        session.user_rights = found.has_value() && found->incarnation == session.user_incarnation
+            ? std::make_shared<const User>(std::move(found->user)) : nullptr;
         session.user_generation = generation;
     }
     return session.user_rights.get();
@@ -626,6 +657,9 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
 }
 
 TableDefinition DefinitionFrom(const cql::CreateTable& create, const TableOptions& defaults) {
+    if (create.columns.size() > kMaxColumnsPerTable) {
+        throw std::invalid_argument("a table has at most " + std::to_string(kMaxColumnsPerTable) + " columns");
+    }
     TableSchema schema{
         .version = 1,
         .next_column_id = static_cast<std::uint32_t>(create.columns.size() + 1U),
@@ -655,7 +689,44 @@ bool HasColumn(const TableSchema& schema, std::string_view name) {
     return std::any_of(schema.columns.begin(), schema.columns.end(),
                        [name](const Column& column) { return column.name == name; });
 }
+
+// A recorded migration belongs to what its statement changes: ADMIN on the
+// table it names, or MANAGES USERS for GRANT and REVOKE. Only a caller with
+// that right sees the record or learns whether its name skips or conflicts.
+// A recorded statement that no longer parses needs ADMIN on `*`.
+bool MayReplayMigration(bool require_auth, const User* user, const MigrationRecord& record) {
+    if (!require_auth) return true;
+    if (user == nullptr) return false;
+    cql::Parsed parsed;
+    try {
+        parsed = cql::Parse(record.statement);
+    } catch (const cql::ParseError&) {
+        const auto right = RightOn(*user, std::string(kEveryTable));
+        return right.has_value() && *right >= Right::kAdmin;
+    }
+    if (std::holds_alternative<cql::GrantRight>(parsed.statement)) return user->manages_users;
+    const auto table = std::visit([](const auto& inner) -> std::string {
+        using T = std::decay_t<decltype(inner)>;
+        if constexpr (std::is_same_v<T, cql::CreateTable> || std::is_same_v<T, cql::AlterTable> || std::is_same_v<T, cql::DropTable> ||
+                      std::is_same_v<T, cql::CreateSlot> || std::is_same_v<T, cql::DropSlot>)
+            return inner.table;
+        return {};
+    }, parsed.statement);
+    const auto right = table.empty() ? std::nullopt : RightOn(*user, table);
+    return right.has_value() && *right >= Right::kAdmin;
+}
+
 }  // namespace
+
+void CommandEngine::DescribeLine(std::string_view line, StatementLogInfo& info) {
+    cql::Parsed parsed;
+    try {
+        parsed = cql::Parse(StatementOf(line));
+    } catch (const cql::ParseError&) {
+        return;  // As in ExecuteStatement: a statement that does not parse is not logged.
+    }
+    DescribeStatement(parsed.statement, info);
+}
 
 void CommandEngine::RequireRight(SessionState& session, const std::string& table, Right needed) const {
     const auto right = RightOnTable(session, table);
@@ -725,6 +796,9 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
         request.reject_response = std::move(response);
         return request;
     };
+    // A session without its user drains the frames and closes, as Execute
+    // answers it.
+    if (std::string lost = LostUserReply(session); !lost.empty()) return reject(std::move(lost));
     cql::Parsed parsed;
     try {
         parsed = cql::Parse(StatementOf(line));
@@ -942,31 +1016,58 @@ std::string CommandEngine::ExecuteStatement(
                             request.kind = MigrationRequest::Kind::kCreateSlot; request.table = slot.table; request.slot = slot.name; request.if_not_exists = slot.if_not_exists;
                             request.slot_filters = {.area = slot.area, .no_before = slot.no_before, .chunks = slot.chunks};
                             request.slot_columns = slot.columns;
+                            request.slot_owner = SlotOwner(slot, config_.require_auth, session.user);
+                            request.slot_owner_given = slot.owner.has_value();
                         },
                         [&](const cql::DropSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
                             request.kind = MigrationRequest::Kind::kDropSlot; request.table = slot.table; request.slot = slot.name; request.if_exists = slot.if_exists;
                         }
                     }, migration.statement);
+                    // The rights just checked, so the lookup reads no user state.
+                    (void)CurrentUser(session);
+                    request.require_recorded_access = [require_auth = config_.require_auth, user = session.user_rights](const MigrationRecord& record) {
+                        if (!MayReplayMigration(require_auth, user.get(), record))
+                            throw PermissionDeniedError("migration name '" + record.name + "' is recorded for a change outside your rights");
+                    };
                     return Protocol::SimpleString(catalog_->Migrate(request, config_.users.get()) ? "applied" : "skipped");
                 },
                 [&](const cql::ShowMigrations&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
-                    if (config_.require_auth) RequireManagesUsers(session);
-                    const auto records = catalog_->Migrations();
+                    const User* user = CurrentUser(session);
+                    // Without MANAGES USERS or an ADMIN grant no record is within the
+                    // caller's rights: the ledger is not read.
+                    if (config_.require_auth && (user == nullptr || (!user->manages_users &&
+                            std::none_of(user->grants.begin(), user->grants.end(), [](const auto& grant) { return grant.second >= Right::kAdmin; })))) {
+                        std::string empty;
+                        Protocol::AppendArrayHeader(empty, 0U);
+                        return empty;
+                    }
+                    std::vector<MigrationRecord> records;
+                    for (auto& record : catalog_->Migrations())
+                        if (MayReplayMigration(config_.require_auth, user, record)) records.push_back(std::move(record));
+                    // Who applied a record is user information: MANAGES USERS shows it.
+                    const bool show_user = !config_.require_auth || user->manages_users;
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, records.size());
                     for (const auto& record : records) {
                         Protocol::AppendMapHeader(reply, 4);
                         Protocol::AppendBulk(reply, "name"); Protocol::AppendBulk(reply, record.name);
                         Protocol::AppendBulk(reply, "applied_ms"); Protocol::AppendInteger(reply, record.applied_ms);
-                        Protocol::AppendBulk(reply, "user"); Protocol::AppendBulk(reply, record.user);
+                        Protocol::AppendBulk(reply, "user");
+                        if (show_user) Protocol::AppendBulk(reply, record.user);
+                        else Protocol::AppendNull(reply);
                         Protocol::AppendBulk(reply, "statement"); Protocol::AppendBulk(reply, record.statement);
                     }
                     return reply;
                 },
                 [&](const cql::Watch& watch) {
                     RequireRight(session, watch.table, Right::kRead);
+                    // The feed ends the watch once the right or user is gone,
+                    // checking from the generation READ was confirmed at. Set
+                    // before subscribing: no watch exists without its check.
+                    session.watch_right = config_.require_auth ? std::make_shared<ReadRightCheck>(config_.users,
+                        session.user, session.user_incarnation, watch.table, session.user_generation) : nullptr;
                     auto table = catalog_->Require(watch.table);
                     const auto filters = SlotFilters(table, watch);
                     FeedOptions options{
@@ -982,6 +1083,8 @@ std::string CommandEngine::ExecuteStatement(
                     };
                     if (watch.slot) {
                         const auto* user = config_.require_auth ? CurrentUser(session) : nullptr;
+                        // A user dropped since the right check must not become an owner.
+                        if (config_.require_auth && !user) throw UserDroppedError();
                         const bool admin_all = !config_.require_auth || (user && user->grants.contains(kEveryTable) &&
                             user->grants.at(kEveryTable) >= Right::kAdmin);
                         auto state = SlotWatch::Create(table, *watch.slot, options, watch.takeover,
@@ -991,6 +1094,11 @@ std::string CommandEngine::ExecuteStatement(
                             });
                         if (session.register_slot_watch && !session.register_slot_watch(state))
                             return Protocol::Error("BUSY", "maximum slot catch-up workers reached", {{"reason", "slot_worker_limit"}, {"table", watch.table}});
+                        // A slot without an owner takes the user of its first
+                        // granted attach; one by ADMIN on * records nobody.
+                        if (config_.require_auth && !admin_all && !state->owner()) state->BindOwner(session.user);
+                        // A watch that ADMIN on * allows ends once that right is gone.
+                        if (session.watch_right && state->owner() != session.user) session.watch_right->RequireEveryTableAdmin();
                         session.slot_watch = std::move(state);
                     } else session.watch = table->SubscribeFeed(options);
                     session.table = std::move(table);
@@ -1009,7 +1117,8 @@ std::string CommandEngine::ExecuteStatement(
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, create.table, Right::kAdmin);
                     const auto table = catalog_->Require(create.table);
-                    (void)table->CreateFeedSlot(create.name, create.if_not_exists, SlotFilters(table, create));
+                    (void)table->CreateFeedSlot(create.name, create.if_not_exists, SlotFilters(table, create),
+                        SlotOwner(create, config_.require_auth, session.user), create.owner.has_value());
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::DropSlot& drop) {
@@ -1048,9 +1157,12 @@ std::string CommandEngine::ExecuteStatement(
                         }
                     }
                     std::string reply;
+                    // An owner is user information: the owner itself or MANAGES USERS sees it.
+                    const auto* viewer = CurrentUser(session);
+                    const bool show_owners = !config_.require_auth || (viewer != nullptr && viewer->manages_users);
                     Protocol::AppendArrayHeader(reply, slots.size());
                     for (const auto& [name, slot] : slots) {
-                        Protocol::AppendMapHeader(reply, 8);
+                        Protocol::AppendMapHeader(reply, 9);
                         Protocol::AppendBulk(reply, "table");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "name");
@@ -1092,6 +1204,9 @@ std::string CommandEngine::ExecuteStatement(
                         } else Protocol::AppendNull(reply);
                         Protocol::AppendBulk(reply, "no_before"); reply += slot.filters.no_before ? "#t\r\n" : "#f\r\n";
                         Protocol::AppendBulk(reply, "chunks"); reply += slot.filters.chunks ? "#t\r\n" : "#f\r\n";
+                        Protocol::AppendBulk(reply, "owner");
+                        if (slot.owner && (show_owners || (viewer != nullptr && *slot.owner == session.user))) Protocol::AppendBulk(reply, *slot.owner);
+                        else Protocol::AppendNull(reply);
                     }
                     return reply;
                 },
@@ -1289,8 +1404,8 @@ std::string CommandEngine::ExecuteStatement(
                     const auto columns = ColumnsOf(geometry.layout(), set.columns);
                     const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(frame->data()), frame->size());
                     const auto limit = ChunkFormBytes(geometry, !columns.empty());
-                    const auto header = ParseChunkFormSections(bytes, limit, ChunkFormReadMode::kMutation).header;
-                    const std::uint64_t encoded_for = header.schema_version;
+                    const auto form = ParseChunkFormSections(bytes, limit, ChunkFormReadMode::kMutation);
+                    const std::uint64_t encoded_for = form.header.schema_version;
                     const std::uint64_t current = geometry.layout().schema().version;
                     if (encoded_for != current) {
                         return Protocol::Error(
@@ -1299,18 +1414,24 @@ std::string CommandEngine::ExecuteStatement(
                                 "; use DESCRIBE " + set.table + " and encode the chunk again with the current columns",
                             {{"current", std::to_string(current)}, {"actual", std::to_string(encoded_for)}, {"table", set.table}});
                     }
-                    const auto next = DecodeSectionedChunkState(geometry, bytes, kVarMaxChunkBytesLimit, columns, limit);
+                    if (session.transaction != nullptr) {
+                        // The transaction's limits are checked by the fewest
+                        // bytes the decoded state takes, before the form is
+                        // decoded or the chunk is read.
+                        RequireTxnRoom(*session.transaction, coord, DecodedStateBytesAtLeast(geometry, form, !columns.empty()));
+                    }
+                    auto next = DecodeSectionedChunkState(geometry, bytes, kVarMaxChunkBytesLimit, columns, limit);
                     if (!columns.empty()) return change([&](ChunkState& state) {
                         if (!state.written && geometry.chunk_columns_require_initialization())
                             throw std::invalid_argument("a first write must supply the REQUIRED chunk columns");
                         state = MergeProjectedChunkState(geometry, state, next, columns, store.var_max_chunk_bytes());
                     });
                     if (session.transaction == nullptr)
-                        return VersionReply(store.WriteChunkState(coord, next, set.if_version, set.if_absent));
+                        return VersionReply(store.WriteChunkState(coord, std::move(next), set.if_version, set.if_absent));
                     return change([&](ChunkState& state) {
                         const auto version = state.version;
                         const auto time = state.commit_time_ms;
-                        state = next;
+                        state = std::move(next);
                         state.version = version;
                         state.commit_time_ms = time;
                     });
@@ -1578,6 +1699,7 @@ std::string CommandEngine::ExecuteStatement(
                     const auto target = ResolveBackupTarget(config_.backup_dir, backup.path);
                     BackupOptions options;
                     options.cancelled = session.backup_cancelled;
+                    options.backup_directory = config_.backup_dir;
                     std::string reply;
                     options.before_publish = [&](const BackupResult& result) {
                         Protocol::AppendMapHeader(reply, 4);
@@ -1684,21 +1806,32 @@ std::string CommandEngine::ExecuteStatement(
                     RequireManagesUsers(session);
                     if (create.if_not_exists)
                         config_.users->Create(create.user, [&] { return VerifierFrom(create.verifier, parameters); },
-                                              create.manages_users, true);
-                    else config_.users->Create(create.user, VerifierFrom(create.verifier, parameters), create.manages_users);
+                                              create.manages_users, true, create.requires_channel_binding);
+                    else config_.users->Create(create.user, VerifierFrom(create.verifier, parameters), create.manages_users,
+                                               false, create.requires_channel_binding);
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::AlterUser& alter) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     if (alter.verifier.has_value()) {
-                        // A user may change their own password.
-                        if (!(config_.require_auth && alter.user == session.user)) {
-                            RequireManagesUsers(session);
+                        // A user may change their own password: the incarnation
+                        // it logged in as, not a user created again under its name.
+                        if (config_.require_auth && alter.user == session.user) {
+                            if (!config_.users->SetOwnVerifier(alter.user, session.user_incarnation,
+                                    VerifierFrom(*alter.verifier, parameters))) {
+                                session.close_after_reply = true;
+                                throw UserDroppedError();
+                            }
+                            return Protocol::SimpleString("OK");
                         }
+                        RequireManagesUsers(session);
                         if (config_.users == nullptr) {
                             throw std::invalid_argument("this server runs without users (--auth none)");
                         }
                         config_.users->SetVerifier(alter.user, VerifierFrom(*alter.verifier, parameters));
+                    } else if (alter.requires_channel_binding.has_value()) {
+                        RequireManagesUsers(session);
+                        config_.users->SetRequiresChannelBinding(alter.user, *alter.requires_channel_binding);
                     } else {
                         RequireManagesUsers(session);
                         config_.users->SetManagesUsers(alter.user, *alter.manages_users);
@@ -1728,11 +1861,13 @@ std::string CommandEngine::ExecuteStatement(
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, users.users.size());
                     for (const auto& [name, user] : users.users) {
-                        Protocol::AppendMapHeader(reply, 3);
+                        Protocol::AppendMapHeader(reply, 4);
                         Protocol::AppendBulk(reply, "name");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "manages_users");
                         Protocol::AppendBoolean(reply, user.manages_users);
+                        Protocol::AppendBulk(reply, "requires_channel_binding");
+                        Protocol::AppendBoolean(reply, user.requires_channel_binding);
                         Protocol::AppendBulk(reply, "grants");
                         Protocol::AppendMapHeader(reply, user.grants.size());
                         for (const auto& [table, right] : user.grants) {
@@ -1807,11 +1942,85 @@ std::string CommandEngine::ExecuteStatement(
 }
 
 
+SessionTransaction::SessionTransaction(TxnBudget* budget, std::chrono::steady_clock::time_point started)
+    : budget(budget), started(started) {
+    std::lock_guard lock(budget->mutex);
+    entry = budget->open.insert(budget->open.end(), this);
+}
+
+SessionTransaction::~SessionTransaction() {
+    std::lock_guard lock(budget->mutex);
+    budget->open.erase(entry);
+    budget->bytes.fetch_sub(bytes);
+}
+
+TransactionConflictError CommandEngine::TxnDurationConflict() const {
+    return TransactionConflictError(
+        TxnConflictReason::kDuration,
+        "the transaction ran longer than " + std::to_string(config_.txn_max_duration.count()) + " ms");
+}
+
+bool CommandEngine::TxnPastDuration(const SessionTransaction& txn, std::chrono::steady_clock::time_point now) const {
+    return std::chrono::duration_cast<std::chrono::milliseconds>(now - txn.started) >= config_.txn_max_duration;
+}
+
+bool CommandEngine::TxnHoldsBudget(const SessionTransaction& txn) {
+    // Without a snapshot it holds nothing: its next table statement or
+    // COMMIT checks the duration.
+    return txn.snapshot != nullptr && !txn.aborted.has_value();
+}
+
+bool CommandEngine::TxnStatementStart(SessionState& session) {
+    SessionTransaction* const txn = session.transaction.get();
+    if (txn == nullptr) {
+        return false;
+    }
+    const bool expired = TxnPastDuration(*txn, std::chrono::steady_clock::now());
+    std::string reply = expired ? ErrorReply(TxnDurationConflict()) : std::string{};
+    // Destroyed after the mutex is released.
+    SessionTransaction::Released released;
+    // Ended under the mutex, like EndExpiredTransactions, so a write that
+    // finds the budget full sees the bytes released once it holds it.
+    std::lock_guard lock(txn_budget_.mutex);
+    if (expired && TxnHoldsBudget(*txn)) {
+        released = txn->Detach(std::move(reply));
+    }
+    txn->in_statement = true;
+    return true;
+}
+
+void CommandEngine::TxnStatementDone(SessionState& session, bool started) noexcept {
+    // COMMIT and ROLLBACK destroy the transaction, which unregisters it.
+    if (!started || session.transaction == nullptr) {
+        return;
+    }
+    std::lock_guard lock(txn_budget_.mutex);
+    session.transaction->in_statement = false;
+}
+
+void CommandEngine::EndExpiredTransactions() {
+    const auto now = std::chrono::steady_clock::now();
+    const std::string reply = ErrorReply(TxnDurationConflict());
+    // The snapshots and private copies of the ended transactions, destroyed
+    // after the mutex is released.
+    std::vector<SessionTransaction::Released> released;
+    // While this holds the mutex no session starts a statement on its
+    // transaction or destroys it.
+    std::lock_guard lock(txn_budget_.mutex);
+    for (SessionTransaction* txn : txn_budget_.open) {
+        // A statement using the transaction changes it without the mutex:
+        // check `in_statement` first.
+        if (!txn->in_statement && TxnHoldsBudget(*txn) && TxnPastDuration(*txn, now)) {
+            released.push_back(txn->Detach(reply));
+        }
+    }
+}
+
 std::string CommandEngine::TxnBegin(SessionState& session) {
     if (session.transaction != nullptr) {
         throw std::invalid_argument("a transaction is already open; COMMIT or ROLLBACK it first");
     }
-    session.transaction = std::make_unique<SessionTransaction>(&txn_total_bytes_, std::chrono::steady_clock::now());
+    session.transaction = std::make_unique<SessionTransaction>(&txn_budget_, std::chrono::steady_clock::now());
     return Protocol::SimpleString("OK");
 }
 
@@ -1823,9 +2032,7 @@ Table::Lease CommandEngine::TxnLease(SessionState& session, const std::string& t
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - txn.started);
     if (elapsed >= config_.txn_max_duration) {
-        throw TransactionConflictError(
-            TxnConflictReason::kDuration,
-            "the transaction ran longer than " + std::to_string(config_.txn_max_duration.count()) + " ms");
+        throw TxnDurationConflict();
     }
     if (txn.snapshot == nullptr) {
         auto lease = AcquireNamedTable(session, table);
@@ -1865,6 +2072,52 @@ void CommandEngine::TxnRead(SessionTransaction& txn, std::span<const ChunkCoord>
     txn.read_set.merge(additions);
 }
 
+namespace {
+
+[[nodiscard]] std::invalid_argument TxnWrittenChunksError(std::size_t limit) {
+    return std::invalid_argument("a transaction writes at most " + std::to_string(limit) + " chunks");
+}
+
+[[nodiscard]] std::invalid_argument TxnMaxBytesError(std::size_t bytes, std::size_t limit) {
+    return std::invalid_argument(
+        "the transaction's changes would take " + std::to_string(bytes) + " bytes, more than --txn-max-bytes (" +
+        std::to_string(limit) + ")");
+}
+
+[[nodiscard]] std::invalid_argument TxnTotalBytesError(std::size_t limit) {
+    return std::invalid_argument(
+        "open transactions hold more than --txn-total-bytes (" + std::to_string(limit) +
+        ") of changes; try again later");
+}
+
+}  // namespace
+
+void CommandEngine::RequireTxnRoom(
+    const SessionTransaction& txn,
+    const ChunkCoord& coord,
+    std::size_t after) {
+    const auto own = txn.writes.find(coord);
+    const auto limit = catalog_->query_limits().txn_max_written_chunks;
+    if (own == txn.writes.end() && txn.writes.size() >= limit) {
+        throw TxnWrittenChunksError(limit);
+    }
+    const std::size_t before = own == txn.writes.end() ? 0U : StateBytes(own->second);
+    if (txn.bytes - before + after > config_.txn_max_bytes) {
+        throw TxnMaxBytesError(txn.bytes - before + after, config_.txn_max_bytes);
+    }
+    // TxnWrite reserves the growth; this only refuses one that cannot fit
+    // now, after ending expired transactions as TxnWrite does.
+    if (after > before) {
+        const auto fits = [&] { return txn_budget_.bytes.load() + (after - before) <= config_.txn_total_bytes; };
+        if (!fits()) {
+            EndExpiredTransactions();
+            if (!fits()) {
+                throw TxnTotalBytesError(config_.txn_total_bytes);
+            }
+        }
+    }
+}
+
 void CommandEngine::TxnWrite(
     SessionTransaction& txn,
     ChunkStore& store,
@@ -1873,9 +2126,9 @@ void CommandEngine::TxnWrite(
     auto own = txn.writes.find(coord);
     const bool created = own == txn.writes.end();
     if (created) {
-        if (txn.writes.size() >= catalog_->query_limits().txn_max_written_chunks) {
-            throw std::invalid_argument(
-                "a transaction writes at most " + std::to_string(catalog_->query_limits().txn_max_written_chunks) + " chunks");
+        const auto limit = catalog_->query_limits().txn_max_written_chunks;
+        if (txn.writes.size() >= limit) {
+            throw TxnWrittenChunksError(limit);
         }
         own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord)).first;
     }
@@ -1900,20 +2153,29 @@ void CommandEngine::TxnWrite(
             ChunkPopulated(store.geometry(), state.presence_bitmap, state.chunk_columns.get());
         const std::size_t after = StateBytes(state);
         if (txn.bytes - before + after > config_.txn_max_bytes) {
-            throw std::invalid_argument(
-                "the transaction's changes would take " + std::to_string(txn.bytes - before + after) +
-                " bytes, more than --txn-max-bytes (" + std::to_string(config_.txn_max_bytes) + ")");
+            throw TxnMaxBytesError(txn.bytes - before + after, config_.txn_max_bytes);
         }
         if (after > before) {
             const std::size_t grown = after - before;
-            if (txn_total_bytes_.fetch_add(grown) + grown > config_.txn_total_bytes) {
-                txn_total_bytes_.fetch_sub(grown);
-                throw std::invalid_argument(
-                    "open transactions hold more than --txn-total-bytes (" +
-                    std::to_string(config_.txn_total_bytes) + ") of changes; try again later");
+            const auto charge = [&] {
+                if (txn_budget_.bytes.fetch_add(grown) + grown <= config_.txn_total_bytes) {
+                    return true;
+                }
+                txn_budget_.bytes.fetch_sub(grown);
+                return false;
+            };
+            // Transactions past their duration hold their bytes until their
+            // session's next statement; ending them may make room.
+            if (!charge()) {
+                if (auto* hook = hook_.load(std::memory_order_acquire))
+                    hook->Run(CommandEngineTestHook::Point::kBeforeTxnBudgetReclaim, txn.table);
+                EndExpiredTransactions();
+                if (!charge()) {
+                    throw TxnTotalBytesError(config_.txn_total_bytes);
+                }
             }
         } else {
-            txn_total_bytes_.fetch_sub(before - after);
+            txn_budget_.bytes.fetch_sub(before - after);
         }
         txn.bytes = txn.bytes - before + after;
     } catch (...) {
@@ -1937,9 +2199,7 @@ std::string CommandEngine::TxnCommit(SessionState& session) {
     const auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(
         std::chrono::steady_clock::now() - txn->started);
     if (elapsed >= config_.txn_max_duration) {
-        throw TransactionConflictError(
-            TxnConflictReason::kDuration,
-            "the transaction ran longer than " + std::to_string(config_.txn_max_duration.count()) + " ms");
+        throw TxnDurationConflict();
     }
     std::optional<Table::Lease> lease;
     const auto changed = [&txn] {

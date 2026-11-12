@@ -57,6 +57,8 @@ do not want to gate on.
   compiler warning fails CI.
 - Stress is tracked separately in the stress-flake workflow.
 - TLS build/smoke validation remains a dedicated CI job.
+- A pull request that changes only `docs/`, Markdown files or `bench/artifacts/` runs the documentation checks and the Docker quick-start page instead of the build matrix; crash, stress and fuzz workflows skip it.
+- A new push to a pull request or to `main` cancels the run still going for it.
 
 ## Scope Discipline
 
@@ -163,6 +165,22 @@ Baseline (2026-10-07, Apple M1 Pro, macOS 27.0, APFS, Release; [summary](bench/a
 | `relaxed` | 74 119 (0.67) | 43 093 (3.81) | 67 519 (2.90) |
 | `fsync-wal` | 677 (79.2) | 543 (79.9) | 982 (70.3) |
 
+### Commit-time bookkeeping
+
+Each commit reads the wall clock and raises one table-wide monotonic commit time before it writes its frame.
+`-DCHUNKDB_BENCH_CONSTANT_COMMIT_TIME=ON` builds a variant that skips both and keeps each chunk's previous commit time, so a paired comparison measures that work alone.
+The variant is for benchmark comparisons on fresh data only: its commit times are not wall-clock times.
+
+```bash
+cmake -S . -B build-constant-time -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_BENCH_CONSTANT_COMMIT_TIME=ON
+cmake --build build-constant-time --target chunkdb_server_bench
+build/chunkdb_budget_compare build-constant-time build \
+  --window-id WINDOW --noise-reference noise.json \
+  --markdown commit-time.md --json commit-time.json
+```
+
+The constant build is the before side, so the reported change is the cost of commit-time bookkeeping.
+
 ### Feed subscribers
 
 Writes must not get slower with the number of watches on their table.
@@ -228,7 +246,7 @@ Metadata harnesses test both the raw input and a copy with its outer CRC repaire
 Storage harnesses also repair WAL header and frame checksums or the image directory checksum.
 The request harness runs the server's own `ReadParameterFrames`.
 
-CI runs every target for 30 seconds on each pull request (`fuzz.yml`) and for 25 minutes each night (`fuzz-scheduled.yml`).
+CI runs every target for 30 seconds on each pull request that changes more than documentation (`fuzz.yml`) and for 25 minutes each night (`fuzz-scheduled.yml`).
 A failing run uploads the crash inputs as an artifact.
 
 To keep a crash as a regression, fix the bug and copy the input to `fuzz/regression/NAME/`.

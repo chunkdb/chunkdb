@@ -14,8 +14,17 @@ Feed recreation cannot invalidate producers still owned by the store.
 
 After WATCH admission, the socket/TLS session moves from its worker to feed I/O.
 Wakeup channels signal new changes, durable frontiers and shutdown; output does not hold request workers.
-Queues, retained changes and encoded output share a bounded table budget.
-Ordinary overflow requests resync; slot overflow catches up from archives, while an individually undeliverable event ends the watch.
+Retained changes use the table budget; queued output uses per-watch shares of it plus one table pool of the same size for slot frames above a share.
+Ordinary overflow requests resync; slot overflow catches up from archives, while an event larger than the table budget ends the watch.
+A slot frame whose bytes and receipt exceed its watch share waits until that watch has no unsent output, then queues in arrival order for a separate table pool bounded by the table budget.
+A watch waiting for anything but its turn, such as its own ACKs, leaves that queue and joins at the back when it needs the pool again.
+Schema frames queue like changes; progress and resync frames are a few bytes and never queue, and above a share they use the pool whenever their watch has no unsent output and the pool has room.
+Those can delay a queued head only while slow readers hold them at shares under about 180 bytes.
+A frame that fits the share alone waits for ACKs instead when receipts fill it.
+Its connection closes, releasing its charges at once, when no byte of its queued output is written for the client I/O timeout; TLS writes one record per call, so every completed call is progress.
+A watch waiting for the pool sends no progress, and reads no ACK while more than its share of a pool frame is unsent.
+Only the catch-up worker charges either counter; while waiting, only frames within a share and the head of the pool queue keep their encoded form.
+Within-share slot output and receipts use another table counter bounded by the budget, so a pending large frame never delays them.
 Write captures evict the oldest retained changes before they are refused, so only readers below the evicted floor resync.
 An admitted frame remains valid when output shares change, and teardown releases ownership before rewatch.
 

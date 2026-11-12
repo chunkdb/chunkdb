@@ -22,6 +22,7 @@ struct FeedSlotTestAccess {
     static FeedArchiveReader CompletedPrefix(Table& table, std::string_view name, FeedPosition after);
     static void EnableChunkForms(FeedArchiveReader& reader, std::size_t budget);
     static void SetEntryBudget(FeedArchiveReader& reader, std::size_t budget);
+    static void Filter(FeedArchiveReader& reader, const FeedSlotFilters& filters);
     static void Retain(Table& table);
     static void SetHook(Table& table, FeedSlotTestHook* hook);
     static void StageAck(Table& table, std::string_view name, FeedPosition position);
@@ -49,7 +50,10 @@ class FeedSlots {
     [[nodiscard]] bool active() const noexcept;
     [[nodiscard]] std::size_t max_bytes() const noexcept { return max_bytes_; }
     [[nodiscard]] bool ArchiveRequired() const noexcept;
-    [[nodiscard]] FeedSlot Create(std::string_view name, std::uint64_t completed, bool if_not_exists = false, const FeedSlotFilters& filters = {});
+    [[nodiscard]] FeedSlot Create(std::string_view name, std::uint64_t completed, bool if_not_exists = false, const FeedSlotFilters& filters = {},
+        std::optional<std::string> owner = std::nullopt);
+    // Records `owner` for a slot that has none; a recorded owner never changes.
+    void BindOwner(std::string_view name, const std::string& owner);
     void Drop(std::string_view name, bool if_exists = false);
     void Advance(std::string_view name, FeedPosition position);
     void UseAckState(const std::shared_ptr<FeedSlotAckState>& state) noexcept { acknowledgements_ = state; }
