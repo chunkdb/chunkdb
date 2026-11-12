@@ -620,6 +620,7 @@ void IdleIo::ReleaseKept(ServerConnection& connection) {
     }
     if (connection.pending.empty() && connection.request_line.empty()) {
         std::string{}.swap(connection.pending.bytes);
+        std::string{}.swap(connection.request_line);
         connection.line_credit.reset();
     }
 }

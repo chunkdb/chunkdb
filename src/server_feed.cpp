@@ -113,6 +113,13 @@ std::shared_ptr<void> FeedDeliveryTestAccess::ReserveReplyCredit(ChunkServer& se
     if (auto io = server.IdleIoHandle()) return io->data_output_credit_->TryAcquire(bytes);
     return {};
 }
+std::optional<std::size_t> FeedDeliveryTestAccess::RequestLineCapacity(ChunkServer& server, std::uint64_t id) {
+    std::lock_guard lock(server.connections_mutex_);
+    const auto found = server.connections_.find(id);
+    const auto connection = found == server.connections_.end() ? nullptr : found->second.lock();
+    if (!connection) return std::nullopt;
+    return connection->request_line.capacity();
+}
 void FeedDeliveryTestAccess::InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake) {
     auto io = server.FeedIoHandle();
     server.delivery_test_hook_.store(hook, std::memory_order_release);

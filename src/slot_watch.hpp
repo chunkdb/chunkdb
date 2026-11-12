@@ -48,6 +48,8 @@ struct FeedDeliveryTestAccess {
     static std::optional<std::pair<long, long>> SocketTimeouts(ChunkServer& server, std::uint64_t id);
     static void WakeTransport(ChunkServer& server);
     static std::shared_ptr<void> ReserveReplyCredit(ChunkServer& server, std::size_t bytes);
+    // For a connection the I/O thread holds idle; nullopt when it is gone.
+    static std::optional<std::size_t> RequestLineCapacity(ChunkServer& server, std::uint64_t id);
   private:
     static void InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake);
 };

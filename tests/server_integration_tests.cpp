@@ -2452,8 +2452,11 @@ void TestWaitingWorkerYieldsToQueuedRequest() {
     RawClient second("127.0.0.1", harness.port);
     const auto second_id = HelloId(second);
     chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
-    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+    constexpr std::size_t kLongLine = 60000U;
+    first.SendLine("PING" + std::string(kLongLine, ' ')); assert(first.ReadLine() == "+PONG\r\n");
     hook.WaitFor(first_id);
+    // The worker keeps the connection with the buffer of its last line.
+    assert(chunkdb::FeedDeliveryTestAccess::RequestLineCapacity(*harness.server, first_id).value() >= kLongLine);
     second.SendLine("PING"); assert(second.ReadLine() == "+PONG\r\n");
     hook.WaitFor(second_id);
     first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
@@ -2792,8 +2795,11 @@ void TestYieldReturnsKeptReplyCredit() {
     RawClient second("127.0.0.1", harness.port);
     const auto second_id = HelloId(second);
     chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
-    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+    constexpr std::size_t kLongLine = 60000U;
+    first.SendLine("PING" + std::string(kLongLine, ' ')); assert(first.ReadLine() == "+PONG\r\n");
     hook.WaitFor(first_id);
+    // The worker keeps the connection with the buffer of its last line.
+    assert(chunkdb::FeedDeliveryTestAccess::RequestLineCapacity(*harness.server, first_id).value() >= kLongLine);
     // Only the waiting connection holds output credit now.
     constexpr std::size_t kPool = 2147483648ULL, kOrdinary = 65536U;
     assert(!chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, kPool));
@@ -2803,6 +2809,8 @@ void TestYieldReturnsKeptReplyCredit() {
     // The first connection returned its reservation when it yielded the worker.
     assert(chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, kPool - kOrdinary));
     assert(!chunkdb::FeedDeliveryTestAccess::ReserveReplyCredit(*harness.server, kPool - kOrdinary + 1U));
+    // It gave back the line buffer together with the line credit.
+    assert(chunkdb::FeedDeliveryTestAccess::RequestLineCapacity(*harness.server, first_id).value() < kLongLine);
     first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
 }
 
