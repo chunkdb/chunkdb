@@ -2650,6 +2650,24 @@ void TestCancelStatementReadByWaitingWorker() {
     assert(target.ReadLine() == "+applied\r\n");
 }
 
+// After a pipelined burst the worker keeps waiting on its connection: the
+// next request is read by that worker, not queued by the I/O thread.
+void TestPipelinedBurstKeepsWaitingWorker() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("pipelined-burst-waiting-worker", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    const auto id = HelloId(client);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    client.SendBytes("PING\r\nPING\r\n");
+    assert(client.ReadLine() == "+PONG\r\n");
+    assert(client.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id);
+    const auto queued = hook.Queued(id);
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id, 2U);
+    assert(hook.Queued(id) == queued);
+}
 
 
 // A worker that has handed its connection back counts as free before it waits
@@ -7324,6 +7342,7 @@ int main(int argc, char** argv) {
         run("TestStopInsideIdleWaitWindow", TestStopInsideIdleWaitWindow);
         run("TestRequestAtIdleDeadlineIsServed", TestRequestAtIdleDeadlineIsServed);
         run("TestCancelStatementReadByWaitingWorker", TestCancelStatementReadByWaitingWorker);
+        run("TestPipelinedBurstKeepsWaitingWorker", TestPipelinedBurstKeepsWaitingWorker);
         run("TestReturningWorkerTakesQueuedRequest", TestReturningWorkerTakesQueuedRequest);
         run("TestWaitingWorkerStatementTimesOut", TestWaitingWorkerStatementTimesOut);
         run("TestRefusedDispatchWakesAfterPop", TestRefusedDispatchWakesAfterPop);

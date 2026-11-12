@@ -97,7 +97,7 @@ bool ChunkServer::HandleClient(
             if (!io->Write(*connection)) return false;
             if (connection->phase != ServerConnection::Phase::kInput || session.watch || session.slot_watch)
                 return park();
-            if (connection->pending.empty()) {
+            while (connection->pending.empty()) {
                 const auto next = AwaitNextRequest(wait, *connection);
                 if (next == NextRequest::kClose) return false;
                 if (next == NextRequest::kReturn) return park();
@@ -108,8 +108,10 @@ bool ChunkServer::HandleClient(
                 if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                     hook->Run(FeedDeliveryTestHook::Point::kAfterClientRead, connection->completed_replies);
                 if (!alive) return false;
-                // Nothing arrived, or part of a TLS record: the I/O owner times it.
-                if (connection->pending.empty()) return park();
+                // Nothing arrived: keep waiting, unless part of a TLS record, a TLS
+                // write or credit is waited for, which the I/O owner times.
+                if (connection->pending.empty() && (connection->input_deadline || connection->io_wait != POLLIN ||
+                    connection->waiting_line_credit || connection->waiting_credit)) return park();
             }
             try { (void)io->Parse(*connection, true); }
             catch (const std::runtime_error& error) {
