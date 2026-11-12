@@ -51,6 +51,20 @@
 #include "txn_history.hpp"
 
 namespace chunkdb {
+namespace {
+template <typename Fn>
+class ScopeExit {
+  public:
+    explicit ScopeExit(Fn fn) : fn_(std::move(fn)) {}
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+    ~ScopeExit() { if (active_) fn_(); }
+    void Dismiss() noexcept { active_ = false; }
+  private:
+    Fn fn_;
+    bool active_ = true;
+};
+}
 
 std::shared_ptr<ChunkStore::LargeChunk> ChunkStore::GetOrCreateLargeChunk(const LargeChunkCoord& large_coord) {
     std::lock_guard lock(large_chunks_mutex_);
@@ -59,10 +73,35 @@ std::shared_ptr<ChunkStore::LargeChunk> ChunkStore::GetOrCreateLargeChunk(const 
         return it->second;
     }
 
-    auto created = std::make_shared<LargeChunk>();
-    large_chunks_.emplace(large_coord, created);
+    LargeChunkReservation reservation(resources_);
+    PauseCacheForTests(CachePausePoint::kLargeChunkAfterReservation,
+        {large_coord.x, large_coord.y, large_coord.z});
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_LARGE_CHUNK_AFTER_RESERVATION_ONCE")) throw std::bad_alloc();
+    auto created = std::make_shared<LargeChunk>(std::move(reservation));
+    bool registered = false;
+    ScopeExit rollback([&] {
+        if (registered) large_chunks_.erase(large_coord);
+    });
+    registered = large_chunks_.emplace(large_coord, created).second;
+    if (!registered) throw std::logic_error("large-chunk container appeared during locked admission");
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_LARGE_CHUNK_BEFORE_RING_ONCE")) throw std::bad_alloc();
     eviction_large_chunk_ring_.push_back(large_coord);
+    rollback.Dismiss();
     return created;
+}
+
+void ChunkStore::RetireEmptyLargeChunk(const LargeChunkCoord& coord, const std::shared_ptr<LargeChunk>& expected) {
+    {
+        std::lock_guard registry(large_chunks_mutex_);
+        const auto found = large_chunks_.find(coord);
+        if (found == large_chunks_.end() || found->second != expected) return;
+        std::lock_guard container(expected->mutex);
+        if (!expected->chunks.empty()) return;
+        expected->retired = true;
+        RemoveLargeChunkFromEvictionRing(coord);
+        large_chunks_.erase(found);
+    }
+    PauseCacheForTests(CachePausePoint::kLargeChunkAfterRetirement, {coord.x, coord.y, coord.z});
 }
 
 // The entry goes before the memory: until then no new instance can take this
@@ -127,12 +166,17 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
     // after that mutex and the large-chunk mutex.
     std::shared_ptr<RegularChunk> previous_instance;
     std::shared_ptr<LargeChunk> large_chunk;
+    ScopeExit failed_load([&] {
+        if (large_chunk) RetireEmptyLargeChunk(large_coord, large_chunk);
+    });
+    std::uint64_t loaded_now = 0U;
     // A read-only store loads a missing chunk with the large chunk unlocked:
     // the load can wait for a writer in another process, and this process
     // changes nothing, so a copy loaded meanwhile by another read is as good
     // as this one, and RefreshReadOnlyChunk checks whichever is kept.
     std::optional<LoadedChunkPayload> read_only_load;
     while (true) {
+        large_chunk.reset();
         large_chunk = GetOrCreateLargeChunk(large_coord);
         std::unique_lock lock(large_chunk->mutex);
         if (large_chunk->retired) {
@@ -179,8 +223,8 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             selected->wal_header_written = loaded.wal_header_written;
             selected->wal_path = loaded.wal_path;
             selected->read_only_generation = loaded.read_only_generation;
-            large_chunk->chunks.emplace(chunk_coord, selected);
-            inserted = true;
+            const auto published = large_chunk->chunks.emplace(chunk_coord, selected).first;
+            ScopeExit rollback_chunk([&] { large_chunk->chunks.erase(published); });
             // Two live objects for one chunk mean writes made through the
             // older one can be discarded by whoever checkpoints from the
             // newer, silently losing acknowledged writes. It is cheap to
@@ -210,6 +254,14 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
                          std::to_string(previous_instance->wal_batch.size())},
                     });
             }
+            TouchChunk(selected);
+            RegisterEvictionCandidate(large_coord, chunk_coord,
+                selected->last_access_tick.load(std::memory_order_relaxed));
+            loaded_chunk_count_.fetch_add(1, std::memory_order_relaxed);
+            loaded_now = resources_->loaded_chunks_.fetch_add(1, std::memory_order_relaxed) + 1U;
+            stats_unique_loaded_chunks_.fetch_add(1, std::memory_order_relaxed);
+            inserted = true;
+            rollback_chunk.Dismiss();
         }
         break;
     }
@@ -217,20 +269,13 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
     if (access_mode_ == AccessMode::kReadOnly && !inserted) {
         RefreshReadOnlyChunk(chunk_coord, *selected);
     }
-    TouchChunk(selected);
+    if (!inserted) TouchChunk(selected);
     if (inserted) {
-        RegisterEvictionCandidate(
-            large_coord,
-            chunk_coord,
-            selected->last_access_tick.load(std::memory_order_relaxed));
-        loaded_chunk_count_.fetch_add(1, std::memory_order_relaxed);
-        const auto loaded_now =
-            resources_->loaded_chunks_.fetch_add(1, std::memory_order_relaxed) + 1U;
-        stats_unique_loaded_chunks_.fetch_add(1, std::memory_order_relaxed);
         if (loaded_now > resources_->max_loaded_chunks_) {
             RequestEviction();
         }
     }
+    failed_load.Dismiss();
     return selected;
 }
 

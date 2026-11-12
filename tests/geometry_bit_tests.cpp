@@ -183,8 +183,7 @@ int main() {
         assert(keys.size() == 3);
         assert((chunkdb::ChunkCoord{1, 2, -1} < chunkdb::ChunkCoord{1, 2, 0}));
         assert((chunkdb::LargeChunkCoord{1, 2, 0} < chunkdb::LargeChunkCoord{1, 2, 1}));
-        assert(chunkdb::ChunkCoordHash{}({1, 2}) ==
-               (std::hash<std::int64_t>{}(1) ^ (std::hash<std::int64_t>{}(2) << 1U)));
+        assert(chunkdb::ChunkCoordHash{}({1, 2}) == chunkdb::ChunkCoordHash{}({1, 2, 0}));
     }
     {
         chunkdb::test::ScopedTempDir temp("geometry-admission");

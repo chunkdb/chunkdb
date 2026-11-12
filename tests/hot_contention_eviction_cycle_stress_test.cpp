@@ -212,6 +212,8 @@ int main() {
         {
             chunkdb::ChunkStore store(config);
             std::atomic<bool> start{false};
+            std::atomic<std::uint64_t> acknowledged_writes{0U};
+            std::atomic<std::uint64_t> refused_operations{0U};
             std::vector<std::thread> workers;
             workers.reserve(kThreadCount);
 
@@ -228,32 +230,40 @@ int main() {
                     }
 
                     for (int op = 0; op < kOpsPerThread; ++op) {
-                        if ((op % 6) == 0) {
-                            (void)store.GetBlockBits(state.hot_coord.x, state.hot_coord.y);
-                            const int idx = cold_pick(rng);
-                            (void)store.GetBlockBits(state.cold_coords[static_cast<std::size_t>(idx)].x,
-                                                     state.cold_coords[static_cast<std::size_t>(idx)].y);
-                        } else if ((op % 2) == 0) {
-                            const auto bits = MakeBits(
-                                static_cast<std::uint32_t>((cycle + 1) * 0x1F1FU + tid * 257U + op));
-                            store.SetBlockBits(state.hot_coord.x, state.hot_coord.y, bits);
-                            state.hot_bits = bits;
-                        } else {
-                            const int idx = cold_pick(rng);
-                            const auto bits = MakeBits(static_cast<std::uint32_t>(
-                                0xA5A50000U + cycle * 37U + tid * 19U + op + idx));
-                            store.SetBlockBits(
-                                state.cold_coords[static_cast<std::size_t>(idx)].x,
-                                state.cold_coords[static_cast<std::size_t>(idx)].y,
-                                bits);
-                            state.cold_bits[static_cast<std::size_t>(idx)] = bits;
-                        }
+                        try {
+                            if ((op % 6) == 0) {
+                                (void)store.GetBlockBits(state.hot_coord.x, state.hot_coord.y);
+                                const int idx = cold_pick(rng);
+                                (void)store.GetBlockBits(state.cold_coords[static_cast<std::size_t>(idx)].x,
+                                                         state.cold_coords[static_cast<std::size_t>(idx)].y);
+                            } else if ((op % 2) == 0) {
+                                const auto bits = MakeBits(
+                                    static_cast<std::uint32_t>((cycle + 1) * 0x1F1FU + tid * 257U + op));
+                                store.SetBlockBits(state.hot_coord.x, state.hot_coord.y, bits);
+                                state.hot_bits = bits;
+                                acknowledged_writes.fetch_add(1U, std::memory_order_relaxed);
+                            } else {
+                                const int idx = cold_pick(rng);
+                                const auto bits = MakeBits(static_cast<std::uint32_t>(
+                                    0xA5A50000U + cycle * 37U + tid * 19U + op + idx));
+                                store.SetBlockBits(
+                                    state.cold_coords[static_cast<std::size_t>(idx)].x,
+                                    state.cold_coords[static_cast<std::size_t>(idx)].y,
+                                    bits);
+                                state.cold_bits[static_cast<std::size_t>(idx)] = bits;
+                                acknowledged_writes.fetch_add(1U, std::memory_order_relaxed);
+                            }
 
-                        // Force repeated loading of distant chunks to pressure eviction under contention.
-                        if ((op % 11) == 0) {
-                            const int spill_x = ((tid + 1) * 10000 + op) * 8;
-                            const int spill_y = -((tid + 1) * 7000 + op * 3) * 8;
-                            (void)store.GetBlockBits(spill_x, spill_y);
+                            // Force repeated loading of distant chunks to pressure eviction under contention.
+                            if ((op % 11) == 0) {
+                                const int spill_x = ((tid + 1) * 10000 + op) * 8;
+                                const int spill_y = -((tid + 1) * 7000 + op * 3) * 8;
+                                (void)store.GetBlockBits(spill_x, spill_y);
+                            }
+                        } catch (const chunkdb::ChunkCacheFullError&) {
+                            // Saturation is a known refusal, not an acknowledged
+                            // write; the next iteration is an independent operation.
+                            refused_operations.fetch_add(1U, std::memory_order_relaxed);
                         }
                     }
                 });
@@ -263,6 +273,11 @@ int main() {
             for (auto& worker : workers) {
                 worker.join();
             }
+            assert(acknowledged_writes.load(std::memory_order_relaxed) != 0U);
+            std::cerr << "stress admission cycle=" << cycle
+                      << " acknowledged_writes=" << acknowledged_writes.load(std::memory_order_relaxed)
+                      << " refused_operations=" << refused_operations.load(std::memory_order_relaxed)
+                      << std::endl;
 
             VerifyState(&store, states, "live", cycle);
             // Two live objects for one chunk is the defect that made this

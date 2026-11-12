@@ -125,6 +125,10 @@ On Windows, rename the file and restart the server; until then it keeps writing 
 
 To size `--max-loaded-chunks`, divide the server's resident memory growth after a warm-up with your own data by `chunkdb_loaded_chunks` from SHOW METRICS.
 The recorded figure, for the default chunk size with one 16-bit column, is in [Resident memory per chunk](releases/PERFORMANCE_HISTORY.md#resident-memory-per-chunk); larger chunks, more or wider columns and variable values use more.
+The cache setting also bounds large-chunk containers shared by the tables, including containers being loaded or still held after retirement.
+`chunkdb_large_chunk_containers` reports the count, `chunkdb_large_chunk_container_limit` reports its exact limit, and `chunkdb_large_chunk_refusals_total` counts new containers refused at capacity.
+A new cache miss that cannot fit returns `BUSY reason=large_chunk_cache_full` before applying a mutation; existing container hits remain usable.
+Raise `--max-loaded-chunks` to raise the associated container limit.
 
 ## Read-only
 

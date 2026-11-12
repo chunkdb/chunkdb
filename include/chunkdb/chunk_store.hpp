@@ -191,6 +191,11 @@ struct TableOptions {
 class StoreResources;
 class MaintenancePool;
 class MaintenanceTask;
+
+class ChunkCacheFullError : public std::runtime_error {
+  public:
+    ChunkCacheFullError() : std::runtime_error("large-chunk cache capacity reached") {}
+};
 class ProcessLock;
 
 // Default limit of the chunk states a store keeps for open transactions.
@@ -479,6 +484,10 @@ enum class CachePausePoint {
     kNoCacheReadBeforeDisk,
     // A no-cache read read the chunk's image, before it reads its WAL.
     kNoCacheReadBeforeWal,
+    // A container's credit is reserved, before its allocation/publication.
+    kLargeChunkAfterReservation,
+    // Failed-load retirement is published, before the last local owner leaves.
+    kLargeChunkAfterRetirement,
     kCount,
 };
 
@@ -1053,7 +1062,20 @@ class ChunkStore {
         std::uint64_t recorded_tick = 0;
     };
 
+    class LargeChunkReservation {
+      public:
+        explicit LargeChunkReservation(std::shared_ptr<StoreResources> owner);
+        LargeChunkReservation(LargeChunkReservation&& other) noexcept = default;
+        LargeChunkReservation(const LargeChunkReservation&) = delete;
+        LargeChunkReservation& operator=(const LargeChunkReservation&) = delete;
+        ~LargeChunkReservation();
+      private:
+        std::shared_ptr<StoreResources> owner_;
+    };
+
     struct LargeChunk {
+        explicit LargeChunk(LargeChunkReservation reservation) : reservation(std::move(reservation)) {}
+        LargeChunkReservation reservation;
         std::mutex mutex;
         std::unordered_map<ChunkCoord, std::shared_ptr<RegularChunk>, ChunkCoordHash> chunks;
         // Set under `mutex` when this container is dropped from
@@ -1336,6 +1358,7 @@ class ChunkStore {
     };
 
     [[nodiscard]] std::shared_ptr<LargeChunk> GetOrCreateLargeChunk(const LargeChunkCoord& large_coord);
+    void RetireEmptyLargeChunk(const LargeChunkCoord& coord, const std::shared_ptr<LargeChunk>& expected);
     [[nodiscard]] std::shared_ptr<RegularChunk> GetOrLoadRegularChunk(const ChunkCoord& chunk_coord);
     // Loads a read-only store's cached chunk again when the table changed
     // since it was read (chunk_cache.cpp).
@@ -1798,6 +1821,13 @@ class StoreResources {
     [[nodiscard]] std::uint64_t LoadedChunkCount() const noexcept {
         return loaded_chunks_.load(std::memory_order_relaxed);
     }
+    [[nodiscard]] std::uint64_t LargeChunkCount() const noexcept {
+        return large_chunks_count_.load(std::memory_order_relaxed);
+    }
+    [[nodiscard]] std::size_t max_large_chunks() const noexcept { return max_large_chunks_; }
+    [[nodiscard]] std::uint64_t LargeChunkRefusals() const noexcept {
+        return large_chunks_refusals_.load(std::memory_order_relaxed);
+    }
     // WAL append streams open in all stores.
     [[nodiscard]] std::size_t OpenWalStreamCount() const;
 
@@ -1837,7 +1867,10 @@ class StoreResources {
     }
 
     std::size_t max_loaded_chunks_;
+    std::size_t max_large_chunks_;
     std::size_t max_open_wal_streams_;
+    std::atomic<std::uint64_t> large_chunks_count_{0};
+    std::atomic<std::uint64_t> large_chunks_refusals_{0};
     std::atomic<std::uint64_t> loaded_chunks_{0};
     std::atomic<std::uint64_t> access_clock_{0};
     // Held shared by an eviction pass, exclusively to add or remove a store,
