@@ -2443,11 +2443,12 @@ void TestWaitingWorkerKeepsIdleDeadline() {
     RawClient client("127.0.0.1", harness.port);
     const auto id = HelloId(client);
     chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    // The idle deadline starts when the reply is written, after this.
+    const auto sent = std::chrono::steady_clock::now();
     client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
-    const auto answered = std::chrono::steady_clock::now();
     hook.WaitFor(id);
     assert(client.WaitForClose(std::chrono::seconds(10)));
-    assert(std::chrono::steady_clock::now() - answered >= std::chrono::milliseconds(250));
+    assert(std::chrono::steady_clock::now() - sent >= std::chrono::milliseconds(300));
     RawClient next("127.0.0.1", harness.port);
     (void)HelloId(next);
     next.SendLine("PING"); assert(next.ReadLine() == "+PONG\r\n");
@@ -6228,6 +6229,11 @@ class PolledPartialInputHook : public ShutdownTraceHook {
             { std::lock_guard lock(mutex_); returned_ = true; }
             changed_.notify_all();
         }
+        // The worker that read the partial line has handed it to the I/O thread.
+        if (point == Point::kAfterWorkerHandle) {
+            { std::lock_guard lock(mutex_); if (returned_) handed_back_ = true; }
+            changed_.notify_all();
+        }
         if (point != Point::kBeforeClientRead || ordinal < 2U) return;
         bool block = false;
         {
@@ -6255,12 +6261,18 @@ class PolledPartialInputHook : public ShutdownTraceHook {
         if (!changed_.wait_for(lock, std::chrono::seconds(10), [&] { return returned_; }))
             throw std::runtime_error("partial-input-poll: nonblocking read did not return");
     }
+    void WaitHandedBack() {
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, std::chrono::seconds(10), [&] { return handed_back_; }))
+            throw std::runtime_error("partial-input-poll: worker did not hand the partial input back");
+    }
   private:
     ScopedWindowsHandle release_;
     std::mutex mutex_;
     std::condition_variable changed_;
     DWORD thread_id_ = 0U;
     bool returned_ = false;
+    bool handed_back_ = false;
 };
 
 void TestStopPolledPartialInputWindows() {
@@ -6280,10 +6292,13 @@ void TestStopPolledPartialInputWindows() {
     client.SetReadDeadline(std::chrono::seconds(15));
     client.Hello();
     client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
-    // A partial request returns to the poller instead of entering a blocking receive.
+    // The worker that answered PING waits for the next request and reads the
+    // partial one; it returns the connection to the I/O thread's poller
+    // instead of entering a blocking receive.
     client.SendBytes("PI");
     chunkdb::test::FeedPhaseWatchdog::Phase("partial-input-poll: confirm ongoing partial-line recv");
     hook.WaitPolledRead();
+    hook.WaitHandedBack();
     chunkdb::test::FeedPhaseWatchdog::Phase("harness: single Stop with ongoing recv");
     harness.server->Stop();
     harness.JoinStopped(); // Keep client alive; no second Stop or disconnect.
@@ -6396,6 +6411,8 @@ void TestPolledInputOwnershipWindows(bool run_error = false) {
     client.SendBytes("PI");
     chunkdb::test::FeedPhaseWatchdog::Phase("partial-input-poll: confirm partial input returned to polling");
     hook.WaitPolledRead();
+    // The worker read it; Stop must find the connection with the I/O thread.
+    hook.WaitHandedBack();
     // Freeze the idle owner before Stop publishes running=false, so this
     // fixture observes the native shutdown path rather than an earlier close.
     hook.ArmIdleScan();
