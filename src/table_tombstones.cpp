@@ -2,6 +2,7 @@
 
 #include "chunk_coordinate_index.hpp"
 #include "chunk_store_internal.hpp"
+#include "statement_control.hpp"
 #include "chunkdb/file_layout.hpp"
 
 namespace chunkdb {
@@ -45,6 +46,9 @@ std::uint64_t TableCatalog::CompactTombstones(std::string_view name, std::uint64
             retire.Dismiss();
             return floor;
         }
+        // From here a failure fences the table: a stop is no longer accepted,
+        // and the reply is the compaction's real result.
+        EnterStatementDecision();
         const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
         store->HandOverUnsyncedOnClose(unsynced);
         publication_started = true;

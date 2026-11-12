@@ -636,6 +636,36 @@ void ChunkModelCatalogAdmissionStops() {
     }
     assert(catalog.Require("default")->Info().chunk_schema.columns.empty());
 }
+// COMPACT TOMBSTONES enters its decision before the step after which a
+// failure fences the table, so a stop requested once it runs is refused and
+// the statement's reply is the compaction's result.
+void TombstoneCompactionEntersItsDecision() {
+    test::ScopedTempDir dir("chunkdb-cancel-compaction");
+    const auto config = Config(dir.path(), DurabilityMode::kFsyncWal);
+    TableCatalog catalog(CatalogConfigFromStoreConfig(config));
+    const auto table = test::CreateBitsTable(catalog, config.geometry);
+    std::uint64_t last = 0U;
+    {
+        auto lease = table->Acquire();
+        auto& store = lease->store();
+        store.SetBlockBits(0, 0, "1000");
+        (void)store.UnsetBlock(0, 0);
+        store.CheckpointForTests(0, 0);
+        store.SetBlockBits(4, 0, "0100");
+        last = store.GetChunkVersion(1, 0);
+        assert(store.RetainedTombstoneCount() == 1U);
+    }
+    StatementControl control(StatementControl::Clock::now(), 0U);
+    assert(control.Start());
+    {
+        ScopedStatementControl scope(&control);
+        assert(catalog.CompactTombstones("default", last + 1U) == last);
+    }
+    assert(control.decision_entered() && !control.RequestStop(StatementStopReason::kCancelled));
+    assert(!control.Complete().has_value());
+    auto lease = catalog.Require("default")->Acquire();
+    assert(lease && lease->store().RetainedTombstoneCount() == 0U && lease->store().GetBlockBits(4, 0) == "0100");
+}
 }
 int main(int argc, char** argv) {
     CancelledWriterReopensReadAdmission();
@@ -655,4 +685,5 @@ int main(int argc, char** argv) {
     CheckpointBacklogWaitStopsOrResumes();
     ChunkModelStatementsStop();
     ChunkModelCatalogAdmissionStops();
+    TombstoneCompactionEntersItsDecision();
 }
