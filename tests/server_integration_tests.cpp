@@ -2324,6 +2324,11 @@ class WorkerIdleWaitHook : public chunkdb::FeedDeliveryTestHook {
         if (point == Point::kAfterStatementQueued) ++queued_[value];
         if (point == Point::kAfterRunningStopPublication) ++stop_publications_;
         if (point == Point::kBeforeWorkerClose) worker_closed_ = true;
+        if (point == Point::kAfterWorkerHandle && hold_after_handle_ && !after_handle_held_) {
+            after_handle_held_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return idle_released_; });
+        }
         if (point == Point::kBeforeBufferedStatementPublication && hold_publication_ && !held_) {
             held_ = true;
             changed_.notify_all();
@@ -2355,6 +2360,9 @@ class WorkerIdleWaitHook : public chunkdb::FeedDeliveryTestHook {
     // Holds the worker after its registration and its KILL check, just
     // before it polls: from there only its wake reports a yield, KILL or stop.
     void HoldIdleWait(std::uint64_t id) { std::lock_guard lock(mutex_); hold_idle_ = id; }
+    // Holds the next worker that returns from a connection, before it waits for another.
+    void HoldAfterHandle() { std::lock_guard lock(mutex_); hold_after_handle_ = true; }
+    void WaitAfterHandleHeld() { Wait([&] { return after_handle_held_; }); }
     void WaitIdleHeld() { Wait([&] { return idle_held_; }); }
     void ReleaseIdleWait() { { std::lock_guard lock(mutex_); idle_released_ = true; } changed_.notify_all(); }
     void WaitQueued(std::uint64_t id) { Wait([&] { return queued_[id] >= 1U; }); }
@@ -2376,6 +2384,7 @@ class WorkerIdleWaitHook : public chunkdb::FeedDeliveryTestHook {
     std::uint64_t hold_idle_ = 0U;
     std::size_t stop_publications_ = 0U;
     bool idle_held_ = false, idle_released_ = false;
+    bool hold_after_handle_ = false, after_handle_held_ = false;
     bool worker_closed_ = false, shutdown_seen_ = false, closed_before_shutdown_ = false;
     bool hold_publication_ = false, held_ = false, released_ = false;
 };
@@ -2639,6 +2648,42 @@ void TestCancelStatementReadByWaitingWorker() {
     harness.catalog->SetMigrationTestHook(nullptr);
     target.SendLine("MIGRATE 'add_light' ALTER TABLE default ADD COLUMN light u8 NULL");
     assert(target.ReadLine() == "+applied\r\n");
+}
+
+
+
+// A worker that has handed its connection back counts as free before it waits
+// again: a request queued meanwhile is left to it, and no worker waiting on
+// another connection is asked to yield.
+void TestReturningWorkerTakesQueuedRequest() {
+    WorkerIdleWaitHook hook;
+    auto config = OneWaitingWorkerConfig();
+    config.worker_threads = 2U;
+    ServerHarness harness("returning-worker-takes-request", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient kept("127.0.0.1", harness.port);
+    const auto kept_id = HelloId(kept);
+    RawClient returned("127.0.0.1", harness.port);
+    const auto returned_id = HelloId(returned);
+    RawClient queued("127.0.0.1", harness.port);
+    const auto queued_id = HelloId(queued);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    kept.SendLine("PING"); assert(kept.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(kept_id);
+    returned.SendLine("PING"); assert(returned.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(returned_id);
+    hook.HoldAfterHandle();
+    returned.SendBytes("PI"); // Part of a line: its worker hands the connection back.
+    hook.WaitAfterHandleHeld();
+    const auto kept_queued = hook.Queued(kept_id);
+    queued.SendLine("PING");
+    hook.WaitQueued(queued_id);
+    hook.ReleaseIdleWait();
+    assert(queued.ReadLine() == "+PONG\r\n");
+    kept.SendLine("PING"); assert(kept.ReadLine() == "+PONG\r\n");
+    assert(hook.Queued(kept_id) == kept_queued);
+    returned.SendBytes("NG\r\n"); assert(returned.ReadLine() == "+PONG\r\n");
 }
 
 // Holds the only worker after it hands a connection back until the I/O
@@ -7279,6 +7324,7 @@ int main(int argc, char** argv) {
         run("TestStopInsideIdleWaitWindow", TestStopInsideIdleWaitWindow);
         run("TestRequestAtIdleDeadlineIsServed", TestRequestAtIdleDeadlineIsServed);
         run("TestCancelStatementReadByWaitingWorker", TestCancelStatementReadByWaitingWorker);
+        run("TestReturningWorkerTakesQueuedRequest", TestReturningWorkerTakesQueuedRequest);
         run("TestWaitingWorkerStatementTimesOut", TestWaitingWorkerStatementTimesOut);
         run("TestRefusedDispatchWakesAfterPop", TestRefusedDispatchWakesAfterPop);
         run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);

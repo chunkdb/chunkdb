@@ -23,6 +23,9 @@ bool ChunkServer::HandleClient(
     const auto io = IdleIoHandle();
     if (!io) return false;
     auto& session = connection->session;
+    // A connection handed back is the I/O thread's to dispatch: free the
+    // worker first, so that dispatch counts it.
+    const auto park = [&] { FreeWorker(wait); return ParkClient(connection); };
     try {
         while (running_.load()) {
             std::shared_ptr<StatementControl> control;
@@ -38,7 +41,7 @@ bool ChunkServer::HandleClient(
                 connection->payload_credit.reset();
                 io->Reply(*connection, stopped ? StatementStoppedReply(*stopped) :
                     Protocol::Error("BUSY", "reply admission budget is full", {{"reason", "reply_budget"}}));
-                return ParkClient(connection);
+                return park();
             }
             {
                 ScopedStatementControl context(control.get());
@@ -72,7 +75,7 @@ bool ChunkServer::HandleClient(
                 connection->reply_continuation.reset();
                 std::string{}.swap(connection->response);
                 io->Reply(*connection, Protocol::Error("BUSY", "reply capture budget is full", {{"reason", "reply_budget"}}));
-                return ParkClient(connection);
+                return park();
             }
             if (session.watch || session.slot_watch) {
                 auto count = watch_count_.load();
@@ -93,11 +96,11 @@ bool ChunkServer::HandleClient(
                 std::chrono::milliseconds(config_.client_io_timeout_ms);
             if (!io->Write(*connection)) return false;
             if (connection->phase != ServerConnection::Phase::kInput || session.watch || session.slot_watch)
-                return ParkClient(connection);
+                return park();
             if (connection->pending.empty()) {
                 const auto next = AwaitNextRequest(wait, *connection);
                 if (next == NextRequest::kClose) return false;
-                if (next == NextRequest::kReturn) return ParkClient(connection);
+                if (next == NextRequest::kReturn) return park();
                 connection->read_ready = false;
                 if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                     hook->Run(FeedDeliveryTestHook::Point::kBeforeClientRead, connection->completed_replies);
@@ -106,7 +109,7 @@ bool ChunkServer::HandleClient(
                     hook->Run(FeedDeliveryTestHook::Point::kAfterClientRead, connection->completed_replies);
                 if (!alive) return false;
                 // Nothing arrived, or part of a TLS record: the I/O owner times it.
-                if (connection->pending.empty()) return ParkClient(connection);
+                if (connection->pending.empty()) return park();
             }
             try { (void)io->Parse(*connection, true); }
             catch (const std::runtime_error& error) {
@@ -114,7 +117,7 @@ bool ChunkServer::HandleClient(
             } catch (const std::invalid_argument& error) {
                 if (!io->RejectProtocol(*connection, error)) return false;
             }
-            if (connection->phase != ServerConnection::Phase::kReady) return ParkClient(connection);
+            if (connection->phase != ServerConnection::Phase::kReady) return park();
         }
     } catch (const std::exception& error) {
         LogMessage(LogLevel::kError, LogComponent::kServer,
@@ -166,7 +169,9 @@ ChunkServer::NextRequest ChunkServer::AwaitNextRequest(WorkerWait& wait, ServerC
         } registration{*this, wait};
         {
             std::lock_guard lock(pending_clients_mutex_);
-            if (!running_.load() || !pending_clients_.empty()) return NextRequest::kReturn;
+            // Queued requests that free workers will take need no yield.
+            if (!running_.load() || pending_clients_.size() > free_workers_ + yielding_workers_)
+                return NextRequest::kReturn;
             wait.waiting = true;
         }
         // A KILL published before the registration sent no wake; one after it did.
@@ -197,6 +202,12 @@ ChunkServer::NextRequest ChunkServer::AwaitNextRequest(WorkerWait& wait, ServerC
     }
 }
 
+void ChunkServer::FreeWorker(WorkerWait& wait) noexcept {
+    std::lock_guard lock(pending_clients_mutex_);
+    if (!std::exchange(wait.holding, false)) return;
+    ++free_workers_;
+}
+
 void ChunkServer::WakeWaitingWorkers() {
     std::lock_guard lock(pending_clients_mutex_);
     for (const auto& wait : worker_waits_) if (wait->waiting) wait->poller.Wake();
@@ -221,9 +232,9 @@ bool ChunkServer::DispatchClient(const std::shared_ptr<ServerConnection>& connec
             connection->worker_queued = true;
             if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kAfterStatementQueued, connection->session.connection_id);
-            // A worker waiting on an idle connection returns it when no blocked
+            // A worker waiting on an idle connection returns it when no free
             // worker or yielding one remains for this request.
-            if (pending_clients_.size() > idle_workers_ + yielding_workers_) {
+            if (pending_clients_.size() > free_workers_ + yielding_workers_) {
                 for (const auto& wait : worker_waits_) {
                     if (!wait->waiting || wait->yield) continue;
                     wait->yield = true;

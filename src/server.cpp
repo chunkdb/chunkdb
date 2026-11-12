@@ -188,6 +188,7 @@ void ChunkServer::StartWorkers() {
         for (std::size_t i = 0; i < config_.worker_threads; ++i) waits.push_back(std::make_shared<WorkerWait>());
         std::lock_guard lock(pending_clients_mutex_);
         worker_waits_ = std::move(waits);
+        free_workers_ = config_.worker_threads;
     }
     io->Start();
     idle->Start();
@@ -566,8 +567,6 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
         bool wake_io = false;
         {
             std::unique_lock lock(pending_clients_mutex_);
-            ++idle_workers_;
-            struct Idle { std::size_t& count; ~Idle() { --count; } } idle{idle_workers_};
             pending_clients_cv_.wait(lock, [&]() {
                 const bool ready = !running_.load() || !pending_clients_.empty();
                 if (!ready) {
@@ -603,6 +602,9 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
                 client_socket = pending_client.socket;
                 connection = pending_client.resumed;
                 statement = pending_client.statement;
+                // Holding a connection until it closes or goes back to the I/O thread.
+                worker_waits_[worker_index]->holding = true;
+                --free_workers_;
                 break;
             }
             // A refused dispatch stays with the I/O owner until queue space
@@ -620,6 +622,12 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
             }
             continue;
         }
+        // However this iteration ends, the worker then holds no connection.
+        struct Holding {
+            ChunkServer& server;
+            WorkerWait& wait;
+            ~Holding() { server.FreeWorker(wait); }
+        } holding{*this, *worker_waits_[worker_index]};
         if (statement) {
             if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kBeforeStatementStart, connection->session.connection_id);

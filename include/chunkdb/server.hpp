@@ -126,10 +126,10 @@ class ChunkServer {
     std::mutex active_clients_mutex_;
     std::condition_variable pending_clients_cv_;
     std::vector<std::thread> workers_;
-    // Under pending_clients_mutex_: workers blocked on pending_clients_cv_,
+    // Under pending_clients_mutex_: workers holding no connection,
     // waiting workers asked to return their connection, and whether a
     // dispatch was refused since the last pop.
-    std::size_t idle_workers_ = 0U;
+    std::size_t free_workers_ = 0U;
     std::size_t yielding_workers_ = 0U;
     bool dispatch_refused_ = false;
     // One per worker; its fields are guarded by pending_clients_mutex_.
@@ -163,6 +163,8 @@ class ChunkServer {
     enum class NextRequest { kRead, kReturn, kClose };
     NextRequest AwaitNextRequest(WorkerWait& wait, ServerConnection& connection);
     void WakeWaitingWorkers();
+    // The worker holds no connection any more: it counts for queued requests.
+    void FreeWorker(WorkerWait& wait) noexcept;
     bool HandOff(const std::shared_ptr<ServerConnection>& connection);
     bool ParkClient(const std::shared_ptr<ServerConnection>& connection);
     bool DispatchClient(const std::shared_ptr<ServerConnection>& connection);
