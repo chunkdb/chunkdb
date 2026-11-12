@@ -347,6 +347,22 @@ void OwnerAdmissionPrecedesChunkReads() {
     }
 }
 
+// A new table directory under a catalog's tables/ never bootstraps a
+// standalone owner: a direct open refuses before creating anything there,
+// and the catalog still opens.
+void DirectOpenUnderCatalogRefuses() {
+    test::ScopedTempDir temporary("chunkdb-owner-direct-table");
+    const auto root = std::filesystem::canonical(temporary.path());
+    CatalogConfig catalog_config; catalog_config.data_dir = root; catalog_config.background_maintenance = false;
+    { TableCatalog catalog(catalog_config); }
+    const auto table = root / "tables" / "default";
+    StoreConfig config; config.data_dir = table; config.background_maintenance = false;
+    Reject([&] { ChunkStore store(config); });
+    assert(!std::filesystem::exists(table));
+    TableCatalog reopened(catalog_config);
+    assert(!reopened.Find("default"));
+}
+
 void UnclaimedOwnersRefuseEverySurface() {
     test::ScopedTempDir temporary("chunkdb-owner-unclaimed-surfaces");
     const auto root = std::filesystem::canonical(temporary.path());
@@ -763,7 +779,7 @@ int main(int argc, char** argv) {
     HistoricalActivationRecoversWithoutOwner(); SparseDecisionAdmission();
     ReusedOwnerMustBeDurableBeforeManifest();
     WrongPendingRootRefusesBeforeInventory();
-    OwnerAdmissionPrecedesChunkReads(); UnclaimedOwnersRefuseEverySurface();
+    OwnerAdmissionPrecedesChunkReads(); DirectOpenUnderCatalogRefuses(); UnclaimedOwnersRefuseEverySurface();
     CreationCrashBoundaries(argv[0]);
     TemporaryCreationRecovery(argv[0]);
     InactiveBackupRestore(argv[0]); BackupRefusesChangedOwner();

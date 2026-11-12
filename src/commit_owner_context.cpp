@@ -18,6 +18,14 @@ void RequireTableScope(const StoreManifest& manifest, const CommitOwnerScope& sc
     if (!Grouped(manifest.features) || !manifest.commit_owner || *manifest.commit_owner != scope || manifest.store_id != epoch)
         Bad("table scope or epoch changed");
 }
+// Whether `path` names an entry of a data directory's tables/, compared by
+// identity once tables/ exists, as the process lock does.
+bool InCatalogTables(const std::filesystem::path& path) {
+    const auto parent = path.parent_path(), root = parent.parent_path();
+    if (parent.empty() || root.empty() || !std::filesystem::exists(DataDirManifestPath(root))) return false;
+    if (std::filesystem::exists(parent)) return std::filesystem::equivalent(parent, root / "tables");
+    return parent.filename() == "tables";
+}
 // Names the table as opening it does, so a refusal says which table it is.
 void RequireTableFeatures(const std::string& name, const FeatureFlags& features, AccessMode access_mode) {
     try {
@@ -187,7 +195,13 @@ std::unique_ptr<CommitOwnerStoreAdmission> CommitOwnerBootstrap::BeginStoreAdmis
     const auto path = std::filesystem::weakly_canonical(config.data_dir);
     if (config.commit_owner_context) return config.commit_owner_context->Consume(path);
     const auto initial = ReadStoreManifest(path);
-    if (!initial) return {};
+    if (!initial) {
+        // Only the catalog creates a table in its tables/ namespace, with its
+        // owner context; a direct open would create a standalone owner there.
+        if (config.access_mode == AccessMode::kReadWrite && InCatalogTables(path))
+            Bad("a new table of a catalog is created only through its catalog");
+        return {};
+    }
     if (!Grouped(initial->features)) {
         if (std::filesystem::symlink_status(path / "chunkdb.groups.owner").type() != std::filesystem::file_type::not_found)
             Bad("unclaimed canonical owner exists");
