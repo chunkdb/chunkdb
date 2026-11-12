@@ -1269,6 +1269,37 @@ void CancelCatalogWaitAndRestrictions() {
     { TableCatalog catalog(multi); assert(!Error([&] { (void)catalog.BackupTo(root / "multi", {}); }).empty()); }
 }
 }
+// A background checkpoint that writes a chunk's files without its lock holds
+// maintenance admission, so a backup waits for it, then pins the image, the
+// WAL and the coordinate index it leaves, with the write made meanwhile.
+void BackupWaitsForBackgroundCheckpointFiles() {
+    ScopedTempDir temp("chunkdb-backup-checkpoint-files");
+    const auto root = std::filesystem::canonical(temp.path());
+    auto config = Config(root / "source");
+    config.background_maintenance = true;
+    config.default_options.checkpoint_update_interval = 1U;
+    TableCatalog catalog(config);
+    (void)feed_test::CreateDefault(catalog);
+    {
+        auto lease = catalog.Find("default")->Acquire();
+        auto& store = lease->store();
+        store.WalBarrier();
+        store.ArmCheckpointBeforeWalRemovalPauseForTests();
+        WriteCounter(store, {0, 0}, 7U);
+        assert(store.WaitForCheckpointBeforeWalRemovalForTests());
+        WriteCounter(store, {0, 0}, 8U);
+        auto backup = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "backup", {}); });
+        const bool waited = backup.wait_for(200ms) != std::future_status::ready;
+        store.ResumeCheckpointBeforeWalRemovalForTests();
+        (void)backup.get();
+        assert(waited);
+    }
+    ValidateBackupInventory(root / "backup", ReadBackupRecord(root / "backup"));
+    RestoreBackup(root / "backup", root / "restored");
+    TableCatalog restored(Config(root / "restored"));
+    auto lease = restored.Find("default")->Acquire();
+    assert(ReadCounter(lease->store(), {0, 0}) == 8U);
+}
 int main(int argc, char** argv) {
 #ifdef _WIN32
     SetErrorMode(SEM_FAILCRITICALERRORS | SEM_NOGPFAULTERRORBOX);
@@ -1298,7 +1329,7 @@ int main(int argc, char** argv) {
         ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); StagingOwnerValidation(); return 0;
     }
     PlainWriterBounds(true); PlainWriterBounds(false); EndedFeedDoesNotClearNewProducers();
-    BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); DroppedSnapshotTableSkipped();
+    BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); BackupWaitsForBackgroundCheckpointFiles(); DroppedSnapshotTableSkipped();
     PerTableDdlProgress(); ColdPinAndStagingAlias(); ColdTailRepairPreservesPinnedInode();
     ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); OrphanedStagingCleanup(); StagingOwnerValidation(); StagingCleanupAliasReplacement(); StagingCleanupRootReplacement();
     CrcChunks();

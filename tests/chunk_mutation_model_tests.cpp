@@ -460,6 +460,45 @@ void ChunkStateWritesWaitForBackgroundCheckpointFiles() {
     }
 }
 
+// A write that empties a chunk while a background checkpoint writes its
+// populated image goes to the next WAL. The chunk's next checkpoint collects
+// it into a tombstone that keeps that write's producing version and time.
+void EmptyingWriteDuringBackgroundCheckpointIsCollected() {
+    test::ScopedTempDir directory("chunkdb-empty-during-checkpoint-files");
+    auto config = BackgroundCheckpointConfig(directory.path(), 2U);
+    std::uint64_t deleted = 0U;
+    std::uint64_t deleted_time = 0U;
+    {
+        ChunkStore store(config);
+        store.WalBarrier();
+        store.ArmCheckpointBeforeWalRemovalPauseForTests();
+        store.SetBlockBits(0, 0, "10000001");
+        assert(store.WaitForCheckpointBeforeWalRemovalForTests());
+        auto emptying = std::async(std::launch::async, [&] { store.UnsetBlock(0, 0); });
+        const bool returned = emptying.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+        store.ResumeCheckpointBeforeWalRemovalForTests();
+        emptying.get();
+        assert(returned);
+        const auto emptied = store.ReadChunkState(0, 0);
+        deleted = emptied.version;
+        deleted_time = emptied.commit_time_ms;
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+        while (store.RetainedTombstoneCount() == 0U && std::chrono::steady_clock::now() < deadline)
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        assert(store.RetainedTombstoneCount() == 1U);
+        store.WalBarrier();
+        assert(!std::filesystem::exists(ChunkDataPath(store.data_dir(), store.geometry(), {0, 0})));
+        assert(!std::filesystem::exists(ChunkWalPath(store.data_dir(), store.geometry(), {0, 0})));
+    }
+    config.background_maintenance = false;
+    ChunkStore reopened(config);
+    const auto state = reopened.ReadChunkState(0, 0);
+    assert(state.written && state.version == deleted && state.commit_time_ms == deleted_time);
+    assert(state.presence_bitmap[0] == 0U);
+    assert(reopened.ScanPopulatedChunks(false, {}, 16U).coords.empty());
+    const auto page = reopened.ScanChunkIdentities(false, {}, 16U, 0U);
+    assert(page.entries.size() == 1U && page.entries[0].version == deleted);
+}
 
 int main() {
     AtomicTransformOwnsWholeState();
@@ -469,4 +508,5 @@ int main() {
     FailedFirstWriteStaysNeverWritten();
     ChunkColumnsOnlyWriteRollsBackAndReplays();
     ChunkStateWritesWaitForBackgroundCheckpointFiles();
+    EmptyingWriteDuringBackgroundCheckpointIsCollected();
 }
