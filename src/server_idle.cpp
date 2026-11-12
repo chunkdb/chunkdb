@@ -720,6 +720,9 @@ void IdleIo::Serve(std::shared_ptr<ServerConnection>& connection) {
                 {"error", "HELLO 3 was not completed within the I/O timeout"},
                 {"socket", std::to_string(connection->socket)}, {"peer", connection->peer_endpoint},
             });
+            // A request still queued for credit leaves the queue with this reply.
+            connection->waiting_credit = false;
+            connection->credit_deadline.reset();
             connection->session.close_after_reply = true;
             Reply(*connection, Protocol::Error("PROTOCOL", "HELLO 3 was not completed within the I/O timeout"));
         }
