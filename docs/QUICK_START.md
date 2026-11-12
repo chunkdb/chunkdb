@@ -56,8 +56,8 @@ SET BLOCK 1 0 IN world kind = 2, name = 'wall'
 
 ```output
 OK
+1
 2
-3
 ```
 <!-- docker-quickstart:read -->
 ```cql docs-check session=main
@@ -78,8 +78,8 @@ chunk-cli --uri "$CHUNKDB_URI" watch world
 ```
 
 ```output
-start <epoch>:3
-change revision 4 time_ms <time-ms> user admin
+start <epoch>:2
+change revision 3 time_ms <time-ms> user admin
   block 0 0: {kind = 1, name = 'grass'} -> {kind = 3, name = 'door'}
 ```
 
@@ -90,7 +90,7 @@ SET BLOCK 0 0 IN world kind = 3, name = 'door'
 ```
 
 ```output
-4
+3
 ```
 
 Press Ctrl-C to stop it.

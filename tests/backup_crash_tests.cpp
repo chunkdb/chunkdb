@@ -191,13 +191,16 @@ int main(int argc, char** argv) {
     if (argc == 5 && std::string_view(argv[1]) == "--child") {
         const std::filesystem::path root(argv[2]);
         const auto mode = static_cast<chunkdb::DurabilityMode>(std::stoi(argv[3]));
-        chunkdb::TableCatalog catalog(Config(root / "source", mode));
         if (std::string_view(argv[4]) == "wal-replace") {
             chunkdb::txn_test::ScopedEnv crash("CHUNKDB_FAILPOINT_CRASH_WAL_REPLACE_AFTER_RENAME_ONCE", "1");
+            // Coordinate admission can repair this tail while opening the
+            // table; arm the crash boundary before recovery begins.
+            chunkdb::TableCatalog catalog(Config(root / "source", mode));
             auto lease = catalog.Find("default")->Acquire();
             (void)chunkdb::txn_test::ReadCounter(lease->store(), {0, 0});
             return 2;
         }
+        chunkdb::TableCatalog catalog(Config(root / "source", mode));
         (void)chunkdb::feed_test::CreateDefault(catalog);
         {
             auto lease = catalog.Find("default")->Acquire();

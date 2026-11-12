@@ -90,9 +90,15 @@ class FeedArchiveReader {
     friend class FeedSlots;
     friend class SlotWatch;
     friend struct FeedArchiveAccess;
+    friend struct FeedSlotTestAccess;
     struct Impl;
     explicit FeedArchiveReader(std::unique_ptr<Impl> impl);
     void EnableChunkForms(std::size_t budget);
+    // Keeps of each change only what a slot watch with `filters` sends,
+    // before the budget counts it; Next then returns the frames it sends.
+    void Filter(const FeedSlotFilters& filters);
+    // Applies to the changes read after it.
+    void SetEntryBudget(std::size_t budget);
     std::unique_ptr<Impl> impl_;
 };
 

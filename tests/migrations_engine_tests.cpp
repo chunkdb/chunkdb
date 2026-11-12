@@ -337,9 +337,11 @@ struct PauseNarrowingScan : MigrationTestHook {
         // table, the manifest changes under it.
         if (point == Point::kBeforeTableExclusive && rewrite && scanning && !rewritten) {
             auto manifest = *ReadStoreManifest(table_dir);
+            const auto before = manifest;
             const auto pending = manifest.schema.pending;
             manifest.schema = RenameColumn(WithoutPendingNarrowing(manifest.schema), "w", "renamed");
             manifest.schema.pending = pending;
+            AlignManifestSchemaDomains(&manifest, before.schema, *before.chunk_schema);
             const auto bytes = SerializeStoreManifest(manifest);
             std::ofstream out(StoreManifestPath(table_dir), std::ios::binary | std::ios::trunc);
             out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));

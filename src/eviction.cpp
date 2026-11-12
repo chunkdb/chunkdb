@@ -322,18 +322,6 @@ bool ChunkStore::TryEvictCandidate(
         if (regular_chunk.use_count() != 2) {
             return false;
         }
-        if (regular_chunk->written && !ChunkPresent(regular_chunk->presence_bitmap) &&
-            !std::filesystem::exists(ChunkDataPath(data_dir_, geometry_, candidate.chunk_coord)) &&
-            !std::filesystem::exists(ChunkWalPath(data_dir_, geometry_, candidate.chunk_coord))) {
-            // Retiring a collected tombstone changes GET CHUNK to NULL.
-            // Order it like a write: take T before loading the open count,
-            // keep the old form tagged T, then erase under the large lock.
-            // A snapshot at or above T cannot obtain this cached object
-            // before the erase; earlier snapshots read its kept state.
-            const auto version = NextChunkVersion();
-            auto keep = PrepareTxnKeepLocked(candidate.chunk_coord, *regular_chunk, version);
-            txn_history_->Publish(keep.node);
-        }
         eviction_removals_.fetch_add(1, std::memory_order_release);
     }
 
@@ -418,16 +406,6 @@ void ChunkStore::FinishEvictedChunks(
         if (erase_large_chunk) {
             RemoveLargeChunkFromEvictionRing(it->first);
             large_chunks_.erase(it);
-            if (scan_catalog_ready_) {
-                const auto key = std::make_pair(large_coord.x, large_coord.y);
-                const auto catalog_it = scan_catalog_.find(key);
-                if (catalog_it != scan_catalog_.end()) {
-                    std::error_code ec;
-                    if (!std::filesystem::exists(catalog_it->second, ec) && !ec) {
-                        scan_catalog_.erase(catalog_it);
-                    }
-                }
-            }
         }
     }
 }

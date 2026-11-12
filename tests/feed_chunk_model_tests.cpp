@@ -1,0 +1,444 @@
+#include <cassert>
+#include <chrono>
+#include <future>
+#include <optional>
+
+#include "chunkdb/engine.hpp"
+#include "feed_archive.hpp"
+#include "feed_slots.hpp"
+#include "feed_protocol.hpp"
+#include "feed_test_utils.hpp"
+#include "sectioned_chunk_form.hpp"
+#include "typed_chunk_form.hpp"
+
+namespace {
+using namespace chunkdb;
+std::shared_ptr<Table> Create(TableCatalog& catalog, std::uint8_t dims = 2U) {
+    auto geometry = txn_test::Config({}).geometry;
+    geometry.block_bits = 8U; geometry.dims = dims;
+    geometry.chunk_depth_blocks = dims == 3U ? 2U : 1U;
+    geometry.large_chunk_depth_chunks = dims == 3U ? 2U : 1U;
+    return catalog.Create("t", [&] {
+        return TableDefinition{.geometry = geometry, .options = catalog.default_options(),
+            .schema = SingleBitsColumnSchema(8U), .chunk_schema = TableSchema{
+                .next_column_id = 2U, .columns = {{.id = 1U, .name = "owner",
+                    .type = {ColumnKind::kUnsigned, 8U}, .default_value = {}}}}};
+    });
+}
+std::uint64_t Metadata(Table& table, ChunkCoord coord, std::uint64_t owner) {
+    auto lease = table.Acquire();
+    return lease->store().TransformChunkState(coord, {}, false, [&](ChunkState& state) {
+        state.chunk_columns = std::make_shared<const ChunkColumnState>(AssignChunkColumns(
+            lease->store().geometry().chunk_schema(), state.chunk_columns.get(), {{"owner", owner}}, !state.written));
+    }).version;
+}
+void Row(const std::optional<std::vector<ColumnValue>>& row, std::uint64_t value) {
+    assert(row && row->size() == 1U && std::get<std::uint64_t>(row->front()) == value);
+}
+void CheckedForm(Table& table, const FeedEntry& event, std::uint64_t owner) {
+    assert(event.chunk_forms.size() == 1U && event.chunk_forms.front().form);
+    const auto& text = *event.chunk_forms.front().form;
+    const auto bytes = std::span<const std::uint8_t>(reinterpret_cast<const std::uint8_t*>(text.data()), text.size());
+    auto lease = table.Acquire();
+    const auto decoded = DecodeSectionedChunkState(lease->store().geometry(), bytes, kVarMaxChunkBytesLimit);
+    assert(decoded.chunk_columns);
+    const auto row = DecodeChunkColumns(lease->store().geometry().chunk_schema(), decoded.chunk_columns->bytes);
+    assert(std::get<std::uint64_t>(row.front()) == owner);
+    const auto envelope = ParseChunkFormSections(bytes, kDefaultFeedBufferBytes, ChunkFormReadMode::kRead);
+    assert(envelope.header.chunk_version == event.chunk_forms.front().version);
+    assert(envelope.header.commit_time_ms == event.commit_time_ms);
+}
+void LiveMetadataAndCheckedForms() {
+    test::ScopedTempDir directory("chunkdb-live-chunk-model");
+    TableCatalog catalog(feed_test::Config(directory.path()));
+    const auto table = Create(catalog);
+    auto ordinary = table->SubscribeFeed();
+    auto chunks = table->SubscribeFeed(FeedOptions{.chunks = true});
+    const auto first = Metadata(*table, {0, 0}, 7U);
+    const auto change = feed_test::Next(*ordinary);
+    assert(change->dims == 2U && change->blocks.empty() && change->position.revision == first);
+    assert(change->chunk_changes.size() == 1U && !change->chunk_changes[0].before);
+    Row(change->chunk_changes[0].after, 7U);
+    CheckedForm(*table, *feed_test::Next(*chunks), 7U);
+    {
+        auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, "10000000");
+    }
+    const auto block = feed_test::Next(*ordinary);
+    assert(block->blocks.size() == 1U && block->chunk_changes.empty());
+    CheckedForm(*table, *feed_test::Next(*chunks), 7U);
+    (void)Metadata(*table, {0, 0}, 0U);
+    const auto reset = feed_test::Next(*ordinary);
+    assert(reset->blocks.empty() && reset->chunk_changes.size() == 1U);
+    Row(reset->chunk_changes[0].before, 7U); Row(reset->chunk_changes[0].after, 0U);
+    CheckedForm(*table, *feed_test::Next(*chunks), 0U);
+    {
+        auto lease = table->Acquire(); lease->store().UnsetBlock(0, 0);
+    }
+    assert(feed_test::Next(*ordinary)->chunk_changes.empty());
+    const auto empty = feed_test::Next(*chunks);
+    assert(empty->chunk_forms.size() == 1U && !empty->chunk_forms[0].form);
+}
+void ArchivePreservesMetadataRowsAndForms() {
+    test::ScopedTempDir directory("chunkdb-archive-chunk-model");
+    auto config = feed_test::Config(directory.path()); config.slot_sync_interval = std::chrono::hours(1);
+    TableCatalog catalog(config);
+    const auto table = Create(catalog);
+    const auto slot = table->CreateFeedSlot("consumer");
+    const auto first = Metadata(*table, {0, 0}, 9U);
+    {
+        auto lease = table->Acquire();
+        lease->store().SetBlockBits(0, 0, "10000000");
+        lease->store().CheckpointForTests(0, 0);
+    }
+    FeedSlotTestAccess::Sync(*table);
+    auto reader = table->ReadFeedArchive(slot.position);
+    const auto metadata = reader.Next();
+    assert(metadata && metadata->position.revision == first && metadata->blocks.empty());
+    assert(metadata->chunk_changes.size() == 1U && !metadata->chunk_changes[0].before);
+    Row(metadata->chunk_changes[0].after, 9U);
+    const auto block = reader.Next();
+    assert(block && block->blocks.size() == 1U && block->chunk_changes.empty() && !reader.Next());
+    auto forms = table->ReadFeedArchive(slot.position);
+    FeedSlotTestAccess::EnableChunkForms(forms, kDefaultFeedBufferBytes);
+    const auto first_form = forms.Next(); assert(first_form);
+    CheckedForm(*table, *first_form, 9U);
+    const auto second_form = forms.Next(); assert(second_form);
+    CheckedForm(*table, *second_form, 9U);
+    assert(!forms.Next());
+}
+void BaselineInitializationAndSchemaRows() {
+    test::ScopedTempDir directory("chunkdb-feed-baseline-row");
+    TableCatalog catalog(feed_test::Config(directory.path()));
+    const auto table = Create(catalog);
+    auto ordinary = table->SubscribeFeed();
+    auto chunks = table->SubscribeFeed(FeedOptions{.chunks = true});
+    (void)Metadata(*table, {0, 0}, 0U);
+    const auto baseline = feed_test::Next(*ordinary);
+    assert(baseline->blocks.empty() && baseline->chunk_changes.size() == 1U);
+    assert(!baseline->chunk_changes[0].before); Row(baseline->chunk_changes[0].after, 0U);
+    const auto empty = feed_test::Next(*chunks);
+    assert(empty->chunk_forms.size() == 1U && !empty->chunk_forms[0].form);
+    catalog.ChangeChunkColumns("t", [](const auto& schema) {
+        return AddChunkColumn(schema, Column{.name = "label", .type = {ColumnKind::kText, 128U},
+            .nullable = true, .default_value = {}});
+    });
+    const auto changed = feed_test::Next(*ordinary);
+    assert(changed->kind == FeedEntry::Kind::kSchema && changed->dims == 2U);
+    assert(changed->columns.size() == 1U && changed->chunk_columns.size() == 2U);
+    assert(feed_test::Next(*chunks)->kind == FeedEntry::Kind::kSchema);
+    const auto plain = catalog.Create("plain", txn_test::Config({}).geometry, catalog.default_options());
+    auto plain_watch = plain->SubscribeFeed();
+    {
+        auto lease = plain->Acquire(); lease->store().SetBlockBits(0, 0, feed_test::Bits(1U));
+    }
+    assert(feed_test::Next(*plain_watch)->chunk_changes.empty());
+}
+void ArchiveEnforcesDecodedEntryBudget() {
+    test::ScopedTempDir directory("chunkdb-archive-row-budget");
+    TableCatalog catalog(feed_test::Config(directory.path()));
+    const auto table = Create(catalog);
+    catalog.ChangeChunkColumns("t", [](const auto& schema) {
+        return AddChunkColumn(schema, Column{.name = "label", .type = {ColumnKind::kText, 262144U},
+            .nullable = true, .default_value = {}});
+    });
+    const auto slot = table->CreateFeedSlot("budget");
+    {
+        auto lease = table->Acquire();
+        (void)lease->store().TransformChunkState({0, 0}, {}, false, [&](ChunkState& state) {
+            state.chunk_columns = std::make_shared<const ChunkColumnState>(AssignChunkColumns(
+                lease->store().geometry().chunk_schema(), state.chunk_columns.get(),
+                {{"label", std::string(131072U, 'x')}}, true));
+        });
+        lease->store().CheckpointForTests(0, 0);
+    }
+    FeedSlotTestAccess::Sync(*table);
+    for (const bool forms : {false, true}) {
+        auto reader = table->ReadFeedArchive(slot.position);
+        FeedSlotTestAccess::SetEntryBudget(reader, 16384U);
+        if (forms) FeedSlotTestAccess::EnableChunkForms(reader, 16384U);
+        bool rejected = false;
+        try { (void)reader.Next(); } catch (const std::length_error&) { rejected = true; }
+        assert(rejected);
+    }
+    auto admitted = table->ReadFeedArchive(slot.position);
+    FeedSlotTestAccess::SetEntryBudget(admitted, 1048576U);
+    const auto entry = admitted.Next();
+    assert(entry && entry->chunk_changes.size() == 1U);
+    assert(FeedEntryRetainedBytes(*entry) > 131072U && FeedEntryRetainedBytes(*entry) <= 1048576U);
+}
+// The budget bounds the encoded frame only: decoded rows and the frame together may take more memory.
+void ArchiveDeliversChangeWhoseFrameFitsTheBudget() {
+    for (const std::uint8_t dims : {std::uint8_t{2U}, std::uint8_t{3U}}) {
+        test::ScopedTempDir directory("chunkdb-archive-frame-budget");
+        TableCatalog catalog(feed_test::Config(directory.path()));
+        const auto table = Create(catalog, dims);
+        catalog.ChangeChunkColumns("t", [](const auto& schema) {
+            return AddChunkColumn(schema, Column{.name = "label", .type = {ColumnKind::kText, 262144U},
+                .nullable = true, .default_value = {}});
+        });
+        const auto slot = table->CreateFeedSlot("budget");
+        {
+            auto lease = table->Acquire();
+            (void)lease->store().TransformChunkState({0, 0, 0}, {}, false, [&](ChunkState& state) {
+                state.chunk_columns = std::make_shared<const ChunkColumnState>(AssignChunkColumns(
+                    lease->store().geometry().chunk_schema(), state.chunk_columns.get(),
+                    {{"label", std::string(131072U, 'x')}}, true));
+            });
+            if (dims == 3U) lease->store().SetBlockBits3D(1, 2, 3, "10000000");
+            else lease->store().SetBlockBits(1, 2, "10000000");
+            lease->store().CheckpointForTests(0, 0);
+        }
+        FeedSlotTestAccess::Sync(*table);
+        std::vector<std::shared_ptr<const FeedEntry>> entries;
+        for (auto reader = table->ReadFeedArchive(slot.position); auto next = reader.Next();) entries.push_back(next);
+        assert(entries.size() == 2U && entries[0]->chunk_changes.size() == 1U && entries[1]->blocks.size() == 1U);
+        auto after = slot.position;
+        for (const auto& expected : entries) {
+            const auto frame = expected->protocol_frame->size();
+            assert(FeedEntryRetainedBytes(*expected) > frame);
+            auto exact = table->ReadFeedArchive(after);
+            FeedSlotTestAccess::SetEntryBudget(exact, frame);
+            const auto delivered = exact.Next();
+            assert(delivered && delivered->position == expected->position && *delivered->protocol_frame == *expected->protocol_frame);
+            auto smaller = table->ReadFeedArchive(after);
+            FeedSlotTestAccess::SetEntryBudget(smaller, frame - 1U);
+            bool rejected = false;
+            try { (void)smaller.Next(); } catch (const std::length_error&) { rejected = true; }
+            assert(rejected);
+            after = expected->position;
+        }
+    }
+}
+// A reader given a slot's filters returns, for each archived change, the
+// frame the watch sends: what FilterFeedEntry or ChunkFeedEntry keep of the
+// unfiltered change, and no frame when they keep nothing.
+void ArchiveFilterMatchesTheWatchFilter() {
+    test::ScopedTempDir directory("chunkdb-archive-filter");
+    auto catalog = std::make_shared<TableCatalog>(feed_test::Config(directory.path()));
+    CommandEngine engine({.require_auth = false}, catalog);
+    SessionState session;
+    (void)engine.Execute(session, "HELLO 3\r\n");
+    const auto run = [&](const std::string& statement) {
+        const auto reply = engine.Execute(session, statement + "\r\n");
+        assert(reply[0] != '-');
+    };
+    run("CREATE TABLE t (n u8, label text(128) NULL) CHUNK 4 x 4 CHUNK COLUMNS (owner u8 NULL)");
+    const auto table = catalog->Find("t");
+    const auto slot = table->CreateFeedSlot("all");
+    run("SET BLOCK 0 0 IN t n = 1, label = 'a'");
+    run("BEGIN");
+    run("SET BLOCK 1 1 IN t n = 2, label = 'b'");
+    run("SET BLOCK 5 0 IN t n = 3, label = 'c'");
+    run("COMMIT");
+    run("SET BLOCK 0 0 IN t n = 1, label = 'd'");
+    run("SET CHUNK 0 0 IN t META owner = 4");
+    run("SET CHUNK 1 0 IN t META owner = 5");
+    run("DELETE BLOCK 0 0 FROM t");
+    run("SET BLOCK 4 4 IN t n = 9");
+    FeedSlotTestAccess::Sync(*table);
+    const auto geometry = table->geometry();
+    const auto n = geometry.layout().schema().columns[0].id, label = geometry.layout().schema().columns[1].id;
+    const FeedArea area{{0, 0}, {0, 0}};
+    const std::vector<FeedSlotFilters> cases{
+        {.area = area}, {.column_ids = std::vector<std::uint32_t>{n}}, {.column_ids = std::vector<std::uint32_t>{label, n}},
+        {.no_before = true}, {.area = area, .column_ids = std::vector<std::uint32_t>{label}, .no_before = true},
+        {.chunks = true}, {.area = area, .chunks = true}, {.area = area, .column_ids = std::vector<std::uint32_t>{n}, .chunks = true}};
+    for (const auto& filters : cases) {
+        auto whole = table->ReadFeedArchive(slot.position);
+        if (filters.chunks) FeedSlotTestAccess::EnableChunkForms(whole, kDefaultFeedBufferBytes);
+        auto filtered = table->ReadFeedArchive(slot.position);
+        FeedSlotTestAccess::Filter(filtered, filters);
+        std::size_t sent = 0U, skipped = 0U;
+        for (auto change = whole.Next(); change; change = whole.Next()) {
+            const auto columns = geometry.LayoutAt(change->schema_version).schema().columns;
+            const auto expected = filters.chunks ? ChunkFeedEntry(change, geometry, filters.area, filters.column_ids)
+                : FilterFeedEntry(change, filters.area, filters.column_ids, filters.no_before, columns);
+            const auto got = filtered.Next();
+            assert(got && got->position == change->position);
+            if (!expected) {
+                assert(!got->protocol_frame && got->blocks.empty() && got->chunk_changes.empty() && got->chunk_forms.empty());
+                ++skipped;
+                continue;
+            }
+            assert(got->protocol_frame && *got->protocol_frame == EncodeFeedEntry(*expected));
+            ++sent;
+        }
+        assert(!filtered.Next() && sent != 0U && (skipped != 0U) == filters.area.has_value());
+    }
+}
+// Each lower bound stays at or below the bytes the encoder writes.
+void MinimumEncodedBytesStayBelowTheFrame() {
+    const std::vector<std::optional<std::vector<ColumnValue>>> rows{std::nullopt, std::vector<ColumnValue>{},
+        std::vector<ColumnValue>{std::monostate{}, true, std::int64_t{0}, std::uint64_t{18446744073709551615ULL}, 1.5, 0.5F,
+            std::string{}, std::string(70000U, 'y'), BytesValue{{1U, 2U}}, BitsValue{"1"}, BitsValue{std::string(17U, '0')}}};
+    for (const std::uint8_t dims : {std::uint8_t{2U}, std::uint8_t{3U}}) for (const auto& before : rows) for (const auto& after : rows) {
+        FeedEntry entry; entry.kind = FeedEntry::Kind::kChange; entry.dims = dims; entry.schema_version = 1U;
+        const auto empty = EncodeFeedEntry(entry).size();
+        entry.blocks.push_back({ChunkCoord{0, 0, 0}, std::nullopt, std::nullopt, before, after, 0U, 0U, std::nullopt, 0U});
+        const auto block = EncodeFeedEntry(entry).size() - empty;
+        assert(FeedChangeItemMinimumEncodedBytes(dims, before, after) <= block);
+        entry.blocks.clear();
+        entry.chunk_changes.push_back({ChunkCoord{-3, 4, dims == 3U ? 5 : 0}, before, after});
+        const auto change = EncodeFeedEntry(entry).size() - empty;
+        assert(FeedChangeItemMinimumEncodedBytes(dims, before, after) <= change);
+    }
+    const std::vector<std::shared_ptr<const std::string>> forms{
+        nullptr, std::make_shared<const std::string>(), std::make_shared<const std::string>(70000U, 'f')};
+    for (const std::uint8_t dims : {std::uint8_t{2U}, std::uint8_t{3U}}) for (const auto& form : forms) {
+        FeedEntry entry; entry.kind = FeedEntry::Kind::kChunks; entry.dims = dims; entry.schema_version = 1U;
+        entry.chunk_forms_complete = true;
+        const auto empty = EncodeFeedEntry(entry).size();
+        entry.chunk_forms.push_back({ChunkCoord{-3, 4, dims == 3U ? 5 : 0}, 0U, form});
+        assert(FeedChunkFormMinimumEncodedBytes(dims, form) <= EncodeFeedEntry(entry).size() - empty);
+    }
+}
+void ThreeDimensionalBlockCoordinates() {
+    test::ScopedTempDir directory("chunkdb-feed-three-dimensional");
+    TableCatalog catalog(feed_test::Config(directory.path()));
+    const auto table = Create(catalog, 3U);
+    auto watch = table->SubscribeFeed();
+    {
+        auto lease = table->Acquire(); lease->store().SetBlockBits3D(-1, 8, -5, "10000000");
+    }
+    const auto entry = feed_test::Next(*watch);
+    assert(entry->dims == 3U && entry->blocks.size() == 1U);
+    const auto& block = entry->blocks[0];
+    assert((block.chunk == ChunkCoord{-1, 2, -3}));
+    assert(block.x == -1 && block.y == 8 && block.z == -5);
+    assert(block.local_x == 3U && block.local_y == 0U && block.local_z == 1U);
+}
+void ScanCutContinuesFirstWatch() {
+    for (const bool restart : {false, true}) for (const bool retained : {false, true}) for (const bool gap : {false, true}) {
+        test::ScopedTempDir directory("chunkdb-scan-first-watch");
+        const auto config = feed_test::Config(directory.path());
+        auto catalog = std::make_shared<TableCatalog>(config);
+        auto table = Create(*catalog);
+        if (retained) {
+            auto lease = table->Acquire();
+            lease->store().SetBlockBits(0, 0, "10000000");
+            lease->store().UnsetBlock(0, 0);
+            lease->store().CheckpointForTests(0, 0);
+        }
+        std::optional<FeedPosition> old_position;
+        if (restart) {
+            { auto lease = table->Acquire(); old_position = FeedPosition{table->store_id(), *lease->store().CompletedRevision()}; }
+            table.reset(); catalog.reset(); catalog = std::make_shared<TableCatalog>(config); table = catalog->Require("t");
+        }
+        FeedPosition position;
+        {
+            auto lease = table->Acquire();
+            const auto page = lease->store().ScanChunkIdentities(false, {}, 10U, 0U, true);
+            assert(page.position && !page.has_more && page.entries.size() == (retained ? 1U : 0U));
+            if (retained) assert(page.entries.front().version != 0U && !page.entries.front().data);
+            position = {table->store_id(), *page.position};
+        }
+        if (gap) {
+            auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, "00100000");
+        }
+        auto watch = table->SubscribeFeed({.after = position});
+        if (gap) assert(feed_test::Next(*watch)->kind == FeedEntry::Kind::kResync);
+        else assert(watch->Progress() == std::optional<FeedPosition>(position));
+        {
+            auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, "01000000");
+        }
+        const auto entry = feed_test::Next(*watch);
+        assert(entry->kind == FeedEntry::Kind::kChange && entry->position.revision > position.revision);
+        auto wrong = position; wrong.epoch[0] ^= 1U;
+        auto epoch = table->SubscribeFeed({.after = wrong});
+        assert(feed_test::Next(*epoch)->kind == FeedEntry::Kind::kResync);
+        auto future = table->SubscribeFeed({.after = FeedPosition{position.epoch, UINT64_MAX}});
+        assert(feed_test::Next(*future)->kind == FeedEntry::Kind::kResync);
+        if (position.revision != 0U) {
+            auto stale = table->SubscribeFeed({.after = FeedPosition{position.epoch, 0U}});
+            assert(feed_test::Next(*stale)->kind == FeedEntry::Kind::kResync);
+        }
+        if (old_position && old_position->revision < position.revision) {
+            auto old = table->SubscribeFeed({.after = old_position});
+            assert(feed_test::Next(*old)->kind == FeedEntry::Kind::kResync);
+        }
+    }
+}
+}
+// While a background checkpoint writes a chunk's files without its lock, a
+// chunk-form subscriber receives an ordinary write, and a metadata SET CHUNK
+// waits for the checkpoint. Creating a slot also waits for it; the archive
+// then records later changes over a base holding every earlier write.
+void BackgroundCheckpointFilesKeepFeedsAndSlots() {
+    test::ScopedTempDir directory("chunkdb-feed-checkpoint-files");
+    auto config = feed_test::Config(directory.path());
+    config.background_maintenance = true;
+    config.default_options.checkpoint_update_interval = 1U;
+    config.slot_sync_interval = std::chrono::hours(1);
+    std::optional<FeedSlot> slot;
+    {
+        TableCatalog catalog(config);
+        const auto table = Create(catalog);
+        auto chunks = table->SubscribeFeed(FeedOptions{.chunks = true});
+        ChunkStore* store = nullptr;
+        const auto paused = [&](std::string_view bits, std::uint64_t owner) {
+            auto lease = table->Acquire();
+            store = &lease->store();
+            store->WalBarrier();
+            store->ArmCheckpointBeforeWalRemovalPauseForTests();
+            store->SetBlockBits(0, 0, bits);
+            assert(store->WaitForCheckpointBeforeWalRemovalForTests());
+            CheckedForm(*table, *feed_test::Next(*chunks), owner);
+        };
+        paused("10000000", 0U);
+        {
+            auto lease = table->Acquire();
+            lease->store().SetBlockBits(1, 0, "01000000");
+        }
+        CheckedForm(*table, *feed_test::Next(*chunks), 0U);
+        auto metadata = std::async(std::launch::async, [&] { return Metadata(*table, {0, 0}, 5U); });
+        bool waited = metadata.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready;
+        store->ResumeCheckpointBeforeWalRemovalForTests();
+        assert(metadata.get() != 0U && waited);
+        CheckedForm(*table, *feed_test::Next(*chunks), 5U);
+
+        paused("11000000", 5U);
+        auto created = std::async(std::launch::async, [&] { return table->CreateFeedSlot("consumer"); });
+        waited = created.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready;
+        store->ResumeCheckpointBeforeWalRemovalForTests();
+        slot = created.get();
+        assert(waited);
+        const auto next = Metadata(*table, {0, 0}, 6U);
+        {
+            auto lease = table->Acquire();
+            lease->store().CheckpointForTests(0, 0);
+        }
+        FeedSlotTestAccess::Sync(*table);
+        auto reader = table->ReadFeedArchive(slot->position);
+        const auto change = reader.Next();
+        assert(change && change->position.revision == next && change->chunk_changes.size() == 1U);
+        Row(change->chunk_changes[0].before, 5U);
+        Row(change->chunk_changes[0].after, 6U);
+        assert(!reader.Next());
+    }
+    config.background_maintenance = false;
+    TableCatalog reopened(config);
+    auto lease = reopened.Require("t")->Acquire();
+    assert(lease->store().GetBlockBits(0, 0) == "11000000" && lease->store().GetBlockBits(1, 0) == "01000000");
+    const auto state = lease->store().ReadChunkState(0, 0);
+    Row(DecodeChunkColumns(lease->store().geometry().chunk_schema(), state.chunk_columns->bytes), 6U);
+}
+int main(int argc, char** argv) {
+    if (argc > 1) {
+        if (std::string_view(argv[1]) == "--archive-budget") {
+            ArchiveEnforcesDecodedEntryBudget(); ArchiveDeliversChangeWhoseFrameFitsTheBudget(); MinimumEncodedBytesStayBelowTheFrame();
+            ArchiveFilterMatchesTheWatchFilter();
+        }
+        else if (std::string_view(argv[1]) == "--scan-continuation") ScanCutContinuesFirstWatch();
+        else ThreeDimensionalBlockCoordinates();
+        return 0;
+    }
+    LiveMetadataAndCheckedForms();
+    ArchivePreservesMetadataRowsAndForms();
+    BaselineInitializationAndSchemaRows();
+    ArchiveEnforcesDecodedEntryBudget();
+    ArchiveDeliversChangeWhoseFrameFitsTheBudget();
+    MinimumEncodedBytesStayBelowTheFrame();
+    ArchiveFilterMatchesTheWatchFilter();
+    ScanCutContinuesFirstWatch();
+    BackgroundCheckpointFilesKeepFeedsAndSlots();
+}

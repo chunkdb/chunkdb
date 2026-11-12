@@ -152,6 +152,7 @@ void DescribeEpochPreservesSchemaAndFrontier() {
     for (const std::string& changed :
          {source, Replace(source, "version = 1", "version = 17"), Replace(source, "chunk = 2 x 2", "chunk = 4 x 8"),
           Replace(source, "large = 8 x 8", "large = 16 x 32"), Replace(source, "revision = 0", "revision = 37"),
+          Replace(Replace(Replace(source, "chunk = 2 x 2", "chunk = 2 x 2 x 2"), "large = 8 x 8", "large = 8 x 8 x 8"), "dims = 2", "dims = 3"),
           Replace(source, "revision = 0", "revision = NULL"), Replace(source, "dims = 2", "dims = 3"),
           Replace(source, "  kind u8", "  epoch text(32) DEFAULT '" + epoch + "'"),
           Replace(source, "1048576", "2097152")}) {
@@ -162,6 +163,40 @@ void DescribeEpochPreservesSchemaAndFrontier() {
     }
     const std::string unrelated = "table = world\nepoch = " + epoch + "\nvalue = " + epoch + "\n";
     assert(Normalize(unrelated) == unrelated);
+}
+
+void ChunkTimesRequireACompleteSummary() {
+    const std::string source = "version = 7\nschema_version = 3\ncommit_time_ms = 123\npresent = 2 of 8 blocks\n"
+        "projected = true\nblock 1 1 1\n  commit_time_ms = 456\n";
+    for (const std::string indent : {"", "  "}) {
+        auto indented = indent + Replace(source, "\n", "\n" + indent);
+        if (!indent.empty()) indented.resize(indented.size() - indent.size());
+        const auto expected = Replace(indented, "commit_time_ms = 123", "commit_time_ms = <time-ms>");
+        assert(Normalize(indented) == expected);
+        assert(Normalize(Replace(indented, "\n", "\r\n")) == expected);
+    }
+    for (const auto& unrelated : {std::string("commit_time_ms = 123\n"),
+             Replace(source, "schema_version = 3", "schema_version = '3'"),
+             Replace(source, "present = 2 of 8 blocks", "present = '2 of 8 blocks'"),
+             Replace(source, "commit_time_ms = 123", "commit_time_ms = NULL")})
+        assert(Normalize(unrelated) == unrelated);
+}
+
+void ScanEpochPreservesCoordinatesAndRevisions() {
+    const std::string epoch = "0123456789abcdef0123456789abcdef";
+    const std::string source = "chunks:\n  1) [-1, 2, 37]\nmore = true\nepoch = " + epoch +
+        "\nposition = 41\nretained_deletion_floor = 13\n";
+    for (const auto& changed : {source, Replace(source, "[-1, 2, 37]", "[-1, 2, -3, 37]"),
+             Replace(source, "position = 41", "position = NULL"),
+             Replace(source, "chunks:\n  1) [-1, 2, 37]", "chunks = []")}) {
+        const auto expected = Replace(changed, epoch, "<epoch>");
+        assert(Normalize(changed) == expected);
+        assert(Normalize(Replace(changed, "\n", "\r\n")) == expected);
+    }
+    for (const auto& unrelated : {std::string("epoch = ") + epoch + "\n", Replace(source, "chunks:", "values:"),
+             Replace(source, "[-1, 2, 37]", "[-1, 2]"),
+             Replace(source, "retained_deletion_floor = 13", "retained_deletion_floor = '13'")})
+        assert(Normalize(unrelated) == unrelated);
 }
 
 void SlotEpochRequiresMetadataContext() {
@@ -355,6 +390,8 @@ int main(int argc, char** argv) {
     OnlyVolatileMetadataChanges();
     MultilineSlotEpochPreservesFields();
     DescribeEpochPreservesSchemaAndFrontier();
+    ChunkTimesRequireACompleteSummary();
+    ScanEpochPreservesCoordinatesAndRevisions();
     SlotEpochRequiresMetadataContext();
     UnifiedDiffMatchesDifflib();
     TextHelpersMatchReference();

@@ -348,14 +348,15 @@ void TestFrameVersions() {
         return batch;
     };
     const auto replay = [&](const std::vector<Bytes>& frames) {
-        auto wal = chunkdb::BuildWalHeader(coord, store_id, {});
+        const chunkdb::FeatureFlags features{.incompat = chunkdb::kChunkModelFormatBit};
+        auto wal = chunkdb::BuildWalHeader(coord, store_id, features);
         for (const auto& f : frames) {
             wal.insert(wal.end(), f.begin(), f.end());
         }
         Bytes payload;
         Bytes presence(2, 0U);
         chunkdb::ChunkVars vars;
-        return chunkdb::ReplayWal(wal, geometry, coord, store_id, {}, 0, 0, &payload, &presence, &vars);
+        return chunkdb::ReplayWal(wal, geometry, coord, store_id, features, 0, 0, &payload, &presence, &vars);
     };
     {
         const auto r = replay({frame(1, 1), frame(2, 3)});

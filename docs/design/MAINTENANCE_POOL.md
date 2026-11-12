@@ -27,12 +27,17 @@ Pool destruction drains accepted jobs and joins its workers.
 
 In relaxed mode a background checkpoint writes and syncs the chunk image and removes the WAL without holding the chunk lock.
 It takes the image, closes the WAL stream and marks the chunk under the lock, and clears the mark when it has retaken the lock.
-While the mark is set, an ordinary block write changes only memory and the batch; SET CHUNK waits for the mark.
+While the mark is set, an ordinary block write changes only memory and the batch; SET CHUNK in every form, including metadata and projected SET CHUNK, waits for the mark.
 Its group-commit flush and checkpoint check wait for the checkpoint, which runs both when it ends.
 A write waits for the checkpoint once the writes since the image reach the hard bound of four checkpoint intervals or four WAL thresholds.
-Transactions, conditional writes, barriers, eviction, backup and feed-slot preparation wait for the mark before they touch the chunk's files.
+Transactions, conditional writes, barriers, eviction, reopen and shutdown flushes, feed-slot syncs and the checkpoints of tombstone compaction wait for the mark before they touch the chunk's files.
+Exclusive table admission does not stop maintenance, so compaction waits like any other path.
+Backup takes maintenance admission, which the checkpoint holds until it ends, and feed-slot creation stops maintenance before it prepares its baseline, so neither meets the mark.
 The checkpoint holds the publish lock from before the image write until the WAL is removed, so barrier drains and the durability floor order with it as before.
 Synced durability modes and tables with a feed archive keep the whole checkpoint under the chunk lock, because their writes need the files.
+A chunk without present blocks or non-default chunk columns is collected under the lock too, so its strict WAL flush and tombstone publication never run without it.
+The image, with its chunk columns, version and commit time, is serialized under the lock; the window reads no chunk state.
+A write that empties the chunk during the window goes to the next WAL, and the checkpoint the ending one schedules collects it.
 
 Holding the chunk lock through the syncs made a writer that revisited the chunk wait for them.
 With fewer workers than tables, those waits came one after another, and writes ran at the checkpoint rate.
@@ -56,6 +61,7 @@ A catalog test with one worker drops a table during its barrier and closes the c
 Existing checkpoint, eviction, backup, migration, feature-activation and crash suites cover the store lifecycle boundaries.
 Measurements use 1, 100 and 1,000 tables and record process threads, memory, barrier latency and write throughput on the benchmark server.
 A store regression test pauses a background checkpoint before its WAL removal and requires writes to that chunk to return, up to the hard bound, and to survive a reopen.
+Chunk-model tests pause it the same way and run every SET CHUNK form and a transaction in two and three dimensions, an emptying write, tombstone compaction, backup and feed-slot creation against it.
 
 ## Measurements
 

@@ -35,6 +35,7 @@ struct FeedPosition {
 struct FeedArea {
     ChunkCoord first;
     ChunkCoord last;
+    std::uint8_t dims = 2;
     friend bool operator==(const FeedArea&, const FeedArea&) = default;
 };
 
@@ -63,6 +64,8 @@ struct FeedBlockChange {
     std::optional<std::vector<ColumnValue>> after;
     std::uint32_t local_x = 0;
     std::uint32_t local_y = 0;
+    std::optional<std::int64_t> z{};
+    std::uint32_t local_z = 0;
 };
 
 struct FeedChunkForm {
@@ -70,6 +73,12 @@ struct FeedChunkForm {
     std::uint64_t version = 0U;
     // Null denotes a committed deletion; bytes are the exact post-commit form.
     std::shared_ptr<const std::string> form;
+};
+
+struct FeedChunkChange {
+    ChunkCoord chunk;
+    std::optional<std::vector<ColumnValue>> before;
+    std::optional<std::vector<ColumnValue>> after;
 };
 
 struct FeedEntry {
@@ -85,6 +94,9 @@ struct FeedEntry {
     std::vector<Column> columns;
     // Immutable RESP3 bytes, charged to the ring and shared by whole-area watches.
     std::shared_ptr<const std::string> protocol_frame;
+    std::uint8_t dims = 2U;
+    std::vector<Column> chunk_columns;
+    std::vector<FeedChunkChange> chunk_changes;
 };
 
 // A subscription has one reader. Different subscriptions are independent.

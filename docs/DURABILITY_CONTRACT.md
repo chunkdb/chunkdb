@@ -31,7 +31,7 @@ FLUSH WAL
 
 ```output
 OK
-2
+1
 OK
 ```
 

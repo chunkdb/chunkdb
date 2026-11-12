@@ -2,11 +2,13 @@
 #include <fstream>
 #include <sstream>
 
+#include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
 #include "feature_activation_records.hpp"
 #include "feed_slot_records.hpp"
+#include "archive_base_format.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
 #include "catalog_test_utils.hpp"
@@ -142,6 +144,9 @@ void FilterOwnership() {
 
 void ArchiveValidation() {
     Fixture fixture;
+    const auto descriptor = fixture.table / kFeedArchiveDirName / ArchiveBaseFileName({0, 0}, 2U, 2U);
+    Save(descriptor, SerializeArchiveBaseDescriptor({.dims = 2U, .kind = ArchiveBaseKind::kNeverWritten,
+        .epoch = fixture.manifest.store_id, .coord = {0, 0}, .first = 2U, .base_schema = 1U}, kMaxChunkImageFileBytes));
     const auto bytes = fixture.Archive();
     Save(fixture.Wal(), bytes);
     auto [counts, output] = fixture.Verify();
@@ -163,10 +168,12 @@ void ArchiveValidation() {
     std::filesystem::rename(fixture.Wal(), fixture.Wal("C_0_0.0-4.wal"));
     assert(fixture.Verify().second.find("feed_archive_name_invalid") != std::string::npos);
     std::filesystem::remove(fixture.Wal("C_0_0.0-4.wal"));
+    std::filesystem::remove(descriptor);
     // A linked base before WAL rename is an accepted checkpoint crash state.
     const auto image = SerializeChunkImage(fixture.geometry, {0, 0}, {7U, 0U}, {1U},
         CheckpointCompression::kNone, 1U, 10U, fixture.manifest.store_id);
     Save(fixture.Base(), image);
+    Save(ChunkDataPath(fixture.table, fixture.geometry, {0, 0}), image);
     assert(fixture.Verify().first.errors == 0U);
     auto bad_base = image;
     bad_base.back() ^= 1U;
@@ -177,6 +184,30 @@ void ArchiveValidation() {
         CheckpointCompression::kNone, 2U, 20U, fixture.manifest.store_id));
     assert(fixture.Verify().second.find("feed_archive_base_invalid") != std::string::npos);
 }
+
+// Owned records verify like unowned ones; an earlier development layout or a
+// record of another dimensionality is reported and left in place.
+void OwnedAndEarlierRecords() {
+    Fixture fixture;
+    const auto path = fixture.table / kFeedSlotsFileName;
+    FeedSlotRecord owned{"owned", 1U, false};
+    owned.owner = "alice";
+    WriteFeedSlotRecords(fixture.table, {fixture.manifest.store_id, 4U, {owned, {"unowned", 2U, false}}});
+    assert(fixture.Verify().first.errors == 0U);
+    const auto valid = LoadFile(path);
+    for (const auto tag : {1U, 2U, 3U}) {
+        auto earlier = valid;
+        earlier[4U] = static_cast<std::uint8_t>(tag);
+        earlier.resize(earlier.size() - 4U);
+        WriteLe32(earlier, Crc32(earlier.data(), earlier.size()));
+        Save(path, earlier);
+        const auto [counts, output] = fixture.Verify();
+        assert(counts.errors > 0U && output.find("feed_slots_invalid") != std::string::npos);
+        assert(output.find("earlier development") != std::string::npos && LoadFile(path) == earlier);
+    }
+    WriteFeedSlotRecords(fixture.table, {fixture.manifest.store_id, 4U, {owned}, false, 3U});
+    assert(fixture.Verify().second.find("feed_slots_invalid") != std::string::npos);
+}
 }  // namespace
 
-int main() { FeatureInspection(); RecordsAndTemporaries(); FilterOwnership(); ArchiveValidation(); }
+int main() { FeatureInspection(); RecordsAndTemporaries(); FilterOwnership(); ArchiveValidation(); OwnedAndEarlierRecords(); }

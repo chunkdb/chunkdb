@@ -5,6 +5,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <optional>
+#include <stdexcept>
 #include <string>
 #include <string_view>
 #include <vector>
@@ -16,25 +17,33 @@
 
 namespace chunkdb {
 
+class EarlierDevelopmentFormatError : public std::runtime_error {
+  public:
+    EarlierDevelopmentFormatError()
+        : std::runtime_error("created by an earlier development build; recreate the data directory") {}
+};
+
 // `table.manifest` records what a table directory (a store) is: its feature
-// flags, geometry, a random store id, options and columns. It is written
-// once, before any other artifact, and replaced atomically only to change
-// options or columns. Little-endian (docs/STORAGE_FORMAT.md Section 1.2):
+// flags, geometry, a random store id, options and columns. Direct creation
+// publishes its checked empty inventory first; both precede chunk data.
+// The manifest is replaced atomically for option or column changes.
+// Little-endian (docs/STORAGE_FORMAT.md Section 1.2):
 //   [0, 4)    magic "CKMF"
-//   [4, 6)    u16 manifest version (3)
+//   [4, 6)    u16 manifest version (5)
 //   [6, 8)    u16 reserved, zero
 //   [8, 20)   u32 incompat, ro_compat, compat feature flags
-//   [20, 36)  u32 large_chunk_width, large_chunk_height, chunk_width,
-//             chunk_height
-//   [36, 52)  store id (16 random bytes, not all zero)
-//   [52, 56)  u32 options_size
+//   [20, 24)  dims u8, three reserved zero bytes
+//   [24, 48)  u32 large x/y/z sides, chunk x/y/z sides
+//   [48, 64)  store id (16 random bytes, not all zero)
+//   [64, 68)  u32 options_size
 //   then      options: TLV entries (u16 type, u16 length, value)
-//   then      u32 schema_size, then the schema area (EncodeTableSchema)
+//   then      u32 block_schema_size, block schema, u32 chunk_schema_size,
+//             chunk schema (EncodeTableSchema / EncodeChunkSchema)
 //   then      u32 CRC32 over every preceding byte
 // A block's width is not a geometry field: it is the schema's fixed bits.
 inline constexpr std::string_view kStoreManifestFileName = "table.manifest";
-inline constexpr std::uint16_t kStoreManifestVersion = 4;
-inline constexpr std::size_t kStoreManifestMinSize = 64;
+inline constexpr std::uint16_t kStoreManifestVersion = 5;
+inline constexpr std::size_t kStoreManifestMinSize = 80;
 inline constexpr std::size_t kStoreManifestMaxSize = 1024U * 1024U;
 
 // Option TLV types of a table manifest. Each appears at most once; an absent
@@ -52,7 +61,7 @@ inline constexpr std::uint16_t kOptionParentEpoch = 10;            // 16-byte st
 inline constexpr std::uint16_t kOptionForkRevision = 11;           // u64, including zero
 
 struct StoreManifest {
-    FeatureFlags features;
+    FeatureFlags features{.incompat = kFeatureChunkModel};
     // block_bits is the schema's fixed bits per block; ParseStoreManifest
     // fills it in and SerializeStoreManifest requires it to match.
     GeometryConfig geometry;
@@ -63,6 +72,9 @@ struct StoreManifest {
     // Owned metadata is separate from mutable options, so option replacements
     // cannot erase the restore relationship. Both TLVs are absent or present.
     std::optional<TableLineage> lineage{};
+    // Omitted only by block-only construction APIs; the encoded envelope
+    // always contains its complete companion domain and shared history.
+    std::optional<TableSchema> chunk_schema{};
 };
 
 // Options area holding every option of `options`.
@@ -77,6 +89,10 @@ void ReplaceTableOptions(StoreManifest* manifest, const TableOptions& options);
 
 [[nodiscard]] std::filesystem::path StoreManifestPath(const std::filesystem::path& data_dir);
 [[nodiscard]] std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest);
+// Advance the unchanged companion of one column-domain change, then validate
+// both complete histories before the caller publishes a replacement manifest.
+void AlignManifestSchemaDomains(
+    StoreManifest* manifest, const TableSchema& previous_blocks, const TableSchema& previous_chunks);
 // Throws std::runtime_error saying what is wrong unless `bytes` is a complete,
 // checksum-valid manifest of this version with well-formed options (no
 // unknown option type unless an unknown non-incompat feature owns it), a
@@ -104,7 +120,7 @@ void ReplaceTableOptions(StoreManifest* manifest, const TableOptions& options);
 // holding tables under `tables/`, with feature flags for the directory
 // itself (docs/STORAGE_FORMAT.md Section 1.1). Little-endian:
 //   [0, 4)    magic "CKDM"
-//   [4, 6)    u16 version (1)
+//   [4, 6)    u16 version (2)
 //   [6, 8)    u16 reserved, zero
 //   [8, 20)   u32 incompat, ro_compat, compat feature flags
 //   [20, 36)  data-directory id (16 random bytes, not all zero)
@@ -113,12 +129,12 @@ void ReplaceTableOptions(StoreManifest* manifest, const TableOptions& options);
 //                            1 version_floor (u64, see below)
 //   then      u32 CRC32 over every preceding byte
 inline constexpr std::string_view kDataDirManifestFileName = "chunkdb.manifest";
-inline constexpr std::uint16_t kDataDirManifestVersion = 1;
+inline constexpr std::uint16_t kDataDirManifestVersion = 2;
 inline constexpr std::size_t kDataDirManifestMinSize = 44;
 inline constexpr std::size_t kDataDirManifestMaxSize = 64U * 1024U;
 
 struct DataDirManifest {
-    FeatureFlags features;
+    FeatureFlags features{.incompat = kFeatureChunkModel};
     StoreId data_dir_id{};
     std::vector<std::uint8_t> options;
 };

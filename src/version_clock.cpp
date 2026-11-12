@@ -12,6 +12,7 @@
 #include "chunk_store_internal.hpp"
 #include "checkpoint.hpp"
 #include "change_feed.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/crc32.hpp"
@@ -342,6 +343,11 @@ std::uint64_t ChunkStore::NextChunkVersion() {
 }
 
 std::uint64_t ChunkStore::NextCommitTimeMs(const RegularChunk& chunk) {
+#ifdef CHUNKDB_BENCH_CONSTANT_COMMIT_TIME
+    // Benchmark builds only: a fixed time per chunk, without the clock read
+    // and the shared monotonic step, so a paired run measures their cost.
+    return std::max<std::uint64_t>(chunk.commit_time_ms, 1U);
+#else
     const std::uint64_t floor = std::max(UnixMillisNow(), chunk.commit_time_ms);
     std::uint64_t last = last_commit_time_ms_.load(std::memory_order_relaxed);
     while (true) {
@@ -351,6 +357,7 @@ std::uint64_t ChunkStore::NextCommitTimeMs(const RegularChunk& chunk) {
             return issued;
         }
     }
+#endif
 }
 
 void ChunkStore::RaiseVersionClockAbove(std::uint64_t revision) {
@@ -385,10 +392,17 @@ std::uint64_t ChunkStore::ChunkCommitTimeForTests(std::int64_t chunk_x, std::int
 }
 
 std::uint64_t ChunkStore::GetChunkVersion(std::int64_t chunk_x, std::int64_t chunk_y) {
+    if (geometry_.dims() != 2U) throw std::invalid_argument("chunk coordinates must match the table dimensions");
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
     return regular_chunk->version;
+}
+
+bool ChunkStore::HasWrittenChunkIdentities() const {
+    const auto index = const_cast<ChunkStore*>(this)->CoordinateIndexForScan();
+    if (!index) throw std::runtime_error("coordinate index is not initialized");
+    return index->has_written_identities();
 }
 
 }  // namespace chunkdb

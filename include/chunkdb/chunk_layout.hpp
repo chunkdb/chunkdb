@@ -37,6 +37,7 @@ class ChunkLayout {
     // Throws std::invalid_argument when `schema` breaks a rule
     // (ValidateTableSchema) or the payload would exceed `max_payload_bytes`.
     ChunkLayout(TableSchema schema, std::size_t block_count, std::size_t max_payload_bytes);
+    ChunkLayout(TableSchema schema, std::size_t block_count, std::size_t max_payload_bytes, ColumnDomain domain);
 
     [[nodiscard]] const TableSchema& schema() const noexcept { return schema_; }
     [[nodiscard]] std::size_t block_count() const noexcept { return block_count_; }

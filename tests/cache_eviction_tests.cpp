@@ -514,10 +514,58 @@ void TestChunkInstanceRegistryHoldsOnlyLiveInstances() {
     }
 }
 
+// Chunks whose blocks were all deleted keep their retained identity through
+// eviction and reload, while the instance registry stays at the cache's size
+// and no reload counts as a duplicate.
+void TestRetainedIdentitiesWithInstanceRegistry() {
+    const auto data_dir = TempDataDir();
+    const chunkdb::StoreConfig config{
+        .geometry = {
+            .large_chunk_width_chunks = 2,
+            .large_chunk_height_chunks = 2,
+            .chunk_width_blocks = 4,
+            .chunk_height_blocks = 4,
+            .block_bits = 4,
+        },
+        .data_dir = data_dir,
+        .durability_mode = chunkdb::DurabilityMode::kRelaxed,
+        .checkpoint_update_interval = 10'000,
+        .checkpoint_wal_bytes = 10'000'000,
+        .max_loaded_chunks = 4,
+        .allow_multiple_processes = false,
+    };
+    {
+        chunkdb::ChunkStore store(config);
+        std::vector<std::uint64_t> deleted;
+        for (int i = 0; i < 16; ++i) {
+            store.SetBlockBits(4 * i, 0, "1010");
+            store.UnsetBlock(4 * i, 0);
+            deleted.push_back(store.GetChunkVersion(i, 0));
+            assert(deleted.back() != 0U && store.LiveChunkInstanceEntriesForTests() <= config.max_loaded_chunks + 2);
+        }
+        for (int i = 0; i < 400; ++i) {
+            (void)store.GetBlockBits(4 * (i % 40), 4 * (i / 40) + 4);
+            assert(store.LiveChunkInstanceEntriesForTests() <= config.max_loaded_chunks + 2);
+        }
+        for (int round = 0; round < 2; ++round) {
+            for (int i = 0; i < 16; ++i) {
+                assert(store.GetChunkVersion(i, 0) == deleted[static_cast<std::size_t>(i)]);
+                assert(store.LiveChunkInstanceEntriesForTests() <= config.max_loaded_chunks + 2);
+            }
+        }
+        assert(store.DuplicateChunkInstancesForTests() == 0U);
+        assert(store.LiveChunkInstanceEntriesForTests() == store.ApproxLoadedChunkCount());
+    }
+    if (!RemoveAllWithRetry(data_dir)) {
+        throw std::runtime_error("failed to remove temp dir: " + data_dir.string());
+    }
+}
+
 }  // namespace
 
 int main() {
     TestChunkInstanceRegistryHoldsOnlyLiveInstances();
+    TestRetainedIdentitiesWithInstanceRegistry();
     TestNoCacheReadAfterEvictionWithConcurrentCheckpoint();
     TestSiblingLoadsWhileEvictionCheckpoints(chunkdb::DurabilityMode::kRelaxed);
     TestSiblingLoadsWhileEvictionCheckpoints(chunkdb::DurabilityMode::kFsyncWal);

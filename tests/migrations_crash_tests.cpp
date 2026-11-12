@@ -36,6 +36,7 @@ const Operation kOperations[] = {
     {"revoke", "REVOKE READ ON realm FROM limited", 2U, false},
     {"create_slot", "CREATE SLOT 'second' ON realm", 3U, false},
     {"create_slot_owner", "CREATE SLOT 'second' ON realm OWNER limited", 3U, false},
+    {"create_slot_space", "CREATE SLOT 'second' ON space AREA 0 0 -1 TO 1 1 1 CHUNKS OWNER limited", 3U, false},
     {"drop_slot", "DROP SLOT 'second' ON realm", 2U, false},
 };
 
@@ -83,6 +84,11 @@ StoreId Seed(const std::filesystem::path& root, const Operation& operation) {
     if (std::string(operation.name).find("slot") != std::string::npos) {
         Reply(e.Run("CREATE SLOT 'first' ON realm"), "+OK\r\n");
         if (std::string(operation.name) == "drop_slot") Reply(e.Run("CREATE SLOT 'second' ON realm"), "+OK\r\n");
+        if (std::string(operation.name) == "create_slot_space") {
+            Reply(e.Run("CREATE TABLE space (v u8) CHUNK 2 x 2 x 2 CHUNK COLUMNS (tag u8 NULL)"), "+OK\r\n");
+            assert(e.Run("SET CHUNK 0 0 -1 IN space META tag = 3").front() == ':');
+            Reply(e.Run("CREATE SLOT 'first' ON space"), "+OK\r\n");
+        }
     }
     return e.catalog->Find("realm")->store_id();
 }
@@ -97,6 +103,24 @@ void Check(const std::filesystem::path& root, const Operation& operation, const 
         Reply(e.Run(std::string("MIGRATE 'once' ") + operation.statement), "+skipped\r\n");
     }
     const std::string name = operation.name;
+    if (name == "create_slot_space") {
+        // The slot record of a three-dimensional table keeps its dimensionality,
+        // its three-axis area and the owner the migration decided.
+        const auto space = e.catalog->Find("space");
+        const auto slots = space->ListFeedSlots();
+        assert(slots.size() == (applied ? 2U : 1U) && slots[0].name == "first" && slots[0].owner == "admin");
+        const auto records = ReadFeedSlotRecords(root / "tables/space", space->store_id(), 3U);
+        assert(records && records->dims == 3U && records->slots.size() == slots.size());
+        assert(ReadLe16(LoadFile(root / "tables/space" / kFeedSlotsFileName), 4U) == 4U);
+        if (applied) {
+            const auto& filters = slots[1].filters;
+            assert(slots[1].owner == "limited" && filters.chunks && filters.area && filters.area->dims == 3U);
+            assert(filters.area->first.z == -1 && filters.area->last.z == 1);
+        }
+        auto lease = space->Acquire();
+        assert(lease && lease->store().ReadChunkState(ChunkCoord{0, 0, -1}).written);
+        return;
+    }
     const auto table = e.catalog->Find("realm");
     if (name == "create") {
         assert(static_cast<bool>(table) == applied);

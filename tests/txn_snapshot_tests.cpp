@@ -55,9 +55,8 @@ TxnConflictReason ConflictReasonOf(const std::function<void()>& action) {
     return TxnConflictReason::kChunkChanged;
 }
 
-// Collection leaves an empty written chunk in the cache. Retiring that
-// tombstone changes GET CHUNK to NULL, but both earlier snapshots must keep
-// its written form and version, including one taken after collection.
+// Collection and eviction preserve the empty written identity for every
+// snapshot; only an actual resurrection creates a new conflict boundary.
 void TestCollectedTombstoneAtSnapshot() {
     ScopedTempDir dir("chunkdb-txn-snapshot-tombstone");
     auto config = Config(dir.path());
@@ -79,21 +78,29 @@ void TestCollectedTombstoneAtSnapshot() {
     assert(store.ReadChunkStateAt(*after_gc, kA.x, kA.y).written);
 
     const auto evictions = store.RuntimeStats().evictions;
+    const auto frontier = store.CompletedRevision();
     (void)store.ReadChunkState(kB.x, kB.y);
     assert(store.RuntimeStats().evictions > evictions);
-    assert(!store.ReadChunkState(kA.x, kA.y).written);
+    assert(store.CompletedRevision() == frontier);
+    assert(store.TxnKeptStateCountForTests() == 0U);
+    assert(store.ReadChunkState(kA.x, kA.y).written);
     auto after_eviction = store.BeginTxnSnapshot(kTxnDuration);
-    assert(!store.ReadChunkStateAt(*after_eviction, kA.x, kA.y).written);
-    for (const auto* snapshot : {before_gc.get(), after_gc.get()}) {
+    assert(store.ReadChunkStateAt(*after_eviction, kA.x, kA.y).written);
+    for (const auto* snapshot : {before_gc.get(), after_gc.get(), after_eviction.get()}) {
         const auto kept = store.ReadChunkStateAt(*snapshot, kA.x, kA.y);
         assert(kept.written);
         assert(kept.version == tombstone.version);
+        assert(kept.commit_time_ms == tombstone.commit_time_ms);
         assert(kept.payload == tombstone.payload);
         assert(kept.presence_bitmap == tombstone.presence_bitmap);
         assert(kept.vars == tombstone.vars);
-        assert(store.ChunkChangedSince(*snapshot, kA.x, kA.y));
+        assert(!store.ChunkChangedSince(*snapshot, kA.x, kA.y));
     }
-    assert(!store.ChunkChangedSince(*after_eviction, kA.x, kA.y));
+    // Collection and eviction preserve producing identity; an actual
+    // resurrection still conflicts with every earlier chunk read.
+    WriteCounter(store, kA, 8U);
+    for (const auto* snapshot : {before_gc.get(), after_gc.get(), after_eviction.get()})
+        assert(store.ChunkChangedSince(*snapshot, kA.x, kA.y));
     assert(store.TxnKeptStateCountForTests() == 1U);
     auto write = store.ReadChunkStateAt(*before_gc, kC.x, kC.y);
     SetCounter(&write, 9);
@@ -104,12 +111,13 @@ void TestCollectedTombstoneAtSnapshot() {
     assert(store.TxnKeptStateCountForTests() == 1U);
     // Read-only commits need no validation of the earlier read set.
     assert(store.CommitTransaction(*after_gc, {kA}, {}) == 0U);
+    assert(store.TxnKeptStateCountForTests() == 1U);
+    store.EndTxnSnapshot(*after_eviction);
     assert(store.TxnKeptStateCountForTests() == 0U);
     assert(store.TxnKeptBytesForTests() == 0U);
-    store.EndTxnSnapshot(*after_eviction);
 }
 
-void TestTombstoneRetirementUsesHistoryLimit() {
+void TestTombstoneRetirementPreservesHistoryLimit() {
     ScopedTempDir dir("chunkdb-txn-snapshot-tombstone-limit");
     auto config = Config(dir.path());
     config.max_loaded_chunks = 1;
@@ -125,11 +133,16 @@ void TestTombstoneRetirementUsesHistoryLimit() {
     const auto evictions = store.RuntimeStats().evictions;
     (void)store.ReadChunkState(kB.x, kB.y);
     assert(store.RuntimeStats().evictions > evictions);
+    assert(store.ReadChunkStateAt(*snapshot, kA.x, kA.y).written);
+    assert(store.TxnRegisteredCountForTests() == 1U);
+    assert(store.TxnKeptStateCountForTests() == 0U);
+    assert(!store.ChunkChangedSince(*snapshot, kA.x, kA.y));
+    WriteCounter(store, kA, 8U);
     assert(ConflictReasonOf([&] { (void)store.ReadChunkStateAt(*snapshot, kA.x, kA.y); }) ==
            TxnConflictReason::kHistoryLimit);
     assert(store.TxnRegisteredCountForTests() == 0U);
     assert(store.TxnKeptStateCountForTests() == 0U);
-    assert(!store.ReadChunkState(kA.x, kA.y).written);
+    assert(store.ReadChunkState(kA.x, kA.y).written);
 }
 
 // Eviction backed by an image preserves a present chunk without publishing
@@ -509,7 +522,7 @@ void TestDurationLimit() {
 
 int main() {
     TestCollectedTombstoneAtSnapshot();
-    TestTombstoneRetirementUsesHistoryLimit();
+    TestTombstoneRetirementPreservesHistoryLimit();
     TestPresentEvictionAtSnapshot();
     TestSnapshotReadsOldStates();
     TestEveryWritePathKeeps();

@@ -6,12 +6,20 @@
 
 #include "chunkdb/feed_slots.hpp"
 #include "chunkdb/geometry.hpp"
+#include "archive_base_format.hpp"
 
 namespace chunkdb {
 struct FeedWalPrefix;
+struct ChunkStateImage;
 
 // A short-lived native read that permits live WAL/image replacement on Windows.
 [[nodiscard]] std::vector<std::uint8_t> ReadFeedSnapshotFile(const std::filesystem::path& path);
+[[nodiscard]] std::optional<ArchiveBaseDescriptor> ReadFeedArchiveBaseDescriptor(
+    const std::filesystem::path& path, const Geometry& geometry, const StoreId& epoch,
+    ChunkCoord coord, std::uint64_t first);
+[[nodiscard]] ChunkStateImage ReadPinnedFeedArchiveBase(const std::filesystem::path& path,
+    const Geometry& geometry, const StoreId& epoch, ChunkCoord coord, FeatureFlags features,
+    const ArchiveBaseDescriptor& descriptor);
 
 // The caller holds the table's exclusive lease and checkpoint publication
 // mutex while capturing the snapshot. The pin prevents deletion of archives

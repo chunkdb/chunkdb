@@ -24,7 +24,7 @@ OK
 (applies at COMMIT)
 (applies at COMMIT)
 gold = 90
-3
+1
 OK
 OK
 ```

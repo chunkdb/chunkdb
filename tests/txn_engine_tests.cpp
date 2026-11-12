@@ -17,6 +17,7 @@
 #include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "txn_test_utils.hpp"
+#include "../src/sectioned_chunk_form.hpp"
 
 namespace {
 
@@ -67,15 +68,17 @@ std::string Value(std::int64_t n) {
     return "*1\r\n:" + std::to_string(n) + "\r\n";
 }
 
-// The version in a GET CHUNK reply: the form's first eight bytes.
-std::uint64_t ChunkVersionOf(const std::string& reply) {
+chunkdb::ChunkFormHeader ChunkHeaderOf(const std::string& reply) {
     const auto body = reply.find("\r\n");
-    assert(reply[0] == '$' && body != std::string::npos);
-    std::uint64_t version = 0;
-    for (std::size_t i = 0; i < 8; ++i) {
-        version |= static_cast<std::uint64_t>(static_cast<unsigned char>(reply[body + 2 + i])) << (8U * i);
-    }
-    return version;
+    assert(!reply.empty() && reply[0] == '$' && body != std::string::npos);
+    const auto length = std::stoull(reply.substr(1U, body - 1U));
+    assert(reply.size() == body + 2U + length + 2U && reply.ends_with("\r\n"));
+    const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(reply.data() + body + 2U), length);
+    return chunkdb::ParseChunkFormSections(bytes, bytes.size(), chunkdb::ChunkFormReadMode::kRead).header;
+}
+
+std::uint64_t ChunkVersionOf(const std::string& reply) {
+    return ChunkHeaderOf(reply).chunk_version;
 }
 
 struct Fixture {
@@ -118,11 +121,17 @@ void TestCommitAppliesTogether() {
     ExpectReply(f.Run(f.a, "SET BLOCK 9 9 IN t n = 2"), "_\r\n");
     ExpectReply(f.Run(f.a, "GET BLOCK 0 0 FROM t"), Value(1));
     ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), "_\r\n");
+    const auto pending = ChunkHeaderOf(f.Run(f.a, "GET CHUNK 0 0 FROM t"));
+    assert(pending.flags == chunkdb::kChunkFormPrivate && pending.chunk_version == 0U &&
+           pending.commit_time_ms == 0U && pending.schema_version == 1U);
     const std::uint64_t version = VersionOf(f.Run(f.a, "COMMIT"));
     ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), Value(1));
     ExpectReply(f.Run(f.b, "GET BLOCK 9 9 FROM t"), Value(2));
     assert(ChunkVersionOf(f.Run(f.b, "GET CHUNK 0 0 FROM t")) == version);
     assert(ChunkVersionOf(f.Run(f.b, "GET CHUNK 2 2 FROM t")) == version);
+    const auto committed = ChunkHeaderOf(f.Run(f.b, "GET CHUNK 0 0 FROM t"));
+    assert(committed.flags == 0U && committed.commit_time_ms > 0U &&
+           committed.schema_version == pending.schema_version);
     // The session is out of the transaction: a write answers its version.
     (void)VersionOf(f.Run(f.a, "SET BLOCK 0 0 IN t n = 3"));
     assert(f.RegisteredSnapshots() == 0);
@@ -358,6 +367,30 @@ void TestExpiredTransactionReleasesBudget() {
     ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), "_\r\n");
 }
 
+// Chunk metadata and block writes of a three-dimensional table count toward
+// --txn-total-bytes, and a transaction past its duration releases them too.
+void TestExpiredDimensionalTransactionReleasesBudget() {
+    Fixture f(chunkdb::EngineConfig{.txn_max_duration = kShortDuration, .txn_total_bytes = 300});
+    ExpectReply(f.Run(f.a, "CREATE TABLE v (n u8) CHUNK 2 x 2 x 2 CHUNK COLUMNS (note text(255) NULL)"), "+OK\r\n");
+    const std::string note(200U, 'm');
+    ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run(f.a, "SET CHUNK 0 0 1 IN v META note = '" + note + "'"), "_\r\n");
+    ExpectReply(f.Run(f.a, "SET BLOCK 0 0 2 IN v n = 1"), "_\r\n");
+    ExpectReply(f.Run(f.b, "BEGIN"), "+OK\r\n");
+    ExpectError(f.Run(f.b, "SET CHUNK 1 0 1 IN v META note = '" + note + "'"),
+        "INVALID_ARGUMENT open transactions hold more than --txn-total-bytes");
+    ExpectReply(f.Run(f.b, "ROLLBACK"), "+OK\r\n");
+    std::this_thread::sleep_for(kPastShortDuration);
+    ExpectReply(f.Run(f.b, "BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run(f.b, "SET CHUNK 1 0 1 IN v META note = '" + note + "'"), "_\r\n");
+    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT reason=duration");
+    (void)VersionOf(f.Run(f.b, "COMMIT"));
+    const auto unwritten = f.Run(f.b, "GET CHUNK 0 0 1 FROM v");
+    assert(unwritten.find(note) == std::string::npos);
+    ExpectReply(f.Run(f.b, "GET BLOCK 0 0 2 FROM v"), "_\r\n");
+    assert(f.Run(f.b, "GET CHUNK 1 0 1 FROM v").find(note) != std::string::npos);
+}
+
 // A session that closes, or runs a statement, while another session's write
 // ends expired transactions: the write gets the bytes in every order, and
 // the expired transaction applies nothing.
@@ -497,6 +530,7 @@ int main() {
     TestDurationLimit();
     TestUnexpiredTransactionKeepsBudget();
     TestExpiredTransactionReleasesBudget();
+    TestExpiredDimensionalTransactionReleasesBudget();
     TestExpiredTransactionEndsDuringSessionClose();
     TestByteAndChunkLimits();
     TestTableChanged();

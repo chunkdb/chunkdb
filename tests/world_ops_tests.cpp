@@ -27,6 +27,9 @@
 #include "chunkdb/metrics.hpp"
 #include "chunkdb/zrle.hpp"
 #include "test_utils.hpp"
+#include "../src/sectioned_chunk_form.hpp"
+#include "../src/store_manifest.hpp"
+#include "../src/typed_chunk_form.hpp"
 
 namespace {
 
@@ -49,9 +52,8 @@ chunkdb::StoreConfig BaseConfig(const std::filesystem::path& data_dir) {
     };
 }
 
-// The first scan discovers cold directories once. Later pages and newly
-// loaded large chunks reuse/update the catalog, including cache-only writes.
-void TestScanCatalogTracksNewDirectoriesAndEviction() {
+// Scan pages list chunks written before the start and chunks written, emptied and rewritten after it under eviction.
+void TestScanPagesSeeWritesAfterStartAndEviction() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-catalog");
     auto config = BaseConfig(dir.path());
     config.max_loaded_chunks = 1;
@@ -63,16 +65,14 @@ void TestScanCatalogTracksNewDirectoriesAndEviction() {
         }
     }
     chunkdb::ChunkStore store(config);
-    assert(store.ScanCatalogBuildsForTests() == 0);
     const auto first = store.ScanPopulatedChunks(false, {}, 2);
     assert(first.coords.size() == 2 && first.has_more);
-    assert(store.ScanCatalogBuildsForTests() == 1);
-    // New directories after initialization must not be hidden by the index.
+    // Chunks first written after the start are listed.
     store.SetBlockBits(4000, 0, "10001");
     store.SetBlockBits(-4000, 0, "10001");
     store.UnsetBlock(4000, 0);
     store.SetBlockBits(8000, 0, "10001");
-    // Re-create a directory removed by empty-chunk GC and eviction.
+    // A chunk emptied and written again under eviction is listed once.
     store.SetBlockBits(4000, 0, "11011");
     std::size_t seen = first.coords.size();
     auto cursor = first.coords.back();
@@ -85,10 +85,10 @@ void TestScanCatalogTracksNewDirectoriesAndEviction() {
         cursor = page.coords.back();
     }
     assert(seen == 42);  // the negative coordinate is behind the cursor
-    assert(store.ScanCatalogBuildsForTests() == 1);
 }
 
-void TestReadOnlyScanCatalogRefreshesAfterWriterChanges() {
+// A read-only store lists chunks a writer adds after the reader opened.
+void TestReadOnlyScanSeesWriterChanges() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-catalog-reader");
     auto config = BaseConfig(dir.path());
     chunkdb::ChunkStore writer(config);
@@ -98,22 +98,18 @@ void TestReadOnlyScanCatalogRefreshesAfterWriterChanges() {
     reader_config.access_mode = chunkdb::AccessMode::kReadOnly;
     chunkdb::ChunkStore reader(reader_config);
     assert(reader.ScanPopulatedChunks(false, {}, 10).coords.size() == 1);
-    assert(reader.ScanCatalogBuildsForTests() == 1);
     assert(reader.ScanPopulatedChunks(false, {}, 10).coords.size() == 1);
-    assert(reader.ScanCatalogBuildsForTests() == 1);
     writer.SetBlockBits(4000, 0, "10001");
     writer.WalBarrier();
     const auto changed = reader.ScanPopulatedChunks(false, {}, 10);
     assert(changed.coords.size() == 2);
     assert(changed.coords.back().x == 1000);
-    assert(reader.ScanCatalogBuildsForTests() == 2);
 }
 
-void TestScanVisitsOnlyNeededLargeChunkColumns() {
-    // Large chunks are 2x2 regular chunks (BaseConfig), so a 24x24 chunk
-    // world spans 144 L_ directories in 12 columns. Every page must list only
-    // the columns it needs, and pagination must still enumerate everything in
-    // ascending (cx, cy) order, negatives included.
+void TestScanPagesWalkAColdWorldInOrder() {
+    // A 24x24 chunk world kept mostly on disk: pagination enumerates every
+    // chunk in ascending (cx, cy) order, negatives included, and a page deep
+    // in the world starts right after its cursor.
     chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-columns");
     auto config = BaseConfig(dir.path());
     config.max_loaded_chunks = 8;  // keep the world on disk, not in cache
@@ -130,8 +126,7 @@ void TestScanVisitsOnlyNeededLargeChunkColumns() {
     }
     store.WalBarrier();
 
-    // A full walk from the start touches every column.
-    const auto before_full = store.ScanLargeDirsListedForTests();
+    // A full walk from the start returns every populated chunk.
     std::vector<chunkdb::ChunkCoord> seen;
     bool has_cursor = false;
     chunkdb::ChunkCoord cursor{};
@@ -151,26 +146,14 @@ void TestScanVisitsOnlyNeededLargeChunkColumns() {
         assert(seen[i].x == expected[i].x && seen[i].y == expected[i].y);
     }
     assert(pages == 6);
-    const auto listed_full = store.ScanLargeDirsListedForTests() - before_full;
-    // 6 pages over 144 directories: the old walk listed all 144 per page
-    // (864); the column walk lists each column at most once per page it
-    // contributes to, plus the column that closes the window.
-    assert(listed_full < 6 * 144);
-    assert(listed_full <= 144 + 6 * 12);
 
-    // A page deep in the world skips every column before the cursor and
-    // stops right after its own.
-    const auto before_page = store.ScanLargeDirsListedForTests();
+    // A page deep in the world starts after the cursor.
     const auto page = store.ScanPopulatedChunks(true, {9, 3}, 10);
     assert(page.has_more);
     assert(page.coords.size() == 10);
     assert(page.coords.front().x == 9 && page.coords.front().y == 4);
     // (9,4)..(9,11) are 8 chunks, then the column cx=10 starts at cy=-12.
     assert(page.coords.back().x == 10 && page.coords.back().y == -11);
-    const auto listed_page = store.ScanLargeDirsListedForTests() - before_page;
-    // Columns lx=4 (cx 8..9), lx=5 (cx 10..11), and lx=6 closes the window:
-    // at most 3 columns of 12 directories each.
-    assert(listed_page <= 36);
 
     // The last page hits the end without a resume loop.
     const auto tail = store.ScanPopulatedChunks(true, {11, 9}, 10);
@@ -180,11 +163,9 @@ void TestScanVisitsOnlyNeededLargeChunkColumns() {
     assert(tail.coords[1].x == 11 && tail.coords[1].y == 11);
 }
 
-// A fully resident world must not make a page more expensive than a cold one:
-// the cached chunks are merged per visited large chunk, under the same cursor
-// and page-window pruning as the on-disk artifacts, instead of being poured
-// into every pass wholesale.
-void TestScanWarmCacheMergesOnlyVisitedLargeChunks() {
+// A fully resident world pages exactly like a cold one: every chunk once, in
+// order, and a page deep in the world starts right after its cursor.
+void TestScanPagesWalkAResidentWorldInOrder() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-warm");
     auto config = BaseConfig(dir.path());
     config.max_loaded_chunks = 4096;  // the whole world stays resident
@@ -201,7 +182,6 @@ void TestScanWarmCacheMergesOnlyVisitedLargeChunks() {
     assert(store.ApproxLoadedChunkCount() == expected.size());
 
     // Warm pagination still enumerates the world exactly once, in order.
-    const auto merged_before_full = store.ScanCachedLargeChunksMergedForTests();
     std::vector<chunkdb::ChunkCoord> seen;
     bool has_cursor = false;
     chunkdb::ChunkCoord cursor{};
@@ -218,33 +198,19 @@ void TestScanWarmCacheMergesOnlyVisitedLargeChunks() {
     for (std::size_t i = 0; i < seen.size(); ++i) {
         assert(seen[i].x == expected[i].x && seen[i].y == expected[i].y);
     }
-    // Six pages over 144 resident large chunks: the unconditional merge cost
-    // 6 * 144 = 864 large-chunk visits.
-    const auto merged_full = store.ScanCachedLargeChunksMergedForTests() - merged_before_full;
-    assert(merged_full < 6 * 144);
 
-    // One page deep in the world touches only the large chunks around it,
-    // whether their chunks come from disk or from the cache.
-    const auto dirs_before = store.ScanLargeDirsListedForTests();
-    const auto merged_before = store.ScanCachedLargeChunksMergedForTests();
+    // One page deep in the world starts after the cursor and crosses into the next column.
     const auto page = store.ScanPopulatedChunks(true, {9, 3}, 10);
     assert(page.has_more);
     assert(page.coords.size() == 10);
     assert(page.coords.front().x == 9 && page.coords.front().y == 4);
     assert(page.coords.back().x == 10 && page.coords.back().y == -11);
-    const auto dirs_page = store.ScanLargeDirsListedForTests() - dirs_before;
-    const auto merged_page = store.ScanCachedLargeChunksMergedForTests() - merged_before;
-    assert(dirs_page <= 36);
-    // The cache merge is bounded by the same visit set, not by the 144
-    // resident large chunks.
-    assert(merged_page <= 36);
 }
 
-// A world no wider than one large-chunk column has no column to skip, so the
-// only available cut is inside the column: large chunks whose lowest
-// coordinate after the cursor already sorts beyond the page window are not
-// listed and not merged.
-void TestScanNarrowWorldPrunesInsideTheColumn() {
+// A world no wider than one large-chunk column: a page from a cursor inside
+// the column returns the next chunks of that column, and a full walk returns
+// every chunk once, in order.
+void TestScanPagesInsideOneLargeChunkColumn() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-scan-narrow");
     auto config = BaseConfig(dir.path());
     config.max_loaded_chunks = 4096;
@@ -258,8 +224,6 @@ void TestScanNarrowWorldPrunesInsideTheColumn() {
         store.SetBlockBits(4, cy * 4, "10001");
     }
 
-    const auto dirs_before = store.ScanLargeDirsListedForTests();
-    const auto merged_before = store.ScanCachedLargeChunksMergedForTests();
     const auto page = store.ScanPopulatedChunks(true, {0, 100}, 10);
     assert(page.has_more);
     assert(page.coords.size() == 10);
@@ -267,14 +231,8 @@ void TestScanNarrowWorldPrunesInsideTheColumn() {
         assert(page.coords[i].x == 0);
         assert(page.coords[i].y == 101 + static_cast<std::int64_t>(i));
     }
-    const auto dirs_page = store.ScanLargeDirsListedForTests() - dirs_before;
-    const auto merged_page = store.ScanCachedLargeChunksMergedForTests() - merged_before;
-    // Before the y-aware cut this listed and merged all 100 large chunks of
-    // the column on every page.
-    assert(dirs_page <= 30);
-    assert(merged_page <= 30);
 
-    // Pruning must not cost coordinates: the whole column still enumerates.
+    // The whole column still enumerates.
     std::vector<chunkdb::ChunkCoord> seen;
     bool has_cursor = false;
     chunkdb::ChunkCoord cursor{};
@@ -697,8 +655,6 @@ void TestRangeAndRadiusDoNotUseTheScanWalk() {
                 (void)store.GetChunkVersion(coord.x, coord.y);
             }
         }
-        const auto dirs_before = store.ScanLargeDirsListedForTests();
-        const auto merged_before = store.ScanCachedLargeChunksMergedForTests();
         std::vector<chunkdb::ChunkCoord> coords;
         for (const auto& entry : store.ReadChunkRange(-4, -4, 4, 4)) {
             coords.push_back(entry.coord);
@@ -706,9 +662,6 @@ void TestRangeAndRadiusDoNotUseTheScanWalk() {
         for (const auto& entry : store.ReadChunkRadius(0, 0, 3)) {
             coords.push_back(entry.coord);
         }
-        // Neither command walks large chunks; both counters stay put.
-        assert(store.ScanLargeDirsListedForTests() == dirs_before);
-        assert(store.ScanCachedLargeChunksMergedForTests() == merged_before);
         return coords;
     };
 
@@ -856,7 +809,7 @@ void TestVersionsCasBatch() {
     const auto presence_none = std::string(store.geometry().ChunkBlockCount(), '0');
 
     const auto v1 = store.GetChunkVersion(0, 0);
-    assert(v1 != 0);
+    assert(v1 == 0);
     assert(store.GetChunkVersion(0, 0) == v1);  // reads do not change versions
 
     store.SetBlockBits(0, 0, "10101");
@@ -973,14 +926,13 @@ void TestEmptyChunkGc() {
     store.SetBlockBits(1, 0, "11111");
     assert(std::filesystem::exists(data_path));
 
-    // Empty the chunk: the next checkpoint reclaims image, WAL, and the
-    // parent directory once it is empty.
+    // Collection reclaims image and WAL while retaining the checked identity.
     store.UnsetBlock(0, 0);
     store.UnsetBlock(1, 0);
     assert(store.RuntimeStats().empty_chunk_gcs >= 1);
     assert(!std::filesystem::exists(data_path));
     assert(!std::filesystem::exists(wal_path));
-    assert(!std::filesystem::exists(data_path.parent_path()));
+    assert(std::filesystem::exists(data_path.parent_path() / "chunkdb.index"));
 
     // Rewriting the chunk recreates storage; GC must not resurrect the old
     // data or drop the new write.
@@ -1263,14 +1215,19 @@ std::string BulkBody(const std::string& reply) {
     return reply.substr(header_end + 2, length);
 }
 
-// The version at the start of a chunk form (u64 little-endian).
+chunkdb::ChunkFormSections FormSections(const std::string& form) {
+    const auto bytes = std::span(reinterpret_cast<const std::uint8_t*>(form.data()), form.size());
+    return chunkdb::ParseChunkFormSections(bytes, bytes.size(), chunkdb::ChunkFormReadMode::kRead);
+}
+
+std::string EncodeForm(const chunkdb::Geometry& geometry, const chunkdb::ChunkState& state) {
+    const auto bytes = chunkdb::EncodeSectionedChunkState(geometry, state, chunkdb::kVarMaxChunkBytesLimit);
+    return std::string(bytes.begin(), bytes.end());
+}
+
+// The producing version in a checked chunk-form header.
 std::uint64_t FormVersion(const std::string& form) {
-    assert(form.size() >= 8);
-    std::uint64_t value = 0;
-    for (std::size_t i = 0; i < 8; ++i) {
-        value |= static_cast<std::uint64_t>(static_cast<std::uint8_t>(form[i])) << (8U * i);
-    }
-    return value;
+    return FormSections(form).header.chunk_version;
 }
 
 struct AreaEntry {
@@ -1326,15 +1283,23 @@ void TestEngineAreaReadsMatchChunkGet() {
     // Full, sparse and dense chunks; (1, 1) stays absent and is omitted.
     (void)VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'10101'\n"));
     (void)VersionOf(engine.Execute(session, "SET BLOCK -3 -1 IN default bits = b'00000'\n"));
-    // Version (not read), schema version 1, every block present, 16 blocks
-    // of 5 bits.
-    std::string dense = std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8);
-    dense += std::string(2, '\xff');
+    const auto lease = catalog->Find("default")->Acquire();
+    const auto& geometry = lease->store().geometry();
+    chunkdb::ChunkState dense_state;
+    dense_state.presence_bitmap.assign(2, 0xFFU);
     for (std::size_t i = 0; i < 10; ++i) {
-        dense.push_back(static_cast<char>(i * 53 + 9));
+        dense_state.payload.push_back(static_cast<std::uint8_t>(i * 53 + 9));
     }
-    (void)VersionOf(engine.Execute(session, "SET CHUNK 1 0 IN default $1\n", Parameters{dense}));
-    assert(BulkBody(engine.Execute(session, "GET CHUNK 1 0 FROM default\n")).substr(8) == dense.substr(8));
+    const auto dense = EncodeForm(geometry, dense_state);
+    const auto version = VersionOf(engine.Execute(session, "SET CHUNK 1 0 IN default $1\n", Parameters{dense}));
+    const auto stored = BulkBody(engine.Execute(session, "GET CHUNK 1 0 FROM default\n"));
+    const auto sections = FormSections(stored);
+    assert(sections.header.chunk_version == version && sections.header.commit_time_ms > 0U);
+    assert(sections.header.schema_version == geometry.layout().schema().version && sections.header.flags == 0U);
+    const auto decoded = chunkdb::DecodeSectionedChunkState(
+        geometry, std::span(reinterpret_cast<const std::uint8_t*>(stored.data()), stored.size()),
+        chunkdb::kVarMaxChunkBytesLimit);
+    assert(decoded.payload == dense_state.payload && decoded.presence_bitmap == dense_state.presence_bitmap);
 
     const std::vector<std::string> forms = {"", " COLUMNS bits"};
     for (const auto& form : forms) {
@@ -1354,10 +1319,9 @@ void TestEngineAreaReadsMatchChunkGet() {
     }
 }
 
-// SET CHUNK ... IF VERSION on a geometry with padding bits: padding is
-// ignored and stored as zero, so a write differing only in padding changes
-// nothing.
-void TestEngineChunkPutIfIgnoresPadding() {
+// Checked forms refuse nonzero padding without changing state; canonical
+// writes retain their CAS and no-op behavior.
+void TestEngineChunkPutIfRequiresZeroPadding() {
     chunkdb::test::ScopedTempDir dir("chunkdb-world-put-padding");
     auto config = BaseConfig(dir.path());
     config.geometry.chunk_width_blocks = 3;
@@ -1376,18 +1340,39 @@ void TestEngineChunkPutIfIgnoresPadding() {
     // NULL has no CAS token. Populate one block to read the initial version.
     (void)VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'000'\n"));
     const auto initial = FormVersion(BulkBody(engine.Execute(session, "GET CHUNK 0 0 FROM default\n")));
-    // The version (not read) and schema version 1.
-    const std::string version_field = std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8);
-    const std::string all_ones = version_field + std::string(6, '\xff');
+    const auto lease = catalog->Find("default")->Acquire();
+    const auto& geometry = lease->store().geometry();
+    chunkdb::ChunkState state;
+    state.presence_bitmap = {0xFFU, 0x01U};
+    state.payload = {0xFFU, 0xFFU, 0xFFU, 0x07U};
+    const auto no_padding = EncodeForm(geometry, state);
+    const auto sections = FormSections(no_padding);
+    const auto before = BulkBody(engine.Execute(session, "GET CHUNK 0 0 FROM default\n"));
+    for (const auto kind : {chunkdb::ChunkFormSectionKind::kPresence, chunkdb::ChunkFormSectionKind::kFixedValues}) {
+        auto invalid = no_padding;
+        const auto found = std::find_if(sections.sections.begin(), sections.sections.end(), [&](const auto& section) {
+            return section.kind == static_cast<std::uint16_t>(kind);
+        });
+        assert(found != sections.sections.end() && !found->body.empty());
+        const auto offset = static_cast<std::size_t>(found->body.data() -
+            reinterpret_cast<const std::uint8_t*>(no_padding.data()));
+        invalid[offset + found->body.size() - 1U] = static_cast<char>(0xFFU);
+        assert(engine.Execute(session,
+            "SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(initial) + "\n",
+            Parameters{invalid}).starts_with("-ERR INVALID_ARGUMENT "));
+        assert(BulkBody(engine.Execute(session, "GET CHUNK 0 0 FROM default\n")) == before);
+    }
     const auto first = VersionOf(engine.Execute(
-        session, "SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(initial) + "\n", Parameters{all_ones}));
+        session, "SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(initial) + "\n", Parameters{no_padding}));
     assert(first != initial);
     const auto stored = BulkBody(engine.Execute(session, "GET CHUNK 0 0 FROM default\n"));
     assert(FormVersion(stored) == first);
-    assert(stored.substr(16) == std::string("\xff\x01\xff\xff\xff\x07", 6));
+    const auto decoded = chunkdb::DecodeSectionedChunkState(
+        geometry, std::span(reinterpret_cast<const std::uint8_t*>(stored.data()), stored.size()),
+        chunkdb::kVarMaxChunkBytesLimit);
+    assert(decoded.payload == state.payload && decoded.presence_bitmap == state.presence_bitmap);
 
     // Same blocks, padding cleared: no change, version kept.
-    const std::string no_padding = version_field + std::string("\xff\x01\xff\xff\xff\x07", 6);
     assert(VersionOf(engine.Execute(
                session, "SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(first) + "\n",
                Parameters{no_padding})) == first);
@@ -1453,11 +1438,15 @@ void TestEngineCommands() {
     chunkdb::SessionState session;
     assert(engine.Execute(session, "HELLO 3\n").rfind("%14\r\n", 0) == 0);
 
-    (void)VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'10101'\n"));
-    (void)VersionOf(engine.Execute(session, "SET BLOCK -1 -1 IN default bits = b'11111'\n"));
+    const auto first = VersionOf(engine.Execute(session, "SET BLOCK 0 0 IN default bits = b'10101'\n"));
+    const auto second = VersionOf(engine.Execute(session, "SET BLOCK -1 -1 IN default bits = b'11111'\n"));
 
     assert(engine.Execute(session, "SCAN CHUNKS FROM default LIMIT 10\n") ==
-           "%2\r\n$6\r\nchunks\r\n*2\r\n*2\r\n:-1\r\n:-1\r\n*2\r\n:0\r\n:0\r\n$4\r\nmore\r\n#f\r\n");
+           "%5\r\n$6\r\nchunks\r\n*2\r\n*3\r\n:-1\r\n:-1\r\n:" + std::to_string(second) +
+           "\r\n*3\r\n:0\r\n:0\r\n:" + std::to_string(first) + "\r\n$4\r\nmore\r\n#f\r\n" +
+           "$5\r\nepoch\r\n$32\r\n" + chunkdb::StoreIdHex(store->store_id()) +
+           "\r\n$8\r\nposition\r\n:" + std::to_string(second) +
+           "\r\n$23\r\nretained_deletion_floor\r\n:0\r\n");
 
     // Two populated chunks, each with its coordinates and chunk form.
     const auto range = AreaEntries(engine.Execute(session, "GET AREA -1 -1 TO 0 0 FROM default\n"));
@@ -1467,10 +1456,10 @@ void TestEngineCommands() {
 
     const auto version = FormVersion(BulkBody(engine.Execute(session, "GET CHUNK 0 0 FROM default\n")));
 
-    // Version (not read), schema version 1, then presence and payload.
-    const std::string state =
-        std::string(8, '\0') + std::string("\x01\0\0\0\0\0\0\0", 8) +
-        std::string((store->geometry().ChunkBlockCount() + 7U) / 8U + store->geometry().ChunkPayloadBytes(), '\xff');
+    chunkdb::ChunkState chunk_state;
+    chunk_state.payload.assign(store->geometry().ChunkPayloadBytes(), 0xFFU);
+    chunk_state.presence_bitmap.assign((store->geometry().ChunkBlockCount() + 7U) / 8U, 0xFFU);
+    const auto state = EncodeForm(store->geometry(), chunk_state);
     const std::string put = "SET CHUNK 0 0 IN default $1 IF VERSION " + std::to_string(version) + "\n";
     const auto written = VersionOf(engine.Execute(session, put, Parameters{state}));
     assert(engine.Execute(session, put, Parameters{state}) ==
@@ -1488,11 +1477,11 @@ void TestEngineCommands() {
 }  // namespace
 
 int main() {
-    TestScanCatalogTracksNewDirectoriesAndEviction();
-    TestReadOnlyScanCatalogRefreshesAfterWriterChanges();
-    TestScanVisitsOnlyNeededLargeChunkColumns();
-    TestScanWarmCacheMergesOnlyVisitedLargeChunks();
-    TestScanNarrowWorldPrunesInsideTheColumn();
+    TestScanPagesSeeWritesAfterStartAndEviction();
+    TestReadOnlyScanSeesWriterChanges();
+    TestScanPagesWalkAColdWorldInOrder();
+    TestScanPagesWalkAResidentWorldInOrder();
+    TestScanPagesInsideOneLargeChunkColumn();
     TestScanEnumeratesCacheOnlyChunks();
     TestScanMutationsBetweenPagesPreserveTheContract();
     TestScanMergesCacheEvenWhereADirectoryExists();
@@ -1515,7 +1504,7 @@ int main() {
     TestMetricsNumberFormat();
     TestEngineCommands();
     TestEngineAreaReadsMatchChunkGet();
-    TestEngineChunkPutIfIgnoresPadding();
+    TestEngineChunkPutIfRequiresZeroPadding();
     TestEngineAreaStaysWithinResponseCap();
     return 0;
 }

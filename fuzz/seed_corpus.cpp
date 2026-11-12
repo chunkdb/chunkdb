@@ -78,6 +78,8 @@ int main(int argc, char** argv) {
     Fixture("slots", "owned-filtered", SerializeFeedSlotRecords({fuzz::kId, 987U,
         {{"owned", 123U, false, {.area = FeedArea{{-1, -2}, {3, 4}}, .column_ids = std::vector<std::uint32_t>{2U, 1U}}, false, "bot"},
          {"unowned", 456U, false}}}));
+    Fixture("slots", "owned-space", SerializeFeedSlotRecords({fuzz::kId, 987U,
+        {{"space", 123U, false, {.area = FeedArea{{-1, -2, -3}, {3, 4, 5}, 3U}, .chunks = true}, false, "bot"}}, true, 3U}));
     const MigrationRecord record{"set_options", 1234U, "admin", "ALTER TABLE default SET checkpoint_updates = 512"};
     const auto ledger = EncodeMigrationRecords(fuzz::kId, {record});
     Fixture("migrations", "ledger", ledger);

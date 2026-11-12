@@ -1137,6 +1137,9 @@ void TestReadOnlyCopiesFollowTheGeneration() {
     std::filesystem::remove(WalPath(config));
     assert(reader.GetBlockBits(0, 0) == "10101");
     assert(reader.ReadChunkRange(0, 0, 0, 0).size() == 1U);
+    const auto cached_scan = reader.ScanChunkIdentities(false, {}, 1U, 0U, true);
+    assert(cached_scan.entries.size() == 1U && cached_scan.entries.front().data && !cached_scan.position);
+    assert(reader.ScanPopulatedChunks(false, {}, 1U).coords.size() == 1U);
     {
         chunkdb::ChunkStore writer(config);
         writer.SetBlockBits(0, 0, "01010");
@@ -1148,6 +1151,14 @@ void TestReadOnlyCopiesFollowTheGeneration() {
     writer.SetBlockBits(1, 0, "00111");
     const auto range = reader.ReadChunkRange(0, 0, 0, 0);
     assert(range.size() == 1U && reader.GetBlockBits(1, 0) == "00111");
+    writer.UnsetBlock(0, 0);
+    writer.UnsetBlock(1, 0);
+    const auto deleted = writer.GetChunkVersion(0, 0);
+    writer.CheckpointForTests(0, 0);
+    assert(reader.ReadChunkRange(0, 0, 0, 0).empty());
+    assert(reader.ScanPopulatedChunks(false, {}, 1U).coords.empty());
+    const auto emptied = reader.ScanChunkIdentities(false, {}, 1U, 0U, true);
+    assert(emptied.entries.size() == 1U && emptied.entries.front().version == deleted && !emptied.entries.front().data);
 }
 
 #ifndef _WIN32

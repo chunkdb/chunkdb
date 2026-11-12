@@ -38,6 +38,13 @@ Reconnect AFTER that position and skip changes you already applied.
 
 5. Apply later changes to a chunk only when their revision exceeds the chunk version you read.
 
+To start from a writer's scan, use `SCAN CHUNKS FROM table WITH DATA` and keep the first page's `epoch` and `position`.
+Start WATCH AFTER that position on another connection, buffer its changes, and finish the scan using AFTER coordinates.
+Keep the first position across every page; later page positions do not replace the baseline cut.
+Pages do not share a snapshot, so retain each returned chunk version and skip older replayed changes when applying the buffer.
+A first watch can resume at the retained floor even when no earlier watcher existed; a lost prefix still requires resync and a new baseline.
+Read-only scans return null for position and cannot establish this writer frontier.
+
 ## If it fails
 
 - `resync`: rebuild; an old epoch, restart, expired ordinary history, or overflow can make resume unavailable.

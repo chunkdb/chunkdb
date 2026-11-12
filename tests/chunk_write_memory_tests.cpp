@@ -10,14 +10,18 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <initializer_list>
 #include <memory>
 #include <new>
 #include <optional>
+#include <span>
 #include <string>
+#include <utility>
 #include <vector>
 
 #include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "../src/sectioned_chunk_form.hpp"
 #include "test_utils.hpp"
 
 // Not on MinGW: there the C++ runtime DLL allocates through its own
@@ -131,6 +135,29 @@ void ExpectGrowthBelow(const char* statement, std::size_t growth, std::size_t bo
     }
 }
 
+// The bytes of the form's sections of `kinds`: (offset, size) of each body.
+std::vector<std::pair<std::size_t, std::size_t>> SectionBodies(
+    const std::string& form, std::initializer_list<chunkdb::ChunkFormSectionKind> kinds) {
+    const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(form.data()), form.size());
+    const auto parsed = chunkdb::ParseChunkFormSections(bytes, form.size(), chunkdb::ChunkFormReadMode::kRead);
+    std::vector<std::pair<std::size_t, std::size_t>> bodies;
+    for (const auto& section : parsed.sections) {
+        for (const auto kind : kinds) {
+            if (section.kind == static_cast<std::uint16_t>(kind)) {
+                bodies.emplace_back(static_cast<std::size_t>(section.body.data() - bytes.data()), section.body.size());
+            }
+        }
+    }
+    return bodies;
+}
+
+// Sets every byte of the form's sections of `kinds` to `value`.
+void FillSections(std::string& form, std::initializer_list<chunkdb::ChunkFormSectionKind> kinds, char value) {
+    for (const auto& [offset, size] : SectionBodies(form, kinds)) {
+        std::fill_n(form.begin() + static_cast<std::ptrdiff_t>(offset), size, value);
+    }
+}
+
 // 256 x 256 blocks of 256 bits: a 2 MiB payload, past the default 1 MiB
 // checkpoint threshold, so one SET CHUNK also checkpoints the chunk inline.
 struct Fixture {
@@ -141,6 +168,7 @@ struct Fixture {
     chunkdb::SessionState b;
     // A chunk form with every block present.
     std::string form;
+    std::size_t state_bytes = 0;
 
     explicit Fixture(chunkdb::EngineConfig config = {}) {
         chunkdb::CatalogConfig catalog_config;
@@ -153,20 +181,30 @@ struct Fixture {
             ExpectReplyStarts(engine->Execute(*session, "HELLO 3\r\n"), "%");
         }
         ExpectReplyStarts(Run(a, "CREATE TABLE big (b bits(256)) CHUNK 256 x 256"), "+OK");
-        // The form of chunk (1,0), with every byte after its header set.
+        // The form of chunk (1,0), with every byte of its presence and block
+        // values set.
         ExpectReplyStarts(Run(a, "SET BLOCK 256 0 IN big b = b'" + std::string(256, '1') + "'"), ":");
         const std::string reply = Run(a, "GET CHUNK 1 0 FROM big");
         const auto body = reply.find("\r\n") + 2U;
         form = reply.substr(body, reply.size() - body - 2U);
-        std::fill(form.begin() + 16, form.end(), '\xff');
+        FillSections(form,
+            {chunkdb::ChunkFormSectionKind::kPresence, chunkdb::ChunkFormSectionKind::kFixedValues,
+                chunkdb::ChunkFormSectionKind::kNullBits},
+            '\xff');
+        for (const auto& body : SectionBodies(form,
+                 {chunkdb::ChunkFormSectionKind::kPresence, chunkdb::ChunkFormSectionKind::kFixedValues,
+                     chunkdb::ChunkFormSectionKind::kNullBits})) {
+            state_bytes += body.second;
+        }
     }
 
     std::string Run(chunkdb::SessionState& session, const std::string& line, const Parameters& parameters = {}) {
         return engine->Execute(session, line + "\r\n", parameters);
     }
 
-    // The bytes of the chunk state the form sends.
-    [[nodiscard]] std::size_t StateBytes() const { return form.size() - 16U; }
+    // The bytes of the chunk state the form sends: its presence and block
+    // values.
+    [[nodiscard]] std::size_t StateBytes() const { return state_bytes; }
 };
 
 // One SET CHUNK of a new chunk holds the decoded state, the empty state it
@@ -189,7 +227,8 @@ void TestSetChunkKeepsWithoutCopy(bool conditional) {
     ExpectReplyStarts(f.Run(f.a, "SET CHUNK 0 0 IN big $1", parameters), ":");
     const std::string version = f.Run(f.a, "GET CHUNK 0 0 FROM big");
     std::uint64_t chunk_version = 0;
-    const auto body = version.find("\r\n") + 2U;
+    // The chunk version follows the form's magic, version and flags.
+    const auto body = version.find("\r\n") + 2U + 8U;
     for (std::size_t i = 0; i < 8U; ++i) {
         chunk_version |= static_cast<std::uint64_t>(static_cast<unsigned char>(version[body + i])) << (8U * i);
     }
@@ -197,10 +236,9 @@ void TestSetChunkKeepsWithoutCopy(bool conditional) {
     ExpectReplyStarts(f.Run(f.b, "BEGIN"), "+OK");
     const std::string old_block = f.Run(f.b, "GET BLOCK 0 0 FROM big");
     ExpectReplyStarts(old_block, "*");
-    // Every block present with a NULL value: the payload after the header
-    // and presence is cleared.
+    // Every block present with its value cleared.
     std::string next = f.form;
-    std::fill(next.begin() + 16 + 256 * 256 / 8, next.end(), '\0');
+    FillSections(next, {chunkdb::ChunkFormSectionKind::kFixedValues}, '\0');
     const Parameters next_parameters{next};
     const HeapWindow window;
     const std::string condition = conditional ? " IF VERSION " + std::to_string(chunk_version) : "";

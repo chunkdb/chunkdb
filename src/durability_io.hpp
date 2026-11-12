@@ -2,16 +2,29 @@
 
 #include <cstdint>
 #include <filesystem>
+#include <functional>
+#include <span>
 #include <system_error>
 #include <vector>
 
 namespace chunkdb {
+
+using AtomicFileSink = std::function<void(std::span<const std::uint8_t>)>;
+using AtomicFileProducer = std::function<void(const AtomicFileSink&)>;
 
 // Creates files readable and writable by their owner alone; publication keeps
 // the mode or protected Windows ACL.
 void WriteAtomicTempFile(
     const std::filesystem::path& tmp_path,
     const std::vector<std::uint8_t>& bytes,
+    bool durable_sync,
+    bool enable_generic_failpoints);
+// The producer streams bounded pieces through the same exclusive owner-only
+// temporary-file handle; a producer or I/O failure removes the unpublished file.
+// The producer calls its borrowed sink synchronously and does not retain it.
+void WriteAtomicTempFile(
+    const std::filesystem::path& tmp_path,
+    const AtomicFileProducer& produce,
     bool durable_sync,
     bool enable_generic_failpoints);
 std::error_code ReplacePathAtomically(
