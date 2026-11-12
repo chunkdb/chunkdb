@@ -73,6 +73,79 @@ void RestoreCrashes(const std::string& executable) {
         }
     }
 }
+// Restore gives every coordinate log and then the inventory the new table
+// identity. A crash between them leaves only a refused temporary copy; the
+// backup stays intact, and a restore after removing that copy returns every
+// acknowledged write, version and tombstone.
+void RestoreIndexCrashes(const std::string& executable) {
+    for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) {
+        for (const auto* point : {"CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_INDEX_LOG_ONCE",
+                 "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_INDEX_ONCE"}) {
+            test::ScopedTempDir temporary("chunkdb-restore-index-crash");
+            const auto root = std::filesystem::canonical(temporary.path());
+            CatalogConfig config; config.data_dir = root / "source"; config.background_maintenance = false;
+            config.default_options.durability_mode = mode;
+            StoreId epoch{};
+            std::uint64_t live = 0U, cut = 0U;
+            std::array<std::uint64_t, 2U> deleted{};
+            {
+                TableCatalog catalog(config);
+                GeometryConfig geometry; geometry.large_chunk_width_chunks = 2U; geometry.large_chunk_height_chunks = 2U;
+                geometry.chunk_width_blocks = 2U; geometry.chunk_height_blocks = 2U; geometry.block_bits = 8U;
+                const auto table = catalog.Create("default", geometry, catalog.default_options());
+                epoch = table->store_id();
+                auto lease = table->Acquire();
+                auto& store = lease->store();
+                store.SetBlockBits(8, 0, "00000011"); live = store.GetChunkVersion(4, 0);
+                // Tombstones in two large chunks give the inventory two logs.
+                for (std::size_t i = 0; i < deleted.size(); ++i) {
+                    const auto x = static_cast<std::int64_t>(4U * i);
+                    store.SetBlockBits(x, 0, "10000000"); store.UnsetBlock(x, 0);
+                    deleted[i] = store.GetChunkVersion(2 * static_cast<std::int64_t>(i), 0);
+                    store.CheckpointForTests(2 * static_cast<std::int64_t>(i), 0);
+                }
+                assert(store.RetainedTombstoneCount() == 2U);
+                store.WalBarrier();
+                lease.reset();
+                const auto result = catalog.BackupTo(root / "backup", {});
+                assert(result.tables.size() == 1U && result.tables.front().epoch == epoch);
+                cut = result.tables.front().revision;
+            }
+            const auto backup = root / "backup", target = root / "restored";
+            const auto marker = InspectBackupFile(backup, kBackupMarkerName);
+            assert(Verify(backup).errors == 0U);
+            assert(Child(executable, {"--restore-child", backup.string(), target.string(), point}) == 86);
+            assert(InspectBackupFile(backup, kBackupMarkerName).crc32 == marker.crc32 && Verify(backup).errors == 0U);
+            assert(!std::filesystem::exists(target));
+            std::vector<std::filesystem::path> copies;
+            for (const auto& entry : std::filesystem::directory_iterator(root))
+                if (entry.path().filename().string().rfind(".chunkdb.restore.", 0U) == 0U) copies.push_back(entry.path());
+            assert(copies.size() == 1U && std::filesystem::exists(copies.front() / kRestoreIncompleteName));
+            assert(Verify(copies.front()).errors > 0U);
+            RefusesOpen(copies.front());
+            assert(!RemoveBackupTemporaryTree(copies.front()));
+            RestoreBackup(backup, target);
+            assert(Verify(target).errors == 0U);
+            auto restored = config; restored.data_dir = target;
+            TableCatalog catalog(restored);
+            const auto table = catalog.Require("default");
+            assert(table->store_id() != epoch);
+            auto lease = table->Acquire();
+            auto& store = lease->store();
+            assert(store.GetBlockBits(8, 0) == "00000011" && store.GetChunkVersion(4, 0) == live);
+            assert(store.RetainedTombstoneCount() == 2U);
+            const auto page = store.ScanChunkIdentities(false, {}, 10U, 0U, false);
+            assert(page.entries.size() == 3U && page.position && *page.position >= cut);
+            assert((page.entries[0].coord == ChunkCoord{0, 0}) && page.entries[0].version == deleted[0]);
+            assert((page.entries[1].coord == ChunkCoord{2, 0}) && page.entries[1].version == deleted[1]);
+            assert((page.entries[2].coord == ChunkCoord{4, 0}) && page.entries[2].version == live);
+            for (std::size_t i = 0; i < deleted.size(); ++i) {
+                const auto state = store.ReadChunkState(2 * static_cast<std::int64_t>(i), 0);
+                assert(state.written && state.version == deleted[i]);
+            }
+        }
+    }
+}
 void BackupCrashes(const std::string& executable) {
     for (const auto* point : kBackupPoints) {
         Fixture fixture; Save(fixture.backup / kBackupIncompleteName, {'C', 'K', 'B', 'I'});
@@ -144,6 +217,6 @@ int main(int argc, char** argv) {
     if (argc == 4 && std::string_view(argv[1]) == "--backup-child") {
         auto record = ReadBackupRecord(argv[2]); txn_test::ScopedEnv point(argv[3], "1"); CompleteBackup(argv[2], record); return 3;
     }
-    RestoreCrashes(argv[0]); BackupCrashes(argv[0]); RestoreTool(argv[0]); LostPostForkMutation(argv[0]);
-    std::cout << "30 backup/restore crash cases and 6 restore tool cases passed\n";
+    RestoreCrashes(argv[0]); RestoreIndexCrashes(argv[0]); BackupCrashes(argv[0]); RestoreTool(argv[0]); LostPostForkMutation(argv[0]);
+    std::cout << "34 backup/restore crash cases and 6 restore tool cases passed\n";
 }

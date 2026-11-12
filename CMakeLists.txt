@@ -393,6 +393,9 @@ if(CHUNKDB_BUILD_TESTS)
         target_link_options(chunkdb_typed_chunk_form_size_test PRIVATE -static-libstdc++ -static-libgcc)
     endif()
 
+    # Its crash children verify the recovered directory.
+    target_link_libraries(chunkdb_table_tombstones_test PRIVATE chunkdb_tools)
+
     # Crash children of the coordinate index and tombstone compaction run in the crash label.
     add_test(NAME chunk_coordinate_index_crash COMMAND chunkdb_chunk_coordinate_index_test --crash-boundaries)
     add_test(NAME table_tombstones_crash COMMAND chunkdb_table_tombstones_test --crash-children)

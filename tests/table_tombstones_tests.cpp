@@ -1,9 +1,13 @@
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <new>
+#include <sstream>
 #include <tuple>
 
 #include "checkpoint.hpp"
@@ -13,6 +17,7 @@
 #include "feed_slots.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "test_utils.hpp"
+#include "verify.hpp"
 #ifndef _WIN32
 #include <sys/wait.h>
 #endif
@@ -297,6 +302,108 @@ void CrashRequiredResurrection(const char* executable) {
         }
     }
 }
+// Collection of an emptied chunk publishes its tombstone, then removes the
+// image and WAL. A crash at each step keeps every acknowledged write and the
+// emptied chunk's version; the old image never resurrects its data.
+constexpr std::array<const char*, 3U> kCollectionPoints{
+    "CHUNKDB_FAILPOINT_CRASH_INDEX_AFTER_LOG_SYNC_ONCE",
+    "CHUNKDB_FAILPOINT_CRASH_INDEX_AFTER_INVENTORY_PUBLISH_ONCE",
+    "CHUNKDB_FAILPOINT_CRASH_EMPTY_GC_AFTER_TOMBSTONE_ONCE"};
+CatalogConfig CollectionConfig(const std::filesystem::path& root, std::string_view mode) {
+    auto config = Config(root / "data");
+    config.default_options.durability_mode = mode == "relaxed" ? DurabilityMode::kRelaxed : DurabilityMode::kFsyncWal;
+    return config;
+}
+// Chunk (0,0) is emptied after a checkpoint gave it an image with data. With
+// `append`, chunk (1,0) of the same large chunk already has a tombstone, so
+// the target's record appends to an existing log instead of creating one.
+void PrepareCollection(const std::filesystem::path& root, std::string_view mode, bool append, const char* point) {
+    TableCatalog catalog(CollectionConfig(root, mode));
+    GeometryConfig geometry; geometry.large_chunk_width_chunks = 2U; geometry.large_chunk_height_chunks = 2U;
+    geometry.chunk_width_blocks = 2U; geometry.chunk_height_blocks = 2U; geometry.block_bits = 8U;
+    auto lease = catalog.Create("t", geometry, catalog.default_options())->Acquire();
+    auto& store = lease->store();
+    store.SetBlockBits(8, 0, "00000011");
+    const auto live = store.GetChunkVersion(4, 0);
+    std::uint64_t prior = 0U;
+    if (append) {
+        store.SetBlockBits(2, 0, "10000000"); store.UnsetBlock(2, 0);
+        prior = store.GetChunkVersion(1, 0); store.CheckpointForTests(1, 0);
+        assert(store.RetainedTombstoneCount() == 1U);
+    }
+    store.SetBlockBits(0, 0, "10000000"); store.CheckpointForTests(0, 0);
+    assert(std::filesystem::exists(ChunkDataPath(store.data_dir(), store.geometry(), {0, 0})));
+    store.UnsetBlock(0, 0);
+    const auto deleted = store.GetChunkVersion(0, 0);
+    // Relaxed acknowledgements become durable at a barrier.
+    if (mode == "relaxed") store.WalBarrier();
+    { std::ofstream expected(root / "expected"); expected << live << ' ' << deleted << ' ' << prior; expected.close(); assert(expected); }
+#ifdef _WIN32
+    _putenv_s(point, "1");
+#else
+    setenv(point, "1", 1);
+#endif
+    store.CheckpointForTests(0, 0);
+}
+void RequireCollectionState(TableCatalog& catalog, std::uint64_t live, std::uint64_t deleted, std::uint64_t prior) {
+    auto lease = catalog.Require("t")->Acquire();
+    auto& store = lease->store();
+    assert(store.GetBlockBits(8, 0) == "00000011" && store.GetChunkVersion(4, 0) == live);
+    const auto emptied = store.ReadChunkState(0, 0);
+    assert(emptied.written && emptied.version == deleted && emptied.commit_time_ms != 0U);
+    assert(std::all_of(emptied.presence_bitmap.begin(), emptied.presence_bitmap.end(), [](std::uint8_t byte) { return byte == 0U; }));
+    assert((store.ScanPopulatedChunks(false, {}, 10U).coords == std::vector<ChunkCoord>{{4, 0}}));
+    const auto page = store.ScanChunkIdentities(false, {}, 10U, 0U, true);
+    std::vector<std::pair<ChunkCoord, std::uint64_t>> identities;
+    for (const auto& entry : page.entries) {
+        assert(entry.data.has_value() == (entry.coord == ChunkCoord{4, 0}));
+        identities.emplace_back(entry.coord, entry.version);
+    }
+    std::vector<std::pair<ChunkCoord, std::uint64_t>> expected{{{0, 0}, deleted}};
+    if (prior != 0U) expected.push_back({{1, 0}, prior});
+    expected.push_back({{4, 0}, live});
+    assert(identities == expected);
+}
+void CrashCollection(const char* executable) {
+    if (!kFailpointsCompiled) return;
+    for (const auto* mode : {"relaxed", "fsync"}) for (const bool append : {false, true}) for (const auto* point : kCollectionPoints) {
+        test::ScopedTempDir directory("chunkdb-collection-crash");
+        const auto root = std::filesystem::canonical(directory.path());
+        const auto command = Quote(std::filesystem::absolute(executable).string()) + " --collection-crash " +
+            Quote(root.string()) + " " + Quote(point) + " " + mode + (append ? " append" : " create");
+#ifdef _WIN32
+        assert(std::system(('"' + command + '"').c_str()) == 86);
+#else
+        const auto result = std::system(command.c_str());
+        assert(result != -1 && WIFEXITED(result) && WEXITSTATUS(result) == 86);
+#endif
+        std::uint64_t live = 0U, deleted = 0U, prior = 0U;
+        std::ifstream expected(root / "expected"); expected >> live >> deleted >> prior;
+        assert(expected && live != 0U && deleted > live && (prior != 0U) == append);
+        const auto config = CollectionConfig(root, mode);
+        const auto table = root / "data/tables/t";
+        // A log appended past its inventory boundary is unpublished, and
+        // recovery removes it; the WAL still holds the emptying commit.
+        const bool published = std::string_view(point) != kCollectionPoints[0] || !append;
+        {
+            TableCatalog catalog(config);
+            RequireCollectionState(catalog, live, deleted, prior);
+            auto lease = catalog.Require("t")->Acquire();
+            auto& store = lease->store();
+            assert(store.RetainedTombstoneCount() == (published ? 1U : 0U) + (append ? 1U : 0U));
+            store.CheckpointForTests(0, 0);
+            assert(store.RetainedTombstoneCount() == 1U + (append ? 1U : 0U));
+            assert(!std::filesystem::exists(ChunkDataPath(table, store.geometry(), {0, 0})));
+            assert(!std::filesystem::exists(ChunkWalPath(table, store.geometry(), {0, 0})));
+        }
+        std::ostringstream findings;
+        const auto verified = VerifyDataDirectory(root / "data", findings);
+        if (verified.errors != 0U) std::cerr << findings.str();
+        assert(verified.errors == 0U);
+        TableCatalog reopened(config);
+        RequireCollectionState(reopened, live, deleted, prior);
+    }
+}
 }
 // Compaction checkpoints every current chunk after its barrier. A background
 // checkpoint that starts after the barrier visited a chunk may still be
@@ -369,7 +476,13 @@ int main(int argc, char** argv) {
         (void)catalog.CompactTombstones("t", deleted + 1U);
         return 1;
     }
-    if (argc == 2 && std::string_view(argv[1]) == "--crash-children") { CrashRequiredResurrection(argv[0]); return 0; }
+    if (argc == 6 && std::string_view(argv[1]) == "--collection-crash") {
+        PrepareCollection(argv[2], argv[4], std::string_view(argv[5]) == "append", argv[3]);
+        return 1;
+    }
+    if (argc == 2 && std::string_view(argv[1]) == "--crash-children") {
+        CrashRequiredResurrection(argv[0]); CrashCollection(argv[0]); return 0;
+    }
     if (argc > 1 && std::string_view(argv[1]) == "--required-replay") { RequiredResurrectionSurvivesCompaction(); return 0; }
     if (argc == 1) { CompactionReopensAndReportsHistoryFloor(); CompactionFailureFencesUntilRecovery(); }
     ResumeAllocationFailureDoesNotEscapeCleanup();
