@@ -471,9 +471,9 @@ void TemporaryCreationRecovery(const std::string& executable) {
                 }) {
             test::ScopedTempDir temporary("chunkdb-owner-temporary-recovery");
             const auto root = std::filesystem::canonical(temporary.path());
-            const auto mode = directory ? "--create-catalog" : index ? "--create-index-temp" : "--create-store";
+            const auto mode = directory ? "--create-catalog" : "--create-store";
             const auto point = directory ? "CHUNKDB_FAILPOINT_CRASH_DATA_DIR_MANIFEST_BEFORE_PUBLISH_ONCE" :
-                index ? "CHUNKDB_TEST_INDEX_TEMP_SYNC" : "CHUNKDB_FAILPOINT_CRASH_MANIFEST_BEFORE_PUBLISH_ONCE";
+                index ? "CHUNKDB_FAILPOINT_CRASH_INDEX_INVENTORY_BEFORE_PUBLISH_ONCE" : "CHUNKDB_FAILPOINT_CRASH_MANIFEST_BEFORE_PUBLISH_ONCE";
             assert(RunChild(executable, mode, root, point) == 86);
             const auto decision = *CommitOwnerBootstrap::ReadPending(root);
             const auto target = directory ? "chunkdb.manifest" : index ? "chunkdb.index" : "table.manifest";
@@ -718,11 +718,7 @@ int main(int argc, char** argv) {
     }
     if (argc == 4) {
         txn_test::ScopedEnv failpoint(argv[3], "1");
-        if (std::string_view(argv[1]) == "--create-store" || std::string_view(argv[1]) == "--create-index-temp") {
-            if (std::string_view(argv[1]) == "--create-index-temp")
-                SetFileSyncObserverForTests([](const auto& path) {
-                    if (path.filename().string().starts_with("chunkdb.index.tmp.")) std::_Exit(86);
-                });
+        if (std::string_view(argv[1]) == "--create-store") {
             StoreConfig config; config.data_dir = argv[2]; config.background_maintenance = false;
             ChunkStore store(config);
         } else if (std::string_view(argv[1]) == "--create-catalog") {

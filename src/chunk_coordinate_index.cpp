@@ -193,7 +193,7 @@ bool ChunkCoordinateIndex::InitializeEmpty(const std::filesystem::path& root, co
     WriteIndexInventory(output, IndexInventoryHeader{.table_id = table_id, .dims = geometry.dims()}, {});
     const auto text = output.str();
     bytes.assign(text.begin(), text.end());
-    return PublishNewFile(path, bytes);
+    return PublishNewFile(path, bytes, "CHUNKDB_FAILPOINT_CRASH_INDEX_INVENTORY_BEFORE_PUBLISH_ONCE");
 }
 
 std::optional<StoreId> ChunkCoordinateIndex::UnpublishedEmptyIdentity(const std::filesystem::path& root,
