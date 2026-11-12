@@ -41,6 +41,7 @@ bool StatementControl::ExpireLocked() {
         !deadline_) return false;
     if (now_() < *deadline_) return false;
     reason_ = StatementStopReason::kTimeout;
+    stopped_.store(true, std::memory_order_release);
     return true;
 }
 
@@ -70,6 +71,7 @@ bool StatementControl::RequestStop(StatementStopReason reason) {
         if (reason == StatementStopReason::kTimeout && !expired) return false;
         if (!expired) {
             reason_ = reason;
+            stopped_.store(true, std::memory_order_release);
             accepted = true;
         } else accepted = reason == StatementStopReason::kTimeout;
         stop = stop_;
@@ -94,6 +96,8 @@ std::optional<StatementStopReason> StatementControl::TakeQueuedStop() {
 }
 
 void StatementControl::Check() {
+    // Without a deadline only RequestStop sets a reason, and it publishes stopped_.
+    if (!deadline_ && !stopped_.load(std::memory_order_acquire)) return;
     std::stop_source stop(std::nostopstate);
     StatementStopReason reason;
     {
@@ -125,11 +129,12 @@ void StatementControl::EnterDecision() {
     if (reason != StatementStopReason::kNone) throw StatementStoppedError(reason);
 }
 
-std::optional<StatementStopReason> StatementControl::Complete() {
+std::optional<StatementStopReason> StatementControl::Complete(bool* decision_entered) {
     std::stop_source stop(std::nostopstate);
     std::optional<StatementStopReason> result;
     {
         std::lock_guard lock(mutex_);
+        if (decision_entered) *decision_entered = decision_entered_;
         if (ExpireLocked()) stop = stop_;
         if (reason_ != StatementStopReason::kNone) result = reason_;
         phase_ = Phase::kComplete;

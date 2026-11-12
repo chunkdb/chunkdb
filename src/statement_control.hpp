@@ -1,5 +1,6 @@
 #pragma once
 
+#include <atomic>
 #include <chrono>
 #include <cstdint>
 #include <mutex>
@@ -35,7 +36,8 @@ class StatementControl {
     void Check();
     void EnterDecision();
     // Result admission must observe any accepted pre-decision stop.
-    std::optional<StatementStopReason> Complete();
+    // decision_entered, when given, receives whether the decision was entered.
+    std::optional<StatementStopReason> Complete(bool* decision_entered = nullptr);
     [[nodiscard]] Phase phase() const;
     [[nodiscard]] bool decision_entered() const;
     [[nodiscard]] std::optional<Clock::time_point> deadline() const noexcept { return deadline_; }
@@ -49,6 +51,9 @@ class StatementControl {
     mutable std::mutex mutex_;
     Phase phase_ = Phase::kQueued;
     StatementStopReason reason_ = StatementStopReason::kNone;
+    // Set with reason_, under mutex_: Check without a deadline needs no lock
+    // until a stop was requested.
+    std::atomic<bool> stopped_{false};
     bool decision_entered_ = false;
     std::stop_source stop_{std::nostopstate};
 };

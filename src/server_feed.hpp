@@ -54,6 +54,8 @@ struct ServerConnection : public std::enable_shared_from_this<ServerConnection> 
     std::shared_ptr<ConnectionRecord> record = std::make_shared<ConnectionRecord>();
     bool worker_queued = false;
     bool irreversible_reply = false;
+    // A statement its worker parsed, started and published; it runs next.
+    std::shared_ptr<StatementControl> started_statement;
     // The client's address and "[address]:port": the socket's peer, or the
     // source a PROXY header carried. Set when the connection starts.
     std::string peer_address;

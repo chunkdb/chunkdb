@@ -671,6 +671,7 @@ void ChunkServer::CloseClient(ServerConnection& connection) {
     connection.payload = {};
     connection.payload_credit.reset();
     connection.line_credit.reset();
+    connection.started_statement.reset();
     connection.reply_credit.reset();
 #ifdef CHUNKDB_WITH_OPENSSL
     if (connection.tls) { SSL_free(connection.tls); connection.tls = nullptr; }

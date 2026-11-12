@@ -435,6 +435,7 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
                 connection.request_line.substr(first, std::min<std::size_t>(32U,
                     connection.request_line.find_first_of(" \t\r\n", first) - first));
             connection.record->statement = std::move(control);
+            if (worker) connection.started_statement = connection.record->statement;
             if (connection.record->killed.load()) killed_statement = connection.record->statement;
         }
         if (killed_statement) (void)killed_statement->RequestStop(StatementStopReason::kKilled);

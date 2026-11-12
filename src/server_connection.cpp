@@ -29,8 +29,9 @@ bool ChunkServer::HandleClient(
     const auto park = [&] { io->ReleaseKept(*connection); FreeWorker(wait); return ParkClient(connection); };
     try {
         while (running_.load()) {
-            std::shared_ptr<StatementControl> control;
-            {
+            // A statement this worker parsed was published running already.
+            auto control = std::move(connection->started_statement);
+            if (!control) {
                 std::lock_guard lock(connection->record->mutex);
                 control = connection->record->statement;
                 connection->record->state = "running";
@@ -57,14 +58,15 @@ bool ChunkServer::HandleClient(
                         std::move(connection->payload_rejection)) :
                     engine_->Execute(session, connection->request_line, connection->parameters,
                         &connection->reply_continuation, &reserve_reply);
-                if (const auto stopped = control->Complete()) {
+                bool decision_entered = false;
+                if (const auto stopped = control->Complete(&decision_entered)) {
                     connection->reply_continuation.reset();
                     connection->response = StatementStoppedReply(*stopped);
                     session.watch.reset();
                     if (session.slot_watch) session.slot_watch->Cancel();
                     session.slot_watch.reset();
                 }
-                connection->irreversible_reply = control->decision_entered();
+                connection->irreversible_reply = decision_entered;
             }
             connection->parameters.clear();
             connection->payload_credit.reset();
@@ -72,7 +74,7 @@ bool ChunkServer::HandleClient(
             if (connection->record->killed.load() && !connection->irreversible_reply) return false;
             if (!io->ReserveReply(*connection, encoded_buffer, false)) {
                 // A lost reply after an irreversible decision is ambiguous, never a retryable refusal.
-                if (control->decision_entered()) return false;
+                if (connection->irreversible_reply) return false;
                 connection->reply_continuation.reset();
                 std::string{}.swap(connection->response);
                 io->Reply(*connection, Protocol::Error("BUSY", "reply capture budget is full", {{"reason", "reply_budget"}}));
