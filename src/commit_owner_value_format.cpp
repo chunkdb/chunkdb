@@ -124,9 +124,15 @@ CommitOwnerObjectKind ValueKind(CommitOwnerTreeKind tree) {
     Bad("set tree kind");
 }
 void Set(const CommitOwnerSet& set, CommitOwnerTreeKind tree) {
-    Ref(set.root, CommitOwnerObjectKind::kPage); Digest(set.sha256); (void)Width(tree);
-    if (set.owned_bytes < set.root.bytes || set.owned_bytes > kMaxCommitCoveredTreeBytes || set.count > set.owned_bytes / 68U)
+    if (tree != CommitOwnerTreeKind::kMembers && tree != CommitOwnerTreeKind::kOwnerEdges &&
+        tree != CommitOwnerTreeKind::kObservations) Bad("set tree kind");
+    Ref(set.root, CommitOwnerObjectKind::kPage); Digest(set.sha256);
+    // Every key owns its own leaf page and one value capsule.
+    const std::uint64_t leaf = kCommitOwnerEmptyPageBytes + Width(tree) + kCommitOwnerReferenceBytes;
+    const std::uint64_t per_key = leaf + (tree == CommitOwnerTreeKind::kMembers ? kCommitOwnerMemberBytes : 68U);
+    if (set.owned_bytes < set.root.bytes || set.owned_bytes > kMaxCommitCoveredTreeBytes || set.count > set.owned_bytes / per_key)
         Bad("set counts or owned bytes");
+    if (set.count != 0U && set.root.bytes < leaf) Bad("nonempty set root page");
     if (set.count == 0U && (set.root.bytes != kCommitOwnerEmptyPageBytes || set.owned_bytes != kCommitOwnerEmptyPageBytes ||
             set.sha256 != CommitOwnerSetHasher(tree).Finish())) Bad("empty set commitment");
 }

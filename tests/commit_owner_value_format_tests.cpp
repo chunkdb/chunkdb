@@ -311,10 +311,60 @@ void SparseHeaderRefusal() {
     }
     assert(refused && owner_artifact_allocation::denied.load() == denied);
 }
+
+using Where = std::source_location;
+Bytes Encode(const CommitOwnerGroupValue& value) { return SerializeCommitOwnerGroup(value); }
+template <class Value, class Change> void RefuseValue(Value value, Change change, const Where& where = Where::current()) {
+    change(value); Reject([&] { (void)Encode(value); }, where);
+}
+CommitOwnerJournalRecord& Journal(CommitOwnerGroupValue& value) { return std::get<CommitOwnerJournalRecord>(value.source); }
+
+void SetCommitmentBounds() {
+    const auto member = Member(Key()); const auto key = EncodeCommitOwnerMemberKey({member.group_id, 0U});
+    const auto value = Ref(CommitOwnerObjectKind::kMemberValue, SerializeCommitOwnerMember(member));
+    auto group = Group(); group.members = One(CommitOwnerTreeKind::kMembers, key, value); Journal(group).bytes = 1000U; (void)Encode(group);
+    const std::uint64_t leaf = 92U + 24U + 48U, per_key = leaf + 204U;
+    assert(group.members.owned_bytes == per_key && group.members.root.bytes == leaf);
+    RefuseValue(group, [](auto& v) { v.members.root.kind = CommitOwnerObjectKind::kMemberValue; v.members.root.bytes = 204U; });
+    RefuseValue(group, [](auto& v) { v.owners.root.bytes = 91U; v.owners.owned_bytes = 91U; });
+    RefuseValue(group, [](auto& v) { v.members.root.sha256 = {}; });
+    RefuseValue(group, [](auto& v) { v.members.sha256 = {}; });
+    RefuseValue(group, [](auto& v) { v.members.owned_bytes = kMaxCommitCoveredTreeBytes + 1U; });
+    auto ceiling = group; ceiling.members.owned_bytes = kMaxCommitCoveredTreeBytes; (void)Encode(ceiling);
+    auto two = group; two.members.count = 2U; two.members.owned_bytes = 2U * per_key; (void)Encode(two);
+    RefuseValue(two, [](auto& v) { --v.members.owned_bytes; });
+    RefuseValue(group, [&](auto& v) { v.members.root.bytes = leaf - 1U; });
+    RefuseValue(group, [&](auto& v) { v.members.root.bytes = 92U; });
+    RefuseValue(group, [](auto& v) { v.owners.root.bytes = 93U; v.owners.owned_bytes = 93U; });
+    RefuseValue(group, [](auto& v) { v.owners.sha256 = Empty(CommitOwnerTreeKind::kMembers).sha256; });
+    for (const auto tree : {CommitOwnerTreeKind::kCoverage, CommitOwnerTreeKind::kGroups}) {
+        const auto set = Empty(tree); CommitOwnerPage page; page.scope = kScope; page.tree = tree;
+        Reject([&] { ValidateCommitOwnerSetRoot(set, tree, kScope, page, set.root, 2U); });
+    }
+    const auto empty = Empty(CommitOwnerTreeKind::kMembers); CommitOwnerPage page; page.scope = kScope; page.tree = CommitOwnerTreeKind::kMembers;
+    ValidateCommitOwnerSetRoot(empty, page.tree, kScope, page, empty.root, 1U);
+    Reject([&] { ValidateCommitOwnerSetRoot(empty, page.tree, kScope, page, empty.root, 0U); });
+    auto newer = page; newer.generation = 2U; Reject([&] { ValidateCommitOwnerSetRoot(empty, page.tree, kScope, newer, empty.root, 1U); });
+    auto other_tree = page; other_tree.tree = CommitOwnerTreeKind::kObservations;
+    Reject([&] { ValidateCommitOwnerSetRoot(empty, page.tree, kScope, other_tree, empty.root, 1U); });
+    auto measured = empty.root; measured.sha256[0U] ^= 1U; Reject([&] { ValidateCommitOwnerSetRoot(empty, page.tree, kScope, page, measured, 1U); });
+
+    Reject([] { CommitOwnerSetHasher invalid(static_cast<CommitOwnerTreeKind>(6U)); });
+    assert(CommitOwnerSetHasher(CommitOwnerTreeKind::kMembers).Finish() != CommitOwnerSetHasher(CommitOwnerTreeKind::kObservations).Finish());
+    CommitOwnerSetHasher digest(CommitOwnerTreeKind::kMembers);
+    Reject([&] { digest.Add(std::span(key).first(23U), value); });
+    auto zero = key; std::fill_n(zero.begin(), 16U, 0U); Reject([&] { digest.Add(zero, value); });
+    Reject([&] { digest.Add(key, Ref(CommitOwnerObjectKind::kObservation, SerializeCommitOwnerMember(member))); });
+    const auto higher = EncodeCommitOwnerMemberKey({member.group_id, 1U});
+    digest.Add(higher, value); Reject([&] { digest.Add(key, value); }); Reject([&] { digest.Add(higher, value); });
+    assert(digest.count() == 1U); (void)digest.Finish();
+    Reject([&] { (void)digest.Finish(); }); Reject([&] { digest.Add(EncodeCommitOwnerMemberKey({member.group_id, 2U}), value); });
+}
 }  // namespace
 
 int main() {
     owner_artifact_allocation::CalibrateAligned();
     CoverageAndOwnedProofs(); GroupAndObservationBindings(); EdgeSetsAndExactSources();
     IdKeyStreamingAndIncarnation(); CounterOwnershipAndExhaustion(); SparseHeaderRefusal();
+    SetCommitmentBounds();
 }

@@ -21,6 +21,7 @@ The set digest hashes a domain-separated tree-kind prefix, every ordered key and
 Empty sets still select a checked empty page and the canonical empty-set digest.
 Member, observation and owner-edge sets each have a format-wide 256 MiB owned-metadata ceiling, independently of current session limits.
 Owned bytes count the tree pages and directly referenced capsules, not native bodies referenced inside capsules.
+A nonempty set selects a root of at least one leaf page and owns one leaf page and one value capsule per key; only member, observation and owner-edge trees take set commitments.
 Counts, extents and sums cannot wrap, and a declared count never determines an allocation before physical bounds pass.
 
 ## Fixed native source locators
