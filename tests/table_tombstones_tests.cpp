@@ -1,6 +1,8 @@
 #include <cassert>
+#include <chrono>
 #include <cstdlib>
 #include <fstream>
+#include <future>
 #include <new>
 #include <tuple>
 
@@ -296,6 +298,56 @@ void CrashRequiredResurrection(const char* executable) {
     }
 }
 }
+// Compaction checkpoints every current chunk after its barrier. A background
+// checkpoint that starts after the barrier visited a chunk may still be
+// writing that chunk's files without its lock when compaction reaches it;
+// compaction waits for it and keeps the write it carries.
+void CompactionWaitsForBackgroundCheckpointFiles() {
+#ifndef _WIN32
+    // On Windows the barrier holds the publish lock through its syncs, so no
+    // checkpoint publishes inside them.
+    test::ScopedTempDir directory("chunkdb-table-tombstone-checkpoint-files");
+    auto config = Config(directory.path());
+    config.default_options.checkpoint_update_interval = 1U;
+    std::uint64_t deleted = 0U;
+    {
+        TableCatalog catalog(config);
+        deleted = Populate(catalog);
+    }
+    config.background_maintenance = true;
+    {
+        TableCatalog catalog(config);
+        ChunkStore* store = nullptr;
+        {
+            auto lease = catalog.Require("t")->Acquire();
+            store = &lease->store();
+            store->ArmBarrierBeforeSyncPauseForTests();
+        }
+        auto compaction = std::async(std::launch::async, [&] { return catalog.CompactTombstones("t", deleted + 1U); });
+        assert(store->WaitForBarrierBeforeSyncForTests());
+        // Compaction is paused inside its own barrier, after it flushed every
+        // chunk, so this write races nothing it has started.
+        store->ArmCheckpointBeforeWalRemovalPauseForTests();
+        store->SetBlockBits(2, 0, "00100000");
+        assert(store->WaitForCheckpointBeforeWalRemovalForTests());
+        store->ResumeBarrierBeforeSyncForTests();
+        const bool waited = compaction.wait_for(std::chrono::milliseconds(200)) != std::future_status::ready;
+        store->ResumeCheckpointBeforeWalRemovalForTests();
+        assert(compaction.get() == deleted);
+        assert(waited);
+        auto lease = catalog.Require("t")->Acquire();
+        assert(lease->store().GetBlockBits(2, 0) == "00100000");
+        assert(lease->store().RetainedTombstoneCount() == 0U && lease->store().RetainedDeletionFloor() == deleted);
+        lease->store().WalBarrier();
+    }
+    config.background_maintenance = false;
+    TableCatalog reopened(config);
+    auto lease = reopened.Require("t")->Acquire();
+    assert(lease->store().GetBlockBits(2, 0) == "00100000");
+    assert(!lease->store().ReadChunkState(0, 0).written);
+    assert(lease->store().RetainedTombstoneCount() == 0U && lease->store().RetainedDeletionFloor() == deleted);
+#endif
+}
 int main(int argc, char** argv) {
     allocation::fail_next = true;
     assert(aligned_allocation_test::Refused(1024U) && !allocation::fail_next);
@@ -323,4 +375,5 @@ int main(int argc, char** argv) {
     ResumeAllocationFailureDoesNotEscapeCleanup();
     if (argc == 1) RequiredResurrectionSurvivesCompaction();
     if (argc == 1) RepeatedCompactionRetainsCurrentState();
+    if (argc == 1) CompactionWaitsForBackgroundCheckpointFiles();
 }

@@ -23,7 +23,7 @@
 namespace chunkdb {
 struct FeatureActivationTestAccess {
     static bool MaintenanceRunning(const Table& table) {
-        return table.store_ && table.store_->maintenance_thread_.joinable();
+        return table.store_ && table.store_->maintenance_task_ != nullptr;
     }
     static bool MetadataExcluded(TableCatalog& catalog) {
         if (!catalog.feature_metadata_gate_.try_lock_shared()) return true;

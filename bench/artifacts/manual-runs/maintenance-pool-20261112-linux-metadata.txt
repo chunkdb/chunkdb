@@ -1,0 +1,10 @@
+date=2026-11-12
+machine=AMD Ryzen 5 4600H (6 cores, 12 threads), 14.49 GiB RAM, CPU governor performance during the run
+os=Ubuntu, Linux 7.0.0-38-generic, ext4 on LVM on a SATA SSD
+compiler=GCC 15.2.0
+source=base: chunkdb main f99ed88 with bench/maintenance_bench.cpp of the branch; branch: feat/shared-maintenance-pool 2426adc
+build=cmake -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WERROR=ON; target chunkdb_maintenance_bench
+command=chunkdb_maintenance_bench --data-dir <ext4 directory> --tables 1|100|1000 --requests 200000 --flushes 100 (30 for 1000 tables) --maintenance-workers 2|8 --background-maintenance on|off
+rows=maintenance-pool-20261112-linux-rows.txt: the first word names the build (base, branch with 2 workers, branch8 with 8 workers), the rest is the benchmark's JSON line; three runs of each case in window order
+load=other services on the host used 105% CPU on average (peak 302%, sampled every 5 s); the longest gap between samples was 7.5 s; no other benchmark or test ran
+limits=ulimit -n 65536; base runs one maintenance thread per table and reports maintenance_workers 0

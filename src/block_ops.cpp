@@ -180,7 +180,10 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     chunk->wal_bytes += appended_bytes;
 
     const bool sync_required = durability_mode_ != DurabilityMode::kRelaxed;
-    if (sync_required || chunk->pending_wal_flush_updates >= wal_group_commit_updates_) {
+    // While a background checkpoint replaces the chunk's files (relaxed mode
+    // only), the batch waits for it; that checkpoint flushes it when it ends.
+    if (sync_required ||
+        (chunk->pending_wal_flush_updates >= wal_group_commit_updates_ && !chunk->checkpoint_io)) {
         // Throws with the WAL file already neutralized on failure; the
         // caller rolls back memory, batch, and counters.
         FlushWalBatch(chunk_coord, chunk, sync_required);
@@ -268,6 +271,7 @@ void ChunkStore::SetBlockBitsAtAddress(const ChunkCoord& chunk_coord, std::size_
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
+    AwaitChunkBacklogLocked(lock, *regular_chunk);
     WriteBlockBitsLocked(chunk_coord, regular_chunk, block_index, bits, true);
 }
 
@@ -454,6 +458,7 @@ ChunkMutationResult ChunkStore::UnsetBlockAtAddress(const ChunkCoord& chunk_coor
         auto& write = PrepareUnsetBlockWrite(block_index);
         const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
         std::unique_lock lock(regular_chunk->mutex);
+        AwaitChunkBacklogLocked(lock, *regular_chunk);
         if (expected_version.has_value() && regular_chunk->version != *expected_version) {
             return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
         }
@@ -465,6 +470,7 @@ ChunkMutationResult ChunkStore::UnsetBlockAtAddress(const ChunkCoord& chunk_coor
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
+    AwaitChunkBacklogLocked(lock, *regular_chunk);
     if (expected_version.has_value() && regular_chunk->version != *expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
     }
@@ -518,6 +524,7 @@ ChunkMutationResult ChunkStore::SetBlockAtAddress(const ChunkCoord& chunk_coord,
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
+    AwaitChunkBacklogLocked(lock, *regular_chunk);
     if (expected_version.has_value() && regular_chunk->version != *expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
     }
@@ -1277,6 +1284,7 @@ std::uint64_t ChunkStore::ApplyChunkState(
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
+    AwaitChunkBacklogLocked(lock, *regular_chunk);
     // Values of blocks the state makes absent go.
     auto var_update = VarUpdateForState(regular_chunk->vars, presence_bitmap);
     return ApplyChunkStateLocked(

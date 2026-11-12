@@ -503,6 +503,7 @@ void ChunkStore::CloseAllWalStreams() noexcept {
         }
         for (const auto& chunk : chunks) {
             std::unique_lock chunk_lock(chunk->mutex);
+            AwaitChunkFilesLocked(chunk_lock, *chunk);
             CloseWalAppendStream(chunk);
         }
     }

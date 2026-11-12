@@ -486,6 +486,10 @@ std::uint64_t ChunkStore::CommitTransaction(
         const bool exclusive = target.write != kNoWrite;
         if (exclusive) {
             target.chunk->mutex.lock();
+            // A transaction writes the chunk's WAL itself.
+            std::unique_lock<RegularChunkMutex> files(target.chunk->mutex, std::adopt_lock);
+            AwaitChunkFilesLocked(files, *target.chunk);
+            (void)files.release();
         } else {
             target.chunk->mutex.lock_shared();
         }
@@ -894,6 +898,7 @@ std::uint64_t ChunkStore::CommitTransaction(
         try {
             const auto& chunk = change.target->chunk;
             std::unique_lock lock(chunk->mutex);
+            AwaitChunkFilesLocked(lock, *chunk);
             if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TXN_AFTER_COMMIT_THROW_ONCE")) {
                 // Not a std::exception: whatever is thrown is contained.
                 throw 86;

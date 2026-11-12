@@ -394,6 +394,9 @@ void ChunkStore::TruncateWalTail(
     const std::shared_ptr<RegularChunk>& chunk,
     std::uint64_t committed_size,
     bool force_sync) {
+    if (chunk->checkpoint_io) {
+        throw std::logic_error("chunk files are owned by a running background checkpoint");
+    }
     SnapshotGenerationWriteGuard snapshot_write(this);
     if (chunk->wal_path.empty()) {
         chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
@@ -491,6 +494,9 @@ void ChunkStore::FlushWalBatch(
     bool force_sync) {
     if (chunk->wal_batch.empty()) {
         return;
+    }
+    if (chunk->checkpoint_io) {
+        throw std::logic_error("chunk files are owned by a running background checkpoint");
     }
 
     // Captured before any file mutation: on a failed or torn append the WAL
@@ -780,6 +786,9 @@ void ChunkStore::FlushWalBatchForEviction(
     if (chunk->wal_batch.empty()) {
         return;
     }
+    if (chunk->checkpoint_io) {
+        throw std::logic_error("chunk files are owned by a running background checkpoint");
+    }
 
     // On eviction, bypass WAL stream-cache tracking when no stream is currently open.
     // This avoids extra map/mutex churn for streams that will be closed immediately.
@@ -934,6 +943,7 @@ void ChunkStore::FlushWalBatchesForReopen() {
         }
         for (const auto& [coord, chunk] : chunks) {
             std::unique_lock chunk_lock(chunk->mutex);
+            AwaitChunkFilesLocked(chunk_lock, *chunk);
             FlushWalBatch(coord, chunk, durability_mode_ != DurabilityMode::kRelaxed);
         }
     }
@@ -961,6 +971,7 @@ void ChunkStore::FlushAllPendingWalBatches() noexcept {
 
         for (const auto& [coord, chunk] : chunks) {
             std::unique_lock chunk_lock(chunk->mutex);
+            AwaitChunkFilesLocked(chunk_lock, *chunk);
             try {
                 FlushWalBatch(
                     coord,
