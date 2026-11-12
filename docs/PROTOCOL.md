@@ -123,7 +123,7 @@ A block's absent row can have a version when its containing chunk retains a comm
 Collection retains empty chunks' producing versions and times in checked tombstones.
 Never-written chunks and identities forgotten by tombstone compaction have null versions.
 Schema versions remain known for absent rows and empty areas; area consistency otherwise remains unchanged.
-Coordinate tuples contain exactly `dims` signed values; three-dimensional tuples include a zero z coordinate.
+Coordinate tuples contain exactly `dims` signed values: x and y, then z only in a three-dimensional table.
 SCAN CHUNKS returns a map with `chunks`, `more`, `epoch`, nullable completed `position`, and `retained_deletion_floor`.
 Its rows are `[coordinates..., chunk_version]`, with a form-or-null appended under WITH DATA.
 SINCE includes retained deletions and refuses a revision below the deletion floor with `RESYNC_REQUIRED reason=history_lost floor=... epoch=...`, adding `current` when known.

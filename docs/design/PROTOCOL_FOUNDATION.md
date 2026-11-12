@@ -254,8 +254,9 @@ An exhausted fork without a representable successor is refused before publicatio
 
 An initial exact-fork watch continues when the restored completed cut is proven and all ordinary replay/loss bounds hold.
 The unchanged checked successor clock proves that no post-fork token was issued; retained feed or durable slot history can also prove the prefix.
-After a later crash or restart, missing chunk files cannot prove that no post-fork mutation was lost.
-Without durable replay/loss proof, even an exact-fork request receives a lineage-bearing resync and rebuilds.
+After a crash or restart, the reopened feed starts its floor and watermark at the persisted clock ceiling minus one (`ChangeFeed::ResumeImpl`).
+That ceiling advances in reservation batches whenever a revision is issued, so chunk files and retained tombstones never extend the floor below it.
+An exact-fork request after a restart therefore continues only if no revision was issued since the restore; otherwise, without durable slot replay, it receives a lineage-bearing resync and rebuilds.
 
 Source evidence: `backup_create.cpp` enumerates `L_*` chunk directories, copies checkpoint images/current WAL prefixes and saves slots at each proven cut.
 It does not copy `.chunkdb.feed/`'s retained historical WAL/base files into the backup inventory (`feed_slot_records.hpp` names that directory).
