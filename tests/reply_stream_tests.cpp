@@ -143,6 +143,35 @@ void CaptureCreditPrecedesLoadingAndOwnsSnapshot() {
     const auto rest = Collect(*reply, 17U, first.size());
     assert(first + rest == expected);
 }
+// The capture credit reserved before reading covers the reply that follows:
+// every axis of an area, variable chunk columns of a table whose block
+// columns are fixed, and identity pages with data.
+void CaptureBoundsCoverChunkModelReplies() {
+    test::ScopedTempDir dir("chunkdb-reply-chunk-model-capture");
+    CatalogConfig config;
+    config.data_dir = dir.path();
+    config.background_maintenance = false;
+    auto catalog = std::make_shared<TableCatalog>(config);
+    CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
+    SessionState session;
+    assert(engine.Execute(session, "HELLO 3\r\n").starts_with("%"));
+    const auto run = [&](const std::string& line, const std::vector<std::optional<std::string>>& parameters = {}) {
+        return engine.Execute(session, line + "\r\n", parameters);
+    };
+    assert(run("CREATE TABLE deep (v u64 DEFAULT 0) CHUNK 32 x 32 x 32") == "+OK\r\n");
+    for (int chunk = 0; chunk < 16; ++chunk)
+        assert(run("SET BLOCK 0 0 " + std::to_string(32 * chunk) + " IN deep v=1").starts_with(":"));
+    assert(run("CREATE TABLE tagged (a u8 DEFAULT 0) CHUNK 2 x 2 CHUNK COLUMNS (tag bytes(800000) NULL)") == "+OK\r\n");
+    assert(run("SET CHUNK 0 0 IN tagged META tag=$1", {std::string(700000U, 'x')}).starts_with(":"));
+    for (const auto* line : {"GET AREA 0 0 0 TO 0 0 15 FROM deep", "SCAN CHUNKS FROM deep WITH DATA",
+             "GET CHUNK 0 0 FROM tagged", "GET AREA 0 0 TO 0 0 FROM tagged", "SCAN CHUNKS FROM tagged WITH DATA"}) {
+        std::size_t reserved = 0U;
+        const std::function<void(std::size_t)> reserve = [&](std::size_t bytes) { reserved = std::max(reserved, bytes); };
+        std::unique_ptr<ReplyContinuation> reply;
+        assert(engine.Execute(session, std::string(line) + "\r\n", {}, &reply, &reserve).empty() && reply);
+        assert(reply->encoded_size() > 500000U && reserved >= reply->encoded_size());
+    }
+}
 void WideNullableSchemaHasAnObtainableCaptureBound() {
     TableSchema schema;
     schema.columns.push_back({.id = 1U, .name = "fixed", .type = {ColumnKind::kUnsigned, 8U}, .required = true, .default_value = {}});
@@ -162,5 +191,6 @@ int main() {
     ProgressiveSnapshotsAndBounds();
     ChunkModelContinuationsMatchReplies();
     CaptureCreditPrecedesLoadingAndOwnsSnapshot();
+    CaptureBoundsCoverChunkModelReplies();
     WideNullableSchemaHasAnObtainableCaptureBound();
 }

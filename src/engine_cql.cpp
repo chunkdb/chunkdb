@@ -286,6 +286,23 @@ void AppendChunkState(ReplyParts& reply, const Geometry& geometry, const ChunkSt
         kVarMaxChunkBytesLimit * (projected ? 2U : 1U);
 }
 
+// The most one encoded chunk form of the table takes in a reply, with the
+// variable byte bound only where a block or chunk column is variable.
+[[nodiscard]] std::size_t ChunkReplyFormBytes(const Geometry& geometry) {
+    const auto& chunk_columns = geometry.chunk_schema().columns;
+    const bool variable = geometry.layout().has_var_columns() ||
+        std::any_of(chunk_columns.begin(), chunk_columns.end(),
+            [](const Column& column) { return !IsFixedWidth(column.type.kind); });
+    return ChunkFormBytes(geometry, false) - (variable ? 0U : kVarMaxChunkBytesLimit);
+}
+
+// Retained state of `count` chunk forms, each with `framing` bytes, within
+// the response byte limit.
+[[nodiscard]] std::size_t ChunkReplyStateBytes(const Geometry& geometry, std::size_t count, std::size_t framing) {
+    const auto chunk_bytes = std::min<std::size_t>(kMaxChunkRangeResponseBytes, framing + ChunkReplyFormBytes(geometry));
+    return count > kMaxChunkRangeResponseBytes / chunk_bytes ? kMaxChunkRangeResponseBytes : count * chunk_bytes;
+}
+
 // Schema indexes of `names`, or empty for every column.
 [[nodiscard]] std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<std::string>& names);
 
@@ -1370,9 +1387,8 @@ std::string CommandEngine::ExecuteStatement(
                     ChunkState state;
                     bool private_state = false;
                     const ChunkCoord coord{get.chunk_x, get.chunk_y, get.chunk_z};
-                    if (reserve_reply) (*reserve_reply)(ChunkReplyCaptureBound(layout,
-                        store.geometry().ChunkPayloadBytes() + ChunkPresenceBitmapBytes(store.geometry()) +
-                        (layout.has_var_columns() ? kVarMaxChunkBytesLimit : 0U)));
+                    if (reserve_reply)
+                        (*reserve_reply)(ChunkReplyCaptureBound(layout, ChunkReplyStateBytes(store.geometry(), 1U, 64U)));
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
                         TxnRead(txn, std::span<const ChunkCoord>(&coord, 1));
@@ -1490,20 +1506,21 @@ std::string CommandEngine::ExecuteStatement(
                             const auto delta = static_cast<std::uint64_t>(last) - static_cast<std::uint64_t>(first);
                             return delta >= kMaxChunkRangeChunks ? kMaxChunkRangeChunks : static_cast<std::size_t>(delta + 1U);
                         };
+                        // Each axis multiplies the count, which never exceeds
+                        // the chunks an area may return.
+                        const auto times = [](std::size_t count, std::size_t axis) {
+                            return axis > kMaxChunkRangeChunks / count ? kMaxChunkRangeChunks : count * axis;
+                        };
                         auto count = kMaxChunkRangeChunks;
                         if (!get.around) {
-                            const auto width = extent(get.x0, get.x1), height = extent(get.y0, get.y1);
-                            count = width > kMaxChunkRangeChunks / height ? kMaxChunkRangeChunks : width * height;
+                            count = times(extent(get.x0, get.x1), extent(get.y0, get.y1));
+                            if (get.dims == 3U) count = times(count, extent(get.z0, get.z1));
                         } else if (get.radius >= 0 && static_cast<std::uint64_t>(get.radius) < kMaxChunkRangeChunks / 2U) {
                             const auto diameter = static_cast<std::size_t>(get.radius) * 2U + 1U;
-                            count = diameter > kMaxChunkRangeChunks / diameter ? kMaxChunkRangeChunks : diameter * diameter;
+                            count = times(diameter, diameter);
+                            if (get.dims == 3U) count = times(count, diameter);
                         }
-                        const auto chunk_bytes = std::min<std::size_t>(kMaxChunkRangeResponseBytes,
-                            96U + store.geometry().ChunkPayloadBytes() + ChunkPresenceBitmapBytes(store.geometry()) +
-                            (layout.has_var_columns() ? kVarMaxChunkBytesLimit : 0U));
-                        const auto state_bytes = count > kMaxChunkRangeResponseBytes / chunk_bytes ?
-                            kMaxChunkRangeResponseBytes : count * chunk_bytes;
-                        (*reserve_reply)(ChunkReplyCaptureBound(layout, state_bytes));
+                        (*reserve_reply)(ChunkReplyCaptureBound(layout, ChunkReplyStateBytes(store.geometry(), count, 96U)));
                     }
                     if (session.transaction != nullptr) {
                         auto& txn = *session.transaction;
@@ -1803,6 +1820,10 @@ std::string CommandEngine::ExecuteStatement(
                     const auto columns = ColumnsOf(geometry.layout(), scan.columns);
                     const ChunkCoord cursor =
                         scan.after.has_value() ? ChunkCoord{scan.after->first, scan.after->second, scan.after_z} : ChunkCoord{};
+                    // A page with data retains chunk states up to the response byte limit.
+                    if (reserve_reply && scan.with_data)
+                        (*reserve_reply)(ChunkReplyCaptureBound(geometry.layout(),
+                            ChunkReplyStateBytes(geometry, static_cast<std::size_t>(limit), 128U)));
                     ChunkIdentityScanPage page;
                     try {
                         page = lease.store().ScanChunkIdentities(scan.after.has_value(), cursor,
