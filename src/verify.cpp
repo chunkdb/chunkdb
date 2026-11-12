@@ -1160,25 +1160,40 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         tables.push_back(entry.path());
     }
     std::sort(tables.begin(), tables.end());
+    // Every table's owner context is checked before any table's chunks.
     std::set<chunkdb::StoreId> epochs;
+    std::vector<std::optional<chunkdb::CommitOwnerScope>> table_scopes;
     bool scopes_valid = true;
     for (const auto& table : tables) {
+        std::optional<chunkdb::StoreManifest> manifest;
         try {
-            const auto manifest = chunkdb::ReadStoreManifest(table);
-            if (!manifest || !epochs.insert(manifest->store_id).second) throw std::runtime_error("missing manifest or duplicate table epoch");
-            const auto expected = pending_owner ? pending_owner : owner_scope;
-            if (manifest->commit_owner != expected && !(pending_owner && !manifest->commit_owner))
-                throw std::runtime_error("table owner scope differs from its admitted catalog");
+            manifest = chunkdb::ReadStoreManifest(table);
         } catch (const std::exception& error) {
             scopes_valid = false;
-            Report(counters, true, "feature_ownership_invalid", table, error.what());
+            Report(counters, true, "manifest_invalid", chunkdb::StoreManifestPath(table),
+                std::string(error.what()) + "; chunk artifacts were not checked");
+            continue;
         }
+        if (!manifest) {
+            scopes_valid = false;
+            Report(counters, true, "manifest_missing", chunkdb::StoreManifestPath(table),
+                "table without a manifest; its chunk artifacts were not checked");
+            continue;
+        }
+        const auto expected = pending_owner ? pending_owner : owner_scope;
+        if (!epochs.insert(manifest->store_id).second) {
+            scopes_valid = false;
+            Report(counters, true, "feature_ownership_invalid", table, "duplicate table epoch");
+        } else if (manifest->commit_owner != expected && !(pending_owner && !manifest->commit_owner)) {
+            scopes_valid = false;
+            Report(counters, true, "feature_ownership_invalid", table, "table owner scope differs from its admitted catalog");
+        }
+        table_scopes.push_back(manifest->commit_owner ? expected : std::optional<chunkdb::CommitOwnerScope>{});
     }
     if (!scopes_valid) return;
-    for (const auto& table : tables) {
-        const auto table_manifest = chunkdb::ReadStoreManifest(table);
-        VerifyTable(table, counters, table_manifest->commit_owner ? (pending_owner ? pending_owner : owner_scope) :
-            std::optional<chunkdb::CommitOwnerScope>{});
+    for (std::size_t i = 0U; i < tables.size(); ++i) {
+        const auto& table = tables[i];
+        VerifyTable(table, counters, table_scopes[i]);
         if (check_tables) {
             try {
                 const auto root = chunkdb::ReadDataDirManifest(data_dir);
