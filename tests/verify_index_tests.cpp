@@ -393,6 +393,56 @@ void ArchiveDescriptors() {
         fixture.Check(true, "digest mismatch");
     }
 }
+void HistoricalIntentCounts() {
+    constexpr std::size_t count = 16385U;
+    for (const auto dims : {std::uint8_t{2U}, std::uint8_t{3U}}) {
+        for (const auto state : {TxnIntentState::kRollback, TxnIntentState::kCommitted}) {
+            test::ScopedTempDir directory("chunkdb-historical-intent-count");
+            Save(DataDirManifestPath(directory.path()), SerializeDataDirManifest({.data_dir_id = StoreId{9U}, .options = {}}));
+            StoreConfig config;
+            config.data_dir = directory.path() / "tables/t";
+            config.geometry = {1U, 1U, 1U, 1U, 8U};
+            config.geometry.dims = dims;
+            config.max_loaded_chunks = 1U;
+            config.background_maintenance = false;
+            StoreId id{};
+            { ChunkStore initialized(config); id = initialized.store_id(); }
+            TxnIntent intent{.state = state, .version = 100U, .entries = {}};
+            for (std::size_t i = 0U; i < count; ++i)
+                intent.entries.push_back({{static_cast<std::int64_t>(i), 0, dims == 3U ? -1 : 0}, 0U});
+            const auto bytes = SerializeTxnIntent(intent, dims, id, count);
+            bool lower_write_limit_refused = false;
+            try { (void)SerializeTxnIntent(intent, dims, id, 1U); }
+            catch (const std::invalid_argument&) { lower_write_limit_refused = true; }
+            assert(lower_write_limit_refused);
+            const auto path = TxnIntentPath(config.data_dir, intent.version);
+            Save(path, bytes);
+            assert(LoadRecoveryTxnIntent(path, dims, id) == bytes);
+            TxnIntent decoded;
+            assert(TryParseTxnIntent(bytes, &decoded, dims, id));
+            assert(decoded.entries.size() == count && decoded.state == state);
+            {
+                auto read_only = config; read_only.access_mode = AccessMode::kReadOnly;
+                ChunkStore reader(read_only);
+                const auto unwritten = reader.ReadChunkState(intent.entries.back().coord);
+                assert(!unwritten.written && unwritten.version == 0U);
+                assert(LoadFile(path) == bytes);
+            }
+            const auto before = Snapshot(directory.path());
+            std::ostringstream findings;
+            const auto checked = VerifyDataDirectory(directory.path(), findings);
+            if (checked.errors != 0U) std::cerr << findings.str();
+            assert(checked.errors == 0U);
+            assert(Snapshot(directory.path()) == before);
+            {
+                ChunkStore recovered(config);
+                assert(!std::filesystem::exists(path));
+                const auto unwritten = recovered.ReadChunkState(intent.entries.back().coord);
+                assert(!unwritten.written && unwritten.version == 0U);
+            }
+        }
+    }
+}
 } // namespace
 
 int main(int argc, char** argv) {
@@ -406,4 +456,5 @@ int main(int argc, char** argv) {
     run("rollback", RollbackVisibility);
     run("aliases", ManagedAliases);
     run("identity-cuts", ImageBaseTimeAndConflictingVisibilityCuts);
+    run("intent-counts", HistoricalIntentCounts);
 }

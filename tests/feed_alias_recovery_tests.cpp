@@ -2,6 +2,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <iostream>
+#include <limits>
 #include <new>
 #include <sstream>
 
@@ -16,11 +17,13 @@
 namespace allocation {
 thread_local bool measuring = false;
 thread_local std::size_t largest = 0U;
+thread_local std::size_t limit = std::numeric_limits<std::size_t>::max();
 }
 #if defined(__GNUC__)
 __attribute__((noinline))
 #endif
 void* operator new(std::size_t bytes) {
+    if (bytes > allocation::limit) throw std::bad_alloc();
     if (allocation::measuring) allocation::largest = std::max(allocation::largest, bytes);
     if (auto* memory = std::malloc(bytes == 0U ? 1U : bytes)) return memory;
     throw std::bad_alloc();
@@ -36,6 +39,8 @@ __attribute__((noinline))
 #endif
 void operator delete(void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
 void operator delete[](void* pointer, std::size_t) noexcept { ::operator delete(pointer); }
+
+#include "aligned_allocation_replacement.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -258,6 +263,14 @@ void PartialExtentMatchesReplayPolicy() {
 }
 
 int main(int argc, char** argv) {
+    allocation::measuring = true; allocation::limit = 128U;
+    assert(aligned_allocation_test::Refused(1024U));
+    allocation::limit = std::numeric_limits<std::size_t>::max();
+    aligned_allocation_test::Succeeds(1024U);
+    assert(allocation::largest >= 1024U);
+    allocation::measuring = false; allocation::largest = 0U;
+    aligned_allocation_test::Succeeds(1024U);
+    assert(allocation::largest == 0U);
     if (argc == 2 && std::string_view(argv[1]) == "--alias") { BoundedReopen(false); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--independent") { BoundedReopen(true); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--first-frame") { FirstFrameAdmission(); return 0; }

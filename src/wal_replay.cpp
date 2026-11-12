@@ -9,6 +9,7 @@
 #include <vector>
 
 #include "chunkdb/crc32.hpp"
+#include "commit_group_identity.hpp"
 #include "feature_flags.hpp"
 #include "store_manifest.hpp"
 
@@ -73,6 +74,7 @@ struct ParsedFrame {
     std::uint64_t schema_version = 1;
     std::uint64_t commit_time_ms = 0;
     std::optional<std::string> user;
+    std::optional<WalGroupRef> group;
     bool gc = false;
     std::size_t size = 0;
     std::vector<PendingSpan> spans;
@@ -152,6 +154,7 @@ struct FrameShape {
     const Geometry& geometry,
     bool may_skip_unknown,
     bool slots_enabled,
+    bool groups_enabled,
     ParsedFrame* frame,
     std::string* stop_reason,
     bool* reaches_end,
@@ -227,6 +230,7 @@ struct FrameShape {
     bool have_schema = false;
     bool have_user = false;
     frame->user.reset();
+    frame->group.reset();
     frame->gc = (frame_flags & kWalFrameGc) != 0U;
     frame->schema_version = 1;
     for (std::size_t at = cursor + kWalFrameFixedHeaderSize; at < crc_at;) {
@@ -261,6 +265,17 @@ struct FrameShape {
             }
             have_user = true;
             frame->user.emplace(reinterpret_cast<const char*>(wal.data() + at + kWalTlvHeaderSize), length);
+        } else if (type == kWalTlvGroup) {
+            if (!groups_enabled || frame->group) {
+                *stop_reason = !groups_enabled ? "tlv_group_without_feature" : "tlv_duplicate_group";
+                return false;
+            }
+            try {
+                frame->group = ParseWalGroupRef(std::span(wal).subspan(at + kWalTlvHeaderSize, length));
+            } catch (const std::invalid_argument&) {
+                *stop_reason = "tlv_group_invalid";
+                return false;
+            }
         } else if (!may_skip_unknown) {
             *stop_reason = "tlv_unknown_type";
             return false;
@@ -488,10 +503,12 @@ FeedFrameInfo ReplayFeedFrame(
     bool reaches_end = false;
     bool intact = false;
     if (!ParseFrame(bytes, 0U, geometry, MaySkipUnknownTypes(features),
-                    (features.incompat & kFeatureFeedSlots) != 0U, &frame, &reason, &reaches_end, &intact) ||
+                    (features.incompat & kFeatureFeedSlots) != 0U,
+                    (features.incompat & kFeatureCommitGroups) != 0U, &frame, &reason, &reaches_end, &intact) ||
         frame.size != bytes.size()) {
         throw std::runtime_error("invalid captured feed frame: " + reason);
     }
+    if (frame.group) throw std::runtime_error("captured feed group requires directory admission");
     const auto& layout = geometry.LayoutAt(frame.schema_version);
     if (state->payload.size() != layout.payload_bytes() || state->presence_bitmap.size() != ChunkPresenceBitmapBytes(geometry)) {
         throw std::logic_error("captured feed state has another layout");
@@ -540,10 +557,12 @@ FeedFrameInfo InspectFeedFrame(
     bool reaches_end = false;
     bool intact = false;
     if (!ParseFrame(bytes, 0U, geometry, MaySkipUnknownTypes(features),
-                    (features.incompat & kFeatureFeedSlots) != 0U, &frame, &reason, &reaches_end, &intact) ||
+                    (features.incompat & kFeatureFeedSlots) != 0U,
+                    (features.incompat & kFeatureCommitGroups) != 0U, &frame, &reason, &reaches_end, &intact) ||
         frame.size != bytes.size()) {
         throw std::runtime_error("invalid feed archive frame: " + reason);
     }
+    if (frame.group) throw std::runtime_error("WAL group frame requires directory admission");
     return {frame.revision, frame.commit_time_ms, frame.schema_version, std::move(frame.user), frame.gc};
 }
 
@@ -657,7 +676,12 @@ WalReplayResult wal_detail::ReplayFromSource(
         bool parsed =
             ParseFrame(frame_bytes, window.offset, geometry, may_skip_unknown,
                        (store_features.incompat & kFeatureFeedSlots) != 0U,
+                       (store_features.incompat & kFeatureCommitGroups) != 0U,
                        &frame, &stop_reason, &reaches_end, &intact, source.Size() - cursor);
+        if (parsed && frame.group) {
+            parsed = false;
+            stop_reason = "frame_group_unresolved";
+        }
         // Every mutation reserves a higher revision than the one before it
         // (under the chunk lock), so a frame that does not is damage.
         if (parsed && frame.revision <= previous_revision) {

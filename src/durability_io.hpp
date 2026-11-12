@@ -4,10 +4,21 @@
 #include <filesystem>
 #include <functional>
 #include <span>
+#include <string>
 #include <system_error>
 #include <vector>
 
 namespace chunkdb {
+
+// Sync the already admitted native generation without reopening its path.
+// Labels are diagnostic and observer values, never I/O instructions.
+#ifdef _WIN32
+void SyncOwnerFileHandle(void* handle, const std::filesystem::path& label);
+void SyncOwnerDirectoryHandle(void* handle, const std::filesystem::path& label);
+#else
+void SyncOwnerFileDescriptor(int fd, const std::filesystem::path& label);
+void SyncOwnerDirectoryDescriptor(int fd, const std::filesystem::path& label);
+#endif
 
 using AtomicFileSink = std::function<void(std::span<const std::uint8_t>)>;
 using AtomicFileProducer = std::function<void(const AtomicFileSink&)>;

@@ -47,12 +47,12 @@ Parameters in WITH follow the same framing rules as all other parameters, indepe
 Before authentication HELLO carries at most 12 parameters, enough for `$1` of USER, every known option and eight unknown ones; more receive `PROTOCOL` and close without their frames being read.
 Unset options use server defaults; explicit per-statement TAG overrides `default_tag`, including an empty tag.
 
-| Limit key | Task 51 value and ownership |
+| Limit key | Value and ownership |
 | --- | --- |
-| `max_area_chunks` | 256, currently enforced by `kMaxChunkRangeChunks`; task 53 replaces the constant with its configured limit. |
-| `max_area_response_bytes` | 67108864, currently enforced; report the effective value after flags exist. |
-| `txn_max_written_chunks` | 64, currently enforced in statement, commit and intent decoding paths; task 53 changes all three together. |
-| `txn_max_read_chunks` | 1024, currently enforced; task 53 supplies the configured limit. |
+| `max_area_chunks` | Configured requested-cell limit per area/page, default 4096. |
+| `max_area_response_bytes` | Configured complete response-byte limit, default 67108864. |
+| `txn_max_written_chunks` | Configured statement/commit admission, default 1024; historical intent decoding validates its checked extent independently. |
+| `txn_max_read_chunks` | Configured statement/commit admission, default 8192. |
 | `max_watches` | Effective server configuration; current default 64. |
 | `max_returning_rows` | 65536, the declared ceiling from E3; RETURNING remains unavailable until task 55. |
 | `max_expression_nodes` | 256, the declared ceiling from E1; expressions remain unavailable until task 55. |

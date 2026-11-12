@@ -19,6 +19,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
 #include "txn_history.hpp"
+#include "txn_block_rows.hpp"
 #include "wal_writer.hpp"
 #include "change_feed.hpp"
 #include "feed_prefix.hpp"
@@ -167,13 +168,14 @@ void ChunkStore::ApplyTxnHistory(
     bool with_vars,
     ChunkRangeEntry* entry) {
     (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) {
-        entry->payload = kept.state.payload;
-        entry->presence_bitmap = kept.state.presence_bitmap;
-        entry->version = kept.state.version;
-        entry->commit_time_ms = kept.state.commit_time_ms;
-        entry->chunk_columns = kept.state.chunk_columns;
+        const auto state = kept.View();
+        entry->payload.assign(state.payload.begin(), state.payload.end());
+        entry->presence_bitmap.assign(state.presence_bitmap.begin(), state.presence_bitmap.end());
+        entry->version = state.version;
+        entry->commit_time_ms = state.commit_time_ms;
+        entry->chunk_columns = state.CopyMetadata();
         if (with_vars) {
-            entry->vars = kept.state.vars;
+            entry->vars = state.vars;
         }
     });
 }
@@ -197,8 +199,32 @@ ChunkState ChunkStore::ReadChunkStateAt(const TxnSnapshot& snapshot, const Chunk
         state.commit_time_ms = regular_chunk->commit_time_ms;
         state.chunk_columns = regular_chunk->chunk_columns;
     }
-    (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) { state = kept.state; });
+    (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) { state = kept.View().CopyState(); });
     return state;
+}
+
+TxnBlockSnapshot ChunkStore::ReadBlockAtSnapshot(const TxnSnapshot& snapshot,
+    const ChunkCoord& chunk_coord, std::size_t block_index, std::pmr::memory_resource* resource) {
+    RequireOwnTxnSnapshot(snapshot);
+    (void)geometry_.ChunkToLarge(chunk_coord);
+    if (block_index >= geometry_.layout().block_count())
+        throw std::invalid_argument("transaction block index is outside its chunk");
+    TxnBlockSnapshot result(resource);
+    const auto capture = [&](const auto& state) {
+        result.row = CaptureTxnBlockRow(geometry_.layout(), state.payload, state.presence_bitmap,
+            state.vars, block_index, resource);
+        result.version = state.version;
+        result.commit_time_ms = state.commit_time_ms;
+        result.written = state.written;
+    };
+    const auto chunk = GetOrLoadRegularChunk(chunk_coord);
+    // The same chunk-to-history order is used when publishing kept states.
+    // Select the source before allocating so a newer large row cannot consume
+    // the budget of a small historical observation.
+    std::shared_lock lock(chunk->mutex);
+    if (!txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) { capture(kept.View()); }))
+        capture(*chunk);
+    return result;
 }
 
 std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAt(
@@ -209,8 +235,8 @@ std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAt(
     const ChunkCoord chunk_coord = geometry_.BlockToChunk(block_x, block_y);
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
-    const auto decode = [&](const std::vector<std::uint8_t>& payload,
-                            const std::vector<std::uint8_t>& presence,
+    const auto decode = [&](std::span<const std::uint8_t> payload,
+                            std::span<const std::uint8_t> presence,
                             const ChunkVars& vars) -> std::optional<std::vector<ColumnValue>> {
         if (!BlockPresent(presence, block_index)) {
             return std::nullopt;
@@ -225,7 +251,8 @@ std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAt(
         values = decode(regular_chunk->payload, regular_chunk->presence_bitmap, regular_chunk->vars);
     }
     (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) {
-        values = decode(kept.state.payload, kept.state.presence_bitmap, kept.state.vars);
+        const auto state = kept.View();
+        values = decode(state.payload, state.presence_bitmap, state.vars);
     });
     return values;
 }
@@ -244,7 +271,7 @@ BlockReadMetadata ChunkStore::GetBlockWithVersionAt(
     };
     const auto chunk = GetOrLoadRegularChunk(coord);
     { std::shared_lock lock(chunk->mutex); capture(*chunk); }
-    (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.state); });
+    (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.View()); });
     return result;
 }
 
@@ -337,16 +364,16 @@ std::uint64_t ChunkStore::CommitTransaction(
     }
 
     // Everything the caller passed is checked before any chunk is touched.
-    if (writes.size() > kMaxTxnWrittenChunks) {
+    if (writes.size() > query_limits_.txn_max_written_chunks) {
         throw std::invalid_argument(
-            "a transaction writes at most " + std::to_string(kMaxTxnWrittenChunks) + " chunks");
+            "a transaction writes at most " + std::to_string(query_limits_.txn_max_written_chunks) + " chunks");
     }
     std::vector<ChunkCoord> reads = read_set;
     std::sort(reads.begin(), reads.end(), TxnCoordLess{});
     reads.erase(std::unique(reads.begin(), reads.end()), reads.end());
-    if (reads.size() > kMaxTxnReadChunks) {
+    if (reads.size() > query_limits_.txn_max_read_chunks) {
         throw std::invalid_argument(
-            "a transaction reads at most " + std::to_string(kMaxTxnReadChunks) + " chunks");
+            "a transaction reads at most " + std::to_string(query_limits_.txn_max_read_chunks) + " chunks");
     }
     std::sort(writes.begin(), writes.end(), [](const TxnChunkWrite& lhs, const TxnChunkWrite& rhs) {
         return TxnCoordLess{}(lhs.coord, rhs.coord);
@@ -610,9 +637,9 @@ std::uint64_t ChunkStore::CommitTransaction(
     }
     const auto intent_path = TxnIntentPath(data_dir_, version);
     const auto intent_dir = intent_path.parent_path();
-    const auto rollback_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_);
+    const auto rollback_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, query_limits_.txn_max_written_chunks);
     intent.state = TxnIntentState::kCommitted;
-    const auto commit_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_);
+    const auto commit_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, query_limits_.txn_max_written_chunks);
 
     // From the intent to its commit form, read-only processes do not take
     // these chunks.

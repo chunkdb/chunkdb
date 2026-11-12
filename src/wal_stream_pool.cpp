@@ -24,6 +24,7 @@
 #else
 #include <cstdio>
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -150,6 +151,25 @@ WalAppendStream& WalAppendStream::write(const char* bytes, std::streamsize size)
 }
 
 WalAppendStream& WalAppendStream::flush() noexcept { return *this; }
+
+WalDurabilityPin WalAppendStream::FlushAndPin() {
+    if (!is_open() || error_ != 0)
+        throw std::system_error(error_ != 0 ? error_ : EBADF, std::generic_category(), "cannot pin a closed or failed WAL stream");
+    const auto native = ReOpenFile(handle_, GENERIC_WRITE | FILE_READ_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_FLAG_OPEN_REPARSE_POINT);
+    if (native == INVALID_HANDLE_VALUE)
+        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "failed to pin writable WAL generation");
+    WalDurabilityPin pin(reinterpret_cast<std::intptr_t>(native));
+    FILE_ATTRIBUTE_TAG_INFO attributes{};
+    if (GetFileInformationByHandleEx(native, FileAttributeTagInfo, &attributes, sizeof(attributes)) == 0)
+        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "failed to inspect pinned WAL generation");
+    if (GetFileType(native) != FILE_TYPE_DISK ||
+        (attributes.FileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0U)
+        throw std::system_error(EINVAL, std::generic_category(), "a WAL generation pin requires a regular file");
+    if (SetHandleInformation(native, HANDLE_FLAG_INHERIT, 0U) == 0)
+        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "failed to prevent WAL pin inheritance");
+    return pin;
+}
 #else
 WalAppendStream::WalAppendStream(const std::filesystem::path& path, std::ios_base::openmode mode) {
     open(path, mode);
@@ -213,6 +233,24 @@ WalAppendStream& WalAppendStream::flush() noexcept {
         error_ = errno == 0 ? EIO : errno;
     }
     return *this;
+}
+
+WalDurabilityPin WalAppendStream::FlushAndPin() {
+    if (!is_open() || error_ != 0)
+        throw std::system_error(error_ != 0 ? error_ : EBADF, std::generic_category(), "cannot pin a closed or failed WAL stream");
+    flush();
+    if (error_ != 0)
+        throw std::system_error(error_, std::generic_category(), "failed to flush WAL stream before pinning");
+    const auto fd = ::fileno(static_cast<FILE*>(handle_));
+    struct stat info{};
+    if (::fstat(fd, &info) != 0)
+        throw std::system_error(errno, std::generic_category(), "failed to inspect WAL generation");
+    if (!S_ISREG(info.st_mode))
+        throw std::system_error(EINVAL, std::generic_category(), "a WAL generation pin requires a regular file");
+    const auto duplicate = ::fcntl(fd, F_DUPFD_CLOEXEC, 0);
+    if (duplicate < 0)
+        throw std::system_error(errno, std::generic_category(), "failed to pin writable WAL generation");
+    return WalDurabilityPin(duplicate);
 }
 #endif
 

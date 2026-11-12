@@ -266,9 +266,23 @@ void TestChunkAndAreaStatements() {
     assert(around.columns.size() == 2);
     assert(Get<cql::GetArea>("GET AREA 0 0 TO 2 2 FROM t WITH SCHEMA").with_schema);
     assert(Get<cql::GetArea>("GET AREA AROUND 0 0 RADIUS 1 FROM t COLUMNS a WITH SCHEMA").with_schema);
-    ExpectError("GET AREA 0 0 TO 2 2 FROM t WITH SCHEMA WITH SCHEMA", "expected the end");
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t WITH SCHEMA WITH SCHEMA", "WITH SCHEMA is given twice");
     ExpectError("GET AREA 0 0 TO 2 2 FROM t WITH VERSION", "expected SCHEMA");
     ExpectError("GET AREA AROUND 0 0 RADIUS -1 FROM t", "a radius must be between 0");
+
+    const auto page = Get<cql::GetArea>("GET AREA -2 -2 TO 5 6 FROM after COLUMNS limit, after LIMIT 7 AFTER -1 3 WITH SCHEMA");
+    assert(page.limit == 7U && page.after == (chunkdb::ChunkCoord{-1, 3}) && page.with_schema);
+    assert(page.table == "after" && page.columns == (std::vector<std::string>{"limit", "after"}));
+    const auto page3 = Get<cql::GetArea>("GET AREA AROUND -1 2 0 RADIUS 8 FROM t AFTER 0 2 0 LIMIT 18446744073709551615");
+    assert(page3.dims == 3U && page3.after == (chunkdb::ChunkCoord{0, 2, 0}));
+    assert(page3.limit == std::numeric_limits<std::uint64_t>::max());
+    assert(Get<cql::GetArea>("GET AREA 0 0 TO 2 2 FROM t AFTER 0 0").after.has_value());
+    assert(Get<cql::GetArea>("GET AREA 0 0 TO 2 2 FROM t LIMIT 0").limit == 0U);
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t LIMIT 1 LIMIT 2", "LIMIT is given twice");
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t AFTER 0 0 AFTER 1 1", "AFTER is given twice");
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t AFTER 0 0 0", "cursor has different dimensions");
+    ExpectError("GET AREA 0 0 0 TO 2 2 0 FROM t AFTER 0 0", "cursor has different dimensions");
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t LIMIT -1", "a limit must be between 0");
 }
 
 void TestLiterals() {

@@ -237,7 +237,7 @@ void ChunkStore::RecoverConditionalRollbackIntents(bool validate_only) {
             if (name.find(".tmp.") != std::string::npos) continue;
             TxnIntent transaction;
             if (!regular || !IsTxnIntentFileName(name) ||
-                !TryParseTxnIntent(LoadRecoveryTxnIntent(intent_path), &transaction, geometry_.dims(), store_id_) ||
+                !TryParseTxnIntent(LoadRecoveryTxnIntent(intent_path, geometry_.dims(), store_id_), &transaction, geometry_.dims(), store_id_) ||
                 TxnIntentPath(data_dir_, transaction.version).filename() != intent_path.filename())
                 throw std::runtime_error("invalid transaction intent: " + intent_path.string());
             if (transaction.state == TxnIntentState::kRollback)

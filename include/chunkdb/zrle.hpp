@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <vector>
 
 namespace chunkdb {
@@ -25,6 +26,7 @@ inline constexpr std::uint8_t kZrleCodecId = 1;
 inline constexpr std::size_t kZrleMaxOverheadBytes = 5 + 1 + 5;
 
 [[nodiscard]] std::vector<std::uint8_t> ZrleCompress(const std::vector<std::uint8_t>& input);
+[[nodiscard]] std::vector<std::uint8_t> ZrleCompressBytes(std::span<const std::uint8_t> input);
 
 [[nodiscard]] std::vector<std::uint8_t> ZrleDecompress(
     const std::uint8_t* data,

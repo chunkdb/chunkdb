@@ -94,7 +94,7 @@ void Equal(const std::optional<std::vector<ColumnValue>>& values, std::optional<
     assert(values.has_value() == value.has_value());
     if (!value) return;
     const Geometry shape({2U, 2U, 2U, 1U, 8U});
-    const auto expected = DecodeBlockColumns(shape.layout(), {*value, 0U}, {}, 0U);
+    const auto expected = DecodeBlockColumns(shape.layout(), std::vector<std::uint8_t>{*value, 0U}, {}, 0U);
     assert(SameFeedValues(*values, expected));
 }
 
@@ -461,6 +461,27 @@ void LiveBaseClassificationValidatesHeader() {
 }
 }  // namespace
 
+// A checksum-valid GROUP frame, admitted by explicit test flags, is refused
+// when the archive reader inspects it, before its base is loaded or applied.
+void GroupFrameRefusedAtArchiveAdmission() {
+    Fixture fixture;
+    const FeatureFlags groups{.incompat = kFeatureChunkModel | kFeatureCommitGroups};
+    fixture.NeverWritten();
+    std::vector<std::uint8_t> grouped;
+    WalFrameBuilder frame(&grouped, 1U, {}, {}, false, WalGroupRef{.id = {1U}, .member_count = 2U, .member_ordinal = 0U});
+    const std::vector<std::uint8_t> state{8U, 0U, 1U};
+    frame.AppendSpan(0U, state.data(), state.size());
+    (void)frame.Finish(2U, 20U);
+    auto wal = BuildWalHeader({0, 0}, fixture.epoch, groups);
+    wal.insert(wal.end(), grouped.begin(), grouped.end());
+    Save(fixture.Archive({0, 0}, 2U, 2U), wal);
+    auto reader = FeedArchiveAccess::Create(fixture.directory.path(), fixture.geometry, fixture.epoch,
+        {fixture.epoch, 0U}, 2U, {}, groups);
+    std::string error;
+    try { (void)reader.Next(); } catch (const std::runtime_error& refused) { error = refused.what(); }
+    assert(error == "WAL group frame requires directory admission");
+}
+
 int main() {
     MergeAndDurability();
     LinkedBaseAndRollover();
@@ -475,4 +496,5 @@ int main() {
     ArchivesOpenOnlyWhenReached();
     CapturedLiveCursorIgnoresFutureSchemaImage();
     LiveBaseClassificationValidatesHeader();
+    GroupFrameRefusedAtArchiveAdmission();
 }

@@ -22,6 +22,13 @@ inline constexpr std::uint32_t kFeatureSlotFilters = 8U;
 inline constexpr std::uint32_t kFeatureActivation = 16U;
 // Dimension-aware chunk files, chunk columns and retained empty identities.
 inline constexpr std::uint32_t kFeatureChunkModel = 32U;
+// Reserved for directory commit decisions and the grouped WAL metadata they
+// authorize. Groups are not active in this build: the bit is outside the
+// registry and the known features, so it is never set on a new directory or
+// table, cannot be enabled, and a directory or table carrying it is refused as
+// an unknown incompat feature. The WAL format code takes it as an explicit
+// flag (InspectFeedFrame, ReplayFeedFrame).
+inline constexpr std::uint32_t kFeatureCommitGroups = 64U;
 
 struct FeatureDefinition {
     std::string_view name;

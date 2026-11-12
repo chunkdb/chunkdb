@@ -827,9 +827,22 @@ class Parser {
                 Expect("from");
                 get.table = Name("a table name");
                 get.columns = Columns();
-                if (Accept("with")) {
-                    Expect("schema");
-                    get.with_schema = true;
+                while (true) {
+                    const auto column = Peek().column;
+                    if (Accept("with")) {
+                        if (get.with_schema) Fail(column, "WITH SCHEMA is given twice");
+                        Expect("schema");
+                        get.with_schema = true;
+                    } else if (Accept("limit")) {
+                        if (get.limit) Fail(column, "LIMIT is given twice");
+                        get.limit = Unsigned("a limit", std::numeric_limits<std::uint64_t>::max());
+                    } else if (Accept("after")) {
+                        if (get.after) Fail(column, "AFTER is given twice");
+                        ChunkCoord coord;
+                        if (Point(coord.x, coord.y, coord.z, true) != get.dims)
+                            Fail(column, "AREA cursor has different dimensions");
+                        get.after = coord;
+                    } else break;
                 }
                 return get;
             }

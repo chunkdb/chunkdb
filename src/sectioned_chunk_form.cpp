@@ -254,6 +254,15 @@ std::vector<ChunkFormChunkColumn> ParseChunkFormChunkColumns(const ChunkFormSect
                 throw std::invalid_argument("chunk form chunk columns are truncated");
         return {};
     }
+    const auto count = ValidateChunkColumnDirectory(body);
+    std::vector<ChunkFormChunkColumn> columns;
+    columns.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) columns.push_back(ChunkColumnDirectoryEntry(body, i));
+    return columns;
+}
+
+std::size_t ValidateChunkColumnDirectory(std::span<const std::uint8_t> body) {
+    if (body.empty()) return 0U;
     if (body.size() < 4) throw std::invalid_argument("chunk form chunk columns are truncated");
     const auto count = static_cast<std::size_t>(ReadLe(body.data(), 4));
     if (count > kMaxColumnsPerTable || body.size() < 4U + 16U * count)
@@ -276,17 +285,13 @@ std::vector<ChunkFormChunkColumn> ParseChunkFormChunkColumns(const ChunkFormSect
         next += length;
     }
     if (next != body.size()) throw std::invalid_argument("bytes after last chunk form chunk column");
-    std::vector<ChunkFormChunkColumn> columns;
-    columns.reserve(count);
-    for (std::size_t i = 0; i < count; ++i) {
-        const auto* entry = body.data() + 4U + 16U * i;
-        columns.push_back({
-            static_cast<std::uint32_t>(ReadLe(entry, 4)), ReadLe(entry + 4, 2) == 1,
-            body.subspan(static_cast<std::size_t>(ReadLe(entry + 8, 4)),
-                         static_cast<std::size_t>(ReadLe(entry + 12, 4))),
-        });
-    }
-    return columns;
+    return count;
+}
+ChunkFormChunkColumn ChunkColumnDirectoryEntry(std::span<const std::uint8_t> body, std::size_t index) noexcept {
+    const auto* entry = body.data() + 4U + 16U * index;
+    return {static_cast<std::uint32_t>(ReadLe(entry, 4)), ReadLe(entry + 4, 2) == 1,
+        body.subspan(static_cast<std::size_t>(ReadLe(entry + 8, 4)),
+            static_cast<std::size_t>(ReadLe(entry + 12, 4)))};
 }
 
 }  // namespace chunkdb

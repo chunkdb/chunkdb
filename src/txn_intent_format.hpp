@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <iosfwd>
 #include <span>
 #include <string>
 #include <string_view>
@@ -22,7 +23,14 @@ namespace chunkdb {
 // before allocating entries. Any malformed member refuses the whole record.
 [[nodiscard]] TxnIntent ParseCheckedTxnIntent(
     std::span<const std::uint8_t> bytes, std::uint8_t expected_dims,
-    const StoreId& expected_table_id, std::size_t written_chunk_limit);
+    const StoreId& expected_table_id);
+
+// Admit recovery independently of current write limits, without allocating
+// owned entries or a complete body before its shape, context and CRC pass.
+void ValidateCheckedTxnIntent(std::span<const std::uint8_t> bytes,
+    std::uint8_t expected_dims, const StoreId& expected_table_id);
+void ValidateCheckedTxnIntentStream(std::istream& input, std::uint64_t measured_bytes,
+    std::uint8_t expected_dims, const StoreId& expected_table_id);
 
 [[nodiscard]] std::string CanonicalConditionalIntentFileName(
     const Geometry& geometry, const ChunkCoord& coord);

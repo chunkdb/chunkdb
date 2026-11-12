@@ -141,7 +141,7 @@ std::string EncodeChunkForm(
     const auto little = [](std::string& out, std::uint64_t value, std::size_t bytes) {
         for (std::size_t i = 0U; i < bytes; ++i) out.push_back(static_cast<char>((value >> (8U * i)) & 0xffU));
     };
-    const auto bytes_of = [](const std::vector<std::uint8_t>& data, std::size_t offset, std::size_t size) {
+    const auto bytes_of = [](std::span<const std::uint8_t> data, std::size_t offset, std::size_t size) {
         return std::string_view(reinterpret_cast<const char*>(data.data()) + offset, size);
     };
     std::string form;

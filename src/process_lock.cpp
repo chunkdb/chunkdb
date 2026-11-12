@@ -27,6 +27,7 @@
 #include <fcntl.h>
 #include <signal.h>
 #include <sys/file.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #endif
 
@@ -362,13 +363,58 @@ std::unique_ptr<ProcessLock> AcquireWriterLock(
     return std::make_unique<ProcessLock>(data_dir);
 }
 
-ProcessLock::ProcessLock(const std::filesystem::path& data_dir)
+struct ProcessLock::RootDirectoryOwner {
+    explicit RootDirectoryOwner(const std::filesystem::path& path) {
+#ifdef _WIN32
+        const auto handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+        if (handle == INVALID_HANDLE_VALUE)
+            throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "pin writer root directory");
+        native = reinterpret_cast<std::intptr_t>(handle);
+        BY_HANDLE_FILE_INFORMATION information{};
+        const auto inspected = GetFileInformationByHandle(handle, &information);
+        const auto error = inspected ? ERROR_SUCCESS : GetLastError();
+        if (!inspected || (information.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT) != 0U ||
+            (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) == 0U) {
+            (void)CloseHandle(handle); native = -1;
+            if (!inspected) throw std::system_error(static_cast<int>(error), std::system_category(), "inspect writer root directory");
+            throw std::runtime_error("writer root is not a plain directory");
+        }
+#else
+        const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        if (fd < 0) throw std::system_error(errno, std::generic_category(), "pin writer root directory");
+        native = fd;
+#endif
+    }
+    ~RootDirectoryOwner() {
+        if (native == -1) return;
+#ifdef _WIN32
+        (void)CloseHandle(reinterpret_cast<HANDLE>(native));
+#else
+        (void)::close(static_cast<int>(native));
+#endif
+    }
+    std::intptr_t native = -1;
+};
+
+std::intptr_t ProcessLock::NativeRootForArtifacts() const noexcept {
+    return root_directory_ ? root_directory_->native : -1;
+}
+
+ProcessLock::ProcessLock(const std::filesystem::path& data_dir) : ProcessLock(data_dir, false) {}
+
+ProcessLock::ProcessLock(const std::filesystem::path& data_dir, PinRootForArtifacts) : ProcessLock(data_dir, true) {}
+
+ProcessLock::ProcessLock(const std::filesystem::path& data_dir, bool pin_root)
     : data_dir_(std::filesystem::weakly_canonical(data_dir)) {
     lock_dir_ = data_dir_ / std::string(kProcessLockDirName);
     lock_file_path_ = lock_dir_ / "writer.lock";
     meta_path_ = lock_dir_ / "writer.meta";
     host_ = CurrentHostName();
 
+    // The path as given, so a symlinked root is refused rather than resolved.
+    if (pin_root) root_directory_ = std::make_unique<RootDirectoryOwner>(data_dir);
     EnsureProcessLockDirectory(lock_dir_);
 
 #ifdef _WIN32

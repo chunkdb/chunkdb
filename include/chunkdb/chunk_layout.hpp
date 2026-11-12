@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <functional>
 #include <limits>
+#include <span>
 #include <string>
 #include <string_view>
 #include <unordered_map>
@@ -67,6 +68,8 @@ class ChunkLayout {
     // column, or is empty in a column that cannot be NULL (an empty value
     // there is stored as no entry).
     void RequireValidVars(const ChunkVars& vars, const std::vector<std::uint8_t>& presence) const;
+    // The same admission over allocator-aware or retained read-only storage.
+    void RequireValidVarsView(const ChunkVars& vars, std::span<const std::uint8_t> presence) const;
     // Zeroes the bits between and after the arrays.
     void MaskPadding(std::vector<std::uint8_t>* payload) const;
     // Zeroes every value and validity bit of a block absent in `presence`,

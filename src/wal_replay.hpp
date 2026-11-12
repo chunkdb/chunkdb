@@ -59,6 +59,7 @@ struct FeedFrameInfo {
     bool gc = false;
 };
 // Validates the whole frame's framing and records without applying state.
+// A GROUP frame is refused: no caller admits group members yet.
 [[nodiscard]] FeedFrameInfo InspectFeedFrame(
     const std::vector<std::uint8_t>& frame, const Geometry& geometry, FeatureFlags features = {});
 // One captured, headerless frame; validated with the same parser as recovery.

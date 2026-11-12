@@ -140,6 +140,8 @@ struct GetArea {
     std::int64_t z0 = 0;
     std::int64_t z1 = 0;
     std::uint8_t dims = 2;
+    std::optional<std::uint64_t> limit;
+    std::optional<ChunkCoord> after;
 };
 
 struct ColumnDefinition {

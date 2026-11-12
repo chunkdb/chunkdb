@@ -93,41 +93,64 @@ void AddVar(Bytes& output, VarKey key, Span value, std::size_t bound) {
     Put32(output, static_cast<std::uint32_t>(value.size()));
     output.insert(output.end(), value.begin(), value.end());
 }
+
+struct EncodingPlan {
+    std::shared_ptr<const ChunkColumnState> metadata;
+    std::vector<std::size_t> indexes;
+    std::unordered_set<std::uint32_t> selected_vars;
+    std::size_t count = 0U;
+    std::size_t fixed_size = 0U;
+    std::size_t validity_size = 0U;
+    std::size_t variable_size = 0U;
+    std::size_t total_size = 0U;
+};
+
+EncodingPlan PlanEncoding(
+    const Geometry& geometry, const ChunkState& state, std::size_t max_variable_bytes,
+    std::span<const std::size_t> projection) {
+    CheckBlockState(geometry, state);
+    EncodingPlan plan;
+    plan.metadata = Metadata(geometry, state);
+    VariableBound(state.vars.encoded_size(), MetadataBytes(geometry, plan.metadata), max_variable_bytes);
+    const auto& layout = geometry.layout();
+    const auto blocks = geometry.ChunkBlockCount();
+    plan.indexes = Columns(layout, projection);
+    for (const auto index : plan.indexes) {
+        if (const auto* fixed = layout.FixedColumnAt(index)) {
+            ++plan.count;
+            plan.fixed_size += (blocks * fixed->width + 7U) / 8U;
+            if (layout.schema().columns[index].nullable) plan.validity_size += state.presence_bitmap.size();
+        } else plan.selected_vars.insert(layout.schema().columns[index].id);
+    }
+    for (const auto entry : state.vars) if (plan.selected_vars.contains(entry.key.column_id))
+        plan.variable_size += kVarEntryHeaderBytes + entry.value.size();
+    const auto metadata_size = plan.metadata ? plan.metadata->bytes.size() : 0U;
+    const auto section_count = 2U + static_cast<unsigned>(plan.fixed_size != 0U) +
+        static_cast<unsigned>(plan.validity_size != 0U) + static_cast<unsigned>(plan.variable_size != 0U) +
+        static_cast<unsigned>(metadata_size != 0U);
+    plan.total_size = 36U + 12U * section_count + state.presence_bitmap.size() + plan.fixed_size +
+        plan.validity_size + plan.variable_size + metadata_size + 4U + 24U * plan.count;
+    return plan;
+}
 }  // namespace
+
+std::size_t SectionedChunkStateBytes(const Geometry& geometry, const ChunkState& state,
+    std::size_t max_variable_bytes, std::span<const std::size_t> projection) {
+    return PlanEncoding(geometry, state, max_variable_bytes, projection).total_size;
+}
 
 std::vector<std::uint8_t> EncodeSectionedChunkState(
     const Geometry& geometry, const ChunkState& state, std::size_t max_variable_bytes,
     std::span<const std::size_t> projection, bool private_state, std::size_t max_form_bytes) {
-    CheckBlockState(geometry, state);
-    const auto metadata = Metadata(geometry, state);
-    VariableBound(state.vars.encoded_size(), MetadataBytes(geometry, metadata), max_variable_bytes);
+    const auto plan = PlanEncoding(geometry, state, max_variable_bytes, projection);
+    if (plan.total_size > std::min(max_form_bytes, static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())))
+        Invalid("chunk form exceeds its byte limit");
     const auto& layout = geometry.layout();
     const auto blocks = geometry.ChunkBlockCount();
-    const auto indexes = Columns(layout, projection);
-    std::size_t count = 0U, fixed_size = 0U, validity_size = 0U;
-    std::unordered_set<std::uint32_t> selected_vars;
-    for (const auto index : indexes) {
-        if (const auto* fixed = layout.FixedColumnAt(index)) {
-            ++count;
-            fixed_size += (blocks * fixed->width + 7U) / 8U;
-            if (layout.schema().columns[index].nullable) validity_size += state.presence_bitmap.size();
-        } else selected_vars.insert(layout.schema().columns[index].id);
-    }
-    std::size_t variable_size = 0U;
-    for (const auto entry : state.vars) if (selected_vars.contains(entry.key.column_id))
-        variable_size += kVarEntryHeaderBytes + entry.value.size();
-    const auto metadata_size = metadata ? metadata->bytes.size() : 0U;
-    const auto section_count = 2U + static_cast<unsigned>(fixed_size != 0U) +
-        static_cast<unsigned>(validity_size != 0U) + static_cast<unsigned>(variable_size != 0U) +
-        static_cast<unsigned>(metadata_size != 0U);
-    const auto total_size = 36U + 12U * section_count + state.presence_bitmap.size() + fixed_size +
-        validity_size + variable_size + metadata_size + 4U + 24U * count;
-    if (total_size > std::min(max_form_bytes, static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())))
-        Invalid("chunk form exceeds its byte limit");
     Bytes fixed, validity, descriptors;
-    fixed.reserve(fixed_size); validity.reserve(validity_size); descriptors.reserve(4U + 24U * count);
-    Put32(descriptors, static_cast<std::uint32_t>(count));
-    for (const auto index : indexes) {
+    fixed.reserve(plan.fixed_size); validity.reserve(plan.validity_size); descriptors.reserve(4U + 24U * plan.count);
+    Put32(descriptors, static_cast<std::uint32_t>(plan.count));
+    for (const auto index : plan.indexes) {
         const auto& column = layout.schema().columns[index];
         const auto* span = layout.FixedColumnAt(index);
         if (span == nullptr) continue;
@@ -146,8 +169,8 @@ std::vector<std::uint8_t> EncodeSectionedChunkState(
         }
     }
     Bytes vars;
-    vars.reserve(variable_size);
-    for (const auto entry : state.vars) if (selected_vars.contains(entry.key.column_id))
+    vars.reserve(plan.variable_size);
+    for (const auto entry : state.vars) if (plan.selected_vars.contains(entry.key.column_id))
         AddVar(vars, entry.key, entry.value, max_variable_bytes);
     std::vector<ChunkFormSection> sections{{static_cast<std::uint16_t>(ChunkFormSectionKind::kPresence), state.presence_bitmap}};
     const auto add = [&](ChunkFormSectionKind kind, Span body) {
@@ -156,7 +179,7 @@ std::vector<std::uint8_t> EncodeSectionedChunkState(
     add(ChunkFormSectionKind::kFixedValues, fixed);
     add(ChunkFormSectionKind::kNullBits, validity);
     add(ChunkFormSectionKind::kVariableValues, vars);
-    if (metadata) add(ChunkFormSectionKind::kChunkColumns, metadata->bytes);
+    if (plan.metadata) add(ChunkFormSectionKind::kChunkColumns, plan.metadata->bytes);
     add(ChunkFormSectionKind::kBlockSpans, descriptors);
     ChunkFormHeader header;
     header.flags = static_cast<std::uint16_t>((projection.empty() ? 0U : kChunkFormProjected) |

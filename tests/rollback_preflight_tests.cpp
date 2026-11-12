@@ -124,7 +124,7 @@ void ConflictingTransactionsAndBoundedRecords() {
         output.close();
         assert(output);
     }
-    Reject([&] { (void)LoadRecoveryTxnIntent(first); });
+    Reject([&] { (void)LoadRecoveryTxnIntent(first, fixture.config.geometry.dims, fixture.id); });
     assert(std::filesystem::file_size(first) == 4U * 1024U * 1024U + 1U);
     Reject([&] { ChunkStore refused(fixture.config); });
     assert(LoadFile(fixture.wal) == fixture.original);

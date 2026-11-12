@@ -138,6 +138,44 @@ void RuntimeActivation() {
     }
 }
 
+// Groups are not active: new directories and tables do not carry
+// commit_groups, it cannot be enabled or listed, and a directory or table
+// whose manifest carries the bit is refused as an unknown feature.
+void CommitGroupsDormant() {
+    test::ScopedTempDir dir("chunkdb-commit-group-feature");
+    CatalogConfig config; config.data_dir = dir.path();
+    {
+        auto catalog = std::make_shared<TableCatalog>(config);
+        const auto created = catalog->Create("alpha", {1U, 1U, 2U, 2U, 8U}, config.default_options);
+        assert((created->Acquire()->store().features().incompat & kFeatureCommitGroups) == 0U);
+        assert((ReadDataDirManifest(dir.path())->features.incompat & kFeatureCommitGroups) == 0U);
+        assert((ReadStoreManifest(dir.path() / "tables/alpha")->features.incompat & kFeatureCommitGroups) == 0U);
+        const auto before = Tree(dir.path());
+        Reject([&] { (void)catalog->EnableFeature("commit_groups"); }, "unknown feature");
+        CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
+        SessionState session; (void)engine.Execute(session, "HELLO 3\r\n");
+        const auto enable = engine.Execute(session, "ENABLE FEATURE 'commit_groups'\r\n");
+        assert(enable.find("reason=unknown_feature") != std::string::npos);
+        const auto status = engine.Execute(session, "SHOW STATUS\r\n");
+        assert(status.starts_with("%3\r\n") && status.find("commit_groups") == std::string::npos);
+        assert(Tree(dir.path()) == before);
+    }
+    const auto table_path = StoreManifestPath(dir.path() / "tables/alpha");
+    const auto table_bytes = LoadFile(table_path);
+    auto table = ParseStoreManifest(table_bytes);
+    table.features.incompat |= kFeatureCommitGroups;
+    Save(table_path, SerializeStoreManifest(table));
+    Reject([&] {
+        TableCatalog catalog(config);
+        (void)catalog.Find("alpha")->Acquire();
+    }, "does not support (unknown incompat=0x40 ");
+    Save(table_path, table_bytes);
+    auto directory = *ReadDataDirManifest(dir.path());
+    directory.features.incompat |= kFeatureCommitGroups;
+    Save(DataDirManifestPath(dir.path()), SerializeDataDirManifest(directory));
+    Reject([&] { TableCatalog catalog(config); }, "does not support (unknown incompat=0x40 ");
+}
+
 void RuntimeAdmissionAndRecovery() {
     test::ScopedTempDir dir("chunkdb-feature-admission");
     auto journal = Seed(dir.path());
@@ -436,5 +474,5 @@ int main(int argc, char** argv) {
         return 3;
     }
     assert(argc == 1);
-    RuntimeActivation(); RuntimeAdmissionAndRecovery(); RuntimePublishedFailure(); MetadataAdmission(); Codec(); ValidationBeforePublication(); RecoveryPreservesCurrentMetadata(); DirectoryOnlyActivation(); BootstrapCrashRecovery(argv[0]); CrashRecovery(argv[0]);
+    RuntimeActivation(); CommitGroupsDormant(); RuntimeAdmissionAndRecovery(); RuntimePublishedFailure(); MetadataAdmission(); Codec(); ValidationBeforePublication(); RecoveryPreservesCurrentMetadata(); DirectoryOnlyActivation(); BootstrapCrashRecovery(argv[0]); CrashRecovery(argv[0]);
 }
