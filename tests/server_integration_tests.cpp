@@ -2561,6 +2561,32 @@ void TestStopInsideIdleWaitWindow() {
     assert(client.WaitForClose(std::chrono::seconds(5)));
 }
 
+// A request that arrived while the worker was held before its poll is
+// served after the idle deadline passes, as the I/O thread would serve it.
+void TestRequestAtIdleDeadlineIsServed() {
+    WorkerIdleWaitHook hook;
+    auto config = OneWaitingWorkerConfig();
+    config.idle_connection_timeout_ms = 300U;
+    ServerHarness harness("request-at-idle-deadline", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient client("127.0.0.1", harness.port);
+    const auto id = HelloId(client);
+    hook.HoldIdleWait(id);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    // The reply was written, and its idle deadline set, before it was read.
+    const auto expired = std::chrono::steady_clock::now() + std::chrono::milliseconds(400);
+    hook.WaitIdleHeld();
+    client.SendLine("PING");
+    std::mutex deadline_mutex;
+    std::condition_variable deadline_wait;
+    std::unique_lock deadline_lock(deadline_mutex);
+    (void)deadline_wait.wait_until(deadline_lock, expired, [] { return false; });
+    hook.ReleaseIdleWait();
+    assert(client.ReadLine() == "+PONG\r\n");
+}
+
 // Holds the only worker after it hands a connection back until the I/O
 // thread has been refused queue space again, so only the following pop can
 // tell it that space returned.
@@ -7181,6 +7207,7 @@ int main(int argc, char** argv) {
         run("TestYieldInsideIdleWaitWindow", TestYieldInsideIdleWaitWindow);
         run("TestKillInsideIdleWaitWindow", TestKillInsideIdleWaitWindow);
         run("TestStopInsideIdleWaitWindow", TestStopInsideIdleWaitWindow);
+        run("TestRequestAtIdleDeadlineIsServed", TestRequestAtIdleDeadlineIsServed);
         run("TestWaitingWorkerStatementTimesOut", TestWaitingWorkerStatementTimesOut);
         run("TestRefusedDispatchWakesAfterPop", TestRefusedDispatchWakesAfterPop);
         run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);

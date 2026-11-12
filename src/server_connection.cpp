@@ -188,8 +188,11 @@ ChunkServer::NextRequest ChunkServer::AwaitNextRequest(WorkerWait& wait, ServerC
         }
         registration.Leave();
         if (connection.record->killed.load()) return NextRequest::kClose;
-        if (registration.yielded || !running_.load() || Clock::now() >= connection.idle_deadline)
+        if (registration.yielded || !running_.load() || Clock::now() >= connection.idle_deadline) {
+            // A request that arrived by then is the I/O thread's to read, as if it had polled.
+            connection.read_ready = ready;
             return NextRequest::kReturn;
+        }
         if (ready) return NextRequest::kRead;
     }
 }
