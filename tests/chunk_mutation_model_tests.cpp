@@ -434,6 +434,11 @@ void ChunkStateWritesWaitForBackgroundCheckpointFiles() {
                 const auto& write = writes[round];
                 // Each round changes both blocks, so each write counts.
                 const auto bits = std::bitset<8>(round + 1U).to_string();
+                // The writes of the round before left updates pending. Absorb
+                // them here, so the write below only makes a checkpoint due
+                // for a worker and never reaches the bound at which the
+                // writer runs it itself and meets the pause.
+                if (round != 0U) store.CheckpointForTests(0, 0);
                 store.ArmCheckpointBeforeWalRemovalPauseForTests();
                 set_bits(store, 0, bits);
                 assert(store.WaitForCheckpointBeforeWalRemovalForTests());
