@@ -24,6 +24,7 @@ namespace chunkdb {
 struct ServerConnection;
 class FeedIo;
 class IdleIo;
+struct WorkerWait;
 class StatementControl;
 struct FeedDeliveryTestHook;
 
@@ -125,6 +126,12 @@ class ChunkServer {
     std::mutex active_clients_mutex_;
     std::condition_variable pending_clients_cv_;
     std::vector<std::thread> workers_;
+    // Under pending_clients_mutex_: workers blocked on pending_clients_cv_
+    // and waiting workers asked to return their connection.
+    std::size_t idle_workers_ = 0U;
+    std::size_t yielding_workers_ = 0U;
+    // One per worker; its fields are guarded by pending_clients_mutex_.
+    std::vector<std::shared_ptr<WorkerWait>> worker_waits_;
     std::atomic<bool> pending_queue_overload_warned_{false};
     // Connections before HELLO, by source address key.
     std::mutex handshakes_mutex_;
@@ -149,7 +156,11 @@ class ChunkServer {
         int client_socket
 #endif
         , const std::shared_ptr<ServerConnection>& connection
+        , WorkerWait& wait
     );
+    enum class NextRequest { kRead, kReturn, kClose };
+    NextRequest AwaitNextRequest(WorkerWait& wait, ServerConnection& connection);
+    void WakeWaitingWorkers();
     bool HandOff(const std::shared_ptr<ServerConnection>& connection);
     bool ParkClient(const std::shared_ptr<ServerConnection>& connection);
     bool DispatchClient(const std::shared_ptr<ServerConnection>& connection);

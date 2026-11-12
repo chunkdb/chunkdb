@@ -2287,10 +2287,10 @@ void TestIdleDispatchRespectsQueueCredit() {
     ServerHarness harness("idle-dispatch-credit", BaseStoreConfig(),
         chunkdb::EngineConfig{.require_auth = false}, config);
     struct Release { IdleQueuePressureHook& hook; ~Release() { hook.Release(); } } release{hook};
+    // Its first statement is dispatched; a later one would be read by the
+    // worker that answered the previous one.
     RawClient worker("127.0.0.1", harness.port);
     worker.Hello();
-    worker.SendLine("PING");
-    assert(worker.ReadLine() == "+PONG\r\n");
     std::vector<std::unique_ptr<RawClient>> idle;
     for (std::size_t i = 0U; i < 3U; ++i) {
         auto client = std::make_unique<RawClient>("127.0.0.1", harness.port);
@@ -2306,6 +2306,194 @@ void TestIdleDispatchRespectsQueueCredit() {
     hook.Release();
     assert(worker.ReadLine() == "+PONG\r\n");
     for (const auto& client : idle) assert(client->ReadLine() == "+PONG\r\n");
+}
+
+// Observes a worker waiting for the next request of a connection it answered.
+class WorkerIdleWaitHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t value) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kBeforeWorkerIdleWait) ++waits_[value];
+        if (point == Point::kBeforeWorkerClose) worker_closed_ = true;
+        if (point == Point::kBeforeBufferedStatementPublication && hold_publication_ && !held_) {
+            held_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        }
+        // Stop holds the active client lock here; a worker reaches its close
+        // trace without it.
+        if (point == Point::kBeforeClientShutdown && !shutdown_seen_) {
+            shutdown_seen_ = true;
+            closed_before_shutdown_ = changed_.wait_for(lock, std::chrono::seconds(10), [&] { return worker_closed_; });
+        }
+        changed_.notify_all();
+    }
+    void WaitFor(std::uint64_t id, std::size_t count = 1U) {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return waits_[id] >= count; }));
+    }
+    std::size_t Waits(std::uint64_t id) { std::lock_guard lock(mutex_); return waits_[id]; }
+    void HoldPublication() { std::lock_guard lock(mutex_); hold_publication_ = true; }
+    void WaitHeld() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return held_; }));
+    }
+    void Release() { { std::lock_guard lock(mutex_); released_ = true; } changed_.notify_all(); }
+    // Closed by its worker before any client socket was shut down, if one was.
+    bool ClosedBeforeShutdown() {
+        std::lock_guard lock(mutex_);
+        return shutdown_seen_ ? closed_before_shutdown_ : worker_closed_;
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::unordered_map<std::uint64_t, std::size_t> waits_;
+    bool worker_closed_ = false, shutdown_seen_ = false, closed_before_shutdown_ = false;
+    bool hold_publication_ = false, held_ = false, released_ = false;
+};
+
+chunkdb::ServerConfig OneWaitingWorkerConfig() {
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    config.idle_connection_timeout_ms = 120000U; // Longer than every wait below.
+    return config;
+}
+
+std::uint64_t HelloId(RawClient& client) {
+    client.SetReadDeadline(std::chrono::seconds(10));
+    client.SendLine("HELLO 3");
+    return std::stoull(ReadHelloReply(client).at("connection_id"));
+}
+
+// A request queued for the only worker takes it from the idle connection
+// that worker waits on; that connection keeps working through the I/O thread.
+void TestWaitingWorkerYieldsToQueuedRequest() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("waiting-worker-yields", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    RawClient first("127.0.0.1", harness.port);
+    const auto first_id = HelloId(first);
+    RawClient second("127.0.0.1", harness.port);
+    const auto second_id = HelloId(second);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(first_id);
+    second.SendLine("PING"); assert(second.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(second_id);
+    first.SendLine("PING"); assert(first.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(first_id, 2U);
+    second.SendLine("PING"); assert(second.ReadLine() == "+PONG\r\n");
+}
+
+// KILL closes an idle connection that a worker waits on without waiting for
+// the idle deadline, and frees that worker.
+void TestKillClosesWaitingWorkerConnection() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("kill-waiting-worker", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    RawClient target("127.0.0.1", harness.port);
+    const auto id = HelloId(target);
+    RawClient controller("127.0.0.1", harness.port);
+    controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    target.SendLine("PING"); assert(target.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id);
+    controller.SendLine("KILL CONNECTION " + std::to_string(id));
+    assert(controller.ReadReply().ends_with("#t\r\n"));
+    assert(target.WaitForClose(std::chrono::seconds(5)));
+    assert(!chunkdb::FeedDeliveryTestAccess::ConnectionStillOwned(*harness.server, id));
+    controller.SendLine("PING"); assert(controller.ReadLine() == "+PONG\r\n");
+}
+
+// The idle deadline still closes a connection while a worker waits on it.
+void TestWaitingWorkerKeepsIdleDeadline() {
+    WorkerIdleWaitHook hook;
+    auto config = OneWaitingWorkerConfig();
+    config.idle_connection_timeout_ms = 300U;
+    ServerHarness harness("waiting-worker-idle-deadline", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient client("127.0.0.1", harness.port);
+    const auto id = HelloId(client);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    const auto answered = std::chrono::steady_clock::now();
+    hook.WaitFor(id);
+    assert(client.WaitForClose(std::chrono::seconds(10)));
+    assert(std::chrono::steady_clock::now() - answered >= std::chrono::milliseconds(250));
+    RawClient next("127.0.0.1", harness.port);
+    (void)HelloId(next);
+    next.SendLine("PING"); assert(next.ReadLine() == "+PONG\r\n");
+}
+
+// Part of a request returns the connection to the I/O thread, whose request
+// line deadline closes it; the worker serves other connections meanwhile.
+void TestPartialInputLeavesWaitingWorker() {
+    WorkerIdleWaitHook hook;
+    auto config = OneWaitingWorkerConfig();
+    config.client_io_timeout_ms = 300U;
+    ServerHarness harness("waiting-worker-partial-input", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient slow("127.0.0.1", harness.port);
+    const auto id = HelloId(slow);
+    RawClient other("127.0.0.1", harness.port);
+    (void)HelloId(other);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    slow.SendLine("PING"); assert(slow.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id);
+    slow.SendBytes("PI");
+    assert(slow.WaitForClose(std::chrono::seconds(10)));
+    assert(slow.Received().empty());
+    assert(hook.Waits(id) == 1U);
+    other.SendLine("PING"); assert(other.ReadLine() == "+PONG\r\n");
+}
+
+// Stop wakes a worker waiting on an idle connection before it shuts the
+// client sockets down.
+void TestStopWakesWaitingWorker() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("stop-waiting-worker", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    const auto id = HelloId(client);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    client.SendLine("PING"); assert(client.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id);
+    harness.server->Stop();
+    harness.JoinStopped();
+    assert(hook.ClosedBeforeShutdown());
+    assert(client.WaitForClose(std::chrono::seconds(5)));
+}
+
+// A statement read by a waiting worker keeps its statement timeout, applies
+// nothing when it expires, and leaves the connection usable.
+void TestWaitingWorkerStatementTimesOut() {
+    WorkerIdleWaitHook hook;
+    ServerHarness harness("waiting-worker-statement-timeout", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, OneWaitingWorkerConfig());
+    struct Release { WorkerIdleWaitHook& hook; ~Release() { hook.Release(); } } release{hook};
+    RawClient target("127.0.0.1", harness.port);
+    target.SetReadDeadline(std::chrono::seconds(10));
+    target.SendLine("HELLO 3 WITH statement_timeout_ms=200");
+    const auto id = std::stoull(ReadHelloReply(target).at("connection_id"));
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    target.SendLine("PING"); assert(target.ReadLine() == "+PONG\r\n");
+    hook.WaitFor(id);
+    hook.HoldPublication();
+    target.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
+    hook.WaitHeld();
+    // Admission preceded the hold, so its deadline has passed 300 ms later.
+    const auto expired = std::chrono::steady_clock::now() + std::chrono::milliseconds(300);
+    std::mutex deadline_mutex;
+    std::condition_variable deadline_wait;
+    std::unique_lock deadline_lock(deadline_mutex);
+    (void)deadline_wait.wait_until(deadline_lock, expired, [] { return false; });
+    hook.Release();
+    assert(target.ReadLine().starts_with("-ERR TIMEOUT applied=false"));
+    {
+        auto lease = harness.catalog->Require("default")->Acquire();
+        assert(!lease->store().GetBlock(0, 0));
+    }
+    target.SendLine("PING"); assert(target.ReadLine() == "+PONG\r\n");
 }
 
 template <typename Client>
@@ -6825,6 +7013,12 @@ int main(int argc, char** argv) {
         run("TestIdleDispatchFailureClosesItsConnection", TestIdleDispatchFailureClosesItsConnection);
         run("TestClientReadFailureClosesItsConnection", TestClientReadFailureClosesItsConnection);
         run("TestIdleDispatchRespectsQueueCredit", TestIdleDispatchRespectsQueueCredit);
+        run("TestWaitingWorkerYieldsToQueuedRequest", TestWaitingWorkerYieldsToQueuedRequest);
+        run("TestKillClosesWaitingWorkerConnection", TestKillClosesWaitingWorkerConnection);
+        run("TestWaitingWorkerKeepsIdleDeadline", TestWaitingWorkerKeepsIdleDeadline);
+        run("TestPartialInputLeavesWaitingWorker", TestPartialInputLeavesWaitingWorker);
+        run("TestStopWakesWaitingWorker", TestStopWakesWaitingWorker);
+        run("TestWaitingWorkerStatementTimesOut", TestWaitingWorkerStatementTimesOut);
         run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);
         run("TestConnectionListingTrimsStatementWhitespace", TestConnectionListingTrimsStatementWhitespace);
         run("TestStopPublicationGapClosesQueuedOwner", TestStopPublicationGapClosesQueuedOwner);

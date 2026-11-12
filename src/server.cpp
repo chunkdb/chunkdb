@@ -183,6 +183,12 @@ void ChunkServer::StartWorkers() {
         users_changed_ = users->OnChange([weak = std::weak_ptr<FeedIo>(io)] {
             if (auto feed = weak.lock()) feed->WakePoll();
         });
+    {
+        std::vector<std::shared_ptr<WorkerWait>> waits;
+        for (std::size_t i = 0; i < config_.worker_threads; ++i) waits.push_back(std::make_shared<WorkerWait>());
+        std::lock_guard lock(pending_clients_mutex_);
+        worker_waits_ = std::move(waits);
+    }
     io->Start();
     idle->Start();
     workers_.reserve(config_.worker_threads);
@@ -205,6 +211,7 @@ void ChunkServer::JoinWorkers() {
         }
     }
     workers_.clear();
+    { std::lock_guard lock(pending_clients_mutex_); worker_waits_.clear(); }
     users_changed_.reset();
     { std::lock_guard lock(lifecycle_mutex_); feed_io_.reset(); idle_io_.reset(); }
 }
@@ -448,6 +455,7 @@ bool ChunkServer::StopRunning() {
         // worker can miss the notification between a false predicate and wait.
         std::lock_guard lock(pending_clients_mutex_);
         was_running = running_.exchange(false);
+        for (const auto& wait : worker_waits_) if (wait->waiting) wait->poller.Wake();
     }
     if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
         hook->Run(FeedDeliveryTestHook::Point::kAfterRunningStopPublication, was_running ? 1U : 0U);
@@ -557,6 +565,8 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
 
         {
             std::unique_lock lock(pending_clients_mutex_);
+            ++idle_workers_;
+            struct Idle { std::size_t& count; ~Idle() { --count; } } idle{idle_workers_};
             pending_clients_cv_.wait(lock, [&]() {
                 const bool ready = !running_.load() || !pending_clients_.empty();
                 if (!ready) {
@@ -640,7 +650,7 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
         }
         auto& current = *connection;
         trace(FeedDeliveryTestHook::Point::kBeforeWorkerHandle);
-        const bool handed_off = HandleClient(client_socket, connection);
+        const bool handed_off = HandleClient(client_socket, connection, *worker_waits_[worker_index]);
         trace(FeedDeliveryTestHook::Point::kAfterWorkerHandle);
         if (!handed_off) {
             trace(FeedDeliveryTestHook::Point::kBeforeWorkerClose);

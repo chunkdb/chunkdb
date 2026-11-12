@@ -15,6 +15,20 @@ class ChunkServer;
 class StatementControl;
 struct ServerConnection;
 
+// A statement worker waiting for the next request of the idle connection it
+// just answered. Its waiting and yield fields are guarded by the server's
+// pending_clients_mutex_.
+struct WorkerWait {
+    server_detail::SocketPoller poller{1U};
+    // Registered: a queued request may ask this worker to yield.
+    bool waiting = false;
+    // Asked to return its connection to the I/O owner.
+    bool yield = false;
+    // Only its worker reads or sets this: the poller failed, so this worker
+    // returns every connection to the I/O owner instead of waiting.
+    bool failed = false;
+};
+
 // Owns transport phases; statement workers receive only complete requests.
 class IdleIo : public std::enable_shared_from_this<IdleIo> {
   public:

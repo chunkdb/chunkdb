@@ -9,6 +9,7 @@ Each connection owns its socket, TLS state, input buffer, session and transactio
 Exactly one owner may access its socket or TLS object at a time.
 An I/O owner handles idle sockets, partial input, TLS handshakes, authentication replies and output readiness.
 A statement worker receives a fully framed request and returns the resulting output continuation.
+The worker that wrote a reply waits for that connection's next request while no queued request needs a worker; a queued request, KILL, shutdown and the idle deadline return or close the connection, and incomplete input returns it to the I/O owner.
 Buffered complete requests retain their worker while bounded input and output credit remains available.
 Ownership transfers publish state before waking the receiving owner.
 Returned credit wakes the I/O owner only after a refused reservation.
@@ -108,6 +109,7 @@ Backup, restore, migrations, verification and offline password reset use that sa
 Deterministic ownership hooks cover worker release, cancellation/decision arbitration, output authorization and descriptor teardown.
 Regression tests prove both sides of every cancellation boundary and reopen durable state after failure.
 Raw and TLS tests fill statement workers while new HELLO and control requests complete, exercise partial records and pipelined parameters, and close idle transactions on shutdown.
+Waiting-worker tests cover a queued request taking the worker, KILL, shutdown, the idle deadline, partial input and statement timeouts.
 Large-reply tests check exact framing, bounded encoded buffers, limit refusal before output and progress deadlines.
 Paused output races concurrent writes and ALTER to prove a fixed reply snapshot and bound.
 KILL and shutdown tests cover idle transactions and each COMMIT decision phase, verifying history and slot release without undoing a committed decision.

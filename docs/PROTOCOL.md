@@ -62,6 +62,7 @@ A second HELLO receives PROTOCOL.
 | `limits` | Map of area, transaction, watch, returning and expression ceilings. |
 
 Authenticated connections release their worker while idle and retain their session and open transaction until the next request or connection closure.
+A worker with no queued request waits for the next request of the connection it answered and releases it as soon as another request needs a worker.
 Buffered pipelined requests continue on the same worker without an idle handoff.
 
 Append `WITH client_name='name',statement_timeout_ms=0,default_tag=x'00'` to HELLO to request session options.

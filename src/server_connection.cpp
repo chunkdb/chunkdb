@@ -4,6 +4,9 @@
 #include "server_feed.hpp"
 #include "server_idle.hpp"
 
+#include <algorithm>
+#include <climits>
+
 namespace chunkdb {
 using namespace server_detail;
 
@@ -13,7 +16,7 @@ bool ChunkServer::HandleClient(
 #else
     int client_socket
 #endif
-    , const std::shared_ptr<ServerConnection>& connection) {
+    , const std::shared_ptr<ServerConnection>& connection, WorkerWait& wait) {
     (void)client_socket;
     if (connection->phase != ServerConnection::Phase::kReady)
         throw std::logic_error("statement worker requires a complete request");
@@ -89,8 +92,22 @@ bool ChunkServer::HandleClient(
             connection->output_deadline = std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(config_.client_io_timeout_ms);
             if (!io->Write(*connection)) return false;
-            if (connection->phase != ServerConnection::Phase::kInput || session.watch || session.slot_watch ||
-                connection->pending.empty()) return ParkClient(connection);
+            if (connection->phase != ServerConnection::Phase::kInput || session.watch || session.slot_watch)
+                return ParkClient(connection);
+            if (connection->pending.empty()) {
+                const auto next = AwaitNextRequest(wait, *connection);
+                if (next == NextRequest::kClose) return false;
+                if (next == NextRequest::kReturn) return ParkClient(connection);
+                connection->read_ready = false;
+                if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                    hook->Run(FeedDeliveryTestHook::Point::kBeforeClientRead, connection->completed_replies);
+                const bool alive = io->Read(*connection);
+                if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+                    hook->Run(FeedDeliveryTestHook::Point::kAfterClientRead, connection->completed_replies);
+                if (!alive) return false;
+                // Nothing arrived, or part of a TLS record: the I/O owner times it.
+                if (connection->pending.empty()) return ParkClient(connection);
+            }
             try { (void)io->Parse(*connection, true); }
             catch (const std::runtime_error& error) {
                 if (!io->RejectProtocol(*connection, error)) return false;
@@ -116,6 +133,71 @@ bool ChunkServer::ParkClient(const std::shared_ptr<ServerConnection>& connection
     return false;
 }
 
+// The worker that wrote a reply keeps its idle connection while no queued
+// request needs a worker, so the next request needs no hand-off. A queued
+// request, KILL, shutdown and the idle deadline return or close it first.
+ChunkServer::NextRequest ChunkServer::AwaitNextRequest(WorkerWait& wait, ServerConnection& connection) {
+    using Clock = std::chrono::steady_clock;
+    if (wait.failed) return NextRequest::kReturn;
+    // Decrypted bytes may already wait inside the TLS session.
+    if (connection.read_ready) return NextRequest::kRead;
+    const auto stop_waiting = [&](const std::runtime_error& error) {
+        wait.failed = true;
+        LogMessage(LogLevel::kError, LogComponent::kServer,
+            "statement worker returns idle connections to the I/O thread", {{"error", error.what()}});
+        return NextRequest::kReturn;
+    };
+    for (;;) {
+        // Drain before the scan below, so a wake published after it is kept.
+        try { wait.poller.DrainWake(); }
+        catch (const std::runtime_error& error) { return stop_waiting(error); }
+        struct Registration {
+            ChunkServer& server;
+            WorkerWait& wait;
+            bool yielded = false;
+            void Leave() noexcept {
+                std::lock_guard lock(server.pending_clients_mutex_);
+                if (!wait.waiting) return;
+                wait.waiting = false;
+                yielded = std::exchange(wait.yield, false);
+                if (yielded) --server.yielding_workers_;
+            }
+            ~Registration() { Leave(); }
+        } registration{*this, wait};
+        {
+            std::lock_guard lock(pending_clients_mutex_);
+            if (!running_.load() || !pending_clients_.empty()) return NextRequest::kReturn;
+            wait.waiting = true;
+        }
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kBeforeWorkerIdleWait, connection.session.connection_id);
+        // A KILL published before the registration sent no wake; one after it did.
+        bool ready = false;
+        if (!connection.record->killed.load()) {
+            const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+                connection.idle_deadline - Clock::now()).count();
+            SocketInterest interest{connection.socket, POLLIN, 0};
+            try {
+                ready = wait.poller.Wait(std::span(&interest, 1U),
+                    static_cast<int>(std::clamp<std::int64_t>(remaining, 0, INT_MAX))) && interest.ready != 0;
+            } catch (const std::runtime_error& error) {
+                registration.Leave();
+                return stop_waiting(error);
+            }
+        }
+        registration.Leave();
+        if (connection.record->killed.load()) return NextRequest::kClose;
+        if (registration.yielded || !running_.load() || Clock::now() >= connection.idle_deadline)
+            return NextRequest::kReturn;
+        if (ready) return NextRequest::kRead;
+    }
+}
+
+void ChunkServer::WakeWaitingWorkers() {
+    std::lock_guard lock(pending_clients_mutex_);
+    for (const auto& wait : worker_waits_) if (wait->waiting) wait->poller.Wake();
+}
+
 bool ChunkServer::DispatchClient(const std::shared_ptr<ServerConnection>& connection) {
     {
         std::lock_guard lock(pending_clients_mutex_);
@@ -134,6 +216,17 @@ bool ChunkServer::DispatchClient(const std::shared_ptr<ServerConnection>& connec
             connection->worker_queued = true;
             if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kAfterStatementQueued, connection->session.connection_id);
+            // A worker waiting on an idle connection returns it when no blocked
+            // worker or yielding one remains for this request.
+            if (pending_clients_.size() > idle_workers_ + yielding_workers_) {
+                for (const auto& wait : worker_waits_) {
+                    if (!wait->waiting || wait->yield) continue;
+                    wait->yield = true;
+                    ++yielding_workers_;
+                    wait->poller.Wake();
+                    break;
+                }
+            }
             pending_clients_cv_.notify_one();
             engine_->metrics()->SetPendingConnections(pending_clients_.size());
             return true;
