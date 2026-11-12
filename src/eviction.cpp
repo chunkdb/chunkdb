@@ -15,6 +15,7 @@
 #include "txn_history.hpp"
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
+#include "maintenance_pool.hpp"
 
 namespace chunkdb {
 
@@ -268,6 +269,7 @@ bool ChunkStore::TryEvictCandidate(
 
     {
         std::unique_lock chunk_lock(regular_chunk->mutex);
+        AwaitChunkFilesLocked(chunk_lock, *regular_chunk);
         // Its WAL past the last good point is not committed state, so memory
         // is the only right copy until a restart repairs the WAL.
         if (regular_chunk->wal_repair_failed) {
@@ -311,6 +313,7 @@ bool ChunkStore::TryEvictCandidate(
     }
     {
         std::unique_lock chunk_lock(regular_chunk->mutex);
+        AwaitChunkFilesLocked(chunk_lock, *regular_chunk);
         if (regular_chunk->wal_repair_failed || !regular_chunk->wal_batch.empty()) {
             return false;
         }
@@ -568,7 +571,7 @@ void ChunkStore::RequestEviction() {
         return;
     }
 
-    // Backpressure: while the maintenance thread catches up, the cache may
+    // Backpressure: while background maintenance catches up, the cache may
     // exceed the configured bound by at most one hysteresis band. Beyond
     // that, the loading thread evicts inline to preserve the hard bound.
     const std::size_t max_loaded_chunks = resources_->max_loaded_chunks_;
@@ -582,9 +585,13 @@ void ChunkStore::RequestEviction() {
 
     {
         std::lock_guard lock(maintenance_mutex_);
-        maintenance_eviction_requested_ = true;
+        if (!maintenance_stop_ && maintenance_task_) {
+            maintenance_eviction_requested_ = true;
+            if (maintenance_pool_->Notify(maintenance_task_)) return;
+            maintenance_eviction_requested_ = false;
+        }
     }
-    maintenance_cv_.notify_one();
+    MaybeEvictChunks();
 }
 
 }  // namespace chunkdb

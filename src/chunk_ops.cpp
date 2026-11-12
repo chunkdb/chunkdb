@@ -339,6 +339,7 @@ ChunkMutationResult ChunkStore::CasChunkStateBytes(
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
+    AwaitChunkFilesLocked(lock, *regular_chunk);
 
     if (regular_chunk->version != expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
@@ -391,6 +392,7 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
+    AwaitChunkFilesLocked(lock, *regular_chunk);
 
     if (has_expected_version && regular_chunk->version != expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
@@ -449,6 +451,7 @@ ChunkMutationResult ChunkStore::WriteChunkState(
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(regular_chunk->mutex);
+    AwaitChunkFilesLocked(lock, *regular_chunk);
     if (expected_version.has_value() && regular_chunk->version != *expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
     }

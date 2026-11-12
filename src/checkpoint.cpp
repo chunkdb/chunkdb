@@ -80,12 +80,37 @@ bool ChunkStore::IsCheckpointDue(const std::shared_ptr<RegularChunk>& chunk) noe
     return false;
 }
 
+bool ChunkStore::CheckpointHardBoundReached(std::size_t updates, std::size_t wal_bytes) const noexcept {
+    return updates >= checkpoint_update_interval_ * 4U || wal_bytes >= checkpoint_wal_bytes_ * 4U;
+}
+
+void ChunkStore::AwaitChunkFilesLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk) {
+    checkpoint_io_cv_.wait(lock, [&] { return !chunk.checkpoint_io; });
+}
+
+void ChunkStore::AwaitChunkBacklogLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk) {
+    // What the running checkpoint absorbs is not backlog; the writes since
+    // are, and they wait once they reach the bound an inline checkpoint
+    // would enforce.
+    checkpoint_io_cv_.wait(lock, [&] {
+        return !chunk.checkpoint_io ||
+               !CheckpointHardBoundReached(
+                   chunk.pending_updates - chunk.checkpoint_io_updates,
+                   chunk.wal_bytes - chunk.checkpoint_io_wal_bytes);
+    });
+}
+
 void ChunkStore::MaybeCheckpointChunk(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
     bool* out_image_committed) {
     if (out_image_committed != nullptr) {
         *out_image_committed = false;
+    }
+    // A background checkpoint owns the files; it schedules the next one for
+    // the writes made meanwhile when it ends (RunBackgroundCheckpoint).
+    if (chunk->checkpoint_io) {
+        return;
     }
     if (!IsCheckpointDue(chunk)) {
         return;
@@ -95,9 +120,7 @@ void ChunkStore::MaybeCheckpointChunk(
         // Bounded deferral: while checkpoints run in the background the WAL
         // may keep growing, but only up to a hard multiple of the configured
         // thresholds. Past that the writer checkpoints inline (backpressure).
-        const bool hard_bound_exceeded =
-            chunk->pending_updates >= checkpoint_update_interval_ * 4U ||
-            chunk->wal_bytes >= checkpoint_wal_bytes_ * 4U;
+        const bool hard_bound_exceeded = CheckpointHardBoundReached(chunk->pending_updates, chunk->wal_bytes);
         if (!hard_bound_exceeded && EnqueueBackgroundCheckpoint(chunk_coord)) {
             return;
         }
@@ -113,6 +136,7 @@ void ChunkStore::CheckpointForTests(std::int64_t chunk_x, std::int64_t chunk_y) 
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto chunk = GetOrLoadRegularChunk(chunk_coord);
     std::unique_lock lock(chunk->mutex);
+    AwaitChunkFilesLocked(lock, *chunk);
     CheckpointChunk(chunk_coord, chunk);
 }
 
@@ -134,9 +158,13 @@ void ChunkStore::EnsureImageDirectoryPrepared(const std::filesystem::path& direc
 bool ChunkStore::CheckpointChunk(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
-    bool* out_image_committed) {
+    bool* out_image_committed,
+    std::unique_lock<RegularChunkMutex>* release) {
     if (out_image_committed != nullptr) {
         *out_image_committed = false;
+    }
+    if (chunk->checkpoint_io) {
+        throw std::logic_error("chunk files are owned by a running background checkpoint");
     }
     std::shared_lock maintenance_lock(backup_maintenance_mutex_, std::try_to_lock);
     if (!maintenance_lock.owns_lock()) {
@@ -208,6 +236,34 @@ bool ChunkStore::CheckpointChunk(
         checkpoint_publishes_during_barrier_syncs_.fetch_add(1, std::memory_order_relaxed);
     }
 
+    // While `release` is unlocked the chunk is marked checkpoint_io: ordinary
+    // writes only append to memory and the batch, and every other path that
+    // touches the chunk's files waits for the mark to clear. Retaking the
+    // chunk lock gives up the publish lock first, keeping the lock order
+    // chunk->mutex -> checkpoint_publish_mutex_.
+    struct FilesRelease {
+        ChunkStore& store;
+        RegularChunk& chunk;
+        std::unique_lock<RegularChunkMutex>* lock;
+        std::unique_lock<std::mutex>& publish;
+        bool active = false;
+        void Retake() {
+            if (!active || lock->owns_lock()) return;
+            if (publish.owns_lock()) publish.unlock();
+            lock->lock();
+        }
+        ~FilesRelease() {
+            if (!active) return;
+            Retake();
+            chunk.checkpoint_io = false;
+            store.checkpoint_io_cv_.notify_all();
+        }
+    } files{*this, *chunk, release, publish_lock};
+    // The batch bytes and group-commit updates the image absorbs.
+    std::size_t absorbed_batch_bytes = 0;
+    std::size_t absorbed_flush_updates = 0;
+    bool wal_removed_unlocked = false;
+
     try {
         const bool archive_enabled = feed_slots_->ArchiveRequired();
         const auto archive_path = archive_enabled ? feed_slots_->PrepareArchive(chunk_coord) : std::filesystem::path{};
@@ -271,6 +327,20 @@ bool ChunkStore::CheckpointChunk(
                 throw std::runtime_error(
                     "injected checkpoint failure before image replacement");
             }
+            // In relaxed mode no write needs the files before its
+            // acknowledgement, so the image and WAL replacement, with their
+            // syncs, run without the chunk lock. A feed archive keeps every
+            // frame and is published under the lock.
+            if (release != nullptr && durability_mode_ == DurabilityMode::kRelaxed && !archive_enabled) {
+                absorbed_batch_bytes = chunk->wal_batch.size();
+                absorbed_flush_updates = chunk->pending_wal_flush_updates;
+                chunk->checkpoint_io_updates = chunk->pending_updates;
+                chunk->checkpoint_io_wal_bytes = chunk->wal_bytes;
+                CloseWalAppendStream(chunk);
+                chunk->checkpoint_io = true;
+                files.active = true;
+                release->unlock();
+            }
             if (strict) {
                 EnsureImageDirectoryPrepared(data_path.parent_path());
             }
@@ -290,7 +360,7 @@ bool ChunkStore::CheckpointChunk(
         }
         PauseCheckpointBeforeWalRemovalForTests();
         if (archive_enabled && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_IMAGE_PUBLISH_ONCE")) std::_Exit(86);
-        CloseWalAppendStream(chunk);
+        if (!files.active) CloseWalAppendStream(chunk);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CHECKPOINT_WAL_REMOVE_FAIL_ONCE")) {
             throw std::runtime_error(
                 "injected checkpoint WAL removal failure: " + wal_path.string());
@@ -317,9 +387,14 @@ bool ChunkStore::CheckpointChunk(
         // The WAL is gone even if a later step fails: the next append must
         // start a new WAL with its header (and sync its directory entry), and
         // the WAL size that schedules checkpoints starts again from zero.
-        chunk->wal_header_written = false;
-        chunk->wal_bytes = 0;
-        if (feed_slots_) feed_slots_->prefix_index().Truncate(chunk_coord, 0U);
+        // Without the chunk lock that waits until it is retaken.
+        if (files.active) {
+            wal_removed_unlocked = true;
+        } else {
+            chunk->wal_header_written = false;
+            chunk->wal_bytes = 0;
+            if (feed_slots_) feed_slots_->prefix_index().Truncate(chunk_coord, 0U);
+        }
         if (!archive_path.empty()) {
             SyncDirectoryPath(archive_path.parent_path());
             SyncDirectoryPath(wal_path.parent_path());
@@ -371,19 +446,42 @@ bool ChunkStore::CheckpointChunk(
         }
 
         stats_checkpoints_.fetch_add(1, std::memory_order_relaxed);
-        chunk->pending_updates = 0;
-        chunk->wal_bytes = 0;
-        chunk->checkpoint_due_armed = false;
-        chunk->deferred_wal_compaction = false;
-        chunk->pending_wal_flush_updates = 0;
-        chunk->wal_batch.clear();
-        chunk->wal_header_written = false;
+        if (files.active) {
+            // Writes made meanwhile stay pending, in memory and in the batch
+            // behind the absorbed frames, for the next WAL.
+            files.Retake();
+            if (feed_slots_) feed_slots_->prefix_index().Truncate(chunk_coord, 0U);
+            chunk->pending_updates -= chunk->checkpoint_io_updates;
+            chunk->wal_bytes -= chunk->checkpoint_io_wal_bytes;
+            chunk->pending_wal_flush_updates -= absorbed_flush_updates;
+            chunk->wal_batch.erase(
+                chunk->wal_batch.begin(), chunk->wal_batch.begin() + static_cast<std::ptrdiff_t>(absorbed_batch_bytes));
+            chunk->checkpoint_due_armed = false;
+            chunk->deferred_wal_compaction = false;
+            chunk->wal_header_written = false;
+        } else {
+            chunk->pending_updates = 0;
+            chunk->wal_bytes = 0;
+            chunk->checkpoint_due_armed = false;
+            chunk->deferred_wal_compaction = false;
+            chunk->pending_wal_flush_updates = 0;
+            chunk->wal_batch.clear();
+            chunk->wal_header_written = false;
+        }
         if (out_image_committed != nullptr) {
             *out_image_committed = image_committed;
         }
         snapshot_write.Finish();
         return true;
     } catch (const std::exception& e) {
+        if (files.active) {
+            files.Retake();
+            if (wal_removed_unlocked) {
+                chunk->wal_header_written = false;
+                chunk->wal_bytes -= chunk->checkpoint_io_wal_bytes;
+                if (feed_slots_) feed_slots_->prefix_index().Truncate(chunk_coord, 0U);
+            }
+        }
         if (out_image_committed != nullptr) {
             *out_image_committed = image_committed;
         }

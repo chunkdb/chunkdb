@@ -795,6 +795,7 @@ void ChunkStore::WalBarrier() {
         }
         for (const auto& [coord, chunk] : chunks) {
             std::unique_lock chunk_lock(chunk->mutex);
+            AwaitChunkFilesLocked(chunk_lock, *chunk);
             FlushWalBatch(coord, chunk, /*force_sync=*/chunk->wal_boundary_durable);
         }
     }

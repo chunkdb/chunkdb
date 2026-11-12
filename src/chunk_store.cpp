@@ -353,7 +353,7 @@ ChunkStore::ChunkStore(StoreConfig config)
           config.resources != nullptr
               ? std::move(config.resources)
               : std::make_shared<StoreResources>(
-                    config.max_loaded_chunks, config.max_open_wal_streams)),
+                    config.max_loaded_chunks, config.max_open_wal_streams, config.maintenance_workers)),
       acquire_process_lock_(config.acquire_process_lock),
       initial_version_floor_(config.initial_version_floor),
       background_maintenance_(config.background_maintenance),
