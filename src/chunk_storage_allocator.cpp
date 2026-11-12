@@ -15,7 +15,7 @@ struct Prefix {
     ChunkStoragePolicy* policy;
 };
 const Prefix& Header(const void* memory) noexcept {
-    return *reinterpret_cast<const Prefix*>(static_cast<const std::byte*>(memory) - sizeof(Prefix));
+    return *(static_cast<const Prefix*>(memory) - 1);
 }
 }  // namespace
 
@@ -101,7 +101,7 @@ void* AllocateChunkStorage(std::size_t bytes, std::size_t alignment,
     auto* memory = upstream->allocate(total, native_alignment);
     auto* result = static_cast<std::byte*>(memory) + prefix_bytes;
     if (policy) policy->AddRef();
-    new (result - sizeof(Prefix)) Prefix{memory, total, native_alignment, upstream, policy};
+    new (static_cast<Prefix*>(static_cast<void*>(result)) - 1) Prefix{memory, total, native_alignment, upstream, policy};
     reservation.committed = true;
     return result;
 }
