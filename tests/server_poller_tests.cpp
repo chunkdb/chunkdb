@@ -137,6 +137,24 @@ void CoalescedRelaxedPublication() {
     }
 }
 
+// A drain reads the channel only after a wait reported it. A wake that
+// follows an unreported wait stays readable, so the next wait returns at
+// once and the drain after that one reads it.
+void DrainFollowsReportedWake() {
+    SocketPoller poller(0);
+    poller.DrainWake();
+    assert(!poller.Wait({}, 0));
+    poller.Wake();
+    poller.DrainWake();
+    assert(poller.Wait({}, 0));
+    poller.DrainWake();
+    assert(!poller.Wait({}, 0));
+    poller.Wake();
+    assert(poller.Wait({}, 0));
+    poller.DrainWake();
+    assert(!poller.Wait({}, 0));
+}
+
 void ReadinessAndOwnership() {
     Loopback first, second;
     {
@@ -201,9 +219,10 @@ int main() {
     WakeOnlyAndCapacity();
     ConcurrentPublication();
     CoalescedRelaxedPublication();
+    DrainFollowsReportedWake();
     ReadinessAndOwnership();
     HighDescriptor();
-    std::puts("poller passed: bounded lists, coalesced publication, readiness, close, ownership, high descriptors");
+    std::puts("poller passed: bounded lists, coalesced publication, reported drains, readiness, close, ownership, high descriptors");
 #ifdef _WIN32
     WSACleanup();
 #endif

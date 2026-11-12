@@ -17,6 +17,9 @@ struct SocketInterest {
 // Wake. DrainWake must precede the owner's state scan, never follow it: a
 // coalesced publication during draining is observed by that following scan.
 // The owner also checks its stop predicate after scanning, before waiting.
+// DrainWake reads the channel only when the previous Wait reported it, or
+// before the first Wait; a byte that arrives later makes the next Wait
+// return at once, and that drain reads it.
 class SocketPoller {
   public:
     explicit SocketPoller(std::size_t max_sockets);
@@ -39,6 +42,8 @@ class SocketPoller {
     } wake_;
     const std::size_t max_sockets_;
     std::atomic<bool> signaled_{false};
+    // Owner-only: whether the wake channel may hold unread bytes.
+    bool wake_readable_ = true;
 #ifdef _WIN32
     std::vector<WSAPOLLFD> descriptors_;
 #else

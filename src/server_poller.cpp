@@ -80,7 +80,7 @@ void SocketPoller::Wake() noexcept {
 
 void SocketPoller::DrainWake() {
     char bytes[256];
-    for (;;) {
+    for (; wake_readable_;) {
         const auto result = recv(wake_.read, bytes, sizeof(bytes), 0);
         if (result > 0) continue;
         const int error = CurrentSocketErrorCode();
@@ -88,6 +88,7 @@ void SocketPoller::DrainWake() {
         if (result < 0 && WouldBlock(error)) break;
         throw std::runtime_error("socket poller wake channel closed");
     }
+    wake_readable_ = false;
     // Acquire the Wake RMW chain, including publishers that saw true and
     // sent no byte. Their preceding work is visible to the following scan.
     (void)signaled_.exchange(false, std::memory_order_acq_rel);
@@ -112,9 +113,10 @@ bool SocketPoller::Wait(std::span<SocketInterest> interests, int timeout_ms) {
     const int result = poll(descriptors_.data(), descriptors_.size(), timeout_ms);
 #endif
     if (result < 0) {
-        if (IsSocketInterruptedError(CurrentSocketErrorCode())) return false;
+        if (IsSocketInterruptedError(CurrentSocketErrorCode())) { wake_readable_ = true; return false; }
         throw std::runtime_error("socket poller wait: " + SocketErrorText());
     }
+    wake_readable_ = wake_readable_ || descriptors_[0].revents != 0;
     for (std::size_t i = 0; i < interests.size(); ++i) {
         interests[i].ready = descriptors_[i + 1U].revents;
     }
