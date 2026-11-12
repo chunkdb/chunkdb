@@ -534,7 +534,7 @@ ChunkMutationResult ChunkStore::TransformChunkState(const ChunkCoord& coord,
     if (!transform) throw std::invalid_argument("chunk transformation must be present");
     ThrowIfDurabilityPoisoned();
     const auto chunk = GetOrLoadRegularChunk(coord);
-    std::unique_lock lock(chunk->mutex);
+    auto lock = LockStatementChunk(chunk->mutex);
     // The conditional path syncs the WAL and publishes an intent naming it.
     AwaitStatementChunkFilesLocked(lock, *chunk);
     if (expected_version && chunk->version != *expected_version)

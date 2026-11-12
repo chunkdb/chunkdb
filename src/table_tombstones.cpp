@@ -22,7 +22,7 @@ class ScopeExit {
 
 std::uint64_t TableCatalog::CompactTombstones(std::string_view name, std::uint64_t before) {
     RequireWritable("COMPACT TOMBSTONES");
-    std::shared_lock metadata(feature_metadata_gate_);
+    auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
     const auto options = table->Info().options;

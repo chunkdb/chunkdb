@@ -1,6 +1,7 @@
 #include "chunkdb/chunk_store.hpp"
 
 #include "chunk_coordinate_index.hpp"
+#include "statement_control.hpp"
 
 namespace chunkdb {
 
@@ -50,6 +51,7 @@ ChunkIdentityScanPage ChunkStore::ScanChunkIdentities(bool has_cursor, ChunkCoor
         const auto candidates = index->Page(pass_has_cursor, pass_cursor,
             limit + 1U - page.entries.size(), since);
         for (const auto& coord : candidates.coords) {
+            CheckStatementCancellation();
             ChunkRangeEntry state;
             if (!ReadPopulatedChunkStateNoCache(coord, &state, with_data, nullptr, since.has_value(), !with_data)) continue;
             if (since && state.version <= *since) continue;

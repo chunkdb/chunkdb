@@ -536,6 +536,106 @@ void CheckpointBacklogWaitStopsOrResumes() {
         assert(reopened.GetBlockBits(0, 1) == "0001" && reopened.GetBlockBits(0, 0) == "1000");
     }
 }
+StoreConfig ThreeAxisConfig(const std::filesystem::path& dir) {
+    auto config = Config(dir, DurabilityMode::kFsyncWal);
+    config.geometry.dims = 3U;
+    config.geometry.chunk_depth_blocks = 2U;
+    config.geometry.large_chunk_depth_chunks = 2U;
+    return config;
+}
+void StartStopped(StatementControl& control) {
+    assert(control.Start() && control.RequestStop(StatementStopReason::kCancelled));
+}
+template <typename Operation> bool Stops(Operation operation) {
+    try { operation(); }
+    catch (const StatementStoppedError&) { return true; }
+    return false;
+}
+// Chunk model statements wait for a contended chunk lock with their stop, and
+// stop at each chunk of a three-axis area, an identity scan and a read-only
+// coordinate index rebuild, even where no chunk lock is taken.
+void ChunkModelStatementsStop() {
+    test::ScopedTempDir dir("chunkdb-cancel-chunk-model");
+    auto config = ThreeAxisConfig(dir.path());
+    {
+        ChunkStore store(config);
+        store.SetBlockBits3D(0, 0, 0, "1000");
+        auto snapshot = store.BeginTxnSnapshot(10s);
+        const auto resident = FeatureActivationTestAccess::Resident(store);
+        resident->mutex.lock();
+        const auto stops = [&](auto operation) {
+            StatementControl control(StatementControl::Clock::now(), 0U);
+            assert(control.Start());
+            auto command = std::async(std::launch::async, [&] {
+                ScopedStatementControl scope(&control);
+                return Stops(operation);
+            });
+            StatementChunkLockTestAccess::WaitBlocked(resident->mutex, 1U);
+            assert(control.RequestStop(StatementStopReason::kCancelled));
+            const bool interrupted = command.wait_for(5s) == std::future_status::ready;
+            if (!interrupted) resident->mutex.unlock();
+            assert(interrupted && command.get());
+        };
+        stops([&] { (void)store.TransformChunkState({0, 0, 0}, std::nullopt, false, [](ChunkState& state) { state.payload[0] = 2U; }); });
+        stops([&] { (void)store.GetBlockWithVersion3DAt(*snapshot, 0, 0, 0); });
+        resident->mutex.unlock();
+        assert(store.GetBlockBits3D(0, 0, 0) == "1000");
+        StatementControl control(StatementControl::Clock::now(), 0U);
+        StartStopped(control);
+        ScopedStatementControl scope(&control);
+        assert(Stops([&] { (void)store.ReadChunkRange3D(10, 10, 10, 11, 11, 11, true); }));
+        assert(Stops([&] { (void)store.ReadChunkRadius3D(10, 10, 10, 1, true); }));
+    }
+    {
+        // Nothing is loaded, so the scan reads the chunk from its files.
+        ChunkStore store(config);
+        StatementControl control(StatementControl::Clock::now(), 0U);
+        StartStopped(control);
+        ScopedStatementControl scope(&control);
+        assert(Stops([&] { (void)store.ScanChunkIdentities(false, {}, 8U, std::nullopt, false); }));
+    }
+    config.access_mode = AccessMode::kReadOnly;
+    ChunkStore read_only(config);
+    {
+        StatementControl control(StatementControl::Clock::now(), 0U);
+        StartStopped(control);
+        ScopedStatementControl scope(&control);
+        assert(Stops([&] { (void)read_only.RetainedTombstoneCount(); }));
+    }
+    assert(read_only.RetainedTombstoneCount() == 0U);
+}
+// ALTER TABLE on chunk columns and COMPACT TOMBSTONES wait for the catalog's
+// feature metadata admission with their stop.
+void ChunkModelCatalogAdmissionStops() {
+    test::ScopedTempDir dir("chunkdb-cancel-chunk-columns");
+    const auto config = Config(dir.path(), DurabilityMode::kFsyncWal);
+    TableCatalog catalog(CatalogConfigFromStoreConfig(config));
+    (void)test::CreateBitsTable(catalog, config.geometry);
+    const auto add = [](const TableSchema& current) {
+        return AddChunkColumn(current, Column{.id = current.next_column_id, .name = "owner",
+            .type = {ColumnKind::kUnsigned, 8U}, .nullable = true, .default_value = {}});
+    };
+    for (const bool compact : {false, true}) {
+        StatementControl control(StatementControl::Clock::now(), 0U);
+        assert(control.Start());
+        auto admission = FeatureActivationTestAccess::Metadata(catalog);
+        std::promise<void> entering;
+        auto command = std::async(std::launch::async, [&] {
+            ScopedStatementControl scope(&control);
+            entering.set_value();
+            return Stops([&] {
+                if (compact) (void)catalog.CompactTombstones("default", 1U);
+                else catalog.ChangeChunkColumns("default", add);
+            });
+        });
+        entering.get_future().get();
+        assert(control.RequestStop(StatementStopReason::kCancelled));
+        const bool interrupted = command.wait_for(2s) == std::future_status::ready;
+        admission.unlock();
+        assert(interrupted && command.get());
+    }
+    assert(catalog.Require("default")->Info().chunk_schema.columns.empty());
+}
 }
 int main(int argc, char** argv) {
     CancelledWriterReopensReadAdmission();
@@ -553,4 +653,6 @@ int main(int argc, char** argv) {
     CancellationInterruptsBackupAdmission();
     CheckpointFilesWaitStops();
     CheckpointBacklogWaitStopsOrResumes();
+    ChunkModelStatementsStop();
+    ChunkModelCatalogAdmissionStops();
 }

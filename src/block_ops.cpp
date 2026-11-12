@@ -748,7 +748,7 @@ BlockReadMetadata ChunkStore::GetBlockWithVersion3DAt(
             std::optional(DecodeBlockColumns(geometry_.layout(), chunk.payload, chunk.vars, index)) : std::nullopt;
     };
     const auto chunk = GetOrLoadRegularChunk(coord);
-    { std::shared_lock lock(chunk->mutex); capture(*chunk); }
+    { auto lock = LockStatementChunkShared(chunk->mutex); capture(*chunk); }
     (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.state); });
     return result;
 }
