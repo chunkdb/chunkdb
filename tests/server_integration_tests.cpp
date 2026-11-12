@@ -2541,6 +2541,44 @@ void TestStopWakesWaitingWorker() {
     assert(client.WaitForClose(std::chrono::seconds(5)));
 }
 
+// A FLUSH WAL whose barrier runs on a shared maintenance worker when the
+// server stops ends before the server's workers are joined, and the stopped
+// server leaves the maintenance workers to the catalog that owns them.
+void TestStopDuringPooledWalBarrier() {
+    auto store_config = BaseStoreConfig();
+    store_config.background_maintenance = true;
+    ServerHarness harness("stop-pooled-barrier", store_config,
+        chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    client.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
+    assert(client.ReadLine().starts_with(":"));
+    auto lease = harness.catalog->Require("default")->Acquire();
+    assert(lease);
+    auto& store = lease->store();
+    store.ArmBarrierBeforeSyncPauseForTests();
+    struct Resume {
+        chunkdb::ChunkStore& store;
+        ~Resume() { store.ResumeBarrierBeforeSyncForTests(); }
+    } resume{store};
+    client.SendLine("FLUSH WAL");
+    assert(store.WaitForBarrierBeforeSyncForTests());
+    harness.server->Stop();
+    auto stopped = std::async(std::launch::async, [&] { harness.JoinStopped(); });
+    assert(stopped.wait_for(std::chrono::milliseconds(200)) == std::future_status::timeout);
+    store.ResumeBarrierBeforeSyncForTests();
+    assert(stopped.wait_for(std::chrono::seconds(10)) == std::future_status::ready);
+    stopped.get();
+    // The barrier ended; the shutdown may have closed the connection first.
+    try {
+        const auto reply = client.ReadLine();
+        assert(reply == "+OK\r\n" || reply.starts_with("-ERR CANCELLED"));
+    } catch (const std::runtime_error&) {}
+    store.SetBlockBits(1, 0, "0100");
+    lease.reset();
+    harness.catalog->WalBarrier();
+}
+
 // A request queued while the only worker is between its registration and
 // its poll still takes that worker: the yield wake must survive until the poll.
 void TestYieldInsideIdleWaitWindow() {
@@ -7596,6 +7634,7 @@ int main(int argc, char** argv) {
         run("TestWaitingWorkerKeepsIdleDeadline", TestWaitingWorkerKeepsIdleDeadline);
         run("TestPartialInputLeavesWaitingWorker", TestPartialInputLeavesWaitingWorker);
         run("TestStopWakesWaitingWorker", TestStopWakesWaitingWorker);
+        run("TestStopDuringPooledWalBarrier", TestStopDuringPooledWalBarrier);
         run("TestYieldInsideIdleWaitWindow", TestYieldInsideIdleWaitWindow);
         run("TestKillInsideIdleWaitWindow", TestKillInsideIdleWaitWindow);
         run("TestStopInsideIdleWaitWindow", TestStopInsideIdleWaitWindow);
