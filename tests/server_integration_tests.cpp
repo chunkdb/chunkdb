@@ -2920,12 +2920,40 @@ struct StalledSocket {
     void Send(std::string_view bytes) const {
         assert(send(fd, bytes.data(), bytes.size(), 0) == static_cast<ssize_t>(bytes.size()));
     }
-    // Reads one short reply, as HELLO and PING return.
+    // Reads one whole reply, however the transport splits it.
     std::string ReadReply() const {
-        char buffer[4096];
-        const auto read = recv(fd, buffer, sizeof(buffer), 0);
-        assert(read > 0);
-        return std::string(buffer, static_cast<std::size_t>(read));
+        std::string reply;
+        while (!Complete(reply)) {
+            char buffer[4096];
+            const auto read = recv(fd, buffer, sizeof(buffer), 0);
+            assert(read > 0);
+            reply.append(buffer, static_cast<std::size_t>(read));
+        }
+        return reply;
+    }
+    // True when `reply` holds exactly one protocol value with all its members.
+    static bool Complete(std::string_view reply) {
+        std::size_t at = 0U;
+        return Skip(reply, at) && at == reply.size();
+    }
+    static bool Skip(std::string_view reply, std::size_t& at) {
+        const auto end = reply.find("\r\n", at);
+        if (end == std::string_view::npos) return false;
+        const char type = reply[at];
+        const auto line = std::string(reply.substr(at + 1U, end - at - 1U));
+        at = end + 2U;
+        if (type == '$' || type == '=' || type == '!') {
+            const auto bytes = std::stoull(line) + 2U;
+            if (reply.size() - at < bytes) return false;
+            at += bytes;
+            return true;
+        }
+        if (type != '*' && type != '%' && type != '~' && type != '>') return true;
+        auto members = std::stoull(line);
+        if (type == '%') members *= 2U;
+        for (; members != 0U; --members)
+            if (!Skip(reply, at)) return false;
+        return true;
     }
     std::uint64_t Hello() const {
         Send("HELLO 3\r\n");
