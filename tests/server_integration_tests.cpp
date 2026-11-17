@@ -48,6 +48,11 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <unistd.h>
+#if defined(__linux__)
+#include <linux/sockios.h>
+#include <netinet/tcp.h>
+#include <sys/ioctl.h>
+#endif
 #endif
 
 #ifdef CHUNKDB_WITH_OPENSSL
@@ -462,6 +467,8 @@ class RawClient {
     }
     void Unread(const std::string& bytes) { pending_ = bytes + pending_; }
     void SetReadDeadline(std::chrono::milliseconds timeout) { test_read_deadline_ = Clock::now() + timeout; }
+    void ReportStallsAfter(std::chrono::milliseconds pause) { stall_report_after_ = pause; }
+    [[nodiscard]] const std::string& LastStallReport() const { return last_stall_report_; }
     void SmallReceiveBuffer() {
         const int bytes = 65536;
         assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
@@ -555,7 +562,7 @@ class RawClient {
     std::string ReadBulkText() {
         const std::string header = ReadLine();
         const std::size_t len = ParseBulkLength(header);
-        if (len > 32U * 1024U * 1024U) {
+        if (len > kLargeReadBytes) {
             std::cerr << "bulk read started " << ReadContext() << " expected=" << len << '\n';
         }
         const std::string payload = ReadExact(len);
@@ -563,7 +570,7 @@ class RawClient {
         if (crlf != "\r\n") {
             throw std::runtime_error("invalid bulk text terminator");
         }
-        if (len > 32U * 1024U * 1024U) {
+        if (len > kLargeReadBytes) {
             std::cerr << "bulk read completed " << ReadContext() << " received=" << payload.size() << '\n';
         }
         return payload;
@@ -688,6 +695,61 @@ class RawClient {
     std::optional<Clock::time_point> test_read_deadline_;
     std::string last_request_;
     std::size_t request_number_ = 0;
+    static constexpr std::size_t kLargeReadBytes = 32U * 1024U * 1024U;
+    static constexpr std::size_t kReadProgressBytes = 8U * 1024U * 1024U;
+    Clock::duration stall_report_after_ = std::chrono::seconds(5);
+    std::string last_stall_report_;
+
+#if defined(__linux__)
+    // The kernel's view of one socket: queued bytes and TCP_INFO counters.
+    static std::string TcpState(int fd) {
+        tcp_info info{};
+        socklen_t length = sizeof(info);
+        if (getsockopt(fd, IPPROTO_TCP, TCP_INFO, &info, &length) != 0) return "unavailable";
+        int inq = -1, outq = -1, notsent = -1;
+        (void)ioctl(fd, SIOCINQ, &inq);
+        (void)ioctl(fd, SIOCOUTQ, &outq);
+        (void)ioctl(fd, SIOCOUTQNSD, &notsent);
+        return "inq=" + std::to_string(inq) + " outq=" + std::to_string(outq) + " notsent=" + std::to_string(notsent) +
+            " unacked=" + std::to_string(info.tcpi_unacked) + " retransmits=" + std::to_string(info.tcpi_retransmits) +
+            " total_retrans=" + std::to_string(info.tcpi_total_retrans) + " probes=" + std::to_string(info.tcpi_probes) +
+            " backoff=" + std::to_string(info.tcpi_backoff) + " rto_us=" + std::to_string(info.tcpi_rto) +
+            " snd_cwnd=" + std::to_string(info.tcpi_snd_cwnd) + " rcv_space=" + std::to_string(info.tcpi_rcv_space) +
+            " last_data_sent_ms=" + std::to_string(info.tcpi_last_data_sent) +
+            " last_data_recv_ms=" + std::to_string(info.tcpi_last_data_recv);
+    }
+#endif
+
+    // Both ends of this connection, where the server runs in this process:
+    // whether the bytes wait in the server's send queue, in this socket's
+    // receive queue, or nowhere. Diagnostic only; the server may close its
+    // descriptor during the scan.
+    [[nodiscard]] std::string ConnectionState() const {
+#if defined(__linux__)
+        sockaddr_in local{}, remote{};
+        socklen_t length = sizeof(local);
+        if (getsockname(socket_, reinterpret_cast<sockaddr*>(&local), &length) != 0) return "";
+        length = sizeof(remote);
+        if (getpeername(socket_, reinterpret_cast<sockaddr*>(&remote), &length) != 0) return "";
+        std::string server = "none";
+        for (int fd = 0; fd < 4096; ++fd) {
+            if (fd == socket_) continue;
+            sockaddr_in fd_local{}, fd_remote{};
+            length = sizeof(fd_local);
+            if (getsockname(fd, reinterpret_cast<sockaddr*>(&fd_local), &length) != 0 || fd_local.sin_family != AF_INET) continue;
+            length = sizeof(fd_remote);
+            if (getpeername(fd, reinterpret_cast<sockaddr*>(&fd_remote), &length) != 0) continue;
+            if (fd_local.sin_port == remote.sin_port && fd_local.sin_addr.s_addr == remote.sin_addr.s_addr &&
+                fd_remote.sin_port == local.sin_port && fd_remote.sin_addr.s_addr == local.sin_addr.s_addr) {
+                server = TcpState(fd);
+                break;
+            }
+        }
+        return " client_socket={" + TcpState(socket_) + "} server_socket={" + server + "}";
+#else
+        return "";
+#endif
+    }
 
     // How one read waited. recv returns at least every 200 ms (the receive
     // timeout) while this thread runs, so a gap well above that is time the
@@ -702,6 +764,7 @@ class RawClient {
             if (bytes) last_byte_ = now;
             else ++empty_returns_;
         }
+        [[nodiscard]] Clock::duration SinceLastByte() const { return Clock::now() - last_byte_; }
         [[nodiscard]] std::string Describe() const {
             const auto ms = [](Clock::duration d) {
                 return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(d).count());
@@ -782,10 +845,21 @@ class RawClient {
 #endif
     }
 
+    // A large read publishes a phase when it starts, which is after the reply
+    // began and so after the server's write deadline was set, and for each
+    // 8 MiB it receives. The phase watchdog then measures a pause rather than
+    // the whole exchange: a stalled reply ends at the server's write deadline,
+    // which reports the bytes written, and here, with the bytes received. The
+    // first pause of `stall_report_after_` is described once while both
+    // sockets are open.
     std::string ReadExact(std::size_t size) {
         std::string out;
         out.reserve(size);
         RecvTrace trace;
+        const bool large = size > kLargeReadBytes;
+        std::size_t next_progress = kReadProgressBytes;
+        bool stall_reported = false;
+        if (large) chunkdb::test::FeedPhaseWatchdog::Phase("client: read 0 of " + std::to_string(size) + " bytes");
 
         while (out.size() < size) {
             if (test_read_deadline_ && Clock::now() >= *test_read_deadline_) {
@@ -796,7 +870,18 @@ class RawClient {
                 const std::size_t take = std::min(size - out.size(), pending_.size());
                 out.append(pending_.data(), take);
                 pending_.erase(0, take);
+                if (large && out.size() >= next_progress) {
+                    chunkdb::test::FeedPhaseWatchdog::Phase(
+                        "client: read " + std::to_string(out.size()) + " of " + std::to_string(size) + " bytes");
+                    next_progress = (out.size() / kReadProgressBytes + 1U) * kReadProgressBytes;
+                }
                 continue;
+            }
+            if (large && !stall_reported && trace.SinceLastByte() >= stall_report_after_) {
+                stall_reported = true;
+                last_stall_report_ = "bulk read stalled " + ReadContext() + " expected=" + std::to_string(size) +
+                    " received=" + std::to_string(out.size()) + trace.Describe() + ConnectionState();
+                std::cerr << last_stall_report_ << '\n';
             }
 
             char buffer[4096];
@@ -1180,10 +1265,21 @@ class TlsClient {
     }
 
     // Decrypted bytes into `buffer`: their count, or at most 0 once the
-    // connection is closed or broken.
+    // connection is closed or broken. With nothing buffered, the wait for the
+    // next record happens here rather than in recv: on Windows the socket's
+    // receive timeout fails recv with WSAETIMEDOUT, which OpenSSL 4 treats as
+    // a fatal error of the TLS session, not as a retry.
     int Read(char* buffer, int size) {
         while (true) {
             if (test_read_deadline_ && Clock::now() >= *test_read_deadline_) throw std::runtime_error("feed test TLS read deadline");
+            if (SSL_has_pending(session_) == 0) {
+                int socket_error = 0;
+                if (chunkdb::server_detail::WaitForSocketReady(
+                        socket_, true, false, std::chrono::milliseconds(200), &socket_error) ==
+                    chunkdb::server_detail::SocketWaitResult::kTimeout) {
+                    continue;
+                }
+            }
             ClearErrors();
             const int read = SSL_read(session_, buffer, size);
             if (read > 0 || !TimedOut(read)) {
@@ -2365,6 +2461,34 @@ void TestHandshakesPerIpAreLimited() {
     fourth.Hello();
     fourth.SendLine("PING");
     assert(fourth.ReadLine() == "+PONG\r\n");
+}
+
+// max_handshakes_per_ip = 0 turns the limit off: one source holds more
+// workers before HELLO than the default limit of 64, none is counted, and
+// each is served.
+void TestHandshakeLimitZeroIsOff() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    constexpr std::size_t kWaiting = 65;
+    server_cfg.worker_threads = kWaiting + 2;
+    server_cfg.max_handshakes_per_ip = 0;
+    ServerHarness harness("handshake-limit-off", BaseStoreConfig(), engine_cfg, server_cfg);
+    std::vector<std::unique_ptr<RawClient>> waiting;
+    for (std::size_t i = 0; i < kWaiting; ++i) {
+        waiting.push_back(std::make_unique<RawClient>("127.0.0.1", harness.port));
+    }
+    // Workers take connections in order, so once a later one is served every
+    // waiting one is held by a worker before HELLO.
+    RawClient later("127.0.0.1", harness.port);
+    later.Hello();
+    later.SendLine("PING");
+    assert(later.ReadLine() == "+PONG\r\n");
+    assert(harness.server->HandshakesInProgressForTests("127.0.0.1") == 0U);
+    for (auto& client : waiting) {
+        client->Hello();
+        client->SendLine("PING");
+        assert(client->ReadLine() == "+PONG\r\n");
+    }
 }
 
 // Area replies are bounded: a read whose reply would exceed
@@ -4158,7 +4282,72 @@ void TestServerHarnessStartupFailure() {
     TestPing();
 }
 
+#if defined(__APPLE__) || defined(__linux__)
+// A host asleep for longer than the limit has not stalled the test. On macOS
+// steady_clock counts sleep, and a full run on a laptop that slept failed
+// feed_watch at this watchdog in a phase that takes milliseconds.
+void TestPhaseWatchdogExcludesSuspension() {
+    chunkdb::test::FeedPhaseWatchdog watchdog("PhaseWatchdogSuspension", std::chrono::milliseconds(300));
+    chunkdb::test::FeedPhaseWatchdog::Phase("control: host suspended past the limit");
+    chunkdb::test::FeedPhaseWatchdog::SimulateSuspension(std::chrono::hours(1));
+    // Elapsed time is the subject here: three limits pass while "asleep".
+    std::this_thread::sleep_for(std::chrono::milliseconds(900));
+}
+#endif
+
 #ifndef _WIN32
+// CI twice stalled the 64 MiB GET of TestChunkPutIfLargestGeometry for 60 s.
+// The phase watchdog, started before the request, ended the run just before
+// the server's write deadline would report the bytes it wrote, and the client
+// reported nothing. A large read now publishes its progress, so a pause, not
+// the transfer, is timed, and describes its first pause with both sockets.
+void TestLargeReadReportsProgressAndStall() {
+    const OccupiedPort listener;
+    constexpr std::size_t kPiece = 8U * 1024U * 1024U;
+    constexpr std::size_t kDeclared = 5U * kPiece;
+    const std::string piece(kPiece, 'x');
+    std::jthread peer([&] {
+        const SocketHandle accepted = accept(listener.listening_socket(), nullptr, nullptr);
+        if (accepted == kInvalidSocket) return;
+        const auto send_all = [&](const std::string& bytes) {
+            for (std::size_t sent = 0; sent < bytes.size();) {
+                const ssize_t written = send(accepted, bytes.data() + sent, bytes.size() - sent, 0);
+                if (written <= 0) return;
+                sent += static_cast<std::size_t>(written);
+            }
+        };
+        send_all("$" + std::to_string(kDeclared) + "\r\n");
+        send_all(piece);
+        // Each pause exceeds the client's stall report threshold; together
+        // they exceed the watchdog limit, each alone does not.
+        for (int i = 0; i < 3; ++i) {
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            send_all(piece);
+        }
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        CloseSocket(accepted);
+    });
+    RawClient client("127.0.0.1", listener.port());
+    client.ReportStallsAfter(std::chrono::milliseconds(300));
+    std::string error;
+    {
+        chunkdb::test::FeedPhaseWatchdog watchdog("LargeReadProgress", std::chrono::milliseconds(2500));
+        try {
+            (void)client.ReadBulkText();
+        } catch (const std::runtime_error& failure) {
+            error = failure.what();
+        }
+    }
+    peer.join();
+    assert(error.find("socket closed while reading exact payload") != std::string::npos);
+    assert(error.find(" received=" + std::to_string(4U * kPiece) + " ") != std::string::npos);
+    const std::string& report = client.LastStallReport();
+    assert(report.find(" received=" + std::to_string(kPiece) + " ") != std::string::npos);
+#if defined(__linux__)
+    assert(report.find("server_socket={inq=") != std::string::npos);
+#endif
+}
+
 // A request larger than the socket buffers reaches a server that stops
 // reading for longer than the client's 200 ms send timeout. CI once failed
 // TestChunkPutIfLargestGeometry with "failed to send client bytes": the
@@ -5938,6 +6127,7 @@ int main(int argc, char** argv) {
         run("TestHelloDeadlineEndsAPartialLine", TestHelloDeadlineEndsAPartialLine);
         run("TestTrickledFramesAreBounded", TestTrickledFramesAreBounded);
         run("TestHandshakesPerIpAreLimited", TestHandshakesPerIpAreLimited);
+        run("TestHandshakeLimitZeroIsOff", TestHandshakeLimitZeroIsOff);
         run("TestAreaReplyIsBounded", TestAreaReplyIsBounded);
         run("TestTimeoutsAreBounded", TestTimeoutsAreBounded);
         run("TestChunkPutRequiresHelloBeforePayload", TestChunkPutRequiresHelloBeforePayload);
@@ -6000,6 +6190,10 @@ int main(int argc, char** argv) {
         run("TestServerHarnessStartupFailure", TestServerHarnessStartupFailure);
 #ifndef _WIN32
         run("TestClientSendOutlastsAPausedReader", TestClientSendOutlastsAPausedReader);
+        run("TestLargeReadReportsProgressAndStall", TestLargeReadReportsProgressAndStall);
+#endif
+#if defined(__APPLE__) || defined(__linux__)
+        run("TestPhaseWatchdogExcludesSuspension", TestPhaseWatchdogExcludesSuspension);
 #endif
         run("TestLogLevelFilteringWarn", TestLogLevelFilteringWarn);
         run("TestLogLevelFilteringError", TestLogLevelFilteringError);

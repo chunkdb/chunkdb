@@ -65,6 +65,7 @@ REVOKE right [, right ...] ON table | * FROM user
 
 The CLI accepts PASSWORD in place of VERIFIER and prompts twice unless you provide `--new-password-file`.
 VERIFIER accepts a quoted value or a binary client parameter.
+A login still between HELLO and AUTH when the user gets a new verifier, gets REQUIRE CHANNEL BINDING for an unbound login, or is dropped fails with AUTH_FAILED.
 See [Protocol](../PROTOCOL.md) for authentication encoding.
 
 ## Arguments
