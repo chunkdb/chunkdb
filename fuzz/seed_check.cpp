@@ -14,7 +14,7 @@
 int main(int argc, char** argv) {
     if (argc != 2) { std::cerr << "usage: chunkdb_fuzz_seed_check CORPUS_DIRECTORY\n"; return 2; }
     int failures = 0;
-    for (unsigned model = 0; model < 3U; ++model) {
+    for (unsigned model = 0; model < chunkdb::fuzz::kModelCount; ++model) {
         const auto path = std::filesystem::path(argv[1]) / "chunk_form" / ("model-" + std::to_string(model));
         std::ifstream in(path, std::ios::binary);
         const std::string bytes{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};

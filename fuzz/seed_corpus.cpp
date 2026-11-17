@@ -43,7 +43,7 @@ int main(int argc, char** argv) {
     root = argv[1];
     using namespace chunkdb;
     // Shapes and mutations used by wal_format/chunk_image/typed_columns tests.
-    for (unsigned model = 0; model < 3U; ++model) {
+    for (unsigned model = 0; model < fuzz::kModelCount; ++model) {
         const auto& geometry = fuzz::Model(model);
         Bytes payload(geometry.ChunkPayloadBytes(), 0U);
         Bytes presence = FullPresenceBitmap(geometry);
