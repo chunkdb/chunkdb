@@ -2463,6 +2463,34 @@ void TestHandshakesPerIpAreLimited() {
     assert(fourth.ReadLine() == "+PONG\r\n");
 }
 
+// max_handshakes_per_ip = 0 turns the limit off: one source holds more
+// workers before HELLO than the default limit of 64, none is counted, and
+// each is served.
+void TestHandshakeLimitZeroIsOff() {
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
+    auto server_cfg = BaseServerConfig();
+    constexpr std::size_t kWaiting = 65;
+    server_cfg.worker_threads = kWaiting + 2;
+    server_cfg.max_handshakes_per_ip = 0;
+    ServerHarness harness("handshake-limit-off", BaseStoreConfig(), engine_cfg, server_cfg);
+    std::vector<std::unique_ptr<RawClient>> waiting;
+    for (std::size_t i = 0; i < kWaiting; ++i) {
+        waiting.push_back(std::make_unique<RawClient>("127.0.0.1", harness.port));
+    }
+    // Workers take connections in order, so once a later one is served every
+    // waiting one is held by a worker before HELLO.
+    RawClient later("127.0.0.1", harness.port);
+    later.Hello();
+    later.SendLine("PING");
+    assert(later.ReadLine() == "+PONG\r\n");
+    assert(harness.server->HandshakesInProgressForTests("127.0.0.1") == 0U);
+    for (auto& client : waiting) {
+        client->Hello();
+        client->SendLine("PING");
+        assert(client->ReadLine() == "+PONG\r\n");
+    }
+}
+
 // Area replies are bounded: a read whose reply would exceed
 // max_response_bytes is refused, and the connection stays usable.
 void TestAreaReplyIsBounded() {
@@ -6099,6 +6127,7 @@ int main(int argc, char** argv) {
         run("TestHelloDeadlineEndsAPartialLine", TestHelloDeadlineEndsAPartialLine);
         run("TestTrickledFramesAreBounded", TestTrickledFramesAreBounded);
         run("TestHandshakesPerIpAreLimited", TestHandshakesPerIpAreLimited);
+        run("TestHandshakeLimitZeroIsOff", TestHandshakeLimitZeroIsOff);
         run("TestAreaReplyIsBounded", TestAreaReplyIsBounded);
         run("TestTimeoutsAreBounded", TestTimeoutsAreBounded);
         run("TestChunkPutRequiresHelloBeforePayload", TestChunkPutRequiresHelloBeforePayload);
