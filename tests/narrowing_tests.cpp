@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "change_feed.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/schema.hpp"
@@ -238,6 +239,50 @@ void TestMisfitAtInt64Edge() {
                                        "uN takes N from 1 to 64");
 }
 
+// A 3D table names the block on all three axes.
+void TestMisfitIn3D() {
+    ScopedTempDir dir("chunkdb-narrowing-3d");
+    chunkdb::StoreConfig config;
+    config.data_dir = dir.path();
+    config.schema = Initial();
+    config.geometry = GeometryFor(Initial());
+    config.geometry.chunk_width_blocks = 2;
+    config.geometry.chunk_height_blocks = 3;
+    config.geometry.dims = 3;
+    config.geometry.chunk_depth_blocks = 2;
+    config.geometry.large_chunk_depth_chunks = 2;
+    chunkdb::ChunkStore store(config);
+    const auto u8 = Type(ColumnKind::kUnsigned, 8);
+    store.SetBlock3D(1, 2, 1, {{"id", std::uint64_t{700}}});
+    auto misfit = store.FindValueNotFitting(1, u8);
+    if (misfit != "block (1, 2, 1) holds 700") {
+        std::fprintf(stderr, "misfit: %s\n", misfit.value_or("none").c_str());
+        assert(false);
+    }
+    store.SetBlock3D(1, 2, 1, {{"id", std::uint64_t{7}}});
+    store.SetBlock3D(-1, -4, -3, {{"id", std::uint64_t{701}}});
+    misfit = store.FindValueNotFitting(1, u8);
+    if (misfit != "block (-1, -4, -3) holds 701") {
+        std::fprintf(stderr, "misfit: %s\n", misfit.value_or("none").c_str());
+        assert(false);
+    }
+
+    ScopedTempDir engine_dir("chunkdb-narrowing-3d-engine");
+    chunkdb::CatalogConfig catalog_config; catalog_config.data_dir = engine_dir.path();
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(catalog_config);
+    chunkdb::EngineConfig engine_config; engine_config.require_auth = false;
+    chunkdb::CommandEngine engine(engine_config, catalog);
+    chunkdb::SessionState session;
+    assert(engine.Execute(session, "HELLO 3").front() == '%');
+    assert(engine.Execute(session, "CREATE TABLE s (v u16) CHUNK 2 x 2 x 2") == "+OK\r\n");
+    assert(engine.Execute(session, "SET BLOCK 0 0 1 IN s v=300").front() == ':');
+    const auto reply = engine.Execute(session, "ALTER TABLE s ALTER COLUMN v TYPE u8");
+    if (!Contains(reply, "block (0, 0, 1) holds 300")) {
+        std::fprintf(stderr, "3D narrowing reply: %s\n", reply.c_str());
+        assert(false);
+    }
+}
+
 void TestNarrowTable() {
     for (const std::size_t checkpoint_updates : {std::size_t{1}, std::size_t{100000}}) {
         ScopedTempDir dir("chunkdb-narrowing");
@@ -349,6 +394,51 @@ void TestRequiredColumnDataGate(bool migrate) {
         assert(engine->Execute(*session, "SET BLOCK 0 0 IN world id=2").starts_with("-ERR INVALID_ARGUMENT "));
         assert(engine->Execute(*session, "SET BLOCK 0 0 IN world id=2,must=7").front() == ':');
         assert(engine->Execute(*session, "GET BLOCK 0 0 FROM world COLUMNS must") == "*1\r\n:7\r\n");
+    }
+}
+
+// Chunk metadata alone holds no block, so it does not need a DEFAULT; a block
+// in a chunk listed after metadata-only chunks still does.
+void TestRequiredAfterChunkMetadata(bool migrate) {
+    for (const bool reopen : {false, true}) {
+        ScopedTempDir dir("chunkdb-required-metadata");
+        chunkdb::CatalogConfig config; config.data_dir = dir.path();
+        config.max_loaded_chunks = 1U;
+        std::shared_ptr<chunkdb::TableCatalog> catalog;
+        std::unique_ptr<chunkdb::CommandEngine> engine;
+        std::unique_ptr<chunkdb::SessionState> session;
+        const auto open = [&] {
+            engine.reset(); catalog.reset();
+            catalog = std::make_shared<chunkdb::TableCatalog>(config);
+            chunkdb::EngineConfig options; options.require_auth = false;
+            engine = std::make_unique<chunkdb::CommandEngine>(options, catalog);
+            session = std::make_unique<chunkdb::SessionState>();
+            assert(engine->Execute(*session, "HELLO 3").front() == '%');
+        };
+        open();
+        assert(engine->Execute(*session, "CREATE TABLE world (id u16) CHUNK 4 x 4 CHUNK COLUMNS (meta u8 DEFAULT 0)") == "+OK\r\n");
+        assert(engine->Execute(*session, "SET CHUNK 0 0 IN world META meta=1").front() == ':');
+        assert(engine->Execute(*session, "SET CHUNK 1 0 IN world META meta=2").front() == ':');
+        if (reopen) {
+            open();
+            // The check reads the chunks on disk without loading them.
+            auto lease = catalog->Find("world")->Acquire();
+            assert(!lease->store().HasPresentBlocks());
+            assert(lease->store().ApproxLoadedChunkCount() == 0U);
+        }
+        const auto prefix = std::string(migrate ? "MIGRATE 'required' " : "");
+        const auto expected = migrate ? "+applied\r\n" : "+OK\r\n";
+        const auto add = engine->Execute(*session, prefix + "ALTER TABLE world ADD COLUMN must u8 REQUIRED");
+        if (add != expected) { std::fprintf(stderr, "metadata-only REQUIRED expected [%s], got [%s]\n", expected, add.c_str()); std::abort(); }
+        assert(catalog->Find("world")->Info().schema.version == 2U);
+        assert(engine->Execute(*session, "GET BLOCK 4 0 FROM world") == "_\r\n");
+        // A block behind the metadata-only chunks still needs a DEFAULT.
+        assert(engine->Execute(*session, "SET BLOCK 9 0 IN world id=1,must=3").front() == ':');
+        if (reopen) open();
+        const auto refused = engine->Execute(
+            *session, (migrate ? "MIGRATE 'second' " : "") + std::string("ALTER TABLE world ADD COLUMN next u8 REQUIRED"));
+        assert(refused.starts_with("-ERR INVALID_ARGUMENT ") && Contains(refused, "needs a DEFAULT"));
+        assert(catalog->Find("world")->Info().schema.version == 2U);
     }
 }
 
@@ -492,6 +582,50 @@ void TestEngineDefaultAndTruncate() {
     }
 }
 
+// Fails the manifest rewrite that ends a narrowing, with the allocation of
+// its fallback failing next.
+struct FailNarrowingEnd final : chunkdb::MigrationTestHook {
+    int admissions = 0;
+    void Run(Point point, std::string_view) override {
+        if (point != Point::kBeforeCatalogAdmission || ++admissions != 2) return;
+        SetEnv("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", "1");
+        throw std::runtime_error("injected failure ending a narrowing");
+    }
+};
+
+// A failure to allocate the fence of a narrowing that cannot be ended comes
+// before the table is closed: the table keeps serving, not busy, and a
+// restart drops the narrowing.
+void TestNarrowingEndFenceAllocationFailureKeepsTable() {
+    ScopedTempDir dir("chunkdb-narrowing-fence-alloc");
+    chunkdb::CatalogConfig config;
+    config.data_dir = dir.path();
+    {
+        chunkdb::TableCatalog catalog(config);
+        (void)catalog.Create("world", GeometryFor(Initial()), {}, Initial());
+        const auto handle = catalog.Find("world");
+        {
+            auto lease = *handle->Acquire();
+            lease.store().SetBlock(9, 9, {{"id", std::uint64_t{700}}});
+        }
+        FailNarrowingEnd hook;
+        catalog.SetMigrationTestHook(&hook);
+        ExpectThrow<std::invalid_argument>(
+            [&] { catalog.NarrowColumn("world", "id", Type(ColumnKind::kUnsigned, 8)); }, "holds 700");
+        catalog.SetMigrationTestHook(nullptr);
+        assert(hook.admissions == 2);
+        // Not left busy: commands on it would wait until a restart.
+        assert(!chunkdb::FeedTestAccess::WaitLingerDraining(*handle, std::chrono::milliseconds(0)));
+        assert(catalog.Find("world") == handle && !catalog.Fence("world"));
+        assert(handle->Info().schema.pending.has_value());
+        auto lease = *handle->Acquire();
+        ExpectRow(lease.store(), 9, 9, Row{std::uint64_t{700}, std::uint64_t{15}, std::monostate{}});
+    }
+    chunkdb::TableCatalog catalog(config);
+    const auto schema = catalog.Find("world")->Info().schema;
+    assert(schema.version == 1U && !schema.pending && schema.columns[0].type == Type(ColumnKind::kUnsigned, 10));
+}
+
 // A crash leaves the narrowing in the manifest; the next open drops it. A
 // failure while reading drops it at once.
 void TestInterruptedNarrowing() {
@@ -537,12 +671,15 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--range") { TestNarrowTable(); return 0; }
     TestRequiredOnEmptyEngine(false); TestRequiredOnEmptyEngine(true);
     TestRequiredColumnDataGate(false); TestRequiredColumnDataGate(true);
+    TestRequiredAfterChunkMetadata(false); TestRequiredAfterChunkMetadata(true);
     TestRequiredWaitsForWriter(false); TestRequiredWaitsForWriter(true);
     TestConcurrentNarrowingWriter(); TestNarrowingRangeFamilies(); TestEngineDefaultAndTruncate();
     TestRules();
     TestWritesWhilePending();
     TestMisfitAtInt64Edge();
+    TestMisfitIn3D();
     TestNarrowTable();
     TestInterruptedNarrowing();
+    TestNarrowingEndFenceAllocationFailureKeepsTable();
     return 0;
 }

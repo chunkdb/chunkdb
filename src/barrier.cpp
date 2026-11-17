@@ -5,6 +5,7 @@
 #include <exception>
 #include <filesystem>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -377,7 +378,17 @@ void ChunkStore::AdoptUnsynced(const UnsyncedArtifacts& artifacts) {
 
 void ChunkStore::RestoreUnsynced(UnsyncedArtifacts drained) {
     std::lock_guard lock(unsynced_mutex_);
-    InsertUnsyncedLocked(drained);
+    try {
+        InsertUnsyncedLocked(drained);
+    } catch (const std::bad_alloc&) {
+        // Out of memory partway through: the entries not inserted yet would
+        // leave the set, so the next barrier syncs the whole data directory
+        // instead, as after an overflow. Nothing here allocates.
+        unsynced_overflow_ = true;
+        unsynced_files_.clear();
+        unsynced_dirs_.clear();
+        unsynced_swept_dirs_.clear();
+    }
 }
 
 void ChunkStore::ForceUnsyncedOverflowForTests() {
@@ -916,16 +927,30 @@ void ChunkStore::WalBarrier() {
 ChunkStore::UnsyncedArtifacts ChunkStore::TakeUnsynced() {
     // Moves the tracked set out and copies what rollback boundaries still
     // sync: their artifacts left the set, but their syncs may not end before
-    // the caller relies on them.
+    // the caller relies on them. Everything that can throw comes before the
+    // first swap, so a failure (out of memory) leaves the set as it was for
+    // a later barrier.
     UnsyncedArtifacts drained;
     std::lock_guard lock(unsynced_mutex_);
+    std::unordered_set<std::string> files_in_flight(
+        unsynced_files_in_flight_.begin(), unsynced_files_in_flight_.end());
+    std::unordered_set<std::string> dirs_in_flight(
+        unsynced_dirs_in_flight_.begin(), unsynced_dirs_in_flight_.end());
+    // Room for the in-flight entries, so the merges below neither rehash nor
+    // allocate. A rehash that fails leaves the set unchanged.
+    if (!files_in_flight.empty()) {
+        unsynced_files_.reserve(unsynced_files_.size() + files_in_flight.size());
+    }
+    if (!dirs_in_flight.empty()) {
+        unsynced_dirs_.reserve(unsynced_dirs_.size() + dirs_in_flight.size());
+    }
     drained.files.swap(unsynced_files_);
     drained.dirs.swap(unsynced_dirs_);
     drained.swept_dirs.swap(unsynced_swept_dirs_);
     drained.overflow = unsynced_overflow_;
     unsynced_overflow_ = false;
-    drained.files.insert(unsynced_files_in_flight_.begin(), unsynced_files_in_flight_.end());
-    drained.dirs.insert(unsynced_dirs_in_flight_.begin(), unsynced_dirs_in_flight_.end());
+    drained.files.merge(files_in_flight);
+    drained.dirs.merge(dirs_in_flight);
     return drained;
 }
 

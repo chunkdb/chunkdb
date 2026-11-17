@@ -268,6 +268,10 @@ void SlotWatch::Build(Prepared& prepared) const {
         metadata.position = entry->position;
         metadata.schema_version = entry->schema_version;
         metadata.columns = columns;
+        const auto geometry = table_->geometry();
+        metadata.dims = geometry.dims();
+        if (geometry.has_chunk_column_history())
+            metadata.chunk_columns = geometry.ChunkColumnsLayoutAt(entry->schema_version).schema().columns;
         auto projected = FilterFeedEntry(std::make_shared<const FeedEntry>(std::move(metadata)), {}, options_.column_ids, false, columns);
         prepared.next.push_back(Output{std::make_shared<const std::string>(EncodeFeedEntry(*projected))});
     }
