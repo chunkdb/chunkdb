@@ -308,7 +308,7 @@ void TestValidityRules() {
 
 // --- image -----------------------------------------------------------------
 
-Bytes AppendUncheckedImageVars(const Bytes& empty, const Bytes& section) {
+Bytes AppendUncheckedImageVars(const Bytes& empty, std::span<const std::uint8_t> section) {
     // Append a raw VARS descriptor independently of the validating writer.
     assert(chunkdb::ReadLe16(empty, 10U) == 2U);
     constexpr std::size_t directory_end = 76U + 2U * 16U;
@@ -317,7 +317,7 @@ Bytes AppendUncheckedImageVars(const Bytes& empty, const Bytes& section) {
     Le16(&bytes, 3U); Le16(&bytes, 0U);
     Le32(&bytes, static_cast<std::uint32_t>(section.size()));
     Le32(&bytes, static_cast<std::uint32_t>(section.size()));
-    Le32(&bytes, chunkdb::Crc32(section));
+    Le32(&bytes, chunkdb::Crc32(section.data(), section.size()));
     Le32(&bytes, chunkdb::Crc32(bytes));
     bytes.insert(bytes.end(), empty.begin() + directory_end + 4U, empty.end());
     bytes.insert(bytes.end(), section.begin(), section.end());
@@ -432,7 +432,8 @@ void TestWalRecords() {
          {chunkdb::kWalRecordVarPut, Entry(4, 0, B("hi"))}});
     const auto f2 =
         RawFrame(2, {{chunkdb::kWalRecordVarDel, DelBody(2, 0)}, {chunkdb::kWalRecordVarPut, Entry(2, 1, B("cd"))}});
-    const auto f3 = RawFrame(3, {{chunkdb::kWalRecordVarReplace, replacement.Encode()}});
+    const auto f3 = RawFrame(3, {{chunkdb::kWalRecordVarReplace,
+        Bytes(replacement.Encode().begin(), replacement.Encode().end())}});
     const auto good = Wal({f1, f2, f3});
     {
         const auto r = Replay(good);
