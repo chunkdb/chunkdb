@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A conditional chunk mutation that has committed is no longer reported as failed when a later cleanup, checkpoint or snapshot warning fails; when a rejected conditional mutation cannot neutralize its WAL tail, the store becomes fail-closed before it logs, and the caller gets the original error.
 - `--max-handshakes-per-ip 0` starts the server with the handshake limit off, as documented, instead of being refused; a negative or non-numeric value is refused.
 - A FLUSH that runs out of memory while it collects the files written without a sync keeps them all recorded, including the full-directory sync owed after the record overflowed, so the next FLUSH still syncs them; before, that failure could drop the record and a later FLUSH could return without syncing those files.
 - A FLUSH whose sync fails and that then runs out of memory while it records the unsynced files again makes the next FLUSH sync the whole data directory; before, the files not yet recorded could be dropped and a later FLUSH could return without syncing them.
