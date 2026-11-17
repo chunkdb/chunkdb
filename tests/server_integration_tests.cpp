@@ -1180,10 +1180,21 @@ class TlsClient {
     }
 
     // Decrypted bytes into `buffer`: their count, or at most 0 once the
-    // connection is closed or broken.
+    // connection is closed or broken. With nothing buffered, the wait for the
+    // next record happens here rather than in recv: on Windows the socket's
+    // receive timeout fails recv with WSAETIMEDOUT, which OpenSSL 4 treats as
+    // a fatal error of the TLS session, not as a retry.
     int Read(char* buffer, int size) {
         while (true) {
             if (test_read_deadline_ && Clock::now() >= *test_read_deadline_) throw std::runtime_error("feed test TLS read deadline");
+            if (SSL_has_pending(session_) == 0) {
+                int socket_error = 0;
+                if (chunkdb::server_detail::WaitForSocketReady(
+                        socket_, true, false, std::chrono::milliseconds(200), &socket_error) ==
+                    chunkdb::server_detail::SocketWaitResult::kTimeout) {
+                    continue;
+                }
+            }
             ClearErrors();
             const int read = SSL_read(session_, buffer, size);
             if (read > 0 || !TimedOut(read)) {
