@@ -280,8 +280,8 @@ int main(int argc, char** argv) {
                 if (arg == "--slot-max-bytes") store_config.slot_max_bytes = parsed;
                 else store_config.slot_sync_interval = std::chrono::milliseconds(parsed);
             } else if (arg == "--max-handshakes-per-ip") {
-                server_config.max_handshakes_per_ip =
-                    ParseSize(require_value("--max-handshakes-per-ip"), "max-handshakes-per-ip");
+                server_config.max_handshakes_per_ip = ParseBounded(require_value("--max-handshakes-per-ip"),
+                    "--max-handshakes-per-ip", 0U, std::numeric_limits<std::size_t>::max());
             } else if (arg == "--max-line-bytes") {
                 server_config.max_line_bytes =
                     ParseSize(require_value("--max-line-bytes"), "max-line-bytes");
