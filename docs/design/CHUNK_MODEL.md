@@ -201,3 +201,9 @@ Crash tests interrupt index publication, tombstone sync, image removal, archive-
 Concurrency tests pin collection against writes, scans, schema changes and backup with deterministic hooks.
 Clients and CLI gain matching dimension-aware forms, metadata, version and unknown-section fixtures before the server switches the public format.
 Separate server-side budget windows measure timestamp bookkeeping, coordinate width, membership transitions, sectioned encoding and metadata against ordinary requests.
+
+## Measurements
+
+The cost of `commit_time_ms` was measured on its own: main d900641 against the same source built with `CHUNKDB_BENCH_CONSTANT_COMMIT_TIME`, 15 paired runs per profile on Linux (AMD Ryzen 5 4600H, ext4).
+Recording the commit time costs 0.8-1.3% in the relaxed profile (world 57,366 -> 56,643 req/s, canvas 49,891 -> 49,384, simulation 50,804 -> 50,265) and is within noise under fsync-wal; no scenario comes near the 5% budget.
+Raw report and setup: [comparison](../../bench/artifacts/manual-runs/commit-time-20261118-linux-comparison.md), [conditions](../../bench/artifacts/manual-runs/commit-time-20261118-linux-metadata.txt).

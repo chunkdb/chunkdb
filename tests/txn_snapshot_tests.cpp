@@ -567,6 +567,75 @@ void TestSnapshotAreaKeepsOverlayAndEmptyConflicts() {
     }
 }
 
+chunkdb::ChunkAreaSelector SnapshotAreaSelector(bool three, bool around) {
+    const std::uint8_t dims = three ? 3U : 2U;
+    if (around) return {.dims = dims, .first = {0, 0, 0}, .around = true, .radius = 2};
+    return {.dims = dims, .first = {-2, -1, three ? -1 : 0}, .last = {2, 1, three ? 1 : 0}};
+}
+
+// Paged GET AREA at a snapshot, resumed with AFTER cursors, visits the same
+// cells in the same order and returns the same entries as the point path,
+// including a chunk emptied and a chunk created after the snapshot.
+void TestPagedSnapshotAreaMatchesPointScan() {
+    for (const bool three : {false, true}) for (const bool around : {false, true}) {
+        ScopedTempDir dir("chunkdb-txn-area-index-paged");
+        ChunkStore store(AreaIndexConfig(dir.path(), three));
+        const ChunkCoord emptied{-1, 0, 0};
+        const ChunkCoord created{2, 0, 0};
+        for (const ChunkCoord coord : {ChunkCoord{-2, 0, 0}, emptied, ChunkCoord{0, 0, 0}, ChunkCoord{1, 0, 0}})
+            WriteAreaBlock(store, coord);
+        WriteAreaMetadata(store, {0, 1, 0}, std::string("note"));
+        auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+        WriteAreaBlock(store, emptied, false);
+        store.CheckpointForTests(emptied.x, emptied.y);
+        WriteAreaBlock(store, created);
+        WriteAreaMetadata(store, {1, 0, 0}, std::string("later"));
+        const auto selector = SnapshotAreaSelector(three, around);
+        const auto cells = AreaCoordinates(three, around);
+        const auto whole = IndexedArea(store, *snapshot, around);
+        assert(whole.size() == 5U);
+        ExpectPointScan(store, *snapshot, around, whole);
+        for (const std::size_t limit : {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{7}})
+            for (const bool one_entry_per_page : {false, true}) {
+                std::vector<ChunkCoord> visited;
+                std::vector<ChunkCoord> covered;
+                std::vector<chunkdb::ChunkRangeEntry> entries;
+                const chunkdb::TxnAreaRead read{.overlay = {}, .covered = &covered};
+                std::optional<ChunkCoord> after;
+                for (std::size_t pages = 0U;; ++pages) {
+                    assert(pages <= cells.size());
+                    bool page_has_entry = false;
+                    std::vector<ChunkCoord> page_cells;
+                    const auto page = store.VisitChunkArea(selector, after, limit,
+                        [&](const ChunkCoord& coord, std::optional<chunkdb::ChunkRangeEntry>&& entry, bool) {
+                            // Refusing a second entry stands in for the page's byte budget.
+                            if (entry && one_entry_per_page && page_has_entry) return false;
+                            page_cells.push_back(coord);
+                            if (entry) {
+                                page_has_entry = true;
+                                entries.push_back(std::move(*entry));
+                            }
+                            return true;
+                        },
+                        true, snapshot.get(), read);
+                    assert(!page_cells.empty() && page_cells.size() <= limit);
+                    visited.insert(visited.end(), page_cells.begin(), page_cells.end());
+                    if (!page.has_more) {
+                        assert(!page.after);
+                        break;
+                    }
+                    assert(page.after && *page.after == page_cells.back());
+                    after = page.after;
+                }
+                assert(visited == cells);
+                std::sort(covered.begin(), covered.end());
+                covered.erase(std::unique(covered.begin(), covered.end()), covered.end());
+                assert(covered == cells);
+                ExpectPointScan(store, *snapshot, around, entries);
+            }
+    }
+}
+
 // Text values at a snapshot.
 chunkdb::TableSchema TextSchema() {
     chunkdb::Column id;
@@ -777,6 +846,7 @@ int main() {
     TestSnapshotAreaIncludesPendingFirstWrite();
     TestSnapshotAreaWaitsForEmptyingWrite();
     TestSnapshotAreaKeepsOverlayAndEmptyConflicts();
+    TestPagedSnapshotAreaMatchesPointScan();
     TestTextValuesAtSnapshot();
     TestWriterRacingRegistrationIsKept();
     TestSnapshotAfterWriterVersionSeesTheWrite();
