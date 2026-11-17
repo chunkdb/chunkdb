@@ -410,9 +410,27 @@ ProcessLock::ProcessLock(const std::filesystem::path& data_dir)
             "failed to open writer lock file: " + lock_file_path_.string());
     }
 
-    if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+    int lock_error = 0;
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_PROCESS_LOCK_FLOCK_FAIL_ONCE")) {
+        lock_error = ENOLCK;
+    } else if (::flock(fd, LOCK_EX | LOCK_NB) != 0) {
+        lock_error = errno;
+    }
+    if (lock_error != 0) {
         ::close(fd);
-        ThrowActiveWriter(data_dir_, lock_file_path_, meta_path_);
+        // Only a held lock means another writer; any other error is a
+        // failure to take the lock and is reported as it is.
+        if (lock_error == EWOULDBLOCK || lock_error == EAGAIN) {
+            ThrowActiveWriter(data_dir_, lock_file_path_, meta_path_);
+        }
+        const std::error_code ec(lock_error, std::generic_category());
+        LogMessage(
+            LogLevel::kError,
+            LogComponent::kLock,
+            "failed to lock writer lock file",
+            {{"path", lock_file_path_.string()}, {"error", ec.message()}});
+        throw std::runtime_error(
+            "failed to lock writer lock file: " + lock_file_path_.string() + ": " + ec.message());
     }
 
     lock_fd_ = fd;
