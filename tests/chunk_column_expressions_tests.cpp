@@ -1,8 +1,14 @@
 #include <algorithm>
 #include <cassert>
+#include <cstdint>
+#include <filesystem>
 #include <iostream>
 #include <limits>
+#include <memory>
+#include <span>
 #include <stdexcept>
+#include <string>
+#include <vector>
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/chunk_columns.hpp"
@@ -12,6 +18,13 @@
 
 namespace {
 using namespace chunkdb;
+
+// A block coordinate, kept apart from ChunkCoord.
+struct BlockPoint {
+    std::int64_t x;
+    std::int64_t y;
+    std::int64_t z;
+};
 
 struct Example {
     std::string name;
@@ -92,7 +105,7 @@ StoreConfig Config(const std::filesystem::path& directory, std::uint8_t dims) {
 
 // Expressions are not wired into CQL statements yet. Exercise their existing
 // input contract with real stored rows, without adding statement semantics.
-void CheckRow(ChunkStore& store, const ChunkState& state, const ChunkCoord& point,
+void CheckRow(ChunkStore& store, const ChunkState& state, const BlockPoint& point,
     const std::vector<ColumnValue>& expected, bool present) {
     const auto& geometry = store.geometry();
     const auto& chunks = geometry.chunk_schema();
@@ -101,9 +114,10 @@ void CheckRow(ChunkStore& store, const ChunkState& state, const ChunkCoord& poin
         ? store.BlockInState3D(state, point.x, point.y, point.z)
         : store.BlockInState(state, point.x, point.y);
     assert(block.has_value() == present);
-    // The evaluator takes a complete row. A chunk without metadata reads as
-    // the defaults its first write would start from; an empty span is a
-    // malformed input, not an absent row.
+    // The evaluator takes a complete row; an empty span is a malformed input.
+    // How CQL resolves chunk.<column> for a chunk without metadata is not
+    // decided yet; until expressions are wired into CQL, this test chooses
+    // the defaults that a first write would start from.
     const auto& stored = state.chunk_columns ? state.chunk_columns : geometry.default_chunk_columns();
     const auto metadata = DecodeChunkColumns(chunks, stored->bytes);
     assert(metadata == expected);
@@ -163,7 +177,7 @@ void CheckRow(ChunkStore& store, const ChunkState& state, const ChunkCoord& poin
 void Lifecycle(std::uint8_t dims) {
     test::ScopedTempDir directory("chunkdb-chunk-expression");
     const auto config = Config(directory.path(), dims);
-    const ChunkCoord point{-1, 3, dims == 3 ? -5 : 0};
+    const BlockPoint point{-1, 3, dims == 3 ? -5 : 0};
     const ChunkCoord coord{-1, 1, dims == 3 ? -3 : 0};
     const auto full = Values(*config.chunk_schema, false);
     const auto nullable = Values(*config.chunk_schema, true);
