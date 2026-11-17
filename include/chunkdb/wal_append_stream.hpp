@@ -1,8 +1,10 @@
 #pragma once
 
 #include <cstddef>
+#include <cstdint>
 #include <filesystem>
 #include <fstream>
+#include <optional>
 
 namespace chunkdb {
 
@@ -29,6 +31,12 @@ class WalAppendStream {
     WalAppendStream& write(const char* bytes, std::streamsize size);
     WalAppendStream& flush() noexcept;
 
+    // Size of the open file with every write flushed: read from the file
+    // once, then kept up by this stream's own writes, so asking costs no
+    // system call. Empty while closed, with unflushed bytes, or after a
+    // failure. Whoever changes the file another way closes the stream first.
+    [[nodiscard]] std::optional<std::uint64_t> size() noexcept;
+
     // Streams of this process with an open file, and the most there were at
     // once since the last reset.
     [[nodiscard]] static std::size_t OpenCountForTests() noexcept;
@@ -42,6 +50,8 @@ class WalAppendStream {
     void* handle_ = nullptr;
     // The first I/O cause survives cleanup; callers capture it before reset.
     int error_ = 0;
+    std::optional<std::uint64_t> size_;
+    std::uint64_t unflushed_ = 0;
 };
 
 }  // namespace chunkdb

@@ -801,6 +801,7 @@ class ChunkStore {
     [[nodiscard]] std::uint64_t ChunkCommitTimeForTests(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] std::uint64_t WalOpenCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t WalParentPrepareCountForTests() const noexcept;
+    [[nodiscard]] std::uint64_t ChunkFileProbeCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t OpenWalStreamCountForTests() const noexcept;
     [[nodiscard]] std::size_t MaxOpenWalStreamsForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionSnapshotBuildCountForTests() const noexcept;
@@ -1150,6 +1151,8 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_empty_batch_{0};
     std::atomic<std::uint64_t> stats_eviction_refill_large_chunk_scans_{0};
     std::atomic<std::uint64_t> stats_wal_parent_prepare_calls_{0};
+    // Path lookups of a chunk's WAL made for its size (CurrentWalFileSize).
+    mutable std::atomic<std::uint64_t> stats_chunk_file_probes_{0};
     std::atomic<std::uint64_t> stats_eviction_recency_skips_{0};
     std::atomic<std::uint64_t> stats_empty_chunk_gcs_{0};
     std::atomic<std::uint64_t> stats_wal_barriers_{0};
