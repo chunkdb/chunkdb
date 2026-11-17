@@ -31,7 +31,7 @@ data_dir/
   chunkdb.migrations                  completed named migration records, when present
   chunkdb.migration.pending           decided migration awaiting completion, when present
   .chunkdb.lock/                      writer-process lock
-  .chunkdb.staging/                    table creation staging
+  .chunkdb.staging/                    table creation and restore staging
   .chunkdb.dropped/                    tables renamed out of the catalog
   .chunkdb.backups/                    temporary pinned backup files
   tables/<name>/
@@ -60,6 +60,8 @@ The catalog's directory names match `[a-z0-9][a-z0-9_-]{0,63}`, excluding `con`,
 Entries in `tables/` with invalid names are ignored; a table directory with a valid name and no manifest is damage.
 
 Creation prepares a complete table under `.chunkdb.staging/`, publishes it by a rename that cannot replace an existing table, then syncs both parents.
+RESTORE TABLE builds its table the same way: it copies the backed-up table under `.chunkdb.staging/`, rebinds it to a new epoch and syncs it before that rename.
+SWAP TABLES syncs both tables' WALs, closes them, exchanges `tables/<a>/` and `tables/<b>/` in one atomic directory exchange and syncs `tables/`; a crash leaves both names exchanged or neither.
 DROP raises and syncs the root version floor before moving the closed table into `.chunkdb.dropped/`.
 The rename commits the drop; deletion can finish at startup.
 Writer startup recovers decided migrations before interrupted-table cleanup and table opening.

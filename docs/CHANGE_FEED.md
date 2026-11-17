@@ -33,7 +33,7 @@ SET BLOCK 0 0 IN world kind = 1
 1
 ```
 
-The **epoch** identifies the table; it changes when the table is recreated or restored.
+The **epoch** identifies the table; it changes when the table is recreated or restored, and SWAP TABLES moves each epoch to the other name.
 The **revision** orders changes within that epoch and can contain gaps.
 
 A restored table records its immediate parent epoch and the completed backup cut, called its **fork revision**.

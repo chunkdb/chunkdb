@@ -78,6 +78,22 @@ Nothing in the backup is written, and the users file keeps its permissions, so t
 The inventory check runs only at startup: a file changed or removed while the server runs is not noticed, and a chunk whose files were removed then reads as absent.
 Statements that change anything are refused; see [Read-only](SERVER_FLAGS.md#read-only).
 
+## 4. Restore one table into a running server
+
+```text
+RESTORE TABLE world FROM 'snapshot' AS world_restored
+SWAP TABLES world, world_restored
+DROP TABLE world_restored
+```
+
+RESTORE TABLE copies one table of a completed backup under `--backup-dir` into a new table while the server keeps serving; it needs ADMIN on `*` or MANAGES USERS.
+The new table gets a new epoch with the backed-up epoch and cut as its lineage, and appears only once it is complete; a failure or crash before then leaves nothing behind.
+Server shutdown cancels a running restore; a client disconnect does not, and the server log reports each tenth of the copied bytes.
+The backed-up table must have `table_lineage`, the table features this directory gives its tables, and options the server's option flags allow.
+SWAP TABLES then exchanges the names atomically, and DROP TABLE removes the replaced data now under the other name.
+A consumer of `world` then sees the restored epoch and resumes by its [lineage](CHANGE_FEED.md) or receives resync.
+See [Tables](reference/TABLES.md) for SWAP TABLES.
+
 ## Contents and space
 
 Backups include definitions, schema history, images, WAL prefixes, users, rights, slots, and completed migration records.
@@ -101,6 +117,8 @@ The server logs a warning for anything it cannot remove.
 - Unfinished migration recovery: restart the writer before taking another backup.
 - A fenced table: run RECOVER TABLE before taking another backup.
 - Unknown restore publication outcome: verify the destination before deciding whether to remove or use it.
+- RESTORE TABLE `TABLE_EXISTS`: restore under another name with AS.
+- RESTORE TABLE refusing features or options: restore offline with `chunkdb_restore`, or enable the feature on this server first.
 
 Stopping the server aborts unfinished copying; client disconnect leaves the backup running.
 See [Server statements](reference/SERVER.md), [Storage format](STORAGE_FORMAT.md), and [Durability](DURABILITY_CONTRACT.md).
