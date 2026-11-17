@@ -472,7 +472,8 @@ void CrashAtSnapshotFailpoint(const char* key) {
 // The table's pending transaction intents, in name order. They are rare
 // and short-lived, so listing them costs little.
 [[nodiscard]] std::vector<ReadOnlyArtifactSnapshot> ReadTxnIntentsForSnapshot(
-    const std::filesystem::path& intent_dir) {
+    const std::filesystem::path& intent_dir,
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& read_intent) {
     std::error_code list_ec;
     std::filesystem::directory_iterator iterator(intent_dir, list_ec);
     if (list_ec == std::errc::no_such_file_or_directory) {
@@ -496,7 +497,6 @@ void CrashAtSnapshotFailpoint(const char* key) {
     }
     std::sort(names.begin(), names.end());
     std::vector<ReadOnlyArtifactSnapshot> intents;
-    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)> read_intent = LoadRecoveryTxnIntent;
     for (const auto& name : names) {
         auto intent = ReadArtifactForSnapshot(intent_dir / name, &read_intent);
         if (intent.present) {
@@ -513,6 +513,7 @@ void CrashAtSnapshotFailpoint(const char* key) {
     const std::filesystem::path& txn_intent_dir,
     std::size_t collection,
     const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& image_reader,
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& txn_intent_reader,
     const std::function<void(
         std::size_t,
         ReadOnlySnapshotArtifact)>& observation) {
@@ -522,7 +523,7 @@ void CrashAtSnapshotFailpoint(const char* key) {
     snapshot.wal = ReadArtifactForSnapshot(wal_path);
     observation(collection, ReadOnlySnapshotArtifact::kWal);
     snapshot.intent = ReadArtifactForSnapshot(intent_path);
-    snapshot.txn_intents = ReadTxnIntentsForSnapshot(txn_intent_dir);
+    snapshot.txn_intents = ReadTxnIntentsForSnapshot(txn_intent_dir, txn_intent_reader);
     observation(collection, ReadOnlySnapshotArtifact::kIntent);
     return snapshot;
 }
@@ -666,6 +667,7 @@ std::optional<SnapshotGenerationObservation> StableSnapshotGeneration(
     bool generation_record_required,
     const ChunkCoord& chunk_coord,
     const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& image_reader,
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& txn_intent_reader,
     const std::function<void(
         std::size_t,
         ReadOnlySnapshotArtifact)>& observation,
@@ -690,7 +692,7 @@ std::optional<SnapshotGenerationObservation> StableSnapshotGeneration(
                 }
             }
             auto snapshot = CollectReadOnlyChunkDiskSnapshot(
-                data_path, wal_path, intent_path, txn_intent_dir, attempt, image_reader, observation);
+                data_path, wal_path, intent_path, txn_intent_dir, attempt, image_reader, txn_intent_reader, observation);
             const auto after =
                 ReadSnapshotGeneration(generation_path, generation_record_required);
             if ((before.second & 1U) == 0U && before == after &&
