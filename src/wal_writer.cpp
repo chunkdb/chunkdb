@@ -348,7 +348,7 @@ void ChunkStore::TruncateWalTail(
     if (chunk->checkpoint_io) {
         throw std::logic_error("chunk files are owned by a running background checkpoint");
     }
-    SnapshotGenerationWriteGuard snapshot_write(this);
+    SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
     if (chunk->wal_path.empty()) {
         chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     }
@@ -460,7 +460,7 @@ void ChunkStore::FlushWalBatch(
     if (feed_slots_ && feed_slots_->ArchiveRequired())
         prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch, geometry_.dims()));
 
-    SnapshotGenerationWriteGuard snapshot_write(this);
+    SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
     bool first_create = false;
     bool stream_artifact_touched = false;
     bool batch_write_started = false;
@@ -755,7 +755,7 @@ void ChunkStore::FlushWalBatchForEviction(
         std::optional<FeedWalPrefixIndex::Prepared> prefix;
         if (feed_slots_ && feed_slots_->ArchiveRequired())
             prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch, geometry_.dims()));
-        SnapshotGenerationWriteGuard snapshot_write(this);
+        SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
         bool file_write_started = false;
         try {
             const auto wal_parent_path = chunk->wal_path.parent_path();

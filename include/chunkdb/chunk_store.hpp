@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -967,7 +968,9 @@ class ChunkStore {
 
     class SnapshotGenerationWriteGuard {
       public:
-        explicit SnapshotGenerationWriteGuard(ChunkStore* store);
+        explicit SnapshotGenerationWriteGuard(ChunkStore* store, std::span<const ChunkCoord> coordinates = {});
+        SnapshotGenerationWriteGuard(ChunkStore* store, const ChunkCoord& coordinate)
+            : SnapshotGenerationWriteGuard(store, std::span(&coordinate, 1U)) {}
         ~SnapshotGenerationWriteGuard();
 
         SnapshotGenerationWriteGuard(

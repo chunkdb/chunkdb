@@ -102,6 +102,7 @@ DirectoryBytes SnapshotDirectory(
             (relative == ".chunkdb.lock" ||
              relative == "chunkdb.snapshot" ||
              relative == "chunkdb.snapshot.live" ||
+             relative == "chunkdb.snapshot.changes" ||
              relative.rfind("chunkdb.snapshot.tmp.", 0) == 0)) {
             // A live writer owns these and rewrites them on its own
             // schedule, through temp files that come and go: the heartbeat

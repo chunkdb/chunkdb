@@ -616,7 +616,10 @@ std::uint64_t ChunkStore::CommitTransaction(
 
     // From the intent to its commit form, read-only processes do not take
     // these chunks.
-    SnapshotGenerationWriteGuard snapshot_write(this);
+    std::vector<ChunkCoord> changed_coordinates;
+    changed_coordinates.reserve(changes.size());
+    for (const auto& change : changes) changed_coordinates.push_back(change.target->coord);
+    SnapshotGenerationWriteGuard snapshot_write(this, changed_coordinates);
     bool intent_visible = false;
     try {
         EnsureDirectoryPathExists(intent_dir, /*durable_sync=*/true);

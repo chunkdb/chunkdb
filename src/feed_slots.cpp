@@ -251,7 +251,7 @@ void FeedSlots::RecoverAliases() {
         if (!std::filesystem::exists(live) || !std::filesystem::equivalent(live, segment.wal)) continue;
         // Complete admission precedes every removal, including when one live
         // name aliases an earlier member of a multi-segment archive.
-        ChunkStore::SnapshotGenerationWriteGuard generation(&store_);
+        ChunkStore::SnapshotGenerationWriteGuard generation(&store_, segment.coord);
         std::filesystem::remove(live);
         SyncDirectoryPath(live.parent_path());
         SyncDirectoryPath(segment.wal.parent_path());
