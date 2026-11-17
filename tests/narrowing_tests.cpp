@@ -19,6 +19,7 @@
 #include <utility>
 #include <vector>
 
+#include "change_feed.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/schema.hpp"
@@ -581,6 +582,50 @@ void TestEngineDefaultAndTruncate() {
     }
 }
 
+// Fails the manifest rewrite that ends a narrowing, with the allocation of
+// its fallback failing next.
+struct FailNarrowingEnd final : chunkdb::MigrationTestHook {
+    int admissions = 0;
+    void Run(Point point, std::string_view) override {
+        if (point != Point::kBeforeCatalogAdmission || ++admissions != 2) return;
+        SetEnv("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", "1");
+        throw std::runtime_error("injected failure ending a narrowing");
+    }
+};
+
+// A failure to allocate the fence of a narrowing that cannot be ended comes
+// before the table is closed: the table keeps serving, not busy, and a
+// restart drops the narrowing.
+void TestNarrowingEndFenceAllocationFailureKeepsTable() {
+    ScopedTempDir dir("chunkdb-narrowing-fence-alloc");
+    chunkdb::CatalogConfig config;
+    config.data_dir = dir.path();
+    {
+        chunkdb::TableCatalog catalog(config);
+        (void)catalog.Create("world", GeometryFor(Initial()), {}, Initial());
+        const auto handle = catalog.Find("world");
+        {
+            auto lease = *handle->Acquire();
+            lease.store().SetBlock(9, 9, {{"id", std::uint64_t{700}}});
+        }
+        FailNarrowingEnd hook;
+        catalog.SetMigrationTestHook(&hook);
+        ExpectThrow<std::invalid_argument>(
+            [&] { catalog.NarrowColumn("world", "id", Type(ColumnKind::kUnsigned, 8)); }, "holds 700");
+        catalog.SetMigrationTestHook(nullptr);
+        assert(hook.admissions == 2);
+        // Not left busy: commands on it would wait until a restart.
+        assert(!chunkdb::FeedTestAccess::WaitLingerDraining(*handle, std::chrono::milliseconds(0)));
+        assert(catalog.Find("world") == handle && !catalog.Fence("world"));
+        assert(handle->Info().schema.pending.has_value());
+        auto lease = *handle->Acquire();
+        ExpectRow(lease.store(), 9, 9, Row{std::uint64_t{700}, std::uint64_t{15}, std::monostate{}});
+    }
+    chunkdb::TableCatalog catalog(config);
+    const auto schema = catalog.Find("world")->Info().schema;
+    assert(schema.version == 1U && !schema.pending && schema.columns[0].type == Type(ColumnKind::kUnsigned, 10));
+}
+
 // A crash leaves the narrowing in the manifest; the next open drops it. A
 // failure while reading drops it at once.
 void TestInterruptedNarrowing() {
@@ -635,5 +680,6 @@ int main(int argc, char** argv) {
     TestMisfitIn3D();
     TestNarrowTable();
     TestInterruptedNarrowing();
+    TestNarrowingEndFenceAllocationFailureKeepsTable();
     return 0;
 }

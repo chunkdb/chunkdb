@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- A CREATE TABLE that fails after its table directory is published, including on a failure to allocate memory while the new table is set up, now removes that directory again, or fences the name until RECOVER TABLE or a restart if the directory cannot be removed, instead of leaving the name taken by a table the server does not serve.
+- A failure to allocate memory while ALTER TABLE or TABLESET prepares to reopen a table now leaves the table serving its old definition, instead of leaving it with the new manifest and every later command on it waiting until a restart.
+- A failure to allocate memory while DROP TABLE prepares its fallback now leaves the table served, instead of leaving every later command on it waiting until a restart.
+- A failure to allocate memory while a refused column narrowing that cannot be removed prepares to fence the table now leaves the table served with the narrowing until a restart, instead of leaving every later command on it waiting until a restart.
 - A narrowing refused by a value in a 3D table names its block as `block (x, y, z)`; it used to give two coordinates, with y counted across the chunk's depth.
 - Accept ALTER TABLE ... ADD COLUMN ... REQUIRED without DEFAULT on a table whose chunks hold only chunk metadata, as documented, instead of refusing it as if blocks were present.
 - On Linux and macOS, a writer lock that fails for a reason other than a lock held by another process is reported with that error (`failed to lock writer lock file: <path>: <reason>`) instead of as an active writer.
