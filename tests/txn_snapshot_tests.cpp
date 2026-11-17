@@ -4,6 +4,7 @@
 // racing a registering snapshot is kept.
 
 #include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -20,6 +21,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunk_store_internal.hpp"
+#include "txn_block_stage.hpp"
 #include "txn_test_utils.hpp"
 
 namespace {
@@ -636,6 +638,81 @@ void TestPagedSnapshotAreaMatchesPointScan() {
     }
 }
 
+struct StageAccount final : chunkdb::detail::ChunkStorageAccount {
+    std::size_t bytes = 0U;
+    void Reserve(std::size_t amount) override { bytes += amount; }
+    void Release(std::size_t amount) noexcept override {
+        assert(amount <= bytes);
+        bytes -= amount;
+    }
+};
+
+// A block stage keeps the state it replaces as a physical kept state. A chunk
+// that stage emptied after the snapshot is absent from the population index,
+// yet GET AREA at the snapshot, paged and unpaged, returns its kept state.
+void TestSnapshotAreaReadsPhysicalKeptState() {
+    for (const bool three : {false, true}) for (const bool around : {false, true}) {
+        ScopedTempDir dir("chunkdb-txn-area-index-physical");
+        ChunkStore store(AreaIndexConfig(dir.path(), three));
+        const auto& geometry = store.geometry();
+        const ChunkCoord listed{-2, 0, 0};
+        const ChunkCoord staged{1, 0, 0};
+        WriteAreaBlock(store, listed);
+        auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+        // The staged chunk as the snapshot saw it: one present block.
+        std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U);
+        std::vector<std::uint8_t> presence((geometry.ChunkBlockCount() + 7U) / 8U, 0U);
+        presence[0] = 1U;
+        chunkdb::ChunkVars vars;
+        auto columns = geometry.default_chunk_columns();
+        std::uint64_t version = snapshot->version();
+        std::uint64_t commit_time_ms = 100U;
+        bool written = true;
+        std::size_t present = 1U;
+        chunkdb::TxnBlockSnapshot before;
+        before.row = chunkdb::CaptureTxnBlockRow(geometry.layout(), payload, presence, vars, 0U, before.row.resource());
+        before.version = version;
+        before.commit_time_ms = commit_time_ms;
+        before.written = written;
+        const chunkdb::StoreId table{1U};
+        chunkdb::TxnBlockDeltas journal(table, geometry.layout(), std::pmr::get_default_resource());
+        journal.Publish(journal.Prepare({staged, 0U}, before, chunkdb::TxnBlockAction::kDelete));
+        const std::array views{chunkdb::TxnBlockMutableChunk{staged, payload, presence, &vars, &columns,
+            &version, &commit_time_ms, &written, &present}};
+        auto account = std::make_shared<StageAccount>();
+        {
+            auto stage = chunkdb::PreparedTxnBlockStage::Prepare(journal, table, geometry, views,
+                store.TxnHistoryForTests(), account, chunkdb::kVarMaxChunkBytesLimit);
+            stage.BindHistoryTag(snapshot->version() + 1U);
+            stage.Apply();
+            stage.Commit();
+        }
+        assert(presence[0] == 0U && present == 0U);
+        assert(store.TxnKeptStateCountForTests() == 1U);
+        const auto whole = IndexedArea(store, *snapshot, around);
+        assert(whole.size() == 2U && whole.front().coord == listed && whole.back().coord == staged);
+        assert(whole.back().presence_bitmap.front() == 1U && whole.back().version == snapshot->version());
+        ExpectPointScan(store, *snapshot, around, whole);
+        const auto selector = SnapshotAreaSelector(three, around);
+        for (const std::size_t limit : {std::size_t{1}, std::size_t{2}, std::size_t{7}}) {
+            std::vector<chunkdb::ChunkRangeEntry> entries;
+            std::optional<ChunkCoord> after;
+            for (;;) {
+                const auto page = store.VisitChunkArea(selector, after, limit,
+                    [&](const ChunkCoord&, std::optional<chunkdb::ChunkRangeEntry>&& entry, bool) {
+                        if (entry) entries.push_back(std::move(*entry));
+                        return true;
+                    },
+                    true, snapshot.get());
+                if (!page.has_more) break;
+                after = page.after;
+            }
+            assert(entries.size() == 2U && entries.back().coord == staged);
+            ExpectPointScan(store, *snapshot, around, entries);
+        }
+    }
+}
+
 // Text values at a snapshot.
 chunkdb::TableSchema TextSchema() {
     chunkdb::Column id;
@@ -847,6 +924,7 @@ int main() {
     TestSnapshotAreaWaitsForEmptyingWrite();
     TestSnapshotAreaKeepsOverlayAndEmptyConflicts();
     TestPagedSnapshotAreaMatchesPointScan();
+    TestSnapshotAreaReadsPhysicalKeptState();
     TestTextValuesAtSnapshot();
     TestWriterRacingRegistrationIsKept();
     TestSnapshotAfterWriterVersionSeesTheWrite();

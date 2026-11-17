@@ -461,7 +461,8 @@ bool ChunkStore::AreaChunkMayBePopulated(
     }
     bool populated = false;
     (void)txn_history_->VisitAt(*snapshot, coord, [&](const TxnKeptState& kept) {
-        populated = ChunkPopulated(geometry_, kept.state.presence_bitmap, kept.state.chunk_columns.get());
+        const auto state = kept.View();
+        populated = ChunkPopulated(geometry_, state.presence_bitmap, state.metadata_present, state.metadata_bytes);
     });
     return populated;
 }

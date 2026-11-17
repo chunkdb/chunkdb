@@ -947,6 +947,8 @@ class ChunkStore {
     [[nodiscard]] std::size_t TxnKeptStateCountForTests() const;
     [[nodiscard]] std::size_t TxnKeptBytesForTests() const;
     [[nodiscard]] std::size_t TxnRegisteredCountForTests() const;
+    // The history itself, for tests that stage physical kept states into it.
+    [[nodiscard]] const std::shared_ptr<TxnHistory>& TxnHistoryForTests() const noexcept { return txn_history_; }
     void ArmTxnPauseForTests(TxnPausePoint point);
     [[nodiscard]] bool WaitForTxnPauseForTests(TxnPausePoint point);
     void ResumeTxnForTests(TxnPausePoint point);

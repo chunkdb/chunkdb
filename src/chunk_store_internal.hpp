@@ -7,6 +7,7 @@
 #include <limits>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -155,6 +156,9 @@ void SetBlockPresent(std::vector<std::uint8_t>* presence_bitmap, std::size_t blo
 [[nodiscard]] std::size_t PresentBlockCount(const std::vector<std::uint8_t>& presence_bitmap) noexcept;
 [[nodiscard]] bool ChunkPopulated(const Geometry& geometry, const std::vector<std::uint8_t>& presence_bitmap,
     const ChunkColumnState* chunk_columns) noexcept;
+// Same test over borrowed bytes, such as a retained transaction state view.
+[[nodiscard]] bool ChunkPopulated(const Geometry& geometry, std::span<const std::uint8_t> presence_bitmap,
+    bool metadata_present, std::span<const std::uint8_t> metadata_bytes) noexcept;
 [[nodiscard]] bool ChunkColumnsPopulated(const Geometry& geometry, const ChunkColumnState* chunk_columns) noexcept;
 [[nodiscard]] std::string PresenceBitsText(
     const Geometry& geometry,
