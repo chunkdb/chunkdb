@@ -22,6 +22,7 @@
 #include <future>
 #include <limits>
 #include <mutex>
+#include <new>
 #include <set>
 #include <string>
 #include <thread>
@@ -34,6 +35,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "chunkdb/logging.hpp"
 #include "chunkdb/protocol.hpp"
 #include "../src/chunk_store_internal.hpp"
 #include "checkpoint.hpp"
@@ -1001,6 +1003,73 @@ void TestConditionalCheckpointFailuresDoNotBecomePostCommitErrors() {
             kind, "CHUNKDB_FAILPOINT_CHECKPOINT_BEFORE_IMAGE_REPLACE_ONCE");
         RunConditionalCheckpointFailureCase(
             kind, "CHUNKDB_FAILPOINT_CHECKPOINT_AFTER_IMAGE_REPLACE_ONCE");
+    }
+}
+
+// Fails every post-commit warning of a conditional mutation while it exists.
+class FailingCommittedWarningSink {
+  public:
+    explicit FailingCommittedWarningSink(int* failed) {
+        chunkdb::SetLogSinkForTests([failed](const std::string& line) {
+            if (line.find("conditional mutation committed") != std::string::npos) {
+                ++*failed;
+                throw std::bad_alloc();
+            }
+        });
+    }
+    ~FailingCommittedWarningSink() { chunkdb::ResetLogSinkForTests(); }
+    FailingCommittedWarningSink(const FailingCommittedWarningSink&) = delete;
+    FailingCommittedWarningSink& operator=(const FailingCommittedWarningSink&) = delete;
+};
+
+void RunCommittedWarningFailureCase(
+    ConditionalKind kind,
+    const char* failpoint,
+    bool checkpoint_each_write) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-conditional-warning");
+    auto config = BaseConfig(dir.path());
+    if (checkpoint_each_write) {
+        config.durability_mode = chunkdb::DurabilityMode::kFsyncCheckpoint;
+        config.checkpoint_update_interval = 1;
+    } else {
+        config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+        config.checkpoint_update_interval = 1'000'000;
+        config.checkpoint_wal_bytes = 1'000'000;
+    }
+    const std::string committed =
+        kind == ConditionalKind::kCas ? "11111" : "01010";
+
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "10101");
+        const auto expected = store.GetChunkVersion(0, 0);
+        int failed_warnings = 0;
+        bool threw = false;
+        {
+            FailingCommittedWarningSink sink(&failed_warnings);
+            ScopedEnv fp(failpoint, "1");
+            try {
+                ApplyConditional(kind, &store, expected);
+            } catch (const std::exception&) {
+                threw = true;
+            }
+        }
+        assert(failed_warnings == 1);
+        assert(!threw);
+        assert(store.GetBlockBits(0, 0) == committed);
+    }
+    chunkdb::ChunkStore recovered(config);
+    assert(recovered.GetBlockBits(0, 0) == committed);
+}
+
+void TestConditionalCommittedWarningFailuresKeepTheCommit() {
+    for (const auto kind : {ConditionalKind::kCas, ConditionalKind::kBatch}) {
+        RunCommittedWarningFailureCase(
+            kind, "CHUNKDB_FAILPOINT_CONDITIONAL_INTENT_UNLINK_FAIL_ONCE", false);
+        RunCommittedWarningFailureCase(
+            kind, "CHUNKDB_FAILPOINT_CHECKPOINT_BEFORE_IMAGE_REPLACE_ONCE", true);
+        RunCommittedWarningFailureCase(
+            kind, "CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_END_FAIL_ONCE", false);
     }
 }
 
@@ -2215,6 +2284,7 @@ int main() {
     TestConditionalRollbackFailuresRecoverFailClosed();
     TestConditionalPreCommitFailuresRemainAbsent();
     TestConditionalCheckpointFailuresDoNotBecomePostCommitErrors();
+    TestConditionalCommittedWarningFailuresKeepTheCommit();
     TestBarrierOverflowFallbackSucceeds();
     TestBarrierFailClosedRetainsBookkeeping();
     TestBarrierCoversConcurrentCheckpointReplacement();
