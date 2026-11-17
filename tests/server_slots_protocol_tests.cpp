@@ -165,6 +165,41 @@ struct AckDeadlineIoTestAccess {
         assert(SlotAckDeadlineTestAccess::Excess(*state) == 0U && SlotAckDeadlineTestAccess::Charged(*state) == 0U);
     }
 };
+// The peer must have stopped reading. A fixed send buffer turns off
+// autotuning, and filler bytes fill it, so the next write blocks on every
+// host. The filler corrupts the stream; the peer never reads it again.
+std::size_t FeedDeliveryTestAccess::FillPeerSendQueue(ChunkServer& server, std::uint16_t peer_port) {
+    std::lock_guard lock(server.active_clients_mutex_);
+    for (const auto client : server.active_clients_) {
+        const auto socket = static_cast<slot_socket_test::Socket>(client);
+        sockaddr_in peer{};
+#ifdef _WIN32
+        int length = sizeof(peer);
+#else
+        socklen_t length = sizeof(peer);
+#endif
+        if (getpeername(socket, reinterpret_cast<sockaddr*>(&peer), &length) != 0 || ntohs(peer.sin_port) != peer_port) continue;
+        const int buffer = 65536;
+        if (setsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&buffer), sizeof(buffer)) != 0)
+            throw std::runtime_error("send buffer of the feed socket was not set");
+        // Feed sockets are nonblocking; a provider may take one send larger than its buffer.
+        const std::string filler(1024U * 1024U, 'x');
+        std::size_t filled = 0U;
+        while (filled < 64U * filler.size()) {
+            const auto sent = send(socket, filler.data(), static_cast<int>(filler.size()), 0);
+            if (sent > 0) { filled += static_cast<std::size_t>(sent); continue; }
+            const auto code = server_detail::CurrentSocketErrorCode();
+            if (sent < 0 && server_detail::IsSocketInterruptedError(code)) continue;
+            if (sent < 0 && slot_socket_test::WouldBlock(code)) {
+                std::cout << "feed send queue filled: bytes=" << filled << std::endl;
+                return filled;
+            }
+            throw std::runtime_error("filling the feed send queue failed");
+        }
+        throw std::runtime_error("feed send queue did not fill");
+    }
+    throw std::runtime_error("no server socket for the client port");
+}
 }
 
 namespace {
@@ -565,8 +600,10 @@ class ReconnectSchedule : public FeedDeliveryTestHook {
         if (point == Point::kAfterAdmission && pause_admission_ && bytes >= minimum_ && !admitted_) {
             admitted_ = true; changed_.notify_all();
             changed_.wait(lock, [&] { return admission_released_; });
+        } else if (point == Point::kAfterPartialFeedWrite || point == Point::kAfterBlockedFeedWrite) {
+            stalled_ = true;
         } else if (point == Point::kAfterSlotCancel) {
-            cancelled_ = true; changed_.notify_all();
+            cancelled_ = true; stalled_before_cancel_ = stalled_; changed_.notify_all();
         } else if (point == Point::kBeforeIoScan && pause_cancel_ && cancelled_ && !scanned_) {
             // Cancel's wake follows the scan that decided to close. With the
             // worker held, the next scan observes whether that socket closed.
@@ -585,6 +622,11 @@ class ReconnectSchedule : public FeedDeliveryTestHook {
         Wait(scanned_, "scan after slot cancellation");
         std::lock_guard lock(mutex_);
         if (closed_) throw std::runtime_error("slot socket closed before the held catch-up worker released its claim");
+    }
+    // The output deadline cancels a watch only after its write stalled.
+    void RequireStallBeforeCancel() {
+        std::lock_guard lock(mutex_);
+        if (!stalled_before_cancel_) throw std::runtime_error("slot cancelled before its output stalled");
     }
     void WaitClose() {
         Wait(closed_, "slot socket close");
@@ -611,6 +653,7 @@ class ReconnectSchedule : public FeedDeliveryTestHook {
     std::condition_variable changed_;
     bool admitted_ = false, cancelled_ = false, scanned_ = false, finished_ = false, closed_ = false;
     bool admission_released_ = false, io_released_ = false, finish_released_ = false, closed_before_finish_ = false;
+    bool stalled_ = false, stalled_before_cancel_ = false;
 };
 
 void ReconnectAfterRevoke(bool tls) {
@@ -683,16 +726,20 @@ void ReconnectAfterWriteDeadline(bool tls) {
     const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
     auto replacement = harness.Connect();
     const auto first = Set(*writer, 1); assert(Change(NextChange(*watch)) == first);
+    // The client stops reading. Its full send queue blocks the next frame on
+    // every host, whatever loopback buffering would otherwise absorb.
+    (void)FeedDeliveryTestAccess::FillPeerSendQueue(harness.server(), watch->LocalPort());
     FeedDeliveryTestAccess::SetObserverHook(harness.server(), &schedule);
     Cleanup clear([&] { schedule.Release(); FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
-    // This frame exceeds the watch's share and the socket's send window. The
-    // client stops reading; only the excess-output deadline can cancel it.
+    // This frame exceeds the watch's share; only the excess-output deadline
+    // can cancel its blocked write.
     const std::string payload(2U * 1024U * 1024U, 'x');
     writer->Line("SET BLOCK 0 0 IN t label = $1");
     writer->Send("$" + std::to_string(payload.size()) + "\r\n" + payload + "\r\n");
     (void)Number(writer->Read());
     schedule.WaitAdmission(); FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
     schedule.WaitDeferredClose();
+    schedule.RequireStallBeforeCancel();
     schedule.ReleaseAdmission(); schedule.WaitFinish();
     schedule.ReleaseIo(); FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
     schedule.WaitClose(); // The close hook observes the actual socket close, even with a partial frame.

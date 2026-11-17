@@ -131,8 +131,10 @@ class Client {
 #else
         socklen_t local_length = sizeof(local);
 #endif
-        if (getsockname(socket_, reinterpret_cast<sockaddr*>(&local), &local_length) == 0)
-            endpoint_ = "127.0.0.1:" + std::to_string(ntohs(local.sin_port));
+        if (getsockname(socket_, reinterpret_cast<sockaddr*>(&local), &local_length) == 0) {
+            local_port_ = ntohs(local.sin_port);
+            endpoint_ = "127.0.0.1:" + std::to_string(local_port_);
+        }
         try {
             std::string error;
             if (!server_detail::SetSocketNonBlocking(socket_, true, &error)) Fail(error);
@@ -217,6 +219,7 @@ class Client {
         }
     }
 #endif
+    [[nodiscard]] std::uint16_t LocalPort() const { return local_port_; }
     void SetReceiveBuffer(int bytes) {
 #ifdef _WIN32
         assert(setsockopt(socket_, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<const char*>(&bytes), sizeof(bytes)) == 0);
@@ -337,6 +340,7 @@ class Client {
         throw std::runtime_error(detail);
     }
     std::string endpoint_ = "unbound", peer_ = "unknown", last_request_ = "connect";
+    std::uint16_t local_port_ = 0U;
     int socket_error_ = 0;
     bool wait_expired_ = false;
 #ifdef CHUNKDB_WITH_OPENSSL
