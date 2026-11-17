@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add configurable area and transaction chunk limits, exact area-response byte admission, and cursor paging for GET AREA; expose allocator-aware variable storage through `ChunkVars::Encode()` (#136).
+- Raise the default limits: GET AREA covers up to 4096 requested chunk cells instead of 256 (`--max-area-chunks`), and a transaction writes up to 1024 chunks instead of 64 (`--txn-max-written-chunks`) and reads up to 8192 instead of 1024 (`--txn-max-read-chunks`); recovery bounds a transaction intent by its file size rather than by the current written-chunk limit, so lowering that limit does not block recovery of an intent written before (#136).
 - The first load of a chunk whose large-chunk directory does not exist yet looks up that directory only, no longer the chunk's image and WAL inside it, so a write to a new chunk costs one failing stat instead of three (#139).
 - A relaxed write no longer looks up its chunk's WAL by path when a group-commit flush records the WAL's size as the write's rollback boundary: the open append stream keeps that size, and without one the lookup is a single stat instead of two (#139).
 - Mix coordinate hashes with a process seed across every axis and bound shared large-chunk containers, exposing capacity metrics and a known BUSY refusal for new cache misses (#134).
