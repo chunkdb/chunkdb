@@ -484,6 +484,36 @@ void TestSetOptionsFenceAllocationFailureKeepsTable() {
     assert(handle->Info().options.checkpoint_update_interval == interval + 7U);
 }
 
+// A failure to allocate the fallback of a drop comes before the table is
+// closed: the table keeps serving.
+void TestDropFenceAllocationFailureKeepsTable() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-drop-fence-alloc");
+    TableCatalog catalog(Config(dir.path()));
+    (void)catalog.Create("terrain", kTerrainGeometry, {});
+    WriteBits(catalog, "terrain", 4, 4, "110000011");
+    const auto handle = catalog.Find("terrain");
+#ifdef _WIN32
+    _putenv_s("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", "1");
+#else
+    setenv("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", "1", 1);
+#endif
+    bool failed = false;
+    try {
+        catalog.Drop("terrain");
+    } catch (const std::bad_alloc&) {
+        failed = true;
+    }
+    assert(failed);
+    // Not left busy: commands on it would wait until a restart.
+    assert(!chunkdb::FeedTestAccess::WaitLingerDraining(*handle, std::chrono::milliseconds(0)));
+    assert(catalog.Find("terrain") == handle);
+    assert(!catalog.Fence("terrain"));
+    assert(ReadBits(catalog, "terrain", 4, 4) == "110000011");
+    catalog.Drop("terrain");
+    assert(catalog.Find("terrain") == nullptr);
+    assert(!std::filesystem::exists(dir.path() / "tables" / "terrain"));
+}
+
 // TABLESET changes only the options it names.
 void TestOptionUpdatesArePatches() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-patch");
@@ -1298,6 +1328,7 @@ int main(int argc, char** argv) {
     TestAcquireDuringDropWaitsThenFails();
     TestFailedTableOperationsDoNotHang();
     TestSetOptionsFenceAllocationFailureKeepsTable();
+    TestDropFenceAllocationFailureKeepsTable();
     TestOptionUpdatesArePatches();
     TestSetOptions();
     TestPersistedOptionFlags();

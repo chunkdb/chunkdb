@@ -1919,7 +1919,7 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
         RetireTable(*table, options);
         migration_health_->Check();
     }
-    admission.Dismiss();
+    // Until the version floor is raised, any failure serves the table again.
     // If the drop fails below, the table is reopened as a new store, so its
     // acknowledged batched writes go to the WAL first. A failure here does
     // not stop the drop (a full disk is a reason to drop a table); it only
@@ -1934,17 +1934,15 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
             "table lacks them",
             {{"table", table->name_}, {"error", e.what()}});
     }
-    {
-        // A table created later under this name must not issue this table's
-        // tokens again: the data directory keeps a floor above all of them,
-        // durably before the drop. Failing here fails the drop.
-        ScopeExit restore([&] { table->EndExclusive(std::move(store), options); });
-        RaiseVersionFloor(store->version_clock_ceiling_.load(std::memory_order_acquire));
-        restore.Dismiss();
-    }
-    // Whatever goes wrong below, the table must not stay busy: commands on
-    // it would wait forever. Unless it is served again or gone, it is fenced.
+    // Whatever goes wrong after the floor, the table must not stay busy:
+    // commands on it would wait forever. Unless it is served again or gone,
+    // it is fenced, with a fence made now, while a failure still serves it.
     auto fence = PrepareFence(table, table->name_, kFenceDropUnknown);
+    // A table created later under this name must not issue this table's
+    // tokens again: the data directory keeps a floor above all of them,
+    // durably before the drop. Failing here fails the drop.
+    RaiseVersionFloor(store->version_clock_ceiling_.load(std::memory_order_acquire));
+    admission.Dismiss();
     bool gone = false;
     ScopeExit retire([&] {
         if (gone) RetireTable(*table, options);
