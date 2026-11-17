@@ -1455,10 +1455,12 @@ class ChunkStore {
         bool with_vars,
         std::string* vars_problem, bool include_empty = false, bool identity_only = false);
     [[nodiscard]] std::size_t ChunkRangeEntryCostBytes() const noexcept;
+    [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> CoordinateIndexForArea(const TxnSnapshot* snapshot);
     // Adds the chunk when populated. `vars_bytes` counts the values read so
     // far with `with_vars`; they and max_entries entries share the
     // response-byte limit.
     void AppendPopulatedChunkRangeEntry(
+        const ChunkCoordinateIndex* index,
         const ChunkCoord& coord,
         std::size_t max_entries,
         const char* operation_name,

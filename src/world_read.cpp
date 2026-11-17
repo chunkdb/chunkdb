@@ -432,7 +432,20 @@ std::size_t ChunkStore::ChunkRangeEntryCostBytes() const noexcept {
     return cost;
 }
 
+std::shared_ptr<ChunkCoordinateIndex> ChunkStore::CoordinateIndexForArea(const TxnSnapshot* snapshot) {
+    // A snapshot includes every version issued before it, not only completed
+    // writes. An unfinished included write may still populate a coordinate
+    // the index does not list yet, so the index is used only once every
+    // write through the snapshot has published its membership.
+    if (snapshot != nullptr) {
+        const auto completed = CompletedRevision();
+        if (!completed || snapshot->version() > *completed) return nullptr;
+    }
+    return CoordinateIndexForScan();
+}
+
 void ChunkStore::AppendPopulatedChunkRangeEntry(
+    const ChunkCoordinateIndex* index,
     const ChunkCoord& coord,
     std::size_t max_entries,
     const char* operation_name,
@@ -484,6 +497,24 @@ void ChunkStore::AppendPopulatedChunkRangeEntry(
             entries->push_back(std::move(entry));
             return;
         }
+    }
+    if (index != nullptr && !index->IsPopulationCandidate(coord)) {
+        if (snapshot == nullptr) return;
+        // Every write the snapshot includes has published its membership
+        // (CoordinateIndexForArea), so an unlisted coordinate was empty at
+        // the snapshot unless a later write emptied it. That writer publishes
+        // membership and then the state it replaced under its exclusive
+        // chunk lock, and eviction cannot remove a chunk a writer holds:
+        // the shared lock of a cached chunk makes that kept state visible,
+        // and a cache miss means it already was.
+        if (const auto loaded = TryGetLoadedChunk(coord); loaded != nullptr) {
+            std::shared_lock lock(loaded->mutex);
+        }
+        bool populated = false;
+        (void)txn_history_->VisitAt(*snapshot, coord, [&](const TxnKeptState& kept) {
+            populated = ChunkPopulated(geometry_, kept.state.presence_bitmap, kept.state.chunk_columns.get());
+        });
+        if (!populated) return;
     }
     if (entries->size() < max_entries) {
         ChunkRangeEntry entry;
@@ -550,13 +581,12 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRangeImpl(
 
     std::vector<ChunkRangeEntry> entries;
     std::size_t vars_bytes = 0;
-    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
+    const auto index = CoordinateIndexForArea(snapshot);
     for (std::int64_t chunk_x = chunk_x0;; ++chunk_x) {
         for (std::int64_t chunk_y = chunk_y0;; ++chunk_y) {
             const ChunkCoord coord{chunk_x, chunk_y};
-            if (!index || index->IsPopulationCandidate(coord))
-                AppendPopulatedChunkRangeEntry(
-                    coord, max_entries, "GET AREA", with_vars, &vars_bytes, &entries, snapshot, txn_read);
+            AppendPopulatedChunkRangeEntry(
+                index.get(), coord, max_entries, "GET AREA", with_vars, &vars_bytes, &entries, snapshot, txn_read);
             if (chunk_y == chunk_y1) {
                 break;
             }
@@ -633,7 +663,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadiusImpl(
     // fall outside the int64 domain do not exist and are skipped.
     std::vector<ChunkRangeEntry> entries;
     std::size_t vars_bytes = 0;
-    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
+    const auto index = CoordinateIndexForArea(snapshot);
     for (std::int64_t dx = -radius_chunks; dx <= radius_chunks; ++dx) {
         if (dx < 0 && center_x < std::numeric_limits<std::int64_t>::min() - dx) {
             continue;
@@ -654,9 +684,8 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadiusImpl(
                 break;
             }
             const ChunkCoord coord{chunk_x, center_y + dy};
-            if (!index || index->IsPopulationCandidate(coord))
-                AppendPopulatedChunkRangeEntry(
-                    coord, max_entries, "GET AREA AROUND", with_vars, &vars_bytes, &entries, snapshot, txn_read);
+            AppendPopulatedChunkRangeEntry(index.get(), coord, max_entries, "GET AREA AROUND", with_vars,
+                &vars_bytes, &entries, snapshot, txn_read);
         }
     }
     return entries;

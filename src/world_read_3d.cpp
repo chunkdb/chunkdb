@@ -84,14 +84,13 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRange3DImpl(
     const auto max_entries = kMaxChunkRangeResponseBytes / ChunkRangeEntryCostBytes();
     std::vector<ChunkRangeEntry> entries;
     std::size_t vars_bytes = 0U;
-    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
+    const auto index = CoordinateIndexForArea(snapshot);
     for (auto x = x0;; ++x) {
         for (auto y = y0;; ++y) {
             for (auto z = z0;; ++z) {
                 const ChunkCoord coord{x, y, z};
-                if (!index || index->IsPopulationCandidate(coord))
-                    AppendPopulatedChunkRangeEntry(coord, max_entries, "GET AREA", with_vars,
-                        &vars_bytes, &entries, snapshot, txn_read);
+                AppendPopulatedChunkRangeEntry(index.get(), coord, max_entries, "GET AREA", with_vars,
+                    &vars_bytes, &entries, snapshot, txn_read);
                 if (z == z1) break;
             }
             if (y == y1) break;
@@ -131,7 +130,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadius3DImpl(
     const auto max_entries = kMaxChunkRangeResponseBytes / ChunkRangeEntryCostBytes();
     std::vector<ChunkRangeEntry> entries;
     std::size_t vars_bytes = 0U;
-    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
+    const auto index = CoordinateIndexForArea(snapshot);
     VisitBallRows(radius_chunks, [&](std::int64_t dx, std::int64_t dy, std::int64_t half_z) {
         std::int64_t x = 0, y = 0;
         if (!AddOffset(cx, dx, &x) || !AddOffset(cy, dy, &y)) return;
@@ -139,9 +138,8 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkRadius3DImpl(
             std::int64_t z = 0;
             if (!AddOffset(cz, dz, &z)) continue;
             const ChunkCoord coord{x, y, z};
-            if (!index || index->IsPopulationCandidate(coord))
-                AppendPopulatedChunkRangeEntry(coord, max_entries, "GET AREA AROUND", with_vars,
-                    &vars_bytes, &entries, snapshot, txn_read);
+            AppendPopulatedChunkRangeEntry(index.get(), coord, max_entries, "GET AREA AROUND", with_vars,
+                &vars_bytes, &entries, snapshot, txn_read);
         }
     });
     return entries;
