@@ -187,7 +187,11 @@ void Scan(bool tls, unsigned dims) {
         const auto metadata_only = client->Command("GET CHUNK " + zero + " FROM t" + projection).value;
         for (const auto* since : {"", " SINCE 0"}) {
             const auto rows = ScanRows(*client, dims, std::string(since) + " WITH DATA" + projection);
-            assert(rows.size() == (std::string_view(since).empty() ? 2U : 3U));
+            std::vector<long long> coordinates;
+            for (const auto& row : rows) coordinates.push_back(std::stoll(row.items[0].value));
+            std::sort(coordinates.begin(), coordinates.end());
+            assert(coordinates == (std::string_view(since).empty() ? std::vector<long long>{-1, 0}
+                                                                    : std::vector<long long>{-1, 0, 1}));
             for (const auto& row : rows) {
                 const auto coordinate = std::stoll(row.items[0].value);
                 for (unsigned axis = 0; axis < dims; ++axis)
@@ -220,12 +224,12 @@ int main(int argc, char** argv) {
     const std::string_view selected = argc == 2 ? argv[1] : "";
     unsigned passed = 0, total = 0, skipped = 0;
     for (const bool tls : {false, true}) {
-#ifndef CHUNKDB_WITH_OPENSSL
-        if (tls) { skipped += 6U; continue; }
-#endif
         for (const unsigned dims : {2U, 3U}) {
             const auto run = [&](std::string_view name, auto function) {
                 if (!selected.empty() && selected != name) return;
+#ifndef CHUNKDB_WITH_OPENSSL
+                if (tls) { ++skipped; return; }
+#endif
                 ++total;
                 const auto label = std::string(tls ? "TLS " : "plain ") + std::to_string(dims) + "D " + std::string(name);
                 std::cout << label << std::endl;
