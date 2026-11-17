@@ -781,6 +781,23 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME feed_slots_shares COMMAND chunkdb_server_slots_protocol_test --shares-only)
     set_tests_properties(feed_slots_shares PROPERTIES TIMEOUT 120 LABELS "smoke")
 
+    add_executable(chunkdb_server_chunk_model_protocol_test
+        tests/server_chunk_model_protocol_tests.cpp
+        src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
+        src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+    )
+    target_link_libraries(chunkdb_server_chunk_model_protocol_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_server_chunk_model_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(chunkdb_server_chunk_model_protocol_test PRIVATE ws2_32)
+    endif()
+    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+        target_link_libraries(chunkdb_server_chunk_model_protocol_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_server_chunk_model_protocol_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+    endif()
+    add_test(NAME server_chunk_model_protocol COMMAND chunkdb_server_chunk_model_protocol_test)
+    set_tests_properties(server_chunk_model_protocol PROPERTIES TIMEOUT 120 LABELS "smoke")
+
     add_executable(chunkdb_server_channel_binding_test
         tests/server_channel_binding_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
@@ -1135,6 +1152,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_server_integration_test
         chunkdb_feed_completed_prefix_reader_test
         chunkdb_server_slots_protocol_test
+        chunkdb_server_chunk_model_protocol_test
         chunkdb_server_channel_binding_test
         chunkdb_server_migrations_protocol_test
         chunkdb_server_slots_process_test
