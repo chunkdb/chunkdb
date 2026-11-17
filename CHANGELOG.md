@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A narrowing refused by a value in a 3D table names its block as `block (x, y, z)`; it used to give two coordinates, with y counted across the chunk's depth.
+- Accept ALTER TABLE ... ADD COLUMN ... REQUIRED without DEFAULT on a table whose chunks hold only chunk metadata, as documented, instead of refusing it as if blocks were present.
 - On Linux and macOS, a writer lock that fails for a reason other than a lock held by another process is reported with that error (`failed to lock writer lock file: <path>: <reason>`) instead of as an active writer.
 - Check a login's credentials when AUTH finishes it, not only at HELLO: a login whose user got a new verifier, was dropped or created again, or, for an unbound login, got REQUIRE CHANNEL BINDING in between fails with the AUTH_FAILED of a wrong password.
 - A schema push from WATCH ... SLOT carries the table's `dims` and the chunk columns of its schema version, where it sent `dims=2` and empty `chunk_columns` for three-dimensional tables and tables with CHUNK COLUMNS.
