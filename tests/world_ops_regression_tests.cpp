@@ -1093,6 +1093,86 @@ void TestConditionalCommittedWarningFailuresKeepTheCommit() {
     }
 }
 
+// Throws a value that is not a std::exception from one post-commit step: the
+// intent directory sync after its unlink, or an inline checkpoint directory sync.
+void RunCommittedNonStdFailureCase(ConditionalKind kind, bool checkpoint_each_write) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-conditional-nonstd");
+    auto config = BaseConfig(dir.path());
+    if (checkpoint_each_write) {
+        config.durability_mode = chunkdb::DurabilityMode::kFsyncCheckpoint;
+        config.checkpoint_update_interval = 1;
+    } else {
+        config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+        config.checkpoint_update_interval = 1'000'000;
+        config.checkpoint_wal_bytes = 1'000'000;
+    }
+    const std::string committed =
+        kind == ConditionalKind::kCas ? "11111" : "01010";
+
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "10101");
+        const auto expected = store.GetChunkVersion(0, 0);
+        const chunkdb::ChunkCoord coord;
+        const auto root = std::filesystem::weakly_canonical(dir.path());
+        const auto intent = chunkdb::ConditionalIntentPathForWal(
+            root, chunkdb::ChunkWalPath(root, store.geometry(), coord));
+        const auto image_dir = chunkdb::ChunkDataPath(root, store.geometry(), coord).parent_path();
+        int injected = 0;
+        bool intent_seen = false;
+        bool intent_cleared = false;
+        bool threw = false;
+        {
+            struct ResetObservers {
+                ~ResetObservers() {
+                    chunkdb::SetDirectorySyncObserverForTests({});
+                }
+            } reset;
+            chunkdb::SetDirectorySyncObserverForTests([&](const std::filesystem::path& path) {
+                if (injected != 0) return;
+                if (intent_cleared) {
+                    // Past the commit point only the inline checkpoint
+                    // syncs the image directory.
+                    if (checkpoint_each_write && path == image_dir) {
+                        ++injected;
+                        throw 7;
+                    }
+                    return;
+                }
+                if (path != intent.parent_path()) return;
+                // The first sync without the intent after it was written
+                // follows its unlink, past the commit point.
+                if (std::filesystem::exists(intent)) {
+                    intent_seen = true;
+                } else if (intent_seen) {
+                    intent_cleared = true;
+                    if (!checkpoint_each_write) {
+                        ++injected;
+                        throw 7;
+                    }
+                }
+            });
+            try {
+                ApplyConditional(kind, &store, expected);
+            } catch (...) {
+                threw = true;
+            }
+        }
+        assert(injected == 1);
+        assert(!threw);
+        assert(store.GetBlockBits(0, 0) == committed);
+    }
+    chunkdb::ChunkStore recovered(config);
+    assert(recovered.GetBlockBits(0, 0) == committed);
+}
+
+void TestConditionalCommittedNonStdFailuresKeepTheCommit() {
+    for (const auto kind : {ConditionalKind::kCas, ConditionalKind::kBatch}) {
+        RunCommittedNonStdFailureCase(kind, false);
+        RunCommittedNonStdFailureCase(kind, true);
+    }
+}
+
 // ---- WALFLUSH overflow fallback --------------------------------------------
 
 // Records the files synced through SyncFilePath while it exists.
@@ -2305,6 +2385,7 @@ int main() {
     TestConditionalPreCommitFailuresRemainAbsent();
     TestConditionalCheckpointFailuresDoNotBecomePostCommitErrors();
     TestConditionalCommittedWarningFailuresKeepTheCommit();
+    TestConditionalCommittedNonStdFailuresKeepTheCommit();
     TestBarrierOverflowFallbackSucceeds();
     TestBarrierFailClosedRetainsBookkeeping();
     TestBarrierCoversConcurrentCheckpointReplacement();
