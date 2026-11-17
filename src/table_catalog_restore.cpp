@@ -10,6 +10,7 @@
 #include "chunkdb/logging.hpp"
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
+#include "feed_slot_records.hpp"
 #include "file_permissions.hpp"
 #include "store_manifest.hpp"
 #include "verify.hpp"
@@ -210,6 +211,23 @@ std::string MovedPath(const std::string& path, const std::string& from, const st
     return to + path.substr(from.size());
 }
 
+// Marks every slot recorded in `dir` so that its next watch starts with
+// resync, durably. Returns the records it replaced, if it replaced any.
+std::optional<FeedSlotRecords> RequireSlotResync(const std::filesystem::path& dir, const StoreId& epoch, std::uint8_t dims) {
+    auto records = ReadFeedSlotRecords(dir, epoch, dims);
+    if (!records) return std::nullopt;
+    auto marked = *records;
+    bool changed = false;
+    for (auto& slot : marked.slots) {
+        if (slot.lost || slot.resync) continue;
+        slot.resync = true;
+        changed = true;
+    }
+    if (!changed) return std::nullopt;
+    WriteFeedSlotRecords(dir, marked);
+    return records;
+}
+
 }  // namespace
 
 void TableCatalog::SwapTables(std::string_view first, std::string_view second, std::stop_token cancelled) {
@@ -217,6 +235,10 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
     RequireValidTableName(first);
     RequireValidTableName(second);
     if (first == second) throw std::invalid_argument("SWAP TABLES needs two different tables");
+#ifdef _WIN32
+    // Windows has no atomic directory exchange: refuse before closing anything.
+    throw std::runtime_error("SWAP TABLES needs an atomic directory exchange, which Windows does not have");
+#endif
     // As RecoverTable: feature activation and backup metadata capture and
     // pinning exclude a swap, so a backup copies both names before or after.
     if (!feature_metadata_gate_.lock_shared(cancelled)) throw std::runtime_error("SWAP TABLES cancelled");
@@ -280,12 +302,35 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
         return std::shared_ptr<Table>(new Table(names[name], dirs[name], store_id, std::move(geometry), table_options,
             std::move(store), config_.feed_buffer_bytes, migration_health_, config_.feed_linger));
     };
-    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_BEFORE_EXCHANGE_ONCE");
-    const auto exchanged = ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SWAP_TABLES_EXCHANGE_UNSUPPORTED_ONCE")
-        ? std::make_error_code(std::errc::function_not_supported) : ExchangeDirectories(dirs[0], dirs[1]);
-    if (exchanged) {
+    // After the exchange each slot is reached by another name, so its
+    // consumer must resync. The marks are durable before the exchange, so no
+    // crash loses them; a crash before it leaves only an extra resync.
+    std::array<std::optional<FeedSlotRecords>, 2U> slot_records;
+    std::error_code exchanged;
+    std::exception_ptr failure;
+    try {
+        for (std::size_t i = 0; i < dirs.size(); ++i)
+            slot_records[i] = RequireSlotResync(dirs[i], tables[i]->store_id(), tables[i]->geometry().dims());
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SWAP_TABLES_SLOT_MARK_FAIL_ONCE"))
+            throw std::runtime_error("injected failure marking swapped slots");
+        CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_BEFORE_EXCHANGE_ONCE");
+        exchanged = ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SWAP_TABLES_EXCHANGE_UNSUPPORTED_ONCE")
+            ? std::make_error_code(std::errc::function_not_supported) : ExchangeDirectories(dirs[0], dirs[1]);
+    } catch (const std::exception&) {
+        failure = std::current_exception();
+    }
+    if (exchanged || failure) {
         // Nothing moved: both tables serve again as they were.
         for (std::size_t i = 0; i < stores.size(); ++i) {
+            if (slot_records[i]) {
+                try {
+                    WriteFeedSlotRecords(dirs[i], *slot_records[i]);
+                } catch (const std::exception& error) {
+                    LogMessage(LogLevel::kWarn, LogComponent::kStore,
+                        "slots of a table whose swap failed could not be restored; their next watch resyncs",
+                        {{"table", names[i]}, {"error", error.what()}});
+                }
+            }
             try {
                 auto store = OpenStore(names[i], dirs[i], tables[i]->geometry().config(), 0U, options[i]);
                 store->AdoptUnsynced(*unsynced[i]);
@@ -298,6 +343,7 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
                 FenceTable(*tables[i], options[i], std::move(fences[i]));
             }
         }
+        if (failure) std::rethrow_exception(failure);
         throw std::runtime_error("SWAP TABLES needs an atomic directory exchange, which was refused: " + exchanged.message());
     }
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_EXCHANGE_ONCE");

@@ -62,6 +62,7 @@ It marks a sender-drained revision; slot progress also stays within the durable 
 - A terminal error closes the watch; acknowledgements arriving after termination do not replace that error.
 
 A slot is a named consumer that retains changes until its saved acknowledgement advances.
+A restore or SWAP TABLES moves a slot away from its consumer's position, so its next watch without AFTER starts with resync until an acknowledgement passes it; a watch with AFTER follows the epoch and lineage rules above.
 Create it with fixed AREA, COLUMNS, NO BEFORE, or CHUNKS filters when a consumer needs a restricted stream.
 WATCH inherits these filters; changing them requires a different slot.
 Projection IDs survive renames, but dropping a projected column makes its slot lost with `reason=schema_filter`.

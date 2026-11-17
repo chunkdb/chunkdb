@@ -111,6 +111,13 @@ void CopyAndResync(bool tls) {
         assert(resync && resync->bytes->find("resync") != std::string::npos);
         assert(resync->bytes->find("$32\r\n" + old_epoch + "\r\n:" + std::to_string(cut) + "\r\n") != std::string::npos);
         session.slot_watch->Cancel(); session.slot_watch->WorkStep(); session.slot_watch.reset();
+        // The restored slot is at the cut, not at its consumer's position.
+        SessionState saved; (void)engine.Execute(saved, "HELLO 3");
+        assert(engine.Execute(saved, "WATCH t SLOT 'consumer'") == start);
+        saved.slot_watch->Activate(); saved.slot_watch->WorkStep();
+        const auto moved = saved.slot_watch->Take(SIZE_MAX);
+        assert(moved && moved->bytes->find("resync") != std::string::npos);
+        saved.slot_watch->Cancel(); saved.slot_watch->WorkStep(); saved.slot_watch.reset();
         SessionState exact; (void)engine.Execute(exact, "HELLO 3");
         assert(engine.Execute(exact, "WATCH t SLOT 'consumer' AFTER " + old_epoch + " " + std::to_string(cut)) == start);
         exact.slot_watch->Activate(); exact.slot_watch->WorkStep();
@@ -259,6 +266,15 @@ void RestoreStatement() {
     assert(Field(described, "epoch").value == Field(reply, "epoch").value);
     const auto slots = harness.catalog->Find("t_restored")->ListFeedSlots();
     assert(slots.size() == 1U && slots[0].name == "consumer" && slots[0].position.revision == cut);
+    // The restored slot is at the cut, not at its consumer's position: a
+    // watch without AFTER starts with resync.
+    {
+        auto watcher = harness.Connect();
+        assert(Start(watcher->Command("WATCH t_restored SLOT 'consumer'")) == std::make_pair(Field(reply, "epoch").value, cut));
+        const auto resync = watcher->Read();
+        assert(resync.type == '>' && resync.items[0].value == "resync" && resync.items[1].value == Field(reply, "epoch").value);
+        Unwatch(*watcher);
+    }
 
     Error(admin->Command(restore + " AS t_restored"), "TABLE_EXISTS");
     Error(admin->Command(restore), "TABLE_EXISTS");
@@ -307,11 +323,26 @@ void SwapStatement() {
     Harness harness(false, true, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
     auto admin = harness.Connect();
     admin->Ok("CREATE TABLE t (n u8) CHUNK 2 x 2");
+    admin->Ok("CREATE SLOT 'consumer' ON t");
     (void)admin->Command("SET BLOCK 0 0 IN t n = 7");
     (void)admin->Command(Backup("snap"));
     (void)admin->Command("SET BLOCK 0 0 IN t n = 8");
     const auto restored = Field(admin->Command("RESTORE TABLE t FROM 'snap' AS t_restored"), "epoch").value;
     const auto live = StoreIdHex(harness.catalog->Find("t")->store_id());
+#ifdef _WIN32
+    // Windows has no atomic directory exchange; both tables keep their names.
+    Error(admin->Command("SWAP TABLES t, t_restored"), "INTERNAL");
+    assert(Field(admin->Command("DESCRIBE t"), "epoch").value == live);
+    return;
+#endif
+    // The live table's slot is consumed and acknowledged under its own name.
+    auto watcher = harness.Connect();
+    (void)Start(watcher->Command("WATCH t SLOT 'consumer'"));
+    const auto acked = Number(admin->Command("SET BLOCK 1 1 IN t n = 3"));
+    while (Change(NextChange(*watcher)) < acked) {}
+    watcher->Line("ACK " + std::to_string(acked));
+    Unwatch(*watcher);
+    WaitAck(*admin, "t", "consumer", acked);
 
     auto txn = harness.Connect();
     txn->Ok("BEGIN");
@@ -323,6 +354,33 @@ void SwapStatement() {
     assert(Field(admin->Command("DESCRIBE t_restored"), "epoch").value == live);
     assert(Number(admin->Command("GET BLOCK 0 0 FROM t").items.at(0)) == 7U);
     assert(Number(admin->Command("GET BLOCK 0 0 FROM t_restored").items.at(0)) == 8U);
+
+    // Each name now reaches another table's slot, so a watch without AFTER
+    // resyncs, until the consumer acknowledges a change after the resync.
+    for (const auto& [table, epoch] : {std::pair{std::string("t"), restored}, std::pair{std::string("t_restored"), live}}) {
+        assert(Start(watcher->Command("WATCH " + table + " SLOT 'consumer'")).first == epoch);
+        const auto resync = watcher->Read();
+        assert(resync.type == '>' && resync.items[0].value == "resync" && resync.items[1].value == epoch);
+        Unwatch(*watcher);
+    }
+    assert(Start(watcher->Command("WATCH t_restored SLOT 'consumer'")) == std::make_pair(live, acked));
+    assert(watcher->Read().items.at(0).value == "resync");
+    const auto after_swap = Number(admin->Command("SET BLOCK 1 1 IN t_restored n = 4"));
+    assert(Change(NextChange(*watcher)) == after_swap);
+    watcher->Line("ACK " + std::to_string(after_swap));
+    Unwatch(*watcher);
+    WaitAck(*admin, "t_restored", "consumer", after_swap);
+    assert(Start(watcher->Command("WATCH t_restored SLOT 'consumer'")) == std::make_pair(live, after_swap));
+    const auto resumed = Number(admin->Command("SET BLOCK 1 1 IN t_restored n = 5"));
+    assert(Change(NextChange(*watcher)) == resumed);
+    Unwatch(*watcher);
+    // A consumer naming its own position keeps it: the exact fork continues.
+    const auto fork = Start(watcher->Command("WATCH t SLOT 'consumer' AFTER " + live + " " +
+        std::to_string(harness.catalog->Find("t")->lineage()->fork_revision)));
+    assert(fork.first == restored);
+    const auto on_restored = Number(admin->Command("SET BLOCK 1 1 IN t n = 6"));
+    assert(Change(NextChange(*watcher)) == on_restored);
+    Unwatch(*watcher);
 
     Error(admin->Command("SWAP TABLES t, t"), "INVALID_ARGUMENT");
     Error(admin->Command("SWAP TABLES t, absent"), "NO_TABLE");

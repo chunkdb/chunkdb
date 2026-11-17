@@ -420,7 +420,8 @@ bool FeedSlots::FlushAcks(bool force, std::chrono::steady_clock::time_point now)
     for (auto& slot : next.slots) {
         const auto pending = acknowledgements_->pending.find(slot.name);
         if (slot.lost || pending == acknowledgements_->pending.end() || pending->second > next.durable_watermark) continue;
-        if (pending->second > slot.written) { slot.written = pending->second; changed = true; }
+        // An acknowledgement past the position follows the resync a watch sent first.
+        if (pending->second > slot.written) { slot.written = pending->second; slot.resync = false; changed = true; }
     }
     if (changed) {
         Persist(std::move(next));
@@ -472,6 +473,7 @@ std::vector<FeedSlot> FeedSlots::List(bool include_lost) const {
     for (const auto& slot : records_.slots) {
         if (slot.lost && !include_lost) continue;
         result.push_back({slot.name, {records_.epoch, slot.written}, records_.durable_watermark, retained[result.size()], slot.lost, slot.filters, slot.schema_filter_lost, slot.owner});
+        result.back().resync = slot.resync;
     }
     return result;
 }
@@ -481,7 +483,9 @@ FeedSlot FeedSlots::Get(std::string_view name) const {
     const auto it = std::find_if(records_.slots.begin(), records_.slots.end(),
         [&](const auto& slot) { return slot.name == name; });
     if (it == records_.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
-    return {it->name, {records_.epoch, it->written}, records_.durable_watermark, 0U, it->lost, it->filters, it->schema_filter_lost, it->owner};
+    FeedSlot slot{it->name, {records_.epoch, it->written}, records_.durable_watermark, 0U, it->lost, it->filters, it->schema_filter_lost, it->owner};
+    slot.resync = it->resync;
+    return slot;
 }
 FeedArchiveReader FeedSlots::Reader(FeedPosition after) {
     std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);

@@ -50,7 +50,7 @@ Stop any server intended to use that destination first.
 A server started without `--read-only` refuses a backup directory.
 
 Restored tables receive new epochs, meaning new identities for feed consumers.
-Saved slot names start at their restored table cuts, without previous archived history.
+Saved slot names start at their restored table cuts, without previous archived history; a slot's next watch without AFTER starts with resync.
 Each table records its immediate parent epoch and backup cut as its **lineage**.
 
 Consumers exactly at that parent cut can continue when the completed cut or retained history proves no changes are missing.

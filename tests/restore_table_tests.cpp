@@ -323,6 +323,59 @@ void SwapRefusals() {
     swapped.Check(false);
     Verified(swapped.source.data);
 }
+
+#ifdef _WIN32
+constexpr bool kAtomicExchange = false;
+#else
+constexpr bool kAtomicExchange = true;
+#endif
+
+// Whether the one slot of `table` starts its next watch without AFTER with resync.
+bool Resyncs(TableCatalog& catalog, std::string_view table) {
+    const auto slots = catalog.Require(table)->ListFeedSlots();
+    assert(slots.size() == 1U);
+    return slots[0].resync;
+}
+
+// A restored slot and both tables' slots after a swap start their next watch
+// without AFTER with resync; a refused swap leaves the slots as they were.
+void SwapMarksSlots() {
+    Swapped swapped{Source()};
+    auto& catalog = swapped.catalog;
+    assert(!Resyncs(catalog, "t") && Resyncs(catalog, "t_restored"));
+    for (const auto* point : {"CHUNKDB_FAILPOINT_SWAP_TABLES_EXCHANGE_UNSUPPORTED_ONCE", "CHUNKDB_FAILPOINT_SWAP_TABLES_SLOT_MARK_FAIL_ONCE"}) {
+        txn_test::ScopedEnv refuse(point, "1");
+        Throws([&] { catalog.SwapTables("t", "t_restored"); });
+        assert(catalog.Fences().empty());
+        swapped.Check(false);
+        assert(!Resyncs(catalog, "t") && Resyncs(catalog, "t_restored"));
+    }
+    catalog.SwapTables("t", "t_restored");
+    swapped.Check(true);
+    assert(Resyncs(catalog, "t") && Resyncs(catalog, "t_restored"));
+}
+
+// The marks are durable: a restart keeps them.
+void SwapMarksSurviveRestart() {
+    Source source;
+    {
+        TableCatalog catalog(source.Config());
+        (void)catalog.RestoreTable(source.Request());
+        catalog.SwapTables("t", "t_restored");
+    }
+    TableCatalog catalog(source.Config());
+    assert(Resyncs(catalog, "t") && Resyncs(catalog, "t_restored"));
+}
+
+// Windows has no atomic directory exchange: SWAP TABLES is refused before
+// anything closes, and both tables keep serving.
+void SwapRefusedOnWindows() {
+    Swapped swapped{Source()};
+    assert(Throws([&] { swapped.catalog.SwapTables("t", "t_restored"); }).find("Windows") != std::string::npos);
+    assert(swapped.catalog.Fences().empty());
+    swapped.Check(false);
+    assert(!Resyncs(swapped.catalog, "t"));
+}
 }  // namespace
 
 int main() {
@@ -332,9 +385,15 @@ int main() {
     DamagedBackups();
     InjectedFailures();
     Cancellation();
-    SwapsNames();
-    SwapSurvivesRestart();
-    FeedAfterSwap();
-    SwapRefusals();
+    if (kAtomicExchange) {
+        SwapsNames();
+        SwapSurvivesRestart();
+        FeedAfterSwap();
+        SwapRefusals();
+        SwapMarksSlots();
+        SwapMarksSurviveRestart();
+    } else {
+        SwapRefusedOnWindows();
+    }
     std::cout << "restore table tests passed\n";
 }

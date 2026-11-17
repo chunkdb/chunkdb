@@ -49,7 +49,7 @@ SWAP takes the feature and backup metadata gates shared, as RECOVER TABLE does, 
 It then takes the tables' DDL locks and exclusive access in name order, so two swaps of overlapping tables cannot deadlock, then the catalog's table operations.
 It waits for running statements on both tables, makes their acknowledged writes durable with a WAL barrier and closes both stores; files a closing store leaves unsynced are carried to the reopened store under the new path.
 One atomic directory exchange then swaps `tables/t` and `tables/t_restored` (`renameat2(RENAME_EXCHANGE)` on Linux, `renamex_np(RENAME_SWAP)` on macOS).
-A platform or file system without an atomic exchange refuses the swap and reopens both tables unchanged; there is no non-atomic fallback.
+A file system without an atomic exchange refuses the swap and reopens both tables unchanged; Windows refuses it before closing either table; there is no non-atomic fallback.
 After the exchange the parent directory is synced and each store is reopened under its new name as a new table object.
 A crash at any point leaves both directories under their old names or both exchanged; each directory is a complete table.
 A failure after the exchange that leaves a name unserved fences that name until RECOVER TABLE or a restart.
@@ -61,6 +61,9 @@ Watches of either table end with INTERNAL `watched table was swapped; watch it a
 A consumer resumes by name with its saved epoch and revision; the name now reaches another epoch, so the feed answers by lineage.
 A position in the parent epoch exactly at the fork revision continues on the restored table while the change feed rules prove no change is missing; any other position receives resync.
 A durable slot belongs to its table's data, so it moves with the data; a restored table's slots start at the cut.
+A slot's saved position then no longer matches its consumer, so the restore marks each slot to resync, and the swap marks both tables' slots durably before the exchange.
+A watch without AFTER on a marked slot starts with resync; one with AFTER follows the epoch and lineage rules; an acknowledgement past the position clears the mark.
+A crash before the exchange leaves the marks, costing one extra resync; a refused exchange puts the slot records back.
 
 ## Checks
 
@@ -69,4 +72,5 @@ Catalog tests restore into a new name, compare chunks, versions, tombstones and 
 Failure tests inject copy, verification and publication failures and show that no table or staging directory remains.
 Subprocess crash tests stop at every restore step and every swap step; the restarted catalog has the table completely or not at all, and both names or neither exchanged.
 Feed tests watch a swapped name from the old epoch and receive resync, or continue from the exact fork revision.
+Slot tests watch restored and swapped slots without AFTER and receive resync until an acknowledgement, and check the marks after each swap crash point and a refused swap.
 `chunkdb_verify` needs no new checks: restore and swap create no new file kinds.

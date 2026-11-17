@@ -110,6 +110,8 @@ void SwapCrashes(const std::string& executable) {
                 assert(copy->store_id() == restored && live->store_id() == source.epoch);
                 assert(copy->Acquire()->store().GetBlockBits(8, 0) == "00000011");
                 assert(live->Acquire()->store().GetBlockBits(8, 0) == "11111111");
+                // The slots were marked before the exchange: every crash point keeps the marks.
+                assert(copy->ListFeedSlots().at(0).resync && live->ListFeedSlots().at(0).resync);
                 // The swap can run again after the restart.
                 catalog.SwapTables("t", "t_restored");
                 assert(catalog.Require(exchanged ? "t_restored" : "t")->store_id() == restored);
@@ -135,6 +137,16 @@ int main(int argc, char** argv) {
         return 3;
     }
     Crashes(argv[0]);
+#ifdef _WIN32
+    // Windows refuses SWAP TABLES before it closes anything.
+    constexpr bool kAtomicExchange = false;
+#else
+    constexpr bool kAtomicExchange = true;
+#endif
+    if (!kAtomicExchange) {
+        std::cout << "16 restore table crash cases passed\n";
+        return 0;
+    }
     SwapCrashes(argv[0]);
     std::cout << "16 restore table and 6 swap tables crash cases passed\n";
 }

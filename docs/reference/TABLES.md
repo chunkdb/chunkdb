@@ -169,6 +169,7 @@ SWAP TABLES exchanges two tables' names in one atomic step; data, epochs, lineag
 It waits for running statements and backups on both tables and makes their acknowledged writes durable first.
 Open transactions on either table answer CONFLICT, and watches of either table end with INTERNAL `watched table was swapped; watch it again`.
 A consumer that watches the name again sees another epoch, so it resumes by [lineage](../CHANGE_FEED.md) or rebuilds.
+Each slot of either table is then reached by another name, so its next watch without AFTER starts with resync.
 A failure after the exchange fences the names it leaves unserved until RECOVER TABLE.
 
 A failure that leaves a table out of service fences it, while other tables keep serving.

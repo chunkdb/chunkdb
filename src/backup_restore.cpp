@@ -195,7 +195,10 @@ StoreId RebindRestoredTable(const std::filesystem::path& directory, const Backup
     RewriteRetainedIndex(directory, geometry, old_epoch, new_epoch);
     if (auto slots = ReadFeedSlotRecords(directory, old_epoch, geometry.dims())) {
         slots->epoch = new_epoch; slots->durable_watermark = cut.revision;
-        for (auto& slot : slots->slots) { slot.written = cut.revision; slot.lost = slot.schema_filter_lost; }
+        // A consumer's position is not the cut: its next watch resyncs.
+        for (auto& slot : slots->slots) {
+            slot.written = cut.revision; slot.lost = slot.schema_filter_lost; slot.resync = !slot.lost;
+        }
         WriteFeedSlotRecords(directory, *slots);
     }
     // The verified backup contains every committed image/WAL/slot at
