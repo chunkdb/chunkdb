@@ -7,6 +7,8 @@
 #include <span>
 #include <vector>
 
+#include "chunkdb/chunk_storage_allocator.hpp"
+
 namespace chunkdb {
 
 // The values of a chunk's variable-length columns (text and bytes;
@@ -46,10 +48,12 @@ struct VarChange {
 };
 
 // The values of one chunk, sorted by key, at most one per key. Held as the
-// encoded VARS section itself plus one u32 offset per entry, so its memory
-// is its encoded size plus 4 bytes per value.
+// encoded VARS section itself plus one u32 offset per entry. Backing buffers
+// also retain capacity and allocation bookkeeping.
 class ChunkVars {
   public:
+    using EncodedStorage = std::vector<std::uint8_t, detail::ChunkStorageAllocator<std::uint8_t>>;
+    ChunkVars() = default;
     struct Entry {
         VarKey key{};
         std::span<const std::uint8_t> value{};
@@ -112,7 +116,8 @@ class ChunkVars {
 
     // The VARS section: for each entry in ascending key order, column_id
     // u32le, block_index u32le, byte_length u32le, then the value bytes.
-    [[nodiscard]] const std::vector<std::uint8_t>& Encode() const noexcept { return data_; }
+    [[nodiscard]] const EncodedStorage& Encode() const noexcept { return data_; }
+    [[nodiscard]] std::span<const std::uint8_t> EncodedBytes() const noexcept { return data_; }
     // Parses a VARS section of a chunk with `block_count` blocks. Throws
     // std::invalid_argument naming the defect: an entry out of the section,
     // keys not strictly ascending, a block index out of range, or more than
@@ -125,13 +130,17 @@ class ChunkVars {
     }
 
   private:
+    friend struct detail::ChunkVarsStorageAccess;
+    explicit ChunkVars(const detail::ChunkStoragePolicyPtr& policy)
+        : data_(detail::ChunkStorageAllocator<std::uint8_t>(policy)),
+          offsets_(detail::ChunkStorageAllocator<std::uint32_t>(policy)) {}
     // Index into offsets_ of the first entry whose key is not below `key`.
     [[nodiscard]] std::size_t LowerBound(VarKey key) const noexcept;
     [[nodiscard]] VarKey KeyAt(std::uint32_t offset) const noexcept;
     [[nodiscard]] std::size_t EntryBytesAt(std::uint32_t offset) const noexcept;
 
-    std::vector<std::uint8_t> data_{};
-    std::vector<std::uint32_t> offsets_{};
+    EncodedStorage data_{};
+    std::vector<std::uint32_t, detail::ChunkStorageAllocator<std::uint32_t>> offsets_{};
 };
 
 // The change one mutation makes to a chunk's values: changes in strictly

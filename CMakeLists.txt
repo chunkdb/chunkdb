@@ -70,6 +70,12 @@ add_library(chunkdb_core STATIC
     src/txn_intent_format.cpp
     src/populated_index_format.cpp
     src/archive_base_format.cpp
+    src/commit_group_identity.cpp
+    src/commit_group_format.cpp
+    src/commit_request_fingerprint.cpp
+    src/commit_group_owner_format.cpp
+    src/commit_owner_artifact_io.cpp
+    src/commit_owner_artifact_identity.cpp
     src/chunk_file_header.cpp
     src/feed_protocol.cpp
     src/change_feed.cpp
@@ -119,6 +125,7 @@ add_library(chunkdb_core STATIC
     src/schema.cpp
     src/store_resources.cpp
     src/table_catalog.cpp
+    src/catalog_txn_snapshot.cpp
     src/table_chunk_columns.cpp
     src/table_tombstones.cpp
     src/table_catalog_migrations.cpp
@@ -126,6 +133,13 @@ add_library(chunkdb_core STATIC
     src/migrations_apply.cpp
     src/uri.cpp
     src/txn_commit.cpp
+    src/txn_block_rows.cpp
+    src/txn_block_memory.cpp
+    src/txn_block_deltas.cpp
+    src/chunk_storage_allocator.cpp
+    src/txn_original_variables.cpp
+    src/txn_retained_state.cpp
+    src/txn_block_stage.cpp
     src/txn_history.cpp
     src/txn_intent.cpp
     src/version_clock.cpp
@@ -133,6 +147,7 @@ add_library(chunkdb_core STATIC
     src/wal_stream_replay.cpp
     src/wal_prefix.cpp
     src/wal_stream_pool.cpp
+    src/wal_durability_pin.cpp
     src/wal_writer.cpp
     src/world_read.cpp
     src/world_read_3d.cpp
@@ -356,13 +371,38 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME coordinate_hash_seed_failure COMMAND chunkdb_coordinate_hash_seed_test --failure)
     set_tests_properties(coordinate_hash_seed_failure PROPERTIES TIMEOUT 60 LABELS "smoke")
 
-    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol)
+    foreach(format IN ITEMS area_cursor sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_group_owner_format commit_owner_artifact_io commit_request_fingerprint wal_group_frame catalog_txn_snapshot ordinary_write_failure chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input wal_durability_pin chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
         add_test(NAME ${format} COMMAND chunkdb_${format}_test)
         set_tests_properties(${format} PROPERTIES TIMEOUT 60 LABELS "smoke")
     endforeach()
+
+    if(MINGW)
+        target_link_options(chunkdb_commit_owner_artifact_io_test PRIVATE -static-libstdc++ -static-libgcc)
+    endif()
+
+    add_executable(chunkdb_area_paging_test tests/area_paging_tests.cpp)
+    target_link_libraries(chunkdb_area_paging_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_area_paging_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME area_paging COMMAND chunkdb_area_paging_test)
+    set_tests_properties(area_paging PROPERTIES TIMEOUT 60 LABELS "smoke")
+
+    add_executable(chunkdb_query_limits_test tests/query_limits_tests.cpp)
+    target_link_libraries(chunkdb_query_limits_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_query_limits_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME query_limits COMMAND chunkdb_query_limits_test)
+    set_tests_properties(query_limits PROPERTIES TIMEOUT 60 LABELS "smoke")
+
+    add_executable(chunkdb_typed_chunk_form_size_test tests/typed_chunk_form_size_tests.cpp)
+    target_link_libraries(chunkdb_typed_chunk_form_size_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_typed_chunk_form_size_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME typed_chunk_form_size COMMAND chunkdb_typed_chunk_form_size_test)
+    set_tests_properties(typed_chunk_form_size PROPERTIES TIMEOUT 60 LABELS "smoke")
+    if(MINGW)
+        target_link_options(chunkdb_typed_chunk_form_size_test PRIVATE -static-libstdc++ -static-libgcc)
+    endif()
 
     # Its crash children verify the recovered directory.
     target_link_libraries(chunkdb_table_tombstones_test PRIVATE chunkdb_tools)
@@ -852,6 +892,37 @@ if(CHUNKDB_BUILD_TESTS)
     )
     add_test(NAME txn_snapshot COMMAND chunkdb_txn_snapshot_test)
 
+    add_executable(chunkdb_txn_block_deltas_test tests/txn_block_deltas_tests.cpp)
+    target_link_libraries(chunkdb_txn_block_deltas_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_txn_block_deltas_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME txn_block_deltas COMMAND chunkdb_txn_block_deltas_test)
+    add_executable(chunkdb_txn_block_snapshot_test tests/txn_block_snapshot_tests.cpp)
+    target_link_libraries(chunkdb_txn_block_snapshot_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_txn_block_snapshot_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME txn_block_snapshot COMMAND chunkdb_txn_block_snapshot_test)
+    add_executable(chunkdb_chunk_storage_allocator_test tests/chunk_storage_allocator_tests.cpp)
+    target_link_libraries(chunkdb_chunk_storage_allocator_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_chunk_storage_allocator_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME chunk_storage_allocator COMMAND chunkdb_chunk_storage_allocator_test)
+    set_tests_properties(chunk_storage_allocator PROPERTIES TIMEOUT 60 LABELS "smoke")
+    add_executable(chunkdb_txn_block_stage_test tests/txn_block_stage_tests.cpp)
+    target_link_libraries(chunkdb_txn_block_stage_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_txn_block_stage_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME txn_block_stage COMMAND chunkdb_txn_block_stage_test)
+    set_tests_properties(txn_block_stage PROPERTIES TIMEOUT 60 LABELS "smoke")
+    if(MINGW)
+        # PMR allocation calls and the test's aligned replacements must share one runtime.
+        foreach(guard IN ITEMS commit_group_format feed_alias_recovery table_tombstones wal_group_frame)
+            target_link_options(chunkdb_${guard}_test PRIVATE -static-libgcc -static-libstdc++)
+        endforeach()
+    endif()
+    if(MINGW)
+        # Allocation guard replacements share the C++ runtime with the library.
+        target_link_options(chunkdb_txn_block_deltas_test PRIVATE -static-libgcc -static-libstdc++)
+        target_link_options(chunkdb_txn_block_snapshot_test PRIVATE -static-libgcc -static-libstdc++)
+        target_link_options(chunkdb_txn_block_stage_test PRIVATE -static-libgcc -static-libstdc++)
+    endif()
+
     add_executable(chunkdb_txn_commit_test tests/txn_commit_tests.cpp)
     target_link_libraries(chunkdb_txn_commit_test PRIVATE chunkdb_tools)
     target_include_directories(
@@ -970,6 +1041,14 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_txn_intent_format_test
         chunkdb_populated_index_format_test
         chunkdb_archive_base_format_test
+        chunkdb_commit_group_identity_test
+        chunkdb_commit_group_format_test
+        chunkdb_commit_request_fingerprint_test
+        chunkdb_wal_group_frame_test
+        chunkdb_catalog_txn_snapshot_test
+        chunkdb_ordinary_write_failure_test
+        chunkdb_commit_group_owner_format_test
+        chunkdb_commit_owner_artifact_io_test
         chunkdb_chunk_file_header_test
         chunkdb_chunk_identity_test
         chunkdb_chunk_schema_test
@@ -982,9 +1061,14 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_wal_prefix_test
         chunkdb_wal_stream_replay_test
         chunkdb_shared_file_input_test
+        chunkdb_wal_durability_pin_test
         chunkdb_chunk_coordinate_index_test
         chunkdb_table_chunk_columns_test
         chunkdb_world_coordinates_3d_test
+        chunkdb_area_cursor_test
+        chunkdb_area_paging_test
+        chunkdb_query_limits_test
+        chunkdb_typed_chunk_form_size_test
         chunkdb_feed_archive_base_test
         chunkdb_feed_alias_recovery_test
         chunkdb_chunk_mutation_model_test
@@ -1060,6 +1144,10 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_snapshot_generation_linger_test
         chunkdb_txn_history_test
         chunkdb_txn_snapshot_test
+        chunkdb_txn_block_deltas_test
+        chunkdb_txn_block_snapshot_test
+        chunkdb_chunk_storage_allocator_test
+        chunkdb_txn_block_stage_test
         chunkdb_txn_commit_test
         chunkdb_txn_crash_test
         chunkdb_txn_kill_test
@@ -1128,6 +1216,7 @@ if(CHUNKDB_BUILD_TESTS)
         wal_prefix
         wal_stream_replay
         shared_file_input
+        wal_durability_pin
         chunk_coordinate_index
         table_chunk_columns
         world_coordinates_3d
@@ -1192,6 +1281,10 @@ if(CHUNKDB_BUILD_TESTS)
         budget_compare
         txn_history
         txn_snapshot
+        txn_block_deltas
+        txn_block_snapshot
+        chunk_storage_allocator
+        txn_block_stage
         txn_commit
         txn_kill
         txn_concurrency
