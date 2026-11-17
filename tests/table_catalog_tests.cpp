@@ -11,11 +11,13 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <new>
 #include <iostream>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "change_feed.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
@@ -220,6 +222,100 @@ void TestCreateUndoneWhenNotDurable() {
     assert(created != nullptr);
 }
 
+// What serving a created table needs is allocated before the table reaches
+// tables/, and a failure while it is served is undone like a failed sync.
+void TestCreateUndoneWhenNotServed() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-create-serve");
+    TableCatalog catalog(Config(dir.path()));
+    const auto create_fails = [&](const char* failpoint) {
+#ifdef _WIN32
+        _putenv_s(failpoint, "1");
+#else
+        setenv(failpoint, "1", 1);
+#endif
+        bool failed = false;
+        try {
+            (void)catalog.Create("terrain", kTerrainGeometry, {});
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        }
+        assert(failed);
+        assert(catalog.Find("terrain") == nullptr);
+        assert(!catalog.Fence("terrain"));
+        assert(!std::filesystem::exists(dir.path() / "tables" / "terrain"));
+        assert(Names(dir.path() / ".chunkdb.staging").empty());
+        assert(Names(dir.path() / ".chunkdb.dropped").empty());
+    };
+    create_fails("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE");
+    create_fails("CHUNKDB_FAILPOINT_TABLE_CREATE_SERVE_ALLOC_FAIL_ONCE");
+    const auto created = catalog.Create("terrain", kTerrainGeometry, {});
+    assert(created != nullptr && catalog.Find("terrain") == created);
+    WriteBits(catalog, "terrain", 1, 1, "110000011");
+    assert(ReadBits(catalog, "terrain", 1, 1) == "110000011");
+}
+
+// A created table leaves tables/, or its name is fenced, before the failure
+// is logged: a log line that cannot be written does not keep the table there.
+void TestCreateUndoneBeforeItsLog() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-create-undo-log");
+    TableCatalog catalog(Config(dir.path()));
+    struct FailingErrorLog {
+        FailingErrorLog() {
+            chunkdb::SetLogSinkForTests([](const std::string& line) {
+                if (line.find(" ERROR ") != std::string::npos) throw std::bad_alloc();
+            });
+        }
+        ~FailingErrorLog() { chunkdb::ResetLogSinkForTests(); }
+    };
+    const auto set = [](const char* failpoint) {
+#ifdef _WIN32
+        _putenv_s(failpoint, "1");
+#else
+        setenv(failpoint, "1", 1);
+#endif
+    };
+    {
+        FailingErrorLog log;
+        set("CHUNKDB_FAILPOINT_TABLE_CREATE_SYNC_FAIL_ONCE");
+        assert(!ErrorOf([&] { (void)catalog.Create("terrain", kTerrainGeometry, {}); }).empty());
+    }
+    assert(catalog.Find("terrain") == nullptr);
+    assert(!catalog.Fence("terrain"));
+    assert(!std::filesystem::exists(dir.path() / "tables" / "terrain"));
+    {
+        FailingErrorLog log;
+        set("CHUNKDB_FAILPOINT_TABLE_CREATE_SYNC_FAIL_ONCE");
+        set("CHUNKDB_FAILPOINT_TABLE_CREATE_UNDO_FAIL_ONCE");
+        assert(!ErrorOf([&] { (void)catalog.Create("terrain", kTerrainGeometry, {}); }).empty());
+    }
+    assert(catalog.Find("terrain") == nullptr);
+    assert(catalog.Fence("terrain"));
+    assert(std::filesystem::exists(dir.path() / "tables" / "terrain"));
+    catalog.RecoverTable("terrain");
+    WriteBits(catalog, "terrain", 1, 1, "110000011");
+    assert(ReadBits(catalog, "terrain", 1, 1) == "110000011");
+}
+
+// A created table is served before its success is logged: a log line that
+// cannot be written does not turn the CREATE into a failure.
+void TestCreateSucceedsWhenItsLogFails() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-create-log");
+    TableCatalog catalog(Config(dir.path()));
+    std::shared_ptr<chunkdb::Table> created;
+    const auto level = chunkdb::GetLogLevel();
+    chunkdb::SetLogLevel(chunkdb::LogLevel::kInfo);
+    chunkdb::SetLogSinkForTests([](const std::string& line) {
+        if (line.find("table created") != std::string::npos) throw std::bad_alloc();
+    });
+    const auto error = ErrorOf([&] { created = catalog.Create("terrain", kTerrainGeometry, {}); });
+    chunkdb::ResetLogSinkForTests();
+    chunkdb::SetLogLevel(level);
+    assert(error.empty());
+    assert(created != nullptr && catalog.Find("terrain") == created);
+    WriteBits(catalog, "terrain", 1, 1, "110000011");
+    assert(ReadBits(catalog, "terrain", 1, 1) == "110000011");
+}
+
 void TestDrop() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-drop");
     {
@@ -365,6 +461,77 @@ void TestFailedTableOperationsDoNotHang() {
     assert(!handle->Acquire().has_value());
     assert(catalog.Find("terrain") == nullptr);
     catalog.WalBarrier();  // does not wait for the retired table
+}
+
+// A failure to allocate the fallback of an option change comes before the
+// manifest is replaced: the table keeps serving its old options.
+void TestSetOptionsFenceAllocationFailureKeepsTable() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-fence-alloc");
+    TableCatalog catalog(Config(dir.path()));
+    (void)catalog.Create("terrain", kTerrainGeometry, {});
+    WriteBits(catalog, "terrain", 4, 4, "110000011");
+    const auto handle = catalog.Find("terrain");
+    const auto manifest_path = chunkdb::StoreManifestPath(dir.path() / "tables" / "terrain");
+    const auto read_manifest = [&] {
+        std::ifstream in(manifest_path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), {});
+    };
+    const auto manifest = read_manifest();
+    assert(!manifest.empty());
+    const auto interval = handle->Info().options.checkpoint_update_interval;
+    chunkdb::TableOptionsUpdate update;
+    update.checkpoint_update_interval = interval + 7U;
+#ifdef _WIN32
+    _putenv_s("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", "1");
+#else
+    setenv("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", "1", 1);
+#endif
+    bool failed = false;
+    try {
+        catalog.SetOptions("terrain", update);
+    } catch (const std::bad_alloc&) {
+        failed = true;
+    }
+    assert(failed);
+    // Not left busy: commands on it would wait until a restart.
+    assert(!chunkdb::FeedTestAccess::WaitLingerDraining(*handle, std::chrono::milliseconds(0)));
+    assert(catalog.Find("terrain") == handle);
+    assert(!catalog.Fence("terrain"));
+    assert(handle->Info().options.checkpoint_update_interval == interval);
+    assert(read_manifest() == manifest);
+    assert(ReadBits(catalog, "terrain", 4, 4) == "110000011");
+    catalog.SetOptions("terrain", update);
+    assert(handle->Info().options.checkpoint_update_interval == interval + 7U);
+}
+
+// A failure to allocate the fallback of a drop comes before the table is
+// closed: the table keeps serving.
+void TestDropFenceAllocationFailureKeepsTable() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-drop-fence-alloc");
+    TableCatalog catalog(Config(dir.path()));
+    (void)catalog.Create("terrain", kTerrainGeometry, {});
+    WriteBits(catalog, "terrain", 4, 4, "110000011");
+    const auto handle = catalog.Find("terrain");
+#ifdef _WIN32
+    _putenv_s("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", "1");
+#else
+    setenv("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", "1", 1);
+#endif
+    bool failed = false;
+    try {
+        catalog.Drop("terrain");
+    } catch (const std::bad_alloc&) {
+        failed = true;
+    }
+    assert(failed);
+    // Not left busy: commands on it would wait until a restart.
+    assert(!chunkdb::FeedTestAccess::WaitLingerDraining(*handle, std::chrono::milliseconds(0)));
+    assert(catalog.Find("terrain") == handle);
+    assert(!catalog.Fence("terrain"));
+    assert(ReadBits(catalog, "terrain", 4, 4) == "110000011");
+    catalog.Drop("terrain");
+    assert(catalog.Find("terrain") == nullptr);
+    assert(!std::filesystem::exists(dir.path() / "tables" / "terrain"));
 }
 
 // TABLESET changes only the options it names.
@@ -1174,10 +1341,15 @@ int main(int argc, char** argv) {
     TestTablesWithDifferentGeometry();
     TestTableNames();
     TestCreateUndoneWhenNotDurable();
+    TestCreateUndoneWhenNotServed();
+    TestCreateUndoneBeforeItsLog();
+    TestCreateSucceedsWhenItsLogFails();
     TestDrop();
     TestDropWaitsForRunningCommands();
     TestAcquireDuringDropWaitsThenFails();
     TestFailedTableOperationsDoNotHang();
+    TestSetOptionsFenceAllocationFailureKeepsTable();
+    TestDropFenceAllocationFailureKeepsTable();
     TestOptionUpdatesArePatches();
     TestSetOptions();
     TestPersistedOptionFlags();
