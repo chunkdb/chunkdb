@@ -519,6 +519,29 @@ void TestSnapshotAreaIncludesPendingFirstWrite() {
     }
 }
 
+// A write that empties a chunk publishes its index membership before the
+// state it replaces, both under its chunk's lock: a GET AREA at an older
+// snapshot that finds the chunk unlisted in between waits for that lock and
+// then reads the kept state.
+void TestSnapshotAreaWaitsForEmptyingWrite() {
+    ScopedTempDir dir("chunkdb-txn-area-index-emptying");
+    ChunkStore store(AreaIndexConfig(dir.path(), false));
+    const ChunkCoord emptied{0, 0, 0};
+    WriteAreaBlock(store, emptied);
+    auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+    store.ArmTxnPauseForTests(TxnPausePoint::kWriteAfterMembership);
+    std::thread writer([&] { WriteAreaBlock(store, emptied, false); });
+    assert(store.WaitForTxnPauseForTests(TxnPausePoint::kWriteAfterMembership));
+    auto reading = std::async(std::launch::async, [&] { return IndexedArea(store, *snapshot, false); });
+    const auto status = reading.wait_for(std::chrono::seconds(2));
+    store.ResumeTxnForTests(TxnPausePoint::kWriteAfterMembership);
+    writer.join();
+    const auto actual = reading.get();
+    assert(status == std::future_status::timeout);
+    assert(actual.size() == 1U && actual.front().coord == emptied);
+    ExpectPointScan(store, *snapshot, false, actual);
+}
+
 void TestSnapshotAreaKeepsOverlayAndEmptyConflicts() {
     for (const bool three : {false, true}) for (const bool around : {false, true}) {
         ScopedTempDir dir("chunkdb-txn-area-index-overlay");
@@ -752,6 +775,7 @@ int main() {
     TestSnapshotAreaMatchesPointScanDuringWrites();
     TestSnapshotAreaSkipsEmptyDiskReads();
     TestSnapshotAreaIncludesPendingFirstWrite();
+    TestSnapshotAreaWaitsForEmptyingWrite();
     TestSnapshotAreaKeepsOverlayAndEmptyConflicts();
     TestTextValuesAtSnapshot();
     TestWriterRacingRegistrationIsKept();

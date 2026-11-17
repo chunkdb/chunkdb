@@ -468,6 +468,9 @@ enum class TxnPausePoint {
     // A plain write took its version and found an open transaction, under
     // its chunk's lock.
     kWriteAfterOpenCount,
+    // A plain write that keeps a state published its chunk's coordinate index
+    // membership and not yet the kept state, under its chunk's lock.
+    kWriteAfterMembership,
     // The transaction released its chunk locks, before publishing any
     // uncertain outcome and completing its post-commit bookkeeping.
     kBeforePostCommitOutcome,
