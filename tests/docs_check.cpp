@@ -1859,8 +1859,8 @@ int RunLinks(const fs::path& root_input, std::ostream& out, std::ostream& err) {
 
 // --- Docker quick-start ----------------------------------------------------------------
 
-const std::vector<std::string> kQuickStartBlocks{"start", "health", "login", "write", "read",
-                                                 "watch", "watch-update", "reset", "reset-login"};
+const std::vector<std::string> kQuickStartBlocks{"start", "health", "install", "login", "write",
+                                                 "read", "watch", "watch-update", "reset", "reset-login"};
 
 // <!-- docker-quickstart:([\w-]+) -->\s*```(sh(?: docs-check-watch)?|cql docs-check[^\n]*)\n(.*?)\n```
 std::map<std::string, std::string> ExtractQuickStart(const std::string& source) {

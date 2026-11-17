@@ -132,6 +132,9 @@ jobs:
     permissions:
       contents: read
       packages: write
+    outputs:
+      version: ${{ steps.image.outputs.version }}
+      major: ${{ steps.image.outputs.major }}
     steps:
       - uses: actions/checkout@v5
       - name: Image tags from release tag
@@ -165,3 +168,45 @@ jobs:
             ghcr.io/chunkdb/chunkdb:${{ steps.image.outputs.version }}
             ghcr.io/chunkdb/chunkdb:${{ steps.image.outputs.major }}
             ghcr.io/chunkdb/chunkdb:latest
+
+  # Runs QUICK_START.md as written on a fresh runner: the page pulls the
+  # published image and installs chunk-cli with its own go install command.
+  docker-quickstart:
+    name: Quick start on the published image
+    needs: docker-image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v5
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.6'
+          cache: false
+      - name: Build documentation checks
+        run: |
+          cmake -S . -B build-docs -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WITH_TLS=OFF -DCHUNKDB_WERROR=ON
+          nice -n 10 cmake --build build-docs --target chunkdb_docs_check --parallel "$(nproc)"
+      - name: Check the page names the released image
+        env:
+          VERSION: ${{ needs.docker-image.outputs.version }}
+          MAJOR: ${{ needs.docker-image.outputs.major }}
+        run: |
+          if ! grep -qE "ghcr\.io/chunkdb/chunkdb:${MAJOR}(\s|$)" docs/QUICK_START.md; then
+            echo "docs/QUICK_START.md does not start the :$MAJOR image"
+            exit 1
+          fi
+          docker pull "ghcr.io/chunkdb/chunkdb:$VERSION"
+          docker pull "ghcr.io/chunkdb/chunkdb:$MAJOR"
+          test "$(docker image inspect --format '{{.Id}}' "ghcr.io/chunkdb/chunkdb:$VERSION")" = \
+            "$(docker image inspect --format '{{.Id}}' "ghcr.io/chunkdb/chunkdb:$MAJOR")"
+      - name: Run commands from QUICK_START.md
+        run: bash scripts/test/docker-quickstart.sh --published --tool build-docs/chunkdb_docs_check --logs docker-quickstart-logs
+      - name: Upload page check logs
+        if: always()
+        uses: actions/upload-artifact@v6
+        with:
+          name: docker-quickstart-published-logs
+          path: docker-quickstart-logs
+          if-no-files-found: warn
