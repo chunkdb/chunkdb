@@ -408,8 +408,11 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
             server_.engine_->Execute(connection.session, connection.request_line, connection.parameters);
         Reply(connection, response);
     } else {
-        auto control = std::make_shared<StatementControl>(std::chrono::steady_clock::now(),
-            connection.session.hello_options.statement_timeout_ms.value_or(server_.config_.statement_timeout_ms));
+        // The admission time matters only to a statement deadline.
+        const auto timeout_ms =
+            connection.session.hello_options.statement_timeout_ms.value_or(server_.config_.statement_timeout_ms);
+        auto control = std::make_shared<StatementControl>(
+            timeout_ms != 0U ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}, timeout_ms);
         if (worker) {
             if (!control->Start()) {
                 Reply(connection, StatementStoppedReply(*control->TakeQueuedStop()));
@@ -513,7 +516,9 @@ void IdleIo::PumpCredits() {
 }
 
 bool IdleIo::Write(ServerConnection& connection, bool keep) {
-    if (std::chrono::steady_clock::now() < connection.session.reply_not_before) return true;
+    // Only a held-back login reply has a time before which it is not written.
+    if (connection.session.reply_not_before != std::chrono::steady_clock::time_point{} &&
+        std::chrono::steady_clock::now() < connection.session.reply_not_before) return true;
     if (connection.response_offset == connection.response.size() && connection.reply_continuation) {
         connection.response = connection.reply_continuation->Next(65536U);
         connection.response_offset = 0U;
@@ -562,12 +567,20 @@ bool IdleIo::Write(ServerConnection& connection, bool keep) {
         if (auto* hook = server_.delivery_test_hook_.load(std::memory_order_acquire))
             hook->Run(FeedDeliveryTestHook::Point::kAfterReplyBufferWrite, connection.response_offset);
         connection.io_wait = POLLOUT;
-        connection.output_deadline = std::chrono::steady_clock::now() +
-            std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
-        if (connection.response_offset != connection.response.size() || connection.reply_continuation) return true;
+        // Progress restarts the deadline of a reply that is still being written.
+        if (connection.response_offset != connection.response.size() || connection.reply_continuation) {
+            connection.output_deadline = std::chrono::steady_clock::now() +
+                std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
+            return true;
+        }
     }
     ++connection.completed_replies;
     std::string{}.swap(connection.response);
+    // A kept connection returns what a larger reply reserved beyond the
+    // ordinary reservation and keeps that reservation for its next request.
+    if (keep && connection.reply_credit_bytes > 65536U && data_output_credit_->Owns(connection.reply_credit) &&
+        data_output_credit_->TryResize(connection.reply_credit, 65536U))
+        connection.reply_credit_bytes = 65536U;
     if (!keep || connection.reply_credit_bytes != 65536U || !data_output_credit_->Owns(connection.reply_credit)) {
         connection.reply_credit.reset();
         connection.reply_credit_bytes = 0U;
