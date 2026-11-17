@@ -933,6 +933,7 @@ class ChunkStore {
     friend struct FeedSlotTestAccess;
     friend struct BackupTestAccess;
     friend struct FeatureActivationTestAccess;
+    friend struct UnsyncedTestAccess;
 
     // What a WAL barrier still has to sync (see unsynced_files_).
     struct UnsyncedArtifacts {
