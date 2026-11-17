@@ -7,6 +7,8 @@ Default workloads and JSON fields stay unchanged when these additions are unused
 - `--watch <table>[:N][:slots]` starts N subscriptions (default 1) after each untimed grid fill and consumes pushes through UNWATCH completion; with `slots`, each owns a durable slot with the watch mode's filters, acknowledges what it reads, counts its initial schema push in `watch_other`, and drops the slot afterwards.
 - `--watch-mode ordinary|progress|filtered|chunks` defaults to `ordinary`; other modes require `--watch default`.
 - `ordinary` delivers mutations, `progress` excludes workload positions with AREA -1 -1 TO -1 -1, `filtered` selects chunk 0,0 and column bits with NO BEFORE, and `chunks` delivers whole chunk forms.
+- `--watch-delivery strict|measure` defaults to `strict`, where a resync or a drain longer than `--io-timeout-ms` fails the run; `measure` requires `--watch` and is meant for measuring many subscribers.
+- `--slot-create-timeout-ms N` bounds the CREATE SLOT reply in `measure` mode (default 600000); the first slot on a table checkpoints every chunk with WAL data before it replies, outside the timed window.
 - `--tests takeover --clients 1 --pipeline 1` measures idle connect→HELLO→WATCH TAKEOVER→old-owner closure cycles and requires no watch or read metadata.
 - Takeover performs no mutations or ACKs; initial slot creation/ownership and final UNWATCH/DROP are excluded from its timing and request counts.
 
@@ -17,6 +19,10 @@ Ordinary latency starts after sending a request and ends after validating its re
 Report-only results add `response_bytes`, `metadata_envelopes`, `watch_bytes`, `watch_changes`, `watch_progress`, `watch_chunks`, `watch_other` and `watch_duration_s`.
 `metadata_envelopes` counts wrapped reads, while watch event counters count fully consumed push frames; watch counters and `watch_bytes` add up all watches, and `watch_duration_s` is the longest watch's.
 Metadata or watches also add `enabled_config` with `report_only`, `with`, `watch` and `watch_mode`.
+In `measure` mode, `enabled_config` adds `watch_delivery`, and each result adds `watchers`, one entry per watch with `index`, `slot`, `events`, `changes`, `chunks`, `progress`, `other`, `resyncs`, `bytes`, `lag_revisions_at_end`, `catch_up_s` and `slot_create_ms`.
+An ordinary watch that falls behind its share of the feed buffer gets a resync and skips the changes before it; `resyncs` counts those, so `changes` can be lower than the writes.
+A drain in `measure` mode waits while pushes arrive and fails after `--io-timeout-ms` without one; a slot watch receives changes only up to the durable frontier, which the server advances every `--slot-sync-ms`, so its catch-up includes that wait.
+`lag_revisions_at_end` is the write frontier minus the watch position when the last write replied, and `catch_up_s` is the time from then until the watch reached the frontier; revisions can have gaps, so lag counts revisions, not changes.
 Takeover adds `report_only`, `ownership_cycles`, `ownership_cycles_s`, `latency_unit="ownership_cycle"` and `acks_sent=0`; `throughput_req_s` counts HELLO/WATCH requests plus AUTH when logging in, and `throughput_blocks_s` is zero.
 Compare matching workload settings and retain absolute requests/s, blocks/s and p50/p99 with the run count and configuration.
 
