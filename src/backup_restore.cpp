@@ -149,6 +149,66 @@ void RewriteRetainedIndex(const std::filesystem::path& directory, const Geometry
     Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_INDEX_ONCE");
 }
 } // namespace
+StoreId RebindRestoredTable(const std::filesystem::path& directory, const BackupTableCut& cut,
+    const std::vector<std::filesystem::path>& files, const BackupCancel& cancelled) {
+    const auto check_cancelled = [&] { if (cancelled.stop_requested()) throw std::runtime_error("backup cancelled"); };
+    auto manifest = *ReadStoreManifest(directory);
+    RequireOpenableFeatures(manifest.features, AccessMode::kReadWrite);
+    if (cut.revision == std::numeric_limits<std::uint64_t>::max())
+        throw std::overflow_error("restore fork revision has no successor");
+    Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
+    const auto old_epoch = cut.epoch; const auto new_epoch = NewStoreId();
+    if (new_epoch == old_epoch) throw std::runtime_error("restore generated an existing epoch");
+    ChunkCoordinateIndex retained(directory, geometry, old_epoch, true);
+    // Chunk files lie one level below the table, in their large-chunk directory.
+    const auto chunk_file = [](const std::filesystem::path& relative) {
+        return std::distance(relative.begin(), relative.end()) == 2;
+    };
+    // Normalize crash-consistent WAL tails while the checkpoint still has
+    // its old epoch, then rewrite the identity without changing history.
+    for (const auto& relative : files) {
+        check_cancelled();
+        if (!chunk_file(relative) || relative.extension() != ".wal") continue;
+        const auto path = directory / relative;
+        const auto coord = Coordinate(relative, geometry);
+        auto bytes = RecoverWal(path, geometry, coord, old_epoch, manifest.features, retained);
+        if (bytes.empty()) {
+            std::filesystem::remove(path);
+            if (backup_detail::DirectoryEntries(path.parent_path()) == backup_detail::DirectoryEntries{})
+                std::filesystem::remove(path.parent_path());
+        } else {
+            bytes = RewriteWalStoreId(std::move(bytes), coord, old_epoch, new_epoch,
+                manifest.features, geometry.dims());
+            AtomicWrite(path, bytes, true, true);
+        }
+    }
+    for (const auto& relative : files) {
+        check_cancelled();
+        if (!chunk_file(relative)) continue;
+        const auto path = directory / relative;
+        if (relative.extension() == ".chk") {
+            auto bytes = RewriteChunkImageStoreId(LoadFile(path), geometry, Coordinate(relative, geometry), old_epoch, new_epoch, manifest.features);
+            AtomicWrite(path, bytes, true, true);
+        }
+        Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_FILE_ONCE");
+    }
+    RewriteRetainedIndex(directory, geometry, old_epoch, new_epoch);
+    if (auto slots = ReadFeedSlotRecords(directory, old_epoch, geometry.dims())) {
+        slots->epoch = new_epoch; slots->durable_watermark = cut.revision;
+        for (auto& slot : slots->slots) { slot.written = cut.revision; slot.lost = slot.schema_filter_lost; }
+        WriteFeedSlotRecords(directory, *slots);
+    }
+    // The verified backup contains every committed image/WAL/slot at
+    // or below this cut. Reservations above it belonged to the old
+    // epoch, so publish its checked successor before the new identity.
+    AtomicWrite(directory / "chunkdb.version", SerializeVersionClockRecord(cut.revision + 1U), true, true);
+    Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_FORK_CLOCK_ONCE");
+    manifest.store_id = new_epoch;
+    manifest.lineage = TableLineage{old_epoch, cut.revision};
+    AtomicWrite(StoreManifestPath(directory), SerializeStoreManifest(manifest), true, true);
+    Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_TABLE_ONCE");
+    return new_epoch;
+}
 void RestoreBackup(const std::filesystem::path& source, const std::filesystem::path& destination) {
     RequireBackupTarget(source, destination);
 #ifdef _WIN32
@@ -204,60 +264,13 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
         if (std::filesystem::exists(temporary / kMigrationsFileName))
             AtomicWrite(temporary / kMigrationsFileName, EncodeMigrationRecords(directory_manifest.data_dir_id, migrations), true, true);
         for (auto& cut : record.tables) {
-            const auto directory = temporary / "tables" / cut.name;
-            auto manifest = *ReadStoreManifest(directory);
-            RequireOpenableFeatures(manifest.features, AccessMode::kReadWrite);
-            Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
-            const auto old_epoch = cut.epoch; const auto new_epoch = NewStoreId();
-            if (new_epoch == old_epoch) throw std::runtime_error("restore generated an existing epoch");
             const auto prefix = std::filesystem::path("tables") / cut.name;
-            ChunkCoordinateIndex retained(directory, geometry, old_epoch, true);
-            // Normalize crash-consistent WAL tails while the checkpoint still has
-            // its old epoch, then rewrite the identity without changing history.
+            std::vector<std::filesystem::path> files;
             for (const auto& file : record.files) {
-                const auto relative = file.relative_path.lexically_relative(prefix);
-                if (std::distance(relative.begin(), relative.end()) != 2 || relative.begin()->string() == "..") continue;
-                const auto path = temporary / file.relative_path;
-                if (relative.extension() == ".wal") {
-                    const auto coord = Coordinate(relative, geometry);
-                    auto bytes = RecoverWal(path, geometry, coord, old_epoch, manifest.features, retained);
-                    if (bytes.empty()) {
-                        std::filesystem::remove(path);
-                        if (backup_detail::DirectoryEntries(path.parent_path()) == backup_detail::DirectoryEntries{})
-                            std::filesystem::remove(path.parent_path());
-                    } else {
-                        bytes = RewriteWalStoreId(std::move(bytes), coord, old_epoch, new_epoch,
-                            manifest.features, geometry.dims());
-                        AtomicWrite(path, bytes, true, true);
-                    }
-                }
+                auto relative = file.relative_path.lexically_relative(prefix);
+                if (!relative.empty() && relative.begin()->string() != "..") files.push_back(std::move(relative));
             }
-            for (const auto& file : record.files) {
-                const auto relative = file.relative_path.lexically_relative(prefix);
-                if (std::distance(relative.begin(), relative.end()) != 2 || relative.begin()->string() == "..") continue;
-                const auto path = temporary / file.relative_path;
-                if (relative.extension() == ".chk") {
-                    auto bytes = RewriteChunkImageStoreId(LoadFile(path), geometry, Coordinate(relative, geometry), old_epoch, new_epoch, manifest.features);
-                    AtomicWrite(path, bytes, true, true);
-                }
-                Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_FILE_ONCE");
-            }
-            RewriteRetainedIndex(directory, geometry, old_epoch, new_epoch);
-            if (auto slots = ReadFeedSlotRecords(directory, old_epoch, geometry.dims())) {
-                slots->epoch = new_epoch; slots->durable_watermark = cut.revision;
-                for (auto& slot : slots->slots) { slot.written = cut.revision; slot.lost = slot.schema_filter_lost; }
-                WriteFeedSlotRecords(directory, *slots);
-            }
-            // The verified backup contains every committed image/WAL/slot at
-            // or below this cut. Reservations above it belonged to the old
-            // epoch, so publish its checked successor before the new identity.
-            AtomicWrite(directory / "chunkdb.version", SerializeVersionClockRecord(cut.revision + 1U), true, true);
-            Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_FORK_CLOCK_ONCE");
-            manifest.store_id = new_epoch;
-            manifest.lineage = TableLineage{old_epoch, cut.revision};
-            AtomicWrite(StoreManifestPath(directory), SerializeStoreManifest(manifest), true, true);
-            cut.epoch = new_epoch;
-            Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_TABLE_ONCE");
+            cut.epoch = RebindRestoredTable(temporary / prefix, cut, files);
         }
         std::erase_if(record.files, [&](const auto& file) { return !std::filesystem::exists(temporary / file.relative_path); });
         for (auto& file : record.files) file = InspectBackupFile(temporary, file.relative_path);

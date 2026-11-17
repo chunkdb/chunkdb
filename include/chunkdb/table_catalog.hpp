@@ -12,6 +12,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <stop_token>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -152,6 +153,28 @@ struct TableDefinition {
     TableOptions options;
     std::optional<TableSchema> schema;
     std::optional<TableSchema> chunk_schema{};
+};
+
+// RESTORE TABLE (docs/design/RESTORE_TABLE.md).
+struct TableRestoreRequest {
+    // A completed backup, already resolved under --backup-dir.
+    std::filesystem::path backup;
+    // The table cut in the backup, and the name it is restored under.
+    std::string table;
+    std::string name;
+    // Ends the restore before publication; nothing is published then.
+    std::stop_token cancelled{};
+    // Called after each copied file: files and bytes copied, and their totals.
+    std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t)> progress{};
+};
+struct TableRestoreResult {
+    std::string name;
+    StoreId epoch{};
+    // The lineage: the backed-up epoch and the backup cut.
+    StoreId parent_epoch{};
+    std::uint64_t fork_revision = 0;
+    std::uint64_t files = 0;
+    std::uint64_t bytes = 0;
 };
 
 // A table that refuses its commands until TableCatalog::RecoverTable or a
@@ -456,6 +479,14 @@ class TableCatalog {
     [[nodiscard]] CatalogFeatureStatus FeatureStatus();
     void WalBarrier();
     [[nodiscard]] BackupResult BackupTo(const std::filesystem::path& target, const BackupOptions& options);
+    // Copies one table of a completed backup into a private directory, gives
+    // it a new epoch whose lineage is the backup cut, and publishes it under
+    // request.name with one rename. Crash-atomic like Create: afterwards the
+    // table exists completely or not at all. Throws TableExistsError,
+    // TableFencedError, std::invalid_argument (bad name, no such backed-up
+    // table, features or options the catalog cannot serve, read-only catalog)
+    // or std::runtime_error (damaged or changed backup, I/O, cancellation).
+    TableRestoreResult RestoreTable(const TableRestoreRequest& request);
     void SetBackupHookForTests(BackupTestHook* hook) noexcept { backup_hook_.store(hook, std::memory_order_release); }
 
   private:

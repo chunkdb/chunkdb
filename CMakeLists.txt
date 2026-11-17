@@ -122,6 +122,7 @@ add_library(chunkdb_core STATIC
     src/table_chunk_columns.cpp
     src/table_tombstones.cpp
     src/table_catalog_migrations.cpp
+    src/table_catalog_restore.cpp
     src/migrations_records.cpp
     src/migrations_apply.cpp
     src/uri.cpp
@@ -340,6 +341,16 @@ if(CHUNKDB_BUILD_TESTS)
     add_dependencies(chunkdb_restore_crash_test chunkdb_restore)
     add_test(NAME restore_crash COMMAND chunkdb_restore_crash_test)
     set_tests_properties(restore_crash PROPERTIES TIMEOUT 300 LABELS "crash")
+
+    add_executable(chunkdb_restore_table_test tests/restore_table_tests.cpp)
+    target_link_libraries(chunkdb_restore_table_test PRIVATE chunkdb_tools)
+    add_test(NAME restore_table COMMAND chunkdb_restore_table_test)
+    set_tests_properties(restore_table PROPERTIES TIMEOUT 300 LABELS "smoke")
+
+    add_executable(chunkdb_restore_table_crash_test tests/restore_table_crash_tests.cpp)
+    target_link_libraries(chunkdb_restore_table_crash_test PRIVATE chunkdb_tools)
+    add_test(NAME restore_table_crash COMMAND chunkdb_restore_table_crash_test)
+    set_tests_properties(restore_table_crash PROPERTIES TIMEOUT 300 LABELS "crash")
 
     add_executable(chunkdb_geometry_bit_test tests/geometry_bit_tests.cpp)
     target_link_libraries(chunkdb_geometry_bit_test PRIVATE chunkdb_core)
@@ -954,6 +965,8 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_backup_crash_test
         chunkdb_backup_restore_test
         chunkdb_restore_crash_test
+        chunkdb_restore_table_test
+        chunkdb_restore_table_crash_test
         chunkdb_server_backup_protocol_test
         chunkdb_feed_slot_records_test
         chunkdb_feed_archive_reader_test

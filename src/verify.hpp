@@ -22,4 +22,9 @@ struct VerifyCounters {
     const std::filesystem::path& data_dir,
     std::ostream& out, bool features = false);
 
+// Checks one table directory as VerifyDataDirectory checks each table.
+[[nodiscard]] VerifyCounters VerifyTableDirectory(
+    const std::filesystem::path& table_dir,
+    std::ostream& out);
+
 }  // namespace chunkdb
