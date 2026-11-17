@@ -107,8 +107,8 @@ bool IdleIo::ReserveReply(ServerConnection& connection, std::size_t bytes, bool 
     return true;
 }
 
-void IdleIo::RestartPieceDeadline(ServerConnection& connection) {
-    connection.input_deadline = std::chrono::steady_clock::now() +
+void IdleIo::RestartPieceDeadline(ServerConnection& connection, std::chrono::steady_clock::time_point now) {
+    connection.input_deadline = now +
         std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
     connection.record_deadline = false;
 }
@@ -279,9 +279,11 @@ bool IdleIo::Read(ServerConnection& connection) {
     }
     connection.io_wait = POLLIN;
     connection.record_deadline = false;
-    if (!connection.input_deadline)
-        connection.input_deadline = std::chrono::steady_clock::now() +
+    if (!connection.input_deadline) {
+        connection.received_at = std::chrono::steady_clock::now();
+        connection.input_deadline = *connection.received_at +
             std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
+    }
     connection.pending.append(buffer.data(), static_cast<std::size_t>(read));
 #ifdef CHUNKDB_WITH_OPENSSL
     if (connection.tls && SSL_pending(connection.tls) != 0) connection.read_ready = true;
@@ -290,9 +292,17 @@ bool IdleIo::Read(ServerConnection& connection) {
 }
 
 bool IdleIo::Parse(ServerConnection& connection, bool worker) {
+    // Parsing does not wait, so one clock reading serves every deadline this
+    // call starts: that of the read that buffered the bytes, or one taken
+    // when first needed.
+    auto at = std::exchange(connection.received_at, std::nullopt);
+    const auto now = [&at] {
+        if (!at) at = std::chrono::steady_clock::now();
+        return *at;
+    };
     if ((!connection.pending.empty() || !connection.request_line.empty()) && !connection.input_deadline &&
         !connection.waiting_credit)
-        connection.input_deadline = std::chrono::steady_clock::now() +
+        connection.input_deadline = now() +
             std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
     if (connection.request_line.empty()) {
         connection.pending.enforce_partial_line_limit(server_.config_.max_line_bytes);
@@ -300,7 +310,7 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
         // After authentication the line had its own deadline; the frames
         // that follow it start another. Before it, the HELLO deadline bounds
         // the whole exchange.
-        if (connection.session.greeted) RestartPieceDeadline(connection);
+        if (connection.session.greeted) RestartPieceDeadline(connection, now());
         connection.payload = server_.engine_->PlanPayload(connection.session, connection.request_line);
         connection.control_request = !connection.session.greeted || ControlRequest(connection.request_line);
         if (!connection.control_request && !data_line_credit_->Owns(connection.line_credit)) {
@@ -350,7 +360,7 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
                     // The server's wait is not the client's lateness: the frame
                     // deadline starts again when the credit is granted.
                     connection.input_deadline.reset();
-                    connection.credit_deadline = std::chrono::steady_clock::now() +
+                    connection.credit_deadline = now() +
                         std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
                     if (auto* hook = server_.delivery_test_hook_.load(std::memory_order_acquire))
                         hook->Run(FeedDeliveryTestHook::Point::kAfterPayloadCreditQueued, connection.session.connection_id);
@@ -373,7 +383,7 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
         const bool complete = connection.frames->Consume(connection.pending, server_.config_.max_line_bytes);
         // After authentication each frame header and each frame body (from
         // the end of its header) has the I/O timeout of its own.
-        if (connection.session.greeted && connection.frames->pieces() != pieces) RestartPieceDeadline(connection);
+        if (connection.session.greeted && connection.frames->pieces() != pieces) RestartPieceDeadline(connection, now());
         if (!complete) return true;
         if (connection.frames->total_exceeded()) {
             connection.session.close_after_reply = true;
@@ -412,7 +422,7 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
         const auto timeout_ms =
             connection.session.hello_options.statement_timeout_ms.value_or(server_.config_.statement_timeout_ms);
         auto control = std::make_shared<StatementControl>(
-            timeout_ms != 0U ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}, timeout_ms);
+            timeout_ms != 0U ? now() : std::chrono::steady_clock::time_point{}, timeout_ms);
         if (worker) {
             if (!control->Start()) {
                 Reply(connection, StatementStoppedReply(*control->TakeQueuedStop()));
@@ -503,7 +513,7 @@ void IdleIo::PumpCredits() {
             connection->payload_credit = std::move(credit);
             connection->waiting_credit = false;
             connection->credit_deadline.reset();
-            RestartPieceDeadline(*connection);
+            RestartPieceDeadline(*connection, std::chrono::steady_clock::now());
             connection->read_ready = true;
             if (auto* hook = server_.delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kAfterPayloadCreditGranted, connection->session.connection_id);
@@ -515,10 +525,11 @@ void IdleIo::PumpCredits() {
     pump(data_waiters_, data_credit_, true);
 }
 
-bool IdleIo::Write(ServerConnection& connection, bool keep) {
+bool IdleIo::Write(ServerConnection& connection, bool keep, std::optional<std::chrono::steady_clock::time_point> now) {
+    const auto clock = [&now] { return now ? *now : std::chrono::steady_clock::now(); };
     // Only a held-back login reply has a time before which it is not written.
     if (connection.session.reply_not_before != std::chrono::steady_clock::time_point{} &&
-        std::chrono::steady_clock::now() < connection.session.reply_not_before) return true;
+        clock() < connection.session.reply_not_before) return true;
     if (connection.response_offset == connection.response.size() && connection.reply_continuation) {
         connection.response = connection.reply_continuation->Next(65536U);
         connection.response_offset = 0U;
@@ -617,7 +628,7 @@ bool IdleIo::Write(ServerConnection& connection, bool keep) {
     if (connection.session.close_after_reply) return false;
     connection.phase = ServerConnection::Phase::kInput;
     connection.io_wait = POLLIN;
-    connection.idle_deadline = std::chrono::steady_clock::now() +
+    connection.idle_deadline = clock() +
         std::chrono::milliseconds(server_.config_.idle_connection_timeout_ms);
     if (!connection.pending.empty()) connection.read_ready = true;
     if (auto* hook = server_.delivery_test_hook_.load(std::memory_order_acquire))

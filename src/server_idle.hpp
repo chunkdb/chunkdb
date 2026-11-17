@@ -3,10 +3,12 @@
 #include "server_poller.hpp"
 #include "server_credit.hpp"
 
+#include <chrono>
 #include <memory>
 #include <atomic>
 #include <deque>
 #include <mutex>
+#include <optional>
 #include <thread>
 #include <vector>
 
@@ -57,13 +59,16 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
     bool Parse(ServerConnection& connection, bool worker = false);
     // keep: the writing worker waits for this connection's next request, so
     // its ordinary reply reservation, data line credit and buffers stay.
-    bool Write(ServerConnection& connection, bool keep = false);
+    // now: a clock reading the caller took just before, for the held-back
+    // time and the idle deadline of a finished reply.
+    bool Write(ServerConnection& connection, bool keep = false,
+        std::optional<std::chrono::steady_clock::time_point> now = std::nullopt);
     // Returns what Write kept once no reply or line is in progress.
     void ReleaseKept(ServerConnection& connection);
     void Reply(ServerConnection& connection, std::string response);
     bool ReserveReply(ServerConnection& connection, std::size_t bytes, bool control);
     bool RejectProtocol(ServerConnection& connection, const std::exception& error);
-    void RestartPieceDeadline(ServerConnection& connection);
+    void RestartPieceDeadline(ServerConnection& connection, std::chrono::steady_clock::time_point now);
     // One connection's step on this thread; its failure closes only it.
     void Serve(std::shared_ptr<ServerConnection>& connection);
     void Abandon(std::shared_ptr<ServerConnection>& connection, const std::exception& error);

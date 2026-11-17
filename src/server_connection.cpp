@@ -109,15 +109,17 @@ bool ChunkServer::HandleClient(
             connection->response_write_size = 0;
             connection->phase = ServerConnection::Phase::kReply;
             connection->io_wait = POLLOUT;
-            connection->output_deadline = std::chrono::steady_clock::now() +
-                std::chrono::milliseconds(config_.client_io_timeout_ms);
-            if (!io->Write(*connection, true)) return false;
+            // The one clock reading after execution starts the output deadline,
+            // and the idle deadline and bounded receive of a reply finished at once.
+            const auto replied = std::chrono::steady_clock::now();
+            connection->output_deadline = replied + std::chrono::milliseconds(config_.client_io_timeout_ms);
+            if (!io->Write(*connection, true, replied)) return false;
             if (connection->phase != ServerConnection::Phase::kInput || session.watch || session.slot_watch)
                 return park();
             // The first wait after a reply is the bounded receive, then the poller.
             bool receive = true;
             while (connection->pending.empty()) {
-                const auto brief = receive ? AwaitReceive(*connection) : std::nullopt;
+                const auto brief = receive ? AwaitReceive(*connection, replied) : std::nullopt;
                 receive = false;
                 const auto next = brief ? *brief : AwaitNextRequest(wait, *connection);
                 if (next == NextRequest::kClose) return false;
@@ -163,16 +165,20 @@ bool ChunkServer::ParkClient(const std::shared_ptr<ServerConnection>& connection
 // kWorkerReceiveWaitMs, the single system call main's worker makes, while no
 // queued request needs it. A request queued meanwhile, KILL and stop take
 // effect when that receive returns; no wake reaches it.
-std::optional<ChunkServer::NextRequest> ChunkServer::AwaitReceive(ServerConnection& connection) {
+std::optional<ChunkServer::NextRequest> ChunkServer::AwaitReceive(
+    ServerConnection& connection, std::chrono::steady_clock::time_point replied) {
 #ifdef _WIN32
     // A Windows socket is indeterminate after a receive times out.
     (void)connection;
+    (void)replied;
     return std::nullopt;
 #else
-    using Clock = std::chrono::steady_clock;
     // OpenSSL keeps record state across reads; its nonblocking reads stay with the poller.
     if (connection.tls) return std::nullopt;
-    if (connection.idle_deadline - Clock::now() <= std::chrono::milliseconds(kWorkerReceiveWaitMs)) return std::nullopt;
+    // The reply was sent after `replied` by one send that waits at most
+    // kWorkerReceiveWaitMs, so the receive ends by the idle deadline when
+    // twice that bound remained at `replied`.
+    if (connection.idle_deadline - replied <= std::chrono::milliseconds(2 * kWorkerReceiveWaitMs)) return std::nullopt;
     // A request queued after this check waits for the receive like one
     // queued during it, so the published shortage needs no mutex here.
     if (!running_.load() || workers_short_.load(std::memory_order_acquire)) return NextRequest::kReturn;

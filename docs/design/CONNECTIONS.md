@@ -82,6 +82,25 @@ A reply continuation owns immutable chunk state, schema and projection until its
 Output progress resets the progress deadline; stalled output closes the connection.
 A lost connection after a commit can still leave the outcome unknown to its client.
 
+## Clock reads
+
+A monotonic clock read can cost more than a microsecond where the kernel has no fast clock source, so the steady-state request path takes no more of them than main's worker.
+The read that buffers a request's first bytes takes one, and the Parse that follows it starts the line and frame deadlines and the statement admission time from it, since parsing does not wait.
+The worker takes one more after execution; it starts the output deadline, checks a held-back time and, when the first send finishes the reply, starts the idle deadline, which can therefore begin up to that send's 2 ms bound early.
+The bounded receive uses the same reading and needs twice the 2 ms bound left before the idle deadline, because that send waits at most 2 ms.
+Only a held-back reply, an unfinished reply's progress deadline and the I/O owner's tracking of a statement deadline add reads.
+For a request on a kept plain connection that arrives whole within the bounded receive, the transport reads the clock this often; execution adds the same two reads (start time and reply metrics) on both, and a configured slow-statement log one more.
+
+| Request | main | before (2f010ef3) | now |
+| --- | --- | --- | --- |
+| GET BLOCK, GET AREA, SET BLOCK without frames | 3 | 5 | 2 |
+| SET CHUNK and other requests with n parameter frames | 3 + 3n | 6 | 2 |
+| either, with a statement timeout (worker only) | no timeout | +1 | +0 |
+
+Main reads once when the line's first bytes arrive, once per frame header, body and terminator, once for the write deadline and once before its first send.
+Before, the worker read once for the first bytes, once when the line ended, once when frames ended, once for the output deadline, once when the reply finished and once before the bounded receive.
+A request that arrives in several reads, waits on the poller or uses TLS reads the clock at each wait as before.
+
 ## Session controls
 
 `SHOW CONNECTIONS` returns bounded entries with exact connection ids, user, peer, state and statement verb.

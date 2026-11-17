@@ -170,8 +170,9 @@ class ChunkServer {
     enum class NextRequest { kRead, kReturn, kClose };
     NextRequest AwaitNextRequest(WorkerWait& wait, ServerConnection& connection);
     // The bounded blocking receive that precedes AwaitNextRequest, or nothing
-    // where only the poller may wait.
-    std::optional<NextRequest> AwaitReceive(ServerConnection& connection);
+    // where only the poller may wait. `replied`: the clock reading taken
+    // before the reply that set the idle deadline was sent.
+    std::optional<NextRequest> AwaitReceive(ServerConnection& connection, std::chrono::steady_clock::time_point replied);
     void WakeWaitingWorker(const ServerConnection& connection);
     // The worker holds no connection any more: it counts for queued requests.
     void FreeWorker(WorkerWait& wait) noexcept;
