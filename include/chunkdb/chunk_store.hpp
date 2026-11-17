@@ -1151,7 +1151,8 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_empty_batch_{0};
     std::atomic<std::uint64_t> stats_eviction_refill_large_chunk_scans_{0};
     std::atomic<std::uint64_t> stats_wal_parent_prepare_calls_{0};
-    // Path lookups of a chunk's WAL made for its size (CurrentWalFileSize).
+    // Path lookups of a chunk's image, WAL or their directory made by a
+    // chunk load or for a WAL's size (CurrentWalFileSize).
     mutable std::atomic<std::uint64_t> stats_chunk_file_probes_{0};
     std::atomic<std::uint64_t> stats_eviction_recency_skips_{0};
     std::atomic<std::uint64_t> stats_empty_chunk_gcs_{0};

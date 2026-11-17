@@ -563,7 +563,48 @@ void TestRetainedIdentitiesWithInstanceRegistry() {
 
 }  // namespace
 
+// A chunk load looks up the directory its image and WAL share, and the two
+// files only when that directory exists: the first load of a chunk in a
+// large chunk nothing was written to costs one lookup.
+void TestChunkLoadLooksUpFilesOnlyInAnExistingDirectory() {
+    const auto data_dir = TempDataDir();
+    const chunkdb::StoreConfig config{
+        .geometry = {
+            .large_chunk_width_chunks = 2,
+            .large_chunk_height_chunks = 2,
+            .chunk_width_blocks = 4,
+            .chunk_height_blocks = 4,
+            .block_bits = 4,
+        },
+        .data_dir = data_dir,
+        .durability_mode = chunkdb::DurabilityMode::kRelaxed,
+        .checkpoint_update_interval = 10'000,
+        .checkpoint_wal_bytes = 10'000'000,
+        .wal_group_commit_updates = 1,
+        .allow_multiple_processes = false,
+    };
+    {
+        chunkdb::ChunkStore store(config);
+        auto probes = store.ChunkFileProbeCountForTests();
+        // Chunk (0,0) of large chunk (0,0), which has no directory yet.
+        assert(store.GetBlockBits(0, 0) == "0000");
+        assert(store.ChunkFileProbeCountForTests() == probes + 1U);
+        // Its WAL creates the directory; a sibling's load then looks up the
+        // directory, its image and its WAL.
+        store.SetBlockBits(0, 0, "1010");
+        probes = store.ChunkFileProbeCountForTests();
+        assert(store.GetBlockBits(4, 0) == "0000");
+        assert(store.ChunkFileProbeCountForTests() == probes + 3U);
+    }
+    {
+        chunkdb::ChunkStore reopened(config);
+        assert(reopened.GetBlockBits(0, 0) == "1010");
+    }
+    assert(RemoveAllWithRetry(data_dir));
+}
+
 int main() {
+    TestChunkLoadLooksUpFilesOnlyInAnExistingDirectory();
     TestChunkInstanceRegistryHoldsOnlyLiveInstances();
     TestRetainedIdentitiesWithInstanceRegistry();
     TestNoCacheReadAfterEvictionWithConcurrentCheckpoint();

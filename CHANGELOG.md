@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The first load of a chunk whose large-chunk directory does not exist yet looks up that directory only, no longer the chunk's image and WAL inside it, so a write to a new chunk costs one failing stat instead of three (#139).
 - A relaxed write no longer looks up its chunk's WAL by path when a group-commit flush records the WAL's size as the write's rollback boundary: the open append stream keeps that size, and without one the lookup is a single stat instead of two (#139).
 - Mix coordinate hashes with a process seed across every axis and bound shared large-chunk containers, exposing capacity metrics and a known BUSY refusal for new cache misses (#134).
 - Add three-dimensional tables, typed chunk columns, checked sectioned chunk forms, atomic metadata and projected writes, and retained tombstone identities with incremental scans and explicit compaction (#133).
