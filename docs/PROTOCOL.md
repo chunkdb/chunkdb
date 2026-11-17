@@ -193,7 +193,7 @@ The following list notation describes push elements, rather than literal wire by
 - `[resync, epoch, revision, parent_epoch, fork_revision]`, requesting consumer state reconstruction.
 - `[progress, epoch, revision]`, marking a sender-drained cut during idle or filtered periods.
 
-Current change frames reserve `tag=null` and `txn=null`; a schema map gives the table's `dims` and the block and chunk columns of its `schema_version`.
+Current change frames reserve `tag=null` and `txn=null`; a schema map gives the table's `dims`, the watched block columns, and all chunk columns of its `schema_version`.
 Resync lineage fields are null when no parent lineage is recorded.
 
 Rows are in schema order and use the reply types above; null denotes absent rows or NULL values and an anonymous user.
