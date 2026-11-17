@@ -976,6 +976,7 @@ class ChunkStore {
     friend struct FeedSlotTestAccess;
     friend struct BackupTestAccess;
     friend struct FeatureActivationTestAccess;
+    friend struct UnsyncedTestAccess;
 
     // What a WAL barrier still has to sync (see unsynced_files_).
     struct UnsyncedArtifacts {
@@ -1564,7 +1565,8 @@ class ChunkStore {
     void NoteUnsyncedDir(const std::filesystem::path& path);
     // Keeps the unsynced set within unsynced_limit_. Requires unsynced_mutex_.
     void LimitUnsyncedLocked();
-    // Puts a failed barrier's drained artifacts back into the unsynced set.
+    // Puts a failed barrier's drained artifacts back into the unsynced set;
+    // out of memory, it sets the overflow flag instead.
     void RestoreUnsynced(UnsyncedArtifacts drained);
 
     void StartMaintenanceThread();
