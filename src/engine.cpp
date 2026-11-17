@@ -275,10 +275,9 @@ struct PendingLogin {
     bool known = false;
     // The incarnation of the user HELLO found; the session keeps it.
     std::uint64_t incarnation = 0;
-    // The verifier HELLO found, and whether the login is bound: AUTH
-    // succeeds only while the user still has this verifier and, for an
-    // unbound login, still takes unbound logins.
-    scram::Verifier verifier;
+    // Whether the login is bound: AUTH succeeds only while the user still
+    // has the verifier of `exchange` and, for an unbound login, still takes
+    // unbound logins.
     bool bound = false;
     scram::ServerExchange exchange;
     SessionHelloOptions options;
@@ -943,7 +942,6 @@ std::string CommandEngine::HandleHello(
         .user = user,
         .known = found.has_value(),
         .incarnation = found.has_value() ? found->incarnation : 0U,
-        .verifier = verifier,
         .bound = bound,
         .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce(), binding_data),
         .options = std::move(options),
@@ -985,7 +983,8 @@ std::string CommandEngine::HandleAuth(
     // between fails the login like a wrong password.
     const auto current = config_.users->FindIncarnation(pending->user);
     if (!current.has_value() || current->incarnation != pending->incarnation ||
-        current->user.verifier != pending->verifier || (!pending->bound && current->user.requires_channel_binding)) {
+        current->user.verifier != pending->exchange.UserVerifier() ||
+        (!pending->bound && current->user.requires_channel_binding)) {
         // The audit log gives the reason as of now too, as HELLO would.
         pending->known = current.has_value();
         pending->unbound_refused = current.has_value() && !pending->bound && current->user.requires_channel_binding;
