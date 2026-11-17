@@ -23,6 +23,7 @@
 #include <limits>
 #include <mutex>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -343,6 +344,42 @@ void TestVersionMonotonicAcrossManyReloads() {
             assert(seen.insert(v).second);
             assert(v > last);
             last = v;
+        }
+    }
+}
+
+// A clock whose durable ceiling is at the top of the token range refuses
+// every write, however many follow, and never wraps to token zero.
+void TestExhaustedVersionClockRefusesEveryWrite() {
+    constexpr auto kMax = std::numeric_limits<std::uint64_t>::max();
+    for (const std::uint64_t ceiling : {kMax, kMax - 1U}) {
+        chunkdb::test::ScopedTempDir dir("chunkdb-reg-version-exhausted");
+        const auto config = BaseConfig(dir.path());
+        std::uint64_t revision = 0;
+        std::string bits;
+        {
+            chunkdb::ChunkStore store(config);
+            store.SetBlockBits(0, 0, "10101");
+            revision = store.GetChunkVersion(0, 0);
+            bits = store.GetBlockBits(0, 0);
+        }
+        const auto clock_path = dir.path() / "chunkdb.version";
+        WriteFileBytes(clock_path, chunkdb::SerializeVersionClockRecord(ceiling));
+        for (int reopen = 0; reopen < 2; ++reopen) {
+            chunkdb::ChunkStore store(config);
+            for (int write = 0; write < 3; ++write) {
+                bool refused = false;
+                try {
+                    store.SetBlockBits(write, 0, "01010");
+                } catch (const std::overflow_error& error) {
+                    refused = std::string(error.what()).find("chunk version clock exhausted") != std::string::npos;
+                }
+                assert(refused);
+            }
+            assert(store.GetChunkVersion(0, 0) == revision);
+            assert(store.GetBlockBits(0, 0) == bits);
+            assert(store.GetBlockBits(1, 0) == "00000");
+            assert(ReadFileBytes(clock_path) == chunkdb::SerializeVersionClockRecord(ceiling));
         }
     }
 }
@@ -2204,6 +2241,7 @@ int main() {
     TestBatchCheckpointFailureRollsBackAcrossRestart();
     TestCasCheckpointFailureRollsBack();
     TestVersionMonotonicAcrossManyReloads();
+    TestExhaustedVersionClockRefusesEveryWrite();
     TestPre20ArtifactsAreRejected();
     TestVersionBookkeepingDamageFailsClosed();
     TestBothVersionRecordsMissingRefusesWithoutPublication();
