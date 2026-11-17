@@ -53,8 +53,11 @@ struct UnsyncedTestAccess {
                      store.unsynced_overflow_};
     }
     // What a rollback boundary does before it syncs its chunk's artifacts.
-    static ChunkStore::UnsyncedArtifacts Forget(ChunkStore& store, const std::string& file) {
-        return store.ForgetUnsynced({std::filesystem::path(file)}, {});
+    static ChunkStore::UnsyncedArtifacts Forget(ChunkStore& store, const std::string& file,
+                                                const std::string& dir = {}) {
+        std::vector<std::filesystem::path> dirs;
+        if (!dir.empty()) dirs.emplace_back(dir);
+        return store.ForgetUnsynced({std::filesystem::path(file)}, dirs);
     }
     static void Finish(ChunkStore& store, const ChunkStore::UnsyncedArtifacts& forgotten, bool synced) {
         store.FinishForgottenUnsynced(forgotten, synced);
@@ -208,12 +211,54 @@ void TestEveryDrainAllocationFailure() {
     store.WalBarrier();
     assert(store.UnsyncedTrackedCountForTests() == 0U);
 }
+
+// A barrier leaves the tracked sets empty, without room for an entry. With a
+// file and a directory in flight, whichever allocation of the next drain
+// fails, the overflow flag stays set; the drain that succeeds holds both.
+void TestDrainIntoEmptySetKeepsOverflow() {
+    test::ScopedTempDir dir("chunkdb-barrier-memory-empty");
+    ChunkStore store(Config(dir.path()));
+    store.SetBlockBits(0, 0, "10101");
+    store.SetBlockBits(4, 0, "01010");
+    const auto tracked = Access::Snapshot(store);
+    assert(!tracked.overflow && !tracked.files.empty() && !tracked.dirs.empty());
+    const auto forgotten = Access::Forget(store, *tracked.files.begin(), *tracked.dirs.begin());
+    assert(forgotten.files.size() == 1U && forgotten.dirs.size() == 1U);
+    store.WalBarrier();
+    store.ForceUnsyncedOverflowForTests();
+    const auto before = Access::Snapshot(store);
+    assert(before.overflow && before.files.empty() && before.dirs.empty() && before.swept_dirs.empty());
+    assert(!before.files_in_flight.empty() && !before.dirs_in_flight.empty());
+
+    long failures = 0;
+    for (long fail_after = 0;; ++fail_after) {
+        bool failed = false;
+        auto drained = TakeFailingAllocation(store, fail_after, failed);
+        if (failed) {
+            ++failures;
+            assert(Access::Snapshot(store) == before);
+            continue;
+        }
+        assert(drained.overflow);
+        for (const auto& file : forgotten.files) assert(drained.files.contains(file));
+        for (const auto& dir_path : forgotten.dirs) assert(drained.dirs.contains(dir_path));
+        Access::Restore(store, std::move(drained));
+        break;
+    }
+    assert(failures > 0);
+    Access::Finish(store, forgotten, true);
+    const auto full_syncs = store.RuntimeStats().wal_barrier_full_syncs;
+    store.WalBarrier();
+    assert(store.RuntimeStats().wal_barrier_full_syncs == full_syncs + 1U);
+    assert(!store.UnsyncedOverflowFlagForTests());
+}
 }  // namespace
 
 int main() {
     TestFailedDrainKeepsTrackedFiles();
     TestFailedDrainKeepsOverflow();
     TestEveryDrainAllocationFailure();
+    TestDrainIntoEmptySetKeepsOverflow();
     std::cout << "wal_barrier_memory tests passed\n";
     return 0;
 }
