@@ -52,7 +52,7 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/time.h>
-#include <sys/select.h>
+#include <poll.h>
 #include <unistd.h>
 #endif
 
@@ -342,16 +342,23 @@ class Client {
                 wait = std::min(wait, std::max(std::chrono::milliseconds(1), remaining));
             }
         }
-        fd_set readable;
-        FD_ZERO(&readable); FD_SET(socket_, &readable);
-        timeval timeout{static_cast<decltype(timeval{}.tv_sec)>(wait.count() / 1000),
-                        static_cast<decltype(timeval{}.tv_usec)>((wait.count() % 1000) * 1000)};
+        // poll has no descriptor bound; select fails once a descriptor
+        // number reaches FD_SETSIZE, as it can beside an in-process server.
+        const auto millis = static_cast<int>(std::clamp<std::chrono::milliseconds::rep>(
+            wait.count(), 0, std::numeric_limits<int>::max()));
 #ifdef _WIN32
-        const int ready = select(0, &readable, nullptr, nullptr, &timeout);
+        WSAPOLLFD readable{};
+        readable.fd = socket_; readable.events = POLLRDNORM;
+        const int ready = WSAPoll(&readable, 1, millis);
 #else
-        const int ready = select(socket_ + 1, &readable, nullptr, nullptr, &timeout);
+        pollfd readable{};
+        readable.fd = socket_; readable.events = POLLIN;
+        const int ready = poll(&readable, 1, millis);
+        // A signal ends the wait early; callers wait again.
+        if (ready < 0 && errno == EINTR) return false;
 #endif
         if (ready < 0) throw IoFailure("watch readiness", true);
+        // Hang-up and errors are readable: the next recv reports them.
         return ready != 0;
     }
     void SendLine(std::string_view command) {

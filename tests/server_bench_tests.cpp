@@ -30,7 +30,9 @@ constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
 #else
 #include <arpa/inet.h>
 #include <sys/socket.h>
+#include <sys/resource.h>
 #include <sys/select.h>
+#include <fcntl.h>
 #include <unistd.h>
 using SocketHandle = int;
 constexpr SocketHandle kInvalidSocket = -1;
@@ -839,6 +841,35 @@ void TestWatchCountAndSlots() {
     }
 }
 
+#ifndef _WIN32
+// Watch readiness works for descriptor numbers at and above FD_SETSIZE.
+void TestWatchAboveFdSetSize() {
+    rlimit limit{};
+    if (getrlimit(RLIMIT_NOFILE, &limit) != 0) return;
+    const rlim_t needed = FD_SETSIZE + 256;
+    if (limit.rlim_cur < needed) {
+        if (limit.rlim_max != RLIM_INFINITY && limit.rlim_max < needed) return;  // Cannot exceed FD_SETSIZE here.
+        auto raised = limit; raised.rlim_cur = needed;
+        if (setrlimit(RLIMIT_NOFILE, &raised) != 0) return;
+    }
+    std::vector<int> fillers;
+    for (int fd = open("/dev/null", O_RDONLY); fd >= 0; fd = open("/dev/null", O_RDONLY)) {
+        fillers.push_back(fd);
+        if (fd >= FD_SETSIZE) break;
+    }
+    assert(!fillers.empty() && fillers.back() >= FD_SETSIZE);
+    auto args = chunkdb::server_bench::ParseArgs({"bench", "--watch", "default:2"});
+    args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
+    args.port = PickFreePort(); args.clients = 1; args.requests = 20; args.keyspace = 16;
+    args.tests = {chunkdb::server_bench::Scenario::kSimulation};
+    args.log_level = chunkdb::LogLevel::kWarn;
+    const auto report = chunkdb::server_bench::Run(args);
+    for (const int fd : fillers) close(fd);
+    if (limit.rlim_cur < needed) (void)setrlimit(RLIMIT_NOFILE, &limit);
+    assert(report.results.front().completed_requests == 20U && report.results.front().watch_changes > 0U);
+}
+#endif
+
 void TestEveryScenario() {
     const auto args = chunkdb::server_bench::ParseArgs({
         "chunkdb_server_bench",
@@ -1177,5 +1208,8 @@ int main(int argc, char** argv) {
     TestCompatibleWatchReplies();
     TestWatchCompletedWriteCut();
     TestWatchCountAndSlots();
+#ifndef _WIN32
+    TestWatchAboveFdSetSize();
+#endif
     return 0;
 }
