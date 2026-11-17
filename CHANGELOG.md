@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- On Linux and macOS, a writer lock that fails for a reason other than a lock held by another process is reported with that error (`failed to lock writer lock file: <path>: <reason>`) instead of as an active writer.
 - Check a login's credentials when AUTH finishes it, not only at HELLO: a login whose user got a new verifier, was dropped or created again, or, for an unbound login, got REQUIRE CHANNEL BINDING in between fails with the AUTH_FAILED of a wrong password.
 - A schema push from WATCH ... SLOT carries the table's `dims` and the chunk columns of its schema version, where it sent `dims=2` and empty `chunk_columns` for three-dimensional tables and tables with CHUNK COLUMNS.
 - Add configurable area and transaction chunk limits, exact area-response byte admission, and cursor paging for GET AREA; expose allocator-aware variable storage through `ChunkVars::Encode()` (#136).
