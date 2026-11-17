@@ -186,22 +186,28 @@ bool ChunkStore::ApplyFullChunkStateLocked(
             // The freshly appended WAL record could not be neutralized, so on a
             // later crash recovery repairs it from the retained durable intent.
             // Memory has already been rolled back, so continuing to serve would
-            // leave memory and disk incoherent. Poison the store until restart.
-            const std::string reason =
-                "WAL rollback after a rejected conditional mutation on chunk (" +
-                std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) +
-                ") failed: " + truncate_error.what();
-            LogMessage(
-                LogLevel::kError,
-                LogComponent::kRecovery,
-                "failed to neutralize WAL after rejected conditional mutation; poisoning store",
-                {
-                    {"chunk_x", std::to_string(chunk_coord.x)},
-                    {"chunk_y", std::to_string(chunk_coord.y)},
-                    {"error", truncate_error.what()},
-                });
-            PoisonDurability(reason);
+            // leave memory and disk incoherent. Fail closed first, with a
+            // reason that cannot fail to build, then name it and log it.
             chunk->wal_repair_failed = true;
+            PoisonDurability(std::string());
+            try {
+                PoisonDurability(
+                    "WAL rollback after a rejected conditional mutation on chunk (" +
+                    std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) +
+                    ") failed: " + truncate_error.what());
+                LogMessage(
+                    LogLevel::kError,
+                    LogComponent::kRecovery,
+                    "failed to neutralize WAL after rejected conditional mutation; poisoning store",
+                    {
+                        {"chunk_x", std::to_string(chunk_coord.x)},
+                        {"chunk_y", std::to_string(chunk_coord.y)},
+                        {"error", truncate_error.what()},
+                    });
+            } catch (...) {
+                // The store is fail-closed already; only the reason or the
+                // log line is missing.
+            }
         }
         snapshot_write.Finish();
         throw;

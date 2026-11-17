@@ -23,6 +23,7 @@
 #include <limits>
 #include <mutex>
 #include <new>
+#include <optional>
 #include <set>
 #include <string>
 #include <thread>
@@ -811,10 +812,27 @@ void TestCommittedIntentCleanupFailuresRemainCommitted() {
     }
 }
 
+// Fails every log line containing `needle` while it exists.
+class FailingLogSink {
+  public:
+    FailingLogSink(const char* needle, int* failed) {
+        chunkdb::SetLogSinkForTests([needle, failed](const std::string& line) {
+            if (line.find(needle) != std::string::npos) {
+                ++*failed;
+                throw std::bad_alloc();
+            }
+        });
+    }
+    ~FailingLogSink() { chunkdb::ResetLogSinkForTests(); }
+    FailingLogSink(const FailingLogSink&) = delete;
+    FailingLogSink& operator=(const FailingLogSink&) = delete;
+};
+
 void RunRejectedConditionalRollbackCase(
     ConditionalKind kind,
     const char* rollback_failpoint,
-    bool seed_existing_wal) {
+    bool seed_existing_wal,
+    const char* failing_log = nullptr) {
     chunkdb::test::ScopedTempDir dir("chunkdb-reg-conditional-rollback");
     auto config = BaseConfig(dir.path());
     config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
@@ -829,10 +847,14 @@ void RunRejectedConditionalRollbackCase(
         const auto expected = store.GetChunkVersion(0, 0);
 
         bool threw = false;
+        std::string error;
+        int failed_logs = 0;
         {
             ScopedEnv after_append(
                 "CHUNKDB_FAILPOINT_CONDITIONAL_AFTER_WAL_APPEND_ONCE", "1");
             ScopedEnv rollback_failure(rollback_failpoint, "1");
+            std::optional<FailingLogSink> sink;
+            if (failing_log != nullptr) sink.emplace(failing_log, &failed_logs);
             try {
                 if (kind == ConditionalKind::kCas) {
                     (void)store.CasChunkState(
@@ -846,11 +868,15 @@ void RunRejectedConditionalRollbackCase(
                         {.set = true, .x = 0, .y = 0, .bits = "01010"}};
                     (void)store.ApplyChunkBatch(0, 0, true, expected, ops);
                 }
-            } catch (const std::exception&) {
+            } catch (const std::exception& e) {
                 threw = true;
+                error = e.what();
             }
         }
         assert(threw);
+        // A failed log line neither replaces the error nor skips failing closed.
+        assert(failed_logs == (failing_log != nullptr ? 1 : 0));
+        assert(error.find("injected conditional-mutation failure after WAL append") != std::string::npos);
         assert(store.GetBlockBits(0, 0) ==
                (seed_existing_wal ? "10101" : "00000"));
 
@@ -892,6 +918,16 @@ void TestConditionalRollbackFailuresRecoverFailClosed() {
             kind, "CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", true);
         RunRejectedConditionalRollbackCase(
             kind, "CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE", true);
+        RunRejectedConditionalRollbackCase(
+            kind,
+            "CHUNKDB_FAILPOINT_WAL_REMOVE_FAIL_ONCE",
+            false,
+            "failed to neutralize WAL after rejected conditional mutation");
+        RunRejectedConditionalRollbackCase(
+            kind,
+            "CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE",
+            true,
+            "failed to neutralize WAL after rejected conditional mutation");
     }
 }
 
@@ -1006,22 +1042,6 @@ void TestConditionalCheckpointFailuresDoNotBecomePostCommitErrors() {
     }
 }
 
-// Fails every post-commit warning of a conditional mutation while it exists.
-class FailingCommittedWarningSink {
-  public:
-    explicit FailingCommittedWarningSink(int* failed) {
-        chunkdb::SetLogSinkForTests([failed](const std::string& line) {
-            if (line.find("conditional mutation committed") != std::string::npos) {
-                ++*failed;
-                throw std::bad_alloc();
-            }
-        });
-    }
-    ~FailingCommittedWarningSink() { chunkdb::ResetLogSinkForTests(); }
-    FailingCommittedWarningSink(const FailingCommittedWarningSink&) = delete;
-    FailingCommittedWarningSink& operator=(const FailingCommittedWarningSink&) = delete;
-};
-
 void RunCommittedWarningFailureCase(
     ConditionalKind kind,
     const char* failpoint,
@@ -1046,7 +1066,7 @@ void RunCommittedWarningFailureCase(
         int failed_warnings = 0;
         bool threw = false;
         {
-            FailingCommittedWarningSink sink(&failed_warnings);
+            FailingLogSink sink("conditional mutation committed", &failed_warnings);
             ScopedEnv fp(failpoint, "1");
             try {
                 ApplyConditional(kind, &store, expected);
