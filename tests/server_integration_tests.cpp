@@ -4154,6 +4154,19 @@ void TestServerHarnessStartupFailure() {
     TestPing();
 }
 
+#if defined(__APPLE__) || defined(__linux__)
+// A host asleep for longer than the limit has not stalled the test. On macOS
+// steady_clock counts sleep, and a full run on a laptop that slept failed
+// feed_watch at this watchdog in a phase that takes milliseconds.
+void TestPhaseWatchdogExcludesSuspension() {
+    chunkdb::test::FeedPhaseWatchdog watchdog("PhaseWatchdogSuspension", std::chrono::milliseconds(300));
+    chunkdb::test::FeedPhaseWatchdog::Phase("control: host suspended past the limit");
+    chunkdb::test::FeedPhaseWatchdog::SimulateSuspension(std::chrono::hours(1));
+    // Elapsed time is the subject here: three limits pass while "asleep".
+    std::this_thread::sleep_for(std::chrono::milliseconds(900));
+}
+#endif
+
 #ifndef _WIN32
 // A request larger than the socket buffers reaches a server that stops
 // reading for longer than the client's 200 ms send timeout. CI once failed
@@ -5996,6 +6009,9 @@ int main(int argc, char** argv) {
         run("TestServerHarnessStartupFailure", TestServerHarnessStartupFailure);
 #ifndef _WIN32
         run("TestClientSendOutlastsAPausedReader", TestClientSendOutlastsAPausedReader);
+#endif
+#if defined(__APPLE__) || defined(__linux__)
+        run("TestPhaseWatchdogExcludesSuspension", TestPhaseWatchdogExcludesSuspension);
 #endif
         run("TestLogLevelFilteringWarn", TestLogLevelFilteringWarn);
         run("TestLogLevelFilteringError", TestLogLevelFilteringError);
