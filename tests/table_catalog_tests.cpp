@@ -254,6 +254,48 @@ void TestCreateUndoneWhenNotServed() {
     assert(ReadBits(catalog, "terrain", 1, 1) == "110000011");
 }
 
+// A created table leaves tables/, or its name is fenced, before the failure
+// is logged: a log line that cannot be written does not keep the table there.
+void TestCreateUndoneBeforeItsLog() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-create-undo-log");
+    TableCatalog catalog(Config(dir.path()));
+    struct FailingErrorLog {
+        FailingErrorLog() {
+            chunkdb::SetLogSinkForTests([](const std::string& line) {
+                if (line.find(" ERROR ") != std::string::npos) throw std::bad_alloc();
+            });
+        }
+        ~FailingErrorLog() { chunkdb::ResetLogSinkForTests(); }
+    };
+    const auto set = [](const char* failpoint) {
+#ifdef _WIN32
+        _putenv_s(failpoint, "1");
+#else
+        setenv(failpoint, "1", 1);
+#endif
+    };
+    {
+        FailingErrorLog log;
+        set("CHUNKDB_FAILPOINT_TABLE_CREATE_SYNC_FAIL_ONCE");
+        assert(!ErrorOf([&] { (void)catalog.Create("terrain", kTerrainGeometry, {}); }).empty());
+    }
+    assert(catalog.Find("terrain") == nullptr);
+    assert(!catalog.Fence("terrain"));
+    assert(!std::filesystem::exists(dir.path() / "tables" / "terrain"));
+    {
+        FailingErrorLog log;
+        set("CHUNKDB_FAILPOINT_TABLE_CREATE_SYNC_FAIL_ONCE");
+        set("CHUNKDB_FAILPOINT_TABLE_CREATE_UNDO_FAIL_ONCE");
+        assert(!ErrorOf([&] { (void)catalog.Create("terrain", kTerrainGeometry, {}); }).empty());
+    }
+    assert(catalog.Find("terrain") == nullptr);
+    assert(catalog.Fence("terrain"));
+    assert(std::filesystem::exists(dir.path() / "tables" / "terrain"));
+    catalog.RecoverTable("terrain");
+    WriteBits(catalog, "terrain", 1, 1, "110000011");
+    assert(ReadBits(catalog, "terrain", 1, 1) == "110000011");
+}
+
 void TestDrop() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-drop");
     {
@@ -1250,6 +1292,7 @@ int main(int argc, char** argv) {
     TestTableNames();
     TestCreateUndoneWhenNotDurable();
     TestCreateUndoneWhenNotServed();
+    TestCreateUndoneBeforeItsLog();
     TestDrop();
     TestDropWaitsForRunningCommands();
     TestAcquireDuringDropWaitsThenFails();

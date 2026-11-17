@@ -1784,23 +1784,33 @@ std::shared_ptr<Table> TableCatalog::Create(
     } catch (const std::exception& e) {
         // The store closes before its directory moves.
         store.reset();
-        LogMessage(
-            LogLevel::kError,
-            LogComponent::kStore,
-            "created table cannot be made durable or opened; removing it",
-            {{"table", table_name}, {"error", e.what()}});
+        // The table leaves tables/, or its name is fenced, before anything is
+        // logged: a log line allocates, and its failure must not leave a
+        // table this server neither serves nor fences.
+        bool removed = false;
         try {
             if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_CREATE_UNDO_FAIL_ONCE"))
                 throw std::runtime_error("injected failure removing a created table");
             MoveToDropped(target, table_name);
+            removed = true;
         } catch (const std::exception& undo_error) {
+            {
+                std::unique_lock lock(tables_mutex_);
+                fenced_.insert(std::move(undo_fence));
+            }
             LogMessage(
                 LogLevel::kError,
                 LogComponent::kStore,
-                "created table could not be removed again; it is fenced until RECOVER TABLE or a restart opens it",
-                {{"table", table_name}, {"error", undo_error.what()}});
-            std::unique_lock lock(tables_mutex_);
-            fenced_.insert(std::move(undo_fence));
+                "created table cannot be made durable or opened and could not be removed again; it is fenced until "
+                "RECOVER TABLE or a restart opens it",
+                {{"table", table_name}, {"error", e.what()}, {"undo_error", undo_error.what()}});
+        }
+        if (removed) {
+            LogMessage(
+                LogLevel::kError,
+                LogComponent::kStore,
+                "created table cannot be made durable or opened; it was removed",
+                {{"table", table_name}, {"error", e.what()}});
         }
         throw;
     }
