@@ -68,14 +68,16 @@ std::uint16_t ParsePort(const std::string& value) {
     return static_cast<std::uint16_t>(port);
 }
 
-// A decimal integer from `min` to `max`.
+// A decimal integer from `min` to `max`; the largest size_t means no upper
+// bound.
 std::size_t ParseBounded(const std::string& value, const char* flag, std::size_t min, std::size_t max) {
     std::size_t parsed = 0;
     const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
     if (result.ec != std::errc() || result.ptr != value.data() + value.size() || parsed < min || parsed > max) {
-        throw std::invalid_argument(
-            std::string("invalid ") + flag + ": " + value + " (expected " + std::to_string(min) + " to " +
-            std::to_string(max) + ")");
+        const std::string expected = max == std::numeric_limits<std::size_t>::max()
+            ? std::to_string(min) + " or more"
+            : std::to_string(min) + " to " + std::to_string(max);
+        throw std::invalid_argument(std::string("invalid ") + flag + ": " + value + " (expected " + expected + ")");
     }
     return parsed;
 }
