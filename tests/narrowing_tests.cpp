@@ -418,7 +418,13 @@ void TestRequiredAfterChunkMetadata(bool migrate) {
         assert(engine->Execute(*session, "CREATE TABLE world (id u16) CHUNK 4 x 4 CHUNK COLUMNS (meta u8 DEFAULT 0)") == "+OK\r\n");
         assert(engine->Execute(*session, "SET CHUNK 0 0 IN world META meta=1").front() == ':');
         assert(engine->Execute(*session, "SET CHUNK 1 0 IN world META meta=2").front() == ':');
-        if (reopen) open();
+        if (reopen) {
+            open();
+            // The check reads the chunks on disk without loading them.
+            auto lease = catalog->Find("world")->Acquire();
+            assert(!lease->store().HasPresentBlocks());
+            assert(lease->store().ApproxLoadedChunkCount() == 0U);
+        }
         const auto prefix = std::string(migrate ? "MIGRATE 'required' " : "");
         const auto expected = migrate ? "+applied\r\n" : "+OK\r\n";
         const auto add = engine->Execute(*session, prefix + "ALTER TABLE world ADD COLUMN must u8 REQUIRED");

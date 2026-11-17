@@ -1199,15 +1199,15 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
 }
 
 bool ChunkStore::HasPresentBlocks() {
-    // A populated chunk may hold only chunk metadata, so check its blocks.
+    // A populated chunk may hold only chunk metadata, so check its blocks,
+    // read without loading the chunk into the cache.
     bool has_cursor = false;
     ChunkCoord cursor{};
     while (true) {
         const auto page = ScanPopulatedChunks(has_cursor, cursor, kMaxChunkScanLimit);
         for (const auto& coord : page.coords) {
-            const auto chunk = GetOrLoadRegularChunk(coord);
-            std::shared_lock lock(chunk->mutex);
-            if (ChunkPresent(chunk->presence_bitmap)) {
+            ChunkRangeEntry state;
+            if (ReadPopulatedChunkStateNoCache(coord, &state, false) && ChunkPresent(state.presence_bitmap)) {
                 return true;
             }
         }
