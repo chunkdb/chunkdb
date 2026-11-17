@@ -18,7 +18,7 @@ usage: docker-quickstart.sh --tool PATH (--cli PATH | --published) [--page FILE]
                 go install command; needs go on PATH
   --page        default docs/QUICK_START.md
   --reset-page  default docs/PASSWORD_RESET.md
-  --image       default chunkdb:quickstart-ci, or the page's image with --published
+  --image       default chunkdb:quickstart-ci, or ghcr.io/chunkdb/chunkdb:2 with --published
   --logs        default docker-quickstart-logs (commands.log, checks.json)
 EOF
   exit 2

@@ -103,7 +103,7 @@ jobs:
           if-no-files-found: error
 
   release:
-    needs: build
+    needs: [build, docker-tags]
     runs-on: ubuntu-22.04
     timeout-minutes: 15
     permissions:
@@ -166,11 +166,11 @@ jobs:
           push: true
           tags: |
             ghcr.io/chunkdb/chunkdb:${{ steps.image.outputs.version }}
-            ghcr.io/chunkdb/chunkdb:${{ steps.image.outputs.major }}
-            ghcr.io/chunkdb/chunkdb:latest
 
-  # Runs QUICK_START.md as written on a fresh runner: the page pulls the
-  # published image and installs chunk-cli with its own go install command.
+  # Runs QUICK_START.md as written on a fresh runner against the version tag:
+  # the page's image is replaced by it, and chunk-cli comes from the page's own
+  # go install command. The major and latest tags and the GitHub release wait
+  # for this job.
   docker-quickstart:
     name: Quick start on the published image
     needs: docker-image
@@ -188,21 +188,20 @@ jobs:
         run: |
           cmake -S . -B build-docs -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WITH_TLS=OFF -DCHUNKDB_WERROR=ON
           nice -n 10 cmake --build build-docs --target chunkdb_docs_check --parallel "$(nproc)"
-      - name: Check the page names the released image
+      - name: Check the page names the released major tag
         env:
-          VERSION: ${{ needs.docker-image.outputs.version }}
           MAJOR: ${{ needs.docker-image.outputs.major }}
         run: |
           if ! grep -qE "ghcr\.io/chunkdb/chunkdb:${MAJOR}(\s|$)" docs/QUICK_START.md; then
             echo "docs/QUICK_START.md does not start the :$MAJOR image"
             exit 1
           fi
-          docker pull "ghcr.io/chunkdb/chunkdb:$VERSION"
-          docker pull "ghcr.io/chunkdb/chunkdb:$MAJOR"
-          test "$(docker image inspect --format '{{.Id}}' "ghcr.io/chunkdb/chunkdb:$VERSION")" = \
-            "$(docker image inspect --format '{{.Id}}' "ghcr.io/chunkdb/chunkdb:$MAJOR")"
       - name: Run commands from QUICK_START.md
-        run: bash scripts/test/docker-quickstart.sh --published --tool build-docs/chunkdb_docs_check --logs docker-quickstart-logs
+        env:
+          VERSION: ${{ needs.docker-image.outputs.version }}
+        run: |
+          bash scripts/test/docker-quickstart.sh --published --image "ghcr.io/chunkdb/chunkdb:$VERSION" \
+            --tool build-docs/chunkdb_docs_check --logs docker-quickstart-logs
       - name: Upload page check logs
         if: always()
         uses: actions/upload-artifact@v6
@@ -210,3 +209,33 @@ jobs:
           name: docker-quickstart-published-logs
           path: docker-quickstart-logs
           if-no-files-found: warn
+
+  # Points the tags the page and new users pull at the version image only after
+  # the page passed on it.
+  docker-tags:
+    name: Tag the checked image as major and latest
+    needs: [docker-image, docker-quickstart]
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: docker/setup-buildx-action@v4
+      - name: Log in to GHCR
+        uses: docker/login-action@v4
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - name: Point the major and latest tags at the version image
+        env:
+          SOURCE: ghcr.io/chunkdb/chunkdb:${{ needs.docker-image.outputs.version }}
+          MAJOR_TAG: ghcr.io/chunkdb/chunkdb:${{ needs.docker-image.outputs.major }}
+          LATEST_TAG: ghcr.io/chunkdb/chunkdb:latest
+        run: |
+          docker buildx imagetools create --tag "$MAJOR_TAG" --tag "$LATEST_TAG" "$SOURCE"
+          docker pull "$SOURCE"
+          docker pull "$MAJOR_TAG"
+          test "$(docker image inspect --format '{{.Id}}' "$SOURCE")" = \
+            "$(docker image inspect --format '{{.Id}}' "$MAJOR_TAG")"

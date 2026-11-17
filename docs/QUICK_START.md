@@ -97,8 +97,8 @@ Press Ctrl-C to stop it.
 
 ## If a step fails
 
-- `The container name "/chunkdb-quickstart" is already in use`: remove the old container with `docker rm -f chunkdb-quickstart` and start again.
-- `port is already allocated`: publish another host port, such as `-p 127.0.0.1:4243:4242`, and use that port in `CHUNKDB_URI`.
+- `The container name "/chunkdb-quickstart" is already in use`: remove the old container with `docker rm -f chunkdb-quickstart` and start again; the volume is kept, so the start prints no `Generated password` line (see below).
+- `port is already allocated`: run `docker rm -f chunkdb-quickstart`, which removes the container that did not start, then publish another host port, such as `-p 127.0.0.1:4243:4242`, and use that port in `CHUNKDB_URI`.
 - No `Generated password` line: the volume keeps the users of an earlier run. Use that password or [reset it](PASSWORD_RESET.md); to start empty, run `docker rm -f chunkdb-quickstart` and `docker volume rm chunkdb-quickstart-data`, which deletes the stored data.
 - `connection refused` or `connection reset`: wait until the health command prints `healthy`.
 - `no password for user admin`: export `CHUNKDB_PASSWORD` in this terminal, as in step 2.
