@@ -173,10 +173,9 @@ std::optional<ChunkServer::NextRequest> ChunkServer::AwaitReceive(ServerConnecti
     // OpenSSL keeps record state across reads; its nonblocking reads stay with the poller.
     if (connection.tls) return std::nullopt;
     if (connection.idle_deadline - Clock::now() <= std::chrono::milliseconds(kWorkerReceiveWaitMs)) return std::nullopt;
-    {
-        std::lock_guard lock(pending_clients_mutex_);
-        if (!running_.load() || pending_clients_.size() > free_workers_ + yielding_workers_) return NextRequest::kReturn;
-    }
+    // A request queued after this check waits for the receive like one
+    // queued during it, so the published shortage needs no mutex here.
+    if (!running_.load() || workers_short_.load(std::memory_order_acquire)) return NextRequest::kReturn;
     if (connection.record->killed.load()) return NextRequest::kClose;
     std::string error;
     if (!connection.worker_timeouts) {
@@ -232,7 +231,10 @@ ChunkServer::NextRequest ChunkServer::AwaitNextRequest(WorkerWait& wait, ServerC
                 wait.waiting = false;
                 wait.connection = nullptr;
                 yielded = std::exchange(wait.yield, false);
-                if (yielded) --server.yielding_workers_;
+                if (yielded) {
+                    --server.yielding_workers_;
+                    server.PublishWorkerShortageLocked();
+                }
             }
             ~Registration() { Leave(); }
         } registration{*this, wait};
@@ -276,6 +278,11 @@ void ChunkServer::FreeWorker(WorkerWait& wait) noexcept {
     std::lock_guard lock(pending_clients_mutex_);
     if (!std::exchange(wait.holding, false)) return;
     ++free_workers_;
+    PublishWorkerShortageLocked();
+}
+
+void ChunkServer::PublishWorkerShortageLocked() noexcept {
+    workers_short_.store(pending_clients_.size() > free_workers_ + yielding_workers_, std::memory_order_release);
 }
 
 void ChunkServer::WakeWaitingWorker(const ServerConnection& connection) {
@@ -319,6 +326,7 @@ bool ChunkServer::DispatchClient(const std::shared_ptr<ServerConnection>& connec
                     break;
                 }
             }
+            PublishWorkerShortageLocked();
             pending_clients_cv_.notify_one();
             engine_->metrics()->SetPendingConnections(pending_clients_.size());
             return true;

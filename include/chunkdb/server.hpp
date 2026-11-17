@@ -135,6 +135,10 @@ class ChunkServer {
     std::size_t yielding_workers_ = 0U;
     std::size_t next_yield_ = 0U;
     bool dispatch_refused_ = false;
+    // Whether queued requests outnumber the free and yielding workers. It is
+    // stored under pending_clients_mutex_ after each change of those counts,
+    // so the check before a bounded receive needs no mutex.
+    std::atomic<bool> workers_short_{false};
     // One per worker; its fields are guarded by pending_clients_mutex_.
     std::vector<std::shared_ptr<WorkerWait>> worker_waits_;
     std::atomic<bool> pending_queue_overload_warned_{false};
@@ -171,6 +175,8 @@ class ChunkServer {
     void WakeWaitingWorker(const ServerConnection& connection);
     // The worker holds no connection any more: it counts for queued requests.
     void FreeWorker(WorkerWait& wait) noexcept;
+    // Stores workers_short_; the caller holds pending_clients_mutex_.
+    void PublishWorkerShortageLocked() noexcept;
     bool HandOff(const std::shared_ptr<ServerConnection>& connection);
     bool ParkClient(const std::shared_ptr<ServerConnection>& connection);
     bool DispatchClient(const std::shared_ptr<ServerConnection>& connection);

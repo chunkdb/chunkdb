@@ -189,6 +189,7 @@ void ChunkServer::StartWorkers() {
         std::lock_guard lock(pending_clients_mutex_);
         worker_waits_ = std::move(waits);
         free_workers_ = config_.worker_threads;
+        PublishWorkerShortageLocked();
     }
     io->Start();
     idle->Start();
@@ -529,6 +530,7 @@ void ChunkServer::Stop() {
             if (client.resumed) continue;
             else CloseSocket(static_cast<SocketHandle>(client.socket));
         }
+        PublishWorkerShortageLocked();
     }
 
     active_count = ShutdownActiveClients();
@@ -607,6 +609,7 @@ void ChunkServer::WorkerLoop(std::size_t worker_index) {
                 --free_workers_;
                 break;
             }
+            PublishWorkerShortageLocked();
             // A refused dispatch stays with the I/O owner until queue space
             // returns; only then does a pop need to wake it.
             wake_io = std::exchange(dispatch_refused_, false);
