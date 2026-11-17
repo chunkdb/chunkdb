@@ -1012,8 +1012,10 @@ void TestCommitTimeSurvivesReload() {
 }  // namespace
 
 void TestWalIoErrorCauses() {
-    struct PreviousStreamLayout { void* handle; bool good; };
-    static_assert(sizeof(chunkdb::WalAppendStream) == sizeof(PreviousStreamLayout));
+    // The error cause fits where the good flag was; the stream also keeps its
+    // file size and its unflushed bytes so relaxed flushes need no stat.
+    struct ExpectedStreamLayout { void* handle; int error; std::optional<std::uint64_t> size; std::uint64_t unflushed; };
+    static_assert(sizeof(chunkdb::WalAppendStream) == sizeof(ExpectedStreamLayout));
     chunkdb::test::ScopedTempDir temp("chunkdb-wal-io-cause");
     chunkdb::WalAppendStream missing(temp.path() / "missing" / "wal", std::ios::binary | std::ios::app);
     assert(!missing.is_open() && missing.error() == ENOENT);

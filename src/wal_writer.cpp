@@ -361,23 +361,30 @@ std::uint64_t ChunkStore::CurrentWalFileSize(
     if (chunk->wal_path.empty()) {
         return 0;
     }
-    std::error_code exists_ec;
-    const bool present = std::filesystem::exists(chunk->wal_path, exists_ec);
-    if (exists_ec) {
-        throw std::runtime_error(
-            "failed to stat WAL for rollback baseline: " + chunk->wal_path.string() +
-            " (ec=" + std::to_string(exists_ec.value()) + ", msg='" + exists_ec.message() + "')");
+    // While the chunk's append stream is open it is the only writer of the
+    // WAL: whatever truncates, replaces or removes the file closes the stream
+    // first. Its size then needs no lookup of the path, which every
+    // group-commit flush would otherwise pay.
+    if (chunk->wal_append_stream != nullptr) {
+        if (const auto size = chunk->wal_append_stream->size()) {
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_SIZE_STAT_FAIL_ONCE")) {
+                throw std::runtime_error(
+                    "injected WAL size inspection failure: " + chunk->wal_path.string());
+            }
+            return *size;
+        }
     }
-    if (!present) {
+    stats_chunk_file_probes_.fetch_add(1, std::memory_order_relaxed);
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(chunk->wal_path, ec);
+    if (ec == std::errc::no_such_file_or_directory || ec == std::errc::not_a_directory) {
         // Definitively absent: there is no committed WAL to preserve.
         return 0;
     }
-    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_SIZE_STAT_FAIL_ONCE")) {
+    if (!ec && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_SIZE_STAT_FAIL_ONCE")) {
         throw std::runtime_error(
             "injected WAL size inspection failure: " + chunk->wal_path.string());
     }
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(chunk->wal_path, ec);
     if (ec) {
         // Never interpret an inspection failure as an empty WAL: doing so would
         // let a failed rollback remove or under-truncate a WAL that still holds
