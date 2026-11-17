@@ -555,6 +555,13 @@ void TestCredentialsChangedDuringLogin() {
     }), kWrongLogin);
     (void)server.LoggedIn("bot", "hunter2");
 
+    // The user dropped.
+    ExpectReply(login_around("hunter2", [&] {
+        ExpectReply(server.Run(admin, "DROP USER bot"), "+OK\r\n");
+    }), kWrongLogin);
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{bot_verifier}), "+OK\r\n");
+    (void)server.LoggedIn("bot", "hunter2");
+
     // The user now takes only bound logins: this unbound one fails.
     ExpectReply(login_around("hunter2", [&] {
         ExpectReply(server.Run(admin, "ALTER USER bot REQUIRE CHANNEL BINDING"), "+OK\r\n");
