@@ -908,7 +908,7 @@ std::string CommandEngine::HandleHello(
     if (session.connection_id == 0U) session.connection_id = NewConnectionId();
     if (!hello.user) {
         if (config_.require_auth) {
-            return Protocol::Error("AUTH_REQUIRED", "log in with a user name and password, for example chunk://admin:PASSWORD@host:4242/ (clients use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message)");
+            return Protocol::Error("AUTH_REQUIRED", "log in with a user name and password: name the user in the URI, such as chunk://admin@host:4242/, and give the client the password (clients use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message)");
         }
         RecordAuthSuccess(session, {});
         session.hello_options = std::move(options);

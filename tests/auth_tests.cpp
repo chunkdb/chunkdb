@@ -133,7 +133,7 @@ int main() {
         const auto auth_required = engine.Execute(session, "HELLO 3\r\n");
         assert(auth_required.rfind("-ERR AUTH_REQUIRED reason=auth_required log in with a user name and password", 0) == 0);
         assert(auth_required.find("use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message") != std::string::npos);
-        assert(auth_required.find("log in with a user name and password, for example chunk://admin:PASSWORD@host:4242/") != std::string::npos);
+        assert(auth_required.find("log in with a user name and password: name the user in the URI, such as chunk://admin@host:4242/, and give the client the password") != std::string::npos);
         // The token option is gone.
         assert(engine.Execute(session, "HELLO 3 AUTH secret\r\n").starts_with("-ERR SYNTAX"));
         // A wrong password and an unknown user fail alike.
