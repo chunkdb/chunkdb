@@ -155,6 +155,7 @@ After ordinary UNWATCH, the subscription is removed and its configured history l
 
 Slot delivery stops at the durable frontier, including in relaxed mode.
 ACK persistence is asynchronous; UNWATCH persists that watch's eligible ACK before returning.
+When a slot watch ends after losing access or exceeding an ACK or output deadline, its claim is released before the terminal reply or socket closure; reconnecting does not wait for background watch cleanup.
 After a crash, changes can repeat.
 Store the applied position atomically with your own output to prevent duplicate effects.
 

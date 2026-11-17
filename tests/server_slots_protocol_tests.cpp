@@ -554,6 +554,154 @@ void WatchRevoke(bool tls) {
     Error(slot.Read(), "NO_TABLE"); Closed(slot);
 }
 
+// Hold the only catch-up worker before cleanup, then hold it again after
+// cleanup. Socket close and immediate reattach must fall between those cuts.
+class ReconnectSchedule : public FeedDeliveryTestHook {
+  public:
+    explicit ReconnectSchedule(bool pause_admission, bool pause_cancel, std::size_t minimum = 0U)
+        : pause_admission_(pause_admission), pause_cancel_(pause_cancel), minimum_(minimum) {}
+    void Run(Point point, std::size_t bytes) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kAfterAdmission && pause_admission_ && bytes >= minimum_ && !admitted_) {
+            admitted_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return admission_released_; });
+        } else if (point == Point::kAfterSlotCancel) {
+            cancelled_ = true; changed_.notify_all();
+        } else if (point == Point::kBeforeIoScan && pause_cancel_ && cancelled_ && !scanned_) {
+            // Cancel's wake follows the scan that decided to close. With the
+            // worker held, the next scan observes whether that socket closed.
+            scanned_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return io_released_; });
+        } else if (point == Point::kAfterSlotFinish && !finished_) {
+            finished_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return finish_released_; });
+        } else if (point == Point::kAfterSlotSocketClose && !closed_) {
+            closed_ = true; closed_before_finish_ = !finished_; changed_.notify_all();
+        }
+    }
+    void WaitAdmission() { Wait(admitted_, "slot admission"); }
+    void WaitFinish() { Wait(finished_, "slot cleanup"); }
+    void WaitDeferredClose() {
+        Wait(scanned_, "scan after slot cancellation");
+        std::lock_guard lock(mutex_);
+        if (closed_) throw std::runtime_error("slot socket closed before the held catch-up worker released its claim");
+    }
+    void WaitClose() {
+        Wait(closed_, "slot socket close");
+        std::lock_guard lock(mutex_);
+        if (closed_before_finish_) throw std::runtime_error("slot socket closed before slot cleanup");
+    }
+    void ReleaseAdmission() { std::lock_guard lock(mutex_); admission_released_ = true; changed_.notify_all(); }
+    void ReleaseIo() { std::lock_guard lock(mutex_); io_released_ = true; changed_.notify_all(); }
+    void Release() {
+        std::lock_guard lock(mutex_);
+        admission_released_ = io_released_ = finish_released_ = true;
+        changed_.notify_all();
+    }
+  private:
+    void Wait(const bool& flag, const char* name) {
+        test::FeedPhaseWatchdog::Phase(name);
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, 10s, [&] { return flag; }))
+            throw std::runtime_error(std::string("did not reach ") + name);
+    }
+    const bool pause_admission_, pause_cancel_;
+    const std::size_t minimum_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool admitted_ = false, cancelled_ = false, scanned_ = false, finished_ = false, closed_ = false;
+    bool admission_released_ = false, io_released_ = false, finish_released_ = false, closed_before_finish_ = false;
+};
+
+void ReconnectAfterRevoke(bool tls) {
+    ReconnectSchedule schedule(true, true);
+    Harness harness(tls, true);
+    auto admin = harness.Connect(); Create(*admin, " OWNER reader");
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
+    admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
+    admin->Ok("GRANT READ ON t TO reader");
+    Client watch(harness.port, tls); watch.Login("reader", "pw");
+    const auto initial = Start(watch.Command("WATCH t SLOT 'consumer'"));
+    auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t AREA 100 100 TO 100 100"));
+    auto replacement = harness.Connect();
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &schedule);
+    Cleanup clear([&] { schedule.Release(); FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    const auto revision = Set(*admin, 7);
+    schedule.WaitAdmission();
+    FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    assert(Change(NextChange(watch)) == revision);
+    admin->Ok("REVOKE READ ON t FROM reader");
+    schedule.WaitDeferredClose();
+    if (watch.Ready(0ms)) throw std::runtime_error("slot terminal reply arrived before claim cleanup");
+    schedule.ReleaseIo(); FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    Unwatch(*ordinary); // Other feed connections run while the slot worker is held.
+    schedule.ReleaseAdmission(); schedule.WaitFinish();
+    // The held worker has not sent its completion wake yet; wake I/O here.
+    FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    Error(watch.Read(), "NO_TABLE");
+    // No takeover, retries or worker progress: cleanup still holds the worker.
+    assert(Start(replacement->Command("WATCH t SLOT 'consumer'")) == initial);
+    schedule.WaitClose(); Closed(watch);
+    schedule.Release();
+    assert(Change(NextChange(*replacement)) == revision);
+    Unwatch(*replacement);
+}
+
+void ReconnectAfterAckTimeout(bool tls) {
+    ReconnectSchedule schedule(false, false);
+    Harness harness(tls);
+    auto writer = harness.Connect(); Create(*writer);
+    auto watch = harness.Connect();
+    const auto initial = Start(watch->Command("WATCH t SLOT 'consumer' ACK TIMEOUT 50"));
+    auto replacement = harness.Connect();
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &schedule);
+    Cleanup clear([&] { schedule.Release(); FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    const auto revision = Set(*writer, 7);
+    assert(Change(NextChange(*watch)) == revision);
+    schedule.WaitFinish(); // ACK timeout already releases its claim before the terminal frame.
+    FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    const auto error = watch->Read(); Error(error, "TIMEOUT");
+    assert(error.value.find("reason=ack_timeout") != std::string::npos);
+    assert(Start(replacement->Command("WATCH t SLOT 'consumer'")) == initial);
+    schedule.WaitClose(); Closed(*watch);
+    schedule.Release();
+    assert(Change(NextChange(*replacement)) == revision);
+    Unwatch(*replacement);
+}
+
+void ReconnectAfterWriteDeadline(bool tls) {
+    ReconnectSchedule schedule(true, true, 1024U * 1024U);
+    constexpr std::size_t budget = 4U * 1024U * 1024U;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, budget, {}, 60000ms, 200ms);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label bytes(2097152)) CHUNK 4 x 4");
+    writer->Ok("ALTER TABLE t SET var_max_chunk_bytes = 16777216");
+    writer->Ok("CREATE SLOT 'consumer' ON t");
+    auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t AREA 100 100 TO 100 100"));
+    auto watch = harness.Connect(); watch->SetReceiveBuffer(4096);
+    const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
+    auto replacement = harness.Connect();
+    const auto first = Set(*writer, 1); assert(Change(NextChange(*watch)) == first);
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &schedule);
+    Cleanup clear([&] { schedule.Release(); FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    // This frame exceeds the watch's share and the socket's send window. The
+    // client stops reading; only the excess-output deadline can cancel it.
+    const std::string payload(2U * 1024U * 1024U, 'x');
+    writer->Line("SET BLOCK 0 0 IN t label = $1");
+    writer->Send("$" + std::to_string(payload.size()) + "\r\n" + payload + "\r\n");
+    (void)Number(writer->Read());
+    schedule.WaitAdmission(); FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    schedule.WaitDeferredClose();
+    schedule.ReleaseAdmission(); schedule.WaitFinish();
+    schedule.ReleaseIo(); FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    schedule.WaitClose(); // The close hook observes the actual socket close, even with a partial frame.
+    assert(Start(replacement->Command("WATCH t SLOT 'consumer'")) == initial);
+    schedule.Release();
+    assert(Change(NextChange(*replacement)) == first);
+    replacement->Close(); watch->Close(); Unwatch(*ordinary);
+}
+
 // Watches of a three-dimensional table, of chunk metadata and of chunk forms
 // end with the same NO_TABLE when their user loses READ, before a later push.
 void WatchRevokeDimensional(bool tls) {
@@ -713,14 +861,14 @@ void SlotOwners(bool tls) {
     Client created(harness.port, tls); created.Login("reader", "pw");
     assert(Start(created.Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(created);
     // ADMIN on * attaches to another user's slot, and the watch needs that
-    // right as long as it lasts; READ on t remains. This comes last: its
-    // connection closes before the catch-up worker finishes the watch and
-    // frees the slot, so an attach right after it can still be SLOT_BUSY.
+    // right as long as it lasts; READ on t remains. Closure releases the slot
+    // before another authorized user attaches to it.
     admin->Ok("GRANT ADMIN ON * TO other");
     assert(Start(later.Command("WATCH t SLOT 'consumer'")).second == first);
     assert(Change(NextChange(later)) == second);
     admin->Ok("REVOKE ADMIN ON * FROM other");
     Error(later.Read(), "NO_TABLE"); Closed(later);
+    assert(Start(any->Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(*any);
 }
 
 // A slot without a recorded owner, as CREATE SLOT makes without authentication,
@@ -2350,6 +2498,7 @@ int main(int argc, char** argv) {
         run("slot-record-outcome", SlotRecordOutcome);
         run("takeover-fence", TakeoverFence); run("takeover", Takeover); run("takeover-rights", TakeoverRights); run("takeover-UNWATCH-return", TakeoverUnwatchReturn); run("takeover-stalled-socket", TakeoverStalledSocket);
         run("lifecycle", Lifecycle); run("rights", Rights); run("watch-revoke", WatchRevoke); run("watch-revoke-dimensional", WatchRevokeDimensional); run("watch-ACK-revoke", WatchAckRevoke); run("watch-dropped-user", WatchDroppedUser); run("slot-owners", SlotOwners); run("first-attach-owner", FirstAttachOwner); run("archive-handover", ArchiveHandover);
+        run("reconnect-revoke", ReconnectAfterRevoke); run("reconnect-ACK-timeout", ReconnectAfterAckTimeout); run("reconnect-write-deadline", ReconnectAfterWriteDeadline);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);

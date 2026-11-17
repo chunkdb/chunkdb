@@ -218,6 +218,14 @@ void FeedIo::ReleaseOutput(Watch& watch, const std::shared_ptr<SlotWatch>& slot)
     watch.output.clear(); watch.bytes = 0U; watch.offset = 0U; watch.excess_frames = 0U;
     if (released) Wake();
 }
+bool FeedIo::ReadyToEnd(Watch& watch) {
+    const auto& slot = watch.connection->session.slot_watch;
+    if (!slot || slot->Finished()) { watch.closing = false; return true; }
+    // Only the catch-up worker can destroy the archive/subscription and stage
+    // the accepted ACK. Its completion wakes I/O after releasing the claim.
+    if (!watch.closing) { watch.closing = true; slot->Cancel(); }
+    return false;
+}
 void FeedIo::Reject(Watch& watch, std::string message) {
     watch.close = true;
     Queue(watch, std::make_shared<const std::string>(Protocol::Error("PROTOCOL", message)));
@@ -551,9 +559,12 @@ void FeedIo::Run() {
                     // rights change is never written.
                     if (!watch.dead) (void)Permitted(watch);
                     const auto& slot = watch.connection->session.slot_watch;
+                    // A terminal reply is observable before EOF: release the
+                    // slot before either can prompt a reconnect.
+                    const bool close_wait = (watch.close || watch.dead) && !ReadyToEnd(watch);
                     const bool takeover_wait = slot && slot->TakingOver() && !slot->Finished();
-                    if (!watch.dead && !takeover_wait && (!watch.connection->tls || watch.read_wait != POLLOUT)) Write(watch);
-                    if (watch.close_immediate) watch.dead = true;
+                    if (!watch.dead && !close_wait && !takeover_wait && (!watch.connection->tls || watch.read_wait != POLLOUT)) Write(watch);
+                    if (watch.close_immediate && !close_wait) watch.dead = true;
                     (void)ExpireStalledWrite(watch, std::chrono::steady_clock::now());
                     if (watch.read_paused && watch.bytes <= std::max<std::size_t>(watch.share, 128U) - 128U)
                         watch.read_paused = false;
@@ -573,8 +584,14 @@ void FeedIo::Run() {
                     const bool ack_timeout_closed = !returned && watch.connection->session.slot_watch &&
                         watch.connection->session.slot_watch->AckTimedOut();
                     if (!returned) {
-                        // The socket closes before its unwritten charges are released.
                         const auto slot = watch.connection->session.slot_watch;
+                        if (!ReadyToEnd(watch)) {
+                            // A socket error or output deadline may have ended
+                            // delivery after the terminal-reply check above.
+                            watch.dead = true;
+                            continue;
+                        }
+                        // The socket closes before its unwritten charges are released.
                         server_.CloseClient(*watch.connection);
                         ReleaseOutput(watch, slot);
                     }
@@ -591,16 +608,22 @@ void FeedIo::Run() {
             std::vector<pollfd> descriptors;
 #endif
             descriptors.push_back({wake_read_, POLLIN, 0});
+            std::vector<std::size_t> polled_watches;
             bool buffered_tls = false;
             int progress_timeout = -1;
             const auto now = std::chrono::steady_clock::now();
-            for (const auto& watch : watches) {
+            for (std::size_t index = 0U; index < watches.size(); ++index) {
+                const auto& watch = watches[index];
+                // A closing socket may stay readable or report HUP. Only the
+                // worker's completion wake can advance it, not socket polling.
+                if (watch.closing) continue;
                 short events = (watch.unwatch || watch.close || watch.read_paused) ? 0 : watch.read_wait;
                 if (!watch.output.empty()) events |= watch.write_wait;
                 if (watch.connection->session.slot_watch && watch.connection->session.slot_watch->TakingOver()) events = 0;
                 if (watch.connection->tls && watch.write_size != 0 &&
                     !(watch.connection->session.slot_watch && watch.connection->session.slot_watch->TakingOver())) events = watch.write_wait;
                 descriptors.push_back({watch.connection->socket, events, 0});
+                polled_watches.push_back(index);
                 const auto wait_until = [&](std::chrono::steady_clock::time_point at) {
                     const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(at - now).count();
                     const auto timeout = remaining < 0 ? 0 : static_cast<int>(std::min<std::int64_t>(remaining + 1, INT_MAX));
@@ -623,8 +646,8 @@ void FeedIo::Run() {
 #endif
             if (result < 0 && !IsSocketInterruptedError(CurrentSocketErrorCode()))
                 throw std::runtime_error("feed poll: " + SocketErrorText());
-            for (std::size_t i = 0; i < watches.size(); ++i)
-                if (descriptors[i + 1U].revents & (POLLERR | POLLHUP | POLLNVAL)) watches[i].dead = true;
+            for (std::size_t i = 0; i < polled_watches.size(); ++i)
+                if (descriptors[i + 1U].revents & (POLLERR | POLLHUP | POLLNVAL)) watches[polled_watches[i]].dead = true;
         }
     } catch (const std::bad_alloc& error) { fail(error); }
       catch (const std::logic_error& error) { fail(error); }
@@ -698,6 +721,8 @@ void ChunkServer::CloseClient(ServerConnection& connection) {
     connection.socket = kInvalidSocket;
     if (slot) {
         slot->SocketClosed();
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kAfterSlotSocketClose, 0U);
         if (slot->TakingOver())
             if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kAfterTakeoverClose, 0U);
