@@ -614,6 +614,16 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::Describe& describe) { info.verb = "DESCRIBE"; info.table = describe.table; },
             [&](const cql::FlushWal&) { info.verb = "FLUSH WAL"; },
             [&](const cql::Backup&) { info.verb = "BACKUP"; info.audit_event = "backup"; },
+            [&](const cql::RestoreTable& restore) {
+                info.verb = "RESTORE TABLE";
+                info.audit_event = "restore_table";
+                info.table = restore.name;
+            },
+            [&](const cql::SwapTables& swap) {
+                info.verb = "SWAP TABLES";
+                info.audit_event = "swap_tables";
+                info.table = swap.first + "," + swap.second;
+            },
             [&](const cql::ShowMetrics&) { info.verb = "SHOW METRICS"; },
             [&](const cql::ReloadTls&) { info.verb = "RELOAD TLS"; info.audit_event = "reload_tls"; },
             [&](const cql::ShowStatus&) { info.verb = "SHOW STATUS"; },
@@ -1737,6 +1747,43 @@ std::string CommandEngine::ExecuteStatement(
                         throw;
                     }
                     return reply;
+                },
+                [&](const cql::RestoreTable& restore) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    // The right CREATE TABLE needs, or the one BACKUP needs.
+                    if (const User* user = CurrentUser(session); config_.require_auth && (user == nullptr || !user->manages_users))
+                        RequireRightOnEveryTable(session, Right::kAdmin);
+                    if (config_.backup_dir.empty())
+                        throw std::invalid_argument("RESTORE TABLE is disabled: set --backup-dir <path>");
+                    TableRestoreRequest request;
+                    request.backup = ResolveBackupSource(config_.backup_dir, restore.path);
+                    request.table = restore.table;
+                    request.name = restore.name;
+                    request.cancelled = session.backup_cancelled;
+                    const auto result = catalog_->RestoreTable(request);
+                    std::string reply;
+                    Protocol::AppendMapHeader(reply, 6);
+                    Protocol::AppendBulk(reply, "table");
+                    Protocol::AppendBulk(reply, result.name);
+                    Protocol::AppendBulk(reply, "epoch");
+                    Protocol::AppendBulk(reply, StoreIdHex(result.epoch));
+                    Protocol::AppendBulk(reply, "parent_epoch");
+                    Protocol::AppendBulk(reply, StoreIdHex(result.parent_epoch));
+                    Protocol::AppendBulk(reply, "fork_revision");
+                    Protocol::AppendInteger(reply, result.fork_revision);
+                    Protocol::AppendBulk(reply, "files");
+                    Protocol::AppendInteger(reply, result.files);
+                    Protocol::AppendBulk(reply, "bytes");
+                    Protocol::AppendInteger(reply, result.bytes);
+                    return reply;
+                },
+                [&](const cql::SwapTables& swap) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    // Grants stay with names: each table moves under a name the user administers.
+                    RequireRight(session, swap.first, Right::kAdmin);
+                    RequireRight(session, swap.second, Right::kAdmin);
+                    catalog_->SwapTables(swap.first, swap.second, session.backup_cancelled);
+                    return Protocol::SimpleString("OK");
                 },
                 [&](const cql::Begin&) { return TxnBegin(session); },
                 [&](const cql::Commit&) {

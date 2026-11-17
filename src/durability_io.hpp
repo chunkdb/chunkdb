@@ -56,4 +56,12 @@ std::error_code MoveDirectoryNoReplace(
     const std::filesystem::path& from,
     const std::filesystem::path& to);
 
+// Exchanges two existing directory entries in one atomic step: after a crash
+// both names hold their old entries or both hold the other's. Returns
+// std::errc::function_not_supported, changing nothing, where the platform
+// or file system has no atomic exchange (Windows has none).
+std::error_code ExchangeDirectories(
+    const std::filesystem::path& first,
+    const std::filesystem::path& second);
+
 }  // namespace chunkdb
