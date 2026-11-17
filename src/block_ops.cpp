@@ -1193,7 +1193,24 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
 }
 
 bool ChunkStore::HasPresentBlocks() {
-    return !ScanPopulatedChunks(false, {}, 1U).coords.empty();
+    // A populated chunk may hold only chunk metadata, so check its blocks.
+    bool has_cursor = false;
+    ChunkCoord cursor{};
+    while (true) {
+        const auto page = ScanPopulatedChunks(has_cursor, cursor, kMaxChunkScanLimit);
+        for (const auto& coord : page.coords) {
+            const auto chunk = GetOrLoadRegularChunk(coord);
+            std::shared_lock lock(chunk->mutex);
+            if (ChunkPresent(chunk->presence_bitmap)) {
+                return true;
+            }
+        }
+        if (!page.has_more || page.coords.empty()) {
+            return false;
+        }
+        cursor = page.coords.back();
+        has_cursor = true;
+    }
 }
 
 bool ChunkStore::ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y) {

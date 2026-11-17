@@ -352,6 +352,45 @@ void TestRequiredColumnDataGate(bool migrate) {
     }
 }
 
+// Chunk metadata alone holds no block, so it does not need a DEFAULT; a block
+// in a chunk listed after metadata-only chunks still does.
+void TestRequiredAfterChunkMetadata(bool migrate) {
+    for (const bool reopen : {false, true}) {
+        ScopedTempDir dir("chunkdb-required-metadata");
+        chunkdb::CatalogConfig config; config.data_dir = dir.path();
+        config.max_loaded_chunks = 1U;
+        std::shared_ptr<chunkdb::TableCatalog> catalog;
+        std::unique_ptr<chunkdb::CommandEngine> engine;
+        std::unique_ptr<chunkdb::SessionState> session;
+        const auto open = [&] {
+            engine.reset(); catalog.reset();
+            catalog = std::make_shared<chunkdb::TableCatalog>(config);
+            chunkdb::EngineConfig options; options.require_auth = false;
+            engine = std::make_unique<chunkdb::CommandEngine>(options, catalog);
+            session = std::make_unique<chunkdb::SessionState>();
+            assert(engine->Execute(*session, "HELLO 3").front() == '%');
+        };
+        open();
+        assert(engine->Execute(*session, "CREATE TABLE world (id u16) CHUNK 4 x 4 CHUNK COLUMNS (meta u8 DEFAULT 0)") == "+OK\r\n");
+        assert(engine->Execute(*session, "SET CHUNK 0 0 IN world META meta=1").front() == ':');
+        assert(engine->Execute(*session, "SET CHUNK 1 0 IN world META meta=2").front() == ':');
+        if (reopen) open();
+        const auto prefix = std::string(migrate ? "MIGRATE 'required' " : "");
+        const auto expected = migrate ? "+applied\r\n" : "+OK\r\n";
+        const auto add = engine->Execute(*session, prefix + "ALTER TABLE world ADD COLUMN must u8 REQUIRED");
+        if (add != expected) { std::fprintf(stderr, "metadata-only REQUIRED expected [%s], got [%s]\n", expected, add.c_str()); std::abort(); }
+        assert(catalog->Find("world")->Info().schema.version == 2U);
+        assert(engine->Execute(*session, "GET BLOCK 4 0 FROM world") == "_\r\n");
+        // A block behind the metadata-only chunks still needs a DEFAULT.
+        assert(engine->Execute(*session, "SET BLOCK 9 0 IN world id=1,must=3").front() == ':');
+        if (reopen) open();
+        const auto refused = engine->Execute(
+            *session, (migrate ? "MIGRATE 'second' " : "") + std::string("ALTER TABLE world ADD COLUMN next u8 REQUIRED"));
+        assert(refused.starts_with("-ERR INVALID_ARGUMENT ") && Contains(refused, "needs a DEFAULT"));
+        assert(catalog->Find("world")->Info().schema.version == 2U);
+    }
+}
+
 struct RequiredAdmissionHook final : chunkdb::MigrationTestHook {
     std::mutex mutex;
     std::condition_variable cv;
@@ -537,6 +576,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--range") { TestNarrowTable(); return 0; }
     TestRequiredOnEmptyEngine(false); TestRequiredOnEmptyEngine(true);
     TestRequiredColumnDataGate(false); TestRequiredColumnDataGate(true);
+    TestRequiredAfterChunkMetadata(false); TestRequiredAfterChunkMetadata(true);
     TestRequiredWaitsForWriter(false); TestRequiredWaitsForWriter(true);
     TestConcurrentNarrowingWriter(); TestNarrowingRangeFamilies(); TestEngineDefaultAndTruncate();
     TestRules();
