@@ -275,6 +275,10 @@ struct PendingLogin {
     bool known = false;
     // The incarnation of the user HELLO found; the session keeps it.
     std::uint64_t incarnation = 0;
+    // Whether the login is bound: AUTH succeeds only while the user still
+    // has the verifier of `exchange` and, for an unbound login, still takes
+    // unbound logins.
+    bool bound = false;
     scram::ServerExchange exchange;
     SessionHelloOptions options;
     // The user takes only bound logins and this one is not: it fails like a
@@ -339,8 +343,9 @@ std::string CommandEngine::Execute(
         // The user a login names, for the audit log: from HELLO 3 USER, or
         // the pending login AUTH finishes.
         std::string audit_user;
-        bool known_user = false;
-        bool unbound_refused = false;
+        // The login AUTH finishes; its flags are read once AUTH has run,
+        // since AUTH sets them from the user as it is then.
+        std::shared_ptr<const PendingLogin> audit_login;
         const bool was_greeted = session.greeted;
         if (config_.audit != nullptr) {
             if (hello) {
@@ -348,8 +353,7 @@ std::string CommandEngine::Execute(
                 if (tokens.size() == 5U && Protocol::CommandEquals(tokens[2], "USER")) audit_user = tokens[3];
             } else if (session.pending_login != nullptr) {
                 audit_user = session.pending_login->user;
-                known_user = session.pending_login->known;
-                unbound_refused = session.pending_login->unbound_refused;
+                audit_login = session.pending_login;
             }
         }
         std::string response;
@@ -375,6 +379,8 @@ std::string CommandEngine::Execute(
             const bool succeeded = session.greeted;
             // A +SCRAM reply only continues the login.
             if (succeeded || (!response.empty() && response[0] == '-')) {
+                const bool known_user = audit_login != nullptr && audit_login->known;
+                const bool unbound_refused = audit_login != nullptr && audit_login->unbound_refused;
                 AuditLogin(session, succeeded ? std::string_view(session.user) : std::string_view(audit_user),
                            known_user, unbound_refused, succeeded, response);
             }
@@ -936,6 +942,7 @@ std::string CommandEngine::HandleHello(
         .user = user,
         .known = found.has_value(),
         .incarnation = found.has_value() ? found->incarnation : 0U,
+        .bound = bound,
         .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce(), binding_data),
         .options = std::move(options),
         .unbound_refused = !bound && found.has_value() && found->user.requires_channel_binding,
@@ -971,6 +978,18 @@ std::string CommandEngine::HandleAuth(
     if (!server_final.has_value() || !pending->known || pending->unbound_refused) {
         return RecordAuthFailure(session, pending->user);
     }
+    // The user's credentials as of now, not as of HELLO: a verifier changed,
+    // a user dropped or created again, or a binding requirement added in
+    // between fails the login like a wrong password.
+    const auto current = config_.users->FindIncarnation(pending->user);
+    if (!current.has_value() || current->incarnation != pending->incarnation ||
+        current->user.verifier != pending->exchange.UserVerifier() ||
+        (!pending->bound && current->user.requires_channel_binding)) {
+        // The audit log gives the reason as of now too, as HELLO would.
+        pending->known = current.has_value();
+        pending->unbound_refused = current.has_value() && !pending->bound && current->user.requires_channel_binding;
+        return RecordAuthFailure(session, pending->user);
+    }
     RecordAuthSuccess(session, pending->user);
     session.greeted = true;
     session.user = pending->user;
@@ -981,6 +1000,7 @@ std::string CommandEngine::HandleAuth(
 
 std::string CommandEngine::HelloReply(const SessionState& session, std::string_view server_signature) const {
     std::string reply;
+    const auto& limits = catalog_->query_limits();
     const auto entry = [&reply](std::string_view key, std::uint64_t value) {
         Protocol::AppendBulk(reply, key);
         Protocol::AppendInteger(reply, value);
@@ -991,8 +1011,8 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, config_.server_version);
     entry("max_line_bytes", config_.max_line_bytes);
     entry("max_parameters", cql::kMaxParameters);
-    entry("max_area_chunks", kMaxChunkRangeChunks);
-    entry("max_response_bytes", kMaxChunkRangeResponseBytes);
+    entry("max_area_chunks", limits.max_area_chunks);
+    entry("max_response_bytes", limits.max_area_response_bytes);
     entry("max_scan_limit", kMaxChunkScanLimit);
     // The client checks it to know the server holds the user's verifier.
     Protocol::AppendBulk(reply, "server_signature");
@@ -1003,7 +1023,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 8);
+    Protocol::AppendArrayHeader(reply, 9);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -1012,6 +1032,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "slot_takeover");
     Protocol::AppendBulk(reply, "lineage");
     Protocol::AppendBulk(reply, "channel_binding");
+    Protocol::AppendBulk(reply, "area_paging");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 1U : 0U);
     if (session.hello_options.client_name) {
@@ -1033,10 +1054,10 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     entry("idle_timeout_ms", session.idle_timeout_ms);
     Protocol::AppendBulk(reply, "limits");
     Protocol::AppendMapHeader(reply, 7);
-    entry("max_area_chunks", kMaxChunkRangeChunks);
-    entry("max_area_response_bytes", kMaxChunkRangeResponseBytes);
-    entry("txn_max_written_chunks", kMaxTxnWrittenChunks);
-    entry("txn_max_read_chunks", kMaxTxnReadChunks);
+    entry("max_area_chunks", limits.max_area_chunks);
+    entry("max_area_response_bytes", limits.max_area_response_bytes);
+    entry("txn_max_written_chunks", limits.txn_max_written_chunks);
+    entry("txn_max_read_chunks", limits.txn_max_read_chunks);
     entry("max_watches", session.max_watches);
     entry("max_returning_rows", 65536U);
     entry("max_expression_nodes", 256U);

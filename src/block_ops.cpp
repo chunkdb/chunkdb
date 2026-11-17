@@ -641,7 +641,7 @@ ColumnValue DecodeFeedColumnValue(const Column& column, const std::uint8_t* byte
 
 std::vector<ColumnValue> DecodeBlockColumns(
     const ChunkLayout& layout,
-    const std::vector<std::uint8_t>& payload_bytes,
+    std::span<const std::uint8_t> payload_bytes,
     const ChunkVars& vars,
     std::size_t block_index,
     std::vector<std::uint8_t>* scratch) {
@@ -747,7 +747,7 @@ BlockReadMetadata ChunkStore::GetBlockWithVersion3DAt(
     };
     const auto chunk = GetOrLoadRegularChunk(coord);
     { std::shared_lock lock(chunk->mutex); capture(*chunk); }
-    (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.state); });
+    (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.View()); });
     return result;
 }
 
@@ -1141,6 +1141,7 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
     const auto* fixed = layout.FixedColumnAt(index);
     const std::uint32_t width = geometry_.config().chunk_width_blocks;
     const std::uint32_t height = geometry_.config().chunk_height_blocks;
+    const std::uint32_t depth = geometry_.config().chunk_depth_blocks;
     // An axis past int64 as [chunk, local], as WATCH reports it.
     const auto axis = [](std::int64_t chunk, std::uint32_t blocks, std::size_t local) {
         const auto absolute = BlockCoordinate(chunk, blocks, local);
@@ -1148,8 +1149,13 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
                                     : "[" + std::to_string(chunk) + ", " + std::to_string(local) + "]";
     };
     const auto describe = [&](const ChunkCoord& coord, std::size_t block, const ColumnValue& value) {
-        return "block (" + axis(coord.x, width, block % width) + ", " + axis(coord.y, height, block / width) +
-               ") holds " + DescribeValue(value);
+        const std::size_t plane = static_cast<std::size_t>(width) * height;
+        std::string text = "block (" + axis(coord.x, width, block % width) + ", " +
+                           axis(coord.y, height, (block / width) % height);
+        if (geometry_.dims() == 3U) {
+            text += ", " + axis(coord.z, depth, block / plane);
+        }
+        return text + ") holds " + DescribeValue(value);
     };
     std::vector<std::uint8_t> bytes(fixed != nullptr ? (fixed->width + 7U) / 8U : 0U);
     bool has_cursor = false;
@@ -1193,7 +1199,24 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
 }
 
 bool ChunkStore::HasPresentBlocks() {
-    return !ScanPopulatedChunks(false, {}, 1U).coords.empty();
+    // A populated chunk may hold only chunk metadata, so check its blocks,
+    // read without loading the chunk into the cache.
+    bool has_cursor = false;
+    ChunkCoord cursor{};
+    while (true) {
+        const auto page = ScanPopulatedChunks(has_cursor, cursor, kMaxChunkScanLimit);
+        for (const auto& coord : page.coords) {
+            ChunkRangeEntry state;
+            if (ReadPopulatedChunkStateNoCache(coord, &state, false) && ChunkPresent(state.presence_bitmap)) {
+                return true;
+            }
+        }
+        if (!page.has_more || page.coords.empty()) {
+            return false;
+        }
+        cursor = page.coords.back();
+        has_cursor = true;
+    }
 }
 
 bool ChunkStore::ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y) {
