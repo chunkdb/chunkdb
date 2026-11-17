@@ -868,15 +868,19 @@ TlsTestCredentials WriteTlsTestCredentials(const std::filesystem::path& dir) {
 }
 
 // The common name of `certificate`'s subject, or empty. Reads the name entry
-// itself, which OpenSSL 3 and 4 both offer without deprecation.
+// itself; OpenSSL 4.1 renamed the length accessor.
 std::string CommonNameOf(const X509* certificate) {
     const auto* subject = X509_get_subject_name(certificate);
     const int index = subject == nullptr ? -1 : X509_NAME_get_index_by_NID(subject, NID_commonName, -1);
     if (index < 0) return {};
     const auto* data = X509_NAME_ENTRY_get_data(X509_NAME_get_entry(subject, index));
     if (data == nullptr) return {};
-    return std::string(reinterpret_cast<const char*>(ASN1_STRING_get0_data(data)),
-                       static_cast<std::size_t>(ASN1_STRING_length(data)));
+#if OPENSSL_VERSION_MAJOR > 4 || (OPENSSL_VERSION_MAJOR == 4 && OPENSSL_VERSION_MINOR >= 1)
+    const auto length = ASN1_STRING_get_length(data);
+#else
+    const auto length = ASN1_STRING_length(data);
+#endif
+    return std::string(reinterpret_cast<const char*>(ASN1_STRING_get0_data(data)), static_cast<std::size_t>(length));
 }
 
 class TlsClient {
