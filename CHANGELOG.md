@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A CREATE TABLE that fails after its table directory is published, including on a failure to allocate memory while the new table is set up, now always removes that directory again, so the name stays free for the next CREATE instead of being taken by a table the server does not serve.
 - A failure to allocate memory while ALTER TABLE or TABLESET prepares to reopen a table now leaves the table serving its old definition, instead of leaving it with the new manifest and every later command on it waiting until a restart.
 - Mix coordinate hashes with a process seed across every axis and bound shared large-chunk containers, exposing capacity metrics and a known BUSY refusal for new cache misses (#134).
 - Add three-dimensional tables, typed chunk columns, checked sectioned chunk forms, atomic metadata and projected writes, and retained tombstone identities with incremental scans and explicit compaction (#133).

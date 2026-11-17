@@ -1720,6 +1720,10 @@ std::shared_ptr<Table> TableCatalog::Create(
         throw TableExistsError("table '" + table_name + "' already exists");
     }
     const auto target = TablesDir() / table_name;
+    // Made now, so that neither serving the table nor fencing it after a
+    // failed undo allocates once it is in tables/.
+    auto entry = PrepareServed(table_name);
+    auto undo_fence = PrepareFence(nullptr, table_name, kFenceCreate);
 
     // Build the complete table under a private name, then publish it with
     // one rename: a crash leaves the staging directory (removed at the next
@@ -1765,6 +1769,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     // opened, take it back out, so the name is not left with a table this
     // server does not serve; the command then fails.
     std::shared_ptr<ChunkStore> store;
+    std::shared_ptr<Table> table;
     try {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_CREATE_SYNC_FAIL_ONCE")) {
             throw std::runtime_error("injected directory sync failure after publishing a table");
@@ -1772,7 +1777,13 @@ std::shared_ptr<Table> TableCatalog::Create(
         SyncDirectoryPath(TablesDir());
         SyncDirectoryPath(StagingDir());
         store = OpenStore(table_name, target, geometry, kAllGeometryFields, options);
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_CREATE_SERVE_ALLOC_FAIL_ONCE")) throw std::bad_alloc();
+        Geometry opened_geometry = store->geometry();
+        table = std::shared_ptr<Table>(new Table(
+            table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store), config_.feed_buffer_bytes, migration_health_, config_.feed_linger));
     } catch (const std::exception& e) {
+        // The store closes before its directory moves.
+        store.reset();
         LogMessage(
             LogLevel::kError,
             LogComponent::kStore,
@@ -1789,16 +1800,15 @@ std::shared_ptr<Table> TableCatalog::Create(
                 "created table could not be removed again; it is fenced until RECOVER TABLE or a restart opens it",
                 {{"table", table_name}, {"error", undo_error.what()}});
             std::unique_lock lock(tables_mutex_);
-            fenced_.insert(PrepareFence(nullptr, table_name, kFenceCreate));
+            fenced_.insert(std::move(undo_fence));
         }
         throw;
     }
-    Geometry opened_geometry = store->geometry();
-    auto table = std::shared_ptr<Table>(new Table(
-        table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store), config_.feed_buffer_bytes, migration_health_, config_.feed_linger));
     {
+        // A node insert does not allocate.
         std::unique_lock lock(tables_mutex_);
-        tables_.emplace(table_name, table);
+        entry.mapped() = table;
+        tables_.insert(std::move(entry));
     }
     LogMessage(
         LogLevel::kInfo,

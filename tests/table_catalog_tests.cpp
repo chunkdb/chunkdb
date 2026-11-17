@@ -222,6 +222,38 @@ void TestCreateUndoneWhenNotDurable() {
     assert(created != nullptr);
 }
 
+// What serving a created table needs is allocated before the table reaches
+// tables/, and a failure while it is served is undone like a failed sync.
+void TestCreateUndoneWhenNotServed() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-create-serve");
+    TableCatalog catalog(Config(dir.path()));
+    const auto create_fails = [&](const char* failpoint) {
+#ifdef _WIN32
+        _putenv_s(failpoint, "1");
+#else
+        setenv(failpoint, "1", 1);
+#endif
+        bool failed = false;
+        try {
+            (void)catalog.Create("terrain", kTerrainGeometry, {});
+        } catch (const std::bad_alloc&) {
+            failed = true;
+        }
+        assert(failed);
+        assert(catalog.Find("terrain") == nullptr);
+        assert(!catalog.Fence("terrain"));
+        assert(!std::filesystem::exists(dir.path() / "tables" / "terrain"));
+        assert(Names(dir.path() / ".chunkdb.staging").empty());
+        assert(Names(dir.path() / ".chunkdb.dropped").empty());
+    };
+    create_fails("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE");
+    create_fails("CHUNKDB_FAILPOINT_TABLE_CREATE_SERVE_ALLOC_FAIL_ONCE");
+    const auto created = catalog.Create("terrain", kTerrainGeometry, {});
+    assert(created != nullptr && catalog.Find("terrain") == created);
+    WriteBits(catalog, "terrain", 1, 1, "110000011");
+    assert(ReadBits(catalog, "terrain", 1, 1) == "110000011");
+}
+
 void TestDrop() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-drop");
     {
@@ -1217,6 +1249,7 @@ int main(int argc, char** argv) {
     TestTablesWithDifferentGeometry();
     TestTableNames();
     TestCreateUndoneWhenNotDurable();
+    TestCreateUndoneWhenNotServed();
     TestDrop();
     TestDropWaitsForRunningCommands();
     TestAcquireDuringDropWaitsThenFails();
