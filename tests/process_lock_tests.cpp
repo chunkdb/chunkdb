@@ -397,6 +397,34 @@ void TestLockFileInPlaceOfLockDirectoryRefused() {
     std::filesystem::remove_all(data_dir);
 }
 
+// A data directory reached through a symlink starts: the writer lock follows
+// the link into the target directory, and a reopen through the link reads the
+// same data.
+void TestSymlinkedDataDirectoryStarts() {
+    const auto target = TempDataDir("symlinked-root");
+    const std::filesystem::path alias = target.string() + "-alias";
+    std::filesystem::create_directories(target);
+    std::error_code symlink_ec;
+    std::filesystem::create_directory_symlink(target, alias, symlink_ec);
+    if (symlink_ec) {
+        // Symlink creation can be blocked by environment policy; skip deterministically.
+        std::filesystem::remove_all(target);
+        return;
+    }
+    {
+        chunkdb::ChunkStore writer(BuildConfig(alias));
+        writer.SetBlockBits(0, 0, "1010");
+        assert(std::filesystem::is_directory(LockDir(target)));
+        assert(std::filesystem::is_regular_file(LockDir(target) / "writer.meta"));
+    }
+    {
+        chunkdb::ChunkStore reopened(BuildConfig(alias));
+        assert(reopened.GetBlockBits(0, 0) == "1010");
+    }
+    std::filesystem::remove(alias);
+    std::filesystem::remove_all(target);
+}
+
 #ifndef _WIN32
 void TestUnsupportedLockPathTypeRejected() {
     const auto data_dir = TempDataDir("unsupported-lock-type");
@@ -501,6 +529,7 @@ int main(int argc, char** argv) {
     TestCleanShutdownReleasesWriterOwnership();
     TestHeartbeatDoesNotConsumeAtomicWriteFailpoints();
     TestLockFileInPlaceOfLockDirectoryRefused();
+    TestSymlinkedDataDirectoryStarts();
 
 #ifndef _WIN32
     TestUnsupportedLockPathTypeRejected();

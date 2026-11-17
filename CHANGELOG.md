@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Add configurable area and transaction chunk limits, exact area-response byte admission, and cursor paging for GET AREA; expose allocator-aware variable storage through `ChunkVars::Encode()` (#136).
+- Raise the default limits: GET AREA covers up to 4096 requested chunk cells instead of 256 (`--max-area-chunks`), and a transaction writes up to 1024 chunks instead of 64 (`--txn-max-written-chunks`) and reads up to 8192 instead of 1024 (`--txn-max-read-chunks`); recovery bounds a transaction intent by its file size rather than by the current written-chunk limit, so lowering that limit does not block recovery of an intent written before (#136).
 - Mix coordinate hashes with a process seed across every axis and bound shared large-chunk containers, exposing capacity metrics and a known BUSY refusal for new cache misses (#134).
 - Add three-dimensional tables, typed chunk columns, checked sectioned chunk forms, atomic metadata and projected writes, and retained tombstone identities with incremental scans and explicit compaction (#133).
 - Measure a slot change read back from the feed archive by the frame the watch sends: decoding skips chunks outside the slot's AREA, keeps only its COLUMNS and drops before values with NO BEFORE, and stops once that frame would exceed the current `feed_buffer_bytes`, so a filtered change whose frame fits is delivered; in CHUNKS mode, chunks outside the area no longer count toward the budget.
