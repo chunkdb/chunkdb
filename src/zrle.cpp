@@ -41,6 +41,10 @@ void AppendUleb128(std::vector<std::uint8_t>* out, std::uint64_t value) {
 }  // namespace
 
 std::vector<std::uint8_t> ZrleCompress(const std::vector<std::uint8_t>& input) {
+    return ZrleCompressBytes(input);
+}
+
+std::vector<std::uint8_t> ZrleCompressBytes(std::span<const std::uint8_t> input) {
     if (input.size() > std::numeric_limits<std::uint32_t>::max()) {
         throw std::runtime_error("zrle: input too large");
     }

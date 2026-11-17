@@ -47,7 +47,7 @@ void Write(TxnHistory& history, const ChunkCoord& coord, std::uint64_t tag, std:
 // The value a read at the snapshot sees from the history; -1 for none.
 int KeptValueAt(TxnHistory& history, const TxnSnapshot& snapshot, const ChunkCoord& coord) {
     int value = -1;
-    (void)history.VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { value = kept.state.payload[0]; });
+    (void)history.VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { value = kept.View().payload[0]; });
     return value;
 }
 

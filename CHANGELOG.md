@@ -2,6 +2,17 @@
 
 ## Unreleased
 
+- A CREATE TABLE that fails after its table directory is published, including on a failure to allocate memory while the new table is set up, now removes that directory again, or fences the name until RECOVER TABLE or a restart if the directory cannot be removed, instead of leaving the name taken by a table the server does not serve.
+- A failure to allocate memory while ALTER TABLE or TABLESET prepares to reopen a table now leaves the table serving its old definition, instead of leaving it with the new manifest and every later command on it waiting until a restart.
+- A failure to allocate memory while DROP TABLE prepares its fallback now leaves the table served, instead of leaving every later command on it waiting until a restart.
+- A failure to allocate memory while a refused column narrowing that cannot be removed prepares to fence the table now leaves the table served with the narrowing until a restart, instead of leaving every later command on it waiting until a restart.
+- A narrowing refused by a value in a 3D table names its block as `block (x, y, z)`; it used to give two coordinates, with y counted across the chunk's depth.
+- Accept ALTER TABLE ... ADD COLUMN ... REQUIRED without DEFAULT on a table whose chunks hold only chunk metadata, as documented, instead of refusing it as if blocks were present.
+- On Linux and macOS, a writer lock that fails for a reason other than a lock held by another process is reported with that error (`failed to lock writer lock file: <path>: <reason>`) instead of as an active writer.
+- Check a login's credentials when AUTH finishes it, not only at HELLO: a login whose user got a new verifier, was dropped or created again, or, for an unbound login, got REQUIRE CHANNEL BINDING in between fails with the AUTH_FAILED of a wrong password.
+- A schema push from WATCH ... SLOT carries the table's `dims` and the chunk columns of its schema version, where it sent `dims=2` and empty `chunk_columns` for three-dimensional tables and tables with CHUNK COLUMNS.
+- Add configurable area and transaction chunk limits, exact area-response byte admission, and cursor paging for GET AREA; expose allocator-aware variable storage through `ChunkVars::Encode()` (#136).
+- Raise the default limits: GET AREA covers up to 4096 requested chunk cells instead of 256 (`--max-area-chunks`), and a transaction writes up to 1024 chunks instead of 64 (`--txn-max-written-chunks`) and reads up to 8192 instead of 1024 (`--txn-max-read-chunks`); recovery bounds a transaction intent by its file size rather than by the current written-chunk limit, so lowering that limit does not block recovery of an intent written before (#136).
 - Mix coordinate hashes with a process seed across every axis and bound shared large-chunk containers, exposing capacity metrics and a known BUSY refusal for new cache misses (#134).
 - Add three-dimensional tables, typed chunk columns, checked sectioned chunk forms, atomic metadata and projected writes, and retained tombstone identities with incremental scans and explicit compaction (#133).
 - Measure a slot change read back from the feed archive by the frame the watch sends: decoding skips chunks outside the slot's AREA, keeps only its COLUMNS and drops before values with NO BEFORE, and stops once that frame would exceed the current `feed_buffer_bytes`, so a filtered change whose frame fits is delivered; in CHUNKS mode, chunks outside the area no longer count toward the budget.

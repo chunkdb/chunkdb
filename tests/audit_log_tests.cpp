@@ -205,6 +205,41 @@ void TestChannelBindingEvents() {
                                         "\"error_code\":\"AUTH_REQUIRED\"", "\"reason\":\"channel_binding\""});
 }
 
+// Logins whose user changes between HELLO and AUTH: the reason is the one the
+// user gives as of AUTH.
+void TestCredentialsChangedDuringLoginEvents() {
+    Engine e;
+    auto admin = e.Admin(40);
+    const std::string password = "bot-private-password";
+    const std::string verifier = Verifier(password);
+    assert(e.Run(admin, "CREATE USER bot VERIFIER $1", {verifier}) == "+OK\r\n");
+    // HELLO on connection `id`, then `change` from the admin, then AUTH with
+    // the password that was right at HELLO.
+    const auto login_around = [&](std::uint64_t id, const std::string& change, const Parameters& parameters) {
+        auto session = e.Session(id);
+        const auto login = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce());
+        const auto first = e.Run(session, chunkdb::test::HelloUserLine("bot"), Parameters{login.first});
+        assert(first.rfind("+SCRAM ", 0) == 0);
+        assert(e.Run(admin, change, parameters) == "+OK\r\n");
+        const auto final_message =
+            chunkdb::scram::FinishClientLogin(login, password, chunkdb::test::ServerFirstOf(first));
+        assert(e.Run(session, "AUTH $1", Parameters{final_message.message}).rfind("-ERR AUTH_FAILED", 0) == 0);
+    };
+    login_around(41, "ALTER USER bot REQUIRE CHANNEL BINDING", {});
+    assert(e.Run(admin, "ALTER USER bot NO REQUIRE CHANNEL BINDING") == "+OK\r\n");
+    login_around(42, "ALTER USER bot VERIFIER $1", {Verifier("bot-other-password")});
+    assert(e.Run(admin, "ALTER USER bot VERIFIER $1", {verifier}) == "+OK\r\n");
+    login_around(43, "DROP USER bot", {});
+
+    const auto lines = Lines(e.audit_path);
+    LineWith(lines, {"\"event\":\"login\"", "\"connection\":41", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"channel_binding_required\""});
+    LineWith(lines, {"\"event\":\"login\"", "\"connection\":42", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"wrong_password\""});
+    LineWith(lines, {"\"event\":\"login\"", "\"connection\":43", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"unknown_user\""});
+}
+
 // Every audited statement, with the names it acts on, and a failure with its
 // code; reads and writes of blocks are not audited.
 void TestStatementEvents() {
@@ -460,6 +495,7 @@ void TestLoginLimits() {
 int main() {
     TestLoginEvents();
     TestChannelBindingEvents();
+    TestCredentialsChangedDuringLoginEvents();
     TestStatementEvents();
     TestDroppedUserEvents();
     TestFileAndReopen();

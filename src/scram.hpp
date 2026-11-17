@@ -113,6 +113,8 @@ class ServerExchange {
         std::span<const std::uint8_t> binding_data = {});
     // `r=<client nonce + server nonce>,s=<salt>,i=<iterations>`.
     [[nodiscard]] const std::string& ServerFirst() const noexcept { return server_first_; }
+    // The verifier the client's proof is checked against.
+    [[nodiscard]] const Verifier& UserVerifier() const noexcept { return verifier_; }
     // The server-final message `v=<signature>` when the client's proof is
     // right, std::nullopt when it is wrong. Throws std::invalid_argument for
     // a message that is not a client-final message of this exchange, and
