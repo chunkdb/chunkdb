@@ -1,0 +1,11 @@
+date=2026-11-18
+machine=AMD Ryzen 5 4600H (6 cores, 12 threads), 30 GiB RAM
+os=Ubuntu, Linux 7.0.0-43-generic, ext4
+compiler=GCC 15.2.0
+source=chunkdb main d900641 twice: once as built, once with -DCHUNKDB_BENCH_CONSTANT_COMMIT_TIME=ON (fixed commit times, the cost of reading the wall clock and storing commit_time_ms removed)
+build=cmake -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WERROR=ON; targets chunkdb_server_bench chunkdb_budget_compare
+command=chunkdb_budget_compare main main --noise-floor, then chunkdb_budget_compare constant main --noise-reference <noise floor JSON>; 15 pairs per profile; 200000 requests, 4 clients, 4 server workers, keyspace 2048, seed 1337
+before=constant commit time; after=main as shipped
+comparison=commit-time-20261118-linux-comparison.md (the tool's Markdown report; temporary paths replaced)
+result=relaxed world 57,365.5 -> 56,642.7 req/s (-1.30% [-2.13, -0.85]); canvas 49,890.8 -> 49,384.3 (-0.90% [-2.89, -0.05]); simulation 50,804.1 -> 50,264.8 (-0.82% [-1.44, -0.34]); fsync-wal world +0.14% [-4.37, +5.58], canvas -0.21% [-3.34, +1.37], simulation +0.88% [-2.41, +3.52]; no row meets the regression criterion (upper CI below -5%)
+load=other services ran on the host; the run started after the load average stayed below 4 for five minutes
