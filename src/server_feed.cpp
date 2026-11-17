@@ -199,7 +199,8 @@ void FeedIo::Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::
 }
 bool FeedIo::ExpireStalledWrite(Watch& watch, std::chrono::steady_clock::time_point now) {
     const auto timeout = std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
-    if (watch.dead || watch.excess_frames == 0U || now < watch.excess_progress + timeout) return false;
+    // A closing watch writes nothing until the worker releases its slot; that wait is not the client's.
+    if (watch.dead || watch.closing || watch.excess_frames == 0U || now < watch.excess_progress + timeout) return false;
     LogMessage(LogLevel::kWarn, LogComponent::kServer, "slot watch made no write progress",
         {{"unsent_bytes", std::to_string(watch.bytes)}, {"timeout_ms", std::to_string(timeout.count())}});
     watch.dead = true;
@@ -244,7 +245,7 @@ bool FeedIo::Permitted(Watch& watch) {
     if (const auto& slot = watch.connection->session.slot_watch)
         for (const auto& output : watch.output)
             if (output.charged) slot->Consumed(output.bytes->size());
-    watch.output.clear(); watch.bytes = 0U;
+    watch.output.clear(); watch.bytes = 0U; watch.excess_frames = 0U;
     Queue(watch, std::make_shared<const std::string>(
         CommandEngine::LostWatchReply(state == ReadRightCheck::State::kNoUser, right->table())));
     watch.close = true;

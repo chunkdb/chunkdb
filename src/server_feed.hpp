@@ -67,7 +67,8 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     void ReleaseOutput(Watch& watch, const std::shared_ptr<SlotWatch>& slot);
     // Request cleanup without blocking I/O; ready only after the slot claim is released.
     bool ReadyToEnd(Watch& watch);
-    // Marks a watch dead when its excess-pool output made no write progress for the client I/O timeout.
+    // Marks a watch dead when its excess-pool output made no write progress for the client I/O timeout;
+    // never while a closing watch waits for the worker.
     bool ExpireStalledWrite(Watch& watch, std::chrono::steady_clock::time_point now);
     void Reject(Watch& watch, std::string message);
     // Whether the user still has READ on the watched table: one atomic load

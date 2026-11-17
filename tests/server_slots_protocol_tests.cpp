@@ -164,6 +164,29 @@ struct AckDeadlineIoTestAccess {
         assert(watch.output.empty() && watch.excess_frames == 0U);
         assert(SlotAckDeadlineTestAccess::Excess(*state) == 0U && SlotAckDeadlineTestAccess::Charged(*state) == 0U);
     }
+    // A closing watch writes nothing while the worker releases its slot, so
+    // its output deadline waits; a lost right leaves no excess frames behind.
+    static void ClosingOutputDeadline(ChunkServer& server, const std::filesystem::path& users_dir, std::chrono::milliseconds timeout) {
+        FeedIo io(server);
+        const auto excess = std::make_shared<const std::string>("excess");
+        FeedIo::Watch closing;
+        closing.connection = std::make_shared<ServerConnection>();
+        io.Queue(closing, excess, {}, false, true);
+        const auto progress = closing.excess_progress;
+        closing.closing = true;
+        assert(!io.ExpireStalledWrite(closing, progress + 2 * timeout) && !closing.dead);
+        closing.closing = false; // The worker finished: the deadline applies again.
+        assert(io.ExpireStalledWrite(closing, progress + timeout) && closing.dead);
+        const auto users = test::MakeUsers(users_dir, "admin", "secret");
+        FeedIo::Watch lost;
+        lost.connection = std::make_shared<ServerConnection>();
+        // An unknown user at a later generation: the next check finds the right gone.
+        lost.connection->session.watch_right = std::make_shared<ReadRightCheck>(users, "reader", 0U, "t", users->Generation() + 1U);
+        io.Queue(lost, excess, {}, false, true);
+        assert(!io.Permitted(lost) && lost.close_immediate && lost.output.size() == 1U && lost.excess_frames == 0U);
+        // Only the reply remains, however long the worker takes to finish.
+        assert(!io.ExpireStalledWrite(lost, lost.excess_progress + 2 * timeout) && !lost.dead);
+    }
 };
 // The peer must have stopped reading. A fixed send buffer turns off
 // autotuning, and filler bytes fill it, so the next write blocks on every
@@ -1735,6 +1758,12 @@ void ExcessStalledHolder(bool tls) {
     }
     assert(SlotAckDeadlineTestAccess::Charged(*holder) == 0U && SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
 }
+void ClosingOutputDeadline(bool tls) {
+    if (tls) return; // Independent of the transport: runs once, with the plain groups.
+    constexpr auto timeout = 3000ms;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, {}, 60000ms, timeout);
+    AckDeadlineIoTestAccess::ClosingOutputDeadline(harness.server(), harness.directory.path() / "users", timeout);
+}
 void TlsWriteCap(bool tls) {
 #ifdef CHUNKDB_WITH_OPENSSL
     if (!tls) return; // Independent of the transport: runs once, with the TLS groups.
@@ -2529,6 +2558,7 @@ int main(int argc, char** argv) {
             run("filtered-archive-chunks", FilteredArchiveChunks);
             run("excess-pool-bound", ExcessPoolBound); run("excess-pool-receipts", ExcessPoolReceipts);
             run("excess-stalled-holder", ExcessStalledHolder); run("TLS-write-cap", TlsWriteCap);
+            run("closing-output-deadline", ClosingOutputDeadline);
             run("excess-pool-FIFO", ExcessPoolFifo); run("excess-pool-control", ExcessPoolControlFrames);
             run("excess-pool-leave", ExcessPoolLeave);
         }
