@@ -2491,8 +2491,9 @@ void TestHandshakeLimitZeroIsOff() {
     }
 }
 
-// Area replies are bounded: a read whose reply would exceed
-// max_response_bytes is refused, and the connection stays usable.
+// Area replies are bounded: a chunk whose reply would exceed
+// max_response_bytes is refused with its coordinate and size, a page ends
+// before it, GET CHUNK reads it, and the connection stays usable.
 void TestAreaReplyIsBounded() {
     auto engine_cfg = chunkdb::EngineConfig{.require_auth = false, .max_auth_failures = 5};
     ServerHarness harness("area-bound", BaseStoreConfig(), engine_cfg, BaseServerConfig());
@@ -2503,12 +2504,31 @@ void TestAreaReplyIsBounded() {
     assert(client.ReadLine() == "+OK\r\n");
     client.SendLine("SET BLOCK 0 0 IN wide v = b'1" + std::string(511, '0') + "'");
     (void)ReadVersion(client);
+    const std::string limit = "67108864";
+    client.SendLine("GET CHUNK 0 0 FROM wide");
+    const std::string full = client.ReadReply();
+    assert(full.rfind('$', 0) == 0 && full.size() > std::stoull(limit));
+    const std::string row = "*3\r\n:0\r\n:0\r\n" + full;
+    const auto refusal = [&](std::size_t required) {
+        return "-ERR OUT_OF_RANGE reason=area_entry_too_large chunk=0,0 required=" + std::to_string(required) +
+            " limit=" + limit + " ";
+    };
     for (const char* line : {"GET AREA 0 0 TO 1 1 FROM wide", "GET AREA AROUND 0 0 RADIUS 1 FROM wide"}) {
         client.SendLine(line);
-        const std::string refused = client.ReadLine();
-        assert(refused.rfind("-ERR OUT_OF_RANGE", 0) == 0);
-        assert(refused.find("response exceeds the 67108864-byte limit") != std::string::npos);
+        assert(client.ReadLine().rfind(refusal(("*1\r\n" + row).size()), 0) == 0);
     }
+    const std::string page = "%3\r\n$6\r\nchunks\r\n";
+    const std::string more = "$4\r\nmore\r\n";
+    const std::string after = "$5\r\nafter\r\n";
+    // A page that starts on an empty cell ends before the chunk.
+    client.SendLine("GET AREA -1 0 TO 1 0 FROM wide LIMIT 3");
+    assert(client.ReadReply() == page + "*0\r\n" + more + "#t\r\n" + after + "*2\r\n:-1\r\n:0\r\n");
+    client.SendLine("GET AREA -1 0 TO 1 0 FROM wide AFTER -1 0 LIMIT 3");
+    const std::string paged_required = page + "*1\r\n" + row + more + "#t\r\n" + after + "*2\r\n:0\r\n:0\r\n";
+    assert(client.ReadLine().rfind(refusal(paged_required.size()), 0) == 0);
+    // The client continues AFTER the chunk it read with GET CHUNK.
+    client.SendLine("GET AREA -1 0 TO 1 0 FROM wide AFTER 0 0 LIMIT 3");
+    assert(client.ReadReply() == page + "*0\r\n" + more + "#f\r\n" + after + "_\r\n");
     client.SendLine("GET AREA 1 1 TO 2 2 FROM wide");
     assert(client.ReadLine() == "*0\r\n");
 }

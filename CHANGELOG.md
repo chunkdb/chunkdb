@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- GET AREA with LIMIT or AFTER ends a page before a chunk too large for an empty page instead of refusing the rows before it; that chunk, as a page's first cell or in a plain area, is refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=x,y[,z] required=n limit=n`, so a client reads it with GET CHUNK or fewer COLUMNS and continues AFTER it, including at the largest chunk geometry (#150).
 - Measure many feed subscribers with `chunkdb_server_bench --watch-delivery measure`: a watch resync is counted instead of failing the run, a drain waits while pushes arrive, CREATE SLOT waits up to `--slot-create-timeout-ms`, and each result lists every watch with its events, resyncs, bytes, lag at the last write and catch-up time; watch readiness uses poll, so watches work beside descriptors numbered past FD_SETSIZE; the default `strict` delivery and its reports are unchanged (#140).
 - A conditional chunk mutation that has committed is no longer reported as failed when a later cleanup, checkpoint or snapshot warning fails; when a rejected conditional mutation cannot neutralize its WAL tail, the store becomes fail-closed before it logs, and the caller gets the original error.
 - `--max-handshakes-per-ip 0` starts the server with the handshake limit off, as documented, instead of being refused; a negative or non-numeric value is refused.
