@@ -1,5 +1,6 @@
 #include <cassert>
 #include <stdexcept>
+#include <string>
 
 #include "chunkdb/uri.hpp"
 
@@ -38,8 +39,8 @@ int main() {
         bool thrown = false;
         try {
             (void)chunkdb::ParseConnectionUri("http://localhost:1/");
-        } catch (const std::invalid_argument&) {
-            thrown = true;
+        } catch (const std::invalid_argument& error) {
+            thrown = std::string(error.what()) == "unsupported URI scheme: http; use chunk:// or chunks://";
         }
         assert(thrown);
     }

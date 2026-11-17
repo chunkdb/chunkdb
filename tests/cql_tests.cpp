@@ -524,7 +524,8 @@ void TestBackup() {
 
 void TestErrors() {
     ExpectError("", "column 1: unknown statement the end of the statement");
-    ExpectError("SELECT * FROM t", "column 1: unknown statement 'SELECT'");
+    ExpectError("SELECT * FROM t", "column 1: unknown statement 'SELECT'; read with GET BLOCK, GET AREA or GET CHUNK");
+    ExpectError("BOGUS", "column 1: unknown statement 'BOGUS'; the CQL reference lists every statement");
     ExpectError("GET ROW 1 2 FROM t", "column 5: expected BLOCK, CHUNK or AREA, got 'ROW'");
     ExpectError("GET BLOCK 1 FROM t", "column 13: expected y, got 'FROM'");
     ExpectError("GET BLOCK 1 2 FROM t extra", "column 22: expected the end of the statement, got 'extra'");

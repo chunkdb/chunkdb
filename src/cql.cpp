@@ -294,11 +294,16 @@ namespace {
 
 using namespace lexer;
 
+// The next step for an unknown statement word: the closest CQL keyword, the
+// CQL form of a common SQL statement, or the reference.
 std::string StatementSuggestion(std::string_view word) {
+    constexpr std::string_view kReference = "; the CQL reference lists every statement";
     if (word.size() > 16U) {
-        return {};
+        return std::string(kReference);
     }
     const auto lower = Lower(word);
+    if (lower == "select") return "; read with GET BLOCK, GET AREA or GET CHUNK";
+    if (lower == "insert" || lower == "update" || lower == "upsert") return "; write with SET BLOCK or SET CHUNK";
     const std::array<std::string_view, 24U> keywords{
         "get", "set", "delete", "create", "alter", "drop", "show", "describe", "grant", "revoke",
         "begin", "commit", "rollback", "ping", "flush", "watch", "unwatch", "ack", "backup", "migrate",
@@ -327,7 +332,7 @@ std::string StatementSuggestion(std::string_view word) {
         }
     }
     if (closest.empty() || tied) {
-        return {};
+        return std::string(kReference);
     }
     std::string name(closest);
     std::transform(name.begin(), name.end(), name.begin(), [](char c) { return static_cast<char>(c - 'a' + 'A'); });
