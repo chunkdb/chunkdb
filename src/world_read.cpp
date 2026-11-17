@@ -533,7 +533,8 @@ ChunkAreaPage ChunkStore::VisitChunkArea(
                 entry.emplace(std::move(candidate));
         }
         if (!visitor(*current, std::move(entry), next.has_value())) {
-            if (admitted == after) throw std::out_of_range("an area entry cannot fit one page");
+            if (admitted == after)
+                throw AreaEntryTooLargeError(*current, selector.dims, query_limits_.max_area_response_bytes);
             return {.has_more = true, .after = admitted};
         }
         admitted = current;

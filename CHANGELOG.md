@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- GET AREA with LIMIT or AFTER ends a page before a chunk too large for an empty page instead of refusing the rows before it; that chunk, as a page's first cell or in a plain area, is refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=x,y[,z] required=n limit=n`, so a client reads it with GET CHUNK or fewer COLUMNS and continues AFTER it, including at the largest chunk geometry (#150).
 - Add configurable area and transaction chunk limits, exact area-response byte admission, and cursor paging for GET AREA; expose allocator-aware variable storage through `ChunkVars::Encode()` (#136).
 - Raise the default limits: GET AREA covers up to 4096 requested chunk cells instead of 256 (`--max-area-chunks`), and a transaction writes up to 1024 chunks instead of 64 (`--txn-max-written-chunks`) and reads up to 8192 instead of 1024 (`--txn-max-read-chunks`); recovery bounds a transaction intent by its file size rather than by the current written-chunk limit, so lowering that limit does not block recovery of an intent written before (#136).
 - Mix coordinate hashes with a process seed across every axis and bound shared large-chunk containers, exposing capacity metrics and a known BUSY refusal for new cache misses (#134).
