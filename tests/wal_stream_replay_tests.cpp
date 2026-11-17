@@ -400,12 +400,43 @@ void CollectionRequiresEmptyMetadataAtFrameSchema() {
 }
 }
 
+// A checksum-valid GROUP frame, admitted by explicit test flags, is refused
+// by the inspections that admit archive WALs and prepare slot archives.
+void GroupFramesRefusedAtInspection() {
+    const auto geometry = MakeGeometry();
+    const FeatureFlags groups{.incompat = kFeatureChunkModel | kFeatureCommitGroups};
+    Bytes grouped;
+    WalFrameBuilder frame(&grouped, 1U, {}, {}, false, WalGroupRef{.id = {1U}, .member_count = 2U, .member_ordinal = 0U});
+    const Bytes state{2U, 42U, 3U};
+    frame.AppendSpan(0U, state.data(), state.size());
+    (void)frame.Finish(2U, 20U);
+    const auto refused = [](auto&& inspect) {
+        std::string error;
+        try { inspect(); } catch (const std::runtime_error& failure) { error = failure.what(); }
+        assert(error == "WAL group frame requires directory admission");
+    };
+    for (const bool first : {true, false}) {
+        auto bytes = BuildWalHeader({0, 0}, kId, groups);
+        if (!first) Append(bytes, Frame(1U));
+        Append(bytes, grouped);
+        refused([&] {
+            std::istringstream input(std::string(bytes.begin(), bytes.end()), std::ios::binary);
+            (void)InspectWalStream(input, bytes.size(), geometry, {0, 0}, kId, groups);
+        });
+        if (first) refused([&] {
+            std::istringstream input(std::string(bytes.begin(), bytes.end()), std::ios::binary);
+            (void)InspectFirstWalFrameStream(input, bytes.size(), geometry, {0, 0}, kId, groups);
+        });
+    }
+}
+
 int main() {
     CutsAndDamage();
     InterruptedCreationAndInteriorSearch();
     SchemaMetadataAndFinalInvariants();
     BoundedReadsAndExtent();
     InspectionAndCancellation();
+    GroupFramesRefusedAtInspection();
     CollectionRequiresEmptyMetadataAtFrameSchema();
     const auto geometry = MakeGeometry();
     auto bytes = Header(); Append(bytes, Frame(7U));

@@ -1,6 +1,7 @@
 #pragma once
 
 #include <condition_variable>
+#include <chrono>
 #include <mutex>
 #include <stop_token>
 
@@ -19,6 +20,14 @@ class BackupMaintenanceGate {
         std::unique_lock lock(mutex_);
         ExclusiveWaiter waiter(*this);
         const bool ready = cv_.wait(lock, cancelled, [&] { return !exclusive_ && readers_ == 0U; });
+        if (!ready || cancelled.stop_requested()) return false;
+        exclusive_ = true;
+        return true;
+    }
+    [[nodiscard]] bool lock_until(std::chrono::steady_clock::time_point deadline, std::stop_token cancelled) {
+        std::unique_lock lock(mutex_);
+        ExclusiveWaiter waiter(*this);
+        const bool ready = cv_.wait_until(lock, cancelled, deadline, [&] { return !exclusive_ && readers_ == 0U; });
         if (!ready || cancelled.stop_requested()) return false;
         exclusive_ = true;
         return true;
