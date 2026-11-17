@@ -26,9 +26,10 @@ inline TableSchema TypedSchema() {
     };
     return schema;
 }
+inline constexpr unsigned kModelCount = 3;
 inline const Geometry& Model(unsigned index) {
     // Padded fixed bits, a byte-aligned layout, and nullable variable columns.
-    static const std::array<Geometry, 3> models{
+    static const std::array<Geometry, kModelCount> models{
         Geometry({2, 2, 3, 3, 5}), Geometry({2, 2, 4, 4, 8}),
         Geometry({2, 2, 3, 3, 1}, TypedSchema())};
     return models[index % models.size()];
