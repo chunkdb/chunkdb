@@ -4,6 +4,7 @@
 #include "feed_slot_records.hpp"
 #include "migrations_records.hpp"
 #include "store_manifest.hpp"
+#include "typed_chunk_form.hpp"
 #include "wal_writer.hpp"
 
 #include <filesystem>
@@ -59,12 +60,15 @@ int main(int argc, char** argv) {
         frame.AppendSpan(0U, state.data(), state.size());
         (void)frame.Finish(1U, 10U);
         ModelFixture("wal", name + "-span", model, wal);
-        auto form = Bytes(16U, 0U); form[8U] = 1U;
-        form.insert(form.end(), presence.begin(), presence.end());
-        form.insert(form.end(), payload.begin(), payload.end());
-        const auto vars = ChunkVars{}.Encode();
-        form.insert(form.end(), vars.begin(), vars.end());
-        ModelFixture("chunk_form", name, model, form);
+        // The production encoder keeps this seed in the current SET CHUNK form.
+        ChunkState form{.version = 42U, .payload = payload, .presence_bitmap = presence,
+            .commit_time_ms = 1727786400123ULL, .chunk_columns = geometry.default_chunk_columns()};
+        const auto& columns = geometry.layout().schema().columns;
+        for (std::size_t index = 0; index < columns.size(); ++index)
+            if (geometry.layout().FixedColumnAt(index) == nullptr)  // text and bytes values
+                form.vars.Assign({columns[index].id, 0U}, Text(columns[index].name));
+        ModelFixture("chunk_form", name, model,
+            EncodeSectionedChunkState(geometry, form, kVarMaxChunkBytesLimit));
     }
     // Equivalent to manifest, slot-record and migration-record unit fixtures.
     const auto& geometry = fuzz::Model(1U);
