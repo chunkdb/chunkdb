@@ -789,7 +789,7 @@ WatchPosition WatchStart(Client& client) {
 class WatchingClient {
   public:
     WatchingClient(const Args& args, std::size_t index) : client_(args.host, args.port, args.io_timeout_ms),
-        timeout_(args.io_timeout_ms), args_(args) {
+        timeout_(args.io_timeout_ms), args_(args), index_(index), measure_(args.watch_delivery == "measure") {
         Hello(client_, args);
         std::string filters;
         if (args.watch_mode == "progress") filters = " AREA -1 -1 TO -1 -1";
@@ -800,13 +800,25 @@ class WatchingClient {
             // The slot persists the mode's filters; WATCH inherits them.
             slot_ = "bench_watch_" + std::to_string(index);
             client_.SendLine("CREATE SLOT IF NOT EXISTS '" + slot_ + "' ON " + args.watch_table + filters);
+            const auto sent = Clock::now();
+            if (measure_) {
+                // The first slot on a table checkpoints every chunk that has
+                // WAL data before it replies, so its reply time grows with
+                // the filled region. This setup is outside the timed window.
+                const auto deadline = sent + std::chrono::milliseconds(args.slot_create_timeout_ms);
+                while (!client_.WaitReply(std::chrono::milliseconds(100)))
+                    if (Clock::now() >= deadline)
+                        throw std::runtime_error("CREATE SLOT reply exceeded --slot-create-timeout-ms");
+            }
             const auto created = ReadValue(client_);
+            slot_create_ms_ = std::chrono::duration<double, std::milli>(Clock::now() - sent).count();
             if (created.type != '+' || created.text != "OK") throw std::runtime_error("CREATE SLOT failed: " + created.text);
             command += " SLOT '" + slot_ + "'";
         } else command += filters;
         client_.SendLine(command);
         position_ = WatchStart(client_);
         acknowledged_ = position_.revision;
+        ackable_ = position_.revision;
         initial_bytes_ = client_.consumed_bytes();
         start_ = Clock::now();
         client_.SetStopDeadline(&stop_deadline_);
@@ -824,7 +836,7 @@ class WatchingClient {
                         return;
                     }
                     std::uint64_t read;
-                    { std::lock_guard lock(event_mutex_); ValidatePush(value); read = position_.revision; }
+                    { std::lock_guard lock(event_mutex_); last_push_ = Clock::now(); ValidatePush(value); read = ackable_; }
                     event_cv_.notify_all();
                     if (!slot_.empty() && !client_.Buffered() && read > acknowledged_) {
                         std::lock_guard lock(send_mutex_);
@@ -839,6 +851,13 @@ class WatchingClient {
         });
     }
     ~WatchingClient() { client_.Shutdown(); if (reader_.joinable()) reader_.join(); }
+    // Records how far the watch trails the completed writes when the last
+    // write replied.
+    void SampleLag(std::optional<std::uint64_t> write_frontier, Clock::time_point writes_end) {
+        std::lock_guard lock(event_mutex_);
+        writes_end_ = writes_end;
+        if (write_frontier && *write_frontier > position_.revision) lag_ = *write_frontier - position_.revision;
+    }
     // Waits until the watch has read what the scenario wrote.
     void Drain(std::optional<std::uint64_t> write_frontier) {
         if (args_.watch_mode == "progress") {
@@ -849,19 +868,12 @@ class WatchingClient {
             if (Field(describe, "epoch").text != position_.epoch)
                 throw std::runtime_error("progress target changed epoch");
             const auto target = Revision(Field(describe, "revision"));
-            std::unique_lock lock(event_mutex_);
-            if (!event_cv_.wait_for(lock, std::chrono::milliseconds(timeout_), [&] {
-                    return error_ || (progress_ != 0U && position_.revision >= target);
-                })) throw std::runtime_error("watch waited for filtered progress frontier past its I/O deadline");
-            if (error_) std::rethrow_exception(error_);
+            WaitEvents([&] { return progress_ != 0U && position_.revision >= target; },
+                       "watch waited for filtered progress frontier past its I/O deadline");
         }
-        if (args_.watch_table == "default" && write_frontier) {
-            std::unique_lock lock(event_mutex_);
-            if (!event_cv_.wait_for(lock, std::chrono::milliseconds(timeout_), [&] {
-                    return error_ || position_.revision >= *write_frontier;
-                })) throw std::runtime_error("watch waited for completed write frontier past its I/O deadline");
-            if (error_) std::rethrow_exception(error_);
-        }
+        if (args_.watch_table == "default" && write_frontier)
+            WaitEvents([&] { return position_.revision >= *write_frontier; },
+                       "watch waited for completed write frontier past its I/O deadline");
     }
     void Unwatch() {
         std::lock_guard lock(send_mutex_);
@@ -877,6 +889,17 @@ class WatchingClient {
         result->watch_bytes += client_.consumed_bytes() - initial_bytes_;
         result->watch_changes += changes_; result->watch_progress += progress_; result->watch_chunks += chunks_; result->watch_other += other_;
         result->watch_duration_s = std::max(result->watch_duration_s, std::chrono::duration<double>(Clock::now() - start_).count());
+        WatcherResult watcher;
+        watcher.index = index_; watcher.slot = !slot_.empty();
+        watcher.changes = changes_; watcher.chunks = chunks_; watcher.progress = progress_; watcher.other = other_;
+        watcher.resyncs = resyncs_;
+        watcher.events = changes_ + chunks_ + progress_ + other_ + resyncs_;
+        watcher.bytes = client_.consumed_bytes() - initial_bytes_;
+        watcher.lag_revisions_at_end = lag_;
+        if (lag_ != 0U && writes_end_ && advanced_ > *writes_end_)
+            watcher.catch_up_s = std::chrono::duration<double>(advanced_ - *writes_end_).count();
+        watcher.slot_create_ms = slot_create_ms_;
+        result->watchers.push_back(watcher);
         if (slot_.empty()) return;
         client_.SetStopDeadline(nullptr);
         client_.SendLine("DROP SLOT IF EXISTS '" + slot_ + "' ON " + args_.watch_table);
@@ -884,6 +907,25 @@ class WatchingClient {
         if (dropped.type != '+' || dropped.text != "OK") throw std::runtime_error("DROP SLOT failed: " + dropped.text);
     }
   private:
+    // Strict delivery bounds the whole wait by the I/O timeout. Measurement
+    // waits while pushes arrive and fails only after a whole I/O timeout
+    // without one, so a slow but live watch reports its catch-up time.
+    template <typename Done>
+    void WaitEvents(Done done, const char* message) {
+        std::unique_lock lock(event_mutex_);
+        const auto timeout = std::chrono::milliseconds(timeout_);
+        if (!measure_) {
+            if (!event_cv_.wait_for(lock, timeout, [&] { return error_ || done(); })) throw std::runtime_error(message);
+        } else {
+            last_push_ = std::max(last_push_, Clock::now());
+            while (!error_ && !done()) {
+                const auto quiet_until = last_push_ + timeout;
+                if (Clock::now() >= quiet_until) throw std::runtime_error(std::string(message) + " without a push");
+                event_cv_.wait_until(lock, quiet_until);
+            }
+        }
+        if (error_) std::rethrow_exception(error_);
+    }
     void ValidatePush(const ReplyValue& value) {
         if (value.type != '>' || value.children.empty() || value.children[0].type != '$')
             throw std::runtime_error("invalid watch push");
@@ -894,6 +936,25 @@ class WatchingClient {
             if (count != 2U || value.children[1].type != '%' || Field(value.children[1], "epoch").text != position_.epoch)
                 throw std::runtime_error("invalid slot watch schema");
             described_ = true; ++other_; return;
+        }
+        if (measure_ && kind == "resync") {
+            // An ordinary watch that falls behind its share resumes after the
+            // resync position on the same connection; the skipped changes are
+            // not delivered. Measurement counts it and keeps reading.
+            if (count != 5U || value.children[1].type != '$' || value.children[1].text != position_.epoch)
+                throw std::runtime_error("invalid watch resync");
+            const auto revision = Revision(value.children[2]);
+            if (revision < position_.revision) throw std::runtime_error("watch resync went backwards");
+            if (revision > position_.revision) advanced_ = Clock::now();
+            position_.revision = revision;
+            ++resyncs_;
+            return;
+        }
+        if (measure_ && kind == "schema") {
+            // The schema is fixed during a run; a resumed watch can describe it again.
+            if (count != 2U || value.children[1].type != '%' || Field(value.children[1], "epoch").text != position_.epoch)
+                throw std::runtime_error("invalid watch schema");
+            ++other_; return;
         }
         if (kind == "resync" || kind == "schema" || kind == "end")
             throw std::runtime_error("watch invalidated the fixed schema or delivery prefix: " + kind);
@@ -907,7 +968,9 @@ class WatchingClient {
         const auto revision = Revision(value.children[2]);
         if (revision < position_.revision || (kind != "progress" && revision == position_.revision))
             throw std::runtime_error("watch revision went backwards");
+        if (revision > position_.revision) advanced_ = Clock::now();
         position_.revision = revision;
+        ackable_ = revision;
         if (kind == "progress") { ++progress_; return; }
         if (value.children[6].type != '*') throw std::runtime_error("invalid watch entries");
         for (const auto& entry : value.children[6].children) {
@@ -935,8 +998,18 @@ class WatchingClient {
     WatchPosition position_;
     Clock::time_point start_;
     std::atomic<Clock::duration::rep> stop_deadline_{0};
-    std::size_t changes_ = 0, progress_ = 0, chunks_ = 0, other_ = 0;
+    std::size_t index_;
+    bool measure_;
+    std::size_t changes_ = 0, progress_ = 0, chunks_ = 0, other_ = 0, resyncs_ = 0;
     bool described_ = false;
+    // The last change, chunks or progress revision: what a slot watch may ACK.
+    std::uint64_t ackable_ = 0;
+    // Lag sample and the last time the position advanced (guarded by event_mutex_).
+    std::uint64_t lag_ = 0;
+    std::optional<Clock::time_point> writes_end_;
+    Clock::time_point advanced_{};
+    Clock::time_point last_push_{};
+    double slot_create_ms_ = 0.0;
     // Only the reader writes the acknowledged revision; send_mutex_ orders ACK with UNWATCH.
     std::uint64_t acknowledged_ = 0;
     std::mutex send_mutex_;
@@ -1664,6 +1737,7 @@ struct ThreadWork {
         }
     }
     const auto end = Clock::now();
+    for (const auto& watch : watches) watch->SampleLag(write_frontier, end);
 
     if (failed.load(std::memory_order_acquire)) {
         throw std::runtime_error(
@@ -1859,6 +1933,10 @@ void ValidateEnabledArgs(const Args& args) {
         args.watch_mode != "filtered" && args.watch_mode != "chunks") throw std::invalid_argument("invalid --watch-mode value");
     if (args.watch_mode != "ordinary" && args.watch_table != "default")
         throw std::invalid_argument("enabled watch modes require --watch default");
+    if (args.watch_delivery != "strict" && args.watch_delivery != "measure")
+        throw std::invalid_argument("invalid --watch-delivery value");
+    if (args.watch_delivery == "measure" && args.watch_table.empty())
+        throw std::invalid_argument("--watch-delivery measure requires --watch");
     if (std::find(args.tests.begin(), args.tests.end(), Scenario::kTakeover) != args.tests.end() &&
         (args.clients != 1U || args.pipeline != 1U || !args.watch_table.empty() || args.with_metadata != "none"))
         throw std::invalid_argument("takeover requires clients=1, pipeline=1, no --watch or --with");
@@ -1962,6 +2040,10 @@ std::string UsageText() {
         << "  --watch <table>[:N][:slots]      N watches (default 1) read pushes after each scenario\n"
         << "                                   warmup; with slots, each owns a durable slot and ACKs\n"
         << "  --watch-mode <mode>              report-only: ordinary (default), progress, filtered, chunks\n"
+        << "  --watch-delivery <strict|measure> strict (default): a resync or a drain longer than\n"
+        << "                                   --io-timeout-ms fails; measure: counts resyncs, waits\n"
+        << "                                   while pushes arrive, reports each watch\n"
+        << "  --slot-create-timeout-ms <N>     measure: CREATE SLOT reply wait (default: 600000)\n"
         << "  --with <none|version|schema|both> report-only metadata on applicable block/area reads\n"
         << "  --tests takeover                report-only idle ownership cycles; clients/pipeline must be 1\n"
         << "  --server-workers <N>             spawn mode: server worker threads (default: 4); a\n"
@@ -2090,6 +2172,21 @@ Args ParseArgs(const std::vector<std::string>& argv) {
                 throw std::invalid_argument("invalid --watch-mode value");
             continue;
         }
+        if (arg == "--watch-delivery") {
+            args.watch_delivery = require_value("--watch-delivery");
+            if (args.watch_delivery != "strict" && args.watch_delivery != "measure")
+                throw std::invalid_argument("invalid --watch-delivery value");
+            continue;
+        }
+        if (arg == "--slot-create-timeout-ms") {
+            const auto value = require_value("--slot-create-timeout-ms");
+            const auto parsed = std::from_chars(value.data(), value.data() + value.size(), args.slot_create_timeout_ms);
+            if (parsed.ec != std::errc{} || parsed.ptr != value.data() + value.size() ||
+                args.slot_create_timeout_ms == 0 || args.slot_create_timeout_ms > 86400000) {
+                throw std::invalid_argument("--slot-create-timeout-ms must be between 1 and 86400000");
+            }
+            continue;
+        }
         if (arg == "--io-timeout-ms") {
             const auto value = require_value("--io-timeout-ms");
             const auto parsed = std::from_chars(value.data(), value.data() + value.size(), args.io_timeout_ms);
@@ -2197,6 +2294,7 @@ BenchmarkReport Run(const Args& args) {
     report.seed = args.seed;
     report.with_metadata = args.with_metadata;
     report.watch_mode = args.watch_mode;
+    report.watch_delivery = args.watch_delivery;
     report.watch_table = args.watch_table;
     if (!args.watch_table.empty()) {
         report.watch = args.watch_table;
@@ -2360,7 +2458,8 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
     out << "tests=" << JoinResultNames(report.results) << "\n";
     const bool descriptive = report.with_metadata != "none" || !report.watch_table.empty();
     if (descriptive) out << "report_only with=" << report.with_metadata << " watch=" << report.watch
-                         << " watch_mode=" << report.watch_mode << "\n";
+                         << " watch_mode=" << report.watch_mode
+                         << (report.watch_delivery == "measure" ? " watch_delivery=measure" : "") << "\n";
 
     for (const auto& result : report.results) {
         out << "\n[" << result.name << "]\n";
@@ -2379,6 +2478,13 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
                 << " Watch bytes: " << result.watch_bytes << " change=" << result.watch_changes
                 << " progress=" << result.watch_progress << " chunks=" << result.watch_chunks << " other=" << result.watch_other
                 << " watch_duration_s=" << result.watch_duration_s << "\n";
+            if (report.watch_delivery == "measure")
+                for (const auto& w : result.watchers)
+                    out << "Watcher " << w.index << (w.slot ? " slot" : "") << ": events=" << w.events
+                        << " change=" << w.changes << " chunks=" << w.chunks << " progress=" << w.progress
+                        << " other=" << w.other << " resyncs=" << w.resyncs << " bytes=" << w.bytes
+                        << " lag_revisions_at_end=" << w.lag_revisions_at_end << " catch_up_s=" << w.catch_up_s
+                        << " slot_create_ms=" << w.slot_create_ms << "\n";
             if (result.ownership_cycles != 0U)
                 out << "Ownership cycles: " << result.ownership_cycles << " cycles/s="
                     << result.ownership_cycles / result.duration_s << " latency_unit=ownership_cycle ACKs=0\n";
@@ -2434,7 +2540,8 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
     const bool descriptive = report.with_metadata != "none" || !report.watch_table.empty();
     if (descriptive) out << "\"enabled_config\":{\"report_only\":true,\"with\":\"" << JsonEscape(report.with_metadata)
         << "\",\"watch\":\"" << JsonEscape(report.watch) << "\",\"watch_mode\":\""
-        << JsonEscape(report.watch_mode) << "\"},";
+        << JsonEscape(report.watch_mode) << "\""
+        << (report.watch_delivery == "measure" ? ",\"watch_delivery\":\"measure\"" : "") << "},";
     out << "\"results\":[";
     for (std::size_t i = 0; i < report.results.size(); ++i) {
         if (i != 0) {
@@ -2455,6 +2562,18 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
                 << ",\"watch_bytes\":" << r.watch_bytes << ",\"watch_changes\":" << r.watch_changes
                 << ",\"watch_progress\":" << r.watch_progress << ",\"watch_chunks\":" << r.watch_chunks
                 << ",\"watch_other\":" << r.watch_other << ",\"watch_duration_s\":" << r.watch_duration_s << ",";
+            if (report.watch_delivery == "measure") {
+                out << "\"watchers\":[";
+                for (std::size_t w = 0; w < r.watchers.size(); ++w) {
+                    const auto& watcher = r.watchers[w];
+                    out << (w ? "," : "") << "{\"index\":" << watcher.index << ",\"slot\":" << (watcher.slot ? "true" : "false")
+                        << ",\"events\":" << watcher.events << ",\"changes\":" << watcher.changes << ",\"chunks\":" << watcher.chunks
+                        << ",\"progress\":" << watcher.progress << ",\"other\":" << watcher.other << ",\"resyncs\":" << watcher.resyncs
+                        << ",\"bytes\":" << watcher.bytes << ",\"lag_revisions_at_end\":" << watcher.lag_revisions_at_end
+                        << ",\"catch_up_s\":" << watcher.catch_up_s << ",\"slot_create_ms\":" << watcher.slot_create_ms << "}";
+                }
+                out << "],";
+            }
             if (r.ownership_cycles != 0U)
                 out << "\"report_only\":true,\"ownership_cycles\":" << r.ownership_cycles
                     << ",\"ownership_cycles_s\":" << r.ownership_cycles / r.duration_s
