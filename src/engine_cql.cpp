@@ -1483,6 +1483,10 @@ std::string CommandEngine::ExecuteStatement(
                     auto prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged, count);
                     auto suffix = AreaReplySuffix(paged, false, {}, get.dims);
                     if (prefix.size() > budget || suffix.size() > budget - prefix.size()) throw too_large();
+                    // An entry that cannot fit an otherwise empty page ends a
+                    // page that already admitted a cell, so the next page starts
+                    // at it; as the first cell it is refused with its coordinate.
+                    bool first_cell = true;
                     (void)store.VisitChunkArea(selector, get.after, static_cast<std::size_t>(limit),
                         [&](const ChunkCoord& coord, std::optional<ChunkRangeEntry>&& entry, bool more) {
                             const auto next_count = count + static_cast<std::size_t>(entry.has_value());
@@ -1498,15 +1502,18 @@ std::string CommandEngine::ExecuteStatement(
                                 Protocol::AppendInteger(row, coord.x);
                                 Protocol::AppendInteger(row, coord.y);
                                 if (get.dims == 3U) Protocol::AppendInteger(row, coord.z);
-                                if (row.size() >= row_budget) throw too_large();
-                                const auto form_bound = row_budget - row.size();
                                 const bool private_state = session.transaction != nullptr && session.transaction->writes.contains(coord);
                                 const ChunkState state{.version = entry->version, .payload = std::move(entry->payload),
                                     .presence_bitmap = std::move(entry->presence_bitmap), .vars = std::move(entry->vars), .written = true,
                                     .commit_time_ms = entry->commit_time_ms, .chunk_columns = std::move(entry->chunk_columns)};
                                 const auto form_size = SectionedChunkStateBytes(store.geometry(), state, kVarMaxChunkBytesLimit, columns);
                                 const auto bulk_overhead = 5U + std::to_string(form_size).size();
-                                if (form_size > form_bound || bulk_overhead > form_bound - form_size) throw too_large();
+                                if (row.size() + bulk_overhead > row_budget || form_size > row_budget - row.size() - bulk_overhead) {
+                                    if (paged && !first_cell) return false;
+                                    throw AreaEntryTooLargeError(coord, get.dims, budget,
+                                        single_prefix.size() + next_suffix.size() + row.size() + bulk_overhead + form_size);
+                                }
+                                const auto form_bound = row_budget - row.size();
                                 const auto form = EncodeSectionedChunkState(store.geometry(), state, kVarMaxChunkBytesLimit,
                                     columns, private_state, form_bound);
                                 Protocol::AppendBulk(row, {reinterpret_cast<const char*>(form.data()), form.size()});
@@ -1519,6 +1526,7 @@ std::string CommandEngine::ExecuteStatement(
                                 return false;
                             }
                             body += row;
+                            first_cell = false;
                             count = next_count;
                             prefix = std::move(next_prefix);
                             suffix = std::move(next_suffix);

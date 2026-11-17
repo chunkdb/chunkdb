@@ -804,7 +804,13 @@ void TestIntentsOnDisk() {
         damaged[10] ^= 1U;
         const auto damaged_path = chunkdb::TxnIntentPath(table_dir, 1000);
         WriteFile(damaged_path, damaged);
-        assert(VerifyOutput(root.path()).find("txn_intent_invalid") != std::string::npos);
+        const auto report = VerifyOutput(root.path());
+        assert(report.find("txn_intent_invalid") != std::string::npos);
+        // The txn_intent_invalid line names the file once.
+        const auto line_start = report.find("txn_intent_invalid");
+        const auto line = report.substr(line_start, report.find('\n', line_start) - line_start);
+        const auto file_name = damaged_path.filename().string();
+        assert(line.find(file_name) != std::string::npos && line.find(file_name, line.find(file_name) + 1) == std::string::npos);
         // Startup names the damaged file and the defect.
         std::string refused;
         try { ChunkStore writer(config); } catch (const std::exception& error) { refused = error.what(); }
