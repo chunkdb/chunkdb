@@ -2109,8 +2109,10 @@ void TableCatalog::EndNarrowing(Table& table, const TableOptions& options, const
         bool fenced = false;
         if (!migration_health_->failed.load(std::memory_order_acquire) && Find(table.name_).get() == &table &&
             table.Info().schema.pending.has_value()) {
+            // Made before the table is closed: a failure here leaves it
+            // served instead of busy until a restart.
+            auto fence = PrepareFence(table.shared_from_this(), table.name_, kFenceNarrowing);
             if (auto store = table.BeginExclusive(/*closing=*/true)) {
-                auto fence = PrepareFence(table.shared_from_this(), table.name_, kFenceNarrowing);
                 std::lock_guard operations(operations_mutex_);
                 store.reset();
                 FenceTable(table, options, std::move(fence));
