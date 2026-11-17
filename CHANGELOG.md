@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A `--read-only` server refreshes the chunk list of GET AREA and SCAN CHUNKS after a writer change by reading only the chunks the writer changed, which the writer records in the volatile table file `chunkdb.snapshot.changes`, instead of reading every chunk of the table again; after a writer restart, COMPACT TOMBSTONES or more than 4096 chunk file writes since its last read, it reads every chunk once.
 - Mix coordinate hashes with a process seed across every axis and bound shared large-chunk containers, exposing capacity metrics and a known BUSY refusal for new cache misses (#134).
 - Add three-dimensional tables, typed chunk columns, checked sectioned chunk forms, atomic metadata and projected writes, and retained tombstone identities with incremental scans and explicit compaction (#133).
 - Measure a slot change read back from the feed archive by the frame the watch sends: decoding skips chunks outside the slot's AREA, keeps only its COLUMNS and drops before values with NO BEFORE, and stops once that frame would exceed the current `feed_buffer_bytes`, so a filtered change whose frame fits is delivered; in CHUNKS mode, chunks outside the area no longer count toward the budget.

@@ -356,7 +356,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME coordinate_hash_seed_failure COMMAND chunkdb_coordinate_hash_seed_test --failure)
     set_tests_properties(coordinate_hash_seed_failure PROPERTIES TIMEOUT 60 LABELS "smoke")
 
-    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol)
+    foreach(format IN ITEMS sectioned_chunk_form txn_intent_format populated_index_format archive_base_format chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input chunk_coordinate_index read_only_index_refresh table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -983,6 +983,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_wal_stream_replay_test
         chunkdb_shared_file_input_test
         chunkdb_chunk_coordinate_index_test
+        chunkdb_read_only_index_refresh_test
         chunkdb_table_chunk_columns_test
         chunkdb_world_coordinates_3d_test
         chunkdb_feed_archive_base_test
@@ -1129,6 +1130,7 @@ if(CHUNKDB_BUILD_TESTS)
         wal_stream_replay
         shared_file_input
         chunk_coordinate_index
+        read_only_index_refresh
         table_chunk_columns
         world_coordinates_3d
         feed_archive_base
