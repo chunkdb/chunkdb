@@ -344,8 +344,9 @@ std::string CommandEngine::Execute(
         // The user a login names, for the audit log: from HELLO 3 USER, or
         // the pending login AUTH finishes.
         std::string audit_user;
-        bool known_user = false;
-        bool unbound_refused = false;
+        // The login AUTH finishes; its flags are read once AUTH has run,
+        // since AUTH sets them from the user as it is then.
+        std::shared_ptr<const PendingLogin> audit_login;
         const bool was_greeted = session.greeted;
         if (config_.audit != nullptr) {
             if (hello) {
@@ -353,8 +354,7 @@ std::string CommandEngine::Execute(
                 if (tokens.size() == 5U && Protocol::CommandEquals(tokens[2], "USER")) audit_user = tokens[3];
             } else if (session.pending_login != nullptr) {
                 audit_user = session.pending_login->user;
-                known_user = session.pending_login->known;
-                unbound_refused = session.pending_login->unbound_refused;
+                audit_login = session.pending_login;
             }
         }
         std::string response;
@@ -380,6 +380,8 @@ std::string CommandEngine::Execute(
             const bool succeeded = session.greeted;
             // A +SCRAM reply only continues the login.
             if (succeeded || (!response.empty() && response[0] == '-')) {
+                const bool known_user = audit_login != nullptr && audit_login->known;
+                const bool unbound_refused = audit_login != nullptr && audit_login->unbound_refused;
                 AuditLogin(session, succeeded ? std::string_view(session.user) : std::string_view(audit_user),
                            known_user, unbound_refused, succeeded, response);
             }
@@ -984,6 +986,9 @@ std::string CommandEngine::HandleAuth(
     const auto current = config_.users->FindIncarnation(pending->user);
     if (!current.has_value() || current->incarnation != pending->incarnation ||
         current->user.verifier != pending->verifier || (!pending->bound && current->user.requires_channel_binding)) {
+        // The audit log gives the reason as of now too, as HELLO would.
+        pending->known = current.has_value();
+        pending->unbound_refused = current.has_value() && !pending->bound && current->user.requires_channel_binding;
         return RecordAuthFailure(session, pending->user);
     }
     RecordAuthSuccess(session, pending->user);
