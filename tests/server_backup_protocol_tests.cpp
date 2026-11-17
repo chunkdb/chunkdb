@@ -301,10 +301,52 @@ void RestoreStatement() {
     assert(refused.starts_with("-ERR INVALID_ARGUMENT") && refused.find("read-only") != std::string::npos);
     Verify(std::filesystem::canonical(destinations.path()) / "it's-snap");
 }
+// SWAP TABLES exchanges the names; open transactions on either end with CONFLICT.
+void SwapStatement() {
+    test::ScopedTempDir destinations("chunkdb-swap-tables-protocol");
+    Harness harness(false, true, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
+    auto admin = harness.Connect();
+    admin->Ok("CREATE TABLE t (n u8) CHUNK 2 x 2");
+    (void)admin->Command("SET BLOCK 0 0 IN t n = 7");
+    (void)admin->Command(Backup("snap"));
+    (void)admin->Command("SET BLOCK 0 0 IN t n = 8");
+    const auto restored = Field(admin->Command("RESTORE TABLE t FROM 'snap' AS t_restored"), "epoch").value;
+    const auto live = StoreIdHex(harness.catalog->Find("t")->store_id());
+
+    auto txn = harness.Connect();
+    txn->Ok("BEGIN");
+    assert(Number(txn->Command("GET BLOCK 0 0 FROM t").items.at(0)) == 8U);
+    admin->Ok("SWAP TABLES t, t_restored");
+    Error(txn->Command("SET BLOCK 0 0 IN t n = 9"), "CONFLICT");
+    txn->Ok("ROLLBACK");
+    assert(Field(admin->Command("DESCRIBE t"), "epoch").value == restored);
+    assert(Field(admin->Command("DESCRIBE t_restored"), "epoch").value == live);
+    assert(Number(admin->Command("GET BLOCK 0 0 FROM t").items.at(0)) == 7U);
+    assert(Number(admin->Command("GET BLOCK 0 0 FROM t_restored").items.at(0)) == 8U);
+
+    Error(admin->Command("SWAP TABLES t, t"), "INVALID_ARGUMENT");
+    Error(admin->Command("SWAP TABLES t, absent"), "NO_TABLE");
+    admin->Ok("BEGIN");
+    Error(admin->Command("SWAP TABLES t, t_restored"), "INVALID_ARGUMENT");
+    admin->Ok("ROLLBACK");
+
+    // Grants stay with names, so the user needs ADMIN on both.
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
+    admin->Ok("CREATE USER operator VERIFIER '" + verifier + "'");
+    admin->Ok("GRANT ADMIN ON t TO operator");
+    admin->Ok("GRANT READ ON t_restored TO operator");
+    Client user(harness.port, false); user.Login("operator", "pw");
+    Error(user.Command("SWAP TABLES t, t_restored"), "PERMISSION_DENIED");
+    admin->Ok("GRANT ADMIN ON t_restored TO operator");
+    user.Ok("SWAP TABLES t_restored, t");
+    assert(Field(admin->Command("DESCRIBE t"), "epoch").value == live);
+}
 } // namespace
 int main() {
     RestoreStatement();
-    std::cout << "restore table protocol group passed\n";
+    SwapStatement();
+    std::cout << "restore and swap protocol groups passed\n";
     for (const bool tls : {false, true}) {
 #ifndef CHUNKDB_WITH_OPENSSL
         if (tls) continue;

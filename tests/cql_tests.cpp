@@ -516,6 +516,12 @@ void TestBackup() {
     ExpectError("RESTORE TABLE world FROM $1", "expected a quoted backup path");
     ExpectError("RESTORE TABLE world FROM 'snap' AS", "expected a table name");
     ExpectError("RESTORE TABLE world FROM 'snap' INTO other", "expected the end of the statement");
+    const auto swap = Get<cql::SwapTables>("SWAP TABLES world, world_restored");
+    assert(swap.first == "world" && swap.second == "world_restored");
+    ExpectError("SWAP TABLE world, other", "expected TABLES");
+    ExpectError("SWAP TABLES world other", "expected a comma");
+    ExpectError("SWAP TABLES world,", "expected a table name");
+    ExpectError("SWAP TABLES world, other, third", "expected the end of the statement");
 }
 
 void TestErrors() {

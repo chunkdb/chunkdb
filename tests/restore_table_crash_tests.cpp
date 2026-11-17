@@ -1,5 +1,5 @@
-// A RESTORE TABLE child process stops at each step; the next writer start
-// serves the restored table completely or not at all.
+// RESTORE TABLE and SWAP TABLES child processes stop at each step; the next
+// writer start serves each table completely, under its old or new name.
 #include <cstdlib>
 #ifndef _WIN32
 #include <sys/wait.h>
@@ -85,6 +85,40 @@ void Crashes(const std::string& executable) {
     }
 }
 
+
+// A SWAP TABLES child process stops before the exchange, after it, and after
+// its sync; the next start serves both names exchanged or neither.
+void SwapCrashes(const std::string& executable) {
+    for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) {
+        for (const std::string point : {"CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_BEFORE_EXCHANGE_ONCE",
+                 "CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_EXCHANGE_ONCE",
+                 "CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_SYNC_ONCE"}) {
+            Source source(mode);
+            StoreId restored{};
+            {
+                TableCatalog catalog(source.Config());
+                restored = catalog.RestoreTable(source.Request()).epoch;
+            }
+            assert(Child(executable, {"--swap-child", source.data.string(), point,
+                       mode == DurabilityMode::kFsyncWal ? "fsync-wal" : "relaxed"}) == 86);
+            const bool exchanged = point.find("BEFORE_EXCHANGE") == std::string::npos;
+            {
+                TableCatalog catalog(source.Config());
+                assert(catalog.TableCount() == 2U && catalog.Fences().empty());
+                const auto copy = catalog.Require(exchanged ? "t" : "t_restored");
+                const auto live = catalog.Require(exchanged ? "t_restored" : "t");
+                assert(copy->store_id() == restored && live->store_id() == source.epoch);
+                assert(copy->Acquire()->store().GetBlockBits(8, 0) == "00000011");
+                assert(live->Acquire()->store().GetBlockBits(8, 0) == "11111111");
+                // The swap can run again after the restart.
+                catalog.SwapTables("t", "t_restored");
+                assert(catalog.Require(exchanged ? "t_restored" : "t")->store_id() == restored);
+            }
+            Verified(source.data);
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -94,6 +128,13 @@ int main(int argc, char** argv) {
         (void)catalog.RestoreTable(TableRestoreRequest{.backup = argv[3], .table = "t", .name = "t_restored"});
         return 3;
     }
+    if (argc == 5 && std::string_view(argv[1]) == "--swap-child") {
+        TableCatalog catalog(ChildConfig(argv[2], argv[4]));
+        txn_test::ScopedEnv point(argv[3], "1");
+        catalog.SwapTables("t", "t_restored");
+        return 3;
+    }
     Crashes(argv[0]);
-    std::cout << "16 restore table crash cases passed\n";
+    SwapCrashes(argv[0]);
+    std::cout << "16 restore table and 6 swap tables crash cases passed\n";
 }

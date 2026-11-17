@@ -299,10 +299,10 @@ std::string StatementSuggestion(std::string_view word) {
         return {};
     }
     const auto lower = Lower(word);
-    const std::array<std::string_view, 25U> keywords{
+    const std::array<std::string_view, 26U> keywords{
         "get", "set", "delete", "create", "alter", "drop", "show", "describe", "grant", "revoke",
         "begin", "commit", "rollback", "ping", "flush", "watch", "unwatch", "ack", "backup", "migrate",
-        "scan", "reload", "recover", "compact", "restore"};
+        "scan", "reload", "recover", "compact", "restore", "swap"};
     std::string_view closest;
     std::size_t best = word.size() < 4U ? 2U : 3U;
     bool tied = false;
@@ -1098,6 +1098,13 @@ class Parser {
             restore.path = Take().text;
             restore.name = Accept("as") ? Name("a table name") : restore.table;
             return restore;
+        }
+        if (Accept("swap")) {
+            Expect("tables");
+            SwapTables swap{.first = Name("a table name")};
+            ExpectToken(TokenKind::kComma, "a comma");
+            swap.second = Name("a table name");
+            return swap;
         }
         if (Accept("compact")) {
             Expect("tombstones");

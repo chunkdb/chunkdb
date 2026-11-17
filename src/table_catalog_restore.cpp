@@ -1,5 +1,6 @@
 #include "chunkdb/table_catalog.hpp"
 
+#include <array>
 #include <cstdlib>
 #include <sstream>
 
@@ -50,9 +51,6 @@ class RestoreProgressLog {
 TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request) {
     RequireWritable("RESTORE TABLE");
     RequireValidTableName(request.name);
-    // ENABLE FEATURE cannot change the directory's features between the
-    // feature check below and publication.
-    std::shared_lock metadata(feature_metadata_gate_);
     const auto require_name = [&] {
         migration_health_->Check();
         ThrowIfFenced(request.name);
@@ -62,8 +60,6 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         std::lock_guard operations(operations_mutex_);
         require_name();
     }
-    const auto directory_manifest = ReadDataDirManifest(config_.data_dir);
-    if (!directory_manifest) throw std::runtime_error("data directory manifest disappeared");
     LogMessage(LogLevel::kInfo, LogComponent::kStore, "table restore started",
         {{"table", request.name}, {"backup", request.backup.string()}, {"backed_up_table", request.table}});
 
@@ -76,6 +72,16 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
     TableRestoreResult result;
     result.name = request.name;
     StoreManifest manifest;
+    // The table must have the table-owned features the directory gives its tables.
+    const auto require_features = [&] {
+        const auto directory_manifest = ReadDataDirManifest(config_.data_dir);
+        if (!directory_manifest) throw std::runtime_error("data directory manifest disappeared");
+        const auto served = TableScopedFeatures(directory_manifest->features);
+        if (TableScopedFeatures(manifest.features).incompat != served.incompat)
+            throw std::invalid_argument("the backed-up table has features " + DescribeFeatures(TableScopedFeatures(manifest.features)) +
+                " but this data directory gives its tables " + DescribeFeatures(served));
+    };
+    std::shared_lock<BackupMaintenanceGate> metadata;
     std::unique_lock operations(operations_mutex_, std::defer_lock);
     try {
         RestoreProgressLog progress(request);
@@ -87,10 +93,7 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         if ((manifest.features.incompat & kFeatureTableLineage) == 0U)
             throw FeatureAdmissionError("feature_disabled", "table_lineage",
                 "restore requires table_lineage on the backed-up table; enable it on the source and create another backup");
-        const auto served = TableScopedFeatures(directory_manifest->features);
-        if (TableScopedFeatures(manifest.features).incompat != served.incompat)
-            throw std::invalid_argument("the backed-up table has features " + DescribeFeatures(TableScopedFeatures(manifest.features)) +
-                " but this data directory gives its tables " + DescribeFeatures(served));
+        require_features();
         RequireValidTableOptions(DecodeTableOptions(manifest.options));
         RequireRecoverableOptions(request.name, manifest);
         result.parent_epoch = copy.cut.epoch;
@@ -106,6 +109,11 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         SyncBackupTree(staging, request.cancelled);
         if (request.cancelled.stop_requested()) throw std::runtime_error("backup cancelled");
         CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_BEFORE_PUBLISH_ONCE");
+        // ENABLE FEATURE cannot change the directory's features from this
+        // check until the table serves.
+        if (!feature_metadata_gate_.lock_shared(request.cancelled)) throw std::runtime_error("backup cancelled");
+        metadata = std::shared_lock(feature_metadata_gate_, std::adopt_lock);
+        require_features();
         operations.lock();
         require_name();
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RESTORE_TABLE_PUBLISH_FAIL_ONCE"))
@@ -164,6 +172,182 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
          {"fork_revision", std::to_string(result.fork_revision)}, {"files", std::to_string(result.files)},
          {"bytes", std::to_string(result.bytes)}});
     return result;
+}
+
+}  // namespace chunkdb
+
+namespace chunkdb {
+namespace {
+
+constexpr const char* kFenceSwapUnknown = "a failed swap could not make its exchange durable";
+constexpr const char* kFenceSwapReopen = "a swap could not open it under its new name";
+constexpr const char* kFenceSwapRefusedReopen = "a refused swap could not reopen it";
+constexpr const char* kWatchSwapped = "watched table was swapped; watch it again";
+
+// Runs `fn` when the scope ends, unless dismissed. `fn` must not throw.
+template <typename Fn>
+class ScopeExit {
+  public:
+    explicit ScopeExit(Fn fn) : fn_(std::move(fn)) {}
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+    ~ScopeExit() {
+        if (active_) fn_();
+    }
+    void Dismiss() noexcept { active_ = false; }
+
+  private:
+    Fn fn_;
+    bool active_ = true;
+};
+
+// `path` below `from`, moved below `to`; any other path unchanged.
+std::string MovedPath(const std::string& path, const std::string& from, const std::string& to) {
+    if (path.rfind(from, 0U) != 0U) return path;
+    if (path.size() != from.size() && path[from.size()] != '/' &&
+        path[from.size()] != static_cast<char>(std::filesystem::path::preferred_separator))
+        return path;
+    return to + path.substr(from.size());
+}
+
+}  // namespace
+
+void TableCatalog::SwapTables(std::string_view first, std::string_view second, std::stop_token cancelled) {
+    RequireWritable("SWAP TABLES");
+    RequireValidTableName(first);
+    RequireValidTableName(second);
+    if (first == second) throw std::invalid_argument("SWAP TABLES needs two different tables");
+    // As RecoverTable: feature activation and backup metadata capture and
+    // pinning exclude a swap, so a backup copies both names before or after.
+    if (!feature_metadata_gate_.lock_shared(cancelled)) throw std::runtime_error("SWAP TABLES cancelled");
+    std::shared_lock feature_metadata(feature_metadata_gate_, std::adopt_lock);
+    if (!backup_metadata_gate_.lock_shared(cancelled)) throw std::runtime_error("SWAP TABLES cancelled");
+    std::shared_lock backup_metadata(backup_metadata_gate_, std::adopt_lock);
+    // Name order, so two swaps of overlapping tables admit in the same order.
+    const std::array<std::string, 2U> names{std::string(std::min(first, second)), std::string(std::max(first, second))};
+    const std::array<std::shared_ptr<Table>, 2U> tables{Require(names[0]), Require(names[1])};
+    std::unique_lock ddl_first(tables[0]->ddl_mutex_);
+    std::unique_lock ddl_second(tables[1]->ddl_mutex_);
+    const std::array<TableOptions, 2U> options{tables[0]->Info().options, tables[1]->Info().options};
+    std::array<std::shared_ptr<ChunkStore>, 2U> stores;
+    ScopeExit serving([&] {
+        for (std::size_t i = 0; i < stores.size(); ++i)
+            if (stores[i]) tables[i]->EndExclusive(std::move(stores[i]), options[i]);
+    });
+    for (std::size_t i = 0; i < stores.size(); ++i) {
+        stores[i] = tables[i]->BeginExclusive(/*closing=*/false, cancelled);
+        if (stores[i]) continue;
+        if (cancelled.stop_requested()) throw std::runtime_error("SWAP TABLES cancelled");
+        throw TableNotFoundError("table '" + names[i] + "' does not exist");
+    }
+    std::lock_guard operations(operations_mutex_);
+    migration_health_->Check();
+    for (std::size_t i = 0; i < stores.size(); ++i) {
+        if (Find(names[i]) != tables[i]) throw TableNotFoundError("table '" + names[i] + "' does not exist");
+        if (const char* reason = Table::StoreFenceReason(*stores[i]))
+            throw TableFencedError("table '" + names[i] + "' is fenced: " + reason + "; run RECOVER TABLE " + names[i]);
+    }
+    // Everything acknowledged becomes durable under the old names first.
+    for (auto& store : stores) store->WalBarrier();
+    const std::array<std::filesystem::path, 2U> dirs{tables[0]->dir_, tables[1]->dir_};
+    // Made now, so that fencing does not allocate.
+    std::array<FenceNode, 2U> fences{PrepareFence(tables[0], names[0], kFenceSwapUnknown),
+        PrepareFence(tables[1], names[1], kFenceSwapUnknown)};
+    std::array<std::shared_ptr<ChunkStore::UnsyncedArtifacts>, 2U> unsynced{
+        std::make_shared<ChunkStore::UnsyncedArtifacts>(), std::make_shared<ChunkStore::UnsyncedArtifacts>()};
+    // Unsynced paths are spelled below each store's own directory.
+    const std::array<std::string, 2U> store_dirs{stores[0]->data_dir().string(), stores[1]->data_dir().string()};
+    serving.Dismiss();
+    for (std::size_t i = 0; i < stores.size(); ++i) {
+        stores[i]->HandOverUnsyncedOnClose(unsynced[i]);
+        stores[i].reset();
+    }
+    // Opens directory `dir` as table `name` with what store `from` still owed.
+    const auto open = [&](std::size_t name, std::size_t from) {
+        const auto manifest = ReadOpenableManifest(dirs[name]);
+        const auto table_options = DecodeTableOptions(manifest.options);
+        auto store = OpenStore(names[name], dirs[name], manifest.geometry, 0U, table_options);
+        ChunkStore::UnsyncedArtifacts moved;
+        moved.overflow = unsynced[from]->overflow;
+        const auto& old_dir = store_dirs[from];
+        const auto new_dir = store->data_dir().string();
+        for (const auto& path : unsynced[from]->files) moved.files.insert(MovedPath(path, old_dir, new_dir));
+        for (const auto& path : unsynced[from]->dirs) moved.dirs.insert(MovedPath(path, old_dir, new_dir));
+        for (const auto& path : unsynced[from]->swept_dirs) moved.swept_dirs.insert(MovedPath(path, old_dir, new_dir));
+        store->AdoptUnsynced(moved);
+        const StoreId store_id = store->store_id();
+        Geometry geometry = store->geometry();
+        return std::shared_ptr<Table>(new Table(names[name], dirs[name], store_id, std::move(geometry), table_options,
+            std::move(store), config_.feed_buffer_bytes, migration_health_, config_.feed_linger));
+    };
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_BEFORE_EXCHANGE_ONCE");
+    const auto exchanged = ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SWAP_TABLES_EXCHANGE_UNSUPPORTED_ONCE")
+        ? std::make_error_code(std::errc::function_not_supported) : ExchangeDirectories(dirs[0], dirs[1]);
+    if (exchanged) {
+        // Nothing moved: both tables serve again as they were.
+        for (std::size_t i = 0; i < stores.size(); ++i) {
+            try {
+                auto store = OpenStore(names[i], dirs[i], tables[i]->geometry().config(), 0U, options[i]);
+                store->AdoptUnsynced(*unsynced[i]);
+                tables[i]->EndExclusive(std::move(store), options[i]);
+            } catch (const std::exception& error) {
+                LogMessage(LogLevel::kError, LogComponent::kStore,
+                    "table could not be reopened after a refused swap; it is fenced until RECOVER TABLE or a restart",
+                    {{"table", names[i]}, {"error", error.what()}});
+                fences[i].mapped().reason = kFenceSwapRefusedReopen;
+                FenceTable(*tables[i], options[i], std::move(fences[i]));
+            }
+        }
+        throw std::runtime_error("SWAP TABLES needs an atomic directory exchange, which was refused: " + exchanged.message());
+    }
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_EXCHANGE_ONCE");
+    try {
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SWAP_TABLES_SYNC_FAIL_ONCE"))
+            throw std::runtime_error("injected directory sync failure after exchanging tables");
+        SyncDirectoryPath(TablesDir());
+    } catch (const std::exception& error) {
+        // Exchanged now, but a crash could still undo it: neither name serves
+        // until a recovery opens what its directory holds.
+        LogMessage(LogLevel::kError, LogComponent::kStore,
+            "swapped tables could not be made durable; both are fenced until RECOVER TABLE or a restart",
+            {{"tables", names[0] + "," + names[1]}, {"error", error.what()}});
+        for (std::size_t i = 0; i < stores.size(); ++i) {
+            tables[i]->ended_.store(kWatchSwapped, std::memory_order_release);
+            FenceTable(*tables[i], options[i], std::move(fences[i]));
+        }
+        throw;
+    }
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_SYNC_ONCE");
+    std::array<std::shared_ptr<Table>, 2U> swapped;
+    for (std::size_t i = 0; i < swapped.size(); ++i) {
+        try {
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SWAP_TABLES_OPEN_FAIL_ONCE"))
+                throw std::runtime_error("injected failure opening a swapped table");
+            swapped[i] = open(i, 1U - i);
+        } catch (const std::exception& error) {
+            LogMessage(LogLevel::kError, LogComponent::kStore,
+                "swapped table could not be opened under its new name; it is fenced until RECOVER TABLE or a restart",
+                {{"table", names[i]}, {"error", error.what()}});
+        }
+    }
+    // Connections holding the old tables find the swapped ones; their
+    // watches end, and a watch by name resumes by lineage or resyncs.
+    for (std::size_t i = 0; i < swapped.size(); ++i) {
+        tables[i]->ended_.store(kWatchSwapped, std::memory_order_release);
+        if (swapped[i]) {
+            {
+                std::unique_lock lock(tables_mutex_);
+                tables_[names[i]] = swapped[i];
+            }
+            tables[i]->EndExclusive(nullptr, options[i]);
+        } else {
+            fences[i].mapped().reason = kFenceSwapReopen;
+            FenceTable(*tables[i], options[i], std::move(fences[i]));
+        }
+    }
+    LogMessage(LogLevel::kInfo, LogComponent::kStore, "tables swapped",
+        {{"tables", names[0] + "," + names[1]}, {"store_ids", StoreIdHex(tables[1]->store_id()) + "," + StoreIdHex(tables[0]->store_id())}});
+    if (!swapped[0] || !swapped[1]) throw std::runtime_error("swapped tables could not all be opened under their new names");
 }
 
 }  // namespace chunkdb

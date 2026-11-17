@@ -241,6 +241,11 @@ struct RestoreTable {
     std::string path;
     std::string name;
 };
+// Exchanges the names of two tables atomically.
+struct SwapTables {
+    std::string first;
+    std::string second;
+};
 struct ShowMetrics {};
 struct ShowStatus {};
 struct EnableFeature { std::string name; };
@@ -335,6 +340,7 @@ using Statement = std::variant<
     FlushWal,
     Backup,
     RestoreTable,
+    SwapTables,
     ShowMetrics,
     ShowStatus,
     EnableFeature,

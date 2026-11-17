@@ -588,6 +588,11 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
                 info.audit_event = "restore_table";
                 info.table = restore.name;
             },
+            [&](const cql::SwapTables& swap) {
+                info.verb = "SWAP TABLES";
+                info.audit_event = "swap_tables";
+                info.table = swap.first + "," + swap.second;
+            },
             [&](const cql::ShowMetrics&) { info.verb = "SHOW METRICS"; },
             [&](const cql::ReloadTls&) { info.verb = "RELOAD TLS"; info.audit_event = "reload_tls"; },
             [&](const cql::ShowStatus&) { info.verb = "SHOW STATUS"; },
@@ -1702,6 +1707,14 @@ std::string CommandEngine::ExecuteStatement(
                     Protocol::AppendBulk(reply, "bytes");
                     Protocol::AppendInteger(reply, result.bytes);
                     return reply;
+                },
+                [&](const cql::SwapTables& swap) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    // Grants stay with names: each table moves under a name the user administers.
+                    RequireRight(session, swap.first, Right::kAdmin);
+                    RequireRight(session, swap.second, Right::kAdmin);
+                    catalog_->SwapTables(swap.first, swap.second, session.backup_cancelled);
+                    return Protocol::SimpleString("OK");
                 },
                 [&](const cql::Begin&) { return TxnBegin(session); },
                 [&](const cql::Commit&) {

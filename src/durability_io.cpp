@@ -335,6 +335,10 @@ std::error_code MoveDirectoryNoReplace(
     return std::error_code(static_cast<int>(error), std::system_category());
 }
 
+std::error_code ExchangeDirectories(const std::filesystem::path&, const std::filesystem::path&) {
+    return std::make_error_code(std::errc::function_not_supported);
+}
+
 namespace {
 // Returns false, without syncing, when `missing_ok` and `path` does not exist.
 bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
@@ -619,6 +623,29 @@ std::error_code MoveDirectoryNoReplace(
         return std::error_code(errno, std::generic_category());
     }
     return {};
+}
+
+std::error_code ExchangeDirectories(
+    const std::filesystem::path& first,
+    const std::filesystem::path& second) {
+#if defined(__linux__) && defined(SYS_renameat2)
+    constexpr unsigned int kRenameExchange = 2U;  // RENAME_EXCHANGE
+    if (::syscall(SYS_renameat2, AT_FDCWD, first.c_str(), AT_FDCWD, second.c_str(), kRenameExchange) == 0) {
+        return {};
+    }
+    return ExclusiveRenameUnsupported(errno) ? std::make_error_code(std::errc::function_not_supported)
+                                             : std::error_code(errno, std::generic_category());
+#elif defined(__APPLE__)
+    if (::renamex_np(first.c_str(), second.c_str(), RENAME_SWAP) == 0) {
+        return {};
+    }
+    return ExclusiveRenameUnsupported(errno) ? std::make_error_code(std::errc::function_not_supported)
+                                             : std::error_code(errno, std::generic_category());
+#else
+    (void)first;
+    (void)second;
+    return std::make_error_code(std::errc::function_not_supported);
+#endif
 }
 
 // Every caller makes a promise of durability (a WAL acknowledgement in a

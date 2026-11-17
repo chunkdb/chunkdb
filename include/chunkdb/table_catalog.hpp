@@ -487,6 +487,16 @@ class TableCatalog {
     // table, features or options the catalog cannot serve, read-only catalog)
     // or std::runtime_error (damaged or changed backup, I/O, cancellation).
     TableRestoreResult RestoreTable(const TableRestoreRequest& request);
+    // Exchanges the names of two served tables with one atomic directory
+    // exchange (docs/design/RESTORE_TABLE.md). Waits for running commands and
+    // backup pins on both, makes their acknowledged writes durable, closes
+    // them, exchanges the directories and opens each under its new name as a
+    // new Table; epochs, slots and data move with the directories. After a
+    // crash both names are exchanged or neither is. Where no atomic exchange
+    // exists the tables serve again unchanged and std::runtime_error is
+    // thrown. A failure after the exchange fences the affected names until
+    // RecoverTable or a restart. `cancelled` ends the waits.
+    void SwapTables(std::string_view first, std::string_view second, std::stop_token cancelled = {});
     void SetBackupHookForTests(BackupTestHook* hook) noexcept { backup_hook_.store(hook, std::memory_order_release); }
 
   private:

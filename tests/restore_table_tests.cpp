@@ -98,6 +98,7 @@ void Refusals() {
         TableCatalog catalog(config);
         Throws<std::invalid_argument>([&] { (void)catalog.RestoreTable(source.Request()); });
         assert(catalog.Find("t_restored") == nullptr);
+        assert(Throws<std::invalid_argument>([&] { catalog.SwapTables("t", "default"); }).find("read-only") != std::string::npos);
     }
 }
 
@@ -202,6 +203,126 @@ void Cancellation() {
     LeavesNothingAfterRefusal(source, catalog);
 }
 
+
+// A restored table and the live one, with their epochs.
+struct Swapped {
+    Source source;
+    TableCatalog catalog{source.Config()};
+    StoreId restored = catalog.RestoreTable(source.Request()).epoch;
+
+    // Each name reaches the other table's data, epoch and slots.
+    void Check(bool exchanged) {
+        const auto t = catalog.Require("t"), other = catalog.Require("t_restored");
+        const auto& live = exchanged ? other : t;
+        const auto& copy = exchanged ? t : other;
+        assert(live->store_id() == source.epoch && copy->store_id() == restored);
+        assert(copy->lineage() && *copy->lineage() == (TableLineage{source.epoch, source.cut}));
+        assert(live->Acquire()->store().GetBlockBits(8, 0) == "11111111");
+        assert(copy->Acquire()->store().GetBlockBits(8, 0) == "00000011");
+        const auto slots = copy->ListFeedSlots();
+        assert(slots.size() == 1U && slots[0].position == (FeedPosition{restored, source.cut}));
+        assert(live->ListFeedSlots().at(0).position.epoch == source.epoch);
+    }
+};
+
+void SwapsNames() {
+    for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) {
+        Swapped swapped{Source(mode)};
+        const auto old_t = swapped.catalog.Require("t");
+        auto watch = old_t->SubscribeFeed();
+        swapped.catalog.SwapTables("t", "t_restored");
+        swapped.Check(true);
+        // The old table objects are gone; their watches end.
+        assert(!old_t->Acquire().has_value());
+        const auto ended = watch->Next(std::chrono::seconds(5));
+        assert(ended && ended->kind == FeedEntry::Kind::kEnd && ended->protocol_frame &&
+               ended->protocol_frame->find("swapped") != std::string::npos);
+        watch.reset();
+        // Writes under the new names are acknowledged and stay there.
+        swapped.catalog.Require("t")->Acquire()->store().SetBlockBits(0, 1, "00010000");
+        swapped.catalog.Require("t_restored")->Acquire()->store().SetBlockBits(0, 1, "00100000");
+        // Either order names the same exchange; swapping again restores both.
+        swapped.catalog.SwapTables("t_restored", "t");
+        swapped.Check(false);
+        swapped.catalog.SwapTables("t", "t_restored");
+        assert(Entries(swapped.source.data / "tables") == 2U);
+    }
+}
+
+void SwapSurvivesRestart() {
+    Source source;
+    StoreId restored{};
+    {
+        TableCatalog catalog(source.Config());
+        restored = catalog.RestoreTable(source.Request()).epoch;
+        catalog.SwapTables("t", "t_restored");
+        catalog.Require("t")->Acquire()->store().SetBlockBits(0, 1, "00010000");
+    }
+    Verified(source.data);
+    TableCatalog catalog(source.Config());
+    assert(catalog.Require("t")->store_id() == restored && catalog.Require("t_restored")->store_id() == source.epoch);
+    assert(catalog.Require("t")->Acquire()->store().GetBlockBits(0, 1) == "00010000");
+}
+
+// A consumer of `t` resumes by name: the exact fork position continues on
+// the restored table, a later position of the old epoch resyncs.
+void FeedAfterSwap() {
+    Swapped swapped{Source()};
+    swapped.catalog.SwapTables("t", "t_restored");
+    const auto t = swapped.catalog.Require("t");
+    FeedOptions exact;
+    exact.after = FeedPosition{swapped.source.epoch, swapped.source.cut};
+    auto continuing = t->SubscribeFeed(exact);
+    FeedOptions later;
+    later.after = FeedPosition{swapped.source.epoch, swapped.source.cut + 1U};
+    auto resyncing = t->SubscribeFeed(later);
+    const auto resync = resyncing->Next(std::chrono::seconds(5));
+    assert(resync && resync->kind == FeedEntry::Kind::kResync);
+    assert(resync->protocol_frame && resync->protocol_frame->find(StoreIdHex(swapped.source.epoch)) != std::string::npos);
+    std::uint64_t written = 0U;
+    {
+        auto lease = t->Acquire();
+        lease->store().SetBlockBits(0, 1, "00010000");
+        written = lease->store().GetChunkVersion(0, 0);
+    }
+    const auto change = continuing->Next(std::chrono::seconds(5));
+    assert(change && change->kind == FeedEntry::Kind::kChange);
+    assert(change->position == (FeedPosition{swapped.restored, written}));
+}
+
+void SwapRefusals() {
+    Swapped swapped{Source()};
+    auto& catalog = swapped.catalog;
+    Throws<std::invalid_argument>([&] { catalog.SwapTables("t", "t"); });
+    Throws<TableNotFoundError>([&] { catalog.SwapTables("t", "absent"); });
+    Throws<std::invalid_argument>([&] { catalog.SwapTables("t", "Bad.Name"); });
+    {
+        // Without an atomic exchange nothing moves and both tables serve.
+        txn_test::ScopedEnv refuse("CHUNKDB_FAILPOINT_SWAP_TABLES_EXCHANGE_UNSUPPORTED_ONCE", "1");
+        assert(Throws([&] { catalog.SwapTables("t", "t_restored"); }).find("atomic directory exchange") != std::string::npos);
+    }
+    assert(catalog.Fences().empty());
+    swapped.Check(false);
+    {
+        // An exchange that cannot be synced leaves both names fenced; a
+        // recovery opens what each directory holds.
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_SWAP_TABLES_SYNC_FAIL_ONCE", "1");
+        Throws([&] { catalog.SwapTables("t", "t_restored"); });
+    }
+    assert(catalog.Fence("t") && catalog.Fence("t_restored") && catalog.TableCount() == 0U);
+    catalog.RecoverTable("t");
+    catalog.RecoverTable("t_restored");
+    swapped.Check(true);
+    {
+        // A name whose table cannot open is fenced; the other serves.
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_SWAP_TABLES_OPEN_FAIL_ONCE", "1");
+        Throws([&] { catalog.SwapTables("t", "t_restored"); });
+    }
+    assert(catalog.Fence("t") && catalog.Find("t_restored") != nullptr);
+    catalog.RecoverTable("t");
+    swapped.Check(false);
+    Verified(swapped.source.data);
+}
 }  // namespace
 
 int main() {
@@ -211,5 +332,9 @@ int main() {
     DamagedBackups();
     InjectedFailures();
     Cancellation();
+    SwapsNames();
+    SwapSurvivesRestart();
+    FeedAfterSwap();
+    SwapRefusals();
     std::cout << "restore table tests passed\n";
 }
