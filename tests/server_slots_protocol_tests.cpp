@@ -632,6 +632,8 @@ class ReconnectSchedule : public FeedDeliveryTestHook {
             // worker held, the next scan observes whether that socket closed.
             scanned_ = true; changed_.notify_all();
             changed_.wait(lock, [&] { return io_released_; });
+        } else if (point == Point::kBeforeIoPoll && scanned_ && !polled_) {
+            polled_ = true; polled_sockets_ = bytes; changed_.notify_all();
         } else if (point == Point::kAfterSlotFinish && !finished_) {
             finished_ = true; changed_.notify_all();
             changed_.wait(lock, [&] { return finish_released_; });
@@ -645,6 +647,13 @@ class ReconnectSchedule : public FeedDeliveryTestHook {
         Wait(scanned_, "scan after slot cancellation");
         std::lock_guard lock(mutex_);
         if (closed_) throw std::runtime_error("slot socket closed before the held catch-up worker released its claim");
+    }
+    // The scan after cancellation polls only these watch sockets.
+    void RequirePolled(std::size_t sockets) {
+        Wait(polled_, "poll after slot cancellation");
+        std::lock_guard lock(mutex_);
+        if (polled_sockets_ != sockets)
+            throw std::runtime_error("feed I/O polled " + std::to_string(polled_sockets_) + " watch sockets, expected " + std::to_string(sockets));
     }
     // The output deadline cancels a watch only after its write stalled.
     void RequireStallBeforeCancel() {
@@ -676,7 +685,8 @@ class ReconnectSchedule : public FeedDeliveryTestHook {
     std::condition_variable changed_;
     bool admitted_ = false, cancelled_ = false, scanned_ = false, finished_ = false, closed_ = false;
     bool admission_released_ = false, io_released_ = false, finish_released_ = false, closed_before_finish_ = false;
-    bool stalled_ = false, stalled_before_cancel_ = false;
+    bool stalled_ = false, stalled_before_cancel_ = false, polled_ = false;
+    std::size_t polled_sockets_ = 0U;
 };
 
 void ReconnectAfterRevoke(bool tls) {
@@ -701,6 +711,8 @@ void ReconnectAfterRevoke(bool tls) {
     schedule.WaitDeferredClose();
     if (watch.Ready(0ms)) throw std::runtime_error("slot terminal reply arrived before claim cleanup");
     schedule.ReleaseIo(); FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    // A closing socket waits for the worker's wake; polling it could only spin.
+    schedule.RequirePolled(1U);
     Unwatch(*ordinary); // Other feed connections run while the slot worker is held.
     schedule.ReleaseAdmission(); schedule.WaitFinish();
     // The held worker has not sent its completion wake yet; wake I/O here.

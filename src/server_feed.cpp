@@ -640,6 +640,8 @@ void FeedIo::Run() {
             // Stop may have raced with DrainWake and had its coalesced wake
             // consumed. Do not enter an unbounded poll after that stop.
             if (!server_.running_.load()) break;
+            if (auto* hook = hook_.load(std::memory_order_acquire))
+                hook->Run(FeedDeliveryTestHook::Point::kBeforeIoPoll, polled_watches.size());
 #ifdef _WIN32
             const int result = WSAPoll(descriptors.data(), static_cast<ULONG>(descriptors.size()), buffered_tls ? 0 : progress_timeout);
 #else
