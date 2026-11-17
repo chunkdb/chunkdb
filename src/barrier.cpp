@@ -5,6 +5,7 @@
 #include <exception>
 #include <filesystem>
 #include <mutex>
+#include <new>
 #include <stdexcept>
 #include <string>
 #include <system_error>
@@ -377,7 +378,17 @@ void ChunkStore::AdoptUnsynced(const UnsyncedArtifacts& artifacts) {
 
 void ChunkStore::RestoreUnsynced(UnsyncedArtifacts drained) {
     std::lock_guard lock(unsynced_mutex_);
-    InsertUnsyncedLocked(drained);
+    try {
+        InsertUnsyncedLocked(drained);
+    } catch (const std::bad_alloc&) {
+        // Out of memory partway through: the entries not inserted yet would
+        // leave the set, so the next barrier syncs the whole data directory
+        // instead, as after an overflow. Nothing here allocates.
+        unsynced_overflow_ = true;
+        unsynced_files_.clear();
+        unsynced_dirs_.clear();
+        unsynced_swept_dirs_.clear();
+    }
 }
 
 void ChunkStore::ForceUnsyncedOverflowForTests() {

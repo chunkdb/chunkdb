@@ -252,6 +252,46 @@ void TestDrainIntoEmptySetKeepsOverflow() {
     assert(store.RuntimeStats().wal_barrier_full_syncs == full_syncs + 1U);
     assert(!store.UnsyncedOverflowFlagForTests());
 }
+
+// Whichever allocation of the restore after a failed sync fails, the set
+// is back as it was or the overflow flag is set, and the next barrier syncs
+// every drained file or the whole data directory.
+void TestEveryRestoreAllocationFailure() {
+    long failures = 0;
+    for (long fail_after = 0;; ++fail_after) {
+        test::ScopedTempDir dir("chunkdb-barrier-memory-restore");
+        ChunkStore store(Config(dir.path()));
+        store.SetBlockBits(0, 0, "10101");
+        store.SetBlockBits(4, 0, "01010");
+        const auto before = Access::Snapshot(store);
+        assert(!before.overflow && !before.files.empty() && !before.dirs.empty());
+
+        auto drained = Access::Take(store);
+        allocation::fail_after = fail_after;
+        try { Access::Restore(store, std::move(drained)); }
+        catch (const std::bad_alloc&) {}
+        const bool failed = allocation::fail_after == -1;
+        allocation::fail_after = -1;
+
+        const auto after = Access::Snapshot(store);
+        if (!failed) {
+            assert(after == before);
+            break;
+        }
+        ++failures;
+        assert(after == before || (after.overflow && after.files.empty() && after.dirs.empty()));
+        const SyncedFiles synced;
+        const auto full_syncs = store.RuntimeStats().wal_barrier_full_syncs;
+        store.WalBarrier();
+        if (after.overflow) {
+            assert(store.RuntimeStats().wal_barrier_full_syncs == full_syncs + 1U);
+        } else {
+            for (const auto& file : before.files) assert(synced.Contains(file));
+        }
+        assert(store.UnsyncedTrackedCountForTests() == 0U && !store.UnsyncedOverflowFlagForTests());
+    }
+    assert(failures > 0);
+}
 }  // namespace
 
 int main() {
@@ -259,6 +299,7 @@ int main() {
     TestFailedDrainKeepsOverflow();
     TestEveryDrainAllocationFailure();
     TestDrainIntoEmptySetKeepsOverflow();
+    TestEveryRestoreAllocationFailure();
     std::cout << "wal_barrier_memory tests passed\n";
     return 0;
 }
