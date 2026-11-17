@@ -234,6 +234,13 @@ struct FlushWal {};
 struct Backup {
     std::string path;
 };
+// Restores table `table` of a completed backup as a new table `name`
+// (docs/design/RESTORE_TABLE.md); without AS, `name` is `table`.
+struct RestoreTable {
+    std::string table;
+    std::string path;
+    std::string name;
+};
 struct ShowMetrics {};
 struct ShowStatus {};
 struct EnableFeature { std::string name; };
@@ -327,6 +334,7 @@ using Statement = std::variant<
     Describe,
     FlushWal,
     Backup,
+    RestoreTable,
     ShowMetrics,
     ShowStatus,
     EnableFeature,

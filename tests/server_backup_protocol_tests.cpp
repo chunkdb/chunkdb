@@ -226,8 +226,85 @@ void DroppedBetweenListingAndPin(bool tls) {
     assert(!std::filesystem::exists(destinations.path() / "snapshot/tables/a"));
     Verify(destinations.path() / "snapshot");
 }
+std::string Quoted(const std::string& text) {
+    std::string quoted;
+    for (const char c : text) { quoted += c; if (c == '\'') quoted += c; }
+    return "'" + quoted + "'";
+}
+// RESTORE TABLE publishes the backup cut as a new table beside the live one.
+void RestoreStatement() {
+    test::ScopedTempDir destinations("chunkdb-restore-table-protocol");
+    Harness harness(false, true, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
+    auto admin = harness.Connect();
+    admin->Ok("CREATE TABLE t (n u8) CHUNK 2 x 2");
+    admin->Ok("CREATE SLOT 'consumer' ON t");
+    const auto written = Number(admin->Command("SET BLOCK 0 0 IN t n = 7"));
+    const auto backup = admin->Command(Backup("it's-snap"));
+    std::uint64_t cut = 0U;
+    for (const auto& item : Field(backup, "cuts").items) if (Field(item, "table").value == "t") cut = Number(Field(item, "revision"));
+    assert(cut >= written);
+    (void)admin->Command("SET BLOCK 0 0 IN t n = 8");
+    const auto old_epoch = StoreIdHex(harness.catalog->Find("t")->store_id());
+
+    const auto restore = "RESTORE TABLE t FROM " + Quoted("it's-snap");
+    const auto reply = admin->Command(restore + " AS t_restored");
+    assert(reply.type == '%' && Field(reply, "table").value == "t_restored");
+    assert(Field(reply, "parent_epoch").value == old_epoch && Number(Field(reply, "fork_revision")) == cut);
+    assert(Field(reply, "epoch").value == StoreIdHex(harness.catalog->Find("t_restored")->store_id()));
+    assert(Field(reply, "epoch").value != old_epoch);
+    assert(Number(Field(reply, "files")) > 0U && Number(Field(reply, "bytes")) > 0U);
+    assert(Number(admin->Command("GET BLOCK 0 0 FROM t_restored").items.at(0)) == 7U);
+    assert(Number(admin->Command("GET BLOCK 0 0 FROM t").items.at(0)) == 8U);
+    const auto described = admin->Command("DESCRIBE t_restored");
+    assert(Field(described, "epoch").value == Field(reply, "epoch").value);
+    const auto slots = harness.catalog->Find("t_restored")->ListFeedSlots();
+    assert(slots.size() == 1U && slots[0].name == "consumer" && slots[0].position.revision == cut);
+
+    Error(admin->Command(restore + " AS t_restored"), "TABLE_EXISTS");
+    Error(admin->Command(restore), "TABLE_EXISTS");
+    Error(admin->Command("RESTORE TABLE absent FROM " + Quoted("it's-snap") + " AS other"), "INVALID_ARGUMENT");
+    Error(admin->Command("RESTORE TABLE t FROM '../escape' AS other"), "INVALID_ARGUMENT");
+    Error(admin->Command("RESTORE TABLE t FROM 'missing' AS other"), "INTERNAL");
+    admin->Ok("BEGIN");
+    Error(admin->Command(restore + " AS other"), "INVALID_ARGUMENT");
+    admin->Ok("ROLLBACK");
+    assert(harness.catalog->Find("other") == nullptr);
+
+    // ADMIN on `*`, or MANAGES USERS, may restore; ADMIN on one table may not.
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
+    admin->Ok("CREATE USER operator VERIFIER '" + verifier + "'");
+    admin->Ok("GRANT ADMIN ON t TO operator");
+    Client user(harness.port, false); user.Login("operator", "pw");
+    Error(user.Command(restore + " AS by_table_admin"), "PERMISSION_DENIED");
+    admin->Ok("GRANT ADMIN ON * TO operator");
+    assert(user.Command(restore + " AS by_admin").type == '%');
+    admin->Ok("REVOKE ADMIN ON * FROM operator");
+    admin->Ok("ALTER USER operator MANAGES USERS");
+    assert(user.Command(restore + " AS by_manager").type == '%');
+    assert(harness.catalog->Find("by_table_admin") == nullptr);
+    assert(harness.catalog->Find("by_admin") && harness.catalog->Find("by_manager"));
+
+    // Without --backup-dir, and on a read-only server, it is refused.
+    EngineConfig config; config.require_auth = false;
+    CommandEngine disabled(config, harness.catalog); SessionState session;
+    (void)disabled.Execute(session, "HELLO 3");
+    const auto error = disabled.Execute(session, restore + " AS other");
+    assert(error.starts_with("-ERR INVALID_ARGUMENT") && error.find("--backup-dir") != std::string::npos);
+    auto read_only_config = feed_test::Config(std::filesystem::canonical(destinations.path()) / "it's-snap");
+    read_only_config.access_mode = AccessMode::kReadOnly;
+    auto read_only = std::make_shared<TableCatalog>(read_only_config);
+    config.backup_dir = destinations.path();
+    CommandEngine reader(config, read_only); SessionState reading;
+    (void)reader.Execute(reading, "HELLO 3");
+    const auto refused = reader.Execute(reading, restore + " AS other");
+    assert(refused.starts_with("-ERR INVALID_ARGUMENT") && refused.find("read-only") != std::string::npos);
+    Verify(std::filesystem::canonical(destinations.path()) / "it's-snap");
+}
 } // namespace
 int main() {
+    RestoreStatement();
+    std::cout << "restore table protocol group passed\n";
     for (const bool tls : {false, true}) {
 #ifndef CHUNKDB_WITH_OPENSSL
         if (tls) continue;
