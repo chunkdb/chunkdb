@@ -238,6 +238,50 @@ void TestMisfitAtInt64Edge() {
                                        "uN takes N from 1 to 64");
 }
 
+// A 3D table names the block on all three axes.
+void TestMisfitIn3D() {
+    ScopedTempDir dir("chunkdb-narrowing-3d");
+    chunkdb::StoreConfig config;
+    config.data_dir = dir.path();
+    config.schema = Initial();
+    config.geometry = GeometryFor(Initial());
+    config.geometry.chunk_width_blocks = 2;
+    config.geometry.chunk_height_blocks = 3;
+    config.geometry.dims = 3;
+    config.geometry.chunk_depth_blocks = 2;
+    config.geometry.large_chunk_depth_chunks = 2;
+    chunkdb::ChunkStore store(config);
+    const auto u8 = Type(ColumnKind::kUnsigned, 8);
+    store.SetBlock3D(1, 2, 1, {{"id", std::uint64_t{700}}});
+    auto misfit = store.FindValueNotFitting(1, u8);
+    if (misfit != "block (1, 2, 1) holds 700") {
+        std::fprintf(stderr, "misfit: %s\n", misfit.value_or("none").c_str());
+        assert(false);
+    }
+    store.SetBlock3D(1, 2, 1, {{"id", std::uint64_t{7}}});
+    store.SetBlock3D(-1, -4, -3, {{"id", std::uint64_t{701}}});
+    misfit = store.FindValueNotFitting(1, u8);
+    if (misfit != "block (-1, -4, -3) holds 701") {
+        std::fprintf(stderr, "misfit: %s\n", misfit.value_or("none").c_str());
+        assert(false);
+    }
+
+    ScopedTempDir engine_dir("chunkdb-narrowing-3d-engine");
+    chunkdb::CatalogConfig catalog_config; catalog_config.data_dir = engine_dir.path();
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(catalog_config);
+    chunkdb::EngineConfig engine_config; engine_config.require_auth = false;
+    chunkdb::CommandEngine engine(engine_config, catalog);
+    chunkdb::SessionState session;
+    assert(engine.Execute(session, "HELLO 3").front() == '%');
+    assert(engine.Execute(session, "CREATE TABLE s (v u16) CHUNK 2 x 2 x 2") == "+OK\r\n");
+    assert(engine.Execute(session, "SET BLOCK 0 0 1 IN s v=300").front() == ':');
+    const auto reply = engine.Execute(session, "ALTER TABLE s ALTER COLUMN v TYPE u8");
+    if (!Contains(reply, "block (0, 0, 1) holds 300")) {
+        std::fprintf(stderr, "3D narrowing reply: %s\n", reply.c_str());
+        assert(false);
+    }
+}
+
 void TestNarrowTable() {
     for (const std::size_t checkpoint_updates : {std::size_t{1}, std::size_t{100000}}) {
         ScopedTempDir dir("chunkdb-narrowing");
@@ -582,6 +626,7 @@ int main(int argc, char** argv) {
     TestRules();
     TestWritesWhilePending();
     TestMisfitAtInt64Edge();
+    TestMisfitIn3D();
     TestNarrowTable();
     TestInterruptedNarrowing();
     return 0;

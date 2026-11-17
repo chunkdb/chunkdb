@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A narrowing refused by a value in a 3D table names its block as `block (x, y, z)`; it used to give two coordinates, with y counted across the chunk's depth.
 - Accept ALTER TABLE ... ADD COLUMN ... REQUIRED without DEFAULT on a table whose chunks hold only chunk metadata, as documented, instead of refusing it as if blocks were present.
 - Mix coordinate hashes with a process seed across every axis and bound shared large-chunk containers, exposing capacity metrics and a known BUSY refusal for new cache misses (#134).
 - Add three-dimensional tables, typed chunk columns, checked sectioned chunk forms, atomic metadata and projected writes, and retained tombstone identities with incremental scans and explicit compaction (#133).

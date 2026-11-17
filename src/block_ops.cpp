@@ -1141,6 +1141,7 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
     const auto* fixed = layout.FixedColumnAt(index);
     const std::uint32_t width = geometry_.config().chunk_width_blocks;
     const std::uint32_t height = geometry_.config().chunk_height_blocks;
+    const std::uint32_t depth = geometry_.config().chunk_depth_blocks;
     // An axis past int64 as [chunk, local], as WATCH reports it.
     const auto axis = [](std::int64_t chunk, std::uint32_t blocks, std::size_t local) {
         const auto absolute = BlockCoordinate(chunk, blocks, local);
@@ -1148,8 +1149,13 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
                                     : "[" + std::to_string(chunk) + ", " + std::to_string(local) + "]";
     };
     const auto describe = [&](const ChunkCoord& coord, std::size_t block, const ColumnValue& value) {
-        return "block (" + axis(coord.x, width, block % width) + ", " + axis(coord.y, height, block / width) +
-               ") holds " + DescribeValue(value);
+        const std::size_t plane = static_cast<std::size_t>(width) * height;
+        std::string text = "block (" + axis(coord.x, width, block % width) + ", " +
+                           axis(coord.y, height, (block / width) % height);
+        if (geometry_.dims() == 3U) {
+            text += ", " + axis(coord.z, depth, block / plane);
+        }
+        return text + ") holds " + DescribeValue(value);
     };
     std::vector<std::uint8_t> bytes(fixed != nullptr ? (fixed->width + 7U) / 8U : 0U);
     bool has_cursor = false;
