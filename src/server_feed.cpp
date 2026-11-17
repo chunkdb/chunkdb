@@ -508,6 +508,13 @@ void FeedIo::WritePlain(Watch& watch) {
 }
 void FeedIo::Run() {
     std::vector<Watch> watches;
+    // Poll buffers are reused across rounds, without an allocation per round.
+#ifdef _WIN32
+    std::vector<WSAPOLLFD> descriptors;
+#else
+    std::vector<pollfd> descriptors;
+#endif
+    std::vector<std::size_t> polled_watches;
     const auto fail = [&](const std::exception& error) {
         LogMessage(LogLevel::kError, LogComponent::kServer, "feed I/O terminated", {{"error", error.what()}});
         server_.Stop();
@@ -603,13 +610,8 @@ void FeedIo::Run() {
                 }
             }
             std::erase_if(watches, [](const Watch& watch) { return !watch.connection; });
-#ifdef _WIN32
-            std::vector<WSAPOLLFD> descriptors;
-#else
-            std::vector<pollfd> descriptors;
-#endif
+            descriptors.clear(); polled_watches.clear();
             descriptors.push_back({wake_read_, POLLIN, 0});
-            std::vector<std::size_t> polled_watches;
             bool buffered_tls = false;
             int progress_timeout = -1;
             const auto now = std::chrono::steady_clock::now();
