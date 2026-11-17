@@ -1517,6 +1517,7 @@ std::optional<TableFence> TableCatalog::Fence(std::string_view name) const {
 }
 
 TableCatalog::FenceNode TableCatalog::PrepareFence(std::shared_ptr<Table> table, const std::string& name, const char* reason) {
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE")) throw std::bad_alloc();
     std::map<std::string, Fenced, std::less<>> one;
     one.emplace(name, Fenced{std::move(table), reason});
     return one.extract(one.begin());
@@ -2196,6 +2197,9 @@ void TableCatalog::RewriteManifest(
     // Acknowledged writes still in group-commit batches reach the WAL now,
     // while a failure can still leave everything as it was.
     store->FlushWalBatchesForReopen();
+    // Made now, while a failure still serves the old store: once the manifest
+    // is replaced, nothing may fail before the table is fenced or served.
+    auto fence = PrepareFence(table.shared_from_this(), table.name_, kFenceReopen);
     bool replaced = false;
     std::exception_ptr write_failure;
     try {
@@ -2239,7 +2243,6 @@ void TableCatalog::RewriteManifest(
     // The old store closes; if the new one cannot open, the table is fenced.
     // What it wrote without a sync goes to the new store, so a later
     // WALFLUSH still syncs it.
-    auto fence = PrepareFence(table.shared_from_this(), table.name_, kFenceReopen);
     ScopeExit retire([&] { FenceTable(table, previous, std::move(fence)); });
     const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     store->HandOverUnsyncedOnClose(unsynced);

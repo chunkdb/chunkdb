@@ -11,11 +11,13 @@
 #include <fstream>
 #include <iterator>
 #include <memory>
+#include <new>
 #include <iostream>
 #include <string>
 #include <thread>
 #include <vector>
 
+#include "change_feed.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
@@ -365,6 +367,47 @@ void TestFailedTableOperationsDoNotHang() {
     assert(!handle->Acquire().has_value());
     assert(catalog.Find("terrain") == nullptr);
     catalog.WalBarrier();  // does not wait for the retired table
+}
+
+// A failure to allocate the fallback of an option change comes before the
+// manifest is replaced: the table keeps serving its old options.
+void TestSetOptionsFenceAllocationFailureKeepsTable() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-fence-alloc");
+    TableCatalog catalog(Config(dir.path()));
+    (void)catalog.Create("terrain", kTerrainGeometry, {});
+    WriteBits(catalog, "terrain", 4, 4, "110000011");
+    const auto handle = catalog.Find("terrain");
+    const auto manifest_path = chunkdb::StoreManifestPath(dir.path() / "tables" / "terrain");
+    const auto read_manifest = [&] {
+        std::ifstream in(manifest_path, std::ios::binary);
+        return std::string(std::istreambuf_iterator<char>(in), {});
+    };
+    const auto manifest = read_manifest();
+    assert(!manifest.empty());
+    const auto interval = handle->Info().options.checkpoint_update_interval;
+    chunkdb::TableOptionsUpdate update;
+    update.checkpoint_update_interval = interval + 7U;
+#ifdef _WIN32
+    _putenv_s("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", "1");
+#else
+    setenv("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", "1", 1);
+#endif
+    bool failed = false;
+    try {
+        catalog.SetOptions("terrain", update);
+    } catch (const std::bad_alloc&) {
+        failed = true;
+    }
+    assert(failed);
+    // Not left busy: commands on it would wait until a restart.
+    assert(!chunkdb::FeedTestAccess::WaitLingerDraining(*handle, std::chrono::milliseconds(0)));
+    assert(catalog.Find("terrain") == handle);
+    assert(!catalog.Fence("terrain"));
+    assert(handle->Info().options.checkpoint_update_interval == interval);
+    assert(read_manifest() == manifest);
+    assert(ReadBits(catalog, "terrain", 4, 4) == "110000011");
+    catalog.SetOptions("terrain", update);
+    assert(handle->Info().options.checkpoint_update_interval == interval + 7U);
 }
 
 // TABLESET changes only the options it names.
@@ -1178,6 +1221,7 @@ int main(int argc, char** argv) {
     TestDropWaitsForRunningCommands();
     TestAcquireDuringDropWaitsThenFails();
     TestFailedTableOperationsDoNotHang();
+    TestSetOptionsFenceAllocationFailureKeepsTable();
     TestOptionUpdatesArePatches();
     TestSetOptions();
     TestPersistedOptionFlags();
