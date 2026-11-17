@@ -128,6 +128,10 @@ On Windows, rename the file and restart the server; until then it keeps writing 
 
 To size `--max-loaded-chunks`, divide the server's resident memory growth after a warm-up with your own data by `chunkdb_loaded_chunks` from SHOW METRICS.
 The recorded figure, for the default chunk size with one 16-bit column, is in [Resident memory per chunk](releases/PERFORMANCE_HISTORY.md#resident-memory-per-chunk); larger chunks, more or wider columns and variable values use more.
+The cache setting also bounds large-chunk containers shared by the tables, including containers being loaded or still held after retirement.
+`chunkdb_large_chunk_containers` reports the count, `chunkdb_large_chunk_container_limit` reports its exact limit, and `chunkdb_large_chunk_refusals_total` counts new containers refused at capacity.
+A new cache miss that cannot fit returns `BUSY reason=large_chunk_cache_full` before applying a mutation; existing container hits remain usable.
+Raise `--max-loaded-chunks` to raise the associated container limit.
 
 ## Read-only
 
@@ -158,6 +162,10 @@ With `--auth scram` the directory must already have users, because `--read-only`
 | Flag | Default | Meaning |
 |---|---|---|
 | `--txn-max-duration-ms` | `5000` | Transaction lifetime from BEGIN; expiry ends it with CONFLICT and releases its private bytes. |
+| `--max-area-chunks` | `4096` | Requested chunk cells per GET AREA or area page, including empty cells. |
+| `--max-area-response-bytes` | `67108864` | Complete encoded GET AREA reply, including page headers and cursor. |
+| `--txn-max-written-chunks` | `1024` | Distinct chunks written by one transaction. |
+| `--txn-max-read-chunks` | `8192` | Distinct chunks read by one transaction. |
 | `--txn-max-bytes` | `16777216` | Private written-chunk bytes for one transaction. |
 | `--txn-total-bytes` | `268435456` | Private written-chunk bytes for all open transactions; a write that finds it full first ends the transactions past `--txn-max-duration-ms`. |
 | `--txn-history-bytes` | `67108864` | Earlier chunk states retained per table; overflow cancels oldest transactions. |
@@ -170,6 +178,7 @@ With `--auth scram` the directory must already have users, because `--read-only`
 | `--slot-sync-ms` | `100` | Durable frontier pass interval in ms, 1–2147483647; see [Feed statements](reference/FEED.md#notes). |
 
 Watches release workers and have no idle timeout.
+The four area and chunk-count limits must be positive and are reported by HELLO.
 See [Transactions](TRANSACTIONS.md) and [Change feed](CHANGE_FEED.md) for outcomes at limits.
 A table without an explicit feed/slot limit uses the server defaults each time it opens.
 An explicit table limit persists; change it with ALTER TABLE SET.

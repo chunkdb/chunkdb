@@ -50,8 +50,8 @@ A second HELLO receives PROTOCOL.
 | `server_version` | Bulk version string. |
 | `max_line_bytes` | Configured request-line limit. |
 | `max_parameters` | 65535. |
-| `max_area_chunks` | 256. |
-| `max_response_bytes` | 67108864 for area responses. |
+| `max_area_chunks` | Configured requested cells per area or page; default 4096. |
+| `max_response_bytes` | Configured complete area-response bytes; default 67108864. |
 | `max_scan_limit` | 1024. |
 | `server_signature` | Bulk SCRAM `v=<signature>`, or null without authentication. |
 | `connection_id` | Nonzero unsigned process-local connection identifier. |
@@ -71,9 +71,12 @@ Before authentication HELLO takes at most 12 parameters; a HELLO with more recei
 
 `client_name` and `statement_timeout_ms` apply; `default_tag` is stored with `reason=implementation_pending`.
 The effective statement timeout appears in `options`, including the server default when HELLO omits it.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, and `channel_binding`.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, and `area_paging`.
 Options become visible only after authentication succeeds.
 Returning and expression ceilings describe reserved limits; their capabilities remain unavailable.
+The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
+The configured positive area bounds appear as both `max_area_chunks`/`max_response_bytes` and `limits.max_area_chunks`/`limits.max_area_response_bytes`.
+`limits.txn_max_written_chunks` and `limits.txn_max_read_chunks` are the configured transaction chunk-count bounds.
 
 The statement timeout starts after the complete request is framed and includes queue wait.
 `CANCELLED` and statement `TIMEOUT` carry `applied=false` and mean that the statement did not apply.
@@ -150,7 +153,7 @@ A block's absent row can have a version when its containing chunk retains a comm
 Collection retains empty chunks' producing versions and times in checked tombstones.
 Never-written chunks and identities forgotten by tombstone compaction have null versions.
 Schema versions remain known for absent rows and empty areas; area consistency otherwise remains unchanged.
-Coordinate tuples contain exactly `dims` signed values; three-dimensional tuples include a zero z coordinate.
+Coordinate tuples contain exactly `dims` signed values: x and y, then z only in a three-dimensional table.
 SCAN CHUNKS returns a map with `chunks`, `more`, `epoch`, nullable completed `position`, and `retained_deletion_floor`.
 Its rows are `[coordinates..., chunk_version]`, with a form-or-null appended under WITH DATA.
 SINCE includes retained deletions and refuses a revision below the deletion floor with `RESYNC_REQUIRED reason=history_lost floor=... epoch=...`, adding `current` when known.
@@ -280,6 +283,7 @@ Clients classify errors by code, never diagnostic text, and preserve unknown key
 
 MIGRATION_MISMATCH identifies different text under a recorded migration name.
 SLOT_BUSY identifies an attached slot; SLOT_LOST identifies unavailable retained history or a dropped projected column.
+`BUSY reason=large_chunk_cache_full` means a new large-chunk cache container could not fit in the shared pool; the request applied no mutation.
 `reason=schema_filter` identifies a lost stable-ID projection; `reason=retention_limit` identifies retained-history overflow.
 SHOW SLOTS adds `lost_reason` (null while healthy), a `filters` map, and `owner` (shown to that user and to MANAGES USERS; null otherwise or for a slot without a recorded owner).
 Its keys are `area`, `columns`, `column_ids`, `no_before`, and `chunks`.

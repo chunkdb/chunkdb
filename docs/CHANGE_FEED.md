@@ -42,8 +42,9 @@ An exact parent-fork position continues when the completed cut or retained histo
 Earlier positions require their replay prefix; later or unrelated parent positions require rebuilding.
 
 Backups contain state at the cut, without archived catch-up history.
-After a later crash or restart, absent chunk files do not prove that no post-fork mutation was lost.
-Without durable replay or loss proof, even an exact-fork watch resyncs.
+After a restart, an ordinary watch continues only from the completed position the restarted table reports.
+That position is at or above every revision issued before the restart, including revisions whose changes left only a tombstone or no chunk file.
+An earlier position, including an exact-fork position once any revision was issued after the restore, receives a resync; a durable slot replays its retained history instead.
 Timestamps can move backward, so use revisions for ordering.
 Idle or filtered watches receive progress at most once per `--feed-progress-ms`, default 1000.
 It marks a sender-drained revision; slot progress also stays within the durable frontier.

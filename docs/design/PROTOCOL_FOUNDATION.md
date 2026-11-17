@@ -47,12 +47,12 @@ Parameters in WITH follow the same framing rules as all other parameters, indepe
 Before authentication HELLO carries at most 12 parameters, enough for `$1` of USER, every known option and eight unknown ones; more receive `PROTOCOL` and close without their frames being read.
 Unset options use server defaults; explicit per-statement TAG overrides `default_tag`, including an empty tag.
 
-| Limit key | Task 51 value and ownership |
+| Limit key | Value and ownership |
 | --- | --- |
-| `max_area_chunks` | 256, currently enforced by `kMaxChunkRangeChunks`; task 53 replaces the constant with its configured limit. |
-| `max_area_response_bytes` | 67108864, currently enforced; report the effective value after flags exist. |
-| `txn_max_written_chunks` | 64, currently enforced in statement, commit and intent decoding paths; task 53 changes all three together. |
-| `txn_max_read_chunks` | 1024, currently enforced; task 53 supplies the configured limit. |
+| `max_area_chunks` | Configured requested-cell limit per area/page, default 4096. |
+| `max_area_response_bytes` | Configured complete response-byte limit, default 67108864. |
+| `txn_max_written_chunks` | Configured statement/commit admission, default 1024; historical intent decoding validates its checked extent independently. |
+| `txn_max_read_chunks` | Configured statement/commit admission, default 8192. |
 | `max_watches` | Effective server configuration; current default 64. |
 | `max_returning_rows` | 65536, the declared ceiling from E3; RETURNING remains unavailable until task 55. |
 | `max_expression_nodes` | 256, the declared ceiling from E1; expressions remain unavailable until task 55. |
@@ -255,8 +255,9 @@ An exhausted fork without a representable successor is refused before publicatio
 
 An initial exact-fork watch continues when the restored completed cut is proven and all ordinary replay/loss bounds hold.
 The unchanged checked successor clock proves that no post-fork token was issued; retained feed or durable slot history can also prove the prefix.
-After a later crash or restart, missing chunk files cannot prove that no post-fork mutation was lost.
-Without durable replay/loss proof, even an exact-fork request receives a lineage-bearing resync and rebuilds.
+After a crash or restart, the reopened feed starts its floor and watermark at the persisted clock ceiling minus one (`ChangeFeed::ResumeImpl`).
+That ceiling advances in reservation batches whenever a revision is issued, so chunk files and retained tombstones never extend the floor below it.
+An exact-fork request after a restart therefore continues only if no revision was issued since the restore; otherwise, without durable slot replay, it receives a lineage-bearing resync and rebuilds.
 
 Source evidence: `backup_create.cpp` enumerates `L_*` chunk directories, copies checkpoint images/current WAL prefixes and saves slots at each proven cut.
 It does not copy `.chunkdb.feed/`'s retained historical WAL/base files into the backup inventory (`feed_slot_records.hpp` names that directory).

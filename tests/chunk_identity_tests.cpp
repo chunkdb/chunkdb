@@ -1,4 +1,6 @@
+#include <atomic>
 #include <cassert>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
@@ -252,6 +254,59 @@ void TestAreaSkipsMissingCoordinatesBeforeDiskReads() {
     assert(status == std::future_status::ready);
 }
 
+// A writer answers scans and area reads from its coordinate index: no
+// directory walk, and no disk read of a cell the index does not list. The
+// identity history (`since`) also lists tombstones and reads each of them.
+void TestScansAndAreaReadOnlyIndexedCells() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-index-reads");
+    const auto config = Config(dir.path());
+    {
+        chunkdb::ChunkStore writer(config);
+        writer.SetBlockBits(0, 0, "10101");
+        writer.SetBlockBits(12, 4, "01010");
+        writer.SetBlockBits(4, 0, "11111");
+        writer.UnsetBlock(4, 0);
+        writer.CheckpointForTests(1, 0);
+        writer.SetBlockBits(8, 0, "11111");
+        writer.UnsetBlock(8, 0);
+    }
+    chunkdb::ChunkStore store(config);
+    class Count final : public chunkdb::CoordinateArtifactTestHook {
+      public:
+        void BeforeStatus(const std::filesystem::path&) override { ++observed; }
+        std::atomic<std::size_t> observed{0U};
+    } walk;
+    chunkdb::SetCoordinateArtifactTestHook(&walk);
+    const auto loaded = store.RuntimeStats().unique_loaded_chunks;
+    const std::vector<chunkdb::ChunkCoord> populated{{0, 0}, {3, 1}};
+    const std::vector<chunkdb::ChunkCoord> deleted{{1, 0}, {2, 0}};
+    const std::vector<chunkdb::ChunkCoord> never{{3, 0}, {0, 1}, {1, 1}, {2, 1}};
+    const auto reads = [&](bool history) {
+        assert(store.ScanPopulatedChunks(false, {}, 10U).coords == populated);
+        for (const bool data : {false, true}) {
+            const auto page = store.ScanChunkIdentities(false, {}, 10U, std::nullopt, data);
+            assert(page.entries.size() == 2U && page.entries[0].coord == populated[0] && page.entries[1].coord == populated[1]);
+            assert(page.entries[0].data.has_value() == data && page.entries[1].data.has_value() == data);
+        }
+        if (history) assert(store.ScanChunkIdentities(false, {}, 10U, 0U, true).entries.size() == 4U);
+        const auto area = store.ReadChunkRange(0, 0, 3, 1, true);
+        assert(area.size() == 2U && area[0].coord == populated[0] && area[1].coord == populated[1]);
+    };
+    for (const auto point : {chunkdb::CachePausePoint::kNoCacheReadBeforeDisk, chunkdb::CachePausePoint::kNoCacheReadBeforeWal}) {
+        for (const bool unwritten : {false, true}) for (const auto& cell : unwritten ? never : deleted) {
+            store.ArmCachePauseForTests(point, cell);
+            auto read = std::async(std::launch::async, reads, unwritten);
+            const auto status = read.wait_for(std::chrono::seconds(2));
+            store.ResumeCachePauseForTests(point);
+            read.get();
+            assert(status == std::future_status::ready);
+        }
+    }
+    chunkdb::SetCoordinateArtifactTestHook(nullptr);
+    assert(walk.observed == 0U);
+    assert(store.RuntimeStats().unique_loaded_chunks == loaded);
+}
+
 void TestRetainedBoundaryRejectsEqualWalTimeConflict() {
     for (const bool newer_image : {false, true}) {
     chunkdb::test::ScopedTempDir directory("chunkdb-retained-wal-time");
@@ -324,5 +379,6 @@ int main(int argc, char** argv) {
     if (selected == "all" || selected == "repair") TestStartupTailRepairRetainsSnapshotOwner();
     if (selected == "all" || selected == "readonly-admission") TestReadOnlyStartupDoesNotWalkLiveArtifacts();
     if (selected == "all" || selected == "area-index") TestAreaSkipsMissingCoordinatesBeforeDiskReads();
+    if (selected == "all" || selected == "index-reads") TestScansAndAreaReadOnlyIndexedCells();
     if (selected == "all" || selected == "retained-time") TestRetainedBoundaryRejectsEqualWalTimeConflict();
 }

@@ -201,7 +201,7 @@ class FeedWriteGuard {
     void Before(ChunkCoord coord, const std::vector<std::uint8_t>& payload,
                 const std::vector<std::uint8_t>& presence, const ChunkVars& vars,
                 const ChunkColumnState* chunk_columns = nullptr, bool written = false) {
-        if (state_ != nullptr && !state_->dropped) CopyBefore(coord, payload, presence, vars.Encode(), chunk_columns, written);
+        if (state_ != nullptr && !state_->dropped) CopyBefore(coord, payload, presence, vars.EncodedBytes(), chunk_columns, written);
     }
     void BeforeBlock(ChunkCoord coord, const std::vector<std::uint8_t>& payload,
                      const std::vector<std::uint8_t>& presence, const ChunkVars& vars,
@@ -237,7 +237,7 @@ class FeedWriteGuard {
     void Start(ChangeFeed& feed, std::atomic<std::uint64_t>& clock);
     void Finish() noexcept;
     void CopyBefore(ChunkCoord coord, const std::vector<std::uint8_t>& payload,
-                    const std::vector<std::uint8_t>& presence, const std::vector<std::uint8_t>& vars,
+                    const std::vector<std::uint8_t>& presence, std::span<const std::uint8_t> vars,
                     const ChunkColumnState* chunk_columns, bool written);
     void CopyFrame(const std::vector<std::uint8_t>& batch, std::size_t frame_bytes);
     bool Charge(std::size_t bytes) noexcept;

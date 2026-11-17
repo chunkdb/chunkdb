@@ -643,7 +643,7 @@ ColumnValue DecodeFeedColumnValue(const Column& column, const std::uint8_t* byte
 
 std::vector<ColumnValue> DecodeBlockColumns(
     const ChunkLayout& layout,
-    const std::vector<std::uint8_t>& payload_bytes,
+    std::span<const std::uint8_t> payload_bytes,
     const ChunkVars& vars,
     std::size_t block_index,
     std::vector<std::uint8_t>* scratch) {
@@ -749,7 +749,7 @@ BlockReadMetadata ChunkStore::GetBlockWithVersion3DAt(
     };
     const auto chunk = GetOrLoadRegularChunk(coord);
     { auto lock = LockStatementChunkShared(chunk->mutex); capture(*chunk); }
-    (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.state); });
+    (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.View()); });
     return result;
 }
 

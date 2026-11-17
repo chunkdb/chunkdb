@@ -67,7 +67,7 @@ class MetricsRegistry {
 
     [[nodiscard]] std::string RenderPrometheus(
         const StoreRuntimeStats& store_stats,
-        std::size_t loaded_chunks) const;
+        std::size_t loaded_chunks, const StoreResources* resources = nullptr) const;
 
   private:
     struct Histogram {

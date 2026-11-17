@@ -1,0 +1,102 @@
+machine os=linux arch=x86_64 cpu="AMD Ryzen 5 4600H with Radeon Graphics" logical_cpus=12 compiler="gcc 15.2.0" build_type=Release
+source commit=0f6353844258abed595eacb377780a8f7b10f4cb state=clean
+profile geometry=8x8x16x16x15 chunks=16384 large_chunks=256 grid_width_chunks=128 ops=204800 segment_ops=1024 runs=15 seed=135 durability=relaxed max_loaded_chunks=32768 wal_group_commit_updates=1099511627776 checkpoints=off chunk_lock_mode=shared-mutex failpoints=on
+run=1 order=many-first metric=read side=many ns_per_op=510.8 window_mean_ns_per_op=528.8
+run=1 order=many-first metric=read side=one ns_per_op=205.7 window_mean_ns_per_op=210.4
+run=1 order=many-first metric=write side=many ns_per_op=2526.9 window_mean_ns_per_op=2730.2
+run=1 order=many-first metric=write side=one ns_per_op=1899.5 window_mean_ns_per_op=2078.2
+run=1 order=many-first metric=lookup side=many ns_per_op=236.5 window_mean_ns_per_op=246.5
+run=1 order=many-first metric=lookup side=one ns_per_op=109.3 window_mean_ns_per_op=114.8
+run=2 order=one-first metric=read side=many ns_per_op=522.9 window_mean_ns_per_op=552.8
+run=2 order=one-first metric=read side=one ns_per_op=209.9 window_mean_ns_per_op=222.5
+run=2 order=one-first metric=write side=many ns_per_op=2541.4 window_mean_ns_per_op=2755.8
+run=2 order=one-first metric=write side=one ns_per_op=1907.3 window_mean_ns_per_op=2110.6
+run=2 order=one-first metric=lookup side=many ns_per_op=238.8 window_mean_ns_per_op=257.8
+run=2 order=one-first metric=lookup side=one ns_per_op=115.9 window_mean_ns_per_op=116.5
+run=3 order=many-first metric=read side=many ns_per_op=497.1 window_mean_ns_per_op=514.4
+run=3 order=many-first metric=read side=one ns_per_op=204.8 window_mean_ns_per_op=209.2
+run=3 order=many-first metric=write side=many ns_per_op=2553.3 window_mean_ns_per_op=2765.5
+run=3 order=many-first metric=write side=one ns_per_op=1896.0 window_mean_ns_per_op=2098.0
+run=3 order=many-first metric=lookup side=many ns_per_op=232.9 window_mean_ns_per_op=253.7
+run=3 order=many-first metric=lookup side=one ns_per_op=115.9 window_mean_ns_per_op=118.3
+run=4 order=one-first metric=read side=many ns_per_op=515.1 window_mean_ns_per_op=538.7
+run=4 order=one-first metric=read side=one ns_per_op=209.4 window_mean_ns_per_op=213.7
+run=4 order=one-first metric=write side=many ns_per_op=2564.6 window_mean_ns_per_op=2777.3
+run=4 order=one-first metric=write side=one ns_per_op=1919.9 window_mean_ns_per_op=2097.8
+run=4 order=one-first metric=lookup side=many ns_per_op=238.3 window_mean_ns_per_op=258.1
+run=4 order=one-first metric=lookup side=one ns_per_op=111.6 window_mean_ns_per_op=114.8
+run=5 order=many-first metric=read side=many ns_per_op=518.7 window_mean_ns_per_op=539.5
+run=5 order=many-first metric=read side=one ns_per_op=200.8 window_mean_ns_per_op=205.6
+run=5 order=many-first metric=write side=many ns_per_op=2550.1 window_mean_ns_per_op=2791.0
+run=5 order=many-first metric=write side=one ns_per_op=1892.3 window_mean_ns_per_op=2060.3
+run=5 order=many-first metric=lookup side=many ns_per_op=234.4 window_mean_ns_per_op=252.0
+run=5 order=many-first metric=lookup side=one ns_per_op=110.8 window_mean_ns_per_op=113.8
+run=6 order=one-first metric=read side=many ns_per_op=524.9 window_mean_ns_per_op=561.0
+run=6 order=one-first metric=read side=one ns_per_op=204.9 window_mean_ns_per_op=213.6
+run=6 order=one-first metric=write side=many ns_per_op=2533.1 window_mean_ns_per_op=2750.7
+run=6 order=one-first metric=write side=one ns_per_op=1897.5 window_mean_ns_per_op=2104.0
+run=6 order=one-first metric=lookup side=many ns_per_op=233.4 window_mean_ns_per_op=252.2
+run=6 order=one-first metric=lookup side=one ns_per_op=110.9 window_mean_ns_per_op=113.0
+run=7 order=many-first metric=read side=many ns_per_op=520.3 window_mean_ns_per_op=553.2
+run=7 order=many-first metric=read side=one ns_per_op=210.5 window_mean_ns_per_op=216.8
+run=7 order=many-first metric=write side=many ns_per_op=2575.2 window_mean_ns_per_op=2819.7
+run=7 order=many-first metric=write side=one ns_per_op=1941.1 window_mean_ns_per_op=2138.9
+run=7 order=many-first metric=lookup side=many ns_per_op=235.5 window_mean_ns_per_op=251.2
+run=7 order=many-first metric=lookup side=one ns_per_op=113.6 window_mean_ns_per_op=118.1
+run=8 order=one-first metric=read side=many ns_per_op=511.8 window_mean_ns_per_op=547.2
+run=8 order=one-first metric=read side=one ns_per_op=204.9 window_mean_ns_per_op=213.0
+run=8 order=one-first metric=write side=many ns_per_op=2549.5 window_mean_ns_per_op=2765.6
+run=8 order=one-first metric=write side=one ns_per_op=1871.7 window_mean_ns_per_op=2090.0
+run=8 order=one-first metric=lookup side=many ns_per_op=236.0 window_mean_ns_per_op=255.2
+run=8 order=one-first metric=lookup side=one ns_per_op=112.3 window_mean_ns_per_op=116.2
+run=9 order=many-first metric=read side=many ns_per_op=522.0 window_mean_ns_per_op=559.5
+run=9 order=many-first metric=read side=one ns_per_op=207.3 window_mean_ns_per_op=211.2
+run=9 order=many-first metric=write side=many ns_per_op=2541.7 window_mean_ns_per_op=2754.2
+run=9 order=many-first metric=write side=one ns_per_op=1904.8 window_mean_ns_per_op=2092.7
+run=9 order=many-first metric=lookup side=many ns_per_op=220.6 window_mean_ns_per_op=231.5
+run=9 order=many-first metric=lookup side=one ns_per_op=111.6 window_mean_ns_per_op=115.5
+run=10 order=one-first metric=read side=many ns_per_op=510.5 window_mean_ns_per_op=529.3
+run=10 order=one-first metric=read side=one ns_per_op=204.7 window_mean_ns_per_op=211.1
+run=10 order=one-first metric=write side=many ns_per_op=2551.0 window_mean_ns_per_op=2762.0
+run=10 order=one-first metric=write side=one ns_per_op=1966.6 window_mean_ns_per_op=2133.9
+run=10 order=one-first metric=lookup side=many ns_per_op=229.2 window_mean_ns_per_op=249.3
+run=10 order=one-first metric=lookup side=one ns_per_op=111.2 window_mean_ns_per_op=112.9
+run=11 order=many-first metric=read side=many ns_per_op=510.6 window_mean_ns_per_op=536.9
+run=11 order=many-first metric=read side=one ns_per_op=204.7 window_mean_ns_per_op=208.3
+run=11 order=many-first metric=write side=many ns_per_op=2522.7 window_mean_ns_per_op=2744.4
+run=11 order=many-first metric=write side=one ns_per_op=1880.4 window_mean_ns_per_op=2066.6
+run=11 order=many-first metric=lookup side=many ns_per_op=223.9 window_mean_ns_per_op=236.6
+run=11 order=many-first metric=lookup side=one ns_per_op=111.2 window_mean_ns_per_op=113.0
+run=12 order=one-first metric=read side=many ns_per_op=525.4 window_mean_ns_per_op=554.6
+run=12 order=one-first metric=read side=one ns_per_op=212.5 window_mean_ns_per_op=218.6
+run=12 order=one-first metric=write side=many ns_per_op=2564.5 window_mean_ns_per_op=2794.2
+run=12 order=one-first metric=write side=one ns_per_op=1880.7 window_mean_ns_per_op=2095.1
+run=12 order=one-first metric=lookup side=many ns_per_op=244.9 window_mean_ns_per_op=261.8
+run=12 order=one-first metric=lookup side=one ns_per_op=111.2 window_mean_ns_per_op=115.1
+run=13 order=many-first metric=read side=many ns_per_op=526.7 window_mean_ns_per_op=562.1
+run=13 order=many-first metric=read side=one ns_per_op=207.9 window_mean_ns_per_op=213.6
+run=13 order=many-first metric=write side=many ns_per_op=2547.8 window_mean_ns_per_op=2794.6
+run=13 order=many-first metric=write side=one ns_per_op=1961.0 window_mean_ns_per_op=2114.3
+run=13 order=many-first metric=lookup side=many ns_per_op=227.8 window_mean_ns_per_op=240.1
+run=13 order=many-first metric=lookup side=one ns_per_op=111.5 window_mean_ns_per_op=114.8
+run=14 order=one-first metric=read side=many ns_per_op=528.7 window_mean_ns_per_op=579.2
+run=14 order=one-first metric=read side=one ns_per_op=205.8 window_mean_ns_per_op=218.1
+run=14 order=one-first metric=write side=many ns_per_op=2560.1 window_mean_ns_per_op=2782.5
+run=14 order=one-first metric=write side=one ns_per_op=1902.3 window_mean_ns_per_op=2102.9
+run=14 order=one-first metric=lookup side=many ns_per_op=243.7 window_mean_ns_per_op=259.9
+run=14 order=one-first metric=lookup side=one ns_per_op=115.9 window_mean_ns_per_op=119.3
+run=15 order=many-first metric=read side=many ns_per_op=517.9 window_mean_ns_per_op=546.2
+run=15 order=many-first metric=read side=one ns_per_op=213.5 window_mean_ns_per_op=219.5
+run=15 order=many-first metric=write side=many ns_per_op=2550.3 window_mean_ns_per_op=2767.3
+run=15 order=many-first metric=write side=one ns_per_op=1885.2 window_mean_ns_per_op=2065.5
+run=15 order=many-first metric=lookup side=many ns_per_op=225.7 window_mean_ns_per_op=247.1
+run=15 order=many-first metric=lookup side=one ns_per_op=107.1 window_mean_ns_per_op=112.7
+summary metric=read side=many runs=15 median_ns_per_op=518.7 min_ns_per_op=497.1 max_ns_per_op=528.7
+summary metric=read side=one runs=15 median_ns_per_op=205.8 min_ns_per_op=200.8 max_ns_per_op=213.5
+summary metric=read side=many-minus-one runs=15 median_ns_per_op=309.8 min_ns_per_op=292.4 max_ns_per_op=322.8
+summary metric=write side=many runs=15 median_ns_per_op=2550.1 min_ns_per_op=2522.7 max_ns_per_op=2575.2
+summary metric=write side=one runs=15 median_ns_per_op=1899.5 min_ns_per_op=1871.7 max_ns_per_op=1966.6
+summary metric=write side=many-minus-one runs=15 median_ns_per_op=642.3 min_ns_per_op=584.4 max_ns_per_op=683.8
+summary metric=lookup side=many runs=15 median_ns_per_op=234.4 min_ns_per_op=220.6 max_ns_per_op=244.9
+summary metric=lookup side=one runs=15 median_ns_per_op=111.5 min_ns_per_op=107.1 max_ns_per_op=115.9
+summary metric=lookup side=many-minus-one runs=15 median_ns_per_op=122.5 min_ns_per_op=109.1 max_ns_per_op=133.6

@@ -68,6 +68,7 @@ A never-written chunk remains NULL instead of receiving a version on load.
 ## Index, tombstones and recovery
 
 One ordered coordinate index per table serves bounded scan pages without walking directories on each page.
+A writer answers scans and area reads from that index and reads no cell it does not list; area reads at a transaction snapshot probe every cell of the area instead.
 Ordinary writes update membership only on population transitions, with no index I/O for updates to an already populated chunk.
 A new coordinate reserves its in-memory map node before the write can commit, and ordinary writes publish no persistent live hint before their commit decision.
 Each stable coordinate node carries atomic producing identity and population state; writes to an existing node publish those fields before completing their producer bound without taking the ordered-map mutex.
@@ -90,7 +91,7 @@ The checked `CKII` inventory lists sorted unique large coordinates, each log's c
 Its independently checksummed fixed header includes a nonzero monotonic inventory generation, advanced by each inventory publication and never reused within a table identity.
 Read-only point reads may reuse a completely admitted retained-boundary index only when that header's identity and generation still match inside the same stable snapshot bracket as their image and WAL.
 An ordinary block write changes the table snapshot generation without changing the inventory generation, so refreshing a point does not rebuild every retained shard after unrelated writes.
-Read-only scans rebuild their complete live-coordinate candidate index when the table snapshot generation changes and publish it only after one unchanged equal-even whole-index observation.
+Read-only scans and area reads rebuild their complete live-coordinate candidate index from a walk of the large-chunk directories, loading every image and WAL found, when the table snapshot generation changes after a writer publication, and publish it only after one unchanged equal-even whole-index observation.
 That private candidate index also includes producing revision and population copied under the locks of point-cache entries admitted at the same generation, preserving their existing cache authority until the generation changes.
 Cache ownership is pinned before taking individual chunk locks, and the published candidate contains scalar hints rather than borrowed cache pointers.
 Every listed boundary covers a complete header and whole records; a listed log shorter than that boundary is damage.
@@ -196,3 +197,9 @@ Crash tests interrupt index publication, tombstone sync, image removal, archive-
 Concurrency tests pin collection against writes, scans, schema changes and backup with deterministic hooks.
 Clients and CLI gain matching dimension-aware forms, metadata, version and unknown-section fixtures before the server switches the public format.
 Separate server-side budget windows measure timestamp bookkeeping, coordinate width, membership transitions, sectioned encoding and metadata against ordinary requests.
+
+## Measurements
+
+The cost of `commit_time_ms` was measured on its own: main d900641 against the same source built with `CHUNKDB_BENCH_CONSTANT_COMMIT_TIME`, 15 paired runs per profile on Linux (AMD Ryzen 5 4600H, ext4).
+Recording the commit time costs 0.8-1.3% in the relaxed profile (world 57,366 -> 56,643 req/s, canvas 49,891 -> 49,384, simulation 50,804 -> 50,265) and is within noise under fsync-wal; no scenario comes near the 5% budget.
+Raw report and setup: [comparison](../../bench/artifacts/manual-runs/commit-time-20261118-linux-comparison.md), [conditions](../../bench/artifacts/manual-runs/commit-time-20261118-linux-metadata.txt).

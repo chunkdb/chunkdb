@@ -21,6 +21,7 @@
 #include "chunk_store_internal.hpp"
 #include "chunk_form.hpp"
 #include "typed_chunk_form.hpp"
+#include "area_cursor.hpp"
 #include "sectioned_chunk_form.hpp"
 #include "chunkdb/chunk_columns.hpp"
 #include "cql.hpp"
@@ -275,6 +276,36 @@ void AppendChunkState(ReplyParts& reply, const Geometry& geometry, const ChunkSt
     return std::string{};
 }
 
+std::string AreaReplyPrefix(bool with_schema, std::uint64_t schema, bool paged, std::size_t count) {
+    std::string prefix;
+    if (with_schema) {
+        Protocol::AppendArrayHeader(prefix, 2U);
+        Protocol::AppendInteger(prefix, schema);
+    }
+    if (paged) {
+        Protocol::AppendMapHeader(prefix, 3U);
+        Protocol::AppendBulk(prefix, "chunks");
+    }
+    Protocol::AppendArrayHeader(prefix, count);
+    return prefix;
+}
+
+std::string AreaReplySuffix(bool paged, bool more, const ChunkCoord& coord, std::uint8_t dims) {
+    std::string suffix;
+    if (!paged) return suffix;
+    Protocol::AppendBulk(suffix, "more");
+    Protocol::AppendBoolean(suffix, more);
+    Protocol::AppendBulk(suffix, "after");
+    if (!more) Protocol::AppendNull(suffix);
+    else {
+        Protocol::AppendArrayHeader(suffix, dims);
+        Protocol::AppendInteger(suffix, coord.x);
+        Protocol::AppendInteger(suffix, coord.y);
+        if (dims == 3U) Protocol::AppendInteger(suffix, coord.z);
+    }
+    return suffix;
+}
+
 // Bound admitted wire storage independently of a lowered write quota; the
 // locked mutation checks whether the resulting stored state may grow.
 [[nodiscard]] std::size_t ChunkFormBytes(const Geometry& geometry, bool projected) {
@@ -297,10 +328,11 @@ void AppendChunkState(ReplyParts& reply, const Geometry& geometry, const ChunkSt
 }
 
 // Retained state of `count` chunk forms, each with `framing` bytes, within
-// the response byte limit.
-[[nodiscard]] std::size_t ChunkReplyStateBytes(const Geometry& geometry, std::size_t count, std::size_t framing) {
-    const auto chunk_bytes = std::min<std::size_t>(kMaxChunkRangeResponseBytes, framing + ChunkReplyFormBytes(geometry));
-    return count > kMaxChunkRangeResponseBytes / chunk_bytes ? kMaxChunkRangeResponseBytes : count * chunk_bytes;
+// the response byte limit `budget`.
+[[nodiscard]] std::size_t ChunkReplyStateBytes(const Geometry& geometry, std::size_t count, std::size_t framing,
+    std::size_t budget = kMaxChunkRangeResponseBytes) {
+    const auto chunk_bytes = std::min<std::size_t>(budget, framing + ChunkReplyFormBytes(geometry));
+    return count > budget / chunk_bytes ? budget : count * chunk_bytes;
 }
 
 // Schema indexes of `names`, or empty for every column.
@@ -1499,73 +1531,112 @@ std::string CommandEngine::ExecuteStatement(
                     RequireDimensions(store.geometry(), get.dims);
                     const auto& layout = store.geometry().layout();
                     const auto columns = ColumnsOf(layout, get.columns);
-                    std::vector<ChunkRangeEntry> entries;
+                    const ChunkAreaSelector selector{.dims = get.dims, .first = {get.x0, get.y0, get.z0},
+                        .last = {get.x1, get.y1, get.z1}, .around = get.around, .radius = get.radius};
+                    const bool paged = get.limit.has_value() || get.after.has_value();
+                    const auto& limits = store.query_limits();
+                    const auto limit = get.limit.value_or(limits.max_area_chunks);
+                    if (limit == 0U || limit > limits.max_area_chunks)
+                        throw std::invalid_argument("area page limit is outside the configured chunk bound");
+                    if (!paged && detail::AreaRequestedExceeds(selector, limits.max_area_chunks))
+                        throw std::invalid_argument("area exceeds its requested-chunk limit; use LIMIT");
+                    const auto budget = limits.max_area_response_bytes;
+                    const auto too_large = [budget] {
+                        return std::out_of_range("area response exceeds the " + std::to_string(budget) +
+                            "-byte limit; request fewer chunks");
+                    };
                     if (reserve_reply) {
-                        const auto extent = [](std::int64_t first, std::int64_t last) {
-                            if (last < first) return kMaxChunkRangeChunks;
+                        const auto bound = static_cast<std::size_t>(limit);
+                        const auto extent = [bound](std::int64_t first, std::int64_t last) {
+                            if (last < first) return bound;
                             const auto delta = static_cast<std::uint64_t>(last) - static_cast<std::uint64_t>(first);
-                            return delta >= kMaxChunkRangeChunks ? kMaxChunkRangeChunks : static_cast<std::size_t>(delta + 1U);
+                            return delta >= bound ? bound : static_cast<std::size_t>(delta + 1U);
                         };
                         // Each axis multiplies the count, which never exceeds
-                        // the chunks an area may return.
-                        const auto times = [](std::size_t count, std::size_t axis) {
-                            return axis > kMaxChunkRangeChunks / count ? kMaxChunkRangeChunks : count * axis;
+                        // the chunks one reply may return.
+                        const auto times = [bound](std::size_t count, std::size_t axis) {
+                            return axis > bound / count ? bound : count * axis;
                         };
-                        auto count = kMaxChunkRangeChunks;
+                        auto count = bound;
                         if (!get.around) {
                             count = times(extent(get.x0, get.x1), extent(get.y0, get.y1));
                             if (get.dims == 3U) count = times(count, extent(get.z0, get.z1));
-                        } else if (get.radius >= 0 && static_cast<std::uint64_t>(get.radius) < kMaxChunkRangeChunks / 2U) {
+                        } else if (get.radius >= 0 && static_cast<std::uint64_t>(get.radius) < bound / 2U) {
                             const auto diameter = static_cast<std::size_t>(get.radius) * 2U + 1U;
                             count = times(diameter, diameter);
                             if (get.dims == 3U) count = times(count, diameter);
                         }
-                        (*reserve_reply)(ChunkReplyCaptureBound(layout, ChunkReplyStateBytes(store.geometry(), count, 96U)));
+                        (*reserve_reply)(ChunkReplyCaptureBound(layout,
+                            ChunkReplyStateBytes(store.geometry(), count, 96U, budget)));
                     }
+                    std::vector<ChunkCoord> covered;
+                    TxnAreaRead read;
                     if (session.transaction != nullptr) {
-                        auto& txn = *session.transaction;
-                        std::vector<ChunkCoord> covered;
-                        const TxnAreaRead read{
-                            .overlay = [&txn](const ChunkCoord& coord) -> const ChunkState* {
-                                const auto own = txn.writes.find(coord);
-                                return own != txn.writes.end() ? &own->second : nullptr;
-                            },
-                            .covered = &covered,
+                        read.overlay = [&session](const ChunkCoord& coord) -> const ChunkState* {
+                            const auto own = session.transaction->writes.find(coord);
+                            return own == session.transaction->writes.end() ? nullptr : &own->second;
                         };
-                        if (get.dims == 3U) entries = get.around
-                            ? store.ReadChunkRadius3DAt(*txn.snapshot, get.x0, get.y0, get.z0, get.radius, true, read)
-                            : store.ReadChunkRange3DAt(*txn.snapshot, get.x0, get.y0, get.z0, get.x1, get.y1, get.z1, true, read);
-                        else entries = get.around
-                            ? store.ReadChunkRadiusAt(*txn.snapshot, get.x0, get.y0, get.radius, true, read)
-                            : store.ReadChunkRangeAt(*txn.snapshot, get.x0, get.y0, get.x1, get.y1, true, read);
-                        TxnRead(txn, covered);
-                    } else {
-                        if (get.dims == 3U) entries = get.around
-                            ? store.ReadChunkRadius3D(get.x0, get.y0, get.z0, get.radius, true)
-                            : store.ReadChunkRange3D(get.x0, get.y0, get.z0, get.x1, get.y1, get.z1, true);
-                        else entries = get.around ? store.ReadChunkRadius(get.x0, get.y0, get.radius, true)
-                                                  : store.ReadChunkRange(get.x0, get.y0, get.x1, get.y1, true);
+                        read.covered = &covered;
                     }
-                    if (info != nullptr) info->chunks = entries.size();
+                    // Admitted rows: framing text before each encoded form.
+                    std::vector<ReplyParts::Piece> rows;
+                    std::size_t count = 0U;
+                    std::size_t body_bytes = 0U;
+                    auto prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged, count);
+                    auto suffix = AreaReplySuffix(paged, false, {}, get.dims);
+                    if (prefix.size() > budget || suffix.size() > budget - prefix.size()) throw too_large();
+                    (void)store.VisitChunkArea(selector, get.after, static_cast<std::size_t>(limit),
+                        [&](const ChunkCoord& coord, std::optional<ChunkRangeEntry>&& entry, bool more) {
+                            const auto next_count = count + static_cast<std::size_t>(entry.has_value());
+                            auto next_prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged, next_count);
+                            auto next_suffix = AreaReplySuffix(paged, more, coord, get.dims);
+                            const auto single_prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged,
+                                static_cast<std::size_t>(entry.has_value()));
+                            if (single_prefix.size() > budget || next_suffix.size() > budget - single_prefix.size()) throw too_large();
+                            const auto row_budget = budget - single_prefix.size() - next_suffix.size();
+                            ReplyParts::Piece row;
+                            std::size_t row_bytes = 0U;
+                            if (entry) {
+                                Protocol::AppendArrayHeader(row.text, static_cast<std::size_t>(get.dims) + 1U);
+                                Protocol::AppendInteger(row.text, coord.x);
+                                Protocol::AppendInteger(row.text, coord.y);
+                                if (get.dims == 3U) Protocol::AppendInteger(row.text, coord.z);
+                                if (row.text.size() >= row_budget) throw too_large();
+                                const auto form_bound = row_budget - row.text.size();
+                                const bool private_state = session.transaction != nullptr && session.transaction->writes.contains(coord);
+                                const ChunkState state{.version = entry->version, .payload = std::move(entry->payload),
+                                    .presence_bitmap = std::move(entry->presence_bitmap), .vars = std::move(entry->vars), .written = true,
+                                    .commit_time_ms = entry->commit_time_ms, .chunk_columns = std::move(entry->chunk_columns)};
+                                const auto form_size = SectionedChunkStateBytes(store.geometry(), state, kVarMaxChunkBytesLimit, columns);
+                                const auto bulk_overhead = 5U + std::to_string(form_size).size();
+                                if (form_size > form_bound || bulk_overhead > form_bound - form_size) throw too_large();
+                                row.body = EncodeSectionedChunkState(store.geometry(), state, kVarMaxChunkBytesLimit,
+                                    columns, private_state, form_bound);
+                                row_bytes = row.text.size() + 5U + std::to_string(row.body.size()).size() + row.body.size();
+                                if (row_bytes > row_budget) throw too_large();
+                            }
+                            if (next_prefix.size() > budget || next_suffix.size() > budget - next_prefix.size() ||
+                                body_bytes > budget - next_prefix.size() - next_suffix.size() ||
+                                row_bytes > budget - next_prefix.size() - next_suffix.size() - body_bytes) {
+                                if (!paged) throw too_large();
+                                return false;
+                            }
+                            if (entry) rows.push_back(std::move(row));
+                            body_bytes += row_bytes;
+                            count = next_count;
+                            prefix = std::move(next_prefix);
+                            suffix = std::move(next_suffix);
+                            return true;
+                        }, true, session.transaction ? &*session.transaction->snapshot : nullptr, read);
+                    if (session.transaction != nullptr) TxnRead(*session.transaction, covered);
+                    if (info != nullptr) info->chunks = count;
                     ReplyParts reply;
-                    if (get.with_schema) {
-                        Protocol::AppendArrayHeader(reply.text(), 2U);
-                        Protocol::AppendInteger(reply.text(), layout.schema().version);
+                    reply.text() = std::move(prefix);
+                    for (auto& row : rows) {
+                        reply.text() += row.text;
+                        reply.AppendBulk(std::move(row.body));
                     }
-                    Protocol::AppendArrayHeader(reply.text(), entries.size());
-                    for (auto& entry : entries) {
-                        CheckStatementCancellation();
-                        Protocol::AppendArrayHeader(reply.text(), static_cast<std::size_t>(get.dims) + 1U);
-                        Protocol::AppendInteger(reply.text(), entry.coord.x);
-                        Protocol::AppendInteger(reply.text(), entry.coord.y);
-                        if (get.dims == 3U) Protocol::AppendInteger(reply.text(), entry.coord.z);
-                        const bool private_state = session.transaction != nullptr && session.transaction->writes.contains(entry.coord);
-                        AppendChunkState(reply, store.geometry(), {.version = entry.version, .payload = std::move(entry.payload),
-                            .presence_bitmap = std::move(entry.presence_bitmap), .vars = std::move(entry.vars), .written = true,
-                            .commit_time_ms = entry.commit_time_ms, .chunk_columns = entry.chunk_columns}, columns, private_state);
-                        if (reply.size() > kMaxChunkRangeResponseBytes)
-                            throw std::invalid_argument("area response exceeds its byte limit");
-                    }
+                    reply.text() += suffix;
                     return FinishReply(std::move(reply), continuation);
                 },
                 [&](const cql::CreateTable& create) {
@@ -2127,22 +2198,26 @@ Table::Lease CommandEngine::TxnLease(SessionState& session, const std::string& t
     return std::move(*lease);
 }
 
-void CommandEngine::TxnRead(SessionTransaction& txn, std::span<const ChunkCoord> coords) {
-    std::size_t added = 0;
-    for (const auto& coord : coords) {
-        added += txn.read_set.contains(coord) ? 0U : 1U;
-    }
-    if (txn.read_set.size() + added > kMaxTxnReadChunks) {
+void CommandEngine::TxnRead(SessionTransaction& txn, std::span<const ChunkCoord> coords) const {
+    const auto limit = catalog_->query_limits().txn_max_read_chunks;
+    const auto too_many = [&] {
         throw std::invalid_argument(
-            "a transaction reads at most " + std::to_string(kMaxTxnReadChunks) + " chunks");
+            "a transaction reads at most " + std::to_string(limit) + " chunks");
+    };
+    if (txn.read_set.size() > limit) too_many();
+    std::set<ChunkCoord, ChunkCoordLess> additions;
+    for (const auto& coord : coords) {
+        if (txn.read_set.contains(coord) || additions.contains(coord)) continue;
+        if (additions.size() >= limit - txn.read_set.size()) too_many();
+        additions.insert(coord);
     }
-    txn.read_set.insert(coords.begin(), coords.end());
+    txn.read_set.merge(additions);
 }
 
 namespace {
 
-[[nodiscard]] std::invalid_argument TxnWrittenChunksError() {
-    return std::invalid_argument("a transaction writes at most " + std::to_string(kMaxTxnWrittenChunks) + " chunks");
+[[nodiscard]] std::invalid_argument TxnWrittenChunksError(std::size_t limit) {
+    return std::invalid_argument("a transaction writes at most " + std::to_string(limit) + " chunks");
 }
 
 [[nodiscard]] std::invalid_argument TxnMaxBytesError(std::size_t bytes, std::size_t limit) {
@@ -2164,8 +2239,9 @@ void CommandEngine::RequireTxnRoom(
     const ChunkCoord& coord,
     std::size_t after) {
     const auto own = txn.writes.find(coord);
-    if (own == txn.writes.end() && txn.writes.size() >= kMaxTxnWrittenChunks) {
-        throw TxnWrittenChunksError();
+    const auto limit = catalog_->query_limits().txn_max_written_chunks;
+    if (own == txn.writes.end() && txn.writes.size() >= limit) {
+        throw TxnWrittenChunksError(limit);
     }
     const std::size_t before = own == txn.writes.end() ? 0U : StateBytes(own->second);
     if (txn.bytes - before + after > config_.txn_max_bytes) {
@@ -2192,8 +2268,9 @@ void CommandEngine::TxnWrite(
     auto own = txn.writes.find(coord);
     const bool created = own == txn.writes.end();
     if (created) {
-        if (txn.writes.size() >= kMaxTxnWrittenChunks) {
-            throw TxnWrittenChunksError();
+        const auto limit = catalog_->query_limits().txn_max_written_chunks;
+        if (txn.writes.size() >= limit) {
+            throw TxnWrittenChunksError(limit);
         }
         own = txn.writes.emplace(coord, store.ReadChunkStateAt(*txn.snapshot, coord)).first;
     }
