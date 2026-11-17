@@ -347,7 +347,8 @@ const char* CheckpointCompressionName(CheckpointCompression compression) noexcep
 }
 
 ChunkStore::ChunkStore(StoreConfig config)
-    : geometry_(OpenStoreGeometry(config)),
+    : query_limits_(config.query_limits),
+      geometry_(OpenStoreGeometry(config)),
       data_dir_(std::move(config.data_dir)),
       durability_mode_(config.durability_mode),
       access_mode_(config.access_mode),
@@ -366,6 +367,7 @@ ChunkStore::ChunkStore(StoreConfig config)
       initial_version_floor_(config.initial_version_floor),
       background_maintenance_(config.background_maintenance),
       background_checkpoint_queue_limit_(config.background_checkpoint_queue_limit) {
+    RequireValidQueryLimits(query_limits_);
     write_producers_ = std::make_shared<FeedProducerRegistry>();
     if (data_dir_.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
