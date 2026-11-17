@@ -514,6 +514,57 @@ void TestRequiredChannelBinding() {
     ExpectError(server.Run(admin, "ALTER USER ghost REQUIRE CHANNEL BINDING"), "INVALID_ARGUMENT");
 }
 
+// A login checks the user's credentials as they are when AUTH finishes it,
+// not as HELLO found them.
+void TestCredentialsChangedDuringLogin() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    const std::string bot_verifier = VerifierText("hunter2");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{bot_verifier}), "+OK\r\n");
+    // HELLO, then `change` from another session, then AUTH with the password
+    // that was right at HELLO.
+    const auto login_around = [&server](const std::string& password, const auto& change) {
+        SessionState session;
+        const auto login = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce());
+        const std::string first = server.Run(session, "HELLO 3 USER bot $1", Parameters{login.first});
+        assert(first.rfind("+SCRAM ", 0) == 0);
+        change();
+        const auto final_message =
+            chunkdb::scram::FinishClientLogin(login, password, first.substr(7, first.size() - 9));
+        const std::string reply = server.Run(session, "AUTH $1", Parameters{final_message.message});
+        assert(session.greeted == (reply.rfind("%14\r\n", 0) == 0));
+        return reply;
+    };
+
+    // A change that leaves the credentials alone does not stop the login.
+    assert(login_around("hunter2", [&] {
+        ExpectReply(server.Run(admin, "GRANT READ ON default TO bot"), "+OK\r\n");
+    }).rfind("%14\r\n", 0) == 0);
+
+    // A new verifier: the old password no longer logs in.
+    ExpectReply(login_around("hunter2", [&] {
+        ExpectReply(server.Run(admin, "ALTER USER bot VERIFIER $1", Parameters{VerifierText("rotated")}), "+OK\r\n");
+    }), kWrongLogin);
+    (void)server.LoggedIn("bot", "rotated");
+
+    // The user dropped and created again with the same verifier.
+    ExpectReply(server.Run(admin, "ALTER USER bot VERIFIER $1", Parameters{bot_verifier}), "+OK\r\n");
+    ExpectReply(login_around("hunter2", [&] {
+        ExpectReply(server.Run(admin, "DROP USER bot"), "+OK\r\n");
+        ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{bot_verifier}), "+OK\r\n");
+    }), kWrongLogin);
+    (void)server.LoggedIn("bot", "hunter2");
+
+    // The user now takes only bound logins: this unbound one fails.
+    ExpectReply(login_around("hunter2", [&] {
+        ExpectReply(server.Run(admin, "ALTER USER bot REQUIRE CHANNEL BINDING"), "+OK\r\n");
+    }), kWrongLogin);
+    SessionState unbound;
+    ExpectReply(server.Login(unbound, "bot", "hunter2"), kWrongLogin);
+    ExpectReply(server.Run(admin, "ALTER USER bot NO REQUIRE CHANNEL BINDING"), "+OK\r\n");
+    (void)server.LoggedIn("bot", "hunter2");
+}
+
 // --auth none: no users, every right.
 void TestWithoutUsers() {
     Server server(false);
@@ -653,6 +704,7 @@ int main() {
     TestConcurrentConditionalUsers();
     TestChannelBinding();
     TestRequiredChannelBinding();
+    TestCredentialsChangedDuringLogin();
     TestWithoutUsers();
     TestReadOnly();
     return 0;
