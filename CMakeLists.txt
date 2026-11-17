@@ -56,6 +56,7 @@ add_library(chunkdb_core STATIC
     src/barrier.cpp
     src/backup_create.cpp
     src/backup_records.cpp
+    src/backup_restore.cpp
     src/bit_codec.cpp
     src/block_ops.cpp
     src/checkpoint.cpp
@@ -90,6 +91,7 @@ add_library(chunkdb_core STATIC
     src/scram.cpp
     src/users.cpp
     src/user_registry.cpp
+    src/verify.cpp
     src/durability_io.cpp
     src/file_permissions.cpp
     src/audit_log.cpp
@@ -203,8 +205,6 @@ target_include_directories(chunkdb_crc32_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DI
 # Offline tools.
 add_library(chunkdb_tools STATIC
     src/admin.cpp
-    src/backup_restore.cpp
-    src/verify.cpp
 )
 target_link_libraries(chunkdb_tools PUBLIC chunkdb_core)
 target_include_directories(chunkdb_tools PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
