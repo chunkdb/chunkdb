@@ -1,6 +1,7 @@
 // RESTORE TABLE into a running catalog (docs/design/RESTORE_TABLE.md).
 #include <stop_token>
 
+#include "feed_slots.hpp"
 #include "restore_table_test_utils.hpp"
 #include "txn_test_utils.hpp"
 
@@ -367,6 +368,35 @@ void SwapMarksSurviveRestart() {
     assert(Resyncs(catalog, "t") && Resyncs(catalog, "t_restored"));
 }
 
+// A marked slot that outgrows its retention limit becomes lost and loses its
+// mark; its records stay valid across a restart.
+void MarkedSlotBecomesLost() {
+    Source source;
+    {
+        TableCatalog catalog(source.Config());
+        (void)catalog.RestoreTable(source.Request());
+        auto update = TableOptionsUpdate::From(catalog.Require("t_restored")->Info().options);
+        update.slot_max_bytes = 1U;
+        catalog.SetOptions("t_restored", update);
+        const auto table = catalog.Require("t_restored");
+        {
+            auto lease = table->Acquire();
+            lease->store().SetBlockBits(0, 1, "00010000");
+            lease->store().WalBarrier();
+            lease->store().CheckpointForTests(0, 0);
+        }
+        FeedSlotTestAccess::Sync(*table);
+        FeedSlotTestAccess::Retain(*table);
+        const auto slots = table->ListFeedSlots(true);
+        assert(slots.size() == 1U && slots[0].lost && !slots[0].resync);
+        table->Acquire()->store().SetBlockBits(0, 1, "00100000");
+    }
+    TableCatalog catalog(source.Config());
+    const auto slots = catalog.Require("t_restored")->ListFeedSlots(true);
+    assert(slots.size() == 1U && slots[0].lost && !slots[0].resync);
+    Verified(source.data);
+}
+
 // Windows has no atomic directory exchange: SWAP TABLES is refused before
 // anything closes, and both tables keep serving.
 void SwapRefusedOnWindows() {
@@ -385,6 +415,7 @@ int main() {
     DamagedBackups();
     InjectedFailures();
     Cancellation();
+    MarkedSlotBecomesLost();
     if (kAtomicExchange) {
         SwapsNames();
         SwapSurvivesRestart();
