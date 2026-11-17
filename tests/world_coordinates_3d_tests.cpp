@@ -62,7 +62,9 @@ void RejectsTwoDimensionalTables() {
 
 void ExactBallsAndRangeAdmission() {
     test::ScopedTempDir directory("chunkdb-world-3d-balls");
-    ChunkStore store(Config(directory.path()));
+    auto config = Config(directory.path());
+    config.query_limits.max_area_chunks = 256U;
+    ChunkStore store(config);
     std::vector<ChunkCoord> expected;
     for (std::int64_t x = -3; x <= 3; ++x) {
         for (std::int64_t y = -3; y <= 3; ++y) {
@@ -92,7 +94,7 @@ void ExactBallsAndRangeAdmission() {
     assert(covered.empty());
     const auto boundary = store.ReadChunkRange3DAt(*snapshot, -128, 0, 0, 127, 0, 0, false, read);
     assert(boundary.size() == 7U);
-    assert(covered.size() == kMaxChunkRangeChunks && std::is_sorted(covered.begin(), covered.end()));
+    assert(covered.size() == config.query_limits.max_area_chunks && std::is_sorted(covered.begin(), covered.end()));
     assert((covered.front() == ChunkCoord{-128, 0, 0} && covered.back() == ChunkCoord{127, 0, 0}));
 }
 

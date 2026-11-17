@@ -7,6 +7,7 @@
 #include <vector>
 
 #include "chunkdb/crc32.hpp"
+#include "feature_flags.hpp"
 #include "wal_replay.hpp"
 #include "wal_writer.hpp"
 
@@ -159,10 +160,35 @@ void WriterAndReaderApplyTheSameFrameCeiling() {
     }
     assert(extent_limit);
 }
+
+// A checksum-valid GROUP frame at or below the replay base is refused, not
+// skipped, even when explicit test flags admit its metadata.
+void GroupFrameBelowTheBaseIsRefused() {
+    const Geometry geometry({2U, 2U, 2U, 2U, 8U});
+    const FeatureFlags groups{.incompat = kChunkModelFormatBit | kFeatureCommitGroups};
+    auto bytes = BuildWalHeader({}, kTable, groups);
+    Bytes grouped;
+    WalFrameBuilder frame(&grouped, 1U, {}, {}, false, WalGroupRef{.id = {1U}, .member_count = 1U, .member_ordinal = 0U});
+    const std::uint8_t value = 1U;
+    frame.AppendSpan(0U, &value, 1U);
+    (void)frame.Finish(1U, 10U);
+    Append(bytes, grouped);
+    ChunkState base;
+    base.payload.assign(geometry.ChunkPayloadBytes(), 0U);
+    base.version = 1U;
+    base.commit_time_ms = 10U;
+    base.written = true;
+    std::istringstream input(std::string(bytes.begin(), bytes.end()));
+    std::string error;
+    try { ValidateWalPrefix(input, bytes.size(), geometry, {}, kTable, groups, base, 1U); }
+    catch (const std::runtime_error& refused) { error = refused.what(); }
+    assert(error == "WAL group frame requires directory admission");
+}
 }
 
 int main() {
     OneFrameAtATimeAndExactCuts();
     SharedSchemaHistoryIsAppliedBeforeEachFrame();
     WriterAndReaderApplyTheSameFrameCeiling();
+    GroupFrameBelowTheBaseIsRefused();
 }

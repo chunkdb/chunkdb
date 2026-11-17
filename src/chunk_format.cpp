@@ -87,7 +87,7 @@ void MaskUnusedPresenceBits(const Geometry& geometry, std::vector<std::uint8_t>*
 }
 
 [[nodiscard]] bool BlockPresent(
-    const std::vector<std::uint8_t>& presence_bitmap,
+    std::span<const std::uint8_t> presence_bitmap,
     std::size_t block_index) {
     const std::size_t byte_index = block_index / 8U;
     const std::uint8_t bit_mask = static_cast<std::uint8_t>(1U << (block_index % 8U));
@@ -271,12 +271,12 @@ void AppendSection(
     std::vector<std::uint8_t>* directory,
     std::vector<ImageSection>* sections,
     std::uint16_t type,
-    const std::vector<std::uint8_t>& raw,
+    std::span<const std::uint8_t> raw,
     CheckpointCompression compression) {
     const bool compressed = compression == CheckpointCompression::kZrle;
     auto& section = sections->emplace_back();
     if (compressed) {
-        section.compressed = ZrleCompress(raw);
+        section.compressed = ZrleCompressBytes(raw);
         section.body = section.compressed;
     } else {
         section.body = raw;
@@ -285,7 +285,7 @@ void AppendSection(
     WriteLe16(*directory, compressed ? kImageSectionFlagZrle : 0U);
     WriteLe32(*directory, static_cast<std::uint32_t>(section.body.size()));
     WriteLe32(*directory, static_cast<std::uint32_t>(raw.size()));
-    WriteLe32(*directory, Crc32(raw));
+    WriteLe32(*directory, Crc32(raw.data(), raw.size()));
 }
 
 }  // namespace
@@ -330,7 +330,7 @@ std::vector<std::uint8_t> SerializeChunkImage(
     AppendSection(&directory, &bodies, kImageSectionPayload, payload, compression);
     AppendSection(&directory, &bodies, kImageSectionPresence, presence_bitmap, compression);
     if (has_vars) {
-        AppendSection(&directory, &bodies, kImageSectionVars, vars->Encode(), compression);
+        AppendSection(&directory, &bodies, kImageSectionVars, vars->EncodedBytes(), compression);
     }
     // Images of a table that never changed its columns stay as they were.
     const std::uint64_t schema_version = geometry.layout().schema().version;
