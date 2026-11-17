@@ -59,7 +59,7 @@ Deterministic scheduler gates cover FIFO fairness, worker concurrency, coalesced
 Catalog tests cover simultaneous table barriers, failure propagation, and dropping or reopening a table while a barrier holds its lease.
 A catalog test with one worker drops a table during its barrier and closes the catalog while that worker is still between turns.
 Existing checkpoint, eviction, backup, migration, feature-activation and crash suites cover the store lifecycle boundaries.
-Measurements use 1, 100 and 1,000 tables and record process threads, memory, barrier latency and write throughput on the benchmark server.
+Measurements use 1, 100 and 1,000 tables and record process threads, memory, barrier latency and write throughput on Linux.
 A store regression test pauses a background checkpoint before its WAL removal and requires writes to that chunk to return, up to the hard bound, and to survive a reopen.
 Chunk-model tests pause it the same way and run every SET CHUNK form and a transaction in two and three dimensions, an emptying write, tombstone compaction, backup and feed-slot creation against it.
 

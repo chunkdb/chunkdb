@@ -1802,7 +1802,7 @@ constexpr std::string_view kHelp =
     "  --markdown [FILE]     write pasteable Markdown; omit FILE for stdout\n"
     "  --noise-floor         same-binary window-start calibration without older reference\n"
     "  --window-id WINDOW_ID\n"
-    "                        coordinator-assigned measurement window identity\n"
+    "                        measurement window identity shared by its control and comparisons\n"
     "  --noise-reference NOISE_REFERENCE\n"
     "                        completed same-window raw control JSON; required for comparisons\n"
     "  --relaxed-concurrency {4,8,16}\n"
