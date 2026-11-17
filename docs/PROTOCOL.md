@@ -49,8 +49,8 @@ A second HELLO receives PROTOCOL.
 | `server_version` | Bulk version string. |
 | `max_line_bytes` | Configured request-line limit. |
 | `max_parameters` | 65535. |
-| `max_area_chunks` | 256. |
-| `max_response_bytes` | 67108864 for area responses. |
+| `max_area_chunks` | Configured requested cells per area or page; default 4096. |
+| `max_response_bytes` | Configured complete area-response bytes; default 67108864. |
 | `max_scan_limit` | 1024. |
 | `server_signature` | Bulk SCRAM `v=<signature>`, or null without authentication. |
 | `connection_id` | Nonzero unsigned process-local connection identifier. |
@@ -66,9 +66,12 @@ Unknown keys are accepted and reported with `reason=unknown_option`.
 Before authentication HELLO takes at most 12 parameters; a HELLO with more receives PROTOCOL and closes without its frames being read.
 
 Only `client_name` currently applies; timeout and tag values are stored with `reason=implementation_pending` until their capabilities appear.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, and `channel_binding`.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `channel_binding`, and `area_paging`.
 Options become visible only after authentication succeeds.
 Returning and expression ceilings describe reserved limits; their capabilities remain unavailable.
+The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
+The configured positive area bounds appear as both `max_area_chunks`/`max_response_bytes` and `limits.max_area_chunks`/`limits.max_area_response_bytes`.
+`limits.txn_max_written_chunks` and `limits.txn_max_read_chunks` are the configured transaction chunk-count bounds.
 
 See [session negotiation](design/PROTOCOL_FOUNDATION.md#handshake-and-session-ownership-a2) for the complete option and limit contract.
 
@@ -193,7 +196,7 @@ The following list notation describes push elements, rather than literal wire by
 - `[resync, epoch, revision, parent_epoch, fork_revision]`, requesting consumer state reconstruction.
 - `[progress, epoch, revision]`, marking a sender-drained cut during idle or filtered periods.
 
-Current change frames reserve `tag=null`, `txn=null`, and `chunk_changes=[]`; schema maps reserve `chunk_columns=[]`.
+Current change frames reserve `tag=null` and `txn=null`; a schema map gives the table's `dims`, the watched block columns, and all chunk columns of its `schema_version`.
 Resync lineage fields are null when no parent lineage is recorded.
 
 Rows are in schema order and use the reply types above; null denotes absent rows or NULL values and an anonymous user.

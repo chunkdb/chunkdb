@@ -102,24 +102,32 @@ const Column* ChunkLayout::VarColumn(std::uint32_t column_id) const noexcept {
 }
 
 void ChunkLayout::RequireValidVars(const ChunkVars& vars, const std::vector<std::uint8_t>& presence) const {
+    RequireValidVarsView(vars, presence);
+}
+
+void ChunkLayout::RequireValidVarsView(const ChunkVars& vars, std::span<const std::uint8_t> presence) const {
+    if (presence.size() != (block_count_ + 7U) / 8U)
+        throw std::invalid_argument("variable values require the complete presence bitmap");
     for (const auto entry : vars) {
-        const auto where = "column " + std::to_string(entry.key.column_id) + " block " +
-                           std::to_string(entry.key.block_index);
+        const auto fail = [&](std::string reason) {
+            throw std::invalid_argument("column " + std::to_string(entry.key.column_id) + " block " +
+                std::to_string(entry.key.block_index) + ": " + reason);
+        };
         const Column* column = VarColumn(entry.key.column_id);
         if (column == nullptr) {
-            throw std::invalid_argument(where + ": no text or bytes column has this id");
+            fail("no text or bytes column has this id");
         }
         if (entry.key.block_index >= block_count_ || !GetBit(presence.data(), entry.key.block_index)) {
-            throw std::invalid_argument(where + ": a value of an absent block");
+            fail("a value of an absent block");
         }
         if (entry.value.size() > column->type.size) {
-            throw std::invalid_argument(where + ": longer than " + ColumnTypeName(column->type));
+            fail("longer than " + ColumnTypeName(column->type));
         }
         if (entry.value.empty() && !column->nullable) {
-            throw std::invalid_argument(where + ": an empty value stored in a column that cannot be NULL");
+            fail("an empty value stored in a column that cannot be NULL");
         }
         if (column->type.kind == ColumnKind::kText && !IsUtf8(entry.value)) {
-            throw std::invalid_argument(where + ": text that is not UTF-8");
+            fail("text that is not UTF-8");
         }
     }
 }

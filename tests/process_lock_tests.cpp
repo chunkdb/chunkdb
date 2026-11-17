@@ -1,4 +1,5 @@
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstdint>
 #include <cstdlib>
@@ -8,6 +9,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <thread>
 #include <unordered_map>
 #include <vector>
@@ -17,6 +19,7 @@
 
 #ifndef _WIN32
 #include <csignal>
+#include <fcntl.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -397,6 +400,34 @@ void TestLockFileInPlaceOfLockDirectoryRefused() {
     std::filesystem::remove_all(data_dir);
 }
 
+// A data directory reached through a symlink starts: the writer lock follows
+// the link into the target directory, and a reopen through the link reads the
+// same data.
+void TestSymlinkedDataDirectoryStarts() {
+    const auto target = TempDataDir("symlinked-root");
+    const std::filesystem::path alias = target.string() + "-alias";
+    std::filesystem::create_directories(target);
+    std::error_code symlink_ec;
+    std::filesystem::create_directory_symlink(target, alias, symlink_ec);
+    if (symlink_ec) {
+        // Symlink creation can be blocked by environment policy; skip deterministically.
+        std::filesystem::remove_all(target);
+        return;
+    }
+    {
+        chunkdb::ChunkStore writer(BuildConfig(alias));
+        writer.SetBlockBits(0, 0, "1010");
+        assert(std::filesystem::is_directory(LockDir(target)));
+        assert(std::filesystem::is_regular_file(LockDir(target) / "writer.meta"));
+    }
+    {
+        chunkdb::ChunkStore reopened(BuildConfig(alias));
+        assert(reopened.GetBlockBits(0, 0) == "1010");
+    }
+    std::filesystem::remove(alias);
+    std::filesystem::remove_all(target);
+}
+
 #ifndef _WIN32
 void TestUnsupportedLockPathTypeRejected() {
     const auto data_dir = TempDataDir("unsupported-lock-type");
@@ -431,6 +462,41 @@ void TestUnsupportedLockPathTypeRejected() {
 #endif
 
 #ifndef _WIN32
+// The lowest descriptor number the process can get; it is the same before and
+// after an operation that closes every descriptor it opened.
+int LowestFreeFd() {
+    const int fd = ::open("/dev/null", O_RDONLY);
+    assert(fd >= 0);
+    ::close(fd);
+    return fd;
+}
+
+// A lock error other than a held lock is reported as that error, not as an
+// active writer, closes the lock file descriptor and leaves nothing that
+// blocks the next open.
+void TestLockErrorOtherThanContentionReported() {
+    chunkdb::test::ScopedTempDir temp_dir("chunkdb-process-lock-test-lock-error");
+    const auto& data_dir = temp_dir.path();
+    constexpr const char* kFailpoint = "CHUNKDB_FAILPOINT_PROCESS_LOCK_FLOCK_FAIL_ONCE";
+    const int lowest_free_fd_before = LowestFreeFd();
+    setenv(kFailpoint, "1", 1);
+
+    std::string message;
+    try {
+        chunkdb::ChunkStore writer(BuildConfig(data_dir));
+    } catch (const std::exception& ex) {
+        message = ex.what();
+    }
+    unsetenv(kFailpoint);
+    assert(LowestFreeFd() == lowest_free_fd_before);
+    assert(message.find("failed to lock writer lock file") != std::string::npos);
+    assert(message.find(std::error_code(ENOLCK, std::generic_category()).message()) != std::string::npos);
+    assert(message.find("active writer") == std::string::npos);
+
+    chunkdb::ChunkStore writer(BuildConfig(data_dir));
+    (void)writer;
+}
+
 [[noreturn]] void ChildWriterLoop(const std::filesystem::path& data_dir) {
     chunkdb::ChunkStore writer(BuildConfig(data_dir));
     writer.SetBlockBits(0, 0, "1010");
@@ -501,9 +567,11 @@ int main(int argc, char** argv) {
     TestCleanShutdownReleasesWriterOwnership();
     TestHeartbeatDoesNotConsumeAtomicWriteFailpoints();
     TestLockFileInPlaceOfLockDirectoryRefused();
+    TestSymlinkedDataDirectoryStarts();
 
 #ifndef _WIN32
     TestUnsupportedLockPathTypeRejected();
+    TestLockErrorOtherThanContentionReported();
 #endif
 
 #ifndef _WIN32

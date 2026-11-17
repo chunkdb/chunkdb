@@ -251,6 +251,7 @@ A failing run uploads the crash inputs as an artifact.
 
 To keep a crash as a regression, fix the bug and copy the input to `fuzz/regression/NAME/`.
 Every normal test build replays those files and the generated seeds through the same entry points without libFuzzer (`ctest -R fuzz_replay`).
+The same build requires the positive chunk form seeds to decode (`ctest -R fuzz_seed_check`), so they keep reaching the section decoders.
 Reproduce a finding with `build/fuzz/fuzz/bin/chunkdb_fuzz_NAME PATH_TO_INPUT`.
 
 ## Checked documentation examples

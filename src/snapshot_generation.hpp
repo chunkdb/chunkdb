@@ -73,6 +73,7 @@ struct ReadOnlyChunkDiskSnapshot {
     bool generation_record_required,
     const ChunkCoord& chunk_coord,
     const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& image_reader,
+    const std::function<std::vector<std::uint8_t>(const std::filesystem::path&)>& txn_intent_reader,
     const std::function<void(
         std::size_t,
         ReadOnlySnapshotArtifact)>& observation,
