@@ -330,7 +330,7 @@ Format/crash tests cover activation before/after each durable decision/publicati
 Verifier tests reject feature ownership contradictions and damaged records without mutating data.
 The implementation gate includes full ctest, MinGW, ASan, TSan, crash and stress jobs plus Go vet/race tests, JS build/tests, CLI tests and independent per-repository reviews.
 
-Linux measurements run only through `~/chunkdb-bench/measure.sh`, under coordinator-reserved windows, with both profiles, paired intervals and that window's noise floor.
+Linux measurements use `chunkdb_budget_compare` with both profiles, paired intervals and the noise floor of the same measurement window; they record the processor, memory, storage, operating system and complete benchmark command.
 Separate budgets measure unused sessions/watches, lexical framing, plain reads versus WITH clauses, ordered-frontier bookkeeping, expanded feed encoding/progress, filters and slot ownership.
 Any per-commit metadata cost is measured separately rather than hidden in an aggregate; feature-off paths keep their existing encoding/locking/worker paths.
-Pass criterion: no relaxed scenario has paired median below −5% with its 95% interval entirely below −5%; absolute results and window provenance accompany each feature.
+Pass criterion: no relaxed scenario has paired median below −5% with its 95% interval entirely below −5%; absolute results and the window ID accompany each feature.
