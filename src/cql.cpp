@@ -1103,7 +1103,7 @@ class Parser {
         }
         if (Accept("restore")) {
             Expect("table");
-            RestoreTable restore{.table = Name("a table name")};
+            RestoreTable restore{.table = Name("a table name"), .path = {}, .name = {}};
             Expect("from");
             const auto& path = Peek();
             if (path.kind != TokenKind::kText)
@@ -1114,7 +1114,7 @@ class Parser {
         }
         if (Accept("swap")) {
             Expect("tables");
-            SwapTables swap{.first = Name("a table name")};
+            SwapTables swap{.first = Name("a table name"), .second = {}};
             ExpectToken(TokenKind::kComma, "a comma");
             swap.second = Name("a table name");
             return swap;
