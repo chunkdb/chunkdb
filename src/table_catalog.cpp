@@ -1820,15 +1820,19 @@ std::shared_ptr<Table> TableCatalog::Create(
         entry.mapped() = table;
         tables_.insert(std::move(entry));
     }
-    LogMessage(
-        LogLevel::kInfo,
-        LogComponent::kStore,
-        "table created",
-        {
-            {"table", table_name},
-            {"store_id", StoreIdHex(manifest.store_id)},
-            {"geometry", DescribeGeometry(geometry)},
-        });
+    try {
+        LogMessage(
+            LogLevel::kInfo,
+            LogComponent::kStore,
+            "table created",
+            {
+                {"table", table_name},
+                {"store_id", StoreIdHex(manifest.store_id)},
+                {"geometry", DescribeGeometry(geometry)},
+            });
+    } catch (...) {
+        // Logging is best-effort; the table is created and served.
+    }
     return table;
 }
 

@@ -296,6 +296,26 @@ void TestCreateUndoneBeforeItsLog() {
     assert(ReadBits(catalog, "terrain", 1, 1) == "110000011");
 }
 
+// A created table is served before its success is logged: a log line that
+// cannot be written does not turn the CREATE into a failure.
+void TestCreateSucceedsWhenItsLogFails() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-create-log");
+    TableCatalog catalog(Config(dir.path()));
+    std::shared_ptr<chunkdb::Table> created;
+    const auto level = chunkdb::GetLogLevel();
+    chunkdb::SetLogLevel(chunkdb::LogLevel::kInfo);
+    chunkdb::SetLogSinkForTests([](const std::string& line) {
+        if (line.find("table created") != std::string::npos) throw std::bad_alloc();
+    });
+    const auto error = ErrorOf([&] { created = catalog.Create("terrain", kTerrainGeometry, {}); });
+    chunkdb::ResetLogSinkForTests();
+    chunkdb::SetLogLevel(level);
+    assert(error.empty());
+    assert(created != nullptr && catalog.Find("terrain") == created);
+    WriteBits(catalog, "terrain", 1, 1, "110000011");
+    assert(ReadBits(catalog, "terrain", 1, 1) == "110000011");
+}
+
 void TestDrop() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-drop");
     {
@@ -1323,6 +1343,7 @@ int main(int argc, char** argv) {
     TestCreateUndoneWhenNotDurable();
     TestCreateUndoneWhenNotServed();
     TestCreateUndoneBeforeItsLog();
+    TestCreateSucceedsWhenItsLogFails();
     TestDrop();
     TestDropWaitsForRunningCommands();
     TestAcquireDuringDropWaitsThenFails();
