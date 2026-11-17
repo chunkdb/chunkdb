@@ -176,6 +176,7 @@ An empty page can advance across an empty region, and the response-byte bound ca
 A populated chunk that cannot fit an otherwise empty page ends the page before it, so the next page starts at that chunk.
 As a page's first cell, or in a plain area, it is refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=x,y[,z] required=n limit=n`.
 `required` is the size of a reply holding only that chunk; read it with GET CHUNK or fewer COLUMNS, then continue AFTER its coordinate.
+A server started with `--max-area-response-bytes` of at least `required` returns that chunk in GET AREA.
 Independent pages can observe intervening writes; pages inside a transaction share its snapshot and private writes.
 
 An empty page still provides a continuation when requested cells remain:

@@ -293,6 +293,26 @@ void VisitRefuses(ChunkStore& store, bool three, std::int64_t last, ChunkCoord a
     assert(thrown && populated.empty());
 }
 
+// A visitor that refuses an empty first cell gets a generic range error: only
+// a populated chunk is reported as an area entry too large.
+void VisitRefusesEmpty(ChunkStore& store, bool three, std::int64_t last, ChunkCoord after) {
+    const ChunkAreaSelector selector{.dims = static_cast<std::uint8_t>(three ? 3U : 2U), .first = {0, 0, 0},
+        .last = {last, 0, 0}};
+    bool empty_cell = false;
+    bool generic = false;
+    try {
+        (void)store.VisitChunkArea(selector, after, 1U,
+            [&](const ChunkCoord&, std::optional<ChunkRangeEntry>&& entry, bool) {
+                empty_cell = !entry.has_value();
+                return false;
+            });
+    } catch (const AreaEntryTooLargeError&) {
+    } catch (const std::out_of_range&) {
+        generic = true;
+    }
+    assert(empty_cell && generic);
+}
+
 // A chunk with large variable values cannot fit an otherwise empty page. A
 // page ends before it, the next page is refused with its coordinate and size,
 // and the client continues AFTER it.
@@ -342,6 +362,7 @@ void OversizeEntryInPage(bool three) {
     assert(page.has_more && page.after == At(1) && populated == (std::vector{At(0), At(1)}));
     VisitRefuses(store, three, 4, At(1), 5U, fits, At(2));
     VisitRefuses(store, three, 4, At(1), 1U, fits, At(2));
+    VisitRefusesEmpty(store, three, 4, At(3));
     populated.clear();
     page = Visit(store, three, 4, At(2), 5U, fits, &populated);
     assert(!page.has_more && !page.after && populated == std::vector{At(3)});

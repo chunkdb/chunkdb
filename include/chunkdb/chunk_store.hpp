@@ -689,7 +689,8 @@ class ChunkStore {
 
     // Visits requested cells, including empty cells; the caller owns encoding.
     // A false result leaves that cell beyond the returned continuation cursor;
-    // for the page's first visited cell it throws AreaEntryTooLargeError.
+    // for the page's first visited cell it throws AreaEntryTooLargeError when
+    // that cell is populated, and std::out_of_range when it is empty.
     // txn_read.covered records observed candidates; publish it only after a
     // complete successful reply, including when the last candidate was refused.
     [[nodiscard]] ChunkAreaPage VisitChunkArea(
