@@ -22,7 +22,7 @@ Changing a table's durability mode first flushes its pending batches; the new mo
 
 A checkpoint writes a same-directory temporary image, closes it with error checking, and atomically replaces the image.
 In synced modes the image and directory entry are synced before deleting the WAL it replaces.
-Relaxed mode preserves this durability floor once a FLUSH WAL starts its syncs and conservatively after reopening an initialized store.
+Relaxed mode preserves this durability floor once a FLUSH WAL or a slot pass, including the first pass at CREATE SLOT, starts its syncs, and conservatively after reopening an initialized store.
 Consequently a later checkpoint cannot discard an earlier barrier's durable state.
 
 Empty-chunk collection persists an empty-state frame where needed, removes the image before the WAL, and syncs these steps when durability requires it.

@@ -295,8 +295,15 @@ void PassCoversPausedBoundary() {
 // A pass syncs what it drained without the publish lock, so a write and the
 // checkpoint it triggers finish while the pass still waits for its syncs. That
 // checkpoint is strict: the archive it publishes is synced, and the frontier
-// the pass persists covers only what the pass captured.
+// the pass persists covers only what the pass captured. On Windows the pass
+// keeps the publish lock through its syncs, so the checkpoint waits for them
+// and publishes after the pass with the same results.
 void CheckpointDoesNotWaitForPassSyncs() {
+#ifdef _WIN32
+    constexpr bool kPublishesDuringSyncs = false;
+#else
+    constexpr bool kPublishesDuringSyncs = true;
+#endif
     ScopedTempDir directory("chunkdb-feed-slots-unlocked-syncs");
     TableCatalog catalog(Configuration(directory.path()));
     (void)feed_test::CreateDefault(catalog);
@@ -318,20 +325,28 @@ void CheckpointDoesNotWaitForPassSyncs() {
         auto lease = table->Acquire();
         auto& store = lease->store();
         const auto before = store.CheckpointPublishesDuringBarrierSyncsForTests();
+        if constexpr (!kPublishesDuringSyncs) store.ArmCheckpointPublishAttemptForTests();
         auto checkpoint = std::async(std::launch::async, [&] {
             store.SetBlockBits(0, 0, Bits(2U));
             store.CheckpointForTests(0, 0);
         });
-        // The pass stays paused before its syncs until the checkpoint ends.
+        if constexpr (!kPublishesDuringSyncs) {
+            // The checkpoint reaches publication and waits for the paused pass.
+            assert(store.WaitForCheckpointPublishAttemptForTests());
+            assert(checkpoint.wait_for(0s) == std::future_status::timeout);
+            pause.Release();
+        }
+        // Outside Windows the pass stays paused before its syncs until the checkpoint ends.
         assert(checkpoint.wait_for(10s) == std::future_status::ready);
         checkpoint.get();
         later = store.GetChunkVersion(0, 0);
         publishes = store.CheckpointPublishesDuringBarrierSyncsForTests() - before;
-        // The checkpoint synced the WAL before archiving it; the pass has not synced yet.
+        // The WAL was synced before the checkpoint archived it: by the
+        // checkpoint outside Windows, where the pass has not synced yet.
         archived_synced = synced.Contains(wal);
     }
-    assert(later > captured && publishes == 1U && archived_synced);
-    pause.Release();
+    assert(later > captured && publishes == (kPublishesDuringSyncs ? 1U : 0U) && archived_synced);
+    if constexpr (kPublishesDuringSyncs) pause.Release();
     pass.join();
     FeedSlotTestAccess::SetHook(*table, nullptr);
     assert(Archives(directory.path()) == 1U && !std::filesystem::exists(wal));
