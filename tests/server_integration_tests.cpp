@@ -6892,6 +6892,28 @@ void TestUnwatchRestartsIdleDeadline(bool slot) {
     assert(Clock::now() - unwatched >= kIdle);
 }
 
+// A connection that UNWATCH returned is listed as idle, not as watching.
+void TestUnwatchListsIdle() {
+    ReturnedReadHook hook(2U); // Outlives the server. Replies: HELLO, WATCH.
+    ServerHarness harness("unwatch-lists-idle", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    RawClient target("127.0.0.1", harness.port); target.SetReadDeadline(std::chrono::seconds(15));
+    target.SendLine("HELLO 3");
+    const auto id = std::stoull(ReadHelloReply(target).at("connection_id"));
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    target.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(target)).empty());
+    target.SendLine("UNWATCH"); assert(target.ReadLine() == "+OK\r\n");
+    assert(hook.WaitRead());
+    RawClient controller("127.0.0.1", harness.port); controller.Hello();
+    controller.SendLine("SHOW CONNECTIONS");
+    const auto listing = controller.ReadReply();
+    const auto at = listing.find("$2\r\nid\r\n:" + std::to_string(id) + "\r\n");
+    assert(at != std::string::npos);
+    const auto end = listing.find("%5\r\n", at);
+    const auto entry = listing.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    assert(entry.find("$5\r\nstate\r\n$4\r\nidle\r\n") != std::string::npos);
+}
+
 template <class Client>
 void TestWatchLinger(bool tls, bool expires, bool disabled = false, bool slot = false) {
     std::cerr << "LINGER tls=" << tls << " expires=" << expires
@@ -7667,6 +7689,7 @@ void TestFeedWatch() {
     run("TestUnwatchReleaseBeforeReply<RawClient>(false)", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
     run("TestUnwatchRestartsIdleDeadline(false)", [] { TestUnwatchRestartsIdleDeadline(false); });
     run("TestUnwatchRestartsIdleDeadline(true)", [] { TestUnwatchRestartsIdleDeadline(true); });
+    run("TestUnwatchListsIdle", TestUnwatchListsIdle);
 #ifdef CHUNKDB_WITH_OPENSSL
     run("TestUnwatchReleaseBeforeReply<TlsClient>(true)", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
 #endif
