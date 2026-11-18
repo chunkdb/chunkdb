@@ -7694,6 +7694,148 @@ void TestDelayedAuthReplyOutlivesHelloDeadline() {
     assert(banned.WaitForClose(std::chrono::seconds(5)));
 }
 
+// A sustained stream of failed logins from several sources, each failure or
+// ban reply held back by the failed-login delay, runs beside logged-in
+// clients on one worker. Every request of those clients is answered within a
+// bound far below the delay, between every two failures, while every held
+// reply is still pending.
+void TestFailedLoginStreamBesideGoodClients() {
+    ScheduledAuthHook hook;
+    auto engine_cfg = chunkdb::EngineConfig{.require_auth = true, .max_auth_failures = 5};
+    engine_cfg.max_auth_failures_per_ip = 1;
+    engine_cfg.auth_failure_delay_ms = 60000;
+    engine_cfg.auth_failure_ban_ms = 60000;
+    auto server_cfg = ProxyServerConfig(false);
+    server_cfg.worker_threads = 1;
+    server_cfg.client_io_timeout_ms = 30000;
+    ServerHarness harness("failed-login-stream", BaseStoreConfig(), engine_cfg, server_cfg);
+    constexpr std::size_t kGoodClients = 4U, kSources = 4U, kAttempts = 6U, kRequestsPerRound = 16U;
+    constexpr std::size_t kMinRequests = 200U;
+    constexpr auto kBound = std::chrono::milliseconds(5000);
+    std::vector<std::unique_ptr<RawClient>> good;
+    for (std::size_t i = 0U; i < kGoodClients; ++i) {
+        good.push_back(std::make_unique<RawClient>("127.0.0.1", harness.port));
+        good.back()->SetReadDeadline(std::chrono::seconds(60));
+        good.back()->SendBytes(ProxyV2Header("203.0.113." + std::to_string(i + 1U)));
+        good.back()->Login();
+    }
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+
+    std::mutex progress_mutex;
+    std::condition_variable progress_changed;
+    std::size_t answered = 0U;
+    bool stream_done = false;
+    std::atomic<bool> failed{false};
+    std::string first_error;
+    const auto fail = [&](const std::string& error) {
+        std::lock_guard lock(progress_mutex);
+        if (first_error.empty()) first_error = error;
+        failed.store(true);
+        progress_changed.notify_all();
+    };
+    std::vector<std::thread> threads;
+    for (std::size_t i = 0U; i < kGoodClients; ++i) {
+        threads.emplace_back([&, i] {
+            try {
+                auto& client = *good[i];
+                const auto x = std::to_string(i);
+                for (std::size_t n = 0U; !failed.load(); ++n) {
+                    {
+                        std::lock_guard lock(progress_mutex);
+                        if (stream_done && n >= kMinRequests) return;
+                    }
+                    const auto bits = n % 2U == 0U ? std::string("1000") : std::string("0100");
+                    const std::array<std::pair<std::string, std::string>, 3> requests{{
+                        {"SET BLOCK " + x + " 0 IN default bits = b'" + bits + "'", ":"},
+                        {"GET BLOCK " + x + " 0 FROM default", BitsReply(bits == "1000" ? "\x01" : "\x02")},
+                        {"PING", "+PONG\r\n"}}};
+                    for (const auto& [request, expected] : requests) {
+                        const auto sent = Clock::now();
+                        client.SendLine(request);
+                        std::string reply;
+                        if (!client.ReadLineWithin(kBound, &reply)) {
+                            fail("no reply within the bound to " + request);
+                            return;
+                        }
+                        if (reply.starts_with('*')) {
+                            std::string rest;
+                            if (!client.ReadLineWithin(kBound, &rest) || !client.ReadLineWithin(kBound, &reply)) {
+                                fail("incomplete reply to " + request);
+                                return;
+                            }
+                            reply = "*1\r\n" + rest + reply;
+                        }
+                        if (expected == ":" ? !reply.starts_with(':') : reply != expected) {
+                            fail("unexpected reply to " + request + ": " + reply);
+                            return;
+                        }
+                        if (Clock::now() - sent >= kBound) {
+                            fail("reply past the bound to " + request);
+                            return;
+                        }
+                    }
+                    {
+                        std::lock_guard lock(progress_mutex);
+                        answered += requests.size();
+                    }
+                    progress_changed.notify_all();
+                }
+            } catch (const std::exception& error) {
+                fail(std::string("logged-in client: ") + error.what());
+            }
+        });
+    }
+
+    // Per source, the first login fails and bans the source; the later ones
+    // receive the ban reply. Each reply is held for the whole test.
+    std::vector<std::unique_ptr<RawClient>> rejected;
+    std::size_t scheduled = 0U;
+    try {
+        for (std::size_t attempt = 0U; attempt < kAttempts && !failed.load(); ++attempt) {
+            for (std::size_t source = 0U; source < kSources && !failed.load(); ++source) {
+                auto client = std::make_unique<RawClient>("127.0.0.1", harness.port);
+                client->SetReadDeadline(std::chrono::seconds(10));
+                const auto login = chunkdb::scram::StartClientLogin(kAdminUser, chunkdb::scram::NewNonce());
+                client->SendBytes(ProxyV2Header("198.51.100." + std::to_string(source + 1U)) +
+                    chunkdb::test::HelloUserBytes(login, kAdminUser));
+                if (attempt == 0U) {
+                    const auto challenge = client->ReadLine();
+                    assert(challenge.starts_with("+SCRAM "));
+                    client->SendBytes(chunkdb::test::WrongAuthBytes(challenge));
+                }
+                hook.Wait(++scheduled);
+                rejected.push_back(std::move(client));
+                // The logged-in clients make progress before the next failure.
+                std::size_t before = 0U;
+                {
+                    std::lock_guard lock(progress_mutex);
+                    before = answered;
+                }
+                std::unique_lock lock(progress_mutex);
+                if (!progress_changed.wait_for(lock, std::chrono::seconds(30),
+                        [&] { return failed.load() || answered >= before + kRequestsPerRound; })) {
+                    if (first_error.empty()) first_error = "no progress beside held login replies";
+                    failed.store(true);
+                }
+            }
+        }
+    } catch (const std::exception& error) {
+        fail(std::string("failed-login stream: ") + error.what());
+    }
+    {
+        std::lock_guard lock(progress_mutex);
+        stream_done = true;
+    }
+    progress_changed.notify_all();
+    for (auto& thread : threads) thread.join();
+    if (!first_error.empty()) throw std::runtime_error(first_error);
+    assert(scheduled == kSources * kAttempts && answered >= kGoodClients * kMinRequests);
+    // The first and the last held replies are both still pending.
+    std::string held;
+    assert(!rejected.front()->ReadLineWithin(std::chrono::milliseconds(1), &held));
+    assert(!rejected.back()->ReadLineWithin(std::chrono::milliseconds(1), &held));
+}
+
 std::string ReadText(const std::filesystem::path& path) {
     std::ifstream in(path, std::ios::binary);
     return std::string(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
@@ -8066,6 +8208,7 @@ int main(int argc, char** argv) {
         run("TestProxyProtocolSourceAddress", TestProxyProtocolSourceAddress);
         run("TestDelayedAuthRepliesDoNotOccupyWorkers", TestDelayedAuthRepliesDoNotOccupyWorkers);
         run("TestDelayedAuthReplyOutlivesHelloDeadline", TestDelayedAuthReplyOutlivesHelloDeadline);
+        run("TestFailedLoginStreamBesideGoodClients", TestFailedLoginStreamBesideGoodClients);
         run("TestProxyProtocolRefusesBadHeaders", TestProxyProtocolRefusesBadHeaders);
         run("TestProxyProtocolOffIgnoresHeaders", TestProxyProtocolOffIgnoresHeaders);
 #ifdef CHUNKDB_WITH_OPENSSL
