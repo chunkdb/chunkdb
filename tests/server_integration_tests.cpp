@@ -6836,6 +6836,84 @@ void TestUnwatchReleaseBeforeReply(bool tls) {
     reader.SendLine("PING"); assert(reader.ReadLine() == "+PONG\r\n");
 }
 
+// Signals the first read of the I/O thread on the connection UNWATCH returned,
+// the connection that has written `replies` replies.
+class ReturnedReadHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    explicit ReturnedReadHook(std::size_t replies) : replies_(replies) {}
+    void Run(Point point, std::size_t value) override {
+        std::lock_guard lock(mutex_);
+        if (point == Point::kBeforeReturnClient) returning_ = true;
+        else if (point == Point::kAfterClientRead && returning_ && value == replies_) read_ = true;
+        else return;
+        changed_.notify_all();
+    }
+    bool WaitRead() {
+        std::unique_lock lock(mutex_);
+        return changed_.wait_for(lock, std::chrono::seconds(10), [&] { return read_; });
+    }
+  private:
+    const std::size_t replies_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool returning_ = false, read_ = false;
+};
+
+// A watch held past the idle timeout: the idle interval of the connection
+// starts when UNWATCH is answered, and still closes it after that.
+void TestUnwatchRestartsIdleDeadline(bool slot) {
+    using Clock = std::chrono::steady_clock;
+    ReturnedReadHook hook(slot ? 4U : 2U); // Outlives the server. Replies: HELLO, CREATE SLOT twice, WATCH.
+    constexpr auto kIdle = std::chrono::milliseconds(1000);
+    auto config = BaseServerConfig();
+    config.idle_connection_timeout_ms = static_cast<std::size_t>(kIdle.count());
+    config.feed_progress_ms = 60000U; // No progress frame precedes the UNWATCH reply.
+    ServerHarness harness(slot ? "unwatch-idle-slot" : "unwatch-idle-plain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient kept("127.0.0.1", harness.port); kept.SetReadDeadline(std::chrono::seconds(15)); kept.Hello();
+    RawClient idle("127.0.0.1", harness.port); idle.SetReadDeadline(std::chrono::seconds(15)); idle.Hello();
+    if (slot) {
+        kept.SendLine("CREATE SLOT 'kept' ON default"); assert(kept.ReadLine() == "+OK\r\n");
+        kept.SendLine("CREATE SLOT 'idle' ON default"); assert(kept.ReadLine() == "+OK\r\n");
+    }
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    kept.SendLine(slot ? "WATCH default SLOT 'kept'" : "WATCH default"); assert(!FeedStart(ReadFeedReply(kept)).empty());
+    idle.SendLine(slot ? "WATCH default SLOT 'idle'" : "WATCH default"); assert(!FeedStart(ReadFeedReply(idle)).empty());
+    // Each WATCH reply set an idle deadline before it was read; both pass here.
+    std::this_thread::sleep_until(Clock::now() + kIdle + std::chrono::milliseconds(100));
+    kept.SendLine("UNWATCH"); assert(kept.ReadLine() == "+OK\r\n");
+    // The I/O thread has read the returned connection once and found no request.
+    assert(hook.WaitRead());
+    kept.SendLine("PING"); assert(kept.ReadLine() == "+PONG\r\n");
+    if (slot) { kept.SendLine("DROP SLOT 'kept' ON default"); assert(kept.ReadLine() == "+OK\r\n"); }
+    const auto unwatched = Clock::now();
+    idle.SendLine("UNWATCH"); assert(idle.ReadLine() == "+OK\r\n");
+    assert(idle.WaitForClose(std::chrono::seconds(10)));
+    assert(Clock::now() - unwatched >= kIdle);
+}
+
+// A connection that UNWATCH returned is listed as idle, not as watching.
+void TestUnwatchListsIdle() {
+    ReturnedReadHook hook(2U); // Outlives the server. Replies: HELLO, WATCH.
+    ServerHarness harness("unwatch-lists-idle", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    RawClient target("127.0.0.1", harness.port); target.SetReadDeadline(std::chrono::seconds(15));
+    target.SendLine("HELLO 3");
+    const auto id = std::stoull(ReadHelloReply(target).at("connection_id"));
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    target.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(target)).empty());
+    target.SendLine("UNWATCH"); assert(target.ReadLine() == "+OK\r\n");
+    assert(hook.WaitRead());
+    RawClient controller("127.0.0.1", harness.port); controller.Hello();
+    controller.SendLine("SHOW CONNECTIONS");
+    const auto listing = controller.ReadReply();
+    const auto at = listing.find("$2\r\nid\r\n:" + std::to_string(id) + "\r\n");
+    assert(at != std::string::npos);
+    const auto end = listing.find("%5\r\n", at);
+    const auto entry = listing.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    assert(entry.find("$5\r\nstate\r\n$4\r\nidle\r\n") != std::string::npos);
+}
+
 template <class Client>
 void TestWatchLinger(bool tls, bool expires, bool disabled = false, bool slot = false) {
     std::cerr << "LINGER tls=" << tls << " expires=" << expires
@@ -7609,6 +7687,9 @@ void TestFeedWatch() {
 #endif
     run("TestStopWaitingWorker", TestStopWaitingWorker);
     run("TestUnwatchReleaseBeforeReply<RawClient>(false)", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
+    run("TestUnwatchRestartsIdleDeadline(false)", [] { TestUnwatchRestartsIdleDeadline(false); });
+    run("TestUnwatchRestartsIdleDeadline(true)", [] { TestUnwatchRestartsIdleDeadline(true); });
+    run("TestUnwatchListsIdle", TestUnwatchListsIdle);
 #ifdef CHUNKDB_WITH_OPENSSL
     run("TestUnwatchReleaseBeforeReply<TlsClient>(true)", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
 #endif
@@ -8232,6 +8313,8 @@ int main(int argc, char** argv) {
         run("TestLingerFailureFenceFalse", [] { TestLingerFailureFence(false); });
         run("TestLingerFailureFenceTrue", [] { TestLingerFailureFence(true); });
         run("TestUnwatchReleaseBeforeReply", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
+        run("TestUnwatchRestartsIdleDeadline", [] { TestUnwatchRestartsIdleDeadline(false); });
+        run("TestUnwatchRestartsIdleDeadlineSlot", [] { TestUnwatchRestartsIdleDeadline(true); });
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestUnwatchReleaseBeforeReplyTls", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
 #endif
