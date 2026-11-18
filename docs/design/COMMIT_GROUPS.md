@@ -203,4 +203,5 @@ The ordinary-write error matrix independently exercises version-clock reservatio
 Failed deletes and whole-chunk writes are reopened to verify the previous values, existence, producing identity and feed frontier.
 `chunkdb_verify` admits the directory journal and certified inventory, resolves every referenced complete group and validates all member or checkpoint proofs without changing files.
 The verifier refuses missing synced members, conflicting decisions, invalid certified cuts and unadmitted grouped frames rather than validating each table in isolation.
+In this build `chunkdb_verify` only reports owner files as unclaimed; an internal check admits an owner, its selections and its journal as records, without member frames, rollback bases or synced-member presence ([coordinator](COMMIT_GROUP_COORDINATOR.md#verification)).
 Snapshot-vector bookkeeping has its own cost scenario, and the ordinary single-chunk hot-path budgets remain merge gates.

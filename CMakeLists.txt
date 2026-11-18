@@ -444,7 +444,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME feed_chunk_model_3d COMMAND chunkdb_feed_chunk_model_test --3d)
     set_tests_properties(cql_chunk_model_3d feed_chunk_model_3d PROPERTIES TIMEOUT 60 LABELS "smoke")
 
-    foreach(verifier IN ITEMS verify_index verify_memory chunk_model_persistence_3d)
+    foreach(verifier IN ITEMS verify_index verify_memory chunk_model_persistence_3d commit_group_verify)
         add_executable(chunkdb_${verifier}_test tests/${verifier}_tests.cpp)
         target_link_libraries(chunkdb_${verifier}_test PRIVATE chunkdb_tools)
         target_include_directories(chunkdb_${verifier}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1140,6 +1140,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_ordinary_write_failure_test
         chunkdb_commit_group_journal_test
         chunkdb_commit_group_coordinator_test
+        chunkdb_commit_group_verify_test
         chunkdb_commit_group_owner_format_test
         chunkdb_commit_owner_artifact_io_test
         chunkdb_chunk_file_header_test

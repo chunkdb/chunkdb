@@ -40,3 +40,13 @@ It reads both tree roots and refuses any nonempty tree, because the child, value
 It reads the journal inventory, pins the journal generation it names, reads the ID inventory against that context and refuses any retained ID entry, because entries are not bound to decisions yet.
 It scans the pinned generation once against the inventory with the ID cursor and the reference cursor, then checks the selections and the zero counter owner.
 Journal records are admitted only as records: member frames, rollback bases and synced-member presence are not checked in this build.
+
+## Verification
+
+`chunkdb_verify` reports `chunkdb.groups.owner`, `chunkdb.groups.objects` and `chunkdb.groups.journal` in a data directory or table as the warning `group_owner_unclaimed`, because no manifest can claim commit groups in this build.
+The internal `VerifyCommitGroupOwner` checks an owner for a supplied scope without changing files; nothing reaches it from the command line until the feature registers.
+A missing root is the error `group_owner_missing`, and an unreadable, foreign or non-generation-one INACTIVE root is the error `group_owner_invalid`.
+An INACTIVE root gets no further checks, because staged objects and journal generations under it are not admitted.
+A PENDING root is the warning `group_owner_pending`.
+For an ACTIVE root, any refusal of the selection is the error `group_journal_invalid` at the journal leaf once the inventory names it, else at the object directory.
+A tail above the cut is the warning `group_journal_tail`, and the info `group_journal` gives the generation, the certified bytes and the uncertified record count.

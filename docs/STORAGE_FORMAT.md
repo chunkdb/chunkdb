@@ -635,7 +635,7 @@ Empty-chunk collection records the empty state when needed, removes the image be
 
 Explicit present-zero blocks are not collected.
 Temporary files use `<target>.tmp.<pid>.<thread>.<clock>.<sequence>` names; writer recovery cleans recognized unpublished artifacts, while read-only opening and verification do not modify them.
-`chunkdb_verify` checks manifests, bookkeeping, intents, images/WALs, archives/slots, migrations, and backup records without repairing them.
+`chunkdb_verify` checks manifests, bookkeeping, intents, images/WALs, archives/slots, migrations, and backup records without repairing them, and reports commit group owner files that no enabled feature claims as `group_owner_unclaimed` warnings.
 Its exit status is 0 without warnings/errors, 1 with warnings/errors, and 2 for invalid arguments or an unreadable target.
 
 Findings carry stable codes and relative paths.
