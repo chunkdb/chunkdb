@@ -708,6 +708,28 @@ void TestAreaStatements() {
         " 0 FROM world"), "INVALID_ARGUMENT");
 }
 
+// Paged GET AREA in a transaction resumes AFTER a cursor at its snapshot: a
+// chunk another session emptied in between is still returned as it was.
+void TestPagedAreaInTransactionAfterEmptyingWrite() {
+    Fixture f;
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN world id = 1"));
+    (void)VersionOf(f.Run("SET BLOCK 4 0 IN world id = 2"));
+    const std::string kept = f.Run("GET CHUNK 1 0 FROM world");
+    const std::string emptied_entry = "*3\r\n:1\r\n:0\r\n" + kept;
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    const std::string first = f.Run("GET AREA 0 0 TO 2 0 FROM world LIMIT 1");
+    assert(first.starts_with("%3\r\n$6\r\nchunks\r\n*1\r\n*3\r\n:0\r\n:0\r\n$"));
+    assert(first.ends_with("$4\r\nmore\r\n#t\r\n$5\r\nafter\r\n*2\r\n:0\r\n:0\r\n"));
+    chunkdb::SessionState writer;
+    ExpectReply(f.engine->Execute(writer, "HELLO 3\r\n").substr(0, 5), "%14\r\n");
+    assert(VersionOf(f.engine->Execute(writer, "DELETE BLOCK 4 0 FROM world\r\n")) > 0);
+    ExpectReply(f.Run("GET AREA 0 0 TO 2 0 FROM world AFTER 0 0 LIMIT 2"),
+        "%3\r\n$6\r\nchunks\r\n*1\r\n" + emptied_entry + "$4\r\nmore\r\n#f\r\n$5\r\nafter\r\n_\r\n");
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+    ExpectReply(f.Run("GET AREA 0 0 TO 2 0 FROM world AFTER 0 0 LIMIT 2"),
+        "%3\r\n$6\r\nchunks\r\n*0\r\n$4\r\nmore\r\n#f\r\n$5\r\nafter\r\n_\r\n");
+}
+
 // After a restart, area reads take chunks from the files without loading
 // them: the same form, version and values as a chunk read.
 void TestAreaFromFiles() {
@@ -1125,6 +1147,7 @@ int main(int argc, char** argv) {
     TestDistinctLargeMaximumParameters();
     TestChunkStatements();
     TestAreaStatements();
+    TestPagedAreaInTransactionAfterEmptyingWrite();
     TestAreaFromFiles();
     TestTableStatements();
     TestColumnTypeBeforeDefault();

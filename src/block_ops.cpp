@@ -209,6 +209,7 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     // Still under the chunk's lock, so no read sees the new state without
     // the kept one.
     if (keep != nullptr && !keep->node.empty()) {
+        txn_history_->PauseForTests(TxnPausePoint::kWriteAfterMembership);
         if (replaced_payload != nullptr) {
             TxnHistory::FillPayload(keep->node, std::move(*replaced_payload), std::move(*replaced_presence));
         }
