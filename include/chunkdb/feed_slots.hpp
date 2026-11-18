@@ -38,6 +38,8 @@ struct FeedSlot {
     std::vector<std::optional<std::string>> column_names{};
     // The next watch starts with resync: a restore or SWAP TABLES moved the slot.
     bool resync = false;
+    // Filled by a table listing: a watch holds the slot.
+    bool attached = false;
 };
 
 class FeedSlotFiltersError : public std::invalid_argument {

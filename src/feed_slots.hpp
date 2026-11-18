@@ -61,6 +61,8 @@ class FeedSlots {
     bool FlushAcks(bool force, std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
     [[nodiscard]] std::vector<FeedSlot> List(bool include_lost = false) const;
     [[nodiscard]] FeedSlot Get(std::string_view name) const;
+    // Slots, lost ones included.
+    [[nodiscard]] std::size_t size() const;
     [[nodiscard]] FeedArchiveReader Reader(FeedPosition after);
     [[nodiscard]] FeedArchiveReader ReaderCompletedPrefix(std::string_view slot_name, FeedPosition after);
     [[nodiscard]] FeedWalPrefixIndex& prefix_index() noexcept { return prefix_index_; }

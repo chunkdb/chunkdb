@@ -228,6 +228,8 @@ struct DropSlot {
 };
 struct ShowSlots {
     std::optional<std::string> table;
+    // Only slots whose names start with it.
+    std::optional<std::string> prefix{};
 };
 struct Describe {
     std::string table;

@@ -762,7 +762,8 @@ void TestReadOnlyNextToWriter(const std::string& binary) {
     assert(Command(reader.port(), "SHOW METRICS").find("chunkdb_") != std::string::npos);
     assert(Command(reader.port(), "SHOW SLOTS") == "*0\r\n");
     assert(Command(reader.port(), "SHOW MIGRATIONS") == "*0\r\n");
-    assert(Command(reader.port(), "SHOW STATUS").rfind("%3\r\n$9\r\ndirectory\r\n", 0) == 0);
+    assert(Command(reader.port(), "SHOW STATUS").rfind("%8\r\n$7\r\nversion\r\n", 0) == 0 &&
+        Command(reader.port(), "SHOW STATUS").find("$9\r\nread_only\r\n#t\r\n$5\r\nstate\r\n$2\r\nok\r\n") != std::string::npos);
     // A reader cannot establish the writer's completed frontier.
     assert(Command(reader.port(), "DESCRIBE default").find("$8\r\nrevision\r\n_\r\n") != std::string::npos);
     ExpectReadOnlyRefusals(reader.port());

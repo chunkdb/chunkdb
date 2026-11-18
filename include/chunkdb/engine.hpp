@@ -361,6 +361,8 @@ class CommandEngine {
     EngineConfig config_;
     std::shared_ptr<TableCatalog> catalog_;
     std::shared_ptr<MetricsRegistry> metrics_;
+    // SHOW STATUS reports the time since.
+    const std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
     std::mutex auth_failures_mutex_;
     std::unordered_map<std::string, IpAuthFailureState> auth_failures_by_ip_;
     // The open transactions and their bytes.

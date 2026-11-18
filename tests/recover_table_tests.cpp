@@ -131,6 +131,13 @@ void WhileFenced(Engine& e, const std::string& state) {
     assert(e.Run("SET BLOCK 1 1 IN other v=6").front() == ':');
     assert(e.Run("GET BLOCK 0 0 FROM other").find(":5\r\n") != std::string::npos);
     assert(e.Run("SHOW TABLES").find("realm") != std::string::npos);
+    // SHOW STATUS names it with its reason, while the other table serves.
+    const auto status = e.Run("SHOW STATUS");
+    assert(status.rfind("%8\r\n", 0U) == 0U && status.find("$5\r\nstate\r\n$2\r\nok\r\n$6\r\nreason\r\n_\r\n$9\r\ndirectory\r\n") != std::string::npos);
+    assert(status.find("$4\r\nname\r\n$5\r\nrealm\r\n$5\r\nstate\r\n$6\r\nfenced\r\n$6\r\nreason\r\n$") != std::string::npos);
+    assert(status.find("$4\r\nname\r\n$5\r\nother\r\n$5\r\nstate\r\n$2\r\nok\r\n$6\r\nreason\r\n_\r\n$7\r\nenabled\r\n") != std::string::npos);
+    // A table whose store is not open has no features to report.
+    assert((status.find("$7\r\nenabled\r\n_\r\n") != std::string::npos) == (state != "durability" && state != "snapshot"));
     const auto describe = e.Run("DESCRIBE realm");
     if (state == "create") assert(describe.rfind(fenced, 0U) == 0U);
     else {

@@ -145,9 +145,18 @@ struct TableInfo {
     TableSchema chunk_schema{};
 };
 
+struct CatalogTableStatus {
+    std::string name;
+    // std::nullopt for a fenced table whose store is not open.
+    std::optional<FeatureFlags> features;
+    // Why the table is fenced; std::nullopt while it serves.
+    std::optional<std::string> fence;
+};
+
 struct CatalogFeatureStatus {
     FeatureFlags directory;
-    std::vector<std::pair<std::string, FeatureFlags>> tables;
+    // Every table, fenced ones included, by name.
+    std::vector<CatalogTableStatus> tables;
     bool activation_pending = false;
 };
 
@@ -245,6 +254,13 @@ class Table : public std::enable_shared_from_this<Table> {
         std::optional<std::string> owner = std::nullopt, bool owner_given = false);
     void DropFeedSlot(std::string_view name, bool if_exists = false);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(bool include_lost = false);
+    struct FeedCounts {
+        std::size_t slots = 0U;
+        std::size_t watches = 0U;
+    };
+    // Durable slots, lost ones included, and open watches, slot watches
+    // included, under `lease`, a lease of this table.
+    [[nodiscard]] FeedCounts CountFeeds(const Lease& lease) const;
     [[nodiscard]] std::vector<std::uint32_t> ResolveFeedColumns(const std::vector<std::string>& names);
     // Monotonic, in this epoch, and no higher than the durable frontier. The
     // streaming layer must additionally check its last revision sent.
@@ -532,6 +548,9 @@ class TableCatalog {
     // failure is rethrown afterwards.
     [[nodiscard]] bool EnableFeature(std::string_view name);
     [[nodiscard]] CatalogFeatureStatus FeatureStatus();
+    // Why every table is closed until a restart recovers the catalog, or
+    // null while it serves; FeatureStatus and leases then refuse.
+    [[nodiscard]] const char* RecoveryRequired() const noexcept { return migration_health_->FailureMessage(); }
     void WalBarrier();
     [[nodiscard]] BackupResult BackupTo(const std::filesystem::path& target, const BackupOptions& options);
     // Copies one table of a completed backup into a private directory, gives

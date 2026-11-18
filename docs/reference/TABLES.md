@@ -125,6 +125,7 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 - SWAP TABLES: `OK` once each name serves the other table.
 - SHOW TABLES: accessible table names, fenced tables included.
 - DESCRIBE: schema version, column definitions, geometry, options, table epoch, completed revision, dimensions, and chunk columns; a fenced table adds `fenced` with its reason.
+- SHOW STATUS: `version`, the `server_version` HELLO reports, `uptime_ms` since the server started, `read_only`, server `state` and `reason`, `directory` features, `tables`, and `activation_pending`; each table has `name`, `state`, `reason`, `enabled`, `compat`, `ro_compat`, and `incompat`.
 
 The `version` field describes the schema; `revision` describes the completed commit frontier within `epoch`.
 The frontier can include terminal gaps from abandoned reservations and recovery.
@@ -202,7 +203,9 @@ See [Server flags](../SERVER_FLAGS.md#table-geometry).
 ## Feature activation
 
 `SHOW STATUS` requires ADMIN on `*` and reports recorded directory and table features.
-Its protected snapshot refuses unhealthy serving state instead of guessing whether activation completed.
+A table's `state` is `ok`, or `fenced` with the fence reason; a fenced table whose store is not open has null features.
+After a migration or activation whose completion failed, the server `state` is `recovery_required` with the reason, every table is `fenced` with it, and features and `activation_pending` are null instead of guessed; only a restart recovers it.
+SHOW STATUS still answers then, while other statements refuse.
 `ENABLE FEATURE 'name'` requires the same right and returns OK for an already enabled feature.
 
 New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, `feature_activation`, and `chunk_model`.

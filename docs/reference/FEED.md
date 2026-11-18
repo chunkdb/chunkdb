@@ -21,7 +21,10 @@ OK
   name = consumer
   epoch = <epoch>
   acked = 0
+  revision = 0
+  lag_revisions = 0
   retained_bytes = 0
+  attached = false
   lost = false
   lost_reason = NULL
   filters:
@@ -86,7 +89,7 @@ OK
 ```text
 CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [OWNER user]
 DROP SLOT [IF EXISTS] 'name' ON table
-SHOW SLOTS [ON table]
+SHOW SLOTS [ON table] [PREFIX 'name']
 WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [AFTER epoch revision] [ACK TIMEOUT ms] [TAKEOVER]
 ACK revision
 UNWATCH
@@ -100,6 +103,7 @@ UNWATCH
 - `NO BEFORE`: omit previous block and chunk-metadata rows from mutation events.
 - `CHUNKS`: receive each relevant committed chunk's version and whole form instead of block changes.
 - `OWNER`: the user the slot belongs to; it defaults to the user running CREATE SLOT, and the user need not exist yet.
+- `PREFIX`: list only slots whose names start with this quoted text, which follows the slot-name rule.
 - `epoch`: the table's identity; dropping and recreating a table changes it.
 - `revision`: a position increasing with committed changes; gaps are allowed.
 - `AFTER`: resume after this position; it does not acknowledge anything.
@@ -112,7 +116,7 @@ UNWATCH
 ## Returns
 
 - CREATE and DROP SLOT: `OK`, including authorized conditional no-ops.
-- SHOW SLOTS: visible table, name, epoch, saved `acked` revision, retained bytes, lost state, filters, loss reason, and owner; the owner is shown to that user and to MANAGES USERS, and is null otherwise; a table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
+- SHOW SLOTS: visible table, name, epoch, saved `acked` revision, `revision`, `lag_revisions`, retained bytes, `attached`, lost state, loss reason, filters, and owner; the owner is shown to that user and to MANAGES USERS, and is null otherwise; a table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
 - WATCH: start position, followed by change or chunks, schema, progress, or resync events.
 - ACK: no success reply; it is accepted only inside a slot watch.
 - UNWATCH: `OK` after the last push; ordinary statements can then resume.
@@ -145,6 +149,10 @@ Conditional slot creation preserves an existing position, owner and lost state w
 WATCH inherits omitted slot filters and rejects supplied filters that differ.
 A dropped projected column makes the slot lost with `reason=schema_filter`.
 SHOW SLOTS preserves its IDs and uses null for names that no longer exist.
+SHOW SLOTS `revision` is the durable revision recorded for the table's slots, which slot delivery never passes; it advances with each durable frontier pass (`--slot-sync-ms`).
+`lag_revisions` is how far `acked` is below `revision`, counted in revision numbers, gaps included.
+`retained_bytes` is the history the slot keeps after `acked`: how many bytes its consumer is behind.
+`attached` is true while a watch holds the slot; another WATCH ... SLOT then answers SLOT_BUSY unless it uses TAKEOVER.
 
 Conditional removal still checks rights and requires an existing table.
 Change events contain complete before and after metadata rows when chunk columns change.

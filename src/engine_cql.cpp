@@ -5,12 +5,14 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -418,6 +420,43 @@ std::optional<std::string> SlotOwner(const cql::CreateSlot& create, bool require
         ApplyTableOption(&update, option.name, text);
     }
     return update;
+}
+
+struct FileUsage {
+    std::uint64_t files = 0U;
+    std::uint64_t bytes = 0U;
+};
+
+// SHOW TABLE STATS: the regular files under a table's directory and their
+// sizes. A file or directory removed during the walk is not counted; any
+// other error fails the statement.
+[[nodiscard]] FileUsage DirectoryUsage(const std::filesystem::path& root) {
+    namespace fs = std::filesystem;
+    const auto gone = [](const std::error_code& error) { return error == std::errc::no_such_file_or_directory; };
+    FileUsage usage;
+    std::vector<fs::path> pending{root};
+    while (!pending.empty()) {
+        const fs::path dir = std::move(pending.back());
+        pending.pop_back();
+        std::error_code error;
+        fs::directory_iterator it(dir, error);
+        if (error && (dir == root || !gone(error))) throw fs::filesystem_error("cannot list table files", dir, error);
+        for (const fs::directory_iterator end{}; !error && it != end; it.increment(error)) {
+            const auto status = it->symlink_status(error);
+            if (!error && fs::is_directory(status)) pending.push_back(it->path());
+            if (!error && fs::is_regular_file(status)) {
+                const auto size = fs::file_size(it->path(), error);
+                if (!error) {
+                    ++usage.files;
+                    usage.bytes += size;
+                }
+            }
+            if (error && !gone(error)) throw fs::filesystem_error("cannot read table files", it->path(), error);
+            error.clear();
+        }
+        if (error && !gone(error)) throw fs::filesystem_error("cannot list table files", dir, error);
+    }
+    return usage;
 }
 
 // The value a column's encoded DEFAULT holds.
@@ -981,7 +1020,8 @@ std::string CommandEngine::ExecuteStatement(
         if (info != nullptr) {
             DescribeStatement(parsed.statement, *info);
         }
-        catalog_->migration_health()->Check();
+        // SHOW STATUS reports that state instead of refusing.
+        if (!std::holds_alternative<cql::ShowStatus>(parsed.statement)) catalog_->migration_health()->Check();
         if (parameters.size() != parsed.parameters) {
             return Protocol::Error(
                 "PROTOCOL",
@@ -1221,7 +1261,8 @@ std::string CommandEngine::ExecuteStatement(
                         const auto table = catalog_->Require(name);
                         if (auto* hook = hook_.load(std::memory_order_acquire))
                             hook->Run(CommandEngineTestHook::Point::kBeforeSlotTableList, name);
-                        for (auto& slot : table->ListFeedSlots(true)) slots.emplace_back(name, std::move(slot));
+                        for (auto& slot : table->ListFeedSlots(true))
+                            if (!show.prefix || slot.name.starts_with(*show.prefix)) slots.emplace_back(name, std::move(slot));
                     };
                     if (show.table) {
                         RequireRight(session, *show.table, Right::kRead);
@@ -1248,7 +1289,7 @@ std::string CommandEngine::ExecuteStatement(
                     const bool show_owners = !config_.require_auth || (viewer != nullptr && viewer->manages_users);
                     Protocol::AppendArrayHeader(reply, slots.size());
                     for (const auto& [name, slot] : slots) {
-                        Protocol::AppendMapHeader(reply, 9);
+                        Protocol::AppendMapHeader(reply, 12);
                         Protocol::AppendBulk(reply, "table");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "name");
@@ -1257,8 +1298,15 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendBulk(reply, StoreIdHex(slot.position.epoch));
                         Protocol::AppendBulk(reply, "acked");
                         Protocol::AppendInteger(reply, slot.position.revision);
+                        // A slot delivers up to the durable revision its records hold.
+                        Protocol::AppendBulk(reply, "revision");
+                        Protocol::AppendInteger(reply, slot.durable_watermark);
+                        Protocol::AppendBulk(reply, "lag_revisions");
+                        Protocol::AppendInteger(reply, slot.durable_watermark > slot.position.revision ? slot.durable_watermark - slot.position.revision : 0U);
                         Protocol::AppendBulk(reply, "retained_bytes");
                         Protocol::AppendInteger(reply, slot.retained_bytes);
+                        Protocol::AppendBulk(reply, "attached");
+                        Protocol::AppendBoolean(reply, slot.attached);
                         Protocol::AppendBulk(reply, "lost");
                         reply += slot.lost ? "#t\r\n" : "#f\r\n";
                         Protocol::AppendBulk(reply, "lost_reason");
@@ -1767,8 +1815,10 @@ std::string CommandEngine::ExecuteStatement(
                     RequireRight(session, stats.table, Right::kRead);
                     const auto lease = AcquireNamedTable(session, stats.table);
                     auto& store = lease.store();
+                    const auto feeds = session.table->CountFeeds(lease);
+                    const auto files = DirectoryUsage(store.data_dir());
                     std::string reply;
-                    Protocol::AppendMapHeader(reply, 5U);
+                    Protocol::AppendMapHeader(reply, 11U);
                     Protocol::AppendBulk(reply, "epoch");
                     Protocol::AppendBulk(reply, StoreIdHex(store.store_id()));
                     Protocol::AppendBulk(reply, "revision");
@@ -1776,10 +1826,22 @@ std::string CommandEngine::ExecuteStatement(
                     else Protocol::AppendNull(reply);
                     Protocol::AppendBulk(reply, "dims");
                     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(store.geometry().dims()));
+                    Protocol::AppendBulk(reply, "chunks");
+                    Protocol::AppendInteger(reply, store.PopulatedChunkCount());
                     Protocol::AppendBulk(reply, "tombstones");
                     Protocol::AppendInteger(reply, store.RetainedTombstoneCount());
                     Protocol::AppendBulk(reply, "retained_deletion_floor");
                     Protocol::AppendInteger(reply, store.RetainedDeletionFloor());
+                    Protocol::AppendBulk(reply, "loaded_chunks");
+                    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(store.ApproxLoadedChunkCount()));
+                    Protocol::AppendBulk(reply, "files");
+                    Protocol::AppendInteger(reply, files.files);
+                    Protocol::AppendBulk(reply, "disk_bytes");
+                    Protocol::AppendInteger(reply, files.bytes);
+                    Protocol::AppendBulk(reply, "slots");
+                    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(feeds.slots));
+                    Protocol::AppendBulk(reply, "watches");
+                    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(feeds.watches));
                     return reply;
                 },
                 [&](const cql::ShowTables&) {
@@ -2100,8 +2162,46 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::ShowStatus&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRightOnEveryTable(session, Right::kAdmin);
-                    const auto status = catalog_->FeatureStatus();
                     std::string reply;
+                    const auto uptime = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_);
+                    const auto server = [&](const char* recovery) {
+                        Protocol::AppendBulk(reply, "version"); Protocol::AppendBulk(reply, config_.server_version);
+                        Protocol::AppendBulk(reply, "uptime_ms"); Protocol::AppendInteger(reply, static_cast<std::uint64_t>(uptime.count()));
+                        Protocol::AppendBulk(reply, "read_only"); Protocol::AppendBoolean(reply, catalog_->access_mode() == AccessMode::kReadOnly);
+                        Protocol::AppendBulk(reply, "state"); Protocol::AppendBulk(reply, recovery != nullptr ? "recovery_required" : "ok");
+                        Protocol::AppendBulk(reply, "reason");
+                        if (recovery != nullptr) Protocol::AppendBulk(reply, recovery); else Protocol::AppendNull(reply);
+                    };
+                    const auto table_state = [&](const std::string& name, const std::optional<std::string>& fence) {
+                        Protocol::AppendBulk(reply, "name"); Protocol::AppendBulk(reply, name);
+                        Protocol::AppendBulk(reply, "state"); Protocol::AppendBulk(reply, fence ? "fenced" : "ok");
+                        Protocol::AppendBulk(reply, "reason");
+                        if (fence) Protocol::AppendBulk(reply, *fence); else Protocol::AppendNull(reply);
+                    };
+                    const auto no_flags = [&] {
+                        for (const char* key : {"enabled", "compat", "ro_compat", "incompat"}) {
+                            Protocol::AppendBulk(reply, key); Protocol::AppendNull(reply);
+                        }
+                    };
+                    if (const char* recovery = catalog_->RecoveryRequired()) {
+                        // Every table refuses until a restart; features are not
+                        // read, since activation may be half applied.
+                        std::set<std::string> names;
+                        for (const auto& info : catalog_->List()) names.insert(info.name);
+                        for (const auto& fence : catalog_->Fences()) names.insert(fence.table);
+                        Protocol::AppendMapHeader(reply, 8U);
+                        server(recovery);
+                        Protocol::AppendBulk(reply, "directory"); Protocol::AppendNull(reply);
+                        Protocol::AppendBulk(reply, "tables"); Protocol::AppendArrayHeader(reply, names.size());
+                        for (const auto& name : names) {
+                            Protocol::AppendMapHeader(reply, 7U);
+                            table_state(name, std::string(recovery));
+                            no_flags();
+                        }
+                        Protocol::AppendBulk(reply, "activation_pending"); Protocol::AppendNull(reply);
+                        return reply;
+                    }
+                    const auto status = catalog_->FeatureStatus();
                     const auto flags = [&](const FeatureFlags& value) {
                         Protocol::AppendBulk(reply, "enabled");
                         std::size_t count = 0U;
@@ -2114,12 +2214,14 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendBulk(reply, "ro_compat"); Protocol::AppendInteger(reply, static_cast<std::uint64_t>(value.ro_compat));
                         Protocol::AppendBulk(reply, "incompat"); Protocol::AppendInteger(reply, static_cast<std::uint64_t>(value.incompat));
                     };
-                    Protocol::AppendMapHeader(reply, 3U);
+                    Protocol::AppendMapHeader(reply, 8U);
+                    server(nullptr);
                     Protocol::AppendBulk(reply, "directory"); Protocol::AppendMapHeader(reply, 4U); flags(status.directory);
                     Protocol::AppendBulk(reply, "tables"); Protocol::AppendArrayHeader(reply, status.tables.size());
-                    for (const auto& [name, features] : status.tables) {
-                        Protocol::AppendMapHeader(reply, 5U);
-                        Protocol::AppendBulk(reply, "name"); Protocol::AppendBulk(reply, name); flags(features);
+                    for (const auto& table : status.tables) {
+                        Protocol::AppendMapHeader(reply, 7U);
+                        table_state(table.name, table.fence);
+                        if (table.features) flags(*table.features); else no_flags();
                     }
                     Protocol::AppendBulk(reply, "activation_pending"); Protocol::AppendBoolean(reply, status.activation_pending);
                     return reply;
