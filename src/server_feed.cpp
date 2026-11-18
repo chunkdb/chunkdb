@@ -716,6 +716,10 @@ void ChunkServer::ReturnClient(std::shared_ptr<ServerConnection> connection) {
     connection->watch_slot = false;
     watch_count_.fetch_sub(1);
     connection->phase = ServerConnection::Phase::kInput;
+    // UNWATCH was answered just now: the connection is idle from here, not
+    // from the WATCH reply, whose idle deadline a long watch has passed.
+    connection->idle_deadline = std::chrono::steady_clock::now() +
+        std::chrono::milliseconds(config_.idle_connection_timeout_ms);
     connection->read_ready = true;
     if (ParkClient(connection)) return;
     CloseClient(*connection);
