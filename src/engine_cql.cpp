@@ -1898,6 +1898,14 @@ std::string CommandEngine::ExecuteStatement(
                     std::stop_callback shutdown(session.backup_cancelled, request_stop);
                     std::stop_callback statement(StatementStopToken(), request_stop);
                     request.cancelled = cancelled.get_token();
+                    // SHOW CONNECTIONS lists the copy's progress.
+                    request.progress = [&](std::uint64_t files, std::uint64_t bytes, std::uint64_t total_files,
+                                           std::uint64_t total_bytes) {
+                        ReportStatementProgress({.files_done = files, .files_total = total_files,
+                            .bytes_done = bytes, .bytes_total = total_bytes});
+                        if (auto* hook = hook_.load(std::memory_order_acquire))
+                            hook->Run(CommandEngineTestHook::Point::kAfterRestoreProgress, restore.name);
+                    };
                     const auto result = catalog_->RestoreTable(request);
                     std::string reply;
                     Protocol::AppendMapHeader(reply, 6);
