@@ -106,7 +106,7 @@ UNWATCH
 - `TAKEOVER`: replace the slot's watcher after publishing its accepted ACK and closing its connection.
   The owner replacing its own watch needs READ; replacing another user additionally needs ADMIN on `*`.
 - `ACK TIMEOUT`: positive milliseconds for a slot watch; closes the connection when its oldest fully sent, unacknowledged mutation expires.
-- `SLOT`: retain history for this named consumer across restarts; only one watcher can hold a slot at a time.
+- `SLOT`: retain history for this named consumer across restarts; only one watcher can hold a slot at a time. After RESTORE TABLE, an offline restore or SWAP TABLES, its next watch without AFTER starts with resync until you acknowledge a later revision.
   Its owner needs READ; another user also needs ADMIN on `*`, with or without AFTER or TAKEOVER, for as long as the watch lasts.
 
 ## Returns
@@ -155,6 +155,7 @@ After ordinary UNWATCH, the subscription is removed and its configured history l
 
 Slot delivery stops at the durable frontier, including in relaxed mode.
 ACK persistence is asynchronous; UNWATCH persists that watch's eligible ACK before returning.
+When a slot watch ends after losing access or exceeding an ACK or output deadline, its claim is released before the terminal reply or socket closure; reconnecting does not wait for background watch cleanup.
 After a crash, changes can repeat.
 Store the applied position atomically with your own output to prevent duplicate effects.
 

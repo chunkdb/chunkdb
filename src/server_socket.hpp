@@ -43,7 +43,7 @@ struct ConnectionTermination {
 using PhaseDeadline = std::optional<std::chrono::steady_clock::time_point>;
 
 extern std::atomic<std::size_t> g_test_send_timeout_config_failures;
-extern std::atomic<std::size_t> g_test_recv_timeout_config_failures;
+extern std::atomic<std::size_t> g_test_nonblocking_config_failures;
 extern std::atomic<std::uint64_t> g_test_recv_timeout_config_calls;
 
 enum class SocketWaitResult {

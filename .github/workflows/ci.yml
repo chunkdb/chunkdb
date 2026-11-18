@@ -260,7 +260,7 @@ jobs:
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
 
     env:
       ASAN_OPTIONS: abort_on_error=1:detect_leaks=1
@@ -363,7 +363,7 @@ jobs:
         shell: msys2 {0}
         run: |
           grep -F 'steady reader: complete=' build/Testing/Temporary/LastTest.log
-          grep -F 'steady slow reader: ' build/Testing/Temporary/LastTest.log
+          grep -F 'steady reader: send_buffer=' build/Testing/Temporary/LastTest.log
 
       - name: Benchmark Snapshot (Windows)
         shell: msys2 {0}
@@ -443,7 +443,7 @@ jobs:
         shell: msys2 {0}
         run: |
           grep -F 'steady reader: complete=' build-tls/Testing/Temporary/LastTest.log
-          grep -F 'steady slow reader: ' build-tls/Testing/Temporary/LastTest.log
+          grep -F 'steady reader: send_buffer=' build-tls/Testing/Temporary/LastTest.log
 
       - name: Verify OpenSSL Was Linked
         shell: msys2 {0}

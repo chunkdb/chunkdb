@@ -16,13 +16,14 @@ class Input {
         }
         return true;
     }
-    bool Body(std::string& body, std::size_t size) {
-        body.clear();
-        while (body.size() < size) {
-            (void)pending_.extract_bytes(size - body.size(), &body);
-            if (body.size() == size) return true;
+    bool Frames(const chunkdb::server_detail::ParameterFrameRules& rules,
+                std::vector<std::optional<std::string>>* parameters, bool* total_exceeded) {
+        chunkdb::server_detail::ParameterFrameDecoder decoder(rules);
+        while (!decoder.Consume(pending_, 65536U)) {
             if (!Fill()) return false;
         }
+        *total_exceeded = decoder.total_exceeded();
+        *parameters = decoder.TakeParameters();
         return true;
     }
   private:
@@ -54,11 +55,7 @@ void Parse(std::string_view bytes, std::size_t fragment) {
         bool total_exceeded = false;
         const chunkdb::server_detail::ParameterFrameRules rules{
             .frame_count = limits.size(), .limits = limits, .total_limit = 128U};
-        std::string rejection;
-        if (!chunkdb::server_detail::ReadParameterFrames(rules, &parameters,
-                [&](std::string& out) { return input.Line(out); },
-                [&](std::string& out, std::size_t count) { return input.Body(out, count); },
-                &total_exceeded, &rejection) || total_exceeded) return;
+        if (!input.Frames(rules, &parameters, &total_exceeded) || total_exceeded) return;
         if (parameters.empty() || !parameters.front()) continue;
         if (hello) (void)chunkdb::scram::ParseClientFirst(*parameters.front());
         if (auth) {

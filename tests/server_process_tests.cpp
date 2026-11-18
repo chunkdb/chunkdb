@@ -461,6 +461,28 @@ void TestQueryLimitFlags(const std::string& binary) {
     assert(Command(server.port(), "GET AREA 0 0 TO 1 0 FROM t") == "*0\r\n");
 }
 
+// --statement-timeout-ms takes 0 (off, the default) through 86400000, and
+// HELLO without the option reports the flag's value as the session's
+// statement timeout.
+void TestStatementTimeoutFlag(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-statement-timeout");
+    const auto log = dir.path() / "server.log";
+    assert(StartupFailure(binary, log, {"--help"}, 0).find("--statement-timeout-ms") != std::string::npos);
+    const auto data = dir.path() / "refused";
+    for (const char* value : {"-1", "+1", "1s", "", "86400001", "18446744073709551616"}) {
+        const auto error = StartupFailure(binary, log, {"--data-dir", data.string(), "--auth", "none",
+                                                        "--statement-timeout-ms", value});
+        assert(error.find("invalid --statement-timeout-ms") != std::string::npos);
+        assert(!std::filesystem::exists(data));
+    }
+    for (const char* value : {"0", "1500", "86400000"}) {
+        ServerProcess server(binary, dir.path() / value, {"--auth", "none", "--statement-timeout-ms", value});
+        std::string hello;
+        assert(Command(server.port(), "PING", &hello) == "+PONG\r\n");
+        assert(hello.find(std::string("$20\r\nstatement_timeout_ms\r\n:") + value + "\r\n") != std::string::npos);
+    }
+}
+
 // SIGHUP reopens the audit log at its path, so a renamed file stops
 // growing (log rotation), and leaves the server running.
 void TestAuditLogReopensOnHangup(const std::string& binary) {
@@ -569,20 +591,40 @@ void TestLogAndLimitFlagsAreValidated(const std::string& binary) {
     chunkdb::test::ScopedTempDir dir("chunkdb-process-log-flags");
     const auto log = dir.path() / "server.log";
     const auto data = dir.path() / "data";
+    {
+        // 0 turns the handshake limit off: one address holds more workers
+        // before HELLO than the default limit of 64, and a later connection
+        // is still served.
+        ServerProcess server(binary, dir.path() / "no-handshake-limit",
+                             {"--auth", "none", "--workers", "67", "--max-handshakes-per-ip", "0"});
+        std::vector<int> waiting;
+        for (int i = 0; i < 65; ++i) {
+            waiting.push_back(Connect(server.port()));
+            assert(waiting.back() >= 0);
+        }
+        assert(Command(server.port(), "PING") == "+PONG\r\n");
+        for (const int fd : waiting) {
+            close(fd);
+        }
+    }
     for (const auto& [flag, value] : std::vector<std::pair<std::string, std::string>>{
              {"--slow-statement-ms", "-1"}, {"--slow-statement-ms", "86400001"}, {"--slow-statement-ms", "1s"},
              {"--auth-max-failures-per-connection", "0"}, {"--auth-max-failures-per-connection", "1001"},
              {"--auth-ban-failures", "1000001"}, {"--auth-ban-ms", "0"}, {"--auth-ban-ms", "86400001"},
-             {"--proxy-protocol", "v1"}, {"--proxy-protocol", "on"}, {"--audit-log", ""}}) {
+             {"--proxy-protocol", "v1"}, {"--proxy-protocol", "on"}, {"--audit-log", ""},
+             {"--max-handshakes-per-ip", "-1"}, {"--max-handshakes-per-ip", "no"}, {"--max-handshakes-per-ip", "1x"}}) {
         const auto error = StartupFailure(binary, log, {"--data-dir", data.string(), "--auth", "none", flag, value});
         assert(error.find(flag) != std::string::npos);
+        if (flag == "--max-handshakes-per-ip") {
+            assert(error.find("(expected 0 or more)") != std::string::npos);
+        }
     }
     const auto unopenable = StartupFailure(binary, log, {"--data-dir", data.string(), "--auth", "none",
                                                          "--audit-log", (dir.path() / "missing" / "audit.log").string()});
     assert(unopenable.find("audit log") != std::string::npos);
     const auto help = StartupFailure(binary, log, {"--help"}, 0);
     for (const char* flag : {"--audit-log", "--slow-statement-ms", "--auth-max-failures-per-connection",
-                             "--auth-ban-failures", "--auth-ban-ms", "--proxy-protocol"}) {
+                             "--auth-ban-failures", "--auth-ban-ms", "--proxy-protocol", "--max-handshakes-per-ip"}) {
         assert(help.find(flag) != std::string::npos);
     }
     // In range, each starts.
@@ -929,6 +971,7 @@ int main(int argc, char** argv) {
     TestListenWarnings(argv[1]);
     TestFeedLingerFlag(argv[1]);
     TestQueryLimitFlags(argv[1]);
+    TestStatementTimeoutFlag(argv[1]);
     TestRemovedServerFlags(argv[1]);
     TestPersistedUsersIgnoreBootstrap(argv[1]);
     TestLogAndLimitFlagsAreValidated(argv[1]);

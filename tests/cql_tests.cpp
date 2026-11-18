@@ -425,6 +425,14 @@ void TestAlterAndOtherStatements() {
     assert(rekey.verifier.has_value() && !rekey.manages_users.has_value());
     assert(Get<cql::AlterUser>("ALTER USER bot NO MANAGES USERS").manages_users == false);
     assert(Get<cql::AlterUser>("ALTER USER bot MANAGES USERS").manages_users == true);
+    const auto limits = Get<cql::AlterUser>("ALTER USER bot LIMIT max_connections = 18446744073709551615, statements_per_sec = 65536");
+    assert(limits.max_connections == std::numeric_limits<std::uint64_t>::max() && limits.statements_per_sec == 65536U);
+    assert(Get<cql::AlterUser>("ALTER USER bot LIMIT statements_per_sec = 0").statements_per_sec == 0U);
+    for (const auto line : {"ALTER USER bot LIMIT", "ALTER USER bot LIMIT max_connections = -1",
+        "ALTER USER bot LIMIT statements_per_sec = 65537", "ALTER USER bot LIMIT max_connections = 18446744073709551616",
+        "ALTER USER bot LIMIT max_connections = 0, max_connections = 1",
+        "ALTER USER bot LIMIT statements_per_sec = 0, statements_per_sec = 1", "ALTER USER bot LIMIT unknown = 1"})
+        ExpectError(line, "");
     assert(Get<cql::CreateUser>("CREATE USER bot VERIFIER $1 REQUIRE CHANNEL BINDING", 1).requires_channel_binding);
     const auto strict = Get<cql::CreateUser>("CREATE USER bot VERIFIER $1 MANAGES USERS REQUIRE CHANNEL BINDING", 1);
     assert(strict.manages_users && strict.requires_channel_binding && !create.requires_channel_binding);
@@ -520,11 +528,28 @@ void TestBackup() {
     ExpectError("BACKUP TO path", "expected a quoted backup path");
     ExpectError("BACKUP TO $1", "expected a quoted backup path");
     ExpectError("BACKUP TO '/path' extra", "expected the end of the statement");
+    const auto restore = Get<cql::RestoreTable>("RESTORE TABLE world FROM 'snap/it''s' AS world_restored");
+    assert(restore.table == "world" && restore.path == "snap/it's" && restore.name == "world_restored");
+    const auto same = Get<cql::RestoreTable>("restore table world from 'snap'");
+    assert(same.table == "world" && same.path == "snap" && same.name == "world");
+    ExpectError("RESTORE world FROM 'snap'", "expected TABLE");
+    ExpectError("RESTORE TABLE world 'snap'", "expected FROM");
+    ExpectError("RESTORE TABLE world FROM snap", "expected a quoted backup path");
+    ExpectError("RESTORE TABLE world FROM $1", "expected a quoted backup path");
+    ExpectError("RESTORE TABLE world FROM 'snap' AS", "expected a table name");
+    ExpectError("RESTORE TABLE world FROM 'snap' INTO other", "expected the end of the statement");
+    const auto swap = Get<cql::SwapTables>("SWAP TABLES world, world_restored");
+    assert(swap.first == "world" && swap.second == "world_restored");
+    ExpectError("SWAP TABLE world, other", "expected TABLES");
+    ExpectError("SWAP TABLES world other", "expected a comma");
+    ExpectError("SWAP TABLES world,", "expected a table name");
+    ExpectError("SWAP TABLES world, other, third", "expected the end of the statement");
 }
 
 void TestErrors() {
     ExpectError("", "column 1: unknown statement the end of the statement");
-    ExpectError("SELECT * FROM t", "column 1: unknown statement 'SELECT'");
+    ExpectError("SELECT * FROM t", "column 1: unknown statement 'SELECT'; read with GET BLOCK, GET AREA or GET CHUNK");
+    ExpectError("BOGUS", "column 1: unknown statement 'BOGUS'; the CQL reference lists every statement");
     ExpectError("GET ROW 1 2 FROM t", "column 5: expected BLOCK, CHUNK or AREA, got 'ROW'");
     ExpectError("GET BLOCK 1 FROM t", "column 13: expected y, got 'FROM'");
     ExpectError("GET BLOCK 1 2 FROM t extra", "column 22: expected the end of the statement, got 'extra'");
@@ -539,7 +564,7 @@ void TestErrors() {
     ExpectError("SET BLOCK 0 0 IN t a = 1 IF 3", "expected VERSION");
     ExpectError("DROP t", "expected TABLE");
     ExpectError("FLUSH", "expected WAL");
-    ExpectError("SHOW GRANTS", "expected TABLES, METRICS, STATUS, MIGRATIONS, USERS or SLOTS");
+    ExpectError("SHOW GRANTS", "expected TABLES, METRICS, STATUS, CONNECTIONS, MIGRATIONS, USERS or SLOTS");
 }
 
 }  // namespace
@@ -559,6 +584,15 @@ void TestHelloOptions() {
 }
 
 int main() {
+    assert(Get<cql::Cancel>("CANCEL 18446744073709551615").id == UINT64_MAX);
+    assert(Get<cql::KillConnection>("KILL CONNECTION 0").id == 0U);
+    (void)Get<cql::ShowConnections>("SHOW CONNECTIONS");
+    for (const auto* line : {"CANCEL -1", "CANCEL 18446744073709551616", "CANCEL $1", "CANCEL 1 extra",
+                             "KILL 1", "KILL CONNECTION -1", "SHOW CONNECTIONS extra"}) {
+        bool refused = false;
+        try { (void)cql::Parse(line); } catch (const cql::ParseError&) { refused = true; }
+        assert(refused);
+    }
     TestChunkModelCoordinates();
     TestChunkModelSchemaAndWrites();
     TestChunkModelScan();

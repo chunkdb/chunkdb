@@ -3,10 +3,12 @@
 #include <algorithm>
 #include <cctype>
 #include <stdexcept>
+#include <type_traits>
 #include <utility>
 
 #include "file_permissions.hpp"
 #include "chunkdb/logging.hpp"
+#include "checkpoint.hpp"
 
 namespace chunkdb {
 
@@ -51,9 +53,13 @@ UserRegistry::UserRegistry(
     std::filesystem::path data_dir,
     std::optional<std::pair<std::string, scram::Verifier>> first_admin,
     const std::array<std::uint8_t, 32>& secret,
-    bool read_only)
-    : data_dir_(std::filesystem::weakly_canonical(data_dir)), read_only_(read_only) {
+    bool read_only,
+    UserAdmissionClock admission_clock)
+    : data_dir_(std::filesystem::weakly_canonical(data_dir)), read_only_(read_only),
+      admission_clock_(std::move(admission_clock)) {
     const auto users_path = data_dir_ / kUsersFileName;
+    // Refuse unsupported records before changing permissions or bookkeeping.
+    auto existing = ReadUsersFile(data_dir_);
     if (read_only_) {
         if (std::filesystem::exists(users_path) && !FileIsOwnerOnly(users_path)) {
             LogMessage(LogLevel::kWarn, LogComponent::kStore,
@@ -64,9 +70,10 @@ UserRegistry::UserRegistry(
         LogMessage(LogLevel::kInfo, LogComponent::kStore, "restricted users file to owner-only access",
             {{"path", users_path.string()}});
     }
-    if (auto existing = ReadUsersFile(data_dir_); existing.has_value()) {
+    if (existing.has_value()) {
+        if (!read_only_) SyncDirectoryPath(data_dir_);
         users_ = std::move(*existing);
-        InstallLocked(PrepareLocked(users_));
+        Publish(PreparePublication(std::make_shared<const Users>(users_)));
         return;
     }
     if (read_only_) {
@@ -85,43 +92,10 @@ UserRegistry::UserRegistry(
         .manages_users = true,
         .grants = {{kEveryTable, Right::kAdmin}},
     };
-    auto publication = PrepareLocked(created);
+    auto published = PreparePublication(std::make_shared<const Users>(created));
     WriteUsersFile(data_dir_, created);
     users_ = std::move(created);
-    InstallLocked(std::move(publication));
-}
-
-UserRegistry::Publication UserRegistry::PrepareLocked(const Users& next) const {
-    Publication publication{.incarnations = {}, .next_incarnation = next_incarnation_, .rights = nullptr};
-    auto rights = std::make_shared<RightsView>();
-    for (const auto& [name, user] : next.users) {
-        const auto kept = incarnations_.find(name);
-        const std::uint64_t incarnation = kept != incarnations_.end() ? kept->second : publication.next_incarnation++;
-        publication.incarnations.emplace(name, incarnation);
-        rights->users.emplace(name, RightsView::Entry{.incarnation = incarnation, .grants = user.grants});
-    }
-    publication.rights = std::move(rights);
-    return publication;
-}
-
-void UserRegistry::InstallLocked(Publication publication) noexcept {
-    incarnations_ = std::move(publication.incarnations);
-    next_incarnation_ = publication.next_incarnation;
-    // The previous view is freed after the lock, never while a reader waits.
-    std::shared_ptr<const RightsView> previous;
-    {
-        std::lock_guard lock(rights_mutex_);
-        previous = std::exchange(rights_, std::move(publication.rights));
-    }
-}
-
-void UserRegistry::CommitLocked(Users next, Publication publication, Wakes& wakes) noexcept {
-    users_ = std::move(next);
-    InstallLocked(std::move(publication));
-    // The view is published before the generation moves: a reader that sees
-    // the new generation reads a view at least that new.
-    generation_.fetch_add(1, std::memory_order_acq_rel);
-    wakes.changed_ = true;
+    Publish(std::move(published));
 }
 
 UserRegistry::Wakes::~Wakes() {
@@ -152,41 +126,69 @@ void UserRegistry::SetMigrationHealth(std::shared_ptr<MigrationHealth> health) {
     Wakes wakes(this);
     std::lock_guard lock(mutex_);
     health->Check();
+    ConfirmPublication();
     const auto stored = ReadUsersFile(data_dir_);
     if (!stored) throw std::runtime_error("users file disappeared while binding the catalog");
     if (users_ != *stored) {
-        auto publication = PrepareLocked(*stored);
-        CommitLocked(*stored, std::move(publication), wakes);
+        CommitPublication(*stored, PreparePublication(std::make_shared<const Users>(*stored)), wakes);
     }
     migration_health_ = std::move(health);
 }
 
+// Moving what was prepared allocates nothing and cannot throw.
+static_assert(std::is_nothrow_move_assignable_v<Users>);
+static_assert(std::is_nothrow_move_constructible_v<Users>);
+static_assert(std::is_nothrow_move_constructible_v<UserPublication>);
+
+void UserRegistry::CommitPublication(Users next, UserPublication publication, Wakes& wakes) noexcept {
+    users_ = std::move(next);
+    Publish(std::move(publication));
+    // The view is published before the generation moves: a reader that sees
+    // the new generation reads a view at least that new.
+    generation_.fetch_add(1, std::memory_order_acq_rel);
+    wakes.changed_ = true;
+}
+
 std::optional<User> UserRegistry::Find(const std::string& name) const {
-    std::lock_guard lock(mutex_);
-    const auto found = users_.users.find(name);
-    if (found == users_.users.end()) {
+    const auto published = Published();
+    const auto found = published->users.find(name);
+    if (found == published->users.end()) {
         return std::nullopt;
     }
     return found->second;
 }
 
 std::optional<UserRegistry::Incarnated> UserRegistry::FindIncarnation(const std::string& name) const {
-    std::lock_guard lock(mutex_);
-    const auto found = users_.users.find(name);
-    if (found == users_.users.end()) {
-        return std::nullopt;
+    std::shared_ptr<const Users> users;
+    std::uint64_t incarnation = 0U;
+    {
+        std::lock_guard lock(published_mutex_);
+        const auto found = admissions_->find(name);
+        if (found == admissions_->end()) return std::nullopt;
+        incarnation = found->second.state->incarnation;
+        users = published_;
     }
-    return Incarnated{.user = found->second, .incarnation = incarnations_.at(name)};
+    return Incarnated{.user = users->users.at(name), .incarnation = incarnation};
 }
 
 Users UserRegistry::Snapshot() const {
-    std::lock_guard lock(mutex_);
-    return users_;
+    return *Published();
 }
 
 std::array<std::uint8_t, 32> UserRegistry::Secret() const {
-    std::lock_guard lock(mutex_);
-    return users_.secret;
+    return Published()->secret;
+}
+
+std::shared_ptr<const Users> UserRegistry::Published() const {
+    std::lock_guard lock(published_mutex_);
+    return published_;
+}
+
+void UserRegistry::ConfirmPublication() {
+    if (!publication_unknown_) return;
+    try { SyncDirectoryPath(data_dir_); }
+    catch (const std::exception&) { std::rethrow_exception(publication_unknown_); }
+    publication_unknown_ = nullptr;
 }
 
 template <typename Change>
@@ -199,11 +201,25 @@ void UserRegistry::UpdateIf(Change&& change) {
     Wakes wakes(this);
     std::lock_guard lock(mutex_);
     if (migration_health_) migration_health_->Check();
+    ConfirmPublication();
     Users next = users_;
     if (!change(next)) return;
-    auto publication = PrepareLocked(next);
-    WriteUsersFile(data_dir_, next);
-    CommitLocked(std::move(next), std::move(publication), wakes);
+    auto published = PreparePublication(std::make_shared<const Users>(next));
+    // Allocate an exact outcome error before replacement can become visible.
+    std::exception_ptr unknown;
+    try { throw UsersOutcomeUnknownError("users record replacement is visible, but its durability could not be confirmed"); }
+    catch (const UsersOutcomeUnknownError&) { unknown = std::current_exception(); }
+    bool replaced = false;
+    try { WriteUsersFile(data_dir_, next, &replaced); }
+    catch (const std::exception&) {
+        if (!replaced) throw;
+        CommitPublication(std::move(next), std::move(published), wakes);
+        publication_unknown_ = unknown;
+        std::rethrow_exception(unknown);
+    }
+    if (auto* hook = test_hook_.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kBeforeUserPublication, {});
+    CommitPublication(std::move(next), std::move(published), wakes);
 }
 
 template <typename Change>
@@ -240,12 +256,32 @@ void UserRegistry::SetVerifier(const std::string& name, scram::Verifier verifier
 bool UserRegistry::SetOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier) {
     bool current = false;
     UpdateIf([&](Users& users) {
-        const auto found = incarnations_.find(name);
-        current = found != incarnations_.end() && found->second == incarnation;
+        {
+            // admissions_ changes only under mutex_, which UpdateIf holds.
+            std::lock_guard lock(published_mutex_);
+            const auto found = admissions_->find(name);
+            current = found != admissions_->end() && found->second.state->incarnation == incarnation;
+        }
         if (current) Existing(users, name).verifier = std::move(verifier);
         return current;
     });
     return current;
+}
+
+void UserRegistry::SetLimits(const std::string& name, std::optional<std::uint64_t> max_connections,
+    std::optional<std::uint64_t> statements_per_sec) {
+    if (!max_connections && !statements_per_sec) throw std::invalid_argument("LIMIT needs at least one setting");
+    if (statements_per_sec && *statements_per_sec > kMaxUserStatementsPerSecond)
+        throw std::invalid_argument("statements_per_sec must be between 0 and 65536");
+    UpdateIf([&](Users& users) {
+        auto& user = Existing(users, name);
+        const auto connections = max_connections.value_or(user.max_connections);
+        const auto rate = statements_per_sec.value_or(user.statements_per_sec);
+        if (user.max_connections == connections && user.statements_per_sec == rate) return false;
+        user.max_connections = connections;
+        user.statements_per_sec = rate;
+        return true;
+    });
 }
 
 void UserRegistry::SetManagesUsers(const std::string& name, bool manages_users) {

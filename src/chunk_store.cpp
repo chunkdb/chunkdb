@@ -717,6 +717,10 @@ std::uint64_t ChunkStore::WalParentPrepareCountForTests() const noexcept {
     return stats_wal_parent_prepare_calls_.load(std::memory_order_relaxed);
 }
 
+std::uint64_t ChunkStore::ChunkFileProbeCountForTests() const noexcept {
+    return stats_chunk_file_probes_.load(std::memory_order_relaxed);
+}
+
 std::uint64_t ChunkStore::OpenWalStreamCountForTests() const noexcept {
     std::lock_guard lock(resources_->wal_stream_mutex_);
     std::uint64_t open = 0;

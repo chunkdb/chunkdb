@@ -64,7 +64,37 @@ struct Args {
     // Report-only read envelopes and watch delivery variants.
     std::string with_metadata = "none";
     std::string watch_mode = "ordinary";
+    // strict: a resync or a slow drain fails the run (budget comparisons).
+    // measure: resyncs are counted, drains wait while pushes arrive, and the
+    // report lists each watch.
+    std::string watch_delivery = "strict";
+    // measure: the longest wait for a CREATE SLOT reply.
+    std::size_t slot_create_timeout_ms = 600000;
+    // Clients that log in as `user` with a wrong password, one login after
+    // another, from when every measured client has logged in until they all
+    // finish; report-only.
+    std::size_t failed_logins = 0;
     bool show_help = false;
+};
+
+// One watch of a scenario. Revisions can have gaps, so lag counts revisions,
+// not changes.
+struct WatcherResult {
+    std::size_t index = 0;
+    bool slot = false;
+    std::size_t events = 0;
+    std::size_t changes = 0;
+    std::size_t chunks = 0;
+    std::size_t progress = 0;
+    std::size_t other = 0;
+    std::size_t resyncs = 0;
+    std::size_t bytes = 0;
+    // Write frontier minus the watch position when the last write replied.
+    std::uint64_t lag_revisions_at_end = 0;
+    // Time after the last write reply until the watch reached the frontier.
+    double catch_up_s = 0.0;
+    // CREATE SLOT reply time; 0 without a slot.
+    double slot_create_ms = 0.0;
 };
 
 struct ScenarioResult {
@@ -86,6 +116,9 @@ struct ScenarioResult {
     std::size_t watch_chunks = 0;
     std::size_t watch_other = 0;
     double watch_duration_s = 0.0;
+    // Failed-login and ban replies the --failed-logins clients received.
+    std::size_t failed_logins = 0;
+    std::vector<WatcherResult> watchers;
     std::vector<std::pair<std::string, std::size_t>> request_mix;
     double latency_avg_ms = 0.0;
     double latency_min_ms = 0.0;
@@ -124,10 +157,13 @@ struct BenchmarkReport {
     std::string with_metadata = "none";
     std::string watch_mode = "ordinary";
     std::string watch_table;
+    std::string watch_delivery = "strict";
     std::size_t chunk_width_blocks = 0;
     std::size_t chunk_height_blocks = 0;
     // The --watch value; empty without watches.
     std::string watch;
+    // The --failed-logins value.
+    std::size_t failed_login_clients = 0;
     std::vector<ScenarioResult> results;
 };
 

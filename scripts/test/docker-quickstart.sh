@@ -2,19 +2,23 @@
 # Run the named shell fences in QUICK_START and PASSWORD_RESET against an owned
 # Docker fixture. chunkdb_docs_check extracts and rewrites the page commands
 # (unique container, volume, freshly built image, ephemeral loopback port) and
-# redacts commands.log. Every exit path captures the container logs and removes
-# this run's container and volume. Needs bash 4+, docker and GNU timeout.
+# redacts commands.log. With --published the page keeps its published image and
+# its own go install command provides chunk-cli, as on a clean machine. Every
+# exit path captures the container logs and removes this run's container and
+# volume. Needs bash 4+, docker and GNU timeout; --published also needs go.
 set -euo pipefail
 
 usage() {
   cat >&2 <<'EOF'
-usage: docker-quickstart.sh --tool PATH --cli PATH [--page FILE] [--reset-page FILE]
-                            [--image IMAGE] [--logs DIR]
+usage: docker-quickstart.sh --tool PATH (--cli PATH | --published) [--page FILE]
+                            [--reset-page FILE] [--image IMAGE] [--logs DIR]
   --tool        built chunkdb_docs_check
   --cli         built chunk-cli
+  --published   run the page's image and install chunk-cli with the page's
+                go install command; needs go on PATH
   --page        default docs/QUICK_START.md
   --reset-page  default docs/PASSWORD_RESET.md
-  --image       default chunkdb:quickstart-ci
+  --image       default chunkdb:quickstart-ci, or ghcr.io/chunkdb/chunkdb:2 with --published
   --logs        default docker-quickstart-logs (commands.log, checks.json)
 EOF
   exit 2
@@ -24,10 +28,15 @@ tool=""
 cli=""
 page="docs/QUICK_START.md"
 reset_page="docs/PASSWORD_RESET.md"
-image="chunkdb:quickstart-ci"
+image=""
 logs="docker-quickstart-logs"
+published=0
 while (($#)); do
   case "$1" in
+    --published)
+      published=1
+      shift
+      ;;
     --tool | --cli | --page | --reset-page | --image | --logs)
       (($# >= 2)) || usage
       name="${1#--}"
@@ -41,10 +50,21 @@ if [[ -z "$tool" || ! -x "$tool" ]]; then
   echo "docker-quickstart: --tool must name the built chunkdb_docs_check executable" >&2
   usage
 fi
-if [[ -z "$cli" || ! -f "$cli" ]]; then
+if ((published)); then
+  if [[ -n "$cli" ]]; then
+    echo "docker-quickstart: --published installs chunk-cli from the page; omit --cli" >&2
+    usage
+  fi
+  command -v go >/dev/null 2>&1 || {
+    echo "docker-quickstart: --published needs go on PATH" >&2
+    exit 1
+  }
+  image="${image:-ghcr.io/chunkdb/chunkdb:2}"
+elif [[ -z "$cli" || ! -f "$cli" ]]; then
   echo "docker-quickstart: --cli must name the built chunk-cli executable" >&2
   usage
 fi
+image="${image:-chunkdb:quickstart-ci}"
 if command -v timeout >/dev/null 2>&1; then
   timeout_command=timeout
 elif command -v gtimeout >/dev/null 2>&1; then
@@ -70,10 +90,13 @@ watch_open=0
 watch_exit=0
 run_out="$work/output"
 run_status=0
+run_timeout=60
 
 export CHUNKDB_URI='chunk://admin@127.0.0.1:4242/'
-PATH="$(cd "$(dirname "$cli")" && pwd -P):$PATH"
-export PATH
+if ((!published)); then
+  PATH="$(cd "$(dirname "$cli")" && pwd -P):$PATH"
+  export PATH
+fi
 
 fail() {
   error_message="$1"
@@ -123,18 +146,19 @@ query_into() {
 }
 
 # run -c COMMAND | run ARGV...: records the command and its output, sets
-# run_status and leaves the output in $run_out. Status 124 is a timeout.
+# run_status and leaves the output in $run_out. Status 124 is a timeout after
+# run_timeout seconds.
 run() {
   if [[ "$1" == -c ]]; then
     record "\$ $2"
     set +e
-    "$timeout_command" -k 5 60 /bin/bash -c "$2" >"$run_out" 2>&1
+    "$timeout_command" -k 5 "$run_timeout" /bin/bash -c "$2" >"$run_out" 2>&1
     run_status=$?
     set -e
   else
     record "\$ $*"
     set +e
-    "$timeout_command" -k 5 60 "$@" >"$run_out" 2>&1
+    "$timeout_command" -k 5 "$run_timeout" "$@" >"$run_out" 2>&1
     run_status=$?
     set -e
   fi
@@ -147,7 +171,7 @@ run() {
 run_checked() {
   run "$@"
   if ((run_status == 124)); then
-    fail "command timed out after 60 seconds: ${*: -1}"
+    fail "command timed out after $run_timeout seconds: ${*: -1}"
   fi
   if ((run_status != 0)); then
     fail "command failed (see commands.log): $run_status"
@@ -193,6 +217,18 @@ read_file() {
   local _read_target="$1" _read_value
   _read_value="$(cat "$2" && printf x)" || fail "cannot read $2"
   printf -v "$_read_target" '%s' "${_read_value%x}"
+}
+
+# Runs the page's go install command and keeps the PATH it exports.
+install_cli() {
+  local path_file="$work/install-path"
+  run_timeout=600 # A first go install downloads and compiles the module.
+  block install $'\n'"printf %s \"\$PATH\" > $(printf %q "$path_file")"
+  run_timeout=60
+  read_file PATH "$path_file"
+  export PATH
+  rm -f "$path_file"
+  run_checked -c "command -v chunk-cli"
 }
 
 login() {
@@ -380,20 +416,26 @@ trap on_exit EXIT
 trap 'error_message="interrupted"; exit 130' INT
 trap 'error_message="terminated"; exit 143' TERM
 
-[[ "$(basename "$cli")" == chunk-cli ]] || fail "--cli must be named chunk-cli"
-# Extracts all nine blocks and checks the page still names the published image.
+if ((!published)); then
+  [[ "$(basename "$cli")" == chunk-cli ]] || fail "--cli must be named chunk-cli"
+fi
+# Extracts all ten blocks and checks the page still names the published image.
 query --code start >/dev/null || fail "invalid quick-start pages"
 
 fixture_started=1
 block start
 run_checked docker image inspect "$image" --format '{{.Id}}'
-built_image="$(trim "$(<"$run_out")")"
+expected_image="$(trim "$(<"$run_out")")"
 run_checked docker inspect "$container" --format '{{.Image}}'
 running_image="$(trim "$(<"$run_out")")"
-if [[ "$built_image" != "$running_image" ]]; then
-  fail "page started an image other than the freshly built image"
+if [[ "$expected_image" != "$running_image" ]]; then
+  fail "page started an image other than $image"
 fi
 health
+if ((published)); then
+  install_cli
+  passed+=("chunk-cli installed by the page")
+fi
 login login
 passed+=("generated-password login and health")
 

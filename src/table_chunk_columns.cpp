@@ -14,7 +14,7 @@ bool TableCatalog::ChangeChunkColumnsIfNeeded(
     std::string_view name,
     const std::function<std::optional<TableSchema>(const TableSchema&)>& change) {
     RequireWritable("ALTER TABLE");
-    std::shared_lock metadata(feature_metadata_gate_);
+    auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
     {

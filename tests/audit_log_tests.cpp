@@ -205,6 +205,70 @@ void TestChannelBindingEvents() {
                                         "\"error_code\":\"AUTH_REQUIRED\"", "\"reason\":\"channel_binding\""});
 }
 
+// Logins that user admission refuses: one with a right proof whose user's
+// verifier changed and changed back between HELLO and AUTH, and one past
+// the user's connection limit.
+void TestAdmissionLoginEvents() {
+    Engine e;
+    auto admin = e.Admin(40);
+    const std::string verifier = Verifier("pw");
+    assert(e.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{verifier}) == "+OK\r\n");
+    auto stale = e.Session(41);
+    const auto login = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce());
+    const auto first = e.Run(stale, chunkdb::test::HelloUserLine("bot"), Parameters{login.first});
+    assert(first.rfind("+SCRAM ", 0) == 0);
+    const auto final = chunkdb::scram::FinishClientLogin(login, "pw", first.substr(7, first.size() - 9));
+    assert(e.Run(admin, "ALTER USER bot VERIFIER $1", Parameters{Verifier("other")}) == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot VERIFIER $1", Parameters{verifier}) == "+OK\r\n");
+    assert(e.Run(stale, "AUTH $1", Parameters{final.message}).rfind("-ERR AUTH_FAILED reason=stale_login ", 0) == 0);
+    assert(e.Run(admin, "ALTER USER bot LIMIT max_connections = 1") == "+OK\r\n");
+    auto holding = e.Session(42);
+    assert(e.Login(holding, "bot", std::string("pw")).rfind("%", 0) == 0);
+    auto limited = e.Session(43);
+    assert(e.Login(limited, "bot", std::string("pw")).rfind("-ERR RATE_LIMITED reason=max_connections ", 0) == 0);
+
+    const auto lines = Lines(e.audit_path);
+    LineWith(lines, {"\"event\":\"login\"", "\"connection\":41", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"stale_login\""});
+    LineWith(lines, {"\"event\":\"login\"", "\"connection\":43", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"RATE_LIMITED\"", "\"reason\":\"max_connections\""});
+}
+
+// Logins whose user changes between HELLO and AUTH: the reason is the one the
+// user gives as of AUTH.
+void TestCredentialsChangedDuringLoginEvents() {
+    Engine e;
+    auto admin = e.Admin(40);
+    const std::string password = "bot-private-password";
+    const std::string verifier = Verifier(password);
+    assert(e.Run(admin, "CREATE USER bot VERIFIER $1", {verifier}) == "+OK\r\n");
+    // HELLO on connection `id`, then `change` from the admin, then AUTH with
+    // the password that was right at HELLO.
+    const auto login_around = [&](std::uint64_t id, const std::string& change, const Parameters& parameters) {
+        auto session = e.Session(id);
+        const auto login = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce());
+        const auto first = e.Run(session, chunkdb::test::HelloUserLine("bot"), Parameters{login.first});
+        assert(first.rfind("+SCRAM ", 0) == 0);
+        assert(e.Run(admin, change, parameters) == "+OK\r\n");
+        const auto final_message =
+            chunkdb::scram::FinishClientLogin(login, password, chunkdb::test::ServerFirstOf(first));
+        assert(e.Run(session, "AUTH $1", Parameters{final_message.message}).rfind("-ERR AUTH_FAILED", 0) == 0);
+    };
+    login_around(41, "ALTER USER bot REQUIRE CHANNEL BINDING", {});
+    assert(e.Run(admin, "ALTER USER bot NO REQUIRE CHANNEL BINDING") == "+OK\r\n");
+    login_around(42, "ALTER USER bot VERIFIER $1", {Verifier("bot-other-password")});
+    assert(e.Run(admin, "ALTER USER bot VERIFIER $1", {verifier}) == "+OK\r\n");
+    login_around(43, "DROP USER bot", {});
+
+    const auto lines = Lines(e.audit_path);
+    LineWith(lines, {"\"event\":\"login\"", "\"connection\":41", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"channel_binding_required\""});
+    LineWith(lines, {"\"event\":\"login\"", "\"connection\":42", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"wrong_password\""});
+    LineWith(lines, {"\"event\":\"login\"", "\"connection\":43", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"unknown_user\""});
+}
+
 // Every audited statement, with the names it acts on, and a failure with its
 // code; reads and writes of blocks are not audited.
 void TestStatementEvents() {
@@ -274,6 +338,26 @@ void TestDroppedUserEvents() {
     assert(bot.close_after_reply);
     LineWith(Lines(e.audit_path), {"\"event\":\"create_table\"", "\"connection\":4", "\"user\":\"bot\"",
                                    "\"ok\":false", "\"error_code\":\"AUTH_REQUIRED\""});
+}
+
+// ENABLE FEATURE is audited when it succeeds (here a feature a new directory
+// already records) and when it is refused, without the right or with an
+// unknown name.
+void TestEnableFeatureEvents() {
+    Engine e;
+    auto admin = e.Admin(5);
+    assert(e.Run(admin, "CREATE USER bot VERIFIER $1", {Verifier("bot-password")}) == "+OK\r\n");
+    assert(e.Run(admin, "ENABLE FEATURE 'feed_slots'") == "+OK\r\n");
+    assert(e.Run(admin, "ENABLE FEATURE 'no_such_feature'").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+    auto bot = e.Session(6);
+    assert(e.Login(bot, "bot", std::string("bot-password")).rfind("%", 0) == 0);
+    assert(e.Run(bot, "ENABLE FEATURE 'feed_slots'").rfind("-ERR PERMISSION_DENIED", 0) == 0);
+    const auto lines = Lines(e.audit_path);
+    LineWith(lines, {"\"event\":\"enable_feature\"", "\"connection\":5", "\"user\":\"admin\"", "\"ok\":true"});
+    LineWith(lines, {"\"event\":\"enable_feature\"", "\"connection\":5", "\"user\":\"admin\"", "\"ok\":false",
+                     "\"error_code\":\"INVALID_ARGUMENT\""});
+    LineWith(lines, {"\"event\":\"enable_feature\"", "\"connection\":6", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"PERMISSION_DENIED\""});
 }
 
 // The file is private, and Reopen (SIGHUP) moves later lines to a new file
@@ -458,10 +542,27 @@ void TestLoginLimits() {
 }  // namespace
 
 int main() {
+    {
+        Engine e;
+        auto session = e.Admin(42U);
+        auto callbacks = std::make_shared<chunkdb::SessionControlCallbacks>();
+        callbacks->cancel = [](const auto&, auto) { return true; };
+        callbacks->kill = [](const auto&, auto) { return false; };
+        session.connection_controls = callbacks;
+        assert(e.Run(session, "CANCEL 18446744073709551615").find("#t") != std::string::npos);
+        assert(e.Run(session, "KILL CONNECTION 10").find("#f") != std::string::npos);
+        const auto lines = Lines(e.audit_path);
+        (void)LineWith(lines, {"\"event\":\"cancel\"", "\"target_connection\":18446744073709551615", "\"connection\":42", "\"ok\":true"});
+        (void)LineWith(lines, {"\"event\":\"kill_connection\"", "\"target_connection\":10", "\"ok\":true"});
+        assert(!Contains(ReadAll(e.audit_path), kPassword));
+    }
     TestLoginEvents();
     TestChannelBindingEvents();
+    TestAdmissionLoginEvents();
+    TestCredentialsChangedDuringLoginEvents();
     TestStatementEvents();
     TestDroppedUserEvents();
+    TestEnableFeatureEvents();
     TestFileAndReopen();
     TestJsonEscaping();
     TestInvalidUserNames();

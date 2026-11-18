@@ -259,15 +259,210 @@ void SetChunkMeetsConfiguredWrittenLimitBeforeDecoding() {
     assert(f.Run("GET BLOCK 2 0 FROM t") == "*1\r\n:6\r\n");
 }
 
-void LargestGeometryProjection() {
+std::string Cell(std::int64_t x, bool three) { return std::to_string(x) + " 0" + (three ? " 0" : ""); }
+ChunkCoord At(std::int64_t x) { return {x, 0, 0}; }
+std::string Refusal(std::int64_t x, bool three, std::size_t required, std::size_t limit) {
+    return "-ERR OUT_OF_RANGE reason=area_entry_too_large chunk=" + std::to_string(x) + (three ? ",0,0" : ",0") +
+        " required=" + std::to_string(required) + " limit=" + std::to_string(limit) + " ";
+}
+
+// Visits a page at the store, refusing entries that `fits` rejects.
+template <typename Fits>
+ChunkAreaPage Visit(ChunkStore& store, bool three, std::int64_t last, std::optional<ChunkCoord> after,
+    std::size_t limit, Fits fits, std::vector<ChunkCoord>* populated) {
+    const ChunkAreaSelector selector{.dims = static_cast<std::uint8_t>(three ? 3U : 2U), .first = {0, 0, 0},
+        .last = {last, 0, 0}};
+    return store.VisitChunkArea(selector, after, limit,
+        [&](const ChunkCoord& coord, std::optional<ChunkRangeEntry>&& entry, bool) {
+            if (entry && !fits(*entry)) return false;
+            if (entry) populated->push_back(coord);
+            return true;
+        });
+}
+
+template <typename Fits>
+void VisitRefuses(ChunkStore& store, bool three, std::int64_t last, ChunkCoord after, std::size_t limit,
+    Fits fits, ChunkCoord refused) {
+    std::vector<ChunkCoord> populated;
+    bool thrown = false;
+    try { (void)Visit(store, three, last, after, limit, fits, &populated); }
+    catch (const AreaEntryTooLargeError& error) {
+        thrown = error.coord() == refused && error.dims() == (three ? 3U : 2U) &&
+            error.limit() == store.query_limits().max_area_response_bytes && !error.required();
+    }
+    assert(thrown && populated.empty());
+}
+
+// A visitor that refuses an empty first cell gets a generic range error: only
+// a populated chunk is reported as an area entry too large.
+void VisitRefusesEmpty(ChunkStore& store, bool three, std::int64_t last, ChunkCoord after) {
+    const ChunkAreaSelector selector{.dims = static_cast<std::uint8_t>(three ? 3U : 2U), .first = {0, 0, 0},
+        .last = {last, 0, 0}};
+    bool empty_cell = false;
+    bool generic = false;
+    try {
+        (void)store.VisitChunkArea(selector, after, 1U,
+            [&](const ChunkCoord&, std::optional<ChunkRangeEntry>&& entry, bool) {
+                empty_cell = !entry.has_value();
+                return false;
+            });
+    } catch (const AreaEntryTooLargeError&) {
+    } catch (const std::out_of_range&) {
+        generic = true;
+    }
+    assert(empty_cell && generic);
+}
+
+// A chunk with large variable values cannot fit an otherwise empty page. A
+// page ends before it, the next page is refused with its coordinate and size,
+// and the client continues AFTER it.
+void OversizeEntryInPage(bool three) {
+    const auto dims = static_cast<std::uint8_t>(three ? 3U : 2U);
+    const std::string columns = "v u8 DEFAULT 0, s text(8192) NULL";
+    std::size_t small = 0U;
+    { Fixture wide; wide.Create(three, columns); wide.Write(Cell(0, three)); small = wide.Run("GET CHUNK " + Cell(0, three) + " FROM t").size(); }
+    const auto limit = Expected({{At(0), std::string(small, 'x')}, {At(1), std::string(small, 'x')}}, At(1), dims).size() + 64U;
+    const std::string big(4096, 'b');
+    assert(limit < big.size());
+    Fixture f(QueryLimits{.max_area_response_bytes = limit}); f.Create(three, columns);
+    for (const int x : {0, 1, 3}) f.Write(Cell(x, three));
+    assert(f.Run("SET BLOCK " + Cell(2, three) + " IN t v=3, s='" + big + "'").starts_with(":"));
+    const auto form = [&](int x, std::string_view projection = "") {
+        return f.Run("GET CHUNK " + Cell(x, three) + " FROM t" + std::string(projection));
+    };
+    const auto first = form(0), second = form(1), oversize = form(2), last = form(3);
+    assert(oversize.find(big) != std::string::npos);
+    const auto area = "GET AREA " + Cell(0, three) + " TO " + Cell(4, three) + " FROM t";
+    const auto refusal = Refusal(2, three, Expected({{At(2), oversize}}, At(2), dims).size(), limit);
+
+    assert(f.Run(area + " LIMIT 5") == Expected({{At(0), first}, {At(1), second}}, At(1), dims));
+    const auto refused = f.Run(area + " AFTER " + Cell(1, three) + " LIMIT 5");
+    assert(refused.starts_with(refusal) && refused.find("GET CHUNK") != std::string::npos);
+    assert(f.Run(area + " AFTER " + Cell(1, three) + " LIMIT 1") == refused);
+    assert(f.Run(area + " LIMIT 1") == Expected({{At(0), first}}, At(0), dims));
+    assert(f.Run(area + " AFTER " + Cell(0, three) + " LIMIT 1") == Expected({{At(1), second}}, At(1), dims));
+    assert(f.Run(area + " AFTER " + Cell(2, three) + " LIMIT 1") == Expected({{At(3), last}}, At(3), dims));
+    assert(f.Run(area + " AFTER " + Cell(2, three) + " LIMIT 5") == Expected({{At(3), last}}, {}, dims));
+    assert(f.Run(area + " COLUMNS v AFTER " + Cell(1, three) + " LIMIT 5") ==
+        Expected({{At(2), form(2, " COLUMNS v")}, {At(3), form(3, " COLUMNS v")}}, {}, dims));
+    assert(f.Run(area).starts_with(Refusal(2, three, Expected({{At(2), oversize}}, {}, dims, false).size(), limit)));
+
+    assert(f.Run("BEGIN") == "+OK\r\n");
+    assert(f.Run(area + " LIMIT 5") == Expected({{At(0), first}, {At(1), second}}, At(1), dims));
+    const auto reads = f.session.transaction->read_set;
+    assert(f.Run(area + " AFTER " + Cell(1, three) + " LIMIT 5") == refused);
+    assert(f.session.transaction->read_set == reads);
+    assert(f.Run("ROLLBACK") == "+OK\r\n");
+
+    auto lease = f.catalog->Require("t")->Acquire();
+    auto& store = lease->store();
+    const auto fits = [](const ChunkRangeEntry& entry) { return entry.vars.encoded_size() < 4096U; };
+    std::vector<ChunkCoord> populated;
+    auto page = Visit(store, three, 4, std::nullopt, 5U, fits, &populated);
+    assert(page.has_more && page.after == At(1) && populated == (std::vector{At(0), At(1)}));
+    VisitRefuses(store, three, 4, At(1), 5U, fits, At(2));
+    VisitRefuses(store, three, 4, At(1), 1U, fits, At(2));
+    VisitRefusesEmpty(store, three, 4, At(3));
+    populated.clear();
+    page = Visit(store, three, 4, At(2), 5U, fits, &populated);
+    assert(!page.has_more && !page.after && populated == std::vector{At(3)});
+}
+
+// At the largest chunk geometry one complete chunk exceeds the default
+// response bound: the page before it advances, the chunk is refused with
+// its coordinate, and GET CHUNK or a projection reads it.
+void LargestGeometry(bool three) {
+    const auto dims = static_cast<std::uint8_t>(three ? 3U : 2U);
     Fixture f;
-    assert(f.Run("CREATE TABLE t (v u8, padding bits(504)) CHUNK 1024 x 1024") == "+OK\r\n");
-    f.Write("0 0", 11U);
-    Error(f.Run("GET AREA 0 0 TO 0 0 FROM t"), "OUT_OF_RANGE");
-    Error(f.Run("GET AREA 0 0 TO 0 0 FROM t LIMIT 1"), "OUT_OF_RANGE");
-    const auto form = f.Run("GET CHUNK 0 0 FROM t COLUMNS v");
-    assert(f.Run("GET AREA 0 0 TO 0 0 FROM t COLUMNS v LIMIT 1") == Expected({{{0, 0}, form}}, {}));
-    assert(f.Run("GET BLOCK 0 0 FROM t COLUMNS v") == "*1\r\n:11\r\n");
+    assert(f.Run(std::string("CREATE TABLE t (v u8, padding bits(504)) CHUNK ") +
+        (three ? "128 x 128 x 64" : "1024 x 1024")) == "+OK\r\n");
+    f.Write(three ? "128 0 0" : "1024 0", 11U);
+    const auto budget = QueryLimits{}.max_area_response_bytes;
+    const auto full = f.Run("GET CHUNK " + Cell(1, three) + " FROM t");
+    assert(full.size() > budget);
+    const auto form = f.Run("GET CHUNK " + Cell(1, three) + " FROM t COLUMNS v");
+    const auto area = "GET AREA " + Cell(0, three) + " TO " + Cell(2, three) + " FROM t";
+    assert(f.Run(area).starts_with(Refusal(1, three, Expected({{At(1), full}}, {}, dims, false).size(), budget)));
+    assert(f.Run(area + " LIMIT 3") == Expected({}, At(0), dims));
+    const auto refused = f.Run(area + " AFTER " + Cell(0, three) + " LIMIT 3");
+    assert(refused.starts_with(Refusal(1, three, Expected({{At(1), full}}, At(1), dims).size(), budget)));
+    assert(f.Run(area + " AFTER " + Cell(0, three) + " LIMIT 1") == refused);
+    assert(f.Run(area + " COLUMNS v AFTER " + Cell(0, three) + " LIMIT 1") == Expected({{At(1), form}}, At(1), dims));
+    assert(f.Run(area + " COLUMNS v") == Expected({{At(1), form}}, {}, dims, false));
+    assert(f.Run(area + " AFTER " + Cell(1, three) + " LIMIT 3") == Expected({}, {}, dims));
+    assert(f.Run(std::string("GET BLOCK ") + (three ? "128 0 0" : "1024 0") + " FROM t COLUMNS v") == "*1\r\n:11\r\n");
+
+    auto lease = f.catalog->Require("t")->Acquire();
+    auto& store = lease->store();
+    const auto bound = store.query_limits().max_area_response_bytes;
+    const auto fits = [bound](const ChunkRangeEntry& entry) { return entry.payload.size() < bound; };
+    std::vector<ChunkCoord> populated;
+    auto page = Visit(store, three, 2, std::nullopt, 3U, fits, &populated);
+    assert(page.has_more && page.after == At(0) && populated.empty());
+    VisitRefuses(store, three, 2, At(0), 3U, fits, At(1));
+    VisitRefuses(store, three, 2, At(0), 1U, fits, At(1));
+    page = Visit(store, three, 2, At(1), 3U, fits, &populated);
+    assert(!page.has_more && !page.after && populated.empty());
+}
+
+// The reply `expected` builds around one chunk form, split at the form.
+std::pair<std::string, std::string> AroundForm(const std::string& expected) {
+    const auto at = expected.find('\0');
+    assert(at != std::string::npos && expected.find('\0', at + 1U) == std::string::npos);
+    return {expected.substr(0U, at), expected.substr(at + 1U)};
+}
+
+// A server whose response bound is the `required` size the refusal reports
+// for the largest chunk returns that chunk through GET AREA, plain and paged;
+// one byte less refuses it. Only the size and a hash of the chunk's GET CHUNK
+// form are kept, so at most one 64 MiB reply is held at a time beside the
+// store; a form records its store, so the hash is taken where it is compared.
+void LargestGeometryWithinBound(bool three) {
+    const auto dims = static_cast<std::uint8_t>(three ? 3U : 2U);
+    const std::string create = std::string("CREATE TABLE t (v u8, padding bits(504)) CHUNK ") +
+        (three ? "128 x 128 x 64" : "1024 x 1024");
+    const std::string block = three ? "128 0 0" : "1024 0";
+    const std::string marker(1U, '\0');
+    const auto plain = AroundForm(Expected({{At(1), marker}}, {}, dims, false));
+    const auto paged = AroundForm(Expected({{At(1), marker}}, {}, dims));
+    // A page reserves room to continue after the chunk while cells remain.
+    const auto continued = AroundForm(Expected({{At(1), marker}}, At(1), dims));
+    std::size_t form_size = 0U;
+    {
+        Fixture probe;
+        assert(probe.Run(create) == "+OK\r\n");
+        probe.Write(block, 11U);
+        form_size = probe.Run("GET CHUNK " + Cell(1, three) + " FROM t").size();
+        assert(form_size > QueryLimits{}.max_area_response_bytes);
+    }
+    const auto required = continued.first.size() + form_size + continued.second.size();
+    assert(required > paged.first.size() + form_size + paged.second.size());
+    const auto area = "GET AREA " + Cell(0, three) + " TO " + Cell(2, three) + " FROM t";
+    {
+        Fixture f(QueryLimits{.max_area_response_bytes = required});
+        assert(f.Run(create) == "+OK\r\n");
+        f.Write(block, 11U);
+        std::size_t form_hash = 0U;
+        {
+            const auto full = f.Run("GET CHUNK " + Cell(1, three) + " FROM t");
+            assert(full.size() == form_size);
+            form_hash = std::hash<std::string_view>{}(full);
+        }
+        const auto check = [&](const std::string& reply, const std::pair<std::string, std::string>& around) {
+            assert(reply.size() == around.first.size() + form_size + around.second.size());
+            assert(reply.starts_with(around.first) && reply.ends_with(around.second));
+            assert(std::hash<std::string_view>{}(std::string_view(reply).substr(around.first.size(), form_size)) ==
+                form_hash);
+        };
+        check(f.Run(area), plain);
+        check(f.Run(area + " LIMIT 3"), paged);
+        check(f.Run(area + " AFTER " + Cell(0, three) + " LIMIT 3"), paged);
+        check(f.Run(area + " AFTER " + Cell(0, three) + " LIMIT 1"), continued);
+    }
+    Fixture smaller(QueryLimits{.max_area_response_bytes = required - 1U});
+    assert(smaller.Run(create) == "+OK\r\n");
+    smaller.Write(block, 11U);
+    assert(smaller.Run(area + " AFTER " + Cell(0, three) + " LIMIT 3").starts_with(Refusal(1, three, required, required - 1U)));
 }
 }  // namespace
 
@@ -278,5 +473,9 @@ int main() {
     ExtremeEmptySelectors();
     TransactionRefusalsAreAtomic();
     SetChunkMeetsConfiguredWrittenLimitBeforeDecoding();
-    LargestGeometryProjection();
+    for (const bool three : {false, true}) {
+        OversizeEntryInPage(three);
+        LargestGeometry(three);
+        LargestGeometryWithinBound(three);
+    }
 }

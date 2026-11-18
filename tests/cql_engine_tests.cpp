@@ -307,8 +307,9 @@ void TestHello() {
     assert(session.greeted);
     assert(Contains(hello, "$14\r\nmax_scan_limit\r\n:1024\r\n"));
     assert(Contains(hello, "$16\r\nserver_signature\r\n$"));
-    assert(Contains(hello, "$8\r\nfeatures\r\n*9\r\n$19\r\nprotocol_foundation\r\n"));
-    assert(Contains(hello, "$12\r\nslot_filters\r\n$13\r\nslot_takeover\r\n$7\r\nlineage\r\n$15\r\nchannel_binding\r\n$11\r\narea_paging\r\n"));
+    assert(Contains(hello, "$8\r\nfeatures\r\n*11\r\n$19\r\nprotocol_foundation\r\n"));
+    assert(Contains(hello, "$12\r\nslot_filters\r\n$13\r\nslot_takeover\r\n$7\r\nlineage\r\n"));
+    assert(Contains(hello, "$19\r\nconnection_controls\r\n$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n$11\r\narea_paging\r\n"));
     ExpectError(engine.Execute(session, "HELLO 3\r\n"), "PROTOCOL HELLO was already sent");
     ExpectReply(engine.Execute(session, "PING\r\n"), "+PONG\r\n");
     // Commands of the retired protocol 2 are not statements.
@@ -803,7 +804,10 @@ void TestTableStatements() {
     assert(Contains(f.Run("DESCRIBE land"), "$18\r\ncheckpoint_updates\r\n:64\r\n"));
     assert(Contains(f.Run("DESCRIBE land"), "$7\r\nversion\r\n:7\r\n"));
 
-    ExpectError(f.Run("CREATE TABLE land (a u8) CHUNK 4 x 4"), "TABLE_EXISTS");
+    ExpectError(f.Run("CREATE TABLE land (a u8) CHUNK 4 x 4"),
+                "TABLE_EXISTS table 'land' already exists; use another name, CREATE TABLE IF NOT EXISTS, or DROP TABLE land first");
+    ExpectError(f.Run("GET BLOCK 0 0 0 FROM land"),
+                "INVALID_ARGUMENT coordinate dimensions differ from the table: the table has 2 and the statement 3; give one coordinate per table dimension (DESCRIBE shows dims)");
     ExpectError(f.Run("CREATE TABLE t (a u8) CHUNK 4 x 4 WITH colour = 1"), "unknown table option 'colour'");
     ExpectError(f.Run("CREATE TABLE t (a u8) CHUNK 4 x 4 WITH checkpoint_updates = 1, checkpoint_updates = 2"), "given twice");
     ExpectError(f.Run("CREATE TABLE t (a u8) CHUNK 4 x 4 WITH checkpoint_updates = TRUE"), "takes a number or a quoted value");

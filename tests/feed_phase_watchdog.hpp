@@ -12,6 +12,7 @@
 #include <iterator>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -38,10 +39,24 @@ class FeedPhaseWatchdog {
         std::fflush(stderr);
         observer_ = std::thread([state = state_, name = name_, limit = limit_] {
             std::unique_lock lock(state->mutex);
+            auto wait = limit;
             while (!state->done) {
                 const auto generation = state->generation;
-                if (state->changed.wait_for(lock, limit, [&] { return state->done || state->generation != generation; })) continue;
+                if (state->changed.wait_for(lock, wait, [&] { return state->done || state->generation != generation; })) {
+                    wait = limit;
+                    continue;
+                }
                 const auto now = HostClocks::Now();
+                // The limit is time the host ran. On macOS steady_clock also
+                // counts time the host slept, so a wait can end early in run
+                // time; it then waits for the rest instead of ending the run.
+                if (const auto ran = now.RanSince(state->changed_at)) {
+                    const auto counted = *ran - state->simulated_suspension_ms;
+                    if (counted < limit.count()) {
+                        wait = limit - std::chrono::milliseconds(std::max<std::int64_t>(counted, 0));
+                        continue;
+                    }
+                }
                 std::fprintf(stderr, "TIMEOUT pid=%ld case=%s phase=%s worker=%s limit_ms=%lld last_change=%s now=%s "
                              "waited_ms=%lld suspended_ms=%s\n", Pid(), name.c_str(), state->phase.data(),
                              state->worker_phase.data(), static_cast<long long>(limit.count()),
@@ -86,6 +101,12 @@ class FeedPhaseWatchdog {
     static void Command(std::string_view action, std::string_view request) {
         Phase(std::string(action) + " " + std::string(Verb(request)));
     }
+    // Counts `duration` since the last phase as time the host was suspended.
+    static void SimulateSuspension(std::chrono::milliseconds duration) {
+        if (!active_) return;
+        std::lock_guard lock(active_->state_->mutex);
+        active_->state_->simulated_suspension_ms += duration.count();
+    }
     static void StalledControl() {
         FeedPhaseWatchdog watchdog("PhaseWatchdogStall", std::chrono::milliseconds(100));
         Phase("control: waiting for unreleased CV");
@@ -110,10 +131,9 @@ class FeedPhaseWatchdog {
     }
     // When a phase began, on two clocks: `running_ms` stops while the host is
     // suspended (asleep), `total_ms` does not, so their difference over a wait
-    // is the time the host slept. A timeout with suspended_ms near waited_ms
-    // is the host, not the test. A host that freezes without suspending, or a
-    // paused VM, advances both clocks; only other processes' timestamps tell
-    // that apart from a hang of this one.
+    // is the time the host slept, which the limit does not count. A host that
+    // freezes without suspending, or a paused VM, advances both clocks; only
+    // other processes' timestamps tell that apart from a hang of this one.
     struct HostClocks {
         std::int64_t running_ms = 0;
         std::int64_t total_ms = 0;
@@ -151,6 +171,11 @@ class FeedPhaseWatchdog {
             }
             return clocks;
         }
+        // Milliseconds the host ran since `since`, where that is known.
+        [[nodiscard]] std::optional<std::int64_t> RanSince(const HostClocks& since) const {
+            if (running_ms < 0 || since.running_ms < 0) return std::nullopt;
+            return running_ms - since.running_ms;
+        }
         [[nodiscard]] std::string Suspended(const HostClocks& since) const {
             if (running_ms < 0 || since.running_ms < 0) return "unknown";
             return std::to_string((total_ms - since.total_ms) - (running_ms - since.running_ms));
@@ -174,6 +199,7 @@ class FeedPhaseWatchdog {
         std::array<char, 256> worker_phase{"none"};
         HostClocks changed_at = HostClocks::Now();
         std::size_t generation = 0U;
+        std::int64_t simulated_suspension_ms = 0;
         bool done = false;
     };
     static void Publish(const std::shared_ptr<State>& state, const std::string& name, std::string_view phase,
@@ -186,6 +212,7 @@ class FeedPhaseWatchdog {
                           static_cast<int>(std::min(phase.size(), destination.size() - 1U)), phase.data());
             ++state->generation;
             state->changed_at = HostClocks::Now();
+            state->simulated_suspension_ms = 0;
             std::fprintf(stderr, "PHASE pid=%ld case=%s phase=%s\n", Pid(), name.c_str(), destination.data());
             std::fflush(stderr);
         }

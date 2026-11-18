@@ -361,23 +361,30 @@ std::uint64_t ChunkStore::CurrentWalFileSize(
     if (chunk->wal_path.empty()) {
         return 0;
     }
-    std::error_code exists_ec;
-    const bool present = std::filesystem::exists(chunk->wal_path, exists_ec);
-    if (exists_ec) {
-        throw std::runtime_error(
-            "failed to stat WAL for rollback baseline: " + chunk->wal_path.string() +
-            " (ec=" + std::to_string(exists_ec.value()) + ", msg='" + exists_ec.message() + "')");
+    // While the chunk's append stream is open it is the only writer of the
+    // WAL: whatever truncates, replaces or removes the file closes the stream
+    // first. Its size then needs no lookup of the path, which every
+    // group-commit flush would otherwise pay.
+    if (chunk->wal_append_stream != nullptr) {
+        if (const auto size = chunk->wal_append_stream->size()) {
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_SIZE_STAT_FAIL_ONCE")) {
+                throw std::runtime_error(
+                    "injected WAL size inspection failure: " + chunk->wal_path.string());
+            }
+            return *size;
+        }
     }
-    if (!present) {
+    stats_chunk_file_probes_.fetch_add(1, std::memory_order_relaxed);
+    std::error_code ec;
+    const auto size = std::filesystem::file_size(chunk->wal_path, ec);
+    if (ec == std::errc::no_such_file_or_directory || ec == std::errc::not_a_directory) {
         // Definitively absent: there is no committed WAL to preserve.
         return 0;
     }
-    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_SIZE_STAT_FAIL_ONCE")) {
+    if (!ec && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_SIZE_STAT_FAIL_ONCE")) {
         throw std::runtime_error(
             "injected WAL size inspection failure: " + chunk->wal_path.string());
     }
-    std::error_code ec;
-    const auto size = std::filesystem::file_size(chunk->wal_path, ec);
     if (ec) {
         // Never interpret an inspection failure as an empty WAL: doing so would
         // let a failed rollback remove or under-truncate a WAL that still holds
@@ -397,7 +404,7 @@ void ChunkStore::TruncateWalTail(
     if (chunk->checkpoint_io) {
         throw std::logic_error("chunk files are owned by a running background checkpoint");
     }
-    SnapshotGenerationWriteGuard snapshot_write(this);
+    SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
     if (chunk->wal_path.empty()) {
         chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     }
@@ -509,7 +516,7 @@ void ChunkStore::FlushWalBatch(
     if (feed_slots_ && feed_slots_->ArchiveRequired())
         prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch, geometry_.dims()));
 
-    SnapshotGenerationWriteGuard snapshot_write(this);
+    SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
     bool first_create = false;
     bool stream_artifact_touched = false;
     bool batch_write_started = false;
@@ -804,7 +811,7 @@ void ChunkStore::FlushWalBatchForEviction(
         std::optional<FeedWalPrefixIndex::Prepared> prefix;
         if (feed_slots_ && feed_slots_->ArchiveRequired())
             prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch, geometry_.dims()));
-        SnapshotGenerationWriteGuard snapshot_write(this);
+        SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
         bool file_write_started = false;
         try {
             const auto wal_parent_path = chunk->wal_path.parent_path();

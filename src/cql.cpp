@@ -294,15 +294,20 @@ namespace {
 
 using namespace lexer;
 
+// The next step for an unknown statement word: the closest CQL keyword, the
+// CQL form of a common SQL statement, or the reference.
 std::string StatementSuggestion(std::string_view word) {
+    constexpr std::string_view kReference = "; the CQL reference lists every statement";
     if (word.size() > 16U) {
-        return {};
+        return std::string(kReference);
     }
     const auto lower = Lower(word);
-    const std::array<std::string_view, 24U> keywords{
+    if (lower == "select") return "; read with GET BLOCK, GET AREA or GET CHUNK";
+    if (lower == "insert" || lower == "update" || lower == "upsert") return "; write with SET BLOCK or SET CHUNK";
+    const std::array<std::string_view, 26U> keywords{
         "get", "set", "delete", "create", "alter", "drop", "show", "describe", "grant", "revoke",
         "begin", "commit", "rollback", "ping", "flush", "watch", "unwatch", "ack", "backup", "migrate",
-        "scan", "reload", "recover", "compact"};
+        "scan", "reload", "recover", "compact", "restore", "swap"};
     std::string_view closest;
     std::size_t best = word.size() < 4U ? 2U : 3U;
     bool tied = false;
@@ -327,7 +332,7 @@ std::string StatementSuggestion(std::string_view word) {
         }
     }
     if (closest.empty() || tied) {
-        return {};
+        return std::string(kReference);
     }
     std::string name(closest);
     std::transform(name.begin(), name.end(), name.begin(), [](char c) { return static_cast<char>(c - 'a' + 'A'); });
@@ -981,6 +986,21 @@ class Parser {
                 alter.user = Name("a user name");
                 if (Accept("verifier")) {
                     alter.verifier = Verifier();
+                } else if (Accept("limit")) {
+                    do {
+                        const auto column = Peek().column;
+                        const auto name = Name("a limit name");
+                        ExpectToken(TokenKind::kEquals, "=");
+                        if (name == "max_connections") {
+                            if (alter.max_connections) Fail(column, "max_connections is given twice");
+                            alter.max_connections = Unsigned("max_connections", std::numeric_limits<std::uint64_t>::max());
+                        } else if (name == "statements_per_sec") {
+                            if (alter.statements_per_sec) Fail(column, "statements_per_sec is given twice");
+                            alter.statements_per_sec = Unsigned("statements_per_sec", kMaxUserStatementsPerSecond);
+                        } else {
+                            Fail(column, "unknown user limit: " + name);
+                        }
+                    } while (AcceptToken(TokenKind::kComma));
                 } else {
                     const bool no = Accept("no");
                     if (Accept("require")) {
@@ -1072,6 +1092,7 @@ class Parser {
             return EnableFeature{.name = Take().text};
         }
         if (Accept("show")) {
+            if (Accept("connections")) return ShowConnections{};
             if (Accept("table")) {
                 Expect("stats");
                 return ShowTableStats{.table = Name("a table name")};
@@ -1092,7 +1113,12 @@ class Parser {
             if (Accept("metrics")) {
                 return ShowMetrics{};
             }
-            Fail(Peek().column, "expected TABLES, METRICS, STATUS, MIGRATIONS, USERS or SLOTS, got " + Quote(Peek()));
+            Fail(Peek().column, "expected TABLES, METRICS, STATUS, CONNECTIONS, MIGRATIONS, USERS or SLOTS, got " + Quote(Peek()));
+        }
+        if (Accept("cancel")) return Cancel{Unsigned("a connection id", std::numeric_limits<std::uint64_t>::max())};
+        if (Accept("kill")) {
+            Expect("connection");
+            return KillConnection{Unsigned("a connection id", std::numeric_limits<std::uint64_t>::max())};
         }
         if (Accept("describe")) {
             return Describe{.table = Name("a table name")};
@@ -1100,6 +1126,24 @@ class Parser {
         if (Accept("recover")) {
             Expect("table");
             return RecoverTable{.table = Name("a table name")};
+        }
+        if (Accept("restore")) {
+            Expect("table");
+            RestoreTable restore{.table = Name("a table name"), .path = {}, .name = {}};
+            Expect("from");
+            const auto& path = Peek();
+            if (path.kind != TokenKind::kText)
+                Fail(path.column, "expected a quoted backup path, got " + Quote(path));
+            restore.path = Take().text;
+            restore.name = Accept("as") ? Name("a table name") : restore.table;
+            return restore;
+        }
+        if (Accept("swap")) {
+            Expect("tables");
+            SwapTables swap{.first = Name("a table name"), .second = {}};
+            ExpectToken(TokenKind::kComma, "a comma");
+            swap.second = Name("a table name");
+            return swap;
         }
         if (Accept("compact")) {
             Expect("tombstones");

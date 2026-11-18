@@ -1,6 +1,7 @@
 #include "chunkdb/chunk_store.hpp"
 
 #include "checkpoint.hpp"
+#include "statement_control.hpp"
 #include "chunk_store_internal.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
@@ -72,7 +73,7 @@ bool ChunkStore::BlockExists3D(std::int64_t x, std::int64_t y, std::int64_t z) {
 
 bool ChunkStore::BlockExistsAtAddress(const ChunkCoord& chunk_coord, std::size_t block_index) {
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::shared_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunkShared(regular_chunk->mutex);
     return BlockPresent(regular_chunk->presence_bitmap, block_index);
 }
 
@@ -84,7 +85,7 @@ std::string ChunkStore::GetBlockBits(std::int64_t block_x, std::int64_t block_y)
     const std::size_t bit_offset = block_index * geometry_.config().block_bits;
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::shared_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunkShared(regular_chunk->mutex);
     if (!BlockPresent(regular_chunk->presence_bitmap, block_index)) {
         return std::string(geometry_.config().block_bits, '0');
     }
@@ -116,7 +117,7 @@ std::optional<std::string> ChunkStore::ReadBlockBitsAtAddress(const ChunkCoord& 
     const std::size_t bit_offset = block_index * geometry_.config().block_bits;
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::shared_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunkShared(regular_chunk->mutex);
     if (!BlockPresent(regular_chunk->presence_bitmap, block_index)) {
         return std::nullopt;
     }
@@ -175,6 +176,7 @@ void ChunkStore::FinishOrdinaryMutationLocked(
     }
     // Group commit counts mutations, whatever number of records each one
     // appended (docs/STORAGE_FORMAT.md Section 5).
+    EnterStatementDecision();
     chunk->pending_wal_flush_updates += 1;
     chunk->pending_updates += 1;
     chunk->wal_bytes += appended_bytes;
@@ -271,7 +273,7 @@ void ChunkStore::SetBlockBitsAtAddress(const ChunkCoord& chunk_coord, std::size_
     }
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::unique_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunk(regular_chunk->mutex);
     AwaitChunkBacklogLocked(lock, *regular_chunk);
     WriteBlockBitsLocked(chunk_coord, regular_chunk, block_index, bits, true);
 }
@@ -458,7 +460,7 @@ ChunkMutationResult ChunkStore::UnsetBlockAtAddress(const ChunkCoord& chunk_coor
     if (!geometry_.layout().bit_string_blocks()) {
         auto& write = PrepareUnsetBlockWrite(block_index);
         const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-        std::unique_lock lock(regular_chunk->mutex);
+        auto lock = LockStatementChunk(regular_chunk->mutex);
         AwaitChunkBacklogLocked(lock, *regular_chunk);
         if (expected_version.has_value() && regular_chunk->version != *expected_version) {
             return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
@@ -470,7 +472,7 @@ ChunkMutationResult ChunkStore::UnsetBlockAtAddress(const ChunkCoord& chunk_coor
     const std::string zero_bits(geometry_.config().block_bits, '0');
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::unique_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunk(regular_chunk->mutex);
     AwaitChunkBacklogLocked(lock, *regular_chunk);
     if (expected_version.has_value() && regular_chunk->version != *expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
@@ -524,7 +526,7 @@ ChunkMutationResult ChunkStore::SetBlockAtAddress(const ChunkCoord& chunk_coord,
     auto& write = PrepareSetBlockWrite(values, block_index);
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::unique_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunk(regular_chunk->mutex);
     AwaitChunkBacklogLocked(lock, *regular_chunk);
     if (expected_version.has_value() && regular_chunk->version != *expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
@@ -699,7 +701,7 @@ std::optional<std::vector<ColumnValue>> ChunkStore::GetBlock3D(std::int64_t x, s
 
 std::optional<std::vector<ColumnValue>> ChunkStore::GetBlockAtAddress(const ChunkCoord& chunk_coord, std::size_t block_index) {
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::shared_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunkShared(regular_chunk->mutex);
     if (!BlockPresent(regular_chunk->presence_bitmap, block_index)) {
         return std::nullopt;
     }
@@ -721,7 +723,7 @@ BlockReadMetadata ChunkStore::GetBlockWithVersion3D(std::int64_t x, std::int64_t
 
 BlockReadMetadata ChunkStore::GetBlockWithVersionAtAddress(const ChunkCoord& coord, std::size_t index) {
     const auto chunk = GetOrLoadRegularChunk(coord);
-    std::shared_lock lock(chunk->mutex);
+    auto lock = LockStatementChunkShared(chunk->mutex);
     BlockReadMetadata result;
     if (chunk->written) result.version = chunk->version;
     if (BlockPresent(chunk->presence_bitmap, index))
@@ -747,7 +749,7 @@ BlockReadMetadata ChunkStore::GetBlockWithVersion3DAt(
             std::optional(DecodeBlockColumns(geometry_.layout(), chunk.payload, chunk.vars, index)) : std::nullopt;
     };
     const auto chunk = GetOrLoadRegularChunk(coord);
-    { std::shared_lock lock(chunk->mutex); capture(*chunk); }
+    { auto lock = LockStatementChunkShared(chunk->mutex); capture(*chunk); }
     (void)txn_history_->VisitAt(snapshot, coord, [&](const TxnKeptState& kept) { capture(kept.View()); });
     return result;
 }
@@ -1142,6 +1144,7 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
     const auto* fixed = layout.FixedColumnAt(index);
     const std::uint32_t width = geometry_.config().chunk_width_blocks;
     const std::uint32_t height = geometry_.config().chunk_height_blocks;
+    const std::uint32_t depth = geometry_.config().chunk_depth_blocks;
     // An axis past int64 as [chunk, local], as WATCH reports it.
     const auto axis = [](std::int64_t chunk, std::uint32_t blocks, std::size_t local) {
         const auto absolute = BlockCoordinate(chunk, blocks, local);
@@ -1149,8 +1152,13 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
                                     : "[" + std::to_string(chunk) + ", " + std::to_string(local) + "]";
     };
     const auto describe = [&](const ChunkCoord& coord, std::size_t block, const ColumnValue& value) {
-        return "block (" + axis(coord.x, width, block % width) + ", " + axis(coord.y, height, block / width) +
-               ") holds " + DescribeValue(value);
+        const std::size_t plane = static_cast<std::size_t>(width) * height;
+        std::string text = "block (" + axis(coord.x, width, block % width) + ", " +
+                           axis(coord.y, height, (block / width) % height);
+        if (geometry_.dims() == 3U) {
+            text += ", " + axis(coord.z, depth, block / plane);
+        }
+        return text + ") holds " + DescribeValue(value);
     };
     std::vector<std::uint8_t> bytes(fixed != nullptr ? (fixed->width + 7U) / 8U : 0U);
     bool has_cursor = false;
@@ -1159,7 +1167,7 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
         const auto page = ScanPopulatedChunks(has_cursor, cursor, kMaxChunkScanLimit);
         for (const auto& coord : page.coords) {
             const auto chunk = GetOrLoadRegularChunk(coord);
-            std::shared_lock lock(chunk->mutex);
+            auto lock = LockStatementChunkShared(chunk->mutex);
             if (fixed == nullptr) {
                 for (const auto entry : chunk->vars) {
                     if (entry.key.column_id != column_id) {
@@ -1194,14 +1202,31 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
 }
 
 bool ChunkStore::HasPresentBlocks() {
-    return !ScanPopulatedChunks(false, {}, 1U).coords.empty();
+    // A populated chunk may hold only chunk metadata, so check its blocks,
+    // read without loading the chunk into the cache.
+    bool has_cursor = false;
+    ChunkCoord cursor{};
+    while (true) {
+        const auto page = ScanPopulatedChunks(has_cursor, cursor, kMaxChunkScanLimit);
+        for (const auto& coord : page.coords) {
+            ChunkRangeEntry state;
+            if (ReadPopulatedChunkStateNoCache(coord, &state, false) && ChunkPresent(state.presence_bitmap)) {
+                return true;
+            }
+        }
+        if (!page.has_more || page.coords.empty()) {
+            return false;
+        }
+        cursor = page.coords.back();
+        has_cursor = true;
+    }
 }
 
 bool ChunkStore::ChunkExists(std::int64_t chunk_x, std::int64_t chunk_y) {
     RequireTwoDimensionalChunks(geometry_);
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::shared_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunkShared(regular_chunk->mutex);
     return ChunkPresent(regular_chunk->presence_bitmap);
 }
 
@@ -1284,7 +1309,7 @@ std::uint64_t ChunkStore::ApplyChunkState(
     RequirePendingFits(payload, presence_bitmap);
 
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::unique_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunk(regular_chunk->mutex);
     AwaitChunkBacklogLocked(lock, *regular_chunk);
     // Values of blocks the state makes absent go.
     auto var_update = VarUpdateForState(regular_chunk->vars, presence_bitmap);
@@ -1432,7 +1457,7 @@ std::string ChunkStore::GetChunkBits(std::int64_t chunk_x, std::int64_t chunk_y)
     RequireBitStringBlocks();
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::shared_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunkShared(regular_chunk->mutex);
     return BitCodec::ExtractBits(regular_chunk->payload, 0, geometry_.ChunkPayloadBits());
 }
 
@@ -1440,7 +1465,7 @@ std::vector<std::uint8_t> ChunkStore::GetChunkPayloadBytes(std::int64_t chunk_x,
     RequireTwoDimensionalChunks(geometry_);
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::shared_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunkShared(regular_chunk->mutex);
     return regular_chunk->payload;
 }
 
@@ -1449,7 +1474,7 @@ std::string ChunkStore::GetChunkStateBits(std::int64_t chunk_x, std::int64_t chu
     RequireBitStringBlocks();
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::shared_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunkShared(regular_chunk->mutex);
     return BitCodec::ExtractBits(regular_chunk->payload, 0, geometry_.ChunkPayloadBits()) + "|" +
            PresenceBitsText(geometry_, regular_chunk->presence_bitmap);
 }
@@ -1458,7 +1483,7 @@ std::vector<std::uint8_t> ChunkStore::GetChunkStateBytes(std::int64_t chunk_x, s
     RequireTwoDimensionalChunks(geometry_);
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
-    std::shared_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunkShared(regular_chunk->mutex);
     return BuildChunkStateBytes(geometry_, regular_chunk->payload, regular_chunk->presence_bitmap);
 }
 

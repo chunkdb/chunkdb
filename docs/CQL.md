@@ -15,12 +15,12 @@ Generated passwords, epochs, and timestamps appear as named placeholders.
 | --- | --- |
 | [Blocks](reference/BLOCKS.md) | GET BLOCK, SET BLOCK, DELETE BLOCK |
 | [Chunks and areas](reference/CHUNKS.md) | GET CHUNK, SET CHUNK, GET AREA, SCAN CHUNKS, COMPACT TOMBSTONES, SHOW TABLE STATS |
-| [Tables](reference/TABLES.md) | CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SHOW TABLES, DESCRIBE, SHOW STATUS, ENABLE FEATURE |
+| [Tables](reference/TABLES.md) | CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SWAP TABLES, SHOW TABLES, DESCRIBE, SHOW STATUS, ENABLE FEATURE |
 | [Migrations](reference/MIGRATIONS.md) | MIGRATE, SHOW MIGRATIONS |
 | [Transaction statements](reference/TRANSACTION_STATEMENTS.md) | BEGIN, COMMIT, ROLLBACK |
 | [Feed statements](reference/FEED.md) | WATCH, ACK, UNWATCH, CREATE SLOT, DROP SLOT, SHOW SLOTS |
 | [User statements](reference/USER_STATEMENTS.md) | CREATE USER, ALTER USER, DROP USER, GRANT, REVOKE, SHOW USERS |
-| [Server statements](reference/SERVER.md) | PING, FLUSH WAL, SHOW METRICS, BACKUP TO, RELOAD TLS |
+| [Server statements](reference/SERVER.md) | PING, FLUSH WAL, SHOW METRICS, BACKUP TO, RESTORE TABLE, RELOAD TLS, SHOW CONNECTIONS, CANCEL, KILL CONNECTION |
 
 ## Names and values
 

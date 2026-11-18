@@ -1,17 +1,67 @@
 #pragma once
 #include "chunkdb/server.hpp"
 #include "server_io.hpp"
+#include "server_poller.hpp"
+#include "server_credit.hpp"
+#include "statement_control.hpp"
 #include "slot_watch.hpp"
 #include <deque>
 #include <type_traits>
 struct ssl_st;
 namespace chunkdb {
-struct ServerConnection {
+struct ConnectionRecord {
+    std::mutex mutex;
+    std::uint64_t incarnation = 0U;
+    std::string user, peer, state = "handshake", verb;
+    std::shared_ptr<StatementControl> statement;
+    std::atomic<bool> killed{false};
+    std::atomic<bool> self_kill_reply{false};
+};
+struct ServerConnection : public std::enable_shared_from_this<ServerConnection> {
     server_detail::SocketHandle socket = server_detail::kInvalidSocket;
     ssl_st* tls = nullptr;
     SessionState session;
     server_detail::PendingLineBuffer pending;
     bool watch_slot = false;
+    bool read_ready = false;
+    std::size_t completed_replies = 0U;
+    std::chrono::steady_clock::time_point idle_deadline{};
+    std::optional<std::size_t> recv_timeout_ms;
+    enum class Phase { kStarting, kProxy, kTls, kInput, kReady, kReply };
+    Phase phase = Phase::kStarting;
+    short io_wait = POLLIN;
+    std::chrono::steady_clock::time_point handshake_deadline{};
+    server_detail::PhaseDeadline input_deadline, output_deadline;
+    // The clock reading of the read that buffered a request's first bytes,
+    // until the Parse that follows it starts its deadlines from it.
+    std::optional<std::chrono::steady_clock::time_point> received_at;
+    // While waiting for payload credit: the frame deadline is suspended and
+    // this one bounds the wait.
+    server_detail::PhaseDeadline credit_deadline;
+    bool record_deadline = false;
+    std::string handshake_source, proxy_header;
+    bool handshake_slot = false;
+    std::size_t proxy_size = 16U;
+    std::string request_line, payload_rejection, response;
+    CommandEngine::PayloadRequest payload;
+    std::unique_ptr<server_detail::ParameterFrameDecoder> frames;
+    std::vector<std::optional<std::string>> parameters;
+    std::size_t response_offset = 0U;
+    int response_write_size = 0;
+    std::unique_ptr<ReplyContinuation> reply_continuation;
+    std::shared_ptr<server_detail::ConnectionByteBudget::Credit> line_credit, payload_credit;
+    std::shared_ptr<server_detail::ConnectionByteBudget::Credit> reply_credit;
+    std::size_t reply_credit_bytes = 0U;
+    bool waiting_credit = false, waiting_line_credit = false, control_request = false, framing_started = false;
+    std::size_t payload_credit_bytes = 0U;
+    std::shared_ptr<ConnectionRecord> record = std::make_shared<ConnectionRecord>();
+    bool worker_queued = false;
+    bool irreversible_reply = false;
+    // A statement its worker parsed, started and published; it runs next.
+    std::shared_ptr<StatementControl> started_statement;
+    // Set while the worker that keeps this connection has it blocking with
+    // kWorkerReceiveWaitMs receive and send timeouts; those are set once.
+    bool worker_blocking = false, worker_timeouts = false;
     // The client's address and "[address]:port": the socket's peer, or the
     // source a PROXY header carried. Set when the connection starts.
     std::string peer_address;
@@ -45,6 +95,7 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
         std::array<char, 4096> input{};
         bool unwatch = false, return_ready = false, close = false, dead = false, read_paused = false;
         bool close_immediate = false;
+        bool closing = false; // Wait for the slot worker to release its claim before closing the socket.
         bool right_lost = false;
         std::size_t share = 0U, buffer_bytes = 0U;
         std::chrono::steady_clock::time_point next_progress{};
@@ -55,7 +106,6 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     };
     void Run();
     void WakeCatchUp() noexcept;
-    void DrainWake();
     void CatchUp();
     void Pull(Watch& watch, std::size_t share);
     void Read(Watch& watch);
@@ -64,16 +114,17 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     void Advance(Watch& watch, std::size_t bytes);
     void Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision = {}, bool charged = false, bool excess = false);
     void ReleaseOutput(Watch& watch, const std::shared_ptr<SlotWatch>& slot);
-    // Marks a watch dead when its excess-pool output made no write progress for the client I/O timeout.
+    // Request cleanup without blocking I/O; ready only after the slot claim is released.
+    bool ReadyToEnd(Watch& watch);
+    // Marks a watch dead when its excess-pool output made no write progress for the client I/O timeout;
+    // never while a closing watch waits for the worker.
     bool ExpireStalledWrite(Watch& watch, std::chrono::steady_clock::time_point now);
     void Reject(Watch& watch, std::string message);
     // Whether the user still has READ on the watched table: one atomic load
     // while the users are unchanged. A lost right ends the watch once.
     bool Permitted(Watch& watch);
     ChunkServer& server_;
-    server_detail::SocketHandle wake_read_ = server_detail::kInvalidSocket;
-    server_detail::SocketHandle wake_write_ = server_detail::kInvalidSocket;
-    std::atomic<bool> signaled_{false};
+    server_detail::SocketPoller poller_;
     std::mutex mutex_;
     std::vector<std::shared_ptr<ServerConnection>> incoming_;
     std::thread thread_;

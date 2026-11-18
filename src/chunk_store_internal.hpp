@@ -3,6 +3,7 @@
 #include <bit>
 #include <chrono>
 #include <cstdint>
+#include <exception>
 #include <filesystem>
 #include <limits>
 #include <mutex>
@@ -22,6 +23,17 @@
 
 namespace chunkdb {
 struct ChunkIndexRecord;
+
+// Called inside a handler: names the exception being handled.
+[[nodiscard]] inline std::string CurrentExceptionMessage() {
+    try {
+        throw;
+    } catch (const std::exception& error) {
+        return error.what();
+    } catch (...) {
+        return "unknown error";
+    }
+}
 
 // Admit expected ownership and complete streamed shape before allocating bytes.
 [[nodiscard]] std::vector<std::uint8_t> LoadRecoveryTxnIntent(const std::filesystem::path& path,

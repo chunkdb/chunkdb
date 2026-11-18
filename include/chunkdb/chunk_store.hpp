@@ -15,7 +15,9 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
+#include <stop_token>
 #include <string>
 #include <string_view>
 #include <system_error>
@@ -47,24 +49,80 @@ struct ChunkIndexRecord;
     (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
 // MinGW winpthreads shared_mutex has shown unstable lock assertions under high contention
 // in CI; fallback preserves correctness by serializing shared/exclusive access on Windows+MinGW.
-class RegularChunkMutex {
-  public:
-    void lock() { mutex_.lock(); }
-    bool try_lock() { return mutex_.try_lock(); }
-    void unlock() { mutex_.unlock(); }
-
-    void lock_shared() { mutex_.lock(); }
-    bool try_lock_shared() { return mutex_.try_lock(); }
-    void unlock_shared() { mutex_.unlock(); }
-
-  private:
-    std::mutex mutex_;
-};
+inline constexpr bool kSerialChunkReaders = true;
 inline constexpr const char* kChunkLockModeName = "serial-mutex";
 #else
-using RegularChunkMutex = std::shared_mutex;
+inline constexpr bool kSerialChunkReaders = false;
 inline constexpr const char* kChunkLockModeName = "shared-mutex";
 #endif
+
+class RegularChunkMutex {
+  public:
+    void lock() { (void)lock(std::stop_token{}); }
+    [[nodiscard]] bool lock(std::stop_token cancelled) {
+        std::unique_lock lock(mutex_);
+        WriterWaiter waiter(*this);
+        const auto ready = [this] { return !exclusive_ && readers_ == 0U; };
+        if (!ready() && !Wait(lock, cancelled, ready)) return false;
+        if (cancelled.stop_requested()) return false;
+        exclusive_ = true;
+        return true;
+    }
+    bool try_lock() {
+        std::lock_guard lock(mutex_);
+        if (exclusive_ || readers_ != 0U) return false;
+        exclusive_ = true;
+        return true;
+    }
+    void unlock() {
+        std::lock_guard lock(mutex_);
+        exclusive_ = false;
+        Notify();
+    }
+    void lock_shared() { (void)lock_shared(std::stop_token{}); }
+    [[nodiscard]] bool lock_shared(std::stop_token cancelled) {
+        std::unique_lock lock(mutex_);
+        const auto ready = [this] { return CanRead(); };
+        if (!ready() && !Wait(lock, cancelled, ready)) return false;
+        if (cancelled.stop_requested()) return false;
+        ++readers_;
+        return true;
+    }
+    bool try_lock_shared() {
+        std::lock_guard lock(mutex_);
+        if (!CanRead()) return false;
+        ++readers_;
+        return true;
+    }
+    void unlock_shared() {
+        std::lock_guard lock(mutex_);
+        --readers_;
+        if (readers_ == 0U) Notify();
+    }
+  private:
+    friend struct StatementChunkLockTestAccess;
+    struct WriterWaiter {
+        explicit WriterWaiter(RegularChunkMutex& mutex) : owner(mutex) {
+            ++owner.writers_;
+            owner.Notify();
+        }
+        ~WriterWaiter() { --owner.writers_; owner.Notify(); }
+        RegularChunkMutex& owner;
+    };
+    // Every state change and every wait happen under mutex_, so a change with
+    // no thread inside a wait has no one to wake.
+    void Notify() { if (waiters_ != 0U) changed_.notify_all(); }
+    template <typename Ready> bool Wait(std::unique_lock<std::mutex>& lock, std::stop_token cancelled, Ready ready) {
+        ++waiters_;
+        struct Leave { std::size_t& count; ~Leave() { --count; } } leave{waiters_};
+        return changed_.wait(lock, std::move(cancelled), ready);
+    }
+    bool CanRead() const { return !exclusive_ && writers_ == 0U && (!kSerialChunkReaders || readers_ == 0U); }
+    std::mutex mutex_;
+    std::condition_variable_any changed_;
+    std::size_t readers_ = 0U, writers_ = 0U, waiters_ = 0U;
+    bool exclusive_ = false;
+};
 
 [[nodiscard]] inline constexpr const char* ChunkLockModeName() noexcept {
     return kChunkLockModeName;
@@ -320,6 +378,36 @@ struct ChunkAreaPage {
 
 // The final argument reports whether the selector has any following cell.
 using ChunkAreaVisitor = std::function<bool(const ChunkCoord&, std::optional<ChunkRangeEntry>&&, bool)>;
+
+// A populated chunk whose area entry cannot fit an otherwise empty page.
+// `required` is the size of a reply holding only that entry, when measured.
+class AreaEntryTooLargeError : public std::out_of_range {
+  public:
+    AreaEntryTooLargeError(const ChunkCoord& coord, std::uint8_t dims, std::size_t limit,
+                           std::optional<std::size_t> required = {})
+        : std::out_of_range(Message(coord, dims, limit, required)),
+          coord_(coord), dims_(dims), limit_(limit), required_(required) {}
+    [[nodiscard]] const ChunkCoord& coord() const noexcept { return coord_; }
+    [[nodiscard]] std::uint8_t dims() const noexcept { return dims_; }
+    [[nodiscard]] std::size_t limit() const noexcept { return limit_; }
+    [[nodiscard]] std::optional<std::size_t> required() const noexcept { return required_; }
+
+  private:
+    static std::string Message(const ChunkCoord& coord, std::uint8_t dims, std::size_t limit,
+                               std::optional<std::size_t> required) {
+        std::string chunk = "[" + std::to_string(coord.x) + ", " + std::to_string(coord.y);
+        if (dims == 3U) chunk += ", " + std::to_string(coord.z);
+        chunk += "]";
+        return "the area entry for chunk " + chunk +
+            (required ? " needs " + std::to_string(*required) + " bytes and" : "") +
+            " exceeds the " + std::to_string(limit) +
+            "-byte response limit; read it with GET CHUNK or fewer COLUMNS, then continue AFTER it";
+    }
+    ChunkCoord coord_;
+    std::uint8_t dims_;
+    std::size_t limit_;
+    std::optional<std::size_t> required_;
+};
 
 // A chunk's whole state: what GET CHUNK and SET CHUNK carry
 // (docs/CQL.md).
@@ -593,9 +681,9 @@ class ChunkStore {
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z);
     [[nodiscard]] BlockReadMetadata GetBlockWithVersion3D(std::int64_t x, std::int64_t y, std::int64_t z);
     // The first stored value of column `column_id` that `type` does not
-    // hold, as "block (x, y) holds <value>" (an axis past int64 as
-    // [chunk, local]), or std::nullopt when every one fits. Reads every
-    // populated chunk (TableCatalog::NarrowColumn).
+    // hold, as "block (x, y) holds <value>" ("block (x, y, z) ..." in a 3D
+    // table; an axis past int64 as [chunk, local]), or std::nullopt when
+    // every one fits. Reads every populated chunk (TableCatalog::NarrowColumn).
     [[nodiscard]] std::optional<std::string> FindValueNotFitting(std::uint32_t column_id, const ColumnType& type);
     // Whether memory, images or WALs contain any present block. Callers that
     // use the answer to change a schema must exclude concurrent writers.
@@ -661,7 +749,9 @@ class ChunkStore {
         bool with_vars = false);
 
     // Visits requested cells, including empty cells; the caller owns encoding.
-    // A false result leaves that cell beyond the returned continuation cursor.
+    // A false result leaves that cell beyond the returned continuation cursor;
+    // for the page's first visited cell it throws AreaEntryTooLargeError when
+    // that cell is populated, and std::out_of_range when it is empty.
     // txn_read.covered records observed candidates; publish it only after a
     // complete successful reply, including when the last candidate was refused.
     [[nodiscard]] ChunkAreaPage VisitChunkArea(
@@ -847,6 +937,7 @@ class ChunkStore {
     [[nodiscard]] std::uint64_t ChunkCommitTimeForTests(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] std::uint64_t WalOpenCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t WalParentPrepareCountForTests() const noexcept;
+    [[nodiscard]] std::uint64_t ChunkFileProbeCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t OpenWalStreamCountForTests() const noexcept;
     [[nodiscard]] std::size_t MaxOpenWalStreamsForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionSnapshotBuildCountForTests() const noexcept;
@@ -981,6 +1072,7 @@ class ChunkStore {
     friend struct FeedSlotTestAccess;
     friend struct BackupTestAccess;
     friend struct FeatureActivationTestAccess;
+    friend struct UnsyncedTestAccess;
 
     // What a WAL barrier still has to sync (see unsynced_files_).
     struct UnsyncedArtifacts {
@@ -1015,7 +1107,9 @@ class ChunkStore {
 
     class SnapshotGenerationWriteGuard {
       public:
-        explicit SnapshotGenerationWriteGuard(ChunkStore* store);
+        explicit SnapshotGenerationWriteGuard(ChunkStore* store, std::span<const ChunkCoord> coordinates = {});
+        SnapshotGenerationWriteGuard(ChunkStore* store, const ChunkCoord& coordinate)
+            : SnapshotGenerationWriteGuard(store, std::span(&coordinate, 1U)) {}
         ~SnapshotGenerationWriteGuard();
 
         SnapshotGenerationWriteGuard(
@@ -1143,6 +1237,7 @@ class ChunkStore {
     std::shared_ptr<ChunkCoordinateIndex> read_only_retained_index_;
     std::mutex coordinate_index_refresh_mutex_;
     std::pair<std::uint64_t, std::uint64_t> coordinate_index_generation_{};
+    std::optional<std::uint64_t> coordinate_index_changes_cursor_;
     bool coordinate_index_complete_ = false;
     std::vector<ChunkCoord> coordinate_startup_candidates_;
     std::filesystem::path data_dir_;
@@ -1199,6 +1294,9 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_empty_batch_{0};
     std::atomic<std::uint64_t> stats_eviction_refill_large_chunk_scans_{0};
     std::atomic<std::uint64_t> stats_wal_parent_prepare_calls_{0};
+    // Path lookups of a chunk's image, WAL or their directory made by a
+    // chunk load or for a WAL's size (CurrentWalFileSize).
+    mutable std::atomic<std::uint64_t> stats_chunk_file_probes_{0};
     std::atomic<std::uint64_t> stats_eviction_recency_skips_{0};
     std::atomic<std::uint64_t> stats_empty_chunk_gcs_{0};
     std::atomic<std::uint64_t> stats_wal_barriers_{0};
@@ -1449,6 +1547,7 @@ class ChunkStore {
     [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix = false,
         const std::shared_ptr<ChunkCoordinateIndex>& recovery_index = {});
     [[nodiscard]] std::vector<ChunkCoord> AdmitCoordinateArtifacts(ChunkCoordinateIndex& index);
+    bool AdmitCoordinateArtifact(const std::filesystem::path& path, const ChunkCoord& coord);
     void PrepareCoordinateIndex();
     void InitializeCoordinateIndex();
     [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> CoordinateIndexForScan();
@@ -1576,7 +1675,8 @@ class ChunkStore {
     void NoteUnsyncedDir(const std::filesystem::path& path);
     // Keeps the unsynced set within unsynced_limit_. Requires unsynced_mutex_.
     void LimitUnsyncedLocked();
-    // Puts a failed barrier's drained artifacts back into the unsynced set.
+    // Puts a failed barrier's drained artifacts back into the unsynced set;
+    // out of memory, it sets the overflow flag instead.
     void RestoreUnsynced(UnsyncedArtifacts drained);
 
     void StartMaintenanceThread();
@@ -1585,11 +1685,18 @@ class ChunkStore {
     [[nodiscard]] bool EnqueueBackgroundCheckpoint(const ChunkCoord& chunk_coord);
     void RunBackgroundCheckpoint(const ChunkCoord& chunk_coord) noexcept;
     // Waits, releasing `lock`, while a background checkpoint owns the
-    // chunk's files.
+    // chunk's files. Cleanup and background paths wait without a stop.
     void AwaitChunkFilesLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk);
+    // The same wait for a statement before its decision: a stop ends it and
+    // the chunk lock's retaking after it, and throws StatementStoppedError
+    // with `lock` released.
+    void AwaitStatementChunkFilesLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk);
     // Waits only while an ordinary write would also pass the hard bound of
-    // deferred checkpoints (MaybeCheckpointChunk).
+    // deferred checkpoints (MaybeCheckpointChunk); a statement's stop ends it
+    // like AwaitStatementChunkFilesLocked.
     void AwaitChunkBacklogLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk);
+    template <typename Ready>
+    void AwaitStatementCheckpointIoLocked(std::unique_lock<RegularChunkMutex>& lock, Ready ready);
     [[nodiscard]] bool CheckpointHardBoundReached(std::size_t updates, std::size_t wal_bytes) const noexcept;
     // Before a synced checkpoint publishes an image into `directory`. A
     // chunk directory this store has not prepared itself may have been made

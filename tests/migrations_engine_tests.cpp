@@ -40,7 +40,7 @@ void GrammarAndRecords() {
         Reply(e.Run("MIGRATE 'add' ALTER TABLE realm ADD COLUMN extra u8 NULL"), "+applied\r\n");
         Reply(e.Run("MIGRATE 'add' ALTER TABLE realm ADD COLUMN extra u8 NULL"), "+skipped\r\n");
         assert(e.catalog->Find("realm")->Info().schema.version == 2U);
-        Error(e.Run(std::string("MIGRATE 'retry' ") + kCreate), "TABLE_EXISTS");
+        Error(e.Run(std::string("MIGRATE 'retry' ") + kCreate), "TABLE_EXISTS reason=table_exists table 'realm' already exists; use another name,");
         Reply(e.Run("MIGRATE 'retry' ALTER TABLE realm RENAME COLUMN extra TO other"), "+applied\r\n");
         const auto records = e.catalog->Migrations();
         assert(records.size() == 3U && records[0].name == "create_realm" && records[1].name == "add" && records[2].name == "retry");

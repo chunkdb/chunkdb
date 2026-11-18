@@ -4,17 +4,20 @@
 #include <atomic>
 #include <cstdint>
 #include <filesystem>
+#include <exception>
 #include <functional>
 #include <map>
 #include <mutex>
 #include <memory>
 #include "chunkdb/migration_health.hpp"
+#include "chunkdb/statement_mutex.hpp"
 #include <optional>
 #include <string>
 #include <string_view>
 #include <vector>
 
 #include "users.hpp"
+#include "user_admission.hpp"
 
 // The users of a data directory in memory, written through to
 // chunkdb.users (docs/design/USERS_DESIGN.md). Every change is checked against
@@ -36,13 +39,15 @@ class UserRegistry {
         std::filesystem::path data_dir,
         std::optional<std::pair<std::string, scram::Verifier>> first_admin,
         const std::array<std::uint8_t, 32>& secret,
-        bool read_only = false);
+        bool read_only = false,
+        UserAdmissionClock admission_clock = {});
 
     [[nodiscard]] std::optional<User> Find(const std::string& name) const;
-    // A user with its incarnation: a number the registry assigns when it
-    // creates or loads the user and never assigns again, so a user dropped
-    // and created again under the same name has another. Kept in memory
-    // only; sessions do not outlive the process.
+    // A user with its incarnation: a number assigned when the registry
+    // creates or loads the user and never assigned again, so a user dropped
+    // and created again under the same name has another. It is the
+    // incarnation of the user's admission state and connection tickets. Kept
+    // in memory only; sessions do not outlive the process.
     struct Incarnated {
         User user;
         std::uint64_t incarnation = 0;
@@ -51,19 +56,21 @@ class UserRegistry {
     [[nodiscard]] Users Snapshot() const;
     // The secret that derives the salts of unknown users.
     [[nodiscard]] std::array<std::uint8_t, 32> Secret() const;
+    [[nodiscard]] std::optional<UserAuthenticationSnapshot> AuthenticationSnapshot(const std::string& name) const;
+    [[nodiscard]] bool AuthenticationCurrent(const UserAuthenticationSnapshot& expected) const;
+    [[nodiscard]] UserAdmissionResult AcquireConnection(const UserAuthenticationSnapshot& expected) const;
+    [[nodiscard]] std::optional<User> FindForConnection(const std::string& name,
+        const std::shared_ptr<UserConnectionTicket>& ticket) const;
+    [[nodiscard]] UserAdmissionResult AdmitStatement(const std::shared_ptr<UserConnectionTicket>& ticket) const;
+    void SetLimits(const std::string& name, std::optional<std::uint64_t> max_connections,
+        std::optional<std::uint64_t> statements_per_sec);
     // Grows with every change, so a connection can tell its copy of its
     // user is stale with one atomic read.
     [[nodiscard]] std::uint64_t Generation() const noexcept { return generation_.load(std::memory_order_acquire); }
     // The rights and incarnations of every user as of the latest change,
     // published before Generation() moves past it. Reading it never waits
     // for the registry lock, which a change holds while it syncs the file.
-    struct RightsView {
-        struct Entry {
-            std::uint64_t incarnation = 0;
-            std::map<std::string, Right> grants;
-        };
-        std::map<std::string, Entry> users;
-    };
+    using RightsView = UserRightsView;
     [[nodiscard]] std::shared_ptr<const RightsView> Rights() const;
     // Runs `wake` after every change while the returned handle is held,
     // once the registry lock is released. It must not block or change users.
@@ -112,6 +119,7 @@ class UserRegistry {
 
   private:
     friend class TableCatalog;
+    friend struct UserRegistryTestAccess;
     std::atomic<MigrationTestHook*> test_hook_{nullptr};
     std::shared_ptr<MigrationHealth> migration_health_;
     // Applies `change` to a copy, writes it, then publishes it.
@@ -119,27 +127,32 @@ class UserRegistry {
     void Update(Change&& change);
     template <typename Change>
     void UpdateIf(Change&& change);
-    // What committing `next` publishes besides it: a user no longer present
-    // retires its incarnation, a new one gets the next, and the rights view
-    // is built again. Prepared under mutex_ before anything changes, so a
-    // failure to build it leaves users, file and view as they were.
-    struct Publication {
-        std::map<std::string, std::uint64_t> incarnations;
-        std::uint64_t next_incarnation = 1;
-        std::shared_ptr<const RightsView> rights;
-    };
-    [[nodiscard]] Publication PrepareLocked(const Users& next) const;
-    void InstallLocked(Publication publication) noexcept;
-    // Under mutex_: makes `next` current and moves the generation past it;
-    // `wakes` runs every OnChange once the lock is released.
-    void CommitLocked(Users next, Publication publication, Wakes& wakes) noexcept;
+    [[nodiscard]] std::shared_ptr<const Users> Published() const;
+    // What publishing `next` changes besides it: admission state, the
+    // incarnation of each user and the rights view. Prepared under mutex_
+    // before anything changes, so a failure leaves users, file and view as
+    // they were.
+    [[nodiscard]] UserPublication PreparePublication(std::shared_ptr<const Users> next) const;
+    // Under mutex_: makes `next` visible. The caller moves the generation
+    // past it and marks `wakes` changed. It runs after the durable decision,
+    // so it cannot fail: PreparePublication allocated everything it needs.
+    void Publish(UserPublication next) noexcept;
+    // Under mutex_: makes `next` current and visible, moves the generation
+    // past it, and marks `wakes` to run every OnChange once the lock is
+    // released. Like Publish, it cannot fail.
+    void CommitPublication(Users next, UserPublication publication, Wakes& wakes) noexcept;
+    void ConfirmPublication();
 
     const std::filesystem::path data_dir_;
     const bool read_only_;
-    mutable std::mutex mutex_;
+    const UserAdmissionClock admission_clock_;
+    mutable StatementMutex mutex_;
     Users users_;
-    std::map<std::string, std::uint64_t> incarnations_;
-    std::uint64_t next_incarnation_ = 1;
+    std::exception_ptr publication_unknown_;
+    // Readers use one published image while the serialized writer performs I/O.
+    mutable std::mutex published_mutex_;
+    std::shared_ptr<const Users> published_;
+    std::shared_ptr<const UserAdmissionMap> admissions_;
     std::atomic<std::uint64_t> generation_{1};
     // Guards only the pointer: held for a copy, never across I/O or another lock.
     mutable std::mutex rights_mutex_;

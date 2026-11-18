@@ -1,4 +1,5 @@
 #include "chunk_coordinate_index.hpp"
+#include "statement_control.hpp"
 
 #include <algorithm>
 #include <array>
@@ -83,49 +84,54 @@ std::vector<ChunkCoord> ChunkStore::AdmitCoordinateArtifacts(ChunkCoordinateInde
             ChunkCoord coord;
             if (!ParseChunkFilePath(path.lexically_relative(data_dir_), geometry_, &coord))
                 throw std::runtime_error("coordinate artifact has noncanonical placement: " + path.string());
-            if (auto* hook = artifact_hook.load(std::memory_order_acquire)) hook->BeforeStatus(path);
-            RequirePlainPath(path, false);
-            SharedFileInput input(path);
-            if (!input) {
-                if (access_mode_ == AccessMode::kReadOnly && !std::filesystem::exists(path)) continue;
-                throw std::runtime_error("failed to admit coordinate artifact " + path.string());
-            }
-            const auto size = FileBytes(input, path);
-            if (path.extension() == ".wal") {
-                const auto header_size = ChunkWalHeaderBytes(geometry_.dims());
-                const auto header = Prefix(input, static_cast<std::size_t>(std::min<std::uint64_t>(size, header_size)));
-                if (header.size() >= 10U && ReadLe16(header, 8U) == 1U) throw EarlierDevelopmentFormatError();
-                const bool complete = header.size() == header_size &&
-                    ReadLe32(header, header_size - 4U) == Crc32(header.data(), header_size - 4U);
-                if (!complete && IsInterruptedWalCreation(header, coord, store_id_, geometry_.dims())) {
-                    std::array<char, 65536> suffix;
-                    while (input) {
-                        input.read(suffix.data(), static_cast<std::streamsize>(suffix.size()));
-                        if (std::any_of(suffix.begin(), suffix.begin() + input.gcount(), [](char byte) { return byte != 0; }))
-                            throw std::runtime_error("interrupted WAL creation has a nonzero suffix");
-                    }
-                    if (!input.eof()) throw std::runtime_error("failed to read interrupted WAL creation");
-                } else {
-                    ValidateWalHeader(header, coord, store_id_, features_, geometry_.dims());
-                }
-            } else {
-                if (size < 12U) throw std::runtime_error("coordinate image header is truncated");
-                const auto first = Prefix(input, 12U);
-                if (ReadLe16(first, 8U) == 1U) throw EarlierDevelopmentFormatError();
-                const auto count = ReadLe16(first, 10U);
-                if (count > kImageMaxSections) throw std::runtime_error("coordinate image has too many sections");
-                const auto header_size = ChunkImageHeaderBytes(geometry_.dims(), count);
-                input.seekg(0);
-                const auto header = Prefix(input, header_size);
-                (void)ParseChunkImageHeader(header, size,
-                    {.dims = geometry_.dims(), .epoch = store_id_, .coord = coord, .admitted_features = features_},
-                    {.max_file_bytes = kMaxChunkImageFileBytes, .max_section_stored_bytes = kMaxChunkImageFileBytes,
-                        .max_section_raw_bytes = kMaxChunkImageRawBytes, .max_total_raw_bytes = kMaxChunkImageRawBytes});
-            }
+            if (!AdmitCoordinateArtifact(path, coord)) continue;
             coordinates.insert(coord);
         }
     }
     return {coordinates.begin(), coordinates.end()};
+}
+
+bool ChunkStore::AdmitCoordinateArtifact(const std::filesystem::path& path, const ChunkCoord& coord) {
+    if (auto* hook = artifact_hook.load(std::memory_order_acquire)) hook->BeforeStatus(path);
+    RequirePlainPath(path, false);
+    SharedFileInput input(path);
+    if (!input) {
+        if (access_mode_ == AccessMode::kReadOnly && !std::filesystem::exists(path)) return false;
+        throw std::runtime_error("failed to admit coordinate artifact " + path.string());
+    }
+    const auto size = FileBytes(input, path);
+    if (path.extension() == ".wal") {
+        const auto header_size = ChunkWalHeaderBytes(geometry_.dims());
+        const auto header = Prefix(input, static_cast<std::size_t>(std::min<std::uint64_t>(size, header_size)));
+        if (header.size() >= 10U && ReadLe16(header, 8U) == 1U) throw EarlierDevelopmentFormatError();
+        const bool complete = header.size() == header_size &&
+            ReadLe32(header, header_size - 4U) == Crc32(header.data(), header_size - 4U);
+        if (!complete && IsInterruptedWalCreation(header, coord, store_id_, geometry_.dims())) {
+            std::array<char, 65536> suffix;
+            while (input) {
+                input.read(suffix.data(), static_cast<std::streamsize>(suffix.size()));
+                if (std::any_of(suffix.begin(), suffix.begin() + input.gcount(), [](char byte) { return byte != 0; }))
+                    throw std::runtime_error("interrupted WAL creation has a nonzero suffix");
+            }
+            if (!input.eof()) throw std::runtime_error("failed to read interrupted WAL creation");
+        } else {
+            ValidateWalHeader(header, coord, store_id_, features_, geometry_.dims());
+        }
+    } else {
+        if (size < 12U) throw std::runtime_error("coordinate image header is truncated");
+        const auto first = Prefix(input, 12U);
+        if (ReadLe16(first, 8U) == 1U) throw EarlierDevelopmentFormatError();
+        const auto count = ReadLe16(first, 10U);
+        if (count > kImageMaxSections) throw std::runtime_error("coordinate image has too many sections");
+        const auto header_size = ChunkImageHeaderBytes(geometry_.dims(), count);
+        input.seekg(0);
+        const auto header = Prefix(input, header_size);
+        (void)ParseChunkImageHeader(header, size,
+            {.dims = geometry_.dims(), .epoch = store_id_, .coord = coord, .admitted_features = features_},
+            {.max_file_bytes = kMaxChunkImageFileBytes, .max_section_stored_bytes = kMaxChunkImageFileBytes,
+                .max_section_raw_bytes = kMaxChunkImageRawBytes, .max_total_raw_bytes = kMaxChunkImageRawBytes});
+    }
+    return true;
 }
 
 void ChunkStore::PrepareCoordinateIndex() {
@@ -197,23 +203,48 @@ std::shared_ptr<ChunkCoordinateIndex> ChunkStore::CoordinateIndexForScan() {
     const auto before = ReadSnapshotGenerationForScan(snapshot_generation_path_, snapshot_generation_record_seen_);
     if ((before.second & 1U) != 0U) throw std::runtime_error("read-only coordinate scan is unstable during writer publication");
     if (coordinate_index_complete_ && coordinate_index_generation_ == before) return coordinate_index_;
-    auto candidate = std::make_shared<ChunkCoordinateIndex>(data_dir_, geometry_, store_id_, true);
+    auto changes = ReadSnapshotCoordinateChanges(data_dir_, before,
+        coordinate_index_complete_ && coordinate_index_generation_.first == before.first
+            ? coordinate_index_changes_cursor_ : std::nullopt);
+    const auto incremental = coordinate_index_complete_ && changes.complete;
+    std::shared_ptr<ChunkCoordinateIndex> candidate;
+    if (incremental) {
+        const auto path = data_dir_ / kChunkIndexFileName;
+        SharedFileInput input(path);
+        if (!input) throw std::runtime_error("read-only table is missing its coordinate inventory");
+        const auto header = ReadIndexInventoryHeader(input, FileBytes(input, path), geometry_, store_id_);
+        if (header.compaction_pending) throw std::runtime_error("coordinate compaction requires writer recovery");
+        if (header.generation == coordinate_index_->inventory_generation()) candidate = coordinate_index_;
+    }
+    if (!candidate) candidate = std::make_shared<ChunkCoordinateIndex>(data_dir_, geometry_, store_id_, true);
     std::vector<ChunkCoord> coordinates;
     try {
-        coordinates = AdmitCoordinateArtifacts(*candidate);
+        if (incremental) {
+            coordinates = std::move(changes.coordinates);
+            std::sort(coordinates.begin(), coordinates.end());
+            coordinates.erase(std::unique(coordinates.begin(), coordinates.end()), coordinates.end());
+            for (const auto& coord : coordinates) {
+                const auto directory = LargeChunkDirectory(data_dir_, geometry_.ChunkToLarge(coord), geometry_.dims());
+                if (std::filesystem::exists(std::filesystem::symlink_status(directory))) RequirePlainPath(directory, true);
+                for (const auto& path : {ChunkDataPath(data_dir_, geometry_, coord), ChunkWalPath(data_dir_, geometry_, coord)}) {
+                    if (std::filesystem::exists(std::filesystem::symlink_status(path)))
+                        (void)AdmitCoordinateArtifact(path, coord);
+                }
+            }
+        } else coordinates = AdmitCoordinateArtifacts(*candidate);
     } catch (const std::exception&) {
         if (ReadSnapshotGenerationForScan(snapshot_generation_path_, snapshot_generation_record_seen_) != before)
             throw std::runtime_error("read-only coordinate index changed during artifact admission");
         throw;
     }
+    std::vector<RecoveredCoordinateIdentity> updates;
     for (const auto& coord : coordinates) {
+        CheckStatementCancellation();
         auto loaded = LoadChunkPayload(coord, false, candidate);
         BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);
         BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
-        candidate->ObserveRecovered(coord, ChunkState{.version = loaded.revision,
-            .payload = std::move(loaded.payload), .presence_bitmap = std::move(loaded.presence_bitmap),
-            .vars = std::move(loaded.vars), .written = loaded.revision != 0U,
-            .commit_time_ms = loaded.commit_time_ms, .chunk_columns = std::move(loaded.chunk_columns)});
+        updates.push_back({coord, loaded.revision,
+            ChunkPopulated(geometry_, loaded.presence_bitmap, loaded.chunk_columns.get())});
     }
     std::vector<std::pair<ChunkCoord, std::shared_ptr<RegularChunk>>> cached;
     {
@@ -225,21 +256,31 @@ std::shared_ptr<ChunkCoordinateIndex> ChunkStore::CoordinateIndexForScan() {
         }
     }
     for (const auto& [coord, chunk] : cached) {
-        std::shared_lock lock(chunk->mutex);
+        CheckStatementCancellation();
+        auto lock = LockStatementChunkShared(chunk->mutex);
         if (chunk->read_only_generation != before) continue;
         if (chunk->written != (chunk->version != 0U))
             throw std::logic_error("cached coordinate has an inconsistent producing identity");
-        candidate->ObserveRecoveredIdentity(coord, chunk->version,
-            ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get()));
+        updates.push_back({coord, chunk->version,
+            ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get())});
     }
-    const auto after = ReadSnapshotGenerationForScan(snapshot_generation_path_, snapshot_generation_record_seen_);
-    if (before != after || (after.second & 1U) != 0U)
-        throw std::runtime_error("read-only coordinate index changed during collection");
-    coordinate_index_ = candidate;
+    const auto validate = [&] {
+        const auto after = ReadSnapshotGenerationForScan(snapshot_generation_path_, snapshot_generation_record_seen_);
+        if (before != after || (after.second & 1U) != 0U)
+            throw std::runtime_error("read-only coordinate index changed during collection");
+    };
+    if (incremental) coordinate_index_->RefreshReadOnly(updates, *candidate, validate);
+    else {
+        for (const auto& update : updates)
+            candidate->ObserveRecoveredIdentity(update.coord, update.revision, update.populated);
+        validate();
+        coordinate_index_ = candidate;
+    }
     read_only_retained_index_ = candidate;
     coordinate_index_generation_ = before;
+    coordinate_index_changes_cursor_ = changes.cursor;
     coordinate_index_complete_ = true;
-    return candidate;
+    return coordinate_index_;
 }
 
 }  // namespace chunkdb

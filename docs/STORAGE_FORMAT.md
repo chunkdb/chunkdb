@@ -31,7 +31,7 @@ data_dir/
   chunkdb.migrations                  completed named migration records, when present
   chunkdb.migration.pending           decided migration awaiting completion, when present
   .chunkdb.lock/                      writer-process lock
-  .chunkdb.staging/                    table creation staging
+  .chunkdb.staging/                    table creation and restore staging
   .chunkdb.dropped/                    tables renamed out of the catalog
   .chunkdb.backups/                    temporary pinned backup files
   tables/<name>/
@@ -39,6 +39,7 @@ data_dir/
     chunkdb.version                   reserved revision ceiling
     chunkdb.snapshot                  checked writer-session crash fence
     chunkdb.snapshot.live             volatile mapped artifact generation
+    chunkdb.snapshot.changes          volatile coordinate change ring
     .chunkdb.lock/snapshot.writer     writer-lifetime coordination lock
     .chunkdb.lock/snapshot.owner      lock that excludes a second writer
     .chunkdb.initialized              checked revision-clock initialization marker
@@ -60,6 +61,8 @@ The catalog's directory names match `[a-z0-9][a-z0-9_-]{0,63}`, excluding `con`,
 Entries in `tables/` with invalid names are ignored; a table directory with a valid name and no manifest is damage.
 
 Creation prepares a complete table under `.chunkdb.staging/`, publishes it by a rename that cannot replace an existing table, then syncs both parents.
+RESTORE TABLE builds its table the same way: it copies the backed-up table under `.chunkdb.staging/`, rebinds it to a new epoch and syncs it before that rename.
+SWAP TABLES syncs both tables' WALs, closes them, marks their slots to resync, exchanges `tables/<a>/` and `tables/<b>/` in one atomic directory exchange and syncs `tables/`; a crash leaves both names exchanged or neither.
 DROP raises and syncs the root version floor before moving the closed table into `.chunkdb.dropped/`.
 The rename commits the drop; deletion can finish at startup.
 Writer startup recovers decided migrations before interrupted-table cleanup and table opening.
@@ -367,6 +370,7 @@ Repair truncates to the accepted boundary and syncs it; when backup hard links p
 Archived WALs are closed segments and require complete valid framing throughout; the live trailing-append policy does not apply to them.
 Persisted revisions survive eviction and restart; a missing chunk artifact gets a fresh revision when loaded.
 The store clock reserves ranges durably before issuing tokens and advances past any recovered revision at or above its ceiling.
+When no further range fits below 2^64, every later write is refused with `chunk version clock exhausted` and the clock never wraps.
 
 ## Revision and snapshot bookkeeping
 
@@ -392,6 +396,14 @@ Writer startup replaces this volatile file once; artifact guards update only its
 Bit 0 is odd while publishing, bit 1 records a failed epoch, bits 2–17 count active guards, and bits 18–63 count completed epochs.
 The last successful guard publishes a new even counter synchronously; failed epochs remain odd until recovery.
 Lock-free aligned 64-bit mapped atomics are required; unsupported platforms are refused.
+
+The optional `chunkdb.snapshot.changes` file accelerates read-only coordinate-index refresh without changing the durable storage format.
+Its 32-byte header is `CKSC`, format `1:u32`, writer session `u64`, CRC32 over the first 16 bytes, zero `u32`, and an aligned native little-endian `u64` append cursor at offset 24.
+The header is followed by 4096 ring entries, each containing four aligned native little-endian 64-bit words: signed chunk x, y, z and a kind (`1` for a coordinate, `0` for table-wide invalidation).
+Writers serialize appends inside their odd snapshot bracket before changing artifacts; entries and cursor use mapped atomics, and the last guard's even publication orders their visibility with the artifacts.
+The file is replaced at writer startup, is never a durable authority and is omitted from backups.
+Readers require the same writer session, a retained interval of at most 4096 entries containing no invalidation, and equal-even observations around collection and publication; otherwise they perform full artifact admission.
+An absent file supports older writers through full admission, while a malformed present file fails validation.
 
 A writer first takes an exclusive lock on `.chunkdb.lock/snapshot.owner`, which readers never open, so a second writer is refused.
 It then tests `.chunkdb.lock/snapshot.writer` with a shared lock, refusing an exclusive holder, and waits for its exclusive lock, which it holds through shutdown.
@@ -464,7 +476,7 @@ Failure repairing an uncommitted operation fences the affected store until recov
 3. Per slot: name length `u8`, slot flags `u8`, projection count `u16`, written revision `u64`, name bytes, then the parts its flags select: area coordinates (`i64` each), projection IDs (`u32` each), and owner length `u8` with owner bytes.
 4. CRC32 over all preceding bytes.
 
-Slot flags are `0x1` lost, `0x2` area, `0x4` projection, `0x8` NO BEFORE, `0x10` CHUNKS, `0x20` lost by a dropped projected column, and `0x40` owner; the projection count is nonzero exactly with `0x4`.
+Slot flags are `0x1` lost, `0x2` area, `0x4` projection, `0x8` NO BEFORE, `0x10` CHUNKS, `0x20` lost by a dropped projected column, `0x40` owner, and `0x80` resync, set by a restore or SWAP TABLES and never with `0x1`; the projection count is nonzero exactly with `0x4`.
 The only header flag, `0x1`, is the filter format; it permits the filter flags `0x2` through `0x20`, requires `slot_filters`, and stays set once written.
 The owner flag needs no header flag or feature bit.
 The dimensions byte is 2 or 3 and must match the owning table.
@@ -493,7 +505,7 @@ Live-history readers capture completed byte boundaries and read only the prefix 
 
 `data_dir/chunkdb.users` is atomically replaced with file and directory sync:
 
-1. `CKDU`, version `1:u32`, server secret (32 bytes), user count `u32`.
+1. `CKDU`, version `2:u32`, server secret (32 bytes), user count `u32`.
 2. Each user stores these fields in order:
 
 - Name length `u16` and name.
@@ -501,11 +513,15 @@ Live-history readers capture completed byte boundaries and read only the prefix 
 - SCRAM iterations `u32` (4096 to 1000000), salt length `u16` (16 to 256), and salt.
 - Stored key (32 bytes), server key (32 bytes), and grant count `u32`.
 3. Per grant: table-name length `u16` and name, right `u8` (1 READ, 2 WRITE, 3 ADMIN); `*` names all tables.
-4. CRC32 over all preceding bytes.
+4. After each user's grants: `max_connections:u64`, `statements_per_sec:u64`, little-endian. Zero disables a limit; the rate is at most 65536.
+5. CRC32 over all preceding bytes, including the limits.
 
+Before serialization or file replacement, the writer checks u16 name widths, salt lengths, u32 user/grant counts, SCRAM iterations (4096–1000000), known rights and the rate limit. Invalid input leaves the existing file and directory metadata unchanged and does not create a new store.
 Writer serialization orders users by name and grants by table; decoding refuses duplicate users/grants, unknown flags/rights/version, bad checksum, truncation, or trailing bytes.
 The writer refuses a salt outside that range or a name over 65535 bytes instead of shortening it; decoding also refuses user and table names that CREATE USER and GRANT refuse.
 Password verifiers contain no plaintext password; the secret derives unknown-user salts used by authentication.
+Earlier development users files are refused with a recreate error before permissions or bookkeeping change; they are not migrated.
+The file is admitted independently of the catalog manifest, including standalone users stores.
 
 ## Named migrations
 
@@ -587,7 +603,7 @@ A failed removal is logged as a warning and retried by the next backup or writer
 Restore validates the complete inventory before publication and gives the root and every table fresh identities.
 
 It rewrites image/WAL header identities/checksums and re-encodes the ledger for the new root without changing its records.
-Retained slots start at their table’s cut in the fresh epoch, with a new baseline and no historical archive transfer.
+Retained slots start at their table’s cut in the fresh epoch, with a new baseline and no historical archive transfer, marked to resync.
 Recoverable WAL tails are normalized before rewriting.
 Restore removes the backup marker and publishes the destination with its incomplete guard held until final durable completion.
 

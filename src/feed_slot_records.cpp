@@ -9,6 +9,7 @@
 
 #include "chunk_store_internal.hpp"
 #include "checkpoint.hpp"
+#include "statement_control.hpp"
 #include "chunkdb/crc32.hpp"
 #include "store_manifest.hpp"
 #include "user_registry.hpp"
@@ -24,7 +25,8 @@ constexpr std::size_t kMaxSlots = 1024U;
 constexpr std::uint16_t kVersion = 4U;
 constexpr std::uint8_t kFilterHeaderFlag = 1U;
 constexpr std::uint8_t kOwnerFlag = 64U;
-constexpr unsigned kSlotFlags = 1U | 2U | 4U | 8U | 16U | 32U | kOwnerFlag;
+constexpr std::uint8_t kResyncFlag = 128U;
+constexpr unsigned kSlotFlags = 1U | 2U | 4U | 8U | 16U | 32U | kOwnerFlag | kResyncFlag;
 
 [[noreturn]] void BadRecords(const std::string& why) {
     throw std::runtime_error("invalid chunkdb.slots: " + why);
@@ -41,6 +43,7 @@ void ValidateRecords(const FeedSlotRecords& records) {
         if (!names.insert(slot.name).second) BadRecords("duplicate name");
         if (slot.written > records.durable_watermark) BadRecords("position above durable watermark");
         if (slot.schema_filter_lost && !slot.lost) BadRecords("schema loss without lost state");
+        if (slot.resync && slot.lost) BadRecords("resync on a lost slot");
         if (slot.filters.area) {
             const auto& area = *slot.filters.area;
             if (area.dims != records.dims) BadRecords("filter dimensionality differs from table");
@@ -91,7 +94,7 @@ std::vector<std::uint8_t> SerializeFeedSlotRecords(const FeedSlotRecords& record
         bytes.push_back(static_cast<std::uint8_t>(slot.name.size()));
         const auto flags = (slot.lost ? 1U : 0U) | (slot.filters.area ? 2U : 0U) |
             (slot.filters.column_ids ? 4U : 0U) | (slot.filters.no_before ? 8U : 0U) |
-            (slot.filters.chunks ? 16U : 0U) | (slot.schema_filter_lost ? 32U : 0U) | (slot.owner ? kOwnerFlag : 0U);
+            (slot.filters.chunks ? 16U : 0U) | (slot.schema_filter_lost ? 32U : 0U) | (slot.owner ? kOwnerFlag : 0U) | (slot.resync ? kResyncFlag : 0U);
         bytes.push_back(static_cast<std::uint8_t>(flags));
         WriteLe16(bytes, static_cast<std::uint16_t>(slot.filters.column_ids ? slot.filters.column_ids->size() : 0U));
         WriteLe64(bytes, slot.written);
@@ -153,6 +156,7 @@ FeedSlotRecords ParseRecords(const std::vector<std::uint8_t>& bytes, const Store
             .lost = (flags & 1U) != 0U,
             .filters = {.no_before = (flags & 8U) != 0U, .chunks = (flags & 16U) != 0U},
             .schema_filter_lost = (flags & 32U) != 0U,
+            .resync = (flags & kResyncFlag) != 0U,
         });
         at += 12U + length;
         auto& slot = records.slots.back();
@@ -219,7 +223,8 @@ std::optional<FeedSlotRecords> ReadFeedSlotRecords(const std::filesystem::path& 
 }
 
 void WriteFeedSlotRecords(const std::filesystem::path& dir, const FeedSlotRecords& records, bool* published) {
-    AtomicWrite(dir / kFeedSlotsFileName, SerializeFeedSlotRecords(records), true, true, published);
+    AtomicWrite(dir / kFeedSlotsFileName, SerializeFeedSlotRecords(records), true, true, published, nullptr, true,
+        EnterStatementDecision);
 }
 
 }  // namespace chunkdb

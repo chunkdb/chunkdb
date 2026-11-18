@@ -27,6 +27,7 @@
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
 #include "chunk_coordinate_index.hpp"
+#include "statement_control.hpp"
 
 #ifdef _WIN32
 #include <fcntl.h>
@@ -89,11 +90,39 @@ void ChunkStore::AwaitChunkFilesLocked(std::unique_lock<RegularChunkMutex>& lock
     checkpoint_io_cv_.wait(lock, [&] { return !chunk.checkpoint_io; });
 }
 
+template <typename Ready>
+void ChunkStore::AwaitStatementCheckpointIoLocked(std::unique_lock<RegularChunkMutex>& lock, Ready ready) {
+    if (ready()) return;
+    const auto stop = StatementStopToken();
+    if (!stop.stop_possible()) {
+        checkpoint_io_cv_.wait(lock, ready);
+        return;
+    }
+    // The wait retakes the chunk lock through this, so a stop also ends that
+    // admission; the predicate then ends the wait without the lock.
+    struct StoppableRelock {
+        RegularChunkMutex& mutex;
+        std::stop_token stop;
+        bool owned = true;
+        void unlock() { owned = false; mutex.unlock(); }
+        void lock() { owned = mutex.lock(stop); }
+    } relock{*lock.release(), stop};
+    const bool ready_now = checkpoint_io_cv_.wait(relock, stop, [&] { return !relock.owned || ready(); });
+    if (relock.owned) lock = std::unique_lock<RegularChunkMutex>(relock.mutex, std::adopt_lock);
+    if (relock.owned && ready_now) return;
+    CheckStatementCancellation();
+    throw std::logic_error("a statement left a checkpoint wait without a stop");
+}
+
+void ChunkStore::AwaitStatementChunkFilesLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk) {
+    AwaitStatementCheckpointIoLocked(lock, [&] { return !chunk.checkpoint_io; });
+}
+
 void ChunkStore::AwaitChunkBacklogLocked(std::unique_lock<RegularChunkMutex>& lock, const RegularChunk& chunk) {
     // What the running checkpoint absorbs is not backlog; the writes since
     // are, and they wait once they reach the bound an inline checkpoint
     // would enforce.
-    checkpoint_io_cv_.wait(lock, [&] {
+    AwaitStatementCheckpointIoLocked(lock, [&] {
         return !chunk.checkpoint_io ||
                !CheckpointHardBoundReached(
                    chunk.pending_updates - chunk.checkpoint_io_updates,
@@ -190,7 +219,7 @@ bool ChunkStore::CheckpointChunk(
         FlushWalBatch(chunk_coord, chunk, false);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_WAL_FLUSH_ONCE")) std::_Exit(86);
     }
-    SnapshotGenerationWriteGuard snapshot_write(this);
+    SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
     bool image_committed = false;
     const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
     const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);

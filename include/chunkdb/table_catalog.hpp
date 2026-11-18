@@ -13,6 +13,7 @@
 #include <optional>
 #include <shared_mutex>
 #include <span>
+#include <stop_token>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -24,6 +25,7 @@
 #include "chunkdb/feed_slots.hpp"
 #include "chunkdb/migration_health.hpp"
 #include "chunkdb/geometry.hpp"
+#include "chunkdb/statement_mutex.hpp"
 
 namespace chunkdb {
 
@@ -154,6 +156,28 @@ struct TableDefinition {
     TableOptions options;
     std::optional<TableSchema> schema;
     std::optional<TableSchema> chunk_schema{};
+};
+
+// RESTORE TABLE (docs/design/RESTORE_TABLE.md).
+struct TableRestoreRequest {
+    // A completed backup, already resolved under --backup-dir.
+    std::filesystem::path backup;
+    // The table cut in the backup, and the name it is restored under.
+    std::string table;
+    std::string name;
+    // Ends the restore before publication; nothing is published then.
+    std::stop_token cancelled{};
+    // Called after each copied file: files and bytes copied, and their totals.
+    std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t)> progress{};
+};
+struct TableRestoreResult {
+    std::string name;
+    StoreId epoch{};
+    // The lineage: the backed-up epoch and the backup cut.
+    StoreId parent_epoch{};
+    std::uint64_t fork_revision = 0;
+    std::uint64_t files = 0;
+    std::uint64_t bytes = 0;
 };
 
 // A table that refuses its commands until TableCatalog::RecoverTable or a
@@ -344,7 +368,8 @@ class Table : public std::enable_shared_from_this<Table> {
     // a reopen to finish. Also guards options_.
     mutable std::mutex mutex_;
     std::condition_variable_any cv_;
-    std::mutex ddl_mutex_;
+    using DdlMutex = StatementMutex;
+    DdlMutex ddl_mutex_;
     std::size_t backup_pins_ = 0;
     std::size_t backup_pin_waiters_ = 0;
     // Written only while state_ is kBusy and no lease is active.
@@ -508,6 +533,24 @@ class TableCatalog {
     [[nodiscard]] CatalogFeatureStatus FeatureStatus();
     void WalBarrier();
     [[nodiscard]] BackupResult BackupTo(const std::filesystem::path& target, const BackupOptions& options);
+    // Copies one table of a completed backup into a private directory, gives
+    // it a new epoch whose lineage is the backup cut, and publishes it under
+    // request.name with one rename. Crash-atomic like Create: afterwards the
+    // table exists completely or not at all. Throws TableExistsError,
+    // TableFencedError, std::invalid_argument (bad name, no such backed-up
+    // table, features or options the catalog cannot serve, read-only catalog)
+    // or std::runtime_error (damaged or changed backup, I/O, cancellation).
+    TableRestoreResult RestoreTable(const TableRestoreRequest& request);
+    // Exchanges the names of two served tables with one atomic directory
+    // exchange (docs/design/RESTORE_TABLE.md). Waits for running commands and
+    // backup pins on both, makes their acknowledged writes durable, closes
+    // them, exchanges the directories and opens each under its new name as a
+    // new Table; epochs, slots and data move with the directories. After a
+    // crash both names are exchanged or neither is. Where no atomic exchange
+    // exists the tables serve again unchanged and std::runtime_error is
+    // thrown. A failure after the exchange fences the affected names until
+    // RecoverTable or a restart. `cancelled` ends the waits.
+    void SwapTables(std::string_view first, std::string_view second, std::stop_token cancelled = {});
     void SetBackupHookForTests(BackupTestHook* hook) noexcept { backup_hook_.store(hook, std::memory_order_release); }
 
   private:
@@ -589,7 +632,9 @@ class TableCatalog {
     std::shared_ptr<StoreResources> resources_;
     std::unique_ptr<ProcessLock> process_lock_;
     // Serializes Create, Drop and SetOptions.
-    mutable std::mutex operations_mutex_;
+    mutable Table::DdlMutex operations_mutex_;
+    [[nodiscard]] std::shared_lock<BackupMaintenanceGate> LockFeatureMetadataShared();
+    [[nodiscard]] std::unique_lock<BackupMaintenanceGate> LockFeatureMetadata();
     std::mutex backup_mutex_;
     // Slow metadata admission only; ordinary read/write leases do not take it.
     BackupMaintenanceGate feature_metadata_gate_;

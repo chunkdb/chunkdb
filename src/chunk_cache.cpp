@@ -2,6 +2,7 @@
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
+#include "statement_control.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "eviction.hpp"
 #include "feed_slots.hpp"
@@ -293,7 +294,7 @@ void ChunkStore::RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChun
     if (const auto now = StableSnapshotGeneration(snapshot_generation_path_, snapshot_generation_record_seen_)) {
         bool unchanged = false;
         {
-            std::shared_lock lock(chunk.mutex);
+            auto lock = LockStatementChunkShared(chunk.mutex);
             unchanged = *now == chunk.read_only_generation;
         }
         if (unchanged) {
@@ -304,7 +305,7 @@ void ChunkStore::RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChun
     auto loaded = LoadChunkPayload(chunk_coord);
     BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);
     BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
-    std::unique_lock lock(chunk.mutex);
+    auto lock = LockStatementChunk(chunk.mutex);
     // Generations only grow, so a copy another read loaded later is kept.
     if (loaded.read_only_generation <= chunk.read_only_generation) {
         return;
@@ -536,10 +537,17 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         return loaded;
     }
 
-    if (writable) {
-        CleanupAtomicTmpArtifacts(data_path);
-    }
-    if (std::filesystem::exists(data_path)) {
+    // Only a writer gets here. The image and the WAL share one directory,
+    // which a chunk that was never written may not have: its load then looks
+    // up that directory and no file in it.
+    stats_chunk_file_probes_.fetch_add(1, std::memory_order_relaxed);
+    const bool directory_present = CleanupAtomicTmpArtifacts(data_path);
+    const auto present = [&](const std::filesystem::path& path) {
+        if (!directory_present) return false;
+        stats_chunk_file_probes_.fetch_add(1, std::memory_order_relaxed);
+        return std::filesystem::exists(path);
+    };
+    if (present(data_path)) {
         try {
             FeedWalPrefixTestAccess::Run(FeedWalPrefixTestHook::Point::kImageRead, chunk_coord);
             const auto data_bytes = LoadChunkImageFile(data_path, geometry_, chunk_coord, store_id_, features_);
@@ -569,7 +577,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
     }
 
     apply_boundary();
-    if (std::filesystem::exists(wal_path)) {
+    if (present(wal_path)) {
         std::optional<SharedFileInput> opened;
         try {
             opened.emplace(wal_path);
@@ -686,7 +694,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
 }
 
 void ChunkStore::TrimWalForAppend(const ChunkCoord& chunk_coord, const std::filesystem::path& wal_path, std::size_t keep_bytes) {
-    SnapshotGenerationWriteGuard snapshot_write(this);
+    SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
     std::lock_guard publish_lock(checkpoint_publish_mutex_);
     const bool strict =
         durability_mode_ != DurabilityMode::kRelaxed ||
