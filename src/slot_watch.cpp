@@ -58,7 +58,7 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     live_options.ack_timeout_ms.reset();
     live_options.areas.clear();
     live_options.column_ids.reset(); live_options.no_before = false;
-    result->live_ = result->table_->SubscribeFeed(live_options);
+    result->live_ = result->table_->SubscribeFeed(live_options, true);
     result->join_ = result->live_->position().revision;
     result->joined_ = start.revision >= result->join_;
     { std::lock_guard lock(result->claim_->owner_mutex); result->claim_->owner = result; }
@@ -454,7 +454,7 @@ bool SlotWatch::Work() {
         options.ack_timeout_ms.reset();
         options.areas.clear();
         options.column_ids.reset(); options.no_before = false;
-        live_ = table_->SubscribeFeed(options);
+        live_ = table_->SubscribeFeed(options, true);
         join_ = live_->position().revision;
         joined_ = cursor_.revision >= join_;
         changed = true;

@@ -692,11 +692,13 @@ std::optional<std::shared_ptr<const FeedEntry>> FeedProjectionGroup::Find(
         [](const Item& item, std::uint64_t value) { return item.revision < value; });
     if (at == items_.end() || at->revision != revision ||
         at->source.owner_before(source) || source.owner_before(at->source)) return std::nullopt;
-    return at->result;
+    return at->identity ? source : at->result;
 }
 void FeedProjectionGroup::Add(const std::shared_ptr<const FeedEntry>& source,
     std::shared_ptr<const FeedEntry> result, std::size_t limit) {
-    const auto bytes = sizeof(Item) + (result && result != source ? FeedEntryRetainedBytes(*result) : 0U);
+    // The ring entry itself is not held here, so it never outlives the ring.
+    const bool identity = result == source;
+    const auto bytes = sizeof(Item) + (result && !identity ? FeedEntryRetainedBytes(*result) : 0U);
     std::lock_guard lock(mutex_);
     // Another member must still read it; one larger than the share is not kept.
     if (positions_.size() < 2U || bytes > limit) return;
@@ -711,7 +713,7 @@ void FeedProjectionGroup::Add(const std::shared_ptr<const FeedEntry>& source,
     const auto at = std::lower_bound(items_.begin(), items_.end(), revision,
         [](const Item& item, std::uint64_t value) { return item.revision < value; });
     if (at != items_.end() && at->revision == revision) return;
-    items_.insert(at, Item{revision, source, std::move(result), bytes});
+    items_.insert(at, Item{revision, source, identity ? nullptr : std::move(result), identity, bytes});
     bytes_ += bytes;
 }
 void FeedProjectionGroup::Join(std::uint64_t position) {
@@ -793,7 +795,7 @@ std::optional<FeedPosition> FeedSubscription::Progress() {
 std::shared_ptr<const FeedEntry> FeedSubscription::Next(std::chrono::milliseconds timeout) {
     return feed_->Next(*this, timeout);
 }
-std::unique_ptr<FeedSubscription> ChangeFeed::Subscribe(std::weak_ptr<Table> table, const FeedOptions& options) {
+std::unique_ptr<FeedSubscription> ChangeFeed::Subscribe(std::weak_ptr<Table> table, const FeedOptions& options, bool slot) {
     auto result = std::unique_ptr<FeedSubscription>(new FeedSubscription(shared_from_this(), {}, options));
     std::lock_guard lock(mutex_);
     if (error_) std::rethrow_exception(error_);
@@ -808,7 +810,7 @@ std::unique_ptr<FeedSubscription> ChangeFeed::Subscribe(std::weak_ptr<Table> tab
         notifications_.push_back(result->notify_);
     }
     FeedProjectionGroup::Key key{result->areas_, result->column_ids_, result->no_before_, options.chunks};
-    if (!key.areas.empty() || key.column_ids || key.no_before || key.chunks) {
+    if (!slot && (!key.areas.empty() || key.column_ids || key.no_before || key.chunks)) {
         std::erase_if(groups_, [](const auto& group) { return group.expired(); });
         for (const auto& weak : groups_) {
             if (auto group = weak.lock(); group && group->key() == key) { result->group_ = std::move(group); break; }
@@ -823,6 +825,7 @@ std::unique_ptr<FeedSubscription> ChangeFeed::Subscribe(std::weak_ptr<Table> tab
         result->group_position_ = result->position_.revision;
     }
     result->chunks_ = options.chunks;
+    result->slot_ = slot;
     if (options.chunks) chunk_watchers_.fetch_add(1U, std::memory_order_acq_rel);
     result->table_ = std::move(table);
     return result;
@@ -881,13 +884,13 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Next(FeedSubscription& sub, std::ch
         std::optional<Geometry> chunk_geometry;
         if (!shared) {
             if (sub.column_ids_) columns = geometry_->LayoutAt(entry->schema_version).schema().columns;
-            if (sub.chunks_) chunk_geometry = geometry_;
+            if (sub.chunks_ && !sub.slot_) chunk_geometry = geometry_;
         }
         lock.unlock();
         std::shared_ptr<const FeedEntry> filtered;
         if (shared) filtered = std::move(*shared);
         else {
-            filtered = sub.chunks_ && entry->kind == FeedEntry::Kind::kChange
+            filtered = sub.chunks_ && !sub.slot_ && entry->kind == FeedEntry::Kind::kChange
                 ? ChunkFeedEntry(entry, *chunk_geometry, sub.areas_, sub.column_ids_)
                 : FilterFeedEntry(entry, sub.areas_, sub.column_ids_, sub.no_before_, columns);
             // Each group shares at most an equal part of the feed budget.

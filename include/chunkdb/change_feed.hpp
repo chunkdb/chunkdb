@@ -136,6 +136,8 @@ class FeedSubscription {
     std::optional<std::vector<std::uint32_t>> column_ids_;
     bool no_before_ = false;
     bool chunks_ = false;
+    // A slot watch's live reader, which projects each entry itself.
+    bool slot_ = false;
     std::uint64_t reset_ = 0;
     bool invalid_ = false;
     bool ended_ = false;

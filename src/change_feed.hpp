@@ -66,7 +66,9 @@ class FeedProjectionGroup {
     struct Item {
         std::uint64_t revision = 0;
         std::weak_ptr<const FeedEntry> source;
+        // Null when `source` itself is the projection: the ring holds and charges it.
         std::shared_ptr<const FeedEntry> result;
+        bool identity = false;
         std::size_t bytes = 0;
     };
     void Prune(std::uint64_t through) noexcept;
@@ -92,7 +94,9 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     [[nodiscard]] std::size_t budget() const noexcept { return budget_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t CompletedWatermark() const;
     void NotifyDurableWatermark();
-    [[nodiscard]] std::unique_ptr<FeedSubscription> Subscribe(std::weak_ptr<Table> table, const FeedOptions& options);
+    // A slot watch's live reader (`slot`) receives ring entries unprojected and
+    // joins no projection group: the watch projects each entry itself.
+    [[nodiscard]] std::unique_ptr<FeedSubscription> Subscribe(std::weak_ptr<Table> table, const FeedOptions& options, bool slot = false);
 
   private:
     friend class FeedWriteGuard;

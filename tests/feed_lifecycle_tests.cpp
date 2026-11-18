@@ -613,6 +613,70 @@ void SeveralAreasShareOneProjection() {
     assert(txn_test::ThrowsAs<std::invalid_argument>([&] { (void)table->SubscribeFeed({.areas = {low, FeedArea{{0, 0, 0}, {0, 0, 0}, 3U}}}); }));
 }
 
+// A projection group keeps an item only while another member must still read
+// it, within its share of the feed budget and above the ring floor; an item
+// that is the ring entry itself does not outlive the ring.
+void ProjectionGroupBounds() {
+    ScopedTempDir dir("chunkdb-feed-group-bounds");
+    TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    // Ungrouped; each read waits until the sender has placed that write in the ring.
+    auto plain = table->SubscribeFeed({.buffer_bytes = 4096U});
+    std::uint32_t value = 0U;
+    const auto write = [&] {
+        { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(++value)); }
+        assert(Next(*plain)->kind == FeedEntry::Kind::kChange);
+    };
+    const auto evict = [&] { for (int i = 0; i < 64; ++i) write(); };
+    // NO BEFORE copies every change, so each read either shares or projects its own.
+    auto fast = table->SubscribeFeed({.no_before = true});
+    auto slow = table->SubscribeFeed({.no_before = true});
+    std::vector<std::unique_ptr<FeedSubscription>> others;
+    for (std::int64_t i = 1; i < 64; ++i) others.push_back(table->SubscribeFeed({.areas = {FeedArea{{i, i}, {i, i}}}}));
+    // 64 groups leave each a share of 64 bytes, less than one projection.
+    write();
+    auto a = Next(*fast);
+    const std::weak_ptr<const FeedEntry> unshared = a;
+    a.reset();
+    assert(unshared.expired());
+    others.clear();
+    // The last member to read a change keeps nothing for the others.
+    auto b = Next(*slow);
+    assert(b->kind == FeedEntry::Kind::kChange && b->position == fast->position());
+    const std::weak_ptr<const FeedEntry> last = b;
+    b.reset();
+    assert(last.expired());
+    write();
+    a = Next(*fast);
+    const std::weak_ptr<const FeedEntry> shared = a;
+    a.reset();
+    assert(Next(*slow) == shared.lock());
+    assert(shared.expired());
+    // The ring floor passes an item that the slow member never read.
+    write();
+    a = Next(*fast);
+    const std::weak_ptr<const FeedEntry> held = a;
+    a.reset();
+    assert(!held.expired());
+    evict();
+    assert(Next(*fast)->kind == FeedEntry::Kind::kResync && !held.expired());
+    write();
+    assert(Next(*fast)->kind == FeedEntry::Kind::kChange && held.expired());
+    assert(Next(*slow)->kind == FeedEntry::Kind::kResync);
+    // An area that holds every change shares the ring entry without holding it.
+    auto reader = table->SubscribeFeed({.areas = {FeedArea{{0, 0}, {0, 0}}}});
+    auto lagging = table->SubscribeFeed({.areas = {FeedArea{{0, 0}, {0, 0}}}});
+    { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(++value)); }
+    auto change = Next(*plain);
+    assert(Next(*reader) == change);
+    const std::weak_ptr<const FeedEntry> ring_entry = change;
+    change.reset();
+    evict();
+    assert(ring_entry.expired());
+    assert(Next(*lagging)->kind == FeedEntry::Kind::kResync);
+}
+
 void RefuseUnsupported() {
     ScopedTempDir dir("chunkdb-feed-refuse");
     { TableCatalog writable(Config(dir.path())); (void)CreateDefault(writable); }
@@ -657,4 +721,5 @@ int main(int argc, char** argv) {
     ChunkCoordinatesBeyondAbsoluteBlockDomain();
     AbsentBlockBytesAreCanonicalizedBeforeCommit();
     SeveralAreasShareOneProjection();
+    ProjectionGroupBounds();
 }

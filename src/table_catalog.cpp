@@ -425,7 +425,8 @@ void Table::QuarantineFeedLinger(const std::exception& error, std::shared_ptr<Ch
     report(error);
 }
 
-std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& options) {
+std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& options) { return SubscribeFeed(options, false); }
+std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& options, bool slot) {
     if (options.ack_timeout_ms) throw std::invalid_argument("ACK TIMEOUT requires a slot watch");
     if (options.areas.size() > kMaxFeedAreas) throw std::invalid_argument("a watch takes at most 64 areas");
     for (const auto& area : options.areas)
@@ -478,7 +479,7 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
     feed_timer_cv_.notify_all();
     if (feed_linger_.count() > 0 && !feed_linger_timer_.joinable()) StartFeedLingerTimer();
     feed_->Resume(*store);
-    auto subscription = feed_->Subscribe(weak_from_this(), options);
+    auto subscription = feed_->Subscribe(weak_from_this(), options, slot);
     ++feed_subscriptions_;
     store->feed_watchers_active_.store(true, std::memory_order_release);
     unused_feed.Dismiss();
