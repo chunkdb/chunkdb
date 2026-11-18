@@ -16,6 +16,8 @@ Committed revisions keep their values; missing chunks after a later crash do not
 | Ordinary write, fsync-checkpoint | Synced WAL acknowledgement and synced checkpoint publication. |
 | FLUSH WAL, every mode | All writes acknowledged before its arrival are durable in every table. |
 | Transaction COMMIT, every mode | All changed chunks commit together durably, or none commit. |
+| RESTORE TABLE | The restored table is durable and complete under its name, or nothing is published. |
+| SWAP TABLES | Writes acknowledged before it are durable, and both names are exchanged durably. |
 
 The **WAL**, or write-ahead log, records changes used during recovery.
 A **checkpoint** saves a chunk image so recovery can discard earlier log records safely.
@@ -78,6 +80,7 @@ Read-only inspection remains available and reports an unknown completed revision
 - macOS requests F_FULLFSYNC and falls back to fsync for unsupported operations.
 - Windows requires FlushFileBuffers and the directory-sync capability used by publication and snapshot bookkeeping.
 - Required atomic publication or sync failures return errors, including required Windows bookkeeping in relaxed mode.
+- SWAP TABLES needs an atomic directory exchange (Linux `renameat2`, macOS `renamex_np`); Windows and file systems without one refuse it.
 - Replication and durability across machines are unavailable.
 
 `chunkdb_verify` inspects files without modifying them; the server always opens its data directory for writing.

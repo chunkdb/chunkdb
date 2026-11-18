@@ -127,7 +127,7 @@ int DockerQuickStartCommands(Arguments& args) {
     if (args.Flag("--check-blocks")) {
         args.NoPositionals();
         (void)ExtractQuickStart(ReadQuickStartPages(page, reset_page));
-        std::cout << "PASS: all nine named shell fences present exactly once\n";
+        std::cout << "PASS: all ten named shell fences present exactly once\n";
         return 0;
     }
     const std::string container = args.Required("--container");

@@ -36,6 +36,8 @@ struct FeedSlot {
     std::optional<std::string> owner{};
     // Filled by a table listing under the same lease as its live schema.
     std::vector<std::optional<std::string>> column_names{};
+    // The next watch starts with resync: a restore or SWAP TABLES moved the slot.
+    bool resync = false;
 };
 
 class FeedSlotFiltersError : public std::invalid_argument {

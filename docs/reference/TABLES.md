@@ -1,4 +1,4 @@
-# CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SHOW TABLES, DESCRIBE
+# CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SWAP TABLES, SHOW TABLES, DESCRIBE
 
 You define a table's columns, inspect its schema, and change or remove it.
 A schema defines the names, types, defaults, and nullability of its columns.
@@ -67,6 +67,7 @@ ALTER TABLE table ALTER COLUMN column TYPE type [USING CLAMP | DEFAULT | TRUNCAT
 ALTER TABLE table SET option = value
 DROP TABLE [IF EXISTS] table
 RECOVER TABLE table
+SWAP TABLES table, table
 SHOW TABLES
 DESCRIBE table
 SHOW STATUS
@@ -121,6 +122,7 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 
 - CREATE, ALTER, and DROP: `OK`, including authorized conditional no-ops.
 - RECOVER TABLE: `OK` once the table serves again, or is gone because its directory is.
+- SWAP TABLES: `OK` once each name serves the other table.
 - SHOW TABLES: accessible table names, fenced tables included.
 - DESCRIBE: schema version, column definitions, geometry, options, table epoch, completed revision, dimensions, and chunk columns; a fenced table adds `fenced` with its reason.
 
@@ -135,14 +137,16 @@ The `chunk_columns` list uses the same column-description maps as `columns`.
 
 | Error | When | What to do |
 | --- | --- | --- |
-| TABLE_EXISTS | A table already exists. | Inspect it or use IF NOT EXISTS. |
+| TABLE_EXISTS | A table already exists. | Use another name, IF NOT EXISTS, [MIGRATE](MIGRATIONS.md), or DROP TABLE. |
 | NO_TABLE | A table is absent or inaccessible. | Check its name and rights. |
-| PERMISSION_DENIED | You lack ADMIN on the table, or on all tables for CREATE. | Request access. |
+| PERMISSION_DENIED | You lack ADMIN on the table, on both tables for SWAP, or on all tables for CREATE. | Request access. |
 | INVALID_ARGUMENT | A name, type, default, conversion, or option is invalid, or RECOVER TABLE names a table that is not fenced. | Correct the reported argument. |
 | INTERNAL | The table is fenced: `table 'name' is fenced: reason; run RECOVER TABLE name`. | Run RECOVER TABLE. |
 | INVALID_ARGUMENT | RECOVER TABLE finds stored options that differ from the server's option flags. | Restart the server without those flags, or with the stored values. |
 | INTERNAL | A migration with an unknown outcome fences every table. | Restart the server; see [Migrations](MIGRATIONS.md#errors). |
-| INVALID_ARGUMENT | You run CREATE, ALTER, DROP, RECOVER TABLE or ENABLE FEATURE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
+| INVALID_ARGUMENT | You run CREATE, ALTER, DROP, RECOVER TABLE, SWAP TABLES or ENABLE FEATURE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
+| INVALID_ARGUMENT | SWAP TABLES names one table twice. | Name two tables. |
+| INTERNAL | SWAP TABLES on Windows or a file system without an atomic directory exchange; both tables keep their names. | Swap on Linux or macOS, or restore under the live name after DROP TABLE. |
 | CONFLICT | An active transaction sees a schema change. | Retry from BEGIN. |
 
 ## Notes
@@ -160,6 +164,13 @@ At least one fixed-width column must remain.
 A text-only application can use `kind u1 DEFAULT 0` alongside its text column.
 DROP TABLE deletes its data, durable slots, and table-specific grants.
 Use [Migrations](MIGRATIONS.md) to record repeatable schema changes.
+
+SWAP TABLES exchanges two tables' names in one atomic step; data, epochs, lineage and durable slots stay with their tables, and grants stay with the names.
+It waits for running statements and backups on both tables and makes their acknowledged writes durable first.
+Open transactions on either table answer CONFLICT, and watches of either table end with INTERNAL `watched table was swapped; watch it again`.
+A consumer that watches the name again sees another epoch, so it resumes by [lineage](../CHANGE_FEED.md) or rebuilds.
+Each slot of either table is then reached by another name, so its next watch without AFTER starts with resync.
+A failure after the exchange fences the names it leaves unserved until RECOVER TABLE.
 
 A failure that leaves a table out of service fences it, while other tables keep serving.
 Statements on that table return INTERNAL with the fenced message and its reason.

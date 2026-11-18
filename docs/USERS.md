@@ -43,6 +43,7 @@ Dropping a table removes its specific grants.
 | WATCH SLOT on a slot another user owns | READ on the table and ADMIN on all tables |
 | SET BLOCK, DELETE BLOCK, SET CHUNK | WRITE on the table |
 | ALTER TABLE, DROP TABLE, RECOVER TABLE, CREATE SLOT, DROP SLOT | ADMIN on the table |
+| SWAP TABLES | ADMIN on both tables |
 | CREATE TABLE, SHOW METRICS, RELOAD TLS | ADMIN on all tables |
 | FLUSH WAL | WRITE on at least one table |
 | SHOW TABLES, SHOW SLOTS | None; results include accessible tables only |
@@ -50,6 +51,7 @@ Dropping a table removes its specific grants.
 | ACK | An open slot watch |
 | PING | None |
 | User management, GRANT, REVOKE, BACKUP TO | MANAGES USERS |
+| RESTORE TABLE | ADMIN on all tables, or MANAGES USERS |
 | MIGRATE | The inner statement's rights |
 
 Changing your own password is the exception to the user-management requirement.

@@ -31,7 +31,7 @@ data_dir/
   chunkdb.migrations                  completed named migration records, when present
   chunkdb.migration.pending           decided migration awaiting completion, when present
   .chunkdb.lock/                      writer-process lock
-  .chunkdb.staging/                    table creation staging
+  .chunkdb.staging/                    table creation and restore staging
   .chunkdb.dropped/                    tables renamed out of the catalog
   .chunkdb.backups/                    temporary pinned backup files
   tables/<name>/
@@ -60,6 +60,8 @@ The catalog's directory names match `[a-z0-9][a-z0-9_-]{0,63}`, excluding `con`,
 Entries in `tables/` with invalid names are ignored; a table directory with a valid name and no manifest is damage.
 
 Creation prepares a complete table under `.chunkdb.staging/`, publishes it by a rename that cannot replace an existing table, then syncs both parents.
+RESTORE TABLE builds its table the same way: it copies the backed-up table under `.chunkdb.staging/`, rebinds it to a new epoch and syncs it before that rename.
+SWAP TABLES syncs both tables' WALs, closes them, marks their slots to resync, exchanges `tables/<a>/` and `tables/<b>/` in one atomic directory exchange and syncs `tables/`; a crash leaves both names exchanged or neither.
 DROP raises and syncs the root version floor before moving the closed table into `.chunkdb.dropped/`.
 The rename commits the drop; deletion can finish at startup.
 Writer startup recovers decided migrations before interrupted-table cleanup and table opening.
@@ -465,7 +467,7 @@ Failure repairing an uncommitted operation fences the affected store until recov
 3. Per slot: name length `u8`, slot flags `u8`, projection count `u16`, written revision `u64`, name bytes, then the parts its flags select: area coordinates (`i64` each), projection IDs (`u32` each), and owner length `u8` with owner bytes.
 4. CRC32 over all preceding bytes.
 
-Slot flags are `0x1` lost, `0x2` area, `0x4` projection, `0x8` NO BEFORE, `0x10` CHUNKS, `0x20` lost by a dropped projected column, and `0x40` owner; the projection count is nonzero exactly with `0x4`.
+Slot flags are `0x1` lost, `0x2` area, `0x4` projection, `0x8` NO BEFORE, `0x10` CHUNKS, `0x20` lost by a dropped projected column, `0x40` owner, and `0x80` resync, set by a restore or SWAP TABLES and never with `0x1`; the projection count is nonzero exactly with `0x4`.
 The only header flag, `0x1`, is the filter format; it permits the filter flags `0x2` through `0x20`, requires `slot_filters`, and stays set once written.
 The owner flag needs no header flag or feature bit.
 The dimensions byte is 2 or 3 and must match the owning table.
@@ -588,7 +590,7 @@ A failed removal is logged as a warning and retried by the next backup or writer
 Restore validates the complete inventory before publication and gives the root and every table fresh identities.
 
 It rewrites image/WAL header identities/checksums and re-encodes the ledger for the new root without changing its records.
-Retained slots start at their table’s cut in the fresh epoch, with a new baseline and no historical archive transfer.
+Retained slots start at their table’s cut in the fresh epoch, with a new baseline and no historical archive transfer, marked to resync.
 Recoverable WAL tails are normalized before rewriting.
 Restore removes the backup marker and publishes the destination with its incomplete guard held until final durable completion.
 

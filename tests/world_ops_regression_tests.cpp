@@ -23,6 +23,8 @@
 #include <future>
 #include <limits>
 #include <mutex>
+#include <new>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
@@ -36,6 +38,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "chunkdb/logging.hpp"
 #include "chunkdb/protocol.hpp"
 #include "../src/chunk_store_internal.hpp"
 #include "checkpoint.hpp"
@@ -912,10 +915,27 @@ void TestCommittedIntentCleanupFailuresRemainCommitted() {
     }
 }
 
+// Fails every log line containing `needle` while it exists.
+class FailingLogSink {
+  public:
+    FailingLogSink(const char* needle, int* failed) {
+        chunkdb::SetLogSinkForTests([needle, failed](const std::string& line) {
+            if (line.find(needle) != std::string::npos) {
+                ++*failed;
+                throw std::bad_alloc();
+            }
+        });
+    }
+    ~FailingLogSink() { chunkdb::ResetLogSinkForTests(); }
+    FailingLogSink(const FailingLogSink&) = delete;
+    FailingLogSink& operator=(const FailingLogSink&) = delete;
+};
+
 void RunRejectedConditionalRollbackCase(
     ConditionalKind kind,
     const char* rollback_failpoint,
-    bool seed_existing_wal) {
+    bool seed_existing_wal,
+    const char* failing_log = nullptr) {
     chunkdb::test::ScopedTempDir dir("chunkdb-reg-conditional-rollback");
     auto config = BaseConfig(dir.path());
     config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
@@ -930,10 +950,14 @@ void RunRejectedConditionalRollbackCase(
         const auto expected = store.GetChunkVersion(0, 0);
 
         bool threw = false;
+        std::string error;
+        int failed_logs = 0;
         {
             ScopedEnv after_append(
                 "CHUNKDB_FAILPOINT_CONDITIONAL_AFTER_WAL_APPEND_ONCE", "1");
             ScopedEnv rollback_failure(rollback_failpoint, "1");
+            std::optional<FailingLogSink> sink;
+            if (failing_log != nullptr) sink.emplace(failing_log, &failed_logs);
             try {
                 if (kind == ConditionalKind::kCas) {
                     (void)store.CasChunkState(
@@ -947,11 +971,15 @@ void RunRejectedConditionalRollbackCase(
                         {.set = true, .x = 0, .y = 0, .bits = "01010"}};
                     (void)store.ApplyChunkBatch(0, 0, true, expected, ops);
                 }
-            } catch (const std::exception&) {
+            } catch (const std::exception& e) {
                 threw = true;
+                error = e.what();
             }
         }
         assert(threw);
+        // A failed log line neither replaces the error nor skips failing closed.
+        assert(failed_logs == (failing_log != nullptr ? 1 : 0));
+        assert(error.find("injected conditional-mutation failure after WAL append") != std::string::npos);
         assert(store.GetBlockBits(0, 0) ==
                (seed_existing_wal ? "10101" : "00000"));
 
@@ -993,6 +1021,16 @@ void TestConditionalRollbackFailuresRecoverFailClosed() {
             kind, "CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", true);
         RunRejectedConditionalRollbackCase(
             kind, "CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE", true);
+        RunRejectedConditionalRollbackCase(
+            kind,
+            "CHUNKDB_FAILPOINT_WAL_REMOVE_FAIL_ONCE",
+            false,
+            "failed to neutralize WAL after rejected conditional mutation");
+        RunRejectedConditionalRollbackCase(
+            kind,
+            "CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE",
+            true,
+            "failed to neutralize WAL after rejected conditional mutation");
     }
 }
 
@@ -1104,6 +1142,137 @@ void TestConditionalCheckpointFailuresDoNotBecomePostCommitErrors() {
             kind, "CHUNKDB_FAILPOINT_CHECKPOINT_BEFORE_IMAGE_REPLACE_ONCE");
         RunConditionalCheckpointFailureCase(
             kind, "CHUNKDB_FAILPOINT_CHECKPOINT_AFTER_IMAGE_REPLACE_ONCE");
+    }
+}
+
+void RunCommittedWarningFailureCase(
+    ConditionalKind kind,
+    const char* failpoint,
+    bool checkpoint_each_write) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-conditional-warning");
+    auto config = BaseConfig(dir.path());
+    if (checkpoint_each_write) {
+        config.durability_mode = chunkdb::DurabilityMode::kFsyncCheckpoint;
+        config.checkpoint_update_interval = 1;
+    } else {
+        config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+        config.checkpoint_update_interval = 1'000'000;
+        config.checkpoint_wal_bytes = 1'000'000;
+    }
+    const std::string committed =
+        kind == ConditionalKind::kCas ? "11111" : "01010";
+
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "10101");
+        const auto expected = store.GetChunkVersion(0, 0);
+        int failed_warnings = 0;
+        bool threw = false;
+        {
+            FailingLogSink sink("conditional mutation committed", &failed_warnings);
+            ScopedEnv fp(failpoint, "1");
+            try {
+                ApplyConditional(kind, &store, expected);
+            } catch (const std::exception&) {
+                threw = true;
+            }
+        }
+        assert(failed_warnings == 1);
+        assert(!threw);
+        assert(store.GetBlockBits(0, 0) == committed);
+    }
+    chunkdb::ChunkStore recovered(config);
+    assert(recovered.GetBlockBits(0, 0) == committed);
+}
+
+void TestConditionalCommittedWarningFailuresKeepTheCommit() {
+    for (const auto kind : {ConditionalKind::kCas, ConditionalKind::kBatch}) {
+        RunCommittedWarningFailureCase(
+            kind, "CHUNKDB_FAILPOINT_CONDITIONAL_INTENT_UNLINK_FAIL_ONCE", false);
+        RunCommittedWarningFailureCase(
+            kind, "CHUNKDB_FAILPOINT_CHECKPOINT_BEFORE_IMAGE_REPLACE_ONCE", true);
+        RunCommittedWarningFailureCase(
+            kind, "CHUNKDB_FAILPOINT_SNAPSHOT_GENERATION_END_FAIL_ONCE", false);
+    }
+}
+
+// Throws a value that is not a std::exception from one post-commit step: the
+// intent directory sync after its unlink, or an inline checkpoint directory sync.
+void RunCommittedNonStdFailureCase(ConditionalKind kind, bool checkpoint_each_write) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-conditional-nonstd");
+    auto config = BaseConfig(dir.path());
+    if (checkpoint_each_write) {
+        config.durability_mode = chunkdb::DurabilityMode::kFsyncCheckpoint;
+        config.checkpoint_update_interval = 1;
+    } else {
+        config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+        config.checkpoint_update_interval = 1'000'000;
+        config.checkpoint_wal_bytes = 1'000'000;
+    }
+    const std::string committed =
+        kind == ConditionalKind::kCas ? "11111" : "01010";
+
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "10101");
+        const auto expected = store.GetChunkVersion(0, 0);
+        const chunkdb::ChunkCoord coord;
+        const auto root = std::filesystem::weakly_canonical(dir.path());
+        const auto intent = chunkdb::ConditionalIntentPathForWal(
+            root, chunkdb::ChunkWalPath(root, store.geometry(), coord));
+        const auto image_dir = chunkdb::ChunkDataPath(root, store.geometry(), coord).parent_path();
+        int injected = 0;
+        bool intent_seen = false;
+        bool intent_cleared = false;
+        bool threw = false;
+        {
+            struct ResetObservers {
+                ~ResetObservers() {
+                    chunkdb::SetDirectorySyncObserverForTests({});
+                }
+            } reset;
+            chunkdb::SetDirectorySyncObserverForTests([&](const std::filesystem::path& path) {
+                if (injected != 0) return;
+                if (intent_cleared) {
+                    // Past the commit point only the inline checkpoint
+                    // syncs the image directory.
+                    if (checkpoint_each_write && path == image_dir) {
+                        ++injected;
+                        throw 7;
+                    }
+                    return;
+                }
+                if (path != intent.parent_path()) return;
+                // The first sync without the intent after it was written
+                // follows its unlink, past the commit point.
+                if (std::filesystem::exists(intent)) {
+                    intent_seen = true;
+                } else if (intent_seen) {
+                    intent_cleared = true;
+                    if (!checkpoint_each_write) {
+                        ++injected;
+                        throw 7;
+                    }
+                }
+            });
+            try {
+                ApplyConditional(kind, &store, expected);
+            } catch (...) {
+                threw = true;
+            }
+        }
+        assert(injected == 1);
+        assert(!threw);
+        assert(store.GetBlockBits(0, 0) == committed);
+    }
+    chunkdb::ChunkStore recovered(config);
+    assert(recovered.GetBlockBits(0, 0) == committed);
+}
+
+void TestConditionalCommittedNonStdFailuresKeepTheCommit() {
+    for (const auto kind : {ConditionalKind::kCas, ConditionalKind::kBatch}) {
+        RunCommittedNonStdFailureCase(kind, false);
+        RunCommittedNonStdFailureCase(kind, true);
     }
 }
 
@@ -2320,6 +2489,8 @@ int main() {
     TestConditionalRollbackFailuresRecoverFailClosed();
     TestConditionalPreCommitFailuresRemainAbsent();
     TestConditionalCheckpointFailuresDoNotBecomePostCommitErrors();
+    TestConditionalCommittedWarningFailuresKeepTheCommit();
+    TestConditionalCommittedNonStdFailuresKeepTheCommit();
     TestBarrierOverflowFallbackSucceeds();
     TestBarrierFailClosedRetainsBookkeeping();
     TestBarrierCoversConcurrentCheckpointReplacement();
