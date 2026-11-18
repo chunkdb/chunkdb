@@ -85,7 +85,9 @@ GET CHUNK cx cy [cz] FROM table [COLUMNS column, ...]
 SET CHUNK cx cy [cz] IN table [COLUMNS column, ...] $1 [IF VERSION version | IF ABSENT]
 SET CHUNK cx cy [cz] IN table META column = value [, ...] [IF VERSION version | IF ABSENT]
 GET AREA cx0 cy0 [cz0] TO cx1 cy1 [cz1] FROM table [COLUMNS column, ...] [WITH SCHEMA] [LIMIT n] [AFTER cx cy [cz]]
+    [SCALE k USING MAX | MIN | MODE | FIRST | ANY]
 GET AREA AROUND cx cy [cz] RADIUS radius FROM table [COLUMNS column, ...] [WITH SCHEMA] [LIMIT n] [AFTER cx cy [cz]]
+    [SCALE k USING MAX | MIN | MODE | FIRST | ANY]
 SCAN CHUNKS FROM table [AFTER cx cy [cz]] [LIMIT count] [SINCE revision] [WITH DATA] [COLUMNS column, ...]
 COMPACT TOMBSTONES table BEFORE revision
 SHOW TABLE STATS table
@@ -105,6 +107,7 @@ SHOW TABLE STATS table
 - `META`: update named chunk columns atomically, preserving blocks and unnamed metadata.
 - `AFTER`: exclude this position and all earlier positions in coordinate order.
 - `LIMIT`: requested cells per area page, or maximum positions per scan page; scans default to at most 1024.
+- `SCALE k USING`: return each chunk downsampled by k with the named reduction; see [Downsampled areas](#downsampled-areas).
 - `SINCE`: include current identities with producing revisions greater than this value, including retained deletions.
 - `WITH DATA`: append a complete form for populated chunks and null for deletions; required with scan COLUMNS.
 
@@ -130,6 +133,7 @@ SHOW TABLE STATS table
 | VERSION_MISMATCH | The destination changed. | Read it again and recompute. |
 | INVALID_ARGUMENT | The geometry, values, or arguments are invalid. | Check the table and syntax. |
 | INVALID_ARGUMENT | You run SET CHUNK on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
+| INVALID_ARGUMENT | SCALE does not divide every chunk side, or a column type does not accept the reduction. | Choose another factor, reduction or COLUMNS. |
 | OUT_OF_RANGE | The area or response exceeds a limit. | Read a smaller area. |
 | OUT_OF_RANGE reason=area_entry_too_large | One chunk cannot fit the response limit. | Read it with GET CHUNK or fewer COLUMNS; continue AFTER it. |
 | RESYNC_REQUIRED reason=history_lost | SINCE is below the retained-deletion floor. | Rebuild the consumer's state and resume at an admitted position. |
@@ -149,6 +153,30 @@ Reads and no-op writes do not make an unwritten chunk written.
 
 Plain area reads and scan pages do not share a snapshot.
 Use [Transactions](../TRANSACTIONS.md) when you need a consistent view of one table.
+
+## Downsampled areas
+
+`SCALE k USING reduction` returns each populated chunk as a downsampled form: every group of k blocks on each active axis becomes one cell.
+k must be positive and divide every chunk side, so a group never crosses a chunk edge; a chunk of 16 x 16 blocks with `SCALE 4` has 4 x 4 cells.
+Each chunk is reduced on its own, so the area can hold any number of chunks.
+A cell is present when a block of its group is present; cells are numbered like blocks, with each side divided by k.
+Each projected column, or every block column without COLUMNS, takes the value of one present block of the group:
+
+| Reduction | Value | Column types |
+| --- | --- | --- |
+| MAX | The largest value. | Integers, bool, f32, f64 |
+| MIN | The smallest value. | Integers, bool, f32, f64 |
+| MODE | The most frequent value; of equally frequent values, the one that occurs first. | Integers, bool, bits |
+| FIRST | The value of the first present block, NULL included. | All |
+| ANY | The value of some present block that is not NULL; which block is unspecified. | All |
+
+First means first in ascending local block index `x + width * (y + height * z)`, so x changes fastest.
+MAX, MIN, MODE and ANY skip NULL values; their cell is NULL only when every present block of the group is NULL.
+MAX and MIN skip NaN values and return NaN only when every value that is not NULL is NaN; -0 and 0 are equal, and of equal values the first wins.
+A column of another type is refused with INVALID_ARGUMENT before any chunk is read.
+The form keeps the chunk version, commit time, schema version and complete chunk columns, and adds section 7 with k and the reduction; see [Protocol](../PROTOCOL.md#chunk-form).
+SET CHUNK refuses a downsampled form.
+SCALE works with COLUMNS, WITH SCHEMA, LIMIT, AFTER and transactions, and the response limit counts the downsampled forms.
 
 ## Tombstones
 

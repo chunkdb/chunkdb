@@ -17,6 +17,18 @@ enum class ChunkFormSectionKind : std::uint16_t {
     kVariableValues = 4,
     kChunkColumns = 5,
     kBlockSpans = 6,
+    kScale = 7,
+};
+
+// How a downsampled area read reduces each group of blocks to one cell; the
+// values are the wire codes of section 7.
+enum class ChunkFormReduction : std::uint16_t { kMax = 1, kMin = 2, kMode = 3, kFirst = 4, kAny = 5 };
+
+// Section 7 (scale:u32, reduction:u16, reserved zero u16): the form holds one
+// cell per factor blocks on every active axis. Mutations refuse it.
+struct ChunkFormScale {
+    std::uint32_t factor = 1;
+    ChunkFormReduction reduction = ChunkFormReduction::kFirst;
 };
 
 struct ChunkFormHeader {

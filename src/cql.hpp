@@ -11,6 +11,7 @@
 
 #include "chunkdb/schema.hpp"
 #include "chunkdb/change_feed.hpp"
+#include "sectioned_chunk_form.hpp"
 #include "users.hpp"
 
 // CQL statements (docs/CQL.md): parsed from one request line, not yet
@@ -142,6 +143,8 @@ struct GetArea {
     std::uint8_t dims = 2;
     std::optional<std::uint64_t> limit;
     std::optional<ChunkCoord> after;
+    // SCALE k USING reduction: one cell per k blocks on every active axis.
+    std::optional<ChunkFormScale> scale;
 };
 
 struct ColumnDefinition {

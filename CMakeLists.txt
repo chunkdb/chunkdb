@@ -66,6 +66,7 @@ add_library(chunkdb_core STATIC
     src/coordinate_hash.cpp
     src/chunk_format.cpp
     src/chunk_form.cpp
+    src/chunk_scale.cpp
     src/typed_chunk_form.cpp
     src/sectioned_chunk_form.cpp
     src/txn_intent_format.cpp
@@ -408,6 +409,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_area_paging_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME area_paging COMMAND chunkdb_area_paging_test)
     set_tests_properties(area_paging PROPERTIES TIMEOUT 60 LABELS "smoke")
+    add_executable(chunkdb_area_scale_test tests/area_scale_tests.cpp)
+    target_link_libraries(chunkdb_area_scale_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_area_scale_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME area_scale COMMAND chunkdb_area_scale_test)
+    set_tests_properties(area_scale PROPERTIES TIMEOUT 60 LABELS "smoke")
 
     add_executable(chunkdb_query_limits_test tests/query_limits_tests.cpp)
     target_link_libraries(chunkdb_query_limits_test PRIVATE chunkdb_core)
@@ -1152,6 +1158,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_world_coordinates_3d_test
         chunkdb_area_cursor_test
         chunkdb_area_paging_test
+        chunkdb_area_scale_test
         chunkdb_query_limits_test
         chunkdb_typed_chunk_form_size_test
         chunkdb_feed_archive_base_test
