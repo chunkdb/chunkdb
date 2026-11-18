@@ -731,7 +731,7 @@ std::string CommandEngine::RecordAuthFailure(SessionState& session, std::string_
             "client and the server ends TLS",
             {{"reason", "channel_binding"}});
     }
-    return Protocol::Error("AUTH_FAILED", "invalid user or password; check the username and password in your connection URI");
+    return Protocol::Error("AUTH_FAILED", "invalid user or password; check the user name and password your client sends, or reset the password with chunkdb_admin reset-password");
 }
 
 CommandEngine::PayloadRequest CommandEngine::PlanPayload(
@@ -919,7 +919,7 @@ std::string CommandEngine::HandleHello(
     if (session.connection_id == 0U) session.connection_id = NewConnectionId();
     if (!hello.user) {
         if (config_.require_auth) {
-            return Protocol::Error("AUTH_REQUIRED", "use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message; set the username and password in your client connection URI");
+            return Protocol::Error("AUTH_REQUIRED", "log in with a user name and password: name the user in the URI, such as chunk://admin@host:4242/, and give the client the password (clients use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message)");
         }
         RecordAuthSuccess(session, {});
         session.hello_options = std::move(options);

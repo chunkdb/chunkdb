@@ -137,7 +137,7 @@ The `chunk_columns` list uses the same column-description maps as `columns`.
 
 | Error | When | What to do |
 | --- | --- | --- |
-| TABLE_EXISTS | A table already exists. | Inspect it or use IF NOT EXISTS. |
+| TABLE_EXISTS | A table already exists. | Use another name, IF NOT EXISTS, [MIGRATE](MIGRATIONS.md), or DROP TABLE. |
 | NO_TABLE | A table is absent or inaccessible. | Check its name and rights. |
 | PERMISSION_DENIED | You lack ADMIN on the table, on both tables for SWAP, or on all tables for CREATE. | Request access. |
 | INVALID_ARGUMENT | A name, type, default, conversion, or option is invalid, or RECOVER TABLE names a table that is not fenced. | Correct the reported argument. |

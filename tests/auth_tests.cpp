@@ -131,13 +131,14 @@ int main() {
             assert(early.close_after_reply);
         }
         const auto auth_required = engine.Execute(session, "HELLO 3\r\n");
-        assert(auth_required.rfind("-ERR AUTH_REQUIRED reason=auth_required use HELLO 3 USER <name> $1", 0) == 0);
-        assert(auth_required.find("set the username and password in your client connection URI") != std::string::npos);
+        assert(auth_required.rfind("-ERR AUTH_REQUIRED reason=auth_required log in with a user name and password", 0) == 0);
+        assert(auth_required.find("use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message") != std::string::npos);
+        assert(auth_required.find("log in with a user name and password: name the user in the URI, such as chunk://admin@host:4242/, and give the client the password") != std::string::npos);
         // The token option is gone.
         assert(engine.Execute(session, "HELLO 3 AUTH secret\r\n").starts_with("-ERR SYNTAX"));
         // A wrong password and an unknown user fail alike.
-        assert(LoginOnEngine(engine, session, "admin", "bad") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
-        assert(LoginOnEngine(engine, session, "nobody", "secret") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
+        assert(LoginOnEngine(engine, session, "admin", "bad") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the user name and password your client sends, or reset the password with chunkdb_admin reset-password\r\n");
+        assert(LoginOnEngine(engine, session, "nobody", "secret") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the user name and password your client sends, or reset the password with chunkdb_admin reset-password\r\n");
         assert(!session.authenticated && !session.greeted);
         assert(!session.close_after_reply);
 

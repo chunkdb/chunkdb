@@ -141,13 +141,13 @@ void TestLogin() {
     ExpectError(server.Run(admin, "HELLO 3"), "PROTOCOL reason=protocol HELLO was already sent");
 
     SessionState wrong;
-    ExpectReply(server.Login(wrong, "admin", "Secret"), "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
+    ExpectReply(server.Login(wrong, "admin", "Secret"), "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the user name and password your client sends, or reset the password with chunkdb_admin reset-password\r\n");
     assert(!wrong.greeted);
     SessionState ghost;
-    ExpectReply(server.Login(ghost, "ghost", "secret"), "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
+    ExpectReply(server.Login(ghost, "ghost", "secret"), "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the user name and password your client sends, or reset the password with chunkdb_admin reset-password\r\n");
 
     SessionState anonymous;
-    ExpectError(server.Run(anonymous, "HELLO 3"), "AUTH_REQUIRED reason=auth_required use HELLO 3 USER <name> $1");
+    ExpectError(server.Run(anonymous, "HELLO 3"), "AUTH_REQUIRED reason=auth_required log in with a user name and password");
     SessionState token;
     ExpectError(server.Run(token, "HELLO 3 AUTH secret"), "SYNTAX column");
     SessionState early;
@@ -389,7 +389,7 @@ void TestConcurrentConditionalUsers() {
 }
 
 constexpr const char* kWrongLogin =
-    "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n";
+    "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the user name and password your client sends, or reset the password with chunkdb_admin reset-password\r\n";
 
 // A session as the server fills it after a TLS handshake; `exporter` empty
 // stands for TLS 1.2.
