@@ -2,6 +2,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -291,6 +292,72 @@ void PassCoversPausedBoundary() {
     FeedSlotTestAccess::SetHook(*table, nullptr);
 }
 
+// A pass syncs what it drained without the publish lock, so a write and the
+// checkpoint it triggers finish while the pass still waits for its syncs. That
+// checkpoint is strict: the archive it publishes is synced, and the frontier
+// the pass persists covers only what the pass captured. On Windows the pass
+// keeps the publish lock through its syncs, so the checkpoint waits for them
+// and publishes after the pass with the same results.
+void CheckpointDoesNotWaitForPassSyncs() {
+#ifdef _WIN32
+    constexpr bool kPublishesDuringSyncs = false;
+#else
+    constexpr bool kPublishesDuringSyncs = true;
+#endif
+    ScopedTempDir directory("chunkdb-feed-slots-unlocked-syncs");
+    TableCatalog catalog(Configuration(directory.path()));
+    (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    const auto start = table->CreateFeedSlot("consumer").position;
+    SetBlocks(*table, {{0, 0}}, 1U);
+    std::uint64_t first;
+    { auto lease = table->Acquire(); first = lease->store().GetChunkVersion(0, 0); }
+    const SyncLog synced;
+    SyncPause pause(FeedSlotTestHook::Point::kAfterDrain);
+    FeedSlotTestAccess::SetHook(*table, &pause);
+    std::thread pass([&] { FeedSlotTestAccess::Sync(*table); });
+    const auto captured = pause.Wait();
+    assert(captured >= first);
+    const auto wal = WalOf(*table, directory.path(), 0, 0);
+    std::uint64_t later, publishes;
+    bool archived_synced;
+    {
+        auto lease = table->Acquire();
+        auto& store = lease->store();
+        const auto before = store.CheckpointPublishesDuringBarrierSyncsForTests();
+        if constexpr (!kPublishesDuringSyncs) store.ArmCheckpointPublishAttemptForTests();
+        auto checkpoint = std::async(std::launch::async, [&] {
+            store.SetBlockBits(0, 0, Bits(2U));
+            store.CheckpointForTests(0, 0);
+        });
+        if constexpr (!kPublishesDuringSyncs) {
+            // The checkpoint reaches publication and waits for the paused pass.
+            assert(store.WaitForCheckpointPublishAttemptForTests());
+            assert(checkpoint.wait_for(0s) == std::future_status::timeout);
+            pause.Release();
+        }
+        // Outside Windows the pass stays paused before its syncs until the checkpoint ends.
+        assert(checkpoint.wait_for(10s) == std::future_status::ready);
+        checkpoint.get();
+        later = store.GetChunkVersion(0, 0);
+        publishes = store.CheckpointPublishesDuringBarrierSyncsForTests() - before;
+        // The WAL was synced before the checkpoint archived it: by the
+        // checkpoint outside Windows, where the pass has not synced yet.
+        archived_synced = synced.Contains(wal);
+    }
+    assert(later > captured && publishes == (kPublishesDuringSyncs ? 1U : 0U) && archived_synced);
+    if constexpr (kPublishesDuringSyncs) pause.Release();
+    pass.join();
+    FeedSlotTestAccess::SetHook(*table, nullptr);
+    assert(Archives(directory.path()) == 1U && !std::filesystem::exists(wal));
+    assert(ReadFeedSlotRecords(TablePath(directory.path()), start.epoch)->durable_watermark == captured);
+    { auto reader = table->ReadFeedArchive(start);
+      assert(reader.Next()->position.revision == first && !reader.Next()); }
+    FeedSlotTestAccess::Sync(*table);
+    auto reader = table->ReadFeedArchive({start.epoch, first});
+    assert(reader.Next()->position.revision == later && !reader.Next());
+}
+
 void AmbiguousAcknowledgementPreservesArchives() {
     ScopedTempDir directory("chunkdb-feed-slots-ack-failure");
     const auto config = Configuration(directory.path());
@@ -541,6 +608,7 @@ int main() {
     FirstPassSyncsEveryFile();
     LaterPassSyncsNewWal();
     PassCoversPausedBoundary();
+    CheckpointDoesNotWaitForPassSyncs();
     AmbiguousAcknowledgementPreservesArchives();
     ArchiveAfterFailedDirectoryPreparationSyncsParent();
     LimitLossKeepsFastSlotAndSurvivesRestart();
