@@ -404,6 +404,66 @@ void LargestGeometry(bool three) {
     page = Visit(store, three, 2, At(1), 3U, fits, &populated);
     assert(!page.has_more && !page.after && populated.empty());
 }
+
+// The reply `expected` builds around one chunk form, split at the form.
+std::pair<std::string, std::string> AroundForm(const std::string& expected) {
+    const auto at = expected.find('\0');
+    assert(at != std::string::npos && expected.find('\0', at + 1U) == std::string::npos);
+    return {expected.substr(0U, at), expected.substr(at + 1U)};
+}
+
+// A server whose response bound is the `required` size the refusal reports
+// for the largest chunk returns that chunk through GET AREA, plain and paged;
+// one byte less refuses it. Only the size and a hash of the chunk's GET CHUNK
+// form are kept, so at most one 64 MiB reply is held at a time beside the
+// store; a form records its store, so the hash is taken where it is compared.
+void LargestGeometryWithinBound(bool three) {
+    const auto dims = static_cast<std::uint8_t>(three ? 3U : 2U);
+    const std::string create = std::string("CREATE TABLE t (v u8, padding bits(504)) CHUNK ") +
+        (three ? "128 x 128 x 64" : "1024 x 1024");
+    const std::string block = three ? "128 0 0" : "1024 0";
+    const std::string marker(1U, '\0');
+    const auto plain = AroundForm(Expected({{At(1), marker}}, {}, dims, false));
+    const auto paged = AroundForm(Expected({{At(1), marker}}, {}, dims));
+    // A page reserves room to continue after the chunk while cells remain.
+    const auto continued = AroundForm(Expected({{At(1), marker}}, At(1), dims));
+    std::size_t form_size = 0U;
+    {
+        Fixture probe;
+        assert(probe.Run(create) == "+OK\r\n");
+        probe.Write(block, 11U);
+        form_size = probe.Run("GET CHUNK " + Cell(1, three) + " FROM t").size();
+        assert(form_size > QueryLimits{}.max_area_response_bytes);
+    }
+    const auto required = continued.first.size() + form_size + continued.second.size();
+    assert(required > paged.first.size() + form_size + paged.second.size());
+    const auto area = "GET AREA " + Cell(0, three) + " TO " + Cell(2, three) + " FROM t";
+    {
+        Fixture f(QueryLimits{.max_area_response_bytes = required});
+        assert(f.Run(create) == "+OK\r\n");
+        f.Write(block, 11U);
+        std::size_t form_hash = 0U;
+        {
+            const auto full = f.Run("GET CHUNK " + Cell(1, three) + " FROM t");
+            assert(full.size() == form_size);
+            form_hash = std::hash<std::string_view>{}(full);
+        }
+        const auto check = [&](const std::string& reply, const std::pair<std::string, std::string>& around) {
+            assert(reply.size() == around.first.size() + form_size + around.second.size());
+            assert(reply.starts_with(around.first) && reply.ends_with(around.second));
+            assert(std::hash<std::string_view>{}(std::string_view(reply).substr(around.first.size(), form_size)) ==
+                form_hash);
+        };
+        check(f.Run(area), plain);
+        check(f.Run(area + " LIMIT 3"), paged);
+        check(f.Run(area + " AFTER " + Cell(0, three) + " LIMIT 3"), paged);
+        check(f.Run(area + " AFTER " + Cell(0, three) + " LIMIT 1"), continued);
+    }
+    Fixture smaller(QueryLimits{.max_area_response_bytes = required - 1U});
+    assert(smaller.Run(create) == "+OK\r\n");
+    smaller.Write(block, 11U);
+    assert(smaller.Run(area + " AFTER " + Cell(0, three) + " LIMIT 3").starts_with(Refusal(1, three, required, required - 1U)));
+}
 }  // namespace
 
 int main() {
@@ -416,5 +476,6 @@ int main() {
     for (const bool three : {false, true}) {
         OversizeEntryInPage(three);
         LargestGeometry(three);
+        LargestGeometryWithinBound(three);
     }
 }

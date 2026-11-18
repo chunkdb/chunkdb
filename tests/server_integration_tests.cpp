@@ -606,6 +606,36 @@ class RawClient {
         return reply;
     }
 
+    // Passes the next `size` bytes to `sink` in pieces of at most 4096 bytes
+    // without holding them.
+    template <typename Sink>
+    void ReadExactTo(std::size_t size, Sink&& sink) {
+        std::size_t done = 0U;
+        while (done < size) {
+            if (test_read_deadline_ && Clock::now() >= *test_read_deadline_)
+                throw std::runtime_error("test read deadline " + ReadContext() + " expected=" + std::to_string(size) +
+                    " received=" + std::to_string(done));
+            if (pending_.empty()) {
+                char buffer[4096];
+#ifdef _WIN32
+                const int read = recv(socket_, buffer, static_cast<int>(sizeof(buffer)), 0);
+#else
+                const ssize_t read = recv(socket_, buffer, sizeof(buffer), 0);
+#endif
+                if (read <= 0) {
+                    if (read < 0 && IsWouldBlockError()) continue;
+                    throw std::runtime_error("socket closed while streaming payload " + ReadContext() +
+                        " expected=" + std::to_string(size) + " received=" + std::to_string(done));
+                }
+                pending_.append(buffer, static_cast<std::size_t>(read));
+            }
+            const auto take = std::min(size - done, pending_.size());
+            sink(std::string_view(pending_.data(), take));
+            pending_.erase(0, take);
+            done += take;
+        }
+    }
+
     void SetReceiveBuffer(std::size_t size) {
         const int value = static_cast<int>(size);
 #ifdef _WIN32
@@ -5849,6 +5879,84 @@ void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false,
     assert(hook.largest_write.load() <= 65536U && hook.writes.load() >= 64U);
 }
 
+// FNV-1a over streamed bytes.
+struct StreamHash {
+    std::uint64_t value = 14695981039346656037ULL;
+    void operator()(std::string_view bytes) {
+        for (const char c : bytes) value = (value ^ static_cast<unsigned char>(c)) * 1099511628211ULL;
+    }
+};
+
+// One bulk string of `client`'s reply: its length and the hash of its bytes.
+std::pair<std::size_t, std::uint64_t> StreamBulk(RawClient& client) {
+    const auto header = client.ReadLine();
+    assert(header.starts_with('$'));
+    const auto length = static_cast<std::size_t>(std::stoull(header.substr(1U)));
+    StreamHash hash;
+    client.ReadExactTo(length, hash);
+    assert(client.ReadLine() == "\r\n");
+    return {length, hash.value};
+}
+
+// At the largest chunk geometry a server whose area response bound admits a
+// whole 64 MiB chunk returns it through GET AREA, plain and paged, written
+// from the reply continuation; the client streams it without holding it.
+void TestAreaReturnsLargestChunkWithinBound() {
+    struct WriteHook final : chunkdb::FeedDeliveryTestHook {
+        std::atomic<std::size_t> largest{0U}, writes{0U};
+        void Run(Point point, std::size_t bytes) override {
+            if (point != Point::kBeforeReplyBufferWrite) return;
+            largest.store(std::max(largest.load(), bytes));
+            writes.fetch_add(1U);
+        }
+    } hook;
+    auto store_cfg = BaseStoreConfig();
+    store_cfg.geometry = {
+        .large_chunk_width_chunks = 1,
+        .large_chunk_height_chunks = 1,
+        .chunk_width_blocks = 1024,
+        .chunk_height_blocks = 1024,
+        .block_bits = 512,
+    };
+    const auto bound = 2U * chunkdb::QueryLimits{}.max_area_response_bytes;
+    store_cfg.query_limits.max_area_response_bytes = bound;
+    auto server_cfg = BaseServerConfig();
+    server_cfg.client_io_timeout_ms = 60000;
+    ServerHarness harness("area-largest-chunk", store_cfg, chunkdb::EngineConfig{.require_auth = false}, server_cfg);
+    assert(harness.geometry().ChunkPayloadBytes() == 64U * 1024U * 1024U);
+    {
+        auto lease = harness.catalog->Find("default")->Acquire();
+        std::string bits(512, '0');
+        for (std::size_t i = 0U; i < bits.size(); i += 7U) bits[i] = '1';
+        lease->store().SetBlockBits(5, 9, bits);
+        lease->store().SetBlockBits(1023, 1023, std::string(512, '1'));
+    }
+    RawClient client("127.0.0.1", harness.port);
+    client.SetReadDeadline(std::chrono::seconds(120));
+    client.SendLine("HELLO 3");
+    const auto hello = ReadHelloReply(client);
+    assert(hello.at("max_response_bytes") == std::to_string(bound));
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+
+    client.SendLine("GET CHUNK 0 0 FROM default");
+    const auto chunk = StreamBulk(client);
+    assert(chunk.first > 64U * 1024U * 1024U && chunk.first < bound);
+    client.SendLine("GET AREA 0 0 TO 1 0 FROM default");
+    assert(client.ReadLine() == "*1\r\n");
+    assert(client.ReadLine() == "*3\r\n" && client.ReadLine() == ":0\r\n" && client.ReadLine() == ":0\r\n");
+    assert(StreamBulk(client) == chunk);
+    client.SendLine("GET AREA 0 0 TO 1 0 FROM default LIMIT 2");
+    assert(client.ReadLine() == "%3\r\n" && client.ReadLine() == "$6\r\n" && client.ReadLine() == "chunks\r\n");
+    assert(client.ReadLine() == "*1\r\n");
+    assert(client.ReadLine() == "*3\r\n" && client.ReadLine() == ":0\r\n" && client.ReadLine() == ":0\r\n");
+    assert(StreamBulk(client) == chunk);
+    assert(client.ReadLine() == "$4\r\n" && client.ReadLine() == "more\r\n" && client.ReadLine() == "#f\r\n");
+    assert(client.ReadLine() == "$5\r\n" && client.ReadLine() == "after\r\n" && client.ReadLine() == "_\r\n");
+    client.SendLine("PING");
+    assert(client.ReadLine() == "+PONG\r\n");
+    assert(hook.largest.load() <= 65536U && hook.writes.load() >= 3U * (64U * 1024U * 1024U / 65536U));
+}
+
 void TestIdlePeerCloseDoesNotLogTerminationWarning() {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
 
@@ -8269,6 +8377,7 @@ int main(int argc, char** argv) {
         run("TestSteadyScanReaderRenewsReplyProgressDeadline", [] {
             TestSteadyReaderRenewsReplyProgressDeadline(false, "SCAN CHUNKS FROM default WITH DATA", '%', 256U, 128);
         });
+        run("TestAreaReturnsLargestChunkWithinBound", TestAreaReturnsLargestChunkWithinBound);
         run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);
         run("TestPendingStatementQueueKeepsHelloAvailable", TestPendingStatementQueueKeepsHelloAvailable);
         run("TestReadinessLogLineExists", TestReadinessLogLineExists);
