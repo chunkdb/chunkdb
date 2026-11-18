@@ -1,0 +1,52 @@
+name: ccache
+description: Install ccache, point CMake at it and cache its directory between runs.
+inputs:
+  name:
+    description: Build configuration, so that each compiler and flag set has its own cache (for example asan, tsan, release).
+    required: true
+  max-size:
+    description: Size limit of the ccache directory.
+    default: 400M
+runs:
+  using: composite
+  steps:
+    # ccache only speeds up builds: without it they run uncached.
+    # On Windows ccache comes from the MSYS2 package list of the job.
+    - name: Install ccache
+      if: runner.os != 'Windows'
+      shell: bash
+      run: |
+        if command -v apt-get >/dev/null 2>&1; then
+          scripts/ci/apt-install.sh ccache || true
+        elif command -v brew >/dev/null 2>&1; then
+          brew install ccache || true
+        fi
+        if ! command -v ccache >/dev/null 2>&1; then
+          echo "::warning::ccache is not available; building without it"
+          echo "CCACHE_MISSING=1" >> "$GITHUB_ENV"
+        fi
+
+    - name: Configure ccache
+      shell: bash
+      env:
+        CCACHE_ROOT: ${{ runner.temp }}/ccache
+        CCACHE_LIMIT: ${{ inputs.max-size }}
+      run: |
+        {
+          echo "CCACHE_DIR=$CCACHE_ROOT"
+          echo "CCACHE_MAXSIZE=$CCACHE_LIMIT"
+          echo "CCACHE_COMPRESS=1"
+          if [ -z "${CCACHE_MISSING:-}" ]; then
+            echo "CMAKE_C_COMPILER_LAUNCHER=ccache"
+            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache"
+          fi
+        } >> "$GITHUB_ENV"
+
+    - name: Restore ccache directory
+      uses: actions/cache@v5
+      with:
+        path: ${{ runner.temp }}/ccache
+        key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.name }}-${{ hashFiles('CMakeLists.txt') }}-${{ github.sha }}
+        restore-keys: |
+          ccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.name }}-${{ hashFiles('CMakeLists.txt') }}-
+          ccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.name }}-

@@ -26,6 +26,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: ccache
+        uses: ./.github/actions/ccache
+        with:
+          name: stress
+
       - name: Configure
         run: >
           cmake -S . -B build
