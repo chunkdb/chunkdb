@@ -461,6 +461,28 @@ void TestQueryLimitFlags(const std::string& binary) {
     assert(Command(server.port(), "GET AREA 0 0 TO 1 0 FROM t") == "*0\r\n");
 }
 
+// --statement-timeout-ms takes 0 (off, the default) through 86400000, and
+// HELLO without the option reports the flag's value as the session's
+// statement timeout.
+void TestStatementTimeoutFlag(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-statement-timeout");
+    const auto log = dir.path() / "server.log";
+    assert(StartupFailure(binary, log, {"--help"}, 0).find("--statement-timeout-ms") != std::string::npos);
+    const auto data = dir.path() / "refused";
+    for (const char* value : {"-1", "+1", "1s", "", "86400001", "18446744073709551616"}) {
+        const auto error = StartupFailure(binary, log, {"--data-dir", data.string(), "--auth", "none",
+                                                        "--statement-timeout-ms", value});
+        assert(error.find("invalid --statement-timeout-ms") != std::string::npos);
+        assert(!std::filesystem::exists(data));
+    }
+    for (const char* value : {"0", "1500", "86400000"}) {
+        ServerProcess server(binary, dir.path() / value, {"--auth", "none", "--statement-timeout-ms", value});
+        std::string hello;
+        assert(Command(server.port(), "PING", &hello) == "+PONG\r\n");
+        assert(hello.find(std::string("$20\r\nstatement_timeout_ms\r\n:") + value + "\r\n") != std::string::npos);
+    }
+}
+
 // SIGHUP reopens the audit log at its path, so a renamed file stops
 // growing (log rotation), and leaves the server running.
 void TestAuditLogReopensOnHangup(const std::string& binary) {
@@ -949,6 +971,7 @@ int main(int argc, char** argv) {
     TestListenWarnings(argv[1]);
     TestFeedLingerFlag(argv[1]);
     TestQueryLimitFlags(argv[1]);
+    TestStatementTimeoutFlag(argv[1]);
     TestRemovedServerFlags(argv[1]);
     TestPersistedUsersIgnoreBootstrap(argv[1]);
     TestLogAndLimitFlagsAreValidated(argv[1]);
