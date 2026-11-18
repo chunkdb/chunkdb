@@ -2,6 +2,7 @@
 
 `RESTORE TABLE t FROM 'snapshot' [AS t_restored]` copies one table of a completed backup into a running writer as a new table (#158).
 `SWAP TABLES t, t_restored` then exchanges the two names atomically; the restore itself never replaces a live table.
+`ALTER TABLE t RENAME TO u` moves one table to a free name with the same machinery.
 The [backup design](BACKUP_DESIGN.md) defines backups, cuts and lineage; the [table catalog](TABLES_DESIGN.md) defines table publication.
 
 ## Statement and rights
@@ -59,6 +60,20 @@ A crash at any point leaves both directories under their old names or both excha
 A failure after the exchange that leaves a name unserved fences that name until RECOVER TABLE or a restart.
 Open transactions on either table end with CONFLICT at their next statement, because their snapshot belongs to the closed store.
 
+## Rename
+
+`ALTER TABLE t RENAME TO u` admits like SWAP: the feature and backup metadata gates shared, then the table's DDL lock, exclusive access and the catalog's table operations.
+It needs ADMIN on both names, because the grants move with the table: each user's grant on `t` goes to `u`, the higher right kept where a user has both, and `t` keeps none.
+The name `u` must be free: no table, no fence, and no directory under `tables/`.
+It makes acknowledged writes durable with a WAL barrier and closes the store; CANCEL, KILL CONNECTION or a statement timeout stops it only before that.
+The grants are copied to `u` first, then one rename that cannot replace an entry moves `tables/t` to `tables/u`, and the parent directory is synced; the grants on `t` are removed last.
+A crash leaves the directory under one of the names, complete; the grants never name neither, and at worst name both, as a crash during DROP TABLE can leave grants of a dropped name.
+A refused rename puts the copied grants back and reopens the table under `t`.
+A failure after the rename fences `u` until RECOVER TABLE or a restart.
+The epoch, lineage, slots and their positions stay: a consumer resumes by the new name with its saved position, without resync, and the old name reaches nothing.
+Watches of the table end with INTERNAL `watched table was renamed; watch it again`, and open transactions end with CONFLICT.
+MIGRATE does not take RENAME TO: its redo journal has no directory rename.
+
 ## Feed consumers
 
 Watches of either table end with INTERNAL `watched table was swapped; watch it again`.
@@ -76,6 +91,7 @@ A protocol test holds a restore after each progress report and checks SHOW CONNE
 Catalog tests restore into a new name, compare chunks, versions, tombstones and slots with the backup cut, and check the new epoch and lineage.
 Failure tests inject copy, verification and publication failures and show that no table or staging directory remains.
 Subprocess crash tests stop at every restore step and every swap step; the restarted catalog has the table completely or not at all, and both names or neither exchanged.
+Rename tests check epoch, data, tombstones and slots under the new name, the ended watch, the refusals and each injected failure; crash tests stop before the rename, after it and after its sync.
 Feed tests watch a swapped name from the old epoch and receive resync, or continue from the exact fork revision.
 Slot tests watch restored and swapped slots without AFTER and receive resync until an acknowledgement, and check the marks after each swap crash point and a refused swap.
 `chunkdb_verify` needs no new checks: restore and swap create no new file kinds.
