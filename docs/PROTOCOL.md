@@ -70,6 +70,7 @@ The implemented capabilities are `protocol_foundation`, `ordered_versions`, `rea
 Options become visible only after authentication succeeds.
 Returning and expression ceilings describe reserved limits; their capabilities remain unavailable.
 The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
+A chunk too large for an empty page ends the page before it and is then refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=... required=... limit=...`; see [chunks](reference/CHUNKS.md#limits).
 The configured positive area bounds appear as both `max_area_chunks`/`max_response_bytes` and `limits.max_area_chunks`/`limits.max_area_response_bytes`.
 `limits.txn_max_written_chunks` and `limits.txn_max_read_chunks` are the configured transaction chunk-count bounds.
 
@@ -196,7 +197,7 @@ The following list notation describes push elements, rather than literal wire by
 - `[resync, epoch, revision, parent_epoch, fork_revision]`, requesting consumer state reconstruction.
 - `[progress, epoch, revision]`, marking a sender-drained cut during idle or filtered periods.
 
-Current change frames reserve `tag=null`, `txn=null`, and `chunk_changes=[]`; schema maps reserve `chunk_columns=[]`.
+Current change frames reserve `tag=null` and `txn=null`; a schema map gives the table's `dims`, the watched block columns, and all chunk columns of its `schema_version`.
 Resync lineage fields are null when no parent lineage is recorded.
 
 Rows are in schema order and use the reply types above; null denotes absent rows or NULL values and an anonymous user.
@@ -224,6 +225,7 @@ Block projections preserve all metadata columns; empty metadata domains emit no 
 Tag and txn are null until their metadata is present.
 
 A slot permits one watch at a time; a competing watch receives SLOT_BUSY and a lost slot receives SLOT_LOST.
+The slot claim is released before the terminal reply or connection closure for lost access, an ACK timeout, or an output deadline, so a new WATCH can claim it immediately.
 A slot belongs to its owner; another user needs ADMIN on `*` to watch it, see [feed statements](reference/FEED.md#arguments).
 
 DROP TABLE ends watches with NO_TABLE; a fenced or recovered table ends them with INTERNAL, and a new WATCH resumes; watches have no idle timeout.

@@ -31,7 +31,10 @@ void CrashAtFailpoint(const char* key) {
 FeedSlotFilters MigrationSlotFilters(const MigrationRequest& request, const Geometry& geometry) {
     auto filters = request.slot_filters;
     if (filters.area && filters.area->dims != geometry.dims())
-        throw std::invalid_argument("coordinate dimensions differ from the table");
+        throw std::invalid_argument("coordinate dimensions differ from the table: the table has " +
+                                    std::to_string(geometry.dims()) + " and the slot area " +
+                                    std::to_string(filters.area->dims) +
+                                    "; give one coordinate per table dimension (DESCRIBE shows dims)");
     const auto& schema = geometry.layout().schema();
     if (request.slot_columns) {
         filters.column_ids.emplace();
@@ -262,7 +265,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             const auto block_schema = definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits));
             const auto geometry = definition.chunk_schema ? Geometry(definition.geometry, block_schema, *definition.chunk_schema)
                                                          : Geometry(definition.geometry, block_schema);
-            if (Find(request.table)) throw TableExistsError("table '" + request.table + "' already exists");
+            if (Find(request.table)) throw TableExistsError("table '" + request.table + "' already exists; use another name, CREATE TABLE IF NOT EXISTS, or DROP TABLE " + request.table + " first");
             journal.directory_action = MigrationDirectoryAction::kCreate;
             journal.operation_name = OperationName(request.table);
             journal.table_id = NewStoreId();

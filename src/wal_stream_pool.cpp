@@ -101,6 +101,8 @@ void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::ope
         }
         handle_ = handle;
         error_ = 0;
+        size_.reset();
+        unflushed_ = 0;
         NoteOpened();
     } catch (const std::system_error& error) {
         // Parent inspection precedes CreateFile. A missing parent is the same
@@ -121,6 +123,8 @@ void WalAppendStream::close() noexcept {
         handle_ = nullptr;
         NoteClosed();
     }
+    size_.reset();
+    unflushed_ = 0;
 }
 
 WalAppendStream& WalAppendStream::write(const char* bytes, std::streamsize size) {
@@ -144,13 +148,25 @@ WalAppendStream& WalAppendStream::write(const char* bytes, std::streamsize size)
             errno = error_;
             break;
         }
+        if (size_) *size_ += written;
         bytes += written;
         remaining -= written;
     }
+    if (error_ != 0) size_.reset();
     return *this;
 }
 
 WalAppendStream& WalAppendStream::flush() noexcept { return *this; }
+
+std::optional<std::uint64_t> WalAppendStream::size() noexcept {
+    if (!is_open() || error_ != 0) return std::nullopt;
+    if (!size_) {
+        LARGE_INTEGER bytes{};
+        if (GetFileSizeEx(handle_, &bytes) == 0 || bytes.QuadPart < 0) return std::nullopt;
+        size_ = static_cast<std::uint64_t>(bytes.QuadPart);
+    }
+    return size_;
+}
 
 WalDurabilityPin WalAppendStream::FlushAndPin() {
     if (!is_open() || error_ != 0)
@@ -202,6 +218,8 @@ void WalAppendStream::open(const std::filesystem::path& path, std::ios_base::ope
         return;
     }
     error_ = 0;
+    size_.reset();
+    unflushed_ = 0;
     NoteOpened();
 }
 
@@ -212,6 +230,8 @@ void WalAppendStream::close() noexcept {
         handle_ = nullptr;
         NoteClosed();
     }
+    size_.reset();
+    unflushed_ = 0;
 }
 
 WalAppendStream& WalAppendStream::write(const char* bytes, std::streamsize size) {
@@ -221,18 +241,36 @@ WalAppendStream& WalAppendStream::write(const char* bytes, std::streamsize size)
         return *this;
     }
     const auto count = static_cast<std::size_t>(size);
-    if (::fwrite(bytes, 1, count, static_cast<FILE*>(handle_)) != count)
+    // Counted as unflushed even when short: some of it may be buffered.
+    unflushed_ += count;
+    if (::fwrite(bytes, 1, count, static_cast<FILE*>(handle_)) != count) {
         error_ = errno == 0 ? EIO : errno;
+        size_.reset();
+    }
     return *this;
 }
 
 WalAppendStream& WalAppendStream::flush() noexcept {
     if (!is_open()) {
         if (error_ == 0) error_ = EIO;
-    } else if (::fflush(static_cast<FILE*>(handle_)) != 0 && error_ == 0) {
-        error_ = errno == 0 ? EIO : errno;
+    } else if (::fflush(static_cast<FILE*>(handle_)) != 0) {
+        if (error_ == 0) error_ = errno == 0 ? EIO : errno;
+        size_.reset();
+    } else if (error_ == 0) {
+        if (size_) *size_ += unflushed_;
+        unflushed_ = 0;
     }
     return *this;
+}
+
+std::optional<std::uint64_t> WalAppendStream::size() noexcept {
+    if (!is_open() || error_ != 0 || unflushed_ != 0) return std::nullopt;
+    if (!size_) {
+        struct stat status {};
+        if (::fstat(::fileno(static_cast<FILE*>(handle_)), &status) != 0 || status.st_size < 0) return std::nullopt;
+        size_ = static_cast<std::uint64_t>(status.st_size);
+    }
+    return size_;
 }
 
 WalDurabilityPin WalAppendStream::FlushAndPin() {

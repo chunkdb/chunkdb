@@ -56,6 +56,7 @@ add_library(chunkdb_core STATIC
     src/barrier.cpp
     src/backup_create.cpp
     src/backup_records.cpp
+    src/backup_restore.cpp
     src/bit_codec.cpp
     src/block_ops.cpp
     src/checkpoint.cpp
@@ -96,6 +97,7 @@ add_library(chunkdb_core STATIC
     src/scram.cpp
     src/users.cpp
     src/user_registry.cpp
+    src/verify.cpp
     src/durability_io.cpp
     src/file_permissions.cpp
     src/audit_log.cpp
@@ -129,6 +131,7 @@ add_library(chunkdb_core STATIC
     src/table_chunk_columns.cpp
     src/table_tombstones.cpp
     src/table_catalog_migrations.cpp
+    src/table_catalog_restore.cpp
     src/migrations_records.cpp
     src/migrations_apply.cpp
     src/uri.cpp
@@ -217,8 +220,6 @@ target_include_directories(chunkdb_crc32_bench PRIVATE ${CMAKE_CURRENT_SOURCE_DI
 # Offline tools.
 add_library(chunkdb_tools STATIC
     src/admin.cpp
-    src/backup_restore.cpp
-    src/verify.cpp
 )
 target_link_libraries(chunkdb_tools PUBLIC chunkdb_core)
 target_include_directories(chunkdb_tools PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -356,6 +357,16 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME restore_crash COMMAND chunkdb_restore_crash_test)
     set_tests_properties(restore_crash PROPERTIES TIMEOUT 300 LABELS "crash")
 
+    add_executable(chunkdb_restore_table_test tests/restore_table_tests.cpp)
+    target_link_libraries(chunkdb_restore_table_test PRIVATE chunkdb_tools)
+    add_test(NAME restore_table COMMAND chunkdb_restore_table_test)
+    set_tests_properties(restore_table PROPERTIES TIMEOUT 300 LABELS "smoke")
+
+    add_executable(chunkdb_restore_table_crash_test tests/restore_table_crash_tests.cpp)
+    target_link_libraries(chunkdb_restore_table_crash_test PRIVATE chunkdb_tools)
+    add_test(NAME restore_table_crash COMMAND chunkdb_restore_table_crash_test)
+    set_tests_properties(restore_table_crash PROPERTIES TIMEOUT 300 LABELS "crash")
+
     add_executable(chunkdb_geometry_bit_test tests/geometry_bit_tests.cpp)
     target_link_libraries(chunkdb_geometry_bit_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -371,7 +382,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME coordinate_hash_seed_failure COMMAND chunkdb_coordinate_hash_seed_test --failure)
     set_tests_properties(coordinate_hash_seed_failure PROPERTIES TIMEOUT 60 LABELS "smoke")
 
-    foreach(format IN ITEMS area_cursor sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_group_owner_format commit_owner_artifact_io commit_request_fingerprint wal_group_frame catalog_txn_snapshot ordinary_write_failure chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input wal_durability_pin chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol read_only_index_refresh)
+    foreach(format IN ITEMS area_cursor sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_group_owner_format commit_owner_artifact_io commit_request_fingerprint wal_group_frame catalog_txn_snapshot ordinary_write_failure chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input wal_durability_pin chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol wal_barrier_memory chunk_column_expressions read_only_index_refresh)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -781,6 +792,23 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME feed_slots_shares COMMAND chunkdb_server_slots_protocol_test --shares-only)
     set_tests_properties(feed_slots_shares PROPERTIES TIMEOUT 120 LABELS "smoke")
 
+    add_executable(chunkdb_server_chunk_model_protocol_test
+        tests/server_chunk_model_protocol_tests.cpp
+        src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
+        src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+    )
+    target_link_libraries(chunkdb_server_chunk_model_protocol_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_server_chunk_model_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    if(WIN32)
+        target_link_libraries(chunkdb_server_chunk_model_protocol_test PRIVATE ws2_32)
+    endif()
+    if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+        target_link_libraries(chunkdb_server_chunk_model_protocol_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_server_chunk_model_protocol_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+    endif()
+    add_test(NAME server_chunk_model_protocol COMMAND chunkdb_server_chunk_model_protocol_test)
+    set_tests_properties(server_chunk_model_protocol PROPERTIES TIMEOUT 120 LABELS "smoke")
+
     add_executable(chunkdb_server_channel_binding_test
         tests/server_channel_binding_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
@@ -1025,6 +1053,8 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_backup_crash_test
         chunkdb_backup_restore_test
         chunkdb_restore_crash_test
+        chunkdb_restore_table_test
+        chunkdb_restore_table_crash_test
         chunkdb_server_backup_protocol_test
         chunkdb_feed_slot_records_test
         chunkdb_feed_archive_reader_test
@@ -1055,6 +1085,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_chunk_storage_format_test
         chunkdb_chunk_columns_test
         chunkdb_chunk_metadata_runtime_test
+        chunkdb_chunk_column_expressions_test
         chunkdb_typed_chunk_form_test
         chunkdb_atomic_stream_test
         chunkdb_block_coordinates_test
@@ -1079,6 +1110,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_cql_chunk_model_test
         chunkdb_feed_chunk_model_test
         chunkdb_feed_chunk_protocol_test
+        chunkdb_wal_barrier_memory_test
         chunkdb_chunk_model_persistence_3d_test
         chunkdb_verify_index_test
         chunkdb_verify_memory_test
@@ -1135,6 +1167,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_server_integration_test
         chunkdb_feed_completed_prefix_reader_test
         chunkdb_server_slots_protocol_test
+        chunkdb_server_chunk_model_protocol_test
         chunkdb_server_channel_binding_test
         chunkdb_server_migrations_protocol_test
         chunkdb_server_slots_process_test
@@ -1211,6 +1244,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunk_storage_format
         chunk_columns
         chunk_metadata_runtime
+        chunk_column_expressions
         typed_chunk_form
         atomic_stream
         block_coordinates

@@ -128,4 +128,32 @@ void SyncBackupTree(const std::filesystem::path& root, const BackupCancel& cance
 void CompleteBackupGuard(const std::filesystem::path& root, std::string_view guard, std::string_view phase);
 void RestoreBackup(const std::filesystem::path& backup, const std::filesystem::path& target);
 
+// The completed backup a RESTORE TABLE statement names, resolved under the
+// configured --backup-dir with the BACKUP TO path rules.
+[[nodiscard]] std::filesystem::path ResolveBackupSource(const std::filesystem::path& backup_directory,
+    const std::filesystem::path& requested);
+// One table of a completed backup, copied into a private directory.
+struct BackupTableCopy {
+    BackupTableCut cut;
+    // Relative to the copied table directory.
+    std::vector<std::filesystem::path> files;
+    std::uint64_t bytes = 0;
+};
+using BackupCopyProgress = std::function<void(std::uint64_t copied_files, std::uint64_t copied_bytes,
+    std::uint64_t total_files, std::uint64_t total_bytes)>;
+// Copies table `table` of the completed backup `backup` into the existing
+// empty `directory`. The backup's table directory must hold exactly its
+// inventory files, all regular; every copied length and CRC must match the
+// inventory, and the copy must pass the inventory check of its cut. Throws
+// std::invalid_argument when the backup has no such table.
+[[nodiscard]] BackupTableCopy CopyBackupTable(const std::filesystem::path& backup, std::string_view table,
+    const std::filesystem::path& directory, const BackupCancel& cancelled = {}, const BackupCopyProgress& progress = {});
+// Gives a copied table directory a new epoch whose lineage is `cut`: WAL
+// crash tails are normalized, every image, WAL, coordinate log and slot is
+// rebound, the clock restarts at the cut's successor, and the manifest is
+// written last. `files` are the table's inventory files relative to it.
+// Returns the new epoch.
+[[nodiscard]] StoreId RebindRestoredTable(const std::filesystem::path& directory, const BackupTableCut& cut,
+    const std::vector<std::filesystem::path>& files, const BackupCancel& cancelled = {});
+
 } // namespace chunkdb

@@ -51,7 +51,7 @@ ConnectionUri ParseConnectionUri(const std::string& uri) {
     } else if (scheme == "chunks") {
         parsed.secure = true;
     } else {
-        throw std::invalid_argument("unsupported URI scheme: " + scheme);
+        throw std::invalid_argument("unsupported URI scheme: " + scheme + "; use chunk:// or chunks://");
     }
 
     const std::string rest = uri.substr(scheme_pos + scheme_delimiter.size());

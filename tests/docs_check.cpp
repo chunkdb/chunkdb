@@ -1859,8 +1859,8 @@ int RunLinks(const fs::path& root_input, std::ostream& out, std::ostream& err) {
 
 // --- Docker quick-start ----------------------------------------------------------------
 
-const std::vector<std::string> kQuickStartBlocks{"start", "health", "login", "write", "read",
-                                                 "watch", "watch-update", "reset", "reset-login"};
+const std::vector<std::string> kQuickStartBlocks{"start", "health", "install", "login", "write",
+                                                 "read", "watch", "watch-update", "reset", "reset-login"};
 
 // <!-- docker-quickstart:([\w-]+) -->\s*```(sh(?: docs-check-watch)?|cql docs-check[^\n]*)\n(.*?)\n```
 std::map<std::string, std::string> ExtractQuickStart(const std::string& source) {
@@ -2137,10 +2137,28 @@ int RunImageTags(const fs::path& workflow, std::ostream& out, std::ostream& err)
         line = end + 1;
     }
 
+    // Lines ^          (SOURCE|MAJOR_TAG|LATEST_TAG): (ghcr.io/chunkdb/chunkdb:[^\n]+)$ in
+    // the docker-tags job, which moves the major and latest tags after the page check.
+    std::vector<std::pair<std::string, std::string>> moved;
+    for (const std::string& line : SplitLines(source)) {
+        for (const std::string key : {"SOURCE", "MAJOR_TAG", "LATEST_TAG"}) {
+            const std::string prefix = "          " + key + ": ";
+            if (StartsWith(line, prefix + "ghcr.io/chunkdb/chunkdb:")) moved.emplace_back(key, line.substr(prefix.size()));
+        }
+    }
+    for (const std::string needs : {"  release:\n    needs: [build, docker-tags]\n",
+                                    "  docker-tags:\n    name: Tag the checked image as major and latest\n"
+                                    "    needs: [docker-image, docker-quickstart]\n"}) {
+        if (source.find(needs) == std::string::npos) {
+            throw std::runtime_error("the release workflow does not wait for the page check: " + needs);
+        }
+    }
+
     struct Calculation {
         Completed result;
         std::vector<std::pair<std::string, std::string>> values;
         std::vector<std::string> tags;
+        std::vector<std::pair<std::string, std::string>> moved;
     };
     auto calculate = [&](const std::string& tag) {
         TempDir directory("chunkdb-image-tags-");
@@ -2168,9 +2186,13 @@ int RunImageTags(const fs::path& workflow, std::ostream& out, std::ostream& err)
             }
         }
         calculation.tags = published;
+        calculation.moved = moved;
         for (const auto& [key, value] : calculation.values) {
             for (std::string& item : calculation.tags) {
                 item = ReplaceAll(item, "${{ steps.image.outputs." + key + " }}", value);
+            }
+            for (auto& item : calculation.moved) {
+                item.second = ReplaceAll(item.second, "${{ needs.docker-image.outputs." + key + " }}", value);
             }
         }
         return calculation;
@@ -2189,9 +2211,11 @@ int RunImageTags(const fs::path& workflow, std::ostream& out, std::ostream& err)
     for (const auto& [tag, version, major_tag] : valid) {
         ++cases;
         const Calculation c = calculate(tag);
-        const std::vector<std::string> expected{"ghcr.io/chunkdb/chunkdb:" + version,
-                                                "ghcr.io/chunkdb/chunkdb:" + major_tag,
-                                                "ghcr.io/chunkdb/chunkdb:latest"};
+        const std::vector<std::string> expected{"ghcr.io/chunkdb/chunkdb:" + version};
+        const std::vector<std::pair<std::string, std::string>> expected_moved{
+            {"SOURCE", "ghcr.io/chunkdb/chunkdb:" + version},
+            {"MAJOR_TAG", "ghcr.io/chunkdb/chunkdb:" + major_tag},
+            {"LATEST_TAG", "ghcr.io/chunkdb/chunkdb:latest"}};
         if (c.result.returncode != 0) {
             failures.push_back(tag + ": exit status " + std::to_string(c.result.returncode) + "\n" +
                                Sanitize(c.result.out));
@@ -2199,6 +2223,10 @@ int RunImageTags(const fs::path& workflow, std::ostream& out, std::ostream& err)
             failures.push_back(tag + ": unexpected outputs");
         } else if (c.tags != expected) {
             failures.push_back(tag + ": unexpected image tags: " + Join(c.tags, ", "));
+        } else if (c.moved != expected_moved) {
+            std::vector<std::string> moved_text;
+            for (const auto& [key, value] : c.moved) moved_text.push_back(key + "=" + value);
+            failures.push_back(tag + ": unexpected moved image tags: " + Join(moved_text, ", "));
         }
     }
     for (const std::string tag : {"2.0.0", "vnext", "v3", "v2.0", "v02.0.0", "v2.0.0+build", "v2.0.0;echo bad"}) {
