@@ -161,6 +161,8 @@ void SlotWatch::Unwatch() {
 }
 void SlotWatch::Cancel() noexcept {
     { std::lock_guard lock(mutex_); cancelled_ = true; }
+    if (auto* hook = hook_.load(std::memory_order_acquire))
+        hook->Run(FeedDeliveryTestHook::Point::kAfterSlotCancel, 0U);
     if (options_.notify) options_.notify();
 }
 bool SlotWatch::Activate() {
