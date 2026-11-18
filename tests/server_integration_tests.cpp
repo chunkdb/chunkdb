@@ -5259,6 +5259,107 @@ void TestQueuedStatementTimeoutPreservesConnection() {
     queued.SendLine("PING"); assert(queued.ReadLine() == "+PONG\r\n");
 }
 
+// Holds the first statement a worker takes and records the connections whose
+// statements were queued for a worker.
+class HeldWorkerQueueHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t value) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kAfterStatementQueued) {
+            queued_.push_back(value);
+            changed_.notify_all();
+        }
+        if (point == Point::kBeforeWorkerHandle && !entered_) {
+            entered_ = true;
+            changed_.notify_all();
+            changed_.wait(lock, [&] { return released_; });
+        }
+    }
+    void WaitWorker() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return entered_; }));
+    }
+    void WaitQueued(std::uint64_t id) {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10),
+            [&] { return std::find(queued_.begin(), queued_.end(), id) != queued_.end(); }));
+    }
+    void Release() {
+        { std::lock_guard lock(mutex_); released_ = true; }
+        changed_.notify_all();
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::vector<std::uint64_t> queued_;
+    bool entered_ = false, released_ = false;
+};
+
+// The HELLO reply's `options` statement_timeout_ms and its connection id.
+std::pair<std::string, std::uint64_t> HelloStatementTimeout(RawClient& client) {
+    const auto reply = client.ReadReply();
+    const std::string option = "$20\r\nstatement_timeout_ms\r\n:";
+    const auto at = reply.find(option);
+    assert(reply.starts_with("%14\r\n") && at != std::string::npos && reply.find(option, at + 1U) == std::string::npos);
+    const auto value = reply.substr(at + option.size(), reply.find("\r\n", at + option.size()) - at - option.size());
+    const std::string id_key = "$13\r\nconnection_id\r\n:";
+    const auto id_at = reply.find(id_key);
+    assert(id_at != std::string::npos);
+    return {value, std::stoull(reply.substr(id_at + id_key.size()))};
+}
+
+// The server default statement timeout (--statement-timeout-ms) is the
+// effective option HELLO reports when it names none and applies to such a
+// session's statements; HELLO statement_timeout_ms=0 turns it off for that
+// session and a nonzero value replaces it.
+void TestServerDefaultStatementTimeout() {
+    HeldWorkerQueueHook hook;
+    auto config = BaseServerConfig();
+    config.worker_threads = 1U;
+    config.statement_timeout_ms = 1000U;
+    ServerHarness harness("server-statement-timeout", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    struct Release { HeldWorkerQueueHook& hook; ~Release() { hook.Release(); } } release{hook};
+    // The statement that holds the worker must outlive the default itself.
+    RawClient worker("127.0.0.1", harness.port); worker.SetReadDeadline(std::chrono::seconds(10));
+    worker.SendLine("HELLO 3 WITH statement_timeout_ms=0");
+    assert(HelloStatementTimeout(worker).first == "0");
+    RawClient defaulted("127.0.0.1", harness.port); defaulted.SetReadDeadline(std::chrono::seconds(10));
+    defaulted.SendLine("HELLO 3");
+    const auto [default_value, default_id] = HelloStatementTimeout(defaulted);
+    assert(default_value == "1000");
+    RawClient disabled("127.0.0.1", harness.port); disabled.SetReadDeadline(std::chrono::seconds(10));
+    disabled.SendLine("HELLO 3 WITH statement_timeout_ms=0");
+    const auto [disabled_value, disabled_id] = HelloStatementTimeout(disabled);
+    assert(disabled_value == "0");
+    RawClient replaced("127.0.0.1", harness.port); replaced.SetReadDeadline(std::chrono::seconds(10));
+    replaced.SendLine("HELLO 3 WITH statement_timeout_ms=86400000");
+    const auto [replaced_value, replaced_id] = HelloStatementTimeout(replaced);
+    assert(replaced_value == "86400000");
+
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    worker.SendLine("PING"); hook.WaitWorker();
+    // Queued in this order, behind the held worker.
+    disabled.SendLine("PING"); hook.WaitQueued(disabled_id);
+    replaced.SendLine("PING"); hook.WaitQueued(replaced_id);
+    defaulted.SendLine("PING"); hook.WaitQueued(default_id);
+    const auto disabled_statement = chunkdb::FeedDeliveryTestAccess::CurrentStatement(*harness.server, disabled_id);
+    const auto replaced_statement = chunkdb::FeedDeliveryTestAccess::CurrentStatement(*harness.server, replaced_id);
+    const auto default_statement = chunkdb::FeedDeliveryTestAccess::CurrentStatement(*harness.server, default_id);
+    assert(disabled_statement && !disabled_statement->deadline());
+    assert(replaced_statement && replaced_statement->deadline());
+    assert(default_statement && default_statement->deadline());
+    assert(*replaced_statement->deadline() - *default_statement->deadline() > std::chrono::hours(23));
+    // The defaulted statement times out in the queue; the two queued before it
+    // have waited longer and are still queued.
+    assert(defaulted.ReadLine().starts_with("-ERR TIMEOUT applied=false"));
+    assert(disabled.Received().empty() && replaced.Received().empty());
+    hook.Release();
+    assert(worker.ReadLine() == "+PONG\r\n");
+    assert(disabled.ReadLine() == "+PONG\r\n");
+    assert(replaced.ReadLine() == "+PONG\r\n");
+    defaulted.SendLine("PING"); assert(defaulted.ReadLine() == "+PONG\r\n");
+}
+
 // A transaction past --txn-max-duration-ms whose client sends nothing does
 // not keep other connections' transactional writes out of
 // --txn-total-bytes, and an idle connection with an open transaction still
@@ -7980,6 +8081,7 @@ int main(int argc, char** argv) {
         run("TestLongIdleConnectionTimeoutReleasesWorker", [] { TestLongIdleConnectionTimeoutReleasesWorker(); });
         run("TestBeforeHelloIdleDeadlineRemainsBounded", [] { TestLongIdleConnectionTimeoutReleasesWorker(false); });
         run("TestQueuedStatementTimeoutPreservesConnection", TestQueuedStatementTimeoutPreservesConnection);
+        run("TestServerDefaultStatementTimeout", TestServerDefaultStatementTimeout);
         run("TestWideNullableReadHasBoundedReplyAdmission", TestWideNullableReadHasBoundedReplyAdmission);
         run("TestReplyAdmissionPrecedesMutation", TestReplyAdmissionPrecedesMutation);
         run("TestRemovingCreditHeadAdmitsNextWaiter", TestRemovingCreditHeadAdmitsNextWaiter);
