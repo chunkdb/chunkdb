@@ -587,6 +587,51 @@ void TestSpawnModeWithUser() {
     assert(report.io_timeout_ms == 30000);
 }
 
+// --failed-logins N needs --user; its clients log in with a wrong password
+// beside the measured clients, at least once each, and are reported. Five
+// failures ban the bench's address on the spawned server, so the second
+// scenario starts once that ban has ended.
+void TestFailedLoginClients() {
+    const auto parsed = chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--user", "bench", "--failed-logins", "3"});
+    assert(parsed.failed_logins == 3U);
+    for (const std::vector<std::string>& refused : {
+             std::vector<std::string>{"chunkdb_server_bench", "--failed-logins", "2"},
+             std::vector<std::string>{"chunkdb_server_bench", "--user", "bench", "--failed-logins", "0"},
+             std::vector<std::string>{"chunkdb_server_bench", "--user", "bench", "--failed-logins", "1",
+                                      "--tests", "takeover", "--clients", "1"}}) {
+        bool threw = false;
+        try { (void)chunkdb::server_bench::ParseArgs(refused); } catch (const std::invalid_argument&) { threw = true; }
+        assert(threw);
+    }
+    assert(chunkdb::server_bench::UsageText().find("--failed-logins") != std::string::npos);
+    auto args = chunkdb::server_bench::Args{
+        .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
+        .host = "127.0.0.1",
+        .port = PickFreePort(),
+        .clients = 2,
+        .pipeline = 1,
+        .requests = 200,
+        .tests = {chunkdb::server_bench::Scenario::kSet, chunkdb::server_bench::Scenario::kPing},
+        .keyspace = 64,
+        .seed = 23,
+        .output_mode = chunkdb::server_bench::OutputMode::kJson,
+        .log_level = chunkdb::LogLevel::kWarn,
+        .user = "bench",
+        .password = "bench-password",
+        .io_timeout_ms = 30000,
+    };
+    args.failed_logins = 5U;
+    const auto report = chunkdb::server_bench::Run(args);
+    assert(report.failed_login_clients == 5U && report.results.size() == 2U);
+    for (const auto& result : report.results) assert(result.completed_requests == 200U && result.failed_logins >= 5U);
+    const auto json = chunkdb::server_bench::RenderJsonReport(report);
+    assert(json.find("\"failed_login_clients\":5,") != std::string::npos);
+    assert(json.find("\"failed_logins\":") != std::string::npos);
+    assert(chunkdb::server_bench::RenderHumanReport(report).find("Failed logins: ") != std::string::npos);
+    const auto plain = chunkdb::server_bench::RenderJsonReport(chunkdb::server_bench::BenchmarkReport{});
+    assert(plain.find("failed_login") == std::string::npos);
+}
+
 void TestParseArgsGridScenariosAndDurability() {
     const auto args = chunkdb::server_bench::ParseArgs({
         "chunkdb_server_bench",
@@ -1273,6 +1318,7 @@ int main(int argc, char** argv) {
     TestExternalModeDoesNotSpawn();
     TestExternalModeLogsIn();
     TestSpawnModeWithUser();
+    TestFailedLoginClients();
     TestSpawnModeStartsAndStops();
     TestOutputContainsPercentilesAndJsonFields();
     TestIdleClientsNoteWhenRequestsLessThanClients();

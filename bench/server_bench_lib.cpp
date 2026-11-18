@@ -1542,6 +1542,47 @@ void FillRegion(const Args& args, const GeometryInfo& geometry) {
     return sorted_ms[lower] + (sorted_ms[upper] - sorted_ms[lower]) * fraction;
 }
 
+// One login as the bench user with a wrong password; returns the refusal, a
+// failed login or, once the address is banned, the ban.
+std::string FailedLogin(const Args& args) {
+    Client client(args.host, args.port, args.io_timeout_ms);
+    const auto login = chunkdb::scram::StartClientLogin(args.user, chunkdb::scram::NewNonce());
+    client.SendLineWithPayload("HELLO 3 USER " + args.user + " $1", "$" + std::to_string(login.first.size()) + "\r\n" + login.first);
+    std::string reply = TrimCrLf(client.ReadReplyLine());
+    if (reply.rfind("+SCRAM ", 0) == 0) {
+        const auto final_message =
+            chunkdb::scram::FinishClientLogin(login, args.password + "-wrong", reply.substr(7));
+        client.SendLineWithPayload(
+            "AUTH $1", "$" + std::to_string(final_message.message.size()) + "\r\n" + final_message.message);
+        reply = TrimCrLf(client.ReadReplyLine());
+    }
+    if (reply.rfind("-ERR AUTH_FAILED", 0) != 0 && reply.rfind("-ERR RATE_LIMITED", 0) != 0)
+        throw std::runtime_error("unexpected reply to a failed login: " + reply);
+    return reply;
+}
+
+// Failed logins ban the bench's address; a login is refused with the ban's
+// retry_after_ms until it ends. Waits for that, outside any timed window.
+void AwaitLoginAfterBan(const Args& args) {
+    for (int attempt = 0; attempt < 100; ++attempt) {
+        Client client(args.host, args.port, args.io_timeout_ms);
+        try {
+            Hello(client, args);
+            return;
+        } catch (const std::runtime_error& error) {
+            const std::string_view text = error.what();
+            const std::string_view key = "retry_after_ms=";
+            const auto at = text.find(key);
+            if (text.find("RATE_LIMITED") == std::string_view::npos || at == std::string_view::npos) throw;
+            std::uint64_t wait_ms = 0;
+            const auto digits = text.substr(at + key.size());
+            (void)std::from_chars(digits.data(), digits.data() + digits.size(), wait_ms);
+            std::this_thread::sleep_for(std::chrono::milliseconds(std::min<std::uint64_t>(wait_ms, 86400000U) + 1U));
+        }
+    }
+    throw std::runtime_error("the failed logins' ban of this address did not end");
+}
+
 struct PendingRequest {
     Clock::time_point sent_at;
     ExpectedResponse expected;
@@ -1608,6 +1649,13 @@ struct ThreadWork {
     std::atomic<bool> failed{false};
     std::mutex error_mutex;
     std::string first_error;
+    // The --failed-logins clients start once every measured client has logged in.
+    const auto measured_clients = CountActiveWorkers(work_split);
+    std::mutex login_mutex;
+    std::condition_variable login_changed;
+    std::size_t logged_in = 0;
+    bool measured_done = false;
+    std::atomic<std::size_t> failed_logins{0};
 
     const auto start = Clock::now();
     std::vector<std::thread> workers;
@@ -1621,6 +1669,11 @@ struct ThreadWork {
             try {
                 Client client(args.host, args.port, args.io_timeout_ms);
                 Hello(client, args);
+                {
+                    std::lock_guard lock(login_mutex);
+                    ++logged_in;
+                }
+                login_changed.notify_all();
 
                 std::mt19937 rng(
                     args.seed ^
@@ -1731,6 +1784,30 @@ struct ThreadWork {
             }
         });
     }
+    std::vector<std::thread> failing;
+    failing.reserve(args.failed_logins);
+    for (std::size_t i = 0; i < args.failed_logins; ++i) {
+        failing.emplace_back([&]() {
+            {
+                std::unique_lock lock(login_mutex);
+                login_changed.wait(lock, [&] { return logged_in == measured_clients || measured_done; });
+            }
+            // Each client makes at least one attempt; one after the measured
+            // clients finish is outside the timed window.
+            try {
+                for (bool more = true; more && !failed.load(std::memory_order_acquire);) {
+                    (void)FailedLogin(args);
+                    failed_logins.fetch_add(1U, std::memory_order_relaxed);
+                    std::lock_guard lock(login_mutex);
+                    more = !measured_done;
+                }
+            } catch (const std::exception& e) {
+                failed.store(true, std::memory_order_release);
+                std::lock_guard lock(error_mutex);
+                if (first_error.empty()) first_error = std::string("failed-login client: ") + e.what();
+            }
+        });
+    }
     for (auto& worker : workers) {
         if (worker.joinable()) {
             worker.join();
@@ -1738,6 +1815,13 @@ struct ThreadWork {
     }
     const auto end = Clock::now();
     for (const auto& watch : watches) watch->SampleLag(write_frontier, end);
+    {
+        std::lock_guard lock(login_mutex);
+        measured_done = true;
+    }
+    login_changed.notify_all();
+    for (auto& client : failing) client.join();
+    if (!failing.empty() && !failed.load(std::memory_order_acquire)) AwaitLoginAfterBan(args);
 
     if (failed.load(std::memory_order_acquire)) {
         throw std::runtime_error(
@@ -1760,6 +1844,7 @@ struct ThreadWork {
     result.returned_area_chunks = returned_area_chunks;
     result.response_bytes = response_bytes;
     result.metadata_envelopes = metadata_envelopes;
+    result.failed_logins = failed_logins.load();
     result.blocks_per_request = static_cast<double>(completed_blocks) / result.completed_requests;
     for (std::size_t i = 0; i < request_mix.size(); ++i) result.request_mix.emplace_back(kRequestNames[i], request_mix[i]);
     result.duration_s = std::chrono::duration<double>(end - start).count();
@@ -1940,6 +2025,10 @@ void ValidateEnabledArgs(const Args& args) {
     if (std::find(args.tests.begin(), args.tests.end(), Scenario::kTakeover) != args.tests.end() &&
         (args.clients != 1U || args.pipeline != 1U || !args.watch_table.empty() || args.with_metadata != "none"))
         throw std::invalid_argument("takeover requires clients=1, pipeline=1, no --watch or --with");
+    if (args.failed_logins != 0U && args.user.empty())
+        throw std::invalid_argument("--failed-logins requires --user");
+    if (args.failed_logins != 0U && std::find(args.tests.begin(), args.tests.end(), Scenario::kTakeover) != args.tests.end())
+        throw std::invalid_argument("--failed-logins does not run with takeover");
 }
 
 void WaitForServerReady(const Args& args) {
@@ -2048,6 +2137,8 @@ std::string UsageText() {
         << "  --tests takeover                report-only idle ownership cycles; clients/pipeline must be 1\n"
         << "  --server-workers <N>             spawn mode: server worker threads (default: 4); a\n"
         << "                                   connection holds one, so use at least --clients\n"
+        << "  --failed-logins <N>              report-only: N clients log in with a wrong password\n"
+        << "                                   beside the measured clients; requires --user\n"
         << "  --user <name>                    log in as this user (also from --uri)\n"
         << "  --password-file <path>           the user's password (first line)\n"
         << "  --log-level <info|warn|error>    default: info\n"
@@ -2200,6 +2291,10 @@ Args ParseArgs(const std::vector<std::string>& argv) {
             args.server_workers = ParsePositiveSize(require_value("--server-workers"), "--server-workers");
             continue;
         }
+        if (arg == "--failed-logins") {
+            args.failed_logins = ParsePositiveSize(require_value("--failed-logins"), "--failed-logins");
+            continue;
+        }
         if (arg == "--durability-mode") {
             args.durability_mode = require_value("--durability-mode");
             (void)ParseDurabilityMode(args.durability_mode);
@@ -2296,6 +2391,7 @@ BenchmarkReport Run(const Args& args) {
     report.watch_mode = args.watch_mode;
     report.watch_delivery = args.watch_delivery;
     report.watch_table = args.watch_table;
+    report.failed_login_clients = args.failed_logins;
     if (!args.watch_table.empty()) {
         report.watch = args.watch_table;
         if (args.watch_count != 1U || args.watch_slots) report.watch += ":" + std::to_string(args.watch_count);
@@ -2460,6 +2556,7 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
     if (descriptive) out << "report_only with=" << report.with_metadata << " watch=" << report.watch
                          << " watch_mode=" << report.watch_mode
                          << (report.watch_delivery == "measure" ? " watch_delivery=measure" : "") << "\n";
+    if (report.failed_login_clients != 0U) out << "report_only failed_login_clients=" << report.failed_login_clients << "\n";
 
     for (const auto& result : report.results) {
         out << "\n[" << result.name << "]\n";
@@ -2489,6 +2586,7 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
                 out << "Ownership cycles: " << result.ownership_cycles << " cycles/s="
                     << result.ownership_cycles / result.duration_s << " latency_unit=ownership_cycle ACKs=0\n";
         }
+        if (report.failed_login_clients != 0U) out << "Failed logins: " << result.failed_logins << "\n";
         out << "Throughput (req/s): " << std::fixed << std::setprecision(2) << result.throughput_req_s << "\n";
         out << "Blocks: " << result.completed_blocks << "  Blocks/request: " << result.blocks_per_request
             << "  Blocks/s: " << result.throughput_blocks_s << "  Mix:";
@@ -2542,6 +2640,7 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
         << "\",\"watch\":\"" << JsonEscape(report.watch) << "\",\"watch_mode\":\""
         << JsonEscape(report.watch_mode) << "\""
         << (report.watch_delivery == "measure" ? ",\"watch_delivery\":\"measure\"" : "") << "},";
+    if (report.failed_login_clients != 0U) out << "\"failed_login_clients\":" << report.failed_login_clients << ",";
     out << "\"results\":[";
     for (std::size_t i = 0; i < report.results.size(); ++i) {
         if (i != 0) {
@@ -2557,6 +2656,7 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
         out << "\"blocks_per_request\":" << std::fixed << std::setprecision(6) << r.blocks_per_request << ",";
         out << "\"throughput_blocks_s\":" << r.throughput_blocks_s << ",";
         out << "\"returned_area_chunks\":" << r.returned_area_chunks << ",";
+        if (report.failed_login_clients != 0U) out << "\"failed_logins\":" << r.failed_logins << ",";
         if (descriptive || r.ownership_cycles != 0U) {
             out << "\"response_bytes\":" << r.response_bytes << ",\"metadata_envelopes\":" << r.metadata_envelopes
                 << ",\"watch_bytes\":" << r.watch_bytes << ",\"watch_changes\":" << r.watch_changes

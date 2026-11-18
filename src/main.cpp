@@ -246,7 +246,8 @@ int main(int argc, char** argv) {
                 server_config.idle_connection_timeout_ms =
                     ParseSize(require_value("--idle-connection-timeout-ms"), "idle-connection-timeout-ms");
             } else if (arg == "--statement-timeout-ms") {
-                server_config.statement_timeout_ms = ParseSize(require_value("--statement-timeout-ms"), "statement-timeout-ms");
+                server_config.statement_timeout_ms =
+                    ParseBounded(require_value("--statement-timeout-ms"), "--statement-timeout-ms", 0U, 86400000U);
             } else if (arg == "--max-pending-clients") {
                 server_config.max_pending_clients =
                     ParseSize(require_value("--max-pending-clients"), "max-pending-clients");

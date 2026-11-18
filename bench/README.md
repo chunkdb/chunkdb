@@ -11,6 +11,9 @@ Default workloads and JSON fields stay unchanged when these additions are unused
 - `--slot-create-timeout-ms N` bounds the CREATE SLOT reply in `measure` mode (default 600000); the first slot on a table checkpoints every chunk with WAL data before it replies, outside the timed window.
 - `--tests takeover --clients 1 --pipeline 1` measures idle connect→HELLO→WATCH TAKEOVER→old-owner closure cycles and requires no watch or read metadata.
 - Takeover performs no mutations or ACKs; initial slot creation/ownership and final UNWATCH/DROP are excluded from its timing and request counts.
+- `--failed-logins N` requires `--user` and starts N clients once every measured client has logged in; each logs in as that user with a wrong password, one login after another, until the measured clients finish, and makes at least one attempt.
+- The server delays each failure and ban reply (see [protocol](../docs/PROTOCOL.md)), so the measured latencies show whether those held replies slow logged-in clients; the failures ban the bench's address, and the next scenario starts after the ban ends.
+- Results add `failed_logins`, the failure and ban replies received, and the report adds `failed_login_clients`; takeover does not take the option.
 
 Ordinary throughput includes worker creation, connection and HELLO, but excludes fill, watch setup and final draining.
 Ordinary latency starts after sending a request and ends after validating its reply; takeover latency covers a whole ownership cycle.

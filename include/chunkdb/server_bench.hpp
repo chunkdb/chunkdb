@@ -70,6 +70,10 @@ struct Args {
     std::string watch_delivery = "strict";
     // measure: the longest wait for a CREATE SLOT reply.
     std::size_t slot_create_timeout_ms = 600000;
+    // Clients that log in as `user` with a wrong password, one login after
+    // another, from when every measured client has logged in until they all
+    // finish; report-only.
+    std::size_t failed_logins = 0;
     bool show_help = false;
 };
 
@@ -112,6 +116,8 @@ struct ScenarioResult {
     std::size_t watch_chunks = 0;
     std::size_t watch_other = 0;
     double watch_duration_s = 0.0;
+    // Failed-login and ban replies the --failed-logins clients received.
+    std::size_t failed_logins = 0;
     std::vector<WatcherResult> watchers;
     std::vector<std::pair<std::string, std::size_t>> request_mix;
     double latency_avg_ms = 0.0;
@@ -156,6 +162,8 @@ struct BenchmarkReport {
     std::size_t chunk_height_blocks = 0;
     // The --watch value; empty without watches.
     std::string watch;
+    // The --failed-logins value.
+    std::size_t failed_login_clients = 0;
     std::vector<ScenarioResult> results;
 };
 

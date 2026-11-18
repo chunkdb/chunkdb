@@ -340,6 +340,26 @@ void TestDroppedUserEvents() {
                                    "\"ok\":false", "\"error_code\":\"AUTH_REQUIRED\""});
 }
 
+// ENABLE FEATURE is audited when it succeeds (here a feature a new directory
+// already records) and when it is refused, without the right or with an
+// unknown name.
+void TestEnableFeatureEvents() {
+    Engine e;
+    auto admin = e.Admin(5);
+    assert(e.Run(admin, "CREATE USER bot VERIFIER $1", {Verifier("bot-password")}) == "+OK\r\n");
+    assert(e.Run(admin, "ENABLE FEATURE 'feed_slots'") == "+OK\r\n");
+    assert(e.Run(admin, "ENABLE FEATURE 'no_such_feature'").rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+    auto bot = e.Session(6);
+    assert(e.Login(bot, "bot", std::string("bot-password")).rfind("%", 0) == 0);
+    assert(e.Run(bot, "ENABLE FEATURE 'feed_slots'").rfind("-ERR PERMISSION_DENIED", 0) == 0);
+    const auto lines = Lines(e.audit_path);
+    LineWith(lines, {"\"event\":\"enable_feature\"", "\"connection\":5", "\"user\":\"admin\"", "\"ok\":true"});
+    LineWith(lines, {"\"event\":\"enable_feature\"", "\"connection\":5", "\"user\":\"admin\"", "\"ok\":false",
+                     "\"error_code\":\"INVALID_ARGUMENT\""});
+    LineWith(lines, {"\"event\":\"enable_feature\"", "\"connection\":6", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"PERMISSION_DENIED\""});
+}
+
 // The file is private, and Reopen (SIGHUP) moves later lines to a new file
 // at the path, leaving a renamed file as it was.
 void TestFileAndReopen() {
@@ -542,6 +562,7 @@ int main() {
     TestCredentialsChangedDuringLoginEvents();
     TestStatementEvents();
     TestDroppedUserEvents();
+    TestEnableFeatureEvents();
     TestFileAndReopen();
     TestJsonEscaping();
     TestInvalidUserNames();
