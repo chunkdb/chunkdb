@@ -44,6 +44,7 @@ Use IF VERSION for equality checks against the containing chunk, including chang
 
 chunkdb has no query planner and does not join tables.
 Each statement reads or writes one table at the coordinates you name.
+Lookup by value needs secondary indexes, which chunkdb does not have yet; see [Known limitations](KNOWN_LIMITATIONS.md) and keep a derived table keyed by the value instead.
 
 ### Keep data read together in one table
 
@@ -85,7 +86,6 @@ block 0 0
   kind = 1
 ```
 
-
 ### Read tables that share coordinates
 
 Use a separate table when the data has its own writers, rights or feed consumers.
@@ -126,6 +126,8 @@ OK
 To detect a write between the two reads, read the chunk of each table with GET CHUNK and note its `version`, then read both again.
 If neither `version` changed, nothing wrote to either chunk between the passes and the first reads match one state of both tables.
 Otherwise repeat the reads.
+This holds only while each table keeps its epoch: SWAP TABLES, RESTORE TABLE, or DROP and CREATE start a new epoch, so also compare the `epoch` from DESCRIBE before the first pass and after the second.
+A chunk that GET CHUNK returns as (null) has no version, so the check holds only for chunks present in both passes.
 Rows read together from a transaction on one table are always consistent, so use one table when that matters.
 
 ### Keep a derived table up to date
