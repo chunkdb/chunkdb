@@ -184,7 +184,7 @@ A block-span descriptor is six `u32` fields: stable column ID, width in bits, va
 Offsets are relative to the corresponding fixed or validity body; a nonnullable descriptor has zero validity offset and length.
 Descriptors follow the requested projection or schema order and cover each packed body exactly.
 The local block index is `x + width * (y + height * z)`; inactive z is zero.
-Section 7 marks a downsampled form from GET AREA SCALE: its presence, values and spans describe cells, with width, height and active depth each divided by `scale`.
+Section 7 marks a downsampled form from GET AREA SCALE: its presence, values and spans describe samples, one per group of blocks, with width, height and active depth each divided by `scale`.
 Its reductions are 1 MAX, 2 MIN, 3 MODE, 4 FIRST and 5 ANY; see [downsampled areas](reference/CHUNKS.md#downsampled-areas).
 Padding bits are zero, and absent blocks contain no retained values.
 Chunk-column bodies start with `count:u32` and a directory of `column_id:u32, null_flags:u16, reserved_zero:u16, offset:u32, length:u32` entries in stable-ID order.

@@ -253,6 +253,46 @@ void Reductions() {
     Error(f.engine->Execute(f.session, "SET CHUNK 0 0 IN t $1\r\n", parameters), "INVALID_ARGUMENT", "downsampled");
 }
 
+// f32, i64 and bool under MAX and MIN, and the tie of -0 and 0.
+void TypeEdges() {
+    Fixture f;
+    // IDs: g 1, d 2, w 3, k 4. Sample 0 holds x 0..1, sample 1 holds x 2..3.
+    f.Ok("CREATE TABLE t (g f32 NULL, d f64, w i64, k bool) CHUNK 4 x 2");
+    f.Ok("SET BLOCK 0 0 IN t g = nan, d = -0.0, w = -5, k = false");
+    f.Ok("SET BLOCK 1 0 IN t g = -2.5, d = 0.0, w = 3, k = true");
+    f.Ok("SET BLOCK 0 1 IN t g = 4.25, d = 0.0, w = 4000000000, k = false");
+    f.Ok("SET BLOCK 2 0 IN t g = nan, d = 0.0, w = 7, k = true");
+    f.Ok("SET BLOCK 3 0 IN t g = nan, d = -0.0, w = 7, k = true");
+    f.Ok("SET BLOCK 2 1 IN t d = 0.0, w = 0, k = false");
+    const auto single = [](float value) -> std::optional<std::uint64_t> { return std::bit_cast<std::uint32_t>(value); };
+    const auto wide = [](std::int64_t value) -> std::optional<std::uint64_t> { return static_cast<std::uint64_t>(value); };
+    const auto single_nan = [](std::optional<std::uint64_t> raw) {
+        return raw && *raw <= 0xFFFFFFFFU && std::isnan(std::bit_cast<float>(static_cast<std::uint32_t>(*raw)));
+    };
+    const auto blocks = One(f, "SCALE 1 USING FIRST");
+    const Cells stored(blocks.form, 8U);
+    assert(stored.Fixed(2, 0) == Double(-0.0) && stored.Fixed(2, 3) == Double(-0.0));
+
+    const auto max = One(f, "SCALE 2 USING MAX");
+    {
+        const Cells cells(max.form, 2U);
+        assert(cells.Present(0U) && cells.Present(1U));
+        // NaN is skipped; i64 compares signed over all 64 bits; true is the larger bool.
+        assert(cells.Fixed(1, 0) == single(4.25F) && cells.Fixed(3, 0) == wide(4000000000) && cells.Fixed(4, 0) == 1U);
+        // -0 and 0 are equal, so the first block wins in either order.
+        assert(cells.Fixed(2, 0) == Double(-0.0) && cells.Fixed(2, 1) == Double(0.0));
+        // Only NaN beside NULL gives NaN.
+        assert(single_nan(cells.Fixed(1, 1)) && cells.Fixed(3, 1) == wide(7) && cells.Fixed(4, 1) == 1U);
+    }
+    const auto min = One(f, "SCALE 2 USING MIN");
+    {
+        const Cells cells(min.form, 2U);
+        assert(cells.Fixed(1, 0) == single(-2.5F) && cells.Fixed(3, 0) == wide(-5) && cells.Fixed(4, 0) == 0U);
+        assert(cells.Fixed(2, 0) == Double(-0.0) && cells.Fixed(2, 1) == Double(0.0));
+        assert(single_nan(cells.Fixed(1, 1)) && cells.Fixed(3, 1) == wide(0) && cells.Fixed(4, 1) == 0U);
+    }
+}
+
 void ThreeDimensionsAndPartialAreas() {
     Fixture f;
     f.Ok("CREATE TABLE t (v u8) CHUNK 2 x 2 x 2");
@@ -368,6 +408,7 @@ void BoundsPagesAndTransactions() {
 
 int main() {
     Reductions();
+    TypeEdges();
     ThreeDimensionsAndPartialAreas();
     BoundsPagesAndTransactions();
 }

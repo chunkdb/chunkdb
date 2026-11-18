@@ -156,10 +156,10 @@ Use [Transactions](../TRANSACTIONS.md) when you need a consistent view of one ta
 
 ## Downsampled areas
 
-`SCALE k USING reduction` returns each populated chunk as a downsampled form: every group of k blocks on each active axis becomes one cell.
-k must be positive and divide every chunk side, so a group never crosses a chunk edge; a chunk of 16 x 16 blocks with `SCALE 4` has 4 x 4 cells.
+`SCALE k USING reduction` returns each populated chunk as a downsampled form: every group of k blocks on each active axis becomes one sample.
+k must be positive and divide every chunk side, so a group never crosses a chunk edge; a chunk of 16 x 16 blocks with `SCALE 4` has 4 x 4 samples.
 Each chunk is reduced on its own, so the area can hold any number of chunks.
-A cell is present when a block of its group is present; cells are numbered like blocks, with each side divided by k.
+A sample is present when a block of its group is present; samples are numbered like blocks, with each side divided by k.
 Each projected column, or every block column without COLUMNS, takes the value of one present block of the group:
 
 | Reduction | Value | Column types |
@@ -171,12 +171,13 @@ Each projected column, or every block column without COLUMNS, takes the value of
 | ANY | The value of some present block that is not NULL; which block is unspecified. | All |
 
 First means first in ascending local block index `x + width * (y + height * z)`, so x changes fastest.
-MAX, MIN, MODE and ANY skip NULL values; their cell is NULL only when every present block of the group is NULL.
+MAX, MIN, MODE and ANY skip NULL values; their sample is NULL only when every present block of the group is NULL.
 MAX and MIN skip NaN values and return NaN only when every value that is not NULL is NaN; -0 and 0 are equal, and of equal values the first wins.
 A column of another type is refused with INVALID_ARGUMENT before any chunk is read.
 The form keeps the chunk version, commit time, schema version and complete chunk columns, and adds section 7 with k and the reduction; see [Protocol](../PROTOCOL.md#chunk-form).
 SET CHUNK refuses a downsampled form.
 SCALE works with COLUMNS, WITH SCHEMA, LIMIT, AFTER and transactions, and the response limit counts the downsampled forms.
+LIMIT, AFTER and `max_area_chunks` still count requested chunk positions, not samples.
 
 ## Tombstones
 
