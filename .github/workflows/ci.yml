@@ -71,6 +71,9 @@ jobs:
           nice -n 10 build/chunkdb_docs_check walkthrough --cli page-bin/chunk-cli
           nice -n 10 build/chunkdb_docs_check examples --server build/chunkdb_server --cli page-bin/chunk-cli
           build/chunkdb_docs_check links
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   build-and-test:
     name: Build and Test (${{ matrix.os }})
@@ -127,6 +130,10 @@ jobs:
         run: |
           ctest --test-dir build -R server_integration --repeat until-fail:5 --output-on-failure
 
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
+
   # The other gates build without a build type, so without optimization;
   # GCC reports some warnings only at -O3.
   build-and-test-release-werror:
@@ -154,6 +161,9 @@ jobs:
           g++ --version
           chmod +x scripts/test/quick.sh
           BUILD_DIR=build-release CMAKE_BUILD_TYPE=Release CHUNKDB_WITH_TLS=OFF CHUNKDB_WERROR=ON scripts/test/quick.sh
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   build-and-test-tls-ubuntu:
     name: Build and Test TLS (ubuntu-latest)
@@ -212,6 +222,9 @@ jobs:
 
           kill "$server_pid"
           wait "$server_pid" || true
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   sanitizer-asan-ubsan:
     name: ASan+UBSan (ubuntu-latest)
@@ -247,6 +260,9 @@ jobs:
 
       - name: Smoke Tests
         run: ctest --test-dir build-asan-ubsan -L smoke --output-on-failure
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   sanitizer-tsan:
     name: TSan (Ubuntu 24.04, GCC)
@@ -285,6 +301,9 @@ jobs:
           -L smoke
           -E "process_lock|durability_kill_recovery"
           --output-on-failure
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   build-and-test-windows:
     name: Build and Test (windows-latest)
@@ -370,6 +389,9 @@ jobs:
           else
             echo "::warning::sparse_world_writes line not found in benchmark output"
           fi
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   build-and-test-windows-tls:
     name: Build and Test TLS (windows-latest)
@@ -491,6 +513,9 @@ jobs:
             cat tls-smoke/server.log
             exit 1
           fi
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   docker-quickstart:
     name: Docker quick-start page

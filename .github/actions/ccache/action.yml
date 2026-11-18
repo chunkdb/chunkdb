@@ -19,7 +19,7 @@ runs:
         if command -v apt-get >/dev/null 2>&1; then
           scripts/ci/apt-install.sh ccache || true
         elif command -v brew >/dev/null 2>&1; then
-          brew install ccache || true
+          HOMEBREW_NO_AUTO_UPDATE=1 HOMEBREW_NO_INSTALL_CLEANUP=1 brew install ccache || true
         fi
         if ! command -v ccache >/dev/null 2>&1; then
           echo "::warning::ccache is not available; building without it"
