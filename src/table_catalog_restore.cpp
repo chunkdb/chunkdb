@@ -14,6 +14,7 @@
 #include "file_permissions.hpp"
 #include "statement_control.hpp"
 #include "store_manifest.hpp"
+#include "user_registry.hpp"
 #include "verify.hpp"
 
 namespace chunkdb {
@@ -401,6 +402,162 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
     LogMessage(LogLevel::kInfo, LogComponent::kStore, "tables swapped",
         {{"tables", names[0] + "," + names[1]}, {"store_ids", StoreIdHex(tables[1]->store_id()) + "," + StoreIdHex(tables[0]->store_id())}});
     if (!swapped[0] || !swapped[1]) throw std::runtime_error("swapped tables could not all be opened under their new names");
+}
+
+}  // namespace chunkdb
+
+namespace chunkdb {
+namespace {
+
+constexpr const char* kFenceRenameUnknown = "a rename could not make it durable";
+constexpr const char* kFenceRenameReopen = "a rename could not open it under its new name";
+constexpr const char* kFenceRenameRefusedReopen = "a refused rename could not reopen it";
+constexpr const char* kWatchRenamed = "watched table was renamed; watch it again";
+
+}  // namespace
+
+void TableCatalog::RenameTable(std::string_view name, std::string_view new_name, UserRegistry* users, std::stop_token cancelled) {
+    RequireWritable("ALTER TABLE ... RENAME TO");
+    RequireValidTableName(name);
+    RequireValidTableName(new_name);
+    const std::string from(name), to(new_name);
+    if (from == to) throw std::invalid_argument("table '" + from + "' already has the name " + to);
+    // As SwapTables: feature activation and backup metadata capture and
+    // pinning exclude a rename, so a backup copies the table under one name.
+    if (!feature_metadata_gate_.lock_shared(cancelled)) throw std::runtime_error("ALTER TABLE ... RENAME TO cancelled");
+    std::shared_lock feature_metadata(feature_metadata_gate_, std::adopt_lock);
+    if (!backup_metadata_gate_.lock_shared(cancelled)) throw std::runtime_error("ALTER TABLE ... RENAME TO cancelled");
+    std::shared_lock backup_metadata(backup_metadata_gate_, std::adopt_lock);
+    const auto table = Require(from);
+    std::lock_guard ddl(table->ddl_mutex_);
+    const TableOptions options = table->Info().options;
+    auto store = table->BeginExclusive(/*closing=*/false, cancelled);
+    if (!store) {
+        if (cancelled.stop_requested()) throw std::runtime_error("ALTER TABLE ... RENAME TO cancelled");
+        throw TableNotFoundError("table '" + from + "' does not exist");
+    }
+    ScopeExit serving([&] { table->EndExclusive(std::move(store), options); });
+    std::lock_guard operations(operations_mutex_);
+    migration_health_->Check();
+    if (Find(from) != table) throw TableNotFoundError("table '" + from + "' does not exist");
+    if (const char* reason = Table::StoreFenceReason(*store))
+        throw TableFencedError("table '" + from + "' is fenced: " + reason + "; run RECOVER TABLE " + from);
+    ThrowIfFenced(to);
+    if (Find(to) != nullptr)
+        throw TableExistsError("table '" + to + "' already exists; use another name, or DROP TABLE " + to + " first");
+    // Everything acknowledged becomes durable under the old name first.
+    store->WalBarrier();
+    const std::filesystem::path old_dir = table->dir_;
+    const std::filesystem::path new_dir = TablesDir() / to;
+    // Made now, so that fencing and publishing do not allocate.
+    auto fence = PrepareFence(table, to, kFenceRenameUnknown);
+    auto refused_fence = PrepareFence(table, from, kFenceRenameRefusedReopen);
+    auto entry = PrepareServed(to);
+    const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
+    const std::string store_dir = store->data_dir().string();
+    // A stop accepted until here leaves the table serving under its name;
+    // after it the statement reports its real outcome.
+    EnterStatementDecision();
+    // The grants move first: a crash from here leaves them on both names,
+    // never on neither. A failure here still serves the table unchanged.
+    UserRegistry::TableGrants copied;
+    if (users) copied = users->CopyTableGrants(from, to);
+    serving.Dismiss();
+    store->HandOverUnsyncedOnClose(unsynced);
+    store.reset();
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_BEFORE_RENAME_ONCE");
+    const auto moved = ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_ONCE")
+        ? std::make_error_code(std::errc::io_error) : MoveDirectoryNoReplace(old_dir, new_dir);
+    if (moved) {
+        // Nothing moved: the table serves again under its name.
+        if (users) {
+            try {
+                users->RestoreTableGrants(to, copied);
+            } catch (const std::exception& error) {
+                LogMessage(LogLevel::kWarn, LogComponent::kStore,
+                    "grants given to the new name of a table whose rename failed could not be taken back; REVOKE them",
+                    {{"table", from}, {"name", to}, {"error", error.what()}});
+            }
+        }
+        try {
+            auto reopened = OpenStore(from, old_dir, table->geometry().config(), 0U, options);
+            reopened->AdoptUnsynced(*unsynced);
+            table->EndExclusive(std::move(reopened), options);
+        } catch (const std::exception& error) {
+            LogMessage(LogLevel::kError, LogComponent::kStore,
+                "table could not be reopened after a refused rename; it is fenced until RECOVER TABLE or a restart",
+                {{"table", from}, {"error", error.what()}});
+            FenceTable(*table, options, std::move(refused_fence));
+        }
+        if (moved == std::errc::file_exists)
+            throw TableExistsError("cannot rename table '" + from + "': " + new_dir.string() +
+                " exists but is not a table this server opened");
+        throw std::runtime_error("cannot rename table '" + from + "' to '" + to + "': " + moved.message());
+    }
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_RENAME_ONCE");
+    try {
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_TABLE_SYNC_FAIL_ONCE"))
+            throw std::runtime_error("injected directory sync failure after renaming a table");
+        SyncDirectoryPath(TablesDir());
+    } catch (const std::exception& error) {
+        // Renamed now, but a crash could still undo it: the new name does
+        // not serve until a recovery opens what its directory holds.
+        LogMessage(LogLevel::kError, LogComponent::kStore,
+            "renamed table could not be made durable; it is fenced until RECOVER TABLE or a restart",
+            {{"table", from}, {"name", to}, {"error", error.what()}});
+        table->ended_.store(kWatchRenamed, std::memory_order_release);
+        FenceTable(*table, options, std::move(fence));
+        throw;
+    }
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_SYNC_ONCE");
+    std::shared_ptr<Table> renamed;
+    try {
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_TABLE_OPEN_FAIL_ONCE"))
+            throw std::runtime_error("injected failure opening a renamed table");
+        auto opened = OpenStore(to, new_dir, table->geometry().config(), 0U, options);
+        // What the closed store still owed, spelled below the new directory.
+        ChunkStore::UnsyncedArtifacts owed;
+        owed.overflow = unsynced->overflow;
+        const auto opened_dir = opened->data_dir().string();
+        for (const auto& path : unsynced->files) owed.files.insert(MovedPath(path, store_dir, opened_dir));
+        for (const auto& path : unsynced->dirs) owed.dirs.insert(MovedPath(path, store_dir, opened_dir));
+        for (const auto& path : unsynced->swept_dirs) owed.swept_dirs.insert(MovedPath(path, store_dir, opened_dir));
+        opened->AdoptUnsynced(owed);
+        const StoreId store_id = opened->store_id();
+        Geometry geometry = opened->geometry();
+        renamed = std::shared_ptr<Table>(new Table(to, new_dir, store_id, std::move(geometry), options, std::move(opened),
+            config_.feed_buffer_bytes, migration_health_, config_.feed_linger));
+    } catch (const std::exception& error) {
+        LogMessage(LogLevel::kError, LogComponent::kStore,
+            "renamed table could not be opened under its new name; it is fenced until RECOVER TABLE or a restart",
+            {{"table", from}, {"name", to}, {"error", error.what()}});
+        fence.mapped().reason = kFenceRenameReopen;
+        table->ended_.store(kWatchRenamed, std::memory_order_release);
+        FenceTable(*table, options, std::move(fence));
+        throw;
+    }
+    // Connections holding the old table find no table of its name; its
+    // watches end, and a watch of the new name resumes in the same epoch.
+    {
+        std::unique_lock lock(tables_mutex_);
+        if (const auto it = tables_.find(from); it != tables_.end() && it->second == table) tables_.erase(it);
+        entry.mapped() = std::move(renamed);
+        tables_.insert(std::move(entry));
+    }
+    table->ended_.store(kWatchRenamed, std::memory_order_release);
+    table->EndExclusive(nullptr, options);
+    LogMessage(LogLevel::kInfo, LogComponent::kStore, "table renamed",
+        {{"table", from}, {"name", to}, {"store_id", StoreIdHex(table->store_id())}});
+    // Inside catalog admission, as DROP TABLE forgets grants: a statement
+    // creating or granting the old name follows the whole rename.
+    if (users) {
+        try {
+            users->ForgetTable(from);
+        } catch (const std::exception& error) {
+            throw std::runtime_error("table '" + from + "' was renamed to '" + to +
+                "', but its grants on the old name could not be removed: " + error.what());
+        }
+    }
 }
 
 }  // namespace chunkdb

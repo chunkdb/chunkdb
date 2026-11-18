@@ -113,6 +113,14 @@ class UserRegistry {
     void Revoke(const std::string& name, const std::string& table, Right right);
     // Removes the grants on a dropped table.
     void ForgetTable(const std::string& table);
+    // The right each user held on a table before CopyTableGrants changed it,
+    // or none.
+    using TableGrants = std::map<std::string, std::optional<Right>>;
+    // Gives `to` the grants on `from`, keeping a user's higher right where
+    // both have one, for a table renamed from `from` to `to`; returns what
+    // RestoreTableGrants needs to take the change back.
+    [[nodiscard]] TableGrants CopyTableGrants(const std::string& from, const std::string& to);
+    void RestoreTableGrants(const std::string& to, const TableGrants& previous);
     [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
     void SetMigrationHealth(std::shared_ptr<MigrationHealth> health);
     void SetMigrationTestHook(MigrationTestHook* hook) noexcept { test_hook_.store(hook, std::memory_order_release); }

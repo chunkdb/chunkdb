@@ -366,6 +366,7 @@ ChunkMutationResult ChunkStore::CasChunkStateBytes(
     if (regular_chunk->version != expected_version) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
     }
+    RequirePendingNotNullKept(regular_chunk->vars, new_presence);
     auto var_update = VarUpdateForState(regular_chunk->vars, new_presence);
 
     (void)ApplyFullChunkStateLocked(

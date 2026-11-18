@@ -330,6 +330,36 @@ void TestRights() {
     ExpectError(server.Login(gone, "bot", "new"), "AUTH_FAILED");
 }
 
+// ALTER TABLE ... RENAME TO needs ADMIN on both names and moves the grants
+// with the table: each user keeps the higher right where both names had one,
+// and the old name keeps none.
+void TestRenameTableGrants() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE TABLE logs (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE TABLE other (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    for (const auto* user : {"bot", "carol", "dave"})
+        ExpectReply(server.Run(admin, std::string("CREATE USER ") + user + " VERIFIER $1", Parameters{VerifierText("pw")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT WRITE ON logs TO bot"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT ADMIN ON logs TO carol"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON archive TO carol"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON archive TO dave"), "+OK\r\n");
+    SessionState bot = server.LoggedIn("bot", "pw");
+    SessionState carol = server.LoggedIn("carol", "pw");
+    ExpectError(server.Run(bot, "ALTER TABLE logs RENAME TO archive"), "PERMISSION_DENIED ADMIN on logs");
+    ExpectError(server.Run(carol, "ALTER TABLE logs RENAME TO archive"), "PERMISSION_DENIED ADMIN on archive");
+    ExpectError(server.Run(admin, "ALTER TABLE logs RENAME TO other"), "TABLE_EXISTS");
+    ExpectReply(server.Run(admin, "ALTER TABLE logs RENAME TO archive"), "+OK\r\n");
+    const auto grants = [&](const std::string& user) { return server.users->Find(user)->grants; };
+    assert(!grants("bot").contains("logs") && grants("bot").at("archive") == chunkdb::Right::kWrite);
+    assert(!grants("carol").contains("logs") && grants("carol").at("archive") == chunkdb::Right::kAdmin);
+    assert(grants("dave").at("archive") == chunkdb::Right::kRead);
+    // A session already logged in follows the moved grants.
+    assert(server.Run(bot, "SET BLOCK 0 0 IN archive bits = b'1010'").rfind(":", 0) == 0);
+    ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM logs"), "NO_TABLE");
+    ExpectError(server.Run(carol, "ALTER TABLE archive RENAME TO logs"), "PERMISSION_DENIED ADMIN on logs");
+}
+
 void TestRecreatedUser() {
     Server server;
     auto admin = server.LoggedIn("admin", "secret");
@@ -935,6 +965,7 @@ int main(int argc, char** argv) {
     TestStaleAuthenticationProofs();
     TestUserLimitStatementsAndAdmissionHook();
     TestRights();
+    TestRenameTableGrants();
     TestRecreatedUser();
     TestConditionalUsers();
     TestConcurrentConditionalUsers();
