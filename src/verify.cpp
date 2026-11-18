@@ -1177,3 +1177,12 @@ chunkdb::VerifyCounters chunkdb::VerifyDataDirectory(
     VerifyDataDirectoryImpl(data_dir, &counters);
     return counters;
 }
+
+chunkdb::VerifyCounters chunkdb::VerifyTableDirectory(
+    const std::filesystem::path& table_dir,
+    std::ostream& out) {
+    ::VerifyCounters counters;
+    counters.out = &out;
+    VerifyTable(table_dir, &counters);
+    return counters;
+}

@@ -23,6 +23,9 @@ struct FeedSlotRecord {
     // The user name the slot belongs to. A slot created without authentication
     // has none; such a slot takes the user of its first granted attach.
     std::optional<std::string> owner{};
+    // A restore or SWAP TABLES moved the slot to other data or another name:
+    // its next watch starts with resync, until an acknowledgement advances it.
+    bool resync = false;
 };
 
 struct FeedSlotRecords {

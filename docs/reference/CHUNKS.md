@@ -131,6 +131,7 @@ SHOW TABLE STATS table
 | INVALID_ARGUMENT | The geometry, values, or arguments are invalid. | Check the table and syntax. |
 | INVALID_ARGUMENT | You run SET CHUNK on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | OUT_OF_RANGE | The area or response exceeds a limit. | Read a smaller area. |
+| OUT_OF_RANGE reason=area_entry_too_large | One chunk cannot fit the response limit. | Read it with GET CHUNK or fewer COLUMNS; continue AFTER it. |
 | RESYNC_REQUIRED reason=history_lost | SINCE is below the retained-deletion floor. | Rebuild the consumer's state and resume at an admitted position. |
 
 ## Notes
@@ -172,7 +173,10 @@ An omitted LIMIT uses `max_area_chunks`; an explicit limit must be positive and 
 When `more` is true, resume the same selector strictly AFTER the returned coordinate; when it is false, `after` is null.
 AFTER must have the table's exact coordinate arity and lie inside the requested range or Euclidean ball.
 An empty page can advance across an empty region, and the response-byte bound can end a page before its requested cell count.
-A single populated chunk that cannot fit a complete page is refused; request fewer columns or use GET CHUNK.
+A populated chunk that cannot fit an otherwise empty page ends the page before it, so the next page starts at that chunk.
+As a page's first cell, or in a plain area, it is refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=x,y[,z] required=n limit=n`.
+`required` is the size of a reply holding only that chunk; read it with GET CHUNK or fewer COLUMNS, then continue AFTER its coordinate.
+A server started with `--max-area-response-bytes` of at least `required` returns that chunk in GET AREA.
 Independent pages can observe intervening writes; pages inside a transaction share its snapshot and private writes.
 
 An empty page still provides a continuation when requested cells remain:

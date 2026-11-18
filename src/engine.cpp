@@ -865,6 +865,17 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
             return Protocol::Error("INVALID_ARGUMENT", std::string(error.what()) + "; use DESCRIBE <table> to check column names");
         return Protocol::Error("INVALID_ARGUMENT", error.what());
     }
+    if (const auto* area = dynamic_cast<const AreaEntryTooLargeError*>(&error); area != nullptr) {
+        std::string chunk = std::to_string(area->coord().x) + "," + std::to_string(area->coord().y);
+        if (area->dims() == 3U) chunk += "," + std::to_string(area->coord().z);
+        const auto limit = std::to_string(area->limit());
+        if (!area->required())
+            return Protocol::Error("OUT_OF_RANGE", error.what(),
+                {{"reason", "area_entry_too_large"}, {"chunk", chunk}, {"limit", limit}});
+        const auto required = std::to_string(*area->required());
+        return Protocol::Error("OUT_OF_RANGE", error.what(),
+            {{"reason", "area_entry_too_large"}, {"chunk", chunk}, {"required", required}, {"limit", limit}});
+    }
     if (dynamic_cast<const std::out_of_range*>(&error) != nullptr) {
         return Protocol::Error("OUT_OF_RANGE", error.what());
     }

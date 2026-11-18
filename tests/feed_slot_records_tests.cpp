@@ -81,7 +81,7 @@ void Filters() {
         changed.resize(crc); WriteLe32(changed, Crc32(changed.data(), changed.size()));
         Reject([&] { (void)ParseFeedSlotRecords(changed, epoch); });
     };
-    auto malformed = bytes; malformed[37U] |= 128U; reject_checked(malformed);
+    auto malformed = bytes; malformed[37U] |= 128U | 1U; reject_checked(malformed); // resync on a lost slot
     malformed = bytes; malformed[38U] = 0U; malformed[39U] = 0U; reject_checked(malformed);
     malformed = bytes; malformed[37U] |= 32U; reject_checked(malformed); // loss reason requires lost
     const auto area_at = 36U + 12U + slot.name.size();
@@ -227,7 +227,7 @@ void Owners() {
     const auto owner_at = 36U + 12U + records.slots[0].name.size();
     auto malformed = bytes; malformed[7U] = 2U; reject_checked(malformed); // unknown header flag
     malformed = bytes; malformed[37U] |= 8U; reject_checked(malformed); // filter without the filter format
-    malformed = bytes; malformed[37U] |= 128U; reject_checked(malformed); // unknown slot flag
+    malformed = bytes; malformed[37U] |= 128U | 1U; reject_checked(malformed); // resync on a lost slot
     malformed = bytes; malformed[owner_at] = 0U; reject_checked(malformed); // empty owner
     malformed = bytes; malformed[owner_at + 1U] = 'A'; reject_checked(malformed); // not a user name
     malformed = bytes; malformed[owner_at] = 64U; reject_checked(malformed); // owner past the record
@@ -245,6 +245,15 @@ void Owners() {
     assert(ReadLe16(filtered, 4U) == 4U && filtered[7U] == 1U);
     const auto both = ParseFeedSlotRecords(filtered, epoch);
     assert(both.filter_format && both.slots[0].owner == "alice" && both.slots[1].filters.no_before);
+    // A slot a restore or swap moved reads back as needing resync.
+    records.slots[0].resync = true;
+    const auto moved = SerializeFeedSlotRecords(records);
+    assert((moved[37U] & 128U) != 0U);
+    const auto resyncing = ParseFeedSlotRecords(moved, epoch);
+    assert(resyncing.slots[0].resync && !resyncing.slots[1].resync && resyncing.slots[0].owner == "alice");
+    records.slots[0].lost = true;
+    Reject([&] { (void)SerializeFeedSlotRecords(records); });
+    records.slots[0].lost = false; records.slots[0].resync = false;
     auto unowned = parsed; unowned.slots.erase(unowned.slots.begin());
     const auto plain = SerializeFeedSlotRecords(unowned);
     assert(ReadLe16(plain, 4U) == 4U && !ParseFeedSlotRecords(plain, epoch).slots[0].owner);
