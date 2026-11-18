@@ -39,7 +39,11 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     if (options.after && table->lineage() && options.after->epoch == table->lineage()->parent_epoch &&
         options.after->revision == table->lineage()->fork_revision) options.after->epoch = table->store_id();
     auto start = slot.position;
-    const bool resync = options.after && (options.after->epoch != start.epoch || options.after->revision > claim->completed);
+    // Without AFTER the saved position decides; a restore or swap moved it, so
+    // the consumer's state is not at it.
+    const bool resync = options.after
+        ? options.after->epoch != start.epoch || options.after->revision > claim->completed
+        : slot.resync;
     if (options.after && !resync) start.revision = std::max(start.revision, options.after->revision);
     auto result = std::shared_ptr<SlotWatch>(new SlotWatch(std::move(table), std::move(claim), start, std::move(options), resync));
     result->slot_owner_ = slot.owner;
@@ -270,6 +274,10 @@ void SlotWatch::Build(Prepared& prepared) const {
         metadata.position = entry->position;
         metadata.schema_version = entry->schema_version;
         metadata.columns = columns;
+        const auto geometry = table_->geometry();
+        metadata.dims = geometry.dims();
+        if (geometry.has_chunk_column_history())
+            metadata.chunk_columns = geometry.ChunkColumnsLayoutAt(entry->schema_version).schema().columns;
         auto projected = FilterFeedEntry(std::make_shared<const FeedEntry>(std::move(metadata)), {}, options_.column_ids, false, columns);
         prepared.next.push_back(Output{std::make_shared<const std::string>(EncodeFeedEntry(*projected))});
     }

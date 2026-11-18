@@ -26,7 +26,10 @@ void SetDirectorySyncObserverForTests(std::function<void(const std::filesystem::
 // Called with each file SyncFilePath or SyncFilePathIfPresent synced; an
 // empty function stops it.
 void SetFileSyncObserverForTests(std::function<void(const std::filesystem::path&)> observer);
-void CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path);
+// Removes stale temporary files of `target_path` left by atomic writes.
+// Returns false, having looked at nothing else, when the directory holding
+// `target_path` does not exist.
+bool CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path);
 // Atomically replaces `path` with `bytes` via a temp file and rename.
 // When `out_replaced` is non-null it is set to true as soon as the rename
 // completes, so a caller can tell whether a post-rename failure (directory

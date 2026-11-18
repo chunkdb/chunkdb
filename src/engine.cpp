@@ -275,6 +275,10 @@ struct PendingLogin {
     bool known = false;
     // The incarnation of the user HELLO found; the session keeps it.
     std::uint64_t incarnation = 0;
+    // Whether the login is bound: AUTH succeeds only while the user still
+    // has the verifier of `exchange` and, for an unbound login, still takes
+    // unbound logins.
+    bool bound = false;
     scram::ServerExchange exchange;
     SessionHelloOptions options;
     // The user takes only bound logins and this one is not: it fails like a
@@ -339,8 +343,9 @@ std::string CommandEngine::Execute(
         // The user a login names, for the audit log: from HELLO 3 USER, or
         // the pending login AUTH finishes.
         std::string audit_user;
-        bool known_user = false;
-        bool unbound_refused = false;
+        // The login AUTH finishes; its flags are read once AUTH has run,
+        // since AUTH sets them from the user as it is then.
+        std::shared_ptr<const PendingLogin> audit_login;
         const bool was_greeted = session.greeted;
         if (config_.audit != nullptr) {
             if (hello) {
@@ -348,8 +353,7 @@ std::string CommandEngine::Execute(
                 if (tokens.size() == 5U && Protocol::CommandEquals(tokens[2], "USER")) audit_user = tokens[3];
             } else if (session.pending_login != nullptr) {
                 audit_user = session.pending_login->user;
-                known_user = session.pending_login->known;
-                unbound_refused = session.pending_login->unbound_refused;
+                audit_login = session.pending_login;
             }
         }
         std::string response;
@@ -375,6 +379,8 @@ std::string CommandEngine::Execute(
             const bool succeeded = session.greeted;
             // A +SCRAM reply only continues the login.
             if (succeeded || (!response.empty() && response[0] == '-')) {
+                const bool known_user = audit_login != nullptr && audit_login->known;
+                const bool unbound_refused = audit_login != nullptr && audit_login->unbound_refused;
                 AuditLogin(session, succeeded ? std::string_view(session.user) : std::string_view(audit_user),
                            known_user, unbound_refused, succeeded, response);
             }
@@ -725,7 +731,7 @@ std::string CommandEngine::RecordAuthFailure(SessionState& session, std::string_
             "client and the server ends TLS",
             {{"reason", "channel_binding"}});
     }
-    return Protocol::Error("AUTH_FAILED", "invalid user or password; check the username and password in your connection URI");
+    return Protocol::Error("AUTH_FAILED", "invalid user or password; check the user name and password your client sends, or reset the password with chunkdb_admin reset-password");
 }
 
 CommandEngine::PayloadRequest CommandEngine::PlanPayload(
@@ -859,6 +865,17 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
             return Protocol::Error("INVALID_ARGUMENT", std::string(error.what()) + "; use DESCRIBE <table> to check column names");
         return Protocol::Error("INVALID_ARGUMENT", error.what());
     }
+    if (const auto* area = dynamic_cast<const AreaEntryTooLargeError*>(&error); area != nullptr) {
+        std::string chunk = std::to_string(area->coord().x) + "," + std::to_string(area->coord().y);
+        if (area->dims() == 3U) chunk += "," + std::to_string(area->coord().z);
+        const auto limit = std::to_string(area->limit());
+        if (!area->required())
+            return Protocol::Error("OUT_OF_RANGE", error.what(),
+                {{"reason", "area_entry_too_large"}, {"chunk", chunk}, {"limit", limit}});
+        const auto required = std::to_string(*area->required());
+        return Protocol::Error("OUT_OF_RANGE", error.what(),
+            {{"reason", "area_entry_too_large"}, {"chunk", chunk}, {"required", required}, {"limit", limit}});
+    }
     if (dynamic_cast<const std::out_of_range*>(&error) != nullptr) {
         return Protocol::Error("OUT_OF_RANGE", error.what());
     }
@@ -902,7 +919,7 @@ std::string CommandEngine::HandleHello(
     if (session.connection_id == 0U) session.connection_id = NewConnectionId();
     if (!hello.user) {
         if (config_.require_auth) {
-            return Protocol::Error("AUTH_REQUIRED", "use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message; set the username and password in your client connection URI");
+            return Protocol::Error("AUTH_REQUIRED", "log in with a user name and password: name the user in the URI, such as chunk://admin@host:4242/, and give the client the password (clients use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message)");
         }
         RecordAuthSuccess(session, {});
         session.hello_options = std::move(options);
@@ -936,6 +953,7 @@ std::string CommandEngine::HandleHello(
         .user = user,
         .known = found.has_value(),
         .incarnation = found.has_value() ? found->incarnation : 0U,
+        .bound = bound,
         .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce(), binding_data),
         .options = std::move(options),
         .unbound_refused = !bound && found.has_value() && found->user.requires_channel_binding,
@@ -969,6 +987,18 @@ std::string CommandEngine::HandleAuth(
         return RecordAuthFailure(session, pending->user, true);
     }
     if (!server_final.has_value() || !pending->known || pending->unbound_refused) {
+        return RecordAuthFailure(session, pending->user);
+    }
+    // The user's credentials as of now, not as of HELLO: a verifier changed,
+    // a user dropped or created again, or a binding requirement added in
+    // between fails the login like a wrong password.
+    const auto current = config_.users->FindIncarnation(pending->user);
+    if (!current.has_value() || current->incarnation != pending->incarnation ||
+        current->user.verifier != pending->exchange.UserVerifier() ||
+        (!pending->bound && current->user.requires_channel_binding)) {
+        // The audit log gives the reason as of now too, as HELLO would.
+        pending->known = current.has_value();
+        pending->unbound_refused = current.has_value() && !pending->bound && current->user.requires_channel_binding;
         return RecordAuthFailure(session, pending->user);
     }
     RecordAuthSuccess(session, pending->user);

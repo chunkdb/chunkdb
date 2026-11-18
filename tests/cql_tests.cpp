@@ -520,11 +520,28 @@ void TestBackup() {
     ExpectError("BACKUP TO path", "expected a quoted backup path");
     ExpectError("BACKUP TO $1", "expected a quoted backup path");
     ExpectError("BACKUP TO '/path' extra", "expected the end of the statement");
+    const auto restore = Get<cql::RestoreTable>("RESTORE TABLE world FROM 'snap/it''s' AS world_restored");
+    assert(restore.table == "world" && restore.path == "snap/it's" && restore.name == "world_restored");
+    const auto same = Get<cql::RestoreTable>("restore table world from 'snap'");
+    assert(same.table == "world" && same.path == "snap" && same.name == "world");
+    ExpectError("RESTORE world FROM 'snap'", "expected TABLE");
+    ExpectError("RESTORE TABLE world 'snap'", "expected FROM");
+    ExpectError("RESTORE TABLE world FROM snap", "expected a quoted backup path");
+    ExpectError("RESTORE TABLE world FROM $1", "expected a quoted backup path");
+    ExpectError("RESTORE TABLE world FROM 'snap' AS", "expected a table name");
+    ExpectError("RESTORE TABLE world FROM 'snap' INTO other", "expected the end of the statement");
+    const auto swap = Get<cql::SwapTables>("SWAP TABLES world, world_restored");
+    assert(swap.first == "world" && swap.second == "world_restored");
+    ExpectError("SWAP TABLE world, other", "expected TABLES");
+    ExpectError("SWAP TABLES world other", "expected a comma");
+    ExpectError("SWAP TABLES world,", "expected a table name");
+    ExpectError("SWAP TABLES world, other, third", "expected the end of the statement");
 }
 
 void TestErrors() {
     ExpectError("", "column 1: unknown statement the end of the statement");
-    ExpectError("SELECT * FROM t", "column 1: unknown statement 'SELECT'");
+    ExpectError("SELECT * FROM t", "column 1: unknown statement 'SELECT'; read with GET BLOCK, GET AREA or GET CHUNK");
+    ExpectError("BOGUS", "column 1: unknown statement 'BOGUS'; the CQL reference lists every statement");
     ExpectError("GET ROW 1 2 FROM t", "column 5: expected BLOCK, CHUNK or AREA, got 'ROW'");
     ExpectError("GET BLOCK 1 FROM t", "column 13: expected y, got 'FROM'");
     ExpectError("GET BLOCK 1 2 FROM t extra", "column 22: expected the end of the statement, got 'extra'");

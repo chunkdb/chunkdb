@@ -323,22 +323,30 @@ std::uint64_t ChunkStore::NextChunkVersion() {
         throw std::runtime_error("injected version reservation failure");
     }
 
+    // The clock only advances below the durable ceiling, so it never passes
+    // the ceiling and can never wrap: an exhausted clock refuses every later
+    // reservation instead of issuing token zero or a reused token.
+    std::uint64_t candidate = version_clock_.load(std::memory_order_seq_cst);
     while (true) {
+        if (candidate >= version_clock_ceiling_.load(std::memory_order_acquire)) {
+            // Reserved range exhausted: persist a higher ceiling before
+            // issuing any token at or above it. Throws, leaving the clock
+            // unchanged, when no higher ceiling exists.
+            std::lock_guard lock(version_clock_mutex_);
+            candidate = version_clock_.load(std::memory_order_seq_cst);
+            if (candidate >= version_clock_ceiling_.load(std::memory_order_acquire)) {
+                ExtendVersionClockCeilingLocked(candidate);
+            }
+            continue;
+        }
         // Sequentially consistent: a write loads the open-transaction count
         // after taking its version, and a transaction snapshot reads the
         // clock after counting itself open (txn_history.hpp), so one of the
         // two always sees the other.
-        const std::uint64_t candidate = version_clock_.fetch_add(1, std::memory_order_seq_cst);
-        if (candidate < version_clock_ceiling_.load(std::memory_order_acquire)) {
+        if (version_clock_.compare_exchange_weak(
+                candidate, candidate + 1U, std::memory_order_seq_cst, std::memory_order_seq_cst)) {
             return candidate;
         }
-        // Reserved range exhausted: persist a higher ceiling before issuing
-        // any token at or above it.
-        std::lock_guard lock(version_clock_mutex_);
-        if (candidate >= version_clock_ceiling_.load(std::memory_order_acquire)) {
-            ExtendVersionClockCeilingLocked(candidate);
-        }
-        return candidate;
     }
 }
 
