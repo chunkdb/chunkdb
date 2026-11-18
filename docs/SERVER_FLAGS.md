@@ -140,7 +140,7 @@ Raise `--max-loaded-chunks` to raise the associated container limit.
 It takes no writer lock, so it can run next to the server that writes the directory.
 It runs no recovery, checkpoints or maintenance, and reserves no revisions.
 It leaves the users file and its permissions as they are, and logs a warning when the file is not owner-only.
-GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, DESCRIBE, the SHOW statements, PING and RELOAD TLS work.
+GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, AGGREGATE, DESCRIBE, the SHOW statements, PING and RELOAD TLS work.
 COMMIT, ROLLBACK, UNWATCH and ACK answer as they do when nothing is open, because no transaction or watch can start.
 Every other statement answers `INVALID_ARGUMENT reason=invalid_argument <statement> is not available: the server opened its data directory read-only`, including WATCH, BEGIN, FLUSH WAL and BACKUP.
 

@@ -1038,7 +1038,7 @@ std::string CommandEngine::ExecuteStatement(
         if (session.transaction != nullptr && !AllowedInTransaction(parsed.statement)) {
             return Protocol::Error(
                 "INVALID_ARGUMENT",
-                "inside a transaction only GET, SET and DELETE statements, DESCRIBE, PING, COMMIT and ROLLBACK run");
+                "inside a transaction only GET, SET and DELETE statements, AGGREGATE, DESCRIBE, PING, COMMIT and ROLLBACK run");
         }
         return std::visit(
             Overloaded{
@@ -1731,7 +1731,6 @@ std::string CommandEngine::ExecuteStatement(
                             return true;
                         }, false, session.transaction ? &*session.transaction->snapshot : nullptr, read);
                     if (page.has_more) throw std::logic_error("AGGREGATE left cells of its selector unvisited");
-                    if (session.transaction != nullptr) TxnRead(*session.transaction, covered);
                     if (info != nullptr) info->chunks = chunks;
                     std::string reply;
                     if (aggregate.by_chunk) {
@@ -1745,6 +1744,7 @@ std::string CommandEngine::ExecuteStatement(
                         }
                     }
                     if (reply.size() > budget) throw too_large();
+                    if (session.transaction != nullptr) TxnRead(*session.transaction, covered);
                     return reply;
                 },
                 [&](const cql::CreateTable& create) {

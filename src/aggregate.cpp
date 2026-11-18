@@ -60,8 +60,7 @@ Aggregator::Aggregator(const ChunkLayout& layout, std::span<const cql::Aggregate
         if (function.kind != Kind::kCount) {
             const auto index = layout.FindColumn(function.column);
             if (index == std::string_view::npos)
-                throw std::invalid_argument("the table has no column " + function.column +
-                    "; use DESCRIBE to check column names");
+                throw std::invalid_argument("the table has no column " + function.column);
             const auto& column = layout.schema().columns[index];
             const auto kind = column.type.kind;
             if (kind != ColumnKind::kUnsigned && kind != ColumnKind::kSigned &&

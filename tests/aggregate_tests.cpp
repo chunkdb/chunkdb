@@ -176,7 +176,9 @@ void Refusals() {
     CreateIntegers(f);
     Error(f.Run("AGGREGATE CHUNK 0 0 FROM t SUM(name)"), "INVALID_ARGUMENT", "sum(name) takes an integer or float column");
     Error(f.Run("AGGREGATE CHUNK 0 0 FROM t MIN(flag)"), "INVALID_ARGUMENT", "min(flag) takes an integer or float column");
-    Error(f.Run("AGGREGATE CHUNK 0 0 FROM t MAX(tag)"), "INVALID_ARGUMENT", "the table has no column tag");
+    const auto missing = f.Run("AGGREGATE CHUNK 0 0 FROM t MAX(tag)");
+    Error(missing, "INVALID_ARGUMENT", "the table has no column tag; use DESCRIBE <table> to check column names\r\n");
+    assert(missing.find("DESCRIBE") == missing.rfind("DESCRIBE"));
     Error(f.Run("AGGREGATE CHUNK 0 0 FROM missing COUNT(*)"), "NO_TABLE");
     Error(f.Run("AGGREGATE CHUNK 0 0 FROM t COUNT(*) WHERE v > 1"), "SYNTAX", "AGGREGATE does not take WHERE");
     Error(f.Run("AGGREGATE AREA 1 0 TO 0 0 FROM t COUNT(*)"), "INVALID_ARGUMENT");
@@ -218,19 +220,33 @@ void Transactions() {
         f.Ok("ROLLBACK");
         Same(f.Run("AGGREGATE AREA 0 0 TO 1 0 FROM t COUNT(*), SUM(v)"), Map({{"count(*)", UInt(4U)}, {"sum(v)", Int(107)}}));
     }
-    Fixture f(QueryLimits{.txn_max_read_chunks = 1U});
+    {
+        Fixture f(QueryLimits{.txn_max_read_chunks = 1U});
+        CreateIntegers(f);
+        f.Ok("BEGIN");
+        Error(f.Run("AGGREGATE AREA 0 0 TO 1 0 FROM t COUNT(*)"), "INVALID_ARGUMENT", "reads at most 1 chunks");
+        assert(f.session.transaction->read_set.empty());
+        Same(f.Run("AGGREGATE CHUNK 0 0 FROM t COUNT(*)"), Map({{"count(*)", UInt(2U)}}));
+        f.Ok("ROLLBACK");
+    }
+    // A reply over the size limit is refused after the visit and adds no
+    // cell, so a later write to those cells does not fail the COMMIT.
+    Fixture f(QueryLimits{.max_area_response_bytes = Rows({{Int(0), Int(0), UInt(2U)}}).size()});
     CreateIntegers(f);
     f.Ok("BEGIN");
-    Error(f.Run("AGGREGATE AREA 0 0 TO 1 0 FROM t COUNT(*)"), "INVALID_ARGUMENT", "reads at most 1 chunks");
+    Error(f.Run("AGGREGATE AREA 0 0 TO 1 0 FROM t COUNT(*), SUM(v), MIN(v)"), "OUT_OF_RANGE", "aggregate response exceeds");
+    Error(f.Run("AGGREGATE AREA 0 0 TO 1 0 FROM t COUNT(*) BY CHUNK"), "OUT_OF_RANGE", "aggregate response exceeds");
     assert(f.session.transaction->read_set.empty());
-    Same(f.Run("AGGREGATE CHUNK 0 0 FROM t COUNT(*)"), Map({{"count(*)", UInt(2U)}}));
-    f.Ok("ROLLBACK");
+    assert(f.RunOther("SET BLOCK 0 0 IN t v = 9").starts_with(":"));
+    assert(f.Run("SET BLOCK 5 5 IN t v = 2") == "_\r\n");
+    f.Ok("COMMIT");
 }
 
 // The block loop of one chunk stops a cancelled statement.
 void Cancellation() {
     TableSchema schema;
-    schema.columns = {Column{.id = 1U, .name = "v", .type = {ColumnKind::kSigned, 4U}, .nullable = true}};
+    schema.columns = {Column{.id = 1U, .name = "v", .type = {ColumnKind::kSigned, 4U}, .nullable = true,
+        .default_value = {}}};
     schema.next_column_id = 2U;
     const ChunkLayout layout(schema, 4U, 1024U);
     const std::vector<cql::AggregateFunction> functions{
