@@ -78,6 +78,7 @@ Limit refusals return RATE_LIMITED with `reason` and `retry_after_ms` without ap
 Dropping and recreating a user does not transfer the old user's authenticated sessions to the new identity.
 A login still between HELLO and AUTH when the user gets a new verifier, gets REQUIRE CHANNEL BINDING for an unbound login, or is dropped fails with AUTH_FAILED.
 A right AUTH proof made before any other change of the user's verifier or channel binding requirement returns AUTH_FAILED with `reason=stale_login` without counting a bad password.
+A user dropped after a right AUTH proof was checked and before the connection is admitted also returns AUTH_FAILED with `reason=stale_login`.
 An unconfirmed users-record replacement returns OUTCOME_UNKNOWN with `stage=users_record` and publishes the whole visible record.
 After an unknown outcome, an unchanged retry succeeds only after the visible record is durable.
 See [Protocol](../PROTOCOL.md) for authentication encoding.

@@ -38,8 +38,9 @@ The copy itself holds no catalog gate, so other DDL, backups and feature activat
 
 ## Cancellation and progress
 
-Server shutdown cancels a running restore at the next block, file or step boundary before the rename; nothing is published.
-A client disconnect does not cancel it, as for BACKUP; per-statement cancellation is a separate item of the 2.0 plan.
+Server shutdown, CANCEL, KILL CONNECTION or a statement timeout cancels a running restore at the next block, file or step boundary before the rename; nothing is published.
+After the rename the statement reports its real outcome.
+A client disconnect does not cancel it, as for BACKUP.
 The server logs the start, each tenth of the copied bytes, and the end, with the table, files and bytes.
 The reply names the table, epoch, parent epoch, fork revision, files and bytes.
 
@@ -48,6 +49,7 @@ The reply names the table, epoch, parent epoch, fork revision, files and bytes.
 SWAP takes the feature and backup metadata gates shared, as RECOVER TABLE does, so no backup pins a table while a swap waits for it.
 It then takes the tables' DDL locks and exclusive access in name order, so two swaps of overlapping tables cannot deadlock, then the catalog's table operations.
 It waits for running statements on both tables, makes their acknowledged writes durable with a WAL barrier and closes both stores; files a closing store leaves unsynced are carried to the reopened store under the new path.
+CANCEL, KILL CONNECTION or a statement timeout stops the swap only before the exchange, and both tables then keep serving under their names.
 One atomic directory exchange then swaps `tables/t` and `tables/t_restored` (`renameat2(RENAME_EXCHANGE)` on Linux, `renamex_np(RENAME_SWAP)` on macOS).
 A file system without an atomic exchange refuses the swap and reopens both tables unchanged; Windows refuses it before closing either table; there is no non-atomic fallback.
 After the exchange the parent directory is synced and each store is reopened under its new name as a new table object.
