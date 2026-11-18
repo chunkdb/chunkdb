@@ -365,6 +365,48 @@ bool TimedOutOnCapacity(Write&& write) {
     return false;
 }
 
+// A relaxed flush takes the WAL's size, its rollback boundary, from the
+// chunk's open append stream: only the flush that opens the stream looks the
+// WAL up by path. A failed flush still cuts the WAL back to that size.
+void TestRelaxedFlushesTakeTheWalSizeFromTheStream() {
+    const auto data_dir = TempDataDir("flush-size-from-stream");
+    auto config = BaseConfig(data_dir);
+    config.wal_group_commit_updates = 1;
+
+    {
+        chunkdb::ChunkStore store(config);
+        const auto wal_path =
+            chunkdb::ChunkWalPath(data_dir, store.geometry(), store.geometry().BlockToChunk(0, 0));
+        store.SetBlockBits(0, 0, MakeBits(1));
+        const auto probes = store.ChunkFileProbeCountForTests();
+        const auto opens = store.WalOpenCountForTests();
+        for (std::uint32_t i = 2; i <= 16; ++i) {
+            store.SetBlockBits(0, 0, MakeBits(i));
+        }
+        assert(store.WalOpenCountForTests() == opens);
+        assert(store.ChunkFileProbeCountForTests() == probes);
+
+        const auto size_before = std::filesystem::file_size(wal_path);
+        SetFailpoint("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
+        bool failed = false;
+        try {
+            store.SetBlockBits(0, 0, MakeBits(99));
+        } catch (const std::runtime_error& e) {
+            failed = std::string(e.what()).find("injected WAL batch sync failure") != std::string::npos;
+        }
+        assert(failed);
+        assert(std::filesystem::file_size(wal_path) == size_before);
+        assert(store.GetBlockBits(0, 0) == MakeBits(16));
+        store.SetBlockBits(0, 0, MakeBits(17));
+    }
+    {
+        chunkdb::ChunkStore recovered(config);
+        assert(recovered.GetBlockBits(0, 0) == MakeBits(17));
+    }
+
+    RemoveAllWithRetry(data_dir);
+}
+
 // A stream that fails before the file is opened, after it is opened, or
 // while its header is written closes what it opened and gives its place
 // back: with a cap of one, the next chunk opens without a capacity timeout,
@@ -755,6 +797,7 @@ int main() {
     TestWalOpenHandleCap();
     TestWalStreamPoolClosesLeastRecentlyUsed();
     TestWalOpenDoesNotBlockOtherChunks();
+    TestRelaxedFlushesTakeTheWalSizeFromTheStream();
     TestFailedWalOpenReleasesItsPlace();
     TestConcurrentWalOpensKeepTheCap(chunkdb::DurabilityMode::kRelaxed, 128);
     TestConcurrentWalOpensKeepTheCap(chunkdb::DurabilityMode::kFsyncWal, 32);

@@ -68,14 +68,16 @@ std::uint16_t ParsePort(const std::string& value) {
     return static_cast<std::uint16_t>(port);
 }
 
-// A decimal integer from `min` to `max`.
+// A decimal integer from `min` to `max`; the largest size_t means no upper
+// bound.
 std::size_t ParseBounded(const std::string& value, const char* flag, std::size_t min, std::size_t max) {
     std::size_t parsed = 0;
     const auto result = std::from_chars(value.data(), value.data() + value.size(), parsed);
     if (result.ec != std::errc() || result.ptr != value.data() + value.size() || parsed < min || parsed > max) {
-        throw std::invalid_argument(
-            std::string("invalid ") + flag + ": " + value + " (expected " + std::to_string(min) + " to " +
-            std::to_string(max) + ")");
+        const std::string expected = max == std::numeric_limits<std::size_t>::max()
+            ? std::to_string(min) + " or more"
+            : std::to_string(min) + " to " + std::to_string(max);
+        throw std::invalid_argument(std::string("invalid ") + flag + ": " + value + " (expected " + expected + ")");
     }
     return parsed;
 }
@@ -287,8 +289,8 @@ int main(int argc, char** argv) {
                 if (arg == "--slot-max-bytes") store_config.slot_max_bytes = parsed;
                 else store_config.slot_sync_interval = std::chrono::milliseconds(parsed);
             } else if (arg == "--max-handshakes-per-ip") {
-                server_config.max_handshakes_per_ip =
-                    ParseSize(require_value("--max-handshakes-per-ip"), "max-handshakes-per-ip");
+                server_config.max_handshakes_per_ip = ParseBounded(require_value("--max-handshakes-per-ip"),
+                    "--max-handshakes-per-ip", 0U, std::numeric_limits<std::size_t>::max());
             } else if (arg == "--max-line-bytes") {
                 server_config.max_line_bytes =
                     ParseSize(require_value("--max-line-bytes"), "max-line-bytes");

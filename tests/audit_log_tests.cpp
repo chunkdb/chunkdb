@@ -205,20 +205,22 @@ void TestChannelBindingEvents() {
                                         "\"error_code\":\"AUTH_REQUIRED\"", "\"reason\":\"channel_binding\""});
 }
 
-// Logins that user admission refuses: one whose user changed between HELLO
-// and AUTH, and one past the user's connection limit.
+// Logins that user admission refuses: one with a right proof whose user's
+// verifier changed and changed back between HELLO and AUTH, and one past
+// the user's connection limit.
 void TestAdmissionLoginEvents() {
     Engine e;
     auto admin = e.Admin(40);
-    assert(e.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{Verifier("pw")}) == "+OK\r\n");
+    const std::string verifier = Verifier("pw");
+    assert(e.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{verifier}) == "+OK\r\n");
     auto stale = e.Session(41);
     const auto login = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce());
     const auto first = e.Run(stale, chunkdb::test::HelloUserLine("bot"), Parameters{login.first});
     assert(first.rfind("+SCRAM ", 0) == 0);
     const auto final = chunkdb::scram::FinishClientLogin(login, "pw", first.substr(7, first.size() - 9));
-    assert(e.Run(admin, "ALTER USER bot REQUIRE CHANNEL BINDING") == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot VERIFIER $1", Parameters{Verifier("other")}) == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot VERIFIER $1", Parameters{verifier}) == "+OK\r\n");
     assert(e.Run(stale, "AUTH $1", Parameters{final.message}).rfind("-ERR AUTH_FAILED reason=stale_login ", 0) == 0);
-    assert(e.Run(admin, "ALTER USER bot NO REQUIRE CHANNEL BINDING") == "+OK\r\n");
     assert(e.Run(admin, "ALTER USER bot LIMIT max_connections = 1") == "+OK\r\n");
     auto holding = e.Session(42);
     assert(e.Login(holding, "bot", std::string("pw")).rfind("%", 0) == 0);
@@ -230,6 +232,41 @@ void TestAdmissionLoginEvents() {
                      "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"stale_login\""});
     LineWith(lines, {"\"event\":\"login\"", "\"connection\":43", "\"user\":\"bot\"", "\"ok\":false",
                      "\"error_code\":\"RATE_LIMITED\"", "\"reason\":\"max_connections\""});
+}
+
+// Logins whose user changes between HELLO and AUTH: the reason is the one the
+// user gives as of AUTH.
+void TestCredentialsChangedDuringLoginEvents() {
+    Engine e;
+    auto admin = e.Admin(40);
+    const std::string password = "bot-private-password";
+    const std::string verifier = Verifier(password);
+    assert(e.Run(admin, "CREATE USER bot VERIFIER $1", {verifier}) == "+OK\r\n");
+    // HELLO on connection `id`, then `change` from the admin, then AUTH with
+    // the password that was right at HELLO.
+    const auto login_around = [&](std::uint64_t id, const std::string& change, const Parameters& parameters) {
+        auto session = e.Session(id);
+        const auto login = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce());
+        const auto first = e.Run(session, chunkdb::test::HelloUserLine("bot"), Parameters{login.first});
+        assert(first.rfind("+SCRAM ", 0) == 0);
+        assert(e.Run(admin, change, parameters) == "+OK\r\n");
+        const auto final_message =
+            chunkdb::scram::FinishClientLogin(login, password, chunkdb::test::ServerFirstOf(first));
+        assert(e.Run(session, "AUTH $1", Parameters{final_message.message}).rfind("-ERR AUTH_FAILED", 0) == 0);
+    };
+    login_around(41, "ALTER USER bot REQUIRE CHANNEL BINDING", {});
+    assert(e.Run(admin, "ALTER USER bot NO REQUIRE CHANNEL BINDING") == "+OK\r\n");
+    login_around(42, "ALTER USER bot VERIFIER $1", {Verifier("bot-other-password")});
+    assert(e.Run(admin, "ALTER USER bot VERIFIER $1", {verifier}) == "+OK\r\n");
+    login_around(43, "DROP USER bot", {});
+
+    const auto lines = Lines(e.audit_path);
+    LineWith(lines, {"\"event\":\"login\"", "\"connection\":41", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"channel_binding_required\""});
+    LineWith(lines, {"\"event\":\"login\"", "\"connection\":42", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"wrong_password\""});
+    LineWith(lines, {"\"event\":\"login\"", "\"connection\":43", "\"user\":\"bot\"", "\"ok\":false",
+                     "\"error_code\":\"AUTH_FAILED\"", "\"reason\":\"unknown_user\""});
 }
 
 // Every audited statement, with the names it acts on, and a failure with its
@@ -502,6 +539,7 @@ int main() {
     TestLoginEvents();
     TestChannelBindingEvents();
     TestAdmissionLoginEvents();
+    TestCredentialsChangedDuringLoginEvents();
     TestStatementEvents();
     TestDroppedUserEvents();
     TestFileAndReopen();

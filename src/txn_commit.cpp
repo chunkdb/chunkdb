@@ -62,16 +62,6 @@ void CrashAtTxnFailpoint(const char* key) {
     return ConsumeFailpointEnv(key);
 }
 
-[[nodiscard]] std::string CurrentExceptionMessage() {
-    try {
-        throw;
-    } catch (const std::exception& error) {
-        return error.what();
-    } catch (...) {
-        return "unknown error";
-    }
-}
-
 [[nodiscard]] std::string CoordText(const ChunkCoord& coord) {
     return "(" + std::to_string(coord.x) + "," + std::to_string(coord.y) + ")";
 }

@@ -187,22 +187,28 @@ bool ChunkStore::ApplyFullChunkStateLocked(
             // The freshly appended WAL record could not be neutralized, so on a
             // later crash recovery repairs it from the retained durable intent.
             // Memory has already been rolled back, so continuing to serve would
-            // leave memory and disk incoherent. Poison the store until restart.
-            const std::string reason =
-                "WAL rollback after a rejected conditional mutation on chunk (" +
-                std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) +
-                ") failed: " + truncate_error.what();
-            LogMessage(
-                LogLevel::kError,
-                LogComponent::kRecovery,
-                "failed to neutralize WAL after rejected conditional mutation; poisoning store",
-                {
-                    {"chunk_x", std::to_string(chunk_coord.x)},
-                    {"chunk_y", std::to_string(chunk_coord.y)},
-                    {"error", truncate_error.what()},
-                });
-            PoisonDurability(reason);
+            // leave memory and disk incoherent. Fail closed first, with a
+            // reason that cannot fail to build, then name it and log it.
             chunk->wal_repair_failed = true;
+            PoisonDurability(std::string());
+            try {
+                PoisonDurability(
+                    "WAL rollback after a rejected conditional mutation on chunk (" +
+                    std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) +
+                    ") failed: " + truncate_error.what());
+                LogMessage(
+                    LogLevel::kError,
+                    LogComponent::kRecovery,
+                    "failed to neutralize WAL after rejected conditional mutation; poisoning store",
+                    {
+                        {"chunk_x", std::to_string(chunk_coord.x)},
+                        {"chunk_y", std::to_string(chunk_coord.y)},
+                        {"error", truncate_error.what()},
+                    });
+            } catch (...) {
+                // The store is fail-closed already; only the reason or the
+                // log line is missing.
+            }
         }
         snapshot_write.Finish();
         throw;
@@ -225,9 +231,27 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     std::vector<std::uint8_t>().swap(previous_payload);
     std::vector<std::uint8_t>().swap(previous_presence);
     feed.Commit();
+    // Past the commit point a failed warning must not turn the committed
+    // mutation into a command error. Called inside a handler: names the
+    // exception being handled.
+    const auto log_committed = [&chunk_coord](const char* message) noexcept {
+        try {
+            LogMessage(
+                LogLevel::kWarn,
+                LogComponent::kRecovery,
+                message,
+                {
+                    {"chunk_x", std::to_string(chunk_coord.x)},
+                    {"chunk_y", std::to_string(chunk_coord.y)},
+                    {"error", CurrentExceptionMessage()},
+                });
+        } catch (...) {
+            // Logging is best-effort; the committed mutation stands.
+        }
+    };
     try {
         ClearCommittedConditionalIntent(rollback_intent_path);
-    } catch (const std::exception& cleanup_error) {
+    } catch (...) {
         if (!commit_record_durable) {
             // The CKRC replace was visible but its first directory sync did
             // not complete. A successful sync now makes either the retained
@@ -261,47 +285,25 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         // The mutation is committed. CKRC is safe if retained: startup removes
         // it without truncating any WAL bytes. If the unlink survives, normal
         // replay reaches the same committed state.
-        LogMessage(
-            LogLevel::kWarn,
-            LogComponent::kRecovery,
-            "conditional mutation committed but intent cleanup was incomplete",
-            {
-                {"chunk_x", std::to_string(chunk_coord.x)},
-                {"chunk_y", std::to_string(chunk_coord.y)},
-                {"error", cleanup_error.what()},
-            });
+        log_committed("conditional mutation committed but intent cleanup was incomplete");
     }
     (void)commit_record_durable;
 
     try {
         MaybeCheckpointChunk(chunk_coord, chunk);
-    } catch (const std::exception& checkpoint_error) {
-        LogMessage(
-            LogLevel::kWarn,
-            LogComponent::kRecovery,
+    } catch (...) {
+        log_committed(
             "conditional mutation committed in WAL but inline checkpoint failed; "
-            "retaining committed mutation for retry",
-            {
-                {"chunk_x", std::to_string(chunk_coord.x)},
-                {"chunk_y", std::to_string(chunk_coord.y)},
-                {"error", checkpoint_error.what()},
-            });
+            "retaining committed mutation for retry");
     }
     try {
         snapshot_write.Finish();
-    } catch (const std::exception& finish_error) {
+    } catch (...) {
         // The mutation is already committed; a generation-publication
         // failure here must not surface as a command error. The epoch stays
         // failed, so subsequent transitions fail closed until restart.
-        LogMessage(
-            LogLevel::kWarn,
-            LogComponent::kRecovery,
-            "conditional mutation committed but snapshot generation could not be republished",
-            {
-                {"chunk_x", std::to_string(chunk_coord.x)},
-                {"chunk_y", std::to_string(chunk_coord.y)},
-                {"error", finish_error.what()},
-            });
+        log_committed(
+            "conditional mutation committed but snapshot generation could not be republished");
     }
     return true;
 }

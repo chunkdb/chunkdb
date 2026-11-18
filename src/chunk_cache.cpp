@@ -537,10 +537,17 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
         return loaded;
     }
 
-    if (writable) {
-        CleanupAtomicTmpArtifacts(data_path);
-    }
-    if (std::filesystem::exists(data_path)) {
+    // Only a writer gets here. The image and the WAL share one directory,
+    // which a chunk that was never written may not have: its load then looks
+    // up that directory and no file in it.
+    stats_chunk_file_probes_.fetch_add(1, std::memory_order_relaxed);
+    const bool directory_present = CleanupAtomicTmpArtifacts(data_path);
+    const auto present = [&](const std::filesystem::path& path) {
+        if (!directory_present) return false;
+        stats_chunk_file_probes_.fetch_add(1, std::memory_order_relaxed);
+        return std::filesystem::exists(path);
+    };
+    if (present(data_path)) {
         try {
             FeedWalPrefixTestAccess::Run(FeedWalPrefixTestHook::Point::kImageRead, chunk_coord);
             const auto data_bytes = LoadChunkImageFile(data_path, geometry_, chunk_coord, store_id_, features_);
@@ -570,7 +577,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
     }
 
     apply_boundary();
-    if (std::filesystem::exists(wal_path)) {
+    if (present(wal_path)) {
         std::optional<SharedFileInput> opened;
         try {
             opened.emplace(wal_path);

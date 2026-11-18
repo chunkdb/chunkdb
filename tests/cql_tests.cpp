@@ -528,6 +528,22 @@ void TestBackup() {
     ExpectError("BACKUP TO path", "expected a quoted backup path");
     ExpectError("BACKUP TO $1", "expected a quoted backup path");
     ExpectError("BACKUP TO '/path' extra", "expected the end of the statement");
+    const auto restore = Get<cql::RestoreTable>("RESTORE TABLE world FROM 'snap/it''s' AS world_restored");
+    assert(restore.table == "world" && restore.path == "snap/it's" && restore.name == "world_restored");
+    const auto same = Get<cql::RestoreTable>("restore table world from 'snap'");
+    assert(same.table == "world" && same.path == "snap" && same.name == "world");
+    ExpectError("RESTORE world FROM 'snap'", "expected TABLE");
+    ExpectError("RESTORE TABLE world 'snap'", "expected FROM");
+    ExpectError("RESTORE TABLE world FROM snap", "expected a quoted backup path");
+    ExpectError("RESTORE TABLE world FROM $1", "expected a quoted backup path");
+    ExpectError("RESTORE TABLE world FROM 'snap' AS", "expected a table name");
+    ExpectError("RESTORE TABLE world FROM 'snap' INTO other", "expected the end of the statement");
+    const auto swap = Get<cql::SwapTables>("SWAP TABLES world, world_restored");
+    assert(swap.first == "world" && swap.second == "world_restored");
+    ExpectError("SWAP TABLE world, other", "expected TABLES");
+    ExpectError("SWAP TABLES world other", "expected a comma");
+    ExpectError("SWAP TABLES world,", "expected a table name");
+    ExpectError("SWAP TABLES world, other, third", "expected the end of the statement");
 }
 
 void TestErrors() {

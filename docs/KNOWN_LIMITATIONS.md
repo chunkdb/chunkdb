@@ -12,7 +12,8 @@
 - **No automatic layout conversion:** unsupported data layouts are refused; see [Storage format](STORAGE_FORMAT.md).
 - **Bounded live history:** ordinary watches resync when history is unavailable; see [Change feed](CHANGE_FEED.md).
 - **Bounded slot history:** slots default to 1073741824 retained bytes; lost slots require rebuilding consumer state and recreating the slot.
-- **Per-table backup cuts:** backups do not share a cross-table snapshot; restore is offline into a new directory; see [Backup and restore](BACKUP.md).
+- **Per-table backup cuts:** backups do not share a cross-table snapshot; a whole backup restores offline into a new directory, one table online with RESTORE TABLE; see [Backup and restore](BACKUP.md).
+- **SWAP TABLES needs an atomic directory exchange:** Linux and macOS have one; Windows refuses SWAP TABLES.
 - **Fixed geometry:** chunk and large-chunk dimensions cannot change after table creation.
 - **Table-wide rights:** you cannot grant access to only part of an area; see [Users and rights](USERS.md).
 - **Read-only view at startup:** a `--read-only` server reads the tables, columns and users that exist when it starts, and its reads can fail while the writer changes a table without pause; see [Server flags](SERVER_FLAGS.md#read-only).

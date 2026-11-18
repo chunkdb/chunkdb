@@ -174,24 +174,37 @@ void TestLogin() {
     assert(idle.close_after_reply);
 }
 
+// A right proof made against credentials that changed before AUTH: a new
+// verifier or a new incarnation fails like a wrong password, and a verifier
+// changed and changed back is a stale login that counts no failure.
 void TestStaleAuthenticationProofs() {
-    for (const bool recreate : {false, true}) {
+    enum class Change { kReplace, kRecreate, kRestore };
+    for (const auto change : {Change::kReplace, Change::kRecreate, Change::kRestore}) {
         Server server;
         const auto verifier = chunkdb::scram::MakeVerifier("original", std::vector<std::uint8_t>(16U, 7U), chunkdb::scram::kMinIterations);
+        const auto replacement = chunkdb::scram::MakeVerifier("replacement", std::vector<std::uint8_t>(16U, 8U), chunkdb::scram::kMinIterations);
         server.users->Create("bot", verifier, false);
         SessionState session;
         const auto client = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce());
         const auto first = server.Run(session, "HELLO 3 USER bot $1", Parameters{client.first});
         assert(first.starts_with("+SCRAM "));
         const auto final = chunkdb::scram::FinishClientLogin(client, "original", first.substr(7, first.size() - 9));
-        if (recreate) {
+        if (change == Change::kRecreate) {
             server.users->Drop("bot");
             server.users->Create("bot", verifier, false);
         } else {
-            server.users->SetVerifier("bot", chunkdb::scram::MakeVerifier("replacement", std::vector<std::uint8_t>(16U, 8U), chunkdb::scram::kMinIterations));
+            server.users->SetVerifier("bot", replacement);
+            if (change == Change::kRestore) server.users->SetVerifier("bot", verifier);
         }
-        ExpectError(server.Run(session, "AUTH $1", Parameters{final.message}), "AUTH_FAILED reason=stale_login");
-        assert(session.failed_auth_attempts == 0U && !session.greeted && !session.authenticated && !session.user_ticket);
+        const auto reply = server.Run(session, "AUTH $1", Parameters{final.message});
+        if (change == Change::kRestore) {
+            ExpectError(reply, "AUTH_FAILED reason=stale_login");
+            assert(session.failed_auth_attempts == 0U);
+        } else {
+            ExpectError(reply, "AUTH_FAILED reason=auth_failed");
+            assert(session.failed_auth_attempts == 1U);
+        }
+        assert(!session.greeted && !session.authenticated && !session.user_ticket);
         assert(server.users->AuthenticationSnapshot("bot")->state->connections == 0U);
     }
 }
@@ -461,7 +474,8 @@ SessionState TlsSession(std::vector<std::uint8_t> exporter, std::vector<std::uin
 }
 
 // A login checked under one channel binding requirement does not finish
-// after the requirement changes, in either direction.
+// after the requirement changes, in either direction: an unbound login that
+// now needs binding fails like a wrong password, and a bound login is stale.
 void TestStaleLoginAfterBindingRequirementChange() {
     const std::vector<std::uint8_t> exporter(32, 0x31);
     const std::vector<std::uint8_t> end_point(32, 0x32);
@@ -479,8 +493,15 @@ void TestStaleLoginAfterBindingRequirementChange() {
         const auto final = chunkdb::scram::FinishClientLogin(client, "hunter2", first.substr(7, first.size() - 9),
             required_before ? std::span<const std::uint8_t>(exporter) : std::span<const std::uint8_t>{});
         server.users->SetRequiresChannelBinding("bot", !required_before);
-        ExpectError(server.Run(session, "AUTH $1", Parameters{final.message}), "AUTH_FAILED reason=stale_login");
-        assert(session.failed_auth_attempts == 0U && !session.greeted && !session.authenticated && !session.user_ticket);
+        const auto reply = server.Run(session, "AUTH $1", Parameters{final.message});
+        if (required_before) {
+            ExpectError(reply, "AUTH_FAILED reason=stale_login");
+            assert(session.failed_auth_attempts == 0U);
+        } else {
+            ExpectReply(reply, kWrongLogin);
+            assert(session.failed_auth_attempts == 1U);
+        }
+        assert(!session.greeted && !session.authenticated && !session.user_ticket);
         assert(server.users->AuthenticationSnapshot("bot")->state->connections == 0U);
     }
 }
@@ -612,6 +633,64 @@ void TestRequiredChannelBinding() {
     SessionState again;
     ExpectReply(server.Login(again, "bot", "hunter2"), kWrongLogin);
     ExpectError(server.Run(admin, "ALTER USER ghost REQUIRE CHANNEL BINDING"), "INVALID_ARGUMENT");
+}
+
+// A login checks the user's credentials as they are when AUTH finishes it,
+// not as HELLO found them.
+void TestCredentialsChangedDuringLogin() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    const std::string bot_verifier = VerifierText("hunter2");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{bot_verifier}), "+OK\r\n");
+    // HELLO, then `change` from another session, then AUTH with the password
+    // that was right at HELLO.
+    const auto login_around = [&server](const std::string& password, const auto& change) {
+        SessionState session;
+        const auto login = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce());
+        const std::string first = server.Run(session, "HELLO 3 USER bot $1", Parameters{login.first});
+        assert(first.rfind("+SCRAM ", 0) == 0);
+        change();
+        const auto final_message =
+            chunkdb::scram::FinishClientLogin(login, password, first.substr(7, first.size() - 9));
+        const std::string reply = server.Run(session, "AUTH $1", Parameters{final_message.message});
+        assert(session.greeted == (reply.rfind("%14\r\n", 0) == 0));
+        return reply;
+    };
+
+    // A change that leaves the credentials alone does not stop the login.
+    assert(login_around("hunter2", [&] {
+        ExpectReply(server.Run(admin, "GRANT READ ON default TO bot"), "+OK\r\n");
+    }).rfind("%14\r\n", 0) == 0);
+
+    // A new verifier: the old password no longer logs in.
+    ExpectReply(login_around("hunter2", [&] {
+        ExpectReply(server.Run(admin, "ALTER USER bot VERIFIER $1", Parameters{VerifierText("rotated")}), "+OK\r\n");
+    }), kWrongLogin);
+    (void)server.LoggedIn("bot", "rotated");
+
+    // The user dropped and created again with the same verifier.
+    ExpectReply(server.Run(admin, "ALTER USER bot VERIFIER $1", Parameters{bot_verifier}), "+OK\r\n");
+    ExpectReply(login_around("hunter2", [&] {
+        ExpectReply(server.Run(admin, "DROP USER bot"), "+OK\r\n");
+        ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{bot_verifier}), "+OK\r\n");
+    }), kWrongLogin);
+    (void)server.LoggedIn("bot", "hunter2");
+
+    // The user dropped.
+    ExpectReply(login_around("hunter2", [&] {
+        ExpectReply(server.Run(admin, "DROP USER bot"), "+OK\r\n");
+    }), kWrongLogin);
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{bot_verifier}), "+OK\r\n");
+    (void)server.LoggedIn("bot", "hunter2");
+
+    // The user now takes only bound logins: this unbound one fails.
+    ExpectReply(login_around("hunter2", [&] {
+        ExpectReply(server.Run(admin, "ALTER USER bot REQUIRE CHANNEL BINDING"), "+OK\r\n");
+    }), kWrongLogin);
+    SessionState unbound;
+    ExpectReply(server.Login(unbound, "bot", "hunter2"), kWrongLogin);
+    ExpectReply(server.Run(admin, "ALTER USER bot NO REQUIRE CHANNEL BINDING"), "+OK\r\n");
+    (void)server.LoggedIn("bot", "hunter2");
 }
 
 // --auth none: no users, every right.
@@ -859,6 +938,7 @@ int main(int argc, char** argv) {
     TestChannelBinding();
     TestRequiredChannelBinding();
     TestStaleLoginAfterBindingRequirementChange();
+    TestCredentialsChangedDuringLogin();
     TestWithoutUsers();
     TestReadOnly();
     return 0;

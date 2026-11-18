@@ -918,7 +918,11 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                             : "startup will keep the committed frames of " + std::to_string(intent.entries.size()) +
                                   " chunks and remove the marker");
                 } catch (const std::invalid_argument& e) {
-                    Report(counters, true, "txn_intent_invalid", file.path(), e.what());
+                    // The loader names the file for startup errors; the report already has it.
+                    std::string detail = e.what();
+                    const auto named = "invalid transaction intent: " + file.path().string() + ": ";
+                    if (detail.starts_with(named)) detail.erase(0, named.size());
+                    Report(counters, true, "txn_intent_invalid", file.path(), detail);
                 } catch (const std::exception& e) {
                     Report(counters, true, "txn_intent_unreadable", file.path(), e.what());
                 }
@@ -1171,5 +1175,14 @@ chunkdb::VerifyCounters chunkdb::VerifyDataDirectory(
         }
     }
     VerifyDataDirectoryImpl(data_dir, &counters);
+    return counters;
+}
+
+chunkdb::VerifyCounters chunkdb::VerifyTableDirectory(
+    const std::filesystem::path& table_dir,
+    std::ostream& out) {
+    ::VerifyCounters counters;
+    counters.out = &out;
+    VerifyTable(table_dir, &counters);
     return counters;
 }

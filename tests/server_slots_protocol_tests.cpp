@@ -1244,6 +1244,53 @@ void HistoricalSchemas(bool tls) {
     Unwatch(*watch); Unwatch(*ordinary);
 }
 
+// Catch-up schemas of a three-dimensional table carry its dimensions and the
+// chunk columns of each historical schema version, for changes and chunk forms.
+void HistoricalSchemasDimensional(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (value u8 DEFAULT 0) CHUNK 2 x 2 x 2 LARGE 2 x 2 x 2 CHUNK COLUMNS (owner u8 DEFAULT 0)");
+    writer->Ok("CREATE SLOT 'consumer' ON t");
+    writer->Ok("CREATE SLOT 'forms' ON t CHUNKS");
+    auto table = harness.catalog->Find("t");
+    auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t"));
+    const auto first = Number(writer->Command("SET CHUNK 0 0 0 IN t META owner=7"));
+    const auto first_entry = ordinary->Read();
+    assert(first_entry.items[0].value == "change" && Number(first_entry.items[2]) == first);
+    writer->Ok("ALTER TABLE t ADD CHUNK COLUMN tag u8 DEFAULT 3");
+    const auto alteration = ordinary->Read();
+    assert(alteration.items[0].value == "schema" && Number(Field(alteration.items[1], "schema_version")) == 2U);
+    assert(Number(Field(alteration.items[1], "dims")) == 3U && Field(alteration.items[1], "chunk_columns").items.size() == 2U);
+    const auto second = Number(writer->Command("SET BLOCK 0 0 1 IN t value=9"));
+    const auto second_entry = ordinary->Read(); assert(Change(second_entry) == second);
+    FeedSlotTestAccess::Sync(*table);
+    const auto old_schema = [](const Reply& schema) {
+        assert(schema.items[0].value == "schema" && Number(Field(schema.items[1], "schema_version")) == 1U);
+        assert(Number(Field(schema.items[1], "dims")) == 3U);
+        const auto& chunk_columns = Field(schema.items[1], "chunk_columns").items;
+        assert(chunk_columns.size() == 1U && Field(chunk_columns[0], "name").value == "owner");
+        assert(Field(schema.items[1], "columns").items.size() == 1U);
+    };
+    const auto new_schema = [&](const Reply& schema) {
+        assert(schema.items[0].value == "schema" && Number(Field(schema.items[1], "schema_version")) == 2U);
+        assert(Number(Field(schema.items[1], "dims")) == 3U);
+        assert(Field(schema.items[1], "chunk_columns").items == Field(alteration.items[1], "chunk_columns").items);
+        assert(Field(schema.items[1], "columns").items == Field(alteration.items[1], "columns").items);
+    };
+    auto watch = harness.Connect(); (void)Start(watch->Command("WATCH t SLOT 'consumer'"));
+    old_schema(watch->Read());
+    assert(watch->Read() == first_entry);
+    new_schema(watch->Read());
+    assert(watch->Read() == second_entry);
+    Unwatch(*watch);
+    auto forms = harness.Connect(); (void)Start(forms->Command("WATCH t SLOT 'forms'"));
+    old_schema(forms->Read());
+    const auto first_forms = forms->Read(); assert(first_forms.items[0].value == "chunks" && Number(first_forms.items[2]) == first);
+    new_schema(forms->Read());
+    const auto second_forms = forms->Read(); assert(second_forms.items[0].value == "chunks" && Number(second_forms.items[2]) == second);
+    Unwatch(*forms); Unwatch(*ordinary);
+}
+
 void ArchiveWhileLeaseHeld(bool tls) {
     // The sender barrier guarantees a real ring reset while the slot worker
     // still has a live subscription. A witness proves the reset happened.
@@ -2434,7 +2481,7 @@ int main(int argc, char** argv) {
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);
         run("persistent-filters", PersistentFilterDelivery);
-        run("historical-schema", HistoricalSchemas); run("held-lease", ArchiveWhileLeaseHeld);
+        run("historical-schema", HistoricalSchemas); run("historical-schema-dimensional", HistoricalSchemasDimensional); run("held-lease", ArchiveWhileLeaseHeld);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
         run("live-schema-ACK", LiveSchemaAcknowledgement);
         run("filtered-idle-progress", FilteredAndIdleProgress);

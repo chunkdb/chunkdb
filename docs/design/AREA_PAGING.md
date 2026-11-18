@@ -19,7 +19,9 @@ When more cells remain, `after` names the last completely admitted visited cell;
 An empty page can advance across empty cells, while an unfinished page must advance its cursor.
 Encoded reply accounting includes the map, array, cursor, coordinates and complete checked forms before appending them.
 A pending candidate that fits a page by itself but not the current page remains after the returned cursor and is reconsidered by the next independent request.
-A candidate that cannot fit an otherwise empty page produces an error without returning a partial reply or advancing past that candidate.
+A candidate that cannot fit an otherwise empty page ends a page that already admitted a cell, so the next request starts at it.
+As the first visited cell it produces `OUT_OF_RANGE reason=area_entry_too_large` with its coordinate, the size of a reply holding only it and the limit, without returning a partial reply or advancing past it.
+The client then reads that chunk with GET CHUNK or a projection and resumes after it, so no page repeats without progress.
 Retained chunk state, metadata, variable values and encoded output have explicit owners; incremental admission does not first accumulate an unbudgeted collection of forms.
 
 Independent pages do not imply one snapshot or an unchanged table between requests.

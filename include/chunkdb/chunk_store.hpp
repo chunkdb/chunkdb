@@ -378,6 +378,36 @@ struct ChunkAreaPage {
 // The final argument reports whether the selector has any following cell.
 using ChunkAreaVisitor = std::function<bool(const ChunkCoord&, std::optional<ChunkRangeEntry>&&, bool)>;
 
+// A populated chunk whose area entry cannot fit an otherwise empty page.
+// `required` is the size of a reply holding only that entry, when measured.
+class AreaEntryTooLargeError : public std::out_of_range {
+  public:
+    AreaEntryTooLargeError(const ChunkCoord& coord, std::uint8_t dims, std::size_t limit,
+                           std::optional<std::size_t> required = {})
+        : std::out_of_range(Message(coord, dims, limit, required)),
+          coord_(coord), dims_(dims), limit_(limit), required_(required) {}
+    [[nodiscard]] const ChunkCoord& coord() const noexcept { return coord_; }
+    [[nodiscard]] std::uint8_t dims() const noexcept { return dims_; }
+    [[nodiscard]] std::size_t limit() const noexcept { return limit_; }
+    [[nodiscard]] std::optional<std::size_t> required() const noexcept { return required_; }
+
+  private:
+    static std::string Message(const ChunkCoord& coord, std::uint8_t dims, std::size_t limit,
+                               std::optional<std::size_t> required) {
+        std::string chunk = "[" + std::to_string(coord.x) + ", " + std::to_string(coord.y);
+        if (dims == 3U) chunk += ", " + std::to_string(coord.z);
+        chunk += "]";
+        return "the area entry for chunk " + chunk +
+            (required ? " needs " + std::to_string(*required) + " bytes and" : "") +
+            " exceeds the " + std::to_string(limit) +
+            "-byte response limit; read it with GET CHUNK or fewer COLUMNS, then continue AFTER it";
+    }
+    ChunkCoord coord_;
+    std::uint8_t dims_;
+    std::size_t limit_;
+    std::optional<std::size_t> required_;
+};
+
 // A chunk's whole state: what GET CHUNK and SET CHUNK carry
 // (docs/CQL.md).
 struct ChunkState {
@@ -647,9 +677,9 @@ class ChunkStore {
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z);
     [[nodiscard]] BlockReadMetadata GetBlockWithVersion3D(std::int64_t x, std::int64_t y, std::int64_t z);
     // The first stored value of column `column_id` that `type` does not
-    // hold, as "block (x, y) holds <value>" (an axis past int64 as
-    // [chunk, local]), or std::nullopt when every one fits. Reads every
-    // populated chunk (TableCatalog::NarrowColumn).
+    // hold, as "block (x, y) holds <value>" ("block (x, y, z) ..." in a 3D
+    // table; an axis past int64 as [chunk, local]), or std::nullopt when
+    // every one fits. Reads every populated chunk (TableCatalog::NarrowColumn).
     [[nodiscard]] std::optional<std::string> FindValueNotFitting(std::uint32_t column_id, const ColumnType& type);
     // Whether memory, images or WALs contain any present block. Callers that
     // use the answer to change a schema must exclude concurrent writers.
@@ -715,7 +745,9 @@ class ChunkStore {
         bool with_vars = false);
 
     // Visits requested cells, including empty cells; the caller owns encoding.
-    // A false result leaves that cell beyond the returned continuation cursor.
+    // A false result leaves that cell beyond the returned continuation cursor;
+    // for the page's first visited cell it throws AreaEntryTooLargeError when
+    // that cell is populated, and std::out_of_range when it is empty.
     // txn_read.covered records observed candidates; publish it only after a
     // complete successful reply, including when the last candidate was refused.
     [[nodiscard]] ChunkAreaPage VisitChunkArea(
@@ -901,6 +933,7 @@ class ChunkStore {
     [[nodiscard]] std::uint64_t ChunkCommitTimeForTests(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] std::uint64_t WalOpenCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t WalParentPrepareCountForTests() const noexcept;
+    [[nodiscard]] std::uint64_t ChunkFileProbeCountForTests() const noexcept;
     [[nodiscard]] std::uint64_t OpenWalStreamCountForTests() const noexcept;
     [[nodiscard]] std::size_t MaxOpenWalStreamsForTests() const noexcept;
     [[nodiscard]] std::uint64_t EvictionSnapshotBuildCountForTests() const noexcept;
@@ -1033,6 +1066,7 @@ class ChunkStore {
     friend struct FeedSlotTestAccess;
     friend struct BackupTestAccess;
     friend struct FeatureActivationTestAccess;
+    friend struct UnsyncedTestAccess;
 
     // What a WAL barrier still has to sync (see unsynced_files_).
     struct UnsyncedArtifacts {
@@ -1251,6 +1285,9 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_eviction_forced_wal_flushes_empty_batch_{0};
     std::atomic<std::uint64_t> stats_eviction_refill_large_chunk_scans_{0};
     std::atomic<std::uint64_t> stats_wal_parent_prepare_calls_{0};
+    // Path lookups of a chunk's image, WAL or their directory made by a
+    // chunk load or for a WAL's size (CurrentWalFileSize).
+    mutable std::atomic<std::uint64_t> stats_chunk_file_probes_{0};
     std::atomic<std::uint64_t> stats_eviction_recency_skips_{0};
     std::atomic<std::uint64_t> stats_empty_chunk_gcs_{0};
     std::atomic<std::uint64_t> stats_wal_barriers_{0};
@@ -1621,7 +1658,8 @@ class ChunkStore {
     void NoteUnsyncedDir(const std::filesystem::path& path);
     // Keeps the unsynced set within unsynced_limit_. Requires unsynced_mutex_.
     void LimitUnsyncedLocked();
-    // Puts a failed barrier's drained artifacts back into the unsynced set.
+    // Puts a failed barrier's drained artifacts back into the unsynced set;
+    // out of memory, it sets the overflow flag instead.
     void RestoreUnsynced(UnsyncedArtifacts drained);
 
     void StartMaintenanceThread();

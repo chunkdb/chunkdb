@@ -299,10 +299,10 @@ std::string StatementSuggestion(std::string_view word) {
         return {};
     }
     const auto lower = Lower(word);
-    const std::array<std::string_view, 24U> keywords{
+    const std::array<std::string_view, 26U> keywords{
         "get", "set", "delete", "create", "alter", "drop", "show", "describe", "grant", "revoke",
         "begin", "commit", "rollback", "ping", "flush", "watch", "unwatch", "ack", "backup", "migrate",
-        "scan", "reload", "recover", "compact"};
+        "scan", "reload", "recover", "compact", "restore", "swap"};
     std::string_view closest;
     std::size_t best = word.size() < 4U ? 2U : 3U;
     bool tied = false;
@@ -1121,6 +1121,24 @@ class Parser {
         if (Accept("recover")) {
             Expect("table");
             return RecoverTable{.table = Name("a table name")};
+        }
+        if (Accept("restore")) {
+            Expect("table");
+            RestoreTable restore{.table = Name("a table name"), .path = {}, .name = {}};
+            Expect("from");
+            const auto& path = Peek();
+            if (path.kind != TokenKind::kText)
+                Fail(path.column, "expected a quoted backup path, got " + Quote(path));
+            restore.path = Take().text;
+            restore.name = Accept("as") ? Name("a table name") : restore.table;
+            return restore;
+        }
+        if (Accept("swap")) {
+            Expect("tables");
+            SwapTables swap{.first = Name("a table name"), .second = {}};
+            ExpectToken(TokenKind::kComma, "a comma");
+            swap.second = Name("a table name");
+            return swap;
         }
         if (Accept("compact")) {
             Expect("tombstones");

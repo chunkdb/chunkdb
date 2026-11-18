@@ -1549,6 +1549,7 @@ std::optional<TableFence> TableCatalog::Fence(std::string_view name) const {
 }
 
 TableCatalog::FenceNode TableCatalog::PrepareFence(std::shared_ptr<Table> table, const std::string& name, const char* reason) {
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE")) throw std::bad_alloc();
     std::map<std::string, Fenced, std::less<>> one;
     one.emplace(name, Fenced{std::move(table), reason});
     return one.extract(one.begin());
@@ -1753,6 +1754,10 @@ std::shared_ptr<Table> TableCatalog::Create(
         throw TableExistsError("table '" + table_name + "' already exists");
     }
     const auto target = TablesDir() / table_name;
+    // Made now, so that neither serving the table nor fencing it after a
+    // failed undo allocates once it is in tables/.
+    auto entry = PrepareServed(table_name);
+    auto undo_fence = PrepareFence(nullptr, table_name, kFenceCreate);
 
     // Build the complete table under a private name, then publish it with
     // one rename: a crash leaves the staging directory (removed at the next
@@ -1799,6 +1804,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     // opened, take it back out, so the name is not left with a table this
     // server does not serve; the command then fails.
     std::shared_ptr<ChunkStore> store;
+    std::shared_ptr<Table> table;
     try {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_CREATE_SYNC_FAIL_ONCE")) {
             throw std::runtime_error("injected directory sync failure after publishing a table");
@@ -1806,43 +1812,62 @@ std::shared_ptr<Table> TableCatalog::Create(
         SyncDirectoryPath(TablesDir());
         SyncDirectoryPath(StagingDir());
         store = OpenStore(table_name, target, geometry, kAllGeometryFields, options);
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_CREATE_SERVE_ALLOC_FAIL_ONCE")) throw std::bad_alloc();
+        Geometry opened_geometry = store->geometry();
+        table = std::shared_ptr<Table>(new Table(
+            table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store), config_.feed_buffer_bytes, migration_health_, config_.feed_linger));
     } catch (const std::exception& e) {
-        LogMessage(
-            LogLevel::kError,
-            LogComponent::kStore,
-            "created table cannot be made durable or opened; removing it",
-            {{"table", table_name}, {"error", e.what()}});
+        // The store closes before its directory moves.
+        store.reset();
+        // The table leaves tables/, or its name is fenced, before anything is
+        // logged: a log line allocates, and its failure must not leave a
+        // table this server neither serves nor fences.
+        bool removed = false;
         try {
             if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_CREATE_UNDO_FAIL_ONCE"))
                 throw std::runtime_error("injected failure removing a created table");
             MoveToDropped(target, table_name);
+            removed = true;
         } catch (const std::exception& undo_error) {
+            {
+                std::unique_lock lock(tables_mutex_);
+                fenced_.insert(std::move(undo_fence));
+            }
             LogMessage(
                 LogLevel::kError,
                 LogComponent::kStore,
-                "created table could not be removed again; it is fenced until RECOVER TABLE or a restart opens it",
-                {{"table", table_name}, {"error", undo_error.what()}});
-            std::unique_lock lock(tables_mutex_);
-            fenced_.insert(PrepareFence(nullptr, table_name, kFenceCreate));
+                "created table cannot be made durable or opened and could not be removed again; it is fenced until "
+                "RECOVER TABLE or a restart opens it",
+                {{"table", table_name}, {"error", e.what()}, {"undo_error", undo_error.what()}});
+        }
+        if (removed) {
+            LogMessage(
+                LogLevel::kError,
+                LogComponent::kStore,
+                "created table cannot be made durable or opened; it was removed",
+                {{"table", table_name}, {"error", e.what()}});
         }
         throw;
     }
-    Geometry opened_geometry = store->geometry();
-    auto table = std::shared_ptr<Table>(new Table(
-        table_name, target, manifest.store_id, std::move(opened_geometry), options, std::move(store), config_.feed_buffer_bytes, migration_health_, config_.feed_linger));
     {
+        // A node insert does not allocate.
         std::unique_lock lock(tables_mutex_);
-        tables_.emplace(table_name, table);
+        entry.mapped() = table;
+        tables_.insert(std::move(entry));
     }
-    LogMessage(
-        LogLevel::kInfo,
-        LogComponent::kStore,
-        "table created",
-        {
-            {"table", table_name},
-            {"store_id", StoreIdHex(manifest.store_id)},
-            {"geometry", DescribeGeometry(geometry)},
-        });
+    try {
+        LogMessage(
+            LogLevel::kInfo,
+            LogComponent::kStore,
+            "table created",
+            {
+                {"table", table_name},
+                {"store_id", StoreIdHex(manifest.store_id)},
+                {"geometry", DescribeGeometry(geometry)},
+            });
+    } catch (...) {
+        // Logging is best-effort; the table is created and served.
+    }
     return table;
 }
 
@@ -1934,7 +1959,7 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
         RetireTable(*table, options);
         migration_health_->Check();
     }
-    admission.Dismiss();
+    // Until the version floor is raised, any failure serves the table again.
     // If the drop fails below, the table is reopened as a new store, so its
     // acknowledged batched writes go to the WAL first. A failure here does
     // not stop the drop (a full disk is a reason to drop a table); it only
@@ -1949,17 +1974,15 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
             "table lacks them",
             {{"table", table->name_}, {"error", e.what()}});
     }
-    {
-        // A table created later under this name must not issue this table's
-        // tokens again: the data directory keeps a floor above all of them,
-        // durably before the drop. Failing here fails the drop.
-        ScopeExit restore([&] { table->EndExclusive(std::move(store), options); });
-        RaiseVersionFloor(store->version_clock_ceiling_.load(std::memory_order_acquire));
-        restore.Dismiss();
-    }
-    // Whatever goes wrong below, the table must not stay busy: commands on
-    // it would wait forever. Unless it is served again or gone, it is fenced.
+    // Whatever goes wrong after the floor, the table must not stay busy:
+    // commands on it would wait forever. Unless it is served again or gone,
+    // it is fenced, with a fence made now, while a failure still serves it.
     auto fence = PrepareFence(table, table->name_, kFenceDropUnknown);
+    // A table created later under this name must not issue this table's
+    // tokens again: the data directory keeps a floor above all of them,
+    // durably before the drop. Failing here fails the drop.
+    RaiseVersionFloor(store->version_clock_ceiling_.load(std::memory_order_acquire));
+    admission.Dismiss();
     bool gone = false;
     ScopeExit retire([&] {
         if (gone) RetireTable(*table, options);
@@ -2126,8 +2149,10 @@ void TableCatalog::EndNarrowing(Table& table, const TableOptions& options, const
         bool fenced = false;
         if (!migration_health_->failed.load(std::memory_order_acquire) && Find(table.name_).get() == &table &&
             table.Info().schema.pending.has_value()) {
+            // Made before the table is closed: a failure here leaves it
+            // served instead of busy until a restart.
+            auto fence = PrepareFence(table.shared_from_this(), table.name_, kFenceNarrowing);
             if (auto store = table.BeginExclusive(/*closing=*/true)) {
-                auto fence = PrepareFence(table.shared_from_this(), table.name_, kFenceNarrowing);
                 std::lock_guard operations(operations_mutex_);
                 store.reset();
                 FenceTable(table, options, std::move(fence));
@@ -2232,6 +2257,9 @@ void TableCatalog::RewriteManifest(
     // Acknowledged writes still in group-commit batches reach the WAL now,
     // while a failure can still leave everything as it was.
     store->FlushWalBatchesForReopen();
+    // Made now, while a failure still serves the old store: once the manifest
+    // is replaced, nothing may fail before the table is fenced or served.
+    auto fence = PrepareFence(table.shared_from_this(), table.name_, kFenceReopen);
     bool replaced = false;
     std::exception_ptr write_failure;
     try {
@@ -2275,7 +2303,6 @@ void TableCatalog::RewriteManifest(
     // The old store closes; if the new one cannot open, the table is fenced.
     // What it wrote without a sync goes to the new store, so a later
     // WALFLUSH still syncs it.
-    auto fence = PrepareFence(table.shared_from_this(), table.name_, kFenceReopen);
     ScopeExit retire([&] { FenceTable(table, previous, std::move(fence)); });
     const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     store->HandOverUnsyncedOnClose(unsynced);

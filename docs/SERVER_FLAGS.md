@@ -91,6 +91,7 @@ These events are recorded:
 | `create_table`, `alter_table`, `drop_table`, `recover_table` | Schema statements and RECOVER TABLE. |
 | `create_user`, `alter_user`, `drop_user`, `grant`, `revoke` | User and right statements. |
 | `backup` | BACKUP. |
+| `restore_table`, `swap_tables` | RESTORE TABLE, with the new table, and SWAP TABLES, with both tables as `a,b`. |
 | `reload_tls` | RELOAD TLS. |
 | `enable_feature` | ENABLE FEATURE. |
 | `migrate` | MIGRATE, with the table its statement names. |
@@ -98,7 +99,7 @@ These events are recorded:
 | `cancel`, `kill_connection` | CANCEL and KILL CONNECTION, with the connection they name. |
 
 Every line has `time_ms` (UTC milliseconds since the Unix epoch), `connection` (an identifier unique within the server process), `event`, `user`, `peer` and `ok`.
-A failure adds `error_code`; a failed login adds `reason`: `wrong_password`, `unknown_user`, `banned`, `no_user`, `invalid_user_name`, `invalid_login`, `channel_binding` (bound to another connection, or not bound on a server that requires it), `channel_binding_required` (not bound, for a user that requires it), `stale_login` (the user's verifier or channel binding requirement changed, or the user was dropped, between HELLO and AUTH) or `max_connections` (the user's connection limit is reached).
+A failure adds `error_code`; a failed login adds `reason`: `wrong_password`, `unknown_user`, `banned`, `no_user`, `invalid_user_name`, `invalid_login`, `channel_binding` (bound to another connection, or not bound on a server that requires it), `channel_binding_required` (not bound, for a user that requires it), `stale_login` (a right proof, but the user's verifier or channel binding requirement changed between HELLO and AUTH in a way that leaves the login otherwise valid) or `max_connections` (the user's connection limit is reached).
 A failed login whose name could not name a user (see [Users and rights](USERS.md)) is written with an empty `user`.
 Lines add `table`, `target_user`, `slot`, `migration` or `target_connection` when the event names them.
 Passwords, verifiers, parameter values and block data are never written.
@@ -118,7 +119,7 @@ On Windows, rename the file and restart the server; until then it keeps writing 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--data-dir` | `data` | Directory containing manifests, users and `tables/`; a fresh directory starts with no tables. |
-| `--backup-dir` | unset | Enables BACKUP; nonempty directory path, with safe relative destinations below its resolved root. |
+| `--backup-dir` | unset | Enables BACKUP and RESTORE TABLE; nonempty directory path, with safe relative destinations and sources below its resolved root. |
 | `--read-only` | off | Boolean switch serving the data directory, or a completed backup, without writing to it; see [Read-only](#read-only). |
 | `--max-loaded-chunks` | `65536` | Shared cache limit counted in chunks across all tables, rather than bytes; chunks in use are not evicted, so it can be exceeded briefly, and `chunkdb_eviction_no_progress_cycles_total` counts eviction passes that freed nothing. |
 | `--max-open-wal-streams` | `1024` | Shared append-stream limit; POSIX descriptor reserves may clamp it. |

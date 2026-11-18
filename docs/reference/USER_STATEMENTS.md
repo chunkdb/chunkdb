@@ -76,7 +76,8 @@ A rolling one-second statement window retains unexpired admissions when a rate l
 CANCEL, KILL and ROLLBACK remain available when the statement limit is reached.
 Limit refusals return RATE_LIMITED with `reason` and `retry_after_ms` without applying the request or changing its transaction.
 Dropping and recreating a user does not transfer the old user's authenticated sessions to the new identity.
-An AUTH proof made before that user's deletion, verifier change or channel binding requirement change is refused without counting a bad password.
+A login still between HELLO and AUTH when the user gets a new verifier, gets REQUIRE CHANNEL BINDING for an unbound login, or is dropped fails with AUTH_FAILED.
+A right AUTH proof made before any other change of the user's verifier or channel binding requirement returns AUTH_FAILED with `reason=stale_login` without counting a bad password.
 An unconfirmed users-record replacement returns OUTCOME_UNKNOWN with `stage=users_record` and publishes the whole visible record.
 After an unknown outcome, an unchanged retry succeeds only after the visible record is durable.
 See [Protocol](../PROTOCOL.md) for authentication encoding.

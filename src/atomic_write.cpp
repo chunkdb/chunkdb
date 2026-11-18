@@ -110,7 +110,7 @@ bool ShouldCleanupTmpArtifactForCurrentProcess(
     return TmpArtifactAgeMs(tmp_path) >= kAtomicTmpCurrentPidCleanupMinAgeMs;
 }
 
-void CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path) {
+bool CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path) {
     const auto parent = target_path.parent_path();
     std::error_code exists_ec;
     if (!std::filesystem::exists(parent, exists_ec)) {
@@ -120,7 +120,7 @@ void CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path) {
                 " (ec=" + std::to_string(exists_ec.value()) +
                 ", msg='" + exists_ec.message() + "')");
         }
-        return;
+        return false;
     }
 
     for (const auto& entry : std::filesystem::directory_iterator(parent)) {
@@ -140,6 +140,7 @@ void CleanupAtomicTmpArtifacts(const std::filesystem::path& target_path) {
                 ", msg='" + remove_ec.message() + "')");
         }
     }
+    return true;
 }
 namespace {
 template <typename Data>
