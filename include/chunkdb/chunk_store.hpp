@@ -584,6 +584,9 @@ enum class TxnPausePoint {
     // A plain write took its version and found an open transaction, under
     // its chunk's lock.
     kWriteAfterOpenCount,
+    // A plain write that keeps a state published its chunk's coordinate index
+    // membership and not yet the kept state, under its chunk's lock.
+    kWriteAfterMembership,
     // The transaction released its chunk locks, before publishing any
     // uncertain outcome and completing its post-commit bookkeeping.
     kBeforePostCommitOutcome,
@@ -1035,6 +1038,8 @@ class ChunkStore {
     [[nodiscard]] std::size_t TxnKeptStateCountForTests() const;
     [[nodiscard]] std::size_t TxnKeptBytesForTests() const;
     [[nodiscard]] std::size_t TxnRegisteredCountForTests() const;
+    // The history itself, for tests that stage physical kept states into it.
+    [[nodiscard]] const std::shared_ptr<TxnHistory>& TxnHistoryForTests() const noexcept { return txn_history_; }
     void ArmTxnPauseForTests(TxnPausePoint point);
     [[nodiscard]] bool WaitForTxnPauseForTests(TxnPausePoint point);
     void ResumeTxnForTests(TxnPausePoint point);
@@ -1598,10 +1603,17 @@ class ChunkStore {
         bool with_vars,
         std::string* vars_problem, bool include_empty = false, bool identity_only = false);
     [[nodiscard]] std::size_t ChunkRangeEntryCostBytes() const noexcept;
+    [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> CoordinateIndexForArea(const TxnSnapshot* snapshot);
+    // False when `index` (from CoordinateIndexForArea) shows the chunk had no
+    // populated state at `snapshot`, or now when `snapshot` is null; the
+    // caller then skips reading it.
+    [[nodiscard]] bool AreaChunkMayBePopulated(
+        const ChunkCoordinateIndex* index, const ChunkCoord& coord, const TxnSnapshot* snapshot);
     // Adds the chunk when populated. `vars_bytes` counts the values read so
     // far with `with_vars`; they and max_entries entries share the
     // response-byte limit.
     void AppendPopulatedChunkRangeEntry(
+        const ChunkCoordinateIndex* index,
         const ChunkCoord& coord,
         std::size_t max_entries,
         const char* operation_name,

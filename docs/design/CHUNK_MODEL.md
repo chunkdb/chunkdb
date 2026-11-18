@@ -68,7 +68,11 @@ A never-written chunk remains NULL instead of receiving a version on load.
 ## Index, tombstones and recovery
 
 One ordered coordinate index per table serves bounded scan pages without walking directories on each page.
-A writer answers scans and area reads from that index and reads no cell it does not list; area reads at a transaction snapshot probe every cell of the area instead.
+A writer answers ordinary scans and area reads from that index and reads no cell it does not list.
+An area read at a transaction snapshot uses the index once the completed revision covers the snapshot's version; before that an unfinished included write may populate an unlisted cell, so every cell takes the snapshot read path.
+An unlisted cell can then hold a populated snapshot state only when a later write emptied it, and that write keeps the replaced state in the transaction history.
+The writer publishes membership and then the kept state under its exclusive chunk lock, and eviction cannot remove a chunk a writer holds, so the reader takes the shared lock of a cached chunk before it checks the history.
+A cell with no populated state at the snapshot is skipped without reading its files; the transaction's own writes are checked first, and every covered cell stays in its conflict set.
 Ordinary writes update membership only on population transitions, with no index I/O for updates to an already populated chunk.
 A new coordinate reserves its in-memory map node before the write can commit, and ordinary writes publish no persistent live hint before their commit decision.
 Each stable coordinate node carries atomic producing identity and population state; writes to an existing node publish those fields before completing their producer bound without taking the ordered-map mutex.

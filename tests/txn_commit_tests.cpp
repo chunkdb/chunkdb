@@ -845,6 +845,7 @@ void TestPauseSlots() {
     constexpr std::array points{
         chunkdb::TxnPausePoint::kRegisterBeforePublish,
         chunkdb::TxnPausePoint::kWriteAfterOpenCount,
+        chunkdb::TxnPausePoint::kWriteAfterMembership,
         chunkdb::TxnPausePoint::kBeforePostCommitOutcome};
     static_assert(points.size() + 1U == static_cast<std::size_t>(chunkdb::TxnPausePoint::kCount));
     for (unsigned round = 0; round < 2U; ++round) {

@@ -3,10 +3,13 @@
 // they were when it was taken (GET AREA's no-cache path too), and a writer
 // racing a registering snapshot is kept.
 
+#include <algorithm>
+#include <array>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
 #include <functional>
+#include <future>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -17,6 +20,8 @@
 
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
+#include "chunk_store_internal.hpp"
+#include "txn_block_stage.hpp"
 #include "txn_test_utils.hpp"
 
 namespace {
@@ -322,6 +327,392 @@ void TestAreaAtSnapshot() {
     assert(around[1].coord == kB && counter_of(around[1]) == 2U);
 }
 
+chunkdb::StoreConfig AreaIndexConfig(const std::filesystem::path& directory, bool three) {
+    auto config = Config(directory, chunkdb::DurabilityMode::kFsyncWal, 8);
+    config.geometry.dims = three ? 3U : 2U;
+    config.geometry.chunk_width_blocks = 1U;
+    config.geometry.chunk_height_blocks = 1U;
+    config.geometry.chunk_depth_blocks = 1U;
+    config.geometry.large_chunk_depth_chunks = three ? 2U : 1U;
+    config.max_loaded_chunks = 256U;
+    config.background_maintenance = false;
+    config.checkpoint_update_interval = 1000U;
+    config.wal_group_commit_updates = 1U;
+    config.chunk_schema = chunkdb::TableSchema{
+        .version = 1U, .next_column_id = 2U,
+        .columns = {{.id = 1U, .name = "note", .type = {chunkdb::ColumnKind::kText, 64U},
+            .nullable = true, .default_value = {}}}};
+    return config;
+}
+
+void WriteAreaBlock(ChunkStore& store, const ChunkCoord& coord, bool present = true) {
+    if (store.geometry().dims() == 3U) {
+        if (present) store.SetBlockBits3D(coord.x, coord.y, coord.z, "10000000");
+        else store.UnsetBlock3D(coord.x, coord.y, coord.z);
+    } else {
+        if (present) store.SetBlockBits(coord.x, coord.y, "10000000");
+        else store.UnsetBlock(coord.x, coord.y);
+    }
+}
+
+void WriteAreaMetadata(ChunkStore& store, const ChunkCoord& coord, chunkdb::ColumnValue value) {
+    auto state = store.ReadChunkState(coord);
+    state.chunk_columns = std::make_shared<const chunkdb::ChunkColumnState>(chunkdb::AssignChunkColumns(
+        store.geometry().chunk_schema(), state.chunk_columns.get(), {{"note", std::move(value)}}, !state.written));
+    assert(store.WriteChunkState(coord, std::move(state), {}).ok);
+}
+
+std::vector<ChunkCoord> AreaCoordinates(bool three, bool around) {
+    std::vector<ChunkCoord> coords;
+    for (std::int64_t x = -2; x <= 2; ++x)
+        for (std::int64_t y = -1; y <= 1; ++y)
+            for (std::int64_t z = three ? -1 : 0; z <= (three ? 1 : 0); ++z)
+                if (!around || x * x + y * y + z * z <= 4) coords.push_back({x, y, z});
+    if (around) {
+        coords.push_back({0, -2, 0});
+        coords.push_back({0, 2, 0});
+        if (three) {
+            coords.push_back({0, 0, -2});
+            coords.push_back({0, 0, 2});
+        }
+        std::sort(coords.begin(), coords.end());
+    }
+    return coords;
+}
+
+std::vector<chunkdb::ChunkRangeEntry> IndexedArea(
+    ChunkStore& store, const chunkdb::TxnSnapshot& snapshot, bool around,
+    const chunkdb::TxnAreaRead& read = {}) {
+    if (store.geometry().dims() == 3U) {
+        if (around) return store.ReadChunkRadius3DAt(snapshot, 0, 0, 0, 2, true, read);
+        return store.ReadChunkRange3DAt(snapshot, -2, -1, -1, 2, 1, 1, true, read);
+    }
+    if (around) return store.ReadChunkRadiusAt(snapshot, 0, 0, 2, true, read);
+    return store.ReadChunkRangeAt(snapshot, -2, -1, 2, 1, true, read);
+}
+
+// The reference deliberately reads every coordinate through the point path,
+// which never consults the population index.
+void ExpectPointScan(
+    ChunkStore& store, const chunkdb::TxnSnapshot& snapshot, bool around,
+    const std::vector<chunkdb::ChunkRangeEntry>& actual, const chunkdb::TxnAreaRead& read = {}) {
+    std::size_t at = 0U;
+    for (const auto& coord : AreaCoordinates(store.geometry().dims() == 3U, around)) {
+        const auto* own = read.overlay ? read.overlay(coord) : nullptr;
+        const auto state = own != nullptr ? *own : store.ReadChunkStateAt(snapshot, coord);
+        if (!chunkdb::ChunkPopulated(store.geometry(), state.presence_bitmap, state.chunk_columns.get())) continue;
+        assert(at < actual.size());
+        const auto& entry = actual[at++];
+        assert(entry.coord == coord);
+        assert(entry.version == state.version && entry.commit_time_ms == state.commit_time_ms);
+        assert(entry.payload == state.payload && entry.presence_bitmap == state.presence_bitmap);
+        assert(entry.vars == state.vars);
+        assert(static_cast<bool>(entry.chunk_columns) == static_cast<bool>(state.chunk_columns));
+        if (state.chunk_columns) assert(entry.chunk_columns->bytes == state.chunk_columns->bytes);
+    }
+    assert(at == actual.size());
+}
+
+void TestSnapshotAreaMatchesPointScanDuringWrites() {
+    for (const bool three : {false, true}) for (const bool around : {false, true}) {
+        ScopedTempDir dir("chunkdb-txn-area-index-writes");
+        const auto config = AreaIndexConfig(dir.path(), three);
+        const ChunkCoord gate{-2, 0, 0};
+        const ChunkCoord emptied{-1, 0, 0};
+        const ChunkCoord metadata{0, 0, 0};
+        const ChunkCoord resurrected{1, 0, 0};
+        const ChunkCoord created{2, 0, 0};
+        {
+            ChunkStore store(config);
+            WriteAreaBlock(store, gate);
+            WriteAreaBlock(store, emptied);
+            WriteAreaMetadata(store, metadata, std::string("before"));
+            WriteAreaBlock(store, resurrected);
+            WriteAreaBlock(store, resurrected, false);
+            store.CheckpointForTests(resurrected.x, resurrected.y);
+            if (three) WriteAreaBlock(store, {0, 0, 1});
+        }
+        ChunkStore store(config);
+        auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+        store.ArmCachePauseForTests(chunkdb::CachePausePoint::kNoCacheReadBeforeDisk, gate);
+        std::vector<ChunkCoord> covered;
+        const chunkdb::TxnAreaRead read{.overlay = {}, .covered = &covered};
+        auto reading = std::async(std::launch::async, [&] { return IndexedArea(store, *snapshot, around, read); });
+        assert(store.WaitForCachePauseForTests(chunkdb::CachePausePoint::kNoCacheReadBeforeDisk));
+        // The scan is already in progress when these state transitions occur.
+        WriteAreaMetadata(store, gate, std::string("after"));
+        WriteAreaBlock(store, emptied, false);
+        store.CheckpointForTests(emptied.x, emptied.y);
+        assert(!std::filesystem::exists(chunkdb::ChunkDataPath(dir.path(), store.geometry(), emptied)));
+        assert(!std::filesystem::exists(chunkdb::ChunkWalPath(dir.path(), store.geometry(), emptied)));
+        WriteAreaMetadata(store, metadata, std::monostate{});
+        WriteAreaBlock(store, resurrected);
+        WriteAreaBlock(store, created);
+        if (three) WriteAreaBlock(store, {0, 0, 1}, false);
+        store.ResumeCachePauseForTests(chunkdb::CachePausePoint::kNoCacheReadBeforeDisk);
+        const auto actual = reading.get();
+        assert(actual.size() == (three ? 4U : 3U));
+        assert(covered == AreaCoordinates(three, around));
+        ExpectPointScan(store, *snapshot, around, actual);
+    }
+}
+
+void TestSnapshotAreaSkipsEmptyDiskReads() {
+    for (const bool three : {false, true}) for (const bool around : {false, true}) {
+        ScopedTempDir dir("chunkdb-txn-area-index-empty");
+        const auto config = AreaIndexConfig(dir.path(), three);
+        {
+            ChunkStore store(config);
+            WriteAreaBlock(store, {0, 0, 0});
+            WriteAreaBlock(store, {0, 0, 0}, false);
+            store.CheckpointForTests(0, 0);  // retained tombstone, no files
+            WriteAreaBlock(store, {1, 0, 0});
+            WriteAreaBlock(store, {1, 0, 0}, false);  // empty WAL still exists
+        }
+        ChunkStore store(config);
+        auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+        const auto loaded = store.RuntimeStats().unique_loaded_chunks;
+        for (const auto point : {chunkdb::CachePausePoint::kNoCacheReadBeforeDisk,
+                 chunkdb::CachePausePoint::kNoCacheReadBeforeWal}) {
+            for (const ChunkCoord coord : {ChunkCoord{0, 0, 0}, ChunkCoord{1, 0, 0}, ChunkCoord{2, 0, 0}}) {
+                store.ArmCachePauseForTests(point, coord);
+                auto reading = std::async(std::launch::async, [&] { return IndexedArea(store, *snapshot, around); });
+                const auto status = reading.wait_for(std::chrono::seconds(2));
+                store.ResumeCachePauseForTests(point);
+                assert(reading.get().empty());
+                assert(status == std::future_status::ready);
+            }
+        }
+        assert(store.RuntimeStats().unique_loaded_chunks == loaded);
+        store.EndTxnSnapshot(*snapshot);
+        bool ended = false;
+        try { (void)IndexedArea(store, *snapshot, around); }
+        catch (const std::invalid_argument&) { ended = true; }
+        assert(ended);
+    }
+}
+
+void TestSnapshotAreaIncludesPendingFirstWrite() {
+    for (const bool three : {false, true}) for (const bool around : {false, true}) {
+        ScopedTempDir dir("chunkdb-txn-area-index-pending");
+        ChunkStore store(AreaIndexConfig(dir.path(), three));
+        auto older = store.BeginTxnSnapshot(kTxnDuration);
+        store.ArmTxnPauseForTests(TxnPausePoint::kWriteAfterOpenCount);
+        std::thread writer([&] { WriteAreaBlock(store, {0, 0, 0}); });
+        assert(store.WaitForTxnPauseForTests(TxnPausePoint::kWriteAfterOpenCount));
+        // The index still says empty, but the newly registered snapshot
+        // includes the writer's reserved version, so the read probes every
+        // cell (the empty one read first too) and waits for the writer.
+        auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+        assert(store.CompletedRevision().value() < snapshot->version());
+        const ChunkCoord first_empty{-2, 0, 0};
+        store.ArmCachePauseForTests(chunkdb::CachePausePoint::kNoCacheReadBeforeDisk, first_empty);
+        auto reading = std::async(std::launch::async, [&] { return IndexedArea(store, *snapshot, around); });
+        const bool probed_empty = store.WaitForCachePauseForTests(chunkdb::CachePausePoint::kNoCacheReadBeforeDisk);
+        store.ResumeCachePauseForTests(chunkdb::CachePausePoint::kNoCacheReadBeforeDisk);
+        store.ResumeTxnForTests(TxnPausePoint::kWriteAfterOpenCount);
+        writer.join();
+        const auto actual = reading.get();
+        assert(probed_empty);
+        assert(store.CompletedRevision().value() >= snapshot->version());
+        assert(actual.size() == 1U && actual.front().version <= snapshot->version());
+        ExpectPointScan(store, *snapshot, around, actual);
+        assert(IndexedArea(store, *older, around).empty());
+    }
+}
+
+// A write that empties a chunk publishes its index membership before the
+// state it replaces, both under its chunk's lock: a GET AREA at an older
+// snapshot that finds the chunk unlisted in between waits for that lock and
+// then reads the kept state.
+void TestSnapshotAreaWaitsForEmptyingWrite() {
+    ScopedTempDir dir("chunkdb-txn-area-index-emptying");
+    ChunkStore store(AreaIndexConfig(dir.path(), false));
+    const ChunkCoord emptied{0, 0, 0};
+    WriteAreaBlock(store, emptied);
+    auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+    store.ArmTxnPauseForTests(TxnPausePoint::kWriteAfterMembership);
+    std::thread writer([&] { WriteAreaBlock(store, emptied, false); });
+    assert(store.WaitForTxnPauseForTests(TxnPausePoint::kWriteAfterMembership));
+    auto reading = std::async(std::launch::async, [&] { return IndexedArea(store, *snapshot, false); });
+    const auto status = reading.wait_for(std::chrono::seconds(2));
+    store.ResumeTxnForTests(TxnPausePoint::kWriteAfterMembership);
+    writer.join();
+    const auto actual = reading.get();
+    assert(status == std::future_status::timeout);
+    assert(actual.size() == 1U && actual.front().coord == emptied);
+    ExpectPointScan(store, *snapshot, false, actual);
+}
+
+void TestSnapshotAreaKeepsOverlayAndEmptyConflicts() {
+    for (const bool three : {false, true}) for (const bool around : {false, true}) {
+        ScopedTempDir dir("chunkdb-txn-area-index-overlay");
+        ChunkStore store(AreaIndexConfig(dir.path(), three));
+        const ChunkCoord own_coord{1, 0, 0};
+        auto own = store.ReadChunkState(own_coord);
+        own.chunk_columns = std::make_shared<const chunkdb::ChunkColumnState>(chunkdb::AssignChunkColumns(
+            store.geometry().chunk_schema(), nullptr, {{"note", std::string("private")}}, true));
+        auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+        std::vector<ChunkCoord> covered;
+        const chunkdb::TxnAreaRead read{.overlay = [&](const ChunkCoord& coord) {
+            return coord == own_coord ? &own : nullptr;
+        }, .covered = &covered};
+        const auto actual = IndexedArea(store, *snapshot, around, read);
+        assert(actual.size() == 1U && actual.front().coord == own_coord);
+        assert(covered == AreaCoordinates(three, around));
+        ExpectPointScan(store, *snapshot, around, actual, read);
+        WriteAreaBlock(store, {-1, 0, 0});
+        assert(ConflictReasonOf([&] {
+            (void)store.CommitTransaction(*snapshot, covered, {{.coord = own_coord, .state = own}});
+        }) ==
+            TxnConflictReason::kChunkChanged);
+    }
+}
+
+chunkdb::ChunkAreaSelector SnapshotAreaSelector(bool three, bool around) {
+    const std::uint8_t dims = three ? 3U : 2U;
+    if (around) return {.dims = dims, .first = {0, 0, 0}, .around = true, .radius = 2};
+    return {.dims = dims, .first = {-2, -1, three ? -1 : 0}, .last = {2, 1, three ? 1 : 0}};
+}
+
+// Paged GET AREA at a snapshot, resumed with AFTER cursors, visits the same
+// cells in the same order and returns the same entries as the point path,
+// including a chunk emptied and a chunk created after the snapshot.
+void TestPagedSnapshotAreaMatchesPointScan() {
+    for (const bool three : {false, true}) for (const bool around : {false, true}) {
+        ScopedTempDir dir("chunkdb-txn-area-index-paged");
+        ChunkStore store(AreaIndexConfig(dir.path(), three));
+        const ChunkCoord emptied{-1, 0, 0};
+        const ChunkCoord created{2, 0, 0};
+        for (const ChunkCoord coord : {ChunkCoord{-2, 0, 0}, emptied, ChunkCoord{0, 0, 0}, ChunkCoord{1, 0, 0}})
+            WriteAreaBlock(store, coord);
+        WriteAreaMetadata(store, {0, 1, 0}, std::string("note"));
+        auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+        WriteAreaBlock(store, emptied, false);
+        store.CheckpointForTests(emptied.x, emptied.y);
+        WriteAreaBlock(store, created);
+        WriteAreaMetadata(store, {1, 0, 0}, std::string("later"));
+        const auto selector = SnapshotAreaSelector(three, around);
+        const auto cells = AreaCoordinates(three, around);
+        const auto whole = IndexedArea(store, *snapshot, around);
+        assert(whole.size() == 5U);
+        ExpectPointScan(store, *snapshot, around, whole);
+        for (const std::size_t limit : {std::size_t{1}, std::size_t{2}, std::size_t{4}, std::size_t{7}})
+            for (const bool one_entry_per_page : {false, true}) {
+                std::vector<ChunkCoord> visited;
+                std::vector<ChunkCoord> covered;
+                std::vector<chunkdb::ChunkRangeEntry> entries;
+                const chunkdb::TxnAreaRead read{.overlay = {}, .covered = &covered};
+                std::optional<ChunkCoord> after;
+                for (std::size_t pages = 0U;; ++pages) {
+                    assert(pages <= cells.size());
+                    bool page_has_entry = false;
+                    std::vector<ChunkCoord> page_cells;
+                    const auto page = store.VisitChunkArea(selector, after, limit,
+                        [&](const ChunkCoord& coord, std::optional<chunkdb::ChunkRangeEntry>&& entry, bool) {
+                            // Refusing a second entry stands in for the page's byte budget.
+                            if (entry && one_entry_per_page && page_has_entry) return false;
+                            page_cells.push_back(coord);
+                            if (entry) {
+                                page_has_entry = true;
+                                entries.push_back(std::move(*entry));
+                            }
+                            return true;
+                        },
+                        true, snapshot.get(), read);
+                    assert(!page_cells.empty() && page_cells.size() <= limit);
+                    visited.insert(visited.end(), page_cells.begin(), page_cells.end());
+                    if (!page.has_more) {
+                        assert(!page.after);
+                        break;
+                    }
+                    assert(page.after && *page.after == page_cells.back());
+                    after = page.after;
+                }
+                assert(visited == cells);
+                std::sort(covered.begin(), covered.end());
+                covered.erase(std::unique(covered.begin(), covered.end()), covered.end());
+                assert(covered == cells);
+                ExpectPointScan(store, *snapshot, around, entries);
+            }
+    }
+}
+
+struct StageAccount final : chunkdb::detail::ChunkStorageAccount {
+    std::size_t bytes = 0U;
+    void Reserve(std::size_t amount) override { bytes += amount; }
+    void Release(std::size_t amount) noexcept override {
+        assert(amount <= bytes);
+        bytes -= amount;
+    }
+};
+
+// A block stage keeps the state it replaces as a physical kept state. A chunk
+// that stage emptied after the snapshot is absent from the population index,
+// yet GET AREA at the snapshot, paged and unpaged, returns its kept state.
+void TestSnapshotAreaReadsPhysicalKeptState() {
+    for (const bool three : {false, true}) for (const bool around : {false, true}) {
+        ScopedTempDir dir("chunkdb-txn-area-index-physical");
+        ChunkStore store(AreaIndexConfig(dir.path(), three));
+        const auto& geometry = store.geometry();
+        const ChunkCoord listed{-2, 0, 0};
+        const ChunkCoord staged{1, 0, 0};
+        WriteAreaBlock(store, listed);
+        auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+        // The staged chunk as the snapshot saw it: one present block.
+        std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U);
+        std::vector<std::uint8_t> presence((geometry.ChunkBlockCount() + 7U) / 8U, 0U);
+        presence[0] = 1U;
+        chunkdb::ChunkVars vars;
+        auto columns = geometry.default_chunk_columns();
+        std::uint64_t version = snapshot->version();
+        std::uint64_t commit_time_ms = 100U;
+        bool written = true;
+        std::size_t present = 1U;
+        chunkdb::TxnBlockSnapshot before;
+        before.row = chunkdb::CaptureTxnBlockRow(geometry.layout(), payload, presence, vars, 0U, before.row.resource());
+        before.version = version;
+        before.commit_time_ms = commit_time_ms;
+        before.written = written;
+        const chunkdb::StoreId table{1U};
+        chunkdb::TxnBlockDeltas journal(table, geometry.layout(), std::pmr::get_default_resource());
+        journal.Publish(journal.Prepare({staged, 0U}, before, chunkdb::TxnBlockAction::kDelete));
+        const std::array views{chunkdb::TxnBlockMutableChunk{staged, payload, presence, &vars, &columns,
+            &version, &commit_time_ms, &written, &present}};
+        auto account = std::make_shared<StageAccount>();
+        {
+            auto stage = chunkdb::PreparedTxnBlockStage::Prepare(journal, table, geometry, views,
+                store.TxnHistoryForTests(), account, chunkdb::kVarMaxChunkBytesLimit);
+            stage.BindHistoryTag(snapshot->version() + 1U);
+            stage.Apply();
+            stage.Commit();
+        }
+        assert(presence[0] == 0U && present == 0U);
+        assert(store.TxnKeptStateCountForTests() == 1U);
+        const auto whole = IndexedArea(store, *snapshot, around);
+        assert(whole.size() == 2U && whole.front().coord == listed && whole.back().coord == staged);
+        assert(whole.back().presence_bitmap.front() == 1U && whole.back().version == snapshot->version());
+        ExpectPointScan(store, *snapshot, around, whole);
+        const auto selector = SnapshotAreaSelector(three, around);
+        for (const std::size_t limit : {std::size_t{1}, std::size_t{2}, std::size_t{7}}) {
+            std::vector<chunkdb::ChunkRangeEntry> entries;
+            std::optional<ChunkCoord> after;
+            for (;;) {
+                const auto page = store.VisitChunkArea(selector, after, limit,
+                    [&](const ChunkCoord&, std::optional<chunkdb::ChunkRangeEntry>&& entry, bool) {
+                        if (entry) entries.push_back(std::move(*entry));
+                        return true;
+                    },
+                    true, snapshot.get());
+                if (!page.has_more) break;
+                after = page.after;
+            }
+            assert(entries.size() == 2U && entries.back().coord == staged);
+            ExpectPointScan(store, *snapshot, around, entries);
+        }
+    }
+}
+
 // Text values at a snapshot.
 chunkdb::TableSchema TextSchema() {
     chunkdb::Column id;
@@ -527,6 +918,13 @@ int main() {
     TestSnapshotReadsOldStates();
     TestEveryWritePathKeeps();
     TestAreaAtSnapshot();
+    TestSnapshotAreaMatchesPointScanDuringWrites();
+    TestSnapshotAreaSkipsEmptyDiskReads();
+    TestSnapshotAreaIncludesPendingFirstWrite();
+    TestSnapshotAreaWaitsForEmptyingWrite();
+    TestSnapshotAreaKeepsOverlayAndEmptyConflicts();
+    TestPagedSnapshotAreaMatchesPointScan();
+    TestSnapshotAreaReadsPhysicalKeptState();
     TestTextValuesAtSnapshot();
     TestWriterRacingRegistrationIsKept();
     TestSnapshotAfterWriterVersionSeesTheWrite();
