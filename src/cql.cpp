@@ -1238,6 +1238,8 @@ class Parser {
                 } else if (Accept("columns")) {
                     if (!scan.columns.empty()) Fail(column, "COLUMNS is given twice");
                     scan.columns = FeedColumns();
+                } else if (Accept("where")) {
+                    Fail(column, "SCAN CHUNKS does not support WHERE");
                 } else break;
             }
             if (!scan.columns.empty() && !scan.with_data) Fail(1, "COLUMNS requires WITH DATA");
