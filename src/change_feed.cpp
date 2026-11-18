@@ -5,6 +5,7 @@
 #include <cstring>
 #include <limits>
 #include <stdexcept>
+#include <tuple>
 #include <type_traits>
 #include <utility>
 
@@ -681,10 +682,70 @@ void ChangeFeed::Notify() {
     std::erase_if(notifications_, [](const auto& callback) { return callback.expired(); });
     for (const auto& weak : notifications_) if (auto callback = weak.lock()) (*callback)();
 }
+std::optional<std::shared_ptr<const FeedEntry>> FeedProjectionGroup::Find(
+    const std::shared_ptr<const FeedEntry>& source, std::uint64_t floor) {
+    std::lock_guard lock(mutex_);
+    // The ring no longer holds entries through the floor; their readers resync.
+    Prune(floor);
+    const auto revision = source->position.revision;
+    const auto at = std::lower_bound(items_.begin(), items_.end(), revision,
+        [](const Item& item, std::uint64_t value) { return item.revision < value; });
+    if (at == items_.end() || at->revision != revision ||
+        at->source.owner_before(source) || source.owner_before(at->source)) return std::nullopt;
+    return at->result;
+}
+void FeedProjectionGroup::Add(const std::shared_ptr<const FeedEntry>& source,
+    std::shared_ptr<const FeedEntry> result, std::size_t limit) {
+    const auto bytes = sizeof(Item) + (result && result != source ? FeedEntryRetainedBytes(*result) : 0U);
+    std::lock_guard lock(mutex_);
+    // Another member must still read it; one larger than the share is not kept.
+    if (positions_.size() < 2U || bytes > limit) return;
+    const auto revision = source->position.revision;
+    if (*std::next(positions_.begin()) >= revision) return;
+    // Older items give way; a member still below them projects its own.
+    while (bytes_ > limit - bytes && !items_.empty() && items_.front().revision < revision) {
+        bytes_ -= items_.front().bytes;
+        items_.pop_front();
+    }
+    if (bytes_ > limit - bytes) return;
+    const auto at = std::lower_bound(items_.begin(), items_.end(), revision,
+        [](const Item& item, std::uint64_t value) { return item.revision < value; });
+    if (at != items_.end() && at->revision == revision) return;
+    items_.insert(at, Item{revision, source, std::move(result), bytes});
+    bytes_ += bytes;
+}
+void FeedProjectionGroup::Join(std::uint64_t position) {
+    std::lock_guard lock(mutex_);
+    positions_.insert(position);
+}
+void FeedProjectionGroup::Move(std::uint64_t from, std::uint64_t to) {
+    if (from == to) return;
+    std::lock_guard lock(mutex_);
+    positions_.insert(to);
+    if (const auto found = positions_.find(from); found != positions_.end()) positions_.erase(found);
+    Prune(*positions_.begin());
+}
+void FeedProjectionGroup::Leave(std::uint64_t position) noexcept {
+    std::lock_guard lock(mutex_);
+    if (const auto found = positions_.find(position); found != positions_.end()) positions_.erase(found);
+    if (positions_.empty()) {
+        items_.clear();
+        bytes_ = 0U;
+    } else Prune(*positions_.begin());
+}
+void FeedProjectionGroup::Prune(std::uint64_t through) noexcept {
+    while (!items_.empty() && items_.front().revision <= through) {
+        bytes_ -= items_.front().bytes;
+        items_.pop_front();
+    }
+}
+
 std::size_t FeedSubscription::buffer_bytes() const noexcept { return feed_->budget(); }
 FeedPosition FeedSubscription::Resync() {
     std::lock_guard lock(feed_->mutex_);
-    position_ = {feed_->epoch_, std::max(feed_->watermark_, feed_->Watermark())};
+    const FeedPosition position{feed_->epoch_, std::max(feed_->watermark_, feed_->Watermark())};
+    Track(position.revision);
+    position_ = position;
     reset_ = feed_->reset_;
     invalid_ = false;
     return position_;
@@ -694,8 +755,26 @@ std::string FeedSubscription::ResyncFrame() {
 }
 
 FeedSubscription::FeedSubscription(std::shared_ptr<ChangeFeed> feed, std::weak_ptr<Table> table, const FeedOptions& options)
-    : feed_(std::move(feed)), table_(std::move(table)), area_(options.area), column_ids_(options.column_ids), no_before_(options.no_before) {}
+    : feed_(std::move(feed)), table_(std::move(table)), areas_(options.areas), column_ids_(options.column_ids), no_before_(options.no_before) {
+    // Overlapping or repeated areas keep the same chunks; one order shares one projection.
+    std::sort(areas_.begin(), areas_.end(), [](const FeedArea& a, const FeedArea& b) {
+        return std::tie(a.first.x, a.first.y, a.first.z, a.last.x, a.last.y, a.last.z) <
+            std::tie(b.first.x, b.first.y, b.first.z, b.last.x, b.last.y, b.last.z);
+    });
+    areas_.erase(std::unique(areas_.begin(), areas_.end()), areas_.end());
+}
+void FeedSubscription::Track(std::uint64_t revision) {
+    if (group_) group_->Move(group_position_, revision);
+    group_position_ = revision;
+}
 FeedSubscription::~FeedSubscription() {
+    if (group_) {
+        group_->Leave(group_position_);
+        group_.reset();
+        std::lock_guard lock(feed_->mutex_);
+        std::erase_if(feed_->groups_, [](const auto& group) { return group.expired(); });
+        feed_->group_count_.store(feed_->groups_.size(), std::memory_order_relaxed);
+    }
     if (chunks_) feed_->chunk_watchers_.fetch_sub(1U, std::memory_order_acq_rel);
     if (auto table = table_.lock()) table->ReleaseFeed(feed_);
 }
@@ -727,6 +806,21 @@ std::unique_ptr<FeedSubscription> ChangeFeed::Subscribe(std::weak_ptr<Table> tab
     if (options.notify) {
         result->notify_ = std::make_shared<const std::function<void()>>(options.notify);
         notifications_.push_back(result->notify_);
+    }
+    FeedProjectionGroup::Key key{result->areas_, result->column_ids_, result->no_before_, options.chunks};
+    if (!key.areas.empty() || key.column_ids || key.no_before || key.chunks) {
+        std::erase_if(groups_, [](const auto& group) { return group.expired(); });
+        for (const auto& weak : groups_) {
+            if (auto group = weak.lock(); group && group->key() == key) { result->group_ = std::move(group); break; }
+        }
+        if (!result->group_) {
+            auto group = std::make_shared<FeedProjectionGroup>(std::move(key));
+            groups_.push_back(group);
+            result->group_ = std::move(group);
+        }
+        group_count_.store(groups_.size(), std::memory_order_relaxed);
+        result->group_->Join(result->position_.revision);
+        result->group_position_ = result->position_.revision;
     }
     result->chunks_ = options.chunks;
     if (options.chunks) chunk_watchers_.fetch_add(1U, std::memory_order_acq_rel);
@@ -760,6 +854,7 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Next(FeedSubscription& sub, std::ch
             entry->kind = FeedEntry::Kind::kResync;
             entry->position = {epoch_, std::max(watermark_, Watermark())};
             entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedResync(entry->position, lineage_));
+            sub.Track(entry->position.revision);
             sub.position_ = entry->position;
             sub.reset_ = reset_;
             sub.invalid_ = false;
@@ -778,16 +873,28 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Next(FeedSubscription& sub, std::ch
             sub.invalid_ = true;
             continue;
         }
+        // Another member of the projection group may already have projected it.
+        auto shared = sub.group_ ? sub.group_->Find(entry, floor_) : std::nullopt;
         // Snapshot the historical schema under the sender's ring lock, then
         // project outside it. Ordinary unfiltered reads allocate no schema copy.
         std::vector<Column> columns;
-        if (sub.column_ids_) columns = geometry_->LayoutAt(entry->schema_version).schema().columns;
         std::optional<Geometry> chunk_geometry;
-        if (sub.chunks_) chunk_geometry = geometry_;
+        if (!shared) {
+            if (sub.column_ids_) columns = geometry_->LayoutAt(entry->schema_version).schema().columns;
+            if (sub.chunks_) chunk_geometry = geometry_;
+        }
         lock.unlock();
-        auto filtered = sub.chunks_ && entry->kind == FeedEntry::Kind::kChange
-            ? ChunkFeedEntry(entry, *chunk_geometry, sub.area_, sub.column_ids_)
-            : FilterFeedEntry(entry, sub.area_, sub.column_ids_, sub.no_before_, columns);
+        std::shared_ptr<const FeedEntry> filtered;
+        if (shared) filtered = std::move(*shared);
+        else {
+            filtered = sub.chunks_ && entry->kind == FeedEntry::Kind::kChange
+                ? ChunkFeedEntry(entry, *chunk_geometry, sub.areas_, sub.column_ids_)
+                : FilterFeedEntry(entry, sub.areas_, sub.column_ids_, sub.no_before_, columns);
+            // Each group shares at most an equal part of the feed budget.
+            if (sub.group_) sub.group_->Add(entry, filtered,
+                budget() / std::max<std::size_t>(1U, group_count_.load(std::memory_order_relaxed)));
+        }
+        sub.Track(entry->position.revision);
         sub.position_ = entry->position;
         if (filtered) return filtered;
     }

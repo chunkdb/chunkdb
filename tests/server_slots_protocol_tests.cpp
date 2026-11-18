@@ -1401,6 +1401,9 @@ void PersistentFilterDelivery(bool tls) {
     auto watch = harness.Connect();
     const auto wrong = watch->Command("WATCH t SLOT 'filtered' COLUMNS n,label");
     Error(wrong, "INVALID_ARGUMENT"); assert(wrong.value.find("reason=slot_filters") != std::string::npos);
+    // A slot keeps one area, so several never match its filters.
+    const auto areas = watch->Command("WATCH t SLOT 'filtered' AREA 0 0 TO 0 0, AREA 1 1 TO 1 1");
+    Error(areas, "INVALID_ARGUMENT"); assert(areas.value.find("reason=slot_filters") != std::string::npos);
     (void)Start(watch->Command("WATCH t SLOT 'filtered'"));
     auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t COLUMNS label,n NO BEFORE AREA 0 0 TO 0 0"));
     (void)Set(*writer, 9, 8); // Outside the fixed area; delivery must skip it.

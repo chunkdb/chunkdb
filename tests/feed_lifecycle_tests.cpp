@@ -530,8 +530,8 @@ void ChunkCoordinatesBeyondAbsoluteBlockDomain() {
     auto table = catalog.Find("default");
     const ChunkCoord coordinate{std::numeric_limits<std::int64_t>::max(), std::numeric_limits<std::int64_t>::min()};
     auto feed = table->SubscribeFeed();
-    auto inside = table->SubscribeFeed({.area = FeedArea{coordinate, coordinate}});
-    auto outside = table->SubscribeFeed({.area = FeedArea{{0, 0}, {0, 0}}});
+    auto inside = table->SubscribeFeed({.areas = {FeedArea{coordinate, coordinate}}});
+    auto outside = table->SubscribeFeed({.areas = {FeedArea{{0, 0}, {0, 0}}}});
     {
         auto lease = table->Acquire();
         auto state = lease->store().ReadChunkState(coordinate.x, coordinate.y);
@@ -557,7 +557,7 @@ void AbsentBlockBytesAreCanonicalizedBeforeCommit() {
     (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed();
-    auto area = table->SubscribeFeed({.area = FeedArea{{0, 0}, {0, 0}}});
+    auto area = table->SubscribeFeed({.areas = {FeedArea{{0, 0}, {0, 0}}}});
     {
         auto lease = table->Acquire();
         auto state = lease->store().ReadChunkState(0, 0);
@@ -566,6 +566,51 @@ void AbsentBlockBytesAreCanonicalizedBeforeCommit() {
         assert(lease->store().SetChunkStateBytes(0, 0, state.payload, state.presence_bitmap) == state.version);
     }
     assert(!feed->Next() && !area->Next());
+}
+
+// A chunk in any area is kept; watches with the same filters receive one
+// projected entry and frame, which nothing keeps once all of them read it.
+void SeveralAreasShareOneProjection() {
+    ScopedTempDir dir("chunkdb-feed-areas");
+    auto catalog = std::make_shared<TableCatalog>(Config(dir.path()));
+    CommandEngine engine({.require_auth = false}, catalog);
+    SessionState session;
+    (void)engine.Execute(session, "HELLO 3\r\n");
+    const auto run = [&](const std::string& statement) { assert(engine.Execute(session, statement + "\r\n")[0] != '-'); };
+    run("CREATE TABLE t (n u8, m u8) CHUNK 2 x 2");
+    auto table = catalog->Find("t");
+    const FeedArea low{{0, 0}, {0, 0}}, high{{2, 2}, {2, 2}};
+    const auto m = table->geometry().layout().schema().columns[1].id;
+    auto first = table->SubscribeFeed({.areas = {low, high}});
+    auto second = table->SubscribeFeed({.areas = {high, low, low}});
+    auto projected = table->SubscribeFeed({.areas = {low, high}, .column_ids = std::vector<std::uint32_t>{m}});
+    auto alone = table->SubscribeFeed({.areas = {low}});
+    SessionState watching;
+    (void)engine.Execute(watching, "HELLO 3\r\n");
+    assert(engine.Execute(watching, "WATCH t AREA 2 2 TO 2 2, AREA 0 0 TO 0 0\r\n")[0] == '%');
+    run("BEGIN");
+    run("SET BLOCK 0 0 IN t n = 1, m = 4");
+    run("SET BLOCK 2 2 IN t n = 2, m = 5");
+    run("SET BLOCK 4 4 IN t n = 3, m = 6");
+    run("COMMIT");
+    auto a = Next(*first);
+    assert(a->blocks.size() == 2U && a->protocol_frame && *a->protocol_frame == EncodeFeedEntry(*a));
+    for (const auto& block : a->blocks) assert(block.chunk == low.first || block.chunk == high.first);
+    auto b = Next(*second);
+    assert(b == a);
+    assert(Next(*watching.watch) == a);
+    const auto c = Next(*projected);
+    assert(c != a && c->blocks.size() == 2U && c->blocks[0].after->size() == 1U && *c->protocol_frame == EncodeFeedEntry(*c));
+    const auto d = Next(*alone);
+    assert(d->blocks.size() == 1U && d->blocks[0].chunk == low.first);
+    const std::weak_ptr<const FeedEntry> shared = a;
+    a.reset();
+    b.reset();
+    assert(shared.expired());
+    assert(txn_test::ThrowsAs<std::invalid_argument>([&] {
+        (void)table->SubscribeFeed({.areas = std::vector<FeedArea>(kMaxFeedAreas + 1U, low)});
+    }));
+    assert(txn_test::ThrowsAs<std::invalid_argument>([&] { (void)table->SubscribeFeed({.areas = {low, FeedArea{{0, 0, 0}, {0, 0, 0}, 3U}}}); }));
 }
 
 void RefuseUnsupported() {
@@ -611,4 +656,5 @@ int main(int argc, char** argv) {
     FailedSchemaPublicationEndsFeedWithoutBlockingTable(true);
     ChunkCoordinatesBeyondAbsoluteBlockDomain();
     AbsentBlockBytesAreCanonicalizedBeforeCommit();
+    SeveralAreasShareOneProjection();
 }

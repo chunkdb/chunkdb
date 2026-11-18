@@ -427,19 +427,20 @@ void Table::QuarantineFeedLinger(const std::exception& error, std::shared_ptr<Ch
 
 std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& options) {
     if (options.ack_timeout_ms) throw std::invalid_argument("ACK TIMEOUT requires a slot watch");
-    if (options.area && (options.area->first.x > options.area->last.x || options.area->first.y > options.area->last.y))
-        throw std::invalid_argument("feed area bounds are reversed");
+    if (options.areas.size() > kMaxFeedAreas) throw std::invalid_argument("a watch takes at most 64 areas");
+    for (const auto& area : options.areas)
+        if (area.first.x > area.last.x || area.first.y > area.last.y) throw std::invalid_argument("feed area bounds are reversed");
     std::lock_guard timer_control(feed_timer_control_mutex_);
     if (feed_timer_finished_.load(std::memory_order_acquire)) StopFeedLingerTimer();
     auto store = BeginExclusive();
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
-    if (options.area) {
-        if (options.area->dims != store->geometry_.dims())
+    for (const auto& area : options.areas) {
+        if (area.dims != store->geometry_.dims())
             throw std::invalid_argument("feed area dimensionality differs from table");
-        (void)store->geometry_.ChunkToLarge(options.area->first);
-        (void)store->geometry_.ChunkToLarge(options.area->last);
-        if (options.area->dims == 3U && options.area->first.z > options.area->last.z)
+        (void)store->geometry_.ChunkToLarge(area.first);
+        (void)store->geometry_.ChunkToLarge(area.last);
+        if (area.dims == 3U && area.first.z > area.last.z)
             throw std::invalid_argument("feed area bounds are reversed");
     }
     if (store->access_mode_ == AccessMode::kReadOnly || store->allow_multiple_processes_)
@@ -734,7 +735,7 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
         if (slot.owner && authorize_owner) authorize_owner(*slot.owner);
         if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
             slot.schema_filter_lost ? "schema_filter" : "retention_limit");
-        if ((options.area && options.area != slot.filters.area) ||
+        if ((!options.areas.empty() && (options.areas.size() != 1U || options.areas.front() != slot.filters.area)) ||
             (options.column_ids && options.column_ids != slot.filters.column_ids) ||
             (options.no_before && !slot.filters.no_before) || (options.chunks && !slot.filters.chunks))
             throw FeedSlotFiltersError("feed slot filters differ from WATCH filters");

@@ -22,19 +22,23 @@ bool Charge(std::atomic<std::size_t>& counter, std::size_t bytes, std::size_t li
 std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     std::string name, FeedOptions options, bool takeover, std::string user,
     const std::function<void(std::string_view)>& authorize_owner) {
-    if (options.area && (options.area->first.x > options.area->last.x || options.area->first.y > options.area->last.y))
-        throw std::invalid_argument("feed area bounds are reversed");
-    if (options.area && (options.area->dims != table->Info().geometry.dims ||
-        (options.area->dims == 2U && (options.area->first.z != 0 || options.area->last.z != 0)) ||
-        (options.area->dims == 3U && options.area->first.z > options.area->last.z)))
-        throw std::invalid_argument("feed area dimensionality or z bounds are invalid");
+    if (options.areas.size() > kMaxFeedAreas) throw std::invalid_argument("a watch takes at most 64 areas");
+    for (const auto& area : options.areas) {
+        if (area.first.x > area.last.x || area.first.y > area.last.y)
+            throw std::invalid_argument("feed area bounds are reversed");
+        if (area.dims != table->Info().geometry.dims || (area.dims == 2U && (area.first.z != 0 || area.last.z != 0)) ||
+            (area.dims == 3U && area.first.z > area.last.z))
+            throw std::invalid_argument("feed area dimensionality or z bounds are invalid");
+    }
     if (options.progress_interval.count() <= 0 || options.progress_interval.count() > INT32_MAX)
         throw std::invalid_argument("feed progress interval must be between 1 and 2147483647 milliseconds");
     if (options.ack_timeout_ms && *options.ack_timeout_ms == 0U)
         throw std::invalid_argument("ACK TIMEOUT must be positive");
     if (options.buffer_bytes && *options.buffer_bytes == 0U) throw std::invalid_argument("feed buffer must be positive");
     auto [slot, claim] = table->ClaimFeedSlot(name, options, takeover, std::move(user), authorize_owner);
-    options.area = slot.filters.area; options.column_ids = slot.filters.column_ids;
+    options.areas.clear();
+    if (slot.filters.area) options.areas.push_back(*slot.filters.area);
+    options.column_ids = slot.filters.column_ids;
     options.no_before = slot.filters.no_before; options.chunks = slot.filters.chunks;
     if (options.after && table->lineage() && options.after->epoch == table->lineage()->parent_epoch &&
         options.after->revision == table->lineage()->fork_revision) options.after->epoch = table->store_id();
@@ -52,7 +56,7 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     FeedOptions live_options = result->options_;
     live_options.after.reset();
     live_options.ack_timeout_ms.reset();
-    live_options.area.reset();
+    live_options.areas.clear();
     live_options.column_ids.reset(); live_options.no_before = false;
     result->live_ = result->table_->SubscribeFeed(live_options);
     result->join_ = result->live_->position().revision;
@@ -258,8 +262,8 @@ void SlotWatch::Build(Prepared& prepared) const {
         prepared.entry = kept ? original : nullptr;
     } else {
         prepared.entry = options_.chunks && mutation
-            ? ChunkFeedEntry(original, table_->geometry(), options_.area, options_.column_ids)
-            : FilterFeedEntry(original, options_.area, options_.column_ids, options_.no_before, columns);
+            ? ChunkFeedEntry(original, table_->geometry(), options_.areas, options_.column_ids)
+            : FilterFeedEntry(original, options_.areas, options_.column_ids, options_.no_before, columns);
     }
     prepared.built = true;
     const auto& entry = prepared.entry;
@@ -279,7 +283,7 @@ void SlotWatch::Build(Prepared& prepared) const {
         if (geometry.has_chunk_column_history())
             metadata.chunk_columns = geometry.ChunkColumnsLayoutAt(entry->schema_version).schema().columns;
         auto projected = FilterFeedEntry(std::make_shared<const FeedEntry>(std::move(metadata)), {}, options_.column_ids, false, columns);
-        prepared.next.push_back(Output{std::make_shared<const std::string>(EncodeFeedEntry(*projected))});
+        prepared.next.push_back(Output{projected->protocol_frame ? projected->protocol_frame : std::make_shared<const std::string>(EncodeFeedEntry(*projected))});
     }
     auto frame = entry->protocol_frame ? entry->protocol_frame : std::make_shared<const std::string>(EncodeFeedEntry(*entry));
     const bool eligible = data || entry->kind == FeedEntry::Kind::kProgress;
@@ -448,7 +452,7 @@ bool SlotWatch::Work() {
         FeedOptions options = options_;
         options.after.reset();
         options.ack_timeout_ms.reset();
-        options.area.reset();
+        options.areas.clear();
         options.column_ids.reset(); options.no_before = false;
         live_ = table_->SubscribeFeed(options);
         join_ = live_->position().revision;
@@ -461,7 +465,7 @@ bool SlotWatch::Work() {
             archive_.emplace(table_->ReadClaimedFeedArchive(claim_, cursor_));
             // The reader keeps only what this watch sends, so its budget
             // counts the frames this watch sends.
-            if (Filtered()) archive_->Filter({options_.area, options_.column_ids, options_.no_before, options_.chunks});
+            if (Filtered()) archive_->Filter({SlotArea(), options_.column_ids, options_.no_before, options_.chunks});
             changed = true;
         }
         if (!pending_) {
