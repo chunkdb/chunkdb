@@ -15,6 +15,7 @@
 #include <mutex>
 #include <optional>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -1044,7 +1045,9 @@ class ChunkStore {
 
     class SnapshotGenerationWriteGuard {
       public:
-        explicit SnapshotGenerationWriteGuard(ChunkStore* store);
+        explicit SnapshotGenerationWriteGuard(ChunkStore* store, std::span<const ChunkCoord> coordinates = {});
+        SnapshotGenerationWriteGuard(ChunkStore* store, const ChunkCoord& coordinate)
+            : SnapshotGenerationWriteGuard(store, std::span(&coordinate, 1U)) {}
         ~SnapshotGenerationWriteGuard();
 
         SnapshotGenerationWriteGuard(
@@ -1172,6 +1175,7 @@ class ChunkStore {
     std::shared_ptr<ChunkCoordinateIndex> read_only_retained_index_;
     std::mutex coordinate_index_refresh_mutex_;
     std::pair<std::uint64_t, std::uint64_t> coordinate_index_generation_{};
+    std::optional<std::uint64_t> coordinate_index_changes_cursor_;
     bool coordinate_index_complete_ = false;
     std::vector<ChunkCoord> coordinate_startup_candidates_;
     std::filesystem::path data_dir_;
@@ -1481,6 +1485,7 @@ class ChunkStore {
     [[nodiscard]] LoadedChunkPayload LoadChunkPayload(const ChunkCoord& chunk_coord, bool authoritative_prefix = false,
         const std::shared_ptr<ChunkCoordinateIndex>& recovery_index = {});
     [[nodiscard]] std::vector<ChunkCoord> AdmitCoordinateArtifacts(ChunkCoordinateIndex& index);
+    bool AdmitCoordinateArtifact(const std::filesystem::path& path, const ChunkCoord& coord);
     void PrepareCoordinateIndex();
     void InitializeCoordinateIndex();
     [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> CoordinateIndexForScan();
