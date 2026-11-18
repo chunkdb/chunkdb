@@ -369,6 +369,7 @@ Repair truncates to the accepted boundary and syncs it; when backup hard links p
 Archived WALs are closed segments and require complete valid framing throughout; the live trailing-append policy does not apply to them.
 Persisted revisions survive eviction and restart; a missing chunk artifact gets a fresh revision when loaded.
 The store clock reserves ranges durably before issuing tokens and advances past any recovered revision at or above its ceiling.
+When no further range fits below 2^64, every later write is refused with `chunk version clock exhausted` and the clock never wraps.
 
 ## Revision and snapshot bookkeeping
 

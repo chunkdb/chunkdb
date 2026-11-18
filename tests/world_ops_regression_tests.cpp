@@ -12,6 +12,7 @@
 //   - oversized-geometry rejection for conditional mutations
 
 #include <algorithm>
+#include <atomic>
 #include <cassert>
 #include <chrono>
 #include <cstdint>
@@ -25,6 +26,7 @@
 #include <new>
 #include <optional>
 #include <set>
+#include <stdexcept>
 #include <string>
 #include <thread>
 #include <tuple>
@@ -348,6 +350,107 @@ void TestVersionMonotonicAcrossManyReloads() {
             last = v;
         }
     }
+}
+
+// A clock whose durable ceiling is at the top of the token range refuses
+// every write, however many follow, and never wraps to token zero.
+void TestExhaustedVersionClockRefusesEveryWrite() {
+    constexpr auto kMax = std::numeric_limits<std::uint64_t>::max();
+    for (const std::uint64_t ceiling : {kMax, kMax - 1U}) {
+        chunkdb::test::ScopedTempDir dir("chunkdb-reg-version-exhausted");
+        const auto config = BaseConfig(dir.path());
+        std::uint64_t revision = 0;
+        std::string bits;
+        {
+            chunkdb::ChunkStore store(config);
+            store.SetBlockBits(0, 0, "10101");
+            revision = store.GetChunkVersion(0, 0);
+            bits = store.GetBlockBits(0, 0);
+        }
+        const auto clock_path = dir.path() / "chunkdb.version";
+        WriteFileBytes(clock_path, chunkdb::SerializeVersionClockRecord(ceiling));
+        for (int reopen = 0; reopen < 2; ++reopen) {
+            chunkdb::ChunkStore store(config);
+            for (int write = 0; write < 3; ++write) {
+                bool refused = false;
+                try {
+                    store.SetBlockBits(write, 0, "01010");
+                } catch (const std::overflow_error& error) {
+                    refused = std::string(error.what()).find("chunk version clock exhausted") != std::string::npos;
+                }
+                assert(refused);
+            }
+            assert(store.GetChunkVersion(0, 0) == revision);
+            assert(store.GetBlockBits(0, 0) == bits);
+            assert(store.GetBlockBits(1, 0) == "00000");
+            assert(ReadFileBytes(clock_path) == chunkdb::SerializeVersionClockRecord(ceiling));
+        }
+    }
+}
+
+// Writers that reach an exhausted clock at the same time all take the
+// refusal path: none is issued a token, and the clock record stays as it was.
+void TestExhaustedVersionClockRefusesConcurrentWrites() {
+    constexpr auto kCeiling = std::numeric_limits<std::uint64_t>::max();
+    constexpr int kThreads = 8;
+    constexpr int kWritesPerThread = 8;
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-version-exhausted-mt");
+    const auto config = BaseConfig(dir.path());
+    std::uint64_t revision = 0;
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "10101");
+        revision = store.GetChunkVersion(0, 0);
+    }
+    const auto clock_path = dir.path() / "chunkdb.version";
+    WriteFileBytes(clock_path, chunkdb::SerializeVersionClockRecord(kCeiling));
+
+    chunkdb::ChunkStore store(config);
+    std::atomic<int> ready{0};
+    std::atomic<bool> go{false};
+    std::atomic<int> refused{0};
+    std::atomic<int> other{0};
+    std::vector<std::thread> writers;
+    for (int t = 0; t < kThreads; ++t) {
+        writers.emplace_back([&, t] {
+            ready.fetch_add(1);
+            while (!go.load()) {
+                std::this_thread::yield();
+            }
+            for (int write = 0; write < kWritesPerThread; ++write) {
+                try {
+                    // Distinct chunks, so the writers meet only at the clock.
+                    store.SetBlockBits(16 + t * 16, write * 16, "01010");
+                    other.fetch_add(1);
+                } catch (const std::overflow_error& error) {
+                    if (std::string(error.what()).find("chunk version clock exhausted") != std::string::npos) {
+                        refused.fetch_add(1);
+                    } else {
+                        other.fetch_add(1);
+                    }
+                } catch (...) {
+                    other.fetch_add(1);
+                }
+            }
+        });
+    }
+    while (ready.load() < kThreads) {
+        std::this_thread::yield();
+    }
+    go.store(true);
+    for (auto& writer : writers) {
+        writer.join();
+    }
+    assert(refused.load() == kThreads * kWritesPerThread);
+    assert(other.load() == 0);
+    assert(store.GetChunkVersion(0, 0) == revision);
+    assert(store.GetBlockBits(0, 0) == "10101");
+    for (int t = 0; t < kThreads; ++t) {
+        for (int write = 0; write < kWritesPerThread; ++write) {
+            assert(store.GetBlockBits(16 + t * 16, write * 16) == "00000");
+        }
+    }
+    assert(ReadFileBytes(clock_path) == chunkdb::SerializeVersionClockRecord(kCeiling));
 }
 
 // A pre-2.0 artifact inside a store can only be damage or a copied file: the
@@ -2373,6 +2476,8 @@ int main() {
     TestBatchCheckpointFailureRollsBackAcrossRestart();
     TestCasCheckpointFailureRollsBack();
     TestVersionMonotonicAcrossManyReloads();
+    TestExhaustedVersionClockRefusesEveryWrite();
+    TestExhaustedVersionClockRefusesConcurrentWrites();
     TestPre20ArtifactsAreRejected();
     TestVersionBookkeepingDamageFailsClosed();
     TestBothVersionRecordsMissingRefusesWithoutPublication();
