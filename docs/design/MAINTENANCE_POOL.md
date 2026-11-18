@@ -31,6 +31,7 @@ While the mark is set, an ordinary block write changes only memory and the batch
 Its group-commit flush and checkpoint check wait for the checkpoint, which runs both when it ends.
 A write waits for the checkpoint once the writes since the image reach the hard bound of four checkpoint intervals or four WAL thresholds.
 Transactions, conditional writes, barriers, eviction, reopen and shutdown flushes, feed-slot syncs and the checkpoints of tombstone compaction wait for the mark before they touch the chunk's files.
+A statement waiting for the mark before its decision stops when it is cancelled, killed or times out, also while it retakes the chunk lock, and reports that it did not apply; background and cleanup paths wait without a stop.
 Exclusive table admission does not stop maintenance, so compaction waits like any other path.
 Backup takes maintenance admission, which the checkpoint holds until it ends, and feed-slot creation stops maintenance before it prepares its baseline, so neither meets the mark.
 The checkpoint holds the publish lock from before the image write until the WAL is removed, so barrier drains and the durability floor order with it as before.

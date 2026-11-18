@@ -12,6 +12,7 @@
 #include "feature_flags.hpp"
 #include "feed_slot_records.hpp"
 #include "file_permissions.hpp"
+#include "statement_control.hpp"
 #include "store_manifest.hpp"
 #include "verify.hpp"
 
@@ -119,6 +120,9 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         require_name();
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RESTORE_TABLE_PUBLISH_FAIL_ONCE"))
             throw std::runtime_error("injected failure before publishing a restored table");
+        // A stop accepted until here leaves nothing restored; after it the
+        // statement reports its real outcome.
+        EnterStatementDecision();
         const auto moved = MoveDirectoryNoReplace(staging, target);
         if (moved == std::errc::file_exists)
             throw TableExistsError("cannot restore table '" + request.name + "': " + target.string() +
@@ -279,6 +283,9 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
         std::make_shared<ChunkStore::UnsyncedArtifacts>(), std::make_shared<ChunkStore::UnsyncedArtifacts>()};
     // Unsynced paths are spelled below each store's own directory.
     const std::array<std::string, 2U> store_dirs{stores[0]->data_dir().string(), stores[1]->data_dir().string()};
+    // A stop accepted until here leaves both tables serving as they were;
+    // after it the statement reports its real outcome.
+    EnterStatementDecision();
     serving.Dismiss();
     for (std::size_t i = 0; i < stores.size(); ++i) {
         stores[i]->HandOverUnsyncedOnClose(unsynced[i]);

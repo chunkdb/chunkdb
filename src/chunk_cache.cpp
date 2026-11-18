@@ -2,6 +2,7 @@
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
+#include "statement_control.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "eviction.hpp"
 #include "feed_slots.hpp"
@@ -293,7 +294,7 @@ void ChunkStore::RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChun
     if (const auto now = StableSnapshotGeneration(snapshot_generation_path_, snapshot_generation_record_seen_)) {
         bool unchanged = false;
         {
-            std::shared_lock lock(chunk.mutex);
+            auto lock = LockStatementChunkShared(chunk.mutex);
             unchanged = *now == chunk.read_only_generation;
         }
         if (unchanged) {
@@ -304,7 +305,7 @@ void ChunkStore::RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChun
     auto loaded = LoadChunkPayload(chunk_coord);
     BringChunkColumnsToSchema(geometry_, loaded.schema_version, geometry_.chunk_schema().version, &loaded.chunk_columns);
     BringToCurrentSchema(geometry_, loaded.schema_version, loaded.presence_bitmap, &loaded.payload, &loaded.vars);
-    std::unique_lock lock(chunk.mutex);
+    auto lock = LockStatementChunk(chunk.mutex);
     // Generations only grow, so a copy another read loaded later is kept.
     if (loaded.read_only_generation <= chunk.read_only_generation) {
         return;

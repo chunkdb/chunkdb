@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <optional>
 #include <string>
 #include <string_view>
 
@@ -37,6 +38,7 @@ class AuditLog {
         std::string_view target_user{};
         std::string_view slot{};
         std::string_view migration{};
+        std::optional<std::uint64_t> target_connection{};
     };
     // Appends one line; a failure is logged, never thrown.
     void Write(const Event& event) noexcept;

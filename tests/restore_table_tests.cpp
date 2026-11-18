@@ -3,6 +3,7 @@
 
 #include "feed_slots.hpp"
 #include "restore_table_test_utils.hpp"
+#include "statement_control.hpp"
 #include "txn_test_utils.hpp"
 
 namespace {
@@ -406,6 +407,52 @@ void SwapRefusedOnWindows() {
     swapped.Check(false);
     assert(!Resyncs(swapped.catalog, "t"));
 }
+
+// CANCEL, KILL or a statement timeout accepted before the decision leaves
+// nothing restored or swapped; after it, a stop is refused and the statement
+// reports its real outcome.
+void StatementStops() {
+    const auto running = [](StatementControl& control) { assert(control.Start()); };
+    {
+        Source source;
+        TableCatalog catalog(source.Config());
+        StatementControl control(StatementControl::Clock::now(), 0U);
+        running(control);
+        ScopedStatementControl context(&control);
+        assert(control.RequestStop(StatementStopReason::kCancelled));
+        (void)Throws<StatementStoppedError>([&] { (void)catalog.RestoreTable(source.Request()); });
+        LeavesNothingAfterRefusal(source, catalog);
+    }
+    {
+        Source source;
+        TableCatalog catalog(source.Config());
+        StatementControl control(StatementControl::Clock::now(), 0U);
+        running(control);
+        ScopedStatementControl context(&control);
+        (void)catalog.RestoreTable(source.Request());
+        assert(control.decision_entered() && !control.RequestStop(StatementStopReason::kCancelled));
+        assert(catalog.Find("t_restored") != nullptr);
+    }
+    if (!kAtomicExchange) return;
+    Swapped swapped{Source()};
+    {
+        StatementControl control(StatementControl::Clock::now(), 0U);
+        running(control);
+        ScopedStatementControl context(&control);
+        assert(control.RequestStop(StatementStopReason::kKilled));
+        (void)Throws<StatementStoppedError>([&] { swapped.catalog.SwapTables("t", "t_restored"); });
+    }
+    assert(swapped.catalog.Fences().empty());
+    swapped.Check(false);
+    {
+        StatementControl control(StatementControl::Clock::now(), 0U);
+        running(control);
+        ScopedStatementControl context(&control);
+        swapped.catalog.SwapTables("t", "t_restored");
+        assert(control.decision_entered() && !control.RequestStop(StatementStopReason::kCancelled));
+    }
+    swapped.Check(true);
+}
 }  // namespace
 
 int main() {
@@ -415,6 +462,7 @@ int main() {
     DamagedBackups();
     InjectedFailures();
     Cancellation();
+    StatementStops();
     MarkedSlotBecomesLost();
     if (kAtomicExchange) {
         SwapsNames();

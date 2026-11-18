@@ -14,6 +14,7 @@
 #include "chunk_store_internal.hpp"
 #include "chunkdb/bit_codec.hpp"
 #include "chunkdb/chunk_store.hpp"
+#include "statement_control.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/zrle.hpp"
 #include "wal_replay.hpp"
@@ -102,7 +103,7 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
             return ReadPopulatedChunkStateFromDisk(chunk_coord, out, with_vars, nullptr, include_empty, identity_only);
         }
         const auto chunk = GetOrLoadRegularChunk(chunk_coord);
-        std::shared_lock lock(chunk->mutex);
+        auto lock = LockStatementChunkShared(chunk->mutex);
         if (!include_cached(*chunk)) {
             return false;
         }
@@ -135,13 +136,13 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
         if (const auto loaded = TryGetLoadedChunk(chunk_coord); loaded != nullptr) {
             if (snapshot != nullptr) {
                 {
-                    std::shared_lock lock(loaded->mutex);
+                    auto lock = LockStatementChunkShared(loaded->mutex);
                     copy_cached(*loaded, target);
                 }
                 TouchChunk(loaded);
                 return finish_snapshot_read();
             }
-            std::shared_lock lock(loaded->mutex);
+            auto lock = LockStatementChunkShared(loaded->mutex);
             if (!include_cached(*loaded)) {
                 return false;
             }
@@ -204,12 +205,12 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     if (snapshot != nullptr) {
         {
-            std::shared_lock lock(regular_chunk->mutex);
+            auto lock = LockStatementChunkShared(regular_chunk->mutex);
             copy_cached(*regular_chunk, target);
         }
         return finish_snapshot_read();
     }
-    std::shared_lock lock(regular_chunk->mutex);
+    auto lock = LockStatementChunkShared(regular_chunk->mutex);
     if (!include_cached(*regular_chunk)) {
         return false;
     }
@@ -399,6 +400,7 @@ ChunkScanPage ChunkStore::ScanPopulatedChunks(
     bool pass_has_cursor = has_cursor;
     ChunkCoord pass_cursor = cursor;
     while (page.coords.size() <= limit) {
+        CheckStatementCancellation();
         const auto candidates = index->Page(pass_has_cursor, pass_cursor, limit + 1U - page.coords.size());
         const auto& pass_coords = candidates.coords;
         for (const auto& coord : pass_coords) {
@@ -516,6 +518,7 @@ ChunkAreaPage ChunkStore::VisitChunkArea(
     auto admitted = after;
     const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
     for (std::size_t visited = 0U; current && visited < limit; ++visited) {
+        CheckStatementCancellation();
         const auto next = cursor.Next(*current);
         if (txn_read.covered != nullptr) txn_read.covered->push_back(*current);
         std::optional<ChunkRangeEntry> entry;
@@ -557,6 +560,7 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkAreaEntriesImpl(
     std::size_t variable_bytes = 0U;
     const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
     for (auto current = std::optional{cursor.First()}; current; current = cursor.Next(*current)) {
+        CheckStatementCancellation();
         if (!index || index->IsPopulationCandidate(*current))
             AppendPopulatedChunkRangeEntry(*current, max_entries, "GET AREA", with_vars,
                 &variable_bytes, &entries, snapshot, txn_read);
