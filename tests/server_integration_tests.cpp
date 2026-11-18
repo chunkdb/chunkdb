@@ -3321,8 +3321,8 @@ void TestAuthAndSetGet() {
     client.SendLine("HELLO 3");
     assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
 
-    assert(FailedLoginReply(client, kAdminUser, "bad") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
-    assert(FailedLoginReply(client, "nobody", kAdminPassword) == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
+    assert(FailedLoginReply(client, kAdminUser, "bad") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the user name and password your client sends, or reset the password with chunkdb_admin reset-password\r\n");
+    assert(FailedLoginReply(client, "nobody", kAdminPassword) == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the user name and password your client sends, or reset the password with chunkdb_admin reset-password\r\n");
 
     // HELLO has no TABLE option: statements name their table. The token
     // option is gone.
@@ -4244,7 +4244,7 @@ void TestQuitClosesConnection() {
     client.Hello();
 
     client.SendLine("QUIT");
-    assert(client.ReadLine() == "-ERR UNKNOWN_COMMAND reason=unknown_command column 1: unknown statement 'QUIT'\r\n");
+    assert(client.ReadLine() == "-ERR UNKNOWN_COMMAND reason=unknown_command column 1: unknown statement 'QUIT'; the CQL reference lists every statement\r\n");
     client.ShutdownWrite();
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
@@ -4715,7 +4715,7 @@ void TestLoginOverTls() {
     TlsClient client("127.0.0.1", harness.port);
     client.SendLine("HELLO 3");
     assert(client.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
-    assert(FailedLoginReply(client, kAdminUser, "wrong") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the username and password in your connection URI\r\n");
+    assert(FailedLoginReply(client, kAdminUser, "wrong") == "-ERR AUTH_FAILED reason=auth_failed invalid user or password; check the user name and password your client sends, or reset the password with chunkdb_admin reset-password\r\n");
     client.SendLine("PING");
     assert(client.ReadLine() == "-ERR PROTOCOL reason=protocol expected HELLO 3\r\n");
     TlsClient authed("127.0.0.1", harness.port);

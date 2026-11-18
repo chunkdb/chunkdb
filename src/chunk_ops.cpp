@@ -88,7 +88,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     const auto saved_pending_updates = chunk->pending_updates;
     const auto saved_wal_bytes = chunk->wal_bytes;
     const auto saved_pending_wal_flush_updates = chunk->pending_wal_flush_updates;
-    SnapshotGenerationWriteGuard snapshot_write(this);
+    SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
     std::filesystem::path rollback_intent_path;
     try {
         rollback_intent_path =

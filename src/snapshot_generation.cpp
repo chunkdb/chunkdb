@@ -76,10 +76,14 @@ struct SnapshotArtifactUnstable : std::runtime_error {
 };
 
 constexpr std::string_view kSnapshotLiveFile = "chunkdb.snapshot.live";
+constexpr std::string_view kSnapshotChangesFile = "chunkdb.snapshot.changes";
 constexpr std::string_view kSnapshotWriterFile = "snapshot.writer";
 constexpr std::string_view kSnapshotOwnerFile = "snapshot.owner";
 constexpr std::size_t kLiveRecordSize = 32;
 constexpr std::size_t kLiveCounterOffset = 24;
+constexpr std::size_t kCoordinateChangeCapacity = 4096U;
+constexpr std::size_t kCoordinateChangeBytes = 4U * sizeof(std::uint64_t);
+constexpr std::size_t kCoordinateChangesSize = kLiveRecordSize + kCoordinateChangeCapacity * kCoordinateChangeBytes;
 constexpr std::uint64_t kGenerationOdd = 1U;
 constexpr std::uint64_t kGenerationFailed = 2U;
 constexpr std::uint64_t kGenerationCountOne = 4U;
@@ -273,7 +277,8 @@ class SnapshotWriterLease {
 
 class MappedSnapshotCounter {
   public:
-    MappedSnapshotCounter(const std::filesystem::path& path, bool writable) {
+    MappedSnapshotCounter(const std::filesystem::path& path, bool writable, bool changes = false)
+        : mapped_size_(changes ? kCoordinateChangesSize : kLiveRecordSize) {
         RequireMappedAtomics();
         try {
 #ifdef _WIN32
@@ -285,26 +290,26 @@ class MappedSnapshotCounter {
             LARGE_INTEGER size{};
             if (!GetFileInformationByHandle(file_, &info) || !GetFileSizeEx(file_, &size) ||
                 (info.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) != 0U ||
-                size.QuadPart != static_cast<LONGLONG>(kLiveRecordSize))
+                size.QuadPart != static_cast<LONGLONG>(mapped_size_))
                 throw std::runtime_error("snapshot live metadata is malformed: " + path.string());
             mapping_ = CreateFileMappingW(file_, nullptr, writable ? PAGE_READWRITE : PAGE_READONLY, 0, 0, nullptr);
             if (!mapping_) throw SnapshotArtifactUnstable("cannot map snapshot live metadata: " + path.string());
-            bytes_ = static_cast<std::uint8_t*>(MapViewOfFile(mapping_, writable ? FILE_MAP_WRITE : FILE_MAP_READ, 0, 0, kLiveRecordSize));
+            bytes_ = static_cast<std::uint8_t*>(MapViewOfFile(mapping_, writable ? FILE_MAP_WRITE : FILE_MAP_READ, 0, 0, mapped_size_));
             if (!bytes_) throw SnapshotArtifactUnstable("cannot view snapshot live metadata: " + path.string());
 #else
             fd_ = ::open(path.c_str(), (writable ? O_RDWR : O_RDONLY) | O_NOFOLLOW | O_CLOEXEC | O_NONBLOCK);
             if (fd_ < 0) throw SnapshotArtifactUnstable("snapshot live mapping is unavailable: " + path.string());
             struct stat info{};
-            if (::fstat(fd_, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size != static_cast<off_t>(kLiveRecordSize))
+            if (::fstat(fd_, &info) != 0 || !S_ISREG(info.st_mode) || info.st_size != static_cast<off_t>(mapped_size_))
                 throw std::runtime_error("snapshot live metadata is malformed: " + path.string());
-            void* address = ::mmap(nullptr, kLiveRecordSize, PROT_READ | (writable ? PROT_WRITE : 0), MAP_SHARED, fd_, 0);
+            void* address = ::mmap(nullptr, mapped_size_, PROT_READ | (writable ? PROT_WRITE : 0), MAP_SHARED, fd_, 0);
             if (address == MAP_FAILED) throw SnapshotArtifactUnstable("cannot map snapshot live metadata: " + path.string());
             bytes_ = static_cast<std::uint8_t*>(address);
 #endif
             // The immutable header is checked separately from the changing
             // atomic word; applying a CRC to live counter bytes would race it.
             const std::vector<std::uint8_t> header(bytes_, bytes_ + kLiveCounterOffset);
-            if (header[0] != 'C' || header[1] != 'K' || header[2] != 'S' || header[3] != 'L' ||
+            if (header[0] != 'C' || header[1] != 'K' || header[2] != 'S' || header[3] != (changes ? 'C' : 'L') ||
                 ReadLe32(header, 4) != 1U || ReadLe32(header, 16) != Crc32(header.data(), 16) ||
                 ReadLe32(header, 20) != 0U) throw std::runtime_error("snapshot live metadata is malformed: " + path.string());
             session_ = ReadLe64(header, 8);
@@ -329,11 +334,47 @@ class MappedSnapshotCounter {
         // Acquiring preceding CAS updates chains concurrent/nested writers.
         return Counter().compare_exchange_strong(expected, desired, std::memory_order_seq_cst);
     }
+    void RecordCoordinates(std::span<const ChunkCoord> coordinates) {
+        std::lock_guard lock(changes_mutex_);
+        auto cursor = Counter().load(std::memory_order_relaxed);
+        const auto count = std::max<std::size_t>(coordinates.size(), 1U);
+        if (cursor >= std::numeric_limits<std::uint64_t>::max() - count)
+            throw std::overflow_error("snapshot coordinate change cursor exhausted");
+        for (std::size_t i = 0; i != count; ++i) {
+            const auto offset = kLiveRecordSize + (cursor % kCoordinateChangeCapacity) * kCoordinateChangeBytes;
+            const auto coord = coordinates.empty() ? ChunkCoord{} : coordinates[i];
+            Word(offset).store(std::bit_cast<std::uint64_t>(coord.x), std::memory_order_relaxed);
+            Word(offset + 8U).store(std::bit_cast<std::uint64_t>(coord.y), std::memory_order_relaxed);
+            Word(offset + 16U).store(std::bit_cast<std::uint64_t>(coord.z), std::memory_order_relaxed);
+            Word(offset + 24U).store(coordinates.empty() ? 0U : 1U, std::memory_order_relaxed);
+            ++cursor;
+        }
+        Counter().store(cursor, std::memory_order_release);
+    }
+    [[nodiscard]] SnapshotCoordinateChanges Changes(std::optional<std::uint64_t> after) const {
+        SnapshotCoordinateChanges result;
+        result.cursor = Counter().load(std::memory_order_acquire);
+        if (!after || *after > result.cursor || result.cursor - *after > kCoordinateChangeCapacity) return result;
+        result.coordinates.reserve(static_cast<std::size_t>(result.cursor - *after));
+        for (auto cursor = *after; cursor != result.cursor; ++cursor) {
+            const auto offset = kLiveRecordSize + (cursor % kCoordinateChangeCapacity) * kCoordinateChangeBytes;
+            if (Word(offset + 24U).load(std::memory_order_relaxed) != 1U) return result;
+            result.coordinates.push_back({
+                std::bit_cast<std::int64_t>(Word(offset).load(std::memory_order_relaxed)),
+                std::bit_cast<std::int64_t>(Word(offset + 8U).load(std::memory_order_relaxed)),
+                std::bit_cast<std::int64_t>(Word(offset + 16U).load(std::memory_order_relaxed))});
+        }
+        result.complete = true;
+        return result;
+    }
   private:
+    [[nodiscard]] std::atomic_ref<std::uint64_t> Word(std::size_t offset) const {
+        return std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(bytes_ + offset));
+    }
     [[nodiscard]] std::atomic_ref<std::uint64_t> Counter() const {
         // mmap/MapViewOfFile returns page-aligned storage; offset 24 is aligned
         // to 8. Read-only instances only call load, never an RMW operation.
-        return std::atomic_ref<std::uint64_t>(*reinterpret_cast<std::uint64_t*>(bytes_ + kLiveCounterOffset));
+        return Word(kLiveCounterOffset);
     }
     void Close() noexcept {
 #ifdef _WIN32
@@ -342,7 +383,7 @@ class MappedSnapshotCounter {
         if (file_ != INVALID_HANDLE_VALUE) (void)CloseHandle(file_);
         mapping_ = nullptr; file_ = INVALID_HANDLE_VALUE;
 #else
-        if (bytes_) (void)::munmap(bytes_, kLiveRecordSize);
+        if (bytes_) (void)::munmap(bytes_, mapped_size_);
         if (fd_ >= 0) (void)::close(fd_);
         fd_ = -1;
 #endif
@@ -356,6 +397,8 @@ class MappedSnapshotCounter {
 #endif
     std::uint8_t* bytes_ = nullptr;
     std::uint64_t session_ = 0;
+    std::size_t mapped_size_;
+    std::mutex changes_mutex_;
 };
 
 [[nodiscard]] SnapshotGenerationObservation ReadLiveSnapshotGeneration(
@@ -540,6 +583,7 @@ struct SnapshotGenerationMapping::Impl {
     SnapshotWriterLease owner;
     SnapshotWriterLease lease;
     std::unique_ptr<MappedSnapshotCounter> counter;
+    std::unique_ptr<MappedSnapshotCounter> changes;
 };
 
 SnapshotGenerationMapping::SnapshotGenerationMapping(const std::filesystem::path& directory)
@@ -558,6 +602,15 @@ void SnapshotGenerationMapping::Initialize(std::uint64_t session) {
     AtomicWrite(path, record, /*fsync_file=*/false, /*fsync_directory=*/false,
         nullptr, nullptr, /*enable_generic_failpoints=*/false);
     impl_->counter = std::make_unique<MappedSnapshotCounter>(path, true);
+    record[3] = 'C';
+    const auto checksum = Crc32(record.data(), 16U);
+    for (std::size_t i = 0; i != 4U; ++i) record[16U + i] = static_cast<std::uint8_t>(checksum >> (i * 8U));
+    std::fill(record.begin() + kLiveCounterOffset, record.end(), 0U);
+    record.resize(kCoordinateChangesSize, 0U);
+    const auto changes_path = impl_->directory / kSnapshotChangesFile;
+    CleanupAtomicTmpArtifacts(changes_path);
+    AtomicWrite(changes_path, record, false, false, nullptr, nullptr, false);
+    impl_->changes = std::make_unique<MappedSnapshotCounter>(changes_path, true, true);
 }
 
 std::uint64_t SnapshotGenerationMapping::Load() const { return impl_->counter->Load(); }
@@ -569,6 +622,22 @@ bool SnapshotGenerationMapping::IsFailed() const {
 
 bool SnapshotGenerationMapping::CompareExchange(std::uint64_t& expected, std::uint64_t desired) {
     return impl_->counter->CompareExchange(expected, desired);
+}
+
+void SnapshotGenerationMapping::RecordCoordinates(std::span<const ChunkCoord> coordinates) {
+    impl_->changes->RecordCoordinates(coordinates);
+}
+
+SnapshotCoordinateChanges ReadSnapshotCoordinateChanges(const std::filesystem::path& directory,
+    const SnapshotGenerationObservation& generation, std::optional<std::uint64_t> after) {
+    // Closed sessions and older writers have no live change history. A new
+    // writer's atomic replacement is rejected by the enclosing generation.
+    if ((generation.first & 1U) == 0U) return {};
+    const auto path = directory / kSnapshotChangesFile;
+    if (!std::filesystem::exists(path)) return {};
+    MappedSnapshotCounter changes(path, false, true);
+    if (changes.Session() != generation.first) return {};
+    return changes.Changes(after);
 }
 
 SnapshotGenerationObservation ReadSnapshotGenerationForScan(
@@ -695,7 +764,7 @@ bool TryParseSnapshotGenerationRecord(
 }
 
 ChunkStore::SnapshotGenerationWriteGuard::SnapshotGenerationWriteGuard(
-    ChunkStore* store)
+    ChunkStore* store, std::span<const ChunkCoord> coordinates)
     : store_(store),
       nested_on_same_thread_(
           std::find(
@@ -705,6 +774,14 @@ ChunkStore::SnapshotGenerationWriteGuard::SnapshotGenerationWriteGuard(
     g_snapshot_write_stack.push_back(store_);
     try {
         store_->BeginSnapshotGenerationWrite();
+        try {
+            store_->snapshot_generation_mapping_->RecordCoordinates(coordinates);
+        } catch (...) {
+            // No artifact was touched by this guard. Balance its acquired
+            // writer count without claiming a successful publication.
+            store_->AbandonSnapshotGenerationWrite(true);
+            throw;
+        }
     } catch (...) {
         g_snapshot_write_stack.pop_back();
         throw;

@@ -404,10 +404,16 @@ class CommandEngine {
         SessionState& session,
         std::string_view line,
         std::span<const std::optional<std::string>> parameters);
+    // What the audit log says of a login AUTH refuses, as of AUTH.
+    struct AuthAudit {
+        bool known_user = false;
+        bool unbound_refused = false;
+    };
     [[nodiscard]] std::string HandleAuth(
         SessionState& session,
         std::string_view line,
-        std::span<const std::optional<std::string>> parameters);
+        std::span<const std::optional<std::string>> parameters,
+        AuthAudit& audit);
     // The HELLO map that ends a login; `server_signature` is the SCRAM
     // server-final message, empty without a user.
     [[nodiscard]] std::string HelloReply(const SessionState& session, std::string_view server_signature) const;

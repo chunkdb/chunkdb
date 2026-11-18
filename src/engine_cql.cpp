@@ -257,7 +257,9 @@ std::size_t ValueReplyBytes(const ColumnValue& value) {
 
 void RequireDimensions(const Geometry& geometry, std::uint8_t dims) {
     if (geometry.dims() != dims)
-        throw std::invalid_argument("coordinate dimensions differ from the table");
+        throw std::invalid_argument("coordinate dimensions differ from the table: the table has " +
+                                    std::to_string(geometry.dims()) + " and the statement " + std::to_string(dims) +
+                                    "; give one coordinate per table dimension (DESCRIBE shows dims)");
 }
 
 ChunkCoord BlockCoord(const Geometry& geometry, std::int64_t x, std::int64_t y, std::int64_t z) {

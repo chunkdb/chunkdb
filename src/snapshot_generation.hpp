@@ -6,6 +6,7 @@
 #include <functional>
 #include <memory>
 #include <optional>
+#include <span>
 #include <utility>
 #include <vector>
 
@@ -25,10 +26,25 @@ class SnapshotGenerationMapping {
     [[nodiscard]] std::uint64_t Load() const;
     [[nodiscard]] bool IsFailed() const;
     bool CompareExchange(std::uint64_t& expected, std::uint64_t desired);
+    // Called inside the odd publication bracket, before changing artifacts.
+    // An empty span invalidates incremental readers (for table-wide changes).
+    void RecordCoordinates(std::span<const ChunkCoord> coordinates);
   private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
+
+struct SnapshotCoordinateChanges {
+    std::uint64_t cursor = 0U;
+    bool complete = false;
+    std::vector<ChunkCoord> coordinates;
+};
+
+// The caller brackets this observation and its artifact reads with the same
+// equal-even generation. Missing history requires full artifact admission.
+[[nodiscard]] SnapshotCoordinateChanges ReadSnapshotCoordinateChanges(
+    const std::filesystem::path& directory, const SnapshotGenerationObservation& generation,
+    std::optional<std::uint64_t> after);
 
 // `record_required`: the store saw a generation record when it opened. A
 // writer never removes it, so its absence then means the store directory was

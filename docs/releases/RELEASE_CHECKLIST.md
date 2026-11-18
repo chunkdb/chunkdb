@@ -84,9 +84,10 @@ Build success alone does not establish archive compatibility.
 
 - [ ] Source/runtime version and the intended `v*` tag agree before tagging; check the CMake project version before the 2.0 release.
 - [ ] The Docker quick-start PR job passes the commands extracted from `docs/QUICK_START.md`.
-- [ ] After all binary builds pass, the release workflow publishes `ghcr.io/chunkdb/chunkdb:<version>` (the tag without `v`) and `:latest` using `GITHUB_TOKEN` with job-scoped `packages: write`.
-- [ ] Both tags contain `linux/amd64` and `linux/arm64`; check with `docker buildx imagetools inspect ghcr.io/chunkdb/chunkdb:2.0.0`.
-- [ ] On the first publication, set the GHCR package visibility to public and verify an anonymous pull of the version tag.
+- [ ] After all binary builds pass, the release workflow publishes `ghcr.io/chunkdb/chunkdb:<version>` (the tag without `v`) using `GITHUB_TOKEN` with job-scoped `packages: write`, runs `docs/QUICK_START.md` against it on a fresh runner, and only then points `:<major>` and `:latest` at it and creates the GitHub release.
+- [ ] If the quick-start job fails, `:<major>`, `:latest` and the GitHub release stay unchanged; fix the cause and re-run the failed jobs.
+- [ ] All three tags contain `linux/amd64` and `linux/arm64`; check with `docker buildx imagetools inspect ghcr.io/chunkdb/chunkdb:2.0.0`.
+- [ ] On the first publication, set the GHCR package visibility to public and verify an anonymous pull of the version tag; the quick-start job pulls without logging in, so re-run it after the change.
 - [ ] Pull the published version and run the quick-start checker with the matching CLI; check health, generated login, reads and offline password reset.
 
 The tag workflow publishes images only for a pushed `v*` tag. Local image builds and PR checks do not publish to GHCR.

@@ -1751,7 +1751,7 @@ std::shared_ptr<Table> TableCatalog::Create(
                                                            Geometry(geometry, table_schema);
     RequireValidTableOptions(options);
     if (existing != nullptr) {
-        throw TableExistsError("table '" + table_name + "' already exists");
+        throw TableExistsError("table '" + table_name + "' already exists; use another name, CREATE TABLE IF NOT EXISTS, or DROP TABLE " + table_name + " first");
     }
     const auto target = TablesDir() / table_name;
     // Made now, so that neither serving the table nor fencing it after a

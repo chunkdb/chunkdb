@@ -147,6 +147,7 @@ Every other statement answers `INVALID_ARGUMENT reason=invalid_argument <stateme
 Reads see what the writer has put in its files; a relaxed table can keep the latest changes in the writer's memory until FLUSH WAL.
 A chunk read by GET BLOCK or GET CHUNK stays in memory, within `--max-loaded-chunks`, and is read from the files again only after the writer changed its table.
 GET AREA and SCAN CHUNKS use chunks in memory and read others from the files without keeping them.
+To find a table's chunks after the writer changed it, they read only the chunks the writer changed; after a writer restart or COMPACT TOMBSTONES, or when the writer wrote chunk files more than 4096 times since their last read, they read every chunk of the table once.
 Each change the writer makes to a table makes the next read of every chunk of that table load it again.
 That load waits for a moment when the writer is not updating the table's files, for at most about 250 ms, and returns an error if there is none; a writer that changes a table without pause can make its reads fail.
 The tables, columns and users are the ones that exist at startup.

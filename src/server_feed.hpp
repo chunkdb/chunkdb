@@ -95,6 +95,7 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
         std::array<char, 4096> input{};
         bool unwatch = false, return_ready = false, close = false, dead = false, read_paused = false;
         bool close_immediate = false;
+        bool closing = false; // Wait for the slot worker to release its claim before closing the socket.
         bool right_lost = false;
         std::size_t share = 0U, buffer_bytes = 0U;
         std::chrono::steady_clock::time_point next_progress{};
@@ -113,7 +114,10 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
     void Advance(Watch& watch, std::size_t bytes);
     void Queue(Watch& watch, std::shared_ptr<const std::string> bytes, std::optional<std::uint64_t> revision = {}, bool charged = false, bool excess = false);
     void ReleaseOutput(Watch& watch, const std::shared_ptr<SlotWatch>& slot);
-    // Marks a watch dead when its excess-pool output made no write progress for the client I/O timeout.
+    // Request cleanup without blocking I/O; ready only after the slot claim is released.
+    bool ReadyToEnd(Watch& watch);
+    // Marks a watch dead when its excess-pool output made no write progress for the client I/O timeout;
+    // never while a closing watch waits for the worker.
     bool ExpireStalledWrite(Watch& watch, std::chrono::steady_clock::time_point now);
     void Reject(Watch& watch, std::string message);
     // Whether the user still has READ on the watched table: one atomic load

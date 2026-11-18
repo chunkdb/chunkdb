@@ -165,7 +165,65 @@ struct AckDeadlineIoTestAccess {
         assert(watch.output.empty() && watch.excess_frames == 0U);
         assert(SlotAckDeadlineTestAccess::Excess(*state) == 0U && SlotAckDeadlineTestAccess::Charged(*state) == 0U);
     }
+    // A closing watch writes nothing while the worker releases its slot, so
+    // its output deadline waits; a lost right leaves no excess frames behind.
+    static void ClosingOutputDeadline(ChunkServer& server, const std::filesystem::path& users_dir, std::chrono::milliseconds timeout) {
+        FeedIo io(server);
+        const auto excess = std::make_shared<const std::string>("excess");
+        FeedIo::Watch closing;
+        closing.connection = std::make_shared<ServerConnection>();
+        io.Queue(closing, excess, {}, false, true);
+        const auto progress = closing.excess_progress;
+        closing.closing = true;
+        assert(!io.ExpireStalledWrite(closing, progress + 2 * timeout) && !closing.dead);
+        closing.closing = false; // The worker finished: the deadline applies again.
+        assert(io.ExpireStalledWrite(closing, progress + timeout) && closing.dead);
+        const auto users = test::MakeUsers(users_dir, "admin", "secret");
+        FeedIo::Watch lost;
+        lost.connection = std::make_shared<ServerConnection>();
+        // An unknown user at a later generation: the next check finds the right gone.
+        lost.connection->session.watch_right = std::make_shared<ReadRightCheck>(users, "reader", 0U, "t", users->Generation() + 1U);
+        io.Queue(lost, excess, {}, false, true);
+        assert(!io.Permitted(lost) && lost.close_immediate && lost.output.size() == 1U && lost.excess_frames == 0U);
+        // Only the reply remains, however long the worker takes to finish.
+        assert(!io.ExpireStalledWrite(lost, lost.excess_progress + 2 * timeout) && !lost.dead);
+    }
 };
+// The peer must have stopped reading. A fixed send buffer turns off
+// autotuning, and filler bytes fill it, so the next write blocks on every
+// host. The filler corrupts the stream; the peer never reads it again.
+std::size_t FeedDeliveryTestAccess::FillPeerSendQueue(ChunkServer& server, std::uint16_t peer_port) {
+    std::lock_guard lock(server.active_clients_mutex_);
+    for (const auto client : server.active_clients_) {
+        const auto socket = static_cast<slot_socket_test::Socket>(client);
+        sockaddr_in peer{};
+#ifdef _WIN32
+        int length = sizeof(peer);
+#else
+        socklen_t length = sizeof(peer);
+#endif
+        if (getpeername(socket, reinterpret_cast<sockaddr*>(&peer), &length) != 0 || ntohs(peer.sin_port) != peer_port) continue;
+        const int buffer = 65536;
+        if (setsockopt(socket, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<const char*>(&buffer), sizeof(buffer)) != 0)
+            throw std::runtime_error("send buffer of the feed socket was not set");
+        // Feed sockets are nonblocking; a provider may take one send larger than its buffer.
+        const std::string filler(1024U * 1024U, 'x');
+        std::size_t filled = 0U;
+        while (filled < 64U * filler.size()) {
+            const auto sent = send(socket, filler.data(), static_cast<int>(filler.size()), 0);
+            if (sent > 0) { filled += static_cast<std::size_t>(sent); continue; }
+            const auto code = server_detail::CurrentSocketErrorCode();
+            if (sent < 0 && server_detail::IsSocketInterruptedError(code)) continue;
+            if (sent < 0 && slot_socket_test::WouldBlock(code)) {
+                std::cout << "feed send queue filled: bytes=" << filled << std::endl;
+                return filled;
+            }
+            throw std::runtime_error("filling the feed send queue failed");
+        }
+        throw std::runtime_error("feed send queue did not fill");
+    }
+    throw std::runtime_error("no server socket for the client port");
+}
 }
 
 namespace {
@@ -633,6 +691,178 @@ void WatchRevoke(bool tls) {
     Error(slot.Read(), "NO_TABLE"); Closed(slot);
 }
 
+// Hold the only catch-up worker before cleanup, then hold it again after
+// cleanup. Socket close and immediate reattach must fall between those cuts.
+class ReconnectSchedule : public FeedDeliveryTestHook {
+  public:
+    explicit ReconnectSchedule(bool pause_admission, bool pause_cancel, std::size_t minimum = 0U)
+        : pause_admission_(pause_admission), pause_cancel_(pause_cancel), minimum_(minimum) {}
+    void Run(Point point, std::size_t bytes) override {
+        std::unique_lock lock(mutex_);
+        if (point == Point::kAfterAdmission && pause_admission_ && bytes >= minimum_ && !admitted_) {
+            admitted_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return admission_released_; });
+        } else if (point == Point::kAfterPartialFeedWrite || point == Point::kAfterBlockedFeedWrite) {
+            stalled_ = true;
+        } else if (point == Point::kAfterSlotCancel) {
+            cancelled_ = true; stalled_before_cancel_ = stalled_; changed_.notify_all();
+        } else if (point == Point::kBeforeIoScan && pause_cancel_ && cancelled_ && !scanned_) {
+            // Cancel's wake follows the scan that decided to close. With the
+            // worker held, the next scan observes whether that socket closed.
+            scanned_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return io_released_; });
+        } else if (point == Point::kBeforeIoPoll && scanned_ && !polled_) {
+            polled_ = true; polled_sockets_ = bytes; changed_.notify_all();
+        } else if (point == Point::kAfterSlotFinish && !finished_) {
+            finished_ = true; changed_.notify_all();
+            changed_.wait(lock, [&] { return finish_released_; });
+        } else if (point == Point::kAfterSlotSocketClose && !closed_) {
+            closed_ = true; closed_before_finish_ = !finished_; changed_.notify_all();
+        }
+    }
+    void WaitAdmission() { Wait(admitted_, "slot admission"); }
+    void WaitFinish() { Wait(finished_, "slot cleanup"); }
+    void WaitDeferredClose() {
+        Wait(scanned_, "scan after slot cancellation");
+        std::lock_guard lock(mutex_);
+        if (closed_) throw std::runtime_error("slot socket closed before the held catch-up worker released its claim");
+    }
+    // The scan after cancellation polls only these watch sockets.
+    void RequirePolled(std::size_t sockets) {
+        Wait(polled_, "poll after slot cancellation");
+        std::lock_guard lock(mutex_);
+        if (polled_sockets_ != sockets)
+            throw std::runtime_error("feed I/O polled " + std::to_string(polled_sockets_) + " watch sockets, expected " + std::to_string(sockets));
+    }
+    // The output deadline cancels a watch only after its write stalled.
+    void RequireStallBeforeCancel() {
+        std::lock_guard lock(mutex_);
+        if (!stalled_before_cancel_) throw std::runtime_error("slot cancelled before its output stalled");
+    }
+    void WaitClose() {
+        Wait(closed_, "slot socket close");
+        std::lock_guard lock(mutex_);
+        if (closed_before_finish_) throw std::runtime_error("slot socket closed before slot cleanup");
+    }
+    void ReleaseAdmission() { std::lock_guard lock(mutex_); admission_released_ = true; changed_.notify_all(); }
+    void ReleaseIo() { std::lock_guard lock(mutex_); io_released_ = true; changed_.notify_all(); }
+    void Release() {
+        std::lock_guard lock(mutex_);
+        admission_released_ = io_released_ = finish_released_ = true;
+        changed_.notify_all();
+    }
+  private:
+    void Wait(const bool& flag, const char* name) {
+        test::FeedPhaseWatchdog::Phase(name);
+        std::unique_lock lock(mutex_);
+        if (!changed_.wait_for(lock, 10s, [&] { return flag; }))
+            throw std::runtime_error(std::string("did not reach ") + name);
+    }
+    const bool pause_admission_, pause_cancel_;
+    const std::size_t minimum_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool admitted_ = false, cancelled_ = false, scanned_ = false, finished_ = false, closed_ = false;
+    bool admission_released_ = false, io_released_ = false, finish_released_ = false, closed_before_finish_ = false;
+    bool stalled_ = false, stalled_before_cancel_ = false, polled_ = false;
+    std::size_t polled_sockets_ = 0U;
+};
+
+void ReconnectAfterRevoke(bool tls) {
+    ReconnectSchedule schedule(true, true);
+    Harness harness(tls, true);
+    auto admin = harness.Connect(); Create(*admin, " OWNER reader");
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = scram::FormatVerifier(test::PrepareLoginVerifier("pw", salt, scram::kMinIterations));
+    admin->Ok("CREATE USER reader VERIFIER '" + verifier + "'");
+    admin->Ok("GRANT READ ON t TO reader");
+    Client watch(harness.port, tls); watch.Login("reader", "pw");
+    const auto initial = Start(watch.Command("WATCH t SLOT 'consumer'"));
+    auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t AREA 100 100 TO 100 100"));
+    auto replacement = harness.Connect();
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &schedule);
+    Cleanup clear([&] { schedule.Release(); FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    const auto revision = Set(*admin, 7);
+    schedule.WaitAdmission();
+    FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    assert(Change(NextChange(watch)) == revision);
+    admin->Ok("REVOKE READ ON t FROM reader");
+    schedule.WaitDeferredClose();
+    if (watch.Ready(0ms)) throw std::runtime_error("slot terminal reply arrived before claim cleanup");
+    schedule.ReleaseIo(); FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    // A closing socket waits for the worker's wake; polling it could only spin.
+    schedule.RequirePolled(1U);
+    Unwatch(*ordinary); // Other feed connections run while the slot worker is held.
+    schedule.ReleaseAdmission(); schedule.WaitFinish();
+    // The held worker has not sent its completion wake yet; wake I/O here.
+    FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    Error(watch.Read(), "NO_TABLE");
+    // No takeover, retries or worker progress: cleanup still holds the worker.
+    assert(Start(replacement->Command("WATCH t SLOT 'consumer'")) == initial);
+    schedule.WaitClose(); Closed(watch);
+    schedule.Release();
+    assert(Change(NextChange(*replacement)) == revision);
+    Unwatch(*replacement);
+}
+
+void ReconnectAfterAckTimeout(bool tls) {
+    ReconnectSchedule schedule(false, false);
+    Harness harness(tls);
+    auto writer = harness.Connect(); Create(*writer);
+    auto watch = harness.Connect();
+    const auto initial = Start(watch->Command("WATCH t SLOT 'consumer' ACK TIMEOUT 50"));
+    auto replacement = harness.Connect();
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &schedule);
+    Cleanup clear([&] { schedule.Release(); FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    const auto revision = Set(*writer, 7);
+    assert(Change(NextChange(*watch)) == revision);
+    schedule.WaitFinish(); // ACK timeout already releases its claim before the terminal frame.
+    FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    const auto error = watch->Read(); Error(error, "TIMEOUT");
+    assert(error.value.find("reason=ack_timeout") != std::string::npos);
+    assert(Start(replacement->Command("WATCH t SLOT 'consumer'")) == initial);
+    schedule.WaitClose(); Closed(*watch);
+    schedule.Release();
+    assert(Change(NextChange(*replacement)) == revision);
+    Unwatch(*replacement);
+}
+
+void ReconnectAfterWriteDeadline(bool tls) {
+    ReconnectSchedule schedule(true, true, 1024U * 1024U);
+    constexpr std::size_t budget = 4U * 1024U * 1024U;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, budget, {}, 60000ms, 200ms);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label bytes(2097152)) CHUNK 4 x 4");
+    writer->Ok("ALTER TABLE t SET var_max_chunk_bytes = 16777216");
+    writer->Ok("CREATE SLOT 'consumer' ON t");
+    auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t AREA 100 100 TO 100 100"));
+    auto watch = harness.Connect(); watch->SetReceiveBuffer(4096);
+    const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
+    auto replacement = harness.Connect();
+    const auto first = Set(*writer, 1); assert(Change(NextChange(*watch)) == first);
+    // The client stops reading. Its full send queue blocks the next frame on
+    // every host, whatever loopback buffering would otherwise absorb.
+    (void)FeedDeliveryTestAccess::FillPeerSendQueue(harness.server(), watch->LocalPort());
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &schedule);
+    Cleanup clear([&] { schedule.Release(); FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    // This frame exceeds the watch's share; only the excess-output deadline
+    // can cancel its blocked write.
+    const std::string payload(2U * 1024U * 1024U, 'x');
+    writer->Line("SET BLOCK 0 0 IN t label = $1");
+    writer->Send("$" + std::to_string(payload.size()) + "\r\n" + payload + "\r\n");
+    (void)Number(writer->Read());
+    schedule.WaitAdmission(); FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    schedule.WaitDeferredClose();
+    schedule.RequireStallBeforeCancel();
+    schedule.ReleaseAdmission(); schedule.WaitFinish();
+    schedule.ReleaseIo(); FeedDeliveryTestAccess::SetHook(harness.server(), &schedule);
+    schedule.WaitClose(); // The close hook observes the actual socket close, even with a partial frame.
+    assert(Start(replacement->Command("WATCH t SLOT 'consumer'")) == initial);
+    schedule.Release();
+    assert(Change(NextChange(*replacement)) == first);
+    replacement->Close(); watch->Close(); Unwatch(*ordinary);
+}
+
 // Watches of a three-dimensional table, of chunk metadata and of chunk forms
 // end with the same NO_TABLE when their user loses READ, before a later push.
 void WatchRevokeDimensional(bool tls) {
@@ -792,14 +1022,14 @@ void SlotOwners(bool tls) {
     Client created(harness.port, tls); created.Login("reader", "pw");
     assert(Start(created.Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(created);
     // ADMIN on * attaches to another user's slot, and the watch needs that
-    // right as long as it lasts; READ on t remains. This comes last: its
-    // connection closes before the catch-up worker finishes the watch and
-    // frees the slot, so an attach right after it can still be SLOT_BUSY.
+    // right as long as it lasts; READ on t remains. Closure releases the slot
+    // before another authorized user attaches to it.
     admin->Ok("GRANT ADMIN ON * TO other");
     assert(Start(later.Command("WATCH t SLOT 'consumer'")).second == first);
     assert(Change(NextChange(later)) == second);
     admin->Ok("REVOKE ADMIN ON * FROM other");
     Error(later.Read(), "NO_TABLE"); Closed(later);
+    assert(Start(any->Command("WATCH t SLOT 'consumer'")).second == first); Unwatch(*any);
 }
 
 // A slot without a recorded owner, as CREATE SLOT makes without authentication,
@@ -1666,6 +1896,12 @@ void ExcessStalledHolder(bool tls) {
     }
     assert(SlotAckDeadlineTestAccess::Charged(*holder) == 0U && SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
 }
+void ClosingOutputDeadline(bool tls) {
+    if (tls) return; // Independent of the transport: runs once, with the plain groups.
+    constexpr auto timeout = 3000ms;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, {}, 60000ms, timeout);
+    AckDeadlineIoTestAccess::ClosingOutputDeadline(harness.server(), harness.directory.path() / "users", timeout);
+}
 void TlsWriteCap(bool tls) {
 #ifdef CHUNKDB_WITH_OPENSSL
     if (!tls) return; // Independent of the transport: runs once, with the TLS groups.
@@ -2460,6 +2696,7 @@ int main(int argc, char** argv) {
             run("filtered-archive-chunks", FilteredArchiveChunks);
             run("excess-pool-bound", ExcessPoolBound); run("excess-pool-receipts", ExcessPoolReceipts);
             run("excess-stalled-holder", ExcessStalledHolder); run("TLS-write-cap", TlsWriteCap);
+            run("closing-output-deadline", ClosingOutputDeadline);
             run("excess-pool-FIFO", ExcessPoolFifo); run("excess-pool-control", ExcessPoolControlFrames);
             run("excess-pool-leave", ExcessPoolLeave);
         }
@@ -2477,6 +2714,7 @@ int main(int argc, char** argv) {
         run("takeover-fence", TakeoverFence); run("takeover", Takeover); run("takeover-rights", TakeoverRights); run("takeover-UNWATCH-return", TakeoverUnwatchReturn); run("takeover-stalled-socket", TakeoverStalledSocket);
         run("takeover-cancellation", TakeoverCancellation);
         run("lifecycle", Lifecycle); run("rights", Rights); run("watch-revoke", WatchRevoke); run("watch-revoke-dimensional", WatchRevokeDimensional); run("watch-ACK-revoke", WatchAckRevoke); run("watch-dropped-user", WatchDroppedUser); run("slot-owners", SlotOwners); run("first-attach-owner", FirstAttachOwner); run("archive-handover", ArchiveHandover);
+        run("reconnect-revoke", ReconnectAfterRevoke); run("reconnect-ACK-timeout", ReconnectAfterAckTimeout); run("reconnect-write-deadline", ReconnectAfterWriteDeadline);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);

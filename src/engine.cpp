@@ -352,9 +352,9 @@ std::string CommandEngine::Execute(
         // The user a login names, for the audit log: from HELLO 3 USER, or
         // the pending login AUTH finishes.
         std::string audit_user;
-        // The login AUTH finishes; its flags are read once AUTH has run,
-        // since AUTH sets them from the user as it is then.
-        std::shared_ptr<const PendingLogin> audit_login;
+        // The flags of the login AUTH finishes, which AUTH sets from the
+        // user as it is then; a HELLO leaves them unset.
+        AuthAudit auth_audit;
         const bool was_greeted = session.greeted;
         if (config_.audit != nullptr) {
             if (hello) {
@@ -362,13 +362,12 @@ std::string CommandEngine::Execute(
                 if (tokens.size() == 5U && Protocol::CommandEquals(tokens[2], "USER")) audit_user = tokens[3];
             } else if (session.pending_login != nullptr) {
                 audit_user = session.pending_login->user;
-                audit_login = session.pending_login;
             }
         }
         std::string response;
         bool count_failure = true;
         try {
-            response = hello ? HandleHello(session, line, parameters) : HandleAuth(session, line, parameters);
+            response = hello ? HandleHello(session, line, parameters) : HandleAuth(session, line, parameters, auth_audit);
         } catch (const cql::DuplicateHelloOptionError& e) {
             response = ErrorReply(e);
             session.pending_login.reset();
@@ -388,10 +387,8 @@ std::string CommandEngine::Execute(
             const bool succeeded = session.greeted;
             // A +SCRAM reply only continues the login.
             if (succeeded || (!response.empty() && response[0] == '-')) {
-                const bool known_user = audit_login != nullptr && audit_login->known;
-                const bool unbound_refused = audit_login != nullptr && audit_login->unbound_refused;
                 AuditLogin(session, succeeded ? std::string_view(session.user) : std::string_view(audit_user),
-                           known_user, unbound_refused, succeeded, response);
+                           auth_audit.known_user, auth_audit.unbound_refused, succeeded, response);
             }
         }
         // Login/grammar failures count toward max_auth_failures (AUTH_FAILED
@@ -750,7 +747,7 @@ std::string CommandEngine::RecordAuthFailure(SessionState& session, std::string_
             "client and the server ends TLS",
             {{"reason", "channel_binding"}});
     }
-    return Protocol::Error("AUTH_FAILED", "invalid user or password; check the username and password in your connection URI");
+    return Protocol::Error("AUTH_FAILED", "invalid user or password; check the user name and password your client sends, or reset the password with chunkdb_admin reset-password");
 }
 
 CommandEngine::PayloadRequest CommandEngine::PlanPayload(
@@ -944,7 +941,7 @@ std::string CommandEngine::HandleHello(
     if (session.connection_id == 0U) session.connection_id = NewConnectionId();
     if (!hello.user) {
         if (config_.require_auth) {
-            return Protocol::Error("AUTH_REQUIRED", "use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message; set the username and password in your client connection URI");
+            return Protocol::Error("AUTH_REQUIRED", "log in with a user name and password: name the user in the URI, such as chunk://admin@host:4242/, and give the client the password (clients use HELLO 3 USER <name> $1 with a SCRAM-SHA-256 client-first message)");
         }
         RecordAuthSuccess(session, {});
         session.hello_options = std::move(options);
@@ -989,13 +986,15 @@ std::string CommandEngine::HandleHello(
 std::string CommandEngine::HandleAuth(
     SessionState& session,
     std::string_view line,
-    std::span<const std::optional<std::string>> parameters) {
+    std::span<const std::optional<std::string>> parameters,
+    AuthAudit& audit) {
     const auto tokens = ParseVarTokens(line);
     const auto pending = std::move(session.pending_login);
     if (pending == nullptr) {
         session.close_after_reply = true;
         return Protocol::Error("PROTOCOL", "AUTH follows HELLO 3 USER <name> $1");
     }
+    audit = {.known_user = pending->known, .unbound_refused = pending->unbound_refused};
     if (tokens.size() != 2 || tokens[1] != "$1" || parameters.size() != 1U || !parameters[0].has_value()) {
         throw std::invalid_argument("AUTH is AUTH $1 with the SCRAM client-final message");
     }
@@ -1025,8 +1024,8 @@ std::string CommandEngine::HandleAuth(
         current->user.verifier != pending->exchange.UserVerifier() ||
         (!pending->bound && current->user.requires_channel_binding)) {
         // The audit log gives the reason as of now too, as HELLO would.
-        pending->known = current.has_value();
-        pending->unbound_refused = current.has_value() && !pending->bound && current->user.requires_channel_binding;
+        audit.known_user = current.has_value();
+        audit.unbound_refused = current.has_value() && !pending->bound && current->user.requires_channel_binding;
         return RecordAuthFailure(session, pending->user);
     }
     // A right proof whose credentials changed in another way since HELLO,

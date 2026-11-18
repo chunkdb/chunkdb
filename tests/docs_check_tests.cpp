@@ -273,7 +273,8 @@ std::string Pages(const fs::path& source) {
 
 void ExactPageCommands(const fs::path& source) {
     const auto blocks = ExtractQuickStart(Pages(source));
-    assert(blocks.size() == 9);
+    assert(blocks.size() == 10);
+    assert(blocks.at("install").rfind("go install github.com/chunkdb/chunk-cli/v2/cmd/chunk-cli@latest\n", 0) == 0);
     assert(blocks.at("write").find("CREATE TABLE world") != std::string::npos);
     assert(blocks.at("reset").find("reset-password admin --password-file /dev/stdin") != std::string::npos);
     assert(blocks.at("write").rfind("chunk-cli --uri \"$CHUNKDB_URI\" shell <<'CQL'\n", 0) == 0);

@@ -252,6 +252,7 @@ Block projections preserve all metadata columns; empty metadata domains emit no 
 Tag and txn are null until their metadata is present.
 
 A slot permits one watch at a time; a competing watch receives SLOT_BUSY and a lost slot receives SLOT_LOST.
+The slot claim is released before the terminal reply or connection closure for lost access, an ACK timeout, or an output deadline, so a new WATCH can claim it immediately.
 A slot belongs to its owner; another user needs ADMIN on `*` to watch it, see [feed statements](reference/FEED.md#arguments).
 
 DROP TABLE ends watches with NO_TABLE; a fenced or recovered table ends them with INTERNAL, and a new WATCH resumes; watches have no idle timeout.

@@ -28,12 +28,16 @@ struct FeedDeliveryTestHook {
         kAfterStatementQueued, kAfterFeedReplyQueue, kFeedInputBackpressure, kAfterRunningStopPublication,
         kBeforeReplyBufferWrite, kAfterReplyBufferWrite, kAfterBlockedReplyWrite, kAfterAuthReplyScheduled,
         kAfterPayloadCreditQueued, kAfterPayloadCreditGranted, kAfterStatementTrackerScan,
-        kBeforeBufferedStatementPublication, kBeforeTakeoverReservation, kBeforeWorkerIdleWait, kBeforeWorkerReceive };
+        kBeforeBufferedStatementPublication, kBeforeTakeoverReservation, kBeforeWorkerIdleWait, kBeforeWorkerReceive,
+        kAfterSlotCancel, kAfterSlotSocketClose,
+        kBeforeIoPoll }; // kBeforeIoPoll passes the number of watch sockets polled.
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
 };
 struct FeedDeliveryTestAccess {
     static std::size_t FillActiveClientSendQueue(ChunkServer& server, int bytes);
+    // Fill the send queue of the server socket whose peer uses `peer_port`, so its next write blocks.
+    static std::size_t FillPeerSendQueue(ChunkServer& server, std::uint16_t peer_port);
     static void SetHook(ChunkServer& server, FeedDeliveryTestHook* hook);
     // Observe existing scheduling without adding a wake before shutdown.
     static void SetObserverHook(ChunkServer& server, FeedDeliveryTestHook* hook);
