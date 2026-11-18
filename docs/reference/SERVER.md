@@ -78,7 +78,8 @@ A backup has one cut per table, rather than a shared cross-table snapshot.
 It includes users and rights, so protect it as sensitive data.
 RESTORE TABLE never replaces a table; use SWAP TABLES from [Tables](TABLES.md) to put the restored table under the live name.
 CANCEL, KILL CONNECTION or a statement timeout stops RESTORE TABLE only before it publishes the table, and nothing is restored.
-While RESTORE TABLE runs, SHOW CONNECTIONS shows its `progress`: `files_done` of `files_total` and `bytes_done` of `bytes_total` copied; after the copy it stays at the totals while the table is checked and published.
+While RESTORE TABLE copies the backup, SHOW CONNECTIONS shows its `progress`: `files_done` of `files_total` and `bytes_done` of `bytes_total` copied; after the copy it stays at the totals while the table is checked and published.
+`progress` is null while the restore checks the backup before the copy and once the statement completes, also after a failure.
 
 When both revision bookkeeping records are missing, a writer refuses directories with chunk artifacts, a capped startup inventory, or an unavailable inventory.
 Restore a consistent backup or reinitialize the whole store; a refused writer does not publish replacement revision records.

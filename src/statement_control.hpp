@@ -45,7 +45,7 @@ class StatementControl {
     [[nodiscard]] std::optional<Clock::time_point> deadline() const noexcept { return deadline_; }
     [[nodiscard]] std::stop_token StopToken();
     // The statement's latest progress, for SHOW CONNECTIONS; std::nullopt
-    // until it reports one.
+    // until it reports one and again once it completes.
     void ReportProgress(const StatementProgress& progress);
     [[nodiscard]] std::optional<StatementProgress> progress() const;
   private:

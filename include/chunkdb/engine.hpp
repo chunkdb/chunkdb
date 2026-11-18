@@ -209,7 +209,7 @@ struct ConnectionInfo {
     std::uint64_t id = 0U;
     std::string user, peer, state, statement;
     // What the running statement reported done; std::nullopt when it reports nothing.
-    std::optional<StatementProgress> progress;
+    std::optional<StatementProgress> progress{};
 };
 
 struct SessionControlCallbacks {

@@ -139,6 +139,8 @@ std::optional<StatementStopReason> StatementControl::Complete(bool* decision_ent
         if (reason_ != StatementStopReason::kNone) result = reason_;
         phase_ = Phase::kComplete;
     }
+    // A finished statement no longer runs, so a listing shows no progress.
+    { std::lock_guard lock(progress_mutex_); progress_.reset(); }
     stop.request_stop();
     return result;
 }

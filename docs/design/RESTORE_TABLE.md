@@ -42,7 +42,7 @@ Server shutdown, CANCEL, KILL CONNECTION or a statement timeout cancels a runnin
 After the rename the statement reports its real outcome.
 A client disconnect does not cancel it, as for BACKUP.
 The server logs the start, each tenth of the copied bytes, and the end, with the table, files and bytes.
-The statement also reports its files and bytes copied of the totals before the first file and after each one; SHOW CONNECTIONS lists them as `progress`.
+The statement also reports its files and bytes copied of the totals before the first file and after each one; SHOW CONNECTIONS lists them as `progress` until the statement completes.
 The report is kept on the statement's control under its own mutex, which only the report and a listing take, so no hot path takes a new lock.
 The reply names the table, epoch, parent epoch, fork revision, files and bytes.
 

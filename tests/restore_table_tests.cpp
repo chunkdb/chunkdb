@@ -197,7 +197,18 @@ void Cancellation() {
     std::stop_source stop;
     auto request = source.Request();
     request.cancelled = stop.get_token();
-    request.progress = [&](std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t) { stop.request_stop(); };
+    // A stop after the first file leaves copied files in staging, which the refusal removes.
+    request.progress = [&](std::uint64_t files, std::uint64_t, std::uint64_t all_files, std::uint64_t) {
+        if (files == 0U) return;
+        assert(files == 1U && all_files > 1U && Entries(source.data / ".chunkdb.staging") > 0U);
+        stop.request_stop();
+    };
+    assert(Throws([&] { (void)catalog.RestoreTable(request); }).find("cancelled") != std::string::npos);
+    LeavesNothingAfterRefusal(source, catalog);
+    // A stop at the totals, before any file is copied.
+    std::stop_source first;
+    request.cancelled = first.get_token();
+    request.progress = [&](std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t) { first.request_stop(); };
     assert(Throws([&] { (void)catalog.RestoreTable(request); }).find("cancelled") != std::string::npos);
     LeavesNothingAfterRefusal(source, catalog);
     std::stop_source before;
