@@ -299,10 +299,13 @@ struct DropUser {
 // GRANT, or REVOKE when `revoke`.
 struct GrantRight {
     bool revoke = false;
-    // Rights are hierarchical. A list grants its highest right or revokes
-    // its lowest right, so the registry publishes the whole list once.
-    Right right = Right::kRead;
-    // A table name, or kEveryTable.
+    // Table rights are hierarchical. A list grants its highest right or
+    // revokes its lowest right, so the registry publishes the whole list
+    // once. Absent when the list names server rights only.
+    std::optional<Right> right;
+    // ServerRight bits; the parser accepts them ON * only.
+    std::uint8_t server_rights = 0U;
+    // A table name, a prefix grant `p*`, or kEveryTable.
     std::string table;
     std::string user;
 };

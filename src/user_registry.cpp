@@ -309,30 +309,13 @@ void UserRegistry::Drop(const std::string& name, bool if_exists) {
     });
 }
 
-void UserRegistry::Grant(const std::string& name, const std::string& table, Right right) {
+void UserRegistry::Grant(const std::string& name, const std::string& table, std::optional<Right> right, std::uint8_t server_rights) {
     RequireValidGrantTable(table);
-    Update([&](Users& users) {
-        auto& grants = Existing(users, name).grants;
-        const auto found = grants.find(table);
-        if (found == grants.end() || found->second < right) {
-            grants[table] = right;
-        }
-    });
+    Update([&](Users& users) { ApplyGrant(Existing(users, name), table, right, server_rights, false); });
 }
 
-void UserRegistry::Revoke(const std::string& name, const std::string& table, Right right) {
-    Update([&](Users& users) {
-        auto& grants = Existing(users, name).grants;
-        const auto found = grants.find(table);
-        if (found == grants.end() || found->second < right) {
-            return;
-        }
-        if (right == Right::kRead) {
-            grants.erase(found);
-        } else {
-            found->second = static_cast<Right>(static_cast<std::uint8_t>(right) - 1U);
-        }
-    });
+void UserRegistry::Revoke(const std::string& name, const std::string& table, std::optional<Right> right, std::uint8_t server_rights) {
+    Update([&](Users& users) { ApplyGrant(Existing(users, name), table, right, server_rights, true); });
 }
 
 void UserRegistry::ForgetTable(const std::string& table) {
@@ -351,7 +334,7 @@ ReadRightCheck::State ReadRightCheck::Recheck(std::uint64_t generation) {
     const auto rights = users_->Rights();
     const auto found = rights->users.find(user_);
     if (found == rights->users.end() || found->second.incarnation != incarnation_) state_ = State::kNoUser;
-    else if (!RightOn(found->second.grants, table_).has_value()) state_ = State::kNoRight;
+    else if (!RightOn(found->second.grants, found->second.prefix_grants, table_).has_value()) state_ = State::kNoRight;
     else if (every_table_admin_) {
         const auto every = found->second.grants.find(kEveryTable);
         if (every == found->second.grants.end() || every->second < Right::kAdmin) state_ = State::kNoRight;

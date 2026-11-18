@@ -35,23 +35,37 @@ See [User statements](reference/USER_STATEMENTS.md) for creation, password files
 ADMIN includes WRITE, and WRITE includes READ.
 Rights apply to whole tables, including grants naming tables not yet created.
 A wildcard grant on `*` applies to every table, including future tables.
-Dropping a table removes its specific grants.
+A prefix grant such as `GRANT ADMIN ON tenant1_* TO t1` applies to every table whose name starts with `tenant1_`, including `tenant1_` itself and future tables.
+A user gets the highest right of its grants on the name, on matching prefixes and on `*`.
+Dropping a table removes its specific grants; prefix and wildcard grants remain.
+
+MONITOR, BACKUP and REPLICATION are server rights, granted with `ON *`, for example `GRANT MONITOR ON * TO metrics`.
+They give no table rights and no user management.
+MONITOR reads server status: SHOW METRICS, SHOW STATUS, SHOW CONNECTIONS of every user, SHOW TABLE STATS and SHOW SLOTS on every table.
+BACKUP runs BACKUP TO and RESTORE TABLE.
+REPLICATION is stored and shown by SHOW USERS; no statement requires it yet.
 
 | Statement | Required right |
 | --- | --- |
 | GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, DESCRIBE, WATCH | READ on the table |
+| SHOW TABLE STATS | READ on the table, or MONITOR |
 | WATCH SLOT on a slot another user owns | READ on the table and ADMIN on all tables |
 | SET BLOCK, DELETE BLOCK, SET CHUNK | WRITE on the table |
 | ALTER TABLE, DROP TABLE, RECOVER TABLE, CREATE SLOT, DROP SLOT | ADMIN on the table |
+| CREATE TABLE | ADMIN on the name, on a matching prefix, or on all tables |
 | SWAP TABLES | ADMIN on both tables |
-| CREATE TABLE, SHOW METRICS, RELOAD TLS | ADMIN on all tables |
-| FLUSH WAL | WRITE on at least one table |
-| SHOW TABLES, SHOW SLOTS | None; results include accessible tables only |
+| SHOW METRICS, SHOW STATUS | MONITOR, or ADMIN on all tables |
+| RELOAD TLS | ADMIN on all tables |
+| FLUSH WAL | WRITE on at least one table or prefix |
+| SHOW TABLES | None; results include accessible tables only |
+| SHOW SLOTS | None; results include accessible tables only, or every table with MONITOR |
+| SHOW CONNECTIONS | None; results include your own connections, or every connection with MONITOR or ADMIN on all tables |
 | SHOW MIGRATIONS | None; results include records on tables with ADMIN, and GRANT and REVOKE records with MANAGES USERS; applying users show with MANAGES USERS |
 | ACK | An open slot watch |
 | PING | None |
-| User management, GRANT, REVOKE, BACKUP TO | MANAGES USERS |
-| RESTORE TABLE | ADMIN on all tables, or MANAGES USERS |
+| User management, GRANT, REVOKE | MANAGES USERS |
+| BACKUP TO | BACKUP, or MANAGES USERS |
+| RESTORE TABLE | BACKUP, MANAGES USERS, or ADMIN on all tables |
 | MIGRATE | The inner statement's rights |
 
 Changing your own password is the exception to the user-management requirement.

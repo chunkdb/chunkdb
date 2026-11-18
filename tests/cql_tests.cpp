@@ -190,8 +190,8 @@ void TestRightsLists() {
     }
     assert(Get<cql::GrantRight>("GRANT READ, ADMIN, WRITE ON * TO bot").right == chunkdb::Right::kAdmin);
     assert(Get<cql::GrantRight>("REVOKE ADMIN, WRITE ON * FROM bot").right == chunkdb::Right::kWrite);
-    ExpectError("GRANT READ, DELETE ON t TO bot", "expected READ, WRITE or ADMIN");
-    ExpectError("GRANT READ, ON t TO bot", "expected READ, WRITE or ADMIN");
+    ExpectError("GRANT READ, DELETE ON t TO bot", "expected READ, WRITE, ADMIN, MONITOR, BACKUP or REPLICATION");
+    ExpectError("GRANT READ, ON t TO bot", "expected READ, WRITE, ADMIN, MONITOR, BACKUP or REPLICATION");
     const auto migration = Get<cql::Migrate>("MIGRATE 'grant' GRANT WRITE, READ ON t TO bot");
     assert(std::get<cql::GrantRight>(migration.statement).right == chunkdb::Right::kWrite);
 }
@@ -447,8 +447,21 @@ void TestAlterAndOtherStatements() {
     assert(every.right == chunkdb::Right::kAdmin && every.table == "*");
     const auto revoke = Get<cql::GrantRight>("REVOKE READ ON * FROM bot");
     assert(revoke.revoke && revoke.right == chunkdb::Right::kRead && revoke.user == "bot");
-    ExpectError("GRANT DELETE ON world TO bot", "expected READ, WRITE or ADMIN");
+    ExpectError("GRANT DELETE ON world TO bot", "expected READ, WRITE, ADMIN, MONITOR, BACKUP or REPLICATION");
     ExpectError("REVOKE READ ON world TO bot", "expected FROM");
+    const auto prefix = Get<cql::GrantRight>("GRANT ADMIN ON tenant1_* TO t1");
+    assert(prefix.right == chunkdb::Right::kAdmin && prefix.table == "tenant1_*" && prefix.server_rights == 0U);
+    assert(Get<cql::GrantRight>("REVOKE READ ON t* FROM t1").table == "t*");
+    ExpectError("GRANT ADMIN ON tenant1_ * TO t1", "expected TO, got '*'");
+    ExpectError("GRANT ADMIN ON tenant1_** TO t1", "expected TO, got '*'");
+    ExpectError("GRANT ADMIN ON Tenant* TO t1", "names are lowercase");
+    const auto server = Get<cql::GrantRight>("GRANT monitor, BACKUP, replication ON * TO ops");
+    assert(!server.right.has_value() && server.server_rights == chunkdb::kKnownServerRights && server.table == "*");
+    const auto mixed = Get<cql::GrantRight>("REVOKE WRITE, MONITOR, READ ON * FROM ops");
+    assert(mixed.revoke && mixed.right == chunkdb::Right::kRead &&
+           mixed.server_rights == static_cast<std::uint8_t>(chunkdb::ServerRight::kMonitor));
+    ExpectError("GRANT MONITOR ON world TO ops", "column 18: MONITOR, BACKUP and REPLICATION are granted ON *");
+    ExpectError("GRANT READ, BACKUP ON t* TO ops", "are granted ON *");
     (void)Get<cql::ShowUsers>("SHOW USERS");
     const auto scan = Get<cql::ScanChunks>("SCAN CHUNKS FROM world AFTER -3 4 LIMIT 10");
     assert(scan.table == "world" && scan.after == std::make_pair(std::int64_t{-3}, std::int64_t{4}) && scan.limit == 10U);

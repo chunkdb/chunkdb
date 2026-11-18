@@ -93,7 +93,7 @@ See [session negotiation](design/PROTOCOL_FOUNDATION.md#handshake-and-session-ow
 `SHOW CONNECTIONS` returns an array of maps containing `id`, `user`, `peer`, `state`, and `statement`.
 An unauthenticated user or an idle statement is represented by NULL in its field.
 The reply includes every authorized connection or fails with `OUT_OF_RANGE reason=response_limit`; it never truncates the listing.
-Users control sessions belonging to their current user incarnation; ADMIN on `*` may control every session.
+Users control sessions belonging to their current user incarnation; ADMIN on `*` may control every session, and MONITOR may list every session.
 
 `CANCEL id` returns `{cancelled: bool}` and accepts cancellation only before the target statement enters its irreversible decision.
 Missing, idle, decision-entered and self targets return false.

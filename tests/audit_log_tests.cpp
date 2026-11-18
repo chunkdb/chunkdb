@@ -285,6 +285,8 @@ void TestStatementEvents() {
     assert(e.Run(admin, "ALTER USER bot MANAGES USERS") == "+OK\r\n");
     assert(e.Run(admin, "GRANT READ ON t TO bot") == "+OK\r\n");
     assert(e.Run(admin, "REVOKE READ ON t FROM bot") == "+OK\r\n");
+    assert(e.Run(admin, "GRANT ADMIN ON t_* TO bot") == "+OK\r\n");
+    assert(e.Run(admin, "GRANT MONITOR, BACKUP ON * TO bot") == "+OK\r\n");
     assert(e.Run(admin, "DROP USER bot") == "+OK\r\n");
     assert(e.Run(admin, "BACKUP TO 'backup-sentinel'").rfind("-", 0) != 0);
     assert(e.Run(admin, "MIGRATE 'add_note' ALTER TABLE t ADD COLUMN note text(4) NULL").rfind("-", 0) != 0);
@@ -308,14 +310,16 @@ void TestStatementEvents() {
     statement({"\"event\":\"alter_user\"", "\"target_user\":\"bot\""});
     statement({"\"event\":\"grant\"", "\"table\":\"t\"", "\"target_user\":\"bot\""});
     statement({"\"event\":\"revoke\"", "\"table\":\"t\"", "\"target_user\":\"bot\""});
+    statement({"\"event\":\"grant\"", "\"table\":\"t_*\"", "\"target_user\":\"bot\""});
+    statement({"\"event\":\"grant\"", "\"table\":\"*\"", "\"target_user\":\"bot\""});
     statement({"\"event\":\"drop_user\"", "\"target_user\":\"bot\""});
     statement({"\"event\":\"backup\"", "\"ok\":true"});
     statement({"\"event\":\"migrate\"", "\"table\":\"t\"", "\"migration\":\"add_note\""});
     statement({"\"event\":\"drop_table\"", "\"table\":\"t\"", "\"ok\":true"});
     statement({"\"event\":\"drop_table\"", "\"table\":\"missing\"", "\"ok\":false", "\"error_code\":\"NO_TABLE\""});
     statement({"\"event\":\"reload_tls\"", "\"ok\":false", "\"error_code\":\"INVALID_ARGUMENT\""});
-    // One login and the fourteen statements above, nothing else.
-    assert(lines.size() == 15U);
+    // One login and the sixteen statements above, nothing else.
+    assert(lines.size() == 17U);
 
     // No password, verifier, value or parameter reaches the file.
     const auto text = ReadAll(e.audit_path);

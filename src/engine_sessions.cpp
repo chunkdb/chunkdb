@@ -25,11 +25,13 @@ SessionControlAccess CommandEngine::ControlAccess(SessionState& session) const {
     SessionControlAccess access{.requester_connection_id = session.connection_id};
     if (!config_.require_auth) {
         access.admin_all = true;
+        access.list_all = true;
         return access;
     }
     if (const User* user = CurrentUser(session)) {
         access.user_incarnation = session.user_incarnation;
         access.admin_all = RightOn(*user, "*") == Right::kAdmin;
+        access.list_all = access.admin_all || chunkdb::HasServerRight(*user, ServerRight::kMonitor);
     }
     return access;
 }

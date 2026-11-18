@@ -139,7 +139,7 @@ The `chunk_columns` list uses the same column-description maps as `columns`.
 | --- | --- | --- |
 | TABLE_EXISTS | A table already exists. | Use another name, IF NOT EXISTS, [MIGRATE](MIGRATIONS.md), or DROP TABLE. |
 | NO_TABLE | A table is absent or inaccessible. | Check its name and rights. |
-| PERMISSION_DENIED | You lack ADMIN on the table, on both tables for SWAP, or on all tables for CREATE. | Request access. |
+| PERMISSION_DENIED | You lack ADMIN on the table, on both tables for SWAP, or for CREATE on the new name, a matching prefix, or all tables. | Request access. |
 | INVALID_ARGUMENT | A name, type, default, conversion, or option is invalid, or RECOVER TABLE names a table that is not fenced. | Correct the reported argument. |
 | INTERNAL | The table is fenced: `table 'name' is fenced: reason; run RECOVER TABLE name`. | Run RECOVER TABLE. |
 | INVALID_ARGUMENT | RECOVER TABLE finds stored options that differ from the server's option flags. | Restart the server without those flags, or with the stored values. |
@@ -201,9 +201,9 @@ See [Server flags](../SERVER_FLAGS.md#table-geometry).
 
 ## Feature activation
 
-`SHOW STATUS` requires ADMIN on `*` and reports recorded directory and table features.
+`SHOW STATUS` requires MONITOR or ADMIN on `*` and reports recorded directory and table features.
 Its protected snapshot refuses unhealthy serving state instead of guessing whether activation completed.
-`ENABLE FEATURE 'name'` requires the same right and returns OK for an already enabled feature.
+`ENABLE FEATURE 'name'` requires ADMIN on `*` and returns OK for an already enabled feature.
 
 New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, `feature_activation`, and `chunk_model`.
 Existing directories retain their recorded bits; enable `feature_activation` before another missing feature.

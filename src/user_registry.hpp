@@ -107,11 +107,13 @@ class UserRegistry {
     void SetManagesUsers(const std::string& name, bool manages_users);
     void SetRequiresChannelBinding(const std::string& name, bool requires_channel_binding);
     void Drop(const std::string& name, bool if_exists = false);
-    void Grant(const std::string& name, const std::string& table, Right right);
+    // `table` is a table, a prefix grant `p*` or `*`; ServerRight bits in
+    // `server_rights` need `*`.
+    void Grant(const std::string& name, const std::string& table, std::optional<Right> right, std::uint8_t server_rights = 0U);
     // Removes `right` and those above it on `table`: a user who had ADMIN
     // keeps WRITE after REVOKE ADMIN, and keeps nothing after REVOKE READ.
-    void Revoke(const std::string& name, const std::string& table, Right right);
-    // Removes the grants on a dropped table.
+    void Revoke(const std::string& name, const std::string& table, std::optional<Right> right, std::uint8_t server_rights = 0U);
+    // Removes the grants on a dropped table; prefix and `*` grants stay.
     void ForgetTable(const std::string& table);
     [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
     void SetMigrationHealth(std::shared_ptr<MigrationHealth> health);

@@ -86,6 +86,59 @@ void TestRights() {
     assert(Right::kRead < Right::kWrite && Right::kWrite < Right::kAdmin);
 }
 
+void TestPrefixRights() {
+    User user{.verifier = {}, .grants = {{"abc_d", Right::kRead}}};
+    user.prefix_grants = {{"a", Right::kRead}, {"ab", Right::kAdmin}, {"abc", Right::kWrite}, {"b", Right::kWrite}};
+    // Every matching prefix counts; the highest right wins.
+    assert(chunkdb::RightOn(user, "abc_d") == Right::kAdmin);
+    assert(chunkdb::RightOn(user, "abcdef") == Right::kAdmin);
+    // A prefix equal to the name matches it; a longer one does not.
+    assert(chunkdb::RightOn(user, "ab") == Right::kAdmin);
+    assert(chunkdb::RightOn(user, "a") == Right::kRead);
+    assert(chunkdb::RightOn(user, "b" + std::string(63, 'z')) == Right::kWrite);
+    assert(!chunkdb::RightOn(user, "c").has_value() && chunkdb::RightOn(user, "ba-") == Right::kWrite);
+    assert(!chunkdb::RightOn(user, "0abc").has_value() && !chunkdb::RightOn(user, "").has_value());
+    assert(chunkdb::HasAnyGrant(user, Right::kAdmin) && !chunkdb::HasAnyGrant(User{}, Right::kRead));
+
+    // GRANT keeps the higher right, REVOKE steps down; an exact grant and
+    // a prefix grant on the same text are apart.
+    User changed;
+    chunkdb::ApplyGrant(changed, "t1_*", Right::kAdmin, 0U, false);
+    chunkdb::ApplyGrant(changed, "t1_*", Right::kRead, 0U, false);
+    chunkdb::ApplyGrant(changed, "t1_", Right::kRead, 0U, false);
+    assert(changed.prefix_grants.at("t1_") == Right::kAdmin && changed.grants.at("t1_") == Right::kRead);
+    chunkdb::ApplyGrant(changed, "t1_*", Right::kAdmin, 0U, true);
+    assert(changed.prefix_grants.at("t1_") == Right::kWrite);
+    chunkdb::ApplyGrant(changed, "t1_*", Right::kRead, 0U, true);
+    assert(changed.prefix_grants.empty() && changed.grants.at("t1_") == Right::kRead);
+
+    // Server rights go ON * and combine with table rights in one list.
+    const auto monitor = static_cast<std::uint8_t>(chunkdb::ServerRight::kMonitor);
+    const auto backup = static_cast<std::uint8_t>(chunkdb::ServerRight::kBackup);
+    chunkdb::ApplyGrant(changed, "*", Right::kRead, static_cast<std::uint8_t>(monitor | backup), false);
+    assert(chunkdb::HasServerRight(changed, chunkdb::ServerRight::kMonitor) && changed.grants.at("*") == Right::kRead);
+    chunkdb::ApplyGrant(changed, "*", std::nullopt, monitor, true);
+    assert(changed.server_rights == backup && changed.grants.at("*") == Right::kRead);
+    ExpectInvalid([&] { chunkdb::ApplyGrant(changed, "world", std::nullopt, monitor, false); }, "granted ON *");
+    ExpectInvalid([&] { chunkdb::ApplyGrant(changed, "*", std::nullopt, 8U, false); }, "unknown server right");
+    assert(changed.server_rights == backup);
+
+    // Both survive a round trip, and a prefix grant kept among the exact
+    // ones is refused rather than read back as another kind.
+    Users users = Sample();
+    users.users["bot"].prefix_grants = {{"tenant1_", Right::kAdmin}, {"con", Right::kRead}};
+    users.users["bot"].server_rights = chunkdb::kKnownServerRights;
+    assert(chunkdb::DecodeUsers(chunkdb::EncodeUsers(users)) == users);
+    users.users["bot"].grants["bad*"] = Right::kRead;
+    ExpectInvalid([&] { (void)chunkdb::EncodeUsers(users); }, "prefix grant among its table grants");
+    users.users["bot"].grants.erase("bad*");
+    users.users["bot"].prefix_grants["_bad"] = Right::kRead;
+    ExpectInvalid([&] { (void)chunkdb::EncodeUsers(users); }, "invalid table prefix");
+    users.users["bot"].prefix_grants.erase("_bad");
+    users.users["bot"].server_rights = 8U;
+    ExpectInvalid([&] { (void)chunkdb::EncodeUsers(users); }, "unknown server right");
+}
+
 void TestDamagedFiles() {
     const auto bytes = chunkdb::EncodeUsers(Sample());
     ExpectInvalid([] { (void)chunkdb::DecodeUsers({}); }, "not a chunkdb users file");
@@ -368,6 +421,7 @@ struct RawUser {
     std::string name = "bot";
     std::size_t salt_bytes = 16;
     std::string table = "world";
+    std::uint8_t flags = 0U;
 };
 
 std::vector<std::uint8_t> RawUsersFile(const RawUser& raw) {
@@ -389,7 +443,7 @@ std::vector<std::uint8_t> RawUsersFile(const RawUser& raw) {
     out.insert(out.end(), 32, 0x07);
     u32(1);
     text(raw.name);
-    out.push_back(0);
+    out.push_back(raw.flags);
     u32(chunkdb::scram::kMinIterations);
     u16(raw.salt_bytes);
     out.insert(out.end(), raw.salt_bytes, 0x5a);
@@ -423,6 +477,25 @@ void TestFieldBounds() {
     }
     ExpectInvalid([] { (void)chunkdb::DecodeUsers(RawUsersFile({.table = std::string(65, 'a')})); }, "invalid table name");
 
+    // A file written before server rights and prefix grants reads unchanged.
+    assert(valid.users.at("bot").server_rights == 0U && valid.users.at("bot").prefix_grants.empty());
+    assert(chunkdb::EncodeUsers(valid) == RawUsersFile({}));
+    // Bits 2..4 are MONITOR, BACKUP and REPLICATION; higher bits stay unknown.
+    const auto rights = chunkdb::DecodeUsers(RawUsersFile({.flags = 0x1CU}));
+    assert(rights.users.at("bot").server_rights == chunkdb::kKnownServerRights);
+    assert(chunkdb::EncodeUsers(rights) == RawUsersFile({.flags = 0x1CU}));
+    for (const std::uint8_t flags : {std::uint8_t{0x20U}, std::uint8_t{0x80U}}) {
+        ExpectInvalid([&] { (void)chunkdb::DecodeUsers(RawUsersFile({.flags = flags})); }, "unknown flags for user bot");
+    }
+    const auto prefix = chunkdb::DecodeUsers(RawUsersFile({.table = "tenant1_*"}));
+    assert(prefix.users.at("bot").prefix_grants.at("tenant1_") == Right::kRead && prefix.users.at("bot").grants.empty());
+    assert(chunkdb::EncodeUsers(prefix) == RawUsersFile({.table = "tenant1_*"}));
+    (void)chunkdb::DecodeUsers(RawUsersFile({.table = "con*"}));
+    (void)chunkdb::DecodeUsers(RawUsersFile({.table = std::string(64, 'a') + "*"}));
+    for (const auto& table : {std::string("_a*"), std::string("A*"), std::string("a/*"), std::string("a**"), std::string(65, 'a') + "*"}) {
+        ExpectInvalid([&] { (void)chunkdb::DecodeUsers(RawUsersFile({.table = table})); }, "invalid table name");
+    }
+
     // A salt longer than its 16-bit length field is refused, not cut short.
     for (const std::size_t size : {std::size_t{15}, chunkdb::scram::kMaxSaltBytes + 1U, std::size_t{65536 + 16}}) {
         Users users = Sample();
@@ -442,6 +515,7 @@ void TestFieldBounds() {
 int main() {
     TestRoundTrip();
     TestRights();
+    TestPrefixRights();
     TestDamagedFiles();
     TestFile();
     TestFileIsOwnerOnly();

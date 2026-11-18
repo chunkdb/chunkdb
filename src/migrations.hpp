@@ -23,7 +23,8 @@ struct MigrationRequest {
     std::function<void(StoreManifest&)> alter;
     std::optional<std::pair<std::string, ColumnType>> narrowing;
     std::string user;
-    Right right = Right::kRead;
+    std::optional<Right> right;
+    std::uint8_t server_rights = 0U;
     bool revoke = false;
     std::string slot;
     FeedSlotFilters slot_filters{};

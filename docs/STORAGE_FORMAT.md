@@ -509,17 +509,18 @@ Live-history readers capture completed byte boundaries and read only the prefix 
 2. Each user stores these fields in order:
 
 - Name length `u16` and name.
-- Flags `u8`, with bit 0 representing MANAGES USERS and bit 1 REQUIRE CHANNEL BINDING.
+- Flags `u8`, with bit 0 representing MANAGES USERS, bit 1 REQUIRE CHANNEL BINDING, bit 2 MONITOR, bit 3 BACKUP and bit 4 REPLICATION.
 - SCRAM iterations `u32` (4096 to 1000000), salt length `u16` (16 to 256), and salt.
 - Stored key (32 bytes), server key (32 bytes), and grant count `u32`.
-3. Per grant: table-name length `u16` and name, right `u8` (1 READ, 2 WRITE, 3 ADMIN); `*` names all tables.
+3. Per grant: table-name length `u16` and name, right `u8` (1 READ, 2 WRITE, 3 ADMIN); `*` names all tables, and a name ending in `*` after a prefix names every table starting with that prefix.
 4. After each user's grants: `max_connections:u64`, `statements_per_sec:u64`, little-endian. Zero disables a limit; the rate is at most 65536.
 5. CRC32 over all preceding bytes, including the limits.
 
 Before serialization or file replacement, the writer checks u16 name widths, salt lengths, u32 user/grant counts, SCRAM iterations (4096–1000000), known rights and the rate limit. Invalid input leaves the existing file and directory metadata unchanged and does not create a new store.
-Writer serialization orders users by name and grants by table; decoding refuses duplicate users/grants, unknown flags/rights/version, bad checksum, truncation, or trailing bytes.
+Writer serialization orders users by name, then table grants by name, then prefix grants by prefix; decoding refuses duplicate users/grants, unknown flags/rights/version, bad checksum, truncation, or trailing bytes.
 The writer refuses a salt outside that range or a name over 65535 bytes instead of shortening it; decoding also refuses user and table names that CREATE USER and GRANT refuse.
 Password verifiers contain no plaintext password; the secret derives unknown-user salts used by authentication.
+A version 2 file without bits 2..4 or prefix grants reads unchanged; a build that predates them refuses a file that uses them as unknown flags or an invalid table name.
 Earlier development users files are refused with a recreate error before permissions or bookkeeping change; they are not migrated.
 The file is admitted independently of the catalog manifest, including standalone users stores.
 
