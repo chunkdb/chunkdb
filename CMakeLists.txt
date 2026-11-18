@@ -404,6 +404,9 @@ if(CHUNKDB_BUILD_TESTS)
         target_link_options(chunkdb_commit_owner_artifact_io_test PRIVATE -static-libstdc++ -static-libgcc)
         target_link_options(chunkdb_commit_group_journal_test PRIVATE -static-libstdc++ -static-libgcc)
     endif()
+    # The crash children of the owner artifacts run in the crash label.
+    add_test(NAME commit_owner_artifact_io_crash COMMAND chunkdb_commit_owner_artifact_io_test --case crash)
+    set_tests_properties(commit_owner_artifact_io_crash PROPERTIES TIMEOUT 300)
 
     add_executable(chunkdb_area_paging_test tests/area_paging_tests.cpp)
     target_link_libraries(chunkdb_area_paging_test PRIVATE chunkdb_core)
@@ -1414,6 +1417,7 @@ if(CHUNKDB_BUILD_TESTS)
         txn_crash
         chunk_coordinate_index_crash
         table_tombstones_crash
+        commit_owner_artifact_io_crash
     )
 
     if(TARGET chunkdb_server_tls_error_queue_test)

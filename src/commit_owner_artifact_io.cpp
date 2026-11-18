@@ -8,6 +8,7 @@
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <utility>
 
@@ -35,6 +36,10 @@ constexpr const char* kObjects = "chunkdb.groups.objects";
 constexpr const char* kRoot = "chunkdb.groups.owner";
 constexpr const char* kMarker = ".scope";
 constexpr const char* kTemporary = ".owner-stage-";
+constexpr const char* kRootTemporary = ".owner-root-";
+constexpr const char* kJournalTemporary = ".journal-stage-";
+constexpr const char* kJournals = "chunkdb.groups.journal";
+static_assert(std::string_view(kJournals) == kCommitJournalDirectoryName);
 
 [[noreturn]] void Damage(const char* reason) {
     throw std::runtime_error(std::string("commit owner artifact: ") + reason);
@@ -49,12 +54,19 @@ CommitOwnerObjectRef Reference(CommitOwnerObjectKind kind, std::span<const std::
     return {kind, bytes.size(), crypto::Sha256Of(bytes)};
 }
 void CheckReference(const CommitOwnerObjectRef& reference, CommitOwnerObjectKind kind) {
-    if (reference.kind != kind ||
-        (kind == CommitOwnerObjectKind::kRoot && reference.bytes != kCommitOwnerRootBytes) ||
-        (kind == CommitOwnerObjectKind::kPage &&
-            (reference.bytes < kCommitOwnerEmptyPageBytes || reference.bytes > kMaxCommitOwnerPageBytes)) ||
+    const auto bytes = reference.bytes;
+    bool bounded = false;
+    switch (kind) {
+        case CommitOwnerObjectKind::kRoot: bounded = bytes == kCommitOwnerRootBytes; break;
+        case CommitOwnerObjectKind::kPage: bounded = bytes >= kCommitOwnerEmptyPageBytes && bytes <= kMaxCommitOwnerPageBytes; break;
+        case CommitOwnerObjectKind::kJournalInventory: bounded = bytes == kCommitJournalInventoryBytes; break;
+        case CommitOwnerObjectKind::kIdInventory:
+            bounded = bytes >= kCommitIdInventoryHeaderBytes + 4U && bytes <= kMaxCommitIdInventoryBytes; break;
+        default: break;
+    }
+    if (reference.kind != kind || !bounded ||
         std::all_of(reference.sha256.begin(), reference.sha256.end(), [](auto b) { return b == 0U; })) {
-        Damage("invalid root or page reference");
+        Damage("invalid object reference");
     }
 }
 
@@ -274,6 +286,24 @@ void WriteAll(const Native& file, std::span<const std::uint8_t> bytes) {
         bytes = bytes.subspan(amount);
     }
 }
+void WriteAt(const Native& file, std::uint64_t offset, std::span<const std::uint8_t> bytes) {
+    while (!bytes.empty()) {
+#ifdef _WIN32
+        LARGE_INTEGER at{}; at.QuadPart = static_cast<LONGLONG>(offset);
+        if (!SetFilePointerEx(file.get(), at, nullptr, FILE_BEGIN)) NativeError("seek owner journal");
+        DWORD written = 0U;
+        if (!WriteFile(file.get(), bytes.data(), static_cast<DWORD>(bytes.size()), &written, nullptr))
+            NativeError("write owner journal");
+        const auto amount = static_cast<std::size_t>(written);
+#else
+        const auto written = ::pwrite(file.get(), bytes.data(), bytes.size(), static_cast<off_t>(offset));
+        if (written < 0) { if (errno == EINTR) continue; NativeError("write owner journal"); }
+        const auto amount = static_cast<std::size_t>(written);
+#endif
+        if (amount == 0U) Damage("zero journal write");
+        offset += amount; bytes = bytes.subspan(amount);
+    }
+}
 void SyncFile(const Native& file, const std::filesystem::path& label) {
 #ifdef _WIN32
     SyncOwnerFileHandle(file.get(), label);
@@ -398,7 +428,95 @@ std::vector<std::uint8_t> ReadChecked(const Native& file, const CommitOwnerScope
     if (reference && crypto::Sha256Of(bytes) != reference->sha256) Damage("object raw digest mismatch");
     return bytes;
 }
+// Journal and ID inventories keep their native encodings without an owner envelope.
+std::vector<std::uint8_t> ReadAdmitted(const Native& file, const CommitOwnerScope& scope, const CommitOwnerObjectRef& reference,
+    const std::optional<CommitJournalContext>& context = {}, std::optional<std::uint64_t> maximum_generation = {}) {
+    if (reference.kind == CommitOwnerObjectKind::kRoot || reference.kind == CommitOwnerObjectKind::kPage)
+        return ReadChecked(file, scope, reference.kind, reference, maximum_generation);
+    const auto extent = Extent(file);
+    if (extent != reference.bytes) Damage("object measured extent mismatch");
+    std::vector<std::uint8_t> bytes;
+    if (reference.kind == CommitOwnerObjectKind::kJournalInventory) {
+        bytes.resize(kCommitJournalInventoryBytes);
+        ReadAt(file, 0U, bytes);
+    } else if (reference.kind == CommitOwnerObjectKind::kIdInventory && context) {
+        std::array<std::uint8_t, kCommitIdInventoryHeaderBytes> header{}; ReadAt(file, 0U, header);
+        const auto admitted = InspectCommitIdInventoryHeader(header, *context);
+        if (admitted.record_bytes != extent) Damage("object declared extent mismatch");
+        bytes.resize(static_cast<std::size_t>(extent));
+        std::copy(header.begin(), header.end(), bytes.begin());
+        ReadAt(file, header.size(), std::span(bytes).subspan(header.size()));
+    } else {
+        Damage("unsupported owner object kind or missing journal context");
+    }
+    if (Extent(file) != extent) Damage("object extent changed during read");
+    if (crypto::Sha256Of(bytes) != reference.sha256) Damage("object raw digest mismatch");
+    return bytes;
+}
+// Only the fixed generation-one INACTIVE bytes are admitted as a canonical root here.
+void RequireExactRoot(const Native& file, std::span<const std::uint8_t> expected) {
+    std::array<std::uint8_t, kCommitOwnerRootBytes> actual{};
+    if (Extent(file) == actual.size()) ReadAt(file, 0U, actual);
+    if (Extent(file) != actual.size() || !std::equal(actual.begin(), actual.end(), expected.begin(), expected.end()))
+        Damage("canonical owner root is not the generation-one INACTIVE root");
+}
 }  // namespace
+
+struct CommitGroupJournalFile::Impl {
+    CommitJournalContext context;
+    std::filesystem::path label;
+    Native directory;
+    Native file;
+    bool writable = false;
+    bool fenced = false;
+    bool tail = false;
+    std::optional<std::uint64_t> end;
+    CommitJournalGroups groups;
+};
+
+CommitGroupJournalFile::CommitGroupJournalFile(std::unique_ptr<Impl> impl) noexcept : impl_(std::move(impl)) {}
+CommitGroupJournalFile::~CommitGroupJournalFile() = default;
+CommitGroupJournalFile::CommitGroupJournalFile(CommitGroupJournalFile&&) noexcept = default;
+CommitGroupJournalFile& CommitGroupJournalFile::operator=(CommitGroupJournalFile&&) noexcept = default;
+const CommitJournalContext& CommitGroupJournalFile::context() const noexcept { return impl_->context; }
+bool CommitGroupJournalFile::writable() const noexcept { return impl_->writable; }
+std::uint64_t CommitGroupJournalFile::MeasuredBytes() const { return Extent(impl_->file); }
+CommitJournalScan CommitGroupJournalFile::Scan(const CommitJournalInventory& certified, std::span<const std::uint64_t> cursors) {
+    if (certified.context != impl_->context) Damage("inventory names another journal generation");
+    const auto& file = impl_->file;
+    const auto measured = Extent(file);
+    auto scan = ScanCommitJournal(certified, measured,
+        [&](std::uint64_t offset, std::span<std::uint8_t> bytes) { ReadAt(file, offset, bytes); }, cursors);
+    if (Extent(file) != measured) Damage("journal changed during admission");
+    impl_->tail = scan.complete_bytes != measured;
+    impl_->end = impl_->tail ? std::nullopt : std::optional<std::uint64_t>(measured);
+    impl_->groups = scan.groups;
+    return scan;
+}
+std::uint64_t CommitGroupJournalFile::Append(std::span<const std::uint8_t> record) {
+    auto& state = *impl_;
+    if (!state.writable) Damage("read-only journal view cannot append");
+    if (state.fenced) Damage("journal is fenced after a failed write or sync");
+    if (state.tail) Damage("journal has an uncertified tail");
+    if (!state.end) Damage("journal end is not admitted");
+    if (Extent(state.file) != *state.end) Damage("journal end changed");
+    // Admit changes the group state only after every check passed; a failed
+    // write fences this object, so its state is never used again.
+    (void)state.groups.Admit(record, state.context.directory_id, *state.end, false);
+    state.fenced = true;
+    WriteAt(state.file, *state.end, record);
+    state.fenced = false;
+    *state.end += record.size();
+    return *state.end;
+}
+void CommitGroupJournalFile::Sync() {
+    auto& state = *impl_;
+    if (!state.writable) Damage("read-only journal view cannot sync");
+    if (state.fenced) Damage("journal is fenced after a failed write or sync");
+    state.fenced = true;
+    SyncFile(state.file, state.label);
+    state.fenced = false;
+}
 
 struct CommitOwnerArtifactIo::Impl {
     std::filesystem::path directory;
@@ -445,7 +563,8 @@ struct CommitOwnerArtifactIo::Impl {
         SyncDirectory(opened, directory / kObjects);
         objects = std::move(opened);
     }
-    CommitOwnerStagedArtifact Stage(CommitOwnerObjectKind kind, std::span<const std::uint8_t> bytes) {
+    CommitOwnerStagedArtifact Stage(CommitOwnerObjectKind kind, std::span<const std::uint8_t> bytes,
+        const std::optional<CommitJournalContext>& context = {}) {
         if (!writable) Damage("read-only artifact view cannot stage objects");
         const auto reference = Reference(kind, bytes);
         EnsureNamespace();
@@ -459,17 +578,91 @@ struct CommitOwnerArtifactIo::Impl {
             installed = Publish(objects, source, temporary, leaf, directory / kObjects / temporary);
             existing = OpenChild(objects, leaf, false, true, false, false, directory / kObjects / leaf);
             if (installed && !SameObject(source.get(), existing.get())) Damage("published native generation substituted");
-            const auto actual = ReadChecked(existing, scope, kind, reference);
+            const auto actual = ReadAdmitted(existing, scope, reference, context);
             if (!std::equal(actual.begin(), actual.end(), bytes.begin(), bytes.end())) Damage("published bytes mismatch");
             source.CloseChecked();
         } else {
-            const auto actual = ReadChecked(existing, scope, kind, reference);
+            const auto actual = ReadAdmitted(existing, scope, reference, context);
             if (!std::equal(actual.begin(), actual.end(), bytes.begin(), bytes.end())) Damage("existing object mismatch");
         }
         SyncFile(existing, directory / kObjects / leaf);
         existing.CloseChecked();
         SyncDirectory(objects, directory / kObjects);
         return {reference, installed};
+    }
+    void CheckJournalContext(const CommitJournalContext& context) const {
+        (void)CommitJournalLeafName(context);
+        if (context.directory_id != scope.directory_id) Damage("journal context directory mismatch");
+    }
+    CommitGroupJournalFile CreateJournal(const CommitJournalContext& context) {
+        if (!writable) Damage("read-only artifact view cannot create a journal");
+        CheckJournalContext(context);
+        const auto leaf = CommitJournalLeafName(context);
+        const auto journals = directory / kJournals;
+        const auto header = SerializeCommitJournalHeader(context);
+        CheckCreationCapability(root);
+        // Every handle that is synced here is opened with write rights for Windows.
+        auto opened = OpenChild(root, kJournals, true, true, false, true, journals);
+        if (!opened) opened = OpenChild(root, kJournals, true, true, true, false, journals);
+        SyncDirectory(root, directory);
+        CheckCreationCapability(opened);
+        if (OpenChild(opened, leaf, false, false, false, true, journals / leaf)) Damage("journal generation already exists");
+        const auto temporary = std::string(kJournalTemporary) + Hex(crypto::RandomBytes(16U));
+        auto source = OpenChild(opened, temporary, false, true, true, false, journals / temporary);
+        WriteAll(source, header);
+        if (!Publish(opened, source, temporary, leaf, journals / temporary)) Damage("journal generation already exists");
+        auto file = OpenChild(opened, leaf, false, true, false, false, journals / leaf);
+        std::array<std::uint8_t, kCommitJournalHeaderBytes> actual{};
+        if (SameObject(source.get(), file.get()) && Extent(file) == actual.size()) ReadAt(file, 0U, actual);
+        if (actual != header || Extent(file) != actual.size()) Damage("journal generation substituted");
+        SyncFile(file, journals / leaf);
+        source.CloseChecked();
+        SyncDirectory(opened, journals);
+        auto state = std::make_unique<CommitGroupJournalFile::Impl>();
+        state->context = context; state->label = journals / leaf;
+        state->directory = std::move(opened); state->file = std::move(file);
+        state->writable = true; state->end = kCommitJournalHeaderBytes;
+        return CommitGroupJournalFile(std::move(state));
+    }
+    CommitGroupJournalFile OpenJournal(const CommitJournalContext& context) const {
+        CheckJournalContext(context);
+        const auto leaf = CommitJournalLeafName(context);
+        const auto journals = directory / kJournals;
+        auto opened = OpenChild(root, kJournals, true, writable, false, false, journals);
+        auto file = OpenChild(opened, leaf, false, writable, false, false, journals / leaf);
+        const auto expected = SerializeCommitJournalHeader(context);
+        std::array<std::uint8_t, kCommitJournalHeaderBytes> actual{};
+        if (Extent(file) < actual.size()) Damage("journal is shorter than its header");
+        ReadAt(file, 0U, actual);
+        if (actual != expected) Damage("journal header does not match its generation");
+        auto state = std::make_unique<CommitGroupJournalFile::Impl>();
+        state->context = context; state->label = journals / leaf;
+        state->directory = std::move(opened); state->file = std::move(file); state->writable = writable;
+        return CommitGroupJournalFile(std::move(state));
+    }
+    CommitOwnerStagedArtifact AdmitCanonicalInactive(bool create) {
+        if (!writable) Damage("read-only artifact view cannot install the canonical root");
+        CommitOwnerRoot inactive; inactive.scope = scope;
+        const auto bytes = SerializeCommitOwnerRoot(inactive);
+        auto existing = OpenChild(root, kRoot, false, true, false, true, directory / kRoot);
+        bool installed = false;
+        Native source;
+        if (!existing) {
+            if (!create) Damage("canonical owner root is missing");
+            CheckCreationCapability(root);
+            const auto temporary = std::string(kRootTemporary) + Hex(crypto::RandomBytes(16U));
+            source = OpenChild(root, temporary, false, true, true, false, directory / temporary);
+            WriteAll(source, bytes);
+            installed = Publish(root, source, temporary, kRoot, directory / temporary);
+            existing = OpenChild(root, kRoot, false, true, false, false, directory / kRoot);
+            if (installed && !SameObject(source.get(), existing.get())) Damage("canonical root generation substituted");
+        }
+        RequireExactRoot(existing, bytes);
+        // Matching visible bytes do not prove that an earlier installer finished its syncs.
+        SyncFile(existing, directory / kRoot);
+        source.CloseChecked();
+        SyncDirectory(root, directory);
+        return {Reference(CommitOwnerObjectKind::kRoot, bytes), installed};
     }
 };
 
@@ -542,4 +735,41 @@ CommitOwnerStagedArtifact CommitOwnerArtifactIo::StagePage(const CommitOwnerPage
     const auto bytes = SerializeCommitOwnerPage(value);
     return impl_->Stage(CommitOwnerObjectKind::kPage, bytes);
 }
+CommitJournalInventoryArtifact CommitOwnerArtifactIo::ReadJournalInventory(const CommitOwnerObjectRef& reference) const {
+    CheckReference(reference, CommitOwnerObjectKind::kJournalInventory);
+    const auto objects = impl_->ObjectDirectory();
+    const auto file = OpenChild(objects, Hex(reference.sha256), false, false, false, false,
+        impl_->directory / kObjects / Hex(reference.sha256));
+    const auto bytes = ReadAdmitted(file, impl_->scope, reference);
+    return {reference, ParseCommitJournalInventory(bytes, impl_->scope.directory_id)};
+}
+CommitIdInventoryArtifact CommitOwnerArtifactIo::ReadIdInventory(const CommitOwnerObjectRef& reference,
+    const CommitJournalContext& expected) const {
+    CheckReference(reference, CommitOwnerObjectKind::kIdInventory);
+    impl_->CheckJournalContext(expected);
+    const auto objects = impl_->ObjectDirectory();
+    const auto file = OpenChild(objects, Hex(reference.sha256), false, false, false, false,
+        impl_->directory / kObjects / Hex(reference.sha256));
+    const auto bytes = ReadAdmitted(file, impl_->scope, reference, expected);
+    const auto header = InspectCommitIdInventoryHeader(std::span(bytes).first(kCommitIdInventoryHeaderBytes), expected);
+    return {reference, header, ParseCommitIdInventory(bytes, expected)};
+}
+CommitOwnerStagedArtifact CommitOwnerArtifactIo::StageJournalInventory(const CommitJournalInventory& value) {
+    if (value.context.directory_id != impl_->scope.directory_id) Damage("staged inventory directory mismatch");
+    const auto bytes = SerializeCommitJournalInventory(value);
+    return impl_->Stage(CommitOwnerObjectKind::kJournalInventory, bytes);
+}
+CommitOwnerStagedArtifact CommitOwnerArtifactIo::StageIdInventory(const CommitIdInventory& value) {
+    if (value.context.directory_id != impl_->scope.directory_id) Damage("staged ID inventory directory mismatch");
+    const auto bytes = SerializeCommitIdInventory(value);
+    return impl_->Stage(CommitOwnerObjectKind::kIdInventory, bytes, value.context);
+}
+CommitGroupJournalFile CommitOwnerArtifactIo::CreateJournal(const CommitJournalContext& context) {
+    return impl_->CreateJournal(context);
+}
+CommitGroupJournalFile CommitOwnerArtifactIo::OpenJournal(const CommitJournalContext& context) const {
+    return impl_->OpenJournal(context);
+}
+CommitOwnerStagedArtifact CommitOwnerArtifactIo::InstallCanonicalInactive() { return impl_->AdmitCanonicalInactive(true); }
+CommitOwnerStagedArtifact CommitOwnerArtifactIo::SettleCanonicalInactive() { return impl_->AdmitCanonicalInactive(false); }
 }  // namespace chunkdb
