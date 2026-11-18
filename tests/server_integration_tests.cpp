@@ -5731,7 +5731,15 @@ void TestReplyAdmissionPrecedesMutation() {
     assert(lease->store().GetBlockBits(0, 0) == "1000");
 }
 
-void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false) {
+// A reply read steadily keeps renewing its progress deadline across many
+// deadline intervals; once the reader stops, the connection is dropped at the
+// deadline. GET CHUNK, GET AREA and SCAN CHUNKS WITH DATA replies larger than
+// the socket buffers are written from their continuation in pieces of at most
+// 64 KiB. `header` is the first byte of the reply; `reads_per_tick` 4 KiB
+// reads every 50 ms keep it steady.
+void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false,
+    const std::string& query = "GET CHUNK 0 0 FROM default", char header = '$', std::size_t block_bits = 512U,
+    int reads_per_tick = 256) {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
     struct QueueHook final : chunkdb::FeedDeliveryTestHook {
         chunkdb::ChunkServer* server = nullptr;
@@ -5739,7 +5747,12 @@ void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false) 
         std::condition_variable changed;
         bool ready = false, released = false;
         std::size_t filled = 0U, reads = 0U, prefills = 0U;
+        std::atomic<std::size_t> largest_write{0U}, writes{0U};
         void Run(Point point, std::size_t completed) override {
+            if (point == Point::kBeforeReplyBufferWrite) {
+                largest_write.store(std::max(largest_write.load(), completed));
+                writes.fetch_add(1U);
+            }
             if (point != Point::kAfterClientRead || completed != 1U) return;
             std::unique_lock lock(mutex);
             ++reads;
@@ -5773,7 +5786,7 @@ void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false) 
         .large_chunk_height_chunks = 1,
         .chunk_width_blocks = 1024,
         .chunk_height_blocks = 1024,
-        .block_bits = 512,
+        .block_bits = static_cast<std::uint32_t>(block_bits),
     };
     auto engine_cfg = chunkdb::EngineConfig{
         .require_auth = false,
@@ -5791,20 +5804,20 @@ void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false) 
     } release{hook};
     {
         auto lease = harness.catalog->Find("default")->Acquire();
-        lease->store().SetBlockBits(0, 0, std::string(512, '0'));
+        lease->store().SetBlockBits(0, 0, std::string(block_bits, '0'));
     }
     RawClient slow("127.0.0.1", harness.port);
     slow.SetReceiveBuffer(1048576);
     slow.Hello();
     hook.server = harness.server.get();
     chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
-    slow.SendBytes("GET CH");
+    slow.SendBytes(query.substr(0U, 6U));
     assert(hook.Wait());
     if (fail_before_read) throw std::runtime_error("injected first read failure");
     std::size_t first_read = 0U;
     assert(slow.ReadSomeWithin(std::chrono::seconds(1), 4096U, &first_read) && first_read != 0U);
     hook.Release();
-    slow.SendBytes("UNK 0 0 FROM default\r\nGET CHUNK 0 0 FROM default\r\n");
+    slow.SendBytes(query.substr(6U) + "\r\n" + query + "\r\n");
     hook.CheckSecondRead();
     // Discard exactly the fixture bytes before interpreting the actual reply.
     // The filled queue proves backpressure without exposing its bytes as CQL.
@@ -5815,13 +5828,13 @@ void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false) 
             &bytes_read) && bytes_read != 0U);
         remaining -= bytes_read;
     }
-    assert(slow.ReadLine().starts_with('$'));
+    assert(slow.ReadLine().starts_with(header));
     const auto start = Clock::now();
     std::mutex cadence_mutex;
     std::condition_variable cadence;
     std::unique_lock cadence_lock(cadence_mutex);
     for (std::size_t tick = 1U; tick <= 32U; ++tick) {
-        for (int read = 0; read < 256; ++read) {
+        for (int read = 0; read < reads_per_tick; ++read) {
             std::size_t bytes_read = 0;
             assert(slow.ReadSomeWithin(std::chrono::milliseconds(200), 4096, &bytes_read) && bytes_read != 0U);
         }
@@ -5832,6 +5845,8 @@ void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false) 
     assert(logs.WaitContains("reply progress deadline exceeded", std::chrono::seconds(6)));
     assert(logs.Contains("phase=write"));
     assert(logs.Contains("reason=timeout"));
+    // The reply was written from its continuation, not from one encoded buffer.
+    assert(hook.largest_write.load() <= 65536U && hook.writes.load() >= 64U);
 }
 
 void TestIdlePeerCloseDoesNotLogTerminationWarning() {
@@ -8246,6 +8261,13 @@ int main(int argc, char** argv) {
                 failed = std::string_view(error.what()) == "injected first read failure";
             }
             assert(failed);
+        });
+        // 32 MiB replies: 16 MiB is read steadily, then the reader stops.
+        run("TestSteadyAreaReaderRenewsReplyProgressDeadline", [] {
+            TestSteadyReaderRenewsReplyProgressDeadline(false, "GET AREA 0 0 TO 0 0 FROM default", '*', 256U, 128);
+        });
+        run("TestSteadyScanReaderRenewsReplyProgressDeadline", [] {
+            TestSteadyReaderRenewsReplyProgressDeadline(false, "SCAN CHUNKS FROM default WITH DATA", '%', 256U, 128);
         });
         run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);
         run("TestPendingStatementQueueKeepsHelloAvailable", TestPendingStatementQueueKeepsHelloAvailable);
