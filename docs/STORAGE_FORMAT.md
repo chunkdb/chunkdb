@@ -483,6 +483,7 @@ Above the cut, a final record whose header or final checksum fails, or that exte
 That rule shares the live-WAL limit: a crash that loses an earlier unsynced record while a later one survives is refused, not repaired.
 A checksum-valid record with an invalid structure, a seal record, conflicting decisions and a receipt without its matching decision are damage.
 No path truncates a journal tail in this build.
+The internal coordinator can stage a generation-two ACTIVE root object that names an empty journal generation, but it never replaces the canonical INACTIVE root.
 Details are in [artifact I/O](design/COMMIT_OWNER_ARTIFACT_IO.md).
 
 ## Feed slots and archives

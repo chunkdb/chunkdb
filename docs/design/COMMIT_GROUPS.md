@@ -4,6 +4,7 @@ This planned contract covers [#136](https://github.com/chunkdb/chunkdb/issues/13
 Groups are not active in this build: the `commit_groups` feature is not registered, and the current guarantees are in [Durability](../DURABILITY_CONTRACT.md).
 The pure checked encodings are specified in [Commit group records](COMMIT_GROUP_FORMAT.md).
 Recovery, checkpoint and restore ownership are specified in [Group recovery](COMMIT_GROUP_RECOVERY.md).
+The inactive owner bootstrap and handover check of this build are described in [Group coordinator](COMMIT_GROUP_COORDINATOR.md).
 
 ## Ownership and identities
 
