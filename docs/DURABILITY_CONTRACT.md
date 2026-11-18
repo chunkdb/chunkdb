@@ -71,7 +71,8 @@ Malformed WAL headers and interior frames are refused; only crash-shaped incompl
 
 Keep `chunkdb.version` and `.chunkdb.initialized` with every table's artifacts.
 With both records missing, a writer refuses chunk artifacts or a startup inventory that is capped or unavailable.
-It leaves revision and recovery records unchanged; restore a consistent backup or reinitialize the whole store.
+It leaves revision and recovery records unchanged; restore a consistent backup, [rebuild the clock](REBUILD_VERSION_CLOCK.md) offline with `chunkdb_admin rebuild-version-clock`, or reinitialize the whole store.
+A missing or malformed clock beside a valid initialized marker, or a malformed marker, is also refused and has the same remedies.
 Read-only inspection remains available and reports an unknown completed revision as null.
 
 ## Platforms and scope
