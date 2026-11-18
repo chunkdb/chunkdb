@@ -2,6 +2,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <fstream>
+#include <future>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -291,6 +292,57 @@ void PassCoversPausedBoundary() {
     FeedSlotTestAccess::SetHook(*table, nullptr);
 }
 
+// A pass syncs what it drained without the publish lock, so a write and the
+// checkpoint it triggers finish while the pass still waits for its syncs. That
+// checkpoint is strict: the archive it publishes is synced, and the frontier
+// the pass persists covers only what the pass captured.
+void CheckpointDoesNotWaitForPassSyncs() {
+    ScopedTempDir directory("chunkdb-feed-slots-unlocked-syncs");
+    TableCatalog catalog(Configuration(directory.path()));
+    (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    const auto start = table->CreateFeedSlot("consumer").position;
+    SetBlocks(*table, {{0, 0}}, 1U);
+    std::uint64_t first;
+    { auto lease = table->Acquire(); first = lease->store().GetChunkVersion(0, 0); }
+    const SyncLog synced;
+    SyncPause pause(FeedSlotTestHook::Point::kAfterDrain);
+    FeedSlotTestAccess::SetHook(*table, &pause);
+    std::thread pass([&] { FeedSlotTestAccess::Sync(*table); });
+    const auto captured = pause.Wait();
+    assert(captured >= first);
+    const auto wal = WalOf(*table, directory.path(), 0, 0);
+    std::uint64_t later, publishes;
+    bool archived_synced;
+    {
+        auto lease = table->Acquire();
+        auto& store = lease->store();
+        const auto before = store.CheckpointPublishesDuringBarrierSyncsForTests();
+        auto checkpoint = std::async(std::launch::async, [&] {
+            store.SetBlockBits(0, 0, Bits(2U));
+            store.CheckpointForTests(0, 0);
+        });
+        // The pass stays paused before its syncs until the checkpoint ends.
+        assert(checkpoint.wait_for(10s) == std::future_status::ready);
+        checkpoint.get();
+        later = store.GetChunkVersion(0, 0);
+        publishes = store.CheckpointPublishesDuringBarrierSyncsForTests() - before;
+        // The checkpoint synced the WAL before archiving it; the pass has not synced yet.
+        archived_synced = synced.Contains(wal);
+    }
+    assert(later > captured && publishes == 1U && archived_synced);
+    pause.Release();
+    pass.join();
+    FeedSlotTestAccess::SetHook(*table, nullptr);
+    assert(Archives(directory.path()) == 1U && !std::filesystem::exists(wal));
+    assert(ReadFeedSlotRecords(TablePath(directory.path()), start.epoch)->durable_watermark == captured);
+    { auto reader = table->ReadFeedArchive(start);
+      assert(reader.Next()->position.revision == first && !reader.Next()); }
+    FeedSlotTestAccess::Sync(*table);
+    auto reader = table->ReadFeedArchive({start.epoch, first});
+    assert(reader.Next()->position.revision == later && !reader.Next());
+}
+
 void AmbiguousAcknowledgementPreservesArchives() {
     ScopedTempDir directory("chunkdb-feed-slots-ack-failure");
     const auto config = Configuration(directory.path());
@@ -541,6 +593,7 @@ int main() {
     FirstPassSyncsEveryFile();
     LaterPassSyncsNewWal();
     PassCoversPausedBoundary();
+    CheckpointDoesNotWaitForPassSyncs();
     AmbiguousAcknowledgementPreservesArchives();
     ArchiveAfterFailedDirectoryPreparationSyncsParent();
     LimitLossKeepsFastSlotAndSurvivesRestart();

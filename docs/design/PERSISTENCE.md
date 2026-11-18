@@ -110,7 +110,7 @@ Slot activation quiesces writers and maintenance and durably establishes a check
 Slot passes sync completed producer state and persist a durable frontier; WATCH SLOT emits only through that frontier, including relaxed writes.
 ACK positions are monotonic; [change feed](../reference/FEED.md#notes) describes persistence and acknowledgement batching.
 Archives are released only using persisted positions; a sync failure fences the store.
-Activation alone does not establish the permanent FLUSH WAL durability floor.
+A slot pass drains its tracked set and sets the FLUSH WAL durability floor under the checkpoint publication lock, then syncs without the lock, except on Windows and in a store's first pass; checkpoints and the writes waiting on them do not wait for its syncs.
 
 Online backup pins completed per-table cuts and copies their checked inventory before publishing the synced completion record.
 It captures schema, users and the completed migrations ledger under one metadata gate, waits for active migrations and refuses unfinished recovery, a fenced catalog or table.
