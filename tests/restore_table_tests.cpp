@@ -16,17 +16,20 @@ void RestoresIntoNewName() {
         StoreId restored{};
         {
             TableCatalog catalog(source.Config());
-            std::uint64_t reported_files = 0U, reported_bytes = 0U, total_files = 0U, total_bytes = 0U;
+            std::uint64_t reported_files = 0U, reported_bytes = 0U, total_files = 0U, total_bytes = 0U, calls = 0U;
             auto request = source.Request();
             request.progress = [&](std::uint64_t files, std::uint64_t bytes, std::uint64_t all_files, std::uint64_t all_bytes) {
-                assert(files > reported_files && bytes >= reported_bytes && files <= all_files && bytes <= all_bytes);
+                // The totals come first, before any file is copied.
+                if (calls++ == 0U) assert(files == 0U && bytes == 0U && all_files > 0U && all_bytes > 0U);
+                else assert(files > reported_files && bytes >= reported_bytes);
+                assert(files <= all_files && bytes <= all_bytes);
                 // Not visible until the restore publishes it.
                 assert(catalog.Find("t_restored") == nullptr && !std::filesystem::exists(source.data / "tables/t_restored"));
                 reported_files = files; reported_bytes = bytes; total_files = all_files; total_bytes = all_bytes;
             };
             const auto result = catalog.RestoreTable(request);
             assert(result.name == "t_restored" && result.parent_epoch == source.epoch && result.fork_revision == source.cut);
-            assert(result.files == total_files && reported_files == total_files);
+            assert(result.files == total_files && reported_files == total_files && calls == total_files + 1U);
             assert(result.bytes == total_bytes && reported_bytes == total_bytes && total_bytes > 0U);
             restored = result.epoch;
             source.CheckRestored(catalog, "t_restored", restored);
