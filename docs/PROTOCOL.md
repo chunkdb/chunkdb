@@ -90,8 +90,10 @@ See [session negotiation](design/PROTOCOL_FOUNDATION.md#handshake-and-session-ow
 
 ## Session controls
 
-`SHOW CONNECTIONS` returns an array of maps containing `id`, `user`, `peer`, `state`, and `statement`.
+`SHOW CONNECTIONS` returns an array of maps containing `id`, `user`, `peer`, `state`, `statement`, and `progress`.
 An unauthenticated user or an idle statement is represented by NULL in its field.
+`progress` is NULL unless the running statement reports progress; a running `RESTORE TABLE` reports a map of integers `files_done`, `files_total`, `bytes_done`, and `bytes_total` for its copy of the backup.
+The map appears when the copy starts; `progress` is NULL while the restore checks the backup before the copy and once the statement completes, including while its reply is written.
 The reply includes every authorized connection or fails with `OUT_OF_RANGE reason=response_limit`; it never truncates the listing.
 Users control sessions belonging to their current user incarnation; ADMIN on `*` may control every session.
 
