@@ -360,6 +360,50 @@ void ChunkCoordinateIndex::ObserveRecoveredIdentity(const ChunkCoord& coord, std
     maximum_recovered_revision_ = std::max(maximum_recovered_revision_, revision);
 }
 
+void ChunkCoordinateIndex::RefreshReadOnly(std::span<const RecoveredCoordinateIdentity> updates,
+    const ChunkCoordinateIndex& retained, const std::function<void()>& validate) {
+    if (!read_only_ || !retained.read_only_) throw std::logic_error("incremental refresh requires a read-only index");
+    std::map<ChunkCoord, ChunkCoordinateNode> nodes;
+    std::set<ChunkCoord> populated;
+    auto highest = maximum_recovered_revision_;
+    for (const auto& update : updates) {
+        if (update.revision == 0U && update.populated)
+            throw std::invalid_argument("unwritten recovered coordinate is populated");
+        auto& node = nodes.try_emplace(update.coord).first->second;
+        node.retained_empty = retained.EmptyBoundary(update.coord);
+        auto revision = update.revision;
+        auto live = update.populated;
+        if (node.retained_empty && revision <= node.retained_empty->revision) {
+            if (revision == node.retained_empty->revision && live)
+                throw std::runtime_error("committed empty boundary conflicts with a populated chunk");
+            revision = node.retained_empty->kind == ChunkIndexKind::kForget ? 0U : node.retained_empty->revision;
+            live = false;
+        }
+        node.revision.store(revision, std::memory_order_relaxed);
+        node.populated.store(live, std::memory_order_relaxed);
+        if (live) populated.insert(update.coord);
+        else populated.erase(update.coord);
+        highest = std::max(highest, revision);
+    }
+    validate();
+    // Node handles make this publication allocation-free. Page readers take
+    // the same lock and cannot observe half of a multi-coordinate refresh.
+    std::lock_guard lock(mutex_);
+    for (auto at = nodes.begin(); at != nodes.end();) {
+        const auto coord = at->first;
+        populated_.erase(coord);
+        coordinates_.erase(coord);
+        auto node = nodes.extract(at++);
+        if (node.mapped().revision.load(std::memory_order_relaxed) != 0U || node.mapped().retained_empty)
+            coordinates_.insert(std::move(node));
+    }
+    populated_.merge(populated);
+    maximum_recovered_revision_ = highest;
+    if (highest != 0U) any_written_.store(true, std::memory_order_release);
+    deletion_floor_.store(retained.retained_deletion_floor(), std::memory_order_release);
+    inventory_generation_.store(retained.inventory_generation(), std::memory_order_release);
+}
+
 ChunkCoordinateNode* ChunkCoordinateIndex::Find(const ChunkCoord& coord) {
     Check();
     std::lock_guard lock(mutex_);

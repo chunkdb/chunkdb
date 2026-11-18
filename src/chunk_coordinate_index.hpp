@@ -2,6 +2,7 @@
 
 #include <atomic>
 #include <filesystem>
+#include <functional>
 #include <map>
 #include <mutex>
 #include <optional>
@@ -58,6 +59,12 @@ struct CoordinatePage {
     bool more = false;
 };
 
+struct RecoveredCoordinateIdentity {
+    ChunkCoord coord;
+    std::uint64_t revision = 0U;
+    bool populated = false;
+};
+
 class ChunkCoordinateIndex {
   public:
     ChunkCoordinateIndex(std::filesystem::path root, const Geometry& geometry,
@@ -74,6 +81,10 @@ class ChunkCoordinateIndex {
     // Candidate construction only; no request may use this owner yet.
     void ObserveRecovered(const ChunkCoord& coord, const ChunkState& state);
     void ObserveRecoveredIdentity(const ChunkCoord& coord, std::uint64_t revision, bool populated);
+    // Prepare every allocation and validate the complete publication before
+    // atomically replacing only the changed nodes of a read-only index.
+    void RefreshReadOnly(std::span<const RecoveredCoordinateIdentity> updates,
+        const ChunkCoordinateIndex& retained, const std::function<void()>& validate);
     // A borrowed node is used only under its canonical chunk's exclusive lock.
     [[nodiscard]] ChunkCoordinateNode* Find(const ChunkCoord& coord);
     [[nodiscard]] bool IsPopulationCandidate(const ChunkCoord& coord) const;

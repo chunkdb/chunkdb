@@ -39,6 +39,7 @@ data_dir/
     chunkdb.version                   reserved revision ceiling
     chunkdb.snapshot                  checked writer-session crash fence
     chunkdb.snapshot.live             volatile mapped artifact generation
+    chunkdb.snapshot.changes          volatile coordinate change ring
     .chunkdb.lock/snapshot.writer     writer-lifetime coordination lock
     .chunkdb.lock/snapshot.owner      lock that excludes a second writer
     .chunkdb.initialized              checked revision-clock initialization marker
@@ -395,6 +396,14 @@ Writer startup replaces this volatile file once; artifact guards update only its
 Bit 0 is odd while publishing, bit 1 records a failed epoch, bits 2–17 count active guards, and bits 18–63 count completed epochs.
 The last successful guard publishes a new even counter synchronously; failed epochs remain odd until recovery.
 Lock-free aligned 64-bit mapped atomics are required; unsupported platforms are refused.
+
+The optional `chunkdb.snapshot.changes` file accelerates read-only coordinate-index refresh without changing the durable storage format.
+Its 32-byte header is `CKSC`, format `1:u32`, writer session `u64`, CRC32 over the first 16 bytes, zero `u32`, and an aligned native little-endian `u64` append cursor at offset 24.
+The header is followed by 4096 ring entries, each containing four aligned native little-endian 64-bit words: signed chunk x, y, z and a kind (`1` for a coordinate, `0` for table-wide invalidation).
+Writers serialize appends inside their odd snapshot bracket before changing artifacts; entries and cursor use mapped atomics, and the last guard's even publication orders their visibility with the artifacts.
+The file is replaced at writer startup, is never a durable authority and is omitted from backups.
+Readers require the same writer session, a retained interval of at most 4096 entries containing no invalidation, and equal-even observations around collection and publication; otherwise they perform full artifact admission.
+An absent file supports older writers through full admission, while a malformed present file fails validation.
 
 A writer first takes an exclusive lock on `.chunkdb.lock/snapshot.owner`, which readers never open, so a second writer is refused.
 It then tests `.chunkdb.lock/snapshot.writer` with a shared lock, refusing an exclusive holder, and waits for its exclusive lock, which it holds through shutdown.

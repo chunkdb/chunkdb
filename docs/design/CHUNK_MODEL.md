@@ -91,9 +91,15 @@ The checked `CKII` inventory lists sorted unique large coordinates, each log's c
 Its independently checksummed fixed header includes a nonzero monotonic inventory generation, advanced by each inventory publication and never reused within a table identity.
 Read-only point reads may reuse a completely admitted retained-boundary index only when that header's identity and generation still match inside the same stable snapshot bracket as their image and WAL.
 An ordinary block write changes the table snapshot generation without changing the inventory generation, so refreshing a point does not rebuild every retained shard after unrelated writes.
-Read-only scans and area reads rebuild their complete live-coordinate candidate index from a walk of the large-chunk directories, loading every image and WAL found, when the table snapshot generation changes after a writer publication, and publish it only after one unchanged equal-even whole-index observation.
-That private candidate index also includes producing revision and population copied under the locks of point-cache entries admitted at the same generation, preserving their existing cache authority until the generation changes.
-Cache ownership is pinned before taking individual chunk locks, and the published candidate contains scalar hints rather than borrowed cache pointers.
+Read-only scans and area reads admit all artifacts once, then refresh only coordinates recorded by the writer's volatile change ring inside its snapshot publication bracket.
+WAL flushes and repairs, full-chunk writes, transactions and checkpoints record their coordinates before changing artifacts, including new coordinates and empty states; repeated coordinates are loaded only once per refresh.
+The ring is bounded to 4096 entries and belongs to one writer session; a reader without a complete retained interval, after a restart, or across table-wide compaction performs full artifact admission instead.
+Older writers without a change ring remain readable through full admission; the ring supplies candidates, never data, commit decisions or retained deletion authority.
+Changed artifacts pass the same path and header validation as initial admission.
+When the inventory generation changes, changed coordinates take their retained boundaries from a newly admitted inventory; a tombstone is published inside its checkpoint's recorded bracket, and compaction records a table-wide invalidation.
+Producing revision and population copied under the locks of point-cache entries admitted at the same generation preserve their existing cache authority until the generation changes.
+Cache ownership is pinned before taking individual chunk locks; every allocation and artifact read finishes before an unchanged equal-even observation permits one allocation-free index update under its membership lock.
+An interrupted writer publication or a raced refresh publishes no partial index and advances no reader cursor.
 Every listed boundary covers a complete header and whole records; a listed log shorter than that boundary is damage.
 Recovery validates complete inventory and logs before mutating artifacts, resolves rollback intents, then reconciles committed image and WAL state.
 Conditional intent names encode exactly the table's dimensions and canonical shard placement.
@@ -115,7 +121,7 @@ Initial table staging contains a synced empty inventory before its catalog entry
 Direct store initialization also publishes the empty inventory before its manifest.
 Without a manifest, only a checked empty inventory with zero deletion floors and no other owned storage state may be adopted under exclusive admission, preserving its table identity and requiring matching dimensions.
 Owned temporary files from that unpublished initialization may then be removed; an inventory retaining any coordinate or compaction decision is never treated as a new store.
-Read-only readers rebuild on a changed equal-even snapshot generation and publish no partial index.
+Read-only readers refresh on a changed equal-even snapshot generation and publish no partial index.
 
 Collection durably publishes the emptying commit's tombstone and any new inventory entry before removing image or WAL files.
 The tombstone preserves the producing revision and time and records the schema of the retained empty baseline; collection allocates no user revision.

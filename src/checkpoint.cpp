@@ -190,7 +190,7 @@ bool ChunkStore::CheckpointChunk(
         FlushWalBatch(chunk_coord, chunk, false);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_WAL_FLUSH_ONCE")) std::_Exit(86);
     }
-    SnapshotGenerationWriteGuard snapshot_write(this);
+    SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
     bool image_committed = false;
     const auto data_path = ChunkDataPath(data_dir_, geometry_, chunk_coord);
     const auto wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
