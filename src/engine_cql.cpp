@@ -2016,22 +2016,28 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::AlterUser& alter) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
-                    if (alter.verifier.has_value()) {
+                    if (alter.verifier.has_value() || alter.added_verifier.has_value() || alter.drop_old_verifier) {
+                        const auto verifier = [&] {
+                            return VerifierFrom(alter.verifier ? *alter.verifier : *alter.added_verifier, parameters);
+                        };
                         // A user may change their own password: the incarnation
                         // it logged in as, not a user created again under its name.
                         if (config_.require_auth && alter.user == session.user) {
-                            if (!config_.users->SetOwnVerifier(alter.user, session.user_incarnation,
-                                    VerifierFrom(*alter.verifier, parameters))) {
+                            const std::uint64_t incarnation = session.user_incarnation;
+                            const bool current = alter.verifier
+                                ? config_.users->SetOwnVerifier(alter.user, incarnation, verifier())
+                                : alter.added_verifier ? config_.users->AddOwnVerifier(alter.user, incarnation, verifier())
+                                : config_.users->DropOwnOldVerifier(alter.user, incarnation);
+                            if (!current) {
                                 session.close_after_reply = true;
                                 throw UserDroppedError();
                             }
                             return Protocol::SimpleString("OK");
                         }
                         RequireManagesUsers(session);
-                        if (config_.users == nullptr) {
-                            throw std::invalid_argument("this server runs without users (--auth none)");
-                        }
-                        config_.users->SetVerifier(alter.user, VerifierFrom(*alter.verifier, parameters));
+                        if (alter.verifier) config_.users->SetVerifier(alter.user, verifier());
+                        else if (alter.added_verifier) config_.users->AddVerifier(alter.user, verifier());
+                        else config_.users->DropOldVerifier(alter.user);
                     } else if (alter.max_connections || alter.statements_per_sec) {
                         RequireManagesUsers(session);
                         config_.users->SetLimits(alter.user, alter.max_connections, alter.statements_per_sec);

@@ -164,8 +164,15 @@ ServerExchange::ServerExchange(
     Verifier verifier,
     std::string_view server_nonce,
     std::span<const std::uint8_t> binding_data)
+    : ServerExchange(std::move(first), std::vector<Verifier>{std::move(verifier)}, server_nonce, binding_data) {}
+
+ServerExchange::ServerExchange(
+    ClientFirst first,
+    std::vector<Verifier> verifiers,
+    std::string_view server_nonce,
+    std::span<const std::uint8_t> binding_data)
     : first_(std::move(first)),
-      verifier_(std::move(verifier)),
+      verifiers_(std::move(verifiers)),
       nonce_(first_.nonce + std::string(server_nonce)),
       channel_binding_(ChannelBindingAttribute(first_.gs2_header, binding_data)) {
     if ((first_.binding == BindingFlag::kBound) == binding_data.empty()) {
@@ -174,11 +181,20 @@ ServerExchange::ServerExchange(
     if (!ValidNonce(server_nonce)) {
         throw std::invalid_argument("a SCRAM nonce is printable ASCII without commas");
     }
-    server_first_ = "r=" + nonce_ + ",s=" + crypto::Base64Encode(verifier_.salt) + ",i=" +
-                    std::to_string(verifier_.iterations);
+    if (verifiers_.empty()) {
+        throw std::invalid_argument("a SCRAM exchange needs a verifier");
+    }
+    const Verifier& first_verifier = verifiers_.front();
+    for (const Verifier& other : verifiers_) {
+        if (other.salt != first_verifier.salt || other.iterations != first_verifier.iterations) {
+            throw std::invalid_argument("the verifiers of one SCRAM exchange share one salt and iteration count");
+        }
+    }
+    server_first_ = "r=" + nonce_ + ",s=" + crypto::Base64Encode(first_verifier.salt) + ",i=" +
+                    std::to_string(first_verifier.iterations);
 }
 
-std::optional<std::string> ServerExchange::Finish(std::string_view client_final) const {
+std::optional<std::string> ServerExchange::Finish(std::string_view client_final, std::size_t* verifier) const {
     const std::string expected_start = channel_binding_ + ",r=" + nonce_ + ",p=";
     if (client_final.substr(0, expected_start.size()) != expected_start) {
         // A bound login that continues this exchange with other binding
@@ -197,15 +213,23 @@ std::optional<std::string> ServerExchange::Finish(std::string_view client_final)
     }
     const std::string without_proof(client_final.substr(0, expected_start.size() - 3));
     const std::string auth_message = first_.bare + "," + server_first_ + "," + without_proof;
-    const auto client_signature = crypto::HmacSha256(verifier_.stored_key, crypto::Bytes(auth_message));
-    crypto::Sha256Digest client_key{};
-    for (std::size_t i = 0; i < client_key.size(); ++i) {
-        client_key[i] = static_cast<std::uint8_t>((*proof)[i] ^ client_signature[i]);
+    // Every verifier is checked, so the time taken does not tell which matched.
+    std::optional<std::size_t> matched;
+    for (std::size_t index = 0; index < verifiers_.size(); ++index) {
+        const auto client_signature = crypto::HmacSha256(verifiers_[index].stored_key, crypto::Bytes(auth_message));
+        crypto::Sha256Digest client_key{};
+        for (std::size_t i = 0; i < client_key.size(); ++i) {
+            client_key[i] = static_cast<std::uint8_t>((*proof)[i] ^ client_signature[i]);
+        }
+        if (crypto::ConstantTimeEqual(crypto::Sha256Of(client_key), verifiers_[index].stored_key) && !matched) {
+            matched = index;
+        }
     }
-    if (!crypto::ConstantTimeEqual(crypto::Sha256Of(client_key), verifier_.stored_key)) {
+    if (!matched) {
         return std::nullopt;
     }
-    return "v=" + crypto::Base64Encode(crypto::HmacSha256(verifier_.server_key, crypto::Bytes(auth_message)));
+    if (verifier != nullptr) *verifier = *matched;
+    return "v=" + crypto::Base64Encode(crypto::HmacSha256(verifiers_[*matched].server_key, crypto::Bytes(auth_message)));
 }
 
 ClientLogin StartClientLogin(std::string_view user, std::string_view nonce, std::string_view binding_type) {

@@ -326,6 +326,31 @@ void TestStatementEvents() {
     assert(!Contains(text, "SET BLOCK") && !Contains(text, "GET BLOCK"));
 }
 
+// ADD VERIFIER and DROP OLD VERIFIER are audited as alter_user, a refused one
+// with its code, and no verifier reaches the file.
+void TestVerifierRotationEvents() {
+    Engine e;
+    auto admin = e.Admin(3);
+    const std::vector<std::uint8_t> salt(16U, 9U);
+    const auto verifier = [&salt](const std::string& password) {
+        return chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier(password, salt, chunkdb::scram::kMinIterations));
+    };
+    assert(e.Run(admin, "CREATE USER bot VERIFIER $1", {verifier("bot-old-password")}) == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot ADD VERIFIER $1", {verifier("bot-new-password")}) == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot ADD VERIFIER $1", {Verifier("bot-third-password")}).rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+    assert(e.Run(admin, "ALTER USER bot DROP OLD VERIFIER") == "+OK\r\n");
+    const auto lines = Lines(e.audit_path);
+    std::size_t done = 0, refused = 0;
+    for (const auto& line : lines) {
+        if (!Contains(line, "\"event\":\"alter_user\"") || !Contains(line, "\"target_user\":\"bot\"")) continue;
+        if (Contains(line, "\"ok\":true")) ++done;
+        if (Contains(line, "\"ok\":false") && Contains(line, "\"error_code\":\"INVALID_ARGUMENT\"")) ++refused;
+    }
+    assert(done == 2U && refused == 1U);
+    const auto text = ReadAll(e.audit_path);
+    assert(!Contains(text, "SCRAM-SHA-256") && !Contains(text, "password\""));
+}
+
 // A statement of a connection whose user was dropped is audited as refused.
 void TestDroppedUserEvents() {
     Engine e;
@@ -561,6 +586,7 @@ int main() {
     TestAdmissionLoginEvents();
     TestCredentialsChangedDuringLoginEvents();
     TestStatementEvents();
+    TestVerifierRotationEvents();
     TestDroppedUserEvents();
     TestEnableFeatureEvents();
     TestFileAndReopen();

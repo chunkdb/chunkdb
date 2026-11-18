@@ -440,6 +440,14 @@ void TestAlterAndOtherStatements() {
     assert(require.requires_channel_binding == true && !require.manages_users.has_value() && !require.verifier.has_value());
     assert(Get<cql::AlterUser>("ALTER USER bot NO REQUIRE CHANNEL BINDING").requires_channel_binding == false);
     assert(!rekey.requires_channel_binding.has_value());
+    const auto add_verifier = Get<cql::AlterUser>("ALTER USER bot ADD VERIFIER $1", 1);
+    assert(add_verifier.added_verifier == cql::Literal(cql::Parameter{.index = 1}) && !add_verifier.verifier &&
+        !add_verifier.drop_old_verifier);
+    const auto drop_old = Get<cql::AlterUser>("alter user bot drop old verifier");
+    assert(drop_old.drop_old_verifier && !drop_old.verifier && !drop_old.added_verifier && !rekey.drop_old_verifier);
+    for (const auto line : {"ALTER USER bot ADD VERIFIER", "ALTER USER bot ADD VERIFIER 12", "ALTER USER bot ADD $1",
+        "ALTER USER bot DROP VERIFIER", "ALTER USER bot DROP OLD", "ALTER USER bot DROP OLD VERIFIER $1"})
+        ExpectError(line, "");
     assert(Get<cql::DropUser>("DROP USER bot").user == "bot");
     const auto grant = Get<cql::GrantRight>("GRANT WRITE ON world TO bot");
     assert(!grant.revoke && grant.right == chunkdb::Right::kWrite && grant.table == "world" && grant.user == "bot");

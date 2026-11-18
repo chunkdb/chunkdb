@@ -56,6 +56,7 @@ Users Sample() {
     };
     users.users["bot"] = User{
         .verifier = chunkdb::scram::MakeVerifier("hunter2", salt, 8192),
+        .added_verifier = chunkdb::scram::MakeVerifier("hunter3", salt, 8192),
         .manages_users = false,
         .grants = {{"world", Right::kWrite}, {"*", Right::kRead}},
     };
@@ -185,6 +186,15 @@ void TestWriterValidation() {
     bad = good;
     bad.users.at("admin").statements_per_sec = chunkdb::kMaxUserStatementsPerSecond + 1U;
     cases.emplace_back(bad, "statements_per_sec");
+    bad = good;
+    bad.users.at("bot").added_verifier->salt.assign(16U, 0x5b);
+    cases.emplace_back(bad, "salt and iteration count");
+    bad = good;
+    bad.users.at("bot").added_verifier->iterations = 4096U;
+    cases.emplace_back(bad, "salt and iteration count");
+    bad = good;
+    bad.users.at("bot").added_verifier = bad.users.at("bot").verifier;
+    cases.emplace_back(bad, "must differ");
 
     chunkdb::test::ScopedTempDir dir("chunkdb-users-writer-validation");
     chunkdb::WriteUsersFile(dir.path(), good);
@@ -281,7 +291,7 @@ void TestLimitsAndMandatoryFields() {
     Users one;
     one.users.emplace("admin", users.users.at("admin"));
     const auto bytes = chunkdb::EncodeUsers(one);
-    assert(bytes[4] == 2U && bytes[5] == 0U && bytes[6] == 0U && bytes[7] == 0U);
+    assert(bytes[4] == 3U && bytes[5] == 0U && bytes[6] == 0U && bytes[7] == 0U);
     // The last user's two mandatory u64 fields precede the complete CRC.
     for (std::size_t i = 0; i < 8U; ++i) assert(bytes[bytes.size() - 20U + i] == 0xffU);
     assert(bytes[bytes.size() - 12U] == 0U && bytes[bytes.size() - 10U] == 1U);
@@ -368,6 +378,10 @@ struct RawUser {
     std::string name = "bot";
     std::size_t salt_bytes = 16;
     std::string table = "world";
+    // Version 2 has no added verifier count.
+    std::uint32_t version = 3;
+    std::uint8_t added_verifiers = 0;
+    std::uint8_t added_key = 0x22;
 };
 
 std::vector<std::uint8_t> RawUsersFile(const RawUser& raw) {
@@ -385,7 +399,7 @@ std::vector<std::uint8_t> RawUsersFile(const RawUser& raw) {
         u16(value.size());
         out.insert(out.end(), value.begin(), value.end());
     };
-    u32(2);
+    u32(raw.version);
     out.insert(out.end(), 32, 0x07);
     u32(1);
     text(raw.name);
@@ -394,6 +408,10 @@ std::vector<std::uint8_t> RawUsersFile(const RawUser& raw) {
     u16(raw.salt_bytes);
     out.insert(out.end(), raw.salt_bytes, 0x5a);
     out.insert(out.end(), 64, 0x11);
+    if (raw.version >= 3U) {
+        out.push_back(raw.added_verifiers);
+        for (std::uint8_t i = 0; i < raw.added_verifiers; ++i) out.insert(out.end(), 64, static_cast<std::uint8_t>(raw.added_key + i));
+    }
     u32(1);
     text(raw.table);
     out.push_back(static_cast<std::uint8_t>(Right::kRead));
@@ -411,6 +429,20 @@ void TestFieldBounds() {
     const auto longest = chunkdb::DecodeUsers(RawUsersFile({.salt_bytes = chunkdb::scram::kMaxSaltBytes}));
     assert(chunkdb::EncodeUsers(longest) == RawUsersFile({.salt_bytes = chunkdb::scram::kMaxSaltBytes}));
     (void)chunkdb::DecodeUsers(RawUsersFile({.table = "*"}));
+
+    // A version 2 file, without added verifiers, is still read; the writer
+    // then writes version 3.
+    const auto old = chunkdb::DecodeUsers(RawUsersFile({.version = 2}));
+    assert(old == valid && !old.users.at("bot").added_verifier.has_value());
+    assert(chunkdb::EncodeUsers(old) == RawUsersFile({}));
+    const auto two = chunkdb::DecodeUsers(RawUsersFile({.added_verifiers = 1}));
+    const auto& added = two.users.at("bot").added_verifier;
+    assert(added && added->salt == valid.users.at("bot").verifier.salt && added->iterations == chunkdb::scram::kMinIterations);
+    assert(added->stored_key[0] == 0x22U && added->server_key[31] == 0x22U);
+    assert(chunkdb::EncodeUsers(two) == RawUsersFile({.added_verifiers = 1}));
+    ExpectInvalid([] { (void)chunkdb::DecodeUsers(RawUsersFile({.added_verifiers = 2})); }, "more than two verifiers");
+    ExpectInvalid([] { (void)chunkdb::DecodeUsers(RawUsersFile({.added_verifiers = 1, .added_key = 0x11})); }, "repeats a verifier of user bot");
+    ExpectInvalid([] { (void)chunkdb::DecodeUsers(RawUsersFile({.version = 4})); }, "version 4, which this build does not read");
 
     ExpectInvalid([] { (void)chunkdb::DecodeUsers(RawUsersFile({.salt_bytes = 15})); }, "15-byte verifier salt, outside 16..256");
     ExpectInvalid([] { (void)chunkdb::DecodeUsers(RawUsersFile({.salt_bytes = 257})); }, "257-byte verifier salt, outside 16..256");

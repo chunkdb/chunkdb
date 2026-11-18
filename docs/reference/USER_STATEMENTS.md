@@ -57,6 +57,8 @@ OK
 ```text
 CREATE USER [IF NOT EXISTS] user VERIFIER verifier [MANAGES USERS] [REQUIRE CHANNEL BINDING]
 ALTER USER user VERIFIER verifier
+ALTER USER user ADD VERIFIER verifier
+ALTER USER user DROP OLD VERIFIER
 ALTER USER user [NO] MANAGES USERS
 ALTER USER user LIMIT max_connections = n [, statements_per_sec = n]
 ALTER USER user LIMIT statements_per_sec = n
@@ -69,6 +71,11 @@ REVOKE right [, right ...] ON table | * FROM user
 
 The CLI accepts PASSWORD in place of VERIFIER and prompts twice unless you provide `--new-password-file`.
 VERIFIER accepts a quoted value or a binary client parameter.
+VERIFIER makes the verifier the user's only one.
+ADD VERIFIER gives the user a second verifier, and the user logs in with either password; see [Rotate a password](../USERS.md#rotate-a-password).
+The added verifier must use the salt and iteration count of the user's verifier, and a user has at most two.
+ADD VERIFIER with a verifier the user already has changes nothing.
+DROP OLD VERIFIER removes the older verifier, so only the added one logs in; on a user with one verifier it changes nothing.
 LIMIT requires MANAGES USERS and accepts either setting once, in either order.
 Zero disables a limit; `statements_per_sec` is at most 65536.
 Lowering `max_connections` leaves existing connections open and refuses new logins until their count falls below the limit.
@@ -77,6 +84,7 @@ CANCEL, KILL and ROLLBACK remain available when the statement limit is reached.
 Limit refusals return RATE_LIMITED with `reason` and `retry_after_ms` without applying the request or changing its transaction.
 Dropping and recreating a user does not transfer the old user's authenticated sessions to the new identity.
 A login still between HELLO and AUTH when the user gets a new verifier, gets REQUIRE CHANNEL BINDING for an unbound login, or is dropped fails with AUTH_FAILED.
+A login still between HELLO and AUTH when its password's verifier is removed by DROP OLD VERIFIER also fails with AUTH_FAILED; ADD VERIFIER does not stop a login.
 A right AUTH proof made before any other change of the user's verifier or channel binding requirement returns AUTH_FAILED with `reason=stale_login` without counting a bad password.
 A user dropped after a right AUTH proof was checked and before the connection is admitted also returns AUTH_FAILED with `reason=stale_login`.
 An unconfirmed users-record replacement returns OUTCOME_UNKNOWN with `stage=users_record` and publishes the whole visible record.
@@ -105,13 +113,14 @@ See [Protocol](../PROTOCOL.md) for authentication encoding.
 | --- | --- | --- |
 | PERMISSION_DENIED | You lack MANAGES USERS or change another user's password without it. | Request access. |
 | INVALID_ARGUMENT | The name, verifier, rights, or final manager removal is invalid. | Correct the reported argument. |
+| INVALID_ARGUMENT | ADD VERIFIER names a user with two verifiers, or a verifier with another salt or iteration count. | Run DROP OLD VERIFIER first, or compute the verifier with the user's salt and iteration count. |
 | INVALID_ARGUMENT | You change a user or a right on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | RATE_LIMITED | Repeated failures temporarily ban the source address. | Wait for the returned retry_after_ms. |
 | AUTH_FAILED | Login credentials are incorrect. | Check the password or use [Reset a forgotten password](../PASSWORD_RESET.md). |
 
 ## Notes
 
-You may change your own password without MANAGES USERS.
+You may change your own password without MANAGES USERS, including ADD VERIFIER and DROP OLD VERIFIER.
 The last user who manages users cannot be dropped or lose that right.
 Changes affect connections already logged in.
 Passwords use their exact UTF-8 bytes, without normalization.

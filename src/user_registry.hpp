@@ -100,10 +100,22 @@ class UserRegistry {
     // is evaluated only after the registry lock confirms the user is absent.
     void Create(const std::string& name, const std::function<scram::Verifier()>& make_verifier,
         bool manages_users, bool if_not_exists = false, bool requires_channel_binding = false);
+    // Makes `verifier` the only verifier of `name`.
     void SetVerifier(const std::string& name, scram::Verifier verifier);
     // Sets the verifier of `name` only while it is still `incarnation`;
     // false, changing nothing, once that user was dropped.
     [[nodiscard]] bool SetOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier);
+    // Adds `verifier` as the second verifier of `name`, which then logs in
+    // with either. Also refuses a user that already has two and a verifier
+    // that RequireAddableVerifier refuses. A verifier the user already has
+    // changes nothing, so a retry succeeds.
+    void AddVerifier(const std::string& name, scram::Verifier verifier);
+    // DropOldVerifier makes the added verifier of `name` its only one. A
+    // user with one verifier is left as it is.
+    void DropOldVerifier(const std::string& name);
+    // The same for the user's own verifiers, like SetOwnVerifier.
+    [[nodiscard]] bool AddOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier);
+    [[nodiscard]] bool DropOwnOldVerifier(const std::string& name, std::uint64_t incarnation);
     void SetManagesUsers(const std::string& name, bool manages_users);
     void SetRequiresChannelBinding(const std::string& name, bool requires_channel_binding);
     void Drop(const std::string& name, bool if_exists = false);
@@ -127,6 +139,10 @@ class UserRegistry {
     void Update(Change&& change);
     template <typename Change>
     void UpdateIf(Change&& change);
+    // Applies `change` to the user `name` while it is still `incarnation`;
+    // false once that user was dropped.
+    template <typename Change>
+    [[nodiscard]] bool UpdateOwn(const std::string& name, std::uint64_t incarnation, Change&& change);
     [[nodiscard]] std::shared_ptr<const Users> Published() const;
     // What publishing `next` changes besides it: admission state, the
     // incarnation of each user and the rights view. Prepared under mutex_
