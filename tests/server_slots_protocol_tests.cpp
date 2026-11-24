@@ -1600,10 +1600,11 @@ void PartitionDimensional(bool tls) {
     const auto low = Number(writer->Command("SET BLOCK 0 0 0 IN t n = 1"));
     const auto high = Number(writer->Command("SET BLOCK 0 0 2 IN t n = 2"));
     FeedSlotTestAccess::Sync(*table);
-    const auto near = next(*one);
-    assert(Number(near.items[2]) == low && near.items[6].items.size() == 1U && near.items[6].items[0].items[2].value == "0");
-    const auto far = next(*zero);
-    assert(Number(far.items[2]) == high && far.items[6].items.size() == 1U && far.items[6].items[0].items[2].value == "2");
+    // Windows headers define near and far as macros, so the names say z.
+    const auto at_z0 = next(*one);
+    assert(Number(at_z0.items[2]) == low && at_z0.items[6].items.size() == 1U && at_z0.items[6].items[0].items[2].value == "0");
+    const auto at_z2 = next(*zero);
+    assert(Number(at_z2.items[2]) == high && at_z2.items[6].items.size() == 1U && at_z2.items[6].items[0].items[2].value == "2");
     assert(!zero->Ready(100ms) && !one->Ready(100ms));
     Unwatch(*zero); Unwatch(*one);
 }
