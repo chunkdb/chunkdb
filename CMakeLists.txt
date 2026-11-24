@@ -1498,6 +1498,12 @@ if(CHUNKDB_BUILD_TESTS)
         txn_kill
         txn_concurrency
         docs_check
+        alter_column
+        schema_check
+        txn_read_only
+        user_admission
+        maintenance_pool
+        admin_rebuild_version_clock
     )
     if(WIN32)
         add_test(
@@ -1523,6 +1529,7 @@ if(CHUNKDB_BUILD_TESTS)
         table_tombstones_crash
         commit_owner_artifact_io_crash
         commit_group_coordinator_crash
+        recover_table
     )
 
     if(TARGET chunkdb_server_tls_error_queue_test)
