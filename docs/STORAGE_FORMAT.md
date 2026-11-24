@@ -84,11 +84,11 @@ The server opens read-write and therefore refuses either of the first two unknow
 Table incompat bit 0 (`0x1`) enables durable feed slots, USER WAL metadata, and collection-frame flags; it remains set after slot removal.
 Directory and table incompat bit 5 (`0x20`), named `chunk_model`, owns dimensional geometry, both column domains, sectioned forms, and retained coordinate decisions.
 Directory and table incompat bit 6 (`0x40`) is reserved for commit groups, which this build does not provide: it never sets the bit, `ENABLE FEATURE` does not accept it, and a directory or table that records it is refused as an unknown feature.
-Earlier development envelopes are refused before artifact mutation; they require recreating the data directory.
+Envelopes of 1.x and of development builds of 2.0 are refused before any artifact changes; such a data directory must be recreated.
 
 Data-directory incompat bit 1 (`0x2`) enables named migrations.
 New directories enable every registered baseline feature before serving requests.
-Existing directories retain their masks until explicit `ENABLE FEATURE`; slot creation and migrations never enable missing bits.
+A directory keeps its masks until an explicit `ENABLE FEATURE`; slot creation and migrations never enable missing bits.
 An image's or WAL header's features must be a subset of its table manifest's features.
 Unknown option, image-section, WAL-TLV, or WAL-record types may be skipped only when an enclosing feature set has an unknown bit.
 WAL parsing also considers the manifest’s features.
@@ -421,7 +421,7 @@ The header is followed by 4096 ring entries, each containing four aligned native
 Writers serialize appends inside their odd snapshot bracket before changing artifacts; entries and cursor use mapped atomics, and the last guard's even publication orders their visibility with the artifacts.
 The file is replaced at writer startup, is never a durable authority and is omitted from backups.
 Readers require the same writer session, a retained interval of at most 4096 entries containing no invalidation, and equal-even observations around collection and publication; otherwise they perform full artifact admission.
-An absent file supports older writers through full admission, while a malformed present file fails validation.
+An absent file means full admission, while a malformed present file fails validation.
 
 A writer first takes an exclusive lock on `.chunkdb.lock/snapshot.owner`, which readers never open, so a second writer is refused.
 It then tests `.chunkdb.lock/snapshot.writer` with a shared lock, refusing an exclusive holder, and waits for its exclusive lock, which it holds through shutdown.
@@ -433,7 +433,7 @@ A dead writer's odd crash fence refuses read-only opening and reads while no wri
 A restarting writer takes the lease before it replaces `chunkdb.snapshot.live`; until then a reader can accept the dead session when its mapped counter is even, and reads the files as that writer left them.
 Rollback intents bound readable WAL prefixes; exhausted concurrent-snapshot retries fail without modifying files.
 Only volatile live metadata is rebuilt after a crash; actual data and WAL validation and durability are unchanged.
-Older readers that do not understand the live counter conservatively reject an open writer's odd fence; closed tables retain the checked CKSG encoding.
+Closed tables keep the checked CKSG encoding.
 
 ## Coordinate index and tombstones
 
@@ -516,7 +516,7 @@ The only header flag, `0x1`, is the filter format; it permits the filter flags `
 The owner flag needs no header flag or feature bit.
 The dimensions byte is 2 or 3 and must match the owning table.
 AREA stores the first active signed coordinates followed by the last active coordinates (x, y and, in a three-dimensional table, z); endpoints must be ordered.
-Format tags 1 to 3 are earlier development layouts and are refused; a writer writes only tag 4.
+Other format tags are refused; a writer writes only tag 4.
 
 Names are unique, 1–63 bytes matching `[a-z_][a-z0-9_]*`; every written revision is at or below the watermark, and epoch matches the table StoreId.
 Owners are user names with the same rule; a slot without an owner records the user of its first granted attach without ADMIN on `*`.
@@ -560,8 +560,7 @@ Writer serialization orders users by name, then table grants by name, then prefi
 Version 2 files have no added verifier count, flag bits 2..4 or prefix grants: they are read as users with one verifier, decoding refuses those bits and prefix grants in them, and the next change writes version 3.
 The writer refuses a salt outside that range or a name over 65535 bytes instead of shortening it; decoding also refuses user and table names that CREATE USER and GRANT refuse.
 Password verifiers contain no plaintext password; the secret derives unknown-user salts used by authentication.
-A build that reads version 3 but predates server rights and prefix grants refuses a file that uses them as unknown flags or an invalid table name; a build that reads only version 2 refuses every version 3 file.
-Earlier development users files are refused with a recreate error before permissions or bookkeeping change; they are not migrated.
+Users files before version 2 are refused with a recreate error before permissions or bookkeeping change; they are not migrated.
 The file is admitted independently of the catalog manifest, including standalone users stores.
 
 ## Named migrations
