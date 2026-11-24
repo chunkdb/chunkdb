@@ -13,8 +13,8 @@ Each writable store registers one reusable job when background maintenance is en
 A ready job appears once in a FIFO queue and runs on at most one worker.
 One turn processes one checkpoint or one eviction pass, then joins the queue tail if work remains.
 A busy table therefore cannot repeatedly run ahead of another ready table.
-A table with an `expire_column` also has an expiry job, whether or not background maintenance is enabled; the catalog requests a sweep of it about once a second, and one turn is one pass over at most 64 populated chunks.
-An expiry turn takes its table lease without waiting and skips the table while it is busy, so a schema change, drop or reopen never waits for a sweep.
+A table with an `expire_column` also has an expiry job, whether or not background maintenance is enabled; the catalog requests a sweep of it about a second after the previous one ended, never two at once, and one turn is one pass over at most 64 populated chunks.
+An expiry turn takes its table lease without waiting and skips the table while it is busy, so a sweep never waits for a schema change, drop or reopen; they wait at most for the lease of the running turn, a pass over at most 64 chunks.
 Checkpoint admission keeps the existing per-table bound and inline backpressure.
 Ready-queue publication allocates no memory after job registration.
 

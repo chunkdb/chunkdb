@@ -76,8 +76,9 @@ KILL CONNECTION id
 There is no native HTTP metrics endpoint.
 Metrics sum all tables, except the expiry metrics, which have a `table` label and appear for each table with an `expire_column` ([Expiry](TABLES.md#expiry)).
 `chunkdb_expiry_lag_seconds` is the time since the start of the table's last completed expiry sweep: every block whose time was at or before that start has been deleted, unless a write set that time after the sweep passed its chunk.
-Until a sweep completes, it counts from when expiry started on the table, at the server start or the `expire_column` change.
-`chunkdb_expired_blocks_total` counts the blocks expiry deleted and `chunkdb_expiry_failed_passes_total` its passes that failed, which the log names; both start at zero when the server starts.
+Until a sweep completes, it counts from when expiry started on the table: the server start, the `expire_column` change, or the RENAME TO, SWAP TABLES, RESTORE TABLE or RECOVER TABLE that serves it.
+`chunkdb_expired_blocks_total` counts the blocks expiry deleted and `chunkdb_expiry_failed_passes_total` its passes that failed, which the log names; both start at zero then too.
+A read-only server runs no expiry and reports none of these metrics.
 A backup has one cut per table, rather than a shared cross-table snapshot.
 It includes users and rights, so protect it as sensitive data.
 RESTORE TABLE never replaces a table; use SWAP TABLES from [Tables](TABLES.md) to put the restored table under the live name.

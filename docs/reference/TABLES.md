@@ -94,7 +94,7 @@ ENABLE FEATURE 'name'
 - `NULL`: the column accepts a missing value, distinct from an absent block.
 - `REQUIRED`: new blocks must provide this column unless it has a default.
 - `DEFAULT`: the value used for an omitted column in a new block.
-- `DEFAULT COMMIT_TIME`: a `u64` column that is not NULL takes the commit time in Unix milliseconds on every write to the block; see [Commit time](#commit-time).
+- `DEFAULT COMMIT_TIME`: a `u64` column that is not NULL takes, in Unix milliseconds, the time of each commit that creates the block or changes another of its values; see [Commit time](#commit-time).
 - `CHUNK`: blocks per chunk, default `16 x 16`; a third side selects a three-dimensional table, and geometry is fixed after creation.
 - `LARGE`: chunks per disk file group, default 8 on each active axis; its dimensions must match CHUNK.
 - `CHUNK COLUMNS`: one metadata row per chunk, with an independent column namespace and stable IDs.
@@ -240,6 +240,8 @@ That time is the commit's `time_ms` in the change feed, and the same for every b
 A write that gives the column a value different from the stored one keeps that value; a write that gives the stored value, or none, gets the commit time.
 A write that changes no value commits nothing and leaves the time as it is; deleting a block removes it with its time.
 SET BLOCK, SET CHUNK, transactions and conditional writes all follow these rules.
+Inside a transaction, statements read the stored value, or zero for a new block, until COMMIT stamps the column.
+Checks see the stamped value: those that read the column run when a plain write or SET CHUNK is checked, and in a transaction at COMMIT rather than at the statement.
 Blocks that existed before ADD COLUMN or SET DEFAULT COMMIT_TIME hold their stored value, zero for an added column, until their next change.
 
 ```cql docs-check session=times
@@ -259,11 +261,11 @@ OK
 With `expire_column = c`, the server deletes each block whose column `c` holds a time t with 0 < t <= now, in Unix milliseconds.
 NULL and 0 never expire; for a time to live, write `expires = NOW() + ttl_ms`.
 Reads do not filter: an expired block stays visible until its deletion, so test `expires > NOW()` in WHERE when that matters.
-About once a second the shared maintenance workers start a sweep of each such table.
+The shared maintenance workers sweep each such table, one sweep at a time, the next starting about a second after the previous one ended.
 A sweep reads every populated chunk in coordinate order, at most 64 chunks per worker turn, and other tables' work runs between its turns.
 Each chunk with expired blocks is one ordinary commit, decided under its chunk lock, so a write that moves the time ahead first keeps its block.
 Its change event has user `@expire`, and the WAL, slots and backups see it as any other delete.
-A sweep never waits for a schema change, drop or reopen of its table; it skips the table instead.
+A sweep never waits for a schema change, drop or reopen of its table; it skips the table instead, and those wait at most for the running turn.
 A crash loses no committed deletion; after a restart the next sweep starts from the first chunk.
 SHOW METRICS reports `chunkdb_expiry_lag_seconds`, `chunkdb_expired_blocks_total` and `chunkdb_expiry_failed_passes_total` per table with an `expire_column`; see [Server statements](SERVER.md#notes).
 ## Checks
