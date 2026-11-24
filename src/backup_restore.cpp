@@ -206,6 +206,9 @@ StoreId RebindRestoredTable(const std::filesystem::path& directory, const Backup
     // epoch, so publish its checked successor before the new identity.
     AtomicWrite(directory / "chunkdb.version", SerializeVersionClockRecord(cut.revision + 1U), true, true);
     Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_FORK_CLOCK_ONCE");
+    // A narrowing or DROP NULL check running when the backup was taken
+    // belongs to the backed-up table, not to this one.
+    manifest.schema = WithoutPendingNarrowing(manifest.schema);
     manifest.store_id = new_epoch;
     manifest.lineage = TableLineage{old_epoch, cut.revision};
     AtomicWrite(StoreManifestPath(directory), SerializeStoreManifest(manifest), true, true);

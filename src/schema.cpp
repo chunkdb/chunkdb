@@ -339,6 +339,13 @@ void UndoLastStep(TableSchema* schema) {
                 }
                 columns[at] = change->previous;
                 break;
+            case SchemaChange::Kind::kChangeAttributes:
+                if (at >= columns.size() || columns[at] != change->column || change->previous.id != change->column.id ||
+                    change->previous.name != change->column.name || change->previous.type != change->column.type) {
+                    throw mismatch();
+                }
+                columns[at] = change->previous;
+                break;
             case SchemaChange::Kind::kOtherDomain:
                 break;
             default:
@@ -386,8 +393,11 @@ void ValidateSchema(const TableSchema& schema, ColumnDomain domain) {
             throw std::invalid_argument("schema history step for version " + std::to_string(step.version) + " is malformed");
         }
         for (const auto& change : step.changes) {
-            if (change.kind < SchemaChange::Kind::kAddColumn || change.kind > SchemaChange::Kind::kOtherDomain)
+            if (change.kind < SchemaChange::Kind::kAddColumn || change.kind > SchemaChange::Kind::kChangeAttributes)
                 throw std::invalid_argument("unknown schema change");
+            // Chunk columns have no ALTER COLUMN attribute changes.
+            if (change.kind == SchemaChange::Kind::kChangeAttributes && domain != ColumnDomain::kBlock)
+                throw std::invalid_argument("chunk columns cannot record an attribute change");
             if (change.kind != SchemaChange::Kind::kOtherDomain) continue;
             if (!IsOtherDomainStep(step) || change.position != 0 || change.column != Column{} ||
                 !change.old_name.empty() || change.previous != Column{} || change.conversion != Conversion::kExact)
@@ -746,7 +756,7 @@ void EncodeColumn(std::vector<std::uint8_t>& out, const Column& column) {
 
 [[nodiscard]] bool IsKnownChange(std::uint8_t kind) noexcept {
     return kind >= static_cast<std::uint8_t>(SchemaChange::Kind::kAddColumn) &&
-           kind <= static_cast<std::uint8_t>(SchemaChange::Kind::kOtherDomain);
+           kind <= static_cast<std::uint8_t>(SchemaChange::Kind::kChangeAttributes);
 }
 
 }  // namespace
@@ -777,10 +787,14 @@ std::vector<std::uint8_t> EncodeSchema(const TableSchema& schema, ColumnDomain d
                 EncodeColumn(out, change.previous);
                 out.push_back(static_cast<std::uint8_t>(change.conversion));
             }
+            if (change.kind == SchemaChange::Kind::kChangeAttributes) {
+                EncodeColumn(out, change.previous);
+            }
         }
     }
     if (schema.pending.has_value()) {
-        out.push_back(1U);
+        // 1 a narrowing, 2 a DROP NULL check.
+        out.push_back(schema.pending->not_null ? 2U : 1U);
         WriteLe32(out, schema.pending->column_id);
         out.push_back(static_cast<std::uint8_t>(schema.pending->type.kind));
         WriteLe32(out, schema.pending->type.size);
@@ -836,16 +850,21 @@ TableSchema DecodeSchema(const std::uint8_t* data, std::size_t size, ColumnDomai
                 }
                 change.conversion = static_cast<Conversion>(conversion);
             }
+            if (change.kind == SchemaChange::Kind::kChangeAttributes) {
+                change.previous = DecodeColumn(in);
+            }
             step.changes.push_back(std::move(change));
         }
         schema.history.push_back(std::move(step));
     }
     if (!in.AtEnd()) {
-        // A narrowing in progress.
-        if (in.Le(1) != 1U) {
+        // A narrowing or a DROP NULL check in progress.
+        const auto tag = in.Le(1);
+        if (tag != 1U && tag != 2U) {
             throw std::runtime_error("schema area has trailing bytes");
         }
         PendingNarrowing pending;
+        pending.not_null = tag == 2U;
         pending.column_id = static_cast<std::uint32_t>(in.Le(4));
         const auto kind = static_cast<std::uint8_t>(in.Le(1));
         if (!IsKnownKind(kind)) {
@@ -1216,6 +1235,12 @@ void ValidatePending(const TableSchema& schema) {
     if (column == schema.columns.end()) {
         throw std::invalid_argument("the narrowing in progress names no column of the table");
     }
+    if (pending.not_null) {
+        if (!column->nullable || pending.type != column->type) {
+            throw std::invalid_argument("column " + column->name + " has no NULL to drop");
+        }
+        return;
+    }
     if (FamilyOf(pending.type.kind) != FamilyOf(column->type.kind) || pending.type == column->type ||
         Widens(column->type, pending.type)) {
         throw std::invalid_argument(
@@ -1282,7 +1307,8 @@ TableSchema WithPendingNarrowing(const TableSchema& schema, std::string_view nam
 
 TableSchema NarrowColumnType(const TableSchema& schema, std::string_view name, ColumnType type) {
     const std::size_t at = ColumnIndex(schema, name);
-    if (!schema.pending.has_value() || schema.pending->column_id != schema.columns[at].id || schema.pending->type != type) {
+    if (!schema.pending.has_value() || schema.pending->not_null || schema.pending->column_id != schema.columns[at].id ||
+        schema.pending->type != type) {
         throw std::invalid_argument("column " + std::string(name) + " has no narrowing to " + ColumnTypeName(type) + " in progress");
     }
     return ChangeTypeAt(WithoutPendingNarrowing(schema), at, type, Conversion::kExact);
@@ -1292,6 +1318,73 @@ TableSchema WithoutPendingNarrowing(const TableSchema& schema) {
     TableSchema next = schema;
     next.pending.reset();
     return next;
+}
+
+namespace {
+
+// The next version with column `at` given `after`'s attributes; the caller
+// has checked the change.
+[[nodiscard]] TableSchema ChangeAttributesAt(const TableSchema& schema, std::size_t at, const Column& after) {
+    TableSchema next = schema;
+    Column& column = next.columns[at];
+    column.nullable = after.nullable;
+    column.required = after.required;
+    column.has_default = after.has_default;
+    column.default_value = after.has_default ? after.default_value : std::vector<std::uint8_t>{};
+    SchemaChange change{
+        .kind = SchemaChange::Kind::kChangeAttributes,
+        .position = static_cast<std::uint32_t>(at),
+        .column = column,
+        .old_name = {},
+        .previous = schema.columns[at],
+        .conversion = Conversion::kExact,
+    };
+    return NextVersion(schema, std::move(change), std::move(next));
+}
+
+}  // namespace
+
+TableSchema ChangeColumnAttributes(const TableSchema& schema, std::string_view name, const Column& attributes) {
+    const std::size_t at = ColumnIndex(schema, name);
+    const Column& before = schema.columns[at];
+    if (before.nullable == attributes.nullable && before.required == attributes.required &&
+        before.has_default == attributes.has_default &&
+        (!attributes.has_default || before.default_value == attributes.default_value)) {
+        throw std::invalid_argument("column " + before.name + " already has these attributes");
+    }
+    if (before.nullable && !attributes.nullable) {
+        throw std::invalid_argument("column " + before.name + ": DROP NULL checks every stored value first");
+    }
+    if (attributes.nullable && attributes.required) {
+        throw std::invalid_argument(
+            "column " + before.name + " cannot be both NULL and REQUIRED; " +
+            (before.required ? "DROP REQUIRED first" : "DROP NULL first"));
+    }
+    return ChangeAttributesAt(schema, at, attributes);
+}
+
+TableSchema WithPendingNotNull(const TableSchema& schema, std::string_view name) {
+    if (schema.pending.has_value()) {
+        throw std::invalid_argument("another narrowing of this table is in progress");
+    }
+    const Column& column = schema.columns[ColumnIndex(schema, name)];
+    if (!column.nullable) {
+        throw std::invalid_argument("column " + column.name + " is not NULL");
+    }
+    TableSchema next = schema;
+    next.pending = PendingNarrowing{.column_id = column.id, .type = column.type, .not_null = true};
+    ValidateTableSchema(next);
+    return next;
+}
+
+TableSchema DropColumnNull(const TableSchema& schema, std::string_view name) {
+    const std::size_t at = ColumnIndex(schema, name);
+    if (!schema.pending.has_value() || !schema.pending->not_null || schema.pending->column_id != schema.columns[at].id) {
+        throw std::invalid_argument("column " + std::string(name) + " has no DROP NULL check in progress");
+    }
+    Column after = schema.columns[at];
+    after.nullable = false;
+    return ChangeAttributesAt(WithoutPendingNarrowing(schema), at, after);
 }
 
 }  // namespace chunkdb

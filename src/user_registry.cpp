@@ -394,6 +394,35 @@ void UserRegistry::ForgetTable(const std::string& table) {
     });
 }
 
+void UserRegistry::CopyTableGrants(const std::string& from, const std::string& to, TableGrants& previous) {
+    RequireValidGrantTable(to);
+    previous.clear();
+    UpdateIf([&](Users& users) {
+        previous.clear();
+        for (auto& [name, user] : users.users) {
+            const auto granted = user.grants.find(from);
+            if (granted == user.grants.end()) continue;
+            const auto existing = user.grants.find(to);
+            if (existing != user.grants.end() && existing->second >= granted->second) continue;
+            previous.emplace(name, existing != user.grants.end() ? std::optional<Right>(existing->second) : std::nullopt);
+            user.grants[to] = granted->second;
+        }
+        return !previous.empty();
+    });
+}
+
+void UserRegistry::RestoreTableGrants(const std::string& to, const TableGrants& previous) {
+    if (previous.empty()) return;
+    Update([&](Users& users) {
+        for (const auto& [name, right] : previous) {
+            const auto user = users.users.find(name);
+            if (user == users.users.end()) continue;
+            if (right.has_value()) user->second.grants[to] = *right;
+            else user->second.grants.erase(to);
+        }
+    });
+}
+
 ReadRightCheck::State ReadRightCheck::Recheck(std::uint64_t generation) {
     // A change after this load bumps the generation again and is read next time.
     generation_ = generation;

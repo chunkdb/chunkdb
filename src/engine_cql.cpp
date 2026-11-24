@@ -402,6 +402,24 @@ std::optional<std::string> SlotOwner(const cql::CreateSlot& create, bool require
     return require_auth ? std::optional<std::string>(user) : std::nullopt;
 }
 
+// Gives `column`, of a valid type, the DEFAULT `literal`; NULL leaves a NULL
+// column without one.
+void SetDefault(Column& column, const cql::Literal& literal) {
+    const ColumnValue value = LiteralValue(column, literal);
+    if (std::holds_alternative<std::monostate>(value)) {
+        // A NULL column without a DEFAULT takes NULL.
+        if (!column.nullable) {
+            throw std::invalid_argument(Describe(column) + " cannot be NULL, so its DEFAULT cannot be NULL");
+        }
+        column.has_default = false;
+        column.default_value.clear();
+        return;
+    }
+    column.has_default = true;
+    column.default_value =
+        IsFixedWidth(column.type.kind) ? EncodeColumnValue(column, value) : EncodeVarValue(column, value);
+}
+
 // A column of CREATE TABLE or ADD COLUMN; `id` is replaced by AddColumn.
 [[nodiscard]] Column ColumnFrom(const cql::ColumnDefinition& definition, std::uint32_t id) {
     Column column;
@@ -415,17 +433,30 @@ std::optional<std::string> SlotOwner(const cql::CreateSlot& create, bool require
     }
     // Before the default is read and encoded for the type.
     ValidateColumnType(column);
-    const ColumnValue value = LiteralValue(column, *definition.default_value);
-    if (std::holds_alternative<std::monostate>(value)) {
-        // A NULL column without a DEFAULT takes NULL.
-        if (!column.nullable) {
-            throw std::invalid_argument(Describe(column) + " cannot be NULL, so its DEFAULT cannot be NULL");
-        }
-        return column;
+    SetDefault(column, *definition.default_value);
+    return column;
+}
+
+// The NULL, REQUIRED and DEFAULT column `attribute.column` of `schema` takes
+// after ALTER COLUMN (chunkdb::ChangeColumnAttributes checks the result).
+[[nodiscard]] Column AttributesFrom(const TableSchema& schema, const cql::AlterColumnAttribute& attribute) {
+    using Change = cql::AlterColumnAttribute::Change;
+    const auto at = std::find_if(schema.columns.begin(), schema.columns.end(),
+        [&](const Column& column) { return column.name == attribute.column; });
+    if (at == schema.columns.end()) throw std::invalid_argument("the table has no column " + attribute.column);
+    Column column = *at;
+    switch (attribute.change) {
+        case Change::kSetDefault: SetDefault(column, *attribute.value); break;
+        case Change::kDropDefault:
+            if (!column.has_default) throw std::invalid_argument(Describe(column) + " has no DEFAULT");
+            column.has_default = false;
+            column.default_value.clear();
+            break;
+        case Change::kSetNull: column.nullable = true; break;
+        case Change::kDropNull: column.nullable = false; break;
+        case Change::kSetRequired: column.required = true; break;
+        case Change::kDropRequired: column.required = false; break;
     }
-    column.has_default = true;
-    column.default_value =
-        IsFixedWidth(column.type.kind) ? EncodeColumnValue(column, value) : EncodeVarValue(column, value);
     return column;
 }
 
@@ -729,7 +760,10 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::Aggregate& aggregate) { info.verb = "AGGREGATE"; info.table = aggregate.table; },
             [&](const cql::ScanChunks& scan) { info.verb = "SCAN CHUNKS"; info.table = scan.table; },
             [&](const cql::CreateTable& create) { table_change(create, "CREATE TABLE", "create_table"); },
-            [&](const cql::AlterTable& alter) { table_change(alter, "ALTER TABLE", "alter_table"); },
+            [&](const cql::AlterTable& alter) {
+                table_change(alter, "ALTER TABLE", "alter_table");
+                if (const auto* rename = std::get_if<cql::RenameTable>(&alter.change)) info.table += "," + rename->new_name;
+            },
             [&](const cql::DropTable& drop) { table_change(drop, "DROP TABLE", "drop_table"); },
             [&](const cql::RecoverTable& recover) { table_change(recover, "RECOVER TABLE", "recover_table"); },
             [&](const cql::CompactTombstones& compact) { table_change(compact, "COMPACT TOMBSTONES", "compact_tombstones"); },
@@ -1166,6 +1200,19 @@ std::string CommandEngine::ExecuteStatement(
                                     request.alter = [&set](StoreManifest& m) {
                                         ReplaceTableOptions(&m, OptionsFrom({set.option}).ApplyTo(DecodeTableOptions(m.options)));
                                     };
+                                },
+                                [&](const cql::AlterColumnAttribute& attribute) {
+                                    if (attribute.change == cql::AlterColumnAttribute::Change::kDropNull) {
+                                        request.drop_null = attribute.column;
+                                        return;
+                                    }
+                                    request.alter = [&attribute](StoreManifest& m) {
+                                        m.schema = ChangeColumnAttributes(m.schema, attribute.column, AttributesFrom(m.schema, attribute));
+                                    };
+                                },
+                                [&](const cql::RenameTable&) {
+                                    // The parser refuses it inside MIGRATE.
+                                    throw std::invalid_argument("MIGRATE cannot rename a table");
                                 }
                             }, alter.change);
                         },
@@ -1891,6 +1938,27 @@ std::string CommandEngine::ExecuteStatement(
                             [&](const cql::SetOption& set) {
                                 catalog_->SetOptions(alter.table, OptionsFrom({set.option}));
                             },
+                            [&](const cql::AlterColumnAttribute& attribute) {
+                                if (attribute.change == cql::AlterColumnAttribute::Change::kDropNull) {
+                                    // Only after checking every stored value.
+                                    catalog_->DropColumnNull(alter.table, attribute.column);
+                                    return;
+                                }
+                                catalog_->ChangeColumns(alter.table, [&attribute](const TableSchema& current) {
+                                    return ChangeColumnAttributes(current, attribute.column, AttributesFrom(current, attribute));
+                                });
+                            },
+                            [&](const cql::RenameTable& rename) {
+                                // Grants move with the table: the new name must be one the user administers.
+                                const auto right = RightOnTable(session, rename.new_name);
+                                if (!right.has_value() || *right < Right::kAdmin)
+                                    throw PermissionDeniedError(std::string(RightName(Right::kAdmin)) + " on " + rename.new_name);
+                                std::stop_source cancelled;
+                                const auto request_stop = [&] { cancelled.request_stop(); };
+                                std::stop_callback shutdown(session.backup_cancelled, request_stop);
+                                std::stop_callback statement(StatementStopToken(), request_stop);
+                                catalog_->RenameTable(alter.table, rename.new_name, config_.users.get(), cancelled.get_token());
+                            },
                         },
                         alter.change);
                     return Protocol::SimpleString("OK");
@@ -2246,11 +2314,15 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::GrantRight& grant) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireManagesUsers(session);
-                    if (grant.revoke) {
-                        config_.users->Revoke(grant.user, grant.table, grant.right);
-                    } else {
-                        config_.users->Grant(grant.user, grant.table, grant.right);
-                    }
+                    // Inside catalog admission: a RENAME TO moving the
+                    // table's grants sees this change before or after it.
+                    catalog_->ChangeGrants([&] {
+                        if (grant.revoke) {
+                            config_.users->Revoke(grant.user, grant.table, grant.right);
+                        } else {
+                            config_.users->Grant(grant.user, grant.table, grant.right);
+                        }
+                    });
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::ShowUsers&) {

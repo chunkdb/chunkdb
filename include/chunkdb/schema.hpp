@@ -78,6 +78,9 @@ struct SchemaChange {
         kChangeType = 4,
         // The shared schema revision changed only the other column domain.
         kOtherDomain = 5,
+        // A block column's NULL, REQUIRED or DEFAULT changed; its id, name
+        // and type did not.
+        kChangeAttributes = 6,
     };
     Kind kind = Kind::kAddColumn;
     // Index in the column list where the column was added, dropped, or is.
@@ -86,7 +89,8 @@ struct SchemaChange {
     Column column{};
     // kRenameColumn: the name before.
     std::string old_name{};
-    // kChangeType: the column before, and how its values were converted.
+    // kChangeType and kChangeAttributes: the column before; kChangeType: how
+    // its values were converted.
     Column previous{};
     Conversion conversion = Conversion::kExact;
 
@@ -102,10 +106,13 @@ struct SchemaStep {
 };
 
 // A narrowing in progress (TableCatalog::NarrowColumn): while it lasts,
-// every write to the column must fit `type` too.
+// every write to the column must fit `type` too. With `not_null` it is a
+// DROP NULL check instead (TableCatalog::DropColumnNull): `type` is the
+// column's own, and no write may leave the column NULL.
 struct PendingNarrowing {
     std::uint32_t column_id = 0;
     ColumnType type{};
+    bool not_null = false;
 
     friend bool operator==(const PendingNarrowing&, const PendingNarrowing&) = default;
 };
@@ -201,6 +208,20 @@ void ValidateColumnType(const Column& column);
 [[nodiscard]] TableSchema WithPendingNarrowing(const TableSchema& schema, std::string_view name, ColumnType type);
 [[nodiscard]] TableSchema NarrowColumnType(const TableSchema& schema, std::string_view name, ColumnType type);
 [[nodiscard]] TableSchema WithoutPendingNarrowing(const TableSchema& schema);
+
+// The next version with block column `name` taking the NULL, REQUIRED and
+// DEFAULT of `attributes` (its id, name and type are ignored): ALTER COLUMN
+// SET or DROP DEFAULT, SET NULL, SET or DROP REQUIRED. Throws
+// std::invalid_argument when nothing changes, for a column both NULL and
+// REQUIRED, a DEFAULT the type does not hold, and for removing NULL, which
+// needs the check below.
+[[nodiscard]] TableSchema ChangeColumnAttributes(const TableSchema& schema, std::string_view name, const Column& attributes);
+// The steps of a DROP NULL check (TableCatalog::DropColumnNull), as for a
+// narrowing: WithPendingNotNull starts one on a NULL column, DropColumnNull
+// ends one whose check found no NULL with the next version, where the
+// column refuses NULL. WithoutPendingNarrowing ends one that failed.
+[[nodiscard]] TableSchema WithPendingNotNull(const TableSchema& schema, std::string_view name);
+[[nodiscard]] TableSchema DropColumnNull(const TableSchema& schema, std::string_view name);
 
 // The schema area of the table manifest (docs/STORAGE_FORMAT.md Section 1.2).
 [[nodiscard]] std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema);

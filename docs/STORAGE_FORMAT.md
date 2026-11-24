@@ -63,6 +63,7 @@ Entries in `tables/` with invalid names are ignored; a table directory with a va
 Creation prepares a complete table under `.chunkdb.staging/`, publishes it by a rename that cannot replace an existing table, then syncs both parents.
 RESTORE TABLE builds its table the same way: it copies the backed-up table under `.chunkdb.staging/`, rebinds it to a new epoch and syncs it before that rename.
 SWAP TABLES syncs both tables' WALs, closes them, marks their slots to resync, exchanges `tables/<a>/` and `tables/<b>/` in one atomic directory exchange and syncs `tables/`; a crash leaves both names exchanged or neither.
+RENAME TO syncs the table's WAL, closes it, renames `tables/<a>/` to `tables/<b>/` without replacing an entry and syncs `tables/`; a crash leaves the table under one name, with its files unchanged.
 DROP raises and syncs the root version floor before moving the closed table into `.chunkdb.dropped/`.
 The rename commits the drop; deletion can finish at startup.
 Writer startup recovers decided migrations before interrupted-table cleanup and table opening.
@@ -204,16 +205,19 @@ Each column is encoded in this order:
 At least one column is fixed-width; the sum of fixed widths per block is at most 65535 bits.
 Columns keep their IDs through renames and type changes; dropped IDs are not reused.
 After the columns are exactly `schema_version - 1` history steps, oldest first; step `k` produced schema version `k + 1`.
-A step is `change_count:u32` (1–2048), then each change's `kind:u8` (1 add, 2 drop, 3 rename, 4 type change), `position:u32`, and an encoded column.
+A step is `change_count:u32` (1–2048), then each change's `kind:u8` (1 add, 2 drop, 3 rename, 4 type change, 6 attribute change), `position:u32`, and an encoded column.
 Kind 5 is an other-domain marker containing only its kind byte.
 Both domains have the same revision; at every step exactly one domain changes columns and the other records that marker.
 
 The column is the added/dropped column or the post-rename/post-conversion column; position identifies its slot in the applicable column list.
 Rename appends `old_name_length:u8, old_name`; type change appends the previous encoded column and `conversion:u8` (0 exact, 1 clamp, 2 default, 3 truncate).
+An attribute change, block columns only, appends the previous encoded column, which differs only in its flags and default.
+Translating across it, a column that becomes nullable sets validity for every present block and stores empty text and bytes values as entries; one that stops being nullable drops validity and the entries of empty values.
 Undoing steps reconstructs and validates every earlier schema used by stored chunks.
 An optional final 10-byte narrowing suffix is `1:u8, column_id:u32, target_kind:u8, target_size:u32`; without pending narrowing there is no suffix.
+A DROP NULL check uses the same suffix with tag `2:u8` and the column's own kind and size; the column is nullable.
 
-While this suffix exists, writes to that column must fit both types; writer startup and RECOVER TABLE remove interrupted narrowing before opening the table.
+While this suffix exists, writes to that column must fit both types, and with tag 2 must not leave it NULL; writer startup and RECOVER TABLE remove interrupted narrowing before opening the table.
 Named migrations also record this suffix while they check stored values, and decide only if the table schema is unchanged since the check; redo does not depend on the suffix.
 
 ## Packed chunk state
