@@ -8315,6 +8315,7 @@ int main(int argc, char** argv) {
         run("TestUnwatchReleaseBeforeReply", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
         run("TestUnwatchRestartsIdleDeadline", [] { TestUnwatchRestartsIdleDeadline(false); });
         run("TestUnwatchRestartsIdleDeadlineSlot", [] { TestUnwatchRestartsIdleDeadline(true); });
+        run("TestUnwatchListsIdle", TestUnwatchListsIdle);
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestUnwatchReleaseBeforeReplyTls", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
 #endif
