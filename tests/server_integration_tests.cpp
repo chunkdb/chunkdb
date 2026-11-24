@@ -6789,6 +6789,33 @@ template <typename Client> void TestWatchDefaultProgress(bool tls) {
     assert(watch.ReadLine() == "+PONG\r\n");
 }
 
+// Lines sent in the same packet as WATCH are read by the watch stream: the
+// first one other than UNWATCH ends it, and each closed watch frees its count.
+template <typename Client> void TestWatchPipelinedLines(bool tls) {
+    auto config = BaseServerConfig(); config.tls_enabled = tls;
+    config.max_watches = 2U;
+    config.feed_progress_ms = 60000U; // No progress frame precedes the refusal.
+    ServerHarness harness(tls ? "watch-pipelined-tls" : "watch-pipelined", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    for (int round = 0; round < 3; ++round) {
+        Client pipelined("127.0.0.1", harness.port); pipelined.SetReadDeadline(std::chrono::seconds(10)); pipelined.Hello();
+        pipelined.SendBytes("WATCH default\r\nPING\r\nPING\r\nWATCH default\r\nUNWATCH\r\n");
+        assert(!FeedStart(ReadFeedReply(pipelined)).empty());
+        assert(pipelined.ReadLine().rfind("-ERR PROTOCOL", 0) == 0);
+        assert(pipelined.WaitForClose(std::chrono::seconds(10)));
+    }
+    // UNWATCH in the same packet ends the watch, and the next line runs as a statement.
+    Client returned("127.0.0.1", harness.port); returned.SetReadDeadline(std::chrono::seconds(10)); returned.Hello();
+    returned.SendBytes("WATCH default\r\nUNWATCH\r\nPING\r\n");
+    assert(!FeedStart(ReadFeedReply(returned)).empty());
+    assert(returned.ReadLine() == "+OK\r\n" && returned.ReadLine() == "+PONG\r\n");
+    // Every closed or ended watch released its count: both watches are free.
+    Client first("127.0.0.1", harness.port); first.SetReadDeadline(std::chrono::seconds(10)); first.Hello();
+    first.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(first)).empty());
+    Client second("127.0.0.1", harness.port); second.SetReadDeadline(std::chrono::seconds(10)); second.Hello();
+    second.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(second)).empty());
+}
+
 void TestWatchPositionsAndRights() {
     auto config = AuthenticatedFeedServerConfig(); config.worker_threads = 2; config.feed_buffer_bytes = 16384;
     config.feed_linger_ms = 0U;
@@ -7840,6 +7867,7 @@ void TestFeedWatch() {
     run("TestWatchLinger<RawClient>(false, false, true)", [] { TestWatchLinger<RawClient>(false, false, true); });
     run("TestWatchLinger<RawClient>(false, false, false, true)", [] { TestWatchLinger<RawClient>(false, false, false, true); });
     run("TestWatchProtocol<RawClient>(false)", [] { TestWatchProtocol<RawClient>(false); });
+    run("TestWatchPipelinedLines<RawClient>(false)", [] { TestWatchPipelinedLines<RawClient>(false); });
     run("TestWatchNoIdle<RawClient>(false)", [] { TestWatchNoIdle<RawClient>(false); });
     run("TestWatchPositionsAndRights()", [] { TestWatchPositionsAndRights(); });
     run("TestWatchSlowReader<RawClient>(false)", [] { TestWatchSlowReader<RawClient>(false); });
@@ -7849,6 +7877,7 @@ void TestFeedWatch() {
     run("TestWatchLinger<TlsClient>(true, false, true)", [] { TestWatchLinger<TlsClient>(true, false, true); });
     run("TestWatchLinger<TlsClient>(true, false, false, true)", [] { TestWatchLinger<TlsClient>(true, false, false, true); });
     run("TestWatchProtocol<TlsClient>(true)", [] { TestWatchProtocol<TlsClient>(true); });
+    run("TestWatchPipelinedLines<TlsClient>(true)", [] { TestWatchPipelinedLines<TlsClient>(true); });
     run("TestWatchNoIdle<TlsClient>(true)", [] { TestWatchNoIdle<TlsClient>(true); });
     run("TestWatchSlowReader<TlsClient>(true)", [] { TestWatchSlowReader<TlsClient>(true); });
 #endif

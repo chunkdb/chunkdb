@@ -710,6 +710,13 @@ void ChunkStore::MakeWalBoundaryDurableLocked(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
     bool own_stream) {
+    // A boundary starts a commit that syncs what it writes: a transaction,
+    // durable in every mode, or a conditional write, whose rollback relies
+    // on the synced WAL. From here on a checkpoint must not replace a WAL
+    // with an unsynced image, as after a barrier. A later checkpoint of this
+    // chunk takes its lock, held by the caller until the commit ends, and
+    // sees the floor.
+    barrier_durability_floor_.store(true, std::memory_order_release);
     if (chunk->wal_path.empty()) {
         chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     }

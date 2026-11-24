@@ -177,7 +177,9 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         chunk->wal_bytes = saved_wal_bytes;
         chunk->pending_wal_flush_updates = saved_pending_wal_flush_updates;
         try {
-            TruncateWalTail(chunk_coord, chunk, committed_wal_size, sync_required);
+            // Synced in every mode before the intent goes: once it is gone,
+            // nothing else would cut the rejected frame off after a crash.
+            TruncateWalTail(chunk_coord, chunk, committed_wal_size, /*force_sync=*/true);
             std::error_code remove_intent_ec;
             std::filesystem::remove(rollback_intent_path, remove_intent_ec);
             if (remove_intent_ec) {

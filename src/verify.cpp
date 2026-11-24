@@ -39,6 +39,7 @@
 #include "archive_base_format.hpp"
 #include "txn_intent_format.hpp"
 #include "shared_file_input.hpp"
+#include "commit_group_coordinator.hpp"
 
 #ifdef _WIN32
 #ifndef NOMINMAX
@@ -138,6 +139,18 @@ void ReportInfo(
         out << " " << QuoteToken(detail);
     }
     out << "\n";
+}
+
+constexpr const char* kGroupOwnerName = "chunkdb.groups.owner";
+constexpr const char* kGroupObjectsName = "chunkdb.groups.objects";
+
+// Commit group owner state that this build never admits: commit_groups stays
+// refused, so no manifest can claim these names yet.
+[[nodiscard]] bool IsGroupOwnerName(const std::string& name) {
+    return name == kGroupOwnerName || name == kGroupObjectsName || name == chunkdb::kCommitJournalDirectoryName;
+}
+void ReportUnclaimedGroupOwner(VerifyCounters* counters, const std::filesystem::path& path) {
+    Report(counters, false, "group_owner_unclaimed", path, "commit group owner state is not admitted by this build");
 }
 
 void ReportFeatures(VerifyCounters* counters, const std::filesystem::path& path, const chunkdb::FeatureFlags& flags) {
@@ -765,6 +778,10 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
         if (name.rfind(".chunkdb", 0) == 0 || name.rfind(".", 0) == 0) {
             continue;
         }
+        if (IsGroupOwnerName(name)) {
+            ReportUnclaimedGroupOwner(counters, entry.path());
+            continue;
+        }
 
         if (entry.is_regular_file()) {
             if (IsTmpArtifactName(name)) {
@@ -1121,6 +1138,10 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         if (name.rfind(".", 0) == 0) {
             continue;  // OS metadata
         }
+        if (IsGroupOwnerName(name)) {
+            ReportUnclaimedGroupOwner(counters, entry.path());
+            continue;
+        }
         if (chunkdb::IsStoreEntryName(name)) {
             // Store state belongs inside a table; chunkdb never reads it here.
             Report(counters, false, "unexpected_entry", entry.path(), "not inside a table");
@@ -1305,4 +1326,52 @@ chunkdb::ChunkFileCheck chunkdb::CheckChunkFiles(const std::filesystem::path& ro
         report(true, "chunk_state_invalid", wal_path, error.what());
     }
     return result;
+}
+
+chunkdb::VerifyCounters chunkdb::VerifyCommitGroupOwner(
+    const std::filesystem::path& directory, const CommitOwnerScope& scope, std::ostream& out) {
+    ::VerifyCounters counters;
+    counters.out = &out;
+    ++counters.checked;
+    const auto owner_path = directory / kGroupOwnerName;
+    const CommitGroupCoordinator coordinator(directory, scope);
+    std::optional<CommitOwnerRootArtifact> owner;
+    try {
+        owner = coordinator.ReadOwner();
+    } catch (const std::exception& error) {
+        Report(&counters, true, "group_owner_invalid", owner_path, error.what());
+        return counters;
+    }
+    if (!owner) {
+        Report(&counters, true, "group_owner_missing", owner_path, "");
+        return counters;
+    }
+    // Staged objects and journal generations under an INACTIVE root are not admitted.
+    if (owner->value.state == CommitOwnerState::kInactive) return counters;
+    if (owner->value.state == CommitOwnerState::kPending) {
+        Report(&counters, false, "group_owner_pending", owner_path, "replacement plan is not checked by this build");
+        return counters;
+    }
+    ++counters.checked;
+    // The journal leaf names a finding once its context is known.
+    auto journal_path = directory / kGroupObjectsName;
+    try {
+        const CommitOwnerArtifactIo io(directory, scope);
+        const auto context = io.ReadJournalInventory(owner->value.journal_inventory).value.context;
+        journal_path = directory / std::string(kCommitJournalDirectoryName) / CommitJournalLeafName(context);
+        const auto selection = coordinator.AdmitSelection(owner->value);
+        const auto& scan = selection.scan;
+        if (scan.measured_bytes != scan.complete_bytes) {
+            Report(&counters, false, "group_journal_tail", journal_path,
+                std::to_string(scan.measured_bytes - scan.complete_bytes) +
+                    " bytes after the last complete record above the certified cut confer no durability");
+        }
+        ReportInfo(&counters, "group_journal", journal_path,
+            "generation " + std::to_string(context.generation) + " certified " +
+                std::to_string(scan.certified.cut.bytes) + " bytes uncertified " +
+                std::to_string(scan.uncertified.size()) + " records; members not checked");
+    } catch (const std::exception& error) {
+        Report(&counters, true, "group_journal_invalid", journal_path, error.what());
+    }
+    return counters;
 }
