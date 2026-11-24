@@ -28,7 +28,7 @@ The 2.0 plan asked for new epochs on both tables; that would rewrite every file 
 The restore copies only the table's inventory files into a private directory under `.chunkdb.staging`, the place CREATE TABLE builds tables.
 Each copied file's length and CRC must match the backup inventory, and the table directory in the backup must hold exactly those files, all regular.
 The copy is then checked against its cut like a backup inventory check, rebound to the new identity with the offline restore's code, verified like `chunkdb_verify`, and synced.
-Rebinding drops a column narrowing or DROP NULL check that the backup caught running: it belonged to the backed-up table, and the restored schema is the one before it.
+Rebinding drops a column narrowing, DROP NULL check or ADD CHECK that the backup caught running: it belonged to the backed-up table, and the restored schema is the one before it.
 Until publication the table is in no catalog listing and no statement can name it.
 Publication takes the catalog's table operations, checks the name again and renames the directory into `tables/` without replacing anything, then syncs both parents.
 The rename is the commit point; the store is opened and served afterwards, as CREATE TABLE does.

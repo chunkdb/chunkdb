@@ -833,10 +833,42 @@ class Parser {
                     Fail(column, "DEFAULT is given twice");
                 }
                 definition.default_value = Value(false);
+            } else if (Accept("check")) {
+                definition.checks.push_back(Check());
             } else {
                 return definition;
             }
         }
+    }
+
+    // After CHECK: [name] '(' condition ')'. The condition (expr.hpp) takes
+    // no parameters; its text is kept as written.
+    [[nodiscard]] CheckDefinition Check() {
+        CheckDefinition check;
+        if (Peek().kind == TokenKind::kWord) check.name = Name("a check name");
+        ExpectToken(TokenKind::kOpen, "(");
+        // The condition lexes from the end of the last token read, as WHERE.
+        if (next_ != tokens_.size()) throw std::logic_error("CHECK was parsed after a lookahead");
+        const std::size_t start = at_;
+        std::set<std::size_t> parameters;
+        (void)expr::ParseConditionAt(line_, &at_, &parameters);
+        if (!parameters.empty()) Fail(start + 1U, "CHECK takes no parameters");
+        std::string_view text = line_.substr(start, at_ - start);
+        const auto first = text.find_first_not_of(" \t");
+        const auto last = text.find_last_not_of(" \t");
+        check.expression = std::string(text.substr(first, last + 1U - first));
+        ExpectToken(TokenKind::kClose, ")");
+        return check;
+    }
+
+    // A column of CHUNK COLUMNS or ADD COLUMN, which take no CHECK.
+    [[nodiscard]] ColumnDefinition DefinitionWithoutCheck(const char* where) {
+        const std::size_t column = Peek().column;
+        auto definition = Definition();
+        if (!definition.checks.empty()) Fail(column, std::string(where) + " takes no CHECK; " +
+            (std::string_view(where) == "ADD COLUMN" ? "add the column, then ALTER TABLE ... ADD CHECK"
+                                                     : "CHECK reads block columns"));
+        return definition;
     }
 
     [[nodiscard]] Option OptionAssignment() {
@@ -1146,7 +1178,7 @@ class Parser {
                         if (chunk_columns) Fail(column, "CHUNK COLUMNS is given twice");
                         chunk_columns = true;
                         ExpectToken(TokenKind::kOpen, "(");
-                        do { create.chunk_columns.push_back(Definition()); } while (AcceptToken(TokenKind::kComma));
+                        do { create.chunk_columns.push_back(DefinitionWithoutCheck("CHUNK COLUMNS")); } while (AcceptToken(TokenKind::kComma));
                         ExpectToken(TokenKind::kClose, ")");
                     } else {
                         if (chunk) Fail(column, "CHUNK is given twice");
@@ -1163,6 +1195,8 @@ class Parser {
                     create.large = std::make_pair(axes[0], axes[1]);
                     large_dims = axes.size();
                     if (axes.size() == 3U) create.large_depth = axes[2];
+                } else if (Accept("check")) {
+                    create.checks.push_back(Check());
                 } else if (Accept("with")) {
                     if (with) Fail(column, "WITH is given twice");
                     with = true;
@@ -1220,11 +1254,21 @@ class Parser {
             AlterTable alter;
             alter.table = Name("a table name");
             if (Accept("add")) {
+                if (Accept("check")) {
+                    alter.change = AddCheck{.check = Check()};
+                    return alter;
+                }
                 const bool chunk_column = Accept("chunk");
                 Expect("column");
                 const bool conditional = IfNotExists();
-                alter.change = AddColumn{.column = Definition(), .if_not_exists = conditional, .chunk_column = chunk_column};
+                alter.change = AddColumn{
+                    .column = DefinitionWithoutCheck("ADD COLUMN"), .if_not_exists = conditional, .chunk_column = chunk_column};
             } else if (Accept("drop")) {
+                if (Accept("check")) {
+                    const bool conditional = IfExists();
+                    alter.change = DropCheck{.name = Name("a check name"), .if_exists = conditional};
+                    return alter;
+                }
                 const bool chunk_column = Accept("chunk");
                 Expect("column");
                 const bool conditional = IfExists();
@@ -1396,7 +1440,12 @@ class Parser {
             return Ping{};
         }
         if (Accept("begin")) {
-            return Begin{};
+            Begin begin;
+            if (Accept("read")) {
+                Expect("only");
+                begin.read_only = true;
+            }
+            return begin;
         }
         if (Accept("commit")) {
             return Commit{};

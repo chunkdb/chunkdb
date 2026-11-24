@@ -706,6 +706,9 @@ StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
             }(),
         .compressed_checkpoint_images =
             stats_compressed_checkpoint_images_.load(std::memory_order_relaxed),
+        .txn_history_copies = txn_history_->CopiedStates(),
+        .txn_history_copied_bytes = txn_history_->CopiedBytes(),
+        .txn_history_bytes = txn_history_->KeptBytesCounter().load(std::memory_order_acquire),
     };
 }
 

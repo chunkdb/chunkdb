@@ -59,6 +59,7 @@ add_library(chunkdb_core STATIC
     src/backup_records.cpp
     src/backup_restore.cpp
     src/bit_codec.cpp
+    src/block_checks.cpp
     src/block_filter.cpp
     src/block_ops.cpp
     src/checkpoint.cpp
@@ -594,6 +595,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_alter_column_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME alter_column COMMAND chunkdb_alter_column_test)
 
+    add_executable(chunkdb_check_constraint_test tests/check_constraint_tests.cpp)
+    target_link_libraries(chunkdb_check_constraint_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_check_constraint_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME schema_check COMMAND chunkdb_check_constraint_test)
+
     add_executable(chunkdb_cql_test tests/cql_tests.cpp)
     target_link_libraries(chunkdb_cql_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_cql_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -690,6 +696,10 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_txn_engine_test tests/txn_engine_tests.cpp)
     target_link_libraries(chunkdb_txn_engine_test PRIVATE chunkdb_core)
     add_test(NAME txn_engine COMMAND chunkdb_txn_engine_test)
+    add_executable(chunkdb_txn_read_only_test tests/txn_read_only_tests.cpp)
+    target_link_libraries(chunkdb_txn_read_only_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_txn_read_only_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME txn_read_only COMMAND chunkdb_txn_read_only_test)
 
     add_executable(chunkdb_chunk_write_memory_test tests/chunk_write_memory_tests.cpp)
     target_link_libraries(chunkdb_chunk_write_memory_test PRIVATE chunkdb_core)
@@ -1242,6 +1252,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_column_types_test
         chunkdb_narrowing_test
         chunkdb_alter_column_test
+        chunkdb_check_constraint_test
         chunkdb_cql_test
         chunkdb_expr_test
         chunkdb_cql_engine_test
@@ -1252,6 +1263,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_migrations_records_test
         chunkdb_feature_activation_records_test
         chunkdb_txn_engine_test
+        chunkdb_txn_read_only_test
         chunkdb_chunk_write_memory_test
         chunkdb_crypto_test
         chunkdb_scram_test
