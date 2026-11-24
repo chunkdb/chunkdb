@@ -20,6 +20,7 @@
 #include <signal.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include "../src/exporter_client.hpp"
@@ -33,13 +34,19 @@ using Clock = std::chrono::steady_clock;
 using chunkdb::exporter::ChunkConnection;
 using chunkdb::exporter::ExporterOptions;
 
-// Owner-only, as the exporter requires of a password file.
+// Created owner-only before anything is written, as the exporter requires of
+// a password file.
 void WriteFile(const std::filesystem::path& path, const std::string& bytes) {
-    std::ofstream out(path, std::ios::binary);
-    out << bytes;
-    assert(out.good());
-    out.close();
-    std::filesystem::permissions(path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+    std::filesystem::remove(path);
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0600);
+    assert(fd >= 0);
+    std::size_t written = 0;
+    while (written < bytes.size()) {
+        const auto n = ::write(fd, bytes.data() + written, bytes.size() - written);
+        assert(n > 0);
+        written += static_cast<std::size_t>(n);
+    }
+    assert(::close(fd) == 0);
 }
 
 std::string ReadFile(const std::filesystem::path& path) {
