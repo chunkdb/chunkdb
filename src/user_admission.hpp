@@ -62,6 +62,9 @@ struct UserRightsView {
         std::uint64_t incarnation = 0;
         std::map<std::string, Right> grants;
         std::map<std::string, Right> prefix_grants = {};
+        bool manages_users = false;
+        // ServerRight bits.
+        std::uint8_t server_rights = 0U;
     };
     std::map<std::string, Entry> users;
 };
@@ -87,6 +90,8 @@ struct UserPublication {
     std::shared_ptr<const Users> users;
     std::shared_ptr<const UserAdmissionMap> admissions;
     std::shared_ptr<const UserRightsView> rights;
+    // The shape of every user's verifier, sorted: what decoys follow.
+    std::shared_ptr<const std::vector<scram::VerifierShape>> shapes;
     std::vector<UserAdmissionUpdate> updates;
 };
 }  // namespace chunkdb
