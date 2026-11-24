@@ -26,6 +26,18 @@ void Records() {
     assert(record.tables.size() == 1U && record.tables[0].epoch == fixture.manifest.store_id && record.tables[0].revision == 3U);
     assert(record.files.size() == fixture.record.files.size());
     auto bad = bytes; bad.back() ^= 1U; Throws([&] { (void)ParseBackupRecord(bad); });
+#ifndef _WIN32
+    // A record over the size limit is refused before it is read; the file is
+    // sparse, so nothing that large is written.
+    {
+        test::ScopedTempDir oversized("chunkdb-backup-record-size");
+        Save(oversized.path() / kBackupMarkerName, bytes);
+        std::filesystem::resize_file(oversized.path() / kBackupMarkerName, kMaxBackupRecordBytes + 1U);
+        std::string error;
+        try { (void)ReadBackupRecord(oversized.path()); } catch (const std::exception& e) { error = e.what(); }
+        assert(error.find("larger than") != std::string::npos);
+    }
+#endif
     auto duplicate = fixture.record; duplicate.files.push_back(duplicate.files.front()); Throws([&] { (void)SerializeBackupRecord(duplicate); });
     auto traversal = fixture.record; traversal.files[0].relative_path = "../outside"; Throws([&] { (void)SerializeBackupRecord(traversal); });
     auto zero = fixture.record; zero.tables[0].epoch = {}; Throws([&] { (void)SerializeBackupRecord(zero); });
@@ -731,6 +743,23 @@ void ResetPasswordRefusesBackup() {
     RestoreBackup(fixture.backup, fixture.root / "restored");
     assert(Verify(fixture.root / "restored").errors == 0U);
 }
+// Like a read-write open, the offline password reset refuses a data
+// directory with a feature this build can only read, and changes nothing.
+void ResetPasswordRefusesReadOnlyFeature() {
+    Fixture fixture;
+    const auto restored = fixture.root / "restored";
+    RestoreBackup(fixture.backup, restored);
+    const auto root_path = DataDirManifestPath(restored);
+    auto root = ParseDataDirManifest(LoadFile(root_path));
+    root.features.ro_compat |= 1U << 3U;
+    Save(root_path, SerializeDataDirManifest(root));
+    const auto users = LoadFile(restored / kUsersFileName);
+    std::string error;
+    try { ResetPassword(restored, "admin", "new-password"); }
+    catch (const std::exception& failure) { error = failure.what(); }
+    assert(error.find("can only be opened read-only") != std::string::npos);
+    assert(LoadFile(restored / kUsersFileName) == users);
+}
 } // namespace
 int main(int argc, char** argv) {
 #ifdef _WIN32
@@ -770,5 +799,6 @@ int main(int argc, char** argv) {
     run("directory ancestor replacement", DirectoryAncestorReplacement);
     run("extended roots", ExtendedRootPaths); run("configured backup roots", ConfiguredBackupDirectoryRoots);
     run("reset password refusal", ResetPasswordRefusesBackup);
+    run("reset password feature refusal", ResetPasswordRefusesReadOnlyFeature);
     std::cout << "20 backup restore groups passed\n";
 }

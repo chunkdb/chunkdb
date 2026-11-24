@@ -112,6 +112,9 @@ void RequireNotBackupDirectory(const std::filesystem::path& path, AccessMode acc
 // Reads only a pinned prefix, permitting replacement of its live name.
 [[nodiscard]] std::vector<std::uint8_t> ReadBackupFile(const std::filesystem::path& source,
     std::uint64_t size, const BackupCancel& cancelled = {});
+// The writer refuses a larger backup record and the reader refuses one before
+// reading it.
+inline constexpr std::uint64_t kMaxBackupRecordBytes = std::uint64_t{1} << 30U;
 [[nodiscard]] std::vector<std::uint8_t> SerializeBackupRecord(const BackupRecord& record);
 [[nodiscard]] BackupRecord ParseBackupRecord(const std::vector<std::uint8_t>& bytes);
 [[nodiscard]] BackupRecord ReadBackupRecord(const std::filesystem::path& root);
