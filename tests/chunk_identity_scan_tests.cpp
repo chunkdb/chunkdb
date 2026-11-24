@@ -217,10 +217,72 @@ void AreaPagesListOnlyTheirCells() {
         assert(refused);
     }
 }
+// Areas whose columns cross several coordinate runs, with changes spread over
+// the runs inside and outside the area: SINCE, snapshot and current pages
+// stop at each column's end inside a run and skip unchanged runs.
+void AreaPagesAcrossRuns() {
+    test::ScopedTempDir directory("chunkdb-scan-area-runs");
+    auto config = txn_test::Config(directory.path(), DurabilityMode::kRelaxed, 8U);
+    config.background_maintenance = false;
+    config.max_loaded_chunks = 4096U;
+    ChunkStore store(config);
+    std::set<ChunkCoord> populated;
+    for (std::int64_t x = -1; x <= 1; ++x)
+        for (std::int64_t y = 0; y < 300; ++y) {
+            store.SetBlockBits(x * 4, y * 4, "10000000");
+            populated.insert({x, y, 0});
+        }
+    const auto position = store.ScanChunkIdentities(false, {}, 1U).position;
+    assert(position);
+    const auto snapshot = store.BeginTxnSnapshot(std::chrono::seconds(60));
+    std::set<ChunkCoord> changed;
+    for (const auto& coord : populated) {
+        // Spread over the runs, except one stretch of a column whose runs stay
+        // unchanged.
+        if ((coord.y * 3 + coord.x + 7) % 7 != 0 || (coord.x == 0 && coord.y >= 120 && coord.y < 200)) continue;
+        store.SetBlockBits(coord.x * 4, coord.y * 4, "01000000");
+        changed.insert(coord);
+    }
+    const std::vector<ChunkAreaSelector> areas{
+        {.dims = 2U, .first = {0, 37, 0}, .last = {0, 251, 0}},
+        {.dims = 2U, .first = {-1, 64, 0}, .last = {1, 130, 0}},
+        {.dims = 2U, .first = {0, 150, 0}, .around = true, .radius = 90},
+    };
+    const auto inside = [](const ChunkAreaSelector& area, const std::set<ChunkCoord>& coords) {
+        const detail::AreaCursor cells(area);
+        std::vector<ChunkCoord> kept;
+        for (const auto& coord : coords)
+            if (cells.Contains(coord)) kept.push_back(coord);
+        return kept;
+    };
+    const auto collect = [&](const ChunkAreaSelector& area, std::size_t limit, std::optional<std::uint64_t> since,
+                             const TxnSnapshot* at) {
+        std::vector<ChunkCoord> coords;
+        bool has_cursor = false;
+        ChunkCoord cursor{};
+        for (;;) {
+            const auto page = at != nullptr
+                ? store.ScanChunkIdentitiesAt(*at, has_cursor, cursor, limit, false, nullptr, &area)
+                : store.ScanChunkIdentities(has_cursor, cursor, limit, since, false, nullptr, &area);
+            for (const auto& entry : page.entries) coords.push_back(entry.coord);
+            if (!page.has_more) return coords;
+            has_cursor = true;
+            cursor = page.entries.back().coord;
+        }
+    };
+    for (const auto& area : areas)
+        for (const std::size_t limit : {std::size_t{1U}, std::size_t{9U}, kMaxChunkScanLimit}) {
+            assert(collect(area, limit, *position, nullptr) == inside(area, changed));
+            assert(collect(area, limit, std::nullopt, snapshot.get()) == inside(area, populated));
+            assert(collect(area, limit, std::nullopt, nullptr) == inside(area, populated));
+        }
+    store.EndTxnSnapshot(*snapshot);
+}
 }
 int main() {
     IdentityPagesIncludeRetainedDeletions();
     CandidateChangedDuringDiskRead();
     DataPagesBoundRetainedCopies();
     AreaPagesListOnlyTheirCells();
+    AreaPagesAcrossRuns();
 }

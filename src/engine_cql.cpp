@@ -37,6 +37,7 @@
 #include "expr.hpp"
 #include "feature_flags.hpp"
 #include "backup.hpp"
+#include "catalog_feed.hpp"
 #include "slot_watch.hpp"
 #include "feed_protocol.hpp"
 #include "store_manifest.hpp"
@@ -564,8 +565,11 @@ struct FileUsage {
 // The value a column's encoded DEFAULT holds.
 // DESCRIBE: a map of the table's name, schema version, columns, chunk and
 // large-chunk sizes, options, epoch and completed revision, and why it is
-// fenced when it is. A fenced table has no `store` and a null revision.
-[[nodiscard]] std::string DescribeReply(const TableInfo& info, const ChunkStore* store, const std::string* fenced) {
+// fenced when it is. A fenced table has no `store` and a null revision. A
+// catalog record (`revision` false) has no revision: it describes the table,
+// not its data.
+[[nodiscard]] std::string DescribeReply(
+    const TableInfo& info, const ChunkStore* store, const std::string* fenced, bool revision = true) {
     std::string reply;
     const auto key = [&reply](std::string_view name) { Protocol::AppendBulk(reply, name); };
     const auto sides = [&reply, &info](std::uint64_t first, std::uint64_t second, std::uint64_t third) {
@@ -575,7 +579,7 @@ struct FileUsage {
         if (info.geometry.dims == 3U) Protocol::AppendInteger(reply, third);
     };
     const auto& checks = info.schema.checks;
-    Protocol::AppendMapHeader(reply, 10U + (fenced != nullptr ? 1U : 0U) + (checks.empty() ? 0U : 1U));
+    Protocol::AppendMapHeader(reply, (revision ? 10U : 9U) + (fenced != nullptr ? 1U : 0U) + (checks.empty() ? 0U : 1U));
     key("table");
     Protocol::AppendBulk(reply, info.name);
     key("version");
@@ -607,10 +611,12 @@ struct FileUsage {
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.slot_max_bytes));
     key("epoch");
     Protocol::AppendBulk(reply, StoreIdHex(store != nullptr ? store->store_id() : info.store_id));
-    key("revision");
-    if (const auto revision = store != nullptr ? store->CompletedRevision() : std::nullopt)
-        Protocol::AppendInteger(reply, *revision);
-    else Protocol::AppendNull(reply);
+    if (revision) {
+        key("revision");
+        if (const auto completed = store != nullptr ? store->CompletedRevision() : std::nullopt)
+            Protocol::AppendInteger(reply, *completed);
+        else Protocol::AppendNull(reply);
+    }
     key("dims");
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.geometry.dims));
     key("chunk_columns");
@@ -643,6 +649,111 @@ struct FileUsage {
             return "ADMIN";
     }
     return "?";
+}
+
+// A user as SHOW USERS and catalog user records show it: name, flags, the
+// number of verifiers, grants and server rights; never a verifier.
+void AppendUserMap(std::string& reply, const std::string& name, const User& user) {
+    Protocol::AppendMapHeader(reply, 6);
+    Protocol::AppendBulk(reply, "name");
+    Protocol::AppendBulk(reply, name);
+    Protocol::AppendBulk(reply, "manages_users");
+    Protocol::AppendBoolean(reply, user.manages_users);
+    Protocol::AppendBulk(reply, "requires_channel_binding");
+    Protocol::AppendBoolean(reply, user.requires_channel_binding);
+    Protocol::AppendBulk(reply, "verifiers");
+    Protocol::AppendInteger(reply, std::uint64_t{user.added_verifier ? 2U : 1U});
+    // Prefix grants as written: `p*`, in name order with the others.
+    std::map<std::string, Right> grants = user.grants;
+    for (const auto& [prefix, right] : user.prefix_grants) grants.emplace(prefix + "*", right);
+    Protocol::AppendBulk(reply, "grants");
+    Protocol::AppendMapHeader(reply, grants.size());
+    for (const auto& [table, right] : grants) {
+        Protocol::AppendBulk(reply, table);
+        Protocol::AppendBulk(reply, RightName(right));
+    }
+    constexpr std::array<std::pair<ServerRight, const char*>, 3> kServerRightNames{{
+        {ServerRight::kMonitor, "MONITOR"}, {ServerRight::kBackup, "BACKUP"},
+        {ServerRight::kReplication, "REPLICATION"}}};
+    std::size_t held = 0U;
+    for (const auto& [right, _] : kServerRightNames) held += chunkdb::HasServerRight(user, right) ? 1U : 0U;
+    Protocol::AppendBulk(reply, "server_rights");
+    Protocol::AppendArrayHeader(reply, held);
+    for (const auto& [right, label] : kServerRightNames)
+        if (chunkdb::HasServerRight(user, right)) Protocol::AppendBulk(reply, label);
+}
+
+// The `filters` key and map of SHOW SLOTS and catalog slot records.
+void AppendSlotFilters(std::string& reply, const FeedSlot& slot) {
+    Protocol::AppendBulk(reply, "filters"); Protocol::AppendMapHeader(reply, 5U);
+    Protocol::AppendBulk(reply, "area");
+    if (slot.filters.area) {
+        const auto& area = *slot.filters.area;
+        Protocol::AppendArrayHeader(reply, static_cast<std::size_t>(area.dims) * 2U);
+        Protocol::AppendInteger(reply, area.first.x);
+        Protocol::AppendInteger(reply, area.first.y);
+        if (area.dims == 3U) Protocol::AppendInteger(reply, area.first.z);
+        Protocol::AppendInteger(reply, area.last.x);
+        Protocol::AppendInteger(reply, area.last.y);
+        if (area.dims == 3U) Protocol::AppendInteger(reply, area.last.z);
+    } else Protocol::AppendNull(reply);
+    Protocol::AppendBulk(reply, "column_ids");
+    if (slot.filters.column_ids) {
+        Protocol::AppendArrayHeader(reply, slot.filters.column_ids->size());
+        for (const auto id : *slot.filters.column_ids) Protocol::AppendInteger(reply, static_cast<std::uint64_t>(id));
+    } else Protocol::AppendNull(reply);
+    Protocol::AppendBulk(reply, "columns");
+    if (slot.filters.column_ids) {
+        Protocol::AppendArrayHeader(reply, slot.column_names.size());
+        for (const auto& name : slot.column_names) {
+            if (name) Protocol::AppendBulk(reply, *name); else Protocol::AppendNull(reply);
+        }
+    } else Protocol::AppendNull(reply);
+    Protocol::AppendBulk(reply, "no_before"); reply += slot.filters.no_before ? "#t\r\n" : "#f\r\n";
+    Protocol::AppendBulk(reply, "chunks"); reply += slot.filters.chunks ? "#t\r\n" : "#f\r\n";
+}
+
+// A catalog slot record: its filters and owner; the owner only with `owner`.
+[[nodiscard]] std::string SlotRecord(const FeedSlot& slot, bool owner) {
+    std::string record;
+    Protocol::AppendMapHeader(record, 2U);
+    AppendSlotFilters(record, slot);
+    Protocol::AppendBulk(record, "owner");
+    if (owner && slot.owner) Protocol::AppendBulk(record, *slot.owner);
+    else Protocol::AppendNull(record);
+    return record;
+}
+
+// What a statement can change in the catalog feed's records; std::nullopt for
+// a statement that changes none. Every statement in scope refreshes the users
+// as well, since table statements move and remove grants.
+[[nodiscard]] std::optional<CatalogScope> CatalogScopeOf(const cql::Statement& statement) {
+    const auto tables = [](std::vector<std::string> names) { return CatalogScope{.tables = std::move(names), .all_tables = false}; };
+    return std::visit(Overloaded{
+        [&](const cql::CreateTable& create) -> std::optional<CatalogScope> { return tables({create.table}); },
+        [&](const cql::AlterTable& alter) -> std::optional<CatalogScope> {
+            auto scope = tables({alter.table});
+            if (const auto* rename = std::get_if<cql::RenameTable>(&alter.change)) scope.tables.push_back(rename->new_name);
+            return scope;
+        },
+        [&](const cql::DropTable& drop) -> std::optional<CatalogScope> { return tables({drop.table}); },
+        [&](const cql::RecoverTable& recover) -> std::optional<CatalogScope> { return tables({recover.table}); },
+        [&](const cql::RestoreTable& restore) -> std::optional<CatalogScope> { return tables({restore.name}); },
+        [&](const cql::SwapTables& swap) -> std::optional<CatalogScope> { return tables({swap.first, swap.second}); },
+        [&](const cql::CreateSlot& create) -> std::optional<CatalogScope> { return tables({create.table}); },
+        [&](const cql::DropSlot& drop) -> std::optional<CatalogScope> { return tables({drop.table}); },
+        // An attach can record the slot's owner.
+        [&](const cql::Watch& watch) -> std::optional<CatalogScope> {
+            if (!watch.slot) return std::nullopt;
+            return tables({watch.table});
+        },
+        [&](const cql::Migrate&) -> std::optional<CatalogScope> { return CatalogScope{.tables = {}, .all_tables = true}; },
+        [&](const cql::CreateUser&) -> std::optional<CatalogScope> { return CatalogScope{}; },
+        [&](const cql::AlterUser&) -> std::optional<CatalogScope> { return CatalogScope{}; },
+        [&](const cql::DropUser&) -> std::optional<CatalogScope> { return CatalogScope{}; },
+        [&](const cql::GrantRight&) -> std::optional<CatalogScope> { return CatalogScope{}; },
+        [&](const auto&) -> std::optional<CatalogScope> { return std::nullopt; },
+    }, statement);
 }
 
 // The most bytes of a verifier, sent as a parameter or a text literal.
@@ -960,7 +1071,7 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::Begin&) { info.verb = "BEGIN"; },
             [&](const cql::Commit&) { info.verb = "COMMIT"; },
             [&](const cql::Rollback&) { info.verb = "ROLLBACK"; },
-            [&](const cql::Watch& watch) { info.verb = "WATCH"; info.table = watch.table; },
+            [&](const cql::Watch& watch) { info.verb = watch.catalog ? "WATCH CATALOG" : "WATCH"; info.table = watch.table; },
             [&](const cql::Unwatch&) { info.verb = "UNWATCH"; },
             [&](const cql::CreateSlot& create) { slot(create, "CREATE SLOT", "create_slot"); },
             [&](const cql::DropSlot& drop) { slot(drop, "DROP SLOT", "drop_slot"); },
@@ -1115,6 +1226,73 @@ void CommandEngine::RequireManagesUsers(SessionState& session) const {
     if (user == nullptr || !user->manages_users) {
         throw PermissionDeniedError("MANAGES USERS");
     }
+}
+
+CatalogState CommandEngine::ReadCatalog(const CatalogScope& scope) const {
+    // Outside the statement that ran before: its cancellation or deadline
+    // neither stops this read nor ends the catalog watches.
+    const ScopedStatementControl detached(nullptr);
+    CatalogState state;
+    std::set<std::string, std::less<>> names(scope.tables.begin(), scope.tables.end());
+    if (scope.all_tables) {
+        for (const auto& info : catalog_->List()) names.insert(info.name);
+        for (const auto& fence : catalog_->Fences()) names.insert(fence.table);
+    }
+    for (const auto& name : names) {
+        // A fenced table keeps the record of what it served last.
+        std::shared_ptr<Table> table;
+        std::optional<TableInfo> info;
+        if (auto fence = catalog_->Fence(name)) info = std::move(fence->info);
+        else if ((table = catalog_->Find(name))) info = table->Info();
+        else continue;
+        if (!info) {
+            state.unknown_tables.insert(name);
+            state.unknown_slots.insert(name);
+            continue;
+        }
+        auto record = DescribeReply(*info, nullptr, nullptr, false);
+        state.records.emplace(CatalogKey{.kind = CatalogKind::kTable, .table = name, .name = {}},
+            CatalogValue{.full = record, .limited = record});
+        if (!table) {
+            state.unknown_slots.insert(name);
+            continue;
+        }
+        // Never waits for a table being reopened: its slots stay as published
+        // and are read again with the next change. A table that refuses leases,
+        // such as one whose feed needs recovery, does the same.
+        std::optional<std::vector<FeedSlot>> slots;
+        try {
+            slots = table->TryListFeedSlots(true);
+        } catch (const TableNotFoundError&) {
+            // The expected refusals; any other error ends the catalog watches.
+            slots.reset();
+        } catch (const TableFencedError&) {
+            slots.reset();
+        } catch (const FeedRecoveryRequiredError&) {
+            slots.reset();
+        } catch (const MigrationRecoveryRequiredError&) {
+            slots.reset();
+        } catch (const FeatureRecoveryRequiredError&) {
+            slots.reset();
+        }
+        if (!slots) {
+            state.unknown_slots.insert(name);
+            continue;
+        }
+        for (const auto& slot : *slots) {
+            state.records.emplace(CatalogKey{.kind = CatalogKind::kSlot, .table = name, .name = slot.name},
+                CatalogValue{.full = SlotRecord(slot, true), .limited = SlotRecord(slot, false)});
+        }
+    }
+    if (config_.users) {
+        for (const auto& [name, user] : config_.users->Snapshot().users) {
+            std::string record;
+            AppendUserMap(record, name, user);
+            state.records.emplace(CatalogKey{.kind = CatalogKind::kUser, .table = {}, .name = name},
+                CatalogValue{.full = std::move(record), .limited = std::nullopt});
+        }
+    }
+    return state;
 }
 
 Table::Lease CommandEngine::AcquireNamedTable(SessionState& session, std::string_view name) const {
@@ -1347,6 +1525,19 @@ std::string CommandEngine::ExecuteStatement(
                     : "inside a transaction only GET, SET and DELETE statements, AGGREGATE, DESCRIBE, PING, COMMIT and "
                       "ROLLBACK run");
         }
+        // After a statement that can change the catalog, finished or failed,
+        // catalog watches receive what changed.
+        struct CatalogRefresh {
+            CatalogFeed& feed;
+            std::optional<CatalogScope> scope;
+            std::string_view user;
+            const std::atomic<CommandEngineTestHook*>& hook;
+            ~CatalogRefresh() {
+                if (!scope) return;
+                if (auto* test = hook.load(std::memory_order_acquire)) test->Run(CommandEngineTestHook::Point::kBeforeCatalogRefresh, {});
+                feed.Refresh(*scope, user);
+            }
+        } catalog_refresh{*catalog_feed_, CatalogScopeOf(parsed.statement), session.user, hook_};
         return std::visit(
             Overloaded{
                 [&](const cql::ShowConnections&) {
@@ -1502,7 +1693,33 @@ std::string CommandEngine::ExecuteStatement(
                     return reply;
                 },
                 [&](const cql::Watch& watch) {
-                    if (session.watch || session.slot_watch) return Protocol::Error("INVALID_ARGUMENT", "a watch is already open");
+                    // The open watch, its rights check and its count stay as they are.
+                    if (session.Watching()) return Protocol::Error("INVALID_ARGUMENT", "a watch is already open");
+                    if (watch.catalog) {
+                        RequireMonitor(session);
+                        // Another process could change the catalog without a push.
+                        if (catalog_->allow_multiple_processes())
+                            throw std::invalid_argument("WATCH CATALOG requires a server that is the only process of its data directory");
+                        const User* user = CurrentUser(session);
+                        const bool users = !config_.require_auth || (user != nullptr && user->manages_users);
+                        // The feed ends the watch once these rights or the user are gone.
+                        session.watch_right = nullptr;
+                        if (config_.require_auth) {
+                            session.watch_right = std::make_shared<ReadRightCheck>(config_.users, session.user,
+                                session.user_incarnation, std::string{}, session.user_generation);
+                            session.watch_right->RequireCatalog(users);
+                        }
+                        session.catalog_watch = catalog_feed_->Subscribe(users, session.watch_options.notify);
+                        // Catalog watches share one output budget, apart from every table's watches.
+                        session.table.reset();
+                        std::string reply;
+                        Protocol::AppendMapHeader(reply, 2U);
+                        Protocol::AppendBulk(reply, "epoch");
+                        Protocol::AppendBulk(reply, StoreIdHex(session.catalog_watch->epoch()));
+                        Protocol::AppendBulk(reply, "revision");
+                        Protocol::AppendInteger(reply, session.catalog_watch->revision());
+                        return reply;
+                    }
                     RequireRight(session, watch.table, Right::kRead);
                     // The feed ends the watch once the right or user is gone,
                     // checking from the generation READ was confirmed at. Set
@@ -1629,32 +1846,7 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendBulk(reply, "lost_reason");
                         if (slot.lost) Protocol::AppendBulk(reply, slot.schema_filter_lost ? "schema_filter" : "retention_limit");
                         else Protocol::AppendNull(reply);
-                        Protocol::AppendBulk(reply, "filters"); Protocol::AppendMapHeader(reply, 5U);
-                        Protocol::AppendBulk(reply, "area");
-                        if (slot.filters.area) {
-                            const auto& area = *slot.filters.area;
-                            Protocol::AppendArrayHeader(reply, static_cast<std::size_t>(area.dims) * 2U);
-                            Protocol::AppendInteger(reply, area.first.x);
-                            Protocol::AppendInteger(reply, area.first.y);
-                            if (area.dims == 3U) Protocol::AppendInteger(reply, area.first.z);
-                            Protocol::AppendInteger(reply, area.last.x);
-                            Protocol::AppendInteger(reply, area.last.y);
-                            if (area.dims == 3U) Protocol::AppendInteger(reply, area.last.z);
-                        } else Protocol::AppendNull(reply);
-                        Protocol::AppendBulk(reply, "column_ids");
-                        if (slot.filters.column_ids) {
-                            Protocol::AppendArrayHeader(reply, slot.filters.column_ids->size());
-                            for (const auto id : *slot.filters.column_ids) Protocol::AppendInteger(reply, static_cast<std::uint64_t>(id));
-                        } else Protocol::AppendNull(reply);
-                        Protocol::AppendBulk(reply, "columns");
-                        if (slot.filters.column_ids) {
-                            Protocol::AppendArrayHeader(reply, slot.column_names.size());
-                            for (const auto& name : slot.column_names) {
-                                if (name) Protocol::AppendBulk(reply, *name); else Protocol::AppendNull(reply);
-                            }
-                        } else Protocol::AppendNull(reply);
-                        Protocol::AppendBulk(reply, "no_before"); reply += slot.filters.no_before ? "#t\r\n" : "#f\r\n";
-                        Protocol::AppendBulk(reply, "chunks"); reply += slot.filters.chunks ? "#t\r\n" : "#f\r\n";
+                        AppendSlotFilters(reply, slot);
                         Protocol::AppendBulk(reply, "owner");
                         if (slot.owner && (show_owners || (viewer != nullptr && *slot.owner == session.user))) Protocol::AppendBulk(reply, *slot.owner);
                         else Protocol::AppendNull(reply);
@@ -2647,35 +2839,7 @@ std::string CommandEngine::ExecuteStatement(
                     const Users users = config_.users->Snapshot();
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, users.users.size());
-                    for (const auto& [name, user] : users.users) {
-                        Protocol::AppendMapHeader(reply, 6);
-                        Protocol::AppendBulk(reply, "name");
-                        Protocol::AppendBulk(reply, name);
-                        Protocol::AppendBulk(reply, "manages_users");
-                        Protocol::AppendBoolean(reply, user.manages_users);
-                        Protocol::AppendBulk(reply, "requires_channel_binding");
-                        Protocol::AppendBoolean(reply, user.requires_channel_binding);
-                        Protocol::AppendBulk(reply, "verifiers");
-                        Protocol::AppendInteger(reply, std::uint64_t{user.added_verifier ? 2U : 1U});
-                        // Prefix grants as written: `p*`, in name order with the others.
-                        std::map<std::string, Right> grants = user.grants;
-                        for (const auto& [prefix, right] : user.prefix_grants) grants.emplace(prefix + "*", right);
-                        Protocol::AppendBulk(reply, "grants");
-                        Protocol::AppendMapHeader(reply, grants.size());
-                        for (const auto& [table, right] : grants) {
-                            Protocol::AppendBulk(reply, table);
-                            Protocol::AppendBulk(reply, RightName(right));
-                        }
-                        constexpr std::array<std::pair<ServerRight, const char*>, 3> kServerRightNames{{
-                            {ServerRight::kMonitor, "MONITOR"}, {ServerRight::kBackup, "BACKUP"},
-                            {ServerRight::kReplication, "REPLICATION"}}};
-                        std::size_t held = 0U;
-                        for (const auto& [right, _] : kServerRightNames) held += chunkdb::HasServerRight(user, right) ? 1U : 0U;
-                        Protocol::AppendBulk(reply, "server_rights");
-                        Protocol::AppendArrayHeader(reply, held);
-                        for (const auto& [right, label] : kServerRightNames)
-                            if (chunkdb::HasServerRight(user, right)) Protocol::AppendBulk(reply, label);
-                    }
+                    for (const auto& [name, user] : users.users) AppendUserMap(reply, name, user);
                     return reply;
                 },
                 [&](const cql::EnableFeature& enable) {

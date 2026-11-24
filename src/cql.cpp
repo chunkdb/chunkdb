@@ -1446,6 +1446,11 @@ class Parser {
         if (Accept("ack")) return Ack{.revision = Unsigned("a revision", std::numeric_limits<std::uint64_t>::max())};
         if (Accept("watch")) {
             Watch watch;
+            // CATALOG is a keyword here: a table named catalog cannot be watched.
+            if (Accept("catalog")) {
+                watch.catalog = true;
+                return watch;
+            }
             watch.table = Name("a table name");
             while (true) {
                 const auto column = Peek().column;

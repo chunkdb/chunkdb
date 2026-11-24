@@ -23,6 +23,9 @@ void SyncDirectoryPath(const std::filesystem::path& path);
 void SyncParentDirectory(const std::filesystem::path& path);
 // Called with each directory once it is synced; an empty function stops it.
 void SetDirectorySyncObserverForTests(std::function<void(const std::filesystem::path&)> observer);
+// Called with each descriptor number right after it is closed for a sync or
+// an atomic write, outside Windows; an empty function stops it.
+void SetDescriptorCloseObserverForTests(std::function<void(int)> observer);
 // Called with each file SyncFilePath or SyncFilePathIfPresent synced; an
 // empty function stops it.
 void SetFileSyncObserverForTests(std::function<void(const std::filesystem::path&)> observer);
