@@ -1,5 +1,3 @@
-| CHECK_FAILED | A write leaves a block for which a check is false, or ADD CHECK finds a stored one: `block (x, y) fails CHECK name (condition)`, with `check=name`. | Change the values, or drop the check. |
-| INVALID_ARGUMENT | A check names an unknown column, is not a condition, or uses parameters, chunk columns, NOW() or EXISTS; DROP COLUMN or ALTER COLUMN TYPE ... USING names a column a check reads. | Correct the condition, or drop the check first. |
 # CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SWAP TABLES, SHOW TABLES, DESCRIBE
 
 You define a table's columns, inspect its schema, and change or remove it.
@@ -75,9 +73,9 @@ ALTER TABLE table DROP CHUNK COLUMN [IF EXISTS] column
 ALTER TABLE table RENAME CHUNK COLUMN column TO name
 ALTER TABLE table ALTER COLUMN column TYPE type [USING CLAMP | DEFAULT | TRUNCATE]
 ALTER TABLE table ALTER COLUMN column SET DEFAULT value | DROP DEFAULT
-ALTER TABLE table ALTER COLUMN column SET NULL ALTER TABLE table ADD CHECK [name] (condition)
+ALTER TABLE table ALTER COLUMN column SET NULL | DROP NULL | SET REQUIRED | DROP REQUIRED
+ALTER TABLE table ADD CHECK [name] (condition)
 ALTER TABLE table DROP CHECK [IF EXISTS] name
-| DROP NULL | SET REQUIRED | DROP REQUIRED
 ALTER TABLE table SET option = value
 ALTER TABLE table RENAME TO name
 DROP TABLE [IF EXISTS] table
@@ -170,6 +168,8 @@ The `chunk_columns` list uses the same column-description maps as `columns`.
 | INVALID_ARGUMENT | SWAP TABLES names one table twice. | Name two tables. |
 | INVALID_ARGUMENT | DROP NULL finds a NULL: `column c cannot drop NULL: block (x, y) holds NULL`. | Set a value in that block, then run DROP NULL again. |
 | INVALID_ARGUMENT | An ALTER COLUMN change leaves the column as it is, or makes it both NULL and REQUIRED. | Drop the other attribute first. |
+| CHECK_FAILED | A write leaves a block for which a check is false, or ADD CHECK finds a stored one: `block (x, y) fails CHECK name (condition)`, with `check=name`. | Change the values, or drop the check. |
+| INVALID_ARGUMENT | A check names an unknown column, is not a condition, or uses parameters, chunk columns, NOW() or EXISTS; DROP COLUMN or ALTER COLUMN TYPE ... USING names a column a check reads. | Correct the condition, or drop the check first. |
 | TABLE_EXISTS | RENAME TO names a table that exists, or a directory under `tables/` that no table of this server uses. | Use another name, or DROP TABLE that table first. |
 | INTERNAL | SWAP TABLES on Windows or a file system without an atomic directory exchange; both tables keep their names. | Swap on Linux or macOS, or restore under the live name after DROP TABLE. |
 | CONFLICT | An active transaction sees a schema change. | Retry from BEGIN. |
@@ -241,9 +241,10 @@ It reads the block's columns and its position (`pos_x`, `pos_y`, `pos_z`); param
 An unnamed check is named `column_check` after its column, or after the first column it reads (`check` when it reads none), with `_2`, `_3` and so on when that name is taken.
 
 Every write that leaves a block present checks it as written: SET BLOCK with the columns it keeps and a new block's defaults, IF VERSION and IF ABSENT writes, SET CHUNK whole or with COLUMNS for every present block of the result, and MIGRATE.
-In a transaction, SET BLOCK and SET CHUNK are refused as statements and COMMIT checks every chunk it writes again.
+In a transaction, a SET BLOCK or SET CHUNK that fails a check is refused at the statement, and COMMIT checks again every block it changes.
 DELETE always passes; a check that cannot be evaluated, such as one dividing by zero, refuses the write with INVALID_ARGUMENT or OUT_OF_RANGE naming the check and the block.
 A table without checks evaluates nothing when it is written.
+A DEFAULT that fails a check is accepted by the schema change and refused only at the first write that gives a new block that DEFAULT.
 
 ADD CHECK evaluates every stored block as DROP NULL checks values, and refuses with CHECK_FAILED for the first block that fails it or cannot evaluate it.
 While it runs, writes must pass the new check too; a restart or RECOVER TABLE drops an interrupted ADD CHECK.

@@ -99,3 +99,5 @@ A table's checks (docs/reference/TABLES.md) are conditions stored as text in the
 A block fails a check only when the condition is false (`EvaluatesFalse`): unknown passes, as in SQL, where IF and WHERE treat it as false.
 Checks refuse parameters, chunk columns, NOW() and EXISTS, so a block's result depends only on its own values and position.
 RENAME COLUMN rewrites the column's name in the text (`RenameColumnIn`), keeping a quoted name quoted and quoting a keyword; undoing the step renames it back.
+A table's checks are planned at the first write that needs them; a geometry that is only read never plans them.
+A write evaluates a check only for a block it adds, or whose columns read by the check it changes; a single-block write is evaluated before it reserves a version, and COMMIT evaluates under the commit locks against the chunks as the transaction read them.
