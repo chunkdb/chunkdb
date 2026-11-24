@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- A slot pass or slot acknowledgement step that takes more than 1 s is logged as a WARN with the time of its flush, sync and persist phases and the number of chunks and files it handled, a slot watch that catches up from the archive because the live feed no longer holds its position is logged at INFO, and an archive reader that takes more than 1 s to open is logged as a WARN, so a durable frontier that trails the writes shows its cause (#140).
 - DROP TABLE waits for a running BACKUP to pin its tables and save the users file, as ALTER TABLE ... RENAME TO and SWAP TABLES do; before, a backup could hold a table without the grants on it when the table was dropped between its pin and the end of the backup's metadata capture (#306).
 - RECOVER TABLE leaves the private copy of a RESTORE TABLE that is still copying into the same name; before, it removed that copy and the restore failed (#306).
 - SHOW METRICS adds the gauges `chunkdb_table_fenced`, 1 for each fenced table, also one out of service, and 0 for each other table, and `chunkdb_slot_frontier_frozen`, 1 for each serving table with a slot whose store failed closed after a durability failure, so that its slots' durable revision stays until RECOVER TABLE or a restart, both labelled `table`; a table that is not serving keeps its `chunkdb_table_fenced` sample. Metric names, types and label names are fixed for 2.x, listed in the exporter guide (#149).
