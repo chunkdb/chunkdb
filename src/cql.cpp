@@ -5,12 +5,14 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
+#include <clocale>
+#include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <limits>
-#include <locale>
 #include <set>
-#include <sstream>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -239,17 +241,26 @@ Integer IntegerOf(const Token& token) {
     return value;
 }
 
+// The nearest f64, subnormals and zero included; a value beyond f64 is
+// refused. The lexer passes only digits, '.', 'e' and signs, so strtod sees
+// no hexadecimal, inf or nan; '.' becomes the C locale's decimal point.
 double FloatOf(const Token& token) {
-    const std::string text = Lower(token.text);
+    std::string text = Lower(token.text);
     if (text == "-inf") {
         return -std::numeric_limits<double>::infinity();
     }
-    double value = 0.0;
-    std::istringstream input(text);
-    input.imbue(std::locale::classic());
-    input >> value;
-    if (input.fail() || input.peek() != std::char_traits<char>::eof()) {
+    const std::string_view point = std::localeconv()->decimal_point;
+    if (const auto dot = text.find('.'); dot != std::string::npos && !point.empty() && point != ".") {
+        text.replace(dot, 1U, point);
+    }
+    char* end = nullptr;
+    errno = 0;
+    const double value = std::strtod(text.c_str(), &end);
+    if (end != text.c_str() + text.size()) {
         Fail(token.column, token.text + " is not a number");
+    }
+    if (errno == ERANGE && std::isinf(value)) {
+        Fail(token.column, token.text + " is beyond the f64 range");
     }
     return value;
 }

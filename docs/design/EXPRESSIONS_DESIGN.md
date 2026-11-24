@@ -52,8 +52,9 @@ Integers of different types combine as their common type for this purpose (the s
 A parameter tested by BETWEEN against two typed bounds takes their common type by the same rule, whatever their order.
 A parameter with no column-typed operand (`$1 < $2`, `$1 IN (1, 2)`, `$1 + 1 < 2`) is refused.
 An integer parameter carries the 64-bit value of its frame; it is not narrowed to its column's width before it is compared or combined.
-Literals keep the value they are written with: a float literal compared or combined with an f32 column is not rounded to f32, the f32 value widens to f64 and the comparison is exact (with an f32 column holding 16777216, `f32c < 16777216.5` holds and `f32c = 16777217.0` does not).
-Rounding to f32, and the `OUT_OF_RANGE` check for a finite float beyond f32, happen only when the final value is assigned to an f32 column.
+In a condition, a float literal takes f32 where a parameter in its place would: it is rounded to the nearest f32, so `f32c = 0.1` holds for a stored 0.1 as `f32c = $1` does with a four-byte 0.1 (with an f32 column holding 16777216, `f32c = 16777217.0` holds and `f32c < 16777216.5` does not).
+A finite float literal beyond f32 keeps its value, so it still compares beyond every f32 value; arithmetic with a float literal stays f64, and so does a literal compared with its result.
+In an assignment, literals keep the value they are written with; rounding to f32, and the `OUT_OF_RANGE` check for a finite float beyond f32, happen when the final value is assigned to an f32 column.
 
 ## NULL and absent blocks
 

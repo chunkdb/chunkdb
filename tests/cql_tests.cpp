@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <clocale>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -297,6 +298,20 @@ void TestChunkAndAreaStatements() {
     ExpectError("GET AREA 0 0 TO 2 2 FROM t LIMIT -1", "a limit must be between 0");
 }
 
+// Float literals read '.' whatever the process locale.
+void TestFloatLocale() {
+    const char* previous = std::setlocale(LC_NUMERIC, nullptr);
+    const std::string saved = previous != nullptr ? previous : "C";
+    for (const char* name : {"de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8", "ru_RU.UTF-8"}) {
+        if (std::setlocale(LC_NUMERIC, name) != nullptr) break;
+    }
+    const cql::Literal half = ValueOf("1.5");
+    const cql::Literal small = ValueOf("-2.5e-310");
+    std::setlocale(LC_NUMERIC, saved.c_str());
+    assert(half == cql::Literal(1.5));
+    assert(small == cql::Literal(-2.5e-310));
+}
+
 void TestLiterals() {
     assert(ValueOf("-12") == cql::Literal(cql::Integer{.negative = true, .magnitude = 12}));
     assert(ValueOf("-0") == cql::Literal(cql::Integer{.negative = false, .magnitude = 0}));
@@ -311,7 +326,15 @@ void TestLiterals() {
     assert(ValueOf("-INF") == cql::Literal(-std::numeric_limits<double>::infinity()));
     assert(std::isnan(std::get<double>(ValueOf("NaN"))));
     ExpectError("SET BLOCK 0 0 IN t a = 1.2.3", "is not a number");
-    ExpectError("SET BLOCK 0 0 IN t a = 1e999", "is not a number");
+    ExpectError("SET BLOCK 0 0 IN t a = 1e999", "1e999 is beyond the f64 range");
+    ExpectError("SET BLOCK 0 0 IN t a = -1e999", "-1e999 is beyond the f64 range");
+    // The nearest f64: subnormal values are kept, and smaller ones are zero.
+    assert(ValueOf("1e-310") == cql::Literal(1e-310));
+    assert(ValueOf("4.9406564584124654e-324") == cql::Literal(std::numeric_limits<double>::denorm_min()));
+    assert(ValueOf("2.2250738585072014e-308") == cql::Literal(std::numeric_limits<double>::min()));
+    assert(ValueOf("1.7976931348623157e308") == cql::Literal(std::numeric_limits<double>::max()));
+    assert(ValueOf("1e-400") == cql::Literal(0.0));
+    assert(ValueOf("-1e-400") == cql::Literal(0.0));
 
     assert(ValueOf("TRUE") == cql::Literal(true));
     assert(ValueOf("false") == cql::Literal(false));
@@ -839,6 +862,7 @@ int main() {
     TestChunkAndAreaStatements();
     TestAggregate();
     TestLiterals();
+    TestFloatLocale();
     TestParameters();
     TestCreateTable();
     TestAlterAndOtherStatements();
