@@ -122,6 +122,7 @@ The leaf name becomes durable only after that directory sync; a crash before it 
 A no-replace hard-link fallback leaves the stage link as a second name of the live generation, so later appends change both names; collection may unlink only that stage name, and a future repair must use a replacement inode when the link count is above one.
 A returned file pins the journal directory and the leaf; on Windows the directory handle denies delete sharing while it lives.
 A writable file appends only at an end it admitted itself: its own creation or appends, or a scan from disk with no tail.
+A refused scan withdraws any end that the file admitted before it.
 An append requires the measured extent to equal that end, admits the complete record against the directory and the group rules of the generation, and writes it without syncing; a separate sync makes it durable.
 A failed write or sync fences that file object; only a fresh object whose scan from disk admits a new end can append again.
 Read-only views open both handles without write rights and refuse append and sync.

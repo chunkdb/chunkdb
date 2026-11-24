@@ -482,6 +482,10 @@ const CommitJournalContext& CommitGroupJournalFile::context() const noexcept { r
 bool CommitGroupJournalFile::writable() const noexcept { return impl_->writable; }
 std::uint64_t CommitGroupJournalFile::MeasuredBytes() const { return Extent(impl_->file); }
 CommitJournalScan CommitGroupJournalFile::Scan(const CommitJournalInventory& certified, std::span<const std::uint64_t> cursors) {
+    // A refused scan withdraws any end admitted before it; only a complete scan admits a new one.
+    impl_->end.reset();
+    impl_->tail = false;
+    impl_->groups = {};
     if (certified.context != impl_->context) Damage("inventory names another journal generation");
     const auto& file = impl_->file;
     const auto measured = Extent(file);

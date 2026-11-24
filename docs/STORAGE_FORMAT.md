@@ -486,6 +486,7 @@ Failure repairing an uncommitted operation fences the affected store until recov
 No server or tool path creates these files; `commit_groups` stays refused, and only internal code and tests write them in this build.
 The owner root is the data directory, or the root of a standalone store.
 `chunkdb.groups.owner` is the 512-byte [CKGO root](design/COMMIT_GROUP_OWNER_FORMAT.md); the only canonical form this build writes is the generation-one INACTIVE root, published from an exclusive `.owner-root-<32 hex>` temporary without replacement.
+An existing root, or one that arrives during that publication, is admitted only by comparing its exact bytes with that root, and is then synced with the root directory.
 `chunkdb.groups.objects/` holds a `.scope` marker and digest-named immutable objects: roots, pages, 128-byte `CKGC` journal inventories and `CKID` ID inventories of at least 164 bytes, in their [native encodings](design/COMMIT_GROUP_FORMAT.md#journal-header-and-certified-inventory).
 `chunkdb.groups.journal/<32 hex journal id>-<16 hex generation>` is one journal generation: a 64-byte `CKGJ` header followed by `CKGR` records, named from the admitted journal context.
 Each temporary is synced before its no-replace publication, the published name is reopened and checked against the temporary's native object and exact bytes, and the file and then its directory are synced; a name is durable only after that directory sync.

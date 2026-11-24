@@ -676,6 +676,21 @@ void JournalAppend() {
     }
     std::filesystem::resize_file(leaf, clean.size());
     {
+        // A refused scan withdraws the end that an earlier scan admitted.
+        auto journal = writer.OpenJournal(kJournal);
+        (void)journal.Scan(EmptyInventory());
+        auto damaged = clean;
+        damaged[24] ^= 0x01U;
+        Save(leaf, damaged);
+        RejectWith("header", [&] { (void)journal.Scan(EmptyInventory()); });
+        RejectWith("journal end is not admitted", [&] { (void)journal.Append(Decision(c)); });
+        assert(LoadFile(leaf) == damaged);
+        Save(leaf, clean);
+        (void)journal.Scan(EmptyInventory());
+        assert(journal.Append(Decision(c)) == clean.size() + Decision(c).size());
+    }
+    std::filesystem::resize_file(leaf, clean.size());
+    {
         auto journal = writer.OpenJournal(kJournal);
         (void)journal.Scan(EmptyInventory());
         Observers observers;

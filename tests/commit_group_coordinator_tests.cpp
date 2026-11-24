@@ -276,6 +276,20 @@ const std::vector<CrashPoint>& CrashPoints() {
     };
     return points;
 }
+// The index of the crash point whose name starts with `prefix`.
+std::size_t PointIndex(std::string_view prefix) {
+    const auto& points = CrashPoints();
+    for (std::size_t i = 0U; i < points.size(); ++i) if (std::string_view(points[i].name).starts_with(prefix)) return i;
+    std::abort();
+}
+// Published journal generations; a stage name kept by a hard-link fallback is not one.
+std::vector<Path> JournalLeaves(const Path& root) {
+    std::vector<Path> leaves;
+    if (!std::filesystem::exists(root / kJournals)) return leaves;
+    for (const auto& entry : std::filesystem::directory_iterator(root / kJournals))
+        if (!Starts(entry.path(), ".")) leaves.push_back(entry.path());
+    return leaves;
+}
 [[noreturn]] void Crash(std::size_t index, const Path& root) {
     ProcessLock lock(root, ProcessLock::PinRootForArtifacts{});
     CommitGroupCoordinator writer(root, kScope, lock, false);
@@ -332,6 +346,12 @@ void CrashBoundaries(const Path& executable) {
         // Before I1 the canonical name is absent; from I1 it is exactly INACTIVE.
         if (index == 0U) assert(!std::filesystem::exists(root / kRoot));
         else assert(LoadFile(root / kRoot) == inactive);
+        // The journal leaf exists from its file sync (J2) on, holding only its header, and the
+        // object directory exists from the root-directory sync that follows its creation (N0) on.
+        const auto leaves = JournalLeaves(root);
+        if (index < PointIndex("J2")) assert(leaves.empty());
+        else assert(leaves.size() == 1U && LoadFile(leaves.front()).size() == kCommitJournalHeaderBytes);
+        assert(std::filesystem::is_directory(root / kObjects) == (index >= PointIndex("N0")));
         ProcessLock lock(root, ProcessLock::PinRootForArtifacts{});
         {
             CommitGroupCoordinator writer(root, kScope, lock, false);
