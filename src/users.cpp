@@ -16,10 +16,13 @@ namespace chunkdb {
 namespace {
 
 constexpr std::array<std::uint8_t, 4> kMagic = {'C', 'K', 'D', 'U'};
-// Version 3 adds the added verifier of a user; version 2 files, which have
-// none, are still read.
+// Version 3 adds the added verifier of a user, the server rights in flag bits
+// 2..4 and prefix grants. Version 2 files, which have none of them, are still
+// read. Builds that read version 3 without the server rights refuse the bits
+// as unknown flags and a prefix grant as an invalid table name.
 constexpr std::uint32_t kVersion = 3;
 constexpr std::uint32_t kVersionWithoutAddedVerifier = 2;
+constexpr unsigned kServerRightsShift = 2U;
 
 void PutU16(std::vector<std::uint8_t>* out, std::uint16_t value) {
     out->push_back(static_cast<std::uint8_t>(value));
@@ -83,14 +86,29 @@ void ValidateUsers(const Users& users) {
         if (user.added_verifier.has_value()) {
             RequireAddableVerifier(user.verifier, *user.added_verifier);
         }
-        if (user.grants.size() > std::numeric_limits<std::uint32_t>::max()) {
+        if (user.grants.size() > std::numeric_limits<std::uint32_t>::max() - user.prefix_grants.size()) {
             throw std::invalid_argument("chunkdb.users has more than 4294967295 grants for user " + name);
         }
-        for (const auto& [table, right] : user.grants) {
+        if ((user.server_rights & ~kKnownServerRights) != 0U) {
+            throw std::invalid_argument("chunkdb.users has an unknown server right for user " + name);
+        }
+        const auto check = [&name](const std::string& table, Right right) {
             ValidateShortString(table);
             if (right < Right::kRead || right > Right::kAdmin) {
                 throw std::invalid_argument("chunkdb.users has an unknown right for user " + name);
             }
+        };
+        for (const auto& [table, right] : user.grants) {
+            if (IsPrefixGrant(table)) {
+                throw std::invalid_argument("user " + name + " has a prefix grant among its table grants");
+            }
+            check(table, right);
+        }
+        for (const auto& [prefix, right] : user.prefix_grants) {
+            if (!IsValidGrantTable(prefix + "*")) {
+                throw std::invalid_argument("user " + name + " has a prefix grant on an invalid table prefix");
+            }
+            check(prefix + "*", right);
         }
     }
 }
@@ -155,11 +173,33 @@ class Reader {
 
 }  // namespace
 
+namespace {
+
+// What could start a table name: the characters IsValidTableName takes, at
+// most kMaxTableNameLength of them, a letter or digit first. A prefix may be
+// a reserved name itself (`con*` covers `console`).
+[[nodiscard]] bool IsValidTablePrefix(std::string_view prefix) noexcept {
+    const auto lower_alnum = [](char c) { return (c >= 'a' && c <= 'z') || (c >= '0' && c <= '9'); };
+    return !prefix.empty() && prefix.size() <= kMaxTableNameLength && lower_alnum(prefix.front()) &&
+        std::all_of(prefix.begin(), prefix.end(), [&](char c) { return lower_alnum(c) || c == '_' || c == '-'; });
+}
+
+}  // namespace
+
+bool IsPrefixGrant(std::string_view table) noexcept {
+    return table.size() > 1U && table.back() == '*';
+}
+
 bool IsValidGrantTable(std::string_view table) noexcept {
+    if (IsPrefixGrant(table)) return IsValidTablePrefix(table.substr(0U, table.size() - 1U));
     return table == kEveryTable || IsValidTableName(table);
 }
 
 void RequireValidGrantTable(std::string_view table) {
+    if (IsPrefixGrant(table)) {
+        if (!IsValidGrantTable(table)) throw std::invalid_argument("invalid table prefix '" + std::string(table) + "'");
+        return;
+    }
     if (table != kEveryTable) {
         RequireValidTableName(table);
     }
@@ -181,19 +221,48 @@ void RequireAddableVerifier(const scram::Verifier& verifier, const scram::Verifi
 }
 
 std::optional<Right> RightOn(const User& user, const std::string& table) {
-    return RightOn(user.grants, table);
+    return RightOn(user.grants, user.prefix_grants, table);
 }
 
-std::optional<Right> RightOn(const std::map<std::string, Right>& grants, const std::string& table) {
+std::optional<Right> RightOn(const std::map<std::string, Right>& grants,
+    const std::map<std::string, Right>& prefix_grants, const std::string& table) {
     std::optional<Right> best;
-    for (const auto& name : {table, std::string(kEveryTable)}) {
-        if (const auto found = grants.find(name); found != grants.end()) {
-            if (!best.has_value() || found->second > *best) {
-                best = found->second;
-            }
-        }
+    const auto take = [&best](Right right) {
+        if (!best.has_value() || right > *best) best = right;
+    };
+    if (const auto found = grants.find(table); found != grants.end()) take(found->second);
+    if (const auto found = grants.find(kEveryTable); found != grants.end()) take(found->second);
+    // A prefix of `table` sorts at or before it.
+    for (auto at = prefix_grants.begin(); at != prefix_grants.end() && at->first <= table; ++at) {
+        if (table.starts_with(at->first)) take(at->second);
     }
     return best;
+}
+
+bool HasAnyGrant(const User& user, Right right) noexcept {
+    const auto reaches = [right](const auto& grant) { return grant.second >= right; };
+    return std::any_of(user.grants.begin(), user.grants.end(), reaches) ||
+        std::any_of(user.prefix_grants.begin(), user.prefix_grants.end(), reaches);
+}
+
+void ApplyGrant(User& user, const std::string& table, std::optional<Right> right, std::uint8_t server_rights, bool revoke) {
+    if ((server_rights & ~kKnownServerRights) != 0U) throw std::invalid_argument("unknown server right");
+    if (server_rights != 0U && table != kEveryTable)
+        throw std::invalid_argument("MONITOR, BACKUP and REPLICATION are granted ON *");
+    if (revoke) user.server_rights = static_cast<std::uint8_t>(user.server_rights & ~server_rights);
+    else user.server_rights = static_cast<std::uint8_t>(user.server_rights | server_rights);
+    if (!right.has_value()) return;
+    const bool prefix = IsPrefixGrant(table);
+    auto& grants = prefix ? user.prefix_grants : user.grants;
+    const std::string key = prefix ? table.substr(0U, table.size() - 1U) : table;
+    const auto found = grants.find(key);
+    if (!revoke) {
+        if (found == grants.end() || found->second < *right) grants[key] = *right;
+        return;
+    }
+    if (found == grants.end() || found->second < *right) return;
+    if (*right == Right::kRead) grants.erase(found);
+    else found->second = static_cast<Right>(static_cast<std::uint8_t>(*right) - 1U);
 }
 
 std::vector<std::uint8_t> EncodeUsers(const Users& users) {
@@ -204,7 +273,8 @@ std::vector<std::uint8_t> EncodeUsers(const Users& users) {
     PutCount(&out, users.users.size());
     for (const auto& [name, user] : users.users) {
         PutShortString(&out, name);
-        out.push_back(static_cast<std::uint8_t>((user.manages_users ? 1U : 0U) | (user.requires_channel_binding ? 2U : 0U)));
+        out.push_back(static_cast<std::uint8_t>((user.manages_users ? 1U : 0U) | (user.requires_channel_binding ? 2U : 0U) |
+            (static_cast<unsigned>(user.server_rights) << kServerRightsShift)));
         PutU32(&out, user.verifier.iterations);
         PutU16(&out, static_cast<std::uint16_t>(user.verifier.salt.size()));
         PutBytes(&out, user.verifier.salt.data(), user.verifier.salt.size());
@@ -215,9 +285,13 @@ std::vector<std::uint8_t> EncodeUsers(const Users& users) {
             PutBytes(&out, user.added_verifier->stored_key.data(), user.added_verifier->stored_key.size());
             PutBytes(&out, user.added_verifier->server_key.data(), user.added_verifier->server_key.size());
         }
-        PutCount(&out, user.grants.size());
+        PutCount(&out, user.grants.size() + user.prefix_grants.size());
         for (const auto& [table, right] : user.grants) {
             PutShortString(&out, table);
+            out.push_back(static_cast<std::uint8_t>(right));
+        }
+        for (const auto& [prefix, right] : user.prefix_grants) {
+            PutShortString(&out, prefix + "*");
             out.push_back(static_cast<std::uint8_t>(right));
         }
         PutU64(&out, user.max_connections);
@@ -259,11 +333,14 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
         }
         User user;
         const std::uint8_t flags = reader.U8();
-        if ((flags & ~3U) != 0U) {
+        const unsigned known_flags =
+            version >= kVersion ? 3U | (static_cast<unsigned>(kKnownServerRights) << kServerRightsShift) : 3U;
+        if ((flags & ~known_flags) != 0U) {
             throw std::invalid_argument("chunkdb.users has unknown flags for user " + name);
         }
         user.manages_users = (flags & 1U) != 0U;
         user.requires_channel_binding = (flags & 2U) != 0U;
+        user.server_rights = static_cast<std::uint8_t>(flags >> kServerRightsShift);
         user.verifier.iterations = reader.U32();
         if (user.verifier.iterations < scram::kMinIterations || user.verifier.iterations > scram::kMaxIterations) {
             throw std::invalid_argument(
@@ -300,7 +377,7 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
         const std::uint32_t grants = reader.U32();
         for (std::uint32_t g = 0; g < grants; ++g) {
             std::string table = reader.ShortString();
-            if (!IsValidGrantTable(table)) {
+            if (!IsValidGrantTable(table) || (version < kVersion && IsPrefixGrant(table))) {
                 throw std::invalid_argument(
                     "chunkdb.users grants user " + name + " a right on an invalid table name");
             }
@@ -308,7 +385,9 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
             if (right < static_cast<std::uint8_t>(Right::kRead) || right > static_cast<std::uint8_t>(Right::kAdmin)) {
                 throw std::invalid_argument("chunkdb.users has an unknown right for user " + name);
             }
-            if (!user.grants.emplace(std::move(table), static_cast<Right>(right)).second) {
+            const bool prefix = IsPrefixGrant(table);
+            if (prefix) table.pop_back();
+            if (!(prefix ? user.prefix_grants : user.grants).emplace(std::move(table), static_cast<Right>(right)).second) {
                 throw std::invalid_argument("chunkdb.users repeats a grant of user " + name);
             }
         }

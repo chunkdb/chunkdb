@@ -91,7 +91,7 @@ UserPublication UserRegistry::PreparePublication(std::shared_ptr<const Users> ne
     auto rights = std::make_shared<UserRightsView>();
     for (const auto& [name, user] : result.users->users) {
         rights->users.emplace(name, UserRightsView::Entry{.incarnation = entries->at(name).state->incarnation,
-            .grants = user.grants});
+            .grants = user.grants, .prefix_grants = user.prefix_grants});
     }
     result.rights = std::move(rights);
     return result;
