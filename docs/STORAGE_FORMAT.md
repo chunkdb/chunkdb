@@ -47,6 +47,7 @@ data_dir/
     chunkdb.slots                     persisted feed slots, when present
     chunkdb.index                     checked shard inventory and deletion floor
     .chunkdb.feed/                     archived WALs and base images
+    .chunkdb.quarantine/               chunk files chunkdb_admin quarantine set aside
     L_<lx>_<ly>/C_<cx>_<cy>.chk         checkpoint image
     L_<lx>_<ly>/C_<cx>_<cy>.wal         live delta log
     L_<lx>_<ly>/chunkdb.index          checked coordinate decisions, when listed
@@ -620,6 +621,21 @@ It rewrites image/WAL header identities/checksums and re-encodes the ledger for 
 Retained slots start at their table’s cut in the fresh epoch, with a new baseline and no historical archive transfer, marked to resync.
 Recoverable WAL tails are normalized before rewriting.
 Restore removes the backup marker and publishes the destination with its incomplete guard held until final durable completion.
+
+## Quarantined chunks
+
+`chunkdb_admin quarantine` sets a damaged chunk's files aside offline, under the writer lock.
+Each run makes an entry `.chunkdb.quarantine/<chunk stem>.<Unix ms>.<nonce hex8>/` in the table directory, such as `C_3_-1.1795529706868.1a2b3c4d`.
+It hard-links the chunk's WAL and image there under their own names, syncs them and the entry, then publishes `quarantine.record` by synced atomic replacement:
+
+1. `CKQR`, format `1:u16`, dimensions `u8`, zero `u8`, table identity (16 bytes).
+2. Each active chunk coordinate `i64`, quarantine Unix milliseconds `u64`, file count `u32` (1 or 2).
+3. Each file: name length `u32` and the chunk's `.chk` or `.wal` name, length `u64`, CRC32 `u32`.
+4. CRC32 over all preceding bytes.
+
+It then marks the table's slots to resync and removes the live WAL before the live image, syncing the large-chunk directory after each.
+A rerun removes this chunk's entries without a record, and finishes an entry whose record holds every remaining file by name, length and CRC32.
+Writers, backups and restores ignore `.chunkdb.quarantine/`; `chunkdb_verify` reports each entry as information and a malformed record as a warning.
 
 ## Checkpoint and verification boundaries
 

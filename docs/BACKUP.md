@@ -114,6 +114,22 @@ BACKUP TO 'without-damage' SKIP DAMAGED
 The reply's `skipped` list and the backup's completion record name each chunk left out; `chunkdb_verify` reports each as warning `backup_chunk_skipped`.
 A restore of that backup has no data for those chunks.
 
+A damaged chunk can keep the server from starting.
+Stop the server and set the chunk aside:
+
+```sh
+chunkdb_admin --data-dir /var/lib/chunkdb quarantine --table world --chunk 3 -1
+```
+
+It moves the chunk's image and WAL into `tables/world/.chunkdb.quarantine/` with a record of them, so the table opens without the chunk.
+The chunk then reads as absent, or as its retained deletion, and takes new writes.
+Each slot of the table starts its next watch with resync.
+It refuses a chunk that passes the checks unless you add `--force`, and a chunk whose WAL a pending recovery needs.
+If it stops partway, run it again to finish.
+The moved files stay for inspection; `chunkdb_verify` lists them as `chunk_quarantined`, and you delete the entry when you no longer need it.
+
+To get the chunk's data back, restore its table from a backup with RESTORE TABLE under another name, then copy the chunk with GET CHUNK and SET CHUNK.
+
 ## Contents and space
 
 Backups include definitions, schema history, images, WAL prefixes, users, rights, slots, and completed migration records.

@@ -3,6 +3,7 @@
 
 #include "verify.hpp"
 #include "chunk_check.hpp"
+#include "quarantine_record.hpp"
 #include "backup.hpp"
 #include "backup_directory.hpp"
 
@@ -724,6 +725,23 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
     std::set<chunkdb::ChunkCoord> checked_coords;
     for (const auto& entry : chunkdb::backup_detail::DirectoryEntries(data_dir)) {
         const auto name = entry.path().filename().string();
+
+        // chunkdb_admin quarantine set these chunk files aside; the table
+        // no longer reads them.
+        if (name == chunkdb::kQuarantineDirName && entry.is_directory()) {
+            for (const auto& quarantined : chunkdb::backup_detail::DirectoryEntries(entry.path())) {
+                const auto record_path = quarantined.path() / std::string(chunkdb::kQuarantineRecordName);
+                try {
+                    const auto record = chunkdb::ParseQuarantineRecord(chunkdb::LoadFile(record_path));
+                    std::string files;
+                    for (const auto& file : record.files) files += (files.empty() ? "" : ", ") + file.name;
+                    ReportInfo(counters, "chunk_quarantined", quarantined.path(), files);
+                } catch (const std::exception& error) {
+                    Report(counters, false, "quarantine_record_invalid", record_path, error.what());
+                }
+            }
+            continue;
+        }
 
         // Process-lock artifacts and OS metadata are not storage state.
         if (name.rfind(".chunkdb", 0) == 0 || name.rfind(".", 0) == 0) {

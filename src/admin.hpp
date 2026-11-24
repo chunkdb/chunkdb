@@ -8,6 +8,8 @@
 #include <string_view>
 #include <vector>
 
+#include "chunkdb/types.hpp"
+
 namespace chunkdb {
 
 // Gives `user` of the data directory a new password, offline: takes the
@@ -47,5 +49,34 @@ struct RebuiltVersionClock {
 // lowered.
 [[nodiscard]] std::vector<RebuiltVersionClock> RebuildVersionClock(
     const std::filesystem::path& data_dir, std::ostream& findings);
+
+struct QuarantinedChunk {
+    // The entry that holds the chunk's files, relative to the data directory.
+    std::filesystem::path entry;
+    // The image and WAL names moved there.
+    std::vector<std::string> files;
+    // The chunkdb_verify code of the chunk's damage; empty for a forced
+    // quarantine of sound files or a finished interrupted one.
+    std::string damage;
+    // Whether an interrupted quarantine of the chunk was finished.
+    bool resumed = false;
+    // Slots marked so that their next watch starts with resync.
+    std::size_t slots_marked = 0;
+    // Errors the chunkdb_verify checks of the table still find.
+    std::uint64_t table_errors = 0;
+};
+
+// Moves the image and WAL of chunk `coord` of `table` into a new entry of
+// the table's `.chunkdb.quarantine/` directory with a synced record of them,
+// offline, so the table opens without the chunk (docs/BACKUP.md). Takes the
+// writer lock, so it fails while a server has the directory open. The
+// chunk must fail the chunkdb_verify checks unless `force`. Refuses a chunk
+// a pending recovery intent names. The files are hard-linked into the
+// entry and synced, the record is published, the table's slots are marked
+// to resync, and then the WAL is removed before the image, so a crash
+// leaves the chunk whole, without its WAL, or gone; running the command
+// again finishes it. Writes the checks' findings to `findings`.
+[[nodiscard]] QuarantinedChunk QuarantineChunk(const std::filesystem::path& data_dir, const std::string& table,
+    std::uint8_t dims, const ChunkCoord& coord, bool force, std::ostream& findings);
 
 }  // namespace chunkdb

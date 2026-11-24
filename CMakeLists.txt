@@ -103,6 +103,7 @@ add_library(chunkdb_core STATIC
     src/user_admission.cpp
     src/verify.cpp
     src/chunk_check.cpp
+    src/quarantine_record.cpp
     src/durability_io.cpp
     src/file_permissions.cpp
     src/audit_log.cpp
@@ -629,6 +630,13 @@ if(CHUNKDB_BUILD_TESTS)
     add_dependencies(chunkdb_admin_rebuild_version_clock_test chunkdb_admin)
     add_test(NAME admin_rebuild_version_clock COMMAND chunkdb_admin_rebuild_version_clock_test $<TARGET_FILE:chunkdb_admin>)
 
+    add_executable(chunkdb_admin_quarantine_test tests/admin_quarantine_tests.cpp)
+    target_link_libraries(chunkdb_admin_quarantine_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_admin_quarantine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_dependencies(chunkdb_admin_quarantine_test chunkdb_admin)
+    add_test(NAME admin_quarantine COMMAND chunkdb_admin_quarantine_test $<TARGET_FILE:chunkdb_admin>)
+    set_tests_properties(admin_quarantine PROPERTIES TIMEOUT 120 LABELS "crash")
+
     add_executable(chunkdb_user_admission_test tests/user_admission_tests.cpp)
     target_link_libraries(chunkdb_user_admission_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_user_admission_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1140,6 +1148,7 @@ if(CHUNKDB_BUILD_TESTS)
 
     set(CHUNKDB_TEST_TARGETS
         chunkdb_check_table_test
+        chunkdb_admin_quarantine_test
         chunkdb_backup_skip_damaged_test
         chunkdb_user_admission_test
         chunkdb_maintenance_pool_test
