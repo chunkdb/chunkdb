@@ -401,38 +401,21 @@ bool HasEvent(const Push& push, std::string_view kind, std::string_view action, 
     });
 }
 
-// Stops the statement that runs as the catalog refresh starts.
-struct StopBeforeRefresh final : CommandEngineTestHook {
-    StatementControl* control = nullptr;
-    void Run(Point point, std::string_view) override {
-        if (point == Point::kBeforeCatalogRefresh && control != nullptr) (void)control->RequestStop(StatementStopReason::kCancelled);
-    }
-};
-
-void TestCancelledStatementKeepsWatch() {
+void TestRefusedStatementTakesNoRevision() {
     EngineFixture fixture;
     auto watcher = fixture.Watcher();
     const auto whole = CatalogPush(NextBytes(*watcher->catalog_watch));
     assert(HasEvent(whole, "table", "create", "default"));
+    const auto recorded = *ReadCatalogRevision(fixture.dir.path());
     auto ddl = fixture.Session();
-    StopBeforeRefresh hook;
-    fixture.engine->SetHookForTests(&hook);
-    StatementControl control(StatementControl::Clock::now(), 0U);
-    assert(control.Start());
-    hook.control = &control;
-    {
-        // A statement that fails before its decision, then is cancelled
-        // while the refresh reads the table it named.
-        const ScopedStatementControl scope(&control);
-        assert(fixture.Run(*ddl, "ALTER TABLE default DROP COLUMN nosuch").starts_with("-ERR "));
-    }
-    hook.control = nullptr;
-    fixture.engine->SetHookForTests(nullptr);
-    // It changed nothing: its revision arrives as progress, not as an error.
-    assert(ProgressRevision(NextBytes(*watcher->catalog_watch)) == whole.revision + 1U);
-    assert(fixture.Run(*ddl, "CREATE TABLE after_stop (n u8) CHUNK 4 x 4") == "+OK\r\n");
+    // Refused before its decision: no mark, no revision, nothing to watch.
+    assert(fixture.Run(*ddl, "ALTER TABLE default DROP COLUMN nosuch").starts_with("-ERR "));
+    assert(!watcher->catalog_watch->Next());
+    assert(*ReadCatalogRevision(fixture.dir.path()) == recorded);
+    assert(fixture.Run(*ddl, "CREATE TABLE after_refusal (n u8) CHUNK 4 x 4") == "+OK\r\n");
     const auto created = CatalogPush(NextBytes(*watcher->catalog_watch));
-    assert(created.revision == whole.revision + 2U && HasEvent(created, "table", "create", "after_stop"));
+    assert(created.revision == whole.revision + 1U);
+    assert(HasEvent(created, "table", "create", "after_refusal"));
 }
 
 struct FeedCleanupFailure final : FeedTestHook {
@@ -462,7 +445,6 @@ void TestTableNeedingRecoveryKeepsWatch() {
     assert(fixture.catalog->Fence("realm"));
     // Statements on it fail; the watch keeps its record and goes on.
     assert(fixture.Run(*session, "ALTER TABLE realm ADD COLUMN extra u8 NULL").starts_with("-ERR "));
-    (void)ProgressRevision(NextBytes(*watcher->catalog_watch));
     assert(!watcher->catalog_watch->Next());
     // A new watch reads the whole catalog, the table included.
     auto late = fixture.Watcher();
@@ -622,14 +604,16 @@ void TestDurableClock() {
         // The catalog may have changed after revision 3: the start takes 4.
         CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
         assert(clock.epoch() == epoch && clock.revision() == 4U);
-        // Without a statement running, a read keeps the revision and records it.
-        assert(clock.Snapshot() == 4U);
-        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 4U, .in_progress = false}));
+        // The record is still marked: a read takes a new revision and records it.
+        assert(clock.Snapshot() == 5U);
+        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 5U, .in_progress = false}));
+        // Unmarked now: a read keeps it.
+        assert(clock.Snapshot() == 5U);
     }
     {
         // Unchanged after a clean stop.
         CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
-        assert(clock.epoch() == epoch && clock.revision() == 4U);
+        assert(clock.epoch() == epoch && clock.revision() == 5U);
     }
     {
         // Several writers: the record stays marked, and the next start moves on.
@@ -637,11 +621,11 @@ void TestDurableClock() {
         shared.Begin();
         (void)shared.End();
         assert(ReadCatalogRevision(dir.path())->in_progress);
-        assert(ReadCatalogRevision(dir.path())->revision == 4U);
+        assert(ReadCatalogRevision(dir.path())->revision == 5U);
     }
     {
         CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
-        assert(clock.epoch() == epoch && clock.revision() == 5U);
+        assert(clock.epoch() == epoch && clock.revision() == 6U);
     }
     // A damaged record starts a new epoch.
     auto bytes = EncodeCatalogRevision(CatalogRevisionRecord{.epoch = epoch, .revision = 5U, .in_progress = false});
@@ -777,11 +761,17 @@ void TestFailedRecordWrites() {
         // Revision 3 was never handed out; a read records it first.
         assert(clock.Snapshot() == 3U);
         assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 3U, .in_progress = false}));
-        // Held: marked even with nothing running.
+        // Held: marked even with nothing running, and a read takes a new revision.
         clock.Hold(true);
         assert(ReadCatalogRevision(dir.path())->in_progress);
-        assert(clock.Snapshot() == 3U);
+        assert(clock.Snapshot() == 4U);
         assert(ReadCatalogRevision(dir.path())->in_progress);
+        // Released, a settled refresh at the current revision clears the mark.
+        clock.Hold(false);
+        clock.Settle(3U);
+        assert(ReadCatalogRevision(dir.path())->in_progress);
+        clock.Settle(4U);
+        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 4U, .in_progress = false}));
     }
     {
         CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
@@ -825,7 +815,7 @@ int main() {
     TestUnknownTableKeepsRecords();
     TestOverflowSendsResyncAndWholeCatalog();
     TestFailureEndsWatches();
-    TestCancelledStatementKeepsWatch();
+    TestRefusedStatementTakesNoRevision();
     TestTableNeedingRecoveryKeepsWatch();
     TestConcurrentStatements();
     TestRenameAndSwap();

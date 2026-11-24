@@ -76,6 +76,9 @@ class CatalogClock {
     // running: the published records miss tables a read could not read, so a
     // start must not let a consumer resume at a revision that misses them.
     void Hold(bool hold);
+    // After a refresh at `revision` read every table: clears the mark when that
+    // is still the current revision and no statement runs.
+    void Settle(std::uint64_t revision);
 
   private:
     void Write(std::uint64_t revision, bool in_progress);

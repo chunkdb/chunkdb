@@ -78,7 +78,7 @@ Read-only inspection remains available and reports an unknown completed revision
 
 ## Catalog revision
 
-With `catalog_revision`, the catalog revision record is synced before a catalog statement runs and again before its revision is published to WATCH CATALOG.
+With `catalog_revision`, the catalog revision record is synced before a catalog statement changes anything and again before its revision is published to WATCH CATALOG.
 A crash between the two moves the next start to a new revision, so a published revision never names two catalog states; see [catalog revision](design/CATALOG_REVISION.md).
 A filesystem rollback or a cold copy of the data directory keeps the catalog epoch, so a consumer must not resume against it with AFTER.
 

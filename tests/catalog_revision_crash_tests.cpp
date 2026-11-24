@@ -79,10 +79,11 @@ void Case(const std::string& executable, const Point& point) {
     const auto position = StoreIdHex(before.epoch) + " " + std::to_string(crashed.revision);
     const auto reply = e.Run("WATCH CATALOG AFTER " + position);
     assert(reply.rfind("%2\r\n", 0) == 0);
-    // The read recorded the revision it took: a mark that was not cleared
-    // moved the start to a new one.
+    // The read recorded the revision it took. After a mark that was not
+    // cleared, the start moved past it and the read took a new revision again.
     const auto started = *ReadCatalogRevision(dir.path());
-    assert(started.epoch == before.epoch && !started.in_progress && started.revision == before.revision + 1U);
+    assert(started.epoch == before.epoch && !started.in_progress);
+    assert(started.revision == before.revision + (point.revision ? 1U : 2U));
     const auto first = e.session.catalog_watch->Next();
     if (point.revision) {
         // Its revision names the catalog with the table: it continues.

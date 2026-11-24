@@ -3,6 +3,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
@@ -65,6 +66,21 @@ class StatementControl {
     // Its own mutex, so a listing never waits for a stop or a decision.
     mutable std::mutex progress_mutex_;
     std::optional<StatementProgress> progress_;
+};
+
+// Runs `hook` on this thread each time the current statement enters its
+// irreversible decision (EnterStatementDecision), after the decision is
+// entered; a hook that throws fails the statement before its change. Every
+// durable change of a statement comes after that point.
+class ScopedDecisionHook {
+  public:
+    explicit ScopedDecisionHook(std::function<void()> hook) noexcept;
+    ~ScopedDecisionHook();
+    ScopedDecisionHook(const ScopedDecisionHook&) = delete;
+    ScopedDecisionHook& operator=(const ScopedDecisionHook&) = delete;
+  private:
+    std::function<void()> hook_;
+    std::function<void()>* previous_;
 };
 
 class ScopedStatementControl {

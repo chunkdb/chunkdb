@@ -94,8 +94,9 @@ CatalogClock::CatalogClock(std::filesystem::path data_dir, Mode mode) : data_dir
         epoch_ = NewStoreId();
         return;
     }
-    // A crash during an earlier replace can leave its temporary file.
-    (void)CleanupAtomicTmpArtifacts(data_dir_ / std::string(kCatalogRevisionFileName));
+    // A crash during an earlier replace can leave its temporary file. With
+    // several processes another one may be replacing the record now.
+    if (mode_ == Mode::kDurable) (void)CleanupAtomicTmpArtifacts(data_dir_ / std::string(kCatalogRevisionFileName));
     std::optional<CatalogRevisionRecord> record;
     try {
         record = ReadCatalogRevision(data_dir_);
@@ -162,16 +163,18 @@ std::uint64_t CatalogClock::End() {
 
 std::uint64_t CatalogClock::Snapshot() {
     std::lock_guard lock(mutex_);
-    if (running_ == 0U) {
-        // Recorded as it is before it is handed out: a failed write may have
-        // left an earlier revision or mark on disk.
-        if (mode_ == Mode::kDurable && (recorded_ != revision_ || marked_ != holding_)) Write(revision_, holding_);
+    if (running_ == 0U && mode_ != Mode::kDurable) return revision_;
+    if (running_ == 0U && !marked_) {
+        // Recorded before it is handed out: a failed write may have left an
+        // earlier revision on disk.
+        if (recorded_ != revision_) Write(revision_, holding_);
         return revision_;
     }
+    // A statement runs, or the record is marked: the catalog may differ from
+    // what the current revision named, so the read takes a new one.
     if (revision_ == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("catalog revisions are exhausted");
     ++revision_;
-    // Still marked: a statement runs.
-    if (mode_ == Mode::kDurable) Write(revision_, true);
+    if (mode_ == Mode::kDurable) Write(revision_, running_ != 0U || holding_);
     return revision_;
 }
 
@@ -179,6 +182,13 @@ void CatalogClock::Hold(bool hold) {
     std::lock_guard lock(mutex_);
     holding_ = hold;
     if (mode_ == Mode::kDurable && hold && !marked_) Write(revision_, true);
+}
+
+void CatalogClock::Settle(std::uint64_t revision) {
+    std::lock_guard lock(mutex_);
+    // The refresh that took `revision` read every table it needed: published
+    // under it, the records are whole, so an idle server does not stay marked.
+    if (mode_ == Mode::kDurable && !holding_ && marked_ && running_ == 0U && revision_ == revision) Write(revision_, false);
 }
 
 }  // namespace chunkdb

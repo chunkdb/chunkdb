@@ -7038,8 +7038,9 @@ void TestWatchCatalog() {
     const auto mon_dropped = ReadCatalogPush(mon);
     assert(CatalogEvent(mon_dropped, "table", "cat_t") != nullptr && CatalogEvent(mon_dropped, "user", "bob") == nullptr);
     assert(mon_dropped.items[2].value == dropped.items[2].value);
-    // Every catalog statement took a revision, the refused ones included.
-    assert(std::stoull(dropped.items[2].value) == created_revision + 6U);
+    // Every catalog statement that changed something took a revision; the
+    // refused ones took none.
+    assert(std::stoull(dropped.items[2].value) == created_revision + 4U);
 
     // Losing MONITOR ends that watch; the other one receives the user change.
     admin.SendLine("REVOKE MONITOR ON * FROM mon"); assert(admin.ReadLine() == "+OK\r\n");

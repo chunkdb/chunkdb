@@ -181,7 +181,7 @@ WATCH CATALOG streams changes to tables, columns, users, grants and slots.
 It needs MONITOR or ADMIN on `*`; users, grants and slot owners appear only with MANAGES USERS.
 The reply is `{epoch, revision}`: the catalog epoch, and the catalog revision the watch starts at; one revision of an epoch names one catalog state.
 The first event holds the whole catalog: one `create` for each table, user and slot, at the revision of that event.
-Each catalog statement takes the next revision when it ends, also one that changed nothing or failed.
+Each catalog statement that reaches its decision takes the next revision when it ends, also one that then changed nothing or failed; a statement refused before it takes none.
 An event carries what a statement changed, under its revision; it can also carry changes of statements that ended at the same time.
 A revision whose statement changed nothing the watch can see arrives as `[progress, epoch, revision]`: your catalog is the catalog of that revision.
 An event is `[catalog, epoch, revision, commit_time_ms, user, events, txn]`, with `txn` null; `user` names the user whose statement sent the event, and is null in the whole-catalog event and for watches without MANAGES USERS.

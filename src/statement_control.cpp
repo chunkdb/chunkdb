@@ -3,9 +3,12 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/statement_mutex.hpp"
 
+#include <utility>
+
 namespace chunkdb {
 namespace {
 thread_local StatementControl* current_statement = nullptr;
+thread_local std::function<void()>* decision_hook = nullptr;
 
 const char* StopMessage(StatementStopReason reason) {
     switch (reason) {
@@ -180,7 +183,13 @@ ScopedStatementControl::ScopedStatementControl(StatementControl* current) noexce
     : previous_(current_statement) { current_statement = current; }
 ScopedStatementControl::~ScopedStatementControl() { current_statement = previous_; }
 void CheckStatementCancellation() { if (current_statement) current_statement->Check(); }
-void EnterStatementDecision() { if (current_statement) current_statement->EnterDecision(); }
+void EnterStatementDecision() {
+    if (current_statement) current_statement->EnterDecision();
+    if (decision_hook != nullptr && *decision_hook) (*decision_hook)();
+}
+ScopedDecisionHook::ScopedDecisionHook(std::function<void()> hook) noexcept
+    : hook_(std::move(hook)), previous_(decision_hook) { decision_hook = &hook_; }
+ScopedDecisionHook::~ScopedDecisionHook() { decision_hook = previous_; }
 void ReportStatementProgress(const StatementProgress& progress) {
     if (current_statement) current_statement->ReportProgress(progress);
 }

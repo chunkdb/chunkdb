@@ -1128,7 +1128,7 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
             try {
                 (void)chunkdb::DecodeCatalogRevision(chunkdb::LoadFile(entry.path()));
             } catch (const std::exception& error) {
-                // A writer start replaces it and starts a new catalog epoch.
+                // The next catalog statement or catalog watch replaces it with a new epoch.
                 Report(counters, false, "catalog_revision_invalid", entry.path(), error.what());
             }
             continue;

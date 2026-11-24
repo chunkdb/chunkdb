@@ -111,9 +111,7 @@ class SlotWatch {
     // Records `user` as the owner of a slot claimed without one, before the
     // watch is activated. A failure ends this watch; it records nothing
     // unless the outcome of the write is unknown, which fences the store.
-    // `before` runs first, only when an owner is to be recorded; its failure
-    // ends the watch the same way.
-    void BindOwner(const std::string& user, const std::function<void()>& before = {});
+    void BindOwner(const std::string& user);
     [[nodiscard]] std::size_t budget() const noexcept { return options_.buffer_bytes.value_or(table_->FeedBufferBytes()); }
     [[nodiscard]] std::optional<Output> Take(std::size_t room);
     void SetQuota(std::size_t bytes);

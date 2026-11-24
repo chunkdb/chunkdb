@@ -134,7 +134,9 @@ void CatalogFeed::Refresh(const CatalogScope& scope, std::string_view user) noex
             CatalogState state = reader_(read);
             // Before anything is published under this revision: a start must not
             // let a consumer resume where tables could not be read.
-            clock_->Hold(!state.unknown_tables.empty() || !state.unknown_slots.empty());
+            const bool unread = !state.unknown_tables.empty() || !state.unknown_slots.empty();
+            clock_->Hold(unread);
+            if (!unread) clock_->Settle(revision);
             std::lock_guard lock(mutex_);
             // The last subscription left while the state was read.
             if (!built_) return;

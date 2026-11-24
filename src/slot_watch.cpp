@@ -64,12 +64,9 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     { std::lock_guard lock(result->claim_->owner_mutex); result->claim_->owner = result; }
     return result;
 }
-void SlotWatch::BindOwner(const std::string& user, const std::function<void()>& before) {
+void SlotWatch::BindOwner(const std::string& user) {
     if (slot_owner_) return;
-    try {
-        if (before) before();
-        table_->BindClaimedFeedSlotOwner(claim_, user);
-    }
+    try { table_->BindClaimedFeedSlotOwner(claim_, user); }
     catch (const std::exception&) {
         // The attach was never granted: free the slot now, not when the
         // catch-up worker drops this watch.

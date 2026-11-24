@@ -131,9 +131,9 @@ Read-only opening never initializes the directory.
 | 4 | reserved zero (`u32`) |
 | 5 | CRC32 of all preceding bytes (`u32`) |
 
-With `catalog_revision` enabled, a server that is the directory's only writer replaces it atomically with file and directory sync; with several processes, each start marks it in progress and leaves it so.
-It is marked in progress before a catalog statement runs and records the statement's revision before the revision is published.
-A start after an in-progress record takes the next revision; a missing or unreadable record starts a new epoch at revision 0.
+With `catalog_revision` enabled, a server that is the directory's only writer replaces it atomically with file and directory sync; with several processes, the first catalog statement of each process marks it in progress and nothing clears the mark.
+A catalog statement marks it in progress at its decision, before it changes anything, and records its revision before the revision is published; a start writes nothing.
+A start after an in-progress record takes the next revision, and its first whole-catalog read a new one again; a missing or unreadable record starts a new epoch at revision 0, written by the first mark or read.
 Backups do not copy it, so a restored directory starts a new epoch.
 
 ### Table manifest
