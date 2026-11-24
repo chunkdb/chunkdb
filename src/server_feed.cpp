@@ -4,6 +4,7 @@
 #include "feed_protocol.hpp"
 #include "cql.hpp"
 #include "user_registry.hpp"
+#include "catalog_feed.hpp"
 #include "chunkdb/logging.hpp"
 #include <algorithm>
 #include <climits>
@@ -281,7 +282,8 @@ bool FeedIo::Permitted(Watch& watch) {
             if (output.charged) slot->Consumed(output.bytes->size());
     watch.output.clear(); watch.bytes = 0U; watch.excess_frames = 0U;
     Queue(watch, std::make_shared<const std::string>(
-        CommandEngine::LostWatchReply(state == ReadRightCheck::State::kNoUser, right->table())));
+        right->catalog() ? CommandEngine::LostCatalogWatchReply(state == ReadRightCheck::State::kNoUser)
+            : CommandEngine::LostWatchReply(state == ReadRightCheck::State::kNoUser, right->table())));
     watch.close = true;
     watch.close_immediate = true; // One best-effort nonblocking terminal write, then close.
     return false;
@@ -322,6 +324,20 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
         return;
     }
     if (watch.unwatch) return;
+    if (const auto& catalog = watch.connection->session.catalog_watch) {
+        for (std::size_t i = 0U; i < 64U; ++i) {
+            // A push waits in the feed while this queue holds its share; one
+            // push larger than the share is queued alone.
+            if (!watch.output.empty() && watch.bytes >= share) return;
+            auto frame = catalog->Next();
+            if (!frame) return;
+            watch.close = frame->close;
+            Queue(watch, std::move(frame->bytes));
+            if (watch.close) return;
+        }
+        Wake();
+        return;
+    }
     const auto resync = [&] {
         // Finish an in-progress frame, preserving SSL_write's exact retry.
         const bool pinned = !watch.output.empty() && (watch.offset != 0U || watch.write_size != 0);
@@ -421,6 +437,7 @@ void FeedIo::Read(Watch& watch) {
                 // Establish removal and the linger policy before acknowledging
                 // UNWATCH. Queued frames own their bytes and still precede OK.
                 connection.session.watch.reset();
+                connection.session.catalog_watch.reset();
                 watch.return_ready = true;
                 Queue(watch, std::make_shared<const std::string>(Protocol::SimpleString("OK")));
             }
@@ -578,7 +595,8 @@ void FeedIo::Run() {
                 // An ordinary UNWATCH can leave output pending after removal.
                 // Keep its last budget until those frames and OK have drained.
                 const auto budget = watch.connection->session.slot_watch ? watch.connection->session.slot_watch->budget()
-                    : watch.unwatch ? watch.buffer_bytes : watch.connection->session.watch->buffer_bytes();
+                    : watch.unwatch ? watch.buffer_bytes : watch.connection->session.catalog_watch ? watch.connection->session.catalog_watch->buffer_bytes()
+                    : watch.connection->session.watch->buffer_bytes();
                 watch.buffer_bytes = budget;
                 watch.share = std::max<std::size_t>(1U, budget / counts[watch.connection->session.table.get()]);
                 if (const auto& slot = watch.connection->session.slot_watch)
@@ -669,7 +687,7 @@ void FeedIo::Run() {
                     const auto timeout = remaining < 0 ? 0 : static_cast<int>(std::min<std::int64_t>(remaining + 1, INT_MAX));
                     if (progress_timeout < 0 || timeout < progress_timeout) progress_timeout = timeout;
                 };
-                if (!watch.connection->session.slot_watch && !watch.unwatch && !watch.close && !watch.dead) wait_until(watch.next_progress);
+                if (!watch.connection->session.slot_watch && !watch.connection->session.catalog_watch && !watch.unwatch && !watch.close && !watch.dead) wait_until(watch.next_progress);
                 if (watch.excess_frames != 0U && !watch.dead) wait_until(watch.excess_progress + std::chrono::milliseconds(server_.config_.client_io_timeout_ms));
 #ifdef CHUNKDB_WITH_OPENSSL
                 if (watch.write_size == 0 && !watch.unwatch && !watch.close && !watch.read_paused && watch.connection->tls &&
@@ -716,6 +734,7 @@ void ChunkServer::ReturnClient(std::shared_ptr<ServerConnection> connection) {
     if (connection->session.slot_watch) connection->session.slot_watch->Cancel();
     connection->session.slot_watch.reset();
     connection->session.watch.reset();
+    connection->session.catalog_watch.reset();
     connection->session.watch_right.reset();
     connection->watch_slot = false;
     watch_count_.fetch_sub(1);
@@ -745,6 +764,7 @@ void ChunkServer::CloseClient(ServerConnection& connection) {
     const auto slot = connection.session.slot_watch;
     if (connection.watch_slot) { watch_count_.fetch_sub(1); connection.watch_slot = false; }
     connection.session.watch.reset();
+    connection.session.catalog_watch.reset();
     if (connection.session.slot_watch) connection.session.slot_watch->Cancel();
     connection.session.slot_watch.reset();
     connection.session.transaction.reset();
