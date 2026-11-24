@@ -18,7 +18,7 @@ The directory feature `catalog_revision` (incompat bit 7) owns the file, so a bu
 ## Clock
 
 A catalog statement is one CatalogScopeOf names: table, column, check, slot, user and grant statements, MIGRATE, RESTORE TABLE, SWAP TABLES, RECOVER TABLE and WATCH SLOT; a WATCH SLOT reaches a decision only when it records the slot's first owner or takes the slot over, so a plain attach does not touch the clock.
-Begin, when the statement enters its decision (EnterStatementDecision, the point after which CANCEL no longer stops it, which every durable change of a statement comes after): when no statement is marked, the record is written in progress. If that write fails, the statement fails before its change. A statement refused before its decision writes nothing and takes no revision.
+Begin, just before the statement enters its decision (EnterStatementDecision, the point after which CANCEL no longer stops it, which every durable change of a statement comes after): when no statement is marked, the record is written in progress. If that write fails, the statement fails before its change. A statement refused before its decision writes nothing and takes no revision.
 End, after the statement finished or failed: the revision moves up by one and is written, still in progress while another statement runs, complete otherwise. Only then are its changes published under it.
 End runs under the feed's refresh mutex, so revisions are published in the order they are taken.
 A whole-catalog read takes its revision after the read: the current one when no statement runs, since a statement ends only under the same mutex, and a new one, written in progress, when one does. Two reads at one revision cannot see different states.
@@ -32,6 +32,7 @@ While a read could not read some tables, the record stays marked in progress, so
 
 A complete record: the clock continues at its revision. Nothing changed after it: every change is preceded by a mark.
 An in-progress record: the clock continues at its revision plus one, which no state was published under.
+Users can change at a start without a statement: a server started with authentication after one without it, or the reverse, the first administrator created, or an offline change. The record keeps a digest of the user records at its revision, and a start whose users differ counts as in progress. A mark keeps the last digest, since a start moves past it anyway; complete writes read the users before taking the clock's lock, because a statement that changes users holds the registry lock while it marks.
 The start writes nothing; the first mark or whole-catalog read records the revision before it is handed out.
 No record, or one that cannot be read: a new random epoch at revision 0. Consumers of the old epoch read the whole catalog again.
 

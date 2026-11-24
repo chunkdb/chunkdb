@@ -590,7 +590,7 @@ void TestDurableClock() {
         clock.Begin();
         assert(ReadCatalogRevision(dir.path())->in_progress);
         assert(clock.End() == 1U);
-        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 1U, .in_progress = false}));
+        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 1U, .in_progress = false, .users = {}}));
         // A read while a statement runs takes a new revision, still marked.
         clock.Begin();
         assert(clock.Snapshot() == 2U);
@@ -606,7 +606,7 @@ void TestDurableClock() {
         assert(clock.epoch() == epoch && clock.revision() == 4U);
         // The record is still marked: a read takes a new revision and records it.
         assert(clock.Snapshot() == 5U);
-        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 5U, .in_progress = false}));
+        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 5U, .in_progress = false, .users = {}}));
         // Unmarked now: a read keeps it.
         assert(clock.Snapshot() == 5U);
     }
@@ -628,7 +628,7 @@ void TestDurableClock() {
         assert(clock.epoch() == epoch && clock.revision() == 6U);
     }
     // A damaged record starts a new epoch.
-    auto bytes = EncodeCatalogRevision(CatalogRevisionRecord{.epoch = epoch, .revision = 5U, .in_progress = false});
+    auto bytes = EncodeCatalogRevision(CatalogRevisionRecord{.epoch = epoch, .revision = 5U, .in_progress = false, .users = {}});
     bytes[30] ^= 1U;
     {
         std::ofstream out(dir.path() / std::string(kCatalogRevisionFileName), std::ios::binary | std::ios::trunc);
@@ -760,7 +760,7 @@ void TestFailedRecordWrites() {
         assert(Throws([&] { (void)clock.End(); }));
         // Revision 3 was never handed out; a read records it first.
         assert(clock.Snapshot() == 3U);
-        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 3U, .in_progress = false}));
+        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 3U, .in_progress = false, .users = {}}));
         // Held: marked even with nothing running, and a read takes a new revision.
         clock.Hold(true);
         assert(ReadCatalogRevision(dir.path())->in_progress);
@@ -771,7 +771,7 @@ void TestFailedRecordWrites() {
         clock.Settle(3U);
         assert(ReadCatalogRevision(dir.path())->in_progress);
         clock.Settle(4U);
-        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 4U, .in_progress = false}));
+        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 4U, .in_progress = false, .users = {}}));
     }
     {
         CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);

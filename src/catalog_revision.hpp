@@ -1,8 +1,10 @@
 #pragma once
 
+#include <array>
 #include <cstddef>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <string_view>
@@ -15,7 +17,10 @@
 namespace chunkdb {
 
 inline constexpr std::string_view kCatalogRevisionFileName = "chunkdb.catalog";
-inline constexpr std::size_t kCatalogRevisionFileSize = 40U;
+inline constexpr std::size_t kCatalogRevisionFileSize = 56U;
+// The first 16 bytes of SHA-256 over the user records WATCH CATALOG shows, in
+// name order; zero bytes without users.
+using CatalogUsersDigest = std::array<std::uint8_t, 16>;
 
 // `chunkdb.catalog`: the catalog epoch, the last catalog revision and whether
 // a catalog statement may have run since that revision was recorded.
@@ -23,6 +28,10 @@ struct CatalogRevisionRecord {
     StoreId epoch{};
     std::uint64_t revision = 0U;
     bool in_progress = false;
+    // The user records at that revision: users change at a start too (a server
+    // started with or without authentication, the first administrator, an
+    // offline change), and a start whose users differ takes a new revision.
+    CatalogUsersDigest users{};
     friend bool operator==(const CatalogRevisionRecord&, const CatalogRevisionRecord&) = default;
 };
 [[nodiscard]] std::vector<std::uint8_t> EncodeCatalogRevision(const CatalogRevisionRecord& record);
@@ -55,7 +64,8 @@ class CatalogClock {
     };
     // kDurable and kShared read the record and write nothing yet; a missing or
     // unreadable record starts a new epoch.
-    CatalogClock(std::filesystem::path data_dir, Mode mode);
+    // `users` gives the digest of the current user records; empty for none.
+    CatalogClock(std::filesystem::path data_dir, Mode mode, std::function<CatalogUsersDigest()> users = {});
     CatalogClock(const CatalogClock&) = delete;
     CatalogClock& operator=(const CatalogClock&) = delete;
 
@@ -81,10 +91,12 @@ class CatalogClock {
     void Settle(std::uint64_t revision);
 
   private:
-    void Write(std::uint64_t revision, bool in_progress);
+    void Write(std::uint64_t revision, bool in_progress, const CatalogUsersDigest& current);
+    [[nodiscard]] CatalogUsersDigest CurrentUsers() const;
 
     const std::filesystem::path data_dir_;
     const Mode mode_;
+    const std::function<CatalogUsersDigest()> users_;
     StoreId epoch_{};
     mutable std::mutex mutex_;
     std::uint64_t revision_ = 0U;
@@ -93,6 +105,8 @@ class CatalogClock {
     bool marked_ = false;
     // The revision the record holds; unknown after a failed write.
     std::optional<std::uint64_t> recorded_;
+    // The digest the record holds, or the start's.
+    CatalogUsersDigest users_digest_{};
     bool holding_ = false;
 };
 

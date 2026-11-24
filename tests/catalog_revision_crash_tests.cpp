@@ -148,8 +148,49 @@ void SlotOwnerRevision() {
     assert(test::LoginOnEngine(*e.engine, reader, "reader", "pw").rfind("%", 0) == 0);
     assert(e.engine->Execute(reader, "WATCH realm SLOT 'a'\r\n").rfind("%2\r\n", 0) == 0);
     assert(reader.slot_watch && reader.slot_watch->owner() == "reader");
-    assert(revision() == before + 1U);
+    // Starting with users after a start without them also moved the revision on.
+    assert(revision() > before);
     assert(!ReadCatalogRevision(dir.path())->in_progress);
+}
+
+// Users change at a start without a statement: a server started with users
+// after one without them, or the reverse, takes a new revision, and the same
+// users keep it.
+void UsersAcrossStarts() {
+    test::ScopedTempDir dir("chunkdb-catalog-users");
+    const auto position = [&] {
+        const auto record = *ReadCatalogRevision(dir.path());
+        return StoreIdHex(record.epoch) + " " + std::to_string(record.revision);
+    };
+    const auto watch_after = [](Engine& e, const std::string& at) {
+        assert(e.Run("WATCH CATALOG AFTER " + at).rfind("%2\r\n", 0) == 0);
+        return e.session.catalog_watch->Next();
+    };
+    const auto resync = [](const std::optional<CatalogSubscription::Frame>& frame) {
+        return frame && frame->bytes->find("$6\r\nresync\r\n") != std::string::npos;
+    };
+    std::string at;
+    {
+        Engine open(dir.path(), false);
+        Reply(open.Run("CREATE TABLE realm (n u8) CHUNK 4 x 4"), "+OK\r\n");
+        at = position();
+    }
+    {
+        // With users the user records appear: a consumer at the old revision rebuilds.
+        Engine users(dir.path(), true);
+        assert(resync(watch_after(users, at)));
+        at = position();
+    }
+    {
+        // The same users: it continues.
+        Engine users(dir.path(), true);
+        assert(!watch_after(users, at));
+    }
+    {
+        // Without users they disappear: it rebuilds again.
+        Engine open(dir.path(), false);
+        assert(resync(watch_after(open, at)));
+    }
 }
 
 }  // namespace
@@ -159,5 +200,6 @@ int main(int argc, char** argv) {
     for (const auto& point : kPoints) Case(argv[0], point);
     VerifyRecord();
     SlotOwnerRevision();
+    UsersAcrossStarts();
     std::cout << "catalog revision crash cases: " << std::size(kPoints) << '\n';
 }

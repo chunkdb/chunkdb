@@ -69,9 +69,10 @@ class StatementControl {
 };
 
 // Runs `hook` on this thread each time the current statement enters its
-// irreversible decision (EnterStatementDecision), after the decision is
-// entered; a hook that throws fails the statement before its change. Every
-// durable change of a statement comes after that point.
+// irreversible decision (EnterStatementDecision), just before the decision
+// is entered; a hook that throws fails the statement before its change, and a
+// stop requested meanwhile still stops it. Every durable change of a
+// statement comes after that point.
 class ScopedDecisionHook {
   public:
     explicit ScopedDecisionHook(std::function<void()> hook) noexcept;

@@ -184,8 +184,10 @@ ScopedStatementControl::ScopedStatementControl(StatementControl* current) noexce
 ScopedStatementControl::~ScopedStatementControl() { current_statement = previous_; }
 void CheckStatementCancellation() { if (current_statement) current_statement->Check(); }
 void EnterStatementDecision() {
-    if (current_statement) current_statement->EnterDecision();
+    // First, while a stop can still be accepted: a statement whose hook fails
+    // is stopped or fails before the decision, never refused as too late.
     if (decision_hook != nullptr && *decision_hook) (*decision_hook)();
+    if (current_statement) current_statement->EnterDecision();
 }
 ScopedDecisionHook::ScopedDecisionHook(std::function<void()> hook) noexcept
     : hook_(std::move(hook)), previous_(decision_hook) { decision_hook = &hook_; }

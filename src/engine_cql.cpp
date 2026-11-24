@@ -38,6 +38,7 @@
 #include "feature_flags.hpp"
 #include "backup.hpp"
 #include "catalog_feed.hpp"
+#include "crypto.hpp"
 #include "slot_watch.hpp"
 #include "feed_protocol.hpp"
 #include "store_manifest.hpp"
@@ -1293,6 +1294,20 @@ CatalogState CommandEngine::ReadCatalog(const CatalogScope& scope) const {
         }
     }
     return state;
+}
+
+std::array<std::uint8_t, 16> CommandEngine::UsersDigest() const {
+    std::array<std::uint8_t, 16> digest{};
+    if (!config_.users) return digest;
+    crypto::Sha256 hash;
+    for (const auto& [name, user] : config_.users->Snapshot().users) {
+        std::string record;
+        AppendUserMap(record, name, user);
+        hash.Update(std::string_view(record));
+    }
+    const auto full = hash.Finish();
+    std::copy_n(full.begin(), digest.size(), digest.begin());
+    return digest;
 }
 
 Table::Lease CommandEngine::AcquireNamedTable(SessionState& session, std::string_view name) const {
