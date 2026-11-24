@@ -1,21 +1,3 @@
-    const auto name = private_copy.filename().string();
-    constexpr std::string_view prefix = ".chunkdb.restore.";
-    if (!name.starts_with(prefix) || name.size() != prefix.size() + 32U ||
-        !std::all_of(name.begin() + static_cast<std::ptrdiff_t>(prefix.size()), name.end(), [](char byte) {
-            return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
-        })) throw CommitOwnerRestoreOwnershipError("restore copy has no private operation name");
-    std::shared_ptr<CommitOwnerArtifactIo> pinned;
-    try {
-        pinned = CommitOwnerArtifactIo::OpenBootstrapDirectory(private_copy);
-    } catch (const std::exception& error) {
-        // Only a name that no longer reaches a plain directory is an ownership
-        // failure; any other error, such as a descriptor limit, takes the
-        // ordinary restore cleanup.
-        std::error_code inspected;
-        const auto status = std::filesystem::symlink_status(private_copy, inspected);
-        if (!inspected && status.type() == std::filesystem::file_type::directory) throw;
-        throw CommitOwnerRestoreOwnershipError(error.what());
-    }
 #include "commit_owner_bootstrap.hpp"
 
 #include <algorithm>
