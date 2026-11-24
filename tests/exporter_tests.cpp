@@ -337,6 +337,8 @@ void TestAgainstServer(Fixture& fixture) {
 // chunks://: the exporter verifies the certificate and binds the login.
 void TestTls(const std::string& exporter, const std::string& server_binary) {
 #ifndef CHUNKDB_WITH_OPENSSL
+    (void)exporter;
+    (void)server_binary;
     std::puts("built without TLS; chunks:// not tested");
     return;
 #else
