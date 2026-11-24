@@ -14,6 +14,7 @@ Generated passwords, epochs, and timestamps appear as named placeholders.
 | Reference | Statements |
 | --- | --- |
 | [Blocks](reference/BLOCKS.md) | GET BLOCK, SET BLOCK, DELETE BLOCK |
+| [Expressions](reference/EXPRESSIONS.md) | Computed values and IF conditions of SET BLOCK and DELETE BLOCK |
 | [Chunks and areas](reference/CHUNKS.md) | GET CHUNK, SET CHUNK, GET AREA, SCAN CHUNKS, COMPACT TOMBSTONES, SHOW TABLE STATS |
 | [Aggregates](reference/AGGREGATE.md) | AGGREGATE |
 | [Tables](reference/TABLES.md) | CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SWAP TABLES, SHOW TABLES, DESCRIBE, SHOW STATUS, ENABLE FEATURE |
@@ -34,16 +35,18 @@ Bytes use hexadecimal literals such as `x'0a0bff'`.
 Bits use literals such as `b'1010'`, with the first digit representing the lowest bit.
 
 Trailing keyword options can appear in any order, each at most once.
-Client APIs supply binary `$n` parameters in these places: SET BLOCK values, values in the WHERE of AGGREGATE and SCAN CHUNKS, the SET CHUNK form or META values, `VERIFIER $1` in CREATE USER and ALTER USER (also `ADD VERIFIER $1`), HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
+Client APIs supply binary `$n` parameters in these places: SET BLOCK values, expressions and conditions, DELETE BLOCK conditions, values in the WHERE of AGGREGATE and SCAN CHUNKS, the SET CHUNK form or META values, `VERIFIER $1` in CREATE USER and ALTER USER (also `ADD VERIFIER $1`), HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
 See [Protocol](PROTOCOL.md#parameters) for encoding.
 
 Committed chunk versions are producing commit revisions, ordered only within the table epoch returned by DESCRIBE.
 DESCRIBE's schema `version` differs from its completed commit `revision`; read-only mode returns null for that frontier.
 Use IF VERSION for equality checks against the containing chunk, including changes to other blocks in that chunk.
+Use IF with a [condition](#conditions) to test the block's own values in the same step as the write.
 
 ## Conditions
 
 AGGREGATE and SCAN CHUNKS take `WHERE condition` and keep only the present blocks for which the condition is true.
+SET BLOCK and DELETE BLOCK take `IF condition`, and SET BLOCK values may be computed from the block; see [Expressions](reference/EXPRESSIONS.md).
 
 ```text
 condition := condition OR condition | condition AND condition | NOT condition | ( condition )
@@ -56,11 +59,14 @@ op        := = | <> | < | <= | > | >=
 ```
 
 - `column` is a block column and `chunk.column` a chunk column of the same chunk; quote a column named like a keyword: `"exists"`.
-- `POS_X`, `POS_Y` and `POS_Z` are the block's coordinates; `NOW()` is the time the statement starts, in milliseconds since the Unix epoch.
+- `POS_X`, `POS_Y` and `POS_Z` are the block's coordinates; `NOW()`, in milliseconds since the Unix epoch, is the time the statement starts in reads and the commit time in writes.
 - A literal or `$n` takes the type of the column it is compared or combined with; a parameter with no column beside it, as in `$1 < $2`, is refused.
-- Integers compute exactly; a result beyond 128 bits is `OUT_OF_RANGE`, and dividing an integer by zero is `INVALID_ARGUMENT`.
+- Integers compute exactly; a result beyond 128 bits is `OUT_OF_RANGE`, and dividing an integer by zero is `INVALID_ARGUMENT`; `/` truncates toward zero and `%` takes the sign of the dividend.
+- An integer with a float computes in f64, but comparisons between them are exact; NaN equals nothing, and -0 equals 0.
 - Text and bytes compare bytewise; bits and bool support `=` and `<>`.
-- A comparison with NULL is unknown, AND, OR and NOT follow three-valued logic, and a block whose condition is unknown is skipped.
+- Arithmetic with NULL is NULL; a comparison with NULL is unknown, AND, OR and NOT follow three-valued logic, and an unknown condition is false.
+- LEAST and GREATEST ignore NULL arguments; COALESCE returns its first argument that is not NULL.
+- For an absent block, EXISTS is false and every block column is NULL; chunk columns keep their values.
 - Comparisons and arithmetic do not chain without parentheses: write `(a < b) AND (b < c)`, not `a < b < c`.
 - A condition has at most 256 values, columns, operators and list items, reported as `max_expression_nodes` by HELLO, and at most 32 levels.
 

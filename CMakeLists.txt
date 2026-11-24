@@ -655,6 +655,10 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_cql_engine_test tests/cql_engine_tests.cpp)
     target_link_libraries(chunkdb_cql_engine_test PRIVATE chunkdb_core)
     add_test(NAME cql_engine COMMAND chunkdb_cql_engine_test)
+    add_executable(chunkdb_conditional_writes_test tests/conditional_writes_tests.cpp)
+    target_link_libraries(chunkdb_conditional_writes_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_conditional_writes_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME conditional_writes COMMAND chunkdb_conditional_writes_test)
     add_executable(chunkdb_txn_engine_test tests/txn_engine_tests.cpp)
     target_link_libraries(chunkdb_txn_engine_test PRIVATE chunkdb_core)
     add_test(NAME txn_engine COMMAND chunkdb_txn_engine_test)
@@ -1213,6 +1217,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_cql_test
         chunkdb_expr_test
         chunkdb_cql_engine_test
+        chunkdb_conditional_writes_test
         chunkdb_migrations_engine_test
         chunkdb_recover_table_test
         chunkdb_migrations_crash_test
@@ -1379,6 +1384,7 @@ if(CHUNKDB_BUILD_TESTS)
         cql
         expr
         cql_engine
+        conditional_writes
         txn_engine
         chunk_write_memory
         crypto

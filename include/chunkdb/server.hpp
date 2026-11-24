@@ -81,8 +81,8 @@ class ChunkServer {
     // before HELLO, counted while max_handshakes_per_ip is set.
     [[nodiscard]] std::size_t HandshakesInProgressForTests(const std::string& source);
 
-    // Waits until Run has bound its listener (true), or until Run fails or
-    // `timeout` passes (false). A test harness checks this before it
+    // Waits until Run has bound its listener (true), or until Run fails, Stop
+    // is called or `timeout` passes (false). A test harness checks this before it
     // connects, so another socket on the same port is never taken for this
     // server.
     [[nodiscard]] bool WaitListeningForTests(std::chrono::milliseconds timeout);
@@ -131,7 +131,11 @@ class ChunkServer {
     std::mutex lifecycle_mutex_;
     // Under lifecycle_mutex_: the last Run failed; cleared when Run starts.
     bool run_failed_ = false;
-    // Signalled when Run binds its listener or fails.
+    // Under lifecycle_mutex_: Stop was called. Run, before or while it binds
+    // its listener, then returns without serving.
+    bool stop_requested_ = false;
+    // Signalled when Run binds its listener, fails, or ends on a Stop before
+    // binding it.
     std::condition_variable listening_cv_;
     std::mutex pending_clients_mutex_;
     std::mutex active_clients_mutex_;

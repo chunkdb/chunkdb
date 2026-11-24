@@ -17,6 +17,7 @@
 
 namespace chunkdb::expr {
 struct Expression;
+struct WriteExpressions;
 }  // namespace chunkdb::expr
 
 // CQL statements (docs/CQL.md): parsed from one request line, not yet
@@ -103,6 +104,9 @@ struct SetBlock {
     std::optional<std::uint64_t> if_version;
     std::int64_t z = 0;
     std::uint8_t dims = 2;
+    // IF <expr> and values that are more than a single value
+    // (docs/design/EXPRESSIONS_DESIGN.md); null for a statement without them.
+    std::shared_ptr<const expr::WriteExpressions> expressions;
 };
 struct DeleteBlock {
     std::int64_t x = 0;
@@ -111,6 +115,8 @@ struct DeleteBlock {
     std::optional<std::uint64_t> if_version;
     std::int64_t z = 0;
     std::uint8_t dims = 2;
+    // IF <expr>; null without it.
+    std::shared_ptr<const expr::WriteExpressions> expressions;
 };
 struct GetChunk {
     std::int64_t chunk_x = 0;

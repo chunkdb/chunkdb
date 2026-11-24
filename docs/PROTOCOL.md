@@ -124,9 +124,11 @@ A parameter in a WHERE condition is encoded as the type of the column it is comp
 | bits(N) | ceil(N/8) bytes, lowest bit first. |
 | text, bytes | UTF-8 text or uninterpreted bytes, within the column bound. |
 | SET CHUNK | Chunk form defined by [Chunk form](#chunk-form). |
+| Expression | The type of the column operand it meets ([Conditions](CQL.md#conditions)). |
+| IF VERSION $n | 8-byte little-endian u64. |
 
 The server bounds a frame before reading its body where the statement's schema permits it.
-For SET BLOCK, it also bounds the sum of actual declared frame lengths at 67117056 bytes. Each header is checked before allocating or reading its payload; small values remain accepted when their columns allow larger maxima. NULL frames add no payload bytes. SET CHUNK retains its separate chunk-form bound.
+For SET BLOCK and DELETE BLOCK, it also bounds the sum of actual declared frame lengths at 67117056 bytes. Each header is checked before allocating or reading its payload; small values remain accepted when their columns allow larger maxima. NULL frames add no payload bytes. SET CHUNK retains its separate chunk-form bound.
 An oversized typed frame or aggregate closes the connection after its error.
 Invalid statements, missing tables and unknown parameter columns drain their frames under `--max-unparsed-parameter-bytes`, default 1048576 payload bytes.
 Before HELLO, a non-handshake statement or wrong protocol version receives PROTOCOL and closes without waiting for advertised frames.
@@ -284,7 +286,7 @@ Malformed or unbounded parameter framing receives PROTOCOL and closes the connec
 INVALID_ARGUMENT also refuses a statement the server configuration rules out, such as a write on a server started with `--read-only`.
 PERMISSION_DENIED identifies the missing right; NO_TABLE also hides tables on which a user has no rights.
 
-TABLE_EXISTS, VERSION_MISMATCH and SCHEMA_MISMATCH leave rejected operations unapplied.
+TABLE_EXISTS, VERSION_MISMATCH, CONDITION_FAILED and SCHEMA_MISMATCH leave rejected operations unapplied.
 Errors contain a code, structured keys, and optional diagnostic text.
 Keys precede text; percent escapes encode whitespace, `%`, `=`, and non-ASCII bytes in values.
 Every error includes `reason`; additional keys identify versions, options, publication stages, or retry delays.
@@ -308,7 +310,7 @@ Its keys are `area`, `columns`, `column_ids`, `no_before`, and `chunks`.
 Unfiltered area and projection fields are null; projected names and IDs are aligned arrays in declared order.
 A dropped column keeps its ID and has a null display name.
 Area bounds are signed `[x0,y0,x1,y1]` with inclusive endpoints; both flags are booleans.
-VERSION_MISMATCH and SCHEMA_MISMATCH include `current`; schema rejection also includes `actual` and `table`.
+VERSION_MISMATCH, CONDITION_FAILED and SCHEMA_MISMATCH include `current`, the chunk or schema version; schema rejection also includes `actual` and `table`.
 RATE_LIMITED authentication bans include remaining `retry_after_ms`.
 OUTCOME_UNKNOWN includes `stage` and requires writer recovery before retrying ([durability](DURABILITY_CONTRACT.md)).
 INTERNAL reports other operational failures without exposing internal diagnostics.

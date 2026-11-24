@@ -30,6 +30,11 @@
 
 namespace chunkdb {
 
+namespace cql {
+struct SetBlock;
+struct DeleteBlock;
+}  // namespace cql
+
 // The wire protocol this engine speaks: CQL statements with typed replies
 // (docs/PROTOCOL.md).
 inline constexpr int kProtocolVersion = 3;
@@ -504,6 +509,16 @@ class CommandEngine {
         ChunkStore& store,
         const ChunkCoord& coord,
         const std::function<void(ChunkState&)>& change);
+    // SET BLOCK (`set`) or DELETE BLOCK (`del`) with IF <expr> or values
+    // that read the block (docs/design/EXPRESSIONS_DESIGN.md): the condition
+    // and values are evaluated under the chunk's lock with the write, or
+    // against the transaction's view.
+    [[nodiscard]] std::string BlockWriteWithExpressions(
+        SessionState& session,
+        const cql::SetBlock* set,
+        const cql::DeleteBlock* del,
+        std::span<const std::optional<std::string>> parameters,
+        MetricsRegistry::CommandClass& command_class);
 };
 
 }  // namespace chunkdb
