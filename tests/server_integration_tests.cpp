@@ -4631,7 +4631,8 @@ void TestStopDuringStartup() {
 }
 
 // While ALTER TABLE waits for a lease to drain, SHOW METRICS answers at once
-// without that table, and the server stops without waiting for either.
+// without that table's store samples, and the server stops without waiting
+// for either.
 void TestShowMetricsBusyTable() {
     ServerHarness harness("metrics-busy", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
                           BaseServerConfig());
@@ -4661,7 +4662,10 @@ void TestShowMetricsBusyTable() {
     stop.get();
     assert(scraped && stopped);
     const auto response = scrape.get();
-    assert(response.find("table=\"default\"") == std::string::npos);
+    // Only its chunkdb_table_fenced sample, which needs no lease.
+    const auto labelled = response.find("table=\"default\"");
+    assert(labelled != std::string::npos && response.find("table=\"default\"", labelled + 1U) == std::string::npos);
+    assert(response.find("\nchunkdb_table_fenced{table=\"default\"} 0\n") != std::string::npos);
     assert(response.find("chunkdb_commands_total") != std::string::npos);
 }
 

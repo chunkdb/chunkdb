@@ -738,6 +738,14 @@ Table::FeedCounts Table::CountFeeds(const Lease& lease) const {
     return FeedCounts{.slots = lease.store().feed_slots_->size(), .watches = feed_subscriptions_};
 }
 
+bool Table::SlotFrontierFrozen(const Lease& lease) const {
+    if (lease.table_ != this) throw std::logic_error("slot frontier state needs a lease of its table");
+    // FeedSlots::SyncImpl refuses a fail-closed store, and the slot worker stops.
+    const auto& store = lease.store();
+    return store.feed_slots_active_.load(std::memory_order_acquire) &&
+           store.durability_poisoned_.load(std::memory_order_acquire);
+}
+
 std::vector<std::uint32_t> Table::ResolveFeedColumns(const std::vector<std::string>& names) {
     auto lease = Acquire();
     if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
