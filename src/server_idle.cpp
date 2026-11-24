@@ -670,7 +670,7 @@ bool IdleIo::Write(ServerConnection& connection, bool keep, std::optional<std::c
         std::lock_guard lock(connection.record->mutex);
         connection.record->user = connection.session.user;
         connection.record->incarnation = connection.session.user_incarnation;
-        connection.record->state = connection.session.watch || connection.session.slot_watch ? "watch" : "idle";
+        connection.record->state = connection.session.Watching() ? "watch" : "idle";
         connection.record->verb.clear();
         connection.record->statement.reset();
     }
@@ -777,7 +777,7 @@ bool IdleIo::Progress(ServerConnection& connection) {
     if (connection.phase == Phase::kReply) return Write(connection);
     if (connection.phase != Phase::kInput) return true;
     // Lines read with WATCH belong to the watch stream: Serve hands them to the feed reader.
-    if (connection.session.watch || connection.session.slot_watch) return true;
+    if (connection.session.Watching()) return true;
     if (connection.waiting_line_credit) {
         auto credit = TakeLineCredit(connection);
         if (!credit) return true;
@@ -871,7 +871,7 @@ void IdleIo::Serve(std::shared_ptr<ServerConnection>& connection) {
     } else if (connection->phase == Phase::kReady) {
         if (server_.DispatchClient(connection)) connection.reset();
     } else if (connection->phase == Phase::kInput &&
-        (connection->session.watch || connection->session.slot_watch)) {
+        (connection->session.Watching())) {
         if (server_.HandOff(connection)) connection.reset();
         else { server_.CloseClient(*connection); connection.reset(); }
     }

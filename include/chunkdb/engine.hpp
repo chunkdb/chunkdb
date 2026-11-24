@@ -48,6 +48,10 @@ class UserRegistry;
 class UserConnectionTicket;
 class AuditLog;
 class SlotWatch;
+class CatalogFeed;
+class CatalogSubscription;
+struct CatalogScope;
+struct CatalogState;
 struct User;
 class ReadRightCheck;
 struct PendingLogin;
@@ -57,7 +61,8 @@ enum class ServerRight : std::uint8_t;
 // Deterministic command interleavings, following the feed hooks.
 struct CommandEngineTestHook {
     enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted, kBeforeTxnBudgetReclaim,
-        kAfterRestoreProgress, kAfterRestoreUserRead, kBeforeTableStatsListing };
+        kAfterRestoreProgress, kAfterRestoreUserRead, kBeforeTableStatsListing,
+        kBeforeCatalogRefresh };
     virtual ~CommandEngineTestHook() = default;
     virtual void Run(Point point, std::string_view table) = 0;
 };
@@ -264,6 +269,10 @@ struct SessionState {
     SessionHelloOptions hello_options;
     std::unique_ptr<FeedSubscription> watch;
     std::shared_ptr<SlotWatch> slot_watch;
+    // WATCH CATALOG.
+    std::shared_ptr<CatalogSubscription> catalog_watch;
+    // A WATCH of any kind is open.
+    [[nodiscard]] bool Watching() const noexcept { return watch || slot_watch || catalog_watch; }
     std::function<bool(std::shared_ptr<SlotWatch>)> register_slot_watch;
     FeedOptions watch_options;
     // Server shutdown interrupts backup work, independent of client lifetime.
@@ -351,6 +360,10 @@ class CommandEngine {
     // as a statement on a table the user cannot see gets, or AUTH_REQUIRED
     // once the user was dropped.
     [[nodiscard]] static std::string LostWatchReply(bool user_dropped, const std::string& table);
+    // The error that ends a catalog watch whose user lost MONITOR and ADMIN on
+    // `*`, or MANAGES USERS when the watch shows users: PERMISSION_DENIED, or
+    // AUTH_REQUIRED once the user was dropped.
+    [[nodiscard]] static std::string LostCatalogWatchReply(bool user_dropped);
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
     }
@@ -393,6 +406,10 @@ class CommandEngine {
     std::atomic<CommandEngineTestHook*> hook_{nullptr};
     std::mutex tls_reload_mutex_;
     std::function<void()> tls_reload_;
+    // WATCH CATALOG; refreshed after every statement that can change the catalog.
+    std::shared_ptr<CatalogFeed> catalog_feed_;
+    // The records of the catalog feed (engine_cql.cpp).
+    [[nodiscard]] CatalogState ReadCatalog(const CatalogScope& scope) const;
 
     // The error reply for an exception a command threw.
     [[nodiscard]] static std::string ErrorReply(const std::exception& error);

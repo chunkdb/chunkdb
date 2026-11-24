@@ -19,6 +19,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -799,6 +800,20 @@ struct Completed {
     std::string err;
 };
 
+// fork fails with EAGAIN when this user reaches its process limit, which a
+// host running many tests at once can reach; the error names that limit.
+std::string ForkError(int error) {
+    std::string message = std::string("fork: ") + std::strerror(error);
+    rlimit limit{};
+    if (::getrlimit(RLIMIT_NPROC, &limit) == 0) {
+        const auto text = [](rlim_t value) {
+            return value == RLIM_INFINITY ? std::string("unlimited") : std::to_string(value);
+        };
+        message += " (process limit RLIMIT_NPROC soft=" + text(limit.rlim_cur) + " hard=" + text(limit.rlim_max) + ")";
+    }
+    return message;
+}
+
 // A child process with optional stdin and output pipes.
 class Child {
   public:
@@ -845,7 +860,7 @@ class Child {
         if (pid_ < 0) {
             const int error = errno;
             close_all();
-            throw std::runtime_error(std::string("fork: ") + std::strerror(error));
+            throw std::runtime_error(ForkError(error));
         }
         if (pid_ == 0) {
             // Only async-signal-safe calls until exec. The child starts with
