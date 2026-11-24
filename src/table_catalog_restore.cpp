@@ -23,7 +23,7 @@ namespace {
 constexpr const char* kFenceRestore = "a failed restore could not remove it";
 
 void CrashAtFailpoint(const char* key) {
-    if (ConsumeFailpointEnv(key)) std::_Exit(86);
+    if (ConsumeFailpointEnv(key)) ExitAbruptly(86);
 }
 
 std::string OperationName(const std::string& table) {

@@ -48,7 +48,7 @@ struct StagingCleanup {
 void Save(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes) {
     AtomicWrite(path, bytes, false, false, nullptr, nullptr, false);
 }
-void Crash(const char* point) { if (ConsumeFailpointEnv(point)) std::_Exit(86); }
+void Crash(const char* point) { if (ConsumeFailpointEnv(point)) ExitAbruptly(86); }
 
 struct RetainedBackupIndex {
     Geometry geometry;
