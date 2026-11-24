@@ -130,6 +130,9 @@ class RegularChunkMutex {
     return kChunkLockModeName;
 }
 
+// kFsyncWal and kFsyncCheckpoint behave the same: every write syncs its WAL
+// before it returns, and every checkpoint syncs its image before it removes
+// a WAL. Both are kept for stored manifests and configurations.
 enum class DurabilityMode {
     kRelaxed = 0,
     kFsyncWal = 1,
@@ -693,6 +696,9 @@ enum class TxnPausePoint {
     // The transaction released its chunk locks, before publishing any
     // uncertain outcome and completing its post-commit bookkeeping.
     kBeforePostCommitOutcome,
+    // The transaction ended its producer bound after its outcome was settled,
+    // before it removes its intent and runs its inline checkpoints.
+    kBeforePostCommitCheckpoints,
     kCount,
 };
 

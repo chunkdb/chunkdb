@@ -515,6 +515,49 @@ void CompletionAndPoison() {
     catalog.SetBackupHookForTests(nullptr);
     assert(!std::filesystem::exists(root / "poisoned" / kBackupMarkerName));
 }
+// A commit held after its outcome is settled, with its committed intent still on
+// disk, does not hold a backup: the backup carries the commit's frames without the
+// intent, and the restored table holds the committed state at the commit's version.
+void CommitBeforeIntentRemoval() {
+    ScopedTempDir temp("chunkdb-backup-commit-intent");
+    const auto root = std::filesystem::canonical(temp.path());
+    TableCatalog catalog(Config(root / "source", DurabilityMode::kFsyncWal));
+    (void)feed_test::CreateDefault(catalog);
+    std::uint64_t version = 0U;
+    {
+        auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
+        WriteCounter(store, {0, 0}, 1);
+        auto snapshot = store.BeginTxnSnapshot(txn_test::kTxnDuration);
+        auto first = store.ReadChunkStateAt(*snapshot, 0, 0); txn_test::SetCounter(&first, 2);
+        auto second = store.ReadChunkStateAt(*snapshot, 1, 0); txn_test::SetCounter(&second, 3);
+        std::vector<TxnChunkWrite> writes{{.coord = {0, 0}, .state = std::move(first)}, {.coord = {1, 0}, .state = std::move(second)}};
+        constexpr auto point = TxnPausePoint::kBeforePostCommitCheckpoints;
+        store.ArmTxnPauseForTests(point);
+        auto transaction = std::async(std::launch::async, [&] { return store.CommitTransaction(*snapshot, {}, std::move(writes)); });
+        assert(store.WaitForTxnPauseForTests(point));
+        version = store.GetChunkVersion(0, 0);
+        assert(version > 0U && store.GetChunkVersion(1, 0) == version);
+        assert(std::filesystem::exists(TxnIntentPath(store.data_dir(), version)));
+        auto backup = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "backup", {}); });
+        const bool finished = backup.wait_for(30s) == std::future_status::ready;
+        store.ResumeTxnForTests(point);
+        assert(finished);
+        const auto result = backup.get();
+        assert(result.tables.size() == 1U && result.tables[0].revision >= version);
+        assert(transaction.get() == version);
+        assert(!std::filesystem::exists(TxnIntentPath(store.data_dir(), version)));
+    }
+    assert(!std::filesystem::exists(TxnIntentPath(root / "backup" / "tables" / "default", version)));
+    RestoreBackup(root / "backup", root / "restored");
+    std::ostringstream report;
+    assert(VerifyDataDirectory(root / "restored", report).errors == 0U);
+    assert(report.str().find("txn_") == std::string::npos);
+    TableCatalog restored(Config(root / "restored", DurabilityMode::kFsyncWal));
+    auto restored_lease = restored.Find("default")->Acquire();
+    auto& restored_store = restored_lease->store();
+    assert(ReadCounter(restored_store, {0, 0}) == 2U && ReadCounter(restored_store, {1, 0}) == 3U);
+    assert(restored_store.GetChunkVersion(0, 0) == version && restored_store.GetChunkVersion(1, 0) == version);
+}
 void FailedGenerationAndEmptyCatalog() {
     ScopedTempDir temp("chunkdb-backup-generation");
     const auto root = std::filesystem::canonical(temp.path());
@@ -1321,7 +1364,7 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--orphaned-staging") { OrphanedStagingCleanup(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--path-regressions") { TargetComponentReplacement(); StagingOwnerValidation(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); SharedTargetDirectories(); return 0; }
     TargetComponentReplacement(); StagingCollisionRetainsExistingEntry(); PathDurabilityFailuresRemainGuarded(); SharedTargetDirectories();
-    if (argc == 2 && std::string_view(argv[1]) == "--completion") { CompletionAndPoison(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--completion") { CompletionAndPoison(); CommitBeforeIntentRemoval(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--generation") { FailedGenerationAndEmptyCatalog(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--pin-regressions") {
         PlainWriterBounds(true); PlainWriterBounds(false); EndedFeedDoesNotClearNewProducers();
@@ -1337,7 +1380,7 @@ int main(int argc, char** argv) {
     FailedIndexRefusesBackup();
     CancelBetweenBoundedWalReplayReads();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint}) { CutAndProgress(mode); AcknowledgedLoad(mode); }
-    CopyReleasesHoldsAndBusy(); TargetAndCancellation(); CompletionAndPoison(); FailedGenerationAndEmptyCatalog(); CancelCatalogWaitAndRestrictions();
+    CopyReleasesHoldsAndBusy(); TargetAndCancellation(); CompletionAndPoison(); CommitBeforeIntentRemoval(); FailedGenerationAndEmptyCatalog(); CancelCatalogWaitAndRestrictions();
     for (unsigned defect = 0; defect < 5U; ++defect) ColdRecovery(defect);
     std::puts("backup core passed: 3 cut modes, 3 load modes x3 tables x155 acknowledgements, 5 cold cases, 18 focused groups");
 }

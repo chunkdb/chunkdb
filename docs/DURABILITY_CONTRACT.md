@@ -12,8 +12,8 @@ Committed revisions keep their values; missing chunks after a later crash do not
 | Operation | Success guarantees |
 | --- | --- |
 | Ordinary write, relaxed | Applied in memory; power loss can lose acknowledged writes, and a process crash can lose those not yet written to the WAL, up to four checkpoint intervals per chunk while a background checkpoint syncs it. |
-| Ordinary write, fsync-wal | The WAL and required directory entries are synced before success. |
-| Ordinary write, fsync-checkpoint | Synced WAL acknowledgement; checkpoints are published synced, and a checkpoint that fails leaves the synced WAL in place ([Disk full](#disk-full)). |
+| Ordinary write, fsync-wal | The WAL and required directory entries are synced before success; a checkpoint syncs its image and directory before it removes the WAL; a checkpoint that fails leaves the synced WAL in place ([Disk full](#disk-full)). |
+| Ordinary write, fsync-checkpoint | The same as fsync-wal; the name is kept for existing tables and configurations. |
 | FLUSH WAL, every mode | All writes acknowledged before its arrival are durable in every table. |
 | Transaction COMMIT, every mode | All changed chunks commit together durably, or none commit. |
 | RESTORE TABLE | The restored table is durable and complete under its name, or nothing is published. |

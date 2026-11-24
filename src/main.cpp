@@ -59,10 +59,11 @@ void OnHangup(int) {
 }
 #endif
 
+// 0 asks the system for a free port, which the ready line names.
 std::uint16_t ParsePort(const std::string& value) {
     std::size_t consumed = 0;
     const int port = std::stoi(value, &consumed, 10);
-    if (consumed != value.size() || port <= 0 || port > 65535) {
+    if (consumed != value.size() || port < 0 || port > 65535) {
         throw std::invalid_argument("invalid port: " + value);
     }
     return static_cast<std::uint16_t>(port);

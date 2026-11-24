@@ -911,7 +911,8 @@ void TestPauseSlots() {
         chunkdb::TxnPausePoint::kRegisterBeforePublish,
         chunkdb::TxnPausePoint::kWriteAfterOpenCount,
         chunkdb::TxnPausePoint::kWriteAfterMembership,
-        chunkdb::TxnPausePoint::kBeforePostCommitOutcome};
+        chunkdb::TxnPausePoint::kBeforePostCommitOutcome,
+        chunkdb::TxnPausePoint::kBeforePostCommitCheckpoints};
     static_assert(points.size() + 1U == static_cast<std::size_t>(chunkdb::TxnPausePoint::kCount));
     for (unsigned round = 0; round < 2U; ++round) {
         std::array<std::atomic<bool>, points.size()> completed{};
@@ -966,11 +967,40 @@ void TestPostCommitPause() {
     assert(ReadCounter(reopened, kA) == 4U && ReadCounter(reopened, kB) == 3U);
 }
 
+// A settled commit ends its producer bound before its intent removal and inline
+// checkpoints, so a scan at a snapshot that includes it does not wait for them.
+void TestScanDoesNotWaitForPostCommitWork() {
+    ScopedTempDir dir("chunkdb-txn-commit-bound");
+    const auto config = Config(dir.path());
+    ChunkStore store(config);
+    WriteCounter(store, kA, 1U);
+    auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+    auto writes = Writes(store, *snapshot, {{kA, 2U}, {kB, 3U}});
+    constexpr auto point = chunkdb::TxnPausePoint::kBeforePostCommitCheckpoints;
+    store.ArmTxnPauseForTests(point);
+    auto commit = std::async(std::launch::async, [&] {
+        return store.CommitTransaction(*snapshot, {}, std::move(writes));
+    });
+    assert(store.WaitForTxnPauseForTests(point));
+    assert(commit.wait_for(std::chrono::seconds(0)) == std::future_status::timeout);
+    const auto committed = store.GetChunkVersion(kA.x, kA.y);
+    // A short duration: a scan still waiting for the paused commit would end
+    // with CONFLICT reason=duration instead of returning.
+    auto reader = store.BeginTxnSnapshot(std::chrono::milliseconds(2000));
+    const auto page = store.ScanChunkIdentitiesAt(*reader, false, ChunkCoord{}, 16U);
+    assert(page.entries.size() == 2U && page.position.has_value() && *page.position >= committed);
+    store.EndTxnSnapshot(*reader);
+    store.ResumeTxnForTests(point);
+    assert(commit.get() == committed);
+    assert(ReadCounter(store, kA) == 2U && ReadCounter(store, kB) == 3U);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     TestPauseSlots();
     TestPostCommitPause();
+    TestScanDoesNotWaitForPostCommitWork();
     if (argc == 2 && std::string_view(argv[1]) == "--pause-regressions") return 0;
     assert(argc == 1);
     for (const auto mode : {chunkdb::DurabilityMode::kRelaxed, chunkdb::DurabilityMode::kFsyncWal,

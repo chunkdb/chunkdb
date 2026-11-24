@@ -250,6 +250,13 @@ void ChunkServer::Run() {
 
     try {
         const SocketHandle listen_socket = CreateListenSocket(config_.host, config_.port);
+        try {
+            // Port 0 binds a port the system picks; report that one.
+            bound_port_.store(ListenSocketPort(listen_socket), std::memory_order_release);
+        } catch (...) {
+            CloseSocket(listen_socket);
+            throw;
+        }
         if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
             hook->Run(FeedDeliveryTestHook::Point::kBeforeListenerPublication, 0U);
         // The listener and running_ are published together, under the mutex
@@ -285,10 +292,12 @@ void ChunkServer::Run() {
             {
                 {"protocol", config_.tls_enabled ? "tls" : "tcp"},
                 {"host", config_.host},
-                {"port", std::to_string(config_.port)},
+                {"port", std::to_string(bound_port_.load(std::memory_order_acquire))},
                 {"tls", config_.tls_enabled ? "on" : "off"},
                 {"workers", std::to_string(config_.worker_threads)},
             });
+        // A reader of a pipe or file learns the port of --port 0 from this line.
+        FlushLog();
 
         while (running_.load()) {
 #ifdef _WIN32

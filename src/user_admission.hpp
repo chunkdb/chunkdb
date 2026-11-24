@@ -62,6 +62,9 @@ struct UserRightsView {
         std::uint64_t incarnation = 0;
         std::map<std::string, Right> grants;
         std::map<std::string, Right> prefix_grants = {};
+        bool manages_users = false;
+        // ServerRight bits.
+        std::uint8_t server_rights = 0U;
     };
     std::map<std::string, Entry> users;
 };

@@ -34,6 +34,9 @@ data_dir/
   .chunkdb.staging/                    table creation and restore staging
   .chunkdb.dropped/                    tables renamed out of the catalog
   .chunkdb.backups/                    temporary pinned backup files
+  chunkdb.groups.owner                commit group owner root (inactive; no path creates it)
+  chunkdb.groups.objects/             commit group owner objects (inactive)
+  chunkdb.groups.journal/             commit group journal generations (inactive)
   tables/<name>/
     table.manifest                    identity, geometry, options, schema history
     chunkdb.version                   reserved revision ceiling
@@ -479,6 +482,23 @@ Rollback truncates/removes each WAL to its recorded boundary; a missing or short
 Committed intents preserve WAL effects, including WALs subsequently checkpointed away; removal and directory sync finish recovery idempotently.
 Failure repairing an uncommitted operation fences the affected store until recovery; post-commit cleanup does not turn a committed operation into a rejected one.
 
+## Commit group owner (inactive)
+
+No server or tool path creates these files; `commit_groups` stays refused, and only internal code and tests write them in this build.
+The owner root is the data directory, or the root of a standalone store.
+`chunkdb.groups.owner` is the 512-byte [CKGO root](design/COMMIT_GROUP_OWNER_FORMAT.md); the only canonical form this build writes is the generation-one INACTIVE root, published from an exclusive `.owner-root-<32 hex>` temporary without replacement.
+An existing root, or one that arrives during that publication, is admitted only by comparing its exact bytes with that root, and is then synced with the root directory.
+`chunkdb.groups.objects/` holds a `.scope` marker and digest-named immutable objects: roots, pages, 128-byte `CKGC` journal inventories and `CKID` ID inventories of at least 164 bytes, in their [native encodings](design/COMMIT_GROUP_FORMAT.md#journal-header-and-certified-inventory).
+`chunkdb.groups.journal/<32 hex journal id>-<16 hex generation>` is one journal generation: a 64-byte `CKGJ` header followed by `CKGR` records, named from the admitted journal context.
+Each temporary is synced before its no-replace publication, the published name is reopened and checked against the temporary's native object and exact bytes, and the file and then its directory are synced; a name is durable only after that directory sync.
+Every byte at or below an inventory's certified cut must match its digest and last record; any failure there is damage.
+Above the cut, a final record whose header or final checksum fails, or that extends past the end, is an interrupted append only when no later checksum-valid record header follows, as for live WALs.
+That rule shares the live-WAL limit: a crash that loses an earlier unsynced record while a later one survives is refused, not repaired.
+A checksum-valid record with an invalid structure, a seal record, conflicting decisions and a receipt without its matching decision are damage.
+No path truncates a journal tail in this build.
+The internal coordinator can stage a generation-two ACTIVE root object that names an empty journal generation, but it never replaces the canonical INACTIVE root.
+Details are in [artifact I/O](design/COMMIT_OWNER_ARTIFACT_IO.md).
+
 ## Feed slots and archives
 
 `chunkdb.slots` is at most 1 MiB, atomically replaced and file/directory synced in every durability mode:
@@ -632,7 +652,7 @@ Empty-chunk collection records the empty state when needed, removes the image be
 
 Explicit present-zero blocks are not collected.
 Temporary files use `<target>.tmp.<pid>.<thread>.<clock>.<sequence>` names; writer recovery cleans recognized unpublished artifacts, while read-only opening and verification do not modify them.
-`chunkdb_verify` checks manifests, bookkeeping, intents, images/WALs, archives/slots, migrations, and backup records without repairing them.
+`chunkdb_verify` checks manifests, bookkeeping, intents, images/WALs, archives/slots, migrations, and backup records without repairing them, and reports commit group owner files that no enabled feature claims as `group_owner_unclaimed` warnings.
 Its exit status is 0 without warnings/errors, 1 with warnings/errors, and 2 for invalid arguments or an unreadable target.
 
 Findings carry stable codes and relative paths.

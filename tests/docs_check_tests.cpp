@@ -16,7 +16,9 @@
 #ifndef _WIN32
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <cerrno>
@@ -376,6 +378,35 @@ void InitialPromptFailureReapsChild() {
     assert(OpenDescriptors() == before);
     fs::remove_all(directory);
 }
+
+// fork fails with EAGAIN at the user's process limit, as on a host running
+// many tests at once; the error names the limit. The limit is lowered only in
+// a child of this test, and it does not bind root.
+void ForkFailureNamesProcessLimit() {
+    if (::geteuid() == 0) return;
+    const pid_t pid = ::fork();
+    assert(pid >= 0);
+    if (pid == 0) {
+        rlimit limit{};
+        if (::getrlimit(RLIMIT_NPROC, &limit) != 0) ::_exit(3);
+        limit.rlim_cur = 1;  // This user already runs this process.
+        if (::setrlimit(RLIMIT_NPROC, &limit) != 0) ::_exit(3);
+        try {
+            OpenShell("/bin/sh", "chunk://127.0.0.1/", std::chrono::milliseconds(1000));
+        } catch (const std::runtime_error& error) {
+            const std::string message = error.what();
+            if (message.rfind("fork: ", 0) == 0 && message.find("(process limit RLIMIT_NPROC soft=1 hard=") != std::string::npos)
+                ::_exit(0);
+            std::cerr << "unexpected error: " << message << '\n';
+            ::_exit(1);
+        }
+        ::_exit(2);  // The shell started despite the limit.
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0 && errno == EINTR) {
+    }
+    assert(WIFEXITED(status) && WEXITSTATUS(status) == 0);
+}
 #endif
 
 }  // namespace
@@ -411,7 +442,10 @@ int main(int argc, char** argv) {
     FixtureChangesOnlyEnvironment(source);
     ResetPasswordComesFromPage(source);
 #ifndef _WIN32
-    if (ProcessChecksSupported()) InitialPromptFailureReapsChild();
+    if (ProcessChecksSupported()) {
+        InitialPromptFailureReapsChild();
+        ForkFailureNamesProcessLimit();
+    }
 #endif
     std::cout << "docs_check tests passed\n";
     return 0;
