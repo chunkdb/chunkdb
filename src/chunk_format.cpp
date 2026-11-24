@@ -130,6 +130,14 @@ bool ChunkColumnsPopulated(const Geometry& geometry, const ChunkColumnState* chu
     return chunk_columns != nullptr && (baseline == nullptr || chunk_columns->bytes != baseline->bytes);
 }
 
+bool ChunkPopulated(const Geometry& geometry, std::span<const std::uint8_t> presence_bitmap,
+    bool metadata_present, std::span<const std::uint8_t> metadata_bytes) noexcept {
+    if (std::any_of(presence_bitmap.begin(), presence_bitmap.end(), [](std::uint8_t byte) { return byte != 0U; }))
+        return true;
+    const auto& baseline = geometry.default_chunk_columns();
+    return metadata_present && (baseline == nullptr || !std::ranges::equal(metadata_bytes, baseline->bytes));
+}
+
 [[nodiscard]] std::string PresenceBitsText(
     const Geometry& geometry,
     const std::vector<std::uint8_t>& presence_bitmap) {

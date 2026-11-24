@@ -9,6 +9,8 @@
 #include <stop_token>
 #include <shared_mutex>
 
+#include "chunkdb/statement_mutex.hpp"
+
 namespace chunkdb {
 class RegularChunkMutex;
 enum class StatementStopReason { kNone, kCancelled, kKilled, kTimeout };
@@ -42,6 +44,10 @@ class StatementControl {
     [[nodiscard]] bool decision_entered() const;
     [[nodiscard]] std::optional<Clock::time_point> deadline() const noexcept { return deadline_; }
     [[nodiscard]] std::stop_token StopToken();
+    // The statement's latest progress, for SHOW CONNECTIONS; std::nullopt
+    // until it reports one and again once it completes.
+    void ReportProgress(const StatementProgress& progress);
+    [[nodiscard]] std::optional<StatementProgress> progress() const;
   private:
     friend struct StatementControlTestAccess;
     bool ExpireLocked();
@@ -56,6 +62,9 @@ class StatementControl {
     std::atomic<bool> stopped_{false};
     bool decision_entered_ = false;
     std::stop_source stop_{std::nostopstate};
+    // Its own mutex, so a listing never waits for a stop or a decision.
+    mutable std::mutex progress_mutex_;
+    std::optional<StatementProgress> progress_;
 };
 
 class ScopedStatementControl {
@@ -70,6 +79,8 @@ class ScopedStatementControl {
 
 void CheckStatementCancellation();
 void EnterStatementDecision();
+// Reports the current statement's progress; does nothing outside a statement.
+void ReportStatementProgress(const StatementProgress& progress);
 [[nodiscard]] std::string StatementStoppedReply(StatementStopReason reason);
 [[nodiscard]] std::stop_token StatementStopToken();
 [[nodiscard]] std::unique_lock<RegularChunkMutex> LockStatementChunk(RegularChunkMutex& mutex);
