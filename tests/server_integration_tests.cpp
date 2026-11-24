@@ -1688,7 +1688,6 @@ struct ServerHarness {
                 run_error = std::current_exception();
             }
         });
-        chunkdb::test::FeedPhaseWatchdog::Phase("harness: server thread started");
         try {
             WaitUntilListening();
         } catch (const std::exception&) {
@@ -1711,7 +1710,6 @@ struct ServerHarness {
             throw std::runtime_error("server did not start listening in time");
         }
         port = server->port();
-        chunkdb::test::FeedPhaseWatchdog::Phase("harness: listening");
 #ifdef CHUNKDB_WITH_OPENSSL
         // With PROXY headers a TLS handshake needs one first; a connection
         // alone reaches the listener.
@@ -1723,7 +1721,6 @@ struct ServerHarness {
 #else
         RawClient probe("127.0.0.1", port);
 #endif
-        chunkdb::test::FeedPhaseWatchdog::Phase("harness: probe closed");
     }
 };
 
@@ -5774,16 +5771,15 @@ void TestLoginFramesChargedByLength() {
     LoginCreditHook hook;
     auto config = BaseServerConfig(); config.client_io_timeout_ms = 30000;
     ServerHarness harness("login-frame-credit", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    // A completed HELLO shows the transports the hook is installed in have started.
+    RawClient ready("127.0.0.1", harness.port); ready.SetReadDeadline(std::chrono::seconds(10)); ready.Hello();
     chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
-    chunkdb::test::FeedPhaseWatchdog::Phase("test: hook installed");
     std::vector<std::unique_ptr<RawClient>> logins;
     for (std::size_t i = 0U; i < 24U; ++i) {
         auto client = std::make_unique<RawClient>("127.0.0.1", harness.port);
-        chunkdb::test::FeedPhaseWatchdog::Phase("test: login " + std::to_string(i) + " connected");
         client->SetReadDeadline(std::chrono::seconds(10));
         client->SendBytes("HELLO 3 WITH client_name=$1\r\n$4\r\n");
         hook.WaitGranted(i + 1U);
-        chunkdb::test::FeedPhaseWatchdog::Phase("test: login " + std::to_string(i) + " charged");
         logins.push_back(std::move(client));
     }
     for (auto& client : logins) {
@@ -5804,14 +5800,11 @@ void TestStalledLoginsLeaveLoginsAndReads() {
     ServerHarness harness("login-stalled", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
     RawClient logged("127.0.0.1", harness.port); logged.SetReadDeadline(std::chrono::seconds(10)); logged.Hello();
     chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
-    chunkdb::test::FeedPhaseWatchdog::Phase("test: hook installed");
     std::vector<std::unique_ptr<RawClient>> stalled;
     for (std::size_t i = 0U; i < 64U; ++i) {
         stalled.push_back(std::make_unique<RawClient>("127.0.0.1", harness.port));
-        chunkdb::test::FeedPhaseWatchdog::Phase("test: stalled " + std::to_string(i) + " connected");
         stalled.back()->SendBytes("HELLO 3 WITH client_name=$1\r\n$8192\r\n" + std::string(4000, 'a'));
         hook.WaitGranted(i + 1U);
-        chunkdb::test::FeedPhaseWatchdog::Phase("test: stalled " + std::to_string(i) + " charged");
     }
     RawClient login("127.0.0.1", harness.port); login.SetReadDeadline(std::chrono::seconds(10));
     login.SendBytes("HELLO 3 WITH client_name=$1\r\n$4\r\nname\r\n");
@@ -8647,43 +8640,9 @@ void TestReloadTlsWithoutTls() {
     assert(client.ReadLine().rfind("-ERR SYNTAX", 0) == 0);
 }
 
-#ifdef _WIN32
-// The code, address and thread of a crash, with the module base and the main thread to place them.
-DWORD g_main_thread = 0;
-LONG WINAPI ReportCrash(EXCEPTION_POINTERS* info) {
-    HMODULE faulting = nullptr;
-    char faulting_name[MAX_PATH] = "?";
-    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-            static_cast<LPCSTR>(info->ExceptionRecord->ExceptionAddress), &faulting))
-        (void)GetModuleFileNameA(faulting, faulting_name, MAX_PATH);
-    std::fprintf(stderr, "CRASH code=0x%08lx address=%p in=%s+0x%llx module=%p thread=%lu main_thread=%lu\n",
-        static_cast<unsigned long>(info->ExceptionRecord->ExceptionCode), info->ExceptionRecord->ExceptionAddress,
-        faulting_name, static_cast<unsigned long long>(static_cast<const char*>(info->ExceptionRecord->ExceptionAddress) -
-            reinterpret_cast<const char*>(faulting)),
-        static_cast<void*>(GetModuleHandleW(nullptr)), static_cast<unsigned long>(GetCurrentThreadId()),
-        static_cast<unsigned long>(g_main_thread));
-    void* frames[32] = {};
-    const auto count = CaptureStackBackTrace(0, 32, frames, nullptr);
-    for (USHORT i = 0; i < count; ++i) {
-        HMODULE frame_module = nullptr;
-        char frame_name[MAX_PATH] = "?";
-        if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
-                static_cast<LPCSTR>(frames[i]), &frame_module))
-            (void)GetModuleFileNameA(frame_module, frame_name, MAX_PATH);
-        std::fprintf(stderr, "CRASH frame %u %s+0x%llx\n", static_cast<unsigned>(i), frame_name,
-            static_cast<unsigned long long>(static_cast<const char*>(frames[i]) - reinterpret_cast<const char*>(frame_module)));
-    }
-    std::fflush(stderr);
-    return EXCEPTION_CONTINUE_SEARCH;
-}
-#endif
-
 int main(int argc, char** argv) {
     chunkdb::test::FeedPhaseWatchdog::SuppressWindowsDialogs();
 #ifdef _WIN32
-    g_main_thread = GetCurrentThreadId();
-    (void)SetUnhandledExceptionFilter(ReportCrash);
-
     (void)EnsureWinsockRuntime();
 #else
     (void)signal(SIGPIPE, SIG_IGN);
@@ -8720,10 +8679,6 @@ int main(int argc, char** argv) {
             } else
 #endif
             function();
-#ifdef _WIN32
-            // Diagnostics: a heap a test damaged is named here, not where the next test fails.
-            std::cerr << "HEAP " << (HeapValidate(GetProcessHeap(), 0, nullptr) ? "valid" : "damaged") << " after " << name << '\n';
-#endif
             RethrowBackgroundServerError();
             ++passed;
             std::cerr << "PASS " << name << '\n';
