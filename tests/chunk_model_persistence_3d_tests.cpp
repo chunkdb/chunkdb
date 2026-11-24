@@ -183,7 +183,7 @@ void Persistence(DurabilityMode mode, bool required) {
     assert(manifest.lineage->parent_epoch == epoch && manifest.lineage->fork_revision == cut);
     const auto slots = *ReadFeedSlotRecords(restored / "tables/t", manifest.store_id, 3U);
     assert(slots.dims == 3U && slots.slots.size() == 1U && slots.slots.front().written == cut);
-    assert(slots.slots.front().filters.areas == std::vector<FeedArea>{FeedArea{{-2, -1, -3}, {-1, 1, -1}, 3U}});
+    assert((slots.slots.front().filters.areas == std::vector<FeedArea>{FeedArea{{-2, -1, -3}, {-1, 1, -1}, 3U}}));
     {
         auto restored_config = config; restored_config.data_dir = restored;
         auto catalog = std::make_shared<TableCatalog>(restored_config);
