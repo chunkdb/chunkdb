@@ -526,6 +526,47 @@ void TestRefusedWritesReserveNothing() {
     }
 }
 
+// A parameter frame: the 64-bit value, little-endian.
+std::string Le(std::uint64_t value) {
+    std::string out;
+    for (std::size_t i = 0; i < 8U; ++i) out.push_back(static_cast<char>((value >> (8U * i)) & 0xffU));
+    return out;
+}
+
+// Computed values and IF conditions (SET BLOCK ... v = v + $1, IF <expr>)
+// meet the checks as plain values do; DELETE BLOCK IF is unaffected.
+void TestComputedAndConditionalWrites() {
+    ScopedTempDir dir("chunkdb-check-computed");
+    Engine e(dir.path());
+    Expect(e.Run("CREATE TABLE w (hp i16 CHECK (hp >= 0), max_hp i16 NULL) CHUNK 4 x 4") == "+OK\r\n", "create");
+    Expect(e.Run("SET BLOCK 0 0 IN w hp=5").front() == ':', "set");
+    Expect(e.Run("SET BLOCK 1 0 IN w hp=1").front() == ':', "set");
+    auto& store = e.catalog->Find("w")->Acquire()->store();
+    const auto version = store.GetChunkVersion(0, 0);
+    const auto minus = Le(static_cast<std::uint64_t>(std::int64_t{-10}));
+    ExpectFailed(e.Run("SET BLOCK 0 0 IN w hp = hp + $1", {minus}), "block (0, 0) fails CHECK hp_check");
+    ExpectFailed(e.Run("SET BLOCK 0 0 IN w hp = hp - 6 IF hp > 0"), "check=hp_check");
+    ExpectFailed(e.Run("SET BLOCK 0 0 IN w hp = -1 IF EXISTS"), "hp_check");
+    Expect(store.GetChunkVersion(0, 0) == version, "no version");
+    Expect(e.Run("GET BLOCK 0 0 FROM w COLUMNS hp") == "*1\r\n:5\r\n", "unchanged");
+    // The next write takes the version after the last one.
+    const auto applied = e.Run("SET BLOCK 0 0 IN w hp = hp + $1 IF hp > 0", {Le(2)});
+    Expect(applied == ":" + std::to_string(version + 1U) + "\r\n", "next version");
+    Expect(e.Run("GET BLOCK 0 0 FROM w COLUMNS hp") == "*1\r\n:7\r\n", "computed");
+    Expect(e.Run("DELETE BLOCK 1 0 FROM w IF hp < 5").front() == ':', "delete if");
+    Expect(e.Run("GET BLOCK 1 0 FROM w") == "_\r\n", "deleted");
+    Expect(e.Run("SET BLOCK 2 0 IN w hp=3").front() == ':', "set");
+    // Inside a transaction: refused at the statement, the rest commits.
+    Expect(e.Run("BEGIN") == "+OK\r\n", "begin");
+    ExpectFailed(e.Run("SET BLOCK 0 0 IN w hp = hp + $1", {minus}), "hp_check");
+    ExpectFailed(e.Run("SET BLOCK 0 0 IN w hp = hp - 8 IF hp > 0"), "hp_check");
+    Expect(e.Run("SET BLOCK 0 0 IN w hp = hp - 7 IF hp > 0") == "_\r\n", "txn computed");
+    Expect(e.Run("DELETE BLOCK 2 0 FROM w IF hp = 3") == "_\r\n", "txn delete if");
+    Expect(e.Run("COMMIT").front() == ':', "commit");
+    Expect(e.Run("GET BLOCK 0 0 FROM w COLUMNS hp") == "*1\r\n:0\r\n", "committed");
+    Expect(e.Run("GET BLOCK 2 0 FROM w") == "_\r\n", "deleted in transaction");
+}
+
 // What a crash during the scan leaves: the next start drops the check in
 // progress and the table keeps the checks it had.
 void TestInterruptedAddCheck() {
@@ -564,6 +605,7 @@ int main() {
     TestWritesDuringScan();
     TestChangedBlocksOnly();
     TestRefusedWritesReserveNothing();
+    TestComputedAndConditionalWrites();
     TestInterruptedAddCheck();
     return 0;
 }
