@@ -84,11 +84,11 @@ The server opens read-write and therefore refuses either of the first two unknow
 Table incompat bit 0 (`0x1`) enables durable feed slots, USER WAL metadata, and collection-frame flags; it remains set after slot removal.
 Directory and table incompat bit 5 (`0x20`), named `chunk_model`, owns dimensional geometry, both column domains, sectioned forms, and retained coordinate decisions.
 Directory and table incompat bit 6 (`0x40`) is reserved for commit groups, which this build does not provide: it never sets the bit, `ENABLE FEATURE` does not accept it, and a directory or table that records it is refused as an unknown feature.
-Earlier development envelopes are refused before artifact mutation; they require recreating the data directory.
+Envelopes of 1.x and of development builds of 2.0 are refused before any artifact changes; such a data directory must be recreated.
 
 Data-directory incompat bit 1 (`0x2`) enables named migrations.
 New directories enable every registered baseline feature before serving requests.
-Existing directories retain their masks until explicit `ENABLE FEATURE`; slot creation and migrations never enable missing bits.
+A directory keeps its masks until an explicit `ENABLE FEATURE`; slot creation and migrations never enable missing bits.
 An image's or WAL header's features must be a subset of its table manifest's features.
 Unknown option, image-section, WAL-TLV, or WAL-record types may be skipped only when an enclosing feature set has an unknown bit.
 WAL parsing also considers the manifest’s features.
@@ -138,7 +138,7 @@ Inactive z side lengths are 1, and inactive coordinates are zero.
 A complete empty `chunkdb.index` is durable before publishing the manifest or catalog name; a missing inventory is damage.
 Publication syncs a temporary file, uses no-replace rename or an exclusive hard link, and syncs the directory; replacements sync the new file and directory too.
 
-Schema/options changes and feed-feature activation replace the manifest atomically.
+Schema and option changes and feature activation replace the manifest atomically.
 Incorrect magic/version, reserved fields, sizes, checksum, geometry, identity, or schema refuse opening.
 
 Options use the same TLV layout as the root manifest:
@@ -157,7 +157,7 @@ Options use the same TLV layout as the root manifest:
 | 11 | completed fork revision `u64`, including zero | absent |
 | 13 | `expire_column`: block column ID `u32`, nonzero, of an unsigned 64-bit column | absent: no expiry |
 
-Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is retired and is not a known option.
+Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is not a known option.
 Type 13 is written only while the table has an `expire_column`; a manifest whose type 13 names no unsigned 64-bit block column, or one a pending narrowing changes, is refused, and so is any change that would write one.
 
 Types 10 and 11 belong to incompatibility feature `table_lineage` (`0x4`) and must appear together.
@@ -215,7 +215,6 @@ A step is `change_count:u32` (1–2048), then each change's `kind:u8` (1 add, 2 
 Kind 5 is an other-domain marker containing only its kind byte.
 Kinds 7 (add check) and 8 (drop check), block columns only, have `position:u32`, the index in the check list, and an encoded check instead of a column.
 A check is `name_length:u8`, a name under the column-name rule, `expression_length:u32` (at most 16384) and the condition's UTF-8 text.
-Builds without CHECK constraints refuse a schema area with these kinds or the tags 3 and 4 below.
 Both domains have the same revision; at every step exactly one domain changes columns and the other records that marker.
 
 The column is the added/dropped column or the post-rename/post-conversion column; position identifies its slot in the applicable column list.
@@ -375,7 +374,7 @@ The final variable state must obey the VARS presence, type, ordering, UTF-8, and
 A writer replays a valid image, or an empty state when none exists, followed by committed frames from its live WAL.
 A failed header is recoverable only with the interrupted-creation shape: an expected header prefix followed by zero bytes.
 Feature-byte differences are ignored.
-Incomplete CRC bytes are allowed after the first 56 header bytes match.
+Incomplete CRC bytes are allowed after the first `44 + 8 * dims` header bytes, everything before the checksum, match.
 
 Other invalid headers are damage; interrupted creation contributes no frames and can be removed.
 A trailing incomplete/bad-checksum frame can be discarded only when no later checksum-valid frame header exists.
@@ -420,7 +419,7 @@ The header is followed by 4096 ring entries, each containing four aligned native
 Writers serialize appends inside their odd snapshot bracket before changing artifacts; entries and cursor use mapped atomics, and the last guard's even publication orders their visibility with the artifacts.
 The file is replaced at writer startup, is never a durable authority and is omitted from backups.
 Readers require the same writer session, a retained interval of at most 4096 entries containing no invalidation, and equal-even observations around collection and publication; otherwise they perform full artifact admission.
-An absent file supports older writers through full admission, while a malformed present file fails validation.
+An absent file means full admission, while a malformed present file fails validation.
 
 A writer first takes an exclusive lock on `.chunkdb.lock/snapshot.owner`, which readers never open, so a second writer is refused.
 It then tests `.chunkdb.lock/snapshot.writer` with a shared lock, refusing an exclusive holder, and waits for its exclusive lock, which it holds through shutdown.
@@ -432,7 +431,7 @@ A dead writer's odd crash fence refuses read-only opening and reads while no wri
 A restarting writer takes the lease before it replaces `chunkdb.snapshot.live`; until then a reader can accept the dead session when its mapped counter is even, and reads the files as that writer left them.
 Rollback intents bound readable WAL prefixes; exhausted concurrent-snapshot retries fail without modifying files.
 Only volatile live metadata is rebuilt after a crash; actual data and WAL validation and durability are unchanged.
-Older readers that do not understand the live counter conservatively reject an open writer's odd fence; closed tables retain the checked CKSG encoding.
+Closed tables keep the checked CKSG encoding.
 
 ## Coordinate index and tombstones
 
@@ -515,7 +514,7 @@ The only header flag, `0x1`, is the filter format; it permits the filter flags `
 The owner flag needs no header flag or feature bit.
 The dimensions byte is 2 or 3 and must match the owning table.
 AREA stores the first active signed coordinates followed by the last active coordinates (x, y and, in a three-dimensional table, z); endpoints must be ordered.
-Format tags 1 to 3 are earlier development layouts and are refused; a writer writes only tag 4.
+Other format tags are refused; a writer writes only tag 4.
 
 Names are unique, 1–63 bytes matching `[a-z_][a-z0-9_]*`; every written revision is at or below the watermark, and epoch matches the table StoreId.
 Owners are user names with the same rule; a slot without an owner records the user of its first granted attach without ADMIN on `*`.
@@ -552,13 +551,14 @@ Live-history readers capture completed byte boundaries and read only the prefix 
 4. After each user's grants: `max_connections:u64`, `statements_per_sec:u64`, little-endian. Zero disables a limit; the rate is at most 65536.
 5. CRC32 over all preceding bytes, including the limits.
 
+The file is at most 64 MiB: the writer refuses a larger one, and readers check the file size before they read it.
+
 Before serialization or file replacement, the writer checks u16 name widths, salt lengths, u32 user/grant counts, SCRAM iterations (4096–1000000), known rights, the rate limit, and an added verifier with another salt or iteration count than the user's verifier, or with its keys. Invalid input leaves the existing file and directory metadata unchanged and does not create a new store.
 Writer serialization orders users by name, then table grants by name, then prefix grants by prefix; decoding refuses duplicate users/grants/verifiers, more than one added verifier, unknown flags/rights/version, bad checksum, truncation, or trailing bytes.
 Version 2 files have no added verifier count, flag bits 2..4 or prefix grants: they are read as users with one verifier, decoding refuses those bits and prefix grants in them, and the next change writes version 3.
 The writer refuses a salt outside that range or a name over 65535 bytes instead of shortening it; decoding also refuses user and table names that CREATE USER and GRANT refuse.
 Password verifiers contain no plaintext password; the secret derives unknown-user salts used by authentication.
-A build that reads version 3 but predates server rights and prefix grants refuses a file that uses them as unknown flags or an invalid table name; a build that reads only version 2 refuses every version 3 file.
-Earlier development users files are refused with a recreate error before permissions or bookkeeping change; they are not migrated.
+Users files before version 2 are refused with a recreate error before permissions or bookkeeping change; they are not migrated.
 The file is admitted independently of the catalog manifest, including standalone users stores.
 
 ## Named migrations
@@ -614,6 +614,8 @@ Completed copies use the same metadata/image/WAL formats and add `chunkdb.backup
 2. Each table: name length `u32` and name, epoch (16 bytes), completed revision cut `u64`.
 3. File count `u32`; each file: relative-path length `u32` and path, length `u64`, CRC32 `u32`.
 4. CRC32 over all preceding bytes.
+
+The record is at most 1 GiB: the writer refuses a larger one, and readers check the file size before they read it.
 
 Inventory paths use canonical `/` separators; absolute roots, drive names, backslashes, NUL, empty components, `.` and `..` are invalid before path conversion/access.
 The inventory includes root metadata, users/ledger when present, table definitions/history, and clocks above cuts.

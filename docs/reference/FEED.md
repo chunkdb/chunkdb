@@ -103,7 +103,7 @@ UNWATCH
 - `AREA ..., AREA ...`: WATCH without SLOT takes up to 64 areas with the same axes and keeps a chunk inside any of them; a slot keeps one AREA, and WATCH SLOT accepts several only when each repeats it.
 - `COLUMNS`: project block values in declared order; column IDs preserve the projection across renames, and chunk metadata remains complete.
 - `NO BEFORE`: omit previous block and chunk-metadata rows from mutation events.
-- `CHUNKS`: receive each relevant committed chunk's version and whole form instead of block changes.
+- `CHUNKS`: receive each relevant committed chunk's version and whole form instead of block changes; while the watch lags, repeated changes of a chunk merge (see [Notes](#notes)).
 - `OWNER`: the user the slot belongs to; it defaults to the user running CREATE SLOT, and the user need not exist yet.
 - `PREFIX`: list only slots whose names start with this quoted text, which follows the slot-name rule.
 - `epoch`: the table's identity; dropping and recreating a table changes it.
@@ -178,6 +178,12 @@ When a slot watch ends after losing access or exceeding an ACK or output deadlin
 After a crash, changes can repeat.
 Store the applied position atomically with your own output to prevent duplicate effects.
 
+A CHUNKS watch lags while the server has output for it that its connection has not taken yet.
+Its next pushes then merge into one `chunks` push, sent once that output is written: each chunk keeps its newest version and form, and the push takes the revision, `commit_time_ms` and `user` of the newest merged change.
+Applying a merged push gives the same table state as applying each change, and its revision covers all of them.
+A merged push stays within the watch's share and never spans a schema event; a watch that keeps up receives one push per change.
+For a slot, ACK of the merged revision acknowledges every merged change; after a reconnect from an earlier ACK, the slot sends those changes again.
+
 ## WATCH CATALOG
 
 WATCH CATALOG streams changes to tables, columns, users, grants and slots.
@@ -219,5 +225,4 @@ A partial frame or pinned TLS retry closes without injecting an error inside the
 A failure after slot metadata replacement returns `OUTCOME_UNKNOWN stage=slot_records`.
 Recover the table before retrying; its ACK or slot change may already be published.
 
-CREATE SLOT requires `feed_slots`; persisted filters also require `slot_filters`.
-[Enable missing features](TABLES.md#feature-activation) before creating a slot; these commands never activate features implicitly.
+CREATE SLOT requires `feed_slots`, and persisted filters `slot_filters`; every table a 2.0 build creates has both, and these commands never activate a feature; see [Feature activation](TABLES.md#feature-activation).

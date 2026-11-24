@@ -1153,6 +1153,8 @@ std::string CommandEngine::RenderMetrics() const {
     std::vector<TableRuntimeStats> tables;
     std::vector<MetricsRegistry::TableExpiryMetrics> expiry;
     const auto now = UnixMillisNow();
+    // The state gauges list every table by name, fenced ones out of service too.
+    std::vector<MetricsRegistry::TableState> states;
     for (const auto& info : catalog_->List()) {
         const auto table = catalog_->Find(info.name);
         if (table == nullptr) {
@@ -1163,14 +1165,24 @@ std::string CommandEngine::RenderMetrics() const {
             expiry.push_back({.table = info.name, .lag_ms = status->lag_ms, .expired_blocks = status->expired_blocks,
                 .failed_passes = status->failed_passes});
         }
+        auto& state = states.emplace_back(MetricsRegistry::TableState{.table = info.name, .fenced = false, .slot_frontier_frozen = std::nullopt});
         const auto lease = table->TryAcquire();
         if (!lease.has_value()) {
             continue;
         }
         tables.push_back(TableRuntimeStats{.table = info.name, .stats = lease->store().RuntimeStats()});
+        state.slot_frontier_frozen = table->SlotFrontierFrozen(*lease);
+    }
+    // Fences waits for no table.
+    for (const auto& fence : catalog_->Fences()) {
+        const auto at = std::lower_bound(states.begin(), states.end(), fence.table,
+            [](const MetricsRegistry::TableState& state, const std::string& name) { return state.table < name; });
+        if (at != states.end() && at->table == fence.table) at->fenced = true;
+        else states.insert(at, MetricsRegistry::TableState{.table = fence.table, .fenced = true, .slot_frontier_frozen = std::nullopt});
     }
     return metrics_->RenderPrometheus(tables, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()),
-        catalog_->resources().get(), expiry);
+               catalog_->resources().get(), expiry) +
+        MetricsRegistry::RenderTableStates(states);
 }
 
 

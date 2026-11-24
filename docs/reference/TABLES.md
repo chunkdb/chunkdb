@@ -1,4 +1,4 @@
-# CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SWAP TABLES, SHOW TABLES, DESCRIBE
+# CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SWAP TABLES, SHOW TABLES, DESCRIBE, SHOW STATUS, ENABLE FEATURE
 
 You define a table's columns, inspect its schema, and change or remove it.
 A schema defines the names, types, defaults, and nullability of its columns.
@@ -190,7 +190,6 @@ While either check runs, writes that the change would refuse are refused already
 A table restored from a backup taken during a check does not have the check, and keeps the column as it was before it.
 SET DEFAULT and DROP DEFAULT change only blocks created later; existing blocks keep their values.
 SET REQUIRED applies to new blocks only: existing blocks of a column that is not NULL always hold a value.
-The embedded bit-string calls (`ChunkStore::GetBlockBits` and the like) need a table whose one column is bits(N) and not NULL: SET NULL on that column, like ADD COLUMN, makes them refuse, and DROP NULL brings them back.
 You can add REQUIRED without DEFAULT only when no block is present.
 For chunk columns, adding REQUIRED without DEFAULT requires no written chunk identity, including retained tombstones.
 Block and chunk columns share the table's schema version; changing either domain advances it once.
@@ -200,6 +199,7 @@ A chunk with metadata differing from that baseline is populated even when it has
 At least one fixed-width column must remain.
 A text-only application can use `kind u1 DEFAULT 0` alongside its text column.
 DROP TABLE deletes its data, durable slots, and table-specific grants.
+It waits for a running backup to pin its tables and save their grants, so a backup holds the table with its grants or neither.
 Use [Migrations](MIGRATIONS.md) to record repeatable schema changes.
 
 SWAP TABLES exchanges two tables' names in one atomic step; data, epochs, lineage and durable slots stay with their tables, and grants stay with the names.
@@ -229,7 +229,7 @@ A failed feed cleanup fences its table, whose statements return INTERNAL `feed c
 A column narrowing whose last manifest change fails before it is written fences its table; a refused narrowing still returns its refusal.
 DESCRIBE of a fenced table shows the definition it served last; the change that fenced it may already be in its files.
 RECOVER TABLE does for one fenced table what a server start does for every table.
-It waits for the table's running statements and running backups, closes it, removes its interrupted creates and drops, drops an interrupted narrowing, DROP NULL or ADD CHECK, and opens it from its files.
+It waits for the table's running statements and running backups, closes it, removes its interrupted creates and drops, drops an interrupted narrowing, DROP NULL or ADD CHECK, and opens it from its files; a RESTORE TABLE still copying into the name keeps its copy.
 Watches of a table that leaves service end with INTERNAL; watch it again after RECOVER TABLE to resume.
 A table whose recovery fails stays fenced and out of service; a restart also recovers it.
 A migration with an unknown outcome fences every table; RECOVER TABLE refuses it, and only a restart completes it.
@@ -319,7 +319,7 @@ Its protected snapshot refuses unhealthy serving state instead of guessing wheth
 `ENABLE FEATURE 'name'` requires ADMIN on `*` and returns OK for an already enabled feature.
 
 New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, `feature_activation`, and `chunk_model`.
-Existing directories retain their recorded bits; enable `feature_activation` before another missing feature.
+A directory keeps its recorded bits; only ENABLE FEATURE adds one, and it refuses any other feature while the directory lacks `feature_activation`.
 Activation validates every table before recording its durable decision, then updates only that feature's registered owners.
 A fenced table refuses activation with its fenced message until RECOVER TABLE.
 An incomplete published activation fences serving until writer startup completes recovery.
