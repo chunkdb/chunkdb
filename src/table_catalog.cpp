@@ -734,8 +734,10 @@ std::vector<FeedSlot> Table::ListFeedSlots(const Lease& lease, bool include_lost
 
 Table::FeedCounts Table::CountFeeds(const Lease& lease) const {
     if (lease.table_ != this) throw std::logic_error("feed counts need a lease of their table");
-    // Subscriptions change only in exclusive sections, which wait for leases.
-    return FeedCounts{.slots = lease.store().feed_slots_->size(), .watches = feed_subscriptions_};
+    // Subscriptions and the feed change only in exclusive sections, which wait
+    // for leases.
+    return FeedCounts{.slots = lease.store().feed_slots_->size(), .watches = feed_subscriptions_,
+        .feed_bytes = feed_ ? feed_->bytes_.load(std::memory_order_relaxed) : 0U};
 }
 
 std::vector<std::uint32_t> Table::ResolveFeedColumns(const std::vector<std::string>& names) {

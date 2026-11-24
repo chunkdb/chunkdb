@@ -34,6 +34,7 @@
 #include <vector>
 
 #include "chunkdb/bit_codec.hpp"
+#include "chunkdb/chunk_columns.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
@@ -689,6 +690,42 @@ std::size_t ChunkStore::ApproxLoadedChunkCount() const {
         loaded += large_chunk->chunks.size();
     }
     return loaded;
+}
+
+std::uint64_t ChunkStore::LoadedChunkBytes(const std::function<void()>& check) const {
+    // One lock at a time, and one chunk referenced at a time: eviction skips a
+    // chunk someone else references.
+    std::vector<std::shared_ptr<LargeChunk>> large_chunks;
+    {
+        std::lock_guard global_lock(large_chunks_mutex_);
+        large_chunks.reserve(large_chunks_.size());
+        for (const auto& [_, large_chunk] : large_chunks_) large_chunks.push_back(large_chunk);
+    }
+    std::uint64_t bytes = 0U;
+    std::vector<ChunkCoord> coords;
+    for (const auto& large_chunk : large_chunks) {
+        coords.clear();
+        {
+            std::lock_guard chunk_lock(large_chunk->mutex);
+            coords.reserve(large_chunk->chunks.size());
+            for (const auto& [coord, _] : large_chunk->chunks) coords.push_back(coord);
+        }
+        for (const auto& coord : coords) {
+            if (check) check();
+            std::shared_ptr<RegularChunk> chunk;
+            {
+                std::lock_guard chunk_lock(large_chunk->mutex);
+                const auto it = large_chunk->chunks.find(coord);
+                if (it == large_chunk->chunks.end()) continue;
+                chunk = it->second;
+            }
+            std::shared_lock lock(chunk->mutex);
+            bytes += sizeof(RegularChunk) + chunk->payload.capacity() + chunk->presence_bitmap.capacity() +
+                chunk->vars.encoded_size() + (chunk->chunk_columns ? chunk->chunk_columns->bytes.size() : 0U) +
+                chunk->wal_batch.capacity();
+        }
+    }
+    return bytes;
 }
 
 StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {

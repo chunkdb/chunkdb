@@ -40,6 +40,7 @@
 #include "catalog_feed.hpp"
 #include "slot_watch.hpp"
 #include "feed_protocol.hpp"
+#include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
 #include "table_options_text.hpp"
 #include "user_registry.hpp"
@@ -524,6 +525,13 @@ void SetDefault(Column& column, const cql::Literal& literal) {
 struct FileUsage {
     std::uint64_t files = 0U;
     std::uint64_t bytes = 0U;
+    // Parts of `bytes`: checkpoint images and live WALs of the large-chunk
+    // directories, the feed archive, and the coordinate index files with the
+    // secondary indexes under `indexes/`.
+    std::uint64_t image_bytes = 0U;
+    std::uint64_t wal_bytes = 0U;
+    std::uint64_t archive_bytes = 0U;
+    std::uint64_t index_bytes = 0U;
 };
 
 // SHOW TABLE STATS: the regular files under table `table`'s directory and
@@ -534,10 +542,29 @@ struct FileUsage {
 [[nodiscard]] FileUsage DirectoryUsage(const std::filesystem::path& root, const std::string& table) {
     namespace fs = std::filesystem;
     const auto gone = [](const std::error_code& error) { return error == std::errc::no_such_file_or_directory; };
+    // Where a directory is (docs/STORAGE_FORMAT.md#directory-layout).
+    enum class Place { kRoot, kLarge, kArchive, kIndex, kOther };
+    const auto child = [](Place parent, const std::string& name) {
+        if (parent != Place::kRoot) return parent == Place::kLarge ? Place::kOther : parent;
+        if (name == kFeedArchiveDirName) return Place::kArchive;
+        if (name == "indexes") return Place::kIndex;
+        return name.starts_with("L_") ? Place::kLarge : Place::kOther;
+    };
+    const auto count = [](FileUsage& usage, Place place, const fs::path& file, std::uint64_t size) {
+        ++usage.files;
+        usage.bytes += size;
+        const auto extension = file.extension();
+        if (place == Place::kArchive) usage.archive_bytes += size;
+        else if (place == Place::kIndex) usage.index_bytes += size;
+        else if ((place == Place::kRoot || place == Place::kLarge) && file.filename() == "chunkdb.index")
+            usage.index_bytes += size;
+        else if (place == Place::kLarge && extension == ".chk") usage.image_bytes += size;
+        else if (place == Place::kLarge && extension == ".wal") usage.wal_bytes += size;
+    };
     FileUsage usage;
-    std::vector<fs::path> pending{root};
+    std::vector<std::pair<fs::path, Place>> pending{{root, Place::kRoot}};
     while (!pending.empty()) {
-        const fs::path dir = std::move(pending.back());
+        const auto [dir, place] = std::move(pending.back());
         pending.pop_back();
         std::error_code error;
         fs::directory_iterator it(dir, error);
@@ -546,13 +573,11 @@ struct FileUsage {
         for (const fs::directory_iterator end{}; !error && it != end; it.increment(error)) {
             CheckStatementCancellation();
             const auto status = it->symlink_status(error);
-            if (!error && fs::is_directory(status)) pending.push_back(it->path());
+            if (!error && fs::is_directory(status))
+                pending.emplace_back(it->path(), child(place, it->path().filename().string()));
             if (!error && fs::is_regular_file(status)) {
                 const auto size = fs::file_size(it->path(), error);
-                if (!error) {
-                    ++usage.files;
-                    usage.bytes += size;
-                }
+                if (!error) count(usage, place, it->path(), size);
             }
             if (error && !gone(error)) throw fs::filesystem_error("cannot read table files", it->path(), error);
             error.clear();
@@ -2449,7 +2474,7 @@ std::string CommandEngine::ExecuteStatement(
                         auto& store = lease.store();
                         feeds = session.table->CountFeeds(lease);
                         dir = store.data_dir();
-                        Protocol::AppendMapHeader(reply, 11U);
+                        Protocol::AppendMapHeader(reply, 19U);
                         Protocol::AppendBulk(reply, "epoch");
                         Protocol::AppendBulk(reply, StoreIdHex(store.store_id()));
                         Protocol::AppendBulk(reply, "revision");
@@ -2465,6 +2490,12 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendInteger(reply, store.RetainedDeletionFloor());
                         Protocol::AppendBulk(reply, "loaded_chunks");
                         Protocol::AppendInteger(reply, static_cast<std::uint64_t>(store.ApproxLoadedChunkCount()));
+                        Protocol::AppendBulk(reply, "cache_bytes");
+                        Protocol::AppendInteger(reply, store.LoadedChunkBytes([] { CheckStatementCancellation(); }));
+                        Protocol::AppendBulk(reply, "history_bytes");
+                        Protocol::AppendInteger(reply, static_cast<std::uint64_t>(store.TxnHistoryBytes()));
+                        Protocol::AppendBulk(reply, "open_transactions");
+                        Protocol::AppendInteger(reply, static_cast<std::uint64_t>(store.OpenTransactionCount()));
                     }
                     if (auto* hook = hook_.load(std::memory_order_acquire))
                         hook->Run(CommandEngineTestHook::Point::kBeforeTableStatsListing, stats.table);
@@ -2473,10 +2504,20 @@ std::string CommandEngine::ExecuteStatement(
                     Protocol::AppendInteger(reply, files.files);
                     Protocol::AppendBulk(reply, "disk_bytes");
                     Protocol::AppendInteger(reply, files.bytes);
+                    Protocol::AppendBulk(reply, "image_bytes");
+                    Protocol::AppendInteger(reply, files.image_bytes);
+                    Protocol::AppendBulk(reply, "wal_bytes");
+                    Protocol::AppendInteger(reply, files.wal_bytes);
+                    Protocol::AppendBulk(reply, "archive_bytes");
+                    Protocol::AppendInteger(reply, files.archive_bytes);
+                    Protocol::AppendBulk(reply, "index_bytes");
+                    Protocol::AppendInteger(reply, files.index_bytes);
                     Protocol::AppendBulk(reply, "slots");
                     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(feeds.slots));
                     Protocol::AppendBulk(reply, "watches");
                     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(feeds.watches));
+                    Protocol::AppendBulk(reply, "feed_bytes");
+                    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(feeds.feed_bytes));
                     return reply;
                 },
                 [&](const cql::ShowTables&) {

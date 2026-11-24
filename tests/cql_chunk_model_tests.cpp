@@ -300,7 +300,7 @@ void RetainedIdentityPermissionsAndAudit() {
     SessionState reader, admin;
     assert(test::LoginOnEngine(engine, reader, "reader", std::string("reader-password")).starts_with("%"));
     assert(test::LoginOnEngine(engine, admin, "admin", std::string("admin-password")).starts_with("%"));
-    assert(engine.Execute(reader, "SHOW TABLE STATS t\r\n").starts_with("%11\r\n"));
+    assert(engine.Execute(reader, "SHOW TABLE STATS t\r\n").starts_with("%19\r\n"));
     Error(engine.Execute(reader, "COMPACT TOMBSTONES t BEFORE 1\r\n"), "PERMISSION_DENIED");
     Reply(engine.Execute(admin, "BEGIN\r\n"), "+OK\r\n");
     Error(engine.Execute(admin, "COMPACT TOMBSTONES t BEFORE 1\r\n"), "INVALID_ARGUMENT");

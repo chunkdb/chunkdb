@@ -270,9 +270,11 @@ class Table : public std::enable_shared_from_this<Table> {
     struct FeedCounts {
         std::size_t slots = 0U;
         std::size_t watches = 0U;
+        std::size_t feed_bytes = 0U;
     };
-    // Durable slots, lost ones included, and open watches, slot watches
-    // included, under `lease`, a lease of this table.
+    // Durable slots, lost ones included, open watches, slot watches included,
+    // and the bytes the live feed buffers, under `lease`, a lease of this
+    // table.
     [[nodiscard]] FeedCounts CountFeeds(const Lease& lease) const;
     [[nodiscard]] std::vector<std::uint32_t> ResolveFeedColumns(const std::vector<std::string>& names);
     // Monotonic, in this epoch, and no higher than the durable frontier. The

@@ -1047,6 +1047,16 @@ class ChunkStore {
         const ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z) const;
 
     [[nodiscard]] std::size_t ApproxLoadedChunkCount() const;
+    // The memory of the loaded chunks: each one's bookkeeping, payload,
+    // presence, text and bytes values, chunk columns and WAL batch. It locks
+    // one loaded chunk at a time, under no other lock, so its cost grows with
+    // their number; `check` runs before each chunk and may throw to stop.
+    [[nodiscard]] std::uint64_t LoadedChunkBytes(const std::function<void()>& check = {}) const;
+    // The bytes of the chunk states kept for open transactions, and the
+    // transactions with a snapshot of this store (BeginTxnSnapshot) that
+    // neither ended nor were ended by a limit.
+    [[nodiscard]] std::size_t TxnHistoryBytes() const noexcept;
+    [[nodiscard]] std::size_t OpenTransactionCount() const;
     [[nodiscard]] StoreRuntimeStats RuntimeStats() const noexcept;
     // Commit time (Unix ms) of the chunk's last mutation, as loaded or set.
     [[nodiscard]] std::uint64_t ChunkCommitTimeForTests(std::int64_t chunk_x, std::int64_t chunk_y);

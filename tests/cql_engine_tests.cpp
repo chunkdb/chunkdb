@@ -1011,9 +1011,15 @@ std::uint64_t MapInteger(const std::string& reply, const std::string& key) {
 void TestTableStats() {
     Fixture f;
     const auto empty = f.Run("SHOW TABLE STATS plain");
-    assert(empty.starts_with("%11\r\n") && MapInteger(empty, "chunks") == 0U && MapInteger(empty, "loaded_chunks") == 0U);
+    assert(empty.starts_with("%19\r\n") && MapInteger(empty, "chunks") == 0U && MapInteger(empty, "loaded_chunks") == 0U);
     assert(MapInteger(empty, "slots") == 0U && MapInteger(empty, "watches") == 0U);
     assert(MapInteger(empty, "files") >= 1U && MapInteger(empty, "disk_bytes") > 0U); // Its manifest at least.
+    // No image, WAL, cached chunk, feed or transaction yet; the coordinate
+    // index inventory exists from creation.
+    assert(MapInteger(empty, "image_bytes") == 0U && MapInteger(empty, "wal_bytes") == 0U);
+    assert(MapInteger(empty, "index_bytes") > 0U && MapInteger(empty, "cache_bytes") == 0U);
+    assert(MapInteger(empty, "feed_bytes") == 0U && MapInteger(empty, "history_bytes") == 0U);
+    assert(MapInteger(empty, "open_transactions") == 0U);
     (void)VersionOf(f.Run("SET BLOCK 0 0 IN plain bits = b'000000000001'"));
     (void)VersionOf(f.Run("SET BLOCK 5 5 IN plain bits = b'000000000001'"));
     ExpectReply(f.Run("CREATE SLOT 'consumer' ON plain"), "+OK\r\n");
@@ -1022,8 +1028,28 @@ void TestTableStats() {
     assert(MapInteger(written, "chunks") == 2U && MapInteger(written, "loaded_chunks") == 2U);
     assert(MapInteger(written, "slots") == 1U && MapInteger(written, "watches") == 1U);
     assert(MapInteger(written, "files") > MapInteger(empty, "files") && MapInteger(written, "disk_bytes") > MapInteger(empty, "disk_bytes"));
+    assert(MapInteger(written, "image_bytes") + MapInteger(written, "wal_bytes") > 0U);
+    assert(MapInteger(written, "image_bytes") + MapInteger(written, "wal_bytes") + MapInteger(written, "archive_bytes") +
+            MapInteger(written, "index_bytes") <=
+        MapInteger(written, "disk_bytes"));
+    assert(MapInteger(written, "cache_bytes") > 0U);
+    // The live feed holds a change once its reader has it.
+    (void)VersionOf(f.Run("SET BLOCK 1 1 IN plain bits = b'000000000001'"));
+    assert(subscription->Next(std::chrono::seconds(10)) != nullptr);
+    assert(MapInteger(f.Run("SHOW TABLE STATS plain"), "feed_bytes") > 0U);
     subscription.reset();
     assert(MapInteger(f.Run("SHOW TABLE STATS plain"), "watches") == 0U);
+    // A transaction counts once it reads the table, and a write keeps for its
+    // snapshot the state it replaces.
+    chunkdb::SessionState reader;
+    ExpectReply(f.engine->Execute(reader, "HELLO 3\r\n").substr(0, 5), "%14\r\n");
+    ExpectReply(f.engine->Execute(reader, "BEGIN\r\n"), "+OK\r\n");
+    (void)f.engine->Execute(reader, "GET BLOCK 0 0 FROM plain\r\n");
+    assert(MapInteger(f.Run("SHOW TABLE STATS plain"), "open_transactions") == 1U);
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN plain bits = b'000000000011'"));
+    assert(MapInteger(f.Run("SHOW TABLE STATS plain"), "history_bytes") > 0U);
+    ExpectReply(f.engine->Execute(reader, "ROLLBACK\r\n"), "+OK\r\n");
+    assert(MapInteger(f.Run("SHOW TABLE STATS plain"), "open_transactions") == 0U);
     assert(MapInteger(f.Run("SHOW TABLE STATS world"), "chunks") == 0U);
     ExpectError(f.Run("SHOW TABLE STATS absent"), "NO_TABLE");
     // The listing stops when its statement is stopped.
