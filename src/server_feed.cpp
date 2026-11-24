@@ -114,6 +114,10 @@ std::shared_ptr<void> FeedDeliveryTestAccess::ReserveReplyCredit(ChunkServer& se
     if (auto io = server.IdleIoHandle()) return io->data_output_credit_->TryAcquire(bytes);
     return {};
 }
+std::shared_ptr<void> FeedDeliveryTestAccess::ReserveListingReplyCredit(ChunkServer& server, std::size_t bytes) {
+    if (auto io = server.IdleIoHandle()) return io->listing_output_credit_->TryAcquire(bytes);
+    return {};
+}
 std::optional<std::size_t> FeedDeliveryTestAccess::RequestLineCapacity(ChunkServer& server, std::uint64_t id) {
     std::lock_guard lock(server.connections_mutex_);
     const auto found = server.connections_.find(id);
