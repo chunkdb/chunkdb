@@ -3,6 +3,7 @@
 #include <stop_token>
 
 #include "feed_slots.hpp"
+#include "migrations_records.hpp"
 #include "restore_table_test_utils.hpp"
 #include "statement_control.hpp"
 #include "txn_test_utils.hpp"
