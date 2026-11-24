@@ -597,6 +597,13 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_user_registry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME user_registry COMMAND chunkdb_user_registry_test)
 
+    add_executable(chunkdb_admin_rebuild_version_clock_test tests/admin_rebuild_version_clock_tests.cpp)
+    target_link_libraries(chunkdb_admin_rebuild_version_clock_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_admin_rebuild_version_clock_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    # Runs the admin binary as a child process.
+    add_dependencies(chunkdb_admin_rebuild_version_clock_test chunkdb_admin)
+    add_test(NAME admin_rebuild_version_clock COMMAND chunkdb_admin_rebuild_version_clock_test $<TARGET_FILE:chunkdb_admin>)
+
     add_executable(chunkdb_user_admission_test tests/user_admission_tests.cpp)
     target_link_libraries(chunkdb_user_admission_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_user_admission_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1200,6 +1207,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_users_file_test
         chunkdb_file_permissions_test
         chunkdb_user_registry_test
+        chunkdb_admin_rebuild_version_clock_test
         chunkdb_users_engine_test
         chunkdb_chunk_image_test
         chunkdb_wal_format_test
