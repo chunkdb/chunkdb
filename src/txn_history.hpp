@@ -141,6 +141,12 @@ class TxnHistory {
     // acquires the history mutex nor enters storage from account callbacks.
     [[nodiscard]] const std::atomic<std::size_t>& KeptBytesCounter() const noexcept { return accounting_->bytes; }
     [[nodiscard]] std::size_t RegisteredCount() const;
+    // What writes paid to keep open snapshots: the chunk states they copied
+    // and those states' bytes with their bookkeeping, whether or not a
+    // snapshot still needed them when the write published. Read without the
+    // history lock.
+    [[nodiscard]] std::uint64_t CopiedStates() const noexcept { return copied_states_.load(std::memory_order_relaxed); }
+    [[nodiscard]] std::uint64_t CopiedBytes() const noexcept { return copied_bytes_.load(std::memory_order_relaxed); }
 
     void ArmPauseForTests(TxnPausePoint point);
     [[nodiscard]] bool WaitForPauseForTests(TxnPausePoint point);
@@ -168,6 +174,10 @@ class TxnHistory {
     std::atomic<std::uint64_t> open_count_{0};
 
     mutable std::mutex mutex_;
+    // Written only under mutex_, beside it, so a write that keeps a state
+    // adds no shared read-modify-write; read without it.
+    std::atomic<std::uint64_t> copied_states_{0};
+    std::atomic<std::uint64_t> copied_bytes_{0};
     std::multimap<std::uint64_t, TxnSnapshot*> by_version_;
     std::multimap<std::chrono::steady_clock::time_point, TxnSnapshot*> by_deadline_;
     KeptByChunk kept_;

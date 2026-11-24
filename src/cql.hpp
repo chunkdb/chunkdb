@@ -370,7 +370,10 @@ struct GrantRight {
 };
 struct ShowUsers {};
 // Transactions (docs/design/TRANSACTIONS_DESIGN.md).
-struct Begin {};
+// BEGIN READ ONLY: reads only, without a read set (docs/reference/TRANSACTION_STATEMENTS.md).
+struct Begin {
+    bool read_only = false;
+};
 struct Commit {};
 struct Rollback {};
 // The populated chunks of table, ordered by every active coordinate axis.
