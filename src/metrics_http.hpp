@@ -20,7 +20,8 @@ namespace server_detail {
 inline constexpr std::size_t kMetricsMaxRequestBytes = 8192;
 
 // The most connections the metrics listener holds at once; a new connection
-// past it closes the oldest one.
+// past it closes the oldest one that has its response, else the oldest one
+// still reading its head, else the oldest one.
 inline constexpr std::size_t kMetricsMaxConnections = 16;
 
 // The complete HTTP response to one request head (without its terminating

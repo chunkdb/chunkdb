@@ -395,11 +395,12 @@ void ChunkServer::Run() {
             if (!ParkClient(connection)) CloseClient(*connection);
         }
 
-        metrics_port_.store(0, std::memory_order_release);
-        metrics_listener_.reset();
         (void)StopRunning();
         RequestBackupStop();
         (void)ShutdownActiveClients();
+        // After the statements are cancelled, so that no scrape waits for one.
+        metrics_port_.store(0, std::memory_order_release);
+        metrics_listener_.reset();
         {
             std::lock_guard lock(lifecycle_mutex_);
             listen_socket_ = kInvalidSocket;
@@ -422,11 +423,12 @@ void ChunkServer::Run() {
             "server run loop failed",
             {{"error", e.what()}});
         note_run_failed();
-        metrics_port_.store(0, std::memory_order_release);
-        metrics_listener_.reset();
         (void)StopRunning();
         RequestBackupStop();
         (void)ShutdownActiveClients();
+        // After the statements are cancelled, so that no scrape waits for one.
+        metrics_port_.store(0, std::memory_order_release);
+        metrics_listener_.reset();
         if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
             hook->Run(FeedDeliveryTestHook::Point::kAfterRunPendingStop, 0U);
         JoinWorkers();

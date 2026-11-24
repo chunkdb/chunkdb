@@ -119,21 +119,24 @@ On Windows, rename the file and restart the server; until then it keeps writing 
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--metrics-listen` | unset | `host:port`, with an IPv6 host in brackets such as `[::1]:9100`, where a listener of its own serves `GET /metrics` over plain HTTP; unset, no HTTP listener is opened. |
+| `--metrics-listen` | unset | `host:port`, with an IPv6 host in brackets such as `[::1]:14242`, where a listener of its own serves `GET /metrics` over plain HTTP; unset, no HTTP listener is opened. |
 | `--metrics-allow-remote` | off | Boolean switch allowing `--metrics-listen` on an address that is not loopback; it needs `--metrics-listen`. |
 
 `GET /metrics` returns the [SHOW METRICS](reference/SERVER.md) text with `Content-Type: text/plain; version=0.0.4`; a query string is ignored.
 The endpoint has no authentication and no TLS, and anyone who reaches it reads the metrics, table names included; bind it to a loopback or private address, or put a TLS proxy in front of it.
 On an address outside 127.0.0.0/8 and `::1`, the server does not start unless `--metrics-allow-remote` is given.
 The listener has its own thread: it takes no statement worker and does not count toward the client connection limits.
-It waits on all its connections at once, so a slow client delays no other scrape; it closes each connection after one response, and past 16 open connections a new one closes the oldest.
+It waits on all its connections at once, so a slow client delays no other scrape; it closes each connection after one response, and past 16 open connections a new one closes the oldest connection that has its response, else the oldest still sending its request, else the oldest.
+After an accept failure such as too many open files, the listener stops accepting for 250 ms.
 The request line and headers must arrive within `--client-io-timeout-ms` of the connection and fit in 8192 bytes; otherwise the reply is `408` or `431`.
 A response not written within `--client-io-timeout-ms` closes the connection.
-Other paths get `404`, other methods on `/metrics` get `405` with `Allow: GET`, and a malformed request gets `400`.
+If the listener fails, the server logs `metrics listener stopped` and closes the metrics port; client connections are not affected.
+`HEAD /metrics` returns the headers of `GET /metrics`.
+Other paths get `404`, other methods on `/metrics` get `405` with `Allow: GET, HEAD`, and a malformed request gets `400`.
 
 ```sh
-chunkdb_server --metrics-listen 127.0.0.1:9100
-curl -s http://127.0.0.1:9100/metrics
+chunkdb_server --metrics-listen 127.0.0.1:14242
+curl -s http://127.0.0.1:14242/metrics
 ```
 
 ## Directory and shared resources

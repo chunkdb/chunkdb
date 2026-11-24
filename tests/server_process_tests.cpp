@@ -641,8 +641,8 @@ void TestMetricsListenFlag(const std::string& binary) {
     chunkdb::test::ScopedTempDir dir("chunkdb-process-metrics");
     const auto log = dir.path() / "server.log";
     const auto data = dir.path() / "data";
-    for (const char* value : {"9100", "127.0.0.1", "127.0.0.1:", ":9100", "127.0.0.1:0", "127.0.0.1:65536",
-                              "127.0.0.1:x", "::1:9100", "[::1]9100", "[::1]", ""}) {
+    for (const char* value : {"14242", "127.0.0.1", "127.0.0.1:", ":14242", "127.0.0.1:0", "127.0.0.1:65536",
+                              "127.0.0.1:x", "::1:14242", "[::1]14242", "[::1]", ""}) {
         const auto error =
             StartupFailure(binary, log, {"--data-dir", data.string(), "--auth", "none", "--metrics-listen", value});
         assert(error.find("invalid --metrics-listen") != std::string::npos);

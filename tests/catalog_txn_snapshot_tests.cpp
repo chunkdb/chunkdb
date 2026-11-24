@@ -38,6 +38,9 @@ struct CatalogTxnTestAccess {
     static auto Pause(Table& table) {
         return table.PauseAdmission(std::chrono::steady_clock::now() + std::chrono::seconds{10}, {});
     }
+    static void SetFailed(Table& table, bool failed) {
+        table.state_.store(failed ? Table::State::kFailed : Table::State::kOpen, std::memory_order_seq_cst);
+    }
     static std::size_t ActiveLeases(const Table& table) {
         return table.active_leases_.load(std::memory_order_seq_cst);
     }
@@ -406,9 +409,42 @@ void CohortsDuringBackgroundCheckpointFiles() {
     assert(engine.Execute(session, "HELLO 3\r\n").starts_with("%"));
     assert(engine.Execute(session, "GET BLOCK 0 0 FROM t\r\n").find(replaced) != std::string::npos);
 }
+// SHOW METRICS leaves out a table that an exclusive statement waits for, or
+// one that failed, instead of waiting for it or failing.
+void MetricsSkipBusyAndFailedTables() {
+    test::ScopedTempDir directory("chunkdb-catalog-metrics-busy");
+    auto catalog = std::make_shared<TableCatalog>(Config(directory.path()));
+    CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
+    SessionState admin;
+    const auto run = [&](const std::string& command) { return engine.Execute(admin, command + "\r\n"); };
+    assert(run("HELLO 3").starts_with("%"));
+    assert(run("CREATE TABLE a (n u8 DEFAULT 0) CHUNK 1 x 1") == "+OK\r\n");
+    assert(run("CREATE TABLE b (n u8 DEFAULT 0) CHUNK 1 x 1") == "+OK\r\n");
+    const auto table = catalog->Require("a");
+    auto lease = table->Acquire();
+    auto alter = std::async(std::launch::async, [&] { return run("ALTER TABLE a SET checkpoint_updates = 3"); });
+    CatalogTxnTestAccess::WaitPaused(*table);
+    auto render = std::async(std::launch::async, [&] { return engine.RenderMetrics(); });
+    const bool prompt = render.wait_for(5s) == std::future_status::ready;
+    lease.reset();
+    assert(prompt);
+    const auto busy = render.get();
+    assert(busy.find("table=\"a\"") == std::string::npos);
+    assert(busy.find("chunkdb_checkpoints_total{table=\"b\"} ") != std::string::npos);
+    assert(alter.get() == "+OK\r\n");
+    assert(engine.RenderMetrics().find("chunkdb_checkpoints_total{table=\"a\"} ") != std::string::npos);
+
+    CatalogTxnTestAccess::SetFailed(*table, true);
+    std::string failed;
+    try { failed = engine.RenderMetrics(); } catch (const std::exception&) {}
+    CatalogTxnTestAccess::SetFailed(*table, false);
+    assert(failed.find("table=\"a\"") == std::string::npos);
+    assert(failed.find("chunkdb_checkpoints_total{table=\"b\"} ") != std::string::npos);
+}
 }  // namespace
 
 int main() {
+    MetricsSkipBusyAndFailedTables();
     CommonCutKeepsFeedAttached();
     CancelledPauseRestoresAdmission(false);
     CancelledPauseRestoresAdmission(true);

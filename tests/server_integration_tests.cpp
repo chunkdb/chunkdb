@@ -4572,6 +4572,45 @@ void TestMetricsListen() {
     assert(scrape("GET /status HTTP/1.1\r\n\r\n").rfind("HTTP/1.1 404 Not Found\r\n", 0) == 0);
 }
 
+// While ALTER TABLE waits for a lease to drain, a scrape answers at once
+// without that table, and the server stops without waiting for either.
+void TestMetricsListenBusyTable() {
+    auto server_cfg = BaseServerConfig();
+    server_cfg.metrics_listen = true;
+    ServerHarness harness("metrics-busy", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
+                          server_cfg);
+    const auto port = harness.server->MetricsPort();
+    const auto table = harness.catalog->Find("default");
+    assert(table != nullptr);
+    auto lease = table->Acquire();
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    client.SendLine("ALTER TABLE default SET checkpoint_updates = 3");
+    // The table is busy once a lease can no longer be taken without waiting.
+    const auto busy_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (table->TryAcquire().has_value()) {
+        assert(std::chrono::steady_clock::now() < busy_deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    auto scrape = std::async(std::launch::async, [port] {
+        RawClient http("127.0.0.1", port);
+        http.SendBytes("GET /metrics HTTP/1.1\r\n\r\n");
+        (void)http.WaitForClose(std::chrono::seconds(30));
+        return http.Received();
+    });
+    const bool scraped = scrape.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    auto stop = std::async(std::launch::async, [&harness] { harness.server->Stop(); harness.JoinStopped(); });
+    const bool stopped = stop.wait_for(std::chrono::seconds(15)) == std::future_status::ready;
+    lease.reset();
+    stop.get();
+    assert(scraped && stopped);
+    const auto response = scrape.get();
+    assert(response.rfind("HTTP/1.1 200 OK\r\n", 0) == 0);
+    assert(response.find("table=\"default\"") == std::string::npos);
+    assert(response.find("chunkdb_commands_total") != std::string::npos);
+}
+
 // The runtime counters: those SHOW METRICS exports are read over the wire,
 // the eviction details it does not export from the store.
 void TestMetricsRuntimeCounters() {
@@ -8468,6 +8507,7 @@ int main(int argc, char** argv) {
         run("TestMaxAuthFailuresDisconnects", TestMaxAuthFailuresDisconnects);
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
         run("TestMetricsListen", TestMetricsListen);
+        run("TestMetricsListenBusyTable", TestMetricsListenBusyTable);
         run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestTlsHandshakeDeadlineReleasesWorker", TestTlsHandshakeDeadlineReleasesWorker);

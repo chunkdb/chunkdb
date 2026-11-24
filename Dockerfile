@@ -56,11 +56,11 @@ USER chunkdb
 EXPOSE 4242
 VOLUME ["/var/lib/chunkdb"]
 
-# The probe needs no credential: it reads GET /metrics from the
-# --metrics-listen address on the container's loopback, or sends HELLO 3
-# when the arguments have no --metrics-listen.
+# The probe needs no credential: it sends HELLO 3 to port 4242 and, when
+# the arguments have --metrics-listen, also reads GET /metrics from that
+# address on the container's loopback.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD ["/usr/local/bin/chunkdb-healthcheck"]
 
 ENTRYPOINT ["/usr/local/bin/chunkdb-entrypoint"]
-CMD ["--listen-uri", "chunk://0.0.0.0:4242/", "--data-dir", "/var/lib/chunkdb/data", "--backup-dir", "/var/lib/chunkdb/backups", "--durability", "relaxed", "--workers", "4", "--metrics-listen", "127.0.0.1:9100"]
+CMD ["--listen-uri", "chunk://0.0.0.0:4242/", "--data-dir", "/var/lib/chunkdb/data", "--backup-dir", "/var/lib/chunkdb/backups", "--durability", "relaxed", "--workers", "4", "--metrics-listen", "127.0.0.1:14242"]

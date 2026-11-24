@@ -955,6 +955,13 @@ std::optional<Table::Lease> Table::Acquire() {
     }
 }
 
+std::optional<Table::Lease> Table::TryAcquire() {
+    active_leases_.fetch_add(1, std::memory_order_seq_cst);
+    if (state_.load(std::memory_order_seq_cst) == State::kOpen) return Lease(this, store_.get());
+    ReleaseLease();
+    return std::nullopt;
+}
+
 void Table::ReleaseLease() noexcept {
     if (active_leases_.fetch_sub(1, std::memory_order_seq_cst) == 1 &&
         state_.load(std::memory_order_seq_cst) == State::kBusy) {

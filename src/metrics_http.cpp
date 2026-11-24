@@ -107,6 +107,19 @@ long Send(SocketHandle socket_fd, const char* data, std::size_t size) {
 #endif
 }
 
+// How long the listener stops accepting after accept fails for a reason
+// other than a closed connection, such as EMFILE.
+constexpr std::chrono::milliseconds kAcceptPause{250};
+
+// Whether accept failed only because the client closed the connection first.
+bool IsAbortedAccept(int code) {
+#ifdef _WIN32
+    return code == WSAECONNRESET;
+#else
+    return code == ECONNABORTED;
+#endif
+}
+
 // Whether a failed nonblocking call only has to wait for readiness again.
 bool ShouldRetry(int code) {
 #ifdef _WIN32
@@ -150,10 +163,13 @@ std::string MetricsHttpResponse(std::string_view head, const std::function<std::
     if (target.substr(0, target.find('?')) != "/metrics") {
         return ErrorResponse("404 Not Found");
     }
-    if (method != "GET") {
-        return ErrorResponse("405 Method Not Allowed", "Allow: GET\r\n");
+    if (method != "GET" && method != "HEAD") {
+        return ErrorResponse("405 Method Not Allowed", "Allow: GET, HEAD\r\n");
     }
-    return Response("200 OK", "text/plain; version=0.0.4; charset=utf-8", {}, render());
+    auto response = Response("200 OK", "text/plain; version=0.0.4; charset=utf-8", {}, render());
+    // HEAD: the headers GET would send, Content-Length included.
+    if (method == "HEAD") response.resize(response.find("\r\n\r\n") + 4U);
+    return response;
 }
 
 
@@ -197,7 +213,7 @@ MetricsHttpListener::~MetricsHttpListener() {
     running_.store(false, std::memory_order_release);
     poller_->Wake();
     if (thread_.joinable()) thread_.join();
-    CloseSocket(listen_socket_);
+    if (listen_socket_ != kInvalidSocket) CloseSocket(listen_socket_);
 }
 
 void MetricsHttpListener::Loop() {
@@ -205,6 +221,20 @@ void MetricsHttpListener::Loop() {
     // In the order they were accepted.
     std::vector<Connection> connections;
     std::vector<SocketInterest> interests;
+    // The connection a new one displaces: one whose response is written,
+    // else one still reading its head, else the oldest; each the oldest of
+    // its kind.
+    const auto eviction_victim = [&] {
+        for (const auto phase : {Connection::Phase::kDrain, Connection::Phase::kRead}) {
+            const auto found = std::find_if(connections.begin(), connections.end(),
+                [phase](const Connection& connection) { return connection.phase == phase; });
+            if (found != connections.end()) return found;
+        }
+        return connections.begin();
+    };
+    auto accept_paused_until = Clock::time_point::min();
+    bool accept_failing = false;
+    std::string failure;
     const auto respond = [&](Connection* connection, std::string response) {
         connection->response = std::move(response);
         connection->written = 0;
@@ -244,9 +274,14 @@ void MetricsHttpListener::Loop() {
             }
             close_finished(keep);
 
+            // After an accept failure such as EMFILE the pending connection
+            // stays queued and the socket stays readable, so the listen
+            // socket is left out of the wait until accept_paused_until.
+            const bool accepting = now >= accept_paused_until;
             interests.clear();
-            interests.push_back({listen_socket_, POLLIN, 0});
-            auto next_deadline = Clock::time_point::max();
+            if (accepting) interests.push_back({listen_socket_, POLLIN, 0});
+            const std::size_t first = interests.size();
+            auto next_deadline = accepting ? Clock::time_point::max() : accept_paused_until;
             for (const auto& connection : connections) {
                 const short events = connection.phase == Connection::Phase::kWrite ? POLLOUT : POLLIN;
                 interests.push_back({connection.socket, events, 0});
@@ -261,16 +296,27 @@ void MetricsHttpListener::Loop() {
 
             keep.assign(connections.size(), true);
             for (std::size_t i = 0; i < connections.size(); ++i) {
-                if (interests[i + 1U].ready != 0) keep[i] = Advance(&connections[i]);
+                if (interests[i + first].ready != 0) keep[i] = Advance(&connections[i]);
             }
             close_finished(keep);
 
-            if (interests[0].ready == 0) continue;
+            if (!accepting || interests[0].ready == 0) continue;
             // Accepts what is waiting, up to one full set of connections per
             // pass.
             for (std::size_t accepted = 0; accepted < kMetricsMaxConnections; ++accepted) {
                 const SocketHandle client = accept(listen_socket_, nullptr, nullptr);
-                if (client == kInvalidSocket) break;
+                if (client == kInvalidSocket) {
+                    const int code = CurrentSocketErrorCode();
+                    if (ShouldRetry(code) || IsAbortedAccept(code)) break;
+                    if (!accept_failing) {
+                        LogMessage(LogLevel::kWarn, LogComponent::kServer, "metrics listener cannot accept",
+                                   {{"error", FormatSocketError(code)}});
+                    }
+                    accept_failing = true;
+                    accept_paused_until = Clock::now() + kAcceptPause;
+                    break;
+                }
+                accept_failing = false;
                 std::string error;
                 if (!SetSocketNonBlocking(client, true, &error)) {
                     CloseSocket(client);
@@ -281,8 +327,9 @@ void MetricsHttpListener::Loop() {
                 (void)setsockopt(client, SOL_SOCKET, SO_NOSIGPIPE, &on, sizeof(on));
 #endif
                 if (connections.size() >= kMetricsMaxConnections) {
-                    CloseSocket(connections.front().socket);
-                    connections.erase(connections.begin());
+                    const auto victim = eviction_victim();
+                    CloseSocket(victim->socket);
+                    connections.erase(victim);
                 }
                 Connection connection;
                 connection.socket = client;
@@ -291,7 +338,17 @@ void MetricsHttpListener::Loop() {
             }
         }
     } catch (const std::exception& error) {
-        LogMessage(LogLevel::kError, LogComponent::kServer, "metrics listener stopped", {{"error", error.what()}});
+        failure = *error.what() != 0 ? error.what() : "unknown error";
+    } catch (...) {
+        failure = "unknown error";
+    }
+    if (!failure.empty()) {
+        // Nothing serves the port any more: close it, before the connections,
+        // so that scrapes are refused instead of queued.
+        CloseSocket(listen_socket_);
+        listen_socket_ = kInvalidSocket;
+        LogMessage(LogLevel::kError, LogComponent::kServer, "metrics listener stopped; GET /metrics is no longer served",
+                   {{"error", failure}});
     }
     for (const auto& connection : connections) CloseSocket(connection.socket);
 }

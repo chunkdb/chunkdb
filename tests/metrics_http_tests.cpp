@@ -3,6 +3,7 @@
 
 #include "metrics_http.hpp"
 
+#include <algorithm>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -14,6 +15,12 @@
 #include <string_view>
 #include <thread>
 #include <vector>
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <sys/resource.h>
+#include <unistd.h>
+#endif
 
 namespace {
 
@@ -65,8 +72,9 @@ class Client {
 #endif
     }
 
-    // Everything the server sends until it closes, within 10 seconds.
-    std::string ReadUntilClose() {
+    // Everything the server sends until it closes, within 10 seconds; with
+    // `allow_reset`, until it closes or resets the connection.
+    std::string ReadUntilClose(bool allow_reset = false) {
         const auto deadline = Clock::now() + std::chrono::seconds(10);
         std::string all;
         char buffer[4096];
@@ -82,6 +90,7 @@ class Client {
 #else
             const auto n = recv(socket_, buffer, sizeof(buffer), 0);
 #endif
+            if (n < 0 && allow_reset && IsSocketPeerCloseError(CurrentSocketErrorCode())) return all;
             assert(n >= 0);
             if (n == 0) return all;
             all.append(buffer, static_cast<std::size_t>(n));
@@ -121,7 +130,7 @@ struct Rendering {
 void TestResponses() {
     Rendering rendering;
     const auto render = rendering.Function();
-    const auto ok = MetricsHttpResponse("GET /metrics HTTP/1.1\r\nHost: localhost:9100\r\nAccept: */*", render);
+    const auto ok = MetricsHttpResponse("GET /metrics HTTP/1.1\r\nHost: localhost:14242\r\nAccept: */*", render);
     assert(StatusLine(ok) == "HTTP/1.1 200 OK");
     assert(ok.find("\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n") != std::string::npos);
     assert(ok.find("\r\nContent-Length: " + std::to_string(kBody.size()) + "\r\n") != std::string::npos);
@@ -129,7 +138,12 @@ void TestResponses() {
     assert(BodyOf(ok) == kBody);
     assert(StatusLine(MetricsHttpResponse("GET /metrics?name[]=x HTTP/1.0", render)) == "HTTP/1.1 200 OK");
     assert(StatusLine(MetricsHttpResponse("GET /metrics HTTP/1.1\nHost: x", render)) == "HTTP/1.1 200 OK");
-    assert(rendering.calls.load() == 3);
+    // HEAD: the same headers, no body.
+    const auto head_only = MetricsHttpResponse("HEAD /metrics HTTP/1.1\r\nHost: x", render);
+    assert(StatusLine(head_only) == "HTTP/1.1 200 OK");
+    assert(head_only.find("\r\nContent-Length: " + std::to_string(kBody.size()) + "\r\n") != std::string::npos);
+    assert(head_only.ends_with("\r\n\r\n") && BodyOf(head_only).empty());
+    assert(rendering.calls.load() == 4);
 
     for (const char* head : {"GET / HTTP/1.1", "GET /metricsx HTTP/1.1", "GET /metrics/ HTTP/1.1",
                              "GET /other HTTP/1.1", "POST /other HTTP/1.1"}) {
@@ -137,10 +151,10 @@ void TestResponses() {
         assert(StatusLine(response) == "HTTP/1.1 404 Not Found");
         assert(BodyOf(response) == "404 Not Found\n");
     }
-    for (const char* head : {"POST /metrics HTTP/1.1", "HEAD /metrics HTTP/1.1", "PUT /metrics?x HTTP/1.0"}) {
+    for (const char* head : {"POST /metrics HTTP/1.1", "OPTIONS /metrics HTTP/1.1", "PUT /metrics?x HTTP/1.0"}) {
         const auto response = MetricsHttpResponse(head, render);
         assert(StatusLine(response) == "HTTP/1.1 405 Method Not Allowed");
-        assert(response.find("\r\nAllow: GET\r\n") != std::string::npos);
+        assert(response.find("\r\nAllow: GET, HEAD\r\n") != std::string::npos);
     }
     for (const char* head : {"", "GARBAGE", "GET /metrics", "GET  /metrics HTTP/1.1", "GET /metrics HTTP/1.1 extra",
                              "get /metrics HTTP/1.1", "GET metrics HTTP/1.1", "GET /metrics HTTP/2.0",
@@ -148,7 +162,7 @@ void TestResponses() {
         assert(StatusLine(MetricsHttpResponse(head, render)) == "HTTP/1.1 400 Bad Request");
     }
     // Refused requests do not render the metrics.
-    assert(rendering.calls.load() == 3);
+    assert(rendering.calls.load() == 4);
 }
 
 void TestScrapeOverSocket() {
@@ -297,6 +311,111 @@ void TestStopWithClients() {
     assert(StatusLine(partial.ReadUntilClose()).empty());
 }
 
+void WaitFor(const std::function<bool()>& condition) {
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    while (!condition()) {
+        assert(Clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
+// Past the cap, a connection still reading its head is closed before one
+// whose response is being written.
+void TestEvictionKeepsResponses() {
+    // More than the socket buffers hold, so the response stays in writing
+    // while its client does not read.
+    const std::string large(32U << 20U, 'x');
+    std::atomic<int> calls{0};
+    MetricsHttpListener listener("127.0.0.1", 0, false, 60000, [&] {
+        calls.fetch_add(1);
+        return large;
+    });
+    Client writing(listener.port());
+    writing.Send("GET /metrics HTTP/1.1\r\n\r\n");
+    WaitFor([&] { return calls.load() == 1; });
+    std::vector<std::unique_ptr<Client>> idle;
+    for (std::size_t i = 0; i + 1U < kMetricsMaxConnections; ++i) {
+        idle.push_back(std::make_unique<Client>(listener.port()));
+    }
+    Client extra(listener.port());
+    assert(idle.front()->ReadUntilClose().empty());
+    const auto response = writing.ReadUntilClose();
+    assert(StatusLine(response) == "HTTP/1.1 200 OK");
+    assert(BodyOf(response).size() == large.size());
+}
+
+#ifndef _WIN32
+double CpuSeconds() {
+    rusage usage{};
+    assert(getrusage(RUSAGE_SELF, &usage) == 0);
+    const auto seconds = [](const timeval& value) {
+        return static_cast<double>(value.tv_sec) + static_cast<double>(value.tv_usec) / 1e6;
+    };
+    return seconds(usage.ru_utime) + seconds(usage.ru_stime);
+}
+
+// When accept fails with EMFILE, the pending connection keeps the listen
+// socket readable; the listener pauses accepting instead of spinning, and
+// serves the connection once descriptors are free.
+void TestAcceptFailureDoesNotSpin() {
+    Rendering rendering;
+    MetricsHttpListener listener("127.0.0.1", 0, false, 5000, rendering.Function());
+    rlimit saved{};
+    assert(getrlimit(RLIMIT_NOFILE, &saved) == 0);
+    rlimit lowered = saved;
+    lowered.rlim_cur = std::min<rlim_t>(saved.rlim_cur, 128);
+    assert(setrlimit(RLIMIT_NOFILE, &lowered) == 0);
+    std::vector<int> fillers;
+    for (;;) {
+        const int fd = open("/dev/null", O_RDONLY);
+        if (fd < 0) break;
+        fillers.push_back(fd);
+    }
+    assert(!fillers.empty());
+    close(fillers.back());
+    fillers.pop_back();
+    {
+        // Takes the last free descriptor; the listener has none to accept it.
+        Client client(listener.port());
+        client.Send("GET /metrics HTTP/1.1\r\n\r\n");
+        const double cpu_before = CpuSeconds();
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        const double cpu_used = CpuSeconds() - cpu_before;
+        for (const int fd : fillers) close(fd);
+        assert(setrlimit(RLIMIT_NOFILE, &saved) == 0);
+        assert(cpu_used < 0.5);
+        // Linux keeps the connection queued and serves it; macOS resets it
+        // when accept fails.
+        const auto first = client.ReadUntilClose(true);
+#ifdef __linux__
+        assert(!first.empty());
+#endif
+        assert(first.empty() || StatusLine(first) == "HTTP/1.1 200 OK");
+    }
+    assert(StatusLine(Exchange(listener.port(), "GET /metrics HTTP/1.1\r\n\r\n")) == "HTTP/1.1 200 OK");
+}
+#endif
+
+// A failure that ends the listener's thread closes its port, so a scrape is
+// refused instead of waiting in the backlog.
+void TestFailureClosesPort() {
+    MetricsHttpListener listener("127.0.0.1", 0, false, 5000, []() -> std::string { throw 42; });
+    {
+        Client client(listener.port());
+        client.Send("GET /metrics HTTP/1.1\r\n\r\n");
+        assert(client.ReadUntilClose().empty());
+    }
+    // The port was closed before the connection.
+    const SocketHandle probe = socket(AF_INET, SOCK_STREAM, 0);
+    assert(probe != kInvalidSocket);
+    sockaddr_in address{};
+    address.sin_family = AF_INET;
+    address.sin_port = htons(listener.port());
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    assert(connect(probe, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0);
+    CloseSocket(probe);
+}
+
 void TestBindRefusals() {
     Rendering rendering;
     bool refused = false;
@@ -321,6 +440,11 @@ int main() {
     TestConcurrentScrapes();
     TestConnectionCap();
     TestStopWithClients();
+    TestEvictionKeepsResponses();
+#ifndef _WIN32
+    TestAcceptFailureDoesNotSpin();
+#endif
+    TestFailureClosesPort();
     TestBindRefusals();
     std::puts("metrics_http tests passed");
     return 0;

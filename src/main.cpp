@@ -110,11 +110,11 @@ std::string ReadSecretFile(const std::string& path, const char* what) {
     return secret;
 }
 
-// `value` as host:port, with an IPv6 host in brackets ([::1]:9100).
+// `value` as host:port, with an IPv6 host in brackets ([::1]:14242).
 std::pair<std::string, std::uint16_t> ParseHostPort(const std::string& value, const char* flag) {
     const auto refuse = [&]() {
         return std::invalid_argument(std::string("invalid ") + flag + ": " + value +
-                                     " (expected host:port, such as 127.0.0.1:9100)");
+                                     " (expected host:port, such as 127.0.0.1:14242)");
     };
     std::string host;
     std::string port;

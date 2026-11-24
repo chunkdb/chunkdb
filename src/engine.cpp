@@ -1119,14 +1119,16 @@ std::string CommandEngine::HandleMetrics() const {
 }
 
 std::string CommandEngine::RenderMetrics() const {
-    // Store counters per table; the cache is shared by them.
+    // Store counters per table; the cache is shared by them. A table that is
+    // not open, such as one an exclusive statement holds or waits for, or one
+    // that failed, is left out rather than waited for.
     std::vector<TableRuntimeStats> tables;
     for (const auto& info : catalog_->List()) {
         const auto table = catalog_->Find(info.name);
         if (table == nullptr) {
             continue;
         }
-        const auto lease = table->Acquire();
+        const auto lease = table->TryAcquire();
         if (!lease.has_value()) {
             continue;
         }
