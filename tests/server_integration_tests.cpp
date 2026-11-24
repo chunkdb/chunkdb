@@ -4555,92 +4555,6 @@ void TestMaxAuthFailuresDisconnects() {
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
-// The runtime counters: those SHOW METRICS exports are read over the wire,
-// the eviction details it does not export from the store.
-void TestMetricsRuntimeCounters() {
-    auto store_cfg = BaseStoreConfig();
-    store_cfg.max_loaded_chunks = 8;
-    store_cfg.wal_group_commit_updates = 64;
-    store_cfg.checkpoint_update_interval = 10'000;
-    store_cfg.checkpoint_wal_bytes = 10'000'000;
-    auto engine_cfg = chunkdb::EngineConfig{
-        .require_auth = false,
-        .max_auth_failures = 5,
-    };
-    auto server_cfg = BaseServerConfig();
-
-    ServerHarness harness("info-counters", store_cfg, engine_cfg, server_cfg);
-    RawClient client("127.0.0.1", harness.port);
-    client.Hello();
-    const auto read_metrics = [&client]() {
-        client.SendLine("SHOW METRICS");
-        return ParseMetrics(client.ReadBulkText());
-    };
-    const auto store_stats = [&harness]() {
-        const auto lease = harness.catalog->Find("default")->Acquire();
-        assert(lease.has_value());
-        return lease->store().RuntimeStats();
-    };
-
-    for (int i = 0; i < 64; ++i) {
-        client.SendLine(
-            "SET BLOCK " + std::to_string(i * static_cast<int>(store_cfg.geometry.chunk_width_blocks)) +
-            " 0 IN default bits = b'1010'");
-        (void)ReadVersion(client);
-    }
-    client.SendLine("GET BLOCK 0 0 FROM default");
-    assert(client.ReadReply() == BitsReply("\x05"));
-
-    const auto metrics_first = read_metrics();
-    const auto stats_first = store_stats();
-    for (const char* name :
-         {"chunkdb_loaded_chunks", "chunkdb_evictions_total", "chunkdb_checkpoints_total",
-          "chunkdb_wal_batch_flushes_total", "chunkdb_unique_loaded_chunks_total", "chunkdb_open_wal_streams"}) {
-        assert(metrics_first.contains(name));
-    }
-    assert(std::string(chunkdb::ChunkLockModeName()) == ExpectedChunkLockMode());
-
-    const auto loaded_chunks_first = std::stoull(metrics_first.at("chunkdb_loaded_chunks"));
-    const auto unique_loaded_chunks_first = std::stoull(metrics_first.at("chunkdb_unique_loaded_chunks_total"));
-    const auto evictions_first = std::stoull(metrics_first.at("chunkdb_evictions_total"));
-    const auto checkpoints_first = std::stoull(metrics_first.at("chunkdb_checkpoints_total"));
-    const auto wal_batch_flushes_first = std::stoull(metrics_first.at("chunkdb_wal_batch_flushes_total"));
-    const auto open_wal_streams_first = std::stoull(metrics_first.at("chunkdb_open_wal_streams"));
-
-    assert(loaded_chunks_first >= 1);
-    assert(unique_loaded_chunks_first >= loaded_chunks_first);
-    assert(evictions_first > 0);
-    assert(stats_first.eviction_probes >= evictions_first);
-    assert(stats_first.eviction_forced_wal_flushes > 0);
-    assert(
-        stats_first.eviction_forced_wal_flushes ==
-        stats_first.eviction_forced_wal_flushes_with_data + stats_first.eviction_forced_wal_flushes_empty_batch);
-
-    for (int i = 64; i < 96; ++i) {
-        client.SendLine(
-            "SET BLOCK " + std::to_string(i * static_cast<int>(store_cfg.geometry.chunk_width_blocks)) +
-            " 0 IN default bits = b'0101'");
-        (void)ReadVersion(client);
-    }
-
-    const auto metrics_second = read_metrics();
-    const auto stats_second = store_stats();
-
-    assert(std::stoull(metrics_second.at("chunkdb_evictions_total")) >= evictions_first);
-    assert(std::stoull(metrics_second.at("chunkdb_checkpoints_total")) >= checkpoints_first);
-    assert(std::stoull(metrics_second.at("chunkdb_wal_batch_flushes_total")) >= wal_batch_flushes_first);
-    assert(std::stoull(metrics_second.at("chunkdb_open_wal_streams")) >= open_wal_streams_first);
-    assert(stats_second.eviction_snapshot_builds >= stats_first.eviction_snapshot_builds);
-    assert(stats_second.eviction_probes >= stats_first.eviction_probes);
-    assert(stats_second.eviction_no_progress_cycles >= stats_first.eviction_no_progress_cycles);
-    assert(stats_second.eviction_forced_wal_flushes >= stats_first.eviction_forced_wal_flushes);
-    assert(
-        stats_second.eviction_forced_wal_flushes ==
-        stats_second.eviction_forced_wal_flushes_with_data + stats_second.eviction_forced_wal_flushes_empty_batch);
-    assert(stats_second.eviction_forced_wal_flushes_with_data >= stats_first.eviction_forced_wal_flushes_with_data);
-    assert(stats_second.eviction_forced_wal_flushes_empty_batch >= stats_first.eviction_forced_wal_flushes_empty_batch);
-}
-
 // Calls Stop on the Run thread at one point of Run's startup.
 class StopAtStartupHook : public chunkdb::FeedDeliveryTestHook {
   public:
@@ -4682,6 +4596,127 @@ void TestStopDuringStartup() {
         }
         RemoveAllWithRetry(store_cfg.data_dir);
     }
+}
+
+// While ALTER TABLE waits for a lease to drain, SHOW METRICS answers at once
+// without that table, and the server stops without waiting for either.
+void TestShowMetricsBusyTable() {
+    ServerHarness harness("metrics-busy", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
+                          BaseServerConfig());
+    const auto table = harness.catalog->Find("default");
+    assert(table != nullptr);
+    auto lease = table->Acquire();
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    client.SendLine("ALTER TABLE default SET checkpoint_updates = 3");
+    // The table is busy once a lease can no longer be taken without waiting.
+    const auto busy_deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+    while (table->TryAcquire().has_value()) {
+        assert(std::chrono::steady_clock::now() < busy_deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+
+    RawClient monitor("127.0.0.1", harness.port);
+    monitor.Hello();
+    auto scrape = std::async(std::launch::async, [&monitor] {
+        monitor.SendLine("SHOW METRICS");
+        return monitor.ReadBulkText();
+    });
+    const bool scraped = scrape.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
+    auto stop = std::async(std::launch::async, [&harness] { harness.server->Stop(); harness.JoinStopped(); });
+    const bool stopped = stop.wait_for(std::chrono::seconds(15)) == std::future_status::ready;
+    lease.reset();
+    stop.get();
+    assert(scraped && stopped);
+    const auto response = scrape.get();
+    assert(response.find("table=\"default\"") == std::string::npos);
+    assert(response.find("chunkdb_commands_total") != std::string::npos);
+}
+
+// The runtime counters: those SHOW METRICS exports are read over the wire,
+// the eviction details it does not export from the store.
+void TestMetricsRuntimeCounters() {
+    auto store_cfg = BaseStoreConfig();
+    store_cfg.max_loaded_chunks = 8;
+    store_cfg.wal_group_commit_updates = 64;
+    store_cfg.checkpoint_update_interval = 10'000;
+    store_cfg.checkpoint_wal_bytes = 10'000'000;
+    auto engine_cfg = chunkdb::EngineConfig{
+        .require_auth = false,
+        .max_auth_failures = 5,
+    };
+    auto server_cfg = BaseServerConfig();
+
+    ServerHarness harness("info-counters", store_cfg, engine_cfg, server_cfg);
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    const auto read_metrics = [&client]() {
+        client.SendLine("SHOW METRICS");
+        return ParseMetrics(client.ReadBulkText());
+    };
+    const auto store_stats = [&harness]() {
+        const auto lease = harness.catalog->Find("default")->Acquire();
+        assert(lease.has_value());
+        return lease->store().RuntimeStats();
+    };
+
+    for (int i = 0; i < 64; ++i) {
+        client.SendLine(
+            "SET BLOCK " + std::to_string(i * static_cast<int>(store_cfg.geometry.chunk_width_blocks)) +
+            " 0 IN default bits = b'1010'");
+        (void)ReadVersion(client);
+    }
+    client.SendLine("GET BLOCK 0 0 FROM default");
+    assert(client.ReadReply() == BitsReply("\x05"));
+
+    const auto metrics_first = read_metrics();
+    const auto stats_first = store_stats();
+    for (const char* name :
+         {"chunkdb_loaded_chunks", "chunkdb_evictions_total{table=\"default\"}", "chunkdb_checkpoints_total{table=\"default\"}",
+          "chunkdb_wal_batch_flushes_total{table=\"default\"}", "chunkdb_unique_loaded_chunks_total{table=\"default\"}", "chunkdb_open_wal_streams{table=\"default\"}"}) {
+        assert(metrics_first.contains(name));
+    }
+    assert(std::string(chunkdb::ChunkLockModeName()) == ExpectedChunkLockMode());
+
+    const auto loaded_chunks_first = std::stoull(metrics_first.at("chunkdb_loaded_chunks"));
+    const auto unique_loaded_chunks_first = std::stoull(metrics_first.at("chunkdb_unique_loaded_chunks_total{table=\"default\"}"));
+    const auto evictions_first = std::stoull(metrics_first.at("chunkdb_evictions_total{table=\"default\"}"));
+    const auto checkpoints_first = std::stoull(metrics_first.at("chunkdb_checkpoints_total{table=\"default\"}"));
+    const auto wal_batch_flushes_first = std::stoull(metrics_first.at("chunkdb_wal_batch_flushes_total{table=\"default\"}"));
+    const auto open_wal_streams_first = std::stoull(metrics_first.at("chunkdb_open_wal_streams{table=\"default\"}"));
+
+    assert(loaded_chunks_first >= 1);
+    assert(unique_loaded_chunks_first >= loaded_chunks_first);
+    assert(evictions_first > 0);
+    assert(stats_first.eviction_probes >= evictions_first);
+    assert(stats_first.eviction_forced_wal_flushes > 0);
+    assert(
+        stats_first.eviction_forced_wal_flushes ==
+        stats_first.eviction_forced_wal_flushes_with_data + stats_first.eviction_forced_wal_flushes_empty_batch);
+
+    for (int i = 64; i < 96; ++i) {
+        client.SendLine(
+            "SET BLOCK " + std::to_string(i * static_cast<int>(store_cfg.geometry.chunk_width_blocks)) +
+            " 0 IN default bits = b'0101'");
+        (void)ReadVersion(client);
+    }
+
+    const auto metrics_second = read_metrics();
+    const auto stats_second = store_stats();
+
+    assert(std::stoull(metrics_second.at("chunkdb_evictions_total{table=\"default\"}")) >= evictions_first);
+    assert(std::stoull(metrics_second.at("chunkdb_checkpoints_total{table=\"default\"}")) >= checkpoints_first);
+    assert(std::stoull(metrics_second.at("chunkdb_wal_batch_flushes_total{table=\"default\"}")) >= wal_batch_flushes_first);
+    assert(std::stoull(metrics_second.at("chunkdb_open_wal_streams{table=\"default\"}")) >= open_wal_streams_first);
+    assert(stats_second.eviction_snapshot_builds >= stats_first.eviction_snapshot_builds);
+    assert(stats_second.eviction_probes >= stats_first.eviction_probes);
+    assert(stats_second.eviction_no_progress_cycles >= stats_first.eviction_no_progress_cycles);
+    assert(stats_second.eviction_forced_wal_flushes >= stats_first.eviction_forced_wal_flushes);
+    assert(
+        stats_second.eviction_forced_wal_flushes ==
+        stats_second.eviction_forced_wal_flushes_with_data + stats_second.eviction_forced_wal_flushes_empty_batch);
+    assert(stats_second.eviction_forced_wal_flushes_with_data >= stats_first.eviction_forced_wal_flushes_with_data);
+    assert(stats_second.eviction_forced_wal_flushes_empty_batch >= stats_first.eviction_forced_wal_flushes_empty_batch);
 }
 
 void TestSlowClientTimeoutReleasesWorker() {
@@ -5839,10 +5874,11 @@ void TestReplyAdmissionPrecedesMutation() {
 // deadline. GET CHUNK, GET AREA and SCAN CHUNKS WITH DATA replies larger than
 // the socket buffers are written from their continuation in pieces of at most
 // 64 KiB. `header` is the first byte of the reply; `reads_per_tick` 4 KiB
-// reads every 50 ms keep it steady.
+// reads every 50 ms keep it steady. `setup`, when given, prepares the data
+// in place of the default table's block.
 void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false,
     const std::string& query = "GET CHUNK 0 0 FROM default", char header = '$', std::size_t block_bits = 512U,
-    int reads_per_tick = 256) {
+    int reads_per_tick = 256, const std::function<void(ServerHarness&)>& setup = {}) {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
     struct QueueHook final : chunkdb::FeedDeliveryTestHook {
         chunkdb::ChunkServer* server = nullptr;
@@ -5905,7 +5941,9 @@ void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false,
         QueueHook& hook;
         ~ReleaseHook() { hook.Release(); }
     } release{hook};
-    {
+    if (setup) {
+        setup(harness);
+    } else {
         auto lease = harness.catalog->Find("default")->Acquire();
         lease->store().SetBlockBits(0, 0, std::string(block_bits, '0'));
     }
@@ -6749,6 +6787,33 @@ template <typename Client> void TestWatchDefaultProgress(bool tls) {
         assert(event.type == '+' && event.value == "OK"); break;
     }
     assert(watch.ReadLine() == "+PONG\r\n");
+}
+
+// Lines sent in the same packet as WATCH are read by the watch stream: the
+// first one other than UNWATCH ends it, and each closed watch frees its count.
+template <typename Client> void TestWatchPipelinedLines(bool tls) {
+    auto config = BaseServerConfig(); config.tls_enabled = tls;
+    config.max_watches = 2U;
+    config.feed_progress_ms = 60000U; // No progress frame precedes the refusal.
+    ServerHarness harness(tls ? "watch-pipelined-tls" : "watch-pipelined", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    for (int round = 0; round < 3; ++round) {
+        Client pipelined("127.0.0.1", harness.port); pipelined.SetReadDeadline(std::chrono::seconds(10)); pipelined.Hello();
+        pipelined.SendBytes("WATCH default\r\nPING\r\nPING\r\nWATCH default\r\nUNWATCH\r\n");
+        assert(!FeedStart(ReadFeedReply(pipelined)).empty());
+        assert(pipelined.ReadLine().rfind("-ERR PROTOCOL", 0) == 0);
+        assert(pipelined.WaitForClose(std::chrono::seconds(10)));
+    }
+    // UNWATCH in the same packet ends the watch, and the next line runs as a statement.
+    Client returned("127.0.0.1", harness.port); returned.SetReadDeadline(std::chrono::seconds(10)); returned.Hello();
+    returned.SendBytes("WATCH default\r\nUNWATCH\r\nPING\r\n");
+    assert(!FeedStart(ReadFeedReply(returned)).empty());
+    assert(returned.ReadLine() == "+OK\r\n" && returned.ReadLine() == "+PONG\r\n");
+    // Every closed or ended watch released its count: both watches are free.
+    Client first("127.0.0.1", harness.port); first.SetReadDeadline(std::chrono::seconds(10)); first.Hello();
+    first.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(first)).empty());
+    Client second("127.0.0.1", harness.port); second.SetReadDeadline(std::chrono::seconds(10)); second.Hello();
+    second.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(second)).empty());
 }
 
 void TestWatchPositionsAndRights() {
@@ -7802,6 +7867,7 @@ void TestFeedWatch() {
     run("TestWatchLinger<RawClient>(false, false, true)", [] { TestWatchLinger<RawClient>(false, false, true); });
     run("TestWatchLinger<RawClient>(false, false, false, true)", [] { TestWatchLinger<RawClient>(false, false, false, true); });
     run("TestWatchProtocol<RawClient>(false)", [] { TestWatchProtocol<RawClient>(false); });
+    run("TestWatchPipelinedLines<RawClient>(false)", [] { TestWatchPipelinedLines<RawClient>(false); });
     run("TestWatchNoIdle<RawClient>(false)", [] { TestWatchNoIdle<RawClient>(false); });
     run("TestWatchPositionsAndRights()", [] { TestWatchPositionsAndRights(); });
     run("TestWatchSlowReader<RawClient>(false)", [] { TestWatchSlowReader<RawClient>(false); });
@@ -7811,6 +7877,7 @@ void TestFeedWatch() {
     run("TestWatchLinger<TlsClient>(true, false, true)", [] { TestWatchLinger<TlsClient>(true, false, true); });
     run("TestWatchLinger<TlsClient>(true, false, false, true)", [] { TestWatchLinger<TlsClient>(true, false, false, true); });
     run("TestWatchProtocol<TlsClient>(true)", [] { TestWatchProtocol<TlsClient>(true); });
+    run("TestWatchPipelinedLines<TlsClient>(true)", [] { TestWatchPipelinedLines<TlsClient>(true); });
     run("TestWatchNoIdle<TlsClient>(true)", [] { TestWatchNoIdle<TlsClient>(true); });
     run("TestWatchSlowReader<TlsClient>(true)", [] { TestWatchSlowReader<TlsClient>(true); });
 #endif
@@ -8494,6 +8561,7 @@ int main(int argc, char** argv) {
         run("TestPipelinedBadRequestDisconnectPolicy", TestPipelinedBadRequestDisconnectPolicy);
         run("TestMaxAuthFailuresDisconnects", TestMaxAuthFailuresDisconnects);
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
+        run("TestShowMetricsBusyTable", TestShowMetricsBusyTable);
         run("TestStopDuringStartup", TestStopDuringStartup);
         run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL
@@ -8557,6 +8625,22 @@ int main(int argc, char** argv) {
         });
         run("TestSteadyScanReaderRenewsReplyProgressDeadline", [] {
             TestSteadyReaderRenewsReplyProgressDeadline(false, "SCAN CHUNKS FROM default WITH DATA", '%', 256U, 128);
+        });
+        // A 48 MiB RETURNING row, written after the write's lock is released.
+        run("TestSteadyReturningReaderRenewsReplyProgressDeadline", [] {
+            TestSteadyReaderRenewsReplyProgressDeadline(false, "SET BLOCK 0 0 IN wide f = 1 RETURNING OLD *", '%', 256U, 128,
+                [](ServerHarness& harness) {
+                    chunkdb::SessionState writer;
+                    (void)harness.engine->Execute(writer, "HELLO 3");
+                    assert(harness.engine->Execute(writer, "CREATE TABLE wide (f u8, b0 bytes(16777216) NULL, "
+                        "b1 bytes(16777216) NULL, b2 bytes(16777216) NULL) CHUNK 1 x 1") == "+OK\r\n");
+                    assert(harness.engine->Execute(writer, "ALTER TABLE wide SET var_max_chunk_bytes = 67108864") == "+OK\r\n");
+                    for (char column = '0'; column <= '2'; ++column) {
+                        const std::vector<std::optional<std::string>> value{std::string(16777216U, column)};
+                        assert(harness.engine->Execute(writer, std::string("SET BLOCK 0 0 IN wide b") + column + " = $1",
+                            value).starts_with(':'));
+                    }
+                });
         });
         run("TestAreaReturnsLargestChunkWithinBound", TestAreaReturnsLargestChunkWithinBound);
         run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);

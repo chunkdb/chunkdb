@@ -26,6 +26,7 @@
 #include "user_registry.hpp"
 #include "statement_control.hpp"
 #include "table_options_text.hpp"
+#include "returning.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -212,35 +213,6 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
         throw std::invalid_argument("unknown table option '" + std::string(key) + "'");
     }
 }
-namespace {
-
-void AddRuntimeStats(StoreRuntimeStats* total, const StoreRuntimeStats& add) {
-    total->evictions += add.evictions;
-    total->checkpoints += add.checkpoints;
-    total->wal_batch_flushes += add.wal_batch_flushes;
-    total->unique_loaded_chunks += add.unique_loaded_chunks;
-    total->open_wal_streams += add.open_wal_streams;
-    total->eviction_snapshot_builds += add.eviction_snapshot_builds;
-    total->eviction_probes += add.eviction_probes;
-    total->eviction_no_progress_cycles += add.eviction_no_progress_cycles;
-    total->eviction_forced_wal_flushes += add.eviction_forced_wal_flushes;
-    total->eviction_forced_wal_flushes_with_data += add.eviction_forced_wal_flushes_with_data;
-    total->eviction_forced_wal_flushes_empty_batch += add.eviction_forced_wal_flushes_empty_batch;
-    total->eviction_recency_skips += add.eviction_recency_skips;
-    total->empty_chunk_gcs += add.empty_chunk_gcs;
-    total->wal_barriers += add.wal_barriers;
-    total->wal_barrier_full_syncs += add.wal_barrier_full_syncs;
-    total->background_checkpoints += add.background_checkpoints;
-    total->background_checkpoint_failures += add.background_checkpoint_failures;
-    total->background_queue_full_inline += add.background_queue_full_inline;
-    total->background_queue_depth += add.background_queue_depth;
-    total->compressed_checkpoint_images += add.compressed_checkpoint_images;
-    total->txn_history_copies += add.txn_history_copies;
-    total->txn_history_copied_bytes += add.txn_history_copied_bytes;
-    total->txn_history_bytes += add.txn_history_bytes;
-}
-
-}  // namespace
 
 CommandEngine::CommandEngine(
     EngineConfig config,
@@ -433,7 +405,7 @@ std::string CommandEngine::Execute(
         response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr,
             continuation, reserve_reply);
     }
-    ObserveReply(command_class, started, response);
+    ObserveReply(command_class, started, response, std::exchange(session.refused_write, std::string_view{}));
     if (logged && info.verb != nullptr) {
         LogStatement(session, info, started, response);
     }
@@ -594,10 +566,11 @@ void CommandEngine::AuditLogin(
 void CommandEngine::ObserveReply(
     MetricsRegistry::CommandClass command_class,
     std::chrono::steady_clock::time_point started,
-    const std::string& response) {
+    const std::string& response,
+    std::string_view refusal) {
     const auto elapsed = std::chrono::steady_clock::now() - started;
 
-    const bool ok = response.empty() || response[0] != '-';
+    const bool ok = refusal.empty() && (response.empty() || response[0] != '-');
     metrics_->ObserveCommand(
         command_class,
         std::chrono::duration<double>(elapsed).count(),
@@ -606,7 +579,9 @@ void CommandEngine::ObserveReply(
         // Error frames look like "-ERR <CODE> <message>\r\n".
         std::string_view code = response;
         constexpr std::string_view kErrPrefix = "-ERR ";
-        if (code.rfind(kErrPrefix, 0) == 0) {
+        if (!refusal.empty()) {
+            code = refusal;
+        } else if (code.rfind(kErrPrefix, 0) == 0) {
             code.remove_prefix(kErrPrefix.size());
             const auto code_end = code.find_first_of(" \r\n");
             if (code_end != std::string_view::npos) {
@@ -895,6 +870,10 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
             return Protocol::Error("INVALID_ARGUMENT", std::string(error.what()) + "; use DESCRIBE <table> to check column names");
         return Protocol::Error("INVALID_ARGUMENT", error.what());
     }
+    if (const auto* returning = dynamic_cast<const ReturningLimitError*>(&error); returning != nullptr) {
+        return Protocol::Error("OUT_OF_RANGE", error.what(), {{"reason", "returning_limit"},
+            {"bound", returning->limit_name()}, {"limit", std::to_string(returning->limit())}});
+    }
     if (const auto* area = dynamic_cast<const AreaEntryTooLargeError*>(&error); area != nullptr) {
         std::string chunk = std::to_string(area->coord().x) + "," + std::to_string(area->coord().y);
         if (area->dims() == 3U) chunk += "," + std::to_string(area->coord().z);
@@ -1100,7 +1079,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 13);
+    Protocol::AppendArrayHeader(reply, 14);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -1114,6 +1093,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "area_paging");
     Protocol::AppendBulk(reply, "area_scale");
     Protocol::AppendBulk(reply, "read_only_transactions");
+    Protocol::AppendBulk(reply, "returning");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 2U : 1U);
     entry("statement_timeout_ms", session.hello_options.statement_timeout_ms.value_or(session.default_statement_timeout_ms));
@@ -1140,7 +1120,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     entry("txn_max_written_chunks", limits.txn_max_written_chunks);
     entry("txn_max_read_chunks", limits.txn_max_read_chunks);
     entry("max_watches", session.max_watches);
-    entry("max_returning_rows", 65536U);
+    entry("max_returning_rows", kMaxReturningRows);
     entry("max_expression_nodes", 256U);
     return reply;
 }
@@ -1151,21 +1131,27 @@ std::size_t CommandEngine::AuthFailureTrackedSourcesForTests() {
 }
 
 std::string CommandEngine::HandleMetrics() const {
-    // Store counters summed over all tables; the cache is shared by them.
-    StoreRuntimeStats total;
+    return Protocol::Bulk(RenderMetrics());
+}
+
+std::string CommandEngine::RenderMetrics() const {
+    // Store counters per table; the cache is shared by them. A table that is
+    // not open, such as one an exclusive statement holds or waits for, or one
+    // that failed, is left out rather than waited for.
+    std::vector<TableRuntimeStats> tables;
     for (const auto& info : catalog_->List()) {
         const auto table = catalog_->Find(info.name);
         if (table == nullptr) {
             continue;
         }
-        const auto lease = table->Acquire();
+        const auto lease = table->TryAcquire();
         if (!lease.has_value()) {
             continue;
         }
-        AddRuntimeStats(&total, lease->store().RuntimeStats());
+        tables.push_back(TableRuntimeStats{.table = info.name, .stats = lease->store().RuntimeStats()});
     }
-    return Protocol::Bulk(metrics_->RenderPrometheus(
-        total, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get()));
+    return metrics_->RenderPrometheus(
+        tables, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get());
 }
 
 

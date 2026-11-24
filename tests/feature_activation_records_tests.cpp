@@ -465,7 +465,7 @@ int main(int argc, char** argv) {
                 catch (const WriteOutcomeUnknownError& error) {
                     assert(error.stage() == "feature_activation" && !ReadFeatureActivationJournal(argv[2]));
                     Reject([&] { (void)catalog.FeatureStatus(); }, "feature activation completion");
-                    std::_Exit(86);
+                    ExitAbruptly(86);
                 }
             } else if (std::string_view(argv[1]) == "--recover") RecoverFeatureActivation(argv[2], AccessMode::kReadWrite);
             else {
@@ -480,7 +480,7 @@ int main(int argc, char** argv) {
             if (std::string_view(argv[3]).find("SYNC_FAIL") == std::string_view::npos) throw;
             const bool removed = std::string_view(argv[3]).find("PENDING_REMOVE") != std::string_view::npos;
             assert(ReadFeatureActivationJournal(argv[2]).has_value() != removed);
-            std::_Exit(86);
+            ExitAbruptly(86);
         }
         return 3;
     }

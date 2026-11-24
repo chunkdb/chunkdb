@@ -495,6 +495,9 @@ struct BlockWriteView {
     std::uint64_t version = 0;
     // The commit time the write takes when it changes the chunk.
     std::uint64_t commit_time_ms = 0;
+    // Whether the chunk has a version a read reports; a never-written
+    // chunk has none.
+    bool written = false;
 };
 
 // Decides a computed write from the block as it is: false changes nothing;
@@ -760,6 +763,13 @@ class ChunkStore {
     // The chunk columns `state` holds (the defaults when null), in chunk-schema
     // order; NULL for a column without a value.
     [[nodiscard]] std::vector<ColumnValue> ChunkColumnValues(const ChunkColumnState* state) const;
+    // The values at `slots` (schema indexes; the others are NULL) of the
+    // block a SET BLOCK of `values` leaves, as a later read decodes them:
+    // given columns take their values, the others keep `before` or, for an
+    // absent block (`before` null), take what a new block takes. Throws for
+    // a value the column does not hold, as the write would.
+    [[nodiscard]] std::vector<ColumnValue> BlockAfterSet(const std::vector<ColumnValue>* before,
+        const std::vector<ColumnAssignment>& values, std::span<const std::size_t> slots) const;
     [[nodiscard]] BlockReadMetadata GetBlockWithVersion3D(std::int64_t x, std::int64_t y, std::int64_t z);
     // The first stored value of column `column_id` that `type` does not
     // hold, or with `refuse_null` the first NULL, as "block (x, y) holds
@@ -1523,7 +1533,9 @@ class ChunkStore {
     // Once a barrier has drained the unsynced set, later relaxed-mode
     // checkpoint/GC replacement must not downgrade durable state by deleting
     // a WAL in favor of an unsynced image: neither one the barrier is still
-    // syncing nor one it has synced.
+    // syncing nor one it has synced. A durable rollback boundary (a transaction
+    // commit or a conditional write) sets it too, as does opening an
+    // initialized store.
     std::atomic<bool> barrier_durability_floor_{false};
     // Set from a barrier's drain until its last sync ends, for
     // CheckpointPublishesDuringBarrierSyncsForTests.

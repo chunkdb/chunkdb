@@ -94,7 +94,8 @@ bool ChunkServer::HandleClient(
                 io->Reply(*connection, Protocol::Error("BUSY", "reply capture budget is full", {{"reason", "reply_budget"}}));
                 return park();
             }
-            if (session.watch || session.slot_watch) {
+            // A watch is counted once, when the statement that opened it is answered.
+            if ((session.watch || session.slot_watch) && !connection->watch_slot) {
                 auto count = watch_count_.load();
                 while (count < config_.max_watches && !watch_count_.compare_exchange_weak(count, count + 1U)) {}
                 if (count >= config_.max_watches) {
