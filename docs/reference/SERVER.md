@@ -1,6 +1,6 @@
-# PING, FLUSH WAL, SHOW METRICS, BACKUP TO, RESTORE TABLE, RELOAD TLS
+# PING, FLUSH WAL, SHOW METRICS, BACKUP TO, RESTORE TABLE, RELOAD TLS, SHOW CONNECTIONS, CANCEL, KILL CONNECTION
 
-You check connectivity, make earlier writes durable, inspect metrics, copy the running server, restore one table from a backup, or load a renewed TLS certificate.
+You check connectivity, make earlier writes durable, inspect metrics, copy the running server, restore one table from a backup, load a renewed TLS certificate, or list, cancel and close connections.
 
 ## Examples
 
