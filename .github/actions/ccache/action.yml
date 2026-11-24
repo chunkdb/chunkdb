@@ -36,17 +36,20 @@ runs:
           echo "CCACHE_DIR=$CCACHE_ROOT"
           echo "CCACHE_MAXSIZE=$CCACHE_LIMIT"
           echo "CCACHE_COMPRESS=1"
+          echo "CCACHE_KEY=ccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.name }}-${{ hashFiles('CMakeLists.txt') }}-${{ github.sha }}"
           if [ -z "${CCACHE_MISSING:-}" ]; then
             echo "CMAKE_C_COMPILER_LAUNCHER=ccache"
             echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache"
           fi
         } >> "$GITHUB_ENV"
 
+    # Pull requests read the caches that main saved; only main saves (see
+    # ccache-stats), so pull request runs do not evict them.
     - name: Restore ccache directory
-      uses: actions/cache@v5
+      uses: actions/cache/restore@v5
       with:
         path: ${{ runner.temp }}/ccache
-        key: ccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.name }}-${{ hashFiles('CMakeLists.txt') }}-${{ github.sha }}
+        key: ${{ env.CCACHE_KEY }}
         restore-keys: |
           ccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.name }}-${{ hashFiles('CMakeLists.txt') }}-
           ccache-${{ runner.os }}-${{ runner.arch }}-${{ inputs.name }}-
