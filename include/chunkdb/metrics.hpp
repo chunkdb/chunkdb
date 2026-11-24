@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <span>
 #include <string>
 #include <string_view>
@@ -72,6 +73,20 @@ class MetricsRegistry {
     void CountMalformedRequest() noexcept;
 
     [[nodiscard]] static ErrorClass ClassifyErrorCode(std::string_view error_code) noexcept;
+
+    // A table as the table state gauges report it.
+    struct TableState {
+        std::string table;
+        // Fenced (TableCatalog::Fences), also when out of service.
+        bool fenced = false;
+        // Table::SlotFrontierFrozen; std::nullopt for a table that is not
+        // serving at that moment.
+        std::optional<bool> slot_frontier_frozen;
+    };
+
+    // chunkdb_table_fenced for each of `tables` and chunkdb_slot_frontier_frozen
+    // for each with a known frontier, labelled `table`, in the order of `tables`.
+    [[nodiscard]] static std::string RenderTableStates(std::span<const TableState> tables);
 
     // `value` as a label value: backslash, double quote and line feed escaped.
     [[nodiscard]] static std::string EscapeLabelValue(std::string_view value);

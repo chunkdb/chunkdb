@@ -7,6 +7,7 @@ Use them to understand that workload rather than predict another application's t
 
 [Measurement records](releases/PERFORMANCE_HISTORY.md) contain absolute throughput, latency, host details, and reproduction commands.
 The records distinguish direct storage calls from protocol requests and synced writes from relaxed writes.
+Each record names its date and build, and every record predates the 2.0 release: those marked before 2.0 or with legacy command syntax measure 0.1 and 1.x builds, the others development builds of 2.0.
 
 ## Your workload
 
