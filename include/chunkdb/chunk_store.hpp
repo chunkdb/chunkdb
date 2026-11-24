@@ -1668,8 +1668,8 @@ class ChunkStore {
     // Measures the chunk's memory again and moves the shared cache byte
     // count by the difference; under the chunk's lock, or before it is shared.
     void RechargeCacheLocked(RegularChunk& chunk) noexcept;
-    // Whether the shared cache passed its chunk or byte limit.
-    [[nodiscard]] bool CacheOverLimit() const noexcept;
+    // Whether the shared cache passed --cache-max-bytes; false without it.
+    [[nodiscard]] bool CacheBytesOverLimit() const noexcept;
 
     [[nodiscard]] std::vector<std::uint8_t> EmptyPayload() const;
     [[nodiscard]] std::vector<std::uint8_t> EmptyPresenceBitmap() const;

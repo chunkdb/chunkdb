@@ -408,7 +408,8 @@ void ChunkStore::FinishEvictedChunks(
 void ChunkStore::MaybeEvictChunks() {
     StoreResources& resources = *resources_;
     const auto loaded_hint = resources.loaded_chunks_.load(std::memory_order_relaxed);
-    if (!CacheOverLimit()) {
+    // The count limit uses the count this caller saw, as without a byte limit.
+    if (loaded_hint <= resources.max_loaded_chunks_ && !CacheBytesOverLimit()) {
         return;
     }
 

@@ -133,11 +133,10 @@ void ChunkStore::RechargeCacheLocked(RegularChunk& chunk) noexcept {
     chunk.cache_charge = charge;
 }
 
-bool ChunkStore::CacheOverLimit() const noexcept {
+bool ChunkStore::CacheBytesOverLimit() const noexcept {
     const auto& resources = *resources_;
-    return resources.loaded_chunks_.load(std::memory_order_relaxed) > resources.max_loaded_chunks_ ||
-        (resources.max_cache_bytes_ != 0U &&
-            resources.cache_bytes_->load(std::memory_order_relaxed) > resources.max_cache_bytes_);
+    return resources.max_cache_bytes_ != 0U &&
+        resources.cache_bytes_->load(std::memory_order_relaxed) > resources.max_cache_bytes_;
 }
 
 std::size_t ChunkStore::LiveChunkInstanceEntriesForTests() const {
@@ -294,7 +293,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
     }
     if (!inserted) TouchChunk(selected);
     if (inserted) {
-        if (loaded_now > resources_->max_loaded_chunks_ || CacheOverLimit()) {
+        if (loaded_now > resources_->max_loaded_chunks_ || CacheBytesOverLimit()) {
             RequestEviction();
         }
     }
