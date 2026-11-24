@@ -1,5 +1,8 @@
 #include <algorithm>
+#include <functional>
 #include <limits>
+#include <map>
+#include <optional>
 #include <span>
 
 #include "server_slots_test_utils.hpp"
@@ -217,6 +220,121 @@ void Scan(bool tls, unsigned dims) {
     }
 }
 
+// Chunk coordinates as one key, the version, and the form or null of a scan row or chunks push entry.
+using ChunkStates = std::map<std::string, std::pair<std::uint64_t, std::optional<std::string>>>;
+void Apply(ChunkStates& states, const Reply& entry, unsigned dims) {
+    assert(entry.items.size() == dims + 2U);
+    std::string key;
+    for (unsigned axis = 0; axis < dims; ++axis) key += entry.items[axis].value + " ";
+    const auto version = Number(entry.items[dims]);
+    const auto& form = entry.items[dims + 1U];
+    assert(form.type == '$' || form.type == '_');
+    auto& state = states[key];
+    if (version <= state.first) return;
+    state = {version, form.type == '$' ? std::optional<std::string>(form.value) : std::nullopt};
+}
+// Applies every SCAN CHUNKS SINCE 0 WITH DATA page to states, passing the first page to first_page.
+void ScanInto(Client& client, unsigned dims, std::string_view limit, ChunkStates& states,
+    const std::function<void(const Reply&)>& first_page = {}) {
+    std::string after;
+    std::vector<long long> previous;
+    for (bool more = true, start = true; more; start = false) {
+        const auto page = client.Command("SCAN CHUNKS FROM t" + after + " " + std::string(limit) + " SINCE 0 WITH DATA");
+        if (start && first_page) first_page(page);
+        const auto& chunks = Field(page, "chunks");
+        ExpectType(chunks, '*');
+        more = Boolean(Field(page, "more"));
+        for (const auto& row : chunks.items) {
+            Apply(states, row, dims);
+            // Rows ascend by cx, then cy, then cz, across pages too.
+            std::vector<long long> coordinates;
+            for (unsigned axis = 0; axis < dims; ++axis) coordinates.push_back(std::stoll(row.items[axis].value));
+            assert(previous.empty() || previous < coordinates);
+            previous = std::move(coordinates);
+        }
+        if (chunks.items.empty()) { assert(!more); break; }
+        after = " AFTER";
+        for (unsigned axis = 0; axis < dims; ++axis) after += " " + chunks.items.back().items[axis].value;
+    }
+}
+// A scan baseline and WATCH CHUNKS AFTER its first page's epoch and position
+// converge to the final table state. After the first page the test writes a
+// chunk before WATCH AFTER starts, then updates a scanned chunk, updates a
+// chunk not yet scanned and deletes a chunk not yet scanned, while another
+// connection keeps writing block data and metadata. An open CHUNKS watch
+// keeps whole-chunk live history from before the scan.
+void ScanThenWatch(bool tls, unsigned dims) {
+    Harness harness(tls);
+    auto client = harness.Connect(); Create(*client, dims);
+    const auto chunk = [&](int c) { return Coordinates(dims, c); };
+    const auto block = [&](int c) { return Coordinates(dims, 2 * c); };
+    const auto key = [&](int c) { return Coordinates(dims, c) + " "; };
+    for (int c = 0; c < 6; ++c) (void)Number(client->Command("SET BLOCK " + block(c) + " IN t n=1,optional=NULL,label='seed'"));
+    (void)Number(client->Command("SET CHUNK " + chunk(5) + " IN t META owner=5,note='seed'"));
+    auto history = harness.Connect(); (void)Start(history->Command("WATCH t CHUNKS"));
+    auto writer = harness.Connect(), noise = harness.Connect();
+    std::exception_ptr noise_error;
+    std::jthread noise_writes;
+    ChunkStates states;
+    std::unique_ptr<Client> watcher;
+    std::uint64_t position = 0;
+    ScanInto(*client, dims, "LIMIT 1", states, [&](const Reply& page) {
+        // The first page holds only chunk 0; the writes below land before the second page.
+        assert(Field(page, "chunks").items.size() == 1U && Field(page, "chunks").items[0].items[0].value == "0");
+        noise_writes = std::jthread([&] {
+            try {
+                for (int i = 0; i < 12; ++i) {
+                    const int c = i % 3;
+                    const auto value = std::to_string(i + 2);
+                    const auto reply = (i / 3) % 2 == 0
+                        ? noise->Command("SET BLOCK " + block(c) + " IN t n=" + value + ",optional=" + value + ",label='w'")
+                        : noise->Command("SET CHUNK " + chunk(c) + " IN t META owner=" + value + ",note='m'");
+                    if (reply.type == '-') throw std::runtime_error("write failed: " + reply.value);
+                }
+            } catch (const std::exception&) { noise_error = std::current_exception(); }
+        });
+        const auto& epoch = Field(page, "epoch");
+        assert(epoch.type == '$' && epoch.value.size() == 32U);
+        position = Number(Field(page, "position"));
+        (void)Number(writer->Command("SET BLOCK " + block(3) + " IN t n=3,optional=3,label='before watch'"));
+        watcher = harness.Connect();
+        const auto [started_epoch, started] = Start(watcher->Command(
+            "WATCH t CHUNKS AFTER " + epoch.value + " " + std::to_string(position)));
+        assert(started_epoch == epoch.value && started == position);
+        (void)Number(writer->Command("SET BLOCK " + block(0) + " IN t n=10,optional=10,label='scanned'"));
+        (void)Number(writer->Command("SET CHUNK " + chunk(4) + " IN t META owner=4,note='unscanned'"));
+        (void)Number(writer->Command("DELETE BLOCK " + block(5) + " FROM t"));
+        (void)Number(writer->Command("SET CHUNK " + chunk(5) + " IN t META owner=0,note=NULL"));
+    });
+    // Later pages carry the newer versions of chunks 3 and 4 and the tombstone of chunk 5.
+    assert(states.at(key(3)).first > position && states.at(key(3)).second);
+    assert(states.at(key(4)).first > position && states.at(key(4)).second);
+    assert(states.at(key(5)).first > position && !states.at(key(5)).second);
+    noise_writes.join();
+    if (noise_error) std::rethrow_exception(noise_error);
+    const auto marker = Number(client->Command("SET CHUNK " + chunk(7) + " IN t META owner=1"));
+    std::size_t pushed = 0;
+    for (std::uint64_t revision = 0; revision < marker;) {
+        const auto push = watcher->Read();
+        ExpectType(push, '>');
+        if (push.items[0].value == "schema" || push.items[0].value == "progress") continue;
+        if (push.items[0].value != "chunks") throw std::runtime_error("unexpected push: " + push.items[0].value);
+        revision = Number(push.items[2]);
+        for (const auto& entry : push.items[6].items) {
+            if (entry.items[0].value != "7") ++pushed;
+            Apply(states, entry, dims);
+        }
+    }
+    assert(pushed != 0U);
+    ChunkStates expected;
+    ScanInto(*client, dims, "LIMIT 1024", expected);
+    assert(expected.size() == 7U && states == expected);
+    assert(!expected.at(key(5)).second && expected.at(key(7)).second);
+    for (int c = 0; c < 5; ++c)
+        assert(!ParseChunkFormBlockColumns(Parse(*expected.at(key(c)).second), dims == 3U ? 8U : 4U).empty());
+    Unwatch(*watcher); Unwatch(*history);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -238,6 +356,7 @@ int main(int argc, char** argv) {
                 catch (const std::exception& error) { std::cerr << "FAILED " << label << ": " << error.what() << std::endl; }
             };
             run("area", Area); run("unknown-sections", UnknownSections); run("scan", Scan);
+            run("scan-then-watch", ScanThenWatch);
         }
     }
     std::cout << passed << "/" << total << " chunk model protocol groups passed; " << skipped << " skipped\n";

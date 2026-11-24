@@ -39,7 +39,7 @@ Dropping a table removes its specific grants.
 
 | Statement | Required right |
 | --- | --- |
-| GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, DESCRIBE, WATCH | READ on the table |
+| GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, AGGREGATE, DESCRIBE, WATCH | READ on the table |
 | WATCH SLOT on a slot another user owns | READ on the table and ADMIN on all tables |
 | SET BLOCK, DELETE BLOCK, SET CHUNK | WRITE on the table |
 | ALTER TABLE, DROP TABLE, RECOVER TABLE, CREATE SLOT, DROP SLOT | ADMIN on the table |
