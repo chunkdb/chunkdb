@@ -121,7 +121,7 @@ SHOW TABLE STATS table
 - SCAN CHUNKS: `chunks`, `more`, `epoch`, `position`, and `retained_deletion_floor`; with WHERE, `after` follows `more`.
 - Each scan row contains the active chunk coordinates and producing version, followed by a form or null when WITH DATA is present.
 - Scan rows ascend by cx, then cy, then cz, within a page and across pages continued AFTER.
-- Continue AFTER the last returned coordinate while `more` is true; with WHERE, continue AFTER the returned `after`, since a page may return no rows; read-only `position` is null.
+- Continue AFTER the last returned coordinate while `more` is true; with WHERE, continue AFTER the returned `after`, since a page may return no rows; on a server started with `--read-only`, `position` is null.
 - Pass the first page's `epoch` and `position` to WATCH AFTER to follow later changes; see [Resume a consumer](../FEED_RESUME.md).
 - COMPACT TOMBSTONES: the retained-deletion floor after completion.
 - SHOW TABLE STATS: `epoch`, nullable completed `revision`, `dims`, `chunks`, retained `tombstones`, `retained_deletion_floor`, `loaded_chunks`, `files`, `disk_bytes`, `slots`, and `watches`.
@@ -161,7 +161,7 @@ Use [Transactions](../TRANSACTIONS.md) when you need a consistent view of one ta
 
 ## Table stats
 
-SHOW TABLE STATS needs READ on the table.
+SHOW TABLE STATS needs READ on the table, or MONITOR.
 `chunks` counts populated chunks, the ones SCAN CHUNKS lists; `loaded_chunks` counts the table's chunks held in the chunk cache.
 `files` and `disk_bytes` count the regular files under the table's directory and their sizes, WAL, images, feed archive and index files included.
 `slots` counts durable slots, lost ones included; `watches` counts open watches, slot watches included.

@@ -71,21 +71,22 @@ REPLICATION is stored and shown by SHOW USERS; no statement requires it yet.
 | SHOW TABLE STATS | READ on the table, or MONITOR |
 | WATCH SLOT on a slot another user owns | READ on the table and ADMIN on all tables |
 | SET BLOCK, DELETE BLOCK, SET CHUNK | WRITE on the table |
-| ALTER TABLE, DROP TABLE, RECOVER TABLE, CREATE SLOT, DROP SLOT | ADMIN on the table |
+| ALTER TABLE, DROP TABLE, RECOVER TABLE, COMPACT TOMBSTONES, CREATE SLOT, DROP SLOT | ADMIN on the table |
 | CREATE TABLE | ADMIN on the name, on a matching prefix, or on all tables |
 | SWAP TABLES | ADMIN on both tables |
 | ALTER TABLE ... RENAME TO | ADMIN on the table, and on the new name, a matching prefix, or all tables |
 | SHOW METRICS, SHOW STATUS | MONITOR, or ADMIN on all tables |
 | WATCH CATALOG | MONITOR, or ADMIN on all tables; user records and slot owners also need MANAGES USERS |
-| RELOAD TLS | ADMIN on all tables |
+| RELOAD TLS, ENABLE FEATURE | ADMIN on all tables |
 | FLUSH WAL | WRITE on at least one table or prefix |
 | SHOW TABLES | None; results include accessible tables only |
 | SHOW SLOTS | None; results include accessible tables only, or every table with MONITOR |
 | SHOW CONNECTIONS | None; results include your own connections, or every connection with MONITOR or ADMIN on all tables |
+| CANCEL, KILL CONNECTION | None for your own connections; ADMIN on all tables for every connection |
 | SHOW MIGRATIONS | None; results include records on tables with ADMIN, and GRANT and REVOKE records with MANAGES USERS; applying users show with MANAGES USERS |
 | ACK | An open slot watch |
 | PING | None |
-| User management, GRANT, REVOKE | MANAGES USERS |
+| User management, SHOW USERS, GRANT, REVOKE | MANAGES USERS |
 | BACKUP TO | BACKUP, or MANAGES USERS |
 | RESTORE TABLE | MANAGES USERS, ADMIN on all tables, or BACKUP and ADMIN on the new name |
 | MIGRATE | The inner statement's rights |

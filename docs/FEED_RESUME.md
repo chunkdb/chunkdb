@@ -41,10 +41,10 @@ Reconnect AFTER that position and skip changes you already applied.
 To start from a writer's scan, use `SCAN CHUNKS FROM table WITH DATA` and keep the first page's `epoch` and `position`.
 Start WATCH AFTER that position on another connection, buffer its changes, and finish the scan using AFTER coordinates.
 Keep the first position across every page; later page positions do not replace the baseline cut.
-Pages do not share a snapshot, so retain each returned chunk version and skip older replayed changes when applying the buffer.
+Pages outside a transaction do not share a snapshot, so retain each returned chunk version and skip older replayed changes when applying the buffer.
 A first watch can resume at the retained floor even when no earlier watcher existed; a lost prefix still requires resync and a new baseline.
 A write committed between the first page and a first WATCH makes that watch resync; open another watch on the table before the first page and keep it open until WATCH AFTER starts to retain those writes, with CHUNKS when you resume with CHUNKS.
-Read-only scans return null for position and cannot establish this writer frontier.
+A server started with `--read-only` returns null for position, so its scans cannot establish this writer frontier.
 A scan with WHERE follows the same steps; see [Filter a scan](reference/CHUNKS.md#filter-a-scan) for the conditions that converge.
 
 ## If it fails
