@@ -95,7 +95,8 @@ Its SCAN CHUNKS first waits for the writes its snapshot includes to finish; CANC
 Its reads are not checked again: COMMIT and ROLLBACK only end it, and `--txn-max-read-chunks` does not apply.
 Ordinary statement errors leave the transaction open without applying the failed statement.
 CANCEL and a statement timeout stop the running statement; the transaction stays open.
-An IF condition of SET BLOCK or DELETE BLOCK, and a value computed from the block, read the transaction's view and count as a read of the chunk; CONDITION_FAILED also leaves the transaction open ([Expressions](EXPRESSIONS.md#in-writes)).
+An IF condition of SET BLOCK or DELETE BLOCK, a value computed from the block, and RETURNING read the transaction's view and count as a read of the chunk; CONDITION_FAILED also leaves the transaction open ([Expressions](EXPRESSIONS.md#in-writes)).
+RETURNING answers a null `version` for a chunk the transaction wrote, since its version is known only at COMMIT.
 A conflict ends its work and writes nothing.
 The connection keeps returning that conflict until ROLLBACK or COMMIT closes it; SHOW CONNECTIONS, CANCEL and KILL CONNECTION still return their own reply.
 
