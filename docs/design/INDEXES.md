@@ -21,8 +21,10 @@ The condition is split into its top-level AND conjuncts.
 The first conjunct that compares an indexed column with constants or parameters selects the index: `=`, `<`, `<=`, `>`, `>=`, `BETWEEN`, `IN (...)` and `IS NOT NULL`; for bits(N) only `=` and `IN`.
 Conjuncts are read in written order, so a statement chooses its index by putting that conjunct first.
 The chosen conjunct becomes one or more key ranges; every candidate block is then read under its chunk's shared lock and the whole condition is evaluated on it, the chosen conjunct included.
+Key ranges are built from the typed constants of the planned condition, so with an f32 index `WHERE f = 0.1` seeks the f32 value that 0.1 rounds to, as the condition compares it (#299).
 Without a usable conjunct, GET BLOCKS is refused with `INVALID_ARGUMENT reason=no_index` naming the columns of the condition, unless the statement ends with ALLOW SCAN.
 ALLOW SCAN without a usable index walks populated chunks in ascending coordinate order, as SCAN CHUNKS WHERE does, and LIMIT counts the blocks it visits.
+A scanned page can therefore return no rows with `more` true; its `after` then names the last block it visited, and the next page continues after it.
 NULL, NaN and absent blocks have no index entry, so `IS NULL`, `<> v`, `NOT` and conditions on NaN need ALLOW SCAN.
 
 ## Keys and order
@@ -44,6 +46,7 @@ A chunk's entries come from the newest layer that covers it, the delta included;
 The delta covers each chunk written since the newest run was published: the chunk's full entry set, ordered, with its revision.
 An in-memory map from chunk coordinates to the newest covering layer serves both reads and maintenance; it costs about 32 bytes per covered chunk.
 Runs merge when there are more than 8, or when the delta's entries reach a quarter of the base run's; a merge writes one run and drops the inputs.
+An entry removed after an open snapshot is kept, marked with its removal revision, in the delta and in every run a flush or merge writes from it, while any open snapshot predates that revision; current reads skip it and snapshot reads before its removal see it.
 
 ## Write maintenance
 
@@ -58,10 +61,12 @@ The delta is bounded by `index_delta_bytes`, 64 MiB per table by default; above 
 ## Durability
 
 A flush writes the delta as a run file with a temporary name in the index directory, syncs it, renames it and syncs the directory, then publishes a new index manifest the same way.
-The manifest lists the runs and their checksums; its atomic replacement is the only commit point of a flush or merge.
+The manifest lists the runs and their checksums and records the table epoch; its atomic replacement is the only commit point of a flush or merge.
 Runs and manifests are written in every durability mode; they are a cache of chunk state and never carry a write that its chunk lost.
 A run may cover a chunk state that the chunk's WAL later loses in relaxed mode; recovery then finds a different revision for that chunk and rebuilds its entries.
-Revisions are never reissued, because the store clock reserves ranges durably before issuing them, so an equal revision means the same chunk state.
+Within one epoch and clock a revision is never reissued, because the store clock reserves ranges durably before issuing them, so an equal revision means the same chunk state.
+A new epoch (RESTORE TABLE or a fork) or a rebuilt clock breaks that, so each of them rebuilds the index: a manifest whose epoch differs from the table's is treated as missing, and `chunkdb_admin rebuild-version-clock` removes the index manifests of every table whose clock it rebuilds.
+SWAP TABLES moves each table with its epoch and its index directory, so its indexes stay valid.
 FLUSH WAL does not flush indexes; the next open repairs what the runs miss.
 
 ## Recovery
@@ -87,7 +92,7 @@ ALTER TABLE that drops, renames or changes the type of an indexed column is refu
 
 An index page seeks the chosen key ranges after `AFTER`, merges the layers in key order, skips entries of chunks a newer layer covers, and checks each candidate.
 A page costs its rows and the candidates it discards, each a seek in up to 9 layers and a block read; it does not grow with the table.
-Inside a transaction, a page reads candidates from the index and checks them at the snapshot; entries removed after the snapshot stay in the delta, marked with their removal revision, while an open snapshot predates it, within `--txn-history-bytes`.
+Inside a transaction, a page reads candidates from the index and checks them at the snapshot; entries removed after the snapshot are kept with their removal revision in the delta and in the runs written from it (see Structure), within `--txn-history-bytes`; a snapshot that outlives that bound ends with CONFLICT reason=history_limit as other snapshot reads do.
 A read-only process loads the runs, recomputes stale chunks into its own delta at open, and recomputes the chunks the writer reports in `chunkdb.snapshot.changes` before a page, as it does for the coordinate index.
 
 ## Commit groups
@@ -99,10 +104,11 @@ No index change is ever a group member, so a group's record and its durability d
 
 ## Backup, restore and verify
 
-BACKUP copies index definitions with the table manifest but not index runs; a restored or swapped-in table builds its indexes at open.
+BACKUP copies index definitions with the table manifest but not index runs; a restored table builds its indexes at open.
 `chunkdb_verify` checks each run's checksums and order, and recomputes the entries of every chunk to compare them with the index.
 DURABILITY_CONTRACT.md states that indexes never decide whether a write committed and are rebuilt from chunk state after any loss.
 Crash tests stop the process inside a flush, a merge, a build and a drop, and check that GET BLOCKS returns exactly the rows a full scan returns.
+Tests check that a rebuilt clock and RESTORE TABLE each make the next open rebuild the index, that SWAP TABLES keeps it, and that a flush and a merge during an open READ ONLY transaction keep the entries its snapshot reads.
 
 ## Limits
 
