@@ -1,5 +1,6 @@
 #include "replication_push.hpp"
 
+#include <algorithm>
 #include <charconv>
 #include <stdexcept>
 #include <string>
@@ -16,10 +17,12 @@ namespace {
 
 class Reader {
   public:
-    explicit Reader(std::string_view bytes) : bytes_(bytes) {}
+    Reader(std::string_view bytes, std::size_t max_values) : bytes_(bytes), values_left_(max_values) {}
 
     ReplicationPushValue Value(std::size_t depth) {
         if (at_ >= bytes_.size()) Bad("it ends inside a value");
+        if (values_left_ == 0U) Bad("it holds more than " + std::to_string(kMaxReplicationPushValues) + " values");
+        --values_left_;
         ReplicationPushValue value;
         value.type = bytes_[at_++];
         switch (value.type) {
@@ -28,22 +31,23 @@ class Reader {
                 if (depth == 0U) Bad("it nests too deeply");
                 const auto count = Count(Line());
                 // Every element takes at least three bytes ("_\r\n").
-                if (count > (bytes_.size() - at_) / 3U) Bad("an array is longer than the push");
-                value.items.reserve(count);
+                if (count > (bytes_.size() - at_) / 3U || count > values_left_) Bad("an array is longer than the push");
+                // Grown as elements arrive: a declared count reserves little.
+                value.items.reserve(std::min<std::size_t>(count, 64U));
                 for (std::size_t i = 0; i < count; ++i) value.items.push_back(Value(depth - 1U));
                 return value;
             }
             case '$': {
                 const auto size = Count(Line());
                 if (size > bytes_.size() - at_ || bytes_.size() - at_ - size < 2U) Bad("a string is longer than the push");
-                value.text.assign(bytes_.substr(at_, size));
+                value.text = bytes_.substr(at_, size);
                 at_ += size;
                 if (bytes_.substr(at_, 2U) != "\r\n") Bad("a string does not end with CRLF");
                 at_ += 2U;
                 return value;
             }
             case '+':
-                value.text.assign(Line());
+                value.text = Line();
                 return value;
             case ':': {
                 const auto line = Line();
@@ -91,10 +95,11 @@ class Reader {
     }
 
     std::string_view bytes_;
+    std::size_t values_left_;
     std::size_t at_ = 0U;
 };
 
-const std::string& String(const ReplicationPushValue& value, const char* what) {
+std::string_view String(const ReplicationPushValue& value, const char* what) {
     if (value.type != '$' && value.type != '+') Bad(std::string(what) + " is not a string");
     return value.text;
 }
@@ -122,7 +127,7 @@ std::vector<std::optional<std::string>> Row(const ReplicationPushValue& value, c
     row.reserve(items.size());
     for (const auto& item : items) {
         if (IsNull(item)) row.emplace_back(std::nullopt);
-        else if (item.type == '$') row.emplace_back(item.text);
+        else if (item.type == '$') row.emplace_back(std::string(item.text));
         else Bad(std::string(what) + " holds a value that is not a string or null");
     }
     return row;
@@ -136,8 +141,8 @@ const std::vector<ReplicationPushValue>& PushItems(const ReplicationPushValue& p
 
 }  // namespace
 
-ReplicationPushValue DecodeReplicationValue(std::string_view bytes, std::size_t max_depth) {
-    Reader reader(bytes);
+ReplicationPushValue DecodeReplicationValue(std::string_view bytes, std::size_t max_depth, std::size_t max_values) {
+    Reader reader(bytes, max_values);
     auto value = reader.Value(max_depth);
     if (!reader.done()) Bad("bytes follow the push");
     return value;
@@ -164,7 +169,7 @@ std::optional<StoreId> ParseEpochHex(std::string_view hex) {
 ReplicationPush ReadReplicationPushHeader(const ReplicationPushValue& value) {
     const auto& items = PushItems(value);
     ReplicationPush push;
-    const auto& kind = String(items[0], "the push kind");
+    const auto kind = String(items[0], "the push kind");
     if (kind == "replication") {
         if (items.size() != 9U) Bad("a replication push has 9 elements");
         push.kind = ReplicationPushKind::kReplication;
@@ -172,7 +177,7 @@ ReplicationPush ReadReplicationPushHeader(const ReplicationPushValue& value) {
         if (items.size() != 3U) Bad("a progress push has 3 elements");
         push.kind = ReplicationPushKind::kProgress;
     } else {
-        throw std::invalid_argument("APPLY takes replication and progress pushes, not " + kind.substr(0U, 32U) +
+        throw std::invalid_argument("APPLY takes replication and progress pushes, not " + std::string(kind.substr(0U, 32U)) +
             (kind == "resync" ? "; after a resync the follower must be built again" : ""));
     }
     const auto epoch = ParseEpochHex(String(items[1], "the epoch"));
@@ -188,7 +193,7 @@ ReplicationPush ReadReplicationPush(const ReplicationPushValue& value, std::uint
     if (dims != 2U && dims != 3U) throw std::logic_error("a table has 2 or 3 dimensions");
     const auto& items = value.items;
     push.commit_time_ms = Unsigned(items[3], "the commit time");
-    if (!IsNull(items[4])) push.user = String(items[4], "the user");
+    if (!IsNull(items[4])) push.user = std::string(String(items[4], "the user"));
     push.schema_version = Unsigned(items[5], "the schema version");
     if (!IsNull(items[7])) throw std::invalid_argument("APPLY does not take a push with a tag yet");
     if (!IsNull(items[8])) throw std::invalid_argument("a push of a cross-table transaction needs APPLY GROUP");
@@ -202,12 +207,12 @@ ReplicationPush ReadReplicationPush(const ReplicationPushValue& value, std::uint
         chunk.coord.y = Signed(fields[1], "a chunk coordinate");
         if (dims == 3U) chunk.coord.z = Signed(fields[2], "a chunk coordinate");
         chunk.version = Unsigned(fields[dims], "a chunk version");
-        const auto& kind = String(fields[dims + 1U], "a chunk kind");
+        const auto kind = String(fields[dims + 1U], "a chunk kind");
         const auto& data = fields[dims + 2U];
         if (kind == "form") {
             if (!IsNull(data)) {
                 if (data.type != '$') Bad("a chunk form is not a string");
-                chunk.form = data.text;
+                chunk.form = std::string(data.text);
             }
         } else if (kind == "rows") {
             chunk.rows = true;

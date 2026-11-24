@@ -36,7 +36,7 @@ The reply is `applied`, or `skipped` when the follower already holds the push.
 - `compact`: COMPACT TOMBSTONES BEFORE `before` on the follower.
 - `resync` and other kinds: INVALID_ARGUMENT; after a resync the follower must be built again.
 
-A `form` is written through the chunk path and a one-block `rows` entry through the block path, as on the primary, so the follower's feed captures the same before rows.
+A `form` and `rows` are both written through the transaction commit; the mirror test (box 5) compares the follower's change pushes, before rows included, with the primary's.
 Every write keeps the primary's commit, so the follower's own WATCH sends the same changes, revisions, commit times, users and schema versions as the primary's.
 A push that does not fit the follower (unknown epoch, version not equal to the revision, a collect of a populated chunk) changes nothing; when the stream itself was right, the follower is no longer a copy and must be built again.
 A malformed push is INVALID_ARGUMENT; the decoder accepts only the push shapes above and bounds every length before it allocates.
@@ -52,7 +52,8 @@ A malformed push is INVALID_ARGUMENT; the decoder accepts only the push shapes a
 
 ## Durability and position
 
-APPLY answers after its changes are durable, in every durability mode: a commit of one chunk appends one WAL frame and syncs it; a commit of several chunks uses a transaction intent, so it applies whole or not at all across a crash.
+APPLY answers after its changes are durable, in every durability mode: a commit uses a transaction intent, so it applies whole or not at all across a crash. A commit of one chunk could append one WAL frame and sync it instead; the first implementation takes the intent for every commit.
+APPLY takes a commit whatever the follower's transaction chunk limit, so a primary with a higher limit does not stop it.
 The APPLYs of one table run one at a time, under a per-table apply lock, so the follower's durable state is always the primary's state at some revision.
 The follower never takes versions from its own clock. APPLY at revision R registers its producer bound, then raises the clock to R + 1, so no reader sees R completed before its changes are published.
 The version clock record keeps its rule: raised on disk before a revision is used, never lowered.

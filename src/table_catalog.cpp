@@ -268,6 +268,7 @@ Table::Table(
       dir_(std::move(dir)),
       store_id_(store_id),
       lineage_(store->lineage()),
+      follower_(store->follower()),
       feed_buffer_bytes_(feed_buffer_bytes),
       effective_feed_buffer_bytes_(options.feed_buffer_bytes.value_or(feed_buffer_bytes)),
       feed_linger_(feed_linger),
@@ -561,6 +562,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     RequireValidFeedSlotName(name);
     if (owner) RequireValidFeedSlotOwner(*owner);
     std::lock_guard ddl(ddl_mutex_);
+    RequireLocalDdl("CREATE SLOT");
     if (if_not_exists) {
         auto lease = Acquire();
         if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
@@ -924,8 +926,14 @@ TableInfo Table::Info() const {
         .feed_buffer_bytes = FeedBufferBytes(),
         .slot_max_bytes = slot_max_bytes_,
         .chunk_schema = geometry_.chunk_schema(),
-        .follower = store_ != nullptr && store_->follower(),
+        .follower = follower_,
     };
+}
+
+void Table::RequireLocalDdl(std::string_view verb) const {
+    if (follower_)
+        throw TableArgumentError("follower", "table '" + name_ + "' is a follower: " + std::string(verb) +
+            " is refused; it changes only through APPLY");
 }
 
 const char* Table::FenceReason() const {
@@ -2177,6 +2185,7 @@ bool TableCatalog::ChangeColumnsIfNeeded(
     auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
+    table->RequireLocalDdl("ALTER TABLE");
     std::optional<TableSchema> changed;
     {
         // Check the store before catalog admission: another exclusive control
@@ -2270,6 +2279,7 @@ void TableCatalog::CheckColumnValues(std::string_view name, const std::function<
     auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
+    table->RequireLocalDdl("ALTER TABLE");
     const TableOptions options = table->Info().options;
     // 1. Every write to the column must pass the check from here on.
     RewriteManifest(

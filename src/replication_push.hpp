@@ -16,17 +16,22 @@ namespace chunkdb {
 // table, which the epoch names.
 struct ReplicationPushValue {
     char type = 0;          // RESP3 prefix: '>', '*', '$', '+', ':', '(' or '_'.
-    std::string text;       // Bulk and simple strings.
+    std::string_view text;  // Bulk and simple strings, inside the decoded bytes.
     std::int64_t integer = 0;
     std::uint64_t unsigned_value = 0;
     bool negative = false;  // ':' below zero.
     std::vector<ReplicationPushValue> items;
 };
 
-// Decodes exactly one RESP3 value filling `bytes`. Every length is bounded by
-// the bytes left before anything is allocated, and nesting by `max_depth`.
-// Throws std::invalid_argument for anything else.
-[[nodiscard]] ReplicationPushValue DecodeReplicationValue(std::string_view bytes, std::size_t max_depth = 8U);
+// The most values one push may hold, aggregates included.
+inline constexpr std::size_t kMaxReplicationPushValues = 1U << 20U;
+
+// Decodes exactly one RESP3 value filling `bytes`, which must outlive the
+// result. Every length is bounded by the bytes left, the values by
+// `max_values`, and nesting by `max_depth`. Throws std::invalid_argument
+// for anything else.
+[[nodiscard]] ReplicationPushValue DecodeReplicationValue(std::string_view bytes, std::size_t max_depth = 8U,
+    std::size_t max_values = kMaxReplicationPushValues);
 
 enum class ReplicationPushKind { kReplication, kProgress };
 

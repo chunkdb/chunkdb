@@ -1,9 +1,15 @@
 // Follower tables and APPLY (docs/design/REPLICATION_APPLY.md): a primary
 // engine and a follower engine in separate data directories; the primary's
 // commits are sent as WATCH t REPLICATION pushes built from its chunk forms.
+#include <atomic>
 #include <cassert>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <iterator>
+#include <thread>
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -19,33 +25,70 @@
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
 
+#ifndef _WIN32
+#include <sys/wait.h>
+#endif
+
 namespace {
 using namespace chunkdb;
 using Parameters = std::vector<std::optional<std::string>>;
 
 constexpr const char* kColumns = "(n u8, s text(8) NULL) CHUNK 2 x 2";
 
+class ScopedEnv {
+  public:
+    ScopedEnv(const char* key, const char* value) : key_(key) {
+#ifdef _WIN32
+        _putenv_s(key_, value);
+#else
+        setenv(key_, value, 1);
+#endif
+    }
+    ~ScopedEnv() {
+#ifdef _WIN32
+        _putenv_s(key_, "");
+#else
+        unsetenv(key_);
+#endif
+    }
+    ScopedEnv(const ScopedEnv&) = delete;
+    ScopedEnv& operator=(const ScopedEnv&) = delete;
+  private:
+    const char* key_;
+};
+
+std::unique_ptr<SessionState> Greeted(CommandEngine& engine) {
+    auto session = std::make_unique<SessionState>();
+    assert(engine.Execute(*session, "HELLO 3\r\n").front() == '%');
+    return session;
+}
+
 struct Server {
     test::ScopedTempDir dir;
+    std::filesystem::path backups;
     std::shared_ptr<TableCatalog> catalog;
     std::unique_ptr<CommandEngine> engine;
     std::unique_ptr<SessionState> session;
 
-    explicit Server(const std::string& prefix) : dir(prefix) { Open(); }
+    explicit Server(const std::string& prefix, std::filesystem::path backup_dir = {})
+        : dir(prefix), backups(std::move(backup_dir)) { Open(); }
 
     void Open() {
         CatalogConfig config;
         config.data_dir = dir.path();
         catalog = std::make_shared<TableCatalog>(config);
-        engine = std::make_unique<CommandEngine>(EngineConfig{.require_auth = false}, catalog);
-        session = std::make_unique<SessionState>();
-        assert(engine->Execute(*session, "HELLO 3\r\n").front() == '%');
+        engine = std::make_unique<CommandEngine>(EngineConfig{.require_auth = false, .backup_dir = backups}, catalog);
+        session = Greeted(*engine);
     }
 
-    void Restart() {
+    void Close() {
         session.reset();
         engine.reset();
         catalog.reset();
+    }
+
+    void Restart() {
+        Close();
         Open();
     }
 
@@ -146,10 +189,11 @@ std::string ProgressPush(const std::string& epoch, std::uint64_t revision) {
 
 // A primary with table t and a follower with table f of t's epoch.
 struct Pair {
-    Server primary{"chunkdb-apply-primary"};
-    Server follower{"chunkdb-apply-follower"};
+    Server primary;
+    Server follower;
     std::string epoch;
-    Pair() {
+    explicit Pair(const std::filesystem::path& backups = {})
+        : primary("chunkdb-apply-primary"), follower("chunkdb-apply-follower", backups) {
         assert(primary.Run(std::string("CREATE TABLE t ") + kColumns) == "+OK\r\n");
         epoch = DescribeField(primary.Run("DESCRIBE t"), "epoch");
         assert(epoch.size() == 32U);
@@ -362,9 +406,204 @@ void TestDecoder() {
         }
         assert(refused);
     }
+    assert(DecodeReplicationValue("*3\r\n_\r\n_\r\n_\r\n", 8U, 4U).items.size() == 3U);
+    bool over = false;
+    try {
+        (void)DecodeReplicationValue("*3\r\n_\r\n_\r\n_\r\n", 8U, 3U);
+    } catch (const std::invalid_argument&) {
+        over = true;
+    }
+    assert(over);
     assert(ParseEpochHex(std::string(32U, 'F')).has_value());
     assert(!ParseEpochHex(std::string(31U, 'f')).has_value());
     assert(!ParseEpochHex(std::string(32U, 'g')).has_value());
+}
+
+// The follower flag is fixed when the table opens: DDL that a reopen (ALTER
+// TABLE SET) holds up is still refused, and DESCRIBE keeps `follower`.
+void TestDdlRacingReopen() {
+    Pair pair;
+    auto& engine = *pair.follower.engine;
+    std::atomic<bool> done{false};
+    std::thread reopen([&] {
+        auto session = Greeted(engine);
+        for (int i = 0; i < 40; ++i)
+            assert(engine.Execute(*session, "ALTER TABLE f SET checkpoint_updates = " + std::to_string(100 + i) + "\r\n") ==
+                "+OK\r\n");
+        done = true;
+    });
+    std::thread describe([&] {
+        auto session = Greeted(engine);
+        while (!done) assert(engine.Execute(*session, "DESCRIBE f\r\n").find("$8\r\nfollower\r\n#t\r\n") != std::string::npos);
+    });
+    auto session = Greeted(engine);
+    for (int i = 0; !done || i < 10; ++i) {
+        for (const char* line : {"ALTER TABLE f ADD COLUMN extra u8 NULL\r\n", "ALTER TABLE f ADD CHECK (n < 9)\r\n",
+                 "ALTER TABLE f ADD CHUNK COLUMN meta u8 NULL\r\n", "ALTER TABLE f RENAME COLUMN n TO m\r\n",
+                 "CREATE SLOT 's' ON f\r\n", "COMPACT TOMBSTONES f BEFORE 1\r\n",
+                 "MIGRATE 'race' ALTER TABLE f ADD COLUMN extra u8 NULL\r\n"})
+            ExpectError(engine.Execute(*session, line), "INVALID_ARGUMENT reason=follower ");
+    }
+    reopen.join();
+    describe.join();
+    assert(DescribeField(pair.follower.Run("DESCRIBE f"), "version") == ":1");
+}
+
+// A follower's checkpoint keeps an emptied chunk instead of collecting it.
+void TestFollowerCheckpoint() {
+    Pair pair;
+    assert(pair.follower.Run("ALTER TABLE f SET checkpoint_updates = 1") == "+OK\r\n");
+    assert(pair.primary.Run("SET BLOCK 2 0 IN t n = 3").front() == ':');
+    assert(pair.ApplyForms({{1, 0}}) == "+applied\r\n");
+    assert(pair.primary.Run("DELETE BLOCK 2 0 FROM t").front() == ':');
+    assert(pair.ApplyForms({{1, 0}}) == "+applied\r\n");
+    pair.ExpectSameChunk(1, 0);
+    assert(pair.follower.Run("SHOW TABLE STATS f").find("$10\r\ntombstones\r\n:0\r\n") != std::string::npos);
+    pair.follower.Restart();
+    pair.ExpectSameChunk(1, 0);
+    pair.ExpectSameRevision();
+    assert(pair.follower.Run("SHOW TABLE STATS f").find("$10\r\ntombstones\r\n:0\r\n") != std::string::npos);
+}
+
+// The primary's commit of two chunks, as one push.
+std::string TwoChunkCommit(Pair& pair) {
+    assert(pair.primary.Run("BEGIN") == "+OK\r\n");
+    assert(pair.primary.Run("SET BLOCK 0 0 IN t n = 4") == "_\r\n");
+    assert(pair.primary.Run("SET BLOCK 2 0 IN t n = 5, s = 'x'") == "_\r\n");
+    assert(!StartsWith(pair.primary.Run("COMMIT"), "-ERR"));
+    std::vector<Chunk> chunks;
+    std::string first;
+    for (const auto& [cx, cy] : std::vector<std::pair<std::int64_t, std::int64_t>>{{0, 0}, {1, 0}}) {
+        const auto form = Form(pair.primary.Run("GET CHUNK " + std::to_string(cx) + " " + std::to_string(cy) + " FROM t"));
+        if (first.empty()) first = form;
+        chunks.push_back(FormChunk(cx, cy, FormVersion(form), form));
+    }
+    return CommitPush(pair.epoch, FormVersion(first), FormTime(first), std::nullopt, FormSchema(first), chunks);
+}
+
+// The follower after a failed APPLY of TwoChunkCommit: both chunks or
+// neither, and sending the push again completes it.
+void ExpectWholeOrNothing(Pair& pair, const std::string& push, bool committed) {
+    auto& follower = pair.follower;
+    if (committed) {
+        pair.ExpectSameChunk(0, 0);
+        pair.ExpectSameChunk(1, 0);
+        pair.ExpectSameRevision();
+        assert(follower.Apply(push) == "+skipped\r\n");
+    } else {
+        assert(follower.Run("GET CHUNK 0 0 FROM f") == "_\r\n");
+        assert(follower.Run("GET CHUNK 1 0 FROM f") == "_\r\n");
+        assert(DescribeField(follower.Run("DESCRIBE f"), "revision") == ":0");
+        assert(follower.Apply(push) == "+applied\r\n");
+    }
+    pair.ExpectSameChunk(0, 0);
+    pair.ExpectSameChunk(1, 0);
+    pair.ExpectSameRevision();
+}
+
+// A commit record that cannot be made durable answers OUTCOME_UNKNOWN; after
+// a restart the push is skipped, since the commit stands.
+void TestOutcomeUnknownResend() {
+    Pair pair;
+    const auto push = TwoChunkCommit(pair);
+    {
+        ScopedEnv rename("CHUNKDB_FAILPOINT_TXN_COMMIT_INTENT_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
+        ScopedEnv sync("CHUNKDB_FAILPOINT_TXN_COMMIT_INTENT_COMPLETION_SYNC_FAIL_ONCE", "1");
+        ExpectError(pair.follower.Apply(push), "OUTCOME_UNKNOWN ");
+    }
+    pair.follower.Restart();
+    ExpectWholeOrNothing(pair, push, true);
+}
+
+constexpr int kCrashExit = 86;
+
+int RunChild(const std::string& executable, const std::vector<std::string>& args) {
+    std::string command = "\"" + executable + "\"";
+    for (const auto& arg : args) command += " \"" + arg + "\"";
+#ifdef _WIN32
+    command = "\"" + command + "\"";
+    return std::system(command.c_str());
+#else
+    const int status = std::system(command.c_str());
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+// Child: APPLY of the push in `push_file` into the catalog at `dir` with a
+// crash failpoint armed; returns only when it did not crash.
+int RunApplyCrashChild(const std::filesystem::path& dir, const std::filesystem::path& push_file,
+    const char* failpoint, const char* value) {
+    std::ifstream input(push_file, std::ios::binary);
+    const std::string push{std::istreambuf_iterator<char>(input), std::istreambuf_iterator<char>()};
+    CatalogConfig config;
+    config.data_dir = dir;
+    auto catalog = std::make_shared<TableCatalog>(config);
+    CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
+    auto session = Greeted(engine);
+    const ScopedEnv armed(failpoint, value);
+    const Parameters parameters{push};
+    (void)engine.Execute(*session, "APPLY $1\r\n", parameters);
+    return 3;
+}
+
+// A process that crashes at each step of a two-chunk APPLY leaves the
+// follower with the whole commit or none of it.
+void TestCrashDuringApply(const std::string& executable) {
+    struct Case {
+        const char* failpoint;
+        const char* value;
+        bool committed;
+    };
+    for (const auto& item : std::vector<Case>{
+             {"CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_INTENT_PUBLISH_ONCE", "1", false},
+             {"CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_FRAMES", "0", false},
+             {"CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_FRAMES", "1", false},
+             {"CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_FRAMES", "2", false},
+             {"CHUNKDB_FAILPOINT_CRASH_TXN_BEFORE_COMMIT_PUBLISH_ONCE", "1", false},
+             {"CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_COMMIT_PUBLISH_ONCE", "1", true},
+             {"CHUNKDB_FAILPOINT_CRASH_TXN_BEFORE_INTENT_UNLINK_ONCE", "1", true}}) {
+        Pair pair;
+        const auto push = TwoChunkCommit(pair);
+        test::ScopedTempDir files("chunkdb-apply-push");
+        const auto push_file = files.path() / "push";
+        {
+            std::ofstream output(push_file, std::ios::binary);
+            output.write(push.data(), static_cast<std::streamsize>(push.size()));
+        }
+        pair.follower.Close();
+        const int code = RunChild(executable,
+            {"--apply-crash-child", pair.follower.dir.path().string(), push_file.string(), item.failpoint, item.value});
+        if (code != kCrashExit) {
+            std::fprintf(stderr, "child for %s=%s exited with %d\n", item.failpoint, item.value, code);
+            assert(false);
+        }
+        pair.follower.Open();
+        ExpectWholeOrNothing(pair, push, item.committed);
+        pair.follower.Restart();
+        pair.ExpectSameChunk(0, 0);
+        pair.ExpectSameRevision();
+    }
+}
+
+// A backup of a follower restores as a writable table with a new epoch whose
+// lineage is the primary's epoch at the cut.
+void TestRestoreFollowerWritable() {
+    test::ScopedTempDir backups("chunkdb-apply-backups");
+    Pair pair(backups.path());
+    assert(pair.primary.Run("SET BLOCK 0 0 IN t n = 6").front() == ':');
+    assert(pair.ApplyForms({{0, 0}}) == "+applied\r\n");
+    auto& follower = pair.follower;
+    assert(follower.Run("BACKUP TO 'b1'").front() == '%');
+    assert(follower.Run("RESTORE TABLE f FROM 'b1' AS g").front() == '%');
+    const auto describe = follower.Run("DESCRIBE g");
+    assert(describe.find("follower") == std::string::npos);
+    assert(DescribeField(describe, "epoch") != pair.epoch);
+    const auto cut = std::stoull(DescribeField(describe, "revision").substr(1U));
+    assert(follower.Run("GET CHUNK 0 0 FROM g") == pair.primary.Run("GET CHUNK 0 0 FROM t"));
+    const auto written = follower.Run("SET BLOCK 1 1 IN g n = 7");
+    assert(written.front() == ':' && std::stoull(written.substr(1U)) > cut);
+    // The follower itself stays a follower.
+    ExpectError(follower.Run("SET BLOCK 1 1 IN f n = 7"), "INVALID_ARGUMENT reason=follower ");
 }
 
 // Option type 14 is moved out of the options area and written back.
@@ -406,7 +645,10 @@ void TestManifestFollower() {
 
 }  // namespace
 
-int main() {
+int main(int argc, char** argv) {
+    if (argc == 6 && std::string(argv[1]) == "--apply-crash-child")
+        return RunApplyCrashChild(argv[2], argv[3], argv[4], argv[5]);
+    assert(argc >= 1);
     TestManifestFollower();
     TestDecoder();
     TestFollowerTable();
@@ -414,5 +656,10 @@ int main() {
     TestApplyRows();
     TestApplyRefusals();
     TestProgressAndRestart();
+    TestDdlRacingReopen();
+    TestFollowerCheckpoint();
+    TestOutcomeUnknownResend();
+    TestCrashDuringApply(argv[0]);
+    TestRestoreFollowerWritable();
     return 0;
 }

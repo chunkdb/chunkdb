@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
@@ -962,17 +963,6 @@ void RequireLocalWrites(const ChunkStore& store, std::string_view table, std::st
             " is refused; it changes only through APPLY");
 }
 
-// The DDL a follower refuses: only APPLY changes its schema, tombstones and slots.
-void RequireNotFollower(TableCatalog& catalog, const std::string& name, std::string_view verb) {
-    if (const auto table = catalog.Find(name); table != nullptr && table->Info().follower)
-        throw TableArgumentError("follower", "table '" + name + "' is a follower: " + std::string(verb) +
-            " is refused; it changes only through APPLY");
-}
-
-[[nodiscard]] bool ChangesFollowedState(const cql::AlterTable& alter) {
-    return !std::holds_alternative<cql::SetOption>(alter.change) && !std::holds_alternative<cql::RenameTable>(alter.change);
-}
-
 // CREATE TABLE ... WITH follower = 'epoch': the epoch, and the statement
 // without the option, whose other options DefinitionFrom reads.
 [[nodiscard]] std::optional<StoreId> TakeFollowerOption(cql::CreateTable& create) {
@@ -1003,11 +993,12 @@ void RequireNotFollower(TableCatalog& catalog, const std::string& name, std::str
 }
 
 // APPLY $1 into the follower whose epoch the push names.
-[[nodiscard]] std::string ApplyPush(TableCatalog& catalog, const std::optional<std::string>& frame) {
+[[nodiscard]] std::string ApplyPush(
+    const std::function<std::shared_ptr<Table>(const StoreId&)>& find, const std::optional<std::string>& frame) {
     if (!frame.has_value()) throw std::invalid_argument("the push cannot be NULL");
     const auto value = DecodeReplicationValue(*frame);
     const auto header = ReadReplicationPushHeader(value);
-    const auto table = catalog.FindByEpoch(header.epoch);
+    const auto table = find(header.epoch);
     const auto lease = table != nullptr ? table->Acquire() : std::nullopt;
     if (!lease) throw TableNotFoundError("no table of this server has epoch " + StoreIdHex(header.epoch));
     ChunkStore& store = lease->store();
@@ -1074,7 +1065,8 @@ void RequireNotFollower(TableCatalog& catalog, const std::string& name, std::str
             if (form.header.chunk_version != push.revision || form.header.commit_time_ms != push.commit_time_ms)
                 throw TableArgumentError("apply", "the form of chunk " + coordinates(chunk.coord) +
                     " does not carry the push's revision and commit time");
-            state = DecodeSectionedChunkState(geometry, bytes, kVarMaxChunkBytesLimit, {}, limit);
+            // The table's value limit, as rows meet in SetBlockInState.
+            state = DecodeSectionedChunkState(geometry, bytes, store.var_max_chunk_bytes(), {}, limit);
         } else {
             // A deletion leaves the chunk written and empty.
             state = store.ReadChunkState(chunk.coord);
@@ -1346,6 +1338,24 @@ bool CommandEngine::HasServerRight(SessionState& session, ServerRight right) con
     if (!config_.require_auth) return true;
     const User* user = CurrentUser(session);
     return user != nullptr && chunkdb::HasServerRight(*user, right);
+}
+
+std::shared_ptr<Table> CommandEngine::TableOfEpoch(const StoreId& epoch) const {
+    {
+        std::lock_guard lock(epoch_tables_mutex_);
+        if (const auto found = epoch_tables_.find(epoch); found != epoch_tables_.end()) {
+            // Still the table serving its name: a drop, swap or rename retires it.
+            if (auto table = found->second.lock(); table != nullptr && catalog_->Find(table->name()) == table)
+                return table;
+        }
+    }
+    auto table = catalog_->FindByEpoch(epoch);
+    if (table != nullptr) {
+        std::lock_guard lock(epoch_tables_mutex_);
+        if (epoch_tables_.size() >= 4096U) std::erase_if(epoch_tables_, [](const auto& entry) { return entry.second.expired(); });
+        epoch_tables_[epoch] = table;
+    }
+    return table;
 }
 
 void CommandEngine::RequireReplication(SessionState& session) const {
@@ -1729,7 +1739,6 @@ std::string CommandEngine::ExecuteStatement(
                         },
                         [&](const cql::AlterTable& alter) {
                             RequireRight(session, alter.table, Right::kAdmin);
-                            if (ChangesFollowedState(alter)) RequireNotFollower(*catalog_, alter.table, "MIGRATE");
                             request.kind = MigrationRequest::Kind::kAlter;
                             request.table = alter.table;
                             std::visit(Overloaded{
@@ -1804,7 +1813,6 @@ std::string CommandEngine::ExecuteStatement(
                         },
                         [&](const cql::CreateSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
-                            RequireNotFollower(*catalog_, slot.table, "MIGRATE");
                             request.kind = MigrationRequest::Kind::kCreateSlot; request.table = slot.table; request.slot = slot.name; request.if_not_exists = slot.if_not_exists;
                             request.slot_filters = {.area = slot.area, .no_before = slot.no_before, .chunks = slot.chunks};
                             request.slot_columns = slot.columns;
@@ -1934,7 +1942,6 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::CreateSlot& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, create.table, Right::kAdmin);
-                    RequireNotFollower(*catalog_, create.table, "CREATE SLOT");
                     const auto table = catalog_->Require(create.table);
                     (void)table->CreateFeedSlot(create.name, create.if_not_exists, SlotFilters(table, create),
                         SlotOwner(create, config_.require_auth, session.user), create.owner.has_value());
@@ -2484,7 +2491,6 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::AlterTable& alter) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, alter.table, Right::kAdmin);
-                    if (ChangesFollowedState(alter)) RequireNotFollower(*catalog_, alter.table, "ALTER TABLE");
                     std::visit(
                         Overloaded{
                             [&](const cql::AddColumn& add) {
@@ -2603,7 +2609,6 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::CompactTombstones& compact) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireRight(session, compact.table, Right::kAdmin);
-                    RequireNotFollower(*catalog_, compact.table, "COMPACT TOMBSTONES");
                     std::string reply;
                     Protocol::AppendInteger(reply, catalog_->CompactTombstones(compact.table, compact.before));
                     return reply;
@@ -2704,7 +2709,8 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::Apply& apply) {
                     command_class = MetricsRegistry::CommandClass::kChunkWrite;
                     RequireReplication(session);
-                    return ApplyPush(*catalog_, parameters[apply.push.index - 1U]);
+                    return ApplyPush([this](const StoreId& epoch) { return TableOfEpoch(epoch); },
+                        parameters[apply.push.index - 1U]);
                 },
                 [&](const cql::Backup& backup) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;

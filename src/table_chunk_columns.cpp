@@ -17,6 +17,7 @@ bool TableCatalog::ChangeChunkColumnsIfNeeded(
     auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
+    table->RequireLocalDdl("ALTER TABLE");
     {
         auto lease = table->Acquire();
         if (!lease) throw TableNotFoundError("table was dropped");

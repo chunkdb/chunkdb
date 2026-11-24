@@ -410,7 +410,11 @@ std::uint64_t ChunkStore::CommitTransactionImpl(
     }
 
     // Everything the caller passed is checked before any chunk is touched.
-    if (writes.size() > query_limits_.txn_max_written_chunks) {
+    // APPLY takes the primary's commit whatever this table's limit: a commit
+    // it refused would stop the follower for good.
+    const std::size_t written_limit = replicated != nullptr
+        ? std::max(writes.size(), query_limits_.txn_max_written_chunks) : query_limits_.txn_max_written_chunks;
+    if (writes.size() > written_limit) {
         throw std::invalid_argument(
             "a transaction writes at most " + std::to_string(query_limits_.txn_max_written_chunks) + " chunks");
     }
@@ -706,9 +710,9 @@ std::uint64_t ChunkStore::CommitTransactionImpl(
     }
     const auto intent_path = TxnIntentPath(data_dir_, version);
     const auto intent_dir = intent_path.parent_path();
-    const auto rollback_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, query_limits_.txn_max_written_chunks);
+    const auto rollback_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, written_limit);
     intent.state = TxnIntentState::kCommitted;
-    const auto commit_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, query_limits_.txn_max_written_chunks);
+    const auto commit_record = SerializeTxnIntent(intent, geometry_.dims(), store_id_, written_limit);
 
     // From the intent to its commit form, read-only processes do not take
     // these chunks.

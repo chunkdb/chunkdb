@@ -151,7 +151,7 @@ struct TableInfo {
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
     TableSchema chunk_schema{};
-    // A follower table (docs/design/REPLICATION_APPLY.md); false while its store is closed.
+    // A follower table (docs/design/REPLICATION_APPLY.md).
     bool follower = false;
 };
 
@@ -255,6 +255,12 @@ class Table : public std::enable_shared_from_this<Table> {
 
     [[nodiscard]] const std::string& name() const noexcept { return name_; }
     [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
+    // A follower table (docs/design/REPLICATION_APPLY.md), fixed when the
+    // table opens: APPLY alone changes its data, schema, tombstones and slots.
+    [[nodiscard]] bool follower() const noexcept { return follower_; }
+    // Throws TableArgumentError reason=follower for a follower; DDL calls it
+    // under ddl_mutex_.
+    void RequireLocalDdl(std::string_view verb) const;
     [[nodiscard]] const std::optional<TableLineage>& lineage() const noexcept { return lineage_; }
     // Changes when the table's columns change.
     [[nodiscard]] Geometry geometry() const;
@@ -390,6 +396,7 @@ class Table : public std::enable_shared_from_this<Table> {
     const std::filesystem::path dir_;
     const StoreId store_id_;
     const std::optional<TableLineage> lineage_;
+    const bool follower_;
     const std::size_t feed_buffer_bytes_;
     std::atomic<std::size_t> effective_feed_buffer_bytes_;
     const std::chrono::milliseconds feed_linger_;

@@ -202,13 +202,15 @@ Only UNWATCH is accepted while streaming.
 
 `APPLY $1` writes one replication push into the follower table whose epoch the push names, so the follower keeps the primary's epoch, revision, chunk versions, commit times and users.
 It needs REPLICATION, and is refused inside a transaction and on a `--read-only` server.
-`$1` is the push as the server sent it, its RESP3 bytes, at most `--feed-buffer-bytes`.
+`$1` is the push as the server sent it, its RESP3 bytes, at most `--feed-buffer-bytes` and 1048576 values.
 A `replication` push is `[replication, epoch, revision, commit_time_ms, user, schema_version, chunks, null, null]`; each chunk is `[cx, cy(, cz), version, kind, data]` with `version` equal to `revision`.
 Kind `form` carries the chunk's form after the commit, or null when the commit left it empty; kind `rows` carries `[blocks, chunk_row]`, each block `[x, y(, z), row]` with the row's values in column order as bulk strings in their [parameter encoding](../PROTOCOL.md#parameters), null for NULL, or null for a deleted block, and `chunk_row` the chunk columns the same way, or null when unchanged.
 A `progress` push, `[progress, epoch, revision]`, raises the follower's revision.
 The reply is `applied`, or `skipped` when the follower's revision is already at or above the push's.
 Every chunk of a push commits at its revision, whole or not at all, and is durable when APPLY answers, in every durability mode.
 After a restart the follower's revision is its last applied commit; progress applied since is not kept.
+A commit applies whatever the follower's `--txn-max-written-chunks`; the follower's `var_max_chunk_bytes` must be at least the primary's.
+A follower's checkpoints do not collect its empty chunks.
 
 A follower is made with `CREATE TABLE f (...) WITH follower = 'epoch'`, the primary table's epoch, for a primary table without commits or schema changes.
 It refuses SET BLOCK, DELETE BLOCK, SET CHUNK, ALTER TABLE column and check changes, COMPACT TOMBSTONES, CREATE SLOT and MIGRATE with `INVALID_ARGUMENT reason=follower`; reads, WATCH, DROP TABLE, RENAME TO and ALTER TABLE SET of options work.

@@ -144,6 +144,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             }
             if (table) {
                 ddl = std::unique_lock(table->ddl_mutex_);
+                if (request.kind == MigrationRequest::Kind::kAlter || request.kind == MigrationRequest::Kind::kCreateSlot)
+                    table->RequireLocalDdl("MIGRATE");
                 if (request.kind == MigrationRequest::Kind::kCreateSlot) {
                     // Checked before any outcome is recorded, a conditional no-op included.
                     if (request.slot_owner) RequireValidFeedSlotOwner(*request.slot_owner);
