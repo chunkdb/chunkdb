@@ -2016,6 +2016,8 @@ bool TakeoverTerminal(std::string_view line) {
 void ValidateEnabledArgs(const Args& args) {
     if (args.port == 0 && args.server_mode != ServerMode::kSpawn)
         throw std::invalid_argument("--port 0 requires --server-mode spawn");
+    if ((args.chunk_blocks != 16U || args.block_bits != 16U) && args.server_mode != ServerMode::kSpawn)
+        throw std::invalid_argument("--chunk-blocks and --block-bits require --server-mode spawn");
     if (args.with_metadata != "none" && args.with_metadata != "version" &&
         args.with_metadata != "schema" && args.with_metadata != "both") throw std::invalid_argument("invalid --with value");
     if (args.watch_mode != "ordinary" && args.watch_mode != "progress" &&
@@ -2142,6 +2144,8 @@ std::string UsageText() {
         << "  --tests takeover                report-only idle ownership cycles; clients/pipeline must be 1\n"
         << "  --server-workers <N>             spawn mode: server worker threads (default: 4); a\n"
         << "                                   connection holds one, so use at least --clients\n"
+        << "  --chunk-blocks <N>               spawn mode: chunks of N x N blocks (default: 16)\n"
+        << "  --block-bits <N>                 spawn mode: bits(N) blocks (default: 16)\n"
         << "  --failed-logins <N>              report-only: N clients log in with a wrong password\n"
         << "                                   beside the measured clients; requires --user\n"
         << "  --user <name>                    log in as this user (also from --uri)\n"
@@ -2296,6 +2300,16 @@ Args ParseArgs(const std::vector<std::string>& argv) {
             args.server_workers = ParsePositiveSize(require_value("--server-workers"), "--server-workers");
             continue;
         }
+        if (arg == "--chunk-blocks") {
+            args.chunk_blocks = ParsePositiveSize(require_value("--chunk-blocks"), "--chunk-blocks");
+            if (args.chunk_blocks > 1024U) throw std::invalid_argument("--chunk-blocks must be between 1 and 1024");
+            continue;
+        }
+        if (arg == "--block-bits") {
+            args.block_bits = ParsePositiveSize(require_value("--block-bits"), "--block-bits");
+            if (args.block_bits > 65535U) throw std::invalid_argument("--block-bits must be between 1 and 65535");
+            continue;
+        }
         if (arg == "--failed-logins") {
             args.failed_logins = ParsePositiveSize(require_value("--failed-logins"), "--failed-logins");
             continue;
@@ -2436,9 +2450,9 @@ BenchmarkReport Run(const Args& requested) {
             .geometry = {
                 .large_chunk_width_chunks = 8,
                 .large_chunk_height_chunks = 8,
-                .chunk_width_blocks = 16,
-                .chunk_height_blocks = 16,
-                .block_bits = 16,
+                .chunk_width_blocks = static_cast<std::uint32_t>(args.chunk_blocks),
+                .chunk_height_blocks = static_cast<std::uint32_t>(args.chunk_blocks),
+                .block_bits = static_cast<std::uint32_t>(args.block_bits),
             },
             .data_dir = data_dir,
             .durability_mode = ParseDurabilityMode(args.durability_mode),

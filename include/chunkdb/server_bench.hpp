@@ -54,6 +54,10 @@ struct Args {
     // Worker threads of the server spawn mode starts. A connection holds a
     // worker until it closes, so fewer workers than clients serialize them.
     std::size_t server_workers = 4;
+    // Table `default` of the server spawn mode starts: square chunks of this
+    // many blocks a side, one bits(block_bits) column.
+    std::size_t chunk_blocks = 16;
+    std::size_t block_bits = 16;
     // Per send/receive wait; also configures the spawned server.
     std::size_t io_timeout_ms = 5000;
     // Watches open on this table throughout the run: --watch TABLE[:COUNT][:slots].

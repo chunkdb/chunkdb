@@ -143,49 +143,70 @@ ChunkFormSections ParseChunkFormSections(
     return result;
 }
 
-std::vector<std::uint8_t> SerializeChunkFormSections(
-    const ChunkFormHeader& header, std::span<const ChunkFormSection> sections,
-    std::size_t max_bytes) {
+namespace {
+
+// The checks, reservation, header and directory of a form of `count`
+// sections, whose kinds and body lengths `kind(i)` and `length(i)` give.
+template <typename Kind, typename Length>
+std::size_t AppendHead(std::vector<std::uint8_t>* out, const ChunkFormHeader& header, std::size_t count,
+    const Kind& kind, const Length& length, std::size_t max_bytes) {
     ValidateHeader(header);
-    if (sections.size() > kMaxSections) throw std::invalid_argument("too many chunk form sections");
+    if (count > kMaxSections) throw std::invalid_argument("too many chunk form sections");
     const auto limit = WireLimit(max_bytes);
-    auto total = kHeaderBytes + sections.size() * kDirectoryEntryBytes;
+    auto total = kHeaderBytes + count * kDirectoryEntryBytes;
     if (total > limit) throw std::invalid_argument("chunk form exceeds byte limit");
     std::uint16_t previous = 0;
     bool presence = false, spans = false;
-    for (std::size_t i = 0; i < sections.size(); ++i) {
-        const auto& section = sections[i];
-        ValidateKinds(section.kind, previous, i);
-        previous = section.kind;
-        if (!KnownKind(section.kind)) throw std::invalid_argument("unknown_form_section");
-        if (section.body.size() > limit - total)
+    for (std::size_t i = 0; i < count; ++i) {
+        const std::uint16_t section = kind(i);
+        ValidateKinds(section, previous, i);
+        previous = section;
+        if (!KnownKind(section)) throw std::invalid_argument("unknown_form_section");
+        if (length(i) > limit - total)
             throw std::invalid_argument("chunk form exceeds byte limit");
-        total += section.body.size();
-        presence |= section.kind == static_cast<std::uint16_t>(ChunkFormSectionKind::kPresence);
-        spans |= section.kind == static_cast<std::uint16_t>(ChunkFormSectionKind::kBlockSpans);
+        total += length(i);
+        presence |= section == static_cast<std::uint16_t>(ChunkFormSectionKind::kPresence);
+        spans |= section == static_cast<std::uint16_t>(ChunkFormSectionKind::kBlockSpans);
     }
     RequireSections(presence, spans);
 
-    std::vector<std::uint8_t> out;
-    out.reserve(total);
-    out.insert(out.end(), {'C', 'K', 'C', 'F'});
-    WriteLe(&out, 1, 2);
-    WriteLe(&out, header.flags, 2);
-    WriteLe(&out, header.chunk_version, 8);
-    WriteLe(&out, header.schema_version, 8);
-    WriteLe(&out, header.commit_time_ms, 8);
-    WriteLe(&out, sections.size(), 2);
-    WriteLe(&out, 0, 2);
-    auto offset = kHeaderBytes + sections.size() * kDirectoryEntryBytes;
-    for (const auto& section : sections) {
-        WriteLe(&out, section.kind, 2);
-        WriteLe(&out, 0, 2);
-        WriteLe(&out, offset, 4);
-        WriteLe(&out, section.body.size(), 4);
-        offset += section.body.size();
+    out->reserve(out->size() + total);
+    out->insert(out->end(), {'C', 'K', 'C', 'F'});
+    WriteLe(out, 1, 2);
+    WriteLe(out, header.flags, 2);
+    WriteLe(out, header.chunk_version, 8);
+    WriteLe(out, header.schema_version, 8);
+    WriteLe(out, header.commit_time_ms, 8);
+    WriteLe(out, count, 2);
+    WriteLe(out, 0, 2);
+    auto offset = kHeaderBytes + count * kDirectoryEntryBytes;
+    for (std::size_t i = 0; i < count; ++i) {
+        WriteLe(out, kind(i), 2);
+        WriteLe(out, 0, 2);
+        WriteLe(out, offset, 4);
+        WriteLe(out, length(i), 4);
+        offset += length(i);
     }
+    return total;
+}
+
+}  // namespace
+
+std::vector<std::uint8_t> SerializeChunkFormSections(
+    const ChunkFormHeader& header, std::span<const ChunkFormSection> sections,
+    std::size_t max_bytes) {
+    std::vector<std::uint8_t> out;
+    (void)AppendHead(&out, header, sections.size(), [&](std::size_t i) { return sections[i].kind; },
+        [&](std::size_t i) { return sections[i].body.size(); }, max_bytes);
     for (const auto& section : sections) out.insert(out.end(), section.body.begin(), section.body.end());
     return out;
+}
+
+std::size_t AppendChunkFormHead(
+    std::vector<std::uint8_t>* out, const ChunkFormHeader& header,
+    std::span<const ChunkFormSectionLength> sections, std::size_t max_bytes) {
+    return AppendHead(out, header, sections.size(), [&](std::size_t i) { return sections[i].kind; },
+        [&](std::size_t i) { return sections[i].length; }, max_bytes);
 }
 
 std::vector<ChunkFormBlockColumn> ParseChunkFormBlockColumns(
