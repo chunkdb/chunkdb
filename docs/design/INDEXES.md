@@ -62,6 +62,7 @@ The delta is bounded by `index_delta_bytes`, 64 MiB per table by default; above 
 
 A flush writes the delta as a run file with a temporary name in the index directory, syncs it, renames it and syncs the directory, then publishes a new index manifest the same way.
 The manifest lists the runs and their checksums and records the table epoch; its atomic replacement is the only commit point of a flush or merge.
+A failure after the manifest was replaced but before memory follows it fails the index closed until it is reopened, and no generation is used twice, so no run a manifest may list is rewritten.
 Runs and manifests are written in every durability mode; they are a cache of chunk state and never carry a write that its chunk lost.
 A run may cover a chunk state that the chunk's WAL later loses in relaxed mode; recovery then finds a different revision for that chunk and rebuilds its entries.
 Within one epoch and clock a revision is never reissued, because the store clock reserves ranges durably before issuing them, so an equal revision means the same chunk state.

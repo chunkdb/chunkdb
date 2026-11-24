@@ -164,6 +164,8 @@ class SecondaryIndex {
     [[nodiscard]] std::vector<std::string> Verify(const IndexChunkSource& source) const;
 
     [[nodiscard]] IndexState state() const noexcept { return manifest_.state; }
+    // A manifest publication failed after it may have replaced the manifest.
+    [[nodiscard]] bool failed() const noexcept { return failed_; }
     [[nodiscard]] std::size_t runs() const noexcept { return manifest_.runs.size(); }
     [[nodiscard]] std::size_t delta_chunks() const noexcept { return delta_.size(); }
     [[nodiscard]] std::uint64_t manifest_generation() const noexcept { return manifest_.generation; }
@@ -186,6 +188,8 @@ class SecondaryIndex {
     void LoadOrThrow();
     void RebuildInMemory(const IndexChunkSource& source);
     void RequireWriter() const;
+    void RequireUsable() const;
+    [[nodiscard]] std::uint64_t NextGeneration() noexcept;
     void RemoveUnlisted() const;
     void Clear() noexcept;
     void PublishManifest(IndexManifest next);
@@ -200,6 +204,11 @@ class SecondaryIndex {
     std::size_t column_index_;
     IndexIdentity identity_;
     bool read_only_;
+    // Set from a manifest replacement until memory follows it; every change
+    // then throws until Open runs again.
+    bool failed_ = false;
+    // The highest generation this index may have put on disk.
+    std::uint64_t issued_ = 0U;
     IndexManifest manifest_{};
     std::vector<std::uint64_t> run_entries_;
     std::map<ChunkCoord, DeltaChunk> delta_;

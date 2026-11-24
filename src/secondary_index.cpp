@@ -532,8 +532,20 @@ std::filesystem::path SecondaryIndex::RunPath(const std::filesystem::path& direc
     return directory / (std::string(kRunPrefix) + std::to_string(generation));
 }
 
+void SecondaryIndex::RequireUsable() const {
+    if (failed_) throw std::runtime_error("the index failed while publishing a manifest and must be reopened");
+}
+
 void SecondaryIndex::RequireWriter() const {
     if (read_only_) throw std::logic_error("a read-only index writes no file");
+    RequireUsable();
+}
+
+std::uint64_t SecondaryIndex::NextGeneration() noexcept {
+    // Never below anything this process may have published, even when a
+    // publication failed after it replaced the manifest.
+    issued_ = std::max(issued_, manifest_.generation) + 1U;
+    return issued_;
 }
 
 void SecondaryIndex::Clear() noexcept {
@@ -585,6 +597,8 @@ void SecondaryIndex::RemoveUnlisted() const {
 
 SecondaryIndex::OpenReport SecondaryIndex::Open(const IndexChunkSource& source) {
     OpenReport report;
+    failed_ = false;
+    issued_ = 0U;
     // A manifest or run this index cannot trust is replaced from chunk state,
     // which is the only source of truth; the reason is returned.
     try {
@@ -654,7 +668,8 @@ void SecondaryIndex::Rebuild(const IndexChunkSource& source) {
         if (RunGeneration(item.path(), &found)) generation = std::max(generation, found);
     }
     Clear();
-    manifest_ = IndexManifest{.identity = identity_, .state = IndexState::kBuilding, .generation = generation};
+    issued_ = std::max(issued_, generation);
+    manifest_ = IndexManifest{.identity = identity_, .state = IndexState::kBuilding, .generation = issued_};
     source.for_each([&](const ChunkCoord& coord, std::uint64_t, bool populated) {
         if (!populated) return;
         const auto state = source.read(coord);
@@ -667,12 +682,14 @@ void SecondaryIndex::Rebuild(const IndexChunkSource& source) {
 }
 
 void SecondaryIndex::Replace(const ChunkCoord& coord, std::uint64_t revision, std::vector<IndexEntry> entries) {
+    RequireUsable();
     if (revision == 0U) throw std::invalid_argument("an index chunk needs its producing revision");
     delta_[coord] = DeltaChunk{revision, std::move(entries)};
     covers_[coord] = Cover{kDelta, revision};
 }
 
 void SecondaryIndex::Forget(const ChunkCoord& coord) {
+    RequireUsable();
     delta_[coord] = DeltaChunk{};
     covers_[coord] = Cover{kDelta, 0U};
 }
@@ -797,16 +814,23 @@ void SecondaryIndex::PublishManifest(IndexManifest next) {
     temporary += ".tmp";
     WriteAtomicTempFile(temporary, SerializeIndexManifest(next), true, true);
     Crash("CHUNKDB_FAILPOINT_CRASH_INDEX_MANIFEST_BEFORE_RENAME_ONCE");
+    // From here the manifest on disk may already be the new one while memory
+    // still holds the old layers: the index fails closed until reopened.
+    failed_ = true;
     if (const auto error = ReplacePathAtomically(temporary, path); error)
         throw std::system_error(error, "failed to publish index manifest " + path.string());
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_INDEX_MANIFEST_AFTER_REPLACE_FAIL_ONCE"))
+        throw std::runtime_error("injected failure after replacing the index manifest");
     SyncDirectoryPath(directory_);
     manifest_ = std::move(next);
+    failed_ = false;
 }
 
 void SecondaryIndex::SetState(IndexState state) {
+    RequireWriter();
     auto next = manifest_;
     next.state = state;
-    ++next.generation;
+    next.generation = NextGeneration();
     PublishManifest(std::move(next));
 }
 
@@ -826,7 +850,7 @@ void SecondaryIndex::Flush(std::uint64_t oldest_snapshot) {
         Merge(oldest_snapshot);
         return;
     }
-    const auto generation = manifest_.generation + 1U;
+    const auto generation = NextGeneration();
     std::vector<IndexRunChunk> chunks;
     chunks.reserve(delta_.size());
     std::vector<const IndexEntry*> ordered;
@@ -861,7 +885,7 @@ void SecondaryIndex::Merge(std::uint64_t oldest_snapshot) {
     RequireWriter();
     if (manifest_.runs.size() <= 1U && delta_.empty()) return;
     const auto previous = manifest_.runs;
-    const auto generation = manifest_.generation + 1U;
+    const auto generation = NextGeneration();
     std::map<ChunkCoord, std::uint32_t> counts;
     for (const auto& [coord, cover] : covers_)
         if (cover.revision != 0U) counts.emplace(coord, 0U);

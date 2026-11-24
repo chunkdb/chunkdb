@@ -528,6 +528,52 @@ void RemovedEntriesFollowSnapshots() {
     assert(marked() == 0U);
 }
 
+// A failure after the manifest was replaced, before memory follows it, fails
+// the index closed: a retry with a changed delta cannot rewrite the run the
+// new manifest lists. Reopening trusts that manifest and recomputes the rest.
+void FailedPublicationFailsClosed() {
+    if (!kFailpointsCompiled) return;
+    test::ScopedTempDir directory("chunkdb-secondary-index-failed");
+    const ChunkLayout layout(Schema(), kBlocks, 1U << 20U);
+    const auto column = ColumnIndex(layout, "u");
+    Model model;
+    for (std::int64_t x = 0; x < 20; ++x) model.Write(layout, {x, 0, 0});
+    SecondaryIndex index(directory.path(), layout, column, Identity(1U));
+    (void)index.Open(model.Source());
+    const auto write = [&](SecondaryIndex& target, const ChunkCoord& coord) {
+        model.Write(layout, coord);
+        const auto& chunk = model.chunks.at(coord);
+        if (!chunk.populated) {
+            target.Forget(coord);
+            return;
+        }
+        target.Replace(coord, chunk.revision, ChunkIndexEntries(layout, column, 0U, coord, chunk.state.presence_bitmap,
+            chunk.state.payload, chunk.state.vars));
+    };
+    const auto refused = [](const std::function<void()>& action) {
+        try { action(); } catch (const std::runtime_error&) { return true; }
+        return false;
+    };
+    write(index, {0, 0, 0});
+#ifdef _WIN32
+    _putenv_s("CHUNKDB_FAILPOINT_INDEX_MANIFEST_AFTER_REPLACE_FAIL_ONCE", "1");
+#else
+    setenv("CHUNKDB_FAILPOINT_INDEX_MANIFEST_AFTER_REPLACE_FAIL_ONCE", "1", 1);
+#endif
+    assert(refused([&] { index.Flush(); }) && index.failed());
+    assert(refused([&] { write(index, {1, 0, 0}); }));
+    assert(refused([&] { index.Flush(); }) && refused([&] { index.Merge(); }));
+    SecondaryIndex reopened(directory.path(), layout, column, Identity(1U));
+    const auto report = reopened.Open(model.Source());
+    assert(report.rebuilt.empty() && report.recomputed == 1U && !reopened.failed());
+    assert(Same(Effective(reopened), Expected(layout, column, 0U, model)));
+    assert(reopened.Verify(model.Source()).empty());
+    write(reopened, {2, 0, 0});
+    reopened.Flush();
+    assert(Same(Effective(reopened), Expected(layout, column, 0U, model)));
+    assert(reopened.Verify(model.Source()).empty());
+}
+
 // The deterministic chunk state of the crash scenario at each step.
 void CrashModel(const ChunkLayout& layout, Model& model, int steps) {
     Populate(layout, model, 2U);
@@ -640,4 +686,5 @@ int main(int argc, char** argv) {
     ManifestRoundTripAndDamage();
     LayersFollowChunkState();
     RemovedEntriesFollowSnapshots();
+    FailedPublicationFailsClosed();
 }
