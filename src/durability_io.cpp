@@ -14,6 +14,7 @@
 #include <system_error>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "chunkdb/crc32.hpp"
@@ -61,6 +62,10 @@ void NoteDirectorySynced(const std::filesystem::path& path) {
     }
 }
 
+std::atomic<bool> g_descriptor_close_observed{false};
+std::mutex g_descriptor_close_observer_mutex;
+std::function<void(int)> g_descriptor_close_observer;
+
 std::atomic<bool> g_file_sync_observed{false};
 std::mutex g_file_sync_observer_mutex;
 std::function<void(const std::filesystem::path&)> g_file_sync_observer;
@@ -80,6 +85,12 @@ void SetDirectorySyncObserverForTests(std::function<void(const std::filesystem::
     std::lock_guard lock(g_directory_sync_observer_mutex);
     g_directory_sync_observed.store(static_cast<bool>(observer), std::memory_order_release);
     g_directory_sync_observer = std::move(observer);
+}
+
+void SetDescriptorCloseObserverForTests(std::function<void(int)> observer) {
+    std::lock_guard lock(g_descriptor_close_observer_mutex);
+    g_descriptor_close_observed.store(static_cast<bool>(observer), std::memory_order_release);
+    g_descriptor_close_observer = std::move(observer);
 }
 
 void SetFileSyncObserverForTests(std::function<void(const std::filesystem::path&)> observer) {
@@ -141,8 +152,11 @@ void LogWindowsDirectorySyncUnavailableOnce(
 }
 #endif
 #ifdef _WIN32
-void CloseHandleChecked(HANDLE handle, const std::filesystem::path& path, const std::string& action) {
-    if (CloseHandle(handle) == 0) {
+// Closes `handle` once and marks it closed, also when CloseHandle fails, so
+// no caller closes it again.
+void CloseHandleChecked(HANDLE& handle, const std::filesystem::path& path, const std::string& action) {
+    const HANDLE closing = std::exchange(handle, INVALID_HANDLE_VALUE);
+    if (CloseHandle(closing) == 0) {
         throw BuildWin32Error(action, path, GetLastError());
     }
 }
@@ -216,7 +230,6 @@ void WriteAtomicTempFile(
         }
 
         CloseHandleChecked(handle, tmp_path, "failed to close temporary file");
-        handle = INVALID_HANDLE_VALUE;
     } catch (...) {
         if (handle != INVALID_HANDLE_VALUE) {
             (void)CloseHandle(handle);
@@ -412,7 +425,9 @@ bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
         }
         CloseHandleChecked(handle, path, "failed to close synced directory");
     } catch (...) {
-        (void)CloseHandle(handle);
+        if (handle != INVALID_HANDLE_VALUE) {
+            (void)CloseHandle(handle);
+        }
         throw;
     }
     NoteDirectorySynced(path);
@@ -421,12 +436,24 @@ bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
 }  // namespace
 
 #else
-void CloseFdChecked(int fd, const std::filesystem::path& path, const std::string& action) {
-    while (::close(fd) != 0) {
-        if (errno == EINTR) {
-            continue;
+// Closes `fd` once and marks it closed (-1), also when close fails. A
+// failed close may still have released the descriptor (EINTR on Linux does),
+// and another thread may already own its number, so it is never closed
+// again; an interrupted close is reported like any other failure.
+void CloseFdChecked(int& fd, const std::filesystem::path& path, const std::string& action) {
+    const int closing = std::exchange(fd, -1);
+    int close_error = ::close(closing) == 0 ? 0 : errno;
+    if (g_descriptor_close_observed.load(std::memory_order_acquire)) {
+        std::lock_guard lock(g_descriptor_close_observer_mutex);
+        if (g_descriptor_close_observer) {
+            g_descriptor_close_observer(closing);
         }
-        throw BuildErrnoError(action, path, errno);
+    }
+    if (close_error == 0 && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CLOSE_INTERRUPTED_ONCE")) {
+        close_error = EINTR;
+    }
+    if (close_error != 0) {
+        throw BuildErrnoError(action, path, close_error);
     }
 }
 
@@ -474,7 +501,7 @@ void WriteAtomicTempFile(
     // fail rather than silently truncate it. O_NOFOLLOW: never write through a
     // symlink left in the target directory. EnsureDirectoryPathExists applies the
     // same stance on the directory axis.
-    const int fd =
+    int fd =
         ::open(tmp_path.c_str(), O_WRONLY | O_CREAT | O_EXCL | O_NOFOLLOW, 0600);
     if (fd < 0) {
         throw BuildErrnoError("failed to open temporary file", tmp_path, errno);
@@ -523,7 +550,9 @@ void WriteAtomicTempFile(
 
         CloseFdChecked(fd, tmp_path, "failed to close temporary file");
     } catch (...) {
-        (void)::close(fd);
+        if (fd >= 0) {
+            (void)::close(fd);
+        }
         std::error_code cleanup_ec;
         std::filesystem::remove(tmp_path, cleanup_ec);
         throw;
@@ -654,7 +683,7 @@ std::error_code ExchangeDirectories(
 namespace {
 // Returns false, without syncing, when `missing_ok` and `path` does not exist.
 bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
-    const int fd = ::open(path.c_str(), O_RDONLY);
+    int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         const int open_error = errno;
         if (missing_ok && open_error == ENOENT) {
@@ -666,7 +695,9 @@ bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
         SyncFdDurably(fd, path, true);
         CloseFdChecked(fd, path, "failed to close synced file");
     } catch (...) {
-        (void)::close(fd);
+        if (fd >= 0) {
+            (void)::close(fd);
+        }
         throw;
     }
     NoteFileSynced(path);
@@ -674,7 +705,7 @@ bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
 }
 
 bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
-    const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
+    int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
     if (fd < 0) {
         const int open_error = errno;
         if (missing_ok && open_error == ENOENT) {
@@ -705,7 +736,9 @@ bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
 #endif
         CloseFdChecked(fd, path, "failed to close synced directory");
     } catch (...) {
-        (void)::close(fd);
+        if (fd >= 0) {
+            (void)::close(fd);
+        }
         throw;
     }
     NoteDirectorySynced(path);
