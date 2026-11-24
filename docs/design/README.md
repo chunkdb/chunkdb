@@ -10,6 +10,7 @@
 - [Secondary indexes](INDEXES.md): keys, runs, write maintenance, recovery and GET BLOCKS.
 - [Revisions and frames](FORMAT_V2_DESIGN.md): persistent equality tokens and atomic mutations.
 - [Table restore](RESTORE_TABLE.md): online RESTORE TABLE, SWAP TABLES, RENAME TO and feed resync.
+- [Swap guard](SWAP_GUARD.md): SWAP TABLES by guarded renames where no atomic exchange exists.
 - [Tables](TABLES_DESIGN.md): catalog leases and directory publication.
 - [Transactions](TRANSACTIONS_DESIGN.md): snapshot history and durable decisions.
 - [Users](USERS_DESIGN.md): SCRAM, rights and metadata recovery.
