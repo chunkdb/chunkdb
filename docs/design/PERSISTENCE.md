@@ -9,8 +9,8 @@ Replication and durability across machines are not provided.
 | Operation / mode | Success guarantees |
 |---|---|
 | Ordinary writes, `relaxed` | Applied in memory; WAL frames may remain batched or unsynced, so power loss can lose acknowledged writes. |
-| Ordinary writes, `fsync-wal` | The WAL frame and required new directory entries are synced before acknowledgement. |
-| Ordinary writes, `fsync-checkpoint` | Synced WAL acknowledgement and synced checkpoint publication. |
+| Ordinary writes, `fsync-wal` | The WAL frame and required new directory entries are synced before acknowledgement; checkpoints are synced before they remove a WAL. |
+| Ordinary writes, `fsync-checkpoint` | The same as `fsync-wal`; the code treats every mode other than `relaxed` alike. |
 | `FLUSH WAL`, every mode | All writes acknowledged before the statement arrived are durable in every table. |
 | Transaction COMMIT, every mode | Every changed chunk of the table is committed together, durably, or none is committed. |
 
