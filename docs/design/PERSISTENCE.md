@@ -22,7 +22,7 @@ Changing a table's durability mode first flushes its pending batches; the new mo
 
 A checkpoint writes a same-directory temporary image, closes it with error checking, and atomically replaces the image.
 In synced modes the image and directory entry are synced before deleting the WAL it replaces.
-Relaxed mode preserves this durability floor once a FLUSH WAL starts its syncs and conservatively after reopening an initialized store.
+Relaxed mode preserves this durability floor once a FLUSH WAL or a slot pass, including the first pass at CREATE SLOT, starts its syncs, and conservatively after reopening an initialized store.
 Consequently a later checkpoint cannot discard an earlier barrier's durable state.
 
 Empty-chunk collection persists an empty-state frame where needed, removes the image before the WAL, and syncs these steps when durability requires it.
@@ -110,7 +110,7 @@ Slot activation quiesces writers and maintenance and durably establishes a check
 Slot passes sync completed producer state and persist a durable frontier; WATCH SLOT emits only through that frontier, including relaxed writes.
 ACK positions are monotonic; [change feed](../reference/FEED.md#notes) describes persistence and acknowledgement batching.
 Archives are released only using persisted positions; a sync failure fences the store.
-Activation alone does not establish the permanent FLUSH WAL durability floor.
+A slot pass drains its tracked set and sets the FLUSH WAL durability floor under the checkpoint publication lock, then syncs it without the lock, except on Windows; a store's first pass also syncs every WAL and image under the lock; checkpoints and the writes waiting on them do not wait for its syncs.
 
 Online backup pins completed per-table cuts and copies their checked inventory before publishing the synced completion record.
 It captures schema, users and the completed migrations ledger under one metadata gate, waits for active migrations and refuses unfinished recovery, a fenced catalog or table.

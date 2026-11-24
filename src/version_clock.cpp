@@ -96,6 +96,10 @@ bool IsValidInitializedStoreMarker(const std::vector<std::uint8_t>& bytes) {
     return IsValidInitializedMarker(bytes);
 }
 
+std::vector<std::uint8_t> SerializeInitializedStoreMarker() {
+    return SerializeInitializedMarker();
+}
+
 std::uint64_t NewChunkVersionToken() {
     static std::mutex rng_mutex;
     static std::mt19937_64 rng([] {
@@ -140,7 +144,8 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting, const std::error
         if (!IsValidInitializedMarker(marker_bytes)) {
             throw std::runtime_error(
                 "initialized-store marker is invalid: " +
-                initialized_marker_path.string());
+                initialized_marker_path.string() +
+                "; run chunkdb_admin rebuild-version-clock to replace it");
         }
     }
 
@@ -171,8 +176,9 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting, const std::error
                 " is missing but the valid initialized-store marker proves "
                 "that persisted version tokens were previously issued; the "
                 "deterministic chunk-version guarantee cannot be honored. "
-                "Restore the file from backup or intentionally reinitialize "
-                "the whole store; refusing to open with a reset clock");
+                "Restore the file from backup, run chunkdb_admin "
+                "rebuild-version-clock, or intentionally reinitialize the "
+                "whole store; refusing to open with a reset clock");
         }
         if (inventory_error) {
             throw std::runtime_error(
@@ -180,16 +186,16 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting, const std::error
                 " and " + initialized_marker_path.string() +
                 "; startup inventory is unavailable (ec=" + std::to_string(inventory_error.value()) +
                 ", msg='" + inventory_error.message() + "'), so this cannot be proved a new store. "
-                "Restore a consistent backup or intentionally reinitialize the whole store; "
-                "refusing to open with a reset clock");
+                "Restore a consistent backup, run chunkdb_admin rebuild-version-clock, or intentionally "
+                "reinitialize the whole store; refusing to open with a reset clock");
         }
         if (store_preexisting) {
             throw std::runtime_error(
                 "both version bookkeeping records are missing: " + version_clock_path_.string() +
                 " and " + initialized_marker_path.string() +
                 "; chunk artifacts or a capped startup scan prevent proving this is a new store. "
-                "Restore a consistent backup or intentionally reinitialize the whole store; "
-                "refusing to open with a reset clock");
+                "Restore a consistent backup, run chunkdb_admin rebuild-version-clock, or intentionally "
+                "reinitialize the whole store; refusing to open with a reset clock");
         }
         // Nothing proves that deterministic tokens were ever exposed: a new
         // store, or one whose initialization stopped after the manifest.
@@ -225,29 +231,36 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting, const std::error
     }
 
     std::vector<std::uint8_t> bytes;
+    std::uintmax_t record_size = kVersionClockRecordSize;
     try {
         std::error_code size_ec;
-        const auto record_size =
-            std::filesystem::file_size(version_clock_path_, size_ec);
+        record_size = std::filesystem::file_size(version_clock_path_, size_ec);
         if (size_ec) {
             throw std::runtime_error(
                 "failed to inspect record size: " + size_ec.message());
         }
-        if (record_size != kVersionClockRecordSize) {
-            throw std::runtime_error(
-                "record size is " + std::to_string(record_size) +
-                " bytes, expected " + std::to_string(kVersionClockRecordSize));
+        if (record_size == kVersionClockRecordSize) {
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_VERSION_READ_FAIL_ONCE")) {
+                throw std::runtime_error("injected version bookkeeping read failure");
+            }
+            bytes = LoadFile(version_clock_path_);
         }
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_VERSION_READ_FAIL_ONCE")) {
-            throw std::runtime_error("injected version bookkeeping read failure");
-        }
-        bytes = LoadFile(version_clock_path_);
     } catch (const std::exception& e) {
-        // Present but unreadable: treat as damage, never as a reset opportunity.
+        // Present but unreadable: treat as damage, never as a reset
+        // opportunity. The offline rebuild refuses an unreadable clock too, so
+        // the file's access must be fixed first.
         throw std::runtime_error(
             "version bookkeeping " + version_clock_path_.string() +
             " exists but could not be read (" + e.what() +
             "); refusing to open so a stale chunk version can never be reissued");
+    }
+    if (record_size != kVersionClockRecordSize) {
+        throw std::runtime_error(
+            "version bookkeeping " + version_clock_path_.string() +
+            " exists but could not be read (record size is " + std::to_string(record_size) +
+            " bytes, expected " + std::to_string(kVersionClockRecordSize) +
+            "); refusing to open so a stale chunk version can never be reissued; "
+            "run chunkdb_admin rebuild-version-clock to replace it");
     }
 
     std::uint64_t persisted_ceiling = 0;
@@ -257,7 +270,7 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting, const std::error
             " is malformed, truncated, oversized, or corrupt (size=" +
             std::to_string(bytes.size()) + " bytes, expected " +
             std::to_string(kVersionClockRecordSize) +
-            "); refusing to open so a stale chunk version can never be reissued");
+            "); refusing to open so a stale chunk version can never be reissued; run chunkdb_admin rebuild-version-clock to replace it");
     }
 
     // Every token ever issued before this start-up was strictly below the last

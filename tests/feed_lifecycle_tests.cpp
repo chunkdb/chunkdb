@@ -3,6 +3,7 @@
 #include <bit>
 #include <cassert>
 #include <cmath>
+#include <future>
 #include <limits>
 #include <string_view>
 #include <thread>
@@ -530,8 +531,8 @@ void ChunkCoordinatesBeyondAbsoluteBlockDomain() {
     auto table = catalog.Find("default");
     const ChunkCoord coordinate{std::numeric_limits<std::int64_t>::max(), std::numeric_limits<std::int64_t>::min()};
     auto feed = table->SubscribeFeed();
-    auto inside = table->SubscribeFeed({.area = FeedArea{coordinate, coordinate}});
-    auto outside = table->SubscribeFeed({.area = FeedArea{{0, 0}, {0, 0}}});
+    auto inside = table->SubscribeFeed({.areas = {FeedArea{coordinate, coordinate}}});
+    auto outside = table->SubscribeFeed({.areas = {FeedArea{{0, 0}, {0, 0}}}});
     {
         auto lease = table->Acquire();
         auto state = lease->store().ReadChunkState(coordinate.x, coordinate.y);
@@ -557,7 +558,7 @@ void AbsentBlockBytesAreCanonicalizedBeforeCommit() {
     (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed();
-    auto area = table->SubscribeFeed({.area = FeedArea{{0, 0}, {0, 0}}});
+    auto area = table->SubscribeFeed({.areas = {FeedArea{{0, 0}, {0, 0}}}});
     {
         auto lease = table->Acquire();
         auto state = lease->store().ReadChunkState(0, 0);
@@ -566,6 +567,214 @@ void AbsentBlockBytesAreCanonicalizedBeforeCommit() {
         assert(lease->store().SetChunkStateBytes(0, 0, state.payload, state.presence_bitmap) == state.version);
     }
     assert(!feed->Next() && !area->Next());
+}
+
+// A chunk in any area is kept; watches with the same filters receive one
+// projected entry and frame, which nothing keeps once all of them read it.
+void SeveralAreasShareOneProjection() {
+    ScopedTempDir dir("chunkdb-feed-areas");
+    auto catalog = std::make_shared<TableCatalog>(Config(dir.path()));
+    CommandEngine engine({.require_auth = false}, catalog);
+    SessionState session;
+    (void)engine.Execute(session, "HELLO 3\r\n");
+    const auto run = [&](const std::string& statement) { assert(engine.Execute(session, statement + "\r\n")[0] != '-'); };
+    run("CREATE TABLE t (n u8, m u8) CHUNK 2 x 2");
+    auto table = catalog->Find("t");
+    const FeedArea low{{0, 0}, {0, 0}}, high{{2, 2}, {2, 2}};
+    const auto m = table->geometry().layout().schema().columns[1].id;
+    auto first = table->SubscribeFeed({.areas = {low, high}});
+    auto second = table->SubscribeFeed({.areas = {high, low, low}});
+    auto projected = table->SubscribeFeed({.areas = {low, high}, .column_ids = std::vector<std::uint32_t>{m}});
+    auto alone = table->SubscribeFeed({.areas = {low}});
+    SessionState watching;
+    (void)engine.Execute(watching, "HELLO 3\r\n");
+    assert(engine.Execute(watching, "WATCH t AREA 2 2 TO 2 2, AREA 0 0 TO 0 0\r\n")[0] == '%');
+    run("BEGIN");
+    run("SET BLOCK 0 0 IN t n = 1, m = 4");
+    run("SET BLOCK 2 2 IN t n = 2, m = 5");
+    run("SET BLOCK 4 4 IN t n = 3, m = 6");
+    run("COMMIT");
+    auto a = Next(*first);
+    assert(a->blocks.size() == 2U && a->protocol_frame && *a->protocol_frame == EncodeFeedEntry(*a));
+    for (const auto& block : a->blocks) assert(block.chunk == low.first || block.chunk == high.first);
+    auto b = Next(*second);
+    assert(b == a);
+    assert(Next(*watching.watch) == a);
+    const auto c = Next(*projected);
+    assert(c != a && c->blocks.size() == 2U && c->blocks[0].after->size() == 1U && *c->protocol_frame == EncodeFeedEntry(*c));
+    const auto d = Next(*alone);
+    assert(d->blocks.size() == 1U && d->blocks[0].chunk == low.first);
+    const std::weak_ptr<const FeedEntry> shared = a;
+    a.reset();
+    b.reset();
+    assert(shared.expired());
+    assert(txn_test::ThrowsAs<std::invalid_argument>([&] {
+        (void)table->SubscribeFeed({.areas = std::vector<FeedArea>(kMaxFeedAreas + 1U, low)});
+    }));
+    assert(txn_test::ThrowsAs<std::invalid_argument>([&] { (void)table->SubscribeFeed({.areas = {low, FeedArea{{0, 0, 0}, {0, 0, 0}, 3U}}}); }));
+}
+
+// A projection group keeps an item only while another member must still read
+// it, within its share of the feed budget and above the ring floor; an item
+// that is the ring entry itself does not outlive the ring.
+void ProjectionGroupBounds() {
+    ScopedTempDir dir("chunkdb-feed-group-bounds");
+    TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    // Ungrouped; each read waits until the sender has placed that write in the ring.
+    auto plain = table->SubscribeFeed({.buffer_bytes = 4096U});
+    std::uint32_t value = 0U;
+    const auto write = [&] {
+        { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(++value)); }
+        assert(Next(*plain)->kind == FeedEntry::Kind::kChange);
+    };
+    const auto evict = [&] { for (int i = 0; i < 64; ++i) write(); };
+    // NO BEFORE copies every change, so each read either shares or projects its own.
+    auto fast = table->SubscribeFeed({.no_before = true});
+    auto slow = table->SubscribeFeed({.no_before = true});
+    std::vector<std::unique_ptr<FeedSubscription>> others;
+    for (std::int64_t i = 1; i < 64; ++i) others.push_back(table->SubscribeFeed({.areas = {FeedArea{{i, i}, {i, i}}}}));
+    // 64 groups leave each a share of 64 bytes, less than one projection.
+    write();
+    auto a = Next(*fast);
+    const std::weak_ptr<const FeedEntry> unshared = a;
+    a.reset();
+    assert(unshared.expired());
+    others.clear();
+    // The last member to read a change keeps nothing for the others.
+    auto b = Next(*slow);
+    assert(b->kind == FeedEntry::Kind::kChange && b->position == fast->position());
+    const std::weak_ptr<const FeedEntry> last = b;
+    b.reset();
+    assert(last.expired());
+    write();
+    a = Next(*fast);
+    const std::weak_ptr<const FeedEntry> shared = a;
+    a.reset();
+    assert(Next(*slow) == shared.lock());
+    assert(shared.expired());
+    // The ring floor passes an item that the slow member never read.
+    write();
+    a = Next(*fast);
+    const std::weak_ptr<const FeedEntry> held = a;
+    a.reset();
+    assert(!held.expired());
+    evict();
+    assert(Next(*fast)->kind == FeedEntry::Kind::kResync && !held.expired());
+    write();
+    assert(Next(*fast)->kind == FeedEntry::Kind::kChange && held.expired());
+    assert(Next(*slow)->kind == FeedEntry::Kind::kResync);
+    // An area that holds every change shares the ring entry without holding it.
+    auto reader = table->SubscribeFeed({.areas = {FeedArea{{0, 0}, {0, 0}}}});
+    auto lagging = table->SubscribeFeed({.areas = {FeedArea{{0, 0}, {0, 0}}}});
+    { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(++value)); }
+    auto change = Next(*plain);
+    assert(Next(*reader) == change);
+    const std::weak_ptr<const FeedEntry> ring_entry = change;
+    change.reset();
+    evict();
+    assert(ring_entry.expired());
+    assert(Next(*lagging)->kind == FeedEntry::Kind::kResync);
+}
+
+// A new projection group shrinks every share, so the groups together keep at
+// most the feed budget, and nothing the ring floor passed stays.
+void ProjectionGroupsShareTheBudget() {
+    ScopedTempDir dir("chunkdb-feed-group-budget");
+    TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    auto plain = table->SubscribeFeed({.buffer_bytes = 4096U});
+    std::uint32_t value = 0U;
+    const auto write = [&] {
+        { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(++value)); }
+        assert(Next(*plain)->kind == FeedEntry::Kind::kChange);
+    };
+    auto fast = table->SubscribeFeed({.no_before = true});
+    auto slow = table->SubscribeFeed({.no_before = true});
+    // Alone, the group may keep the whole budget for the slow member.
+    write();
+    auto a = Next(*fast);
+    const std::weak_ptr<const FeedEntry> alone = a;
+    a.reset();
+    assert(!alone.expired());
+    // 63 more groups leave it 64 bytes, less than one projection.
+    std::vector<std::unique_ptr<FeedSubscription>> others;
+    for (std::int64_t i = 1; i < 64; ++i) others.push_back(table->SubscribeFeed({.areas = {FeedArea{{i, i}, {i, i}}}}));
+    assert(alone.expired());
+    others.clear();
+    // An item that still fits the share goes once the ring floor has passed it.
+    write();
+    a = Next(*fast);
+    const std::weak_ptr<const FeedEntry> passed = a;
+    a.reset();
+    for (int i = 0; i < 64; ++i) write();
+    assert(!passed.expired());
+    auto other = table->SubscribeFeed({.areas = {FeedArea{{1, 1}, {1, 1}}}});
+    assert(passed.expired());
+}
+
+// Records whether `entry` was freed while its feed's ring mutex was held:
+// 0 not yet freed, 1 freed outside it, 2 freed under it.
+std::shared_ptr<std::atomic<int>> ObserveFree(Table& table, const std::shared_ptr<const FeedEntry>& entry) {
+    auto state = std::make_shared<std::atomic<int>>(0);
+    auto& ring = FeedTestAccess::RingMutex(table);
+    // The projection was built mutable; only this test changes it.
+    auto& target = const_cast<FeedEntry&>(*entry);
+    target.protocol_frame = std::shared_ptr<const std::string>(new std::string(*entry->protocol_frame),
+        [&ring, state](const std::string* frame) {
+            delete frame;
+            // The freeing thread may hold the mutex, so another one tests it.
+            const bool unlocked = std::async(std::launch::async, [&ring] {
+                const auto until = std::chrono::steady_clock::now() + 2s;
+                do {
+                    if (ring.try_lock()) { ring.unlock(); return true; }
+                    std::this_thread::yield();
+                } while (std::chrono::steady_clock::now() < until);
+                return false;
+            }).get();
+            state->store(unlocked ? 1 : 2);
+        });
+    return state;
+}
+
+// Readers free the group items they prune after releasing the ring mutex,
+// which writers take at a full ring.
+void ProjectionGroupFreesOutsideRing() {
+    ScopedTempDir dir("chunkdb-feed-group-free");
+    TableCatalog catalog(Config(dir.path()));
+    (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    auto plain = table->SubscribeFeed({.buffer_bytes = 4096U});
+    std::uint32_t value = 0U;
+    const auto write = [&] {
+        { auto lease = table->Acquire(); lease->store().SetBlockBits(0, 0, Bits(++value)); }
+        assert(Next(*plain)->kind == FeedEntry::Kind::kChange);
+    };
+    auto fast = table->SubscribeFeed({.no_before = true});
+    auto slow = table->SubscribeFeed({.no_before = true});
+    write();
+    auto a = Next(*fast);
+    const auto floor_pruned = ObserveFree(*table, a);
+    a.reset();
+    for (int i = 0; i < 64; ++i) write();
+    assert(Next(*fast)->kind == FeedEntry::Kind::kResync && floor_pruned->load() == 0);
+    // The next read finds its entry after pruning the item the floor passed.
+    write();
+    a = Next(*fast);
+    assert(a->kind == FeedEntry::Kind::kChange && floor_pruned->load() == 1);
+    const auto read_past = ObserveFree(*table, a);
+    a.reset();
+    // The slow member's resync moves it past the item fast kept for it.
+    assert(Next(*slow)->kind == FeedEntry::Kind::kResync && read_past->load() == 1);
+    // So does an explicit resync.
+    write();
+    a = Next(*fast);
+    const auto skipped = ObserveFree(*table, a);
+    a.reset();
+    (void)slow->Resync();
+    assert(skipped->load() == 1);
 }
 
 void RefuseUnsupported() {
@@ -611,4 +820,8 @@ int main(int argc, char** argv) {
     FailedSchemaPublicationEndsFeedWithoutBlockingTable(true);
     ChunkCoordinatesBeyondAbsoluteBlockDomain();
     AbsentBlockBytesAreCanonicalizedBeforeCommit();
+    SeveralAreasShareOneProjection();
+    ProjectionGroupBounds();
+    ProjectionGroupsShareTheBudget();
+    ProjectionGroupFreesOutsideRing();
 }

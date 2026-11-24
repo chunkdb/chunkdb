@@ -19,7 +19,7 @@ void ConcurrentModel() {
     (void)feed_test::CreateDefault(catalog);
     auto table = catalog.Find("default");
     auto feed = table->SubscribeFeed();
-    auto area = table->SubscribeFeed({.area = FeedArea{{0, 0}, {0, 3}}});
+    auto area = table->SubscribeFeed({.areas = {FeedArea{{0, 0}, {0, 3}}}});
     constexpr std::size_t writers = 6;
     constexpr std::size_t rounds = 48;
     struct Expected { std::uint64_t version; std::vector<FeedBlockChange> blocks; std::string user; };
