@@ -94,6 +94,17 @@ SWAP TABLES then exchanges the names atomically, and DROP TABLE removes the repl
 A consumer of `world` then sees the restored epoch and resumes by its [lineage](CHANGE_FEED.md) or receives resync.
 See [Tables](reference/TABLES.md) for SWAP TABLES.
 
+## Repair damaged chunks
+
+CHECK TABLE finds damaged chunk files while the server keeps serving:
+
+```text
+CHECK TABLE world
+```
+
+It lists each damaged chunk with its coordinates, the damaged file and the `chunkdb_verify` code; see [Tables](reference/TABLES.md).
+It needs ADMIN on the table or MONITOR.
+
 ## Contents and space
 
 Backups include definitions, schema history, images, WAL prefixes, users, rights, slots, and completed migration records.

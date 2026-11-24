@@ -305,10 +305,10 @@ std::string StatementSuggestion(std::string_view word) {
     const auto lower = Lower(word);
     if (lower == "select") return "; read with GET BLOCK, GET AREA or GET CHUNK";
     if (lower == "insert" || lower == "update" || lower == "upsert") return "; write with SET BLOCK or SET CHUNK";
-    const std::array<std::string_view, 27U> keywords{
+    const std::array<std::string_view, 28U> keywords{
         "get", "set", "delete", "create", "alter", "drop", "show", "describe", "grant", "revoke",
         "begin", "commit", "rollback", "ping", "flush", "watch", "unwatch", "ack", "backup", "migrate",
-        "scan", "reload", "recover", "compact", "restore", "swap", "aggregate"};
+        "scan", "reload", "recover", "compact", "restore", "swap", "aggregate", "check"};
     std::string_view closest;
     std::size_t best = word.size() < 4U ? 2U : 3U;
     bool tied = false;
@@ -677,6 +677,30 @@ class Parser {
         // token after WHERE may have been read yet.
         if (next_ != tokens_.size()) throw std::logic_error("WHERE was parsed after a lookahead");
         return std::make_shared<const expr::Expression>(expr::ParseConditionAt(line_, &at_, &parameters_));
+    }
+
+    // CHUNK c | AREA a TO b | AREA AROUND c RADIUS r, or nothing.
+    [[nodiscard]] std::optional<ChunkAreaSelector> OptionalChunkSelector() {
+        ChunkAreaSelector selector;
+        if (Accept("chunk")) {
+            selector.dims = Point(selector.first.x, selector.first.y, selector.first.z, true);
+            selector.last = selector.first;
+        } else if (Accept("area")) {
+            if (Accept("around")) {
+                selector.around = true;
+                selector.dims = Point(selector.first.x, selector.first.y, selector.first.z, true);
+                Expect("radius");
+                selector.radius = static_cast<std::int64_t>(Unsigned("a radius", std::numeric_limits<std::int64_t>::max()));
+            } else {
+                selector.dims = Point(selector.first.x, selector.first.y, selector.first.z, true);
+                Expect("to");
+                if (Point(selector.last.x, selector.last.y, selector.last.z, true) != selector.dims)
+                    Fail(1, "AREA endpoints have different dimensions");
+            }
+        } else {
+            return std::nullopt;
+        }
+        return selector;
     }
 
     // After AGGREGATE: CHUNK c | AREA a TO b | AREA AROUND c RADIUS r, then
@@ -1323,6 +1347,12 @@ class Parser {
         if (Accept("recover")) {
             Expect("table");
             return RecoverTable{.table = Name("a table name")};
+        }
+        if (Accept("check")) {
+            Expect("table");
+            CheckTable check{.table = Name("a table name"), .area = {}};
+            check.area = OptionalChunkSelector();
+            return check;
         }
         if (Accept("restore")) {
             Expect("table");

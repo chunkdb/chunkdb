@@ -92,7 +92,7 @@ Connection identifiers are exact unsigned integers scoped to the server process.
 A user may list and control connections of the same live user incarnation; ADMIN on `*` permits access to all connections, and MONITOR lists all connections without controlling them.
 Dropping and recreating a user does not grant the replacement user access to the previous user's connections.
 An empty user or statement is null in SHOW CONNECTIONS, and `statement` contains only the statement verb.
-`progress` is null unless the running statement reports progress; only RESTORE TABLE does.
+`progress` is null unless the running statement reports progress; RESTORE TABLE does, and CHECK TABLE reports its chunks as files.
 A listing that exceeds the response limit returns OUT_OF_RANGE without a partial listing.
 Missing, idle, self-cancelled, and decision-entered statements return `cancelled: false`.
 Killing a connection preserves the real outcome of a statement that already entered its decision boundary.

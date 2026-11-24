@@ -36,6 +36,7 @@
 #include "expr.hpp"
 #include "feature_flags.hpp"
 #include "backup.hpp"
+#include "chunk_check.hpp"
 #include "slot_watch.hpp"
 #include "feed_protocol.hpp"
 #include "store_manifest.hpp"
@@ -851,6 +852,7 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::RecoverTable& recover) { table_change(recover, "RECOVER TABLE", "recover_table"); },
             [&](const cql::CompactTombstones& compact) { table_change(compact, "COMPACT TOMBSTONES", "compact_tombstones"); },
             [&](const cql::ShowTableStats& stats) { info.verb = "SHOW TABLE STATS"; info.table = stats.table; },
+            [&](const cql::CheckTable& check) { info.verb = "CHECK TABLE"; info.table = check.table; },
             [&](const cql::ShowTables&) { info.verb = "SHOW TABLES"; },
             [&](const cql::Describe& describe) { info.verb = "DESCRIBE"; info.table = describe.table; },
             [&](const cql::FlushWal&) { info.verb = "FLUSH WAL"; },
@@ -2184,6 +2186,65 @@ std::string CommandEngine::ExecuteStatement(
                     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(feeds.slots));
                     Protocol::AppendBulk(reply, "watches");
                     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(feeds.watches));
+                    return reply;
+                },
+                [&](const cql::CheckTable& check) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    if (!HasServerRight(session, ServerRight::kMonitor)) RequireRight(session, check.table, Right::kAdmin);
+                    StoreId epoch{};
+                    std::filesystem::path dir;
+                    std::optional<Geometry> geometry;
+                    std::optional<detail::AreaCursor> area;
+                    {
+                        const auto lease = AcquireNamedTable(session, check.table);
+                        auto& store = lease.store();
+                        if (check.area) {
+                            RequireDimensions(store.geometry(), check.area->dims);
+                            area.emplace(*check.area);
+                        }
+                        epoch = store.store_id();
+                        dir = store.data_dir();
+                        geometry.emplace(store.geometry());
+                    }
+                    // Listed and checked one chunk per lease: a lease held for the
+                    // whole table would make DDL, and every statement queued
+                    // behind it, wait for the check.
+                    auto coordinates = ChunkFileCoordinates(dir, *geometry);
+                    if (area) std::erase_if(coordinates, [&](const ChunkCoord& coord) { return !area->Contains(coord); });
+                    std::vector<std::pair<ChunkCoord, ChunkStore::ChunkFileDamage>> damaged;
+                    std::uint64_t checked = 0U;
+                    for (const auto& coord : coordinates) {
+                        if (session.backup_cancelled.stop_requested())
+                            throw std::runtime_error("CHECK TABLE stopped: the server is shutting down");
+                        CheckStatementCancellation();
+                        ReportStatementProgress({.files_done = checked, .files_total = coordinates.size()});
+                        const auto lease = AcquireNamedTable(session, check.table);
+                        if (lease.store().store_id() != epoch)
+                            throw std::runtime_error("table '" + check.table + "' was replaced during CHECK TABLE; run it again");
+                        if (auto damage = lease.store().CheckChunkFiles(coord)) damaged.emplace_back(coord, std::move(*damage));
+                        ++checked;
+                    }
+                    const auto dims = geometry->dims();
+                    std::string reply;
+                    Protocol::AppendMapHeader(reply, 2U);
+                    Protocol::AppendBulk(reply, "chunks");
+                    Protocol::AppendInteger(reply, checked);
+                    Protocol::AppendBulk(reply, "damaged");
+                    Protocol::AppendArrayHeader(reply, damaged.size());
+                    for (const auto& [coord, damage] : damaged) {
+                        Protocol::AppendMapHeader(reply, 4U);
+                        Protocol::AppendBulk(reply, "chunk");
+                        Protocol::AppendArrayHeader(reply, dims);
+                        Protocol::AppendInteger(reply, coord.x);
+                        Protocol::AppendInteger(reply, coord.y);
+                        if (dims == 3U) Protocol::AppendInteger(reply, coord.z);
+                        Protocol::AppendBulk(reply, "file");
+                        Protocol::AppendBulk(reply, damage.path.generic_string());
+                        Protocol::AppendBulk(reply, "code");
+                        Protocol::AppendBulk(reply, damage.code);
+                        Protocol::AppendBulk(reply, "detail");
+                        Protocol::AppendBulk(reply, damage.detail);
+                    }
                     return reply;
                 },
                 [&](const cql::ShowTables&) {

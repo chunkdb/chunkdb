@@ -889,6 +889,20 @@ class ChunkStore {
     [[nodiscard]] std::uint64_t RetainedTombstoneCount();
     [[nodiscard]] std::uint64_t RetainedDeletionFloor();
     [[nodiscard]] bool HasWrittenChunkIdentities() const;
+    // Damage chunkdb_verify finds in a chunk's files: its code, the file
+    // relative to the table directory, and what is wrong.
+    struct ChunkFileDamage {
+        std::string code;
+        std::filesystem::path path;
+        std::string detail;
+    };
+    // Checks the image and WAL of chunk `coord` as chunkdb_verify checks
+    // them (CHECK TABLE). A cached chunk is checked under its lock, so only
+    // writes to that chunk wait for the check; a chunk that is not cached is
+    // read without locks and read again when a load or an eviction races
+    // the read. Returns the first damage, or nothing for sound files or a
+    // chunk without files. A stopped statement throws StatementStoppedError.
+    [[nodiscard]] std::optional<ChunkFileDamage> CheckChunkFiles(const ChunkCoord& coord);
     [[nodiscard]] ChunkMutationResult CasChunkState(
         std::int64_t chunk_x,
         std::int64_t chunk_y,
