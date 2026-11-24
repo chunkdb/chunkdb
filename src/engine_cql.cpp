@@ -43,6 +43,7 @@
 #include "user_registry.hpp"
 #include "migrations.hpp"
 #include "reply_stream.hpp"
+#include "returning.hpp"
 #include "statement_control.hpp"
 
 namespace chunkdb {
@@ -700,6 +701,34 @@ struct BlockWritePlan {
     }
     plan.reads_chunk = plan.condition || !plan.block_slots.empty() || plan.reads_chunk_columns;
     return plan;
+}
+
+// The columns RETURNING names, as schema indexes in its order; every
+// column for *.
+[[nodiscard]] std::vector<std::size_t> ReturnedColumns(const ChunkLayout& layout, const cql::Returning& returning) {
+    std::vector<std::size_t> columns;
+    if (returning.columns.empty()) {
+        columns.resize(layout.schema().columns.size());
+        for (std::size_t i = 0; i < columns.size(); ++i) columns[i] = i;
+        return columns;
+    }
+    columns.reserve(returning.columns.size());
+    for (const auto& name : returning.columns) columns.push_back(RequireColumn(layout, name));
+    return columns;
+}
+
+// The reply of a single write with RETURNING before its rows:
+// {applied, version, rows} (docs/PROTOCOL.md).
+[[nodiscard]] std::string ReturningPrefix(bool applied, std::optional<std::uint64_t> version) {
+    std::string prefix;
+    Protocol::AppendMapHeader(prefix, 3U);
+    Protocol::AppendBulk(prefix, "applied");
+    Protocol::AppendBoolean(prefix, applied);
+    Protocol::AppendBulk(prefix, "version");
+    if (version) Protocol::AppendInteger(prefix, *version);
+    else Protocol::AppendNull(prefix);
+    Protocol::AppendBulk(prefix, "rows");
+    return prefix;
 }
 
 // Calls `use` with each parameter the expressions take and its type.
@@ -1651,7 +1680,8 @@ std::string CommandEngine::ExecuteStatement(
                     return reply;
                 },
                 [&](const cql::SetBlock& set) {
-                    if (set.expressions) return BlockWriteWithExpressions(session, &set, nullptr, parameters, command_class);
+                    if (set.expressions || set.returning)
+                        return BlockWriteWithExpressions(session, &set, nullptr, parameters, command_class, continuation, reserve_reply);
                     command_class = set.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
                                                                : MetricsRegistry::CommandClass::kPointWrite;
                     RequireRight(session, set.table, Right::kWrite);
@@ -1686,7 +1716,8 @@ std::string CommandEngine::ExecuteStatement(
                                                        : store.SetBlock(set.x, set.y, values, set.if_version));
                 },
                 [&](const cql::DeleteBlock& del) {
-                    if (del.expressions) return BlockWriteWithExpressions(session, nullptr, &del, parameters, command_class);
+                    if (del.expressions || del.returning)
+                        return BlockWriteWithExpressions(session, nullptr, &del, parameters, command_class, continuation, reserve_reply);
                     command_class = del.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
                                                                : MetricsRegistry::CommandClass::kPointWrite;
                     RequireRight(session, del.table, Right::kWrite);
@@ -2901,8 +2932,13 @@ std::string CommandEngine::BlockWriteWithExpressions(
     const cql::SetBlock* set,
     const cql::DeleteBlock* del,
     std::span<const std::optional<std::string>> parameters,
-    MetricsRegistry::CommandClass& command_class) {
-    const auto& expressions = set != nullptr ? *set->expressions : *del->expressions;
+    MetricsRegistry::CommandClass& command_class,
+    std::unique_ptr<ReplyContinuation>* continuation,
+    const std::function<void(std::size_t)>* reserve_reply) {
+    static const expr::WriteExpressions kNoExpressions;
+    const auto& written = set != nullptr ? set->expressions : del->expressions;
+    const auto& expressions = written ? *written : kNoExpressions;
+    const cql::Returning* returning = set != nullptr ? set->returning.get() : del->returning.get();
     const std::string& table = set != nullptr ? set->table : del->table;
     std::optional<std::uint64_t> if_version = set != nullptr ? set->if_version : del->if_version;
     const std::int64_t x = set != nullptr ? set->x : del->x;
@@ -2927,8 +2963,23 @@ std::string CommandEngine::BlockWriteWithExpressions(
     const Geometry& geometry = store.geometry();
     RequireDimensions(geometry, set != nullptr ? set->dims : del->dims);
     const auto& layout = geometry.layout();
-    const BlockWritePlan plan = PlanBlockWrite(expressions, geometry);
+    BlockWritePlan plan = PlanBlockWrite(expressions, geometry);
     const std::vector<ColumnValue> values = ExpressionParameters(plan, parameters);
+    // RETURNING reads the returned columns with the block, and its rows
+    // are kept until the reply is written (docs/DESIGN-2.0.md E4).
+    std::vector<std::size_t> returned;
+    std::optional<ReturningRows> rows;
+    if (returning != nullptr) {
+        returned = ReturnedColumns(layout, *returning);
+        plan.block_slots.insert(plan.block_slots.end(), returned.begin(), returned.end());
+        std::sort(plan.block_slots.begin(), plan.block_slots.end());
+        plan.block_slots.erase(std::unique(plan.block_slots.begin(), plan.block_slots.end()), plan.block_slots.end());
+        plan.reads_chunk = true;
+        // Admitted before the write, so a refusal changes nothing.
+        if (reserve_reply) (*reserve_reply)(BlockReplyCaptureBound(layout, returned));
+        rows.emplace(geometry.dims(), kMaxReturningRows, store.query_limits().max_area_response_bytes,
+            ReturningPrefix(false, std::numeric_limits<std::uint64_t>::max()).size());
+    }
     // Single values with IF <expr> are decoded as without it.
     std::vector<ColumnAssignment> single;
     if (set != nullptr && !plan.assignments) {
@@ -2944,7 +2995,7 @@ std::string CommandEngine::BlockWriteWithExpressions(
         }
     }
     bool version_mismatch = false;
-    const auto decide = [&](const BlockWriteView& block, std::vector<ColumnAssignment>& out) {
+    const auto decide_write = [&](const BlockWriteView& block, std::vector<ColumnAssignment>& out) {
         if (if_version && block.version != *if_version) {
             version_mismatch = true;
             return false;
@@ -2972,10 +3023,26 @@ std::string CommandEngine::BlockWriteWithExpressions(
         }
         return true;
     };
+    // The row of an applied write: OLD of a present block, or NEW. Made
+    // before the write, so a row past a bound changes nothing.
+    const auto decide = [&](const BlockWriteView& block, std::vector<ColumnAssignment>& out) {
+        if (!decide_write(block, out)) return false;
+        if (!rows || (!returning->new_values && block.values == nullptr)) return true;
+        const std::vector<ColumnValue> after =
+            returning->new_values ? store.BlockAfterSet(block.values, out, returned) : std::vector<ColumnValue>{};
+        const std::vector<ColumnValue>& source = returning->new_values ? after : *block.values;
+        std::vector<ColumnValue> row;
+        row.reserve(returned.size());
+        for (const std::size_t index : returned) row.push_back(source[index]);
+        rows->Add(x, y, z, std::move(row));
+        return true;
+    };
 
     if (session.transaction == nullptr) {
         const auto result =
             store.WriteBlockDecided(x, y, z, del != nullptr, plan.block_slots, plan.reads_chunk_columns, decide);
+        // With RETURNING, a refused write answers applied false (E4).
+        if (rows) return std::move(*rows).Reply(ReturningPrefix(result.ok, result.version), {}, continuation);
         if (version_mismatch) return Protocol::Error("VERSION_MISMATCH", "", {{"current", std::to_string(result.version)}});
         if (!result.ok) return ErrorReply(ConditionFailedError(result.version));
         std::string reply;
@@ -2995,6 +3062,8 @@ std::string CommandEngine::BlockWriteWithExpressions(
     std::optional<std::vector<ColumnValue>> block;
     std::vector<ColumnValue> chunk_columns;
     std::uint64_t version = 0;
+    // The version a read of the view shows: none for the transaction's own copy.
+    std::optional<std::uint64_t> visible_version;
     if (const auto own = txn.writes.find(coord); own != txn.writes.end()) {
         const ChunkState& state = own->second;
         block = geometry.dims() == 3U ? store.BlockInState3D(state, x, y, z) : store.BlockInState(state, x, y);
@@ -3005,13 +3074,17 @@ std::string CommandEngine::BlockWriteWithExpressions(
                                           : store.GetBlockWithVersionAt(*txn.snapshot, x, y);
         block = std::move(read.values);
         version = read.version.value_or(0U);
+        visible_version = read.version;
         if (plan.reads_chunk_columns) {
             chunk_columns = store.ChunkColumnValues(store.ReadChunkStateAt(*txn.snapshot, coord).chunk_columns.get());
         }
     }
     std::vector<ColumnAssignment> assignments;
     const BlockWriteView view{.values = block ? &*block : nullptr, .chunk_columns = chunk_columns, .version = version};
-    if (!decide(view, assignments)) return ErrorReply(ConditionFailedError(version));
+    if (!decide(view, assignments)) {
+        if (rows) return std::move(*rows).Reply(ReturningPrefix(false, visible_version), {}, continuation);
+        return ErrorReply(ConditionFailedError(version));
+    }
     TxnWrite(txn, store, coord, [&](ChunkState& state) {
         if (del != nullptr) {
             if (geometry.dims() == 3U) store.UnsetBlockInState3D(state, x, y, z);
@@ -3022,6 +3095,8 @@ std::string CommandEngine::BlockWriteWithExpressions(
             store.SetBlockInState(state, x, y, assignments);
         }
     });
+    // The chunk is the transaction's own until COMMIT: no version yet.
+    if (rows) return std::move(*rows).Reply(ReturningPrefix(true, std::nullopt), {}, continuation);
     return NullReply();
 }
 

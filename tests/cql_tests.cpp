@@ -729,6 +729,43 @@ void TestBlockExpressions() {
     ExpectError("DELETE BLOCK 0 0 FROM t IF VERSION 1.5", "expected a version");
 }
 
+// RETURNING [OLD | NEW] (* | column, ...) of SET BLOCK and DELETE BLOCK
+// (#145): NEW is SET's default, OLD DELETE's and its only form; a write
+// without it parses as before.
+void TestBlockReturning() {
+    assert(!Get<cql::SetBlock>("SET BLOCK 0 0 IN t a = 1").returning);
+    assert(!Get<cql::DeleteBlock>("DELETE BLOCK 0 0 FROM t").returning);
+
+    const auto all = Get<cql::SetBlock>("SET BLOCK 0 0 IN t a = 1, b = $1 RETURNING *", 1);
+    assert(all.values.size() == 2U && !all.expressions && all.returning);
+    assert(all.returning->new_values && all.returning->columns.empty());
+    const auto old = Get<cql::SetBlock>("set block 0 0 in t a = 1 returning old a, b");
+    assert(!old.expressions && !old.returning->new_values);
+    assert((old.returning->columns == std::vector<std::string>{"a", "b"}));
+    const auto computed = Get<cql::SetBlock>("SET BLOCK 1 2 3 IN t coins = coins + $1 IF coins > 0 RETURNING NEW coins", 1);
+    assert(computed.dims == 3U && computed.expressions->condition && computed.expressions->assignments.size() == 1U);
+    assert(computed.returning->new_values && computed.returning->columns == std::vector<std::string>{"coins"});
+    const auto versioned = Get<cql::SetBlock>("SET BLOCK 0 0 IN t a = 1 IF VERSION 3 RETURNING OLD *");
+    assert(versioned.if_version == 3U && !versioned.returning->new_values);
+    // OLD and NEW right after RETURNING are keywords; a column named old
+    // follows one of them.
+    const auto named = Get<cql::SetBlock>("SET BLOCK 0 0 IN t old = 1 RETURNING NEW old, new");
+    assert((named.returning->columns == std::vector<std::string>{"old", "new"}));
+
+    const auto removed = Get<cql::DeleteBlock>("DELETE BLOCK 0 0 FROM t RETURNING *");
+    assert(removed.returning && !removed.returning->new_values && !removed.expressions);
+    const auto conditional = Get<cql::DeleteBlock>("DELETE BLOCK 0 0 FROM t IF hp <= $1 RETURNING OLD hp", 1);
+    assert(conditional.expressions->condition && conditional.returning->columns == std::vector<std::string>{"hp"});
+
+    ExpectError("DELETE BLOCK 0 0 FROM t RETURNING NEW *", "column 35: DELETE BLOCK returns only OLD values");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 RETURNING", "expected a column name or *");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 RETURNING OLD", "expected a column name or *");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 RETURNING a,", "expected a column name or *");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 RETURNING *, a", "expected the end of the statement, got ','");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 RETURNING A", "names are lowercase");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 RETURNING * IF a > 1", "expected the end of the statement, got 'IF'");
+}
+
 }  // namespace
 
 void TestHelloOptions() {
@@ -766,6 +803,7 @@ int main() {
     TestConditionalObjects();
     TestBlockStatements();
     TestBlockExpressions();
+    TestBlockReturning();
     TestChunkAndAreaStatements();
     TestAggregate();
     TestLiterals();

@@ -71,9 +71,9 @@ Before authentication HELLO takes at most 12 parameters; a HELLO with more recei
 
 `client_name` and `statement_timeout_ms` apply; `default_tag` is stored with `reason=implementation_pending`.
 The effective statement timeout appears in `options`, including the server default when HELLO omits it.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, and `area_scale`.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, and `returning`.
 Options become visible only after authentication succeeds.
-Returning and expression ceilings describe reserved limits; their capabilities remain unavailable.
+The `returning` feature permits [RETURNING](#returning) on SET BLOCK and DELETE BLOCK; `limits.max_returning_rows` bounds its rows and `limits.max_expression_nodes` each expression.
 The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
 The `area_scale` feature permits GET AREA SCALE and its downsampled forms.
 A chunk too large for an empty page ends the page before it and is then refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=... required=... limit=...`; see [chunks](reference/CHUNKS.md#limits).
@@ -84,7 +84,7 @@ The statement timeout starts after the complete request is framed and includes q
 `CANCELLED` and statement `TIMEOUT` carry `applied=false` and mean that the statement did not apply.
 An operation admitted to its irreversible decision completes with its real result.
 Transport timeouts remain independent and close the connection.
-Large chunk and area replies retain their schema, projection and immutable state while bounded output continuations drain.
+Large chunk, area and RETURNING replies retain their schema, projection and immutable state while bounded output continuations drain.
 Output progress renews the reply deadline; a stalled writer closes the connection.
 
 See [session negotiation](design/PROTOCOL_FOUNDATION.md#handshake-and-session-ownership-a2) for the complete option and limit contract.
@@ -170,6 +170,17 @@ AGGREGATE returns a map from each function's lowercase name, such as `count(*)` 
 With BY CHUNK it returns an array of rows `[coordinates..., results...]`, one per chunk with a present block that matches WHERE, in coordinate order.
 COUNT(*) is an integer; SUM, MIN and MAX of integer columns are integers or big numbers; AVG and float SUM are doubles; float MIN and MAX are doubles that keep the column value, so an f32 prints at f32 precision; a function over no value is null.
 See [AGGREGATE](reference/AGGREGATE.md#returns) for the rules.
+
+## RETURNING
+
+SET BLOCK and DELETE BLOCK with RETURNING answer the map `{applied, version, rows}` instead of a version.
+`applied` is false when IF VERSION or the IF condition refused the write; nothing changed and `rows` is empty.
+`version` is the chunk's version after the write, or its current version when refused; inside a transaction it is that of the transaction's view, null for a chunk the transaction wrote.
+`rows` is an array of rows `[x, y, values...]`, with z after y in a three-dimensional table, and values in the order RETURNING names them, encoded as GET BLOCK encodes them.
+An OLD row comes only from a block present before the write; a NEW row holds the block as GET BLOCK reads it after the write.
+A reply holds at most `limits.max_returning_rows` rows in at most `max_response_bytes` bytes; over either bound the write is refused with `OUT_OF_RANGE reason=returning_limit bound=<max_returning_rows | max_response_bytes> limit=<n>` and changes nothing.
+The rows are read under the write's lock and the reply is written after that lock is released, row by row under the reply progress deadline.
+A connection that closes after the write and before the whole reply arrives leaves the write applied; read the block again to learn its state.
 
 ## Chunk form
 

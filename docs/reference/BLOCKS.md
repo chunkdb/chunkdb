@@ -30,8 +30,8 @@ NULL
 
 ```text
 GET BLOCK x y [z] FROM table [COLUMNS column, ...] [WITH VERSION] [WITH SCHEMA]
-SET BLOCK x y [z] IN table column = expression [, ...] [IF VERSION version | IF condition]
-DELETE BLOCK x y [z] FROM table [IF VERSION version | IF condition]
+SET BLOCK x y [z] IN table column = expression [, ...] [IF VERSION version | IF condition] [RETURNING [OLD | NEW] (* | column, ...)]
+DELETE BLOCK x y [z] FROM table [IF VERSION version | IF condition] [RETURNING [OLD] (* | column, ...)]
 ```
 
 ## Arguments
@@ -46,11 +46,14 @@ DELETE BLOCK x y [z] FROM table [IF VERSION version | IF condition]
 - `IF VERSION`: update only when the containing chunk still has this version, an integer or a `$n` u64 parameter; another block's change can invalidate it.
 - `IF condition`: write only when the [condition](EXPRESSIONS.md) holds for the block as it is ([conditions](../CQL.md#conditions)); it is false when it is unknown (NULL).
 - IF VERSION and IF condition exclude each other; `IF version = 3` tests a column named `version`.
+- `RETURNING`: return the block with the write; `NEW`, SET's default, is the block after the write, and `OLD`, DELETE's default and only form, the block before it.
+- RETURNING `*` returns every column in schema order, a list the named columns in your order; OLD or NEW right after RETURNING is the keyword, so `RETURNING NEW old` returns a column named `old`.
 
 ## Returns
 
 - GET: one `column = value` line per column, or `NULL` when the block is absent.
 - SET and DELETE: the containing chunk's version after the statement.
+- SET and DELETE with RETURNING: `applied`, `version` and `rows`, described below.
 - Transaction writes: `(applies at COMMIT)` in the CLI shell.
 
 WITH VERSION returns `[chunk_version, row_or_null]`; WITH SCHEMA returns `[schema_version, row_or_null]`.
@@ -63,6 +66,12 @@ Collection preserves an empty chunk's producing version and time in a tombstone.
 Never-written chunks and chunks forgotten by [tombstone compaction](CHUNKS.md#tombstones) have null versions.
 The schema version is present even when the row is absent.
 
+With RETURNING, `applied` is false when IF VERSION or the IF condition refuses the write, which then changes nothing and returns no rows.
+`version` is the chunk's version after the write, or its current version when refused; inside a transaction it is that of the transaction's view, null for a chunk the transaction wrote.
+Each row is `[x, y, values...]`, with `z` after `y` in a three-dimensional table.
+An OLD row exists only for a block present before the write; a NEW row holds the values a GET BLOCK reads after the write, including the defaults of a new block.
+Other refusals, such as an unknown column or a value out of range, are errors as without RETURNING.
+
 ## Errors
 
 | Error | When | What to do |
@@ -74,6 +83,7 @@ The schema version is present even when the row is absent.
 | VERSION_MISMATCH | Another write changed the chunk. | Read it again and recompute your update. |
 | CONDITION_FAILED | The IF condition is false or unknown; `current` is the chunk's version. | Read the block again and decide again. |
 | OUT_OF_RANGE | A computed value does not fit its column, such as `coins - 3` below zero in a u16 column. | Change the expression or add a condition. |
+| OUT_OF_RANGE reason=returning_limit | The RETURNING rows exceed a bound; nothing changed. | Return fewer columns. |
 | CONFLICT | Your transaction loses its snapshot. | Follow [Retry a transaction](../TRANSACTION_RETRY.md). |
 
 ## Notes
@@ -90,8 +100,10 @@ IF VERSION still compares for equality; another chunk's write does not change th
 An absent chunk supplies no token, and zero does not mean create-if-absent.
 
 A condition and computed values read the block with the write, so no other write comes between; see [Expressions in writes](EXPRESSIONS.md#in-writes).
+RETURNING reads the block the same way, so it needs WRITE, which includes READ.
 
 ## Limits
 
 Value bounds follow the table's column types and `var_max_chunk_bytes`.
+RETURNING returns at most `max_returning_rows` (65536) rows in a reply of at most `max_response_bytes`, both reported by HELLO; over either bound the write is refused with `OUT_OF_RANGE reason=returning_limit` and changes nothing.
 See [Transactions](../TRANSACTIONS.md#limits) for transaction bounds and [Protocol](../PROTOCOL.md#parameters) for parameter bounds.

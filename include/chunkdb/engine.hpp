@@ -506,16 +506,20 @@ class CommandEngine {
         ChunkStore& store,
         const ChunkCoord& coord,
         const std::function<void(ChunkState&)>& change);
-    // SET BLOCK (`set`) or DELETE BLOCK (`del`) with IF <expr> or values
-    // that read the block (docs/design/EXPRESSIONS_DESIGN.md): the condition
-    // and values are evaluated under the chunk's lock with the write, or
-    // against the transaction's view.
+    // SET BLOCK (`set`) or DELETE BLOCK (`del`) with IF <expr>, values that
+    // read the block (docs/design/EXPRESSIONS_DESIGN.md) or RETURNING: the
+    // condition, values and returned row are made under the chunk's lock
+    // with the write, or against the transaction's view. A RETURNING reply
+    // is written through `continuation` when given, after the lock is
+    // released; `reserve_reply`, when given, admits its capture first.
     [[nodiscard]] std::string BlockWriteWithExpressions(
         SessionState& session,
         const cql::SetBlock* set,
         const cql::DeleteBlock* del,
         std::span<const std::optional<std::string>> parameters,
-        MetricsRegistry::CommandClass& command_class);
+        MetricsRegistry::CommandClass& command_class,
+        std::unique_ptr<ReplyContinuation>* continuation = nullptr,
+        const std::function<void(std::size_t)>* reserve_reply = nullptr);
 };
 
 }  // namespace chunkdb

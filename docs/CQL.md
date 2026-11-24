@@ -42,6 +42,7 @@ Committed chunk versions are producing commit revisions, ordered only within the
 DESCRIBE's schema `version` differs from its completed commit `revision`; read-only mode returns null for that frontier.
 Use IF VERSION for equality checks against the containing chunk, including changes to other blocks in that chunk.
 Use IF with a [condition](#conditions) to test the block's own values in the same step as the write.
+Add RETURNING to SET BLOCK or DELETE BLOCK to receive the block before or after the write in the same reply; see [Blocks](reference/BLOCKS.md#returns).
 
 ## Conditions
 
