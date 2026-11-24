@@ -64,7 +64,7 @@ chunk 0 0
 A chunk version is the revision of the last change to that chunk, so this chunk already contains revision 2.
 Read `version` and `revision` from DESCRIBE before the first read and after the last one, and take the snapshot again when `version` differs.
 Store each chunk with its version, and the snapshot with the epoch, the schema version, the first `revision` as its start, and the larger of the second `revision` and the highest chunk version as its position.
-Plain reads do not share one snapshot; the chunk versions make reading while writes continue safe.
+Plain reads do not share one snapshot; the chunk versions make reading while writes continue safe, and reads inside `BEGIN READ ONLY` share one within `--txn-max-duration-ms`.
 
 ## Rebuild a point in time and render a timelapse
 

@@ -22,6 +22,23 @@ namespace {
 
 constexpr const char* kFenceRestore = "a failed restore could not remove it";
 
+// Runs `fn` when the scope ends, unless dismissed. `fn` must not throw.
+template <typename Fn>
+class ScopeExit {
+  public:
+    explicit ScopeExit(Fn fn) : fn_(std::move(fn)) {}
+    ScopeExit(const ScopeExit&) = delete;
+    ScopeExit& operator=(const ScopeExit&) = delete;
+    ~ScopeExit() {
+        if (active_) fn_();
+    }
+    void Dismiss() noexcept { active_ = false; }
+
+  private:
+    Fn fn_;
+    bool active_ = true;
+};
+
 void CrashAtFailpoint(const char* key) {
     if (ConsumeFailpointEnv(key)) ExitAbruptly(86);
 }
@@ -59,17 +76,25 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         ThrowIfFenced(request.name);
         if (Find(request.name) != nullptr) throw TableExistsError("table '" + request.name + "' already exists");
     };
+    // Build the table under a private name, as Create does: a crash leaves
+    // the staging directory, which the next writer start removes. While the
+    // restore runs, RECOVER TABLE of the name leaves it alone.
+    const auto operation = OperationName(request.name);
     {
         std::lock_guard operations(operations_mutex_);
         require_name();
+        restore_staging_.insert(operation);
     }
+    // Runs last, after the operations lock taken below is released.
+    ScopeExit registration([&] {
+        std::lock_guard operations(operations_mutex_);
+        restore_staging_.erase(operation);
+    });
     LogMessage(LogLevel::kInfo, LogComponent::kStore, "table restore started",
         {{"table", request.name}, {"backup", request.backup.string()}, {"backed_up_table", request.table}});
 
-    // Build the table under a private name, as Create does: a crash leaves
-    // the staging directory, which the next writer start removes.
     EnsureDirectoryPathExists(StagingDir(), /*durable_sync=*/true);
-    const auto staging = StagingDir() / OperationName(request.name);
+    const auto staging = StagingDir() / operation;
     if (!CreateOwnerOnlyDirectory(staging)) throw std::runtime_error("table staging directory already exists");
     const auto target = TablesDir() / request.name;
     TableRestoreResult result;
@@ -195,23 +220,6 @@ constexpr const char* kFenceSwapUnknown = "a failed swap could not make its exch
 constexpr const char* kFenceSwapReopen = "a swap could not open it under its new name";
 constexpr const char* kFenceSwapRefusedReopen = "a refused swap could not reopen it";
 constexpr const char* kWatchSwapped = "watched table was swapped; watch it again";
-
-// Runs `fn` when the scope ends, unless dismissed. `fn` must not throw.
-template <typename Fn>
-class ScopeExit {
-  public:
-    explicit ScopeExit(Fn fn) : fn_(std::move(fn)) {}
-    ScopeExit(const ScopeExit&) = delete;
-    ScopeExit& operator=(const ScopeExit&) = delete;
-    ~ScopeExit() {
-        if (active_) fn_();
-    }
-    void Dismiss() noexcept { active_ = false; }
-
-  private:
-    Fn fn_;
-    bool active_ = true;
-};
 
 // `path` below `from`, moved below `to`; any other path unchanged.
 std::string MovedPath(const std::string& path, const std::string& from, const std::string& to) {

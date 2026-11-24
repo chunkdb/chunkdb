@@ -315,6 +315,36 @@ void InjectedFailures() {
     Verified(source.data);
 }
 
+// RECOVER TABLE of a fenced name leaves the private copy of a restore still
+// copying into that name; that restore then finds the recovered table and is
+// refused, removing its copy itself.
+void RecoverLeavesRunningRestore() {
+    Source source;
+    TableCatalog catalog(source.Config());
+    auto request = source.Request();
+    bool recovered = false;
+    request.progress = [&](std::uint64_t files, std::uint64_t, std::uint64_t, std::uint64_t) {
+        if (files != 0U || recovered) return;
+        recovered = true;
+        assert(Entries(source.data / ".chunkdb.staging") == 1U);
+        {
+            // A second restore of the name publishes it but can neither open
+            // it nor move it out again, so the name is fenced.
+            txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_RESTORE_TABLE_OPEN_FAIL_ONCE", "1");
+            txn_test::ScopedEnv undo("CHUNKDB_FAILPOINT_RESTORE_TABLE_UNDO_FAIL_ONCE", "1");
+            Throws([&] { (void)catalog.RestoreTable(source.Request()); });
+        }
+        assert(catalog.Fence("t_restored").has_value());
+        catalog.RecoverTable("t_restored");
+        assert(catalog.Find("t_restored") != nullptr);
+        // The running restore keeps its copy.
+        assert(Entries(source.data / ".chunkdb.staging") == 1U);
+    };
+    Throws<TableExistsError>([&] { (void)catalog.RestoreTable(request); });
+    assert(recovered && Entries(source.data / ".chunkdb.staging") == 0U);
+    source.CheckRestored(catalog, "t_restored", catalog.Require("t_restored")->store_id());
+}
+
 void Cancellation() {
     Source source;
     TableCatalog catalog(source.Config());
@@ -754,6 +784,7 @@ int main() {
     Refusals();
     DamagedBackups();
     InjectedFailures();
+    RecoverLeavesRunningRestore();
     Cancellation();
     StatementStops();
     MarkedSlotBecomesLost();

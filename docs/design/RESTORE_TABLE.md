@@ -34,6 +34,7 @@ Until publication the table is in no catalog listing and no statement can name i
 Publication takes the catalog's table operations, checks the name again and renames the directory into `tables/` without replacing anything, then syncs both parents.
 The rename is the commit point; the store is opened and served afterwards, as CREATE TABLE does.
 A failure before the rename removes the private directory; a crash before it leaves the directory for the next writer start to remove.
+The catalog records the private directory while the restore runs, so RECOVER TABLE of the same name, which removes the interrupted operations of that name, leaves it alone.
 A failure after the rename that leaves the table unopened moves it out again, or fences its name until RECOVER TABLE.
 The backup is only read; a backup that changes while it is copied fails the checksum check.
 The feature check runs after the copy and again at publication, under the feature metadata gate held shared until the table serves, so a feature cannot be enabled in between.
