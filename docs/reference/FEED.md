@@ -156,6 +156,9 @@ SHOW SLOTS `revision` is the durable revision recorded for the table's slots, wh
 `retained_bytes` is the history the slot keeps after `acked`: how many bytes its consumer is behind.
 `attached` is true while a watch holds the slot; another WATCH ... SLOT then answers SLOT_BUSY unless it uses TAKEOVER.
 
+Expiry deletions ([Expiry](TABLES.md#expiry)) are change events of user `@expire`, one per chunk, with the deleted blocks' before rows and no after rows; slots carry them like any other delete.
+No user name starts with `@`, so `@expire` never names a client.
+
 Conditional removal still checks rights and requires an existing table.
 Change events contain complete before and after metadata rows when chunk columns change.
 A null metadata before row means the chunk had never been written.

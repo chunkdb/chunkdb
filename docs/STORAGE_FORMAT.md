@@ -152,8 +152,10 @@ Options use the same TLV layout as the root manifest:
 | 9 | retained byte limit per durable slot `u64`, positive | current catalog/server default (1073741824 unless configured) |
 | 10 | immediate restore parent epoch, 16 nonzero bytes | absent |
 | 11 | completed fork revision `u64`, including zero | absent |
+| 12 | `expire_column`: block column ID `u32`, nonzero, of an unsigned 64-bit column | absent: no expiry |
 
 Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is retired and is not a known option.
+Type 12 is written only while the table has an `expire_column`; a manifest whose type 12 names no unsigned 64-bit block column, or one a pending narrowing changes, is refused, and so is any change that would write one.
 
 Types 10 and 11 belong to incompatibility feature `table_lineage` (`0x4`) and must appear together.
 The parent epoch differs from the table's current epoch; the fork revision preserves its exact unsigned value.
@@ -198,10 +200,11 @@ Each column is encoded in this order:
 | column ID | `u32`, unique, positive, below `next_column_id` |
 | kind | `u8`: 1 unsigned, 2 signed, 3 bool, 4 f32, 5 f64, 6 bits, 7 text, 8 bytes |
 | size | `u32`: unsigned width 1–64; signed width 2–64; bool 1; floats 32/64; bits width 1–65535; text/bytes maximum 1–16777216 bytes |
-| flags | `u8`: bit 0 nullable, bit 1 REQUIRED, bit 2 default present; nullable and REQUIRED cannot both be set |
+| flags | `u8`: bit 0 nullable, bit 1 REQUIRED, bit 2 default present, bit 3 DEFAULT COMMIT_TIME; nullable and REQUIRED cannot both be set |
 | name | length `u8`, then 1–63 bytes matching `[a-z_][a-z0-9_]*`, unique in the schema |
 | default, only with bit 2 | length `u32`, then bytes: fixed value takes `ceil(width/8)` with unused bits zero; text is UTF-8; variable defaults fit the declared maximum |
 
+Bit 3 is valid only on a block column of kind unsigned, size 64, not nullable, with bit 2 and an 8-byte zero default; writes replace that zero with the commit time.
 At least one column is fixed-width; the sum of fixed widths per block is at most 65535 bits.
 Columns keep their IDs through renames and type changes; dropped IDs are not reused.
 After the columns are exactly `schema_version - 1` history steps, oldest first; step `k` produced schema version `k + 1`.

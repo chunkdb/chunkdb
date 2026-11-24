@@ -58,17 +58,17 @@ SHOW TABLES also lists any other tables you have created.
 ## Syntax
 
 ```text
-CREATE TABLE [IF NOT EXISTS] table (column type [NULL] [REQUIRED] [DEFAULT value], ...)
+CREATE TABLE [IF NOT EXISTS] table (column type [NULL] [REQUIRED] [DEFAULT value | DEFAULT COMMIT_TIME], ...)
   [CHUNK width x height [x depth]] [LARGE width x height [x depth]]
   [CHUNK COLUMNS (column type [NULL] [REQUIRED] [DEFAULT value], ...)] [WITH option = value, ...]
-ALTER TABLE table ADD COLUMN [IF NOT EXISTS] column type [NULL] [REQUIRED] [DEFAULT value]
+ALTER TABLE table ADD COLUMN [IF NOT EXISTS] column type [NULL] [REQUIRED] [DEFAULT value | DEFAULT COMMIT_TIME]
 ALTER TABLE table DROP COLUMN [IF EXISTS] column
 ALTER TABLE table RENAME COLUMN column TO name
 ALTER TABLE table ADD CHUNK COLUMN [IF NOT EXISTS] column type [NULL] [REQUIRED] [DEFAULT value]
 ALTER TABLE table DROP CHUNK COLUMN [IF EXISTS] column
 ALTER TABLE table RENAME CHUNK COLUMN column TO name
 ALTER TABLE table ALTER COLUMN column TYPE type [USING CLAMP | DEFAULT | TRUNCATE]
-ALTER TABLE table ALTER COLUMN column SET DEFAULT value | DROP DEFAULT
+ALTER TABLE table ALTER COLUMN column SET DEFAULT value | SET DEFAULT COMMIT_TIME | DROP DEFAULT
 ALTER TABLE table ALTER COLUMN column SET NULL | DROP NULL | SET REQUIRED | DROP REQUIRED
 ALTER TABLE table SET option = value
 ALTER TABLE table RENAME TO name
@@ -88,6 +88,7 @@ ENABLE FEATURE 'name'
 - `NULL`: the column accepts a missing value, distinct from an absent block.
 - `REQUIRED`: new blocks must provide this column unless it has a default.
 - `DEFAULT`: the value used for an omitted column in a new block.
+- `DEFAULT COMMIT_TIME`: a `u64` column that is not NULL takes the commit time in Unix milliseconds on every write to the block; see [Commit time](#commit-time).
 - `CHUNK`: blocks per chunk, default `16 x 16`; a third side selects a three-dimensional table, and geometry is fixed after creation.
 - `LARGE`: chunks per disk file group, default 8 on each active axis; its dimensions must match CHUNK.
 - `CHUNK COLUMNS`: one metadata row per chunk, with an independent column namespace and stable IDs.
@@ -123,6 +124,7 @@ Reserved table names are `con`, `prn`, `aux`, `nul`, `com0` through `com9`, and 
 | `var_max_chunk_bytes` | Encoded text and bytes per chunk; default 1048576 bytes. |
 | `feed_buffer_bytes` | Live feed history and output; default 67108864 bytes. |
 | `slot_max_bytes` | Retained history per durable slot; default 1073741824 bytes. |
+| `expire_column` | A `u64` block column, as a name or quoted name, whose time in Unix milliseconds deletes the block once it has passed; `NULL` or `''` for none, the default; see [Expiry](#expiry). |
 
 Feed and slot limits must be positive.
 Unset limits inherit server defaults each time the table opens; explicit table values persist across restarts.
@@ -137,6 +139,7 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 - RENAME TO: `OK` once the new name serves the table.
 - SHOW TABLES: accessible table names, fenced tables included.
 - DESCRIBE: schema version, column definitions, geometry, options, table epoch, completed revision, dimensions, and chunk columns; a fenced table adds `fenced` with its reason.
+  A column's `default` is `COMMIT_TIME` for DEFAULT COMMIT_TIME, and `options` has `expire_column` only while the table has one.
 - SHOW STATUS: `version`, the `server_version` HELLO reports, `uptime_ms` since the server started, `read_only`, `directory` features, `tables`, `fenced`, and `activation_pending`; each `tables` entry has `name`, `state`, `reason`, `enabled`, `compat`, `ro_compat`, and `incompat`, and each `fenced` entry has `name` and `reason`.
 
 The `version` field describes the schema; `revision` describes the completed commit frontier within `epoch`.
@@ -161,6 +164,8 @@ The `chunk_columns` list uses the same column-description maps as `columns`.
 | INVALID_ARGUMENT | SWAP TABLES names one table twice. | Name two tables. |
 | INVALID_ARGUMENT | DROP NULL finds a NULL: `column c cannot drop NULL: block (x, y) holds NULL`. | Set a value in that block, then run DROP NULL again. |
 | INVALID_ARGUMENT | An ALTER COLUMN change leaves the column as it is, or makes it both NULL and REQUIRED. | Drop the other attribute first. |
+| INVALID_ARGUMENT | DEFAULT COMMIT_TIME names a column that is not `u64` or is NULL, a chunk column, or a type change of such a column. | Use a `u64` column, or DROP DEFAULT before the type change. |
+| INVALID_ARGUMENT | `expire_column` names no `u64` column, or DROP COLUMN, a type change or a narrowing would leave it without one. | Set `expire_column = NULL` first. |
 | TABLE_EXISTS | RENAME TO names a table that exists, or a directory under `tables/` that no table of this server uses. | Use another name, or DROP TABLE that table first. |
 | INTERNAL | SWAP TABLES on Windows or a file system without an atomic directory exchange; both tables keep their names. | Swap on Linux or macOS, or restore under the live name after DROP TABLE. |
 | CONFLICT | An active transaction sees a schema change. | Retry from BEGIN. |
@@ -218,6 +223,40 @@ It waits for the table's running statements and running backups, closes it, remo
 Watches of a table that leaves service end with INTERNAL; watch it again after RECOVER TABLE to resume.
 A table whose recovery fails stays fenced and out of service; a restart also recovers it.
 A migration with an unknown outcome fences every table; RECOVER TABLE refuses it, and only a restart completes it.
+
+## Commit time
+
+A DEFAULT COMMIT_TIME column holds the time of the last commit that created the block or changed another of its values, in Unix milliseconds.
+That time is the commit's `time_ms` in the change feed, and the same for every block of one commit or transaction.
+A write that gives the column a value different from the stored one keeps that value; a write that gives the stored value, or none, gets the commit time.
+A write that changes no value commits nothing and leaves the time as it is; deleting a block removes it with its time.
+SET BLOCK, SET CHUNK, transactions and conditional writes all follow these rules.
+Blocks that existed before ADD COLUMN or SET DEFAULT COMMIT_TIME hold their stored value, zero for an added column, until their next change.
+
+```cql docs-check session=times
+CREATE TABLE seen (v u8, updated u64 DEFAULT COMMIT_TIME, expires u64 NULL) CHUNK 4 x 4 WITH expire_column = expires
+ALTER TABLE seen SET expire_column = NULL
+DROP TABLE seen
+```
+
+```output
+OK
+OK
+OK
+```
+
+## Expiry
+
+With `expire_column = c`, the server deletes each block whose column `c` holds a time t with 0 < t <= now, in Unix milliseconds.
+NULL and 0 never expire; for a time to live, write `expires = NOW() + ttl_ms`.
+Reads do not filter: an expired block stays visible until its deletion, so test `expires > NOW()` in WHERE when that matters.
+About once a second the shared maintenance workers start a sweep of each such table.
+A sweep reads every populated chunk in coordinate order, at most 64 chunks per worker turn, and other tables' work runs between its turns.
+Each chunk with expired blocks is one ordinary commit, decided under its chunk lock, so a write that moves the time ahead first keeps its block.
+Its change event has user `@expire`, and the WAL, slots and backups see it as any other delete.
+A sweep never waits for a schema change, drop or reopen of its table; it skips the table instead.
+A crash loses no committed deletion; after a restart the next sweep starts from the first chunk.
+SHOW METRICS reports `chunkdb_expiry_lag_seconds`, `chunkdb_expired_blocks_total` and `chunkdb_expiry_failed_passes_total` per table with an `expire_column`; see [Server statements](SERVER.md#notes).
 
 ## Limits
 
