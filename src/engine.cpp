@@ -26,6 +26,7 @@
 #include "user_registry.hpp"
 #include "statement_control.hpp"
 #include "table_options_text.hpp"
+#include "returning.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -404,7 +405,7 @@ std::string CommandEngine::Execute(
         response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr,
             continuation, reserve_reply);
     }
-    ObserveReply(command_class, started, response);
+    ObserveReply(command_class, started, response, std::exchange(session.refused_write, std::string_view{}));
     if (logged && info.verb != nullptr) {
         LogStatement(session, info, started, response);
     }
@@ -565,10 +566,11 @@ void CommandEngine::AuditLogin(
 void CommandEngine::ObserveReply(
     MetricsRegistry::CommandClass command_class,
     std::chrono::steady_clock::time_point started,
-    const std::string& response) {
+    const std::string& response,
+    std::string_view refusal) {
     const auto elapsed = std::chrono::steady_clock::now() - started;
 
-    const bool ok = response.empty() || response[0] != '-';
+    const bool ok = refusal.empty() && (response.empty() || response[0] != '-');
     metrics_->ObserveCommand(
         command_class,
         std::chrono::duration<double>(elapsed).count(),
@@ -577,7 +579,9 @@ void CommandEngine::ObserveReply(
         // Error frames look like "-ERR <CODE> <message>\r\n".
         std::string_view code = response;
         constexpr std::string_view kErrPrefix = "-ERR ";
-        if (code.rfind(kErrPrefix, 0) == 0) {
+        if (!refusal.empty()) {
+            code = refusal;
+        } else if (code.rfind(kErrPrefix, 0) == 0) {
             code.remove_prefix(kErrPrefix.size());
             const auto code_end = code.find_first_of(" \r\n");
             if (code_end != std::string_view::npos) {
@@ -866,6 +870,10 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
             return Protocol::Error("INVALID_ARGUMENT", std::string(error.what()) + "; use DESCRIBE <table> to check column names");
         return Protocol::Error("INVALID_ARGUMENT", error.what());
     }
+    if (const auto* returning = dynamic_cast<const ReturningLimitError*>(&error); returning != nullptr) {
+        return Protocol::Error("OUT_OF_RANGE", error.what(), {{"reason", "returning_limit"},
+            {"bound", returning->limit_name()}, {"limit", std::to_string(returning->limit())}});
+    }
     if (const auto* area = dynamic_cast<const AreaEntryTooLargeError*>(&error); area != nullptr) {
         std::string chunk = std::to_string(area->coord().x) + "," + std::to_string(area->coord().y);
         if (area->dims() == 3U) chunk += "," + std::to_string(area->coord().z);
@@ -1071,7 +1079,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 13);
+    Protocol::AppendArrayHeader(reply, 14);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -1085,6 +1093,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "area_paging");
     Protocol::AppendBulk(reply, "area_scale");
     Protocol::AppendBulk(reply, "read_only_transactions");
+    Protocol::AppendBulk(reply, "returning");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 2U : 1U);
     entry("statement_timeout_ms", session.hello_options.statement_timeout_ms.value_or(session.default_statement_timeout_ms));
@@ -1111,7 +1120,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     entry("txn_max_written_chunks", limits.txn_max_written_chunks);
     entry("txn_max_read_chunks", limits.txn_max_read_chunks);
     entry("max_watches", session.max_watches);
-    entry("max_returning_rows", 65536U);
+    entry("max_returning_rows", kMaxReturningRows);
     entry("max_expression_nodes", 256U);
     return reply;
 }

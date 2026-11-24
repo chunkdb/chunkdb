@@ -618,8 +618,8 @@ class Parser {
         return at_;
     }
 
-    // SET BLOCK's values: single values followed by IF or the end, as
-    // before expressions; otherwise every value is an expression
+    // SET BLOCK's values: single values followed by IF, RETURNING or the
+    // end, as before expressions; otherwise every value is an expression
     // (docs/design/EXPRESSIONS_DESIGN.md), parsed into `*expressions`.
     void BlockValues(std::vector<Assignment>* values, std::shared_ptr<expr::WriteExpressions>* expressions) {
         const std::size_t start = Rewind();
@@ -627,7 +627,7 @@ class Parser {
         const std::set<std::size_t> before = parameters_;
         try {
             *values = Assignments();
-            if (Peek().kind == TokenKind::kEnd || IsKeyword(Peek(), "if")) return;
+            if (Peek().kind == TokenKind::kEnd || IsKeyword(Peek(), "if") || IsKeyword(Peek(), "returning")) return;
         } catch (const ParseError&) {
             // Not single values: read again as expressions below.
         }
@@ -657,6 +657,28 @@ class Parser {
         }
         if (!*expressions) *expressions = std::make_shared<expr::WriteExpressions>();
         (*expressions)->condition = expr::ParseConditionAt(line_, &at_, &parameters_);
+    }
+
+    // RETURNING [OLD | NEW] (* | column, ...), or nothing. OLD is the default
+    // of DELETE, which takes only OLD; NEW that of SET. OLD and NEW right
+    // after RETURNING are always the keywords: RETURNING NEW old names a
+    // column old.
+    [[nodiscard]] std::shared_ptr<const Returning> ReturningClause(bool remove) {
+        if (!Accept("returning")) return nullptr;
+        auto returning = std::make_shared<Returning>();
+        returning->new_values = !remove;
+        const std::size_t column = Peek().column;
+        if (Accept("old")) {
+            returning->new_values = false;
+        } else if (Accept("new")) {
+            if (remove) Fail(column, "DELETE BLOCK returns only OLD values");
+            returning->new_values = true;
+        }
+        if (AcceptToken(TokenKind::kStar)) return returning;
+        do {
+            returning->columns.push_back(Name("a column name or *"));
+        } while (AcceptToken(TokenKind::kComma));
+        return returning;
     }
 
     [[nodiscard]] std::uint8_t Point(std::int64_t& x, std::int64_t& y, std::int64_t& z, bool chunk = false) {
@@ -1056,6 +1078,7 @@ class Parser {
                 BlockValues(&set.values, &expressions);
                 BlockCondition(&set.if_version, &expressions);
                 set.expressions = std::move(expressions);
+                set.returning = ReturningClause(false);
                 return set;
             }
             if (Accept("chunk")) {
@@ -1094,6 +1117,7 @@ class Parser {
             std::shared_ptr<expr::WriteExpressions> expressions;
             BlockCondition(&del.if_version, &expressions);
             del.expressions = std::move(expressions);
+            del.returning = ReturningClause(true);
             return del;
         }
         if (Accept("create")) {
