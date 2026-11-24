@@ -1426,6 +1426,9 @@ void PersistentFilterDelivery(bool tls) {
     const auto entry = NextChange(*watch); assert(Change(entry) == first);
     const auto& block = entry.items[6].items[0];
     assert(block.items[2].type == '_' && block.items[3].items[0].value == "one" && Number(block.items[3].items[1]) == 7U);
+    // A slot watch keeps the areas of its slot; the refusal leaves it open.
+    const auto replace = watch->Command("WATCH AREA 1 1 TO 1 1");
+    Error(replace, "INVALID_ARGUMENT"); assert(replace.value.find("reason=slot_filters") != std::string::npos);
     Unwatch(*watch); // No ACK: reopen must replay the same projected historical schema.
     writer->Ok("ALTER TABLE t RENAME COLUMN label TO renamed");
     const auto second = Number(writer->Command("SET BLOCK 0 0 IN t n=8,renamed='two'"));

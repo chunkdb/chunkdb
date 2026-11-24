@@ -6854,6 +6854,44 @@ template <typename Client> void TestWatchPipelinedLines(bool tls) {
     second.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(second)).empty());
 }
 
+// WATCH AREA on a watching connection replaces the areas of its watch: pushes
+// after its reply keep chunks in the new areas only, a refused replacement
+// leaves the watch open with its areas, and a full second WATCH still closes.
+template <typename Client> void TestWatchAreaReplace(bool tls) {
+    auto config = BaseServerConfig(); config.tls_enabled = tls;
+    config.feed_progress_ms = 60000U; // No progress frame between the replies and pushes read here.
+    ServerHarness harness(tls ? "watch-area-replace-tls" : "watch-area-replace", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    Client writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(10)); writer.Hello();
+    Client watch("127.0.0.1", harness.port); watch.SetReadDeadline(std::chrono::seconds(10)); watch.Hello();
+    const auto set = [&](int x, int y) {
+        writer.SendLine("SET BLOCK " + std::to_string(x) + " " + std::to_string(y) + " IN default bits = b'0100'");
+        return ReadVersion(writer);
+    };
+    const auto changed = [&](std::uint64_t revision, const char* x) {
+        const auto change = ReadFeedReply(watch);
+        assert(change.type == '>' && change.items[0].value == "change" && change.items[2].value == std::to_string(revision));
+        assert(change.items[6].items.size() == 1U && change.items[6].items[0].items[0].value == x);
+    };
+    watch.SendLine("WATCH default AREA 0 0 TO 0 0");
+    const auto start = FeedStart(ReadFeedReply(watch));
+    const auto low = set(0, 0);
+    changed(low, "0");
+    // Chunk 2 2 holds block 8 8.
+    watch.SendLine("WATCH AREA 2 2 TO 2 2, AREA 5 5 TO 6 6");
+    const auto replaced = FeedStart(ReadFeedReply(watch));
+    assert(replaced.substr(0U, 32U) == start.substr(0U, 32U) && std::stoull(replaced.substr(33U)) >= low);
+    (void)set(1, 1); // Chunk 0 0 is no longer watched.
+    changed(set(8, 8), "8");
+    watch.SendLine("WATCH AREA 0 0 0 TO 0 0 0");
+    assert(watch.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+    (void)set(0, 0);
+    changed(set(9, 9), "9");
+    watch.SendLine("WATCH default");
+    assert(watch.ReadLine().rfind("-ERR PROTOCOL", 0) == 0);
+    assert(watch.WaitForClose(std::chrono::seconds(10)));
+}
+
 void TestWatchPositionsAndRights() {
     auto config = AuthenticatedFeedServerConfig(); config.worker_threads = 2; config.feed_buffer_bytes = 16384;
     config.feed_linger_ms = 0U;
@@ -8068,6 +8106,7 @@ void TestFeedWatch() {
     run("TestWatchLinger<RawClient>(false, false, false, true)", [] { TestWatchLinger<RawClient>(false, false, false, true); });
     run("TestWatchProtocol<RawClient>(false)", [] { TestWatchProtocol<RawClient>(false); });
     run("TestWatchPipelinedLines<RawClient>(false)", [] { TestWatchPipelinedLines<RawClient>(false); });
+    run("TestWatchAreaReplace<RawClient>(false)", [] { TestWatchAreaReplace<RawClient>(false); });
     run("TestWatchNoIdle<RawClient>(false)", [] { TestWatchNoIdle<RawClient>(false); });
     run("TestWatchPositionsAndRights()", [] { TestWatchPositionsAndRights(); });
     run("TestWatchCatalog()", [] { TestWatchCatalog(); });
@@ -8080,6 +8119,7 @@ void TestFeedWatch() {
     run("TestWatchLinger<TlsClient>(true, false, false, true)", [] { TestWatchLinger<TlsClient>(true, false, false, true); });
     run("TestWatchProtocol<TlsClient>(true)", [] { TestWatchProtocol<TlsClient>(true); });
     run("TestWatchPipelinedLines<TlsClient>(true)", [] { TestWatchPipelinedLines<TlsClient>(true); });
+    run("TestWatchAreaReplace<TlsClient>(true)", [] { TestWatchAreaReplace<TlsClient>(true); });
     run("TestWatchNoIdle<TlsClient>(true)", [] { TestWatchNoIdle<TlsClient>(true); });
     run("TestWatchSlowReader<TlsClient>(true)", [] { TestWatchSlowReader<TlsClient>(true); });
 #endif

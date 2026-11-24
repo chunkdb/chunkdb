@@ -344,6 +344,8 @@ struct ReloadTls {};
 struct Ping {};
 struct Watch {
     // WATCH CATALOG: the catalog, not a table; every other field is empty.
+    // WATCH AREA ...: `table` is empty and only `areas` is given; it replaces
+    // the areas of the watch open on the connection.
     bool catalog = false;
     std::string table;
     std::optional<std::vector<std::string>> columns{};

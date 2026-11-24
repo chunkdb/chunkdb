@@ -123,6 +123,10 @@ class FeedSubscription {
     // nullptr if nothing is available before timeout. kEnd is delivered once.
     [[nodiscard]] std::shared_ptr<const FeedEntry> Next(
         std::chrono::milliseconds timeout = std::chrono::milliseconds{0});
+    // Keeps a chunk inside any of `areas` in the entries read after the
+    // returned position, which is the last one read; a slot reader cannot.
+    // The reader calls it, between reads.
+    [[nodiscard]] FeedPosition SetAreas(std::vector<FeedArea> areas);
 
   private:
     friend class ChangeFeed;

@@ -37,6 +37,14 @@ bool SameValues(const std::optional<std::vector<ColumnValue>>& a,
     if (!a) return true;
     return SameFeedValues(*a, *b);
 }
+// Overlapping or repeated areas keep the same chunks; one order shares one projection.
+void SortAreas(std::vector<FeedArea>& areas) {
+    std::sort(areas.begin(), areas.end(), [](const FeedArea& a, const FeedArea& b) {
+        return std::tie(a.first.x, a.first.y, a.first.z, a.last.x, a.last.y, a.last.z) <
+            std::tie(b.first.x, b.first.y, b.first.z, b.last.x, b.last.y, b.last.z);
+    });
+    areas.erase(std::unique(areas.begin(), areas.end()), areas.end());
+}
 
 }  // namespace
 
@@ -805,12 +813,7 @@ std::string FeedSubscription::ResyncFrame() {
 
 FeedSubscription::FeedSubscription(std::shared_ptr<ChangeFeed> feed, std::weak_ptr<Table> table, const FeedOptions& options)
     : feed_(std::move(feed)), table_(std::move(table)), areas_(options.areas), column_ids_(options.column_ids), no_before_(options.no_before) {
-    // Overlapping or repeated areas keep the same chunks; one order shares one projection.
-    std::sort(areas_.begin(), areas_.end(), [](const FeedArea& a, const FeedArea& b) {
-        return std::tie(a.first.x, a.first.y, a.first.z, a.last.x, a.last.y, a.last.z) <
-            std::tie(b.first.x, b.first.y, b.first.z, b.last.x, b.last.y, b.last.z);
-    });
-    areas_.erase(std::unique(areas_.begin(), areas_.end()), areas_.end());
+    SortAreas(areas_);
 }
 void FeedSubscription::Track(std::uint64_t revision) {
     if (group_) group_->Move(group_position_, revision);
@@ -858,33 +861,64 @@ std::unique_ptr<FeedSubscription> ChangeFeed::Subscribe(std::weak_ptr<Table> tab
         result->notify_ = std::make_shared<const std::function<void()>>(options.notify);
         notifications_.push_back(result->notify_);
     }
-    FeedProjectionGroup::Key key{result->areas_, result->column_ids_, result->no_before_, options.chunks};
-    if (!slot && (!key.areas.empty() || key.column_ids || key.no_before || key.chunks)) {
-        std::erase_if(groups_, [](const auto& group) { return group.expired(); });
-        for (const auto& weak : groups_) {
-            if (auto group = weak.lock(); group && group->key() == key) { result->group_ = std::move(group); break; }
-        }
-        if (!result->group_) {
-            auto group = std::make_shared<FeedProjectionGroup>(std::move(key));
-            groups_.push_back(group);
-            result->group_ = std::move(group);
-            group_count_.store(groups_.size(), std::memory_order_relaxed);
-            // Every share shrinks, so existing groups give up what exceeds theirs
-            // and what the ring floor passed; together they keep at most the budget.
-            for (const auto& weak : groups_) {
-                if (auto other = weak.lock(); other && other != result->group_)
-                    other->Trim(budget() / groups_.size(), floor_, released);
-            }
-        }
-        group_count_.store(groups_.size(), std::memory_order_relaxed);
-        result->group_->Join(result->position_.revision);
-        result->group_position_ = result->position_.revision;
-    }
     result->chunks_ = options.chunks;
     result->slot_ = slot;
+    JoinGroup(*result, released);
     if (options.chunks) chunk_watchers_.fetch_add(1U, std::memory_order_acq_rel);
     result->table_ = std::move(table);
     return result;
+}
+void ChangeFeed::JoinGroup(FeedSubscription& sub, FeedProjectionGroup::Released& released) {
+    FeedProjectionGroup::Key key{sub.areas_, sub.column_ids_, sub.no_before_, sub.chunks_};
+    if (sub.slot_ || (key.areas.empty() && !key.column_ids && !key.no_before && !key.chunks)) return;
+    std::erase_if(groups_, [](const auto& group) { return group.expired(); });
+    for (const auto& weak : groups_) {
+        if (auto group = weak.lock(); group && group->key() == key) { sub.group_ = std::move(group); break; }
+    }
+    if (!sub.group_) {
+        auto group = std::make_shared<FeedProjectionGroup>(std::move(key));
+        groups_.push_back(group);
+        sub.group_ = std::move(group);
+        group_count_.store(groups_.size(), std::memory_order_relaxed);
+        // Every share shrinks, so existing groups give up what exceeds theirs
+        // and what the ring floor passed; together they keep at most the budget.
+        for (const auto& weak : groups_) {
+            if (auto other = weak.lock(); other && other != sub.group_)
+                other->Trim(budget() / groups_.size(), floor_, released);
+        }
+    }
+    group_count_.store(groups_.size(), std::memory_order_relaxed);
+    sub.group_->Join(sub.position_.revision);
+    sub.group_position_ = sub.position_.revision;
+}
+FeedPosition FeedSubscription::SetAreas(std::vector<FeedArea> areas) {
+    if (slot_) throw std::logic_error("a slot reader keeps the areas of its slot");
+    if (areas.size() > kMaxFeedAreas) throw std::invalid_argument("a watch takes at most 64 areas");
+    // Without its table the feed has ended, and the next read says so.
+    if (const auto table = table_.lock()) {
+        const auto dims = table->geometry().dims();
+        for (const auto& area : areas) {
+            if (area.dims != dims) throw std::invalid_argument("feed area dimensionality differs from table");
+            if (area.first.x > area.last.x || area.first.y > area.last.y || area.first.z > area.last.z)
+                throw std::invalid_argument("feed area bounds are reversed");
+        }
+    }
+    SortAreas(areas);
+    // Items the old group keeps for this reader are freed outside every feed
+    // lock, with the group itself when this reader was its last member.
+    if (group_) {
+        group_->Leave(group_position_);
+        group_.reset();
+    }
+    areas_ = std::move(areas);
+    FeedProjectionGroup::Released released;
+    {
+        std::lock_guard lock(feed_->mutex_);
+        std::erase_if(feed_->groups_, [](const auto& group) { return group.expired(); });
+        feed_->group_count_.store(feed_->groups_.size(), std::memory_order_relaxed);
+        feed_->JoinGroup(*this, released);
+    }
+    return position_;
 }
 std::shared_ptr<const FeedEntry> ChangeFeed::Next(FeedSubscription& sub, std::chrono::milliseconds timeout) {
     if (sub.ended_) return nullptr;

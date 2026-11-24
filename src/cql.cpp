@@ -1506,6 +1506,12 @@ class Parser {
                 watch.catalog = true;
                 return watch;
             }
+            // WATCH AREA ... replaces the areas of an open watch. No option starts
+            // with a coordinate, so WATCH area ... still watches a table named area.
+            if (IsKeyword(Peek(), "area") && PeekSecond().kind == TokenKind::kInteger) {
+                (void)FeedFilter(watch);
+                return watch;
+            }
             watch.table = Name("a table name");
             while (true) {
                 const auto column = Peek().column;

@@ -341,12 +341,15 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
     const auto resync = [&] {
         // Finish an in-progress frame, preserving SSL_write's exact retry.
         const bool pinned = !watch.output.empty() && (watch.offset != 0U || watch.write_size != 0);
-        if (pinned) {
-            while (watch.output.size() > 1U) watch.output.pop_back();
-            watch.bytes = watch.output.front().bytes->size() - watch.offset;
-        } else {
-            watch.output.clear(); watch.bytes = 0U;
-        }
+        // Only pushes are dropped: a reply to a line read on the stream, such
+        // as WATCH AREA, is still owed and keeps its place.
+        std::deque<Watch::Output> kept;
+        for (auto& output : watch.output)
+            if ((pinned && kept.empty()) || output.bytes->front() != '>') kept.push_back(std::move(output));
+        watch.output = std::move(kept);
+        watch.bytes = 0U;
+        for (const auto& output : watch.output) watch.bytes += output.bytes->size();
+        watch.bytes -= watch.offset;
         Queue(watch, std::make_shared<const std::string>(watch.connection->session.watch->ResyncFrame()));
     };
     for (std::size_t i = 0; i < 64U; ++i) {
@@ -425,11 +428,18 @@ void FeedIo::Read(Watch& watch) {
                     Wake();
                     continue;
                 }
+                if (const auto* replace = std::get_if<cql::Watch>(&parsed.statement); replace && !replace->catalog && replace->table.empty()) {
+                    // Pushes already queued keep the old areas; the reply follows them.
+                    if (!Permitted(watch)) return;
+                    Queue(watch, std::make_shared<const std::string>(CommandEngine::ReplaceWatchAreas(connection.session, replace->areas)));
+                    Wake();
+                    continue;
+                }
                 if (!std::holds_alternative<cql::Unwatch>(parsed.statement)) {
-                    Reject(watch, "only UNWATCH is accepted while watching"); return;
+                    Reject(watch, "only UNWATCH, WATCH AREA and a slot's ACK are accepted while watching"); return;
                 }
             } catch (const cql::ParseError&) {
-                Reject(watch, "only UNWATCH is accepted while watching"); return;
+                Reject(watch, "only UNWATCH, WATCH AREA and a slot's ACK are accepted while watching"); return;
             }
             watch.unwatch = true;
             if (connection.session.slot_watch) { connection.session.slot_watch->Unwatch(); Wake(); }

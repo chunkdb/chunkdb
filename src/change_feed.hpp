@@ -183,6 +183,9 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     [[nodiscard]] bool HasError() const;
     void Fail(std::exception_ptr error);
     void Send();
+    // Under mutex_: puts a filtered reader into the projection group of its
+    // filters, at its position; `released` holds what other groups trimmed.
+    void JoinGroup(FeedSubscription& subscription, FeedProjectionGroup::Released& released);
     void Merge(std::uint64_t watermark);
     void Append(std::shared_ptr<const FeedEntry> entry, std::size_t bytes, RawWrite* consumed = nullptr,
                 bool notify = true);

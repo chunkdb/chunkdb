@@ -652,6 +652,13 @@ void TestWatch() {
     ExpectError("WATCH world AREA 0 0 TO 1 1 AREA 2 2 TO 3 3", "AREA is given twice");
     ExpectError("WATCH world AREA 0 0 TO 1 1, COLUMNS a", "expected AREA");
     ExpectError("WATCH world AREA 0 0 TO 1 1, AREA 0 0 0 TO 1 1 1", "AREA dimensions differ");
+    // WATCH AREA without a table replaces the areas of an open watch; a table named area is still watched.
+    const auto replace = Get<cql::Watch>("WATCH AREA 0 0 TO 1 1, AREA -2 -2 TO -1 -1");
+    assert(!replace.catalog && replace.table.empty() && replace.areas.size() == 2U && replace.areas[1].first.x == -2);
+    assert(Get<cql::Watch>("WATCH area").table == "area");
+    const auto named = Get<cql::Watch>("WATCH area AREA 0 0 TO 1 1");
+    assert(named.table == "area" && named.areas.size() == 1U);
+    ExpectError("WATCH AREA 0 0 TO 1 1 COLUMNS a", "expected the end of the statement");
     ExpectError("CREATE SLOT 's' ON world AREA 0 0 TO 1 1, AREA 2 2 TO 3 3", "a slot takes one AREA");
     std::string many = "WATCH world AREA 0 0 TO 0 0";
     for (std::size_t i = 1U; i < chunkdb::kMaxFeedAreas; ++i) many += ", AREA 0 0 TO 0 0";

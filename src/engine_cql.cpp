@@ -1071,7 +1071,10 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::Begin&) { info.verb = "BEGIN"; },
             [&](const cql::Commit&) { info.verb = "COMMIT"; },
             [&](const cql::Rollback&) { info.verb = "ROLLBACK"; },
-            [&](const cql::Watch& watch) { info.verb = watch.catalog ? "WATCH CATALOG" : "WATCH"; info.table = watch.table; },
+            [&](const cql::Watch& watch) {
+                info.verb = watch.catalog ? "WATCH CATALOG" : watch.table.empty() ? "WATCH AREA" : "WATCH";
+                info.table = watch.table;
+            },
             [&](const cql::Unwatch&) { info.verb = "UNWATCH"; },
             [&](const cql::CreateSlot& create) { slot(create, "CREATE SLOT", "create_slot"); },
             [&](const cql::DropSlot& drop) { slot(drop, "DROP SLOT", "drop_slot"); },
@@ -1693,6 +1696,7 @@ std::string CommandEngine::ExecuteStatement(
                     return reply;
                 },
                 [&](const cql::Watch& watch) {
+                    if (!watch.catalog && watch.table.empty()) return ReplaceWatchAreas(session, watch.areas);
                     // The open watch, its rights check and its count stay as they are.
                     if (session.Watching()) return Protocol::Error("INVALID_ARGUMENT", "a watch is already open");
                     if (watch.catalog) {
@@ -2997,6 +3001,27 @@ void CommandEngine::EndExpiredTransactions() {
             released.push_back(txn->Detach(reply));
         }
     }
+}
+
+std::string CommandEngine::ReplaceWatchAreas(SessionState& session, const std::vector<FeedArea>& areas) {
+    if (session.slot_watch)
+        return Protocol::Error("INVALID_ARGUMENT", "a slot watch keeps the areas of its slot", {{"reason", "slot_filters"}});
+    if (session.catalog_watch) return Protocol::Error("INVALID_ARGUMENT", "WATCH CATALOG has no areas");
+    if (!session.watch) return Protocol::Error("INVALID_ARGUMENT", "no watch is open");
+    FeedPosition position;
+    try {
+        position = session.watch->SetAreas(areas);
+    } catch (const std::invalid_argument& error) {
+        // The watch keeps its areas.
+        return ErrorReply(error);
+    }
+    std::string reply;
+    Protocol::AppendMapHeader(reply, 2U);
+    Protocol::AppendBulk(reply, "epoch");
+    Protocol::AppendBulk(reply, StoreIdHex(position.epoch));
+    Protocol::AppendBulk(reply, "revision");
+    Protocol::AppendInteger(reply, position.revision);
+    return reply;
 }
 
 std::string CommandEngine::TxnBegin(SessionState& session, bool read_only) {
