@@ -125,11 +125,6 @@ jobs:
           nice -n 10 build/chunkdb_docs_check examples --server build/chunkdb_server --cli page-bin/chunk-cli
           build/chunkdb_docs_check links
 
-      - name: server_integration flake guard
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          ctest --test-dir build -R server_integration --repeat until-fail:5 --output-on-failure
-
       - name: ccache statistics
         if: always()
         uses: ./.github/actions/ccache-stats
@@ -190,10 +185,6 @@ jobs:
           chmod +x scripts/test/quick.sh
           BUILD_DIR=build CHUNKDB_WITH_TLS=ON CHUNKDB_WERROR=ON scripts/test/quick.sh
 
-      - name: server_integration flake guard
-        run: |
-          ctest --test-dir build -R server_integration --repeat until-fail:5 --output-on-failure
-
       - name: TLS Server Startup Smoke Test
         run: |
           mkdir -p tls-smoke
@@ -222,6 +213,47 @@ jobs:
 
           kill "$server_pid"
           wait "$server_pid" || true
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
+
+  # Five more runs of server_integration catch rare timing failures. They take
+  # about 10 minutes, which in the build-and-test jobs left the TLS job at its
+  # 30-minute limit, so they run here against a build of that test alone.
+  server-integration-flake-guard:
+    name: server_integration flake guard (ubuntu-latest, TLS ${{ matrix.tls }})
+    needs: changes
+    if: needs.changes.outputs.code == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        tls: ['OFF', 'ON']
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: ccache
+        uses: ./.github/actions/ccache
+        with:
+          name: flake-guard-tls-${{ matrix.tls }}
+
+      - name: Install OpenSSL Development Packages
+        if: matrix.tls == 'ON'
+        timeout-minutes: 12
+        run: scripts/ci/apt-install.sh libssl-dev openssl
+
+      - name: Build server_integration
+        run: |
+          cmake -S . -B build -DCHUNKDB_BUILD_TESTS=ON -DCHUNKDB_WITH_TLS=${{ matrix.tls }} -DCHUNKDB_WERROR=ON
+          cmake --build build --parallel "$(nproc)" --target chunkdb_server_integration_test
+
+      - name: server_integration flake guard
+        run: |
+          ctest --test-dir build -R '^server_integration$' --repeat until-fail:5 --output-on-failure
+
       - name: ccache statistics
         if: always()
         uses: ./.github/actions/ccache-stats
@@ -264,12 +296,19 @@ jobs:
         if: always()
         uses: ./.github/actions/ccache-stats
 
+  # The TSan smoke tests take about 19 minutes in a row (November 2026 runs),
+  # which with the build left the job at its 30-minute limit; each shard runs
+  # every second test of the list ctest selects, after its own build.
   sanitizer-tsan:
-    name: TSan (Ubuntu 24.04, GCC)
+    name: TSan (Ubuntu 24.04, GCC, shard ${{ matrix.shard }} of 2)
     needs: changes
     if: needs.changes.outputs.code == 'true'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        shard: [1, 2]
 
     env:
       TSAN_OPTIONS: halt_on_error=1:second_deadlock_stack=1
@@ -295,12 +334,16 @@ jobs:
       - name: Build
         run: cmake --build build-tsan --parallel "$(getconf _NPROCESSORS_ONLN)"
 
+      # Explicit names: ctest -I applies its stride to the label-filtered list
+      # and ran one test in both shards.
       - name: Smoke Tests
-        run: >
-          ctest --test-dir build-tsan
-          -L smoke
-          -E "process_lock|durability_kill_recovery"
-          --output-on-failure
+        run: |
+          names=$(ctest --test-dir build-tsan -N -L smoke -E "process_lock|durability_kill_recovery" |
+            sed -n 's/^ *Test *#[0-9]*: //p')
+          test -n "$names"
+          shard=$(printf '%s\n' "$names" | awk -v shard=${{ matrix.shard }} 'NR % 2 == shard % 2' | paste -sd'|' -)
+          echo "shard ${{ matrix.shard }} of 2: $(printf '%s\n' "$names" | awk -v shard=${{ matrix.shard }} 'NR % 2 == shard % 2' | wc -l) of $(printf '%s\n' "$names" | wc -l) tests"
+          ctest --test-dir build-tsan -L smoke -R "^($shard)$" --output-on-failure
       - name: ccache statistics
         if: always()
         uses: ./.github/actions/ccache-stats
