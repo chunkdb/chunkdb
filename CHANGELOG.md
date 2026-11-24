@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add `AGGREGATE CHUNK | AREA | AREA AROUND ... FROM t COUNT(*), SUM(a), MIN(a), MAX(a), AVG(a) [BY CHUNK]` over the present blocks of integer and float columns: a map of results, or with BY CHUNK one row per chunk; integer SUM is exact in 128 bits, NULL values are skipped, float MIN and MAX order NaN above every value; it covers at most `--max-area-chunks` chunks and replies within `--max-area-response-bytes`, reads the transaction snapshot inside a transaction, and refuses WHERE (#148).
 - With a feed slot, checkpoints and the writes that wait on them no longer wait while a slot pass syncs the files written since the previous pass; a pass held checkpoint publication through all its syncs, so with many chunks written between passes a write could wait for seconds. A pass now sets the FLUSH WAL durability floor, so later relaxed-mode checkpoints of that store sync their images, as after FLUSH WAL or a reopen (#140).
 - A connection that leaves a WATCH or WATCH ... SLOT with UNWATCH starts its `--idle-connection-timeout-ms` interval when UNWATCH is answered; before, a watch longer than that timeout made the server close the connection without a reply to its next request (#140).
 - SHOW CONNECTIONS lists a connection that left its WATCH with UNWATCH as `idle`; before, it showed `watch` until the connection's next request.
