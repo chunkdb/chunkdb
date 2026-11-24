@@ -406,6 +406,7 @@ void TestErrors() {
     ExpectError(f.Run("SET BLOCK 0 0 IN world id = 1, mask = b'1'"), "INVALID_ARGUMENT");
     ExpectError(f.Run("GET BLOCK 0 0 FROM world;"), "SYNTAX column 25: unexpected ';'");
     ExpectError(f.Run("SET BLOCK 0 0 IN world id = 1\x01"), "SYNTAX column 30: unexpected '\\x01'");
+    ExpectError(f.Run("SET BLOCK 0 0 IN world id = 1\xc3\xa9"), "SYNTAX column 30: unexpected '\\xc3'");
     ExpectReply(f.Run("GET BLOCK 0 0 FROM world"), "_\r\n");
 }
 

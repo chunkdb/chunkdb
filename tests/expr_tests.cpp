@@ -981,7 +981,8 @@ void TestTypeErrors() {
     }
     (void)table.Plan("NULL IN (NULL, 1, 2.5)");
     (void)table.Plan("NULL IN (NULL)");
-    // A float literal is not rounded to f32 when planned, whatever its range.
+    // A float literal compared with f32 beyond the f32 range plans and keeps
+    // its value.
     (void)table.Plan("f32c < 1e39");
     (void)table.Plan("f32c * 1e39 > 0");
     (void)table.Plan("f32c + 1e39 < 0 AND f32c IN (1e39) AND f32c BETWEEN -1e39 AND 1e39");
@@ -1118,25 +1119,49 @@ void TestNumbersMixed() {
     table["f64c"] = -0.0;
     table.True("f64c = 0 AND f64c = 0.0 AND 0.0 = -0.0 AND NOT f64c < 0 AND f64c >= 0");
     table.True("-f64c = f64c");
-    // f32 widens exactly; float literals keep the value they are written
-    // with, so comparisons with them are exact.
+    // f32 widens exactly. A float literal compared with an f32 operand takes
+    // f32, as a parameter in its place would: it is rounded to the nearest
+    // f32. Arithmetic with a float literal stays f64, and so does a literal
+    // compared with it.
     table["f32c"] = 0.1F;
-    table.True("f32c <> 0.1 AND f32c > 0.1");
+    table.True("f32c = 0.1 AND NOT f32c > 0.1 AND NOT f32c < 0.1 AND 0.1 = f32c AND f32c = -(-0.1)");
     table.True("f32c = 0.100000001490116119384765625");
     table.True("f32c + 0.0 <> 0.1 + 0.0 AND f32c * 1 > 0.1");
-    table.True("f32c NOT IN (0.1) AND f32c NOT BETWEEN 0.1 AND 0.1 AND f32c BETWEEN 0.1 AND 0.2");
+    table.True("f32c IN (0.2, 0.1) AND f32c BETWEEN 0.1 AND 0.1 AND 0.1 BETWEEN f32c AND f32c AND NOT f32c NOT IN (0.1)");
+    table.True("LEAST(f32c, f32c) = 0.1 AND COALESCE(f32c, NULL) = 0.1 AND f32c + NULL IS NULL");
     table.True("f32c = f32c + f32c - f32c");
     table["f64c"] = 0.1;
-    table.True("f64c = 0.1 AND f32c <> f64c AND f32c > f64c");
+    table.True("f64c = 0.1 AND f32c <> f64c AND f32c > f64c AND f64c <> 0.100000001490116119384765625");
+    // Bounds of f32 and f64 give the tested literal f64.
+    table["f64c"] = 0.2;
+    table.True("NOT 0.1 BETWEEN f32c AND f64c AND 0.1 BETWEEN f32c AND 0.2");
     table["f32c"] = 16777216.0F;
     table.True("f32c = 16777216 AND f32c < 16777217 AND f32c + 1 = 16777217");
-    table.True("f32c < 16777216.5");
-    table.False("f32c = 16777217.0");
-    table.True("f32c <> 16777217.0 AND f32c + 1.0 = 16777217.0 AND f32c IN (16777216.0, 16777217.0)");
-    table.True("f32c < 1e39 AND f32c > -1e39 AND f32c * 1e39 > 0");
+    // 16777216.5 and 16777217 round to 16777216, half to even.
+    table.True("f32c = 16777216.5 AND NOT f32c < 16777216.5 AND f32c = 16777217.0 AND f32c < 16777217.0001");
+    table.True("f32c + 1.0 = 16777217.0 AND f32c IN (16777216.0, 16777217.0) AND f32c + 0.0 < 16777216.5");
+    // Integers compare exactly.
+    table.False("f32c = 16777217");
+    // A finite literal beyond f32 keeps its value.
+    table.True("f32c < 1e39 AND f32c > -1e39 AND f32c * 1e39 > 0 AND f32c <> 1e39");
     table["f32c"] = std::numeric_limits<float>::max();
-    table.True("f32c = 3.4028234663852886e38");
+    table.True("f32c = 3.4028234663852886e38 AND f32c = 3.40282346e38");
+    table.True("f32c < 3.4028235e38 AND f32c < 3.4028235677973366e38 AND f32c <> 1e39");
     table.True("f32c * 2 > 6e38");
+    table["f32c"] = std::numeric_limits<float>::infinity();
+    table.True("f32c = inf AND f32c > 3.4028235677973366e38 AND f32c <> nan");
+    table["f32c"] = std::numeric_limits<float>::denorm_min();
+    table.True("f32c = 1e-45 AND f32c > 0 AND 0 < f32c AND f32c > 1e-46 AND f32c <> 1e-310");
+    table["f32c"] = 0.0F;
+    table.True("f32c = 1e-46 AND f32c = -1e-46 AND f32c = 1e-310");
+    // Parameters of four bytes and literals agree.
+    table["f32c"] = 0.1F;
+    table.parameters = {0.1F};
+    table.True("f32c = $1 AND f32c = 0.1");
+    table.parameters.clear();
+    // An assignment keeps its literals as written and rounds the result.
+    table["f64c"] = 0.0;
+    ExpectValues(table.Assign("f32c = 0.1, f64c = 0.1"), {0.1F, 0.1}, "assigned literals");
 }
 
 void TestTextBytesBitsBool() {
@@ -1947,11 +1972,75 @@ class Reference {
         return out;
     }
 
-    Value ValueOf(const Tree& tree, Type type) const {
-        const auto& ops = tree.operands;
+    // A value's type before parameters take theirs, as far as f32 goes: open
+    // for NULL and parameters alone, typed when a column, position or NOW()
+    // is in it, f32 when every operand that is not open is an f32 column.
+    struct Static {
+        bool open = true;
+        bool typed = false;
+        bool f32 = false;
+    };
+
+    Static StaticOf(const Tree& tree) const {
         switch (tree.node) {
             case Node::kLiteral:
-                return tree.literal;
+                return Static{.open = tree.literal.kind == Kind::kNull};
+            case Node::kParameter:
+                return Static{};
+            case Node::kColumn:
+            case Node::kChunk: {
+                const ColumnType& type = tree.node == Node::kColumn ? case_.block[tree.index].type : case_.chunk[tree.index].type;
+                return Static{.open = false, .typed = true, .f32 = type.kind == ColumnKind::kFloat32};
+            }
+            case Node::kPosX:
+            case Node::kPosY:
+            case Node::kPosZ:
+            case Node::kNow:
+                return Static{.open = false, .typed = true};
+            case Node::kNegate:
+                return StaticOf(tree.operands[0]);
+            case Node::kArithmetic:
+            case Node::kLeast:
+            case Node::kGreatest:
+            case Node::kCoalesce: {
+                Static out;
+                for (const Tree& operand : tree.operands) {
+                    const Static type = StaticOf(operand);
+                    if (type.open) continue;
+                    if (out.open) {
+                        out = type;
+                    } else {
+                        out.typed = out.typed || type.typed;
+                        out.f32 = out.f32 && type.f32;
+                    }
+                }
+                return out;
+            }
+            default:
+                return Static{.open = false};
+        }
+    }
+
+    // A float literal in a condition compared with an f32 operand: the
+    // nearest f32, unless it is finite beyond f32.
+    static double NearestF32(double value) {
+        if (std::isfinite(value) && std::fabs(value) > static_cast<double>(std::numeric_limits<float>::max())) return value;
+        return static_cast<double>(static_cast<float>(value));
+    }
+
+    // `f32`: the value is compared with an f32 operand, so its float
+    // literals take f32. A typed value passes its own type to its operands
+    // instead.
+    Value ValueOf(const Tree& tree, Type type, bool f32) const {
+        const auto& ops = tree.operands;
+        const Static own = StaticOf(tree);
+        const bool down = own.typed ? own.f32 : f32;
+        switch (tree.node) {
+            case Node::kLiteral: {
+                Value value = tree.literal;
+                if (f32 && value.kind == Kind::kFloat) value.number = NearestF32(value.number);
+                return value;
+            }
             case Node::kParameter:
                 return Load(case_.parameters[tree.index - 1U]);
             case Node::kColumn:
@@ -1963,14 +2052,14 @@ class Reference {
             case Node::kPosZ: return Int(FromSigned(case_.z));
             case Node::kNow: return Int(FromUnsigned(case_.now));
             case Node::kNegate: {
-                Value value = Eval(ops[0]);
+                Value value = Eval(ops[0], down);
                 if (value.kind == Kind::kInt) value.integer = InRange(Negate(value.integer));
                 if (value.kind == Kind::kFloat) value.number = -value.number;
                 return value;
             }
             case Node::kArithmetic: {
-                const Value a = Eval(ops[0]);
-                const Value b = Eval(ops[1]);
+                const Value a = Eval(ops[0], down);
+                const Value b = Eval(ops[1], down);
                 if (a.kind == Kind::kNull || b.kind == Kind::kNull) return Value{};
                 if (a.kind == Kind::kInt && b.kind == Kind::kInt) {
                     switch (tree.op) {
@@ -1995,7 +2084,7 @@ class Reference {
             case Node::kLeast:
             case Node::kGreatest: {
                 std::vector<Value> values;
-                for (const Tree& operand : ops) values.push_back(Eval(operand));
+                for (const Tree& operand : ops) values.push_back(Eval(operand, down));
                 Value best;
                 bool nan = false;
                 for (const Value& value : values) {
@@ -2017,7 +2106,7 @@ class Reference {
             }
             case Node::kCoalesce:
                 for (const Tree& operand : ops) {
-                    const Value value = Eval(operand);
+                    const Value value = Eval(operand, down);
                     if (value.kind != Kind::kNull) return Widen(value, type);
                 }
                 return Value{};
@@ -2034,30 +2123,42 @@ class Reference {
         return value;
     }
 
-    Value Eval(const Tree& tree) const { return ValueOf(tree, TypeOf(tree)); }
+    Value Eval(const Tree& tree, bool f32 = false) const { return ValueOf(tree, TypeOf(tree), f32); }
 
     char Truth(const Tree& tree) const {
         const auto& ops = tree.operands;
         switch (tree.node) {
             case Node::kCompare: {
-                const Value a = Eval(ops[0]);
-                const Value b = Eval(ops[1]);
+                // Each side takes the other's type.
+                const Value a = Eval(ops[0], StaticOf(ops[1]).f32);
+                const Value b = Eval(ops[1], StaticOf(ops[0]).f32);
                 return Holds(tree.compare, a, b);
             }
             case Node::kIsNull: return Eval(ops[0]).kind == Kind::kNull ? 'T' : 'F';
             case Node::kIsNotNull: return Eval(ops[0]).kind == Kind::kNull ? 'F' : 'T';
             case Node::kIn:
             case Node::kNotIn: {
+                // The items take the tested value's type.
                 const Value value = Eval(ops[0]);
+                const bool f32 = StaticOf(ops[0]).f32;
                 char truth = 'F';
-                for (std::size_t k = 1; k < ops.size(); ++k) truth = Or(truth, Holds(0, value, Eval(ops[k])));
+                for (std::size_t k = 1; k < ops.size(); ++k) truth = Or(truth, Holds(0, value, Eval(ops[k], f32)));
                 return tree.node == Node::kIn ? truth : Not(truth);
             }
             case Node::kBetween:
             case Node::kNotBetween: {
-                const Value value = Eval(ops[0]);
-                const Value low = Eval(ops[1]);
-                const Value high = Eval(ops[2]);
+                // The tested value's type when typed, else the bounds'
+                // common type.
+                const Static tested = StaticOf(ops[0]);
+                const Static lower = StaticOf(ops[1]);
+                const Static upper = StaticOf(ops[2]);
+                const bool f32 = tested.typed                    ? tested.f32
+                               : lower.typed && upper.typed ? lower.f32 && upper.f32
+                               : lower.typed                ? lower.f32
+                                                            : upper.f32;
+                const Value value = Eval(ops[0], f32);
+                const Value low = Eval(ops[1], f32);
+                const Value high = Eval(ops[2], f32);
                 const char truth = And(Holds(5, value, low), Holds(3, value, high));
                 return tree.node == Node::kBetween ? truth : Not(truth);
             }
@@ -2327,11 +2428,12 @@ class Generator {
         static const std::array<double, 12> kExact{0.0, -0.0, 0.5, 1.5, -2.25, 3.0, 1e10, 16777216.0, 3.4028234663852886e38,
                                                    std::numeric_limits<double>::infinity(), -std::numeric_limits<double>::infinity(),
                                                    std::numeric_limits<double>::quiet_NaN()};
-        // Not exact in f32, or beyond it: compared or combined with f32
-        // columns as written.
-        static const std::array<double, 13> kOther{0.1, 1e300, -1e-300, 9007199254740992.0, 9223372036854775808.0,
+        // Not exact in f32, or beyond it: rounded to f32 when compared with
+        // an f32 operand (unless beyond f32), else as written. Subnormal
+        // f64 and f32 values included.
+        static const std::array<double, 16> kOther{0.1, 1e300, -1e-300, 9007199254740992.0, 9223372036854775808.0,
                                                    18446744073709551616.0, 1.7014118346046923e38, std::numeric_limits<double>::max(), -0.7,
-                                                   16777216.5, 16777217.0, 1e39, -3.4028235677973366e38};
+                                                   16777216.5, 16777217.0, 1e39, -3.4028235677973366e38, 1e-310, 1e-45, 3.4028235e38};
         Value value;
         value.kind = Kind::kFloat;
         value.number = Chance(random_, 50) ? kExact[Draw(random_, kExact.size())] : kOther[Draw(random_, kOther.size())];

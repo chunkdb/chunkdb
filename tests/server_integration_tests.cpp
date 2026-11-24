@@ -5859,6 +5859,31 @@ class StatementTrackerHook : public chunkdb::FeedDeliveryTestHook {
     }
     std::atomic<std::size_t> last{0U}, maximum{0U};
 };
+// SHOW CONNECTIONS reserves the encoded size of its listing, from a reserve of
+// its own: with all but 64 KiB of it held a listing is answered, where the most
+// a listing could take was reserved before; with all of it held the listing is
+// refused with BUSY, and logins and other replies are answered.
+void TestListingReplyShare() {
+    ServerHarness harness("listing-reply-share", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
+        BaseServerConfig());
+    RawClient controller("127.0.0.1", harness.port); controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    constexpr std::size_t kReserve = 16777216U;
+    auto held = chunkdb::FeedDeliveryTestAccess::ReserveListingReplyCredit(*harness.server, kReserve - 65536U);
+    assert(held);
+    controller.SendLine("SHOW CONNECTIONS"); assert(controller.ReadReply().starts_with('*'));
+    // The answered PING follows the end of the listing's write, which returned its reservation.
+    controller.SendLine("PING"); assert(controller.ReadLine() == "+PONG\r\n");
+    held.reset();
+    held = chunkdb::FeedDeliveryTestAccess::ReserveListingReplyCredit(*harness.server, kReserve);
+    assert(held);
+    controller.SendLine("SHOW CONNECTIONS");
+    assert(controller.ReadLine().starts_with("-ERR BUSY reason=reply_budget "));
+    RawClient login("127.0.0.1", harness.port); login.SetReadDeadline(std::chrono::seconds(10));
+    login.SendLine("HELLO 3"); (void)ReadHelloReply(login);
+    login.SendLine("HELLO 3"); assert(login.ReadLine().starts_with("-ERR PROTOCOL"));
+    controller.SendLine("PING"); assert(controller.ReadLine() == "+PONG\r\n");
+}
+
 void TestReplyAdmissionPrecedesMutation() {
     StatementTrackerHook hook;
     ServerHarness harness("reply-credit-before-write", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
@@ -6261,10 +6286,10 @@ void TestServerHarnessStartupFailure() {
     // The same holds when another listener takes the port while the server
     // is stopped: Restart reports the listen failure instead of probing it.
     {
-        auto kept = BaseServerConfig();
-        kept.port = chunkdb::test::PickListenerPort();
         ServerHarness harness("harness-restart-taken-port", BaseStoreConfig(),
-            chunkdb::EngineConfig{.require_auth = false}, kept);
+            chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+        // Restart on the port the server picked, as a test-given port is kept.
+        harness.saved_server_config.port = harness.port;
         harness.server->Stop();
         harness.JoinStopped();
         const OccupiedPort taken(harness.port);
@@ -8807,6 +8832,7 @@ int main(int argc, char** argv) {
         run("TestServerDefaultStatementTimeout", TestServerDefaultStatementTimeout);
         run("TestWideNullableReadHasBoundedReplyAdmission", TestWideNullableReadHasBoundedReplyAdmission);
         run("TestReplyAdmissionPrecedesMutation", TestReplyAdmissionPrecedesMutation);
+        run("TestListingReplyShare", TestListingReplyShare);
         run("TestRemovingCreditHeadAdmitsNextWaiter", TestRemovingCreditHeadAdmitsNextWaiter);
         run("TestPayloadCreditWaitIsRefused", TestPayloadCreditWaitIsRefused);
         run("TestPayloadCreditGrantRestartsFrameDeadline", TestPayloadCreditGrantRestartsFrameDeadline);
