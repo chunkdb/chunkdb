@@ -1151,6 +1151,7 @@ BackupTableCopy CopyBackupTable(const std::filesystem::path& backup, std::string
     });
     if (seen != expected.size() || !directories.empty()) throw std::runtime_error("backup inventory entry is missing");
     std::uint64_t copied_files = 0U;
+    if (progress) progress(0U, 0U, expected.size(), total);
     for (const auto& [name, file] : expected) {
         const auto local = file->relative_path.lexically_relative(prefix);
         // A copy reads only the inventory length; a longer file is a changed one.
