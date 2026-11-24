@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- A connection that leaves a WATCH or WATCH ... SLOT with UNWATCH starts its `--idle-connection-timeout-ms` interval when UNWATCH is answered; before, a watch longer than that timeout made the server close the connection without a reply to its next request (#140).
+- SHOW CONNECTIONS lists a connection that left its WATCH with UNWATCH as `idle`; before, it showed `watch` until the connection's next request.
 - The published Docker image carries the OCI labels `org.opencontainers.image.title`, `version`, `revision`, `source`, `created` and `licenses` (#154).
 - Serve idle connections, authentication and session controls without occupying statement workers, add cancellation and statement timeouts with user admission limits, and stream bounded large replies under output progress deadlines; a request waiting for the server's input credit has its frame deadline restart when the credit is granted, and one that waits longer than `--client-io-timeout-ms` receives `BUSY reason=input_budget` and closes, and after authentication a drained frame body must arrive whole within `--client-io-timeout-ms` of the end of its header, like a kept one, where each 4096-byte piece of it had a timeout of its own; a worker with no queued request waits for the next request of the connection it answered and gives it up when another request needs a worker (#137).
 - A `--read-only` server refreshes the chunk list of GET AREA and SCAN CHUNKS after a writer change by reading only the chunks the writer changed, which the writer records in the volatile table file `chunkdb.snapshot.changes`, instead of reading every chunk of the table again; after a writer restart, COMPACT TOMBSTONES or more than 4096 chunk file writes since its last read, it reads every chunk once.
