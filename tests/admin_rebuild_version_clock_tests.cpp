@@ -7,6 +7,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <iostream>
 #include <iterator>
 #include <sstream>
@@ -20,8 +21,10 @@
 #include "admin.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
+#include "txn_history.hpp"
 
 namespace {
 
@@ -66,6 +69,22 @@ void WriteBytes(const std::filesystem::path& path, const std::vector<std::uint8_
     std::ofstream out(path, std::ios::binary | std::ios::trunc);
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     assert(out.good());
+}
+
+void SetEnvVar(const char* key, const char* value) {
+#ifdef _WIN32
+    (void)_putenv_s(key, value);
+#else
+    (void)setenv(key, value, 1);
+#endif
+}
+
+void UnsetEnvVar(const char* key) {
+#ifdef _WIN32
+    (void)_putenv_s(key, "");
+#else
+    (void)unsetenv(key);
+#endif
 }
 
 std::uint64_t Ceiling(const std::filesystem::path& table_dir) {
@@ -137,7 +156,8 @@ void TestRebuildAfterLostClock() {
         assert(table.rewritten && !table.previous_ceiling.has_value());
         assert(table.ceiling == table.highest_revision + chunkdb::kRebuiltVersionClockMargin);
     }
-    assert(rebuilt[0].highest_revision >= other_highest && rebuilt[1].highest_revision >= world_highest);
+    assert(rebuilt[0].marker_rewritten && !rebuilt[1].marker_rewritten);
+    assert(rebuilt[0].highest_revision == other_highest && rebuilt[1].highest_revision == world_highest);
     assert(Ceiling(world) == rebuilt[1].ceiling && Ceiling(other) == rebuilt[0].ceiling);
     assert(chunkdb::IsValidInitializedStoreMarker(ReadBytes(other / ".chunkdb.initialized")));
 
@@ -153,7 +173,8 @@ void TestRebuildAfterLostClock() {
     const auto kept_bytes = ReadBytes(world / "chunkdb.version");
     std::ostringstream again_findings;
     for (const auto& table : chunkdb::RebuildVersionClock(dir.path(), again_findings)) {
-        assert(!table.rewritten && table.previous_ceiling.has_value() && table.ceiling == *table.previous_ceiling);
+        assert(!table.rewritten && !table.marker_rewritten && table.previous_ceiling.has_value() &&
+            table.ceiling == *table.previous_ceiling);
     }
     assert(ReadBytes(world / "chunkdb.version") == kept_bytes);
 }
@@ -199,7 +220,7 @@ void TestRefusals() {
         (void)Fill(catalog, "world", 4);
         const auto clock = ReadBytes(world / "chunkdb.version");
         std::ostringstream findings;
-        assert(!ErrorOf([&] { (void)chunkdb::RebuildVersionClock(dir.path(), findings); }).empty());
+        assert(Contains(ErrorOf([&] { (void)chunkdb::RebuildVersionClock(dir.path(), findings); }), "already has an active writer"));
         assert(ReadBytes(world / "chunkdb.version") == clock);
     }
 
@@ -223,6 +244,131 @@ void TestRefusals() {
     assert(Contains(ErrorOf([&] { (void)chunkdb::RebuildVersionClock(empty.path(), findings); }),
         "is not a chunkdb data directory"));
     assert(std::filesystem::is_empty(empty.path()));
+}
+
+void RewriteTableManifest(const std::filesystem::path& table_dir, const std::function<void(chunkdb::StoreManifest&)>& edit) {
+    const auto path = chunkdb::StoreManifestPath(table_dir);
+    auto manifest = chunkdb::ParseStoreManifest(ReadBytes(path));
+    edit(manifest);
+    WriteBytes(path, chunkdb::SerializeStoreManifest(manifest));
+}
+
+// A revision held only by the restore lineage is the table's highest one:
+// the survey reads it exactly, below the margin that would hide a miss.
+void TestLineageRevision() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-admin-rebuild-lineage");
+    const auto world = dir.path() / "tables" / "world";
+    std::uint64_t highest = 0;
+    {
+        TableCatalog catalog(Config(dir.path()));
+        highest = Fill(catalog, "world", 3);
+    }
+    const std::uint64_t fork = highest + 1000U;
+    RewriteTableManifest(world, [&](chunkdb::StoreManifest& manifest) {
+        manifest.features.incompat |= chunkdb::kFeatureTableLineage;
+        manifest.lineage = chunkdb::TableLineage{.parent_epoch = chunkdb::NewStoreId(), .fork_revision = fork};
+    });
+    std::filesystem::remove(world / "chunkdb.version");
+    std::ostringstream findings;
+    const auto rebuilt = chunkdb::RebuildVersionClock(dir.path(), findings);
+    assert(rebuilt.size() == 1U && rebuilt[0].rewritten && !rebuilt[0].marker_rewritten);
+    assert(rebuilt[0].highest_revision == fork);
+    assert(rebuilt[0].ceiling == fork + chunkdb::kRebuiltVersionClockMargin);
+}
+
+// A revision held only by the slot records' durable watermark, or only by a
+// transaction intent, is the table's highest one.
+void TestSlotAndIntentRevisions() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-admin-rebuild-slots-intents");
+    const auto world = dir.path() / "tables" / "world";
+    std::uint64_t highest = 0;
+    {
+        TableCatalog catalog(Config(dir.path()));
+        highest = Fill(catalog, "world", 3);
+    }
+    const auto manifest = chunkdb::ParseStoreManifest(ReadBytes(chunkdb::StoreManifestPath(world)));
+    const std::uint64_t watermark = highest + 500U;
+    RewriteTableManifest(world, [](chunkdb::StoreManifest& edited) {
+        edited.features.incompat |= chunkdb::kFeatureFeedSlots;
+    });
+    chunkdb::WriteFeedSlotRecords(world, chunkdb::FeedSlotRecords{
+        .epoch = manifest.store_id,
+        .durable_watermark = watermark,
+        .slots = {chunkdb::FeedSlotRecord{.name = "reader", .written = highest}},
+        .filter_format = false,
+        .dims = manifest.geometry.dims,
+    });
+    std::filesystem::remove(world / "chunkdb.version");
+    std::ostringstream findings;
+    auto rebuilt = chunkdb::RebuildVersionClock(dir.path(), findings);
+    assert(rebuilt.size() == 1U && rebuilt[0].rewritten);
+    assert(rebuilt[0].highest_revision == watermark);
+
+    const std::uint64_t intent_version = watermark + 700U;
+    const auto intent_path = chunkdb::TxnIntentPath(world, intent_version);
+    std::filesystem::create_directories(intent_path.parent_path());
+    WriteBytes(intent_path, chunkdb::SerializeTxnIntent(chunkdb::TxnIntent{
+        .state = chunkdb::TxnIntentState::kCommitted,
+        .version = intent_version,
+        .entries = {chunkdb::TxnIntentEntry{.coord = chunkdb::ChunkCoord{}, .wal_boundary = 0U}},
+    }, manifest.geometry.dims, manifest.store_id));
+    std::filesystem::remove(world / "chunkdb.version");
+    rebuilt = chunkdb::RebuildVersionClock(dir.path(), findings);
+    assert(rebuilt.size() == 1U && rebuilt[0].rewritten);
+    assert(rebuilt[0].highest_revision == intent_version);
+}
+
+// Like a read-write open, the rebuild refuses a table or directory with a
+// feature this build can only read, whose records may hold revisions.
+void TestReadOnlyFeatureRefused() {
+    constexpr std::uint32_t kUnknownRoCompat = 1U << 3U;
+    chunkdb::test::ScopedTempDir dir("chunkdb-admin-rebuild-features");
+    const auto world = dir.path() / "tables" / "world";
+    {
+        TableCatalog catalog(Config(dir.path()));
+        (void)Fill(catalog, "world", 2);
+    }
+    std::filesystem::remove(world / "chunkdb.version");
+    RewriteTableManifest(world, [](chunkdb::StoreManifest& manifest) { manifest.features.ro_compat |= kUnknownRoCompat; });
+    std::ostringstream findings;
+    auto error = ErrorOf([&] { (void)chunkdb::RebuildVersionClock(dir.path(), findings); });
+    assert(Contains(error, "can only be opened read-only"));
+    assert(!std::filesystem::exists(world / "chunkdb.version"));
+    RewriteTableManifest(world, [](chunkdb::StoreManifest& manifest) { manifest.features.ro_compat &= ~kUnknownRoCompat; });
+
+    const auto root_path = chunkdb::DataDirManifestPath(dir.path());
+    auto root = chunkdb::ParseDataDirManifest(ReadBytes(root_path));
+    root.features.ro_compat |= kUnknownRoCompat;
+    WriteBytes(root_path, chunkdb::SerializeDataDirManifest(root));
+    error = ErrorOf([&] { (void)chunkdb::RebuildVersionClock(dir.path(), findings); });
+    assert(Contains(error, "can only be opened read-only"));
+    assert(!std::filesystem::exists(world / "chunkdb.version"));
+}
+
+// The server names the rebuild only for a clock the rebuild replaces, not
+// for one it cannot read.
+void TestServerAdvice() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-admin-rebuild-advice");
+    const auto world = dir.path() / "tables" / "world";
+    {
+        TableCatalog catalog(Config(dir.path()));
+        (void)Fill(catalog, "world", 2);
+    }
+    const auto clock = ReadBytes(world / "chunkdb.version");
+    WriteBytes(world / "chunkdb.version", std::vector<std::uint8_t>(clock.begin(), clock.end() - 1));
+    const auto open = [&] {
+        TableCatalog catalog(Config(dir.path()));
+        WriteBits(catalog, "world", 0, 0, "0101");
+    };
+    auto refused = ErrorOf(open);
+    assert(Contains(refused, "record size is 15 bytes") && Contains(refused, "rebuild-version-clock"));
+
+    WriteBytes(world / "chunkdb.version", clock);
+    SetEnvVar("CHUNKDB_FAILPOINT_VERSION_READ_FAIL_ONCE", "1");
+    refused = ErrorOf(open);
+    UnsetEnvVar("CHUNKDB_FAILPOINT_VERSION_READ_FAIL_ONCE");
+    assert(Contains(refused, "injected version bookkeeping read failure"));
+    assert(!Contains(refused, "rebuild-version-clock"));
 }
 
 int ExitCode(int status) {
@@ -262,6 +408,15 @@ void TestCommandLine(const std::string& admin) {
     assert(Contains(output, "table world: rebuilt, next revision "));
     assert(Run(admin, "--data-dir \"" + data_dir.string() + "\" rebuild-version-clock", log, &output) == 0);
     assert(Contains(output, "table world: kept, next revision "));
+    assert(!Contains(output, "marker rewritten"));
+    // A malformed marker beside a kept clock is replaced; the clock is not.
+    const auto world = data_dir / "tables" / "world";
+    const auto clock = ReadBytes(world / "chunkdb.version");
+    WriteBytes(world / ".chunkdb.initialized", {'b', 'a', 'd'});
+    assert(Run(admin, "--data-dir \"" + data_dir.string() + "\" rebuild-version-clock", log, &output) == 0);
+    assert(Contains(output, "table world: kept, next revision ") && Contains(output, ", marker rewritten"));
+    assert(ReadBytes(world / "chunkdb.version") == clock);
+    assert(chunkdb::IsValidInitializedStoreMarker(ReadBytes(world / ".chunkdb.initialized")));
 }
 
 }  // namespace
@@ -274,6 +429,10 @@ int main(int argc, char** argv) {
     TestRebuildAfterLostClock();
     TestNeverLowers();
     TestRefusals();
+    TestLineageRevision();
+    TestSlotAndIntentRevisions();
+    TestReadOnlyFeatureRefused();
+    TestServerAdvice();
     TestCommandLine(argv[1]);
     std::cout << "admin rebuild-version-clock tests passed\n";
     return 0;

@@ -231,29 +231,36 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting, const std::error
     }
 
     std::vector<std::uint8_t> bytes;
+    std::uintmax_t record_size = kVersionClockRecordSize;
     try {
         std::error_code size_ec;
-        const auto record_size =
-            std::filesystem::file_size(version_clock_path_, size_ec);
+        record_size = std::filesystem::file_size(version_clock_path_, size_ec);
         if (size_ec) {
             throw std::runtime_error(
                 "failed to inspect record size: " + size_ec.message());
         }
-        if (record_size != kVersionClockRecordSize) {
-            throw std::runtime_error(
-                "record size is " + std::to_string(record_size) +
-                " bytes, expected " + std::to_string(kVersionClockRecordSize));
+        if (record_size == kVersionClockRecordSize) {
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_VERSION_READ_FAIL_ONCE")) {
+                throw std::runtime_error("injected version bookkeeping read failure");
+            }
+            bytes = LoadFile(version_clock_path_);
         }
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_VERSION_READ_FAIL_ONCE")) {
-            throw std::runtime_error("injected version bookkeeping read failure");
-        }
-        bytes = LoadFile(version_clock_path_);
     } catch (const std::exception& e) {
-        // Present but unreadable: treat as damage, never as a reset opportunity.
+        // Present but unreadable: treat as damage, never as a reset
+        // opportunity. The offline rebuild refuses an unreadable clock too, so
+        // the file's access must be fixed first.
         throw std::runtime_error(
             "version bookkeeping " + version_clock_path_.string() +
             " exists but could not be read (" + e.what() +
-            "); refusing to open so a stale chunk version can never be reissued; restore it from backup or run chunkdb_admin rebuild-version-clock");
+            "); refusing to open so a stale chunk version can never be reissued");
+    }
+    if (record_size != kVersionClockRecordSize) {
+        throw std::runtime_error(
+            "version bookkeeping " + version_clock_path_.string() +
+            " exists but could not be read (record size is " + std::to_string(record_size) +
+            " bytes, expected " + std::to_string(kVersionClockRecordSize) +
+            "); refusing to open so a stale chunk version can never be reissued; "
+            "run chunkdb_admin rebuild-version-clock to replace it");
     }
 
     std::uint64_t persisted_ceiling = 0;

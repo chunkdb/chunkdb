@@ -30,17 +30,21 @@ struct RebuiltVersionClock {
     std::optional<std::uint64_t> previous_ceiling;
     // The table's next revision after the rebuild.
     std::uint64_t ceiling = 0;
+    // Whether chunkdb.version was written; false when the clock is kept.
     bool rewritten = false;
+    // Whether .chunkdb.initialized was written, also beside a kept clock.
+    bool marker_rewritten = false;
 };
 
 // Rebuilds each table's chunkdb.version and .chunkdb.initialized offline:
 // takes the writer lock, so it fails while a server has the directory open,
 // and runs the chunkdb_verify checks, writing their findings to `findings`.
-// Any damage other than a missing or malformed clock or marker refuses the
-// whole directory before a file changes. A readable clock above every
-// revision on disk is kept; any other gets the highest revision on disk or
-// the directory's version floor, whichever is larger, plus
-// kRebuiltVersionClockMargin, so a clock is never lowered.
+// Any damage other than a missing or malformed clock or marker, or a feature
+// a read-write open of this build refuses, refuses the whole directory before
+// a file changes. A readable clock above every revision on disk is kept; any
+// other gets the highest revision on disk or the directory's version floor,
+// whichever is larger, plus kRebuiltVersionClockMargin, so a clock is never
+// lowered.
 [[nodiscard]] std::vector<RebuiltVersionClock> RebuildVersionClock(
     const std::filesystem::path& data_dir, std::ostream& findings);
 

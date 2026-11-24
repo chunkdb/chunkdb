@@ -40,7 +40,8 @@ int ResetPasswordCommand(const std::string& data_dir, const std::string& user, c
 int RebuildVersionClockCommand(const std::string& data_dir) {
     for (const auto& table : chunkdb::RebuildVersionClock(data_dir, std::cerr)) {
         std::cout << "table " << table.table << ": " << (table.rewritten ? "rebuilt" : "kept")
-                  << ", next revision " << table.ceiling << ", highest on disk " << table.highest_revision << "\n";
+                  << ", next revision " << table.ceiling << ", highest on disk " << table.highest_revision
+                  << (table.marker_rewritten ? ", marker rewritten" : "") << "\n";
     }
     return 0;
 }

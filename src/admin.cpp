@@ -8,6 +8,7 @@
 #include "backup.hpp"
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
+#include "feature_flags.hpp"
 #include "process_lock.hpp"
 #include "migrations_records.hpp"
 #include "store_manifest.hpp"
@@ -79,11 +80,17 @@ std::vector<RebuiltVersionClock> RebuildVersionClock(const std::filesystem::path
             " errors other than a lost clock (see the findings above), so the highest revision on disk is unknown; "
             "no clock was changed. Restore a consistent backup");
     }
+    // The rebuild writes where a read-write open writes, so it admits only
+    // what such an open admits: records of a feature this build can only read
+    // may hold revisions the checks skipped.
+    if (const auto root = ReadDataDirManifest(data_dir)) RequireOpenableFeatures(root->features, AccessMode::kReadWrite);
+    for (const auto& table : survey.tables) {
+        if (const auto manifest = ReadStoreManifest(table.table_dir))
+            RequireOpenableFeatures(manifest->features, AccessMode::kReadWrite);
+    }
     // Every table is decided before any file changes, so a refusal leaves
     // the directory as it was.
     std::vector<RebuiltVersionClock> result;
-    std::vector<bool> write_clock;
-    std::vector<bool> write_marker;
     for (const auto& table : survey.tables) {
         RebuiltVersionClock rebuilt{
             .table = table.table_dir.filename().string(),
@@ -91,6 +98,7 @@ std::vector<RebuiltVersionClock> RebuildVersionClock(const std::filesystem::path
             .previous_ceiling = std::nullopt,
             .ceiling = 0,
             .rewritten = false,
+            .marker_rewritten = false,
         };
         if (const auto bytes = ReadClockRecord(table.table_dir / "chunkdb.version")) {
             std::uint64_t ceiling = 0;
@@ -107,17 +115,17 @@ std::vector<RebuiltVersionClock> RebuildVersionClock(const std::filesystem::path
                     "chunk version clock exhausted for table " + rebuilt.table + "; no clock was changed");
             rebuilt.ceiling = std::max(base + kRebuiltVersionClockMargin, rebuilt.previous_ceiling.value_or(0U));
         }
-        write_clock.push_back(!keep);
-        write_marker.push_back(!marker || !IsValidInitializedStoreMarker(*marker));
-        rebuilt.rewritten = write_clock.back() || write_marker.back();
+        rebuilt.rewritten = !keep;
+        rebuilt.marker_rewritten = !marker || !IsValidInitializedStoreMarker(*marker);
         result.push_back(std::move(rebuilt));
     }
     for (std::size_t i = 0; i < result.size(); ++i) {
         const auto& table_dir = survey.tables[i].table_dir;
-        if (write_clock[i])
+        if (result[i].rewritten)
             PublishClockRecord(table_dir / "chunkdb.version", SerializeVersionClockRecord(result[i].ceiling));
         // Like first initialization: the clock is durable before the marker.
-        if (write_marker[i]) PublishClockRecord(table_dir / ".chunkdb.initialized", SerializeInitializedStoreMarker());
+        if (result[i].marker_rewritten)
+            PublishClockRecord(table_dir / ".chunkdb.initialized", SerializeInitializedStoreMarker());
     }
     return result;
 }
