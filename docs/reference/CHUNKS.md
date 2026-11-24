@@ -157,8 +157,8 @@ SHOW TABLE STATS needs READ on the table.
 `files` and `disk_bytes` count the regular files under the table's directory and their sizes, WAL, images, feed archive and index files included.
 `slots` counts durable slots, lost ones included; `watches` counts open watches, slot watches included.
 The counts come from memory, except `files` and `disk_bytes`, which list the table's directory: their cost grows with its file count.
-Statements that change the table, such as ALTER TABLE and DROP TABLE, wait for that listing.
-A file written or removed during the listing may or may not be counted.
+The listing runs after the statement stops using the table, so no other statement waits for it, and a statement timeout stops it.
+A file written or removed during the listing may or may not be counted; a table dropped before it returns NO_TABLE, and a SWAP TABLES, or a DROP TABLE and CREATE TABLE of the same name, during it may count the other table's files.
 
 ## Tombstones
 

@@ -27,10 +27,6 @@ class MigrationOutcomeUnknownError : public MigrationRecoveryRequiredError {
     using MigrationRecoveryRequiredError::MigrationRecoveryRequiredError;
 };
 
-inline constexpr const char* kMigrationCompletionFailedMessage = "migration completion failed; restart the server to recover";
-inline constexpr const char* kFeatureCompletionFailedMessage =
-    "feature activation completion failed; restart the server to recover";
-
 class FeatureRecoveryRequiredError : public std::runtime_error {
   public:
     using std::runtime_error::runtime_error;
@@ -46,14 +42,9 @@ struct MigrationHealth {
     void Check() const {
         if (failed.load(std::memory_order_acquire)) {
             if (feature_failed.load(std::memory_order_acquire))
-                throw FeatureRecoveryRequiredError(kFeatureCompletionFailedMessage);
-            throw MigrationRecoveryRequiredError(kMigrationCompletionFailedMessage);
+                throw FeatureRecoveryRequiredError("feature activation completion failed; restart the server to recover");
+            throw MigrationRecoveryRequiredError("migration completion failed; restart the server to recover");
         }
-    }
-    // What Check reports; null while the catalog serves.
-    [[nodiscard]] const char* FailureMessage() const noexcept {
-        if (!failed.load(std::memory_order_acquire)) return nullptr;
-        return feature_failed.load(std::memory_order_acquire) ? kFeatureCompletionFailedMessage : kMigrationCompletionFailedMessage;
     }
 };
 

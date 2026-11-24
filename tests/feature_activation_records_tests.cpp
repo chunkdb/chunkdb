@@ -159,7 +159,7 @@ void CommitGroupsDormant() {
         const auto enable = engine.Execute(session, "ENABLE FEATURE 'commit_groups'\r\n");
         assert(enable.find("reason=unknown_feature") != std::string::npos);
         const auto status = engine.Execute(session, "SHOW STATUS\r\n");
-        assert(status.starts_with("%8\r\n") && status.find("commit_groups") == std::string::npos);
+        assert(status.starts_with("%7\r\n") && status.find("commit_groups") == std::string::npos);
         assert(Tree(dir.path()) == before);
     }
     const auto table_path = StoreManifestPath(dir.path() / "tables/alpha");
@@ -200,7 +200,7 @@ void RuntimeAdmissionAndRecovery() {
         assert(Tree(dir.path()) == before);
         assert(engine.Execute(session, "ENABLE FEATURE 'feed_slots'\r\n") == "+OK\r\n");
         assert(engine.Execute(session, "CREATE SLOT 'slot' ON alpha\r\n") == "+OK\r\n");
-        assert(engine.Execute(session, "SHOW STATUS\r\n").starts_with("%8\r\n"));
+        assert(engine.Execute(session, "SHOW STATUS\r\n").starts_with("%7\r\n"));
     }
     WriteFeatureActivationJournal(dir.path(), journal);
     config.access_mode = AccessMode::kReadOnly;
@@ -230,14 +230,11 @@ void RuntimePublishedFailure() {
         Reject([&] { (void)subscriber->Next(std::chrono::milliseconds(0)); }, "feature activation completion");
         Reject([&] { (void)catalog->FeatureStatus(); }, "feature activation completion");
         Reject([&] { (void)catalog->Find("alpha")->Acquire(); }, "feature activation completion");
-        // SHOW STATUS reports the state instead, without features.
+        // SHOW STATUS refuses too: it never reports features or activation_pending it cannot know.
         CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
         SessionState session; (void)engine.Execute(session, "HELLO 3\r\n");
         const auto status = engine.Execute(session, "SHOW STATUS\r\n");
-        const std::string reason = "$67\r\nfeature activation completion failed; restart the server to recover\r\n";
-        assert(status.starts_with("%8\r\n") && status.find("$5\r\nstate\r\n$17\r\nrecovery_required\r\n$6\r\nreason\r\n" + reason) != std::string::npos);
-        assert(status.find("$9\r\ndirectory\r\n_\r\n") != std::string::npos && status.find("$18\r\nactivation_pending\r\n_\r\n") != std::string::npos);
-        assert(status.find("$4\r\nname\r\n$5\r\nalpha\r\n$5\r\nstate\r\n$6\r\nfenced\r\n$6\r\nreason\r\n" + reason + "$7\r\nenabled\r\n_\r\n") != std::string::npos);
+        assert(status.starts_with("-ERR ") && status.find("feature activation completion failed; restart the server to recover") != std::string::npos);
     }
     TableCatalog catalog(config);
     assert(!ReadFeatureActivationJournal(dir.path()));

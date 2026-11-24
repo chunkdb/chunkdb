@@ -147,7 +147,8 @@ struct TableInfo {
 
 struct CatalogTableStatus {
     std::string name;
-    // std::nullopt for a fenced table whose store is not open.
+    // std::nullopt for a fenced table that refuses leases: its store is not
+    // open or its feed cleanup failed.
     std::optional<FeatureFlags> features;
     // Why the table is fenced; std::nullopt while it serves.
     std::optional<std::string> fence;
@@ -548,9 +549,6 @@ class TableCatalog {
     // failure is rethrown afterwards.
     [[nodiscard]] bool EnableFeature(std::string_view name);
     [[nodiscard]] CatalogFeatureStatus FeatureStatus();
-    // Why every table is closed until a restart recovers the catalog, or
-    // null while it serves; FeatureStatus and leases then refuse.
-    [[nodiscard]] const char* RecoveryRequired() const noexcept { return migration_health_->FailureMessage(); }
     void WalBarrier();
     [[nodiscard]] BackupResult BackupTo(const std::filesystem::path& target, const BackupOptions& options);
     // Copies one table of a completed backup into a private directory, gives

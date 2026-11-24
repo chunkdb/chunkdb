@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <barrier>
 #include <cassert>
 #include <cstdint>
@@ -24,6 +25,7 @@
 #include "../src/chunk_store_internal.hpp"
 #include "../src/store_manifest.hpp"
 #include "../src/sectioned_chunk_form.hpp"
+#include "../src/statement_control.hpp"
 #include "test_utils.hpp"
 
 namespace {
@@ -1023,16 +1025,51 @@ void TestTableStats() {
     assert(MapInteger(f.Run("SHOW TABLE STATS plain"), "watches") == 0U);
     assert(MapInteger(f.Run("SHOW TABLE STATS world"), "chunks") == 0U);
     ExpectError(f.Run("SHOW TABLE STATS absent"), "NO_TABLE");
+    // The listing stops when its statement is stopped.
+    struct StopHook final : chunkdb::CommandEngineTestHook {
+        chunkdb::StatementControl* control = nullptr;
+        void Run(Point point, std::string_view) override {
+            if (point == Point::kBeforeTableStatsListing) assert(control->RequestStop(chunkdb::StatementStopReason::kCancelled));
+        }
+    } stop;
+    {
+        chunkdb::StatementControl control(chunkdb::StatementControl::Clock::now(), 0U);
+        assert(control.Start());
+        stop.control = &control;
+        chunkdb::ScopedStatementControl context(&control);
+        f.engine->SetHookForTests(&stop);
+        ExpectError(f.Run("SHOW TABLE STATS plain"), "CANCELLED");
+        f.engine->SetHookForTests(nullptr);
+    }
+    // The directory is listed after the lease ends, so DROP, which waits for
+    // every lease, completes before the listing, which then finds no table.
+    struct DropHook final : chunkdb::CommandEngineTestHook {
+        std::shared_ptr<chunkdb::TableCatalog> catalog;
+        bool dropped = false;
+        void Run(Point point, std::string_view table) override {
+            if (point != Point::kBeforeTableStatsListing || table != "plain") return;
+            auto drop = std::async(std::launch::async, [&] { catalog->Drop("plain"); });
+            // Under a lease DROP would wait for this statement forever.
+            assert(drop.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+            drop.get();
+            dropped = true;
+        }
+    } hook;
+    hook.catalog = f.catalog;
+    f.engine->SetHookForTests(&hook);
+    ExpectError(f.Run("SHOW TABLE STATS plain"), "NO_TABLE");
+    assert(hook.dropped);
+    f.engine->SetHookForTests(nullptr);
 }
 
 void TestShowStatus() {
     Fixture f;
     const auto status = f.Run("SHOW STATUS");
-    assert(status.starts_with("%8\r\n$7\r\nversion\r\n$4\r\ntest\r\n$9\r\nuptime_ms\r\n:"));
-    assert(Contains(status, "\r\n$9\r\nread_only\r\n#f\r\n$5\r\nstate\r\n$2\r\nok\r\n$6\r\nreason\r\n_\r\n$9\r\ndirectory\r\n%4\r\n"));
+    assert(status.starts_with("%7\r\n$7\r\nversion\r\n$4\r\ntest\r\n$9\r\nuptime_ms\r\n:"));
+    assert(Contains(status, "\r\n$9\r\nread_only\r\n#f\r\n$9\r\ndirectory\r\n%4\r\n"));
     assert(Contains(status, "$6\r\ntables\r\n*2\r\n%7\r\n$4\r\nname\r\n$5\r\nplain\r\n$5\r\nstate\r\n$2\r\nok\r\n$6\r\nreason\r\n_\r\n$7\r\nenabled\r\n*"));
     assert(Contains(status, "%7\r\n$4\r\nname\r\n$5\r\nworld\r\n$5\r\nstate\r\n$2\r\nok\r\n$6\r\nreason\r\n_\r\n$7\r\nenabled\r\n*"));
-    assert(status.ends_with("$18\r\nactivation_pending\r\n#f\r\n"));
+    assert(status.ends_with("$6\r\nfenced\r\n*0\r\n$18\r\nactivation_pending\r\n#f\r\n"));
 }
 
 void TestSlotStatements() {
