@@ -635,6 +635,47 @@ void TestTlsMinVersionFlag(const std::string& binary) {
     assert(StartupFailure(binary, log, {"--help"}, 0).find("--tls-min-version") != std::string::npos);
 }
 
+// --metrics-listen serves GET /metrics over HTTP beside the client listener,
+// and refuses an address beyond loopback without --metrics-allow-remote.
+void TestMetricsListenFlag(const std::string& binary) {
+    chunkdb::test::ScopedTempDir dir("chunkdb-process-metrics");
+    const auto log = dir.path() / "server.log";
+    const auto data = dir.path() / "data";
+    for (const char* value : {"9100", "127.0.0.1", "127.0.0.1:", ":9100", "127.0.0.1:0", "127.0.0.1:65536",
+                              "127.0.0.1:x", "::1:9100", "[::1]9100", "[::1]", ""}) {
+        const auto error =
+            StartupFailure(binary, log, {"--data-dir", data.string(), "--auth", "none", "--metrics-listen", value});
+        assert(error.find("invalid --metrics-listen") != std::string::npos);
+    }
+    assert(StartupFailure(binary, log, {"--data-dir", data.string(), "--auth", "none", "--metrics-allow-remote"})
+               .find("--metrics-allow-remote needs --metrics-listen") != std::string::npos);
+    const auto remote = StartupFailure(binary, log, {"--data-dir", data.string(), "--auth", "none", "--port",
+        std::to_string(chunkdb::test::PickListenerPort()), "--metrics-listen", "0.0.0.0:" + std::to_string(chunkdb::test::PickListenerPort())});
+    assert(remote.find("not a loopback address") != std::string::npos);
+    assert(remote.find("--metrics-allow-remote") != std::string::npos);
+    const auto help = StartupFailure(binary, log, {"--help"}, 0);
+    assert(help.find("--metrics-listen") != std::string::npos);
+    assert(help.find("--metrics-allow-remote") != std::string::npos);
+
+    const int metrics_port = chunkdb::test::PickListenerPort();
+    ServerProcess server(binary, data, {"--auth", "none", "--metrics-listen", "127.0.0.1:" + std::to_string(metrics_port)});
+    assert(Command(server.port(), "CREATE TABLE terrain (bits bits(16))") == "+OK\r\n");
+    const int fd = Connect(metrics_port);
+    assert(fd >= 0);
+    SendAll(fd, "GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    std::string response;
+    char buffer[4096];
+    for (;;) {
+        const ssize_t n = recv(fd, buffer, sizeof(buffer), 0);
+        if (n <= 0) break;
+        response.append(buffer, static_cast<std::size_t>(n));
+    }
+    close(fd);
+    assert(response.rfind("HTTP/1.1 200 OK\r\n", 0) == 0);
+    assert(response.find("\nchunkdb_checkpoints_total{table=\"terrain\"} ") != std::string::npos);
+    assert(Command(server.port(), "PING") == "+PONG\r\n");
+}
+
 void TestPersistedUsersIgnoreBootstrap(const std::string& binary) {
     chunkdb::test::ScopedTempDir dir("chunkdb-process-bootstrap");
     const auto data = dir.path() / "data";
@@ -967,6 +1008,7 @@ int main(int argc, char** argv) {
     TestLogAndLimitFlagsAreValidated(argv[1]);
     TestAuditLogReopensOnHangup(argv[1]);
     TestTlsMinVersionFlag(argv[1]);
+    TestMetricsListenFlag(argv[1]);
     TestTlsReloadsOnHangup(argv[1]);
     if (argc == 3) {
         std::puts("startup diagnostics and persisted bootstrap tests passed");

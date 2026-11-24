@@ -16,6 +16,7 @@
 #include <stdexcept>
 #include <string>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #ifndef _WIN32
@@ -109,6 +110,33 @@ std::string ReadSecretFile(const std::string& path, const char* what) {
     return secret;
 }
 
+// `value` as host:port, with an IPv6 host in brackets ([::1]:9100).
+std::pair<std::string, std::uint16_t> ParseHostPort(const std::string& value, const char* flag) {
+    const auto refuse = [&]() {
+        return std::invalid_argument(std::string("invalid ") + flag + ": " + value +
+                                     " (expected host:port, such as 127.0.0.1:9100)");
+    };
+    std::string host;
+    std::string port;
+    if (!value.empty() && value.front() == '[') {
+        const auto close = value.find(']');
+        if (close == std::string::npos || close + 1U >= value.size() || value[close + 1U] != ':') throw refuse();
+        host = value.substr(1U, close - 1U);
+        port = value.substr(close + 2U);
+    } else {
+        const auto colon = value.find(':');
+        if (colon == std::string::npos || value.find(':', colon + 1U) != std::string::npos) throw refuse();
+        host = value.substr(0U, colon);
+        port = value.substr(colon + 1U);
+    }
+    std::uint16_t parsed = 0U;
+    const auto result = std::from_chars(port.data(), port.data() + port.size(), parsed);
+    if (host.empty() || result.ec != std::errc() || result.ptr != port.data() + port.size() || parsed == 0U) {
+        throw refuse();
+    }
+    return {host, parsed};
+}
+
 bool IsLoopbackBindAddress(const std::string& host) {
     return host == "localhost" || host == "::1" || host == "[::1]" ||
            host == "127.0.0.1" || host.rfind("127.", 0) == 0;
@@ -190,7 +218,12 @@ void PrintUsage() {
         << "  --tls-key <path-to-key.pem>\n"
         << "  --tls-min-version <1.2|1.3>\n"
         << "      Lowest TLS version accepted (1.2). RELOAD TLS, or SIGHUP outside\n"
-        << "      Windows, reloads the certificate and key from their files.\n";
+        << "      Windows, reloads the certificate and key from their files.\n"
+        << "  --metrics-listen <host:port>\n"
+        << "      Serve GET /metrics, the SHOW METRICS text, over plain HTTP without\n"
+        << "      authentication; off by default.\n"
+        << "  --metrics-allow-remote\n"
+        << "      Allow --metrics-listen on an address that is not loopback.\n";
 }
 
 }  // namespace
@@ -413,6 +446,13 @@ int main(int argc, char** argv) {
                 if (version == "1.2") server_config.tls_min_version = chunkdb::TlsMinVersion::k1_2;
                 else if (version == "1.3") server_config.tls_min_version = chunkdb::TlsMinVersion::k1_3;
                 else throw std::invalid_argument("--tls-min-version is 1.2 or 1.3, got " + version);
+            } else if (arg == "--metrics-listen") {
+                const auto [host, port] = ParseHostPort(require_value("--metrics-listen"), "--metrics-listen");
+                server_config.metrics_listen = true;
+                server_config.metrics_host = host;
+                server_config.metrics_port = port;
+            } else if (arg == "--metrics-allow-remote") {
+                server_config.metrics_allow_remote = true;
             } else if (arg == "--help" || arg == "-h") {
                 PrintUsage();
                 return 0;
@@ -491,6 +531,10 @@ int main(int argc, char** argv) {
                     {"host", server_config.host},
                     {"port", std::to_string(server_config.port)},
                 });
+        }
+
+        if (server_config.metrics_allow_remote && !server_config.metrics_listen) {
+            throw std::invalid_argument("--metrics-allow-remote needs --metrics-listen");
         }
 
         if (engine_config.require_channel_binding && (!engine_config.require_auth || !server_config.tls_enabled)) {

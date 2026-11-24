@@ -28,6 +28,6 @@ Named migrations record one repeatable metadata change and completion together.
 
 WATCH streams committed changes in revision order; slot watches deliver only durable changes.
 A backup records a separate completed cut for each copied table.
-SHOW METRICS returns authenticated Prometheus text.
+SHOW METRICS returns authenticated Prometheus text; `--metrics-listen` also serves it over HTTP without authentication.
 
 See [CQL reference](CQL.md), [Transactions](TRANSACTIONS.md), [Change feed](CHANGE_FEED.md), and [Durability](DURABILITY_CONTRACT.md).

@@ -39,6 +39,7 @@
 #include "server_tls.hpp"
 #include "server_feed.hpp"
 #include "server_idle.hpp"
+#include "metrics_http.hpp"
 #include "user_registry.hpp"
 
 namespace chunkdb {
@@ -249,6 +250,17 @@ void ChunkServer::Run() {
 #endif
 
     try {
+        // Before the main listener is published, so that a caller that sees
+        // it listening also sees MetricsPort.
+        if (config_.metrics_listen) {
+            metrics_listener_ = std::make_unique<MetricsHttpListener>(
+                config_.metrics_host, config_.metrics_port, config_.metrics_allow_remote, config_.client_io_timeout_ms,
+                [engine = engine_] { return engine->RenderMetrics(); });
+            metrics_port_.store(metrics_listener_->port(), std::memory_order_release);
+            LogMessage(LogLevel::kInfo, LogComponent::kServer, "serving metrics over HTTP", {
+                {"host", config_.metrics_host}, {"port", std::to_string(metrics_listener_->port())},
+            });
+        }
         const SocketHandle listen_socket = CreateListenSocket(config_.host, config_.port);
         {
             std::lock_guard lock(lifecycle_mutex_);
@@ -383,6 +395,8 @@ void ChunkServer::Run() {
             if (!ParkClient(connection)) CloseClient(*connection);
         }
 
+        metrics_port_.store(0, std::memory_order_release);
+        metrics_listener_.reset();
         (void)StopRunning();
         RequestBackupStop();
         (void)ShutdownActiveClients();
@@ -408,6 +422,8 @@ void ChunkServer::Run() {
             "server run loop failed",
             {{"error", e.what()}});
         note_run_failed();
+        metrics_port_.store(0, std::memory_order_release);
+        metrics_listener_.reset();
         (void)StopRunning();
         RequestBackupStop();
         (void)ShutdownActiveClients();

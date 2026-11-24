@@ -212,32 +212,6 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
         throw std::invalid_argument("unknown table option '" + std::string(key) + "'");
     }
 }
-namespace {
-
-void AddRuntimeStats(StoreRuntimeStats* total, const StoreRuntimeStats& add) {
-    total->evictions += add.evictions;
-    total->checkpoints += add.checkpoints;
-    total->wal_batch_flushes += add.wal_batch_flushes;
-    total->unique_loaded_chunks += add.unique_loaded_chunks;
-    total->open_wal_streams += add.open_wal_streams;
-    total->eviction_snapshot_builds += add.eviction_snapshot_builds;
-    total->eviction_probes += add.eviction_probes;
-    total->eviction_no_progress_cycles += add.eviction_no_progress_cycles;
-    total->eviction_forced_wal_flushes += add.eviction_forced_wal_flushes;
-    total->eviction_forced_wal_flushes_with_data += add.eviction_forced_wal_flushes_with_data;
-    total->eviction_forced_wal_flushes_empty_batch += add.eviction_forced_wal_flushes_empty_batch;
-    total->eviction_recency_skips += add.eviction_recency_skips;
-    total->empty_chunk_gcs += add.empty_chunk_gcs;
-    total->wal_barriers += add.wal_barriers;
-    total->wal_barrier_full_syncs += add.wal_barrier_full_syncs;
-    total->background_checkpoints += add.background_checkpoints;
-    total->background_checkpoint_failures += add.background_checkpoint_failures;
-    total->background_queue_full_inline += add.background_queue_full_inline;
-    total->background_queue_depth += add.background_queue_depth;
-    total->compressed_checkpoint_images += add.compressed_checkpoint_images;
-}
-
-}  // namespace
 
 CommandEngine::CommandEngine(
     EngineConfig config,
@@ -1141,8 +1115,12 @@ std::size_t CommandEngine::AuthFailureTrackedSourcesForTests() {
 }
 
 std::string CommandEngine::HandleMetrics() const {
-    // Store counters summed over all tables; the cache is shared by them.
-    StoreRuntimeStats total;
+    return Protocol::Bulk(RenderMetrics());
+}
+
+std::string CommandEngine::RenderMetrics() const {
+    // Store counters per table; the cache is shared by them.
+    std::vector<TableRuntimeStats> tables;
     for (const auto& info : catalog_->List()) {
         const auto table = catalog_->Find(info.name);
         if (table == nullptr) {
@@ -1152,10 +1130,10 @@ std::string CommandEngine::HandleMetrics() const {
         if (!lease.has_value()) {
             continue;
         }
-        AddRuntimeStats(&total, lease->store().RuntimeStats());
+        tables.push_back(TableRuntimeStats{.table = info.name, .stats = lease->store().RuntimeStats()});
     }
-    return Protocol::Bulk(metrics_->RenderPrometheus(
-        total, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get()));
+    return metrics_->RenderPrometheus(
+        tables, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get());
 }
 
 

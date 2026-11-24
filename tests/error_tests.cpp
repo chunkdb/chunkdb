@@ -303,31 +303,31 @@ int main() {
         assert(chunk_of(0, 0) == std::string("\xff\xff", 2) + payload);
         (void)engine.Execute(session, "GET BLOCK 3 3 FROM default\r\n");
 
-        // Store counters, summed over the tables.
+        // Store counters, per table.
         const std::string metrics_payload =
             ExtractBulkPayload(engine.Execute(session, "SHOW METRICS\r\n"));
         const auto metrics = ParseMetrics(metrics_payload);
 
         assert(metrics.contains("chunkdb_loaded_chunks"));
-        assert(metrics.contains("chunkdb_evictions_total"));
-        assert(metrics.contains("chunkdb_checkpoints_total"));
-        assert(metrics.contains("chunkdb_wal_batch_flushes_total"));
-        assert(metrics.contains("chunkdb_unique_loaded_chunks_total"));
-        assert(metrics.contains("chunkdb_open_wal_streams"));
+        assert(metrics.contains("chunkdb_evictions_total{table=\"default\"}"));
+        assert(metrics.contains("chunkdb_checkpoints_total{table=\"default\"}"));
+        assert(metrics.contains("chunkdb_wal_batch_flushes_total{table=\"default\"}"));
+        assert(metrics.contains("chunkdb_unique_loaded_chunks_total{table=\"default\"}"));
+        assert(metrics.contains("chunkdb_open_wal_streams{table=\"default\"}"));
         for (const char* eviction :
-             {"chunkdb_eviction_snapshot_builds_total", "chunkdb_eviction_probes_total",
-              "chunkdb_eviction_no_progress_cycles_total", "chunkdb_eviction_forced_wal_flushes_with_data_total",
-              "chunkdb_eviction_forced_wal_flushes_empty_batch_total"}) {
+             {"chunkdb_eviction_snapshot_builds_total{table=\"default\"}", "chunkdb_eviction_probes_total{table=\"default\"}",
+              "chunkdb_eviction_no_progress_cycles_total{table=\"default\"}", "chunkdb_eviction_forced_wal_flushes_with_data_total{table=\"default\"}",
+              "chunkdb_eviction_forced_wal_flushes_empty_batch_total{table=\"default\"}"}) {
             assert(metrics.contains(eviction));
             (void)std::stoull(metrics.at(eviction));
         }
 
         assert(std::stoull(metrics.at("chunkdb_loaded_chunks")) >= 1U);
-        (void)std::stoull(metrics.at("chunkdb_evictions_total"));
-        (void)std::stoull(metrics.at("chunkdb_checkpoints_total"));
-        (void)std::stoull(metrics.at("chunkdb_wal_batch_flushes_total"));
-        assert(std::stoull(metrics.at("chunkdb_unique_loaded_chunks_total")) >= 1U);
-        (void)std::stoull(metrics.at("chunkdb_open_wal_streams"));
+        (void)std::stoull(metrics.at("chunkdb_evictions_total{table=\"default\"}"));
+        (void)std::stoull(metrics.at("chunkdb_checkpoints_total{table=\"default\"}"));
+        (void)std::stoull(metrics.at("chunkdb_wal_batch_flushes_total{table=\"default\"}"));
+        assert(std::stoull(metrics.at("chunkdb_unique_loaded_chunks_total{table=\"default\"}")) >= 1U);
+        (void)std::stoull(metrics.at("chunkdb_open_wal_streams{table=\"default\"}"));
     }
 
     RemoveAllWithRetry(data_dir);

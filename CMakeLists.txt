@@ -192,7 +192,7 @@ add_executable(chunkdb_server
     src/server_poller.cpp
     src/server_idle.cpp
     src/server_feed.cpp
-    src/server_connection.cpp src/proxy_protocol.cpp
+    src/server_connection.cpp src/proxy_protocol.cpp src/metrics_http.cpp
 )
 
 target_link_libraries(chunkdb_server PRIVATE chunkdb_core)
@@ -251,7 +251,7 @@ add_library(chunkdb_server_bench_lib STATIC
     src/server_poller.cpp
     src/server_idle.cpp
     src/server_feed.cpp
-    src/server_connection.cpp src/proxy_protocol.cpp
+    src/server_connection.cpp src/proxy_protocol.cpp src/metrics_http.cpp
 )
 target_link_libraries(chunkdb_server_bench_lib PUBLIC chunkdb_core)
 target_include_directories(chunkdb_server_bench_lib PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -795,6 +795,12 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME server_socket COMMAND chunkdb_server_socket_test)
     set_tests_properties(server_socket PROPERTIES TIMEOUT 30 LABELS "smoke")
 
+    add_executable(chunkdb_metrics_http_test tests/metrics_http_tests.cpp src/metrics_http.cpp src/server_socket.cpp src/server_poller.cpp)
+    target_link_libraries(chunkdb_metrics_http_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_metrics_http_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME metrics_http COMMAND chunkdb_metrics_http_test)
+    set_tests_properties(metrics_http PROPERTIES TIMEOUT 60 LABELS "smoke")
+
     if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
         add_executable(chunkdb_server_tls_error_queue_test tests/server_tls_error_queue_tests.cpp
             src/server_socket.cpp src/server_io.cpp src/server_tls.cpp)
@@ -814,7 +820,7 @@ if(CHUNKDB_BUILD_TESTS)
         src/server_poller.cpp
         src/server_idle.cpp
         src/server_feed.cpp
-        src/server_connection.cpp src/proxy_protocol.cpp
+        src/server_connection.cpp src/proxy_protocol.cpp src/metrics_http.cpp
     )
     target_link_libraries(chunkdb_server_integration_test PRIVATE chunkdb_core)
     if(WIN32)
@@ -842,7 +848,7 @@ if(CHUNKDB_BUILD_TESTS)
         tests/server_slots_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
         src/server_poller.cpp
-        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp src/metrics_http.cpp
     )
     target_link_libraries(chunkdb_server_slots_protocol_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_slots_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -864,7 +870,7 @@ if(CHUNKDB_BUILD_TESTS)
         tests/server_chunk_model_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
         src/server_poller.cpp
-        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp src/metrics_http.cpp
     )
     target_link_libraries(chunkdb_server_chunk_model_protocol_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_chunk_model_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -882,7 +888,7 @@ if(CHUNKDB_BUILD_TESTS)
         tests/server_channel_binding_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
         src/server_poller.cpp
-        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp src/metrics_http.cpp
     )
     target_link_libraries(chunkdb_server_channel_binding_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_channel_binding_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -900,7 +906,7 @@ if(CHUNKDB_BUILD_TESTS)
         tests/server_migrations_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
         src/server_poller.cpp
-        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp src/metrics_http.cpp
     )
     target_link_libraries(chunkdb_server_migrations_protocol_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_server_migrations_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -918,7 +924,7 @@ if(CHUNKDB_BUILD_TESTS)
         tests/server_backup_protocol_tests.cpp
         src/server.cpp src/server_socket.cpp src/server_io.cpp src/server_tls.cpp
         src/server_poller.cpp
-        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp
+        src/server_idle.cpp src/server_feed.cpp src/server_connection.cpp src/proxy_protocol.cpp src/metrics_http.cpp
     )
     target_link_libraries(chunkdb_server_backup_protocol_test PRIVATE chunkdb_tools)
     target_include_directories(chunkdb_server_backup_protocol_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1245,6 +1251,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_server_framing_test
         chunkdb_server_poller_test
         chunkdb_server_socket_test
+        chunkdb_metrics_http_test
         chunkdb_server_integration_test
         chunkdb_feed_completed_prefix_reader_test
         chunkdb_server_slots_protocol_test

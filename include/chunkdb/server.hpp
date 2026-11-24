@@ -28,6 +28,9 @@ class IdleIo;
 struct WorkerWait;
 class StatementControl;
 struct FeedDeliveryTestHook;
+namespace server_detail {
+class MetricsHttpListener;
+}
 
 // The lowest TLS version a chunks:// listener accepts.
 enum class TlsMinVersion { k1_2, k1_3 };
@@ -61,6 +64,16 @@ struct ServerConfig {
     std::string tls_cert_path;
     std::string tls_key_path;
     TlsMinVersion tls_min_version = TlsMinVersion::k1_2;
+
+    // When set, a thread of its own serves GET /metrics, the SHOW METRICS
+    // text, over plain HTTP without authentication on metrics_host and
+    // metrics_port (0: a free port). A request head must arrive within
+    // client_io_timeout_ms. An address that is not loopback is refused
+    // unless metrics_allow_remote is set.
+    bool metrics_listen = false;
+    std::string metrics_host = "127.0.0.1";
+    std::uint16_t metrics_port = 0;
+    bool metrics_allow_remote = false;
 };
 
 class ChunkServer {
@@ -87,6 +100,10 @@ class ChunkServer {
     // server.
     [[nodiscard]] bool WaitListeningForTests(std::chrono::milliseconds timeout);
 
+    // The port the metrics listener has bound while Run serves; 0 before, after
+    // and without one.
+    [[nodiscard]] std::uint16_t MetricsPort() const noexcept { return metrics_port_.load(std::memory_order_acquire); }
+
   private:
     friend class FeedIo;
     friend class IdleIo;
@@ -108,6 +125,9 @@ class ChunkServer {
     // Isolated schedule observer; installed hooks outlive server shutdown.
     std::atomic<FeedDeliveryTestHook*> delivery_test_hook_{nullptr};
     std::stop_source backup_stop_;
+    // Created and destroyed by Run only.
+    std::unique_ptr<server_detail::MetricsHttpListener> metrics_listener_;
+    std::atomic<std::uint16_t> metrics_port_{0};
 
 #ifdef _WIN32
     std::uintptr_t listen_socket_;

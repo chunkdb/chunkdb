@@ -335,6 +335,8 @@ class CommandEngine {
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
     }
+    // SHOW METRICS text: the registry with the store counters of every table.
+    [[nodiscard]] std::string RenderMetrics() const;
     // The users of the data directory; null without users.
     [[nodiscard]] const std::shared_ptr<UserRegistry>& users() const noexcept { return config_.users; }
     // Test-only visibility into the bounded auth-failure tracking table.

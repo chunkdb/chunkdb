@@ -4519,6 +4519,59 @@ void TestMaxAuthFailuresDisconnects() {
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
+// The metrics listener is off by default; when on, GET /metrics returns the
+// SHOW METRICS samples on its own port, and a scraper that sends nothing
+// does not hold up statements on the client listener or other scrapes.
+void TestMetricsListen() {
+    assert(!chunkdb::ServerConfig{}.metrics_listen);
+    {
+        ServerHarness harness("metrics-off", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
+                              BaseServerConfig());
+        assert(harness.server->MetricsPort() == 0U);
+    }
+    auto server_cfg = BaseServerConfig();
+    server_cfg.metrics_listen = true;
+    server_cfg.client_io_timeout_ms = 1000;
+    ServerHarness harness("metrics-listen", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
+                          server_cfg);
+    const auto port = harness.server->MetricsPort();
+    assert(port != 0U && port != harness.port);
+    const auto scrape = [port](const std::string& request) {
+        RawClient http("127.0.0.1", port);
+        http.SendBytes(request);
+        assert(http.WaitForClose(std::chrono::seconds(10)));
+        return http.Received();
+    };
+
+    RawClient client("127.0.0.1", harness.port);
+    client.Hello();
+    client.SendLine("SET BLOCK 0 0 IN default bits = b'1010'");
+    (void)ReadVersion(client);
+    client.SendLine("FLUSH WAL");
+    assert(client.ReadLine() == "+OK\r\n");
+
+    const auto response = scrape("GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n");
+    assert(response.rfind("HTTP/1.1 200 OK\r\n", 0) == 0);
+    const auto samples = ParseMetrics(response.substr(response.find("\r\n\r\n") + 4U));
+    assert(std::stoull(samples.at("chunkdb_wal_barriers_total{table=\"default\"}")) >= 1U);
+    client.SendLine("SHOW METRICS");
+    const auto shown = ParseMetrics(client.ReadBulkText());
+    assert(shown.size() == samples.size());
+    for (const auto& [name, value] : shown) {
+        (void)value;
+        assert(samples.contains(name));
+    }
+
+    RawClient idle("127.0.0.1", port);
+    client.SendLine("PING");
+    assert(client.ReadLine() == "+PONG\r\n");
+    assert(scrape("GET /metrics HTTP/1.0\r\n\r\n").rfind("HTTP/1.1 200 OK\r\n", 0) == 0);
+    assert(idle.WaitForClose(std::chrono::seconds(10)));
+    assert(idle.Received().rfind("HTTP/1.1 408 Request Timeout\r\n", 0) == 0);
+    assert(scrape("POST /metrics HTTP/1.1\r\n\r\n").rfind("HTTP/1.1 405 Method Not Allowed\r\n", 0) == 0);
+    assert(scrape("GET /status HTTP/1.1\r\n\r\n").rfind("HTTP/1.1 404 Not Found\r\n", 0) == 0);
+}
+
 // The runtime counters: those SHOW METRICS exports are read over the wire,
 // the eviction details it does not export from the store.
 void TestMetricsRuntimeCounters() {
@@ -4558,18 +4611,18 @@ void TestMetricsRuntimeCounters() {
     const auto metrics_first = read_metrics();
     const auto stats_first = store_stats();
     for (const char* name :
-         {"chunkdb_loaded_chunks", "chunkdb_evictions_total", "chunkdb_checkpoints_total",
-          "chunkdb_wal_batch_flushes_total", "chunkdb_unique_loaded_chunks_total", "chunkdb_open_wal_streams"}) {
+         {"chunkdb_loaded_chunks", "chunkdb_evictions_total{table=\"default\"}", "chunkdb_checkpoints_total{table=\"default\"}",
+          "chunkdb_wal_batch_flushes_total{table=\"default\"}", "chunkdb_unique_loaded_chunks_total{table=\"default\"}", "chunkdb_open_wal_streams{table=\"default\"}"}) {
         assert(metrics_first.contains(name));
     }
     assert(std::string(chunkdb::ChunkLockModeName()) == ExpectedChunkLockMode());
 
     const auto loaded_chunks_first = std::stoull(metrics_first.at("chunkdb_loaded_chunks"));
-    const auto unique_loaded_chunks_first = std::stoull(metrics_first.at("chunkdb_unique_loaded_chunks_total"));
-    const auto evictions_first = std::stoull(metrics_first.at("chunkdb_evictions_total"));
-    const auto checkpoints_first = std::stoull(metrics_first.at("chunkdb_checkpoints_total"));
-    const auto wal_batch_flushes_first = std::stoull(metrics_first.at("chunkdb_wal_batch_flushes_total"));
-    const auto open_wal_streams_first = std::stoull(metrics_first.at("chunkdb_open_wal_streams"));
+    const auto unique_loaded_chunks_first = std::stoull(metrics_first.at("chunkdb_unique_loaded_chunks_total{table=\"default\"}"));
+    const auto evictions_first = std::stoull(metrics_first.at("chunkdb_evictions_total{table=\"default\"}"));
+    const auto checkpoints_first = std::stoull(metrics_first.at("chunkdb_checkpoints_total{table=\"default\"}"));
+    const auto wal_batch_flushes_first = std::stoull(metrics_first.at("chunkdb_wal_batch_flushes_total{table=\"default\"}"));
+    const auto open_wal_streams_first = std::stoull(metrics_first.at("chunkdb_open_wal_streams{table=\"default\"}"));
 
     assert(loaded_chunks_first >= 1);
     assert(unique_loaded_chunks_first >= loaded_chunks_first);
@@ -4590,10 +4643,10 @@ void TestMetricsRuntimeCounters() {
     const auto metrics_second = read_metrics();
     const auto stats_second = store_stats();
 
-    assert(std::stoull(metrics_second.at("chunkdb_evictions_total")) >= evictions_first);
-    assert(std::stoull(metrics_second.at("chunkdb_checkpoints_total")) >= checkpoints_first);
-    assert(std::stoull(metrics_second.at("chunkdb_wal_batch_flushes_total")) >= wal_batch_flushes_first);
-    assert(std::stoull(metrics_second.at("chunkdb_open_wal_streams")) >= open_wal_streams_first);
+    assert(std::stoull(metrics_second.at("chunkdb_evictions_total{table=\"default\"}")) >= evictions_first);
+    assert(std::stoull(metrics_second.at("chunkdb_checkpoints_total{table=\"default\"}")) >= checkpoints_first);
+    assert(std::stoull(metrics_second.at("chunkdb_wal_batch_flushes_total{table=\"default\"}")) >= wal_batch_flushes_first);
+    assert(std::stoull(metrics_second.at("chunkdb_open_wal_streams{table=\"default\"}")) >= open_wal_streams_first);
     assert(stats_second.eviction_snapshot_builds >= stats_first.eviction_snapshot_builds);
     assert(stats_second.eviction_probes >= stats_first.eviction_probes);
     assert(stats_second.eviction_no_progress_cycles >= stats_first.eviction_no_progress_cycles);
@@ -8414,6 +8467,7 @@ int main(int argc, char** argv) {
         run("TestPipelinedBadRequestDisconnectPolicy", TestPipelinedBadRequestDisconnectPolicy);
         run("TestMaxAuthFailuresDisconnects", TestMaxAuthFailuresDisconnects);
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
+        run("TestMetricsListen", TestMetricsListen);
         run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestTlsHandshakeDeadlineReleasesWorker", TestTlsHandshakeDeadlineReleasesWorker);

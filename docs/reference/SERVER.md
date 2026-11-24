@@ -51,7 +51,8 @@ KILL CONNECTION id
 
 - PING: `PONG`.
 - FLUSH WAL: `OK` after every write acknowledged before its arrival is durable.
-- SHOW METRICS: Prometheus text, obtained through an authenticated connection.
+- SHOW METRICS: Prometheus text, obtained through an authenticated connection; `--metrics-listen` serves the same text over HTTP without authentication, see [Server flags](../SERVER_FLAGS.md#metrics).
+- In SHOW METRICS, the table storage metrics have one sample per table with a `table` label: `chunkdb_open_wal_streams`, `chunkdb_wal_*`, `chunkdb_evictions_total`, `chunkdb_eviction_*`, `chunkdb_checkpoints_total`, `chunkdb_background_*`, `chunkdb_compressed_checkpoint_images_total`, `chunkdb_empty_chunk_gcs_total` and `chunkdb_unique_loaded_chunks_total`; the other metrics are server-wide and have no `table` label.
 - BACKUP: table count, inventoried files and bytes, and per-table epoch/revision cuts.
 - RESTORE TABLE: the new `table`, its `epoch`, its `parent_epoch` and `fork_revision` (the backed-up epoch and cut), and the `files` and `bytes` copied.
 - RELOAD TLS: `OK` once connections that start from then on use the certificate and key read again from the `--tls-cert` and `--tls-key` files.
