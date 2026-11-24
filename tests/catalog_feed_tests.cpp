@@ -98,8 +98,18 @@ Push CatalogPush(const std::string& bytes) {
     return push;
 }
 
-// A named parameter, not a temporary inside the assert condition.
-bool EventsAre(const std::vector<Event>& actual, const std::vector<Event>& expected) { return actual == expected; }
+// Events as "kind action name table data|...", "." for an empty field: a
+// string to compare, without temporaries GCC 15 and 16 misreport as dangling.
+std::string Render(const std::vector<Event>& events) {
+    std::string out;
+    const auto field = [&out](const std::string& value) { out += value.empty() ? std::string(".") : value; };
+    for (const auto& event : events) {
+        if (!out.empty()) out += "|";
+        field(event.kind); out += " "; field(event.action); out += " "; field(event.name);
+        out += " "; field(event.table); out += " "; field(event.data);
+    }
+    return out;
+}
 
 std::string Value(const std::string& text) {
     return "%1\r\n$1\r\nv\r\n$" + std::to_string(text.size()) + "\r\n" + text + "\r\n";
@@ -186,9 +196,7 @@ void TestWholeCatalogThenChanges() {
     assert(watch->revision() == 1U);
     const auto whole = CatalogPush(NextBytes(*watch));
     assert(whole.revision == 1U && whole.user_null);
-    assert(EventsAre(whole.events, {
-        {"table", "create", "t", "", "one"}, {"table", "create", "x", "", "x1"},
-        {"user", "create", "u", "", "user"}, {"slot", "create", "s", "t", "owner u"}}));
+    assert(Render(whole.events) == "table create t . one|table create x . x1|user create u . user|slot create s t owner u");
     assert(!watch->Next());
 
     catalog.SetTable("t", "two");
@@ -200,8 +208,7 @@ void TestWholeCatalogThenChanges() {
     assert(notified == 1U);
     const auto change = CatalogPush(NextBytes(*watch));
     assert(change.epoch == whole.epoch && change.revision == 2U && !change.user_null && change.user == "admin");
-    assert(EventsAre(change.events, {
-        {"user", "drop", "u", "", ""}, {"table", "alter", "t", "", "two"}, {"slot", "create", "s2", "t", "owner u"}}));
+    assert(Render(change.events) == "user drop u . .|table alter t . two|slot create s2 t owner u");
     assert(!watch->Next());
 
     // Nothing changed: no push and no revision.
@@ -214,16 +221,14 @@ void TestWholeCatalogThenChanges() {
     feed->Refresh(CatalogScope{.tables = {}, .all_tables = true}, {});
     const auto dropped = CatalogPush(NextBytes(*watch));
     assert(dropped.revision == 3U && dropped.user_null);
-    assert(EventsAre(dropped.events, {
-        {"table", "drop", "t", "", ""}, {"slot", "drop", "s", "t", ""}, {"slot", "drop", "s2", "t", ""},
-        {"table", "alter", "x", "", "x2"}}));
+    assert(Render(dropped.events) == "table drop t . .|slot drop s t .|slot drop s2 t .|table alter x . x2");
 
     // A new watch starts from the whole catalog at the current revision.
     auto late = feed->Subscribe(true, {});
     assert(late->revision() == 3U);
     const auto now = CatalogPush(NextBytes(*late));
     assert(now.revision == 3U);
-    assert(EventsAre(now.events, {{"table", "create", "x", "", "x2"}}));
+    assert(Render(now.events) == "table create x . x2");
 }
 
 void TestUsersHiddenWithoutManagesUsers() {
@@ -236,7 +241,7 @@ void TestUsersHiddenWithoutManagesUsers() {
     auto limited = feed->Subscribe(false, {});
     (void)NextBytes(*full);
     const auto whole = CatalogPush(NextBytes(*limited));
-    assert(EventsAre(whole.events, {{"table", "create", "t", "", "one"}, {"slot", "create", "s", "t", "owner"}}));
+    assert(Render(whole.events) == "table create t . one|slot create s t owner");
 
     // A user change and a new slot owner: only the full watch sees them.
     catalog.SetUser("u", "user2");
@@ -244,7 +249,7 @@ void TestUsersHiddenWithoutManagesUsers() {
     feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     const auto seen = CatalogPush(NextBytes(*full));
     assert(!seen.user_null && seen.user == "admin");
-    assert(EventsAre(seen.events, {{"user", "alter", "u", "", "user2"}, {"slot", "alter", "s", "t", "owner v"}}));
+    assert(Render(seen.events) == "user alter u . user2|slot alter s t owner v");
     assert(!limited->Next());
 
     catalog.SetTable("t", "two");
@@ -252,7 +257,7 @@ void TestUsersHiddenWithoutManagesUsers() {
     const auto table = CatalogPush(NextBytes(*limited));
     // Who ran the statement is user information too.
     assert(table.revision == 3U && table.user_null);
-    assert(EventsAre(table.events, {{"table", "alter", "t", "", "two"}}));
+    assert(Render(table.events) == "table alter t . two");
     assert(CatalogPush(NextBytes(*full)).revision == 3U);
 }
 
@@ -273,11 +278,11 @@ void TestUnknownTableKeepsRecords() {
     catalog.SetUser("v", "user");
     feed->Refresh(CatalogScope{.tables = {}, .all_tables = false}, "admin");
     const auto retried = CatalogPush(NextBytes(*watch));
-    assert(EventsAre(retried.events, {{"table", "alter", "t", "", "two"}, {"user", "create", "v", "", "user"}}));
+    assert(Render(retried.events) == "table alter t . two|user create v . user");
     catalog.records.erase(TableKey("t"));
     feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     const auto dropped = CatalogPush(NextBytes(*watch));
-    assert(EventsAre(dropped.events, {{"table", "drop", "t", "", ""}}));
+    assert(Render(dropped.events) == "table drop t . .");
 }
 
 void TestOverflowSendsResyncAndWholeCatalog() {
@@ -297,7 +302,7 @@ void TestOverflowSendsResyncAndWholeCatalog() {
     assert(resync.items[3].type == '_' && resync.items[4].type == '_');
     const auto again = CatalogPush(NextBytes(*watch));
     assert(again.revision == 3U && again.user_null);
-    assert(EventsAre(again.events, {{"table", "create", "t", "", "two"}, {"table", "create", "u", "", "three"}}));
+    assert(Render(again.events) == "table create t . two|table create u . three");
     assert(!watch->Next());
 }
 
@@ -321,7 +326,7 @@ void TestFailureEndsWatches() {
     auto fresh = feed->Subscribe(true, {});
     assert(catalog.reads == reads + 1U);
     const auto whole = CatalogPush(NextBytes(*fresh));
-    assert(EventsAre(whole.events, {{"table", "create", "t", "", "two"}}));
+    assert(Render(whole.events) == "table create t . two");
     catalog.SetTable("t", "three");
     feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     assert(CatalogPush(NextBytes(*fresh)).events.size() == 1U);
@@ -339,6 +344,9 @@ struct EngineFixture {
         config.feed_buffer_bytes = feed_buffer_bytes;
         catalog = std::make_shared<TableCatalog>(config);
         engine = std::make_unique<CommandEngine>(EngineConfig{.require_auth = false}, catalog);
+        // A catalog opened this way starts without tables.
+        auto session = Session();
+        assert(Run(*session, "CREATE TABLE default (n u8) CHUNK 4 x 4") == "+OK\r\n");
     }
     std::unique_ptr<SessionState> Session() {
         auto session = std::make_unique<SessionState>();
@@ -353,7 +361,7 @@ struct EngineFixture {
     }
 };
 
-bool HasEvent(const Push& push, const std::string& kind, const std::string& action, const std::string& name) {
+bool HasEvent(const Push& push, std::string_view kind, std::string_view action, std::string_view name) {
     return std::any_of(push.events.begin(), push.events.end(), [&](const Event& event) {
         return event.kind == kind && event.action == action && event.name == name;
     });
