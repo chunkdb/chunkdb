@@ -25,7 +25,10 @@ struct VerifyCounters {
     const std::filesystem::path& data_dir,
     std::ostream& out, bool features = false);
 
-// Checks one table directory as VerifyDataDirectory checks each table.
+// Checks one table directory as VerifyDataDirectory checks each table. Its
+// manifest owner scope is checked only against itself, since the directory
+// that binds a catalog table is not part of the check; a standalone store
+// also has its canonical INACTIVE owner root checked.
 [[nodiscard]] VerifyCounters VerifyTableDirectory(
     const std::filesystem::path& table_dir,
     std::ostream& out);

@@ -266,6 +266,9 @@ class ChunkCacheFullError : public std::runtime_error {
     ChunkCacheFullError() : std::runtime_error("large-chunk cache capacity reached") {}
 };
 class ProcessLock;
+class CommitOwnerContext;
+class CommitOwnerDirectoryContext;
+class CommitOwnerStoreAdmission;
 
 // Default limit of the chunk states a store keeps for open transactions.
 inline constexpr std::size_t kDefaultTxnHistoryBytes = 64ULL * 1024ULL * 1024ULL;
@@ -346,6 +349,10 @@ struct StoreConfig {
     // The chunk-column domain, sharing the block schema's revision history.
     std::optional<TableSchema> chunk_schema = std::nullopt;
     QueryLimits query_limits{};
+    // Opaque catalog admission; never a caller-supplied scope value.
+    std::shared_ptr<const CommitOwnerContext> commit_owner_context{};
+    // Borrowed only during fresh standalone initialization when locking is delegated.
+    const ProcessLock* bootstrap_process_lock = nullptr;
 };
 
 // Defaults for world-oriented reads; request admission uses QueryLimits.
@@ -1346,6 +1353,7 @@ class ChunkStore {
     };
 
     const QueryLimits query_limits_;
+    std::unique_ptr<CommitOwnerStoreAdmission> owner_admission_;
     Geometry geometry_;
     // Declared before the cache so borrowed node pointers outlive cached chunks.
     std::shared_ptr<ChunkCoordinateIndex> coordinate_index_;
@@ -1373,6 +1381,7 @@ class ChunkStore {
 
     // Held while the store is open, unless the directory's owner holds it.
     std::unique_ptr<ProcessLock> process_lock_;
+    std::shared_ptr<const CommitOwnerDirectoryContext> commit_owner_context_;
 
     std::filesystem::path snapshot_generation_path_;
     StoreId store_id_{};
@@ -1766,7 +1775,7 @@ class ChunkStore {
     void RecoverConditionalRollbackIntents(bool validate_only = false);
     // Creates the manifest of a new store, or confirms the existing one
     // still records the geometry this store opened with.
-    void InitializeStoreManifest();
+    void InitializeStoreManifest(const ProcessLock* bootstrap_owner);
     void InitializeSnapshotGeneration(bool store_preexisting);
     void FinishSnapshotGenerationRecovery();
     void BeginSnapshotGenerationWrite();

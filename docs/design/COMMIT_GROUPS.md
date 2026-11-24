@@ -1,7 +1,7 @@
 # Commit groups
 
 This planned contract covers [#136](https://github.com/chunkdb/chunkdb/issues/136) and builds on the [chunk model](CHUNK_MODEL.md).
-Groups are not active in this build: the `commit_groups` feature is not registered, and the current guarantees are in [Durability](../DURABILITY_CONTRACT.md).
+Grouped writes are not active in this build: the `commit_groups` feature is registered and new directories and tables carry it, but every owner stays INACTIVE and no write path creates a group; the current guarantees are in [Durability](../DURABILITY_CONTRACT.md).
 The pure checked encodings are specified in [Commit group records](COMMIT_GROUP_FORMAT.md).
 Recovery, checkpoint and restore ownership are specified in [Group recovery](COMMIT_GROUP_RECOVERY.md).
 The inactive owner bootstrap and handover check of this build are described in [Group coordinator](COMMIT_GROUP_COORDINATOR.md).
@@ -98,6 +98,7 @@ A checksum-valid record with an invalid identity or structure, any failure at or
 The journal scanner in this build also refuses any seal record and any receipt without an earlier matching decision; seal placement is not decided yet.
 
 A checkpoint makes the decisions of all groups it includes durable before publishing its image.
+Every grouped write path, including a one-member conditional group and a transaction group, makes its rollback boundary durable as the ordinary rollback boundary does before its first grouped frame, and so sets the barrier durability floor: from then on no checkpoint replaces a synced WAL with an unsynced image.
 Checked image and tombstone provenance identifies a covered group member after its WAL frame is retired.
 Only durable published coverage can replace a frame during group admission.
 Live journal records can retire after all members have published coverage.

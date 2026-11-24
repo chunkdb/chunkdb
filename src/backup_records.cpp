@@ -33,6 +33,7 @@
 #include "feature_flags.hpp"
 #include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
+#include "commit_owner_bootstrap.hpp"
 #include "wal_replay.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "shared_file_input.hpp"
@@ -579,10 +580,12 @@ class SharedInput {
 };
 // Checks one table directory of a backup, or a copy of one, against its cut.
 // `files` are the table's inventory files, relative to `dir`.
-void ValidateTableCut(const std::filesystem::path& dir, const BackupTableCut& cut,
-    const std::vector<std::filesystem::path>& files, const BackupCancel& cancelled) {
+StoreId ValidateTableCut(const std::filesystem::path& dir, const BackupTableCut& cut,
+    const std::vector<std::filesystem::path>& files, const BackupCancel& cancelled,
+    const std::optional<CommitOwnerScope>& owner) {
     const auto manifest = ReadStoreManifest(dir);
     if (!manifest || manifest->store_id != cut.epoch) throw std::runtime_error("backup table epoch mismatch: " + cut.name);
+    if (manifest->commit_owner != owner) throw std::runtime_error("backup table owner scope mismatch: " + cut.name);
     RequireOpenableFeatures(manifest->features, AccessMode::kReadOnly);
     Geometry geometry(manifest->geometry, manifest->schema, *manifest->chunk_schema);
     std::uint64_t ceiling = 0U, generation = 0U;
@@ -655,6 +658,7 @@ void ValidateTableCut(const std::filesystem::path& dir, const BackupTableCut& cu
                 (!boundaries.empty() && boundaries.back().revision > cut.revision)) throw std::runtime_error("backup WAL is damaged or exceeds cut");
         } else throw std::runtime_error("unknown backup chunk artifact: " + relative);
     }
+    return manifest->store_id;
 }
 void ValidateInventory(const std::filesystem::path& root, const BackupRecord& record, bool completing, const BackupCancel& cancelled = {}) {
     ValidateRecord(record);
@@ -697,6 +701,11 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
     if (Present(root / kUsersFileName)) (void)DecodeUsers(LoadFile(root / kUsersFileName));
     (void)ReadMigrationRecords(root);
     std::set<std::string> allowed{"chunkdb.manifest", "chunkdb.users", std::string(kMigrationsFileName)};
+    if (directory_manifest.commit_owner) {
+        (void)CommitOwnerBootstrap::ReadInactiveRoot(root, *directory_manifest.commit_owner);
+        allowed.insert("chunkdb.groups.owner");
+    } else if (Present(root / "chunkdb.groups.owner")) throw std::runtime_error("unclaimed canonical commit owner exists");
+    std::set<StoreId> epochs;
     for (const auto& cut : record.tables) {
         Cancelled(cancelled);
         const auto prefix = std::filesystem::path("tables") / cut.name;
@@ -708,7 +717,8 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
             files.push_back(file.relative_path.lexically_relative(prefix));
             allowed.insert(relative);
         }
-        ValidateTableCut(root / prefix, cut, files, cancelled);
+        const auto epoch = ValidateTableCut(root / prefix, cut, files, cancelled, directory_manifest.commit_owner);
+        if (!epochs.insert(epoch).second) throw std::runtime_error("backup contains duplicate table epochs");
     }
     for (const auto& file : record.files)
         if (!allowed.contains(file.relative_path.generic_string())) throw std::runtime_error("unknown backup inventory artifact");
@@ -1165,7 +1175,10 @@ BackupTableCopy CopyBackupTable(const std::filesystem::path& backup, std::string
         ++copied_files;
         if (progress) progress(copied_files, copy.bytes, expected.size(), total);
     }
-    ValidateTableCut(directory, copy.cut, copy.files, cancelled);
+    // The copied manifest still names the backed-up directory's owner scope.
+    const auto source = ReadDataDirManifest(backup);
+    if (!source) throw std::runtime_error("backup data-directory manifest is missing");
+    (void)ValidateTableCut(directory, copy.cut, copy.files, cancelled, source->commit_owner);
     return copy;
 }
 void ValidateBackupContents(const std::filesystem::path& root, const BackupRecord& record) { ValidateInventory(root, record, true); }

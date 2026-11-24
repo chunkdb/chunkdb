@@ -1,7 +1,7 @@
 # Commit group recovery ownership
 
 This owner contract completes the recovery, checkpoint and restore rules of [#136](https://github.com/chunkdb/chunkdb/issues/136).
-It is planned and not active in this build; recovery does not admit grouped frames.
+Grouped recovery is planned and not active in this build: owners are created INACTIVE and recovery does not admit grouped frames.
 It uses the checked [group records](COMMIT_GROUP_FORMAT.md) and does not change the meaning of a producing revision.
 A revision greater than a group member's revision is never evidence that the member survived.
 The `commit_groups` feature owns every additional object described here.
@@ -62,7 +62,7 @@ The runtime coordinator remains lazy, and an INACTIVE root lets startup omit gro
 First grouped use stages and syncs empty journal, coverage, reference and ID objects and their parent names, then atomically publishes and syncs an ACTIVE root before appending any GROUP frame.
 This transition uses only the independent owner-transition serialization and pinned file I/O; it never acquires catalog operations, feature metadata admission or another table lease.
 It is therefore admissible from an existing direct C++ conditional operation already owning a table lease, and from a standalone store.
-This build implements only the fixed INACTIVE installer, with no production caller, and the handover check against a staged ACTIVE candidate in the [coordinator](COMMIT_GROUP_COORDINATOR.md); it never publishes an ACTIVE root.
+This build installs the fixed INACTIVE root at creation and `ENABLE FEATURE` through the [bootstrap](COMMIT_OWNER_BOOTSTRAP.md) and implements the handover check against a staged ACTIVE candidate in the [coordinator](COMMIT_GROUP_COORDINATOR.md); it never publishes an ACTIVE root.
 An ACTIVE owner never reverts, including after its last group retires, and a missing selected object is damage.
 A failed activation publishes no grouped frame; an uncertain ACTIVE publication fences the coordinator until checked admission resolves it.
 This is a once-per-directory boundary and adds no sync or journal lookup to unused ordinary writes.

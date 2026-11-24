@@ -26,9 +26,11 @@
 #include "feature_flags.hpp"
 #include "feature_activation_records.hpp"
 #include "feed_archive.hpp"
+#include "feed_prefix.hpp"
 #include "feed_slot_records.hpp"
 #include "migrations_records.hpp"
 #include "store_manifest.hpp"
+#include "commit_owner_bootstrap.hpp"
 #include "txn_history.hpp"
 #include "wal_replay.hpp"
 #include "populated_index_format.hpp"
@@ -141,8 +143,10 @@ void ReportInfo(
 constexpr const char* kGroupOwnerName = "chunkdb.groups.owner";
 constexpr const char* kGroupObjectsName = "chunkdb.groups.objects";
 
-// Commit group owner state that this build never admits: commit_groups stays
-// refused, so no manifest can claim these names yet.
+// Commit group owner state. A data directory and a standalone store with the
+// commit_groups feature claim only their canonical INACTIVE root here; object
+// and journal directories, and any of these names elsewhere, are not admitted
+// by this build, which never publishes an ACTIVE owner.
 [[nodiscard]] bool IsGroupOwnerName(const std::string& name) {
     return name == kGroupOwnerName || name == kGroupObjectsName || name == chunkdb::kCommitJournalDirectoryName;
 }
@@ -352,6 +356,7 @@ void VerifyChunkArtifacts(const std::filesystem::path& root, const chunkdb::Geom
     if (std::filesystem::exists(image_path)) {
         ++counters->checked;
         try {
+            chunkdb::FeedWalPrefixTestAccess::Run(chunkdb::FeedWalPrefixTestHook::Point::kImageRead, coord);
             auto image = chunkdb::ParseChunkImage(chunkdb::LoadChunkImageFile(image_path, geometry,
                 coord, manifest.store_id, manifest.features), geometry, coord, manifest.store_id, manifest.features);
             payload = std::move(image.payload); presence = std::move(image.presence_bitmap);
@@ -586,7 +591,8 @@ void VerifyFeedArtifacts(
 
 // Verifies one table directory (a store): its manifest, bookkeeping, chunk
 // images, WALs and conditional intents.
-void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters) {
+void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters,
+    const std::optional<chunkdb::CommitOwnerScope>& owner_scope) {
     counters->highest_revision = 0;
     bool initialized_marker_present = false;
     bool has_storage_artifacts = false;
@@ -600,6 +606,8 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
     try {
         const auto manifest = chunkdb::ReadStoreManifest(data_dir);
         if (manifest.has_value()) {
+            if (manifest->commit_owner != owner_scope)
+                throw std::runtime_error("table owner scope differs from its admitted catalog");
             ReportFeatures(counters, manifest_path, manifest->features);
             if ((manifest->features.incompat & chunkdb::kFeatureActivation) != 0U ||
                 (manifest->features.incompat & chunkdb::kFeatureMigrations) != 0U)
@@ -786,12 +794,23 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
             initialized_exists_ec.message());
     }
 
+    bool standalone_root_seen = false;
     std::set<chunkdb::ChunkCoord> checked_coords;
     for (const auto& entry : chunkdb::backup_detail::DirectoryEntries(data_dir)) {
         const auto name = entry.path().filename().string();
 
         // Process-lock artifacts and OS metadata are not storage state.
         if (name.rfind(".chunkdb", 0) == 0 || name.rfind(".", 0) == 0) {
+            continue;
+        }
+        // A standalone store owns its canonical root in its own directory.
+        if (name == kGroupOwnerName && owner_scope && owner_scope->role == chunkdb::CommitOwnerRole::kStandalone) {
+            standalone_root_seen = true;
+            try {
+                (void)chunkdb::CommitOwnerBootstrap::ReadInactiveRoot(data_dir, *owner_scope);
+            } catch (const std::exception& error) {
+                Report(counters, true, "group_owner_invalid", entry.path(), error.what());
+            }
             continue;
         }
         if (IsGroupOwnerName(name)) {
@@ -898,6 +917,8 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
             }
         }
     }
+    if (owner_scope && owner_scope->role == chunkdb::CommitOwnerRole::kStandalone && !standalone_root_seen)
+        Report(counters, true, "group_owner_missing", data_dir / kGroupOwnerName, "standalone store without its canonical owner root");
     if (index && store_geometry) for (const auto& [coord, boundary] : index->unpublished) {
         const auto artifact = index->artifacts.find(coord);
         bool valid = artifact != index->artifacts.end() && artifact->second.revision >= boundary.revision;
@@ -1052,6 +1073,21 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
 void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounters* counters) {
     const auto manifest_path = chunkdb::DataDirManifestPath(data_dir);
     bool check_tables = false;
+    std::optional<chunkdb::CommitOwnerScope> owner_scope;
+    try {
+        if (const auto pending = chunkdb::CommitOwnerBootstrap::ReadPending(data_dir)) {
+            if (pending->kind != chunkdb::CommitOwnerBootstrapKind::kDirectory)
+                throw std::runtime_error("standalone creation decision is not a catalog decision");
+            const auto existing = chunkdb::ReadDataDirManifest(data_dir);
+            if (existing && chunkdb::SerializeDataDirManifest(*existing) != pending->manifest)
+                throw std::runtime_error("manifest differs from creation decision");
+            Report(counters, false, "owner_bootstrap_pending", data_dir / chunkdb::kCommitOwnerBootstrapName,
+                "initial owner publication requires a read-write open");
+            if (!existing) return;
+        }
+    } catch (const std::exception& error) {
+        Report(counters, true, "owner_bootstrap_invalid", data_dir, error.what()); return;
+    }
     ++counters->checked;
     try {
         const auto manifest = chunkdb::ReadDataDirManifest(data_dir);
@@ -1060,6 +1096,15 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
                 counters, true, "data_dir_manifest_missing", manifest_path,
                 "not an initialized chunkdb data directory; tables were not checked");
         } else {
+            owner_scope = manifest->commit_owner;
+            if (owner_scope) (void)chunkdb::CommitOwnerBootstrap::ReadInactiveRoot(data_dir, *owner_scope);
+            else if (std::filesystem::symlink_status(data_dir / "chunkdb.groups.owner").type() != std::filesystem::file_type::not_found) {
+                const auto pending = chunkdb::ReadFeatureActivationJournal(data_dir);
+                if (!pending || pending->feature != chunkdb::kFeatureCommitGroups || !pending->commit_owner)
+                    throw std::runtime_error("unclaimed canonical commit owner exists");
+                chunkdb::ValidateFeatureActivationJournal(data_dir, *pending);
+                (void)chunkdb::CommitOwnerBootstrap::ReadInactiveRoot(data_dir, *pending->commit_owner);
+            }
             ReportFeatures(counters, manifest_path, manifest->features);
             const auto unknown = chunkdb::UnknownFeatures(manifest->features);
             if (unknown.incompat != 0U) {
@@ -1103,11 +1148,13 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
     }
 
     std::uint32_t pending_feature = 0U;
+    std::optional<chunkdb::CommitOwnerScope> pending_owner;
     ++counters->checked;
     try {
         if (const auto journal = chunkdb::ReadFeatureActivationJournal(data_dir)) {
             chunkdb::ValidateFeatureActivationJournal(data_dir, *journal);
             pending_feature = journal->feature;
+            pending_owner = journal->commit_owner;
             Report(counters, false, "feature_recovery_pending", data_dir / chunkdb::kFeaturePendingFileName,
                 "activation decision requires a read-write start to finish publication");
         }
@@ -1119,6 +1166,7 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         const auto name = entry.path().filename().string();
         if (name == chunkdb::kDataDirManifestFileName || name == chunkdb::kBackupMarkerName || name == "tables" ||
             name == chunkdb::kMigrationsFileName || name == chunkdb::kMigrationPendingFileName || name == chunkdb::kFeaturePendingFileName ||
+            name == "chunkdb.groups.owner" || name == chunkdb::kCommitOwnerBootstrapName ||
             name.rfind(".chunkdb.lock", 0) == 0) {
             continue;
         }
@@ -1180,8 +1228,35 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         tables.push_back(entry.path());
     }
     std::sort(tables.begin(), tables.end());
+    // Every table's owner context is checked before any table's chunks.
+    std::set<chunkdb::StoreId> epochs;
+    std::vector<std::optional<chunkdb::CommitOwnerScope>> table_scopes;
+    bool scopes_valid = true;
     for (const auto& table : tables) {
-        VerifyTable(table, counters);
+        const auto expected = pending_owner ? pending_owner : owner_scope;
+        std::optional<chunkdb::StoreManifest> manifest;
+        try {
+            manifest = chunkdb::ReadStoreManifest(table);
+        } catch (const std::exception&) {
+            // VerifyTable reports the unreadable manifest itself.
+        }
+        if (!manifest) {
+            table_scopes.push_back(expected);
+            continue;
+        }
+        if (!epochs.insert(manifest->store_id).second) {
+            scopes_valid = false;
+            Report(counters, true, "feature_ownership_invalid", table, "duplicate table epoch");
+        } else if (manifest->commit_owner != expected && !(pending_owner && !manifest->commit_owner)) {
+            scopes_valid = false;
+            Report(counters, true, "feature_ownership_invalid", table, "table owner scope differs from its admitted catalog");
+        }
+        table_scopes.push_back(manifest->commit_owner ? expected : std::optional<chunkdb::CommitOwnerScope>{});
+    }
+    if (!scopes_valid) return;
+    for (std::size_t i = 0U; i < tables.size(); ++i) {
+        const auto& table = tables[i];
+        VerifyTable(table, counters, table_scopes[i]);
         if (counters->tables != nullptr) counters->tables->push_back({table, counters->highest_revision});
         if (check_tables) {
             try {
@@ -1248,7 +1323,15 @@ chunkdb::VerifyCounters chunkdb::VerifyTableDirectory(
     std::ostream& out) {
     ::VerifyCounters counters;
     counters.out = &out;
-    VerifyTable(table_dir, &counters);
+    // Without its directory a catalog table is checked against its own scope;
+    // a standalone store also has its canonical root checked here.
+    std::optional<CommitOwnerScope> scope;
+    try {
+        if (const auto manifest = ReadStoreManifest(table_dir)) scope = manifest->commit_owner;
+    } catch (const std::exception&) {
+        // VerifyTable reports the unreadable manifest itself.
+    }
+    VerifyTable(table_dir, &counters, scope);
     return counters;
 }
 

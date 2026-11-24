@@ -35,7 +35,57 @@ constexpr std::size_t kDataDirOptionsOffset = 40U;
 
 [[nodiscard]] bool IsKnownTableManifestType(std::uint16_t type) noexcept {
     return IsKnownTableOptionType(type) || type == kOptionParentEpoch ||
-           type == kOptionForkRevision;
+           type == kOptionForkRevision || type == kOptionCommitOwnerScope;
+}
+
+void RequireOwnerScope(const FeatureFlags& features, const std::optional<CommitOwnerScope>& scope,
+    const StoreId& identity, bool directory) {
+    if (((features.incompat & kFeatureCommitGroups) != 0U) != scope.has_value())
+        throw std::invalid_argument("commit_groups feature and owner scope must both be present or absent");
+    if (!scope) return;
+    (void)SerializeCommitOwnerScope(*scope);
+    if ((directory && (scope->role != CommitOwnerRole::kCatalog || scope->directory_id != identity)) ||
+        (!directory && scope->role == CommitOwnerRole::kStandalone && scope->directory_id != identity))
+        throw std::invalid_argument("commit owner scope does not match its manifest identity or role");
+}
+
+void RequireNoRawOwnerScope(const std::vector<std::uint8_t>& options, std::uint16_t owned_type) {
+    for (std::size_t at = 0U; at < options.size();) {
+        if (options.size() - at < 4U) throw std::invalid_argument("truncated manifest option");
+        const auto type = ReadLe16(options, at), length = ReadLe16(options, at + 2U);
+        if (length > options.size() - at - 4U) throw std::invalid_argument("manifest option overruns its area");
+        if (type == owned_type) throw std::invalid_argument("commit owner scope must use its immutable manifest field");
+        at += 4U + length;
+    }
+}
+
+std::optional<CommitOwnerScope> ExtractOwnerScope(std::vector<std::uint8_t>& options, std::uint16_t owned_type) {
+    std::optional<CommitOwnerScope> scope;
+    std::vector<std::uint8_t> retained;
+    retained.reserve(options.size());
+    for (std::size_t at = 0U; at < options.size();) {
+        const auto type = ReadLe16(options, at), length = ReadLe16(options, at + 2U);
+        const auto next = at + 4U + length;
+        if (type == owned_type) {
+            if (scope) throw std::runtime_error("commit owner scope appears twice");
+            if (length != kCommitOwnerScopeBytes) throw std::runtime_error("commit owner scope has invalid length");
+            scope = ParseCommitOwnerScope(std::span(options).subspan(at + 4U, length));
+        } else {
+            retained.insert(retained.end(), options.begin() + static_cast<std::ptrdiff_t>(at),
+                options.begin() + static_cast<std::ptrdiff_t>(next));
+        }
+        at = next;
+    }
+    options = std::move(retained);
+    return scope;
+}
+
+void AppendOwnerScope(std::vector<std::uint8_t>& bytes, std::uint16_t type,
+    const std::optional<CommitOwnerScope>& scope) {
+    if (!scope) return;
+    const auto encoded = SerializeCommitOwnerScope(*scope);
+    WriteLe16(bytes, type); WriteLe16(bytes, static_cast<std::uint16_t>(encoded.size()));
+    bytes.insert(bytes.end(), encoded.begin(), encoded.end());
 }
 
 void RequireValidLineage(const StoreManifest& manifest) {
@@ -218,6 +268,8 @@ void AlignManifestSchemaDomains(
 
 std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) {
     RequireValidLineage(manifest);
+    RequireOwnerScope(manifest.features, manifest.commit_owner, manifest.store_id, false);
+    RequireNoRawOwnerScope(manifest.options, kOptionCommitOwnerScope);
     if ((manifest.features.incompat & kFeatureChunkModel) == 0)
         throw std::invalid_argument("table manifest lacks chunk_model feature");
     const auto chunk_schema = manifest.chunk_schema ? *manifest.chunk_schema : EmptyChunkSchemaFor(manifest.schema);
@@ -231,10 +283,10 @@ std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) 
     (void)Geometry(manifest.geometry, manifest.schema, chunk_schema);
     const auto schema = EncodeTableSchema(manifest.schema);
     const auto encoded_chunk_schema = EncodeChunkSchema(chunk_schema);
-    const auto lineage_bytes = manifest.lineage ? 32U : 0U;
-    if (manifest.options.size() > kStoreManifestMaxSize - lineage_bytes)
+    const auto owned_bytes = (manifest.lineage ? 32U : 0U) + (manifest.commit_owner ? 44U : 0U);
+    if (manifest.options.size() > kStoreManifestMaxSize - owned_bytes)
         throw std::invalid_argument("store manifest options and schema are too large");
-    const auto options_size = manifest.options.size() + lineage_bytes;
+    const auto options_size = manifest.options.size() + owned_bytes;
     if (options_size > kStoreManifestMaxSize - kStoreManifestMinSize ||
         schema.size() > kStoreManifestMaxSize - kStoreManifestMinSize - options_size ||
         encoded_chunk_schema.size() > kStoreManifestMaxSize - kStoreManifestMinSize - options_size - schema.size()) {
@@ -266,6 +318,7 @@ std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) 
         bytes.insert(bytes.end(), manifest.lineage->parent_epoch.begin(), manifest.lineage->parent_epoch.end());
         AppendOption(bytes, kOptionForkRevision, manifest.lineage->fork_revision);
     }
+    AppendOwnerScope(bytes, kOptionCommitOwnerScope, manifest.commit_owner);
     WriteLe32(bytes, static_cast<std::uint32_t>(schema.size()));
     bytes.insert(bytes.end(), schema.begin(), schema.end());
     WriteLe32(bytes, static_cast<std::uint32_t>(encoded_chunk_schema.size()));
@@ -364,6 +417,8 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
         bytes.begin() + static_cast<std::ptrdiff_t>(kOptionsOffset),
         bytes.begin() + static_cast<std::ptrdiff_t>(schema_size_offset));
     ValidateOptions(manifest.options, manifest.features, IsKnownTableManifestType);
+    manifest.commit_owner = ExtractOwnerScope(manifest.options, kOptionCommitOwnerScope);
+    RequireOwnerScope(manifest.features, manifest.commit_owner, manifest.store_id, false);
     DecodeLineage(&manifest);
     (void)DecodeTableOptions(manifest.options);
     return manifest;
@@ -498,12 +553,16 @@ std::filesystem::path DataDirManifestPath(const std::filesystem::path& data_dir)
 }
 
 std::vector<std::uint8_t> SerializeDataDirManifest(const DataDirManifest& manifest) {
+    RequireOwnerScope(manifest.features, manifest.commit_owner, manifest.data_dir_id, true);
+    RequireNoRawOwnerScope(manifest.options, kDataDirOptionCommitOwnerScope);
     if ((manifest.features.incompat & kFeatureChunkModel) == 0)
         throw std::invalid_argument("data directory manifest lacks chunk_model feature");
-    if (manifest.options.size() > kDataDirManifestMaxSize - kDataDirManifestMinSize) {
+    const auto owned_bytes = manifest.commit_owner ? 44U : 0U;
+    if (manifest.options.size() > kDataDirManifestMaxSize - kDataDirManifestMinSize - owned_bytes) {
         throw std::invalid_argument("data directory manifest options are too large");
     }
-    const std::size_t size = kDataDirManifestMinSize + manifest.options.size();
+    const auto options_size = manifest.options.size() + owned_bytes;
+    const std::size_t size = kDataDirManifestMinSize + options_size;
     std::vector<std::uint8_t> bytes;
     bytes.reserve(size);
     bytes.insert(bytes.end(), kDataDirManifestMagic.begin(), kDataDirManifestMagic.end());
@@ -513,8 +572,9 @@ std::vector<std::uint8_t> SerializeDataDirManifest(const DataDirManifest& manife
     WriteLe32(bytes, manifest.features.ro_compat);
     WriteLe32(bytes, manifest.features.compat);
     bytes.insert(bytes.end(), manifest.data_dir_id.begin(), manifest.data_dir_id.end());
-    WriteLe32(bytes, static_cast<std::uint32_t>(manifest.options.size()));
+    WriteLe32(bytes, static_cast<std::uint32_t>(options_size));
     bytes.insert(bytes.end(), manifest.options.begin(), manifest.options.end());
+    AppendOwnerScope(bytes, kDataDirOptionCommitOwnerScope, manifest.commit_owner);
     WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
     return bytes;
 }
@@ -573,8 +633,10 @@ DataDirManifest ParseDataDirManifest(const std::vector<std::uint8_t>& bytes) {
         bytes.begin() + static_cast<std::ptrdiff_t>(kDataDirOptionsOffset),
         bytes.begin() + static_cast<std::ptrdiff_t>(crc_offset));
     ValidateOptions(manifest.options, manifest.features, [](std::uint16_t type) {
-        return type == kDataDirOptionVersionFloor;
+        return type == kDataDirOptionVersionFloor || type == kDataDirOptionCommitOwnerScope;
     });
+    manifest.commit_owner = ExtractOwnerScope(manifest.options, kDataDirOptionCommitOwnerScope);
+    RequireOwnerScope(manifest.features, manifest.commit_owner, manifest.data_dir_id, true);
     (void)DataDirVersionFloor(manifest);  // checks its length and that it appears once
     return manifest;
 }

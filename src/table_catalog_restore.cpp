@@ -6,6 +6,7 @@
 
 #include "backup.hpp"
 #include "checkpoint.hpp"
+#include "commit_owner_bootstrap.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/logging.hpp"
 #include "durability_io.hpp"
@@ -79,8 +80,12 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
     const auto require_features = [&] {
         const auto directory_manifest = ReadDataDirManifest(config_.data_dir);
         if (!directory_manifest) throw std::runtime_error("data directory manifest disappeared");
-        const auto served = TableScopedFeatures(directory_manifest->features);
-        if (TableScopedFeatures(manifest.features).incompat != served.incompat)
+        // commit_groups follows the directory's owner: the rebind sets or clears it.
+        auto served = TableScopedFeatures(directory_manifest->features);
+        served.incompat &= ~kFeatureCommitGroups;
+        auto restored = TableScopedFeatures(manifest.features);
+        restored.incompat &= ~kFeatureCommitGroups;
+        if (restored.incompat != served.incompat)
             throw std::invalid_argument("the backed-up table has features " + DescribeFeatures(TableScopedFeatures(manifest.features)) +
                 " but this data directory gives its tables " + DescribeFeatures(served));
     };
@@ -103,8 +108,12 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         result.fork_revision = copy.cut.revision;
         result.files = copy.files.size();
         result.bytes = copy.bytes;
-        result.epoch = RebindRestoredTable(staging, copy.cut, copy.files, request.cancelled);
+        const auto owner = commit_owner_context_ ? std::optional(commit_owner_context_->scope()) : std::nullopt;
+        result.epoch = RebindRestoredTable(staging, copy.cut, copy.files, owner, request.cancelled);
         manifest.store_id = result.epoch;
+        manifest.commit_owner = owner;
+        if (owner) manifest.features.incompat |= kFeatureCommitGroups;
+        else manifest.features.incompat &= ~kFeatureCommitGroups;
         manifest.lineage = TableLineage{result.parent_epoch, result.fork_revision};
         std::ostringstream findings;
         if (VerifyTableDirectory(staging, findings).errors != 0U)

@@ -19,10 +19,10 @@ class ProcessLock {
   public:
     // Throws when another process holds the lock or it cannot be created.
     explicit ProcessLock(const std::filesystem::path& data_dir);
-    // For a writer that stages commit owner artifacts: also pins `data_dir`
-    // itself as a plain directory, not a symlink or reparse point. The pin is
-    // taken before the lock directory is created, so a refused root leaves no
-    // lock directory. Writers that do not stage artifacts do not take it.
+    // Every lock pins the directory `data_dir` reaches, following a link at
+    // `data_dir` itself once, so a writer can stage commit owner artifacts
+    // relative to it. The pin is taken before the lock directory is created,
+    // so a refused root leaves no lock directory. This overload is the same.
     struct PinRootForArtifacts {};
     ProcessLock(const std::filesystem::path& data_dir, PinRootForArtifacts);
     ~ProcessLock();

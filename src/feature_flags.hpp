@@ -15,19 +15,19 @@ inline constexpr std::uint32_t kFeatureFeedSlots = 1U;
 // Data-directory migration ledger and redo journal; older writers must refuse.
 inline constexpr std::uint32_t kFeatureMigrations = 2U;
 // Immediate restore parent and the completed revision at its fork.
-inline constexpr std::uint32_t kFeatureTableLineage = 4U;
+inline constexpr std::uint32_t kFeatureTableLineage | kFeatureSlotFilters | kFeatureActivation | kFeatureChunkModel | kFeatureCommitGroups};= 4U;
 // Persistent projection IDs, area/before/chunks filters and schema-filter loss.
 inline constexpr std::uint32_t kFeatureSlotFilters = 8U;
 // Checked multi-manifest activation decisions; belongs only to the directory.
 inline constexpr std::uint32_t kFeatureActivation = 16U;
 // Dimension-aware chunk files, chunk columns and retained empty identities.
 inline constexpr std::uint32_t kFeatureChunkModel = 32U;
-// Reserved for directory commit decisions and the grouped WAL metadata they
-// authorize. Groups are not active in this build: the bit is outside the
-// registry and the known features, so it is never set on a new directory or
-// table, cannot be enabled, and a directory or table carrying it is refused as
-// an unknown incompat feature. The WAL format code takes it as an explicit
-// flag (InspectFeedFrame, ReplayFeedFrame).
+// Directory commit decisions and the grouped WAL metadata they authorize. A
+// directory or table carrying it binds a checked owner scope and a canonical
+// owner root; new directories and tables set it, and ENABLE FEATURE adds it.
+// In this build every owner stays INACTIVE: no grouped write path exists yet.
+// The WAL format code takes it as an explicit flag (InspectFeedFrame,
+// ReplayFeedFrame).
 inline constexpr std::uint32_t kFeatureCommitGroups = 64U;
 
 struct FeatureDefinition {
@@ -36,13 +36,14 @@ struct FeatureDefinition {
     bool table_scoped;
     std::string_view ownership;
 };
-inline constexpr std::array<FeatureDefinition, 6> kFeatureRegistry{{
+inline constexpr std::array<FeatureDefinition, 7> kFeatureRegistry{{
     {"feed_slots", kFeatureFeedSlots, true, "slot records, feed archive and USER WAL metadata"},
     {"migrations", kFeatureMigrations, false, "migration ledger and redo decisions"},
     {"table_lineage", kFeatureTableLineage, true, "table parent-epoch and fork-revision TLVs"},
     {"slot_filters", kFeatureSlotFilters, true, "slot filter records and stable projection IDs"},
     {"feature_activation", kFeatureActivation, false, "directory feature activation decisions"},
     {"chunk_model", kFeatureChunkModel, true, "dimension-aware chunks, chunk metadata and coordinate indexes"},
+    {"commit_groups", kFeatureCommitGroups, true, "directory commit decisions and grouped table artifacts"},
 }};
 inline constexpr FeatureFlags kKnownFeatures{.incompat = kFeatureFeedSlots | kFeatureMigrations |
     kFeatureTableLineage | kFeatureSlotFilters | kFeatureActivation | kFeatureChunkModel};

@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "commit_group_owner_format.hpp"
 #include "users.hpp"
 
 namespace chunkdb {
@@ -152,9 +153,10 @@ using BackupCopyProgress = std::function<void(std::uint64_t copied_files, std::u
 // Gives a copied table directory a new epoch whose lineage is `cut`: WAL
 // crash tails are normalized, every image, WAL, coordinate log and slot is
 // rebound, the clock restarts at the cut's successor, and the manifest is
-// written last. `files` are the table's inventory files relative to it.
-// Returns the new epoch.
+// written last with the destination directory's owner scope `owner`.
+// `files` are the table's inventory files relative to it. Returns the new epoch.
 [[nodiscard]] StoreId RebindRestoredTable(const std::filesystem::path& directory, const BackupTableCut& cut,
-    const std::vector<std::filesystem::path>& files, const BackupCancel& cancelled = {});
+    const std::vector<std::filesystem::path>& files, const std::optional<CommitOwnerScope>& owner,
+    const BackupCancel& cancelled = {});
 
 } // namespace chunkdb

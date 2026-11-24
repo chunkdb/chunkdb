@@ -368,7 +368,7 @@ struct ProcessLock::RootDirectoryOwner {
 #ifdef _WIN32
         const auto handle = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES | SYNCHRONIZE,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
-            FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT, nullptr);
+            FILE_FLAG_BACKUP_SEMANTICS, nullptr);
         if (handle == INVALID_HANDLE_VALUE)
             throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "pin writer root directory");
         native = reinterpret_cast<std::intptr_t>(handle);
@@ -382,7 +382,7 @@ struct ProcessLock::RootDirectoryOwner {
             throw std::runtime_error("writer root is not a plain directory");
         }
 #else
-        const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_NOFOLLOW | O_CLOEXEC);
+        const int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
         if (fd < 0) throw std::system_error(errno, std::generic_category(), "pin writer root directory");
         native = fd;
 #endif
@@ -413,8 +413,10 @@ ProcessLock::ProcessLock(const std::filesystem::path& data_dir, bool pin_root)
     meta_path_ = lock_dir_ / "writer.meta";
     host_ = CurrentHostName();
 
-    // The path as given, so a symlinked root is refused rather than resolved.
-    if (pin_root) root_directory_ = std::make_unique<RootDirectoryOwner>(data_dir);
+    // A link at the root itself is followed once: the pin is the directory
+    // it reaches, and owner artifacts are reached only relative to the pin.
+    (void)pin_root;
+    root_directory_ = std::make_unique<RootDirectoryOwner>(data_dir);
     EnsureProcessLockDirectory(lock_dir_);
 
 #ifdef _WIN32
