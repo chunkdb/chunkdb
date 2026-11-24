@@ -162,7 +162,7 @@ Use [Transactions](../TRANSACTIONS.md) when you need a consistent view of one ta
 
 ## Table stats
 
-SHOW TABLE STATS needs READ on the table.
+SHOW TABLE STATS needs READ on the table, or MONITOR.
 `chunks` counts populated chunks, the ones SCAN CHUNKS lists; `loaded_chunks` counts the table's chunks held in the chunk cache.
 `files` and `disk_bytes` count the regular files under the table's directory and their sizes, WAL, images, feed archive and index files included.
 `slots` counts durable slots, lost ones included; `watches` counts open watches, slot watches included.

@@ -1,13 +1,17 @@
 // chunkdb_exporter as a process against a chunkdb_server process: flags,
 // login with the MONITOR right, scrapes, refusals, a server restart and TLS.
 // Usage: chunkdb_exporter_test <chunkdb_exporter> <chunkdb_server>
+#include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -62,7 +66,9 @@ int Connect(int port) {
     address.sin_port = htons(static_cast<std::uint16_t>(port));
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        const int error = errno;  // For the caller's message.
         close(fd);
+        errno = error;
         return -1;
     }
     return fd;
@@ -73,11 +79,14 @@ class Process {
   public:
     Process(const std::string& binary, std::vector<std::string> arguments, const std::filesystem::path& log)
         : log_(log) {
+        // Emptied before the fork: a restart that reuses `log` must not show the
+        // previous process's port to WaitListening.
+        const int out = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        assert(out >= 0);
         pid_ = fork();
         assert(pid_ >= 0);
         if (pid_ == 0) {
-            FILE* out = std::fopen(log.c_str(), "w");
-            if (out == nullptr || dup2(fileno(out), STDERR_FILENO) < 0 || dup2(fileno(out), STDOUT_FILENO) < 0) _exit(126);
+            if (dup2(out, STDERR_FILENO) < 0 || dup2(out, STDOUT_FILENO) < 0) _exit(126);
             arguments.insert(arguments.begin(), binary);
             std::vector<char*> argv;
             for (auto& argument : arguments) argv.push_back(argument.data());
@@ -85,8 +94,11 @@ class Process {
             execv(binary.c_str(), argv.data());
             _exit(127);
         }
+        close(out);
+        live_.push_back(this);
     }
     ~Process() {
+        live_.erase(std::remove(live_.begin(), live_.end(), this), live_.end());
         if (pid_ > 0) {
             kill(pid_, SIGKILL);
             (void)waitpid(pid_, nullptr, 0);
@@ -101,9 +113,8 @@ class Process {
         const auto deadline = Clock::now() + std::chrono::seconds(20);
         for (;;) {
             if (const auto port = chunkdb::test::LogLinePort(log_, message)) return *port;
-            int status = 0;
-            assert(waitpid(pid_, &status, WNOHANG) == 0);
-            assert(Clock::now() < deadline);
+            if (!Running() || Clock::now() >= deadline)
+                throw std::runtime_error("no log line \"" + message + "\" within 20 s" + Describe());
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
     }
@@ -124,7 +135,36 @@ class Process {
         return WEXITSTATUS(status);
     }
 
+    // Each live child: pid, state and the end of its log, for a failure message.
+    static std::string DescribeAll() {
+        std::string out;
+        for (const auto* process : live_) out += process->Describe();
+        return out;
+    }
+
   private:
+    // Whether the child has not exited; it is not reaped, so Stop and Wait
+    // still see its status.
+    [[nodiscard]] bool Running() const {
+        if (pid_ <= 0) return false;
+        siginfo_t info{};
+        return waitid(P_PID, static_cast<id_t>(pid_), &info, WEXITED | WNOHANG | WNOWAIT) == 0 && info.si_pid == 0;
+    }
+    [[nodiscard]] std::string Describe() const {
+        std::string state = "reaped";
+        if (pid_ > 0) {
+            siginfo_t info{};
+            if (waitid(P_PID, static_cast<id_t>(pid_), &info, WEXITED | WNOHANG | WNOWAIT) != 0) state = "unknown";
+            else if (info.si_pid == 0) state = "running";
+            else state = (info.si_code == CLD_EXITED ? "exited " : "killed by signal ") + std::to_string(info.si_status);
+        }
+        std::ifstream in(log_, std::ios::binary);
+        const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        return "\n--- pid=" + std::to_string(pid_) + " " + state + " log=" + log_.string() + "\n" +
+               text.substr(text.size() > 4000U ? text.size() - 4000U : 0U);
+    }
+
+    static inline std::vector<const Process*> live_;
     std::filesystem::path log_;
     pid_t pid_ = -1;
 };
@@ -132,7 +172,11 @@ class Process {
 // One HTTP exchange; the whole response.
 std::string Http(int port, const std::string& request) {
     const int fd = Connect(port);
-    assert(fd >= 0);
+    if (fd < 0) {
+        const int error = errno;
+        throw std::runtime_error("cannot connect to 127.0.0.1:" + std::to_string(port) + ": " +
+                                 std::strerror(error) + Process::DescribeAll());
+    }
     assert(send(fd, request.data(), request.size(), 0) == static_cast<ssize_t>(request.size()));
     std::string response;
     char buffer[4096];
@@ -399,15 +443,21 @@ void TestTls(const std::string& exporter, const std::string& server_binary) {
 int main(int argc, char** argv) {
     assert(argc == 3);
     signal(SIGPIPE, SIG_IGN);
-    TestFlags(argv[1]);
-    {
-        Fixture fixture;
-        fixture.exporter = argv[1];
-        fixture.server_binary = argv[2];
-        fixture.idle_timeout_ms = "500";
-        TestAgainstServer(fixture);
+    // A caught failure unwinds, so each Process destructor kills its child.
+    try {
+        TestFlags(argv[1]);
+        {
+            Fixture fixture;
+            fixture.exporter = argv[1];
+            fixture.server_binary = argv[2];
+            fixture.idle_timeout_ms = "500";
+            TestAgainstServer(fixture);
+        }
+        TestTls(argv[1], argv[2]);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAIL exporter: %s\n", error.what());
+        return 1;
     }
-    TestTls(argv[1], argv[2]);
     std::puts("exporter tests passed");
     return 0;
 }

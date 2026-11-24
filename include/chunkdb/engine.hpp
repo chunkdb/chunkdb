@@ -277,6 +277,9 @@ struct SessionState {
     // Server shutdown interrupts backup work, independent of client lifetime.
     std::stop_token backup_cancelled;
     std::string remote_address;
+    // The client's "[address]:port", as SHOW CONNECTIONS names it; set with
+    // remote_address.
+    std::string remote_endpoint;
     bool authenticated = false;
     std::size_t failed_auth_attempts = 0;
     bool close_after_reply = false;

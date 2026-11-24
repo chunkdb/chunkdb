@@ -1080,12 +1080,12 @@ void TestSlotStatements() {
     ExpectReply(f.Run("CREATE SLOT 'consumer' ON world"), "+OK\r\n");
     ExpectReply(f.Run("CREATE SLOT 'other' ON plain"), "+OK\r\n");
     const auto world = f.catalog->Find("world")->ListFeedSlots().front();
-    std::string expected = "*1\r\n%12\r\n$5\r\ntable\r\n$5\r\nworld\r\n$4\r\nname\r\n$8\r\nconsumer\r\n$5\r\nepoch\r\n$32\r\n";
+    std::string expected = "*1\r\n%14\r\n$5\r\ntable\r\n$5\r\nworld\r\n$4\r\nname\r\n$8\r\nconsumer\r\n$5\r\nepoch\r\n$32\r\n";
     expected += chunkdb::StoreIdHex(world.position.epoch);
     expected += "\r\n$5\r\nacked\r\n:" + std::to_string(world.position.revision);
     expected += "\r\n$8\r\nrevision\r\n:" + std::to_string(world.durable_watermark);
     expected += "\r\n$13\r\nlag_revisions\r\n:" + std::to_string(world.durable_watermark - world.position.revision);
-    expected += "\r\n$14\r\nretained_bytes\r\n:0\r\n$8\r\nattached\r\n#f\r\n$4\r\nlost\r\n#f\r\n";
+    expected += "\r\n$14\r\nretained_bytes\r\n:0\r\n$8\r\nattached\r\n#f\r\n$4\r\npeer\r\n_\r\n$11\r\nlast_ack_ms\r\n_\r\n$4\r\nlost\r\n#f\r\n";
     expected += "$11\r\nlost_reason\r\n_\r\n$7\r\nfilters\r\n%5\r\n$4\r\narea\r\n_\r\n$10\r\ncolumn_ids\r\n_\r\n$7\r\ncolumns\r\n_\r\n$9\r\nno_before\r\n#f\r\n$6\r\nchunks\r\n#f\r\n$5\r\nowner\r\n_\r\n";
     ExpectReply(f.Run("SHOW SLOTS ON world"), expected); // No user records no owner.
     ExpectReply(f.Run("CREATE SLOT 'owned' ON plain OWNER bot NO BEFORE"), "+OK\r\n");

@@ -463,6 +463,99 @@ std::size_t FeedEntryRetainedBytes(const FeedEntry& entry) {
     columns(entry.columns); columns(entry.chunk_columns);
     return bytes.total;
 }
+namespace {
+// RESP sizes as EncodeFeedEntry writes them: a number takes a prefix, its
+// digits and CRLF; a bulk string adds its length line.
+std::size_t Digits(std::uint64_t value) noexcept {
+    std::size_t digits = 1U;
+    for (; value >= 10U; value /= 10U) ++digits;
+    return digits;
+}
+std::size_t NumberBytes(std::uint64_t value) noexcept { return Digits(value) + 3U; }
+std::size_t SignedBytes(std::int64_t value) noexcept {
+    return value < 0 ? Digits(0U - static_cast<std::uint64_t>(value)) + 4U : NumberBytes(static_cast<std::uint64_t>(value));
+}
+std::size_t BulkBytes(std::size_t size) noexcept { return Digits(size) + size + 5U; }
+std::size_t ChunkItemBytes(std::uint8_t dims, const FeedChunkForm& chunk) noexcept {
+    return 4U + SignedBytes(chunk.chunk.x) + SignedBytes(chunk.chunk.y) + (dims == 3U ? SignedBytes(chunk.chunk.z) : 0U) +
+        NumberBytes(chunk.version) + (chunk.form ? BulkBytes(chunk.form->size()) : 3U);
+}
+// Everything but the chunk items, for a push with `count` chunks.
+std::size_t ChunksHeaderBytes(const FeedEntry& entry, std::size_t count) {
+    return 4U + BulkBytes(6U) + BulkBytes(StoreIdHex(entry.position.epoch).size()) + NumberBytes(entry.position.revision) +
+        NumberBytes(entry.commit_time_ms) + (entry.user ? BulkBytes(entry.user->size()) : 3U) +
+        NumberBytes(entry.schema_version) + NumberBytes(count) + 6U;
+}
+}
+std::size_t FeedChunksEncodedBytes(const FeedEntry& entry) {
+    if (entry.kind != FeedEntry::Kind::kChunks) throw std::logic_error("feed entry is not a chunks push");
+    std::size_t bytes = ChunksHeaderBytes(entry, entry.chunk_forms.size());
+    for (const auto& chunk : entry.chunk_forms) bytes += ChunkItemBytes(entry.dims, chunk);
+    return bytes;
+}
+bool FeedChunksMerge::Add(const std::shared_ptr<const FeedEntry>& entry, std::size_t limit) {
+    if (entry->kind != FeedEntry::Kind::kChunks) throw std::logic_error("only chunks pushes merge");
+    if (!newest_) {
+        const auto bytes = entry->protocol_frame ? entry->protocol_frame->size() : FeedChunksEncodedBytes(*entry);
+        if (bytes > limit) return false;
+        items_.clear();
+        item_bytes_ = 0U;
+        for (std::size_t i = 0U; i < entry->chunk_forms.size(); ++i) {
+            const auto item = ChunkItemBytes(entry->dims, entry->chunk_forms[i]);
+            items_[entry->chunk_forms[i].chunk] = {i, item};
+            item_bytes_ += item;
+        }
+        newest_ = entry;
+        return true;
+    }
+    if (entry->position.epoch != newest_->position.epoch || entry->position.revision <= newest_->position.revision ||
+        entry->dims != newest_->dims) throw std::logic_error("merged chunks pushes are out of order");
+    if (entry->schema_version != newest_->schema_version) return false;
+    // A push names each chunk once, so each replaced chunk is counted once.
+    auto bytes = item_bytes_;
+    auto count = items_.size();
+    for (const auto& chunk : entry->chunk_forms) {
+        bytes += ChunkItemBytes(entry->dims, chunk);
+        if (const auto found = items_.find(chunk.chunk); found != items_.end()) bytes -= found->second.bytes;
+        else ++count;
+    }
+    if (ChunksHeaderBytes(*entry, count) + bytes > limit) return false;
+    if (!merged_) {
+        merged_ = std::make_shared<FeedEntry>(*newest_);
+        merged_->protocol_frame.reset();
+    }
+    for (const auto& chunk : entry->chunk_forms) {
+        const auto item = ChunkItemBytes(entry->dims, chunk);
+        if (const auto found = items_.find(chunk.chunk); found != items_.end()) {
+            merged_->chunk_forms[found->second.index] = chunk;
+            found->second.bytes = item;
+        } else {
+            items_[chunk.chunk] = {merged_->chunk_forms.size(), item};
+            merged_->chunk_forms.push_back(chunk);
+        }
+    }
+    item_bytes_ = bytes;
+    merged_->position = entry->position;
+    merged_->commit_time_ms = entry->commit_time_ms;
+    merged_->user = entry->user;
+    newest_ = entry;
+    return true;
+}
+std::shared_ptr<const FeedEntry> FeedChunksMerge::Take() {
+    std::shared_ptr<const FeedEntry> result = newest_;
+    if (merged_) {
+        merged_->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*merged_));
+        result = std::move(merged_);
+    }
+    Clear();
+    return result;
+}
+void FeedChunksMerge::Clear() noexcept {
+    newest_.reset();
+    merged_.reset();
+    items_.clear();
+    item_bytes_ = 0U;
+}
 std::string EncodeFeedResync(FeedPosition position, const std::optional<TableLineage>& lineage) {
     std::string out = ">5\r\n";
     Protocol::AppendBulk(out, "resync"); Protocol::AppendBulk(out, StoreIdHex(position.epoch));

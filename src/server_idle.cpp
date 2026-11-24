@@ -704,6 +704,7 @@ bool IdleIo::Progress(ServerConnection& connection) {
     }
     if (connection.phase == Phase::kTls) {
         connection.session.remote_address = connection.peer_address;
+        connection.session.remote_endpoint = connection.peer_endpoint;
         { std::lock_guard lock(connection.record->mutex); connection.record->peer = connection.peer_endpoint; }
 #ifdef CHUNKDB_WITH_OPENSSL
         if (server_.config_.tls_enabled) {

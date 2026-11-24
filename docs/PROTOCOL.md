@@ -284,7 +284,7 @@ Slot progress cannot pass the durable frontier or changes not yet queued ahead o
 
 An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
 Slot pushes stop at the persisted durable frontier; see [durable slots](reference/FEED.md#notes) for ACK persistence and batching.
-SHOW SLOTS reports written `acked`, the durable `revision`, `lag_revisions`, retained bytes, `attached` and loss state.
+SHOW SLOTS reports written `acked`, the durable `revision`, `lag_revisions`, retained bytes, `attached`, the attached watch's `peer` and `last_ack_ms` (null without a watch), and loss state.
 CHUNKS pushes use `[chunks,epoch,revision,commit_time_ms,user,schema_version,chunks,tag,txn]`.
 A CHUNKS push of a commit that published a message appends `messages` after `txn`.
 Each chunk is `[cx,cy,version,form_or_null]` or `[cx,cy,cz,version,form_or_null]`; a null form represents deletion.
