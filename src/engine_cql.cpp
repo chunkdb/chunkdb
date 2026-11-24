@@ -23,6 +23,7 @@
 #include "chunkdb/engine.hpp"
 #include "chunkdb/protocol.hpp"
 #include "aggregate.hpp"
+#include "block_checks.hpp"
 #include "block_filter.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
@@ -464,6 +465,16 @@ void SetDefault(Column& column, const cql::Literal& literal) {
     return column;
 }
 
+// The check `definition` makes in `schema`; an unnamed one takes a name
+// from `column` (a column's own CHECK) or from the first column it reads.
+[[nodiscard]] CheckConstraint CheckFrom(
+    const cql::CheckDefinition& definition, const TableSchema& schema, std::string_view column = {}) {
+    CheckConstraint check{.name = definition.name.value_or(std::string{}), .expression = definition.expression};
+    if (!definition.name.has_value()) check.name = NewCheckName(schema, definition.expression, column);
+    else if (HasCheck(schema, check.name)) throw std::invalid_argument("the table already has a CHECK named " + check.name);
+    return check;
+}
+
 // The NULL, REQUIRED and DEFAULT column `attribute.column` of `schema` takes
 // after ALTER COLUMN (chunkdb::ChangeColumnAttributes checks the result).
 [[nodiscard]] Column AttributesFrom(const TableSchema& schema, const cql::AlterColumnAttribute& attribute) {
@@ -563,7 +574,8 @@ struct FileUsage {
         Protocol::AppendInteger(reply, second);
         if (info.geometry.dims == 3U) Protocol::AppendInteger(reply, third);
     };
-    Protocol::AppendMapHeader(reply, fenced != nullptr ? 11 : 10);
+    const auto& checks = info.schema.checks;
+    Protocol::AppendMapHeader(reply, 10U + (fenced != nullptr ? 1U : 0U) + (checks.empty() ? 0U : 1U));
     key("table");
     Protocol::AppendBulk(reply, info.name);
     key("version");
@@ -603,6 +615,17 @@ struct FileUsage {
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.geometry.dims));
     key("chunk_columns");
     Protocol::AppendColumns(reply, info.chunk_schema.columns);
+    if (!checks.empty()) {
+        key("checks");
+        Protocol::AppendArrayHeader(reply, checks.size());
+        for (const auto& check : checks) {
+            Protocol::AppendMapHeader(reply, 2);
+            key("name");
+            Protocol::AppendBulk(reply, check.name);
+            key("expression");
+            Protocol::AppendBulk(reply, check.expression);
+        }
+    }
     if (fenced != nullptr) {
         key("fenced");
         Protocol::AppendBulk(reply, *fenced);
@@ -758,12 +781,16 @@ void ForEachExpressionParameter(const BlockWritePlan& plan, Use&& use) {
            std::holds_alternative<cql::Cancel>(statement) || std::holds_alternative<cql::KillConnection>(statement);
 }
 
-[[nodiscard]] bool AllowedInTransaction(const cql::Statement& statement) {
+// A READ ONLY transaction runs no write and may scan: it keeps no read set,
+// so COMMIT has nothing to check.
+[[nodiscard]] bool AllowedInTransaction(const cql::Statement& statement, bool read_only) {
     if (SessionControl(statement)) return true;
-    return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::SetBlock>(statement) ||
-           std::holds_alternative<cql::DeleteBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
-           std::holds_alternative<cql::SetChunk>(statement) || std::holds_alternative<cql::GetArea>(statement) ||
-           std::holds_alternative<cql::Aggregate>(statement) ||
+    if (std::holds_alternative<cql::SetBlock>(statement) || std::holds_alternative<cql::DeleteBlock>(statement) ||
+        std::holds_alternative<cql::SetChunk>(statement))
+        return !read_only;
+    if (std::holds_alternative<cql::ScanChunks>(statement)) return read_only;
+    return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
+           std::holds_alternative<cql::GetArea>(statement) || std::holds_alternative<cql::Aggregate>(statement) ||
            std::holds_alternative<cql::Describe>(statement) || std::holds_alternative<cql::Ping>(statement) ||
            std::holds_alternative<cql::Begin>(statement) ||
            std::holds_alternative<cql::Commit>(statement) || std::holds_alternative<cql::Rollback>(statement);
@@ -961,6 +988,13 @@ TableDefinition DefinitionFrom(const cql::CreateTable& create, const TableOption
     };
     for (std::size_t i = 0; i < create.columns.size(); ++i)
         schema.columns.push_back(ColumnFrom(create.columns[i], static_cast<std::uint32_t>(i + 1U)));
+    // Column CHECKs in column order, then the table's; ValidateTableSchema
+    // checks each against the columns.
+    for (const auto& column : create.columns)
+        for (const auto& check : column.checks) schema.checks.push_back(CheckFrom(check, schema, column.name));
+    for (const auto& check : create.checks) schema.checks.push_back(CheckFrom(check, schema));
+    if (schema.checks.size() > kMaxChecksPerTable)
+        throw std::invalid_argument("a table has at most " + std::to_string(kMaxChecksPerTable) + " CHECK constraints");
     GeometryConfig geometry;
     geometry.chunk_width_blocks = create.chunk_width;
     geometry.chunk_height_blocks = create.chunk_height;
@@ -1303,10 +1337,15 @@ std::string CommandEngine::ExecuteStatement(
             }
             return reply;
         }
-        if (session.transaction != nullptr && !AllowedInTransaction(parsed.statement)) {
+        if (session.transaction != nullptr &&
+            !AllowedInTransaction(parsed.statement, session.transaction->read_only)) {
             return Protocol::Error(
                 "INVALID_ARGUMENT",
-                "inside a transaction only GET, SET and DELETE statements, AGGREGATE, DESCRIBE, PING, COMMIT and ROLLBACK run");
+                session.transaction->read_only
+                    ? "inside a READ ONLY transaction only GET statements, SCAN CHUNKS, AGGREGATE, DESCRIBE, PING, "
+                      "COMMIT and ROLLBACK run"
+                    : "inside a transaction only GET, SET and DELETE statements, AGGREGATE, DESCRIBE, PING, COMMIT and "
+                      "ROLLBACK run");
         }
         return std::visit(
             Overloaded{
@@ -1392,6 +1431,14 @@ std::string CommandEngine::ExecuteStatement(
                                 [&](const cql::RenameTable&) {
                                     // The parser refuses it inside MIGRATE.
                                     throw std::invalid_argument("MIGRATE cannot rename a table");
+                                },
+                                [&](const cql::AddCheck& add) {
+                                    request.add_check = [&add](const TableSchema& schema) { return CheckFrom(add.check, schema); };
+                                },
+                                [&](const cql::DropCheck& drop) {
+                                    if (drop.if_exists)
+                                        request.columns_if_needed = [&drop](const TableSchema& schema) { return HasCheck(schema, drop.name); };
+                                    request.alter = [&drop](StoreManifest& m) { m.schema = chunkdb::DropCheck(m.schema, drop.name); };
                                 }
                             }, alter.change);
                         },
@@ -1790,8 +1837,20 @@ std::string CommandEngine::ExecuteStatement(
                             const auto current_metadata = !state.written && geometry.chunk_columns_require_initialization()
                                 ? nullptr : state.chunk_columns;
                             if (!state.written && geometry.chunk_columns_require_initialization()) state.chunk_columns.reset();
+                            const auto* checks = geometry.checks();
+                            // The blocks before the statement, kept only to evaluate the changed ones.
+                            std::vector<std::uint8_t> payload;
+                            std::vector<std::uint8_t> presence;
+                            if (checks != nullptr) {
+                                payload = state.payload;
+                                presence = state.presence_bitmap;
+                            }
                             transform(state);
                             store.PrepareTxnChunkState(state, current_vars, current_metadata.get());
+                            // A failing block refuses the statement; COMMIT checks again.
+                            if (checks != nullptr)
+                                checks->RequireChanged(coord, state.payload, state.presence_bitmap, state.vars, payload,
+                                    presence, current_vars);
                             state.written = true;
                         });
                         return NullReply();
@@ -2146,6 +2205,16 @@ std::string CommandEngine::ExecuteStatement(
                                 std::stop_callback statement(StatementStopToken(), request_stop);
                                 catalog_->RenameTable(alter.table, rename.new_name, config_.users.get(), cancelled.get_token());
                             },
+                            [&](const cql::AddCheck& add) {
+                                // Only after evaluating it for every stored block.
+                                catalog_->AddCheck(alter.table, [&add](const TableSchema& current) { return CheckFrom(add.check, current); });
+                            },
+                            [&](const cql::DropCheck& drop) {
+                                (void)catalog_->ChangeColumnsIfNeeded(alter.table, [&drop](const TableSchema& current) -> std::optional<TableSchema> {
+                                    if (drop.if_exists && !HasCheck(current, drop.name)) return std::nullopt;
+                                    return chunkdb::DropCheck(current, drop.name);
+                                });
+                            },
                         },
                         alter.change);
                     return Protocol::SimpleString("OK");
@@ -2381,7 +2450,7 @@ std::string CommandEngine::ExecuteStatement(
                     catalog_->SwapTables(swap.first, swap.second, cancelled.get_token());
                     return Protocol::SimpleString("OK");
                 },
-                [&](const cql::Begin&) { return TxnBegin(session); },
+                [&](const cql::Begin& begin) { return TxnBegin(session, begin.read_only); },
                 [&](const cql::Commit&) {
                     command_class = MetricsRegistry::CommandClass::kConditional;
                     if (info != nullptr && session.transaction != nullptr) {
@@ -2403,7 +2472,12 @@ std::string CommandEngine::ExecuteStatement(
                         throw std::invalid_argument(
                             "LIMIT must be between 1 and " + std::to_string(kMaxChunkScanLimit));
                     }
-                    const auto lease = AcquireNamedTable(session, scan.table);
+                    // Inside a transaction (only READ ONLY runs SCAN) the page
+                    // reads the snapshot; SINCE follows the current changes.
+                    if (session.transaction != nullptr && scan.since)
+                        throw std::invalid_argument("SCAN CHUNKS SINCE does not run inside a transaction");
+                    const auto lease = session.transaction != nullptr ? TxnLease(session, scan.table)
+                                                                      : AcquireNamedTable(session, scan.table);
                     const auto& geometry = lease.store().geometry();
                     if (scan.after) RequireDimensions(geometry, scan.dims);
                     if (!scan.with_data && !scan.columns.empty())
@@ -2440,9 +2514,13 @@ std::string CommandEngine::ExecuteStatement(
                     }
                     ChunkIdentityScanPage page;
                     try {
-                        page = lease.store().ScanChunkIdentities(scan.after.has_value(), cursor,
-                            static_cast<std::size_t>(limit), scan.since, scan.with_data,
-                            scan_filter ? &*scan_filter : nullptr);
+                        page = session.transaction != nullptr
+                            ? lease.store().ScanChunkIdentitiesAt(*session.transaction->snapshot, scan.after.has_value(),
+                                  cursor, static_cast<std::size_t>(limit), scan.with_data,
+                                  scan_filter ? &*scan_filter : nullptr)
+                            : lease.store().ScanChunkIdentities(scan.after.has_value(), cursor,
+                                  static_cast<std::size_t>(limit), scan.since, scan.with_data,
+                                  scan_filter ? &*scan_filter : nullptr);
                     } catch (const TombstoneHistoryLostError& error) {
                         const auto floor = std::to_string(error.retained_deletion_floor());
                         const auto epoch = StoreIdHex(lease.store().store_id());
@@ -2756,11 +2834,12 @@ void CommandEngine::EndExpiredTransactions() {
     }
 }
 
-std::string CommandEngine::TxnBegin(SessionState& session) {
+std::string CommandEngine::TxnBegin(SessionState& session, bool read_only) {
     if (session.transaction != nullptr) {
         throw std::invalid_argument("a transaction is already open; COMMIT or ROLLBACK it first");
     }
     auto transaction = std::make_unique<SessionTransaction>(&txn_budget_, std::chrono::steady_clock::now());
+    transaction->read_only = read_only;
     EnterStatementDecision();
     session.transaction = std::move(transaction);
     return Protocol::SimpleString("OK");
@@ -2799,6 +2878,9 @@ Table::Lease CommandEngine::TxnLease(SessionState& session, const std::string& t
 }
 
 void CommandEngine::TxnRead(SessionTransaction& txn, std::span<const ChunkCoord> coords) const {
+    // COMMIT of a READ ONLY transaction checks no chunk: no read set, no
+    // read limit.
+    if (txn.read_only) return;
     const auto limit = catalog_->query_limits().txn_max_read_chunks;
     const auto too_many = [&] {
         throw std::invalid_argument(
@@ -3132,7 +3214,9 @@ std::string CommandEngine::TxnCommit(SessionState& session) {
     }
     // COMMIT ends the transaction whatever it answers.
     const std::unique_ptr<SessionTransaction> txn = std::move(session.transaction);
-    if (txn->snapshot == nullptr) {
+    // Every read of a READ ONLY transaction was consistent when it answered:
+    // COMMIT only ends it, as ROLLBACK does.
+    if (txn->snapshot == nullptr || txn->read_only) {
         return NullReply();
     }
     if (!txn->writes.empty()) {

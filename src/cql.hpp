@@ -194,12 +194,19 @@ struct Aggregate {
     std::shared_ptr<const expr::Expression> where;
 };
 
+// CHECK [name] (expr): the condition's text as written, trimmed.
+struct CheckDefinition {
+    std::optional<std::string> name;
+    std::string expression;
+};
 struct ColumnDefinition {
     std::string name;
     ColumnType type;
     bool nullable = false;
     bool required = false;
     std::optional<Literal> default_value;
+    // Block columns of CREATE TABLE only.
+    std::vector<CheckDefinition> checks{};
 };
 struct Option {
     std::string name;
@@ -223,6 +230,8 @@ struct CreateTable {
     std::uint32_t large_depth = 1;
     std::uint8_t dims = 2;
     std::vector<ColumnDefinition> chunk_columns;
+    // CHECK clauses after the columns.
+    std::vector<CheckDefinition> checks{};
 };
 struct AddColumn {
     ColumnDefinition column;
@@ -261,9 +270,19 @@ struct AlterColumnAttribute {
 struct RenameTable {
     std::string new_name;
 };
+// ADD CHECK [name] (expr), DROP CHECK [IF EXISTS] name.
+struct AddCheck {
+    CheckDefinition check;
+};
+struct DropCheck {
+    std::string name;
+    bool if_exists = false;
+};
 struct AlterTable {
     std::string table;
-    std::variant<AddColumn, DropColumn, RenameColumn, AlterColumnType, SetOption, AlterColumnAttribute, RenameTable> change;
+    std::variant<AddColumn, DropColumn, RenameColumn, AlterColumnType, SetOption, AlterColumnAttribute, RenameTable,
+        AddCheck, DropCheck>
+        change;
 };
 struct DropTable {
     std::string table;
@@ -381,7 +400,10 @@ struct GrantRight {
 };
 struct ShowUsers {};
 // Transactions (docs/design/TRANSACTIONS_DESIGN.md).
-struct Begin {};
+// BEGIN READ ONLY: reads only, without a read set (docs/reference/TRANSACTION_STATEMENTS.md).
+struct Begin {
+    bool read_only = false;
+};
 struct Commit {};
 struct Rollback {};
 // The populated chunks of table, ordered by every active coordinate axis.

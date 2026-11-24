@@ -73,7 +73,7 @@ A function is `COUNT(*)`, `SUM(column)`, `MIN(column)`, `MAX(column)` or `AVG(co
 | INVALID_ARGUMENT | A column is unknown, or holds no integer or float values. | Check DESCRIBE. |
 | INVALID_ARGUMENT | WHERE names an unknown column, mixes types, has a parameter with no column to take its type from or of the wrong size, or divides an integer by zero. | Check DESCRIBE and the condition. |
 | INVALID_ARGUMENT | The coordinates differ from the table's dims, or the selector covers more chunks than the limit. | Aggregate smaller areas and combine their results. |
-| INVALID_ARGUMENT | Inside a transaction, the selector would take the read set past `--txn-max-read-chunks`. | Aggregate a smaller area or commit first. |
+| INVALID_ARGUMENT | Inside a transaction other than BEGIN READ ONLY, the selector would take the read set past `--txn-max-read-chunks`. | Aggregate a smaller area or commit first. |
 | OUT_OF_RANGE | The reply exceeds the response limit, or an integer SUM or AVG leaves the 128-bit range: `sum(v) is outside the 128-bit integer range`, with `avg(v)` for AVG. | Aggregate a smaller area or fewer functions. |
 | OUT_OF_RANGE | Integer arithmetic in WHERE leaves the 128-bit range. | Change the condition. |
 
@@ -90,4 +90,5 @@ WHERE decodes the columns it names for every present block, so it costs more tha
 Outside a transaction, each chunk is read as it is when AGGREGATE reaches it, so writes during the statement can be counted in some chunks and not in others.
 Inside a [transaction](../TRANSACTIONS.md), AGGREGATE reads the transaction's snapshot and its own writes, and every requested chunk cell joins its read set, as with GET AREA.
 With WHERE, every requested cell still joins the read set, because a write to any block can change which blocks match.
+A [BEGIN READ ONLY](TRANSACTION_STATEMENTS.md) transaction reads its snapshot without a read set, so `--txn-max-read-chunks` does not bound it.
 A server started with `--read-only` runs AGGREGATE, with or without WHERE.

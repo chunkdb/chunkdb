@@ -259,6 +259,7 @@ As a page's first cell, or in a plain area, it is refused with `OUT_OF_RANGE rea
 `required` is the size of a reply holding only that chunk; read it with GET CHUNK or fewer COLUMNS, then continue AFTER its coordinate.
 A server started with `--max-area-response-bytes` of at least `required` returns that chunk in GET AREA.
 Independent pages can observe intervening writes; pages inside a transaction share its snapshot and private writes.
+SCAN CHUNKS runs inside a [BEGIN READ ONLY](TRANSACTION_STATEMENTS.md) transaction without SINCE: its pages list the chunks populated at the snapshot and report the snapshot's revision as `position`.
 
 An empty page still provides a continuation when requested cells remain:
 

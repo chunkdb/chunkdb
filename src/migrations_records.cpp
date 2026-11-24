@@ -205,6 +205,7 @@ bool ConditionalNoOp(const cql::Statement& statement) {
     if (const auto* alter = std::get_if<cql::AlterTable>(&statement)) {
         if (const auto* add = std::get_if<cql::AddColumn>(&alter->change)) return add->if_not_exists;
         if (const auto* drop = std::get_if<cql::DropColumn>(&alter->change)) return drop->if_exists;
+        if (const auto* drop = std::get_if<cql::DropCheck>(&alter->change)) return drop->if_exists;
     }
     return false;
 }
@@ -495,6 +496,8 @@ void ValidateMigrationJournal(const std::filesystem::path& root, const Migration
                 if (!exists(add->column.name, add->chunk_column)) Bad("conditional add no-op column is absent");
             } else if (const auto* drop = std::get_if<cql::DropColumn>(&alter->change)) {
                 if (exists(drop->column, drop->chunk_column)) Bad("conditional drop no-op column is present");
+            } else if (const auto* drop = std::get_if<cql::DropCheck>(&alter->change)) {
+                if (HasCheck(table->schema, drop->name)) Bad("conditional drop no-op check is present");
             }
         } else if (std::holds_alternative<cql::CreateSlot>(statement) || std::holds_alternative<cql::DropSlot>(statement)) {
             const auto relative = "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName);

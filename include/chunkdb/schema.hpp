@@ -4,8 +4,10 @@
 #include <cstdint>
 #include <optional>
 #include <span>
+#include <stdexcept>
 #include <string>
 #include <string_view>
+#include <utility>
 #include <variant>
 #include <vector>
 
@@ -38,6 +40,33 @@ inline constexpr std::uint32_t kMaxFixedBitsPerBlock = 65535;
 inline constexpr std::uint32_t kMaxVariableValueBytes = 16U * 1024U * 1024U;
 // A table has at most this many versions above 1 (docs/design/COLUMNS_DESIGN.md).
 inline constexpr std::uint64_t kMaxSchemaVersions = 65535;
+// CHECK constraints of a table, and the bytes of one's expression.
+inline constexpr std::size_t kMaxChecksPerTable = 64;
+inline constexpr std::size_t kMaxCheckExpressionBytes = 16384;
+
+// A CHECK constraint (docs/reference/TABLES.md): a condition over the block
+// columns and positions that every present block must not make false. NULL
+// (unknown) passes, as in SQL.
+struct CheckConstraint {
+    // Unique among the table's checks; the column-name rule.
+    std::string name;
+    // The condition's text (docs/design/EXPRESSIONS_DESIGN.md), without
+    // parameters, chunk columns, NOW() or EXISTS.
+    std::string expression;
+
+    friend bool operator==(const CheckConstraint&, const CheckConstraint&) = default;
+};
+
+// A block of a write or of stored data that makes a CHECK false.
+class CheckFailedError : public std::invalid_argument {
+  public:
+    CheckFailedError(std::string check, const std::string& message)
+        : std::invalid_argument(message), check_(std::move(check)) {}
+    [[nodiscard]] const std::string& check() const noexcept { return check_; }
+
+  private:
+    std::string check_;
+};
 
 struct Column {
     // Never reused within a table.
@@ -81,6 +110,10 @@ struct SchemaChange {
         // A block column's NULL, REQUIRED or DEFAULT changed; its id, name
         // and type did not.
         kChangeAttributes = 6,
+        // A CHECK constraint was added at `position` of the check list, or
+        // dropped from it; block columns only.
+        kAddCheck = 7,
+        kDropCheck = 8,
     };
     Kind kind = Kind::kAddColumn;
     // Index in the column list where the column was added, dropped, or is.
@@ -93,6 +126,8 @@ struct SchemaChange {
     // its values were converted.
     Column previous{};
     Conversion conversion = Conversion::kExact;
+    // kAddCheck and kDropCheck: the check added or dropped.
+    CheckConstraint check{};
 
     friend bool operator==(const SchemaChange&, const SchemaChange&) = default;
 };
@@ -108,11 +143,14 @@ struct SchemaStep {
 // A narrowing in progress (TableCatalog::NarrowColumn): while it lasts,
 // every write to the column must fit `type` too. With `not_null` it is a
 // DROP NULL check instead (TableCatalog::DropColumnNull): `type` is the
-// column's own, and no write may leave the column NULL.
+// column's own, and no write may leave the column NULL. With `check` it is
+// an ADD CHECK scan (TableCatalog::AddCheck): `column_id` is 0, and every
+// write must also pass that check.
 struct PendingNarrowing {
     std::uint32_t column_id = 0;
     ColumnType type{};
     bool not_null = false;
+    std::optional<CheckConstraint> check{};
 
     friend bool operator==(const PendingNarrowing&, const PendingNarrowing&) = default;
 };
@@ -127,6 +165,8 @@ struct TableSchema {
     std::vector<SchemaStep> history{};
     // Of the current version only.
     std::optional<PendingNarrowing> pending{};
+    // The CHECK constraints of this version; block columns only.
+    std::vector<CheckConstraint> checks{};
 
     friend bool operator==(const TableSchema&, const TableSchema&) = default;
 };
@@ -222,6 +262,30 @@ void ValidateColumnType(const Column& column);
 // column refuses NULL. WithoutPendingNarrowing ends one that failed.
 [[nodiscard]] TableSchema WithPendingNotNull(const TableSchema& schema, std::string_view name);
 [[nodiscard]] TableSchema DropColumnNull(const TableSchema& schema, std::string_view name);
+
+// CHECK constraints. ValidateCheck throws std::invalid_argument for a name
+// that breaks the column-name rule, a text over kMaxCheckExpressionBytes, a
+// condition that does not parse (the message of cql::ParseError), uses
+// parameters, chunk columns, NOW() or EXISTS, or does not plan against
+// `columns` (expr::PlanCondition).
+void ValidateCheck(const CheckConstraint& check, const std::vector<Column>& columns);
+// The block columns `check` reads, each once, in the order first read.
+[[nodiscard]] std::vector<std::string> CheckColumnNames(const CheckConstraint& check);
+// A name for an unnamed check: `<column>_check` for `column`, else for the
+// first column `expression` reads (else `check`), with `_2`, `_3`, ... when
+// another check of `schema` has it.
+[[nodiscard]] std::string NewCheckName(
+    const TableSchema& schema, const std::string& expression, std::string_view column = {});
+// The steps of an ADD CHECK scan (TableCatalog::AddCheck), as for a
+// narrowing: WithPendingCheck starts one, AddPendingCheck ends one whose
+// scan found no block failing it with the next version, which has the
+// check. WithoutPendingNarrowing ends one that failed.
+[[nodiscard]] TableSchema WithPendingCheck(const TableSchema& schema, CheckConstraint check);
+[[nodiscard]] TableSchema AddPendingCheck(const TableSchema& schema);
+// The next version with check `name` dropped. Throws std::invalid_argument
+// when the table has no check of that name.
+[[nodiscard]] TableSchema DropCheck(const TableSchema& schema, std::string_view name);
+[[nodiscard]] bool HasCheck(const TableSchema& schema, std::string_view name) noexcept;
 
 // The schema area of the table manifest (docs/STORAGE_FORMAT.md Section 1.2).
 [[nodiscard]] std::vector<std::uint8_t> EncodeTableSchema(const TableSchema& schema);

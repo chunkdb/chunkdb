@@ -48,6 +48,7 @@ Add RETURNING to SET BLOCK or DELETE BLOCK to receive the block before or after 
 
 AGGREGATE and SCAN CHUNKS take `WHERE condition` and keep only the present blocks for which the condition is true.
 SET BLOCK and DELETE BLOCK take `IF condition`, and SET BLOCK values may be computed from the block; see [Expressions](reference/EXPRESSIONS.md).
+A table's `CHECK (condition)` refuses every write that leaves a block for which it is false; see [Tables](reference/TABLES.md#checks).
 
 ```text
 condition := condition OR condition | condition AND condition | NOT condition | ( condition )

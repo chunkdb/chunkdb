@@ -195,6 +195,11 @@ struct StoreRuntimeStats {
     std::uint64_t background_queue_full_inline = 0;
     std::uint64_t background_queue_depth = 0;
     std::uint64_t compressed_checkpoint_images = 0;
+    // Chunk states writes copied for open transaction snapshots, their bytes,
+    // and the bytes of the states kept now (--txn-history-bytes).
+    std::uint64_t txn_history_copies = 0;
+    std::uint64_t txn_history_copied_bytes = 0;
+    std::uint64_t txn_history_bytes = 0;
 };
 
 // Random identity of a data directory, recorded in its manifest.
@@ -613,6 +618,8 @@ class TxnSnapshot {
 
     std::shared_ptr<TxnHistory> history_;
     std::uint64_t version_ = 0;
+    // When the snapshot's duration ends; set once at registration.
+    std::chrono::steady_clock::time_point deadline_{};
     // Guarded by the history's lock.
     bool registered_ = false;
     // Set when a limit unregistered the snapshot.
@@ -768,6 +775,10 @@ class ChunkStore {
     // populated chunk (TableCatalog::NarrowColumn, TableCatalog::DropColumnNull).
     [[nodiscard]] std::optional<std::string> FindValueNotFitting(
         std::uint32_t column_id, const ColumnType& type, bool refuse_null = false);
+    // The first present block the ADD CHECK in progress refuses, described
+    // as BlockChecks::FindPendingFailure does, or std::nullopt when none
+    // does. Reads every populated chunk (TableCatalog::AddCheck).
+    [[nodiscard]] std::optional<std::string> FindCheckFailure();
     // Whether memory, images or WALs contain any present block. Callers that
     // use the answer to change a schema must exclude concurrent writers.
     [[nodiscard]] bool HasPresentBlocks();
@@ -815,6 +826,16 @@ class ChunkStore {
     [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentities(
         bool has_cursor, ChunkCoord cursor, std::size_t limit,
         std::optional<std::uint64_t> since = {}, bool with_data = false,
+        const ChunkScanFilter* filter = nullptr);
+    // ScanChunkIdentities as of a snapshot: the chunks populated at the
+    // snapshot, with their state and version then, also those a later write
+    // emptied; `position` is the snapshot's revision. It first waits for the
+    // writes the snapshot includes, so the coordinate index lists their
+    // chunks: past the snapshot's duration it throws TransactionConflictError,
+    // and a stopped statement ends the wait. Throws std::invalid_argument for
+    // another store's snapshot, and as the snapshot reads do.
+    [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentitiesAt(const TxnSnapshot& snapshot,
+        bool has_cursor, ChunkCoord cursor, std::size_t limit, bool with_data = false,
         const ChunkScanFilter* filter = nullptr);
     // With `with_vars`, each entry carries its text and bytes values, and
     // they count toward the response-byte limit.
@@ -1639,6 +1660,13 @@ class ChunkStore {
     void PrepareCoordinateIndex();
     void InitializeCoordinateIndex();
     [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> CoordinateIndexForScan();
+    // ScanChunkIdentities, or ScanChunkIdentitiesAt with `snapshot`.
+    [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentitiesImpl(const TxnSnapshot* snapshot, bool has_cursor,
+        ChunkCoord cursor, std::size_t limit, std::optional<std::uint64_t> since, bool with_data,
+        const ChunkScanFilter* filter);
+    // Waits until every write the snapshot includes has completed (see
+    // ScanChunkIdentitiesAt).
+    void WaitForTxnSnapshotWrites(const TxnSnapshot& snapshot);
     [[nodiscard]] std::optional<ChunkIndexRecord> RetainedEmptyBoundaryForArchive(const ChunkCoord& coord);
     [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> RetainedIndexForSnapshot();
     // Before a loaded chunk can append, drops what replay could not use: the
@@ -1910,7 +1938,10 @@ class ChunkStore {
         const std::vector<ColumnAssignment>& values, std::optional<std::uint64_t> expected_version);
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlockAtAddress(const ChunkCoord& coord, std::size_t index);
     [[nodiscard]] BlockReadMetadata GetBlockWithVersionAtAddress(const ChunkCoord& coord, std::size_t index);
-    void SetBlockInStateAtIndex(ChunkState& state, std::size_t index, const std::vector<ColumnAssignment>& values) const;
+    // With `coord`, the table has checks: the block must pass them, and a
+    // block that fails leaves `state` as it was.
+    void SetBlockInStateAtIndex(ChunkState& state, std::size_t index, const std::vector<ColumnAssignment>& values,
+        const std::optional<ChunkCoord>& coord) const;
     void UnsetBlockInStateAtIndex(ChunkState& state, std::size_t index) const;
     [[nodiscard]] std::optional<std::vector<ColumnValue>> BlockInStateAtIndex(const ChunkState& state, std::size_t index) const;
     // This thread's BlockWrite, emptied.
@@ -1926,6 +1957,11 @@ class ChunkStore {
     BlockWrite& PrepareUnsetBlockWrite(std::size_t block_index) const;
     // Applies `write` to a state outside the store.
     void ApplyBlockWriteToState(ChunkState& state, std::size_t block_index, BlockWrite& write, bool present) const;
+    // Writes the fixed-width values and validity bits of `write` into
+    // `payload`.
+    static void WriteEditsToPayload(std::vector<std::uint8_t>& payload, std::size_t block_index, const BlockWrite& write);
+    // This thread's buffer for bytes a write puts back.
+    static std::vector<std::uint8_t>& ThreadSavedBytes();
     // Writes `write` and the block's presence as one WAL frame, or changes
     // nothing when it throws. Called with the chunk's mutex held. The write
     // issues its commit time, or takes the one a computed write read as
@@ -2000,7 +2036,7 @@ class ChunkStore {
         const TxnSnapshot& snapshot,
         const ChunkCoord& chunk_coord,
         bool with_vars,
-        ChunkRangeEntry* entry);
+        ChunkRangeEntry* entry, bool with_payload = true);
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkAreaEntriesImpl(
         const ChunkAreaSelector& selector, bool with_vars,
         const TxnSnapshot* snapshot, const TxnAreaRead* txn_read);
