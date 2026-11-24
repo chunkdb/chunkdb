@@ -158,6 +158,9 @@ struct SessionTransaction {
     // budget->mutex.
     bool in_statement = false;
     std::chrono::steady_clock::time_point started;
+    // BEGIN READ ONLY: writes are refused, reads keep no read set, and COMMIT
+    // only ends it.
+    bool read_only = false;
     // The table of the first statement and the snapshot it took; empty
     // before.
     std::string table{};
@@ -469,7 +472,7 @@ class CommandEngine {
     [[nodiscard]] std::string HandleMetrics() const;
 
     // Transactions (engine_cql.cpp, docs/design/TRANSACTIONS_DESIGN.md).
-    [[nodiscard]] std::string TxnBegin(SessionState& session);
+    [[nodiscard]] std::string TxnBegin(SessionState& session, bool read_only);
     [[nodiscard]] std::string TxnCommit(SessionState& session);
     // The conflict a transaction past --txn-max-duration-ms ends with.
     [[nodiscard]] TransactionConflictError TxnDurationConflict() const;

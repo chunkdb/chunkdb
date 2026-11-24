@@ -180,6 +180,26 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                         throw FeedSlotFiltersError("feed slot owner differs from existing slot");
                     no_op = request.kind == MigrationRequest::Kind::kCreateSlot ? exists : !exists;
                 }
+                if (!no_op && request.kind == MigrationRequest::Kind::kAlter && request.add_check) {
+                    // An ADD CHECK evaluates every stored block first.
+                    operations.lock();
+                    if (already_applied()) return false;
+                    operations.unlock();
+                    narrowing_recorded = !table->Info().schema.pending.has_value();
+                    std::string check_name;
+                    RewriteManifest(
+                        *table, previous,
+                        [&](StoreManifest* manifest) {
+                            auto check = request.add_check(manifest->schema);
+                            check_name = check.name;
+                            manifest->schema = WithPendingCheck(manifest->schema, std::move(check));
+                        },
+                        "CHUNKDB_FAILPOINT_NARROW_PENDING_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+                    scanned_schema = table->Info().schema;
+                    if (const auto failure = ScanNarrowing(*table))
+                        throw CheckFailedError(check_name,
+                            "cannot add CHECK " + check_name + ": " + *failure + "; change or delete that block first");
+                }
                 if (!no_op && request.kind == MigrationRequest::Kind::kAlter && (request.narrowing || request.drop_null)) {
                     // A narrowing or a DROP NULL check.
                     const std::string column_name = request.narrowing ? request.narrowing->first : *request.drop_null;
@@ -332,6 +352,11 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     if (!narrowing_recorded || manifest->schema != scanned_schema)
                         throw std::runtime_error("table '" + request.table + "' changed during the DROP NULL check");
                     manifest->schema = chunkdb::DropColumnNull(manifest->schema, *request.drop_null);
+                } else if (request.add_check) {
+                    // The scan evaluated the blocks of this schema only.
+                    if (!narrowing_recorded || manifest->schema != scanned_schema)
+                        throw std::runtime_error("table '" + request.table + "' changed during the ADD CHECK scan");
+                    manifest->schema = AddPendingCheck(manifest->schema);
                 } else request.alter(*manifest);
                 AlignManifestSchemaDomains(&*manifest, previous_schema, previous_chunk_schema);
                 RequireCompatibleColumnAdditions(previous_schema, manifest->schema, *store);

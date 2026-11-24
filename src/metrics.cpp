@@ -378,6 +378,15 @@ std::string MetricsRegistry::RenderPrometheus(
          &StoreRuntimeStats::empty_chunk_gcs},
         {"chunkdb_unique_loaded_chunks_total", "counter", "Chunk loads into the cache.",
          &StoreRuntimeStats::unique_loaded_chunks},
+        {"chunkdb_txn_history_bytes", "gauge",
+         "Bytes, with bookkeeping overhead, of the chunk states kept for open transaction snapshots.",
+         &StoreRuntimeStats::txn_history_bytes},
+        {"chunkdb_txn_history_copies_total", "counter",
+         "Chunk states writes copied to keep open transaction snapshots.",
+         &StoreRuntimeStats::txn_history_copies},
+        {"chunkdb_txn_history_copied_bytes_total", "counter",
+         "Bytes, with bookkeeping overhead, of the chunk states writes copied to keep open transaction snapshots.",
+         &StoreRuntimeStats::txn_history_copied_bytes},
     };
     std::vector<std::string> table_labels;
     table_labels.reserve(tables.size());

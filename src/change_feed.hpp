@@ -1,12 +1,14 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <mutex>
 #include <optional>
 #include <set>
 #include <span>
+#include <stop_token>
 #include <thread>
 
 #include "chunkdb/change_feed.hpp"
@@ -239,6 +241,13 @@ class FeedProducerRegistry : public std::enable_shared_from_this<FeedProducerReg
     ~FeedProducerRegistry();
     [[nodiscard]] bool Completed(std::atomic<std::uint64_t>& clock, std::uint64_t through) const;
     [[nodiscard]] std::uint64_t CompletedFrontier(const std::atomic<std::uint64_t>& clock) const;
+    // Waits until Completed(clock, through), `deadline` passes or `stopped`
+    // is requested; returns whether the writes completed. Writers wake it
+    // only while a waiter is counted: one load when there is none.
+    [[nodiscard]] bool WaitCompleted(std::atomic<std::uint64_t>& clock, std::uint64_t through,
+        std::chrono::steady_clock::time_point deadline, std::stop_token stopped);
+    // After a producer cleared its bound.
+    void NotifyCompletionWaiters() noexcept;
   private:
     friend class ChangeFeed;
     friend class FeedWriteGuard;
@@ -248,6 +257,9 @@ class FeedProducerRegistry : public std::enable_shared_from_this<FeedProducerReg
     const std::uint64_t id_;
     std::atomic<ChangeFeed::Producer*> head_{nullptr};
     std::atomic<FeedTestHook*> hook_{nullptr};
+    std::atomic<std::uint32_t> completion_waiters_{0U};
+    std::mutex completion_mutex_;
+    std::condition_variable_any completion_cv_;
 };
 
 // Every mutation publishes its own producer bound through postcommit work.
@@ -309,6 +321,7 @@ class FeedWriteGuard {
     bool ResizeBuffer(std::vector<std::uint8_t>& target, std::size_t size);
     bool CopyBuffer(std::vector<std::uint8_t>& target, std::span<const std::uint8_t> source);
     void Publish() noexcept;
+    FeedProducerRegistry* registry_ = nullptr;
     ChangeFeed::Producer* producer_ = nullptr;
     ChangeFeed::Producer::WriteContext* state_ = nullptr;
 };

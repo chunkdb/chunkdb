@@ -27,13 +27,24 @@ OK
 - Your first table statement chooses the snapshot and the transaction's single table.
 - Reads see that snapshot and your own pending writes.
 - Other connections see none of your changes before COMMIT.
-- COMMIT checks every chunk you read or wrote for intervening changes.
+- COMMIT checks every chunk you read or wrote for intervening changes, except in a read-only transaction.
 - A successful COMMIT survives a crash in every durability mode.
 - A conflict applies none of your transaction's writes; retry the complete operation.
 
 Plain GET AREA reads chunks separately and can see a partially observed multi-chunk commit.
 Use a transaction when those chunks must share one consistent view.
-A read-only transaction can commit while its snapshot remains valid.
+A transaction that only reads can commit while its snapshot remains valid.
+
+## Read-only transactions
+
+`BEGIN READ ONLY` reads one snapshot of a table with GET, AGGREGATE and SCAN CHUNKS, and refuses writes.
+It keeps no read set, so `--txn-max-read-chunks` does not bound it and COMMIT, like ROLLBACK, only ends it.
+`--txn-max-duration-ms` and `--txn-history-bytes` bound it as any transaction.
+
+While a snapshot is open, a write copies the state of the chunk it changes and keeps the copy while an older open snapshot needs it.
+Without an open snapshot writes copy nothing.
+`chunkdb_txn_history_copies_total` and `chunkdb_txn_history_copied_bytes_total` in SHOW METRICS count these copies and their bytes, bookkeeping included, and `chunkdb_txn_history_bytes` is what is kept now, each per table with a `table` label.
+A long scan beside heavy writes therefore costs memory up to `--txn-history-bytes` per table, after which the oldest transaction ends with CONFLICT reason=history_limit.
 
 ## Limits
 
@@ -41,7 +52,7 @@ A read-only transaction can commit while its snapshot remains valid.
 | --- | --- |
 | Duration from BEGIN | 5000 ms, `--txn-max-duration-ms` |
 | Written chunks | 1024, `--txn-max-written-chunks` |
-| Read chunks | 8192, `--txn-max-read-chunks` |
+| Read chunks, except READ ONLY | 8192, `--txn-max-read-chunks` |
 | Private written chunks per transaction | 16777216 bytes, `--txn-max-bytes` |
 | Private written chunks across transactions | 268435456 bytes, `--txn-total-bytes` |
 | Earlier chunk states per table | 67108864 bytes, `--txn-history-bytes` |

@@ -58,6 +58,7 @@ That owner must reserve and charge every variable-section materialization and re
 It must retain those charges until the corresponding prepared or undo memory is released, rather than exempting it as existing storage.
 It also captures and reserves any current-chunk before state required by registered snapshots before the first in-place edit.
 All fixed-byte, presence and variable undo must then be prepared, nonallocating and nonthrowing, and failure must restore every earlier applied row before releasing any commit lock.
+Row assignment does not evaluate CHECK constraints: the owner that applies these rows must evaluate the checks for every row it changes under the commit locks, as `CommitTransaction` does for whole chunk states, before the first in-place edit.
 No physical application API is exposed by this foundation, so a valid sparse plan cannot stand in for that missing admission and rollback owner.
 
 An explicit chunk or area operation promotes its affected chunks to the snapshot's whole producing-revision dependency.
