@@ -10,6 +10,7 @@
 #include <utility>
 #include <vector>
 
+#include "block_checks.hpp"
 #include "chunk_store_internal.hpp"
 #include "statement_control.hpp"
 #include "checkpoint.hpp"
@@ -50,6 +51,9 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     RequireVarWrite(chunk->vars, var_update, chunk_columns ? chunk_columns->variable_bytes : 0U,
         chunk->written && chunk->chunk_columns ? chunk->chunk_columns->variable_bytes : 0U);
     RequirePendingFits(new_payload, new_presence);
+    if (const auto* checks = geometry_.checks())
+        checks->RequireChangedAfter(
+            chunk_coord, new_payload, new_presence, var_update, chunk->payload, chunk->presence_bitmap, chunk->vars);
     // A WAL whose failed write or transaction could not be repaired takes
     // nothing more until a restart repairs it.
     if (chunk->wal_repair_failed) {

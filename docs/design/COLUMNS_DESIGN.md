@@ -49,6 +49,7 @@ Writer restart removes an interrupted narrowing constraint without committing it
 A restore of a backup that caught the constraint removes it from the restored table the same way.
 ALTER COLUMN SET or DROP DEFAULT, SET NULL and SET or DROP REQUIRED publish one attribute change, which records the column before it; existing values stay, and a column added earlier still takes the DEFAULT of its own version.
 DROP NULL is a narrowing of nullability: its temporary constraint refuses NULL writes to the column while stored values are checked, and the first NULL found refuses the change with its block.
+ADD CHECK works the same way: its temporary constraint is the check, evaluated for every write while every stored block is evaluated, and the first block that fails refuses it; CHECK constraints are stored per schema version and planned once per version, so a table without them evaluates nothing on writes.
 SET REQUIRED needs no check: existing blocks of a column that is not NULL always hold a value, and REQUIRED applies to new blocks.
 
 ## Wire form

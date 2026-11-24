@@ -581,6 +581,11 @@ class TableCatalog {
     // leave the column NULL are refused while the check lasts, and a NULL
     // found makes std::invalid_argument name its block.
     void DropColumnNull(std::string_view name, std::string_view column);
+    // ALTER TABLE ... ADD CHECK: adds the check `check` makes from the
+    // current schema after evaluating it for every stored block as
+    // NarrowColumn checks values; writes that fail it are refused while the
+    // scan lasts, and a block that fails it makes CheckFailedError name it.
+    void AddCheck(std::string_view name, const std::function<CheckConstraint(const TableSchema&)>& check);
     // ALTER TABLE ... RENAME TO (docs/design/RESTORE_TABLE.md): waits for
     // running commands and backup pins, makes acknowledged writes durable,
     // closes the table, renames its directory without replacing anything and

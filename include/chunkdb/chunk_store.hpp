@@ -779,6 +779,10 @@ class ChunkStore {
     // populated chunk (TableCatalog::NarrowColumn, TableCatalog::DropColumnNull).
     [[nodiscard]] std::optional<std::string> FindValueNotFitting(
         std::uint32_t column_id, const ColumnType& type, bool refuse_null = false);
+    // The first present block the ADD CHECK in progress refuses, described
+    // as BlockChecks::FindPendingFailure does, or std::nullopt when none
+    // does. Reads every populated chunk (TableCatalog::AddCheck).
+    [[nodiscard]] std::optional<std::string> FindCheckFailure();
     // Whether memory, images or WALs contain any present block. Callers that
     // use the answer to change a schema must exclude concurrent writers.
     [[nodiscard]] bool HasPresentBlocks();
@@ -1949,7 +1953,10 @@ class ChunkStore {
         const std::vector<ColumnAssignment>& values, std::optional<std::uint64_t> expected_version);
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlockAtAddress(const ChunkCoord& coord, std::size_t index);
     [[nodiscard]] BlockReadMetadata GetBlockWithVersionAtAddress(const ChunkCoord& coord, std::size_t index);
-    void SetBlockInStateAtIndex(ChunkState& state, std::size_t index, const std::vector<ColumnAssignment>& values) const;
+    // With `coord`, the table has checks: the block must pass them, and a
+    // block that fails leaves `state` as it was.
+    void SetBlockInStateAtIndex(ChunkState& state, std::size_t index, const std::vector<ColumnAssignment>& values,
+        const std::optional<ChunkCoord>& coord) const;
     void UnsetBlockInStateAtIndex(ChunkState& state, std::size_t index) const;
     [[nodiscard]] std::optional<std::vector<ColumnValue>> BlockInStateAtIndex(const ChunkState& state, std::size_t index) const;
     // This thread's BlockWrite, emptied.
@@ -1965,6 +1972,11 @@ class ChunkStore {
     BlockWrite& PrepareUnsetBlockWrite(std::size_t block_index) const;
     // Applies `write` to a state outside the store.
     void ApplyBlockWriteToState(ChunkState& state, std::size_t block_index, BlockWrite& write, bool present) const;
+    // Writes the fixed-width values and validity bits of `write` into
+    // `payload`.
+    static void WriteEditsToPayload(std::vector<std::uint8_t>& payload, std::size_t block_index, const BlockWrite& write);
+    // This thread's buffer for bytes a write puts back.
+    static std::vector<std::uint8_t>& ThreadSavedBytes();
     // Writes `write` and the block's presence as one WAL frame, or changes
     // nothing when it throws. Called with the chunk's mutex held. The write
     // issues its commit time, or takes the one a computed write read as

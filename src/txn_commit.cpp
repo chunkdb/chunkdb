@@ -15,6 +15,7 @@
 
 #include "checkpoint.hpp"
 #include "statement_control.hpp"
+#include "block_checks.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
@@ -569,6 +570,11 @@ std::uint64_t ChunkStore::CommitTransaction(
             write.state.vars == chunk.vars && same_metadata && (!write.state.written || chunk.written)) {
             continue;
         }
+        // Under the locks, against the chunk the transaction read: only the
+        // blocks it changed are evaluated, and nothing is written yet.
+        if (const auto* checks = geometry_.checks())
+            checks->RequireChanged(target.coord, write.state.payload, write.state.presence_bitmap, write.state.vars,
+                chunk.payload, chunk.presence_bitmap, chunk.vars);
         changes.push_back(Change{.target = &target, .write = &write});
     }
     if (changes.empty()) {
