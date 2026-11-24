@@ -6,6 +6,7 @@
 #include <sys/wait.h>
 #endif
 
+#include "migrations_records.hpp"
 #include "restore_table_test_utils.hpp"
 #include "txn_test_utils.hpp"
 
@@ -158,6 +159,49 @@ void RenameCrashes(const std::string& executable) {
     }
 }
 
+
+
+// DROP TABLE and RENAME TO with grants on the table stop after the grant
+// journal, after the directory move and around the users write; the next
+// start serves the table with its grants, or the change whole: no table and
+// no grants after a drop, both under the new name after a rename.
+void GrantCrashes(const std::string& executable) {
+    const std::array<std::string, 4U> common{"CHUNKDB_FAILPOINT_CRASH_MIGRATION_FILE_0_BEFORE_PUBLISH_ONCE",
+        "CHUNKDB_FAILPOINT_CRASH_MIGRATION_FILE_0_AFTER_PUBLISH_ONCE",
+        "CHUNKDB_FAILPOINT_CRASH_MIGRATION_BEFORE_PENDING_REMOVE_ONCE", ""};
+    for (const bool rename : {false, true}) {
+        std::vector<std::string> points{rename ? "CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_JOURNAL_ONCE"
+                                               : "CHUNKDB_FAILPOINT_CRASH_TABLE_DROP_AFTER_JOURNAL_ONCE",
+            rename ? "CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_RENAME_ONCE" : "CHUNKDB_FAILPOINT_CRASH_TABLE_DROP_AFTER_RENAME_ONCE"};
+        if (rename) points.push_back("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_SYNC_ONCE");
+        for (const auto& point : common) if (!point.empty()) points.push_back(point);
+        for (const auto& point : points) {
+            Source source;
+            {
+                TableCatalog catalog(source.Config());
+                OpenUsers(source.data)->Grant("admin", "t", Right::kWrite);
+            }
+            assert(Child(executable, {rename ? "--rename-grants-child" : "--drop-grants-child", source.data.string(), point}) == 86);
+            const bool before_move = point.find("AFTER_JOURNAL") != std::string::npos;
+            {
+                TableCatalog catalog(source.Config());
+                assert(!ReadMigrationJournal(source.data));
+                const auto users = OpenUsers(source.data);
+                const std::string name = before_move ? "t" : rename ? "t_old" : "";
+                if (name.empty()) {
+                    assert(catalog.Find("t") == nullptr && catalog.TableCount() == 0U);
+                } else {
+                    assert(catalog.Require(name)->store_id() == source.epoch && catalog.TableCount() == 1U);
+                    assert(GrantOn(source.data, name) == Right::kWrite);
+                }
+                // Nothing names a table that is not there.
+                for (const auto* other : {"t", "t_old"})
+                    if (other != name) assert(!GrantOn(source.data, other));
+            }
+            Verified(source.data);
+        }
+    }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -165,6 +209,14 @@ int main(int argc, char** argv) {
         TableCatalog catalog(ChildConfig(argv[2], argv[5]));
         txn_test::ScopedEnv point(argv[4], "1");
         (void)catalog.RestoreTable(TableRestoreRequest{.backup = argv[3], .table = "t", .name = "t_restored"});
+        return 3;
+    }
+    if (argc == 4 && (std::string_view(argv[1]) == "--drop-grants-child" || std::string_view(argv[1]) == "--rename-grants-child")) {
+        TableCatalog catalog(ChildConfig(argv[2], "relaxed"));
+        const auto users = OpenUsers(argv[2]);
+        txn_test::ScopedEnv point(argv[3], "1");
+        if (std::string_view(argv[1]) == "--drop-grants-child") catalog.Drop("t", users.get(), false);
+        else catalog.RenameTable("t", "t_old", users.get());
         return 3;
     }
     if (argc == 5 && std::string_view(argv[1]) == "--rename-child") {
@@ -182,6 +234,7 @@ int main(int argc, char** argv) {
         return 3;
     }
     Crashes(argv[0]);
+    GrantCrashes(argv[0]);
     RenameCrashes(argv[0]);
 #ifdef _WIN32
     // Windows refuses SWAP TABLES before it closes anything.
@@ -190,9 +243,9 @@ int main(int argc, char** argv) {
     constexpr bool kAtomicExchange = true;
 #endif
     if (!kAtomicExchange) {
-        std::cout << "16 restore table and 6 rename table crash cases passed\n";
+        std::cout << "16 restore table, 6 rename table and 11 grant crash cases passed\n";
         return 0;
     }
     SwapCrashes(argv[0]);
-    std::cout << "16 restore table, 6 rename table and 6 swap tables crash cases passed\n";
+    std::cout << "16 restore table, 6 rename table, 11 grant and 6 swap tables crash cases passed\n";
 }

@@ -29,7 +29,7 @@ data_dir/
   chunkdb.manifest                    data-directory identity, features, version floor
   chunkdb.users                       user verifiers and grants, when authentication is configured
   chunkdb.migrations                  completed named migration records, when present
-  chunkdb.migration.pending           decided migration awaiting completion, when present
+  chunkdb.migration.pending           decided migration, or DROP TABLE or RENAME TO grant change, awaiting completion, when present
   .chunkdb.lock/                      writer-process lock
   .chunkdb.staging/                    table creation and restore staging
   .chunkdb.dropped/                    tables renamed out of the catalog
@@ -601,6 +601,18 @@ Writer recovery validates every participant before changing any.
 
 Current bytes must equal before or after bytes, and prepared CREATE must match its image.
 A directory move must have exactly one expected identity at its two names.
+
+DROP TABLE and ALTER TABLE ... RENAME TO outside MIGRATE use format version 2 for the grant change, written only when the users file holds grants the change alters:
+
+1. `CKMJ`, version `2:u16`, reserved zero `u16`, data-directory ID (16 bytes); no record.
+2. Directory action `u8` (2 drop, 3 rename), table length `u32` and name, table StoreId (16 bytes), operation-name length `u32` and name: `<table>.<16 lowercase hex digits>` under `.chunkdb.dropped/` for a drop, the new table name for a rename.
+3. Participant count `u32` (0–5): only `chunkdb.users`, with its before-image, encoded as in version 1.
+4. CRC32 over all preceding bytes.
+
+It needs no `migrations` feature and has no ledger. A build that reads only version 1 refuses it and does not open the directory.
+The journal is synced before the directory move, and the move, not the journal, commits the operation; the table directory and the moved name must hold exactly one table of the journal's identity.
+After the move and its directory sync, the users are published and written and the journal is removed; a failure before the move removes the journal, a failure after it fences the catalog until restart.
+Writer recovery completes a version-2 journal whose table directory is gone and removes one whose table directory is still in place, before it removes interrupted drops.
 Recovery redoes exact images rather than executing statement text; read-only and multi-process opening refuse pending recovery.
 Malformed, foreign, or inconsistent journal state refuses opening without partial completion.
 

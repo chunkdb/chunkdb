@@ -72,10 +72,11 @@ void PutRecord(Bytes& out, const MigrationRecord& record) {
 
 class Reader {
   public:
-    Reader(const Bytes& bytes, const std::array<std::uint8_t, 4>& magic, std::size_t limit) : bytes_(bytes) {
+    Reader(const Bytes& bytes, const std::array<std::uint8_t, 4>& magic, std::size_t limit, std::uint16_t version = 1U)
+        : bytes_(bytes) {
         if (bytes.size() < 12U || bytes.size() > limit) Bad("file size");
         end_ = bytes.size() - 4U;
-        if (!std::equal(magic.begin(), magic.end(), bytes.begin()) || ReadLe16(bytes, 4U) != 1U ||
+        if (!std::equal(magic.begin(), magic.end(), bytes.begin()) || ReadLe16(bytes, 4U) != version ||
             ReadLe16(bytes, 6U) != 0U) Bad("magic, version or reserved field");
         if (ReadLe32(bytes, end_) != Crc32(bytes.data(), end_)) Bad("checksum");
     }
@@ -111,8 +112,8 @@ class Reader {
     std::size_t end_ = 0;
 };
 
-Bytes Header(const std::array<std::uint8_t, 4>& magic) {
-    Bytes bytes(magic.begin(), magic.end()); WriteLe16(bytes, 1U); WriteLe16(bytes, 0U); return bytes;
+Bytes Header(const std::array<std::uint8_t, 4>& magic, std::uint16_t version = 1U) {
+    Bytes bytes(magic.begin(), magic.end()); WriteLe16(bytes, version); WriteLe16(bytes, 0U); return bytes;
 }
 void Finish(Bytes& bytes, std::size_t limit) {
     if (bytes.size() > limit - 4U) Bad("file size");
@@ -210,7 +211,42 @@ bool ConditionalNoOp(const cql::Statement& statement) {
     return false;
 }
 
+constexpr std::uint16_t kCatalogOperationJournalVersion = 2U;
+
+bool IsOperationName(const std::string& table, const std::string& name) {
+    const auto prefix = table + ".";
+    return name.size() == prefix.size() + 16U && name.rfind(prefix, 0) == 0U &&
+           std::all_of(name.begin() + static_cast<std::ptrdiff_t>(prefix.size()), name.end(),
+               [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
+}
+
+// A DROP TABLE or RENAME TO outside MIGRATE: one table, its directory move,
+// and at most the users file, which a recovery writes once the move happened.
+void ValidateCatalogOperation(const MigrationJournal& journal) {
+    if (Zero(journal.data_dir_id)) Bad("zero data-directory identity");
+    if (journal.directory_action != MigrationDirectoryAction::kDrop &&
+        journal.directory_action != MigrationDirectoryAction::kRename) Bad("catalog operation directory action");
+    if (!IsValidTableName(journal.table) || Zero(journal.table_id)) Bad("table name or identity");
+    if (journal.directory_action == MigrationDirectoryAction::kDrop
+            ? !IsOperationName(journal.table, journal.operation_name)
+            : !IsValidTableName(journal.operation_name) || journal.operation_name == journal.table)
+        Bad("operation name");
+    if (journal.files.size() > kMaxFiles) Bad("participant count");
+    std::set<std::string> paths;
+    for (const auto& file : journal.files) {
+        if (!paths.insert(file.path).second || file.path != kUsersFileName) Bad("duplicate or unrelated operation participant");
+        if (!file.before || file.before->size() > kMaxMigrationRecordsBytes || file.after.size() > kMaxMigrationRecordsBytes)
+            Bad("users participant images");
+        ValidateImage(journal, file.path, *file.before);
+        ValidateImage(journal, file.path, file.after);
+    }
+}
+
 void ValidateStructure(const MigrationJournal& journal) {
+    if (journal.catalog_operation) {
+        ValidateCatalogOperation(journal);
+        return;
+    }
     if (Zero(journal.data_dir_id)) Bad("zero data-directory identity");
     ValidateRecord(journal.record);
     if (journal.directory_action != MigrationDirectoryAction::kNone &&
@@ -384,9 +420,11 @@ std::vector<MigrationRecord> ReadMigrationRecords(const std::filesystem::path& r
 
 Bytes EncodeMigrationJournal(const MigrationJournal& journal) {
     ValidateStructure(journal);
-    auto bytes = Header(kJournalMagic);
+    // A catalog operation has format version 2 and no record, so a build
+    // that knows only version 1 refuses it instead of misreading it.
+    auto bytes = Header(kJournalMagic, journal.catalog_operation ? kCatalogOperationJournalVersion : 1U);
     bytes.insert(bytes.end(), journal.data_dir_id.begin(), journal.data_dir_id.end());
-    PutRecord(bytes, journal.record);
+    if (!journal.catalog_operation) PutRecord(bytes, journal.record);
     bytes.push_back(static_cast<std::uint8_t>(journal.directory_action));
     PutString(bytes, journal.table);
     bytes.insert(bytes.end(), journal.table_id.begin(), journal.table_id.end());
@@ -402,14 +440,17 @@ Bytes EncodeMigrationJournal(const MigrationJournal& journal) {
 }
 
 MigrationJournal DecodeMigrationJournal(const Bytes& bytes) {
-    Reader reader(bytes, kJournalMagic, kMaxMigrationJournalBytes);
+    const bool catalog_operation = bytes.size() >= 6U && ReadLe16(bytes, 4U) == kCatalogOperationJournalVersion;
+    Reader reader(bytes, kJournalMagic, kMaxMigrationJournalBytes, catalog_operation ? kCatalogOperationJournalVersion : 1U);
     MigrationJournal journal;
-    journal.data_dir_id = reader.Id(); journal.record = reader.Record();
+    journal.catalog_operation = catalog_operation;
+    journal.data_dir_id = reader.Id();
+    if (!catalog_operation) journal.record = reader.Record();
     journal.directory_action = static_cast<MigrationDirectoryAction>(reader.Byte());
     journal.table = reader.String(kMaxTableNameLength); journal.table_id = reader.Id();
     journal.operation_name = reader.String(kMaxTableNameLength + 17U);
     const auto count = reader.U32();
-    if (count == 0U || count > kMaxFiles) Bad("participant count");
+    if ((count == 0U && !catalog_operation) || count > kMaxFiles) Bad("participant count");
     for (std::uint32_t i = 0; i < count; ++i) {
         MigrationFileChange file;
         file.path = reader.String(128U);
@@ -432,8 +473,44 @@ void WriteMigrationJournal(const std::filesystem::path& root, const MigrationJou
                 "CHUNKDB_FAILPOINT_MIGRATION_DECISION_SYNC_FAIL_ONCE", false, EnterStatementDecision);
 }
 
+namespace {
+// The directory `tables/<table>` moves to when a catalog operation commits.
+std::string CatalogOperationTarget(const MigrationJournal& journal) {
+    return journal.directory_action == MigrationDirectoryAction::kDrop
+        ? ".chunkdb.dropped/" + journal.operation_name : "tables/" + journal.operation_name;
+}
+
+void ValidateCatalogOperationJournal(const std::filesystem::path& root, const MigrationJournal& journal) {
+    SafePath(root, std::string(kDataDirManifestFileName));
+    const auto manifest = ReadDataDirManifest(root);
+    if (!manifest || manifest->data_dir_id != journal.data_dir_id) Bad("source data-directory identity");
+    RequireOpenableFeatures(manifest->features, AccessMode::kReadWrite);
+    if (Present(root / kUsersFileName) && journal.files.empty()) Bad("catalog operation users participant is missing");
+    for (const auto& file : journal.files) {
+        SafePath(root, file.path);
+        const auto current = ReadBytes(root / file.path, kMaxMigrationRecordsBytes);
+        if (current != file.before && (!current || *current != file.after)) Bad("participant differs from before and after: " + file.path);
+    }
+    const auto source = "tables/" + journal.table;
+    const auto target = CatalogOperationTarget(journal);
+    SafePath(root, source);
+    SafePath(root, target);
+    const bool source_present = Present(root / source);
+    if (source_present == Present(root / target)) Bad("ambiguous directory operation");
+    CheckDirectory(root / (source_present ? source : target), journal.table_id);
+}
+}  // namespace
+
+bool CatalogOperationMoved(const std::filesystem::path& root, const MigrationJournal& journal) {
+    return !Present(root / "tables" / journal.table);
+}
+
 void ValidateMigrationJournal(const std::filesystem::path& root, const MigrationJournal& journal) {
     ValidateStructure(journal);
+    if (journal.catalog_operation) {
+        ValidateCatalogOperationJournal(root, journal);
+        return;
+    }
     SafePath(root, std::string(kDataDirManifestFileName));
     const auto manifest = ReadDataDirManifest(root);
     if (!manifest || manifest->data_dir_id != journal.data_dir_id ||

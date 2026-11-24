@@ -12,6 +12,8 @@
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
 #include "verify.hpp"
+#include "scram.hpp"
+#include "user_registry.hpp"
 
 namespace chunkdb::restore_table_test {
 
@@ -25,6 +27,21 @@ std::string Throws(Function&& function) {
 inline std::size_t Entries(const std::filesystem::path& directory) {
     if (!std::filesystem::exists(directory)) return 0U;
     return static_cast<std::size_t>(std::distance(std::filesystem::directory_iterator(directory), {}));
+}
+
+// The users of `data`; the first open creates them with `admin`.
+inline std::shared_ptr<UserRegistry> OpenUsers(const std::filesystem::path& data) {
+    return std::make_shared<UserRegistry>(data, std::make_pair(std::string("admin"),
+        scram::MakeVerifier("secret", crypto::RandomBytes(16), scram::kMinIterations)), std::array<std::uint8_t, 32>{7});
+}
+
+// The right `admin` holds on `table` by name.
+inline std::optional<Right> GrantOn(const std::filesystem::path& data, const std::string& table) {
+    const auto users = ReadUsersFile(data);
+    assert(users);
+    const auto& grants = users->users.at("admin").grants;
+    const auto found = grants.find(table);
+    return found == grants.end() ? std::nullopt : std::optional<Right>(found->second);
 }
 
 inline void Verified(const std::filesystem::path& data_dir) {

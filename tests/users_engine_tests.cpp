@@ -554,19 +554,20 @@ void TestRenameTableGrants() {
     ExpectError(server.Run(carol, "ALTER TABLE archive RENAME TO logs"), "PERMISSION_DENIED ADMIN on logs");
 }
 
-// Runs `at_forget` on the second users change of this thread's rename: the
-// removal of the old name's grants, after they were copied to the new name.
-struct PauseRenameGrants final : chunkdb::MigrationTestHook {
-    std::atomic<int> calls{0};
-    std::function<void()> at_forget;
-    void Run(Point point, std::string_view) override {
-        if (point == Point::kBeforeUserUpdate && ++calls == 2) at_forget();
+// Runs `at_journal` once the grant journal of a rename or drop of `table` is
+// written, while the statement holds catalog admission.
+struct PauseAtGrantJournal final : chunkdb::MigrationTestHook {
+    std::string table;
+    std::function<void()> at_journal;
+    void Run(Point point, std::string_view name) override {
+        if (point == Point::kPrepared && name == table) at_journal();
     }
 };
 
-// RENAME TO takes back grants whose copy has an unknown outcome, leaves no
-// grants on the old name of a table it renamed but could not open, and a
-// REVOKE waits for the whole rename.
+// RENAME TO whose grant journal cannot be written keeps the table and its
+// grants; one renamed but not opened has its grants on the new name only; a
+// REVOKE waits for the whole rename. DROP TABLE removes the grants with the
+// table, and one whose journal cannot be written keeps both.
 void TestRenameGrantFailures() {
     Server server;
     SessionState admin = server.LoggedIn("admin", "secret");
@@ -575,33 +576,49 @@ void TestRenameGrantFailures() {
     ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("pw")}), "+OK\r\n");
     ExpectReply(server.Run(admin, "GRANT WRITE ON logs TO bot"), "+OK\r\n");
     const auto grants = [&] { return server.users->Find("bot")->grants; };
+    const auto pending = server.dir.path() / "chunkdb.migration.pending";
     {
-        chunkdb::txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
-        ExpectError(server.Run(admin, "ALTER TABLE logs RENAME TO archive"), "OUTCOME_UNKNOWN");
+        chunkdb::txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_MIGRATION_DECISION_SYNC_FAIL_ONCE", "1");
+        ExpectError(server.Run(admin, "ALTER TABLE logs RENAME TO archive"), "INTERNAL");
     }
     assert(server.catalog->Find("logs") != nullptr && server.catalog->Find("archive") == nullptr);
     assert(grants().at("logs") == chunkdb::Right::kWrite && !grants().contains("archive"));
+    assert(!std::filesystem::exists(pending));
     {
         chunkdb::txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_RENAME_TABLE_OPEN_FAIL_ONCE", "1");
         ExpectError(server.Run(admin, "ALTER TABLE logs RENAME TO archive"), "INTERNAL");
     }
     assert(!grants().contains("logs") && grants().at("archive") == chunkdb::Right::kWrite);
+    assert(!std::filesystem::exists(pending));
     ExpectReply(server.Run(admin, "RECOVER TABLE archive"), "+OK\r\n");
 
-    PauseRenameGrants hook;
+    PauseAtGrantJournal hook;
+    hook.table = "archive";
     bool revoked_inside = false;
     std::future<std::string> revoke;
-    hook.at_forget = [&] {
+    hook.at_journal = [&] {
         revoke = std::async(std::launch::async, [&] { return server.Run(other_admin, "REVOKE WRITE ON archive FROM bot"); });
         revoked_inside = revoke.wait_for(std::chrono::milliseconds(300)) == std::future_status::ready;
     };
-    server.users->SetMigrationTestHook(&hook);
+    server.catalog->SetMigrationTestHook(&hook);
     ExpectReply(server.Run(admin, "ALTER TABLE archive RENAME TO store"), "+OK\r\n");
     ExpectReply(revoke.get(), "+OK\r\n");
-    server.users->SetMigrationTestHook(nullptr);
+    server.catalog->SetMigrationTestHook(nullptr);
     assert(!revoked_inside);
     // The REVOKE came after the rename, when the old name had no grants.
     assert(grants().size() == 1U && grants().at("store") == chunkdb::Right::kWrite);
+
+    {
+        chunkdb::txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_MIGRATION_DECISION_SYNC_FAIL_ONCE", "1");
+        ExpectError(server.Run(admin, "DROP TABLE store"), "INTERNAL");
+    }
+    assert(server.catalog->Find("store") != nullptr && grants().at("store") == chunkdb::Right::kWrite);
+    assert(!std::filesystem::exists(pending));
+    ExpectReply(server.Run(admin, "DROP TABLE store"), "+OK\r\n");
+    assert(server.catalog->Find("store") == nullptr && grants().empty() && !std::filesystem::exists(pending));
+    // A table created again under the name inherits no grant.
+    ExpectReply(server.Run(admin, "CREATE TABLE store (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    assert(grants().empty());
 }
 
 // A rename moves only the grants on the table's own name: prefix grants

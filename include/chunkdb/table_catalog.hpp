@@ -37,6 +37,7 @@ struct BackupTestHook;
 struct MigrationRequest;
 struct MigrationRecord;
 class UserRegistry;
+struct Users;
 
 class ProcessLock;
 class SlotWatch;
@@ -681,7 +682,29 @@ class TableCatalog {
     // RecoverTable or a restart drops the narrowing; the failure is rethrown.
     void EndNarrowing(Table& table, const TableOptions& options, const std::function<void(StoreManifest*)>& change);
     // Moves `dir` out of `tables/` into `.chunkdb.dropped/` and syncs both.
-    void MoveToDropped(const std::filesystem::path& dir, const std::string& name);
+    // `operation` names the moved directory (a new name when empty); with
+    // `remove_tree` false the caller removes it.
+    void MoveToDropped(const std::filesystem::path& dir, const std::string& name, const std::string& operation = {},
+        bool remove_tree = true);
+    // The grant change of a DROP TABLE or RENAME TO, journaled before the
+    // directory move that commits it (docs/STORAGE_FORMAT.md, pending
+    // migration decision version 2).
+    struct GrantJournal;
+    // Under operations_mutex_: locks `users`, and returns the journal of the
+    // change `change` makes to the grants in their file for moving `table`
+    // to `.chunkdb.dropped/<operation>`, or with `rename` to
+    // `tables/<operation>`; nullptr, and nothing locked, when there is no
+    // users file or the change changes nothing.
+    [[nodiscard]] std::shared_ptr<GrantJournal> PrepareGrantJournal(UserRegistry* users, const Table& table, bool rename,
+        const std::string& operation, const std::function<void(Users&)>& change);
+    // Writes the journal before the move; a failure removes it and rethrows.
+    void WriteGrantJournal(GrantJournal& journal);
+    // After a move that did not happen: removes the journal. A failure is
+    // logged; the next writer start removes it.
+    void DiscardGrantJournal(GrantJournal& journal) noexcept;
+    // After the move is durable: publishes the users and writes their file.
+    // A failure fences the catalog until a restart completes the journal.
+    void CompleteGrantJournal(GrantJournal& journal);
     void RemoveDroppedTree(const std::filesystem::path& dropped) noexcept;
     // Ends an exclusive section with the table out of service: removed from
     // the catalog and gone for every connection holding it.

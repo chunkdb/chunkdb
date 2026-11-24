@@ -463,30 +463,29 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     auto entry = PrepareServed(to);
     const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     const std::string store_dir = store->data_dir().string();
+    // The grants move with the table, a user's higher right kept where both
+    // names have one: journaled before the rename that commits both, the
+    // change is completed by this statement or by the next writer start, and
+    // dropped with the journal when the rename does not happen. Inside
+    // catalog admission, so a statement creating or granting either name
+    // follows the whole rename.
+    const auto grants = PrepareGrantJournal(users, *table, /*rename=*/true, to, [&](Users& next) {
+        for (auto& [_, user] : next.users) {
+            const auto granted = user.grants.find(from);
+            if (granted == user.grants.end()) continue;
+            const auto right = granted->second;
+            user.grants.erase(granted);
+            const auto existing = user.grants.find(to);
+            if (existing == user.grants.end()) user.grants.emplace(to, right);
+            else existing->second = std::max(existing->second, right);
+        }
+    });
     // A stop accepted until here leaves the table serving under its name;
     // after it the statement reports its real outcome.
     EnterStatementDecision();
-    // The grants move first: a crash from here leaves them on both names,
-    // never on neither. A failure here still serves the table unchanged.
-    UserRegistry::TableGrants copied;
-    // Takes back the grants given to the new name, which no table then has.
-    const auto take_back_grants = [&] {
-        try {
-            users->RestoreTableGrants(to, copied);
-        } catch (const std::exception& error) {
-            LogMessage(LogLevel::kWarn, LogComponent::kStore,
-                "grants given to the new name of a table whose rename failed could not be taken back; REVOKE them",
-                {{"table", from}, {"name", to}, {"error", error.what()}});
-        }
-    };
-    if (users) {
-        try {
-            users->CopyTableGrants(from, to, copied);
-        } catch (const UsersOutcomeUnknownError&) {
-            take_back_grants();
-            throw;
-        }
-    }
+    // A failure here still serves the table unchanged.
+    if (grants) WriteGrantJournal(*grants);
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_JOURNAL_ONCE");
     serving.Dismiss();
     store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
@@ -494,8 +493,8 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     const auto moved = ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_ONCE")
         ? std::make_error_code(std::errc::io_error) : MoveDirectoryNoReplace(old_dir, new_dir);
     if (moved) {
-        // Nothing moved: the table serves again under its name.
-        if (users) take_back_grants();
+        // Nothing moved: the table serves again under its name, with its grants.
+        if (grants) DiscardGrantJournal(*grants);
         try {
             auto reopened = OpenStore(from, old_dir, table->geometry().config(), 0U, options);
             reopened->AdoptUnsynced(*unsynced);
@@ -519,10 +518,12 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     } catch (const std::exception& error) {
         // Renamed now, but a crash could still undo it: as after a failed
         // swap, neither name serves until a recovery opens what its
-        // directory holds, and the grants stay on both names.
+        // directory holds. A grant journal waits for the restart that decides
+        // it by the directory, and the catalog refuses statements until then.
         LogMessage(LogLevel::kError, LogComponent::kStore,
             "renamed table could not be made durable; both names are fenced until RECOVER TABLE or a restart",
             {{"table", from}, {"name", to}, {"error", error.what()}});
+        if (grants) migration_health_->failed.store(true, std::memory_order_release);
         table->ended_.store(kWatchRenamed, std::memory_order_release);
         old_fence.mapped().reason = kFenceRenameUnknown;
         {
@@ -534,6 +535,18 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
         throw;
     }
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_SYNC_ONCE");
+    if (grants) {
+        try {
+            CompleteGrantJournal(*grants);
+        } catch (const std::exception& error) {
+            LogMessage(LogLevel::kError, LogComponent::kStore,
+                "the grants of a renamed table could not be written; the catalog refuses statements until a restart",
+                {{"table", from}, {"name", to}, {"error", error.what()}});
+            table->ended_.store(kWatchRenamed, std::memory_order_release);
+            FenceTable(*table, options, std::move(fence));
+            throw;
+        }
+    }
     std::shared_ptr<Table> renamed;
     try {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_TABLE_OPEN_FAIL_ONCE"))
@@ -558,16 +571,7 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
         fence.mapped().reason = kFenceRenameReopen;
         table->ended_.store(kWatchRenamed, std::memory_order_release);
         FenceTable(*table, options, std::move(fence));
-        // The rename is durable, so the old name is free and keeps no grants.
-        if (users) {
-            try {
-                users->ForgetTable(from);
-            } catch (const std::exception& forget_error) {
-                LogMessage(LogLevel::kWarn, LogComponent::kStore,
-                    "grants on the old name of a renamed table could not be removed; REVOKE them",
-                    {{"table", from}, {"name", to}, {"error", forget_error.what()}});
-            }
-        }
+        // The rename is durable, and the grants moved with it.
         throw;
     }
     // Connections holding the old table find no table of its name; its
@@ -582,16 +586,6 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     table->EndExclusive(nullptr, options);
     LogMessage(LogLevel::kInfo, LogComponent::kStore, "table renamed",
         {{"table", from}, {"name", to}, {"store_id", StoreIdHex(table->store_id())}});
-    // Inside catalog admission, as DROP TABLE forgets grants: a statement
-    // creating or granting the old name follows the whole rename.
-    if (users) {
-        try {
-            users->ForgetTable(from);
-        } catch (const std::exception& error) {
-            throw std::runtime_error("table '" + from + "' was renamed to '" + to +
-                "', but its grants on the old name could not be removed: " + error.what());
-        }
-    }
 }
 
 }  // namespace chunkdb

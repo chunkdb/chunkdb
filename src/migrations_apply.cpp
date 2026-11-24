@@ -30,8 +30,25 @@ void ApplyFile(const std::filesystem::path& root, const MigrationFileChange& fil
 
 }  // namespace
 
+void DiscardCatalogOperation(const std::filesystem::path& root) {
+    std::error_code ec;
+    std::filesystem::remove(root / kMigrationPendingFileName, ec);
+    if (ec) throw std::runtime_error("cannot remove " + (root / kMigrationPendingFileName).string() + ": " + ec.message());
+    SyncDirectoryPath(root);
+}
+
 void CompleteMigrationJournal(const std::filesystem::path& root, const MigrationJournal& journal) {
     ValidateMigrationJournal(root, journal);
+    if (journal.catalog_operation) {
+        // The directory move decided the operation; only the users file is left.
+        if (!CatalogOperationMoved(root, journal)) throw std::logic_error("catalog operation completed before its move");
+        for (std::size_t i = 0; i < journal.files.size(); ++i) ApplyFile(root, journal.files[i], i);
+        Crash("CHUNKDB_FAILPOINT_CRASH_MIGRATION_BEFORE_PENDING_REMOVE_ONCE");
+        if (!std::filesystem::remove(root / kMigrationPendingFileName))
+            throw std::runtime_error("catalog operation journal disappeared before completion");
+        SyncDirectoryPath(root);
+        return;
+    }
     std::size_t first = 0;
     // DROP's version floor must be durable before removing the live name.
     if (journal.files.front().path == kDataDirManifestFileName) {
@@ -69,9 +86,14 @@ void RecoverMigrations(const std::filesystem::path& root, AccessMode access_mode
         ValidateMigrationJournal(root, *journal);
         if (access_mode == AccessMode::kReadOnly)
             throw std::runtime_error(
-                "the data directory needs recovery: a decided migration has not finished; a running writer may "
+                std::string("the data directory needs recovery: a ") +
+                (journal->catalog_operation ? "DROP TABLE or RENAME TO" : "decided migration") +
+                " has not finished; a running writer may "
                 "be finishing it, so try again, and with no writer running open it read-write once to recover it");
-        CompleteMigrationJournal(root, *journal);
+        // A catalog operation whose directory move did not happen changed
+        // nothing: its table keeps its name and grants.
+        if (journal->catalog_operation && !CatalogOperationMoved(root, *journal)) DiscardCatalogOperation(root);
+        else CompleteMigrationJournal(root, *journal);
     }
     if (access_mode == AccessMode::kReadWrite) {
         CleanupAtomicTmpArtifacts(root / kMigrationPendingFileName);

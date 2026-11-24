@@ -65,6 +65,38 @@ void KeepsTheBackedUpName() {
     assert(table->Acquire()->store().GetBlockBits(8, 0) == "00000011");
 }
 
+// DROP TABLE and RENAME TO whose grants cannot be written after the move:
+// the users in memory already follow the change, the catalog refuses
+// statements, and the next start writes the grants (#306).
+void GrantWriteFailures() {
+    for (const bool rename : {false, true}) {
+        Source source;
+        {
+            TableCatalog catalog(source.Config());
+            const auto users = OpenUsers(source.data);
+            users->Grant("admin", "t", Right::kWrite);
+            {
+                txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_CATALOG_GRANTS_WRITE_FAIL_ONCE", "1");
+                Throws([&] {
+                    if (rename) catalog.RenameTable("t", "t_old", users.get());
+                    else catalog.Drop("t", users.get(), false);
+                });
+            }
+            assert(!users->Find("admin")->grants.contains("t"));
+            assert(GrantOn(source.data, "t") == Right::kWrite && std::filesystem::exists(source.data / "chunkdb.migration.pending"));
+            Throws<MigrationRecoveryRequiredError>([&] { (void)catalog.Migrations(); });
+        }
+        TableCatalog catalog(source.Config());
+        assert(!std::filesystem::exists(source.data / "chunkdb.migration.pending"));
+        assert(!GrantOn(source.data, "t") && (catalog.Find("t") == nullptr));
+        if (rename) {
+            assert(catalog.Require("t_old")->store_id() == source.epoch && GrantOn(source.data, "t_old") == Right::kWrite);
+        } else {
+            assert(catalog.TableCount() == 0U);
+        }
+    }
+}
+
 void LeavesNothingAfterRefusal(const Source& source, TableCatalog& catalog) {
     assert(Entries(source.data / ".chunkdb.staging") == 0U);
     assert(Entries(source.data / "tables") == 1U && catalog.TableCount() == 1U);
@@ -653,6 +685,7 @@ int main() {
     RenamesTable();
     RenameRefusals();
     RenameStatementStops();
+    GrantWriteFailures();
     if (kAtomicExchange) {
         SwapsNames();
         SwapSurvivesRestart();

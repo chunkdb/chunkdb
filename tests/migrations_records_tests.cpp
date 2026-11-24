@@ -15,6 +15,9 @@
 #include "catalog_test_utils.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "verify.hpp"
+#include "scram.hpp"
+#include "user_registry.hpp"
+#include "users.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -439,6 +442,80 @@ void PathAliases() {
     Reject([&] { ValidateMigrationJournal(fixture.root, fixture.Journal()); });
 #endif
 }
+
+// DROP TABLE and RENAME TO outside MIGRATE journal the grant change as format
+// version 2: no record and no ledger, only the users file, with the
+// directory move as the commit point. A writer start completes the journal
+// once the move happened and removes it otherwise.
+void CatalogOperationJournal() {
+    Fixture fixture;
+    {
+        UserRegistry users(fixture.root, std::make_pair(std::string("admin"),
+            scram::MakeVerifier("secret", crypto::RandomBytes(16), scram::kMinIterations)), std::array<std::uint8_t, 32>{7});
+        users.Grant("admin", "default", Right::kWrite);
+    }
+    const auto users_before = LoadFile(fixture.root / std::string(kUsersFileName));
+    auto next = *ReadUsersFile(fixture.root);
+    next.users.at("admin").grants.erase("default");
+    const auto users_after = EncodeUsers(next);
+    MigrationJournal journal;
+    journal.catalog_operation = true;
+    journal.data_dir_id = fixture.data_id;
+    journal.directory_action = MigrationDirectoryAction::kDrop;
+    journal.table = "default"; journal.table_id = fixture.table.store_id;
+    journal.operation_name = "default.0123456789abcdef";
+    journal.files = {{std::string(kUsersFileName), users_before, users_after}};
+    const auto encoded = EncodeMigrationJournal(journal);
+    // Version 2: a reader of version 1 refuses it, as this one refuses any other version.
+    assert(ReadLe16(encoded, 4U) == 2U);
+    auto other_version = encoded; other_version[4] = 3U; Checksum(other_version);
+    Reject([&] { (void)DecodeMigrationJournal(other_version); });
+    const auto decoded = DecodeMigrationJournal(encoded);
+    assert(decoded.catalog_operation && decoded.record == MigrationRecord{} && decoded.files.size() == 1U);
+    assert(EncodeMigrationJournal(decoded) == encoded);
+    ValidateMigrationJournal(fixture.root, decoded);
+    assert(!CatalogOperationMoved(fixture.root, decoded));
+    // Refused: another participant, a drop name that is not an operation
+    // name, a rename onto its own name, and a missing users participant.
+    auto bad = journal;
+    bad.files.push_back({"tables/default/table.manifest", fixture.before, fixture.after});
+    Reject([&] { (void)EncodeMigrationJournal(bad); });
+    bad = journal; bad.operation_name = "default";
+    Reject([&] { (void)EncodeMigrationJournal(bad); });
+    bad = journal; bad.directory_action = MigrationDirectoryAction::kRename; bad.operation_name = "default";
+    Reject([&] { (void)EncodeMigrationJournal(bad); });
+    bad = journal; bad.files.clear();
+    Reject([&] { ValidateMigrationJournal(fixture.root, bad); });
+
+    // The move did not happen: the start removes the journal, and the table
+    // keeps its grants.
+    WriteMigrationJournal(fixture.root, journal);
+    RecoverMigrations(fixture.root, AccessMode::kReadWrite);
+    assert(!ReadMigrationJournal(fixture.root) && std::filesystem::exists(fixture.root / "tables/default"));
+    assert(LoadFile(fixture.root / std::string(kUsersFileName)) == users_before);
+    // A read-only open refuses a pending one.
+    WriteMigrationJournal(fixture.root, journal);
+    Reject([&] { RecoverMigrations(fixture.root, AccessMode::kReadOnly); });
+    // The move happened: the start writes the users and removes the journal.
+    std::filesystem::create_directories(fixture.root / ".chunkdb.dropped");
+    std::filesystem::rename(fixture.root / "tables/default", fixture.root / ".chunkdb.dropped" / journal.operation_name);
+    assert(CatalogOperationMoved(fixture.root, journal));
+    RecoverMigrations(fixture.root, AccessMode::kReadWrite);
+    assert(!ReadMigrationJournal(fixture.root));
+    assert(LoadFile(fixture.root / std::string(kUsersFileName)) == users_after);
+
+    // A rename moves `tables/<table>` to `tables/<operation name>`.
+    std::filesystem::rename(fixture.root / ".chunkdb.dropped" / journal.operation_name, fixture.root / "tables/default");
+    auto rename = journal;
+    rename.directory_action = MigrationDirectoryAction::kRename;
+    rename.operation_name = "renamed";
+    rename.files = {{std::string(kUsersFileName), users_after, users_before}};
+    WriteMigrationJournal(fixture.root, rename);
+    std::filesystem::rename(fixture.root / "tables/default", fixture.root / "tables/renamed");
+    RecoverMigrations(fixture.root, AccessMode::kReadWrite);
+    assert(!ReadMigrationJournal(fixture.root));
+    assert(LoadFile(fixture.root / std::string(kUsersFileName)) == users_before);
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -449,6 +526,6 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--slot-dimensions") { SlotImageDimensions(); return 0; }
     RecordTextWithoutGrammar(); RecordTextUtf8();
     Records(); RecordDamage(); JournalAndVerification(); JournalDamage(); DiskIdentity(); CompletionPreflight(); DirectoryPublication(); PathAliases();
-    JournalStatementRestrictions(); ConditionalLedgerOnlyCodec(); SlotImageDimensions();
-    std::cout << "13 migration codec and verification groups passed\n";
+    JournalStatementRestrictions(); ConditionalLedgerOnlyCodec(); SlotImageDimensions(); CatalogOperationJournal();
+    std::cout << "14 migration codec and verification groups passed\n";
 }
