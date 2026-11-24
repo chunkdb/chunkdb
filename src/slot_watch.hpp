@@ -1,9 +1,11 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <limits>
 #include <list>
 #include <mutex>
 #include <optional>
@@ -82,10 +84,16 @@ struct FeedSlotClaim {
     // receipts, and output above a share. Each stays within the table budget.
     const std::shared_ptr<std::atomic<std::size_t>> output_bytes;
     const std::shared_ptr<FeedExcessPool> excess;
+    // The "[address]:port" of the watch's client; empty when unknown.
+    const std::string peer;
+    // When the watch's last accepted ACK arrived, as steady_clock ticks since
+    // its epoch; kNoAck before the first.
+    static constexpr std::chrono::steady_clock::rep kNoAck = std::numeric_limits<std::chrono::steady_clock::rep>::min();
+    std::atomic<std::chrono::steady_clock::rep> last_ack{kNoAck};
     FeedSlotClaim(std::string value, std::uint64_t revision, std::shared_ptr<std::atomic<std::size_t>> bytes,
-        std::shared_ptr<FeedExcessPool> pool, std::string owner_user)
+        std::shared_ptr<FeedExcessPool> pool, std::string owner_user, std::string client = {})
         : name(std::move(value)), user(std::move(owner_user)), completed(revision), output_bytes(std::move(bytes)),
-          excess(std::move(pool)) {}
+          excess(std::move(pool)), peer(std::move(client)) {}
 };
 
 // Socket operations only touch the bounded queue and control fields. A single
@@ -103,10 +111,11 @@ class SlotWatch {
     };
     // `authorize_owner` throws to refuse a user name: the slot's recorded
     // owner, and on takeover the user of the replaced watch. `user` is the
-    // claim's user; claiming never records an owner.
+    // claim's user; claiming never records an owner. `peer` is the
+    // "[address]:port" of the watch's client, which SHOW SLOTS reports.
     static std::shared_ptr<SlotWatch> Create(std::shared_ptr<Table> table,
         std::string name, FeedOptions options, bool takeover = false, std::string user = {},
-        const std::function<void(std::string_view)>& authorize_owner = {});
+        const std::function<void(std::string_view)>& authorize_owner = {}, std::string peer = {});
     ~SlotWatch();
     [[nodiscard]] FeedPosition position() const noexcept { return start_; }
     // The slot's owner when it was claimed, or as BindOwner recorded it.
