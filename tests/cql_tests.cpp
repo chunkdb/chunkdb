@@ -327,7 +327,7 @@ void TestLiterals() {
     assert(std::isnan(std::get<double>(ValueOf("NaN"))));
     ExpectError("SET BLOCK 0 0 IN t a = 1.2.3", "is not a number");
     ExpectError("SET BLOCK 0 0 IN t a = 1e999", "1e999 is beyond the f64 range");
-    ExpectError("SET BLOCK 0 0 IN t a = -1e999", "-1e999 is beyond the f64 range");
+    ExpectError("SET BLOCK 0 0 IN t a = -1e999", "column 25: 1e999 is beyond the f64 range");
     // The nearest f64: subnormal values are kept, and smaller ones are zero.
     assert(ValueOf("1e-310") == cql::Literal(1e-310));
     assert(ValueOf("4.9406564584124654e-324") == cql::Literal(std::numeric_limits<double>::denorm_min()));
