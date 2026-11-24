@@ -460,10 +460,15 @@ void VerifyFeedArtifacts(
         if (records) {
             ++counters->checked;
             ObserveRevision(counters, records->durable_watermark);
-            for (const auto& slot : records->slots) ObserveRevision(counters, slot.written);
+            for (const auto& slot : records->slots) {
+                ObserveRevision(counters, slot.written);
+                for (const auto& partition : slot.partitions) ObserveRevision(counters, partition.written);
+            }
             if (!enabled) Report(counters, true, "feed_slots_without_feature", records_path, "feed slots feature is absent");
             if (records->filter_format && (manifest.features.incompat & chunkdb::kFeatureSlotFilters) == 0U)
                 Report(counters, true, "slot_filters_without_feature", records_path, "slot filters feature is absent");
+            if (records->partition_format && (manifest.features.incompat & chunkdb::kFeatureSlotPartitions) == 0U)
+                Report(counters, true, "slot_partitions_without_feature", records_path, "slot partitions feature is absent");
         }
     } catch (const std::exception& error) {
         ++counters->checked;

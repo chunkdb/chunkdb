@@ -11,6 +11,7 @@
 #include "checkpoint.hpp"
 #include "statement_control.hpp"
 #include "chunkdb/crc32.hpp"
+#include "feed_slot_partitions.hpp"
 #include "store_manifest.hpp"
 #include "user_registry.hpp"
 
@@ -24,10 +25,23 @@ constexpr std::size_t kMaxSlots = 1024U;
 // dimensionality, the filter format and an optional owner for each slot.
 constexpr std::uint16_t kVersion = 4U;
 constexpr std::uint8_t kFilterHeaderFlag = 1U;
+// Every slot record ends with its partition count (docs/design/SLOT_PARTITIONS.md).
+constexpr std::uint8_t kPartitionHeaderFlag = 2U;
+constexpr std::uint8_t kPartitionResyncFlag = 1U;
 constexpr std::uint8_t kOwnerFlag = 64U;
 constexpr std::uint8_t kResyncFlag = 128U;
 constexpr unsigned kSlotFlags = 1U | 2U | 4U | 8U | 16U | 32U | kOwnerFlag | kResyncFlag;
 
+// The bytes one slot record takes in chunkdb.slots.
+std::size_t SlotRecordBytes(const FeedSlotRecord& slot, std::uint8_t dims, bool partition_format) {
+    return 12U + slot.name.size() + (slot.filters.area ? 16U * dims : 0U) +
+        (slot.filters.column_ids ? slot.filters.column_ids->size() * 4U : 0U) + (slot.owner ? 1U + slot.owner->size() : 0U) +
+        (partition_format ? 2U + 9U * slot.partitions.size() : 0U);
+}
+bool PartitionFormat(const FeedSlotRecords& records) {
+    return records.partition_format || std::any_of(records.slots.begin(), records.slots.end(),
+        [](const auto& slot) { return !slot.partitions.empty(); });
+}
 [[noreturn]] void BadRecords(const std::string& why) {
     throw std::runtime_error("invalid chunkdb.slots: " + why);
 }
@@ -36,6 +50,7 @@ void ValidateRecords(const FeedSlotRecords& records) {
     if (std::all_of(records.epoch.begin(), records.epoch.end(), [](auto b) { return b == 0U; }))
         BadRecords("zero epoch");
     if (records.slots.size() > kMaxSlots) BadRecords("too many slot records");
+    const bool partition_format = PartitionFormat(records);
     std::set<std::string> names;
     std::size_t encoded_size = kFixedBytes;
     for (const auto& slot : records.slots) {
@@ -59,8 +74,19 @@ void ValidateRecords(const FeedSlotRecords& records) {
                 if (id == 0U || !ids.insert(id).second) BadRecords("zero or duplicate projection id");
         }
         if (slot.owner && !IsValidUserName(*slot.owner)) BadRecords("owner is not a user name");
-        encoded_size += 12U + slot.name.size() + (slot.filters.area ? 16U * records.dims : 0U) +
-            (slot.filters.column_ids ? slot.filters.column_ids->size() * 4U : 0U) + (slot.owner ? 1U + slot.owner->size() : 0U);
+        if (!slot.partitions.empty()) {
+            if (slot.partitions.size() < 2U || slot.partitions.size() > kMaxFeedSlotPartitions) BadRecords("partition count");
+            auto lowest = std::numeric_limits<std::uint64_t>::max();
+            bool resync = false;
+            for (const auto& partition : slot.partitions) {
+                if (partition.written > records.durable_watermark) BadRecords("partition position above durable watermark");
+                lowest = std::min(lowest, partition.written);
+                resync = resync || partition.resync;
+            }
+            if (lowest != slot.written) BadRecords("slot position is not its lowest partition position");
+            if (resync != slot.resync) BadRecords("slot resync differs from its partitions");
+        }
+        encoded_size += SlotRecordBytes(slot, records.dims, partition_format);
         if (encoded_size > kMaxRecordsBytes) BadRecords("size");
     }
 }
@@ -75,6 +101,16 @@ void RequireValidFeedSlotName(std::string_view name) {
     }
 }
 
+void RequireFeedSlotRoom(const FeedSlotRecords& records, const FeedSlotRecord& slot) {
+    if (records.slots.size() >= kMaxSlots) throw std::out_of_range("a table has at most 1024 slots");
+    const bool partition_format = PartitionFormat(records) || !slot.partitions.empty();
+    std::size_t bytes = kFixedBytes + SlotRecordBytes(slot, records.dims, partition_format);
+    for (const auto& existing : records.slots) bytes += SlotRecordBytes(existing, records.dims, partition_format);
+    if (bytes > kMaxRecordsBytes)
+        throw std::out_of_range("a table's slot records take at most 1048576 bytes, and this slot would need " +
+                                std::to_string(bytes) + "; a slot takes about 9 bytes per partition");
+}
+
 void RequireValidFeedSlotOwner(std::string_view owner) {
     if (!IsValidUserName(owner)) throw std::invalid_argument("slot owners are user names, 1 to 63 bytes: [a-z_][a-z0-9_]*");
 }
@@ -84,9 +120,11 @@ std::vector<std::uint8_t> SerializeFeedSlotRecords(const FeedSlotRecords& record
     std::vector<std::uint8_t> bytes(kMagic.begin(), kMagic.end());
     const bool extended = records.filter_format || std::any_of(records.slots.begin(), records.slots.end(),
         [](const auto& slot) { return !slot.filters.empty() || slot.schema_filter_lost; });
+    const bool partitioned = records.partition_format || std::any_of(records.slots.begin(), records.slots.end(),
+        [](const auto& slot) { return !slot.partitions.empty(); });
     WriteLe16(bytes, kVersion);
     bytes.push_back(records.dims);
-    bytes.push_back(extended ? kFilterHeaderFlag : 0U);
+    bytes.push_back(static_cast<std::uint8_t>((extended ? kFilterHeaderFlag : 0U) | (partitioned ? kPartitionHeaderFlag : 0U)));
     bytes.insert(bytes.end(), records.epoch.begin(), records.epoch.end());
     WriteLe64(bytes, records.durable_watermark);
     WriteLe32(bytes, static_cast<std::uint32_t>(records.slots.size()));
@@ -114,6 +152,13 @@ std::vector<std::uint8_t> SerializeFeedSlotRecords(const FeedSlotRecords& record
             bytes.push_back(static_cast<std::uint8_t>(slot.owner->size()));
             bytes.insert(bytes.end(), slot.owner->begin(), slot.owner->end());
         }
+        if (partitioned) {
+            WriteLe16(bytes, static_cast<std::uint16_t>(FeedSlotPartitionCount(slot.partitions)));
+            for (const auto& partition : slot.partitions) {
+                WriteLe64(bytes, partition.written);
+                bytes.push_back(partition.resync ? kPartitionResyncFlag : 0U);
+            }
+        }
     }
     WriteLe32(bytes, Crc32(bytes.data(), bytes.size()));
     return bytes;
@@ -126,7 +171,7 @@ FeedSlotRecords ParseRecords(const std::vector<std::uint8_t>& bytes, const Store
     const auto version = ReadLe16(bytes, 4U);
     if (!std::equal(kMagic.begin(), kMagic.end(), bytes.begin())) BadRecords("magic");
     if (version >= 1U && version < kVersion) throw EarlierDevelopmentFormatError();
-    if (version != kVersion || (bytes[6U] != 2U && bytes[6U] != 3U) || (bytes[7U] & ~kFilterHeaderFlag) != 0U)
+    if (version != kVersion || (bytes[6U] != 2U && bytes[6U] != 3U) || (bytes[7U] & ~(kFilterHeaderFlag | kPartitionHeaderFlag)) != 0U)
         BadRecords("magic, version or reserved field");
     if (expected_dims && *expected_dims != bytes[6U]) BadRecords("dimensionality differs from table");
     const auto crc_at = bytes.size() - 4U;
@@ -136,6 +181,7 @@ FeedSlotRecords ParseRecords(const std::vector<std::uint8_t>& bytes, const Store
     if (records.epoch != epoch) BadRecords("epoch differs from table");
     records.durable_watermark = ReadLe64(bytes, 24U);
     records.filter_format = (bytes[7U] & kFilterHeaderFlag) != 0U;
+    records.partition_format = (bytes[7U] & kPartitionHeaderFlag) != 0U;
     records.dims = bytes[6U];
     const auto count = ReadLe32(bytes, 32U);
     if (count > kMaxSlots) BadRecords("too many slot records");
@@ -184,6 +230,21 @@ FeedSlotRecords ParseRecords(const std::vector<std::uint8_t>& bytes, const Store
                                bytes.begin() + static_cast<std::ptrdiff_t>(at + 1U + bytes[at]));
             at += 1U + bytes[at];
         }
+        if (records.partition_format) {
+            if (crc_at - at < 2U) BadRecords("truncated partition count");
+            const auto partitions = ReadLe16(bytes, at);
+            at += 2U;
+            if (partitions == 0U || partitions > kMaxFeedSlotPartitions) BadRecords("partition count");
+            if (partitions > 1U) {
+                if ((crc_at - at) / 9U < partitions) BadRecords("truncated partitions");
+                slot.partitions.reserve(partitions);
+                for (std::uint16_t j = 0U; j < partitions; ++j, at += 9U) {
+                    const auto partition_flags = bytes[at + 8U];
+                    if ((partition_flags & ~kPartitionResyncFlag) != 0U) BadRecords("partition flags");
+                    slot.partitions.push_back({ReadLe64(bytes, at), (partition_flags & kPartitionResyncFlag) != 0U});
+                }
+            }
+        }
     }
     if (at != crc_at) BadRecords("trailing bytes");
     if (!records.filter_format && std::any_of(records.slots.begin(), records.slots.end(),
@@ -223,8 +284,11 @@ std::optional<FeedSlotRecords> ReadFeedSlotRecords(const std::filesystem::path& 
 }
 
 void WriteFeedSlotRecords(const std::filesystem::path& dir, const FeedSlotRecords& records, bool* published) {
-    AtomicWrite(dir / kFeedSlotsFileName, SerializeFeedSlotRecords(records), true, true, published, nullptr, true,
-        EnterStatementDecision);
+    const auto bytes = SerializeFeedSlotRecords(records);
+    // Crash tests stop a slot record change before and after its replace.
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_SLOT_RECORDS_BEFORE_REPLACE_ONCE")) ExitAbruptly(86);
+    AtomicWrite(dir / kFeedSlotsFileName, bytes, true, true, published, nullptr, true, EnterStatementDecision);
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_SLOT_RECORDS_AFTER_REPLACE_ONCE")) ExitAbruptly(86);
 }
 
 }  // namespace chunkdb

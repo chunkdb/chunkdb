@@ -413,6 +413,50 @@ void MarkedSlotBecomesLost() {
     Verified(source.data);
 }
 
+// A partitioned slot keeps its partitions through BACKUP and RESTORE TABLE:
+// every partition starts at the cut with resync, whatever it acknowledged
+// before; SWAP TABLES marks every partition of both tables.
+void PartitionedSlotRestore() {
+    test::ScopedTempDir temporary("chunkdb-restore-partitions");
+    const auto root = std::filesystem::canonical(temporary.path());
+    CatalogConfig config;
+    config.data_dir = root / "data";
+    config.background_maintenance = false;
+    TableCatalog catalog(config);
+    GeometryConfig geometry;
+    geometry.large_chunk_width_chunks = 2U; geometry.large_chunk_height_chunks = 2U;
+    geometry.chunk_width_blocks = 2U; geometry.chunk_height_blocks = 2U; geometry.block_bits = 8U;
+    const auto table = catalog.Create("t", geometry, catalog.default_options());
+    const auto start = table->CreateFeedSlot("parts", false, {}, std::nullopt, false, 3U).position;
+    {
+        auto lease = table->Acquire();
+        lease->store().SetBlockBits(0, 0, "00000001");
+        lease->store().SetBlockBits(4, 0, "00000010");
+        lease->store().WalBarrier();
+    }
+    FeedSlotTestAccess::Sync(*table);
+    const auto frontier = table->ListFeedSlots().front().durable_watermark;
+    FeedSlotTestAccess::StageAck(*table, "parts", {start.epoch, frontier}, {0U});
+    (void)FeedSlotTestAccess::FlushAcks(*table, true, std::chrono::steady_clock::now());
+    const auto result = catalog.BackupTo(root / "snap", {});
+    assert(result.tables.size() == 1U);
+    const auto cut = result.tables.front().revision;
+    assert(cut >= frontier);
+    (void)catalog.RestoreTable(TableRestoreRequest{.backup = root / "snap", .table = "t", .name = "t_restored"});
+    const auto restored = catalog.Require("t_restored")->ListFeedSlots();
+    assert(restored.size() == 1U && restored[0].partitions.size() == 3U && restored[0].resync);
+    for (const auto& partition : restored[0].partitions) assert(partition.written == cut && partition.resync);
+    const auto live = catalog.Require("t")->ListFeedSlots();
+    assert(live[0].partitions[0].written == frontier && live[0].partitions[1].written == start.revision && !live[0].resync);
+    if (!kAtomicExchange) return;
+    catalog.SwapTables("t", "t_restored");
+    for (const auto* name : {"t", "t_restored"}) {
+        const auto slots = catalog.Require(name)->ListFeedSlots();
+        assert(slots.size() == 1U && slots[0].partitions.size() == 3U && slots[0].resync);
+        for (const auto& partition : slots[0].partitions) assert(partition.resync);
+    }
+}
+
 // Windows has no atomic directory exchange: SWAP TABLES is refused before
 // anything closes, and both tables keep serving.
 void SwapRefusedOnWindows() {
@@ -619,6 +663,7 @@ int main() {
     Cancellation();
     StatementStops();
     MarkedSlotBecomesLost();
+    PartitionedSlotRestore();
     RenamesTable();
     RenameRefusals();
     RenameStatementStops();

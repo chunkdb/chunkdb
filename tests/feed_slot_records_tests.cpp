@@ -1,6 +1,10 @@
+#include <algorithm>
 #include <cassert>
 #include <functional>
+#include <stdexcept>
+#include <string>
 
+#include "feed_slot_partitions.hpp"
 #include "feed_slot_records.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/crc32.hpp"
@@ -142,7 +146,7 @@ void Dimensions() {
     auto bad = bytes; bad[6U] = 2U; Checksum(bad);
     Reject([&] { (void)ParseFeedSlotRecords(bad, epoch); }); // Extra active-axis bytes cannot become a 2D filter.
     bad = bytes; bad[7U] = 0U; reject_checked(bad);
-    bad = bytes; bad[7U] |= 2U; reject_checked(bad);
+    bad = bytes; bad[7U] |= 4U; reject_checked(bad);
     const auto area = 36U + 12U + slot.name.size();
     bad = bytes;
     std::swap_ranges(bad.begin() + static_cast<std::ptrdiff_t>(area + 16U),
@@ -225,7 +229,8 @@ void Owners() {
         Checksum(changed); Reject([&] { (void)ParseFeedSlotRecords(changed, epoch); });
     };
     const auto owner_at = 36U + 12U + records.slots[0].name.size();
-    auto malformed = bytes; malformed[7U] = 2U; reject_checked(malformed); // unknown header flag
+    auto malformed = bytes; malformed[7U] = 4U; reject_checked(malformed); // unknown header flag
+    malformed = bytes; malformed[7U] = 2U; reject_checked(malformed); // partition format without partition counts
     malformed = bytes; malformed[37U] |= 8U; reject_checked(malformed); // filter without the filter format
     malformed = bytes; malformed[37U] |= 128U | 1U; reject_checked(malformed); // resync on a lost slot
     malformed = bytes; malformed[owner_at] = 0U; reject_checked(malformed); // empty owner
@@ -300,6 +305,142 @@ void Owners() {
     Reject([&] { (void)SerializeFeedSlotRecords(large); });
 }
 
+// Header flag 0x2 gives every slot its partition count; a partitioned slot's
+// position and resync are the lowest and any of its partitions'.
+void Partitions() {
+    StoreId epoch{}; epoch[0] = 7U;
+    FeedSlotRecords records{epoch, 20U, {{"parts", 5U, false}, {"single", 9U, false}}};
+    records.slots[0].partitions = {{5U, false}, {20U, true}, {7U, false}};
+    records.slots[0].resync = true;
+    const auto bytes = SerializeFeedSlotRecords(records);
+    assert(bytes[7U] == 2U && bytes.size() == 40U + (12U + 5U + 2U + 27U) + (12U + 6U + 2U));
+    const auto parsed = ParseFeedSlotRecords(bytes, epoch, 2U);
+    assert(parsed.partition_format && !parsed.filter_format);
+    assert(parsed.slots[0].partitions == records.slots[0].partitions && parsed.slots[0].resync && parsed.slots[0].written == 5U);
+    assert(parsed.slots[1].partitions.empty() && parsed.slots[1].written == 9U && !parsed.slots[1].resync);
+    for (std::size_t at = 0; at < bytes.size(); ++at) {
+        auto partial = bytes; partial.resize(at);
+        Reject([&] { (void)ParseFeedSlotRecords(partial, epoch); });
+        auto corrupt = bytes; corrupt[at] ^= 1U;
+        Reject([&] { (void)ParseFeedSlotRecords(corrupt, epoch); });
+    }
+    const auto reject_checked = [&](std::vector<std::uint8_t> changed) {
+        Checksum(changed); Reject([&] { (void)ParseFeedSlotRecords(changed, epoch); });
+    };
+    const auto count_at = 36U + 12U + records.slots[0].name.size();
+    assert(ReadLe16(bytes, count_at) == 3U);
+    auto malformed = bytes; malformed[count_at] = 0U; reject_checked(malformed); // no partitions
+    malformed = bytes; malformed[count_at + 2U + 8U] = 2U; reject_checked(malformed); // unknown partition flag
+    malformed = bytes; malformed[count_at + 2U] = 6U; reject_checked(malformed); // position is not the lowest
+    malformed = bytes; malformed[count_at + 2U + 9U + 8U] = 0U; reject_checked(malformed); // resync no partition has
+    malformed = bytes; malformed[count_at + 2U + 9U + 1U] = 1U; reject_checked(malformed); // above the watermark
+    malformed = bytes; malformed[7U] = 0U; reject_checked(malformed); // counts without the partition format
+    const auto refused = [&](const std::function<void(FeedSlotRecord&)>& change) {
+        auto bad = records; change(bad.slots[0]);
+        Reject([&] { (void)SerializeFeedSlotRecords(bad); });
+    };
+    refused([](auto& slot) { slot.written = 6U; });
+    refused([](auto& slot) { slot.resync = false; });
+    refused([](auto& slot) { slot.partitions[1].written = 21U; });
+    refused([](auto& slot) { slot.partitions.resize(1U); slot.resync = false; });
+    refused([](auto& slot) { slot.partitions.assign(257U, {5U, false}); slot.resync = false; });
+    auto most = records; most.slots[0].partitions.assign(256U, {5U, false}); most.slots[0].resync = false;
+    assert(ParseFeedSlotRecords(SerializeFeedSlotRecords(most), epoch).slots[0].partitions.size() == 256U);
+    // The partition format stays once written.
+    auto plain = parsed; plain.slots.erase(plain.slots.begin());
+    const auto kept = SerializeFeedSlotRecords(plain);
+    assert(kept[7U] == 2U && ParseFeedSlotRecords(kept, epoch).partition_format);
+    FeedSlotRecords unpartitioned{epoch, 20U, {{"single", 9U, false}}};
+    assert(SerializeFeedSlotRecords(unpartitioned)[7U] == 0U);
+
+    auto slot = records.slots[0];
+    assert(AdvanceFeedSlotRecord(slot, {0U, 2U}, 8U) && slot.written == 8U && slot.resync);
+    assert(!AdvanceFeedSlotRecord(slot, {1U}, 20U));
+    assert(AdvanceFeedSlotRecord(slot, {}, 9U) && slot.written == 9U && slot.resync && slot.partitions[1].written == 20U);
+    MarkFeedSlotRecordLost(slot);
+    assert(slot.lost && !slot.resync && std::none_of(slot.partitions.begin(), slot.partitions.end(), [](const auto& p) { return p.resync; }));
+    slot.lost = false; MarkFeedSlotRecordResync(slot);
+    assert(slot.resync && std::all_of(slot.partitions.begin(), slot.partitions.end(), [](const auto& p) { return p.resync; }));
+    LowerFeedSlotRecordPositions(slot, 9U);
+    assert(slot.written == 9U && slot.partitions[1].written == 9U);
+    SetFeedSlotRecordPosition(slot, 3U);
+    assert(slot.written == 3U && std::all_of(slot.partitions.begin(), slot.partitions.end(), [](const auto& p) { return p.written == 3U; }));
+    assert(AdvanceFeedSlotRecord(slot, {}, 4U, false) && slot.written == 4U && slot.resync);
+    assert(AdvanceFeedSlotRecord(slot, {2U}, 5U) && slot.written == 4U && slot.resync && !slot.partitions[2].resync);
+    FeedSlotRecords updated{epoch, 20U, {slot}};
+    assert(ParseFeedSlotRecords(SerializeFeedSlotRecords(updated), epoch).slots[0].partitions == slot.partitions);
+
+    // CREATE SLOT checks the whole file: slots of 256 partitions fill 1 MiB at about 450.
+    FeedSlotRecords full{epoch, 0U, {}};
+    for (std::size_t i = 0U;; ++i) {
+        FeedSlotRecord wide{"wide_" + std::to_string(i), 0U, false};
+        wide.partitions.assign(256U, {0U, false});
+        bool room = true;
+        try { RequireFeedSlotRoom(full, wide); } catch (const std::out_of_range&) { room = false; }
+        if (!room) break;
+        full.slots.push_back(std::move(wide));
+    }
+    assert(full.slots.size() > 400U && full.slots.size() < 460U);
+    assert(SerializeFeedSlotRecords(full).size() <= 1024U * 1024U);
+    RequireFeedSlotRoom(full, FeedSlotRecord{"narrow", 0U, false});
+    FeedSlotRecords many{epoch, 0U, {}};
+    many.slots.assign(1024U, FeedSlotRecord{"a", 0U, false});
+    bool counted = false;
+    try { RequireFeedSlotRoom(many, FeedSlotRecord{"b", 0U, false}); } catch (const std::out_of_range&) { counted = true; }
+    assert(counted);
+
+    // The partition of a chunk is fixed by the storage format.
+    assert(FeedSlotPartitionOf({0, 0, 0}, 256U) == 145U && FeedSlotPartitionOf({1, 0, 0}, 256U) == 195U);
+    assert(FeedSlotPartitionOf({-1, -1, 0}, 256U) == 10U && FeedSlotPartitionOf({5, 7, 3}, 7U) == 0U);
+    assert(FeedSlotPartitionOf({5, 7, 3}, 4U) == 3U && FeedSlotPartitionOf({5, 7, 3}, 1U) == 0U);
+    assert(NormalizeFeedSlotPartitions({3U, 1U}, 4U) == (std::vector<std::uint16_t>{1U, 3U}));
+    assert(NormalizeFeedSlotPartitions({0U, 2U, 1U}, 3U).empty() && NormalizeFeedSlotPartitions({0U}, 1U).empty());
+    Reject([] { (void)NormalizeFeedSlotPartitions({1U, 1U}, 4U); });
+    Reject([] { (void)NormalizeFeedSlotPartitions({4U}, 4U); });
+    assert(FeedSlotPartitionsOverlap({}, {2U}) && FeedSlotPartitionsOverlap({0U, 2U}, {2U}));
+    assert(!FeedSlotPartitionsOverlap({0U, 2U}, {1U, 3U}));
+
+    FeedSlot view_slot{"parts", {epoch, 5U}, 20U};
+    view_slot.partitions = {{5U, false}, {20U, true}, {7U, false}};
+    view_slot.resync = true;
+    const auto low = FeedSlotPartitionView(view_slot, {0U, 2U});
+    assert(low.position.revision == 5U && !low.resync);
+    const auto high = FeedSlotPartitionView(view_slot, {1U});
+    assert(high.position.revision == 20U && high.resync);
+    assert(FeedSlotPartitionFloors(view_slot, {1U, 2U}) == (std::vector<std::uint64_t>{UINT64_MAX, 20U, 7U}));
+    assert(FeedSlotPartitionFloors(view_slot, {}) == (std::vector<std::uint64_t>{5U, 20U, 7U}));
+
+    // With three partitions, chunks (0, 0), (3, 0) and (2, 0) are in partitions 0, 1 and 2.
+    assert(FeedSlotPartitionOf({0, 0, 0}, 3U) == 0U && FeedSlotPartitionOf({3, 0, 0}, 3U) == 1U && FeedSlotPartitionOf({2, 0, 0}, 3U) == 2U);
+    FeedEntry change;
+    change.kind = FeedEntry::Kind::kChange; change.position = {epoch, 10U};
+    for (const std::int64_t x : {0, 3, 2}) {
+        FeedBlockChange block;
+        block.chunk = {x, 0, 0};
+        change.blocks.push_back(block);
+    }
+    change.protocol_frame = std::make_shared<const std::string>("frame");
+    const auto original = std::make_shared<const FeedEntry>(change);
+    const auto kept_change = PartitionFeedEntry(original, {5U, UINT64_MAX, 10U});
+    assert(kept_change && kept_change != original && kept_change->blocks.size() == 1U);
+    assert(kept_change->blocks[0].chunk.x == 0 && !kept_change->protocol_frame && kept_change->position.revision == 10U);
+    assert(PartitionFeedEntry(original, {5U, 5U, 5U}) == original && PartitionFeedEntry(original, {}) == original);
+    assert(!PartitionFeedEntry(original, {10U, UINT64_MAX, 10U}));
+    FeedEntry chunks;
+    chunks.kind = FeedEntry::Kind::kChunks; chunks.position = {epoch, 10U};
+    chunks.chunk_forms.emplace_back().chunk = {3, 0, 0};
+    chunks.chunk_changes.emplace_back().chunk = {2, 0, 0};
+    const auto forms = PartitionFeedEntry(std::make_shared<const FeedEntry>(chunks), {0U, 0U, UINT64_MAX});
+    assert(forms && forms->chunk_forms.size() == 1U && forms->chunk_changes.empty());
+    FeedEntry empty;
+    empty.kind = FeedEntry::Kind::kChange; empty.position = {epoch, 10U};
+    assert(!PartitionFeedEntry(std::make_shared<const FeedEntry>(empty), {0U, 0U, 0U}));
+    FeedEntry progress;
+    progress.kind = FeedEntry::Kind::kProgress; progress.position = {epoch, 10U};
+    const auto pushed = std::make_shared<const FeedEntry>(progress);
+    assert(PartitionFeedEntry(pushed, {UINT64_MAX, UINT64_MAX, UINT64_MAX}) == pushed);
+}
+
 }  // namespace
 
-int main() { Records(); Filters(); Dimensions(); AdmissionBounds(); Owners(); }
+int main() { Records(); Filters(); Dimensions(); AdmissionBounds(); Owners(); Partitions(); }

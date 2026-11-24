@@ -81,6 +81,9 @@ struct FeedSlotClaim {
     // receipts, and output above a share. Each stays within the table budget.
     const std::shared_ptr<std::atomic<std::size_t>> output_bytes;
     const std::shared_ptr<FeedExcessPool> excess;
+    // The partitions held, sorted; empty for the whole slot. Set before the
+    // claim is published.
+    std::vector<std::uint16_t> partitions{};
     FeedSlotClaim(std::string value, std::uint64_t revision, std::shared_ptr<std::atomic<std::size_t>> bytes,
         std::shared_ptr<FeedExcessPool> pool, std::string owner_user)
         : name(std::move(value)), user(std::move(owner_user)), completed(revision), output_bytes(std::move(bytes)),
@@ -202,6 +205,9 @@ class SlotWatch {
     const std::shared_ptr<FeedExcessPool> pool_;
     const FeedPosition start_;
     const FeedOptions options_;
+    // A partitioned slot's floors (FeedSlotPartitionFloors); set before the
+    // watch is published and empty without partitions.
+    std::vector<std::uint64_t> partition_floors_;
     mutable std::mutex mutex_;
     std::condition_variable closed_cv_;
     std::exception_ptr takeover_error_;

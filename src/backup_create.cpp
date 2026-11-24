@@ -18,6 +18,7 @@
 #include "chunk_coordinate_index.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "feed_slot_partitions.hpp"
 #include "feed_slots.hpp"
 #include "migrations_records.hpp"
 #include "snapshot_generation.hpp"
@@ -259,7 +260,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             save(table_root / ".chunkdb.initialized", initialized);
             if (auto slots = ReadFeedSlotRecords(store.data_dir_, store.store_id_, store.geometry_.dims())) {
                 slots->durable_watermark = std::min(slots->durable_watermark, cut);
-                for (auto& slot : slots->slots) slot.written = std::min(slot.written, slots->durable_watermark);
+                for (auto& slot : slots->slots) LowerFeedSlotRecordPositions(slot, slots->durable_watermark);
                 save(table_root / kFeedSlotsFileName, SerializeFeedSlotRecords(*slots));
             }
             record.tables.push_back({table->name(), store.store_id_, cut});

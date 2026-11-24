@@ -175,6 +175,9 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     if (request.kind == MigrationRequest::Kind::kCreateSlot && exists &&
                         existing->filters != MigrationSlotFilters(request, lease->store().geometry()))
                         throw FeedSlotFiltersError("feed slot filters differ from existing slot");
+                    // A migration creates only slots without partitions.
+                    if (request.kind == MigrationRequest::Kind::kCreateSlot && exists && !existing->partitions.empty())
+                        throw FeedSlotFiltersError("feed slot partitions differ from existing slot");
                     if (request.kind == MigrationRequest::Kind::kCreateSlot && exists && request.slot_owner_given &&
                         existing->owner != request.slot_owner)
                         throw FeedSlotFiltersError("feed slot owner differs from existing slot");
@@ -480,10 +483,11 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                 if (request.kind == MigrationRequest::Kind::kDropSlot) {
                     const auto at = table->slot_claims_.find(request.slot);
                     if (at != table->slot_claims_.end()) {
-                        if (const auto claim = at->second.lock()) claim->valid.store(false, std::memory_order_release);
+                        for (const auto& held : at->second)
+                            if (const auto claim = held.lock()) claim->valid.store(false, std::memory_order_release);
                         table->slot_claims_.erase(at);
                     }
-                    table->slot_ack_state_->pending.erase(request.slot);
+                    table->slot_ack_state_->Erase(request.slot);
                 }
                 table->EndExclusive(std::move(reopened), next_options);
             }

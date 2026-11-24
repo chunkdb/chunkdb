@@ -13,6 +13,8 @@ class FeedSlots;
 
 inline constexpr std::size_t kDefaultSlotMaxBytes = 1024ULL * 1024ULL * 1024ULL;
 inline constexpr std::chrono::milliseconds kDefaultSlotSyncInterval{100};
+// CREATE SLOT ... PARTITIONS takes 1 to this many.
+inline constexpr std::uint32_t kMaxFeedSlotPartitions = 256U;
 
 // Stable IDs survive column renames and determine projection identity.
 struct FeedSlotFilters {
@@ -22,6 +24,15 @@ struct FeedSlotFilters {
     bool chunks = false;
     friend bool operator==(const FeedSlotFilters&, const FeedSlotFilters&) = default;
     [[nodiscard]] bool empty() const noexcept { return !area && !column_ids && !no_before && !chunks; }
+};
+
+// One partition of a partitioned slot (docs/design/SLOT_PARTITIONS.md).
+struct FeedSlotPartition {
+    // The acknowledged revision of the partition's changes.
+    std::uint64_t written = 0;
+    // Its next watch starts with resync.
+    bool resync = false;
+    friend bool operator==(const FeedSlotPartition&, const FeedSlotPartition&) = default;
 };
 
 struct FeedSlot {
@@ -40,6 +51,11 @@ struct FeedSlot {
     bool resync = false;
     // Filled by a table listing: a watch holds the slot.
     bool attached = false;
+    // Empty for a slot without partitions; otherwise one per partition, and
+    // `position` and `resync` are the lowest of them and any of them.
+    std::vector<FeedSlotPartition> partitions{};
+    // Filled by a table listing: per partition, whether a watch holds it.
+    std::vector<bool> partitions_attached{};
 };
 
 class FeedSlotFiltersError : public std::invalid_argument {

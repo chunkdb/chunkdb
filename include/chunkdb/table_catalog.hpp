@@ -260,9 +260,11 @@ class Table : public std::enable_shared_from_this<Table> {
     // access; callers must not hold a Lease. Listing may hold a Lease.
     // Positions are persisted atomically and synced.
     // `owner` is recorded with a new slot. With `owner_given`, an existing
-    // slot that IF NOT EXISTS keeps must have that owner too.
+    // slot that IF NOT EXISTS keeps must have that owner too. `partitions`
+    // is 1 for a slot without partitions, or 2 to 256; an existing slot that
+    // IF NOT EXISTS keeps must have as many.
     [[nodiscard]] FeedSlot CreateFeedSlot(std::string_view name, bool if_not_exists = false, const FeedSlotFilters& filters = {},
-        std::optional<std::string> owner = std::nullopt, bool owner_given = false);
+        std::optional<std::string> owner = std::nullopt, bool owner_given = false, std::uint32_t partitions = 1U);
     void DropFeedSlot(std::string_view name, bool if_exists = false);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(bool include_lost = false);
     // ListFeedSlots on a TryAcquire lease: std::nullopt when TryAcquire gives none.
@@ -412,7 +414,8 @@ class Table : public std::enable_shared_from_this<Table> {
     std::size_t slot_max_bytes_ = kDefaultSlotMaxBytes;
     std::shared_ptr<ChangeFeed> feed_;
     std::size_t feed_subscriptions_ = 0;
-    std::map<std::string, std::weak_ptr<FeedSlotClaim>> slot_claims_;
+    // Per slot, the claims of its watches: one, or one per set of partitions.
+    std::map<std::string, std::vector<std::weak_ptr<FeedSlotClaim>>> slot_claims_;
     std::shared_ptr<FeedSlotAckState> slot_ack_state_;
     std::shared_ptr<std::atomic<std::size_t>> slot_output_bytes_ = std::make_shared<std::atomic<std::size_t>>(0U);
     std::shared_ptr<FeedExcessPool> slot_excess_;

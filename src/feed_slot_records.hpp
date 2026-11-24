@@ -26,6 +26,9 @@ struct FeedSlotRecord {
     // A restore or SWAP TABLES moved the slot to other data or another name:
     // its next watch starts with resync, until an acknowledgement advances it.
     bool resync = false;
+    // Empty without partitions; otherwise 2 to 256 entries, `written` is the
+    // lowest of their positions and `resync` is set when any of them is.
+    std::vector<FeedSlotPartition> partitions{};
 };
 
 struct FeedSlotRecords {
@@ -34,9 +37,14 @@ struct FeedSlotRecords {
     std::vector<FeedSlotRecord> slots;
     bool filter_format = false;
     std::uint8_t dims = 2U;
+    // Every slot record carries its partition count; requires slot_partitions.
+    bool partition_format = false;
 };
 
 void RequireValidFeedSlotName(std::string_view name);
+// Throws std::out_of_range when `slot` added to `records` would exceed what
+// chunkdb.slots holds: 1024 slots in 1 MiB.
+void RequireFeedSlotRoom(const FeedSlotRecords& records, const FeedSlotRecord& slot);
 // Owners are user names; the user need not exist.
 void RequireValidFeedSlotOwner(std::string_view owner);
 [[nodiscard]] std::vector<std::uint8_t> SerializeFeedSlotRecords(const FeedSlotRecords& records);

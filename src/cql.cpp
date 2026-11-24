@@ -1,5 +1,6 @@
 #include "cql.hpp"
 #include "cql_lexer.hpp"
+#include "chunkdb/feed_slots.hpp"
 #include "expr.hpp"
 
 #include <algorithm>
@@ -1175,6 +1176,11 @@ class Parser {
                     if (Accept("owner")) {
                         if (create.owner) Fail(column, "OWNER is given twice");
                         create.owner = Name("a user name");
+                    } else if (Accept("partitions")) {
+                        if (create.partitions) Fail(column, "PARTITIONS is given twice");
+                        const auto count_column = Peek().column;
+                        create.partitions = static_cast<std::uint32_t>(Unsigned("a partition count", kMaxFeedSlotPartitions));
+                        if (*create.partitions == 0U) Fail(count_column, "a partition count must be between 1 and 256");
                     } else if (!FeedFilter(create)) break;
                 }
                 return create;
@@ -1516,6 +1522,15 @@ class Parser {
                 } else if (Accept("takeover")) {
                     if (watch.takeover) Fail(column, "TAKEOVER is given twice");
                     watch.takeover = true;
+                } else if (Accept("partition")) {
+                    if (!watch.partitions.empty()) Fail(column, "PARTITION is given twice");
+                    do {
+                        const auto at = Peek().column;
+                        const auto partition = static_cast<std::uint16_t>(Unsigned("a partition", kMaxFeedSlotPartitions - 1U));
+                        if (std::find(watch.partitions.begin(), watch.partitions.end(), partition) != watch.partitions.end())
+                            Fail(at, "partition " + std::to_string(partition) + " is given twice");
+                        watch.partitions.push_back(partition);
+                    } while (AcceptToken(TokenKind::kComma));
                 } else if (Accept("ack")) {
                     if (watch.ack_timeout_ms) Fail(column, "ACK TIMEOUT is given twice");
                     Expect("timeout");
@@ -1541,6 +1556,7 @@ class Parser {
             }
             if (watch.ack_timeout_ms && !watch.slot) Fail(1, "ACK TIMEOUT requires SLOT");
             if (watch.takeover && !watch.slot) Fail(1, "TAKEOVER requires SLOT");
+            if (!watch.partitions.empty() && !watch.slot) Fail(1, "PARTITION requires SLOT");
             return watch;
         }
         if (Accept("scan")) {

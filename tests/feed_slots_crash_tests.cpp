@@ -46,6 +46,11 @@ constexpr std::array<const char*, 4U> kPoints{
 constexpr std::array<DurabilityMode, 3U> kModes{
     DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint};
 
+// A crash before or after a slot record replace (docs/design/SLOT_PARTITIONS.md).
+constexpr std::array<const char*, 2U> kRecordPoints{
+    "CHUNKDB_FAILPOINT_CRASH_SLOT_RECORDS_BEFORE_REPLACE_ONCE",
+    "CHUNKDB_FAILPOINT_CRASH_SLOT_RECORDS_AFTER_REPLACE_ONCE"};
+
 CatalogConfig CrashConfig(const std::filesystem::path& path, DurabilityMode mode) {
     auto config = Config(path);
     config.default_options.durability_mode = mode;
@@ -247,6 +252,63 @@ int Crash(const std::filesystem::path& path, DurabilityMode mode, const char* po
     return 3;  // Reaching here means the claimed crash point was not reached.
 }
 
+// The child's step that replaces the records: creating a partitioned slot,
+// or flushing an ACK of partitions 1 and 3.
+int PartitionCrash(const std::filesystem::path& path, const char* point, std::string_view step) {
+    TableCatalog catalog(CrashConfig(path, DurabilityMode::kFsyncWal));
+    auto table = catalog.Find("default");
+    if (step == "create") {
+        txn_test::ScopedEnv armed(point, "1");
+        (void)table->CreateFeedSlot("parts", false, {}, std::nullopt, false, 4U);
+        return 3;
+    }
+    const auto slot = table->ListFeedSlots().front();
+    FeedSlotTestAccess::StageAck(*table, "parts", {slot.position.epoch, slot.durable_watermark}, {1U, 3U});
+    txn_test::ScopedEnv armed(point, "1");
+    (void)FeedSlotTestAccess::FlushAcks(*table, true, std::chrono::steady_clock::now());
+    return 3;
+}
+
+// After the crash the records hold the change for every partition or for none.
+void PartitionCase(const std::string& executable, const char* point, std::string_view step) {
+    test::ScopedTempDir directory("chunkdb-feed-slot-partition-crash");
+    std::cout << "partitions " << step << ' ' << point << '\n' << std::flush;
+    const auto config = CrashConfig(directory.path(), DurabilityMode::kFsyncWal);
+    std::uint64_t start = 0U, frontier = 0U;
+    {
+        TableCatalog catalog(config);
+        auto table = feed_test::CreateDefault(catalog);
+        if (step == "ack") {
+            start = table->CreateFeedSlot("parts", false, {}, std::nullopt, false, 4U).position.revision;
+            {
+                auto lease = table->Acquire();
+                lease->store().SetBlockBits(0, 0, Bits(5U));
+            }
+            FeedSlotTestAccess::Sync(*table);
+            frontier = table->ListFeedSlots().front().durable_watermark;
+            assert(frontier > start);
+        }
+    }
+    const auto exit_code = RunChild(executable, {"--partition-crash", directory.path().string(), point, std::string(step)});
+    if (exit_code != kCrashExit)
+        throw std::runtime_error("partition crash child did not reach " + std::string(point) + " exit=" + std::to_string(exit_code));
+    TableCatalog catalog(config);
+    auto table = catalog.Find("default");
+    const auto slots = table->ListFeedSlots();
+    const bool after = std::string_view(point).find("AFTER") != std::string_view::npos;
+    if (step == "create") {
+        assert(slots.size() == (after ? 1U : 0U));
+        if (after) {
+            assert(slots[0].partitions.size() == 4U);
+            for (const auto& partition : slots[0].partitions) assert(partition.written == slots[0].position.revision);
+        }
+        return;
+    }
+    assert(slots.size() == 1U && slots[0].partitions.size() == 4U && slots[0].position.revision == start);
+    for (std::size_t i = 0U; i < 4U; ++i)
+        assert(slots[0].partitions[i].written == (after && (i == 1U || i == 3U) ? frontier : start));
+}
+
 using Row = std::pair<std::optional<std::uint32_t>, std::optional<std::uint32_t>>;
 
 void Value(const std::optional<std::vector<ColumnValue>>& actual, std::optional<std::uint32_t> value) {
@@ -366,6 +428,7 @@ int main(int argc, char** argv) {
     try {
         if (argc == 6 && std::string_view(argv[1]) == "--crash")
             return Crash(argv[2], ParseDurabilityMode(argv[3]), argv[4], std::string_view(argv[5]) == "empty");
+        if (argc == 5 && std::string_view(argv[1]) == "--partition-crash") return PartitionCrash(argv[2], argv[3], argv[4]);
         assert(argc == 1);
         ChildDeadline(std::filesystem::absolute(argv[0]).string());
         ExitWhileBusyEnds(std::filesystem::absolute(argv[0]).string());
@@ -376,6 +439,9 @@ int main(int argc, char** argv) {
                 ++count;
             }
         std::cout << count << " archive crash scenarios passed\n";
+        for (const auto* point : kRecordPoints)
+            for (const std::string_view step : {"create", "ack"}) PartitionCase(std::filesystem::absolute(argv[0]).string(), point, step);
+        std::cout << "partition record crash scenarios passed\n";
     } catch (const std::exception& error) {
         std::cerr << "FAIL feed_slots_crash: " << error.what() << '\n';
         return 1;

@@ -23,6 +23,7 @@
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
 #include "feature_activation_records.hpp"
+#include "feed_slot_partitions.hpp"
 #include "feed_slots.hpp"
 #include "backup.hpp"
 #include "slot_watch.hpp"
@@ -557,9 +558,10 @@ void Table::StopFeed() {
 }
 
 FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const FeedSlotFilters& filters,
-    std::optional<std::string> owner, bool owner_given) {
+    std::optional<std::string> owner, bool owner_given, std::uint32_t partitions) {
     RequireValidFeedSlotName(name);
     if (owner) RequireValidFeedSlotOwner(*owner);
+    if (partitions == 0U || partitions > kMaxFeedSlotPartitions) throw std::invalid_argument("PARTITIONS must be between 1 and 256");
     std::lock_guard ddl(ddl_mutex_);
     if (if_not_exists) {
         auto lease = Acquire();
@@ -572,6 +574,8 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
         const auto existing = std::find_if(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; });
         if (existing != slots.end()) {
             if (existing->filters != filters) throw FeedSlotFiltersError("feed slot filters differ from existing slot");
+            if (FeedSlotPartitionCount(existing->partitions) != partitions)
+                throw FeedSlotFiltersError("feed slot partitions differ from existing slot");
             if (owner_given && existing->owner != owner) throw FeedSlotFiltersError("feed slot owner differs from existing slot");
             return *existing;
         }
@@ -581,6 +585,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
         if (!lease) throw TableNotFoundError("table was dropped");
         RequireFeature(lease->store().features(), *FindFeature("feed_slots"));
         if (!filters.empty()) RequireFeature(lease->store().features(), *FindFeature("slot_filters"));
+        if (partitions > 1U) RequireFeature(lease->store().features(), *FindFeature("slot_partitions"));
     }
     auto store = BeginExclusive();
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
@@ -590,6 +595,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     store->ThrowIfDurabilityPoisoned();
     RequireFeature(store->features(), *FindFeature("feed_slots"));
     if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
+    if (partitions > 1U) RequireFeature(store->features(), *FindFeature("slot_partitions"));
     // Validate the complete filter before baseline, feature or record publication.
     (void)SerializeFeedSlotRecords(FeedSlotRecords{store_id_, 0U, {{std::string(name), 0U, false, filters, false, owner}},
         false, store->geometry_.dims()});
@@ -602,6 +608,12 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     const auto slots = store->feed_slots_->List();
     if (std::any_of(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; }))
         throw std::invalid_argument("feed slot already exists: " + std::string(name));
+    // Refuse a slot the records cannot hold before any baseline work.
+    {
+        FeedSlotRecord created{std::string(name), 0U, false, filters, false, owner};
+        if (partitions > 1U) created.partitions.assign(partitions, FeedSlotPartition{0U, false});
+        store->feed_slots_->RequireRoom(created);
+    }
     // Allocate before publishing a slot. Maintenance and cross-table eviction
     // do not take Table leases, so quiesce both before changing cached flags.
     if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
@@ -613,7 +625,8 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     });
     std::unique_lock eviction_lock(store->resources_->stores_mutex_);
     PrepareFeedSlotBaseline(*store);
-    return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U, false, filters, std::move(owner));
+    return store->feed_slots_->Create(name, store->version_clock_.load(std::memory_order_seq_cst) - 1U, false, filters, std::move(owner),
+        partitions);
 }
 
 void Table::PrepareFeedSlotBaseline(ChunkStore& store) {
@@ -693,7 +706,8 @@ void Table::DropFeedSlot(std::string_view name, bool if_exists) {
     const auto claimed = slot_claims_.find(std::string(name));
     store->feed_slots_->Drop(name);
     if (claimed != slot_claims_.end()) {
-        if (auto claim = claimed->second.lock()) claim->valid.store(false, std::memory_order_release);
+        for (const auto& held : claimed->second)
+            if (auto claim = held.lock()) claim->valid.store(false, std::memory_order_release);
         slot_claims_.erase(claimed);
     }
     store->feed_slots_->Retain();
@@ -720,9 +734,18 @@ std::vector<FeedSlot> Table::ListFeedSlots(const Lease& lease, bool include_lost
     auto slots = lease.store().feed_slots_->List(include_lost);
     const auto& columns = lease.store().geometry().layout().schema().columns;
     for (auto& slot : slots) {
-        // ClaimFeedSlot refuses a second watch by the same rule.
+        // ClaimFeedSlot refuses a second watch of the same partitions by the same rule.
+        slot.partitions_attached.assign(FeedSlotPartitionCount(slot.partitions), false);
         if (const auto claimed = slot_claims_.find(slot.name); claimed != slot_claims_.end())
-            if (const auto claim = claimed->second.lock()) slot.attached = claim->valid.load(std::memory_order_acquire);
+            for (const auto& held : claimed->second) {
+                const auto claim = held.lock();
+                if (!claim || !claim->valid.load(std::memory_order_acquire)) continue;
+                slot.attached = true;
+                for (std::size_t i = 0U; i < slot.partitions_attached.size(); ++i)
+                    if (claim->partitions.empty() ||
+                        std::binary_search(claim->partitions.begin(), claim->partitions.end(), static_cast<std::uint16_t>(i)))
+                        slot.partitions_attached[i] = true;
+            }
         if (!slot.filters.column_ids) continue;
         for (const auto id : *slot.filters.column_ids) {
             const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
@@ -758,6 +781,7 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
     const std::function<void(std::string_view)>& authorize_owner) {
     std::shared_ptr<FeedSlotClaim> old;
     std::shared_ptr<SlotWatch> owner;
+    std::vector<std::uint16_t> partitions;
     const auto validate = [&](ChunkStore& store) {
         if (store.access_mode_ != AccessMode::kReadWrite || store.allow_multiple_processes_)
             throw std::invalid_argument("feed slots require a single-process read-write table");
@@ -770,23 +794,43 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
             (options.column_ids && options.column_ids != slot.filters.column_ids) ||
             (options.no_before && !slot.filters.no_before) || (options.chunks && !slot.filters.chunks))
             throw FeedSlotFiltersError("feed slot filters differ from WATCH filters");
+        // Naming every partition, or partition 0 of a slot without partitions, holds the whole slot.
+        partitions = NormalizeFeedSlotPartitions(options.partitions, FeedSlotPartitionCount(slot.partitions));
         return slot;
+    };
+    // The watches holding a partition this one asks for. A claim that is
+    // gone or no longer valid holds nothing and leaves the list.
+    const auto holders = [&](std::vector<std::weak_ptr<FeedSlotClaim>>& claims) {
+        std::erase_if(claims, [](const auto& held) {
+            const auto claim = held.lock();
+            return !claim || !claim->valid.load(std::memory_order_acquire);
+        });
+        std::vector<std::shared_ptr<FeedSlotClaim>> result;
+        for (const auto& held : claims)
+            if (auto claim = held.lock(); claim && FeedSlotPartitionsOverlap(claim->partitions, partitions))
+                result.push_back(std::move(claim));
+        return result;
+    };
+    const auto publish = [&](ChunkStore& store, std::vector<std::weak_ptr<FeedSlotClaim>>& claims, FeedSlot slot) {
+        auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store.version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_, std::move(user));
+        claim->partitions = partitions;
+        claims.push_back(claim);
+        return std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>>{FeedSlotPartitionView(std::move(slot), partitions), std::move(claim)};
     };
     {
         auto store = BeginExclusive();
         if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
         ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
         auto slot = validate(*store);
-        auto& existing = slot_claims_[std::string(name)];
-        old = existing.lock();
-        if (old && old->takeover_pending.load(std::memory_order_acquire))
+        auto& claims = slot_claims_[std::string(name)];
+        const auto held = holders(claims);
+        if (std::any_of(held.begin(), held.end(), [](const auto& claim) { return claim->takeover_pending.load(std::memory_order_acquire); }))
             throw FeedSlotBusyError("feed slot ownership handoff is pending", "takeover_pending");
-        if (!old || !old->valid.load(std::memory_order_acquire)) {
-            auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_, std::move(user));
-            existing = claim;
-            return {std::move(slot), std::move(claim)};
-        }
+        if (held.empty()) return publish(*store, claims, std::move(slot));
         if (!takeover) throw FeedSlotBusyError("feed slot already has a watch");
+        // TAKEOVER replaces one watch.
+        if (held.size() != 1U) throw FeedSlotBusyError("feed slot partitions are held by several watches");
+        old = held.front();
         if (authorize_owner) authorize_owner(old->user);
         {
             std::lock_guard lock(old->owner_mutex);
@@ -819,13 +863,17 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
     if (!store) throw TableNotFoundError("table '" + name_ + "' was dropped");
     ScopeExit serving([&] { EndExclusive(std::move(store), options_); });
     const auto found = slot_claims_.find(std::string(name));
-    if (!old->valid.load(std::memory_order_acquire) || found == slot_claims_.end() || found->second.lock() != old)
+    if (!old->valid.load(std::memory_order_acquire) || found == slot_claims_.end() ||
+        std::none_of(found->second.begin(), found->second.end(), [&](const auto& held) { return held.lock() == old; }))
         throw FeedSlotLostError("feed slot was removed during takeover");
     auto slot = validate(*store);
-    auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_, std::move(user));
+    // Another watch may have taken a partition the replaced one did not hold.
+    const auto held = holders(found->second);
+    if (std::any_of(held.begin(), held.end(), [&](const auto& claim) { return claim != old; }))
+        throw FeedSlotBusyError("feed slot already has a watch");
     old->valid.store(false, std::memory_order_release);
-    found->second = claim;
-    return {std::move(slot), std::move(claim)};
+    std::erase_if(found->second, [&](const auto& claim) { return claim.lock() == old; });
+    return publish(*store, found->second, std::move(slot));
 }
 
 void Table::BindClaimedFeedSlotOwner(const std::shared_ptr<FeedSlotClaim>& claim, const std::string& owner) {
@@ -842,7 +890,7 @@ FeedSlot Table::ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim)
     const auto slot = lease->store().feed_slots_->Get(claim->name);
     if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
         slot.schema_filter_lost ? "schema_filter" : "retention_limit");
-    return slot;
+    return FeedSlotPartitionView(slot, claim->partitions);
 }
 
 void Table::SyncClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim) {
@@ -870,7 +918,7 @@ void Table::StageClaimedFeedSlotAck(const std::shared_ptr<FeedSlotClaim>& claim,
     auto lease = Acquire();
     if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
     if (!claim->valid.load(std::memory_order_acquire)) throw FeedSlotLostError("feed slot was removed");
-    lease->store().feed_slots_->StageAck(claim->name, position);
+    lease->store().feed_slots_->StageAck(claim->name, position, claim->partitions);
 }
 
 void Table::FlushClaimedFeedSlotAcks(const std::shared_ptr<FeedSlotClaim>& claim, bool force) {

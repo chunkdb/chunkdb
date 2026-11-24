@@ -596,6 +596,9 @@ void ValidateTableCut(const std::filesystem::path& dir, const BackupTableCut& cu
             throw std::runtime_error("backup slot frontier exceeds cut or has no feature");
         if (slots->filter_format && (manifest->features.incompat & kFeatureSlotFilters) == 0U)
             throw std::runtime_error("backup slot filters have no storage feature");
+        if (slots->partition_format && (manifest->features.incompat & kFeatureSlotPartitions) == 0U)
+            throw std::runtime_error("backup slot partitions have no storage feature");
+        // A partition position is at or below its record's watermark, which is at or below the cut.
         for (const auto& slot : slots->slots) if (slot.written > cut.revision) throw std::runtime_error("backup slot exceeds cut");
     }
     const auto prefix = "tables/" + cut.name + "/";
