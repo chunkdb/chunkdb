@@ -1,4 +1,3 @@
-    if (selected == "all" || selected == "clock-stats") TestVersionClockCountsCeilingWrites();
 #include <atomic>
 #include <cassert>
 #include <chrono>
