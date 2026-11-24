@@ -616,46 +616,58 @@ void TestRelaxedBoundaryMakesImageDurable() {
 }
 
 // A table created in this process, in relaxed mode, has seen no barrier.
-// A committed transaction is durable in every mode, so a later checkpoint
-// of its chunk syncs the image and its directory before it removes the WAL
-// that holds the commit, as after a barrier or a reopen.
+// A committed transaction is durable in every mode, and a conditional write
+// syncs its WAL for its rollback, so a later checkpoint of the chunk syncs
+// the image and its directory before it removes the WAL that holds the
+// commit, as after a barrier or a reopen.
 void TestRelaxedCommitSetsDurabilityFloor() {
-    ScopedTempDir dir("chunkdb-txn-commit-relaxed-floor");
-    auto config = Config(dir.path(), chunkdb::DurabilityMode::kRelaxed);
-    config.checkpoint_update_interval = 1000;
-    config.checkpoint_wal_bytes = 1U << 20U;
-    config.wal_group_commit_updates = 1;
-    {
-        ChunkStore store(config);
-        // Directory syncs of a chunk's large-chunk directory while it is
-        // checkpointed.
-        const auto checkpoint_dir_syncs = [&](const ChunkCoord& coord) {
-            const auto large_dir = chunkdb::ChunkDataPath(store.data_dir(), store.geometry(), coord).parent_path();
-            std::mutex mutex;
-            std::size_t syncs = 0;
-            chunkdb::SetDirectorySyncObserverForTests([&](const std::filesystem::path& path) {
-                std::error_code ec;
-                if (std::filesystem::equivalent(path, large_dir, ec) && !ec) {
-                    std::lock_guard lock(mutex);
-                    ++syncs;
-                }
-            });
-            store.CheckpointForTests(coord.x, coord.y);
-            chunkdb::SetDirectorySyncObserverForTests({});
-            assert(std::filesystem::exists(chunkdb::ChunkDataPath(store.data_dir(), store.geometry(), coord)));
-            assert(!std::filesystem::exists(WalOf(store, coord)));
-            return syncs;
-        };
-        // Before the commit a relaxed checkpoint syncs nothing.
-        WriteCounter(store, kC, 1);
-        assert(checkpoint_dir_syncs(kC) == 0U);
+    const auto run = [](const char* name, const std::function<void(ChunkStore&)>& commit) {
+        ScopedTempDir dir(name);
+        auto config = Config(dir.path(), chunkdb::DurabilityMode::kRelaxed);
+        config.checkpoint_update_interval = 1000;
+        config.checkpoint_wal_bytes = 1U << 20U;
+        config.wal_group_commit_updates = 1;
+        {
+            ChunkStore store(config);
+            // Directory syncs of a chunk's large-chunk directory while it is
+            // checkpointed.
+            const auto checkpoint_dir_syncs = [&](const ChunkCoord& coord) {
+                const auto large_dir = chunkdb::ChunkDataPath(store.data_dir(), store.geometry(), coord).parent_path();
+                std::mutex mutex;
+                std::size_t syncs = 0;
+                chunkdb::SetDirectorySyncObserverForTests([&](const std::filesystem::path& path) {
+                    std::error_code ec;
+                    if (std::filesystem::equivalent(path, large_dir, ec) && !ec) {
+                        std::lock_guard lock(mutex);
+                        ++syncs;
+                    }
+                });
+                store.CheckpointForTests(coord.x, coord.y);
+                chunkdb::SetDirectorySyncObserverForTests({});
+                assert(std::filesystem::exists(chunkdb::ChunkDataPath(store.data_dir(), store.geometry(), coord)));
+                assert(!std::filesystem::exists(WalOf(store, coord)));
+                return syncs;
+            };
+            // Before the commit a relaxed checkpoint syncs nothing.
+            WriteCounter(store, kC, 1);
+            assert(checkpoint_dir_syncs(kC) == 0U);
 
+            commit(store);
+            assert(checkpoint_dir_syncs(kA) > 0U);
+        }
+        ChunkStore reopened(config);
+        assert(ReadCounter(reopened, kA) == 7U && ReadCounter(reopened, kC) == 1U);
+    };
+    run("chunkdb-txn-commit-relaxed-floor", [](ChunkStore& store) {
         auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
         assert(store.CommitTransaction(*snapshot, {}, Writes(store, *snapshot, {{kA, 7}})) > 0U);
-        assert(checkpoint_dir_syncs(kA) > 0U);
-    }
-    ChunkStore reopened(config);
-    assert(ReadCounter(reopened, kA) == 7U && ReadCounter(reopened, kC) == 1U);
+    });
+    run("chunkdb-txn-commit-relaxed-floor-cas", [](ChunkStore& store) {
+        WriteCounter(store, kA, 1);
+        auto state = store.ReadChunkState(kA.x, kA.y);
+        SetCounter(&state, 7);
+        assert(store.CasChunkStateBytes(kA.x, kA.y, state.version, state.payload, state.presence_bitmap).ok);
+    });
 }
 
 // Few WAL streams, all held by chunks the commit only reads: the commit
