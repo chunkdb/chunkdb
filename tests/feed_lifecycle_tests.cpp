@@ -313,6 +313,11 @@ void WritingUser(bool authenticated) {
     assert(!Next(*feed)->user);
 }
 
+// Whether the entry carries exactly this one message.
+bool OnlyMessage(const FeedEntry& entry, std::string_view channel, std::string_view payload) {
+    return entry.messages.size() == 1U && entry.messages[0].channel == channel && entry.messages[0].payload == payload;
+}
+
 std::uint64_t VersionReply(const std::string& reply) {
     assert(reply.size() > 3U && reply.front() == ':');
     return std::stoull(reply.substr(1U));
@@ -332,7 +337,7 @@ void MessagesRideTheirCommit() {
     const auto first = VersionReply(engine.Execute(session, "SET BLOCK 0 0 IN notes kind = 1 PUBLISH 'orders.paid' 'order 7'\r\n"));
     auto entry = Next(*feed);
     assert(entry->position.revision == first && entry->blocks.size() == 1U);
-    assert(entry->messages == (std::vector<FeedMessage>{{"orders.paid", "order 7"}}));
+    assert(OnlyMessage(*entry, "orders.paid", "order 7"));
     assert(entry->protocol_frame->starts_with(">11\r\n$6\r\nchange\r\n"));
     assert(entry->protocol_frame->ends_with("*1\r\n*2\r\n$11\r\norders.paid\r\n$7\r\norder 7\r\n"));
 
@@ -341,7 +346,7 @@ void MessagesRideTheirCommit() {
     assert(second > first);
     entry = Next(*feed);
     assert(entry->position.revision == second && entry->blocks.empty());
-    assert(entry->messages == (std::vector<FeedMessage>{{"orders", std::string("\0\xff", 2U)}}));
+    assert(OnlyMessage(*entry, "orders", std::string_view("\0\xff", 2U)));
     // Without a message it commits nothing; the next change is the DELETE.
     assert(VersionReply(engine.Execute(session, "SET BLOCK 0 0 IN notes kind = 1\r\n")) == second);
     const std::vector<std::optional<std::string>> payload{std::string("\0\1", 2U)};
@@ -364,14 +369,14 @@ void MessagesRideTheirCommit() {
     const auto committed = VersionReply(engine.Execute(session, "COMMIT\r\n"));
     entry = Next(*feed);
     assert(entry->position.revision == committed && entry->blocks.size() == 2U);
-    assert(entry->messages == (std::vector<FeedMessage>{{"orders", "both"}}));
+    assert(OnlyMessage(*entry, "orders", "both"));
     // A transaction that publishes commits even when it changes nothing.
     assert(engine.Execute(session, "BEGIN\r\n") == "+OK\r\n");
     assert(engine.Execute(session, "SET BLOCK 2 2 IN notes kind = 3 PUBLISH 'audit' 'same'\r\n") == "_\r\n");
     const auto unchanged = VersionReply(engine.Execute(session, "COMMIT\r\n"));
     entry = Next(*feed);
     assert(entry->position.revision == unchanged && entry->blocks.empty());
-    assert(entry->messages == (std::vector<FeedMessage>{{"audit", "same"}}));
+    assert(OnlyMessage(*entry, "audit", "same"));
 }
 
 // Only AREA drops a change, with its messages; the wire form adds the

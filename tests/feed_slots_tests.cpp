@@ -223,6 +223,9 @@ void AllMutationsAndRelease() {
     assert(table->ListFeedSlots().empty());
 }
 
+bool OnlyMessage(const FeedEntry& entry, const FeedMessage& message) {
+    return entry.messages.size() == 1U && entry.messages[0] == message;
+}
 // A slot replays each message from the WAL frame its commit wrote, also after
 // a checkpoint archived that WAL and the server restarted.
 void MessagesInSlotHistory() {
@@ -273,9 +276,9 @@ void MessagesInSlotHistory() {
             store.CheckpointForTests(0, 0);
             store.CheckpointForTests(1, 0);
         }
-        assert(live[0]->messages == std::vector<FeedMessage>{paid} && live[1]->messages == std::vector<FeedMessage>{cas});
-        assert(live[2]->messages == std::vector<FeedMessage>{both} && live[2]->blocks.size() == 2U);
-        assert(live[3]->messages == std::vector<FeedMessage>{same} && live[3]->blocks.empty());
+        assert(OnlyMessage(*live[0], paid) && OnlyMessage(*live[1], cas));
+        assert(OnlyMessage(*live[2], both) && live[2]->blocks.size() == 2U);
+        assert(OnlyMessage(*live[3], same) && live[3]->blocks.empty());
         FeedSlotTestAccess::Sync(*table);
     }
     TableCatalog catalog(config);
