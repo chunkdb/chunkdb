@@ -1333,7 +1333,10 @@ void TableCatalog::RemoveInterruptedOperations(std::string_view table) {
         const std::filesystem::directory_iterator end;
         std::vector<std::filesystem::path> leftovers;
         for (; !ec && it != end; it.increment(ec)) {
-            if (it->path().filename().string().starts_with(prefix)) leftovers.push_back(it->path());
+            const auto name = it->path().filename().string();
+            // A RESTORE TABLE still copying into this name keeps its staging.
+            if (dir == StagingDir() && restore_staging_.contains(name)) continue;
+            if (name.starts_with(prefix)) leftovers.push_back(it->path());
         }
         if (ec) {
             throw std::runtime_error("cannot list " + dir.string() + ": " + ec.message());
@@ -1996,6 +1999,11 @@ void TableCatalog::Drop(std::string_view name, bool if_exists) {
 void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exists) {
     RequireWritable("DROP TABLE");
     auto metadata = LockFeatureMetadataShared();
+    // As RENAME TO: backup metadata capture and pinning exclude a drop, so a
+    // backup holds the table with its grants, or neither.
+    if (!backup_metadata_gate_.lock_shared(StatementStopToken())) CheckStatementCancellation();
+    std::shared_lock backup_metadata(backup_metadata_gate_, std::adopt_lock);
+    CheckStatementCancellation();
     auto table = Find(name);
     if (!table && if_exists) {
         RequireValidTableName(name);
