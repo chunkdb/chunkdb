@@ -148,7 +148,7 @@ class ScopeExit {
 
 void CrashAtFailpoint(const char* key) {
     if (ConsumeFailpointEnv(key)) {
-        std::_Exit(86);
+        ExitAbruptly(86);
     }
 }
 

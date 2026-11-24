@@ -20,6 +20,7 @@
 
 #include "chunkdb/chunk_columns.hpp"
 #include "chunkdb/chunk_store.hpp"
+#include "chunk_store_internal.hpp"
 #include "txn_test_utils.hpp"
 
 namespace {
@@ -401,7 +402,7 @@ int RunWholeState3DChild(const std::filesystem::path& dir, DurabilityMode mode, 
         return 3;
     }
     if (store.WriteChunkState(coord, state, std::nullopt).version != reserved) return 4;
-    std::_Exit(kCrashExit);
+    chunkdb::ExitAbruptly(kCrashExit);
 }
 
 // After the restart the chunk holds its old state or all of the new one with
