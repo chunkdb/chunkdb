@@ -14,6 +14,7 @@
 #include "chunk_store_internal.hpp"
 #include "feed_test_utils.hpp"
 #include "store_manifest.hpp"
+#include "feed_slot_records.hpp"
 #include "users.hpp"
 #include "wal_archive.hpp"
 
@@ -186,7 +187,8 @@ void DirectoryArchive() {
         Write(*table, 0, 0, 3U);
         const auto second = Completed(*table);
         catalog.RunArchivePass();
-        entry = Entry(Records(archive, directory).back(), epoch);
+        const auto latest = Records(archive, directory);
+        entry = Entry(latest.back(), epoch);
         assert(entry && entry->revision == second && entry->schema_version == 2U);
         assert(Files(files, ".manifest").size() == 2U);
         // The chunk's two segments follow each other without overlap.

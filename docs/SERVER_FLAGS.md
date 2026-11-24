@@ -136,6 +136,22 @@ The cache setting also bounds large-chunk containers shared by the tables, inclu
 A new cache miss that cannot fit returns `BUSY reason=large_chunk_cache_full` before applying a mutation; existing container hits remain usable.
 Raise `--max-loaded-chunks` to raise the associated container limit.
 
+## WAL archive
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--archive-dir` | unset | Copies every table's sealed WAL segments, manifests, users file and migrations ledger to this directory, which must not contain or lie in `--data-dir`. |
+| `--archive-command` | unset | Instead of `--archive-dir`, runs this command through the system shell for each file: `%p` is its local path, `%f` its name in the archive, `%%` a `%`; exit status 0 means archived. |
+| `--archive-interval-ms` | `60000` | 100 to 86400000; how often every table is sealed and its files shipped. |
+| `--archive-retention-ms` | `0` | With `--archive-dir`, how long seal records and the segments only they need are kept; `0` keeps everything. |
+
+The two archive flags exclude each other, and `--read-only` refuses them.
+A pass also runs when the server starts and at clean shutdown; see [WAL archive](DURABILITY_CONTRACT.md#wal-archive) for what a seal record guarantees.
+`--archive-command` must succeed again for a file it already archived with the same bytes, for example `--archive-command 'aws s3 cp %p s3://bucket/chunkdb/%f'`.
+While shipping fails, the files wait in the data directory and SHOW STATUS reports `archive` with the error and `staged_bytes`.
+A table needs the `feed_slots` feature, which tables created by this version have; for an older table, start without the archive flags, run `ENABLE FEATURE 'feed_slots'` and restart.
+Starting a writer without the archive flags ends the archive's chain of seal records; the next start with them begins a new chain.
+
 ## Read-only
 
 `--read-only` serves a data directory, or a completed [backup](BACKUP.md#3-inspect-a-backup), without writing to its files.

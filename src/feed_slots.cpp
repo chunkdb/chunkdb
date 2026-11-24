@@ -761,22 +761,26 @@ void FeedSlots::Retain() {
 }
 std::size_t FeedSlots::StageForArchive(const std::filesystem::path& directory) {
     store_.ThrowIfDurabilityPoisoned();
-    std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
-    std::lock_guard lock(mutex_);
     std::vector<std::string> names;
-    for (const auto& segment : Segments(store_.data_dir_, store_.geometry_.dims())) {
-        auto name = segment.wal.filename().string();
-        if (staged_.contains(name)) continue;
-        if (names.empty()) (void)EnsureDirectoryPathExists(directory, true);
-        if (std::filesystem::exists(segment.descriptor))
-            LinkStaged(segment.descriptor, directory / segment.descriptor.filename());
-        LinkStaged(segment.wal, directory / name);
-        names.push_back(std::move(name));
+    {
+        std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
+        std::lock_guard lock(mutex_);
+        for (const auto& segment : Segments(store_.data_dir_, store_.geometry_.dims())) {
+            auto name = segment.wal.filename().string();
+            if (staged_.contains(name)) continue;
+            if (names.empty()) (void)EnsureDirectoryPathExists(directory, true);
+            if (std::filesystem::exists(segment.descriptor))
+                LinkStaged(segment.descriptor, directory / segment.descriptor.filename());
+            LinkStaged(segment.wal, directory / name);
+            names.push_back(std::move(name));
+        }
     }
     if (names.empty()) return 0U;
-    // Retention removes a staged segment's archive name; its staged name
-    // must be durable first.
+    // Retention removes only names in staged_, so a staged segment keeps its
+    // archive name until its staged name is durable. The sync runs without
+    // the publish lock, so checkpoints do not wait for it.
     SyncDirectoryPath(directory);
+    std::lock_guard lock(mutex_);
     staged_.insert(names.begin(), names.end());
     return names.size();
 }

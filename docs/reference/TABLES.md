@@ -145,7 +145,7 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 - RENAME TO: `OK` once the new name serves the table.
 - SHOW TABLES: accessible table names, fenced tables included.
 - DESCRIBE: schema version, column definitions, geometry, options, table epoch, completed revision, dimensions, and chunk columns; a table with checks adds `checks`, a list of maps with `name` and `expression`; a fenced table adds `fenced` with its reason.
-- SHOW STATUS: `version`, the `server_version` HELLO reports, `uptime_ms` since the server started, `read_only`, `directory` features, `tables`, `fenced`, and `activation_pending`; each `tables` entry has `name`, `state`, `reason`, `enabled`, `compat`, `ro_compat`, and `incompat`, and each `fenced` entry has `name` and `reason`.
+- SHOW STATUS: `version`, the `server_version` HELLO reports, `uptime_ms` since the server started, `read_only`, `directory` features, `tables`, `fenced`, and `activation_pending`; each `tables` entry has `name`, `state`, `reason`, `enabled`, `compat`, `ro_compat`, and `incompat`, and each `fenced` entry has `name` and `reason`. With `--archive-dir` or `--archive-command` it also has `archive`: `mode` (`dir` or `command`), `last_seal_ms`, the capture time of the last seal record, `error`, null after a pass that succeeded, `staged_bytes`, the bytes waiting in the data directory to be shipped, and `tables`, each with `name` and `revision`, its seal point in the last record.
 
 The `version` field describes the schema; `revision` describes the completed commit frontier within `epoch`.
 The frontier can include terminal gaps from abandoned reservations and recovery.

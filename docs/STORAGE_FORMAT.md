@@ -34,6 +34,7 @@ data_dir/
   .chunkdb.staging/                    table creation and restore staging
   .chunkdb.dropped/                    tables renamed out of the catalog
   .chunkdb.backups/                    temporary pinned backup files
+  .chunkdb.archive/                    WAL archive files waiting to be shipped, and the chain file
   chunkdb.groups.owner                commit group owner root (inactive; no path creates it)
   chunkdb.groups.objects/             commit group owner objects (inactive)
   chunkdb.groups.journal/             commit group journal generations (inactive)
@@ -531,6 +532,32 @@ Retention preserves segments needed by persisted active-slot positions and pinne
 Active readers keep live rollover archival even if the last slot is dropped.
 
 Live-history readers capture completed byte boundaries and read only the prefix at or below the persisted frontier; a shortened accepted prefix is damage.
+
+## WAL archive
+
+With `--archive-dir` or `--archive-command`, `data_dir/.chunkdb.archive/` holds the files waiting to be shipped and the chain file; see the [design](design/WAL_ARCHIVE.md).
+Each pass hard-links every sealed segment of `.chunkdb.feed/` and its `.base` descriptor into `table.<epoch hex32>/` and syncs it before slot retention may remove the `.chunkdb.feed/` names.
+A changed table manifest is staged there as `table.<schema version>.<CRC32 of its bytes, 8 hex digits>.manifest`; a changed users file and migrations ledger are staged in `directory.<data-directory id hex32>/` as `users.<CRC32>` and `migrations.<CRC32>`.
+Archive files keep the same relative names, are written once and are never changed: `--archive-dir` copies to `.<name>.copy`, syncs it, renames it without replacing and syncs the directory; an existing file of equal length and CRC32 counts as shipped.
+
+After shipping a pass's files, the pass writes its seal record `directory.<id>/seal.<capture Unix ms, 20 digits>` to staging with file and directory sync, ships it, atomically replaces `chain`, and then removes the staged record and the staged files it lists.
+A writer start with archiving first ships a staged record again, points `chain` at it and removes it; a writer start without archiving removes `.chunkdb.archive/` before tables open.
+A start also removes staged entries it does not recognize and names starting with `.` or containing `.tmp.`.
+
+A seal record:
+
+1. `CKAS`, format `1:u16`, zero `u16`, data-directory id (16 bytes), capture time in Unix ms `u64`, predecessor's capture time `u64` (zero at a chain start, else below the capture time).
+2. Users file name and ledger file name, each length `u8` and name, empty when absent; table count `u32`.
+3. Per table: flags `u8` (`0x1` sealed), name length `u8` and name (empty for a dropped table), epoch (16 bytes), seal revision `u64` and time bound in Unix ms `u64` (both zero without `0x1`), schema version `u64`, manifest name length `u8` and name (empty for a dropped table), file count `u32`.
+4. Per file: name length `u16` and name, length `u64`, CRC32 of the whole file `u32`.
+5. CRC32 over all preceding bytes.
+
+A table appears at most once; names are single path components that do not start with `.`.
+A sealed table's revision S means every frame at or below it is in a segment listed by this record or an earlier one of its chain; its time bound was issued from the table's commit-time counter before S was sampled.
+`chain` is exactly 36 bytes: `CKAC`, format `1:u16`, zero `u16`, data-directory id, the last published record's capture time `u64` (nonzero), CRC32 over the first 32 bytes.
+
+Retention takes k, the newest record captured before now minus `--archive-retention-ms`, and removes older records oldest first while each of their tables is sealed in k above every listed segment's last revision, or is listed in neither k nor the newest record.
+It removes the record first, then its segments and descriptors; manifests, users and ledger files stay.
 
 ## Users
 

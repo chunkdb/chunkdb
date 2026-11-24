@@ -26,7 +26,12 @@
 #include "users.hpp"
 
 #ifndef _WIN32
+#include <cerrno>
+#include <spawn.h>
 #include <sys/wait.h>
+#include <unistd.h>
+
+extern char** environ;
 #endif
 
 namespace chunkdb {
@@ -152,17 +157,38 @@ WalArchiveFile CopySynced(const std::filesystem::path& source, const std::filesy
     return file;
 }
 
+// Runs `line` through the system shell and returns its wait status. Outside
+// Windows the shell is spawned and waited for directly: std::system would
+// ignore SIGINT and SIGQUIT for the whole server while the command runs.
+int RunShellCommand(const std::string& line) {
+#ifdef _WIN32
+    return std::system(line.c_str());
+#else
+    std::string shell = "sh", option = "-c", text = line;
+    char* argv[] = {shell.data(), option.data(), text.data(), nullptr};
+    pid_t pid = 0;
+    const int started = ::posix_spawn(&pid, "/bin/sh", nullptr, nullptr, argv, environ);
+    if (started != 0) throw std::system_error(started, std::generic_category(), "cannot start --archive-command");
+    int status = 0;
+    while (::waitpid(pid, &status, 0) == -1) {
+        if (errno != EINTR) throw std::system_error(errno, std::generic_category(), "cannot wait for --archive-command");
+    }
+    return status;
+#endif
+}
+
 bool CommandSucceeded(int status) {
 #ifdef _WIN32
     return status == 0;
 #else
-    return status != -1 && WIFEXITED(status) && WEXITSTATUS(status) == 0;
+    return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 #endif
 }
 
 bool Within(const std::filesystem::path& path, const std::filesystem::path& root) {
     const auto relative = path.lexically_relative(root);
-    return !relative.empty() && relative.native().front() != '.';
+    // Inside `root` when the first component neither leaves it nor is it.
+    return !relative.empty() && *relative.begin() != ".." && relative != ".";
 }
 
 std::vector<std::filesystem::path> SortedEntries(const std::filesystem::path& directory) {
@@ -523,11 +549,6 @@ WalArchiveStatus WalArchiver::Status() const {
 }
 
 void WalArchiver::Pass(std::stop_token cancel) {
-    // A record staged before a crash or a failed pass is published first,
-    // so the record this pass makes names it as predecessor.
-    FinishStagedRecords();
-    const auto captured = std::max({UnixMs(), predecessor_ms_ + 1U, last_attempt_ms_ + 1U});
-    last_attempt_ms_ = captured;
     const auto capture = CaptureCatalog(cancel);
     std::map<StoreId, WalArchiveTableEntry> entries;
     for (const auto& table : capture.tables) {
@@ -546,6 +567,12 @@ void WalArchiver::Pass(std::stop_token cancel) {
         }
     }
     Crash("CHUNKDB_FAILPOINT_CRASH_ARCHIVE_AFTER_STAGE_ONCE");
+    // A record staged before a crash or a failed pass is published before
+    // this one, which names it as predecessor. Staging came first, so a
+    // failure here leaves this pass's sealed segments staged.
+    FinishStagedRecords();
+    const auto captured = std::max({UnixMs(), predecessor_ms_ + 1U, last_attempt_ms_ + 1U});
+    last_attempt_ms_ = captured;
     // Everything staged, of these tables and of tables gone since.
     ShipStaged(entries, capture);
     Crash("CHUNKDB_FAILPOINT_CRASH_ARCHIVE_AFTER_SHIP_ONCE");
@@ -663,6 +690,18 @@ void WalArchiver::StageTable(const CatalogCapture::TableCapture& capture, std::m
     const auto seal = store.SealForArchive();
     (void)store.StageForArchive(staging_ / WalArchiveTableDirName(capture.table->store_id()));
     auto& entry = entries[capture.table->store_id()];
+    // ALTER TABLE does not take the metadata gate: frames this pass sealed
+    // may use a newer schema than the captured manifest, which then ships
+    // in this pass too.
+    const auto bytes = LoadFile(StoreManifestPath(store.data_dir()));
+    const auto version = ParseStoreManifest(bytes).schema.version;
+    const auto manifest = WalArchiveContentName("table." + std::to_string(version), bytes) + ".manifest";
+    if (manifest != entry.manifest) {
+        if (shipped_manifests_[capture.table->store_id()] != manifest)
+            StageBytes(staging_ / WalArchiveTableDirName(capture.table->store_id()), manifest, bytes);
+        entry.manifest = manifest;
+        entry.schema_version = version;
+    }
     if (seal) {
         entry.revision = seal->revision;
         entry.time_bound_ms = seal->time_bound_ms;
@@ -699,7 +738,7 @@ WalArchiveFile WalArchiver::Ship(const std::filesystem::path& source, const std:
         auto file = Inspect(source);
         file.name = name;
         const auto line = ExpandWalArchiveCommand(config_.command, source.string(), relative_dir + "/" + name);
-        const int status = std::system(line.c_str());
+        const int status = RunShellCommand(line);
         if (!CommandSucceeded(status))
             throw std::runtime_error("--archive-command failed for " + relative_dir + "/" + name + " (status " +
                 std::to_string(status) + ")");
@@ -773,8 +812,12 @@ void WalArchiver::RemoveShipped(const WalArchiveRecord& record) {
 std::uint64_t WalArchiver::StagedBytes() const {
     std::uint64_t bytes = 0U;
     std::error_code ec;
-    for (std::filesystem::recursive_directory_iterator it(staging_, ec), end; !ec && it != end; it.increment(ec))
-        if (it->is_regular_file(ec)) bytes += it->file_size(ec);
+    for (std::filesystem::recursive_directory_iterator it(staging_, ec), end; !ec && it != end; it.increment(ec)) {
+        std::error_code entry_ec;
+        if (!it->is_regular_file(entry_ec) || entry_ec) continue;
+        const auto size = it->file_size(entry_ec);
+        if (!entry_ec) bytes += size;
+    }
     return bytes;
 }
 
