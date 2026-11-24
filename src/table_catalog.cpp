@@ -189,6 +189,14 @@ void RequireValidTableName(std::string_view name) {
     }
 }
 
+void RequireNewTableName(std::string_view name) {
+    RequireValidTableName(name);
+    if (name == kReservedTableName) {
+        throw std::invalid_argument(
+            "the table name '" + std::string(kReservedTableName) + "' is reserved: WATCH CATALOG watches the catalog; choose another name");
+    }
+}
+
 void RequireValidTableOptions(const TableOptions& options) {
     if (options.checkpoint_update_interval == 0) {
         throw std::invalid_argument("checkpoint_updates must be > 0");
@@ -1755,7 +1763,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     bool if_not_exists) {
     RequireWritable("CREATE TABLE");
     auto metadata = LockFeatureMetadataShared();
-    RequireValidTableName(name);
+    RequireNewTableName(name);
     const std::string table_name(name);
     std::lock_guard operations(operations_mutex_);
     migration_health_->Check();

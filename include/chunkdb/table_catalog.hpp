@@ -52,6 +52,12 @@ inline constexpr std::size_t kMaxTableNameLength = 64;
 [[nodiscard]] bool IsValidTableName(std::string_view name) noexcept;
 // Throws std::invalid_argument stating the rule when `name` breaks it.
 void RequireValidTableName(std::string_view name);
+// A name a new table cannot take: WATCH CATALOG reserves it. A table of this
+// name made before keeps working, but cannot be watched.
+inline constexpr std::string_view kReservedTableName = "catalog";
+// RequireValidTableName, and refuses kReservedTableName: for CREATE TABLE,
+// RENAME TO and RESTORE TABLE.
+void RequireNewTableName(std::string_view name);
 // Throws std::invalid_argument for an option a table cannot use.
 void RequireValidTableOptions(const TableOptions& options);
 

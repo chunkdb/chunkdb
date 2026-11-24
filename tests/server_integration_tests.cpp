@@ -6877,6 +6877,10 @@ void TestWatchCatalog() {
     slot = CatalogEvent(slot_push, "slot", "sub");
     assert(slot != nullptr && FeedMap(FeedMap(*slot, "data"), "owner").type == '_');
 
+    // WATCH CATALOG reserves the name for new tables.
+    admin.SendLine("CREATE TABLE catalog (n u8) CHUNK 4 x 4"); assert(admin.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+    admin.SendLine("ALTER TABLE cat_t RENAME TO catalog"); assert(admin.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+
     // A user change reaches only the watch that shows users.
     admin.SendLine("CREATE USER bob VERIFIER '" + verifier + "'"); assert(admin.ReadLine() == "+OK\r\n");
     const auto bob_push = ReadFeedReply(full);

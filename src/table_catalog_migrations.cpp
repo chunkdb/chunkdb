@@ -288,7 +288,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             journal.table = table ? request.table : std::string{};
             if (table) journal.table_id = table->store_id_;
         } else if (request.kind == MigrationRequest::Kind::kCreate) {
-            RequireValidTableName(request.table);
+            RequireNewTableName(request.table);
             RequireValidTableOptions(definition.options);
             if (const auto reason = UnsupportedSchemaReason(definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits))); !reason.empty()) throw std::invalid_argument(reason);
             const auto block_schema = definition.schema.value_or(SingleBitsColumnSchema(definition.geometry.block_bits));

@@ -189,7 +189,8 @@ A user's `data` is its SHOW USERS map, so GRANT and REVOKE appear as `alter` of 
 A slot's `data` is a map of its SHOW SLOTS `filters` and `owner`; its position, lag and loss state are not catalog changes.
 RENAME TO appears as `drop` of the old name and `create` of the new one, SWAP TABLES as `alter` of both names.
 A watch that falls more than 67108864 bytes of events behind receives `[resync, epoch, revision, null, null]` and then the whole catalog again; start your catalog over from it.
-After a server restart the epoch changes and the revision starts over; watch the catalog again.
+The catalog revision is not stored: after a server restart the epoch changes and the revision starts over, so watch the catalog again and rebuild your catalog from the first push.
+`CATALOG` after WATCH is a keyword: new tables cannot be named `catalog`, and a table of that name made before cannot be watched.
 The watch ends when the user loses MONITOR and ADMIN on `*`, or MANAGES USERS when it shows users.
 Only UNWATCH is accepted while streaming.
 
