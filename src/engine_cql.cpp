@@ -159,7 +159,7 @@ constexpr std::size_t kMaxStatementParameterBytes =
     BlockFilter filter(geometry, where);
     std::vector<ColumnValue> values(parameters.size());
     for (const auto& parameter : filter.parameters()) {
-        const Column column{.name = "WHERE", .type = parameter.type, .nullable = true};
+        const Column column{.name = "WHERE", .type = parameter.type, .nullable = true, .default_value = {}};
         values.at(parameter.index - 1U) = ParameterValue(column, parameter.index, parameters[parameter.index - 1U]);
     }
     const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
