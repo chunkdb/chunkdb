@@ -79,10 +79,12 @@ struct Server {
 std::string Int(std::uint64_t value) { return "*1\r\n:" + std::to_string(value) + "\r\n"; }
 
 void TestCommitTimeRules() {
-    Column column{.id = 1, .name = "at", .type = {.kind = ColumnKind::kUnsigned, .size = 64U}};
-    column.has_default = true;
-    column.default_value.assign(8U, 0U);
-    column.default_commit_time = true;
+    const Column column{.id = 1,
+                        .name = "at",
+                        .type = {.kind = ColumnKind::kUnsigned, .size = 64U},
+                        .has_default = true,
+                        .default_value = std::vector<std::uint8_t>(8U, 0U),
+                        .default_commit_time = true};
     TableSchema schema{.version = 1, .next_column_id = 2, .columns = {column}, .history = {}, .pending = std::nullopt};
     ValidateTableSchema(schema);
     const auto bytes = EncodeTableSchema(schema);
