@@ -132,7 +132,8 @@ bool ShouldRetry(int code) {
 }  // namespace
 
 struct MetricsHttpListener::Connection {
-    enum class Phase { kRead, kWrite, kDrain };
+    // kRender: waiting for the scrape of `generation`.
+    enum class Phase { kRead, kRender, kWrite, kDrain };
 
     SocketHandle socket = kInvalidSocket;
     Phase phase = Phase::kRead;
@@ -141,16 +142,19 @@ struct MetricsHttpListener::Connection {
     std::string head;
     std::string response;
     std::size_t written = 0;
+    bool head_only = false;
+    std::uint64_t generation = 0;
 };
 
 
-std::string MetricsHttpResponse(std::string_view head, const std::function<std::string()>& render) {
+MetricsRequest ParseMetricsRequest(std::string_view head) {
+    const auto refuse = [](std::string response) { return MetricsRequest{.refusal = std::move(response), .head_only = false}; };
     std::string_view line = head.substr(0, head.find('\n'));
     if (!line.empty() && line.back() == '\r') line.remove_suffix(1);
     const auto first = line.find(' ');
     const auto second = first == std::string_view::npos ? first : line.find(' ', first + 1U);
     if (second == std::string_view::npos || line.find(' ', second + 1U) != std::string_view::npos) {
-        return ErrorResponse("400 Bad Request");
+        return refuse(ErrorResponse("400 Bad Request"));
     }
     const auto method = line.substr(0, first);
     const auto target = line.substr(first + 1U, second - first - 1U);
@@ -158,18 +162,29 @@ std::string MetricsHttpResponse(std::string_view head, const std::function<std::
     const bool method_ok = !method.empty() &&
         std::all_of(method.begin(), method.end(), [](char c) { return c >= 'A' && c <= 'Z'; });
     if (!method_ok || target.empty() || target.front() != '/' || (version != "HTTP/1.0" && version != "HTTP/1.1")) {
-        return ErrorResponse("400 Bad Request");
+        return refuse(ErrorResponse("400 Bad Request"));
     }
     if (target.substr(0, target.find('?')) != "/metrics") {
-        return ErrorResponse("404 Not Found");
+        return refuse(ErrorResponse("404 Not Found"));
     }
     if (method != "GET" && method != "HEAD") {
-        return ErrorResponse("405 Method Not Allowed", "Allow: GET, HEAD\r\n");
+        return refuse(ErrorResponse("405 Method Not Allowed", "Allow: GET, HEAD\r\n"));
     }
-    auto response = Response("200 OK", "text/plain; version=0.0.4; charset=utf-8", {}, render());
+    return MetricsRequest{.refusal = std::nullopt, .head_only = method == "HEAD"};
+}
+
+std::string MetricsResponse(const MetricsScrape& scrape, bool head_only) {
+    auto response = Response(scrape.available ? "200 OK" : "503 Service Unavailable",
+                             "text/plain; version=0.0.4; charset=utf-8", {}, scrape.body);
     // HEAD: the headers GET would send, Content-Length included.
-    if (method == "HEAD") response.resize(response.find("\r\n\r\n") + 4U);
+    if (head_only) response.resize(response.find("\r\n\r\n") + 4U);
     return response;
+}
+
+std::string MetricsHttpResponse(std::string_view head, const std::function<MetricsScrape()>& render) {
+    const auto request = ParseMetricsRequest(head);
+    if (request.refusal) return *request.refusal;
+    return MetricsResponse(render(), request.head_only);
 }
 
 
@@ -178,7 +193,7 @@ MetricsHttpListener::MetricsHttpListener(
     std::uint16_t port,
     bool allow_remote,
     std::size_t timeout_ms,
-    std::function<std::string()> render)
+    MetricsRender render)
     : timeout_ms_(timeout_ms), render_(std::move(render)) {
     listen_socket_ = CreateListenSocket(host, port);
     try {
@@ -194,7 +209,7 @@ MetricsHttpListener::MetricsHttpListener(
         if (!allow_remote && !IsLoopbackAddress(bound)) {
             throw std::runtime_error(
                 "metrics address " + host + " is not a loopback address and the metrics endpoint has no "
-                "authentication; listen on a loopback address or set --metrics-allow-remote");
+                "authentication; listen on a loopback address or set --allow-remote");
         }
         port_ = PortOf(bound);
         std::string error;
@@ -202,6 +217,7 @@ MetricsHttpListener::MetricsHttpListener(
             throw std::runtime_error("cannot make the metrics listener nonblocking: " + error);
         }
         poller_ = std::make_unique<SocketPoller>(kMetricsMaxConnections + 1U);
+        render_thread_ = std::jthread([this](std::stop_token stop) { RenderLoop(stop); });
         thread_ = std::thread(&MetricsHttpListener::Loop, this);
     } catch (...) {
         CloseSocket(listen_socket_);
@@ -213,7 +229,39 @@ MetricsHttpListener::~MetricsHttpListener() {
     running_.store(false, std::memory_order_release);
     poller_->Wake();
     if (thread_.joinable()) thread_.join();
+    // Wakes a render waiting for work; a running one sees the stop token.
+    render_thread_.request_stop();
+    if (render_thread_.joinable()) render_thread_.join();
     if (listen_socket_ != kInvalidSocket) CloseSocket(listen_socket_);
+}
+
+void MetricsHttpListener::RenderLoop(std::stop_token stop) {
+    for (;;) {
+        std::uint64_t generation = 0;
+        {
+            std::unique_lock lock(render_mutex_);
+            if (!render_cv_.wait(lock, stop, [this] { return render_wanted_ > render_done_; })) return;
+            generation = render_wanted_;
+        }
+        auto scrape = std::make_shared<MetricsScrape>();
+        try {
+            *scrape = render_(stop);
+        } catch (const std::exception& error) {
+            LogMessage(LogLevel::kWarn, LogComponent::kServer, "metrics scrape failed", {{"error", error.what()}});
+            scrape->available = false;
+            scrape->body = {};
+        } catch (...) {
+            LogMessage(LogLevel::kWarn, LogComponent::kServer, "metrics scrape failed", {{"error", "unknown error"}});
+            scrape->available = false;
+            scrape->body = {};
+        }
+        {
+            std::lock_guard lock(render_mutex_);
+            render_done_ = generation;
+            render_result_ = std::move(scrape);
+        }
+        poller_->Wake();
+    }
 }
 
 void MetricsHttpListener::Loop() {
@@ -221,11 +269,13 @@ void MetricsHttpListener::Loop() {
     // In the order they were accepted.
     std::vector<Connection> connections;
     std::vector<SocketInterest> interests;
+    // The connections in `interests`, after the listen socket.
+    std::vector<std::size_t> polled;
     // The connection a new one displaces: one whose response is written,
-    // else one still reading its head, else the oldest; each the oldest of
-    // its kind.
+    // else one still reading its head, else one waiting for its scrape, else
+    // the oldest; each the oldest of its kind.
     const auto eviction_victim = [&] {
-        for (const auto phase : {Connection::Phase::kDrain, Connection::Phase::kRead}) {
+        for (const auto phase : {Connection::Phase::kDrain, Connection::Phase::kRead, Connection::Phase::kRender}) {
             const auto found = std::find_if(connections.begin(), connections.end(),
                 [phase](const Connection& connection) { return connection.phase == phase; });
             if (found != connections.end()) return found;
@@ -259,8 +309,25 @@ void MetricsHttpListener::Loop() {
             poller_->DrainWake();
             if (!running_.load(std::memory_order_acquire)) break;
 
-            // A head that missed its deadline gets 408; a response or drain
-            // that missed its deadline closes the connection.
+            // Connections whose scrape has finished get its response.
+            {
+                std::uint64_t done = 0;
+                std::shared_ptr<const MetricsScrape> result;
+                {
+                    std::lock_guard lock(render_mutex_);
+                    done = render_done_;
+                    result = render_result_;
+                }
+                for (auto& connection : connections) {
+                    if (connection.phase == Connection::Phase::kRender && connection.generation <= done) {
+                        respond(&connection, MetricsResponse(*result, connection.head_only));
+                    }
+                }
+            }
+
+            // A head that missed its deadline gets 408 and a scrape 503; a
+            // response or drain that missed its deadline closes the
+            // connection.
             auto now = Clock::now();
             std::vector<bool> keep(connections.size(), true);
             for (std::size_t i = 0; i < connections.size(); ++i) {
@@ -268,6 +335,8 @@ void MetricsHttpListener::Loop() {
                 if (now < connection.deadline) continue;
                 if (connection.phase == Connection::Phase::kRead) {
                     respond(&connection, ErrorResponse("408 Request Timeout"));
+                } else if (connection.phase == Connection::Phase::kRender) {
+                    respond(&connection, ErrorResponse("503 Service Unavailable"));
                 } else {
                     keep[i] = false;
                 }
@@ -281,11 +350,16 @@ void MetricsHttpListener::Loop() {
             interests.clear();
             if (accepting) interests.push_back({listen_socket_, POLLIN, 0});
             const std::size_t first = interests.size();
+            polled.clear();
             auto next_deadline = accepting ? Clock::time_point::max() : accept_paused_until;
-            for (const auto& connection : connections) {
+            for (std::size_t i = 0; i < connections.size(); ++i) {
+                const auto& connection = connections[i];
+                next_deadline = std::min(next_deadline, connection.deadline);
+                // A connection waiting for its scrape is woken by the render.
+                if (connection.phase == Connection::Phase::kRender) continue;
                 const short events = connection.phase == Connection::Phase::kWrite ? POLLOUT : POLLIN;
                 interests.push_back({connection.socket, events, 0});
-                next_deadline = std::min(next_deadline, connection.deadline);
+                polled.push_back(i);
             }
             int wait_ms = -1;
             if (next_deadline != Clock::time_point::max()) {
@@ -295,8 +369,8 @@ void MetricsHttpListener::Loop() {
             if (!poller_->Wait(interests, wait_ms)) continue;
 
             keep.assign(connections.size(), true);
-            for (std::size_t i = 0; i < connections.size(); ++i) {
-                if (interests[i + first].ready != 0) keep[i] = Advance(&connections[i]);
+            for (std::size_t j = 0; j < polled.size(); ++j) {
+                if (interests[j + first].ready != 0) keep[polled[j]] = Advance(&connections[polled[j]]);
             }
             close_finished(keep);
 
@@ -353,6 +427,18 @@ void MetricsHttpListener::Loop() {
     for (const auto& connection : connections) CloseSocket(connection.socket);
 }
 
+std::uint64_t MetricsHttpListener::RequestRender() {
+    std::lock_guard lock(render_mutex_);
+    // A scrape that is running, or the next one: requests while one runs
+    // share its result.
+    const std::uint64_t generation = render_done_ + 1U;
+    if (render_wanted_ < generation) {
+        render_wanted_ = generation;
+        render_cv_.notify_one();
+    }
+    return generation;
+}
+
 bool MetricsHttpListener::Advance(Connection* connection) {
     char buffer[4096];
     switch (connection->phase) {
@@ -368,13 +454,16 @@ bool MetricsHttpListener::Advance(Connection* connection) {
                 connection->head.append(buffer, static_cast<std::size_t>(received));
                 if (const auto end = HeadEnd(connection->head); end != std::string::npos) {
                     connection->head.resize(end);
-                    try {
-                        connection->response = MetricsHttpResponse(connection->head, render_);
-                    } catch (const std::exception& error) {
-                        LogMessage(LogLevel::kWarn, LogComponent::kServer, "metrics scrape failed",
-                                   {{"error", error.what()}});
-                        connection->response = ErrorResponse("500 Internal Server Error");
+                    auto request = ParseMetricsRequest(connection->head);
+                    if (!request.refusal) {
+                        connection->head.clear();
+                        connection->head_only = request.head_only;
+                        connection->generation = RequestRender();
+                        connection->phase = Connection::Phase::kRender;
+                        connection->deadline = Clock::now() + std::chrono::milliseconds(timeout_ms_);
+                        return true;
                     }
+                    connection->response = std::move(*request.refusal);
                 } else if (connection->head.size() >= kMetricsMaxRequestBytes) {
                     connection->response = ErrorResponse("431 Request Header Fields Too Large");
                 } else {
@@ -403,6 +492,8 @@ bool MetricsHttpListener::Advance(Connection* connection) {
             connection->deadline = Clock::now() + std::chrono::milliseconds(timeout_ms_);
             return true;
         }
+        case Connection::Phase::kRender:
+            return true;
         case Connection::Phase::kDrain: {
             const auto received = Receive(connection->socket, buffer, sizeof(buffer));
             if (received < 0) return ShouldRetry(CurrentSocketErrorCode());

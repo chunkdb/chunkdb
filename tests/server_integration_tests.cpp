@@ -4555,59 +4555,6 @@ void TestMaxAuthFailuresDisconnects() {
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
-// The metrics listener is off by default; when on, GET /metrics returns the
-// SHOW METRICS samples on its own port, and a scraper that sends nothing
-// does not hold up statements on the client listener or other scrapes.
-void TestMetricsListen() {
-    assert(!chunkdb::ServerConfig{}.metrics_listen);
-    {
-        ServerHarness harness("metrics-off", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
-                              BaseServerConfig());
-        assert(harness.server->MetricsPort() == 0U);
-    }
-    auto server_cfg = BaseServerConfig();
-    server_cfg.metrics_listen = true;
-    server_cfg.client_io_timeout_ms = 1000;
-    ServerHarness harness("metrics-listen", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
-                          server_cfg);
-    const auto port = harness.server->MetricsPort();
-    assert(port != 0U && port != harness.port);
-    const auto scrape = [port](const std::string& request) {
-        RawClient http("127.0.0.1", port);
-        http.SendBytes(request);
-        assert(http.WaitForClose(std::chrono::seconds(10)));
-        return http.Received();
-    };
-
-    RawClient client("127.0.0.1", harness.port);
-    client.Hello();
-    client.SendLine("SET BLOCK 0 0 IN default bits = b'1010'");
-    (void)ReadVersion(client);
-    client.SendLine("FLUSH WAL");
-    assert(client.ReadLine() == "+OK\r\n");
-
-    const auto response = scrape("GET /metrics HTTP/1.1\r\nHost: localhost\r\n\r\n");
-    assert(response.rfind("HTTP/1.1 200 OK\r\n", 0) == 0);
-    const auto samples = ParseMetrics(response.substr(response.find("\r\n\r\n") + 4U));
-    assert(std::stoull(samples.at("chunkdb_wal_barriers_total{table=\"default\"}")) >= 1U);
-    client.SendLine("SHOW METRICS");
-    const auto shown = ParseMetrics(client.ReadBulkText());
-    assert(shown.size() == samples.size());
-    for (const auto& [name, value] : shown) {
-        (void)value;
-        assert(samples.contains(name));
-    }
-
-    RawClient idle("127.0.0.1", port);
-    client.SendLine("PING");
-    assert(client.ReadLine() == "+PONG\r\n");
-    assert(scrape("GET /metrics HTTP/1.0\r\n\r\n").rfind("HTTP/1.1 200 OK\r\n", 0) == 0);
-    assert(idle.WaitForClose(std::chrono::seconds(10)));
-    assert(idle.Received().rfind("HTTP/1.1 408 Request Timeout\r\n", 0) == 0);
-    assert(scrape("POST /metrics HTTP/1.1\r\n\r\n").rfind("HTTP/1.1 405 Method Not Allowed\r\n", 0) == 0);
-    assert(scrape("GET /status HTTP/1.1\r\n\r\n").rfind("HTTP/1.1 404 Not Found\r\n", 0) == 0);
-}
-
 // Calls Stop on the Run thread at one point of Run's startup.
 class StopAtStartupHook : public chunkdb::FeedDeliveryTestHook {
   public:
@@ -4623,46 +4570,39 @@ class StopAtStartupHook : public chunkdb::FeedDeliveryTestHook {
 };
 
 // A Stop just before Run publishes its listener, or between the listener
-// and running_, ends Run, with and without the metrics listener; before,
-// Run kept polling a closed socket and the next Stop found nothing to stop.
+// and running_, ends Run; before, Run kept polling a closed socket and the
+// next Stop found nothing to stop.
 void TestStopDuringStartup() {
     using Point = chunkdb::FeedDeliveryTestHook::Point;
-    for (const bool metrics : {false, true}) {
-        for (const auto point : {Point::kBeforeListenerPublication, Point::kAfterListenerPublication}) {
-            auto store_cfg = BaseStoreConfig();
-            store_cfg.data_dir = TempDataDir("stop-during-startup");
-            {
-                auto server_cfg = BaseServerConfig();
-                server_cfg.port = chunkdb::test::PickListenerPort();
-                server_cfg.metrics_listen = metrics;
-                auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(store_cfg));
-                auto engine = std::make_shared<chunkdb::CommandEngine>(chunkdb::EngineConfig{.require_auth = false}, catalog);
-                chunkdb::ChunkServer server(server_cfg, engine);
-                StopAtStartupHook hook(server, point);
-                chunkdb::FeedDeliveryTestAccess::SetPendingObserverHook(server, &hook);
-                auto run = std::async(std::launch::async, [&server] { server.Run(); });
-                const bool ended = run.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
-                if (!ended) server.Stop();
-                run.get();
-                assert(hook.fired.load());
-                assert(ended);
-                assert(!server.WaitListeningForTests(std::chrono::milliseconds(0)));
-                assert(server.MetricsPort() == 0U);
-                chunkdb::FeedDeliveryTestAccess::SetPendingObserverHook(server, nullptr);
-            }
-            RemoveAllWithRetry(store_cfg.data_dir);
+    for (const auto point : {Point::kBeforeListenerPublication, Point::kAfterListenerPublication}) {
+        auto store_cfg = BaseStoreConfig();
+        store_cfg.data_dir = TempDataDir("stop-during-startup");
+        {
+            auto server_cfg = BaseServerConfig();
+            server_cfg.port = chunkdb::test::PickListenerPort();
+            auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(store_cfg));
+            auto engine = std::make_shared<chunkdb::CommandEngine>(chunkdb::EngineConfig{.require_auth = false}, catalog);
+            chunkdb::ChunkServer server(server_cfg, engine);
+            StopAtStartupHook hook(server, point);
+            chunkdb::FeedDeliveryTestAccess::SetPendingObserverHook(server, &hook);
+            auto run = std::async(std::launch::async, [&server] { server.Run(); });
+            const bool ended = run.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+            if (!ended) server.Stop();
+            run.get();
+            assert(hook.fired.load());
+            assert(ended);
+            assert(!server.WaitListeningForTests(std::chrono::milliseconds(0)));
+            chunkdb::FeedDeliveryTestAccess::SetPendingObserverHook(server, nullptr);
         }
+        RemoveAllWithRetry(store_cfg.data_dir);
     }
 }
 
-// While ALTER TABLE waits for a lease to drain, a scrape answers at once
+// While ALTER TABLE waits for a lease to drain, SHOW METRICS answers at once
 // without that table, and the server stops without waiting for either.
-void TestMetricsListenBusyTable() {
-    auto server_cfg = BaseServerConfig();
-    server_cfg.metrics_listen = true;
+void TestShowMetricsBusyTable() {
     ServerHarness harness("metrics-busy", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
-                          server_cfg);
-    const auto port = harness.server->MetricsPort();
+                          BaseServerConfig());
     const auto table = harness.catalog->Find("default");
     assert(table != nullptr);
     auto lease = table->Acquire();
@@ -4676,11 +4616,11 @@ void TestMetricsListenBusyTable() {
         std::this_thread::sleep_for(std::chrono::milliseconds(10));
     }
 
-    auto scrape = std::async(std::launch::async, [port] {
-        RawClient http("127.0.0.1", port);
-        http.SendBytes("GET /metrics HTTP/1.1\r\n\r\n");
-        (void)http.WaitForClose(std::chrono::seconds(30));
-        return http.Received();
+    RawClient monitor("127.0.0.1", harness.port);
+    monitor.Hello();
+    auto scrape = std::async(std::launch::async, [&monitor] {
+        monitor.SendLine("SHOW METRICS");
+        return monitor.ReadBulkText();
     });
     const bool scraped = scrape.wait_for(std::chrono::seconds(5)) == std::future_status::ready;
     auto stop = std::async(std::launch::async, [&harness] { harness.server->Stop(); harness.JoinStopped(); });
@@ -4689,7 +4629,6 @@ void TestMetricsListenBusyTable() {
     stop.get();
     assert(scraped && stopped);
     const auto response = scrape.get();
-    assert(response.rfind("HTTP/1.1 200 OK\r\n", 0) == 0);
     assert(response.find("table=\"default\"") == std::string::npos);
     assert(response.find("chunkdb_commands_total") != std::string::npos);
 }
@@ -8590,8 +8529,7 @@ int main(int argc, char** argv) {
         run("TestPipelinedBadRequestDisconnectPolicy", TestPipelinedBadRequestDisconnectPolicy);
         run("TestMaxAuthFailuresDisconnects", TestMaxAuthFailuresDisconnects);
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
-        run("TestMetricsListen", TestMetricsListen);
-        run("TestMetricsListenBusyTable", TestMetricsListenBusyTable);
+        run("TestShowMetricsBusyTable", TestShowMetricsBusyTable);
         run("TestStopDuringStartup", TestStopDuringStartup);
         run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL

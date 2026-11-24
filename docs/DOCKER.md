@@ -70,6 +70,7 @@ These settings apply only before users exist.
 ## Data and health
 
 The image runs as the chunkdb user, includes TLS support, and listens on port 4242.
+It also contains `chunkdb_exporter`, which serves the server's metrics to Prometheus; see [Export metrics](EXPORTER.md#docker).
 One volume at /var/lib/chunkdb contains data/ and backups/.
 Directories created by the server use owner-only mode 0700; new files use mode 0600.
 Startup tightens existing users-file permissions.
@@ -88,22 +89,6 @@ docker inspect --format '{{.State.Health.Status}}' chunkdb
 ```output
 healthy
 ```
-
-The image starts the server with `--metrics-listen 127.0.0.1:14242`, on the container's loopback only.
-The health probe needs no password: it sends `HELLO 3` to port 4242 and reads `GET /metrics` from the `--metrics-listen` address.
-If your server arguments leave out `--metrics-listen`, the probe sends only `HELLO 3`.
-
-To scrape metrics from the host, listen on every container address and publish the port on the host's loopback:
-
-```sh
-docker run -d --name chunkdb -p 127.0.0.1:4242:4242 -p 127.0.0.1:14242:14242 \
-  -v chunkdb-data:/var/lib/chunkdb ghcr.io/chunkdb/chunkdb:2 \
-  --listen-uri chunk://0.0.0.0:4242/ --data-dir /var/lib/chunkdb/data --backup-dir /var/lib/chunkdb/backups \
-  --metrics-listen 0.0.0.0:14242 --metrics-allow-remote
-curl -s http://127.0.0.1:14242/metrics | head -n 3
-```
-
-The endpoint has no authentication and shows table names; see [Server flags](SERVER_FLAGS.md#metrics).
 
 Removing a container retains the named volume; deleting the volume deletes the database and its backups.
 Keep the loopback binding for local use.

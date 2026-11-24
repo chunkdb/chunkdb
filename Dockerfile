@@ -45,22 +45,21 @@ COPY --from=build /src/build/chunkdb_server /usr/local/bin/chunkdb_server
 COPY --from=build /src/build/chunkdb_verify /usr/local/bin/chunkdb_verify
 COPY --from=build /src/build/chunkdb_restore /usr/local/bin/chunkdb_restore
 COPY --from=build /src/build/chunkdb_admin /usr/local/bin/chunkdb_admin
+COPY --from=build /src/build/chunkdb_exporter /usr/local/bin/chunkdb_exporter
 RUN mkdir -p /var/lib/chunkdb/data /var/lib/chunkdb/backups \
     && chown -R chunkdb:chunkdb /var/lib/chunkdb
 
 COPY scripts/docker/entrypoint.sh /usr/local/bin/chunkdb-entrypoint
-COPY scripts/docker/healthcheck.sh /usr/local/bin/chunkdb-healthcheck
 
 USER chunkdb
 
 EXPOSE 4242
 VOLUME ["/var/lib/chunkdb"]
 
-# The probe needs no credential: it sends HELLO 3 to port 4242 and, when
-# the arguments have --metrics-listen, also reads GET /metrics from that
-# address on the container's loopback.
+# The probe needs no credential: HELLO 3 is answered with the server's map
+# (`%...`), or with AUTH_REQUIRED when logins need a user.
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
-    CMD ["/usr/local/bin/chunkdb-healthcheck"]
+    CMD printf 'HELLO 3\r\n' | nc -w 2 127.0.0.1 4242 | grep -q -e '^%' -e '^-ERR AUTH_REQUIRED'
 
 ENTRYPOINT ["/usr/local/bin/chunkdb-entrypoint"]
-CMD ["--listen-uri", "chunk://0.0.0.0:4242/", "--data-dir", "/var/lib/chunkdb/data", "--backup-dir", "/var/lib/chunkdb/backups", "--durability", "relaxed", "--workers", "4", "--metrics-listen", "127.0.0.1:14242"]
+CMD ["--listen-uri", "chunk://0.0.0.0:4242/", "--data-dir", "/var/lib/chunkdb/data", "--backup-dir", "/var/lib/chunkdb/backups", "--durability", "relaxed", "--workers", "4"]

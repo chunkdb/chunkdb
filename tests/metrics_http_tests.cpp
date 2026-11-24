@@ -7,6 +7,9 @@
 #include <atomic>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
+#include <mutex>
+#include <stop_token>
 #include <cstdio>
 #include <functional>
 #include <memory>
@@ -117,19 +120,27 @@ std::string BodyOf(const std::string& response) {
     return response.substr(end + 4U);
 }
 
+void WaitFor(const std::function<bool()>& condition) {
+    const auto deadline = Clock::now() + std::chrono::seconds(10);
+    while (!condition()) {
+        assert(Clock::now() < deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+}
+
 struct Rendering {
     std::atomic<int> calls{0};
-    std::function<std::string()> Function() {
-        return [this] {
+    MetricsRender Function() {
+        return [this](std::stop_token) {
             calls.fetch_add(1);
-            return kBody;
+            return MetricsScrape{.available = true, .body = kBody};
         };
     }
 };
 
 void TestResponses() {
     Rendering rendering;
-    const auto render = rendering.Function();
+    const auto render = [function = rendering.Function()] { return function({}); };
     const auto ok = MetricsHttpResponse("GET /metrics HTTP/1.1\r\nHost: localhost:14242\r\nAccept: */*", render);
     assert(StatusLine(ok) == "HTTP/1.1 200 OK");
     assert(ok.find("\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\n") != std::string::npos);
@@ -228,14 +239,75 @@ void TestReadTimeout() {
     assert(rendering.calls.load() == 1);
 }
 
+// A scrape that is not available, or whose render throws, answers 503.
 void TestRenderFailure() {
-    MetricsHttpListener listener("127.0.0.1", 0, false, 5000, []() -> std::string {
-        throw std::runtime_error("no metrics");
+    {
+        MetricsHttpListener listener("127.0.0.1", 0, false, 5000, [](std::stop_token) {
+            return MetricsScrape{.available = false, .body = "chunkdb_up 0\n"};
+        });
+        const auto response = Exchange(listener.port(), "GET /metrics HTTP/1.1\r\n\r\n");
+        assert(StatusLine(response) == "HTTP/1.1 503 Service Unavailable");
+        assert(BodyOf(response) == "chunkdb_up 0\n");
+    }
+    for (const bool standard : {true, false}) {
+        MetricsHttpListener listener("127.0.0.1", 0, false, 5000, [standard](std::stop_token) -> MetricsScrape {
+            if (standard) throw std::runtime_error("no metrics");
+            throw 42;
+        });
+        for (int i = 0; i < 2; ++i) {
+            assert(StatusLine(Exchange(listener.port(), "GET /metrics HTTP/1.1\r\n\r\n")) ==
+                   "HTTP/1.1 503 Service Unavailable");
+        }
+    }
+}
+
+// A scrape that takes long delays no other connection, requests that arrive
+// while it runs share it, one that outlasts the timeout answers 503, and
+// stopping does not wait for it.
+void TestSlowRender() {
+    std::mutex mutex;
+    std::condition_variable_any released_cv;
+    bool released = false;
+    std::atomic<int> calls{0};
+    auto listener = std::make_unique<MetricsHttpListener>("127.0.0.1", 0, false, 2000, [&](std::stop_token stop) {
+        calls.fetch_add(1);
+        std::unique_lock lock(mutex);
+        (void)released_cv.wait(lock, stop, [&] { return released; });
+        return MetricsScrape{.available = true, .body = kBody};
     });
-    assert(StatusLine(Exchange(listener.port(), "GET /metrics HTTP/1.1\r\n\r\n")) ==
-           "HTTP/1.1 500 Internal Server Error");
-    assert(StatusLine(Exchange(listener.port(), "GET /metrics HTTP/1.1\r\n\r\n")) ==
-           "HTTP/1.1 500 Internal Server Error");
+    const auto port = listener->port();
+    std::vector<std::unique_ptr<Client>> waiting;
+    for (int i = 0; i < 3; ++i) {
+        waiting.push_back(std::make_unique<Client>(port));
+        waiting.back()->Send("GET /metrics HTTP/1.1\r\n\r\n");
+    }
+    WaitFor([&] { return calls.load() == 1; });
+    assert(StatusLine(Exchange(port, "GET /other HTTP/1.1\r\n\r\n")) == "HTTP/1.1 404 Not Found");
+    {
+        std::lock_guard lock(mutex);
+        released = true;
+    }
+    released_cv.notify_all();
+    for (auto& client : waiting) {
+        const auto response = client->ReadUntilClose();
+        assert(StatusLine(response) == "HTTP/1.1 200 OK" && BodyOf(response) == kBody);
+    }
+    assert(calls.load() == 1);
+
+    // A scrape past the 2-second timeout.
+    {
+        std::lock_guard lock(mutex);
+        released = false;
+    }
+    const auto started = Clock::now();
+    assert(StatusLine(Exchange(port, "GET /metrics HTTP/1.1\r\n\r\n")) == "HTTP/1.1 503 Service Unavailable");
+    assert(Clock::now() - started >= std::chrono::milliseconds(1900));
+    // Still running: stopping requests its stop and does not wait for a release.
+    Client pending(port);
+    pending.Send("GET /metrics HTTP/1.1\r\n\r\n");
+    const auto stopping = Clock::now();
+    listener.reset();
+    assert(Clock::now() - stopping < std::chrono::seconds(1));
 }
 
 // A client that sends part of its head and then nothing, or never reads its
@@ -256,7 +328,8 @@ void TestSlowClientsDoNotBlock() {
     silent.Send("ics HTTP/1.1\r\n\r\n");
     assert(StatusLine(silent.ReadUntilClose()) == "HTTP/1.1 200 OK");
     assert(StatusLine(not_reading.ReadUntilClose()) == "HTTP/1.1 200 OK");
-    assert(rendering.calls.load() == 7);
+    // Concurrent requests may share a scrape.
+    assert(rendering.calls.load() >= 1 && rendering.calls.load() <= 7);
 }
 
 // Scrapes from several threads at once each get a whole response.
@@ -277,7 +350,7 @@ void TestConcurrentScrapes() {
     }
     for (auto& thread : threads) thread.join();
     assert(ok.load() == kThreads * kScrapes);
-    assert(rendering.calls.load() == kThreads * kScrapes);
+    assert(rendering.calls.load() >= 1 && rendering.calls.load() <= kThreads * kScrapes);
 }
 
 // Past kMetricsMaxConnections, a new connection closes the oldest one.
@@ -311,14 +384,6 @@ void TestStopWithClients() {
     assert(StatusLine(partial.ReadUntilClose()).empty());
 }
 
-void WaitFor(const std::function<bool()>& condition) {
-    const auto deadline = Clock::now() + std::chrono::seconds(10);
-    while (!condition()) {
-        assert(Clock::now() < deadline);
-        std::this_thread::sleep_for(std::chrono::milliseconds(10));
-    }
-}
-
 // Past the cap, a connection still reading its head is closed before one
 // whose response is being written.
 void TestEvictionKeepsResponses() {
@@ -326,9 +391,9 @@ void TestEvictionKeepsResponses() {
     // while its client does not read.
     const std::string large(32U << 20U, 'x');
     std::atomic<int> calls{0};
-    MetricsHttpListener listener("127.0.0.1", 0, false, 60000, [&] {
+    MetricsHttpListener listener("127.0.0.1", 0, false, 60000, [&](std::stop_token) {
         calls.fetch_add(1);
-        return large;
+        return MetricsScrape{.available = true, .body = large};
     });
     Client writing(listener.port());
     writing.Send("GET /metrics HTTP/1.1\r\n\r\n");
@@ -396,33 +461,13 @@ void TestAcceptFailureDoesNotSpin() {
 }
 #endif
 
-// A failure that ends the listener's thread closes its port, so a scrape is
-// refused instead of waiting in the backlog.
-void TestFailureClosesPort() {
-    MetricsHttpListener listener("127.0.0.1", 0, false, 5000, []() -> std::string { throw 42; });
-    {
-        Client client(listener.port());
-        client.Send("GET /metrics HTTP/1.1\r\n\r\n");
-        assert(client.ReadUntilClose().empty());
-    }
-    // The port was closed before the connection.
-    const SocketHandle probe = socket(AF_INET, SOCK_STREAM, 0);
-    assert(probe != kInvalidSocket);
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_port = htons(listener.port());
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    assert(connect(probe, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0);
-    CloseSocket(probe);
-}
-
 void TestBindRefusals() {
     Rendering rendering;
     bool refused = false;
     try {
         MetricsHttpListener listener("0.0.0.0", 0, false, 5000, rendering.Function());
     } catch (const std::runtime_error& error) {
-        refused = std::string_view(error.what()).find("--metrics-allow-remote") != std::string_view::npos;
+        refused = std::string_view(error.what()).find("--allow-remote") != std::string_view::npos;
     }
     assert(refused);
 }
@@ -444,7 +489,7 @@ int main() {
 #ifndef _WIN32
     TestAcceptFailureDoesNotSpin();
 #endif
-    TestFailureClosesPort();
+    TestSlowRender();
     TestBindRefusals();
     std::puts("metrics_http tests passed");
     return 0;

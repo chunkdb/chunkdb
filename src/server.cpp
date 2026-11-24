@@ -39,7 +39,6 @@
 #include "server_tls.hpp"
 #include "server_feed.hpp"
 #include "server_idle.hpp"
-#include "metrics_http.hpp"
 #include "user_registry.hpp"
 
 namespace chunkdb {
@@ -250,17 +249,6 @@ void ChunkServer::Run() {
 #endif
 
     try {
-        // Before the main listener is published, so that a caller that sees
-        // it listening also sees MetricsPort.
-        if (config_.metrics_listen) {
-            metrics_listener_ = std::make_unique<MetricsHttpListener>(
-                config_.metrics_host, config_.metrics_port, config_.metrics_allow_remote, config_.client_io_timeout_ms,
-                [engine = engine_] { return engine->RenderMetrics(); });
-            metrics_port_.store(metrics_listener_->port(), std::memory_order_release);
-            LogMessage(LogLevel::kInfo, LogComponent::kServer, "serving metrics over HTTP", {
-                {"host", config_.metrics_host}, {"port", std::to_string(metrics_listener_->port())},
-            });
-        }
         const SocketHandle listen_socket = CreateListenSocket(config_.host, config_.port);
         if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
             hook->Run(FeedDeliveryTestHook::Point::kBeforeListenerPublication, 0U);
@@ -280,8 +268,6 @@ void ChunkServer::Run() {
         listening_cv_.notify_all();
         if (stopped) {
             CloseSocket(listen_socket);
-            metrics_port_.store(0, std::memory_order_release);
-            metrics_listener_.reset();
             LogMessage(LogLevel::kInfo, LogComponent::kServer, "stopped before accepting connections");
 #ifdef _WIN32
             WSACleanup();
@@ -419,9 +405,6 @@ void ChunkServer::Run() {
         (void)StopRunning();
         RequestBackupStop();
         (void)ShutdownActiveClients();
-        // After the statements are cancelled, so that no scrape waits for one.
-        metrics_port_.store(0, std::memory_order_release);
-        metrics_listener_.reset();
         {
             std::lock_guard lock(lifecycle_mutex_);
             listen_socket_ = kInvalidSocket;
@@ -447,9 +430,6 @@ void ChunkServer::Run() {
         (void)StopRunning();
         RequestBackupStop();
         (void)ShutdownActiveClients();
-        // After the statements are cancelled, so that no scrape waits for one.
-        metrics_port_.store(0, std::memory_order_release);
-        metrics_listener_.reset();
         if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
             hook->Run(FeedDeliveryTestHook::Point::kAfterRunPendingStop, 0U);
         JoinWorkers();
