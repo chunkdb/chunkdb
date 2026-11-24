@@ -51,7 +51,8 @@ KILL CONNECTION id
 
 - PING: `PONG`.
 - FLUSH WAL: `OK` after every write acknowledged before its arrival is durable.
-- SHOW METRICS: Prometheus text, obtained through an authenticated connection.
+- SHOW METRICS: Prometheus text, obtained through an authenticated connection with MONITOR or ADMIN on all tables; [chunkdb_exporter](../EXPORTER.md) serves it to Prometheus over HTTP.
+- In SHOW METRICS, the table storage metrics have one sample per table with a `table` label: `chunkdb_open_wal_streams`, `chunkdb_wal_*`, `chunkdb_evictions_total`, `chunkdb_eviction_*`, `chunkdb_checkpoints_total`, `chunkdb_background_*`, `chunkdb_compressed_checkpoint_images_total`, `chunkdb_empty_chunk_gcs_total`, `chunkdb_unique_loaded_chunks_total` and `chunkdb_txn_history_*`; the other metrics are server-wide and have no `table` label. SHOW METRICS does not wait for a table that is not serving at that moment: one that an exclusive statement such as ALTER TABLE holds or waits for, one whose change feed cleanup failed until RECOVER TABLE, or one being dropped has no samples in that reply.
 - BACKUP: table count, inventoried files and bytes, and per-table epoch/revision cuts.
 - RESTORE TABLE: the new `table`, its `epoch`, its `parent_epoch` and `fork_revision` (the backed-up epoch and cut), and the `files` and `bytes` copied.
 - RELOAD TLS: `OK` once connections that start from then on use the certificate and key read again from the `--tls-cert` and `--tls-key` files.
@@ -74,7 +75,7 @@ KILL CONNECTION id
 ## Notes
 
 There is no native HTTP metrics endpoint.
-Metrics sum all tables, except the expiry metrics, which have a `table` label and appear for each table with an `expire_column` ([Expiry](TABLES.md#expiry)).
+The expiry metrics also have a `table` label, and appear only for each table with an `expire_column` ([Expiry](TABLES.md#expiry)), also while the table is not serving.
 `chunkdb_expiry_lag_seconds` is the time since the start of the table's last completed expiry sweep: every block whose time was at or before that start has been deleted, unless a write set that time after the sweep passed its chunk.
 Until a sweep completes, it counts from when expiry started on the table: the server start, the `expire_column` change, or the RENAME TO, SWAP TABLES, RESTORE TABLE or RECOVER TABLE that serves it.
 `chunkdb_expired_blocks_total` counts the blocks expiry deleted and `chunkdb_expiry_failed_passes_total` its passes that failed, which the log names; both start at zero then too.

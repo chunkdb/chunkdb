@@ -1529,6 +1529,7 @@ std::string CommandEngine::ExecuteStatement(
                     return reply;
                 },
                 [&](const cql::Watch& watch) {
+                    if (session.watch || session.slot_watch) return Protocol::Error("INVALID_ARGUMENT", "a watch is already open");
                     RequireRight(session, watch.table, Right::kRead);
                     // The feed ends the watch once the right or user is gone,
                     // checking from the generation READ was confirmed at. Set

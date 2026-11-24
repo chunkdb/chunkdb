@@ -14,6 +14,7 @@
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
+#include "../src/chunk_store_internal.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -294,7 +295,7 @@ int RunIdleCrashChild(const std::filesystem::path& data_dir) {
     chunkdb::ChunkStore writer(BuildConfig(data_dir));
     writer.SetBlockBits(0, 0, "11110000");
     assert((ObservedGeneration(data_dir) & 1U) == 0U);
-    std::_Exit(87);
+    chunkdb::ExitAbruptly(87);
 }
 
 void TestIdleCrashCannotReuseCachedEven(const std::string& executable) {

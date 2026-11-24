@@ -213,6 +213,11 @@ inline constexpr bool kFailpointsCompiled = false;
 #endif
 [[nodiscard]] bool ConsumeFailpointEnv(const char* key);
 [[nodiscard]] std::chrono::milliseconds ConsumeFailpointDelayMs(const char* key);
+// Ends the process at once with `code`, as a crash does: no destructors,
+// exit handlers, stream flushes or, on Windows, DLL detach notifications.
+// Crash failpoints and crash test children end through it while other
+// threads still run.
+[[noreturn]] void ExitAbruptly(int code) noexcept;
 [[nodiscard]] bool TryParseInt64(const std::string& text, std::int64_t* out);
 [[nodiscard]] bool TryParseUint64(const std::string& text, std::uint64_t* out);
 [[nodiscard]] bool IsProcessAlive(std::int64_t pid);

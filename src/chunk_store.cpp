@@ -307,6 +307,22 @@ bool ConsumeFailpointEnv(const char* key) {
     return true;
 }
 
+void ExitAbruptly(int code) noexcept {
+#ifdef _WIN32
+    // std::_Exit ends in ExitProcess, which terminates the other threads
+    // wherever they are and then runs DLL detach in this thread: C runtime
+    // stream flushes and thread library cleanup. A lock a terminated thread
+    // held stays held, and that cleanup can wait for it forever.
+    // TerminateProcess runs neither. Waiting on this process returns only if
+    // the termination failed to end this thread.
+    if (TerminateProcess(GetCurrentProcess(), static_cast<UINT>(code)) != 0)
+        (void)WaitForSingleObject(GetCurrentProcess(), INFINITE);
+    std::abort();
+#else
+    std::_Exit(code);
+#endif
+}
+
 [[nodiscard]] std::chrono::milliseconds ConsumeFailpointDelayMs(const char* key) {
     if constexpr (!kFailpointsCompiled) {
         (void)key;

@@ -41,7 +41,7 @@ constexpr auto kTxnMaxDurationCap = std::chrono::hours(24 * 365);
 
 void CrashAtTxnFailpoint(const char* key) {
     if (ConsumeFailpointEnv(key)) {
-        std::_Exit(86);
+        ExitAbruptly(86);
     }
 }
 
@@ -721,7 +721,7 @@ std::uint64_t ChunkStore::CommitTransaction(
                     " transaction frames");
             }
             if (ConsumeFailpointAt("CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_FRAMES", i)) {
-                std::_Exit(86);
+                ExitAbruptly(86);
             }
             if (i == changes.size()) {
                 break;
