@@ -54,6 +54,11 @@ bool Table::ExpiryJob::Step() noexcept {
         return false;
     };
     if (stopped) return end();
+    // No sweep after a failed migration or feed cleanup: they wait for
+    // RECOVER TABLE or a restart.
+    if (table->migration_health_->failed.load(std::memory_order_acquire) ||
+        table->feed_cleanup_failed_.load(std::memory_order_acquire))
+        return end();
     const auto lease = table->TryAcquire();
     if (!lease) return end();
     std::uint32_t current = 0U;
@@ -92,17 +97,6 @@ bool Table::ExpiryJob::Step() noexcept {
     has_cursor = false;
     frontier_ms.store(sweep_started_ms, std::memory_order_relaxed);
     return end();
-}
-
-std::optional<Table::Lease> Table::TryAcquire() {
-    active_leases_.fetch_add(1, std::memory_order_seq_cst);
-    if (state_.load(std::memory_order_seq_cst) == State::kOpen &&
-        !migration_health_->failed.load(std::memory_order_acquire) &&
-        !feed_cleanup_failed_.load(std::memory_order_acquire)) {
-        return Lease(this, store_.get());
-    }
-    ReleaseLease();
-    return std::nullopt;
 }
 
 bool Table::HasExpireColumn() const {

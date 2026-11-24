@@ -373,8 +373,6 @@ class Table : public std::enable_shared_from_this<Table> {
     void StopFeedLingerTimer();
     void StartFeedLingerTimer();
     [[nodiscard]] bool ExpireFeedLinger(std::stop_token cancelled);
-    // A lease when the table serves now, without waiting for a reopen.
-    [[nodiscard]] std::optional<Lease> TryAcquire();
     // Expiry passes run on `pool` (table_expiry.cpp). RequestExpiry starts a
     // sweep unless one runs or, without `now`, the last one ended less than
     // `interval` ago; it does nothing without an expire_column or after
