@@ -117,6 +117,7 @@ Omitting this option disables the mutation deadline.
 CHUNKS delivers exact post-commit whole-chunk forms, including unchanged blocks; a null form denotes deletion.
 COLUMNS projects each form in its declared column order, matching GET CHUNK with the same projection.
 Queued forms retain their commit's values even when later writes change the chunk.
+A CHUNKS watch that lags merges its next pushes, so each chunk arrives with its newest form; see [Feed statements](reference/FEED.md#notes).
 An ordinary resume over earlier row-only history requires resync; a slot can use its retained archive prefix.
 
 `WATCH table SLOT 'consumer' TAKEOVER` replaces the slot's watching connection.

@@ -25,6 +25,8 @@ OK
   lag_revisions = 0
   retained_bytes = 0
   attached = false
+  peer = NULL
+  last_ack_ms = NULL
   lost = false
   lost_reason = NULL
   filters:
@@ -104,7 +106,7 @@ UNWATCH
 - `AREA ..., AREA ...`: WATCH and CREATE SLOT take up to 64 areas with the same axes and keep a chunk inside any of them; WATCH SLOT accepts areas only when they are the slot's areas, in any order and with repeats.
 - `COLUMNS`: project block values in declared order; column IDs preserve the projection across renames, and chunk metadata remains complete.
 - `NO BEFORE`: omit previous block and chunk-metadata rows from mutation events.
-- `CHUNKS`: receive each relevant committed chunk's version and whole form instead of block changes.
+- `CHUNKS`: receive each relevant committed chunk's version and whole form instead of block changes; while the watch lags, repeated changes of a chunk merge (see [Notes](#notes)).
 - `OWNER`: the user the slot belongs to; it defaults to the user running CREATE SLOT, and the user need not exist yet.
 - `PREFIX`: list only slots whose names start with this quoted text, which follows the slot-name rule.
 - `epoch`: the table's identity; dropping and recreating a table changes it.
@@ -119,7 +121,7 @@ UNWATCH
 ## Returns
 
 - CREATE and DROP SLOT: `OK`, including authorized conditional no-ops.
-- SHOW SLOTS: visible table (every table with MONITOR), name, epoch, saved `acked` revision, `revision`, `lag_revisions`, retained bytes, `attached`, lost state, loss reason, filters, and owner; in filters, `areas` lists the slot's areas in coordinate order, or is null for the whole table, and `area` is the only area, or null with none or several; the owner is shown to that user and to MANAGES USERS, and is null otherwise; a table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
+- SHOW SLOTS: visible table (every table with MONITOR), name, epoch, saved `acked` revision, `revision`, `lag_revisions`, retained bytes, `attached`, `peer`, `last_ack_ms`, lost state, loss reason, filters, and owner; in filters, `areas` lists the slot's areas in coordinate order, or is null for the whole table, and `area` is the only area, or null with none or several; the owner is shown to that user and to MANAGES USERS, and is null otherwise; a table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
 - WATCH: start position, followed by change or chunks, schema, progress, or resync events.
 - WATCH CATALOG: the catalog epoch and revision, followed by catalog events; see [WATCH CATALOG](#watch-catalog).
 - ACK: no success reply; it is accepted only inside a slot watch.
@@ -161,6 +163,8 @@ SHOW SLOTS `revision` is the durable revision recorded for the table's slots, wh
 `lag_revisions` is how far `acked` is below `revision`, counted in revision numbers, gaps included.
 `retained_bytes` is the history the slot keeps after `acked`: how many bytes its consumer is behind.
 `attached` is true while a watch holds the slot; another WATCH ... SLOT then answers SLOT_BUSY unless it uses TAKEOVER.
+`peer` is the `[address]:port` of that watch's client, as SHOW CONNECTIONS names it, and `last_ack_ms` the milliseconds since that watch's last accepted ACK; both are null without a watch, and `last_ack_ms` also before the watch's first ACK.
+`peer` is shown to the watch's user and to ADMIN on `*` or MONITOR, as SHOW CONNECTIONS shows connections, and is null to others.
 
 Conditional removal still checks rights and requires an existing table.
 Change events contain complete before and after metadata rows when chunk columns change.
@@ -175,6 +179,12 @@ ACK persistence is asynchronous; UNWATCH persists that watch's eligible ACK befo
 When a slot watch ends after losing access or exceeding an ACK or output deadline, its claim is released before the terminal reply or socket closure; reconnecting does not wait for background watch cleanup.
 After a crash, changes can repeat.
 Store the applied position atomically with your own output to prevent duplicate effects.
+
+A CHUNKS watch lags while the server has output for it that its connection has not taken yet.
+Its next pushes then merge into one `chunks` push, sent once that output is written: each chunk keeps its newest version and form, and the push takes the revision, `commit_time_ms` and `user` of the newest merged change.
+Applying a merged push gives the same table state as applying each change, and its revision covers all of them.
+A merged push stays within the watch's share and never spans a schema event; a watch that keeps up receives one push per change.
+For a slot, ACK of the merged revision acknowledges every merged change; after a reconnect from an earlier ACK, the slot sends those changes again.
 
 ## WATCH CATALOG
 
@@ -217,5 +227,4 @@ A partial frame or pinned TLS retry closes without injecting an error inside the
 A failure after slot metadata replacement returns `OUTCOME_UNKNOWN stage=slot_records`.
 Recover the table before retrying; its ACK or slot change may already be published.
 
-CREATE SLOT requires `feed_slots`; persisted filters also require `slot_filters`.
-[Enable missing features](TABLES.md#feature-activation) before creating a slot; these commands never activate features implicitly.
+CREATE SLOT requires `feed_slots`, and persisted filters `slot_filters`; every table a 2.0 build creates has both, and these commands never activate a feature; see [Feature activation](TABLES.md#feature-activation).
