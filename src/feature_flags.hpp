@@ -15,7 +15,7 @@ inline constexpr std::uint32_t kFeatureFeedSlots = 1U;
 // Data-directory migration ledger and redo journal; older writers must refuse.
 inline constexpr std::uint32_t kFeatureMigrations = 2U;
 // Immediate restore parent and the completed revision at its fork.
-inline constexpr std::uint32_t kFeatureTableLineage | kFeatureSlotFilters | kFeatureActivation | kFeatureChunkModel | kFeatureCommitGroups};= 4U;
+inline constexpr std::uint32_t kFeatureTableLineage = 4U;
 // Persistent projection IDs, area/before/chunks filters and schema-filter loss.
 inline constexpr std::uint32_t kFeatureSlotFilters = 8U;
 // Checked multi-manifest activation decisions; belongs only to the directory.
@@ -46,7 +46,7 @@ inline constexpr std::array<FeatureDefinition, 7> kFeatureRegistry{{
     {"commit_groups", kFeatureCommitGroups, true, "directory commit decisions and grouped table artifacts"},
 }};
 inline constexpr FeatureFlags kKnownFeatures{.incompat = kFeatureFeedSlots | kFeatureMigrations |
-    kFeatureTableLineage | kFeatureSlotFilters | kFeatureActivation | kFeatureChunkModel};
+    kFeatureTableLineage | kFeatureSlotFilters | kFeatureActivation | kFeatureChunkModel | kFeatureCommitGroups};
 [[nodiscard]] constexpr FeatureFlags RegisteredTableFeatures() noexcept {
     FeatureFlags flags;
     for (const auto& feature : kFeatureRegistry) {
