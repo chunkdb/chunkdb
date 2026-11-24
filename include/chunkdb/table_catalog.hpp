@@ -440,6 +440,7 @@ class TableCatalog {
         return config_.data_dir;
     }
     [[nodiscard]] AccessMode access_mode() const noexcept { return config_.access_mode; }
+    [[nodiscard]] bool allow_multiple_processes() const noexcept { return config_.allow_multiple_processes; }
     [[nodiscard]] const QueryLimits& query_limits() const noexcept { return config_.query_limits; }
     [[nodiscard]] const TableOptions& default_options() const noexcept {
         return config_.default_options;

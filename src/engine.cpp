@@ -1,6 +1,7 @@
 #include "chunkdb/engine.hpp"
 #include "audit_log.hpp"
 #include "backup.hpp"
+#include "catalog_feed.hpp"
 #include "source_address.hpp"
 
 #include <algorithm>
@@ -263,6 +264,8 @@ CommandEngine::CommandEngine(
     if (config_.max_auth_failures == 0) {
         throw std::invalid_argument("max_auth_failures must be > 0");
     }
+    catalog_feed_ = std::make_shared<CatalogFeed>(
+        [this](const CatalogScope& scope) { return ReadCatalog(scope); }, kDefaultFeedBufferBytes);
 }
 
 // The longest SCRAM message HELLO and AUTH take as a parameter frame.
@@ -465,6 +468,11 @@ std::string CommandEngine::RejectPayload(SessionState& session, std::string_view
 std::string CommandEngine::LostWatchReply(bool user_dropped, const std::string& table) {
     if (user_dropped) return ErrorReply(UserDroppedError());
     return ErrorReply(TableNotFoundError("table '" + table + "' does not exist"));
+}
+
+std::string CommandEngine::LostCatalogWatchReply(bool user_dropped) {
+    if (user_dropped) return ErrorReply(UserDroppedError());
+    return ErrorReply(PermissionDeniedError("MONITOR or ADMIN on *, and MANAGES USERS for a watch that shows users"));
 }
 
 std::string CommandEngine::LostUserReply(SessionState& session) const {
@@ -1100,7 +1108,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 13);
+    Protocol::AppendArrayHeader(reply, 14);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -1114,6 +1122,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "area_paging");
     Protocol::AppendBulk(reply, "area_scale");
     Protocol::AppendBulk(reply, "read_only_transactions");
+    Protocol::AppendBulk(reply, "watch_catalog");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 2U : 1U);
     entry("statement_timeout_ms", session.hello_options.statement_timeout_ms.value_or(session.default_statement_timeout_ms));

@@ -91,6 +91,7 @@ CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a
 DROP SLOT [IF EXISTS] 'name' ON table
 SHOW SLOTS [ON table] [PREFIX 'name']
 WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1 [, AREA cx0 cy0 TO cx1 cy1 ...]] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [AFTER epoch revision] [ACK TIMEOUT ms] [TAKEOVER]
+WATCH CATALOG
 ACK revision
 UNWATCH
 ```
@@ -119,6 +120,7 @@ UNWATCH
 - CREATE and DROP SLOT: `OK`, including authorized conditional no-ops.
 - SHOW SLOTS: visible table (every table with MONITOR), name, epoch, saved `acked` revision, `revision`, `lag_revisions`, retained bytes, `attached`, lost state, loss reason, filters, and owner; the owner is shown to that user and to MANAGES USERS, and is null otherwise; a table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
 - WATCH: start position, followed by change or chunks, schema, progress, or resync events.
+- WATCH CATALOG: the catalog epoch and revision, followed by catalog events; see [WATCH CATALOG](#watch-catalog).
 - ACK: no success reply; it is accepted only inside a slot watch.
 - UNWATCH: `OK` after the last push; ordinary statements can then resume.
 
@@ -127,6 +129,7 @@ UNWATCH
 | Error | When | What to do |
 | --- | --- | --- |
 | PERMISSION_DENIED | WATCH lacks READ, slot creation/removal lacks ADMIN, or watching another user's slot or takeover of another user lacks ADMIN on `*`. | Request access. |
+| PERMISSION_DENIED | WATCH CATALOG lacks MONITOR and ADMIN on `*`, or the watch lost them, or MANAGES USERS when it shows users (sent best-effort before the connection closes). | Request access. |
 | BUSY | A watcher or catch-up worker limit is reached. | Close another watcher or retry later. |
 | SLOT_BUSY | The slot already has a watcher. | Close its existing watcher. |
 | SLOT_LOST | Retained history exceeds its limit, or a projected column was dropped. | Rebuild state and recreate the slot. |
@@ -134,6 +137,8 @@ UNWATCH
 | OUT_OF_RANGE | A single slot change or schema event, as the slot's filters send it and with its ACK TIMEOUT record when set, is larger than the table's `feed_buffer_bytes`. | Increase feed_buffer_bytes before reconnecting. |
 | INVALID_ARGUMENT | ACK exceeds the last fully delivered position. | Acknowledge only processed events. |
 | INVALID_ARGUMENT | You run WATCH, CREATE SLOT or DROP SLOT on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
+| INVALID_ARGUMENT | You run WATCH CATALOG on a server that shares its data directory with other processes. | Watch the catalog on a server that is the only process of its data directory. |
+| INTERNAL | `the catalog feed failed; watch the catalog again`: the server could not read the catalog after a change. | Watch the catalog again; the first event holds the whole catalog. |
 | PROTOCOL | You send another statement while streaming. | Use a separate connection. |
 | NO_TABLE | The table is absent, inaccessible, or dropped, or while watching you lost READ on it, or ADMIN on `*` that your watch of a slot you do not own needs (sent best-effort before the connection closes). | Check the table and access. |
 | AUTH_REQUIRED reason=user_dropped | Your user was dropped while watching; sent best-effort, and the connection closes. | Log in again as an existing user. |
@@ -169,6 +174,24 @@ ACK persistence is asynchronous; UNWATCH persists that watch's eligible ACK befo
 When a slot watch ends after losing access or exceeding an ACK or output deadline, its claim is released before the terminal reply or socket closure; reconnecting does not wait for background watch cleanup.
 After a crash, changes can repeat.
 Store the applied position atomically with your own output to prevent duplicate effects.
+
+## WATCH CATALOG
+
+WATCH CATALOG streams changes to tables, columns, users, grants and slots.
+It needs MONITOR or ADMIN on `*`; users, grants and slot owners appear only with MANAGES USERS.
+The reply is `{epoch, revision}`: the catalog epoch identifies the server process, and the catalog revision orders catalog events within it.
+The first event holds the whole catalog: one `create` for each table, user and slot, at the revision of that event.
+Each later event carries what one statement changed, with the next catalog revision; a statement whose changes the watch cannot see leaves a gap.
+An event is `[catalog, epoch, revision, commit_time_ms, user, events, txn]`, with the user who ran the statement, and `txn` null.
+Each entry of `events` is a map of `kind` (`table`, `user` or `slot`), `action` (`create`, `alter` or `drop`), `name`, `table` (the table of a slot, null otherwise) and `data`, the object after the change, null for `drop`.
+A table's `data` is its DESCRIBE map without `revision`, so columns, CHECK constraints and options changes appear as `alter`.
+A user's `data` is its SHOW USERS map, so GRANT and REVOKE appear as `alter` of the user; a table rename or drop also changes the users whose grants follow it.
+A slot's `data` is a map of its SHOW SLOTS `filters` and `owner`; its position, lag and loss state are not catalog changes.
+RENAME TO appears as `drop` of the old name and `create` of the new one, SWAP TABLES as `alter` of both names.
+A watch that falls more than 67108864 bytes of events behind receives `[resync, epoch, revision, null, null]` and then the whole catalog again; start your catalog over from it.
+After a server restart the epoch changes and the revision starts over; watch the catalog again.
+The watch ends when the user loses MONITOR and ADMIN on `*`, or MANAGES USERS when it shows users.
+Only UNWATCH is accepted while streaming.
 
 ## Limits
 

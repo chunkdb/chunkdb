@@ -169,7 +169,7 @@ Chunk-change entries are `[cx,cy,before,after]` or `[cx,cy,cz,before,after]`; be
 Chunk push entries are `[cx,cy,version,form_or_null]` or `[cx,cy,cz,version,form_or_null]`; null form denotes deletion.
 Block axes retain the existing integer-or-`[chunk,local]` representation when an absolute position exceeds int64; chunk axes are signed int64.
 Catalog events are extensible maps with `kind`, `action`, `name`, `table`, and `data`; irrelevant keys are null and unknown keys are ignored.
-Task 56 defines each catalog event's data map and authorization before emitting it; task 51 reserves this envelope without claiming WATCH CATALOG exists.
+WATCH CATALOG emits this envelope; [the feed reference](../reference/FEED.md#watch-catalog) defines each event's data map and authorization.
 `txn` is a nullable unsigned u64 directory counter, encoded as an integer or big number under the boundary rule above.
 It has the same type in change, chunks, catalog, repeated-ID and SHOW COMMIT replies.
 Current change pushes send `tag=null`, `txn=null`, and `chunk_changes=[]`; later owners fill these fields without moving them.
