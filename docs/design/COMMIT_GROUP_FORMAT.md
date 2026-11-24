@@ -119,6 +119,7 @@ Admission compares the measured prefix, raw digest and exact last record boundar
 Bytes beyond the cut confer no durability and do not alter its digest.
 Journal-byte certification and a particular group's member-durability receipt remain distinct.
 The pure API accepts already measured prefix facts so a filesystem caller need not materialize the complete journal.
+The journal scanner streams one journal generation through a reader, applies the [tail rule](COMMIT_GROUPS.md#recovery-and-checkpoints) above the cut and proves each requested cursor at a complete record boundary within the cut.
 
 ## Retained-ID inventory
 
