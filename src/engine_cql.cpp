@@ -1263,7 +1263,16 @@ CatalogState CommandEngine::ReadCatalog(const CatalogScope& scope) const {
         std::optional<std::vector<FeedSlot>> slots;
         try {
             slots = table->TryListFeedSlots(true);
-        } catch (const std::runtime_error&) {
+        } catch (const TableNotFoundError&) {
+            // The expected refusals; any other error ends the catalog watches.
+            slots.reset();
+        } catch (const TableFencedError&) {
+            slots.reset();
+        } catch (const FeedRecoveryRequiredError&) {
+            slots.reset();
+        } catch (const MigrationRecoveryRequiredError&) {
+            slots.reset();
+        } catch (const FeatureRecoveryRequiredError&) {
             slots.reset();
         }
         if (!slots) {

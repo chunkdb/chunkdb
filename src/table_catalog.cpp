@@ -711,13 +711,9 @@ std::vector<FeedSlot> Table::ListFeedSlots(bool include_lost) {
 
 std::optional<std::vector<FeedSlot>> Table::TryListFeedSlots(bool include_lost) {
     migration_health_->Check();
-    active_leases_.fetch_add(1, std::memory_order_seq_cst);
-    if (state_.load(std::memory_order_seq_cst) != State::kOpen || feed_cleanup_failed_.load(std::memory_order_acquire)) {
-        ReleaseLease();
-        return std::nullopt;
-    }
-    const Lease lease(this, store_.get());
-    return ListFeedSlots(lease, include_lost);
+    const auto lease = TryAcquire();
+    if (!lease) return std::nullopt;
+    return ListFeedSlots(*lease, include_lost);
 }
 
 std::vector<FeedSlot> Table::ListFeedSlots(const Lease& lease, bool include_lost) {
@@ -980,7 +976,8 @@ std::optional<Table::Lease> Table::Acquire() {
 
 std::optional<Table::Lease> Table::TryAcquire() {
     active_leases_.fetch_add(1, std::memory_order_seq_cst);
-    if (state_.load(std::memory_order_seq_cst) == State::kOpen) return Lease(this, store_.get());
+    if (state_.load(std::memory_order_seq_cst) == State::kOpen && !feed_cleanup_failed_.load(std::memory_order_acquire))
+        return Lease(this, store_.get());
     ReleaseLease();
     return std::nullopt;
 }

@@ -247,8 +247,8 @@ class Table : public std::enable_shared_from_this<Table> {
     // dropped: a table of the same name created later is another table.
     [[nodiscard]] std::optional<Lease> Acquire();
     // Never waits: std::nullopt while the table is not open, as while an
-    // exclusive statement holds or waits for it, after a failure, or once it
-    // was dropped.
+    // exclusive statement holds or waits for it, after a failure (its feed
+    // cleanup included), or once it was dropped.
     [[nodiscard]] std::optional<Lease> TryAcquire();
 
     [[nodiscard]] std::unique_ptr<FeedSubscription> SubscribeFeed(const FeedOptions& options = {});
@@ -265,8 +265,7 @@ class Table : public std::enable_shared_from_this<Table> {
         std::optional<std::string> owner = std::nullopt, bool owner_given = false);
     void DropFeedSlot(std::string_view name, bool if_exists = false);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(bool include_lost = false);
-    // ListFeedSlots without waiting: std::nullopt while the table is being
-    // reopened or refuses leases.
+    // ListFeedSlots on a TryAcquire lease: std::nullopt when TryAcquire gives none.
     [[nodiscard]] std::optional<std::vector<FeedSlot>> TryListFeedSlots(bool include_lost = false);
     struct FeedCounts {
         std::size_t slots = 0U;
