@@ -202,6 +202,7 @@ void RequireValidTableOptions(const TableOptions& options) {
     RequireValidVarLimit(options.var_max_chunk_bytes);
     if (options.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be > 0");
     if (options.slot_max_bytes == 0U) throw std::invalid_argument("slot_max_bytes must be > 0");
+    if (options.max_disk_bytes == 0U) throw std::invalid_argument("max_disk_bytes must be > 0");
 }
 
 CatalogConfig CatalogConfigFromStoreConfig(
@@ -228,6 +229,7 @@ CatalogConfig CatalogConfigFromStoreConfig(
     catalog.txn_history_bytes = config.txn_history_bytes;
     catalog.slot_max_bytes = config.slot_max_bytes;
     catalog.slot_sync_interval = config.slot_sync_interval;
+    catalog.byte_limits = config.byte_limits;
     catalog.query_limits = config.query_limits;
     return catalog;
 }
@@ -272,7 +274,7 @@ Table::Table(
     slot_ack_state_ = std::make_shared<FeedSlotAckState>();
     store_->feed_slots_->UseAckState(slot_ack_state_);
     if (store_->feed_slots_->active() && store_->access_mode_ == AccessMode::kReadWrite) {
-        feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
+        feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes(), store_->resources_->feed_budget());
         feed_->Resume(*store_);
         store_->feed_slots_->Start(feed_);
     }
@@ -465,7 +467,8 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
         feed_->End();
         feed_.reset();
     }
-    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, options.buffer_bytes.value_or(FeedBufferBytes()));
+    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, options.buffer_bytes.value_or(FeedBufferBytes()),
+        store->resources_->feed_budget());
     ScopeExit unused_feed([&] {
         if (feed_subscriptions_ == 0U && !store->feed_slots_->active()) {
             { std::lock_guard timer_lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
@@ -545,7 +548,7 @@ void Table::StopFeed() {
     feed_subscriptions_ = 0U;
     store->feed_watchers_active_.store(false, std::memory_order_release);
     if (store->feed_slots_->active())
-        feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
+        feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes(), store->resources_->feed_budget());
 }
 
 FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const FeedSlotFilters& filters,
@@ -596,7 +599,7 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
         throw std::invalid_argument("feed slot already exists: " + std::string(name));
     // Allocate before publishing a slot. Maintenance and cross-table eviction
     // do not take Table leases, so quiesce both before changing cached flags.
-    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
+    if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes(), store->resources_->feed_budget());
     store->StopMaintenanceThread();
     ScopeExit maintenance([&] {
         if (!store->background_maintenance_) return;
@@ -1084,7 +1087,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
         feed_.reset();
     }
     if (store && store->feed_slots_->active() && store->access_mode_ == AccessMode::kReadWrite && !feed_)
-        feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
+        feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes(), store->resources_->feed_budget());
     if (feed_) {
         if (store == nullptr) feed_->End(ended_.load(std::memory_order_acquire));
         else if (!feed_->attached()) feed_->Resume(*store);
@@ -1121,12 +1124,14 @@ TableCatalog::TableCatalog(CatalogConfig config)
     (void)ReadUsersFile(config_.data_dir);
     if (config_.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be positive");
     if (config_.slot_max_bytes == 0U) throw std::invalid_argument("slot_max_bytes must be positive");
+    if (config_.disk_check_interval.count() <= 0)
+        throw std::invalid_argument("disk_check_interval must be positive");
     if (config_.feed_linger.count() < 0 || config_.feed_linger.count() > std::numeric_limits<std::int32_t>::max())
         throw std::invalid_argument("feed_linger must be 0..2147483647 milliseconds");
     RequireNotBackupDirectory(config_.data_dir, config_.access_mode);
     RequireValidTableOptions(config_.default_options);
     resources_ = std::make_shared<StoreResources>(
-        config_.max_loaded_chunks, config_.max_open_wal_streams, config_.maintenance_workers);
+        config_.max_loaded_chunks, config_.max_open_wal_streams, config_.maintenance_workers, config_.byte_limits);
 
     const bool writable = config_.access_mode == AccessMode::kReadWrite;
     if (writable) {
@@ -1186,9 +1191,17 @@ TableCatalog::TableCatalog(CatalogConfig config)
             {"max_loaded_chunks", std::to_string(resources_->max_loaded_chunks())},
             {"max_open_wal_streams", std::to_string(resources_->max_open_wal_streams())},
         });
+    if (writable) {
+        // Refuses writes from the start when the disk is already nearly full.
+        SampleDisk();
+        disk_sampler_ = std::jthread([this](std::stop_token stop) { RunDiskSampler(std::move(stop)); });
+    }
 }
 
 TableCatalog::~TableCatalog() {
+    // The sampler reads the tables; it stops before they close.
+    disk_sampler_.request_stop();
+    if (disk_sampler_.joinable()) disk_sampler_.join();
     // Close every store while the writer lock is still held.
     std::map<std::string, std::shared_ptr<Table>, std::less<>> tables;
     {
@@ -2081,6 +2094,7 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
     RewriteManifest(
         *table, options, [&](StoreManifest* manifest) { ReplaceTableOptions(manifest, options); },
         "CHUNKDB_FAILPOINT_TABLESET_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+    if (update.max_disk_bytes) WakeDiskSampler();
     LogMessage(
         LogLevel::kInfo,
         LogComponent::kStore,
@@ -2436,6 +2450,7 @@ TableOptionsUpdate TableOptionsUpdate::From(const TableOptions& options) {
         .var_max_chunk_bytes = options.var_max_chunk_bytes,
         .feed_buffer_bytes = options.feed_buffer_bytes,
         .slot_max_bytes = options.slot_max_bytes,
+        .max_disk_bytes = options.max_disk_bytes.value_or(0U),
     };
 }
 
@@ -2451,13 +2466,14 @@ TableOptions TableOptionsUpdate::ApplyTo(TableOptions options) const {
     options.var_max_chunk_bytes = var_max_chunk_bytes.value_or(options.var_max_chunk_bytes);
     if (feed_buffer_bytes) options.feed_buffer_bytes = feed_buffer_bytes;
     if (slot_max_bytes) options.slot_max_bytes = slot_max_bytes;
+    if (max_disk_bytes) options.max_disk_bytes = *max_disk_bytes == 0U ? std::nullopt : max_disk_bytes;
     return options;
 }
 
 bool TableOptionsUpdate::empty() const noexcept {
     return !durability_mode && !checkpoint_update_interval && !checkpoint_wal_bytes &&
            !wal_group_commit_updates && !checkpoint_compression && !var_max_chunk_bytes &&
-           !feed_buffer_bytes && !slot_max_bytes;
+           !feed_buffer_bytes && !slot_max_bytes && !max_disk_bytes;
 }
 
 bool TableCatalog::EnableFeature(std::string_view name) {

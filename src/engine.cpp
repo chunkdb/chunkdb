@@ -204,6 +204,9 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
         update->feed_buffer_bytes = ParsePositiveSize(key, value);
     } else if (KeyIs(key, "slot_max_bytes")) {
         update->slot_max_bytes = ParsePositiveSize(key, value);
+    } else if (KeyIs(key, "max_disk_bytes")) {
+        // Zero removes the limit.
+        update->max_disk_bytes = value == "0" ? 0U : ParsePositiveSize(key, value);
     } else if (IsGeometryKey(key)) {
         throw std::invalid_argument(
             std::string(key) + " is part of the geometry, which is fixed when a table is "
@@ -825,6 +828,18 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     // decides.
     if (dynamic_cast<const ChunkCacheFullError*>(&error))
         return Protocol::Error("BUSY", error.what(), {{"reason", "large_chunk_cache_full"}});
+    if (const auto* full = dynamic_cast<const DiskFullError*>(&error)) {
+        // min_free_disk names available and limit; max_disk_bytes names
+        // table, used and limit.
+        const auto& keys = full->keys();
+        if (keys.size() == 2U)
+            return Protocol::Error("DISK_FULL", error.what(), {{"reason", full->reason()},
+                {keys[0].first, keys[0].second}, {keys[1].first, keys[1].second}});
+        if (keys.size() == 3U)
+            return Protocol::Error("DISK_FULL", error.what(), {{"reason", full->reason()},
+                {keys[0].first, keys[0].second}, {keys[1].first, keys[1].second}, {keys[2].first, keys[2].second}});
+        return Protocol::Error("DISK_FULL", error.what(), {{"reason", full->reason()}});
+    }
     if (const auto* option = dynamic_cast<const HelloOptionError*>(&error))
         return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", option->reason()}, {"option", option->option()}});
     if (const auto* option = dynamic_cast<const cql::DuplicateHelloOptionError*>(&error))

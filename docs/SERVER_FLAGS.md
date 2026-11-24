@@ -127,6 +127,9 @@ On Windows, rename the file and restart the server; until then it keeps writing 
 | `--background-maintenance` | off | Boolean switch running checkpoint and eviction work on shared workers; acknowledgement durability is unchanged. |
 | `--maintenance-workers` | `8` | Positive worker count shared by background maintenance and parallel per-table `FLUSH WAL` barriers. |
 | `--background-checkpoint-queue-limit` | `4096` | Per-table queue; overflow and excessive WAL growth force inline checkpointing. |
+| `--cache-max-bytes` | `0` | Shared cache limit in bytes across all tables, beside `--max-loaded-chunks`; `0` sets none. |
+| `--min-free-disk-bytes` | `0` | Data writes answer `DISK_FULL` while the file system of `--data-dir` has fewer bytes available; `0` turns the check off. |
+| `--disk-check-ms` | `1000` | 1–86400000 ms between samples of free space and of the files of tables with `max_disk_bytes`. |
 
 To size `--max-loaded-chunks`, divide the server's resident memory growth after a warm-up with your own data by `chunkdb_loaded_chunks` from SHOW METRICS.
 The recorded figure, for the default chunk size with one 16-bit column, is in [Resident memory per chunk](releases/PERFORMANCE_HISTORY.md#resident-memory-per-chunk); larger chunks, more or wider columns and variable values use more.
@@ -134,6 +137,22 @@ The cache setting also bounds large-chunk containers shared by the tables, inclu
 `chunkdb_large_chunk_containers` reports the count, `chunkdb_large_chunk_container_limit` reports its exact limit, and `chunkdb_large_chunk_refusals_total` counts new containers refused at capacity.
 A new cache miss that cannot fit returns `BUSY reason=large_chunk_cache_full` before applying a mutation; existing container hits remain usable.
 Raise `--max-loaded-chunks` to raise the associated container limit.
+
+`--cache-max-bytes` counts each cached chunk's values, presence bits, variable values, chunk columns and pending WAL batch.
+A chunk is measured when it loads and at each of its checkpoints, so writes that grow variable values between checkpoints are counted late.
+A load that passes the byte limit evicts the coldest chunks of all tables, as one past `--max-loaded-chunks` does, until the cache holds at most fifteen sixteenths of the byte limit.
+Chunks in use and chunks whose WAL could not be repaired are not evicted, so the cache can exceed the limit briefly.
+
+## Disk space
+
+`--min-free-disk-bytes` keeps the disk from filling: while the file system of `--data-dir` has fewer bytes available, SET BLOCK, DELETE BLOCK, SET CHUNK, a COMMIT with writes, CREATE TABLE, RESTORE TABLE and MIGRATE answer `DISK_FULL reason=min_free_disk` and change nothing.
+Reads, DROP TABLE, ALTER TABLE, FLUSH WAL and the statements of an open transaction before its COMMIT still run.
+The table option `max_disk_bytes` does the same for one table: once its files take at least that many bytes, its SET BLOCK, DELETE BLOCK, SET CHUNK and COMMIT answer `DISK_FULL reason=max_disk_bytes`; see [Tables](reference/TABLES.md#options).
+Writes check the result of the last sample, taken at startup and every `--disk-check-ms` by one background thread, so writes between two samples can pass the floor or the limit.
+A sample lists the files of each table with `max_disk_bytes`, so it reads more with more files; raise `--disk-check-ms` for tables with many chunks.
+Refusals end at the first sample after space is freed or the limit is raised; ALTER TABLE ... SET max_disk_bytes starts a sample at once.
+If free space cannot be queried, the last result stands and the server log reports it.
+See [Durability](DURABILITY_CONTRACT.md#disk-full) for writes that meet a full disk.
 
 ## Read-only
 
@@ -172,7 +191,9 @@ With `--auth scram` the directory must already have users, because `--read-only`
 | `--txn-max-bytes` | `16777216` | Private written-chunk bytes for one transaction. |
 | `--txn-total-bytes` | `268435456` | Private written-chunk bytes for all open transactions; a write that finds it full first ends the transactions past `--txn-max-duration-ms`. |
 | `--txn-history-bytes` | `67108864` | Earlier chunk states retained per table; overflow cancels oldest transactions. |
+| `--txn-history-total-bytes` | `0` | Earlier chunk states retained across all tables; `0` sets no limit beyond `--txn-history-bytes`. |
 | `--feed-buffer-bytes` | `67108864` | Default live feed budget for tables without an explicit `feed_buffer_bytes` option, shared among watches. |
+| `--feed-total-bytes` | `0` | Live feed history and capture buffers across all tables; `0` sets no limit beyond each table's budget. |
 | `--tcp-keepalive-ms` | `60000` | Set TCP idle and repeat probe intervals, 1–32767000 ms, for every accepted connection. |
 | `--feed-progress-ms` | `1000` | Emit idle or filtered watch progress at most once per interval, 1–2147483647 ms. |
 | `--feed-linger-ms` | `30000` | Keep live history after the last watch closes, 0–2147483647 ms; 0 releases it immediately. Writes keep copying into the feed during this interval; slots retain history independently. |
@@ -182,6 +203,8 @@ With `--auth scram` the directory must already have users, because `--read-only`
 
 Watches release workers and have no idle timeout.
 The four area and chunk-count limits must be positive and are reported by HELLO.
+Past `--txn-history-total-bytes`, a write that must keep an earlier state ends the oldest transactions of its own table, whichever tables hold the bytes.
+Past `--feed-total-bytes`, a table's capture evicts that table's oldest live history; a change that still does not fit makes that table's watches resync.
 See [Transactions](TRANSACTIONS.md) and [Change feed](CHANGE_FEED.md) for outcomes at limits.
 A table without an explicit feed/slot limit uses the server defaults each time it opens.
 An explicit table limit persists; change it with ALTER TABLE SET.

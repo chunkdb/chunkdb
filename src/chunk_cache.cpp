@@ -117,7 +117,26 @@ void ChunkStore::RegularChunkDeleter::operator()(RegularChunk* chunk) const noex
             registry->entries.erase(it);
         }
     }
+    if (registry->cache_bytes) registry->cache_bytes->fetch_sub(chunk->cache_charge, std::memory_order_relaxed);
     delete chunk;
+}
+
+void ChunkStore::RechargeCacheLocked(RegularChunk& chunk) noexcept {
+    const std::size_t charge = sizeof(RegularChunk) + chunk.payload.capacity() + chunk.presence_bitmap.capacity() +
+        chunk.vars.encoded_size() + (chunk.chunk_columns ? chunk.chunk_columns->bytes.size() : 0U) +
+        chunk.wal_batch.capacity();
+    if (charge == chunk.cache_charge) return;
+    auto& bytes = *resources_->cache_bytes_;
+    if (charge > chunk.cache_charge) bytes.fetch_add(charge - chunk.cache_charge, std::memory_order_relaxed);
+    else bytes.fetch_sub(chunk.cache_charge - charge, std::memory_order_relaxed);
+    chunk.cache_charge = charge;
+}
+
+bool ChunkStore::CacheOverLimit() const noexcept {
+    const auto& resources = *resources_;
+    return resources.loaded_chunks_.load(std::memory_order_relaxed) > resources.max_loaded_chunks_ ||
+        (resources.max_cache_bytes_ != 0U &&
+            resources.cache_bytes_->load(std::memory_order_relaxed) > resources.max_cache_bytes_);
 }
 
 std::size_t ChunkStore::LiveChunkInstanceEntriesForTests() const {
@@ -224,6 +243,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             selected->wal_header_written = loaded.wal_header_written;
             selected->wal_path = loaded.wal_path;
             selected->read_only_generation = loaded.read_only_generation;
+            RechargeCacheLocked(*selected);
             const auto published = large_chunk->chunks.emplace(chunk_coord, selected).first;
             ScopeExit rollback_chunk([&] { large_chunk->chunks.erase(published); });
             // Two live objects for one chunk mean writes made through the
@@ -272,7 +292,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
     }
     if (!inserted) TouchChunk(selected);
     if (inserted) {
-        if (loaded_now > resources_->max_loaded_chunks_) {
+        if (loaded_now > resources_->max_loaded_chunks_ || CacheOverLimit()) {
             RequestEviction();
         }
     }
@@ -322,6 +342,7 @@ void ChunkStore::RefreshReadOnlyChunk(const ChunkCoord& chunk_coord, RegularChun
     chunk.wal_header_written = loaded.wal_header_written;
     chunk.wal_path = loaded.wal_path;
     chunk.read_only_generation = loaded.read_only_generation;
+    RechargeCacheLocked(chunk);
 }
 
 std::vector<std::uint8_t> ChunkStore::EmptyPayload() const {

@@ -327,9 +327,21 @@ void ChunkStore::AppendTxnFrameLocked(
     if (!out.is_open()) {
         throw BuildWalOpenError(wal_path, errno);
     }
+    // A full file system: half of the frame reaches the file, then the write
+    // fails with ENOSPC.
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TXN_APPEND_ENOSPC_ONCE")) {
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size() / 2U));
+        out.flush();
+        throw std::system_error(ENOSPC, std::generic_category(),
+            "injected ENOSPC while appending a transaction frame to WAL " + wal_path.string());
+    }
     out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
     out.flush();
     if (!out.good()) {
+        // The cause (ENOSPC answers DISK_FULL) when the stream recorded one.
+        if (out.error() != 0)
+            throw std::system_error(out.error(), std::generic_category(),
+                "failed to append a transaction frame to WAL " + wal_path.string());
         throw std::runtime_error("failed to append a transaction frame to WAL " + wal_path.string());
     }
     out.close();

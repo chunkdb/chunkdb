@@ -575,7 +575,8 @@ struct FileUsage {
     sides(info.geometry.large_chunk_width_chunks, info.geometry.large_chunk_height_chunks,
         info.geometry.large_chunk_depth_chunks);
     key("options");
-    Protocol::AppendMapHeader(reply, 8);
+    // max_disk_bytes is listed only when the table sets it.
+    Protocol::AppendMapHeader(reply, info.options.max_disk_bytes ? 9 : 8);
     key("durability_mode");
     Protocol::AppendBulk(reply, DurabilityModeName(info.options.durability_mode));
     key("checkpoint_updates");
@@ -592,6 +593,10 @@ struct FileUsage {
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.feed_buffer_bytes));
     key("slot_max_bytes");
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.slot_max_bytes));
+    if (info.options.max_disk_bytes) {
+        key("max_disk_bytes");
+        Protocol::AppendInteger(reply, static_cast<std::uint64_t>(*info.options.max_disk_bytes));
+    }
     key("epoch");
     Protocol::AppendBulk(reply, StoreIdHex(store != nullptr ? store->store_id() : info.store_id));
     key("revision");
@@ -1395,6 +1400,7 @@ std::string CommandEngine::ExecuteStatement(
                         if (!MayReplayMigration(require_auth, user.get(), record))
                             throw PermissionDeniedError("migration name '" + record.name + "' is recorded for a change outside your rights");
                     };
+                    catalog_->RequireDiskRoom();
                     return Protocol::SimpleString(catalog_->Migrate(request, config_.users.get()) ? "applied" : "skipped");
                 },
                 [&](const cql::ShowMigrations&) {
@@ -1656,8 +1662,7 @@ std::string CommandEngine::ExecuteStatement(
                                                                : MetricsRegistry::CommandClass::kPointWrite;
                     RequireRight(session, set.table, Right::kWrite);
                     RequireNoVersionInTxn(session, set.if_version);
-                    const auto lease = session.transaction != nullptr ? TxnLease(session, set.table)
-                                                                      : AcquireNamedTable(session, set.table);
+                    const auto lease = WriteLease(session, set.table);
                     ChunkStore& store = lease.store();
                     RequireDimensions(store.geometry(), set.dims);
                     const auto& layout = store.geometry().layout();
@@ -1703,7 +1708,7 @@ std::string CommandEngine::ExecuteStatement(
                             });
                         return NullReply();
                     }
-                    const auto lease = AcquireNamedTable(session, del.table);
+                    const auto lease = WriteLease(session, del.table);
                     RequireDimensions(lease.store().geometry(), del.dims);
                     return VersionReply(del.dims == 3U
                         ? lease.store().UnsetBlock3D(del.x, del.y, del.z, del.if_version)
@@ -1745,8 +1750,7 @@ std::string CommandEngine::ExecuteStatement(
                     RequireNoVersionInTxn(session, set.if_version);
                     if (session.transaction != nullptr && set.if_absent)
                         throw std::invalid_argument("IF ABSENT is not used inside a transaction: COMMIT checks every chunk the transaction touched");
-                    const auto lease = session.transaction != nullptr ? TxnLease(session, set.table)
-                                                                      : AcquireNamedTable(session, set.table);
+                    const auto lease = WriteLease(session, set.table);
                     ChunkStore& store = lease.store();
                     const auto& geometry = store.geometry();
                     RequireDimensions(geometry, set.dims);
@@ -2023,6 +2027,7 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::CreateTable& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireCreateRight(session, create.table);
+                    catalog_->RequireDiskRoom();
                     (void)catalog_->Create(create.table,
                         [&] { return DefinitionFrom(create, catalog_->default_options()); }, create.if_not_exists);
                     return Protocol::SimpleString("OK");
@@ -2304,6 +2309,7 @@ std::string CommandEngine::ExecuteStatement(
                     }
                     if (config_.backup_dir.empty())
                         throw std::invalid_argument("RESTORE TABLE is disabled: set --backup-dir <path>");
+                    catalog_->RequireDiskRoom();
                     TableRestoreRequest request;
                     request.backup = ResolveBackupSource(config_.backup_dir, restore.path);
                     request.table = restore.table;
@@ -2767,6 +2773,13 @@ Table::Lease CommandEngine::TxnLease(SessionState& session, const std::string& t
     return std::move(*lease);
 }
 
+Table::Lease CommandEngine::WriteLease(SessionState& session, const std::string& table) {
+    if (session.transaction != nullptr) return TxnLease(session, table);
+    auto lease = AcquireNamedTable(session, table);
+    catalog_->RequireDiskRoom(session.table.get());
+    return lease;
+}
+
 void CommandEngine::TxnRead(SessionTransaction& txn, std::span<const ChunkCoord> coords) const {
     const auto limit = catalog_->query_limits().txn_max_read_chunks;
     const auto too_many = [&] {
@@ -2922,7 +2935,7 @@ std::string CommandEngine::BlockWriteWithExpressions(
     // E3); WRITE includes READ.
     RequireRight(session, table, Right::kWrite);
     RequireNoVersionInTxn(session, if_version);
-    const auto lease = session.transaction != nullptr ? TxnLease(session, table) : AcquireNamedTable(session, table);
+    const auto lease = WriteLease(session, table);
     ChunkStore& store = lease.store();
     const Geometry& geometry = store.geometry();
     RequireDimensions(geometry, set != nullptr ? set->dims : del->dims);
@@ -3056,6 +3069,8 @@ std::string CommandEngine::TxnCommit(SessionState& session) {
     if (!store.OwnsTxnSnapshot(*txn->snapshot)) {
         throw changed();
     }
+    // Refused like a plain write; the transaction ends unapplied.
+    if (!txn->writes.empty()) catalog_->RequireDiskRoom(session.table.get());
     std::vector<ChunkCoord> read_set;
     read_set.reserve(txn->read_set.size());
     for (const auto& coord : txn->read_set) {

@@ -362,7 +362,8 @@ ChunkStore::ChunkStore(StoreConfig config)
           config.resources != nullptr
               ? std::move(config.resources)
               : std::make_shared<StoreResources>(
-                    config.max_loaded_chunks, config.max_open_wal_streams, config.maintenance_workers)),
+                    config.max_loaded_chunks, config.max_open_wal_streams, config.maintenance_workers,
+                    config.byte_limits)),
       acquire_process_lock_(config.acquire_process_lock),
       initial_version_floor_(config.initial_version_floor),
       background_maintenance_(config.background_maintenance),
@@ -390,7 +391,8 @@ ChunkStore::ChunkStore(StoreConfig config)
     if (config.txn_history_bytes == 0) {
         throw std::invalid_argument("txn_history_bytes must be > 0");
     }
-    txn_history_ = std::make_shared<TxnHistory>(config.txn_history_bytes);
+    txn_history_ = std::make_shared<TxnHistory>(config.txn_history_bytes, resources_->txn_history_budget());
+    live_chunk_instances_->cache_bytes = resources_->cache_bytes_;
 
 
     const auto recovery_start = std::chrono::steady_clock::now();

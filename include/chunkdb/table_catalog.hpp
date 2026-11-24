@@ -107,6 +107,14 @@ struct CatalogConfig {
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::chrono::milliseconds feed_linger{30000};
     QueryLimits query_limits{};
+    // Shared by all tables (StoreResources); zero turns a limit off.
+    ServerByteLimits byte_limits{};
+    // A writer refuses data writes with DISK_FULL while the file system of
+    // the data directory has fewer bytes available; zero turns it off.
+    std::uint64_t min_free_disk_bytes = 0U;
+    // How often a writer samples the free space and the files of tables
+    // with a max_disk_bytes option.
+    std::chrono::milliseconds disk_check_interval{1000};
 };
 
 // A catalog configuration whose new-table options and shared budgets come
@@ -126,6 +134,8 @@ struct TableOptionsUpdate {
     std::optional<std::size_t> var_max_chunk_bytes;
     std::optional<std::size_t> feed_buffer_bytes;
     std::optional<std::size_t> slot_max_bytes;
+    // Zero removes the limit.
+    std::optional<std::size_t> max_disk_bytes;
 
     // Every field set from `options`.
     [[nodiscard]] static TableOptionsUpdate From(const TableOptions& options);
@@ -403,6 +413,11 @@ class Table : public std::enable_shared_from_this<Table> {
     std::shared_ptr<FeedSlotAckState> slot_ack_state_;
     std::shared_ptr<std::atomic<std::size_t>> slot_output_bytes_ = std::make_shared<std::atomic<std::size_t>>(0U);
     std::shared_ptr<FeedExcessPool> slot_excess_;
+    // What the catalog's last disk sample found for the max_disk_bytes
+    // option (TableCatalog::SampleDisk).
+    std::atomic<bool> disk_limit_reached_{false};
+    std::atomic<std::uint64_t> disk_used_bytes_{0U};
+    std::atomic<std::uint64_t> disk_limit_bytes_{0U};
 };
 
 struct CatalogTxnSnapshot {
@@ -592,7 +607,27 @@ class TableCatalog {
     void SwapTables(std::string_view first, std::string_view second, std::stop_token cancelled = {});
     void SetBackupHookForTests(BackupTestHook* hook) noexcept { backup_hook_.store(hook, std::memory_order_release); }
 
+    // Throws DiskFullError while the data directory's file system has fewer
+    // than min_free_disk_bytes available, or while `table`, when given, has
+    // reached its max_disk_bytes option, as the last disk sample found. A
+    // single atomic load while neither holds for any table.
+    void RequireDiskRoom(const Table* table = nullptr) const {
+        if (disk_refusals_.load(std::memory_order_relaxed) != 0U) [[unlikely]] RefuseDiskWrite(table);
+    }
+    // Samples free space and the files of tables with max_disk_bytes now; a
+    // writer also does so every disk_check_interval.
+    void SampleDisk();
+    // Replaces the free-space query of later samples; std::nullopt reads as
+    // a failed query.
+    void SetDiskSpaceProbeForTests(
+        std::function<std::optional<std::uint64_t>(const std::filesystem::path&)> probe);
+
   private:
+    // RequireDiskRoom once some refusal holds.
+    void RefuseDiskWrite(const Table* table) const;
+    // Asks the sampler for a sample now, after a change of max_disk_bytes.
+    void WakeDiskSampler();
+    void RunDiskSampler(std::stop_token stop);
     [[nodiscard]] std::filesystem::path TablesDir() const;
     friend struct BackupTestAccess;
     friend struct FeatureActivationTestAccess;
@@ -696,6 +731,21 @@ class TableCatalog {
     // Out of service until RecoverTable; disjoint from tables_, which
     // tables_mutex_ guards with it.
     std::map<std::string, Fenced, std::less<>> fenced_;
+
+    // The free-disk floor and max_disk_bytes, as SampleDisk last found them.
+    // disk_refusals_ counts what refuses writes: the floor and each table at
+    // its limit. Written by SampleDisk under disk_sample_mutex_.
+    std::atomic<std::uint32_t> disk_refusals_{0U};
+    std::atomic<bool> disk_floor_reached_{false};
+    std::atomic<std::uint64_t> disk_available_bytes_{0U};
+    std::mutex disk_sample_mutex_;
+    std::function<std::optional<std::uint64_t>(const std::filesystem::path&)> disk_space_probe_;
+    bool disk_probe_failure_logged_ = false;
+    std::mutex disk_sampler_mutex_;
+    std::condition_variable_any disk_sampler_cv_;
+    bool disk_sample_requested_ = false;
+    // Started last and stopped first by the destructor.
+    std::jthread disk_sampler_;
 };
 
 }  // namespace chunkdb

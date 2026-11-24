@@ -196,6 +196,9 @@ bool ChunkStore::CheckpointChunk(
     if (chunk->checkpoint_io) {
         throw std::logic_error("chunk files are owned by a running background checkpoint");
     }
+    // Writes change a chunk's memory without measuring it; each checkpoint
+    // measures it again for the cache byte limit.
+    RechargeCacheLocked(*chunk);
     std::shared_lock maintenance_lock(backup_maintenance_mutex_, std::try_to_lock);
     if (!maintenance_lock.owns_lock()) {
         chunk->checkpoint_due_armed = true;
@@ -356,6 +359,10 @@ bool ChunkStore::CheckpointChunk(
             }
             if (strict) {
                 EnsureImageDirectoryPrepared(data_path.parent_path());
+            }
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CHECKPOINT_IMAGE_ENOSPC_ONCE")) {
+                throw std::system_error(ENOSPC, std::generic_category(),
+                    "injected ENOSPC while writing checkpoint image " + data_path.string());
             }
             AtomicWrite(data_path, image, strict, strict, &image_committed);
             if (checkpoint_compression_ == CheckpointCompression::kZrle) {

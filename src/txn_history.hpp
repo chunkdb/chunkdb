@@ -48,6 +48,8 @@ struct TxnKeptState {
 // Release may run after a final policy owner outlives the history index.
 struct TxnHistoryAccounting final : detail::ChunkStorageAccount {
     std::atomic<std::size_t> bytes{0U};
+    // The server-wide limit these bytes also count toward; null when off.
+    std::shared_ptr<ServerByteBudget> total;
     void Reserve(std::size_t) override;
     void Release(std::size_t amount) noexcept override;
 };
@@ -77,7 +79,8 @@ class TxnHistory {
     // afterwards allocates nothing.
     using Reservation = KeptByChunk::node_type;
 
-    explicit TxnHistory(std::size_t limit_bytes);
+    // `total`, when given, is shared with the histories of the other tables.
+    explicit TxnHistory(std::size_t limit_bytes, std::shared_ptr<ServerByteBudget> total = nullptr);
 
     TxnHistory(const TxnHistory&) = delete;
     TxnHistory& operator=(const TxnHistory&) = delete;

@@ -30,7 +30,7 @@ constexpr std::size_t kDataDirOptionsOffset = 40U;
 
 [[nodiscard]] bool IsKnownTableOptionType(std::uint16_t type) noexcept {
     return (type >= kOptionDurabilityMode && type <= kOptionVarMaxChunkBytes) ||
-           type == kOptionFeedBufferBytes || type == kOptionSlotMaxBytes;
+           type == kOptionFeedBufferBytes || type == kOptionSlotMaxBytes || type == kOptionMaxDiskBytes;
 }
 
 [[nodiscard]] bool IsKnownTableManifestType(std::uint16_t type) noexcept {
@@ -403,6 +403,7 @@ std::vector<std::uint8_t> EncodeTableOptions(const TableOptions& options) {
     AppendOption(out, kOptionVarMaxChunkBytes, static_cast<std::uint64_t>(options.var_max_chunk_bytes));
     if (options.feed_buffer_bytes) AppendOption(out, kOptionFeedBufferBytes, static_cast<std::uint64_t>(*options.feed_buffer_bytes));
     if (options.slot_max_bytes) AppendOption(out, kOptionSlotMaxBytes, static_cast<std::uint64_t>(*options.slot_max_bytes));
+    if (options.max_disk_bytes) AppendOption(out, kOptionMaxDiskBytes, static_cast<std::uint64_t>(*options.max_disk_bytes));
     return out;
 }
 
@@ -481,6 +482,8 @@ TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options) {
             decoded.feed_buffer_bytes = size_value;
         } else if (type == kOptionSlotMaxBytes) {
             decoded.slot_max_bytes = size_value;
+        } else if (type == kOptionMaxDiskBytes) {
+            decoded.max_disk_bytes = size_value;
         } else {
             try {
                 RequireValidVarLimit(size_value);

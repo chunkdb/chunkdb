@@ -76,6 +76,24 @@ It leaves revision and recovery records unchanged; restore a consistent backup, 
 A missing or malformed clock beside a valid initialized marker, or a malformed marker, is also refused and has the same remedies.
 Read-only inspection remains available and reports an unknown completed revision as null.
 
+## Disk full
+
+A write that meets a full disk (ENOSPC) answers `DISK_FULL reason=disk_full` and is not applied, in every mode.
+Its WAL is cut back to its length before the write, so no part of it stays in the file.
+
+| Mode | Writes acknowledged before it |
+| --- | --- |
+| relaxed | Kept in memory and in the WAL batch; the next batch flush, eviction or FLUSH WAL writes them again. FLUSH WAL answers DISK_FULL until it can, and a crash before then loses them. |
+| fsync-wal, fsync-checkpoint | Already durable. |
+
+COMMIT whose WAL frames cannot be written answers DISK_FULL in every mode; its WALs are cut back and its intent removed, so no part of the transaction commits.
+A checkpoint image that cannot be written leaves the chunk's image and WAL as they were; the write that started the checkpoint stays acknowledged, in fsync-checkpoint mode too, the server log reports the failure, and a later write or eviction tries again.
+The WAL grows until a checkpoint succeeds.
+ENOSPC alone does not fence a table.
+Only when a WAL cannot be cut back after a failed write does the write answer OUTCOME_UNKNOWN and the table refuse changes until RECOVER TABLE or a restart.
+
+Set `--min-free-disk-bytes` to refuse writes before the disk fills, and the table option `max_disk_bytes` to bound one table; see [Server flags](SERVER_FLAGS.md#disk-space).
+
 ## Platforms and scope
 
 - Linux uses fdatasync where applicable, with fsync fallback and directory fsync.

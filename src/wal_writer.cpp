@@ -547,6 +547,15 @@ void ChunkStore::FlushWalBatch(
             output.flush();
             std::_Exit(86);
         }
+        // A full file system: half of the batch reaches the file, then the
+        // write fails with ENOSPC.
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_APPEND_ENOSPC_ONCE")) {
+            output.write(reinterpret_cast<const char*>(chunk->wal_batch.data()),
+                static_cast<std::streamsize>(chunk->wal_batch.size() / 2U));
+            output.flush();
+            throw std::system_error(ENOSPC, std::generic_category(),
+                "injected ENOSPC while appending a WAL record batch: " + chunk->wal_path.string());
+        }
         output.write(
             reinterpret_cast<const char*>(chunk->wal_batch.data()),
             static_cast<std::streamsize>(chunk->wal_batch.size()));

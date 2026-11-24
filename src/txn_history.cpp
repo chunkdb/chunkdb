@@ -26,7 +26,7 @@ thread_local std::vector<const void*> g_thread_chunk_locks;
         case TxnConflictReason::kDuration:
             return "the transaction was open longer than its duration limit";
         case TxnConflictReason::kHistoryLimit:
-            return "the table's kept states for open transactions reached their byte limit";
+            return "the kept states for open transactions reached the table's or the server's byte limit";
         case TxnConflictReason::kTableChanged:
             return "the table was altered or dropped during the transaction";
     }
@@ -62,10 +62,13 @@ void TxnHistoryAccounting::Release(std::size_t amount) noexcept {
     const auto previous = bytes.fetch_sub(amount, std::memory_order_acq_rel);
     assert(amount <= previous);
     (void)previous;
+    if (total) total->Release(amount);
 }
 
-TxnHistory::TxnHistory(std::size_t limit_bytes)
-    : limit_bytes_(limit_bytes), accounting_(std::make_shared<TxnHistoryAccounting>()) {}
+TxnHistory::TxnHistory(std::size_t limit_bytes, std::shared_ptr<ServerByteBudget> total)
+    : limit_bytes_(limit_bytes), accounting_(std::make_shared<TxnHistoryAccounting>()) {
+    accounting_->total = std::move(total);
+}
 
 TxnHistory::~TxnHistory() {
     // Snapshots hold the history, so none is registered any more.
@@ -147,13 +150,25 @@ void TxnHistory::Publish(Reservation& reservation) noexcept {
         return;
     }
     // Plain writes never fail for the limit: the oldest snapshots go first,
-    // and only while one of them still needs the state.
-    while (needed() && (state.bytes > limit_bytes_ ||
-            accounting_->bytes.load(std::memory_order_acquire) > limit_bytes_ - state.bytes)) {
+    // and only while one of them still needs the state. Past the server-wide
+    // total they are this table's oldest snapshots too, whichever tables hold
+    // the bytes.
+    const auto& total = accounting_->total;
+    const auto fits = [&] {
+        if (state.bytes > limit_bytes_ ||
+            accounting_->bytes.load(std::memory_order_acquire) > limit_bytes_ - state.bytes) return false;
+        return !total || total->TryReserve(state.bytes);
+    };
+    bool admitted = false;
+    while (needed()) {
+        if (fits()) {
+            admitted = true;
+            break;
+        }
         UnregisterLocked(*by_version_.begin()->second, TxnConflictReason::kHistoryLimit);
         PruneLocked();
     }
-    if (!needed()) {
+    if (!admitted) {
         return;
     }
     // Admit the complete retained extent before changing any policy target.
