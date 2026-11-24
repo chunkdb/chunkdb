@@ -6882,6 +6882,168 @@ void TestWatchPositionsAndRights() {
     RawClient multi("127.0.0.1", harness.port); multi.SetReadDeadline(std::chrono::seconds(15)); multi.Login();
     multi.SendLine("WATCH default"); assert(multi.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
 }
+// The event of a catalog push for `kind` and `name`, or null.
+const FeedReply* CatalogEvent(const FeedReply& push, std::string_view kind, std::string_view name) {
+    assert(push.type == '>' && push.items.size() == 7U && push.items[0].value == "catalog");
+    assert(push.items[3].type == ':' && push.items[5].type == '*' && push.items[6].type == '_');
+    for (const auto& event : push.items[5].items)
+        if (FeedMap(event, "kind").value == kind && FeedMap(event, "name").value == name) return &event;
+    return nullptr;
+}
+// Who sees users, who keeps the watch, and the watch limit.
+void TestWatchCatalogRights() {
+    auto config = AuthenticatedFeedServerConfig(); config.worker_threads = 2; config.max_watches = 3;
+    ServerHarness harness("watch-catalog-rights", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    RawClient admin("127.0.0.1", harness.port); admin.SetReadDeadline(std::chrono::seconds(15)); admin.Login();
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    admin.SetReadDeadline(std::chrono::seconds(15));
+    for (const std::string name : {"ops", "um", "gone"}) {
+        admin.SendLine("CREATE USER " + name + " VERIFIER '" + verifier + "'"); assert(admin.ReadLine() == "+OK\r\n");
+    }
+    admin.SendLine("GRANT ADMIN ON * TO ops"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("GRANT MONITOR ON * TO um"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("ALTER USER um MANAGES USERS"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("GRANT MONITOR ON * TO gone"); assert(admin.ReadLine() == "+OK\r\n");
+    RawClient ops("127.0.0.1", harness.port); ops.SetReadDeadline(std::chrono::seconds(15)); ops.Login("ops", "pw");
+    RawClient um("127.0.0.1", harness.port); um.SetReadDeadline(std::chrono::seconds(15)); um.Login("um", "pw");
+    RawClient gone("127.0.0.1", harness.port); gone.SetReadDeadline(std::chrono::seconds(15)); gone.Login("gone", "pw");
+    for (auto* client : {&admin, &ops, &um, &gone}) client->SetReadDeadline(std::chrono::seconds(15));
+
+    // ADMIN on * without MANAGES USERS: no user records.
+    ops.SendLine("WATCH CATALOG"); (void)ReadFeedReply(ops);
+    const auto ops_whole = ReadFeedReply(ops);
+    assert(CatalogEvent(ops_whole, "table", "default") != nullptr && CatalogEvent(ops_whole, "user", "ops") == nullptr);
+    um.SendLine("WATCH CATALOG"); (void)ReadFeedReply(um);
+    assert(CatalogEvent(ReadFeedReply(um), "user", "um") != nullptr);
+    gone.SendLine("WATCH CATALOG"); (void)ReadFeedReply(gone);
+    (void)ReadFeedReply(gone);
+    // Catalog watches count against --max-watches.
+    admin.SendLine("WATCH CATALOG"); assert(admin.ReadLine().rfind("-ERR BUSY", 0) == 0);
+
+    // Who ran a statement is shown with MANAGES USERS only.
+    admin.SendLine("CREATE TABLE rights_t (n u8) CHUNK 4 x 4"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto hidden = ReadFeedReply(ops);
+    assert(CatalogEvent(hidden, "table", "rights_t") != nullptr && hidden.items[4].type == '_');
+    const auto shown = ReadFeedReply(um);
+    assert(CatalogEvent(shown, "table", "rights_t") != nullptr && shown.items[4].value == kAdminUser);
+    assert(ReadFeedReply(gone).items[2].value == shown.items[2].value);
+
+    // Losing MANAGES USERS ends a watch that shows users.
+    admin.SendLine("ALTER USER um NO MANAGES USERS"); assert(admin.ReadLine() == "+OK\r\n");
+    assert(um.ReadLine().rfind("-ERR PERMISSION_DENIED", 0) == 0);
+    assert(um.WaitForClose(std::chrono::seconds(5)));
+    // A dropped user's watch ends.
+    admin.SendLine("DROP USER gone"); assert(admin.ReadLine() == "+OK\r\n");
+    assert(gone.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
+    assert(gone.WaitForClose(std::chrono::seconds(5)));
+    // The ADMIN watch saw neither user change and goes on.
+    admin.SendLine("DROP TABLE rights_t"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto dropped = ReadFeedReply(ops);
+    assert(dropped.items[5].items.size() == 1U && CatalogEvent(dropped, "table", "rights_t") != nullptr);
+    ops.SendBytes("UNWATCH\r\nPING\r\n");
+    assert(ops.ReadLine() == "+OK\r\n" && ops.ReadLine() == "+PONG\r\n");
+}
+void TestWatchCatalog() {
+    auto config = AuthenticatedFeedServerConfig(); config.worker_threads = 2;
+    ServerHarness harness("watch-catalog", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    RawClient admin("127.0.0.1", harness.port); admin.SetReadDeadline(std::chrono::seconds(15)); admin.Login();
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    admin.SetReadDeadline(std::chrono::seconds(15));
+    for (const std::string name : {"mon", "reader"}) {
+        admin.SendLine("CREATE USER " + name + " VERIFIER '" + verifier + "'"); assert(admin.ReadLine() == "+OK\r\n");
+    }
+    admin.SendLine("GRANT MONITOR ON * TO mon"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("GRANT READ ON default TO reader"); assert(admin.ReadLine() == "+OK\r\n");
+    RawClient reader("127.0.0.1", harness.port); reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login("reader", "pw");
+    RawClient full("127.0.0.1", harness.port); full.SetReadDeadline(std::chrono::seconds(15)); full.Login();
+    RawClient mon("127.0.0.1", harness.port); mon.SetReadDeadline(std::chrono::seconds(15)); mon.Login("mon", "pw");
+    // Re-arm the read windows after the SCRAM setup of every client.
+    for (auto* client : {&admin, &reader, &full, &mon}) client->SetReadDeadline(std::chrono::seconds(15));
+    reader.SendLine("WATCH CATALOG"); assert(reader.ReadLine().rfind("-ERR PERMISSION_DENIED", 0) == 0);
+
+    // ADMIN on * with MANAGES USERS: tables, users and slot owners.
+    full.SendLine("WATCH CATALOG");
+    const auto start = ReadFeedReply(full);
+    const auto epoch = FeedStart(start).substr(0, 32U);
+    const auto whole = ReadFeedReply(full);
+    assert(whole.items[1].value == epoch && whole.items[4].type == '_');
+    const auto* table = CatalogEvent(whole, "table", "default");
+    assert(table != nullptr && FeedMap(*table, "action").value == "create" && FeedMap(*table, "table").type == '_');
+    assert(CatalogEvent(whole, "user", kAdminUser) != nullptr && CatalogEvent(whole, "user", "mon") != nullptr);
+    // MONITOR without MANAGES USERS: no user records and no slot owners.
+    mon.SendLine("WATCH CATALOG");
+    assert(FeedStart(ReadFeedReply(mon)).substr(0, 32U) == epoch);
+    const auto limited = ReadFeedReply(mon);
+    assert(CatalogEvent(limited, "table", "default") != nullptr && CatalogEvent(limited, "user", "mon") == nullptr);
+
+    admin.SendLine("CREATE TABLE cat_t (n u8) CHUNK 4 x 4"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto created = ReadFeedReply(full);
+    assert(created.items[1].value == epoch && created.items[4].value == kAdminUser);
+    const auto created_revision = std::stoull(created.items[2].value);
+    table = CatalogEvent(created, "table", "cat_t");
+    assert(table != nullptr && FeedMap(*table, "action").value == "create");
+    // DESCRIBE's map without the data revision.
+    const auto& described = FeedMap(*table, "data");
+    assert(described.type == '%' && described.items.size() == 18U && FeedMap(described, "version").value == "1");
+    const auto seen = ReadFeedReply(mon);
+    assert(seen.items[2].value == created.items[2].value && CatalogEvent(seen, "table", "cat_t") != nullptr);
+
+    admin.SendLine("ALTER TABLE cat_t ADD COLUMN m u16"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto altered = ReadFeedReply(full);
+    table = CatalogEvent(altered, "table", "cat_t");
+    assert(table != nullptr && FeedMap(*table, "action").value == "alter");
+    assert(FeedMap(FeedMap(*table, "data"), "version").value == "2");
+    assert(CatalogEvent(ReadFeedReply(mon), "table", "cat_t") != nullptr);
+
+    admin.SendLine("CREATE SLOT 'sub' ON cat_t"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto slot_full = ReadFeedReply(full);
+    const auto* slot = CatalogEvent(slot_full, "slot", "sub");
+    assert(slot != nullptr && FeedMap(*slot, "action").value == "create" && FeedMap(*slot, "table").value == "cat_t");
+    assert(FeedMap(FeedMap(*slot, "data"), "owner").value == kAdminUser);
+    const auto slot_push = ReadFeedReply(mon);
+    slot = CatalogEvent(slot_push, "slot", "sub");
+    assert(slot != nullptr && FeedMap(FeedMap(*slot, "data"), "owner").type == '_');
+
+    // WATCH CATALOG reserves the name for new tables.
+    admin.SendLine("CREATE TABLE catalog (n u8) CHUNK 4 x 4"); assert(admin.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+    admin.SendLine("ALTER TABLE cat_t RENAME TO catalog"); assert(admin.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+
+    // A user change reaches only the watch that shows users.
+    admin.SendLine("CREATE USER bob VERIFIER '" + verifier + "'"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto bob_push = ReadFeedReply(full);
+    const auto* bob = CatalogEvent(bob_push, "user", "bob");
+    assert(bob != nullptr && FeedMap(*bob, "action").value == "create" && FeedMap(FeedMap(*bob, "data"), "verifiers").value == "1");
+    admin.SendLine("DROP TABLE cat_t"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto dropped = ReadFeedReply(full);
+    table = CatalogEvent(dropped, "table", "cat_t");
+    slot = CatalogEvent(dropped, "slot", "sub");
+    assert(table != nullptr && FeedMap(*table, "action").value == "drop" && FeedMap(*table, "data").type == '_');
+    assert(slot != nullptr && FeedMap(*slot, "action").value == "drop");
+    const auto mon_dropped = ReadFeedReply(mon);
+    assert(CatalogEvent(mon_dropped, "table", "cat_t") != nullptr && CatalogEvent(mon_dropped, "user", "bob") == nullptr);
+    assert(mon_dropped.items[2].value == dropped.items[2].value);
+    assert(std::stoull(dropped.items[2].value) == created_revision + 4U);
+
+    // Losing MONITOR ends that watch; the other one receives the user change.
+    admin.SendLine("REVOKE MONITOR ON * FROM mon"); assert(admin.ReadLine() == "+OK\r\n");
+    assert(mon.ReadLine().rfind("-ERR PERMISSION_DENIED", 0) == 0);
+    assert(mon.WaitForClose(std::chrono::seconds(5)));
+    const auto revoke_push = ReadFeedReply(full);
+    const auto* revoked = CatalogEvent(revoke_push, "user", "mon");
+    assert(revoked != nullptr && FeedMap(*revoked, "action").value == "alter");
+    assert(FeedMap(FeedMap(*revoked, "data"), "server_rights").items.empty());
+
+    full.SendBytes("UNWATCH\r\nPING\r\n");
+    assert(full.ReadLine() == "+OK\r\n" && full.ReadLine() == "+PONG\r\n");
+
+    // Another process could change the catalog without a push.
+    harness.saved_store_config.allow_multiple_processes = true;
+    harness.Restart();
+    RawClient multi("127.0.0.1", harness.port); multi.SetReadDeadline(std::chrono::seconds(15)); multi.Login();
+    multi.SendLine("WATCH CATALOG"); assert(multi.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+}
 template <typename Client> void TestWatchSlowReader(bool tls) {
     auto config = BaseServerConfig(); config.worker_threads = 2; config.max_watches = 10;
     config.feed_buffer_bytes = 32U * 1024U * 1024U; config.tls_enabled = tls;
@@ -7883,6 +8045,8 @@ void TestFeedWatch() {
     run("TestWatchPipelinedLines<RawClient>(false)", [] { TestWatchPipelinedLines<RawClient>(false); });
     run("TestWatchNoIdle<RawClient>(false)", [] { TestWatchNoIdle<RawClient>(false); });
     run("TestWatchPositionsAndRights()", [] { TestWatchPositionsAndRights(); });
+    run("TestWatchCatalog()", [] { TestWatchCatalog(); });
+    run("TestWatchCatalogRights()", [] { TestWatchCatalogRights(); });
     run("TestWatchSlowReader<RawClient>(false)", [] { TestWatchSlowReader<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
     run("TestWatchLinger<TlsClient>(true, false)", [] { TestWatchLinger<TlsClient>(true, false); });

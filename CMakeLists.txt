@@ -86,6 +86,7 @@ add_library(chunkdb_core STATIC
     src/chunk_file_header.cpp
     src/feed_protocol.cpp
     src/change_feed.cpp
+    src/catalog_feed.cpp
     src/feed_slot_records.cpp
     src/feed_slots.cpp
     src/slot_watch.cpp
@@ -1125,6 +1126,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_feed_order_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME feed_order COMMAND chunkdb_feed_order_test)
 
+    add_executable(chunkdb_catalog_feed_test tests/catalog_feed_tests.cpp)
+    target_link_libraries(chunkdb_catalog_feed_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_catalog_feed_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME catalog_feed COMMAND chunkdb_catalog_feed_test)
+
     add_executable(chunkdb_feed_slot_records_test tests/feed_slot_records_tests.cpp)
     target_link_libraries(chunkdb_feed_slot_records_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_feed_slot_records_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1201,6 +1207,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_feed_slots_crash_test
         chunkdb_feed_slots_durability_test
         chunkdb_feed_order_test
+        chunkdb_catalog_feed_test
         chunkdb_feed_watermark_test
         chunkdb_feed_lifecycle_test
         chunkdb_table_feed_limits_test
@@ -1393,6 +1400,7 @@ if(CHUNKDB_BUILD_TESTS)
         feed_slots_verify
         feed_slots_durability
         feed_order
+        catalog_feed
         feed_watermark
         feed_lifecycle
         table_feed_limits

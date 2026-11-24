@@ -211,6 +211,10 @@ class ReadRightCheck {
     // Also requires ADMIN on `*` from now on: a watch of a slot another user
     // owns. Set by the statement thread before the watch reaches the feed.
     void RequireEveryTableAdmin() noexcept { every_table_admin_ = true; }
+    // A catalog watch instead of a table watch: MONITOR or ADMIN on `*`, and
+    // MANAGES USERS too when `manages_users`. The table is empty.
+    void RequireCatalog(bool manages_users) noexcept { catalog_ = true; catalog_users_ = manages_users; }
+    [[nodiscard]] bool catalog() const noexcept { return catalog_; }
 
   private:
     State Recheck(std::uint64_t generation);
@@ -221,6 +225,8 @@ class ReadRightCheck {
     std::uint64_t generation_;
     State state_ = State::kHeld;
     bool every_table_admin_ = false;
+    bool catalog_ = false;
+    bool catalog_users_ = false;
 };
 
 }  // namespace chunkdb
