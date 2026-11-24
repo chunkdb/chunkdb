@@ -497,13 +497,19 @@ void TestWalRecords() {
         RawFrame(4, {{chunkdb::kWalRecordVarReplace, Concat({Entry(3, 1, B("a")), Entry(2, 0, B("a"))})}}),
         "record_vars_invalid");
 
-    // The rules hold for the state replay ends in, not per frame.
+    // The rules hold for the state after every frame, as in feed replay.
     {
         auto wal = good;
         const auto bad = RawFrame(4, {{chunkdb::kWalRecordVarPut, Entry(2, 7, B("a"))}});
         wal.insert(wal.end(), bad.begin(), bad.end());
         const auto r = Replay(wal);
         assert(!r.result.tail_truncated_or_corrupt && Contains(r.result.vars_problem, "a value of an absent block"));
+        // A later frame that makes the block present does not hide it.
+        const auto present = RawFrame(5, {{chunkdb::kWalRecordSpan, SpanBody(kPayloadBytes, {0x83, 0x00})}});
+        wal.insert(wal.end(), present.begin(), present.end());
+        const auto hidden = Replay(wal);
+        assert(!hidden.result.tail_truncated_or_corrupt && hidden.result.applied_frames == 5U);
+        assert(Contains(hidden.result.vars_problem, "a value of an absent block"));
     }
 
     // A table without text or bytes columns has no value records.

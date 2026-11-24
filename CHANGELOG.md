@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Loading a chunk, backup checks and `chunkdb_verify` check text and bytes values after every WAL frame, as feed replay does, instead of only in the state replay ends in; a backup links or admits coordinate-index entries only after the inventory's checksum and length are checked; a start refused by its option flags or by a later table no longer drops an interrupted narrowing or ADD CHECK from a manifest first, which now happens only once every table passed its checks (#282).
+- `chunkdb.users` is at most 64 MiB and the backup record `chunkdb.backup` at most 1 GiB: writers refuse larger files and readers check the size before they read one whole (#282).
 - `chunkdb_admin reset-password` refuses a data directory with a feature this build can only read before it recovers or writes anything, as `rebuild-version-clock` and a read-write open do (#282).
 - A SIGTERM or SIGINT that arrives while the server starts ends it: a stop between binding the client listener and serving it was lost, and the server kept running.
 - Add `chunkdb_exporter`, which logs in to a server as a user with the MONITOR right (SCRAM, password from `--password-file`, `chunks://` with certificate verification and channel binding), reads SHOW METRICS on each scrape and serves it at `GET` and `HEAD /metrics` on `--listen` (`127.0.0.1:14242`; another address needs `--allow-remote`) with `chunkdb_up`, answering `503` with `chunkdb_up 0` when the server cannot be read; a kept connection that fails is replaced within the same scrape, a failed login is not tried again for 1 to 30 seconds, the password file must be readable by its owner only, scrapes that arrive during a read share it and ships in the release archives and the Docker image (#149).

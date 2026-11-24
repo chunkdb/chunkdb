@@ -5,6 +5,7 @@
 #include <bit>
 #include <limits>
 #include <stdexcept>
+#include <vector>
 
 #include "chunkdb/crc32.hpp"
 
@@ -329,6 +330,10 @@ IndexInventoryHeader ReadIndexInventory(
     std::array<std::uint8_t, 72> entry{};
     const auto fields = 8U * header.dims;
     const auto active_entry = std::span(entry).first(fields + 48U);
+    // Entries reach `candidate` only once the checksum and the end of the
+    // file are checked: a caller acts on them (backup staging links files),
+    // and a damaged inventory must not have been acted on in part.
+    std::vector<IndexInventoryEntry> entries;
     for (std::uint64_t i = 0; i < header.count; ++i) {
         ReadExact(input, active_entry);
         crc = Crc32Extend(crc, active_entry.data(), active_entry.size());
@@ -339,7 +344,7 @@ IndexInventoryHeader ReadIndexInventory(
         std::copy_n(entry.begin() + static_cast<std::ptrdiff_t>(fields + 16U), parsed.replacement_sha256.size(),
             parsed.replacement_sha256.begin());
         RequireInventoryEntry(header, parsed);
-        if (candidate) candidate(parsed);
+        if (candidate) entries.push_back(parsed);
         previous = coord;
     }
     std::array<std::uint8_t, 4> checksum{};
@@ -354,6 +359,7 @@ IndexInventoryHeader ReadIndexInventory(
         if (input.bad() || !input.eof()) throw;
     }
     if (input.bad() || !input.eof()) throw std::invalid_argument("index inventory stream is unreadable");
+    for (const auto& parsed : entries) candidate(parsed);
     return header;
 }
 

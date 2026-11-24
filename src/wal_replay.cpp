@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstring>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -664,6 +665,22 @@ WalReplayResult wal_detail::ReplayFromSource(
         set_state(*payload, *presence_bitmap);
     }
 
+    // Every committed state keeps the value invariants; the first state that
+    // does not is damage, even when a later frame would hide it.
+    const auto vars_problem_of = [&](const ChunkLayout& layout, std::span<const std::uint8_t> presence) -> std::string {
+        if (vars->encoded_size() > kVarMaxChunkBytesLimit)
+            return "values take " + std::to_string(vars->encoded_size()) + " bytes, more than " +
+                   std::to_string(kVarMaxChunkBytesLimit);
+        if (*chunk_columns && (*chunk_columns)->variable_bytes > kVarMaxChunkBytesLimit - vars->encoded_size())
+            return "block and chunk values exceed the combined variable-byte limit";
+        try {
+            layout.RequireValidVarsView(*vars, presence);
+        } catch (const std::invalid_argument& e) {
+            return e.what();
+        }
+        return {};
+    };
+
     std::size_t cursor = header_size;
     ParsedFrame frame;
     std::uint64_t previous_revision = 0;
@@ -763,6 +780,13 @@ WalReplayResult wal_detail::ReplayFromSource(
                 frame_bytes.data() + span.source + span.size,
                 state.begin() + static_cast<std::ptrdiff_t>(span.offset));
         }
+        // Checked after every frame, as feed replay does. Without text or
+        // bytes values only the byte limits apply, and they cannot fail.
+        if (result.vars_problem.empty() && (!vars->empty() || *chunk_columns)) {
+            const auto& layout = geometry.LayoutAt(state_version);
+            result.vars_problem = vars_problem_of(
+                layout, std::span<const std::uint8_t>(state).subspan(layout.payload_bytes()));
+        }
         result.applied_records += frame.record_count;
         result.applied_frames += 1;
         result.revision = frame.revision;
@@ -776,20 +800,8 @@ WalReplayResult wal_detail::ReplayFromSource(
         move_state_to(current_version);
     }
     SplitChunkStateBytes(geometry, state, payload, presence_bitmap);
-    // Every committed state keeps the value invariants, and replay ends in a
-    // committed state; anything else is damage.
-    if (vars->encoded_size() > kVarMaxChunkBytesLimit) {
-        result.vars_problem = "values take " + std::to_string(vars->encoded_size()) + " bytes, more than " +
-                              std::to_string(kVarMaxChunkBytesLimit);
-    } else if (*chunk_columns && (*chunk_columns)->variable_bytes > kVarMaxChunkBytesLimit - vars->encoded_size()) {
-        result.vars_problem = "block and chunk values exceed the combined variable-byte limit";
-    } else {
-        try {
-            geometry.layout().RequireValidVars(*vars, *presence_bitmap);
-        } catch (const std::invalid_argument& e) {
-            result.vars_problem = e.what();
-        }
-    }
+    // Replay ends in a committed state, which keeps the invariants too.
+    if (result.vars_problem.empty()) result.vars_problem = vars_problem_of(geometry.layout(), *presence_bitmap);
     return result;
 }
 
