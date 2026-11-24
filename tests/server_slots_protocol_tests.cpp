@@ -1392,6 +1392,37 @@ void ChunkForms(bool tls) {
     assert(NextChunks(*slot) == partial && NextChunks(*slot) == removed); Unwatch(*slot);
 }
 
+// A slot keeps several areas: CREATE SLOT records them in order without
+// repeats, SHOW SLOTS lists them, WATCH SLOT accepts the same set in any order,
+// and live delivery and the replay after a reconnect keep only their chunks.
+void SeveralAreaSlot(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8) CHUNK 4 x 4");
+    writer->Ok("CREATE SLOT 'several' ON t AREA 2 2 TO 2 2, AREA 0 0 TO 0 0, AREA 0 0 TO 0 0");
+    writer->Ok("CREATE SLOT IF NOT EXISTS 'several' ON t AREA 0 0 TO 0 0, AREA 2 2 TO 2 2");
+    const auto fewer = writer->Command("CREATE SLOT IF NOT EXISTS 'several' ON t AREA 0 0 TO 0 0");
+    Error(fewer, "INVALID_ARGUMENT"); assert(fewer.value.find("reason=slot_filters") != std::string::npos);
+    const auto shown = writer->Command("SHOW SLOTS ON t");
+    const auto& filters = Field(Slot(shown, "t", "several"), "filters");
+    assert(Field(filters, "area").type == '_');
+    const auto& areas = Field(filters, "areas").items;
+    assert(areas.size() == 2U && areas[0].items.size() == 4U && Number(areas[0].items[0]) == 0U && Number(areas[1].items[3]) == 2U);
+    auto watch = harness.Connect();
+    const auto one = watch->Command("WATCH t SLOT 'several' AREA 0 0 TO 0 0");
+    Error(one, "INVALID_ARGUMENT"); assert(one.value.find("reason=slot_filters") != std::string::npos);
+    (void)Start(watch->Command("WATCH t SLOT 'several' AREA 2 2 TO 2 2, AREA 0 0 TO 0 0, AREA 2 2 TO 2 2"));
+    (void)Number(writer->Command("SET BLOCK 4 4 IN t n = 1")); // Chunk 1 1 is outside both areas.
+    const auto low = Number(writer->Command("SET BLOCK 0 0 IN t n = 2"));
+    const auto high = Number(writer->Command("SET BLOCK 8 8 IN t n = 3"));
+    FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
+    assert(Change(NextChange(*watch)) == low && Change(NextChange(*watch)) == high);
+    Unwatch(*watch); // No ACK: the next watch replays both and still skips chunk 1 1.
+    (void)Start(watch->Command("WATCH t SLOT 'several'"));
+    assert(Change(NextChange(*watch)) == low && Change(NextChange(*watch)) == high);
+    Unwatch(*watch);
+}
+
 void PersistentFilterDelivery(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect();
@@ -1408,7 +1439,7 @@ void PersistentFilterDelivery(bool tls) {
     auto watch = harness.Connect();
     const auto wrong = watch->Command("WATCH t SLOT 'filtered' COLUMNS n,label");
     Error(wrong, "INVALID_ARGUMENT"); assert(wrong.value.find("reason=slot_filters") != std::string::npos);
-    // A slot keeps one area, so different ones never match its filters; repeats of it do.
+    // Areas other than the slot's never match its filters; repeats of them do.
     const auto areas = watch->Command("WATCH t SLOT 'filtered' AREA 0 0 TO 0 0, AREA 1 1 TO 1 1");
     Error(areas, "INVALID_ARGUMENT"); assert(areas.value.find("reason=slot_filters") != std::string::npos);
     (void)Start(watch->Command("WATCH t SLOT 'filtered' AREA 0 0 TO 0 0, AREA 0 0 TO 0 0"));
@@ -2760,6 +2791,7 @@ int main(int argc, char** argv) {
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);
         run("persistent-filters", PersistentFilterDelivery);
+        run("several-area-slot", SeveralAreaSlot);
         run("historical-schema", HistoricalSchemas); run("historical-schema-dimensional", HistoricalSchemasDimensional); run("held-lease", ArchiveWhileLeaseHeld);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
         run("live-schema-ACK", LiveSchemaAcknowledgement);

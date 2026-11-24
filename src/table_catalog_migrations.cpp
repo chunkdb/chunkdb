@@ -30,11 +30,13 @@ void CrashAtFailpoint(const char* key) {
 
 FeedSlotFilters MigrationSlotFilters(const MigrationRequest& request, const Geometry& geometry) {
     auto filters = request.slot_filters;
-    if (filters.area && filters.area->dims != geometry.dims())
-        throw std::invalid_argument("coordinate dimensions differ from the table: the table has " +
-                                    std::to_string(geometry.dims()) + " and the slot area " +
-                                    std::to_string(filters.area->dims) +
-                                    "; give one coordinate per table dimension (DESCRIBE shows dims)");
+    for (const auto& area : filters.areas)
+        if (area.dims != geometry.dims())
+            throw std::invalid_argument("coordinate dimensions differ from the table: the table has " +
+                                        std::to_string(geometry.dims()) + " and the slot area " +
+                                        std::to_string(area.dims) +
+                                        "; give one coordinate per table dimension (DESCRIBE shows dims)");
+    SortFeedAreas(filters.areas);
     const auto& schema = geometry.layout().schema();
     if (request.slot_columns) {
         filters.column_ids.emplace();

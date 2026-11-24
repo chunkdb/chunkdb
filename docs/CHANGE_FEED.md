@@ -92,8 +92,8 @@ Reducing a table's limits can also trigger resync or mark existing slots lost.
 ## Slots watched with AREA
 
 ACK accepts at most the last change, chunks or progress revision delivered to your application.
-A slot watch with AREA filters mutations, while progress can advance its ACK through completed writes outside that area.
-Writes outside the area still add to the slot's retained history until acknowledged, which can exceed `slot_max_bytes` and mark the slot lost.
+A slot watch with AREA filters mutations, while progress can advance its ACK through completed writes outside its areas.
+Writes outside its areas still add to the slot's retained history until acknowledged, which can exceed `slot_max_bytes` and mark the slot lost.
 Consume and acknowledge progress as well as mutations, or raise `slot_max_bytes` to cover the writes between acknowledgements.
 SHOW SLOTS reports each slot's retained bytes.
 

@@ -415,12 +415,9 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
 
 template<class Statement>
 FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement& statement) {
-    std::optional<FeedArea> area;
-    if constexpr (requires { statement.areas; }) {
-        for (const auto& each : statement.areas) RequireDimensions(table->geometry(), each.dims);
-    } else area = statement.area;
-    if (area) RequireDimensions(table->geometry(), area->dims);
-    FeedSlotFilters filters{.area = area, .no_before = statement.no_before, .chunks = statement.chunks};
+    for (const auto& area : statement.areas) RequireDimensions(table->geometry(), area.dims);
+    FeedSlotFilters filters{.areas = statement.areas, .no_before = statement.no_before, .chunks = statement.chunks};
+    SortFeedAreas(filters.areas);
     if (statement.columns) filters.column_ids = table->ResolveFeedColumns(*statement.columns);
     return filters;
 }
@@ -685,10 +682,7 @@ void AppendUserMap(std::string& reply, const std::string& name, const User& user
 
 // The `filters` key and map of SHOW SLOTS and catalog slot records.
 void AppendSlotFilters(std::string& reply, const FeedSlot& slot) {
-    Protocol::AppendBulk(reply, "filters"); Protocol::AppendMapHeader(reply, 5U);
-    Protocol::AppendBulk(reply, "area");
-    if (slot.filters.area) {
-        const auto& area = *slot.filters.area;
+    const auto append_area = [&](const FeedArea& area) {
         Protocol::AppendArrayHeader(reply, static_cast<std::size_t>(area.dims) * 2U);
         Protocol::AppendInteger(reply, area.first.x);
         Protocol::AppendInteger(reply, area.first.y);
@@ -696,6 +690,17 @@ void AppendSlotFilters(std::string& reply, const FeedSlot& slot) {
         Protocol::AppendInteger(reply, area.last.x);
         Protocol::AppendInteger(reply, area.last.y);
         if (area.dims == 3U) Protocol::AppendInteger(reply, area.last.z);
+    };
+    const auto& areas = slot.filters.areas;
+    Protocol::AppendBulk(reply, "filters"); Protocol::AppendMapHeader(reply, 6U);
+    // `area` is the only area, null for none or several; `areas` lists them all, null for none.
+    Protocol::AppendBulk(reply, "area");
+    if (areas.size() == 1U) append_area(areas.front());
+    else Protocol::AppendNull(reply);
+    Protocol::AppendBulk(reply, "areas");
+    if (!areas.empty()) {
+        Protocol::AppendArrayHeader(reply, areas.size());
+        for (const auto& area : areas) append_area(area);
     } else Protocol::AppendNull(reply);
     Protocol::AppendBulk(reply, "column_ids");
     if (slot.filters.column_ids) {
@@ -1646,7 +1651,7 @@ std::string CommandEngine::ExecuteStatement(
                         [&](const cql::CreateSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
                             request.kind = MigrationRequest::Kind::kCreateSlot; request.table = slot.table; request.slot = slot.name; request.if_not_exists = slot.if_not_exists;
-                            request.slot_filters = {.area = slot.area, .no_before = slot.no_before, .chunks = slot.chunks};
+                            request.slot_filters = {.areas = slot.areas, .no_before = slot.no_before, .chunks = slot.chunks};
                             request.slot_columns = slot.columns;
                             request.slot_owner = SlotOwner(slot, config_.require_auth, session.user);
                             request.slot_owner_given = slot.owner.has_value();
