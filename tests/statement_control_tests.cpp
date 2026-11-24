@@ -201,6 +201,26 @@ void ScopedContextAndOverflow() {
     catch (const std::invalid_argument&) { overflow = true; }
     assert(overflow);
 }
+
+// Progress shows only while the statement runs; a completed one, stopped or not, reports none.
+void ProgressEndsAtCompletion() {
+    for (const bool stop : {false, true}) {
+        Control control(Clock::now(), 0U);
+        assert(control.Start() && !control.progress());
+        {
+            ScopedStatementControl context(&control);
+            ReportStatementProgress({.files_done = 0U, .files_total = 10U, .bytes_done = 0U, .bytes_total = 100U});
+            ReportStatementProgress({.files_done = 3U, .files_total = 10U, .bytes_done = 30U, .bytes_total = 100U});
+        }
+        const auto reported = control.progress();
+        assert(reported && reported->files_done == 3U && reported->files_total == 10U);
+        assert(reported->bytes_done == 30U && reported->bytes_total == 100U);
+        if (stop) assert(control.RequestStop(StatementStopReason::kCancelled));
+        assert(control.Complete().has_value() == stop);
+        assert(!control.progress());
+    }
+    ReportStatementProgress({.files_done = 1U, .files_total = 1U, .bytes_done = 1U, .bytes_total = 1U});
+}
 }  // namespace
 
 int main() {
@@ -211,4 +231,5 @@ int main() {
     DecisionSamplesClockUnderArbitrationLock();
     StopCallbacksRunOutsideAdmissionLock();
     ScopedContextAndOverflow();
+    ProgressEndsAtCompletion();
 }
