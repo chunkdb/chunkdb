@@ -605,13 +605,13 @@ DROP TABLE and ALTER TABLE ... RENAME TO outside MIGRATE use format version 2 fo
 
 1. `CKMJ`, version `2:u16`, reserved zero `u16`, data-directory ID (16 bytes); no record.
 2. Directory action `u8` (2 drop, 3 rename), table length `u32` and name, table StoreId (16 bytes), operation-name length `u32` and name: `<table>.<16 lowercase hex digits>` under `.chunkdb.dropped/` for a drop, the new table name for a rename.
-3. Participant count `u32` (0–5): only `chunkdb.users`, with its before-image, encoded as in version 1.
+3. Participant count `u32` (0 or 1): only `chunkdb.users`, with its before-image, encoded as in version 1.
 4. CRC32 over all preceding bytes.
 
 It needs no `migrations` feature and has no ledger. A build that reads only version 1 refuses it and does not open the directory.
 The journal is synced before the directory move, and the move, not the journal, commits the operation; the table directory and the moved name must hold exactly one table of the journal's identity.
-After the move and its directory sync, the users are published and written and the journal is removed; a failure before the move removes the journal, a failure after it fences the catalog until restart.
-Writer recovery completes a version-2 journal whose table directory is gone and removes one whose table directory is still in place, before it removes interrupted drops.
+After the move and its directory sync, the users are published and written and the journal is removed; a failure before the move removes the journal, and a failure to remove it, a move whose outcome is unknown or a failure after the move fences the catalog until restart.
+Writer recovery removes a version-2 journal whose `tables/<table>` still holds the journal's table identity and completes one whose moved name holds it, also when a table of another identity has the old name, before it removes interrupted drops.
 Recovery redoes exact images rather than executing statement text; read-only and multi-process opening refuse pending recovery.
 Malformed, foreign, or inconsistent journal state refuses opening without partial completion.
 

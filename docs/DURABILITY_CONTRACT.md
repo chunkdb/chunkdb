@@ -69,7 +69,7 @@ A failed rollback also requires that recovery before durability-changing operati
 Named migrations use a durable decision containing their metadata change and completion record.
 After an unknown migration outcome, restart and retry the same name and text.
 DROP TABLE and RENAME TO journal their grant change before the directory move that commits them; writer recovery writes the grants when the move happened and drops the journal when it did not.
-A failure after the move refuses catalog commands until a restart completes the change.
+When grants change, a failure after the move, or a failure to remove the journal after a refused move, refuses catalog commands until a restart completes or removes it.
 Checkpoint or collection failures do not silently weaken synced durability.
 Malformed WAL headers and interior frames are refused; only crash-shaped incomplete tails are repaired during writer recovery.
 

@@ -474,6 +474,15 @@ void WriteMigrationJournal(const std::filesystem::path& root, const MigrationJou
 }
 
 namespace {
+// Whether `tables/<table>` still holds the journal's table: a table created
+// under the name since is another identity.
+bool SourceHoldsTable(const std::filesystem::path& root, const MigrationJournal& journal) {
+    const auto source = root / "tables" / journal.table;
+    if (!Present(source)) return false;
+    const auto image = ReadBytes(source / kStoreManifestFileName, kStoreManifestMaxSize);
+    return image && ParseStoreManifest(*image).store_id == journal.table_id;
+}
+
 // The directory `tables/<table>` moves to when a catalog operation commits.
 std::string CatalogOperationTarget(const MigrationJournal& journal) {
     return journal.directory_action == MigrationDirectoryAction::kDrop
@@ -495,14 +504,14 @@ void ValidateCatalogOperationJournal(const std::filesystem::path& root, const Mi
     const auto target = CatalogOperationTarget(journal);
     SafePath(root, source);
     SafePath(root, target);
-    const bool source_present = Present(root / source);
-    if (source_present == Present(root / target)) Bad("ambiguous directory operation");
-    CheckDirectory(root / (source_present ? source : target), journal.table_id);
+    const bool at_source = SourceHoldsTable(root, journal);
+    if (at_source == Present(root / target)) Bad("ambiguous directory operation");
+    CheckDirectory(root / (at_source ? source : target), journal.table_id);
 }
 }  // namespace
 
 bool CatalogOperationMoved(const std::filesystem::path& root, const MigrationJournal& journal) {
-    return !Present(root / "tables" / journal.table);
+    return !SourceHoldsTable(root, journal);
 }
 
 void ValidateMigrationJournal(const std::filesystem::path& root, const MigrationJournal& journal) {

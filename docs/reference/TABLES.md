@@ -213,7 +213,7 @@ Open transactions on the table answer CONFLICT, and watches end with INTERNAL `w
 A consumer watches the new name and resumes in the same epoch; slots keep their positions.
 GRANT and REVOKE wait for a running RENAME TO, so each applies before or after it.
 A crash during RENAME TO leaves the table under one of the two names, with the grants on that name only.
-A failure to make the rename durable fences both names, and the server refuses catalog statements until a restart, which keeps the grants with whichever name the table then has.
+A failure to make the rename durable fences both names until RECOVER TABLE of each; when grants move with the table, the server instead refuses catalog statements until a restart, which keeps the grants with whichever name the table then has.
 A failure to open the renamed table fences the new name until RECOVER TABLE; the old name is free and keeps no grants.
 RENAME TO is not taken inside [MIGRATE](MIGRATIONS.md).
 

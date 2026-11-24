@@ -2033,11 +2033,17 @@ void TableCatalog::WriteGrantJournal(GrantJournal& prepared) {
 
 void TableCatalog::DiscardGrantJournal(GrantJournal& prepared) noexcept {
     try {
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CATALOG_JOURNAL_DISCARD_FAIL_ONCE"))
+            throw std::runtime_error("injected failure removing a grant journal");
         DiscardCatalogOperation(config_.data_dir);
     } catch (const std::exception& error) {
+        // A journal left behind would be taken for the next decision: the
+        // catalog refuses statements until the restart that removes it.
+        migration_health_->failed.store(true, std::memory_order_release);
         try {
-            LogMessage(LogLevel::kWarn, LogComponent::kStore,
-                "the grant journal of a table that kept its name could not be removed; the next writer start removes it",
+            LogMessage(LogLevel::kError, LogComponent::kStore,
+                "the grant journal of a table that kept its name could not be removed; the catalog refuses statements "
+                "until a restart removes it",
                 {{"table", prepared.journal.table}, {"error", error.what()}});
         } catch (...) {
         }

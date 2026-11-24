@@ -704,8 +704,8 @@ class TableCatalog {
         const std::string& operation, const std::function<void(Users&)>& change);
     // Writes the journal before the move; a failure removes it and rethrows.
     void WriteGrantJournal(GrantJournal& journal);
-    // After a move that did not happen: removes the journal. A failure is
-    // logged; the next writer start removes it.
+    // After a move that did not happen: removes the journal. A failure
+    // fences the catalog until a restart removes it.
     void DiscardGrantJournal(GrantJournal& journal) noexcept;
     // After the move is durable: publishes the users and writes their file.
     // A failure fences the catalog until a restart completes the journal.

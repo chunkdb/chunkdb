@@ -98,6 +98,35 @@ void GrantWriteFailures() {
     }
 }
 
+// A refused rename whose grant journal cannot be removed, and a rename whose
+// move reports an error after it took effect, fence the catalog: the next
+// start removes the journal of the table still in place, or completes the
+// one of the table under its new name (#306).
+void GrantJournalRefusals() {
+    const auto pending = [](const Source& source) { return std::filesystem::exists(source.data / "chunkdb.migration.pending"); };
+    for (const bool moved : {false, true}) {
+        Source source;
+        {
+            TableCatalog catalog(source.Config());
+            const auto users = OpenUsers(source.data);
+            users->Grant("admin", "t", Right::kWrite);
+            {
+                txn_test::ScopedEnv move(moved ? "CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_AFTER_RENAME_ONCE"
+                                               : "CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_ONCE", "1");
+                txn_test::ScopedEnv discard("CHUNKDB_FAILPOINT_CATALOG_JOURNAL_DISCARD_FAIL_ONCE", "1");
+                Throws([&] { catalog.RenameTable("t", "t_old", users.get()); });
+            }
+            assert(pending(source));
+            Throws<MigrationRecoveryRequiredError>([&] { (void)catalog.Migrations(); });
+        }
+        TableCatalog catalog(source.Config());
+        assert(!pending(source));
+        const std::string name = moved ? "t_old" : "t", other = moved ? "t" : "t_old";
+        assert(catalog.Require(name)->store_id() == source.epoch && catalog.Find(other) == nullptr);
+        assert(GrantOn(source.data, name) == Right::kWrite && !GrantOn(source.data, other));
+    }
+}
+
 void LeavesNothingAfterRefusal(const Source& source, TableCatalog& catalog) {
     assert(Entries(source.data / ".chunkdb.staging") == 0U);
     assert(Entries(source.data / "tables") == 1U && catalog.TableCount() == 1U);
@@ -687,6 +716,7 @@ int main() {
     RenameRefusals();
     RenameStatementStops();
     GrantWriteFailures();
+    GrantJournalRefusals();
     if (kAtomicExchange) {
         SwapsNames();
         SwapSurvivesRestart();

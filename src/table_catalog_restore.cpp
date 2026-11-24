@@ -490,11 +490,22 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_BEFORE_RENAME_ONCE");
-    const auto moved = ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_ONCE")
+    auto moved = ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_ONCE")
         ? std::make_error_code(std::errc::io_error) : MoveDirectoryNoReplace(old_dir, new_dir);
+    if (!moved && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_AFTER_RENAME_ONCE"))
+        moved = std::make_error_code(std::errc::io_error);
     if (moved) {
+        if (grants) {
+            // The grant journal goes only when the directory provably did not
+            // move; otherwise the restart decides it by the directory, and the
+            // catalog refuses statements until then.
+            std::error_code old_ec, new_ec;
+            const bool old_present = std::filesystem::exists(old_dir, old_ec);
+            const bool new_present = std::filesystem::exists(new_dir, new_ec);
+            if (!old_ec && !new_ec && old_present && !new_present) DiscardGrantJournal(*grants);
+            else migration_health_->failed.store(true, std::memory_order_release);
+        }
         // Nothing moved: the table serves again under its name, with its grants.
-        if (grants) DiscardGrantJournal(*grants);
         try {
             auto reopened = OpenStore(from, old_dir, table->geometry().config(), 0U, options);
             reopened->AdoptUnsynced(*unsynced);

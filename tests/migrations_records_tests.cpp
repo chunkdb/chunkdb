@@ -515,6 +515,18 @@ void CatalogOperationJournal() {
     RecoverMigrations(fixture.root, AccessMode::kReadWrite);
     assert(!ReadMigrationJournal(fixture.root));
     assert(LoadFile(fixture.root / std::string(kUsersFileName)) == users_before);
+
+    // A table of another identity under the old name does not hold the
+    // journal's table: the moved table decides, and the start completes it.
+    std::filesystem::rename(fixture.root / "tables/renamed", fixture.root / ".chunkdb.dropped" / journal.operation_name);
+    WriteMigrationJournal(fixture.root, journal);
+    auto other = fixture.table;
+    other.store_id = NewStoreId();
+    Save(fixture.root / "tables/default" / std::string(kStoreManifestFileName), SerializeStoreManifest(other));
+    assert(CatalogOperationMoved(fixture.root, journal));
+    RecoverMigrations(fixture.root, AccessMode::kReadWrite);
+    assert(!ReadMigrationJournal(fixture.root) && std::filesystem::exists(fixture.root / "tables/default"));
+    assert(LoadFile(fixture.root / std::string(kUsersFileName)) == users_after);
 }
 }  // namespace
 
