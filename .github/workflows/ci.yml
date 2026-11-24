@@ -334,8 +334,9 @@ jobs:
       - name: Build
         run: cmake --build build-tsan --parallel "$(getconf _NPROCESSORS_ONLN)"
 
-      # Explicit names: ctest -I applies its stride to the label-filtered list
-      # and ran one test in both shards.
+      # Every second name of the selected list, so the shards are disjoint;
+      # ctest adds a fixture setup test, such as fuzz_seeds, to each shard
+      # that runs a test requiring it.
       - name: Smoke Tests
         run: |
           names=$(ctest --test-dir build-tsan -N -L smoke -E "process_lock|durability_kill_recovery" |
