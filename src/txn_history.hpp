@@ -196,7 +196,7 @@ class TxnHistory {
     std::mutex pause_mutex_;
     std::condition_variable pause_cv_;
     static constexpr auto kPauseCount = static_cast<std::size_t>(TxnPausePoint::kCount);
-    static_assert(kPauseCount == static_cast<std::size_t>(TxnPausePoint::kBeforePostCommitOutcome) + 1U);
+    static_assert(kPauseCount == static_cast<std::size_t>(TxnPausePoint::kBeforePostCommitCheckpoints) + 1U);
     std::array<PauseState, kPauseCount> pauses_{};
 };
 
