@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <limits>
 #include <unordered_set>
+#include <vector>
 
 #include "chunkdb/types.hpp"
 
@@ -20,8 +21,11 @@ void Distribution(std::uint64_t seed, bool three_axes) {
         const Coord coord{(i << 1U) ^ (z << 2U), i, z};
         assert(keys.insert(coord).second);
     }
-    std::size_t maximum = 0U;
-    for (std::size_t i = 0; i < keys.bucket_count(); ++i) maximum = std::max(maximum, keys.bucket_size(i));
+    // Count each bucket by key: bucket_size's local iterators copy the stateful hash, which
+    // GCC 15 at -O2 falsely reports as maybe-uninitialized.
+    std::vector<std::size_t> buckets(keys.bucket_count());
+    for (const auto& key : keys) ++buckets[keys.bucket(key)];
+    const std::size_t maximum = *std::max_element(buckets.begin(), buckets.end());
     assert(keys.size() == count && maximum <= 16U);
     assert(hash(Coord{2, 0}) != hash(Coord{0, 1}));
     for (const auto x : {std::numeric_limits<std::int64_t>::min(), std::int64_t{-1}, std::int64_t{0},
