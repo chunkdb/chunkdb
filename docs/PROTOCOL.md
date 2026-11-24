@@ -252,7 +252,7 @@ The following list notation describes push elements, rather than literal wire by
 - `[schema, {epoch, revision, schema_version, dims, columns, chunk_columns}]`, using DESCRIBE column maps.
 - `[resync, epoch, revision, parent_epoch, fork_revision]`, requesting consumer state reconstruction.
 - `[progress, epoch, revision]`, marking a sender-drained cut during idle or filtered periods.
-- `[catalog, epoch, revision, commit_time_ms, user, events, txn]`, from WATCH CATALOG, with a catalog epoch and revision; each event is a map of `kind`, `action`, `name`, `table` and `data`, see [WATCH CATALOG](reference/FEED.md#watch-catalog).
+- `[catalog, epoch, revision, commit_time_ms, user, events, txn]`, from WATCH CATALOG [AFTER epoch revision], with a catalog epoch and revision; each event is a map of `kind`, `action`, `name`, `table` and `data`, and a revision without a visible change arrives as `progress`; see [WATCH CATALOG](reference/FEED.md#watch-catalog).
 
 Current change frames reserve `tag=null` and `txn=null`; a schema map gives the table's `dims`, the watched block columns, and all chunk columns of its `schema_version`.
 Resync lineage fields are null when no parent lineage is recorded.

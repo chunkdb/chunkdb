@@ -27,6 +27,7 @@ Use the same operating-system account for later starts and offline tools.
 ```text
 data_dir/
   chunkdb.manifest                    data-directory identity, features, version floor
+  chunkdb.catalog                     catalog epoch and revision of WATCH CATALOG, with catalog_revision
   chunkdb.users                       user verifiers and grants, when authentication is configured
   chunkdb.migrations                  completed named migration records, when present
   chunkdb.migration.pending           decided migration awaiting completion, when present
@@ -84,6 +85,7 @@ The server opens read-write and therefore refuses either of the first two unknow
 Table incompat bit 0 (`0x1`) enables durable feed slots, USER WAL metadata, and collection-frame flags; it remains set after slot removal.
 Directory and table incompat bit 5 (`0x20`), named `chunk_model`, owns dimensional geometry, both column domains, sectioned forms, and retained coordinate decisions.
 Directory and table incompat bit 6 (`0x40`) is reserved for commit groups, which this build does not provide: it never sets the bit, `ENABLE FEATURE` does not accept it, and a directory or table that records it is refused as an unknown feature.
+Directory incompat bit 7 (`0x80`), named `catalog_revision`, owns `chunkdb.catalog`; a build without it would change the catalog without recording a revision, so it must refuse the directory.
 Earlier development envelopes are refused before artifact mutation; they require recreating the data directory.
 
 Data-directory incompat bit 1 (`0x2`) enables named migrations.
@@ -116,6 +118,23 @@ Missing floor is zero; new clocks start at least at 1, and duplicate floor entri
 A writer creates a missing root manifest only when no chunkdb-owned entries exist, except its lock and unpublished manifest temporary files.
 Foreign entries such as `lost+found` are preserved.
 Read-only opening never initializes the directory.
+
+### Catalog revision
+
+`data_dir/chunkdb.catalog` is 40 bytes (docs/design/CATALOG_REVISION.md):
+
+| Order | Field |
+|---|---|
+| 1 | `CKCR` (4 bytes), format `1` (`u16`), flags (`u16`): bit 0 in progress, other bits zero |
+| 2 | nonzero catalog epoch (16 bytes) |
+| 3 | revision (`u64`) |
+| 4 | reserved zero (`u32`) |
+| 5 | CRC32 of all preceding bytes (`u32`) |
+
+With `catalog_revision` enabled, a server that is the directory's only writer replaces it atomically with file and directory sync; with several processes, each start marks it in progress and leaves it so.
+It is marked in progress before a catalog statement runs and records the statement's revision before the revision is published.
+A start after an in-progress record takes the next revision; a missing or unreadable record starts a new epoch at revision 0.
+Backups do not copy it, so a restored directory starts a new epoch.
 
 ### Table manifest
 

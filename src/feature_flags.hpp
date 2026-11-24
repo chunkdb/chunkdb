@@ -29,6 +29,10 @@ inline constexpr std::uint32_t kFeatureChunkModel = 32U;
 // an unknown incompat feature. The WAL format code takes it as an explicit
 // flag (InspectFeedFrame, ReplayFeedFrame).
 inline constexpr std::uint32_t kFeatureCommitGroups = 64U;
+// The durable catalog epoch and revision in chunkdb.catalog; belongs only to
+// the directory. Older writers must refuse: they would change the catalog
+// without recording it.
+inline constexpr std::uint32_t kFeatureCatalogRevision = 128U;
 
 struct FeatureDefinition {
     std::string_view name;
@@ -36,16 +40,17 @@ struct FeatureDefinition {
     bool table_scoped;
     std::string_view ownership;
 };
-inline constexpr std::array<FeatureDefinition, 6> kFeatureRegistry{{
+inline constexpr std::array<FeatureDefinition, 7> kFeatureRegistry{{
     {"feed_slots", kFeatureFeedSlots, true, "slot records, feed archive and USER WAL metadata"},
     {"migrations", kFeatureMigrations, false, "migration ledger and redo decisions"},
     {"table_lineage", kFeatureTableLineage, true, "table parent-epoch and fork-revision TLVs"},
     {"slot_filters", kFeatureSlotFilters, true, "slot filter records and stable projection IDs"},
     {"feature_activation", kFeatureActivation, false, "directory feature activation decisions"},
     {"chunk_model", kFeatureChunkModel, true, "dimension-aware chunks, chunk metadata and coordinate indexes"},
+    {"catalog_revision", kFeatureCatalogRevision, false, "catalog epoch and revision of WATCH CATALOG in chunkdb.catalog"},
 }};
 inline constexpr FeatureFlags kKnownFeatures{.incompat = kFeatureFeedSlots | kFeatureMigrations |
-    kFeatureTableLineage | kFeatureSlotFilters | kFeatureActivation | kFeatureChunkModel};
+    kFeatureTableLineage | kFeatureSlotFilters | kFeatureActivation | kFeatureChunkModel | kFeatureCatalogRevision};
 [[nodiscard]] constexpr FeatureFlags RegisteredTableFeatures() noexcept {
     FeatureFlags flags;
     for (const auto& feature : kFeatureRegistry) {

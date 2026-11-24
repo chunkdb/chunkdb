@@ -23,6 +23,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "catalog_revision.hpp"
 #include "feature_flags.hpp"
 #include "feature_activation_records.hpp"
 #include "feed_archive.hpp"
@@ -1120,6 +1121,16 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
         if (name == chunkdb::kDataDirManifestFileName || name == chunkdb::kBackupMarkerName || name == "tables" ||
             name == chunkdb::kMigrationsFileName || name == chunkdb::kMigrationPendingFileName || name == chunkdb::kFeaturePendingFileName ||
             name.rfind(".chunkdb.lock", 0) == 0) {
+            continue;
+        }
+        if (name == chunkdb::kCatalogRevisionFileName) {
+            ++counters->checked;
+            try {
+                (void)chunkdb::DecodeCatalogRevision(chunkdb::LoadFile(entry.path()));
+            } catch (const std::exception& error) {
+                // A writer start replaces it and starts a new catalog epoch.
+                Report(counters, false, "catalog_revision_invalid", entry.path(), error.what());
+            }
             continue;
         }
         if (name == chunkdb::kUsersFileName) {

@@ -6882,6 +6882,20 @@ void TestWatchPositionsAndRights() {
     RawClient multi("127.0.0.1", harness.port); multi.SetReadDeadline(std::chrono::seconds(15)); multi.Login();
     multi.SendLine("WATCH default"); assert(multi.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
 }
+// The next catalog push, after any progress a statement without a change
+// the watch can see sent.
+template <typename Client> FeedReply ReadCatalogPush(Client& client) {
+    for (;;) {
+        auto reply = ReadFeedReply(client);
+        if (reply.type != '>' || reply.items.empty() || reply.items[0].value != "progress") return reply;
+    }
+}
+// The error that ends a watch, after any progress before it.
+template <typename Client> std::string ReadWatchError(Client& client) {
+    const auto reply = ReadCatalogPush(client);
+    assert(reply.type == '-');
+    return reply.value;
+}
 // The event of a catalog push for `kind` and `name`, or null.
 const FeedReply* CatalogEvent(const FeedReply& push, std::string_view kind, std::string_view name) {
     assert(push.type == '>' && push.items.size() == 7U && push.items[0].value == "catalog");
@@ -6923,23 +6937,23 @@ void TestWatchCatalogRights() {
 
     // Who ran a statement is shown with MANAGES USERS only.
     admin.SendLine("CREATE TABLE rights_t (n u8) CHUNK 4 x 4"); assert(admin.ReadLine() == "+OK\r\n");
-    const auto hidden = ReadFeedReply(ops);
+    const auto hidden = ReadCatalogPush(ops);
     assert(CatalogEvent(hidden, "table", "rights_t") != nullptr && hidden.items[4].type == '_');
-    const auto shown = ReadFeedReply(um);
+    const auto shown = ReadCatalogPush(um);
     assert(CatalogEvent(shown, "table", "rights_t") != nullptr && shown.items[4].value == kAdminUser);
-    assert(ReadFeedReply(gone).items[2].value == shown.items[2].value);
+    assert(ReadCatalogPush(gone).items[2].value == shown.items[2].value);
 
     // Losing MANAGES USERS ends a watch that shows users.
     admin.SendLine("ALTER USER um NO MANAGES USERS"); assert(admin.ReadLine() == "+OK\r\n");
-    assert(um.ReadLine().rfind("-ERR PERMISSION_DENIED", 0) == 0);
+    assert(ReadWatchError(um).rfind("ERR PERMISSION_DENIED", 0) == 0);
     assert(um.WaitForClose(std::chrono::seconds(5)));
     // A dropped user's watch ends.
     admin.SendLine("DROP USER gone"); assert(admin.ReadLine() == "+OK\r\n");
-    assert(gone.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
+    assert(ReadWatchError(gone).rfind("ERR AUTH_REQUIRED", 0) == 0);
     assert(gone.WaitForClose(std::chrono::seconds(5)));
     // The ADMIN watch saw neither user change and goes on.
     admin.SendLine("DROP TABLE rights_t"); assert(admin.ReadLine() == "+OK\r\n");
-    const auto dropped = ReadFeedReply(ops);
+    const auto dropped = ReadCatalogPush(ops);
     assert(dropped.items[5].items.size() == 1U && CatalogEvent(dropped, "table", "rights_t") != nullptr);
     ops.SendBytes("UNWATCH\r\nPING\r\n");
     assert(ops.ReadLine() == "+OK\r\n" && ops.ReadLine() == "+PONG\r\n");
@@ -6979,7 +6993,7 @@ void TestWatchCatalog() {
     assert(CatalogEvent(limited, "table", "default") != nullptr && CatalogEvent(limited, "user", "mon") == nullptr);
 
     admin.SendLine("CREATE TABLE cat_t (n u8) CHUNK 4 x 4"); assert(admin.ReadLine() == "+OK\r\n");
-    const auto created = ReadFeedReply(full);
+    const auto created = ReadCatalogPush(full);
     assert(created.items[1].value == epoch && created.items[4].value == kAdminUser);
     const auto created_revision = std::stoull(created.items[2].value);
     table = CatalogEvent(created, "table", "cat_t");
@@ -6987,22 +7001,22 @@ void TestWatchCatalog() {
     // DESCRIBE's map without the data revision.
     const auto& described = FeedMap(*table, "data");
     assert(described.type == '%' && described.items.size() == 18U && FeedMap(described, "version").value == "1");
-    const auto seen = ReadFeedReply(mon);
+    const auto seen = ReadCatalogPush(mon);
     assert(seen.items[2].value == created.items[2].value && CatalogEvent(seen, "table", "cat_t") != nullptr);
 
     admin.SendLine("ALTER TABLE cat_t ADD COLUMN m u16"); assert(admin.ReadLine() == "+OK\r\n");
-    const auto altered = ReadFeedReply(full);
+    const auto altered = ReadCatalogPush(full);
     table = CatalogEvent(altered, "table", "cat_t");
     assert(table != nullptr && FeedMap(*table, "action").value == "alter");
     assert(FeedMap(FeedMap(*table, "data"), "version").value == "2");
-    assert(CatalogEvent(ReadFeedReply(mon), "table", "cat_t") != nullptr);
+    assert(CatalogEvent(ReadCatalogPush(mon), "table", "cat_t") != nullptr);
 
     admin.SendLine("CREATE SLOT 'sub' ON cat_t"); assert(admin.ReadLine() == "+OK\r\n");
-    const auto slot_full = ReadFeedReply(full);
+    const auto slot_full = ReadCatalogPush(full);
     const auto* slot = CatalogEvent(slot_full, "slot", "sub");
     assert(slot != nullptr && FeedMap(*slot, "action").value == "create" && FeedMap(*slot, "table").value == "cat_t");
     assert(FeedMap(FeedMap(*slot, "data"), "owner").value == kAdminUser);
-    const auto slot_push = ReadFeedReply(mon);
+    const auto slot_push = ReadCatalogPush(mon);
     slot = CatalogEvent(slot_push, "slot", "sub");
     assert(slot != nullptr && FeedMap(FeedMap(*slot, "data"), "owner").type == '_');
 
@@ -7012,31 +7026,46 @@ void TestWatchCatalog() {
 
     // A user change reaches only the watch that shows users.
     admin.SendLine("CREATE USER bob VERIFIER '" + verifier + "'"); assert(admin.ReadLine() == "+OK\r\n");
-    const auto bob_push = ReadFeedReply(full);
+    const auto bob_push = ReadCatalogPush(full);
     const auto* bob = CatalogEvent(bob_push, "user", "bob");
     assert(bob != nullptr && FeedMap(*bob, "action").value == "create" && FeedMap(FeedMap(*bob, "data"), "verifiers").value == "1");
     admin.SendLine("DROP TABLE cat_t"); assert(admin.ReadLine() == "+OK\r\n");
-    const auto dropped = ReadFeedReply(full);
+    const auto dropped = ReadCatalogPush(full);
     table = CatalogEvent(dropped, "table", "cat_t");
     slot = CatalogEvent(dropped, "slot", "sub");
     assert(table != nullptr && FeedMap(*table, "action").value == "drop" && FeedMap(*table, "data").type == '_');
     assert(slot != nullptr && FeedMap(*slot, "action").value == "drop");
-    const auto mon_dropped = ReadFeedReply(mon);
+    const auto mon_dropped = ReadCatalogPush(mon);
     assert(CatalogEvent(mon_dropped, "table", "cat_t") != nullptr && CatalogEvent(mon_dropped, "user", "bob") == nullptr);
     assert(mon_dropped.items[2].value == dropped.items[2].value);
-    assert(std::stoull(dropped.items[2].value) == created_revision + 4U);
+    // Every catalog statement took a revision, the refused ones included.
+    assert(std::stoull(dropped.items[2].value) == created_revision + 6U);
 
     // Losing MONITOR ends that watch; the other one receives the user change.
     admin.SendLine("REVOKE MONITOR ON * FROM mon"); assert(admin.ReadLine() == "+OK\r\n");
-    assert(mon.ReadLine().rfind("-ERR PERMISSION_DENIED", 0) == 0);
+    assert(ReadWatchError(mon).rfind("ERR PERMISSION_DENIED", 0) == 0);
     assert(mon.WaitForClose(std::chrono::seconds(5)));
-    const auto revoke_push = ReadFeedReply(full);
+    const auto revoke_push = ReadCatalogPush(full);
     const auto* revoked = CatalogEvent(revoke_push, "user", "mon");
     assert(revoked != nullptr && FeedMap(*revoked, "action").value == "alter");
     assert(FeedMap(FeedMap(*revoked, "data"), "server_rights").items.empty());
 
     full.SendBytes("UNWATCH\r\nPING\r\n");
     assert(full.ReadLine() == "+OK\r\n" && full.ReadLine() == "+PONG\r\n");
+
+    // The catalog revision survives a restart: a consumer at the last one
+    // continues without the whole catalog.
+    const auto position = epoch + " " + revoke_push.items[2].value;
+    harness.Restart();
+    RawClient resumed("127.0.0.1", harness.port); resumed.SetReadDeadline(std::chrono::seconds(15)); resumed.Login();
+    RawClient writer("127.0.0.1", harness.port); writer.SetReadDeadline(std::chrono::seconds(15)); writer.Login();
+    resumed.SetReadDeadline(std::chrono::seconds(15));
+    resumed.SendLine("WATCH CATALOG AFTER " + position);
+    assert(FeedStart(ReadFeedReply(resumed)) == position);
+    writer.SendLine("CREATE TABLE after_restart (n u8) CHUNK 4 x 4"); assert(writer.ReadLine() == "+OK\r\n");
+    const auto resumed_push = ReadFeedReply(resumed);
+    assert(resumed_push.items[1].value == epoch && resumed_push.items[5].items.size() == 1U);
+    assert(CatalogEvent(resumed_push, "table", "after_restart") != nullptr);
 
     // Another process could change the catalog without a push.
     harness.saved_store_config.allow_multiple_processes = true;

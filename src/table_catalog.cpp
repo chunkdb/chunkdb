@@ -28,6 +28,7 @@
 #include "slot_watch.hpp"
 #include "snapshot_generation.hpp"
 #include "process_lock.hpp"
+#include "catalog_revision.hpp"
 #include "store_manifest.hpp"
 #include "migrations_records.hpp"
 #include "user_registry.hpp"
@@ -83,7 +84,8 @@ constexpr const char* kWatchRecovered = "watched table was recovered; watch it a
         name.rfind(std::string(kDataDirManifestFileName) + ".tmp.", 0) == 0) {
         return false;
     }
-    return name == kTablesDirName || name == kMigrationsFileName || name == kMigrationPendingFileName || name == kFeaturePendingFileName || IsStoreEntryName(name);
+    return name == kTablesDirName || name == kMigrationsFileName || name == kMigrationPendingFileName || name == kFeaturePendingFileName ||
+        name == kCatalogRevisionFileName || IsStoreEntryName(name);
 }
 
 [[nodiscard]] std::optional<std::string> FindDataDirEntry(const std::filesystem::path& data_dir) {

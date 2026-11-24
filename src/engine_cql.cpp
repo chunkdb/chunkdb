@@ -1537,7 +1537,11 @@ std::string CommandEngine::ExecuteStatement(
                 if (auto* test = hook.load(std::memory_order_acquire)) test->Run(CommandEngineTestHook::Point::kBeforeCatalogRefresh, {});
                 feed.Refresh(*scope, user);
             }
-        } catalog_refresh{*catalog_feed_, CatalogScopeOf(parsed.statement), session.user, hook_};
+        };
+        auto catalog_scope = CatalogScopeOf(parsed.statement);
+        // Marked before it runs; a mark that cannot be recorded refuses it.
+        if (catalog_scope) catalog_feed_->Begin();
+        CatalogRefresh catalog_refresh{*catalog_feed_, std::move(catalog_scope), session.user, hook_};
         return std::visit(
             Overloaded{
                 [&](const cql::ShowConnections&) {
@@ -1709,7 +1713,7 @@ std::string CommandEngine::ExecuteStatement(
                                 session.user_incarnation, std::string{}, session.user_generation);
                             session.watch_right->RequireCatalog(users);
                         }
-                        session.catalog_watch = catalog_feed_->Subscribe(users, session.watch_options.notify);
+                        session.catalog_watch = catalog_feed_->Subscribe(users, session.watch_options.notify, watch.after);
                         // Catalog watches share one output budget, apart from every table's watches.
                         session.table.reset();
                         std::string reply;

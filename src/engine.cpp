@@ -23,6 +23,7 @@
 #include "chunkdb/protocol.hpp"
 #include "cql.hpp"
 #include "feature_flags.hpp"
+#include "store_manifest.hpp"
 #include "scram.hpp"
 #include "user_registry.hpp"
 #include "statement_control.hpp"
@@ -236,8 +237,16 @@ CommandEngine::CommandEngine(
     if (config_.max_auth_failures == 0) {
         throw std::invalid_argument("max_auth_failures must be > 0");
     }
+    // The catalog revision is durable when the directory has catalog_revision
+    // and this process changes it alone (docs/design/CATALOG_REVISION.md).
+    const auto root = ReadDataDirManifest(catalog_->data_dir());
+    const bool durable = root && (root->features.incompat & kFeatureCatalogRevision) != 0U &&
+        catalog_->access_mode() == AccessMode::kReadWrite;
+    const auto mode = !durable ? CatalogClock::Mode::kMemory
+        : catalog_->allow_multiple_processes() ? CatalogClock::Mode::kShared : CatalogClock::Mode::kDurable;
     catalog_feed_ = std::make_shared<CatalogFeed>(
-        [this](const CatalogScope& scope) { return ReadCatalog(scope); }, catalog_->feed_buffer_bytes());
+        [this](const CatalogScope& scope) { return ReadCatalog(scope); }, catalog_->feed_buffer_bytes(),
+        std::make_unique<CatalogClock>(catalog_->data_dir(), mode));
 }
 
 // The longest SCRAM message HELLO and AUTH take as a parameter frame.

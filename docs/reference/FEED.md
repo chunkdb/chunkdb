@@ -91,7 +91,7 @@ CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a
 DROP SLOT [IF EXISTS] 'name' ON table
 SHOW SLOTS [ON table] [PREFIX 'name']
 WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1 [, AREA cx0 cy0 TO cx1 cy1 ...]] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [AFTER epoch revision] [ACK TIMEOUT ms] [TAKEOVER]
-WATCH CATALOG
+WATCH CATALOG [AFTER epoch revision]
 ACK revision
 UNWATCH
 ```
@@ -120,7 +120,7 @@ UNWATCH
 - CREATE and DROP SLOT: `OK`, including authorized conditional no-ops.
 - SHOW SLOTS: visible table (every table with MONITOR), name, epoch, saved `acked` revision, `revision`, `lag_revisions`, retained bytes, `attached`, lost state, loss reason, filters, and owner; the owner is shown to that user and to MANAGES USERS, and is null otherwise; a table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
 - WATCH: start position, followed by change or chunks, schema, progress, or resync events.
-- WATCH CATALOG: the catalog epoch and revision, followed by catalog events; see [WATCH CATALOG](#watch-catalog).
+- WATCH CATALOG: the catalog epoch and the revision it starts at, followed by catalog, progress and resync events; see [WATCH CATALOG](#watch-catalog).
 - ACK: no success reply; it is accepted only inside a slot watch.
 - UNWATCH: `OK` after the last push; ordinary statements can then resume.
 
@@ -179,9 +179,11 @@ Store the applied position atomically with your own output to prevent duplicate 
 
 WATCH CATALOG streams changes to tables, columns, users, grants and slots.
 It needs MONITOR or ADMIN on `*`; users, grants and slot owners appear only with MANAGES USERS.
-The reply is `{epoch, revision}`: the catalog epoch identifies the server process, and the catalog revision orders catalog events within it.
-The first event holds the whole catalog: one `create` for each table, user and slot, at the revision of that event; each read of the whole catalog takes a new revision, so one revision names one catalog state.
-Each later event carries what a statement changed, with the next catalog revision; it can also carry changes of statements that ended at the same time, and a change the watch cannot see leaves a gap.
+The reply is `{epoch, revision}`: the catalog epoch, and the catalog revision the watch starts at; one revision of an epoch names one catalog state.
+The first event holds the whole catalog: one `create` for each table, user and slot, at the revision of that event.
+Each catalog statement takes the next revision when it ends, also one that changed nothing or failed.
+An event carries what a statement changed, under its revision; it can also carry changes of statements that ended at the same time.
+A revision whose statement changed nothing the watch can see arrives as `[progress, epoch, revision]`: your catalog is the catalog of that revision.
 An event is `[catalog, epoch, revision, commit_time_ms, user, events, txn]`, with `txn` null; `user` names the user whose statement sent the event, and is null in the whole-catalog event and for watches without MANAGES USERS.
 Each entry of `events` is a map of `kind` (`table`, `user` or `slot`), `action` (`create`, `alter` or `drop`), `name`, `table` (the table of a slot, null otherwise) and `data`, the object after the change, null for `drop`.
 A table's `data` is its DESCRIBE map without `revision`, so columns, CHECK constraints and options changes appear as `alter`.
@@ -192,7 +194,10 @@ A table that cannot be read without waiting, such as one ALTER TABLE is reopenin
 The server keeps at most `--feed-buffer-bytes` (default 67108864) of catalog events for all catalog watches together; a table's `feed_buffer_bytes` does not apply.
 A watch further behind receives `[resync, epoch, revision, null, null]` and then the whole catalog again; start your catalog over from it.
 Catalog watches count against `--max-watches`, and a connection that already watches cannot start another watch.
-The catalog revision is not stored: after a server restart the epoch changes and the revision starts over, so watch the catalog again and rebuild your catalog from the first push.
+With the directory feature `catalog_revision`, which new directories have, the epoch and revision survive restarts; without it, or on a server that shares its directory with other processes, each start has a new epoch.
+`AFTER epoch revision` continues from your last event or progress: with the current epoch and the current revision, or a revision the server still holds, it sends only later events.
+With another epoch or revision it sends `resync` and then the whole catalog; after a restart only the current revision continues.
+A start after a crash during a catalog statement moves to the next revision, and a restored backup starts a new epoch.
 `CATALOG` after WATCH is a keyword: new tables cannot be named `catalog`, and a table of that name made before cannot be watched.
 The watch ends when the user loses MONITOR and ADMIN on `*`, or MANAGES USERS when it shows users.
 Only UNWATCH is accepted while streaming.

@@ -539,6 +539,10 @@ void TestWatch() {
     assert(catalog.catalog && catalog.table.empty() && !catalog.slot && catalog.areas.empty());
     assert(Get<cql::Watch>("watch catalog").catalog && !Get<cql::Watch>("WATCH world").catalog);
     ExpectError("WATCH CATALOG SLOT 's'", "expected the end of the statement");
+    const auto resume = Get<cql::Watch>("WATCH CATALOG AFTER 1234567890abcdefABCDEF0123456789 7");
+    assert(resume.catalog && resume.after->epoch[0] == 0x12 && resume.after->revision == 7U);
+    ExpectError("WATCH CATALOG AFTER abc 1", "32 hex digits");
+    ExpectError("WATCH CATALOG AFTER 00000000000000000000000000000000 1 SLOT 's'", "expected the end of the statement");
     assert(Get<cql::Watch>("WATCH world ACK TIMEOUT 18446744073709551615 SLOT 's'").ack_timeout_ms == UINT64_MAX);
     assert(Get<cql::Watch>("WATCH world TAKEOVER SLOT 's'").takeover);
     assert(Get<cql::Watch>("WATCH world SLOT 's' TAKEOVER ACK TIMEOUT 10").takeover);
