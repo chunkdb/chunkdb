@@ -87,6 +87,8 @@ struct UserPublication {
     std::shared_ptr<const Users> users;
     std::shared_ptr<const UserAdmissionMap> admissions;
     std::shared_ptr<const UserRightsView> rights;
+    // The shape of every user's verifier, sorted: what decoys follow.
+    std::shared_ptr<const std::vector<scram::VerifierShape>> shapes;
     std::vector<UserAdmissionUpdate> updates;
 };
 }  // namespace chunkdb

@@ -141,6 +141,24 @@ struct Server {
     }
 };
 
+// The challenge for an unknown user has the iteration count and salt length
+// of the users that exist.
+void TestUnknownUserChallengeShape() {
+    Server server;
+    server.users->SetVerifier("admin", chunkdb::scram::MakeVerifier("secret", chunkdb::crypto::RandomBytes(32), 5000U));
+    const auto challenge = [&](const std::string& user) {
+        SessionState session;
+        const auto login = chunkdb::scram::StartClientLogin(user, chunkdb::scram::NewNonce());
+        const std::string first = server.Run(session, "HELLO 3 USER " + user + " $1", Parameters{login.first});
+        assert(first.rfind("+SCRAM ", 0) == 0);
+        const auto salt = first.find(",s="), iterations = first.find(",i=");
+        assert(salt != std::string::npos && iterations != std::string::npos);
+        return std::make_pair(first.substr(iterations), iterations - salt);
+    };
+    assert(challenge("ghost") == challenge("admin"));
+    assert(challenge("ghost").first == ",i=5000\r\n");
+}
+
 void TestLogin() {
     Server server;
     SessionState admin = server.LoggedIn("admin", "secret");
@@ -1330,6 +1348,7 @@ int main(int argc, char** argv) {
     TestSessionControls();
     TestVerifierAndGrantBounds();
     TestLogin();
+    TestUnknownUserChallengeShape();
     TestStaleAuthenticationProofs();
     TestUserLimitStatementsAndAdmissionHook();
     TestRights();

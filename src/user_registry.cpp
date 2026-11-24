@@ -206,6 +206,17 @@ std::array<std::uint8_t, 32> UserRegistry::Secret() const {
     return Published()->secret;
 }
 
+scram::Verifier UserRegistry::DecoyVerifier(std::string_view name) const {
+    std::shared_ptr<const Users> users;
+    std::shared_ptr<const std::vector<scram::VerifierShape>> shapes;
+    {
+        std::lock_guard lock(published_mutex_);
+        users = published_;
+        shapes = shapes_;
+    }
+    return scram::DecoyVerifier(users->secret, name, *shapes);
+}
+
 std::shared_ptr<const Users> UserRegistry::Published() const {
     std::lock_guard lock(published_mutex_);
     return published_;

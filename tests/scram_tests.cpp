@@ -1,6 +1,7 @@
 // The server side of SCRAM-SHA-256 login (docs/design/USERS_DESIGN.md): the
 // exchange of RFC 7677, wrong passwords, malformed messages and verifiers.
 
+#include <algorithm>
 #include <cassert>
 #include <cstdio>
 #include <functional>
@@ -233,6 +234,20 @@ void TestDecoyAndNonce() {
     assert(!(ghost == scram::DecoyVerifier(secret, "phantom")));
     assert(!(ghost == scram::DecoyVerifier(std::vector<std::uint8_t>(32, 0x43), "ghost")));
     assert(ghost.salt.size() == 16 && ghost.iterations == scram::kMinIterations);
+    // A decoy takes the shape of one of the users' verifiers, the same one for the same name.
+    const std::vector<scram::VerifierShape> strong{{.iterations = 100000U, .salt_bytes = 40U}};
+    const auto shaped = scram::DecoyVerifier(secret, "ghost", strong);
+    assert(shaped.iterations == 100000U && shaped.salt.size() == 40U && shaped == scram::DecoyVerifier(secret, "ghost", strong));
+    assert(std::equal(ghost.salt.begin(), ghost.salt.end(), shaped.salt.begin()));
+    const std::vector<scram::VerifierShape> mixed{{.iterations = 4096U, .salt_bytes = 16U}, {.iterations = 200000U, .salt_bytes = 256U}};
+    std::vector<bool> seen(mixed.size(), false);
+    for (int i = 0; i < 64; ++i) {
+        const auto decoy = scram::DecoyVerifier(secret, "user" + std::to_string(i), mixed);
+        const auto found = std::find(mixed.begin(), mixed.end(), scram::VerifierShape{decoy.iterations, decoy.salt.size()});
+        assert(found != mixed.end());
+        seen[static_cast<std::size_t>(found - mixed.begin())] = true;
+    }
+    assert(seen[0] && seen[1]);
     // The client cannot know the decoy's keys: the proof never matches.
     const auto first = scram::ParseClientFirst(std::string("n,,n=ghost,r=") + kClientNonce);
     const scram::ServerExchange exchange(first, ghost, kServerNonce);
