@@ -66,7 +66,7 @@ A snapshot is the table's state at that moment.
 
 Allowed statements are GET BLOCK, GET CHUNK, GET AREA, AGGREGATE, SET BLOCK, DELETE BLOCK, SET CHUNK, DESCRIBE, PING, SHOW CONNECTIONS, CANCEL and KILL CONNECTION.
 Ordinary statement errors leave the transaction open without applying the failed statement.
-An IF condition of SET BLOCK or DELETE BLOCK reads the transaction's view and counts as a read of its chunk; CONDITION_FAILED also leaves the transaction open ([Expressions](EXPRESSIONS.md#in-writes)).
+An IF condition of SET BLOCK or DELETE BLOCK, and a value computed from the block, read the transaction's view and count as a read of the chunk; CONDITION_FAILED also leaves the transaction open ([Expressions](EXPRESSIONS.md#in-writes)).
 A conflict ends its work and writes nothing.
 The connection keeps returning that conflict until ROLLBACK or COMMIT closes it; SHOW CONNECTIONS, CANCEL and KILL CONNECTION still return their own reply.
 

@@ -22,6 +22,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <list>
 #include <unordered_map>
 #include <unordered_set>
@@ -479,8 +480,27 @@ struct BlockWriteView {
 };
 
 // Decides a computed write from the block as it is: false changes nothing;
-// for a SET, it fills `values`.
-using BlockWriteDecision = std::function<bool(const BlockWriteView& block, std::vector<ColumnAssignment>& values)>;
+// for a SET, it fills `values`. It refers to a callable that outlives the
+// call it is passed to, and never allocates.
+class BlockWriteDecision {
+  public:
+    template <class F>
+        requires(!std::is_same_v<std::remove_cvref_t<F>, BlockWriteDecision> &&
+                 std::is_invocable_r_v<bool, F&, const BlockWriteView&, std::vector<ColumnAssignment>&>)
+    BlockWriteDecision(F&& decide) noexcept  // NOLINT(google-explicit-constructor)
+        : object_(static_cast<const void*>(std::addressof(decide))),
+          call_([](const void* object, const BlockWriteView& block, std::vector<ColumnAssignment>& values) {
+              return static_cast<bool>(
+                  (*static_cast<std::remove_reference_t<F>*>(const_cast<void*>(object)))(block, values));
+          }) {}
+    bool operator()(const BlockWriteView& block, std::vector<ColumnAssignment>& values) const {
+        return call_(object_, block, values);
+    }
+
+  private:
+    const void* object_;
+    bool (*call_)(const void*, const BlockWriteView&, std::vector<ColumnAssignment>&);
+};
 
 struct ChunkMutationResult {
     bool ok = false;
@@ -712,10 +732,11 @@ class ChunkStore {
     // under the chunk's lock, so no write comes between the read and the
     // write. When it returns false nothing changes, and the result is not ok
     // with the current version; otherwise as SetBlock and UnsetBlock. `z` is
-    // used by a three-dimensional table. `read_chunk_columns` decodes the
-    // chunk columns for `decide`. What `decide` throws changes nothing.
+    // used by a three-dimensional table. `decide` sees the block columns at
+    // `block_slots` (schema indexes; the others are NULL), and the chunk
+    // columns when `read_chunk_columns`. What `decide` throws changes nothing.
     [[nodiscard]] ChunkMutationResult WriteBlockDecided(std::int64_t x, std::int64_t y, std::int64_t z, bool remove,
-        bool read_chunk_columns, const BlockWriteDecision& decide);
+        std::span<const std::size_t> block_slots, bool read_chunk_columns, BlockWriteDecision decide);
     // The chunk columns `state` holds (the defaults when null), in chunk-schema
     // order; NULL for a column without a value.
     [[nodiscard]] std::vector<ColumnValue> ChunkColumnValues(const ChunkColumnState* state) const;

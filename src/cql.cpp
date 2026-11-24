@@ -646,7 +646,13 @@ class Parser {
         const std::size_t after = Rewind();
         if (expr::IsVersionClause(line_.substr(after))) {
             Expect("version");
-            *if_version = Unsigned("a version", std::numeric_limits<std::uint64_t>::max());
+            if (Peek().kind != TokenKind::kParameter) {
+                *if_version = Unsigned("a version", std::numeric_limits<std::uint64_t>::max());
+                return;
+            }
+            // IF VERSION $n: read where the parameter's frame is.
+            if (!*expressions) *expressions = std::make_shared<expr::WriteExpressions>();
+            (*expressions)->version_parameter = std::get<Parameter>(Value(true)).index;
             return;
         }
         if (!*expressions) *expressions = std::make_shared<expr::WriteExpressions>();

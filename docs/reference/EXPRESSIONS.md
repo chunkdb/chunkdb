@@ -75,8 +75,8 @@ A refused statement changes nothing and produces no feed change.
 - A condition, like any write, needs WRITE on the table, which includes READ.
 
 Inside a transaction, the condition and values read the transaction's view, including its own earlier writes.
-A condition counts as a read of its chunk: COMMIT conflicts when another write changed that chunk.
-A refused statement leaves the transaction open; `NOW()` is refused there, since the commit time is known only at COMMIT.
+A condition, or a value that reads a block or chunk column, counts as a read of its chunk: COMMIT conflicts when another write changed that chunk.
+A refused statement leaves the transaction open and takes none of its write room; `NOW()` is refused there, since the commit time is known only at COMMIT.
 
 ## Limits
 

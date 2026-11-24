@@ -87,9 +87,12 @@ Planning and evaluation throw `std::invalid_argument` (`INVALID_ARGUMENT`) and `
 
 SET BLOCK keeps its parse when every value is a single value or parameter followed by a comma, IF or the end; otherwise it reads the whole value list again as assignments, so a statement without expressions keeps its parse, plan and write path (`cql::SetBlock::expressions` stays null).
 DELETE BLOCK and SET BLOCK take `IF <condition>` after the values; IF VERSION combines with computed values but not with a condition.
+`IF VERSION $n` takes the version from a u64 frame and runs on this path, so the plain path keeps its literal version.
 The statement plans its expressions against the table's columns when it runs, and when its frames are planned, which bounds each parameter frame by the type the plan gives it.
 `ChunkStore::WriteBlockDecided` holds the chunk's statement lock from the read to the write: after the chunk's backlog it decodes the block, and the chunk columns when the plan names one, issues the commit time that `NOW()` reads and the write takes, evaluates, and writes through the same locked path as SET BLOCK and DELETE BLOCK.
+It decodes only the block columns the plan reads, and takes the decision as a non-owning callable reference, which does not allocate.
 A false or unknown condition answers `CONDITION_FAILED current=<chunk version>` and writes no WAL frame, revision or feed change; IF VERSION with computed values still answers VERSION_MISMATCH.
-In a transaction the expressions read the transaction's copy of the chunk or its snapshot; a condition adds the chunk to the read set, and a refused statement leaves the copy as it was.
+In a transaction the expressions read the transaction's copy of the chunk, or the block at the snapshot, before the chunk joins the write set, so a refused statement takes no write room and copies nothing.
+A condition, or a value that reads a block or chunk column, adds the chunk to the read set.
 Decision: `NOW()` is refused in a transaction's write, since its commit time is known only at COMMIT; a client passes the time as a parameter.
 A condition needs READ and WRITE, which WRITE alone gives.

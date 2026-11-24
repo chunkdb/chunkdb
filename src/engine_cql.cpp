@@ -575,12 +575,17 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
 struct BlockWritePlan {
     std::optional<expr::ConditionPlan> condition;
     std::optional<expr::AssignmentsPlan> assignments;
+    // The block columns they read (schema indexes, ascending).
+    std::vector<std::size_t> block_slots;
     bool reads_now = false;
     bool reads_chunk_columns = false;
+    // Whether the statement depends on the chunk as it is: a condition, or
+    // a value that reads a block or chunk column.
+    bool reads_chunk = false;
 };
 
 [[nodiscard]] BlockWritePlan PlanBlockWrite(const expr::WriteExpressions& expressions, const Geometry& geometry) {
-    const expr::ColumnList schema(geometry.layout().schema().columns, geometry.chunk_schema().columns);
+    const expr::ColumnSpans schema(geometry.layout().schema().columns, geometry.chunk_schema().columns);
     BlockWritePlan plan;
     if (expressions.condition) plan.condition = expr::PlanCondition(*expressions.condition, schema);
     if (!expressions.assignments.empty()) plan.assignments = expr::PlanAssignments(expressions.assignments, schema);
@@ -589,6 +594,14 @@ struct BlockWritePlan {
     };
     plan.reads_now = reads(expr::Op::kNow);
     plan.reads_chunk_columns = reads(expr::Op::kChunkColumn);
+    if (plan.condition) plan.block_slots = plan.condition->BlockSlots();
+    if (plan.assignments) {
+        const auto slots = plan.assignments->BlockSlots();
+        plan.block_slots.insert(plan.block_slots.end(), slots.begin(), slots.end());
+        std::sort(plan.block_slots.begin(), plan.block_slots.end());
+        plan.block_slots.erase(std::unique(plan.block_slots.begin(), plan.block_slots.end()), plan.block_slots.end());
+    }
+    plan.reads_chunk = plan.condition || !plan.block_slots.empty() || plan.reads_chunk_columns;
     return plan;
 }
 
@@ -1033,6 +1046,7 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
             ForEachExpressionParameter(PlanBlockWrite(*expressions, geometry), [&](const expr::ParameterType& parameter) {
                 request.parameter_limits[parameter.index - 1U] = ParameterBytes(parameter.type);
             });
+            if (expressions->version_parameter != 0U) request.parameter_limits[expressions->version_parameter - 1U] = 8U;
         } catch (const std::invalid_argument& e) {
             return reject(ErrorReply(e));
         } catch (const std::out_of_range& e) {
@@ -2586,10 +2600,18 @@ std::string CommandEngine::BlockWriteWithExpressions(
     MetricsRegistry::CommandClass& command_class) {
     const auto& expressions = set != nullptr ? *set->expressions : *del->expressions;
     const std::string& table = set != nullptr ? set->table : del->table;
-    const std::optional<std::uint64_t>& if_version = set != nullptr ? set->if_version : del->if_version;
+    std::optional<std::uint64_t> if_version = set != nullptr ? set->if_version : del->if_version;
     const std::int64_t x = set != nullptr ? set->x : del->x;
     const std::int64_t y = set != nullptr ? set->y : del->y;
     const std::int64_t z = set != nullptr ? set->z : del->z;
+    if (expressions.version_parameter != 0U) {
+        // IF VERSION $n: a u64 frame.
+        Column version;
+        version.type = ColumnType{.kind = ColumnKind::kUnsigned, .size = 64};
+        const auto value = ParameterValue(version, expressions.version_parameter, parameters[expressions.version_parameter - 1U]);
+        if (std::holds_alternative<std::monostate>(value)) throw std::invalid_argument("IF VERSION cannot be NULL");
+        if_version = std::get<std::uint64_t>(value);
+    }
     command_class = expressions.condition || if_version ? MetricsRegistry::CommandClass::kConditional
                                                         : MetricsRegistry::CommandClass::kPointWrite;
     // A condition reads the block and needs READ and WRITE (docs/DESIGN-2.0.md
@@ -2648,7 +2670,8 @@ std::string CommandEngine::BlockWriteWithExpressions(
     };
 
     if (session.transaction == nullptr) {
-        const auto result = store.WriteBlockDecided(x, y, z, del != nullptr, plan.reads_chunk_columns, decide);
+        const auto result =
+            store.WriteBlockDecided(x, y, z, del != nullptr, plan.block_slots, plan.reads_chunk_columns, decide);
         if (version_mismatch) return Protocol::Error("VERSION_MISMATCH", "", {{"current", std::to_string(result.version)}});
         if (!result.ok) return ErrorReply(ConditionFailedError(result.version));
         std::string reply;
@@ -2659,16 +2682,33 @@ std::string CommandEngine::BlockWriteWithExpressions(
     if (plan.reads_now) throw std::invalid_argument("NOW() is not used in a transaction's writes; pass the time as a parameter");
     auto& txn = *session.transaction;
     const ChunkCoord coord = BlockCoord(geometry, x, y, z);
-    // A condition reads the transaction's view and counts as a read.
-    if (plan.condition) TxnRead(txn, std::span<const ChunkCoord>(&coord, 1));
-    TxnWrite(txn, store, coord, [&](ChunkState& state) {
-        const auto block = geometry.dims() == 3U ? store.BlockInState3D(state, x, y, z) : store.BlockInState(state, x, y);
-        std::vector<ColumnValue> chunk_columns;
+    // What the statement reads of the transaction's view counts as a read of
+    // the chunk (E2, E3).
+    if (plan.reads_chunk) TxnRead(txn, std::span<const ChunkCoord>(&coord, 1));
+    // Decided against the transaction's own copy of the chunk, or the block
+    // at the snapshot, before the chunk joins the transaction's writes: a
+    // refused statement takes no write room and copies nothing.
+    std::optional<std::vector<ColumnValue>> block;
+    std::vector<ColumnValue> chunk_columns;
+    std::uint64_t version = 0;
+    if (const auto own = txn.writes.find(coord); own != txn.writes.end()) {
+        const ChunkState& state = own->second;
+        block = geometry.dims() == 3U ? store.BlockInState3D(state, x, y, z) : store.BlockInState(state, x, y);
         if (plan.reads_chunk_columns) chunk_columns = store.ChunkColumnValues(state.chunk_columns.get());
-        std::vector<ColumnAssignment> assignments;
-        const BlockWriteView view{.values = block ? &*block : nullptr, .chunk_columns = chunk_columns, .version = state.version};
-        // TxnWrite puts the copy back when this throws.
-        if (!decide(view, assignments)) throw ConditionFailedError(state.version);
+        version = state.version;
+    } else {
+        auto read = geometry.dims() == 3U ? store.GetBlockWithVersion3DAt(*txn.snapshot, x, y, z)
+                                          : store.GetBlockWithVersionAt(*txn.snapshot, x, y);
+        block = std::move(read.values);
+        version = read.version.value_or(0U);
+        if (plan.reads_chunk_columns) {
+            chunk_columns = store.ChunkColumnValues(store.ReadChunkStateAt(*txn.snapshot, coord).chunk_columns.get());
+        }
+    }
+    std::vector<ColumnAssignment> assignments;
+    const BlockWriteView view{.values = block ? &*block : nullptr, .chunk_columns = chunk_columns, .version = version};
+    if (!decide(view, assignments)) return ErrorReply(ConditionFailedError(version));
+    TxnWrite(txn, store, coord, [&](ChunkState& state) {
         if (del != nullptr) {
             if (geometry.dims() == 3U) store.UnsetBlockInState3D(state, x, y, z);
             else store.UnsetBlockInState(state, x, y);

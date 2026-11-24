@@ -1505,8 +1505,37 @@ std::vector<ColumnValue> ChunkStore::ChunkColumnValues(const ChunkColumnState* s
     return DecodeChunkColumns(schema, state->bytes);
 }
 
+namespace {
+// The block's values at `slots` (schema indexes), as DecodeBlockColumns
+// gives them; the other columns are NULL and are not decoded.
+std::vector<ColumnValue> DecodeBlockSlots(const ChunkLayout& layout, std::span<const std::uint8_t> payload,
+    const ChunkVars& vars, std::size_t block_index, std::span<const std::size_t> slots) {
+    const auto& columns = layout.schema().columns;
+    std::vector<ColumnValue> values(columns.size());
+    std::vector<std::uint8_t> bytes;
+    for (const std::size_t index : slots) {
+        const auto& column = columns.at(index);
+        const auto* fixed = layout.FixedColumnAt(index);
+        if (fixed == nullptr) {
+            const auto value = vars.Find(VarKey{.column_id = column.id, .block_index = static_cast<std::uint32_t>(block_index)});
+            if (value.has_value()) values[index] = DecodeVarValue(column, *value);
+            else if (!column.nullable) values[index] = DecodeVarValue(column, {});
+            continue;
+        }
+        if (fixed->validity != ChunkLayout::kNoValidity &&
+            ((payload[fixed->validity + block_index / 8U] >> (block_index % 8U)) & 1U) == 0U) {
+            continue;
+        }
+        bytes.resize((fixed->width + 7U) / 8U);
+        ReadValueBits(payload.data(), fixed->values * 8U + block_index * fixed->width, bytes.data(), fixed->width);
+        values[index] = DecodeColumnValue(column, bytes.data());
+    }
+    return values;
+}
+}  // namespace
+
 ChunkMutationResult ChunkStore::WriteBlockDecided(std::int64_t x, std::int64_t y, std::int64_t z, bool remove,
-    bool read_chunk_columns, const BlockWriteDecision& decide) {
+    std::span<const std::size_t> block_slots, bool read_chunk_columns, BlockWriteDecision decide) {
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
@@ -1529,7 +1558,7 @@ ChunkMutationResult ChunkStore::WriteBlockDecided(std::int64_t x, std::int64_t y
     // The block as it is now, read under the lock the write keeps.
     const bool present = BlockPresent(regular_chunk->presence_bitmap, block_index);
     std::optional<std::vector<ColumnValue>> values;
-    if (present) values = DecodeBlockColumns(geometry_.layout(), regular_chunk->payload, regular_chunk->vars, block_index);
+    if (present) values = DecodeBlockSlots(geometry_.layout(), regular_chunk->payload, regular_chunk->vars, block_index, block_slots);
     std::vector<ColumnValue> chunk_columns;
     if (read_chunk_columns) chunk_columns = ChunkColumnValues(regular_chunk->chunk_columns.get());
     // NOW() is the commit time: issued here and taken by the write.

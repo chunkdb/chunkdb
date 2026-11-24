@@ -650,6 +650,13 @@ void TestBlockExpressions() {
     assert(removed3.dims == 3U && removed3.expressions->condition);
     const auto unconditional = Get<cql::DeleteBlock>("DELETE BLOCK 1 2 FROM t IF VERSION 4");
     assert(unconditional.if_version == 4U && !unconditional.expressions);
+    // IF VERSION $n reads the version from a parameter frame.
+    const auto versioned_parameter = Get<cql::SetBlock>("SET BLOCK 1 2 IN t a = $2 IF VERSION $1", 2);
+    assert(!versioned_parameter.if_version && versioned_parameter.values.size() == 1U);
+    assert(versioned_parameter.expressions->version_parameter == 1U && !versioned_parameter.expressions->condition);
+    const auto removed_parameter = Get<cql::DeleteBlock>("DELETE BLOCK 1 2 FROM t IF VERSION $1", 1);
+    assert(!removed_parameter.if_version && removed_parameter.expressions->version_parameter == 1U);
+    ExpectError("DELETE BLOCK 1 2 FROM t IF VERSION $1 AND a = 1", "expected the end of the statement");
 
     ExpectError("SET BLOCK 0 0 IN t a = 1 IF VERSION 3 AND a = 1", "expected the end of the statement, got 'AND'");
     ExpectError("SET BLOCK 0 0 IN t a = coins + $1 IF a > $1", "$1 is used twice");

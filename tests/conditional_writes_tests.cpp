@@ -77,9 +77,10 @@ struct Fixture {
     std::unique_ptr<CommandEngine> engine;
     SessionState session;
 
-    Fixture() {
+    explicit Fixture(chunkdb::QueryLimits limits = {}) {
         chunkdb::CatalogConfig config;
         config.data_dir = dir.path();
+        config.query_limits = limits;
         catalog = std::make_shared<chunkdb::TableCatalog>(config);
         engine = std::make_unique<CommandEngine>(chunkdb::EngineConfig{.require_auth = false, .server_version = "test"}, catalog);
         Hello(session);
@@ -315,7 +316,7 @@ void TestDecisionHoldsTheLock() {
     std::atomic<bool> started{false};
     std::uint64_t other_version = 0;
     std::thread other;
-    const auto result = store.WriteBlockDecided(0, 0, 0, false, false,
+    const auto result = store.WriteBlockDecided(0, 0, 0, false, std::vector<std::size_t>{0}, false,
         [&](const BlockWriteView& block, std::vector<ColumnAssignment>& values) {
             assert(block.values != nullptr && block.commit_time_ms != 0U);
             const auto coins = std::get<std::uint64_t>((*block.values)[0]);
@@ -335,14 +336,14 @@ void TestDecisionHoldsTheLock() {
 
     // A refusal and a throw change nothing.
     const auto before = f.Run("GET BLOCK 0 0 FROM bank WITH VERSION");
-    const auto refused = store.WriteBlockDecided(0, 0, 0, true, true, [](const BlockWriteView& block, auto&) {
+    const auto refused = store.WriteBlockDecided(0, 0, 0, true, {}, true, [](const BlockWriteView& block, auto&) {
         assert(block.chunk_columns.size() == 1U && std::get<std::uint64_t>(block.chunk_columns[0]) == 0U);
         return false;
     });
     assert(!refused.ok && refused.version == other_version);
     bool thrown = false;
     try {
-        (void)store.WriteBlockDecided(0, 0, 0, true, false, [](const BlockWriteView&, auto&) -> bool {
+        (void)store.WriteBlockDecided(0, 0, 0, true, {}, false, [](const BlockWriteView&, auto&) -> bool {
             throw std::out_of_range("refused");
         });
     } catch (const std::out_of_range&) {
@@ -380,6 +381,84 @@ void TestConcurrentWriters() {
     assert(applied == 100 && refused == kThreads * kWrites - 100);
 }
 
+
+// In a transaction a value that reads the block is a read of its chunk, as
+// a condition is; a value that reads nothing of the chunk is not.
+void TestTransactionReadSet() {
+    Fixture f;
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN bank coins = 1"));
+    const chunkdb::ChunkCoord first{0, 0, 0};
+    const chunkdb::ChunkCoord second{2, 2, 0};
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run("SET BLOCK 9 9 IN bank coins = 2 * 3"), "_\r\n");
+    assert(!f.session.transaction->read_set.contains(second));
+    ExpectReply(f.Run("SET BLOCK 0 0 IN bank coins = coins + 1"), "_\r\n");
+    assert(f.session.transaction->read_set.contains(first));
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run("SET BLOCK 9 9 IN bank a = chunk.status"), "_\r\n");
+    assert(f.session.transaction->read_set.contains(second));
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+}
+
+// A refused condition in a transaction answers CONDITION_FAILED even when
+// the transaction may write no more chunks, and adds no write.
+void TestTransactionRefusalTakesNoWriteRoom() {
+    chunkdb::QueryLimits limits;
+    limits.txn_max_written_chunks = 1U;
+    Fixture f(limits);
+    (void)VersionOf(f.Run("SET BLOCK 8 8 IN bank coins = 4"));
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run("SET BLOCK 0 0 IN bank coins = 1"), "_\r\n");
+    ExpectError(f.Run("SET BLOCK 8 8 IN bank coins = 5 IF coins > 4"), "CONDITION_FAILED");
+    ExpectError(f.Run("DELETE BLOCK 100 100 FROM bank IF EXISTS"), "CONDITION_FAILED current=0 ");
+    assert(f.session.transaction->writes.size() == 1U);
+    ExpectError(f.Run("SET BLOCK 8 8 IN bank coins = 5 IF coins = 4"), "INVALID_ARGUMENT a transaction writes at most 1 chunks");
+    (void)VersionOf(f.Run("COMMIT"));
+    ExpectReply(f.Coins(8, 8), Int(4));
+}
+
+// IF VERSION $n: the version as a u64 parameter (docs/DESIGN-2.0.md E1).
+void TestVersionParameter() {
+    Fixture f;
+    const auto version = VersionOf(f.Run("SET BLOCK 0 0 IN bank coins = 1"));
+    ExpectError(f.Run("SET BLOCK 0 0 IN bank coins = 2 IF VERSION $1", Parameters{Le(version + 1)}),
+                "VERSION_MISMATCH current=" + std::to_string(version));
+    const auto next = VersionOf(f.Run("SET BLOCK 0 0 IN bank coins = $2 IF VERSION $1", Parameters{Le(version), Le(2)}));
+    ExpectReply(f.Coins(), Int(2));
+    ExpectError(f.Run("SET BLOCK 0 0 IN bank coins = coins + 1 IF VERSION $1", Parameters{Le(version)}), "VERSION_MISMATCH");
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN bank coins = coins + 1 IF VERSION $1", Parameters{Le(next)}));
+    ExpectReply(f.Coins(), Int(3));
+    ExpectError(f.Run("DELETE BLOCK 0 0 FROM bank IF VERSION $1", Parameters{std::nullopt}), "INVALID_ARGUMENT IF VERSION cannot be NULL");
+    ExpectError(f.Run("DELETE BLOCK 0 0 FROM bank IF VERSION $1", Parameters{Le(1, 4)}), "INVALID_ARGUMENT $1 for a u64 value must be 8 bytes");
+    const auto current = VersionOf(f.Run("GET BLOCK 0 0 FROM bank WITH VERSION").substr(4));
+    (void)VersionOf(f.Run("DELETE BLOCK 0 0 FROM bank IF VERSION $1", Parameters{Le(current)}));
+    ExpectReply(f.Run("GET BLOCK 0 0 FROM bank"), "_\r\n");
+    using Plan = CommandEngine::PayloadPlan;
+    const auto plan = f.engine->PlanPayload(f.session, "SET BLOCK 0 0 IN bank name = $2 IF VERSION $1\r\n");
+    assert(plan.plan == Plan::kParameters && (plan.parameter_limits == std::vector<std::size_t>{8, 8}));
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    ExpectError(f.Run("SET BLOCK 0 0 IN bank coins = 1 IF VERSION $1", Parameters{Le(1)}), "INVALID_ARGUMENT IF VERSION");
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+}
+
+// Under the chunk's lock the store decodes only the columns the decision
+// reads.
+void TestDecisionDecodesItsColumns() {
+    Fixture f;
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN bank coins = 7, name = 'abc', a = 3"));
+    const auto lease = f.catalog->Find("bank")->Acquire();
+    const std::vector<std::size_t> slots{0, 3};
+    const auto result = lease->store().WriteBlockDecided(0, 0, 0, false, slots, false,
+        [](const BlockWriteView& block, std::vector<ColumnAssignment>&) {
+            const auto& values = *block.values;
+            assert(values.size() == 6U && block.chunk_columns.empty());
+            assert(std::get<std::uint64_t>(values[0]) == 7U && std::get<std::string>(values[3]) == "abc");
+            for (const std::size_t unread : {1U, 2U, 4U, 5U}) assert(std::holds_alternative<std::monostate>(values[unread]));
+            return false;
+        });
+    assert(!result.ok);
+}
 }  // namespace
 
 int main() {
@@ -389,6 +468,10 @@ int main() {
     TestRights();
     TestDecisionHoldsTheLock();
     TestConcurrentWriters();
+    TestTransactionReadSet();
+    TestTransactionRefusalTakesNoWriteRoom();
+    TestVersionParameter();
+    TestDecisionDecodesItsColumns();
     std::puts("conditional writes tests passed");
     return 0;
 }

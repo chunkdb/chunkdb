@@ -123,6 +123,7 @@ These are data bytes and are never parsed as CQL text.
 | text, bytes | UTF-8 text or uninterpreted bytes, within the column bound. |
 | SET CHUNK | Chunk form defined by [Chunk form](#chunk-form). |
 | Expression | The type of the column operand it meets ([Expressions](reference/EXPRESSIONS.md#types)). |
+| IF VERSION $n | 8-byte little-endian u64. |
 
 The server bounds a frame before reading its body where the statement's schema permits it.
 For SET BLOCK and DELETE BLOCK, it also bounds the sum of actual declared frame lengths at 67117056 bytes. Each header is checked before allocating or reading its payload; small values remain accepted when their columns allow larger maxima. NULL frames add no payload bytes. SET CHUNK retains its separate chunk-form bound.
