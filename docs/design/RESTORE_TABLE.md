@@ -56,6 +56,7 @@ It waits for running statements on both tables, makes their acknowledged writes 
 CANCEL, KILL CONNECTION or a statement timeout stops the swap only before the exchange, and both tables then keep serving under their names.
 One atomic directory exchange then swaps `tables/t` and `tables/t_restored` (`renameat2(RENAME_EXCHANGE)` on Linux, `renamex_np(RENAME_SWAP)` on macOS).
 A file system without an atomic exchange refuses the swap and reopens both tables unchanged; Windows refuses it before closing either table; there is no non-atomic fallback.
+The [swap guard design](SWAP_GUARD.md) replaces this refusal with three renames under one guard record.
 After the exchange the parent directory is synced and each store is reopened under its new name as a new table object.
 A crash at any point leaves both directories under their old names or both exchanged; each directory is a complete table.
 A failure after the exchange that leaves a name unserved fences that name until RECOVER TABLE or a restart.

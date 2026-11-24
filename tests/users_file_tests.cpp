@@ -155,6 +155,11 @@ void TestDamagedFiles() {
     auto truncated = bytes;
     truncated.resize(bytes.size() / 2);
     ExpectInvalid([&] { (void)chunkdb::DecodeUsers(truncated); }, "checksum does not match");
+    // A file over the size limit is refused before it is read.
+    chunkdb::test::ScopedTempDir dir("chunkdb-users-file-size");
+    chunkdb::WriteUsersFile(dir.path(), Sample());
+    std::filesystem::resize_file(dir.path() / chunkdb::kUsersFileName, chunkdb::kMaxUsersFileBytes + 1U);
+    ExpectInvalid([&] { (void)chunkdb::ReadUsersFile(dir.path()); }, "larger than");
 }
 
 void TestFile() {
