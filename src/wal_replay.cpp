@@ -4,6 +4,7 @@
 #include <algorithm>
 #include <cstring>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <string>
 #include <vector>
@@ -694,6 +695,60 @@ WalReplayResult wal_detail::ReplayFromSource(
         set_state(*payload, *presence_bitmap);
     }
 
+    // Every committed state keeps the value invariants; the first state that
+    // does not is damage, even when a later frame would hide it.
+    const auto byte_problem = [&]() -> std::string {
+        if (vars->encoded_size() > kVarMaxChunkBytesLimit)
+            return "values take " + std::to_string(vars->encoded_size()) + " bytes, more than " +
+                   std::to_string(kVarMaxChunkBytesLimit);
+        if (*chunk_columns && (*chunk_columns)->variable_bytes > kVarMaxChunkBytesLimit - vars->encoded_size())
+            return "block and chunk values exceed the combined variable-byte limit";
+        return {};
+    };
+    // Every value of the state.
+    const auto vars_problem_of = [&](const ChunkLayout& layout, std::span<const std::uint8_t> presence) -> std::string {
+        if (auto problem = byte_problem(); !problem.empty()) return problem;
+        try {
+            layout.RequireValidVarsView(*vars, presence);
+        } catch (const std::invalid_argument& e) {
+            return e.what();
+        }
+        return {};
+    };
+    // What one frame changed: the byte totals, the values it wrote and the
+    // blocks its spans left absent, so a frame costs what it wrote rather
+    // than the whole chunk's values.
+    const auto frame_vars_problem = [&](const ChunkLayout& layout, std::span<const std::uint8_t> presence,
+                                        const ParsedFrame& changed, const std::vector<std::uint8_t>& changed_bytes) -> std::string {
+        if (auto problem = byte_problem(); !problem.empty()) return problem;
+        if (vars->empty()) return {};
+        ChunkVars written;
+        for (const auto& op : changed.var_ops) {
+            if (op.put) written.Assign(op.key, std::span<const std::uint8_t>(changed_bytes.data() + op.source, op.length));
+        }
+        try {
+            layout.RequireValidVarsView(written, presence);
+        } catch (const std::invalid_argument& e) {
+            return e.what();
+        }
+        const auto payload_bytes = layout.payload_bytes();
+        for (const auto& span : changed.spans) {
+            for (auto at = std::max(span.offset, payload_bytes); at < span.offset + span.size; ++at) {
+                const auto byte = presence[at - payload_bytes];
+                for (std::uint32_t bit = 0; bit < 8U; ++bit) {
+                    const auto block = static_cast<std::uint32_t>((at - payload_bytes) * 8U + bit);
+                    if (((byte >> bit) & 1U) != 0U || block >= layout.block_count()) continue;
+                    for (const auto& column : layout.schema().columns) {
+                        if (layout.VarColumn(column.id) != nullptr && vars->Find({column.id, block}))
+                            return "column " + std::to_string(column.id) + " block " + std::to_string(block) +
+                                   ": a value of an absent block";
+                    }
+                }
+            }
+        }
+        return {};
+    };
+
     std::size_t cursor = header_size;
     ParsedFrame frame;
     std::uint64_t previous_revision = 0;
@@ -759,7 +814,9 @@ WalReplayResult wal_detail::ReplayFromSource(
             result.stopped_at_crash_tail = false;
             break;
         }
-        if (frame.schema_version != state_version) {
+        // A schema step converts the values, which are then checked whole.
+        const bool moved = frame.schema_version != state_version;
+        if (moved) {
             move_state_to(frame.schema_version);
         }
         if (frame.gc && (std::any_of(
@@ -785,6 +842,7 @@ WalReplayResult wal_detail::ReplayFromSource(
             }
             *chunk_columns = DefaultChunkColumnsAt(geometry, frame.schema_version);
         }
+        const bool replaced = frame.var_replace.has_value();
         if (!frame.var_ops.empty() || frame.var_replace.has_value()) {
             ApplyFrameVars(frame_bytes, &frame, vars);
         }
@@ -793,6 +851,15 @@ WalReplayResult wal_detail::ReplayFromSource(
                 frame_bytes.data() + span.source,
                 frame_bytes.data() + span.source + span.size,
                 state.begin() + static_cast<std::ptrdiff_t>(span.offset));
+        }
+        // Checked after every frame, as feed replay does: what the frame
+        // changed, or the whole state after a new set of values or a schema
+        // step.
+        if (result.vars_problem.empty()) {
+            const auto& layout = geometry.LayoutAt(state_version);
+            const auto presence = std::span<const std::uint8_t>(state).subspan(layout.payload_bytes());
+            result.vars_problem = replaced || moved ? vars_problem_of(layout, presence)
+                                                    : frame_vars_problem(layout, presence, frame, frame_bytes);
         }
         result.applied_records += frame.record_count;
         result.applied_frames += 1;
@@ -807,20 +874,8 @@ WalReplayResult wal_detail::ReplayFromSource(
         move_state_to(current_version);
     }
     SplitChunkStateBytes(geometry, state, payload, presence_bitmap);
-    // Every committed state keeps the value invariants, and replay ends in a
-    // committed state; anything else is damage.
-    if (vars->encoded_size() > kVarMaxChunkBytesLimit) {
-        result.vars_problem = "values take " + std::to_string(vars->encoded_size()) + " bytes, more than " +
-                              std::to_string(kVarMaxChunkBytesLimit);
-    } else if (*chunk_columns && (*chunk_columns)->variable_bytes > kVarMaxChunkBytesLimit - vars->encoded_size()) {
-        result.vars_problem = "block and chunk values exceed the combined variable-byte limit";
-    } else {
-        try {
-            geometry.layout().RequireValidVars(*vars, *presence_bitmap);
-        } catch (const std::invalid_argument& e) {
-            result.vars_problem = e.what();
-        }
-    }
+    // Replay ends in a committed state, which keeps the invariants too.
+    if (result.vars_problem.empty()) result.vars_problem = vars_problem_of(geometry.layout(), *presence_bitmap);
     return result;
 }
 

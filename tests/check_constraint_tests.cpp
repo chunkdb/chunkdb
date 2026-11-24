@@ -586,6 +586,14 @@ void TestInterruptedAddCheck() {
         out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
         Expect(static_cast<bool>(out), "manifest written");
     }
+    // A start refused by its option flags leaves the manifest as it was.
+    {
+        auto refused = config;
+        refused.default_options.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
+        refused.default_option_fields = chunkdb::kOptionFieldDurabilityMode;
+        ExpectThrow([&] { chunkdb::TableCatalog catalog(refused); }, "--durability fsync-wal");
+        Expect(chunkdb::ReadStoreManifest(table_dir)->schema.pending.has_value(), "manifest unchanged after a refusal");
+    }
     chunkdb::TableCatalog catalog(config);
     Expect(catalog.Find("w")->Info().schema == Checked(), "dropped");
     Expect(!chunkdb::ReadStoreManifest(table_dir)->schema.pending.has_value(), "manifest without it");

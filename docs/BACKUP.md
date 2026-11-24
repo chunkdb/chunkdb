@@ -61,7 +61,7 @@ Restore publishes a checked successor clock before exposing the new epoch; it pr
 It also preserves chunk commit times and deletion floors while rebinding every index and log to the new table identity.
 After later crashes or restarts, missing chunk files cannot prove that no history was lost.
 Without durable proof, an exact-cut request also resyncs.
-Existing backed-up tables need `table_lineage` enabled on the source before creating their backup.
+Restore, offline or with RESTORE TABLE, refuses a backed-up table without `table_lineage`; every table a 2.0 build creates has it.
 
 ## 3. Inspect a backup
 
