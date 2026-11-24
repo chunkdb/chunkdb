@@ -852,26 +852,38 @@ class Parser {
         return value;
     }
 
-    // GRANT <right>, ... ON <table | *> TO <user>, or REVOKE ... FROM <user>.
+    // GRANT <right>, ... ON <table | prefix* | *> TO <user>, or REVOKE ...
+    // FROM <user>. Server rights go ON * only.
     [[nodiscard]] GrantRight GrantOrRevoke(bool revoke) {
         GrantRight grant;
         grant.revoke = revoke;
-        bool first = true;
+        const auto server = [&grant](ServerRight right) { grant.server_rights |= static_cast<std::uint8_t>(right); };
         do {
             Right right;
+            if (Accept("monitor")) { server(ServerRight::kMonitor); continue; }
+            if (Accept("backup")) { server(ServerRight::kBackup); continue; }
+            if (Accept("replication")) { server(ServerRight::kReplication); continue; }
             if (Accept("read")) right = Right::kRead;
             else if (Accept("write")) right = Right::kWrite;
             else if (Accept("admin")) right = Right::kAdmin;
-            else Fail(Peek().column, "expected READ, WRITE or ADMIN, got " + Quote(Peek()));
-            if (first || (revoke ? right < grant.right : right > grant.right)) grant.right = right;
-            first = false;
+            else Fail(Peek().column, "expected READ, WRITE, ADMIN, MONITOR, BACKUP or REPLICATION, got " + Quote(Peek()));
+            if (!grant.right || (revoke ? right < *grant.right : right > *grant.right)) grant.right = right;
         } while (AcceptToken(TokenKind::kComma));
         Expect("on");
+        const std::size_t target = Peek().column;
         if (AcceptToken(TokenKind::kStar)) {
             grant.table = kEveryTable;
         } else {
-            grant.table = Name("a table name or *");
+            const std::size_t end = Peek().column + Peek().text.size();
+            grant.table = Name("a table name, a prefix followed by *, or *");
+            // `p*` written without a space is a prefix grant.
+            if (Peek().kind == TokenKind::kStar && Peek().column == end) {
+                Take();
+                grant.table += '*';
+            }
         }
+        if (grant.server_rights != 0U && grant.table != kEveryTable)
+            Fail(target, "MONITOR, BACKUP and REPLICATION are granted ON *");
         Expect(revoke ? "from" : "to");
         grant.user = Name("a user name");
         return grant;

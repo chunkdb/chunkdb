@@ -28,7 +28,8 @@ struct MigrationRequest {
     // whose stored blocks are evaluated as a narrowing checks values.
     std::function<CheckConstraint(const TableSchema&)> add_check{};
     std::string user;
-    Right right = Right::kRead;
+    std::optional<Right> right;
+    std::uint8_t server_rights = 0U;
     bool revoke = false;
     std::string slot;
     FeedSlotFilters slot_filters{};

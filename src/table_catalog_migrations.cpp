@@ -431,14 +431,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             if (!next_users) throw std::invalid_argument("this server runs without users (--auth none)");
             const auto at = next_users->users.find(request.user);
             if (at == next_users->users.end()) throw std::invalid_argument("user " + request.user + " does not exist");
-            auto& grants = at->second.grants;
-            const auto current = grants.find(request.table);
-            if (!request.revoke) {
-                if (current == grants.end() || current->second < request.right) grants[request.table] = request.right;
-            } else if (current != grants.end() && current->second >= request.right) {
-                if (request.right == Right::kRead) grants.erase(current);
-                else current->second = static_cast<Right>(static_cast<std::uint8_t>(request.right) - 1U);
-            }
+            ApplyGrant(at->second, request.table, request.right, request.server_rights, request.revoke);
         }
         if (next_users) add_file(std::string(kUsersFileName), EncodeUsers(*next_users));
         // Built before the decision, so publishing the users cannot fail after it.
