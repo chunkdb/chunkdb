@@ -144,9 +144,11 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             hook(BackupTestHook::Point::kAfterCut, table->name(), cut);
             while (!store.write_producers_->Completed(store.version_clock_, cut)) {
                 hook(BackupTestHook::Point::kWaitingForCompletion, table->name(), cut);
-                // Waiting work stays on this side: mutations only publish and
-                // clear their own cache-line bound, without locks or wakeups.
-                std::this_thread::yield();
+                // A write clearing its bound at or below the cut wakes this
+                // wait, and so does CANCEL or shutdown; the hook above then
+                // ends a cancelled backup. The slice only bounds one wait.
+                (void)store.write_producers_->WaitCompleted(store.version_clock_, cut,
+                    std::chrono::steady_clock::now() + std::chrono::hours(1), options.cancelled);
             }
             Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_CUT_ONCE");
             require_healthy();

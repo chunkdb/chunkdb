@@ -478,6 +478,45 @@ void TargetAndCancellation() {
     assert(!std::filesystem::exists(root / "cancelled" / kBackupMarkerName));
     (void)catalog.BackupTo(root / "later", {});
 }
+class CountCompletionWaits final : public BackupTestHook {
+  public:
+    void Run(Point point, std::string_view, std::uint64_t) override {
+        if (point == Point::kWaitingForCompletion) calls.fetch_add(1U, std::memory_order_relaxed);
+    }
+    std::atomic<std::size_t> calls{0U};
+};
+void CompletionWaitSleepsUntilCancel() {
+    ScopedTempDir temp("chunkdb-backup-completion-wait");
+    const auto root = std::filesystem::canonical(temp.path());
+    TableCatalog catalog(Config(root / "source", DurabilityMode::kFsyncWal));
+    (void)feed_test::CreateDefault(catalog);
+    auto lease = catalog.Find("default")->Acquire(); auto& store = lease->store();
+    WriteCounter(store, {0, 0}, 1);
+    auto snapshot = store.BeginTxnSnapshot(txn_test::kTxnDuration);
+    auto state = store.ReadChunkStateAt(*snapshot, 0, 0); txn_test::SetCounter(&state, 2);
+    std::vector<TxnChunkWrite> writes{{.coord = {0, 0}, .state = std::move(state)}};
+    // The commit holds its revision's bound, below every later cut, until resumed.
+    store.ArmTxnPauseForTests(TxnPausePoint::kBeforePostCommitOutcome);
+    auto transaction = std::async(std::launch::async, [&] { return Error([&] { (void)store.CommitTransaction(*snapshot, {}, std::move(writes)); }); });
+    assert(store.WaitForTxnPauseForTests(TxnPausePoint::kBeforePostCommitOutcome));
+    CountCompletionWaits waits; catalog.SetBackupHookForTests(&waits);
+    std::stop_source cancel;
+    auto backup = std::async(std::launch::async, [&] { return Error([&] { (void)catalog.BackupTo(root / "cancelled", {.cancelled = cancel.get_token()}); }); });
+    const auto deadline = std::chrono::steady_clock::now() + 10s;
+    while (waits.calls.load() == 0U) { assert(std::chrono::steady_clock::now() < deadline); std::this_thread::sleep_for(1ms); }
+    // The backup sleeps on the held write instead of spinning.
+    std::this_thread::sleep_for(300ms);
+    assert(waits.calls.load() <= 2U && backup.wait_for(0s) == std::future_status::timeout);
+    cancel.request_stop();
+    assert(backup.wait_for(10s) == std::future_status::ready);
+    assert(backup.get().find("cancelled") != std::string::npos);
+    catalog.SetBackupHookForTests(nullptr);
+    store.ResumeTxnForTests(TxnPausePoint::kBeforePostCommitOutcome);
+    assert(transaction.get().empty());
+    assert(!std::filesystem::exists(root / "cancelled" / kBackupMarkerName));
+    (void)catalog.BackupTo(root / "later", {});
+    assert(txn_test::CounterOf(ReadBackup(root / "later", "default", {0, 0})) == 2U);
+}
 void CompletionAndPoison() {
     ScopedTempDir temp("chunkdb-backup-completion");
     const auto root = std::filesystem::canonical(temp.path());
@@ -1337,7 +1376,7 @@ int main(int argc, char** argv) {
     FailedIndexRefusesBackup();
     CancelBetweenBoundedWalReplayReads();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint}) { CutAndProgress(mode); AcknowledgedLoad(mode); }
-    CopyReleasesHoldsAndBusy(); TargetAndCancellation(); CompletionAndPoison(); FailedGenerationAndEmptyCatalog(); CancelCatalogWaitAndRestrictions();
+    CopyReleasesHoldsAndBusy(); TargetAndCancellation(); CompletionWaitSleepsUntilCancel(); CompletionAndPoison(); FailedGenerationAndEmptyCatalog(); CancelCatalogWaitAndRestrictions();
     for (unsigned defect = 0; defect < 5U; ++defect) ColdRecovery(defect);
     std::puts("backup core passed: 3 cut modes, 3 load modes x3 tables x155 acknowledgements, 5 cold cases, 18 focused groups");
 }

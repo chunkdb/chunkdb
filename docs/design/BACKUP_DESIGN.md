@@ -28,7 +28,7 @@ The store owns the feed's stable per-thread Producer registry even without subsc
 Before reserving a version, a write stores its lower bound on its own aligned producer; the bound remains through postcommit durability work and is cleared at scope completion.
 Clock loads, bound publication and version reservation use the watermark's sequentially consistent Dekker pairing.
 Backup samples S = next revision minus one, then reads the clock and producer bounds until every in-flight bound <=S clears.
-Waiting may poll/yield; writers take no completion mutex and perform no completion notification or syscall.
+The wait sleeps on the registry's completion wait: a writer clearing its bound takes the completion mutex and wakes it only while a waiter is counted, and a stop request (CANCEL, shutdown) wakes it too.
 Feed End clears its capture buffers and detaches its registry reference; ended subscriptions cannot later clear another feed's buffers.
 The store keeps producer nodes alive through feed recreation and until its own close.
 
