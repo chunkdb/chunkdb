@@ -10,6 +10,9 @@ The client speaks first and knows its TLS version, so it picks the type without 
 A binding mismatch is reported apart from a wrong password because it depends on neither the user nor the password; a user that requires binding is not, so the reply does not tell that the user exists.
 Unknown-user authentication uses a derived salt and the same failure message as an invalid password.
 Passwords use UTF-8 bytes without SASLprep normalization.
+A user has at most two verifiers, so a password rotates without a moment in which no password logs in.
+The server sends one salt and iteration count before the client proves its password, so an added verifier must share them; the proof is checked against both verifiers.
+AUTH succeeds only while the user still has the verifier the proof matched.
 
 chunkdb.users is checksummed and atomically replaced with file/directory syncs.
 Its checked CKDU format stores users, verifier data, management capability, the channel binding requirement, grants,

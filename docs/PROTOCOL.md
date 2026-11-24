@@ -71,10 +71,11 @@ Before authentication HELLO takes at most 12 parameters; a HELLO with more recei
 
 `client_name` and `statement_timeout_ms` apply; `default_tag` is stored with `reason=implementation_pending`.
 The effective statement timeout appears in `options`, including the server default when HELLO omits it.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, and `area_paging`.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, and `area_scale`.
 Options become visible only after authentication succeeds.
 Returning and expression ceilings describe reserved limits; their capabilities remain unavailable.
 The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
+The `area_scale` feature permits GET AREA SCALE and its downsampled forms.
 A chunk too large for an empty page ends the page before it and is then refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=... required=... limit=...`; see [chunks](reference/CHUNKS.md#limits).
 The configured positive area bounds appear as both `max_area_chunks`/`max_response_bytes` and `limits.max_area_chunks`/`limits.max_area_response_bytes`.
 `limits.txn_max_written_chunks` and `limits.txn_max_read_chunks` are the configured transaction chunk-count bounds.
@@ -183,11 +184,14 @@ Kinds are strictly increasing, and section bodies are contiguous after the direc
 | 4 Variable values | Entries `column_id:u32, block_index:u32, length:u32, bytes:length`. |
 | 5 Chunk columns | Complete checked one-row metadata encoding. |
 | 6 Block spans | `count:u32`, then fixed-column descriptors. |
+| 7 Scale | `scale:u32`, `reduction:u16`, and zero `reserved:u16`. |
 
 A block-span descriptor is six `u32` fields: stable column ID, width in bits, values offset, values length, validity offset, and validity length.
 Offsets are relative to the corresponding fixed or validity body; a nonnullable descriptor has zero validity offset and length.
 Descriptors follow the requested projection or schema order and cover each packed body exactly.
 The local block index is `x + width * (y + height * z)`; inactive z is zero.
+Section 7 marks a downsampled form from GET AREA SCALE: its presence, values and spans describe samples, one per group of blocks, with width, height and active depth each divided by `scale`.
+Its reductions are 1 MAX, 2 MIN, 3 MODE, 4 FIRST and 5 ANY; see [downsampled areas](reference/CHUNKS.md#downsampled-areas).
 Padding bits are zero, and absent blocks contain no retained values.
 Chunk-column bodies start with `count:u32` and a directory of `column_id:u32, null_flags:u16, reserved_zero:u16, offset:u32, length:u32` entries in stable-ID order.
 Flag 1 means null; all other flag bits are invalid.
@@ -195,7 +199,7 @@ Offsets are relative to the metadata body, and values follow the complete direct
 Scalar value bytes use the parameter encodings above; null values have no bytes.
 
 Read clients validate the complete directory and may retain unknown sections or fixed types as opaque data.
-SET CHUNK refuses unknown sections and requires exactly the current schema and requested projection.
+SET CHUNK refuses unknown sections and section 7, and requires exactly the current schema and requested projection.
 A full write replaces both domains; a projected write preserves chunk metadata and unnamed continuing block values.
 The server ignores supplied producing version and time and assigns its own committed identity.
 SCHEMA_MISMATCH reports a different supplied schema revision.

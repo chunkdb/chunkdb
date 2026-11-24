@@ -12,6 +12,7 @@
 
 #include "chunkdb/schema.hpp"
 #include "chunkdb/change_feed.hpp"
+#include "sectioned_chunk_form.hpp"
 #include "users.hpp"
 
 namespace chunkdb::expr {
@@ -152,6 +153,8 @@ struct GetArea {
     std::uint8_t dims = 2;
     std::optional<std::uint64_t> limit;
     std::optional<ChunkCoord> after;
+    // SCALE k USING reduction: one cell per k blocks on every active axis.
+    std::optional<ChunkFormScale> scale;
 };
 
 // One function of AGGREGATE; `column` is empty for COUNT(*).
@@ -316,11 +319,15 @@ struct CreateUser {
     bool requires_channel_binding = false;
     bool if_not_exists = false;
 };
-// Exactly one change is set: the verifier, manages_users, the limits or
-// requires_channel_binding.
+// Exactly one change is set: the verifier, the added verifier,
+// drop_old_verifier, manages_users, the limits or requires_channel_binding.
 struct AlterUser {
     std::string user;
     std::optional<Literal> verifier;
+    // ADD VERIFIER: a second verifier the user logs in with besides its own.
+    std::optional<Literal> added_verifier;
+    // DROP OLD VERIFIER: the added verifier becomes the only one.
+    bool drop_old_verifier = false;
     std::optional<bool> manages_users;
     std::optional<std::uint64_t> max_connections{};
     std::optional<std::uint64_t> statements_per_sec{};
