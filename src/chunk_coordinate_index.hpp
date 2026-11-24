@@ -35,7 +35,8 @@ void SetCoordinatePublicationTestHook(CoordinatePublicationTestHook* hook) noexc
 // Consecutive coordinates of the index with an upper bound of their
 // revisions, so a page of changes after a revision skips an unchanged run
 // whole instead of visiting each coordinate in it.
-struct CoordinateRun {
+// One cache line each, so writers raising neighbouring runs do not share one.
+struct alignas(64) CoordinateRun {
     std::atomic<std::uint64_t> maximum_revision{0U};
     // The owning index mutex protects the boundary and the count.
     ChunkCoord first{};
@@ -149,14 +150,15 @@ class ChunkCoordinateIndex {
     void AttachRun(Coordinates::iterator at) noexcept;
     void DetachRun(ChunkCoordinateNode& node) noexcept;
     void SplitRun(Runs::iterator run) noexcept;
-    // Under mutex_: visits in order, from `from` (inclusive) or the start, each
+    // Under mutex_: visits in order, after `from` (from it when `inclusive`) or
+    // from the start without `has_from`, each
     // coordinate whose revision exceeds `since`, skipping runs whose maximum
     // does not. Stops before a coordinate `visit` refuses, or once `budget`
-    // runs and coordinates are examined, returning where to resume
-    // (inclusive); returns nothing at the end.
+    // runs and coordinates are examined, setting where to resume
+    // (inclusive) in `resume` and returning true; returns false at the end.
     template <class Visit>
-    std::optional<ChunkCoord> WalkChanged(const std::optional<ChunkCoord>& from, bool inclusive,
-        std::uint64_t since, std::size_t budget, Visit&& visit) const;
+    bool WalkChanged(bool has_from, const ChunkCoord& from, bool inclusive, std::uint64_t since,
+        std::size_t budget, ChunkCoord& resume, Visit&& visit) const;
     void ReleaseReservation(CoordinateReservation& reservation) noexcept;
     void PublishReservation(CoordinateReservation& reservation, bool populated, std::uint64_t revision) noexcept;
     void PublishInventory(const IndexInventoryHeader& header, std::span<const IndexInventoryEntry> entries);

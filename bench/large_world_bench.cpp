@@ -36,8 +36,9 @@
 //
 // `--scenario scan-pages` times each SCAN CHUNKS page instead of the whole
 // walk: the current chunks, the chunks changed SINCE a position after about
-// one chunk in `--changed-every` was rewritten, the chunks WITH DATA, and the
-// chunks as of a READ ONLY snapshot. Run it at two world sizes; a page's cost
+// one chunk in `--changed-every` was rewritten (`--changed-layout` spread or
+// clustered), the chunks WITH DATA, and the chunks as of a READ ONLY snapshot
+// taken before the rewrites. Run it at two world sizes; a page's cost
 // follows the page when the per-page and per-entry figures stay flat.
 //
 // A third scenario (`--scenario evict-load`) measures cold loads of chunks
@@ -270,6 +271,7 @@ struct Args {
     std::string scenario_name = "sparse-writes";
     std::size_t scan_limit = 1024;
     std::size_t changed_every = 64;
+    bool changed_clustered = false;
     std::int64_t grid_width = 1024;
     std::size_t chunks = 5000;
     std::size_t cache = 16384;
@@ -298,6 +300,8 @@ constexpr char kUsage[] =
     "  --scan-limit N   chunkscan, scan-pages: page size, 1..1024 (default 1024)\n"
     "  --changed-every N scan-pages: rewrite about one chunk in N before the\n"
     "                   SINCE pass (default 64)\n"
+    "  --changed-layout L scan-pages: spread (hashed over the world) or clustered\n"
+    "                   (the lowest cx columns, in scan order) (default spread)\n"
     "  --grid-width N   chunks per world row; use a value <= large_chunk_width_chunks\n"
     "                   (8) to measure a world that is one large-chunk column wide\n"
     "                   (default 1024)\n"
@@ -358,6 +362,12 @@ Args ParseArgs(int argc, char** argv) {
             }
         } else if (arg == "--changed-every") {
             args.changed_every = parse_size(require_value("--changed-every"), "--changed-every");
+        } else if (arg == "--changed-layout") {
+            const auto value = require_value("--changed-layout");
+            if (value != "spread" && value != "clustered") {
+                throw std::invalid_argument("invalid --changed-layout value: " + value);
+            }
+            args.changed_clustered = value == "clustered";
         } else if (arg == "--grid-width") {
             args.grid_width =
                 static_cast<std::int64_t>(parse_size(require_value("--grid-width"), "--grid-width"));
@@ -706,7 +716,7 @@ std::pair<std::int64_t, std::int64_t> EvictLoadChunkOf(std::size_t large_index, 
     };
 }
 
-double PercentileUs(const std::vector<double>& sorted, double fraction) {
+double Percentile(const std::vector<double>& sorted, double fraction) {
     if (sorted.empty()) {
         return 0.0;
     }
@@ -755,8 +765,8 @@ PagePass TimePages(std::string name, NextPage&& next_page) {
     pass.seconds = std::accumulate(page_ms.begin(), page_ms.end(), 0.0) / 1000.0;
     pass.first_ms = page_ms.front();
     std::sort(page_ms.begin(), page_ms.end());
-    pass.p50_ms = PercentileUs(page_ms, 0.50);
-    pass.p99_ms = PercentileUs(page_ms, 0.99);
+    pass.p50_ms = Percentile(page_ms, 0.50);
+    pass.p99_ms = Percentile(page_ms, 0.99);
     pass.max_ms = page_ms.back();
     pass.us_per_entry = pass.entries == 0 ? 0.0 : pass.seconds * 1e6 / static_cast<double>(pass.entries);
     return pass;
@@ -772,9 +782,11 @@ struct ScanPagesResult {
 // Passes, in order on one store reopened after populating:
 //   current   the populated chunks, cold cache;
 //   since     after rewriting about one chunk in --changed-every, spread over
-//             the world: only those (SINCE the position before the rewrites);
+//             the world or clustered in the lowest cx columns: only those
+//             (SINCE the position before the rewrites);
 //   with-data the populated chunks with their data;
-//   snapshot  the populated chunks as of a read-only transaction snapshot.
+//   snapshot  the populated chunks as of a READ ONLY snapshot taken before
+//             the rewrites, so the rewritten chunks are read from history.
 ScanPagesResult RunScanPagesRepeat(const Args& args, std::size_t run_index) {
     const std::filesystem::path dir = args.data_dir / ("scan-pages-" + std::to_string(run_index));
     std::error_code ec;
@@ -796,12 +808,17 @@ ScanPagesResult RunScanPagesRepeat(const Args& args, std::size_t run_index) {
     if (!position) {
         throw std::runtime_error("scan returned no position");
     }
+    const auto snapshot = store.BeginTxnSnapshot(std::chrono::hours(1));
     const std::string bits = "0000111100001111";
+    const auto clustered_columns =
+        std::max<std::int64_t>(1, args.grid_width / static_cast<std::int64_t>(args.changed_every));
     for (std::size_t i = 0; i < args.chunks; ++i) {
-        if (chunkdb::detail::MixCoordinateWord(i) % args.changed_every != 0) {
+        const auto [cx, cy] = ChunkOf(i, args.grid_width);
+        const bool changed = args.changed_clustered ? cx < clustered_columns
+                                                    : chunkdb::detail::MixCoordinateWord(i) % args.changed_every == 0;
+        if (!changed) {
             continue;
         }
-        const auto [cx, cy] = ChunkOf(i, args.grid_width);
         store.SetBlockBits(cx * 16 + 8, cy * 16, bits);
         ++result.changed;
     }
@@ -811,7 +828,6 @@ ScanPagesResult RunScanPagesRepeat(const Args& args, std::size_t run_index) {
     result.passes.push_back(TimePages("with-data", [&](bool has_cursor, chunkdb::ChunkCoord cursor) {
         return store.ScanChunkIdentities(has_cursor, cursor, limit, std::nullopt, true);
     }));
-    const auto snapshot = store.BeginTxnSnapshot(std::chrono::hours(1));
     result.passes.push_back(TimePages("snapshot", [&](bool has_cursor, chunkdb::ChunkCoord cursor) {
         return store.ScanChunkIdentitiesAt(*snapshot, has_cursor, cursor, limit);
     }));
@@ -981,10 +997,10 @@ EvictLoadResult RunEvictLoadRepeat(const Args& args, std::size_t run_index) {
     std::sort(all.begin(), all.end());
     result.cold_loads = all.size();
     result.overlap = all.empty() ? 0.0 : static_cast<double>(overlapping.load()) / static_cast<double>(all.size());
-    result.p50_us = PercentileUs(all, 0.50);
-    result.p90_us = PercentileUs(all, 0.90);
-    result.p99_us = PercentileUs(all, 0.99);
-    result.p999_us = PercentileUs(all, 0.999);
+    result.p50_us = Percentile(all, 0.50);
+    result.p90_us = Percentile(all, 0.90);
+    result.p99_us = Percentile(all, 0.99);
+    result.p999_us = Percentile(all, 0.999);
     result.max_us = all.empty() ? 0.0 : all.back();
 
     if (!args.keep_data) {
@@ -1290,6 +1306,7 @@ int main(int argc, char** argv) {
                           << " grid_width=" << args.grid_width
                           << " scan_limit=" << args.scan_limit
                           << " changed_every=" << args.changed_every
+                          << " changed_layout=" << (args.changed_clustered ? "clustered" : "spread")
                           << " repeats=" << args.repeats
                           << '\n'
                           << "host data_dir=" << args.data_dir

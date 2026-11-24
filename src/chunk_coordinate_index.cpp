@@ -577,23 +577,24 @@ void ChunkCoordinateIndex::SplitRun(Runs::iterator run) noexcept {
 }
 
 template <class Visit>
-std::optional<ChunkCoord> ChunkCoordinateIndex::WalkChanged(const std::optional<ChunkCoord>& from, bool inclusive,
-    std::uint64_t since, std::size_t budget, Visit&& visit) const {
-    auto run = from ? std::prev(runs_.upper_bound(*from)) : runs_.begin();
+bool ChunkCoordinateIndex::WalkChanged(bool has_from, const ChunkCoord& from, bool inclusive, std::uint64_t since,
+    std::size_t budget, ChunkCoord& resume, Visit&& visit) const {
+    const auto stop = [&](const ChunkCoord& coord) { resume = coord; return true; };
+    auto run = has_from ? std::prev(runs_.upper_bound(from)) : runs_.begin();
     std::size_t examined = 0U;
     for (bool first = true; run != runs_.end(); ++run, first = false) {
         const auto next = std::next(run);
-        if (!first && examined++ >= budget) return run->first;
+        if (!first && examined++ >= budget) return stop(run->first);
         if (run->second->maximum_revision.load(std::memory_order_acquire) <= since) continue;
-        auto at = !first || !from ? coordinates_.lower_bound(run->first)
-            : inclusive ? coordinates_.lower_bound(*from) : coordinates_.upper_bound(*from);
+        auto at = !first || !has_from ? coordinates_.lower_bound(run->first)
+            : inclusive ? coordinates_.lower_bound(from) : coordinates_.upper_bound(from);
         for (; at != coordinates_.end() && (next == runs_.end() || at->first < next->first); ++at) {
-            if (examined++ >= budget) return at->first;
+            if (examined++ >= budget) return stop(at->first);
             if (at->second.revision.load(std::memory_order_acquire) <= since) continue;
-            if (!visit(at->first)) return at->first;
+            if (!visit(at->first)) return stop(at->first);
         }
     }
-    return std::nullopt;
+    return false;
 }
 
 CoordinatePage ChunkCoordinateIndex::Page(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
@@ -606,12 +607,13 @@ CoordinatePage ChunkCoordinateIndex::Page(bool has_cursor, const ChunkCoord& cur
     page.coords.reserve(limit);
     std::lock_guard lock(mutex_);
     if (since) {
-        const auto from = has_cursor ? std::optional(cursor) : std::nullopt;
-        (void)WalkChanged(from, false, *since, std::numeric_limits<std::size_t>::max(), [&](const ChunkCoord& coord) {
-            if (page.coords.size() == limit) { page.more = true; return false; }
-            page.coords.push_back(coord);
-            return true;
-        });
+        ChunkCoord resume{};
+        (void)WalkChanged(has_cursor, cursor, false, *since, std::numeric_limits<std::size_t>::max(), resume,
+            [&](const ChunkCoord& coord) {
+                if (page.coords.size() == limit) { page.more = true; return false; }
+                page.coords.push_back(coord);
+                return true;
+            });
     } else {
         auto at = has_cursor ? populated_.upper_bound(cursor) : populated_.begin();
         for (; at != populated_.end(); ++at) {
@@ -639,23 +641,28 @@ CoordinatePage ChunkCoordinateIndex::SnapshotPage(bool has_cursor, const ChunkCo
     // the lock that a write emptying a coordinate takes after it published
     // the revision and raised its run.
     constexpr std::size_t kBatchNodes = 256U;
-    auto from = has_cursor ? std::optional(cursor) : std::nullopt;
+    bool has_from = has_cursor;
+    ChunkCoord from = cursor;
     bool inclusive = false;
     std::vector<ChunkCoord> changed;
+    changed.reserve(limit + 1U);
     for (;;) {
         std::lock_guard lock(mutex_);
         changed.clear();
         const auto wanted = limit + 1U - page.coords.size();
-        const auto stop = WalkChanged(from, inclusive, snapshot, kBatchNodes, [&](const ChunkCoord& coord) {
-            if (changed.size() == wanted) return false;
-            changed.push_back(coord);
-            return true;
-        });
+        ChunkCoord stop{};
+        const bool stopped = WalkChanged(has_from, from, inclusive, snapshot, kBatchNodes, stop,
+            [&](const ChunkCoord& coord) {
+                if (changed.size() == wanted) return false;
+                changed.push_back(coord);
+                return true;
+            });
         // Every coordinate before `stop` is decided: merge the populated ones.
-        auto live = !from ? populated_.begin() : inclusive ? populated_.lower_bound(*from) : populated_.upper_bound(*from);
+        auto live = !has_from ? populated_.begin()
+            : inclusive ? populated_.lower_bound(from) : populated_.upper_bound(from);
         auto change = changed.begin();
         for (;;) {
-            const bool has_live = live != populated_.end() && (!stop || *live < *stop);
+            const bool has_live = live != populated_.end() && (!stopped || *live < stop);
             const bool has_change = change != changed.end();
             if (!has_live && !has_change) break;
             ChunkCoord next;
@@ -667,7 +674,8 @@ CoordinatePage ChunkCoordinateIndex::SnapshotPage(bool has_cursor, const ChunkCo
             if (page.coords.size() == limit) { page.more = true; return page; }
             page.coords.push_back(next);
         }
-        if (!stop) return page;
+        if (!stopped) return page;
+        has_from = true;
         from = stop;
         inclusive = true;
     }
