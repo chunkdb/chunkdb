@@ -22,7 +22,7 @@ Changing a table's durability mode first flushes its pending batches; the new mo
 
 A checkpoint writes a same-directory temporary image, closes it with error checking, and atomically replaces the image.
 In synced modes the image and directory entry are synced before deleting the WAL it replaces.
-Relaxed mode preserves this durability floor once a FLUSH WAL or a slot pass, including the first pass at CREATE SLOT, starts its syncs, and conservatively after reopening an initialized store.
+Relaxed mode preserves this durability floor once a FLUSH WAL or a slot pass, including the first pass at CREATE SLOT, starts its syncs, once a transaction COMMIT or a conditional write makes its rollback boundary durable, and conservatively after reopening an initialized store.
 Consequently a later checkpoint cannot discard an earlier barrier's durable state.
 
 Empty-chunk collection persists an empty-state frame where needed, removes the image before the WAL, and syncs these steps when durability requires it.
@@ -46,7 +46,7 @@ After a crash, a new process's barrier cannot recover acknowledged writes alread
 
 Conditional SET CHUNK (IF VERSION or IF ABSENT) first durably records its previous WAL boundary as CKRB, then writes the new state and commits by atomically publishing synced CKRC.
 In relaxed mode the new frame may stay in its group-commit batch after CKRC: the decision governs rollback, not durability, and a crash can lose the acknowledged write.
-Before commit, failure restores memory and truncates/removes the WAL to the previous boundary.
+Before commit, failure restores memory and truncates/removes the WAL to the previous boundary, synced in every mode before the intent is removed.
 Metadata and projected SET CHUNK always take this path; a whole-state SET CHUNK without a condition, a chunk's first write included, is an ordinary write.
 Transaction COMMIT records all changed chunks' durable boundaries as CKTB, appends and syncs one frame per changed chunk, then publishes synced CKTC before exposing the new states.
 Startup rolls back CKRB/CKTB boundaries and preserves CKRC/CKTC frames.

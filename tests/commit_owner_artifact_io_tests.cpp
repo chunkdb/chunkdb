@@ -11,6 +11,7 @@
 #include <vector>
 
 #include "checkpoint.hpp"
+#include "chunk_store_internal.hpp"
 #include "commit_owner_artifact_identity.hpp"
 #include "commit_owner_artifact_io.hpp"
 #include "directory_alias_test_utils.hpp"
@@ -471,15 +472,15 @@ void Crash(unsigned point, const std::filesystem::path& root) {
     SetDirectorySyncObserverForTests([&](const auto& path) {
         if ((point == 0U && path == root) ||
             (path == root / kObjects && ++object_directories == (point == 2U ? 1U : 2U) && (point == 2U || point == 4U)))
-            std::_Exit(86);
+            ExitAbruptly(86);
     });
     SetFileSyncObserverForTests([&](const auto& path) {
         const auto name = path.filename().string();
         if ((point == 1U && name.starts_with(".owner-marker-")) || (point == 3U && name.starts_with(".owner-stage-")))
-            std::_Exit(86);
+            ExitAbruptly(86);
     });
     (void)writer.StagePage(Page());
-    std::_Exit(87);
+    ExitAbruptly(87);
 }
 void CrashBoundaries(const std::filesystem::path& executable) {
     for (unsigned point = 0U; point <= 4U; ++point) {

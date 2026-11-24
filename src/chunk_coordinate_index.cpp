@@ -101,7 +101,7 @@ void WriteInventoryFile(const std::filesystem::path& path, const IndexInventoryH
     }, true, true, replaced, nullptr, false);
 }
 
-void Crash(const char* point) { if (ConsumeFailpointEnv(point)) std::_Exit(86); }
+void Crash(const char* point) { if (ConsumeFailpointEnv(point)) ExitAbruptly(86); }
 
 }  // namespace
 

@@ -539,7 +539,7 @@ int main(int argc, char** argv) {
     if (argc == 4 && (std::string(argv[1]) == "--crash" || std::string(argv[1]) == "--crash-recovering")) {
         Engine e(argv[2], true);
         Seed(e, argv[3]); Fence(e, argv[3]); WhileFenced(e, argv[3]);
-        if (std::string(argv[1]) == "--crash") std::_Exit(86);
+        if (std::string(argv[1]) == "--crash") ExitAbruptly(86);
         txn_test::ScopedEnv crash("CHUNKDB_FAILPOINT_CRASH_RECOVER_TABLE_AFTER_CLOSE_ONCE", "1");
         (void)e.Run("RECOVER TABLE realm");
         return 3;  // The failpoint must have ended the process.

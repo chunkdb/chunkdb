@@ -35,7 +35,7 @@ bool ResizeWalPreservingLinks(const std::filesystem::path& path, std::uint64_t s
         // Persist its replacement before publishing a new inode; directory
         // synchronization still follows the caller's durability contract.
         AtomicWrite(path, bytes, true, false, nullptr, nullptr, false);
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_REPLACE_AFTER_RENAME_ONCE")) std::_Exit(86);
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_REPLACE_AFTER_RENAME_ONCE")) ExitAbruptly(86);
         if (durable) SyncDirectoryPath(path.parent_path());
         return true;
     } else {
@@ -545,7 +545,7 @@ void ChunkStore::FlushWalBatch(
             output.write(reinterpret_cast<const char*>(chunk->wal_batch.data()),
                 static_cast<std::streamsize>(chunk->wal_batch.size() / 2U));
             output.flush();
-            std::_Exit(86);
+            ExitAbruptly(86);
         }
         output.write(
             reinterpret_cast<const char*>(chunk->wal_batch.data()),
@@ -554,7 +554,7 @@ void ChunkStore::FlushWalBatch(
         if (!output.good()) {
             throw std::system_error(output.error(), std::generic_category(), "failed to append WAL record batch: " + chunk->wal_path.string());
         }
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_BATCH_BEFORE_SYNC_ONCE")) std::_Exit(86);
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_BATCH_BEFORE_SYNC_ONCE")) ExitAbruptly(86);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE")) {
             throw std::runtime_error(
                 "injected WAL batch sync failure: " + chunk->wal_path.string());
@@ -710,6 +710,13 @@ void ChunkStore::MakeWalBoundaryDurableLocked(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
     bool own_stream) {
+    // A boundary starts a commit that syncs what it writes: a transaction,
+    // durable in every mode, or a conditional write, whose rollback relies
+    // on the synced WAL. From here on a checkpoint must not replace a WAL
+    // with an unsynced image, as after a barrier. A later checkpoint of this
+    // chunk takes its lock, held by the caller until the commit ends, and
+    // sees the floor.
+    barrier_durability_floor_.store(true, std::memory_order_release);
     if (chunk->wal_path.empty()) {
         chunk->wal_path = ChunkWalPath(data_dir_, geometry_, chunk_coord);
     }
