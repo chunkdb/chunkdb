@@ -12,7 +12,7 @@ namespace chunkdb {
 namespace {
 
 void Crash(const char* key) {
-    if (ConsumeFailpointEnv(key)) std::_Exit(86);
+    if (ConsumeFailpointEnv(key)) ExitAbruptly(86);
 }
 
 void ApplyFile(const std::filesystem::path& root, const MigrationFileChange& file, std::size_t index) {
