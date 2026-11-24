@@ -208,6 +208,16 @@ void ChunksMerge() {
     Refuse([&] { (void)merge.Add(first, 1U << 20U); }); // Positions only increase.
     merge.Clear();
     assert(merge.empty());
+
+    // A push that carries a message belongs to its own commit: it is sent alone.
+    auto with_message = std::make_shared<FeedEntry>(*Chunks(20U, std::nullopt, {{{0, 0, 0}, 20U, c}}));
+    with_message->messages.push_back({"orders", "paid"});
+    with_message->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*with_message));
+    const std::shared_ptr<const FeedEntry> published = with_message;
+    assert(FeedChunksEncodedBytes(*published) == published->protocol_frame->size());
+    const auto later = Chunks(21U, std::nullopt, {{{1, 0, 0}, 21U, c}});
+    assert(merge.Add(third, 1U << 20U) && !merge.Add(published, 1U << 20U) && merge.Take() == third);
+    assert(merge.Add(published, 1U << 20U) && !merge.Add(later, 1U << 20U) && merge.Take() == published);
 }
 
 void EmptyMetadataProjection() {

@@ -40,6 +40,7 @@ A checkpoint without slots drops the WAL and with it the message history, as it 
 
 A change whose commit published a message has one more element after `chunk_changes`: `messages`, an array of `[channel, message]`.
 A CHUNKS push likewise appends `messages` after `txn`.
+A lagging CHUNKS watch never merges a push that carries a message with other pushes.
 Other pushes keep their element count, so clients that read the elements they know keep working.
 AREA drops a change that keeps no data in its areas, with its message: a message belongs to its commit's data.
 COLUMNS, NO BEFORE and CHUNKS shape the data and never drop a change that carries a message, so a watch without AREA receives a published change even when it has no blocks.

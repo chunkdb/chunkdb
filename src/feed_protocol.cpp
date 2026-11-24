@@ -480,11 +480,19 @@ std::size_t ChunkItemBytes(std::uint8_t dims, const FeedChunkForm& chunk) noexce
     return 4U + SignedBytes(chunk.chunk.x) + SignedBytes(chunk.chunk.y) + (dims == 3U ? SignedBytes(chunk.chunk.z) : 0U) +
         NumberBytes(chunk.version) + (chunk.form ? BulkBytes(chunk.form->size()) : 3U);
 }
+// The trailing messages element, as AppendMessages writes it.
+std::size_t MessagesBytes(const std::vector<FeedMessage>& messages) noexcept {
+    if (messages.empty()) return 0U;
+    std::size_t bytes = NumberBytes(messages.size());
+    for (const auto& message : messages) bytes += 4U + BulkBytes(message.channel.size()) + BulkBytes(message.payload.size());
+    return bytes;
+}
 // Everything but the chunk items, for a push with `count` chunks.
 std::size_t ChunksHeaderBytes(const FeedEntry& entry, std::size_t count) {
-    return 4U + BulkBytes(6U) + BulkBytes(StoreIdHex(entry.position.epoch).size()) + NumberBytes(entry.position.revision) +
+    return (entry.messages.empty() ? 4U : 5U) + BulkBytes(6U) + BulkBytes(StoreIdHex(entry.position.epoch).size()) +
+        NumberBytes(entry.position.revision) +
         NumberBytes(entry.commit_time_ms) + (entry.user ? BulkBytes(entry.user->size()) : 3U) +
-        NumberBytes(entry.schema_version) + NumberBytes(count) + 6U;
+        NumberBytes(entry.schema_version) + NumberBytes(count) + 6U + MessagesBytes(entry.messages);
 }
 }
 std::size_t FeedChunksEncodedBytes(const FeedEntry& entry) {
@@ -511,6 +519,8 @@ bool FeedChunksMerge::Add(const std::shared_ptr<const FeedEntry>& entry, std::si
     if (entry->position.epoch != newest_->position.epoch || entry->position.revision <= newest_->position.revision ||
         entry->dims != newest_->dims) throw std::logic_error("merged chunks pushes are out of order");
     if (entry->schema_version != newest_->schema_version) return false;
+    // A message belongs to its own commit, so a push that carries one is never merged.
+    if (!entry->messages.empty() || !newest_->messages.empty()) return false;
     // A push names each chunk once, so each replaced chunk is counted once.
     auto bytes = item_bytes_;
     auto count = items_.size();

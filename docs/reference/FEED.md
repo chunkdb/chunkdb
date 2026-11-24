@@ -183,6 +183,7 @@ A CHUNKS watch lags while the server has output for it that its connection has n
 Its next pushes then merge into one `chunks` push, sent once that output is written: each chunk keeps its newest version and form, and the push takes the revision, `commit_time_ms` and `user` of the newest merged change.
 Applying a merged push gives the same table state as applying each change, and its revision covers all of them.
 A merged push stays within the watch's share and never spans a schema event; a watch that keeps up receives one push per change.
+A push whose commit [published a message](BLOCKS.md#publish) is never merged, so each message arrives in its own commit's push.
 For a slot, ACK of the merged revision acknowledges every merged change; after a reconnect from an earlier ACK, the slot sends those changes again.
 
 ## WATCH CATALOG

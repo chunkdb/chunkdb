@@ -63,11 +63,12 @@ std::size_t FeedChunksEncodedBytes(const FeedEntry& entry);
 // Merges consecutive chunks pushes of a lagging watch into one push. Each chunk
 // keeps its newest version and form, in the order chunks first appear; the push
 // takes the position, commit time and user of the newest merged push.
+// A push that carries a message is never merged: it is sent alone.
 class FeedChunksMerge {
   public:
     // Adds a chunks push above the merged ones. Returns false and changes
-    // nothing when its schema version differs from theirs or the merged push
-    // would encode to more than `limit` bytes.
+    // nothing when its schema version differs from theirs, either push carries
+    // a message, or the merged push would encode to more than `limit` bytes.
     bool Add(const std::shared_ptr<const FeedEntry>& entry, std::size_t limit);
     [[nodiscard]] bool empty() const noexcept { return newest_ == nullptr; }
     // The merged push with its frame, or the only push as it was added; empties the merge.
