@@ -27,8 +27,8 @@ error: OUT_OF_RANGE reason=out_of_range column coins does not hold -1: u16 holds
 ## Syntax
 
 ```text
-SET BLOCK x y [z] IN table column = value [, ...] [IF VERSION version | IF condition]
-DELETE BLOCK x y [z] FROM table [IF VERSION version | IF condition]
+SET BLOCK x y [z] IN table column = value [, ...] [IF VERSION version | IF condition] [RETURNING [OLD | NEW] (* | column, ...)]
+DELETE BLOCK x y [z] FROM table [IF VERSION version | IF condition] [RETURNING [OLD] (* | column, ...)]
 ```
 
 A `value` and a `condition` follow [Conditions](../CQL.md#conditions): columns, `chunk.column`, positions, `NOW()`, typed `$n` parameters and the same operators, types and NULL rules.
@@ -47,7 +47,9 @@ A refused statement changes nothing and produces no feed change.
 - `IF NOT EXISTS` writes only a new block, and `DELETE ... IF EXISTS AND ...` deletes only a present block.
 - IF VERSION combines with computed values but not with a condition.
 - A condition, like any write, needs WRITE on the table, which includes READ.
+- [RETURNING](BLOCKS.md#returns) reads the block under the same lock: OLD is the block the condition saw, NEW the block the write leaves.
+- With RETURNING, a false or unknown condition or an IF VERSION mismatch answers `applied` false with the chunk's version and no rows instead of an error.
 
 Inside a transaction, the condition and values read the transaction's view, including its own earlier writes.
-A condition, or a value that reads a block or chunk column, counts as a read of its chunk: COMMIT conflicts when another write changed that chunk.
+A condition, a value that reads a block or chunk column, or RETURNING counts as a read of its chunk: COMMIT conflicts when another write changed that chunk.
 A refused statement leaves the transaction open and takes none of its write room; `NOW()` is refused there, since the commit time is known only at COMMIT.
