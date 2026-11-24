@@ -1519,7 +1519,8 @@ class ChunkStore {
     // Once a barrier has drained the unsynced set, later relaxed-mode
     // checkpoint/GC replacement must not downgrade durable state by deleting
     // a WAL in favor of an unsynced image: neither one the barrier is still
-    // syncing nor one it has synced.
+    // syncing nor one it has synced. A transaction commit sets it too, as
+    // does opening an initialized store.
     std::atomic<bool> barrier_durability_floor_{false};
     // Set from a barrier's drain until its last sync ends, for
     // CheckpointPublishesDuringBarrierSyncsForTests.

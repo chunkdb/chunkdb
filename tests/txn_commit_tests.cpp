@@ -15,6 +15,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -26,6 +27,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "checkpoint.hpp"
 #include "txn_history.hpp"
 #include "store_manifest.hpp"
 #include "txn_test_utils.hpp"
@@ -587,8 +589,14 @@ void TestRelaxedBoundaryMakesImageDurable() {
         auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
         assert(store.CommitTransaction(*snapshot, {kA}, Writes(store, *snapshot, {{kA, 3}})) > 0U);
         assert(store.UnsyncedTrackedCountForTests() == 0U);
-
-        // The conditional write path, on another chunk.
+    }
+    // The conditional write path, in a new store: the commit above makes
+    // every later checkpoint of its store sync, as does reopening it.
+    ScopedTempDir conditional_dir("chunkdb-txn-commit-relaxed-image-cas");
+    auto conditional_config = config;
+    conditional_config.data_dir = conditional_dir.path();
+    {
+        ChunkStore store(conditional_config);
         WriteCounter(store, kB, 1);
         store.CheckpointForTests(kB.x, kB.y);
         WriteCounter(store, kB, 2);
@@ -602,7 +610,52 @@ void TestRelaxedBoundaryMakesImageDurable() {
         assert(store.UnsyncedTrackedCountForTests() == 1U);
     }
     ChunkStore reopened(config);
-    assert(ReadCounter(reopened, kA) == 3U && ReadCounter(reopened, kB) == 3U);
+    assert(ReadCounter(reopened, kA) == 3U);
+    ChunkStore conditional_reopened(conditional_config);
+    assert(ReadCounter(conditional_reopened, kB) == 3U);
+}
+
+// A table created in this process, in relaxed mode, has seen no barrier.
+// A committed transaction is durable in every mode, so a later checkpoint
+// of its chunk syncs the image and its directory before it removes the WAL
+// that holds the commit, as after a barrier or a reopen.
+void TestRelaxedCommitSetsDurabilityFloor() {
+    ScopedTempDir dir("chunkdb-txn-commit-relaxed-floor");
+    auto config = Config(dir.path(), chunkdb::DurabilityMode::kRelaxed);
+    config.checkpoint_update_interval = 1000;
+    config.checkpoint_wal_bytes = 1U << 20U;
+    config.wal_group_commit_updates = 1;
+    {
+        ChunkStore store(config);
+        // Directory syncs of a chunk's large-chunk directory while it is
+        // checkpointed.
+        const auto checkpoint_dir_syncs = [&](const ChunkCoord& coord) {
+            const auto large_dir = chunkdb::ChunkDataPath(store.data_dir(), store.geometry(), coord).parent_path();
+            std::mutex mutex;
+            std::size_t syncs = 0;
+            chunkdb::SetDirectorySyncObserverForTests([&](const std::filesystem::path& path) {
+                std::error_code ec;
+                if (std::filesystem::equivalent(path, large_dir, ec) && !ec) {
+                    std::lock_guard lock(mutex);
+                    ++syncs;
+                }
+            });
+            store.CheckpointForTests(coord.x, coord.y);
+            chunkdb::SetDirectorySyncObserverForTests({});
+            assert(std::filesystem::exists(chunkdb::ChunkDataPath(store.data_dir(), store.geometry(), coord)));
+            assert(!std::filesystem::exists(WalOf(store, coord)));
+            return syncs;
+        };
+        // Before the commit a relaxed checkpoint syncs nothing.
+        WriteCounter(store, kC, 1);
+        assert(checkpoint_dir_syncs(kC) == 0U);
+
+        auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+        assert(store.CommitTransaction(*snapshot, {}, Writes(store, *snapshot, {{kA, 7}})) > 0U);
+        assert(checkpoint_dir_syncs(kA) > 0U);
+    }
+    ChunkStore reopened(config);
+    assert(ReadCounter(reopened, kA) == 7U && ReadCounter(reopened, kC) == 1U);
 }
 
 // Few WAL streams, all held by chunks the commit only reads: the commit
@@ -924,6 +977,7 @@ int main(int argc, char** argv) {
     TestCommitRecordNotDurable();
     TestIntentsOnDisk();
     TestRelaxedBoundaryMakesImageDurable();
+    TestRelaxedCommitSetsDurabilityFloor();
     TestFewWalStreams();
     TestFailureAfterCommitPoint();
     return 0;

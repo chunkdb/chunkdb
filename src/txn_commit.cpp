@@ -581,6 +581,12 @@ std::uint64_t ChunkStore::CommitTransaction(
         return 0;
     }
 
+    // The commit is durable in every mode, so from here on a checkpoint must
+    // not replace a WAL with an unsynced image, as after a barrier. A later
+    // checkpoint of these chunks takes their locks, held until the commit
+    // ends, and sees the floor.
+    barrier_durability_floor_.store(true, std::memory_order_release);
+
     // Each WAL's size becomes a durable boundary the transaction can go back
     // to.
     for (std::size_t i = 0; i < changes.size(); ++i) {
