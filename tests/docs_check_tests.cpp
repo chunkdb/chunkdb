@@ -188,14 +188,18 @@ void ScanEpochPreservesCoordinatesAndRevisions() {
         "\nposition = 41\nretained_deletion_floor = 13\n";
     for (const auto& changed : {source, Replace(source, "[-1, 2, 37]", "[-1, 2, -3, 37]"),
              Replace(source, "position = 41", "position = NULL"),
-             Replace(source, "chunks:\n  1) [-1, 2, 37]", "chunks = []")}) {
+             Replace(source, "chunks:\n  1) [-1, 2, 37]", "chunks = []"),
+             Replace(source, "more = true\n", "more = true\nafter = [-1, 2]\n"),
+             Replace(source, "more = true\n", "more = false\nafter = NULL\n")}) {
         const auto expected = Replace(changed, epoch, "<epoch>");
         assert(Normalize(changed) == expected);
         assert(Normalize(Replace(changed, "\n", "\r\n")) == expected);
     }
     for (const auto& unrelated : {std::string("epoch = ") + epoch + "\n", Replace(source, "chunks:", "values:"),
              Replace(source, "[-1, 2, 37]", "[-1, 2]"),
-             Replace(source, "retained_deletion_floor = 13", "retained_deletion_floor = '13'")})
+             Replace(source, "retained_deletion_floor = 13", "retained_deletion_floor = '13'"),
+             Replace(source, "more = true\n", "more = true\nafter = [1]\n"),
+             Replace(source, "more = true\n", "more = true\nafter = 1\n")})
         assert(Normalize(unrelated) == unrelated);
 }
 

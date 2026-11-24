@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -12,6 +13,10 @@
 #include "chunkdb/schema.hpp"
 #include "chunkdb/change_feed.hpp"
 #include "users.hpp"
+
+namespace chunkdb::expr {
+struct Expression;
+}  // namespace chunkdb::expr
 
 // CQL statements (docs/CQL.md): parsed from one request line, not yet
 // executed.
@@ -165,6 +170,8 @@ struct Aggregate {
     std::int64_t z0 = 0;
     std::int64_t z1 = 0;
     std::uint8_t dims = 2;
+    // WHERE (expr.hpp): only the present blocks for which it is TRUE.
+    std::shared_ptr<const expr::Expression> where;
 };
 
 struct ColumnDefinition {
@@ -344,6 +351,8 @@ struct ScanChunks {
     std::optional<std::uint64_t> since;
     bool with_data = false;
     std::vector<std::string> columns;
+    // WHERE (expr.hpp): only the present blocks for which it is TRUE.
+    std::shared_ptr<const expr::Expression> where;
 };
 
 using MigrationStatement = std::variant<CreateTable, AlterTable, DropTable, GrantRight, CreateSlot, DropSlot>;

@@ -34,12 +34,35 @@ Bytes use hexadecimal literals such as `x'0a0bff'`.
 Bits use literals such as `b'1010'`, with the first digit representing the lowest bit.
 
 Trailing keyword options can appear in any order, each at most once.
-Client APIs supply binary `$n` parameters in these places: SET BLOCK values, the SET CHUNK form or META values, `VERIFIER $1` in CREATE USER and ALTER USER, HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
+Client APIs supply binary `$n` parameters in these places: SET BLOCK values, values in the WHERE of AGGREGATE and SCAN CHUNKS, the SET CHUNK form or META values, `VERIFIER $1` in CREATE USER and ALTER USER, HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
 See [Protocol](PROTOCOL.md#parameters) for encoding.
 
 Committed chunk versions are producing commit revisions, ordered only within the table epoch returned by DESCRIBE.
 DESCRIBE's schema `version` differs from its completed commit `revision`; read-only mode returns null for that frontier.
 Use IF VERSION for equality checks against the containing chunk, including changes to other blocks in that chunk.
+
+## Conditions
+
+AGGREGATE and SCAN CHUNKS take `WHERE condition` and keep only the present blocks for which the condition is true.
+
+```text
+condition := condition OR condition | condition AND condition | NOT condition | ( condition )
+           | EXISTS | value op value | value IS [NOT] NULL
+           | value [NOT] IN ( literal or $n, ... ) | value [NOT] BETWEEN value AND value | bool_column
+value     := literal | $n | column | chunk.column | POS_X | POS_Y | POS_Z | NOW()
+           | value + value | value - value | value * value | value / value | value % value | - value
+           | LEAST(value, ...) | GREATEST(value, ...) | COALESCE(value, ...) | ( value )
+op        := = | <> | < | <= | > | >=
+```
+
+- `column` is a block column and `chunk.column` a chunk column of the same chunk; quote a column named like a keyword: `"exists"`.
+- `POS_X`, `POS_Y` and `POS_Z` are the block's coordinates; `NOW()` is the time the statement starts, in milliseconds since the Unix epoch.
+- A literal or `$n` takes the type of the column it is compared or combined with; a parameter with no column beside it, as in `$1 < $2`, is refused.
+- Integers compute exactly; a result beyond 128 bits is `OUT_OF_RANGE`, and dividing an integer by zero is `INVALID_ARGUMENT`.
+- Text and bytes compare bytewise; bits and bool support `=` and `<>`.
+- A comparison with NULL is unknown, AND, OR and NOT follow three-valued logic, and a block whose condition is unknown is skipped.
+- Comparisons and arithmetic do not chain without parentheses: write `(a < b) AND (b < c)`, not `a < b < c`.
+- A condition has at most 256 values, columns, operators and list items, reported as `max_expression_nodes` by HELLO, and at most 32 levels.
 
 ## Related data
 

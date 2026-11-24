@@ -59,6 +59,7 @@ add_library(chunkdb_core STATIC
     src/backup_records.cpp
     src/backup_restore.cpp
     src/bit_codec.cpp
+    src/block_filter.cpp
     src/block_ops.cpp
     src/checkpoint.cpp
     src/chunk_cache.cpp

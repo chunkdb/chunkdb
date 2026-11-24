@@ -112,6 +112,7 @@ That count determines the number of following frames.
 Valid statements use unique indices from `$1` through `$n`; frames bind by numeric index even when references appear out of order.
 Each frame is `$<byte length>\r\n<bytes>\r\n`; `$-1\r\n` means NULL.
 These are data bytes and are never parsed as CQL text.
+A parameter in a WHERE condition is encoded as the type of the column it is compared or combined with.
 
 | Column / value | Parameter bytes |
 |---|---|
@@ -158,11 +159,12 @@ Never-written chunks and identities forgotten by tombstone compaction have null 
 Schema versions remain known for absent rows and empty areas; area consistency otherwise remains unchanged.
 Coordinate tuples contain exactly `dims` signed values: x and y, then z only in a three-dimensional table.
 SCAN CHUNKS returns a map with `chunks`, `more`, `epoch`, nullable completed `position`, and `retained_deletion_floor`.
+With WHERE, the map adds `after` after `more`: the coordinates of the last chunk the page visited, or null when `more` is false.
 Its rows are `[coordinates..., chunk_version]`, with a form-or-null appended under WITH DATA.
 Rows ascend by cx, then cy, then cz.
 SINCE includes retained deletions and refuses a revision below the deletion floor with `RESYNC_REQUIRED reason=history_lost floor=... epoch=...`, adding `current` when known.
 AGGREGATE returns a map from each function's lowercase name, such as `count(*)` or `sum(a)`, to its result, in statement order.
-With BY CHUNK it returns an array of rows `[coordinates..., results...]`, one per chunk with a present block, in coordinate order.
+With BY CHUNK it returns an array of rows `[coordinates..., results...]`, one per chunk with a present block that matches WHERE, in coordinate order.
 COUNT(*) is an integer; SUM, MIN and MAX of integer columns are integers or big numbers; AVG and float SUM are doubles; float MIN and MAX are doubles that keep the column value, so an f32 prints at f32 precision; a function over no value is null.
 See [AGGREGATE](reference/AGGREGATE.md#returns) for the rules.
 
