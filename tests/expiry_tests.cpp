@@ -210,7 +210,7 @@ void TestExpireColumnOption() {
         assert(!Contains(server.Run("DESCRIBE e"), "expire_column"));
         Expect(server.Run("MIGRATE 'add_expiry' ALTER TABLE e SET expire_column = deadline"), "+applied");
     }
-    // Option type 12 survives a restart.
+    // Option type 13 survives a restart.
     Server server(dir.path());
     Expect(server.Run("DESCRIBE e"), "$13\r\nexpire_column\r\n$8\r\ndeadline");
 }
