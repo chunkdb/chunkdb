@@ -1154,7 +1154,7 @@ std::string CommandEngine::RenderMetrics() const {
         if (table == nullptr) {
             continue;
         }
-        auto& state = states.emplace_back(MetricsRegistry::TableState{.table = info.name});
+        auto& state = states.emplace_back(MetricsRegistry::TableState{.table = info.name, .fenced = false, .slot_frontier_frozen = std::nullopt});
         const auto lease = table->TryAcquire();
         if (!lease.has_value()) {
             continue;
@@ -1167,7 +1167,7 @@ std::string CommandEngine::RenderMetrics() const {
         const auto at = std::lower_bound(states.begin(), states.end(), fence.table,
             [](const MetricsRegistry::TableState& state, const std::string& name) { return state.table < name; });
         if (at != states.end() && at->table == fence.table) at->fenced = true;
-        else states.insert(at, MetricsRegistry::TableState{.table = fence.table, .fenced = true});
+        else states.insert(at, MetricsRegistry::TableState{.table = fence.table, .fenced = true, .slot_frontier_frozen = std::nullopt});
     }
     return metrics_->RenderPrometheus(
         tables, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get()) +

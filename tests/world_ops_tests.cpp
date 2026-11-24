@@ -1369,8 +1369,9 @@ void TestMetricNamesFixed() {
             continue;
         }
         auto name = line.substr(0, line.find_first_of("{ "));
-        for (const std::string suffix : {"_bucket", "_sum", "_count"}) {
-            if (!actual.contains(name) && name.ends_with(suffix)) name.resize(name.size() - suffix.size());
+        for (const char* suffix : {"_bucket", "_sum", "_count"}) {
+            const std::string_view s(suffix);
+            if (!actual.contains(name) && name.ends_with(s)) name.resize(name.size() - s.size());
         }
         auto& labels = actual.at(name).second;
         auto at = line.find('{');
