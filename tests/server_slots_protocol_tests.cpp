@@ -587,6 +587,21 @@ void Lifecycle(bool tls) {
     assert(writer->Command("SHOW SLOTS ON t").items.empty());
 }
 
+// A DROP SLOT step of a migration of several steps ends the claim of a
+// watch that holds the slot, so the name can be created and watched again.
+void UnitDropsClaimedSlot(bool tls) {
+    Harness harness(tls);
+    auto writer = harness.Connect(); Create(*writer);
+    const auto table = harness.catalog->Find("t");
+    auto old = SlotWatch::Create(table, "consumer", {}); old->Activate();
+    const auto applied = writer->Command("MIGRATE 'drop_unit' ALTER TABLE t ADD COLUMN extra u8 NULL; DROP SLOT 'consumer' ON t");
+    assert(applied.type == '+' && applied.value == "applied");
+    assert(writer->Command("SHOW SLOTS ON t").items.empty() && harness.catalog->Find("t") == table);
+    writer->Ok("CREATE SLOT 'consumer' ON t");
+    auto fresh = SlotWatch::Create(table, "consumer", {}); fresh->Activate();
+    fresh->Unwatch();
+}
+
 void ConditionalObjects(bool tls) {
     Harness harness(tls, true);
     auto admin = harness.Connect();
@@ -2754,6 +2769,7 @@ int main(int argc, char** argv) {
         run("slot-record-outcome", SlotRecordOutcome);
         run("takeover-fence", TakeoverFence); run("takeover", Takeover); run("takeover-rights", TakeoverRights); run("takeover-UNWATCH-return", TakeoverUnwatchReturn); run("takeover-stalled-socket", TakeoverStalledSocket);
         run("takeover-cancellation", TakeoverCancellation);
+        run("migration-unit-drop-slot", UnitDropsClaimedSlot);
         run("lifecycle", Lifecycle); run("rights", Rights); run("watch-revoke", WatchRevoke); run("watch-revoke-dimensional", WatchRevokeDimensional); run("watch-ACK-revoke", WatchAckRevoke); run("watch-dropped-user", WatchDroppedUser); run("slot-owners", SlotOwners); run("first-attach-owner", FirstAttachOwner); run("archive-handover", ArchiveHandover);
         run("reconnect-revoke", ReconnectAfterRevoke); run("reconnect-ACK-timeout", ReconnectAfterAckTimeout); run("reconnect-write-deadline", ReconnectAfterWriteDeadline);
         run("durable-gate", DurableGate); run("lost-and-drop", LostAndDrop); run("replacement", ReplacementClaim);

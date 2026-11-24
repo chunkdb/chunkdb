@@ -928,6 +928,13 @@ void TestMigrationSteps() {
     ExpectError("MIGRATE 's' DROP TABLE t; SET BLOCK 0 0 IN t a=1", "each MIGRATE step is one schema statement");
     ExpectError("MIGRATE 's' DROP TABLE t; ALTER TABLE t RENAME TO u", "MIGRATE cannot rename a table");
     ExpectError("MIGRATE 's' DROP TABLE t DROP TABLE u; DROP TABLE v", "expected the end of the statement");
+    // A `;` inside a quoted value or a CHECK condition belongs to its step.
+    const auto quoted = Get<cql::Migrate>(
+        "MIGRATE 'quoted' ALTER TABLE t ADD COLUMN s text(8) DEFAULT 'a;b'; ALTER TABLE t ADD CHECK (s <> 'x;y')");
+    assert(quoted.then.size() == 1U);
+    const auto& added = std::get<cql::AddColumn>(std::get<cql::AlterTable>(quoted.statement).change);
+    assert(added.column.default_value == cql::Literal(cql::Text{.value = "a;b"}));
+    assert(std::get<cql::AddCheck>(std::get<cql::AlterTable>(quoted.then[0]).change).check.expression == "s <> 'x;y'");
     // `;` separates steps of MIGRATE only.
     ExpectError("DROP TABLE t; DROP TABLE u", "column 13: unexpected ';'");
     std::string many = "MIGRATE 'many' DROP TABLE t0";

@@ -46,6 +46,9 @@ const Operation kOperations[] = {
     {"unit_narrow", "ALTER TABLE realm ALTER COLUMN v TYPE u8; ALTER TABLE realm ADD COLUMN a u8 NULL", 2U, false},
     {"unit_slot", "ALTER TABLE realm ADD COLUMN a u8 NULL; CREATE SLOT 'second' ON realm COLUMNS (a); GRANT WRITE ON realm TO limited", 4U, false},
     {"unit_create", "CREATE TABLE realm (v u16 REQUIRED) CHUNK 2 x 2 LARGE 1 x 1; ALTER TABLE realm ADD COLUMN a u8 NULL; GRANT WRITE ON realm TO limited", 4U, true},
+    {"unit_check", "ALTER TABLE realm ADD CHECK (v < 100); ALTER TABLE realm ADD COLUMN a u8 NULL", 2U, false},
+    {"unit_drop_null", "ALTER TABLE realm ALTER COLUMN extra DROP NULL; ALTER TABLE realm ADD COLUMN a u8 NULL", 2U, false},
+    {"unit_grants", "REVOKE READ ON realm FROM limited; GRANT ADMIN ON realm TO limited", 2U, false},
 };
 
 // The number of steps of a migration statement.
@@ -94,6 +97,11 @@ StoreId Seed(const std::filesystem::path& root, const Operation& operation) {
     assert(e.Run(std::string("SET BLOCK 0 0 IN realm v=") + (std::string(operation.name) == "clamp" ? "300" : "7")).front() == ':');
     Reply(e.Run("FLUSH WAL"), "+OK\r\n");
     if (std::string(operation.name) == "drop_column") Reply(e.Run("ALTER TABLE realm ADD COLUMN extra u8 NULL"), "+OK\r\n");
+    if (std::string(operation.name) == "unit_drop_null") {
+        Reply(e.Run("ALTER TABLE realm ADD COLUMN extra u8 NULL"), "+OK\r\n");
+        assert(e.Run("SET BLOCK 0 0 IN realm v = 7, extra = 1").front() == ':');
+        Reply(e.Run("FLUSH WAL"), "+OK\r\n");
+    }
     if (std::string(operation.name).find("slot") != std::string::npos) {
         Reply(e.Run("CREATE SLOT 'first' ON realm"), "+OK\r\n");
         if (std::string(operation.name) == "drop_slot") Reply(e.Run("CREATE SLOT 'second' ON realm"), "+OK\r\n");
@@ -151,8 +159,18 @@ void Check(const std::filesystem::path& root, const Operation& operation, const 
         assert(table && table->store_id() == before);
         const auto info = table->Info();
         assert(!info.schema.pending && !ReadStoreManifest(root / "tables" / "realm")->schema.pending);
-        assert(info.schema.columns.size() == (applied ? 2U : 1U));
-        if (applied) assert(info.schema.columns[1].name == "a");
+        if (name == "unit_grants") {
+            // GRANT and REVOKE steps only: one users change, no table file.
+            assert(info.schema.version == 1U && info.schema.columns.size() == 1U);
+            assert(e.users->Find("limited")->grants.at("realm") == (applied ? Right::kAdmin : Right::kRead));
+            assert(e.Run("GET BLOCK 0 0 FROM realm COLUMNS v").find(":7\r\n") != std::string::npos);
+            return;
+        }
+        const std::size_t seeded = name == "unit_drop_null" ? 2U : 1U;
+        assert(info.schema.columns.size() == seeded + (applied ? 1U : 0U));
+        if (applied) assert(info.schema.columns.back().name == "a");
+        if (name == "unit_check") assert(info.schema.checks.size() == (applied ? 1U : 0U));
+        if (name == "unit_drop_null") assert(info.schema.columns[1].name == "extra" && info.schema.columns[1].nullable != applied);
         if (name == "unit_alter") {
             assert(info.schema.columns.front().name == (applied ? "renamed" : "v"));
             assert(info.options.checkpoint_update_interval == (applied ? 64U : Config(root).default_options.checkpoint_update_interval));

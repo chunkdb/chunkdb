@@ -975,10 +975,17 @@ void UnitsAllOrNothing() {
         Reply(e.Run("MIGRATE 'again' CREATE TABLE IF NOT EXISTS fresh (v u8) CHUNK 2 x 2; ALTER TABLE fresh ADD COLUMN x u8 NULL"),
               "+applied\r\n");
         assert(e.catalog->Find("fresh") == fresh && fresh->Info().schema.version == 3U);
+        // The most steps a migration takes, through the engine.
+        std::string wide = "CREATE TABLE wide (v u8) CHUNK 2 x 2";
+        for (std::size_t i = 1U; i < cql::kMaxMigrationSteps; ++i) wide += "; ALTER TABLE wide ADD COLUMN c" + std::to_string(i) + " u8 NULL";
+        Reply(e.Run("MIGRATE 'wide' " + wide), "+applied\r\n");
+        const auto info_wide = e.catalog->Find("wide")->Info();
+        assert(info_wide.schema.columns.size() == cql::kMaxMigrationSteps && info_wide.schema.version == cql::kMaxMigrationSteps);
+        Error(e.Run("MIGRATE 'wider' " + wide + "; ALTER TABLE wide ADD COLUMN extra u8 NULL"), "SYNTAX");
     }
     Engine e(dir.path());
     assert(e.catalog->Find("realm")->Info().schema.version == 3U && e.catalog->Find("realm")->ListFeedSlots().size() == 1U);
-    assert(e.catalog->Find("fresh")->Info().schema.version == 3U && e.catalog->Migrations().size() == 4U);
+    assert(e.catalog->Find("fresh")->Info().schema.version == 3U && e.catalog->Migrations().size() == 5U);
     Reply(e.Run("MIGRATE 'unit' " + unit), "+skipped\r\n");
 }
 

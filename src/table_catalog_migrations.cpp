@@ -575,7 +575,6 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
     RequireMigrationUnit(steps);
     const bool grants_only = std::all_of(steps.begin(), steps.end(), [](const auto* step) { return step->kind == Kind::kGrant; });
     const bool creates = request.kind == Kind::kCreate;
-    const bool creates_slot = std::any_of(steps.begin(), steps.end(), [](const auto* step) { return step->kind == Kind::kCreateSlot; });
     if (!feature_metadata_gate_.lock_shared(request.cancelled)) throw std::runtime_error("migration cancelled");
     std::shared_lock feature_metadata(feature_metadata_gate_, std::adopt_lock);
     if (config_.allow_multiple_processes) throw std::invalid_argument("MIGRATE requires a single-process catalog");
@@ -782,8 +781,8 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
         std::vector<std::string> dropped_slots;
         std::optional<Users> next_users;
         std::uint64_t completed = 0U;
-        // The table's slot records, read once at the first slot step; a CREATE
-        // SLOT step syncs the feed baseline first, as Migrate does.
+        bool baseline_prepared = false;
+        // The table's slot records, read once at the first slot step.
         const auto load_slots = [&] {
             if (slots) return;
             if (created)
@@ -791,14 +790,25 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
             if (store->allow_multiple_processes_) throw std::invalid_argument("feed slots require a single-process table");
             std::unique_lock eviction(store->resources_->stores_mutex_);
             const auto dims = store->geometry().dims();
-            if (creates_slot) {
-                RequireFeature(store->features(), *FindFeature("feed_slots"));
-                table->PrepareFeedSlotBaseline(*store);
-                completed = store->version_clock_.load(std::memory_order_seq_cst) - 1U;
-                store->feed_slots_->Sync(completed);
-            }
+            slots = ReadFeedSlotRecords(table->dir_, journal.table_id, dims).value_or(
+                FeedSlotRecords{.epoch = journal.table_id, .durable_watermark = 0U, .slots = {}, .dims = dims});
+        };
+        // Before the first slot a step really creates, after that step's
+        // checks, as Migrate does: syncs the feed baseline and reads the
+        // records again, keeping the drops of the steps before it. No slot
+        // was created before, so the drops are all the earlier changes.
+        const auto prepare_baseline = [&] {
+            if (baseline_prepared) return;
+            baseline_prepared = true;
+            std::unique_lock eviction(store->resources_->stores_mutex_);
+            const auto dims = store->geometry().dims();
+            table->PrepareFeedSlotBaseline(*store);
+            completed = store->version_clock_.load(std::memory_order_seq_cst) - 1U;
+            store->feed_slots_->Sync(completed);
             slots = ReadFeedSlotRecords(table->dir_, journal.table_id, dims).value_or(
                 FeedSlotRecords{.epoch = journal.table_id, .durable_watermark = completed, .slots = {}, .dims = dims});
+            for (const auto& name : dropped_slots)
+                std::erase_if(slots->slots, [&](const auto& slot) { return slot.name == name; });
         };
         // The users as the steps change them, read once at the first GRANT or
         // REVOKE step under the registry's lock, as Migrate reads them.
@@ -886,6 +896,7 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
                 case Kind::kCreateSlot: {
                     RequireValidFeedSlotName(step.slot);
                     load_slots();
+                    RequireFeature(store->features(), *FindFeature("feed_slots"));
                     const auto dims = store->geometry().dims();
                     // Columns are named in the schema the earlier steps left.
                     const auto filters = MigrationSlotFilters(step, dims, manifest.schema);
@@ -901,6 +912,7 @@ bool TableCatalog::MigrateUnit(const MigrationRequest& request, UserRegistry* us
                     (void)SerializeFeedSlotRecords(FeedSlotRecords{.epoch = journal.table_id, .durable_watermark = 0U,
                         .slots = {{step.slot, 0U, false, filters, false, step.slot_owner}}, .dims = dims});
                     if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
+                    prepare_baseline();
                     slots->slots.push_back({step.slot, completed, false, filters, false, step.slot_owner});
                     slots->filter_format = slots->filter_format || !filters.empty();
                     slots_changed = true;
