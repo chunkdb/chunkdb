@@ -61,6 +61,13 @@ void TestClientSide() {
     assert(final_message.server_signature == "v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4=");
     ExpectInvalid([&] { (void)scram::FinishClientLogin(login, "pencil", "r=other,s=AAAA,i=4096"); }, "does not continue");
     ExpectInvalid([&] { (void)scram::FinishClientLogin(login, "pencil", "nonsense"); }, "not a SCRAM server-first");
+    // An iteration count outside what a verifier may hold is refused before
+    // any PBKDF2 round runs.
+    const std::string server_nonce = std::string("r=") + kClientNonce + "%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=";
+    for (const char* count : {"1", "4095", "1000001", "4294967295"}) {
+        ExpectInvalid([&] { (void)scram::FinishClientLogin(login, "pencil", server_nonce + count); }, "SCRAM iterations, outside");
+    }
+    (void)scram::FinishClientLogin(login, "pencil", server_nonce + "1000000");
 }
 
 void TestWrongPassword() {

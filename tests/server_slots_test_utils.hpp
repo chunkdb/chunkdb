@@ -518,8 +518,7 @@ inline std::uint64_t Change(const Reply& reply, std::size_t blocks = 1U) {
     assert(reply.items[9].type == '*' && reply.items[9].items.empty());
     return Number(reply.items[2]);
 }
-inline Reply NextChange(Client& client) {
-    auto reply = client.Read();
+inline Reply ChangeFrom(Client& client, Reply reply) {
     if (reply.type == '>' && !reply.items.empty() && reply.items[0].value == "schema") {
         assert(reply.items.size() == 2U && reply.items[1].type == '%');
         const auto& metadata = reply.items[1];
@@ -532,6 +531,14 @@ inline Reply NextChange(Client& client) {
     }
     (void)Change(reply, reply.items.size() == 10U ? reply.items[6].items.size() : 0U);
     return reply;
+}
+inline Reply NextChange(Client& client) { return ChangeFrom(client, client.Read()); }
+// A watch that idles for its progress interval receives a progress push, so a
+// fixture with a short interval can read progress before a change on a slow host.
+inline Reply NextChangeAfterProgress(Client& client) {
+    auto reply = client.Read();
+    while (reply.type == '>' && reply.items.size() == 3U && reply.items[0].value == "progress") reply = client.Read();
+    return ChangeFrom(client, std::move(reply));
 }
 inline void Error(const Reply& reply, std::string_view code) {
     assert(reply.type == '-' && reply.value.rfind("ERR " + std::string(code), 0) == 0);

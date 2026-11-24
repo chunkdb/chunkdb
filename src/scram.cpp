@@ -277,6 +277,12 @@ ClientFinal FinishClientLogin(
     if (!salt.has_value() || parsed.ec != std::errc() || parsed.ptr != text.data() + text.size() || iterations == 0U) {
         throw std::invalid_argument("not a SCRAM server-first message");
     }
+    // As ParseVerifier: a server must not make a login spend unbounded work.
+    if (iterations < kMinIterations || iterations > kMaxIterations) {
+        throw std::invalid_argument("the server asks for " + std::to_string(iterations) +
+                                    " SCRAM iterations, outside " + std::to_string(kMinIterations) + ".." +
+                                    std::to_string(kMaxIterations));
+    }
     const auto salted = crypto::Pbkdf2Sha256(crypto::Bytes(password), *salt, iterations);
     const auto client_key = crypto::HmacSha256(salted, crypto::Bytes("Client Key"));
     const auto stored_key = crypto::Sha256Of(client_key);

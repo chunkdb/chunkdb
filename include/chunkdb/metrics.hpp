@@ -4,6 +4,7 @@
 #include <atomic>
 #include <cstddef>
 #include <cstdint>
+#include <span>
 #include <string>
 #include <string_view>
 
@@ -11,9 +12,16 @@
 
 namespace chunkdb {
 
+// The store counters of one table, rendered with its name as the `table`
+// label.
+struct TableRuntimeStats {
+    std::string table;
+    StoreRuntimeStats stats{};
+};
+
 // Thread-safe runtime metrics with bounded label cardinality: every label
-// value comes from the fixed enums below. Rendered in the Prometheus text
-// exposition format; durations are reported in seconds.
+// value comes from the fixed enums below or names a table. Rendered in the
+// Prometheus text exposition format; durations are reported in seconds.
 class MetricsRegistry {
   public:
     enum class CommandClass : std::size_t {
@@ -65,8 +73,13 @@ class MetricsRegistry {
 
     [[nodiscard]] static ErrorClass ClassifyErrorCode(std::string_view error_code) noexcept;
 
+    // `value` as a label value: backslash, double quote and line feed escaped.
+    [[nodiscard]] static std::string EscapeLabelValue(std::string_view value);
+
+    // Store counters come as one sample per table, labelled `table`, in the
+    // order of `tables`.
     [[nodiscard]] std::string RenderPrometheus(
-        const StoreRuntimeStats& store_stats,
+        std::span<const TableRuntimeStats> tables,
         std::size_t loaded_chunks, const StoreResources* resources = nullptr) const;
 
   private:

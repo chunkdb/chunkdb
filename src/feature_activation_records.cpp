@@ -22,7 +22,7 @@ constexpr std::array<std::uint8_t, 4> kMagic{'C', 'K', 'F', 'A'};
 [[noreturn]] void Bad(const std::string& why) {
     throw std::runtime_error("invalid feature activation metadata: " + why);
 }
-void Crash(const char* name) { if (ConsumeFailpointEnv(name)) std::_Exit(86); }
+void Crash(const char* name) { if (ConsumeFailpointEnv(name)) ExitAbruptly(86); }
 
 void ValidateStructure(const FeatureActivationJournal& journal) {
     if (journal.data_dir_id == StoreId{}) Bad("zero data-directory identity");
