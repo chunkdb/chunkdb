@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- The frozen slot frontier case of the RECOVER TABLE tests writes a block after CREATE SLOT, whose baseline checkpoint removes the chunk's WAL, so that the injected failure truncates a WAL and fails the store closed; on an empty WAL the failed append rolled back cleanly and the test failed (#149).
 - DROP TABLE waits for a running BACKUP to pin its tables and save the users file, as ALTER TABLE ... RENAME TO and SWAP TABLES do; before, a backup could hold a table without the grants on it when the table was dropped between its pin and the end of the backup's metadata capture (#306).
 - RECOVER TABLE leaves the private copy of a RESTORE TABLE that is still copying into the same name; before, it removed that copy and the restore failed (#306).
 - SHOW METRICS adds the gauges `chunkdb_table_fenced`, 1 for each fenced table, also one out of service, and 0 for each other table, and `chunkdb_slot_frontier_frozen`, 1 for each serving table with a slot whose store failed closed after a durability failure, so that its slots' durable revision stays until RECOVER TABLE or a restart, both labelled `table`; a table that is not serving keeps its `chunkdb_table_fenced` sample. Metric names, types and label names are fixed for 2.x, listed in the exporter guide (#149).
