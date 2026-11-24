@@ -43,7 +43,7 @@ constexpr std::array<std::uint8_t, 4> kMagic{'C', 'K', 'B', 'P'};
 void Cancelled(const BackupCancel& cancelled) {
     if (cancelled.stop_requested()) throw std::runtime_error("backup cancelled");
 }
-void Crash(const char* point) noexcept { if (ConsumeFailpointEnv(point)) std::_Exit(86); }
+void Crash(const char* point) noexcept { if (ConsumeFailpointEnv(point)) ExitAbruptly(86); }
 bool Present(const std::filesystem::path& path) {
     const auto status = std::filesystem::symlink_status(path);
     return status.type() != std::filesystem::file_type::not_found;

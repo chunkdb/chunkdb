@@ -6,11 +6,13 @@
 #include <filesystem>
 #include <fstream>
 #include <functional>
+#include <mutex>
 #include <string>
 #include <thread>
 #include <utility>
 #include <vector>
 
+#include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/crc32.hpp"
@@ -545,6 +547,77 @@ void TestFailedFlushBeforeConditionalWrite() {
     std::filesystem::remove_all(dir);
 }
 
+// A rejected conditional write in relaxed mode cuts its frame off the WAL
+// and syncs the cut before it removes its rollback intent, as a rolled-back
+// transaction does: once the intent is gone, nothing would cut the rejected
+// frame off after a crash.
+void TestRejectedRelaxedConditionalSyncsTruncation() {
+    const auto dir = TempDataDir("relaxed-cas-reject");
+    auto config = BuildConfig(dir);
+    config.wal_group_commit_updates = 1;  // the rejected frame reaches the WAL
+    const chunkdb::Geometry geometry(config.geometry);
+    const auto wal = chunkdb::ChunkWalPath(dir, geometry, {0, 0});
+    const auto intent_dir = chunkdb::ConditionalIntentDirectory(dir);
+    {
+        chunkdb::ChunkStore store(config);
+        store.SetBlockBits(0, 0, "00000001");
+        const std::vector<std::uint8_t> payload(16, 0x07);
+        const std::vector<std::uint8_t> presence(2, 0xFF);
+        // File (true) and directory (false) syncs, in order.
+        std::mutex mutex;
+        std::vector<std::pair<bool, std::filesystem::path>> syncs;
+        const auto note = [&](bool file) {
+            return [&, file](const std::filesystem::path& path) {
+                std::lock_guard lock(mutex);
+                syncs.emplace_back(file, path);
+            };
+        };
+        chunkdb::SetFileSyncObserverForTests(note(true));
+        chunkdb::SetDirectorySyncObserverForTests(note(false));
+        SetEnvVar("CHUNKDB_FAILPOINT_CONDITIONAL_AFTER_WAL_APPEND_ONCE", "1");
+        bool rejected = false;
+        try {
+            (void)store.CasChunkStateBytes(0, 0, store.GetChunkVersion(0, 0), payload, presence);
+        } catch (const std::exception&) {
+            rejected = true;
+        }
+        UnsetEnvVar("CHUNKDB_FAILPOINT_CONDITIONAL_AFTER_WAL_APPEND_ONCE");
+        chunkdb::SetFileSyncObserverForTests({});
+        chunkdb::SetDirectorySyncObserverForTests({});
+        assert(rejected);
+        const auto same = [](const std::filesystem::path& lhs, const std::filesystem::path& rhs) {
+            std::error_code ec;
+            return std::filesystem::equivalent(lhs, rhs, ec) && !ec;
+        };
+        // The last two syncs of the intent directory publish the intent and
+        // remove it; the WAL is synced between them.
+        constexpr auto kNone = static_cast<std::size_t>(-1);
+        std::size_t published = kNone;
+        std::size_t removed = kNone;
+        for (std::size_t i = 0; i < syncs.size(); ++i) {
+            if (!syncs[i].first && same(syncs[i].second, intent_dir)) {
+                published = removed;
+                removed = i;
+            }
+        }
+        assert(published != kNone && removed != kNone);
+        bool wal_synced = false;
+        for (std::size_t i = published + 1U; i < removed; ++i) {
+            wal_synced = wal_synced || (syncs[i].first && same(syncs[i].second, wal));
+        }
+        assert(wal_synced);
+        assert(store.GetBlockBits(0, 0) == "00000001");
+        store.SetBlockBits(1, 0, "00000011");
+    }
+    {
+        chunkdb::ChunkStore reopened(config);
+        assert(reopened.GetBlockBits(0, 0) == "00000001");
+        assert(reopened.GetBlockBits(1, 0) == "00000011");
+        assert(!reopened.BlockExists(2, 0));
+    }
+    std::filesystem::remove_all(dir);
+}
+
 // A write whose WAL append fails and cannot be repaired leaves its frame in
 // the WAL while memory is rolled back. Eviction must not drop that memory:
 // a reload would serve the write that failed.
@@ -703,6 +776,7 @@ int main() {
     TestCollectionAfterGappedWal();
     TestRollbackBoundaryCoversTheBatch();
     TestFailedFlushBeforeConditionalWrite();
+    TestRejectedRelaxedConditionalSyncsTruncation();
     TestFailedOrdinaryRepairKeepsChunkCached();
     TestUndurableCommitReportsUnknownOutcome();
     TestCleanCloseSyncsUnsyncedWrites();

@@ -220,7 +220,7 @@ bool ChunkStore::CheckpointChunk(
         // history. The archive keeps each individual frame, including relaxed
         // group-commit frames that ordinary checkpoints absorb into the image.
         FlushWalBatch(chunk_coord, chunk, false);
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_WAL_FLUSH_ONCE")) std::_Exit(86);
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_WAL_FLUSH_ONCE")) ExitAbruptly(86);
     }
     SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
     bool image_committed = false;
@@ -290,7 +290,7 @@ bool ChunkStore::CheckpointChunk(
                     .revision = chunk->version, .commit_time_ms = chunk->commit_time_ms,
                     .schema_version = geometry_.chunk_schema().version});
                 // The tombstone is durable; the image and WAL still hold the same empty state.
-                if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_EMPTY_GC_AFTER_TOMBSTONE_ONCE")) std::_Exit(86);
+                if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_EMPTY_GC_AFTER_TOMBSTONE_ONCE")) ExitAbruptly(86);
             }
             // Empty-chunk garbage collection: a chunk with no present blocks
             // is observably identical to an absent chunk, so its storage
@@ -379,7 +379,7 @@ bool ChunkStore::CheckpointChunk(
                 "injected checkpoint failure after image replacement");
         }
         PauseCheckpointBeforeWalRemovalForTests();
-        if (archive_enabled && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_IMAGE_PUBLISH_ONCE")) std::_Exit(86);
+        if (archive_enabled && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_IMAGE_PUBLISH_ONCE")) ExitAbruptly(86);
         if (!files.active) CloseWalAppendStream(chunk);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CHECKPOINT_WAL_REMOVE_FAIL_ONCE")) {
             throw std::runtime_error(
@@ -418,7 +418,7 @@ bool ChunkStore::CheckpointChunk(
         if (!archive_path.empty()) {
             SyncDirectoryPath(archive_path.parent_path());
             SyncDirectoryPath(wal_path.parent_path());
-            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_WAL_RENAME_ONCE")) std::_Exit(86);
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_WAL_RENAME_ONCE")) ExitAbruptly(86);
         }
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_EMPTY_GC_AFTER_WAL_REMOVE_ONCE")) {
             throw std::runtime_error(

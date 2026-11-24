@@ -418,7 +418,7 @@ class MappedSnapshotCounter {
 
 void CrashAtSnapshotFailpoint(const char* key) {
     if (ConsumeFailpointEnv(key)) {
-        std::_Exit(86);
+        ExitAbruptly(86);
     }
 }
 
