@@ -117,9 +117,10 @@ class UserRegistry {
     // or none.
     using TableGrants = std::map<std::string, std::optional<Right>>;
     // Gives `to` the grants on `from`, keeping a user's higher right where
-    // both have one, for a table renamed from `from` to `to`; returns what
-    // RestoreTableGrants needs to take the change back.
-    [[nodiscard]] TableGrants CopyTableGrants(const std::string& from, const std::string& to);
+    // both have one, for a table renamed from `from` to `to`. Sets `previous`
+    // to what RestoreTableGrants needs to take the change back, also when it
+    // throws UsersOutcomeUnknownError.
+    void CopyTableGrants(const std::string& from, const std::string& to, TableGrants& previous);
     void RestoreTableGrants(const std::string& to, const TableGrants& previous);
     [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
     void SetMigrationHealth(std::shared_ptr<MigrationHealth> health);

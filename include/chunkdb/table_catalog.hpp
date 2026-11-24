@@ -533,9 +533,14 @@ class TableCatalog {
     // opens it under `new_name` as a new Table; epoch, slots and data stay.
     // With `users`, the grants on `name` move to `new_name`, a user's
     // higher right kept where both names have one. After a crash the table
-    // has one of the two names. A failure after the rename fences `new_name`
+    // has one of the two names. A failure to make the rename durable fences
+    // both names, a failure to open the renamed table fences `new_name`,
     // until RecoverTable or a restart. `cancelled` ends the waits.
     void RenameTable(std::string_view name, std::string_view new_name, UserRegistry* users, std::stop_token cancelled = {});
+    // Runs `change`, a GRANT or REVOKE, inside catalog admission, as DROP
+    // TABLE, RENAME TO and MIGRATE change grants: it sees their grant
+    // changes whole, before or after.
+    void ChangeGrants(const std::function<void()>& change);
 
     void SetMigrationTestHook(MigrationTestHook* hook) noexcept { migration_health_->hook.store(hook, std::memory_order_release); }
     [[nodiscard]] bool Migrate(const MigrationRequest& request, UserRegistry* users);

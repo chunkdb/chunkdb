@@ -1857,7 +1857,8 @@ class ChunkStore {
         std::size_t block_index,
         std::string_view bits,
         bool present);
-    // The bit-string commands need a table with one bits(N) column.
+    // The bit-string commands need a table with one bits(N) column that is
+    // not NULL.
     void RequireBitStringBlocks() const;
     // While a narrowing is in progress, throws std::invalid_argument when a
     // whole-chunk write's state holds a value of that column the narrower

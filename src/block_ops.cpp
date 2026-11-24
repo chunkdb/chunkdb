@@ -483,7 +483,7 @@ ChunkMutationResult ChunkStore::UnsetBlockAtAddress(const ChunkCoord& chunk_coor
 
 void ChunkStore::RequireBitStringBlocks() const {
     if (!geometry_.layout().bit_string_blocks()) {
-        throw std::invalid_argument("bit strings need a table with one bits(N) column; this table has columns");
+        throw std::invalid_argument("bit strings need a table with one bits(N) column that is not NULL");
     }
 }
 

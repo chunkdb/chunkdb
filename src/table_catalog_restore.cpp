@@ -451,7 +451,7 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     const std::filesystem::path new_dir = TablesDir() / to;
     // Made now, so that fencing and publishing do not allocate.
     auto fence = PrepareFence(table, to, kFenceRenameUnknown);
-    auto refused_fence = PrepareFence(table, from, kFenceRenameRefusedReopen);
+    auto old_fence = PrepareFence(table, from, kFenceRenameRefusedReopen);
     auto entry = PrepareServed(to);
     const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     const std::string store_dir = store->data_dir().string();
@@ -461,7 +461,24 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     // The grants move first: a crash from here leaves them on both names,
     // never on neither. A failure here still serves the table unchanged.
     UserRegistry::TableGrants copied;
-    if (users) copied = users->CopyTableGrants(from, to);
+    // Takes back the grants given to the new name, which no table then has.
+    const auto take_back_grants = [&] {
+        try {
+            users->RestoreTableGrants(to, copied);
+        } catch (const std::exception& error) {
+            LogMessage(LogLevel::kWarn, LogComponent::kStore,
+                "grants given to the new name of a table whose rename failed could not be taken back; REVOKE them",
+                {{"table", from}, {"name", to}, {"error", error.what()}});
+        }
+    };
+    if (users) {
+        try {
+            users->CopyTableGrants(from, to, copied);
+        } catch (const UsersOutcomeUnknownError&) {
+            take_back_grants();
+            throw;
+        }
+    }
     serving.Dismiss();
     store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
@@ -470,15 +487,7 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
         ? std::make_error_code(std::errc::io_error) : MoveDirectoryNoReplace(old_dir, new_dir);
     if (moved) {
         // Nothing moved: the table serves again under its name.
-        if (users) {
-            try {
-                users->RestoreTableGrants(to, copied);
-            } catch (const std::exception& error) {
-                LogMessage(LogLevel::kWarn, LogComponent::kStore,
-                    "grants given to the new name of a table whose rename failed could not be taken back; REVOKE them",
-                    {{"table", from}, {"name", to}, {"error", error.what()}});
-            }
-        }
+        if (users) take_back_grants();
         try {
             auto reopened = OpenStore(from, old_dir, table->geometry().config(), 0U, options);
             reopened->AdoptUnsynced(*unsynced);
@@ -487,7 +496,7 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
             LogMessage(LogLevel::kError, LogComponent::kStore,
                 "table could not be reopened after a refused rename; it is fenced until RECOVER TABLE or a restart",
                 {{"table", from}, {"error", error.what()}});
-            FenceTable(*table, options, std::move(refused_fence));
+            FenceTable(*table, options, std::move(old_fence));
         }
         if (moved == std::errc::file_exists)
             throw TableExistsError("cannot rename table '" + from + "': " + new_dir.string() +
@@ -500,12 +509,19 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
             throw std::runtime_error("injected directory sync failure after renaming a table");
         SyncDirectoryPath(TablesDir());
     } catch (const std::exception& error) {
-        // Renamed now, but a crash could still undo it: the new name does
-        // not serve until a recovery opens what its directory holds.
+        // Renamed now, but a crash could still undo it: as after a failed
+        // swap, neither name serves until a recovery opens what its
+        // directory holds, and the grants stay on both names.
         LogMessage(LogLevel::kError, LogComponent::kStore,
-            "renamed table could not be made durable; it is fenced until RECOVER TABLE or a restart",
+            "renamed table could not be made durable; both names are fenced until RECOVER TABLE or a restart",
             {{"table", from}, {"name", to}, {"error", error.what()}});
         table->ended_.store(kWatchRenamed, std::memory_order_release);
+        old_fence.mapped().reason = kFenceRenameUnknown;
+        {
+            std::unique_lock lock(tables_mutex_);
+            // A node insert does not allocate.
+            fenced_.insert(std::move(old_fence));
+        }
         FenceTable(*table, options, std::move(fence));
         throw;
     }
@@ -534,6 +550,16 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
         fence.mapped().reason = kFenceRenameReopen;
         table->ended_.store(kWatchRenamed, std::memory_order_release);
         FenceTable(*table, options, std::move(fence));
+        // The rename is durable, so the old name is free and keeps no grants.
+        if (users) {
+            try {
+                users->ForgetTable(from);
+            } catch (const std::exception& forget_error) {
+                LogMessage(LogLevel::kWarn, LogComponent::kStore,
+                    "grants on the old name of a renamed table could not be removed; REVOKE them",
+                    {{"table", from}, {"name", to}, {"error", forget_error.what()}});
+            }
+        }
         throw;
     }
     // Connections holding the old table find no table of its name; its

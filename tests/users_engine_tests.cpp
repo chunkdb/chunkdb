@@ -4,6 +4,10 @@
 #include <algorithm>
 #include <cassert>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <future>
 #include <barrier>
 #include <thread>
 #include <cstdio>
@@ -358,6 +362,56 @@ void TestRenameTableGrants() {
     assert(server.Run(bot, "SET BLOCK 0 0 IN archive bits = b'1010'").rfind(":", 0) == 0);
     ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM logs"), "NO_TABLE");
     ExpectError(server.Run(carol, "ALTER TABLE archive RENAME TO logs"), "PERMISSION_DENIED ADMIN on logs");
+}
+
+// Runs `at_forget` on the second users change of this thread's rename: the
+// removal of the old name's grants, after they were copied to the new name.
+struct PauseRenameGrants final : chunkdb::MigrationTestHook {
+    std::atomic<int> calls{0};
+    std::function<void()> at_forget;
+    void Run(Point point, std::string_view) override {
+        if (point == Point::kBeforeUserUpdate && ++calls == 2) at_forget();
+    }
+};
+
+// RENAME TO takes back grants whose copy has an unknown outcome, leaves no
+// grants on the old name of a table it renamed but could not open, and a
+// REVOKE waits for the whole rename.
+void TestRenameGrantFailures() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    SessionState other_admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE TABLE logs (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("pw")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT WRITE ON logs TO bot"), "+OK\r\n");
+    const auto grants = [&] { return server.users->Find("bot")->grants; };
+    {
+        chunkdb::txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
+        ExpectError(server.Run(admin, "ALTER TABLE logs RENAME TO archive"), "OUTCOME_UNKNOWN");
+    }
+    assert(server.catalog->Find("logs") != nullptr && server.catalog->Find("archive") == nullptr);
+    assert(grants().at("logs") == chunkdb::Right::kWrite && !grants().contains("archive"));
+    {
+        chunkdb::txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_RENAME_TABLE_OPEN_FAIL_ONCE", "1");
+        ExpectError(server.Run(admin, "ALTER TABLE logs RENAME TO archive"), "INTERNAL");
+    }
+    assert(!grants().contains("logs") && grants().at("archive") == chunkdb::Right::kWrite);
+    ExpectReply(server.Run(admin, "RECOVER TABLE archive"), "+OK\r\n");
+
+    PauseRenameGrants hook;
+    bool revoked_inside = false;
+    std::future<std::string> revoke;
+    hook.at_forget = [&] {
+        revoke = std::async(std::launch::async, [&] { return server.Run(other_admin, "REVOKE WRITE ON archive FROM bot"); });
+        revoked_inside = revoke.wait_for(std::chrono::milliseconds(300)) == std::future_status::ready;
+    };
+    server.users->SetMigrationTestHook(&hook);
+    ExpectReply(server.Run(admin, "ALTER TABLE archive RENAME TO store"), "+OK\r\n");
+    ExpectReply(revoke.get(), "+OK\r\n");
+    server.users->SetMigrationTestHook(nullptr);
+    assert(!revoked_inside);
+    // The REVOKE came after the rename, when the old name had no grants.
+    assert(grants().size() == 1U && grants().at("store") == chunkdb::Right::kWrite);
 }
 
 void TestRecreatedUser() {
@@ -966,6 +1020,7 @@ int main(int argc, char** argv) {
     TestUserLimitStatementsAndAdmissionHook();
     TestRights();
     TestRenameTableGrants();
+    TestRenameGrantFailures();
     TestRecreatedUser();
     TestConditionalUsers();
     TestConcurrentConditionalUsers();

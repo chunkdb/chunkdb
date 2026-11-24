@@ -9,13 +9,16 @@
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
+#include <functional>
 #include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <vector>
 
+#include "backup.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/schema.hpp"
@@ -405,6 +408,65 @@ void TestStatements() {
     }
 }
 
+// Runs `run` once, when DROP NULL is about to read the stored values.
+struct AtNarrowingScan final : chunkdb::MigrationTestHook {
+    std::function<void()> run;
+    void Run(Point point, std::string_view) override {
+        if (point == Point::kBeforeNarrowingScan && run) std::exchange(run, nullptr)();
+    }
+};
+
+// A backup taken while DROP NULL checks its values: the restored table does
+// not inherit the check and takes NULL as the backed-up table did.
+void TestBackupDuringDropNull() {
+    ScopedTempDir dir("chunkdb-drop-null-backup");
+    const auto root = std::filesystem::canonical(dir.path());
+    chunkdb::CatalogConfig config;
+    config.data_dir = root / "data";
+    config.background_maintenance = false;
+    chunkdb::TableCatalog catalog(config);
+    (void)catalog.Create("world", GeometryFor(Initial()), chunkdb::TableOptions{}, Initial());
+    (*catalog.Find("world")->Acquire()).store().SetBlock(0, 0, {{"id", std::uint64_t{1}}, {"level", std::uint64_t{4}}});
+    AtNarrowingScan hook;
+    hook.run = [&] { (void)catalog.BackupTo(root / "snap", {}); };
+    catalog.SetMigrationTestHook(&hook);
+    catalog.DropColumnNull("world", "level");
+    catalog.SetMigrationTestHook(nullptr);
+    assert(!hook.run && !catalog.Find("world")->Info().schema.columns[3].nullable);
+    (void)catalog.RestoreTable(chunkdb::TableRestoreRequest{.backup = root / "snap", .table = "world", .name = "copy"});
+    assert(catalog.Find("copy")->Info().schema == Initial());
+    {
+        auto lease = *catalog.Find("copy")->Acquire();
+        lease.store().SetBlock(1, 0, {{"id", std::uint64_t{2}}});
+        lease.store().SetBlock(0, 0, {{"level", std::monostate{}}});
+        ExpectRow(lease.store(), 1, 0, Row{std::uint64_t{2}, std::uint64_t{15}, std::monostate{}, std::monostate{}, std::string("")});
+    }
+    // Another check of the restored table can start.
+    ExpectThrow<std::invalid_argument>([&] { catalog.DropColumnNull("copy", "level"); }, "block (0, 0) holds NULL");
+}
+
+// The bit-string calls need the only bits(N) column to be not NULL: SET NULL
+// ends them with a reason, and DROP NULL brings them back.
+void TestBitStringNullability() {
+    ScopedTempDir dir("chunkdb-alter-column-bits");
+    chunkdb::CatalogConfig config;
+    config.data_dir = dir.path();
+    auto catalog = std::make_shared<chunkdb::TableCatalog>(config);
+    chunkdb::EngineConfig engine_config;
+    engine_config.require_auth = false;
+    chunkdb::CommandEngine engine(engine_config, catalog);
+    chunkdb::SessionState session;
+    assert(engine.Execute(session, "HELLO 3").front() == '%');
+    assert(engine.Execute(session, "CREATE TABLE flags (v bits(8)) CHUNK 4 x 4") == "+OK\r\n");
+    catalog->Find("flags")->Acquire()->store().SetBlockBits(0, 0, "10100000");
+    assert(engine.Execute(session, "ALTER TABLE flags ALTER COLUMN v SET NULL") == "+OK\r\n");
+    ExpectThrow<std::invalid_argument>(
+        [&] { (void)catalog->Find("flags")->Acquire()->store().GetBlockBits(0, 0); },
+        "bit strings need a table with one bits(N) column that is not NULL");
+    assert(engine.Execute(session, "ALTER TABLE flags ALTER COLUMN v DROP NULL") == "+OK\r\n");
+    assert(catalog->Find("flags")->Acquire()->store().GetBlockBits(0, 0) == "10100000");
+}
+
 }  // namespace
 
 int main() {
@@ -414,6 +476,8 @@ int main() {
     TestDropNullTable();
     TestInterruptedDropNull();
     TestStatements();
+    TestBackupDuringDropNull();
+    TestBitStringNullability();
     std::printf("alter column tests passed\n");
     return 0;
 }

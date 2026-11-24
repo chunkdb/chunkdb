@@ -562,14 +562,18 @@ void RenameRefusals() {
     assert(catalog.Fences().empty() && catalog.Find("t_new") == nullptr);
     CheckLive(source, catalog, "t");
     {
-        // A rename that cannot be synced fences the new name; a recovery
-        // opens what its directory holds.
+        // A rename that cannot be synced fences both names, since a crash
+        // could still undo it; a recovery opens what each directory holds.
         txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_RENAME_TABLE_SYNC_FAIL_ONCE", "1");
         Throws([&] { catalog.RenameTable("t", "t_new", nullptr); });
     }
-    assert(catalog.Fence("t_new") && catalog.Find("t") == nullptr && catalog.Find("t_new") == nullptr);
+    assert(catalog.Fence("t_new") && catalog.Fence("t") && catalog.Find("t") == nullptr && catalog.Find("t_new") == nullptr);
+    Throws<TableFencedError>([&] { (void)catalog.Create("t", geometry, catalog.default_options()); });
     catalog.RecoverTable("t_new");
     CheckLive(source, catalog, "t_new");
+    assert(catalog.Fence("t"));
+    catalog.RecoverTable("t");
+    assert(catalog.Fences().empty() && catalog.Find("t") == nullptr && catalog.TableCount() == 2U);
     {
         txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_RENAME_TABLE_OPEN_FAIL_ONCE", "1");
         Throws([&] { catalog.RenameTable("t_new", "t", nullptr); });

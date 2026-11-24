@@ -2129,11 +2129,15 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::GrantRight& grant) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireManagesUsers(session);
-                    if (grant.revoke) {
-                        config_.users->Revoke(grant.user, grant.table, grant.right);
-                    } else {
-                        config_.users->Grant(grant.user, grant.table, grant.right);
-                    }
+                    // Inside catalog admission: a RENAME TO moving the
+                    // table's grants sees this change before or after it.
+                    catalog_->ChangeGrants([&] {
+                        if (grant.revoke) {
+                            config_.users->Revoke(grant.user, grant.table, grant.right);
+                        } else {
+                            config_.users->Grant(grant.user, grant.table, grant.right);
+                        }
+                    });
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::ShowUsers&) {

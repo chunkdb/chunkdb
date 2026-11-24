@@ -344,9 +344,9 @@ void UserRegistry::ForgetTable(const std::string& table) {
     });
 }
 
-UserRegistry::TableGrants UserRegistry::CopyTableGrants(const std::string& from, const std::string& to) {
+void UserRegistry::CopyTableGrants(const std::string& from, const std::string& to, TableGrants& previous) {
     RequireValidGrantTable(to);
-    TableGrants previous;
+    previous.clear();
     UpdateIf([&](Users& users) {
         previous.clear();
         for (auto& [name, user] : users.users) {
@@ -359,7 +359,6 @@ UserRegistry::TableGrants UserRegistry::CopyTableGrants(const std::string& from,
         }
         return !previous.empty();
     });
-    return previous;
 }
 
 void UserRegistry::RestoreTableGrants(const std::string& to, const TableGrants& previous) {

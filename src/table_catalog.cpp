@@ -1914,6 +1914,11 @@ void TableCatalog::RetireTable(Table& table, const TableOptions& options) {
     table.EndExclusive(nullptr, options);
 }
 
+void TableCatalog::ChangeGrants(const std::function<void()>& change) {
+    std::lock_guard operations(operations_mutex_);
+    change();
+}
+
 void TableCatalog::Drop(std::string_view name) {
     Drop(name, nullptr);
 }
