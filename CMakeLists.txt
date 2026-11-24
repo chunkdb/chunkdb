@@ -65,6 +65,7 @@ add_library(chunkdb_core STATIC
     src/checkpoint.cpp
     src/chunk_cache.cpp
     src/chunk_coordinate_index.cpp
+    src/secondary_index.cpp
     src/coordinate_index_store.cpp
     src/coordinate_hash.cpp
     src/chunk_format.cpp
@@ -411,7 +412,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME coordinate_hash_seed_failure COMMAND chunkdb_coordinate_hash_seed_test --failure)
     set_tests_properties(coordinate_hash_seed_failure PROPERTIES TIMEOUT 60 LABELS "smoke")
 
-    foreach(format IN ITEMS area_cursor sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_group_journal commit_group_coordinator commit_group_owner_format commit_owner_artifact_io commit_request_fingerprint wal_group_frame catalog_txn_snapshot ordinary_write_failure chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input wal_durability_pin chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol wal_barrier_memory chunk_column_expressions read_only_index_refresh)
+    foreach(format IN ITEMS area_cursor sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_group_journal commit_group_coordinator commit_group_owner_format commit_owner_artifact_io commit_request_fingerprint wal_group_frame catalog_txn_snapshot ordinary_write_failure chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input wal_durability_pin chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol wal_barrier_memory chunk_column_expressions read_only_index_refresh secondary_index)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -466,8 +467,9 @@ if(CHUNKDB_BUILD_TESTS)
 
     # Crash children of the coordinate index and tombstone compaction run in the crash label.
     add_test(NAME chunk_coordinate_index_crash COMMAND chunkdb_chunk_coordinate_index_test --crash-boundaries)
+    add_test(NAME secondary_index_crash COMMAND chunkdb_secondary_index_test --crash-boundaries)
     add_test(NAME table_tombstones_crash COMMAND chunkdb_table_tombstones_test --crash-children)
-    set_tests_properties(chunk_coordinate_index_crash table_tombstones_crash PROPERTIES TIMEOUT 300)
+    set_tests_properties(chunk_coordinate_index_crash table_tombstones_crash secondary_index_crash PROPERTIES TIMEOUT 300)
 
     add_test(NAME cql_chunk_model_3d COMMAND chunkdb_cql_chunk_model_test --3d)
     add_test(NAME feed_chunk_model_3d COMMAND chunkdb_feed_chunk_model_test --3d)
@@ -1242,6 +1244,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_shared_file_input_test
         chunkdb_wal_durability_pin_test
         chunkdb_chunk_coordinate_index_test
+        chunkdb_secondary_index_test
         chunkdb_read_only_index_refresh_test
         chunkdb_table_chunk_columns_test
         chunkdb_world_coordinates_3d_test
@@ -1424,6 +1427,7 @@ if(CHUNKDB_BUILD_TESTS)
         shared_file_input
         wal_durability_pin
         chunk_coordinate_index
+        secondary_index
         read_only_index_refresh
         table_chunk_columns
         world_coordinates_3d
@@ -1520,6 +1524,7 @@ if(CHUNKDB_BUILD_TESTS)
         snapshot_generation_linger
         txn_crash
         chunk_coordinate_index_crash
+        secondary_index_crash
         table_tombstones_crash
         commit_owner_artifact_io_crash
         commit_group_coordinator_crash

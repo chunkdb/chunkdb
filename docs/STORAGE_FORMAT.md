@@ -53,6 +53,8 @@ data_dir/
     L_<lx>_<ly>/C_<cx>_<cy>.chk         checkpoint image
     L_<lx>_<ly>/C_<cx>_<cy>.wal         live delta log
     L_<lx>_<ly>/chunkdb.index          checked coordinate decisions, when listed
+    indexes/<id>/manifest             secondary index manifest (no statement creates one yet)
+    indexes/<id>/run-<generation>     secondary index run
 ```
 
 Unless prefixed with `data_dir/`, paths below are relative to a table directory.
@@ -456,6 +458,24 @@ That decision raises the cumulative deletion floor before any retained deletion 
 Recovery accepts an installed shard only if its complete structure, length, and digest match; otherwise it installs the checked staged replacement.
 The final synced inventory clears the decision before staging cleanup.
 Pending compaction refuses read-only opening, and uncertain decided failures fence serving until recovery.
+
+## Secondary indexes
+
+An index (see [Secondary indexes](design/INDEXES.md)) is derived from chunk state; a table opens it after chunk recovery and the coordinate index, and rebuilds it from chunk state when a file below cannot be trusted.
+Integers are little-endian; coordinates are the table's active axes as two's-complement u64 values.
+
+| File | Encoding |
+| --- | --- |
+| `manifest` | `CKXM`, version `1:u16`, reserved zero `u16`, table epoch (16 bytes), dims `u8`, state `u8` (1 building, 2 ready), reserved zero `u16`, index id `u32`, column id `u32`, prefix `u32`, schema version `u64`, generation `u64`, run count `u32` (at most 9), per run newest first its generation `u64`, bytes `u64` and SHA-256 (32 bytes), CRC32 over everything before it |
+| `run-<generation>` header | `CKXR`, version `1:u16`, reserved zero `u16`, table epoch, dims `u8`, reserved zero `u8` and `u16`, index id, column id and prefix `u32`, schema version `u64`, generation `u64`, chunk count `u64`, CRC32 of the 64 bytes before it |
+| chunk table | per chunk in ascending coordinates: coordinates, revision `u64` (0 for no populated state), entry count `u32`; CRC32 of the table |
+| entry blocks | per block: entry count `u32`, body bytes `u32`, body, CRC32 of the block before it; at most 512 entries or about 64 KiB each |
+| entry | key length `u16`, key, coordinates, block index `u32`, removal revision `u64` (0 for a current entry); entries ascend by key bytes, coordinates and block index |
+| block index | block count `u32`, per block its file offset `u64`, reserved zero `u32` and first entry, CRC32 |
+| footer | chunk table, entry blocks and block index offsets `u64`, entry count `u64`, block count `u32`, `CKXE`, CRC32 of the 40 bytes before it |
+
+A manifest whose epoch, dims, index id, column id or prefix differ from the table's, an index still building, or a listed run whose size, header, footer or chunk table does not check is rebuilt; verification also checks each run's SHA-256, block checksums and order, and every chunk's entries against its state.
+A run is written under a temporary name, synced, renamed and its directory synced before the manifest that lists it replaces the previous one the same way; files the manifest does not list are removed when the index opens.
 
 ## Conditional and transaction intents
 

@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- Add the secondary index files and their recovery: a manifest bound to the table epoch, runs with a chunk table, checked entry blocks and a block index, flushes and merges published by replacing the manifest, and on open a comparison with the coordinate index that recomputes only the chunks whose revision changed and rebuilds from chunk state any index whose files cannot be trusted; no statement creates an index yet (#147).
 - `--listen-uri` takes port 0 as `--port` does; `chunkdb_exporter --listen host:0` listens on a free port, which the `port` field of its INFO line `serving metrics` names, now written at once; `chunkdb_server_bench --server-mode spawn --port 0` starts its server on a free port and reports that port (#130).
 - A float literal compared with an f32 value in a condition is rounded to the nearest f32, as an f32 `$n` is, so `IF f = 0.1`, `WHERE f = 0.1` and `CHECK (f <> 0.1)` see a stored 0.1 as equal; before, the literal stayed f64 and missed it. This holds for IF, the WHERE of AGGREGATE and SCAN CHUNKS, and CHECK, also the checks of existing tables; arithmetic with a float literal, assignments, integer literals and f64 columns are unchanged, and a finite literal beyond f32 keeps its value (#297).
 - A float literal in the subnormal range, such as `1e-310`, reads as its nearest f64 on every platform, and one below it as zero; before, some platforms refused it as not a number. A literal beyond the f64 range, such as `1e999`, is still refused with SYNTAX, now saying it is beyond the f64 range (#297).
