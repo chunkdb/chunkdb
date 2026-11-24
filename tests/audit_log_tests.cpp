@@ -326,8 +326,8 @@ void TestStatementEvents() {
     assert(!Contains(text, "SET BLOCK") && !Contains(text, "GET BLOCK"));
 }
 
-// ADD VERIFIER and DROP OLD VERIFIER are audited as alter_user, a refused one
-// with its code, and no verifier reaches the file.
+// ADD VERIFIER and DROP OLD VERIFIER are audited as alter_user with the form
+// that ran, a refused one with its code, and no verifier reaches the file.
 void TestVerifierRotationEvents() {
     Engine e;
     auto admin = e.Admin(3);
@@ -347,6 +347,23 @@ void TestVerifierRotationEvents() {
         if (Contains(line, "\"ok\":false") && Contains(line, "\"error_code\":\"INVALID_ARGUMENT\"")) ++refused;
     }
     assert(done == 2U && refused == 1U);
+    const std::vector<std::string> event{"\"event\":\"alter_user\"", "\"target_user\":\"bot\""};
+    const auto with = [&event](std::vector<std::string> parts) {
+        parts.insert(parts.end(), event.begin(), event.end());
+        return parts;
+    };
+    LineWith(lines, with({"\"ok\":true", "\"change\":\"add_verifier\""}));
+    LineWith(lines, with({"\"ok\":false", "\"change\":\"add_verifier\""}));
+    LineWith(lines, with({"\"ok\":true", "\"change\":\"drop_old_verifier\""}));
+    assert(e.Run(admin, "ALTER USER bot VERIFIER $1", {verifier("bot-reset-password")}) == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot MANAGES USERS") == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot LIMIT max_connections = 4") == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot REQUIRE CHANNEL BINDING") == "+OK\r\n");
+    const auto all = Lines(e.audit_path);
+    LineWith(all, with({"\"change\":\"verifier\""}));
+    LineWith(all, with({"\"change\":\"manages_users\""}));
+    LineWith(all, with({"\"change\":\"limit\""}));
+    LineWith(all, with({"\"change\":\"requires_channel_binding\""}));
     const auto text = ReadAll(e.audit_path);
     assert(!Contains(text, "SCRAM-SHA-256") && !Contains(text, "password\""));
 }

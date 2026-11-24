@@ -518,7 +518,7 @@ Live-history readers capture completed byte boundaries and read only the prefix 
 4. After each user's grants: `max_connections:u64`, `statements_per_sec:u64`, little-endian. Zero disables a limit; the rate is at most 65536.
 5. CRC32 over all preceding bytes, including the limits.
 
-Before serialization or file replacement, the writer checks u16 name widths, salt lengths, u32 user/grant counts, SCRAM iterations (4096–1000000), known rights and the rate limit. Invalid input leaves the existing file and directory metadata unchanged and does not create a new store.
+Before serialization or file replacement, the writer checks u16 name widths, salt lengths, u32 user/grant counts, SCRAM iterations (4096–1000000), known rights, the rate limit, and an added verifier with another salt or iteration count than the user's verifier, or with its keys. Invalid input leaves the existing file and directory metadata unchanged and does not create a new store.
 Writer serialization orders users by name and grants by table; decoding refuses duplicate users/grants/verifiers, more than one added verifier, unknown flags/rights/version, bad checksum, truncation, or trailing bytes.
 Version 2 files, which have no added verifier count, are read as users with one verifier; the next change writes version 3.
 The writer refuses a salt outside that range or a name over 65535 bytes instead of shortening it; decoding also refuses user and table names that CREATE USER and GRANT refuse.

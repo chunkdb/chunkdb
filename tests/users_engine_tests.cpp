@@ -721,12 +721,20 @@ void TestTwoVerifiers() {
         "INVALID_ARGUMENT user bot already has two verifiers; DROP OLD VERIFIER first");
     const auto both = server.users->Find("bot");
     assert(both && both->added_verifier.has_value());
+    // SHOW USERS tells a user with two verifiers from one with one.
+    const std::string users = server.Run(admin, "SHOW USERS");
+    assert(Contains(users, "$5\r\nadmin\r\n$13\r\nmanages_users\r\n#t\r\n$24\r\nrequires_channel_binding\r\n#f\r\n"
+                           "$9\r\nverifiers\r\n:1\r\n"));
+    assert(Contains(users, "$3\r\nbot\r\n$13\r\nmanages_users\r\n#f\r\n$24\r\nrequires_channel_binding\r\n#f\r\n"
+                           "$9\r\nverifiers\r\n:2\r\n"));
     {
         const chunkdb::UserRegistry restarted(server.dir.path(), std::nullopt, std::array<std::uint8_t, 32>{7}, true);
         assert(restarted.Find("bot") == both);
     }
 
     ExpectReply(server.Run(admin, "ALTER USER bot DROP OLD VERIFIER"), "+OK\r\n");
+    assert(Contains(server.Run(admin, "SHOW USERS"), "$3\r\nbot\r\n$13\r\nmanages_users\r\n#f\r\n$24\r\nrequires_channel_binding\r\n#f\r\n"
+                                                     "$9\r\nverifiers\r\n:1\r\n"));
     SessionState dropped;
     ExpectReply(server.Login(dropped, "bot", "old"), kWrongLogin);
     (void)server.LoggedIn("bot", "new");

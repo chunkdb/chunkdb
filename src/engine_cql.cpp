@@ -694,6 +694,13 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
                 info.verb = "ALTER USER";
                 info.audit_event = "alter_user";
                 info.target_user = alter.user;
+                // The same order as the statement runs its forms.
+                info.change = alter.verifier ? "verifier"
+                    : alter.added_verifier ? "add_verifier"
+                    : alter.drop_old_verifier ? "drop_old_verifier"
+                    : alter.max_connections || alter.statements_per_sec ? "limit"
+                    : alter.requires_channel_binding ? "requires_channel_binding"
+                    : "manages_users";
             },
             [&](const cql::DropUser& drop) {
                 info.verb = "DROP USER";
@@ -2073,13 +2080,15 @@ std::string CommandEngine::ExecuteStatement(
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, users.users.size());
                     for (const auto& [name, user] : users.users) {
-                        Protocol::AppendMapHeader(reply, 4);
+                        Protocol::AppendMapHeader(reply, 5);
                         Protocol::AppendBulk(reply, "name");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "manages_users");
                         Protocol::AppendBoolean(reply, user.manages_users);
                         Protocol::AppendBulk(reply, "requires_channel_binding");
                         Protocol::AppendBoolean(reply, user.requires_channel_binding);
+                        Protocol::AppendBulk(reply, "verifiers");
+                        Protocol::AppendInteger(reply, std::uint64_t{user.added_verifier ? 2U : 1U});
                         Protocol::AppendBulk(reply, "grants");
                         Protocol::AppendMapHeader(reply, user.grants.size());
                         for (const auto& [table, right] : user.grants) {

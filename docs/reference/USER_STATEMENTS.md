@@ -41,12 +41,14 @@ OK
   name = admin
   manages_users = true
   requires_channel_binding = false
+  verifiers = 1
   grants:
     * = ADMIN
 2)
   name = bot
   manages_users = false
   requires_channel_binding = false
+  verifiers = 1
   grants:
     world = READ
 OK
@@ -105,7 +107,7 @@ See [Protocol](../PROTOCOL.md) for authentication encoding.
 ## Returns
 
 - CREATE, ALTER, DROP, GRANT, and REVOKE: `OK`.
-- SHOW USERS: user names, MANAGES USERS state, REQUIRE CHANNEL BINDING state, and grants.
+- SHOW USERS: user names, MANAGES USERS state, REQUIRE CHANNEL BINDING state, the number of verifiers (1, or 2 after ADD VERIFIER), and grants.
 
 ## Errors
 

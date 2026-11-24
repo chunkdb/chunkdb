@@ -524,6 +524,7 @@ void CommandEngine::LogStatement(
             .target_user = info.target_user,
             .slot = info.slot,
             .migration = info.migration,
+            .change = info.change != nullptr ? std::string_view{info.change} : std::string_view{},
             .target_connection = info.target_connection,
         });
     }
