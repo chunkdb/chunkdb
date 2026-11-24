@@ -9,10 +9,10 @@ on:
 permissions:
   contents: read
 
-# A new push to a pull request or to main replaces the run still going for it.
+# A new push to a pull request replaces the run still going for it; runs on main always finish.
 concurrency:
   group: ${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   changes:
