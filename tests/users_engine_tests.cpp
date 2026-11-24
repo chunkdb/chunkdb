@@ -356,7 +356,7 @@ void TestServerRights() {
 
     // MONITOR: status statements over every table, without data or changes.
     assert(server.Run(mon, "SHOW METRICS").rfind("-ERR", 0) != 0);
-    assert(server.Run(mon, "SHOW STATUS").starts_with("%3\r\n"));
+    assert(server.Run(mon, "SHOW STATUS").starts_with("%7\r\n"));
     assert(server.Run(mon, "SHOW TABLE STATS world").starts_with("%5\r\n"));
     ExpectError(server.Run(mon, "SHOW TABLE STATS absent"), "NO_TABLE");
     const auto slots = server.Run(mon, "SHOW SLOTS");
