@@ -1,6 +1,6 @@
 # Expressions (engine)
 Conditions (`IF`, `WHERE`) and computed assignments (`SET BLOCK ... coins = coins + $1`) share one expression engine in `src/expr.hpp`.
-This note records its semantics as implemented; statements do not use it yet.
+This note records its semantics as implemented; AGGREGATE and SCAN CHUNKS use it for WHERE.
 
 ## Grammar
 
@@ -82,3 +82,13 @@ An expression has at most 256 nodes (values, columns, operators and list items) 
 Beyond them, and for anything the grammar refuses, parsing throws `ParseError` (`SYNTAX`).
 Parsing recurses only through parentheses, so it is bounded by the depth limit.
 Planning and evaluation throw `std::invalid_argument` (`INVALID_ARGUMENT`) and `std::out_of_range` (`OUT_OF_RANGE`).
+
+## WHERE in reads
+
+AGGREGATE and SCAN CHUNKS (E5, E6) evaluate WHERE once per present block; absent positions are not evaluated, since a read has no block to return or count there.
+A chunk without chunk-column values reads the columns' defaults.
+NOW() is the statement's start time.
+Parameters take their types from the plan, and `$n` frames are bounded by those types before they are read.
+AGGREGATE adds every requested cell to a transaction's read set, as without WHERE: any block's write can change which blocks match.
+SCAN CHUNKS without SINCE omits chunks with no match; with SINCE it lists every changed identity, with null data when no block matches, so a filtered copy converges; SINCE with WHERE needs WITH DATA, since the rows would otherwise ignore WHERE.
+LIMIT counts visited identities, so the page's reads stay bounded; the reply adds `after`, the last visited identity, because the last row need not be.

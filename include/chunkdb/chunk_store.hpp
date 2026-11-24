@@ -437,6 +437,16 @@ struct ChunkIdentityScanPage {
     // A read-only process cannot establish the writer's completed frontier.
     std::optional<std::uint64_t> position;
     std::uint64_t retained_deletion_floor = 0U;
+    // When more remain: the last identity the page visited, kept or not.
+    std::optional<ChunkCoord> after;
+};
+
+// Which identities a scan keeps (SCAN CHUNKS WHERE). `keep` may change the
+// state it is given and returns false to leave the identity out of the page.
+struct ChunkScanFilter {
+    std::function<bool(const ChunkCoord&, ChunkRangeEntry&)> keep;
+    // Whether `keep` reads text and bytes values.
+    bool needs_vars = false;
 };
 
 class TombstoneHistoryLostError : public std::invalid_argument {
@@ -729,9 +739,12 @@ class ChunkStore {
         bool has_cursor,
         ChunkCoord cursor,
         std::size_t limit);
+    // With `filter`, the page reads each identity's state, and every identity it
+    // visits counts toward `limit`, whether the filter keeps it or not.
     [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentities(
         bool has_cursor, ChunkCoord cursor, std::size_t limit,
-        std::optional<std::uint64_t> since = {}, bool with_data = false);
+        std::optional<std::uint64_t> since = {}, bool with_data = false,
+        const ChunkScanFilter* filter = nullptr);
     // With `with_vars`, each entry carries its text and bytes values, and
     // they count toward the response-byte limit.
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange(

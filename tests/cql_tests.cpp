@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "cql.hpp"
+#include "expr.hpp"
 
 namespace {
 
@@ -129,7 +130,17 @@ void TestChunkModelScan() {
     ExpectError("SCAN CHUNKS FROM t WITH DATA WITH DATA", "given twice");
     ExpectError("SCAN CHUNKS FROM t COLUMNS a", "requires WITH DATA");
     ExpectError("SCAN CHUNKS FROM t SINCE -1", "a revision must be between 0");
-    ExpectError("SCAN CHUNKS FROM t SINCE 0 WHERE n = 1 WITH DATA", "column 28: SCAN CHUNKS does not support WHERE");
+    // WHERE ends before the next clause; its parameters are the statement's.
+    const auto where = Get<cql::ScanChunks>("SCAN CHUNKS FROM t WHERE n = $1 AND chunk.k IS NULL LIMIT 3 SINCE 0 WITH DATA", 1);
+    assert(where.where && where.where->nodes[where.where->root].op == chunkdb::expr::Op::kAnd);
+    assert(where.limit == 3U && where.since == 0U && where.with_data);
+    assert(!Get<cql::ScanChunks>("SCAN CHUNKS FROM t").where);
+    assert(Get<cql::ScanChunks>("SCAN CHUNKS FROM t AFTER 1 2 WHERE pos_x < 4").after_z == 0);
+    ExpectError("SCAN CHUNKS FROM t SINCE 0 WHERE n = 1", "WHERE with SINCE requires WITH DATA");
+    ExpectError("SCAN CHUNKS FROM t WHERE n = 1 WHERE n = 2", "column 32: WHERE is given twice");
+    ExpectError("SCAN CHUNKS FROM t WHERE", "column 25: expected a value, got the end of the statement");
+    ExpectError("SCAN CHUNKS FROM t WHERE n = $2", "parameters must be numbered $1 to $2 without gaps");
+    ExpectError("SCAN CHUNKS FROM t WHERE n = 1 n", "expected the end of the statement, got 'n'");
     const auto compact = Get<cql::CompactTombstones>("COMPACT TOMBSTONES t BEFORE 18446744073709551615");
     assert(compact.table == "t" && compact.before == std::numeric_limits<std::uint64_t>::max());
     assert(Get<cql::CompactTombstones>("COMPACT TOMBSTONES t BEFORE 0").before == 0U);
@@ -617,8 +628,17 @@ void TestAggregate() {
     ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t SUM(a), sum(a)", "column 42: sum(a) is given twice");
     ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) BY CHUNK BY CHUNK", "BY CHUNK is given twice");
     ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) BY BLOCK", "expected CHUNK, got 'BLOCK'");
-    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) WHERE a > 1",
-        "column 43: AGGREGATE does not take WHERE; it aggregates every present block of the selector");
+    const auto where = Get<cql::Aggregate>("AGGREGATE CHUNK 0 0 FROM t COUNT(*) WHERE a > $1 OR b IN ($2, 3) BY CHUNK", 2);
+    assert(where.where && where.by_chunk && where.where->nodes[where.where->root].op == chunkdb::expr::Op::kOr);
+    assert(Get<cql::Aggregate>("AGGREGATE CHUNK 0 0 FROM t COUNT(*) BY CHUNK WHERE EXISTS").where->nodes.size() == 1U);
+    assert(!chunk.where);
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) WHERE a > 1 WHERE a < 3", "column 55: WHERE is given twice");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) WHERE a >", "expected a value, got the end of the statement");
+    ExpectError("AGGREGATE CHUNK 0 0 FROM t COUNT(*) WHERE a = $1 AND b = $1", "$1 is used twice");
+    ExpectError("AGGREGATE CHUNK 0 0 FROM t COUNT(*) WHERE (a = 1) + 1 > 0", "column 51: unexpected '+'");
+    std::string long_where = "AGGREGATE CHUNK 0 0 FROM t COUNT(*) WHERE a = 0";
+    for (int i = 1; i < 90; ++i) long_where += " OR a = " + std::to_string(i);
+    ExpectError(long_where, "the expression is too long: at most 256 nodes");
     ExpectError("AGGREGATE AREA 0 0 TO 1 1 0 FROM t COUNT(*)", "AREA endpoints have different dimensions");
     ExpectError("AGGREGATE AREA AROUND 0 0 RADIUS -1 FROM t COUNT(*)", "a radius must be between 0");
     ExpectError("AGGREGATE BLOCK 0 0 FROM t COUNT(*)", "expected CHUNK or AREA, got 'BLOCK'");

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
@@ -20,6 +21,7 @@
 #include "chunkdb/engine.hpp"
 #include "chunkdb/protocol.hpp"
 #include "aggregate.hpp"
+#include "block_filter.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunk_form.hpp"
@@ -149,6 +151,24 @@ constexpr std::size_t kMaxStatementParameterBytes =
             return BytesValue{.bytes = std::vector<std::uint8_t>(bytes.begin(), bytes.end())};
     }
     throw std::logic_error("unknown column kind");
+}
+
+// A read's WHERE planned against `geometry`, with its parameters decoded as
+// the types they take and NOW() the time the statement starts.
+[[nodiscard]] BlockFilter WhereFilter(
+    const Geometry& geometry,
+    const expr::Expression& where,
+    std::span<const std::optional<std::string>> parameters) {
+    BlockFilter filter(geometry, where);
+    std::vector<ColumnValue> values(parameters.size());
+    for (const auto& parameter : filter.parameters()) {
+        const Column column{.name = "WHERE", .type = parameter.type, .nullable = true, .default_value = {}};
+        values.at(parameter.index - 1U) = ParameterValue(column, parameter.index, parameters[parameter.index - 1U]);
+    }
+    const auto now = std::chrono::duration_cast<std::chrono::milliseconds>(
+        std::chrono::system_clock::now().time_since_epoch()).count();
+    filter.Bind(std::move(values), static_cast<std::uint64_t>(std::max<std::int64_t>(now, 0)));
+    return filter;
 }
 
 // The value a literal of the statement gives `column`. Whether it is in
@@ -1042,6 +1062,31 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
         request.plan = PayloadPlan::kParameters;
         return request;
     }
+    // A read's WHERE: each parameter is at most the size of the type it
+    // takes from the table.
+    const auto where_read = [&]() -> std::optional<std::pair<std::string, std::shared_ptr<const expr::Expression>>> {
+        if (const auto* aggregate = std::get_if<cql::Aggregate>(&parsed.statement)) return std::pair{aggregate->table, aggregate->where};
+        if (const auto* scan = std::get_if<cql::ScanChunks>(&parsed.statement)) return std::pair{scan->table, scan->where};
+        return std::nullopt;
+    }();
+    if (where_read && where_read->second) {
+        const std::shared_ptr<Table> table = find(where_read->first);
+        if (table == nullptr) return missing(where_read->first);
+        const Geometry geometry = table->geometry();
+        try {
+            const BlockFilter filter(geometry, *where_read->second);
+            request.parameter_limits.assign(parsed.parameters, 0U);
+            for (const auto& parameter : filter.parameters())
+                request.parameter_limits.at(parameter.index - 1U) = ParameterBytes(parameter.type);
+        } catch (const std::invalid_argument& error) {
+            return reject(ErrorReply(error));
+        } catch (const std::out_of_range& error) {
+            return reject(ErrorReply(error));
+        }
+        request.parameter_bytes_limit = kMaxStatementParameterBytes;
+        request.plan = PayloadPlan::kParameters;
+        return request;
+    }
     const auto* set = std::get_if<cql::SetBlock>(&parsed.statement);
     if (set == nullptr) {
         return reject(Protocol::Error("UNKNOWN_COMMAND", "this statement is not available yet"));
@@ -1793,6 +1838,8 @@ std::string CommandEngine::ExecuteStatement(
                     ChunkStore& store = lease.store();
                     RequireDimensions(store.geometry(), aggregate.dims);
                     Aggregator aggregator(store.geometry().layout(), aggregate.functions);
+                    std::optional<BlockFilter> filter;
+                    if (aggregate.where) filter.emplace(WhereFilter(store.geometry(), *aggregate.where, parameters));
                     const ChunkAreaSelector selector{.dims = aggregate.dims,
                         .first = {aggregate.x0, aggregate.y0, aggregate.z0},
                         .last = {aggregate.x1, aggregate.y1, aggregate.z1},
@@ -1835,6 +1882,8 @@ std::string CommandEngine::ExecuteStatement(
                             if (!entry) return true;
                             ++chunks;
                             if (aggregate.by_chunk) aggregator.Reset();
+                            if (filter) (void)filter->Apply(coord, entry->payload, entry->presence_bitmap, entry->vars,
+                                entry->chunk_columns.get());
                             aggregator.Add(entry->payload, entry->presence_bitmap);
                             if (!aggregate.by_chunk || aggregator.blocks() == 0U) return true;
                             Protocol::AppendArrayHeader(rows, aggregate.dims + aggregator.functions());
@@ -1845,7 +1894,7 @@ std::string CommandEngine::ExecuteStatement(
                             ++row_count;
                             if (rows.size() > budget) throw too_large();
                             return true;
-                        }, false, session.transaction ? &*session.transaction->snapshot : nullptr, read);
+                        }, filter && filter->needs_vars(), session.transaction ? &*session.transaction->snapshot : nullptr, read);
                     if (page.has_more) throw std::logic_error("AGGREGATE left cells of its selector unvisited");
                     if (info != nullptr) info->chunks = chunks;
                     std::string reply;
@@ -2216,10 +2265,34 @@ std::string CommandEngine::ExecuteStatement(
                     if (reserve_reply && scan.with_data)
                         (*reserve_reply)(ChunkReplyCaptureBound(geometry.layout(),
                             ChunkReplyStateBytes(geometry, static_cast<std::size_t>(limit), 128U)));
+                    // WHERE keeps the matching blocks of each identity. Without
+                    // SINCE a chunk with none is left out; with SINCE it stays,
+                    // without data, so a consumer drops its copy.
+                    std::optional<BlockFilter> filter;
+                    std::optional<ChunkScanFilter> scan_filter;
+                    if (scan.where) {
+                        filter.emplace(WhereFilter(geometry, *scan.where, parameters));
+                        scan_filter.emplace(ChunkScanFilter{.keep = [&](const ChunkCoord& coord, ChunkRangeEntry& state) {
+                            if (state.presence_bitmap.empty()) return scan.since.has_value();
+                            if (filter->Apply(coord, state.payload, state.presence_bitmap, state.vars, state.chunk_columns.get()) == 0U) {
+                                if (!scan.since) return false;
+                                state.presence_bitmap.clear();
+                                state.vars = ChunkVars{};
+                                return true;
+                            }
+                            CanonicalizeAbsentBlocks(geometry, state.presence_bitmap, &state.payload);
+                            std::vector<VarKey> absent;
+                            for (const auto value : state.vars)
+                                if (!BlockPresent(state.presence_bitmap, value.key.block_index)) absent.push_back(value.key);
+                            for (const auto& key : absent) (void)state.vars.Remove(key);
+                            return true;
+                        }, .needs_vars = filter->needs_vars()});
+                    }
                     ChunkIdentityScanPage page;
                     try {
                         page = lease.store().ScanChunkIdentities(scan.after.has_value(), cursor,
-                            static_cast<std::size_t>(limit), scan.since, scan.with_data);
+                            static_cast<std::size_t>(limit), scan.since, scan.with_data,
+                            scan_filter ? &*scan_filter : nullptr);
                     } catch (const TombstoneHistoryLostError& error) {
                         const auto floor = std::to_string(error.retained_deletion_floor());
                         const auto epoch = StoreIdHex(lease.store().store_id());
@@ -2231,7 +2304,9 @@ std::string CommandEngine::ExecuteStatement(
                     }
                     if (info != nullptr) info->chunks = page.entries.size();
                     ReplyParts reply;
-                    Protocol::AppendMapHeader(reply.text(), 5);
+                    // WHERE adds `after`, since a page can end with identities
+                    // it left out.
+                    Protocol::AppendMapHeader(reply.text(), scan.where ? 6U : 5U);
                     Protocol::AppendBulk(reply.text(), "chunks");
                     Protocol::AppendArrayHeader(reply.text(), page.entries.size());
                     for (const auto& entry : page.entries) {
@@ -2250,6 +2325,16 @@ std::string CommandEngine::ExecuteStatement(
                     }
                     Protocol::AppendBulk(reply.text(), "more");
                     Protocol::AppendBoolean(reply.text(), page.has_more);
+                    if (scan.where) {
+                        Protocol::AppendBulk(reply.text(), "after");
+                        if (!page.has_more || !page.after) Protocol::AppendNull(reply.text());
+                        else {
+                            Protocol::AppendArrayHeader(reply.text(), geometry.dims());
+                            Protocol::AppendInteger(reply.text(), page.after->x);
+                            Protocol::AppendInteger(reply.text(), page.after->y);
+                            if (geometry.dims() == 3U) Protocol::AppendInteger(reply.text(), page.after->z);
+                        }
+                    }
                     Protocol::AppendBulk(reply.text(), "epoch");
                     Protocol::AppendBulk(reply.text(), StoreIdHex(lease.store().store_id()));
                     Protocol::AppendBulk(reply.text(), "position");

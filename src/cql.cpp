@@ -1,5 +1,6 @@
 #include "cql.hpp"
 #include "cql_lexer.hpp"
+#include "expr.hpp"
 
 #include <algorithm>
 #include <array>
@@ -626,8 +627,17 @@ class Parser {
         return 2;
     }
 
+    // After WHERE: the condition (expr.hpp), up to the first token that
+    // cannot continue it. Its parameters join the statement's.
+    [[nodiscard]] std::shared_ptr<const expr::Expression> Where() {
+        // The expression lexes from the end of the last token read, so no
+        // token after WHERE may have been read yet.
+        if (next_ != tokens_.size()) throw std::logic_error("WHERE was parsed after a lookahead");
+        return std::make_shared<const expr::Expression>(expr::ParseConditionAt(line_, &at_, &parameters_));
+    }
+
     // After AGGREGATE: CHUNK c | AREA a TO b | AREA AROUND c RADIUS r, then
-    // FROM t, the functions and BY CHUNK.
+    // FROM t, the functions, WHERE and BY CHUNK.
     [[nodiscard]] Aggregate AggregateStatement() {
         Aggregate aggregate;
         if (Accept("chunk")) {
@@ -680,8 +690,9 @@ class Parser {
                 if (aggregate.by_chunk) Fail(column, "BY CHUNK is given twice");
                 Expect("chunk");
                 aggregate.by_chunk = true;
-            } else if (IsKeyword(Peek(), "where")) {
-                Fail(column, "AGGREGATE does not take WHERE; it aggregates every present block of the selector");
+            } else if (Accept("where")) {
+                if (aggregate.where) Fail(column, "WHERE is given twice");
+                aggregate.where = Where();
             } else {
                 break;
             }
@@ -1366,10 +1377,12 @@ class Parser {
                     if (!scan.columns.empty()) Fail(column, "COLUMNS is given twice");
                     scan.columns = FeedColumns();
                 } else if (Accept("where")) {
-                    Fail(column, "SCAN CHUNKS does not support WHERE");
+                    if (scan.where) Fail(column, "WHERE is given twice");
+                    scan.where = Where();
                 } else break;
             }
             if (!scan.columns.empty() && !scan.with_data) Fail(1, "COLUMNS requires WITH DATA");
+            if (scan.where && scan.since && !scan.with_data) Fail(1, "WHERE with SINCE requires WITH DATA");
             return scan;
         }
         throw UnknownCommandError("column " + std::to_string(first.column) + ": unknown statement " +
