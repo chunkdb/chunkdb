@@ -200,7 +200,7 @@ int main() {
         assert(err("SET BLOCK 1 2 IN default nope = b'1111'", "INVALID_ARGUMENT"));
         assert(err("SET BLOCK 1 2 IN nope bits = b'1111'", "NO_TABLE"));
         assert(err("SET BLOCK 1 2 IN default bits = b'1111' IF", "SYNTAX"));
-        assert(err("SET BLOCK 1 2 IN default bits = b'1111' IF 1", "SYNTAX"));
+        assert(err("SET BLOCK 1 2 IN default bits = b'1111' IF 1", "INVALID_ARGUMENT"));
         assert(err("SET BLOCK 1 2 IN default bits = b'1111' IF VERSION x", "SYNTAX"));
         // A parameter frame of the wrong size, or with bits past the width.
         assert(err("SET BLOCK 1 2 IN default bits = $1", "INVALID_ARGUMENT", Parameters{std::string(2, '\x01')}));
