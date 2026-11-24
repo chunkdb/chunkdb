@@ -6,6 +6,7 @@
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 #include "scram.hpp"
 #include "login_helpers.hpp"
@@ -70,6 +71,32 @@ void TestWrongPassword() {
     const auto login = scram::StartClientLogin("user", kClientNonce);
     const auto wrong_client = scram::FinishClientLogin(login, "pencils", correct.ServerFirst());
     assert(!correct.Finish(wrong_client.message));
+}
+
+// A user with two verifiers: the proof of either password matches its own
+// verifier, and both share the salt and iteration count the server sends.
+void TestTwoVerifiers() {
+    const auto first = scram::ParseClientFirst(std::string("n,,n=user,r=") + kClientNonce);
+    const auto salt = *crypto::Base64Decode("W22ZaJ0SNY7soEsUEjb6gQ==");
+    const auto other = scram::MakeVerifier("pencils", salt, 4096);
+    const scram::ServerExchange exchange(first, std::vector<scram::Verifier>{other, PencilVerifier()}, kServerNonce);
+    assert(exchange.ServerFirst() == "r=rOprNGfwEbeRWgbNEkqO%hvYDpWUa2RaTCAfuxFIlj)hNlF$k0,s=W22ZaJ0SNY7soEsUEjb6gQ==,i=4096");
+    std::size_t matched = 7;
+    assert(exchange.Finish(kClientFinal, &matched) == std::string("v=6rriTRBi23WpRR/wtup+mMhUZUn/dB5nLTJRsjl95G4="));
+    assert(matched == 1U);
+    const auto login = scram::StartClientLogin("user", kClientNonce);
+    const auto with_other = scram::FinishClientLogin(login, "pencils", exchange.ServerFirst());
+    assert(exchange.Finish(with_other.message, &matched) == with_other.server_signature && matched == 0U);
+    const auto wrong = scram::FinishClientLogin(login, "pen", exchange.ServerFirst());
+    matched = 7;
+    assert(!exchange.Finish(wrong.message, &matched) && matched == 7U);
+    ExpectInvalid([&] { (void)scram::ServerExchange(first, std::vector<scram::Verifier>{}, kServerNonce); }, "needs a verifier");
+    const auto other_salt = scram::MakeVerifier("pencils", std::vector<std::uint8_t>(16U, 1U), 4096);
+    const auto other_count = scram::MakeVerifier("pencils", salt, 8192);
+    for (const auto& mismatch : {other_salt, other_count}) {
+        ExpectInvalid([&] { (void)scram::ServerExchange(first, std::vector<scram::Verifier>{PencilVerifier(), mismatch}, kServerNonce); },
+            "share one salt and iteration count");
+    }
 }
 
 void TestPreparedSocketLogin() {
@@ -253,6 +280,7 @@ int main() {
     TestRfcExchange();
     TestClientSide();
     TestWrongPassword();
+    TestTwoVerifiers();
     TestPreparedSocketLogin();
     TestPrepareExistingFixtureUser();
     TestMalformedMessages();

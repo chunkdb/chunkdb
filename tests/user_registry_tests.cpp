@@ -275,7 +275,7 @@ void TestFormatRefusalPrecedesBookkeeping() {
         }
         return result;
     };
-    for (const auto version : {1U, 3U}) {
+    for (const auto version : {1U, 4U}) {
         auto unsupported = record;
         unsupported[4] = static_cast<std::uint8_t>(version);
         seal(unsupported);

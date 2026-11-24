@@ -1078,6 +1078,13 @@ class Parser {
                 alter.user = Name("a user name");
                 if (Accept("verifier")) {
                     alter.verifier = Verifier();
+                } else if (Accept("add")) {
+                    Expect("verifier");
+                    alter.added_verifier = Verifier();
+                } else if (Accept("drop")) {
+                    Expect("old");
+                    Expect("verifier");
+                    alter.drop_old_verifier = true;
                 } else if (Accept("limit")) {
                     do {
                         const auto column = Peek().column;

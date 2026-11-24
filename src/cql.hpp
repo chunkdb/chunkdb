@@ -309,11 +309,15 @@ struct CreateUser {
     bool requires_channel_binding = false;
     bool if_not_exists = false;
 };
-// Exactly one change is set: the verifier, manages_users, the limits or
-// requires_channel_binding.
+// Exactly one change is set: the verifier, the added verifier,
+// drop_old_verifier, manages_users, the limits or requires_channel_binding.
 struct AlterUser {
     std::string user;
     std::optional<Literal> verifier;
+    // ADD VERIFIER: a second verifier the user logs in with besides its own.
+    std::optional<Literal> added_verifier;
+    // DROP OLD VERIFIER: the added verifier becomes the only one.
+    bool drop_old_verifier = false;
     std::optional<bool> manages_users;
     std::optional<std::uint64_t> max_connections{};
     std::optional<std::uint64_t> statements_per_sec{};

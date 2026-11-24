@@ -280,8 +280,8 @@ struct PendingLogin {
     // a connection ticket only while all are still current.
     std::optional<UserAuthenticationSnapshot> identity;
     // Whether the login is bound: AUTH succeeds only while the user still
-    // has the verifier of `exchange` and, for an unbound login, still takes
-    // unbound logins.
+    // has the verifier of `exchange` the proof matches and, for an unbound
+    // login, still takes unbound logins.
     bool bound = false;
     scram::ServerExchange exchange;
     SessionHelloOptions options;
@@ -524,6 +524,7 @@ void CommandEngine::LogStatement(
             .target_user = info.target_user,
             .slot = info.slot,
             .migration = info.migration,
+            .change = info.change != nullptr ? std::string_view{info.change} : std::string_view{},
             .target_connection = info.target_connection,
         });
     }
@@ -970,13 +971,15 @@ std::string CommandEngine::HandleHello(
     }
     const auto found = config_.users->AuthenticationSnapshot(user);
     const auto secret = config_.users->Secret();
-    scram::Verifier verifier = found.has_value() ? found->user.verifier : scram::DecoyVerifier(secret, user);
+    // A user with two verifiers logs in with either.
+    std::vector<scram::Verifier> verifiers{found.has_value() ? found->user.verifier : scram::DecoyVerifier(secret, user)};
+    if (found.has_value() && found->user.added_verifier.has_value()) verifiers.push_back(*found->user.added_verifier);
     session.pending_login = std::make_shared<PendingLogin>(PendingLogin{
         .user = user,
         .known = found.has_value(),
         .identity = found,
         .bound = bound,
-        .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce(), binding_data),
+        .exchange = scram::ServerExchange(std::move(first), std::move(verifiers), scram::NewNonce(), binding_data),
         .options = std::move(options),
         .unbound_refused = !bound && found.has_value() && found->user.requires_channel_binding,
     });
@@ -1006,8 +1009,9 @@ std::string CommandEngine::HandleAuth(
         return Protocol::Error("AUTH_FAILED", "login context changed; start HELLO again", {{"reason", "stale_login"}});
     };
     std::optional<std::string> server_final;
+    std::size_t verifier = 0;
     try {
-        server_final = pending->exchange.Finish(*parameters[0]);
+        server_final = pending->exchange.Finish(*parameters[0], &verifier);
     } catch (const scram::ChannelMismatchError&) {
         // Whoever relays this login ends TLS itself: the reply says so, and
         // it depends on neither the user nor the password.
@@ -1016,12 +1020,13 @@ std::string CommandEngine::HandleAuth(
     if (!server_final.has_value() || !pending->known || pending->unbound_refused) {
         return RecordAuthFailure(session, pending->user);
     }
-    // The user's credentials as of now, not as of HELLO: a verifier changed,
-    // a user dropped or created again, or a binding requirement added in
-    // between fails the login like a wrong password.
+    // The user's credentials as of now, not as of HELLO: the verifier the
+    // proof matches replaced or dropped, a user dropped or created again, or
+    // a binding requirement added in between fails the login like a wrong
+    // password.
     const auto current = config_.users->FindIncarnation(pending->user);
     if (!current.has_value() || current->incarnation != pending->identity->state->incarnation ||
-        current->user.verifier != pending->exchange.UserVerifier() ||
+        !HoldsVerifier(current->user, pending->exchange.Verifiers()[verifier]) ||
         (!pending->bound && current->user.requires_channel_binding)) {
         // The audit log gives the reason as of now too, as HELLO would.
         audit.known_user = current.has_value();
