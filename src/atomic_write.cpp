@@ -258,7 +258,7 @@ bool PublishNewFile(
 
     if (before_publish_crash_failpoint != nullptr &&
         ConsumeFailpointEnv(before_publish_crash_failpoint)) {
-        std::_Exit(86);
+        ExitAbruptly(86);
     }
 
     std::error_code publish_ec;
@@ -309,7 +309,7 @@ bool PublishNewFile(
 
     if (after_publish_crash_failpoint != nullptr &&
         ConsumeFailpointEnv(after_publish_crash_failpoint)) {
-        std::_Exit(86);
+        ExitAbruptly(86);
     }
     SyncDirectoryPath(parent);
     return true;

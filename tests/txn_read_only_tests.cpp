@@ -14,6 +14,7 @@
 #include <optional>
 #include <random>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <vector>
 
@@ -71,10 +72,22 @@ std::string Row(std::int64_t x, std::int64_t y, std::uint64_t version) {
 }
 
 // A metric's value in SHOW METRICS.
+// The sum of `name` over its samples, one per table.
 std::uint64_t Metric(const std::string& metrics, const std::string& name) {
-    const auto at = metrics.find("\n" + name + " ");
-    assert(at != std::string::npos);
-    return std::stoull(metrics.substr(at + name.size() + 2U));
+    std::uint64_t sum = 0;
+    bool found = false;
+    std::size_t begin = 0;
+    while (begin < metrics.size()) {
+        auto end = metrics.find('\n', begin);
+        if (end == std::string::npos) end = metrics.size();
+        const std::string_view line(metrics.data() + begin, end - begin);
+        begin = end + 1U;
+        if (!line.starts_with(name + "{")) continue;
+        sum += std::stoull(std::string(line.substr(line.rfind(' ') + 1U)));
+        found = true;
+    }
+    assert(found);
+    return sum;
 }
 
 struct Fixture {

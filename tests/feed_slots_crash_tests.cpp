@@ -3,17 +3,24 @@
 #include <array>
 #include <cassert>
 #include <chrono>
+#include <condition_variable>
+#include <cstdint>
+#include <cstdio>
 #include <cstdlib>
+#include <fstream>
 #include <future>
+#include <mutex>
 #include <stdexcept>
 #include <iostream>
 #include <map>
+#include <thread>
 
 #ifdef _WIN32
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 #include <windows.h>
+#include <tlhelp32.h>
 #else
 #include <cerrno>
 #include <csignal>
@@ -60,6 +67,31 @@ std::wstring QuoteArgument(const std::wstring& argument) {
     quoted.append(slashes * 2U, L'\\');
     return quoted + L'"';
 }
+
+// What a child that missed its deadline was doing: its live threads and the
+// CPU time it used, so a log tells a waiting child from a busy one.
+std::string ChildState(const PROCESS_INFORMATION& child) {
+    std::string state = " threads=";
+    const auto snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0U);
+    if (snapshot == INVALID_HANDLE_VALUE) {
+        state += "unknown";
+    } else {
+        std::size_t threads = 0U;
+        THREADENTRY32 entry{};
+        entry.dwSize = sizeof(entry);
+        for (auto more = Thread32First(snapshot, &entry); more; more = Thread32Next(snapshot, &entry))
+            if (entry.th32OwnerProcessID == child.dwProcessId) ++threads;
+        (void)CloseHandle(snapshot);
+        state += std::to_string(threads);
+    }
+    FILETIME created{}, exited{}, kernel{}, user{};
+    const auto ms = [](const FILETIME& time) {
+        return ((static_cast<std::uint64_t>(time.dwHighDateTime) << 32U) | time.dwLowDateTime) / 10000U;
+    };
+    if (GetProcessTimes(child.hProcess, &created, &exited, &kernel, &user))
+        state += " user_ms=" + std::to_string(ms(user)) + " kernel_ms=" + std::to_string(ms(kernel));
+    return state;
+}
 #endif
 
 int RunChild(const std::string& executable, const std::vector<std::string>& arguments,
@@ -88,13 +120,14 @@ int RunChild(const std::string& executable, const std::vector<std::string>& argu
     const auto result = WaitForSingleObject(child.hProcess, static_cast<DWORD>(timeout.count()));
     if (result != WAIT_OBJECT_0) {
         const auto error = GetLastError();
+        const auto state = ChildState(child);
         if (!TerminateProcess(child.hProcess, 124U))
             throw std::runtime_error("cannot terminate child pid=" + std::to_string(child.dwProcessId) + " " + context);
         if (WaitForSingleObject(child.hProcess, 5000U) != WAIT_OBJECT_0)
             throw std::runtime_error("child termination did not complete pid=" + std::to_string(child.dwProcessId) + " " + context);
         throw std::runtime_error("child " + std::string(result == WAIT_TIMEOUT ? "deadline exceeded" : "wait failed") +
             " pid=" + std::to_string(child.dwProcessId) + " timeout_ms=" + std::to_string(timeout.count()) +
-            " " + context + " error=" + std::to_string(error));
+            " " + context + " error=" + std::to_string(error) + state);
     }
     DWORD exit_code = 0U;
     if (!GetExitCodeProcess(child.hProcess, &exit_code))
@@ -143,6 +176,60 @@ void ChildDeadline(const std::string& executable) {
     }
     assert(refused);
     std::cout << "child deadline and cleanup passed\n" << std::flush;
+}
+
+// A crash point is often reached while other threads run, as the feed sender
+// and slot worker do after a WAL flush. The exit must not wait for a lock one
+// of them holds: these threads keep taking a mutex, a condition variable, the
+// C runtime file and stdout locks and the heap until the process ends.
+[[noreturn]] void ExitWhileBusy(const std::filesystem::path& file) {
+    std::mutex mutex;
+    std::condition_variable changed, ready;
+    std::size_t started = 0U;
+    const auto running = [&](bool& counted) {
+        if (counted) return;
+        counted = true;
+        { std::lock_guard lock(mutex); ++started; }
+        ready.notify_all();
+    };
+    std::vector<std::thread> threads;
+    threads.emplace_back([&] {
+        for (bool counted = false;; running(counted)) { { std::lock_guard lock(mutex); } changed.notify_all(); }
+    });
+    threads.emplace_back([&] {
+        for (bool counted = false;; running(counted)) {
+            std::unique_lock lock(mutex);
+            (void)changed.wait_for(lock, std::chrono::milliseconds(1));
+        }
+    });
+    threads.emplace_back([&] {
+        for (bool counted = false;; running(counted))
+            std::ofstream(file, std::ios::binary | std::ios::trunc) << std::string(4096U, 'x');
+    });
+    threads.emplace_back([&] {
+        for (bool counted = false;; running(counted)) {
+            (void)std::fflush(stdout);
+            std::vector<std::uint8_t> bytes(65536U, 1U);
+            (void)bytes;
+        }
+    });
+    {
+        std::unique_lock lock(mutex);
+        ready.wait(lock, [&] { return started == threads.size(); });
+    }
+    std::cout << "busy child exits" << '\n';  // Left in the stdout buffer an orderly exit would flush.
+    ExitAbruptly(kCrashExit);
+}
+
+void ExitWhileBusyEnds(const std::string& executable) {
+    test::ScopedTempDir directory("chunkdb-feed-slot-busy-exit");
+    for (int run = 0; run < 20; ++run) {
+        const auto code = RunChild(executable, {"--exit-busy", (directory.path() / "busy").string()},
+                                   std::chrono::seconds(10));
+        if (code != kCrashExit)
+            throw std::runtime_error("busy crash exit returned " + std::to_string(code) + " run=" + std::to_string(run));
+    }
+    std::cout << "abrupt exit with busy threads passed\n" << std::flush;
 }
 
 int Crash(const std::filesystem::path& path, DurabilityMode mode, const char* point, bool empty) {
@@ -275,11 +362,13 @@ int main(int argc, char** argv) {
         never.get_future().wait();
         return 3;
     }
+    if (argc == 3 && std::string_view(argv[1]) == "--exit-busy") ExitWhileBusy(argv[2]);
     try {
         if (argc == 6 && std::string_view(argv[1]) == "--crash")
             return Crash(argv[2], ParseDurabilityMode(argv[3]), argv[4], std::string_view(argv[5]) == "empty");
         assert(argc == 1);
         ChildDeadline(std::filesystem::absolute(argv[0]).string());
+        ExitWhileBusyEnds(std::filesystem::absolute(argv[0]).string());
         std::size_t count = 0U;
         for (const auto mode : kModes) for (const bool base : {false, true}) for (const bool empty : {false, true})
             for (const auto* point : kPoints) {

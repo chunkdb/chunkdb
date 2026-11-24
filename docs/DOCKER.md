@@ -70,6 +70,7 @@ These settings apply only before users exist.
 ## Data and health
 
 The image runs as the chunkdb user, includes TLS support, and listens on port 4242.
+It also contains `chunkdb_exporter`, which serves the server's metrics to Prometheus; see [Export metrics](EXPORTER.md#docker).
 One volume at /var/lib/chunkdb contains data/ and backups/.
 Directories created by the server use owner-only mode 0700; new files use mode 0600.
 Startup tightens existing users-file permissions.
