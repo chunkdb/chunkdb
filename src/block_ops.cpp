@@ -1020,6 +1020,54 @@ void ChunkStore::WriteBlockColumnsLocked(
             after.begin() + static_cast<std::ptrdiff_t>(range.saved));
     };
     const bool presence_changed = previous_presence_byte != next_presence_byte;
+    // DEFAULT COMMIT_TIME columns take the commit time when the block is new
+    // or another of its values changes, unless the write changes them itself.
+    std::optional<std::uint64_t> stamped_time;
+    if (present && !geometry_.layout().commit_time_columns().empty()) [[unlikely]] {
+        const auto& layout = geometry_.layout();
+        const auto& stamp_columns = layout.commit_time_columns();
+        const auto stamps = [&](const ChunkLayout::FixedColumn* fixed) {
+            const auto index = static_cast<std::size_t>(fixed - layout.fixed_columns().data());
+            return std::find(stamp_columns.begin(), stamp_columns.end(), index) != stamp_columns.end();
+        };
+        constexpr std::size_t kChangedByWrite = std::numeric_limits<std::size_t>::max();
+        bool other = presence_changed || !var_update.empty();
+        // Each edited commit-time column with its value range, or
+        // kChangedByWrite when the write changes it.
+        std::vector<std::pair<const ChunkLayout::FixedColumn*, std::size_t>> edited;
+        std::size_t next = 0;
+        for (const auto& edit : write.edits) {
+            const std::size_t value_range = next++;
+            bool edit_changed = changed(ranges[value_range]);
+            if (edit.fixed->validity != ChunkLayout::kNoValidity) edit_changed = changed(ranges[next++]) || edit_changed;
+            if (!stamps(edit.fixed)) other = other || edit_changed;
+            else edited.emplace_back(edit.fixed, edit_changed ? kChangedByWrite : value_range);
+        }
+        if (other) {
+            if constexpr (sizeof...(Pinned) == 0U) stamped_time = NextCommitTimeMs(*chunk);
+            else stamped_time = (pinned_commit_time_ms, ...);
+            std::array<std::uint8_t, 8> time{};
+            for (std::size_t i = 0; i < time.size(); ++i) time[i] = static_cast<std::uint8_t>(*stamped_time >> (8U * i));
+            for (const auto index : stamp_columns) {
+                const auto* fixed = &layout.fixed_columns()[index];
+                const std::size_t bit = fixed->values * 8U + block_index * fixed->width;
+                const auto found = std::find_if(edited.begin(), edited.end(), [&](const auto& entry) { return entry.first == fixed; });
+                std::size_t range_index = 0;
+                if (found == edited.end()) {
+                    const std::size_t size = (bit + fixed->width - 1U) / 8U - bit / 8U + 1U;
+                    keep(bit / 8U, size);
+                    after.insert(after.end(), saved.end() - static_cast<std::ptrdiff_t>(size), saved.end());
+                    range_index = ranges.size() - 1U;
+                } else if (found->second == kChangedByWrite) {
+                    continue;
+                } else {
+                    range_index = found->second;
+                }
+                const auto& range = ranges[range_index];
+                WriteValueBits(after.data() + range.saved, bit - range.begin * 8U, time.data(), fixed->width);
+            }
+        }
+    }
     if (!presence_changed && var_update.empty() && std::none_of(ranges.begin(), ranges.end(), changed)) {
         return;
     }
@@ -1050,7 +1098,7 @@ void ChunkStore::WriteBlockColumnsLocked(
             var_undo = ApplyVarUpdate(&chunk->vars, std::move(var_update));
         }
         std::uint64_t commit_time_ms = 0;
-        if constexpr (sizeof...(Pinned) == 0U) commit_time_ms = NextCommitTimeMs(*chunk);
+        if constexpr (sizeof...(Pinned) == 0U) commit_time_ms = stamped_time ? *stamped_time : NextCommitTimeMs(*chunk);
         else commit_time_ms = (pinned_commit_time_ms, ...);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
         WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
@@ -1392,6 +1440,12 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
     std::vector<std::uint8_t> presence_bitmap,
     VarUpdate var_update,
     std::shared_ptr<const ChunkColumnState> chunk_columns, bool force_write) {
+    std::optional<std::uint64_t> stamped_time;
+    if (!geometry_.layout().commit_time_columns().empty()) [[unlikely]] {
+        stamped_time = NextCommitTimeMs(*regular_chunk);
+        geometry_.layout().StampCommitTime(regular_chunk->payload, regular_chunk->presence_bitmap, presence_bitmap,
+            VarChangedBlocks(regular_chunk->vars, var_update, geometry_.layout().block_count()), *stamped_time, &payload);
+    }
     const bool payload_changed = payload != regular_chunk->payload;
     const bool presence_changed = presence_bitmap != regular_chunk->presence_bitmap;
     const bool supplied_chunk_columns = chunk_columns != nullptr;
@@ -1434,7 +1488,7 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
         if (!var_update.empty()) {
             var_undo = ApplyVarUpdate(&regular_chunk->vars, std::move(var_update));
         }
-        const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
+        const std::uint64_t commit_time_ms = stamped_time ? *stamped_time : NextCommitTimeMs(*regular_chunk);
         // A full-chunk replace can span several records; the frame makes the
         // whole replace atomic across crash recovery.
         WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());

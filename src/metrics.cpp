@@ -189,7 +189,7 @@ MetricsRegistry::ErrorClass MetricsRegistry::ClassifyErrorCode(
 
 std::string MetricsRegistry::RenderPrometheus(
     const StoreRuntimeStats& store_stats,
-    std::size_t loaded_chunks, const StoreResources* resources) const {
+    std::size_t loaded_chunks, const StoreResources* resources, const std::vector<TableExpiryMetrics>& expiry) const {
     std::string out;
     out.reserve(8192);
 
@@ -375,6 +375,27 @@ std::string MetricsRegistry::RenderPrometheus(
         out += counter.name;
         out += " counter\n";
         AppendCounter(&out, counter.name, "", counter.value);
+    }
+
+    if (!expiry.empty()) {
+        out += "# HELP chunkdb_expiry_lag_seconds Time since the start of the last completed expiry sweep, "
+               "by table with an expire_column.\n";
+        out += "# TYPE chunkdb_expiry_lag_seconds gauge\n";
+        for (const auto& table : expiry) {
+            out += "chunkdb_expiry_lag_seconds{table=\"";
+            out += table.table;
+            out += "\"} ";
+            out += FormatMicrosAsSeconds(table.lag_ms * 1000U);
+            out += "\n";
+        }
+        out += "# HELP chunkdb_expired_blocks_total Blocks deleted by expiry, by table.\n";
+        out += "# TYPE chunkdb_expired_blocks_total counter\n";
+        for (const auto& table : expiry)
+            AppendCounter(&out, "chunkdb_expired_blocks_total", "table=\"" + table.table + "\"", table.expired_blocks);
+        out += "# HELP chunkdb_expiry_failed_passes_total Expiry passes that failed, by table.\n";
+        out += "# TYPE chunkdb_expiry_failed_passes_total counter\n";
+        for (const auto& table : expiry)
+            AppendCounter(&out, "chunkdb_expiry_failed_passes_total", "table=\"" + table.table + "\"", table.failed_passes);
     }
 
     return out;

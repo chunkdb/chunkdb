@@ -109,6 +109,7 @@ add_library(chunkdb_core STATIC
     src/engine_cql.cpp
     src/engine_sessions.cpp
     src/eviction.cpp
+    src/expiry.cpp
     src/chunk_vars.cpp
     src/feature_flags.cpp
     src/feature_activation_records.cpp
@@ -135,6 +136,7 @@ add_library(chunkdb_core STATIC
     src/schema.cpp
     src/store_resources.cpp
     src/table_catalog.cpp
+    src/table_expiry.cpp
     src/catalog_txn_snapshot.cpp
     src/table_chunk_columns.cpp
     src/table_tombstones.cpp
@@ -572,6 +574,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_alter_column_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_alter_column_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME alter_column COMMAND chunkdb_alter_column_test)
+
+    add_executable(chunkdb_expiry_test tests/expiry_tests.cpp)
+    target_link_libraries(chunkdb_expiry_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_expiry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    add_test(NAME expiry COMMAND chunkdb_expiry_test)
 
     add_executable(chunkdb_cql_test tests/cql_tests.cpp)
     target_link_libraries(chunkdb_cql_test PRIVATE chunkdb_core)
@@ -1210,6 +1217,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_column_types_test
         chunkdb_narrowing_test
         chunkdb_alter_column_test
+        chunkdb_expiry_test
         chunkdb_cql_test
         chunkdb_expr_test
         chunkdb_cql_engine_test

@@ -6,6 +6,7 @@
 #include <cstdint>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "chunkdb/chunk_store.hpp"
 
@@ -65,9 +66,19 @@ class MetricsRegistry {
 
     [[nodiscard]] static ErrorClass ClassifyErrorCode(std::string_view error_code) noexcept;
 
+    // Expiry of one table with an expire_column (Table::Expiry); table names
+    // are labels.
+    struct TableExpiryMetrics {
+        std::string table;
+        std::uint64_t lag_ms = 0U;
+        std::uint64_t expired_blocks = 0U;
+        std::uint64_t failed_passes = 0U;
+    };
+
     [[nodiscard]] std::string RenderPrometheus(
         const StoreRuntimeStats& store_stats,
-        std::size_t loaded_chunks, const StoreResources* resources = nullptr) const;
+        std::size_t loaded_chunks, const StoreResources* resources = nullptr,
+        const std::vector<TableExpiryMetrics>& expiry = {}) const;
 
   private:
     struct Histogram {

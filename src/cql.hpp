@@ -189,6 +189,8 @@ struct ColumnDefinition {
     bool nullable = false;
     bool required = false;
     std::optional<Literal> default_value;
+    // DEFAULT COMMIT_TIME, in place of a default value.
+    bool default_commit_time = false;
 };
 struct Option {
     std::string name;
@@ -243,7 +245,7 @@ struct AlterColumnAttribute {
     enum class Change : std::uint8_t { kSetDefault, kDropDefault, kSetNull, kDropNull, kSetRequired, kDropRequired };
     std::string column;
     Change change = Change::kSetDefault;
-    // kSetDefault only.
+    // kSetDefault only: the value, or none for DEFAULT COMMIT_TIME.
     std::optional<Literal> value{};
 };
 // RENAME TO: the table's new name.

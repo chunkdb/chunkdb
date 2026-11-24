@@ -592,6 +592,16 @@ std::uint64_t ChunkStore::CommitTransaction(
     for (const auto& change : changes) {
         commit_time_ms = NextCommitTimeMs(*change.target->chunk);
     }
+    // DEFAULT COMMIT_TIME columns of the blocks the transaction changes take
+    // its commit time, unless it changes them itself.
+    if (!geometry_.layout().commit_time_columns().empty()) [[unlikely]] {
+        for (auto& change : changes) {
+            auto& state = change.write->state;
+            const auto& chunk = *change.target->chunk;
+            geometry_.layout().StampCommitTime(chunk.payload, chunk.presence_bitmap, state.presence_bitmap,
+                VarChangedBlocks(chunk.vars, state.vars, geometry_.layout().block_count()), commit_time_ms, &state.payload);
+        }
+    }
     // Loaded after the version was taken, as a plain write does.
     const bool keep_states = txn_history_->OpenCount() > 0U;
 

@@ -20,7 +20,8 @@ namespace {
 constexpr std::uint8_t kFlagNullable = 0x1U;
 constexpr std::uint8_t kFlagRequired = 0x2U;
 constexpr std::uint8_t kFlagHasDefault = 0x4U;
-constexpr std::uint8_t kKnownFlags = kFlagNullable | kFlagRequired | kFlagHasDefault;
+constexpr std::uint8_t kFlagCommitTime = 0x8U;
+constexpr std::uint8_t kKnownFlags = kFlagNullable | kFlagRequired | kFlagHasDefault | kFlagCommitTime;
 
 [[nodiscard]] bool IsKnownKind(std::uint8_t kind) noexcept {
     return kind >= static_cast<std::uint8_t>(ColumnKind::kUnsigned) &&
@@ -95,6 +96,14 @@ void ValidateColumnType(const Column& column) {
 namespace {
 
 void ValidateDefault(const Column& column) {
+    if (column.default_commit_time) {
+        if (column.type != ColumnType{.kind = ColumnKind::kUnsigned, .size = 64U} || column.nullable) {
+            throw std::invalid_argument("column " + column.name + ": DEFAULT COMMIT_TIME needs a u64 column that is not NULL");
+        }
+        if (!column.has_default || column.default_value != std::vector<std::uint8_t>(8U, 0U)) {
+            throw std::invalid_argument("column " + column.name + ": DEFAULT COMMIT_TIME keeps a zero default value");
+        }
+    }
     if (!column.has_default) {
         if (!column.default_value.empty()) {
             throw std::invalid_argument("column " + column.name + ": a default value without DEFAULT");
@@ -286,6 +295,9 @@ void ValidateColumns(const TableSchema& schema, ColumnDomain domain) {
             throw std::invalid_argument("column " + column.name + " cannot be both NULL and REQUIRED");
         }
         ValidateDefault(column);
+        if (column.default_commit_time && domain == ColumnDomain::kChunk) {
+            throw std::invalid_argument("chunk column " + column.name + " cannot take DEFAULT COMMIT_TIME");
+        }
     }
     std::uint64_t fixed_bits = 0;
     for (const auto& column : schema.columns) {
@@ -717,7 +729,7 @@ void EncodeColumn(std::vector<std::uint8_t>& out, const Column& column) {
     WriteLe32(out, column.type.size);
     out.push_back(static_cast<std::uint8_t>(
         (column.nullable ? kFlagNullable : 0U) | (column.required ? kFlagRequired : 0U) |
-        (column.has_default ? kFlagHasDefault : 0U)));
+        (column.has_default ? kFlagHasDefault : 0U) | (column.default_commit_time ? kFlagCommitTime : 0U)));
     out.push_back(static_cast<std::uint8_t>(column.name.size()));
     out.insert(out.end(), column.name.begin(), column.name.end());
     if (column.has_default) {
@@ -741,6 +753,7 @@ void EncodeColumn(std::vector<std::uint8_t>& out, const Column& column) {
     column.nullable = (flags & kFlagNullable) != 0U;
     column.required = (flags & kFlagRequired) != 0U;
     column.has_default = (flags & kFlagHasDefault) != 0U;
+    column.default_commit_time = (flags & kFlagCommitTime) != 0U;
     const auto name_length = static_cast<std::size_t>(in.Le(1));
     const auto name = in.Bytes(name_length);
     column.name.assign(name.begin(), name.end());
@@ -1209,6 +1222,10 @@ TableSchema ChangeColumnType(
     if (before.type == type) {
         throw std::invalid_argument("column " + before.name + " is already " + ColumnTypeName(type));
     }
+    if (before.default_commit_time) {
+        throw std::invalid_argument(
+            "column " + before.name + " has DEFAULT COMMIT_TIME, which needs u64; DROP DEFAULT first");
+    }
     if (conversion == Conversion::kExact && !Widens(before.type, type)) {
         throw std::invalid_argument(
             "column " + before.name + ": " + ColumnTypeName(type) + " does not hold every " + ColumnTypeName(before.type) +
@@ -1246,6 +1263,10 @@ void ValidatePending(const TableSchema& schema) {
         throw std::invalid_argument(
             "column " + column->name + " cannot be narrowed from " + ColumnTypeName(column->type) + " to " +
             ColumnTypeName(pending.type));
+    }
+    if (column->default_commit_time) {
+        throw std::invalid_argument(
+            "column " + column->name + " has DEFAULT COMMIT_TIME, which needs u64; DROP DEFAULT first");
     }
     Column narrowed = *column;
     narrowed.type = pending.type;
@@ -1331,6 +1352,7 @@ namespace {
     column.required = after.required;
     column.has_default = after.has_default;
     column.default_value = after.has_default ? after.default_value : std::vector<std::uint8_t>{};
+    column.default_commit_time = after.default_commit_time;
     SchemaChange change{
         .kind = SchemaChange::Kind::kChangeAttributes,
         .position = static_cast<std::uint32_t>(at),
@@ -1349,7 +1371,8 @@ TableSchema ChangeColumnAttributes(const TableSchema& schema, std::string_view n
     const Column& before = schema.columns[at];
     if (before.nullable == attributes.nullable && before.required == attributes.required &&
         before.has_default == attributes.has_default &&
-        (!attributes.has_default || before.default_value == attributes.default_value)) {
+        (!attributes.has_default || before.default_value == attributes.default_value) &&
+        before.default_commit_time == attributes.default_commit_time) {
         throw std::invalid_argument("column " + before.name + " already has these attributes");
     }
     if (before.nullable && !attributes.nullable) {

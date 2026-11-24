@@ -59,6 +59,7 @@ inline constexpr std::uint16_t kOptionFeedBufferBytes = 8;         // u64, > 0
 inline constexpr std::uint16_t kOptionSlotMaxBytes = 9;            // u64, > 0
 inline constexpr std::uint16_t kOptionParentEpoch = 10;            // 16-byte store id
 inline constexpr std::uint16_t kOptionForkRevision = 11;           // u64, including zero
+inline constexpr std::uint16_t kOptionExpireColumn = 12;           // u32 block column id, > 0
 
 struct StoreManifest {
     FeatureFlags features{.incompat = kFeatureChunkModel};
@@ -86,6 +87,9 @@ void ReplaceTableOptions(StoreManifest* manifest, const TableOptions& options);
 // ParseStoreManifest has already checked that the manifest's features allow
 // them.
 [[nodiscard]] TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options);
+// Throws std::invalid_argument unless the expire_column of `options`, when
+// set, is a u64 block column of `schema` that no narrowing changes.
+void RequireValidExpireColumn(const TableOptions& options, const TableSchema& schema);
 
 [[nodiscard]] std::filesystem::path StoreManifestPath(const std::filesystem::path& data_dir);
 [[nodiscard]] std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest);

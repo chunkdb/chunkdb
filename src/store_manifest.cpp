@@ -30,7 +30,20 @@ constexpr std::size_t kDataDirOptionsOffset = 40U;
 
 [[nodiscard]] bool IsKnownTableOptionType(std::uint16_t type) noexcept {
     return (type >= kOptionDurabilityMode && type <= kOptionVarMaxChunkBytes) ||
-           type == kOptionFeedBufferBytes || type == kOptionSlotMaxBytes;
+           type == kOptionFeedBufferBytes || type == kOptionSlotMaxBytes || type == kOptionExpireColumn;
+}
+
+// The value of the first well-formed expire_column entry, or 0.
+[[nodiscard]] std::uint32_t ExpireColumnEntry(const std::vector<std::uint8_t>& options) {
+    for (std::size_t at = 0; options.size() - at >= kOptionEntryHeaderSize;) {
+        const auto type = ReadLe16(options, at);
+        const auto length = ReadLe16(options, at + 2U);
+        const auto value_at = at + kOptionEntryHeaderSize;
+        if (options.size() - value_at < length) break;
+        if (type == kOptionExpireColumn && length == 4U) return ReadLe32(options, value_at);
+        at = value_at + length;
+    }
+    return 0U;
 }
 
 [[nodiscard]] bool IsKnownTableManifestType(std::uint16_t type) noexcept {
@@ -229,6 +242,9 @@ std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) 
             " fixed bits per block");
     }
     (void)Geometry(manifest.geometry, manifest.schema, chunk_schema);
+    // Malformed options are ParseStoreManifest's to refuse; a well-formed
+    // expire_column must name a column the schema keeps.
+    RequireValidExpireColumn(TableOptions{.expire_column = ExpireColumnEntry(manifest.options)}, manifest.schema);
     const auto schema = EncodeTableSchema(manifest.schema);
     const auto encoded_chunk_schema = EncodeChunkSchema(chunk_schema);
     const auto lineage_bytes = manifest.lineage ? 32U : 0U;
@@ -365,7 +381,11 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
         bytes.begin() + static_cast<std::ptrdiff_t>(schema_size_offset));
     ValidateOptions(manifest.options, manifest.features, IsKnownTableManifestType);
     DecodeLineage(&manifest);
-    (void)DecodeTableOptions(manifest.options);
+    try {
+        RequireValidExpireColumn(DecodeTableOptions(manifest.options), manifest.schema);
+    } catch (const std::invalid_argument& e) {
+        throw std::runtime_error(std::string("invalid options: ") + e.what());
+    }
     return manifest;
 }
 
@@ -403,7 +423,27 @@ std::vector<std::uint8_t> EncodeTableOptions(const TableOptions& options) {
     AppendOption(out, kOptionVarMaxChunkBytes, static_cast<std::uint64_t>(options.var_max_chunk_bytes));
     if (options.feed_buffer_bytes) AppendOption(out, kOptionFeedBufferBytes, static_cast<std::uint64_t>(*options.feed_buffer_bytes));
     if (options.slot_max_bytes) AppendOption(out, kOptionSlotMaxBytes, static_cast<std::uint64_t>(*options.slot_max_bytes));
+    if (options.expire_column != 0U) {
+        WriteLe16(out, kOptionExpireColumn);
+        WriteLe16(out, 4U);
+        WriteLe32(out, options.expire_column);
+    }
     return out;
+}
+
+void RequireValidExpireColumn(const TableOptions& options, const TableSchema& schema) {
+    if (options.expire_column == 0U) return;
+    const auto at = std::find_if(schema.columns.begin(), schema.columns.end(),
+        [&](const Column& column) { return column.id == options.expire_column; });
+    if (at == schema.columns.end()) {
+        throw std::invalid_argument("the expire_column is not a column of the table; set expire_column = NULL first");
+    }
+    if (at->type != ColumnType{.kind = ColumnKind::kUnsigned, .size = 64U}) {
+        throw std::invalid_argument("expire_column " + at->name + " must be u64; set expire_column = NULL first");
+    }
+    if (schema.pending && schema.pending->column_id == at->id && !schema.pending->not_null) {
+        throw std::invalid_argument("expire_column " + at->name + " must stay u64; set expire_column = NULL first");
+    }
 }
 
 void ReplaceTableOptions(StoreManifest* manifest, const TableOptions& options) {
@@ -443,6 +483,12 @@ TableOptions DecodeTableOptions(const std::vector<std::uint8_t>& options) {
             throw std::runtime_error("option " + std::to_string(type) + " appears twice");
         }
         seen |= bit;
+        if (type == kOptionExpireColumn) {
+            if (length != 4U) throw std::runtime_error("option " + std::to_string(type) + " has length " + std::to_string(length));
+            decoded.expire_column = ReadLe32(options, value_at);
+            if (decoded.expire_column == 0U) throw std::runtime_error("option " + std::to_string(type) + " has value 0");
+            continue;
+        }
         const bool is_u8 =
             type == kOptionDurabilityMode || type == kOptionCheckpointCompression;
         if (length != (is_u8 ? 1U : 8U)) {

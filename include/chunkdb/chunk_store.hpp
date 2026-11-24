@@ -247,6 +247,9 @@ struct TableOptions {
     // Absent limits inherit the catalog defaults when the table opens.
     std::optional<std::size_t> feed_buffer_bytes{};
     std::optional<std::size_t> slot_max_bytes{};
+    // Id of the u64 block column whose time, in Unix ms, deletes a block
+    // once it has passed (expiry); 0 for none.
+    std::uint32_t expire_column = 0U;
 };
 
 class StoreResources;
@@ -355,6 +358,17 @@ inline constexpr std::size_t kDefaultSnapshotGenerationLingerMaxBrackets = 512;
 struct ChunkScanPage {
     std::vector<ChunkCoord> coords;
     bool has_more = false;
+};
+
+// One bounded expiry pass (ChunkStore::ExpireBlocks).
+struct ExpiryPass {
+    // Populated chunks the pass read.
+    std::size_t chunks = 0U;
+    // Blocks it deleted.
+    std::size_t deleted = 0U;
+    // Whether populated chunks remain after `next`, the last chunk read.
+    bool more = false;
+    ChunkCoord next{};
 };
 
 struct ChunkRangeEntry {
@@ -800,6 +814,14 @@ class ChunkStore {
         bool has_cursor,
         ChunkCoord cursor,
         std::size_t limit);
+    // Expiry (docs/reference/TABLES.md#expiry): reads at most `max_chunks`
+    // populated chunks after `cursor` in coordinate order and deletes their
+    // present blocks whose u64 column `column_id` holds a time t with
+    // 0 < t <= now_ms. Each chunk with such blocks is one ordinary commit of
+    // the current write user, decided under its chunk lock; other chunks
+    // are read without entering the cache.
+    [[nodiscard]] ExpiryPass ExpireBlocks(std::uint32_t column_id, bool has_cursor, ChunkCoord cursor,
+        std::size_t max_chunks, std::uint64_t now_ms);
     // With `filter`, the page reads each identity's state, and every identity it
     // visits counts toward `limit`, whether the filter keeps it or not.
     [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentities(
@@ -1701,6 +1723,9 @@ class ChunkStore {
         const TxnSnapshot* snapshot,
         const TxnAreaRead* txn_read);
 
+    // ExpireBlocks for one chunk: the blocks it deleted.
+    [[nodiscard]] std::size_t ExpireChunkBlocks(const ChunkCoord& coord, const ChunkLayout::FixedColumn& column,
+        std::uint64_t now_ms);
     // Issues the next version token; requires a read-write store.
     [[nodiscard]] std::uint64_t NextChunkVersion();
     // Commit time for a mutation of `chunk`: the wall clock in Unix ms, never
@@ -2090,6 +2115,7 @@ class StoreResources {
     friend class ChunkStore;
     friend class Table;
     friend class TableCatalog;
+    friend struct ExpiryTestAccess;
 
     [[nodiscard]] std::shared_ptr<MaintenancePool> MaintenanceWorkers();
     const std::size_t maintenance_workers_;

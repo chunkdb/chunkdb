@@ -1,6 +1,7 @@
 #include "chunkdb/chunk_layout.hpp"
 
 #include <algorithm>
+#include <array>
 #include <optional>
 #include <variant>
 #include <cstring>
@@ -82,11 +83,54 @@ ChunkLayout::ChunkLayout(
             throw std::invalid_argument("chunk payload must be <= " + std::to_string(max_payload_bytes) + " bytes");
         }
         fixed_index_[i] = fixed_.size();
+        if (column.default_commit_time) commit_time_columns_.push_back(fixed_.size());
         fixed_.push_back(fixed);
     }
     payload_bytes_ = offset;
     bit_string_blocks_ = schema_.columns.size() == 1U && schema_.columns.front().type.kind == ColumnKind::kBits &&
                          !schema_.columns.front().nullable;
+}
+
+namespace {
+
+// Bit `bit` of `bytes`; bits past the end are zero (a chunk without state).
+[[nodiscard]] bool BitOrZero(std::span<const std::uint8_t> bytes, std::size_t bit) noexcept {
+    return bit / 8U < bytes.size() && GetBit(bytes.data(), bit);
+}
+
+}  // namespace
+
+void ChunkLayout::StampCommitTime(std::span<const std::uint8_t> before_payload,
+    std::span<const std::uint8_t> before_presence, std::span<const std::uint8_t> presence,
+    const std::vector<bool>& var_changed, std::uint64_t commit_time_ms, std::vector<std::uint8_t>* payload) const {
+    if (commit_time_columns_.empty()) return;
+    std::array<std::uint8_t, 8> time{};
+    for (std::size_t i = 0; i < time.size(); ++i) time[i] = static_cast<std::uint8_t>(commit_time_ms >> (8U * i));
+    const auto stamped = [this](std::size_t fixed) {
+        return std::find(commit_time_columns_.begin(), commit_time_columns_.end(), fixed) != commit_time_columns_.end();
+    };
+    for (std::size_t block = 0; block < block_count_; ++block) {
+        if (!BitOrZero(presence, block)) continue;
+        const std::span<const std::uint8_t> after(*payload);
+        const auto differs = [&](const FixedColumn& column) {
+            if (column.validity != kNoValidity &&
+                BitOrZero(before_payload, column.validity * 8U + block) != BitOrZero(after, column.validity * 8U + block))
+                return true;
+            const std::size_t first = column.values * 8U + block * column.width;
+            for (std::size_t bit = first; bit < first + column.width; ++bit)
+                if (BitOrZero(before_payload, bit) != BitOrZero(after, bit)) return true;
+            return false;
+        };
+        bool other = !BitOrZero(before_presence, block) || (block < var_changed.size() && var_changed[block]);
+        for (std::size_t fixed = 0; !other && fixed < fixed_.size(); ++fixed)
+            other = !stamped(fixed) && differs(fixed_[fixed]);
+        if (!other) continue;
+        for (const auto fixed : commit_time_columns_) {
+            // A value the commit gives the column itself stays.
+            if (differs(fixed_[fixed])) continue;
+            WriteValueBits(payload->data(), fixed_[fixed].values * 8U + block * fixed_[fixed].width, time.data(), 64U);
+        }
+    }
 }
 
 const ChunkLayout::FixedColumn* ChunkLayout::FixedColumnAt(std::size_t index) const noexcept {

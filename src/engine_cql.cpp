@@ -432,6 +432,7 @@ std::optional<std::string> SlotOwner(const cql::CreateSlot& create, bool require
 // column without one.
 void SetDefault(Column& column, const cql::Literal& literal) {
     const ColumnValue value = LiteralValue(column, literal);
+    column.default_commit_time = false;
     if (std::holds_alternative<std::monostate>(value)) {
         // A NULL column without a DEFAULT takes NULL.
         if (!column.nullable) {
@@ -446,6 +447,14 @@ void SetDefault(Column& column, const cql::Literal& literal) {
         IsFixedWidth(column.type.kind) ? EncodeColumnValue(column, value) : EncodeVarValue(column, value);
 }
 
+// Gives `column` DEFAULT COMMIT_TIME: a zero default the commit time
+// replaces (ValidateTableSchema checks that it is u64).
+void SetCommitTimeDefault(Column& column) {
+    column.has_default = true;
+    column.default_value.assign(8U, 0U);
+    column.default_commit_time = true;
+}
+
 // A column of CREATE TABLE or ADD COLUMN; `id` is replaced by AddColumn.
 [[nodiscard]] Column ColumnFrom(const cql::ColumnDefinition& definition, std::uint32_t id) {
     Column column;
@@ -454,6 +463,10 @@ void SetDefault(Column& column, const cql::Literal& literal) {
     column.type = definition.type;
     column.nullable = definition.nullable;
     column.required = definition.required;
+    if (definition.default_commit_time) {
+        SetCommitTimeDefault(column);
+        return column;
+    }
     if (!definition.default_value.has_value()) {
         return column;
     }
@@ -472,11 +485,15 @@ void SetDefault(Column& column, const cql::Literal& literal) {
     if (at == schema.columns.end()) throw std::invalid_argument("the table has no column " + attribute.column);
     Column column = *at;
     switch (attribute.change) {
-        case Change::kSetDefault: SetDefault(column, *attribute.value); break;
+        case Change::kSetDefault:
+            if (attribute.value) SetDefault(column, *attribute.value);
+            else SetCommitTimeDefault(column);
+            break;
         case Change::kDropDefault:
             if (!column.has_default) throw std::invalid_argument(Describe(column) + " has no DEFAULT");
             column.has_default = false;
             column.default_value.clear();
+            column.default_commit_time = false;
             break;
         case Change::kSetNull: column.nullable = true; break;
         case Change::kDropNull: column.nullable = false; break;
@@ -500,6 +517,8 @@ void SetDefault(Column& column, const cql::Literal& literal) {
             text = std::to_string(integer->magnitude);
         } else if (const auto* word = std::get_if<cql::Text>(&option.value); word != nullptr) {
             text = word->value;
+        } else if (std::holds_alternative<cql::Null>(option.value) && option.name == "expire_column") {
+            // NULL: no expiry.
         } else {
             throw std::invalid_argument("option " + option.name + " takes a number or a quoted value");
         }
@@ -575,7 +594,10 @@ struct FileUsage {
     sides(info.geometry.large_chunk_width_chunks, info.geometry.large_chunk_height_chunks,
         info.geometry.large_chunk_depth_chunks);
     key("options");
-    Protocol::AppendMapHeader(reply, 8);
+    const auto expire_column = std::find_if(info.schema.columns.begin(), info.schema.columns.end(),
+        [&](const Column& column) { return column.id == info.options.expire_column; });
+    const bool expires = info.options.expire_column != 0U && expire_column != info.schema.columns.end();
+    Protocol::AppendMapHeader(reply, expires ? 9 : 8);
     key("durability_mode");
     Protocol::AppendBulk(reply, DurabilityModeName(info.options.durability_mode));
     key("checkpoint_updates");
@@ -592,6 +614,10 @@ struct FileUsage {
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.feed_buffer_bytes));
     key("slot_max_bytes");
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.slot_max_bytes));
+    if (expires) {
+        key("expire_column");
+        Protocol::AppendBulk(reply, expire_column->name);
+    }
     key("epoch");
     Protocol::AppendBulk(reply, StoreIdHex(store != nullptr ? store->store_id() : info.store_id));
     key("revision");
@@ -947,7 +973,8 @@ TableDefinition DefinitionFrom(const cql::CreateTable& create, const TableOption
         .columns = {}, .history = {}, .pending = std::nullopt};
     for (std::size_t i = 0U; i < create.chunk_columns.size(); ++i)
         chunk_schema.columns.push_back(ColumnFrom(create.chunk_columns[i], static_cast<std::uint32_t>(i + 1U)));
-    return {geometry, OptionsFrom(create.options).ApplyTo(defaults), std::move(schema), std::move(chunk_schema)};
+    auto options = OptionsFrom(create.options).ApplyTo(defaults, &schema);
+    return {geometry, std::move(options), std::move(schema), std::move(chunk_schema)};
 }
 
 bool HasColumn(const TableSchema& schema, std::string_view name) {
@@ -1348,7 +1375,7 @@ std::string CommandEngine::ExecuteStatement(
                                 },
                                 [&](const cql::SetOption& set) {
                                     request.alter = [&set](StoreManifest& m) {
-                                        ReplaceTableOptions(&m, OptionsFrom({set.option}).ApplyTo(DecodeTableOptions(m.options)));
+                                        ReplaceTableOptions(&m, OptionsFrom({set.option}).ApplyTo(DecodeTableOptions(m.options), &m.schema));
                                     };
                                 },
                                 [&](const cql::AlterColumnAttribute& attribute) {

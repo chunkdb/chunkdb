@@ -61,6 +61,17 @@ class ChunkLayout {
     [[nodiscard]] bool bit_string_blocks() const noexcept { return bit_string_blocks_; }
     // The schema has text or bytes columns.
     [[nodiscard]] bool has_var_columns() const noexcept { return !var_by_id_.empty(); }
+    // Indexes in fixed_columns() of the DEFAULT COMMIT_TIME columns.
+    [[nodiscard]] const std::vector<std::size_t>& commit_time_columns() const noexcept { return commit_time_columns_; }
+    // Within each block present in `presence`, sets every DEFAULT
+    // COMMIT_TIME column to `commit_time_ms` (with its validity bit) when the
+    // block is new or another value of it differs from `before`, and the
+    // column itself is unchanged. `var_changed[i]` says that a text or bytes
+    // value of block i changed. `before_payload` and `before_presence` may be
+    // empty for a chunk that had no state.
+    void StampCommitTime(std::span<const std::uint8_t> before_payload,
+        std::span<const std::uint8_t> before_presence, std::span<const std::uint8_t> presence,
+        const std::vector<bool>& var_changed, std::uint64_t commit_time_ms, std::vector<std::uint8_t>* payload) const;
 
     // Throws std::invalid_argument naming the first entry of `vars` that is
     // not a value of a text or bytes column of a block present in
@@ -93,6 +104,7 @@ class ChunkLayout {
     std::unordered_map<std::uint32_t, std::size_t> var_by_id_;
     // Every column by id.
     std::unordered_map<std::uint32_t, std::size_t> by_id_;
+    std::vector<std::size_t> commit_time_columns_;
     bool bit_string_blocks_ = false;
 };
 

@@ -186,6 +186,7 @@ void Protocol::AppendColumns(std::string& out, const std::vector<Column>& column
         AppendBulk(out, "required"); AppendBoolean(out, column.required);
         AppendBulk(out, "default");
         if (!column.has_default) AppendNull(out);
+        else if (column.default_commit_time) AppendBulk(out, "COMMIT_TIME");
         else AppendValue(out, IsFixedWidth(column.type.kind)
             ? DecodeColumnValue(column, column.default_value.data()) : DecodeVarValue(column, column.default_value));
     }

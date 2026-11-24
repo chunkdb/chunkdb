@@ -1,6 +1,7 @@
 #include "chunkdb/engine.hpp"
 #include "audit_log.hpp"
 #include "backup.hpp"
+#include "chunk_store_internal.hpp"
 #include "source_address.hpp"
 
 #include <algorithm>
@@ -204,6 +205,9 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
         update->feed_buffer_bytes = ParsePositiveSize(key, value);
     } else if (KeyIs(key, "slot_max_bytes")) {
         update->slot_max_bytes = ParsePositiveSize(key, value);
+    } else if (KeyIs(key, "expire_column")) {
+        // Empty for none; the table's columns resolve the name.
+        update->expire_column_name = std::string(value);
     } else if (IsGeometryKey(key)) {
         throw std::invalid_argument(
             std::string(key) + " is part of the geometry, which is fixed when a table is "
@@ -1146,10 +1150,16 @@ std::size_t CommandEngine::AuthFailureTrackedSourcesForTests() {
 std::string CommandEngine::HandleMetrics() const {
     // Store counters summed over all tables; the cache is shared by them.
     StoreRuntimeStats total;
+    std::vector<MetricsRegistry::TableExpiryMetrics> expiry;
+    const auto now = UnixMillisNow();
     for (const auto& info : catalog_->List()) {
         const auto table = catalog_->Find(info.name);
         if (table == nullptr) {
             continue;
+        }
+        if (const auto status = table->Expiry(now)) {
+            expiry.push_back({.table = info.name, .lag_ms = status->lag_ms, .expired_blocks = status->expired_blocks,
+                .failed_passes = status->failed_passes});
         }
         const auto lease = table->Acquire();
         if (!lease.has_value()) {
@@ -1158,7 +1168,7 @@ std::string CommandEngine::HandleMetrics() const {
         AddRuntimeStats(&total, lease->store().RuntimeStats());
     }
     return Protocol::Bulk(metrics_->RenderPrometheus(
-        total, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get()));
+        total, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get(), expiry));
 }
 
 

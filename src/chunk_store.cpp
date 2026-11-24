@@ -17,6 +17,7 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <cerrno>
 #include <cstdlib>
@@ -224,10 +225,57 @@ std::uint64_t CurrentProcessIdValue() {
 #endif
 }
 
+#ifdef CHUNKDB_FAILPOINTS
+namespace {
+std::atomic<std::uint64_t (*)()> unix_millis_clock_for_tests{nullptr};
+}  // namespace
+
+void SetUnixMillisClockForTests(std::uint64_t (*clock)()) noexcept {
+    unix_millis_clock_for_tests.store(clock, std::memory_order_release);
+}
+#endif
+
 std::uint64_t UnixMillisNow() {
+#ifdef CHUNKDB_FAILPOINTS
+    if (auto* clock = unix_millis_clock_for_tests.load(std::memory_order_acquire)) return clock();
+#endif
     const auto now = std::chrono::system_clock::now().time_since_epoch();
     return static_cast<std::uint64_t>(
         std::chrono::duration_cast<std::chrono::milliseconds>(now).count());
+}
+
+std::vector<bool> VarChangedBlocks(const ChunkVars& before, const VarUpdate& update, std::size_t blocks) {
+    if (update.replace) return VarChangedBlocks(before, *update.replace, blocks);
+    std::vector<bool> changed(blocks, false);
+    for (const auto& change : update.changes) {
+        const auto current = before.Find(change.key);
+        const bool same = change.value ? current && std::equal(current->begin(), current->end(),
+                                                               change.value->begin(), change.value->end())
+                                       : !current;
+        if (!same && change.key.block_index < blocks) changed[change.key.block_index] = true;
+    }
+    return changed;
+}
+
+std::vector<bool> VarChangedBlocks(const ChunkVars& before, const ChunkVars& after, std::size_t blocks) {
+    std::vector<bool> changed(blocks, false);
+    const auto mark = [&](const VarKey& key) {
+        if (key.block_index < blocks) changed[key.block_index] = true;
+    };
+    auto left = before.begin();
+    auto right = after.begin();
+    while (left != before.end() || right != after.end()) {
+        if (right == after.end() || (left != before.end() && (*left).key < (*right).key)) {
+            mark((*left++).key);
+        } else if (left == before.end() || (*right).key < (*left).key) {
+            mark((*right++).key);
+        } else {
+            const auto a = *left++;
+            const auto b = *right++;
+            if (!std::equal(a.value.begin(), a.value.end(), b.value.begin(), b.value.end())) mark(a.key);
+        }
+    }
+    return changed;
 }
 
 std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor) {

@@ -107,6 +107,9 @@ struct CatalogConfig {
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::chrono::milliseconds feed_linger{30000};
     QueryLimits query_limits{};
+    // How often tables with an expire_column start an expiry sweep; zero
+    // starts none (tests run them through ExpiryTestAccess).
+    std::chrono::milliseconds expiry_interval{1000};
 };
 
 // A catalog configuration whose new-table options and shared budgets come
@@ -126,10 +129,16 @@ struct TableOptionsUpdate {
     std::optional<std::size_t> var_max_chunk_bytes;
     std::optional<std::size_t> feed_buffer_bytes;
     std::optional<std::size_t> slot_max_bytes;
+    // The expire_column by id (0 for none), or by name (empty for none),
+    // which ApplyTo looks up in its schema.
+    std::optional<std::uint32_t> expire_column;
+    std::optional<std::string> expire_column_name;
 
     // Every field set from `options`.
     [[nodiscard]] static TableOptionsUpdate From(const TableOptions& options);
-    [[nodiscard]] TableOptions ApplyTo(TableOptions options) const;
+    // Throws std::invalid_argument for an expire_column name that is not a
+    // u64 column of `schema`, or with no schema.
+    [[nodiscard]] TableOptions ApplyTo(TableOptions options, const TableSchema* schema = nullptr) const;
     [[nodiscard]] bool empty() const noexcept;
 };
 
@@ -268,7 +277,18 @@ class Table : public std::enable_shared_from_this<Table> {
     void AdvanceFeedSlot(std::string_view name, FeedPosition position);
     [[nodiscard]] FeedArchiveReader ReadFeedArchive(FeedPosition after);
 
+    // Expiry by the table's expire_column, while it has one.
+    struct ExpiryStatus {
+        // Time since the start of the last completed sweep, or since expiry
+        // started on the table before one completed.
+        std::uint64_t lag_ms = 0U;
+        std::uint64_t expired_blocks = 0U;
+        std::uint64_t failed_passes = 0U;
+    };
+    [[nodiscard]] std::optional<ExpiryStatus> Expiry(std::uint64_t now_ms) const;
+
   private:
+    friend struct ExpiryTestAccess;
     friend class SlotWatch;
     friend class TableCatalog;
     friend struct FeedSlotTestAccess;
@@ -349,6 +369,14 @@ class Table : public std::enable_shared_from_this<Table> {
     void StopFeedLingerTimer();
     void StartFeedLingerTimer();
     [[nodiscard]] bool ExpireFeedLinger(std::stop_token cancelled);
+    // A lease when the table serves now, without waiting for a reopen.
+    [[nodiscard]] std::optional<Lease> TryAcquire();
+    // Expiry passes run on `pool` (table_expiry.cpp). RequestExpiry starts a
+    // sweep unless one runs, and does nothing without an expire_column or
+    // after StopExpiry, which returns once no pass runs or can run.
+    struct ExpiryJob;
+    void RequestExpiry(const std::shared_ptr<MaintenancePool>& pool);
+    void StopExpiry() noexcept;
     void QuarantineFeedLinger(const std::exception& error, std::shared_ptr<ChunkStore> store, bool admitted) noexcept;
     // Why a table in its catalog refuses commands; nullptr when it does not.
     [[nodiscard]] const char* FenceReason() const;
@@ -371,6 +399,12 @@ class Table : public std::enable_shared_from_this<Table> {
     std::optional<std::chrono::steady_clock::time_point> feed_linger_deadline_;
     std::jthread feed_linger_timer_;
     std::atomic<bool> feed_timer_finished_{true};
+    // Guards the expiry members; never held while a pass runs.
+    mutable std::mutex expiry_mutex_;
+    bool expiry_stopped_ = false;
+    std::shared_ptr<ExpiryJob> expiry_;
+    std::shared_ptr<MaintenancePool> expiry_pool_;
+    std::shared_ptr<MaintenanceTask> expiry_task_;
     std::atomic<bool> feed_cleanup_failed_{false};
     // Why watches of a table that left service end, when not dropped: a static
     // text, set before the exclusive section that ends them.
@@ -427,6 +461,7 @@ struct CatalogTxnLease {
 // all of them.
 class TableCatalog {
     friend struct CatalogTxnTestAccess;
+    friend struct ExpiryTestAccess;
   public:
     // Opens (a writer creates when new) the data directory and every table
     // in it; a writer that finds no table creates `default`.
@@ -696,6 +731,13 @@ class TableCatalog {
     // Out of service until RecoverTable; disjoint from tables_, which
     // tables_mutex_ guards with it.
     std::map<std::string, Fenced, std::less<>> fenced_;
+    // Every expiry_interval, requests an expiry sweep of each served table
+    // (table_expiry.cpp); declared last, so it stops first.
+    void StartExpiryTicker();
+    void StopExpiryTicker() noexcept;
+    std::mutex expiry_ticker_mutex_;
+    std::condition_variable_any expiry_ticker_cv_;
+    std::jthread expiry_ticker_;
 };
 
 }  // namespace chunkdb
