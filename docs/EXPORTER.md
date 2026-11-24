@@ -57,13 +57,26 @@ After a failed connect or login the exporter does not try again for 1 second, do
 Each response appends `chunkdb_up`: 1 with the server's metrics, or 0 alone with status `503` when the server cannot be reached, refuses the login or refuses SHOW METRICS.
 The exporter logs the reason when scrapes start failing and when they work again.
 Scrapes that arrive while one runs share its result.
-SHOW METRICS leaves out a table that is not serving at that moment: one that an exclusive statement such as ALTER TABLE holds or waits for, one whose change feed cleanup failed until RECOVER TABLE, or one being dropped.
+SHOW METRICS leaves out the samples of a table that is not serving at that moment, except `chunkdb_table_fenced`: one that an exclusive statement such as ALTER TABLE holds or waits for, one whose change feed cleanup failed until RECOVER TABLE, or one being dropped.
 Resolving the URI's host does not observe `--timeout-ms`: a scrape that waits on DNS answers `503` with `chunkdb_up 0` when the timeout passes, and stopping the exporter waits for that lookup.
 
 `HEAD /metrics` returns the headers of `GET /metrics`.
 Other paths get `404`, other methods `405` with `Allow: GET, HEAD`, and a malformed request `400`.
 A request line and headers must arrive within the timeout and fit in 8192 bytes, or the reply is `408` or `431`.
 The listener holds at most 16 connections; a slow client delays no other one.
+
+## Metrics
+
+Metric names, types and label names are fixed for 2.x: a 2.x release may add a metric or a label value, and renames, removes or retypes none.
+[SHOW METRICS](reference/SERVER.md#returns) says what the table metrics count.
+
+- By `class` (`auth`, `point_read`, `point_write`, `chunk_read`, `chunk_write`, `scan`, `range`, `conditional`, `barrier`, `admin`, `other`): the counter `chunkdb_commands_total`, also by `outcome` (`ok`, `error`), and the histogram `chunkdb_command_duration_seconds`.
+- The counter `chunkdb_errors_total` by `code`: `invalid_argument`, `out_of_range`, `auth_required`, `auth_failed`, `unknown_command`, `version_mismatch`, `internal`, `other`.
+- Server counters: `chunkdb_auth_failures_total`, `chunkdb_connections_rejected_total`, `chunkdb_malformed_requests_total`, `chunkdb_large_chunk_refusals_total`.
+- Server gauges: `chunkdb_active_connections`, `chunkdb_pending_connections`, `chunkdb_loaded_chunks`, `chunkdb_large_chunk_containers`, `chunkdb_large_chunk_container_limit`.
+- Table gauges by `table`: `chunkdb_open_wal_streams`, `chunkdb_background_queue_depth`, `chunkdb_txn_history_bytes`, `chunkdb_table_fenced`, `chunkdb_slot_frontier_frozen`.
+- Table counters by `table`: `chunkdb_checkpoints_total`, `chunkdb_background_checkpoints_total`, `chunkdb_background_checkpoint_failures_total`, `chunkdb_background_queue_full_inline_total`, `chunkdb_compressed_checkpoint_images_total`, `chunkdb_wal_batch_flushes_total`, `chunkdb_wal_barriers_total`, `chunkdb_wal_barrier_full_syncs_total`, `chunkdb_evictions_total`, `chunkdb_eviction_recency_skips_total`, `chunkdb_eviction_snapshot_builds_total`, `chunkdb_eviction_probes_total`, `chunkdb_eviction_no_progress_cycles_total`, `chunkdb_eviction_forced_wal_flushes_with_data_total`, `chunkdb_eviction_forced_wal_flushes_empty_batch_total`, `chunkdb_empty_chunk_gcs_total`, `chunkdb_unique_loaded_chunks_total`, `chunkdb_txn_history_copies_total`, `chunkdb_txn_history_copied_bytes_total`.
+- From the exporter: the gauge `chunkdb_up`.
 
 ## Security
 

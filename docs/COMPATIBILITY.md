@@ -84,7 +84,8 @@ Native Windows TLS uses MSYS2 UCRT64 and its OpenSSL package.
 MSVC and other Windows TLS distributions are outside the validated toolchain boundary.
 Filesystem and device sync semantics remain prerequisites for durability.
 
-Internal C++ symbols, diagnostic log text, metric names and benchmark results are not protocol or storage compatibility guarantees.
+Metric names, types and label names are fixed for 2.x; see [Metrics](EXPORTER.md#metrics).
+Internal C++ symbols, diagnostic log text and benchmark results are not protocol or storage compatibility guarantees.
 Only one server writes a data directory.
 Replication and shared multi-writer operation are unavailable.
 See [known limitations](KNOWN_LIMITATIONS.md) before selecting runtime options.

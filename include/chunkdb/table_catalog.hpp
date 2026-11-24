@@ -274,6 +274,11 @@ class Table : public std::enable_shared_from_this<Table> {
     // Durable slots, lost ones included, and open watches, slot watches
     // included, under `lease`, a lease of this table.
     [[nodiscard]] FeedCounts CountFeeds(const Lease& lease) const;
+    // Whether the durable frontier of this table's slots stopped advancing,
+    // under `lease`, a lease of this table: it has a slot that is not lost
+    // and its store is fail-closed after a durability failure, which stops
+    // slot passes until RECOVER TABLE or a restart.
+    [[nodiscard]] bool SlotFrontierFrozen(const Lease& lease) const;
     [[nodiscard]] std::vector<std::uint32_t> ResolveFeedColumns(const std::vector<std::string>& names);
     // Monotonic, in this epoch, and no higher than the durable frontier. The
     // streaming layer must additionally check its last revision sent.

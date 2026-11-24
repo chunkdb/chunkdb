@@ -1147,19 +1147,31 @@ std::string CommandEngine::RenderMetrics() const {
     // not open, such as one an exclusive statement holds or waits for, or one
     // that failed, is left out rather than waited for.
     std::vector<TableRuntimeStats> tables;
+    // The state gauges list every table by name, fenced ones out of service too.
+    std::vector<MetricsRegistry::TableState> states;
     for (const auto& info : catalog_->List()) {
         const auto table = catalog_->Find(info.name);
         if (table == nullptr) {
             continue;
         }
+        auto& state = states.emplace_back(MetricsRegistry::TableState{.table = info.name});
         const auto lease = table->TryAcquire();
         if (!lease.has_value()) {
             continue;
         }
         tables.push_back(TableRuntimeStats{.table = info.name, .stats = lease->store().RuntimeStats()});
+        state.slot_frontier_frozen = table->SlotFrontierFrozen(*lease);
+    }
+    // Fences waits for no table.
+    for (const auto& fence : catalog_->Fences()) {
+        const auto at = std::lower_bound(states.begin(), states.end(), fence.table,
+            [](const MetricsRegistry::TableState& state, const std::string& name) { return state.table < name; });
+        if (at != states.end() && at->table == fence.table) at->fenced = true;
+        else states.insert(at, MetricsRegistry::TableState{.table = fence.table, .fenced = true});
     }
     return metrics_->RenderPrometheus(
-        tables, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get());
+        tables, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get()) +
+        MetricsRegistry::RenderTableStates(states);
 }
 
 
