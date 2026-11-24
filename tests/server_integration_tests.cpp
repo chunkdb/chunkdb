@@ -149,6 +149,16 @@ bool IsWouldBlockError() {
 #endif
 }
 
+// Whether the last socket error says the peer closed or reset the connection.
+bool IsPeerClosedError() {
+#ifdef _WIN32
+    const int code = WSAGetLastError();
+    return code == WSAECONNRESET || code == WSAECONNABORTED || code == WSAESHUTDOWN;
+#else
+    return errno == EPIPE || errno == ECONNRESET;
+#endif
+}
+
 void ConfigureSocketNoSigPipe(SocketHandle socket) {
 #if defined(__APPLE__)
     const int enabled = 1;
@@ -412,7 +422,13 @@ class RawClient {
         }
     }
 
-    void SendBytes(const std::string& data) {
+    void SendBytes(const std::string& data) { (void)Send(data, false); }
+
+    // Sends `data`, or returns false when the server has already closed or
+    // reset the connection, as a request deadline may before the next byte.
+    [[nodiscard]] bool SendBytesUnlessClosed(const std::string& data) { return Send(data, true); }
+
+    bool Send(const std::string& data, bool closed_ok) {
         chunkdb::test::FeedPhaseWatchdog::Command("client: send", data);
         // Keep the verb only: AUTH and statements may carry credentials or data.
         last_request_ = data.substr(0, std::min(data.find_first_of(" \t\r\n"), std::size_t{32}));
@@ -447,11 +463,13 @@ class RawClient {
                     continue;
                 }
 #endif
+                if (closed_ok && written < 0 && IsPeerClosedError()) return false;
                 throw std::runtime_error("failed to send client bytes " + ReadContext() +
                     " sent=" + std::to_string(offset) + " of=" + std::to_string(data.size()));
             }
             offset += static_cast<std::size_t>(written);
         }
+        return true;
     }
 
     void Disconnect() {
@@ -5291,14 +5309,16 @@ void TestSlowRequestDribbleDeadlineReleasesWorker() {
     RawClient stalled("127.0.0.1", harness.port);
     stalled.Hello();
     stalled.SendBytes("P");
+    // The 250 ms request deadline runs from "P". On a slow host it can close the
+    // connection before a later byte is sent; the test asserts that close below.
     std::this_thread::sleep_for(std::chrono::milliseconds(90));
-    stalled.SendBytes("I");
+    (void)stalled.SendBytesUnlessClosed("I");
     std::this_thread::sleep_for(std::chrono::milliseconds(90));
 
     RawClient fast("127.0.0.1", harness.port);
     fast.SendLine("HELLO 3");
 
-    stalled.SendBytes("N");
+    (void)stalled.SendBytesUnlessClosed("N");
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));

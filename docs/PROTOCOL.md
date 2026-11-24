@@ -144,8 +144,8 @@ A bounded fixed-width value of the wrong length returns INVALID_ARGUMENT and pre
 
 ## Read metadata
 
-DESCRIBE adds `epoch`, `revision`, `dims`, and `chunk_columns` to its existing map.
-`version` remains the schema version; `revision` is the completed commit frontier within the 32-hex-digit table epoch.
+DESCRIBE returns `epoch`, `revision`, `dims`, and `chunk_columns` with the schema.
+`version` is the schema version; `revision` is the completed commit frontier within the 32-hex-digit table epoch.
 Read-only mode encodes an unknown frontier as null; read-write mode returns an unsigned integer.
 DESCRIBE of a fenced table adds `fenced` with its reason and encodes its frontier as null.
 The frontier includes terminal reservation gaps but never crosses an unfinished producer.

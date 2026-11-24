@@ -38,6 +38,7 @@ Each has a world example: [Go](https://github.com/chunkdb/chunkdb-go/tree/main/e
 
 - [Quick start](docs/QUICK_START.md): start, connect, write, read, and watch.
 - [CQL reference](docs/CQL.md): statements, arguments, results, and errors.
+- [Related data](docs/RELATED_DATA.md): what to do instead of joins.
 - [Transactions](docs/TRANSACTIONS.md): change several chunks together.
 - [Change feed](docs/CHANGE_FEED.md): consume committed changes.
 - [Users and rights](docs/USERS.md): control access to tables.
