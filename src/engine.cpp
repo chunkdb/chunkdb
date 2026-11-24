@@ -1,6 +1,7 @@
 #include "chunkdb/engine.hpp"
 #include "audit_log.hpp"
 #include "backup.hpp"
+#include "catalog_feed.hpp"
 #include "source_address.hpp"
 
 #include <algorithm>
@@ -213,35 +214,6 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
         throw std::invalid_argument("unknown table option '" + std::string(key) + "'");
     }
 }
-namespace {
-
-void AddRuntimeStats(StoreRuntimeStats* total, const StoreRuntimeStats& add) {
-    total->evictions += add.evictions;
-    total->checkpoints += add.checkpoints;
-    total->wal_batch_flushes += add.wal_batch_flushes;
-    total->unique_loaded_chunks += add.unique_loaded_chunks;
-    total->open_wal_streams += add.open_wal_streams;
-    total->eviction_snapshot_builds += add.eviction_snapshot_builds;
-    total->eviction_probes += add.eviction_probes;
-    total->eviction_no_progress_cycles += add.eviction_no_progress_cycles;
-    total->eviction_forced_wal_flushes += add.eviction_forced_wal_flushes;
-    total->eviction_forced_wal_flushes_with_data += add.eviction_forced_wal_flushes_with_data;
-    total->eviction_forced_wal_flushes_empty_batch += add.eviction_forced_wal_flushes_empty_batch;
-    total->eviction_recency_skips += add.eviction_recency_skips;
-    total->empty_chunk_gcs += add.empty_chunk_gcs;
-    total->wal_barriers += add.wal_barriers;
-    total->wal_barrier_full_syncs += add.wal_barrier_full_syncs;
-    total->background_checkpoints += add.background_checkpoints;
-    total->background_checkpoint_failures += add.background_checkpoint_failures;
-    total->background_queue_full_inline += add.background_queue_full_inline;
-    total->background_queue_depth += add.background_queue_depth;
-    total->compressed_checkpoint_images += add.compressed_checkpoint_images;
-    total->txn_history_copies += add.txn_history_copies;
-    total->txn_history_copied_bytes += add.txn_history_copied_bytes;
-    total->txn_history_bytes += add.txn_history_bytes;
-}
-
-}  // namespace
 
 CommandEngine::CommandEngine(
     EngineConfig config,
@@ -264,6 +236,8 @@ CommandEngine::CommandEngine(
     if (config_.max_auth_failures == 0) {
         throw std::invalid_argument("max_auth_failures must be > 0");
     }
+    catalog_feed_ = std::make_shared<CatalogFeed>(
+        [this](const CatalogScope& scope) { return ReadCatalog(scope); }, catalog_->feed_buffer_bytes());
 }
 
 // The longest SCRAM message HELLO and AUTH take as a parameter frame.
@@ -466,6 +440,11 @@ std::string CommandEngine::RejectPayload(SessionState& session, std::string_view
 std::string CommandEngine::LostWatchReply(bool user_dropped, const std::string& table) {
     if (user_dropped) return ErrorReply(UserDroppedError());
     return ErrorReply(TableNotFoundError("table '" + table + "' does not exist"));
+}
+
+std::string CommandEngine::LostCatalogWatchReply(bool user_dropped) {
+    if (user_dropped) return ErrorReply(UserDroppedError());
+    return ErrorReply(PermissionDeniedError("MONITOR or ADMIN on *, and MANAGES USERS for a watch that shows users"));
 }
 
 std::string CommandEngine::LostUserReply(SessionState& session) const {
@@ -987,9 +966,8 @@ std::string CommandEngine::HandleHello(
             {{"reason", "channel_binding"}});
     }
     const auto found = config_.users->AuthenticationSnapshot(user);
-    const auto secret = config_.users->Secret();
     // A user with two verifiers logs in with either.
-    std::vector<scram::Verifier> verifiers{found.has_value() ? found->user.verifier : scram::DecoyVerifier(secret, user)};
+    std::vector<scram::Verifier> verifiers{found.has_value() ? found->user.verifier : config_.users->DecoyVerifier(user)};
     if (found.has_value() && found->user.added_verifier.has_value()) verifiers.push_back(*found->user.added_verifier);
     session.pending_login = std::make_shared<PendingLogin>(PendingLogin{
         .user = user,
@@ -1108,7 +1086,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 14);
+    Protocol::AppendArrayHeader(reply, 15);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -1123,6 +1101,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "area_scale");
     Protocol::AppendBulk(reply, "read_only_transactions");
     Protocol::AppendBulk(reply, "returning");
+    Protocol::AppendBulk(reply, "watch_catalog");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 2U : 1U);
     entry("statement_timeout_ms", session.hello_options.statement_timeout_ms.value_or(session.default_statement_timeout_ms));
@@ -1160,21 +1139,27 @@ std::size_t CommandEngine::AuthFailureTrackedSourcesForTests() {
 }
 
 std::string CommandEngine::HandleMetrics() const {
-    // Store counters summed over all tables; the cache is shared by them.
-    StoreRuntimeStats total;
+    return Protocol::Bulk(RenderMetrics());
+}
+
+std::string CommandEngine::RenderMetrics() const {
+    // Store counters per table; the cache is shared by them. A table that is
+    // not open, such as one an exclusive statement holds or waits for, or one
+    // that failed, is left out rather than waited for.
+    std::vector<TableRuntimeStats> tables;
     for (const auto& info : catalog_->List()) {
         const auto table = catalog_->Find(info.name);
         if (table == nullptr) {
             continue;
         }
-        const auto lease = table->Acquire();
+        const auto lease = table->TryAcquire();
         if (!lease.has_value()) {
             continue;
         }
-        AddRuntimeStats(&total, lease->store().RuntimeStats());
+        tables.push_back(TableRuntimeStats{.table = info.name, .stats = lease->store().RuntimeStats()});
     }
-    return Protocol::Bulk(metrics_->RenderPrometheus(
-        total, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get()));
+    return metrics_->RenderPrometheus(
+        tables, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get());
 }
 
 

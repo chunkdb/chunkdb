@@ -16,6 +16,10 @@ struct ConnectionUri {
     std::string path = "/";
 };
 
-[[nodiscard]] ConnectionUri ParseConnectionUri(const std::string& uri);
+// A URI a client connects to names ports 1-65535; one a server listens on may
+// name port 0, a free port the system picks.
+enum class UriUse { kConnect, kListen };
+
+[[nodiscard]] ConnectionUri ParseConnectionUri(const std::string& uri, UriUse use = UriUse::kConnect);
 
 }  // namespace chunkdb

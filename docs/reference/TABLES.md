@@ -118,6 +118,7 @@ ENABLE FEATURE 'name'
 | `bytes(max)` | Uninterpreted bytes with at most max bytes |
 
 Reserved table names are `con`, `prn`, `aux`, `nul`, `com0` through `com9`, and `lpt0` through `lpt9`.
+CREATE TABLE, ALTER TABLE ... RENAME TO and RESTORE TABLE also refuse the name `catalog`, which [WATCH CATALOG](FEED.md#watch-catalog) reserves; a table of that name made before keeps working but cannot be watched.
 
 ## Options
 
@@ -277,7 +278,7 @@ Its protected snapshot refuses unhealthy serving state instead of guessing wheth
 `ENABLE FEATURE 'name'` requires ADMIN on `*` and returns OK for an already enabled feature.
 
 New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, `feature_activation`, and `chunk_model`.
-Existing directories retain their recorded bits; enable `feature_activation` before another missing feature.
+A directory keeps its recorded bits; only ENABLE FEATURE adds one, and it refuses any other feature while the directory lacks `feature_activation`.
 Activation validates every table before recording its durable decision, then updates only that feature's registered owners.
 A fenced table refuses activation with its fenced message until RECOVER TABLE.
 An incomplete published activation fences serving until writer startup completes recovery.

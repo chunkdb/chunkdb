@@ -101,7 +101,20 @@ void WriteInventoryFile(const std::filesystem::path& path, const IndexInventoryH
     }, true, true, replaced, nullptr, false);
 }
 
-void Crash(const char* point) { if (ConsumeFailpointEnv(point)) std::_Exit(86); }
+void Crash(const char* point) { if (ConsumeFailpointEnv(point)) ExitAbruptly(86); }
+
+// A split leaves two runs of at least half this many coordinates. Smaller
+// runs make a page visit fewer coordinates inside a changed run; larger ones
+// make it examine fewer unchanged runs.
+constexpr std::size_t kRunNodes = 64U;
+constexpr ChunkCoord kLowestCoord{std::numeric_limits<std::int64_t>::min(),
+    std::numeric_limits<std::int64_t>::min(), std::numeric_limits<std::int64_t>::min()};
+
+void RaiseRun(CoordinateRun& run, std::uint64_t revision) noexcept {
+    auto current = run.maximum_revision.load(std::memory_order_relaxed);
+    while (current < revision && !run.maximum_revision.compare_exchange_weak(current, revision,
+        std::memory_order_release, std::memory_order_relaxed)) {}
+}
 
 }  // namespace
 
@@ -138,6 +151,15 @@ void ChunkCoordinateIndex::Check() const {
 ChunkCoordinateIndex::ChunkCoordinateIndex(std::filesystem::path root, const Geometry& geometry,
     StoreId table_id, bool read_only)
     : root_(std::move(root)), geometry_(geometry), table_id_(table_id), read_only_(read_only) {
+    ReserveRunSplits(1U);
+    auto entry = std::move(spare_run_entries_.back());
+    spare_run_entries_.pop_back();
+    auto* first = free_runs_.back();
+    free_runs_.pop_back();
+    first->first = kLowestCoord;
+    entry.key() = kLowestCoord;
+    entry.mapped() = first;
+    runs_.insert(std::move(entry));
     const auto path = root_ / kChunkIndexFileName;
     SharedFileInput input(path);
     if (!input) throw std::runtime_error("missing or unreadable coordinate inventory " + path.string());
@@ -180,9 +202,13 @@ void ChunkCoordinateIndex::AdmitLog(const Shard& shard, const std::filesystem::p
     for (const auto& [coord, boundary] : log.empty_boundaries) {
         if (boundary.kind == ChunkIndexKind::kForget && boundary.revision > inventory_.retained_deletion_floor)
             throw std::runtime_error("coordinate forget record exceeds the retained deletion floor");
-        auto& node = coordinates_.try_emplace(coord).first->second;
+        ReserveRunSplits(1U);
+        const auto [at, inserted] = coordinates_.try_emplace(coord);
+        if (inserted) AttachRun(at);
+        auto& node = at->second;
         node.retained_empty = boundary;
         node.revision.store(boundary.kind == ChunkIndexKind::kForget ? 0U : boundary.revision, std::memory_order_relaxed);
+        RaiseRun(*node.run.load(std::memory_order_relaxed), node.revision.load(std::memory_order_relaxed));
         if (boundary.kind != ChunkIndexKind::kForget) any_written_.store(true, std::memory_order_relaxed);
     }
 }
@@ -345,18 +371,25 @@ void ChunkCoordinateIndex::ObserveRecoveredIdentity(const ChunkCoord& coord, std
     if (revision == 0U && populated)
         throw std::invalid_argument("unwritten recovered coordinate is populated");
     std::lock_guard lock(mutex_);
-    auto& node = coordinates_.try_emplace(coord).first->second;
+    ReserveRunSplits(1U);
+    const auto [at, inserted] = coordinates_.try_emplace(coord);
+    if (inserted) AttachRun(at);
+    auto& node = at->second;
     if (node.retained_empty && revision <= node.retained_empty->revision) {
         if (revision == node.retained_empty->revision && populated)
             throw std::runtime_error("committed empty boundary conflicts with a populated chunk");
         return;
     }
     if (revision == 0U) {
-        if (!node.retained_empty) coordinates_.erase(coord);
+        if (!node.retained_empty) {
+            DetachRun(node);
+            coordinates_.erase(at);
+        }
         return;
     }
     node.populated.store(populated, std::memory_order_relaxed);
     node.revision.store(revision, std::memory_order_release);
+    RaiseRun(*node.run.load(std::memory_order_relaxed), revision);
     any_written_.store(true, std::memory_order_release);
     if (populated) populated_.insert(coord);
     else populated_.erase(coord);
@@ -389,16 +422,25 @@ void ChunkCoordinateIndex::RefreshReadOnly(std::span<const RecoveredCoordinateId
         highest = std::max(highest, revision);
     }
     validate();
-    // Node handles make this publication allocation-free. Page readers take
-    // the same lock and cannot observe half of a multi-coordinate refresh.
+    // Node handles and reserved run splits make this publication
+    // allocation-free. Page readers take the same lock and cannot observe
+    // half of a multi-coordinate refresh.
     std::lock_guard lock(mutex_);
+    // A split takes a run above kRunNodes down to two of about half, so each
+    // run splits once and then once per kRunNodes / 2 further insertions.
+    ReserveRunSplits(std::min(nodes.size(), runs_.size() + nodes.size() / (kRunNodes / 2U) + 1U));
     for (auto at = nodes.begin(); at != nodes.end();) {
         const auto coord = at->first;
         populated_.erase(coord);
-        coordinates_.erase(coord);
+        if (const auto old = coordinates_.find(coord); old != coordinates_.end()) {
+            DetachRun(old->second);
+            coordinates_.erase(old);
+        }
         auto node = nodes.extract(at++);
-        if (node.mapped().revision.load(std::memory_order_relaxed) != 0U || node.mapped().retained_empty)
-            coordinates_.insert(std::move(node));
+        if (node.mapped().revision.load(std::memory_order_relaxed) != 0U || node.mapped().retained_empty) {
+            const auto inserted = coordinates_.insert(std::move(node)).position;
+            AttachRun(inserted);
+        }
     }
     populated_.merge(populated);
     maximum_recovered_revision_ = highest;
@@ -428,7 +470,9 @@ CoordinateReservation ChunkCoordinateIndex::Prepare(const ChunkCoord& coord, Chu
     reservation.cache_slot_ = cache_slot;
     if (*cache_slot == nullptr) {
         std::lock_guard lock(mutex_);
+        ReserveRunSplits(1U);
         const auto [at, inserted] = coordinates_.try_emplace(coord);
+        if (inserted) AttachRun(at);
         reservation.inserted_ = inserted;
         *cache_slot = &at->second;
     }
@@ -446,6 +490,7 @@ void ChunkCoordinateIndex::ReleaseReservation(CoordinateReservation& reservation
     std::lock_guard lock(mutex_);
     if (reservation.node_->revision.load(std::memory_order_relaxed) != 0U) std::terminate();
     *reservation.cache_slot_ = nullptr;
+    DetachRun(*reservation.node_);
     coordinates_.erase(reservation.coord_);
 }
 
@@ -455,10 +500,14 @@ void ChunkCoordinateIndex::PublishReservation(CoordinateReservation& reservation
     const auto previous_revision = reservation.node_->revision.load(std::memory_order_relaxed);
     if (revision <= previous_revision) std::terminate();
     const bool previous = reservation.node_->populated.load(std::memory_order_relaxed);
-    // The revision goes first: a snapshot page that finds a coordinate no
-    // longer populated under the index lock also finds the revision that
-    // emptied it (SnapshotPage).
-    reservation.node_->revision.store(revision, std::memory_order_release);
+    // The revision and its run go first: a snapshot page that finds a
+    // coordinate no longer populated under the index lock also finds the
+    // revision that emptied it (SnapshotPage). The store and the run load
+    // pair with SplitRun's run store and revision load: either the split
+    // reads this revision or this write raises the run the split moved the
+    // coordinate to.
+    reservation.node_->revision.store(revision, std::memory_order_seq_cst);
+    RaiseRun(*reservation.node_->run.load(std::memory_order_seq_cst), revision);
     if (previous != populated) {
         std::lock_guard lock(mutex_);
         if (populated) {
@@ -473,6 +522,81 @@ void ChunkCoordinateIndex::PublishReservation(CoordinateReservation& reservation
     if (previous_revision == 0U) any_written_.store(true, std::memory_order_release);
 }
 
+void ChunkCoordinateIndex::ReserveRunSplits(std::size_t splits) {
+    if (spare_run_entries_.size() < splits) spare_run_entries_.reserve(splits);
+    while (spare_run_entries_.size() < splits) {
+        Runs staging;
+        staging.emplace(ChunkCoord{}, nullptr);
+        spare_run_entries_.push_back(staging.extract(staging.begin()));
+    }
+    while (free_runs_.size() < splits) {
+        // Every run can return to the free list without allocating.
+        free_runs_.reserve(run_storage_.size() + 1U);
+        free_runs_.push_back(&run_storage_.emplace_back());
+    }
+}
+
+void ChunkCoordinateIndex::AttachRun(Coordinates::iterator at) noexcept {
+    const auto run = std::prev(runs_.upper_bound(at->first));
+    at->second.run.store(run->second, std::memory_order_seq_cst);
+    RaiseRun(*run->second, at->second.revision.load(std::memory_order_seq_cst));
+    if (++run->second->nodes > kRunNodes) SplitRun(run);
+}
+
+void ChunkCoordinateIndex::DetachRun(ChunkCoordinateNode& node) noexcept {
+    auto* run = node.run.load(std::memory_order_relaxed);
+    if (--run->nodes != 0U || run == runs_.begin()->second) return;
+    // The previous run's range absorbs this empty one.
+    runs_.erase(run->first);
+    free_runs_.push_back(run);
+}
+
+void ChunkCoordinateIndex::SplitRun(Runs::iterator run) noexcept {
+    const auto next = std::next(run);
+    auto at = coordinates_.lower_bound(run->first);
+    std::advance(at, static_cast<std::ptrdiff_t>(run->second->nodes / 2U));
+    auto* upper = free_runs_.back();
+    free_runs_.pop_back();
+    upper->maximum_revision.store(0U, std::memory_order_relaxed);
+    upper->first = at->first;
+    upper->nodes = 0U;
+    std::uint64_t maximum = 0U;
+    for (; at != coordinates_.end() && (next == runs_.end() || at->first < next->first); ++at) {
+        at->second.run.store(upper, std::memory_order_seq_cst);
+        maximum = std::max(maximum, at->second.revision.load(std::memory_order_seq_cst));
+        ++upper->nodes;
+    }
+    RaiseRun(*upper, maximum);
+    // The lower run keeps its maximum: an upper bound stays one.
+    run->second->nodes -= upper->nodes;
+    auto entry = std::move(spare_run_entries_.back());
+    spare_run_entries_.pop_back();
+    entry.key() = upper->first;
+    entry.mapped() = upper;
+    runs_.insert(std::move(entry));
+}
+
+template <class Visit>
+bool ChunkCoordinateIndex::WalkChanged(bool has_from, const ChunkCoord& from, bool inclusive, std::uint64_t since,
+    std::size_t budget, ChunkCoord& resume, Visit&& visit) const {
+    const auto stop = [&](const ChunkCoord& coord) { resume = coord; return true; };
+    auto run = has_from ? std::prev(runs_.upper_bound(from)) : runs_.begin();
+    std::size_t examined = 0U;
+    for (bool first = true; run != runs_.end(); ++run, first = false) {
+        const auto next = std::next(run);
+        if (!first && examined++ >= budget) return stop(run->first);
+        if (run->second->maximum_revision.load(std::memory_order_acquire) <= since) continue;
+        auto at = !first || !has_from ? coordinates_.lower_bound(run->first)
+            : inclusive ? coordinates_.lower_bound(from) : coordinates_.upper_bound(from);
+        for (; at != coordinates_.end() && (next == runs_.end() || at->first < next->first); ++at) {
+            if (examined++ >= budget) return stop(at->first);
+            if (at->second.revision.load(std::memory_order_acquire) <= since) continue;
+            if (!visit(at->first)) return stop(at->first);
+        }
+    }
+    return false;
+}
+
 CoordinatePage ChunkCoordinateIndex::Page(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
     std::optional<std::uint64_t> since) const {
     Check();
@@ -483,12 +607,13 @@ CoordinatePage ChunkCoordinateIndex::Page(bool has_cursor, const ChunkCoord& cur
     page.coords.reserve(limit);
     std::lock_guard lock(mutex_);
     if (since) {
-        auto at = has_cursor ? coordinates_.upper_bound(cursor) : coordinates_.begin();
-        for (; at != coordinates_.end(); ++at) {
-            if (at->second.revision.load(std::memory_order_acquire) <= *since) continue;
-            if (page.coords.size() == limit) { page.more = true; break; }
-            page.coords.push_back(at->first);
-        }
+        ChunkCoord resume{};
+        (void)WalkChanged(has_cursor, cursor, false, *since, std::numeric_limits<std::size_t>::max(), resume,
+            [&](const ChunkCoord& coord) {
+                if (page.coords.size() == limit) { page.more = true; return false; }
+                page.coords.push_back(coord);
+                return true;
+            });
     } else {
         auto at = has_cursor ? populated_.upper_bound(cursor) : populated_.begin();
         for (; at != populated_.end(); ++at) {
@@ -512,24 +637,47 @@ CoordinatePage ChunkCoordinateIndex::SnapshotPage(bool has_cursor, const ChunkCo
     // Populated at the snapshot: populated now, or changed after it. Once
     // true for a fixed snapshot this stays true (revisions only grow), so
     // the walk can release the lock between batches, letting writers publish,
-    // and resume after the last key it examined.
+    // and resume where it stopped. Within one batch both sets are read under
+    // the lock that a write emptying a coordinate takes after it published
+    // the revision and raised its run.
     constexpr std::size_t kBatchNodes = 256U;
-    bool resume = has_cursor;
-    ChunkCoord after = cursor;
+    bool has_from = has_cursor;
+    ChunkCoord from = cursor;
+    bool inclusive = false;
+    std::vector<ChunkCoord> changed;
+    changed.reserve(limit + 1U);
     for (;;) {
         std::lock_guard lock(mutex_);
-        auto at = resume ? coordinates_.upper_bound(after) : coordinates_.begin();
-        for (std::size_t examined = 0U; at != coordinates_.end(); ++at, ++examined) {
-            if (examined == kBatchNodes) break;
-            if (!at->second.populated.load(std::memory_order_relaxed) &&
-                at->second.revision.load(std::memory_order_acquire) <= snapshot)
-                continue;
+        changed.clear();
+        const auto wanted = limit + 1U - page.coords.size();
+        ChunkCoord stop{};
+        const bool stopped = WalkChanged(has_from, from, inclusive, snapshot, kBatchNodes, stop,
+            [&](const ChunkCoord& coord) {
+                if (changed.size() == wanted) return false;
+                changed.push_back(coord);
+                return true;
+            });
+        // Every coordinate before `stop` is decided: merge the populated ones.
+        auto live = !has_from ? populated_.begin()
+            : inclusive ? populated_.lower_bound(from) : populated_.upper_bound(from);
+        auto change = changed.begin();
+        for (;;) {
+            const bool has_live = live != populated_.end() && (!stopped || *live < stop);
+            const bool has_change = change != changed.end();
+            if (!has_live && !has_change) break;
+            ChunkCoord next;
+            if (has_live && (!has_change || !(*change < *live))) {
+                next = *live;
+                if (has_change && *change == *live) ++change;
+                ++live;
+            } else next = *change++;
             if (page.coords.size() == limit) { page.more = true; return page; }
-            page.coords.push_back(at->first);
+            page.coords.push_back(next);
         }
-        if (at == coordinates_.end()) return page;
-        resume = true;
-        after = std::prev(at)->first;
+        if (!stopped) return page;
+        has_from = true;
+        from = stop;
+        inclusive = true;
     }
 }
 

@@ -148,20 +148,17 @@ std::string Command(int port, const std::string& line, std::string* hello = null
 
 class ServerProcess {
   public:
-    // "{port}" in an option stands for the chosen port; with `log`, the
-    // server's output goes to that file.
+    // The server listens on a port it picks (--port 0) and names it in its
+    // ready line; its output goes to `log`, or to a new file beside `data_dir`.
     ServerProcess(const std::string& binary, const std::filesystem::path& data_dir,
                   const std::vector<std::string>& options = {"--auth", "none"},
                   std::filesystem::path log = {})
         : log_(std::move(log)) {
-        // Another process can take the free port before the server binds
-        // it; the server then exits and is started again on a new port.
-        for (int attempt = 0; attempt < 5; ++attempt) {
-            if (Start(binary, data_dir, options)) {
-                return;
-            }
-        }
-        assert(false && "server did not start");
+        static int starts = 0;
+        if (log_.empty())
+            log_ = data_dir.parent_path() / (data_dir.filename().string() + "-server-" + std::to_string(++starts) + ".log");
+        const bool started = Start(binary, data_dir, options);
+        assert(started && "server did not start");
     }
 
     ServerProcess(const ServerProcess&) = delete;
@@ -207,37 +204,30 @@ class ServerProcess {
   private:
     bool Start(const std::string& binary, const std::filesystem::path& data_dir,
                const std::vector<std::string>& options) {
-        port_ = chunkdb::test::PickListenerPort();
         pid_ = fork();
         assert(pid_ >= 0);
         if (pid_ == 0) {
             // A test runner may ignore SIGPIPE; the server must not rely on it.
             signal(SIGPIPE, SIG_DFL);
-            const std::string port = std::to_string(port_);
             const std::string dir = data_dir.string();
-            if (!log_.empty()) {
-                FILE* out = std::fopen(log_.c_str(), "w");
-                assert(out != nullptr);
-                assert(dup2(fileno(out), STDERR_FILENO) >= 0);
-                assert(dup2(fileno(out), STDOUT_FILENO) >= 0);
-            }
-            std::vector<std::string> arguments = {"--host", "127.0.0.1", "--port", port, "--data-dir", dir,
-                "--log-level", "error", "--workers", "2", "--wal-group-commit-updates", "100"};
-            for (auto option : options) {
-                if (const auto at = option.find("{port}"); at != std::string::npos) option.replace(at, 6, port);
-                arguments.push_back(std::move(option));
-            }
+            FILE* out = std::fopen(log_.c_str(), "w");
+            assert(out != nullptr);
+            assert(dup2(fileno(out), STDERR_FILENO) >= 0);
+            assert(dup2(fileno(out), STDOUT_FILENO) >= 0);
+            // The ready line naming the port is an INFO line.
+            std::vector<std::string> arguments = {"--host", "127.0.0.1", "--port", "0", "--data-dir", dir,
+                "--log-level", "info", "--workers", "2", "--wal-group-commit-updates", "100"};
+            arguments.insert(arguments.end(), options.begin(), options.end());
             ExecServer(binary, std::move(arguments));
         }
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
         for (;;) {
-            const int fd = Connect(port_);
-            if (fd >= 0) {
-                close(fd);
-                return Alive();  // not another process on that port
-            }
             if (!Alive()) {
                 return false;
+            }
+            if (const auto ready = chunkdb::test::ReadyLinePort(log_)) {
+                port_ = *ready;
+                return true;
             }
             assert(std::chrono::steady_clock::now() < deadline);
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
@@ -549,7 +539,7 @@ void TestTlsReloadsOnHangup(const std::string& binary) {
     };
     install("first", "first");
     const auto log = dir.path() / "server.log";
-    ServerProcess server(binary, dir.path() / "data", {"--auth", "none", "--listen-uri", "chunks://127.0.0.1:{port}/",
+    ServerProcess server(binary, dir.path() / "data", {"--auth", "none", "--listen-uri", "chunks://127.0.0.1:0/",
         "--tls-cert", cert.string(), "--tls-key", key.string(), "--log-level", "info"}, log);
     const auto served = [&] {
         return Output("openssl s_client -connect 127.0.0.1:" + std::to_string(server.port()) +
@@ -925,7 +915,7 @@ void TestReadOnlyWithUsers(const std::string& binary) {
     const auto bytes = ReadFile(users);
     const auto log = dir.path() / "reader.log";
     {
-        ServerProcess reader(binary, data, {"--auth", "scram", "--read-only", "--log-level", "warn"}, log);
+        ServerProcess reader(binary, data, {"--auth", "scram", "--read-only"}, log);
         const int fd = Connect(reader.port());
         assert(fd >= 0);
         SendAll(fd, "HELLO 3\r\n");

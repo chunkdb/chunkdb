@@ -65,8 +65,10 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
         std::optional<std::chrono::steady_clock::time_point> now = std::nullopt);
     // Returns what Write kept once no reply or line is in progress.
     void ReleaseKept(ServerConnection& connection);
-    void Reply(ServerConnection& connection, std::string response);
+    // listing: a SHOW CONNECTIONS reply, charged to the listing reserve.
+    void Reply(ServerConnection& connection, std::string response, bool listing = false);
     bool ReserveReply(ServerConnection& connection, std::size_t bytes, bool control);
+    bool ReserveReply(ServerConnection& connection, std::size_t bytes, server_detail::ConnectionByteBudget& pool);
     bool RejectProtocol(ServerConnection& connection, const std::exception& error);
     void RestartPieceDeadline(ServerConnection& connection, std::chrono::steady_clock::time_point now);
     // One connection's step on this thread; its failure closes only it.
@@ -80,7 +82,7 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
     std::vector<std::shared_ptr<ServerConnection>> incoming_;
     std::thread thread_;
     std::shared_ptr<server_detail::ConnectionByteBudget> data_credit_, control_credit_, line_credit_, data_line_credit_;
-    std::shared_ptr<server_detail::ConnectionByteBudget> data_output_credit_, control_output_credit_;
+    std::shared_ptr<server_detail::ConnectionByteBudget> data_output_credit_, control_output_credit_, listing_output_credit_;
     std::deque<std::weak_ptr<ServerConnection>> data_waiters_, control_waiters_;
     std::atomic<std::size_t> data_waiter_count_{0U};
     struct TrackedStatement {

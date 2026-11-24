@@ -1,6 +1,8 @@
 #include "scram.hpp"
 
+#include <algorithm>
 #include <charconv>
+#include <cstddef>
 #include <stdexcept>
 
 namespace chunkdb::scram {
@@ -51,14 +53,28 @@ Verifier MakeVerifier(std::string_view password, std::span<const std::uint8_t> s
     };
 }
 
-Verifier DecoyVerifier(std::span<const std::uint8_t> secret, std::string_view name) {
+Verifier DecoyVerifier(std::span<const std::uint8_t> secret, std::string_view name, std::span<const VerifierShape> shapes) {
     const auto derive = [&](std::string_view purpose) {
         return crypto::HmacSha256(secret, crypto::Bytes(std::string(purpose) + std::string(name)));
     };
-    const auto salt = derive("salt:");
+    VerifierShape shape;
+    if (!shapes.empty()) {
+        const auto pick = derive("shape:");
+        std::uint64_t index = 0U;
+        for (std::size_t i = 0U; i < 8U; ++i) index = (index << 8U) | pick[i];
+        shape = shapes[static_cast<std::size_t>(index % shapes.size())];
+    }
+    // Each 32 bytes of salt have a derivation of their own.
+    std::vector<std::uint8_t> salt;
+    salt.reserve(shape.salt_bytes);
+    for (std::size_t block = 0U; salt.size() < shape.salt_bytes; ++block) {
+        const auto bytes = derive(block == 0U ? std::string("salt:") : "salt" + std::to_string(block) + ":");
+        const auto take = std::min(bytes.size(), shape.salt_bytes - salt.size());
+        salt.insert(salt.end(), bytes.begin(), bytes.begin() + static_cast<std::ptrdiff_t>(take));
+    }
     return Verifier{
-        .iterations = kMinIterations,
-        .salt = std::vector<std::uint8_t>(salt.begin(), salt.begin() + kMinSaltBytes),
+        .iterations = shape.iterations,
+        .salt = std::move(salt),
         .stored_key = derive("stored:"),
         .server_key = derive("server:"),
     };
@@ -260,6 +276,12 @@ ClientFinal FinishClientLogin(
     const auto parsed = std::from_chars(text.data(), text.data() + text.size(), iterations);
     if (!salt.has_value() || parsed.ec != std::errc() || parsed.ptr != text.data() + text.size() || iterations == 0U) {
         throw std::invalid_argument("not a SCRAM server-first message");
+    }
+    // As ParseVerifier: a server must not make a login spend unbounded work.
+    if (iterations < kMinIterations || iterations > kMaxIterations) {
+        throw std::invalid_argument("the server asks for " + std::to_string(iterations) +
+                                    " SCRAM iterations, outside " + std::to_string(kMinIterations) + ".." +
+                                    std::to_string(kMaxIterations));
     }
     const auto salted = crypto::Pbkdf2Sha256(crypto::Bytes(password), *salt, iterations);
     const auto client_key = crypto::HmacSha256(salted, crypto::Bytes("Client Key"));

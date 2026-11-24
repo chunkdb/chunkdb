@@ -34,6 +34,9 @@ data_dir/
   .chunkdb.staging/                    table creation and restore staging
   .chunkdb.dropped/                    tables renamed out of the catalog
   .chunkdb.backups/                    temporary pinned backup files
+  chunkdb.groups.owner                commit group owner root (inactive; no path creates it)
+  chunkdb.groups.objects/             commit group owner objects (inactive)
+  chunkdb.groups.journal/             commit group journal generations (inactive)
   tables/<name>/
     table.manifest                    identity, geometry, options, schema history
     chunkdb.version                   reserved revision ceiling
@@ -81,11 +84,11 @@ The server opens read-write and therefore refuses either of the first two unknow
 Table incompat bit 0 (`0x1`) enables durable feed slots, USER WAL metadata, and collection-frame flags; it remains set after slot removal.
 Directory and table incompat bit 5 (`0x20`), named `chunk_model`, owns dimensional geometry, both column domains, sectioned forms, and retained coordinate decisions.
 Directory and table incompat bit 6 (`0x40`) is reserved for commit groups, which this build does not provide: it never sets the bit, `ENABLE FEATURE` does not accept it, and a directory or table that records it is refused as an unknown feature.
-Earlier development envelopes are refused before artifact mutation; they require recreating the data directory.
+Envelopes of 1.x and of development builds of 2.0 are refused before any artifact changes; such a data directory must be recreated.
 
 Data-directory incompat bit 1 (`0x2`) enables named migrations.
 New directories enable every registered baseline feature before serving requests.
-Existing directories retain their masks until explicit `ENABLE FEATURE`; slot creation and migrations never enable missing bits.
+A directory keeps its masks until an explicit `ENABLE FEATURE`; slot creation and migrations never enable missing bits.
 An image's or WAL header's features must be a subset of its table manifest's features.
 Unknown option, image-section, WAL-TLV, or WAL-record types may be skipped only when an enclosing feature set has an unknown bit.
 WAL parsing also considers the manifest’s features.
@@ -369,7 +372,7 @@ The final variable state must obey the VARS presence, type, ordering, UTF-8, and
 A writer replays a valid image, or an empty state when none exists, followed by committed frames from its live WAL.
 A failed header is recoverable only with the interrupted-creation shape: an expected header prefix followed by zero bytes.
 Feature-byte differences are ignored.
-Incomplete CRC bytes are allowed after the first 56 header bytes match.
+Incomplete CRC bytes are allowed after the first `44 + 8 * dims` header bytes, everything before the checksum, match.
 
 Other invalid headers are damage; interrupted creation contributes no frames and can be removed.
 A trailing incomplete/bad-checksum frame can be discarded only when no later checksum-valid frame header exists.
@@ -414,7 +417,7 @@ The header is followed by 4096 ring entries, each containing four aligned native
 Writers serialize appends inside their odd snapshot bracket before changing artifacts; entries and cursor use mapped atomics, and the last guard's even publication orders their visibility with the artifacts.
 The file is replaced at writer startup, is never a durable authority and is omitted from backups.
 Readers require the same writer session, a retained interval of at most 4096 entries containing no invalidation, and equal-even observations around collection and publication; otherwise they perform full artifact admission.
-An absent file supports older writers through full admission, while a malformed present file fails validation.
+An absent file means full admission, while a malformed present file fails validation.
 
 A writer first takes an exclusive lock on `.chunkdb.lock/snapshot.owner`, which readers never open, so a second writer is refused.
 It then tests `.chunkdb.lock/snapshot.writer` with a shared lock, refusing an exclusive holder, and waits for its exclusive lock, which it holds through shutdown.
@@ -426,7 +429,7 @@ A dead writer's odd crash fence refuses read-only opening and reads while no wri
 A restarting writer takes the lease before it replaces `chunkdb.snapshot.live`; until then a reader can accept the dead session when its mapped counter is even, and reads the files as that writer left them.
 Rollback intents bound readable WAL prefixes; exhausted concurrent-snapshot retries fail without modifying files.
 Only volatile live metadata is rebuilt after a crash; actual data and WAL validation and durability are unchanged.
-Older readers that do not understand the live counter conservatively reject an open writer's odd fence; closed tables retain the checked CKSG encoding.
+Closed tables keep the checked CKSG encoding.
 
 ## Coordinate index and tombstones
 
@@ -478,6 +481,23 @@ Rollback truncates/removes each WAL to its recorded boundary; a missing or short
 Committed intents preserve WAL effects, including WALs subsequently checkpointed away; removal and directory sync finish recovery idempotently.
 Failure repairing an uncommitted operation fences the affected store until recovery; post-commit cleanup does not turn a committed operation into a rejected one.
 
+## Commit group owner (inactive)
+
+No server or tool path creates these files; `commit_groups` stays refused, and only internal code and tests write them in this build.
+The owner root is the data directory, or the root of a standalone store.
+`chunkdb.groups.owner` is the 512-byte [CKGO root](design/COMMIT_GROUP_OWNER_FORMAT.md); the only canonical form this build writes is the generation-one INACTIVE root, published from an exclusive `.owner-root-<32 hex>` temporary without replacement.
+An existing root, or one that arrives during that publication, is admitted only by comparing its exact bytes with that root, and is then synced with the root directory.
+`chunkdb.groups.objects/` holds a `.scope` marker and digest-named immutable objects: roots, pages, 128-byte `CKGC` journal inventories and `CKID` ID inventories of at least 164 bytes, in their [native encodings](design/COMMIT_GROUP_FORMAT.md#journal-header-and-certified-inventory).
+`chunkdb.groups.journal/<32 hex journal id>-<16 hex generation>` is one journal generation: a 64-byte `CKGJ` header followed by `CKGR` records, named from the admitted journal context.
+Each temporary is synced before its no-replace publication, the published name is reopened and checked against the temporary's native object and exact bytes, and the file and then its directory are synced; a name is durable only after that directory sync.
+Every byte at or below an inventory's certified cut must match its digest and last record; any failure there is damage.
+Above the cut, a final record whose header or final checksum fails, or that extends past the end, is an interrupted append only when no later checksum-valid record header follows, as for live WALs.
+That rule shares the live-WAL limit: a crash that loses an earlier unsynced record while a later one survives is refused, not repaired.
+A checksum-valid record with an invalid structure, a seal record, conflicting decisions and a receipt without its matching decision are damage.
+No path truncates a journal tail in this build.
+The internal coordinator can stage a generation-two ACTIVE root object that names an empty journal generation, but it never replaces the canonical INACTIVE root.
+Details are in [artifact I/O](design/COMMIT_OWNER_ARTIFACT_IO.md).
+
 ## Feed slots and archives
 
 `chunkdb.slots` is at most 1 MiB, atomically replaced and file/directory synced in every durability mode:
@@ -492,7 +512,7 @@ The only header flag, `0x1`, is the filter format; it permits the filter flags `
 The owner flag needs no header flag or feature bit.
 The dimensions byte is 2 or 3 and must match the owning table.
 AREA stores the first active signed coordinates followed by the last active coordinates (x, y and, in a three-dimensional table, z); endpoints must be ordered.
-Format tags 1 to 3 are earlier development layouts and are refused; a writer writes only tag 4.
+Other format tags are refused; a writer writes only tag 4.
 
 Names are unique, 1–63 bytes matching `[a-z_][a-z0-9_]*`; every written revision is at or below the watermark, and epoch matches the table StoreId.
 Owners are user names with the same rule; a slot without an owner records the user of its first granted attach without ADMIN on `*`.
@@ -529,13 +549,14 @@ Live-history readers capture completed byte boundaries and read only the prefix 
 4. After each user's grants: `max_connections:u64`, `statements_per_sec:u64`, little-endian. Zero disables a limit; the rate is at most 65536.
 5. CRC32 over all preceding bytes, including the limits.
 
+The file is at most 64 MiB: the writer refuses a larger one, and readers check the file size before they read it.
+
 Before serialization or file replacement, the writer checks u16 name widths, salt lengths, u32 user/grant counts, SCRAM iterations (4096–1000000), known rights, the rate limit, and an added verifier with another salt or iteration count than the user's verifier, or with its keys. Invalid input leaves the existing file and directory metadata unchanged and does not create a new store.
 Writer serialization orders users by name, then table grants by name, then prefix grants by prefix; decoding refuses duplicate users/grants/verifiers, more than one added verifier, unknown flags/rights/version, bad checksum, truncation, or trailing bytes.
 Version 2 files have no added verifier count, flag bits 2..4 or prefix grants: they are read as users with one verifier, decoding refuses those bits and prefix grants in them, and the next change writes version 3.
 The writer refuses a salt outside that range or a name over 65535 bytes instead of shortening it; decoding also refuses user and table names that CREATE USER and GRANT refuse.
 Password verifiers contain no plaintext password; the secret derives unknown-user salts used by authentication.
-A build that reads version 3 but predates server rights and prefix grants refuses a file that uses them as unknown flags or an invalid table name; a build that reads only version 2 refuses every version 3 file.
-Earlier development users files are refused with a recreate error before permissions or bookkeeping change; they are not migrated.
+Users files before version 2 are refused with a recreate error before permissions or bookkeeping change; they are not migrated.
 The file is admitted independently of the catalog manifest, including standalone users stores.
 
 ## Named migrations
@@ -592,6 +613,8 @@ Completed copies use the same metadata/image/WAL formats and add `chunkdb.backup
 3. File count `u32`; each file: relative-path length `u32` and path, length `u64`, CRC32 `u32`.
 4. CRC32 over all preceding bytes.
 
+The record is at most 1 GiB: the writer refuses a larger one, and readers check the file size before they read it.
+
 Inventory paths use canonical `/` separators; absolute roots, drive names, backslashes, NUL, empty components, `.` and `..` are invalid before path conversion/access.
 The inventory includes root metadata, users/ledger when present, table definitions/history, and clocks above cuts.
 It also includes initialized markers, stable snapshot generations, slots, images, and bounded WAL copies.
@@ -631,7 +654,7 @@ Empty-chunk collection records the empty state when needed, removes the image be
 
 Explicit present-zero blocks are not collected.
 Temporary files use `<target>.tmp.<pid>.<thread>.<clock>.<sequence>` names; writer recovery cleans recognized unpublished artifacts, while read-only opening and verification do not modify them.
-`chunkdb_verify` checks manifests, bookkeeping, intents, images/WALs, archives/slots, migrations, and backup records without repairing them.
+`chunkdb_verify` checks manifests, bookkeeping, intents, images/WALs, archives/slots, migrations, and backup records without repairing them, and reports commit group owner files that no enabled feature claims as `group_owner_unclaimed` warnings.
 Its exit status is 0 without warnings/errors, 1 with warnings/errors, and 2 for invalid arguments or an unreadable target.
 
 Findings carry stable codes and relative paths.

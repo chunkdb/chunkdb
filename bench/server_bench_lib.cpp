@@ -198,7 +198,9 @@ constexpr std::array<double, 8> kPercentiles{
 [[nodiscard]] std::uint16_t ParsePort(std::string_view text) {
     std::size_t consumed = 0;
     const auto value = std::stoul(std::string(text), &consumed, 10);
-    if (consumed != text.size() || value == 0 || value > 65535) {
+    // 0 lets a spawned server listen on a free port; ValidateEnabledArgs
+    // refuses it for an external server.
+    if (consumed != text.size() || value > 65535) {
         throw std::invalid_argument("invalid --port value: " + std::string(text));
     }
     return static_cast<std::uint16_t>(value);
@@ -2012,6 +2014,8 @@ bool TakeoverTerminal(std::string_view line) {
 }
 
 void ValidateEnabledArgs(const Args& args) {
+    if (args.port == 0 && args.server_mode != ServerMode::kSpawn)
+        throw std::invalid_argument("--port 0 requires --server-mode spawn");
     if (args.with_metadata != "none" && args.with_metadata != "version" &&
         args.with_metadata != "schema" && args.with_metadata != "both") throw std::invalid_argument("invalid --with value");
     if (args.watch_mode != "ordinary" && args.watch_mode != "progress" &&
@@ -2113,7 +2117,8 @@ std::string UsageText() {
         << "  --server-mode <external|spawn>   default: external\n"
         << "  --uri <chunk://token@host:port/> optional endpoint URI\n"
         << "  --host <host>                    default: 127.0.0.1\n"
-        << "  --port <port>                    default: 4242\n"
+        << "  --port <port>                    default: 4242; 0 with --server-mode spawn\n"
+        << "                                   listens on a free port\n"
         << "  --clients <N>                    default: 50\n"
         << "  --pipeline <N>                   default: 1\n"
         << "  --io-timeout-ms <N>              send/receive wait: 1..86400000 ms (default: 5000);\n"
@@ -2362,8 +2367,10 @@ Args ParseArgs(const std::vector<std::string>& argv) {
     return args;
 }
 
-BenchmarkReport Run(const Args& args) {
-    ValidateEnabledArgs(args);
+BenchmarkReport Run(const Args& requested) {
+    ValidateEnabledArgs(requested);
+    // A spawned server on port 0 sets the port the clients use.
+    Args args = requested;
     if (args.io_timeout_ms == 0 || args.io_timeout_ms > 86400000) {
         throw std::invalid_argument("--io-timeout-ms must be between 1 and 86400000");
     }
@@ -2482,6 +2489,10 @@ BenchmarkReport Run(const Args& args) {
             engine);
 
         server_thread = std::thread([&]() { server->Run(); });
+        if (!server->WaitListeningForTests(std::chrono::seconds(10)))
+            throw std::runtime_error("spawned benchmark server did not start listening");
+        args.port = server->port();
+        report.port = args.port;
         WaitForServerReady(args);
 
         report.spawned_server = true;

@@ -1,5 +1,8 @@
 #include <algorithm>
+#include <atomic>
 #include <cassert>
+#include <map>
+#include <set>
 #include <condition_variable>
 #include <mutex>
 #include <thread>
@@ -415,6 +418,242 @@ void SnapshotPageKeepsLaterEmptiedCoordinates() {
     assert(std::equal(rest.coords.begin(), rest.coords.end(), all.coords.begin() + 300));
 }
 
+struct ModelEntry {
+    std::uint64_t revision = 0U;
+    bool populated = false;
+    ChunkCoordinateNode* node = nullptr;
+};
+using Model = std::map<ChunkCoord, ModelEntry>;
+
+std::vector<ChunkCoord> Collect(const std::function<CoordinatePage(bool, const ChunkCoord&)>& page) {
+    std::vector<ChunkCoord> all;
+    bool has_cursor = false;
+    ChunkCoord cursor{};
+    for (;;) {
+        const auto next = page(has_cursor, cursor);
+        assert(next.more ? !next.coords.empty() : true);
+        all.insert(all.end(), next.coords.begin(), next.coords.end());
+        if (!next.more) return all;
+        has_cursor = true;
+        cursor = next.coords.back();
+    }
+}
+
+// Pages of changes skip runs of coordinates whose revisions are all at or
+// below the requested one; every page must still equal a full comparison.
+void ExpectChangedPages(const ChunkCoordinateIndex& owner, const Model& model, std::uint64_t since) {
+    std::vector<ChunkCoord> changed, at_snapshot, populated;
+    for (const auto& [coord, entry] : model) {
+        if (entry.revision == 0U) continue;
+        if (entry.revision > since) changed.push_back(coord);
+        if (entry.populated || entry.revision > since) at_snapshot.push_back(coord);
+        if (entry.populated) populated.push_back(coord);
+    }
+    for (const std::size_t limit : {std::size_t{1}, std::size_t{7}, std::size_t{64}, kMaxChunkScanLimit + 1U}) {
+        assert(Collect([&](bool has, const ChunkCoord& at) { return owner.Page(has, at, limit, since); }) == changed);
+        assert(Collect([&](bool has, const ChunkCoord& at) { return owner.SnapshotPage(has, at, limit, since); }) ==
+            at_snapshot);
+        assert(Collect([&](bool has, const ChunkCoord& at) { return owner.Page(has, at, limit); }) == populated);
+    }
+}
+
+void ChangedPagesSkipUnchangedRuns() {
+    test::ScopedTempDir directory("chunkdb-index-runs");
+    const auto geometry = Shape();
+    assert(ChunkCoordinateIndex::InitializeEmpty(directory.path() / "writer", geometry, kTable));
+    ChunkCoordinateIndex owner(directory.path() / "writer", geometry, kTable, false);
+    Model model;
+    std::uint64_t revision = 0U;
+    std::uint32_t seed = 12345U;
+    const auto next = [&](std::uint32_t bound) {
+        seed = seed * 1664525U + 1013904223U;
+        return static_cast<std::int64_t>((seed >> 8U) % bound);
+    };
+    std::vector<std::uint64_t> marks{0U};
+    for (int step = 1; step <= 6000; ++step) {
+        const ChunkCoord coord{next(40U) - 20, next(200U) - 100};
+        auto& entry = model[coord];
+        if (next(8U) == 0) {
+            // An abandoned first write leaves no coordinate behind.
+            auto reservation = owner.Prepare(coord, &entry.node);
+            continue;
+        }
+        const bool populated = next(3U) != 0;
+        Publish(owner, coord, entry.node, populated, ++revision);
+        entry.revision = revision;
+        entry.populated = populated;
+        if (step % 750 == 0) marks.push_back(revision);
+    }
+    marks.push_back(revision);
+    for (const auto since : marks) ExpectChangedPages(owner, model, since);
+
+    // Recovery builds the same runs from observed identities.
+    assert(ChunkCoordinateIndex::InitializeEmpty(directory.path() / "recovered", geometry, kTable));
+    ChunkCoordinateIndex recovered(directory.path() / "recovered", geometry, kTable, false);
+    for (const auto& [coord, entry] : model) recovered.ObserveRecoveredIdentity(coord, entry.revision, entry.populated);
+    for (const auto since : marks) ExpectChangedPages(recovered, model, since);
+}
+
+// A writer raising its run races a split moving its coordinate to a new run.
+void ConcurrentSplitsKeepEveryRevision() {
+    test::ScopedTempDir directory("chunkdb-index-run-race");
+    const auto geometry = Shape();
+    assert(ChunkCoordinateIndex::InitializeEmpty(directory.path(), geometry, kTable));
+    ChunkCoordinateIndex owner(directory.path(), geometry, kTable, false);
+    constexpr std::int64_t kRows = 2000;
+    std::atomic<std::uint64_t> clock{0U};
+    Model rewritten, inserted;
+    for (std::int64_t y = 0; y < kRows; y += 2) {
+        auto& entry = rewritten[{0, y}];
+        entry.revision = ++clock;
+        Publish(owner, {0, y}, entry.node, true, entry.revision);
+    }
+    const auto before = clock.load();
+    std::thread writer([&] {
+        for (int round = 0; round < 4; ++round) {
+            for (auto& [coord, entry] : rewritten) {
+                entry.revision = ++clock;
+                entry.populated = (round % 2) == 0;
+                Publish(owner, coord, entry.node, entry.populated, entry.revision);
+            }
+        }
+    });
+    std::thread splitter([&] {
+        for (std::int64_t y = 1; y < kRows; y += 2) {
+            auto& entry = inserted[{0, y}];
+            entry.revision = ++clock;
+            entry.populated = true;
+            Publish(owner, {0, y}, entry.node, true, entry.revision);
+        }
+    });
+    writer.join();
+    splitter.join();
+    Model model = rewritten;
+    model.insert(inserted.begin(), inserted.end());
+    for (const auto since : {std::uint64_t{0U}, before, (before + clock.load()) / 2U, clock.load() - 1U})
+        ExpectChangedPages(owner, model, since);
+}
+
+
+// A reader pages while a writer inserts coordinates between others, splitting
+// their runs, and rewrites some. Each page must ascend past its cursor and
+// list every coordinate in its range written after R before the reader began.
+void PagesDuringSplitsKeepEarlierChanges() {
+    test::ScopedTempDir directory("chunkdb-index-run-reader");
+    const auto geometry = Shape();
+    assert(ChunkCoordinateIndex::InitializeEmpty(directory.path(), geometry, kTable));
+    ChunkCoordinateIndex owner(directory.path(), geometry, kTable, false);
+    constexpr std::int64_t kRows = 3000;
+    std::uint64_t clock = 0U;
+    std::vector<ChunkCoordinateNode*> nodes(kRows, nullptr);
+    for (std::int64_t y = 1; y < kRows; y += 3) Publish(owner, {0, y}, nodes[y], true, ++clock);
+    const auto since = clock;
+    std::set<ChunkCoord> kept;
+    for (std::int64_t y = 0; y < kRows; y += 3) {
+        Publish(owner, {0, y}, nodes[y], true, ++clock);
+        kept.insert(ChunkCoord{0, y});
+    }
+    std::atomic<std::uint64_t> next_revision{clock};
+    std::atomic<bool> done{false};
+    std::thread writer([&] {
+        for (std::int64_t y = 2; y < kRows; y += 3) Publish(owner, {0, y}, nodes[y], y % 2 == 0, ++next_revision);
+        for (std::int64_t y = 1; y < kRows; y += 6) Publish(owner, {0, y}, nodes[y], false, ++next_revision);
+        done.store(true);
+    });
+    const auto check = [&](bool changes_only, std::size_t limit) {
+        bool has_cursor = false;
+        ChunkCoord cursor{};
+        for (;;) {
+            const auto page = changes_only ? owner.Page(has_cursor, cursor, limit, since)
+                                           : owner.SnapshotPage(has_cursor, cursor, limit, since);
+            for (std::size_t at = 0U; at < page.coords.size(); ++at) {
+                const auto& coord = page.coords[at];
+                assert(at == 0U ? !has_cursor || cursor < coord : page.coords[at - 1U] < coord);
+                if (changes_only) {
+                    assert(owner.Find(coord)->revision.load() > since);
+                }
+            }
+            auto expected = has_cursor ? kept.upper_bound(cursor) : kept.begin();
+            for (; expected != kept.end() && (!page.more || !(page.coords.back() < *expected)); ++expected)
+                assert(std::binary_search(page.coords.begin(), page.coords.end(), *expected));
+            if (!page.more) return;
+            has_cursor = true;
+            cursor = page.coords.back();
+        }
+    };
+    do {
+        for (const std::size_t limit : {std::size_t{5}, std::size_t{97}}) {
+            check(true, limit);
+            check(false, limit);
+        }
+    } while (!done.load());
+    writer.join();
+    check(true, 97U);
+    check(false, 97U);
+}
+
+// A read-only refresh that forgets a stretch of coordinates empties whole
+// runs, which are removed; coordinates published there again split the
+// surrounding run and reuse them.
+void ReadOnlyRefreshRemovesAndReusesRuns() {
+    test::ScopedTempDir directory("chunkdb-index-run-refresh");
+    const auto geometry = Shape();
+    assert(ChunkCoordinateIndex::InitializeEmpty(directory.path(), geometry, kTable));
+    const ChunkCoordinateIndex retained(directory.path(), geometry, kTable, true);
+    ChunkCoordinateIndex reader(directory.path(), geometry, kTable, true);
+    Model model;
+    std::uint64_t revision = 0U;
+    for (std::int64_t y = 0; y < 400; ++y) {
+        reader.ObserveRecoveredIdentity({0, y}, ++revision, true);
+        model[{0, y}] = ModelEntry{.revision = revision, .populated = true};
+    }
+    const auto refresh = [&](const std::vector<RecoveredCoordinateIdentity>& updates) {
+        reader.RefreshReadOnly(updates, retained, [] {});
+        for (const auto& update : updates)
+            model[update.coord] = ModelEntry{.revision = update.revision, .populated = update.populated};
+    };
+    std::vector<RecoveredCoordinateIdentity> updates;
+    for (std::int64_t y = 100; y < 300; ++y) updates.push_back({{0, y}, 0U, false});
+    refresh(updates);
+    for (const auto since : {std::uint64_t{0U}, std::uint64_t{200U}, revision}) ExpectChangedPages(reader, model, since);
+    const auto before = revision;
+    updates.clear();
+    for (std::int64_t y = 100; y < 300; y += 2) updates.push_back({{0, y}, ++revision, y % 4 == 0});
+    refresh(updates);
+    for (const auto since : {std::uint64_t{0U}, before, revision - 50U, revision}) ExpectChangedPages(reader, model, since);
+}
+
+// A coordinate recovered from a forget record joins a run, so a later write
+// to it raises that run and SINCE pages find it.
+void AdmittedForgetJoinsItsRun() {
+    test::ScopedTempDir directory("chunkdb-index-run-forget");
+    const auto geometry = Shape();
+    const LargeChunkCoord large{};
+    const ChunkCoord forgotten{0, 0}, deleted{1, 0};
+    auto bytes = SerializeChunkIndexHeader({kTable, 2U, large});
+    for (const auto& record : {ChunkIndexRecord{ChunkIndexKind::kDeleted, forgotten, 2U, 20U, 1U},
+             ChunkIndexRecord{ChunkIndexKind::kForget, forgotten, 2U, 20U, 1U},
+             ChunkIndexRecord{ChunkIndexKind::kDeleted, deleted, 4U, 40U, 1U}}) {
+        const auto encoded = SerializeChunkIndexRecord(record, geometry, large);
+        bytes.insert(bytes.end(), encoded.begin(), encoded.end());
+    }
+    AtomicWrite(Log(directory.path(), geometry, {}), bytes, true, true);
+    std::ostringstream output;
+    WriteIndexInventory(output, {.table_id = kTable, .dims = 2U, .retained_deletion_floor = 2U, .count = 1U},
+        std::vector<IndexInventoryEntry>{{large, bytes.size()}});
+    const auto encoded = output.str();
+    AtomicWrite(directory.path() / kChunkIndexFileName, Bytes(encoded.begin(), encoded.end()), true, true);
+    ChunkCoordinateIndex owner(directory.path(), geometry, kTable, false);
+    owner.CompleteRecovery();
+    assert(owner.Page(false, {}, 10U, 2U).coords == std::vector{deleted});
+    ChunkCoordinateNode* node = nullptr;
+    Publish(owner, forgotten, node, true, 5U);
+    assert(owner.Page(false, {}, 10U, 4U).coords == std::vector{forgotten});
+    assert((owner.Page(false, {}, 10U, 2U).coords == std::vector{forgotten, deleted}));
+    assert(owner.SnapshotPage(false, {}, 10U, 4U).coords == std::vector{forgotten});
+}
+
+
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--binding-only") {
         ReplacementIdentityBindsValidSameLengthContent();
@@ -440,4 +679,9 @@ int main(int argc, char** argv) {
     ForgetRequiresItsPublishedRefusalFloor();
     ReplacementIdentityBindsValidSameLengthContent();
     SnapshotPageKeepsLaterEmptiedCoordinates();
+    ChangedPagesSkipUnchangedRuns();
+    ConcurrentSplitsKeepEveryRevision();
+    PagesDuringSplitsKeepEarlierChanges();
+    ReadOnlyRefreshRemovesAndReusesRuns();
+    AdmittedForgetJoinsItsRun();
 }

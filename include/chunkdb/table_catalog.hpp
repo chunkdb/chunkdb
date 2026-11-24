@@ -52,6 +52,12 @@ inline constexpr std::size_t kMaxTableNameLength = 64;
 [[nodiscard]] bool IsValidTableName(std::string_view name) noexcept;
 // Throws std::invalid_argument stating the rule when `name` breaks it.
 void RequireValidTableName(std::string_view name);
+// A name a new table cannot take: WATCH CATALOG reserves it. A table of this
+// name made before keeps working, but cannot be watched.
+inline constexpr std::string_view kReservedTableName = "catalog";
+// RequireValidTableName, and refuses kReservedTableName: for CREATE TABLE,
+// RENAME TO and RESTORE TABLE.
+void RequireNewTableName(std::string_view name);
 // Throws std::invalid_argument for an option a table cannot use.
 void RequireValidTableOptions(const TableOptions& options);
 
@@ -240,6 +246,10 @@ class Table : public std::enable_shared_from_this<Table> {
     // Waits while the table is being reopened. std::nullopt once it was
     // dropped: a table of the same name created later is another table.
     [[nodiscard]] std::optional<Lease> Acquire();
+    // Never waits: std::nullopt while the table is not open, as while an
+    // exclusive statement holds or waits for it, after a failure (its feed
+    // cleanup included), or once it was dropped.
+    [[nodiscard]] std::optional<Lease> TryAcquire();
 
     [[nodiscard]] std::unique_ptr<FeedSubscription> SubscribeFeed(const FeedOptions& options = {});
     [[nodiscard]] std::size_t FeedBufferBytes() const noexcept { return effective_feed_buffer_bytes_.load(std::memory_order_acquire); }
@@ -255,6 +265,8 @@ class Table : public std::enable_shared_from_this<Table> {
         std::optional<std::string> owner = std::nullopt, bool owner_given = false);
     void DropFeedSlot(std::string_view name, bool if_exists = false);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(bool include_lost = false);
+    // ListFeedSlots on a TryAcquire lease: std::nullopt when TryAcquire gives none.
+    [[nodiscard]] std::optional<std::vector<FeedSlot>> TryListFeedSlots(bool include_lost = false);
     struct FeedCounts {
         std::size_t slots = 0U;
         std::size_t watches = 0U;
@@ -283,6 +295,7 @@ class Table : public std::enable_shared_from_this<Table> {
     [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name, const FeedOptions& options,
         bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner);
     [[nodiscard]] FeedSlot ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
+    [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(const Lease& lease, bool include_lost);
     // Records `owner` for the claimed slot when it has none.
     void BindClaimedFeedSlotOwner(const std::shared_ptr<FeedSlotClaim>& claim, const std::string& owner);
     void StageClaimedFeedSlotAck(const std::shared_ptr<FeedSlotClaim>& claim, FeedPosition position);
@@ -440,6 +453,9 @@ class TableCatalog {
         return config_.data_dir;
     }
     [[nodiscard]] AccessMode access_mode() const noexcept { return config_.access_mode; }
+    [[nodiscard]] bool allow_multiple_processes() const noexcept { return config_.allow_multiple_processes; }
+    // --feed-buffer-bytes: the default feed budget of tables, and the catalog feed's.
+    [[nodiscard]] std::size_t feed_buffer_bytes() const noexcept { return config_.feed_buffer_bytes; }
     [[nodiscard]] const QueryLimits& query_limits() const noexcept { return config_.query_limits; }
     [[nodiscard]] const TableOptions& default_options() const noexcept {
         return config_.default_options;
@@ -610,8 +626,12 @@ class TableCatalog {
     void RemoveInterruptedOperations(std::string_view table = {});
     void OpenExistingTables();
     struct FoundTable;
-    // Reads a table directory to open; a writer drops an interrupted narrowing.
+    // Reads a table directory to open without changing it; a writer drops an
+    // interrupted narrowing or ADD CHECK from the manifest it returns.
     [[nodiscard]] FoundTable ReadTableToOpen(const std::string& name, const std::filesystem::path& dir);
+    // Publishes the manifest without the dropped narrowing or ADD CHECK, once
+    // every check that could refuse the open has passed.
+    void PublishDroppedPending(const FoundTable& table);
     [[nodiscard]] std::shared_ptr<Table> OpenFoundTable(FoundTable& table);
     // Throws as opening does for a table directory without its manifest.
     [[nodiscard]] StoreManifest ReadOpenableManifest(const std::filesystem::path& dir) const;

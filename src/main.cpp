@@ -59,10 +59,11 @@ void OnHangup(int) {
 }
 #endif
 
+// 0 asks the system for a free port, which the ready line names.
 std::uint16_t ParsePort(const std::string& value) {
     std::size_t consumed = 0;
     const int port = std::stoi(value, &consumed, 10);
-    if (consumed != value.size() || port <= 0 || port > 65535) {
+    if (consumed != value.size() || port < 0 || port > 65535) {
         throw std::invalid_argument("invalid port: " + value);
     }
     return static_cast<std::uint16_t>(port);
@@ -396,7 +397,7 @@ int main(int argc, char** argv) {
                     require_value("--background-checkpoint-queue-limit"),
                     "background-checkpoint-queue-limit");
             } else if (arg == "--listen-uri") {
-                const auto parsed_uri = chunkdb::ParseConnectionUri(require_value("--listen-uri"));
+                const auto parsed_uri = chunkdb::ParseConnectionUri(require_value("--listen-uri"), chunkdb::UriUse::kListen);
                 server_config.host = parsed_uri.host;
                 server_config.port = parsed_uri.port;
                 server_config.tls_enabled = parsed_uri.secure;

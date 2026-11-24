@@ -23,7 +23,7 @@ namespace {
 constexpr const char* kFenceRestore = "a failed restore could not remove it";
 
 void CrashAtFailpoint(const char* key) {
-    if (ConsumeFailpointEnv(key)) std::_Exit(86);
+    if (ConsumeFailpointEnv(key)) ExitAbruptly(86);
 }
 
 std::string OperationName(const std::string& table) {
@@ -53,7 +53,7 @@ class RestoreProgressLog {
 
 TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request) {
     RequireWritable("RESTORE TABLE");
-    RequireValidTableName(request.name);
+    RequireNewTableName(request.name);
     const auto require_name = [&] {
         migration_health_->Check();
         ThrowIfFenced(request.name);
@@ -419,7 +419,7 @@ constexpr const char* kWatchRenamed = "watched table was renamed; watch it again
 void TableCatalog::RenameTable(std::string_view name, std::string_view new_name, UserRegistry* users, std::stop_token cancelled) {
     RequireWritable("ALTER TABLE ... RENAME TO");
     RequireValidTableName(name);
-    RequireValidTableName(new_name);
+    RequireNewTableName(new_name);
     const std::string from(name), to(new_name);
     if (from == to) throw std::invalid_argument("table '" + from + "' already has the name " + to);
     // As SwapTables: feature activation and backup metadata capture and

@@ -55,5 +55,20 @@ int main() {
         assert(thrown);
     }
 
+    {
+        // Port 0 is a free port a listener picks; a client cannot connect to it.
+        assert(chunkdb::ParseConnectionUri("chunks://127.0.0.1:0/", chunkdb::UriUse::kListen).port == 0U);
+        assert(chunkdb::ParseConnectionUri("chunk://[::1]:0/", chunkdb::UriUse::kListen).port == 0U);
+        for (const char* uri : {"chunk://127.0.0.1:0/", "chunk://[::1]:0/"}) {
+            bool thrown = false;
+            try {
+                (void)chunkdb::ParseConnectionUri(uri);
+            } catch (const std::invalid_argument& error) {
+                thrown = std::string(error.what()) == "invalid port: 0";
+            }
+            assert(thrown);
+        }
+    }
+
     return 0;
 }

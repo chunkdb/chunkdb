@@ -9,8 +9,8 @@ Numeric values are decimal integers, with the bounds shown here.
 | Flag | Default | Meaning and bounds |
 |---|---|---|
 | `--host` | `127.0.0.1` | Bind address. |
-| `--port` | `4242` | TCP port, 1–65535. |
-| `--listen-uri` | unset | `chunk://host:port/` or `chunks://host:port/`; sets address, port and TLS at this point in argument order; a username is refused. |
+| `--port` | `4242` | TCP port, 0–65535; 0 listens on a free port the system picks, which the `port` field of the INFO line `ready to accept connections` names. |
+| `--listen-uri` | unset | `chunk://host:port/` or `chunks://host:port/`; sets address, port and TLS at this point in argument order; port 0 picks a free port as with `--port`; a username is refused. |
 | `--workers` | CPU thread count, or 4 | Concurrent statement execution; idle input, partial frames, TLS, authentication and output wait on I/O pollers, except that a worker with no queued request waits for the next request of the connection it answered. |
 | `--client-io-timeout-ms` | `5000` | 1–86400000 ms each for the PROXY header, the TLS handshake, HELLO and AUTH with all their parameter frames (after those two), each later request line (from its first byte), frame header (from the end of the line or the previous frame) and frame body, kept or drained (from the end of its header), not counting a wait for the server's input credit, which receives `BUSY reason=input_budget` and closes after this interval; reply writes close after this interval without output progress, and a slot watch sending any frame above its feed share is closed when no byte of its output is written for this long, where on TLS each completed record of up to 16 KiB counts. |
 | `--idle-connection-timeout-ms` | `60000` | 1–86400000 ms between requests; before HELLO the smaller I/O/idle timeout applies. |
@@ -74,6 +74,7 @@ With `off`, the server never reads a header, so a client cannot claim another ad
 ## Logs
 
 The server log goes to standard output at `--log-level`.
+The INFO line `ready to accept connections` is written out as soon as the server accepts connections, also to a pipe or file; its `port` field names the port it listens on.
 
 `--slow-statement-ms` logs a WARN line for each statement that took at least that long.
 The line names the statement verb, table, user, peer address, duration in milliseconds and, where the server knows it, the number of chunks read or written; it never contains values.

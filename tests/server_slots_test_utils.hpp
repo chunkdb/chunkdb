@@ -398,7 +398,7 @@ class Harness {
   public:
     test::ScopedTempDir directory{"chunkdb-slots-socket"};
     std::shared_ptr<TableCatalog> catalog;
-    std::uint16_t port = test::PickListenerPort();
+    std::uint16_t port = 0; // The port the server picked; set once it listens.
     bool tls;
     bool auth;
     Harness(bool use_tls, bool use_auth = false, std::size_t max_bytes = kDefaultSlotMaxBytes,
@@ -419,7 +419,7 @@ class Harness {
         if (auth) engine_config.users = test::MakeUsers(directory.path(), "admin", "secret");
         engine_ = std::make_shared<CommandEngine>(engine_config, catalog);
         ServerConfig server_config;
-        server_config.port = port;
+        server_config.port = 0;
         server_config.worker_threads = 4;
         // Software SCRAM in Debug/sanitizer builds needs a bounded functional
         // login budget; these fixtures do not test handshake deadlines.
@@ -443,13 +443,11 @@ class Harness {
         Start();
     }
     // Another process may have bound the old port since Stop; no caller needs
-    // the same port, so the server restarts on a newly chosen one.
+    // the same port, so the server restarts on one the system picks again.
     void Restart() {
         test::FeedPhaseWatchdog::Phase("harness: restart Stop"); server_->Stop();
         test::FeedPhaseWatchdog::Phase("harness: restart join"); thread_.join();
         { std::lock_guard lock(error_mutex_); if (error_) std::rethrow_exception(error_); }
-        port = test::PickListenerPort();
-        server_config_.port = port;
         server_ = std::make_unique<ChunkServer>(server_config_, engine_);
         Start();
     }
@@ -479,6 +477,7 @@ class Harness {
             // Run reports its own listener, so the probe never reaches another
             // socket on this port; a failed Run ends the wait at once.
             if (!server_->WaitListeningForTests(10s)) throw std::runtime_error("server did not start listening in time");
+            port = server_->port();
             const auto probe = std::make_unique<Client>(port, tls);
             // TCP can connect while Run is still constructing its feed I/O.
             // A completed handshake proves workers are ready before installing
@@ -518,8 +517,7 @@ inline std::uint64_t Change(const Reply& reply, std::size_t blocks = 1U) {
     assert(reply.items[9].type == '*' && reply.items[9].items.empty());
     return Number(reply.items[2]);
 }
-inline Reply NextChange(Client& client) {
-    auto reply = client.Read();
+inline Reply ChangeFrom(Client& client, Reply reply) {
     if (reply.type == '>' && !reply.items.empty() && reply.items[0].value == "schema") {
         assert(reply.items.size() == 2U && reply.items[1].type == '%');
         const auto& metadata = reply.items[1];
@@ -532,6 +530,14 @@ inline Reply NextChange(Client& client) {
     }
     (void)Change(reply, reply.items.size() == 10U ? reply.items[6].items.size() : 0U);
     return reply;
+}
+inline Reply NextChange(Client& client) { return ChangeFrom(client, client.Read()); }
+// A watch that idles for its progress interval receives a progress push, so a
+// fixture with a short interval can read progress before a change on a slow host.
+inline Reply NextChangeAfterProgress(Client& client) {
+    auto reply = client.Read();
+    while (reply.type == '>' && reply.items.size() == 3U && reply.items[0].value == "progress") reply = client.Read();
+    return ChangeFrom(client, std::move(reply));
 }
 inline void Error(const Reply& reply, std::string_view code) {
     assert(reply.type == '-' && reply.value.rfind("ERR " + std::string(code), 0) == 0);

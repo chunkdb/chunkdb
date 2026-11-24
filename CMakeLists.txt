@@ -78,12 +78,15 @@ add_library(chunkdb_core STATIC
     src/commit_group_identity.cpp
     src/commit_group_format.cpp
     src/commit_request_fingerprint.cpp
+    src/commit_group_journal.cpp
+    src/commit_group_coordinator.cpp
     src/commit_group_owner_format.cpp
     src/commit_owner_artifact_io.cpp
     src/commit_owner_artifact_identity.cpp
     src/chunk_file_header.cpp
     src/feed_protocol.cpp
     src/change_feed.cpp
+    src/catalog_feed.cpp
     src/feed_slot_records.cpp
     src/feed_slots.cpp
     src/slot_watch.cpp
@@ -245,6 +248,16 @@ target_link_libraries(chunkdb_restore PRIVATE chunkdb_tools)
 add_executable(chunkdb_admin src/admin_main.cpp)
 target_link_libraries(chunkdb_admin PRIVATE chunkdb_tools)
 
+add_executable(chunkdb_exporter
+    src/exporter_main.cpp
+    src/exporter_client.cpp
+    src/metrics_http.cpp
+    src/server_socket.cpp
+    src/server_poller.cpp
+)
+target_link_libraries(chunkdb_exporter PRIVATE chunkdb_core)
+target_include_directories(chunkdb_exporter PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 add_library(chunkdb_server_bench_lib STATIC
     bench/server_bench_lib.cpp
     src/server.cpp
@@ -317,6 +330,8 @@ if(CHUNKDB_WITH_TLS)
     if(OpenSSL_FOUND)
         target_link_libraries(chunkdb_server PRIVATE OpenSSL::SSL OpenSSL::Crypto)
         target_compile_definitions(chunkdb_server PRIVATE CHUNKDB_WITH_OPENSSL=1)
+        target_link_libraries(chunkdb_exporter PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_exporter PRIVATE CHUNKDB_WITH_OPENSSL=1)
 
         target_link_libraries(chunkdb_server_bench_lib PUBLIC OpenSSL::SSL OpenSSL::Crypto)
         target_compile_definitions(chunkdb_server_bench_lib PRIVATE CHUNKDB_WITH_OPENSSL=1)
@@ -396,7 +411,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME coordinate_hash_seed_failure COMMAND chunkdb_coordinate_hash_seed_test --failure)
     set_tests_properties(coordinate_hash_seed_failure PROPERTIES TIMEOUT 60 LABELS "smoke")
 
-    foreach(format IN ITEMS area_cursor sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_group_owner_format commit_owner_artifact_io commit_request_fingerprint wal_group_frame catalog_txn_snapshot ordinary_write_failure chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input wal_durability_pin chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol wal_barrier_memory chunk_column_expressions read_only_index_refresh)
+    foreach(format IN ITEMS area_cursor sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_group_journal commit_group_coordinator commit_group_owner_format commit_owner_artifact_io commit_request_fingerprint wal_group_frame catalog_txn_snapshot ordinary_write_failure chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input wal_durability_pin chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol wal_barrier_memory chunk_column_expressions read_only_index_refresh)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -406,7 +421,13 @@ if(CHUNKDB_BUILD_TESTS)
 
     if(MINGW)
         target_link_options(chunkdb_commit_owner_artifact_io_test PRIVATE -static-libstdc++ -static-libgcc)
+        target_link_options(chunkdb_commit_group_journal_test PRIVATE -static-libstdc++ -static-libgcc)
     endif()
+    # The crash children of the owner artifacts and the coordinator run in the crash label.
+    add_test(NAME commit_owner_artifact_io_crash COMMAND chunkdb_commit_owner_artifact_io_test --case crash)
+    set_tests_properties(commit_owner_artifact_io_crash PROPERTIES TIMEOUT 300)
+    add_test(NAME commit_group_coordinator_crash COMMAND chunkdb_commit_group_coordinator_test --case crash)
+    set_tests_properties(commit_group_coordinator_crash PROPERTIES TIMEOUT 300)
 
     add_executable(chunkdb_area_paging_test tests/area_paging_tests.cpp)
     target_link_libraries(chunkdb_area_paging_test PRIVATE chunkdb_core)
@@ -452,7 +473,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME feed_chunk_model_3d COMMAND chunkdb_feed_chunk_model_test --3d)
     set_tests_properties(cql_chunk_model_3d feed_chunk_model_3d PROPERTIES TIMEOUT 60 LABELS "smoke")
 
-    foreach(verifier IN ITEMS verify_index verify_memory chunk_model_persistence_3d)
+    foreach(verifier IN ITEMS verify_index verify_memory chunk_model_persistence_3d commit_group_verify)
         add_executable(chunkdb_${verifier}_test tests/${verifier}_tests.cpp)
         target_link_libraries(chunkdb_${verifier}_test PRIVATE chunkdb_tools)
         target_include_directories(chunkdb_${verifier}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -820,6 +841,26 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME server_socket COMMAND chunkdb_server_socket_test)
     set_tests_properties(server_socket PROPERTIES TIMEOUT 30 LABELS "smoke")
 
+    add_executable(chunkdb_metrics_http_test tests/metrics_http_tests.cpp src/metrics_http.cpp src/server_socket.cpp src/server_poller.cpp)
+    target_link_libraries(chunkdb_metrics_http_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_metrics_http_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME metrics_http COMMAND chunkdb_metrics_http_test)
+    set_tests_properties(metrics_http PROPERTIES TIMEOUT 60 LABELS "smoke")
+
+    if(NOT WIN32)
+        add_executable(chunkdb_exporter_test tests/exporter_tests.cpp src/exporter_client.cpp src/metrics_http.cpp
+            src/server_socket.cpp src/server_poller.cpp)
+        target_link_libraries(chunkdb_exporter_test PRIVATE chunkdb_core)
+        target_include_directories(chunkdb_exporter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+            target_link_libraries(chunkdb_exporter_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+            target_compile_definitions(chunkdb_exporter_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+        endif()
+        add_dependencies(chunkdb_exporter_test chunkdb_exporter chunkdb_server)
+        add_test(NAME exporter COMMAND chunkdb_exporter_test $<TARGET_FILE:chunkdb_exporter> $<TARGET_FILE:chunkdb_server>)
+        set_tests_properties(exporter PROPERTIES TIMEOUT 300)
+    endif()
+
     if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
         add_executable(chunkdb_server_tls_error_queue_test tests/server_tls_error_queue_tests.cpp
             src/server_socket.cpp src/server_io.cpp src/server_tls.cpp)
@@ -1085,6 +1126,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_feed_order_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME feed_order COMMAND chunkdb_feed_order_test)
 
+    add_executable(chunkdb_catalog_feed_test tests/catalog_feed_tests.cpp)
+    target_link_libraries(chunkdb_catalog_feed_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_catalog_feed_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME catalog_feed COMMAND chunkdb_catalog_feed_test)
+
     add_executable(chunkdb_feed_slot_records_test tests/feed_slot_records_tests.cpp)
     target_link_libraries(chunkdb_feed_slot_records_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_feed_slot_records_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1161,6 +1207,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_feed_slots_crash_test
         chunkdb_feed_slots_durability_test
         chunkdb_feed_order_test
+        chunkdb_catalog_feed_test
         chunkdb_feed_watermark_test
         chunkdb_feed_lifecycle_test
         chunkdb_table_feed_limits_test
@@ -1175,6 +1222,9 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_wal_group_frame_test
         chunkdb_catalog_txn_snapshot_test
         chunkdb_ordinary_write_failure_test
+        chunkdb_commit_group_journal_test
+        chunkdb_commit_group_coordinator_test
+        chunkdb_commit_group_verify_test
         chunkdb_commit_group_owner_format_test
         chunkdb_commit_owner_artifact_io_test
         chunkdb_chunk_file_header_test
@@ -1275,6 +1325,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_server_framing_test
         chunkdb_server_poller_test
         chunkdb_server_socket_test
+        chunkdb_metrics_http_test
         chunkdb_server_integration_test
         chunkdb_feed_completed_prefix_reader_test
         chunkdb_server_slots_protocol_test
@@ -1301,6 +1352,9 @@ if(CHUNKDB_BUILD_TESTS)
     )
     if(TARGET chunkdb_server_tls_error_queue_test)
         list(APPEND CHUNKDB_TEST_TARGETS chunkdb_server_tls_error_queue_test)
+    endif()
+    if(NOT WIN32)
+        list(APPEND CHUNKDB_TEST_TARGETS chunkdb_exporter_test)
     endif()
     if(MSVC)
         set(CHUNKDB_TEST_UNDEBUG_OPTION /UNDEBUG)
@@ -1346,6 +1400,7 @@ if(CHUNKDB_BUILD_TESTS)
         feed_slots_verify
         feed_slots_durability
         feed_order
+        catalog_feed
         feed_watermark
         feed_lifecycle
         table_feed_limits
@@ -1466,6 +1521,8 @@ if(CHUNKDB_BUILD_TESTS)
         txn_crash
         chunk_coordinate_index_crash
         table_tombstones_crash
+        commit_owner_artifact_io_crash
+        commit_group_coordinator_crash
     )
 
     if(TARGET chunkdb_server_tls_error_queue_test)
@@ -1487,6 +1544,7 @@ if(CHUNKDB_ENABLE_PACKAGING)
             chunkdb_verify
             chunkdb_restore
             chunkdb_admin
+            chunkdb_exporter
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 

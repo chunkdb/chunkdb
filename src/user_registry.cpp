@@ -206,6 +206,17 @@ std::array<std::uint8_t, 32> UserRegistry::Secret() const {
     return Published()->secret;
 }
 
+scram::Verifier UserRegistry::DecoyVerifier(std::string_view name) const {
+    std::shared_ptr<const Users> users;
+    std::shared_ptr<const std::vector<scram::VerifierShape>> shapes;
+    {
+        std::lock_guard lock(published_mutex_);
+        users = published_;
+        shapes = shapes_;
+    }
+    return scram::DecoyVerifier(users->secret, name, *shapes);
+}
+
 std::shared_ptr<const Users> UserRegistry::Published() const {
     std::lock_guard lock(published_mutex_);
     return published_;
@@ -413,6 +424,13 @@ ReadRightCheck::State ReadRightCheck::Recheck(std::uint64_t generation) {
     const auto rights = users_->Rights();
     const auto found = rights->users.find(user_);
     if (found == rights->users.end() || found->second.incarnation != incarnation_) state_ = State::kNoUser;
+    else if (catalog_) {
+        const auto& user = found->second;
+        const auto every = user.grants.find(kEveryTable);
+        const bool admin_all = every != user.grants.end() && every->second >= Right::kAdmin;
+        const bool monitor = (user.server_rights & static_cast<std::uint8_t>(ServerRight::kMonitor)) != 0U;
+        if ((!monitor && !admin_all) || (catalog_users_ && !user.manages_users)) state_ = State::kNoRight;
+    }
     else if (!RightOn(found->second.grants, found->second.prefix_grants, table_).has_value()) state_ = State::kNoRight;
     else if (every_table_admin_) {
         const auto every = found->second.grants.find(kEveryTable);
