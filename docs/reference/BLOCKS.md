@@ -44,7 +44,7 @@ DELETE BLOCK x y [z] FROM table [IF VERSION version | IF condition]
 - `WITH SCHEMA`: include the table's schema version with the row.
 - `column = expression`: values to change, each a value, a `$n` parameter or an [expression](EXPRESSIONS.md) such as `coins + $1`; unspecified columns of an existing block retain their values.
 - `IF VERSION`: update only when the containing chunk still has this version, an integer or a `$n` u64 parameter; another block's change can invalidate it.
-- `IF condition`: write only when the [condition](EXPRESSIONS.md) holds for the block as it is; it is false when it is unknown (NULL).
+- `IF condition`: write only when the [condition](EXPRESSIONS.md) holds for the block as it is ([conditions](../CQL.md#conditions)); it is false when it is unknown (NULL).
 - IF VERSION and IF condition exclude each other; `IF version = 3` tests a column named `version`.
 
 ## Returns

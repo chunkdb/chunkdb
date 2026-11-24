@@ -309,8 +309,10 @@ Span SlotEpoch(const std::string& text, std::size_t line) {
     const std::size_t begin = s.pos();
     if (!s.Epoch()) return std::nullopt;
     const std::size_t end = s.pos();
-    if (!s.Newline() || !s.Literal("  acked = ") || !s.Digits() || !s.Newline() ||
-        !s.Literal("  retained_bytes = ") || !s.Digits() || !s.Newline() || !s.Literal("  lost = ") ||
+    if (!s.Newline() || !s.Literal("  acked = ") || !s.Digits() || !s.Newline() || !s.Literal("  revision = ") ||
+        !s.Digits() || !s.Newline() || !s.Literal("  lag_revisions = ") || !s.Digits() || !s.Newline() ||
+        !s.Literal("  retained_bytes = ") || !s.Digits() || !s.Newline() || !s.Literal("  attached = ") ||
+        !(s.Literal("true") || s.Literal("false")) || !s.Newline() || !s.Literal("  lost = ") ||
         !(s.Literal("true") || s.Literal("false")) || !s.Newline() || !s.Literal("  lost_reason = ") ||
         !s.RestOfLine() || !s.Newline() || !s.Literal("  filters:") || !s.Newline()) {
         return std::nullopt;
@@ -375,8 +377,21 @@ Span ScanEpoch(const std::string& text, std::size_t line) {
         }
         if (!any) return std::nullopt;
     } else if (!s.Literal("chunks = []") || !s.Newline()) return std::nullopt;
-    if (!s.Literal("more = ") || !(s.Literal("true") || s.Literal("false")) ||
-        !s.Newline() || !s.Literal("epoch = ")) return std::nullopt;
+    if (!s.Literal("more = ") || !(s.Literal("true") || s.Literal("false")) || !s.Newline()) return std::nullopt;
+    // A scan with WHERE adds its continuation.
+    if (s.Literal("after = ")) {
+        if (s.Literal("[")) {
+            std::size_t values = 0U;
+            do {
+                s.Literal("-");
+                if (!s.Digits()) return std::nullopt;
+                ++values;
+            } while (s.Literal(", "));
+            if ((values != 2U && values != 3U) || !s.Literal("]")) return std::nullopt;
+        } else if (!s.Literal("NULL")) return std::nullopt;
+        if (!s.Newline()) return std::nullopt;
+    }
+    if (!s.Literal("epoch = ")) return std::nullopt;
     const auto begin = s.pos();
     if (!s.Epoch()) return std::nullopt;
     const auto end = s.pos();

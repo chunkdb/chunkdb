@@ -700,13 +700,23 @@ std::vector<FeedSlot> Table::ListFeedSlots(bool include_lost) {
     if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
     auto slots = lease->store().feed_slots_->List(include_lost);
     const auto& columns = lease->store().geometry().layout().schema().columns;
-    for (auto& slot : slots) if (slot.filters.column_ids) {
+    for (auto& slot : slots) {
+        // ClaimFeedSlot refuses a second watch by the same rule.
+        if (const auto claimed = slot_claims_.find(slot.name); claimed != slot_claims_.end())
+            if (const auto claim = claimed->second.lock()) slot.attached = claim->valid.load(std::memory_order_acquire);
+        if (!slot.filters.column_ids) continue;
         for (const auto id : *slot.filters.column_ids) {
             const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
             slot.column_names.push_back(at == columns.end() ? std::nullopt : std::optional<std::string>(at->name));
         }
     }
     return slots;
+}
+
+Table::FeedCounts Table::CountFeeds(const Lease& lease) const {
+    if (lease.table_ != this) throw std::logic_error("feed counts need a lease of their table");
+    // Subscriptions change only in exclusive sections, which wait for leases.
+    return FeedCounts{.slots = lease.store().feed_slots_->size(), .watches = feed_subscriptions_};
 }
 
 std::vector<std::uint32_t> Table::ResolveFeedColumns(const std::vector<std::string>& names) {
@@ -1925,6 +1935,11 @@ void TableCatalog::RetireTable(Table& table, const TableOptions& options) {
     table.EndExclusive(nullptr, options);
 }
 
+void TableCatalog::ChangeGrants(const std::function<void()>& change) {
+    std::lock_guard operations(operations_mutex_);
+    change();
+}
+
 void TableCatalog::Drop(std::string_view name) {
     Drop(name, nullptr);
 }
@@ -2139,7 +2154,7 @@ std::optional<std::string> TableCatalog::ScanNarrowing(Table& table) {
     if (!lease.has_value()) {
         throw TableNotFoundError("table '" + table.name_ + "' is unavailable");
     }
-    return lease->store().FindValueNotFitting(pending->column_id, pending->type);
+    return lease->store().FindValueNotFitting(pending->column_id, pending->type, pending->not_null);
 }
 
 void TableCatalog::EndNarrowing(Table& table, const TableOptions& options, const std::function<void(StoreManifest*)>& change) {
@@ -2180,16 +2195,17 @@ void TableCatalog::EndNarrowing(Table& table, const TableOptions& options, const
     }
 }
 
-void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
+void TableCatalog::CheckColumnValues(std::string_view name, const std::function<TableSchema(const TableSchema&)>& start,
+    const std::function<TableSchema(const TableSchema&)>& finish, const std::function<std::string(const std::string&)>& refusal) {
     RequireWritable("ALTER TABLE");
     auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = table->Info().options;
-    // 1. Every write to the column must fit `type` from here on.
+    // 1. Every write to the column must pass the check from here on.
     RewriteManifest(
         *table, options,
-        [&](StoreManifest* manifest) { manifest->schema = WithPendingNarrowing(manifest->schema, column, type); },
+        [&](StoreManifest* manifest) { manifest->schema = start(manifest->schema); },
         "CHUNKDB_FAILPOINT_NARROW_PENDING_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
     // 2. Every value already stored.
     std::optional<std::string> misfit;
@@ -2200,10 +2216,10 @@ void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, 
         scan_failure = std::current_exception();
     }
     // 3. The new version, or the schema as it was.
-    const bool narrow = scan_failure == nullptr && !misfit.has_value();
-    if (narrow) {
+    const bool change = scan_failure == nullptr && !misfit.has_value();
+    if (change) {
         EndNarrowing(*table, options, [&](StoreManifest* manifest) {
-            manifest->schema = NarrowColumnType(manifest->schema, column, type);
+            manifest->schema = finish(manifest->schema);
             manifest->geometry.block_bits = FixedBitsPerBlock(manifest->schema);
         });
     } else {
@@ -2218,14 +2234,37 @@ void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, 
         std::rethrow_exception(scan_failure);
     }
     if (misfit.has_value()) {
-        throw std::invalid_argument(
-            "column " + std::string(column) + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit + "; " + ColumnTypeRange(type));
+        throw std::invalid_argument(refusal(*misfit));
     }
+}
+
+void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
+    CheckColumnValues(
+        name, [&](const TableSchema& schema) { return WithPendingNarrowing(schema, column, type); },
+        [&](const TableSchema& schema) { return NarrowColumnType(schema, column, type); },
+        [&](const std::string& misfit) {
+            return "column " + std::string(column) + " cannot be narrowed to " + ColumnTypeName(type) + ": " + misfit + "; " +
+                   ColumnTypeRange(type);
+        });
     LogMessage(
         LogLevel::kInfo,
         LogComponent::kStore,
         "table column narrowed",
-        {{"table", table->name_}, {"column", std::string(column)}, {"type", ColumnTypeName(type)}});
+        {{"table", std::string(name)}, {"column", std::string(column)}, {"type", ColumnTypeName(type)}});
+}
+
+void TableCatalog::DropColumnNull(std::string_view name, std::string_view column) {
+    CheckColumnValues(
+        name, [&](const TableSchema& schema) { return WithPendingNotNull(schema, column); },
+        [&](const TableSchema& schema) { return chunkdb::DropColumnNull(schema, column); },
+        [&](const std::string& misfit) {
+            return "column " + std::string(column) + " cannot drop NULL: " + misfit + "; set a value there first";
+        });
+    LogMessage(
+        LogLevel::kInfo,
+        LogComponent::kStore,
+        "table column no longer takes NULL",
+        {{"table", std::string(name)}, {"column", std::string(column)}});
 }
 
 void TableCatalog::RequireCompatibleColumnAdditions(
@@ -2520,16 +2559,30 @@ CatalogFeatureStatus TableCatalog::FeatureStatus() {
     auto metadata = LockFeatureMetadata();
     migration_health_->Check();
     std::vector<std::shared_ptr<Table>> tables;
+    CatalogFeatureStatus status;
     {
         std::shared_lock lock(tables_mutex_);
         for (const auto& [_, table] : tables_) tables.push_back(table);
+        // Out of the inventory until RecoverTable: no store is open.
+        for (const auto& [name, fenced] : fenced_)
+            status.tables.push_back({.name = name, .features = std::nullopt, .fence = std::string(fenced.reason)});
     }
-    CatalogFeatureStatus status;
     for (const auto& table : tables) {
-        const auto lease = table->Acquire();
-        if (!lease) throw TableNotFoundError("table disappeared while reading feature status");
-        status.tables.emplace_back(table->name(), lease->store().features());
+        CatalogTableStatus entry{.name = table->name(), .features = std::nullopt, .fence = std::nullopt};
+        try {
+            const auto lease = table->Acquire();
+            if (!lease) throw TableNotFoundError("table disappeared while reading feature status");
+            entry.features = lease->store().features();
+        } catch (const FeedRecoveryRequiredError&) {
+            // Its feed cleanup failed, which fences it without a lease.
+            entry.fence = kFenceFeed;
+        }
+        if (!entry.fence) {
+            if (const char* reason = table->FenceReason()) entry.fence = reason;
+        }
+        status.tables.push_back(std::move(entry));
     }
+    std::sort(status.tables.begin(), status.tables.end(), [](const auto& a, const auto& b) { return a.name < b.name; });
     std::lock_guard operations(operations_mutex_);
     migration_health_->Check();
     const auto directory = ReadDataDirManifest(config_.data_dir);

@@ -34,7 +34,7 @@ SHOW MIGRATIONS
 ## Arguments
 
 - `name`: quoted `[a-z_][a-z0-9_]*`, from 1 through 63 bytes.
-- `statement`: one CREATE TABLE, ALTER TABLE, DROP TABLE, GRANT, REVOKE, CREATE SLOT, or DROP SLOT statement.
+- `statement`: one CREATE TABLE, ALTER TABLE, DROP TABLE, GRANT, REVOKE, CREATE SLOT, or DROP SLOT statement; ALTER TABLE ... RENAME TO is refused.
 - Conditional IF NOT EXISTS and IF EXISTS forms are supported inside a migration.
 
 ## Returns
@@ -68,8 +68,8 @@ Keyword case and internal whitespace remain part of the statement identity.
 Separating and trailing spaces or tabs are removed.
 
 Concurrent requests for the same name wait, then compare text.
-A narrowing ALTER COLUMN ... TYPE checks stored values while statements on other tables keep running; BACKUP, ENABLE FEATURE and SHOW STATUS started during the check wait for it.
-During the check, writes to that column must fit the new type.
+A narrowing ALTER COLUMN ... TYPE, and ALTER COLUMN ... DROP NULL, checks stored values while statements on other tables keep running; BACKUP, ENABLE FEATURE and SHOW STATUS started during the check wait for it.
+During the check, writes to that column must fit the new type, or for DROP NULL must not leave it NULL.
 A refused narrowing records nothing in the ledger and removes its narrowing again; if that removal fails, the table is fenced until RECOVER TABLE or a restart.
 Completed records survive restart, backup, and restore together with their changes.
 A migration with an unknown outcome fences every table, because its decision can include the ledger, users and the root manifest.

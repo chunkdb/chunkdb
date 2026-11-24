@@ -1,5 +1,6 @@
-// RESTORE TABLE and SWAP TABLES child processes stop at each step; the next
-// writer start serves each table completely, under its old or new name.
+// RESTORE TABLE, ALTER TABLE ... RENAME TO and SWAP TABLES child processes stop
+// at each step; the next writer start serves each table completely, under its
+// old or new name.
 #include <cstdlib>
 #ifndef _WIN32
 #include <sys/wait.h>
@@ -121,6 +122,42 @@ void SwapCrashes(const std::string& executable) {
     }
 }
 
+// An ALTER TABLE ... RENAME TO child process stops before the rename, after
+// it, and after its sync; the next start serves the table, with its epoch,
+// data and slot, under exactly one of the names.
+void RenameCrashes(const std::string& executable) {
+    for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) {
+        for (const std::string point : {"CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_BEFORE_RENAME_ONCE",
+                 "CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_RENAME_ONCE",
+                 "CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_SYNC_ONCE"}) {
+            Source source(mode);
+            assert(Child(executable, {"--rename-child", source.data.string(), point,
+                       mode == DurabilityMode::kFsyncWal ? "fsync-wal" : "relaxed"}) == 86);
+            const bool renamed = point.find("BEFORE_RENAME") == std::string::npos;
+            {
+                TableCatalog catalog(source.Config());
+                assert(catalog.TableCount() == 1U && catalog.Fences().empty());
+                assert(catalog.Find(renamed ? "t" : "t_old") == nullptr);
+                const auto table = catalog.Require(renamed ? "t_old" : "t");
+                assert(table->store_id() == source.epoch);
+                {
+                    auto lease = table->Acquire();
+                    assert(lease->store().GetBlockBits(8, 0) == "11111111");
+                    assert(lease->store().GetBlockBits(0, 1) == "00010000");
+                    assert(lease->store().GetBlockBits(9, 3) == "00000101");
+                }
+                const auto slots = table->ListFeedSlots();
+                assert(slots.size() == 1U && !slots[0].resync && slots[0].position.epoch == source.epoch);
+                // The rename can run again after the restart.
+                if (renamed) catalog.RenameTable("t_old", "t", nullptr);
+                else catalog.RenameTable("t", "t_old", nullptr);
+                assert(catalog.Require(renamed ? "t" : "t_old")->store_id() == source.epoch);
+            }
+            Verified(source.data);
+        }
+    }
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -130,6 +167,14 @@ int main(int argc, char** argv) {
         (void)catalog.RestoreTable(TableRestoreRequest{.backup = argv[3], .table = "t", .name = "t_restored"});
         return 3;
     }
+    if (argc == 5 && std::string_view(argv[1]) == "--rename-child") {
+        TableCatalog catalog(ChildConfig(argv[2], argv[4]));
+        // Acknowledged before the rename, so every crash point keeps it.
+        catalog.Require("t")->Acquire()->store().SetBlockBits(0, 1, "00010000");
+        txn_test::ScopedEnv point(argv[3], "1");
+        catalog.RenameTable("t", "t_old", nullptr);
+        return 3;
+    }
     if (argc == 5 && std::string_view(argv[1]) == "--swap-child") {
         TableCatalog catalog(ChildConfig(argv[2], argv[4]));
         txn_test::ScopedEnv point(argv[3], "1");
@@ -137,6 +182,7 @@ int main(int argc, char** argv) {
         return 3;
     }
     Crashes(argv[0]);
+    RenameCrashes(argv[0]);
 #ifdef _WIN32
     // Windows refuses SWAP TABLES before it closes anything.
     constexpr bool kAtomicExchange = false;
@@ -144,9 +190,9 @@ int main(int argc, char** argv) {
     constexpr bool kAtomicExchange = true;
 #endif
     if (!kAtomicExchange) {
-        std::cout << "16 restore table crash cases passed\n";
+        std::cout << "16 restore table and 6 rename table crash cases passed\n";
         return 0;
     }
     SwapCrashes(argv[0]);
-    std::cout << "16 restore table and 6 swap tables crash cases passed\n";
+    std::cout << "16 restore table, 6 rename table and 6 swap tables crash cases passed\n";
 }

@@ -124,12 +124,14 @@ void MultilineSlotEpochPreservesFields() {
     const std::string epoch = "e8a2a1d9c318cdeefba7349821885917";
     const std::string source =
         "OK\nOK\n1)\n  table = feed_demo\n  name = consumer\n"
-        "  epoch = " + epoch + "\n  acked = 0\n  retained_bytes = 0\n"
-        "  lost = false\n  lost_reason = NULL\n  filters:\n"
+        "  epoch = " + epoch + "\n  acked = 0\n  revision = 0\n  lag_revisions = 0\n  retained_bytes = 0\n"
+        "  attached = false\n  lost = false\n  lost_reason = NULL\n  filters:\n"
         "    area = NULL\n    column_ids = NULL\n    columns = NULL\n"
         "    no_before = false\n    chunks = false\n";
     for (const std::string& changed :
          {source, Replace(source, "acked = 0", "acked = 37"),
+          Replace(source, "revision = 0", "revision = 40"), Replace(source, "lag_revisions = 0", "lag_revisions = 3"),
+          Replace(source, "attached = false", "attached = true"),
           Replace(source, "retained_bytes = 0", "retained_bytes = 4096"), Replace(source, "lost = false", "lost = true"),
           Replace(source, "lost_reason = NULL", "lost_reason = schema_filter"),
           Replace(source, "area = NULL", "area = [-2, 0, 3, 4]"),
@@ -188,14 +190,18 @@ void ScanEpochPreservesCoordinatesAndRevisions() {
         "\nposition = 41\nretained_deletion_floor = 13\n";
     for (const auto& changed : {source, Replace(source, "[-1, 2, 37]", "[-1, 2, -3, 37]"),
              Replace(source, "position = 41", "position = NULL"),
-             Replace(source, "chunks:\n  1) [-1, 2, 37]", "chunks = []")}) {
+             Replace(source, "chunks:\n  1) [-1, 2, 37]", "chunks = []"),
+             Replace(source, "more = true\n", "more = true\nafter = [-1, 2]\n"),
+             Replace(source, "more = true\n", "more = false\nafter = NULL\n")}) {
         const auto expected = Replace(changed, epoch, "<epoch>");
         assert(Normalize(changed) == expected);
         assert(Normalize(Replace(changed, "\n", "\r\n")) == expected);
     }
     for (const auto& unrelated : {std::string("epoch = ") + epoch + "\n", Replace(source, "chunks:", "values:"),
              Replace(source, "[-1, 2, 37]", "[-1, 2]"),
-             Replace(source, "retained_deletion_floor = 13", "retained_deletion_floor = '13'")})
+             Replace(source, "retained_deletion_floor = 13", "retained_deletion_floor = '13'"),
+             Replace(source, "more = true\n", "more = true\nafter = [1]\n"),
+             Replace(source, "more = true\n", "more = true\nafter = 1\n")})
         assert(Normalize(unrelated) == unrelated);
 }
 

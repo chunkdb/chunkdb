@@ -27,37 +27,11 @@ error: OUT_OF_RANGE reason=out_of_range column coins does not hold -1: u16 holds
 ## Syntax
 
 ```text
-condition := and_expr { OR and_expr }
-and_expr  := not_expr { AND not_expr }
-not_expr  := NOT not_expr | predicate
-predicate := ( condition ) | EXISTS | value cmp value | value IS [NOT] NULL
-           | value [NOT] IN ( literal | $n, ... ) | value [NOT] BETWEEN value AND value | bool_value
-value     := term { (+ | -) term }
-term      := factor { (* | / | %) factor }
-factor    := - factor | literal | $n | column | chunk.column | POS_X | POS_Y | POS_Z | NOW()
-           | LEAST ( value, ... ) | GREATEST ( value, ... ) | COALESCE ( value, ... ) | ( value )
-cmp       := = | <> | < | <= | > | >=
+SET BLOCK x y [z] IN table column = value [, ...] [IF VERSION version | IF condition]
+DELETE BLOCK x y [z] FROM table [IF VERSION version | IF condition]
 ```
 
-- `column` names a block column; write `"name"` for a column named like a keyword, such as `"exists"`.
-- `chunk.column` names a [chunk column](CHUNKS.md); `POS_X`, `POS_Y` and `POS_Z` are the block's coordinates.
-- `NOW()` is the write's commit time in milliseconds.
-- Comparisons do not chain: write `a < b AND b < c` for `a < b < c`.
-
-## Types
-
-- Integers compute exactly; a result beyond 128 bits is OUT_OF_RANGE, and dividing an integer by zero is INVALID_ARGUMENT.
-- `/` truncates toward zero, and `%` takes the sign of the dividend.
-- An integer with a float computes in f64, but comparisons between them are exact; NaN equals nothing, and -0 equals 0.
-- Text and bytes compare bytewise; bits compare with `=` and `<>`; bool compares with `=` and `<>` and is a condition by itself.
-- A parameter or literal takes the type of the column operand it meets, and its frame is encoded as that type ([Protocol](../PROTOCOL.md#parameters)); `$1 < $2` has no column operand and is refused.
-- LEAST and GREATEST take numbers and ignore NULL arguments; COALESCE returns its first argument that is not NULL.
-
-## NULL
-
-Arithmetic with NULL is NULL; a comparison with NULL is unknown, and an unknown condition is false.
-`IS NULL` and `IS NOT NULL` are never unknown.
-For an absent block, EXISTS is false and every block column is NULL; chunk columns keep their values.
+A `value` and a `condition` follow [Conditions](../CQL.md#conditions): columns, `chunk.column`, positions, `NOW()`, typed `$n` parameters and the same operators, types and NULL rules.
 
 ## In writes
 
@@ -77,7 +51,3 @@ A refused statement changes nothing and produces no feed change.
 Inside a transaction, the condition and values read the transaction's view, including its own earlier writes.
 A condition, or a value that reads a block or chunk column, counts as a read of its chunk: COMMIT conflicts when another write changed that chunk.
 A refused statement leaves the transaction open and takes none of its write room; `NOW()` is refused there, since the commit time is known only at COMMIT.
-
-## Limits
-
-An expression has at most 256 nodes (values, columns, operators and list items) and 32 levels of nesting; HELLO reports `max_expression_nodes`.

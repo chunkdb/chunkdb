@@ -113,6 +113,7 @@ That count determines the number of following frames.
 Valid statements use unique indices from `$1` through `$n`; frames bind by numeric index even when references appear out of order.
 Each frame is `$<byte length>\r\n<bytes>\r\n`; `$-1\r\n` means NULL.
 These are data bytes and are never parsed as CQL text.
+A parameter in a WHERE condition is encoded as the type of the column it is compared or combined with.
 
 | Column / value | Parameter bytes |
 |---|---|
@@ -122,7 +123,7 @@ These are data bytes and are never parsed as CQL text.
 | bits(N) | ceil(N/8) bytes, lowest bit first. |
 | text, bytes | UTF-8 text or uninterpreted bytes, within the column bound. |
 | SET CHUNK | Chunk form defined by [Chunk form](#chunk-form). |
-| Expression | The type of the column operand it meets ([Expressions](reference/EXPRESSIONS.md#types)). |
+| Expression | The type of the column operand it meets ([Conditions](CQL.md#conditions)). |
 | IF VERSION $n | 8-byte little-endian u64. |
 
 The server bounds a frame before reading its body where the statement's schema permits it.
@@ -161,11 +162,12 @@ Never-written chunks and identities forgotten by tombstone compaction have null 
 Schema versions remain known for absent rows and empty areas; area consistency otherwise remains unchanged.
 Coordinate tuples contain exactly `dims` signed values: x and y, then z only in a three-dimensional table.
 SCAN CHUNKS returns a map with `chunks`, `more`, `epoch`, nullable completed `position`, and `retained_deletion_floor`.
+With WHERE, the map adds `after` after `more`: the coordinates of the last chunk the page visited, or null when `more` is false.
 Its rows are `[coordinates..., chunk_version]`, with a form-or-null appended under WITH DATA.
 Rows ascend by cx, then cy, then cz.
 SINCE includes retained deletions and refuses a revision below the deletion floor with `RESYNC_REQUIRED reason=history_lost floor=... epoch=...`, adding `current` when known.
 AGGREGATE returns a map from each function's lowercase name, such as `count(*)` or `sum(a)`, to its result, in statement order.
-With BY CHUNK it returns an array of rows `[coordinates..., results...]`, one per chunk with a present block, in coordinate order.
+With BY CHUNK it returns an array of rows `[coordinates..., results...]`, one per chunk with a present block that matches WHERE, in coordinate order.
 COUNT(*) is an integer; SUM, MIN and MAX of integer columns are integers or big numbers; AVG and float SUM are doubles; float MIN and MAX are doubles that keep the column value, so an f32 prints at f32 precision; a function over no value is null.
 See [AGGREGATE](reference/AGGREGATE.md#returns) for the rules.
 
@@ -254,7 +256,7 @@ Slot progress cannot pass the durable frontier or changes not yet queued ahead o
 
 An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
 Slot pushes stop at the persisted durable frontier; see [durable slots](reference/FEED.md#notes) for ACK persistence and batching.
-SHOW SLOTS reports written `acked`, retained bytes and loss state.
+SHOW SLOTS reports written `acked`, the durable `revision`, `lag_revisions`, retained bytes, `attached` and loss state.
 CHUNKS pushes use `[chunks,epoch,revision,commit_time_ms,user,schema_version,chunks,tag,txn]`.
 Each chunk is `[cx,cy,version,form_or_null]` or `[cx,cy,cz,version,form_or_null]`; a null form represents deletion.
 Forms match GET CHUNK for that exact commit and projection; later writes cannot change queued bytes.
@@ -269,6 +271,7 @@ The slot claim is released before the terminal reply or connection closure for l
 A slot belongs to its owner; another user needs ADMIN on `*` to watch it, see [feed statements](reference/FEED.md#arguments).
 
 DROP TABLE ends watches with NO_TABLE; a fenced or recovered table ends them with INTERNAL, and a new WATCH resumes; watches have no idle timeout.
+SWAP TABLES and RENAME TO end watches with INTERNAL `watched table was swapped; watch it again` or `watched table was renamed; watch it again`; watch the table by its name from the saved position.
 Losing READ on the table ends a watch with a best-effort NO_TABLE, as losing ADMIN on `*` ends a watch of a slot its user does not own, and a dropped user with a best-effort `AUTH_REQUIRED reason=user_dropped`; the connection closes either way; see [users](USERS.md#rights).
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 

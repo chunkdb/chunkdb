@@ -16,6 +16,7 @@
 #include "users.hpp"
 
 namespace chunkdb::expr {
+struct Expression;
 struct WriteExpressions;
 }  // namespace chunkdb::expr
 
@@ -178,6 +179,8 @@ struct Aggregate {
     std::int64_t z0 = 0;
     std::int64_t z1 = 0;
     std::uint8_t dims = 2;
+    // WHERE (expr.hpp): only the present blocks for which it is TRUE.
+    std::shared_ptr<const expr::Expression> where;
 };
 
 struct ColumnDefinition {
@@ -234,9 +237,22 @@ struct AlterColumnType {
 struct SetOption {
     Option option;
 };
+// ALTER COLUMN c SET DEFAULT v | DROP DEFAULT | SET NULL | DROP NULL |
+// SET REQUIRED | DROP REQUIRED.
+struct AlterColumnAttribute {
+    enum class Change : std::uint8_t { kSetDefault, kDropDefault, kSetNull, kDropNull, kSetRequired, kDropRequired };
+    std::string column;
+    Change change = Change::kSetDefault;
+    // kSetDefault only.
+    std::optional<Literal> value{};
+};
+// RENAME TO: the table's new name.
+struct RenameTable {
+    std::string new_name;
+};
 struct AlterTable {
     std::string table;
-    std::variant<AddColumn, DropColumn, RenameColumn, AlterColumnType, SetOption> change;
+    std::variant<AddColumn, DropColumn, RenameColumn, AlterColumnType, SetOption, AlterColumnAttribute, RenameTable> change;
 };
 struct DropTable {
     std::string table;
@@ -264,6 +280,8 @@ struct DropSlot {
 };
 struct ShowSlots {
     std::optional<std::string> table;
+    // Only slots whose names start with it.
+    std::optional<std::string> prefix{};
 };
 struct Describe {
     std::string table;
@@ -362,6 +380,8 @@ struct ScanChunks {
     std::optional<std::uint64_t> since;
     bool with_data = false;
     std::vector<std::string> columns;
+    // WHERE (expr.hpp): only the present blocks for which it is TRUE.
+    std::shared_ptr<const expr::Expression> where;
 };
 
 using MigrationStatement = std::variant<CreateTable, AlterTable, DropTable, GrantRight, CreateSlot, DropSlot>;

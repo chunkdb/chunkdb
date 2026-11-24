@@ -438,6 +438,16 @@ struct ChunkIdentityScanPage {
     // A read-only process cannot establish the writer's completed frontier.
     std::optional<std::uint64_t> position;
     std::uint64_t retained_deletion_floor = 0U;
+    // When more remain: the last identity the page visited, kept or not.
+    std::optional<ChunkCoord> after;
+};
+
+// Which identities a scan keeps (SCAN CHUNKS WHERE). `keep` may change the
+// state it is given and returns false to leave the identity out of the page.
+struct ChunkScanFilter {
+    std::function<bool(const ChunkCoord&, ChunkRangeEntry&)> keep;
+    // Whether `keep` reads text and bytes values.
+    bool needs_vars = false;
 };
 
 class TombstoneHistoryLostError : public std::invalid_argument {
@@ -742,10 +752,12 @@ class ChunkStore {
     [[nodiscard]] std::vector<ColumnValue> ChunkColumnValues(const ChunkColumnState* state) const;
     [[nodiscard]] BlockReadMetadata GetBlockWithVersion3D(std::int64_t x, std::int64_t y, std::int64_t z);
     // The first stored value of column `column_id` that `type` does not
-    // hold, as "block (x, y) holds <value>" ("block (x, y, z) ..." in a 3D
-    // table; an axis past int64 as [chunk, local]), or std::nullopt when
-    // every one fits. Reads every populated chunk (TableCatalog::NarrowColumn).
-    [[nodiscard]] std::optional<std::string> FindValueNotFitting(std::uint32_t column_id, const ColumnType& type);
+    // hold, or with `refuse_null` the first NULL, as "block (x, y) holds
+    // <value>" ("block (x, y, z) ..." in a 3D table; an axis past int64 as
+    // [chunk, local]), or std::nullopt when every one fits. Reads every
+    // populated chunk (TableCatalog::NarrowColumn, TableCatalog::DropColumnNull).
+    [[nodiscard]] std::optional<std::string> FindValueNotFitting(
+        std::uint32_t column_id, const ColumnType& type, bool refuse_null = false);
     // Whether memory, images or WALs contain any present block. Callers that
     // use the answer to change a schema must exclude concurrent writers.
     [[nodiscard]] bool HasPresentBlocks();
@@ -788,9 +800,12 @@ class ChunkStore {
         bool has_cursor,
         ChunkCoord cursor,
         std::size_t limit);
+    // With `filter`, the page reads each identity's state, and every identity it
+    // visits counts toward `limit`, whether the filter keeps it or not.
     [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentities(
         bool has_cursor, ChunkCoord cursor, std::size_t limit,
-        std::optional<std::uint64_t> since = {}, bool with_data = false);
+        std::optional<std::uint64_t> since = {}, bool with_data = false,
+        const ChunkScanFilter* filter = nullptr);
     // With `with_vars`, each entry carries its text and bytes values, and
     // they count toward the response-byte limit.
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange(
@@ -869,6 +884,8 @@ class ChunkStore {
     // Completed commit frontier, including terminal reservation gaps. A
     // read-only process cannot establish the writer's frontier and returns null.
     [[nodiscard]] std::optional<std::uint64_t> CompletedRevision() const;
+    // Populated chunks, metadata-only chunks included.
+    [[nodiscard]] std::uint64_t PopulatedChunkCount();
     [[nodiscard]] std::uint64_t RetainedTombstoneCount();
     [[nodiscard]] std::uint64_t RetainedDeletionFloor();
     [[nodiscard]] bool HasWrittenChunkIdentities() const;
@@ -1922,16 +1939,21 @@ class ChunkStore {
         std::string_view bits,
         bool present,
         Pinned... pinned_commit_time_ms);
-    // The bit-string commands need a table with one bits(N) column.
+    // The bit-string commands need a table with one bits(N) column that is
+    // not NULL.
     void RequireBitStringBlocks() const;
     // While a narrowing is in progress, throws std::invalid_argument when a
     // whole-chunk write's state holds a value of that column the narrower
-    // type does not; `vars` are the write's text and bytes values, when it
-    // carries them.
+    // type does not, or, during a DROP NULL check, a NULL of that column;
+    // `vars` are the write's text and bytes values, when it carries them.
     void RequirePendingFits(
         const std::vector<std::uint8_t>& payload,
         const std::vector<std::uint8_t>& presence,
         const ChunkVars* vars = nullptr) const;
+    // During a DROP NULL check of a text or bytes column, throws
+    // std::invalid_argument when a write without text and bytes values,
+    // which keeps `vars`, leaves a block of `presence` without its value.
+    void RequirePendingNotNullKept(const ChunkVars& vars, const std::vector<std::uint8_t>& presence) const;
     // `keep`, when it holds a state, is published to the transaction
     // history once the commit point passed. A whole-chunk write passes the
     // payload and presence it replaced: at the commit point they move into
