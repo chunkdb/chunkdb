@@ -1720,6 +1720,47 @@ std::vector<ColumnValue> ChunkStore::ChunkColumnValues(const ChunkColumnState* s
     return DecodeChunkColumns(schema, state->bytes);
 }
 
+std::vector<ColumnValue> ChunkStore::BlockAfterSet(const std::vector<ColumnValue>* before,
+    const std::vector<ColumnAssignment>& values, std::span<const std::size_t> slots) const {
+    const auto& layout = geometry_.layout();
+    const auto& columns = layout.schema().columns;
+    std::vector<ColumnValue> after(columns.size());
+    for (const std::size_t index : slots) {
+        const auto& column = columns.at(index);
+        const auto* fixed = layout.FixedColumnAt(index);
+        const auto given = std::find_if(values.begin(), values.end(),
+            [&](const ColumnAssignment& assignment) { return assignment.column == column.name; });
+        if (given != values.end()) {
+            const ColumnValue& value = given->value;
+            if (std::holds_alternative<std::monostate>(value)) continue;
+            if (fixed != nullptr) {
+                // As stored: an f32 or bits value reads back in its stored form.
+                after[index] = DecodeColumnValue(column, EncodeColumnValue(column, value).data());
+            } else {
+                const auto bytes = EncodeVarValue(column, value);
+                // An empty value of a column without NULL is stored as no entry.
+                after[index] = DecodeVarValue(column, bytes);
+            }
+            continue;
+        }
+        if (before != nullptr) {
+            after[index] = (*before)[index];
+            continue;
+        }
+        // A new block: as AddNewBlockColumns writes it.
+        if (fixed != nullptr) {
+            if (column.has_default) after[index] = DecodeColumnValue(column, column.default_value.data());
+            else if (!column.nullable)
+                after[index] = DecodeColumnValue(column, std::vector<std::uint8_t>((fixed->width + 7U) / 8U).data());
+        } else if (column.has_default && (!column.default_value.empty() || column.nullable)) {
+            after[index] = DecodeVarValue(column, column.default_value);
+        } else if (!column.nullable) {
+            after[index] = DecodeVarValue(column, {});
+        }
+    }
+    return after;
+}
+
 namespace {
 // The block's values at `slots` (schema indexes), as DecodeBlockColumns
 // gives them; the other columns are NULL and are not decoded.
@@ -1780,7 +1821,7 @@ ChunkMutationResult ChunkStore::WriteBlockDecided(std::int64_t x, std::int64_t y
     const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
     std::vector<ColumnAssignment> assignments;
     const BlockWriteView view{.values = values ? &*values : nullptr, .chunk_columns = chunk_columns,
-        .version = regular_chunk->version, .commit_time_ms = commit_time_ms};
+        .version = regular_chunk->version, .commit_time_ms = commit_time_ms, .written = regular_chunk->written};
     if (!decide(view, assignments)) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
     }
