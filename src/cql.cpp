@@ -39,12 +39,13 @@ namespace lexer {
     return out;
 }
 
-// `text` with control bytes as \xHH, so an error reply stays one line.
+// `text` with control bytes and bytes of 0x80 and above as \xHH, so an
+// error reply stays one line of ASCII, valid UTF-8 whatever the input.
 [[nodiscard]] std::string Printable(std::string_view text) {
     std::string out;
     for (const char c : text) {
         const auto byte = static_cast<unsigned char>(c);
-        if (byte < 0x20U || byte == 0x7fU) {
+        if (byte < 0x20U || byte >= 0x7fU) {
             constexpr std::string_view kHex = "0123456789abcdef";
             out += "\\x";
             out += kHex[byte >> 4U];
@@ -394,6 +395,16 @@ class Parser {
         }
         return tokens_[next_];
     }
+    // The token after the next one; the end when the next one is the end.
+    [[nodiscard]] const Token& PeekSecond() {
+        if (Peek().kind == TokenKind::kEnd) {
+            return tokens_[next_];
+        }
+        if (next_ + 1U == tokens_.size()) {
+            tokens_.push_back(Lex(line_, &at_));
+        }
+        return tokens_[next_ + 1U];
+    }
     const Token& Take() {
         const Token& token = Peek();
         if (token.kind != TokenKind::kEnd) {
@@ -595,15 +606,25 @@ class Parser {
         return true;
     }
 
+    // IF starts IF [NOT] EXISTS only when NOT or EXISTS follows, so a table,
+    // column, user or check named `if` reads as a name.
+    [[nodiscard]] bool AcceptIf() {
+        if (!IsKeyword(Peek(), "if")) return false;
+        const Token& after = PeekSecond();
+        if (!IsKeyword(after, "not") && !IsKeyword(after, "exists")) return false;
+        Take();
+        return true;
+    }
+
     [[nodiscard]] bool IfNotExists() {
-        if (!Accept("if")) return false;
+        if (!AcceptIf()) return false;
         Expect("not");
         Expect("exists");
         return true;
     }
 
     [[nodiscard]] bool IfExists() {
-        if (!Accept("if")) return false;
+        if (!AcceptIf()) return false;
         Expect("exists");
         return true;
     }
@@ -995,16 +1016,23 @@ class Parser {
                 get.dims = Point(get.x, get.y, get.z);
                 Expect("from");
                 get.table = Name("a table name");
-                get.columns = Columns();
-                while (Accept("with")) {
-                    const auto column = Peek().column;
-                    if (Accept("version")) {
-                        if (get.with_version) Fail(column, "WITH VERSION is given twice");
-                        get.with_version = true;
-                    } else if (Accept("schema")) {
-                        if (get.with_schema) Fail(column, "WITH SCHEMA is given twice");
-                        get.with_schema = true;
-                    } else Fail(column, "expected VERSION or SCHEMA");
+                bool columns = false;
+                while (true) {
+                    const auto option = Peek().column;
+                    if (IsKeyword(Peek(), "columns")) {
+                        if (columns) Fail(option, "COLUMNS is given twice");
+                        columns = true;
+                        get.columns = Columns();
+                    } else if (Accept("with")) {
+                        const auto column = Peek().column;
+                        if (Accept("version")) {
+                            if (get.with_version) Fail(column, "WITH VERSION is given twice");
+                            get.with_version = true;
+                        } else if (Accept("schema")) {
+                            if (get.with_schema) Fail(column, "WITH SCHEMA is given twice");
+                            get.with_schema = true;
+                        } else Fail(column, "expected VERSION or SCHEMA");
+                    } else break;
                 }
                 return get;
             }
@@ -1030,10 +1058,14 @@ class Parser {
                 }
                 Expect("from");
                 get.table = Name("a table name");
-                get.columns = Columns();
+                bool columns = false;
                 while (true) {
                     const auto column = Peek().column;
-                    if (Accept("with")) {
+                    if (IsKeyword(Peek(), "columns")) {
+                        if (columns) Fail(column, "COLUMNS is given twice");
+                        columns = true;
+                        get.columns = Columns();
+                    } else if (Accept("with")) {
                         if (get.with_schema) Fail(column, "WITH SCHEMA is given twice");
                         Expect("schema");
                         get.with_schema = true;
@@ -1142,14 +1174,18 @@ class Parser {
                 create.user = Name("a user name");
                 Expect("verifier");
                 create.verifier = Verifier();
-                if (Accept("manages")) {
-                    Expect("users");
-                    create.manages_users = true;
-                }
-                if (Accept("require")) {
-                    Expect("channel");
-                    Expect("binding");
-                    create.requires_channel_binding = true;
+                while (true) {
+                    const auto column = Peek().column;
+                    if (Accept("manages")) {
+                        if (create.manages_users) Fail(column, "MANAGES USERS is given twice");
+                        Expect("users");
+                        create.manages_users = true;
+                    } else if (Accept("require")) {
+                        if (create.requires_channel_binding) Fail(column, "REQUIRE CHANNEL BINDING is given twice");
+                        Expect("channel");
+                        Expect("binding");
+                        create.requires_channel_binding = true;
+                    } else break;
                 }
                 return create;
             }
@@ -1365,8 +1401,16 @@ class Parser {
             if (Accept("migrations")) return ShowMigrations{};
             if (Accept("slots")) {
                 ShowSlots show;
-                if (Accept("on")) show.table = Name("a table name");
-                if (Accept("prefix")) show.prefix = SlotName();
+                while (true) {
+                    const auto column = Peek().column;
+                    if (Accept("on")) {
+                        if (show.table) Fail(column, "ON is given twice");
+                        show.table = Name("a table name");
+                    } else if (Accept("prefix")) {
+                        if (show.prefix) Fail(column, "PREFIX is given twice");
+                        show.prefix = SlotName();
+                    } else break;
+                }
                 return show;
             }
             if (Accept("users")) {

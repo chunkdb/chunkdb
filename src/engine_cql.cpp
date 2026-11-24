@@ -1343,9 +1343,9 @@ std::string CommandEngine::ExecuteStatement(
                 "INVALID_ARGUMENT",
                 session.transaction->read_only
                     ? "inside a READ ONLY transaction only GET statements, SCAN CHUNKS, AGGREGATE, DESCRIBE, PING, "
-                      "COMMIT and ROLLBACK run"
-                    : "inside a transaction only GET, SET and DELETE statements, AGGREGATE, DESCRIBE, PING, COMMIT and "
-                      "ROLLBACK run");
+                      "SHOW CONNECTIONS, CANCEL, KILL CONNECTION, COMMIT and ROLLBACK run"
+                    : "inside a transaction only GET, SET and DELETE statements, AGGREGATE, DESCRIBE, PING, "
+                      "SHOW CONNECTIONS, CANCEL, KILL CONNECTION, COMMIT and ROLLBACK run");
         }
         return std::visit(
             Overloaded{

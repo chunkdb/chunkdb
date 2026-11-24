@@ -35,6 +35,8 @@ Bytes use hexadecimal literals such as `x'0a0bff'`.
 Bits use literals such as `b'1010'`, with the first digit representing the lowest bit.
 
 Trailing keyword options can appear in any order, each at most once.
+A repeated option is refused with SYNTAX.
+`IF` starts `IF [NOT] EXISTS` only when NOT or EXISTS follows it, so a table, column, user or check named `if` can be named where that clause may appear, as in `DROP TABLE if`.
 Client APIs supply binary `$n` parameters in these places: SET BLOCK values, expressions and conditions, DELETE BLOCK conditions, values in the WHERE of AGGREGATE and SCAN CHUNKS, the SET CHUNK form or META values, `VERIFIER $1` in CREATE USER and ALTER USER (also `ADD VERIFIER $1`), HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
 See [Protocol](PROTOCOL.md#parameters) for encoding.
 
@@ -69,7 +71,7 @@ op        := = | <> | < | <= | > | >=
 - Arithmetic with NULL is NULL; a comparison with NULL is unknown, AND, OR and NOT follow three-valued logic, and an unknown condition is false.
 - LEAST and GREATEST ignore NULL arguments; COALESCE returns its first argument that is not NULL.
 - For an absent block, EXISTS is false and every block column is NULL; chunk columns keep their values.
-- Comparisons and arithmetic do not chain without parentheses: write `(a < b) AND (b < c)`, not `a < b < c`.
+- Arithmetic chains from left to right, so `a - b - c` is `(a - b) - c`; comparisons do not chain: write `(a < b) AND (b < c)`, not `a < b < c`.
 - A condition has at most 256 values, columns, operators and list items, reported as `max_expression_nodes` by HELLO, and at most 32 levels.
 
 ## Related data

@@ -2,6 +2,11 @@
 
 ## Unreleased
 
+- Trailing options are accepted in any order, as the CQL reference says: GET BLOCK and GET AREA take COLUMNS after WITH, LIMIT, AFTER or SCALE, SHOW SLOTS takes PREFIX before ON, and CREATE USER takes REQUIRE CHANNEL BINDING before MANAGES USERS; a repeated option is refused with SYNTAX (#297).
+- A table, column, user or check named `if` can be dropped and altered: IF starts IF [NOT] EXISTS only when NOT or EXISTS follows it, so `DROP TABLE if` and `ALTER TABLE t DROP COLUMN if` read `if` as the name (#297).
+- SYNTAX errors escape bytes of 0x80 and above as `\xHH`, as they did control bytes, so an error reply is ASCII and valid UTF-8 whatever the statement held; before, a statement with a non-ASCII byte where no token may start got an error reply with that byte alone (#297).
+- The refusal of a statement inside a transaction lists SHOW CONNECTIONS, CANCEL and KILL CONNECTION, which run there (#297).
+- The CQL reference says that arithmetic chains from left to right and only comparisons do not chain (#297).
 - `chunkdb_verify` reports commit group owner files in a data directory or table, which this build never creates, as `group_owner_unclaimed` warnings instead of `unexpected_entry`, `foreign_entry` or no finding (#136).
 - A SIGTERM or SIGINT that arrives while the server starts ends it: a stop between binding the client listener and serving it was lost, and the server kept running.
 - Add `chunkdb_exporter`, which logs in to a server as a user with the MONITOR right (SCRAM, password from `--password-file`, `chunks://` with certificate verification and channel binding), reads SHOW METRICS on each scrape and serves it at `GET` and `HEAD /metrics` on `--listen` (`127.0.0.1:14242`; another address needs `--allow-remote`) with `chunkdb_up`, answering `503` with `chunkdb_up 0` when the server cannot be read; a kept connection that fails is replaced within the same scrape, a failed login is not tried again for 1 to 30 seconds, the password file must be readable by its owner only, scrapes that arrive during a read share it and ships in the release archives and the Docker image (#149).
