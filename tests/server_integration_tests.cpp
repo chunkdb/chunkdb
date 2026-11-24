@@ -5839,10 +5839,11 @@ void TestReplyAdmissionPrecedesMutation() {
 // deadline. GET CHUNK, GET AREA and SCAN CHUNKS WITH DATA replies larger than
 // the socket buffers are written from their continuation in pieces of at most
 // 64 KiB. `header` is the first byte of the reply; `reads_per_tick` 4 KiB
-// reads every 50 ms keep it steady.
+// reads every 50 ms keep it steady. `setup`, when given, prepares the data
+// in place of the default table's block.
 void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false,
     const std::string& query = "GET CHUNK 0 0 FROM default", char header = '$', std::size_t block_bits = 512U,
-    int reads_per_tick = 256) {
+    int reads_per_tick = 256, const std::function<void(ServerHarness&)>& setup = {}) {
     ScopedLogCapture logs(chunkdb::LogLevel::kWarn);
     struct QueueHook final : chunkdb::FeedDeliveryTestHook {
         chunkdb::ChunkServer* server = nullptr;
@@ -5905,7 +5906,9 @@ void TestSteadyReaderRenewsReplyProgressDeadline(bool fail_before_read = false,
         QueueHook& hook;
         ~ReleaseHook() { hook.Release(); }
     } release{hook};
-    {
+    if (setup) {
+        setup(harness);
+    } else {
         auto lease = harness.catalog->Find("default")->Acquire();
         lease->store().SetBlockBits(0, 0, std::string(block_bits, '0'));
     }
@@ -8662,6 +8665,22 @@ int main(int argc, char** argv) {
         });
         run("TestSteadyScanReaderRenewsReplyProgressDeadline", [] {
             TestSteadyReaderRenewsReplyProgressDeadline(false, "SCAN CHUNKS FROM default WITH DATA", '%', 256U, 128);
+        });
+        // A 48 MiB RETURNING row, written after the write's lock is released.
+        run("TestSteadyReturningReaderRenewsReplyProgressDeadline", [] {
+            TestSteadyReaderRenewsReplyProgressDeadline(false, "SET BLOCK 0 0 IN wide f = 1 RETURNING OLD *", '%', 256U, 128,
+                [](ServerHarness& harness) {
+                    chunkdb::SessionState writer;
+                    (void)harness.engine->Execute(writer, "HELLO 3");
+                    assert(harness.engine->Execute(writer, "CREATE TABLE wide (f u8, b0 bytes(16777216) NULL, "
+                        "b1 bytes(16777216) NULL, b2 bytes(16777216) NULL) CHUNK 1 x 1") == "+OK\r\n");
+                    assert(harness.engine->Execute(writer, "ALTER TABLE wide SET var_max_chunk_bytes = 67108864") == "+OK\r\n");
+                    for (char column = '0'; column <= '2'; ++column) {
+                        const std::vector<std::optional<std::string>> value{std::string(16777216U, column)};
+                        assert(harness.engine->Execute(writer, std::string("SET BLOCK 0 0 IN wide b") + column + " = $1",
+                            value).starts_with(':'));
+                    }
+                });
         });
         run("TestAreaReturnsLargestChunkWithinBound", TestAreaReturnsLargestChunkWithinBound);
         run("TestIdlePeerCloseDoesNotLogTerminationWarning", TestIdlePeerCloseDoesNotLogTerminationWarning);

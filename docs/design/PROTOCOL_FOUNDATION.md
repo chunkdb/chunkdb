@@ -54,7 +54,7 @@ Unset options use server defaults; explicit per-statement TAG overrides `default
 | `txn_max_written_chunks` | Configured statement/commit admission, default 1024; historical intent decoding validates its checked extent independently. |
 | `txn_max_read_chunks` | Configured statement/commit admission, default 8192. |
 | `max_watches` | Effective server configuration; current default 64. |
-| `max_returning_rows` | 65536, the declared ceiling from E3; RETURNING remains unavailable until task 55. |
+| `max_returning_rows` | 65536, the most rows one RETURNING answers (E4). |
 | `max_expression_nodes` | 256, the ceiling from E1 for the expressions of SET BLOCK and DELETE BLOCK and the WHERE of AGGREGATE and SCAN CHUNKS. |
 
 Unavailable capabilities do not become supported merely because their numeric ceilings appear in HELLO.

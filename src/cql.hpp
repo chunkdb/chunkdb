@@ -96,6 +96,13 @@ struct GetBlock {
     std::int64_t z = 0;
     std::uint8_t dims = 2;
 };
+// RETURNING [OLD | NEW] (* | column, ...) of a block write (docs/DESIGN-2.0.md
+// E4): the block before the write (OLD) or after it (NEW).
+struct Returning {
+    bool new_values = false;
+    // In the order given; empty for *, every column in schema order.
+    std::vector<std::string> columns;
+};
 struct SetBlock {
     std::int64_t x = 0;
     std::int64_t y = 0;
@@ -107,6 +114,8 @@ struct SetBlock {
     // IF <expr> and values that are more than a single value
     // (docs/design/EXPRESSIONS_DESIGN.md); null for a statement without them.
     std::shared_ptr<const expr::WriteExpressions> expressions;
+    // RETURNING; null without it.
+    std::shared_ptr<const Returning> returning;
 };
 struct DeleteBlock {
     std::int64_t x = 0;
@@ -117,6 +126,8 @@ struct DeleteBlock {
     std::uint8_t dims = 2;
     // IF <expr>; null without it.
     std::shared_ptr<const expr::WriteExpressions> expressions;
+    // RETURNING (OLD only); null without it.
+    std::shared_ptr<const Returning> returning;
 };
 struct GetChunk {
     std::int64_t chunk_x = 0;
