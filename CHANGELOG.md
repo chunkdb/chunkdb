@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- With a feed slot, checkpoints and the writes that wait on them no longer wait while a slot pass syncs the files written since the previous pass; a pass held checkpoint publication through all its syncs, so with many chunks written between passes a write could wait for seconds. A pass now sets the FLUSH WAL durability floor, so later relaxed-mode checkpoints of that store sync their images, as after FLUSH WAL or a reopen (#140).
 - A connection that leaves a WATCH or WATCH ... SLOT with UNWATCH starts its `--idle-connection-timeout-ms` interval when UNWATCH is answered; before, a watch longer than that timeout made the server close the connection without a reply to its next request (#140).
 - SHOW CONNECTIONS lists a connection that left its WATCH with UNWATCH as `idle`; before, it showed `watch` until the connection's next request.
 - The published Docker image carries the OCI labels `org.opencontainers.image.title`, `version`, `revision`, `source`, `created` and `licenses` (#154).
