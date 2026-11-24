@@ -64,6 +64,19 @@ void TestFirstAdministrator() {
     assert(reopened.Snapshot().secret == kSecret);
 }
 
+// The verifier of an unknown user is shaped like those of the users that
+// exist, and follows them when they change.
+void TestDecoyFollowsUsers() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-user-registry-decoy");
+    const auto strong = chunkdb::scram::MakeVerifier("secret", std::vector<std::uint8_t>(32, 0x22), 5000U);
+    UserRegistry registry(dir.path(), std::make_pair(std::string("admin"), strong), kSecret);
+    const auto decoy = registry.DecoyVerifier("ghost");
+    assert(decoy.iterations == 5000U && decoy.salt.size() == 32U && decoy == registry.DecoyVerifier("ghost"));
+    registry.SetVerifier("admin", VerifierOf("secret"));
+    const auto plain = registry.DecoyVerifier("ghost");
+    assert(plain.iterations == 4096U && plain.salt.size() == 16U);
+}
+
 void TestChanges() {
     chunkdb::test::ScopedTempDir dir("chunkdb-user-registry-changes");
     UserRegistry registry(dir.path(), std::make_pair(std::string("admin"), VerifierOf("secret")), kSecret);
@@ -399,6 +412,7 @@ void TestIncarnations() {
 
 int main() {
     TestFirstAdministrator();
+    TestDecoyFollowsUsers();
     TestIncarnations();
     TestChanges();
     TestConditionalChanges();

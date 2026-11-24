@@ -97,6 +97,7 @@ Writes outside the area still add to the slot's retained history until acknowled
 Consume and acknowledge progress as well as mutations, or raise `slot_max_bytes` to cover the writes between acknowledgements.
 SHOW SLOTS reports each slot's retained bytes.
 
+To follow table, user and slot changes rather than data, see [WATCH CATALOG](reference/FEED.md#watch-catalog).
 See [Feed statements](reference/FEED.md), [Resume a consumer](FEED_RESUME.md), and [Users and rights](USERS.md).
 To keep a history of every change, see [Event journal](EVENT_JOURNAL.md).
 

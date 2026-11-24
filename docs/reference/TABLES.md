@@ -123,6 +123,7 @@ ENABLE FEATURE 'name'
 | `bytes(max)` | Uninterpreted bytes with at most max bytes |
 
 Reserved table names are `con`, `prn`, `aux`, `nul`, `com0` through `com9`, and `lpt0` through `lpt9`.
+CREATE TABLE, ALTER TABLE ... RENAME TO and RESTORE TABLE also refuse the name `catalog`, which [WATCH CATALOG](FEED.md#watch-catalog) reserves; a table of that name made before keeps working but cannot be watched.
 
 ## Options
 

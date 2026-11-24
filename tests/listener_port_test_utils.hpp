@@ -2,7 +2,10 @@
 
 #include <chrono>
 #include <cstdint>
+#include <filesystem>
+#include <fstream>
 #include <mutex>
+#include <optional>
 #include <random>
 #include <stdexcept>
 #include <string>
@@ -71,6 +74,23 @@ inline std::uint16_t PickListenerPort() {
         if (bound) return port;
     }
     throw std::runtime_error("no free loopback listener port in 20000-32767 after 64 candidates");
+}
+
+// The port a chunkdb_server process names in its INFO line `ready to accept
+// connections`, read from the file its output goes to; empty until that line
+// is complete. With --port 0 the server picks a free port and keeps it, so no
+// other listener can take it between a choice and the bind.
+inline std::optional<std::uint16_t> ReadyLinePort(const std::filesystem::path& log) {
+    std::ifstream input(log, std::ios::binary);
+    std::string line;
+    while (std::getline(input, line)) {
+        if (input.eof()) break;  // A line without its newline is still being written.
+        if (line.find(" ready to accept connections ") == std::string::npos) continue;
+        const auto at = line.find(" port=");
+        if (at == std::string::npos) throw std::runtime_error("ready line without a port: " + line);
+        return static_cast<std::uint16_t>(std::stoul(line.substr(at + 6U)));
+    }
+    return std::nullopt;
 }
 
 }  // namespace chunkdb::test
