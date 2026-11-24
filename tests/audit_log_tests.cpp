@@ -285,6 +285,8 @@ void TestStatementEvents() {
     assert(e.Run(admin, "ALTER USER bot MANAGES USERS") == "+OK\r\n");
     assert(e.Run(admin, "GRANT READ ON t TO bot") == "+OK\r\n");
     assert(e.Run(admin, "REVOKE READ ON t FROM bot") == "+OK\r\n");
+    assert(e.Run(admin, "GRANT ADMIN ON t_* TO bot") == "+OK\r\n");
+    assert(e.Run(admin, "GRANT MONITOR, BACKUP ON * TO bot") == "+OK\r\n");
     assert(e.Run(admin, "DROP USER bot") == "+OK\r\n");
     assert(e.Run(admin, "BACKUP TO 'backup-sentinel'").rfind("-", 0) != 0);
     assert(e.Run(admin, "MIGRATE 'add_note' ALTER TABLE t ADD COLUMN note text(4) NULL").rfind("-", 0) != 0);
@@ -308,14 +310,16 @@ void TestStatementEvents() {
     statement({"\"event\":\"alter_user\"", "\"target_user\":\"bot\""});
     statement({"\"event\":\"grant\"", "\"table\":\"t\"", "\"target_user\":\"bot\""});
     statement({"\"event\":\"revoke\"", "\"table\":\"t\"", "\"target_user\":\"bot\""});
+    statement({"\"event\":\"grant\"", "\"table\":\"t_*\"", "\"target_user\":\"bot\""});
+    statement({"\"event\":\"grant\"", "\"table\":\"*\"", "\"target_user\":\"bot\""});
     statement({"\"event\":\"drop_user\"", "\"target_user\":\"bot\""});
     statement({"\"event\":\"backup\"", "\"ok\":true"});
     statement({"\"event\":\"migrate\"", "\"table\":\"t\"", "\"migration\":\"add_note\""});
     statement({"\"event\":\"drop_table\"", "\"table\":\"t\"", "\"ok\":true"});
     statement({"\"event\":\"drop_table\"", "\"table\":\"missing\"", "\"ok\":false", "\"error_code\":\"NO_TABLE\""});
     statement({"\"event\":\"reload_tls\"", "\"ok\":false", "\"error_code\":\"INVALID_ARGUMENT\""});
-    // One login and the fourteen statements above, nothing else.
-    assert(lines.size() == 15U);
+    // One login and the sixteen statements above, nothing else.
+    assert(lines.size() == 17U);
 
     // No password, verifier, value or parameter reaches the file.
     const auto text = ReadAll(e.audit_path);
@@ -324,6 +328,48 @@ void TestStatementEvents() {
     // Text sentinels: digits could appear in times and ids.
     assert(!Contains(text, "hidden") && !Contains(text, "backup-sentinel"));
     assert(!Contains(text, "SET BLOCK") && !Contains(text, "GET BLOCK"));
+}
+
+// ADD VERIFIER and DROP OLD VERIFIER are audited as alter_user with the form
+// that ran, a refused one with its code, and no verifier reaches the file.
+void TestVerifierRotationEvents() {
+    Engine e;
+    auto admin = e.Admin(3);
+    const std::vector<std::uint8_t> salt(16U, 9U);
+    const auto verifier = [&salt](const std::string& password) {
+        return chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier(password, salt, chunkdb::scram::kMinIterations));
+    };
+    assert(e.Run(admin, "CREATE USER bot VERIFIER $1", {verifier("bot-old-password")}) == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot ADD VERIFIER $1", {verifier("bot-new-password")}) == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot ADD VERIFIER $1", {Verifier("bot-third-password")}).rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+    assert(e.Run(admin, "ALTER USER bot DROP OLD VERIFIER") == "+OK\r\n");
+    const auto lines = Lines(e.audit_path);
+    std::size_t done = 0, refused = 0;
+    for (const auto& line : lines) {
+        if (!Contains(line, "\"event\":\"alter_user\"") || !Contains(line, "\"target_user\":\"bot\"")) continue;
+        if (Contains(line, "\"ok\":true")) ++done;
+        if (Contains(line, "\"ok\":false") && Contains(line, "\"error_code\":\"INVALID_ARGUMENT\"")) ++refused;
+    }
+    assert(done == 2U && refused == 1U);
+    const std::vector<std::string> event{"\"event\":\"alter_user\"", "\"target_user\":\"bot\""};
+    const auto with = [&event](std::vector<std::string> parts) {
+        parts.insert(parts.end(), event.begin(), event.end());
+        return parts;
+    };
+    LineWith(lines, with({"\"ok\":true", "\"change\":\"add_verifier\""}));
+    LineWith(lines, with({"\"ok\":false", "\"change\":\"add_verifier\""}));
+    LineWith(lines, with({"\"ok\":true", "\"change\":\"drop_old_verifier\""}));
+    assert(e.Run(admin, "ALTER USER bot VERIFIER $1", {verifier("bot-reset-password")}) == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot MANAGES USERS") == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot LIMIT max_connections = 4") == "+OK\r\n");
+    assert(e.Run(admin, "ALTER USER bot REQUIRE CHANNEL BINDING") == "+OK\r\n");
+    const auto all = Lines(e.audit_path);
+    LineWith(all, with({"\"change\":\"verifier\""}));
+    LineWith(all, with({"\"change\":\"manages_users\""}));
+    LineWith(all, with({"\"change\":\"limit\""}));
+    LineWith(all, with({"\"change\":\"requires_channel_binding\""}));
+    const auto text = ReadAll(e.audit_path);
+    assert(!Contains(text, "SCRAM-SHA-256") && !Contains(text, "password\""));
 }
 
 // A statement of a connection whose user was dropped is audited as refused.
@@ -561,6 +607,7 @@ int main() {
     TestAdmissionLoginEvents();
     TestCredentialsChangedDuringLoginEvents();
     TestStatementEvents();
+    TestVerifierRotationEvents();
     TestDroppedUserEvents();
     TestEnableFeatureEvents();
     TestFileAndReopen();

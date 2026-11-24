@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "cql.hpp"
+#include "expr.hpp"
 
 namespace {
 
@@ -74,7 +75,7 @@ void TestChunkModelCoordinates() {
     const auto ball = Get<cql::GetArea>("GET AREA AROUND 1 2 3 RADIUS 4 FROM t");
     assert(ball.dims == 3U && ball.around && ball.z0 == 3 && ball.radius == 4);
     const auto watch = Get<cql::Watch>("WATCH t AREA -1 -2 -3 TO 4 5 6");
-    assert(watch.area && watch.area->dims == 3U && watch.area->first.z == -3 && watch.area->last.z == 6);
+    assert(watch.areas.size() == 1U && watch.areas[0].dims == 3U && watch.areas[0].first.z == -3 && watch.areas[0].last.z == 6);
     const auto slot = Get<cql::CreateSlot>("CREATE SLOT 's' ON t AREA 1 2 0 TO 3 4 0");
     assert(slot.area && slot.area->dims == 3U && slot.area->first.z == 0);
     ExpectError("GET BLOCK 1 2 9223372036854775808 FROM t", "z is out of range");
@@ -129,6 +130,17 @@ void TestChunkModelScan() {
     ExpectError("SCAN CHUNKS FROM t WITH DATA WITH DATA", "given twice");
     ExpectError("SCAN CHUNKS FROM t COLUMNS a", "requires WITH DATA");
     ExpectError("SCAN CHUNKS FROM t SINCE -1", "a revision must be between 0");
+    // WHERE ends before the next clause; its parameters are the statement's.
+    const auto where = Get<cql::ScanChunks>("SCAN CHUNKS FROM t WHERE n = $1 AND chunk.k IS NULL LIMIT 3 SINCE 0 WITH DATA", 1);
+    assert(where.where && where.where->nodes[where.where->root].op == chunkdb::expr::Op::kAnd);
+    assert(where.limit == 3U && where.since == 0U && where.with_data);
+    assert(!Get<cql::ScanChunks>("SCAN CHUNKS FROM t").where);
+    assert(Get<cql::ScanChunks>("SCAN CHUNKS FROM t AFTER 1 2 WHERE pos_x < 4").after_z == 0);
+    ExpectError("SCAN CHUNKS FROM t SINCE 0 WHERE n = 1", "WHERE with SINCE requires WITH DATA");
+    ExpectError("SCAN CHUNKS FROM t WHERE n = 1 WHERE n = 2", "column 32: WHERE is given twice");
+    ExpectError("SCAN CHUNKS FROM t WHERE", "column 25: expected a value, got the end of the statement");
+    ExpectError("SCAN CHUNKS FROM t WHERE n = $2", "parameters must be numbered $1 to $2 without gaps");
+    ExpectError("SCAN CHUNKS FROM t WHERE n = 1 n", "expected the end of the statement, got 'n'");
     const auto compact = Get<cql::CompactTombstones>("COMPACT TOMBSTONES t BEFORE 18446744073709551615");
     assert(compact.table == "t" && compact.before == std::numeric_limits<std::uint64_t>::max());
     assert(Get<cql::CompactTombstones>("COMPACT TOMBSTONES t BEFORE 0").before == 0U);
@@ -190,8 +202,8 @@ void TestRightsLists() {
     }
     assert(Get<cql::GrantRight>("GRANT READ, ADMIN, WRITE ON * TO bot").right == chunkdb::Right::kAdmin);
     assert(Get<cql::GrantRight>("REVOKE ADMIN, WRITE ON * FROM bot").right == chunkdb::Right::kWrite);
-    ExpectError("GRANT READ, DELETE ON t TO bot", "expected READ, WRITE or ADMIN");
-    ExpectError("GRANT READ, ON t TO bot", "expected READ, WRITE or ADMIN");
+    ExpectError("GRANT READ, DELETE ON t TO bot", "expected READ, WRITE, ADMIN, MONITOR, BACKUP or REPLICATION");
+    ExpectError("GRANT READ, ON t TO bot", "expected READ, WRITE, ADMIN, MONITOR, BACKUP or REPLICATION");
     const auto migration = Get<cql::Migrate>("MIGRATE 'grant' GRANT WRITE, READ ON t TO bot");
     assert(std::get<cql::GrantRight>(migration.statement).right == chunkdb::Right::kWrite);
 }
@@ -200,7 +212,7 @@ void TestUnorderedOptions() {
     std::vector<std::string> options{"AFTER 0123456789abcdef0123456789abcdef 42", "AREA -1 0 TO 1 2", "SLOT 'consumer'"};
     do {
         const auto watch = Get<cql::Watch>("WATCH t " + options[0] + " " + options[1] + " " + options[2]);
-        assert(watch.slot == "consumer" && watch.area->first.x == -1 && watch.area->last.y == 2);
+        assert(watch.slot == "consumer" && watch.areas.at(0).first.x == -1 && watch.areas.at(0).last.y == 2);
         assert(watch.after->revision == 42 && watch.after->epoch[0] == 1);
     } while (std::next_permutation(options.begin(), options.end()));
     for (const auto* option : {"AREA 0 0 TO 1 1", "SLOT 'consumer'", "AFTER 00000000000000000000000000000000 0"})
@@ -300,7 +312,6 @@ void TestLiterals() {
     assert(std::isnan(std::get<double>(ValueOf("NaN"))));
     ExpectError("SET BLOCK 0 0 IN t a = 1.2.3", "is not a number");
     ExpectError("SET BLOCK 0 0 IN t a = 1e999", "is not a number");
-    ExpectError("SET BLOCK 0 0 IN t a = -abc", "expected a number after -");
 
     assert(ValueOf("TRUE") == cql::Literal(true));
     assert(ValueOf("false") == cql::Literal(false));
@@ -397,6 +408,28 @@ void TestAlterAndOtherStatements() {
     const auto cut = std::get<cql::AlterColumnType>(Get<cql::AlterTable>("ALTER TABLE t ALTER COLUMN s TYPE text(4) USING TRUNCATE").change);
     assert(cut.conversion == Conversion::kTruncate);
     ExpectError("ALTER TABLE t ALTER COLUMN a TYPE u4 USING ROUND", "expected CLAMP, DEFAULT or TRUNCATE");
+    using Change = cql::AlterColumnAttribute::Change;
+    const auto attribute = [](const std::string& line) { return std::get<cql::AlterColumnAttribute>(Get<cql::AlterTable>(line).change); };
+    const auto set_default = attribute("ALTER TABLE t ALTER COLUMN a SET DEFAULT 7");
+    assert(set_default.column == "a" && set_default.change == Change::kSetDefault &&
+           set_default.value == cql::Literal(cql::Integer{.negative = false, .magnitude = 7}));
+    assert(attribute("alter table t alter column s set default 'x'").value == cql::Literal(cql::Text{.value = "x"}));
+    assert(attribute("ALTER TABLE t ALTER COLUMN a DROP DEFAULT").change == Change::kDropDefault);
+    assert(!attribute("ALTER TABLE t ALTER COLUMN a DROP DEFAULT").value.has_value());
+    assert(attribute("ALTER TABLE t ALTER COLUMN a SET NULL").change == Change::kSetNull);
+    assert(attribute("ALTER TABLE t ALTER COLUMN a DROP NULL").change == Change::kDropNull);
+    assert(attribute("ALTER TABLE t ALTER COLUMN a SET REQUIRED").change == Change::kSetRequired);
+    assert(attribute("ALTER TABLE t ALTER COLUMN a DROP REQUIRED").change == Change::kDropRequired);
+    ExpectError("ALTER TABLE t ALTER COLUMN a SET DEFAULT $1", "parameters are values of SET BLOCK and SET CHUNK");
+    ExpectError("ALTER TABLE t ALTER COLUMN a SET UNIQUE", "expected DEFAULT, NULL or REQUIRED, got 'UNIQUE'");
+    ExpectError("ALTER TABLE t ALTER COLUMN a DROP NULL NOW", "expected the end of the statement");
+    ExpectError("ALTER TABLE t ALTER COLUMN a WIDEN", "expected TYPE, SET or DROP, got 'WIDEN'");
+    assert(std::get<cql::RenameTable>(Get<cql::AlterTable>("ALTER TABLE t RENAME TO t_old").change).new_name == "t_old");
+    ExpectError("ALTER TABLE t RENAME TO", "expected a table name");
+    ExpectError("ALTER TABLE t RENAME TO T", "names are lowercase: 'T'");
+    ExpectError("MIGRATE 'm1' ALTER TABLE t RENAME TO u", "MIGRATE cannot rename a table");
+    const auto migrated = Get<cql::Migrate>("MIGRATE 'm1' ALTER TABLE t ALTER COLUMN a DROP NULL");
+    assert(std::holds_alternative<cql::AlterColumnAttribute>(std::get<cql::AlterTable>(migrated.statement).change));
 
     const auto option = std::get<cql::SetOption>(Get<cql::AlterTable>("ALTER TABLE t SET cache_chunks = 64").change).option;
     assert(option.name == "cache_chunks" && option.value == cql::Literal(cql::Integer{.negative = false, .magnitude = 64}));
@@ -440,6 +473,14 @@ void TestAlterAndOtherStatements() {
     assert(require.requires_channel_binding == true && !require.manages_users.has_value() && !require.verifier.has_value());
     assert(Get<cql::AlterUser>("ALTER USER bot NO REQUIRE CHANNEL BINDING").requires_channel_binding == false);
     assert(!rekey.requires_channel_binding.has_value());
+    const auto add_verifier = Get<cql::AlterUser>("ALTER USER bot ADD VERIFIER $1", 1);
+    assert(add_verifier.added_verifier == cql::Literal(cql::Parameter{.index = 1}) && !add_verifier.verifier &&
+        !add_verifier.drop_old_verifier);
+    const auto drop_old = Get<cql::AlterUser>("alter user bot drop old verifier");
+    assert(drop_old.drop_old_verifier && !drop_old.verifier && !drop_old.added_verifier && !rekey.drop_old_verifier);
+    for (const auto line : {"ALTER USER bot ADD VERIFIER", "ALTER USER bot ADD VERIFIER 12", "ALTER USER bot ADD $1",
+        "ALTER USER bot DROP VERIFIER", "ALTER USER bot DROP OLD", "ALTER USER bot DROP OLD VERIFIER $1"})
+        ExpectError(line, "");
     assert(Get<cql::DropUser>("DROP USER bot").user == "bot");
     const auto grant = Get<cql::GrantRight>("GRANT WRITE ON world TO bot");
     assert(!grant.revoke && grant.right == chunkdb::Right::kWrite && grant.table == "world" && grant.user == "bot");
@@ -447,8 +488,21 @@ void TestAlterAndOtherStatements() {
     assert(every.right == chunkdb::Right::kAdmin && every.table == "*");
     const auto revoke = Get<cql::GrantRight>("REVOKE READ ON * FROM bot");
     assert(revoke.revoke && revoke.right == chunkdb::Right::kRead && revoke.user == "bot");
-    ExpectError("GRANT DELETE ON world TO bot", "expected READ, WRITE or ADMIN");
+    ExpectError("GRANT DELETE ON world TO bot", "expected READ, WRITE, ADMIN, MONITOR, BACKUP or REPLICATION");
     ExpectError("REVOKE READ ON world TO bot", "expected FROM");
+    const auto prefix = Get<cql::GrantRight>("GRANT ADMIN ON tenant1_* TO t1");
+    assert(prefix.right == chunkdb::Right::kAdmin && prefix.table == "tenant1_*" && prefix.server_rights == 0U);
+    assert(Get<cql::GrantRight>("REVOKE READ ON t* FROM t1").table == "t*");
+    ExpectError("GRANT ADMIN ON tenant1_ * TO t1", "expected TO, got '*'");
+    ExpectError("GRANT ADMIN ON tenant1_** TO t1", "expected TO, got '*'");
+    ExpectError("GRANT ADMIN ON Tenant* TO t1", "names are lowercase");
+    const auto server = Get<cql::GrantRight>("GRANT monitor, BACKUP, replication ON * TO ops");
+    assert(!server.right.has_value() && server.server_rights == chunkdb::kKnownServerRights && server.table == "*");
+    const auto mixed = Get<cql::GrantRight>("REVOKE WRITE, MONITOR, READ ON * FROM ops");
+    assert(mixed.revoke && mixed.right == chunkdb::Right::kRead &&
+           mixed.server_rights == static_cast<std::uint8_t>(chunkdb::ServerRight::kMonitor));
+    ExpectError("GRANT MONITOR ON world TO ops", "column 18: MONITOR, BACKUP and REPLICATION are granted ON *");
+    ExpectError("GRANT READ, BACKUP ON t* TO ops", "are granted ON *");
     (void)Get<cql::ShowUsers>("SHOW USERS");
     const auto scan = Get<cql::ScanChunks>("SCAN CHUNKS FROM world AFTER -3 4 LIMIT 10");
     assert(scan.table == "world" && scan.after == std::make_pair(std::int64_t{-3}, std::int64_t{4}) && scan.limit == 10U);
@@ -476,7 +530,7 @@ void TestWatch() {
     }
 
     const auto watch = Get<cql::Watch>("WATCH world AREA -2 3 TO 4 5 AFTER 1234567890abcdefABCDEF0123456789 18446744073709551615");
-    assert(watch.table == "world" && watch.area->first.x == -2 && watch.area->last.y == 5);
+    assert(watch.table == "world" && watch.areas.at(0).first.x == -2 && watch.areas.at(0).last.y == 5);
     assert(watch.after->epoch[0] == 0x12 && watch.after->epoch[15] == 0x89);
     assert(watch.after->revision == UINT64_MAX);
     assert(Get<cql::Watch>("watch world after 00000000000000000000000000000000 0").after->revision == 0);
@@ -496,7 +550,17 @@ void TestWatch() {
     ExpectError("WATCH world AFTER z0000000000000000000000000000000 0", "32 hex digits");
     ExpectError("WATCH world AFTER 00000000000000000000000000000000 -1", "revision must be between 0");
     const auto slot = Get<cql::Watch>("WATCH world SLOT 'consumer_1' AREA 0 0 TO 1 1 AFTER 00000000000000000000000000000000 4");
-    assert(slot.slot == "consumer_1" && slot.after->revision == 4 && slot.area->last.x == 1);
+    assert(slot.slot == "consumer_1" && slot.after->revision == 4 && slot.areas.at(0).last.x == 1);
+    const auto several = Get<cql::Watch>("WATCH world AREA 0 0 TO 1 1, AREA -4 -4 TO -3 -3,area 9 9 TO 9 9 COLUMNS a");
+    assert(several.areas.size() == 3U && several.areas[1].first.x == -4 && several.areas[2].last.y == 9 && several.columns->size() == 1U);
+    ExpectError("WATCH world AREA 0 0 TO 1 1 AREA 2 2 TO 3 3", "AREA is given twice");
+    ExpectError("WATCH world AREA 0 0 TO 1 1, COLUMNS a", "expected AREA");
+    ExpectError("WATCH world AREA 0 0 TO 1 1, AREA 0 0 0 TO 1 1 1", "AREA dimensions differ");
+    ExpectError("CREATE SLOT 's' ON world AREA 0 0 TO 1 1, AREA 2 2 TO 3 3", "a slot takes one AREA");
+    std::string many = "WATCH world AREA 0 0 TO 0 0";
+    for (std::size_t i = 1U; i < chunkdb::kMaxFeedAreas; ++i) many += ", AREA 0 0 TO 0 0";
+    assert(Get<cql::Watch>(many).areas.size() == chunkdb::kMaxFeedAreas);
+    ExpectError(many + ", AREA 0 0 TO 0 0", "at most 64 areas");
     assert(Get<cql::Ack>("ACK 18446744073709551615").revision == UINT64_MAX);
     ExpectError("ACK -1", "revision must be between 0");
     ExpectError("ACK 18446744073709551616", "not a 64-bit integer");
@@ -507,6 +571,10 @@ void TestWatch() {
     assert(drop.name == "consumer" && drop.table == "world");
     assert(!Get<cql::ShowSlots>("SHOW SLOTS").table);
     assert(Get<cql::ShowSlots>("SHOW SLOTS ON world").table == "world");
+    const auto prefixed = Get<cql::ShowSlots>("SHOW SLOTS ON world PREFIX 'con'");
+    assert(prefixed.table == "world" && prefixed.prefix == "con");
+    assert(!Get<cql::ShowSlots>("SHOW SLOTS PREFIX '_'").table && Get<cql::ShowSlots>("show slots prefix '_'").prefix == "_");
+    assert(!Get<cql::ShowSlots>("SHOW SLOTS ON world").prefix);
     for (const auto& name : std::vector<std::string>{"", "Upper", "1start", "hy-phen", "quote'", std::string(64, 'a')}) {
         std::string quoted;
         for (const char c : name) { quoted += c; if (c == '\'') quoted += c; }
@@ -519,8 +587,43 @@ void TestWatch() {
     ExpectError("CREATE SLOT consumer ON world", "quoted slot name");
     ExpectError("DROP SLOT $1 ON world", "quoted slot name");
     ExpectError("SHOW SLOTS ON world extra", "expected the end");
+    ExpectError("SHOW SLOTS PREFIX con", "quoted slot name");
+    ExpectError("SHOW SLOTS PREFIX ''", "slot names must match");
+    ExpectError("SHOW SLOTS PREFIX 'con' ON world", "expected the end");
     ExpectError("UNWATCH extra", "expected the end");
 }
+// CHECK in CREATE TABLE (a column's and the table's), ADD CHECK and DROP
+// CHECK; the condition's text is kept as written.
+void TestChecks() {
+    const auto create = Get<cql::CreateTable>(
+        "CREATE TABLE t (hp i32 CHECK (hp >= 0) CHECK hp_max ( hp <= max_hp ), max_hp i32 NULL) CHUNK 4 x 4 "
+        "CHECK (pos_z = 0 OR hp > 1) CHECK named (\"max_hp\" IS NULL)");
+    assert(create.columns[0].checks.size() == 2U && create.columns[1].checks.empty());
+    assert(!create.columns[0].checks[0].name && create.columns[0].checks[0].expression == "hp >= 0");
+    assert(create.columns[0].checks[1].name == "hp_max" && create.columns[0].checks[1].expression == "hp <= max_hp");
+    assert(create.chunk_width == 4U && create.checks.size() == 2U);
+    assert(create.checks[0].expression == "pos_z = 0 OR hp > 1" && create.checks[1].name == "named");
+    assert(create.checks[1].expression == "\"max_hp\" IS NULL");
+    // A column named check is still a column.
+    assert(Get<cql::CreateTable>("CREATE TABLE t (check u8, b bits(4) CHECK (b <> b'0000'))").columns.size() == 2U);
+    const auto add = std::get<cql::AddCheck>(Get<cql::AlterTable>("ALTER TABLE t ADD CHECK (a + b < 10)").change);
+    assert(!add.check.name && add.check.expression == "a + b < 10");
+    assert(std::get<cql::AddCheck>(Get<cql::AlterTable>("alter table t add check ab ((a) < b)").change).check.name == "ab");
+    const auto drop = std::get<cql::DropCheck>(Get<cql::AlterTable>("ALTER TABLE t DROP CHECK IF EXISTS ab").change);
+    assert(drop.name == "ab" && drop.if_exists);
+    assert(!std::get<cql::DropCheck>(Get<cql::AlterTable>("ALTER TABLE t DROP CHECK ab").change).if_exists);
+    const auto migrated = Get<cql::Migrate>("MIGRATE 'm1' ALTER TABLE t ADD CHECK (a > 0)");
+    assert(std::holds_alternative<cql::AddCheck>(std::get<cql::AlterTable>(migrated.statement).change));
+    ExpectError("ALTER TABLE t ADD CHECK (a > $1)", "CHECK takes no parameters");
+    ExpectError("ALTER TABLE t ADD CHECK a = 0", "expected (, got '='");
+    ExpectError("ALTER TABLE t ADD CHECK (a > 0", "expected )");
+    ExpectError("ALTER TABLE t ADD CHECK (a >)", "expected a value");
+    ExpectError("ALTER TABLE t ADD CHECK Named (a > 0)", "names are lowercase");
+    ExpectError("ALTER TABLE t ADD COLUMN c u8 CHECK (c > 0)", "ADD COLUMN takes no CHECK; add the column, then ALTER TABLE ... ADD CHECK");
+    ExpectError("CREATE TABLE t (a u8) CHUNK COLUMNS (b u8 CHECK (b > 0))", "CHUNK COLUMNS takes no CHECK");
+    ExpectError("ALTER TABLE t DROP CHECK", "expected a check name");
+}
+
 void TestBackup() {
     assert(Get<cql::Backup>("BACKUP TO '/backups/snapshot'").path == "/backups/snapshot");
     assert(Get<cql::Backup>("backup to '/backups/it''s'").path == "/backups/it's");
@@ -546,6 +649,47 @@ void TestBackup() {
     ExpectError("SWAP TABLES world, other, third", "expected the end of the statement");
 }
 
+void TestAggregate() {
+    using Kind = cql::AggregateFunction::Kind;
+    const auto area = Get<cql::Aggregate>("AGGREGATE AREA -1 -2 TO 3 4 FROM t COUNT(*), SUM(a), MIN(a), MAX(b), AVG(a)");
+    assert(!area.around && area.dims == 2U && area.x0 == -1 && area.y0 == -2 && area.x1 == 3 && area.y1 == 4);
+    assert(area.table == "t" && !area.by_chunk);
+    assert((area.functions == std::vector<cql::AggregateFunction>{{Kind::kCount, ""}, {Kind::kSum, "a"},
+        {Kind::kMin, "a"}, {Kind::kMax, "b"}, {Kind::kAvg, "a"}}));
+    std::vector<std::string> names;
+    for (const auto& function : area.functions) names.push_back(cql::AggregateFunctionName(function));
+    assert((names == std::vector<std::string>{"count(*)", "sum(a)", "min(a)", "max(b)", "avg(a)"}));
+    const auto ball = Get<cql::Aggregate>("aggregate area around 1 2 3 radius 4 from t count ( * ) by chunk");
+    assert(ball.around && ball.dims == 3U && ball.z0 == 3 && ball.radius == 4 && ball.by_chunk);
+    const auto chunk = Get<cql::Aggregate>("AGGREGATE CHUNK 5 -6 7 FROM t SUM(a) BY CHUNK");
+    assert(!chunk.around && chunk.dims == 3U && chunk.by_chunk && chunk.functions.size() == 1U);
+    assert(chunk.x0 == 5 && chunk.x1 == 5 && chunk.y0 == -6 && chunk.y1 == -6 && chunk.z0 == 7 && chunk.z1 == 7);
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t", "expected COUNT, SUM, MIN, MAX or AVG, got the end of the statement");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(a)", "COUNT takes *, got 'a'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t SUM(*)", "expected a column name, got '*'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t SUM a", "expected (, got 'a'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t MEDIAN(a)", "expected COUNT, SUM, MIN, MAX or AVG, got 'MEDIAN'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t SUM(a), sum(a)", "column 42: sum(a) is given twice");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) BY CHUNK BY CHUNK", "BY CHUNK is given twice");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) BY BLOCK", "expected CHUNK, got 'BLOCK'");
+    const auto where = Get<cql::Aggregate>("AGGREGATE CHUNK 0 0 FROM t COUNT(*) WHERE a > $1 OR b IN ($2, 3) BY CHUNK", 2);
+    assert(where.where && where.by_chunk && where.where->nodes[where.where->root].op == chunkdb::expr::Op::kOr);
+    assert(Get<cql::Aggregate>("AGGREGATE CHUNK 0 0 FROM t COUNT(*) BY CHUNK WHERE EXISTS").where->nodes.size() == 1U);
+    assert(!chunk.where);
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) WHERE a > 1 WHERE a < 3", "column 55: WHERE is given twice");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) WHERE a >", "expected a value, got the end of the statement");
+    ExpectError("AGGREGATE CHUNK 0 0 FROM t COUNT(*) WHERE a = $1 AND b = $1", "$1 is used twice");
+    ExpectError("AGGREGATE CHUNK 0 0 FROM t COUNT(*) WHERE (a = 1) + 1 > 0", "column 51: unexpected '+'");
+    std::string long_where = "AGGREGATE CHUNK 0 0 FROM t COUNT(*) WHERE a = 0";
+    for (int i = 1; i < 90; ++i) long_where += " OR a = " + std::to_string(i);
+    ExpectError(long_where, "the expression is too long: at most 256 nodes");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 0 FROM t COUNT(*)", "AREA endpoints have different dimensions");
+    ExpectError("AGGREGATE AREA AROUND 0 0 RADIUS -1 FROM t COUNT(*)", "a radius must be between 0");
+    ExpectError("AGGREGATE BLOCK 0 0 FROM t COUNT(*)", "expected CHUNK or AREA, got 'BLOCK'");
+    ExpectError("AGGREGATE CHUNK 0 0 FROM t COUNT(*) LIMIT 1", "expected the end of the statement, got 'LIMIT'");
+    ExpectError("AGGREGAT CHUNK 0 0 FROM t COUNT(*)", "did you mean AGGREGATE?");
+}
+
 void TestErrors() {
     ExpectError("", "column 1: unknown statement the end of the statement");
     ExpectError("SELECT * FROM t", "column 1: unknown statement 'SELECT'; read with GET BLOCK, GET AREA or GET CHUNK");
@@ -559,12 +703,62 @@ void TestErrors() {
     ExpectError("GET BLOCK 1 2 FROM t; DROP TABLE t", "column 21: unexpected ';'");
     ExpectError("SET BLOCK 0 0 IN t", "expected a column name");
     ExpectError("SET BLOCK 0 0 IN t a 1", "expected =, got '1'");
-    ExpectError("SET BLOCK 0 0 IN t a = b", "expected a value, got 'b'");
     ExpectError("SET BLOCK 0 0 IN t a = 1 IF VERSION -1", "a version must be between 0");
-    ExpectError("SET BLOCK 0 0 IN t a = 1 IF 3", "expected VERSION");
     ExpectError("DROP t", "expected TABLE");
     ExpectError("FLUSH", "expected WAL");
     ExpectError("SHOW GRANTS", "expected TABLES, METRICS, STATUS, CONNECTIONS, MIGRATIONS, USERS or SLOTS");
+}
+
+// IF <expr> and computed values of SET BLOCK and DELETE BLOCK (#145): a
+// statement with single values and no condition parses as before.
+void TestBlockExpressions() {
+    const auto plain = Get<cql::SetBlock>("SET BLOCK 0 0 IN t a = 1, b = $1", 1);
+    assert(plain.values.size() == 2U && !plain.expressions && !plain.if_version);
+    const auto versioned = Get<cql::SetBlock>("SET BLOCK 0 0 IN t a = 1 IF VERSION 3");
+    assert(versioned.if_version == 3U && !versioned.expressions);
+
+    const auto computed = Get<cql::SetBlock>("SET BLOCK 1 2 IN t coins = coins + $1", 1);
+    assert(computed.values.empty() && computed.expressions && !computed.expressions->condition);
+    assert(computed.expressions->assignments.size() == 1U && computed.expressions->assignments[0].column == "coins");
+    // One computed value makes every value an expression.
+    const auto mixed = Get<cql::SetBlock>("SET BLOCK 1 2 IN t a = $1, b = a * 2, c = (3)", 1);
+    assert(mixed.values.empty() && mixed.expressions->assignments.size() == 3U);
+    assert(Get<cql::SetBlock>("SET BLOCK 1 2 IN t a = 1 * 2").expressions->assignments.size() == 1U);
+    assert(Get<cql::SetBlock>("SET BLOCK 1 2 IN t a = -b").expressions);
+
+    const auto conditional = Get<cql::SetBlock>("SET BLOCK 1 2 3 IN t a = 1, b = $1 IF a < $2 AND EXISTS", 2);
+    assert(conditional.dims == 3U && conditional.values.size() == 2U && !conditional.if_version);
+    assert(conditional.expressions->condition && conditional.expressions->assignments.empty());
+    const auto both = Get<cql::SetBlock>("SET BLOCK 1 2 IN t hp = LEAST(hp + 5, max_hp) if hp > 0", 0);
+    assert(both.expressions->condition && both.expressions->assignments.size() == 1U);
+    // `version` is a column unless VERSION is followed by a number.
+    const auto column = Get<cql::SetBlock>("SET BLOCK 1 2 IN t a = 1 IF version = 3");
+    assert(!column.if_version && column.expressions->condition);
+    const auto counted = Get<cql::SetBlock>("SET BLOCK 1 2 IN t n = COALESCE(n, 0) + 1 IF VERSION 7");
+    assert(counted.if_version == 7U && counted.expressions && !counted.expressions->condition);
+
+    const auto removed = Get<cql::DeleteBlock>("DELETE BLOCK 1 2 FROM t IF EXISTS AND hp <= $1", 1);
+    assert(removed.expressions && removed.expressions->condition && !removed.if_version);
+    const auto removed3 = Get<cql::DeleteBlock>("delete block 1 2 3 from t if chunk.status = 2");
+    assert(removed3.dims == 3U && removed3.expressions->condition);
+    const auto unconditional = Get<cql::DeleteBlock>("DELETE BLOCK 1 2 FROM t IF VERSION 4");
+    assert(unconditional.if_version == 4U && !unconditional.expressions);
+    // IF VERSION $n reads the version from a parameter frame.
+    const auto versioned_parameter = Get<cql::SetBlock>("SET BLOCK 1 2 IN t a = $2 IF VERSION $1", 2);
+    assert(!versioned_parameter.if_version && versioned_parameter.values.size() == 1U);
+    assert(versioned_parameter.expressions->version_parameter == 1U && !versioned_parameter.expressions->condition);
+    const auto removed_parameter = Get<cql::DeleteBlock>("DELETE BLOCK 1 2 FROM t IF VERSION $1", 1);
+    assert(!removed_parameter.if_version && removed_parameter.expressions->version_parameter == 1U);
+    ExpectError("DELETE BLOCK 1 2 FROM t IF VERSION $1 AND a = 1", "expected the end of the statement");
+
+    ExpectError("SET BLOCK 0 0 IN t a = 1 IF VERSION 3 AND a = 1", "expected the end of the statement, got 'AND'");
+    ExpectError("SET BLOCK 0 0 IN t a = coins + $1 IF a > $1", "$1 is used twice");
+    ExpectError("SET BLOCK 0 0 IN t a = b + $2", "numbered $1 to $2 without gaps");
+    ExpectError("SET BLOCK 0 0 IN t a = b +", "column 27");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 IF", "column 28");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 IF a > 1 extra", "expected the end of the statement, got 'extra'");
+    ExpectError("DELETE BLOCK 0 0 FROM t IF a +", "column 31");
+    ExpectError("DELETE BLOCK 0 0 FROM t IF VERSION 1.5", "expected a version");
 }
 
 }  // namespace
@@ -603,13 +797,16 @@ int main() {
     TestStatementSuggestions();
     TestConditionalObjects();
     TestBlockStatements();
+    TestBlockExpressions();
     TestChunkAndAreaStatements();
+    TestAggregate();
     TestLiterals();
     TestParameters();
     TestCreateTable();
     TestAlterAndOtherStatements();
     TestWatch();
     TestBackup();
+    TestChecks();
     TestErrors();
     return 0;
 }

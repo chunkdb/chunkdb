@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -11,7 +12,13 @@
 
 #include "chunkdb/schema.hpp"
 #include "chunkdb/change_feed.hpp"
+#include "sectioned_chunk_form.hpp"
 #include "users.hpp"
+
+namespace chunkdb::expr {
+struct Expression;
+struct WriteExpressions;
+}  // namespace chunkdb::expr
 
 // CQL statements (docs/CQL.md): parsed from one request line, not yet
 // executed.
@@ -97,6 +104,9 @@ struct SetBlock {
     std::optional<std::uint64_t> if_version;
     std::int64_t z = 0;
     std::uint8_t dims = 2;
+    // IF <expr> and values that are more than a single value
+    // (docs/design/EXPRESSIONS_DESIGN.md); null for a statement without them.
+    std::shared_ptr<const expr::WriteExpressions> expressions;
 };
 struct DeleteBlock {
     std::int64_t x = 0;
@@ -105,6 +115,8 @@ struct DeleteBlock {
     std::optional<std::uint64_t> if_version;
     std::int64_t z = 0;
     std::uint8_t dims = 2;
+    // IF <expr>; null without it.
+    std::shared_ptr<const expr::WriteExpressions> expressions;
 };
 struct GetChunk {
     std::int64_t chunk_x = 0;
@@ -142,14 +154,48 @@ struct GetArea {
     std::uint8_t dims = 2;
     std::optional<std::uint64_t> limit;
     std::optional<ChunkCoord> after;
+    // SCALE k USING reduction: one cell per k blocks on every active axis.
+    std::optional<ChunkFormScale> scale;
 };
 
+// One function of AGGREGATE; `column` is empty for COUNT(*).
+struct AggregateFunction {
+    enum class Kind : std::uint8_t { kCount, kSum, kMin, kMax, kAvg };
+    Kind kind = Kind::kCount;
+    std::string column;
+    friend bool operator==(const AggregateFunction&, const AggregateFunction&) = default;
+};
+// AGGREGATE over a chunk range or ball; CHUNK c is the range from c to c.
+struct Aggregate {
+    bool around = false;
+    std::int64_t x0 = 0;
+    std::int64_t y0 = 0;
+    std::int64_t x1 = 0;
+    std::int64_t y1 = 0;
+    std::int64_t radius = 0;
+    std::string table;
+    std::vector<AggregateFunction> functions;
+    bool by_chunk = false;
+    std::int64_t z0 = 0;
+    std::int64_t z1 = 0;
+    std::uint8_t dims = 2;
+    // WHERE (expr.hpp): only the present blocks for which it is TRUE.
+    std::shared_ptr<const expr::Expression> where;
+};
+
+// CHECK [name] (expr): the condition's text as written, trimmed.
+struct CheckDefinition {
+    std::optional<std::string> name;
+    std::string expression;
+};
 struct ColumnDefinition {
     std::string name;
     ColumnType type;
     bool nullable = false;
     bool required = false;
     std::optional<Literal> default_value;
+    // Block columns of CREATE TABLE only.
+    std::vector<CheckDefinition> checks{};
 };
 struct Option {
     std::string name;
@@ -173,6 +219,8 @@ struct CreateTable {
     std::uint32_t large_depth = 1;
     std::uint8_t dims = 2;
     std::vector<ColumnDefinition> chunk_columns;
+    // CHECK clauses after the columns.
+    std::vector<CheckDefinition> checks{};
 };
 struct AddColumn {
     ColumnDefinition column;
@@ -198,9 +246,32 @@ struct AlterColumnType {
 struct SetOption {
     Option option;
 };
+// ALTER COLUMN c SET DEFAULT v | DROP DEFAULT | SET NULL | DROP NULL |
+// SET REQUIRED | DROP REQUIRED.
+struct AlterColumnAttribute {
+    enum class Change : std::uint8_t { kSetDefault, kDropDefault, kSetNull, kDropNull, kSetRequired, kDropRequired };
+    std::string column;
+    Change change = Change::kSetDefault;
+    // kSetDefault only.
+    std::optional<Literal> value{};
+};
+// RENAME TO: the table's new name.
+struct RenameTable {
+    std::string new_name;
+};
+// ADD CHECK [name] (expr), DROP CHECK [IF EXISTS] name.
+struct AddCheck {
+    CheckDefinition check;
+};
+struct DropCheck {
+    std::string name;
+    bool if_exists = false;
+};
 struct AlterTable {
     std::string table;
-    std::variant<AddColumn, DropColumn, RenameColumn, AlterColumnType, SetOption> change;
+    std::variant<AddColumn, DropColumn, RenameColumn, AlterColumnType, SetOption, AlterColumnAttribute, RenameTable,
+        AddCheck, DropCheck>
+        change;
 };
 struct DropTable {
     std::string table;
@@ -228,6 +299,8 @@ struct DropSlot {
 };
 struct ShowSlots {
     std::optional<std::string> table;
+    // Only slots whose names start with it.
+    std::optional<std::string> prefix{};
 };
 struct Describe {
     std::string table;
@@ -264,7 +337,8 @@ struct Watch {
     bool no_before = false;
     bool chunks = false;
     std::optional<std::string> slot{};
-    std::optional<FeedArea> area{};
+    // Empty for the whole table; AREA ..., AREA ... gives several.
+    std::vector<FeedArea> areas{};
     std::optional<FeedPosition> after{};
     std::optional<std::uint64_t> ack_timeout_ms{};
     bool takeover = false;
@@ -282,11 +356,15 @@ struct CreateUser {
     bool requires_channel_binding = false;
     bool if_not_exists = false;
 };
-// Exactly one change is set: the verifier, manages_users, the limits or
-// requires_channel_binding.
+// Exactly one change is set: the verifier, the added verifier,
+// drop_old_verifier, manages_users, the limits or requires_channel_binding.
 struct AlterUser {
     std::string user;
     std::optional<Literal> verifier;
+    // ADD VERIFIER: a second verifier the user logs in with besides its own.
+    std::optional<Literal> added_verifier;
+    // DROP OLD VERIFIER: the added verifier becomes the only one.
+    bool drop_old_verifier = false;
     std::optional<bool> manages_users;
     std::optional<std::uint64_t> max_connections{};
     std::optional<std::uint64_t> statements_per_sec{};
@@ -299,16 +377,22 @@ struct DropUser {
 // GRANT, or REVOKE when `revoke`.
 struct GrantRight {
     bool revoke = false;
-    // Rights are hierarchical. A list grants its highest right or revokes
-    // its lowest right, so the registry publishes the whole list once.
-    Right right = Right::kRead;
-    // A table name, or kEveryTable.
+    // Table rights are hierarchical. A list grants its highest right or
+    // revokes its lowest right, so the registry publishes the whole list
+    // once. Absent when the list names server rights only.
+    std::optional<Right> right;
+    // ServerRight bits; the parser accepts them ON * only.
+    std::uint8_t server_rights = 0U;
+    // A table name, a prefix grant `p*`, or kEveryTable.
     std::string table;
     std::string user;
 };
 struct ShowUsers {};
 // Transactions (docs/design/TRANSACTIONS_DESIGN.md).
-struct Begin {};
+// BEGIN READ ONLY: reads only, without a read set (docs/reference/TRANSACTION_STATEMENTS.md).
+struct Begin {
+    bool read_only = false;
+};
 struct Commit {};
 struct Rollback {};
 // The populated chunks of table, ordered by every active coordinate axis.
@@ -321,6 +405,8 @@ struct ScanChunks {
     std::optional<std::uint64_t> since;
     bool with_data = false;
     std::vector<std::string> columns;
+    // WHERE (expr.hpp): only the present blocks for which it is TRUE.
+    std::shared_ptr<const expr::Expression> where;
 };
 
 using MigrationStatement = std::variant<CreateTable, AlterTable, DropTable, GrantRight, CreateSlot, DropSlot>;
@@ -339,6 +425,7 @@ using Statement = std::variant<
     GetChunk,
     SetChunk,
     GetArea,
+    Aggregate,
     CreateTable,
     AlterTable,
     DropTable,
@@ -392,6 +479,9 @@ struct Parsed {
 // Parses one statement (docs/CQL.md). Throws ParseError naming the
 // first token that does not fit, with its 1-based column.
 [[nodiscard]] Parsed Parse(std::string_view line);
+// How AGGREGATE names `function` in its reply and errors: `count(*)`,
+// `sum(a)`, `min(a)`, `max(a)` or `avg(a)`.
+[[nodiscard]] std::string AggregateFunctionName(const AggregateFunction& function);
 [[nodiscard]] HelloRequest ParseHello(std::string_view line);
 
 }  // namespace chunkdb::cql

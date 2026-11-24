@@ -88,7 +88,7 @@ These events are recorded:
 | `event` | When |
 |---|---|
 | `login` | A login succeeds or fails. |
-| `create_table`, `alter_table`, `drop_table`, `recover_table` | Schema statements and RECOVER TABLE. |
+| `create_table`, `alter_table`, `drop_table`, `recover_table` | Schema statements and RECOVER TABLE; ALTER TABLE ... RENAME TO names both tables as `a,b`. |
 | `create_user`, `alter_user`, `drop_user`, `grant`, `revoke` | User and right statements. |
 | `backup` | BACKUP. |
 | `restore_table`, `swap_tables` | RESTORE TABLE, with the new table, and SWAP TABLES, with both tables as `a,b`. |
@@ -102,6 +102,7 @@ Every line has `time_ms` (UTC milliseconds since the Unix epoch), `connection` (
 A failure adds `error_code`; a failed login adds `reason`: `wrong_password`, `unknown_user`, `banned`, `no_user`, `invalid_user_name`, `invalid_login`, `channel_binding` (bound to another connection, or not bound on a server that requires it), `channel_binding_required` (not bound, for a user that requires it), `stale_login` (a right proof, but the user's verifier or channel binding requirement changed between HELLO and AUTH in a way that leaves the login otherwise valid, or the user was dropped after the proof was checked and before the connection was admitted) or `max_connections` (the user's connection limit is reached).
 A failed login whose name could not name a user (see [Users and rights](USERS.md)) is written with an empty `user`.
 Lines add `table`, `target_user`, `slot`, `migration` or `target_connection` when the event names them.
+`alter_user` lines add `change`, the form that ran: `verifier`, `add_verifier`, `drop_old_verifier`, `manages_users`, `limit` or `requires_channel_binding`.
 Passwords, verifiers, parameter values and block data are never written.
 
 ```text
@@ -140,7 +141,7 @@ Raise `--max-loaded-chunks` to raise the associated container limit.
 It takes no writer lock, so it can run next to the server that writes the directory.
 It runs no recovery, checkpoints or maintenance, and reserves no revisions.
 It leaves the users file and its permissions as they are, and logs a warning when the file is not owner-only.
-GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, DESCRIBE, the SHOW statements, PING and RELOAD TLS work.
+GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, AGGREGATE, DESCRIBE, the SHOW statements, PING and RELOAD TLS work.
 COMMIT, ROLLBACK, UNWATCH and ACK answer as they do when nothing is open, because no transaction or watch can start.
 Every other statement answers `INVALID_ARGUMENT reason=invalid_argument <statement> is not available: the server opened its data directory read-only`, including WATCH, BEGIN, FLUSH WAL and BACKUP.
 
@@ -163,14 +164,14 @@ With `--auth scram` the directory must already have users, because `--read-only`
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--txn-max-duration-ms` | `5000` | Transaction lifetime from BEGIN; expiry ends it with CONFLICT and releases its private bytes. |
-| `--max-area-chunks` | `4096` | Requested chunk cells per GET AREA or area page, including empty cells. |
-| `--max-area-response-bytes` | `67108864` | Complete encoded GET AREA reply, including page headers and cursor. |
+| `--txn-max-duration-ms` | `5000` | Transaction lifetime from BEGIN, also for BEGIN READ ONLY; expiry ends it with CONFLICT and releases its private bytes and the earlier chunk states kept for it. |
+| `--max-area-chunks` | `4096` | Requested chunk cells per GET AREA, area page or AGGREGATE, including empty cells. |
+| `--max-area-response-bytes` | `67108864` | Complete encoded GET AREA or AGGREGATE reply, including page headers and cursor. |
 | `--txn-max-written-chunks` | `1024` | Distinct chunks written by one transaction. |
-| `--txn-max-read-chunks` | `8192` | Distinct chunks read by one transaction. |
+| `--txn-max-read-chunks` | `8192` | Distinct chunks read by one transaction; a BEGIN READ ONLY transaction keeps no read set and has no such limit. |
 | `--txn-max-bytes` | `16777216` | Private written-chunk bytes for one transaction. |
 | `--txn-total-bytes` | `268435456` | Private written-chunk bytes for all open transactions; a write that finds it full first ends the transactions past `--txn-max-duration-ms`. |
-| `--txn-history-bytes` | `67108864` | Earlier chunk states retained per table; overflow cancels oldest transactions. |
+| `--txn-history-bytes` | `67108864` | Earlier chunk states retained per table for open snapshots, also of BEGIN READ ONLY; overflow cancels oldest transactions. `chunkdb_txn_history_bytes` reports the retained bytes. |
 | `--feed-buffer-bytes` | `67108864` | Default live feed budget for tables without an explicit `feed_buffer_bytes` option, shared among watches. |
 | `--tcp-keepalive-ms` | `60000` | Set TCP idle and repeat probe intervals, 1–32767000 ms, for every accepted connection. |
 | `--feed-progress-ms` | `1000` | Emit idle or filtered watch progress at most once per interval, 1–2147483647 ms. |

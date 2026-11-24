@@ -1,4 +1,9 @@
+#include <algorithm>
 #include <cassert>
+#include <condition_variable>
+#include <mutex>
+#include <thread>
+#include <vector>
 #include <cstdlib>
 #include <fstream>
 #include <functional>
@@ -342,6 +347,74 @@ void CrashCompactionBoundaries(const char* executable) {
 }
 }
 
+// A snapshot page lists the coordinates populated at its revision: one a
+// later write empties stays listed while that write is between its
+// population change and its return, since the revision is published first;
+// the walk releases the index lock between batches and keeps its order.
+void SnapshotPageKeepsLaterEmptiedCoordinates() {
+    test::ScopedTempDir directory("chunkdb-coordinate-snapshot");
+    const auto geometry = Shape();
+    assert(ChunkCoordinateIndex::InitializeEmpty(directory.path(), geometry, kTable));
+    ChunkCoordinateIndex owner(directory.path(), geometry, kTable, false);
+    const ChunkCoord emptied{0, 0};
+    const ChunkCoord kept{2, 0};
+    ChunkCoordinateNode* emptied_node = nullptr;
+    ChunkCoordinateNode* kept_node = nullptr;
+    Publish(owner, emptied, emptied_node, true, 1U);
+    Publish(owner, kept, kept_node, true, 2U);
+    const std::uint64_t snapshot = 2U;
+
+    struct Hold final : CoordinatePublicationTestHook {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool reached = false;
+        bool released = false;
+        void AfterPopulationChange(const ChunkCoord&) noexcept override {
+            std::unique_lock lock(mutex);
+            reached = true;
+            changed.notify_all();
+            changed.wait(lock, [&] { return released; });
+        }
+    } hold;
+    SetCoordinatePublicationTestHook(&hold);
+    std::thread writer([&] { Publish(owner, emptied, emptied_node, false, 3U); });
+    {
+        std::unique_lock lock(hold.mutex);
+        hold.changed.wait(lock, [&] { return hold.reached; });
+    }
+    // The write has removed the coordinate from the populated set.
+    assert(owner.Page(false, {}, 10U).coords == std::vector{kept});
+    assert((owner.SnapshotPage(false, {}, 10U, snapshot).coords == std::vector{emptied, kept}));
+    assert(owner.SnapshotPage(false, {}, 10U, 3U).coords == std::vector{kept});
+    {
+        std::lock_guard lock(hold.mutex);
+        hold.released = true;
+    }
+    hold.changed.notify_all();
+    writer.join();
+    SetCoordinatePublicationTestHook(nullptr);
+    assert((owner.SnapshotPage(false, {}, 10U, snapshot).coords == std::vector{emptied, kept}));
+
+    // More than one batch of nodes: every other one emptied after revision R.
+    constexpr std::int64_t kCount = 700;
+    std::vector<ChunkCoordinateNode*> nodes(kCount, nullptr);
+    std::uint64_t revision = 10U;
+    for (std::int64_t x = 0; x < kCount; ++x) Publish(owner, {x, 9}, nodes[x], true, ++revision);
+    const auto before = revision;
+    for (std::int64_t x = 0; x < kCount; x += 2) Publish(owner, {x, 9}, nodes[x], false, ++revision);
+    const auto all = owner.SnapshotPage(false, {}, kMaxChunkScanLimit + 1U, before);
+    assert(!all.more && all.coords.size() == static_cast<std::size_t>(kCount) + 1U);
+    assert(std::is_sorted(all.coords.begin(), all.coords.end()));
+    const auto now = owner.SnapshotPage(false, {}, kMaxChunkScanLimit + 1U, revision);
+    assert(!now.more && now.coords.size() == static_cast<std::size_t>(kCount) / 2U + 1U);
+    // A limited page resumes after its cursor.
+    const auto first = owner.SnapshotPage(false, {}, 300U, before);
+    assert(first.more && first.coords.size() == 300U);
+    const auto rest = owner.SnapshotPage(true, first.coords.back(), 500U, before);
+    assert(!rest.more && first.coords.size() + rest.coords.size() == all.coords.size());
+    assert(std::equal(rest.coords.begin(), rest.coords.end(), all.coords.begin() + 300));
+}
+
 int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--binding-only") {
         ReplacementIdentityBindsValidSameLengthContent();
@@ -366,4 +439,5 @@ int main(int argc, char** argv) {
     InventoryGenerationNeverWraps();
     ForgetRequiresItsPublishedRefusalFloor();
     ReplacementIdentityBindsValidSameLengthContent();
+    SnapshotPageKeepsLaterEmptiedCoordinates();
 }

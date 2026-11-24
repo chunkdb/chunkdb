@@ -82,11 +82,14 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
     const auto copy_cached = [&, with_vars](const RegularChunk& chunk, ChunkRangeEntry* entry) {
         entry->version = chunk.version;
         entry->commit_time_ms = chunk.commit_time_ms;
-        if (identity_only || (include_empty && !ChunkPopulated(geometry_, chunk.presence_bitmap, chunk.chunk_columns.get()))) {
+        if ((identity_only && snapshot == nullptr) ||
+            (include_empty && !ChunkPopulated(geometry_, chunk.presence_bitmap, chunk.chunk_columns.get()))) {
             entry->payload.clear(); entry->presence_bitmap.clear(); entry->vars = {}; entry->chunk_columns.reset();
             return;
         }
-        entry->payload = chunk.payload;
+        // An identity read as of a snapshot keeps what decides populated-ness.
+        if (identity_only) entry->payload.clear();
+        else entry->payload = chunk.payload;
         entry->presence_bitmap = chunk.presence_bitmap;
         entry->chunk_columns = chunk.chunk_columns;
         if (with_vars) {
@@ -113,11 +116,12 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
         return true;
     }
     // As of a snapshot the state is read whole, current state first and the
-    // history after it, before populated-ness is known.
+    // history after it, before populated-ness is known; an identity read
+    // leaves out the payload.
     ChunkRangeEntry snapshot_entry;
     ChunkRangeEntry* const target = snapshot != nullptr && out == nullptr ? &snapshot_entry : out;
     const auto finish_snapshot_read = [&]() {
-        ApplyTxnHistory(*snapshot, chunk_coord, with_vars, target);
+        ApplyTxnHistory(*snapshot, chunk_coord, with_vars && !identity_only, target, !identity_only);
         return ChunkPopulated(geometry_, target->presence_bitmap, target->chunk_columns.get());
     };
     // Per-chunk consistency protocol: a cached chunk is authoritative (its
@@ -173,7 +177,8 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
             target->version = 0;
             target->vars = ChunkVars{};
         }
-        const bool populated = ReadPopulatedChunkStateFromDisk(chunk_coord, target, with_vars, &vars_problem, include_empty, identity_only);
+        const bool populated = ReadPopulatedChunkStateFromDisk(chunk_coord, target, with_vars, &vars_problem, include_empty,
+            identity_only && snapshot == nullptr);
         if (TryGetLoadedChunk(chunk_coord) == nullptr &&
             eviction_removals_.load(std::memory_order_acquire) == eviction_removals_before) {
             if (!vars_problem.empty()) {
@@ -435,7 +440,42 @@ std::size_t ChunkStore::ChunkRangeEntryCostBytes() const noexcept {
     return cost;
 }
 
+std::shared_ptr<ChunkCoordinateIndex> ChunkStore::CoordinateIndexForArea(const TxnSnapshot* snapshot) {
+    // A snapshot includes every version issued before it, not only completed
+    // writes. An unfinished included write may still populate a coordinate
+    // the index does not list yet, so the index is used only once every
+    // write through the snapshot has published its membership.
+    if (snapshot != nullptr) {
+        const auto completed = CompletedRevision();
+        if (!completed || snapshot->version() > *completed) return nullptr;
+    }
+    return CoordinateIndexForScan();
+}
+
+bool ChunkStore::AreaChunkMayBePopulated(
+    const ChunkCoordinateIndex* index, const ChunkCoord& coord, const TxnSnapshot* snapshot) {
+    if (index == nullptr || index->IsPopulationCandidate(coord)) return true;
+    if (snapshot == nullptr) return false;
+    // Every write the snapshot includes has published its membership
+    // (CoordinateIndexForArea), so an unlisted coordinate was empty at
+    // the snapshot unless a later write emptied it. That writer publishes
+    // membership and then the state it replaced under its exclusive
+    // chunk lock, and eviction cannot remove a chunk a writer holds:
+    // the shared lock of a cached chunk makes that kept state visible,
+    // and a cache miss means it already was.
+    if (const auto loaded = TryGetLoadedChunk(coord); loaded != nullptr) {
+        std::shared_lock lock(loaded->mutex);
+    }
+    bool populated = false;
+    (void)txn_history_->VisitAt(*snapshot, coord, [&](const TxnKeptState& kept) {
+        const auto state = kept.View();
+        populated = ChunkPopulated(geometry_, state.presence_bitmap, state.metadata_present, state.metadata_bytes);
+    });
+    return populated;
+}
+
 void ChunkStore::AppendPopulatedChunkRangeEntry(
+    const ChunkCoordinateIndex* index,
     const ChunkCoord& coord,
     std::size_t max_entries,
     const char* operation_name,
@@ -488,6 +528,7 @@ void ChunkStore::AppendPopulatedChunkRangeEntry(
             return;
         }
     }
+    if (!AreaChunkMayBePopulated(index, coord, snapshot)) return;
     if (entries->size() < max_entries) {
         ChunkRangeEntry entry;
         entry.coord = coord;
@@ -516,7 +557,7 @@ ChunkAreaPage ChunkStore::VisitChunkArea(
     if (after && !cursor.Contains(*after)) throw std::invalid_argument("area cursor is outside its selector");
     auto current = after ? cursor.Next(*after) : std::optional{cursor.First()};
     auto admitted = after;
-    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
+    const auto index = CoordinateIndexForArea(snapshot);
     for (std::size_t visited = 0U; current && visited < limit; ++visited) {
         CheckStatementCancellation();
         const auto next = cursor.Next(*current);
@@ -530,7 +571,7 @@ ChunkAreaPage ChunkStore::VisitChunkArea(
                     .vars = with_vars ? own->vars : ChunkVars{}, .commit_time_ms = own->commit_time_ms,
                     .chunk_columns = own->chunk_columns});
             }
-        } else if (!index || index->IsPopulationCandidate(*current)) {
+        } else if (AreaChunkMayBePopulated(index.get(), *current, snapshot)) {
             ChunkRangeEntry candidate; candidate.coord = *current;
             if (ReadPopulatedChunkStateNoCache(*current, &candidate, with_vars, snapshot))
                 entry.emplace(std::move(candidate));
@@ -558,12 +599,11 @@ std::vector<ChunkRangeEntry> ChunkStore::ReadChunkAreaEntriesImpl(
     const auto max_entries = query_limits_.max_area_response_bytes / ChunkRangeEntryCostBytes();
     std::vector<ChunkRangeEntry> entries;
     std::size_t variable_bytes = 0U;
-    const auto index = snapshot == nullptr ? CoordinateIndexForScan() : nullptr;
+    const auto index = CoordinateIndexForArea(snapshot);
     for (auto current = std::optional{cursor.First()}; current; current = cursor.Next(*current)) {
         CheckStatementCancellation();
-        if (!index || index->IsPopulationCandidate(*current))
-            AppendPopulatedChunkRangeEntry(*current, max_entries, "GET AREA", with_vars,
-                &variable_bytes, &entries, snapshot, txn_read);
+        AppendPopulatedChunkRangeEntry(index.get(), *current, max_entries, "GET AREA", with_vars,
+            &variable_bytes, &entries, snapshot, txn_read);
     }
     return entries;
 }

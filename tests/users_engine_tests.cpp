@@ -4,6 +4,10 @@
 #include <algorithm>
 #include <cassert>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <future>
 #include <barrier>
 #include <thread>
 #include <cstdio>
@@ -75,7 +79,7 @@ struct Server {
     std::shared_ptr<chunkdb::UserRegistry> users;
     std::unique_ptr<CommandEngine> engine;
 
-    explicit Server(bool require_auth = true, bool require_channel_binding = false) {
+    explicit Server(bool require_auth = true, bool require_channel_binding = false, std::filesystem::path backup_dir = {}) {
         chunkdb::CatalogConfig config;
         config.data_dir = dir.path();
         catalog = std::make_shared<chunkdb::TableCatalog>(config);
@@ -91,6 +95,7 @@ struct Server {
         engine = std::make_unique<CommandEngine>(
             chunkdb::EngineConfig{
                 .require_auth = require_auth,
+                .backup_dir = std::move(backup_dir),
                 .users = users,
                 .max_auth_failures = 5,
                 .require_channel_binding = require_channel_binding,
@@ -288,9 +293,9 @@ void TestRights() {
     ExpectReply(server.Run(bot, "FLUSH WAL"), "+OK\r\n");
     ExpectError(server.Run(bot, "ALTER TABLE world ADD COLUMN extra u8 NULL"), "PERMISSION_DENIED ADMIN on world");
     ExpectError(server.Run(bot, "DROP TABLE world"), "PERMISSION_DENIED ADMIN on world");
-    ExpectError(server.Run(bot, "CREATE TABLE mine (bits bits(4)) CHUNK 4 x 4"), "PERMISSION_DENIED ADMIN on *");
-    ExpectError(server.Run(bot, "SHOW METRICS"), "PERMISSION_DENIED ADMIN on *");
-    ExpectError(server.Run(bot, "SHOW STATUS"), "PERMISSION_DENIED ADMIN on *");
+    ExpectError(server.Run(bot, "CREATE TABLE mine (bits bits(4)) CHUNK 4 x 4"), "PERMISSION_DENIED ADMIN on mine");
+    ExpectError(server.Run(bot, "SHOW METRICS"), "PERMISSION_DENIED MONITOR or ADMIN on *");
+    ExpectError(server.Run(bot, "SHOW STATUS"), "PERMISSION_DENIED MONITOR or ADMIN on *");
     ExpectError(server.Run(bot, "ENABLE FEATURE 'feed_slots'"), "PERMISSION_DENIED ADMIN on *");
     ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM other"), "NO_TABLE");
 
@@ -328,6 +333,286 @@ void TestRights() {
     assert(bot.close_after_reply);
     SessionState gone;
     ExpectError(server.Login(gone, "bot", "new"), "AUTH_FAILED");
+}
+
+// MONITOR, BACKUP and REPLICATION: server rights granted ON *, apart from
+// table rights and MANAGES USERS.
+void TestServerRights() {
+    chunkdb::test::ScopedTempDir backups{"chunkdb-users-backups"};
+    Server server(true, false, backups.path());
+    auto admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE TABLE world (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE SLOT 'consumer' ON world"), "+OK\r\n");
+    for (const std::string name : {"mon", "bk", "rep"})
+        ExpectReply(server.Run(admin, "CREATE USER " + name + " VERIFIER $1", {VerifierText("pw")}), "+OK\r\n");
+    auto mon = server.LoggedIn("mon", "pw");
+    auto bk = server.LoggedIn("bk", "pw");
+    auto rep = server.LoggedIn("rep", "pw");
+    for (auto* session : {&mon, &bk, &rep}) {
+        ExpectError(server.Run(*session, "SHOW METRICS"), "PERMISSION_DENIED MONITOR or ADMIN on *");
+        ExpectError(server.Run(*session, "SHOW STATUS"), "PERMISSION_DENIED MONITOR or ADMIN on *");
+        ExpectError(server.Run(*session, "BACKUP TO 'b0'"), "PERMISSION_DENIED BACKUP or MANAGES USERS");
+    }
+    ExpectError(server.Run(admin, "GRANT MONITOR ON world TO mon"), "SYNTAX");
+    ExpectReply(server.Run(admin, "GRANT MONITOR ON * TO mon"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT BACKUP ON * TO bk"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "MIGRATE 'replication' GRANT REPLICATION ON * TO rep"), "+applied\r\n");
+
+    // MONITOR: status statements over every table, without data or changes.
+    assert(server.Run(mon, "SHOW METRICS").rfind("-ERR", 0) != 0);
+    assert(server.Run(mon, "SHOW STATUS").starts_with("%7\r\n"));
+    assert(server.Run(mon, "SHOW TABLE STATS world").starts_with("%11\r\n"));
+    ExpectError(server.Run(mon, "SHOW TABLE STATS absent"), "NO_TABLE");
+    const auto slots = server.Run(mon, "SHOW SLOTS");
+    assert(slots.starts_with("*1\r\n") && Contains(slots, "consumer"));
+    assert(server.Run(mon, "SHOW SLOTS ON world") == slots);
+    ExpectError(server.Run(mon, "GET BLOCK 0 0 FROM world"), "NO_TABLE");
+    ExpectError(server.Run(mon, "SET BLOCK 0 0 IN world bits = b'1010'"), "NO_TABLE");
+    ExpectReply(server.Run(mon, "SHOW TABLES"), "*0\r\n");
+    ExpectError(server.Run(mon, "CREATE TABLE mine (bits bits(4)) CHUNK 4 x 4"), "PERMISSION_DENIED ADMIN on mine");
+    ExpectError(server.Run(mon, "RELOAD TLS"), "PERMISSION_DENIED ADMIN on *");
+    ExpectError(server.Run(mon, "SHOW USERS"), "PERMISSION_DENIED MANAGES USERS");
+    // MONITOR lists every connection and controls only its own.
+    auto callbacks = std::make_shared<chunkdb::SessionControlCallbacks>();
+    chunkdb::SessionControlAccess seen;
+    callbacks->enumerate = [&](const auto& access, const auto&) { seen = access; };
+    callbacks->cancel = [&](const auto& access, std::uint64_t) { seen = access; return false; };
+    mon.connection_controls = callbacks;
+    bk.connection_controls = callbacks;
+    admin.connection_controls = callbacks;
+    ExpectReply(server.Run(mon, "SHOW CONNECTIONS"), "*0\r\n");
+    assert(seen.list_all && !seen.admin_all);
+    ExpectReply(server.Run(mon, "CANCEL 71"), "%1\r\n$9\r\ncancelled\r\n#f\r\n");
+    assert(seen.list_all && !seen.admin_all);
+    ExpectReply(server.Run(bk, "SHOW CONNECTIONS"), "*0\r\n");
+    assert(!seen.list_all && !seen.admin_all);
+    ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), "*0\r\n");
+    assert(seen.list_all && seen.admin_all);
+
+    // BACKUP: BACKUP TO and RESTORE TABLE without MANAGES USERS.
+    const auto backup = server.Run(bk, "BACKUP TO 'b1'");
+    assert(backup.starts_with("%4\r\n") && Contains(backup, "cuts"));
+    // RESTORE TABLE needs ADMIN on the new name too, as CREATE TABLE does.
+    ExpectError(server.Run(bk, "RESTORE TABLE world FROM 'b1' AS world_copy"), "PERMISSION_DENIED ADMIN on world_copy");
+    ExpectReply(server.Run(admin, "GRANT READ ON world_copy TO bk"), "+OK\r\n");
+    ExpectError(server.Run(bk, "RESTORE TABLE world FROM 'b1' AS world_copy"), "PERMISSION_DENIED ADMIN on world_copy");
+    ExpectReply(server.Run(admin, "GRANT ADMIN ON bk_* TO bk"), "+OK\r\n");
+    assert(server.Run(bk, "RESTORE TABLE world FROM 'b1' AS bk_world").starts_with("%6\r\n"));
+    ExpectReply(server.Run(bk, "GET BLOCK 0 0 FROM bk_world"), "_\r\n");
+    ExpectError(server.Run(bk, "GET BLOCK 0 0 FROM world"), "NO_TABLE");
+    ExpectError(server.Run(admin, "GET BLOCK 0 0 FROM world_copy"), "NO_TABLE");
+    // A user change once RESTORE TABLE has read the user: the checks keep
+    // reading that user, not one read again and the first freed.
+    struct RevokeBackup final : chunkdb::CommandEngineTestHook {
+        chunkdb::UserRegistry* users = nullptr;
+        bool revoked = false;
+        void Run(Point point, std::string_view table) override {
+            if (point != Point::kAfterRestoreUserRead || table != "bk_again" || revoked) return;
+            users->Revoke("bk", "*", std::nullopt, static_cast<std::uint8_t>(chunkdb::ServerRight::kBackup));
+            revoked = true;
+        }
+    } revoke_backup;
+    revoke_backup.users = server.users.get();
+    server.engine->SetHookForTests(&revoke_backup);
+    assert(server.Run(bk, "RESTORE TABLE world FROM 'b1' AS bk_again").starts_with("%6\r\n"));
+    server.engine->SetHookForTests(nullptr);
+    assert(revoke_backup.revoked);
+    ExpectError(server.Run(bk, "RESTORE TABLE world FROM 'b1' AS bk_third"), "PERMISSION_DENIED BACKUP, MANAGES USERS or ADMIN on *");
+    ExpectReply(server.Run(admin, "GRANT BACKUP ON * TO bk"), "+OK\r\n");
+    ExpectError(server.Run(bk, "SHOW METRICS"), "PERMISSION_DENIED");
+    ExpectError(server.Run(bk, "CREATE USER eve VERIFIER $1", {VerifierText("x")}), "PERMISSION_DENIED MANAGES USERS");
+    ExpectError(server.Run(mon, "RESTORE TABLE world FROM 'b1' AS world_other"),
+                "PERMISSION_DENIED BACKUP, MANAGES USERS or ADMIN on *");
+
+    // REPLICATION is kept and shown; no statement needs it yet.
+    ExpectError(server.Run(rep, "SHOW METRICS"), "PERMISSION_DENIED");
+    ExpectError(server.Run(rep, "BACKUP TO 'b2'"), "PERMISSION_DENIED");
+    ExpectError(server.Run(rep, "GET BLOCK 0 0 FROM world"), "NO_TABLE");
+    const auto users = server.Run(admin, "SHOW USERS");
+    assert(Contains(users, "$13\r\nserver_rights\r\n*1\r\n$7\r\nMONITOR\r\n"));
+    assert(Contains(users, "$13\r\nserver_rights\r\n*1\r\n$6\r\nBACKUP\r\n"));
+    assert(Contains(users, "$13\r\nserver_rights\r\n*1\r\n$11\r\nREPLICATION\r\n"));
+    assert(Contains(users, "$13\r\nserver_rights\r\n*0\r\n"));
+
+    // The rights are in the file and change sessions already logged in.
+    const auto saved = chunkdb::ReadUsersFile(server.dir.path());
+    assert(saved && saved->users.at("mon").server_rights == static_cast<std::uint8_t>(chunkdb::ServerRight::kMonitor));
+    assert(saved->users.at("rep").server_rights == static_cast<std::uint8_t>(chunkdb::ServerRight::kReplication));
+    ExpectReply(server.Run(admin, "REVOKE MONITOR ON * FROM mon"), "+OK\r\n");
+    ExpectError(server.Run(mon, "SHOW METRICS"), "PERMISSION_DENIED MONITOR or ADMIN on *");
+    ExpectError(server.Run(mon, "SHOW TABLE STATS world"), "NO_TABLE");
+    ExpectReply(server.Run(mon, "SHOW SLOTS"), "*0\r\n");
+    assert(chunkdb::ReadUsersFile(server.dir.path())->users.at("mon").server_rights == 0U);
+}
+
+// GRANT ... ON prefix*: every table whose name starts with the prefix, also
+// one not yet created, and CREATE TABLE with ADMIN on it.
+void TestPrefixGrants() {
+    Server server;
+    auto admin = server.LoggedIn("admin", "secret");
+    const auto table = [](const std::string& name) { return "CREATE TABLE " + name + " (bits bits(4)) CHUNK 4 x 4"; };
+    const auto bulk = [](const std::string& text) { return "$" + std::to_string(text.size()) + "\r\n" + text + "\r\n"; };
+    ExpectReply(server.Run(admin, "CREATE USER t1 VERIFIER $1", {VerifierText("pw")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, table("tenant2_world")), "+OK\r\n");
+    auto t1 = server.LoggedIn("t1", "pw");
+    ExpectError(server.Run(t1, table("tenant1_world")), "PERMISSION_DENIED ADMIN on tenant1_world");
+    ExpectReply(server.Run(admin, "GRANT ADMIN ON tenant1_* TO t1"), "+OK\r\n");
+
+    // A name longer than the prefix, the name equal to it, the longest name.
+    const std::string longest = "tenant1_" + std::string(chunkdb::kMaxTableNameLength - 8U, 'z');
+    for (const auto& name : {std::string("tenant1_world"), std::string("tenant1_"), longest})
+        ExpectReply(server.Run(t1, table(name)), "+OK\r\n");
+    // Shorter than the prefix, another prefix, the prefix inside a name; an
+    // existing table without a right answers as an absent one would.
+    for (const auto& name : {std::string("tenant1"), std::string("tenant2_world"), std::string("xtenant1_world")})
+        ExpectError(server.Run(t1, table(name)), "PERMISSION_DENIED ADMIN on " + name);
+    ExpectError(server.Run(t1, "GET BLOCK 0 0 FROM tenant2_world"), "NO_TABLE");
+    assert(server.Run(t1, "SET BLOCK 0 0 IN tenant1_world bits = b'1010'").front() == ':');
+    ExpectReply(server.Run(t1, "FLUSH WAL"), "+OK\r\n");
+    ExpectReply(server.Run(t1, "SHOW TABLES"), "*3\r\n" + bulk("tenant1_") + bulk("tenant1_world") + bulk(longest));
+    ExpectReply(server.Run(t1, "CREATE SLOT 's' ON tenant1_world"), "+OK\r\n");
+    ExpectReply(server.Run(t1, "MIGRATE 'tenant_logs' " + table("tenant1_logs")), "+applied\r\n");
+    ExpectError(server.Run(t1, "MIGRATE 'other_logs' " + table("tenant2_logs")), "PERMISSION_DENIED ADMIN on tenant2_logs");
+    assert(Contains(server.Run(t1, "SHOW MIGRATIONS"), "tenant_logs"));
+
+    // Dropping a table keeps the prefix grant, as it keeps a grant on *.
+    ExpectReply(server.Run(t1, "DROP TABLE tenant1_world"), "+OK\r\n");
+    ExpectReply(server.Run(t1, table("tenant1_world")), "+OK\r\n");
+
+    // An exact grant and a prefix grant give the higher of the two.
+    ExpectReply(server.Run(admin, "REVOKE WRITE ON tenant1_* FROM t1"), "+OK\r\n");
+    ExpectError(server.Run(t1, "SET BLOCK 0 0 IN tenant1_world bits = b'1010'"), "PERMISSION_DENIED WRITE on tenant1_world");
+    ExpectError(server.Run(t1, table("tenant1_more")), "PERMISSION_DENIED ADMIN on tenant1_more");
+    ExpectReply(server.Run(admin, "GRANT WRITE ON tenant1_world TO t1"), "+OK\r\n");
+    assert(server.Run(t1, "SET BLOCK 0 0 IN tenant1_world bits = b'1010'").front() == ':');
+
+    ExpectError(server.Run(admin, "GRANT READ ON _t* TO t1"), "INVALID_ARGUMENT invalid table prefix '_t*'");
+    ExpectError(server.Run(admin, "GRANT READ ON " + std::string(65, 'a') + "* TO t1"), "INVALID_ARGUMENT invalid table prefix");
+    ExpectReply(server.Run(admin, "GRANT READ ON " + std::string(64, 'a') + "* TO t1"), "+OK\r\n");
+    ExpectError(server.Run(admin, "GRANT READ ON tenant1_ * TO t1"), "SYNTAX");
+    const auto users = server.Run(admin, "SHOW USERS");
+    assert(Contains(users, bulk("tenant1_*") + bulk("READ")) && Contains(users, bulk("tenant1_world") + bulk("WRITE")));
+    const auto saved = chunkdb::ReadUsersFile(server.dir.path());
+    assert(saved && saved->users.at("t1").prefix_grants.at("tenant1_") == chunkdb::Right::kRead);
+    assert(saved->users.at("t1").grants.at("tenant1_world") == chunkdb::Right::kWrite);
+
+    // A watch the prefix allows ends once the prefix grant is gone.
+    auto watcher = server.LoggedIn("t1", "pw");
+    assert(server.Run(watcher, "WATCH tenant1_").starts_with("%2\r\n") && watcher.watch_right);
+    assert(watcher.watch_right->Check() == chunkdb::ReadRightCheck::State::kHeld);
+    ExpectReply(server.Run(admin, "REVOKE READ ON tenant1_* FROM t1"), "+OK\r\n");
+    assert(watcher.watch_right->Check() == chunkdb::ReadRightCheck::State::kNoRight);
+    ExpectError(server.Run(t1, "GET BLOCK 0 0 FROM tenant1_"), "NO_TABLE");
+    assert(server.Run(t1, "GET BLOCK 1 1 FROM tenant1_world").rfind("-ERR", 0) != 0);
+}
+
+// ALTER TABLE ... RENAME TO needs ADMIN on both names and moves the grants
+// with the table: each user keeps the higher right where both names had one,
+// and the old name keeps none.
+void TestRenameTableGrants() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE TABLE logs (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE TABLE other (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    for (const auto* user : {"bot", "carol", "dave"})
+        ExpectReply(server.Run(admin, std::string("CREATE USER ") + user + " VERIFIER $1", Parameters{VerifierText("pw")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT WRITE ON logs TO bot"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT ADMIN ON logs TO carol"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON archive TO carol"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON archive TO dave"), "+OK\r\n");
+    SessionState bot = server.LoggedIn("bot", "pw");
+    SessionState carol = server.LoggedIn("carol", "pw");
+    ExpectError(server.Run(bot, "ALTER TABLE logs RENAME TO archive"), "PERMISSION_DENIED ADMIN on logs");
+    ExpectError(server.Run(carol, "ALTER TABLE logs RENAME TO archive"), "PERMISSION_DENIED ADMIN on archive");
+    ExpectError(server.Run(admin, "ALTER TABLE logs RENAME TO other"), "TABLE_EXISTS");
+    ExpectReply(server.Run(admin, "ALTER TABLE logs RENAME TO archive"), "+OK\r\n");
+    const auto grants = [&](const std::string& user) { return server.users->Find(user)->grants; };
+    assert(!grants("bot").contains("logs") && grants("bot").at("archive") == chunkdb::Right::kWrite);
+    assert(!grants("carol").contains("logs") && grants("carol").at("archive") == chunkdb::Right::kAdmin);
+    assert(grants("dave").at("archive") == chunkdb::Right::kRead);
+    // A session already logged in follows the moved grants.
+    assert(server.Run(bot, "SET BLOCK 0 0 IN archive bits = b'1010'").rfind(":", 0) == 0);
+    ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM logs"), "NO_TABLE");
+    ExpectError(server.Run(carol, "ALTER TABLE archive RENAME TO logs"), "PERMISSION_DENIED ADMIN on logs");
+}
+
+// Runs `at_forget` on the second users change of this thread's rename: the
+// removal of the old name's grants, after they were copied to the new name.
+struct PauseRenameGrants final : chunkdb::MigrationTestHook {
+    std::atomic<int> calls{0};
+    std::function<void()> at_forget;
+    void Run(Point point, std::string_view) override {
+        if (point == Point::kBeforeUserUpdate && ++calls == 2) at_forget();
+    }
+};
+
+// RENAME TO takes back grants whose copy has an unknown outcome, leaves no
+// grants on the old name of a table it renamed but could not open, and a
+// REVOKE waits for the whole rename.
+void TestRenameGrantFailures() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    SessionState other_admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE TABLE logs (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("pw")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT WRITE ON logs TO bot"), "+OK\r\n");
+    const auto grants = [&] { return server.users->Find("bot")->grants; };
+    {
+        chunkdb::txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
+        ExpectError(server.Run(admin, "ALTER TABLE logs RENAME TO archive"), "OUTCOME_UNKNOWN");
+    }
+    assert(server.catalog->Find("logs") != nullptr && server.catalog->Find("archive") == nullptr);
+    assert(grants().at("logs") == chunkdb::Right::kWrite && !grants().contains("archive"));
+    {
+        chunkdb::txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_RENAME_TABLE_OPEN_FAIL_ONCE", "1");
+        ExpectError(server.Run(admin, "ALTER TABLE logs RENAME TO archive"), "INTERNAL");
+    }
+    assert(!grants().contains("logs") && grants().at("archive") == chunkdb::Right::kWrite);
+    ExpectReply(server.Run(admin, "RECOVER TABLE archive"), "+OK\r\n");
+
+    PauseRenameGrants hook;
+    bool revoked_inside = false;
+    std::future<std::string> revoke;
+    hook.at_forget = [&] {
+        revoke = std::async(std::launch::async, [&] { return server.Run(other_admin, "REVOKE WRITE ON archive FROM bot"); });
+        revoked_inside = revoke.wait_for(std::chrono::milliseconds(300)) == std::future_status::ready;
+    };
+    server.users->SetMigrationTestHook(&hook);
+    ExpectReply(server.Run(admin, "ALTER TABLE archive RENAME TO store"), "+OK\r\n");
+    ExpectReply(revoke.get(), "+OK\r\n");
+    server.users->SetMigrationTestHook(nullptr);
+    assert(!revoked_inside);
+    // The REVOKE came after the rename, when the old name had no grants.
+    assert(grants().size() == 1U && grants().at("store") == chunkdb::Right::kWrite);
+}
+
+// A rename moves only the grants on the table's own name: prefix grants
+// neither follow it nor are lost, and the new name needs ADMIN through its
+// name, a matching prefix or `*`.
+void TestRenamePrefixGrants() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE USER t1 VERIFIER $1", Parameters{VerifierText("pw")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT ADMIN ON tenant1_* TO t1"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON other_* TO t1"), "+OK\r\n");
+    SessionState t1 = server.LoggedIn("t1", "pw");
+    ExpectReply(server.Run(t1, "CREATE TABLE tenant1_logs (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT WRITE ON tenant1_logs TO t1"), "+OK\r\n");
+    ExpectError(server.Run(t1, "ALTER TABLE tenant1_logs RENAME TO other_logs"), "PERMISSION_DENIED ADMIN on other_logs");
+    ExpectReply(server.Run(t1, "ALTER TABLE tenant1_logs RENAME TO tenant1_archive"), "+OK\r\n");
+    const auto prefixes = [&] { return server.users->Find("t1")->prefix_grants; };
+    const auto grants = [&] { return server.users->Find("t1")->grants; };
+    const std::map<std::string, chunkdb::Right> kept{{"other_", chunkdb::Right::kRead}, {"tenant1_", chunkdb::Right::kAdmin}};
+    assert(prefixes() == kept);
+    assert(grants().size() == 1U && grants().at("tenant1_archive") == chunkdb::Right::kWrite);
+    // Out of the prefix: the exact grant moves, the prefix grant stays behind.
+    ExpectReply(server.Run(admin, "ALTER TABLE tenant1_archive RENAME TO other_archive"), "+OK\r\n");
+    assert(prefixes() == kept);
+    assert(grants().size() == 1U && grants().at("other_archive") == chunkdb::Right::kWrite);
+    ExpectError(server.Run(t1, "ALTER TABLE other_archive RENAME TO tenant1_back"), "PERMISSION_DENIED ADMIN on other_archive");
+    assert(server.Run(t1, "SET BLOCK 0 0 IN other_archive bits = b'1010'").rfind(":", 0) == 0);
+    // The old name is free and covered by the prefix grant alone.
+    ExpectReply(server.Run(t1, "CREATE TABLE tenant1_archive (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
 }
 
 void TestRecreatedUser() {
@@ -693,6 +978,119 @@ void TestCredentialsChangedDuringLogin() {
     (void)server.LoggedIn("bot", "hunter2");
 }
 
+// The verifier text of `password` with `salt`.
+std::string SaltedVerifier(const std::string& password, const std::vector<std::uint8_t>& salt,
+    std::uint32_t iterations = chunkdb::scram::kMinIterations) {
+    return chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier(password, salt, iterations));
+}
+
+// ALTER USER ... ADD VERIFIER and DROP OLD VERIFIER rotate a password with
+// both passwords logging in between: at most two, with one salt and
+// iteration count, kept across a restart; a new password replaces both.
+void TestTwoVerifiers() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    const std::vector<std::uint8_t> salt(16U, 9U);
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{SaltedVerifier("old", salt)}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("new", salt)}), "+OK\r\n");
+    SessionState bot_old = server.LoggedIn("bot", "old");
+    (void)server.LoggedIn("bot", "new");
+    SessionState wrong;
+    ExpectReply(server.Login(wrong, "bot", "other"), kWrongLogin);
+
+    // A verifier the user has changes nothing; a third one, or one with
+    // another salt or iteration count, is refused.
+    ExpectReply(server.Run(admin, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("new", salt)}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("old", salt)}), "+OK\r\n");
+    ExpectError(server.Run(admin, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("third", salt)}),
+        "INVALID_ARGUMENT user bot already has two verifiers; DROP OLD VERIFIER first");
+    const auto both = server.users->Find("bot");
+    assert(both && both->added_verifier.has_value());
+    // SHOW USERS tells a user with two verifiers from one with one.
+    const std::string users = server.Run(admin, "SHOW USERS");
+    assert(Contains(users, "$5\r\nadmin\r\n$13\r\nmanages_users\r\n#t\r\n$24\r\nrequires_channel_binding\r\n#f\r\n"
+                           "$9\r\nverifiers\r\n:1\r\n"));
+    assert(Contains(users, "$3\r\nbot\r\n$13\r\nmanages_users\r\n#f\r\n$24\r\nrequires_channel_binding\r\n#f\r\n"
+                           "$9\r\nverifiers\r\n:2\r\n"));
+    {
+        const chunkdb::UserRegistry restarted(server.dir.path(), std::nullopt, std::array<std::uint8_t, 32>{7}, true);
+        assert(restarted.Find("bot") == both);
+    }
+
+    ExpectReply(server.Run(admin, "ALTER USER bot DROP OLD VERIFIER"), "+OK\r\n");
+    assert(Contains(server.Run(admin, "SHOW USERS"), "$3\r\nbot\r\n$13\r\nmanages_users\r\n#f\r\n$24\r\nrequires_channel_binding\r\n#f\r\n"
+                                                     "$9\r\nverifiers\r\n:1\r\n"));
+    SessionState dropped;
+    ExpectReply(server.Login(dropped, "bot", "old"), kWrongLogin);
+    (void)server.LoggedIn("bot", "new");
+    // A connection logged in with the dropped password stays open.
+    ExpectReply(server.Run(bot_old, "PING"), "+PONG\r\n");
+    ExpectReply(server.Run(admin, "ALTER USER bot DROP OLD VERIFIER"), "+OK\r\n");
+    (void)server.LoggedIn("bot", "new");
+    ExpectError(server.Run(admin, "ALTER USER bot ADD VERIFIER $1",
+                    Parameters{SaltedVerifier("next", std::vector<std::uint8_t>(16U, 10U))}),
+        "INVALID_ARGUMENT an added verifier must use the salt and iteration count of the user's verifier");
+    ExpectError(server.Run(admin, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("next", salt, 8192U)}),
+        "INVALID_ARGUMENT an added verifier must use the salt and iteration count");
+    ExpectError(server.Run(admin, "ALTER USER ghost ADD VERIFIER $1", Parameters{SaltedVerifier("next", salt)}),
+        "INVALID_ARGUMENT user ghost does not exist");
+    ExpectError(server.Run(admin, "ALTER USER ghost DROP OLD VERIFIER"), "INVALID_ARGUMENT user ghost does not exist");
+
+    // A user rotates its own password without MANAGES USERS, but not another's.
+    SessionState bot = server.LoggedIn("bot", "new");
+    ExpectReply(server.Run(bot, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("own", salt)}), "+OK\r\n");
+    (void)server.LoggedIn("bot", "own");
+    ExpectError(server.Run(bot, "ALTER USER admin ADD VERIFIER $1", Parameters{SaltedVerifier("own", salt)}),
+        "PERMISSION_DENIED MANAGES USERS");
+    ExpectError(server.Run(bot, "ALTER USER admin DROP OLD VERIFIER"), "PERMISSION_DENIED MANAGES USERS");
+    ExpectReply(server.Run(bot, "ALTER USER bot DROP OLD VERIFIER"), "+OK\r\n");
+    SessionState replaced;
+    ExpectReply(server.Login(replaced, "bot", "new"), kWrongLogin);
+    (void)server.LoggedIn("bot", "own");
+
+    // A new password, also the user's own, leaves one verifier.
+    ExpectReply(server.Run(admin, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("second", salt)}), "+OK\r\n");
+    ExpectReply(server.Run(bot, "ALTER USER bot VERIFIER $1", Parameters{VerifierText("reset")}), "+OK\r\n");
+    assert(!server.users->Find("bot")->added_verifier.has_value());
+    SessionState second;
+    ExpectReply(server.Login(second, "bot", "second"), kWrongLogin);
+    (void)server.LoggedIn("bot", "reset");
+}
+
+// A login between HELLO and AUTH while the verifiers change: one started
+// before ADD VERIFIER finishes, one whose verifier DROP OLD VERIFIER removes
+// fails like a wrong password, and one with the kept verifier is stale.
+void TestTwoVerifiersDuringLogin() {
+    Server server;
+    const std::vector<std::uint8_t> salt(16U, 9U);
+    const auto verifier = [&salt](const std::string& password) {
+        return chunkdb::scram::MakeVerifier(password, salt, chunkdb::scram::kMinIterations);
+    };
+    server.users->Create("bot", verifier("old"), false);
+    // HELLO, then `change`, then AUTH: the reply and the failures counted.
+    const auto login_around = [&server](const std::string& password, const auto& change) {
+        SessionState session;
+        const auto login = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce());
+        const std::string first = server.Run(session, "HELLO 3 USER bot $1", Parameters{login.first});
+        assert(first.rfind("+SCRAM ", 0) == 0);
+        change();
+        const auto final_message = chunkdb::scram::FinishClientLogin(login, password, first.substr(7, first.size() - 9));
+        const std::string reply = server.Run(session, "AUTH $1", Parameters{final_message.message});
+        assert(session.greeted == (reply.rfind("%14\r\n", 0) == 0));
+        return std::make_pair(reply, session.failed_auth_attempts);
+    };
+    const auto added = login_around("old", [&] { server.users->AddVerifier("bot", verifier("new")); });
+    assert(added.first.rfind("%14\r\n", 0) == 0 && added.second == 0U);
+    const auto removed = login_around("old", [&] { server.users->DropOldVerifier("bot"); });
+    ExpectReply(removed.first, kWrongLogin);
+    assert(removed.second == 1U);
+    server.users->AddVerifier("bot", verifier("next"));
+    const auto kept = login_around("next", [&] { server.users->DropOldVerifier("bot"); });
+    ExpectError(kept.first, "AUTH_FAILED reason=stale_login");
+    assert(kept.second == 0U);
+    (void)server.LoggedIn("bot", "next");
+}
+
 // --auth none: no users, every right.
 void TestWithoutUsers() {
     Server server(false);
@@ -873,9 +1271,12 @@ void TestSessionControls() {
     callbacks->enumerate = [&](const auto& access, const auto& visitor) {
         seen = access;
         visitor(chunkdb::ConnectionInfo{.id = UINT64_MAX, .user = "bot", .peer = "127.0.0.1", .state = "idle", .statement = ""});
-        visitor(chunkdb::ConnectionInfo{.id = 1U, .user = "", .peer = "local", .state = "running", .statement = "PING"});
+        visitor(chunkdb::ConnectionInfo{.id = 1U, .user = "", .peer = "local", .state = "running", .statement = "RESTORE",
+            .progress = chunkdb::StatementProgress{.files_done = 1U, .files_total = 3U, .bytes_done = 10U, .bytes_total = UINT64_MAX}});
     };
-    const std::string expected = "*2\r\n%5\r\n$2\r\nid\r\n(18446744073709551615\r\n$4\r\nuser\r\n$3\r\nbot\r\n$4\r\npeer\r\n$9\r\n127.0.0.1\r\n$5\r\nstate\r\n$4\r\nidle\r\n$9\r\nstatement\r\n_\r\n%5\r\n$2\r\nid\r\n:1\r\n$4\r\nuser\r\n_\r\n$4\r\npeer\r\n$5\r\nlocal\r\n$5\r\nstate\r\n$7\r\nrunning\r\n$9\r\nstatement\r\n$4\r\nPING\r\n";
+    const std::string expected = "*2\r\n%6\r\n$2\r\nid\r\n(18446744073709551615\r\n$4\r\nuser\r\n$3\r\nbot\r\n$4\r\npeer\r\n$9\r\n127.0.0.1\r\n$5\r\nstate\r\n$4\r\nidle\r\n$9\r\nstatement\r\n_\r\n$8\r\nprogress\r\n_\r\n"
+        "%6\r\n$2\r\nid\r\n:1\r\n$4\r\nuser\r\n_\r\n$4\r\npeer\r\n$5\r\nlocal\r\n$5\r\nstate\r\n$7\r\nrunning\r\n$9\r\nstatement\r\n$7\r\nRESTORE\r\n"
+        "$8\r\nprogress\r\n%4\r\n$10\r\nfiles_done\r\n:1\r\n$11\r\nfiles_total\r\n:3\r\n$10\r\nbytes_done\r\n:10\r\n$11\r\nbytes_total\r\n(18446744073709551615\r\n";
     callbacks->max_response_bytes = expected.size();
     ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), expected);
     --callbacks->max_response_bytes;
@@ -932,6 +1333,11 @@ int main(int argc, char** argv) {
     TestStaleAuthenticationProofs();
     TestUserLimitStatementsAndAdmissionHook();
     TestRights();
+    TestServerRights();
+    TestPrefixGrants();
+    TestRenameTableGrants();
+    TestRenameGrantFailures();
+    TestRenamePrefixGrants();
     TestRecreatedUser();
     TestConditionalUsers();
     TestConcurrentConditionalUsers();
@@ -939,6 +1345,8 @@ int main(int argc, char** argv) {
     TestRequiredChannelBinding();
     TestStaleLoginAfterBindingRequirementChange();
     TestCredentialsChangedDuringLogin();
+    TestTwoVerifiers();
+    TestTwoVerifiersDuringLogin();
     TestWithoutUsers();
     TestReadOnly();
     return 0;

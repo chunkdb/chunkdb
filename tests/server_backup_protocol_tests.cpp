@@ -50,6 +50,26 @@ class AbortNotice : public CommandEngineTestHook {
   private:
     std::mutex mutex_; std::condition_variable cv_; bool aborted_ = false;
 };
+// Holds RESTORE TABLE after each progress report until the test releases it.
+class RestoreProgressPause : public CommandEngineTestHook {
+  public:
+    void Run(Point point, std::string_view) override {
+        if (point != Point::kAfterRestoreProgress) return;
+        std::unique_lock lock(mutex_);
+        const auto report = ++reports_;
+        cv_.notify_all();
+        if (!cv_.wait_for(lock, 10s, [&] { return released_ >= report; }))
+            throw std::runtime_error("restore progress pause was not released");
+    }
+    void Wait(std::uint64_t report) {
+        std::unique_lock lock(mutex_);
+        assert(cv_.wait_for(lock, 10s, [&] { return reports_ >= report; }) && reports_ == report);
+    }
+    void Release(std::uint64_t report) { std::lock_guard lock(mutex_); released_ = report; cv_.notify_all(); }
+  private:
+    std::mutex mutex_; std::condition_variable cv_;
+    std::uint64_t reports_ = 0U, released_ = 0U;
+};
 void Verify(const std::filesystem::path& root) {
     std::ostringstream output;
     const auto counters = VerifyDataDirectory(root, output);
@@ -317,6 +337,60 @@ void RestoreStatement() {
     assert(refused.starts_with("-ERR INVALID_ARGUMENT") && refused.find("read-only") != std::string::npos);
     Verify(std::filesystem::canonical(destinations.path()) / "it's-snap");
 }
+// A running RESTORE TABLE lists the files and bytes it copied in SHOW CONNECTIONS.
+void RestoreProgress() {
+    RestoreProgressPause pause;
+    test::ScopedTempDir destinations("chunkdb-restore-progress-protocol");
+    Harness harness(false, false, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
+    auto admin = harness.Connect();
+    admin->Ok("CREATE TABLE t (n u8) CHUNK 2 x 2");
+    (void)admin->Command("SET BLOCK 0 0 IN t n = 7");
+    (void)admin->Command(Backup("snap"));
+    auto restorer = harness.Connect();
+    // The progress of the one connection running RESTORE.
+    const auto restoring = [&] {
+        const auto listing = admin->Command("SHOW CONNECTIONS");
+        ExpectType(listing, '*');
+        const Reply* found = nullptr;
+        for (const auto& item : listing.items) {
+            if (Field(item, "statement").value != "RESTORE") continue;
+            assert(found == nullptr);
+            found = &item;
+        }
+        assert(found != nullptr && Field(*found, "state").value == "running");
+        return Field(*found, "progress");
+    };
+    harness.engine().SetHookForTests(&pause);
+    restorer->Line("RESTORE TABLE t FROM 'snap' AS t_progress");
+    // The totals come before the first file is copied.
+    pause.Wait(1U);
+    auto progress = restoring();
+    assert(progress.type == '%' && progress.items.size() == 8U);
+    assert(Number(Field(progress, "files_done")) == 0U && Number(Field(progress, "bytes_done")) == 0U);
+    const auto files = Number(Field(progress, "files_total"));
+    const auto bytes = Number(Field(progress, "bytes_total"));
+    assert(files > 0U && bytes > 0U);
+    std::uint64_t copied = 0U;
+    for (std::uint64_t file = 1U; file <= files; ++file) {
+        assert(harness.catalog->Find("t_progress") == nullptr);
+        pause.Release(file);
+        pause.Wait(file + 1U);
+        progress = restoring();
+        assert(Number(Field(progress, "files_done")) == file && Number(Field(progress, "files_total")) == files);
+        const auto done = Number(Field(progress, "bytes_done"));
+        assert(done >= copied && done <= bytes && Number(Field(progress, "bytes_total")) == bytes);
+        copied = done;
+    }
+    assert(copied == bytes);
+    pause.Release(files + 1U);
+    const auto reply = restorer->Read();
+    harness.engine().SetHookForTests(nullptr);
+    assert(reply.type == '%' && Number(Field(reply, "files")) == files && Number(Field(reply, "bytes")) == bytes);
+    assert(harness.catalog->Find("t_progress") != nullptr);
+    // The next statement on the connection reports no progress.
+    assert(restorer->Command("PING").value == "PONG");
+    for (const auto& item : admin->Command("SHOW CONNECTIONS").items) assert(Field(item, "progress").type == '_');
+}
 // SWAP TABLES exchanges the names; open transactions on either end with CONFLICT.
 void SwapStatement() {
     test::ScopedTempDir destinations("chunkdb-swap-tables-protocol");
@@ -400,11 +474,53 @@ void SwapStatement() {
     user.Ok("SWAP TABLES t_restored, t");
     assert(Field(admin->Command("DESCRIBE t"), "epoch").value == live);
 }
+// ALTER TABLE ... RENAME TO keeps the epoch and the slot position under the
+// new name; open transactions end with CONFLICT and the old name is gone.
+void RenameStatement() {
+    test::ScopedTempDir destinations("chunkdb-rename-table-protocol");
+    Harness harness(false, true, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
+    auto admin = harness.Connect();
+    admin->Ok("CREATE TABLE r (n u8) CHUNK 2 x 2");
+    admin->Ok("CREATE SLOT 'consumer' ON r");
+    const auto epoch = StoreIdHex(harness.catalog->Find("r")->store_id());
+    auto watcher = harness.Connect();
+    (void)Start(watcher->Command("WATCH r SLOT 'consumer'"));
+    const auto acked = Number(admin->Command("SET BLOCK 1 1 IN r n = 3"));
+    while (Change(NextChange(*watcher)) < acked) {}
+    watcher->Line("ACK " + std::to_string(acked));
+    Unwatch(*watcher);
+    WaitAck(*admin, "r", "consumer", acked);
+
+    auto txn = harness.Connect();
+    txn->Ok("BEGIN");
+    assert(Number(txn->Command("GET BLOCK 1 1 FROM r").items.at(0)) == 3U);
+    admin->Ok("ALTER TABLE r RENAME TO r_old");
+    Error(txn->Command("SET BLOCK 0 0 IN r n = 9"), "CONFLICT");
+    txn->Ok("ROLLBACK");
+    Error(admin->Command("DESCRIBE r"), "NO_TABLE");
+    assert(Field(admin->Command("DESCRIBE r_old"), "epoch").value == epoch);
+    assert(Number(admin->Command("GET BLOCK 1 1 FROM r_old").items.at(0)) == 3U);
+    // The slot is reached by its new name at its saved position, without resync.
+    assert(Start(watcher->Command("WATCH r_old SLOT 'consumer'")) == std::make_pair(epoch, acked));
+    const auto after = Number(admin->Command("SET BLOCK 1 1 IN r_old n = 4"));
+    assert(Change(NextChange(*watcher)) == after);
+    Unwatch(*watcher);
+
+    Error(admin->Command("ALTER TABLE r_old RENAME TO r_old"), "INVALID_ARGUMENT");
+    Error(admin->Command("ALTER TABLE r RENAME TO r_new"), "NO_TABLE");
+    admin->Ok("CREATE TABLE r (n u8) CHUNK 2 x 2");
+    Error(admin->Command("ALTER TABLE r_old RENAME TO r"), "TABLE_EXISTS");
+    admin->Ok("BEGIN");
+    Error(admin->Command("ALTER TABLE r_old RENAME TO r_new"), "INVALID_ARGUMENT");
+    admin->Ok("ROLLBACK");
+}
 } // namespace
 int main() {
     RestoreStatement();
+    RestoreProgress();
     SwapStatement();
-    std::cout << "restore and swap protocol groups passed\n";
+    RenameStatement();
+    std::cout << "restore, swap and rename protocol groups passed\n";
     for (const bool tls : {false, true}) {
 #ifndef CHUNKDB_WITH_OPENSSL
         if (tls) continue;

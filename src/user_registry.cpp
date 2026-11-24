@@ -41,6 +41,33 @@ void RequireName(const std::string& name) {
     return found->second;
 }
 
+// The user logs in with `verifier` alone.
+void ReplaceVerifiers(User& user, scram::Verifier verifier) {
+    user.verifier = std::move(verifier);
+    user.added_verifier.reset();
+}
+
+// Adds `verifier` as the second verifier of `user`; false, changing nothing,
+// for a verifier the user already has, so a retry succeeds.
+[[nodiscard]] bool AddTo(User& user, const std::string& name, scram::Verifier verifier) {
+    if (HoldsVerifier(user, verifier)) return false;
+    if (user.added_verifier.has_value()) {
+        throw std::invalid_argument("user " + name + " already has two verifiers; DROP OLD VERIFIER first");
+    }
+    RequireAddableVerifier(user.verifier, verifier);
+    user.added_verifier = std::move(verifier);
+    return true;
+}
+
+// Makes the added verifier of `user` its only one; false, changing nothing,
+// for a user with one verifier, so a retry succeeds.
+[[nodiscard]] bool DropOld(User& user) {
+    if (!user.added_verifier.has_value()) return false;
+    user.verifier = std::move(*user.added_verifier);
+    user.added_verifier.reset();
+    return true;
+}
+
 void RequireUserManager(const Users& users) {
     if (std::none_of(users.users.begin(), users.users.end(), [](const auto& entry) { return entry.second.manages_users; })) {
         throw std::invalid_argument("the last user who manages users cannot be dropped or lose that right");
@@ -249,11 +276,8 @@ void UserRegistry::Create(const std::string& name, const std::function<scram::Ve
     });
 }
 
-void UserRegistry::SetVerifier(const std::string& name, scram::Verifier verifier) {
-    Update([&](Users& users) { Existing(users, name).verifier = std::move(verifier); });
-}
-
-bool UserRegistry::SetOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier) {
+template <typename Change>
+bool UserRegistry::UpdateOwn(const std::string& name, std::uint64_t incarnation, Change&& change) {
     bool current = false;
     UpdateIf([&](Users& users) {
         {
@@ -262,10 +286,36 @@ bool UserRegistry::SetOwnVerifier(const std::string& name, std::uint64_t incarna
             const auto found = admissions_->find(name);
             current = found != admissions_->end() && found->second.state->incarnation == incarnation;
         }
-        if (current) Existing(users, name).verifier = std::move(verifier);
-        return current;
+        return current && change(Existing(users, name));
     });
     return current;
+}
+
+void UserRegistry::SetVerifier(const std::string& name, scram::Verifier verifier) {
+    Update([&](Users& users) { ReplaceVerifiers(Existing(users, name), std::move(verifier)); });
+}
+
+bool UserRegistry::SetOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier) {
+    return UpdateOwn(name, incarnation, [&](User& user) {
+        ReplaceVerifiers(user, std::move(verifier));
+        return true;
+    });
+}
+
+void UserRegistry::AddVerifier(const std::string& name, scram::Verifier verifier) {
+    UpdateIf([&](Users& users) { return AddTo(Existing(users, name), name, std::move(verifier)); });
+}
+
+bool UserRegistry::AddOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier) {
+    return UpdateOwn(name, incarnation, [&](User& user) { return AddTo(user, name, std::move(verifier)); });
+}
+
+void UserRegistry::DropOldVerifier(const std::string& name) {
+    UpdateIf([&](Users& users) { return DropOld(Existing(users, name)); });
+}
+
+bool UserRegistry::DropOwnOldVerifier(const std::string& name, std::uint64_t incarnation) {
+    return UpdateOwn(name, incarnation, [](User& user) { return DropOld(user); });
 }
 
 void UserRegistry::SetLimits(const std::string& name, std::optional<std::uint64_t> max_connections,
@@ -309,30 +359,13 @@ void UserRegistry::Drop(const std::string& name, bool if_exists) {
     });
 }
 
-void UserRegistry::Grant(const std::string& name, const std::string& table, Right right) {
+void UserRegistry::Grant(const std::string& name, const std::string& table, std::optional<Right> right, std::uint8_t server_rights) {
     RequireValidGrantTable(table);
-    Update([&](Users& users) {
-        auto& grants = Existing(users, name).grants;
-        const auto found = grants.find(table);
-        if (found == grants.end() || found->second < right) {
-            grants[table] = right;
-        }
-    });
+    Update([&](Users& users) { ApplyGrant(Existing(users, name), table, right, server_rights, false); });
 }
 
-void UserRegistry::Revoke(const std::string& name, const std::string& table, Right right) {
-    Update([&](Users& users) {
-        auto& grants = Existing(users, name).grants;
-        const auto found = grants.find(table);
-        if (found == grants.end() || found->second < right) {
-            return;
-        }
-        if (right == Right::kRead) {
-            grants.erase(found);
-        } else {
-            found->second = static_cast<Right>(static_cast<std::uint8_t>(right) - 1U);
-        }
-    });
+void UserRegistry::Revoke(const std::string& name, const std::string& table, std::optional<Right> right, std::uint8_t server_rights) {
+    Update([&](Users& users) { ApplyGrant(Existing(users, name), table, right, server_rights, true); });
 }
 
 void UserRegistry::ForgetTable(const std::string& table) {
@@ -344,6 +377,35 @@ void UserRegistry::ForgetTable(const std::string& table) {
     });
 }
 
+void UserRegistry::CopyTableGrants(const std::string& from, const std::string& to, TableGrants& previous) {
+    RequireValidGrantTable(to);
+    previous.clear();
+    UpdateIf([&](Users& users) {
+        previous.clear();
+        for (auto& [name, user] : users.users) {
+            const auto granted = user.grants.find(from);
+            if (granted == user.grants.end()) continue;
+            const auto existing = user.grants.find(to);
+            if (existing != user.grants.end() && existing->second >= granted->second) continue;
+            previous.emplace(name, existing != user.grants.end() ? std::optional<Right>(existing->second) : std::nullopt);
+            user.grants[to] = granted->second;
+        }
+        return !previous.empty();
+    });
+}
+
+void UserRegistry::RestoreTableGrants(const std::string& to, const TableGrants& previous) {
+    if (previous.empty()) return;
+    Update([&](Users& users) {
+        for (const auto& [name, right] : previous) {
+            const auto user = users.users.find(name);
+            if (user == users.users.end()) continue;
+            if (right.has_value()) user->second.grants[to] = *right;
+            else user->second.grants.erase(to);
+        }
+    });
+}
+
 ReadRightCheck::State ReadRightCheck::Recheck(std::uint64_t generation) {
     // A change after this load bumps the generation again and is read next time.
     generation_ = generation;
@@ -351,7 +413,7 @@ ReadRightCheck::State ReadRightCheck::Recheck(std::uint64_t generation) {
     const auto rights = users_->Rights();
     const auto found = rights->users.find(user_);
     if (found == rights->users.end() || found->second.incarnation != incarnation_) state_ = State::kNoUser;
-    else if (!RightOn(found->second.grants, table_).has_value()) state_ = State::kNoRight;
+    else if (!RightOn(found->second.grants, found->second.prefix_grants, table_).has_value()) state_ = State::kNoRight;
     else if (every_table_admin_) {
         const auto every = found->second.grants.find(kEveryTable);
         if (every == found->second.grants.end() || every->second < Right::kAdmin) state_ = State::kNoRight;

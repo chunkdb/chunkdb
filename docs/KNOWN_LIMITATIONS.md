@@ -2,9 +2,9 @@
 
 - **One writer:** one process owns a data directory; shared multi-writer use is unsupported.
 - **Local filesystem:** the writer lock relies on `flock`, so keep the data directory on a local filesystem; on network and shared volumes a process on another host does not start beside a writer whose heartbeat is under 5 seconds old by its own clock, but this cannot exclude two hosts that start together and needs distinct host names and agreeing clocks.
-- **One transaction table:** each transaction covers one table and, by default, at most 1024 written chunks and 8192 read chunks; see [Transactions](TRANSACTIONS.md#limits).
+- **One transaction table:** each transaction covers one table and, by default, at most 1024 written chunks and 8192 read chunks, without a read limit for `BEGIN READ ONLY`; see [Transactions](TRANSACTIONS.md#limits).
 - **Bounded transactions:** duration defaults to 5000 ms, with private-write and snapshot-history budgets; see [Transactions](TRANSACTIONS.md#limits).
-- **No global read snapshot:** ordinary area reads and scan pages can observe concurrent changes; use a transaction within one table.
+- **No global read snapshot:** ordinary area reads and scan pages can observe concurrent changes; use a transaction within one table, `BEGIN READ ONLY` for scan pages.
 - **Power loss in relaxed mode:** ordinary acknowledgements can be lost; use FLUSH WAL, a synced mode, or COMMIT; see [Durability](DURABILITY_CONTRACT.md).
 - **Required filesystem operations:** atomic publication and sync must succeed; unsupported operations return errors rather than weakening guarantees.
 - **Damaged logs:** malformed WAL headers or interior frames are refused; only crash-shaped incomplete tails are repaired during writer recovery.
@@ -36,7 +36,7 @@
 
 - **No secondary indexes or lookup by value:** statements address blocks and chunks by coordinates; to find blocks by a value, keep your own index, such as a second table keyed by that value, updated from a change feed slot.
 - **No query planner or joins:** each statement reads or writes one table at the coordinates you name; see [Related data](CQL.md#related-data) for keeping data together, reading tables that share coordinates, and derived tables.
-- **No server-side aggregates:** there is no COUNT, SUM or GROUP BY; compute them in your client from GET AREA or SCAN CHUNKS, or keep running totals updated from a change feed slot.
+- **Aggregates by chunk only:** [AGGREGATE](reference/AGGREGATE.md) groups only BY CHUNK and covers at most `--max-area-chunks` chunks per statement; combine the results of several areas in your client, or keep running totals updated from a change feed slot.
 - **No replication:** durability across machines and distributed transactions are unavailable; keep copies with [Backup and restore](BACKUP.md), or copy changes to another system from a change feed slot.
 
 Recorded measurements are in [Performance](PERFORMANCE.md).

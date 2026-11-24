@@ -299,8 +299,29 @@ void TranslateChunk(
                     next.data() + fixed->values, payload->data() + old->values,
                     BytesForBits(block_count * fixed->width));
                 if (fixed->validity != ChunkLayout::kNoValidity) {
+                    // SET NULL: every present block has a value. A NULL that
+                    // DROP NULL found none of keeps its zero value bits.
                     std::memcpy(
-                        next.data() + fixed->validity, payload->data() + old->validity, BytesForBits(block_count));
+                        next.data() + fixed->validity,
+                        old->validity != ChunkLayout::kNoValidity ? payload->data() + old->validity : presence.data(),
+                        BytesForBits(block_count));
+                }
+            } else if (before.nullable != column.nullable) {
+                // No entry is NULL of a NULL column and the empty value of
+                // another: SET NULL keeps empty values as entries, DROP NULL
+                // drops them.
+                std::vector<bool> stored(column.nullable ? block_count : 0U, false);
+                for (const auto entry : *vars) {
+                    if (entry.key.column_id != column.id) continue;
+                    if (column.nullable) stored[entry.key.block_index] = true;
+                    else if (entry.value.empty()) var_changes.push_back(VarChange{.key = entry.key, .value = std::nullopt});
+                }
+                for (std::size_t block = 0; block < stored.size(); ++block) {
+                    if (stored[block] || !GetBit(presence.data(), block)) continue;
+                    var_changes.push_back(VarChange{
+                        .key = VarKey{.column_id = column.id, .block_index = static_cast<std::uint32_t>(block)},
+                        .value = std::vector<std::uint8_t>{},
+                    });
                 }
             }
             continue;

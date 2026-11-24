@@ -1,4 +1,5 @@
 #include "user_registry.hpp"
+#include "checkpoint.hpp"
 #include "test_utils.hpp"
 #include "txn_test_utils.hpp"
 
@@ -6,6 +7,7 @@
 #include <barrier>
 #include <cassert>
 #include <chrono>
+#include <filesystem>
 #include <future>
 #include <thread>
 #include <vector>
@@ -108,6 +110,44 @@ void VerifierIdentityAndPublishedPair() {
     assert(users.AcquireConnection(during).status == UserAdmissionStatus::kStale);
 }
 
+// Adding a verifier keeps logins checked against the first one current;
+// dropping the old one does not. An addition whose durability is unknown is
+// confirmed by the unchanged retry, and a failed write changes nothing.
+void AddedVerifierGenerationAndRetry() {
+    test::ScopedTempDir dir("chunkdb-user-added-verifier");
+    UserRegistry users(dir.path(), std::make_pair(std::string("admin"), Verifier()), {});
+    const auto before = *users.AuthenticationSnapshot("admin");
+    users.AddVerifier("admin", Verifier("next"));
+    assert(users.AuthenticationCurrent(before));
+    const auto added = *users.AuthenticationSnapshot("admin");
+    assert(added.user.verifier == Verifier() && added.user.added_verifier == Verifier("next"));
+    users.DropOldVerifier("admin");
+    assert(!users.AuthenticationCurrent(added));
+    const auto dropped = *users.AuthenticationSnapshot("admin");
+    assert(dropped.user.verifier == Verifier("next") && !dropped.user.added_verifier);
+    {
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
+        bool unknown = false;
+        try { users.AddVerifier("admin", Verifier("third")); }
+        catch (const UsersOutcomeUnknownError&) { unknown = true; }
+        assert(unknown);
+    }
+    assert(users.Snapshot().users.at("admin").added_verifier == Verifier("third"));
+    users.AddVerifier("admin", Verifier("third"));
+    assert(ReadUsersFile(dir.path()) == users.Snapshot());
+    const auto published = users.Snapshot();
+    {
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_WRITE_FAIL_ONCE", "1");
+        bool refused = false;
+        try { users.DropOldVerifier("admin"); }
+        catch (const std::exception&) { refused = true; }
+        assert(refused);
+    }
+    assert(users.Snapshot() == published && ReadUsersFile(dir.path()) == published);
+    UserRegistry reopened(dir.path(), std::nullopt, {});
+    assert(reopened.Snapshot() == published);
+}
+
 void RollingRateWindowAndLowering() {
     test::ScopedTempDir dir("chunkdb-user-rate-window");
     std::atomic<std::int64_t> milliseconds{0};
@@ -187,6 +227,8 @@ void UnknownReplacementPublishesWholeImage() {
     assert(users.Snapshot() != before);
     const auto stored = ReadUsersFile(dir.path());
     assert(stored && *stored == users.Snapshot());
+#if defined(__APPLE__)
+    // This failpoint fails F_FULLFSYNC, so it exists only on macOS.
     {
         txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE", "1");
         bool unknown = false;
@@ -194,7 +236,20 @@ void UnknownReplacementPublishesWholeImage() {
         catch (const UsersOutcomeUnknownError&) { unknown = true; }
         assert(unknown); // An unchanged retry must confirm the outstanding rename.
     }
-    users.SetLimits("admin", 1U, 7U);
+#endif
+    {
+        // The unchanged retry confirms the outstanding rename with a directory sync, once.
+        const auto data_dir = std::filesystem::weakly_canonical(dir.path());
+        std::atomic<int> syncs{0};
+        SetDirectorySyncObserverForTests([&](const std::filesystem::path& synced) {
+            if (synced == data_dir) ++syncs;
+        });
+        users.SetLimits("admin", 1U, 7U);
+        assert(syncs == 1);
+        users.SetLimits("admin", 1U, 7U);
+        assert(syncs == 1);
+        SetDirectorySyncObserverForTests({});
+    }
     UserRegistry reopened(dir.path(), std::nullopt, {});
     assert(reopened.Snapshot() == users.Snapshot());
     auto ticket = Connect(users, "admin");
@@ -241,6 +296,7 @@ int main(int argc, char** argv) {
         {"verifier", VerifierIdentityAndPublishedPair}, {"rate", RollingRateWindowAndLowering},
         {"growth", GrowthRetainsAdmissionsDuringPublication}, {"unknown", UnknownReplacementPublishesWholeImage},
         {"allocation", HistoryAllocationPrecedesPublication},
+        {"added_verifier", AddedVerifierGenerationAndRetry},
     };
     bool selected = false;
     for (const auto& test : cases) if (argc == 1 || (argc == 2 && std::string_view(argv[1]) == test.name)) {

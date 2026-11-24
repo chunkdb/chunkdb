@@ -29,6 +29,7 @@
 #include "catalog_test_utils.hpp"
 #include "login_helpers.hpp"
 #include "feed_phase_watchdog.hpp"
+#include "listener_port_test_utils.hpp"
 #include "../src/audit_log.hpp"
 #include "../src/change_feed.hpp"
 #include "../src/proxy_protocol.hpp"
@@ -218,43 +219,14 @@ WinsockRuntime& EnsureWinsockRuntime() {
 }
 #endif
 
-std::uint16_t PickFreePort() {
-#ifdef _WIN32
-    (void)EnsureWinsockRuntime();
-#endif
-    const SocketHandle s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == kInvalidSocket) {
-        throw std::runtime_error("failed to create socket for free-port probe");
-    }
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-
-    if (bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
-        CloseSocket(s);
-        throw std::runtime_error("failed to bind free-port probe socket");
-    }
-
-    SocketLen len = static_cast<SocketLen>(sizeof(addr));
-    if (getsockname(s, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
-        CloseSocket(s);
-        throw std::runtime_error("failed to read free-port probe socket name");
-    }
-
-    const std::uint16_t port = ntohs(addr.sin_port);
-    CloseSocket(s);
-    return port;
-}
-
 // A loopback port held by a listening socket for the lifetime of the object,
 // so a server configured for it deterministically fails to listen. Unlike an
 // unresolvable host name this does not depend on DNS: resolvers with a
-// `localhost` search domain turn any name into 127.0.0.1.
+// `localhost` search domain turn any name into 127.0.0.1. Port 0 holds a port
+// the kernel picks.
 class OccupiedPort {
   public:
-    OccupiedPort() {
+    explicit OccupiedPort(std::uint16_t port = 0) {
 #ifdef _WIN32
         (void)EnsureWinsockRuntime();
 #endif
@@ -272,11 +244,19 @@ class OccupiedPort {
             CloseSocket(socket_);
             throw std::runtime_error("failed to set SO_EXCLUSIVEADDRUSE");
         }
+#else
+        // A port a stopped server just closed may still have connections in
+        // TIME_WAIT; this still refuses a second listener.
+        int reuse = 1;
+        if (port != 0 && setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
+            CloseSocket(socket_);
+            throw std::runtime_error("failed to set SO_REUSEADDR");
+        }
 #endif
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0;
+        addr.sin_port = htons(port);
         SocketLen len = static_cast<SocketLen>(sizeof(addr));
         if (bind(socket_, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0 ||
             listen(socket_, 1) != 0 ||
@@ -294,6 +274,19 @@ class OccupiedPort {
 
     [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
     [[nodiscard]] SocketHandle listening_socket() const noexcept { return socket_; }
+
+    // A connection waits to be accepted, as a startup probe would leave one.
+    [[nodiscard]] bool HasPendingConnection() const {
+        fd_set ready;
+        FD_ZERO(&ready);
+        FD_SET(socket_, &ready);
+        timeval none{0, 0};
+#ifdef _WIN32
+        return select(0, &ready, nullptr, nullptr, &none) == 1;
+#else
+        return select(socket_ + 1, &ready, nullptr, nullptr, &none) == 1;
+#endif
+    }
 
   private:
     SocketHandle socket_ = kInvalidSocket;
@@ -1545,6 +1538,8 @@ struct ServerHarness {
     std::unique_ptr<chunkdb::ChunkServer> server;
     std::thread thread;
     std::uint16_t port = 0;
+    // The harness chose `port`; a test-given port is kept across Restart.
+    bool picked_port = false;
     bool tls_enabled = false;
     chunkdb::StoreConfig saved_store_config;
     chunkdb::ServerConfig saved_server_config;
@@ -1576,6 +1571,12 @@ struct ServerHarness {
         RethrowRunError();
         chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset server/engine/catalog for restart");
         server.reset(); engine.reset(); catalog.reset();
+        // Another process may have bound the old port since Stop; no caller
+        // needs the same port, so a port the harness chose is chosen again.
+        if (picked_port) {
+            port = chunkdb::test::PickListenerPort();
+            saved_server_config.port = port;
+        }
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(saved_store_config);
         catalog_config.feed_linger = std::chrono::milliseconds(saved_server_config.feed_linger_ms);
         catalog = std::make_shared<chunkdb::TableCatalog>(catalog_config);
@@ -1598,7 +1599,8 @@ struct ServerHarness {
         chunkdb::EngineConfig engine_config,
         chunkdb::ServerConfig server_config)
         : data_dir(TempDataDir(std::move(name))),
-          port(server_config.port == 0 ? PickFreePort() : server_config.port) {
+          port(server_config.port == 0 ? chunkdb::test::PickListenerPort() : server_config.port),
+          picked_port(server_config.port == 0) {
         chunkdb::test::FeedPhaseWatchdog::Phase("harness: constructor");
         store_config.data_dir = data_dir;
         server_config.host = "127.0.0.1";
@@ -1709,31 +1711,23 @@ struct ServerHarness {
     }
 
     void WaitUntilListening() {
-        const auto deadline = Clock::now() + std::chrono::seconds(3);
-
-        while (Clock::now() < deadline) {
-            RethrowRunError();
-
-            try {
-#ifdef CHUNKDB_WITH_OPENSSL
-                // With PROXY headers a TLS handshake needs one first; a
-                // connection alone shows the listener is up.
-                if (tls_enabled && !saved_server_config.proxy_protocol_v2) {
-                    TlsClient probe("127.0.0.1", port);
-                } else {
-                    RawClient probe("127.0.0.1", port);
-                }
-#else
-                RawClient probe("127.0.0.1", port);
-#endif
-                return;
-            } catch (const std::runtime_error&) {
-                // Listener startup only; tests do not use this for ordering.
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            }
+        // Run reports its own listener, so the probe never reaches another
+        // socket on this port; a failed Run ends the wait at once and
+        // StartAndWait reports its error.
+        if (!server->WaitListeningForTests(std::chrono::seconds(3))) {
+            throw std::runtime_error("server did not start listening in time");
         }
-
-        throw std::runtime_error("server did not start listening in time");
+#ifdef CHUNKDB_WITH_OPENSSL
+        // With PROXY headers a TLS handshake needs one first; a connection
+        // alone reaches the listener.
+        if (tls_enabled && !saved_server_config.proxy_protocol_v2) {
+            TlsClient probe("127.0.0.1", port);
+        } else {
+            RawClient probe("127.0.0.1", port);
+        }
+#else
+        RawClient probe("127.0.0.1", port);
+#endif
     }
 };
 
@@ -2312,12 +2306,48 @@ void TestConnectionListingTrimsStatementWhitespace() {
     const auto listing = controller.ReadReply();
     const auto at = listing.find("$2\r\nid\r\n:" + std::to_string(id) + "\r\n");
     assert(at != std::string::npos);
-    const auto end = listing.find("%5\r\n", at);
+    const auto end = listing.find("%6\r\n", at);
     const auto entry = listing.substr(at, end == std::string::npos ? std::string::npos : end - at);
     assert(entry.find("$5\r\nstate\r\n$6\r\nqueued\r\n") != std::string::npos);
-    assert(entry.find("$9\r\nstatement\r\n$4\r\nPING\r\n") != std::string::npos);
+    assert(entry.find("$9\r\nstatement\r\n$4\r\nPING\r\n$8\r\nprogress\r\n_\r\n") != std::string::npos);
     hook.Release();
     assert(worker.ReadLine() == "+PONG\r\n" && target.ReadLine() == "+PONG\r\n");
+}
+
+// MONITOR lists every user's connections and controls none of them; a user
+// without it lists only its own.
+void TestMonitorListsConnectionsWithoutControl() {
+    ServerHarness harness("monitor-connections", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = true}, BaseServerConfig());
+    RawClient admin("127.0.0.1", harness.port); admin.SetReadDeadline(std::chrono::seconds(15)); admin.Login();
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    for (const std::string name : {"mon", "bot"}) {
+        admin.SendLine("CREATE USER " + name + " VERIFIER '" + verifier + "'");
+        assert(admin.ReadLine() == "+OK\r\n");
+    }
+    admin.SendLine("GRANT MONITOR ON * TO mon");
+    assert(admin.ReadLine() == "+OK\r\n");
+    RawClient bot("127.0.0.1", harness.port); bot.SetReadDeadline(std::chrono::seconds(15));
+    std::uint64_t bot_id = 0U;
+    assert(LoginReply(bot, "bot", "pw", &bot_id) == "%14\r\n" && bot_id != 0U);
+    RawClient mon("127.0.0.1", harness.port); mon.SetReadDeadline(std::chrono::seconds(15));
+    std::uint64_t mon_id = 0U;
+    assert(LoginReply(mon, "mon", "pw", &mon_id) == "%14\r\n" && mon_id != 0U);
+    const auto entry = [](std::uint64_t id) { return "$2\r\nid\r\n:" + std::to_string(id) + "\r\n"; };
+
+    mon.SendLine("SHOW CONNECTIONS");
+    const auto listing = mon.ReadReply();
+    assert(listing.find(entry(bot_id)) != std::string::npos && listing.find(entry(mon_id)) != std::string::npos);
+    bot.SendLine("SHOW CONNECTIONS");
+    const auto own = bot.ReadReply();
+    assert(own.find(entry(bot_id)) != std::string::npos && own.find(entry(mon_id)) == std::string::npos);
+
+    mon.SendLine("CANCEL " + std::to_string(bot_id));
+    assert(mon.ReadReply() == "%1\r\n$9\r\ncancelled\r\n#f\r\n");
+    mon.SendLine("KILL CONNECTION " + std::to_string(bot_id));
+    assert(mon.ReadReply() == "%1\r\n$6\r\nkilled\r\n#f\r\n");
+    bot.SendLine("PING");
+    assert(bot.ReadLine() == "+PONG\r\n");
 }
 
 class ShutdownPublicationHook : public RateQueueHook {
@@ -4611,6 +4641,49 @@ void TestMetricsRuntimeCounters() {
     assert(stats_second.eviction_forced_wal_flushes_empty_batch >= stats_first.eviction_forced_wal_flushes_empty_batch);
 }
 
+// Calls Stop on the Run thread at one point of Run's startup.
+class StopAtStartupHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    StopAtStartupHook(chunkdb::ChunkServer& server, Point point) : server_(server), point_(point) {}
+    void Run(Point point, std::size_t) override {
+        if (point == point_ && !fired.exchange(true)) server_.Stop();
+    }
+    std::atomic<bool> fired{false};
+
+  private:
+    chunkdb::ChunkServer& server_;
+    const Point point_;
+};
+
+// A Stop just before Run publishes its listener, or between the listener
+// and running_, ends Run; before, Run kept polling a closed socket and the
+// next Stop found nothing to stop.
+void TestStopDuringStartup() {
+    using Point = chunkdb::FeedDeliveryTestHook::Point;
+    for (const auto point : {Point::kBeforeListenerPublication, Point::kAfterListenerPublication}) {
+        auto store_cfg = BaseStoreConfig();
+        store_cfg.data_dir = TempDataDir("stop-during-startup");
+        {
+            auto server_cfg = BaseServerConfig();
+            server_cfg.port = chunkdb::test::PickListenerPort();
+            auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(store_cfg));
+            auto engine = std::make_shared<chunkdb::CommandEngine>(chunkdb::EngineConfig{.require_auth = false}, catalog);
+            chunkdb::ChunkServer server(server_cfg, engine);
+            StopAtStartupHook hook(server, point);
+            chunkdb::FeedDeliveryTestAccess::SetPendingObserverHook(server, &hook);
+            auto run = std::async(std::launch::async, [&server] { server.Run(); });
+            const bool ended = run.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+            if (!ended) server.Stop();
+            run.get();
+            assert(hook.fired.load());
+            assert(ended);
+            assert(!server.WaitListeningForTests(std::chrono::milliseconds(0)));
+            chunkdb::FeedDeliveryTestAccess::SetPendingObserverHook(server, nullptr);
+        }
+        RemoveAllWithRetry(store_cfg.data_dir);
+    }
+}
+
 void TestSlowClientTimeoutReleasesWorker() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -6122,19 +6195,41 @@ void TestServerHarnessStartupFailure() {
     config.port = occupied.port();
     bool failed = false;
     try {
-        {
-            ServerHarness harness("harness-startup-failure", BaseStoreConfig(),
-                chunkdb::EngineConfig{.require_auth = false}, config);
-        }
-        // The occupied listener can accept the probe before Run reports the
-        // bind failure. Teardown must preserve that error too.
-        RethrowBackgroundServerError();
+        ServerHarness harness("harness-startup-failure", BaseStoreConfig(),
+            chunkdb::EngineConfig{.require_auth = false}, config);
     } catch (const std::runtime_error& error) {
         const std::string_view message(error.what());
         failed = message.find("port is already in use") != std::string_view::npos &&
             message.find(std::to_string(occupied.port())) != std::string_view::npos;
     }
-    assert(failed && "a failed startup must report its server error after joining the thread");
+    assert(failed && "a failed startup must report its server error from the constructor");
+    // The harness waits for its own listener and never probes the occupied one.
+    assert(!occupied.HasPendingConnection());
+    RethrowBackgroundServerError();
+    // The same holds when another listener takes the port while the server
+    // is stopped: Restart reports the listen failure instead of probing it.
+    {
+        auto kept = BaseServerConfig();
+        kept.port = chunkdb::test::PickListenerPort();
+        ServerHarness harness("harness-restart-taken-port", BaseStoreConfig(),
+            chunkdb::EngineConfig{.require_auth = false}, kept);
+        harness.server->Stop();
+        harness.JoinStopped();
+        const OccupiedPort taken(harness.port);
+        const auto restarted = Clock::now();
+        std::string reported;
+        try {
+            harness.Restart();
+        } catch (const std::runtime_error& error) {
+            reported = error.what();
+        }
+        assert(reported.find("port is already in use") != std::string::npos &&
+            reported.find(std::to_string(harness.port)) != std::string::npos);
+        // Reported by Run, not after the 3 s listener wait.
+        assert(Clock::now() - restarted < std::chrono::seconds(3));
+        assert(!taken.HasPendingConnection());
+        harness.JoinFailed(reported);
+    }
     RethrowBackgroundServerError();
     // A caught startup failure must not poison the next server lifetime.
     TestPing();
@@ -6302,7 +6397,7 @@ void TestStartupLogOrder() {
     auto server_cfg = BaseServerConfig();
     const std::filesystem::path data_dir = TempDataDir("log-order");
     store_cfg.data_dir = data_dir;
-    server_cfg.port = PickFreePort();
+    server_cfg.port = chunkdb::test::PickListenerPort();
 
     chunkdb::LogServerStartupContext(
         "test-version",
@@ -6834,6 +6929,84 @@ void TestUnwatchReleaseBeforeReply(bool tls) {
     } catch (...) { hook.Release(); throw; }
     hook.Release();
     reader.SendLine("PING"); assert(reader.ReadLine() == "+PONG\r\n");
+}
+
+// Signals the first read of the I/O thread on the connection UNWATCH returned,
+// the connection that has written `replies` replies.
+class ReturnedReadHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    explicit ReturnedReadHook(std::size_t replies) : replies_(replies) {}
+    void Run(Point point, std::size_t value) override {
+        std::lock_guard lock(mutex_);
+        if (point == Point::kBeforeReturnClient) returning_ = true;
+        else if (point == Point::kAfterClientRead && returning_ && value == replies_) read_ = true;
+        else return;
+        changed_.notify_all();
+    }
+    bool WaitRead() {
+        std::unique_lock lock(mutex_);
+        return changed_.wait_for(lock, std::chrono::seconds(10), [&] { return read_; });
+    }
+  private:
+    const std::size_t replies_;
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    bool returning_ = false, read_ = false;
+};
+
+// A watch held past the idle timeout: the idle interval of the connection
+// starts when UNWATCH is answered, and still closes it after that.
+void TestUnwatchRestartsIdleDeadline(bool slot) {
+    using Clock = std::chrono::steady_clock;
+    ReturnedReadHook hook(slot ? 4U : 2U); // Outlives the server. Replies: HELLO, CREATE SLOT twice, WATCH.
+    constexpr auto kIdle = std::chrono::milliseconds(1000);
+    auto config = BaseServerConfig();
+    config.idle_connection_timeout_ms = static_cast<std::size_t>(kIdle.count());
+    config.feed_progress_ms = 60000U; // No progress frame precedes the UNWATCH reply.
+    ServerHarness harness(slot ? "unwatch-idle-slot" : "unwatch-idle-plain", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient kept("127.0.0.1", harness.port); kept.SetReadDeadline(std::chrono::seconds(15)); kept.Hello();
+    RawClient idle("127.0.0.1", harness.port); idle.SetReadDeadline(std::chrono::seconds(15)); idle.Hello();
+    if (slot) {
+        kept.SendLine("CREATE SLOT 'kept' ON default"); assert(kept.ReadLine() == "+OK\r\n");
+        kept.SendLine("CREATE SLOT 'idle' ON default"); assert(kept.ReadLine() == "+OK\r\n");
+    }
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    kept.SendLine(slot ? "WATCH default SLOT 'kept'" : "WATCH default"); assert(!FeedStart(ReadFeedReply(kept)).empty());
+    idle.SendLine(slot ? "WATCH default SLOT 'idle'" : "WATCH default"); assert(!FeedStart(ReadFeedReply(idle)).empty());
+    // Each WATCH reply set an idle deadline before it was read; both pass here.
+    std::this_thread::sleep_until(Clock::now() + kIdle + std::chrono::milliseconds(100));
+    kept.SendLine("UNWATCH"); assert(kept.ReadLine() == "+OK\r\n");
+    // The I/O thread has read the returned connection once and found no request.
+    assert(hook.WaitRead());
+    kept.SendLine("PING"); assert(kept.ReadLine() == "+PONG\r\n");
+    if (slot) { kept.SendLine("DROP SLOT 'kept' ON default"); assert(kept.ReadLine() == "+OK\r\n"); }
+    const auto unwatched = Clock::now();
+    idle.SendLine("UNWATCH"); assert(idle.ReadLine() == "+OK\r\n");
+    assert(idle.WaitForClose(std::chrono::seconds(10)));
+    assert(Clock::now() - unwatched >= kIdle);
+}
+
+// A connection that UNWATCH returned is listed as idle, not as watching.
+void TestUnwatchListsIdle() {
+    ReturnedReadHook hook(2U); // Outlives the server. Replies: HELLO, WATCH.
+    ServerHarness harness("unwatch-lists-idle", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+    RawClient target("127.0.0.1", harness.port); target.SetReadDeadline(std::chrono::seconds(15));
+    target.SendLine("HELLO 3");
+    const auto id = std::stoull(ReadHelloReply(target).at("connection_id"));
+    chunkdb::FeedDeliveryTestAccess::SetHook(*harness.server, &hook);
+    target.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(target)).empty());
+    target.SendLine("UNWATCH"); assert(target.ReadLine() == "+OK\r\n");
+    assert(hook.WaitRead());
+    RawClient controller("127.0.0.1", harness.port); controller.Hello();
+    controller.SendLine("SHOW CONNECTIONS");
+    const auto listing = controller.ReadReply();
+    const auto at = listing.find("$2\r\nid\r\n:" + std::to_string(id) + "\r\n");
+    assert(at != std::string::npos);
+    const auto end = listing.find("%5\r\n", at);
+    const auto entry = listing.substr(at, end == std::string::npos ? std::string::npos : end - at);
+    assert(entry.find("$5\r\nstate\r\n$4\r\nidle\r\n") != std::string::npos);
 }
 
 template <class Client>
@@ -7609,6 +7782,9 @@ void TestFeedWatch() {
 #endif
     run("TestStopWaitingWorker", TestStopWaitingWorker);
     run("TestUnwatchReleaseBeforeReply<RawClient>(false)", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
+    run("TestUnwatchRestartsIdleDeadline(false)", [] { TestUnwatchRestartsIdleDeadline(false); });
+    run("TestUnwatchRestartsIdleDeadline(true)", [] { TestUnwatchRestartsIdleDeadline(true); });
+    run("TestUnwatchListsIdle", TestUnwatchListsIdle);
 #ifdef CHUNKDB_WITH_OPENSSL
     run("TestUnwatchReleaseBeforeReply<TlsClient>(true)", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
 #endif
@@ -8232,6 +8408,9 @@ int main(int argc, char** argv) {
         run("TestLingerFailureFenceFalse", [] { TestLingerFailureFence(false); });
         run("TestLingerFailureFenceTrue", [] { TestLingerFailureFence(true); });
         run("TestUnwatchReleaseBeforeReply", [] { TestUnwatchReleaseBeforeReply<RawClient>(false); });
+        run("TestUnwatchRestartsIdleDeadline", [] { TestUnwatchRestartsIdleDeadline(false); });
+        run("TestUnwatchRestartsIdleDeadlineSlot", [] { TestUnwatchRestartsIdleDeadline(true); });
+        run("TestUnwatchListsIdle", TestUnwatchListsIdle);
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestUnwatchReleaseBeforeReplyTls", [] { TestUnwatchReleaseBeforeReply<TlsClient>(true); });
 #endif
@@ -8270,6 +8449,7 @@ int main(int argc, char** argv) {
         run("TestRefusedDispatchWakesAfterPop", TestRefusedDispatchWakesAfterPop);
         run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);
         run("TestConnectionListingTrimsStatementWhitespace", TestConnectionListingTrimsStatementWhitespace);
+        run("TestMonitorListsConnectionsWithoutControl", TestMonitorListsConnectionsWithoutControl);
         run("TestStopPublicationGapClosesQueuedOwner", TestStopPublicationGapClosesQueuedOwner);
         run("TestOrdinaryWatchRateRepliesAreBounded", TestOrdinaryWatchRateRepliesAreBounded);
         run("TestExpiredQueueRetainsTransportOwner", TestExpiredQueueRetainsTransportOwner);
@@ -8314,6 +8494,7 @@ int main(int argc, char** argv) {
         run("TestPipelinedBadRequestDisconnectPolicy", TestPipelinedBadRequestDisconnectPolicy);
         run("TestMaxAuthFailuresDisconnects", TestMaxAuthFailuresDisconnects);
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
+        run("TestStopDuringStartup", TestStopDuringStartup);
         run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestTlsHandshakeDeadlineReleasesWorker", TestTlsHandshakeDeadlineReleasesWorker);

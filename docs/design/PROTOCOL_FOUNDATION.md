@@ -55,7 +55,7 @@ Unset options use server defaults; explicit per-statement TAG overrides `default
 | `txn_max_read_chunks` | Configured statement/commit admission, default 8192. |
 | `max_watches` | Effective server configuration; current default 64. |
 | `max_returning_rows` | 65536, the declared ceiling from E3; RETURNING remains unavailable until task 55. |
-| `max_expression_nodes` | 256, the declared ceiling from E1; expressions remain unavailable until task 55. |
+| `max_expression_nodes` | 256, the ceiling from E1 for the expressions of SET BLOCK and DELETE BLOCK and the WHERE of AGGREGATE and SCAN CHUNKS. |
 
 Unavailable capabilities do not become supported merely because their numeric ceilings appear in HELLO.
 The initial capability names are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, and `lineage`.
@@ -190,7 +190,7 @@ WATCH omitting filters inherits them; explicitly supplied filters must match exa
 Column projections persist stable column ids in declared order; equivalent area bounds normalize identically, independent of spelling.
 A dropped projected column makes the slot lost with reason=schema_filter; it never silently broadens or changes the projection.
 Changing filters requires creating a different slot; IF NOT EXISTS must compare filters rather than silently accept incompatible existing state.
-Task 51 implements these fixed filters, including a CHUNKS event for each relevant committed chunk; task 56 adds lagging-consumer coalescing and multiple areas.
+Task 51 implements these fixed filters, including a CHUNKS event for each relevant committed chunk; task 56 adds lagging-consumer coalescing; ordinary watches take several areas, and a slot keeps one.
 The chunk push prefix is selected by dims and does not depend on the form format.
 
 CREATE SLOT accepts each AREA, COLUMNS, NO BEFORE, CHUNKS and OWNER suffix once, in any order after `ON table`.
@@ -288,7 +288,7 @@ After that decision an incomplete publication returns OUTCOME_UNKNOWN stage=feat
 Each manifest uses the established atomic checked publication and directory-sync rules; no unsynced shortcut or fallback is allowed.
 The journal is cleared only after all affected manifests and directories are durable; replay is idempotent across every publication crash point.
 
-SHOW STATUS requires ADMIN on `*` and returns `{directory,tables,activation_pending}`.
+SHOW STATUS requires MONITOR or ADMIN on `*` and returns `{directory,tables,activation_pending}`.
 The directory map is `{enabled,compat,ro_compat,incompat}`; table maps add `name` and appear in the `tables` array.
 `enabled` is `[bulk_feature_name,…]`, containing known feature names.
 The raw masks are checked unsigned u64 values, preserving unsupported bits explicitly.

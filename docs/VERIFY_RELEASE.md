@@ -37,3 +37,15 @@ if ($actual -eq $expected) { 'OK' } else { 'MISMATCH' }
 The filenames illustrate platform/version selection; use the exact filename attached to your selected release.
 MISMATCH means the archive should not be used as a verified download; obtain the matching archive and sidecar again.
 After extraction, follow [quick start](QUICK_START.md) with the included server and tools.
+
+## Docker image labels
+
+The published image records its version and source commit in OCI labels:
+
+```sh
+docker pull ghcr.io/chunkdb/chunkdb:2.0.0
+docker image inspect --format '{{json .Config.Labels}}' ghcr.io/chunkdb/chunkdb:2.0.0
+```
+
+The labels are `org.opencontainers.image.title`, `version`, `revision`, `source`, `created` and `licenses`.
+The image is published for linux/amd64 and linux/arm64.

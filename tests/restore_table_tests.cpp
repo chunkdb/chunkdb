@@ -1,4 +1,5 @@
-// RESTORE TABLE into a running catalog (docs/design/RESTORE_TABLE.md).
+// RESTORE TABLE into a running catalog, SWAP TABLES and ALTER TABLE ... RENAME
+// TO (docs/design/RESTORE_TABLE.md).
 #include <stop_token>
 
 #include "feed_slots.hpp"
@@ -16,17 +17,20 @@ void RestoresIntoNewName() {
         StoreId restored{};
         {
             TableCatalog catalog(source.Config());
-            std::uint64_t reported_files = 0U, reported_bytes = 0U, total_files = 0U, total_bytes = 0U;
+            std::uint64_t reported_files = 0U, reported_bytes = 0U, total_files = 0U, total_bytes = 0U, calls = 0U;
             auto request = source.Request();
             request.progress = [&](std::uint64_t files, std::uint64_t bytes, std::uint64_t all_files, std::uint64_t all_bytes) {
-                assert(files > reported_files && bytes >= reported_bytes && files <= all_files && bytes <= all_bytes);
+                // The totals come first, before any file is copied.
+                if (calls++ == 0U) assert(files == 0U && bytes == 0U && all_files > 0U && all_bytes > 0U);
+                else assert(files > reported_files && bytes >= reported_bytes);
+                assert(files <= all_files && bytes <= all_bytes);
                 // Not visible until the restore publishes it.
                 assert(catalog.Find("t_restored") == nullptr && !std::filesystem::exists(source.data / "tables/t_restored"));
                 reported_files = files; reported_bytes = bytes; total_files = all_files; total_bytes = all_bytes;
             };
             const auto result = catalog.RestoreTable(request);
             assert(result.name == "t_restored" && result.parent_epoch == source.epoch && result.fork_revision == source.cut);
-            assert(result.files == total_files && reported_files == total_files);
+            assert(result.files == total_files && reported_files == total_files && calls == total_files + 1U);
             assert(result.bytes == total_bytes && reported_bytes == total_bytes && total_bytes > 0U);
             restored = result.epoch;
             source.CheckRestored(catalog, "t_restored", restored);
@@ -194,7 +198,18 @@ void Cancellation() {
     std::stop_source stop;
     auto request = source.Request();
     request.cancelled = stop.get_token();
-    request.progress = [&](std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t) { stop.request_stop(); };
+    // A stop after the first file leaves copied files in staging, which the refusal removes.
+    request.progress = [&](std::uint64_t files, std::uint64_t, std::uint64_t all_files, std::uint64_t) {
+        if (files == 0U) return;
+        assert(files == 1U && all_files > 1U && Entries(source.data / ".chunkdb.staging") > 0U);
+        stop.request_stop();
+    };
+    assert(Throws([&] { (void)catalog.RestoreTable(request); }).find("cancelled") != std::string::npos);
+    LeavesNothingAfterRefusal(source, catalog);
+    // A stop at the totals, before any file is copied.
+    std::stop_source first;
+    request.cancelled = first.get_token();
+    request.progress = [&](std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t) { first.request_stop(); };
     assert(Throws([&] { (void)catalog.RestoreTable(request); }).find("cancelled") != std::string::npos);
     LeavesNothingAfterRefusal(source, catalog);
     std::stop_source before;
@@ -453,6 +468,146 @@ void StatementStops() {
     }
     swapped.Check(true);
 }
+
+// The table `name` holds the live table of `source` with its epoch, data,
+// tombstones and slot, and its slot does not resync.
+void CheckLive(const Source& source, TableCatalog& catalog, std::string_view name) {
+    const auto table = catalog.Require(name);
+    assert(table->store_id() == source.epoch && !table->lineage());
+    {
+        auto lease = table->Acquire();
+        auto& store = lease->store();
+        assert(store.GetBlockBits(8, 0) == "11111111");
+        assert(store.GetBlockBits(9, 3) == "00000101" && store.GetChunkVersion(4, 1) == source.wal_only);
+        assert(store.RetainedTombstoneCount() == 2U);
+    }
+    const auto slots = table->ListFeedSlots();
+    assert(slots.size() == 1U && slots[0].name == "consumer" && !slots[0].resync && slots[0].position.epoch == source.epoch);
+}
+
+// RENAME TO keeps the table's epoch, data and slots under the new name; the
+// old name is free, its table object is gone and its watches end.
+void RenamesTable() {
+    for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) {
+        Source source(mode);
+        {
+            TableCatalog catalog(source.Config());
+            const auto old_t = catalog.Require("t");
+            const auto position = old_t->ListFeedSlots().at(0).position;
+            auto watch = old_t->SubscribeFeed();
+            catalog.RenameTable("t", "t_old", nullptr);
+            assert(catalog.Find("t") == nullptr && catalog.TableCount() == 1U && catalog.Fences().empty());
+            CheckLive(source, catalog, "t_old");
+            assert(catalog.Require("t_old")->ListFeedSlots().at(0).position == position);
+            assert(!old_t->Acquire().has_value());
+            const auto ended = watch->Next(std::chrono::seconds(5));
+            assert(ended && ended->kind == FeedEntry::Kind::kEnd && ended->protocol_frame &&
+                   ended->protocol_frame->find("renamed") != std::string::npos);
+            watch.reset();
+            // A watch of the new name continues from the last revision in the same epoch.
+            FeedOptions after;
+            after.after = FeedPosition{source.epoch, *catalog.Require("t_old")->Acquire()->store().CompletedRevision()};
+            auto continuing = catalog.Require("t_old")->SubscribeFeed(after);
+            std::uint64_t written = 0U;
+            {
+                auto lease = catalog.Require("t_old")->Acquire();
+                lease->store().SetBlockBits(1, 3, "00010000");
+                written = lease->store().GetChunkVersion(0, 1);
+            }
+            bool seen = false;
+            for (int i = 0; i < 64 && !seen; ++i) {
+                const auto entry = continuing->Next(std::chrono::seconds(5));
+                assert(entry && entry->kind != FeedEntry::Kind::kResync && entry->kind != FeedEntry::Kind::kEnd);
+                seen = entry->kind == FeedEntry::Kind::kChange && entry->position == (FeedPosition{source.epoch, written});
+            }
+            assert(seen);
+            continuing.reset();
+            // A new table can take the old name.
+            GeometryConfig geometry;
+            geometry.block_bits = 8U;
+            (void)catalog.Create("t", geometry, catalog.default_options());
+        }
+        Verified(source.data);
+        TableCatalog catalog(source.Config());
+        CheckLive(source, catalog, "t_old");
+        assert(catalog.Require("t_old")->Acquire()->store().GetBlockBits(1, 3) == "00010000");
+        assert(catalog.Require("t")->store_id() != source.epoch);
+        catalog.Drop("t");
+        catalog.RenameTable("t_old", "t", nullptr);
+        CheckLive(source, catalog, "t");
+        assert(Entries(source.data / "tables") == 1U);
+    }
+}
+
+void RenameRefusals() {
+    Source source;
+    TableCatalog catalog(source.Config());
+    Throws<std::invalid_argument>([&] { catalog.RenameTable("t", "t", nullptr); });
+    Throws<TableNotFoundError>([&] { catalog.RenameTable("absent", "other", nullptr); });
+    Throws<std::invalid_argument>([&] { catalog.RenameTable("t", "Bad.Name", nullptr); });
+    GeometryConfig geometry;
+    geometry.block_bits = 8U;
+    (void)catalog.Create("taken", geometry, catalog.default_options());
+    Throws<TableExistsError>([&] { catalog.RenameTable("t", "taken", nullptr); });
+    // A directory no table of this server owns is not replaced.
+    std::filesystem::create_directory(source.data / "tables" / "squatted");
+    assert(Throws<TableExistsError>([&] { catalog.RenameTable("t", "squatted", nullptr); }).find("not a table this server opened") !=
+           std::string::npos);
+    std::filesystem::remove(source.data / "tables" / "squatted");
+    {
+        // A rename that fails serves the table again under its name.
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_ONCE", "1");
+        Throws([&] { catalog.RenameTable("t", "t_new", nullptr); });
+    }
+    assert(catalog.Fences().empty() && catalog.Find("t_new") == nullptr);
+    CheckLive(source, catalog, "t");
+    {
+        // A rename that cannot be synced fences both names, since a crash
+        // could still undo it; a recovery opens what each directory holds.
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_RENAME_TABLE_SYNC_FAIL_ONCE", "1");
+        Throws([&] { catalog.RenameTable("t", "t_new", nullptr); });
+    }
+    assert(catalog.Fence("t_new") && catalog.Fence("t") && catalog.Find("t") == nullptr && catalog.Find("t_new") == nullptr);
+    Throws<TableFencedError>([&] { (void)catalog.Create("t", geometry, catalog.default_options()); });
+    catalog.RecoverTable("t_new");
+    CheckLive(source, catalog, "t_new");
+    assert(catalog.Fence("t"));
+    catalog.RecoverTable("t");
+    assert(catalog.Fences().empty() && catalog.Find("t") == nullptr && catalog.TableCount() == 2U);
+    {
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_RENAME_TABLE_OPEN_FAIL_ONCE", "1");
+        Throws([&] { catalog.RenameTable("t_new", "t", nullptr); });
+    }
+    assert(catalog.Fence("t") && catalog.Find("t_new") == nullptr);
+    catalog.RecoverTable("t");
+    CheckLive(source, catalog, "t");
+    Verified(source.data);
+}
+
+// A stop accepted before the decision leaves the name as it was; after it,
+// the rename reports its real outcome.
+void RenameStatementStops() {
+    Source source;
+    TableCatalog catalog(source.Config());
+    {
+        StatementControl control(StatementControl::Clock::now(), 0U);
+        assert(control.Start());
+        ScopedStatementControl context(&control);
+        assert(control.RequestStop(StatementStopReason::kCancelled));
+        (void)Throws<StatementStoppedError>([&] { catalog.RenameTable("t", "t_old", nullptr); });
+    }
+    assert(catalog.Fences().empty());
+    CheckLive(source, catalog, "t");
+    {
+        StatementControl control(StatementControl::Clock::now(), 0U);
+        assert(control.Start());
+        ScopedStatementControl context(&control);
+        catalog.RenameTable("t", "t_old", nullptr);
+        assert(control.decision_entered() && !control.RequestStop(StatementStopReason::kCancelled));
+    }
+    CheckLive(source, catalog, "t_old");
+}
+
 }  // namespace
 
 int main() {
@@ -464,6 +619,9 @@ int main() {
     Cancellation();
     StatementStops();
     MarkedSlotBecomesLost();
+    RenamesTable();
+    RenameRefusals();
+    RenameStatementStops();
     if (kAtomicExchange) {
         SwapsNames();
         SwapSurvivesRestart();

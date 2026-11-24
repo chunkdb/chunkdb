@@ -30,28 +30,63 @@ chunk-cli --uri "$CHUNKDB_URI" "ALTER USER admin PASSWORD"
 The CLI prompts twice and computes the password verifier locally.
 See [User statements](reference/USER_STATEMENTS.md) for creation, password files, and conditional forms.
 
+## Rotate a password
+
+A user can hold two verifiers, so clients move to a new password while the old one still logs in:
+
+```cql
+ALTER USER bot ADD VERIFIER $1
+ALTER USER bot DROP OLD VERIFIER
+```
+
+Compute the new verifier with the salt and iteration count of the current one.
+They are the `<iterations>:<salt>` part of the current verifier text, and a login as the user receives them as `i=` and `s=` in the SCRAM server-first message.
+In chunkdb-js, `scramVerifier(password, { salt, iterations })` with the decoded salt bytes computes such a verifier.
+chunk-cli PASSWORD forms and chunkdb-go `ComputeVerifier` pick a new salt, so their verifiers fit VERIFIER but not ADD VERIFIER.
+After ADD VERIFIER both passwords log in.
+Move every client to the new password, then run DROP OLD VERIFIER; from then on only the new password logs in.
+Connections logged in with the old password stay open.
+SHOW USERS reports `verifiers = 2` while a user has two, and the audit log records `change` on each `alter_user` line, so an added verifier stays visible.
+
 ## Rights
 
 ADMIN includes WRITE, and WRITE includes READ.
 Rights apply to whole tables, including grants naming tables not yet created.
 A wildcard grant on `*` applies to every table, including future tables.
-Dropping a table removes its specific grants.
+A prefix grant such as `GRANT ADMIN ON tenant1_* TO t1` applies to every table whose name starts with `tenant1_`, including `tenant1_` itself and future tables.
+A user gets the highest right of its grants on the name, on matching prefixes and on `*`.
+Dropping a table removes its specific grants; prefix and wildcard grants remain.
+Renaming a table with ALTER TABLE ... RENAME TO moves its specific grants to the new name; a user with grants on both names keeps the higher right; prefix and wildcard grants stay as they are.
+GRANT and REVOKE wait for a running DROP TABLE or RENAME TO, so each applies before or after it.
+
+MONITOR, BACKUP and REPLICATION are server rights, granted with `ON *`, for example `GRANT MONITOR ON * TO metrics`.
+They give no table rights and no user management.
+MONITOR reads server status: SHOW METRICS, SHOW STATUS, SHOW CONNECTIONS of every user, SHOW TABLE STATS and SHOW SLOTS on every table.
+BACKUP runs BACKUP TO, and RESTORE TABLE under a name the user has ADMIN on; the backup may hold any table, and the restored table falls under the grants that match its new name.
+REPLICATION is stored and shown by SHOW USERS; no statement requires it yet.
 
 | Statement | Required right |
 | --- | --- |
-| GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, DESCRIBE, WATCH | READ on the table |
+| GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, AGGREGATE, DESCRIBE, WATCH | READ on the table |
+| SHOW TABLE STATS | READ on the table, or MONITOR |
 | WATCH SLOT on a slot another user owns | READ on the table and ADMIN on all tables |
 | SET BLOCK, DELETE BLOCK, SET CHUNK | WRITE on the table |
 | ALTER TABLE, DROP TABLE, RECOVER TABLE, CREATE SLOT, DROP SLOT | ADMIN on the table |
+| CREATE TABLE | ADMIN on the name, on a matching prefix, or on all tables |
 | SWAP TABLES | ADMIN on both tables |
-| CREATE TABLE, SHOW METRICS, RELOAD TLS | ADMIN on all tables |
-| FLUSH WAL | WRITE on at least one table |
-| SHOW TABLES, SHOW SLOTS | None; results include accessible tables only |
+| ALTER TABLE ... RENAME TO | ADMIN on the table, and on the new name, a matching prefix, or all tables |
+| SHOW METRICS, SHOW STATUS | MONITOR, or ADMIN on all tables |
+| RELOAD TLS | ADMIN on all tables |
+| FLUSH WAL | WRITE on at least one table or prefix |
+| SHOW TABLES | None; results include accessible tables only |
+| SHOW SLOTS | None; results include accessible tables only, or every table with MONITOR |
+| SHOW CONNECTIONS | None; results include your own connections, or every connection with MONITOR or ADMIN on all tables |
 | SHOW MIGRATIONS | None; results include records on tables with ADMIN, and GRANT and REVOKE records with MANAGES USERS; applying users show with MANAGES USERS |
 | ACK | An open slot watch |
 | PING | None |
-| User management, GRANT, REVOKE, BACKUP TO | MANAGES USERS |
-| RESTORE TABLE | ADMIN on all tables, or MANAGES USERS |
+| User management, GRANT, REVOKE | MANAGES USERS |
+| BACKUP TO | BACKUP, or MANAGES USERS |
+| RESTORE TABLE | MANAGES USERS, ADMIN on all tables, or BACKUP and ADMIN on the new name |
 | MIGRATE | The inner statement's rights |
 
 Changing your own password is the exception to the user-management requirement.

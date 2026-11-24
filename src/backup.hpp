@@ -144,7 +144,8 @@ using BackupCopyProgress = std::function<void(std::uint64_t copied_files, std::u
 // Copies table `table` of the completed backup `backup` into the existing
 // empty `directory`. The backup's table directory must hold exactly its
 // inventory files, all regular; every copied length and CRC must match the
-// inventory, and the copy must pass the inventory check of its cut. Throws
+// inventory, and the copy must pass the inventory check of its cut. Calls
+// `progress` before the first file and after each copied file. Throws
 // std::invalid_argument when the backup has no such table.
 [[nodiscard]] BackupTableCopy CopyBackupTable(const std::filesystem::path& backup, std::string_view table,
     const std::filesystem::path& directory, const BackupCancel& cancelled = {}, const BackupCopyProgress& progress = {});

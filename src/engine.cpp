@@ -235,6 +235,9 @@ void AddRuntimeStats(StoreRuntimeStats* total, const StoreRuntimeStats& add) {
     total->background_queue_full_inline += add.background_queue_full_inline;
     total->background_queue_depth += add.background_queue_depth;
     total->compressed_checkpoint_images += add.compressed_checkpoint_images;
+    total->txn_history_copies += add.txn_history_copies;
+    total->txn_history_copied_bytes += add.txn_history_copied_bytes;
+    total->txn_history_bytes += add.txn_history_bytes;
 }
 
 }  // namespace
@@ -280,8 +283,8 @@ struct PendingLogin {
     // a connection ticket only while all are still current.
     std::optional<UserAuthenticationSnapshot> identity;
     // Whether the login is bound: AUTH succeeds only while the user still
-    // has the verifier of `exchange` and, for an unbound login, still takes
-    // unbound logins.
+    // has the verifier of `exchange` the proof matches and, for an unbound
+    // login, still takes unbound logins.
     bool bound = false;
     scram::ServerExchange exchange;
     SessionHelloOptions options;
@@ -524,6 +527,7 @@ void CommandEngine::LogStatement(
             .target_user = info.target_user,
             .slot = info.slot,
             .migration = info.migration,
+            .change = info.change != nullptr ? std::string_view{info.change} : std::string_view{},
             .target_connection = info.target_connection,
         });
     }
@@ -877,8 +881,14 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (dynamic_cast<const TableExistsError*>(&error) != nullptr) {
         return Protocol::Error("TABLE_EXISTS", error.what());
     }
+    if (const auto* failed = dynamic_cast<const ConditionFailedError*>(&error); failed != nullptr) {
+        return Protocol::Error("CONDITION_FAILED", error.what(), {{"current", std::to_string(failed->current())}});
+    }
     if (const auto* conflict = dynamic_cast<const TransactionConflictError*>(&error); conflict != nullptr) {
         return Protocol::Error("CONFLICT", error.what(), {{"reason", TxnConflictReasonName(conflict->reason())}});
+    }
+    if (const auto* failed = dynamic_cast<const CheckFailedError*>(&error); failed != nullptr) {
+        return Protocol::Error("CHECK_FAILED", error.what(), {{"check", failed->check()}});
     }
     if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr) {
         if (std::string_view(error.what()).starts_with("the table has no column "))
@@ -970,13 +980,15 @@ std::string CommandEngine::HandleHello(
     }
     const auto found = config_.users->AuthenticationSnapshot(user);
     const auto secret = config_.users->Secret();
-    scram::Verifier verifier = found.has_value() ? found->user.verifier : scram::DecoyVerifier(secret, user);
+    // A user with two verifiers logs in with either.
+    std::vector<scram::Verifier> verifiers{found.has_value() ? found->user.verifier : scram::DecoyVerifier(secret, user)};
+    if (found.has_value() && found->user.added_verifier.has_value()) verifiers.push_back(*found->user.added_verifier);
     session.pending_login = std::make_shared<PendingLogin>(PendingLogin{
         .user = user,
         .known = found.has_value(),
         .identity = found,
         .bound = bound,
-        .exchange = scram::ServerExchange(std::move(first), std::move(verifier), scram::NewNonce(), binding_data),
+        .exchange = scram::ServerExchange(std::move(first), std::move(verifiers), scram::NewNonce(), binding_data),
         .options = std::move(options),
         .unbound_refused = !bound && found.has_value() && found->user.requires_channel_binding,
     });
@@ -1006,8 +1018,9 @@ std::string CommandEngine::HandleAuth(
         return Protocol::Error("AUTH_FAILED", "login context changed; start HELLO again", {{"reason", "stale_login"}});
     };
     std::optional<std::string> server_final;
+    std::size_t verifier = 0;
     try {
-        server_final = pending->exchange.Finish(*parameters[0]);
+        server_final = pending->exchange.Finish(*parameters[0], &verifier);
     } catch (const scram::ChannelMismatchError&) {
         // Whoever relays this login ends TLS itself: the reply says so, and
         // it depends on neither the user nor the password.
@@ -1016,12 +1029,13 @@ std::string CommandEngine::HandleAuth(
     if (!server_final.has_value() || !pending->known || pending->unbound_refused) {
         return RecordAuthFailure(session, pending->user);
     }
-    // The user's credentials as of now, not as of HELLO: a verifier changed,
-    // a user dropped or created again, or a binding requirement added in
-    // between fails the login like a wrong password.
+    // The user's credentials as of now, not as of HELLO: the verifier the
+    // proof matches replaced or dropped, a user dropped or created again, or
+    // a binding requirement added in between fails the login like a wrong
+    // password.
     const auto current = config_.users->FindIncarnation(pending->user);
     if (!current.has_value() || current->incarnation != pending->identity->state->incarnation ||
-        current->user.verifier != pending->exchange.UserVerifier() ||
+        !HoldsVerifier(current->user, pending->exchange.Verifiers()[verifier]) ||
         (!pending->bound && current->user.requires_channel_binding)) {
         // The audit log gives the reason as of now too, as HELLO would.
         audit.known_user = current.has_value();
@@ -1086,7 +1100,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 11);
+    Protocol::AppendArrayHeader(reply, 13);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -1098,6 +1112,8 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "statement_timeout");
     Protocol::AppendBulk(reply, "channel_binding");
     Protocol::AppendBulk(reply, "area_paging");
+    Protocol::AppendBulk(reply, "area_scale");
+    Protocol::AppendBulk(reply, "read_only_transactions");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 2U : 1U);
     entry("statement_timeout_ms", session.hello_options.statement_timeout_ms.value_or(session.default_statement_timeout_ms));

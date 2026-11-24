@@ -145,9 +145,19 @@ struct TableInfo {
     TableSchema chunk_schema{};
 };
 
+struct CatalogTableStatus {
+    std::string name;
+    // std::nullopt for a fenced table that refuses leases: its store is not
+    // open or its feed cleanup failed.
+    std::optional<FeatureFlags> features;
+    // Why the table is fenced; std::nullopt while it serves.
+    std::optional<std::string> fence;
+};
+
 struct CatalogFeatureStatus {
     FeatureFlags directory;
-    std::vector<std::pair<std::string, FeatureFlags>> tables;
+    // Every table, fenced ones included, by name.
+    std::vector<CatalogTableStatus> tables;
     bool activation_pending = false;
 };
 
@@ -167,7 +177,8 @@ struct TableRestoreRequest {
     std::string name;
     // Ends the restore before publication; nothing is published then.
     std::stop_token cancelled{};
-    // Called after each copied file: files and bytes copied, and their totals.
+    // Called before the first and after each copied file: files and bytes
+    // copied, and their totals.
     std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t)> progress{};
 };
 struct TableRestoreResult {
@@ -244,6 +255,13 @@ class Table : public std::enable_shared_from_this<Table> {
         std::optional<std::string> owner = std::nullopt, bool owner_given = false);
     void DropFeedSlot(std::string_view name, bool if_exists = false);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(bool include_lost = false);
+    struct FeedCounts {
+        std::size_t slots = 0U;
+        std::size_t watches = 0U;
+    };
+    // Durable slots, lost ones included, and open watches, slot watches
+    // included, under `lease`, a lease of this table.
+    [[nodiscard]] FeedCounts CountFeeds(const Lease& lease) const;
     [[nodiscard]] std::vector<std::uint32_t> ResolveFeedColumns(const std::vector<std::string>& names);
     // Monotonic, in this epoch, and no higher than the durable frontier. The
     // streaming layer must additionally check its last revision sent.
@@ -259,6 +277,8 @@ class Table : public std::enable_shared_from_this<Table> {
     friend struct BackupTestAccess;
     friend struct FeatureActivationTestAccess;
     friend struct CatalogTxnTestAccess;
+    // With `slot`, a slot watch's live reader: ring entries unprojected, in no projection group.
+    [[nodiscard]] std::unique_ptr<FeedSubscription> SubscribeFeed(const FeedOptions& options, bool slot);
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);
     [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name, const FeedOptions& options,
         bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner);
@@ -521,6 +541,30 @@ class TableCatalog {
     // end leaves the schema as it was: the next open drops the narrowing.
     // Holds the catalog's table operations for the whole check.
     void NarrowColumn(std::string_view name, std::string_view column, ColumnType type);
+    // ALTER COLUMN DROP NULL: makes NULL column `column` refuse NULL after
+    // checking every stored value as NarrowColumn does; writes that would
+    // leave the column NULL are refused while the check lasts, and a NULL
+    // found makes std::invalid_argument name its block.
+    void DropColumnNull(std::string_view name, std::string_view column);
+    // ALTER TABLE ... ADD CHECK: adds the check `check` makes from the
+    // current schema after evaluating it for every stored block as
+    // NarrowColumn checks values; writes that fail it are refused while the
+    // scan lasts, and a block that fails it makes CheckFailedError name it.
+    void AddCheck(std::string_view name, const std::function<CheckConstraint(const TableSchema&)>& check);
+    // ALTER TABLE ... RENAME TO (docs/design/RESTORE_TABLE.md): waits for
+    // running commands and backup pins, makes acknowledged writes durable,
+    // closes the table, renames its directory without replacing anything and
+    // opens it under `new_name` as a new Table; epoch, slots and data stay.
+    // With `users`, the grants on `name` move to `new_name`, a user's
+    // higher right kept where both names have one. After a crash the table
+    // has one of the two names. A failure to make the rename durable fences
+    // both names, a failure to open the renamed table fences `new_name`,
+    // until RecoverTable or a restart. `cancelled` ends the waits.
+    void RenameTable(std::string_view name, std::string_view new_name, UserRegistry* users, std::stop_token cancelled = {});
+    // Runs `change`, a GRANT or REVOKE, inside catalog admission, as DROP
+    // TABLE, RENAME TO and MIGRATE change grants: it sees their grant
+    // changes whole, before or after.
+    void ChangeGrants(const std::function<void()>& change);
 
     void SetMigrationTestHook(MigrationTestHook* hook) noexcept { migration_health_->hook.store(hook, std::memory_order_release); }
     [[nodiscard]] bool Migrate(const MigrationRequest& request, UserRegistry* users);
@@ -603,6 +647,12 @@ class TableCatalog {
     // writes from adding values that do not fit meanwhile. Returns the first
     // value that does not fit the narrower type.
     [[nodiscard]] std::optional<std::string> ScanNarrowing(Table& table);
+    // Records the check `start` makes, scans with ScanNarrowing and ends it
+    // with `finish`, or drops it and throws std::invalid_argument with
+    // `refusal` of the first value that fails (NarrowColumn, DropColumnNull).
+    void CheckColumnValues(std::string_view name, const std::function<TableSchema(const TableSchema&)>& start,
+        const std::function<TableSchema(const TableSchema&)>& finish,
+        const std::function<std::string(const std::string&)>& refusal);
     // Ends a narrowing check with `change` under the table's DDL lock. When
     // the manifest cannot be rewritten and the table still serves the
     // narrowing, the failure is logged and the table is fenced, so that

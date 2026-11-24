@@ -137,6 +137,7 @@ void AuditLog::Write(const Event& event) noexcept {
         if (!event.target_user.empty()) AppendField(line_, "target_user", event.target_user);
         if (!event.slot.empty()) AppendField(line_, "slot", event.slot);
         if (!event.migration.empty()) AppendField(line_, "migration", event.migration);
+        if (!event.change.empty()) AppendField(line_, "change", event.change);
         if (event.target_connection) {
             line_ += ",\"target_connection\":";
             line_ += std::to_string(*event.target_connection);

@@ -92,6 +92,24 @@ void TestChanges() {
     registry.ForgetTable("world");
     assert(!chunkdb::RightOn(*registry.Find("bot"), "world").has_value());
 
+    // Prefix grants and server rights stay through ForgetTable and a reopen.
+    const auto monitor = static_cast<std::uint8_t>(chunkdb::ServerRight::kMonitor);
+    registry.Grant("bot", "wor*", Right::kWrite);
+    registry.Grant("bot", "*", std::nullopt, monitor);
+    ExpectInvalid([&] { registry.Grant("bot", "_wor*", Right::kRead); }, "invalid table prefix");
+    ExpectInvalid([&] { registry.Grant("bot", "world", std::nullopt, monitor); }, "granted ON *");
+    registry.ForgetTable("world");
+    assert(chunkdb::RightOn(*registry.Find("bot"), "world") == Right::kWrite);
+    {
+        UserRegistry reopened(dir.path(), std::nullopt, kSecret);
+        const auto bot = reopened.Find("bot");
+        assert(bot && chunkdb::RightOn(*bot, "worlds") == Right::kWrite && bot->server_rights == monitor);
+        assert(*bot == *registry.Find("bot"));
+    }
+    registry.Revoke("bot", "wor*", Right::kRead);
+    registry.Revoke("bot", "*", std::nullopt, monitor);
+    assert(!chunkdb::RightOn(*registry.Find("bot"), "world").has_value() && registry.Find("bot")->server_rights == 0U);
+
     registry.SetVerifier("bot", VerifierOf("new"));
     assert(registry.Find("bot")->verifier == VerifierOf("new"));
 
@@ -275,7 +293,7 @@ void TestFormatRefusalPrecedesBookkeeping() {
         }
         return result;
     };
-    for (const auto version : {1U, 3U}) {
+    for (const auto version : {1U, 4U}) {
         auto unsupported = record;
         unsupported[4] = static_cast<std::uint8_t>(version);
         seal(unsupported);

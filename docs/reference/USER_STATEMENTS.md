@@ -1,7 +1,7 @@
 # CREATE USER, ALTER USER, DROP USER, GRANT, REVOKE, SHOW USERS
 
 You create login identities and grant access to tables.
-A right permits reading, writing, or administering a table.
+A right permits reading, writing, or administering tables, or reading server status and taking backups.
 
 ## Examples
 
@@ -41,14 +41,18 @@ OK
   name = admin
   manages_users = true
   requires_channel_binding = false
+  verifiers = 1
   grants:
     * = ADMIN
+  server_rights = []
 2)
   name = bot
   manages_users = false
   requires_channel_binding = false
+  verifiers = 1
   grants:
     world = READ
+  server_rights = []
 OK
 ```
 
@@ -57,18 +61,25 @@ OK
 ```text
 CREATE USER [IF NOT EXISTS] user VERIFIER verifier [MANAGES USERS] [REQUIRE CHANNEL BINDING]
 ALTER USER user VERIFIER verifier
+ALTER USER user ADD VERIFIER verifier
+ALTER USER user DROP OLD VERIFIER
 ALTER USER user [NO] MANAGES USERS
 ALTER USER user LIMIT max_connections = n [, statements_per_sec = n]
 ALTER USER user LIMIT statements_per_sec = n
 ALTER USER user [NO] REQUIRE CHANNEL BINDING
 DROP USER [IF EXISTS] user
 SHOW USERS
-GRANT right [, right ...] ON table | * TO user
-REVOKE right [, right ...] ON table | * FROM user
+GRANT right [, right ...] ON table | prefix* | * TO user
+REVOKE right [, right ...] ON table | prefix* | * FROM user
 ```
 
 The CLI accepts PASSWORD in place of VERIFIER and prompts twice unless you provide `--new-password-file`.
 VERIFIER accepts a quoted value or a binary client parameter.
+VERIFIER makes the verifier the user's only one.
+ADD VERIFIER gives the user a second verifier, and the user logs in with either password; see [Rotate a password](../USERS.md#rotate-a-password).
+The added verifier must use the salt and iteration count of the user's verifier, and a user has at most two.
+ADD VERIFIER with a verifier the user already has changes nothing.
+DROP OLD VERIFIER removes the older verifier, so only the added one logs in; on a user with one verifier it changes nothing.
 LIMIT requires MANAGES USERS and accepts either setting once, in either order.
 Zero disables a limit; `statements_per_sec` is at most 65536.
 Lowering `max_connections` leaves existing connections open and refuses new logins until their count falls below the limit.
@@ -77,6 +88,7 @@ CANCEL, KILL and ROLLBACK remain available when the statement limit is reached.
 Limit refusals return RATE_LIMITED with `reason` and `retry_after_ms` without applying the request or changing its transaction.
 Dropping and recreating a user does not transfer the old user's authenticated sessions to the new identity.
 A login still between HELLO and AUTH when the user gets a new verifier, gets REQUIRE CHANNEL BINDING for an unbound login, or is dropped fails with AUTH_FAILED.
+A login still between HELLO and AUTH when its password's verifier is removed by DROP OLD VERIFIER also fails with AUTH_FAILED; ADD VERIFIER does not stop a login.
 A right AUTH proof made before any other change of the user's verifier or channel binding requirement returns AUTH_FAILED with `reason=stale_login` without counting a bad password.
 A user dropped after a right AUTH proof was checked and before the connection is admitted also returns AUTH_FAILED with `reason=stale_login`.
 An unconfirmed users-record replacement returns OUTCOME_UNKNOWN with `stage=users_record` and publishes the whole visible record.
@@ -87,8 +99,10 @@ See [Protocol](../PROTOCOL.md) for authentication encoding.
 
 - `user`: `[a-z_][a-z0-9_]*`, from 1 through 63 bytes.
 - `verifier`: `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` with base64 parts, 4096 through 1000000 iterations, a salt of 16 through 256 bytes, and at most 512 bytes in all.
-- `right`: READ, WRITE, or ADMIN; ADMIN includes WRITE, and WRITE includes READ.
+- `right`: READ, WRITE, or ADMIN on tables; ADMIN includes WRITE, and WRITE includes READ.
+- `right` can also be MONITOR, BACKUP, or REPLICATION, server rights granted ON * only; see [Rights](../USERS.md#rights).
 - `table`: a valid table name, including one not yet created.
+- `prefix*`: every table whose name starts with `prefix`, written without a space before `*`, including tables created later; `prefix` is `[a-z][a-z0-9_]*`, from 1 through 64 bytes.
 - `*`: all tables, including tables created later.
 - `MANAGES USERS`: permission to manage users, rights, and backups, and to list GRANT and REVOKE migrations.
 - `REQUIRE CHANNEL BINDING`: the user logs in only with a login bound to its TLS connection; see [Channel binding](../USERS.md#channel-binding).
@@ -97,28 +111,30 @@ See [Protocol](../PROTOCOL.md) for authentication encoding.
 ## Returns
 
 - CREATE, ALTER, DROP, GRANT, and REVOKE: `OK`.
-- SHOW USERS: user names, MANAGES USERS state, REQUIRE CHANNEL BINDING state, and grants.
+- SHOW USERS: user names, MANAGES USERS state, REQUIRE CHANNEL BINDING state, the number of verifiers (1, or 2 after ADD VERIFIER), grants by table, `prefix*` or `*`, and `server_rights`, the list of MONITOR, BACKUP and REPLICATION the user holds.
 
 ## Errors
 
 | Error | When | What to do |
 | --- | --- | --- |
 | PERMISSION_DENIED | You lack MANAGES USERS or change another user's password without it. | Request access. |
-| INVALID_ARGUMENT | The name, verifier, rights, or final manager removal is invalid. | Correct the reported argument. |
+| INVALID_ARGUMENT | The name, prefix, verifier, rights, or final manager removal is invalid. | Correct the reported argument. |
+| INVALID_ARGUMENT | ADD VERIFIER names a user with two verifiers, or a verifier with another salt or iteration count. | Run DROP OLD VERIFIER first, or compute the verifier with the user's salt and iteration count. |
+| SYNTAX | MONITOR, BACKUP or REPLICATION is granted on a table or prefix rather than `*`. | Grant it ON *. |
 | INVALID_ARGUMENT | You change a user or a right on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | RATE_LIMITED | Repeated failures temporarily ban the source address. | Wait for the returned retry_after_ms. |
 | AUTH_FAILED | Login credentials are incorrect. | Check the password or use [Reset a forgotten password](../PASSWORD_RESET.md). |
 
 ## Notes
 
-You may change your own password without MANAGES USERS.
+You may change your own password without MANAGES USERS, including ADD VERIFIER and DROP OLD VERIFIER.
 The last user who manages users cannot be dropped or lose that right.
 Changes affect connections already logged in.
 Passwords use their exact UTF-8 bytes, without normalization.
 
 GRANT and REVOKE apply comma-separated lists atomically.
 REVOKE removes the named right and every higher right; revoking WRITE from ADMIN leaves READ.
-Dropping a table removes its table-specific grants, while wildcard grants remain.
+Dropping a table removes its table-specific grants, while prefix and wildcard grants remain.
 
 ## Limits
 

@@ -4,6 +4,7 @@
 
 #include <algorithm>
 #include <bit>
+#include <chrono>
 #include <barrier>
 #include <cassert>
 #include <cstdint>
@@ -24,6 +25,7 @@
 #include "../src/chunk_store_internal.hpp"
 #include "../src/store_manifest.hpp"
 #include "../src/sectioned_chunk_form.hpp"
+#include "../src/statement_control.hpp"
 #include "test_utils.hpp"
 
 namespace {
@@ -307,9 +309,9 @@ void TestHello() {
     assert(session.greeted);
     assert(Contains(hello, "$14\r\nmax_scan_limit\r\n:1024\r\n"));
     assert(Contains(hello, "$16\r\nserver_signature\r\n$"));
-    assert(Contains(hello, "$8\r\nfeatures\r\n*11\r\n$19\r\nprotocol_foundation\r\n"));
+    assert(Contains(hello, "$8\r\nfeatures\r\n*13\r\n$19\r\nprotocol_foundation\r\n"));
     assert(Contains(hello, "$12\r\nslot_filters\r\n$13\r\nslot_takeover\r\n$7\r\nlineage\r\n"));
-    assert(Contains(hello, "$19\r\nconnection_controls\r\n$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n$11\r\narea_paging\r\n"));
+    assert(Contains(hello, "$19\r\nconnection_controls\r\n$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n$11\r\narea_paging\r\n$10\r\narea_scale\r\n$22\r\nread_only_transactions\r\n"));
     ExpectError(engine.Execute(session, "HELLO 3\r\n"), "PROTOCOL HELLO was already sent");
     ExpectReply(engine.Execute(session, "PING\r\n"), "+PONG\r\n");
     // Commands of the retired protocol 2 are not statements.
@@ -708,6 +710,28 @@ void TestAreaStatements() {
         " 0 FROM world"), "INVALID_ARGUMENT");
 }
 
+// Paged GET AREA in a transaction resumes AFTER a cursor at its snapshot: a
+// chunk another session emptied in between is still returned as it was.
+void TestPagedAreaInTransactionAfterEmptyingWrite() {
+    Fixture f;
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN world id = 1"));
+    (void)VersionOf(f.Run("SET BLOCK 4 0 IN world id = 2"));
+    const std::string kept = f.Run("GET CHUNK 1 0 FROM world");
+    const std::string emptied_entry = "*3\r\n:1\r\n:0\r\n" + kept;
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    const std::string first = f.Run("GET AREA 0 0 TO 2 0 FROM world LIMIT 1");
+    assert(first.starts_with("%3\r\n$6\r\nchunks\r\n*1\r\n*3\r\n:0\r\n:0\r\n$"));
+    assert(first.ends_with("$4\r\nmore\r\n#t\r\n$5\r\nafter\r\n*2\r\n:0\r\n:0\r\n"));
+    chunkdb::SessionState writer;
+    ExpectReply(f.engine->Execute(writer, "HELLO 3\r\n").substr(0, 5), "%14\r\n");
+    assert(VersionOf(f.engine->Execute(writer, "DELETE BLOCK 4 0 FROM world\r\n")) > 0);
+    ExpectReply(f.Run("GET AREA 0 0 TO 2 0 FROM world AFTER 0 0 LIMIT 2"),
+        "%3\r\n$6\r\nchunks\r\n*1\r\n" + emptied_entry + "$4\r\nmore\r\n#f\r\n$5\r\nafter\r\n_\r\n");
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+    ExpectReply(f.Run("GET AREA 0 0 TO 2 0 FROM world AFTER 0 0 LIMIT 2"),
+        "%3\r\n$6\r\nchunks\r\n*0\r\n$4\r\nmore\r\n#f\r\n$5\r\nafter\r\n_\r\n");
+}
+
 // After a restart, area reads take chunks from the files without loading
 // them: the same form, version and values as a chunk read.
 void TestAreaFromFiles() {
@@ -975,16 +999,91 @@ void TestReadOnlySlotWithoutOwner() {
     assert(chunkdb::LoadFile(slots_file) == before);
 }
 
+// The integer a map reply holds under `key`.
+std::uint64_t MapInteger(const std::string& reply, const std::string& key) {
+    const std::string marker = "$" + std::to_string(key.size()) + "\r\n" + key + "\r\n:";
+    const auto at = reply.find(marker);
+    assert(at != std::string::npos);
+    return std::stoull(reply.substr(at + marker.size()));
+}
+
+void TestTableStats() {
+    Fixture f;
+    const auto empty = f.Run("SHOW TABLE STATS plain");
+    assert(empty.starts_with("%11\r\n") && MapInteger(empty, "chunks") == 0U && MapInteger(empty, "loaded_chunks") == 0U);
+    assert(MapInteger(empty, "slots") == 0U && MapInteger(empty, "watches") == 0U);
+    assert(MapInteger(empty, "files") >= 1U && MapInteger(empty, "disk_bytes") > 0U); // Its manifest at least.
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN plain bits = b'000000000001'"));
+    (void)VersionOf(f.Run("SET BLOCK 5 5 IN plain bits = b'000000000001'"));
+    ExpectReply(f.Run("CREATE SLOT 'consumer' ON plain"), "+OK\r\n");
+    auto subscription = f.catalog->Find("plain")->SubscribeFeed();
+    const auto written = f.Run("SHOW TABLE STATS plain");
+    assert(MapInteger(written, "chunks") == 2U && MapInteger(written, "loaded_chunks") == 2U);
+    assert(MapInteger(written, "slots") == 1U && MapInteger(written, "watches") == 1U);
+    assert(MapInteger(written, "files") > MapInteger(empty, "files") && MapInteger(written, "disk_bytes") > MapInteger(empty, "disk_bytes"));
+    subscription.reset();
+    assert(MapInteger(f.Run("SHOW TABLE STATS plain"), "watches") == 0U);
+    assert(MapInteger(f.Run("SHOW TABLE STATS world"), "chunks") == 0U);
+    ExpectError(f.Run("SHOW TABLE STATS absent"), "NO_TABLE");
+    // The listing stops when its statement is stopped.
+    struct StopHook final : chunkdb::CommandEngineTestHook {
+        chunkdb::StatementControl* control = nullptr;
+        void Run(Point point, std::string_view) override {
+            if (point == Point::kBeforeTableStatsListing) assert(control->RequestStop(chunkdb::StatementStopReason::kCancelled));
+        }
+    } stop;
+    {
+        chunkdb::StatementControl control(chunkdb::StatementControl::Clock::now(), 0U);
+        assert(control.Start());
+        stop.control = &control;
+        chunkdb::ScopedStatementControl context(&control);
+        f.engine->SetHookForTests(&stop);
+        ExpectError(f.Run("SHOW TABLE STATS plain"), "CANCELLED");
+        f.engine->SetHookForTests(nullptr);
+    }
+    // The directory is listed after the lease ends, so DROP, which waits for
+    // every lease, completes before the listing, which then finds no table.
+    struct DropHook final : chunkdb::CommandEngineTestHook {
+        std::shared_ptr<chunkdb::TableCatalog> catalog;
+        bool dropped = false;
+        void Run(Point point, std::string_view table) override {
+            if (point != Point::kBeforeTableStatsListing || table != "plain") return;
+            auto drop = std::async(std::launch::async, [&] { catalog->Drop("plain"); });
+            // Under a lease DROP would wait for this statement forever.
+            assert(drop.wait_for(std::chrono::seconds(30)) == std::future_status::ready);
+            drop.get();
+            dropped = true;
+        }
+    } hook;
+    hook.catalog = f.catalog;
+    f.engine->SetHookForTests(&hook);
+    ExpectError(f.Run("SHOW TABLE STATS plain"), "NO_TABLE");
+    assert(hook.dropped);
+    f.engine->SetHookForTests(nullptr);
+}
+
+void TestShowStatus() {
+    Fixture f;
+    const auto status = f.Run("SHOW STATUS");
+    assert(status.starts_with("%7\r\n$7\r\nversion\r\n$4\r\ntest\r\n$9\r\nuptime_ms\r\n:"));
+    assert(Contains(status, "\r\n$9\r\nread_only\r\n#f\r\n$9\r\ndirectory\r\n%4\r\n"));
+    assert(Contains(status, "$6\r\ntables\r\n*2\r\n%7\r\n$4\r\nname\r\n$5\r\nplain\r\n$5\r\nstate\r\n$2\r\nok\r\n$6\r\nreason\r\n_\r\n$7\r\nenabled\r\n*"));
+    assert(Contains(status, "%7\r\n$4\r\nname\r\n$5\r\nworld\r\n$5\r\nstate\r\n$2\r\nok\r\n$6\r\nreason\r\n_\r\n$7\r\nenabled\r\n*"));
+    assert(status.ends_with("$6\r\nfenced\r\n*0\r\n$18\r\nactivation_pending\r\n#f\r\n"));
+}
+
 void TestSlotStatements() {
     Fixture f;
     ExpectReply(f.Run("SHOW SLOTS"), "*0\r\n");
     ExpectReply(f.Run("CREATE SLOT 'consumer' ON world"), "+OK\r\n");
     ExpectReply(f.Run("CREATE SLOT 'other' ON plain"), "+OK\r\n");
     const auto world = f.catalog->Find("world")->ListFeedSlots().front();
-    std::string expected = "*1\r\n%9\r\n$5\r\ntable\r\n$5\r\nworld\r\n$4\r\nname\r\n$8\r\nconsumer\r\n$5\r\nepoch\r\n$32\r\n";
+    std::string expected = "*1\r\n%12\r\n$5\r\ntable\r\n$5\r\nworld\r\n$4\r\nname\r\n$8\r\nconsumer\r\n$5\r\nepoch\r\n$32\r\n";
     expected += chunkdb::StoreIdHex(world.position.epoch);
     expected += "\r\n$5\r\nacked\r\n:" + std::to_string(world.position.revision);
-    expected += "\r\n$14\r\nretained_bytes\r\n:0\r\n$4\r\nlost\r\n#f\r\n";
+    expected += "\r\n$8\r\nrevision\r\n:" + std::to_string(world.durable_watermark);
+    expected += "\r\n$13\r\nlag_revisions\r\n:" + std::to_string(world.durable_watermark - world.position.revision);
+    expected += "\r\n$14\r\nretained_bytes\r\n:0\r\n$8\r\nattached\r\n#f\r\n$4\r\nlost\r\n#f\r\n";
     expected += "$11\r\nlost_reason\r\n_\r\n$7\r\nfilters\r\n%5\r\n$4\r\narea\r\n_\r\n$10\r\ncolumn_ids\r\n_\r\n$7\r\ncolumns\r\n_\r\n$9\r\nno_before\r\n#f\r\n$6\r\nchunks\r\n#f\r\n$5\r\nowner\r\n_\r\n";
     ExpectReply(f.Run("SHOW SLOTS ON world"), expected); // No user records no owner.
     ExpectReply(f.Run("CREATE SLOT 'owned' ON plain OWNER bot NO BEFORE"), "+OK\r\n");
@@ -999,6 +1098,10 @@ void TestSlotStatements() {
     ExpectReply(f.Run("CREATE SLOT IF NOT EXISTS 'consumer' ON world"), "+OK\r\n");
     assert(!f.catalog->Find("world")->ListFeedSlots().front().owner);
     assert(f.Run("SHOW SLOTS").starts_with("*3\r\n"));
+    assert(f.Run("SHOW SLOTS PREFIX 'o'").starts_with("*2\r\n"));
+    const auto owned = f.Run("SHOW SLOTS ON plain PREFIX 'ow'");
+    assert(owned.starts_with("*1\r\n") && Contains(owned, "$4\r\nname\r\n$5\r\nowned\r\n"));
+    ExpectReply(f.Run("SHOW SLOTS ON world PREFIX 'other'"), "*0\r\n");
     ExpectError(f.Run("CREATE SLOT 'consumer' ON world"), "INVALID_ARGUMENT");
     ExpectError(f.Run("DROP SLOT 'missing' ON world"), "INVALID_ARGUMENT");
     ExpectError(f.Run("ACK 0"), "INVALID_ARGUMENT no slot watch is open");
@@ -1125,12 +1228,15 @@ int main(int argc, char** argv) {
     TestDistinctLargeMaximumParameters();
     TestChunkStatements();
     TestAreaStatements();
+    TestPagedAreaInTransactionAfterEmptyingWrite();
     TestAreaFromFiles();
     TestTableStatements();
     TestColumnTypeBeforeDefault();
     TestConditionalObjects();
     TestConcurrentConditionalCreate();
     TestScanChunks();
+    TestTableStats();
+    TestShowStatus();
     TestSlotStatements();
     TestReadOnlySlotWithoutOwner();
     TestSlotListingDuringDrop();

@@ -300,7 +300,7 @@ void RetainedIdentityPermissionsAndAudit() {
     SessionState reader, admin;
     assert(test::LoginOnEngine(engine, reader, "reader", std::string("reader-password")).starts_with("%"));
     assert(test::LoginOnEngine(engine, admin, "admin", std::string("admin-password")).starts_with("%"));
-    assert(engine.Execute(reader, "SHOW TABLE STATS t\r\n").starts_with("%5\r\n"));
+    assert(engine.Execute(reader, "SHOW TABLE STATS t\r\n").starts_with("%11\r\n"));
     Error(engine.Execute(reader, "COMPACT TOMBSTONES t BEFORE 1\r\n"), "PERMISSION_DENIED");
     Reply(engine.Execute(admin, "BEGIN\r\n"), "+OK\r\n");
     Error(engine.Execute(admin, "COMPACT TOMBSTONES t BEFORE 1\r\n"), "INVALID_ARGUMENT");
@@ -346,6 +346,138 @@ void ThreeDimensions() {
     Error(f.Run("GET CHUNK -1 -1 FROM t"), "INVALID_ARGUMENT");
     Error(f.Run("GET AREA -1 -1 TO 0 0 FROM t"), "INVALID_ARGUMENT");
 }
+// The forms of a scan reply's rows, in order; null rows are std::nullopt.
+std::vector<std::optional<ChunkState>> ScanForms(const Geometry& geometry, const std::string& reply) {
+    std::vector<std::optional<ChunkState>> forms;
+    const std::string chunks = "$6\r\nchunks\r\n*";
+    auto at = reply.find(chunks);
+    assert(at != std::string::npos);
+    at += chunks.size();
+    std::size_t rows = 0U;
+    at = static_cast<std::size_t>(std::from_chars(reply.data() + at, reply.data() + reply.size(), rows).ptr - reply.data()) + 2U;
+    for (std::size_t row = 0U; row < rows; ++row) {
+        std::size_t items = 0U;
+        assert(reply[at] == '*');
+        at = static_cast<std::size_t>(std::from_chars(reply.data() + at + 1U, reply.data() + reply.size(), items).ptr - reply.data()) + 2U;
+        for (std::size_t item = 0U; item + 1U < items; ++item) {
+            assert(reply[at] == ':');
+            at = reply.find("\r\n", at) + 2U;
+        }
+        if (reply.compare(at, 3U, "_\r\n") == 0) {
+            forms.emplace_back();
+            at += 3U;
+            continue;
+        }
+        assert(reply[at] == '$');
+        std::size_t length = 0U;
+        const auto start = static_cast<std::size_t>(
+            std::from_chars(reply.data() + at + 1U, reply.data() + reply.size(), length).ptr - reply.data()) + 2U;
+        forms.emplace_back(DecodeSectionedChunkState(geometry,
+            std::span(reinterpret_cast<const std::uint8_t*>(reply.data() + start), length), kVarMaxChunkBytesLimit));
+        at = start + length + 2U;
+    }
+    return forms;
+}
+
+std::string U64Frame(std::uint64_t value) {
+    std::string frame(8U, '\0');
+    for (std::size_t i = 0U; i < 8U; ++i) frame[i] = static_cast<char>((value >> (8U * i)) & 0xFFU);
+    return frame;
+}
+
+// SCAN CHUNKS WHERE keeps the matching blocks of each identity. Without
+// SINCE it lists the chunks with a match; with SINCE every changed identity,
+// null when no block matches. LIMIT bounds the identities a page visits and
+// `after` continues past those it left out.
+void ScanWhere() {
+    Fixture f;
+    Reply(f.Run("CREATE TABLE t (a u8 DEFAULT 0, name text(8) NULL) CHUNK 2 x 2 CHUNK COLUMNS (owner u8 DEFAULT 0)"), "+OK\r\n");
+    const auto first = Revision(f.Run("SET BLOCK 0 0 IN t a=5, name='x'"));
+    Revision(f.Run("SET BLOCK 1 0 IN t a=1"));
+    const auto skipped = Revision(f.Run("SET BLOCK 2 0 IN t a=1"));
+    const auto kept = Revision(f.Run("SET BLOCK 4 0 IN t a=9"));
+    const auto meta = Revision(f.Run("SET CHUNK 3 0 IN t META owner=2"));
+    const auto rows = [](std::initializer_list<std::pair<int, std::uint64_t>> chunks) {
+        std::string out = "$6\r\nchunks\r\n*" + std::to_string(chunks.size()) + "\r\n";
+        for (const auto& [x, version] : chunks)
+            out += "*3\r\n:" + std::to_string(x) + "\r\n:0\r\n:" + std::to_string(version) + "\r\n";
+        return out;
+    };
+    const auto zero_version = Revision(f.Run("SET BLOCK 1 1 IN t a=6"));
+    const auto last = std::string("$4\r\nmore\r\n#f\r\n$5\r\nafter\r\n_\r\n");
+    auto reply = f.Run("SCAN CHUNKS FROM t WHERE a > 2");
+    assert(reply.starts_with("%6\r\n" + rows({{0, zero_version}, {2, kept}}) + last));
+    // A page of two visits 0 0 and 1 0, keeps one and continues after 1 0.
+    reply = f.Run("SCAN CHUNKS FROM t WHERE a > 2 LIMIT 2");
+    assert(reply.starts_with("%6\r\n" + rows({{0, zero_version}}) + "$4\r\nmore\r\n#t\r\n$5\r\nafter\r\n*2\r\n:1\r\n:0\r\n"));
+    reply = f.Run("SCAN CHUNKS FROM t AFTER 1 0 LIMIT 2 WHERE a > 2");
+    assert(reply.starts_with("%6\r\n" + rows({{2, kept}}) + last));
+    reply = f.Run("SCAN CHUNKS FROM t AFTER 2 0 LIMIT 1 WHERE a > 2");
+    assert(reply.starts_with("%6\r\n" + rows({}) + last));
+    // NULL and false skip a block; chunk columns, positions and parameters.
+    assert(f.Run("SCAN CHUNKS FROM t WHERE NOT (name = 'x')").starts_with("%6\r\n" + rows({}) + last));
+    assert(f.Run("SCAN CHUNKS FROM t WHERE name IS NULL").starts_with("%6\r\n" + rows({{0, zero_version}, {1, skipped}, {2, kept}}) + last));
+    assert(f.Run("SCAN CHUNKS FROM t WHERE chunk.owner = 0 AND POS_X >= 2").starts_with("%6\r\n" + rows({{1, skipped}, {2, kept}}) + last));
+    assert(f.Run("SCAN CHUNKS FROM t WHERE a = $1", {U64Frame(9U)}).starts_with("%6\r\n" + rows({{2, kept}}) + last));
+    const auto plan = f.engine->PlanPayload(f.session, "SCAN CHUNKS FROM t WHERE a = $1 OR name = $2\r\n");
+    assert(plan.plan == CommandEngine::PayloadPlan::kParameters && (plan.parameter_limits == std::vector<std::size_t>{8U, 8U}));
+    // Without WHERE the reply keeps its five keys.
+    assert(f.Run("SCAN CHUNKS FROM t").starts_with("%5\r\n"));
+
+    // WITH DATA: a form of the matching blocks, with their text values only.
+    const auto geometry = f.catalog->Require("t")->geometry();
+    auto forms = ScanForms(geometry, f.Run("SCAN CHUNKS FROM t WHERE a = 1 OR a = 6 LIMIT 1 WITH DATA"));
+    assert(forms.size() == 1U && forms[0] && forms[0]->presence_bitmap == std::vector<std::uint8_t>{0x0A});
+    assert(forms[0]->vars.empty());
+    forms = ScanForms(geometry, f.Run("SCAN CHUNKS FROM t WHERE name = 'x' LIMIT 1 WITH DATA"));
+    assert(forms.size() == 1U && forms[0] && forms[0]->presence_bitmap == std::vector<std::uint8_t>{0x01});
+    assert(forms[0]->vars.size() == 1U);
+
+    // SINCE lists every changed identity: a chunk without a match, the
+    // metadata-only chunk and a deleted chunk come with null.
+    forms = ScanForms(geometry, f.Run("SCAN CHUNKS FROM t SINCE 0 WHERE a > 2 WITH DATA"));
+    assert(forms.size() == 4U && forms[0] && !forms[1] && forms[2] && !forms[3]);
+    assert(forms[0]->presence_bitmap == std::vector<std::uint8_t>{0x09});
+    const auto deleted = Revision(f.Run("DELETE BLOCK 4 0 FROM t"));
+    reply = f.Run("SCAN CHUNKS FROM t SINCE " + std::to_string(meta) + " WHERE a > 2 WITH DATA");
+    assert(reply.starts_with("%6\r\n$6\r\nchunks\r\n*2\r\n*4\r\n:0\r\n:0\r\n:" + std::to_string(zero_version) + "\r\n$"));
+    assert(reply.find("*4\r\n:2\r\n:0\r\n:" + std::to_string(deleted) + "\r\n_\r\n") != std::string::npos);
+    {
+        auto lease = f.catalog->Require("t")->Acquire();
+        lease->store().CheckpointForTests(0, 0);
+    }
+    reply = f.Run("SCAN CHUNKS FROM t SINCE " + std::to_string(zero_version) + " WHERE a > 2 WITH DATA");
+    assert(reply.starts_with("%6\r\n$6\r\nchunks\r\n*1\r\n*4\r\n:2\r\n:0\r\n:" + std::to_string(deleted) + "\r\n_\r\n"));
+    assert(first < skipped);
+
+    // Refusals.
+    const auto refused = [&f](std::string_view statement, std::string_view code) { Error(f.Run(statement), code); };
+    refused("SCAN CHUNKS FROM t WHERE b = 1", "INVALID_ARGUMENT");
+    refused("SCAN CHUNKS FROM t WHERE name > 1", "INVALID_ARGUMENT");
+    refused("SCAN CHUNKS FROM t WHERE a / 0 = 1", "INVALID_ARGUMENT");
+    refused("SCAN CHUNKS FROM t SINCE 0 WHERE a = 1", "SYNTAX");
+    refused("SCAN CHUNKS FROM t WHERE a = 1 WHERE a = 2", "SYNTAX");
+    Error(f.Run("SCAN CHUNKS FROM t WHERE a = $1", {std::string("a")}), "INVALID_ARGUMENT");
+    Reply(f.Run("BEGIN"), "+OK\r\n");
+    refused("SCAN CHUNKS FROM t WHERE a = 1", "INVALID_ARGUMENT");
+    Reply(f.Run("ROLLBACK"), "+OK\r\n");
+
+    // A server that opened its directory read-only runs WHERE reads.
+    const auto directory = f.directory.path();
+    f.engine.reset();
+    f.catalog.reset();
+    CatalogConfig config;
+    config.data_dir = directory;
+    config.background_maintenance = false;
+    config.access_mode = AccessMode::kReadOnly;
+    auto catalog = std::make_shared<TableCatalog>(config);
+    CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
+    SessionState session;
+    assert(engine.Execute(session, "HELLO 3\r\n").starts_with("%"));
+    assert(engine.Execute(session, "SCAN CHUNKS FROM t WHERE a = 6\r\n").starts_with("%6\r\n" + rows({{0, zero_version}})));
+    Reply(engine.Execute(session, "AGGREGATE AREA 0 0 TO 3 0 FROM t COUNT(*) WHERE a > 2\r\n"), "%1\r\n$8\r\ncount(*)\r\n:2\r\n");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -356,6 +488,7 @@ int main(int argc, char** argv) {
     else if (argc == 2 && std::string_view(argv[1]) == "--transactions") TransactionForms();
     else if (argc == 2 && std::string_view(argv[1]) == "--history") ScanHistoryLoss();
     else if (argc == 2 && std::string_view(argv[1]) == "--permissions") RetainedIdentityPermissionsAndAudit();
+    else if (argc == 2 && std::string_view(argv[1]) == "--scan-where") ScanWhere();
     else {
         assert(argc == 1);
         MetadataProjectionAndTombstone();
@@ -365,5 +498,6 @@ int main(int argc, char** argv) {
         ScanHistoryLoss();
         RetainedIdentityPermissionsAndAudit();
         ThreeDimensions();
+        ScanWhere();
     }
 }

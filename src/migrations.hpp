@@ -22,8 +22,14 @@ struct MigrationRequest {
     TableSchema schema;
     std::function<void(StoreManifest&)> alter;
     std::optional<std::pair<std::string, ColumnType>> narrowing;
+    // ALTER COLUMN ... DROP NULL of this column, checked as a narrowing is.
+    std::optional<std::string> drop_null{};
+    // ALTER TABLE ... ADD CHECK: the check made from the current schema,
+    // whose stored blocks are evaluated as a narrowing checks values.
+    std::function<CheckConstraint(const TableSchema&)> add_check{};
     std::string user;
-    Right right = Right::kRead;
+    std::optional<Right> right;
+    std::uint8_t server_rights = 0U;
     bool revoke = false;
     std::string slot;
     FeedSlotFilters slot_filters{};

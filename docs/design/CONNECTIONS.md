@@ -103,9 +103,9 @@ A request that arrives in several reads, waits on the poller or uses TLS reads t
 
 ## Session controls
 
-`SHOW CONNECTIONS` returns bounded entries with exact connection ids, user, peer, state and statement verb.
+`SHOW CONNECTIONS` returns bounded entries with exact connection ids, user, peer, state, statement verb and the progress a running statement reports.
 The listing either returns every authorized entry within the response bound or returns an explicit limit error before output; it never silently truncates.
-A user sees and controls only sessions from the same live user incarnation; ADMIN on `*` may inspect and control all sessions.
+A user sees and controls only sessions from the same live user incarnation; MONITOR may inspect all sessions, and ADMIN on `*` may inspect and control all sessions.
 Names alone do not identify an incarnation after DROP and CREATE.
 Authorization uses currently published rights at control admission.
 `CANCEL id` returns `{cancelled: bool}`; missing, idle and decision-entered targets return false.
@@ -121,7 +121,7 @@ Kill, cancel and feature activation emit audit events without statement paramete
 `ALTER USER u LIMIT max_connections = n, statements_per_sec = n` accepts either key once and rejects unknown, duplicate or invalid keys before publication.
 Zero disables a limit and the maximum accepted rate is 65536 statements per second.
 Each user incarnation owns its authenticated connection count and rate history under a separate lock.
-Authentication rechecks the same live incarnation and verifier generation before taking one connection ticket; a verifier or channel binding requirement change advances that generation.
+Authentication rechecks the same live incarnation and verifier generation before taking one connection ticket; removing or replacing a verifier, or changing the channel binding requirement, advances that generation, and ADD VERIFIER does not.
 Every ticket is released exactly once, including failed final HELLO output and user deletion.
 Lowering a connection limit preserves existing connections and refuses new admissions until below the limit.
 A rolling one-second rate window retains unexpired admissions when a limit is lowered.

@@ -57,6 +57,10 @@ std::map<std::string, Bytes> Tree(const std::filesystem::path& root) {
     std::map<std::string, Bytes> tree;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
         const auto relative = entry.path().lexically_relative(root).generic_string();
+        // An open catalog's heartbeat thread rewrites writer.meta through
+        // temporary files on its own schedule. It is not activation state,
+        // so it is skipped before anything reads it.
+        if (relative == ".chunkdb.lock/writer.meta" || relative.starts_with(".chunkdb.lock/writer.meta.tmp.")) continue;
         // The empty writer lock is held without sharing on Windows. Preserve
         // its inventory entry without reopening the live OS lock handle.
         if (relative == ".chunkdb.lock/writer.lock")
@@ -100,7 +104,9 @@ void RuntimeActivation() {
         const auto status = catalog.FeatureStatus();
         assert(!status.activation_pending && status.tables.size() == 2U);
         assert((status.directory.incompat & kFeatureSlotFilters) != 0U);
-        for (const auto& [name, flags] : status.tables) {
+        for (const auto& [name, features, fence] : status.tables) {
+            assert(features && !fence);
+            const auto& flags = *features;
             assert((flags.incompat & kFeatureSlotFilters) != 0U);
             assert((flags.compat & (1U << 29U)) != 0U);
             auto table = catalog.Find(name);
@@ -157,7 +163,7 @@ void CommitGroupsDormant() {
         const auto enable = engine.Execute(session, "ENABLE FEATURE 'commit_groups'\r\n");
         assert(enable.find("reason=unknown_feature") != std::string::npos);
         const auto status = engine.Execute(session, "SHOW STATUS\r\n");
-        assert(status.starts_with("%3\r\n") && status.find("commit_groups") == std::string::npos);
+        assert(status.starts_with("%7\r\n") && status.find("commit_groups") == std::string::npos);
         assert(Tree(dir.path()) == before);
     }
     const auto table_path = StoreManifestPath(dir.path() / "tables/alpha");
@@ -198,7 +204,7 @@ void RuntimeAdmissionAndRecovery() {
         assert(Tree(dir.path()) == before);
         assert(engine.Execute(session, "ENABLE FEATURE 'feed_slots'\r\n") == "+OK\r\n");
         assert(engine.Execute(session, "CREATE SLOT 'slot' ON alpha\r\n") == "+OK\r\n");
-        assert(engine.Execute(session, "SHOW STATUS\r\n").starts_with("%3\r\n"));
+        assert(engine.Execute(session, "SHOW STATUS\r\n").starts_with("%7\r\n"));
     }
     WriteFeatureActivationJournal(dir.path(), journal);
     config.access_mode = AccessMode::kReadOnly;
@@ -217,17 +223,22 @@ void RuntimePublishedFailure() {
     test::ScopedTempDir dir("chunkdb-feature-outcome");
     (void)Seed(dir.path()); CatalogConfig config; config.data_dir = dir.path(); config.background_maintenance = true;
     {
-        TableCatalog catalog(config);
-        assert(FeatureActivationTestAccess::MaintenanceRunning(*catalog.Find("alpha")));
-        auto subscriber = catalog.Find("alpha")->SubscribeFeed();
+        auto catalog = std::make_shared<TableCatalog>(config);
+        assert(FeatureActivationTestAccess::MaintenanceRunning(*catalog->Find("alpha")));
+        auto subscriber = catalog->Find("alpha")->SubscribeFeed();
         txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_FEATURE_ROOT_SYNC_FAIL_ONCE", "1");
-        try { (void)catalog.EnableFeature("slot_filters"); assert(false); }
+        try { (void)catalog->EnableFeature("slot_filters"); assert(false); }
         catch (const WriteOutcomeUnknownError& error) { assert(error.stage() == "feature_activation"); }
         assert(ReadFeatureActivationJournal(dir.path()));
-        assert(!FeatureActivationTestAccess::MaintenanceRunning(*catalog.Find("alpha")));
+        assert(!FeatureActivationTestAccess::MaintenanceRunning(*catalog->Find("alpha")));
         Reject([&] { (void)subscriber->Next(std::chrono::milliseconds(0)); }, "feature activation completion");
-        Reject([&] { (void)catalog.FeatureStatus(); }, "feature activation completion");
-        Reject([&] { (void)catalog.Find("alpha")->Acquire(); }, "feature activation completion");
+        Reject([&] { (void)catalog->FeatureStatus(); }, "feature activation completion");
+        Reject([&] { (void)catalog->Find("alpha")->Acquire(); }, "feature activation completion");
+        // SHOW STATUS refuses too: it never reports features or activation_pending it cannot know.
+        CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
+        SessionState session; (void)engine.Execute(session, "HELLO 3\r\n");
+        const auto status = engine.Execute(session, "SHOW STATUS\r\n");
+        assert(status.starts_with("-ERR ") && status.find("feature activation completion failed; restart the server to recover") != std::string::npos);
     }
     TableCatalog catalog(config);
     assert(!ReadFeatureActivationJournal(dir.path()));

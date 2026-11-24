@@ -171,9 +171,10 @@ bool IdleIo::Initialize(ServerConnection& connection) {
             if (const auto target = weak.lock()) {
                 std::lock_guard state_lock(target->record->mutex);
                 const auto& record = *target->record;
-                if (!access.admin_all && (access.user_incarnation == 0U || record.incarnation != access.user_incarnation)) continue;
+                if (!access.list_all && (access.user_incarnation == 0U || record.incarnation != access.user_incarnation)) continue;
                 visitor(ConnectionInfo{.id = id, .user = record.user, .peer = record.peer,
-                    .state = record.state, .statement = record.verb});
+                    .state = record.state, .statement = record.verb,
+                    .progress = record.statement ? record.statement->progress() : std::nullopt});
             }
         }
     };

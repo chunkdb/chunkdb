@@ -25,9 +25,15 @@
 #include "chunkdb/metrics.hpp"
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/reply.hpp"
+#include "chunkdb/statement_mutex.hpp"
 #include "chunkdb/table_catalog.hpp"
 
 namespace chunkdb {
+
+namespace cql {
+struct SetBlock;
+struct DeleteBlock;
+}  // namespace cql
 
 // The wire protocol this engine speaks: CQL statements with typed replies
 // (docs/PROTOCOL.md).
@@ -42,10 +48,12 @@ struct User;
 class ReadRightCheck;
 struct PendingLogin;
 enum class Right : std::uint8_t;
+enum class ServerRight : std::uint8_t;
 
 // Deterministic command interleavings, following the feed hooks.
 struct CommandEngineTestHook {
-    enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted, kBeforeTxnBudgetReclaim };
+    enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted, kBeforeTxnBudgetReclaim,
+        kAfterRestoreProgress, kAfterRestoreUserRead, kBeforeTableStatsListing };
     virtual ~CommandEngineTestHook() = default;
     virtual void Run(Point point, std::string_view table) = 0;
 };
@@ -101,6 +109,8 @@ struct StatementLogInfo {
     const char* verb = nullptr;
     // The audit event, null for statements the audit log leaves out.
     const char* audit_event = nullptr;
+    // Which ALTER USER form ran, e.g. "add_verifier"; null for other statements.
+    const char* change = nullptr;
     std::string table;
     std::string target_user;
     std::string slot;
@@ -148,6 +158,9 @@ struct SessionTransaction {
     // budget->mutex.
     bool in_statement = false;
     std::chrono::steady_clock::time_point started;
+    // BEGIN READ ONLY: writes are refused, reads keep no read set, and COMMIT
+    // only ends it.
+    bool read_only = false;
     // The table of the first statement and the snapshot it took; empty
     // before.
     std::string table{};
@@ -201,11 +214,15 @@ struct SessionControlAccess {
     std::uint64_t requester_connection_id = 0U;
     std::uint64_t user_incarnation = 0U;
     bool admin_all = false;
+    // Lists every connection without controlling it: ADMIN on `*` or MONITOR.
+    bool list_all = false;
 };
 
 struct ConnectionInfo {
     std::uint64_t id = 0U;
     std::string user, peer, state, statement;
+    // What the running statement reported done; std::nullopt when it reports nothing.
+    std::optional<StatementProgress> progress{};
 };
 
 struct SessionControlCallbacks {
@@ -357,6 +374,8 @@ class CommandEngine {
     EngineConfig config_;
     std::shared_ptr<TableCatalog> catalog_;
     std::shared_ptr<MetricsRegistry> metrics_;
+    // SHOW STATUS reports the time since.
+    const std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
     std::mutex auth_failures_mutex_;
     std::unordered_map<std::string, IpAuthFailureState> auth_failures_by_ip_;
     // The open transactions and their bytes.
@@ -436,6 +455,12 @@ class CommandEngine {
     [[nodiscard]] std::optional<Right> RightOnTable(SessionState& session, const std::string& table) const;
     void RequireRight(SessionState& session, const std::string& table, Right needed) const;
     void RequireRightOnEveryTable(SessionState& session, Right needed) const;
+    // Whether the session's user holds `right`; every right without auth.
+    [[nodiscard]] bool HasServerRight(SessionState& session, ServerRight right) const;
+    // MONITOR, or ADMIN on `*`, which includes what MONITOR allows.
+    void RequireMonitor(SessionState& session) const;
+    // CREATE TABLE: ADMIN on the name, on a prefix of it, or on `*`.
+    void RequireCreateRight(SessionState& session, const std::string& table) const;
     void RequireManagesUsers(SessionState& session) const;
     // Records a reply in the command metrics.
     void ObserveReply(
@@ -445,7 +470,7 @@ class CommandEngine {
     [[nodiscard]] std::string HandleMetrics() const;
 
     // Transactions (engine_cql.cpp, docs/design/TRANSACTIONS_DESIGN.md).
-    [[nodiscard]] std::string TxnBegin(SessionState& session);
+    [[nodiscard]] std::string TxnBegin(SessionState& session, bool read_only);
     [[nodiscard]] std::string TxnCommit(SessionState& session);
     // The conflict a transaction past --txn-max-duration-ms ends with.
     [[nodiscard]] TransactionConflictError TxnDurationConflict() const;
@@ -484,6 +509,16 @@ class CommandEngine {
         ChunkStore& store,
         const ChunkCoord& coord,
         const std::function<void(ChunkState&)>& change);
+    // SET BLOCK (`set`) or DELETE BLOCK (`del`) with IF <expr> or values
+    // that read the block (docs/design/EXPRESSIONS_DESIGN.md): the condition
+    // and values are evaluated under the chunk's lock with the write, or
+    // against the transaction's view.
+    [[nodiscard]] std::string BlockWriteWithExpressions(
+        SessionState& session,
+        const cql::SetBlock* set,
+        const cql::DeleteBlock* del,
+        std::span<const std::optional<std::string>> parameters,
+        MetricsRegistry::CommandClass& command_class);
 };
 
 }  // namespace chunkdb

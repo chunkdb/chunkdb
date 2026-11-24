@@ -25,11 +25,13 @@ SessionControlAccess CommandEngine::ControlAccess(SessionState& session) const {
     SessionControlAccess access{.requester_connection_id = session.connection_id};
     if (!config_.require_auth) {
         access.admin_all = true;
+        access.list_all = true;
         return access;
     }
     if (const User* user = CurrentUser(session)) {
         access.user_incarnation = session.user_incarnation;
         access.admin_all = RightOn(*user, "*") == Right::kAdmin;
+        access.list_all = access.admin_all || chunkdb::HasServerRight(*user, ServerRight::kMonitor);
     }
     return access;
 }
@@ -64,12 +66,15 @@ std::string CommandEngine::ListConnections(SessionState& session) const {
             if (count == std::numeric_limits<std::size_t>::max()) throw ConnectionResponseLimit();
             header = Digits(count + 1U) + 3U;
             check(4U);
-            Protocol::AppendMapHeader(reply, 5U);
-            bulk("id");
-            std::string id;
-            Protocol::AppendInteger(id, item.id);
-            check(id.size());
-            reply += id;
+            Protocol::AppendMapHeader(reply, 6U);
+            const auto number = [&](std::string_view key, std::uint64_t value) {
+                bulk(key);
+                std::string encoded;
+                Protocol::AppendInteger(encoded, value);
+                check(encoded.size());
+                reply += encoded;
+            };
+            number("id", item.id);
             const auto field = [&](std::string_view key, std::string_view value, bool nullable) {
                 bulk(key);
                 if (nullable && value.empty()) { check(3U); Protocol::AppendNull(reply); }
@@ -79,6 +84,18 @@ std::string CommandEngine::ListConnections(SessionState& session) const {
             field("peer", item.peer, false);
             field("state", item.state, false);
             field("statement", item.statement, true);
+            bulk("progress");
+            if (!item.progress) {
+                check(3U);
+                Protocol::AppendNull(reply);
+            } else {
+                check(4U);
+                Protocol::AppendMapHeader(reply, 4U);
+                number("files_done", item.progress->files_done);
+                number("files_total", item.progress->files_total);
+                number("bytes_done", item.progress->bytes_done);
+                number("bytes_total", item.progress->bytes_total);
+            }
             ++count;
         });
         std::string prefix;

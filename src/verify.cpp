@@ -51,7 +51,17 @@ namespace {
 struct VerifyCounters : chunkdb::VerifyCounters {
     std::ostream* out = nullptr;
     bool features = false;
+    // The highest revision seen in the table being checked.
+    std::uint64_t highest_revision = 0;
+    // Set by SurveyRevisions: errors a version-clock rebuild cannot repair, and
+    // the highest revision of each table.
+    std::uint64_t* damage = nullptr;
+    std::vector<chunkdb::TableRevisions>* tables = nullptr;
 };
+
+void ObserveRevision(VerifyCounters* counters, std::uint64_t revision) {
+    counters->highest_revision = std::max(counters->highest_revision, revision);
+}
 
 // Emits `text` as a double-quoted token with C-style escapes, so a path or
 // detail containing spaces, quotes, or control characters cannot break the
@@ -100,6 +110,9 @@ void Report(
     const std::string& detail) {
     if (is_error) {
         ++counters->errors;
+        if (counters->damage != nullptr && code != "version_clock_missing" && code != "version_clock_invalid" &&
+            code != "initialized_marker_invalid")
+            ++*counters->damage;
     } else {
         ++counters->warnings;
     }
@@ -218,6 +231,7 @@ CheckedIndex VerifyIndex(const std::filesystem::path& root, const chunkdb::Geome
     if (!inventory) throw std::runtime_error("missing or unreadable coordinate inventory");
     result.inventory = chunkdb::ReadIndexInventory(inventory, Measure(inventory, path), geometry,
         manifest.store_id, [&](const auto& entry) { entries.emplace(entry.coord, entry); });
+    ObserveRevision(counters, result.inventory.retained_deletion_floor);
     const auto read_log = [&](const std::filesystem::path& log_path, const chunkdb::LargeChunkCoord& large,
         std::optional<std::uint64_t> cut, bool listed) {
         ++counters->checked;
@@ -232,8 +246,10 @@ CheckedIndex VerifyIndex(const std::filesystem::path& root, const chunkdb::Geome
         for (const auto& [coord, record] : checked.latest) {
             (void)coord;
             (void)geometry.LayoutAt(record.schema_version);
+            ObserveRevision(counters, record.revision);
         }
         for (const auto& [coord, boundary] : checked.empty_boundaries) {
+            ObserveRevision(counters, boundary.revision);
             if (boundary.kind == chunkdb::ChunkIndexKind::kForget &&
                 (!listed || boundary.revision > result.inventory.retained_deletion_floor))
                 throw std::runtime_error("coordinate forget record has no matching inventory floor");
@@ -341,6 +357,7 @@ void VerifyChunkArtifacts(const std::filesystem::path& root, const chunkdb::Geom
             payload = std::move(image.payload); presence = std::move(image.presence_bitmap);
             vars = std::move(image.vars); columns = std::move(image.chunk_columns);
             revision = image.revision; time = image.commit_time_ms; schema = image.schema_version;
+            ObserveRevision(counters, revision);
         } catch (const std::exception& error) {
             Report(counters, true, "chunk_image_invalid", image_path, error.what());
             return; // An invalid image grants no empty replay base.
@@ -380,7 +397,10 @@ void VerifyChunkArtifacts(const std::filesystem::path& root, const chunkdb::Geom
                     Report(counters, true, "wal_vars_inconsistent", wal_path, replay.vars_problem);
                     return;
                 }
-                if (replay.applied_frames != 0U) { revision = replay.revision; time = replay.commit_time_ms; }
+                if (replay.applied_frames != 0U) {
+                    revision = replay.revision; time = replay.commit_time_ms;
+                    ObserveRevision(counters, revision);
+                }
                 if (revision != 0U) schema = geometry.layout().schema().version;
             }
         }
@@ -439,6 +459,8 @@ void VerifyFeedArtifacts(
         const auto records = chunkdb::ReadFeedSlotRecords(root, manifest.store_id, geometry.dims());
         if (records) {
             ++counters->checked;
+            ObserveRevision(counters, records->durable_watermark);
+            for (const auto& slot : records->slots) ObserveRevision(counters, slot.written);
             if (!enabled) Report(counters, true, "feed_slots_without_feature", records_path, "feed slots feature is absent");
             if (records->filter_format && (manifest.features.incompat & chunkdb::kFeatureSlotFilters) == 0U)
                 Report(counters, true, "slot_filters_without_feature", records_path, "slot filters feature is absent");
@@ -487,7 +509,8 @@ void VerifyFeedArtifacts(
         }
         try {
             if (descriptor) {
-                (void)ReadArchiveBase(directory, geometry, manifest, coord, first);
+                const auto binding = ReadArchiveBase(directory, geometry, manifest, coord, first);
+                ObserveRevision(counters, binding.descriptor.base_revision);
                 continue;
             }
             if (base) {
@@ -495,6 +518,7 @@ void VerifyFeedArtifacts(
                     coord, manifest.store_id, manifest.features), geometry,
                     coord, manifest.store_id, manifest.features);
                 if (image.revision >= first) throw std::runtime_error("base revision overlaps the archive WAL");
+                ObserveRevision(counters, image.revision);
                 const auto descriptor_path = directory / chunkdb::ArchiveBaseFileName(coord, geometry.dims(), first);
                 if (std::filesystem::exists(descriptor_path)) {
                     (void)ReadArchiveBase(directory, geometry, manifest, coord, first);
@@ -544,6 +568,7 @@ void VerifyFeedArtifacts(
                 throw std::runtime_error("archive WAL is damaged: " + replay.stop_reason + " " + replay.vars_problem);
             if (replay.applied_frames == 0U || chunkdb::ReadLe64(first_revision, 0U) != first || replay.revision != last)
                 throw std::runtime_error("archive revision range disagrees with its name");
+            ObserveRevision(counters, last);
         } catch (const std::exception& error) {
             Report(counters, true, base || descriptor ? "feed_archive_base_invalid" : "feed_archive_wal_invalid", file.path(), error.what());
         }
@@ -562,6 +587,7 @@ void VerifyFeedArtifacts(
 // Verifies one table directory (a store): its manifest, bookkeeping, chunk
 // images, WALs and conditional intents.
 void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters) {
+    counters->highest_revision = 0;
     bool initialized_marker_present = false;
     bool has_storage_artifacts = false;
 
@@ -599,6 +625,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                             "; data owned by those features was not checked");
                 }
                 store_geometry.emplace(manifest->geometry, manifest->schema, *manifest->chunk_schema);
+                if (manifest->lineage) ObserveRevision(counters, manifest->lineage->fork_revision);
                 store_manifest = manifest;
             }
         } else {
@@ -923,6 +950,7 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
                             "expected a checked transaction intent named txn-<version>.rollback");
                         continue;
                     }
+                    ObserveRevision(counters, intent.version);
                     Report(
                         counters,
                         false,
@@ -1154,6 +1182,7 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
     std::sort(tables.begin(), tables.end());
     for (const auto& table : tables) {
         VerifyTable(table, counters);
+        if (counters->tables != nullptr) counters->tables->push_back({table, counters->highest_revision});
         if (check_tables) {
             try {
                 const auto root = chunkdb::ReadDataDirManifest(data_dir);
@@ -1197,6 +1226,21 @@ chunkdb::VerifyCounters chunkdb::VerifyDataDirectory(
     }
     VerifyDataDirectoryImpl(data_dir, &counters);
     return counters;
+}
+
+chunkdb::RevisionSurvey chunkdb::SurveyRevisions(const std::filesystem::path& data_dir, std::ostream& out) {
+    RevisionSurvey survey;
+    ::VerifyCounters counters;
+    counters.out = &out;
+    counters.damage = &survey.damage;
+    counters.tables = &survey.tables;
+    VerifyDataDirectoryImpl(data_dir, &counters);
+    survey.counters = static_cast<const chunkdb::VerifyCounters&>(counters);
+    // A damaged root manifest is already counted as damage.
+    if (survey.damage == 0U) {
+        if (const auto root = ReadDataDirManifest(data_dir)) survey.version_floor = DataDirVersionFloor(*root);
+    }
+    return survey;
 }
 
 chunkdb::VerifyCounters chunkdb::VerifyTableDirectory(

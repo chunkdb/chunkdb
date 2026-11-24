@@ -100,19 +100,42 @@ class UserRegistry {
     // is evaluated only after the registry lock confirms the user is absent.
     void Create(const std::string& name, const std::function<scram::Verifier()>& make_verifier,
         bool manages_users, bool if_not_exists = false, bool requires_channel_binding = false);
+    // Makes `verifier` the only verifier of `name`.
     void SetVerifier(const std::string& name, scram::Verifier verifier);
     // Sets the verifier of `name` only while it is still `incarnation`;
     // false, changing nothing, once that user was dropped.
     [[nodiscard]] bool SetOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier);
+    // Adds `verifier` as the second verifier of `name`, which then logs in
+    // with either. Also refuses a user that already has two and a verifier
+    // that RequireAddableVerifier refuses. A verifier the user already has
+    // changes nothing, so a retry succeeds.
+    void AddVerifier(const std::string& name, scram::Verifier verifier);
+    // DropOldVerifier makes the added verifier of `name` its only one. A
+    // user with one verifier is left as it is.
+    void DropOldVerifier(const std::string& name);
+    // The same for the user's own verifiers, like SetOwnVerifier.
+    [[nodiscard]] bool AddOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier);
+    [[nodiscard]] bool DropOwnOldVerifier(const std::string& name, std::uint64_t incarnation);
     void SetManagesUsers(const std::string& name, bool manages_users);
     void SetRequiresChannelBinding(const std::string& name, bool requires_channel_binding);
     void Drop(const std::string& name, bool if_exists = false);
-    void Grant(const std::string& name, const std::string& table, Right right);
+    // `table` is a table, a prefix grant `p*` or `*`; ServerRight bits in
+    // `server_rights` need `*`.
+    void Grant(const std::string& name, const std::string& table, std::optional<Right> right, std::uint8_t server_rights = 0U);
     // Removes `right` and those above it on `table`: a user who had ADMIN
     // keeps WRITE after REVOKE ADMIN, and keeps nothing after REVOKE READ.
-    void Revoke(const std::string& name, const std::string& table, Right right);
-    // Removes the grants on a dropped table.
+    void Revoke(const std::string& name, const std::string& table, std::optional<Right> right, std::uint8_t server_rights = 0U);
+    // Removes the grants on a dropped table; prefix and `*` grants stay.
     void ForgetTable(const std::string& table);
+    // The right each user held on a table before CopyTableGrants changed it,
+    // or none.
+    using TableGrants = std::map<std::string, std::optional<Right>>;
+    // Gives `to` the grants on `from`, keeping a user's higher right where
+    // both have one, for a table renamed from `from` to `to`. Sets `previous`
+    // to what RestoreTableGrants needs to take the change back, also when it
+    // throws UsersOutcomeUnknownError.
+    void CopyTableGrants(const std::string& from, const std::string& to, TableGrants& previous);
+    void RestoreTableGrants(const std::string& to, const TableGrants& previous);
     [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
     void SetMigrationHealth(std::shared_ptr<MigrationHealth> health);
     void SetMigrationTestHook(MigrationTestHook* hook) noexcept { test_hook_.store(hook, std::memory_order_release); }
@@ -127,6 +150,10 @@ class UserRegistry {
     void Update(Change&& change);
     template <typename Change>
     void UpdateIf(Change&& change);
+    // Applies `change` to the user `name` while it is still `incarnation`;
+    // false once that user was dropped.
+    template <typename Change>
+    [[nodiscard]] bool UpdateOwn(const std::string& name, std::uint64_t incarnation, Change&& change);
     [[nodiscard]] std::shared_ptr<const Users> Published() const;
     // What publishing `next` changes besides it: admission state, the
     // incarnation of each user and the rights view. Prepared under mutex_

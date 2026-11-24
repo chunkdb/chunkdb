@@ -1,6 +1,6 @@
 # Expressions (engine)
 Conditions (`IF`, `WHERE`) and computed assignments (`SET BLOCK ... coins = coins + $1`) share one expression engine in `src/expr.hpp`.
-This note records its semantics as implemented; statements do not use it yet.
+This note records its semantics as implemented; SET BLOCK and DELETE BLOCK use it for IF and computed values (#145), and AGGREGATE and SCAN CHUNKS for WHERE; see the last two sections.
 
 ## Grammar
 
@@ -82,3 +82,39 @@ An expression has at most 256 nodes (values, columns, operators and list items) 
 Beyond them, and for anything the grammar refuses, parsing throws `ParseError` (`SYNTAX`).
 Parsing recurses only through parentheses, so it is bounded by the depth limit.
 Planning and evaluation throw `std::invalid_argument` (`INVALID_ARGUMENT`) and `std::out_of_range` (`OUT_OF_RANGE`).
+
+## Statements
+
+Every statement plans its expressions against the table's columns; each `$n` takes the type the plan gives it, and the server bounds its frame by that type before reading it.
+`NOW()` is the commit time in writes and the start time in reads (docs/DESIGN-2.0.md E1).
+
+## IF and computed values in writes
+
+SET BLOCK keeps its parse when every value is a single value or parameter followed by a comma, IF or the end; otherwise it reads the whole value list again as assignments, so a statement without expressions keeps its parse, plan and write path (`cql::SetBlock::expressions` stays null).
+DELETE BLOCK and SET BLOCK take `IF <condition>` after the values; IF VERSION combines with computed values but not with a condition.
+`IF VERSION $n` takes the version from a u64 frame and runs on this path, so the plain path keeps its literal version.
+The statement plans its expressions against the table's columns when it runs.
+`ChunkStore::WriteBlockDecided` holds the chunk's statement lock from the read to the write: after the chunk's backlog it decodes the block, and the chunk columns when the plan names one, issues the commit time that `NOW()` reads and the write takes, evaluates, and writes through the same locked path as SET BLOCK and DELETE BLOCK.
+It decodes only the block columns the plan reads, and takes the decision as a non-owning callable reference, which does not allocate.
+A false or unknown condition answers `CONDITION_FAILED current=<chunk version>` and writes no WAL frame, revision or feed change; IF VERSION with computed values still answers VERSION_MISMATCH.
+In a transaction the expressions read the transaction's copy of the chunk, or the block at the snapshot, before the chunk joins the write set, so a refused statement takes no write room and copies nothing.
+A condition, or a value that reads a block or chunk column, adds the chunk to the read set.
+`NOW()` is refused in a transaction's write, since its commit time is known only at COMMIT; a client passes the time as a parameter (decision).
+A condition needs READ and WRITE, which WRITE alone gives.
+
+## WHERE in reads
+
+AGGREGATE and SCAN CHUNKS (E5, E6) evaluate WHERE once per present block; absent positions are not evaluated, since a read has no block to return or count there.
+A chunk without chunk-column values reads the columns' defaults.
+AGGREGATE adds every requested cell to a transaction's read set, as without WHERE: any block's write can change which blocks match.
+SCAN CHUNKS without SINCE omits chunks with no match; with SINCE it lists every changed identity, with null data when no block matches, so a filtered copy converges; SINCE with WHERE needs WITH DATA, since the rows would otherwise ignore WHERE.
+LIMIT counts visited identities, so the page's reads stay bounded; the reply adds `after`, the last visited identity, because the last row need not be.
+
+## CHECK constraints
+
+A table's checks (docs/reference/TABLES.md) are conditions stored as text in the schema and planned once per schema version against its block columns.
+A block fails a check only when the condition is false (`EvaluatesFalse`): unknown passes, as in SQL, where IF and WHERE treat it as false.
+Checks refuse parameters, chunk columns, NOW() and EXISTS, so a block's result depends only on its own values and position.
+RENAME COLUMN rewrites the column's name in the text (`RenameColumnIn`), keeping a quoted name quoted and quoting a keyword; undoing the step renames it back.
+A table's checks are planned at the first write that needs them; a geometry that is only read never plans them.
+A write evaluates a check only for a block it adds, or whose columns read by the check it changes; a single-block write is evaluated before it reserves a version, and COMMIT evaluates under the commit locks against the chunks as the transaction read them.

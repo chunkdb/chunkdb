@@ -1,5 +1,6 @@
 #include "cql.hpp"
 #include "cql_lexer.hpp"
+#include "expr.hpp"
 
 #include <algorithm>
 #include <array>
@@ -304,10 +305,10 @@ std::string StatementSuggestion(std::string_view word) {
     const auto lower = Lower(word);
     if (lower == "select") return "; read with GET BLOCK, GET AREA or GET CHUNK";
     if (lower == "insert" || lower == "update" || lower == "upsert") return "; write with SET BLOCK or SET CHUNK";
-    const std::array<std::string_view, 26U> keywords{
+    const std::array<std::string_view, 27U> keywords{
         "get", "set", "delete", "create", "alter", "drop", "show", "describe", "grant", "revoke",
         "begin", "commit", "rollback", "ping", "flush", "watch", "unwatch", "ack", "backup", "migrate",
-        "scan", "reload", "recover", "compact", "restore", "swap"};
+        "scan", "reload", "recover", "compact", "restore", "swap", "aggregate"};
     std::string_view closest;
     std::size_t best = word.size() < 4U ? 2U : 3U;
     bool tied = false;
@@ -566,8 +567,21 @@ class Parser {
     bool FeedFilter(Filters& filters) {
         const auto column = Peek().column;
         if (Accept("area")) {
-            if (filters.area) Fail(column, "AREA is given twice");
-            filters.area = FeedBounds();
+            if constexpr (requires { filters.areas; }) {
+                if (!filters.areas.empty()) Fail(column, "AREA is given twice");
+                filters.areas.push_back(FeedBounds());
+                while (AcceptToken(TokenKind::kComma)) {
+                    const auto next = Peek().column;
+                    Expect("area");
+                    if (filters.areas.size() == kMaxFeedAreas) Fail(next, "a watch takes at most 64 areas");
+                    filters.areas.push_back(FeedBounds());
+                    if (filters.areas.back().dims != filters.areas.front().dims) Fail(next, "AREA dimensions differ");
+                }
+            } else {
+                if (filters.area) Fail(column, "AREA is given twice");
+                filters.area = FeedBounds();
+                if (Peek().kind == TokenKind::kComma) Fail(Peek().column, "a slot takes one AREA");
+            }
         } else if (Accept("columns")) {
             if (filters.columns) Fail(column, "COLUMNS is given twice");
             filters.columns = FeedColumns();
@@ -594,12 +608,55 @@ class Parser {
         return true;
     }
 
-    [[nodiscard]] std::optional<std::uint64_t> IfVersion() {
-        if (!Accept("if")) {
-            return std::nullopt;
+    // Drops the tokens read ahead of the next one and returns the offset
+    // where the next token starts, so an expression parser can take over.
+    std::size_t Rewind() {
+        if (next_ < tokens_.size()) {
+            at_ = tokens_[next_].column - 1U;
+            tokens_.resize(next_);
         }
-        Expect("version");
-        return Unsigned("a version", std::numeric_limits<std::uint64_t>::max());
+        return at_;
+    }
+
+    // SET BLOCK's values: single values followed by IF or the end, as
+    // before expressions; otherwise every value is an expression
+    // (docs/design/EXPRESSIONS_DESIGN.md), parsed into `*expressions`.
+    void BlockValues(std::vector<Assignment>* values, std::shared_ptr<expr::WriteExpressions>* expressions) {
+        const std::size_t start = Rewind();
+        const std::size_t mark = next_;
+        const std::set<std::size_t> before = parameters_;
+        try {
+            *values = Assignments();
+            if (Peek().kind == TokenKind::kEnd || IsKeyword(Peek(), "if")) return;
+        } catch (const ParseError&) {
+            // Not single values: read again as expressions below.
+        }
+        values->clear();
+        next_ = mark;
+        tokens_.resize(mark);
+        at_ = start;
+        parameters_ = before;
+        *expressions = std::make_shared<expr::WriteExpressions>();
+        (*expressions)->assignments = expr::ParseAssignmentsAt(line_, &at_, &parameters_);
+    }
+
+    // IF VERSION n, or IF <expr> into `*expressions`, or nothing.
+    void BlockCondition(std::optional<std::uint64_t>* if_version, std::shared_ptr<expr::WriteExpressions>* expressions) {
+        if (!Accept("if")) return;
+        const std::size_t after = Rewind();
+        if (expr::IsVersionClause(line_.substr(after))) {
+            Expect("version");
+            if (Peek().kind != TokenKind::kParameter) {
+                *if_version = Unsigned("a version", std::numeric_limits<std::uint64_t>::max());
+                return;
+            }
+            // IF VERSION $n: read where the parameter's frame is.
+            if (!*expressions) *expressions = std::make_shared<expr::WriteExpressions>();
+            (*expressions)->version_parameter = std::get<Parameter>(Value(true)).index;
+            return;
+        }
+        if (!*expressions) *expressions = std::make_shared<expr::WriteExpressions>();
+        (*expressions)->condition = expr::ParseConditionAt(line_, &at_, &parameters_);
     }
 
     [[nodiscard]] std::uint8_t Point(std::int64_t& x, std::int64_t& y, std::int64_t& z, bool chunk = false) {
@@ -611,6 +668,79 @@ class Parser {
         }
         z = 0;
         return 2;
+    }
+
+    // After WHERE: the condition (expr.hpp), up to the first token that
+    // cannot continue it. Its parameters join the statement's.
+    [[nodiscard]] std::shared_ptr<const expr::Expression> Where() {
+        // The expression lexes from the end of the last token read, so no
+        // token after WHERE may have been read yet.
+        if (next_ != tokens_.size()) throw std::logic_error("WHERE was parsed after a lookahead");
+        return std::make_shared<const expr::Expression>(expr::ParseConditionAt(line_, &at_, &parameters_));
+    }
+
+    // After AGGREGATE: CHUNK c | AREA a TO b | AREA AROUND c RADIUS r, then
+    // FROM t, the functions, WHERE and BY CHUNK.
+    [[nodiscard]] Aggregate AggregateStatement() {
+        Aggregate aggregate;
+        if (Accept("chunk")) {
+            aggregate.dims = Point(aggregate.x0, aggregate.y0, aggregate.z0, true);
+            aggregate.x1 = aggregate.x0;
+            aggregate.y1 = aggregate.y0;
+            aggregate.z1 = aggregate.z0;
+        } else if (Accept("area")) {
+            if (Accept("around")) {
+                aggregate.around = true;
+                aggregate.dims = Point(aggregate.x0, aggregate.y0, aggregate.z0);
+                Expect("radius");
+                aggregate.radius = static_cast<std::int64_t>(Unsigned("a radius", std::numeric_limits<std::int64_t>::max()));
+            } else {
+                aggregate.dims = Point(aggregate.x0, aggregate.y0, aggregate.z0);
+                Expect("to");
+                if (Point(aggregate.x1, aggregate.y1, aggregate.z1) != aggregate.dims)
+                    Fail(1, "AREA endpoints have different dimensions");
+            }
+        } else {
+            Fail(Peek().column, "expected CHUNK or AREA, got " + Quote(Peek()));
+        }
+        Expect("from");
+        aggregate.table = Name("a table name");
+        do {
+            const auto column = Peek().column;
+            AggregateFunction function;
+            using Kind = AggregateFunction::Kind;
+            if (Accept("count")) function.kind = Kind::kCount;
+            else if (Accept("sum")) function.kind = Kind::kSum;
+            else if (Accept("min")) function.kind = Kind::kMin;
+            else if (Accept("max")) function.kind = Kind::kMax;
+            else if (Accept("avg")) function.kind = Kind::kAvg;
+            else Fail(column, "expected COUNT, SUM, MIN, MAX or AVG, got " + Quote(Peek()));
+            ExpectToken(TokenKind::kOpen, "(");
+            if (function.kind == Kind::kCount) {
+                if (Peek().kind != TokenKind::kStar) Fail(Peek().column, "COUNT takes *, got " + Quote(Peek()));
+                Take();
+            } else {
+                function.column = Name("a column name");
+            }
+            ExpectToken(TokenKind::kClose, ")");
+            if (std::find(aggregate.functions.begin(), aggregate.functions.end(), function) != aggregate.functions.end())
+                Fail(column, AggregateFunctionName(function) + " is given twice");
+            aggregate.functions.push_back(std::move(function));
+        } while (AcceptToken(TokenKind::kComma));
+        while (true) {
+            const auto column = Peek().column;
+            if (Accept("by")) {
+                if (aggregate.by_chunk) Fail(column, "BY CHUNK is given twice");
+                Expect("chunk");
+                aggregate.by_chunk = true;
+            } else if (Accept("where")) {
+                if (aggregate.where) Fail(column, "WHERE is given twice");
+                aggregate.where = Where();
+            } else {
+                break;
+            }
+        }
+        return aggregate;
     }
 
     [[nodiscard]] std::vector<Assignment> Assignments() {
@@ -679,10 +809,42 @@ class Parser {
                     Fail(column, "DEFAULT is given twice");
                 }
                 definition.default_value = Value(false);
+            } else if (Accept("check")) {
+                definition.checks.push_back(Check());
             } else {
                 return definition;
             }
         }
+    }
+
+    // After CHECK: [name] '(' condition ')'. The condition (expr.hpp) takes
+    // no parameters; its text is kept as written.
+    [[nodiscard]] CheckDefinition Check() {
+        CheckDefinition check;
+        if (Peek().kind == TokenKind::kWord) check.name = Name("a check name");
+        ExpectToken(TokenKind::kOpen, "(");
+        // The condition lexes from the end of the last token read, as WHERE.
+        if (next_ != tokens_.size()) throw std::logic_error("CHECK was parsed after a lookahead");
+        const std::size_t start = at_;
+        std::set<std::size_t> parameters;
+        (void)expr::ParseConditionAt(line_, &at_, &parameters);
+        if (!parameters.empty()) Fail(start + 1U, "CHECK takes no parameters");
+        std::string_view text = line_.substr(start, at_ - start);
+        const auto first = text.find_first_not_of(" \t");
+        const auto last = text.find_last_not_of(" \t");
+        check.expression = std::string(text.substr(first, last + 1U - first));
+        ExpectToken(TokenKind::kClose, ")");
+        return check;
+    }
+
+    // A column of CHUNK COLUMNS or ADD COLUMN, which take no CHECK.
+    [[nodiscard]] ColumnDefinition DefinitionWithoutCheck(const char* where) {
+        const std::size_t column = Peek().column;
+        auto definition = Definition();
+        if (!definition.checks.empty()) Fail(column, std::string(where) + " takes no CHECK; " +
+            (std::string_view(where) == "ADD COLUMN" ? "add the column, then ALTER TABLE ... ADD CHECK"
+                                                     : "CHECK reads block columns"));
+        return definition;
     }
 
     [[nodiscard]] Option OptionAssignment() {
@@ -733,26 +895,38 @@ class Parser {
         return value;
     }
 
-    // GRANT <right>, ... ON <table | *> TO <user>, or REVOKE ... FROM <user>.
+    // GRANT <right>, ... ON <table | prefix* | *> TO <user>, or REVOKE ...
+    // FROM <user>. Server rights go ON * only.
     [[nodiscard]] GrantRight GrantOrRevoke(bool revoke) {
         GrantRight grant;
         grant.revoke = revoke;
-        bool first = true;
+        const auto server = [&grant](ServerRight right) { grant.server_rights |= static_cast<std::uint8_t>(right); };
         do {
             Right right;
+            if (Accept("monitor")) { server(ServerRight::kMonitor); continue; }
+            if (Accept("backup")) { server(ServerRight::kBackup); continue; }
+            if (Accept("replication")) { server(ServerRight::kReplication); continue; }
             if (Accept("read")) right = Right::kRead;
             else if (Accept("write")) right = Right::kWrite;
             else if (Accept("admin")) right = Right::kAdmin;
-            else Fail(Peek().column, "expected READ, WRITE or ADMIN, got " + Quote(Peek()));
-            if (first || (revoke ? right < grant.right : right > grant.right)) grant.right = right;
-            first = false;
+            else Fail(Peek().column, "expected READ, WRITE, ADMIN, MONITOR, BACKUP or REPLICATION, got " + Quote(Peek()));
+            if (!grant.right || (revoke ? right < *grant.right : right > *grant.right)) grant.right = right;
         } while (AcceptToken(TokenKind::kComma));
         Expect("on");
+        const std::size_t target = Peek().column;
         if (AcceptToken(TokenKind::kStar)) {
             grant.table = kEveryTable;
         } else {
-            grant.table = Name("a table name or *");
+            const std::size_t end = Peek().column + Peek().text.size();
+            grant.table = Name("a table name, a prefix followed by *, or *");
+            // `p*` written without a space is a prefix grant.
+            if (Peek().kind == TokenKind::kStar && Peek().column == end) {
+                Take();
+                grant.table += '*';
+            }
         }
+        if (grant.server_rights != 0U && grant.table != kEveryTable)
+            Fail(target, "MONITOR, BACKUP and REPLICATION are granted ON *");
         Expect(revoke ? "from" : "to");
         grant.user = Name("a user name");
         return grant;
@@ -786,6 +960,9 @@ class Parser {
             }, statement);
             if (!allowed || !parameters_.empty())
                 Fail(start + 1U, "MIGRATE takes one schema statement without parameters");
+            if (const auto* alter = std::get_if<AlterTable>(&migration.statement);
+                alter != nullptr && std::holds_alternative<RenameTable>(alter->change))
+                Fail(start + 1U, "MIGRATE cannot rename a table; run ALTER TABLE ... RENAME TO on its own");
             const auto end = line_.find_last_not_of(" \t");
             migration.text = std::string(line_.substr(start, end == std::string_view::npos ? 0U : end + 1U - start));
             return migration;
@@ -847,20 +1024,38 @@ class Parser {
                         if (Point(coord.x, coord.y, coord.z, true) != get.dims)
                             Fail(column, "AREA cursor has different dimensions");
                         get.after = coord;
+                    } else if (Accept("scale")) {
+                        if (get.scale) Fail(column, "SCALE is given twice");
+                        ChunkFormScale scale;
+                        const auto factor = Peek().column;
+                        scale.factor = static_cast<std::uint32_t>(Unsigned("a scale", std::numeric_limits<std::uint32_t>::max()));
+                        if (scale.factor == 0U) Fail(factor, "a scale must be positive");
+                        Expect("using");
+                        const auto reduction = Peek().column;
+                        if (Accept("max")) scale.reduction = ChunkFormReduction::kMax;
+                        else if (Accept("min")) scale.reduction = ChunkFormReduction::kMin;
+                        else if (Accept("mode")) scale.reduction = ChunkFormReduction::kMode;
+                        else if (Accept("first")) scale.reduction = ChunkFormReduction::kFirst;
+                        else if (Accept("any")) scale.reduction = ChunkFormReduction::kAny;
+                        else Fail(reduction, "expected MAX, MIN, MODE, FIRST or ANY, got " + Quote(Peek()));
+                        get.scale = scale;
                     } else break;
                 }
                 return get;
             }
             Fail(Peek().column, "expected BLOCK, CHUNK or AREA, got " + Quote(Peek()));
         }
+        if (Accept("aggregate")) return AggregateStatement();
         if (Accept("set")) {
             if (Accept("block")) {
                 SetBlock set;
                 set.dims = Point(set.x, set.y, set.z);
                 Expect("in");
                 set.table = Name("a table name");
-                set.values = Assignments();
-                set.if_version = IfVersion();
+                std::shared_ptr<expr::WriteExpressions> expressions;
+                BlockValues(&set.values, &expressions);
+                BlockCondition(&set.if_version, &expressions);
+                set.expressions = std::move(expressions);
                 return set;
             }
             if (Accept("chunk")) {
@@ -896,7 +1091,9 @@ class Parser {
             del.dims = Point(del.x, del.y, del.z);
             Expect("from");
             del.table = Name("a table name");
-            del.if_version = IfVersion();
+            std::shared_ptr<expr::WriteExpressions> expressions;
+            BlockCondition(&del.if_version, &expressions);
+            del.expressions = std::move(expressions);
             return del;
         }
         if (Accept("create")) {
@@ -952,7 +1149,7 @@ class Parser {
                         if (chunk_columns) Fail(column, "CHUNK COLUMNS is given twice");
                         chunk_columns = true;
                         ExpectToken(TokenKind::kOpen, "(");
-                        do { create.chunk_columns.push_back(Definition()); } while (AcceptToken(TokenKind::kComma));
+                        do { create.chunk_columns.push_back(DefinitionWithoutCheck("CHUNK COLUMNS")); } while (AcceptToken(TokenKind::kComma));
                         ExpectToken(TokenKind::kClose, ")");
                     } else {
                         if (chunk) Fail(column, "CHUNK is given twice");
@@ -969,6 +1166,8 @@ class Parser {
                     create.large = std::make_pair(axes[0], axes[1]);
                     large_dims = axes.size();
                     if (axes.size() == 3U) create.large_depth = axes[2];
+                } else if (Accept("check")) {
+                    create.checks.push_back(Check());
                 } else if (Accept("with")) {
                     if (with) Fail(column, "WITH is given twice");
                     with = true;
@@ -986,6 +1185,13 @@ class Parser {
                 alter.user = Name("a user name");
                 if (Accept("verifier")) {
                     alter.verifier = Verifier();
+                } else if (Accept("add")) {
+                    Expect("verifier");
+                    alter.added_verifier = Verifier();
+                } else if (Accept("drop")) {
+                    Expect("old");
+                    Expect("verifier");
+                    alter.drop_old_verifier = true;
                 } else if (Accept("limit")) {
                     do {
                         const auto column = Peek().column;
@@ -1019,16 +1225,30 @@ class Parser {
             AlterTable alter;
             alter.table = Name("a table name");
             if (Accept("add")) {
+                if (Accept("check")) {
+                    alter.change = AddCheck{.check = Check()};
+                    return alter;
+                }
                 const bool chunk_column = Accept("chunk");
                 Expect("column");
                 const bool conditional = IfNotExists();
-                alter.change = AddColumn{.column = Definition(), .if_not_exists = conditional, .chunk_column = chunk_column};
+                alter.change = AddColumn{
+                    .column = DefinitionWithoutCheck("ADD COLUMN"), .if_not_exists = conditional, .chunk_column = chunk_column};
             } else if (Accept("drop")) {
+                if (Accept("check")) {
+                    const bool conditional = IfExists();
+                    alter.change = DropCheck{.name = Name("a check name"), .if_exists = conditional};
+                    return alter;
+                }
                 const bool chunk_column = Accept("chunk");
                 Expect("column");
                 const bool conditional = IfExists();
                 alter.change = DropColumn{.column = Name("a column name"), .if_exists = conditional, .chunk_column = chunk_column};
             } else if (Accept("rename")) {
+                if (Accept("to")) {
+                    alter.change = RenameTable{.new_name = Name("a table name")};
+                    return alter;
+                }
                 const bool chunk_column = Accept("chunk");
                 Expect("column");
                 RenameColumn rename;
@@ -1039,8 +1259,28 @@ class Parser {
                 alter.change = rename;
             } else if (Accept("alter")) {
                 Expect("column");
+                const auto column_name = Name("a column name");
+                const bool set = Accept("set");
+                if (set || Accept("drop")) {
+                    using Change = AlterColumnAttribute::Change;
+                    AlterColumnAttribute attribute;
+                    attribute.column = column_name;
+                    if (Accept("default")) {
+                        attribute.change = set ? Change::kSetDefault : Change::kDropDefault;
+                        if (set) attribute.value = Value(false);
+                    } else if (Accept("null")) {
+                        attribute.change = set ? Change::kSetNull : Change::kDropNull;
+                    } else if (Accept("required")) {
+                        attribute.change = set ? Change::kSetRequired : Change::kDropRequired;
+                    } else {
+                        Fail(Peek().column, "expected DEFAULT, NULL or REQUIRED, got " + Quote(Peek()));
+                    }
+                    alter.change = std::move(attribute);
+                    return alter;
+                }
                 AlterColumnType change;
-                change.column = Name("a column name");
+                change.column = column_name;
+                if (!IsKeyword(Peek(), "type")) Fail(Peek().column, "expected TYPE, SET or DROP, got " + Quote(Peek()));
                 Expect("type");
                 change.type = Type();
                 if (Accept("using")) {
@@ -1102,6 +1342,7 @@ class Parser {
             if (Accept("slots")) {
                 ShowSlots show;
                 if (Accept("on")) show.table = Name("a table name");
+                if (Accept("prefix")) show.prefix = SlotName();
                 return show;
             }
             if (Accept("users")) {
@@ -1164,7 +1405,12 @@ class Parser {
             return Ping{};
         }
         if (Accept("begin")) {
-            return Begin{};
+            Begin begin;
+            if (Accept("read")) {
+                Expect("only");
+                begin.read_only = true;
+            }
+            return begin;
         }
         if (Accept("commit")) {
             return Commit{};
@@ -1238,9 +1484,13 @@ class Parser {
                 } else if (Accept("columns")) {
                     if (!scan.columns.empty()) Fail(column, "COLUMNS is given twice");
                     scan.columns = FeedColumns();
+                } else if (Accept("where")) {
+                    if (scan.where) Fail(column, "WHERE is given twice");
+                    scan.where = Where();
                 } else break;
             }
             if (!scan.columns.empty() && !scan.with_data) Fail(1, "COLUMNS requires WITH DATA");
+            if (scan.where && scan.since && !scan.with_data) Fail(1, "WHERE with SINCE requires WITH DATA");
             return scan;
         }
         throw UnknownCommandError("column " + std::to_string(first.column) + ": unknown statement " +
@@ -1282,6 +1532,13 @@ std::size_t CountParameterTokens(std::string_view line) noexcept {
 
 Parsed Parse(std::string_view line) {
     return Parser(line).Statement();
+}
+
+std::string AggregateFunctionName(const AggregateFunction& function) {
+    using Kind = AggregateFunction::Kind;
+    const char* name = function.kind == Kind::kCount ? "count" : function.kind == Kind::kSum ? "sum"
+        : function.kind == Kind::kMin ? "min" : function.kind == Kind::kMax ? "max" : "avg";
+    return std::string(name) + "(" + (function.kind == Kind::kCount ? std::string("*") : function.column) + ")";
 }
 
 HelloRequest ParseHello(std::string_view line) {

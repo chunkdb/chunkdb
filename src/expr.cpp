@@ -1222,6 +1222,28 @@ std::vector<AssignmentExpression> ParseAssignmentsAt(
     return values;
 }
 
+std::string RenameColumnIn(std::string_view text, std::string_view from, std::string_view to) {
+    const Condition condition = ParseCondition(text);
+    // Token starts, ascending, of the names to replace.
+    std::vector<std::size_t> starts;
+    for (const auto& node : condition.expression.nodes) {
+        if (node.op == Op::kColumn && node.name == from) starts.push_back(node.column - 1U);
+    }
+    std::sort(starts.begin(), starts.end());
+    std::string renamed;
+    std::size_t copied = 0U;
+    for (const auto start : starts) {
+        const bool quoted = text[start] == '"';
+        const std::size_t length = quoted ? text.find('"', start + 1U) + 1U - start : from.size();
+        renamed.append(text.substr(copied, start - copied));
+        if (quoted || IsKeyword(to)) renamed.append("\"").append(to).append("\"");
+        else renamed.append(to);
+        copied = start + length;
+    }
+    renamed.append(text.substr(copied));
+    return renamed;
+}
+
 bool IsVersionClause(std::string_view after_if) {
     try {
         std::size_t at = 0;
@@ -1250,7 +1272,7 @@ ColumnList::ColumnList(std::vector<Column> block, std::vector<Column> chunk)
 
 namespace {
 
-std::optional<ColumnBinding> Find(const std::vector<Column>& columns, std::string_view name) {
+std::optional<ColumnBinding> Find(std::span<const Column> columns, std::string_view name) {
     for (std::size_t i = 0; i < columns.size(); ++i) {
         if (columns[i].name == name) {
             return ColumnBinding{.id = columns[i].id, .slot = i, .type = columns[i].type, .nullable = columns[i].nullable};
@@ -1266,6 +1288,14 @@ std::optional<ColumnBinding> ColumnList::BlockColumn(std::string_view name) cons
 }
 
 std::optional<ColumnBinding> ColumnList::ChunkColumn(std::string_view name) const {
+    return Find(chunk_, name);
+}
+
+std::optional<ColumnBinding> ColumnSpans::BlockColumn(std::string_view name) const {
+    return Find(block_, name);
+}
+
+std::optional<ColumnBinding> ColumnSpans::ChunkColumn(std::string_view name) const {
     return Find(chunk_, name);
 }
 
@@ -1289,6 +1319,38 @@ const std::vector<ParameterType>& ConditionPlan::parameters() const {
 
 const std::vector<ParameterType>& AssignmentsPlan::parameters() const {
     return program().parameters;
+}
+
+namespace {
+[[nodiscard]] bool ProgramReads(const Program& program, Op op) {
+    return std::any_of(program.steps.begin(), program.steps.end(), [op](const Step& step) { return step.op == op; });
+}
+
+[[nodiscard]] std::vector<std::size_t> ProgramBlockSlots(const Program& program) {
+    std::vector<std::size_t> slots;
+    for (const auto& step : program.steps) {
+        if (step.op == Op::kColumn) slots.push_back(step.slot);
+    }
+    std::sort(slots.begin(), slots.end());
+    slots.erase(std::unique(slots.begin(), slots.end()), slots.end());
+    return slots;
+}
+}  // namespace
+
+std::vector<std::size_t> ConditionPlan::BlockSlots() const {
+    return ProgramBlockSlots(program());
+}
+
+std::vector<std::size_t> AssignmentsPlan::BlockSlots() const {
+    return ProgramBlockSlots(program());
+}
+
+bool ConditionPlan::Reads(Op op) const {
+    return ProgramReads(program(), op);
+}
+
+bool AssignmentsPlan::Reads(Op op) const {
+    return ProgramReads(program(), op);
 }
 
 const std::vector<ColumnBinding>& AssignmentsPlan::targets() const {

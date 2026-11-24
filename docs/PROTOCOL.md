@@ -71,10 +71,12 @@ Before authentication HELLO takes at most 12 parameters; a HELLO with more recei
 
 `client_name` and `statement_timeout_ms` apply; `default_tag` is stored with `reason=implementation_pending`.
 The effective statement timeout appears in `options`, including the server default when HELLO omits it.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, and `area_paging`.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, and `read_only_transactions`.
 Options become visible only after authentication succeeds.
 Returning and expression ceilings describe reserved limits; their capabilities remain unavailable.
 The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
+The `area_scale` feature permits GET AREA SCALE and its downsampled forms.
+The `read_only_transactions` feature permits BEGIN READ ONLY and SCAN CHUNKS inside it.
 A chunk too large for an empty page ends the page before it and is then refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=... required=... limit=...`; see [chunks](reference/CHUNKS.md#limits).
 The configured positive area bounds appear as both `max_area_chunks`/`max_response_bytes` and `limits.max_area_chunks`/`limits.max_area_response_bytes`.
 `limits.txn_max_written_chunks` and `limits.txn_max_read_chunks` are the configured transaction chunk-count bounds.
@@ -90,10 +92,12 @@ See [session negotiation](design/PROTOCOL_FOUNDATION.md#handshake-and-session-ow
 
 ## Session controls
 
-`SHOW CONNECTIONS` returns an array of maps containing `id`, `user`, `peer`, `state`, and `statement`.
+`SHOW CONNECTIONS` returns an array of maps containing `id`, `user`, `peer`, `state`, `statement`, and `progress`.
 An unauthenticated user or an idle statement is represented by NULL in its field.
+`progress` is NULL unless the running statement reports progress; a running `RESTORE TABLE` reports a map of integers `files_done`, `files_total`, `bytes_done`, and `bytes_total` for its copy of the backup.
+The map appears when the copy starts; `progress` is NULL while the restore checks the backup before the copy and once the statement completes, including while its reply is written.
 The reply includes every authorized connection or fails with `OUT_OF_RANGE reason=response_limit`; it never truncates the listing.
-Users control sessions belonging to their current user incarnation; ADMIN on `*` may control every session.
+Users control sessions belonging to their current user incarnation; ADMIN on `*` may control every session, and MONITOR may list every session.
 
 `CANCEL id` returns `{cancelled: bool}` and accepts cancellation only before the target statement enters its irreversible decision.
 Missing, idle, decision-entered and self targets return false.
@@ -110,6 +114,7 @@ That count determines the number of following frames.
 Valid statements use unique indices from `$1` through `$n`; frames bind by numeric index even when references appear out of order.
 Each frame is `$<byte length>\r\n<bytes>\r\n`; `$-1\r\n` means NULL.
 These are data bytes and are never parsed as CQL text.
+A parameter in a WHERE condition is encoded as the type of the column it is compared or combined with.
 
 | Column / value | Parameter bytes |
 |---|---|
@@ -119,9 +124,11 @@ These are data bytes and are never parsed as CQL text.
 | bits(N) | ceil(N/8) bytes, lowest bit first. |
 | text, bytes | UTF-8 text or uninterpreted bytes, within the column bound. |
 | SET CHUNK | Chunk form defined by [Chunk form](#chunk-form). |
+| Expression | The type of the column operand it meets ([Conditions](CQL.md#conditions)). |
+| IF VERSION $n | 8-byte little-endian u64. |
 
 The server bounds a frame before reading its body where the statement's schema permits it.
-For SET BLOCK, it also bounds the sum of actual declared frame lengths at 67117056 bytes. Each header is checked before allocating or reading its payload; small values remain accepted when their columns allow larger maxima. NULL frames add no payload bytes. SET CHUNK retains its separate chunk-form bound.
+For SET BLOCK and DELETE BLOCK, it also bounds the sum of actual declared frame lengths at 67117056 bytes. Each header is checked before allocating or reading its payload; small values remain accepted when their columns allow larger maxima. NULL frames add no payload bytes. SET CHUNK retains its separate chunk-form bound.
 An oversized typed frame or aggregate closes the connection after its error.
 Invalid statements, missing tables and unknown parameter columns drain their frames under `--max-unparsed-parameter-bytes`, default 1048576 payload bytes.
 Before HELLO, a non-handshake statement or wrong protocol version receives PROTOCOL and closes without waiting for advertised frames.
@@ -156,8 +163,14 @@ Never-written chunks and identities forgotten by tombstone compaction have null 
 Schema versions remain known for absent rows and empty areas; area consistency otherwise remains unchanged.
 Coordinate tuples contain exactly `dims` signed values: x and y, then z only in a three-dimensional table.
 SCAN CHUNKS returns a map with `chunks`, `more`, `epoch`, nullable completed `position`, and `retained_deletion_floor`.
+With WHERE, the map adds `after` after `more`: the coordinates of the last chunk the page visited, or null when `more` is false.
 Its rows are `[coordinates..., chunk_version]`, with a form-or-null appended under WITH DATA.
+Rows ascend by cx, then cy, then cz.
 SINCE includes retained deletions and refuses a revision below the deletion floor with `RESYNC_REQUIRED reason=history_lost floor=... epoch=...`, adding `current` when known.
+AGGREGATE returns a map from each function's lowercase name, such as `count(*)` or `sum(a)`, to its result, in statement order.
+With BY CHUNK it returns an array of rows `[coordinates..., results...]`, one per chunk with a present block that matches WHERE, in coordinate order.
+COUNT(*) is an integer; SUM, MIN and MAX of integer columns are integers or big numbers; AVG and float SUM are doubles; float MIN and MAX are doubles that keep the column value, so an f32 prints at f32 precision; a function over no value is null.
+See [AGGREGATE](reference/AGGREGATE.md#returns) for the rules.
 
 ## Chunk form
 
@@ -175,11 +188,14 @@ Kinds are strictly increasing, and section bodies are contiguous after the direc
 | 4 Variable values | Entries `column_id:u32, block_index:u32, length:u32, bytes:length`. |
 | 5 Chunk columns | Complete checked one-row metadata encoding. |
 | 6 Block spans | `count:u32`, then fixed-column descriptors. |
+| 7 Scale | `scale:u32`, `reduction:u16`, and zero `reserved:u16`. |
 
 A block-span descriptor is six `u32` fields: stable column ID, width in bits, values offset, values length, validity offset, and validity length.
 Offsets are relative to the corresponding fixed or validity body; a nonnullable descriptor has zero validity offset and length.
 Descriptors follow the requested projection or schema order and cover each packed body exactly.
 The local block index is `x + width * (y + height * z)`; inactive z is zero.
+Section 7 marks a downsampled form from GET AREA SCALE: its presence, values and spans describe samples, one per group of blocks, with width, height and active depth each divided by `scale`.
+Its reductions are 1 MAX, 2 MIN, 3 MODE, 4 FIRST and 5 ANY; see [downsampled areas](reference/CHUNKS.md#downsampled-areas).
 Padding bits are zero, and absent blocks contain no retained values.
 Chunk-column bodies start with `count:u32` and a directory of `column_id:u32, null_flags:u16, reserved_zero:u16, offset:u32, length:u32` entries in stable-ID order.
 Flag 1 means null; all other flag bits are invalid.
@@ -187,7 +203,7 @@ Offsets are relative to the metadata body, and values follow the complete direct
 Scalar value bytes use the parameter encodings above; null values have no bytes.
 
 Read clients validate the complete directory and may retain unknown sections or fixed types as opaque data.
-SET CHUNK refuses unknown sections and requires exactly the current schema and requested projection.
+SET CHUNK refuses unknown sections and section 7, and requires exactly the current schema and requested projection.
 A full write replaces both domains; a projected write preserves chunk metadata and unnamed continuing block values.
 The server ignores supplied producing version and time and assigns its own committed identity.
 SCHEMA_MISMATCH reports a different supplied schema revision.
@@ -241,7 +257,7 @@ Slot progress cannot pass the durable frontier or changes not yet queued ahead o
 
 An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
 Slot pushes stop at the persisted durable frontier; see [durable slots](reference/FEED.md#notes) for ACK persistence and batching.
-SHOW SLOTS reports written `acked`, retained bytes and loss state.
+SHOW SLOTS reports written `acked`, the durable `revision`, `lag_revisions`, retained bytes, `attached` and loss state.
 CHUNKS pushes use `[chunks,epoch,revision,commit_time_ms,user,schema_version,chunks,tag,txn]`.
 Each chunk is `[cx,cy,version,form_or_null]` or `[cx,cy,cz,version,form_or_null]`; a null form represents deletion.
 Forms match GET CHUNK for that exact commit and projection; later writes cannot change queued bytes.
@@ -256,6 +272,7 @@ The slot claim is released before the terminal reply or connection closure for l
 A slot belongs to its owner; another user needs ADMIN on `*` to watch it, see [feed statements](reference/FEED.md#arguments).
 
 DROP TABLE ends watches with NO_TABLE; a fenced or recovered table ends them with INTERNAL, and a new WATCH resumes; watches have no idle timeout.
+SWAP TABLES and RENAME TO end watches with INTERNAL `watched table was swapped; watch it again` or `watched table was renamed; watch it again`; watch the table by its name from the saved position.
 Losing READ on the table ends a watch with a best-effort NO_TABLE, as losing ADMIN on `*` ends a watch of a slot its user does not own, and a dropped user with a best-effort `AUTH_REQUIRED reason=user_dropped`; the connection closes either way; see [users](USERS.md#rights).
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 
@@ -269,7 +286,7 @@ Malformed or unbounded parameter framing receives PROTOCOL and closes the connec
 INVALID_ARGUMENT also refuses a statement the server configuration rules out, such as a write on a server started with `--read-only`.
 PERMISSION_DENIED identifies the missing right; NO_TABLE also hides tables on which a user has no rights.
 
-TABLE_EXISTS, VERSION_MISMATCH and SCHEMA_MISMATCH leave rejected operations unapplied.
+TABLE_EXISTS, VERSION_MISMATCH, CONDITION_FAILED and SCHEMA_MISMATCH leave rejected operations unapplied.
 Errors contain a code, structured keys, and optional diagnostic text.
 Keys precede text; percent escapes encode whitespace, `%`, `=`, and non-ASCII bytes in values.
 Every error includes `reason`; additional keys identify versions, options, publication stages, or retry delays.
@@ -284,6 +301,7 @@ Clients classify errors by code, never diagnostic text, and preserve unknown key
 | fatal | All other and unknown codes | Correct the request or resolve the reported condition. |
 
 MIGRATION_MISMATCH identifies different text under a recorded migration name.
+CHECK_FAILED includes `check`, the CHECK constraint a write or ADD CHECK found false; nothing changes.
 SLOT_BUSY identifies an attached slot; SLOT_LOST identifies unavailable retained history or a dropped projected column.
 `BUSY reason=large_chunk_cache_full` means a new large-chunk cache container could not fit in the shared pool; the request applied no mutation.
 `reason=schema_filter` identifies a lost stable-ID projection; `reason=retention_limit` identifies retained-history overflow.
@@ -293,7 +311,7 @@ Its keys are `area`, `columns`, `column_ids`, `no_before`, and `chunks`.
 Unfiltered area and projection fields are null; projected names and IDs are aligned arrays in declared order.
 A dropped column keeps its ID and has a null display name.
 Area bounds are signed `[x0,y0,x1,y1]` with inclusive endpoints; both flags are booleans.
-VERSION_MISMATCH and SCHEMA_MISMATCH include `current`; schema rejection also includes `actual` and `table`.
+VERSION_MISMATCH, CONDITION_FAILED and SCHEMA_MISMATCH include `current`, the chunk or schema version; schema rejection also includes `actual` and `table`.
 RATE_LIMITED authentication bans include remaining `retry_after_ms`.
 OUTCOME_UNKNOWN includes `stage` and requires writer recovery before retrying ([durability](DURABILITY_CONTRACT.md)).
 INTERNAL reports other operational failures without exposing internal diagnostics.

@@ -30,8 +30,8 @@ NULL
 
 ```text
 GET BLOCK x y [z] FROM table [COLUMNS column, ...] [WITH VERSION] [WITH SCHEMA]
-SET BLOCK x y [z] IN table column = value [, ...] [IF VERSION version]
-DELETE BLOCK x y [z] FROM table [IF VERSION version]
+SET BLOCK x y [z] IN table column = expression [, ...] [IF VERSION version | IF condition]
+DELETE BLOCK x y [z] FROM table [IF VERSION version | IF condition]
 ```
 
 ## Arguments
@@ -42,8 +42,10 @@ DELETE BLOCK x y [z] FROM table [IF VERSION version]
 - `COLUMNS`: returned columns, in your requested order; omitting it uses schema order.
 - `WITH VERSION`: include the containing chunk's committed version with the row.
 - `WITH SCHEMA`: include the table's schema version with the row.
-- `column = value`: values to change; unspecified columns of an existing block retain their values.
-- `IF VERSION`: update only when the containing chunk still has this version; another block's change can invalidate it.
+- `column = expression`: values to change, each a value, a `$n` parameter or an [expression](EXPRESSIONS.md) such as `coins + $1`; unspecified columns of an existing block retain their values.
+- `IF VERSION`: update only when the containing chunk still has this version, an integer or a `$n` u64 parameter; another block's change can invalidate it.
+- `IF condition`: write only when the [condition](EXPRESSIONS.md) holds for the block as it is ([conditions](../CQL.md#conditions)); it is false when it is unknown (NULL).
+- IF VERSION and IF condition exclude each other; `IF version = 3` tests a column named `version`.
 
 ## Returns
 
@@ -67,9 +69,11 @@ The schema version is present even when the row is absent.
 | --- | --- | --- |
 | NO_TABLE | The table is absent or inaccessible. | Create it or request access. |
 | PERMISSION_DENIED | You lack READ or WRITE. | Request the required right. |
-| INVALID_ARGUMENT | A value, column, or required field is invalid. | Check [Tables](TABLES.md). |
+| INVALID_ARGUMENT | A value, column, or required field is invalid, or a computed value is NULL for a column without NULL. | Check [Tables](TABLES.md) and [Expressions](EXPRESSIONS.md). |
 | INVALID_ARGUMENT | You run SET BLOCK or DELETE BLOCK on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | VERSION_MISMATCH | Another write changed the chunk. | Read it again and recompute your update. |
+| CONDITION_FAILED | The IF condition is false or unknown; `current` is the chunk's version. | Read the block again and decide again. |
+| OUT_OF_RANGE | A computed value does not fit its column, such as `coins - 3` below zero in a u16 column. | Change the expression or add a condition. |
 | CONFLICT | Your transaction loses its snapshot. | Follow [Retry a transaction](../TRANSACTION_RETRY.md). |
 
 ## Notes
@@ -84,6 +88,8 @@ A committed chunk version is its producing commit revision, never a timestamp.
 Compare revisions only within the same table epoch, obtained from DESCRIBE.
 IF VERSION still compares for equality; another chunk's write does not change this chunk's version.
 An absent chunk supplies no token, and zero does not mean create-if-absent.
+
+A condition and computed values read the block with the write, so no other write comes between; see [Expressions in writes](EXPRESSIONS.md#in-writes).
 
 ## Limits
 

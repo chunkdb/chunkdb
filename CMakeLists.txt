@@ -52,12 +52,15 @@ else()
 endif()
 
 add_library(chunkdb_core STATIC
+    src/aggregate.cpp
     src/atomic_write.cpp
     src/barrier.cpp
     src/backup_create.cpp
     src/backup_records.cpp
     src/backup_restore.cpp
     src/bit_codec.cpp
+    src/block_checks.cpp
+    src/block_filter.cpp
     src/block_ops.cpp
     src/checkpoint.cpp
     src/chunk_cache.cpp
@@ -66,6 +69,7 @@ add_library(chunkdb_core STATIC
     src/coordinate_hash.cpp
     src/chunk_format.cpp
     src/chunk_form.cpp
+    src/chunk_scale.cpp
     src/typed_chunk_form.cpp
     src/sectioned_chunk_form.cpp
     src/txn_intent_format.cpp
@@ -416,6 +420,17 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_area_paging_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME area_paging COMMAND chunkdb_area_paging_test)
     set_tests_properties(area_paging PROPERTIES TIMEOUT 60 LABELS "smoke")
+    add_executable(chunkdb_area_scale_test tests/area_scale_tests.cpp)
+    target_link_libraries(chunkdb_area_scale_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_area_scale_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME area_scale COMMAND chunkdb_area_scale_test)
+    set_tests_properties(area_scale PROPERTIES TIMEOUT 60 LABELS "smoke")
+
+    add_executable(chunkdb_aggregate_test tests/aggregate_tests.cpp)
+    target_link_libraries(chunkdb_aggregate_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_aggregate_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME aggregate COMMAND chunkdb_aggregate_test)
+    set_tests_properties(aggregate PROPERTIES TIMEOUT 60 LABELS "smoke")
 
     add_executable(chunkdb_query_limits_test tests/query_limits_tests.cpp)
     target_link_libraries(chunkdb_query_limits_test PRIVATE chunkdb_core)
@@ -562,6 +577,16 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_narrowing_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME narrowing COMMAND chunkdb_narrowing_test)
 
+    add_executable(chunkdb_alter_column_test tests/alter_column_tests.cpp)
+    target_link_libraries(chunkdb_alter_column_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_alter_column_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME alter_column COMMAND chunkdb_alter_column_test)
+
+    add_executable(chunkdb_check_constraint_test tests/check_constraint_tests.cpp)
+    target_link_libraries(chunkdb_check_constraint_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_check_constraint_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME schema_check COMMAND chunkdb_check_constraint_test)
+
     add_executable(chunkdb_cql_test tests/cql_tests.cpp)
     target_link_libraries(chunkdb_cql_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_cql_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -597,6 +622,13 @@ if(CHUNKDB_BUILD_TESTS)
     target_link_libraries(chunkdb_user_registry_test PRIVATE chunkdb_tools)
     target_include_directories(chunkdb_user_registry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME user_registry COMMAND chunkdb_user_registry_test)
+
+    add_executable(chunkdb_admin_rebuild_version_clock_test tests/admin_rebuild_version_clock_tests.cpp)
+    target_link_libraries(chunkdb_admin_rebuild_version_clock_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_admin_rebuild_version_clock_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    # Runs the admin binary as a child process.
+    add_dependencies(chunkdb_admin_rebuild_version_clock_test chunkdb_admin)
+    add_test(NAME admin_rebuild_version_clock COMMAND chunkdb_admin_rebuild_version_clock_test $<TARGET_FILE:chunkdb_admin>)
 
     add_executable(chunkdb_user_admission_test tests/user_admission_tests.cpp)
     target_link_libraries(chunkdb_user_admission_test PRIVATE chunkdb_core)
@@ -637,9 +669,17 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_cql_engine_test tests/cql_engine_tests.cpp)
     target_link_libraries(chunkdb_cql_engine_test PRIVATE chunkdb_core)
     add_test(NAME cql_engine COMMAND chunkdb_cql_engine_test)
+    add_executable(chunkdb_conditional_writes_test tests/conditional_writes_tests.cpp)
+    target_link_libraries(chunkdb_conditional_writes_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_conditional_writes_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME conditional_writes COMMAND chunkdb_conditional_writes_test)
     add_executable(chunkdb_txn_engine_test tests/txn_engine_tests.cpp)
     target_link_libraries(chunkdb_txn_engine_test PRIVATE chunkdb_core)
     add_test(NAME txn_engine COMMAND chunkdb_txn_engine_test)
+    add_executable(chunkdb_txn_read_only_test tests/txn_read_only_tests.cpp)
+    target_link_libraries(chunkdb_txn_read_only_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_txn_read_only_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME txn_read_only COMMAND chunkdb_txn_read_only_test)
 
     add_executable(chunkdb_chunk_write_memory_test tests/chunk_write_memory_tests.cpp)
     target_link_libraries(chunkdb_chunk_write_memory_test PRIVATE chunkdb_core)
@@ -1163,6 +1203,8 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_world_coordinates_3d_test
         chunkdb_area_cursor_test
         chunkdb_area_paging_test
+        chunkdb_area_scale_test
+        chunkdb_aggregate_test
         chunkdb_query_limits_test
         chunkdb_typed_chunk_form_size_test
         chunkdb_feed_archive_base_test
@@ -1188,21 +1230,26 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_schema_versions_test
         chunkdb_column_types_test
         chunkdb_narrowing_test
+        chunkdb_alter_column_test
+        chunkdb_check_constraint_test
         chunkdb_cql_test
         chunkdb_expr_test
         chunkdb_cql_engine_test
+        chunkdb_conditional_writes_test
         chunkdb_migrations_engine_test
         chunkdb_recover_table_test
         chunkdb_migrations_crash_test
         chunkdb_migrations_records_test
         chunkdb_feature_activation_records_test
         chunkdb_txn_engine_test
+        chunkdb_txn_read_only_test
         chunkdb_chunk_write_memory_test
         chunkdb_crypto_test
         chunkdb_scram_test
         chunkdb_users_file_test
         chunkdb_file_permissions_test
         chunkdb_user_registry_test
+        chunkdb_admin_rebuild_version_clock_test
         chunkdb_users_engine_test
         chunkdb_chunk_image_test
         chunkdb_wal_format_test
@@ -1355,6 +1402,7 @@ if(CHUNKDB_BUILD_TESTS)
         cql
         expr
         cql_engine
+        conditional_writes
         txn_engine
         chunk_write_memory
         crypto
