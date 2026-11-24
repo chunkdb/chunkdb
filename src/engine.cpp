@@ -966,9 +966,8 @@ std::string CommandEngine::HandleHello(
             {{"reason", "channel_binding"}});
     }
     const auto found = config_.users->AuthenticationSnapshot(user);
-    const auto secret = config_.users->Secret();
     // A user with two verifiers logs in with either.
-    std::vector<scram::Verifier> verifiers{found.has_value() ? found->user.verifier : scram::DecoyVerifier(secret, user)};
+    std::vector<scram::Verifier> verifiers{found.has_value() ? found->user.verifier : config_.users->DecoyVerifier(user)};
     if (found.has_value() && found->user.added_verifier.has_value()) verifiers.push_back(*found->user.added_verifier);
     session.pending_login = std::make_shared<PendingLogin>(PendingLogin{
         .user = user,
