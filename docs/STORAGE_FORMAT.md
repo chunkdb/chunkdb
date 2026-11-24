@@ -505,12 +505,12 @@ Details are in [artifact I/O](design/COMMIT_OWNER_ARTIFACT_IO.md).
 
 1. `CKSL`, format tag `4:u16`, dimensions `u8`, header flags `u8`, table epoch (16 bytes).
 2. Durable watermark `u64`, slot count `u32` (at most 1024).
-3. Per slot: name length `u8`, slot flags `u8`, projection count `u16`, written revision `u64`, name bytes, then the parts its flags select: area coordinates (`i64` each), projection IDs (`u32` each), and owner length `u8` with owner bytes; with header flag `0x2`, last the partition count `u16` and, for a count of 2 or more, per partition its position `u64` and flags `u8`.
+3. Per slot: name length `u8`, slot flags `u8`, projection count `u16`, written revision `u64`, name bytes, then the parts its flags select: area coordinates (`i64` each), projection IDs (`u32` each), and owner length `u8` with owner bytes; with header flag `0x4`, last the partition count `u16` and, for a count of 2 or more, per partition its position `u64` and flags `u8`.
 4. CRC32 over all preceding bytes.
 
 Slot flags are `0x1` lost, `0x2` area, `0x4` projection, `0x8` NO BEFORE, `0x10` CHUNKS, `0x20` lost by a dropped projected column, `0x40` owner, and `0x80` resync, set by a restore or SWAP TABLES and never with `0x1`; the projection count is nonzero exactly with `0x4`.
 Header flag `0x1` is the filter format; it permits the filter flags `0x2` through `0x20`, requires `slot_filters`, and stays set once written.
-Header flag `0x2` is the partition format; it requires `slot_partitions` and stays set once written.
+Header flag `0x4` is the partition format; it requires `slot_partitions` and stays set once written.
 A partition count is 1 (no positions follow) through 256; partition flag `0x1` is resync and the other bits are zero.
 CREATE SLOT refuses, with OUT_OF_RANGE, a slot that would take the file past 1024 slots or 1 MiB.
 A partitioned slot's written revision is the lowest partition position and its resync flag is set exactly when a partition's is; every position is at or below the watermark.

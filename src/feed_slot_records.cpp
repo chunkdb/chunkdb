@@ -26,7 +26,7 @@ constexpr std::size_t kMaxSlots = 1024U;
 constexpr std::uint16_t kVersion = 4U;
 constexpr std::uint8_t kFilterHeaderFlag = 1U;
 // Every slot record ends with its partition count (docs/design/SLOT_PARTITIONS.md).
-constexpr std::uint8_t kPartitionHeaderFlag = 2U;
+constexpr std::uint8_t kPartitionHeaderFlag = 4U;
 constexpr std::uint8_t kPartitionResyncFlag = 1U;
 constexpr std::uint8_t kOwnerFlag = 64U;
 constexpr std::uint8_t kResyncFlag = 128U;

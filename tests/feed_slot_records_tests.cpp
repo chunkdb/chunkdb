@@ -146,7 +146,7 @@ void Dimensions() {
     auto bad = bytes; bad[6U] = 2U; Checksum(bad);
     Reject([&] { (void)ParseFeedSlotRecords(bad, epoch); }); // Extra active-axis bytes cannot become a 2D filter.
     bad = bytes; bad[7U] = 0U; reject_checked(bad);
-    bad = bytes; bad[7U] |= 4U; reject_checked(bad);
+    bad = bytes; bad[7U] |= 8U; reject_checked(bad);
     const auto area = 36U + 12U + slot.name.size();
     bad = bytes;
     std::swap_ranges(bad.begin() + static_cast<std::ptrdiff_t>(area + 16U),
@@ -229,8 +229,8 @@ void Owners() {
         Checksum(changed); Reject([&] { (void)ParseFeedSlotRecords(changed, epoch); });
     };
     const auto owner_at = 36U + 12U + records.slots[0].name.size();
-    auto malformed = bytes; malformed[7U] = 4U; reject_checked(malformed); // unknown header flag
-    malformed = bytes; malformed[7U] = 2U; reject_checked(malformed); // partition format without partition counts
+    auto malformed = bytes; malformed[7U] = 8U; reject_checked(malformed); // unknown header flag
+    malformed = bytes; malformed[7U] = 4U; reject_checked(malformed); // partition format without partition counts
     malformed = bytes; malformed[37U] |= 8U; reject_checked(malformed); // filter without the filter format
     malformed = bytes; malformed[37U] |= 128U | 1U; reject_checked(malformed); // resync on a lost slot
     malformed = bytes; malformed[owner_at] = 0U; reject_checked(malformed); // empty owner
@@ -305,7 +305,7 @@ void Owners() {
     Reject([&] { (void)SerializeFeedSlotRecords(large); });
 }
 
-// Header flag 0x2 gives every slot its partition count; a partitioned slot's
+// Header flag 0x4 gives every slot its partition count; a partitioned slot's
 // position and resync are the lowest and any of its partitions'.
 void Partitions() {
     StoreId epoch{}; epoch[0] = 7U;
@@ -313,7 +313,7 @@ void Partitions() {
     records.slots[0].partitions = {{5U, false}, {20U, true}, {7U, false}};
     records.slots[0].resync = true;
     const auto bytes = SerializeFeedSlotRecords(records);
-    assert(bytes[7U] == 2U && bytes.size() == 40U + (12U + 5U + 2U + 27U) + (12U + 6U + 2U));
+    assert(bytes[7U] == 4U && bytes.size() == 40U + (12U + 5U + 2U + 27U) + (12U + 6U + 2U));
     const auto parsed = ParseFeedSlotRecords(bytes, epoch, 2U);
     assert(parsed.partition_format && !parsed.filter_format);
     assert(parsed.slots[0].partitions == records.slots[0].partitions && parsed.slots[0].resync && parsed.slots[0].written == 5U);
@@ -349,7 +349,7 @@ void Partitions() {
     // The partition format stays once written.
     auto plain = parsed; plain.slots.erase(plain.slots.begin());
     const auto kept = SerializeFeedSlotRecords(plain);
-    assert(kept[7U] == 2U && ParseFeedSlotRecords(kept, epoch).partition_format);
+    assert(kept[7U] == 4U && ParseFeedSlotRecords(kept, epoch).partition_format);
     FeedSlotRecords unpartitioned{epoch, 20U, {{"single", 9U, false}}};
     assert(SerializeFeedSlotRecords(unpartitioned)[7U] == 0U);
 

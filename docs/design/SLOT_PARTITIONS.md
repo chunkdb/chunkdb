@@ -39,7 +39,7 @@ The group's assignment lives in memory: after a restart the members join again.
 
 ## Format
 
-`chunkdb.slots` keeps format tag 4; header flag `0x2` marks the partition format, and then every slot record ends with its partition count `u16`, followed, for a count of 2 or more, by each partition's position `u64` and flags `u8` (`0x1` resync).
+`chunkdb.slots` keeps format tag 4; header flag `0x4` marks the partition format, and then every slot record ends with its partition count `u16`, followed, for a count of 2 or more, by each partition's position `u64` and flags `u8` (`0x1` resync).
 The slot's written revision is the lowest partition position and its resync flag is set when any partition has resync; a record that disagrees is damage.
 The flag stays set once written, like the filter format flag.
 The table feature `slot_partitions` (incompat bit 8, `0x100`) owns the partition format: CREATE SLOT with PARTITIONS 2 or more requires it, and a table whose records carry the flag without the feature is refused.
