@@ -36,6 +36,8 @@ The lease is released before shipping, so a slow archive never delays DDL; stage
 ## Shipping and seal records
 
 The pass ships every staged file, then publishes its seal record, then removes the staged files the record lists.
+Publication has four steps: write the record to `.chunkdb.archive/directory.<id>/` and sync it, ship it, atomically replace `.chunkdb.archive/chain` with its name and sync, then remove the staged record and the files it lists.
+The staged record is the intent: a writer start that finds one ships the same bytes again (equal bytes count as shipped), points `chain` at it and removes it before its first pass, so a record published before a crash stays the predecessor of the next one.
 `--archive-dir` copies to a `.`-prefixed temporary name, syncs it, renames it without replacing and syncs the directory; an existing file of equal length and CRC32 counts as shipped, a different one fails the pass.
 `--archive-command` runs through the system shell with `%p` the local path, `%f` the archive-relative name and `%%` a `%`; exit status 0 means shipped, and the command must accept a file it already shipped with equal bytes.
 A failed pass is retried every interval; staged files stay in the data directory meanwhile, and SHOW STATUS shows `archive` with the error and the staged bytes.
@@ -44,8 +46,8 @@ Layout: `table.<epoch>/` holds segments, descriptors and manifests `table.<schem
 A seal record holds the data-directory id, its capture time, its predecessor's capture time (zero at a chain start), the users and ledger file names, and per table: name, epoch, seal point and time bound (absent when unsealed), schema version, manifest name, and the files shipped since the predecessor with length and CRC32.
 Every table of the catalog appears in every record, so an idle table gets a new seal point each pass.
 A record is published only after every file it names is durable in the archive.
-`.chunkdb.archive/chain` holds the last published record's name; a writer start with archiving reads it as the predecessor, and a writer start without archiving, or an offline tool that changes table files, removes it before any table file changes, so the next record starts a new chain.
-Two records naming the same predecessor are a fork; restore refuses it.
+`.chunkdb.archive/chain` holds the last published record's name; a writer start with archiving reads it as the predecessor after finishing a staged record, and a writer start without archiving, or an offline tool that changes table files, removes it and any staged record before any table file changes, so the next record starts a new chain.
+Two records naming the same predecessor are a fork, which only two writers of one copied data directory can make; restore refuses it.
 
 ## Retention
 
@@ -89,6 +91,7 @@ The receiver writes the guard first, each file with its length and CRC checked, 
 - After staging links, before their sync: the feed names are still there, and the next pass stages them again.
 - During shipping: a temporary name is left; the next pass ships again, and retention removes `.`-prefixed names older than the bound.
 - After shipping, before the record: the files are unlisted; the next pass finds them equal and lists them.
+- After staging the record, before or after shipping it, and before `chain` names it: the start ships it again as equal, points `chain` at it, and the next record names it as predecessor; no fork.
 - After the record, before staged removal: the next pass ships them again as equal and lists them again; a record may repeat a file.
 - During retention: the record is gone first; its files are removed by a later pass as unlisted segments.
 - During restore: only its guarded temporary directory exists, as today.
@@ -96,7 +99,7 @@ The receiver writes the guard first, each file with its length and CRC checked, 
 
 ## Checks
 
-Crash tests stop the archiver at each point above and check that a restart ships again and the archive still restores.
+Crash tests stop the archiver at each point above, including between shipping the record and replacing `chain`, and check that a restart ships again, the chain has no fork and the archive still restores.
 A restore test writes, backs up, then writes with ALTER, collection, transactions, CREATE and DROP TABLE, and compares a restore at each seal point and at chosen times with the acknowledged state.
 Damage tests remove a listed segment, break a chunk chain, restart without archiving, fork a chain, and start the archive after the backup.
 Stream tests cover rights, BUSY, TABLES, disconnect, CANCEL, a statement during the stream and a receiver that restores.
