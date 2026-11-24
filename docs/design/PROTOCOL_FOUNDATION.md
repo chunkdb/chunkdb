@@ -190,7 +190,7 @@ WATCH omitting filters inherits them; explicitly supplied filters must match exa
 Column projections persist stable column ids in declared order; equivalent area bounds normalize identically, independent of spelling.
 A dropped projected column makes the slot lost with reason=schema_filter; it never silently broadens or changes the projection.
 Changing filters requires creating a different slot; IF NOT EXISTS must compare filters rather than silently accept incompatible existing state.
-Task 51 implements these fixed filters, including a CHUNKS event for each relevant committed chunk; task 56 adds lagging-consumer coalescing and multiple areas.
+Task 51 implements these fixed filters, including a CHUNKS event for each relevant committed chunk; task 56 adds lagging-consumer coalescing; ordinary watches take several areas, and a slot keeps one.
 The chunk push prefix is selected by dims and does not depend on the form format.
 
 CREATE SLOT accepts each AREA, COLUMNS, NO BEFORE, CHUNKS and OWNER suffix once, in any order after `ON table`.

@@ -382,6 +382,7 @@ When no further range fits below 2^64, every later write is refused with `chunk 
 
 Clock reservations sync their complete record and directory entry before tokens are issued; first initialization publishes the clock before the initialized marker.
 A valid initialized marker with missing, unreadable, or malformed clock is damage and refuses writer opening.
+Offline, `chunkdb_admin rebuild-version-clock` replaces a missing or malformed clock and marker above every revision on disk; see [Rebuild a lost version clock](REBUILD_VERSION_CLOCK.md).
 Missing both records with chunk artifacts or a capped startup inventory refuses writer opening before publishing recovery records.
 Manifest-only and empty initialization remain valid; read-only inspection can still read retained committed versions without creating these records.
 

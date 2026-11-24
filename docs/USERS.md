@@ -47,7 +47,7 @@ REPLICATION is stored and shown by SHOW USERS; no statement requires it yet.
 
 | Statement | Required right |
 | --- | --- |
-| GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, DESCRIBE, WATCH | READ on the table |
+| GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, AGGREGATE, DESCRIBE, WATCH | READ on the table |
 | SHOW TABLE STATS | READ on the table, or MONITOR |
 | WATCH SLOT on a slot another user owns | READ on the table and ADMIN on all tables |
 | SET BLOCK, DELETE BLOCK, SET CHUNK | WRITE on the table |

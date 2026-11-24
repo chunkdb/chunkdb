@@ -2,6 +2,7 @@
 #include <cassert>
 #include <condition_variable>
 #include <exception>
+#include <functional>
 #include <future>
 #include <mutex>
 #include <sstream>
@@ -30,6 +31,20 @@ struct BackupTestAccess {
         std::lock_guard lock(gate.mutex_);
         failure = std::current_exception();
         gate.cv_.notify_all();
+    }
+    // Runs `while_held` while `table` is pinned for a backup, or while its
+    // admission is paused, and releases it afterwards.
+    static void WhilePinned(Table& table, const std::function<void()>& while_held) {
+        const auto pin = table.PinForBackup({});
+        while_held();
+    }
+    static void WhilePaused(Table& table, const std::function<void()>& while_held) {
+        const auto pause = table.PauseAdmission(std::chrono::steady_clock::now() + std::chrono::seconds(10), {});
+        while_held();
+    }
+    static std::shared_ptr<ChunkStore> BeginExclusive(Table& table) { return table.BeginExclusive(); }
+    static void EndExclusive(Table& table, std::shared_ptr<ChunkStore> store, const TableOptions& options) {
+        table.EndExclusive(std::move(store), options);
     }
 };
 }
@@ -362,6 +377,49 @@ void PoisonWhileOrdinaryDdlWaits() {
     assert(reopened.catalog->Migrations().size() == 1U);
 }
 
+// A released backup pin or admission pause holds the store no longer: the
+// exclusive section the release admits may close it and open the table again,
+// which a second open writer of the same table refuses.
+void ReleaseDropsStore() {
+    struct Released final : MigrationTestHook {
+        Point point = Point::kAfterBackupPinRelease;
+        std::mutex mutex;
+        std::condition_variable cv;
+        bool checked = false;
+        void Run(Point at, std::string_view name) override {
+            if (at != point || name != "realm") return;
+            std::unique_lock lock(mutex);
+            assert(cv.wait_for(lock, 10s, [&] { return checked; }));
+        }
+        void Check() { std::lock_guard lock(mutex); checked = true; cv.notify_all(); }
+    };
+    test::ScopedTempDir source("chunkdb-backup-migrations-release");
+    Engine e(source.path()); Reply(e.Run(kCreate), "+OK\r\n");
+    const auto table = e.catalog->Find("realm");
+    const auto options = table->Info().options;
+    using Hold = void (*)(Table&, const std::function<void()>&);
+    for (const auto& [point, hold] : {std::pair<MigrationTestHook::Point, Hold>{MigrationTestHook::Point::kAfterBackupPinRelease, &BackupTestAccess::WhilePinned},
+             std::pair<MigrationTestHook::Point, Hold>{MigrationTestHook::Point::kAfterAdmissionResume, &BackupTestAccess::WhilePaused}}) {
+        Released released; released.point = point;
+        e.catalog->SetMigrationTestHook(&released);
+        std::future<long> holders;
+        // The hook keeps the releasing thread just past the release while the
+        // exclusive section counts the store's holders.
+        hold(*table, [&] {
+            holders = std::async(std::launch::async, [&] {
+                auto store = BackupTestAccess::BeginExclusive(*table);
+                const long count = store.use_count();
+                released.Check();
+                BackupTestAccess::EndExclusive(*table, std::move(store), options);
+                return count;
+            });
+        });
+        Ready(holders); assert(holders.get() == 1);
+        e.catalog->SetMigrationTestHook(nullptr);
+    }
+    assert(e.Run("SET BLOCK 0 0 IN realm v=1").front() == ':');
+}
+
 void OrdinaryDdlAndMigration() {
     test::ScopedTempDir source("chunkdb-backup-migrations-ddl"), target("chunkdb-backup-migrations-ddl-copy");
     Engine e(source.path()); Reply(e.Run(kCreate), "+OK\r\n");
@@ -387,6 +445,6 @@ int main(int argc, char** argv) {
         return 0;
     }
     assert(argc == 1);
-    RestoreHistory(); MetadataCutAndCopyProgress(); GrantCoherence(); CancelAdmission(); InvalidLedgerAndFencedBackup(); PoisonWhileOrdinaryDdlWaits(); OrdinaryDdlAndMigration();
-    std::puts("backup migrations: 8 groups passed");
+    RestoreHistory(); MetadataCutAndCopyProgress(); GrantCoherence(); CancelAdmission(); InvalidLedgerAndFencedBackup(); PoisonWhileOrdinaryDdlWaits(); OrdinaryDdlAndMigration(); ReleaseDropsStore();
+    std::puts("backup migrations: 9 groups passed");
 }
