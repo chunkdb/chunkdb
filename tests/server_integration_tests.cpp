@@ -4572,6 +4572,53 @@ void TestMetricsListen() {
     assert(scrape("GET /status HTTP/1.1\r\n\r\n").rfind("HTTP/1.1 404 Not Found\r\n", 0) == 0);
 }
 
+// Calls Stop on the Run thread at one point of Run's startup.
+class StopAtStartupHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    StopAtStartupHook(chunkdb::ChunkServer& server, Point point) : server_(server), point_(point) {}
+    void Run(Point point, std::size_t) override {
+        if (point == point_ && !fired.exchange(true)) server_.Stop();
+    }
+    std::atomic<bool> fired{false};
+
+  private:
+    chunkdb::ChunkServer& server_;
+    const Point point_;
+};
+
+// A Stop just before Run publishes its listener, or between the listener
+// and running_, ends Run, with and without the metrics listener; before,
+// Run kept polling a closed socket and the next Stop found nothing to stop.
+void TestStopDuringStartup() {
+    using Point = chunkdb::FeedDeliveryTestHook::Point;
+    for (const bool metrics : {false, true}) {
+        for (const auto point : {Point::kBeforeListenerPublication, Point::kAfterListenerPublication}) {
+            auto store_cfg = BaseStoreConfig();
+            store_cfg.data_dir = TempDataDir("stop-during-startup");
+            {
+                auto server_cfg = BaseServerConfig();
+                server_cfg.port = chunkdb::test::PickListenerPort();
+                server_cfg.metrics_listen = metrics;
+                auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(store_cfg));
+                auto engine = std::make_shared<chunkdb::CommandEngine>(chunkdb::EngineConfig{.require_auth = false}, catalog);
+                chunkdb::ChunkServer server(server_cfg, engine);
+                StopAtStartupHook hook(server, point);
+                chunkdb::FeedDeliveryTestAccess::SetPendingObserverHook(server, &hook);
+                auto run = std::async(std::launch::async, [&server] { server.Run(); });
+                const bool ended = run.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+                if (!ended) server.Stop();
+                run.get();
+                assert(hook.fired.load());
+                assert(ended);
+                assert(!server.WaitListeningForTests(std::chrono::milliseconds(0)));
+                assert(server.MetricsPort() == 0U);
+                chunkdb::FeedDeliveryTestAccess::SetPendingObserverHook(server, nullptr);
+            }
+            RemoveAllWithRetry(store_cfg.data_dir);
+        }
+    }
+}
+
 // While ALTER TABLE waits for a lease to drain, a scrape answers at once
 // without that table, and the server stops without waiting for either.
 void TestMetricsListenBusyTable() {
@@ -8508,6 +8555,7 @@ int main(int argc, char** argv) {
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
         run("TestMetricsListen", TestMetricsListen);
         run("TestMetricsListenBusyTable", TestMetricsListenBusyTable);
+        run("TestStopDuringStartup", TestStopDuringStartup);
         run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestTlsHandshakeDeadlineReleasesWorker", TestTlsHandshakeDeadlineReleasesWorker);

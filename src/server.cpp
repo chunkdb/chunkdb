@@ -262,13 +262,34 @@ void ChunkServer::Run() {
             });
         }
         const SocketHandle listen_socket = CreateListenSocket(config_.host, config_.port);
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kBeforeListenerPublication, 0U);
+        // The listener and running_ are published together, under the mutex
+        // Stop takes them with: a Stop before this point is seen here, and a
+        // Stop after it clears both.
+        bool stopped = false;
         {
             std::lock_guard lock(lifecycle_mutex_);
-            listen_socket_ = static_cast<decltype(listen_socket_)>(listen_socket);
-            backup_stop_ = std::stop_source{};
+            stopped = stop_requested_;
+            if (!stopped) {
+                listen_socket_ = static_cast<decltype(listen_socket_)>(listen_socket);
+                backup_stop_ = std::stop_source{};
+                running_.store(true);
+            }
         }
         listening_cv_.notify_all();
-        running_.store(true);
+        if (stopped) {
+            CloseSocket(listen_socket);
+            metrics_port_.store(0, std::memory_order_release);
+            metrics_listener_.reset();
+            LogMessage(LogLevel::kInfo, LogComponent::kServer, "stopped before accepting connections");
+#ifdef _WIN32
+            WSACleanup();
+#endif
+            return;
+        }
+        if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
+            hook->Run(FeedDeliveryTestHook::Point::kAfterListenerPublication, 0U);
 
         StartWorkers();
         LogMessage(
@@ -464,7 +485,8 @@ std::size_t ChunkServer::HandshakesInProgressForTests(const std::string& source)
 
 bool ChunkServer::WaitListeningForTests(std::chrono::milliseconds timeout) {
     std::unique_lock lock(lifecycle_mutex_);
-    (void)listening_cv_.wait_for(lock, timeout, [&] { return run_failed_ || listen_socket_ != kInvalidSocket; });
+    (void)listening_cv_.wait_for(
+        lock, timeout, [&] { return run_failed_ || stop_requested_ || listen_socket_ != kInvalidSocket; });
     return !run_failed_ && listen_socket_ != kInvalidSocket;
 }
 
@@ -528,17 +550,20 @@ std::size_t ChunkServer::ShutdownActiveClients() {
 void ChunkServer::Stop() {
     if (auto* hook = delivery_test_hook_.load(std::memory_order_acquire))
         hook->Run(FeedDeliveryTestHook::Point::kBeforePendingShutdown, running_.load() ? 1U : 0U);
-    const bool was_running = StopRunning();
-    RequestBackupStop();
-
+    // Before running_ is cleared: Run publishes its listener and running_
+    // under this mutex, so either it sees stop_requested_ or this takes the
+    // listener it published and StopRunning then clears running_.
     SocketHandle listen_socket = kInvalidSocket;
     {
         std::lock_guard lock(lifecycle_mutex_);
+        stop_requested_ = true;
         if (listen_socket_ != kInvalidSocket) {
             listen_socket = static_cast<SocketHandle>(listen_socket_);
             listen_socket_ = kInvalidSocket;
         }
     }
+    const bool was_running = StopRunning();
+    RequestBackupStop();
 
     std::size_t pending_count = 0;
     std::size_t active_count = 0;
