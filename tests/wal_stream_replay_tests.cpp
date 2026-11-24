@@ -161,7 +161,7 @@ void InterruptedCreationAndInteriorSearch() {
     assert(!Run(tail, geometry, true).result.stopped_at_crash_tail);
 }
 
-void SchemaMetadataAndFinalInvariants() {
+void SchemaMetadataAndFrameInvariants() {
     const auto initial = MakeGeometry();
     auto chunks = AddChunkColumn(TableSchema{}, {.id = 0U, .name = "owner",
         .type = {ColumnKind::kUnsigned, 8U}, .has_default = true, .default_value = {7U}});
@@ -215,8 +215,10 @@ void SchemaMetadataAndFinalInvariants() {
         frame.AppendSpan(2U, &present, 1U);
         (void)frame.Finish(2U, 20U);
     }
+    // Every frame's state keeps the invariants: a later frame that makes
+    // the block present does not hide the first one.
     Check(bytes, variable_geometry);
-    assert(Run(bytes, variable_geometry, true).result.vars_problem.empty());
+    assert(!Run(bytes, variable_geometry, true).result.vars_problem.empty());
 
     config = initial.config();
     config.dims = 3U;
@@ -433,7 +435,7 @@ void GroupFramesRefusedAtInspection() {
 int main() {
     CutsAndDamage();
     InterruptedCreationAndInteriorSearch();
-    SchemaMetadataAndFinalInvariants();
+    SchemaMetadataAndFrameInvariants();
     BoundedReadsAndExtent();
     InspectionAndCancellation();
     GroupFramesRefusedAtInspection();
