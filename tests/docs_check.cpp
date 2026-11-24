@@ -1,7 +1,4 @@
-|| !s.Literal("  attached = ") ||
-        !(s.Literal("true") || s.Literal("false")) || !s.Newline() || !s.Literal("  peer = ") || !s.RestOfLine() ||
-        !s.Newline() || !s.Literal("  last_ack_ms = ") || !(s.Digits() || s.Literal("NULL")) || !s.Newline() ||
-        !s.Literal("  lost = ") ||#include "docs_check.hpp"
+#include "docs_check.hpp"
 #include "listener_port_test_utils.hpp"
 
 #include <algorithm>
