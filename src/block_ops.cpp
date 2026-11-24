@@ -1663,7 +1663,7 @@ ChunkMutationResult ChunkStore::WriteBlockDecided(std::int64_t x, std::int64_t y
     const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
     std::vector<ColumnAssignment> assignments;
     const BlockWriteView view{.values = values ? &*values : nullptr, .chunk_columns = chunk_columns,
-        .version = regular_chunk->version, .commit_time_ms = commit_time_ms};
+        .version = regular_chunk->version, .commit_time_ms = commit_time_ms, .written = regular_chunk->written};
     if (!decide(view, assignments)) {
         return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
     }

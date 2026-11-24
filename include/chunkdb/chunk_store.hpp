@@ -487,6 +487,9 @@ struct BlockWriteView {
     std::uint64_t version = 0;
     // The commit time the write takes when it changes the chunk.
     std::uint64_t commit_time_ms = 0;
+    // Whether the chunk has a version a read reports; a never-written
+    // chunk has none.
+    bool written = false;
 };
 
 // Decides a computed write from the block as it is: false changes nothing;

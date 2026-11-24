@@ -212,6 +212,67 @@ void TestDelete() {
     ExpectError(f.Run("DELETE BLOCK 1 2 FROM bank RETURNING NEW *"), "SYNTAX");
 }
 
+// A column named twice is returned twice, NEW and OLD alike.
+void TestRepeatedColumn() {
+    Fixture f;
+    auto reply = f.Run("SET BLOCK 0 0 IN bank coins = 4, name = 'ab' RETURNING NEW name, coins, name");
+    ExpectReply(reply, Answer(true, AnswerVersion(reply), "*1\r\n" + Row(3, {0, 0}, "$2\r\nab\r\n:4\r\n$2\r\nab\r\n")));
+    reply = f.Run("DELETE BLOCK 0 0 FROM bank RETURNING coins, coins");
+    ExpectReply(reply, Answer(true, AnswerVersion(reply), "*1\r\n" + Row(2, {0, 0}, ":4\r\n:4\r\n")));
+}
+
+// A refused write on a never-written chunk has no version, as GET BLOCK
+// WITH VERSION shows, in and out of a transaction.
+void TestNeverWrittenChunk() {
+    Fixture f;
+    ExpectReply(f.Run("GET BLOCK 40 40 FROM bank WITH VERSION"), "*2\r\n_\r\n_\r\n");
+    ExpectReply(f.Run("SET BLOCK 40 40 IN bank coins = 1 IF EXISTS RETURNING *"), Answer(false, std::nullopt, "*0\r\n"));
+    ExpectReply(f.Run("SET BLOCK 40 40 IN bank coins = 1 IF VERSION 5 RETURNING *"), Answer(false, std::nullopt, "*0\r\n"));
+    ExpectReply(f.Run("DELETE BLOCK 40 40 FROM bank IF EXISTS RETURNING *"), Answer(false, std::nullopt, "*0\r\n"));
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run("DELETE BLOCK 40 40 FROM bank IF EXISTS RETURNING *"), Answer(false, std::nullopt, "*0\r\n"));
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+    ExpectReply(f.Run("GET BLOCK 40 40 FROM bank WITH VERSION"), "*2\r\n_\r\n_\r\n");
+}
+
+// The counter `name{labels}` in SHOW METRICS.
+std::uint64_t Metric(Fixture& f, const std::string& series) {
+    const auto text = f.Run("SHOW METRICS");
+    const auto at = text.find("\n" + series + " ");
+    assert(at != std::string::npos);
+    return std::stoull(text.substr(at + series.size() + 2U));
+}
+
+// Metrics count a refusal answered as applied false as the error it stands
+// for, as without RETURNING.
+void TestRefusalMetrics() {
+    Fixture f;
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN bank coins = 1"));
+    const std::string mismatches = "chunkdb_errors_total{code=\"version_mismatch\"}";
+    const std::string other = "chunkdb_errors_total{code=\"other\"}";
+    const std::string refused = "chunkdb_commands_total{class=\"conditional\",outcome=\"error\"}";
+    const std::string applied = "chunkdb_commands_total{class=\"conditional\",outcome=\"ok\"}";
+    const auto count = [&] {
+        return std::vector<std::uint64_t>{Metric(f, mismatches), Metric(f, other), Metric(f, refused), Metric(f, applied)};
+    };
+    auto before = count();
+    ExpectError(f.Run("SET BLOCK 0 0 IN bank coins = 2 IF VERSION 999"), "VERSION_MISMATCH");
+    ExpectError(f.Run("SET BLOCK 0 0 IN bank coins = 2 IF coins > 5"), "CONDITION_FAILED");
+    const auto plain = count();
+    assert(plain[0] == before[0] + 1U && plain[1] == before[1] + 1U && plain[2] == before[2] + 2U && plain[3] == before[3]);
+    before = plain;
+    (void)f.Run("SET BLOCK 0 0 IN bank coins = 2 IF VERSION 999 RETURNING *");
+    (void)f.Run("SET BLOCK 0 0 IN bank coins = 2 IF coins > 5 RETURNING *");
+    const auto returning = count();
+    assert(returning[0] == before[0] + 1U && returning[1] == before[1] + 1U && returning[2] == before[2] + 2U &&
+           returning[3] == before[3]);
+    // An applied write and a following statement count as ok.
+    (void)f.Run("SET BLOCK 0 0 IN bank coins = 2 IF coins = 1 RETURNING *");
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN bank coins = 3 IF coins = 2"));
+    const auto after = count();
+    assert(after[2] == returning[2] && after[3] == returning[3] + 2U);
+}
+
 // A table of one bits column and a three-dimensional table.
 void TestBitsAndThreeDimensions() {
     Fixture f;
@@ -423,5 +484,8 @@ int main() {
     TestRowsBounds();
     TestContinuation();
     TestEngineContinuation();
+    TestRepeatedColumn();
+    TestNeverWrittenChunk();
+    TestRefusalMetrics();
     return 0;
 }

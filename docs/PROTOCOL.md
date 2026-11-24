@@ -175,12 +175,13 @@ See [AGGREGATE](reference/AGGREGATE.md#returns) for the rules.
 
 SET BLOCK and DELETE BLOCK with RETURNING answer the map `{applied, version, rows}` instead of a version.
 `applied` is false when IF VERSION or the IF condition refused the write; nothing changed and `rows` is empty.
-`version` is the chunk's version after the write, or its current version when refused; inside a transaction it is that of the transaction's view, null for a chunk the transaction wrote.
+`version` is the chunk's version after the write, or its current version when refused, null for a never-written chunk; inside a transaction it is that of the transaction's view, null for a chunk the transaction wrote.
 `rows` is an array of rows `[x, y, values...]`, with z after y in a three-dimensional table, and values in the order RETURNING names them, encoded as GET BLOCK encodes them.
 An OLD row comes only from a block present before the write; a NEW row holds the block as GET BLOCK reads it after the write.
 A reply holds at most `limits.max_returning_rows` rows in at most `max_response_bytes` bytes; over either bound the write is refused with `OUT_OF_RANGE reason=returning_limit bound=<max_returning_rows | max_response_bytes> limit=<n>` and changes nothing.
 The rows are read under the write's lock and the reply is written after that lock is released, row by row under the reply progress deadline.
-A connection that closes after the write and before the whole reply arrives leaves the write applied; read the block again to learn its state.
+A connection that closes after the commit point and before the whole reply arrives leaves the outcome unknown to the client: the write may be applied.
+A write has no idempotency key yet, so resending it is not safe; read the block again to learn its state.
 
 ## Chunk form
 

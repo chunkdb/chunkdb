@@ -67,7 +67,7 @@ Never-written chunks and chunks forgotten by [tombstone compaction](CHUNKS.md#to
 The schema version is present even when the row is absent.
 
 With RETURNING, `applied` is false when IF VERSION or the IF condition refuses the write, which then changes nothing and returns no rows.
-`version` is the chunk's version after the write, or its current version when refused; inside a transaction it is that of the transaction's view, null for a chunk the transaction wrote.
+`version` is the chunk's version after the write, or its current version when refused, null for a never-written chunk; inside a transaction it is that of the transaction's view, null for a chunk the transaction wrote.
 Each row is `[x, y, values...]`, with `z` after `y` in a three-dimensional table.
 An OLD row exists only for a block present before the write; a NEW row holds the values a GET BLOCK reads after the write, including the defaults of a new block.
 Other refusals, such as an unknown column or a value out of range, are errors as without RETURNING.
@@ -80,8 +80,8 @@ Other refusals, such as an unknown column or a value out of range, are errors as
 | PERMISSION_DENIED | You lack READ or WRITE. | Request the required right. |
 | INVALID_ARGUMENT | A value, column, or required field is invalid, or a computed value is NULL for a column without NULL. | Check [Tables](TABLES.md) and [Expressions](EXPRESSIONS.md). |
 | INVALID_ARGUMENT | You run SET BLOCK or DELETE BLOCK on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
-| VERSION_MISMATCH | Another write changed the chunk. | Read it again and recompute your update. |
-| CONDITION_FAILED | The IF condition is false or unknown; `current` is the chunk's version. | Read the block again and decide again. |
+| VERSION_MISMATCH | Without RETURNING: another write changed the chunk. | Read it again and recompute your update. |
+| CONDITION_FAILED | Without RETURNING: the IF condition is false or unknown; `current` is the chunk's version. | Read the block again and decide again. |
 | OUT_OF_RANGE | A computed value does not fit its column, such as `coins - 3` below zero in a u16 column. | Change the expression or add a condition. |
 | OUT_OF_RANGE reason=returning_limit | The RETURNING rows exceed a bound; nothing changed. | Return fewer columns. |
 | CONFLICT | Your transaction loses its snapshot. | Follow [Retry a transaction](../TRANSACTION_RETRY.md). |

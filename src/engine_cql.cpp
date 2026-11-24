@@ -2969,8 +2969,12 @@ std::string CommandEngine::BlockWriteWithExpressions(
     // are kept until the reply is written (docs/DESIGN-2.0.md E4).
     std::vector<std::size_t> returned;
     std::optional<ReturningRows> rows;
+    bool returned_once = true;
     if (returning != nullptr) {
         returned = ReturnedColumns(layout, *returning);
+        std::vector<std::size_t> distinct = returned;
+        std::sort(distinct.begin(), distinct.end());
+        returned_once = std::adjacent_find(distinct.begin(), distinct.end()) == distinct.end();
         plan.block_slots.insert(plan.block_slots.end(), returned.begin(), returned.end());
         std::sort(plan.block_slots.begin(), plan.block_slots.end());
         plan.block_slots.erase(std::unique(plan.block_slots.begin(), plan.block_slots.end()), plan.block_slots.end());
@@ -3025,24 +3029,43 @@ std::string CommandEngine::BlockWriteWithExpressions(
     };
     // The row of an applied write: OLD of a present block, or NEW. Made
     // before the write, so a row past a bound changes nothing.
+    bool chunk_written = false;
     const auto decide = [&](const BlockWriteView& block, std::vector<ColumnAssignment>& out) {
+        chunk_written = block.written;
         if (!decide_write(block, out)) return false;
         if (!rows || (!returning->new_values && block.values == nullptr)) return true;
-        const std::vector<ColumnValue> after =
-            returning->new_values ? store.BlockAfterSet(block.values, out, returned) : std::vector<ColumnValue>{};
-        const std::vector<ColumnValue>& source = returning->new_values ? after : *block.values;
         std::vector<ColumnValue> row;
         row.reserve(returned.size());
-        for (const std::size_t index : returned) row.push_back(source[index]);
+        if (returning->new_values) {
+            // The NEW values are this row's own: moved unless a column is
+            // named twice.
+            auto after = store.BlockAfterSet(block.values, out, returned);
+            for (const std::size_t index : returned)
+                row.push_back(returned_once ? std::move(after[index]) : after[index]);
+        } else {
+            // The OLD values belong to the block read: copied.
+            for (const std::size_t index : returned) row.push_back((*block.values)[index]);
+        }
         rows->Add(x, y, z, std::move(row));
         return true;
+    };
+    // A refused write with RETURNING answers applied false; the metrics
+    // still count it as the error it stands for.
+    const auto refused = [&]() -> std::string_view {
+        return version_mismatch ? "VERSION_MISMATCH" : "CONDITION_FAILED";
     };
 
     if (session.transaction == nullptr) {
         const auto result =
             store.WriteBlockDecided(x, y, z, del != nullptr, plan.block_slots, plan.reads_chunk_columns, decide);
-        // With RETURNING, a refused write answers applied false (E4).
-        if (rows) return std::move(*rows).Reply(ReturningPrefix(result.ok, result.version), {}, continuation);
+        // With RETURNING, a refused write answers applied false (E4); a
+        // never-written chunk has no version, as for GET BLOCK WITH VERSION.
+        if (rows) {
+            if (!result.ok) session.refused_write = refused();
+            const std::optional<std::uint64_t> version =
+                result.ok || chunk_written ? std::optional<std::uint64_t>(result.version) : std::nullopt;
+            return std::move(*rows).Reply(ReturningPrefix(result.ok, version), {}, continuation);
+        }
         if (version_mismatch) return Protocol::Error("VERSION_MISMATCH", "", {{"current", std::to_string(result.version)}});
         if (!result.ok) return ErrorReply(ConditionFailedError(result.version));
         std::string reply;
@@ -3080,9 +3103,13 @@ std::string CommandEngine::BlockWriteWithExpressions(
         }
     }
     std::vector<ColumnAssignment> assignments;
-    const BlockWriteView view{.values = block ? &*block : nullptr, .chunk_columns = chunk_columns, .version = version};
+    const BlockWriteView view{.values = block ? &*block : nullptr, .chunk_columns = chunk_columns, .version = version,
+        .written = visible_version.has_value()};
     if (!decide(view, assignments)) {
-        if (rows) return std::move(*rows).Reply(ReturningPrefix(false, visible_version), {}, continuation);
+        if (rows) {
+            session.refused_write = refused();
+            return std::move(*rows).Reply(ReturningPrefix(false, visible_version), {}, continuation);
+        }
         return ErrorReply(ConditionFailedError(version));
     }
     TxnWrite(txn, store, coord, [&](ChunkState& state) {

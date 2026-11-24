@@ -265,6 +265,10 @@ struct SessionState {
     bool authenticated = false;
     std::size_t failed_auth_attempts = 0;
     bool close_after_reply = false;
+    // The refusal a write with RETURNING answered as applied false
+    // (VERSION_MISMATCH or CONDITION_FAILED), counted in the metrics as
+    // that error; empty otherwise. Set by the statement, cleared by Execute.
+    std::string_view refused_write;
     // HELLO succeeded; every other command needs it.
     bool greeted = false;
     // The logged-in user; empty when logins need no user.
@@ -460,10 +464,13 @@ class CommandEngine {
     void RequireCreateRight(SessionState& session, const std::string& table) const;
     void RequireManagesUsers(SessionState& session) const;
     // Records a reply in the command metrics.
+    // `refusal`, when not empty, is the error code a reply that is not an
+    // error stands for (SessionState::refused_write).
     void ObserveReply(
         MetricsRegistry::CommandClass command_class,
         std::chrono::steady_clock::time_point started,
-        const std::string& response);
+        const std::string& response,
+        std::string_view refusal = {});
     [[nodiscard]] std::string HandleMetrics() const;
 
     // Transactions (engine_cql.cpp, docs/design/TRANSACTIONS_DESIGN.md).

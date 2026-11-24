@@ -431,7 +431,7 @@ std::string CommandEngine::Execute(
         response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr,
             continuation, reserve_reply);
     }
-    ObserveReply(command_class, started, response);
+    ObserveReply(command_class, started, response, std::exchange(session.refused_write, std::string_view{}));
     if (logged && info.verb != nullptr) {
         LogStatement(session, info, started, response);
     }
@@ -592,10 +592,11 @@ void CommandEngine::AuditLogin(
 void CommandEngine::ObserveReply(
     MetricsRegistry::CommandClass command_class,
     std::chrono::steady_clock::time_point started,
-    const std::string& response) {
+    const std::string& response,
+    std::string_view refusal) {
     const auto elapsed = std::chrono::steady_clock::now() - started;
 
-    const bool ok = response.empty() || response[0] != '-';
+    const bool ok = refusal.empty() && (response.empty() || response[0] != '-');
     metrics_->ObserveCommand(
         command_class,
         std::chrono::duration<double>(elapsed).count(),
@@ -604,7 +605,9 @@ void CommandEngine::ObserveReply(
         // Error frames look like "-ERR <CODE> <message>\r\n".
         std::string_view code = response;
         constexpr std::string_view kErrPrefix = "-ERR ";
-        if (code.rfind(kErrPrefix, 0) == 0) {
+        if (!refusal.empty()) {
+            code = refusal;
+        } else if (code.rfind(kErrPrefix, 0) == 0) {
             code.remove_prefix(kErrPrefix.size());
             const auto code_end = code.find_first_of(" \r\n");
             if (code_end != std::string_view::npos) {
