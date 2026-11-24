@@ -26,6 +26,7 @@
 #include "sectioned_chunk_form.hpp"
 #include "chunkdb/chunk_columns.hpp"
 #include "cql.hpp"
+#include "expr.hpp"
 #include "feature_flags.hpp"
 #include "backup.hpp"
 #include "slot_watch.hpp"
@@ -91,6 +92,8 @@ constexpr std::size_t kMaxStatementParameterBytes =
 }
 
 [[nodiscard]] std::string Describe(const Column& column) {
+    // An expression's parameter has no column of its own.
+    if (column.name.empty()) return "a " + ColumnTypeName(column.type) + " value";
     return "column " + column.name + " (" + ColumnTypeName(column.type) + ")";
 }
 
@@ -566,6 +569,50 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
     }
 }
 
+// The expressions of one SET BLOCK or DELETE BLOCK, planned against the
+// table's columns as they are.
+struct BlockWritePlan {
+    std::optional<expr::ConditionPlan> condition;
+    std::optional<expr::AssignmentsPlan> assignments;
+    bool reads_now = false;
+    bool reads_chunk_columns = false;
+};
+
+[[nodiscard]] BlockWritePlan PlanBlockWrite(const expr::WriteExpressions& expressions, const Geometry& geometry) {
+    const expr::ColumnList schema(geometry.layout().schema().columns, geometry.chunk_schema().columns);
+    BlockWritePlan plan;
+    if (expressions.condition) plan.condition = expr::PlanCondition(*expressions.condition, schema);
+    if (!expressions.assignments.empty()) plan.assignments = expr::PlanAssignments(expressions.assignments, schema);
+    const auto reads = [&plan](expr::Op op) {
+        return (plan.condition && plan.condition->Reads(op)) || (plan.assignments && plan.assignments->Reads(op));
+    };
+    plan.reads_now = reads(expr::Op::kNow);
+    plan.reads_chunk_columns = reads(expr::Op::kChunkColumn);
+    return plan;
+}
+
+// Calls `use` with each parameter the expressions take and its type.
+template <class Use>
+void ForEachExpressionParameter(const BlockWritePlan& plan, Use&& use) {
+    if (plan.condition)
+        for (const auto& parameter : plan.condition->parameters()) use(parameter);
+    if (plan.assignments)
+        for (const auto& parameter : plan.assignments->parameters()) use(parameter);
+}
+
+// The expressions' parameters, $n at index n - 1, each decoded as the type
+// it takes.
+[[nodiscard]] std::vector<ColumnValue> ExpressionParameters(
+    const BlockWritePlan& plan, std::span<const std::optional<std::string>> frames) {
+    std::vector<ColumnValue> values(frames.size());
+    ForEachExpressionParameter(plan, [&](const expr::ParameterType& parameter) {
+        Column column;
+        column.type = parameter.type;
+        values[parameter.index - 1U] = ParameterValue(column, parameter.index, frames[parameter.index - 1U]);
+    });
+    return values;
+}
+
 [[nodiscard]] bool SessionControl(const cql::Statement& statement) {
     return std::holds_alternative<cql::ShowConnections>(statement) ||
            std::holds_alternative<cql::Cancel>(statement) || std::holds_alternative<cql::KillConnection>(statement);
@@ -958,26 +1005,41 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
         return request;
     }
     const auto* set = std::get_if<cql::SetBlock>(&parsed.statement);
-    if (set == nullptr) {
+    const auto* del = std::get_if<cql::DeleteBlock>(&parsed.statement);
+    if (set == nullptr && (del == nullptr || !del->expressions)) {
         return reject(Protocol::Error("UNKNOWN_COMMAND", "this statement is not available yet"));
     }
-    const std::shared_ptr<Table> table = find(set->table);
+    const std::string& table_name = set != nullptr ? set->table : del->table;
+    const std::shared_ptr<Table> table = find(table_name);
     if (table == nullptr) {
-        return missing(set->table);
+        return missing(table_name);
     }
     // The statement checks the values again under its lease, so a column
     // that changes in between is not trusted.
     const Geometry geometry = table->geometry();
     const auto& layout = geometry.layout();
     request.parameter_limits.assign(parsed.parameters, 0);
-    for (const auto& assignment : set->values) {
+    // An expression's parameter takes the type the plan gives it.
+    if (const auto& expressions = set != nullptr ? set->expressions : del->expressions) {
+        try {
+            ForEachExpressionParameter(PlanBlockWrite(*expressions, geometry), [&](const expr::ParameterType& parameter) {
+                request.parameter_limits[parameter.index - 1U] = ParameterBytes(parameter.type);
+            });
+        } catch (const std::invalid_argument& e) {
+            return reject(ErrorReply(e));
+        } catch (const std::out_of_range& e) {
+            return reject(ErrorReply(e));
+        }
+    }
+    for (const auto& assignment :
+         set != nullptr ? std::span<const cql::Assignment>(set->values) : std::span<const cql::Assignment>{}) {
         const auto* parameter = std::get_if<cql::Parameter>(&assignment.value);
         if (parameter == nullptr) {
             continue;
         }
         const std::size_t index = layout.FindColumn(assignment.column);
         if (index == std::string_view::npos) {
-            return reject(Protocol::Error("INVALID_ARGUMENT", "the table has no column " + assignment.column + "; use DESCRIBE " + set->table + " to check column names"));
+            return reject(Protocol::Error("INVALID_ARGUMENT", "the table has no column " + assignment.column + "; use DESCRIBE " + table_name + " to check column names"));
         }
         request.parameter_limits[parameter->index - 1U] = ParameterBytes(layout.schema().columns[index].type);
     }
@@ -1394,6 +1456,7 @@ std::string CommandEngine::ExecuteStatement(
                     return reply;
                 },
                 [&](const cql::SetBlock& set) {
+                    if (set.expressions) return BlockWriteWithExpressions(session, &set, nullptr, parameters, command_class);
                     command_class = set.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
                                                                : MetricsRegistry::CommandClass::kPointWrite;
                     RequireRight(session, set.table, Right::kWrite);
@@ -1428,6 +1491,7 @@ std::string CommandEngine::ExecuteStatement(
                                                        : store.SetBlock(set.x, set.y, values, set.if_version));
                 },
                 [&](const cql::DeleteBlock& del) {
+                    if (del.expressions) return BlockWriteWithExpressions(session, nullptr, &del, parameters, command_class);
                     command_class = del.if_version.has_value() ? MetricsRegistry::CommandClass::kConditional
                                                                : MetricsRegistry::CommandClass::kPointWrite;
                     RequireRight(session, del.table, Right::kWrite);
@@ -2490,6 +2554,109 @@ void CommandEngine::TxnWrite(
         undo();
         throw;
     }
+}
+
+std::string CommandEngine::BlockWriteWithExpressions(
+    SessionState& session,
+    const cql::SetBlock* set,
+    const cql::DeleteBlock* del,
+    std::span<const std::optional<std::string>> parameters,
+    MetricsRegistry::CommandClass& command_class) {
+    const auto& expressions = set != nullptr ? *set->expressions : *del->expressions;
+    const std::string& table = set != nullptr ? set->table : del->table;
+    const std::optional<std::uint64_t>& if_version = set != nullptr ? set->if_version : del->if_version;
+    const std::int64_t x = set != nullptr ? set->x : del->x;
+    const std::int64_t y = set != nullptr ? set->y : del->y;
+    const std::int64_t z = set != nullptr ? set->z : del->z;
+    command_class = expressions.condition || if_version ? MetricsRegistry::CommandClass::kConditional
+                                                        : MetricsRegistry::CommandClass::kPointWrite;
+    // A condition reads the block and needs READ and WRITE (docs/DESIGN-2.0.md
+    // E3); WRITE includes READ.
+    RequireRight(session, table, Right::kWrite);
+    RequireNoVersionInTxn(session, if_version);
+    const auto lease = session.transaction != nullptr ? TxnLease(session, table) : AcquireNamedTable(session, table);
+    ChunkStore& store = lease.store();
+    const Geometry& geometry = store.geometry();
+    RequireDimensions(geometry, set != nullptr ? set->dims : del->dims);
+    const auto& layout = geometry.layout();
+    const BlockWritePlan plan = PlanBlockWrite(expressions, geometry);
+    const std::vector<ColumnValue> values = ExpressionParameters(plan, parameters);
+    // Single values with IF <expr> are decoded as without it.
+    std::vector<ColumnAssignment> single;
+    if (set != nullptr && !plan.assignments) {
+        single.reserve(set->values.size());
+        for (const auto& assignment : set->values) {
+            const Column& column = layout.schema().columns[RequireColumn(layout, assignment.column)];
+            const auto* parameter = std::get_if<cql::Parameter>(&assignment.value);
+            single.push_back(ColumnAssignment{
+                .column = assignment.column,
+                .value = parameter != nullptr ? ParameterValue(column, parameter->index, parameters[parameter->index - 1U])
+                                              : LiteralValue(column, assignment.value),
+            });
+        }
+    }
+    bool version_mismatch = false;
+    const auto decide = [&](const BlockWriteView& block, std::vector<ColumnAssignment>& out) {
+        if (if_version && block.version != *if_version) {
+            version_mismatch = true;
+            return false;
+        }
+        const expr::Inputs inputs{
+            .exists = block.values != nullptr,
+            .block = block.values != nullptr ? std::span<const ColumnValue>(*block.values) : std::span<const ColumnValue>{},
+            .chunk = block.chunk_columns,
+            .x = x,
+            .y = y,
+            .z = z,
+            .now = block.commit_time_ms,
+            .parameters = values,
+        };
+        if (plan.condition && !expr::EvaluateCondition(*plan.condition, inputs)) return false;
+        if (!plan.assignments) {
+            out = std::move(single);
+            return true;
+        }
+        auto computed = expr::EvaluateAssignments(*plan.assignments, inputs);
+        const auto& targets = plan.assignments->targets();
+        out.reserve(targets.size());
+        for (std::size_t i = 0; i < targets.size(); ++i) {
+            out.push_back(ColumnAssignment{.column = layout.schema().columns[targets[i].slot].name, .value = std::move(computed[i])});
+        }
+        return true;
+    };
+
+    if (session.transaction == nullptr) {
+        const auto result = store.WriteBlockDecided(x, y, z, del != nullptr, plan.reads_chunk_columns, decide);
+        if (version_mismatch) return Protocol::Error("VERSION_MISMATCH", "", {{"current", std::to_string(result.version)}});
+        if (!result.ok) return ErrorReply(ConditionFailedError(result.version));
+        std::string reply;
+        Protocol::AppendInteger(reply, result.version);
+        return reply;
+    }
+    // The commit time of a transaction is known only at COMMIT.
+    if (plan.reads_now) throw std::invalid_argument("NOW() is not used in a transaction's writes; pass the time as a parameter");
+    auto& txn = *session.transaction;
+    const ChunkCoord coord = BlockCoord(geometry, x, y, z);
+    // A condition reads the transaction's view and counts as a read.
+    if (plan.condition) TxnRead(txn, std::span<const ChunkCoord>(&coord, 1));
+    TxnWrite(txn, store, coord, [&](ChunkState& state) {
+        const auto block = geometry.dims() == 3U ? store.BlockInState3D(state, x, y, z) : store.BlockInState(state, x, y);
+        std::vector<ColumnValue> chunk_columns;
+        if (plan.reads_chunk_columns) chunk_columns = store.ChunkColumnValues(state.chunk_columns.get());
+        std::vector<ColumnAssignment> assignments;
+        const BlockWriteView view{.values = block ? &*block : nullptr, .chunk_columns = chunk_columns, .version = state.version};
+        // TxnWrite puts the copy back when this throws.
+        if (!decide(view, assignments)) throw ConditionFailedError(state.version);
+        if (del != nullptr) {
+            if (geometry.dims() == 3U) store.UnsetBlockInState3D(state, x, y, z);
+            else store.UnsetBlockInState(state, x, y);
+        } else if (geometry.dims() == 3U) {
+            store.SetBlockInState3D(state, x, y, z, assignments);
+        } else {
+            store.SetBlockInState(state, x, y, assignments);
+        }
+    });
+    return NullReply();
 }
 
 std::string CommandEngine::TxnCommit(SessionState& session) {

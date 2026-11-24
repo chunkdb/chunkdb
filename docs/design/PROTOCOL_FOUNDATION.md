@@ -55,7 +55,7 @@ Unset options use server defaults; explicit per-statement TAG overrides `default
 | `txn_max_read_chunks` | Configured statement/commit admission, default 8192. |
 | `max_watches` | Effective server configuration; current default 64. |
 | `max_returning_rows` | 65536, the declared ceiling from E3; RETURNING remains unavailable until task 55. |
-| `max_expression_nodes` | 256, the declared ceiling from E1; expressions remain unavailable until task 55. |
+| `max_expression_nodes` | 256, the ceiling from E1 for the expressions of SET BLOCK and DELETE BLOCK. |
 
 Unavailable capabilities do not become supported merely because their numeric ceilings appear in HELLO.
 The initial capability names are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, and `lineage`.

@@ -14,6 +14,7 @@ Generated passwords, epochs, and timestamps appear as named placeholders.
 | Reference | Statements |
 | --- | --- |
 | [Blocks](reference/BLOCKS.md) | GET BLOCK, SET BLOCK, DELETE BLOCK |
+| [Expressions](reference/EXPRESSIONS.md) | Computed values and IF conditions of SET BLOCK and DELETE BLOCK |
 | [Chunks and areas](reference/CHUNKS.md) | GET CHUNK, SET CHUNK, GET AREA, SCAN CHUNKS, COMPACT TOMBSTONES, SHOW TABLE STATS |
 | [Aggregates](reference/AGGREGATE.md) | AGGREGATE |
 | [Tables](reference/TABLES.md) | CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SWAP TABLES, SHOW TABLES, DESCRIBE, SHOW STATUS, ENABLE FEATURE |
@@ -34,12 +35,13 @@ Bytes use hexadecimal literals such as `x'0a0bff'`.
 Bits use literals such as `b'1010'`, with the first digit representing the lowest bit.
 
 Trailing keyword options can appear in any order, each at most once.
-Client APIs supply binary `$n` parameters in these places: SET BLOCK values, the SET CHUNK form or META values, `VERIFIER $1` in CREATE USER and ALTER USER, HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
+Client APIs supply binary `$n` parameters in these places: SET BLOCK values, expressions and conditions, DELETE BLOCK conditions, the SET CHUNK form or META values, `VERIFIER $1` in CREATE USER and ALTER USER, HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
 See [Protocol](PROTOCOL.md#parameters) for encoding.
 
 Committed chunk versions are producing commit revisions, ordered only within the table epoch returned by DESCRIBE.
 DESCRIBE's schema `version` differs from its completed commit `revision`; read-only mode returns null for that frontier.
 Use IF VERSION for equality checks against the containing chunk, including changes to other blocks in that chunk.
+Use IF with a [condition](reference/EXPRESSIONS.md) to test the block's own values in the same step as the write.
 
 ## Related data
 

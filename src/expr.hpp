@@ -139,6 +139,15 @@ struct Assignments {
     std::size_t parameters = 0;
 };
 
+// The expressions of one SET BLOCK or DELETE BLOCK (cql::SetBlock::expressions).
+struct WriteExpressions {
+    // IF <expr>.
+    std::optional<Expression> condition;
+    // SET BLOCK's values when one of them is more than a single value;
+    // cql::SetBlock::values is then empty.
+    std::vector<AssignmentExpression> assignments;
+};
+
 // The whole of `text` as a condition, or as `column = sum {, column = sum}`.
 // Throws ParseError.
 [[nodiscard]] Condition ParseCondition(std::string_view text, const Limits& limits = {});
@@ -211,6 +220,8 @@ class ConditionPlan {
     explicit ConditionPlan(std::shared_ptr<const detail::Program> program) : program_(std::move(program)) {}
     // The parameters the condition uses, by index.
     [[nodiscard]] const std::vector<ParameterType>& parameters() const;
+    // Whether a node of the condition is `op` (kNow, kChunkColumn).
+    [[nodiscard]] bool Reads(Op op) const;
     // Throws std::logic_error for a plan that was never made.
     [[nodiscard]] const detail::Program& program() const;
 
@@ -223,6 +234,8 @@ class AssignmentsPlan {
     AssignmentsPlan() = default;
     explicit AssignmentsPlan(std::shared_ptr<const detail::Program> program) : program_(std::move(program)) {}
     [[nodiscard]] const std::vector<ParameterType>& parameters() const;
+    // Whether a node of a value is `op` (kNow, kChunkColumn).
+    [[nodiscard]] bool Reads(Op op) const;
     // The assigned columns, in the order of the assignments.
     [[nodiscard]] const std::vector<ColumnBinding>& targets() const;
     // Throws std::logic_error for a plan that was never made.

@@ -1291,6 +1291,20 @@ const std::vector<ParameterType>& AssignmentsPlan::parameters() const {
     return program().parameters;
 }
 
+namespace {
+[[nodiscard]] bool ProgramReads(const Program& program, Op op) {
+    return std::any_of(program.steps.begin(), program.steps.end(), [op](const Step& step) { return step.op == op; });
+}
+}  // namespace
+
+bool ConditionPlan::Reads(Op op) const {
+    return ProgramReads(program(), op);
+}
+
+bool AssignmentsPlan::Reads(Op op) const {
+    return ProgramReads(program(), op);
+}
+
 const std::vector<ColumnBinding>& AssignmentsPlan::targets() const {
     return program().target_columns;
 }

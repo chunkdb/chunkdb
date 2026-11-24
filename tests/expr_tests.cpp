@@ -684,16 +684,17 @@ void TestStatementEmbedding() {
 }
 
 void TestStatementsUnchanged() {
-    // Statements still lex '-' with a number and refuse expression tokens.
+    // Statements still lex '-' with a number and refuse expression tokens
+    // outside SET BLOCK values and IF conditions.
     const auto parsed = cql::Parse("SET BLOCK 0 0 IN t a = -5, b = -inf");
     const auto& set = std::get<cql::SetBlock>(parsed.statement);
     Check(std::get<cql::Integer>(set.values[0].value) == cql::Integer{.negative = true, .magnitude = 5}, "statement -5");
     Check(std::isinf(std::get<double>(set.values[1].value)), "statement -inf");
     for (const auto& [line, part] : std::vector<std::pair<std::string, std::string>>{
              {"GET BLOCK 1 2 FROM t <", "column 22: unexpected '<'"},
-             {"SET BLOCK 0 0 IN t a = \"x\"", "unexpected '\"'"},
-             {"SET BLOCK 0 0 IN t a = 1 + 2", "unexpected '+'"},
-             {"SET BLOCK 0 0 IN t a = - 5", "unexpected '-'"},
+             {"GET BLOCK 1 2 FROM t COLUMNS \"x\"", "unexpected '\"'"},
+             {"SET CHUNK 0 0 IN t META a = 1 + 2", "unexpected '+'"},
+             {"SET CHUNK 0 0 IN t META a = - 5", "unexpected '-'"},
              {"GET BLOCK 1 2 FROM t.x", "unexpected '.'"},
              {"SET BLOCK 0 0 IN t a = $1, b = $1", "$1 is used twice"},
              {"SET BLOCK 0 0 IN t a = $2", "parameters must be numbered $1 to $2 without gaps"},

@@ -31,6 +31,7 @@
 #include <vector>
 
 #include "chunkdb/bit_codec.hpp"
+#include "chunkdb/chunk_columns.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
@@ -278,12 +279,15 @@ void ChunkStore::SetBlockBitsAtAddress(const ChunkCoord& chunk_coord, std::size_
     WriteBlockBitsLocked(chunk_coord, regular_chunk, block_index, bits, true);
 }
 
+template <class... Pinned>
 void ChunkStore::WriteBlockBitsLocked(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& regular_chunk,
     std::size_t block_index,
     std::string_view bits,
-    bool present) {
+    bool present,
+    Pinned... pinned_commit_time_ms) {
+    static_assert(sizeof...(Pinned) <= 1U);
     const std::size_t bit_offset = block_index * geometry_.config().block_bits;
     const std::size_t begin_byte = bit_offset / 8U;
     const std::size_t end_byte = (bit_offset + bits.size() - 1U) / 8U;
@@ -333,7 +337,9 @@ void ChunkStore::WriteBlockBitsLocked(
             next_bytes.end(),
             regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte));
         regular_chunk->presence_bitmap[presence_byte_index] = next_presence_byte;
-        const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
+        std::uint64_t commit_time_ms = 0;
+        if constexpr (sizeof...(Pinned) == 0U) commit_time_ms = NextCommitTimeMs(*regular_chunk);
+        else commit_time_ms = (pinned_commit_time_ms, ...);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
         WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
         if (payload_changed) {
@@ -911,12 +917,15 @@ void ChunkStore::PrepareTxnChunkState(ChunkState& state, const ChunkVars& curren
         current_chunk_columns ? current_chunk_columns->variable_bytes : 0U);
 }
 
+template <class... Pinned>
 void ChunkStore::WriteBlockColumnsLocked(
     const ChunkCoord& chunk_coord,
     const std::shared_ptr<RegularChunk>& chunk,
     std::size_t block_index,
     BlockWrite& write,
-    bool present) {
+    bool present,
+    Pinned... pinned_commit_time_ms) {
+    static_assert(sizeof...(Pinned) <= 1U);
     // The text and bytes values that change, ascending, checked against the
     // table's limit before anything changes.
     VarUpdate var_update;
@@ -1030,7 +1039,9 @@ void ChunkStore::WriteBlockColumnsLocked(
         if (!var_update.empty()) {
             var_undo = ApplyVarUpdate(&chunk->vars, std::move(var_update));
         }
-        const std::uint64_t commit_time_ms = NextCommitTimeMs(*chunk);
+        std::uint64_t commit_time_ms = 0;
+        if constexpr (sizeof...(Pinned) == 0U) commit_time_ms = NextCommitTimeMs(*chunk);
+        else commit_time_ms = (pinned_commit_time_ms, ...);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
         WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
         for (const auto& range : ranges) {
@@ -1485,6 +1496,62 @@ std::vector<std::uint8_t> ChunkStore::GetChunkStateBytes(std::int64_t chunk_x, s
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     auto lock = LockStatementChunkShared(regular_chunk->mutex);
     return BuildChunkStateBytes(geometry_, regular_chunk->payload, regular_chunk->presence_bitmap);
+}
+
+std::vector<ColumnValue> ChunkStore::ChunkColumnValues(const ChunkColumnState* state) const {
+    const auto& schema = geometry_.chunk_schema();
+    if (state == nullptr) state = geometry_.default_chunk_columns().get();
+    if (state == nullptr) return std::vector<ColumnValue>(schema.columns.size());
+    return DecodeChunkColumns(schema, state->bytes);
+}
+
+ChunkMutationResult ChunkStore::WriteBlockDecided(std::int64_t x, std::int64_t y, std::int64_t z, bool remove,
+    bool read_chunk_columns, const BlockWriteDecision& decide) {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        throw std::invalid_argument("store is read-only");
+    }
+    ThrowIfDurabilityPoisoned();
+    ChunkCoord chunk_coord;
+    std::size_t block_index = 0;
+    if (geometry_.dims() == 3U) {
+        chunk_coord = geometry_.BlockToChunk(x, y, z);
+        const auto local = geometry_.BlockToLocal(x, y, z);
+        block_index = geometry_.LocalBlockIndex(local[0], local[1], local[2]);
+    } else {
+        chunk_coord = geometry_.BlockToChunk(x, y);
+        const auto [local_x, local_y] = geometry_.BlockToLocal(x, y);
+        block_index = geometry_.LocalBlockIndex(local_x, local_y);
+    }
+
+    const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
+    auto lock = LockStatementChunk(regular_chunk->mutex);
+    AwaitChunkBacklogLocked(lock, *regular_chunk);
+    // The block as it is now, read under the lock the write keeps.
+    const bool present = BlockPresent(regular_chunk->presence_bitmap, block_index);
+    std::optional<std::vector<ColumnValue>> values;
+    if (present) values = DecodeBlockColumns(geometry_.layout(), regular_chunk->payload, regular_chunk->vars, block_index);
+    std::vector<ColumnValue> chunk_columns;
+    if (read_chunk_columns) chunk_columns = ChunkColumnValues(regular_chunk->chunk_columns.get());
+    // NOW() is the commit time: issued here and taken by the write.
+    const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
+    std::vector<ColumnAssignment> assignments;
+    const BlockWriteView view{.values = values ? &*values : nullptr, .chunk_columns = chunk_columns,
+        .version = regular_chunk->version, .commit_time_ms = commit_time_ms};
+    if (!decide(view, assignments)) {
+        return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+    }
+    if (!remove) {
+        auto& write = PrepareSetBlockWrite(assignments, block_index);
+        if (!present) AddNewBlockColumns(write, block_index);
+        WriteBlockColumnsLocked(chunk_coord, regular_chunk, block_index, write, true, commit_time_ms);
+    } else if (!geometry_.layout().bit_string_blocks()) {
+        WriteBlockColumnsLocked(
+            chunk_coord, regular_chunk, block_index, PrepareUnsetBlockWrite(block_index), false, commit_time_ms);
+    } else {
+        const std::string zero_bits(geometry_.config().block_bits, '0');
+        WriteBlockBitsLocked(chunk_coord, regular_chunk, block_index, zero_bits, false, commit_time_ms);
+    }
+    return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
 }
 
 }  // namespace chunkdb
