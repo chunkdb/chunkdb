@@ -19,6 +19,7 @@
 #include <netinet/in.h>
 #include <poll.h>
 #include <signal.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/stat.h>
 #include <sys/wait.h>
@@ -791,7 +792,8 @@ void CloseFd(int& fd) {
 }
 
 enum class Input { kInherit, kPipe };
-enum class Output { kNull, kMerge, kSeparate };
+// kFile writes stdout and stderr to a file a Child names.
+enum class Output { kNull, kMerge, kSeparate, kFile };
 
 struct Completed {
     int returncode = 0;
@@ -799,10 +801,25 @@ struct Completed {
     std::string err;
 };
 
+// fork fails with EAGAIN when this user reaches its process limit, which a
+// host running many tests at once can reach; the error names that limit.
+std::string ForkError(int error) {
+    std::string message = std::string("fork: ") + std::strerror(error);
+    rlimit limit{};
+    if (::getrlimit(RLIMIT_NPROC, &limit) == 0) {
+        const auto text = [](rlim_t value) {
+            return value == RLIM_INFINITY ? std::string("unlimited") : std::to_string(value);
+        };
+        message += " (process limit RLIMIT_NPROC soft=" + text(limit.rlim_cur) + " hard=" + text(limit.rlim_max) + ")";
+    }
+    return message;
+}
+
 // A child process with optional stdin and output pipes.
 class Child {
   public:
-    Child(const std::vector<std::string>& argv, const Environment& env, Input input, Output output)
+    Child(const std::vector<std::string>& argv, const Environment& env, Input input, Output output,
+          const fs::path& output_file = {})
         : description_(Repr(argv)) {
         const std::string path = FindExecutable(argv.at(0), env);
         std::vector<char*> args;
@@ -818,19 +835,20 @@ class Child {
         int out_pipe[2] = {-1, -1};
         int err_pipe[2] = {-1, -1};
         int exec_pipe[2] = {-1, -1};
-        int null_fd = -1;
+        int file_fd = -1;
         auto close_all = [&] {
             for (int* fd : {&in_pipe[0], &in_pipe[1], &out_pipe[0], &out_pipe[1], &err_pipe[0], &err_pipe[1],
-                            &exec_pipe[0], &exec_pipe[1], &null_fd}) {
+                            &exec_pipe[0], &exec_pipe[1], &file_fd}) {
                 CloseFd(*fd);
             }
         };
         try {
             if (input == Input::kPipe) MakePipe(in_pipe);
-            if (output == Output::kNull) {
-                null_fd = ::open("/dev/null", O_WRONLY);
-                if (null_fd < 0) throw std::runtime_error(std::string("/dev/null: ") + std::strerror(errno));
-                SetCloseOnExec(null_fd);
+            if (output == Output::kNull || output == Output::kFile) {
+                const std::string target = output == Output::kFile ? output_file.string() : "/dev/null";
+                file_fd = ::open(target.c_str(), O_WRONLY | (output == Output::kFile ? O_CREAT | O_TRUNC : 0), 0600);
+                if (file_fd < 0) throw std::runtime_error(target + ": " + std::strerror(errno));
+                SetCloseOnExec(file_fd);
             } else {
                 MakePipe(out_pipe);
                 if (output == Output::kSeparate) MakePipe(err_pipe);
@@ -845,13 +863,13 @@ class Child {
         if (pid_ < 0) {
             const int error = errno;
             close_all();
-            throw std::runtime_error(std::string("fork: ") + std::strerror(error));
+            throw std::runtime_error(ForkError(error));
         }
         if (pid_ == 0) {
             // Only async-signal-safe calls until exec. The child starts with
             // default SIGPIPE and SIGINT and no blocked signals.
             if (in_pipe[0] >= 0) ::dup2(in_pipe[0], 0);
-            const int out_fd = output == Output::kNull ? null_fd : out_pipe[1];
+            const int out_fd = file_fd >= 0 ? file_fd : out_pipe[1];
             ::dup2(out_fd, 1);
             ::dup2(output == Output::kSeparate ? err_pipe[1] : out_fd, 2);
             ::signal(SIGPIPE, SIG_DFL);
@@ -869,7 +887,7 @@ class Child {
         CloseFd(out_pipe[1]);
         CloseFd(err_pipe[1]);
         CloseFd(exec_pipe[1]);
-        CloseFd(null_fd);
+        CloseFd(file_fd);
         int exec_error = 0;
         ssize_t n = 0;
         while ((n = ::read(exec_pipe[0], &exec_error, sizeof(exec_error))) < 0 && errno == EINTR) {
@@ -1197,25 +1215,31 @@ class TempDir {
 class Fixture {
   public:
     Fixture(const fs::path& server, const fs::path& cli, const std::string& directory)
-        : cli_(cli), env_(CurrentEnvironment()) {
-        const std::string port = std::to_string(chunkdb::test::PickListenerPort());
+        : cli_(cli), env_(CurrentEnvironment()), log_(fs::path(directory) / "server.log") {
         env_["CHUNKDB_ADMIN_USER"] = "admin";
         env_["CHUNKDB_ADMIN_PASSWORD"] = "docs-fixture-private-password";
         env_["CHUNKDB_PASSWORD"] = env_["CHUNKDB_ADMIN_PASSWORD"];
         env_.erase("CHUNKDB_ADMIN_PASSWORD_FILE");
-        env_["CHUNKDB_URI"] = "chunk://admin@127.0.0.1:" + port + "/";
         env_["EXAMPLE_DIR"] = directory;
         env_["PATH"] = cli.parent_path().string() + ":" + env_.at("PATH");
         process_ = std::make_unique<Child>(
-            std::vector<std::string>{server.string(), "--listen-uri", "chunk://127.0.0.1:" + port + "/", "--data-dir",
-                                     directory + "/data", "--backup-dir", directory + "/backups", "--workers", "2"},
-            env_, Input::kInherit, Output::kNull);
+            // Port 0: the server picks a free port and names it in its INFO ready line.
+            std::vector<std::string>{server.string(), "--listen-uri", "chunk://127.0.0.1:0/", "--data-dir",
+                                     directory + "/data", "--backup-dir", directory + "/backups", "--workers", "2",
+                                     "--log-level", "info"},
+            env_, Input::kInherit, Output::kFile, log_);
     }
 
     void Start() {
-        // A real PING is the readiness signal. Startup races are bounded by an
-        // explicit deadline; they do not weaken any production behavior.
         const auto deadline = Clock::now() + std::chrono::seconds(20);
+        std::optional<std::uint16_t> port;
+        while (!(port = chunkdb::test::ReadyLinePort(log_))) {
+            if (process_->Poll()) throw std::runtime_error("server exited before listening; its log is " + log_.string());
+            if (Clock::now() >= deadline) throw std::runtime_error("server did not report listening in 20 s");
+            std::this_thread::sleep_for(std::chrono::milliseconds(20));  // Server startup only.
+        }
+        env_["CHUNKDB_URI"] = "chunk://admin@127.0.0.1:" + std::to_string(*port) + "/";
+        // A real PING is the readiness signal.
         while (true) {
             Completed result = Run({cli_.string(), "--uri", env_.at("CHUNKDB_URI"), "PING"}, env_,
                                    std::chrono::seconds(5), Output::kSeparate);
@@ -1306,6 +1330,7 @@ class Fixture {
   private:
     fs::path cli_;
     Environment env_;
+    fs::path log_;
     std::unique_ptr<Child> process_;
     std::vector<std::pair<std::string, std::unique_ptr<Shell>>> shells_;
     std::unique_ptr<Child> watch_;

@@ -9,8 +9,8 @@ Numeric values are decimal integers, with the bounds shown here.
 | Flag | Default | Meaning and bounds |
 |---|---|---|
 | `--host` | `127.0.0.1` | Bind address. |
-| `--port` | `4242` | TCP port, 1–65535. |
-| `--listen-uri` | unset | `chunk://host:port/` or `chunks://host:port/`; sets address, port and TLS at this point in argument order; a username is refused. |
+| `--port` | `4242` | TCP port, 0–65535; 0 listens on a free port the system picks, which the `port` field of the INFO line `ready to accept connections` names. |
+| `--listen-uri` | unset | `chunk://host:port/` or `chunks://host:port/`; sets address, port and TLS at this point in argument order; port 0 picks a free port as with `--port`; a username is refused. |
 | `--workers` | CPU thread count, or 4 | Concurrent statement execution; idle input, partial frames, TLS, authentication and output wait on I/O pollers, except that a worker with no queued request waits for the next request of the connection it answered. |
 | `--client-io-timeout-ms` | `5000` | 1–86400000 ms each for the PROXY header, the TLS handshake, HELLO and AUTH with all their parameter frames (after those two), each later request line (from its first byte), frame header (from the end of the line or the previous frame) and frame body, kept or drained (from the end of its header), not counting a wait for the server's input credit, which receives `BUSY reason=input_budget` and closes after this interval; reply writes close after this interval without output progress, and a slot watch sending any frame above its feed share is closed when no byte of its output is written for this long, where on TLS each completed record of up to 16 KiB counts. |
 | `--idle-connection-timeout-ms` | `60000` | 1–86400000 ms between requests; before HELLO the smaller I/O/idle timeout applies. |
@@ -74,6 +74,7 @@ With `off`, the server never reads a header, so a client cannot claim another ad
 ## Logs
 
 The server log goes to standard output at `--log-level`.
+The INFO line `ready to accept connections` is written out as soon as the server accepts connections, also to a pipe or file; its `port` field names the port it listens on.
 
 `--slow-statement-ms` logs a WARN line for each statement that took at least that long.
 The line names the statement verb, table, user, peer address, duration in milliseconds and, where the server knows it, the number of chunks read or written; it never contains values.
@@ -139,13 +140,17 @@ Raise `--max-loaded-chunks` to raise the associated container limit.
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--archive-dir` | unset | Copies every sealed WAL segment of every table to this directory, outside `--data-dir`; see [WAL archive](BACKUP.md#5-archive-the-wal). |
-| `--archive-command` | unset | Instead of `--archive-dir`, runs this shell command for each file: `%p` is its local path, `%f` its name in the archive, `%%` a `%`; exit status 0 means archived. |
-| `--archive-interval-ms` | `60000` | 100 to 86400000; how often every table is sealed and shipped. |
+| `--archive-dir` | unset | Copies every table's sealed WAL segments, manifests, users file and migrations ledger to this directory, which must not contain or lie in `--data-dir`. |
+| `--archive-command` | unset | Instead of `--archive-dir`, runs this command through the system shell for each file: `%p` is its local path, `%f` its name in the archive, `%%` a `%`; exit status 0 means archived. |
+| `--archive-interval-ms` | `60000` | 100 to 86400000; how often every table is sealed and its files shipped. |
 | `--archive-retention-ms` | `0` | With `--archive-dir`, how long seal records and the segments only they need are kept; `0` keeps everything. |
 
 The two archive flags exclude each other, and `--read-only` refuses them.
-A table needs the `feed_slots` feature, which tables created by this version have; for an older table, start without the archive flags, run `ENABLE FEATURE 'feed_slots'`, and restart.
+A pass also runs when the server starts and at clean shutdown; see [WAL archive](DURABILITY_CONTRACT.md#wal-archive) for what a seal record guarantees.
+`--archive-command` must succeed again for a file it already archived with the same bytes, for example `--archive-command 'aws s3 cp %p s3://bucket/chunkdb/%f'`.
+While shipping fails, the files wait in the data directory and SHOW STATUS reports `archive` with the error and `staged_bytes`.
+A table needs the `feed_slots` feature, which tables created by this version have; for an older table, start without the archive flags, run `ENABLE FEATURE 'feed_slots'` and restart.
+Starting a writer without the archive flags ends the archive's chain of seal records; the next start with them begins a new chain.
 
 ## Read-only
 

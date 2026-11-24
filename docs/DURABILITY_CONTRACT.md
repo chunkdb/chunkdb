@@ -12,8 +12,8 @@ Committed revisions keep their values; missing chunks after a later crash do not
 | Operation | Success guarantees |
 | --- | --- |
 | Ordinary write, relaxed | Applied in memory; power loss can lose acknowledged writes, and a process crash can lose those not yet written to the WAL, up to four checkpoint intervals per chunk while a background checkpoint syncs it. |
-| Ordinary write, fsync-wal | The WAL and required directory entries are synced before success. |
-| Ordinary write, fsync-checkpoint | Synced WAL acknowledgement and synced checkpoint publication. |
+| Ordinary write, fsync-wal | The WAL and required directory entries are synced before success; a checkpoint syncs its image and directory before it removes the WAL. |
+| Ordinary write, fsync-checkpoint | The same as fsync-wal. |
 | FLUSH WAL, every mode | All writes acknowledged before its arrival are durable in every table. |
 | Transaction COMMIT, every mode | All changed chunks commit together durably, or none commit. |
 | RESTORE TABLE | The restored table is durable and complete under its name, or nothing is published. |
@@ -61,11 +61,14 @@ Above 65,536 changed large-chunk directories, the barrier syncs every file and d
 ## WAL archive
 
 With `--archive-dir` or `--archive-command`, every checkpoint keeps its WAL as a sealed segment, and checkpoints publish their images synced in every mode.
-Every `--archive-interval-ms` the server checkpoints each table's chunks that hold changes, ships the sealed segments and then publishes a seal record.
-A seal record's revision R for a table means: every change at or below R is in a shipped segment, and the segments were durable in the archive before the record.
-Changes after the newest seal record are not in the archive; a clean shutdown runs one more pass.
-A failed copy or command is retried every interval; until then the sealed segments stay in the data directory.
+Every `--archive-interval-ms`, at start and at clean shutdown, the server seals each table: it samples a revision S as backup does, syncs the WALs and checkpoints every chunk whose live WAL holds a change at or below S.
+It ships the sealed segments, then publishes a seal record; a record's revision S for a table means that every change at or below S is in a segment the record or an earlier one of its chain lists, durable in the archive before the record.
+The record also holds a time bound taken before S: a change above S has a commit time at or above it, unless it is a conditional or expression write that took its commit time before its revision and was in flight while S was sampled.
+Changes after the newest record are not in the archive yet.
+A failed copy or command is retried every interval; until then the files stay in the data directory.
+A record is written to the data directory before it ships and becomes the chain's last only after it shipped, so a crash at any step leaves a chain without a fork, and the next start ships what is left.
 A dropped table's changes after the last pass before DROP are not archived.
+A writer start without archiving ends the chain.
 
 ## Failures
 

@@ -77,6 +77,7 @@ bool ChunkServer::HandleClient(
                     connection->reply_continuation.reset();
                     connection->response = StatementStoppedReply(*stopped);
                     session.watch.reset();
+                    session.catalog_watch.reset();
                     if (session.slot_watch) session.slot_watch->Cancel();
                     session.slot_watch.reset();
                 }
@@ -95,11 +96,12 @@ bool ChunkServer::HandleClient(
                 return park();
             }
             // A watch is counted once, when the statement that opened it is answered.
-            if ((session.watch || session.slot_watch) && !connection->watch_slot) {
+            if (session.Watching() && !connection->watch_slot) {
                 auto count = watch_count_.load();
                 while (count < config_.max_watches && !watch_count_.compare_exchange_weak(count, count + 1U)) {}
                 if (count >= config_.max_watches) {
                     session.watch.reset();
+                    session.catalog_watch.reset();
                     if (session.slot_watch) session.slot_watch->Cancel();
                     session.slot_watch.reset();
                     connection->response = Protocol::Error("BUSY", "maximum watches reached");
@@ -115,7 +117,7 @@ bool ChunkServer::HandleClient(
             const auto replied = std::chrono::steady_clock::now();
             connection->output_deadline = replied + std::chrono::milliseconds(config_.client_io_timeout_ms);
             if (!io->Write(*connection, true, replied)) return false;
-            if (connection->phase != ServerConnection::Phase::kInput || session.watch || session.slot_watch)
+            if (connection->phase != ServerConnection::Phase::kInput || session.Watching())
                 return park();
             // The first wait after a reply is the bounded receive, then the poller.
             bool receive = true;

@@ -118,6 +118,7 @@ ENABLE FEATURE 'name'
 | `bytes(max)` | Uninterpreted bytes with at most max bytes |
 
 Reserved table names are `con`, `prn`, `aux`, `nul`, `com0` through `com9`, and `lpt0` through `lpt9`.
+CREATE TABLE, ALTER TABLE ... RENAME TO and RESTORE TABLE also refuse the name `catalog`, which [WATCH CATALOG](FEED.md#watch-catalog) reserves; a table of that name made before keeps working but cannot be watched.
 
 ## Options
 
@@ -144,7 +145,7 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 - RENAME TO: `OK` once the new name serves the table.
 - SHOW TABLES: accessible table names, fenced tables included.
 - DESCRIBE: schema version, column definitions, geometry, options, table epoch, completed revision, dimensions, and chunk columns; a table with checks adds `checks`, a list of maps with `name` and `expression`; a fenced table adds `fenced` with its reason.
-- SHOW STATUS: `version`, the `server_version` HELLO reports, `uptime_ms` since the server started, `read_only`, `directory` features, `tables`, `fenced`, and `activation_pending`; each `tables` entry has `name`, `state`, `reason`, `enabled`, `compat`, `ro_compat`, and `incompat`, and each `fenced` entry has `name` and `reason`. With `--archive-dir` or `--archive-command` it also has `archive`: `mode` (`dir` or `command`), `last_seal_ms`, the capture time of the last seal record, `error`, null after a pass that succeeded, and `tables`, each with `name` and `revision`, its sealed revision.
+- SHOW STATUS: `version`, the `server_version` HELLO reports, `uptime_ms` since the server started, `read_only`, `directory` features, `tables`, `fenced`, and `activation_pending`; each `tables` entry has `name`, `state`, `reason`, `enabled`, `compat`, `ro_compat`, and `incompat`, and each `fenced` entry has `name` and `reason`. With `--archive-dir` or `--archive-command` it also has `archive`: `mode` (`dir` or `command`), `last_seal_ms`, the capture time of the last seal record, `error`, null after a pass that succeeded, `staged_bytes`, the bytes waiting in the data directory to be shipped, and `tables`, each with `name` and `revision`, its seal point in the last record.
 
 The `version` field describes the schema; `revision` describes the completed commit frontier within `epoch`.
 The frontier can include terminal gaps from abandoned reservations and recovery.
@@ -277,7 +278,7 @@ Its protected snapshot refuses unhealthy serving state instead of guessing wheth
 `ENABLE FEATURE 'name'` requires ADMIN on `*` and returns OK for an already enabled feature.
 
 New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, `feature_activation`, and `chunk_model`.
-Existing directories retain their recorded bits; enable `feature_activation` before another missing feature.
+A directory keeps its recorded bits; only ENABLE FEATURE adds one, and it refuses any other feature while the directory lacks `feature_activation`.
 Activation validates every table before recording its durable decision, then updates only that feature's registered owners.
 A fenced table refuses activation with its fenced message until RECOVER TABLE.
 An incomplete published activation fences serving until writer startup completes recovery.

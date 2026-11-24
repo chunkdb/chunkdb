@@ -22,7 +22,7 @@
 - **No chunk-count limit:** chunkdb does not cap the chunks of a table; files, directories and the coordinate index grow with the world.
 - **Filesystem entries:** a chunk with data has a checkpoint image, a WAL, or both, in the directory of its large chunk, so a default 8x8 large chunk holds up to 128 files; a checkpoint removes the WAL, but with feed slots each checkpoint adds the archived WAL and, when one existed, a hard-linked base image to the flat `.chunkdb.feed/` directory of the table until every slot passes them, up to `slot_max_bytes` (default 1 GiB) per slot, and a large chunk with retained index decisions also holds `chunkdb.index`; each small file takes at least one filesystem block; see [Storage format](STORAGE_FORMAT.md#directory-layout).
 - **Open cost:** opening a table counts at most 100000 of its files and replays a chunk's WAL when that chunk is first loaded, apart from WALs named by [recovery intents](STORAGE_FORMAT.md#conditional-and-transaction-intents); with a feed slot, the first slot sync after opening syncs every image and WAL of the table; at the default log level each table logs `startup recovery summary` with `elapsed_ms`.
-- **Coordinate index memory:** opening a table discovers live artifacts and retains an ordered in-memory coordinate index; scan pages do not repeat a filesystem walk.
+- **Coordinate index memory:** opening a table discovers live artifacts and retains an ordered in-memory coordinate index; scan pages do not repeat a filesystem walk and seek from their cursor, and SINCE and READ ONLY pages skip runs of unchanged chunks.
 - **Deletion history:** tombstone compaction forgets empty identities and advances the deletion floor; consumers below it must rebuild their state.
 - **Background threads:** maintenance and FLUSH WAL share `--maintenance-workers` threads, but a table with watches or slots still runs its own feed sender and slot worker threads, and a timer thread while `--feed-linger-ms` keeps its feed after the last watch; see [Server flags](SERVER_FLAGS.md).
 - **Background checkpoint syncs:** at most `--maintenance-workers` background checkpoints sync at once per data directory; when writes make checkpoints due faster than those workers finish them, a write waits for or runs its chunk's checkpoint once the chunk holds four checkpoint intervals of deferred updates.
@@ -35,7 +35,7 @@
 ## What chunkdb does not do
 
 - **No secondary indexes or lookup by value:** statements address blocks and chunks by coordinates; to find blocks by a value, keep your own index, such as a second table keyed by that value, updated from a change feed slot.
-- **No query planner or joins:** each statement reads or writes one table at the coordinates you name; see [Related data](CQL.md#related-data) for keeping data together, reading tables that share coordinates, and derived tables.
+- **No query planner or joins:** each statement reads or writes one table at the coordinates you name; see [Related data](RELATED_DATA.md) for keeping data together, reading related chunks of two tables, and derived tables.
 - **Aggregates by chunk only:** [AGGREGATE](reference/AGGREGATE.md) groups only BY CHUNK and covers at most `--max-area-chunks` chunks per statement; combine the results of several areas in your client, or keep running totals updated from a change feed slot.
 - **No replication:** durability across machines and distributed transactions are unavailable; keep copies with [Backup and restore](BACKUP.md), or copy changes to another system from a change feed slot.
 

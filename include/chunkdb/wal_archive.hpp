@@ -44,6 +44,8 @@ struct WalArchiveStatus {
     // Why the last pass failed; std::nullopt after a pass that succeeded.
     std::optional<std::string> error{};
     std::vector<WalArchiveTableStatus> tables{};
+    // Bytes of the files waiting in the data directory to be shipped.
+    std::uint64_t staged_bytes = 0;
 };
 
 }  // namespace chunkdb

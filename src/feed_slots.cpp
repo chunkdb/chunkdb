@@ -126,18 +126,30 @@ void LinkStaged(const std::filesystem::path& source, const std::filesystem::path
 }
 }  // namespace
 
-std::optional<std::uint64_t> ChunkStore::SealForArchive() {
+std::optional<ChunkStore::ArchiveSeal> ChunkStore::SealForArchive() {
     if (access_mode_ != AccessMode::kReadWrite || !feed_slots_) throw std::logic_error("only a writer archives its WAL");
     ThrowIfDurabilityPoisoned();
-    const auto completed = CompletedRevision();
-    if (!completed) throw std::logic_error("only a writer archives its WAL");
+    // The bound is issued from the counter writes take their commit times
+    // from, before the cut is sampled: a write that reserves its revision
+    // after the sample and then takes its time takes one at or above it.
+    std::uint64_t time_bound = UnixMillisNow();
+    {
+        std::uint64_t last = last_commit_time_ms_.load(std::memory_order_relaxed);
+        while (!last_commit_time_ms_.compare_exchange_weak(
+            last, std::max(time_bound, last), std::memory_order_seq_cst, std::memory_order_relaxed)) {
+        }
+        time_bound = std::max(time_bound, last);
+    }
+    // The cut as backup samples it: every revision at or below it is complete.
+    const auto cut = version_clock_.load(std::memory_order_seq_cst) - 1U;
+    while (!write_producers_->Completed(version_clock_, cut)) std::this_thread::yield();
     // Staged batches reach their WALs, and the WALs reach the disk.
-    feed_slots_->Sync(*completed);
+    feed_slots_->Sync(cut);
     feed_slots_->prefix_index().SeedMissing(data_dir_, geometry_, store_id_, features_, checkpoint_publish_mutex_);
     std::vector<FeedWalPrefix> prefixes;
     {
         std::lock_guard publish_lock(checkpoint_publish_mutex_);
-        prefixes = feed_slots_->prefix_index().Capture(*completed);
+        prefixes = feed_slots_->prefix_index().Capture(cut);
     }
     for (const auto& prefix : prefixes) {
         const auto chunk = GetOrLoadRegularChunk(prefix.coord);
@@ -148,7 +160,7 @@ std::optional<std::uint64_t> ChunkStore::SealForArchive() {
         // A backup linking this table's files defers the checkpoint.
         if (!CheckpointChunk(prefix.coord, chunk)) return std::nullopt;
     }
-    return completed;
+    return ArchiveSeal{cut, time_bound};
 }
 
 std::size_t ChunkStore::StageForArchive(const std::filesystem::path& directory) {
@@ -749,22 +761,26 @@ void FeedSlots::Retain() {
 }
 std::size_t FeedSlots::StageForArchive(const std::filesystem::path& directory) {
     store_.ThrowIfDurabilityPoisoned();
-    std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
-    std::lock_guard lock(mutex_);
     std::vector<std::string> names;
-    for (const auto& segment : Segments(store_.data_dir_, store_.geometry_.dims())) {
-        auto name = segment.wal.filename().string();
-        if (staged_.contains(name)) continue;
-        if (names.empty()) (void)EnsureDirectoryPathExists(directory, true);
-        if (std::filesystem::exists(segment.descriptor))
-            LinkStaged(segment.descriptor, directory / segment.descriptor.filename());
-        LinkStaged(segment.wal, directory / name);
-        names.push_back(std::move(name));
+    {
+        std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
+        std::lock_guard lock(mutex_);
+        for (const auto& segment : Segments(store_.data_dir_, store_.geometry_.dims())) {
+            auto name = segment.wal.filename().string();
+            if (staged_.contains(name)) continue;
+            if (names.empty()) (void)EnsureDirectoryPathExists(directory, true);
+            if (std::filesystem::exists(segment.descriptor))
+                LinkStaged(segment.descriptor, directory / segment.descriptor.filename());
+            LinkStaged(segment.wal, directory / name);
+            names.push_back(std::move(name));
+        }
     }
     if (names.empty()) return 0U;
-    // Retention removes a staged segment's archive name; its staged name
-    // must be durable first.
+    // Retention removes only names in staged_, so a staged segment keeps its
+    // archive name until its staged name is durable. The sync runs without
+    // the publish lock, so checkpoints do not wait for it.
     SyncDirectoryPath(directory);
+    std::lock_guard lock(mutex_);
     staged_.insert(names.begin(), names.end());
     return names.size();
 }

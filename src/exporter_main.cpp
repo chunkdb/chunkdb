@@ -47,7 +47,7 @@ std::pair<std::string, std::uint16_t> ParseHostPort(const std::string& value, co
     }
     std::uint16_t parsed = 0U;
     const auto result = std::from_chars(port.data(), port.data() + port.size(), parsed);
-    if (host.empty() || result.ec != std::errc() || result.ptr != port.data() + port.size() || parsed == 0U) {
+    if (host.empty() || result.ec != std::errc() || result.ptr != port.data() + port.size()) {
         throw refuse();
     }
     return {host, parsed};
@@ -171,8 +171,10 @@ int main(int argc, char** argv) {
         chunkdb::server_detail::MetricsHttpListener listener(
             host, port, allow_remote, static_cast<std::size_t>(timeout.count()) + 1000U,
             [&exporter](std::stop_token stop) { return exporter.Scrape(stop); }, chunkdb::exporter::DownBody());
+        // Port 0 binds a free port; this line names the one bound, at once.
         chunkdb::LogMessage(chunkdb::LogLevel::kInfo, chunkdb::LogComponent::kServer, "serving metrics",
-                            {{"listen", listen}});
+                            {{"listen", listen}, {"port", std::to_string(listener.port())}});
+        chunkdb::FlushLog();
 #ifdef _WIN32
         std::unique_lock lock(g_stop_mutex);
         g_stop_cv.wait(lock, [] { return g_stop; });

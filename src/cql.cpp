@@ -5,12 +5,14 @@
 #include <algorithm>
 #include <array>
 #include <cctype>
+#include <cerrno>
 #include <charconv>
+#include <clocale>
+#include <cmath>
+#include <cstdlib>
 #include <deque>
 #include <limits>
-#include <locale>
 #include <set>
-#include <sstream>
 #include <string>
 #include <tuple>
 #include <utility>
@@ -39,12 +41,13 @@ namespace lexer {
     return out;
 }
 
-// `text` with control bytes as \xHH, so an error reply stays one line.
+// `text` with control bytes and bytes of 0x80 and above as \xHH, so an
+// error reply stays one line of ASCII, valid UTF-8 whatever the input.
 [[nodiscard]] std::string Printable(std::string_view text) {
     std::string out;
     for (const char c : text) {
         const auto byte = static_cast<unsigned char>(c);
-        if (byte < 0x20U || byte == 0x7fU) {
+        if (byte < 0x20U || byte >= 0x7fU) {
             constexpr std::string_view kHex = "0123456789abcdef";
             out += "\\x";
             out += kHex[byte >> 4U];
@@ -239,17 +242,26 @@ Integer IntegerOf(const Token& token) {
     return value;
 }
 
+// The nearest f64, subnormals and zero included; a value beyond f64 is
+// refused. The lexer passes only digits, '.', 'e' and signs, so strtod sees
+// no hexadecimal, inf or nan; '.' becomes the C locale's decimal point.
 double FloatOf(const Token& token) {
-    const std::string text = Lower(token.text);
+    std::string text = Lower(token.text);
     if (text == "-inf") {
         return -std::numeric_limits<double>::infinity();
     }
-    double value = 0.0;
-    std::istringstream input(text);
-    input.imbue(std::locale::classic());
-    input >> value;
-    if (input.fail() || input.peek() != std::char_traits<char>::eof()) {
+    const std::string_view point = std::localeconv()->decimal_point;
+    if (const auto dot = text.find('.'); dot != std::string::npos && !point.empty() && point != ".") {
+        text.replace(dot, 1U, point);
+    }
+    char* end = nullptr;
+    errno = 0;
+    const double value = std::strtod(text.c_str(), &end);
+    if (end != text.c_str() + text.size()) {
         Fail(token.column, token.text + " is not a number");
+    }
+    if (errno == ERANGE && std::isinf(value)) {
+        Fail(token.column, token.text + " is beyond the f64 range");
     }
     return value;
 }
@@ -393,6 +405,16 @@ class Parser {
             tokens_.push_back(Lex(line_, &at_));
         }
         return tokens_[next_];
+    }
+    // The token after the next one; the end when the next one is the end.
+    [[nodiscard]] const Token& PeekSecond() {
+        if (Peek().kind == TokenKind::kEnd) {
+            return tokens_[next_];
+        }
+        if (next_ + 1U == tokens_.size()) {
+            tokens_.push_back(Lex(line_, &at_));
+        }
+        return tokens_[next_ + 1U];
     }
     const Token& Take() {
         const Token& token = Peek();
@@ -595,15 +617,25 @@ class Parser {
         return true;
     }
 
+    // IF starts IF [NOT] EXISTS only when NOT or EXISTS follows, so a table,
+    // column, user or check named `if` reads as a name.
+    [[nodiscard]] bool AcceptIf() {
+        if (!IsKeyword(Peek(), "if")) return false;
+        const Token& after = PeekSecond();
+        if (!IsKeyword(after, "not") && !IsKeyword(after, "exists")) return false;
+        Take();
+        return true;
+    }
+
     [[nodiscard]] bool IfNotExists() {
-        if (!Accept("if")) return false;
+        if (!AcceptIf()) return false;
         Expect("not");
         Expect("exists");
         return true;
     }
 
     [[nodiscard]] bool IfExists() {
-        if (!Accept("if")) return false;
+        if (!AcceptIf()) return false;
         Expect("exists");
         return true;
     }
@@ -995,16 +1027,23 @@ class Parser {
                 get.dims = Point(get.x, get.y, get.z);
                 Expect("from");
                 get.table = Name("a table name");
-                get.columns = Columns();
-                while (Accept("with")) {
-                    const auto column = Peek().column;
-                    if (Accept("version")) {
-                        if (get.with_version) Fail(column, "WITH VERSION is given twice");
-                        get.with_version = true;
-                    } else if (Accept("schema")) {
-                        if (get.with_schema) Fail(column, "WITH SCHEMA is given twice");
-                        get.with_schema = true;
-                    } else Fail(column, "expected VERSION or SCHEMA");
+                bool columns = false;
+                while (true) {
+                    const auto option = Peek().column;
+                    if (IsKeyword(Peek(), "columns")) {
+                        if (columns) Fail(option, "COLUMNS is given twice");
+                        columns = true;
+                        get.columns = Columns();
+                    } else if (Accept("with")) {
+                        const auto column = Peek().column;
+                        if (Accept("version")) {
+                            if (get.with_version) Fail(column, "WITH VERSION is given twice");
+                            get.with_version = true;
+                        } else if (Accept("schema")) {
+                            if (get.with_schema) Fail(column, "WITH SCHEMA is given twice");
+                            get.with_schema = true;
+                        } else Fail(column, "expected VERSION or SCHEMA");
+                    } else break;
                 }
                 return get;
             }
@@ -1030,10 +1069,14 @@ class Parser {
                 }
                 Expect("from");
                 get.table = Name("a table name");
-                get.columns = Columns();
+                bool columns = false;
                 while (true) {
                     const auto column = Peek().column;
-                    if (Accept("with")) {
+                    if (IsKeyword(Peek(), "columns")) {
+                        if (columns) Fail(column, "COLUMNS is given twice");
+                        columns = true;
+                        get.columns = Columns();
+                    } else if (Accept("with")) {
                         if (get.with_schema) Fail(column, "WITH SCHEMA is given twice");
                         Expect("schema");
                         get.with_schema = true;
@@ -1142,14 +1185,18 @@ class Parser {
                 create.user = Name("a user name");
                 Expect("verifier");
                 create.verifier = Verifier();
-                if (Accept("manages")) {
-                    Expect("users");
-                    create.manages_users = true;
-                }
-                if (Accept("require")) {
-                    Expect("channel");
-                    Expect("binding");
-                    create.requires_channel_binding = true;
+                while (true) {
+                    const auto column = Peek().column;
+                    if (Accept("manages")) {
+                        if (create.manages_users) Fail(column, "MANAGES USERS is given twice");
+                        Expect("users");
+                        create.manages_users = true;
+                    } else if (Accept("require")) {
+                        if (create.requires_channel_binding) Fail(column, "REQUIRE CHANNEL BINDING is given twice");
+                        Expect("channel");
+                        Expect("binding");
+                        create.requires_channel_binding = true;
+                    } else break;
                 }
                 return create;
             }
@@ -1365,8 +1412,16 @@ class Parser {
             if (Accept("migrations")) return ShowMigrations{};
             if (Accept("slots")) {
                 ShowSlots show;
-                if (Accept("on")) show.table = Name("a table name");
-                if (Accept("prefix")) show.prefix = SlotName();
+                while (true) {
+                    const auto column = Peek().column;
+                    if (Accept("on")) {
+                        if (show.table) Fail(column, "ON is given twice");
+                        show.table = Name("a table name");
+                    } else if (Accept("prefix")) {
+                        if (show.prefix) Fail(column, "PREFIX is given twice");
+                        show.prefix = SlotName();
+                    } else break;
+                }
                 return show;
             }
             if (Accept("users")) {
@@ -1446,6 +1501,11 @@ class Parser {
         if (Accept("ack")) return Ack{.revision = Unsigned("a revision", std::numeric_limits<std::uint64_t>::max())};
         if (Accept("watch")) {
             Watch watch;
+            // CATALOG is a keyword here: a table named catalog cannot be watched.
+            if (Accept("catalog")) {
+                watch.catalog = true;
+                return watch;
+            }
             watch.table = Name("a table name");
             while (true) {
                 const auto column = Peek().column;

@@ -1,8 +1,8 @@
 # Commit owner artifact I/O
 
 This foundation supports [#136](https://github.com/chunkdb/chunkdb/issues/136), the [recovery owner](COMMIT_GROUP_RECOVERY.md) and the [checked owner formats](COMMIT_GROUP_OWNER_FORMAT.md).
-It reads and stages exact immutable root and page objects and reads the fixed canonical owner root.
-It does not publish a canonical owner root, activate grouping, install a pending plan or authorize a group from an object checksum.
+It reads and stages exact immutable root, page, journal-inventory and ID-inventory objects, creates and appends journal generations, reads the fixed canonical owner root and can install the fixed generation-one INACTIVE canonical root.
+It does not publish an ACTIVE or PENDING canonical owner root, activate grouping, install a pending plan or authorize a group from an object checksum.
 Complete typed coverage, retained-group, observation, replacement-plan and restore-provenance admission remains a prerequisite for those mutations.
 
 ## Scope and native directory ownership
@@ -11,7 +11,7 @@ The caller supplies the admitted manifest scope; persisted object references nev
 The canonical root name is `chunkdb.groups.owner` and the object directory name is `chunkdb.groups.objects`.
 Each immutable object has exactly the lowercase 64-character hexadecimal encoding of its complete raw SHA-256 as its name.
 Temporary names use a reserved private prefix and one generated nonce, with exclusive creation and no overwrite or retry loop on collision.
-Only the checked root and page kinds are supported by this foundation; other reference kinds refuse rather than becoming opaque admitted payloads.
+Only the checked root, page, journal-inventory and ID-inventory kinds are supported by this foundation; other reference kinds refuse rather than becoming opaque admitted payloads.
 
 Read-only opening pins the actual root directory and refuses a symbolic link or reparse point at that leaf.
 A writer additionally borrows an existing exclusive ProcessLock for its entire lifetime and verifies its admitted canonical directory, the pinned native root generation and the native identity of `root/.chunkdb.lock/writer.lock` against that lock.
@@ -33,7 +33,8 @@ Windows native identity comparisons use FileIdInfo's complete 128-bit file ID an
 NtSetInformationFile performs no-replace publication from the exact temporary handle with a relative destination in its pinned directory.
 These documented native OS entrypoints are resolved from the already loaded ntdll module and require no additional package or link dependency; unavailable capability refuses before mutation without a pathname fallback.
 No final-path reconstruction or check after an outside write substitutes for handle-relative admission.
-No operation follows a record-supplied path or modifies an existing file in place.
+No operation follows a record-supplied path.
+Objects, markers and the canonical root are never modified in place; the only file changed in place is a journal generation, appended through its pinned writer handle at an admitted end.
 
 Hard links to plain regular files are allowed.
 Reusing an immutable object only reads its existing native generation and proves exact bytes and typed context; it never truncates, changes permissions on or repairs that inode.
@@ -102,11 +103,46 @@ The foundation never unlinks a POSIX replacement based on a racy pathname identi
 An exclusive rename consumes its original source name itself; a no-replace hard-link fallback retains its private source link for admitted collection rather than performing an unsafe name-based unlink.
 On failure, uncertain private or digest names are retained without unlink or replacement, including a substituted sentinel; this API claims no atomic unlink-if-inode operation or protection against arbitrary same-user in-place mutation.
 
+## Inventory objects
+
+Journal inventories (kind 9) and ID inventories (kind 10) are digest-named objects in `chunkdb.groups.objects` and keep their native [CKGC and CKID encodings](COMMIT_GROUP_FORMAT.md#journal-header-and-certified-inventory) without an owner envelope.
+A kind 9 reference must name exactly 128 bytes; a kind 10 reference must name between 164 bytes and the ID-inventory ceiling.
+Both readers require the measured extent to equal the reference before any body read.
+A kind 10 reader admits its 160-byte header against the expected journal context and requires the declared extent to equal the measured extent before allocating the complete buffer.
+Both readers re-measure after the read, compare the raw SHA-256 and then parse the complete value; staging reuse and post-publication checks use the same reader.
+
+## Journal generations
+
+Each journal generation is one file `chunkdb.groups.journal/<32 hex journal id>-<16 hex generation>` named from the admitted context, never from persisted text.
+The directory needs no scope marker: each 64-byte CKGJ header binds the directory, journal and generation, and only an admitted inventory selects a generation.
+Creation requires a writer and a context for the scope directory; it checks owner-only ACL capability, creates or opens the journal directory with write rights and syncs the root directory.
+It writes the header through an exclusive `.journal-stage-<nonce>` temporary, syncs it and publishes it without replacement; an existing generation is refused and never adopted.
+It then opens the final leaf with write rights, requires the same native object, a 64-byte extent and the exact header, syncs the leaf and then the journal directory.
+The leaf name becomes durable only after that directory sync; a crash before it can leave no leaf.
+A no-replace hard-link fallback leaves the stage link as a second name of the live generation, so later appends change both names; collection may unlink only that stage name, and a future repair must use a replacement inode when the link count is above one.
+A returned file pins the journal directory and the leaf; on Windows the directory handle denies delete sharing while it lives.
+A writable file appends only at an end it admitted itself: its own creation or appends, or a scan from disk with no tail.
+A refused scan withdraws any end that the file admitted before it.
+An append requires the measured extent to equal that end, admits the complete record against the directory and the group rules of the generation, and writes it without syncing; a separate sync makes it durable.
+A failed write or sync fences that file object; only a fresh object whose scan from disk admits a new end can append again.
+Read-only views open both handles without write rights and refuse append and sync.
+Tail truncation is not implemented, so a generation with a tail above the cut cannot be appended to in this build.
+
+## Canonical INACTIVE root
+
+The installer writes only the fixed 512-byte generation-one INACTIVE root for the writer's scope and never accepts a caller's root.
+If `chunkdb.groups.owner` exists, it must be exactly those bytes, else the call refuses without a change.
+Otherwise it writes `.owner-root-<nonce>` exclusively in the root directory, syncs it and publishes it without replacement; an arrival during publication is admitted only when it is byte-identical.
+In both cases it opens the final name with write rights, checks the exact bytes, syncs that file and then the root directory, because a visible matching name does not prove that an earlier installer finished its syncs.
+A settle call performs the same admission and syncs for an existing root and refuses when the root is absent.
+The root name becomes durable only after the root-directory sync.
+
 ## Publication boundary
 
 This initial API exposes native I/O facts and durable private artifacts only.
 It has no generic canonical-root write or compare-and-swap method accepting an arbitrary parsed CommitOwnerRoot.
 Canonical INACTIVE installation must join the checked creation or ENABLE FEATURE decision, including its real manifest claim and exclusive writer ownership.
+The fixed-bytes, no-replace INACTIVE installer is the primitive that creation and ENABLE FEATURE will call; it has no production caller in this build, and calling it outside that decision is forbidden by the [recovery owner rules](COMMIT_GROUP_RECOVERY.md).
 ACTIVE or PENDING publication additionally requires fully admitted typed values, exact selected reference closure and complete replacement-plan authorization.
 Canonical publication APIs cannot use an optional callback that declares an unchecked root safe.
 Canonical publication requires the existing owner-transition and lifecycle ordering rules.
@@ -123,6 +159,11 @@ Native rename and replacement gates prove that reads stay on their opened genera
 An independent native-inode substitution gate replaces a synced POSIX temporary leaf before publication, then requires refusal, no durable reference, unchanged selected-root bytes and an untouched unrelated sentinel.
 Crashes cover directory creation, marker file and name sync, object temporary write, file sync, no-replace publication and directory sync, with exact old or complete new immutable bytes afterward.
 A first directory-sync failure followed by exact-object reuse must perform the required sync before reporting durability.
+Inventory tests cover wrong kinds and lengths, a same-length different inventory under a claimed digest, a foreign expected context and sparse oversized ID inventories under an allocation guard.
+Journal tests cover exact creation syncs, refused re-creation, arrivals and substitutions during publication, symlinked and redirected names, read-only refusal, stale ends, invalid records, appends after a tail and fencing after an injected sync failure.
+Canonical-root tests cover installation, idempotent re-admission with fresh syncs, refusal of ACTIVE, foreign-scope and generation-two roots, identical and foreign arrivals and substitution.
+Crash children stop after the stage, leaf and directory syncs of journal creation and the temporary, root and directory syncs of installation, then require an absent name or the exact bytes; they model a process crash, while sync order is checked by observer counts.
+No test can inject a failed journal write or a change during a native scan, so those fences are checked by review only.
 Isolated omission controls target no-follow and native type admission, digest and measured-length checks, namespace scope, correct writer ownership and publication ordering.
 Pure identity checks distinguish equal low 64-bit IDs with different upper halves, and native Windows hard links and distinct files validate the full identity query.
 Native and GCC focused tests precede platform CI, including actual Windows sharing and reparse behavior; no local speed measurements are involved.

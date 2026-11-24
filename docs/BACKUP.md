@@ -61,7 +61,7 @@ Restore publishes a checked successor clock before exposing the new epoch; it pr
 It also preserves chunk commit times and deletion floors while rebinding every index and log to the new table identity.
 After later crashes or restarts, missing chunk files cannot prove that no history was lost.
 Without durable proof, an exact-cut request also resyncs.
-Existing backed-up tables need `table_lineage` enabled on the source before creating their backup.
+Restore, offline or with RESTORE TABLE, refuses a backed-up table without `table_lineage`; every table a 2.0 build creates has it.
 
 ## 3. Inspect a backup
 
@@ -93,22 +93,6 @@ The backed-up table must have `table_lineage`, the table features this directory
 SWAP TABLES then exchanges the names atomically, and DROP TABLE removes the replaced data now under the other name.
 A consumer of `world` then sees the restored epoch and resumes by its [lineage](CHANGE_FEED.md) or receives resync.
 See [Tables](reference/TABLES.md) for SWAP TABLES.
-
-## 5. Archive the WAL
-
-A server started with `--archive-dir` copies every table's sealed WAL segments there; see [WAL archive flags](SERVER_FLAGS.md#wal-archive).
-
-```sh
-chunkdb_server --data-dir /var/lib/chunkdb/data --archive-dir /archive/chunkdb
-```
-
-Every `--archive-interval-ms` (one minute by default) the server checkpoints each table's changed chunks, copies the closed WAL segments, and then writes a seal record naming each table's revision: every change at or below it is in the archive.
-The first pass runs when the server starts, and a clean shutdown runs one more.
-`--archive-command` runs a command for each file instead, for example `--archive-command 'aws s3 cp %p s3://bucket/chunkdb/%f'`; it must succeed again for a file it already copied with the same bytes.
-SHOW STATUS reports `archive` with the time of the last seal record, each table's sealed revision and the last error.
-While copying fails, the sealed segments stay in the data directory and the next pass retries.
-`--archive-retention-ms` removes seal records older than the bound and the segments only they need; a backup older than the oldest kept record can no longer be rolled forward.
-Protect the archive as sensitive data, like backups: files are created with the archive directory's default permissions.
 
 ## Contents and space
 

@@ -190,6 +190,14 @@ void RequireValidTableName(std::string_view name) {
     }
 }
 
+void RequireNewTableName(std::string_view name) {
+    RequireValidTableName(name);
+    if (name == kReservedTableName) {
+        throw std::invalid_argument(
+            "the table name '" + std::string(kReservedTableName) + "' is reserved: WATCH CATALOG watches the catalog; choose another name");
+    }
+}
+
 void RequireValidTableOptions(const TableOptions& options) {
     if (options.checkpoint_update_interval == 0) {
         throw std::invalid_argument("checkpoint_updates must be > 0");
@@ -699,8 +707,19 @@ void Table::DropFeedSlot(std::string_view name, bool if_exists) {
 std::vector<FeedSlot> Table::ListFeedSlots(bool include_lost) {
     auto lease = Acquire();
     if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
-    auto slots = lease->store().feed_slots_->List(include_lost);
-    const auto& columns = lease->store().geometry().layout().schema().columns;
+    return ListFeedSlots(*lease, include_lost);
+}
+
+std::optional<std::vector<FeedSlot>> Table::TryListFeedSlots(bool include_lost) {
+    migration_health_->Check();
+    const auto lease = TryAcquire();
+    if (!lease) return std::nullopt;
+    return ListFeedSlots(*lease, include_lost);
+}
+
+std::vector<FeedSlot> Table::ListFeedSlots(const Lease& lease, bool include_lost) {
+    auto slots = lease.store().feed_slots_->List(include_lost);
+    const auto& columns = lease.store().geometry().layout().schema().columns;
     for (auto& slot : slots) {
         // ClaimFeedSlot refuses a second watch by the same rule.
         if (const auto claimed = slot_claims_.find(slot.name); claimed != slot_claims_.end())
@@ -958,7 +977,8 @@ std::optional<Table::Lease> Table::Acquire() {
 
 std::optional<Table::Lease> Table::TryAcquire() {
     active_leases_.fetch_add(1, std::memory_order_seq_cst);
-    if (state_.load(std::memory_order_seq_cst) == State::kOpen) return Lease(this, store_.get());
+    if (state_.load(std::memory_order_seq_cst) == State::kOpen && !feed_cleanup_failed_.load(std::memory_order_acquire))
+        return Lease(this, store_.get());
     ReleaseLease();
     return std::nullopt;
 }
@@ -1187,6 +1207,9 @@ TableCatalog::TableCatalog(CatalogConfig config)
     if (writable) {
         EnsureDirectoryPathExists(TablesDir(), /*durable_sync=*/true);
         RemoveInterruptedOperations();
+        // Without archiving, checkpoints may drop frames the archive never
+        // gets: the chain ends before any table opens (docs/design/WAL_ARCHIVE.md).
+        if (!config_.wal_archive.enabled()) RemoveWalArchiveStaging(config_.data_dir);
     }
     OpenExistingTables();
 
@@ -1361,6 +1384,10 @@ struct TableCatalog::FoundTable {
     std::filesystem::path dir;
     StoreManifest manifest;
     TableOptions options;
+    // A narrowing or ADD CHECK a crash interrupted, dropped from `manifest`
+    // and published by PublishDroppedPending.
+    bool dropped_pending = false;
+    bool dropped_check = false;
 };
 
 void TableCatalog::OpenExistingTables() {
@@ -1400,33 +1427,43 @@ void TableCatalog::OpenExistingTables() {
     }
     if (!mismatches.empty()) throw std::runtime_error(OptionMismatchMessage(mismatches));
 
+    for (const auto& table : tables) PublishDroppedPending(table);
     for (auto& table : tables) tables_.emplace(table.name, OpenFoundTable(table));
 }
 
 TableCatalog::FoundTable TableCatalog::ReadTableToOpen(const std::string& name, const std::filesystem::path& dir) {
     auto manifest = ReadOpenableManifest(dir);
     const TableOptions options = DecodeTableOptions(manifest.options);
+    bool dropped_pending = false;
+    bool dropped_check = false;
     if (manifest.schema.pending.has_value() && config_.access_mode == AccessMode::kReadWrite) {
         // A narrowing or ADD CHECK a crash interrupted: the schema stays as
         // it was.
-        const bool check = manifest.schema.pending->check.has_value();
+        dropped_pending = true;
+        dropped_check = manifest.schema.pending->check.has_value();
         manifest.schema = WithoutPendingNarrowing(manifest.schema);
-        AtomicWrite(
-            StoreManifestPath(dir), SerializeStoreManifest(manifest), /*fsync_file=*/true,
-            /*fsync_directory=*/true, nullptr, nullptr, /*enable_generic_failpoints=*/false);
-        LogMessage(
-            LogLevel::kWarn,
-            LogComponent::kStore,
-            check ? "dropped an ADD CHECK that did not finish; the table keeps its checks"
-                  : "dropped a column narrowing that did not finish; the table keeps its columns",
-            {{"table", name}});
     }
     return FoundTable{
         .name = name,
         .dir = dir,
         .manifest = std::move(manifest),
         .options = options,
+        .dropped_pending = dropped_pending,
+        .dropped_check = dropped_check,
     };
+}
+
+void TableCatalog::PublishDroppedPending(const FoundTable& table) {
+    if (!table.dropped_pending) return;
+    AtomicWrite(
+        StoreManifestPath(table.dir), SerializeStoreManifest(table.manifest), /*fsync_file=*/true,
+        /*fsync_directory=*/true, nullptr, nullptr, /*enable_generic_failpoints=*/false);
+    LogMessage(
+        LogLevel::kWarn,
+        LogComponent::kStore,
+        table.dropped_check ? "dropped an ADD CHECK that did not finish; the table keeps its checks"
+                            : "dropped a column narrowing that did not finish; the table keeps its columns",
+        {{"table", table.name}});
 }
 
 std::shared_ptr<Table> TableCatalog::OpenFoundTable(FoundTable& table) {
@@ -1699,6 +1736,7 @@ void TableCatalog::RecoverTable(std::string_view name, std::stop_token cancelled
         if (IsDirectory(dir)) {
             auto found = ReadTableToOpen(table_name, dir);
             RequireRecoverableOptions(table_name, found.manifest);
+            PublishDroppedPending(found);
             recovered = OpenFoundTable(found);
         }
     } catch (const std::exception& error) {
@@ -1777,7 +1815,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     bool if_not_exists) {
     RequireWritable("CREATE TABLE");
     auto metadata = LockFeatureMetadataShared();
-    RequireValidTableName(name);
+    RequireNewTableName(name);
     const std::string table_name(name);
     std::lock_guard operations(operations_mutex_);
     migration_health_->Check();

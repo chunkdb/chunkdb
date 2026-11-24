@@ -129,6 +129,9 @@ class RegularChunkMutex {
     return kChunkLockModeName;
 }
 
+// kFsyncWal and kFsyncCheckpoint behave the same: every write syncs its WAL
+// before it returns, and every checkpoint syncs its image before it removes
+// a WAL. Both are kept for stored manifests and configurations.
 enum class DurabilityMode {
     kRelaxed = 0,
     kFsyncWal = 1,
@@ -661,6 +664,9 @@ enum class TxnPausePoint {
     // The transaction released its chunk locks, before publishing any
     // uncertain outcome and completing its post-commit bookkeeping.
     kBeforePostCommitOutcome,
+    // The transaction ended its producer bound after its outcome was settled,
+    // before it removes its intent and runs its inline checkpoints.
+    kBeforePostCommitCheckpoints,
     kCount,
 };
 
@@ -1187,11 +1193,17 @@ class ChunkStore {
     friend struct UnsyncedTestAccess;
     friend class WalArchiver;
 
-    // Seals every frame at or below the completed revision into archived WAL
-    // segments by checkpointing each chunk whose live WAL holds one, and
-    // returns that revision; std::nullopt when a running backup deferred a
-    // checkpoint (docs/design/WAL_ARCHIVE.md).
-    [[nodiscard]] std::optional<std::uint64_t> SealForArchive();
+    struct ArchiveSeal {
+        // Every frame at or below it is in a sealed segment.
+        std::uint64_t revision = 0;
+        // Issued from the commit-time counter before `revision` was sampled.
+        std::uint64_t time_bound_ms = 0;
+    };
+    // Issues a time bound, samples a cut as backup does, and seals every
+    // frame at or below it into archived WAL segments by checkpointing each
+    // chunk whose live WAL holds one; std::nullopt when a running backup
+    // deferred a checkpoint (docs/design/WAL_ARCHIVE.md).
+    [[nodiscard]] std::optional<ArchiveSeal> SealForArchive();
     // Hard-links every archived segment and its base descriptor not staged
     // yet into `directory`, syncs it, then lets slot retention remove what is
     // staged. Returns how many segments it staged.

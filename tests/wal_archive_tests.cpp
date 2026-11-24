@@ -14,6 +14,8 @@
 #include "chunk_store_internal.hpp"
 #include "feed_test_utils.hpp"
 #include "store_manifest.hpp"
+#include "feed_slot_records.hpp"
+#include "users.hpp"
 #include "wal_archive.hpp"
 
 using namespace chunkdb;
@@ -82,9 +84,10 @@ std::uint64_t Completed(Table& table) {
 }
 
 void RecordFormat() {
-    WalArchiveRecord record{{1U, 2U}, 42U, {}};
-    record.tables.push_back({"world", {3U}, 9U, 2U, {{"C_0_0.5-9.wal", 100U, 7U}, {"C_0_0.5.base", 80U, 8U}}});
-    record.tables.push_back({"", {4U}, std::nullopt, 1U, {{"table.1.0000abcd.manifest", 10U, 9U}}});
+    WalArchiveRecord record{{1U, 2U}, 42U, 41U, "users.0000abcd", "", {}};
+    record.tables.push_back({"world", {3U}, 9U, 40U, 2U, "table.2.00001234.manifest",
+        {{"C_0_0.5-9.wal", 100U, 7U}, {"C_0_0.5.base", 80U, 8U}, {"table.2.00001234.manifest", 10U, 9U}}});
+    record.tables.push_back({"", {4U}, std::nullopt, 0U, 1U, "", {{"C_1_0.3-4.wal", 10U, 9U}}});
     const auto bytes = SerializeWalArchiveRecord(record);
     assert(ParseWalArchiveRecord(bytes) == record);
     auto damaged = bytes;
@@ -97,6 +100,22 @@ void RecordFormat() {
     auto path = record;
     path.tables[0].files[0].name = "../outside";
     Throws([&] { (void)SerializeWalArchiveRecord(path); });
+    auto unordered = record;
+    unordered.predecessor_ms = unordered.captured_ms;
+    Throws([&] { (void)SerializeWalArchiveRecord(unordered); });
+    // An unsealed entry carries no time bound.
+    auto bounded = record;
+    bounded.tables[1].time_bound_ms = 5U;
+    assert(ParseWalArchiveRecord(SerializeWalArchiveRecord(bounded)).tables[1].time_bound_ms == 0U);
+
+    const StoreId directory{7U, 8U};
+    const auto chain = SerializeWalArchiveChain(directory, 42U);
+    assert(chain.size() == 36U && ParseWalArchiveChain(chain, directory) == 42U);
+    Throws([&] { (void)ParseWalArchiveChain(chain, StoreId{9U}); });
+    auto damaged_chain = chain;
+    damaged_chain[24] ^= 1U;
+    Throws([&] { (void)ParseWalArchiveChain(damaged_chain, directory); });
+    assert(WalArchiveContentName("users", {1U, 2U}).starts_with("users.") && WalArchiveContentName("users", {1U, 2U}).size() == 14U);
 
     assert(WalArchiveRecordName(42U) == "seal.00000000000000000042");
     assert(ParseWalArchiveRecordName("seal.00000000000000000042") == 42U);
@@ -168,7 +187,8 @@ void DirectoryArchive() {
         Write(*table, 0, 0, 3U);
         const auto second = Completed(*table);
         catalog.RunArchivePass();
-        entry = Entry(Records(archive, directory).back(), epoch);
+        const auto latest = Records(archive, directory);
+        entry = Entry(latest.back(), epoch);
         assert(entry && entry->revision == second && entry->schema_version == 2U);
         assert(Files(files, ".manifest").size() == 2U);
         // The chunk's two segments follow each other without overlap.
@@ -191,6 +211,82 @@ void DirectoryArchive() {
         assert(!catalog.ArchiveStatus()->error);
     }
     assert(Records(archive, directory).size() > before);
+}
+
+// Records of one chain, oldest first: each names the previous one, and only
+// `starts` of them start a chain.
+void CheckChain(const std::vector<WalArchiveRecord>& records, std::size_t starts) {
+    std::size_t seen = 0U;
+    for (std::size_t i = 0U; i < records.size(); ++i) {
+        if (records[i].predecessor_ms == 0U) { ++seen; continue; }
+        assert(i > 0U && records[i].predecessor_ms == records[i - 1U].captured_ms);
+    }
+    assert(seen == starts);
+}
+
+void ChainAndTimeBound() {
+    test::ScopedTempDir temporary("chunkdb-wal-archive-chain");
+    const auto root = std::filesystem::canonical(temporary.path());
+    const auto data = root / "data", archive = root / "archive";
+    {
+        // A users file is captured and shipped by content.
+        Users users;
+        users.secret.fill(7U);
+        std::filesystem::create_directories(data);
+        TableCatalog catalog(Config(data));
+        (void)CreateDefault(catalog);
+        WriteUsersFile(data, users);
+    }
+    StoreId directory{};
+    {
+        TableCatalog catalog(ArchiveConfig(data, archive));
+        AwaitFirstPass(catalog);
+        const auto table = catalog.Find("default");
+        directory = ReadDataDirManifest(data)->data_dir_id;
+        Write(*table, 0, 0, 1U);
+        catalog.RunArchivePass();
+        const auto record = Records(archive, directory).back();
+        const auto* entry = Entry(record, table->store_id());
+        assert(entry && entry->revision && entry->time_bound_ms != 0U && !entry->manifest.empty());
+        assert(std::filesystem::exists(archive / WalArchiveTableDirName(table->store_id()) / entry->manifest));
+        assert(!record.users.empty() && record.ledger.empty());
+        assert(std::filesystem::exists(archive / WalArchiveDirectoryDirName(directory) / record.users));
+        {
+            auto lease = table->Acquire();
+            const auto sealed = lease->store().ReadChunkState(0, 0);
+            // Frames at or below the seal point took their times before the bound.
+            assert(sealed.version <= *entry->revision && sealed.commit_time_ms <= entry->time_bound_ms);
+        }
+        Write(*table, 0, 0, 2U);
+        {
+            auto lease = table->Acquire();
+            const auto later = lease->store().ReadChunkState(0, 0);
+            // A frame above the seal point takes a time at or above the bound.
+            assert(later.version > *entry->revision && later.commit_time_ms >= entry->time_bound_ms);
+        }
+        catalog.RunArchivePass();
+    }
+    {
+        // A restart with archiving continues the chain.
+        TableCatalog catalog(ArchiveConfig(data, archive));
+        catalog.RunArchivePass();
+    }
+    auto records = Records(archive, directory);
+    assert(records.size() >= 4U);
+    CheckChain(records, 1U);
+    // Unchanged users bytes ship once per process under the same name.
+    assert(records.back().users == records.front().users);
+    {
+        // A start without archiving ends the chain.
+        TableCatalog catalog(Config(data));
+        assert(!std::filesystem::exists(data / std::string(kWalArchiveStagingName)));
+    }
+    {
+        TableCatalog catalog(ArchiveConfig(data, archive));
+        catalog.RunArchivePass();
+    }
+    records = Records(archive, directory);
+    CheckChain(records, 2U);
 }
 
 void Retention() {
@@ -287,6 +383,7 @@ int main() {
     RecordFormat();
     Configuration();
     DirectoryArchive();
+    ChainAndTimeBound();
     Retention();
     SlotsKeepTheirSegments();
 #ifndef _WIN32

@@ -43,10 +43,22 @@ struct Verifier {
     std::string_view password,
     std::span<const std::uint8_t> salt,
     std::uint32_t iterations);
-// The verifier a login of unknown user `name` runs against: a salt derived
-// from `secret` and the name, so the same name always gets the same reply,
-// and keys no proof matches. The exchange then fails like a wrong password.
-[[nodiscard]] Verifier DecoyVerifier(std::span<const std::uint8_t> secret, std::string_view name);
+// The iteration count and salt length of a verifier, which the server-first
+// message shows before the client proves its password.
+struct VerifierShape {
+    std::uint32_t iterations = kMinIterations;
+    std::size_t salt_bytes = kMinSaltBytes;
+
+    friend bool operator==(const VerifierShape&, const VerifierShape&) = default;
+};
+// The verifier a login of unknown user `name` runs against: the shape of one
+// of `shapes`, the verifiers of the users that exist, chosen by `secret` and
+// the name, or kMinIterations and kMinSaltBytes when there are none; a salt
+// derived from `secret` and the name, so the same name always gets the same
+// reply while the users keep their shapes; and keys no proof matches. The
+// exchange then fails like a wrong password.
+[[nodiscard]] Verifier DecoyVerifier(std::span<const std::uint8_t> secret, std::string_view name,
+    std::span<const VerifierShape> shapes = {});
 // A fresh server nonce: printable, without commas.
 [[nodiscard]] std::string NewNonce();
 

@@ -49,6 +49,9 @@ void IdleIo::Start() {
     control_credit_ = std::make_shared<ConnectionByteBudget>(16777216U, wake);
     data_output_credit_ = std::make_shared<ConnectionByteBudget>(2147483648ULL, wake);
     control_output_credit_ = std::make_shared<ConnectionByteBudget>(16777216U, wake);
+    // SHOW CONNECTIONS listings have their own output reserve, so their slow
+    // readers cannot hold what login and error replies need.
+    listing_output_credit_ = std::make_shared<ConnectionByteBudget>(16777216U, wake);
     const auto line_bound = server_.config_.max_line_bytes + 4096U;
     line_credit_ = std::make_shared<ConnectionByteBudget>(std::max<std::size_t>(16777216U, line_bound), wake);
     data_line_credit_ = std::make_shared<ConnectionByteBudget>(std::max<std::size_t>(67108864U, line_bound), wake);
@@ -66,9 +69,16 @@ bool IdleIo::Add(std::shared_ptr<ServerConnection> connection) {
     return true;
 }
 
-void IdleIo::Reply(ServerConnection& connection, std::string response) {
+void IdleIo::Reply(ServerConnection& connection, std::string response, bool listing) {
     connection.response = std::move(response);
-    if (!ReserveReply(connection, connection.response.capacity(), true)) {
+    // A listing reserves its encoded size once it is built; one the listing
+    // reserve cannot hold is refused from the control reserve instead.
+    if (listing) {
+        connection.response.shrink_to_fit();
+        listing = ReserveReply(connection, connection.response.capacity(), *listing_output_credit_);
+        if (!listing) connection.response = Protocol::Error("BUSY", "control reply budget is full", {{"reason", "reply_budget"}});
+    }
+    if (!listing && !ReserveReply(connection, connection.response.capacity(), true)) {
         connection.session.close_after_reply = true;
         std::string{}.swap(connection.response);
     }
@@ -91,16 +101,19 @@ void IdleIo::Reply(ServerConnection& connection, std::string response) {
 }
 
 bool IdleIo::ReserveReply(ServerConnection& connection, std::size_t bytes, bool control) {
+    return ReserveReply(connection, bytes, control ? *control_output_credit_ : *data_output_credit_);
+}
+
+bool IdleIo::ReserveReply(ServerConnection& connection, std::size_t bytes, ConnectionByteBudget& pool) {
     if (connection.reply_credit && bytes <= connection.reply_credit_bytes) return true;
-    const auto limit = control ? 16777216ULL : 2147483648ULL;
+    const auto limit = &pool == data_output_credit_.get() ? 2147483648ULL : 16777216ULL;
     if (bytes > limit) return false;
-    const auto& pool = control ? control_output_credit_ : data_output_credit_;
-    if (pool->Owns(connection.reply_credit)) {
-        if (!pool->TryResize(connection.reply_credit, bytes)) return false;
+    if (pool.Owns(connection.reply_credit)) {
+        if (!pool.TryResize(connection.reply_credit, bytes)) return false;
         connection.reply_credit_bytes = bytes;
         return true;
     }
-    auto credit = pool->TryAcquire(bytes);
+    auto credit = pool.TryAcquire(bytes);
     if (!credit) return false;
     connection.reply_credit = std::move(credit);
     connection.reply_credit_bytes = bytes;
@@ -406,18 +419,16 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
     connection.phase = ServerConnection::Phase::kReady;
     if (connection.control_request) {
         const auto first = connection.request_line.find_first_not_of(" \t\r\n");
-        if (first != std::string::npos && Protocol::CommandEquals(connection.request_line.substr(first, 4U), "SHOW")) {
-            if (!ReserveReply(connection, connection.session.connection_controls->max_response_bytes * 2U + 64U, true)) {
-                Reply(connection, Protocol::Error("BUSY", "control reply budget is full", {{"reason", "reply_budget"}}));
-                return true;
-            }
-        }
-        const auto response = connection.payload.plan == CommandEngine::PayloadPlan::kDiscard ?
+        // SHOW CONNECTIONS is built here, one listing at a time, before its
+        // encoded size is reserved.
+        const bool listing = first != std::string::npos &&
+            Protocol::CommandEquals(connection.request_line.substr(first, 4U), "SHOW");
+        auto response = connection.payload.plan == CommandEngine::PayloadPlan::kDiscard ?
             server_.engine_->RejectPayload(connection.session, connection.request_line, connection.payload.reject_response) :
             !connection.payload_rejection.empty() ? server_.engine_->RejectPayload(connection.session,
                 connection.request_line, std::move(connection.payload_rejection)) :
             server_.engine_->Execute(connection.session, connection.request_line, connection.parameters);
-        Reply(connection, response);
+        Reply(connection, std::move(response), listing);
     } else {
         // The admission time matters only to a statement deadline.
         const auto timeout_ms =
@@ -617,7 +628,7 @@ bool IdleIo::Write(ServerConnection& connection, bool keep, std::optional<std::c
         std::lock_guard lock(connection.record->mutex);
         connection.record->user = connection.session.user;
         connection.record->incarnation = connection.session.user_incarnation;
-        connection.record->state = connection.session.watch || connection.session.slot_watch ? "watch" : "idle";
+        connection.record->state = connection.session.Watching() ? "watch" : "idle";
         connection.record->verb.clear();
         connection.record->statement.reset();
     }
@@ -724,7 +735,7 @@ bool IdleIo::Progress(ServerConnection& connection) {
     if (connection.phase == Phase::kReply) return Write(connection);
     if (connection.phase != Phase::kInput) return true;
     // Lines read with WATCH belong to the watch stream: Serve hands them to the feed reader.
-    if (connection.session.watch || connection.session.slot_watch) return true;
+    if (connection.session.Watching()) return true;
     if (connection.waiting_line_credit) {
         connection.line_credit = line_credit_->TryAcquire(server_.config_.max_line_bytes + 4096U);
         if (!connection.line_credit) return true;
@@ -817,7 +828,7 @@ void IdleIo::Serve(std::shared_ptr<ServerConnection>& connection) {
     } else if (connection->phase == Phase::kReady) {
         if (server_.DispatchClient(connection)) connection.reset();
     } else if (connection->phase == Phase::kInput &&
-        (connection->session.watch || connection->session.slot_watch)) {
+        (connection->session.Watching())) {
         if (server_.HandOff(connection)) connection.reset();
         else { server_.CloseClient(*connection); connection.reset(); }
     }

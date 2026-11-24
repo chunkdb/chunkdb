@@ -489,5 +489,19 @@ SocketHandle CreateListenSocket(const std::string& host, std::uint16_t port) {
     return listen_socket;
 }
 
+std::uint16_t ListenSocketPort(SocketHandle socket_fd) {
+    sockaddr_storage address{};
+#ifdef _WIN32
+    int length = static_cast<int>(sizeof(address));
+#else
+    socklen_t length = static_cast<socklen_t>(sizeof(address));
+#endif
+    if (getsockname(socket_fd, reinterpret_cast<sockaddr*>(&address), &length) != 0)
+        throw std::runtime_error("cannot read the listener port: " + FormatSocketError(CurrentSocketErrorCode()));
+    if (address.ss_family == AF_INET) return ntohs(reinterpret_cast<const sockaddr_in*>(&address)->sin_port);
+    if (address.ss_family == AF_INET6) return ntohs(reinterpret_cast<const sockaddr_in6*>(&address)->sin6_port);
+    throw std::runtime_error("cannot read the listener port: address family " + std::to_string(address.ss_family));
+}
+
 }  // namespace server_detail
 }  // namespace chunkdb

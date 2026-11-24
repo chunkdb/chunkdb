@@ -149,6 +149,16 @@ bool IsWouldBlockError() {
 #endif
 }
 
+// Whether the last socket error says the peer closed or reset the connection.
+bool IsPeerClosedError() {
+#ifdef _WIN32
+    const int code = WSAGetLastError();
+    return code == WSAECONNRESET || code == WSAECONNABORTED || code == WSAESHUTDOWN;
+#else
+    return errno == EPIPE || errno == ECONNRESET;
+#endif
+}
+
 void ConfigureSocketNoSigPipe(SocketHandle socket) {
 #if defined(__APPLE__)
     const int enabled = 1;
@@ -412,7 +422,13 @@ class RawClient {
         }
     }
 
-    void SendBytes(const std::string& data) {
+    void SendBytes(const std::string& data) { (void)Send(data, false); }
+
+    // Sends `data`, or returns false when the server has already closed or
+    // reset the connection, as a request deadline may before the next byte.
+    [[nodiscard]] bool SendBytesUnlessClosed(const std::string& data) { return Send(data, true); }
+
+    bool Send(const std::string& data, bool closed_ok) {
         chunkdb::test::FeedPhaseWatchdog::Command("client: send", data);
         // Keep the verb only: AUTH and statements may carry credentials or data.
         last_request_ = data.substr(0, std::min(data.find_first_of(" \t\r\n"), std::size_t{32}));
@@ -447,11 +463,13 @@ class RawClient {
                     continue;
                 }
 #endif
+                if (closed_ok && written < 0 && IsPeerClosedError()) return false;
                 throw std::runtime_error("failed to send client bytes " + ReadContext() +
                     " sent=" + std::to_string(offset) + " of=" + std::to_string(data.size()));
             }
             offset += static_cast<std::size_t>(written);
         }
+        return true;
     }
 
     void Disconnect() {
@@ -1537,9 +1555,9 @@ struct ServerHarness {
     std::shared_ptr<chunkdb::CommandEngine> engine;
     std::unique_ptr<chunkdb::ChunkServer> server;
     std::thread thread;
+    // The port the server listens on: a test-given one, kept across Restart,
+    // or with 0 in the config one the server picks at each start.
     std::uint16_t port = 0;
-    // The harness chose `port`; a test-given port is kept across Restart.
-    bool picked_port = false;
     bool tls_enabled = false;
     chunkdb::StoreConfig saved_store_config;
     chunkdb::ServerConfig saved_server_config;
@@ -1571,12 +1589,6 @@ struct ServerHarness {
         RethrowRunError();
         chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset server/engine/catalog for restart");
         server.reset(); engine.reset(); catalog.reset();
-        // Another process may have bound the old port since Stop; no caller
-        // needs the same port, so a port the harness chose is chosen again.
-        if (picked_port) {
-            port = chunkdb::test::PickListenerPort();
-            saved_server_config.port = port;
-        }
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(saved_store_config);
         catalog_config.feed_linger = std::chrono::milliseconds(saved_server_config.feed_linger_ms);
         catalog = std::make_shared<chunkdb::TableCatalog>(catalog_config);
@@ -1599,12 +1611,10 @@ struct ServerHarness {
         chunkdb::EngineConfig engine_config,
         chunkdb::ServerConfig server_config)
         : data_dir(TempDataDir(std::move(name))),
-          port(server_config.port == 0 ? chunkdb::test::PickListenerPort() : server_config.port),
-          picked_port(server_config.port == 0) {
+          port(server_config.port) {
         chunkdb::test::FeedPhaseWatchdog::Phase("harness: constructor");
         store_config.data_dir = data_dir;
         server_config.host = "127.0.0.1";
-        server_config.port = port;
 #ifdef CHUNKDB_WITH_OPENSSL
         if (server_config.tls_enabled &&
             (server_config.tls_cert_path.empty() || server_config.tls_key_path.empty())) {
@@ -1717,6 +1727,7 @@ struct ServerHarness {
         if (!server->WaitListeningForTests(std::chrono::seconds(3))) {
             throw std::runtime_error("server did not start listening in time");
         }
+        port = server->port();
 #ifdef CHUNKDB_WITH_OPENSSL
         // With PROXY headers a TLS handshake needs one first; a connection
         // alone reaches the listener.
@@ -4569,6 +4580,28 @@ class StopAtStartupHook : public chunkdb::FeedDeliveryTestHook {
     const Point point_;
 };
 
+// Port 0 listens on a port the system picks: port() names it once Run has
+// bound it, the ready line names the same port, and a restart picks again.
+void TestPortZeroReportsPickedPort() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kInfo);
+    auto server_cfg = BaseServerConfig();
+    assert(server_cfg.port == 0);
+    ServerHarness harness("port-zero", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, server_cfg);
+    assert(harness.port != 0 && harness.server->port() == harness.port);
+    (void)logs.WaitIndexOf(" ready to accept connections ", std::chrono::seconds(2));
+    assert(logs.Contains(" port=" + std::to_string(harness.port) + " "));
+    const auto ping = [&] {
+        RawClient client("127.0.0.1", harness.port);
+        client.Hello();
+        client.SendLine("PING");
+        assert(client.ReadLine() == "+PONG\r\n");
+    };
+    ping();
+    harness.Restart();
+    assert(harness.port != 0 && harness.server->port() == harness.port);
+    ping();
+}
+
 // A Stop just before Run publishes its listener, or between the listener
 // and running_, ends Run; before, Run kept polling a closed socket and the
 // next Stop found nothing to stop.
@@ -4579,7 +4612,6 @@ void TestStopDuringStartup() {
         store_cfg.data_dir = TempDataDir("stop-during-startup");
         {
             auto server_cfg = BaseServerConfig();
-            server_cfg.port = chunkdb::test::PickListenerPort();
             auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(store_cfg));
             auto engine = std::make_shared<chunkdb::CommandEngine>(chunkdb::EngineConfig{.require_auth = false}, catalog);
             chunkdb::ChunkServer server(server_cfg, engine);
@@ -5277,14 +5309,16 @@ void TestSlowRequestDribbleDeadlineReleasesWorker() {
     RawClient stalled("127.0.0.1", harness.port);
     stalled.Hello();
     stalled.SendBytes("P");
+    // The 250 ms request deadline runs from "P". On a slow host it can close the
+    // connection before a later byte is sent; the test asserts that close below.
     std::this_thread::sleep_for(std::chrono::milliseconds(90));
-    stalled.SendBytes("I");
+    (void)stalled.SendBytesUnlessClosed("I");
     std::this_thread::sleep_for(std::chrono::milliseconds(90));
 
     RawClient fast("127.0.0.1", harness.port);
     fast.SendLine("HELLO 3");
 
-    stalled.SendBytes("N");
+    (void)stalled.SendBytesUnlessClosed("N");
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
@@ -5845,6 +5879,31 @@ class StatementTrackerHook : public chunkdb::FeedDeliveryTestHook {
     }
     std::atomic<std::size_t> last{0U}, maximum{0U};
 };
+// SHOW CONNECTIONS reserves the encoded size of its listing, from a reserve of
+// its own: with all but 64 KiB of it held a listing is answered, where the most
+// a listing could take was reserved before; with all of it held the listing is
+// refused with BUSY, and logins and other replies are answered.
+void TestListingReplyShare() {
+    ServerHarness harness("listing-reply-share", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
+        BaseServerConfig());
+    RawClient controller("127.0.0.1", harness.port); controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    constexpr std::size_t kReserve = 16777216U;
+    auto held = chunkdb::FeedDeliveryTestAccess::ReserveListingReplyCredit(*harness.server, kReserve - 65536U);
+    assert(held);
+    controller.SendLine("SHOW CONNECTIONS"); assert(controller.ReadReply().starts_with('*'));
+    // The answered PING follows the end of the listing's write, which returned its reservation.
+    controller.SendLine("PING"); assert(controller.ReadLine() == "+PONG\r\n");
+    held.reset();
+    held = chunkdb::FeedDeliveryTestAccess::ReserveListingReplyCredit(*harness.server, kReserve);
+    assert(held);
+    controller.SendLine("SHOW CONNECTIONS");
+    assert(controller.ReadLine().starts_with("-ERR BUSY reason=reply_budget "));
+    RawClient login("127.0.0.1", harness.port); login.SetReadDeadline(std::chrono::seconds(10));
+    login.SendLine("HELLO 3"); (void)ReadHelloReply(login);
+    login.SendLine("HELLO 3"); assert(login.ReadLine().starts_with("-ERR PROTOCOL"));
+    controller.SendLine("PING"); assert(controller.ReadLine() == "+PONG\r\n");
+}
+
 void TestReplyAdmissionPrecedesMutation() {
     StatementTrackerHook hook;
     ServerHarness harness("reply-credit-before-write", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
@@ -6247,10 +6306,10 @@ void TestServerHarnessStartupFailure() {
     // The same holds when another listener takes the port while the server
     // is stopped: Restart reports the listen failure instead of probing it.
     {
-        auto kept = BaseServerConfig();
-        kept.port = chunkdb::test::PickListenerPort();
         ServerHarness harness("harness-restart-taken-port", BaseStoreConfig(),
-            chunkdb::EngineConfig{.require_auth = false}, kept);
+            chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+        // Restart on the port the server picked, as a test-given port is kept.
+        harness.saved_server_config.port = harness.port;
         harness.server->Stop();
         harness.JoinStopped();
         const OccupiedPort taken(harness.port);
@@ -6435,7 +6494,6 @@ void TestStartupLogOrder() {
     auto server_cfg = BaseServerConfig();
     const std::filesystem::path data_dir = TempDataDir("log-order");
     store_cfg.data_dir = data_dir;
-    server_cfg.port = chunkdb::test::PickListenerPort();
 
     chunkdb::LogServerStartupContext(
         "test-version",
@@ -6868,6 +6926,168 @@ void TestWatchPositionsAndRights() {
     harness.Restart();
     RawClient multi("127.0.0.1", harness.port); multi.SetReadDeadline(std::chrono::seconds(15)); multi.Login();
     multi.SendLine("WATCH default"); assert(multi.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+}
+// The event of a catalog push for `kind` and `name`, or null.
+const FeedReply* CatalogEvent(const FeedReply& push, std::string_view kind, std::string_view name) {
+    assert(push.type == '>' && push.items.size() == 7U && push.items[0].value == "catalog");
+    assert(push.items[3].type == ':' && push.items[5].type == '*' && push.items[6].type == '_');
+    for (const auto& event : push.items[5].items)
+        if (FeedMap(event, "kind").value == kind && FeedMap(event, "name").value == name) return &event;
+    return nullptr;
+}
+// Who sees users, who keeps the watch, and the watch limit.
+void TestWatchCatalogRights() {
+    auto config = AuthenticatedFeedServerConfig(); config.worker_threads = 2; config.max_watches = 3;
+    ServerHarness harness("watch-catalog-rights", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    RawClient admin("127.0.0.1", harness.port); admin.SetReadDeadline(std::chrono::seconds(15)); admin.Login();
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    admin.SetReadDeadline(std::chrono::seconds(15));
+    for (const std::string name : {"ops", "um", "gone"}) {
+        admin.SendLine("CREATE USER " + name + " VERIFIER '" + verifier + "'"); assert(admin.ReadLine() == "+OK\r\n");
+    }
+    admin.SendLine("GRANT ADMIN ON * TO ops"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("GRANT MONITOR ON * TO um"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("ALTER USER um MANAGES USERS"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("GRANT MONITOR ON * TO gone"); assert(admin.ReadLine() == "+OK\r\n");
+    RawClient ops("127.0.0.1", harness.port); ops.SetReadDeadline(std::chrono::seconds(15)); ops.Login("ops", "pw");
+    RawClient um("127.0.0.1", harness.port); um.SetReadDeadline(std::chrono::seconds(15)); um.Login("um", "pw");
+    RawClient gone("127.0.0.1", harness.port); gone.SetReadDeadline(std::chrono::seconds(15)); gone.Login("gone", "pw");
+    for (auto* client : {&admin, &ops, &um, &gone}) client->SetReadDeadline(std::chrono::seconds(15));
+
+    // ADMIN on * without MANAGES USERS: no user records.
+    ops.SendLine("WATCH CATALOG"); (void)ReadFeedReply(ops);
+    const auto ops_whole = ReadFeedReply(ops);
+    assert(CatalogEvent(ops_whole, "table", "default") != nullptr && CatalogEvent(ops_whole, "user", "ops") == nullptr);
+    um.SendLine("WATCH CATALOG"); (void)ReadFeedReply(um);
+    assert(CatalogEvent(ReadFeedReply(um), "user", "um") != nullptr);
+    gone.SendLine("WATCH CATALOG"); (void)ReadFeedReply(gone);
+    (void)ReadFeedReply(gone);
+    // Catalog watches count against --max-watches.
+    admin.SendLine("WATCH CATALOG"); assert(admin.ReadLine().rfind("-ERR BUSY", 0) == 0);
+
+    // Who ran a statement is shown with MANAGES USERS only.
+    admin.SendLine("CREATE TABLE rights_t (n u8) CHUNK 4 x 4"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto hidden = ReadFeedReply(ops);
+    assert(CatalogEvent(hidden, "table", "rights_t") != nullptr && hidden.items[4].type == '_');
+    const auto shown = ReadFeedReply(um);
+    assert(CatalogEvent(shown, "table", "rights_t") != nullptr && shown.items[4].value == kAdminUser);
+    assert(ReadFeedReply(gone).items[2].value == shown.items[2].value);
+
+    // Losing MANAGES USERS ends a watch that shows users.
+    admin.SendLine("ALTER USER um NO MANAGES USERS"); assert(admin.ReadLine() == "+OK\r\n");
+    assert(um.ReadLine().rfind("-ERR PERMISSION_DENIED", 0) == 0);
+    assert(um.WaitForClose(std::chrono::seconds(5)));
+    // A dropped user's watch ends.
+    admin.SendLine("DROP USER gone"); assert(admin.ReadLine() == "+OK\r\n");
+    assert(gone.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
+    assert(gone.WaitForClose(std::chrono::seconds(5)));
+    // The ADMIN watch saw neither user change and goes on.
+    admin.SendLine("DROP TABLE rights_t"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto dropped = ReadFeedReply(ops);
+    assert(dropped.items[5].items.size() == 1U && CatalogEvent(dropped, "table", "rights_t") != nullptr);
+    ops.SendBytes("UNWATCH\r\nPING\r\n");
+    assert(ops.ReadLine() == "+OK\r\n" && ops.ReadLine() == "+PONG\r\n");
+}
+void TestWatchCatalog() {
+    auto config = AuthenticatedFeedServerConfig(); config.worker_threads = 2;
+    ServerHarness harness("watch-catalog", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    RawClient admin("127.0.0.1", harness.port); admin.SetReadDeadline(std::chrono::seconds(15)); admin.Login();
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    admin.SetReadDeadline(std::chrono::seconds(15));
+    for (const std::string name : {"mon", "reader"}) {
+        admin.SendLine("CREATE USER " + name + " VERIFIER '" + verifier + "'"); assert(admin.ReadLine() == "+OK\r\n");
+    }
+    admin.SendLine("GRANT MONITOR ON * TO mon"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("GRANT READ ON default TO reader"); assert(admin.ReadLine() == "+OK\r\n");
+    RawClient reader("127.0.0.1", harness.port); reader.SetReadDeadline(std::chrono::seconds(15)); reader.Login("reader", "pw");
+    RawClient full("127.0.0.1", harness.port); full.SetReadDeadline(std::chrono::seconds(15)); full.Login();
+    RawClient mon("127.0.0.1", harness.port); mon.SetReadDeadline(std::chrono::seconds(15)); mon.Login("mon", "pw");
+    // Re-arm the read windows after the SCRAM setup of every client.
+    for (auto* client : {&admin, &reader, &full, &mon}) client->SetReadDeadline(std::chrono::seconds(15));
+    reader.SendLine("WATCH CATALOG"); assert(reader.ReadLine().rfind("-ERR PERMISSION_DENIED", 0) == 0);
+
+    // ADMIN on * with MANAGES USERS: tables, users and slot owners.
+    full.SendLine("WATCH CATALOG");
+    const auto start = ReadFeedReply(full);
+    const auto epoch = FeedStart(start).substr(0, 32U);
+    const auto whole = ReadFeedReply(full);
+    assert(whole.items[1].value == epoch && whole.items[4].type == '_');
+    const auto* table = CatalogEvent(whole, "table", "default");
+    assert(table != nullptr && FeedMap(*table, "action").value == "create" && FeedMap(*table, "table").type == '_');
+    assert(CatalogEvent(whole, "user", kAdminUser) != nullptr && CatalogEvent(whole, "user", "mon") != nullptr);
+    // MONITOR without MANAGES USERS: no user records and no slot owners.
+    mon.SendLine("WATCH CATALOG");
+    assert(FeedStart(ReadFeedReply(mon)).substr(0, 32U) == epoch);
+    const auto limited = ReadFeedReply(mon);
+    assert(CatalogEvent(limited, "table", "default") != nullptr && CatalogEvent(limited, "user", "mon") == nullptr);
+
+    admin.SendLine("CREATE TABLE cat_t (n u8) CHUNK 4 x 4"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto created = ReadFeedReply(full);
+    assert(created.items[1].value == epoch && created.items[4].value == kAdminUser);
+    const auto created_revision = std::stoull(created.items[2].value);
+    table = CatalogEvent(created, "table", "cat_t");
+    assert(table != nullptr && FeedMap(*table, "action").value == "create");
+    // DESCRIBE's map without the data revision.
+    const auto& described = FeedMap(*table, "data");
+    assert(described.type == '%' && described.items.size() == 18U && FeedMap(described, "version").value == "1");
+    const auto seen = ReadFeedReply(mon);
+    assert(seen.items[2].value == created.items[2].value && CatalogEvent(seen, "table", "cat_t") != nullptr);
+
+    admin.SendLine("ALTER TABLE cat_t ADD COLUMN m u16"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto altered = ReadFeedReply(full);
+    table = CatalogEvent(altered, "table", "cat_t");
+    assert(table != nullptr && FeedMap(*table, "action").value == "alter");
+    assert(FeedMap(FeedMap(*table, "data"), "version").value == "2");
+    assert(CatalogEvent(ReadFeedReply(mon), "table", "cat_t") != nullptr);
+
+    admin.SendLine("CREATE SLOT 'sub' ON cat_t"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto slot_full = ReadFeedReply(full);
+    const auto* slot = CatalogEvent(slot_full, "slot", "sub");
+    assert(slot != nullptr && FeedMap(*slot, "action").value == "create" && FeedMap(*slot, "table").value == "cat_t");
+    assert(FeedMap(FeedMap(*slot, "data"), "owner").value == kAdminUser);
+    const auto slot_push = ReadFeedReply(mon);
+    slot = CatalogEvent(slot_push, "slot", "sub");
+    assert(slot != nullptr && FeedMap(FeedMap(*slot, "data"), "owner").type == '_');
+
+    // WATCH CATALOG reserves the name for new tables.
+    admin.SendLine("CREATE TABLE catalog (n u8) CHUNK 4 x 4"); assert(admin.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+    admin.SendLine("ALTER TABLE cat_t RENAME TO catalog"); assert(admin.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
+
+    // A user change reaches only the watch that shows users.
+    admin.SendLine("CREATE USER bob VERIFIER '" + verifier + "'"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto bob_push = ReadFeedReply(full);
+    const auto* bob = CatalogEvent(bob_push, "user", "bob");
+    assert(bob != nullptr && FeedMap(*bob, "action").value == "create" && FeedMap(FeedMap(*bob, "data"), "verifiers").value == "1");
+    admin.SendLine("DROP TABLE cat_t"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto dropped = ReadFeedReply(full);
+    table = CatalogEvent(dropped, "table", "cat_t");
+    slot = CatalogEvent(dropped, "slot", "sub");
+    assert(table != nullptr && FeedMap(*table, "action").value == "drop" && FeedMap(*table, "data").type == '_');
+    assert(slot != nullptr && FeedMap(*slot, "action").value == "drop");
+    const auto mon_dropped = ReadFeedReply(mon);
+    assert(CatalogEvent(mon_dropped, "table", "cat_t") != nullptr && CatalogEvent(mon_dropped, "user", "bob") == nullptr);
+    assert(mon_dropped.items[2].value == dropped.items[2].value);
+    assert(std::stoull(dropped.items[2].value) == created_revision + 4U);
+
+    // Losing MONITOR ends that watch; the other one receives the user change.
+    admin.SendLine("REVOKE MONITOR ON * FROM mon"); assert(admin.ReadLine() == "+OK\r\n");
+    assert(mon.ReadLine().rfind("-ERR PERMISSION_DENIED", 0) == 0);
+    assert(mon.WaitForClose(std::chrono::seconds(5)));
+    const auto revoke_push = ReadFeedReply(full);
+    const auto* revoked = CatalogEvent(revoke_push, "user", "mon");
+    assert(revoked != nullptr && FeedMap(*revoked, "action").value == "alter");
+    assert(FeedMap(FeedMap(*revoked, "data"), "server_rights").items.empty());
+
+    full.SendBytes("UNWATCH\r\nPING\r\n");
+    assert(full.ReadLine() == "+OK\r\n" && full.ReadLine() == "+PONG\r\n");
+
+    // Another process could change the catalog without a push.
+    harness.saved_store_config.allow_multiple_processes = true;
+    harness.Restart();
+    RawClient multi("127.0.0.1", harness.port); multi.SetReadDeadline(std::chrono::seconds(15)); multi.Login();
+    multi.SendLine("WATCH CATALOG"); assert(multi.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
 }
 template <typename Client> void TestWatchSlowReader(bool tls) {
     auto config = BaseServerConfig(); config.worker_threads = 2; config.max_watches = 10;
@@ -7870,6 +8090,8 @@ void TestFeedWatch() {
     run("TestWatchPipelinedLines<RawClient>(false)", [] { TestWatchPipelinedLines<RawClient>(false); });
     run("TestWatchNoIdle<RawClient>(false)", [] { TestWatchNoIdle<RawClient>(false); });
     run("TestWatchPositionsAndRights()", [] { TestWatchPositionsAndRights(); });
+    run("TestWatchCatalog()", [] { TestWatchCatalog(); });
+    run("TestWatchCatalogRights()", [] { TestWatchCatalogRights(); });
     run("TestWatchSlowReader<RawClient>(false)", [] { TestWatchSlowReader<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
     run("TestWatchLinger<TlsClient>(true, false)", [] { TestWatchLinger<TlsClient>(true, false); });
@@ -8563,6 +8785,7 @@ int main(int argc, char** argv) {
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
         run("TestShowMetricsBusyTable", TestShowMetricsBusyTable);
         run("TestStopDuringStartup", TestStopDuringStartup);
+        run("TestPortZeroReportsPickedPort", TestPortZeroReportsPickedPort);
         run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestTlsHandshakeDeadlineReleasesWorker", TestTlsHandshakeDeadlineReleasesWorker);
@@ -8599,6 +8822,7 @@ int main(int argc, char** argv) {
         run("TestServerDefaultStatementTimeout", TestServerDefaultStatementTimeout);
         run("TestWideNullableReadHasBoundedReplyAdmission", TestWideNullableReadHasBoundedReplyAdmission);
         run("TestReplyAdmissionPrecedesMutation", TestReplyAdmissionPrecedesMutation);
+        run("TestListingReplyShare", TestListingReplyShare);
         run("TestRemovingCreditHeadAdmitsNextWaiter", TestRemovingCreditHeadAdmitsNextWaiter);
         run("TestPayloadCreditWaitIsRefused", TestPayloadCreditWaitIsRefused);
         run("TestPayloadCreditGrantRestartsFrameDeadline", TestPayloadCreditGrantRestartsFrameDeadline);
