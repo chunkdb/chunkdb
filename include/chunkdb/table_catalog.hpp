@@ -8,6 +8,7 @@
 #include <exception>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -624,7 +625,8 @@ class TableCatalog {
     void OpenDataDirManifest();
     // Raises the data directory's version floor (chunkdb.manifest) durably.
     void RaiseVersionFloor(std::uint64_t floor);
-    // Every interrupted operation, or only those of `table`.
+    // Every interrupted operation, or only those of `table`; the staging
+    // directory of a running RESTORE TABLE is not interrupted.
     void RemoveInterruptedOperations(std::string_view table = {});
     void OpenExistingTables();
     struct FoundTable;
@@ -720,6 +722,9 @@ class TableCatalog {
     // The data directory's version floor (see DataDirVersionFloor); changed
     // under operations_mutex_.
     std::uint64_t version_floor_ = 0;
+    // Staging directory names of running RESTORE TABLE statements, which
+    // RECOVER TABLE leaves alone; changed under operations_mutex_.
+    std::set<std::string, std::less<>> restore_staging_;
     mutable std::shared_mutex tables_mutex_;
     std::map<std::string, std::shared_ptr<Table>, std::less<>> tables_;
     // Out of service until RecoverTable; disjoint from tables_, which
