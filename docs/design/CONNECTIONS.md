@@ -103,7 +103,7 @@ A request that arrives in several reads, waits on the poller or uses TLS reads t
 
 ## Session controls
 
-`SHOW CONNECTIONS` returns bounded entries with exact connection ids, user, peer, state and statement verb.
+`SHOW CONNECTIONS` returns bounded entries with exact connection ids, user, peer, state, statement verb and the progress a running statement reports.
 The listing either returns every authorized entry within the response bound or returns an explicit limit error before output; it never silently truncates.
 A user sees and controls only sessions from the same live user incarnation; MONITOR may inspect all sessions, and ADMIN on `*` may inspect and control all sessions.
 Names alone do not identify an incarnation after DROP and CREATE.

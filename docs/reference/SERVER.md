@@ -55,7 +55,7 @@ KILL CONNECTION id
 - BACKUP: table count, inventoried files and bytes, and per-table epoch/revision cuts.
 - RESTORE TABLE: the new `table`, its `epoch`, its `parent_epoch` and `fork_revision` (the backed-up epoch and cut), and the `files` and `bytes` copied.
 - RELOAD TLS: `OK` once connections that start from then on use the certificate and key read again from the `--tls-cert` and `--tls-key` files.
-- SHOW CONNECTIONS: an array of maps with `id`, `user`, `peer`, `state`, and `statement`.
+- SHOW CONNECTIONS: an array of maps with `id`, `user`, `peer`, `state`, `statement`, and `progress`.
 - CANCEL: `{cancelled: bool}`, indicating whether cancellation was accepted before the target statement's decision boundary.
 - KILL CONNECTION: `{killed: bool}`, indicating whether closure was requested for the target connection.
 
@@ -78,6 +78,8 @@ A backup has one cut per table, rather than a shared cross-table snapshot.
 It includes users and rights, so protect it as sensitive data.
 RESTORE TABLE never replaces a table; use SWAP TABLES from [Tables](TABLES.md) to put the restored table under the live name.
 CANCEL, KILL CONNECTION or a statement timeout stops RESTORE TABLE only before it publishes the table, and nothing is restored.
+While RESTORE TABLE copies the backup, SHOW CONNECTIONS shows its `progress`: `files_done` of `files_total` and `bytes_done` of `bytes_total` copied; after the copy it stays at the totals while the table is checked and published.
+`progress` is null while the restore checks the backup before the copy and once the statement completes, also after a failure.
 
 When both revision bookkeeping records are missing, a writer refuses directories with chunk artifacts, a capped startup inventory, or an unavailable inventory.
 Restore a consistent backup or reinitialize the whole store; a refused writer does not publish replacement revision records.
@@ -90,6 +92,7 @@ Connection identifiers are exact unsigned integers scoped to the server process.
 A user may list and control connections of the same live user incarnation; ADMIN on `*` permits access to all connections, and MONITOR lists all connections without controlling them.
 Dropping and recreating a user does not grant the replacement user access to the previous user's connections.
 An empty user or statement is null in SHOW CONNECTIONS, and `statement` contains only the statement verb.
+`progress` is null unless the running statement reports progress; only RESTORE TABLE does.
 A listing that exceeds the response limit returns OUT_OF_RANGE without a partial listing.
 Missing, idle, self-cancelled, and decision-entered statements return `cancelled: false`.
 Killing a connection preserves the real outcome of a statement that already entered its decision boundary.

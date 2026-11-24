@@ -2312,10 +2312,10 @@ void TestConnectionListingTrimsStatementWhitespace() {
     const auto listing = controller.ReadReply();
     const auto at = listing.find("$2\r\nid\r\n:" + std::to_string(id) + "\r\n");
     assert(at != std::string::npos);
-    const auto end = listing.find("%5\r\n", at);
+    const auto end = listing.find("%6\r\n", at);
     const auto entry = listing.substr(at, end == std::string::npos ? std::string::npos : end - at);
     assert(entry.find("$5\r\nstate\r\n$6\r\nqueued\r\n") != std::string::npos);
-    assert(entry.find("$9\r\nstatement\r\n$4\r\nPING\r\n") != std::string::npos);
+    assert(entry.find("$9\r\nstatement\r\n$4\r\nPING\r\n$8\r\nprogress\r\n_\r\n") != std::string::npos);
     hook.Release();
     assert(worker.ReadLine() == "+PONG\r\n" && target.ReadLine() == "+PONG\r\n");
 }
