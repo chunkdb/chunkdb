@@ -32,7 +32,7 @@ chunk-cli --uri "$CHUNKDB_URI" "SHOW METRICS" | sed -n '1,2p'
 PING
 FLUSH WAL
 SHOW METRICS
-BACKUP TO 'destination'
+BACKUP TO 'destination' [SKIP DAMAGED]
 RESTORE TABLE table FROM 'backup' [AS name]
 RELOAD TLS
 SHOW CONNECTIONS
@@ -46,13 +46,14 @@ KILL CONNECTION id
 - Use `/` separators; rooted paths, backslashes, `..` components, and symlinks below the resolved backup directory are refused.
 - `backup`: a completed backup under the configured backup directory, with the same path rules.
 - `table`: a table the backup holds; `name`: the new table, `table` when AS is omitted.
+- `SKIP DAMAGED`: leave out each chunk whose image or WAL fails the `chunkdb_verify` checks instead of refusing the backup.
 
 ## Returns
 
 - PING: `PONG`.
 - FLUSH WAL: `OK` after every write acknowledged before its arrival is durable.
 - SHOW METRICS: Prometheus text, obtained through an authenticated connection.
-- BACKUP: table count, inventoried files and bytes, and per-table epoch/revision cuts.
+- BACKUP: table count, inventoried files and bytes, and per-table epoch/revision cuts; with SKIP DAMAGED also `skipped`, one entry per left-out chunk with its `table`, `chunk` coordinates, damaged `file`, `code` and `detail`.
 - RESTORE TABLE: the new `table`, its `epoch`, its `parent_epoch` and `fork_revision` (the backed-up epoch and cut), and the `files` and `bytes` copied.
 - RELOAD TLS: `OK` once connections that start from then on use the certificate and key read again from the `--tls-cert` and `--tls-key` files.
 - SHOW CONNECTIONS: an array of maps with `id`, `user`, `peer`, `state`, `statement`, and `progress`.
@@ -69,7 +70,7 @@ KILL CONNECTION id
 | INVALID_ARGUMENT | Backup configuration, destination or source is invalid, the backup has no such table, or its features or stored options differ from what this server serves. | Follow [Backup and restore](../BACKUP.md). |
 | INVALID_ARGUMENT | You run FLUSH WAL, BACKUP or RESTORE TABLE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | INVALID_ARGUMENT | RELOAD TLS on a server without a `chunks://` listener, or the files hold no readable certificate and matching key. | Fix the files; the previous certificate stays in use. |
-| INTERNAL | Required persistence or copying fails, a restored backup is incomplete, damaged or changed, or the server stops during a restore. | Check the error and [Durability](../DURABILITY_CONTRACT.md). |
+| INTERNAL | Required persistence or copying fails, a backed-up chunk is damaged, a restored backup is incomplete, damaged or changed, or the server stops during a restore. | Check the error and [Durability](../DURABILITY_CONTRACT.md); for a damaged chunk, see [Repair damaged chunks](../BACKUP.md#repair-damaged-chunks). |
 
 ## Notes
 

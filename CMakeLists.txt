@@ -386,6 +386,12 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME check_table COMMAND chunkdb_check_table_test)
     set_tests_properties(check_table PROPERTIES TIMEOUT 120 LABELS "smoke")
 
+    add_executable(chunkdb_backup_skip_damaged_test tests/backup_skip_damaged_tests.cpp)
+    target_link_libraries(chunkdb_backup_skip_damaged_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_backup_skip_damaged_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME backup_skip_damaged COMMAND chunkdb_backup_skip_damaged_test)
+    set_tests_properties(backup_skip_damaged PROPERTIES TIMEOUT 120 LABELS "smoke")
+
     add_executable(chunkdb_geometry_bit_test tests/geometry_bit_tests.cpp)
     target_link_libraries(chunkdb_geometry_bit_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1134,6 +1140,7 @@ if(CHUNKDB_BUILD_TESTS)
 
     set(CHUNKDB_TEST_TARGETS
         chunkdb_check_table_test
+        chunkdb_backup_skip_damaged_test
         chunkdb_user_admission_test
         chunkdb_maintenance_pool_test
         chunkdb_coordinate_hash_test

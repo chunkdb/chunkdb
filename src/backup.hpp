@@ -32,15 +32,31 @@ struct BackupFileRecord {
     std::uint64_t size = 0;
     std::uint32_t crc32 = 0;
 };
+// A chunk BACKUP ... SKIP DAMAGED left out because its files failed the
+// chunkdb_verify checks: neither its image nor its WAL is in the backup.
+struct BackupSkippedChunk {
+    std::string table;
+    std::uint8_t dims = 2;
+    ChunkCoord coord{};
+    // The chunkdb_verify code of the damage.
+    std::string code;
+    // The damaged file relative to the table directory, and what is wrong;
+    // the reply has them, the completion record does not.
+    std::filesystem::path file{};
+    std::string detail{};
+};
 struct BackupRecord {
     std::uint64_t created_at_ms = 0;
     std::vector<BackupTableCut> tables;
     std::vector<BackupFileRecord> files;
+    // Version 2 of the record lists them; a record without them stays version 1.
+    std::vector<BackupSkippedChunk> skipped;
 };
 struct BackupResult {
     std::vector<BackupTableCut> tables;
     std::uint64_t files_count = 0;
     std::uint64_t bytes = 0;
+    std::vector<BackupSkippedChunk> skipped;
 };
 // Deterministic pin/copy boundaries, following the storage test-hook pattern.
 struct BackupTestHook {
@@ -56,6 +72,9 @@ struct BackupOptions {
     std::function<void(const BackupResult&)> before_publish{};
     // The configured --backup-dir the target lies under; see PrepareBackupTarget.
     std::filesystem::path backup_directory{};
+    // SKIP DAMAGED: leave out each chunk whose image or WAL fails the
+    // chunkdb_verify checks instead of failing the backup.
+    bool skip_damaged = false;
 };
 class BackupBusyError : public std::runtime_error {
   public:

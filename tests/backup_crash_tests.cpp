@@ -210,7 +210,9 @@ int main(int argc, char** argv) {
             lease->store().WalBarrier();
         }
         chunkdb::txn_test::ScopedEnv crash(argv[4], "1");
-        (void)catalog.BackupTo(root / "backup", {});
+        chunkdb::BackupOptions options;
+        options.skip_damaged = std::string_view(argv[4]).find("SKIP_DAMAGED") != std::string_view::npos;
+        (void)catalog.BackupTo(root / "backup", options);
         return 2;
     }
     if (argc == 2 && std::string_view(argv[1]) == "--wal-replacement") {
@@ -230,8 +232,8 @@ int main(int argc, char** argv) {
     for (const auto mode : {chunkdb::DurabilityMode::kRelaxed, chunkdb::DurabilityMode::kFsyncWal, chunkdb::DurabilityMode::kFsyncCheckpoint})
         WalReplacementCrash(argv[0], mode);
     for (const auto mode : {chunkdb::DurabilityMode::kRelaxed, chunkdb::DurabilityMode::kFsyncWal, chunkdb::DurabilityMode::kFsyncCheckpoint})
-        for (const auto* step : {"AFTER_TARGET_GUARD", "AFTER_STAGING_CREATE", "AFTER_STAGING_OWNER", "AFTER_CUT", "AFTER_FLUSH", "AFTER_PIN", "BEFORE_COPY", "AFTER_COPY",
+        for (const auto* step : {"AFTER_TARGET_GUARD", "AFTER_STAGING_CREATE", "AFTER_STAGING_OWNER", "AFTER_CUT", "AFTER_FLUSH", "AFTER_PIN", "BEFORE_COPY", "AFTER_SKIP_DAMAGED", "AFTER_COPY",
                 "BEFORE_MARKER", "AFTER_MARKER", "AFTER_GUARD_REMOVE", "AFTER_COMPLETE"}) CrashCase(argv[0], mode, step);
     CompletionFailure(false); CompletionFailure(true);
-    std::puts("backup crash passed: 12 stages x3 modes =36 child exits, 3 WAL replacement crash/restore modes, 2 completion failures, linked-WAL sync and cleanup checks");
+    std::puts("backup crash passed: 13 stages x3 modes =39 child exits, 3 WAL replacement crash/restore modes, 2 completion failures, linked-WAL sync and cleanup checks");
 }

@@ -105,6 +105,15 @@ CHECK TABLE world
 It lists each damaged chunk with its coordinates, the damaged file and the `chunkdb_verify` code; see [Tables](reference/TABLES.md).
 It needs ADMIN on the table or MONITOR.
 
+A damaged chunk refuses BACKUP TO; SKIP DAMAGED backs up the other chunks:
+
+```text
+BACKUP TO 'without-damage' SKIP DAMAGED
+```
+
+The reply's `skipped` list and the backup's completion record name each chunk left out; `chunkdb_verify` reports each as warning `backup_chunk_skipped`.
+A restore of that backup has no data for those chunks.
+
 ## Contents and space
 
 Backups include definitions, schema history, images, WAL prefixes, users, rights, slots, and completed migration records.
@@ -125,6 +134,7 @@ The server logs a warning for anything it cannot remove.
 - Unsafe or nonempty destination: choose an empty path under the backup directory.
 - Backup directory not owned by the server user or root, or writable by group or others: the error names it; remove group and other write access, for example `chmod 755`, or choose another path.
 - Incomplete backup: remove that failed destination before retrying; it cannot be restored.
+- A damaged chunk: see [Repair damaged chunks](#repair-damaged-chunks).
 - Unfinished migration recovery: restart the writer before taking another backup.
 - A fenced table: run RECOVER TABLE before taking another backup.
 - Unknown restore publication outcome: verify the destination before deciding whether to remove or use it.

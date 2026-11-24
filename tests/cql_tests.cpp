@@ -606,6 +606,9 @@ void TestWatch() {
 void TestBackup() {
     assert(Get<cql::Backup>("BACKUP TO '/backups/snapshot'").path == "/backups/snapshot");
     assert(Get<cql::Backup>("backup to '/backups/it''s'").path == "/backups/it's");
+    assert(!Get<cql::Backup>("BACKUP TO 'b'").skip_damaged);
+    assert(Get<cql::Backup>("backup to 'b' skip damaged").skip_damaged);
+    ExpectError("BACKUP TO 'b' SKIP", "expected DAMAGED");
     ExpectError("BACKUP '/path'", "expected TO");
     ExpectError("BACKUP TO path", "expected a quoted backup path");
     ExpectError("BACKUP TO $1", "expected a quoted backup path");

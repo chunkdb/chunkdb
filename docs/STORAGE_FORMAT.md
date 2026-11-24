@@ -581,10 +581,15 @@ Malformed, foreign, or inconsistent journal state refuses opening without partia
 
 Completed copies use the same metadata/image/WAL formats and add `chunkdb.backup`:
 
-1. `CKBP`, version `1:u16`, reserved zero `u16`, creation Unix milliseconds `u64`, table count `u32`.
+1. `CKBP`, version `u16` (1, or 2 when chunks were skipped), reserved zero `u16`, creation Unix milliseconds `u64`, table count `u32`.
 2. Each table: name length `u32` and name, epoch (16 bytes), completed revision cut `u64`.
 3. File count `u32`; each file: relative-path length `u32` and path, length `u64`, CRC32 `u32`.
-4. CRC32 over all preceding bytes.
+4. Version 2 only: skipped-chunk count `u32`, positive; each chunk: table-name length `u32` and name, dimensions `u8` (2 or 3), each active coordinate `i64`, and the `chunkdb_verify` code as length `u32` and text.
+5. CRC32 over all preceding bytes.
+
+BACKUP ... SKIP DAMAGED leaves out a chunk whose pinned image or WAL fails the `chunkdb_verify` checks: the inventory lists neither file, and the record names the chunk once.
+A table, coordinates and dimension count must be valid and unique; the coordinate index keeps its records for the chunk.
+Builds that know only version 1 refuse a version 2 record; a backup without skipped chunks keeps version 1.
 
 Inventory paths use canonical `/` separators; absolute roots, drive names, backslashes, NUL, empty components, `.` and `..` are invalid before path conversion/access.
 The inventory includes root metadata, users/ledger when present, table definitions/history, and clocks above cuts.

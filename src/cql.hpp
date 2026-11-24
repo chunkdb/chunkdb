@@ -290,6 +290,8 @@ struct Describe {
 struct FlushWal {};
 struct Backup {
     std::string path;
+    // SKIP DAMAGED: leave out chunks whose files fail their checks.
+    bool skip_damaged = false;
 };
 // Restores table `table` of a completed backup as a new table `name`
 // (docs/design/RESTORE_TABLE.md); without AS, `name` is `table`.

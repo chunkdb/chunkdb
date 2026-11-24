@@ -10,6 +10,7 @@
 #include <set>
 
 #include "checkpoint.hpp"
+#include "chunk_check.hpp"
 #include "statement_control.hpp"
 #include "file_permissions.hpp"
 #include "change_feed.hpp"
@@ -276,6 +277,48 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     hook(BackupTestHook::Point::kBeforeCopy);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_BEFORE_COPY_ONCE");
     std::map<std::string, std::unique_ptr<RetainedBackupIndex>> retained_indexes;
+    if (options.skip_damaged) {
+        // A chunk whose staged image or WAL fails the chunkdb_verify checks
+        // is left out whole, before any file is copied.
+        std::map<std::string, StoreManifest> manifests;
+        std::set<std::pair<std::string, ChunkCoord>> chunks, damaged;
+        for (const auto& file : files) {
+            if (file.relative.extension() != ".chk" && file.relative.extension() != ".wal") continue;
+            const auto table_name = std::next(file.relative.begin())->string();
+            const auto table_dir = staging.path / "tables" / table_name;
+            auto manifest = manifests.find(table_name);
+            if (manifest == manifests.end()) manifest = manifests.emplace(table_name, *ReadStoreManifest(table_dir)).first;
+            auto& retained = retained_indexes[table_name];
+            if (!retained) retained = std::make_unique<RetainedBackupIndex>(table_dir, manifest->second);
+            ChunkCoord coord;
+            if (!ParseChunkFilePath(file.relative.lexically_relative(std::filesystem::path("tables") / table_name), retained->geometry, &coord))
+                throw std::logic_error("invalid staged chunk name");
+            chunks.emplace(table_name, coord);
+        }
+        for (const auto& [table_name, coord] : chunks) {
+            CheckCancelled(options.cancelled);
+            const auto table_dir = staging.path / "tables" / table_name;
+            const auto& manifest = manifests.at(table_name);
+            const auto& retained = *retained_indexes.at(table_name);
+            const auto check = CheckChunkFiles(table_dir, retained.geometry, manifest.store_id, manifest.features, coord,
+                retained.index.EmptyBoundary(coord));
+            const auto* damage = check.damage();
+            if (damage == nullptr) continue;
+            const auto file = damage->path.lexically_relative(table_dir);
+            LogMessage(LogLevel::kWarn, LogComponent::kStore, "backup skips a damaged chunk",
+                {{"table", table_name}, {"file", file.generic_string()}, {"code", damage->code}, {"detail", damage->detail}});
+            record.skipped.push_back({table_name, retained.geometry.dims(), coord, damage->code, file, damage->detail});
+            damaged.emplace(table_name, coord);
+        }
+        std::erase_if(files, [&](const PinnedFile& file) {
+            if (file.relative.extension() != ".chk" && file.relative.extension() != ".wal") return false;
+            const auto table_name = std::next(file.relative.begin())->string();
+            ChunkCoord coord;
+            return ParseChunkFilePath(file.relative.lexically_relative(std::filesystem::path("tables") / table_name),
+                       retained_indexes.at(table_name)->geometry, &coord) && damaged.contains({table_name, coord});
+        });
+        Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_SKIP_DAMAGED_ONCE");
+    }
     for (auto& file : files) {
         CheckCancelled(options.cancelled);
         if (file.relative.extension() == ".wal") {
@@ -335,7 +378,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_COPY_ONCE");
     RemoveBackupStaging(staging.path);
     staging.path.clear();
-    BackupResult result{record.tables, record.files.size(), 0U};
+    BackupResult result{record.tables, record.files.size(), 0U, record.skipped};
     for (const auto& file : record.files) {
         if (file.size > std::numeric_limits<std::uint64_t>::max() - result.bytes)
             throw std::overflow_error("backup byte count overflows");

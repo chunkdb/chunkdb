@@ -1145,10 +1145,21 @@ chunkdb::VerifyCounters chunkdb::VerifyDataDirectory(
     }
     if (present(data_dir / kBackupMarkerName)) {
         ++counters.checked;
-        try { ValidateBackupInventory(data_dir, ReadBackupRecord(data_dir)); }
-        catch (const std::exception& error) {
+        std::vector<BackupSkippedChunk> skipped;
+        try {
+            auto record = ReadBackupRecord(data_dir);
+            ValidateBackupInventory(data_dir, record);
+            skipped = std::move(record.skipped);
+        } catch (const std::exception& error) {
             Report(&counters, true, "backup_invalid", data_dir / kBackupMarkerName, error.what());
             return counters;
+        }
+        // BACKUP ... SKIP DAMAGED left these chunks out: the copy lacks them.
+        for (const auto& chunk : skipped) {
+            std::string coordinates = std::to_string(chunk.coord.x) + "," + std::to_string(chunk.coord.y);
+            if (chunk.dims == 3U) coordinates += "," + std::to_string(chunk.coord.z);
+            Report(&counters, false, "backup_chunk_skipped", data_dir / "tables" / chunk.table,
+                "chunk " + coordinates + " was left out as damaged: " + chunk.code);
         }
     }
     VerifyDataDirectoryImpl(data_dir, &counters);

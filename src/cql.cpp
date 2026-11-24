@@ -931,7 +931,12 @@ class Parser {
             const auto& path = Peek();
             if (path.kind != TokenKind::kText)
                 Fail(path.column, "expected a quoted backup path, got " + Quote(path));
-            return Backup{Take().text};
+            Backup backup{.path = Take().text};
+            if (Accept("skip")) {
+                Expect("damaged");
+                backup.skip_damaged = true;
+            }
+            return backup;
         }
         if (Accept("migrate")) {
             Migrate migration;

@@ -2312,14 +2312,18 @@ std::string CommandEngine::ExecuteStatement(
                     std::stop_callback statement(StatementStopToken(), request_stop);
                     options.cancelled = cancelled.get_token();
                     options.backup_directory = config_.backup_dir;
+                    options.skip_damaged = backup.skip_damaged;
                     std::string reply;
                     options.before_publish = [&](const BackupResult& result) {
                         if (reserve_reply) {
                             if (result.tables.size() > (std::numeric_limits<std::size_t>::max() - 1024U) / 512U)
                                 throw ReplyAdmissionError("backup reply bound overflows");
-                            (*reserve_reply)(1024U + 512U * result.tables.size());
+                            std::size_t skipped_bytes = 0U;
+                            for (const auto& chunk : result.skipped)
+                                skipped_bytes += 256U + chunk.table.size() + chunk.file.native().size() + chunk.code.size() + chunk.detail.size();
+                            (*reserve_reply)(1024U + 512U * result.tables.size() + skipped_bytes);
                         }
-                        Protocol::AppendMapHeader(reply, 4);
+                        Protocol::AppendMapHeader(reply, backup.skip_damaged ? 5U : 4U);
                         Protocol::AppendBulk(reply, "tables");
                         Protocol::AppendInteger(reply, static_cast<std::uint64_t>(result.tables.size()));
                         Protocol::AppendBulk(reply, "files");
@@ -2336,6 +2340,25 @@ std::string CommandEngine::ExecuteStatement(
                             Protocol::AppendBulk(reply, StoreIdHex(cut.epoch));
                             Protocol::AppendBulk(reply, "revision");
                             Protocol::AppendInteger(reply, cut.revision);
+                        }
+                        if (!backup.skip_damaged) return;
+                        Protocol::AppendBulk(reply, "skipped");
+                        Protocol::AppendArrayHeader(reply, result.skipped.size());
+                        for (const auto& chunk : result.skipped) {
+                            Protocol::AppendMapHeader(reply, 5U);
+                            Protocol::AppendBulk(reply, "table");
+                            Protocol::AppendBulk(reply, chunk.table);
+                            Protocol::AppendBulk(reply, "chunk");
+                            Protocol::AppendArrayHeader(reply, chunk.dims);
+                            Protocol::AppendInteger(reply, chunk.coord.x);
+                            Protocol::AppendInteger(reply, chunk.coord.y);
+                            if (chunk.dims == 3U) Protocol::AppendInteger(reply, chunk.coord.z);
+                            Protocol::AppendBulk(reply, "file");
+                            Protocol::AppendBulk(reply, chunk.file.generic_string());
+                            Protocol::AppendBulk(reply, "code");
+                            Protocol::AppendBulk(reply, chunk.code);
+                            Protocol::AppendBulk(reply, "detail");
+                            Protocol::AppendBulk(reply, chunk.detail);
                         }
                     };
                     try {
