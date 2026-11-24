@@ -49,7 +49,7 @@ WakeChannel::WakeChannel() {
     if (getsockname(listener.read, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
         throw std::runtime_error("socket poller wake getsockname: " + SocketErrorText());
     }
-    wake_.write = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    wake_.write = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (wake_.write == kInvalidSocket || connect(wake_.write, reinterpret_cast<sockaddr*>(&address), length) != 0) {
         throw std::runtime_error("socket poller wake connect: " + SocketErrorText());
     }
@@ -189,20 +189,15 @@ void ReadinessPoller::Set(std::uint64_t token, SocketHandle socket, short events
 void ReadinessPoller::Remove(std::uint64_t token) {
     const auto found = registered_.find(token);
     if (found == registered_.end()) return;
-    // The socket may be closed already, or owned by another thread that
-    // closes it; only this owner registers, so its number names no other
-    // registration here, and a missing one is no error.
-#if defined(CHUNKDB_POLLER_EPOLL)
-    if (found->second.events != 0) (void)epoll_ctl(kernel_, EPOLL_CTL_DEL, found->second.socket, nullptr);
-#elif defined(CHUNKDB_POLLER_KQUEUE)
-    for (const short filter : {static_cast<short>(EVFILT_READ), static_cast<short>(EVFILT_WRITE)}) {
-        const bool held = filter == EVFILT_READ ? (found->second.events & POLLIN) != 0 : (found->second.events & POLLOUT) != 0;
-        if (!held) continue;
-        struct kevent change {};
-        EV_SET(&change, static_cast<uintptr_t>(found->second.socket), filter, EV_DELETE, 0, 0, nullptr);
-        (void)kevent(kernel_, &change, 1, nullptr, 0, nullptr);
-    }
-#else
+    if (found->second.events != 0) Apply(token, found->second, 0);
+    registered_.erase(found);
+}
+
+void ReadinessPoller::Forget(std::uint64_t token) {
+    const auto found = registered_.find(token);
+    if (found == registered_.end()) return;
+#if !defined(CHUNKDB_POLLER_EPOLL) && !defined(CHUNKDB_POLLER_KQUEUE)
+    // The kept array holds the closed descriptor until it is taken out.
     if (found->second.events != 0) Apply(token, found->second, 0);
 #endif
     registered_.erase(found);

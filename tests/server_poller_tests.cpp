@@ -232,10 +232,10 @@ void RegisteredReadiness() {
     CloseSocket(second.writer);
     second.writer = kInvalidSocket;
     assert(poller.Wait(5000, ready) && Reported(ready, 2U, POLLIN | POLLHUP));
-    // Removing a registration whose socket is already closed is no error.
+    // A registration whose socket this owner closed is forgotten without naming it.
     CloseSocket(second.reader);
     second.reader = kInvalidSocket;
-    poller.Remove(2U);
+    poller.Forget(2U);
     assert(poller.registered() == 0U);
     bool refused = false;
     try { poller.Set(3U, third.reader, POLLIN); poller.Set(3U, first.reader, POLLIN); }

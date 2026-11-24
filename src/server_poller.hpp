@@ -100,8 +100,12 @@ class ReadinessPoller {
     // Waits for `events` (POLLIN, POLLOUT) on `socket`, reported as `token`;
     // zero events waits for nothing on it until a later Set.
     void Set(std::uint64_t token, SocketHandle socket, short events);
-    // Forgets `token`, before its socket is reused for another registration.
+    // Takes `token` out of the wait while its socket is still open and this
+    // owner's, before another thread may close it.
     void Remove(std::uint64_t token);
+    // Drops `token` after this owner closed its socket, which close already
+    // took out of the kernel set; no call names the closed descriptor.
+    void Forget(std::uint64_t token);
     // Replaces `ready` with what the wait reported; a token can appear once
     // for input and once for output. Negative one waits indefinitely.
     bool Wait(int timeout_ms, std::vector<Ready>& ready);

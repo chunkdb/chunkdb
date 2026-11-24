@@ -838,9 +838,12 @@ void IdleIo::Serve(std::shared_ptr<ServerConnection>& connection) {
         connection.reset();
         PumpCredits();
     } else if (connection->phase == Phase::kReady) {
+        // Out of this thread's wait before another thread can own or close the socket.
+        poller_.Remove(connection->io_token);
         if (server_.DispatchClient(connection)) connection.reset();
     } else if (connection->phase == Phase::kInput &&
         (connection->session.Watching())) {
+        poller_.Remove(connection->io_token);
         if (server_.HandOff(connection)) connection.reset();
         else { server_.CloseClient(*connection); connection.reset(); }
     }
@@ -966,8 +969,8 @@ void IdleIo::Run() {
                     try { settle(token, found->second, Clock::now()); continue; }
                     catch (const std::exception& error) { Abandon(connection, error); }
                 }
-                // Handed on or closed: this thread no longer waits on it.
-                poller_.Remove(token);
+                // Handed on, which Serve took out of the wait first, or closed.
+                poller_.Forget(token);
                 clients.erase(found);
             }
             serve.clear();
