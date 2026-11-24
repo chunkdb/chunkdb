@@ -1399,7 +1399,9 @@ TableCatalog::FoundTable TableCatalog::ReadTableToOpen(const std::string& name, 
     auto manifest = ReadOpenableManifest(dir);
     const TableOptions options = DecodeTableOptions(manifest.options);
     if (manifest.schema.pending.has_value() && config_.access_mode == AccessMode::kReadWrite) {
-        // A narrowing a crash interrupted: the schema stays as it was.
+        // A narrowing or ADD CHECK a crash interrupted: the schema stays as
+        // it was.
+        const bool check = manifest.schema.pending->check.has_value();
         manifest.schema = WithoutPendingNarrowing(manifest.schema);
         AtomicWrite(
             StoreManifestPath(dir), SerializeStoreManifest(manifest), /*fsync_file=*/true,
@@ -1407,7 +1409,8 @@ TableCatalog::FoundTable TableCatalog::ReadTableToOpen(const std::string& name, 
         LogMessage(
             LogLevel::kWarn,
             LogComponent::kStore,
-            "dropped a column narrowing that did not finish; the table keeps its columns",
+            check ? "dropped an ADD CHECK that did not finish; the table keeps its checks"
+                  : "dropped a column narrowing that did not finish; the table keeps its columns",
             {{"table", name}});
     }
     return FoundTable{
@@ -2168,6 +2171,7 @@ std::optional<std::string> TableCatalog::ScanNarrowing(Table& table) {
     if (!lease.has_value()) {
         throw TableNotFoundError("table '" + table.name_ + "' is unavailable");
     }
+    if (pending->check.has_value()) return lease->store().FindCheckFailure();
     return lease->store().FindValueNotFitting(pending->column_id, pending->type, pending->not_null);
 }
 
@@ -2221,6 +2225,9 @@ void TableCatalog::CheckColumnValues(std::string_view name, const std::function<
         *table, options,
         [&](StoreManifest* manifest) { manifest->schema = start(manifest->schema); },
         "CHUNKDB_FAILPOINT_NARROW_PENDING_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
+    // An ADD CHECK refuses with CHECK_FAILED.
+    const auto pending = table->Info().schema.pending;
+    const auto* check = pending.has_value() && pending->check.has_value() ? &*pending->check : nullptr;
     // 2. Every value already stored.
     std::optional<std::string> misfit;
     std::exception_ptr scan_failure;
@@ -2248,6 +2255,7 @@ void TableCatalog::CheckColumnValues(std::string_view name, const std::function<
         std::rethrow_exception(scan_failure);
     }
     if (misfit.has_value()) {
+        if (check != nullptr) throw CheckFailedError(check->name, refusal(*misfit));
         throw std::invalid_argument(refusal(*misfit));
     }
 }
@@ -2265,6 +2273,26 @@ void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, 
         LogComponent::kStore,
         "table column narrowed",
         {{"table", std::string(name)}, {"column", std::string(column)}, {"type", ColumnTypeName(type)}});
+}
+
+void TableCatalog::AddCheck(std::string_view name, const std::function<CheckConstraint(const TableSchema&)>& check) {
+    std::string check_name;
+    CheckColumnValues(
+        name,
+        [&](const TableSchema& schema) {
+            auto added = check(schema);
+            check_name = added.name;
+            return WithPendingCheck(schema, std::move(added));
+        },
+        [](const TableSchema& schema) { return AddPendingCheck(schema); },
+        [&](const std::string& failure) {
+            return "cannot add CHECK " + check_name + ": " + failure + "; change or delete that block first";
+        });
+    LogMessage(
+        LogLevel::kInfo,
+        LogComponent::kStore,
+        "table CHECK added",
+        {{"table", std::string(name)}, {"check", check_name}});
 }
 
 void TableCatalog::DropColumnNull(std::string_view name, std::string_view column) {

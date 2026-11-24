@@ -183,14 +183,14 @@ With `--auth scram` the directory must already have users, because `--read-only`
 
 | Flag | Default | Meaning |
 |---|---|---|
-| `--txn-max-duration-ms` | `5000` | Transaction lifetime from BEGIN; expiry ends it with CONFLICT and releases its private bytes. |
+| `--txn-max-duration-ms` | `5000` | Transaction lifetime from BEGIN, also for BEGIN READ ONLY; expiry ends it with CONFLICT and releases its private bytes and the earlier chunk states kept for it. |
 | `--max-area-chunks` | `4096` | Requested chunk cells per GET AREA, area page or AGGREGATE, including empty cells. |
 | `--max-area-response-bytes` | `67108864` | Complete encoded GET AREA or AGGREGATE reply, including page headers and cursor. |
 | `--txn-max-written-chunks` | `1024` | Distinct chunks written by one transaction. |
-| `--txn-max-read-chunks` | `8192` | Distinct chunks read by one transaction. |
+| `--txn-max-read-chunks` | `8192` | Distinct chunks read by one transaction; a BEGIN READ ONLY transaction keeps no read set and has no such limit. |
 | `--txn-max-bytes` | `16777216` | Private written-chunk bytes for one transaction. |
 | `--txn-total-bytes` | `268435456` | Private written-chunk bytes for all open transactions; a write that finds it full first ends the transactions past `--txn-max-duration-ms`. |
-| `--txn-history-bytes` | `67108864` | Earlier chunk states retained per table; overflow cancels oldest transactions. |
+| `--txn-history-bytes` | `67108864` | Earlier chunk states retained per table for open snapshots, also of BEGIN READ ONLY; overflow cancels oldest transactions. `chunkdb_txn_history_bytes` reports the retained bytes. |
 | `--txn-history-total-bytes` | `0` | Earlier chunk states retained across all tables; `0` sets no limit beyond `--txn-history-bytes`. |
 | `--feed-buffer-bytes` | `67108864` | Default live feed budget for tables without an explicit `feed_buffer_bytes` option, shared among watches. |
 | `--feed-total-bytes` | `0` | Live feed history and capture buffers across all tables; `0` sets no limit beyond each table's budget. |

@@ -623,6 +623,11 @@ bool EvaluateCondition(const ConditionPlan& plan, const Inputs& inputs) {
     return Evaluator(program, inputs).TruthOf(program.root) == Truth::kTrue;
 }
 
+bool EvaluatesFalse(const ConditionPlan& plan, const Inputs& inputs) {
+    const auto& program = plan.program();
+    return Evaluator(program, inputs).TruthOf(program.root) == Truth::kFalse;
+}
+
 std::vector<ColumnValue> EvaluateAssignments(const AssignmentsPlan& plan, const Inputs& inputs) {
     const Program& program = plan.program();
     const Evaluator evaluator(program, inputs);

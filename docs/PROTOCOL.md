@@ -71,11 +71,12 @@ Before authentication HELLO takes at most 12 parameters; a HELLO with more recei
 
 `client_name` and `statement_timeout_ms` apply; `default_tag` is stored with `reason=implementation_pending`.
 The effective statement timeout appears in `options`, including the server default when HELLO omits it.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, and `area_scale`.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, and `read_only_transactions`.
 Options become visible only after authentication succeeds.
 Returning and expression ceilings describe reserved limits; their capabilities remain unavailable.
 The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
 The `area_scale` feature permits GET AREA SCALE and its downsampled forms.
+The `read_only_transactions` feature permits BEGIN READ ONLY and SCAN CHUNKS inside it.
 A chunk too large for an empty page ends the page before it and is then refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=... required=... limit=...`; see [chunks](reference/CHUNKS.md#limits).
 The configured positive area bounds appear as both `max_area_chunks`/`max_response_bytes` and `limits.max_area_chunks`/`limits.max_area_response_bytes`.
 `limits.txn_max_written_chunks` and `limits.txn_max_read_chunks` are the configured transaction chunk-count bounds.
@@ -300,6 +301,7 @@ Clients classify errors by code, never diagnostic text, and preserve unknown key
 | fatal | All other and unknown codes | Correct the request or resolve the reported condition. |
 
 MIGRATION_MISMATCH identifies different text under a recorded migration name.
+CHECK_FAILED includes `check`, the CHECK constraint a write or ADD CHECK found false; nothing changes.
 SLOT_BUSY identifies an attached slot; SLOT_LOST identifies unavailable retained history or a dropped projected column.
 `BUSY reason=large_chunk_cache_full` means a new large-chunk cache container could not fit in the shared pool; the request applied no mutation.
 DISK_FULL means the request applied no mutation: `reason=disk_full` when the file system reported no space, `reason=min_free_disk` with `available` and `limit` below `--min-free-disk-bytes`, and `reason=max_disk_bytes` with `table`, `used` and `limit` when that table's files reached its option ([durability](DURABILITY_CONTRACT.md#disk-full)).

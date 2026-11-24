@@ -208,6 +208,9 @@ Columns keep their IDs through renames and type changes; dropped IDs are not reu
 After the columns are exactly `schema_version - 1` history steps, oldest first; step `k` produced schema version `k + 1`.
 A step is `change_count:u32` (1–2048), then each change's `kind:u8` (1 add, 2 drop, 3 rename, 4 type change, 6 attribute change), `position:u32`, and an encoded column.
 Kind 5 is an other-domain marker containing only its kind byte.
+Kinds 7 (add check) and 8 (drop check), block columns only, have `position:u32`, the index in the check list, and an encoded check instead of a column.
+A check is `name_length:u8`, a name under the column-name rule, `expression_length:u32` (at most 16384) and the condition's UTF-8 text.
+Builds without CHECK constraints refuse a schema area with these kinds or the tags 3 and 4 below.
 Both domains have the same revision; at every step exactly one domain changes columns and the other records that marker.
 
 The column is the added/dropped column or the post-rename/post-conversion column; position identifies its slot in the applicable column list.
@@ -215,10 +218,13 @@ Rename appends `old_name_length:u8, old_name`; type change appends the previous 
 An attribute change, block columns only, appends the previous encoded column, which differs only in its flags and default.
 Translating across it, a column that becomes nullable sets validity for every present block and stores empty text and bytes values as entries; one that stops being nullable drops validity and the entries of empty values.
 Undoing steps reconstructs and validates every earlier schema used by stored chunks.
+Undoing a rename also renames the column in the checks, so each version keeps the checks it had.
+After the history, a schema whose current version has checks has `4:u8, check_count:u32` (1–64) and its checks, in order; without checks there is nothing.
 An optional final 10-byte narrowing suffix is `1:u8, column_id:u32, target_kind:u8, target_size:u32`; without pending narrowing there is no suffix.
 A DROP NULL check uses the same suffix with tag `2:u8` and the column's own kind and size; the column is nullable.
+An ADD CHECK in progress is instead `3:u8` and an encoded check whose name no check of the table has.
 
-While this suffix exists, writes to that column must fit both types, and with tag 2 must not leave it NULL; writer startup and RECOVER TABLE remove interrupted narrowing before opening the table.
+While this suffix exists, writes to that column must fit both types, with tag 2 must not leave it NULL, and with tag 3 must leave no block for which the check is false; writer startup and RECOVER TABLE remove an interrupted suffix before opening the table.
 Named migrations also record this suffix while they check stored values, and decide only if the table schema is unchanged since the check; redo does not depend on the suffix.
 
 ## Packed chunk state

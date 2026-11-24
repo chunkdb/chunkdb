@@ -129,9 +129,11 @@ void TxnHistory::Publish(Reservation& reservation) noexcept {
     if (reservation.empty()) {
         return;
     }
-    std::lock_guard lock(mutex_);
-    ExpireLocked(std::chrono::steady_clock::now());
     TxnKeptState& state = reservation.mapped();
+    std::lock_guard lock(mutex_);
+    copied_states_.store(copied_states_.load(std::memory_order_relaxed) + 1U, std::memory_order_relaxed);
+    copied_bytes_.store(copied_bytes_.load(std::memory_order_relaxed) + state.bytes, std::memory_order_relaxed);
+    ExpireLocked(std::chrono::steady_clock::now());
     const auto needed = [&]() {
         // Some registered snapshot is older than the write, and no kept
         // state of the chunk is already tagged above the newest snapshot
@@ -213,6 +215,7 @@ std::unique_ptr<TxnSnapshot> TxnHistory::Register(
     try {
         const std::uint64_t next = clock.load(std::memory_order_seq_cst);
         snapshot->version_ = next == 0U ? 0U : next - 1U;
+        snapshot->deadline_ = deadline;
         PauseForTests(TxnPausePoint::kRegisterBeforePublish);
         snapshot->by_version_ = by_version_.emplace(snapshot->version_, snapshot.get());
         try {
