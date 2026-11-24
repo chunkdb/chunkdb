@@ -3,6 +3,8 @@
 #include "chunk_coordinate_index.hpp"
 #include "statement_control.hpp"
 
+#include <limits>
+
 namespace chunkdb {
 
 ChunkIdentityScanPage ChunkStore::ScanChunkIdentities(bool has_cursor, ChunkCoord cursor,
@@ -64,11 +66,19 @@ ChunkIdentityScanPage ChunkStore::ScanChunkIdentitiesImpl(const TxnSnapshot* sna
     };
     bool pass_has_cursor = has_cursor;
     auto pass_cursor = cursor;
+    const auto* x_range = filter != nullptr && filter->x_range ? &*filter->x_range : nullptr;
+    // A range starts the scan at its first x, unless the cursor is past it.
+    if (x_range != nullptr && (!has_cursor || cursor.x < x_range->first)) {
+        pass_has_cursor = x_range->first != std::numeric_limits<std::int64_t>::min();
+        pass_cursor = {x_range->first - (pass_has_cursor ? 1 : 0), std::numeric_limits<std::int64_t>::max(),
+            std::numeric_limits<std::int64_t>::max()};
+    }
     // Identities visited; without a filter, the entries.
     std::size_t visited = 0U;
     std::optional<ChunkCoord> last;
-    const bool with_vars = with_data || (filter != nullptr && filter->needs_vars);
-    const bool identity_only = !with_data && filter == nullptr;
+    const bool keeps = filter != nullptr && filter->keep;
+    const bool with_vars = with_data || (keeps && filter->needs_vars);
+    const bool identity_only = !with_data && !keeps;
     const auto more = [&]() {
         page.has_more = true;
         page.after = last;
@@ -80,6 +90,14 @@ ChunkIdentityScanPage ChunkStore::ScanChunkIdentitiesImpl(const TxnSnapshot* sna
             : index->Page(pass_has_cursor, pass_cursor, limit + 1U - visited, since);
         for (const auto& coord : candidates.coords) {
             CheckStatementCancellation();
+            // Past the range nothing more is in it.
+            if (x_range != nullptr && coord.x > x_range->second) return finish();
+            if (filter != nullptr && filter->covers && !filter->covers(coord)) {
+                if (visited == limit) return more();
+                ++visited;
+                last = coord;
+                continue;
+            }
             ChunkRangeEntry state;
             const bool populated = snapshot != nullptr
                 ? ReadPopulatedChunkStateNoCache(coord, &state, with_vars, snapshot, false, identity_only)
@@ -87,7 +105,7 @@ ChunkIdentityScanPage ChunkStore::ScanChunkIdentitiesImpl(const TxnSnapshot* sna
             if (!populated) continue;
             if (since && state.version <= *since) continue;
             if (visited == limit) return more();
-            if (filter != nullptr && !filter->keep(coord, state)) {
+            if (keeps && !filter->keep(coord, state)) {
                 ++visited;
                 last = coord;
                 continue;

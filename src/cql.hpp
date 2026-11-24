@@ -149,7 +149,8 @@ struct SetChunk {
     std::vector<std::string> columns;
     bool if_absent = false;
 };
-// A chunk range or ball; dims selects whether z0 and z1 participate.
+// A chunk range or ball, or with `blocks` a range of block coordinates
+// (BLOCKS); dims selects whether z0 and z1 participate.
 struct GetArea {
     bool around = false;
     std::int64_t x0 = 0;
@@ -167,6 +168,10 @@ struct GetArea {
     std::optional<ChunkCoord> after;
     // SCALE k USING reduction: one cell per k blocks on every active axis.
     std::optional<ChunkFormScale> scale;
+    // BLOCKS x0 y0 TO x1 y1: x0 to z1 are block coordinates.
+    bool blocks = false;
+    // WHERE (expr.hpp): only the present blocks for which it is TRUE.
+    std::shared_ptr<const expr::Expression> where;
 };
 
 // One function of AGGREGATE; `column` is empty for COUNT(*).
@@ -192,6 +197,8 @@ struct Aggregate {
     std::uint8_t dims = 2;
     // WHERE (expr.hpp): only the present blocks for which it is TRUE.
     std::shared_ptr<const expr::Expression> where;
+    // BLOCKS x0 y0 TO x1 y1: x0 to z1 are block coordinates.
+    bool blocks = false;
 };
 
 // CHECK [name] (expr): the condition's text as written, trimmed.
@@ -408,6 +415,21 @@ struct Begin {
 };
 struct Commit {};
 struct Rollback {};
+// AREA x0 y0 TO x1 y1, AREA AROUND x0 y0 RADIUS r (chunk coordinates) or
+// BLOCKS x0 y0 TO x1 y1 (block coordinates); dims selects whether z0 and z1
+// participate.
+struct Selection {
+    bool around = false;
+    bool blocks = false;
+    std::int64_t x0 = 0;
+    std::int64_t y0 = 0;
+    std::int64_t z0 = 0;
+    std::int64_t x1 = 0;
+    std::int64_t y1 = 0;
+    std::int64_t z1 = 0;
+    std::int64_t radius = 0;
+    std::uint8_t dims = 2;
+};
 // The populated chunks of table, ordered by every active coordinate axis.
 struct ScanChunks {
     std::string table;
@@ -420,6 +442,8 @@ struct ScanChunks {
     std::vector<std::string> columns;
     // WHERE (expr.hpp): only the present blocks for which it is TRUE.
     std::shared_ptr<const expr::Expression> where;
+    // Only the chunks of a selection; with BLOCKS, only its blocks.
+    std::optional<Selection> selection;
 };
 
 using MigrationStatement = std::variant<CreateTable, AlterTable, DropTable, GrantRight, CreateSlot, DropSlot>;

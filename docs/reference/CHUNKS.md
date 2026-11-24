@@ -1,4 +1,4 @@
-# GET CHUNK, SET CHUNK, GET AREA, SCAN CHUNKS, COMPACT TOMBSTONES, SHOW TABLE STATS
+# GET CHUNK, SET CHUNK, GET AREA, GET BLOCKS, SCAN CHUNKS, COMPACT TOMBSTONES, SHOW TABLE STATS
 
 You read or replace whole chunks and find populated chunks in an area.
 A chunk groups the fixed rectangle or cuboid of blocks specified by its table.
@@ -84,13 +84,17 @@ The metadata write populates the chunk before any block exists.
 GET CHUNK cx cy [cz] FROM table [COLUMNS column, ...]
 SET CHUNK cx cy [cz] IN table [COLUMNS column, ...] $1 [IF VERSION version | IF ABSENT]
 SET CHUNK cx cy [cz] IN table META column = value [, ...] [IF VERSION version | IF ABSENT]
-GET AREA cx0 cy0 [cz0] TO cx1 cy1 [cz1] FROM table [COLUMNS column, ...] [WITH SCHEMA] [LIMIT n] [AFTER cx cy [cz]]
-    [SCALE k USING MAX | MIN | MODE | FIRST | ANY]
-GET AREA AROUND cx cy [cz] RADIUS radius FROM table [COLUMNS column, ...] [WITH SCHEMA] [LIMIT n] [AFTER cx cy [cz]]
-    [SCALE k USING MAX | MIN | MODE | FIRST | ANY]
-SCAN CHUNKS FROM table [AFTER cx cy [cz]] [LIMIT count] [SINCE revision] [WHERE condition] [WITH DATA] [COLUMNS column, ...]
+GET selection FROM table [COLUMNS column, ...] [WITH SCHEMA] [LIMIT n] [AFTER cx cy [cz]]
+    [SCALE k USING MAX | MIN | MODE | FIRST | ANY] [WHERE condition]
+SCAN CHUNKS FROM table [selection] [AFTER cx cy [cz]] [LIMIT count] [SINCE revision] [WHERE condition] [WITH DATA]
+    [COLUMNS column, ...]
 COMPACT TOMBSTONES table BEFORE revision
 SHOW TABLE STATS table
+
+selection:
+    AREA cx0 cy0 [cz0] TO cx1 cy1 [cz1]
+    AREA AROUND cx cy [cz] RADIUS radius
+    BLOCKS x0 y0 [z0] TO x1 y1 [z1]
 ```
 
 ## Arguments
@@ -99,6 +103,7 @@ SHOW TABLE STATS table
 - Supply exactly the table's number of axes, including when `cz` is zero.
 - `TO`: inclusive opposite corner; endpoints must be ordered on every axis.
 - `RADIUS`: nonnegative distance in chunks; the area contains coordinates whose sum of squared active-axis offsets is at most radius².
+- `BLOCKS`: the blocks from one corner to the other in block coordinates, inclusive and ordered on every axis; it covers the chunks that hold any of them and keeps only these blocks of each.
 - `COLUMNS`: a block-column projection in requested order; chunk metadata remains complete.
 - `WITH SCHEMA`: return `[schema_version, entries]`, including the schema version when no chunks match.
 - `$1`: a complete chunk form supplied through your client; see [Protocol](../PROTOCOL.md#chunk-form).
@@ -110,6 +115,7 @@ SHOW TABLE STATS table
 - `SCALE k USING`: return each chunk downsampled by k with the named reduction; see [Downsampled areas](#downsampled-areas).
 - `SINCE`: include current identities with producing revisions greater than this value, including retained deletions.
 - `WHERE`: keep only blocks for which a [condition](../CQL.md#conditions) is true; see [Filter a scan](#filter-a-scan).
+- With WHERE or BLOCKS, each form holds only the blocks that stay, and a chunk where none stays is left out, unless a SINCE scan lists it with null data so that a consumer drops its copy.
 - `WITH DATA`: append a complete form for populated chunks and null for deletions; required with scan COLUMNS.
 
 ## Returns
@@ -117,11 +123,11 @@ SHOW TABLE STATS table
 - GET CHUNK: version, schema version, and presence count; `--blocks` adds individual values.
 - Unwritten chunk: `NULL`, with no version token.
 - SET CHUNK: destination chunk version; the input's version and time do not select the committed identity.
-- GET AREA: populated chunks, including metadata-only chunks, in lexicographic coordinate order.
-- SCAN CHUNKS: `chunks`, `more`, `epoch`, `position`, and `retained_deletion_floor`; with WHERE, `after` follows `more`.
+- GET AREA and GET BLOCKS: populated chunks, including metadata-only chunks unless WHERE or BLOCKS leaves them out, in lexicographic coordinate order.
+- SCAN CHUNKS: `chunks`, `more`, `epoch`, `position`, and `retained_deletion_floor`; with WHERE or a selection, `after` follows `more`.
 - Each scan row contains the active chunk coordinates and producing version, followed by a form or null when WITH DATA is present.
 - Scan rows ascend by cx, then cy, then cz, within a page and across pages continued AFTER.
-- Continue AFTER the last returned coordinate while `more` is true; with WHERE, continue AFTER the returned `after`, since a page may return no rows; on a server started with `--read-only`, `position` is null.
+- Continue AFTER the last returned coordinate while `more` is true; with WHERE or a selection, continue AFTER the returned `after`, since a page may return no rows; on a server started with `--read-only`, `position` is null.
 - Pass the first page's `epoch` and `position` to WATCH AFTER to follow later changes; see [Resume a consumer](../FEED_RESUME.md).
 - COMPACT TOMBSTONES: the retained-deletion floor after completion.
 - SHOW TABLE STATS: `epoch`, nullable completed `revision`, `dims`, `chunks`, retained `tombstones`, `retained_deletion_floor`, `loaded_chunks`, `files`, `disk_bytes`, `slots`, and `watches`.

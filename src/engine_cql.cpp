@@ -25,6 +25,7 @@
 #include "aggregate.hpp"
 #include "block_checks.hpp"
 #include "block_filter.hpp"
+#include "block_selection.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunk_form.hpp"
@@ -1397,6 +1398,7 @@ CommandEngine::PayloadRequest CommandEngine::PlanParameters(SessionState& sessio
     const auto where_read = [&]() -> std::optional<std::pair<std::string, std::shared_ptr<const expr::Expression>>> {
         if (const auto* aggregate = std::get_if<cql::Aggregate>(&parsed.statement)) return std::pair{aggregate->table, aggregate->where};
         if (const auto* scan = std::get_if<cql::ScanChunks>(&parsed.statement)) return std::pair{scan->table, scan->where};
+        if (const auto* get = std::get_if<cql::GetArea>(&parsed.statement)) return std::pair{get->table, get->where};
         return std::nullopt;
     }();
     if (where_read && where_read->second) {
@@ -2121,8 +2123,27 @@ std::string CommandEngine::ExecuteStatement(
                         ? std::optional<Geometry>(ScaledGeometry(store.geometry(), *get.scale, columns)) : std::nullopt;
                     const Geometry& form_geometry = scaled ? *scaled : store.geometry();
                     const ChunkFormScale* scale = get.scale ? &*get.scale : nullptr;
-                    const ChunkAreaSelector selector{.dims = get.dims, .first = {get.x0, get.y0, get.z0},
-                        .last = {get.x1, get.y1, get.z1}, .around = get.around, .radius = get.radius};
+                    const AreaSelection selection = SelectArea(store.geometry(), get.around, get.blocks, get.dims,
+                        {get.x0, get.y0, get.z0}, {get.x1, get.y1, get.z1}, get.radius);
+                    const ChunkAreaSelector& selector = selection.chunks;
+                    // WHERE and BLOCKS keep only some blocks of each chunk, and
+                    // leave out a chunk where none stays.
+                    std::optional<BlockFilter> filter;
+                    if (get.where) filter.emplace(WhereFilter(store.geometry(), *get.where, parameters));
+                    const auto keep_blocks = [&](const ChunkCoord& coord, std::optional<ChunkRangeEntry>& entry) {
+                        if (!entry || (!filter && !selection.blocks)) return;
+                        std::size_t kept = selection.blocks
+                            ? ClipToBox(store.geometry(), *selection.blocks, coord, entry->presence_bitmap)
+                            : 1U;
+                        if (kept != 0U && filter)
+                            kept = filter->Apply(coord, entry->payload, entry->presence_bitmap, entry->vars,
+                                entry->chunk_columns.get());
+                        if (kept == 0U) {
+                            entry.reset();
+                            return;
+                        }
+                        DropAbsentBlocks(store.geometry(), entry->presence_bitmap, &entry->payload, &entry->vars);
+                    };
                     const bool paged = get.limit.has_value() || get.after.has_value();
                     const auto& limits = store.query_limits();
                     const auto limit = get.limit.value_or(limits.max_area_chunks);
@@ -2163,6 +2184,7 @@ std::string CommandEngine::ExecuteStatement(
                     bool first_cell = true;
                     (void)store.VisitChunkArea(selector, get.after, static_cast<std::size_t>(limit),
                         [&](const ChunkCoord& coord, std::optional<ChunkRangeEntry>&& entry, bool more) {
+                            keep_blocks(coord, entry);
                             const auto next_count = count + static_cast<std::size_t>(entry.has_value());
                             auto next_prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged, next_count);
                             auto next_suffix = AreaReplySuffix(paged, more, coord, get.dims);
@@ -2231,10 +2253,10 @@ std::string CommandEngine::ExecuteStatement(
                     Aggregator aggregator(store.geometry().layout(), aggregate.functions);
                     std::optional<BlockFilter> filter;
                     if (aggregate.where) filter.emplace(WhereFilter(store.geometry(), *aggregate.where, parameters));
-                    const ChunkAreaSelector selector{.dims = aggregate.dims,
-                        .first = {aggregate.x0, aggregate.y0, aggregate.z0},
-                        .last = {aggregate.x1, aggregate.y1, aggregate.z1},
-                        .around = aggregate.around, .radius = aggregate.radius};
+                    const AreaSelection selection = SelectArea(store.geometry(), aggregate.around, aggregate.blocks,
+                        aggregate.dims, {aggregate.x0, aggregate.y0, aggregate.z0},
+                        {aggregate.x1, aggregate.y1, aggregate.z1}, aggregate.radius);
+                    const ChunkAreaSelector& selector = selection.chunks;
                     const auto& limits = store.query_limits();
                     const auto max_chunks = limits.max_area_chunks;
                     if (detail::AreaRequestedExceeds(selector, max_chunks))
@@ -2273,6 +2295,8 @@ std::string CommandEngine::ExecuteStatement(
                             if (!entry) return true;
                             ++chunks;
                             if (aggregate.by_chunk) aggregator.Reset();
+                            if (selection.blocks)
+                                (void)ClipToBox(store.geometry(), *selection.blocks, coord, entry->presence_bitmap);
                             if (filter) (void)filter->Apply(coord, entry->payload, entry->presence_bitmap, entry->vars,
                                 entry->chunk_columns.get());
                             aggregator.Add(entry->payload, entry->presence_bitmap);
@@ -2682,28 +2706,52 @@ std::string CommandEngine::ExecuteStatement(
                     if (reserve_reply && scan.with_data)
                         (*reserve_reply)(ChunkReplyCaptureBound(geometry.layout(),
                             ChunkReplyStateBytes(geometry, static_cast<std::size_t>(limit), 128U)));
-                    // WHERE keeps the matching blocks of each identity. Without
-                    // SINCE a chunk with none is left out; with SINCE it stays,
-                    // without data, so a consumer drops its copy.
+                    // A selection visits only its chunks. WHERE and BLOCKS keep the
+                    // matching blocks of each identity. Without SINCE a chunk with
+                    // none is left out; with SINCE it stays, without data, so a
+                    // consumer drops its copy.
+                    std::optional<AreaSelection> selection;
+                    std::optional<detail::AreaCursor> area;
+                    if (scan.selection) {
+                        const auto& chosen = *scan.selection;
+                        RequireDimensions(geometry, chosen.dims);
+                        selection = SelectArea(geometry, chosen.around, chosen.blocks, chosen.dims,
+                            {chosen.x0, chosen.y0, chosen.z0}, {chosen.x1, chosen.y1, chosen.z1}, chosen.radius);
+                        area.emplace(selection->chunks);
+                    }
+                    const bool clip = selection && selection->blocks.has_value();
                     std::optional<BlockFilter> filter;
                     std::optional<ChunkScanFilter> scan_filter;
-                    if (scan.where) {
-                        filter.emplace(WhereFilter(geometry, *scan.where, parameters));
-                        scan_filter.emplace(ChunkScanFilter{.keep = [&](const ChunkCoord& coord, ChunkRangeEntry& state) {
-                            if (state.presence_bitmap.empty()) return scan.since.has_value();
-                            if (filter->Apply(coord, state.payload, state.presence_bitmap, state.vars, state.chunk_columns.get()) == 0U) {
-                                if (!scan.since) return false;
-                                state.presence_bitmap.clear();
-                                state.vars = ChunkVars{};
+                    if (scan.where || selection) {
+                        if (scan.where) filter.emplace(WhereFilter(geometry, *scan.where, parameters));
+                        scan_filter.emplace();
+                        if (selection) {
+                            const auto& chunks = selection->chunks;
+                            const auto radius = static_cast<std::uint64_t>(chunks.radius);
+                            scan_filter->x_range = std::make_pair(
+                                chunks.around ? detail::AreaSubtractClipped(chunks.first.x, radius) : chunks.first.x,
+                                chunks.around ? detail::AreaAddClipped(chunks.first.x, radius) : chunks.last.x);
+                            scan_filter->covers = [&area](const ChunkCoord& coord) { return area->Contains(coord); };
+                        }
+                        if (filter || clip) {
+                            scan_filter->needs_vars = filter && filter->needs_vars();
+                            scan_filter->keep = [&](const ChunkCoord& coord, ChunkRangeEntry& state) {
+                                if (state.presence_bitmap.empty()) return scan.since.has_value();
+                                std::size_t kept = clip
+                                    ? ClipToBox(geometry, *selection->blocks, coord, state.presence_bitmap) : 1U;
+                                if (kept != 0U && filter)
+                                    kept = filter->Apply(coord, state.payload, state.presence_bitmap, state.vars,
+                                        state.chunk_columns.get());
+                                if (kept == 0U) {
+                                    if (!scan.since) return false;
+                                    state.presence_bitmap.clear();
+                                    state.vars = ChunkVars{};
+                                    return true;
+                                }
+                                DropAbsentBlocks(geometry, state.presence_bitmap, &state.payload, &state.vars);
                                 return true;
-                            }
-                            CanonicalizeAbsentBlocks(geometry, state.presence_bitmap, &state.payload);
-                            std::vector<VarKey> absent;
-                            for (const auto value : state.vars)
-                                if (!BlockPresent(state.presence_bitmap, value.key.block_index)) absent.push_back(value.key);
-                            for (const auto& key : absent) (void)state.vars.Remove(key);
-                            return true;
-                        }, .needs_vars = filter->needs_vars()});
+                            };
+                        }
                     }
                     ChunkIdentityScanPage page;
                     try {
@@ -2725,9 +2773,10 @@ std::string CommandEngine::ExecuteStatement(
                     }
                     if (info != nullptr) info->chunks = page.entries.size();
                     ReplyParts reply;
-                    // WHERE adds `after`, since a page can end with identities
-                    // it left out.
-                    Protocol::AppendMapHeader(reply.text(), scan.where ? 6U : 5U);
+                    // WHERE and a selection add `after`, since a page can end
+                    // with identities they left out.
+                    const bool filtered = scan.where || scan.selection;
+                    Protocol::AppendMapHeader(reply.text(), filtered ? 6U : 5U);
                     Protocol::AppendBulk(reply.text(), "chunks");
                     Protocol::AppendArrayHeader(reply.text(), page.entries.size());
                     for (const auto& entry : page.entries) {
@@ -2746,7 +2795,7 @@ std::string CommandEngine::ExecuteStatement(
                     }
                     Protocol::AppendBulk(reply.text(), "more");
                     Protocol::AppendBoolean(reply.text(), page.has_more);
-                    if (scan.where) {
+                    if (filtered) {
                         Protocol::AppendBulk(reply.text(), "after");
                         if (!page.has_more || !page.after) Protocol::AppendNull(reply.text());
                         else {
