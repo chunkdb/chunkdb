@@ -64,7 +64,7 @@ A snapshot is the table's state at that moment.
 
 ## Notes
 
-Allowed statements are GET BLOCK, GET CHUNK, GET AREA, SET BLOCK, DELETE BLOCK, SET CHUNK, DESCRIBE, PING, SHOW CONNECTIONS, CANCEL and KILL CONNECTION.
+Allowed statements are GET BLOCK, GET CHUNK, GET AREA, AGGREGATE, SET BLOCK, DELETE BLOCK, SET CHUNK, DESCRIBE, PING, SHOW CONNECTIONS, CANCEL and KILL CONNECTION.
 Ordinary statement errors leave the transaction open without applying the failed statement.
 A conflict ends its work and writes nothing.
 The connection keeps returning that conflict until ROLLBACK or COMMIT closes it; SHOW CONNECTIONS, CANCEL and KILL CONNECTION still return their own reply.
