@@ -4548,6 +4548,27 @@ void TestMaxAuthFailuresDisconnects() {
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
+// A delivery hook is refused before the server's transports exist, which it
+// would not reach; clearing one needs none.
+void TestDeliveryHookNeedsTransports() {
+    struct Unused : chunkdb::FeedDeliveryTestHook {
+        void Run(Point, std::size_t) override {}
+    } hook;
+    auto store_cfg = BaseStoreConfig();
+    store_cfg.data_dir = TempDataDir("hook-before-start");
+    {
+        auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(store_cfg));
+        auto engine = std::make_shared<chunkdb::CommandEngine>(chunkdb::EngineConfig{.require_auth = false}, catalog);
+        chunkdb::ChunkServer server(BaseServerConfig(), engine);
+        bool refused = false;
+        try { chunkdb::FeedDeliveryTestAccess::SetObserverHook(server, &hook); }
+        catch (const std::logic_error& error) { refused = std::string(error.what()).find("transports") != std::string::npos; }
+        assert(refused);
+        chunkdb::FeedDeliveryTestAccess::SetHook(server, nullptr);
+    }
+    RemoveAllWithRetry(store_cfg.data_dir);
+}
+
 // Calls Stop on the Run thread at one point of Run's startup.
 class StopAtStartupHook : public chunkdb::FeedDeliveryTestHook {
   public:
@@ -8765,6 +8786,7 @@ int main(int argc, char** argv) {
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
         run("TestShowMetricsBusyTable", TestShowMetricsBusyTable);
         run("TestStopDuringStartup", TestStopDuringStartup);
+        run("TestDeliveryHookNeedsTransports", TestDeliveryHookNeedsTransports);
         run("TestPortZeroReportsPickedPort", TestPortZeroReportsPickedPort);
         run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL

@@ -126,8 +126,14 @@ std::optional<std::size_t> FeedDeliveryTestAccess::RequestLineCapacity(ChunkServ
     return connection->request_line.capacity();
 }
 void FeedDeliveryTestAccess::InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake) {
+    // The feed I/O exists from when Run starts its transports, after the
+    // listener is published, until Stop; a hook installed outside that window
+    // would not reach it. Clearing a hook needs no transports.
     auto io = server.FeedIoHandle();
+    if (!io && hook != nullptr)
+        throw std::logic_error("a delivery hook needs the server's transports: install it once a request has been answered");
     server.delivery_test_hook_.store(hook, std::memory_order_release);
+    if (!io) return;
     {
         std::lock_guard lock(io->catchup_mutex_);
         io->hook_.store(hook, std::memory_order_release);

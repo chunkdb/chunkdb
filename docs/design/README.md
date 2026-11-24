@@ -9,6 +9,7 @@
 - [Extensible format](EXTENSIBLE_FORMAT_DESIGN.md): feature flags and typed extensions.
 - [Secondary indexes](INDEXES.md): keys, runs, write maintenance, recovery and GET BLOCKS.
 - [Revisions and frames](FORMAT_V2_DESIGN.md): persistent equality tokens and atomic mutations.
+- [Request I/O](REQUEST_IO.md): polling, reads, dispatch and replies on the request path, and how changes to them are measured.
 - [Table restore](RESTORE_TABLE.md): online RESTORE TABLE, SWAP TABLES, RENAME TO and feed resync.
 - [Tables](TABLES_DESIGN.md): catalog leases and directory publication.
 - [Transactions](TRANSACTIONS_DESIGN.md): snapshot history and durable decisions.
