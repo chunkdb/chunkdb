@@ -1369,6 +1369,10 @@ struct TableCatalog::FoundTable {
     std::filesystem::path dir;
     StoreManifest manifest;
     TableOptions options;
+    // A narrowing or ADD CHECK a crash interrupted, dropped from `manifest`
+    // and published by PublishDroppedPending.
+    bool dropped_pending = false;
+    bool dropped_check = false;
 };
 
 void TableCatalog::OpenExistingTables() {
@@ -1408,33 +1412,43 @@ void TableCatalog::OpenExistingTables() {
     }
     if (!mismatches.empty()) throw std::runtime_error(OptionMismatchMessage(mismatches));
 
+    for (const auto& table : tables) PublishDroppedPending(table);
     for (auto& table : tables) tables_.emplace(table.name, OpenFoundTable(table));
 }
 
 TableCatalog::FoundTable TableCatalog::ReadTableToOpen(const std::string& name, const std::filesystem::path& dir) {
     auto manifest = ReadOpenableManifest(dir);
     const TableOptions options = DecodeTableOptions(manifest.options);
+    bool dropped_pending = false;
+    bool dropped_check = false;
     if (manifest.schema.pending.has_value() && config_.access_mode == AccessMode::kReadWrite) {
         // A narrowing or ADD CHECK a crash interrupted: the schema stays as
         // it was.
-        const bool check = manifest.schema.pending->check.has_value();
+        dropped_pending = true;
+        dropped_check = manifest.schema.pending->check.has_value();
         manifest.schema = WithoutPendingNarrowing(manifest.schema);
-        AtomicWrite(
-            StoreManifestPath(dir), SerializeStoreManifest(manifest), /*fsync_file=*/true,
-            /*fsync_directory=*/true, nullptr, nullptr, /*enable_generic_failpoints=*/false);
-        LogMessage(
-            LogLevel::kWarn,
-            LogComponent::kStore,
-            check ? "dropped an ADD CHECK that did not finish; the table keeps its checks"
-                  : "dropped a column narrowing that did not finish; the table keeps its columns",
-            {{"table", name}});
     }
     return FoundTable{
         .name = name,
         .dir = dir,
         .manifest = std::move(manifest),
         .options = options,
+        .dropped_pending = dropped_pending,
+        .dropped_check = dropped_check,
     };
+}
+
+void TableCatalog::PublishDroppedPending(const FoundTable& table) {
+    if (!table.dropped_pending) return;
+    AtomicWrite(
+        StoreManifestPath(table.dir), SerializeStoreManifest(table.manifest), /*fsync_file=*/true,
+        /*fsync_directory=*/true, nullptr, nullptr, /*enable_generic_failpoints=*/false);
+    LogMessage(
+        LogLevel::kWarn,
+        LogComponent::kStore,
+        table.dropped_check ? "dropped an ADD CHECK that did not finish; the table keeps its checks"
+                            : "dropped a column narrowing that did not finish; the table keeps its columns",
+        {{"table", table.name}});
 }
 
 std::shared_ptr<Table> TableCatalog::OpenFoundTable(FoundTable& table) {
@@ -1706,6 +1720,7 @@ void TableCatalog::RecoverTable(std::string_view name, std::stop_token cancelled
         if (IsDirectory(dir)) {
             auto found = ReadTableToOpen(table_name, dir);
             RequireRecoverableOptions(table_name, found.manifest);
+            PublishDroppedPending(found);
             recovered = OpenFoundTable(found);
         }
     } catch (const std::exception& error) {
