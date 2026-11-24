@@ -626,8 +626,12 @@ class TableCatalog {
     void RemoveInterruptedOperations(std::string_view table = {});
     void OpenExistingTables();
     struct FoundTable;
-    // Reads a table directory to open; a writer drops an interrupted narrowing.
+    // Reads a table directory to open without changing it; a writer drops an
+    // interrupted narrowing or ADD CHECK from the manifest it returns.
     [[nodiscard]] FoundTable ReadTableToOpen(const std::string& name, const std::filesystem::path& dir);
+    // Publishes the manifest without the dropped narrowing or ADD CHECK, once
+    // every check that could refuse the open has passed.
+    void PublishDroppedPending(const FoundTable& table);
     [[nodiscard]] std::shared_ptr<Table> OpenFoundTable(FoundTable& table);
     // Throws as opening does for a table directory without its manifest.
     [[nodiscard]] StoreManifest ReadOpenableManifest(const std::filesystem::path& dir) const;
