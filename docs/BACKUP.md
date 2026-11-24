@@ -61,7 +61,6 @@ Restore publishes a checked successor clock before exposing the new epoch; it pr
 It also preserves chunk commit times and deletion floors while rebinding every index and log to the new table identity.
 After later crashes or restarts, missing chunk files cannot prove that no history was lost.
 Without durable proof, an exact-cut request also resyncs.
-Existing backed-up tables need `table_lineage` enabled on the source before creating their backup.
 
 ## 3. Inspect a backup
 
@@ -89,7 +88,7 @@ DROP TABLE world_restored
 RESTORE TABLE copies one table of a completed backup under `--backup-dir` into a new table while the server keeps serving; it needs MANAGES USERS, ADMIN on `*`, or BACKUP and ADMIN on the new name, a matching prefix or `*`; the restored table falls under the grants that match its new name.
 The new table gets a new epoch with the backed-up epoch and cut as its lineage, and appears only once it is complete; a failure or crash before then leaves nothing behind.
 Server shutdown, CANCEL, KILL CONNECTION or a statement timeout cancels a running restore before it publishes the table; a client disconnect does not, and the server log reports each tenth of the copied bytes.
-The backed-up table must have `table_lineage`, the table features this directory gives its tables, and options the server's option flags allow.
+The backed-up table must have the table features this directory gives its tables, and options the server's option flags allow.
 SWAP TABLES then exchanges the names atomically, and DROP TABLE removes the replaced data now under the other name.
 A consumer of `world` then sees the restored epoch and resumes by its [lineage](CHANGE_FEED.md) or receives resync.
 See [Tables](reference/TABLES.md) for SWAP TABLES.

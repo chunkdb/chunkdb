@@ -33,7 +33,6 @@ An older binary is not required to open data that uses a newer feature it does n
 
 Upgrade the binary before enabling such a feature.
 Use `ENABLE FEATURE '<name>'` with ADMIN on `*`; activation never clears existing bits.
-Existing directories require `feature_activation` before enabling another missing feature.
 A durable activation decision finishes during writer startup; read-only opening refuses a pending decision.
 An uncertain activation publication returns OUTCOME_UNKNOWN and fences serving until recovery.
 `SHOW STATUS` reports recorded directory and table masks, known enabled names, and protected activation state.
@@ -50,7 +49,7 @@ Later 2.x servers still open valid 2.0 data.
 
 A reader or writer must support every recorded incompatibility bit, even when its owned records are absent.
 To use a binary lacking a feature, restore the whole consistent backup identified above.
-Use a restore tool that supports that backup's recorded features; current restore requires `table_lineage` in its source tables.
+Use a restore tool that supports that backup's recorded features.
 Dropping records or manually clearing masks does not establish a supported rollback.
 New directories already enable these initial features; an older binary must support their masks to open them.
 
@@ -59,23 +58,18 @@ A parent position continues only when its required prefix survives or a proven e
 Backups contain state at their cuts, without archived catch-up history.
 After later crashes or restarts, absent chunks cannot prove no history was lost; requests without durable proof receive lineage-bearing resync.
 
-
 Table geometry is immutable and validated against its manifest.
 Keep manifests, revision clocks, initialized markers and all other required artifacts together in a consistent backup.
-2.0 accepts only its documented directory and file layouts.
-It does not import superseded development layouts.
-Development formats are not migrated, including users files before version 2; version 2 users files are read.
-Development directories using earlier manifest, image, WAL, slot, or index envelopes must be recreated; opening refuses them before changing artifacts.
-Slot records use format 4, which holds the table dimensionality, persisted filters and slot owners; formats 1 to 3 are earlier development layouts.
+2.0 accepts only its documented directory and file layouts and never converts another layout in place.
 
-An unsupported layout is refused, rather than converted in place.
+## Data and clients of 1.x
+
+chunkdb 2.0 does not open data directories or backups written by 1.x or by development builds of 2.0, and has no conversion tool.
+Opening refuses them before it changes any file; to keep the data, read it from a 1.x server and write it to a 2.0 server with a client.
+A 1.x client does not send `HELLO 3`, so its first statement receives PROTOCOL and the connection closes.
+Users files of version 2 are read and rewritten as version 3 on the next user change; earlier users files are refused.
 
 ## Boundaries
-
-The C++ `ChunkVars::Encode()` accessor returns `const ChunkVars::EncodedStorage&`, an allocator-aware vector reference.
-Code using `auto` retains owning-copy, capacity and equality behavior.
-Code requiring `std::vector<std::uint8_t>` explicitly must use the alias, `EncodedBytes()` for a byte view, or an iterator-range copy.
-This representation change permits transaction storage allocations to be admitted before allocation; it does not change encoded bytes, protocol or storage formats.
 
 The durability modes and `FLUSH WAL` preserve their documented guarantees throughout 2.x.
 
