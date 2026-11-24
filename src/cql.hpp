@@ -287,7 +287,8 @@ struct Watch {
     bool no_before = false;
     bool chunks = false;
     std::optional<std::string> slot{};
-    std::optional<FeedArea> area{};
+    // Empty for the whole table; AREA ..., AREA ... gives several.
+    std::vector<FeedArea> areas{};
     std::optional<FeedPosition> after{};
     std::optional<std::uint64_t> ack_timeout_ms{};
     bool takeover = false;

@@ -87,7 +87,7 @@ OK
 CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [OWNER user]
 DROP SLOT [IF EXISTS] 'name' ON table
 SHOW SLOTS [ON table]
-WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [AFTER epoch revision] [ACK TIMEOUT ms] [TAKEOVER]
+WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1 [, AREA cx0 cy0 TO cx1 cy1 ...]] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [AFTER epoch revision] [ACK TIMEOUT ms] [TAKEOVER]
 ACK revision
 UNWATCH
 ```
@@ -96,6 +96,7 @@ UNWATCH
 
 - `name`: quoted `[a-z_][a-z0-9_]*`, 1 through 63 bytes.
 - `AREA`: inclusive chunk-coordinate rectangle or cuboid with exactly the table's active axes; transactions are clipped to it.
+- `AREA ..., AREA ...`: WATCH without SLOT takes up to 64 areas with the same axes and keeps a chunk inside any of them; a slot keeps one AREA, and WATCH SLOT accepts several only when each repeats it.
 - `COLUMNS`: project block values in declared order; column IDs preserve the projection across renames, and chunk metadata remains complete.
 - `NO BEFORE`: omit previous block and chunk-metadata rows from mutation events.
 - `CHUNKS`: receive each relevant committed chunk's version and whole form instead of block changes.
@@ -151,6 +152,7 @@ Change events contain complete before and after metadata rows when chunk columns
 A null metadata before row means the chunk had never been written.
 Metadata-only changes remain visible under block-column projections.
 Watches have no idle timeout.
+Watches without SLOT that have the same AREA set in any order, COLUMNS, NO BEFORE and CHUNKS share each projected event and its encoding. Shared events that a member has not read yet take at most `feed_buffer_bytes` per table in addition to the live feed history, divided equally among the sets.
 After ordinary UNWATCH, the subscription is removed and its configured history linger begins before success returns.
 
 Slot delivery stops at the durable frontier, including in relaxed mode.
