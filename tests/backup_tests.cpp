@@ -1241,7 +1241,10 @@ void WaitingBackupDefersCheckpoints() {
     store.CheckpointForTests(0, 0);
     assert(std::filesystem::exists(ChunkDataPath(store.data_dir(), store.geometry(), {0, 0})));
 }
-void DroppedSnapshotTableSkipped() {
+// A DROP TABLE issued while a backup lists and pins its tables waits for the
+// backup's metadata capture: the backup holds the table, and the drop then
+// removes it.
+void DropWaitsForSnapshotPins() {
     ScopedTempDir temp("chunkdb-backup-dropped-table");
     const auto root = std::filesystem::canonical(temp.path());
     const auto config = Config(root / "source"); TableCatalog catalog(config);
@@ -1249,14 +1252,17 @@ void DroppedSnapshotTableSkipped() {
     (void)catalog.Create("a", txn_test::Config({}).geometry, config.default_options);
     Pause pause(BackupTestHook::Point::kBeforeTablePin); catalog.SetBackupHookForTests(&pause);
     auto backup = std::async(std::launch::async, [&] { return catalog.BackupTo(root / "backup", {}); });
-    pause.Wait(); catalog.Drop("a"); pause.Release();
+    pause.Wait();
+    auto drop = std::async(std::launch::async, [&] { catalog.Drop("a"); });
+    pause.Release();
     const auto result = backup.get(); catalog.SetBackupHookForTests(nullptr);
+    drop.get();
+    assert(!catalog.Find("a"));
     const auto record = ReadBackupRecord(root / "backup"); ValidateBackupInventory(root / "backup", record);
-    assert(result.tables.size() == 1U && record.tables.size() == 1U);
-    assert(result.tables[0].name == "default" && record.tables[0].name == "default");
-    assert(!std::filesystem::exists(root / "backup/tables/a"));
+    assert(result.tables.size() == 2U && record.tables.size() == 2U);
+    assert(std::filesystem::exists(root / "backup/tables/a"));
     RestoreBackup(root / "backup", root / "restored");
-    TableCatalog restored(Config(root / "restored")); assert(!restored.Find("a") && restored.Find("default"));
+    TableCatalog restored(Config(root / "restored")); assert(restored.Find("a") && restored.Find("default"));
 }
 void CancelCatalogWaitAndRestrictions() {
     ScopedTempDir temp("chunkdb-backup-waits");
@@ -1352,10 +1358,10 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--cancel-wal-replay") { CancelBetweenBoundedWalReplayReads(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--batched-eviction") { BatchedEvictionDuringPin(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--waiting-maintenance") { WaitingBackupDefersCheckpoints(); return 0; }
-    if (argc == 2 && std::string_view(argv[1]) == "--dropped-table") { DroppedSnapshotTableSkipped(); return 0; }
+    if (argc == 2 && std::string_view(argv[1]) == "--dropped-table") { DropWaitsForSnapshotPins(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--cold-registry") { ColdPinAndStagingAlias(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--review-pin-regressions") {
-        BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); DroppedSnapshotTableSkipped(); ColdPinAndStagingAlias(); return 0;
+        BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); DropWaitsForSnapshotPins(); ColdPinAndStagingAlias(); return 0;
     }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-collision-regression") { StagingCollisionRetainsExistingEntry(); return 0; }
     if (argc == 2 && std::string_view(argv[1]) == "--staging-owner-regression") { StagingOwnerValidation(); return 0; }
@@ -1372,7 +1378,7 @@ int main(int argc, char** argv) {
         ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); StagingOwnerValidation(); return 0;
     }
     PlainWriterBounds(true); PlainWriterBounds(false); EndedFeedDoesNotClearNewProducers();
-    BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); BackupWaitsForBackgroundCheckpointFiles(); DroppedSnapshotTableSkipped();
+    BatchedEvictionDuringPin(); WaitingBackupDefersCheckpoints(); BackupWaitsForBackgroundCheckpointFiles(); DropWaitsForSnapshotPins();
     PerTableDdlProgress(); ColdPinAndStagingAlias(); ColdTailRepairPreservesPinnedInode();
     ConditionalRollbackPreservesPinnedPrefix(); CleanupWarningAndAliasRestart(); OrphanedStagingCleanup(); StagingOwnerValidation(); StagingCleanupAliasReplacement(); StagingCleanupRootReplacement();
     CrcChunks();

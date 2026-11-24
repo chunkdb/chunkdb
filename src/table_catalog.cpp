@@ -721,8 +721,15 @@ std::vector<FeedSlot> Table::ListFeedSlots(const Lease& lease, bool include_lost
     const auto& columns = lease.store().geometry().layout().schema().columns;
     for (auto& slot : slots) {
         // ClaimFeedSlot refuses a second watch by the same rule.
-        if (const auto claimed = slot_claims_.find(slot.name); claimed != slot_claims_.end())
-            if (const auto claim = claimed->second.lock()) slot.attached = claim->valid.load(std::memory_order_acquire);
+        if (const auto claimed = slot_claims_.find(slot.name); claimed != slot_claims_.end()) {
+            if (const auto claim = claimed->second.lock(); claim && claim->valid.load(std::memory_order_acquire)) {
+                slot.attached = true;
+                slot.watch_user = claim->user;
+                slot.peer = claim->peer;
+                if (const auto ack = claim->last_ack.load(std::memory_order_acquire); ack != FeedSlotClaim::kNoAck)
+                    slot.last_ack = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(ack));
+            }
+        }
         if (!slot.filters.column_ids) continue;
         for (const auto id : *slot.filters.column_ids) {
             const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
@@ -738,6 +745,14 @@ Table::FeedCounts Table::CountFeeds(const Lease& lease) const {
     // for leases.
     return FeedCounts{.slots = lease.store().feed_slots_->size(), .watches = feed_subscriptions_,
         .feed_bytes = feed_ ? feed_->bytes_.load(std::memory_order_relaxed) : 0U};
+}
+
+bool Table::SlotFrontierFrozen(const Lease& lease) const {
+    if (lease.table_ != this) throw std::logic_error("slot frontier state needs a lease of its table");
+    // FeedSlots::SyncImpl refuses a fail-closed store, and the slot worker stops.
+    const auto& store = lease.store();
+    return store.feed_slots_active_.load(std::memory_order_acquire) &&
+           store.durability_poisoned_.load(std::memory_order_acquire);
 }
 
 std::vector<std::uint32_t> Table::ResolveFeedColumns(const std::vector<std::string>& names) {
@@ -757,7 +772,7 @@ std::vector<std::uint32_t> Table::ResolveFeedColumns(const std::vector<std::stri
 
 std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::string_view name,
     const FeedOptions& options, bool takeover, std::string user,
-    const std::function<void(std::string_view)>& authorize_owner) {
+    const std::function<void(std::string_view)>& authorize_owner, std::string peer) {
     std::shared_ptr<FeedSlotClaim> old;
     std::shared_ptr<SlotWatch> owner;
     const auto validate = [&](ChunkStore& store) {
@@ -784,7 +799,7 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
         if (old && old->takeover_pending.load(std::memory_order_acquire))
             throw FeedSlotBusyError("feed slot ownership handoff is pending", "takeover_pending");
         if (!old || !old->valid.load(std::memory_order_acquire)) {
-            auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_, std::move(user));
+            auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_, std::move(user), std::move(peer));
             existing = claim;
             return {std::move(slot), std::move(claim)};
         }
@@ -824,7 +839,7 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
     if (!old->valid.load(std::memory_order_acquire) || found == slot_claims_.end() || found->second.lock() != old)
         throw FeedSlotLostError("feed slot was removed during takeover");
     auto slot = validate(*store);
-    auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_, std::move(user));
+    auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_, std::move(user), std::move(peer));
     old->valid.store(false, std::memory_order_release);
     found->second = claim;
     return {std::move(slot), std::move(claim)};
@@ -1335,7 +1350,10 @@ void TableCatalog::RemoveInterruptedOperations(std::string_view table) {
         const std::filesystem::directory_iterator end;
         std::vector<std::filesystem::path> leftovers;
         for (; !ec && it != end; it.increment(ec)) {
-            if (it->path().filename().string().starts_with(prefix)) leftovers.push_back(it->path());
+            const auto name = it->path().filename().string();
+            // A RESTORE TABLE still copying into this name keeps its staging.
+            if (dir == StagingDir() && restore_staging_.contains(name)) continue;
+            if (name.starts_with(prefix)) leftovers.push_back(it->path());
         }
         if (ec) {
             throw std::runtime_error("cannot list " + dir.string() + ": " + ec.message());
@@ -1369,6 +1387,10 @@ struct TableCatalog::FoundTable {
     std::filesystem::path dir;
     StoreManifest manifest;
     TableOptions options;
+    // A narrowing or ADD CHECK a crash interrupted, dropped from `manifest`
+    // and published by PublishDroppedPending.
+    bool dropped_pending = false;
+    bool dropped_check = false;
 };
 
 void TableCatalog::OpenExistingTables() {
@@ -1408,33 +1430,43 @@ void TableCatalog::OpenExistingTables() {
     }
     if (!mismatches.empty()) throw std::runtime_error(OptionMismatchMessage(mismatches));
 
+    for (const auto& table : tables) PublishDroppedPending(table);
     for (auto& table : tables) tables_.emplace(table.name, OpenFoundTable(table));
 }
 
 TableCatalog::FoundTable TableCatalog::ReadTableToOpen(const std::string& name, const std::filesystem::path& dir) {
     auto manifest = ReadOpenableManifest(dir);
     const TableOptions options = DecodeTableOptions(manifest.options);
+    bool dropped_pending = false;
+    bool dropped_check = false;
     if (manifest.schema.pending.has_value() && config_.access_mode == AccessMode::kReadWrite) {
         // A narrowing or ADD CHECK a crash interrupted: the schema stays as
         // it was.
-        const bool check = manifest.schema.pending->check.has_value();
+        dropped_pending = true;
+        dropped_check = manifest.schema.pending->check.has_value();
         manifest.schema = WithoutPendingNarrowing(manifest.schema);
-        AtomicWrite(
-            StoreManifestPath(dir), SerializeStoreManifest(manifest), /*fsync_file=*/true,
-            /*fsync_directory=*/true, nullptr, nullptr, /*enable_generic_failpoints=*/false);
-        LogMessage(
-            LogLevel::kWarn,
-            LogComponent::kStore,
-            check ? "dropped an ADD CHECK that did not finish; the table keeps its checks"
-                  : "dropped a column narrowing that did not finish; the table keeps its columns",
-            {{"table", name}});
     }
     return FoundTable{
         .name = name,
         .dir = dir,
         .manifest = std::move(manifest),
         .options = options,
+        .dropped_pending = dropped_pending,
+        .dropped_check = dropped_check,
     };
+}
+
+void TableCatalog::PublishDroppedPending(const FoundTable& table) {
+    if (!table.dropped_pending) return;
+    AtomicWrite(
+        StoreManifestPath(table.dir), SerializeStoreManifest(table.manifest), /*fsync_file=*/true,
+        /*fsync_directory=*/true, nullptr, nullptr, /*enable_generic_failpoints=*/false);
+    LogMessage(
+        LogLevel::kWarn,
+        LogComponent::kStore,
+        table.dropped_check ? "dropped an ADD CHECK that did not finish; the table keeps its checks"
+                            : "dropped a column narrowing that did not finish; the table keeps its columns",
+        {{"table", table.name}});
 }
 
 std::shared_ptr<Table> TableCatalog::OpenFoundTable(FoundTable& table) {
@@ -1706,6 +1738,7 @@ void TableCatalog::RecoverTable(std::string_view name, std::stop_token cancelled
         if (IsDirectory(dir)) {
             auto found = ReadTableToOpen(table_name, dir);
             RequireRecoverableOptions(table_name, found.manifest);
+            PublishDroppedPending(found);
             recovered = OpenFoundTable(found);
         }
     } catch (const std::exception& error) {
@@ -1983,6 +2016,11 @@ void TableCatalog::Drop(std::string_view name, bool if_exists) {
 void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exists) {
     RequireWritable("DROP TABLE");
     auto metadata = LockFeatureMetadataShared();
+    // As RENAME TO: backup metadata capture and pinning exclude a drop, so a
+    // backup holds the table with its grants, or neither.
+    if (!backup_metadata_gate_.lock_shared(StatementStopToken())) CheckStatementCancellation();
+    std::shared_lock backup_metadata(backup_metadata_gate_, std::adopt_lock);
+    CheckStatementCancellation();
     auto table = Find(name);
     if (!table && if_exists) {
         RequireValidTableName(name);

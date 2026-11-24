@@ -121,7 +121,7 @@ SHOW TABLE STATS table
 - SCAN CHUNKS: `chunks`, `more`, `epoch`, `position`, and `retained_deletion_floor`; with WHERE, `after` follows `more`.
 - Each scan row contains the active chunk coordinates and producing version, followed by a form or null when WITH DATA is present.
 - Scan rows ascend by cx, then cy, then cz, within a page and across pages continued AFTER.
-- Continue AFTER the last returned coordinate while `more` is true; with WHERE, continue AFTER the returned `after`, since a page may return no rows; read-only `position` is null.
+- Continue AFTER the last returned coordinate while `more` is true; with WHERE, continue AFTER the returned `after`, since a page may return no rows; on a server started with `--read-only`, `position` is null.
 - Pass the first page's `epoch` and `position` to WATCH AFTER to follow later changes; see [Resume a consumer](../FEED_RESUME.md).
 - COMPACT TOMBSTONES: the retained-deletion floor after completion.
 - SHOW TABLE STATS: `epoch`, nullable completed `revision`, `dims`, `chunks`, retained `tombstones`, `retained_deletion_floor`, `loaded_chunks`, `cache_bytes`, `history_bytes`, `open_transactions`, `files`, `disk_bytes`, `image_bytes`, `wal_bytes`, `archive_bytes`, `index_bytes`, `slots`, `watches`, and `feed_bytes`.
@@ -161,7 +161,7 @@ Use [Transactions](../TRANSACTIONS.md) when you need a consistent view of one ta
 
 ## Table stats
 
-SHOW TABLE STATS needs READ on the table.
+SHOW TABLE STATS needs READ on the table, or MONITOR.
 `chunks` counts populated chunks, the ones SCAN CHUNKS lists; `loaded_chunks` counts the table's chunks held in the chunk cache.
 `cache_bytes` is the memory of those chunks: each one's payload, presence, text and bytes values, chunk columns and unflushed WAL batch, and its bookkeeping.
 `history_bytes` counts the chunk states kept for open transactions; `open_transactions` counts the open transactions that have used the table; one that a limit ended no longer counts.

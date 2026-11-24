@@ -18,6 +18,9 @@ namespace chunkdb {
 
 inline constexpr const char* kUsersFileName = "chunkdb.users";
 inline constexpr std::uint64_t kMaxUserStatementsPerSecond = 65536U;
+// The writer refuses a larger users file and the reader refuses one before
+// reading it.
+inline constexpr std::uint64_t kMaxUsersFileBytes = std::uint64_t{64} << 20U;
 
 class UsersOutcomeUnknownError : public std::runtime_error {
   public:
