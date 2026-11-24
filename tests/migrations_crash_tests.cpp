@@ -66,7 +66,7 @@ int CrashChild(const std::filesystem::path& root, const Operation& operation, co
         assert(reply.find(" stage=migration_completion ") != std::string::npos);
         assert(reply.find(" reason=outcome_unknown ") != std::string::npos);
         assert(ReadMigrationJournal(root));
-        std::_Exit(86);
+        ExitAbruptly(86);
     }
     return 3;  // Every named point must have actually terminated the process.
 }

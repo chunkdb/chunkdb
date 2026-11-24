@@ -5,6 +5,7 @@
 #include <sys/wait.h>
 #endif
 #include "backup_restore_test_utils.hpp"
+#include "chunk_store_internal.hpp"
 #include "txn_test_utils.hpp"
 
 namespace {
@@ -209,7 +210,7 @@ int main(int argc, char** argv) {
         lease->store().FlushSnapshotGenerationLingerForTests();
         assert(!std::filesystem::exists(ChunkDataPath(lease->store().data_dir(), lease->store().geometry(), {0, 0})));
         assert(!std::filesystem::exists(ChunkWalPath(lease->store().data_dir(), lease->store().geometry(), {0, 0})));
-        std::_Exit(86);
+        ExitAbruptly(86);
     }
     if (argc == 5 && std::string_view(argv[1]) == "--restore-child") {
         txn_test::ScopedEnv point(argv[4], "1"); RestoreBackup(argv[2], argv[3]); return 3;

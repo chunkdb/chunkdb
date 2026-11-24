@@ -9,11 +9,14 @@
 #include <chrono>
 #include <clocale>
 #include <filesystem>
+#include <cstdlib>
 #include <limits>
+#include <map>
 #include <memory>
 #include <optional>
 #include <set>
 #include <string>
+#include <string_view>
 #include <thread>
 #include <utility>
 #include <vector>
@@ -1147,9 +1150,8 @@ void TestMetricsRegistry() {
     // Concurrent observation and rendering must not crash or lose counts.
     std::atomic<bool> stop{false};
     std::thread renderer([&]() {
-        chunkdb::StoreRuntimeStats stats{};
         while (!stop.load()) {
-            (void)registry.RenderPrometheus(stats, 0);
+            (void)registry.RenderPrometheus({}, 0);
         }
     });
     std::vector<std::thread> writers;
@@ -1169,8 +1171,7 @@ void TestMetricsRegistry() {
     stop.store(true);
     renderer.join();
 
-    chunkdb::StoreRuntimeStats stats{};
-    const auto text = registry.RenderPrometheus(stats, 3);
+    const auto text = registry.RenderPrometheus({}, 3);
     const std::string expected_count =
         "chunkdb_commands_total{class=\"point_write\",outcome=\"ok\"} " +
         std::to_string(kThreads * kPerThread);
@@ -1178,6 +1179,121 @@ void TestMetricsRegistry() {
     assert(text.find("chunkdb_command_duration_seconds_bucket") != std::string::npos);
     assert(text.find("chunkdb_loaded_chunks 3") != std::string::npos);
     assert(text.find("# TYPE chunkdb_command_duration_seconds histogram") != std::string::npos);
+}
+
+// Checks `text` against the Prometheus text exposition format 0.0.4: each
+// family has one TYPE before its samples, names and label names are valid,
+// label values use only the \\, \" and \n escapes, every value is a number,
+// and no series repeats.
+void AssertPrometheusText(const std::string& text) {
+    const auto name_char = [](char c, bool first) {
+        return (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') || c == '_' || c == ':' || (!first && c >= '0' && c <= '9');
+    };
+    const auto valid_name = [&](std::string_view name) {
+        if (name.empty() || !name_char(name[0], true)) return false;
+        return std::all_of(name.begin() + 1, name.end(), [&](char c) { return name_char(c, false); });
+    };
+    std::map<std::string, std::string> types;
+    std::set<std::string> series;
+    std::string current_family;
+    assert(!text.empty() && text.back() == '\n');
+    std::size_t begin = 0;
+    while (begin < text.size()) {
+        const auto end = text.find('\n', begin);
+        const std::string_view line(text.data() + begin, end - begin);
+        begin = end + 1U;
+        assert(!line.empty());
+        if (line.rfind("# HELP ", 0) == 0) continue;
+        if (line.rfind("# TYPE ", 0) == 0) {
+            const auto rest = line.substr(7);
+            const auto space = rest.find(' ');
+            const std::string name(rest.substr(0, space));
+            const auto type = rest.substr(space + 1U);
+            assert(valid_name(name) && (type == "counter" || type == "gauge" || type == "histogram"));
+            assert(types.emplace(name, std::string(type)).second);
+            current_family = name;
+            continue;
+        }
+        assert(line[0] != '#');
+        std::size_t at = 0;
+        while (at < line.size() && line[at] != '{' && line[at] != ' ') ++at;
+        const std::string name(line.substr(0, at));
+        assert(valid_name(name));
+        std::string family = name;
+        for (const char* suffix : {"_bucket", "_sum", "_count"}) {
+            const std::string_view s(suffix);
+            if (!types.contains(family) && family.size() > s.size() && family.ends_with(s)) {
+                family.resize(family.size() - s.size());
+            }
+        }
+        // A sample follows the TYPE of its own family.
+        assert(types.contains(family) && family == current_family);
+        if (line[at] == '{') {
+            ++at;
+            for (;;) {
+                const auto label_start = at;
+                while (at < line.size() && line[at] != '=') ++at;
+                assert(at + 1U < line.size() && line[at + 1U] == '"');
+                assert(valid_name(line.substr(label_start, at - label_start)) && line[label_start] != ':');
+                at += 2U;
+                while (line.at(at) != '"') {
+                    if (line[at] == '\\') {
+                        const char escaped = line.at(at + 1U);
+                        assert(escaped == '\\' || escaped == '"' || escaped == 'n');
+                        ++at;
+                    }
+                    ++at;
+                }
+                ++at;
+                if (line.at(at) == '}') break;
+                assert(line[at] == ',');
+                ++at;
+            }
+            ++at;
+        }
+        assert(series.insert(std::string(line.substr(0, at))).second);
+        assert(at < line.size() && line[at] == ' ');
+        const std::string value(line.substr(at + 1U));
+        assert(!value.empty());
+        if (value != "+Inf" && value != "-Inf" && value != "NaN") {
+            char* parsed_end = nullptr;
+            (void)std::strtod(value.c_str(), &parsed_end);
+            assert(parsed_end == value.c_str() + value.size());
+        }
+    }
+}
+
+// Store counters come once per table, labelled with its escaped name.
+void TestMetricsTableLabels() {
+    assert(chunkdb::MetricsRegistry::EscapeLabelValue("plain_name-1") == "plain_name-1");
+    assert(chunkdb::MetricsRegistry::EscapeLabelValue("a\\b\"c\nd") == "a\\\\b\\\"c\\nd");
+
+    chunkdb::MetricsRegistry registry;
+    registry.ObserveCommand(chunkdb::MetricsRegistry::CommandClass::kPointRead, 0.002, true);
+    std::vector<chunkdb::TableRuntimeStats> tables(2);
+    tables[0].table = "terrain";
+    tables[0].stats.checkpoints = 7;
+    tables[0].stats.open_wal_streams = 2;
+    tables[1].table = "odd\"name\\x\n";
+    tables[1].stats.checkpoints = 9;
+    const auto text = registry.RenderPrometheus(tables, 0);
+    assert(text.find("chunkdb_checkpoints_total{table=\"terrain\"} 7\n") != std::string::npos);
+    assert(text.find("chunkdb_checkpoints_total{table=\"odd\\\"name\\\\x\\n\"} 9\n") != std::string::npos);
+    assert(text.find("chunkdb_open_wal_streams{table=\"terrain\"} 2\n") != std::string::npos);
+    assert(text.find("# TYPE chunkdb_open_wal_streams gauge\n") != std::string::npos);
+    // One HELP and TYPE per family, before its samples; shared counters carry no label.
+    const auto type = text.find("# TYPE chunkdb_checkpoints_total counter\n");
+    assert(type != std::string::npos && type == text.rfind("# TYPE chunkdb_checkpoints_total counter\n"));
+    assert(type < text.find("chunkdb_checkpoints_total{"));
+    assert(text.find("chunkdb_loaded_chunks 0\n") != std::string::npos);
+    assert(text.find("\nchunkdb_checkpoints_total ") == std::string::npos);
+    AssertPrometheusText(text);
+
+    // Without tables a store family has no samples.
+    const auto empty = registry.RenderPrometheus({}, 0);
+    assert(empty.find("# TYPE chunkdb_checkpoints_total counter\n") != std::string::npos);
+    assert(empty.find("chunkdb_checkpoints_total{") == std::string::npos);
+    AssertPrometheusText(empty);
 }
 
 // Bucket bounds and sums use '.' whatever the process locale.
@@ -1191,7 +1307,7 @@ void TestMetricsNumberFormat() {
     chunkdb::MetricsRegistry registry;
     registry.ObserveCommand(chunkdb::MetricsRegistry::CommandClass::kPointRead, 1.5, true);
     registry.ObserveCommand(chunkdb::MetricsRegistry::CommandClass::kPointRead, 0.000125, true);
-    const auto text = registry.RenderPrometheus(chunkdb::StoreRuntimeStats{}, 0);
+    const auto text = registry.RenderPrometheus({}, 0);
     std::setlocale(LC_NUMERIC, saved.c_str());
     assert(text.find("chunkdb_command_duration_seconds_bucket{class=\"point_read\",le=\"0.0001\"} 0") != std::string::npos);
     assert(text.find("chunkdb_command_duration_seconds_bucket{class=\"point_read\",le=\"0.00025\"} 1") != std::string::npos);
@@ -1471,8 +1587,9 @@ void TestEngineCommands() {
 
     const auto metrics = BulkBody(engine.Execute(session, "SHOW METRICS\n"));
     assert(metrics.find("chunkdb_commands_total") != std::string::npos);
-    assert(metrics.find("chunkdb_wal_barriers_total 1") != std::string::npos);
+    assert(metrics.find("chunkdb_wal_barriers_total{table=\"default\"} 1") != std::string::npos);
     assert(metrics.find("chunkdb_empty_chunk_gcs_total") != std::string::npos);
+    AssertPrometheusText(metrics);
 }
 
 }  // namespace
@@ -1502,6 +1619,7 @@ int main() {
     TestZrleCodec();
     TestCheckpointCompression();
     TestMetricsRegistry();
+    TestMetricsTableLabels();
     TestMetricsNumberFormat();
     TestEngineCommands();
     TestEngineAreaReadsMatchChunkGet();

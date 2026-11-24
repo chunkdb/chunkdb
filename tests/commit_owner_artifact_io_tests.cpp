@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "checkpoint.hpp"
+#include "chunk_store_internal.hpp"
 #include "commit_owner_artifact_identity.hpp"
 #include "commit_owner_artifact_io.hpp"
 #include "directory_alias_test_utils.hpp"
@@ -833,19 +834,19 @@ void Crash(unsigned point, const std::filesystem::path& root) {
         if ((point == 0U && path == root) ||
             (path == root / kObjects && ++object_directories == (point == 2U ? 1U : 2U) && (point == 2U || point == 4U)) ||
             ((point == 7U || point == 8U) && path == root) || (point == 11U && path == root / kJournals))
-            std::_Exit(86);
+            ExitAbruptly(86);
     });
     SetFileSyncObserverForTests([&](const auto& path) {
         const auto name = path.filename().string();
         if ((point == 1U && name.starts_with(".owner-marker-")) || (point == 3U && name.starts_with(".owner-stage-")) ||
             (point == 5U && name.starts_with(".owner-root-")) || (point == 6U && path == root / kRoot) ||
             (point == 9U && name.starts_with(".journal-stage-")) || (point == 10U && path == JournalLeaf(root)))
-            std::_Exit(86);
+            ExitAbruptly(86);
     });
     if (point <= 4U) (void)writer.StagePage(Page());
     else if (point <= 7U) (void)writer.InstallCanonicalInactive();
     else (void)writer.CreateJournal(kJournal);
-    std::_Exit(87);
+    ExitAbruptly(87);
 }
 void CrashBoundaries(const std::filesystem::path& executable) {
     for (unsigned point = 0U; point <= 11U; ++point) {

@@ -589,6 +589,10 @@ void SeveralAreasShareOneProjection() {
     SessionState watching;
     (void)engine.Execute(watching, "HELLO 3\r\n");
     assert(engine.Execute(watching, "WATCH t AREA 2 2 TO 2 2, AREA 0 0 TO 0 0\r\n")[0] == '%');
+    // A second WATCH leaves the open one in place.
+    const auto* open = watching.watch.get();
+    assert(engine.Execute(watching, "WATCH t\r\n").starts_with("-ERR INVALID_ARGUMENT"));
+    assert(watching.watch.get() == open);
     run("BEGIN");
     run("SET BLOCK 0 0 IN t n = 1, m = 4");
     run("SET BLOCK 2 2 IN t n = 2, m = 5");

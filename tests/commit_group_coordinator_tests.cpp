@@ -13,6 +13,7 @@
 #include <vector>
 
 #include "checkpoint.hpp"
+#include "chunk_store_internal.hpp"
 #include "commit_group_coordinator.hpp"
 #include "process_lock.hpp"
 #include "test_utils.hpp"
@@ -296,13 +297,13 @@ std::vector<Path> JournalLeaves(const Path& root) {
     const auto& point = CrashPoints().at(index);
     unsigned seen = 0U;
     const auto observe = [&](bool directory, const Path& path) {
-        if (directory == point.directory && point.match(root, path) && ++seen == point.ordinal) std::_Exit(86);
+        if (directory == point.directory && point.match(root, path) && ++seen == point.ordinal) ExitAbruptly(86);
     };
     SetFileSyncObserverForTests([&](const auto& path) { observe(false, path); });
     SetDirectorySyncObserverForTests([&](const auto& path) { observe(true, path); });
     (void)writer.InstallInactiveOwner();
     (void)writer.StageActivation();
-    std::_Exit(87);
+    ExitAbruptly(87);
 }
 #ifdef _WIN32
 std::wstring Quote(const std::wstring& input) {

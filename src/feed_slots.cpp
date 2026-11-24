@@ -104,7 +104,7 @@ struct ReaderPin {
     std::shared_ptr<std::atomic<std::size_t>> counter;
 };
 void CrashPoint(const char* name) {
-    if (ConsumeFailpointEnv(name)) std::_Exit(86);
+    if (ConsumeFailpointEnv(name)) ExitAbruptly(86);
 }
 }  // namespace
 
