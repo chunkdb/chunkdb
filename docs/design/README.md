@@ -13,5 +13,6 @@
 - [Tables](TABLES_DESIGN.md): catalog leases and directory publication.
 - [Transactions](TRANSACTIONS_DESIGN.md): snapshot history and durable decisions.
 - [Users](USERS_DESIGN.md): SCRAM, rights and metadata recovery.
+- [WAL archive](WAL_ARCHIVE.md): sealed segments, seal records, retention, point-in-time restore and BACKUP STREAM.
 
 - [Persistence design](PERSISTENCE.md) records checkpoint, rollback, publication, and platform sync details.
