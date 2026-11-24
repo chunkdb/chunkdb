@@ -3085,6 +3085,20 @@ std::string CommandEngine::BlockWriteWithExpressions(
         std::sort(distinct.begin(), distinct.end());
         returned_once = std::adjacent_find(distinct.begin(), distinct.end()) == distinct.end();
         plan.block_slots.insert(plan.block_slots.end(), returned.begin(), returned.end());
+        // NEW of a DEFAULT COMMIT_TIME column is the commit time when another
+        // value changes: the given columns are read too, to compare.
+        if (set != nullptr && returning->new_values &&
+            std::any_of(returned.begin(), returned.end(),
+                [&](std::size_t index) { return layout.schema().columns[index].default_commit_time; })) {
+            if (session.transaction != nullptr)
+                throw std::invalid_argument("RETURNING NEW of a DEFAULT COMMIT_TIME column is not used in a "
+                                            "transaction: its commit time is known only at COMMIT");
+            if (plan.assignments) {
+                for (const auto& target : plan.assignments->targets()) plan.block_slots.push_back(target.slot);
+            } else {
+                for (const auto& assignment : set->values) plan.block_slots.push_back(RequireColumn(layout, assignment.column));
+            }
+        }
         std::sort(plan.block_slots.begin(), plan.block_slots.end());
         plan.block_slots.erase(std::unique(plan.block_slots.begin(), plan.block_slots.end()), plan.block_slots.end());
         plan.reads_chunk = true;
@@ -3148,7 +3162,7 @@ std::string CommandEngine::BlockWriteWithExpressions(
         if (returning->new_values) {
             // The NEW values are this row's own: moved unless a column is
             // named twice.
-            auto after = store.BlockAfterSet(block.values, out, returned);
+            auto after = store.BlockAfterSet(block.values, out, returned, block.commit_time_ms);
             for (const std::size_t index : returned)
                 row.push_back(returned_once ? std::move(after[index]) : after[index]);
         } else {

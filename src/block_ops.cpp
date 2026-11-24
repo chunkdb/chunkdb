@@ -21,6 +21,7 @@
 #include <fstream>
 #include <functional>
 #include <limits>
+#include <optional>
 #include <random>
 #include <sstream>
 #include <type_traits>
@@ -1721,7 +1722,7 @@ std::vector<ColumnValue> ChunkStore::ChunkColumnValues(const ChunkColumnState* s
 }
 
 std::vector<ColumnValue> ChunkStore::BlockAfterSet(const std::vector<ColumnValue>* before,
-    const std::vector<ColumnAssignment>& values, std::span<const std::size_t> slots) const {
+    const std::vector<ColumnAssignment>& values, std::span<const std::size_t> slots, std::uint64_t commit_time_ms) const {
     const auto& layout = geometry_.layout();
     const auto& columns = layout.schema().columns;
     std::vector<ColumnValue> after(columns.size());
@@ -1757,6 +1758,44 @@ std::vector<ColumnValue> ChunkStore::BlockAfterSet(const std::vector<ColumnValue
         } else if (!column.nullable) {
             after[index] = DecodeVarValue(column, {});
         }
+    }
+    if (layout.commit_time_columns().empty()) [[likely]] return after;
+    // DEFAULT COMMIT_TIME columns, as the write stamps them: the commit time
+    // when the block is new or another of its stored values changes, unless
+    // the write changes the column's stored value itself.
+    const auto stored = [&](const Column& column, std::size_t index,
+                            const ColumnValue& value) -> std::optional<std::vector<std::uint8_t>> {
+        if (std::holds_alternative<std::monostate>(value)) return std::nullopt;
+        if (layout.FixedColumnAt(index) != nullptr) return EncodeColumnValue(column, value);
+        auto bytes = EncodeVarValue(column, value);
+        // An empty value of a column without NULL is stored as no entry.
+        if (bytes.empty() && !column.nullable) return std::nullopt;
+        return bytes;
+    };
+    // The value a write gives column `index`, against the block before it;
+    // an absent block's fixed values read as zero bytes.
+    const auto changes = [&](std::size_t index, const ColumnValue& value) {
+        const auto& column = columns[index];
+        if (before != nullptr) return stored(column, index, value) != stored(column, index, (*before)[index]);
+        if (column.default_commit_time) return stored(column, index, value) != stored(column, index, std::uint64_t{0});
+        return true;
+    };
+    const auto index_of = [&](const ColumnAssignment& assignment) {
+        return static_cast<std::size_t>(std::find_if(columns.begin(), columns.end(),
+            [&](const Column& column) { return column.name == assignment.column; }) - columns.begin());
+    };
+    bool other = before == nullptr;
+    for (const auto& assignment : values) {
+        const auto index = index_of(assignment);
+        if (!other && index < columns.size() && !columns[index].default_commit_time) other = changes(index, assignment.value);
+    }
+    if (!other) return after;
+    for (const std::size_t index : slots) {
+        if (!columns[index].default_commit_time) continue;
+        const auto given = std::find_if(values.begin(), values.end(),
+            [&](const ColumnAssignment& assignment) { return assignment.column == columns[index].name; });
+        if (given != values.end() && changes(index, given->value)) continue;
+        after[index] = commit_time_ms;
     }
     return after;
 }

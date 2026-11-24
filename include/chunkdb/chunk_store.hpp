@@ -777,10 +777,13 @@ class ChunkStore {
     // The values at `slots` (schema indexes; the others are NULL) of the
     // block a SET BLOCK of `values` leaves, as a later read decodes them:
     // given columns take their values, the others keep `before` or, for an
-    // absent block (`before` null), take what a new block takes. Throws for
-    // a value the column does not hold, as the write would.
+    // absent block (`before` null), take what a new block takes. DEFAULT
+    // COMMIT_TIME columns take `commit_time_ms` as the write stamps them; in
+    // a table with one, `before` holds the values of the given columns too.
+    // Throws for a value the column does not hold, as the write would.
     [[nodiscard]] std::vector<ColumnValue> BlockAfterSet(const std::vector<ColumnValue>* before,
-        const std::vector<ColumnAssignment>& values, std::span<const std::size_t> slots) const;
+        const std::vector<ColumnAssignment>& values, std::span<const std::size_t> slots,
+        std::uint64_t commit_time_ms) const;
     [[nodiscard]] BlockReadMetadata GetBlockWithVersion3D(std::int64_t x, std::int64_t y, std::int64_t z);
     // The first stored value of column `column_id` that `type` does not
     // hold, or with `refuse_null` the first NULL, as "block (x, y) holds

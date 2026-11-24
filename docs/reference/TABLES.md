@@ -241,6 +241,7 @@ A write that gives the column a value different from the stored one keeps that v
 A write that changes no value commits nothing and leaves the time as it is; deleting a block removes it with its time.
 SET BLOCK, SET CHUNK, transactions and conditional writes all follow these rules.
 Inside a transaction, statements read the stored value, or zero for a new block, until COMMIT stamps the column.
+RETURNING NEW of the column returns the stamped time, and is refused inside a transaction.
 Checks see the stamped value: those that read the column run when a plain write or SET CHUNK is checked, and in a transaction at COMMIT rather than at the statement.
 Blocks that existed before ADD COLUMN or SET DEFAULT COMMIT_TIME hold their stored value, zero for an added column, until their next change.
 

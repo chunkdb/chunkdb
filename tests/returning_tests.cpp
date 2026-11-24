@@ -324,6 +324,56 @@ void TestTransactions() {
     ExpectReply(f.Run("GET BLOCK 8 8 FROM bank"), "_\r\n");
 }
 
+// A DEFAULT COMMIT_TIME column: NEW holds the commit time the write stamps,
+// OLD the value before it; a transaction refuses NEW of it.
+void TestCommitTime() {
+    Fixture f;
+    ExpectReply(f.Run("CREATE TABLE stamps (n u8, t text(4) NULL, at u64 DEFAULT COMMIT_TIME) CHUNK 2 x 2"), "+OK\r\n");
+    const auto at = [&f] { return Values(f.Run("GET BLOCK 0 0 FROM stamps COLUMNS at")); };
+    // The reply of an applied write of block (0, 0) returning `values`.
+    const auto expect_row = [&](const std::string& reply, std::size_t columns, const std::string& values) {
+        ExpectReply(reply, Answer(true, AnswerVersion(reply), "*1\r\n" + Row(columns, {0, 0}, values)));
+    };
+    // A new block.
+    auto reply = f.Run("SET BLOCK 0 0 IN stamps n = 1 RETURNING NEW *");
+    ExpectReply(reply, Answer(true, AnswerVersion(reply), "*1\r\n" + Row(3, {0, 0}, Values(f.Run("GET BLOCK 0 0 FROM stamps")))));
+    auto stamped = at();
+    assert(stamped != ":0\r\n");
+    // Another value changes: OLD is the stamp before, NEW the new stamp, with
+    // single values, expressions and a text value.
+    expect_row(f.Run("SET BLOCK 0 0 IN stamps n = 2 RETURNING OLD at"), 1U, stamped);
+    reply = f.Run("SET BLOCK 0 0 IN stamps n = n + 1 RETURNING NEW at");
+    expect_row(reply, 1U, at());
+    reply = f.Run("SET BLOCK 0 0 IN stamps t = 'ab' RETURNING NEW at, n");
+    expect_row(reply, 2U, at() + ":3\r\n");
+    // Nothing changes: the stamp stays.
+    stamped = at();
+    expect_row(f.Run("SET BLOCK 0 0 IN stamps n = 3, t = 'ab' RETURNING NEW at"), 1U, stamped);
+    assert(at() == stamped);
+    // A value the write gives the column itself stays; the same value as
+    // before does not count as given.
+    expect_row(f.Run("SET BLOCK 0 0 IN stamps n = 4, at = 5 RETURNING NEW at"), 1U, ":5\r\n");
+    assert(at() == ":5\r\n");
+    reply = f.Run("SET BLOCK 0 0 IN stamps n = 5, at = 5 RETURNING NEW at");
+    expect_row(reply, 1U, at());
+    assert(at() != ":5\r\n");
+    // A new block given a zero stamp takes the commit time.
+    reply = f.Run("SET BLOCK 1 1 IN stamps at = 0 RETURNING NEW at");
+    const auto new_stamp = Values(f.Run("GET BLOCK 1 1 FROM stamps COLUMNS at"));
+    assert(new_stamp != ":0\r\n");
+    ExpectReply(reply, Answer(true, AnswerVersion(reply), "*1\r\n" + Row(1, {1, 1}, new_stamp)));
+
+    // In a transaction the commit time is known only at COMMIT.
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    ExpectError(f.Run("SET BLOCK 0 0 IN stamps n = 6 RETURNING NEW at"), "INVALID_ARGUMENT COMMIT_TIME");
+    ExpectError(f.Run("SET BLOCK 0 0 IN stamps n = 6 RETURNING NEW *"), "INVALID_ARGUMENT COMMIT_TIME");
+    ExpectReply(f.Run("SET BLOCK 0 0 IN stamps n = 6 RETURNING NEW n"), Answer(true, std::nullopt, "*1\r\n" + Row(1, {0, 0}, ":6\r\n")));
+    stamped = at();
+    ExpectReply(f.Run("SET BLOCK 0 0 IN stamps n = 7 RETURNING OLD at"),
+        Answer(true, std::nullopt, "*1\r\n" + Row(1, {0, 0}, stamped)));
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+}
+
 // RETURNING needs READ and WRITE (WRITE includes READ).
 void TestRights() {
     chunkdb::test::ScopedTempDir dir{"chunkdb-returning-rights"};
@@ -479,6 +529,7 @@ int main() {
     TestDelete();
     TestBitsAndThreeDimensions();
     TestTransactions();
+    TestCommitTime();
     TestRights();
     TestResponseBound();
     TestRowsBounds();
