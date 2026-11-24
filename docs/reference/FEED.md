@@ -152,7 +152,7 @@ Change events contain complete before and after metadata rows when chunk columns
 A null metadata before row means the chunk had never been written.
 Metadata-only changes remain visible under block-column projections.
 Watches have no idle timeout.
-Watches without SLOT that have the same AREA set in any order, COLUMNS, NO BEFORE and CHUNKS share each projected event and its encoding; each such set keeps unread shared events within an equal part of `feed_buffer_bytes`.
+Watches without SLOT that have the same AREA set in any order, COLUMNS, NO BEFORE and CHUNKS share each projected event and its encoding. Shared events that a member has not read yet take at most `feed_buffer_bytes` per table in addition to the live feed history, divided equally among the sets.
 After ordinary UNWATCH, the subscription is removed and its configured history linger begins before success returns.
 
 Slot delivery stops at the durable frontier, including in relaxed mode.
