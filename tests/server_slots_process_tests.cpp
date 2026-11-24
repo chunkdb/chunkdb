@@ -29,7 +29,9 @@ class Process {
             execl(binary.c_str(), binary.c_str(), "--host", "127.0.0.1", "--port", "0",
                 "--auth", "none", "--data-dir", path.c_str(), "--log-level", "info", "--workers", "4",
                 "--durability", mode.c_str(), "--checkpoint-updates", "2", "--checkpoint-wal-bytes", "1048576",
-                "--wal-group-commit-updates", "1000", "--slot-sync-ms", "100", static_cast<char*>(nullptr));
+                "--wal-group-commit-updates", "1000", "--slot-sync-ms", "100",
+                // Every read expects a change; an idle watch would receive progress.
+                "--feed-progress-ms", "60000", static_cast<char*>(nullptr));
             _exit(127);
         }
         close(output);
@@ -121,7 +123,12 @@ void CrashResume(const std::string& binary, const std::string& mode) {
 int main(int argc, char** argv) {
 #ifndef _WIN32
     assert(argc == 2);
-    CrashResume(argv[1], "relaxed"); CrashResume(argv[1], "fsync-wal");
+    // A caught failure unwinds, so each Process destructor kills its server.
+    try { CrashResume(argv[1], "relaxed"); CrashResume(argv[1], "fsync-wal"); }
+    catch (const std::exception& error) {
+        std::cerr << "FAIL feed_slots_process: " << error.what() << "\n";
+        return 1;
+    }
 #else
     (void)argc; (void)argv;
     std::cout << "SIGKILL slot restart requires POSIX\n";

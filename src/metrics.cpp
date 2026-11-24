@@ -2,6 +2,7 @@
 
 #include <cmath>
 #include <string_view>
+#include <vector>
 
 
 namespace chunkdb {
@@ -187,8 +188,25 @@ MetricsRegistry::ErrorClass MetricsRegistry::ClassifyErrorCode(
     return ErrorClass::kOther;
 }
 
+std::string MetricsRegistry::EscapeLabelValue(std::string_view value) {
+    std::string escaped;
+    escaped.reserve(value.size());
+    for (const char c : value) {
+        if (c == '\\') {
+            escaped += "\\\\";
+        } else if (c == '"') {
+            escaped += "\\\"";
+        } else if (c == '\n') {
+            escaped += "\\n";
+        } else {
+            escaped += c;
+        }
+    }
+    return escaped;
+}
+
 std::string MetricsRegistry::RenderPrometheus(
-    const StoreRuntimeStats& store_stats,
+    std::span<const TableRuntimeStats> tables,
     std::size_t loaded_chunks, const StoreResources* resources) const {
     std::string out;
     out.reserve(8192);
@@ -270,18 +288,6 @@ std::string MetricsRegistry::RenderPrometheus(
     out += "# TYPE chunkdb_large_chunk_refusals_total counter\n";
     AppendCounter(&out, "chunkdb_large_chunk_refusals_total", "", resources ? resources->LargeChunkRefusals() : 0U);
 
-    out += "# HELP chunkdb_open_wal_streams Currently open WAL append streams.\n";
-    out += "# TYPE chunkdb_open_wal_streams gauge\n";
-    AppendCounter(&out, "chunkdb_open_wal_streams", "", store_stats.open_wal_streams);
-
-    out += "# HELP chunkdb_background_queue_depth Queued background checkpoint requests.\n";
-    out += "# TYPE chunkdb_background_queue_depth gauge\n";
-    AppendCounter(&out, "chunkdb_background_queue_depth", "", store_stats.background_queue_depth);
-
-    out += "# HELP chunkdb_txn_history_bytes Bytes, with bookkeeping overhead, of the chunk states kept for open transaction snapshots.\n";
-    out += "# TYPE chunkdb_txn_history_bytes gauge\n";
-    AppendCounter(&out, "chunkdb_txn_history_bytes", "", store_stats.txn_history_bytes);
-
     const auto render_signed_gauge =
         [&out](std::string_view name, std::string_view help, std::int64_t value) {
             out += "# HELP ";
@@ -319,72 +325,87 @@ std::string MetricsRegistry::RenderPrometheus(
         &out, "chunkdb_malformed_requests_total", "",
         malformed_requests_.load(std::memory_order_relaxed));
 
-    out += "# HELP chunkdb_wal_barrier_full_syncs_total WAL barriers that fell back to a full "
-           "data-directory sync.\n";
-    out += "# TYPE chunkdb_wal_barrier_full_syncs_total counter\n";
-    AppendCounter(
-        &out, "chunkdb_wal_barrier_full_syncs_total", "", store_stats.wal_barrier_full_syncs);
-
-    out += "# HELP chunkdb_compressed_checkpoint_images_total Checkpoint images written with "
-           "zrle compression.\n";
-    out += "# TYPE chunkdb_compressed_checkpoint_images_total counter\n";
-    AppendCounter(
-        &out, "chunkdb_compressed_checkpoint_images_total", "",
-        store_stats.compressed_checkpoint_images);
-
+    // Store counters, one sample per table.
     const struct {
         const char* name;
+        const char* type;
         const char* help;
-        std::uint64_t value;
-    } counters[] = {
-        {"chunkdb_evictions_total", "Chunks evicted from the cache.", store_stats.evictions},
-        {"chunkdb_eviction_recency_skips_total",
+        std::uint64_t StoreRuntimeStats::*value;
+    } store_families[] = {
+        {"chunkdb_open_wal_streams", "gauge", "Currently open WAL append streams.",
+         &StoreRuntimeStats::open_wal_streams},
+        {"chunkdb_background_queue_depth", "gauge", "Queued background checkpoint requests.",
+         &StoreRuntimeStats::background_queue_depth},
+        {"chunkdb_wal_barrier_full_syncs_total", "counter",
+         "WAL barriers that fell back to a full data-directory sync.",
+         &StoreRuntimeStats::wal_barrier_full_syncs},
+        {"chunkdb_compressed_checkpoint_images_total", "counter",
+         "Checkpoint images written with zrle compression.",
+         &StoreRuntimeStats::compressed_checkpoint_images},
+        {"chunkdb_evictions_total", "counter", "Chunks evicted from the cache.",
+         &StoreRuntimeStats::evictions},
+        {"chunkdb_eviction_recency_skips_total", "counter",
          "Eviction candidates skipped because they were accessed recently.",
-         store_stats.eviction_recency_skips},
-        {"chunkdb_eviction_snapshot_builds_total", "Eviction candidate snapshots built.",
-         store_stats.eviction_snapshot_builds},
-        {"chunkdb_eviction_probes_total", "Eviction candidates probed.", store_stats.eviction_probes},
-        {"chunkdb_eviction_no_progress_cycles_total", "Eviction passes that evicted nothing.",
-         store_stats.eviction_no_progress_cycles},
-        {"chunkdb_eviction_forced_wal_flushes_with_data_total",
+         &StoreRuntimeStats::eviction_recency_skips},
+        {"chunkdb_eviction_snapshot_builds_total", "counter", "Eviction candidate snapshots built.",
+         &StoreRuntimeStats::eviction_snapshot_builds},
+        {"chunkdb_eviction_probes_total", "counter", "Eviction candidates probed.",
+         &StoreRuntimeStats::eviction_probes},
+        {"chunkdb_eviction_no_progress_cycles_total", "counter", "Eviction passes that evicted nothing.",
+         &StoreRuntimeStats::eviction_no_progress_cycles},
+        {"chunkdb_eviction_forced_wal_flushes_with_data_total", "counter",
          "WAL batches flushed by eviction that held writes.",
-         store_stats.eviction_forced_wal_flushes_with_data},
-        {"chunkdb_eviction_forced_wal_flushes_empty_batch_total",
+         &StoreRuntimeStats::eviction_forced_wal_flushes_with_data},
+        {"chunkdb_eviction_forced_wal_flushes_empty_batch_total", "counter",
          "WAL flushes forced by eviction with an empty batch.",
-         store_stats.eviction_forced_wal_flushes_empty_batch},
-        {"chunkdb_checkpoints_total", "Chunk checkpoints written.", store_stats.checkpoints},
-        {"chunkdb_background_checkpoints_total",
+         &StoreRuntimeStats::eviction_forced_wal_flushes_empty_batch},
+        {"chunkdb_checkpoints_total", "counter", "Chunk checkpoints written.",
+         &StoreRuntimeStats::checkpoints},
+        {"chunkdb_background_checkpoints_total", "counter",
          "Checkpoints completed by the background maintenance thread.",
-         store_stats.background_checkpoints},
-        {"chunkdb_background_checkpoint_failures_total",
+         &StoreRuntimeStats::background_checkpoints},
+        {"chunkdb_background_checkpoint_failures_total", "counter",
          "Background checkpoint attempts that failed.",
-         store_stats.background_checkpoint_failures},
-        {"chunkdb_background_queue_full_inline_total",
+         &StoreRuntimeStats::background_checkpoint_failures},
+        {"chunkdb_background_queue_full_inline_total", "counter",
          "Checkpoints run inline because the background queue was full.",
-         store_stats.background_queue_full_inline},
-        {"chunkdb_wal_batch_flushes_total", "WAL batch flushes.", store_stats.wal_batch_flushes},
-        {"chunkdb_wal_barriers_total", "Explicit WAL durability barriers completed.",
-         store_stats.wal_barriers},
-        {"chunkdb_empty_chunk_gcs_total", "Empty-chunk storage reclamations.",
-         store_stats.empty_chunk_gcs},
-        {"chunkdb_unique_loaded_chunks_total", "Chunk loads into the cache.",
-         store_stats.unique_loaded_chunks},
-        {"chunkdb_txn_history_copies_total",
+         &StoreRuntimeStats::background_queue_full_inline},
+        {"chunkdb_wal_batch_flushes_total", "counter", "WAL batch flushes.",
+         &StoreRuntimeStats::wal_batch_flushes},
+        {"chunkdb_wal_barriers_total", "counter", "Explicit WAL durability barriers completed.",
+         &StoreRuntimeStats::wal_barriers},
+        {"chunkdb_empty_chunk_gcs_total", "counter", "Empty-chunk storage reclamations.",
+         &StoreRuntimeStats::empty_chunk_gcs},
+        {"chunkdb_unique_loaded_chunks_total", "counter", "Chunk loads into the cache.",
+         &StoreRuntimeStats::unique_loaded_chunks},
+        {"chunkdb_txn_history_bytes", "gauge",
+         "Bytes, with bookkeeping overhead, of the chunk states kept for open transaction snapshots.",
+         &StoreRuntimeStats::txn_history_bytes},
+        {"chunkdb_txn_history_copies_total", "counter",
          "Chunk states writes copied to keep open transaction snapshots.",
-         store_stats.txn_history_copies},
-        {"chunkdb_txn_history_copied_bytes_total",
+         &StoreRuntimeStats::txn_history_copies},
+        {"chunkdb_txn_history_copied_bytes_total", "counter",
          "Bytes, with bookkeeping overhead, of the chunk states writes copied to keep open transaction snapshots.",
-         store_stats.txn_history_copied_bytes},
+         &StoreRuntimeStats::txn_history_copied_bytes},
     };
-    for (const auto& counter : counters) {
+    std::vector<std::string> table_labels;
+    table_labels.reserve(tables.size());
+    for (const auto& table : tables) {
+        table_labels.push_back("table=\"" + EscapeLabelValue(table.table) + "\"");
+    }
+    for (const auto& family : store_families) {
         out += "# HELP ";
-        out += counter.name;
+        out += family.name;
         out += " ";
-        out += counter.help;
+        out += family.help;
         out += "\n# TYPE ";
-        out += counter.name;
-        out += " counter\n";
-        AppendCounter(&out, counter.name, "", counter.value);
+        out += family.name;
+        out += " ";
+        out += family.type;
+        out += "\n";
+        for (std::size_t i = 0; i < tables.size(); ++i) {
+            AppendCounter(&out, family.name, table_labels[i], tables[i].stats.*family.value);
+        }
     }
 
     return out;
