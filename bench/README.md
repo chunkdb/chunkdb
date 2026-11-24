@@ -15,6 +15,8 @@ Default workloads and JSON fields stay unchanged when these additions are unused
 - `--failed-logins N` requires `--user` and starts N clients once every measured client has logged in; each logs in as that user with a wrong password, one login after another, until the measured clients finish, and makes at least one attempt.
 - The server delays each failure and ban reply (see [protocol](../docs/PROTOCOL.md)), so the measured latencies show whether those held replies slow logged-in clients; the failures ban the bench's address, and the next scenario starts after the ban ends.
 - Results add `failed_logins`, the failure and ban replies received, and the report adds `failed_login_clients`; takeover does not take the option.
+- `--idle-connections N` opens N more connections before each scenario, logs each in like a measured client, and keeps them silent until the scenario ends; spawn mode then raises the server's idle connection timeout to its maximum, and an external server's `--idle-connection-timeout-ms` must outlast the run.
+- The bench holds both ends of each idle connection against a spawned server, so its descriptor limit must exceed twice N plus the measured clients; the report adds `idle_connections`, and takeover does not take the option.
 
 Ordinary throughput includes worker creation, connection and HELLO, but excludes fill, watch setup and final draining.
 Ordinary latency starts after sending a request and ends after validating its reply; takeover latency covers a whole ownership cycle.

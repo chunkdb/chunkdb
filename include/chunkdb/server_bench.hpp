@@ -78,6 +78,9 @@ struct Args {
     // another, from when every measured client has logged in until they all
     // finish; report-only.
     std::size_t failed_logins = 0;
+    // Connections that log in before each scenario and send nothing until it
+    // ends: the open connections the server carries beside the measured ones.
+    std::size_t idle_connections = 0;
     bool show_help = false;
 };
 
@@ -168,6 +171,8 @@ struct BenchmarkReport {
     std::string watch;
     // The --failed-logins value.
     std::size_t failed_login_clients = 0;
+    // The --idle-connections value.
+    std::size_t idle_connections = 0;
     std::vector<ScenarioResult> results;
 };
 

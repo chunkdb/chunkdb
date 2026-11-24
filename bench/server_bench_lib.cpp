@@ -1635,6 +1635,13 @@ struct ThreadWork {
     std::vector<std::unique_ptr<WatchingClient>> watches;
     if (!args.watch_table.empty())
         for (std::size_t i = 0; i < args.watch_count; ++i) watches.push_back(std::make_unique<WatchingClient>(args, i));
+    // Logged in before the timed window and silent through it; closed after it.
+    std::vector<std::unique_ptr<Client>> idle;
+    idle.reserve(args.idle_connections);
+    for (std::size_t i = 0; i < args.idle_connections; ++i) {
+        idle.push_back(std::make_unique<Client>(args.host, args.port, args.io_timeout_ms));
+        Hello(*idle.back(), args);
+    }
 
     std::mutex latencies_mutex;
     std::vector<double> latencies_ms;
@@ -2035,6 +2042,8 @@ void ValidateEnabledArgs(const Args& args) {
         throw std::invalid_argument("--failed-logins requires --user");
     if (args.failed_logins != 0U && std::find(args.tests.begin(), args.tests.end(), Scenario::kTakeover) != args.tests.end())
         throw std::invalid_argument("--failed-logins does not run with takeover");
+    if (args.idle_connections != 0U && std::find(args.tests.begin(), args.tests.end(), Scenario::kTakeover) != args.tests.end())
+        throw std::invalid_argument("--idle-connections does not run with takeover");
 }
 
 void WaitForServerReady(const Args& args) {
@@ -2148,6 +2157,9 @@ std::string UsageText() {
         << "  --block-bits <N>                 spawn mode: bits(N) blocks (default: 16)\n"
         << "  --failed-logins <N>              report-only: N clients log in with a wrong password\n"
         << "                                   beside the measured clients; requires --user\n"
+        << "  --idle-connections <N>           N more connections log in before each scenario and stay\n"
+        << "                                   idle until it ends; an external server's\n"
+        << "                                   --idle-connection-timeout-ms must outlast the run\n"
         << "  --user <name>                    log in as this user (also from --uri)\n"
         << "  --password-file <path>           the user's password (first line)\n"
         << "  --log-level <info|warn|error>    default: info\n"
@@ -2314,6 +2326,10 @@ Args ParseArgs(const std::vector<std::string>& argv) {
             args.failed_logins = ParsePositiveSize(require_value("--failed-logins"), "--failed-logins");
             continue;
         }
+        if (arg == "--idle-connections") {
+            args.idle_connections = ParsePositiveSize(require_value("--idle-connections"), "--idle-connections");
+            continue;
+        }
         if (arg == "--durability-mode") {
             args.durability_mode = require_value("--durability-mode");
             (void)ParseDurabilityMode(args.durability_mode);
@@ -2413,6 +2429,7 @@ BenchmarkReport Run(const Args& requested) {
     report.watch_delivery = args.watch_delivery;
     report.watch_table = args.watch_table;
     report.failed_login_clients = args.failed_logins;
+    report.idle_connections = args.idle_connections;
     if (!args.watch_table.empty()) {
         report.watch = args.watch_table;
         if (args.watch_count != 1U || args.watch_slots) report.watch += ":" + std::to_string(args.watch_count);
@@ -2495,6 +2512,8 @@ BenchmarkReport Run(const Args& requested) {
                 .max_line_bytes = 65536,
                 .worker_threads = args.server_workers,
                 .client_io_timeout_ms = args.io_timeout_ms,
+                // Idle connections stay open for the whole run.
+                .idle_connection_timeout_ms = args.idle_connections != 0U ? 86400000U : ServerConfig{}.idle_connection_timeout_ms,
                 .max_watches = std::max<std::size_t>(64U, args.watch_count),
                 .tls_enabled = false,
                 .tls_cert_path = "",
@@ -2582,6 +2601,7 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
                          << " watch_mode=" << report.watch_mode
                          << (report.watch_delivery == "measure" ? " watch_delivery=measure" : "") << "\n";
     if (report.failed_login_clients != 0U) out << "report_only failed_login_clients=" << report.failed_login_clients << "\n";
+    if (report.idle_connections != 0U) out << "idle_connections=" << report.idle_connections << "\n";
 
     for (const auto& result : report.results) {
         out << "\n[" << result.name << "]\n";
@@ -2666,6 +2686,7 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
         << JsonEscape(report.watch_mode) << "\""
         << (report.watch_delivery == "measure" ? ",\"watch_delivery\":\"measure\"" : "") << "},";
     if (report.failed_login_clients != 0U) out << "\"failed_login_clients\":" << report.failed_login_clients << ",";
+    if (report.idle_connections != 0U) out << "\"idle_connections\":" << report.idle_connections << ",";
     out << "\"results\":[";
     for (std::size_t i = 0; i < report.results.size(); ++i) {
         if (i != 0) {
