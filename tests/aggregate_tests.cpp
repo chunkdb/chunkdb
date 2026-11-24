@@ -242,6 +242,24 @@ void Transactions() {
     f.Ok("COMMIT");
 }
 
+// A chunk with only chunk-column values has no blocks, committed or written
+// in the open transaction.
+void MetaOnlyChunk() {
+    Fixture f;
+    CreateIntegers(f);
+    f.Ok("SET CHUNK 5 5 IN t META tag = 1");
+    const auto empty = Map({{"count(*)", UInt(0U)}, {"sum(v)", Null()}});
+    Same(f.Run("AGGREGATE CHUNK 5 5 FROM t COUNT(*), SUM(v)"), empty);
+    Same(f.Run("AGGREGATE CHUNK 5 5 FROM t COUNT(*), SUM(v) BY CHUNK"), Rows({}));
+    f.Ok("BEGIN");
+    f.Ok("SET CHUNK 6 6 IN t META tag = 2");
+    Same(f.Run("AGGREGATE AREA 5 5 TO 6 6 FROM t COUNT(*), SUM(v)"), empty);
+    Same(f.Run("AGGREGATE AREA 5 5 TO 6 6 FROM t COUNT(*), SUM(v) BY CHUNK"), Rows({}));
+    f.Ok("COMMIT");
+    Same(f.Run("AGGREGATE AREA 5 5 TO 6 6 FROM t COUNT(*), SUM(v)"), empty);
+    Same(f.Run("AGGREGATE AREA 5 5 TO 6 6 FROM t COUNT(*), SUM(v) BY CHUNK"), Rows({}));
+}
+
 // The block loop of one chunk stops a cancelled statement.
 void Cancellation() {
     TableSchema schema;
@@ -279,6 +297,7 @@ int main() {
     Refusals();
     Bounds();
     Transactions();
+    MetaOnlyChunk();
     Cancellation();
     return 0;
 }

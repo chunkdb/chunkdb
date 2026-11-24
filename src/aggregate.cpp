@@ -76,6 +76,9 @@ Aggregator::Aggregator(const ChunkLayout& layout, std::span<const cql::Aggregate
 }
 
 void Aggregator::Add(std::span<const std::uint8_t> payload, std::span<const std::uint8_t> presence) {
+    // A chunk without blocks, such as one with only chunk-column values, has
+    // an empty presence bitmap.
+    if (presence.empty()) return;
     if (payload.size() < payload_bytes_ || presence.size() < (block_count_ + 7U) / 8U)
         throw std::logic_error("a chunk state does not match the table's layout");
     for (std::size_t byte = 0U; byte < (block_count_ + 7U) / 8U; ++byte) {
