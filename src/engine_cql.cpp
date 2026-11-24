@@ -364,6 +364,33 @@ std::string AreaReplySuffix(bool paged, bool more, const ChunkCoord& coord, std:
     return suffix;
 }
 
+// The bytes Protocol::AppendInteger and AppendArrayHeader write for `value`:
+// a prefix, its decimal digits and CRLF.
+[[nodiscard]] std::size_t RespUnsignedBytes(std::uint64_t value) noexcept {
+    std::size_t digits = 1U;
+    while (value >= 10U) { value /= 10U; ++digits; }
+    return digits + 3U;
+}
+[[nodiscard]] std::size_t RespIntegerBytes(std::int64_t value) noexcept {
+    return value < 0 ? 1U + RespUnsignedBytes(0U - static_cast<std::uint64_t>(value))
+                     : RespUnsignedBytes(static_cast<std::uint64_t>(value));
+}
+
+// The sizes of AreaReplyPrefix and AreaReplySuffix, without building them:
+// an area page checks them at every cell it visits.
+[[nodiscard]] std::size_t AreaReplyPrefixBytes(bool with_schema, std::uint64_t schema, bool paged, std::size_t count) noexcept {
+    // "*2" and the schema; "%3" and the bulk "chunks"; the array header.
+    return (with_schema ? 4U + RespUnsignedBytes(schema) : 0U) + (paged ? 4U + 12U : 0U) + RespUnsignedBytes(count);
+}
+[[nodiscard]] std::size_t AreaReplySuffixBytes(bool paged, bool more, const ChunkCoord& coord, std::uint8_t dims) noexcept {
+    if (!paged) return 0U;
+    // The bulk "more", a boolean, the bulk "after"; then null or the cursor.
+    const std::size_t fixed = 10U + 4U + 11U;
+    if (!more) return fixed + 3U;
+    return fixed + RespUnsignedBytes(dims) + RespIntegerBytes(coord.x) + RespIntegerBytes(coord.y) +
+        (dims == 3U ? RespIntegerBytes(coord.z) : 0U);
+}
+
 // Bound admitted wire storage independently of a lowered write quota; the
 // locked mutation checks whether the resulting stored state may grow.
 [[nodiscard]] std::size_t ChunkFormBytes(const Geometry& geometry, bool projected) {
@@ -2154,9 +2181,17 @@ std::string CommandEngine::ExecuteStatement(
                     std::vector<ReplyParts::Piece> rows;
                     std::size_t count = 0U;
                     std::size_t body_bytes = 0U;
-                    auto prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged, count);
-                    auto suffix = AreaReplySuffix(paged, false, {}, get.dims);
-                    if (prefix.size() > budget || suffix.size() > budget - prefix.size()) throw too_large();
+                    // The framing around the rows is measured at every cell and
+                    // built once, for the cells the page admitted.
+                    const auto schema_version = layout.schema().version;
+                    const auto prefix_bytes = [&](std::size_t cells) {
+                        return AreaReplyPrefixBytes(get.with_schema, schema_version, paged, cells);
+                    };
+                    std::size_t prefix_size = prefix_bytes(count);
+                    std::size_t suffix_size = AreaReplySuffixBytes(paged, false, {}, get.dims);
+                    ChunkCoord last_coord{};
+                    bool last_more = false;
+                    if (prefix_size > budget || suffix_size > budget - prefix_size) throw too_large();
                     // An entry that cannot fit an otherwise empty page ends a
                     // page that already admitted a cell, so the next page starts
                     // at it; as the first cell it is refused with its coordinate.
@@ -2164,12 +2199,11 @@ std::string CommandEngine::ExecuteStatement(
                     (void)store.VisitChunkArea(selector, get.after, static_cast<std::size_t>(limit),
                         [&](const ChunkCoord& coord, std::optional<ChunkRangeEntry>&& entry, bool more) {
                             const auto next_count = count + static_cast<std::size_t>(entry.has_value());
-                            auto next_prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged, next_count);
-                            auto next_suffix = AreaReplySuffix(paged, more, coord, get.dims);
-                            const auto single_prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged,
-                                static_cast<std::size_t>(entry.has_value()));
-                            if (single_prefix.size() > budget || next_suffix.size() > budget - single_prefix.size()) throw too_large();
-                            const auto row_budget = budget - single_prefix.size() - next_suffix.size();
+                            const auto next_prefix = prefix_bytes(next_count);
+                            const auto next_suffix = AreaReplySuffixBytes(paged, more, coord, get.dims);
+                            const auto single_prefix = prefix_bytes(static_cast<std::size_t>(entry.has_value()));
+                            if (single_prefix > budget || next_suffix > budget - single_prefix) throw too_large();
+                            const auto row_budget = budget - single_prefix - next_suffix;
                             ReplyParts::Piece row;
                             std::size_t row_bytes = 0U;
                             if (entry) {
@@ -2183,22 +2217,22 @@ std::string CommandEngine::ExecuteStatement(
                                     .commit_time_ms = entry->commit_time_ms, .chunk_columns = std::move(entry->chunk_columns)};
                                 if (scaled) state = ScaleChunkState(store.geometry(), *scaled, *scale, columns, state);
                                 const auto form_size = SectionedChunkStateBytes(form_geometry, state, kVarMaxChunkBytesLimit, columns, scale);
-                                const auto bulk_overhead = 5U + std::to_string(form_size).size();
+                                const auto bulk_overhead = RespUnsignedBytes(form_size) + 2U;
                                 if (row.text.size() + bulk_overhead > row_budget ||
                                     form_size > row_budget - row.text.size() - bulk_overhead) {
                                     if (paged && !first_cell) return false;
                                     throw AreaEntryTooLargeError(coord, get.dims, budget,
-                                        single_prefix.size() + next_suffix.size() + row.text.size() + bulk_overhead + form_size);
+                                        single_prefix + next_suffix + row.text.size() + bulk_overhead + form_size);
                                 }
                                 const auto form_bound = row_budget - row.text.size();
                                 row.body = EncodeSectionedChunkState(form_geometry, state, kVarMaxChunkBytesLimit,
                                     columns, private_state, form_bound, scale);
-                                row_bytes = row.text.size() + 5U + std::to_string(row.body.size()).size() + row.body.size();
+                                row_bytes = row.text.size() + RespUnsignedBytes(row.body.size()) + 2U + row.body.size();
                                 if (row_bytes > row_budget) throw too_large();
                             }
-                            if (next_prefix.size() > budget || next_suffix.size() > budget - next_prefix.size() ||
-                                body_bytes > budget - next_prefix.size() - next_suffix.size() ||
-                                row_bytes > budget - next_prefix.size() - next_suffix.size() - body_bytes) {
+                            if (next_prefix > budget || next_suffix > budget - next_prefix ||
+                                body_bytes > budget - next_prefix - next_suffix ||
+                                row_bytes > budget - next_prefix - next_suffix - body_bytes) {
                                 if (!paged) throw too_large();
                                 return false;
                             }
@@ -2206,12 +2240,19 @@ std::string CommandEngine::ExecuteStatement(
                             body_bytes += row_bytes;
                             first_cell = false;
                             count = next_count;
-                            prefix = std::move(next_prefix);
-                            suffix = std::move(next_suffix);
+                            prefix_size = next_prefix;
+                            suffix_size = next_suffix;
+                            last_coord = coord;
+                            last_more = more;
                             return true;
                         }, true, session.transaction ? &*session.transaction->snapshot : nullptr, read);
                     if (session.transaction != nullptr) TxnRead(*session.transaction, covered);
                     if (info != nullptr) info->chunks = count;
+                    auto prefix = AreaReplyPrefix(get.with_schema, schema_version, paged, count);
+                    const auto suffix = AreaReplySuffix(paged, last_more, last_coord, get.dims);
+                    // The page was admitted by these sizes.
+                    if (prefix.size() != prefix_size || suffix.size() != suffix_size)
+                        throw std::logic_error("area reply framing differs from its measured size");
                     ReplyParts reply;
                     reply.text() = std::move(prefix);
                     for (auto& row : rows) {
