@@ -46,7 +46,7 @@ struct Fixture {
     test::ScopedTempDir directory{"chunkdb-restore-table-area"};
     std::filesystem::path root = std::filesystem::canonical(directory.path());
     std::filesystem::path source = root / "source", backups = root / "backups", backup = backups / "b";
-    std::uint64_t split = 0U;
+    std::uint64_t split = 0U, deleting = 0U;
 
     // Table t: chunks (0,0) and (1,0), a transaction over (0,0) and (3,0),
     // chunk (5,5), and a tombstone at (4,4).
@@ -61,7 +61,7 @@ struct Fixture {
         const auto run = [&](std::string_view statement) { return engine.Execute(session, std::string(statement) + "\r\n"); };
         assert(run("HELLO 3").starts_with("%"));
         Reply(run("CREATE TABLE t (a u8 DEFAULT 0) CHUNK 2 x 2"), "+OK\r\n");
-        for (const auto* statement : {"SET BLOCK 0 0 IN t a = 1", "SET BLOCK 2 0 IN t a = 2", "SET BLOCK 10 10 IN t a = 3",
+        for (const auto* statement : {"SET BLOCK 0 0 IN t a = 1", "SET BLOCK 2 0 IN t a = 2", "SET BLOCK 10 10 IN t a = 3", "SET BLOCK 14 14 IN t a = 7",
                  "SET BLOCK 8 8 IN t a = 4", "DELETE BLOCK 8 8 FROM t"})
             assert(run(statement).starts_with(":"));
         {
@@ -75,7 +75,18 @@ struct Fixture {
         assert(!commit.starts_with("-ERR"));
         split = catalog->Require("t")->Acquire()->store().GetChunkVersion(3, 0);
         assert(split == catalog->Require("t")->Acquire()->store().GetChunkVersion(0, 0));
-        assert(run("SHOW TABLE STATS t").find("$10\r\ntombstones\r\n:1\r\n") != std::string::npos);
+        // A transaction that writes (0,1) and empties (7,7), which collection
+        // then turns into a tombstone.
+        Reply(run("BEGIN"), "+OK\r\n");
+        assert(!run("SET BLOCK 0 2 IN t a = 8").starts_with("-ERR"));
+        assert(!run("DELETE BLOCK 14 14 FROM t").starts_with("-ERR"));
+        assert(!run("COMMIT").starts_with("-ERR"));
+        deleting = catalog->Require("t")->Acquire()->store().GetChunkVersion(0, 1);
+        {
+            auto lease = catalog->Require("t")->Acquire();
+            lease->store().CheckpointForTests(7, 7);
+        }
+        assert(run("SHOW TABLE STATS t").find("$10\r\ntombstones\r\n:2\r\n") != std::string::npos);
         assert(run("BACKUP TO 'b'").starts_with("%4\r\n"));
     }
     int Run(const std::string& args, std::string* output) const {
@@ -112,7 +123,7 @@ void WholeTable(const Fixture& f) {
     assert(Contains(output, "restored table t as t: epoch ") && !Contains(output, "split commits"));
     Reply(Query(target, "GET BLOCK 10 10 FROM t"), "*1\r\n:3\r\n");
     Reply(Query(target, "GET BLOCK 6 0 FROM t"), "*1\r\n:6\r\n");
-    assert(Query(target, "SHOW TABLE STATS t").find("$10\r\ntombstones\r\n:1\r\n") != std::string::npos);
+    assert(Query(target, "SHOW TABLE STATS t").find("$10\r\ntombstones\r\n:2\r\n") != std::string::npos);
     std::ostringstream findings;
     assert(VerifyDataDirectory(target, findings).errors == 0U);
     // The name is taken now; another one is not.
@@ -127,6 +138,10 @@ void WholeTable(const Fixture& f) {
         assert(f.Run(f.Args("--table t --as third", target), &output) == 1);
     }
     assert(f.Run(f.Args("--table missing --as fourth", target), &output) == 1 && Contains(output, "no table 'missing'"));
+    // A failed restore leaves a directory it would have made absent.
+    assert(f.Run(f.Args("--table missing", f.root / "never"), &output) == 1 && !std::filesystem::exists(f.root / "never"));
+    std::filesystem::create_directory(f.root / "empty");
+    assert(f.Run(f.Args("--table missing", f.root / "empty"), &output) == 1 && std::filesystem::is_empty(f.root / "empty"));
 }
 
 void Areas(const Fixture& f) {
@@ -143,6 +158,9 @@ void Areas(const Fixture& f) {
     Reply(Query(target, "GET BLOCK 10 10 FROM split"), "_\r\n");
     assert(Query(target, "SHOW TABLE STATS split").find("$10\r\ntombstones\r\n:0\r\n") != std::string::npos);
     assert(Query(target, "SHOW TABLE STATS split").find("$6\r\nchunks\r\n:2\r\n") != std::string::npos);
+    // The deleting transaction is found from the tombstone outside the area.
+    assert(f.Run(f.Args("--table t --as lone --area 0 1 TO 0 1", target), &output) == 1);
+    assert(Contains(output, "splits 1 commits") && Contains(output, "revisions " + std::to_string(f.deleting) + ")"));
     // An area holding every chunk of the transaction splits nothing.
     assert(f.Run(f.Args("--table t --as whole_row --area 0 0 TO 3 0", target), &output) == 0);
     assert(Contains(output, "3 chunks in the area") && !Contains(output, "split commits"));

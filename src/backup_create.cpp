@@ -282,6 +282,8 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
         // is left out whole, before any file is copied.
         std::map<std::string, StoreManifest> manifests;
         std::set<std::pair<std::string, ChunkCoord>> chunks, damaged;
+        // The pinned WAL prefix: the live file may grow while it is checked.
+        std::map<std::pair<std::string, ChunkCoord>, std::uint64_t> wal_prefixes;
         for (const auto& file : files) {
             if (file.relative.extension() != ".chk" && file.relative.extension() != ".wal") continue;
             const auto table_name = std::next(file.relative.begin())->string();
@@ -294,14 +296,17 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             if (!ParseChunkFilePath(file.relative.lexically_relative(std::filesystem::path("tables") / table_name), retained->geometry, &coord))
                 throw std::logic_error("invalid staged chunk name");
             chunks.emplace(table_name, coord);
+            if (file.relative.extension() == ".wal") wal_prefixes[{table_name, coord}] = file.observed;
         }
         for (const auto& [table_name, coord] : chunks) {
             CheckCancelled(options.cancelled);
             const auto table_dir = staging.path / "tables" / table_name;
             const auto& manifest = manifests.at(table_name);
             const auto& retained = *retained_indexes.at(table_name);
+            const auto prefix = wal_prefixes.find({table_name, coord});
             const auto check = CheckChunkFiles(table_dir, retained.geometry, manifest.store_id, manifest.features, coord,
-                retained.index.EmptyBoundary(coord));
+                retained.index.EmptyBoundary(coord), std::nullopt, true,
+                prefix == wal_prefixes.end() ? std::nullopt : std::optional{prefix->second});
             const auto* damage = check.damage();
             if (damage == nullptr) continue;
             const auto file = damage->path.lexically_relative(table_dir);

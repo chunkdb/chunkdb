@@ -46,12 +46,13 @@ struct ChunkFileCheck {
 // `table_dir` as chunkdb_verify checks them: the image is parsed, and the WAL
 // is replayed over it, or over the retained empty boundary `retained` of the
 // coordinate index. `wal_cut` is the committed WAL length a pending rollback
-// intent names. Without `check_wal`, only the image is checked. Never
-// throws for damage; it reports a finding.
+// intent names. `wal_bytes` bounds the WAL to a pinned prefix with the same
+// crash-tail rules as the whole file. Without `check_wal`, only the image is
+// checked. Never throws for damage; it reports a finding.
 [[nodiscard]] ChunkFileCheck CheckChunkFiles(const std::filesystem::path& table_dir, const Geometry& geometry,
     const StoreId& epoch, FeatureFlags features, const ChunkCoord& coord,
     const std::optional<ChunkIndexRecord>& retained, std::optional<std::uint64_t> wal_cut = std::nullopt,
-    bool check_wal = true);
+    bool check_wal = true, std::optional<std::uint64_t> wal_bytes = std::nullopt);
 
 // The coordinates of the chunks with an image or a WAL in the table
 // directory `table_dir`, in ascending order. Listing takes no lock.

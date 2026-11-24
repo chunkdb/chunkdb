@@ -201,6 +201,9 @@ void Crashes(const std::string& admin) {
         assert(std::filesystem::exists(f.File(0, 0, true)) != removed_wal);
         assert(std::filesystem::exists(f.File(0, 0, false)));
         assert(f.Opens() == removed_wal);
+        std::ostringstream interrupted;
+        (void)VerifyDataDirectory(f.data, interrupted);
+        assert(Contains(interrupted.str(), "quarantine_interrupted"));
         if (removed_wal) assert(f.Block(0, 0) == "00000001");
         const int rerun = f.Run("quarantine --table t --chunk 0 0", &output);
         if (rerun != 0) std::cerr << point << " exit " << rerun << ": " << output << "\n";
@@ -209,6 +212,12 @@ void Crashes(const std::string& admin) {
         assert(f.Entries().size() == 1U);
         assert(!std::filesystem::exists(f.File(0, 0, true)) && !std::filesystem::exists(f.File(0, 0, false)));
         assert(f.Opens() && f.Block(0, 0).empty() && f.Block(2, 0) == "00000100");
+        std::ostringstream finished;
+        (void)VerifyDataDirectory(f.data, finished);
+        assert(!Contains(finished.str(), "quarantine_interrupted"));
+        // A run after a finished one changes nothing.
+        assert(f.Run("quarantine --table t --chunk 0 0", &output) == 0 && Contains(output, "is already quarantined in"));
+        assert(f.Entries().size() == 1U);
     }
 }
 

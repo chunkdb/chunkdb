@@ -267,9 +267,20 @@ RestoredArea SelectRestoredArea(const std::filesystem::path& directory, const Ba
     for (const auto& relative : files)
         if (std::distance(relative.begin(), relative.end()) == 2 && (relative.extension() == ".chk" || relative.extension() == ".wal"))
             chunks.insert(Coordinate(relative, geometry));
-    // A commit at one revision changed every chunk that holds it.
+    // Only a transaction commits several chunks at one revision; every
+    // other write, and MIGRATE, gives each chunk a revision of its own.
     std::set<std::uint64_t> inside, outside;
     RestoredArea result;
+    const auto inventory_path = directory / kChunkIndexFileName;
+    std::vector<IndexInventoryEntry> entries;
+    IndexInventoryHeader header;
+    {
+        SharedFileInput inventory(inventory_path);
+        if (!inventory) throw std::runtime_error("restored coordinate inventory is missing");
+        header = ReadIndexInventory(inventory, std::filesystem::file_size(inventory_path), geometry, cut.epoch,
+            [&](const auto& entry) { entries.push_back(entry); });
+    }
+    if (header.compaction_pending) throw std::runtime_error("restored coordinate compaction is pending");
     {
         const ChunkCoordinateIndex retained(directory, geometry, cut.epoch, true);
         for (const auto& coord : chunks) {
@@ -279,6 +290,17 @@ RestoredArea SelectRestoredArea(const std::filesystem::path& directory, const Ba
             for (const auto revision : ChunkRevisions(directory, geometry, coord, cut.epoch, manifest.features, retained))
                 (in ? inside : outside).insert(revision);
         }
+    }
+    // A deletion boundary keeps the revision of the commit that emptied its
+    // chunk, also after collection removed the chunk's files.
+    for (const auto& entry : entries) {
+        check_cancelled();
+        const auto path = LargeChunkDirectory(directory, entry.coord, geometry.dims()) / kChunkIndexFileName;
+        SharedFileInput input(path);
+        if (!input) throw std::runtime_error("restored coordinate log is missing");
+        const auto log = ReadChunkIndexLog(input, std::filesystem::file_size(path), geometry, cut.epoch, entry.coord, entry.committed_bytes);
+        for (const auto& [coord, boundary] : log.empty_boundaries)
+            (selected.Contains(coord) ? inside : outside).insert(boundary.revision);
     }
     std::set_intersection(inside.begin(), inside.end(), outside.begin(), outside.end(), std::back_inserter(result.split_revisions));
     if (!result.split_revisions.empty() && !allow_split) {
@@ -301,16 +323,6 @@ RestoredArea SelectRestoredArea(const std::filesystem::path& directory, const Ba
     }
     // So do their coordinate-index records: the restored table has no
     // identity, live or deleted, outside the area.
-    const auto inventory_path = directory / kChunkIndexFileName;
-    std::vector<IndexInventoryEntry> entries;
-    IndexInventoryHeader header;
-    {
-        SharedFileInput inventory(inventory_path);
-        if (!inventory) throw std::runtime_error("restored coordinate inventory is missing");
-        header = ReadIndexInventory(inventory, std::filesystem::file_size(inventory_path), geometry, cut.epoch,
-            [&](const auto& entry) { entries.push_back(entry); });
-    }
-    if (header.compaction_pending) throw std::runtime_error("restored coordinate compaction is pending");
     // Fixed-size records: length, kind, coordinates, revision, time, schema, CRC32.
     const std::size_t record_bytes = 36U + 8U * geometry.dims();
     for (auto& entry : entries) {

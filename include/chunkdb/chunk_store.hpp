@@ -672,6 +672,11 @@ enum class CachePausePoint {
     kLargeChunkAfterReservation,
     // Failed-load retirement is published, before the last local owner leaves.
     kLargeChunkAfterRetirement,
+    // CHECK TABLE took the eviction count for a chunk outside the cache,
+    // before it reads the chunk's files.
+    kCheckTableBeforeRead,
+    // CHECK TABLE read those files, before it looks for a race.
+    kCheckTableAfterRead,
     kCount,
 };
 
@@ -918,10 +923,11 @@ class ChunkStore {
         std::string detail;
     };
     // Checks the image and WAL of chunk `coord` as chunkdb_verify checks
-    // them (CHECK TABLE). A cached chunk is checked under its lock, so only
-    // writes to that chunk wait for the check; a chunk that is not cached is
-    // read without locks and read again when a load or an eviction races
-    // the read. Returns the first damage, or nothing for sound files or a
+    // them (CHECK TABLE). A cached chunk is checked under its exclusive lock,
+    // so statements on that chunk wait for the check; a chunk that is not
+    // cached is read without locks and read again when a load or an eviction
+    // races the read. After repeated races it is loaded, checked and evicted
+    // again; when that load fails, the damage the last read found is returned. Returns the first damage, or nothing for sound files or a
     // chunk without files. A stopped statement throws StatementStoppedError.
     [[nodiscard]] std::optional<ChunkFileDamage> CheckChunkFiles(const ChunkCoord& coord);
     [[nodiscard]] ChunkMutationResult CasChunkState(

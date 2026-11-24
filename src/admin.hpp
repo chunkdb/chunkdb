@@ -60,6 +60,8 @@ struct QuarantinedChunk {
     std::string damage;
     // Whether an interrupted quarantine of the chunk was finished.
     bool resumed = false;
+    // Whether an earlier run had finished already; nothing changed.
+    bool already_quarantined = false;
     // Slots marked so that their next watch starts with resync.
     std::size_t slots_marked = 0;
     // Errors the chunkdb_verify checks of the table still find.

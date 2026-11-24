@@ -149,6 +149,25 @@ void SkipsAndListsDamagedChunks() {
         Reply(engine.Execute(session, "GET BLOCK 2 0 FROM t\r\n"), "_\r\n");
         Reply(engine.Execute(session, "CHECK TABLE t\r\n"), "%2\r\n$6\r\nchunks\r\n:1\r\n$7\r\ndamaged\r\n*0\r\n");
     }
+    // A record whose skipped chunk does not fit its table is refused.
+    const auto marker_path = backup / std::string(kBackupMarkerName);
+    std::filesystem::permissions(marker_path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
+    const auto rewrite = [&](const BackupRecord& changed) {
+        const auto bytes = SerializeBackupRecord(changed);
+        std::ofstream output(marker_path, std::ios::binary | std::ios::trunc);
+        output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+        assert(output);
+    };
+    auto wrong = record;
+    wrong.skipped[0].dims = 3U;
+    rewrite(wrong);
+    assert(Contains(Throws([&] { ValidateBackupInventory(backup, ReadBackupRecord(backup)); }), "other dimensions"));
+    wrong = record;
+    wrong.skipped[0].coord = ChunkCoord{0, 0};
+    rewrite(wrong);
+    assert(Contains(Throws([&] { ValidateBackupInventory(backup, ReadBackupRecord(backup)); }), "is in the inventory"));
+    rewrite(record);
+    ValidateBackupInventory(backup, ReadBackupRecord(backup));
 }
 
 // Without damage, SKIP DAMAGED lists nothing and writes a version 1 record.

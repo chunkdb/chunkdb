@@ -8,6 +8,7 @@
 #include <iterator>
 #include <memory>
 #include <string>
+#include <thread>
 #include <vector>
 
 #include "chunkdb/engine.hpp"
@@ -69,9 +70,10 @@ struct Fixture {
     std::unique_ptr<CommandEngine> engine;
     SessionState session;
 
-    Fixture() {
+    explicit Fixture(std::size_t max_loaded_chunks = kDefaultMaxLoadedChunks) {
         config.data_dir = directory.path();
         config.background_maintenance = false;
+        config.max_loaded_chunks = max_loaded_chunks;
         Open();
     }
     void Open() {
@@ -186,10 +188,58 @@ void RightsAndCancellation() {
     Error(engine.Execute(owner, "CHECK TABLE t\r\n"), "CANCELLED");
 }
 
+// Evictions that race every read of a chunk outside the cache: the check
+// loads the chunk, checks it there and evicts it again; when the load
+// refuses damaged files, the damage the last read found is the report.
+void RacedReadsUseTheCache() {
+    Fixture f(1U);
+    Reply(f.Run("CREATE TABLE t (a u8 DEFAULT 0) CHUNK 2 x 2"), "+OK\r\n");
+    for (const auto* statement : {"SET BLOCK 0 0 IN t a = 1", "SET BLOCK 2 0 IN t a = 2", "SET BLOCK 4 0 IN t a = 3",
+             "SET BLOCK 6 0 IN t a = 4"})
+        assert(f.Run(statement).starts_with(":"));
+    f.Checkpoint(0, 0);
+    Reply(f.Run("FLUSH WAL"), "+OK\r\n");
+    f.Open();
+    Damage(f.File(0, 0, false));
+    for (const std::int64_t x : {1, 0}) {
+        const auto table = f.catalog->Require("t");
+        auto lease = table->Acquire();
+        auto& store = lease->store();
+        const ChunkCoord coord{x, 0};
+        using Point = CachePausePoint;
+        store.ArmCachePauseForTests(Point::kCheckTableBeforeRead, coord);
+        std::string reply;
+        std::thread checker([&] { reply = f.Run("CHECK TABLE t CHUNK " + std::to_string(x) + " 0"); });
+        SessionState other;
+        assert(f.engine->Execute(other, "HELLO 3\r\n").starts_with("%"));
+        for (int attempt = 0; attempt < 3; ++attempt) {
+            assert(store.WaitForCachePauseForTests(Point::kCheckTableBeforeRead));
+            // With room for one chunk, each load evicts the other.
+            Reply(f.engine->Execute(other, "GET BLOCK 4 0 FROM t\r\n"), "*1\r\n:3\r\n");
+            Reply(f.engine->Execute(other, "GET BLOCK 6 0 FROM t\r\n"), "*1\r\n:4\r\n");
+            store.ArmCachePauseForTests(Point::kCheckTableAfterRead, coord);
+            store.ResumeCachePauseForTests(Point::kCheckTableBeforeRead);
+            assert(store.WaitForCachePauseForTests(Point::kCheckTableAfterRead));
+            if (attempt != 2) store.ArmCachePauseForTests(Point::kCheckTableBeforeRead, coord);
+            store.ResumeCachePauseForTests(Point::kCheckTableAfterRead);
+        }
+        checker.join();
+        if (x == 1) {
+            Reply(reply, "%2\r\n$6\r\nchunks\r\n:1\r\n$7\r\ndamaged\r\n*0\r\n");
+            assert(!store.IsChunkLoadedForTests(1, 0));
+        } else {
+            assert(reply.starts_with("%2\r\n$6\r\nchunks\r\n:1\r\n$7\r\ndamaged\r\n*1\r\n"));
+            assert(Contains(reply, "chunk_image_invalid") && !store.IsChunkLoadedForTests(0, 0));
+        }
+    }
+}
+
 // A read-only server leaves file checks to chunkdb_verify.
 void ReadOnlyRefuses() {
     Fixture f;
     Reply(f.Run("CREATE TABLE t (a u8 DEFAULT 0) CHUNK 2 x 2"), "+OK\r\n");
+    assert(f.Run("SET BLOCK 0 0 IN t a = 1").starts_with(":"));
+    Reply(f.Run("FLUSH WAL"), "+OK\r\n");
     f.engine.reset();
     f.catalog.reset();
     f.config.access_mode = AccessMode::kReadOnly;
@@ -204,6 +254,7 @@ int main() {
     DamagedCachedChunk();
     CrashTailIsNotDamage();
     RightsAndCancellation();
+    RacedReadsUseTheCache();
     ReadOnlyRefuses();
     std::cout << "check_table tests passed\n";
     return 0;

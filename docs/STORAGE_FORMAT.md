@@ -641,8 +641,9 @@ It hard-links the chunk's WAL and image there under their own names, syncs them 
 4. CRC32 over all preceding bytes.
 
 It then marks the table's slots to resync and removes the live WAL before the live image, syncing the large-chunk directory after each.
-A rerun removes this chunk's entries without a record, and finishes an entry whose record holds every remaining file by name, length and CRC32.
-Writers, backups and restores ignore `.chunkdb.quarantine/`; `chunkdb_verify` reports each entry as information and a malformed record as a warning.
+A rerun removes this chunk's entries without a record, finishes an entry whose record holds every remaining file by name, length and CRC32, and with no file left reports the chunk as quarantined.
+It refuses a chunk whose deletion boundary sits in a log the inventory does not list, since recovery needs the chunk's files to admit it.
+Writers, backups and restores ignore `.chunkdb.quarantine/`; `chunkdb_verify` reports each entry as information, and as a warning a malformed record, an entry without a record, or a live file its record holds.
 
 ## Checkpoint and verification boundaries
 

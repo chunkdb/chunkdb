@@ -23,6 +23,8 @@
 #include "feed_slot_records.hpp"
 #include "file_permissions.hpp"
 #include "quarantine_record.hpp"
+#include "populated_index_format.hpp"
+#include "shared_file_input.hpp"
 #include "txn_history.hpp"
 #include "txn_intent_format.hpp"
 
@@ -186,6 +188,29 @@ void RequireNoIntentFor(const std::filesystem::path& table_dir, const Geometry& 
     }
 }
 
+// Recovery needs the artifact of a deletion boundary that the coordinate
+// inventory does not list yet; without it the table does not open.
+void RequirePublishedBoundary(const std::filesystem::path& table_dir, const Geometry& geometry, const StoreId& epoch,
+    const ChunkCoord& coord) {
+    const auto large = geometry.ChunkToLarge(coord);
+    const auto log_path = LargeChunkDirectory(table_dir, large, geometry.dims()) / kChunkIndexFileName;
+    if (!std::filesystem::exists(log_path)) return;
+    bool listed = false;
+    {
+        const auto inventory_path = table_dir / kChunkIndexFileName;
+        SharedFileInput inventory(inventory_path);
+        if (!inventory) throw std::runtime_error("cannot read the coordinate inventory " + inventory_path.string());
+        (void)ReadIndexInventory(inventory, std::filesystem::file_size(inventory_path), geometry, epoch,
+            [&](const IndexInventoryEntry& entry) { listed = listed || entry.coord == large; });
+    }
+    if (listed) return;
+    SharedFileInput log(log_path);
+    if (!log) throw std::runtime_error("cannot read the coordinate log " + log_path.string());
+    if (ReadChunkIndexLog(log, std::filesystem::file_size(log_path), geometry, epoch, large).empty_boundaries.contains(coord))
+        throw std::runtime_error("the chunk has a deletion the coordinate inventory does not list yet, and opening the "
+            "table needs its files; restore the table from a backup instead");
+}
+
 // Marks every slot that is not lost so that its next watch starts with
 // resync; returns how many it marked.
 std::size_t RequireSlotResync(const std::filesystem::path& table_dir, const StoreId& epoch, std::uint8_t dims) {
@@ -233,8 +258,6 @@ QuarantinedChunk QuarantineChunk(const std::filesystem::path& data_dir, const st
             throw std::runtime_error(path.string() + " is not a regular file");
         present.push_back(path);
     }
-    if (present.empty()) throw std::invalid_argument(described + " has no image or WAL");
-
     QuarantinedChunk result;
     const auto root = table_dir / kQuarantineDirName;
     std::filesystem::path entry;
@@ -259,14 +282,22 @@ QuarantinedChunk QuarantineChunk(const std::filesystem::path& data_dir, const st
                     return file.name == path.filename().string() && file.size == sum.size && file.crc32 == sum.crc32;
                 });
             });
-            if (holds_all) {
+            if (holds_all && !result.resumed) {
                 entry = candidate.path();
                 result.resumed = true;
                 for (const auto& file : record.files) result.files.push_back(file.name);
             }
         }
     }
+    if (present.empty()) {
+        if (!result.resumed) throw std::invalid_argument(described + " has no image or WAL");
+        // An earlier run finished: nothing is left to move or to mark.
+        result.already_quarantined = true;
+        result.entry = entry.lexically_relative(data_dir);
+        return result;
+    }
     if (!result.resumed) {
+        RequirePublishedBoundary(table_dir, geometry, manifest->store_id, coord);
         const auto check = CheckChunkFiles(table_dir, geometry, manifest->store_id, manifest->features, coord,
             ChunkCoordinateIndex(table_dir, geometry, manifest->store_id, true).EmptyBoundary(coord));
         for (const auto& finding : check.findings)

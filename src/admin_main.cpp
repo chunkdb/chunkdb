@@ -56,6 +56,12 @@ int QuarantineCommand(const std::string& data_dir, const std::string& table, con
     bool force) {
     const chunkdb::ChunkCoord coord{chunk[0], chunk[1], chunk.size() == 3U ? chunk[2] : 0};
     const auto result = chunkdb::QuarantineChunk(data_dir, table, static_cast<std::uint8_t>(chunk.size()), coord, force, std::cerr);
+    if (result.already_quarantined) {
+        std::cout << "chunk";
+        for (const auto axis : chunk) std::cout << ' ' << axis;
+        std::cout << " of table " << table << " is already quarantined in " << result.entry.generic_string() << "\n";
+        return 0;
+    }
     std::cout << (result.resumed ? "finished quarantine of" : "quarantined") << " chunk";
     for (const auto axis : chunk) std::cout << ' ' << axis;
     std::cout << " of table " << table << " in " << result.entry.generic_string() << ":";

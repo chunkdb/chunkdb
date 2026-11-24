@@ -53,10 +53,10 @@ OK
 OK
 OK
 OK
+OK
+OK
 chunks = 0
 damaged = []
-OK
-OK
 OK
 ```
 
@@ -235,7 +235,7 @@ A table whose recovery fails stays fenced and out of service; a restart also rec
 A migration with an unknown outcome fences every table; RECOVER TABLE refuses it, and only a restart completes it.
 
 CHECK TABLE runs the `chunkdb_verify` checks on the image and WAL of each chunk with files, one chunk at a time, while the table serves.
-Statements on other chunks do not wait; a write to a chunk waits only while that chunk is checked.
+Statements on other chunks do not wait; a statement on a cached chunk waits while that chunk is checked.
 It checks the files, not memory: changes not yet written to the WAL are checked once they are.
 A WAL tail left by a crash is repaired when the chunk loads and is not damage.
 CANCEL, KILL CONNECTION, a statement timeout or server shutdown stops it without a result; SHOW CONNECTIONS shows the chunks checked as `files_done` of `files_total`.

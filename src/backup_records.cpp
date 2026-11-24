@@ -717,6 +717,19 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
             allowed.insert(relative);
         }
         ValidateTableCut(root / prefix, cut, files, cancelled);
+        // A skipped chunk has the table's dimensions and no file in the inventory.
+        if (std::any_of(record.skipped.begin(), record.skipped.end(), [&](const auto& chunk) { return chunk.table == cut.name; })) {
+            const auto manifest = *ReadStoreManifest(root / prefix);
+            const Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
+            for (const auto& chunk : record.skipped) {
+                if (chunk.table != cut.name) continue;
+                if (chunk.dims != geometry.dims())
+                    throw std::runtime_error("skipped backup chunk has other dimensions than its table: " + cut.name);
+                for (const auto& path : {ChunkDataPath(prefix, geometry, chunk.coord), ChunkWalPath(prefix, geometry, chunk.coord)})
+                    if (allowed.contains(path.generic_string()))
+                        throw std::runtime_error("skipped backup chunk is in the inventory: " + path.generic_string());
+            }
+        }
     }
     for (const auto& file : record.files)
         if (!allowed.contains(file.relative_path.generic_string())) throw std::runtime_error("unknown backup inventory artifact");

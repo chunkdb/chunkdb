@@ -4,6 +4,7 @@
 #include "verify.hpp"
 #include "chunk_check.hpp"
 #include "quarantine_record.hpp"
+#include "chunkdb/crc32.hpp"
 #include "backup.hpp"
 #include "backup_directory.hpp"
 
@@ -731,11 +732,28 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
         if (name == chunkdb::kQuarantineDirName && entry.is_directory()) {
             for (const auto& quarantined : chunkdb::backup_detail::DirectoryEntries(entry.path())) {
                 const auto record_path = quarantined.path() / std::string(chunkdb::kQuarantineRecordName);
+                if (!std::filesystem::exists(record_path)) {
+                    Report(counters, false, "quarantine_interrupted", quarantined.path(),
+                        "no record; run chunkdb_admin quarantine for this chunk again before starting the server");
+                    continue;
+                }
                 try {
                     const auto record = chunkdb::ParseQuarantineRecord(chunkdb::LoadFile(record_path));
                     std::string files;
                     for (const auto& file : record.files) files += (files.empty() ? "" : ", ") + file.name;
                     ReportInfo(counters, "chunk_quarantined", quarantined.path(), files);
+                    // A live file the record holds: the tool stopped before it
+                    // removed it, and the table may still refuse to open.
+                    const bool own = store_geometry && store_manifest && record.table_epoch == store_manifest->store_id;
+                    for (const auto& file : own ? record.files : std::vector<chunkdb::QuarantineFile>{}) {
+                        const auto live = file.name.ends_with(".wal") ? chunkdb::ChunkWalPath(data_dir, *store_geometry, record.coord)
+                                                                       : chunkdb::ChunkDataPath(data_dir, *store_geometry, record.coord);
+                        if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(live))) continue;
+                        const auto bytes = chunkdb::LoadFile(live);
+                        if (bytes.size() == file.size && chunkdb::Crc32(bytes) == file.crc32)
+                            Report(counters, false, "quarantine_interrupted", live,
+                                "run chunkdb_admin quarantine for this chunk again before starting the server");
+                    }
                 } catch (const std::exception& error) {
                     Report(counters, false, "quarantine_record_invalid", record_path, error.what());
                 }
@@ -1210,7 +1228,7 @@ chunkdb::VerifyCounters chunkdb::VerifyTableDirectory(
 
 chunkdb::ChunkFileCheck chunkdb::CheckChunkFiles(const std::filesystem::path& root, const Geometry& geometry,
     const StoreId& epoch, FeatureFlags features, const ChunkCoord& coord,
-    const std::optional<ChunkIndexRecord>& retained, std::optional<std::uint64_t> wal_cut, bool check_wal) {
+    const std::optional<ChunkIndexRecord>& retained, std::optional<std::uint64_t> wal_cut, bool check_wal, std::optional<std::uint64_t> wal_bytes) {
     ChunkFileCheck result;
     const auto report = [&result](bool error, std::string code, const std::filesystem::path& path, std::string detail) {
         result.findings.push_back({error, std::move(code), path, std::move(detail)});
@@ -1243,7 +1261,11 @@ chunkdb::ChunkFileCheck chunkdb::CheckChunkFiles(const std::filesystem::path& ro
             ++result.files;
             RequirePlain(wal_path);
             SharedFileInput input(wal_path);
-            const auto measured = Measure(input, wal_path);
+            auto measured = Measure(input, wal_path);
+            if (wal_bytes) {
+                if (*wal_bytes > measured) throw std::runtime_error("WAL shorter than its pinned prefix");
+                measured = *wal_bytes;
+            }
             const auto admitted = wal_cut.value_or(measured);
             if (admitted > measured) throw std::runtime_error("rollback WAL shortened before verification");
             if (admitted != 0U || !wal_cut) {

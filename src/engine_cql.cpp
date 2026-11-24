@@ -2260,6 +2260,9 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::CheckTable& check) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     if (!HasServerRight(session, ServerRight::kMonitor)) RequireRight(session, check.table, Right::kAdmin);
+                    // Before any listing: a read-only server leaves file checks to chunkdb_verify.
+                    if (catalog_->access_mode() == AccessMode::kReadOnly)
+                        throw std::invalid_argument("CHECK TABLE needs a server started without --read-only; use chunkdb_verify");
                     StoreId epoch{};
                     std::filesystem::path dir;
                     std::optional<Geometry> geometry;
