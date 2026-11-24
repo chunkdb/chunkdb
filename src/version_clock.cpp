@@ -1,5 +1,6 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <mutex>
@@ -23,6 +24,11 @@
 namespace chunkdb {
 
 namespace {
+
+[[nodiscard]] std::uint64_t MicrosecondsSince(std::chrono::steady_clock::time_point started) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+}
 
 // Number of version tokens reserved (and durably persisted) per extension of
 // the version clock. Larger values amortize the persistence fsync over more
@@ -310,6 +316,7 @@ void ChunkStore::ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive
         new_ceiling = minimum_exclusive + kVersionClockReservationBatch;
     }
 
+    const auto started = std::chrono::steady_clock::now();
     AtomicWrite(
         version_clock_path_,
         SerializeVersionClockRecord(new_ceiling),
@@ -322,6 +329,8 @@ void ChunkStore::ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive
         // its own VERSION_RESERVE_FAIL_ONCE hook.
         /*enable_generic_failpoints=*/false);
     version_clock_ceiling_.store(new_ceiling, std::memory_order_release);
+    stats_version_clock_extensions_.fetch_add(1U, std::memory_order_relaxed);
+    stats_version_clock_extension_us_.fetch_add(MicrosecondsSince(started), std::memory_order_relaxed);
 }
 
 std::uint64_t ChunkStore::NextChunkVersion() {
@@ -344,12 +353,18 @@ std::uint64_t ChunkStore::NextChunkVersion() {
         if (candidate >= version_clock_ceiling_.load(std::memory_order_acquire)) {
             // Reserved range exhausted: persist a higher ceiling before
             // issuing any token at or above it. Throws, leaving the clock
-            // unchanged, when no higher ceiling exists.
-            std::lock_guard lock(version_clock_mutex_);
-            candidate = version_clock_.load(std::memory_order_seq_cst);
-            if (candidate >= version_clock_ceiling_.load(std::memory_order_acquire)) {
-                ExtendVersionClockCeilingLocked(candidate);
+            // unchanged, when no higher ceiling exists. The wait counts from
+            // here, so a writer blocked behind another writer's extension
+            // counts too.
+            const auto waiting = std::chrono::steady_clock::now();
+            {
+                std::lock_guard lock(version_clock_mutex_);
+                candidate = version_clock_.load(std::memory_order_seq_cst);
+                if (candidate >= version_clock_ceiling_.load(std::memory_order_acquire)) {
+                    ExtendVersionClockCeilingLocked(candidate);
+                }
             }
+            stats_version_clock_wait_us_.fetch_add(MicrosecondsSince(waiting), std::memory_order_relaxed);
             continue;
         }
         // Sequentially consistent: a write loads the open-transaction count

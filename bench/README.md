@@ -29,6 +29,11 @@ A drain in `measure` mode waits while pushes arrive and fails after `--io-timeou
 Takeover adds `report_only`, `ownership_cycles`, `ownership_cycles_s`, `latency_unit="ownership_cycle"` and `acks_sent=0`; `throughput_req_s` counts HELLO/WATCH requests plus AUTH when logging in, and `throughput_blocks_s` is zero.
 Compare matching workload settings and retain absolute requests/s, blocks/s and p50/p99 with the run count and configuration.
 
+`--system-stats` adds `system` to each result except takeover, counters of the measured window from just before its first connection to just after its last reply, and `server_close_s` to a spawned run, the time from stopping the server until its store closed.
+`process_*` comes from getrusage (not on Windows); on Linux, `threads_*` sums the threads alive at both ends of the window (off-CPU time includes idle waits; `threads_blkio_s` needs `kernel.task_delayacct=1`), and `machine_cpu_*`, `psi_*`, `vm_*`, `mem_*` and `disk_<device>_*` (devices with activity in the window) cover the whole machine.
+`engine_*` are the spawned store's checkpoints, evictions, WAL batch flushes and barriers, version clock ceiling writes with their time, and the time writers waited for a ceiling, each waiting writer counted; `requests_over_100ms` counts slow requests and `requests_over_100ms_s` sums their latencies.
+`sampler_max_gap_ms` is the longest gap between wake-ups of a thread that sleeps 10 ms, so a stall of the whole process or machine shows there, while a stall inside the engine does not.
+
 See [artifact formats](artifacts/README.md) for stored results.
 
 ## Shared maintenance

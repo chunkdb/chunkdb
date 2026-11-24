@@ -203,6 +203,11 @@ struct StoreRuntimeStats {
     std::uint64_t txn_history_copies = 0;
     std::uint64_t txn_history_copied_bytes = 0;
     std::uint64_t txn_history_bytes = 0;
+    // Durable writes of the version clock ceiling and their total time, and
+    // the time writers waited for a ceiling, each waiting writer counted.
+    std::uint64_t version_clock_extensions = 0;
+    std::uint64_t version_clock_extension_us = 0;
+    std::uint64_t version_clock_wait_us = 0;
 };
 
 // Random identity of a data directory, recorded in its manifest.
@@ -1421,6 +1426,9 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_background_eviction_failures_{0};
     std::atomic<std::uint64_t> stats_background_queue_full_inline_{0};
     std::atomic<std::uint64_t> stats_compressed_checkpoint_images_{0};
+    std::atomic<std::uint64_t> stats_version_clock_extensions_{0};
+    std::atomic<std::uint64_t> stats_version_clock_extension_us_{0};
+    std::atomic<std::uint64_t> stats_version_clock_wait_us_{0};
 
     // Also exists without a feed. Its per-thread nodes remain stable through
     // postcommit durability work and feed subscription recreation.

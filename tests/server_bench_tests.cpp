@@ -830,6 +830,57 @@ void TestSpawnModeReportsDurability() {
            std::string::npos);
 }
 
+// --system-stats adds each window's counters and the spawned server's close
+// time; without it the report has neither.
+void TestSystemStats() {
+    assert(!chunkdb::server_bench::ParseArgs({"bench"}).system_stats);
+    assert(chunkdb::server_bench::ParseArgs({"bench", "--system-stats"}).system_stats);
+    chunkdb::server_bench::Args args{
+        .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
+        .host = "127.0.0.1",
+        .port = 0,
+        .clients = 2,
+        .pipeline = 1,
+        .requests = 200,
+        .tests = {chunkdb::server_bench::Scenario::kWorld},
+        .keyspace = 64,
+        .seed = 3,
+        .output_mode = chunkdb::server_bench::OutputMode::kJson,
+        .log_level = chunkdb::LogLevel::kWarn,
+    };
+    args.system_stats = true;
+    const auto report = chunkdb::server_bench::Run(args);
+    assert(report.results.size() == 1U && report.server_close_s && *report.server_close_s >= 0.0);
+    const auto& stats = report.results[0].system_stats;
+    auto value = [&](const std::string& name) -> std::optional<std::string> {
+        for (const auto& [key, number] : stats)
+            if (key == name) return number;
+        return std::nullopt;
+    };
+    for (const char* name : {"window_s", "engine_checkpoints", "engine_version_clock_extensions",
+                             "engine_version_clock_wait_s", "sampler_max_gap_ms", "requests_over_100ms",
+                             "requests_over_100ms_s"})
+        assert(value(name));
+#ifndef _WIN32
+    assert(value("process_cpu_user_s") && value("process_voluntary_switches") && value("process_max_rss_kib_end"));
+#endif
+#ifdef __linux__
+    assert(value("machine_cpu_iowait_s") && value("threads_cpu_s") && value("threads_off_cpu_s"));
+#endif
+    for (const auto& [key, number] : stats) assert(!key.empty() && !number.empty() && number.find_first_not_of("-0123456789.") == std::string::npos);
+    const auto json = chunkdb::server_bench::RenderJsonReport(report);
+    assert(json.find("\"system\":{\"window_s\":") != std::string::npos);
+    assert(json.find("\"server_close_s\":") != std::string::npos);
+    const auto human = chunkdb::server_bench::RenderHumanReport(report);
+    assert(human.find("System: window_s=") != std::string::npos);
+    assert(human.find("report_only server_close_s=") != std::string::npos);
+
+    args.system_stats = false;
+    const auto plain = chunkdb::server_bench::Run(args);
+    assert(!plain.server_close_s && plain.results[0].system_stats.empty());
+    assert(chunkdb::server_bench::RenderJsonReport(plain).find("\"system\"") == std::string::npos);
+}
+
 }  // namespace
 
 // Every scenario runs against a spawned server; the retired protocol 2
@@ -1335,6 +1386,7 @@ int main(int argc, char** argv) {
     TestChunkFormsRetainDescribedStableColumnId();
     TestChunkReadsCoverNullAndForms();
     TestSpawnModeReportsDurability();
+    TestSystemStats();
     TestShortGridMixAndClippedAreas();
     TestEveryScenario();
     TestEnabledBenchmarkOptions();

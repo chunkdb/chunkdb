@@ -2,6 +2,7 @@
 
 #include <cstddef>
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <utility>
 #include <vector>
@@ -74,6 +75,9 @@ struct Args {
     // another, from when every measured client has logged in until they all
     // finish; report-only.
     std::size_t failed_logins = 0;
+    // Report-only: process, machine and engine counters of each measured
+    // window (except takeover) and the spawned server's close time.
+    bool system_stats = false;
     bool show_help = false;
 };
 
@@ -120,6 +124,8 @@ struct ScenarioResult {
     std::size_t failed_logins = 0;
     std::vector<WatcherResult> watchers;
     std::vector<std::pair<std::string, std::size_t>> request_mix;
+    // --system-stats counters of the measured window, as name and number.
+    std::vector<std::pair<std::string, std::string>> system_stats;
     double latency_avg_ms = 0.0;
     double latency_min_ms = 0.0;
     double latency_p50_ms = 0.0;
@@ -164,6 +170,8 @@ struct BenchmarkReport {
     std::string watch;
     // The --failed-logins value.
     std::size_t failed_login_clients = 0;
+    // --system-stats in spawn mode: seconds from Stop until the store closed.
+    std::optional<double> server_close_s;
     std::vector<ScenarioResult> results;
 };
 
