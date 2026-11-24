@@ -95,6 +95,12 @@ void CatalogFeed::TrimLocked() noexcept {
     }
 }
 
+void CatalogFeed::RetryLocked(const CatalogState& state) {
+    retry_.clear();
+    retry_.insert(state.unknown_tables.begin(), state.unknown_tables.end());
+    retry_.insert(state.unknown_slots.begin(), state.unknown_slots.end());
+}
+
 std::vector<std::function<void()>> CatalogFeed::NotifiesLocked() const {
     std::vector<std::function<void()>> notifies;
     notifies.reserve(subscriptions_.size());
@@ -112,13 +118,16 @@ void CatalogFeed::Refresh(const CatalogScope& scope, std::string_view user) noex
             if (!built_) return;
         }
         try {
-            CatalogState state = reader_(scope);
+            // Tables a previous read could not read are read again.
+            CatalogScope read = scope;
+            if (!read.all_tables) read.tables.insert(read.tables.end(), retry_.begin(), retry_.end());
+            CatalogState state = reader_(read);
             std::lock_guard lock(mutex_);
             // The last subscription left while the state was read.
             if (!built_) return;
-            const std::set<std::string, std::less<>> tables(scope.tables.begin(), scope.tables.end());
+            const std::set<std::string, std::less<>> tables(read.tables.begin(), read.tables.end());
             const auto in_scope = [&](const CatalogKey& key) {
-                return key.kind == CatalogKind::kUser || scope.all_tables || tables.contains(key.table);
+                return key.kind == CatalogKind::kUser || read.all_tables || tables.contains(key.table);
             };
             std::vector<CatalogKey> removed;
             for (const auto& entry : records_) {
@@ -146,11 +155,13 @@ void CatalogFeed::Refresh(const CatalogScope& scope, std::string_view user) noex
                 if (value.limited && at->second.limited != value.limited)
                     limited.push_back(Event{.key = &key, .action = "alter", .data = &*value.limited});
             }
+            RetryLocked(state);
             if (full.empty()) return;
             const std::uint64_t revision = revision_ + 1U;
             auto full_frame = std::make_shared<const std::string>(Push(revision, user, full));
+            // Who ran a statement is user information: only MANAGES USERS sees it.
             std::shared_ptr<const std::string> limited_frame =
-                limited.empty() ? nullptr : std::make_shared<const std::string>(Push(revision, user, limited));
+                limited.empty() ? nullptr : std::make_shared<const std::string>(Push(revision, {}, limited));
             const std::size_t bytes = full_frame->size() + (limited_frame ? limited_frame->size() : 0U);
             history_.push_back(Entry{.revision = revision, .full = std::move(full_frame),
                 .limited = std::move(limited_frame), .bytes = bytes});
@@ -163,18 +174,19 @@ void CatalogFeed::Refresh(const CatalogScope& scope, std::string_view user) noex
         } catch (const std::exception& error) {
             // The published records may no longer match the catalog: every
             // watch ends with INTERNAL, and a new one starts from the whole
-            // catalog again.
-            {
-                std::lock_guard lock(mutex_);
-                for (auto* subscription : subscriptions_) subscription->failed_ = true;
-                ClearLocked();
-            }
+            // catalog again. Nothing may leave this noexcept function.
             try {
+                {
+                    std::lock_guard lock(mutex_);
+                    for (auto* subscription : subscriptions_) subscription->failed_ = true;
+                    ClearLocked();
+                    retry_.clear();
+                    notifies = NotifiesLocked();
+                }
                 LogMessage(LogLevel::kError, LogComponent::kServer, "catalog feed failed", {{"error", error.what()}});
-                std::lock_guard lock(mutex_);
-                notifies = NotifiesLocked();
-            } catch (const std::bad_alloc&) {
-                // Without the wake the watches still end at FeedIo's next pass.
+            } catch (const std::exception&) {
+                // The failure is marked first: the watches end at FeedIo's next
+                // pass even without this log line or wake.
             }
         }
     }
@@ -192,8 +204,11 @@ std::shared_ptr<CatalogSubscription> CatalogFeed::Subscribe(bool users, std::fun
     if (state) *state = reader_(CatalogScope{.tables = {}, .all_tables = true});
     std::lock_guard lock(mutex_);
     if (state && !built_) {
+        // A new revision: no other state was published under it.
+        ++revision_;
         ClearLocked();
         records_ = std::move(state->records);
+        RetryLocked(*state);
         built_ = true;
     }
     std::shared_ptr<CatalogSubscription> subscription(

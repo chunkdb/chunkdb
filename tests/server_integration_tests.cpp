@@ -6815,6 +6815,60 @@ const FeedReply* CatalogEvent(const FeedReply& push, std::string_view kind, std:
         if (FeedMap(event, "kind").value == kind && FeedMap(event, "name").value == name) return &event;
     return nullptr;
 }
+// Who sees users, who keeps the watch, and the watch limit.
+void TestWatchCatalogRights() {
+    auto config = AuthenticatedFeedServerConfig(); config.worker_threads = 2; config.max_watches = 3;
+    ServerHarness harness("watch-catalog-rights", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    RawClient admin("127.0.0.1", harness.port); admin.SetReadDeadline(std::chrono::seconds(15)); admin.Login();
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    admin.SetReadDeadline(std::chrono::seconds(15));
+    for (const std::string name : {"ops", "um", "gone"}) {
+        admin.SendLine("CREATE USER " + name + " VERIFIER '" + verifier + "'"); assert(admin.ReadLine() == "+OK\r\n");
+    }
+    admin.SendLine("GRANT ADMIN ON * TO ops"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("GRANT MONITOR ON * TO um"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("ALTER USER um MANAGES USERS"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("GRANT MONITOR ON * TO gone"); assert(admin.ReadLine() == "+OK\r\n");
+    RawClient ops("127.0.0.1", harness.port); ops.SetReadDeadline(std::chrono::seconds(15)); ops.Login("ops", "pw");
+    RawClient um("127.0.0.1", harness.port); um.SetReadDeadline(std::chrono::seconds(15)); um.Login("um", "pw");
+    RawClient gone("127.0.0.1", harness.port); gone.SetReadDeadline(std::chrono::seconds(15)); gone.Login("gone", "pw");
+    for (auto* client : {&admin, &ops, &um, &gone}) client->SetReadDeadline(std::chrono::seconds(15));
+
+    // ADMIN on * without MANAGES USERS: no user records.
+    ops.SendLine("WATCH CATALOG"); (void)ReadFeedReply(ops);
+    const auto ops_whole = ReadFeedReply(ops);
+    assert(CatalogEvent(ops_whole, "table", "default") != nullptr && CatalogEvent(ops_whole, "user", "ops") == nullptr);
+    um.SendLine("WATCH CATALOG"); (void)ReadFeedReply(um);
+    assert(CatalogEvent(ReadFeedReply(um), "user", "um") != nullptr);
+    gone.SendLine("WATCH CATALOG"); (void)ReadFeedReply(gone);
+    (void)ReadFeedReply(gone);
+    // Catalog watches count against --max-watches.
+    admin.SendLine("WATCH CATALOG"); assert(admin.ReadLine().rfind("-ERR BUSY", 0) == 0);
+
+    // Who ran a statement is shown with MANAGES USERS only.
+    admin.SendLine("CREATE TABLE rights_t (n u8) CHUNK 4 x 4"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto hidden = ReadFeedReply(ops);
+    assert(CatalogEvent(hidden, "table", "rights_t") != nullptr && hidden.items[4].type == '_');
+    const auto shown = ReadFeedReply(um);
+    assert(CatalogEvent(shown, "table", "rights_t") != nullptr && shown.items[4].value == kAdminUser);
+    assert(ReadFeedReply(gone).items[2].value == shown.items[2].value);
+
+    // Losing MANAGES USERS ends a watch that shows users.
+    admin.SendLine("ALTER USER um NO MANAGES USERS"); assert(admin.ReadLine() == "+OK\r\n");
+    assert(um.ReadLine().rfind("-ERR PERMISSION_DENIED", 0) == 0);
+    assert(um.WaitForClose(std::chrono::seconds(5)));
+    // A dropped user's watch ends.
+    admin.SendLine("DROP USER gone"); assert(admin.ReadLine() == "+OK\r\n");
+    assert(gone.ReadLine().rfind("-ERR AUTH_REQUIRED", 0) == 0);
+    assert(gone.WaitForClose(std::chrono::seconds(5)));
+    // The ADMIN watch saw neither user change and goes on.
+    admin.SendLine("DROP TABLE rights_t"); assert(admin.ReadLine() == "+OK\r\n");
+    const auto dropped = ReadFeedReply(ops);
+    assert(dropped.items[5].items.size() == 1U && CatalogEvent(dropped, "table", "rights_t") != nullptr);
+    ops.SendBytes("UNWATCH\r\nPING\r\n");
+    assert(ops.ReadLine() == "+OK\r\n" && ops.ReadLine() == "+PONG\r\n");
+}
 void TestWatchCatalog() {
     auto config = AuthenticatedFeedServerConfig(); config.worker_threads = 2;
     ServerHarness harness("watch-catalog", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
@@ -7916,6 +7970,7 @@ void TestFeedWatch() {
     run("TestWatchNoIdle<RawClient>(false)", [] { TestWatchNoIdle<RawClient>(false); });
     run("TestWatchPositionsAndRights()", [] { TestWatchPositionsAndRights(); });
     run("TestWatchCatalog()", [] { TestWatchCatalog(); });
+    run("TestWatchCatalogRights()", [] { TestWatchCatalogRights(); });
     run("TestWatchSlowReader<RawClient>(false)", [] { TestWatchSlowReader<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL
     run("TestWatchLinger<TlsClient>(true, false)", [] { TestWatchLinger<TlsClient>(true, false); });

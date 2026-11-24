@@ -266,7 +266,7 @@ CommandEngine::CommandEngine(
         throw std::invalid_argument("max_auth_failures must be > 0");
     }
     catalog_feed_ = std::make_shared<CatalogFeed>(
-        [this](const CatalogScope& scope) { return ReadCatalog(scope); }, kDefaultFeedBufferBytes);
+        [this](const CatalogScope& scope) { return ReadCatalog(scope); }, catalog_->feed_buffer_bytes());
 }
 
 // The longest SCRAM message HELLO and AUTH take as a parameter frame.

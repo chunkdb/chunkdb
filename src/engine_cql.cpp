@@ -1229,6 +1229,9 @@ void CommandEngine::RequireManagesUsers(SessionState& session) const {
 }
 
 CatalogState CommandEngine::ReadCatalog(const CatalogScope& scope) const {
+    // Outside the statement that ran before: its cancellation or deadline
+    // neither stops this read nor ends the catalog watches.
+    const ScopedStatementControl detached(nullptr);
     CatalogState state;
     std::set<std::string, std::less<>> names(scope.tables.begin(), scope.tables.end());
     if (scope.all_tables) {
@@ -1254,18 +1257,20 @@ CatalogState CommandEngine::ReadCatalog(const CatalogScope& scope) const {
             state.unknown_slots.insert(name);
             continue;
         }
-        std::vector<FeedSlot> slots;
+        // Never waits for a table being reopened: its slots stay as published
+        // and are read again with the next change. A table that refuses leases,
+        // such as one whose feed needs recovery, does the same.
+        std::optional<std::vector<FeedSlot>> slots;
         try {
-            slots = table->ListFeedSlots(true);
-        } catch (const TableNotFoundError&) {
-            // Dropped meanwhile: the DROP publishes that when it ends.
-            state.unknown_slots.insert(name);
-            continue;
-        } catch (const TableFencedError&) {
+            slots = table->TryListFeedSlots(true);
+        } catch (const std::runtime_error&) {
+            slots.reset();
+        }
+        if (!slots) {
             state.unknown_slots.insert(name);
             continue;
         }
-        for (const auto& slot : slots) {
+        for (const auto& slot : *slots) {
             state.records.emplace(CatalogKey{.kind = CatalogKind::kSlot, .table = name, .name = slot.name},
                 CatalogValue{.full = SlotRecord(slot, true), .limited = SlotRecord(slot, false)});
         }
@@ -1517,10 +1522,13 @@ std::string CommandEngine::ExecuteStatement(
             CatalogFeed& feed;
             std::optional<CatalogScope> scope;
             std::string_view user;
+            const std::atomic<CommandEngineTestHook*>& hook;
             ~CatalogRefresh() {
-                if (scope) feed.Refresh(*scope, user);
+                if (!scope) return;
+                if (auto* test = hook.load(std::memory_order_acquire)) test->Run(CommandEngineTestHook::Point::kBeforeCatalogRefresh, {});
+                feed.Refresh(*scope, user);
             }
-        } catalog_refresh{*catalog_feed_, CatalogScopeOf(parsed.statement), session.user};
+        } catalog_refresh{*catalog_feed_, CatalogScopeOf(parsed.statement), session.user, hook_};
         return std::visit(
             Overloaded{
                 [&](const cql::ShowConnections&) {
@@ -1676,6 +1684,8 @@ std::string CommandEngine::ExecuteStatement(
                     return reply;
                 },
                 [&](const cql::Watch& watch) {
+                    // The open watch, its rights check and its count stay as they are.
+                    if (session.Watching()) return Protocol::Error("INVALID_ARGUMENT", "a watch is already open");
                     if (watch.catalog) {
                         RequireMonitor(session);
                         // Another process could change the catalog without a push.

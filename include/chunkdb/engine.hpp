@@ -57,7 +57,8 @@ enum class ServerRight : std::uint8_t;
 // Deterministic command interleavings, following the feed hooks.
 struct CommandEngineTestHook {
     enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted, kBeforeTxnBudgetReclaim,
-        kAfterRestoreProgress, kAfterRestoreUserRead, kBeforeTableStatsListing };
+        kAfterRestoreProgress, kAfterRestoreUserRead, kBeforeTableStatsListing,
+        kBeforeCatalogRefresh };
     virtual ~CommandEngineTestHook() = default;
     virtual void Run(Point point, std::string_view table) = 0;
 };

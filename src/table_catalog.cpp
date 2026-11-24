@@ -706,8 +706,23 @@ void Table::DropFeedSlot(std::string_view name, bool if_exists) {
 std::vector<FeedSlot> Table::ListFeedSlots(bool include_lost) {
     auto lease = Acquire();
     if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
-    auto slots = lease->store().feed_slots_->List(include_lost);
-    const auto& columns = lease->store().geometry().layout().schema().columns;
+    return ListFeedSlots(*lease, include_lost);
+}
+
+std::optional<std::vector<FeedSlot>> Table::TryListFeedSlots(bool include_lost) {
+    migration_health_->Check();
+    active_leases_.fetch_add(1, std::memory_order_seq_cst);
+    if (state_.load(std::memory_order_seq_cst) != State::kOpen || feed_cleanup_failed_.load(std::memory_order_acquire)) {
+        ReleaseLease();
+        return std::nullopt;
+    }
+    const Lease lease(this, store_.get());
+    return ListFeedSlots(lease, include_lost);
+}
+
+std::vector<FeedSlot> Table::ListFeedSlots(const Lease& lease, bool include_lost) {
+    auto slots = lease.store().feed_slots_->List(include_lost);
+    const auto& columns = lease.store().geometry().layout().schema().columns;
     for (auto& slot : slots) {
         // ClaimFeedSlot refuses a second watch by the same rule.
         if (const auto claimed = slot_claims_.find(slot.name); claimed != slot_claims_.end())

@@ -180,15 +180,18 @@ Store the applied position atomically with your own output to prevent duplicate 
 WATCH CATALOG streams changes to tables, columns, users, grants and slots.
 It needs MONITOR or ADMIN on `*`; users, grants and slot owners appear only with MANAGES USERS.
 The reply is `{epoch, revision}`: the catalog epoch identifies the server process, and the catalog revision orders catalog events within it.
-The first event holds the whole catalog: one `create` for each table, user and slot, at the revision of that event.
-Each later event carries what one statement changed, with the next catalog revision; a statement whose changes the watch cannot see leaves a gap.
-An event is `[catalog, epoch, revision, commit_time_ms, user, events, txn]`, with the user who ran the statement, and `txn` null.
+The first event holds the whole catalog: one `create` for each table, user and slot, at the revision of that event; each read of the whole catalog takes a new revision, so one revision names one catalog state.
+Each later event carries what a statement changed, with the next catalog revision; it can also carry changes of statements that ended at the same time, and a change the watch cannot see leaves a gap.
+An event is `[catalog, epoch, revision, commit_time_ms, user, events, txn]`, with `txn` null; `user` names the user whose statement sent the event, and is null in the whole-catalog event and for watches without MANAGES USERS.
 Each entry of `events` is a map of `kind` (`table`, `user` or `slot`), `action` (`create`, `alter` or `drop`), `name`, `table` (the table of a slot, null otherwise) and `data`, the object after the change, null for `drop`.
 A table's `data` is its DESCRIBE map without `revision`, so columns, CHECK constraints and options changes appear as `alter`.
 A user's `data` is its SHOW USERS map, so GRANT and REVOKE appear as `alter` of the user; a table rename or drop also changes the users whose grants follow it.
 A slot's `data` is a map of its SHOW SLOTS `filters` and `owner`; its position, lag and loss state are not catalog changes.
 RENAME TO appears as `drop` of the old name and `create` of the new one, SWAP TABLES as `alter` of both names.
-A watch that falls more than 67108864 bytes of events behind receives `[resync, epoch, revision, null, null]` and then the whole catalog again; start your catalog over from it.
+A table that cannot be read without waiting, such as one ALTER TABLE is reopening or one that is fenced, keeps its published records; its changes follow in a later event.
+The server keeps at most `--feed-buffer-bytes` (default 67108864) of catalog events for all catalog watches together; a table's `feed_buffer_bytes` does not apply.
+A watch further behind receives `[resync, epoch, revision, null, null]` and then the whole catalog again; start your catalog over from it.
+Catalog watches count against `--max-watches`, and a connection that already watches cannot start another watch.
 The catalog revision is not stored: after a server restart the epoch changes and the revision starts over, so watch the catalog again and rebuild your catalog from the first push.
 `CATALOG` after WATCH is a keyword: new tables cannot be named `catalog`, and a table of that name made before cannot be watched.
 The watch ends when the user loses MONITOR and ADMIN on `*`, or MANAGES USERS when it shows users.

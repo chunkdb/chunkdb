@@ -63,8 +63,10 @@ class CatalogSubscription;
 
 // One per server process. The catalog revision orders catalog pushes in the
 // feed's epoch, a random identity of the process; it grows by one with each
-// push that changes a record. Without subscriptions the feed keeps nothing and
-// Refresh returns at once.
+// push that changes a record and each time the feed reads the whole catalog,
+// so one revision names one catalog state. Without subscriptions the feed
+// keeps nothing and Refresh returns at once. Tables a read cannot read without
+// waiting keep their published records and are read again by the next Refresh.
 class CatalogFeed : public std::enable_shared_from_this<CatalogFeed> {
   public:
     // Reads every user and the tables and slots of the scope.
@@ -110,6 +112,8 @@ class CatalogFeed : public std::enable_shared_from_this<CatalogFeed> {
     void TrimLocked() noexcept;
     void Unsubscribe(CatalogSubscription* subscription) noexcept;
     [[nodiscard]] std::vector<std::function<void()>> NotifiesLocked() const;
+    // Tables `state` could not read, for the next Refresh to read again.
+    void RetryLocked(const CatalogState& state);
 
     const Reader reader_;
     const std::size_t buffer_bytes_;
@@ -117,6 +121,8 @@ class CatalogFeed : public std::enable_shared_from_this<CatalogFeed> {
     // Serializes Refresh and Subscribe: each reads the state and publishes it
     // as one step, so a later revision never shows an older state.
     std::mutex refresh_mutex_;
+    // Under refresh_mutex_: tables the last read could not read.
+    std::set<std::string, std::less<>> retry_;
     mutable std::mutex mutex_;
     std::set<CatalogSubscription*> subscriptions_;
     // The published records; valid while built_.
