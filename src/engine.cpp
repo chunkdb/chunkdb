@@ -878,6 +878,9 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (dynamic_cast<const TableExistsError*>(&error) != nullptr) {
         return Protocol::Error("TABLE_EXISTS", error.what());
     }
+    if (const auto* failed = dynamic_cast<const ConditionFailedError*>(&error); failed != nullptr) {
+        return Protocol::Error("CONDITION_FAILED", error.what(), {{"current", std::to_string(failed->current())}});
+    }
     if (const auto* conflict = dynamic_cast<const TransactionConflictError*>(&error); conflict != nullptr) {
         return Protocol::Error("CONFLICT", error.what(), {{"reason", TxnConflictReasonName(conflict->reason())}});
     }
