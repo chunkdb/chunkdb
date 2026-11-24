@@ -697,6 +697,10 @@ class ChunkStore {
     // populated chunk (TableCatalog::NarrowColumn, TableCatalog::DropColumnNull).
     [[nodiscard]] std::optional<std::string> FindValueNotFitting(
         std::uint32_t column_id, const ColumnType& type, bool refuse_null = false);
+    // The first present block the ADD CHECK in progress refuses, described
+    // as BlockChecks::FindPendingFailure does, or std::nullopt when none
+    // does. Reads every populated chunk (TableCatalog::AddCheck).
+    [[nodiscard]] std::optional<std::string> FindCheckFailure();
     // Whether memory, images or WALs contain any present block. Callers that
     // use the answer to change a schema must exclude concurrent writers.
     [[nodiscard]] bool HasPresentBlocks();
@@ -1839,7 +1843,8 @@ class ChunkStore {
         const std::vector<ColumnAssignment>& values, std::optional<std::uint64_t> expected_version);
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlockAtAddress(const ChunkCoord& coord, std::size_t index);
     [[nodiscard]] BlockReadMetadata GetBlockWithVersionAtAddress(const ChunkCoord& coord, std::size_t index);
-    void SetBlockInStateAtIndex(ChunkState& state, std::size_t index, const std::vector<ColumnAssignment>& values) const;
+    void SetBlockInStateAtIndex(
+        ChunkState& state, const ChunkCoord& coord, std::size_t index, const std::vector<ColumnAssignment>& values) const;
     void UnsetBlockInStateAtIndex(ChunkState& state, std::size_t index) const;
     [[nodiscard]] std::optional<std::vector<ColumnValue>> BlockInStateAtIndex(const ChunkState& state, std::size_t index) const;
     // This thread's BlockWrite, emptied.

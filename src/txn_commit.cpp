@@ -15,6 +15,7 @@
 
 #include "checkpoint.hpp"
 #include "statement_control.hpp"
+#include "block_checks.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
@@ -385,6 +386,8 @@ std::uint64_t ChunkStore::CommitTransaction(
         CanonicalizeAbsentBlocks(geometry_, state.presence_bitmap, &state.payload);
         geometry_.layout().RequireValidVars(state.vars, state.presence_bitmap);
         RequirePendingFits(state.payload, state.presence_bitmap, &state.vars);
+        if (const auto* checks = geometry_.checks())
+            checks->RequireChunk(writes[i].coord, state.payload, state.presence_bitmap, state.vars);
         if (state.chunk_columns) {
             const auto variable_bytes = ValidateChunkColumns(geometry_.chunk_schema(), state.chunk_columns->bytes);
             if (state.chunk_columns->variable_bytes != variable_bytes)

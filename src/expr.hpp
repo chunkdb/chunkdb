@@ -159,6 +159,11 @@ struct Assignments {
     std::set<std::size_t>* parameters,
     const Limits& limits = {});
 
+// `text`, a condition, with every block column `from` named `to`. A name
+// keeps its form (bare or "quoted"); a bare one becomes quoted when `to` is
+// a keyword. Throws ParseError when `text` is not a condition.
+[[nodiscard]] std::string RenameColumnIn(std::string_view text, std::string_view from, std::string_view to);
+
 // Whether `after_if`, the text after IF, is the version clause: VERSION
 // followed by an integer (a digit, or - and a digit) or a parameter. Anything
 // else after IF is a condition, so `IF version = 3` tests a column named
@@ -265,6 +270,9 @@ struct Inputs {
 // division or modulo by zero or a parameter that is missing or not of its
 // type.
 [[nodiscard]] bool EvaluateCondition(const ConditionPlan& plan, const Inputs& inputs);
+// Whether the condition is false; unknown is not (a CHECK passes it).
+// Throws as EvaluateCondition.
+[[nodiscard]] bool EvaluatesFalse(const ConditionPlan& plan, const Inputs& inputs);
 // The new values of AssignmentsPlan::targets(), all computed from the block
 // as it was. Throws as EvaluateCondition, and also std::out_of_range for a
 // value its column does not hold and std::invalid_argument for NULL in a

@@ -16,6 +16,8 @@
 
 namespace chunkdb {
 
+class BlockChecks;
+
 struct GeometryConfig {
     std::uint32_t large_chunk_width_chunks = 8;
     std::uint32_t large_chunk_height_chunks = 8;
@@ -60,6 +62,10 @@ class Geometry {
     [[nodiscard]] bool chunk_columns_require_initialization() const noexcept {
         return chunk_columns_require_initialization_;
     }
+    // The CHECK constraints of the current version and an ADD CHECK in
+    // progress, or null when there is none: a write evaluates checks only
+    // when this is set.
+    [[nodiscard]] const BlockChecks* checks() const noexcept { return checks_.get(); }
 
     // Coordinate overloads must match the table's active dimension count.
     [[nodiscard]] ChunkCoord BlockToChunk(std::int64_t block_x, std::int64_t block_y) const;
@@ -90,6 +96,7 @@ class Geometry {
     bool has_chunk_column_history_ = false;
     std::shared_ptr<const ChunkColumnState> default_chunk_columns_;
     bool chunk_columns_require_initialization_ = false;
+    std::shared_ptr<const BlockChecks> checks_;
 
     static std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor) noexcept;
     static std::int64_t FloorMod(std::int64_t value, std::int64_t divisor) noexcept;

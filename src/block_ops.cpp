@@ -1,5 +1,6 @@
 #include "chunkdb/chunk_store.hpp"
 
+#include "block_checks.hpp"
 #include "checkpoint.hpp"
 #include "statement_control.hpp"
 #include "chunk_store_internal.hpp"
@@ -267,7 +268,7 @@ void ChunkStore::SetBlockBitsAtAddress(const ChunkCoord& chunk_coord, std::size_
         throw std::invalid_argument("bit string must contain only 0 and 1");
     }
     if (const auto& pending = geometry_.layout().schema().pending;
-        pending.has_value() && !ValueFits(pending->type, BitsValue{.digits = std::string(bits)})) {
+        pending.has_value() && !pending->check.has_value() && !ValueFits(pending->type, BitsValue{.digits = std::string(bits)})) {
         throw std::invalid_argument(
             "the block's bits are being narrowed to " + ColumnTypeName(pending->type) + ", which does not hold this value");
     }
@@ -333,6 +334,9 @@ void ChunkStore::WriteBlockBitsLocked(
             next_bytes.end(),
             regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte));
         regular_chunk->presence_bitmap[presence_byte_index] = next_presence_byte;
+        // Checked on the block as written; the catch below takes it back.
+        if (const auto* checks = geometry_.checks(); checks != nullptr && present)
+            checks->RequireBlock(chunk_coord, regular_chunk->payload, regular_chunk->vars, block_index);
         const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
         WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
@@ -787,22 +791,31 @@ void ChunkStore::SetBlockInState(
     const std::vector<ColumnAssignment>& values) const {
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
-    SetBlockInStateAtIndex(state, block_index, values);
+    SetBlockInStateAtIndex(state, geometry_.BlockToChunk(block_x, block_y), block_index, values);
 }
 
 void ChunkStore::SetBlockInState3D(ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z,
     const std::vector<ColumnAssignment>& values) const {
     const auto local = geometry_.BlockToLocal(x, y, z);
-    SetBlockInStateAtIndex(state, geometry_.LocalBlockIndex(local[0], local[1], local[2]), values);
+    SetBlockInStateAtIndex(state, geometry_.BlockToChunk(x, y, z), geometry_.LocalBlockIndex(local[0], local[1], local[2]), values);
 }
 
-void ChunkStore::SetBlockInStateAtIndex(ChunkState& state, std::size_t block_index,
+void ChunkStore::SetBlockInStateAtIndex(ChunkState& state, const ChunkCoord& coord, std::size_t block_index,
     const std::vector<ColumnAssignment>& values) const {
     auto& write = PrepareSetBlockWrite(values, block_index);
     if (!BlockPresent(state.presence_bitmap, block_index)) {
         AddNewBlockColumns(write, block_index);
     }
-    ApplyBlockWriteToState(state, block_index, write, true);
+    const auto* checks = geometry_.checks();
+    if (checks == nullptr) {
+        ApplyBlockWriteToState(state, block_index, write, true);
+        return;
+    }
+    // Checked on a copy, so a block that fails leaves `state` as it was.
+    ChunkState next = state;
+    ApplyBlockWriteToState(next, block_index, write, true);
+    checks->RequireBlock(coord, next.payload, next.vars, block_index);
+    state = std::move(next);
 }
 
 void ChunkStore::UnsetBlockInState(ChunkState& state, std::int64_t block_x, std::int64_t block_y) const {
@@ -1040,6 +1053,9 @@ void ChunkStore::WriteBlockColumnsLocked(
         if (!var_update.empty()) {
             var_undo = ApplyVarUpdate(&chunk->vars, std::move(var_update));
         }
+        // Checked on the block as written; the catch below takes it back.
+        if (const auto* checks = geometry_.checks(); checks != nullptr && present)
+            checks->RequireBlock(chunk_coord, chunk->payload, chunk->vars, block_index);
         const std::uint64_t commit_time_ms = NextCommitTimeMs(*chunk);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
         WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
@@ -1079,7 +1095,8 @@ void ChunkStore::RequirePendingFits(
     const ChunkVars* vars) const {
     const auto& layout = geometry_.layout();
     const auto& pending = layout.schema().pending;
-    if (!pending.has_value()) {
+    // An ADD CHECK in progress names no column; BlockChecks enforces it.
+    if (!pending.has_value() || pending->check.has_value()) {
         return;
     }
     const std::size_t index = layout.IndexOfId(pending->column_id);
@@ -1257,6 +1274,28 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(
     }
 }
 
+std::optional<std::string> ChunkStore::FindCheckFailure() {
+    const auto* checks = geometry_.checks();
+    if (checks == nullptr) throw std::logic_error("no ADD CHECK is in progress");
+    bool has_cursor = false;
+    ChunkCoord cursor{};
+    while (true) {
+        const auto page = ScanPopulatedChunks(has_cursor, cursor, kMaxChunkScanLimit);
+        for (const auto& coord : page.coords) {
+            const auto chunk = GetOrLoadRegularChunk(coord);
+            auto lock = LockStatementChunkShared(chunk->mutex);
+            if (auto failure = checks->FindPendingFailure(coord, chunk->payload, chunk->presence_bitmap, chunk->vars)) {
+                return failure;
+            }
+        }
+        if (!page.has_more || page.coords.empty()) {
+            return std::nullopt;
+        }
+        cursor = page.coords.back();
+        has_cursor = true;
+    }
+}
+
 bool ChunkStore::HasPresentBlocks() {
     // A populated chunk may hold only chunk metadata, so check its blocks,
     // read without loading the chunk into the cache.
@@ -1393,6 +1432,8 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
     if (!payload_changed && !presence_changed && var_update.empty() && !metadata_changed && !first_write) {
         return regular_chunk->version;
     }
+    if (const auto* checks = geometry_.checks())
+        checks->RequireChunkAfter(chunk_coord, payload, presence_bitmap, regular_chunk->vars, var_update);
 
     // Reserve the version token before the chunk changes, so a version-clock
     // failure is a clean pre-WAL error and an open transaction can keep the

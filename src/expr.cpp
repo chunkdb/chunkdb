@@ -1222,6 +1222,28 @@ std::vector<AssignmentExpression> ParseAssignmentsAt(
     return values;
 }
 
+std::string RenameColumnIn(std::string_view text, std::string_view from, std::string_view to) {
+    const Condition condition = ParseCondition(text);
+    // Token starts, ascending, of the names to replace.
+    std::vector<std::size_t> starts;
+    for (const auto& node : condition.expression.nodes) {
+        if (node.op == Op::kColumn && node.name == from) starts.push_back(node.column - 1U);
+    }
+    std::sort(starts.begin(), starts.end());
+    std::string renamed;
+    std::size_t copied = 0U;
+    for (const auto start : starts) {
+        const bool quoted = text[start] == '"';
+        const std::size_t length = quoted ? text.find('"', start + 1U) + 1U - start : from.size();
+        renamed.append(text.substr(copied, start - copied));
+        if (quoted || IsKeyword(to)) renamed.append("\"").append(to).append("\"");
+        else renamed.append(to);
+        copied = start + length;
+    }
+    renamed.append(text.substr(copied));
+    return renamed;
+}
+
 bool IsVersionClause(std::string_view after_if) {
     try {
         std::size_t at = 0;
