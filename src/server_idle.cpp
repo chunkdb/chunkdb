@@ -8,7 +8,10 @@
 
 #include <algorithm>
 #include <climits>
+#include <functional>
 #include <limits>
+#include <queue>
+#include <unordered_map>
 
 namespace chunkdb {
 using namespace server_detail;
@@ -41,7 +44,7 @@ bool ControlRequest(std::string_view line) {
 }
 
 IdleIo::IdleIo(ChunkServer& server)
-    : server_(server), poller_(std::numeric_limits<std::uint32_t>::max() - 1U) {}
+    : server_(server) {}
 IdleIo::~IdleIo() { Stop(); }
 void IdleIo::Start() {
     const auto wake = [weak = weak_from_this()] { if (auto io = weak.lock()) io->Wake(); };
@@ -59,6 +62,13 @@ void IdleIo::Start() {
 }
 void IdleIo::Stop() { Wake(); if (thread_.joinable()) thread_.join(); }
 void IdleIo::Wake() noexcept { poller_.Wake(); }
+void IdleIo::Touch(const std::shared_ptr<ServerConnection>& connection) {
+    {
+        std::lock_guard lock(mutex_);
+        touched_incoming_.push_back(connection);
+    }
+    Wake();
+}
 bool IdleIo::Add(std::shared_ptr<ServerConnection> connection) {
     {
         std::lock_guard lock(mutex_);
@@ -225,7 +235,7 @@ bool IdleIo::Initialize(ServerConnection& connection) {
         std::shared_ptr<StatementControl> statement;
         { std::lock_guard lock(target->record->mutex); statement = target->record->statement; }
         if (statement) (void)statement->RequestStop(StatementStopReason::kKilled);
-        Wake();
+        Touch(target);
         server_.WakeWaitingWorker(*target);
         if (auto feed = server_.FeedIoHandle()) feed->Wake();
         return killed;
@@ -496,6 +506,7 @@ void IdleIo::CheckStatements() {
                 Reply(*connection, StatementStoppedReply(*stopped));
                 if (connection->record->killed.load()) connection->session.close_after_reply = true;
                 if (queued) clients_returned_.push_back(connection);
+                else touched_.push_back(connection);
             } catch (const std::exception& error) { Abandon(connection, error); }
         }
     }
@@ -529,6 +540,7 @@ void IdleIo::PumpCredits() {
             connection->read_ready = true;
             if (auto* hook = server_.delivery_test_hook_.load(std::memory_order_acquire))
                 hook->Run(FeedDeliveryTestHook::Point::kAfterPayloadCreditGranted, connection->session.connection_id);
+            granted_.push_back(connection);
             waiters.pop_front();
             if (data) data_waiter_count_.fetch_sub(1U, std::memory_order_release);
         }
@@ -847,77 +859,153 @@ void IdleIo::Abandon(std::shared_ptr<ServerConnection>& connection, const std::e
 }
 
 void IdleIo::Run() {
-    std::vector<std::shared_ptr<ServerConnection>> clients;
-    std::vector<SocketInterest> interests;
+    using Clock = std::chrono::steady_clock;
+    using Phase = ServerConnection::Phase;
+    struct Owned {
+        std::shared_ptr<ServerConnection> connection;
+        // The earliest deadline last queued for it; max while none is.
+        Clock::time_point due = Clock::time_point::max();
+    };
+    // The connections this thread owns, by poller token; a token is never reused.
+    std::unordered_map<std::uint64_t, Owned> clients;
+    std::uint64_t next_token = 0U;
+    using Due = std::pair<Clock::time_point, std::uint64_t>;
+    std::priority_queue<Due, std::vector<Due>, std::greater<>> deadlines;
+    // serve: this pass. waiting: a queue refusal or line credit, retried on
+    // every pass. immediate: buffered input or granted credit, served by a
+    // pass that does not wait.
+    std::vector<std::uint64_t> serve, waiting, immediate;
+    std::vector<std::shared_ptr<ServerConnection>> arrived;
+    std::vector<std::weak_ptr<ServerConnection>> touched;
+    std::vector<server_detail::ReadinessPoller::Ready> ready;
     const auto fail = [&](const std::exception& error) {
         LogMessage(LogLevel::kError, LogComponent::kServer,
             "connection transport terminated", {{"error", error.what()}});
         server_.Stop();
+    };
+    const auto own = [&](std::shared_ptr<ServerConnection> connection) {
+        const auto token = ++next_token;
+        connection->io_token = token;
+        clients.emplace(token, Owned{std::move(connection)});
+        serve.push_back(token);
+    };
+    const auto mark = [&](const std::shared_ptr<ServerConnection>& connection, std::vector<std::uint64_t>& into) {
+        const auto found = clients.find(connection->io_token);
+        if (found != clients.end() && found->second.connection == connection) into.push_back(found->first);
+    };
+    // After a step: the events the connection waits for and its next deadline.
+    const auto settle = [&](std::uint64_t token, Owned& owned, Clock::time_point now) {
+        const auto& connection = *owned.connection;
+        const bool delayed = connection.phase == Phase::kReply && now < connection.session.reply_not_before;
+        const bool parked = connection.phase == Phase::kReady || connection.waiting_line_credit;
+        poller_.Set(token, connection.socket,
+            static_cast<short>(parked || delayed || connection.waiting_credit ? 0 : connection.io_wait));
+        auto due = Clock::time_point::max();
+        const auto until = [&](Clock::time_point at) { due = std::min(due, at); };
+        if (delayed) until(connection.session.reply_not_before);
+        if (!connection.session.greeted && !DelayedLoginReply(connection)) until(connection.handshake_deadline);
+        if (connection.input_deadline) until(*connection.input_deadline);
+        if (connection.output_deadline) until(*connection.output_deadline);
+        if (connection.waiting_credit && connection.credit_deadline) until(*connection.credit_deadline);
+        else if (connection.phase == Phase::kInput && !connection.input_deadline) until(connection.idle_deadline);
+        if (due != owned.due && due != Clock::time_point::max()) deadlines.push({due, token});
+        owned.due = due;
+        if (parked) waiting.push_back(token);
+        if (connection.read_ready && !connection.waiting_credit && connection.phase == Phase::kInput)
+            immediate.push_back(token);
     };
     try {
         while (server_.running_.load()) {
             poller_.DrainWake();
             {
                 std::lock_guard lock(mutex_);
-                clients.insert(clients.end(), std::make_move_iterator(incoming_.begin()),
-                    std::make_move_iterator(incoming_.end()));
-                incoming_.clear();
+                arrived.swap(incoming_);
                 statements_.insert(statements_.end(), std::make_move_iterator(incoming_statements_.begin()),
                     std::make_move_iterator(incoming_statements_.end()));
                 incoming_statements_.clear();
+                touched.swap(touched_incoming_);
             }
+            for (auto& connection : arrived) own(std::move(connection));
+            arrived.clear();
+            for (const auto& weak : touched) if (const auto connection = weak.lock()) mark(connection, serve);
+            touched.clear();
             CheckStatements();
-            clients.insert(clients.end(), std::make_move_iterator(clients_returned_.begin()),
-                std::make_move_iterator(clients_returned_.end()));
+            for (auto& connection : clients_returned_) own(std::move(connection));
             clients_returned_.clear();
+            for (const auto& connection : touched_) mark(connection, serve);
+            touched_.clear();
             PumpCredits();
-            for (auto& connection : clients) {
-                // Closed while its stopped statement was answered.
-                if (connection->socket == kInvalidSocket) { connection.reset(); continue; }
-                try { Serve(connection); }
-                catch (const std::exception& error) { Abandon(connection, error); }
+            for (const auto& connection : granted_) mark(connection, serve);
+            granted_.clear();
+            serve.insert(serve.end(), waiting.begin(), waiting.end());
+            waiting.clear();
+            serve.insert(serve.end(), immediate.begin(), immediate.end());
+            immediate.clear();
+            for (const auto now = Clock::now(); !deadlines.empty() && deadlines.top().first <= now;) {
+                const auto [at, token] = deadlines.top();
+                deadlines.pop();
+                const auto found = clients.find(token);
+                if (found == clients.end() || found->second.due != at) continue;
+                found->second.due = Clock::time_point::max();
+                serve.push_back(token);
             }
-            std::erase(clients, nullptr);
+            std::sort(serve.begin(), serve.end());
+            serve.erase(std::unique(serve.begin(), serve.end()), serve.end());
+            for (const auto token : serve) {
+                const auto found = clients.find(token);
+                if (found == clients.end()) continue;
+                auto connection = found->second.connection;
+                // Closed while its stopped statement was answered.
+                if (connection->socket == kInvalidSocket) connection.reset();
+                else {
+                    try { Serve(connection); }
+                    catch (const std::exception& error) { Abandon(connection, error); }
+                }
+                if (connection) {
+                    // A registration the poller refuses closes only this connection.
+                    try { settle(token, found->second, Clock::now()); continue; }
+                    catch (const std::exception& error) { Abandon(connection, error); }
+                }
+                // Handed on or closed: this thread no longer waits on it.
+                poller_.Remove(token);
+                clients.erase(found);
+            }
+            serve.clear();
             PumpCredits();
-            interests.clear();
-            interests.reserve(clients.size());
+            for (const auto& connection : granted_) mark(connection, immediate);
+            granted_.clear();
             int timeout = -1;
-            const auto now = std::chrono::steady_clock::now();
+            const auto now = Clock::now();
             const auto wait_until = [&](auto until) {
                 const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(until - now).count();
                 const auto bounded = static_cast<int>(std::clamp<std::int64_t>(remaining, 0, INT_MAX));
                 timeout = timeout < 0 ? bounded : std::min(timeout, bounded);
             };
-            for (const auto& connection : clients) {
-                const bool delayed = connection->phase == ServerConnection::Phase::kReply &&
-                    now < connection->session.reply_not_before;
-                interests.push_back({connection->socket,
-                    static_cast<short>(connection->phase == ServerConnection::Phase::kReady || delayed ||
-                        connection->waiting_credit || connection->waiting_line_credit ? 0 : connection->io_wait), 0});
-                if (delayed) wait_until(connection->session.reply_not_before);
-                if (!connection->session.greeted && !DelayedLoginReply(*connection))
-                    wait_until(connection->handshake_deadline);
-                if (connection->input_deadline) wait_until(*connection->input_deadline);
-                if (connection->output_deadline) wait_until(*connection->output_deadline);
-                if (connection->waiting_credit && connection->credit_deadline) wait_until(*connection->credit_deadline);
-                else if (connection->phase == ServerConnection::Phase::kInput && !connection->input_deadline)
-                    wait_until(connection->idle_deadline);
-                if (connection->read_ready && !connection->waiting_credit && connection->phase == ServerConnection::Phase::kInput) timeout = 0;
+            // Entries a later step replaced are dropped on the way to the earliest current one.
+            while (!deadlines.empty()) {
+                const auto found = clients.find(deadlines.top().second);
+                if (found != clients.end() && found->second.due == deadlines.top().first) break;
+                deadlines.pop();
             }
+            if (!deadlines.empty()) wait_until(deadlines.top().first);
             for (const auto& tracked : statements_)
                 if (const auto deadline = tracked.statement->deadline(); deadline && *deadline > now) wait_until(*deadline);
+            if (!immediate.empty()) timeout = 0;
             if (!server_.running_.load()) break;
-            (void)poller_.Wait(interests, timeout);
-            // A writable reply is not input: Write runs in its phase regardless.
-            for (std::size_t i = 0U; i < clients.size(); ++i)
-                if (interests[i].ready != 0 && clients[i]->phase != ServerConnection::Phase::kReply)
-                    clients[i]->read_ready = true;
+            (void)poller_.Wait(timeout, ready);
+            for (const auto& reported : ready) {
+                const auto found = clients.find(reported.token);
+                if (found == clients.end()) continue;
+                // A writable reply is not input: Write runs in its phase regardless.
+                if (found->second.connection->phase != Phase::kReply) found->second.connection->read_ready = true;
+                serve.push_back(reported.token);
+            }
         }
     } catch (const std::exception& error) {
         // Only the poller, wake-ups and the scan itself fail here.
         fail(error);
     }
-    for (const auto& connection : clients) if (connection) server_.CloseClient(*connection);
+    for (const auto& entry : clients) if (entry.second.connection) server_.CloseClient(*entry.second.connection);
     const auto close_queued = [&](const auto& tracked) {
         if (tracked.statement) (void)tracked.statement->RequestStop(StatementStopReason::kKilled);
         if (tracked.io_claimed || (tracked.statement && tracked.statement->TakeQueuedStop()))
