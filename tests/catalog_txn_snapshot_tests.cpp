@@ -409,8 +409,9 @@ void CohortsDuringBackgroundCheckpointFiles() {
     assert(engine.Execute(session, "HELLO 3\r\n").starts_with("%"));
     assert(engine.Execute(session, "GET BLOCK 0 0 FROM t\r\n").find(replaced) != std::string::npos);
 }
-// SHOW METRICS leaves out a table that an exclusive statement waits for, or
-// one that failed, instead of waiting for it or failing.
+// SHOW METRICS leaves out the store samples of a table that an exclusive
+// statement waits for, or one that failed, instead of waiting for it or
+// failing; its chunkdb_table_fenced sample stays.
 void MetricsSkipBusyAndFailedTables() {
     test::ScopedTempDir directory("chunkdb-catalog-metrics-busy");
     auto catalog = std::make_shared<TableCatalog>(Config(directory.path()));
@@ -429,16 +430,24 @@ void MetricsSkipBusyAndFailedTables() {
     lease.reset();
     assert(prompt);
     const auto busy = render.get();
-    assert(busy.find("table=\"a\"") == std::string::npos);
+    const auto only_fenced_sample = [](const std::string& text) {
+        const auto first = text.find("table=\"a\"");
+        return first != std::string::npos && text.find("table=\"a\"", first + 1U) == std::string::npos &&
+            text.find("\nchunkdb_table_fenced{table=\"a\"} 0\n") != std::string::npos;
+    };
+    assert(only_fenced_sample(busy));
     assert(busy.find("chunkdb_checkpoints_total{table=\"b\"} ") != std::string::npos);
+    assert(busy.find("\nchunkdb_slot_frontier_frozen{table=\"b\"} 0\n") != std::string::npos);
     assert(alter.get() == "+OK\r\n");
-    assert(engine.RenderMetrics().find("chunkdb_checkpoints_total{table=\"a\"} ") != std::string::npos);
+    const auto serving = engine.RenderMetrics();
+    assert(serving.find("chunkdb_checkpoints_total{table=\"a\"} ") != std::string::npos);
+    assert(serving.find("\nchunkdb_slot_frontier_frozen{table=\"a\"} 0\n") != std::string::npos);
 
     CatalogTxnTestAccess::SetFailed(*table, true);
     std::string failed;
     try { failed = engine.RenderMetrics(); } catch (const std::exception&) {}
     CatalogTxnTestAccess::SetFailed(*table, false);
-    assert(failed.find("table=\"a\"") == std::string::npos);
+    assert(only_fenced_sample(failed));
     assert(failed.find("chunkdb_checkpoints_total{table=\"b\"} ") != std::string::npos);
 }
 }  // namespace

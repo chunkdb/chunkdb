@@ -206,6 +206,9 @@ void SlotWatch::Finish(std::optional<Output> control) {
     // Archive/subscription destruction can enter table control; never do it
     // on the socket thread or while holding its queue lock.
     pending_.reset();
+    projected_ = false;
+    merge_.Clear();
+    merged_.reset();
     prepared_.reset();
     (void)LeaveExcessQueue();  // Finish wakes the worker for the next waiter.
     archive_.reset();
@@ -394,6 +397,8 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original, bool f
     return true;
 }
 bool SlotWatch::Progress(const FeedSlot& slot) {
+    // The cursor has passed the merged pushes; no progress before their frame.
+    if (Merging()) return FlushMerge();
     const auto now = std::chrono::steady_clock::now();
     if (now < next_progress_) return false;
     next_progress_ = now + options_.progress_interval;
@@ -474,12 +479,7 @@ bool SlotWatch::Work() {
             archive_->SetEntryBudget(budget());
             pending_ = archive_->Next();
         }
-        if (pending_) {
-            if (!Publish(pending_, Filtered())) return changed;
-            cursor_ = pending_->position;
-            pending_.reset();
-            return true;
-        }
+        if (pending_) return Deliver(Filtered()) || changed;
         cursor_ = archive_->through();
         archive_.reset();
         joined_ = cursor_.revision >= join_;
@@ -494,11 +494,48 @@ bool SlotWatch::Work() {
         pending_.reset();
         return true;
     }
-    if (pending_->position.revision <= cursor_.revision) { pending_.reset(); return true; }
-    if (pending_->position.revision > slot.durable_watermark) return changed;
-    if (!Publish(pending_)) return changed;
-    cursor_ = pending_->position;
-    pending_.reset();
+    if (pending_->position.revision <= cursor_.revision) { pending_.reset(); projected_ = false; return true; }
+    if (pending_->position.revision > slot.durable_watermark) {
+        // Merged pushes below the durable frontier need not wait for it.
+        const bool flushed = Merging() && FlushMerge();
+        return flushed || changed;
+    }
+    return Deliver(false) || changed;
+}
+bool SlotWatch::Deliver(bool filtered) {
+    const bool mutation = pending_->kind == FeedEntry::Kind::kChange || pending_->kind == FeedEntry::Kind::kChunks;
+    if (options_.chunks && mutation && !filtered && !projected_) {
+        // Projected once, so a waiting push keeps its built frame and its place in the pool queue.
+        auto projected = ChunkFeedEntry(pending_, table_->geometry(), options_.areas, options_.column_ids);
+        if (!projected) { cursor_ = pending_->position; pending_.reset(); return true; }
+        pending_ = std::move(projected);
+        projected_ = true;
+    }
+    // While earlier output is unsent, chunks pushes merge.
+    if (options_.chunks && pending_->kind == FeedEntry::Kind::kChunks && (Merging() || Lagging())) {
+        std::size_t quota;
+        { std::lock_guard lock(mutex_); quota = quota_; }
+        if (!merged_ && merge_.Add(pending_, quota)) {
+            cursor_ = pending_->position; pending_.reset(); projected_ = false;
+            return true;
+        }
+        // Another schema version or a full merge waits for the merged frame.
+        // An empty merge cannot take a push above the share; it is published alone.
+        if (Merging()) return FlushMerge();
+    }
+    if (!FlushMerge()) return false;
+    if (!Publish(pending_, filtered || projected_)) return false;
+    cursor_ = pending_->position; pending_.reset(); projected_ = false;
+    return true;
+}
+bool SlotWatch::FlushMerge() {
+    if (!merged_) {
+        if (merge_.empty()) return true;
+        if (Lagging()) return false;
+        merged_ = merge_.Take();
+    }
+    if (!Publish(merged_, true)) return false;
+    merged_.reset();
     return true;
 }
 bool SlotWatch::WorkStep() {
