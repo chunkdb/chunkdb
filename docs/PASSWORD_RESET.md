@@ -36,6 +36,7 @@ printf 'choose-a-new-private-password\n' > ./new.password
 ```
 
 Restart your server and connect with the new password.
+The reset leaves the user one password: a verifier added with ADD VERIFIER is removed.
 The tool must have permission to write the data directory.
 It refuses a backup directory; restore the backup with `chunkdb_restore` first.
 The reset keeps the user's [channel binding](USERS.md#channel-binding) requirement, so such a user still needs a `chunks://` connection.

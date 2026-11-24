@@ -30,6 +30,24 @@ chunk-cli --uri "$CHUNKDB_URI" "ALTER USER admin PASSWORD"
 The CLI prompts twice and computes the password verifier locally.
 See [User statements](reference/USER_STATEMENTS.md) for creation, password files, and conditional forms.
 
+## Rotate a password
+
+A user can hold two verifiers, so clients move to a new password while the old one still logs in:
+
+```cql
+ALTER USER bot ADD VERIFIER $1
+ALTER USER bot DROP OLD VERIFIER
+```
+
+Compute the new verifier with the salt and iteration count of the current one.
+They are the `<iterations>:<salt>` part of the current verifier text, and a login as the user receives them as `i=` and `s=` in the SCRAM server-first message.
+In chunkdb-js, `scramVerifier(password, { salt, iterations })` with the decoded salt bytes computes such a verifier.
+chunk-cli PASSWORD forms and chunkdb-go `ComputeVerifier` pick a new salt, so their verifiers fit VERIFIER but not ADD VERIFIER.
+After ADD VERIFIER both passwords log in.
+Move every client to the new password, then run DROP OLD VERIFIER; from then on only the new password logs in.
+Connections logged in with the old password stay open.
+SHOW USERS reports `verifiers = 2` while a user has two, and the audit log records `change` on each `alter_user` line, so an added verifier stays visible.
+
 ## Rights
 
 ADMIN includes WRITE, and WRITE includes READ.

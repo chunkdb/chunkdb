@@ -52,9 +52,11 @@ UserPublication UserRegistry::PreparePublication(std::shared_ptr<const Users> ne
         auto state = existing->second.state;
         auto entry = existing->second;
         const auto& previous = before->users.at(name);
-        // A login checked against the previous verifier or binding requirement
-        // must not take a ticket after either changes.
-        const bool credentials_changed = user.verifier != previous.verifier ||
+        // A login checked against a verifier the user no longer has, or
+        // against the previous binding requirement, must not take a ticket.
+        // Adding a verifier keeps those a login was checked against.
+        const bool credentials_changed = !HoldsVerifier(user, previous.verifier) ||
+            (previous.added_verifier.has_value() && !HoldsVerifier(user, *previous.added_verifier)) ||
             user.requires_channel_binding != previous.requires_channel_binding;
         if (!credentials_changed && user.max_connections == previous.max_connections &&
             user.statements_per_sec == previous.statements_per_sec) {

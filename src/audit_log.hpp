@@ -38,6 +38,8 @@ class AuditLog {
         std::string_view target_user{};
         std::string_view slot{};
         std::string_view migration{};
+        // The ALTER USER form, e.g. "add_verifier".
+        std::string_view change{};
         std::optional<std::uint64_t> target_connection{};
     };
     // Appends one line; a failure is logged, never thrown.

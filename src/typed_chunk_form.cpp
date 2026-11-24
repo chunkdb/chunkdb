@@ -107,7 +107,7 @@ struct EncodingPlan {
 
 EncodingPlan PlanEncoding(
     const Geometry& geometry, const ChunkState& state, std::size_t max_variable_bytes,
-    std::span<const std::size_t> projection) {
+    std::span<const std::size_t> projection, bool scaled) {
     CheckBlockState(geometry, state);
     EncodingPlan plan;
     plan.metadata = Metadata(geometry, state);
@@ -127,22 +127,23 @@ EncodingPlan PlanEncoding(
     const auto metadata_size = plan.metadata ? plan.metadata->bytes.size() : 0U;
     const auto section_count = 2U + static_cast<unsigned>(plan.fixed_size != 0U) +
         static_cast<unsigned>(plan.validity_size != 0U) + static_cast<unsigned>(plan.variable_size != 0U) +
-        static_cast<unsigned>(metadata_size != 0U);
+        static_cast<unsigned>(metadata_size != 0U) + static_cast<unsigned>(scaled);
     plan.total_size = 36U + 12U * section_count + state.presence_bitmap.size() + plan.fixed_size +
-        plan.validity_size + plan.variable_size + metadata_size + 4U + 24U * plan.count;
+        plan.validity_size + plan.variable_size + metadata_size + 4U + 24U * plan.count + (scaled ? 8U : 0U);
     return plan;
 }
 }  // namespace
 
 std::size_t SectionedChunkStateBytes(const Geometry& geometry, const ChunkState& state,
-    std::size_t max_variable_bytes, std::span<const std::size_t> projection) {
-    return PlanEncoding(geometry, state, max_variable_bytes, projection).total_size;
+    std::size_t max_variable_bytes, std::span<const std::size_t> projection, const ChunkFormScale* scale) {
+    return PlanEncoding(geometry, state, max_variable_bytes, projection, scale != nullptr).total_size;
 }
 
 std::vector<std::uint8_t> EncodeSectionedChunkState(
     const Geometry& geometry, const ChunkState& state, std::size_t max_variable_bytes,
-    std::span<const std::size_t> projection, bool private_state, std::size_t max_form_bytes) {
-    const auto plan = PlanEncoding(geometry, state, max_variable_bytes, projection);
+    std::span<const std::size_t> projection, bool private_state, std::size_t max_form_bytes,
+    const ChunkFormScale* scale) {
+    const auto plan = PlanEncoding(geometry, state, max_variable_bytes, projection, scale != nullptr);
     if (plan.total_size > std::min(max_form_bytes, static_cast<std::size_t>(std::numeric_limits<std::uint32_t>::max())))
         Invalid("chunk form exceeds its byte limit");
     const auto& layout = geometry.layout();
@@ -181,6 +182,13 @@ std::vector<std::uint8_t> EncodeSectionedChunkState(
     add(ChunkFormSectionKind::kVariableValues, vars);
     if (plan.metadata) add(ChunkFormSectionKind::kChunkColumns, plan.metadata->bytes);
     add(ChunkFormSectionKind::kBlockSpans, descriptors);
+    Bytes scale_body;
+    if (scale != nullptr) {
+        Put32(scale_body, scale->factor);
+        // reduction:u16, then the reserved zero u16.
+        Put32(scale_body, static_cast<std::uint32_t>(scale->reduction));
+        add(ChunkFormSectionKind::kScale, scale_body);
+    }
     ChunkFormHeader header;
     header.flags = static_cast<std::uint16_t>((projection.empty() ? 0U : kChunkFormProjected) |
                                              (private_state ? kChunkFormPrivate : 0U));

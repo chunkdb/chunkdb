@@ -111,19 +111,29 @@ class ServerExchange {
         Verifier verifier,
         std::string_view server_nonce,
         std::span<const std::uint8_t> binding_data = {});
+    // The proof is checked against each of `verifiers`, which share one salt
+    // and iteration count: those of a user with two verifiers. Throws
+    // std::invalid_argument for none, or for verifiers with other salts.
+    ServerExchange(
+        ClientFirst first,
+        std::vector<Verifier> verifiers,
+        std::string_view server_nonce,
+        std::span<const std::uint8_t> binding_data = {});
     // `r=<client nonce + server nonce>,s=<salt>,i=<iterations>`.
     [[nodiscard]] const std::string& ServerFirst() const noexcept { return server_first_; }
-    // The verifier the client's proof is checked against.
-    [[nodiscard]] const Verifier& UserVerifier() const noexcept { return verifier_; }
+    // The verifiers the client's proof is checked against.
+    [[nodiscard]] const std::vector<Verifier>& Verifiers() const noexcept { return verifiers_; }
     // The server-final message `v=<signature>` when the client's proof is
-    // right, std::nullopt when it is wrong. Throws std::invalid_argument for
-    // a message that is not a client-final message of this exchange, and
-    // ChannelMismatchError when a bound login carries other binding data.
-    [[nodiscard]] std::optional<std::string> Finish(std::string_view client_final) const;
+    // right, std::nullopt when it is wrong; `verifier`, when given, is set to
+    // the index in Verifiers() of the one it matches. Throws
+    // std::invalid_argument for a message that is not a client-final message
+    // of this exchange, and ChannelMismatchError when a bound login carries
+    // other binding data.
+    [[nodiscard]] std::optional<std::string> Finish(std::string_view client_final, std::size_t* verifier = nullptr) const;
 
   private:
     ClientFirst first_;
-    Verifier verifier_;
+    std::vector<Verifier> verifiers_;
     std::string nonce_;
     std::string server_first_;
     // `c=<base64 of the header and the binding data>`.
