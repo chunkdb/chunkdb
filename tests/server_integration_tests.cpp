@@ -6261,10 +6261,10 @@ void TestServerHarnessStartupFailure() {
     // The same holds when another listener takes the port while the server
     // is stopped: Restart reports the listen failure instead of probing it.
     {
-        auto kept = BaseServerConfig();
-        kept.port = chunkdb::test::PickListenerPort();
         ServerHarness harness("harness-restart-taken-port", BaseStoreConfig(),
-            chunkdb::EngineConfig{.require_auth = false}, kept);
+            chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+        // Restart on the port the server picked, as a test-given port is kept.
+        harness.saved_server_config.port = harness.port;
         harness.server->Stop();
         harness.JoinStopped();
         const OccupiedPort taken(harness.port);
