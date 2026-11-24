@@ -4,6 +4,7 @@ This planned contract covers [#136](https://github.com/chunkdb/chunkdb/issues/13
 Groups are not active in this build: the `commit_groups` feature is not registered, and the current guarantees are in [Durability](../DURABILITY_CONTRACT.md).
 The pure checked encodings are specified in [Commit group records](COMMIT_GROUP_FORMAT.md).
 Recovery, checkpoint and restore ownership are specified in [Group recovery](COMMIT_GROUP_RECOVERY.md).
+The inactive owner bootstrap and handover check of this build are described in [Group coordinator](COMMIT_GROUP_COORDINATOR.md).
 
 ## Ownership and identities
 
@@ -90,8 +91,11 @@ Its surviving members and later dependent relaxed suffixes are discarded togethe
 If such a suffix contains a later group's member, the recovery plan includes that complete dependent group and computes the transitive closure before changing any member.
 Rollback never guesses or silently replaces an invalid preceding prefix.
 A checked synced decision or durability receipt with a missing required member is damage rather than an undecided crash tail.
-An incomplete final append wholly above the certified cut is unpublished.
-A complete record with invalid checksum, identity or structure, interior corruption, a shortened certified prefix and conflicting decisions refuse recovery without repair.
+Above the certified cut, a final record whose header or final checksum fails, or whose declared extent passes the end of the journal, is an interrupted append and is unpublished, but only when no later checksum-valid record header follows it.
+After a failed header checksum the search for a later header starts at the next byte; after a failed final checksum it starts after the declared record, so that record's own body is not searched.
+This matches the live-WAL policy and shares its limits: a crash that loses an earlier unsynced record while a later one survives is refused rather than repaired, and so is a torn record whose remaining bytes hold a checksum-valid record header, such as a seal's nested decision or request and tag bytes.
+A checksum-valid record with an invalid identity or structure, any failure at or below the cut, a shortened certified prefix and conflicting decisions refuse recovery without repair.
+The journal scanner in this build also refuses any seal record and any receipt without an earlier matching decision; seal placement is not decided yet.
 
 A checkpoint makes the decisions of all groups it includes durable before publishing its image.
 Checked image and tombstone provenance identifies a covered group member after its WAL frame is retired.
@@ -199,4 +203,5 @@ The ordinary-write error matrix independently exercises version-clock reservatio
 Failed deletes and whole-chunk writes are reopened to verify the previous values, existence, producing identity and feed frontier.
 `chunkdb_verify` admits the directory journal and certified inventory, resolves every referenced complete group and validates all member or checkpoint proofs without changing files.
 The verifier refuses missing synced members, conflicting decisions, invalid certified cuts and unadmitted grouped frames rather than validating each table in isolation.
+In this build `chunkdb_verify` only reports owner files as unclaimed; an internal check admits an owner, its selections and its journal as records, without member frames, rollback bases or synced-member presence ([coordinator](COMMIT_GROUP_COORDINATOR.md#verification)).
 Snapshot-vector bookkeeping has its own cost scenario, and the ordinary single-chunk hot-path budgets remain merge gates.
