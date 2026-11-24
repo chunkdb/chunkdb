@@ -189,6 +189,14 @@ void RequireValidTableName(std::string_view name) {
     }
 }
 
+void RequireNewTableName(std::string_view name) {
+    RequireValidTableName(name);
+    if (name == kReservedTableName) {
+        throw std::invalid_argument(
+            "the table name '" + std::string(kReservedTableName) + "' is reserved: WATCH CATALOG watches the catalog; choose another name");
+    }
+}
+
 void RequireValidTableOptions(const TableOptions& options) {
     if (options.checkpoint_update_interval == 0) {
         throw std::invalid_argument("checkpoint_updates must be > 0");
@@ -698,8 +706,19 @@ void Table::DropFeedSlot(std::string_view name, bool if_exists) {
 std::vector<FeedSlot> Table::ListFeedSlots(bool include_lost) {
     auto lease = Acquire();
     if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
-    auto slots = lease->store().feed_slots_->List(include_lost);
-    const auto& columns = lease->store().geometry().layout().schema().columns;
+    return ListFeedSlots(*lease, include_lost);
+}
+
+std::optional<std::vector<FeedSlot>> Table::TryListFeedSlots(bool include_lost) {
+    migration_health_->Check();
+    const auto lease = TryAcquire();
+    if (!lease) return std::nullopt;
+    return ListFeedSlots(*lease, include_lost);
+}
+
+std::vector<FeedSlot> Table::ListFeedSlots(const Lease& lease, bool include_lost) {
+    auto slots = lease.store().feed_slots_->List(include_lost);
+    const auto& columns = lease.store().geometry().layout().schema().columns;
     for (auto& slot : slots) {
         // ClaimFeedSlot refuses a second watch by the same rule.
         if (const auto claimed = slot_claims_.find(slot.name); claimed != slot_claims_.end())
@@ -957,7 +976,8 @@ std::optional<Table::Lease> Table::Acquire() {
 
 std::optional<Table::Lease> Table::TryAcquire() {
     active_leases_.fetch_add(1, std::memory_order_seq_cst);
-    if (state_.load(std::memory_order_seq_cst) == State::kOpen) return Lease(this, store_.get());
+    if (state_.load(std::memory_order_seq_cst) == State::kOpen && !feed_cleanup_failed_.load(std::memory_order_acquire))
+        return Lease(this, store_.get());
     ReleaseLease();
     return std::nullopt;
 }
@@ -1762,7 +1782,7 @@ std::shared_ptr<Table> TableCatalog::Create(
     bool if_not_exists) {
     RequireWritable("CREATE TABLE");
     auto metadata = LockFeatureMetadataShared();
-    RequireValidTableName(name);
+    RequireNewTableName(name);
     const std::string table_name(name);
     std::lock_guard operations(operations_mutex_);
     migration_health_->Check();

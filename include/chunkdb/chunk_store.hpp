@@ -129,6 +129,9 @@ class RegularChunkMutex {
     return kChunkLockModeName;
 }
 
+// kFsyncWal and kFsyncCheckpoint behave the same: every write syncs its WAL
+// before it returns, and every checkpoint syncs its image before it removes
+// a WAL. Both are kept for stored manifests and configurations.
 enum class DurabilityMode {
     kRelaxed = 0,
     kFsyncWal = 1,
