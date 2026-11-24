@@ -14,7 +14,7 @@ using namespace chunkdb;
 using namespace chunkdb::restore_table_test;
 
 // In the order a restore reaches them; the last one follows publication.
-constexpr std::array<const char*, 8U> kPoints{
+constexpr std::array<const char*, 9U> kPoints{
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_AFTER_COPY_ONCE",
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_FILE_ONCE",
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_INDEX_LOG_ONCE",
@@ -22,6 +22,7 @@ constexpr std::array<const char*, 8U> kPoints{
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_FORK_CLOCK_ONCE",
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_TABLE_ONCE",
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_BEFORE_PUBLISH_ONCE",
+    "CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_AFTER_NAME_FLOOR_ONCE",
     "CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_AFTER_PUBLISH_ONCE"};
 
 std::string Quote(const std::string& argument) {
@@ -92,6 +93,7 @@ void Crashes(const std::string& executable) {
 // version the dropped table issued.
 void RestoreAfterDropCrashes(const std::string& executable) {
     for (const std::string point : {"CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_BEFORE_PUBLISH_ONCE",
+             "CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_AFTER_NAME_FLOOR_ONCE",
              "CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_AFTER_PUBLISH_ONCE"}) {
         Source source;
         std::uint64_t stale = 0U;
@@ -107,6 +109,8 @@ void RestoreAfterDropCrashes(const std::string& executable) {
             const bool published = point.find("AFTER_PUBLISH") != std::string::npos;
             assert((catalog.Find("t") != nullptr) == published);
             if (!published) (void)catalog.RestoreTable(source.Request("t"));
+            // The name floor is in the published table's manifest.
+            assert(ReadStoreManifest(source.data / "tables/t")->name_floor > stale);
             RefusesStaleVersion(catalog, "t", stale);
         }
         Verified(source.data);
@@ -119,6 +123,7 @@ void RestoreAfterDropCrashes(const std::string& executable) {
 void SwapCrashes(const std::string& executable) {
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) {
         for (const std::string point : {"CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_VERSION_FLOOR_ONCE",
+                 "CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_NAME_FLOOR_ONCE",
                  "CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_BEFORE_EXCHANGE_ONCE",
                  "CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_EXCHANGE_ONCE",
                  "CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_SYNC_ONCE"}) {
@@ -132,7 +137,8 @@ void SwapCrashes(const std::string& executable) {
             }
             assert(Child(executable, {"--swap-child", source.data.string(), point,
                        mode == DurabilityMode::kFsyncWal ? "fsync-wal" : "relaxed"}) == 86);
-            const bool floor_only = point.find("AFTER_VERSION_FLOOR") != std::string::npos;
+            const bool floor_only = point.find("_FLOOR_ONCE") != std::string::npos;
+            const bool name_floor = point.find("AFTER_VERSION_FLOOR") == std::string::npos;
             const bool exchanged = !floor_only && point.find("BEFORE_EXCHANGE") == std::string::npos;
             {
                 TableCatalog catalog(source.Config());
@@ -148,6 +154,9 @@ void SwapCrashes(const std::string& executable) {
                 assert(copy->ListFeedSlots().at(0).resync && live->ListFeedSlots().at(0).resync == !floor_only);
                 // The floor was raised durably before every crash point: the
                 // restored table never reaches a version of the live one.
+                // From the name floors on, both manifests carry them.
+                for (const auto* name : {"t", "t_restored"})
+                    assert((ReadStoreManifest(source.data / "tables" / name)->name_floor > stale) == name_floor);
                 RefusesStaleVersion(catalog, exchanged ? "t" : "t_restored", stale);
                 // The swap can run again after the restart.
                 catalog.SwapTables("t", "t_restored");
@@ -165,6 +174,7 @@ void SwapCrashes(const std::string& executable) {
 void RenameCrashes(const std::string& executable) {
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) {
         for (const std::string point : {"CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_VERSION_FLOOR_ONCE",
+                 "CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_NAME_FLOOR_ONCE",
                  "CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_BEFORE_RENAME_ONCE",
                  "CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_RENAME_ONCE",
                  "CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_SYNC_ONCE"}) {
@@ -172,7 +182,8 @@ void RenameCrashes(const std::string& executable) {
             assert(Child(executable, {"--rename-child", source.data.string(), point,
                        mode == DurabilityMode::kFsyncWal ? "fsync-wal" : "relaxed"}) == 86);
             const bool renamed = point.find("BEFORE_RENAME") == std::string::npos &&
-                point.find("AFTER_VERSION_FLOOR") == std::string::npos;
+                point.find("_FLOOR_ONCE") == std::string::npos;
+            const bool name_floor = point.find("AFTER_VERSION_FLOOR") == std::string::npos;
             {
                 TableCatalog catalog(source.Config());
                 assert(catalog.TableCount() == 1U && catalog.Fences().empty());
@@ -189,6 +200,9 @@ void RenameCrashes(const std::string& executable) {
                     // starts above it.
                     const auto root = ReadDataDirManifest(source.data);
                     assert(root && DataDirVersionFloor(*root) > lease->store().GetChunkVersion(0, 0));
+                    // From the name floor on, the table's manifest carries it.
+                    assert((ReadStoreManifest(source.data / "tables" / (renamed ? "t_old" : "t"))->name_floor ==
+                               DataDirVersionFloor(*root)) == name_floor);
                 }
                 const auto slots = table->ListFeedSlots();
                 assert(slots.size() == 1U && !slots[0].resync && slots[0].position.epoch == source.epoch);

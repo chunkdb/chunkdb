@@ -274,7 +274,7 @@ BlockReadMetadata ChunkStore::GetBlockWithVersionAt(
     const auto index = geometry_.LocalBlockIndex(local_x, local_y);
     BlockReadMetadata result;
     const auto capture = [&](const auto& chunk) {
-        result.version = chunk.written ? std::optional<std::uint64_t>(chunk.version) : std::nullopt;
+        result.version = chunk.written ? std::optional<std::uint64_t>(ReportedVersion(chunk.version)) : std::nullopt;
         result.values = BlockPresent(chunk.presence_bitmap, index) ?
             std::optional(DecodeBlockColumns(geometry_.layout(), chunk.payload, chunk.vars, index)) : std::nullopt;
     };

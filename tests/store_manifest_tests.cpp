@@ -1008,6 +1008,54 @@ void TestLineageManifestCodec() {
     assert(Contains(ExpectRefused([&] { (void)chunkdb::SerializeStoreManifest(disabled); }), "requires table_lineage"));
 }
 
+// Option 12, the name floor, round-trips with and without lineage, survives
+// option replacement, and refuses a zero, repeated or wrongly sized entry.
+void TestNameFloorManifestCodec() {
+    chunkdb::StoreManifest manifest{
+        .features = {.incompat = chunkdb::kFeatureTableLineage | chunkdb::kFeatureChunkModel},
+        .geometry = kDefaultGeometry, .store_id = chunkdb::NewStoreId(),
+        .options = chunkdb::EncodeTableOptions({}),
+        .schema = chunkdb::SingleBitsColumnSchema(kDefaultGeometry.block_bits)};
+    const auto original_options = manifest.options;
+    assert(chunkdb::ParseStoreManifest(chunkdb::SerializeStoreManifest(manifest)).name_floor == 0U);
+    manifest.name_floor = 32769U;
+    for (const bool lineage : {false, true}) {
+        if (lineage) manifest.lineage = chunkdb::TableLineage{chunkdb::NewStoreId(), 7U};
+        const auto bytes = chunkdb::SerializeStoreManifest(manifest);
+        const auto decoded = chunkdb::ParseStoreManifest(bytes);
+        assert(decoded.name_floor == 32769U && decoded.lineage == manifest.lineage);
+        assert(decoded.options == original_options);
+        assert(chunkdb::SerializeStoreManifest(decoded) == bytes);
+    }
+    auto decoded = chunkdb::ParseStoreManifest(chunkdb::SerializeStoreManifest(manifest));
+    chunkdb::TableOptions replacement;
+    replacement.checkpoint_update_interval = 17U;
+    chunkdb::ReplaceTableOptions(&decoded, replacement);
+    assert(chunkdb::ParseStoreManifest(chunkdb::SerializeStoreManifest(decoded)).name_floor == 32769U);
+
+    const auto raw = [](std::uint64_t value, std::uint16_t length = 8U) {
+        std::vector<std::uint8_t> bytes;
+        chunkdb::WriteLe16(bytes, chunkdb::kOptionNameFloor);
+        chunkdb::WriteLe16(bytes, length);
+        for (std::uint16_t i = 0; i < length; ++i) bytes.push_back(static_cast<std::uint8_t>(value >> (8U * (i % 8U))));
+        return bytes;
+    };
+    const auto refuse = [&](std::vector<std::uint8_t> options, const char* reason) {
+        auto damaged = manifest;
+        damaged.lineage.reset();
+        damaged.name_floor = 0U;
+        damaged.options = std::move(options);
+        const auto bytes = chunkdb::SerializeStoreManifest(damaged);
+        assert(Contains(ExpectRefused([&] { (void)chunkdb::ParseStoreManifest(bytes); }), reason));
+    };
+    refuse(raw(0U), "name floor is zero");
+    refuse(raw(5U, 4U), "name floor has invalid length");
+    auto twice = raw(5U);
+    const auto again = raw(6U);
+    twice.insert(twice.end(), again.begin(), again.end());
+    refuse(twice, "name floor appears twice");
+}
+
 void TestNamedFeatureRegistry() {
     std::uint32_t bits = 0U;
     for (const auto& feature : chunkdb::kFeatureRegistry) {
@@ -1068,6 +1116,7 @@ int main(int argc, char** argv) {
     }
     TestNewStoreRecordsGeometryAndId();
     TestLineageManifestCodec();
+    TestNameFloorManifestCodec();
     TestNamedFeatureRegistry();
     TestLineageSurvivesTableMetadataChanges();
     TestGeometryMismatchRefusedWithoutChanges();

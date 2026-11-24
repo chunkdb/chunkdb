@@ -59,6 +59,9 @@ inline constexpr std::uint16_t kOptionFeedBufferBytes = 8;         // u64, > 0
 inline constexpr std::uint16_t kOptionSlotMaxBytes = 9;            // u64, > 0
 inline constexpr std::uint16_t kOptionParentEpoch = 10;            // 16-byte store id
 inline constexpr std::uint16_t kOptionForkRevision = 11;           // u64, including zero
+// The name floor of a table that took its name by SWAP TABLES, RENAME TO or
+// RESTORE TABLE (ChunkStore::ReportedVersion); absent when zero.
+inline constexpr std::uint16_t kOptionNameFloor = 12;              // u64, > 0
 
 struct StoreManifest {
     FeatureFlags features{.incompat = kFeatureChunkModel};
@@ -72,6 +75,8 @@ struct StoreManifest {
     // Owned metadata is separate from mutable options, so option replacements
     // cannot erase the restore relationship. Both TLVs are absent or present.
     std::optional<TableLineage> lineage{};
+    // Owned like the lineage: option replacements keep it. 0 when absent.
+    std::uint64_t name_floor = 0;
     // Omitted only by block-only construction APIs; the encoded envelope
     // always contains its complete companion domain and shared history.
     std::optional<TableSchema> chunk_schema{};

@@ -1323,6 +1323,25 @@ void TableCatalog::RaiseVersionFloor(std::uint64_t floor) {
     version_floor_ = floor;
 }
 
+void TableCatalog::RecordNameFloor(const std::filesystem::path& dir) {
+    auto manifest = ReadOpenableManifest(dir);
+    if (version_floor_ <= manifest.name_floor) {
+        return;
+    }
+    manifest.name_floor = version_floor_;
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_NAME_FLOOR_WRITE_FAIL_ONCE")) {
+        throw std::runtime_error("injected name floor write failure");
+    }
+    AtomicWrite(
+        StoreManifestPath(dir),
+        SerializeStoreManifest(manifest),
+        /*fsync_file=*/true,
+        /*fsync_directory=*/true,
+        /*out_replaced=*/nullptr,
+        /*after_rename_failpoint=*/nullptr,
+        /*enable_generic_failpoints=*/false);
+}
+
 void TableCatalog::RemoveInterruptedOperations(std::string_view table) {
     // Operation directories are named `<table>.<suffix>`; table names hold no dot.
     const std::string prefix = table.empty() ? std::string{} : std::string(table) + ".";

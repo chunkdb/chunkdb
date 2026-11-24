@@ -35,7 +35,7 @@ constexpr std::size_t kDataDirOptionsOffset = 40U;
 
 [[nodiscard]] bool IsKnownTableManifestType(std::uint16_t type) noexcept {
     return IsKnownTableOptionType(type) || type == kOptionParentEpoch ||
-           type == kOptionForkRevision;
+           type == kOptionForkRevision || type == kOptionNameFloor;
 }
 
 void RequireValidLineage(const StoreManifest& manifest) {
@@ -86,6 +86,30 @@ void DecodeLineage(StoreManifest* manifest) {
         at = next;
     }
     manifest->options = std::move(options);
+}
+
+// Removes the owned name floor TLV into manifest->name_floor.
+void DecodeNameFloor(StoreManifest* manifest) {
+    std::vector<std::uint8_t> options;
+    options.reserve(manifest->options.size());
+    bool found = false;
+    for (std::size_t at = 0; at < manifest->options.size();) {
+        const auto type = ReadLe16(manifest->options, at);
+        const auto length = ReadLe16(manifest->options, at + 2U);
+        const auto next = at + kOptionEntryHeaderSize + length;
+        if (type == kOptionNameFloor) {
+            if (found) throw std::runtime_error("name floor appears twice");
+            if (length != 8U) throw std::runtime_error("name floor has invalid length");
+            manifest->name_floor = ReadLe64(manifest->options, at + 4U);
+            if (manifest->name_floor == 0U) throw std::runtime_error("name floor is zero");
+            found = true;
+        } else {
+            options.insert(options.end(), manifest->options.begin() + static_cast<std::ptrdiff_t>(at),
+                manifest->options.begin() + static_cast<std::ptrdiff_t>(next));
+        }
+        at = next;
+    }
+    if (found) manifest->options = std::move(options);
 }
 
 // Walks a TLV options area: every entry must lie inside it, and an entry of a
@@ -231,7 +255,7 @@ std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) 
     (void)Geometry(manifest.geometry, manifest.schema, chunk_schema);
     const auto schema = EncodeTableSchema(manifest.schema);
     const auto encoded_chunk_schema = EncodeChunkSchema(chunk_schema);
-    const auto lineage_bytes = manifest.lineage ? 32U : 0U;
+    const auto lineage_bytes = (manifest.lineage ? 32U : 0U) + (manifest.name_floor != 0U ? 12U : 0U);
     if (manifest.options.size() > kStoreManifestMaxSize - lineage_bytes)
         throw std::invalid_argument("store manifest options and schema are too large");
     const auto options_size = manifest.options.size() + lineage_bytes;
@@ -266,6 +290,7 @@ std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) 
         bytes.insert(bytes.end(), manifest.lineage->parent_epoch.begin(), manifest.lineage->parent_epoch.end());
         AppendOption(bytes, kOptionForkRevision, manifest.lineage->fork_revision);
     }
+    if (manifest.name_floor != 0U) AppendOption(bytes, kOptionNameFloor, manifest.name_floor);
     WriteLe32(bytes, static_cast<std::uint32_t>(schema.size()));
     bytes.insert(bytes.end(), schema.begin(), schema.end());
     WriteLe32(bytes, static_cast<std::uint32_t>(encoded_chunk_schema.size()));
@@ -365,6 +390,7 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
         bytes.begin() + static_cast<std::ptrdiff_t>(schema_size_offset));
     ValidateOptions(manifest.options, manifest.features, IsKnownTableManifestType);
     DecodeLineage(&manifest);
+    DecodeNameFloor(&manifest);
     (void)DecodeTableOptions(manifest.options);
     return manifest;
 }

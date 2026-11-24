@@ -622,6 +622,10 @@ class TableCatalog {
     void OpenDataDirManifest();
     // Raises the data directory's version floor (chunkdb.manifest) durably.
     void RaiseVersionFloor(std::uint64_t floor);
+    // Records the version floor as the name floor of the table in `dir`
+    // (ChunkStore::ReportedVersion) durably, when it is higher, before the
+    // table takes a name another table may have held.
+    void RecordNameFloor(const std::filesystem::path& dir);
     // Every interrupted operation, or only those of `table`.
     void RemoveInterruptedOperations(std::string_view table = {});
     void OpenExistingTables();

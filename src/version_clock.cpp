@@ -305,10 +305,14 @@ void ChunkStore::RaiseVersionClockToFloor() {
     // gave up a name issued (DROP TABLE, RENAME TO, SWAP TABLES). A table that
     // takes such a name by RESTORE TABLE, SWAP TABLES or RENAME TO opens at
     // it, its ceiling synced before its first token, so it never issues one
-    // of them again. Recovery issues no token, so the tokens between the
-    // recovered clock and the floor were never issued by this store.
-    const std::uint64_t floor =
-        std::min(initial_version_floor_, std::numeric_limits<std::uint64_t>::max() - 1U);
+    // of them again. Its clock opens strictly above its own name floor, which
+    // its unchanged chunks report (ReportedVersion), so no write issues it.
+    // Recovery issues no token, so the tokens between the recovered clock
+    // and the floor were never issued by this store.
+    const std::uint64_t name_floor = name_floor_ == 0U ? 0U
+        : name_floor_ == std::numeric_limits<std::uint64_t>::max() ? name_floor_ : name_floor_ + 1U;
+    const std::uint64_t floor = std::min(std::max(initial_version_floor_, name_floor),
+        std::numeric_limits<std::uint64_t>::max() - 1U);
     const std::uint64_t clock = version_clock_.load(std::memory_order_relaxed);
     if (floor <= clock) {
         return;

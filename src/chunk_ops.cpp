@@ -369,8 +369,8 @@ ChunkMutationResult ChunkStore::CasChunkStateBytes(
     auto lock = LockStatementChunk(regular_chunk->mutex);
     AwaitStatementChunkFilesLocked(lock, *regular_chunk);
 
-    if (regular_chunk->version != expected_version) {
-        return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+    if (ReportedVersion(regular_chunk->version) != expected_version) {
+        return ChunkMutationResult{.ok = false, .version = ReportedVersion(regular_chunk->version)};
     }
     RequirePendingNotNullKept(regular_chunk->vars, new_presence);
     auto var_update = VarUpdateForState(regular_chunk->vars, new_presence);
@@ -381,7 +381,7 @@ ChunkMutationResult ChunkStore::CasChunkStateBytes(
         std::move(new_payload),
         std::move(new_presence),
         std::move(var_update));
-    return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
+    return ChunkMutationResult{.ok = true, .version = ReportedVersion(regular_chunk->version)};
 }
 
 ChunkMutationResult ChunkStore::ApplyChunkBatch(
@@ -424,8 +424,8 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
     auto lock = LockStatementChunk(regular_chunk->mutex);
     AwaitStatementChunkFilesLocked(lock, *regular_chunk);
 
-    if (has_expected_version && regular_chunk->version != expected_version) {
-        return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+    if (has_expected_version && ReportedVersion(regular_chunk->version) != expected_version) {
+        return ChunkMutationResult{.ok = false, .version = ReportedVersion(regular_chunk->version)};
     }
 
     auto new_payload = regular_chunk->payload;
@@ -441,7 +441,7 @@ ChunkMutationResult ChunkStore::ApplyChunkBatch(
     // A table of bit strings has no text or bytes columns.
     (void)ApplyFullChunkStateLocked(
         chunk_coord, regular_chunk, std::move(new_payload), std::move(new_presence), VarUpdate{});
-    return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
+    return ChunkMutationResult{.ok = true, .version = ReportedVersion(regular_chunk->version)};
 }
 
 ChunkState ChunkStore::ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y) {
@@ -501,11 +501,11 @@ ChunkMutationResult ChunkStore::WriteChunkState(const ChunkCoord& chunk_coord, C
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     auto lock = LockStatementChunk(regular_chunk->mutex);
     AwaitStatementChunkFilesLocked(lock, *regular_chunk);
-    if (expected_version.has_value() && regular_chunk->version != *expected_version) {
-        return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+    if (expected_version.has_value() && ReportedVersion(regular_chunk->version) != *expected_version) {
+        return ChunkMutationResult{.ok = false, .version = ReportedVersion(regular_chunk->version)};
     }
     if (if_absent && ChunkPopulated(geometry_, regular_chunk->presence_bitmap, regular_chunk->chunk_columns.get()))
-        return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+        return ChunkMutationResult{.ok = false, .version = ReportedVersion(regular_chunk->version)};
     if (!state.chunk_columns && !regular_chunk->written && geometry_.chunk_columns_require_initialization())
         throw std::invalid_argument("a first write must supply the REQUIRED chunk columns");
     if (!state.chunk_columns) state.chunk_columns = geometry_.default_chunk_columns();
@@ -525,7 +525,7 @@ ChunkMutationResult ChunkStore::WriteChunkState(const ChunkCoord& chunk_coord, C
             std::move(state.payload),
             std::move(state.presence_bitmap),
             std::move(var_update), std::move(state.chunk_columns), true);
-        return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
+        return ChunkMutationResult{.ok = true, .version = ReportedVersion(regular_chunk->version)};
     }
     const std::uint64_t version = ApplyChunkStateLocked(
         chunk_coord,
@@ -533,7 +533,7 @@ ChunkMutationResult ChunkStore::WriteChunkState(const ChunkCoord& chunk_coord, C
         std::move(state.payload),
         std::move(state.presence_bitmap),
         std::move(var_update), std::move(state.chunk_columns), /*force_write=*/true);
-    return ChunkMutationResult{.ok = true, .version = version};
+    return ChunkMutationResult{.ok = true, .version = ReportedVersion(version)};
 }
 
 ChunkMutationResult ChunkStore::TransformChunkState(const ChunkCoord& coord,
@@ -546,10 +546,10 @@ ChunkMutationResult ChunkStore::TransformChunkState(const ChunkCoord& coord,
     auto lock = LockStatementChunk(chunk->mutex);
     // The conditional path syncs the WAL and publishes an intent naming it.
     AwaitStatementChunkFilesLocked(lock, *chunk);
-    if (expected_version && chunk->version != *expected_version)
-        return {.ok = false, .version = chunk->version};
+    if (expected_version && ReportedVersion(chunk->version) != *expected_version)
+        return {.ok = false, .version = ReportedVersion(chunk->version)};
     if (if_absent && ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get()))
-        return {.ok = false, .version = chunk->version};
+        return {.ok = false, .version = ReportedVersion(chunk->version)};
     ChunkState next{.version = chunk->version, .payload = chunk->payload,
         .presence_bitmap = chunk->presence_bitmap, .vars = chunk->vars, .written = chunk->written,
         .commit_time_ms = chunk->commit_time_ms, .chunk_columns = chunk->chunk_columns};
@@ -561,7 +561,7 @@ ChunkMutationResult ChunkStore::TransformChunkState(const ChunkCoord& coord,
     if (next.vars.Encode() != chunk->vars.Encode()) variables.replace = std::move(next.vars);
     (void)ApplyFullChunkStateLocked(coord, chunk, std::move(next.payload), std::move(next.presence_bitmap),
         std::move(variables), std::move(next.chunk_columns), true);
-    return {.ok = true, .version = chunk->version};
+    return {.ok = true, .version = ReportedVersion(chunk->version)};
 }
 
 }  // namespace chunkdb

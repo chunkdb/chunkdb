@@ -701,6 +701,16 @@ class ChunkStore {
     }
     [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
     [[nodiscard]] const std::optional<TableLineage>& lineage() const noexcept { return lineage_; }
+    // The chunk version clients see and conditional writes compare. A written
+    // chunk last changed before this table took its name by SWAP TABLES,
+    // RENAME TO or RESTORE TABLE shows the name floor recorded then: every
+    // version a table that held the name issued is below it, and this table's
+    // writes are above it, so a version read under the name before never
+    // matches. Stored revisions, which positions use, keep their values.
+    [[nodiscard]] std::uint64_t ReportedVersion(std::uint64_t stored) const noexcept {
+        return stored < name_floor_ && stored != 0U ? name_floor_ : stored;
+    }
+    [[nodiscard]] std::uint64_t name_floor() const noexcept { return name_floor_; }
     [[nodiscard]] const FeatureFlags& features() const noexcept { return features_; }
     [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
     [[nodiscard]] DurabilityMode durability_mode() const noexcept { return durability_mode_; }
@@ -1379,6 +1389,8 @@ class ChunkStore {
     std::filesystem::path snapshot_generation_path_;
     StoreId store_id_{};
     std::optional<TableLineage> lineage_;
+    // The table manifest's name floor (ReportedVersion); 0 when it has none.
+    std::uint64_t name_floor_ = 0;
     FeatureFlags features_{};
     std::uint64_t snapshot_generation_ = 0;
     // The generation record existed when the store opened (a writer never

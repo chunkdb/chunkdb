@@ -612,6 +612,7 @@ void ChunkStore::InitializeStoreManifest() {
     }
     store_id_ = manifest->store_id;
     lineage_ = manifest->lineage;
+    name_floor_ = manifest->name_floor;
     features_ = manifest->features;
 }
 

@@ -119,6 +119,12 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         require_features();
         operations.lock();
         require_name();
+        // The copied chunks keep their versions, which may equal versions a
+        // table dropped or renamed away under this name gave: they report the
+        // name floor, recorded in the copy under the catalog's table
+        // operations, which keep the version floor where it is.
+        RecordNameFloor(staging);
+        CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_AFTER_NAME_FLOOR_ONCE");
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RESTORE_TABLE_PUBLISH_FAIL_ONCE"))
             throw std::runtime_error("injected failure before publishing a restored table");
         // A stop accepted until here leaves nothing restored; after it the
@@ -283,6 +289,12 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
     RaiseVersionFloor(std::max(stores[0]->version_clock_ceiling_.load(std::memory_order_acquire),
         stores[1]->version_clock_ceiling_.load(std::memory_order_acquire)));
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_VERSION_FLOOR_ONCE");
+    // Their existing chunks keep their versions, which may equal versions
+    // the other table gave under the name: each records the floor as its
+    // name floor, which those chunks then report. Neither store reads its
+    // manifest again before it opens under its new name.
+    for (const auto& table : tables) RecordNameFloor(table->dir_);
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_NAME_FLOOR_ONCE");
     const std::array<std::filesystem::path, 2U> dirs{tables[0]->dir_, tables[1]->dir_};
     // Made now, so that fencing does not allocate.
     std::array<FenceNode, 2U> fences{PrepareFence(tables[0], names[0], kFenceSwapUnknown),
@@ -461,6 +473,10 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     // name. A failure here serves the table unchanged.
     RaiseVersionFloor(store->version_clock_ceiling_.load(std::memory_order_acquire));
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_VERSION_FLOOR_ONCE");
+    // Its existing chunks keep their versions, which may equal versions a
+    // table dropped under the new name gave: they report the name floor.
+    RecordNameFloor(table->dir_);
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_NAME_FLOOR_ONCE");
     const std::filesystem::path old_dir = table->dir_;
     const std::filesystem::path new_dir = TablesDir() / to;
     // Made now, so that fencing and publishing do not allocate.
