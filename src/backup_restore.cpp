@@ -3,6 +3,8 @@
 
 #include <algorithm>
 #include <array>
+#include <iterator>
+#include <set>
 #include <fstream>
 #include <limits>
 #include <sstream>
@@ -19,6 +21,8 @@
 #include "wal_replay.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "shared_file_input.hpp"
+#include "area_cursor.hpp"
+#include "populated_index_format.hpp"
 
 #ifdef _WIN32
 #include <windows.h>
@@ -214,6 +218,130 @@ StoreId RebindRestoredTable(const std::filesystem::path& directory, const Backup
     AtomicWrite(StoreManifestPath(directory), SerializeStoreManifest(manifest), true, true);
     Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_TABLE_ONCE");
     return new_epoch;
+}
+namespace {
+// The revisions a copied chunk's image and WAL frames hold.
+std::set<std::uint64_t> ChunkRevisions(const std::filesystem::path& directory, const Geometry& geometry,
+    const ChunkCoord& coord, const StoreId& epoch, FeatureFlags features, const ChunkCoordinateIndex& retained) {
+    std::set<std::uint64_t> revisions;
+    std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U), presence(ChunkPresenceBitmapBytes(geometry), 0U);
+    ChunkVars vars; std::uint64_t revision = 0U, schema = 0U, time = 0U;
+    std::shared_ptr<const ChunkColumnState> chunk_columns;
+    const auto image_path = ChunkDataPath(directory, geometry, coord);
+    if (std::filesystem::exists(image_path)) {
+        auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, coord, epoch, features),
+            geometry, coord, epoch, features);
+        revision = image.revision; schema = image.schema_version; time = image.commit_time_ms;
+        payload = std::move(image.payload); presence = std::move(image.presence_bitmap); vars = std::move(image.vars);
+        chunk_columns = std::move(image.chunk_columns);
+        revisions.insert(revision);
+    }
+    const auto wal_path = ChunkWalPath(directory, geometry, coord);
+    if (!std::filesystem::exists(wal_path)) return revisions;
+    const auto boundary = retained.EmptyBoundary(coord);
+    if (boundary)
+        (void)ApplyRetainedEmptyBase(geometry, *boundary, revision, time, schema, payload, presence, vars, chunk_columns);
+    std::vector<WalFrameBoundary> frames;
+    const auto replay = ReplayWal(LoadFile(wal_path), geometry, coord, epoch, features, revision, schema,
+        &payload, &presence, &vars, &frames, &chunk_columns, time,
+        boundary ? std::optional{WalKnownIdentity{boundary->revision, boundary->commit_time_ms}} : std::nullopt);
+    if (!replay.torn_creation &&
+        (!replay.replayable || (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty()))
+        throw std::runtime_error("restored WAL is damaged: " + wal_path.string());
+    for (const auto& frame : frames) revisions.insert(frame.revision);
+    return revisions;
+}
+} // namespace
+
+RestoredArea SelectRestoredArea(const std::filesystem::path& directory, const BackupTableCut& cut,
+    const std::vector<std::filesystem::path>& files, const ChunkAreaSelector& area, bool allow_split,
+    const BackupCancel& cancelled) {
+    const auto check_cancelled = [&] { if (cancelled.stop_requested()) throw std::runtime_error("backup cancelled"); };
+    const auto manifest = *ReadStoreManifest(directory);
+    const Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
+    if (area.dims != geometry.dims())
+        throw std::invalid_argument("table " + cut.name + " has " + std::to_string(geometry.dims()) +
+            " dimensions; give the area one coordinate for each");
+    const detail::AreaCursor selected(area);
+    std::set<ChunkCoord> chunks;
+    for (const auto& relative : files)
+        if (std::distance(relative.begin(), relative.end()) == 2 && (relative.extension() == ".chk" || relative.extension() == ".wal"))
+            chunks.insert(Coordinate(relative, geometry));
+    // A commit at one revision changed every chunk that holds it.
+    std::set<std::uint64_t> inside, outside;
+    RestoredArea result;
+    {
+        const ChunkCoordinateIndex retained(directory, geometry, cut.epoch, true);
+        for (const auto& coord : chunks) {
+            check_cancelled();
+            const bool in = selected.Contains(coord);
+            if (in) ++result.chunks;
+            for (const auto revision : ChunkRevisions(directory, geometry, coord, cut.epoch, manifest.features, retained))
+                (in ? inside : outside).insert(revision);
+        }
+    }
+    std::set_intersection(inside.begin(), inside.end(), outside.begin(), outside.end(), std::back_inserter(result.split_revisions));
+    if (!result.split_revisions.empty() && !allow_split) {
+        std::string listed;
+        for (std::size_t i = 0; i < result.split_revisions.size() && i < 10U; ++i)
+            listed += (i == 0U ? "" : ", ") + std::to_string(result.split_revisions[i]);
+        if (result.split_revisions.size() > 10U) listed += ", ...";
+        throw std::invalid_argument("the area splits " + std::to_string(result.split_revisions.size()) +
+            " commits that also changed chunks outside it (revisions " + listed + "); give --allow-split to restore it anyway");
+    }
+    // Images and WALs of chunks outside the area go.
+    for (const auto& relative : files) {
+        const bool chunk_file = std::distance(relative.begin(), relative.end()) == 2 &&
+            (relative.extension() == ".chk" || relative.extension() == ".wal");
+        if (chunk_file && !selected.Contains(Coordinate(relative, geometry))) {
+            std::filesystem::remove(directory / relative);
+            continue;
+        }
+        result.files.push_back(relative);
+    }
+    // So do their coordinate-index records: the restored table has no
+    // identity, live or deleted, outside the area.
+    const auto inventory_path = directory / kChunkIndexFileName;
+    std::vector<IndexInventoryEntry> entries;
+    IndexInventoryHeader header;
+    {
+        SharedFileInput inventory(inventory_path);
+        if (!inventory) throw std::runtime_error("restored coordinate inventory is missing");
+        header = ReadIndexInventory(inventory, std::filesystem::file_size(inventory_path), geometry, cut.epoch,
+            [&](const auto& entry) { entries.push_back(entry); });
+    }
+    if (header.compaction_pending) throw std::runtime_error("restored coordinate compaction is pending");
+    // Fixed-size records: length, kind, coordinates, revision, time, schema, CRC32.
+    const std::size_t record_bytes = 36U + 8U * geometry.dims();
+    for (auto& entry : entries) {
+        check_cancelled();
+        const auto path = LargeChunkDirectory(directory, entry.coord, geometry.dims()) / kChunkIndexFileName;
+        {
+            SharedFileInput input(path);
+            if (!input) throw std::runtime_error("restored coordinate log is missing");
+            (void)ReadChunkIndexLog(input, std::filesystem::file_size(path), geometry, cut.epoch, entry.coord, entry.committed_bytes);
+        }
+        const auto bytes = LoadFile(path);
+        auto kept = SerializeChunkIndexHeader({cut.epoch, geometry.dims(), entry.coord});
+        const auto header_bytes = kept.size();
+        if (entry.committed_bytes < header_bytes || (entry.committed_bytes - header_bytes) % record_bytes != 0U)
+            throw std::runtime_error("restored coordinate log has partial records");
+        for (std::size_t at = header_bytes; at < entry.committed_bytes; at += record_bytes) {
+            const std::span record(bytes.data() + at, record_bytes);
+            if (selected.Contains(ParseChunkIndexRecord(record, geometry, entry.coord).coord))
+                kept.insert(kept.end(), record.begin(), record.end());
+        }
+        if (kept.size() == entry.committed_bytes) continue;
+        AtomicWrite(path, kept, true, true);
+        entry.committed_bytes = kept.size();
+    }
+    AtomicWriteStream(inventory_path, [&](const AtomicFileSink& sink) {
+        SinkBuffer buffer(sink);
+        std::ostream output(&buffer);
+        WriteIndexInventory(output, header, entries);
+        if (!output) throw std::runtime_error("failed to rewrite restored coordinate inventory");
+    }, true, true);
+    return result;
 }
 void RestoreBackup(const std::filesystem::path& source, const std::filesystem::path& destination) {
     RequireBackupTarget(source, destination);

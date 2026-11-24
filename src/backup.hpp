@@ -173,6 +173,24 @@ using BackupCopyProgress = std::function<void(std::uint64_t copied_files, std::u
 // rebound, the clock restarts at the cut's successor, and the manifest is
 // written last. `files` are the table's inventory files relative to it.
 // Returns the new epoch.
+// The chunks of a copied table an area selects.
+struct RestoredArea {
+    // The table's remaining files, relative to it.
+    std::vector<std::filesystem::path> files;
+    // Chunks with an image or a WAL in the area.
+    std::uint64_t chunks = 0;
+    // Revisions of commits that changed chunks both inside and outside the
+    // area, as the copied images and WAL frames hold them.
+    std::vector<std::uint64_t> split_revisions;
+};
+// Keeps only the chunks `area` selects in a table copied by CopyBackupTable,
+// before RebindRestoredTable: the images and WALs of the others are removed,
+// and so are their coordinate-index records, live or deleted. Without
+// `allow_split`, a split commit throws std::invalid_argument naming its
+// revisions before any file changes.
+[[nodiscard]] RestoredArea SelectRestoredArea(const std::filesystem::path& directory, const BackupTableCut& cut,
+    const std::vector<std::filesystem::path>& files, const ChunkAreaSelector& area, bool allow_split,
+    const BackupCancel& cancelled = {});
 [[nodiscard]] StoreId RebindRestoredTable(const std::filesystem::path& directory, const BackupTableCut& cut,
     const std::vector<std::filesystem::path>& files, const BackupCancel& cancelled = {});
 

@@ -381,6 +381,13 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME restore_table_crash COMMAND chunkdb_restore_table_crash_test)
     set_tests_properties(restore_table_crash PROPERTIES TIMEOUT 300 LABELS "crash")
 
+    add_executable(chunkdb_restore_table_area_test tests/restore_table_area_tests.cpp)
+    target_link_libraries(chunkdb_restore_table_area_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_restore_table_area_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_dependencies(chunkdb_restore_table_area_test chunkdb_restore)
+    add_test(NAME restore_table_area COMMAND chunkdb_restore_table_area_test $<TARGET_FILE:chunkdb_restore>)
+    set_tests_properties(restore_table_area PROPERTIES TIMEOUT 180 LABELS "crash")
+
     add_executable(chunkdb_check_table_test tests/check_table_tests.cpp)
     target_link_libraries(chunkdb_check_table_test PRIVATE chunkdb_tools)
     target_include_directories(chunkdb_check_table_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1148,6 +1155,7 @@ if(CHUNKDB_BUILD_TESTS)
 
     set(CHUNKDB_TEST_TARGETS
         chunkdb_check_table_test
+        chunkdb_restore_table_area_test
         chunkdb_admin_quarantine_test
         chunkdb_backup_skip_damaged_test
         chunkdb_user_admission_test

@@ -63,6 +63,7 @@ Entries in `tables/` with invalid names are ignored; a table directory with a va
 
 Creation prepares a complete table under `.chunkdb.staging/`, publishes it by a rename that cannot replace an existing table, then syncs both parents.
 RESTORE TABLE builds its table the same way: it copies the backed-up table under `.chunkdb.staging/`, rebinds it to a new epoch and syncs it before that rename.
+`chunkdb_restore --table` does the same offline; with `--area` it first removes from the copy the images, WALs and coordinate-index records of chunks outside the area, rewriting each changed log and the inventory with synced atomic replacement.
 SWAP TABLES syncs both tables' WALs, closes them, marks their slots to resync, exchanges `tables/<a>/` and `tables/<b>/` in one atomic directory exchange and syncs `tables/`; a crash leaves both names exchanged or neither.
 RENAME TO syncs the table's WAL, closes it, renames `tables/<a>/` to `tables/<b>/` without replacing an entry and syncs `tables/`; a crash leaves the table under one name, with its files unchanged.
 DROP raises and syncs the root version floor before moving the closed table into `.chunkdb.dropped/`.

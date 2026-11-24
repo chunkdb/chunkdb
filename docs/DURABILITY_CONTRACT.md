@@ -16,7 +16,8 @@ Committed revisions keep their values; missing chunks after a later crash do not
 | Ordinary write, fsync-checkpoint | Synced WAL acknowledgement and synced checkpoint publication. |
 | FLUSH WAL, every mode | All writes acknowledged before its arrival are durable in every table. |
 | Transaction COMMIT, every mode | All changed chunks commit together durably, or none commit. |
-| RESTORE TABLE | The restored table is durable and complete under its name, or nothing is published. |
+| RESTORE TABLE, `chunkdb_restore --table` | The restored table is durable and complete under its name, or nothing is published. |
+| `chunkdb_admin quarantine` | The chunk's files and their record are synced in the quarantine entry before the WAL, then the image, leave the table; a crash leaves the chunk whole, without its WAL, or gone, and a rerun finishes. |
 | SWAP TABLES | Writes acknowledged before it are durable, and both names are exchanged durably. |
 | ALTER TABLE ... RENAME TO | Writes acknowledged before it are durable, and the table is renamed durably; after a crash it has one of the two names. |
 

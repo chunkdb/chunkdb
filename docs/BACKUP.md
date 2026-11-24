@@ -94,6 +94,25 @@ SWAP TABLES then exchanges the names atomically, and DROP TABLE removes the repl
 A consumer of `world` then sees the restored epoch and resumes by its [lineage](CHANGE_FEED.md) or receives resync.
 See [Tables](reference/TABLES.md) for SWAP TABLES.
 
+## 5. Restore one table offline
+
+With the server stopped, `chunkdb_restore --table` adds one table of a backup to a data directory as a new table:
+
+```sh
+chunkdb_restore --table world --as world_restored /backups/snapshot /var/lib/chunkdb
+```
+
+The data directory may exist already; an absent or empty one becomes a new data directory that holds only this table and no users.
+As with RESTORE TABLE, the table gets a new epoch with the backed-up epoch and cut as its lineage, needs the features this directory gives its tables, and appears only once complete; an interrupted restore leaves nothing, and the next start removes its staging.
+Users, grants and migration records of the backup are not restored; the table falls under the grants that match its name.
+
+`--area cx0 cy0 TO cx1 cy1` restores only the chunks in that range, with a third coordinate on each side for a three-dimensional table.
+The restored table has no data, tombstones or other chunk identities outside the area.
+A transaction commits all its chunks at one revision; an area that holds only some of them splits that commit, and restore refuses it and names the revisions.
+`--allow-split` restores such an area anyway and prints the split revisions.
+Restore finds them in the revisions the backed-up images and WAL frames still hold, so a commit an image has since absorbed is not found.
+A commit changes one table, so restoring a whole table splits none.
+
 ## Repair damaged chunks
 
 CHECK TABLE finds damaged chunk files while the server keeps serving:
@@ -128,7 +147,15 @@ It refuses a chunk that passes the checks unless you add `--force`, and a chunk 
 If it stops partway, run it again to finish.
 The moved files stay for inspection; `chunkdb_verify` lists them as `chunk_quarantined`, and you delete the entry when you no longer need it.
 
-To get the chunk's data back, restore its table from a backup with RESTORE TABLE under another name, then copy the chunk with GET CHUNK and SET CHUNK.
+To get the chunk's data back, restore it from a backup into a new table, start the server, and copy it with the [CLI](reference/CHUNKS.md) while both tables have the same columns:
+
+```sh
+chunkdb_restore --table world --as world_repair --area 3 -1 TO 3 -1 /backups/snapshot /var/lib/chunkdb
+chunk-cli --out chunk.bin 'GET CHUNK 3 -1 FROM world_repair'
+chunk-cli --in chunk.bin 'SET CHUNK 3 -1 IN world $1'
+```
+
+Then drop `world_repair`.
 
 ## Contents and space
 
@@ -156,6 +183,7 @@ The server logs a warning for anything it cannot remove.
 - Unknown restore publication outcome: verify the destination before deciding whether to remove or use it.
 - RESTORE TABLE `TABLE_EXISTS`: restore under another name with AS.
 - RESTORE TABLE refusing features or options: restore offline with `chunkdb_restore`, or enable the feature on this server first.
+- `chunkdb_restore --area` naming split revisions: choose an area that holds every chunk of those commits, or add `--allow-split`.
 
 Stopping the server aborts unfinished copying; client disconnect leaves the backup running.
 See [Server statements](reference/SERVER.md), [Storage format](STORAGE_FORMAT.md), and [Durability](DURABILITY_CONTRACT.md).

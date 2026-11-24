@@ -101,9 +101,17 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         RequireRecoverableOptions(request.name, manifest);
         result.parent_epoch = copy.cut.epoch;
         result.fork_revision = copy.cut.revision;
-        result.files = copy.files.size();
+        auto files = copy.files;
+        if (request.area) {
+            auto selected = SelectRestoredArea(staging, copy.cut, copy.files, *request.area, request.allow_split, request.cancelled);
+            files = std::move(selected.files);
+            result.chunks = selected.chunks;
+            result.split_revisions = std::move(selected.split_revisions);
+            CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_AFTER_AREA_ONCE");
+        }
+        result.files = files.size();
         result.bytes = copy.bytes;
-        result.epoch = RebindRestoredTable(staging, copy.cut, copy.files, request.cancelled);
+        result.epoch = RebindRestoredTable(staging, copy.cut, files, request.cancelled);
         manifest.store_id = result.epoch;
         manifest.lineage = TableLineage{result.parent_epoch, result.fork_revision};
         std::ostringstream findings;
