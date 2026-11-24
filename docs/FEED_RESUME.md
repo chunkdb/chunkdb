@@ -43,6 +43,7 @@ Start WATCH AFTER that position on another connection, buffer its changes, and f
 Keep the first position across every page; later page positions do not replace the baseline cut.
 Pages do not share a snapshot, so retain each returned chunk version and skip older replayed changes when applying the buffer.
 A first watch can resume at the retained floor even when no earlier watcher existed; a lost prefix still requires resync and a new baseline.
+A write committed between the first page and a first WATCH makes that watch resync; open another watch on the table before the first page and keep it open until WATCH AFTER starts to retain those writes, with CHUNKS when you resume with CHUNKS.
 Read-only scans return null for position and cannot establish this writer frontier.
 
 ## If it fails

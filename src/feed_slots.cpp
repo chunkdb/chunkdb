@@ -576,17 +576,29 @@ bool FeedSlots::SyncImpl(std::uint64_t completed) {
             store_.FlushWalBatch(coord, chunk, false);
         }
     }
-    // Fsync is outside chunk locks. Publication is serialized so none of the
-    // flushed paths can be replaced by an unsynced checkpoint during the pass.
-    std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
+    // Fsync is outside chunk locks. The drain follows WalBarrier: it runs
+    // under the publish lock and sets the durability floor, so a step that
+    // replaces an image or WAL either finished before the drain, which hands
+    // its unsynced artifacts to this pass, or runs after it and is strict.
+    // The syncs then run without the publish lock (outside Windows, as for
+    // WalBarrier), so checkpoints and the writers waiting on their chunks do
+    // not wait for this pass's syncs.
+    std::unique_lock publish_lock(store_.checkpoint_publish_mutex_);
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kBeforeSync, completed);
     // The store tracks what it wrote without a sync, as for WALFLUSH, so a
     // pass syncs only that, with the WAL barrier's take: it includes what a
     // rollback boundary took out of the set and may still be syncing, so the
     // frontier never relies on a sync this pass does not wait for. A store's
     // first pass also syncs every WAL and image, which an earlier process may
-    // have left unsynced.
+    // have left unsynced; it lists the directories, so it keeps the lock.
+    store_.barrier_durability_floor_.store(true, std::memory_order_release);
     auto drained = store_.TakeUnsynced();
+    struct SyncPhase {
+        std::atomic<bool>& syncing;
+        ~SyncPhase() { syncing.store(false, std::memory_order_release); }
+    };
+    store_.barrier_syncing_.store(true, std::memory_order_release);
+    const SyncPhase sync_phase{store_.barrier_syncing_};
     try {
         if (!synced_) {
             std::vector<std::filesystem::path> dirs{store_.data_dir_};
@@ -600,6 +612,10 @@ bool FeedSlots::SyncImpl(std::uint64_t completed) {
             }
             for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) SyncDirectoryPath(*it);
         }
+#ifndef _WIN32
+        publish_lock.unlock();
+#endif
+        if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kAfterDrain, completed);
         store_.SyncUnsynced(drained);
     } catch (const std::exception&) {
         store_.RestoreUnsynced(std::move(drained));

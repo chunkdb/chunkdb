@@ -1,0 +1,18 @@
+name: ccache-stats
+description: Print the ccache statistics of the job, so the hit rate can be read from the log, and save the cache on main.
+runs:
+  using: composite
+  steps:
+    - name: Print ccache statistics
+      shell: bash
+      run: |
+        if command -v ccache >/dev/null 2>&1; then
+          ccache -s || true
+        fi
+
+    - name: Save ccache directory
+      if: github.event_name == 'push' && github.ref == 'refs/heads/main' && env.CCACHE_KEY != ''
+      uses: actions/cache/save@v5
+      with:
+        path: ${{ runner.temp }}/ccache
+        key: ${{ env.CCACHE_KEY }}

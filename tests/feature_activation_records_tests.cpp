@@ -57,6 +57,10 @@ std::map<std::string, Bytes> Tree(const std::filesystem::path& root) {
     std::map<std::string, Bytes> tree;
     for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
         const auto relative = entry.path().lexically_relative(root).generic_string();
+        // An open catalog's heartbeat thread rewrites writer.meta through
+        // temporary files on its own schedule. It is not activation state,
+        // so it is skipped before anything reads it.
+        if (relative == ".chunkdb.lock/writer.meta" || relative.starts_with(".chunkdb.lock/writer.meta.tmp.")) continue;
         // The empty writer lock is held without sharing on Windows. Preserve
         // its inventory entry without reopening the live OS lock handle.
         if (relative == ".chunkdb.lock/writer.lock")

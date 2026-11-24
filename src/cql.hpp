@@ -144,6 +144,29 @@ struct GetArea {
     std::optional<ChunkCoord> after;
 };
 
+// One function of AGGREGATE; `column` is empty for COUNT(*).
+struct AggregateFunction {
+    enum class Kind : std::uint8_t { kCount, kSum, kMin, kMax, kAvg };
+    Kind kind = Kind::kCount;
+    std::string column;
+    friend bool operator==(const AggregateFunction&, const AggregateFunction&) = default;
+};
+// AGGREGATE over a chunk range or ball; CHUNK c is the range from c to c.
+struct Aggregate {
+    bool around = false;
+    std::int64_t x0 = 0;
+    std::int64_t y0 = 0;
+    std::int64_t x1 = 0;
+    std::int64_t y1 = 0;
+    std::int64_t radius = 0;
+    std::string table;
+    std::vector<AggregateFunction> functions;
+    bool by_chunk = false;
+    std::int64_t z0 = 0;
+    std::int64_t z1 = 0;
+    std::uint8_t dims = 2;
+};
+
 struct ColumnDefinition {
     std::string name;
     ColumnType type;
@@ -266,7 +289,8 @@ struct Watch {
     bool no_before = false;
     bool chunks = false;
     std::optional<std::string> slot{};
-    std::optional<FeedArea> area{};
+    // Empty for the whole table; AREA ..., AREA ... gives several.
+    std::vector<FeedArea> areas{};
     std::optional<FeedPosition> after{};
     std::optional<std::uint64_t> ack_timeout_ms{};
     bool takeover = false;
@@ -341,6 +365,7 @@ using Statement = std::variant<
     GetChunk,
     SetChunk,
     GetArea,
+    Aggregate,
     CreateTable,
     AlterTable,
     DropTable,
@@ -394,6 +419,9 @@ struct Parsed {
 // Parses one statement (docs/CQL.md). Throws ParseError naming the
 // first token that does not fit, with its 1-based column.
 [[nodiscard]] Parsed Parse(std::string_view line);
+// How AGGREGATE names `function` in its reply and errors: `count(*)`,
+// `sum(a)`, `min(a)`, `max(a)` or `avg(a)`.
+[[nodiscard]] std::string AggregateFunctionName(const AggregateFunction& function);
 [[nodiscard]] HelloRequest ParseHello(std::string_view line);
 
 }  // namespace chunkdb::cql

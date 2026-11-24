@@ -251,8 +251,8 @@ void ArchiveFilterMatchesTheWatchFilter() {
         std::size_t sent = 0U, skipped = 0U;
         for (auto change = whole.Next(); change; change = whole.Next()) {
             const auto columns = geometry.LayoutAt(change->schema_version).schema().columns;
-            const auto expected = filters.chunks ? ChunkFeedEntry(change, geometry, filters.area, filters.column_ids)
-                : FilterFeedEntry(change, filters.area, filters.column_ids, filters.no_before, columns);
+            const auto expected = filters.chunks ? ChunkFeedEntry(change, geometry, FeedAreas(filters.area), filters.column_ids)
+                : FilterFeedEntry(change, FeedAreas(filters.area), filters.column_ids, filters.no_before, columns);
             const auto got = filtered.Next();
             assert(got && got->position == change->position);
             if (!expected) {

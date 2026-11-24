@@ -28,6 +28,7 @@ struct SlotAckDeadlineTestAccess {
     static std::size_t Excess(const SlotWatch& watch) { return watch.pool_->bytes.load(std::memory_order_acquire); }
     static constexpr std::size_t kReceipt = SlotWatch::kReceiptBytes;
     static std::size_t PreparedSize(const SlotWatch& watch) { return watch.prepared_ ? watch.prepared_->size : 0U; }
+    static FeedSubscription& Live(SlotWatch& watch) { return *watch.live_; }
     // Stands in for other output charged to the table's within-share counter.
     static void ChargeTable(SlotWatch& watch, std::size_t bytes) { watch.table_bytes_->fetch_add(bytes, std::memory_order_acq_rel); }
     static void ReleaseTable(SlotWatch& watch, std::size_t bytes) { watch.table_bytes_->fetch_sub(bytes, std::memory_order_acq_rel); }
@@ -1407,7 +1408,10 @@ void PersistentFilterDelivery(bool tls) {
     auto watch = harness.Connect();
     const auto wrong = watch->Command("WATCH t SLOT 'filtered' COLUMNS n,label");
     Error(wrong, "INVALID_ARGUMENT"); assert(wrong.value.find("reason=slot_filters") != std::string::npos);
-    (void)Start(watch->Command("WATCH t SLOT 'filtered'"));
+    // A slot keeps one area, so different ones never match its filters; repeats of it do.
+    const auto areas = watch->Command("WATCH t SLOT 'filtered' AREA 0 0 TO 0 0, AREA 1 1 TO 1 1");
+    Error(areas, "INVALID_ARGUMENT"); assert(areas.value.find("reason=slot_filters") != std::string::npos);
+    (void)Start(watch->Command("WATCH t SLOT 'filtered' AREA 0 0 TO 0 0, AREA 0 0 TO 0 0"));
     auto ordinary = harness.Connect(); (void)Start(ordinary->Command("WATCH t COLUMNS label,n NO BEFORE AREA 0 0 TO 0 0"));
     (void)Set(*writer, 9, 8); // Outside the fixed area; delivery must skip it.
     const auto first = Number(writer->Command("SET BLOCK 0 0 IN t n=7,label='one'"));
@@ -2304,6 +2308,36 @@ void AckDeadlineLedgerMode(bool tls, bool chunks) {
 void AckDeadlineLedger(bool tls) { AckDeadlineLedgerMode(tls, false); }
 void ChunksDeadlineLedger(bool tls) { AckDeadlineLedgerMode(tls, true); }
 
+// A CHUNKS slot's live reader receives ring entries, so the watch projects and
+// encodes each change once, and it shares no projection with ordinary CHUNKS
+// watches, which a slot catching up or held at the durable frontier would pin.
+void ChunkSlotLiveReader(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect(); Create(*writer, " CHUNKS");
+    auto table = harness.catalog->Find("t");
+    auto state = SlotWatch::Create(table, "consumer", {});
+    auto plain = table->SubscribeFeed();
+    auto ordinary = table->SubscribeFeed({.chunks = true});
+    const auto revision = Set(*writer, 1);
+    auto chunks = feed_test::Next(*ordinary);
+    assert(chunks->kind == FeedEntry::Kind::kChunks && chunks->position.revision == revision && chunks->protocol_frame);
+    const auto frame = *chunks->protocol_frame;
+    const std::weak_ptr<const FeedEntry> projected = chunks;
+    chunks.reset();
+    assert(projected.expired());
+    const auto change = feed_test::Next(*plain);
+    const auto live = feed_test::Next(SlotAckDeadlineTestAccess::Live(*state));
+    assert(live == change && live->kind == FeedEntry::Kind::kChange);
+    assert(SlotAckDeadlineTestAccess::Publish(*state, live));
+    bool sent = false;
+    while (auto output = state->Take(1024U * 1024U)) {
+        sent = sent || *output->bytes == frame;
+        state->Consumed(output->bytes->size());
+    }
+    assert(sent);
+    state->Cancel(); state->WorkStep();
+}
+
 void AckDeadlineWireMode(bool tls, bool chunks) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, kDefaultFeedBufferBytes, {}, 100ms);
     auto writer = harness.Connect(); Create(*writer, chunks ? " AREA 0 0 TO 0 0 CHUNKS" : " AREA 0 0 TO 0 0");
@@ -2733,6 +2767,7 @@ int main(int argc, char** argv) {
         run("table-ACK-batch", TableAckBatching);
         run("ACK-deadline-ledger", AckDeadlineLedger);
         run("CHUNKS-ACK-deadline-ledger", ChunksDeadlineLedger);
+        run("CHUNKS-slot-live-reader", ChunkSlotLiveReader);
         run("ACK-deadline-wire", AckDeadlineWire);
         run("CHUNKS-ACK-deadline-wire", ChunksDeadlineWire);
         run("ACK-deadline-stalled-socket", AckDeadlineStalledSocket);

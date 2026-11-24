@@ -116,7 +116,9 @@ SHOW TABLE STATS table
 - GET AREA: populated chunks, including metadata-only chunks, in lexicographic coordinate order.
 - SCAN CHUNKS: `chunks`, `more`, `epoch`, `position`, and `retained_deletion_floor`.
 - Each scan row contains the active chunk coordinates and producing version, followed by a form or null when WITH DATA is present.
+- Scan rows ascend by cx, then cy, then cz, within a page and across pages continued AFTER.
 - Continue AFTER the last returned coordinate while `more` is true; read-only `position` is null.
+- Pass the first page's `epoch` and `position` to WATCH AFTER to follow later changes; see [Resume a consumer](../FEED_RESUME.md).
 - COMPACT TOMBSTONES: the retained-deletion floor after completion.
 - SHOW TABLE STATS: `epoch`, nullable completed `revision`, `dims`, `chunks`, retained `tombstones`, `retained_deletion_floor`, `loaded_chunks`, `files`, `disk_bytes`, `slots`, and `watches`.
 
@@ -130,6 +132,7 @@ SHOW TABLE STATS table
 | VERSION_MISMATCH | The destination changed. | Read it again and recompute. |
 | INVALID_ARGUMENT | The geometry, values, or arguments are invalid. | Check the table and syntax. |
 | INVALID_ARGUMENT | You run SET CHUNK on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
+| SYNTAX | SCAN CHUNKS has WHERE, which it does not support. | Remove WHERE and filter the returned forms. |
 | OUT_OF_RANGE | The area or response exceeds a limit. | Read a smaller area. |
 | OUT_OF_RANGE reason=area_entry_too_large | One chunk cannot fit the response limit. | Read it with GET CHUNK or fewer COLUMNS; continue AFTER it. |
 | RESYNC_REQUIRED reason=history_lost | SINCE is below the retained-deletion floor. | Rebuild the consumer's state and resume at an admitted position. |

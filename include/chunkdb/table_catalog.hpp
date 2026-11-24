@@ -277,6 +277,8 @@ class Table : public std::enable_shared_from_this<Table> {
     friend struct BackupTestAccess;
     friend struct FeatureActivationTestAccess;
     friend struct CatalogTxnTestAccess;
+    // With `slot`, a slot watch's live reader: ring entries unprojected, in no projection group.
+    [[nodiscard]] std::unique_ptr<FeedSubscription> SubscribeFeed(const FeedOptions& options, bool slot);
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);
     [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name, const FeedOptions& options,
         bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner);
