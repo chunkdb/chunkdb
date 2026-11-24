@@ -1,4 +1,4 @@
-# CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SWAP TABLES, SHOW TABLES, DESCRIBE
+# CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SWAP TABLES, SHOW TABLES, DESCRIBE, SHOW STATUS, ENABLE FEATURE
 
 You define a table's columns, inspect its schema, and change or remove it.
 A schema defines the names, types, defaults, and nullability of its columns.
@@ -188,7 +188,6 @@ While either check runs, writes that the change would refuse are refused already
 A table restored from a backup taken during a check does not have the check, and keeps the column as it was before it.
 SET DEFAULT and DROP DEFAULT change only blocks created later; existing blocks keep their values.
 SET REQUIRED applies to new blocks only: existing blocks of a column that is not NULL always hold a value.
-The embedded bit-string calls (`ChunkStore::GetBlockBits` and the like) need a table whose one column is bits(N) and not NULL: SET NULL on that column, like ADD COLUMN, makes them refuse, and DROP NULL brings them back.
 You can add REQUIRED without DEFAULT only when no block is present.
 For chunk columns, adding REQUIRED without DEFAULT requires no written chunk identity, including retained tombstones.
 Block and chunk columns share the table's schema version; changing either domain advances it once.

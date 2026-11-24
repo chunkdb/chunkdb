@@ -723,8 +723,15 @@ std::vector<FeedSlot> Table::ListFeedSlots(const Lease& lease, bool include_lost
     const auto& columns = lease.store().geometry().layout().schema().columns;
     for (auto& slot : slots) {
         // ClaimFeedSlot refuses a second watch by the same rule.
-        if (const auto claimed = slot_claims_.find(slot.name); claimed != slot_claims_.end())
-            if (const auto claim = claimed->second.lock()) slot.attached = claim->valid.load(std::memory_order_acquire);
+        if (const auto claimed = slot_claims_.find(slot.name); claimed != slot_claims_.end()) {
+            if (const auto claim = claimed->second.lock(); claim && claim->valid.load(std::memory_order_acquire)) {
+                slot.attached = true;
+                slot.watch_user = claim->user;
+                slot.peer = claim->peer;
+                if (const auto ack = claim->last_ack.load(std::memory_order_acquire); ack != FeedSlotClaim::kNoAck)
+                    slot.last_ack = std::chrono::steady_clock::time_point(std::chrono::steady_clock::duration(ack));
+            }
+        }
         if (!slot.filters.column_ids) continue;
         for (const auto id : *slot.filters.column_ids) {
             const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
@@ -738,6 +745,14 @@ Table::FeedCounts Table::CountFeeds(const Lease& lease) const {
     if (lease.table_ != this) throw std::logic_error("feed counts need a lease of their table");
     // Subscriptions change only in exclusive sections, which wait for leases.
     return FeedCounts{.slots = lease.store().feed_slots_->size(), .watches = feed_subscriptions_};
+}
+
+bool Table::SlotFrontierFrozen(const Lease& lease) const {
+    if (lease.table_ != this) throw std::logic_error("slot frontier state needs a lease of its table");
+    // FeedSlots::SyncImpl refuses a fail-closed store, and the slot worker stops.
+    const auto& store = lease.store();
+    return store.feed_slots_active_.load(std::memory_order_acquire) &&
+           store.durability_poisoned_.load(std::memory_order_acquire);
 }
 
 std::vector<std::uint32_t> Table::ResolveFeedColumns(const std::vector<std::string>& names) {
@@ -757,7 +772,7 @@ std::vector<std::uint32_t> Table::ResolveFeedColumns(const std::vector<std::stri
 
 std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::string_view name,
     const FeedOptions& options, bool takeover, std::string user,
-    const std::function<void(std::string_view)>& authorize_owner) {
+    const std::function<void(std::string_view)>& authorize_owner, std::string peer) {
     std::shared_ptr<FeedSlotClaim> old;
     std::shared_ptr<SlotWatch> owner;
     const auto validate = [&](ChunkStore& store) {
@@ -784,7 +799,7 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
         if (old && old->takeover_pending.load(std::memory_order_acquire))
             throw FeedSlotBusyError("feed slot ownership handoff is pending", "takeover_pending");
         if (!old || !old->valid.load(std::memory_order_acquire)) {
-            auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_, std::move(user));
+            auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_, std::move(user), std::move(peer));
             existing = claim;
             return {std::move(slot), std::move(claim)};
         }
@@ -824,7 +839,7 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
     if (!old->valid.load(std::memory_order_acquire) || found == slot_claims_.end() || found->second.lock() != old)
         throw FeedSlotLostError("feed slot was removed during takeover");
     auto slot = validate(*store);
-    auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_, std::move(user));
+    auto claim = std::make_shared<FeedSlotClaim>(std::string(name), store->version_clock_.load(std::memory_order_seq_cst) - 1U, slot_output_bytes_, slot_excess_, std::move(user), std::move(peer));
     old->valid.store(false, std::memory_order_release);
     found->second = claim;
     return {std::move(slot), std::move(claim)};
