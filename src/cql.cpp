@@ -304,10 +304,10 @@ std::string StatementSuggestion(std::string_view word) {
     const auto lower = Lower(word);
     if (lower == "select") return "; read with GET BLOCK, GET AREA or GET CHUNK";
     if (lower == "insert" || lower == "update" || lower == "upsert") return "; write with SET BLOCK or SET CHUNK";
-    const std::array<std::string_view, 26U> keywords{
+    const std::array<std::string_view, 27U> keywords{
         "get", "set", "delete", "create", "alter", "drop", "show", "describe", "grant", "revoke",
         "begin", "commit", "rollback", "ping", "flush", "watch", "unwatch", "ack", "backup", "migrate",
-        "scan", "reload", "recover", "compact", "restore", "swap"};
+        "scan", "reload", "recover", "compact", "restore", "swap", "aggregate"};
     std::string_view closest;
     std::size_t best = word.size() < 4U ? 2U : 3U;
     bool tied = false;
@@ -613,6 +613,69 @@ class Parser {
         return 2;
     }
 
+    // After AGGREGATE: CHUNK c | AREA a TO b | AREA AROUND c RADIUS r, then
+    // FROM t, the functions and BY CHUNK.
+    [[nodiscard]] Aggregate AggregateStatement() {
+        Aggregate aggregate;
+        if (Accept("chunk")) {
+            aggregate.dims = Point(aggregate.x0, aggregate.y0, aggregate.z0, true);
+            aggregate.x1 = aggregate.x0;
+            aggregate.y1 = aggregate.y0;
+            aggregate.z1 = aggregate.z0;
+        } else if (Accept("area")) {
+            if (Accept("around")) {
+                aggregate.around = true;
+                aggregate.dims = Point(aggregate.x0, aggregate.y0, aggregate.z0);
+                Expect("radius");
+                aggregate.radius = static_cast<std::int64_t>(Unsigned("a radius", std::numeric_limits<std::int64_t>::max()));
+            } else {
+                aggregate.dims = Point(aggregate.x0, aggregate.y0, aggregate.z0);
+                Expect("to");
+                if (Point(aggregate.x1, aggregate.y1, aggregate.z1) != aggregate.dims)
+                    Fail(1, "AREA endpoints have different dimensions");
+            }
+        } else {
+            Fail(Peek().column, "expected CHUNK or AREA, got " + Quote(Peek()));
+        }
+        Expect("from");
+        aggregate.table = Name("a table name");
+        do {
+            const auto column = Peek().column;
+            AggregateFunction function;
+            using Kind = AggregateFunction::Kind;
+            if (Accept("count")) function.kind = Kind::kCount;
+            else if (Accept("sum")) function.kind = Kind::kSum;
+            else if (Accept("min")) function.kind = Kind::kMin;
+            else if (Accept("max")) function.kind = Kind::kMax;
+            else if (Accept("avg")) function.kind = Kind::kAvg;
+            else Fail(column, "expected COUNT, SUM, MIN, MAX or AVG, got " + Quote(Peek()));
+            ExpectToken(TokenKind::kOpen, "(");
+            if (function.kind == Kind::kCount) {
+                if (Peek().kind != TokenKind::kStar) Fail(Peek().column, "COUNT takes *, got " + Quote(Peek()));
+                Take();
+            } else {
+                function.column = Name("a column name");
+            }
+            ExpectToken(TokenKind::kClose, ")");
+            if (std::find(aggregate.functions.begin(), aggregate.functions.end(), function) != aggregate.functions.end())
+                Fail(column, AggregateFunctionName(function) + " is given twice");
+            aggregate.functions.push_back(std::move(function));
+        } while (AcceptToken(TokenKind::kComma));
+        while (true) {
+            const auto column = Peek().column;
+            if (Accept("by")) {
+                if (aggregate.by_chunk) Fail(column, "BY CHUNK is given twice");
+                Expect("chunk");
+                aggregate.by_chunk = true;
+            } else if (IsKeyword(Peek(), "where")) {
+                Fail(column, "AGGREGATE does not take WHERE; it aggregates every present block of the selector");
+            } else {
+                break;
+            }
+        }
+        return aggregate;
+    }
+
     [[nodiscard]] std::vector<Assignment> Assignments() {
         std::vector<Assignment> values;
         do {
@@ -853,6 +916,7 @@ class Parser {
             }
             Fail(Peek().column, "expected BLOCK, CHUNK or AREA, got " + Quote(Peek()));
         }
+        if (Accept("aggregate")) return AggregateStatement();
         if (Accept("set")) {
             if (Accept("block")) {
                 SetBlock set;
@@ -1284,6 +1348,13 @@ std::size_t CountParameterTokens(std::string_view line) noexcept {
 
 Parsed Parse(std::string_view line) {
     return Parser(line).Statement();
+}
+
+std::string AggregateFunctionName(const AggregateFunction& function) {
+    using Kind = AggregateFunction::Kind;
+    const char* name = function.kind == Kind::kCount ? "count" : function.kind == Kind::kSum ? "sum"
+        : function.kind == Kind::kMin ? "min" : function.kind == Kind::kMax ? "max" : "avg";
+    return std::string(name) + "(" + (function.kind == Kind::kCount ? std::string("*") : function.column) + ")";
 }
 
 HelloRequest ParseHello(std::string_view line) {

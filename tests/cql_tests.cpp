@@ -547,6 +547,38 @@ void TestBackup() {
     ExpectError("SWAP TABLES world, other, third", "expected the end of the statement");
 }
 
+void TestAggregate() {
+    using Kind = cql::AggregateFunction::Kind;
+    const auto area = Get<cql::Aggregate>("AGGREGATE AREA -1 -2 TO 3 4 FROM t COUNT(*), SUM(a), MIN(a), MAX(b), AVG(a)");
+    assert(!area.around && area.dims == 2U && area.x0 == -1 && area.y0 == -2 && area.x1 == 3 && area.y1 == 4);
+    assert(area.table == "t" && !area.by_chunk);
+    assert((area.functions == std::vector<cql::AggregateFunction>{{Kind::kCount, ""}, {Kind::kSum, "a"},
+        {Kind::kMin, "a"}, {Kind::kMax, "b"}, {Kind::kAvg, "a"}}));
+    std::vector<std::string> names;
+    for (const auto& function : area.functions) names.push_back(cql::AggregateFunctionName(function));
+    assert((names == std::vector<std::string>{"count(*)", "sum(a)", "min(a)", "max(b)", "avg(a)"}));
+    const auto ball = Get<cql::Aggregate>("aggregate area around 1 2 3 radius 4 from t count ( * ) by chunk");
+    assert(ball.around && ball.dims == 3U && ball.z0 == 3 && ball.radius == 4 && ball.by_chunk);
+    const auto chunk = Get<cql::Aggregate>("AGGREGATE CHUNK 5 -6 7 FROM t SUM(a) BY CHUNK");
+    assert(!chunk.around && chunk.dims == 3U && chunk.by_chunk && chunk.functions.size() == 1U);
+    assert(chunk.x0 == 5 && chunk.x1 == 5 && chunk.y0 == -6 && chunk.y1 == -6 && chunk.z0 == 7 && chunk.z1 == 7);
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t", "expected COUNT, SUM, MIN, MAX or AVG, got the end of the statement");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(a)", "COUNT takes *, got 'a'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t SUM(*)", "expected a column name, got '*'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t SUM a", "expected (, got 'a'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t MEDIAN(a)", "expected COUNT, SUM, MIN, MAX or AVG, got 'MEDIAN'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t SUM(a), sum(a)", "column 42: sum(a) is given twice");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) BY CHUNK BY CHUNK", "BY CHUNK is given twice");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) BY BLOCK", "expected CHUNK, got 'BLOCK'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) WHERE a > 1",
+        "column 43: AGGREGATE does not take WHERE; it aggregates every present block of the selector");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 0 FROM t COUNT(*)", "AREA endpoints have different dimensions");
+    ExpectError("AGGREGATE AREA AROUND 0 0 RADIUS -1 FROM t COUNT(*)", "a radius must be between 0");
+    ExpectError("AGGREGATE BLOCK 0 0 FROM t COUNT(*)", "expected CHUNK or AREA, got 'BLOCK'");
+    ExpectError("AGGREGATE CHUNK 0 0 FROM t COUNT(*) LIMIT 1", "expected the end of the statement, got 'LIMIT'");
+    ExpectError("AGGREGAT CHUNK 0 0 FROM t COUNT(*)", "did you mean AGGREGATE?");
+}
+
 void TestErrors() {
     ExpectError("", "column 1: unknown statement the end of the statement");
     ExpectError("SELECT * FROM t", "column 1: unknown statement 'SELECT'; read with GET BLOCK, GET AREA or GET CHUNK");
@@ -605,6 +637,7 @@ int main() {
     TestConditionalObjects();
     TestBlockStatements();
     TestChunkAndAreaStatements();
+    TestAggregate();
     TestLiterals();
     TestParameters();
     TestCreateTable();
