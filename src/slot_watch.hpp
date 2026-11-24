@@ -30,6 +30,7 @@ struct FeedDeliveryTestHook {
         kAfterPayloadCreditQueued, kAfterPayloadCreditGranted, kAfterStatementTrackerScan,
         kBeforeBufferedStatementPublication, kBeforeTakeoverReservation, kBeforeWorkerIdleWait, kBeforeWorkerReceive,
         kAfterSlotCancel, kAfterSlotSocketClose,
+        kBeforeListenerPublication, kAfterListenerPublication,
         kBeforeIoPoll }; // kBeforeIoPoll passes the number of watch sockets polled.
     virtual ~FeedDeliveryTestHook() = default;
     virtual void Run(Point point, std::size_t bytes) = 0;
