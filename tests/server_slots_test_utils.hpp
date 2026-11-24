@@ -33,6 +33,7 @@
 #include "chunkdb/server.hpp"
 #include "feed_test_utils.hpp"
 #include "feed_phase_watchdog.hpp"
+#include "listener_port_test_utils.hpp"
 #include "login_helpers.hpp"
 #include "server_socket.hpp"
 #include "tls_test_utils.hpp"
@@ -64,21 +65,6 @@ inline sockaddr_in Address(std::uint16_t port) {
     address.sin_port = htons(port);
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     return address;
-}
-inline std::uint16_t FreePort() {
-    InitializeSockets();
-    const auto socket = ::socket(AF_INET, SOCK_STREAM, 0);
-    assert(socket != kInvalid);
-    auto address = Address(0);
-    assert(bind(socket, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
-#ifdef _WIN32
-    int length = sizeof(address);
-#else
-    socklen_t length = sizeof(address);
-#endif
-    assert(getsockname(socket, reinterpret_cast<sockaddr*>(&address), &length) == 0);
-    CloseSocket(socket);
-    return ntohs(address.sin_port);
 }
 struct Reply {
     char type = 0;
@@ -412,7 +398,7 @@ class Harness {
   public:
     test::ScopedTempDir directory{"chunkdb-slots-socket"};
     std::shared_ptr<TableCatalog> catalog;
-    std::uint16_t port = FreePort();
+    std::uint16_t port = test::PickListenerPort();
     bool tls;
     bool auth;
     Harness(bool use_tls, bool use_auth = false, std::size_t max_bytes = kDefaultSlotMaxBytes,
@@ -452,12 +438,19 @@ class Harness {
             server_config.tls_cert_path = cert.string(); server_config.tls_key_path = key.string();
         }
 #endif
+        server_config_ = server_config;
         server_ = std::make_unique<ChunkServer>(server_config, engine_);
         Start();
     }
+    // Another process may have bound the old port since Stop; no caller needs
+    // the same port, so the server restarts on a newly chosen one.
     void Restart() {
         test::FeedPhaseWatchdog::Phase("harness: restart Stop"); server_->Stop();
         test::FeedPhaseWatchdog::Phase("harness: restart join"); thread_.join();
+        { std::lock_guard lock(error_mutex_); if (error_) std::rethrow_exception(error_); }
+        port = test::PickListenerPort();
+        server_config_.port = port;
+        server_ = std::make_unique<ChunkServer>(server_config_, engine_);
         Start();
     }
     ~Harness() {
@@ -483,26 +476,24 @@ class Harness {
             catch (const std::exception&) { std::lock_guard lock(error_mutex_); error_ = std::current_exception(); }
         });
         try {
-            const auto deadline = Clock::now() + 10s;
-            std::unique_ptr<Client> probe;
-            while (true) {
-                { std::lock_guard lock(error_mutex_); if (error_) std::rethrow_exception(error_); }
-                try { probe = std::make_unique<Client>(port, tls); break; }
-                catch (const std::runtime_error&) {
-                    if (Clock::now() >= deadline) throw;
-                    std::this_thread::sleep_for(10ms); // Only listener startup, no test ordering relies on this.
-                }
-            }
+            // Run reports its own listener, so the probe never reaches another
+            // socket on this port; a failed Run ends the wait at once.
+            if (!server_->WaitListeningForTests(10s)) throw std::runtime_error("server did not start listening in time");
+            const auto probe = std::make_unique<Client>(port, tls);
             // TCP can connect while Run is still constructing its feed I/O.
             // A completed handshake proves workers are ready before installing
             // observers. Protocol/auth failures are not connection retries.
             if (auth) probe->Login(); else probe->Hello();
         } catch (const std::exception&) {
             test::FeedPhaseWatchdog::Phase("harness: failed startup Stop"); server_->Stop();
-            test::FeedPhaseWatchdog::Phase("harness: failed startup join"); thread_.join(); throw;
+            test::FeedPhaseWatchdog::Phase("harness: failed startup join"); thread_.join();
+            // Report the server's own error, such as a port already in use.
+            { std::lock_guard lock(error_mutex_); if (auto error = std::exchange(error_, {})) std::rethrow_exception(error); }
+            throw;
         }
     }
     std::shared_ptr<CommandEngine> engine_;
+    ServerConfig server_config_;
     std::unique_ptr<ChunkServer> server_;
     std::thread thread_;
     std::mutex error_mutex_;

@@ -103,6 +103,8 @@ struct StatementLogInfo {
     const char* verb = nullptr;
     // The audit event, null for statements the audit log leaves out.
     const char* audit_event = nullptr;
+    // Which ALTER USER form ran, e.g. "add_verifier"; null for other statements.
+    const char* change = nullptr;
     std::string table;
     std::string target_user;
     std::string slot;

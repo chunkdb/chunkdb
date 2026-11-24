@@ -10,10 +10,13 @@
 
 namespace chunkdb {
 
+struct ChunkFormScale;
+
+// A nonnull scale adds section 7; the geometry and state are then the downsampled ones.
 // Validate the same section plan as the encoder without allocating bodies.
 [[nodiscard]] std::size_t SectionedChunkStateBytes(
     const Geometry& geometry, const ChunkState& state, std::size_t max_variable_bytes,
-    std::span<const std::size_t> projection = {});
+    std::span<const std::size_t> projection = {}, const ChunkFormScale* scale = nullptr);
 
 // An empty projection means the full block schema; a nonempty projection
 // retains its requested order, even when it names every block column.
@@ -22,7 +25,8 @@ namespace chunkdb {
 [[nodiscard]] std::vector<std::uint8_t> EncodeSectionedChunkState(
     const Geometry& geometry, const ChunkState& state, std::size_t max_variable_bytes,
     std::span<const std::size_t> projection = {}, bool private_state = false,
-    std::size_t max_form_bytes = std::numeric_limits<std::uint32_t>::max());
+    std::size_t max_form_bytes = std::numeric_limits<std::uint32_t>::max(),
+    const ChunkFormScale* scale = nullptr);
 
 // Incoming mutations require the current shared schema revision.
 // Their producing identity is discarded; a projected mutation can omit its

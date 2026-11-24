@@ -27,6 +27,7 @@
 #include <unistd.h>
 #endif
 
+#include "listener_port_test_utils.hpp"
 #include "test_utils.hpp"
 
 #ifndef _WIN32
@@ -71,18 +72,6 @@ std::string StartupFailure(const std::string& binary, const std::filesystem::pat
     assert(waitpid(pid, &status, 0) == pid);
     assert(WIFEXITED(status) && WEXITSTATUS(status) == expected_exit);
     return ReadFile(log);
-}
-
-int FreePort() {
-    const int fd = socket(AF_INET, SOCK_STREAM, 0);
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    assert(bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0);
-    socklen_t size = sizeof(address);
-    assert(getsockname(fd, reinterpret_cast<sockaddr*>(&address), &size) == 0);
-    close(fd);
-    return ntohs(address.sin_port);
 }
 
 int Connect(int port) {
@@ -218,7 +207,7 @@ class ServerProcess {
   private:
     bool Start(const std::string& binary, const std::filesystem::path& data_dir,
                const std::vector<std::string>& options) {
-        port_ = FreePort();
+        port_ = chunkdb::test::PickListenerPort();
         pid_ = fork();
         assert(pid_ >= 0);
         if (pid_ == 0) {

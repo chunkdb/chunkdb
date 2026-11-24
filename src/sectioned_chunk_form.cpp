@@ -40,7 +40,7 @@ void ValidateKinds(std::uint16_t kind, std::uint16_t previous, std::size_t index
 
 bool KnownKind(std::uint16_t kind) noexcept {
     return kind >= static_cast<std::uint16_t>(ChunkFormSectionKind::kPresence) &&
-           kind <= static_cast<std::uint16_t>(ChunkFormSectionKind::kBlockSpans);
+           kind <= static_cast<std::uint16_t>(ChunkFormSectionKind::kScale);
 }
 
 void RequireSections(bool presence, bool spans) {
@@ -106,7 +106,7 @@ ChunkFormSections ParseChunkFormSections(
 
     std::size_t next = body_begin;
     std::uint16_t previous = 0;
-    bool presence = false, spans = false, unknown = false;
+    bool presence = false, spans = false, unknown = false, scaled = false;
     for (std::size_t i = 0; i < count; ++i) {
         const auto* entry = bytes.data() + kHeaderBytes + i * kDirectoryEntryBytes;
         const auto kind = static_cast<std::uint16_t>(ReadLe(entry, 2));
@@ -121,11 +121,14 @@ ChunkFormSections ParseChunkFormSections(
         presence |= kind == static_cast<std::uint16_t>(ChunkFormSectionKind::kPresence);
         spans |= kind == static_cast<std::uint16_t>(ChunkFormSectionKind::kBlockSpans);
         unknown |= !KnownKind(kind);
+        scaled |= kind == static_cast<std::uint16_t>(ChunkFormSectionKind::kScale);
     }
     if (next != bytes.size()) throw std::invalid_argument("bytes after last chunk form section");
     RequireSections(presence, spans);
     if (unknown && mode == ChunkFormReadMode::kMutation)
         throw std::invalid_argument("unknown_form_section");
+    if (scaled && mode == ChunkFormReadMode::kMutation)
+        throw std::invalid_argument("a downsampled chunk form cannot be written");
 
     ChunkFormSections result{header, {}};
     result.sections.reserve(count);

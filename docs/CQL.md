@@ -34,7 +34,7 @@ Bytes use hexadecimal literals such as `x'0a0bff'`.
 Bits use literals such as `b'1010'`, with the first digit representing the lowest bit.
 
 Trailing keyword options can appear in any order, each at most once.
-Client APIs supply binary `$n` parameters in these places: SET BLOCK values, values in the WHERE of AGGREGATE and SCAN CHUNKS, the SET CHUNK form or META values, `VERIFIER $1` in CREATE USER and ALTER USER, HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
+Client APIs supply binary `$n` parameters in these places: SET BLOCK values, values in the WHERE of AGGREGATE and SCAN CHUNKS, the SET CHUNK form or META values, `VERIFIER $1` in CREATE USER and ALTER USER (also `ADD VERIFIER $1`), HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
 See [Protocol](PROTOCOL.md#parameters) for encoding.
 
 Committed chunk versions are producing commit revisions, ordered only within the table epoch returned by DESCRIBE.
