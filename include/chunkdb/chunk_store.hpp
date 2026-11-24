@@ -23,6 +23,7 @@
 #include <system_error>
 #include <thread>
 #include <type_traits>
+#include <limits>
 #include <list>
 #include <unordered_map>
 #include <unordered_set>
@@ -332,9 +333,10 @@ struct StoreConfig {
     // directory this store belongs to (a table of a data directory).
     bool acquire_process_lock = true;
     // A new version clock starts at this token instead of 1; an existing
-    // clock ignores it. The table catalog sets it to the data directory's
-    // version floor, so a table dropped and created again under the same
-    // name never reuses a token of the earlier table.
+    // clock below it is raised to it, durably, before its first token. The
+    // table catalog sets it to the data directory's version floor, so a table
+    // that takes a name another table held (CREATE after DROP, RESTORE TABLE,
+    // SWAP TABLES, RENAME TO) never reuses a token of the earlier table.
     std::uint64_t initial_version_floor = 0;
     // The most bytes of chunk states the store keeps for open transactions
     // (docs/design/TRANSACTIONS_DESIGN.md); past it the oldest transactions are
@@ -1437,6 +1439,11 @@ class ChunkStore {
     // leave the clock unused and issue random epoch tokens instead.
     std::atomic<std::uint64_t> version_clock_{0};
     std::atomic<std::uint64_t> version_clock_ceiling_{0};
+    // The recovered clock when the data directory's version floor raised it
+    // on opening (RaiseVersionClockToFloor), otherwise the largest u64. This
+    // store issued no token from it up to the raised clock, so a change
+    // feed's history is complete from just below it.
+    std::uint64_t opened_clock_ = std::numeric_limits<std::uint64_t>::max();
     // Latest commit time this store instance issued (Unix ms).
     std::atomic<std::uint64_t> last_commit_time_ms_{0};
     std::mutex version_clock_mutex_;
@@ -1763,6 +1770,9 @@ class ChunkStore {
     // tokens issued from now on are above every revision the store holds even
     // when the clock bookkeeping was lost and restarted low.
     void RaiseVersionClockAbove(std::uint64_t revision);
+    // Raises the clock of a writer to initial_version_floor_ after recovery,
+    // durably before its first token, and records opened_clock_.
+    void RaiseVersionClockToFloor();
     void RecoverConditionalRollbackIntents(bool validate_only = false);
     // Creates the manifest of a new store, or confirms the existing one
     // still records the geometry this store opened with.

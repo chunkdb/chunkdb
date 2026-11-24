@@ -87,22 +87,53 @@ void Crashes(const std::string& executable) {
 }
 
 
-// A SWAP TABLES child process stops before the exchange, after it, and after
-// its sync; the next start serves both names exchanged or neither.
+// RESTORE TABLE under the name of a dropped table stops before and after it
+// publishes; the table the next start serves under the name never reaches a
+// version the dropped table issued.
+void RestoreAfterDropCrashes(const std::string& executable) {
+    for (const std::string point : {"CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_BEFORE_PUBLISH_ONCE",
+             "CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_AFTER_PUBLISH_ONCE"}) {
+        Source source;
+        std::uint64_t stale = 0U;
+        {
+            TableCatalog catalog(source.Config());
+            stale = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
+            catalog.Drop("t");
+        }
+        assert(Child(executable, {"--restore-table-child", source.data.string(), source.backup.string(), point, "relaxed", "t"}) == 86);
+        {
+            TableCatalog catalog(source.Config());
+            assert(Entries(source.data / ".chunkdb.staging") == 0U);
+            const bool published = point.find("AFTER_PUBLISH") != std::string::npos;
+            assert((catalog.Find("t") != nullptr) == published);
+            if (!published) (void)catalog.RestoreTable(source.Request("t"));
+            RefusesStaleVersion(catalog, "t", stale);
+        }
+        Verified(source.data);
+    }
+}
+
+// A SWAP TABLES child process stops after it raises the version floor, before
+// the exchange, after it, and after its sync; the next start serves both names
+// exchanged or neither.
 void SwapCrashes(const std::string& executable) {
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) {
-        for (const std::string point : {"CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_BEFORE_EXCHANGE_ONCE",
+        for (const std::string point : {"CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_VERSION_FLOOR_ONCE",
+                 "CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_BEFORE_EXCHANGE_ONCE",
                  "CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_EXCHANGE_ONCE",
                  "CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_SYNC_ONCE"}) {
             Source source(mode);
             StoreId restored{};
+            std::uint64_t stale = 0U;
             {
                 TableCatalog catalog(source.Config());
                 restored = catalog.RestoreTable(source.Request()).epoch;
+                stale = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
             }
             assert(Child(executable, {"--swap-child", source.data.string(), point,
                        mode == DurabilityMode::kFsyncWal ? "fsync-wal" : "relaxed"}) == 86);
-            const bool exchanged = point.find("BEFORE_EXCHANGE") == std::string::npos;
+            const bool floor_only = point.find("AFTER_VERSION_FLOOR") != std::string::npos;
+            const bool exchanged = !floor_only && point.find("BEFORE_EXCHANGE") == std::string::npos;
             {
                 TableCatalog catalog(source.Config());
                 assert(catalog.TableCount() == 2U && catalog.Fences().empty());
@@ -111,8 +142,13 @@ void SwapCrashes(const std::string& executable) {
                 assert(copy->store_id() == restored && live->store_id() == source.epoch);
                 assert(copy->Acquire()->store().GetBlockBits(8, 0) == "00000011");
                 assert(live->Acquire()->store().GetBlockBits(8, 0) == "11111111");
-                // The slots were marked before the exchange: every crash point keeps the marks.
-                assert(copy->ListFeedSlots().at(0).resync && live->ListFeedSlots().at(0).resync);
+                // The slots were marked before the exchange: every crash point
+                // from the marks on keeps them; the restored slot was marked
+                // by the restore.
+                assert(copy->ListFeedSlots().at(0).resync && live->ListFeedSlots().at(0).resync == !floor_only);
+                // The floor was raised durably before every crash point: the
+                // restored table never reaches a version of the live one.
+                RefusesStaleVersion(catalog, exchanged ? "t" : "t_restored", stale);
                 // The swap can run again after the restart.
                 catalog.SwapTables("t", "t_restored");
                 assert(catalog.Require(exchanged ? "t_restored" : "t")->store_id() == restored);
@@ -122,18 +158,21 @@ void SwapCrashes(const std::string& executable) {
     }
 }
 
-// An ALTER TABLE ... RENAME TO child process stops before the rename, after
-// it, and after its sync; the next start serves the table, with its epoch,
-// data and slot, under exactly one of the names.
+// An ALTER TABLE ... RENAME TO child process stops after it raises the version
+// floor, before the rename, after it, and after its sync; the next start
+// serves the table, with its epoch, data and slot, under exactly one of the
+// names.
 void RenameCrashes(const std::string& executable) {
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal}) {
-        for (const std::string point : {"CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_BEFORE_RENAME_ONCE",
+        for (const std::string point : {"CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_VERSION_FLOOR_ONCE",
+                 "CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_BEFORE_RENAME_ONCE",
                  "CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_RENAME_ONCE",
                  "CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_SYNC_ONCE"}) {
             Source source(mode);
             assert(Child(executable, {"--rename-child", source.data.string(), point,
                        mode == DurabilityMode::kFsyncWal ? "fsync-wal" : "relaxed"}) == 86);
-            const bool renamed = point.find("BEFORE_RENAME") == std::string::npos;
+            const bool renamed = point.find("BEFORE_RENAME") == std::string::npos &&
+                point.find("AFTER_VERSION_FLOOR") == std::string::npos;
             {
                 TableCatalog catalog(source.Config());
                 assert(catalog.TableCount() == 1U && catalog.Fences().empty());
@@ -145,6 +184,11 @@ void RenameCrashes(const std::string& executable) {
                     assert(lease->store().GetBlockBits(8, 0) == "11111111");
                     assert(lease->store().GetBlockBits(0, 1) == "00010000");
                     assert(lease->store().GetBlockBits(9, 3) == "00000101");
+                    // The floor rose above the version the child wrote before
+                    // every crash point, so a table created under the old name
+                    // starts above it.
+                    const auto root = ReadDataDirManifest(source.data);
+                    assert(root && DataDirVersionFloor(*root) > lease->store().GetChunkVersion(0, 0));
                 }
                 const auto slots = table->ListFeedSlots();
                 assert(slots.size() == 1U && !slots[0].resync && slots[0].position.epoch == source.epoch);
@@ -161,10 +205,10 @@ void RenameCrashes(const std::string& executable) {
 }  // namespace
 
 int main(int argc, char** argv) {
-    if (argc == 6 && std::string_view(argv[1]) == "--restore-table-child") {
+    if ((argc == 6 || argc == 7) && std::string_view(argv[1]) == "--restore-table-child") {
         TableCatalog catalog(ChildConfig(argv[2], argv[5]));
         txn_test::ScopedEnv point(argv[4], "1");
-        (void)catalog.RestoreTable(TableRestoreRequest{.backup = argv[3], .table = "t", .name = "t_restored"});
+        (void)catalog.RestoreTable(TableRestoreRequest{.backup = argv[3], .table = "t", .name = argc == 7 ? argv[6] : "t_restored"});
         return 3;
     }
     if (argc == 5 && std::string_view(argv[1]) == "--rename-child") {
@@ -182,6 +226,7 @@ int main(int argc, char** argv) {
         return 3;
     }
     Crashes(argv[0]);
+    RestoreAfterDropCrashes(argv[0]);
     RenameCrashes(argv[0]);
 #ifdef _WIN32
     // Windows refuses SWAP TABLES before it closes anything.
@@ -190,9 +235,9 @@ int main(int argc, char** argv) {
     constexpr bool kAtomicExchange = true;
 #endif
     if (!kAtomicExchange) {
-        std::cout << "16 restore table and 6 rename table crash cases passed\n";
+        std::cout << "18 restore table and 8 rename table crash cases passed\n";
         return 0;
     }
     SwapCrashes(argv[0]);
-    std::cout << "16 restore table, 6 rename table and 6 swap tables crash cases passed\n";
+    std::cout << "18 restore table, 8 rename table and 8 swap tables crash cases passed\n";
 }

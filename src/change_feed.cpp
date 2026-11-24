@@ -319,7 +319,10 @@ void ChangeFeed::ResumeImpl(ChunkStore& store) {
     const auto clock = store.version_clock_.load(std::memory_order_seq_cst);
     ceiling_ = store.version_clock_ceiling_.load(std::memory_order_acquire);
     if (!geometry_) {
-        floor_ = clock - 1U;
+        // The tokens the version floor skipped on opening hold no change, so
+        // a position just below them, such as a restored table's fork
+        // revision after SWAP TABLES, is still complete.
+        floor_ = std::min(clock, store.opened_clock_) - 1U;
         watermark_ = floor_;
         drained_watermark_ = floor_;
         lineage_ = store.lineage();

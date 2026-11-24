@@ -5,6 +5,7 @@ Each table records its durability mode.
 Your filesystem and device must honor the required sync and atomic publication operations.
 
 Restore publishes its checked successor clock and immediate-parent lineage inside a guarded private copy before exposing the new epoch.
+A table that takes a name by RESTORE TABLE, SWAP TABLES or RENAME TO opens its version clock above every chunk version a table of that name gave before, synced before the name changes, so an IF VERSION write with an earlier version is refused.
 Committed revisions keep their values; missing chunks after a later crash do not prove that replay history remains available.
 
 ## Guarantees

@@ -488,6 +488,8 @@ ChunkStore::ChunkStore(StoreConfig config)
         RecoverConditionalRollbackIntents();
         RecoverTransactionIntents();
         InitializeCoordinateIndex();
+        // After every recovered revision has raised the clock.
+        RaiseVersionClockToFloor();
         FinishSnapshotGenerationRecovery();
         feed_slots_ = std::make_shared<FeedSlots>(*this, config.slot_max_bytes, config.slot_sync_interval);
     } catch (...) {

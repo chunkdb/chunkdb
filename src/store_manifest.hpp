@@ -139,10 +139,11 @@ struct DataDirManifest {
     std::vector<std::uint8_t> options;
 };
 
-// Every version token a table of the directory issued is below the
-// version_floor option (raised when a table is dropped); a table's version
-// clock starts there, so a table dropped and created again under the same
-// name never reuses a token. 0 when the option is absent.
+// Every version token a table that gave up its name issued is below the
+// version_floor option (raised by DROP TABLE, RENAME TO and SWAP TABLES
+// before the name changes); every table's version clock opens at or above
+// it, so a table that takes a name never reuses a token of a table that
+// held it. 0 when the option is absent.
 inline constexpr std::uint16_t kDataDirOptionVersionFloor = 1;
 [[nodiscard]] std::uint64_t DataDirVersionFloor(const DataDirManifest& manifest);
 void SetDataDirVersionFloor(DataDirManifest* manifest, std::uint64_t floor);

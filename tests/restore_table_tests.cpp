@@ -57,12 +57,64 @@ void RestoresIntoNewName() {
 void KeepsTheBackedUpName() {
     Source source;
     TableCatalog catalog(source.Config());
+    // Read from the dropped table after the backup cut.
+    const auto stale = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
+    assert(stale > source.cut);
     catalog.Drop("t");
     auto request = source.Request("t");
     const auto result = catalog.RestoreTable(request);
     const auto table = catalog.Require("t");
     assert(table->store_id() == result.epoch && result.epoch != source.epoch);
     assert(table->Acquire()->store().GetBlockBits(8, 0) == "00000011");
+    // The restored clock starts above the dropped table's, not at the cut's successor.
+    RefusesStaleVersion(catalog, "t", stale);
+}
+
+// After RESTORE ... AS t_restored and SWAP TABLES, `t` reaches the restored
+// table, whose clock the restore started at the cut's successor; a version a
+// client read from the live `t` after the cut never matches it.
+void SwapRefusesStaleVersions() {
+    Source source;
+    std::uint64_t stale = 0U;
+    {
+        TableCatalog catalog(source.Config());
+        (void)catalog.RestoreTable(source.Request());
+        stale = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
+        assert(stale > source.cut);
+        catalog.SwapTables("t", "t_restored");
+        RefusesStaleVersion(catalog, "t", stale);
+    }
+    // The floor that keeps them apart is durable.
+    TableCatalog catalog(source.Config());
+    RefusesStaleVersion(catalog, "t", stale);
+}
+
+// RENAME TO onto the name of a dropped table starts the renamed table's clock
+// above the dropped table's, and a table created later under the old name
+// starts above the renamed table's.
+void RenameRefusesStaleVersions() {
+    Source source;
+    TableCatalog catalog(source.Config());
+    (void)catalog.Create("u", SourceGeometry(), catalog.default_options());
+    std::uint64_t old_name_stale = 0U;
+    {
+        auto lease = catalog.Require("u")->Acquire();
+        lease->store().SetBlockBits(8, 0, "00001111");
+        old_name_stale = lease->store().GetChunkVersion(4, 0);
+    }
+    // A version of `t` at or above every version `u` has reserved.
+    std::uint64_t stale = 0U;
+    {
+        auto lease = catalog.Require("t")->Acquire();
+        lease->store().SetBlockBits(8, 0, "00011111");
+        stale = lease->store().GetChunkVersion(4, 0);
+    }
+    assert(stale > old_name_stale);
+    catalog.Drop("t");
+    catalog.RenameTable("u", "t", nullptr);
+    RefusesStaleVersion(catalog, "t", stale);
+    (void)catalog.Create("u", SourceGeometry(), catalog.default_options());
+    RefusesStaleVersion(catalog, "u", old_name_stale);
 }
 
 void LeavesNothingAfterRefusal(const Source& source, TableCatalog& catalog) {
@@ -314,6 +366,14 @@ void SwapRefusals() {
     Throws<TableNotFoundError>([&] { catalog.SwapTables("t", "absent"); });
     Throws<std::invalid_argument>([&] { catalog.SwapTables("t", "Bad.Name"); });
     {
+        // Without a version floor above both clocks nothing moves and both
+        // tables serve.
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_VERSION_FLOOR_WRITE_FAIL_ONCE", "1");
+        assert(Throws([&] { catalog.SwapTables("t", "t_restored"); }).find("version floor") != std::string::npos);
+    }
+    assert(catalog.Fences().empty());
+    swapped.Check(false);
+    {
         // Without an atomic exchange nothing moves and both tables serve.
         txn_test::ScopedEnv refuse("CHUNKDB_FAILPOINT_SWAP_TABLES_EXCHANGE_UNSUPPORTED_ONCE", "1");
         assert(Throws([&] { catalog.SwapTables("t", "t_restored"); }).find("atomic directory exchange") != std::string::npos);
@@ -549,6 +609,13 @@ void RenameRefusals() {
     geometry.block_bits = 8U;
     (void)catalog.Create("taken", geometry, catalog.default_options());
     Throws<TableExistsError>([&] { catalog.RenameTable("t", "taken", nullptr); });
+    {
+        // Without a version floor above its clock the table serves unchanged.
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_VERSION_FLOOR_WRITE_FAIL_ONCE", "1");
+        assert(Throws([&] { catalog.RenameTable("t", "t_new", nullptr); }).find("version floor") != std::string::npos);
+    }
+    assert(catalog.Fences().empty() && catalog.Find("t_new") == nullptr);
+    CheckLive(source, catalog, "t");
     // A directory no table of this server owns is not replaced.
     std::filesystem::create_directory(source.data / "tables" / "squatted");
     assert(Throws<TableExistsError>([&] { catalog.RenameTable("t", "squatted", nullptr); }).find("not a table this server opened") !=
@@ -622,7 +689,9 @@ int main() {
     RenamesTable();
     RenameRefusals();
     RenameStatementStops();
+    RenameRefusesStaleVersions();
     if (kAtomicExchange) {
+        SwapRefusesStaleVersions();
         SwapsNames();
         SwapSurvivesRestart();
         FeedAfterSwap();

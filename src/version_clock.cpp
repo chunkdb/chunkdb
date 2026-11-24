@@ -297,6 +297,26 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting, const std::error
     }
 }
 
+void ChunkStore::RaiseVersionClockToFloor() {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        return;
+    }
+    // The data directory's version floor is above every token a table that
+    // gave up a name issued (DROP TABLE, RENAME TO, SWAP TABLES). A table that
+    // takes such a name by RESTORE TABLE, SWAP TABLES or RENAME TO opens at
+    // it, its ceiling synced before its first token, so it never issues one
+    // of them again. Recovery issues no token, so the tokens between the
+    // recovered clock and the floor were never issued by this store.
+    const std::uint64_t floor =
+        std::min(initial_version_floor_, std::numeric_limits<std::uint64_t>::max() - 1U);
+    const std::uint64_t clock = version_clock_.load(std::memory_order_relaxed);
+    if (floor <= clock) {
+        return;
+    }
+    RaiseVersionClockAbove(floor - 1U);
+    opened_clock_ = clock;
+}
+
 void ChunkStore::ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive) {
     // Called under version_clock_mutex_. Persists a new ceiling above
     // minimum_exclusive before it is used, so a crash can never leave issued

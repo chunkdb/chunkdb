@@ -203,10 +203,12 @@ CANCEL, KILL CONNECTION or a statement timeout stops it only before the exchange
 Open transactions on either table answer CONFLICT, and watches of either table end with INTERNAL `watched table was swapped; watch it again`.
 A consumer that watches the name again sees another epoch, so it resumes by [lineage](../CHANGE_FEED.md) or rebuilds.
 Each slot of either table is then reached by another name, so its next watch without AFTER starts with resync.
+Chunk versions under each name stay above every version the name gave before, so an IF VERSION write with a version read before the swap is refused.
 A failure after the exchange fences the names it leaves unserved until RECOVER TABLE.
 
 RENAME TO gives a table a new name in one atomic step; data, epoch, lineage and durable slots stay with the table, and the grants on its name move to the new name; prefix and `*` grants stay as they are.
 A user with grants on both names keeps the higher right; the old name keeps no grants and is free for a new table.
+Chunk versions under the new name stay above those of a table dropped under it, and a new table of the old name starts above the renamed table's, so an IF VERSION write with a version read from an earlier table of the name is refused.
 It waits for running statements and backups on the table and makes their acknowledged writes durable first.
 CANCEL, KILL CONNECTION or a statement timeout stops it only before the rename.
 Open transactions on the table answer CONFLICT, and watches end with INTERNAL `watched table was renamed; watch it again`.

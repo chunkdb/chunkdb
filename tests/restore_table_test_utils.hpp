@@ -34,6 +34,29 @@ inline void Verified(const std::filesystem::path& data_dir) {
     assert(counters.errors == 0U);
 }
 
+// The geometry of the table `t` that Source creates.
+inline GeometryConfig SourceGeometry() {
+    GeometryConfig geometry;
+    geometry.large_chunk_width_chunks = 2U; geometry.large_chunk_height_chunks = 2U;
+    geometry.chunk_width_blocks = 2U; geometry.chunk_height_blocks = 2U; geometry.block_bits = 8U;
+    return geometry;
+}
+
+// `stale` is a version of chunk (4, 0) that a client read under `name` from
+// the table that held the name before. However often the table that holds
+// the name now writes the chunk, it never reaches that version again, so a
+// write conditioned on it is refused. Without a clock above the earlier
+// table's, the chunk would reach `stale` within that many writes.
+inline void RefusesStaleVersion(TableCatalog& catalog, std::string_view name, std::uint64_t stale) {
+    auto lease = catalog.Require(name)->Acquire();
+    auto& store = lease->store();
+    for (std::uint64_t i = 0U; i <= stale && store.GetChunkVersion(4, 0) < stale; ++i)
+        store.SetBlockBits(8, 0, i % 2U == 0U ? "00000110" : "00000111");
+    assert(store.GetChunkVersion(4, 0) > stale);
+    assert(!store.UnsetBlock(8, 0, stale).ok);
+    assert(store.BlockExists(8, 0));
+}
+
 // A table `t` with a slot, a checkpointed image, a WAL-only chunk and
 // tombstones in two large chunks, backed up to `backup`; a later write is
 // not in the backup.
@@ -48,10 +71,7 @@ struct Source {
 
     explicit Source(DurabilityMode durability = DurabilityMode::kRelaxed) : mode(durability) {
         TableCatalog catalog(Config());
-        GeometryConfig geometry;
-        geometry.large_chunk_width_chunks = 2U; geometry.large_chunk_height_chunks = 2U;
-        geometry.chunk_width_blocks = 2U; geometry.chunk_height_blocks = 2U; geometry.block_bits = 8U;
-        const auto table = catalog.Create("t", geometry, catalog.default_options());
+        const auto table = catalog.Create("t", SourceGeometry(), catalog.default_options());
         epoch = table->store_id();
         (void)table->CreateFeedSlot("consumer");
         {

@@ -1276,6 +1276,37 @@ void TestRecreatedTableNeverReusesVersionTokens() {
     }
 }
 
+// A table whose clock is below the data directory's version floor opens at
+// it, with its clock record raised before its first version; its feed still
+// continues from just below its old clock, since the skipped versions hold no
+// change.
+void TestOpenRaisesClockToVersionFloor() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-open-floor");
+    std::uint64_t floor = 0;
+    {
+        TableCatalog catalog(Config(dir.path()));
+        (void)catalog.Create("low", kDefaultGeometry, {});
+        (void)catalog.Create("high", kDefaultGeometry, {});
+        WriteBits(catalog, "high", 0, 0, "0001");
+        catalog.Drop("high");
+        floor = chunkdb::DataDirVersionFloor(*chunkdb::ReadDataDirManifest(dir.path()));
+    }
+    std::uint64_t ceiling = 0;
+    const auto record = dir.path() / "tables" / "low" / "chunkdb.version";
+    assert(chunkdb::TryParseVersionClockRecord(chunkdb::LoadFile(record), &ceiling) && ceiling < floor);
+    TableCatalog catalog(Config(dir.path()));
+    assert(chunkdb::TryParseVersionClockRecord(chunkdb::LoadFile(record), &ceiling) && ceiling > floor);
+    const auto table = catalog.Find("low");
+    chunkdb::FeedOptions after;
+    after.after = chunkdb::FeedPosition{table->store_id(), 0U};
+    auto watch = table->SubscribeFeed(after);
+    WriteBits(catalog, "low", 0, 0, "0001");
+    const auto version = ChunkVersion(catalog, "low");
+    assert(version >= floor);
+    const auto change = watch->Next(std::chrono::seconds(5));
+    assert(change && change->kind == chunkdb::FeedEntry::Kind::kChange && change->position.revision == version);
+}
+
 void TestConditionalCatalogOperations() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-conditional");
     TableCatalog catalog(Config(dir.path()));
@@ -1366,6 +1397,7 @@ int main(int argc, char** argv) {
     TestReopenKeepsAcknowledgedWrites();
     TestSetOptionsRefusesFailClosedTable();
     TestRecreatedTableNeverReusesVersionTokens();
+    TestOpenRaisesClockToVersionFloor();
     TestCrashBoundaries(argv[0]);
     std::cout << "table catalog tests passed\n";
     return 0;

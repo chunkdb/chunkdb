@@ -109,8 +109,8 @@ A `compat` extension can be discarded by a writer that does not understand it.
 | 5 | CRC32 of all preceding bytes (`u32`) |
 
 Options are consecutive `type:u16, length:u16, value:length` entries filling the declared area.
-Type 1 is `version_floor:u64`, the lower bound for a newly initialized table clock.
-DROP raises it to at least the dropped table’s reserved ceiling, preventing token reuse after recreation.
+Type 1 is `version_floor:u64`, the lower bound for every table clock a writer opens: a new clock starts there, and an existing clock below it is raised to it and synced before its first token.
+DROP TABLE raises it to at least the dropped table’s reserved ceiling, ALTER TABLE ... RENAME TO to at least the renamed table’s and SWAP TABLES to at least both tables’, each synced before the name changes, so a table that takes a name never reissues a token of a table that held it.
 Missing floor is zero; new clocks start at least at 1, and duplicate floor entries or a wrong length are invalid.
 
 A writer creates a missing root manifest only when no chunkdb-owned entries exist, except its lock and unpublished manifest temporary files.
@@ -162,7 +162,7 @@ Types 10 and 11 belong to incompatibility feature `table_lineage` (`0x4`) and mu
 The parent epoch differs from the table's current epoch; the fork revision preserves its exact unsigned value.
 New tables omit both fields.
 Schema and option replacements preserve lineage and unknown compatible option entries.
-Restore writes its checked fork-successor clock before publishing the new epoch and immediate-parent fields.
+Restore writes its checked fork-successor clock before publishing the new epoch and immediate-parent fields; the restored table opens at the directory version floor when that is higher.
 Committed image and WAL revisions retain their numeric values; reserved tokens belonging to the parent epoch do not set the restored frontier.
 
 ### Feature activation decision

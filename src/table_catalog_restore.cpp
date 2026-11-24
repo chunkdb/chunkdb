@@ -276,6 +276,13 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
     }
     // Everything acknowledged becomes durable under the old names first.
     for (auto& store : stores) store->WalBarrier();
+    // Neither name may issue a token the other table issued: the version
+    // floor rises above both clocks durably before the exchange, and each
+    // table opens at it under its new name. A failure here serves both
+    // tables as they were.
+    RaiseVersionFloor(std::max(stores[0]->version_clock_ceiling_.load(std::memory_order_acquire),
+        stores[1]->version_clock_ceiling_.load(std::memory_order_acquire)));
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_VERSION_FLOOR_ONCE");
     const std::array<std::filesystem::path, 2U> dirs{tables[0]->dir_, tables[1]->dir_};
     // Made now, so that fencing does not allocate.
     std::array<FenceNode, 2U> fences{PrepareFence(tables[0], names[0], kFenceSwapUnknown),
@@ -447,6 +454,13 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
         throw TableExistsError("table '" + to + "' already exists; use another name, or DROP TABLE " + to + " first");
     // Everything acknowledged becomes durable under the old name first.
     store->WalBarrier();
+    // As DROP TABLE: a table created later under the old name must not issue
+    // this table's tokens, and this table must not issue those of a table
+    // dropped under the new name. The version floor rises above this clock
+    // durably before the rename, and the table opens at it under its new
+    // name. A failure here serves the table unchanged.
+    RaiseVersionFloor(store->version_clock_ceiling_.load(std::memory_order_acquire));
+    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_VERSION_FLOOR_ONCE");
     const std::filesystem::path old_dir = table->dir_;
     const std::filesystem::path new_dir = TablesDir() / to;
     // Made now, so that fencing and publishing do not allocate.

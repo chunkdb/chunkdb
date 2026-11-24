@@ -17,7 +17,7 @@ Both statements are refused inside a transaction and on a `--read-only` server.
 ## Identity
 
 The restored table gets a new epoch; its lineage records the backed-up epoch and the backup cut as parent epoch and fork revision.
-Its clock restarts at the cut's successor, and every chunk keeps its committed revision, commit time and deletion floor.
+Its clock restarts at the cut's successor or the data directory's version floor, whichever is higher, and every chunk keeps its committed revision, commit time and deletion floor.
 Retained slots get the new epoch at the cut, with no archived history, exactly as the offline restore does.
 The table must have `table_lineage`, and its table-owned feature bits must equal the directory's; otherwise the copy is removed and nothing is published.
 SWAP keeps each table's epoch: identity travels with the data, and only the name that reaches it changes.
