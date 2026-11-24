@@ -40,6 +40,10 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+      - name: ccache
+        uses: ./.github/actions/ccache
+        with:
+          name: docs
       - name: Build documentation checks and the server
         run: |
           cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WITH_TLS=OFF -DCHUNKDB_WERROR=ON
@@ -67,6 +71,9 @@ jobs:
           nice -n 10 build/chunkdb_docs_check walkthrough --cli page-bin/chunk-cli
           nice -n 10 build/chunkdb_docs_check examples --server build/chunkdb_server --cli page-bin/chunk-cli
           build/chunkdb_docs_check links
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   build-and-test:
     name: Build and Test (${{ matrix.os }})
@@ -83,28 +90,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # ccache only speeds up builds: without it they run uncached.
-      - name: Install ccache
-        timeout-minutes: 12
-        run: |
-          if command -v apt-get >/dev/null 2>&1; then
-            scripts/ci/apt-install.sh ccache || true
-          elif command -v brew >/dev/null 2>&1; then
-            brew install ccache || true
-          fi
-          if command -v ccache >/dev/null 2>&1; then
-            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
-          else
-            echo "::warning::ccache is not available; building without it"
-          fi
-
-      - name: Cache ccache
-        uses: actions/cache@v5
+      - name: ccache
+        uses: ./.github/actions/ccache
         with:
-          path: ~/.ccache
-          key: ${{ runner.os }}-ccache-${{ hashFiles('CMakeLists.txt', 'include/**', 'src/**', 'bench/**', 'tests/**') }}
-          restore-keys: |
-            ${{ runner.os }}-ccache-
+          name: smoke
 
       - name: Quick Gate (smoke)
         run: |
@@ -141,6 +130,10 @@ jobs:
         run: |
           ctest --test-dir build -R server_integration --repeat until-fail:5 --output-on-failure
 
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
+
   # The other gates build without a build type, so without optimization;
   # GCC reports some warnings only at -O3.
   build-and-test-release-werror:
@@ -158,30 +151,19 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # ccache only speeds up builds: without it they run uncached.
-      - name: Install ccache
-        timeout-minutes: 12
-        run: |
-          scripts/ci/apt-install.sh ccache || true
-          if command -v ccache >/dev/null 2>&1; then
-            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
-          else
-            echo "::warning::ccache is not available; building without it"
-          fi
-
-      - name: Cache ccache
-        uses: actions/cache@v5
+      - name: ccache
+        uses: ./.github/actions/ccache
         with:
-          path: ~/.ccache
-          key: ${{ runner.os }}-release-ccache-${{ hashFiles('CMakeLists.txt', 'include/**', 'src/**', 'bench/**', 'tests/**') }}
-          restore-keys: |
-            ${{ runner.os }}-release-ccache-
+          name: release-werror
 
       - name: Quick Gate (smoke, Release)
         run: |
           g++ --version
           chmod +x scripts/test/quick.sh
           BUILD_DIR=build-release CMAKE_BUILD_TYPE=Release CHUNKDB_WITH_TLS=OFF CHUNKDB_WERROR=ON scripts/test/quick.sh
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   build-and-test-tls-ubuntu:
     name: Build and Test TLS (ubuntu-latest)
@@ -194,24 +176,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
-      # ccache only speeds up builds: without it they run uncached.
-      - name: Install ccache
-        timeout-minutes: 12
-        run: |
-          scripts/ci/apt-install.sh ccache || true
-          if command -v ccache >/dev/null 2>&1; then
-            echo "CMAKE_CXX_COMPILER_LAUNCHER=ccache" >> "$GITHUB_ENV"
-          else
-            echo "::warning::ccache is not available; building without it"
-          fi
-
-      - name: Cache ccache
-        uses: actions/cache@v5
+      - name: ccache
+        uses: ./.github/actions/ccache
         with:
-          path: ~/.ccache
-          key: ${{ runner.os }}-tls-ccache-${{ hashFiles('CMakeLists.txt', 'include/**', 'src/**', 'bench/**', 'tests/**') }}
-          restore-keys: |
-            ${{ runner.os }}-tls-ccache-
+          name: tls
 
       - name: Install OpenSSL Development Packages
         timeout-minutes: 12
@@ -254,6 +222,9 @@ jobs:
 
           kill "$server_pid"
           wait "$server_pid" || true
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   sanitizer-asan-ubsan:
     name: ASan+UBSan (ubuntu-latest)
@@ -270,6 +241,11 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v5
 
+      - name: ccache
+        uses: ./.github/actions/ccache
+        with:
+          name: asan-ubsan
+
       - name: Configure
         run: >
           cmake -S . -B build-asan-ubsan
@@ -284,6 +260,9 @@ jobs:
 
       - name: Smoke Tests
         run: ctest --test-dir build-asan-ubsan -L smoke --output-on-failure
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   sanitizer-tsan:
     name: TSan (Ubuntu 24.04, GCC)
@@ -298,6 +277,11 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v5
+
+      - name: ccache
+        uses: ./.github/actions/ccache
+        with:
+          name: tsan
 
       - name: Configure
         run: >
@@ -317,6 +301,9 @@ jobs:
           -L smoke
           -E "process_lock|durability_kill_recovery"
           --output-on-failure
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   build-and-test-windows:
     name: Build and Test (windows-latest)
@@ -339,6 +326,12 @@ jobs:
             mingw-w64-ucrt-x86_64-gcc
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
+            mingw-w64-ucrt-x86_64-ccache
+
+      - name: ccache
+        uses: ./.github/actions/ccache
+        with:
+          name: windows
 
       - name: Quick Gate (smoke)
         shell: msys2 {0}
@@ -396,6 +389,9 @@ jobs:
           else
             echo "::warning::sparse_world_writes line not found in benchmark output"
           fi
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   build-and-test-windows-tls:
     name: Build and Test TLS (windows-latest)
@@ -419,6 +415,12 @@ jobs:
             mingw-w64-ucrt-x86_64-cmake
             mingw-w64-ucrt-x86_64-ninja
             mingw-w64-ucrt-x86_64-openssl
+            mingw-w64-ucrt-x86_64-ccache
+
+      - name: ccache
+        uses: ./.github/actions/ccache
+        with:
+          name: windows-tls
 
       - name: Quick Gate (smoke, TLS ON)
         shell: msys2 {0}
@@ -511,6 +513,9 @@ jobs:
             cat tls-smoke/server.log
             exit 1
           fi
+      - name: ccache statistics
+        if: always()
+        uses: ./.github/actions/ccache-stats
 
   docker-quickstart:
     name: Docker quick-start page
