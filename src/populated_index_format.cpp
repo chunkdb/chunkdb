@@ -5,7 +5,6 @@
 #include <bit>
 #include <limits>
 #include <stdexcept>
-#include <vector>
 
 #include "chunkdb/crc32.hpp"
 
@@ -319,9 +318,13 @@ IndexInventoryHeader ReadIndexInventoryHeader(std::istream& input, std::uint64_t
     return ParseInventoryHeader(fixed, file_bytes, geometry, table_id);
 }
 
-IndexInventoryHeader ReadIndexInventory(
+namespace {
+// One pass from the start of the inventory: checks the header, every entry,
+// the checksum and the end of the file, and hands each entry to `deliver`
+// when it is set.
+IndexInventoryHeader ReadInventoryPass(
     std::istream& input, std::uint64_t file_bytes, const Geometry& geometry, const StoreId& table_id,
-    const std::function<void(const IndexInventoryEntry&)>& candidate) {
+    const std::function<void(const IndexInventoryEntry&)>* deliver) {
     std::array<std::uint8_t, 60> fixed{};
     ReadExact(input, fixed);
     const auto header = ParseInventoryHeader(fixed, file_bytes, geometry, table_id);
@@ -330,10 +333,6 @@ IndexInventoryHeader ReadIndexInventory(
     std::array<std::uint8_t, 72> entry{};
     const auto fields = 8U * header.dims;
     const auto active_entry = std::span(entry).first(fields + 48U);
-    // Entries reach `candidate` only once the checksum and the end of the
-    // file are checked: a caller acts on them (backup staging links files),
-    // and a damaged inventory must not have been acted on in part.
-    std::vector<IndexInventoryEntry> entries;
     for (std::uint64_t i = 0; i < header.count; ++i) {
         ReadExact(input, active_entry);
         crc = Crc32Extend(crc, active_entry.data(), active_entry.size());
@@ -344,7 +343,7 @@ IndexInventoryHeader ReadIndexInventory(
         std::copy_n(entry.begin() + static_cast<std::ptrdiff_t>(fields + 16U), parsed.replacement_sha256.size(),
             parsed.replacement_sha256.begin());
         RequireInventoryEntry(header, parsed);
-        if (candidate) entries.push_back(parsed);
+        if (deliver != nullptr) (*deliver)(parsed);
         previous = coord;
     }
     std::array<std::uint8_t, 4> checksum{};
@@ -359,7 +358,28 @@ IndexInventoryHeader ReadIndexInventory(
         if (input.bad() || !input.eof()) throw;
     }
     if (input.bad() || !input.eof()) throw std::invalid_argument("index inventory stream is unreadable");
-    for (const auto& parsed : entries) candidate(parsed);
+    return header;
+}
+}  // namespace
+
+IndexInventoryHeader ReadIndexInventory(
+    std::istream& input, std::uint64_t file_bytes, const Geometry& geometry, const StoreId& table_id,
+    const std::function<void(const IndexInventoryEntry&)>& candidate) {
+    if (!candidate) return ReadInventoryPass(input, file_bytes, geometry, table_id, nullptr);
+    // Entries reach `candidate` only once the checksum and the end of the
+    // file are checked: a caller acts on them (backup staging links files),
+    // and a damaged inventory must not have been acted on in part. Reading
+    // the stream twice keeps memory constant for any number of entries.
+    const auto start = input.tellg();
+    if (start == std::istream::pos_type(std::istream::off_type(-1)))
+        throw std::invalid_argument("index inventory stream cannot be read twice");
+    const auto checked = ReadInventoryPass(input, file_bytes, geometry, table_id, nullptr);
+    input.clear();
+    input.seekg(start);
+    if (!input) throw std::invalid_argument("index inventory stream cannot be read twice");
+    const auto header = ReadInventoryPass(input, file_bytes, geometry, table_id, &candidate);
+    if (header.count != checked.count || header.generation != checked.generation)
+        throw std::invalid_argument("index inventory changed while it was read");
     return header;
 }
 

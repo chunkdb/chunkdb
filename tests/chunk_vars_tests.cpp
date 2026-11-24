@@ -518,6 +518,39 @@ void TestWalRecords() {
     assert(r.result.stop_reason == "record_vars_without_columns");
 }
 
+// Many frames over large values: replay checks what each frame wrote and
+// ends with every value of the chunk, and a frame that leaves a valued block
+// absent stays reported after a later frame makes it present again.
+void TestWalReplayManyFramesLargeValues() {
+    auto id = MakeColumn(1, "id", ColumnKind::kUnsigned, 4);
+    auto doc = MakeColumn(2, "doc", ColumnKind::kText, 4096);
+    doc.nullable = true;
+    const chunkdb::Geometry large(kGeometry, TableSchema{.version = 1, .next_column_id = 3, .columns = {id, doc}});
+    const auto value = [](std::size_t frame) { return Bytes(4000U, static_cast<std::uint8_t>('a' + frame % 26U)); };
+    ChunkVars expected;
+    std::vector<Record> first{{chunkdb::kWalRecordSpan, SpanBody(kPayloadBytes, {0xFF, 0xFF})}};
+    for (std::uint32_t block = 0; block < 16U; ++block) {
+        first.push_back({chunkdb::kWalRecordVarPut, Entry(2, block, value(0))});
+        expected.Assign({2, block}, value(0));
+    }
+    std::vector<Bytes> frames{RawFrame(1, first)};
+    for (std::size_t i = 1; i <= 300U; ++i) {
+        const auto block = static_cast<std::uint32_t>(i % 16U);
+        frames.push_back(RawFrame(i + 1U, {{chunkdb::kWalRecordSpan, SpanBody(kPayloadBytes, {0xFF, 0xFF})},
+            {chunkdb::kWalRecordVarPut, Entry(2, block, value(i))}}));
+        expected.Assign({2, block}, value(i));
+    }
+    const auto good = Replay(Wal(frames), large);
+    assert(!good.result.tail_truncated_or_corrupt && good.result.applied_frames == 301U);
+    assert(good.result.vars_problem.empty() && good.vars == expected);
+
+    frames.push_back(RawFrame(302, {{chunkdb::kWalRecordSpan, SpanBody(kPayloadBytes, {0xFE, 0xFF})}}));
+    frames.push_back(RawFrame(303, {{chunkdb::kWalRecordSpan, SpanBody(kPayloadBytes, {0xFF, 0xFF})}}));
+    const auto hidden = Replay(Wal(frames), large);
+    assert(!hidden.result.tail_truncated_or_corrupt && hidden.result.applied_frames == 303U);
+    assert(Contains(hidden.result.vars_problem, "column 2 block 0: a value of an absent block"));
+}
+
 // --- store -----------------------------------------------------------------
 
 chunkdb::StoreConfig Config(
@@ -762,6 +795,7 @@ int main() {
     TestValidityRules();
     TestImageSection();
     TestWalRecords();
+    TestWalReplayManyFramesLargeValues();
     TestBlockValues();
     TestWholeChunkWrites();
     TestLoweredLimit();
