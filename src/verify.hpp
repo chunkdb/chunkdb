@@ -7,6 +7,8 @@
 
 namespace chunkdb {
 
+struct CommitOwnerScope;
+
 struct VerifyCounters {
     std::uint64_t checked = 0;
     std::uint64_t warnings = 0;
@@ -26,6 +28,16 @@ struct VerifyCounters {
 // Checks one table directory as VerifyDataDirectory checks each table.
 [[nodiscard]] VerifyCounters VerifyTableDirectory(
     const std::filesystem::path& table_dir,
+    std::ostream& out);
+
+// Checks the commit group owner of a directory for an admitted scope without
+// changing it. Not called by VerifyDataDirectory: no manifest can claim commit
+// groups in this build, so the CLI reports owner files as group_owner_unclaimed.
+// Journal records are checked as records only; member frames are not checked.
+// Throws when the directory itself cannot be opened.
+[[nodiscard]] VerifyCounters VerifyCommitGroupOwner(
+    const std::filesystem::path& directory,
+    const CommitOwnerScope& scope,
     std::ostream& out);
 
 // The highest revision the checked artifacts of one table hold: images,

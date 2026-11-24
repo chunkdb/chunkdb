@@ -345,6 +345,8 @@ struct ReloadTls {};
 // Answers +PONG: for health checks.
 struct Ping {};
 struct Watch {
+    // WATCH CATALOG: the catalog, not a table; every other field is empty.
+    bool catalog = false;
     std::string table;
     std::optional<std::vector<std::string>> columns{};
     bool no_before = false;

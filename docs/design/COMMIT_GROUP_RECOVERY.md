@@ -62,6 +62,7 @@ The runtime coordinator remains lazy, and an INACTIVE root lets startup omit gro
 First grouped use stages and syncs empty journal, coverage, reference and ID objects and their parent names, then atomically publishes and syncs an ACTIVE root before appending any GROUP frame.
 This transition uses only the independent owner-transition serialization and pinned file I/O; it never acquires catalog operations, feature metadata admission or another table lease.
 It is therefore admissible from an existing direct C++ conditional operation already owning a table lease, and from a standalone store.
+This build implements only the fixed INACTIVE installer, with no production caller, and the handover check against a staged ACTIVE candidate in the [coordinator](COMMIT_GROUP_COORDINATOR.md); it never publishes an ACTIVE root.
 An ACTIVE owner never reverts, including after its last group retires, and a missing selected object is damage.
 A failed activation publishes no grouped frame; an uncertain ACTIVE publication fences the coordinator until checked admission resolves it.
 This is a once-per-directory boundary and adds no sync or journal lookup to unused ordinary writes.
