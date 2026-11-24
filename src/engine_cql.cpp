@@ -2866,7 +2866,9 @@ std::string CommandEngine::ExecuteStatement(
                     };
                     const auto readable = static_cast<std::size_t>(std::count_if(status.tables.begin(), status.tables.end(),
                         [](const auto& table) { return table.features.has_value(); }));
-                    Protocol::AppendMapHeader(reply, 7U);
+                    // The archive key is there only while WAL archiving is on.
+                    const auto archive = catalog_->ArchiveStatus();
+                    Protocol::AppendMapHeader(reply, archive ? 8U : 7U);
                     Protocol::AppendBulk(reply, "version"); Protocol::AppendBulk(reply, config_.server_version);
                     Protocol::AppendBulk(reply, "uptime_ms"); Protocol::AppendInteger(reply, static_cast<std::uint64_t>(uptime.count()));
                     Protocol::AppendBulk(reply, "read_only"); Protocol::AppendBoolean(reply, catalog_->access_mode() == AccessMode::kReadOnly);
@@ -2891,6 +2893,21 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendBulk(reply, "reason"); Protocol::AppendBulk(reply, *table.fence);
                     }
                     Protocol::AppendBulk(reply, "activation_pending"); Protocol::AppendBoolean(reply, status.activation_pending);
+                    if (archive) {
+                        Protocol::AppendBulk(reply, "archive");
+                        Protocol::AppendMapHeader(reply, 5U);
+                        Protocol::AppendBulk(reply, "mode"); Protocol::AppendBulk(reply, archive->mode);
+                        Protocol::AppendBulk(reply, "last_seal_ms"); Protocol::AppendInteger(reply, archive->last_seal_ms);
+                        Protocol::AppendBulk(reply, "error");
+                        if (archive->error) Protocol::AppendBulk(reply, *archive->error); else Protocol::AppendNull(reply);
+                        Protocol::AppendBulk(reply, "staged_bytes"); Protocol::AppendInteger(reply, archive->staged_bytes);
+                        Protocol::AppendBulk(reply, "tables"); Protocol::AppendArrayHeader(reply, archive->tables.size());
+                        for (const auto& table : archive->tables) {
+                            Protocol::AppendMapHeader(reply, 2U);
+                            Protocol::AppendBulk(reply, "name"); Protocol::AppendBulk(reply, table.name);
+                            Protocol::AppendBulk(reply, "revision"); Protocol::AppendInteger(reply, table.revision);
+                        }
+                    }
                     return reply;
                 },
                 [&](const cql::ShowMetrics&) {

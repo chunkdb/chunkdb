@@ -32,6 +32,7 @@
 #include "migrations_records.hpp"
 #include "user_registry.hpp"
 #include "maintenance_pool.hpp"
+#include "wal_archive.hpp"
 
 namespace chunkdb {
 
@@ -1152,6 +1153,13 @@ TableCatalog::TableCatalog(CatalogConfig config)
         throw std::invalid_argument("feed_linger must be 0..2147483647 milliseconds");
     RequireNotBackupDirectory(config_.data_dir, config_.access_mode);
     RequireValidTableOptions(config_.default_options);
+    if (config_.wal_archive.enabled()) {
+        RequireWalArchiveOutside(config_.wal_archive, config_.data_dir);
+        if (config_.access_mode != AccessMode::kReadWrite)
+            throw std::invalid_argument("WAL archiving needs a writer; a read-only server archives nothing");
+        if (config_.allow_multiple_processes)
+            throw std::invalid_argument("WAL archiving requires a single-process data directory");
+    }
     resources_ = std::make_shared<StoreResources>(
         config_.max_loaded_chunks, config_.max_open_wal_streams, config_.maintenance_workers);
 
@@ -1199,6 +1207,9 @@ TableCatalog::TableCatalog(CatalogConfig config)
     if (writable) {
         EnsureDirectoryPathExists(TablesDir(), /*durable_sync=*/true);
         RemoveInterruptedOperations();
+        // Without archiving, checkpoints may drop frames the archive never
+        // gets: the chain ends before any table opens (docs/design/WAL_ARCHIVE.md).
+        if (!config_.wal_archive.enabled()) RemoveWalArchiveStaging(config_.data_dir);
     }
     OpenExistingTables();
 
@@ -1213,9 +1224,15 @@ TableCatalog::TableCatalog(CatalogConfig config)
             {"max_loaded_chunks", std::to_string(resources_->max_loaded_chunks())},
             {"max_open_wal_streams", std::to_string(resources_->max_open_wal_streams())},
         });
+    if (config_.wal_archive.enabled()) {
+        archiver_ = std::make_unique<WalArchiver>(*this, config_.wal_archive);
+        archiver_->Start();
+    }
 }
 
 TableCatalog::~TableCatalog() {
+    // A last pass archives what the tables sealed before they close.
+    if (archiver_) archiver_->Stop(/*final_pass=*/true);
     // Close every store while the writer lock is still held.
     std::map<std::string, std::shared_ptr<Table>, std::less<>> tables;
     {
@@ -1488,6 +1505,7 @@ std::shared_ptr<ChunkStore> TableCatalog::OpenStore(
     store_config.txn_history_bytes = config_.txn_history_bytes;
     store_config.slot_max_bytes = options.slot_max_bytes.value_or(config_.slot_max_bytes);
     store_config.slot_sync_interval = config_.slot_sync_interval;
+    store_config.wal_archive = config_.wal_archive.enabled();
     store_config.resources = resources_;
     store_config.acquire_process_lock = false;
     store_config.initial_version_floor = version_floor_;
@@ -2660,6 +2678,16 @@ CatalogFeatureStatus TableCatalog::FeatureStatus() {
     status.directory = directory->features;
     status.activation_pending = ReadFeatureActivationJournal(config_.data_dir).has_value();
     return status;
+}
+
+std::optional<WalArchiveStatus> TableCatalog::ArchiveStatus() const {
+    if (!archiver_) return std::nullopt;
+    return archiver_->Status();
+}
+
+void TableCatalog::RunArchivePass() {
+    if (!archiver_) throw std::invalid_argument("WAL archiving is off: set --archive-dir or --archive-command");
+    archiver_->RunPass();
 }
 
 }  // namespace chunkdb

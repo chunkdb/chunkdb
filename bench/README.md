@@ -31,6 +31,11 @@ Compare matching workload settings and retain absolute requests/s, blocks/s and 
 
 See [artifact formats](artifacts/README.md) for stored results.
 
+## WAL archive
+
+`chunkdb_server_bench --server-mode spawn --port 0 --archive-dir NEW_PATH` measures the same workloads while the spawned server archives sealed WAL segments to `NEW_PATH` every `--archive-interval-ms` (1000 by default).
+Compare it with the same command without `--archive-dir`, with matching `--durability-mode`, clients and requests.
+
 ## Shared maintenance
 
 `chunkdb_maintenance_bench --data-dir NEW_PATH` runs separate 1, 100 and 1,000 table cases with background maintenance enabled.

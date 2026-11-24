@@ -5,6 +5,7 @@
 #include <chrono>
 #include <mutex>
 #include <map>
+#include <set>
 #include <thread>
 
 #include "feed_slot_records.hpp"
@@ -41,7 +42,9 @@ struct FeedSlotAckState {
 // holding records takes a chunk or publish lock.
 class FeedSlots {
   public:
-    FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::milliseconds interval);
+    // With `wal_archive`, every checkpoint archives its WAL and retention
+    // removes only segments the WAL archiver has staged.
+    FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::milliseconds interval, bool wal_archive = false);
     // Read-only admission before rollback/tail repair or alias removal.
     static void ValidateRecoveryAliases(const ChunkStore& store);
     ~FeedSlots();
@@ -50,6 +53,8 @@ class FeedSlots {
     [[nodiscard]] bool active() const noexcept;
     [[nodiscard]] std::size_t max_bytes() const noexcept { return max_bytes_; }
     [[nodiscard]] bool ArchiveRequired() const noexcept;
+    // Slots or pinned readers: the worker that syncs slots and retains runs.
+    [[nodiscard]] bool WorkerRequired() const noexcept;
     [[nodiscard]] FeedSlot Create(std::string_view name, std::uint64_t completed, bool if_not_exists = false, const FeedSlotFilters& filters = {},
         std::optional<std::string> owner = std::nullopt);
     // Records `owner` for a slot that has none; a recorded owner never changes.
@@ -71,6 +76,10 @@ class FeedSlots {
     [[nodiscard]] std::filesystem::path PrepareArchive(ChunkCoord coord);
     void Sync(std::uint64_t completed);
     void Retain();
+    // Hard-links each archived segment and its base descriptor not staged
+    // yet into `directory` and syncs it; the segments then count as staged.
+    // Returns how many segments it staged.
+    std::size_t StageForArchive(const std::filesystem::path& directory);
 
   private:
     friend struct FeedSlotTestAccess;
@@ -98,6 +107,9 @@ class FeedSlots {
     std::atomic<bool> archive_dir_prepared_{false};
     // Whether a pass synced every WAL and image; under the WAL barrier lock.
     bool synced_ = false;
+    const bool wal_archive_;
+    // Archived WAL file names the WAL archiver has staged; under mutex_.
+    std::set<std::string> staged_;
 };
 
 }  // namespace chunkdb
