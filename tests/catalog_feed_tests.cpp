@@ -82,6 +82,9 @@ Push CatalogPush(const std::string& bytes) {
     return push;
 }
 
+// A named parameter, not a temporary inside the assert condition.
+bool EventsAre(const std::vector<Event>& actual, const std::vector<Event>& expected) { return actual == expected; }
+
 std::string Value(const std::string& text) {
     return "%1\r\n$1\r\nv\r\n$" + std::to_string(text.size()) + "\r\n" + text + "\r\n";
 }
@@ -163,7 +166,7 @@ void TestWholeCatalogThenChanges() {
     assert(watch->revision() == 0U);
     const auto whole = CatalogPush(NextBytes(*watch));
     assert(whole.revision == 0U && whole.user_null);
-    assert((whole.events == std::vector<Event>{
+    assert(EventsAre(whole.events, {
         {"table", "create", "t", "", "one"}, {"table", "create", "x", "", "x1"},
         {"user", "create", "u", "", "user"}, {"slot", "create", "s", "t", "owner u"}}));
     assert(!watch->Next());
@@ -177,7 +180,7 @@ void TestWholeCatalogThenChanges() {
     assert(notified == 1U);
     const auto change = CatalogPush(NextBytes(*watch));
     assert(change.epoch == whole.epoch && change.revision == 1U && !change.user_null && change.user == "admin");
-    assert((change.events == std::vector<Event>{
+    assert(EventsAre(change.events, {
         {"user", "drop", "u", "", ""}, {"table", "alter", "t", "", "two"}, {"slot", "create", "s2", "t", "owner u"}}));
     assert(!watch->Next());
 
@@ -191,7 +194,7 @@ void TestWholeCatalogThenChanges() {
     feed->Refresh(CatalogScope{.tables = {}, .all_tables = true}, {});
     const auto dropped = CatalogPush(NextBytes(*watch));
     assert(dropped.revision == 2U && dropped.user_null);
-    assert((dropped.events == std::vector<Event>{
+    assert(EventsAre(dropped.events, {
         {"table", "drop", "t", "", ""}, {"slot", "drop", "s", "t", ""}, {"slot", "drop", "s2", "t", ""},
         {"table", "alter", "x", "", "x2"}}));
 
@@ -199,7 +202,8 @@ void TestWholeCatalogThenChanges() {
     auto late = feed->Subscribe(true, {});
     assert(late->revision() == 2U);
     const auto now = CatalogPush(NextBytes(*late));
-    assert(now.revision == 2U && (now.events == std::vector<Event>{{"table", "create", "x", "", "x2"}}));
+    assert(now.revision == 2U);
+    assert(EventsAre(now.events, {{"table", "create", "x", "", "x2"}}));
 }
 
 void TestUsersHiddenWithoutManagesUsers() {
@@ -212,20 +216,21 @@ void TestUsersHiddenWithoutManagesUsers() {
     auto limited = feed->Subscribe(false, {});
     (void)NextBytes(*full);
     const auto whole = CatalogPush(NextBytes(*limited));
-    assert((whole.events == std::vector<Event>{{"table", "create", "t", "", "one"}, {"slot", "create", "s", "t", "owner"}}));
+    assert(EventsAre(whole.events, {{"table", "create", "t", "", "one"}, {"slot", "create", "s", "t", "owner"}}));
 
     // A user change and a new slot owner: only the full watch sees them.
     catalog.SetUser("u", "user2");
     catalog.SetSlot("t", "s", "v");
     feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     const auto seen = CatalogPush(NextBytes(*full));
-    assert((seen.events == std::vector<Event>{{"user", "alter", "u", "", "user2"}, {"slot", "alter", "s", "t", "owner v"}}));
+    assert(EventsAre(seen.events, {{"user", "alter", "u", "", "user2"}, {"slot", "alter", "s", "t", "owner v"}}));
     assert(!limited->Next());
 
     catalog.SetTable("t", "two");
     feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     const auto table = CatalogPush(NextBytes(*limited));
-    assert(table.revision == 2U && (table.events == std::vector<Event>{{"table", "alter", "t", "", "two"}}));
+    assert(table.revision == 2U);
+    assert(EventsAre(table.events, {{"table", "alter", "t", "", "two"}}));
     assert(CatalogPush(NextBytes(*full)).revision == 2U);
 }
 
@@ -244,7 +249,7 @@ void TestUnknownTableKeepsRecords() {
     catalog.records.erase(TableKey("t"));
     feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     const auto dropped = CatalogPush(NextBytes(*watch));
-    assert((dropped.events == std::vector<Event>{{"table", "drop", "t", "", ""}}));
+    assert(EventsAre(dropped.events, {{"table", "drop", "t", "", ""}}));
 }
 
 void TestOverflowSendsResyncAndWholeCatalog() {
@@ -264,7 +269,7 @@ void TestOverflowSendsResyncAndWholeCatalog() {
     assert(resync.items[3].type == '_' && resync.items[4].type == '_');
     const auto again = CatalogPush(NextBytes(*watch));
     assert(again.revision == 2U && again.user_null);
-    assert((again.events == std::vector<Event>{{"table", "create", "t", "", "two"}, {"table", "create", "u", "", "three"}}));
+    assert(EventsAre(again.events, {{"table", "create", "t", "", "two"}, {"table", "create", "u", "", "three"}}));
     assert(!watch->Next());
 }
 
@@ -288,7 +293,7 @@ void TestFailureEndsWatches() {
     auto fresh = feed->Subscribe(true, {});
     assert(catalog.reads == reads + 1U);
     const auto whole = CatalogPush(NextBytes(*fresh));
-    assert((whole.events == std::vector<Event>{{"table", "create", "t", "", "two"}}));
+    assert(EventsAre(whole.events, {{"table", "create", "t", "", "two"}}));
     catalog.SetTable("t", "three");
     feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     assert(CatalogPush(NextBytes(*fresh)).events.size() == 1U);
