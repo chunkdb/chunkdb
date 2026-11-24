@@ -49,7 +49,7 @@ void ExpectLoggedIn(const Reply& reply) {
 // A TLS server with the user admin (password secret).
 class Server {
   public:
-    std::uint16_t port = test::PickListenerPort();
+    std::uint16_t port = 0; // The port the server picked; set once it listens.
 
     explicit Server(bool require_channel_binding = false) {
         catalog_ = std::make_shared<TableCatalog>(feed_test::Config(std::filesystem::canonical(directory_.path())));
@@ -60,7 +60,7 @@ class Server {
         engine_config.require_channel_binding = require_channel_binding;
         engine_ = std::make_shared<CommandEngine>(engine_config, catalog_);
         ServerConfig server_config;
-        server_config.port = port;
+        server_config.port = 0;
         server_config.worker_threads = 4;
         // Software SCRAM in Debug and sanitizer builds needs a login budget;
         // nothing here tests handshake deadlines.
@@ -80,6 +80,7 @@ class Server {
         // socket on this port; a failed Run ends the wait at once.
         try {
             if (!server_->WaitListeningForTests(10s)) throw std::runtime_error("server did not start listening in time");
+            port = server_->port();
             // The server is ready once a TLS handshake completes.
             Client probe(port, true);
         } catch (const std::exception&) {

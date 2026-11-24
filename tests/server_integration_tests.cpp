@@ -1537,9 +1537,9 @@ struct ServerHarness {
     std::shared_ptr<chunkdb::CommandEngine> engine;
     std::unique_ptr<chunkdb::ChunkServer> server;
     std::thread thread;
+    // The port the server listens on: a test-given one, kept across Restart,
+    // or with 0 in the config one the server picks at each start.
     std::uint16_t port = 0;
-    // The harness chose `port`; a test-given port is kept across Restart.
-    bool picked_port = false;
     bool tls_enabled = false;
     chunkdb::StoreConfig saved_store_config;
     chunkdb::ServerConfig saved_server_config;
@@ -1571,12 +1571,6 @@ struct ServerHarness {
         RethrowRunError();
         chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset server/engine/catalog for restart");
         server.reset(); engine.reset(); catalog.reset();
-        // Another process may have bound the old port since Stop; no caller
-        // needs the same port, so a port the harness chose is chosen again.
-        if (picked_port) {
-            port = chunkdb::test::PickListenerPort();
-            saved_server_config.port = port;
-        }
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(saved_store_config);
         catalog_config.feed_linger = std::chrono::milliseconds(saved_server_config.feed_linger_ms);
         catalog = std::make_shared<chunkdb::TableCatalog>(catalog_config);
@@ -1599,12 +1593,10 @@ struct ServerHarness {
         chunkdb::EngineConfig engine_config,
         chunkdb::ServerConfig server_config)
         : data_dir(TempDataDir(std::move(name))),
-          port(server_config.port == 0 ? chunkdb::test::PickListenerPort() : server_config.port),
-          picked_port(server_config.port == 0) {
+          port(server_config.port) {
         chunkdb::test::FeedPhaseWatchdog::Phase("harness: constructor");
         store_config.data_dir = data_dir;
         server_config.host = "127.0.0.1";
-        server_config.port = port;
 #ifdef CHUNKDB_WITH_OPENSSL
         if (server_config.tls_enabled &&
             (server_config.tls_cert_path.empty() || server_config.tls_key_path.empty())) {
@@ -1717,6 +1709,7 @@ struct ServerHarness {
         if (!server->WaitListeningForTests(std::chrono::seconds(3))) {
             throw std::runtime_error("server did not start listening in time");
         }
+        port = server->port();
 #ifdef CHUNKDB_WITH_OPENSSL
         // With PROXY headers a TLS handshake needs one first; a connection
         // alone reaches the listener.
@@ -4569,6 +4562,28 @@ class StopAtStartupHook : public chunkdb::FeedDeliveryTestHook {
     const Point point_;
 };
 
+// Port 0 listens on a port the system picks: port() names it once Run has
+// bound it, the ready line names the same port, and a restart picks again.
+void TestPortZeroReportsPickedPort() {
+    ScopedLogCapture logs(chunkdb::LogLevel::kInfo);
+    auto server_cfg = BaseServerConfig();
+    assert(server_cfg.port == 0);
+    ServerHarness harness("port-zero", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, server_cfg);
+    assert(harness.port != 0 && harness.server->port() == harness.port);
+    (void)logs.WaitIndexOf(" ready to accept connections ", std::chrono::seconds(2));
+    assert(logs.Contains(" port=" + std::to_string(harness.port) + " "));
+    const auto ping = [&] {
+        RawClient client("127.0.0.1", harness.port);
+        client.Hello();
+        client.SendLine("PING");
+        assert(client.ReadLine() == "+PONG\r\n");
+    };
+    ping();
+    harness.Restart();
+    assert(harness.port != 0 && harness.server->port() == harness.port);
+    ping();
+}
+
 // A Stop just before Run publishes its listener, or between the listener
 // and running_, ends Run; before, Run kept polling a closed socket and the
 // next Stop found nothing to stop.
@@ -4579,7 +4594,6 @@ void TestStopDuringStartup() {
         store_cfg.data_dir = TempDataDir("stop-during-startup");
         {
             auto server_cfg = BaseServerConfig();
-            server_cfg.port = chunkdb::test::PickListenerPort();
             auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(store_cfg));
             auto engine = std::make_shared<chunkdb::CommandEngine>(chunkdb::EngineConfig{.require_auth = false}, catalog);
             chunkdb::ChunkServer server(server_cfg, engine);
@@ -6435,7 +6449,6 @@ void TestStartupLogOrder() {
     auto server_cfg = BaseServerConfig();
     const std::filesystem::path data_dir = TempDataDir("log-order");
     store_cfg.data_dir = data_dir;
-    server_cfg.port = chunkdb::test::PickListenerPort();
 
     chunkdb::LogServerStartupContext(
         "test-version",
@@ -6787,6 +6800,33 @@ template <typename Client> void TestWatchDefaultProgress(bool tls) {
         assert(event.type == '+' && event.value == "OK"); break;
     }
     assert(watch.ReadLine() == "+PONG\r\n");
+}
+
+// Lines sent in the same packet as WATCH are read by the watch stream: the
+// first one other than UNWATCH ends it, and each closed watch frees its count.
+template <typename Client> void TestWatchPipelinedLines(bool tls) {
+    auto config = BaseServerConfig(); config.tls_enabled = tls;
+    config.max_watches = 2U;
+    config.feed_progress_ms = 60000U; // No progress frame precedes the refusal.
+    ServerHarness harness(tls ? "watch-pipelined-tls" : "watch-pipelined", BaseStoreConfig(),
+        chunkdb::EngineConfig{.require_auth = false}, config);
+    for (int round = 0; round < 3; ++round) {
+        Client pipelined("127.0.0.1", harness.port); pipelined.SetReadDeadline(std::chrono::seconds(10)); pipelined.Hello();
+        pipelined.SendBytes("WATCH default\r\nPING\r\nPING\r\nWATCH default\r\nUNWATCH\r\n");
+        assert(!FeedStart(ReadFeedReply(pipelined)).empty());
+        assert(pipelined.ReadLine().rfind("-ERR PROTOCOL", 0) == 0);
+        assert(pipelined.WaitForClose(std::chrono::seconds(10)));
+    }
+    // UNWATCH in the same packet ends the watch, and the next line runs as a statement.
+    Client returned("127.0.0.1", harness.port); returned.SetReadDeadline(std::chrono::seconds(10)); returned.Hello();
+    returned.SendBytes("WATCH default\r\nUNWATCH\r\nPING\r\n");
+    assert(!FeedStart(ReadFeedReply(returned)).empty());
+    assert(returned.ReadLine() == "+OK\r\n" && returned.ReadLine() == "+PONG\r\n");
+    // Every closed or ended watch released its count: both watches are free.
+    Client first("127.0.0.1", harness.port); first.SetReadDeadline(std::chrono::seconds(10)); first.Hello();
+    first.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(first)).empty());
+    Client second("127.0.0.1", harness.port); second.SetReadDeadline(std::chrono::seconds(10)); second.Hello();
+    second.SendLine("WATCH default"); assert(!FeedStart(ReadFeedReply(second)).empty());
 }
 
 void TestWatchPositionsAndRights() {
@@ -7840,6 +7880,7 @@ void TestFeedWatch() {
     run("TestWatchLinger<RawClient>(false, false, true)", [] { TestWatchLinger<RawClient>(false, false, true); });
     run("TestWatchLinger<RawClient>(false, false, false, true)", [] { TestWatchLinger<RawClient>(false, false, false, true); });
     run("TestWatchProtocol<RawClient>(false)", [] { TestWatchProtocol<RawClient>(false); });
+    run("TestWatchPipelinedLines<RawClient>(false)", [] { TestWatchPipelinedLines<RawClient>(false); });
     run("TestWatchNoIdle<RawClient>(false)", [] { TestWatchNoIdle<RawClient>(false); });
     run("TestWatchPositionsAndRights()", [] { TestWatchPositionsAndRights(); });
     run("TestWatchSlowReader<RawClient>(false)", [] { TestWatchSlowReader<RawClient>(false); });
@@ -7849,6 +7890,7 @@ void TestFeedWatch() {
     run("TestWatchLinger<TlsClient>(true, false, true)", [] { TestWatchLinger<TlsClient>(true, false, true); });
     run("TestWatchLinger<TlsClient>(true, false, false, true)", [] { TestWatchLinger<TlsClient>(true, false, false, true); });
     run("TestWatchProtocol<TlsClient>(true)", [] { TestWatchProtocol<TlsClient>(true); });
+    run("TestWatchPipelinedLines<TlsClient>(true)", [] { TestWatchPipelinedLines<TlsClient>(true); });
     run("TestWatchNoIdle<TlsClient>(true)", [] { TestWatchNoIdle<TlsClient>(true); });
     run("TestWatchSlowReader<TlsClient>(true)", [] { TestWatchSlowReader<TlsClient>(true); });
 #endif
@@ -8534,6 +8576,7 @@ int main(int argc, char** argv) {
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
         run("TestShowMetricsBusyTable", TestShowMetricsBusyTable);
         run("TestStopDuringStartup", TestStopDuringStartup);
+        run("TestPortZeroReportsPickedPort", TestPortZeroReportsPickedPort);
         run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestTlsHandshakeDeadlineReleasesWorker", TestTlsHandshakeDeadlineReleasesWorker);

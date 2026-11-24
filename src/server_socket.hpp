@@ -123,6 +123,8 @@ bool ConfigureSocketSendTimeout(
     std::string* error);
 
 SocketHandle CreateListenSocket(const std::string& host, std::uint16_t port);
+// The local port a bound socket listens on; throws when the system cannot say.
+std::uint16_t ListenSocketPort(SocketHandle socket_fd);
 
 }  // namespace server_detail
 }  // namespace chunkdb
