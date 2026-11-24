@@ -672,6 +672,12 @@ void ChunkCoordinateIndex::Compact(std::uint64_t before, std::uint64_t completed
     } catch (const std::exception&) { failed_.store(true, std::memory_order_release); throw; }
 }
 
+std::uint64_t ChunkCoordinateIndex::populated_count() const {
+    Check();
+    std::lock_guard lock(mutex_);
+    return populated_.size();
+}
+
 std::uint64_t ChunkCoordinateIndex::tombstone_count() const {
     Check();
     std::lock_guard lock(mutex_);

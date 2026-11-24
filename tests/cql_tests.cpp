@@ -526,6 +526,10 @@ void TestWatch() {
     assert(drop.name == "consumer" && drop.table == "world");
     assert(!Get<cql::ShowSlots>("SHOW SLOTS").table);
     assert(Get<cql::ShowSlots>("SHOW SLOTS ON world").table == "world");
+    const auto prefixed = Get<cql::ShowSlots>("SHOW SLOTS ON world PREFIX 'con'");
+    assert(prefixed.table == "world" && prefixed.prefix == "con");
+    assert(!Get<cql::ShowSlots>("SHOW SLOTS PREFIX '_'").table && Get<cql::ShowSlots>("show slots prefix '_'").prefix == "_");
+    assert(!Get<cql::ShowSlots>("SHOW SLOTS ON world").prefix);
     for (const auto& name : std::vector<std::string>{"", "Upper", "1start", "hy-phen", "quote'", std::string(64, 'a')}) {
         std::string quoted;
         for (const char c : name) { quoted += c; if (c == '\'') quoted += c; }
@@ -538,6 +542,9 @@ void TestWatch() {
     ExpectError("CREATE SLOT consumer ON world", "quoted slot name");
     ExpectError("DROP SLOT $1 ON world", "quoted slot name");
     ExpectError("SHOW SLOTS ON world extra", "expected the end");
+    ExpectError("SHOW SLOTS PREFIX con", "quoted slot name");
+    ExpectError("SHOW SLOTS PREFIX ''", "slot names must match");
+    ExpectError("SHOW SLOTS PREFIX 'con' ON world", "expected the end");
     ExpectError("UNWATCH extra", "expected the end");
 }
 void TestBackup() {

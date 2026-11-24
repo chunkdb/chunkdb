@@ -123,7 +123,7 @@ SHOW TABLE STATS table
 - Continue AFTER the last returned coordinate while `more` is true; read-only `position` is null.
 - Pass the first page's `epoch` and `position` to WATCH AFTER to follow later changes; see [Resume a consumer](../FEED_RESUME.md).
 - COMPACT TOMBSTONES: the retained-deletion floor after completion.
-- SHOW TABLE STATS: `epoch`, nullable completed `revision`, `dims`, retained `tombstones`, and `retained_deletion_floor`.
+- SHOW TABLE STATS: `epoch`, nullable completed `revision`, `dims`, `chunks`, retained `tombstones`, `retained_deletion_floor`, `loaded_chunks`, `files`, `disk_bytes`, `slots`, and `watches`.
 
 ## Errors
 
@@ -156,6 +156,16 @@ Reads and no-op writes do not make an unwritten chunk written.
 
 Plain area reads and scan pages do not share a snapshot.
 Use [Transactions](../TRANSACTIONS.md) when you need a consistent view of one table.
+
+## Table stats
+
+SHOW TABLE STATS needs READ on the table.
+`chunks` counts populated chunks, the ones SCAN CHUNKS lists; `loaded_chunks` counts the table's chunks held in the chunk cache.
+`files` and `disk_bytes` count the regular files under the table's directory and their sizes, WAL, images, feed archive and index files included.
+`slots` counts durable slots, lost ones included; `watches` counts open watches, slot watches included.
+The counts come from memory, except `files` and `disk_bytes`, which list the table's directory: their cost grows with its file count.
+The listing runs after the statement stops using the table, so no other statement waits for it, and a statement timeout stops it.
+A file written or removed during the listing may or may not be counted; a table dropped before it returns NO_TABLE, and a SWAP TABLES, or a DROP TABLE and CREATE TABLE of the same name, during it may count the other table's files.
 
 ## Downsampled areas
 

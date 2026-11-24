@@ -547,8 +547,10 @@ void Lifecycle(bool tls) {
     const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
     auto listed = writer->Command("SHOW SLOTS ON t");
     const auto& slot = Slot(listed, "t", "consumer");
-    assert(slot.items.size() == 18U && Field(slot, "epoch").value == initial.first);
+    assert(slot.items.size() == 24U && Field(slot, "epoch").value == initial.first);
     assert(Number(Field(slot, "acked")) == initial.second && !Boolean(Field(slot, "lost")));
+    assert(Boolean(Field(slot, "attached")));
+    assert(Number(Field(slot, "lag_revisions")) == Number(Field(slot, "revision")) - initial.second);
     auto second = harness.Connect();
     Error(second->Command("WATCH t SLOT 'consumer'"), "SLOT_BUSY");
     // A lone relaxed-mode write must be delivered even without another event.
@@ -606,7 +608,11 @@ void ConditionalObjects(bool tls) {
     assert(initial.second >= revision);
     const auto slot_before = Slot(admin->Command("SHOW SLOTS ON t"), "t", "consumer");
     admin->Ok("CREATE SLOT IF NOT EXISTS 'consumer' ON t");
-    assert(Slot(admin->Command("SHOW SLOTS ON t"), "t", "consumer") == slot_before);
+    // Its durable revision and lag follow the table's background sync.
+    const auto slot_after = Slot(admin->Command("SHOW SLOTS ON t"), "t", "consumer");
+    for (const char* key : {"epoch", "acked", "retained_bytes", "attached", "lost", "lost_reason", "filters", "owner"})
+        assert(Field(slot_after, key) == Field(slot_before, key));
+    assert(Boolean(Field(slot_after, "attached")));
     const auto next = Set(*admin, 9);
     assert(Change(NextChange(*watch)) == next); // Conditional creation preserves the active claim.
     Unwatch(*watch);
