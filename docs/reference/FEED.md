@@ -25,6 +25,8 @@ OK
   lag_revisions = 0
   retained_bytes = 0
   attached = false
+  peer = NULL
+  last_ack_ms = NULL
   lost = false
   lost_reason = NULL
   filters:
@@ -118,7 +120,7 @@ UNWATCH
 ## Returns
 
 - CREATE and DROP SLOT: `OK`, including authorized conditional no-ops.
-- SHOW SLOTS: visible table (every table with MONITOR), name, epoch, saved `acked` revision, `revision`, `lag_revisions`, retained bytes, `attached`, lost state, loss reason, filters, and owner; the owner is shown to that user and to MANAGES USERS, and is null otherwise; a table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
+- SHOW SLOTS: visible table (every table with MONITOR), name, epoch, saved `acked` revision, `revision`, `lag_revisions`, retained bytes, `attached`, `peer`, `last_ack_ms`, lost state, loss reason, filters, and owner; the owner is shown to that user and to MANAGES USERS, and is null otherwise; a table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
 - WATCH: start position, followed by change or chunks, schema, progress, or resync events.
 - WATCH CATALOG: the catalog epoch and revision, followed by catalog events; see [WATCH CATALOG](#watch-catalog).
 - ACK: no success reply; it is accepted only inside a slot watch.
@@ -160,6 +162,8 @@ SHOW SLOTS `revision` is the durable revision recorded for the table's slots, wh
 `lag_revisions` is how far `acked` is below `revision`, counted in revision numbers, gaps included.
 `retained_bytes` is the history the slot keeps after `acked`: how many bytes its consumer is behind.
 `attached` is true while a watch holds the slot; another WATCH ... SLOT then answers SLOT_BUSY unless it uses TAKEOVER.
+`peer` is the `[address]:port` of that watch's client, as SHOW CONNECTIONS names it, and `last_ack_ms` the milliseconds since that watch's last accepted ACK; both are null without a watch, and `last_ack_ms` also before the watch's first ACK.
+`peer` is shown to the watch's user and to ADMIN on `*` or MONITOR, as SHOW CONNECTIONS shows connections, and is null to others.
 
 Expiry deletions ([Expiry](TABLES.md#expiry)) are change events of user `@expire`, one per chunk, with the deleted blocks' before rows and no after rows; slots carry them like any other delete.
 No user name starts with `@`, so `@expire` never names a client.
