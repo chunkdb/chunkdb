@@ -1,4 +1,5 @@
 #include "user_registry.hpp"
+#include "checkpoint.hpp"
 #include "test_utils.hpp"
 #include "txn_test_utils.hpp"
 
@@ -6,6 +7,7 @@
 #include <barrier>
 #include <cassert>
 #include <chrono>
+#include <filesystem>
 #include <future>
 #include <thread>
 #include <vector>
@@ -187,6 +189,8 @@ void UnknownReplacementPublishesWholeImage() {
     assert(users.Snapshot() != before);
     const auto stored = ReadUsersFile(dir.path());
     assert(stored && *stored == users.Snapshot());
+#if defined(__APPLE__)
+    // This failpoint fails F_FULLFSYNC, so it exists only on macOS.
     {
         txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE", "1");
         bool unknown = false;
@@ -194,7 +198,20 @@ void UnknownReplacementPublishesWholeImage() {
         catch (const UsersOutcomeUnknownError&) { unknown = true; }
         assert(unknown); // An unchanged retry must confirm the outstanding rename.
     }
-    users.SetLimits("admin", 1U, 7U);
+#endif
+    {
+        // The unchanged retry confirms the outstanding rename with a directory sync, once.
+        const auto data_dir = std::filesystem::weakly_canonical(dir.path());
+        std::atomic<int> syncs{0};
+        SetDirectorySyncObserverForTests([&](const std::filesystem::path& synced) {
+            if (synced == data_dir) ++syncs;
+        });
+        users.SetLimits("admin", 1U, 7U);
+        assert(syncs == 1);
+        users.SetLimits("admin", 1U, 7U);
+        assert(syncs == 1);
+        SetDirectorySyncObserverForTests({});
+    }
     UserRegistry reopened(dir.path(), std::nullopt, {});
     assert(reopened.Snapshot() == users.Snapshot());
     auto ticket = Connect(users, "admin");

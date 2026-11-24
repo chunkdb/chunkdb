@@ -77,12 +77,13 @@ void FiltersRetainMetadata() {
     }
     entry->protocol_frame = std::make_shared<const std::string>("cached whole entry");
     const std::vector<Column> columns{Scalar(1U, "a"), Scalar(2U, "b")};
-    const FeedArea area{{0, 0, 1}, {0, 0, 1}, 3U};
+    const std::vector<FeedArea> area{FeedArea{{0, 0, 1}, {0, 0, 1}, 3U}};
     auto filtered = FilterFeedEntry(entry, area, {}, false, columns);
     assert(filtered && filtered->blocks.size() == 1U && filtered->chunk_changes.size() == 1U);
     assert(filtered->blocks[0].chunk.z == 1 && filtered->chunk_changes[0].chunk.z == 1);
     filtered = FilterFeedEntry(entry, area, std::vector<std::uint32_t>{2U}, true, columns);
-    assert(filtered && filtered->dims == 3U && !filtered->protocol_frame);
+    // The projection carries its own frame, not the whole entry's.
+    assert(filtered && filtered->dims == 3U && filtered->protocol_frame && *filtered->protocol_frame == EncodeFeedEntry(*filtered));
     assert(!filtered->blocks[0].before && filtered->blocks[0].after == std::optional<Row>(Row{std::uint64_t{4U}}));
     assert(!filtered->chunk_changes[0].before && filtered->chunk_changes[0].after->size() == 2U);
     assert(entry->blocks[1].before && entry->chunk_changes[1].before && entry->protocol_frame);
@@ -90,8 +91,8 @@ void FiltersRetainMetadata() {
     metadata_only->blocks.clear();
     metadata_only->chunk_changes.erase(metadata_only->chunk_changes.begin());
     assert(FilterFeedEntry(metadata_only, area, {}, false, columns));
-    assert(!FilterFeedEntry(metadata_only, FeedArea{{0, 0, -1}, {0, 0, -1}, 3U}, {}, false, columns));
-    Refuse([&] { (void)FilterFeedEntry(entry, FeedArea{{0, 0}, {0, 0}}, {}, false, columns); });
+    assert(!FilterFeedEntry(metadata_only, std::vector<FeedArea>{FeedArea{{0, 0, -1}, {0, 0, -1}, 3U}}, {}, false, columns));
+    Refuse([&] { (void)FilterFeedEntry(entry, std::vector<FeedArea>{FeedArea{{0, 0}, {0, 0}}}, {}, false, columns); });
     Refuse([&] { (void)FilterFeedEntry(entry, {}, std::vector<std::uint32_t>{}, false, columns); });
     entry->kind = FeedEntry::Kind::kSchema; entry->columns = columns;
     entry->chunk_columns = {Scalar(1U, "metadata")};
@@ -122,7 +123,7 @@ void CheckedHistoricalProjection() {
     const auto newer_metadata = AdvanceOtherDomain(metadata, ColumnDomain::kChunk);
     config.block_bits = FixedBitsPerBlock(newer_blocks);
     const Geometry current(config, newer_blocks, newer_metadata);
-    const auto projected = ChunkFeedEntry(entry, current, FeedArea{{0, 0, 0}, {0, 0, 0}, 3U}, std::vector<std::uint32_t>{2U});
+    const auto projected = ChunkFeedEntry(entry, current, std::vector<FeedArea>{FeedArea{{0, 0, 0}, {0, 0, 0}, 3U}}, std::vector<std::uint32_t>{2U});
     assert(projected && projected->dims == 3U && projected->chunk_forms.size() == 1U);
     const auto& value = *projected->chunk_forms[0].form;
     const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(value.data()), value.size());

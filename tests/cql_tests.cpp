@@ -74,7 +74,7 @@ void TestChunkModelCoordinates() {
     const auto ball = Get<cql::GetArea>("GET AREA AROUND 1 2 3 RADIUS 4 FROM t");
     assert(ball.dims == 3U && ball.around && ball.z0 == 3 && ball.radius == 4);
     const auto watch = Get<cql::Watch>("WATCH t AREA -1 -2 -3 TO 4 5 6");
-    assert(watch.area && watch.area->dims == 3U && watch.area->first.z == -3 && watch.area->last.z == 6);
+    assert(watch.areas.size() == 1U && watch.areas[0].dims == 3U && watch.areas[0].first.z == -3 && watch.areas[0].last.z == 6);
     const auto slot = Get<cql::CreateSlot>("CREATE SLOT 's' ON t AREA 1 2 0 TO 3 4 0");
     assert(slot.area && slot.area->dims == 3U && slot.area->first.z == 0);
     ExpectError("GET BLOCK 1 2 9223372036854775808 FROM t", "z is out of range");
@@ -129,6 +129,7 @@ void TestChunkModelScan() {
     ExpectError("SCAN CHUNKS FROM t WITH DATA WITH DATA", "given twice");
     ExpectError("SCAN CHUNKS FROM t COLUMNS a", "requires WITH DATA");
     ExpectError("SCAN CHUNKS FROM t SINCE -1", "a revision must be between 0");
+    ExpectError("SCAN CHUNKS FROM t SINCE 0 WHERE n = 1 WITH DATA", "column 28: SCAN CHUNKS does not support WHERE");
     const auto compact = Get<cql::CompactTombstones>("COMPACT TOMBSTONES t BEFORE 18446744073709551615");
     assert(compact.table == "t" && compact.before == std::numeric_limits<std::uint64_t>::max());
     assert(Get<cql::CompactTombstones>("COMPACT TOMBSTONES t BEFORE 0").before == 0U);
@@ -200,7 +201,7 @@ void TestUnorderedOptions() {
     std::vector<std::string> options{"AFTER 0123456789abcdef0123456789abcdef 42", "AREA -1 0 TO 1 2", "SLOT 'consumer'"};
     do {
         const auto watch = Get<cql::Watch>("WATCH t " + options[0] + " " + options[1] + " " + options[2]);
-        assert(watch.slot == "consumer" && watch.area->first.x == -1 && watch.area->last.y == 2);
+        assert(watch.slot == "consumer" && watch.areas.at(0).first.x == -1 && watch.areas.at(0).last.y == 2);
         assert(watch.after->revision == 42 && watch.after->epoch[0] == 1);
     } while (std::next_permutation(options.begin(), options.end()));
     for (const auto* option : {"AREA 0 0 TO 1 1", "SLOT 'consumer'", "AFTER 00000000000000000000000000000000 0"})
@@ -498,7 +499,7 @@ void TestWatch() {
     }
 
     const auto watch = Get<cql::Watch>("WATCH world AREA -2 3 TO 4 5 AFTER 1234567890abcdefABCDEF0123456789 18446744073709551615");
-    assert(watch.table == "world" && watch.area->first.x == -2 && watch.area->last.y == 5);
+    assert(watch.table == "world" && watch.areas.at(0).first.x == -2 && watch.areas.at(0).last.y == 5);
     assert(watch.after->epoch[0] == 0x12 && watch.after->epoch[15] == 0x89);
     assert(watch.after->revision == UINT64_MAX);
     assert(Get<cql::Watch>("watch world after 00000000000000000000000000000000 0").after->revision == 0);
@@ -518,7 +519,17 @@ void TestWatch() {
     ExpectError("WATCH world AFTER z0000000000000000000000000000000 0", "32 hex digits");
     ExpectError("WATCH world AFTER 00000000000000000000000000000000 -1", "revision must be between 0");
     const auto slot = Get<cql::Watch>("WATCH world SLOT 'consumer_1' AREA 0 0 TO 1 1 AFTER 00000000000000000000000000000000 4");
-    assert(slot.slot == "consumer_1" && slot.after->revision == 4 && slot.area->last.x == 1);
+    assert(slot.slot == "consumer_1" && slot.after->revision == 4 && slot.areas.at(0).last.x == 1);
+    const auto several = Get<cql::Watch>("WATCH world AREA 0 0 TO 1 1, AREA -4 -4 TO -3 -3,area 9 9 TO 9 9 COLUMNS a");
+    assert(several.areas.size() == 3U && several.areas[1].first.x == -4 && several.areas[2].last.y == 9 && several.columns->size() == 1U);
+    ExpectError("WATCH world AREA 0 0 TO 1 1 AREA 2 2 TO 3 3", "AREA is given twice");
+    ExpectError("WATCH world AREA 0 0 TO 1 1, COLUMNS a", "expected AREA");
+    ExpectError("WATCH world AREA 0 0 TO 1 1, AREA 0 0 0 TO 1 1 1", "AREA dimensions differ");
+    ExpectError("CREATE SLOT 's' ON world AREA 0 0 TO 1 1, AREA 2 2 TO 3 3", "a slot takes one AREA");
+    std::string many = "WATCH world AREA 0 0 TO 0 0";
+    for (std::size_t i = 1U; i < chunkdb::kMaxFeedAreas; ++i) many += ", AREA 0 0 TO 0 0";
+    assert(Get<cql::Watch>(many).areas.size() == chunkdb::kMaxFeedAreas);
+    ExpectError(many + ", AREA 0 0 TO 0 0", "at most 64 areas");
     assert(Get<cql::Ack>("ACK 18446744073709551615").revision == UINT64_MAX);
     ExpectError("ACK -1", "revision must be between 0");
     ExpectError("ACK 18446744073709551616", "not a 64-bit integer");
@@ -566,6 +577,38 @@ void TestBackup() {
     ExpectError("SWAP TABLES world other", "expected a comma");
     ExpectError("SWAP TABLES world,", "expected a table name");
     ExpectError("SWAP TABLES world, other, third", "expected the end of the statement");
+}
+
+void TestAggregate() {
+    using Kind = cql::AggregateFunction::Kind;
+    const auto area = Get<cql::Aggregate>("AGGREGATE AREA -1 -2 TO 3 4 FROM t COUNT(*), SUM(a), MIN(a), MAX(b), AVG(a)");
+    assert(!area.around && area.dims == 2U && area.x0 == -1 && area.y0 == -2 && area.x1 == 3 && area.y1 == 4);
+    assert(area.table == "t" && !area.by_chunk);
+    assert((area.functions == std::vector<cql::AggregateFunction>{{Kind::kCount, ""}, {Kind::kSum, "a"},
+        {Kind::kMin, "a"}, {Kind::kMax, "b"}, {Kind::kAvg, "a"}}));
+    std::vector<std::string> names;
+    for (const auto& function : area.functions) names.push_back(cql::AggregateFunctionName(function));
+    assert((names == std::vector<std::string>{"count(*)", "sum(a)", "min(a)", "max(b)", "avg(a)"}));
+    const auto ball = Get<cql::Aggregate>("aggregate area around 1 2 3 radius 4 from t count ( * ) by chunk");
+    assert(ball.around && ball.dims == 3U && ball.z0 == 3 && ball.radius == 4 && ball.by_chunk);
+    const auto chunk = Get<cql::Aggregate>("AGGREGATE CHUNK 5 -6 7 FROM t SUM(a) BY CHUNK");
+    assert(!chunk.around && chunk.dims == 3U && chunk.by_chunk && chunk.functions.size() == 1U);
+    assert(chunk.x0 == 5 && chunk.x1 == 5 && chunk.y0 == -6 && chunk.y1 == -6 && chunk.z0 == 7 && chunk.z1 == 7);
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t", "expected COUNT, SUM, MIN, MAX or AVG, got the end of the statement");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(a)", "COUNT takes *, got 'a'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t SUM(*)", "expected a column name, got '*'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t SUM a", "expected (, got 'a'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t MEDIAN(a)", "expected COUNT, SUM, MIN, MAX or AVG, got 'MEDIAN'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t SUM(a), sum(a)", "column 42: sum(a) is given twice");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) BY CHUNK BY CHUNK", "BY CHUNK is given twice");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) BY BLOCK", "expected CHUNK, got 'BLOCK'");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 FROM t COUNT(*) WHERE a > 1",
+        "column 43: AGGREGATE does not take WHERE; it aggregates every present block of the selector");
+    ExpectError("AGGREGATE AREA 0 0 TO 1 1 0 FROM t COUNT(*)", "AREA endpoints have different dimensions");
+    ExpectError("AGGREGATE AREA AROUND 0 0 RADIUS -1 FROM t COUNT(*)", "a radius must be between 0");
+    ExpectError("AGGREGATE BLOCK 0 0 FROM t COUNT(*)", "expected CHUNK or AREA, got 'BLOCK'");
+    ExpectError("AGGREGATE CHUNK 0 0 FROM t COUNT(*) LIMIT 1", "expected the end of the statement, got 'LIMIT'");
+    ExpectError("AGGREGAT CHUNK 0 0 FROM t COUNT(*)", "did you mean AGGREGATE?");
 }
 
 void TestErrors() {
@@ -626,6 +669,7 @@ int main() {
     TestConditionalObjects();
     TestBlockStatements();
     TestChunkAndAreaStatements();
+    TestAggregate();
     TestLiterals();
     TestParameters();
     TestCreateTable();

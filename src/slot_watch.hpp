@@ -146,7 +146,11 @@ class SlotWatch {
     bool Publish(const std::shared_ptr<const FeedEntry>& entry, bool filtered = false);
     // True when the slot has filters (FeedSlotFilters::empty).
     [[nodiscard]] bool Filtered() const noexcept {
-        return options_.area || options_.column_ids || options_.no_before || options_.chunks;
+        return !options_.areas.empty() || options_.column_ids || options_.no_before || options_.chunks;
+    }
+    // A slot keeps at most one area.
+    [[nodiscard]] std::optional<FeedArea> SlotArea() const {
+        return options_.areas.empty() ? std::nullopt : std::optional<FeedArea>(options_.areas.front());
     }
     void Finish(std::optional<Output> control);
     bool Work();

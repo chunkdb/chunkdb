@@ -19,12 +19,15 @@ namespace chunkdb {
 
 class Table;
 class ChangeFeed;
+class FeedProjectionGroup;
 inline constexpr std::string_view kFeedRecoveryRequiredMessage = "feed cleanup failed; run RECOVER TABLE or restart server before retrying";
 class FeedRecoveryRequiredError : public std::runtime_error {
   public:
     FeedRecoveryRequiredError() : std::runtime_error(std::string(kFeedRecoveryRequiredMessage)) {}
 };
 inline constexpr std::size_t kDefaultFeedBufferBytes = 64ULL * 1024ULL * 1024ULL;
+// The most chunk-coordinate areas one watch can give.
+inline constexpr std::size_t kMaxFeedAreas = 64U;
 
 struct FeedPosition {
     StoreId epoch{};
@@ -41,7 +44,8 @@ struct FeedArea {
 
 struct FeedOptions {
     std::optional<FeedPosition> after{};
-    std::optional<FeedArea> area{};
+    // Empty for the whole table; otherwise a chunk in any of these areas is kept.
+    std::vector<FeedArea> areas{};
     std::optional<std::vector<std::uint32_t>> column_ids{};
     bool no_before = false;
     bool chunks = false;
@@ -92,7 +96,8 @@ struct FeedEntry {
     bool chunk_forms_complete = false;
     std::vector<FeedChunkForm> chunk_forms;
     std::vector<Column> columns;
-    // Immutable RESP3 bytes, charged to the ring and shared by whole-area watches.
+    // Immutable RESP3 bytes, charged to the ring and shared by whole-area watches;
+    // a filtered entry carries its own, shared by watches with the same filters.
     std::shared_ptr<const std::string> protocol_frame;
     std::uint8_t dims = 2U;
     std::vector<Column> chunk_columns;
@@ -122,17 +127,24 @@ class FeedSubscription {
   private:
     friend class ChangeFeed;
     FeedSubscription(std::shared_ptr<ChangeFeed> feed, std::weak_ptr<Table> table, const FeedOptions& options);
+    // Records a read through `revision` in the projection group.
+    void Track(std::uint64_t revision);
     std::shared_ptr<ChangeFeed> feed_;
     std::weak_ptr<Table> table_;
     FeedPosition position_;
-    std::optional<FeedArea> area_;
+    std::vector<FeedArea> areas_;
     std::optional<std::vector<std::uint32_t>> column_ids_;
     bool no_before_ = false;
     bool chunks_ = false;
+    // A slot watch's live reader, which projects each entry itself.
+    bool slot_ = false;
     std::uint64_t reset_ = 0;
     bool invalid_ = false;
     bool ended_ = false;
     std::shared_ptr<const std::function<void()>> notify_;
+    // Shared by subscriptions with the same filters; null without filters.
+    std::shared_ptr<FeedProjectionGroup> group_;
+    std::uint64_t group_position_ = 0;
 };
 
 // Identity of the current C++ write context. The engine scopes each statement
