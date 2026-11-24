@@ -957,7 +957,15 @@ void Table::ReleaseLease() noexcept {
 
 Table::BackupPin::BackupPin(BackupPin&& other) noexcept
     : table_(std::move(other.table_)), store_(std::move(other.store_)) {}
-Table::BackupPin::~BackupPin() { if (table_) table_->ReleaseBackupPin(); }
+Table::BackupPin::~BackupPin() {
+    if (!table_) return;
+    // The store goes first: the exclusive section the release admits may
+    // close the store and open its table again, which needs it closed.
+    store_.reset();
+    table_->ReleaseBackupPin();
+    if (auto* hook = table_->migration_health_->hook.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kAfterBackupPinRelease, table_->name_);
+}
 Table::BackupPin Table::PinForBackup(std::stop_token cancelled) {
     std::unique_lock lock(mutex_);
     ++backup_pin_waiters_;

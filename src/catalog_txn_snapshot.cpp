@@ -24,7 +24,13 @@ Table::AdmissionPause::AdmissionPause(AdmissionPause&& other) noexcept
     : table_(std::move(other.table_)), store_(std::move(other.store_)) {}
 
 Table::AdmissionPause::~AdmissionPause() {
-    if (table_) table_->ResumeAdmission();
+    if (!table_) return;
+    // The store goes first, as for a backup pin: the exclusive section the
+    // resume admits may close the store and open its table again.
+    store_.reset();
+    table_->ResumeAdmission();
+    if (auto* hook = table_->migration_health_->hook.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kAfterAdmissionResume, table_->name_);
 }
 
 void Table::ResumeAdmission() noexcept {
