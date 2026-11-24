@@ -658,7 +658,7 @@ void TestWatch() {
     ExpectError("SHOW SLOTS ON world extra", "expected the end");
     ExpectError("SHOW SLOTS PREFIX con", "quoted slot name");
     ExpectError("SHOW SLOTS PREFIX ''", "slot names must match");
-    ExpectError("SHOW SLOTS PREFIX 'con' ON world", "expected the end");
+    assert(Get<cql::ShowSlots>("SHOW SLOTS PREFIX 'con' ON world").table == std::optional<std::string>("world"));
     ExpectError("UNWATCH extra", "expected the end");
 }
 // CHECK in CREATE TABLE (a column's and the table's), ADD CHECK and DROP
