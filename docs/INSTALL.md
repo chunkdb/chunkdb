@@ -6,7 +6,7 @@ You can run a downloaded server or build one from source.
 
 Choose your platform's latest archive from [Releases](https://github.com/chunkdb/chunkdb/releases/latest).
 Follow [Verify a downloaded archive](VERIFY_RELEASE.md) before extracting it.
-The archive contains `chunkdb_server`, `chunkdb_verify`, `chunkdb_restore`, and `chunkdb_admin`.
+The archive contains `chunkdb_server`, `chunkdb_verify`, `chunkdb_restore`, `chunkdb_admin`, and `chunkdb_exporter` ([metrics for Prometheus](EXPORTER.md)).
 Windows executables have the `.exe` suffix.
 
 ## Start
@@ -31,7 +31,7 @@ OpenSSL enables TLS; see [Windows native](WINDOWS_NATIVE.md) for the Windows too
 
 ```sh
 cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCHUNKDB_WITH_TLS=ON -DCHUNKDB_BUILD_TESTS=OFF
-cmake --build build --parallel 3 --target chunkdb_server chunkdb_verify chunkdb_restore chunkdb_admin
+cmake --build build --parallel 3 --target chunkdb_server chunkdb_verify chunkdb_restore chunkdb_admin chunkdb_exporter
 ```
 
 Use `./build/chunkdb_server` in the start command.

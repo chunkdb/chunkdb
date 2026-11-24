@@ -25,7 +25,7 @@ std::optional<std::vector<std::uint8_t>> FileImage(const std::filesystem::path& 
 }
 
 void CrashAtFailpoint(const char* key) {
-    if (ConsumeFailpointEnv(key)) std::_Exit(86);
+    if (ConsumeFailpointEnv(key)) ExitAbruptly(86);
 }
 
 FeedSlotFilters MigrationSlotFilters(const MigrationRequest& request, const Geometry& geometry) {

@@ -246,6 +246,16 @@ target_link_libraries(chunkdb_restore PRIVATE chunkdb_tools)
 add_executable(chunkdb_admin src/admin_main.cpp)
 target_link_libraries(chunkdb_admin PRIVATE chunkdb_tools)
 
+add_executable(chunkdb_exporter
+    src/exporter_main.cpp
+    src/exporter_client.cpp
+    src/metrics_http.cpp
+    src/server_socket.cpp
+    src/server_poller.cpp
+)
+target_link_libraries(chunkdb_exporter PRIVATE chunkdb_core)
+target_include_directories(chunkdb_exporter PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+
 add_library(chunkdb_server_bench_lib STATIC
     bench/server_bench_lib.cpp
     src/server.cpp
@@ -318,6 +328,8 @@ if(CHUNKDB_WITH_TLS)
     if(OpenSSL_FOUND)
         target_link_libraries(chunkdb_server PRIVATE OpenSSL::SSL OpenSSL::Crypto)
         target_compile_definitions(chunkdb_server PRIVATE CHUNKDB_WITH_OPENSSL=1)
+        target_link_libraries(chunkdb_exporter PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+        target_compile_definitions(chunkdb_exporter PRIVATE CHUNKDB_WITH_OPENSSL=1)
 
         target_link_libraries(chunkdb_server_bench_lib PUBLIC OpenSSL::SSL OpenSSL::Crypto)
         target_compile_definitions(chunkdb_server_bench_lib PRIVATE CHUNKDB_WITH_OPENSSL=1)
@@ -821,6 +833,26 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME server_socket COMMAND chunkdb_server_socket_test)
     set_tests_properties(server_socket PROPERTIES TIMEOUT 30 LABELS "smoke")
 
+    add_executable(chunkdb_metrics_http_test tests/metrics_http_tests.cpp src/metrics_http.cpp src/server_socket.cpp src/server_poller.cpp)
+    target_link_libraries(chunkdb_metrics_http_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_metrics_http_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME metrics_http COMMAND chunkdb_metrics_http_test)
+    set_tests_properties(metrics_http PROPERTIES TIMEOUT 60 LABELS "smoke")
+
+    if(NOT WIN32)
+        add_executable(chunkdb_exporter_test tests/exporter_tests.cpp src/exporter_client.cpp src/metrics_http.cpp
+            src/server_socket.cpp src/server_poller.cpp)
+        target_link_libraries(chunkdb_exporter_test PRIVATE chunkdb_core)
+        target_include_directories(chunkdb_exporter_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+        if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
+            target_link_libraries(chunkdb_exporter_test PRIVATE OpenSSL::SSL OpenSSL::Crypto)
+            target_compile_definitions(chunkdb_exporter_test PRIVATE CHUNKDB_WITH_OPENSSL=1)
+        endif()
+        add_dependencies(chunkdb_exporter_test chunkdb_exporter chunkdb_server)
+        add_test(NAME exporter COMMAND chunkdb_exporter_test $<TARGET_FILE:chunkdb_exporter> $<TARGET_FILE:chunkdb_server>)
+        set_tests_properties(exporter PROPERTIES TIMEOUT 300)
+    endif()
+
     if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
         add_executable(chunkdb_server_tls_error_queue_test tests/server_tls_error_queue_tests.cpp
             src/server_socket.cpp src/server_io.cpp src/server_tls.cpp)
@@ -1282,6 +1314,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_server_framing_test
         chunkdb_server_poller_test
         chunkdb_server_socket_test
+        chunkdb_metrics_http_test
         chunkdb_server_integration_test
         chunkdb_feed_completed_prefix_reader_test
         chunkdb_server_slots_protocol_test
@@ -1308,6 +1341,9 @@ if(CHUNKDB_BUILD_TESTS)
     )
     if(TARGET chunkdb_server_tls_error_queue_test)
         list(APPEND CHUNKDB_TEST_TARGETS chunkdb_server_tls_error_queue_test)
+    endif()
+    if(NOT WIN32)
+        list(APPEND CHUNKDB_TEST_TARGETS chunkdb_exporter_test)
     endif()
     if(MSVC)
         set(CHUNKDB_TEST_UNDEBUG_OPTION /UNDEBUG)
@@ -1495,6 +1531,7 @@ if(CHUNKDB_ENABLE_PACKAGING)
             chunkdb_verify
             chunkdb_restore
             chunkdb_admin
+            chunkdb_exporter
         RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
     )
 
