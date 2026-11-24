@@ -71,7 +71,8 @@ int Connect(int port) {
 // A child process with its output in `log`.
 class Process {
   public:
-    Process(const std::string& binary, std::vector<std::string> arguments, const std::filesystem::path& log) {
+    Process(const std::string& binary, std::vector<std::string> arguments, const std::filesystem::path& log)
+        : log_(log) {
         pid_ = fork();
         assert(pid_ >= 0);
         if (pid_ == 0) {
@@ -94,15 +95,12 @@ class Process {
     Process(const Process&) = delete;
     Process& operator=(const Process&) = delete;
 
-    // Waits until `port` accepts connections, failing if the process ends.
-    void WaitListening(int port) {
+    // The port in the `port` field of the log line `message`, which the process
+    // writes once it listens; fails if the process ends first.
+    int WaitListening(const std::string& message) {
         const auto deadline = Clock::now() + std::chrono::seconds(20);
         for (;;) {
-            const int fd = Connect(port);
-            if (fd >= 0) {
-                close(fd);
-                return;
-            }
+            if (const auto port = chunkdb::test::LogLinePort(log_, message)) return *port;
             int status = 0;
             assert(waitpid(pid_, &status, WNOHANG) == 0);
             assert(Clock::now() < deadline);
@@ -127,6 +125,7 @@ class Process {
     }
 
   private:
+    std::filesystem::path log_;
     pid_t pid_ = -1;
 };
 
@@ -160,19 +159,24 @@ struct Fixture {
     chunkdb::test::ScopedTempDir dir{"chunkdb-exporter"};
     std::string exporter;
     std::string server_binary;
-    int server_port = chunkdb::test::PickListenerPort();
+    // 0 until the first start, where the server picks it; restarts keep it.
+    int server_port = 0;
     std::filesystem::path admin_password = dir.path() / "admin.password";
     std::vector<std::string> server_tls;
     std::string idle_timeout_ms = "60000";
 
     std::unique_ptr<Process> StartServer(const std::string& log_name = "server.log") {
         std::vector<std::string> arguments = {
-            "--host", "127.0.0.1", "--port", std::to_string(server_port), "--data-dir", (dir.path() / "data").string(),
+            "--host", "127.0.0.1", "--data-dir", (dir.path() / "data").string(),
             "--auth", "scram", "--admin-user", "admin", "--admin-password-file", admin_password.string(),
-            "--log-level", "error", "--workers", "2", "--idle-connection-timeout-ms", idle_timeout_ms};
+            "--log-level", "info", "--workers", "2", "--idle-connection-timeout-ms", idle_timeout_ms};
         arguments.insert(arguments.end(), server_tls.begin(), server_tls.end());
+        // After a --listen-uri in server_tls, so this port is the one used.
+        arguments.insert(arguments.end(), {"--port", std::to_string(server_port)});
         auto server = std::make_unique<Process>(server_binary, arguments, dir.path() / log_name);
-        server->WaitListening(server_port);
+        const int port = server->WaitListening("ready to accept connections");
+        assert(server_port == 0 || port == server_port);
+        server_port = port;
         return server;
     }
 
@@ -210,17 +214,18 @@ struct Fixture {
         WriteFile(dir.path() / (name + ".password"), password + "\n");
     }
 
-    std::unique_ptr<Process> StartExporter(const std::string& user, int port, std::vector<std::string> extra = {}) {
+    // The exporter listens on a free port, which `port` receives.
+    std::unique_ptr<Process> StartExporter(const std::string& user, int& port, std::vector<std::string> extra = {}) {
         std::vector<std::string> arguments = {"--uri", Uri(user), "--password-file",
                                               (dir.path() / (user + ".password")).string(),
-                                              "--listen", "127.0.0.1:" + std::to_string(port), "--timeout-ms", "2000"};
+                                              "--listen", "127.0.0.1:0", "--timeout-ms", "2000"};
         if (!server_tls.empty()) {
             arguments.push_back("--tls-ca-file");
             arguments.push_back((dir.path() / "server.pem").string());
         }
         arguments.insert(arguments.end(), extra.begin(), extra.end());
         auto process = std::make_unique<Process>(exporter, arguments, dir.path() / ("exporter-" + user + ".log"));
-        process->WaitListening(port);
+        port = process->WaitListening("serving metrics");
         return process;
     }
 };
@@ -246,7 +251,7 @@ void TestFlags(const std::string& exporter) {
     refused({"--uri", "chunk://m@127.0.0.1:4242/", "--password-file", password.string(), "--timeout-ms", "0"}, 2,
             "--timeout-ms");
     refused({"--uri", "chunk://m@127.0.0.1:4242/", "--password-file", password.string(), "--listen",
-             "0.0.0.0:" + std::to_string(chunkdb::test::PickListenerPort())},
+             "0.0.0.0:0"},
             1, "--allow-remote");
     refused({"--bogus"}, 2, "unknown option --bogus");
     const auto shared = dir.path() / "shared.password";
@@ -262,7 +267,7 @@ void TestAgainstServer(Fixture& fixture) {
     fixture.CreateUser("plain", "plain-password");
     fixture.Admin({"GRANT MONITOR ON * TO monitor", "CREATE TABLE terrain (bits bits(16))"});
 
-    const int port = chunkdb::test::PickListenerPort();
+    int port = 0;
     auto exporter = fixture.StartExporter("monitor", port);
     auto response = Scrape(port);
     assert(StatusLine(response) == "HTTP/1.1 200 OK");
@@ -281,7 +286,7 @@ void TestAgainstServer(Fixture& fixture) {
     assert(StatusLine(Http(port, "nonsense\r\n\r\n")) == "HTTP/1.1 400 Bad Request");
 
     // A user without MONITOR: the server refuses SHOW METRICS.
-    const int plain_port = chunkdb::test::PickListenerPort();
+    int plain_port = 0;
     auto plain = fixture.StartExporter("plain", plain_port);
     const auto refused = Scrape(plain_port);
     assert(StatusLine(refused) == "HTTP/1.1 503 Service Unavailable");
@@ -359,13 +364,13 @@ void TestTls(const std::string& exporter, const std::string& server_binary) {
         std::puts("openssl cannot make a test certificate; chunks:// not tested");
         return;
     }
-    fixture.server_tls = {"--listen-uri", "chunks://127.0.0.1:" + std::to_string(fixture.server_port) + "/",
+    fixture.server_tls = {"--listen-uri", "chunks://127.0.0.1:0/",
                           "--tls-cert", base + ".pem", "--tls-key", base + ".key", "--auth-channel-binding", "require"};
     WriteFile(fixture.admin_password, "admin-password\n");
     auto server = fixture.StartServer();
     fixture.CreateUser("monitor", "monitor-password");
     fixture.Admin({"GRANT MONITOR ON * TO monitor"});
-    const int port = chunkdb::test::PickListenerPort();
+    int port = 0;
     {
         auto process = fixture.StartExporter("monitor", port);
         const auto response = Scrape(port);
@@ -380,9 +385,9 @@ void TestTls(const std::string& exporter, const std::string& server_binary) {
     // A certificate the exporter does not trust.
     {
         std::vector<std::string> arguments = {"--uri", fixture.Uri("monitor"), "--password-file",
-            (fixture.dir.path() / "monitor.password").string(), "--listen", "127.0.0.1:" + std::to_string(port)};
+            (fixture.dir.path() / "monitor.password").string(), "--listen", "127.0.0.1:0"};
         Process process(exporter, arguments, fixture.dir.path() / "exporter-untrusted.log");
-        process.WaitListening(port);
+        port = process.WaitListening("serving metrics");
         assert(StatusLine(Scrape(port)) == "HTTP/1.1 503 Service Unavailable");
     }
     assert(ReadFile(fixture.dir.path() / "exporter-untrusted.log").find("not trusted") != std::string::npos);

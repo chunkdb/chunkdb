@@ -198,7 +198,9 @@ constexpr std::array<double, 8> kPercentiles{
 [[nodiscard]] std::uint16_t ParsePort(std::string_view text) {
     std::size_t consumed = 0;
     const auto value = std::stoul(std::string(text), &consumed, 10);
-    if (consumed != text.size() || value == 0 || value > 65535) {
+    // 0 lets a spawned server listen on a free port; ValidateEnabledArgs
+    // refuses it for an external server.
+    if (consumed != text.size() || value > 65535) {
         throw std::invalid_argument("invalid --port value: " + std::string(text));
     }
     return static_cast<std::uint16_t>(value);
@@ -1633,6 +1635,13 @@ struct ThreadWork {
     std::vector<std::unique_ptr<WatchingClient>> watches;
     if (!args.watch_table.empty())
         for (std::size_t i = 0; i < args.watch_count; ++i) watches.push_back(std::make_unique<WatchingClient>(args, i));
+    // Logged in before the timed window and silent through it; closed after it.
+    std::vector<std::unique_ptr<Client>> idle;
+    idle.reserve(args.idle_connections);
+    for (std::size_t i = 0; i < args.idle_connections; ++i) {
+        idle.push_back(std::make_unique<Client>(args.host, args.port, args.io_timeout_ms));
+        Hello(*idle.back(), args);
+    }
 
     std::mutex latencies_mutex;
     std::vector<double> latencies_ms;
@@ -2012,6 +2021,8 @@ bool TakeoverTerminal(std::string_view line) {
 }
 
 void ValidateEnabledArgs(const Args& args) {
+    if (args.port == 0 && args.server_mode != ServerMode::kSpawn)
+        throw std::invalid_argument("--port 0 requires --server-mode spawn");
     if (args.with_metadata != "none" && args.with_metadata != "version" &&
         args.with_metadata != "schema" && args.with_metadata != "both") throw std::invalid_argument("invalid --with value");
     if (args.watch_mode != "ordinary" && args.watch_mode != "progress" &&
@@ -2029,6 +2040,8 @@ void ValidateEnabledArgs(const Args& args) {
         throw std::invalid_argument("--failed-logins requires --user");
     if (args.failed_logins != 0U && std::find(args.tests.begin(), args.tests.end(), Scenario::kTakeover) != args.tests.end())
         throw std::invalid_argument("--failed-logins does not run with takeover");
+    if (args.idle_connections != 0U && std::find(args.tests.begin(), args.tests.end(), Scenario::kTakeover) != args.tests.end())
+        throw std::invalid_argument("--idle-connections does not run with takeover");
 }
 
 void WaitForServerReady(const Args& args) {
@@ -2113,7 +2126,8 @@ std::string UsageText() {
         << "  --server-mode <external|spawn>   default: external\n"
         << "  --uri <chunk://token@host:port/> optional endpoint URI\n"
         << "  --host <host>                    default: 127.0.0.1\n"
-        << "  --port <port>                    default: 4242\n"
+        << "  --port <port>                    default: 4242; 0 with --server-mode spawn\n"
+        << "                                   listens on a free port\n"
         << "  --clients <N>                    default: 50\n"
         << "  --pipeline <N>                   default: 1\n"
         << "  --io-timeout-ms <N>              send/receive wait: 1..86400000 ms (default: 5000);\n"
@@ -2139,6 +2153,9 @@ std::string UsageText() {
         << "                                   connection holds one, so use at least --clients\n"
         << "  --failed-logins <N>              report-only: N clients log in with a wrong password\n"
         << "                                   beside the measured clients; requires --user\n"
+        << "  --idle-connections <N>           N more connections log in before each scenario and stay\n"
+        << "                                   idle until it ends; an external server's\n"
+        << "                                   --idle-connection-timeout-ms must outlast the run\n"
         << "  --user <name>                    log in as this user (also from --uri)\n"
         << "  --password-file <path>           the user's password (first line)\n"
         << "  --log-level <info|warn|error>    default: info\n"
@@ -2295,6 +2312,10 @@ Args ParseArgs(const std::vector<std::string>& argv) {
             args.failed_logins = ParsePositiveSize(require_value("--failed-logins"), "--failed-logins");
             continue;
         }
+        if (arg == "--idle-connections") {
+            args.idle_connections = ParsePositiveSize(require_value("--idle-connections"), "--idle-connections");
+            continue;
+        }
         if (arg == "--durability-mode") {
             args.durability_mode = require_value("--durability-mode");
             (void)ParseDurabilityMode(args.durability_mode);
@@ -2362,8 +2383,10 @@ Args ParseArgs(const std::vector<std::string>& argv) {
     return args;
 }
 
-BenchmarkReport Run(const Args& args) {
-    ValidateEnabledArgs(args);
+BenchmarkReport Run(const Args& requested) {
+    ValidateEnabledArgs(requested);
+    // A spawned server on port 0 sets the port the clients use.
+    Args args = requested;
     if (args.io_timeout_ms == 0 || args.io_timeout_ms > 86400000) {
         throw std::invalid_argument("--io-timeout-ms must be between 1 and 86400000");
     }
@@ -2392,6 +2415,7 @@ BenchmarkReport Run(const Args& args) {
     report.watch_delivery = args.watch_delivery;
     report.watch_table = args.watch_table;
     report.failed_login_clients = args.failed_logins;
+    report.idle_connections = args.idle_connections;
     if (!args.watch_table.empty()) {
         report.watch = args.watch_table;
         if (args.watch_count != 1U || args.watch_slots) report.watch += ":" + std::to_string(args.watch_count);
@@ -2474,6 +2498,8 @@ BenchmarkReport Run(const Args& args) {
                 .max_line_bytes = 65536,
                 .worker_threads = args.server_workers,
                 .client_io_timeout_ms = args.io_timeout_ms,
+                // Idle connections stay open for the whole run.
+                .idle_connection_timeout_ms = args.idle_connections != 0U ? 86400000U : ServerConfig{}.idle_connection_timeout_ms,
                 .max_watches = std::max<std::size_t>(64U, args.watch_count),
                 .tls_enabled = false,
                 .tls_cert_path = "",
@@ -2482,6 +2508,10 @@ BenchmarkReport Run(const Args& args) {
             engine);
 
         server_thread = std::thread([&]() { server->Run(); });
+        if (!server->WaitListeningForTests(std::chrono::seconds(10)))
+            throw std::runtime_error("spawned benchmark server did not start listening");
+        args.port = server->port();
+        report.port = args.port;
         WaitForServerReady(args);
 
         report.spawned_server = true;
@@ -2557,6 +2587,7 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
                          << " watch_mode=" << report.watch_mode
                          << (report.watch_delivery == "measure" ? " watch_delivery=measure" : "") << "\n";
     if (report.failed_login_clients != 0U) out << "report_only failed_login_clients=" << report.failed_login_clients << "\n";
+    if (report.idle_connections != 0U) out << "idle_connections=" << report.idle_connections << "\n";
 
     for (const auto& result : report.results) {
         out << "\n[" << result.name << "]\n";
@@ -2641,6 +2672,7 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
         << JsonEscape(report.watch_mode) << "\""
         << (report.watch_delivery == "measure" ? ",\"watch_delivery\":\"measure\"" : "") << "},";
     if (report.failed_login_clients != 0U) out << "\"failed_login_clients\":" << report.failed_login_clients << ",";
+    if (report.idle_connections != 0U) out << "\"idle_connections\":" << report.idle_connections << ",";
     out << "\"results\":[";
     for (std::size_t i = 0; i < report.results.size(); ++i) {
         if (i != 0) {

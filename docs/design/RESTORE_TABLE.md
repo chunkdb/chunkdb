@@ -33,6 +33,7 @@ Until publication the table is in no catalog listing and no statement can name i
 Publication takes the catalog's table operations, checks the name again and renames the directory into `tables/` without replacing anything, then syncs both parents.
 The rename is the commit point; the store is opened and served afterwards, as CREATE TABLE does.
 A failure before the rename removes the private directory; a crash before it leaves the directory for the next writer start to remove.
+The catalog records the private directory while the restore runs, so RECOVER TABLE of the same name, which removes the interrupted operations of that name, leaves it alone.
 A failure after the rename that leaves the table unopened moves it out again, or fences its name until RECOVER TABLE.
 The backup is only read; a backup that changes while it is copied fails the checksum check.
 The feature check runs after the copy and again at publication, under the feature metadata gate held shared until the table serves, so a feature cannot be enabled in between.
@@ -56,6 +57,7 @@ It waits for running statements on both tables, makes their acknowledged writes 
 CANCEL, KILL CONNECTION or a statement timeout stops the swap only before the exchange, and both tables then keep serving under their names.
 One atomic directory exchange then swaps `tables/t` and `tables/t_restored` (`renameat2(RENAME_EXCHANGE)` on Linux, `renamex_np(RENAME_SWAP)` on macOS).
 A file system without an atomic exchange refuses the swap and reopens both tables unchanged; Windows refuses it before closing either table; there is no non-atomic fallback.
+The [swap guard design](SWAP_GUARD.md) replaces this refusal with three renames under one guard record.
 After the exchange the parent directory is synced and each store is reopened under its new name as a new table object.
 A crash at any point leaves both directories under their old names or both exchanged; each directory is a complete table.
 A failure after the exchange that leaves a name unserved fences that name until RECOVER TABLE or a restart.

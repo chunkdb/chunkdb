@@ -8,6 +8,7 @@
 #include <exception>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -274,6 +275,11 @@ class Table : public std::enable_shared_from_this<Table> {
     // Durable slots, lost ones included, and open watches, slot watches
     // included, under `lease`, a lease of this table.
     [[nodiscard]] FeedCounts CountFeeds(const Lease& lease) const;
+    // Whether the durable frontier of this table's slots stopped advancing,
+    // under `lease`, a lease of this table: it has a slot that is not lost
+    // and its store is fail-closed after a durability failure, which stops
+    // slot passes until RECOVER TABLE or a restart.
+    [[nodiscard]] bool SlotFrontierFrozen(const Lease& lease) const;
     [[nodiscard]] std::vector<std::uint32_t> ResolveFeedColumns(const std::vector<std::string>& names);
     // Monotonic, in this epoch, and no higher than the durable frontier. The
     // streaming layer must additionally check its last revision sent.
@@ -622,12 +628,17 @@ class TableCatalog {
     void OpenDataDirManifest();
     // Raises the data directory's version floor (chunkdb.manifest) durably.
     void RaiseVersionFloor(std::uint64_t floor);
-    // Every interrupted operation, or only those of `table`.
+    // Every interrupted operation, or only those of `table`; the staging
+    // directory of a running RESTORE TABLE is not interrupted.
     void RemoveInterruptedOperations(std::string_view table = {});
     void OpenExistingTables();
     struct FoundTable;
-    // Reads a table directory to open; a writer drops an interrupted narrowing.
+    // Reads a table directory to open without changing it; a writer drops an
+    // interrupted narrowing or ADD CHECK from the manifest it returns.
     [[nodiscard]] FoundTable ReadTableToOpen(const std::string& name, const std::filesystem::path& dir);
+    // Publishes the manifest without the dropped narrowing or ADD CHECK, once
+    // every check that could refuse the open has passed.
+    void PublishDroppedPending(const FoundTable& table);
     [[nodiscard]] std::shared_ptr<Table> OpenFoundTable(FoundTable& table);
     // Throws as opening does for a table directory without its manifest.
     [[nodiscard]] StoreManifest ReadOpenableManifest(const std::filesystem::path& dir) const;
@@ -712,6 +723,9 @@ class TableCatalog {
     // The data directory's version floor (see DataDirVersionFloor); changed
     // under operations_mutex_.
     std::uint64_t version_floor_ = 0;
+    // Staging directory names of running RESTORE TABLE statements, which
+    // RECOVER TABLE leaves alone; changed under operations_mutex_.
+    std::set<std::string, std::less<>> restore_staging_;
     mutable std::shared_mutex tables_mutex_;
     std::map<std::string, std::shared_ptr<Table>, std::less<>> tables_;
     // Out of service until RecoverTable; disjoint from tables_, which

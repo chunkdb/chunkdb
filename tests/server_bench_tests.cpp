@@ -93,7 +93,6 @@ struct ExternalServerHarness {
         // Not empty: logins need user `bench` with this password.
         const std::string& bench_password = "") {
         data_dir = TempDataDir(suffix);
-        port = chunkdb::test::PickListenerPort();
 
         catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(chunkdb::StoreConfig{
             .geometry = geometry,
@@ -119,7 +118,7 @@ struct ExternalServerHarness {
         server = std::make_unique<chunkdb::ChunkServer>(
             chunkdb::ServerConfig{
                 .host = "127.0.0.1",
-                .port = port,
+                .port = 0,
                 .max_line_bytes = 65536,
                 .worker_threads = 2,
                 // Give SCRAM proof work a fixed budget in every build.
@@ -143,6 +142,7 @@ struct ExternalServerHarness {
             if (run_error) std::rethrow_exception(run_error);
             throw std::runtime_error("benchmark test server did not start listening in time");
         }
+        port = server->port();
     }
 
     // Set by the server thread, read after it is joined.
@@ -423,7 +423,7 @@ void TestSpawnModeStartsAndStops() {
     const auto report = chunkdb::server_bench::Run(chunkdb::server_bench::Args{
         .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
         .host = "127.0.0.1",
-        .port = chunkdb::test::PickListenerPort(),
+        .port = 0,
         .clients = 2,
         .pipeline = 1,
         .requests = 80,
@@ -439,13 +439,14 @@ void TestSpawnModeStartsAndStops() {
     assert(report.active_clients == 2);
     assert(report.results.size() == 1);
     assert(report.results.front().completed_requests == 80);
+    assert(report.port != 0);  // The port the spawned server picked for --port 0.
 }
 
 void TestOutputContainsPercentilesAndJsonFields() {
     const auto report = chunkdb::server_bench::Run(chunkdb::server_bench::Args{
         .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
         .host = "127.0.0.1",
-        .port = chunkdb::test::PickListenerPort(),
+        .port = 0,
         .clients = 2,
         .pipeline = 3,
         .requests = 120,
@@ -482,7 +483,7 @@ void TestIdleClientsNoteWhenRequestsLessThanClients() {
     const auto report = chunkdb::server_bench::Run(chunkdb::server_bench::Args{
         .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
         .host = "127.0.0.1",
-        .port = chunkdb::test::PickListenerPort(),
+        .port = 0,
         .clients = 8,
         .pipeline = 1,
         .requests = 3,
@@ -562,7 +563,7 @@ void TestSpawnModeWithUser() {
     const auto report = chunkdb::server_bench::Run(chunkdb::server_bench::Args{
         .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
         .host = "127.0.0.1",
-        .port = chunkdb::test::PickListenerPort(),
+        .port = 0,
         .clients = 2,
         .pipeline = 1,
         .requests = 60,
@@ -601,7 +602,7 @@ void TestFailedLoginClients() {
     auto args = chunkdb::server_bench::Args{
         .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
         .host = "127.0.0.1",
-        .port = chunkdb::test::PickListenerPort(),
+        .port = 0,
         .clients = 2,
         .pipeline = 1,
         .requests = 200,
@@ -624,6 +625,40 @@ void TestFailedLoginClients() {
     assert(chunkdb::server_bench::RenderHumanReport(report).find("Failed logins: ") != std::string::npos);
     const auto plain = chunkdb::server_bench::RenderJsonReport(chunkdb::server_bench::BenchmarkReport{});
     assert(plain.find("failed_login") == std::string::npos);
+}
+
+// Idle connections log in before each scenario and stay open beside the measured clients.
+void TestIdleConnections() {
+    assert(chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--idle-connections", "7"}).idle_connections == 7U);
+    for (const std::vector<std::string>& refused : {
+             std::vector<std::string>{"chunkdb_server_bench", "--idle-connections", "0"},
+             std::vector<std::string>{"chunkdb_server_bench", "--idle-connections", "1", "--tests", "takeover", "--clients", "1"}}) {
+        bool threw = false;
+        try { (void)chunkdb::server_bench::ParseArgs(refused); } catch (const std::invalid_argument&) { threw = true; }
+        assert(threw);
+    }
+    assert(chunkdb::server_bench::UsageText().find("--idle-connections") != std::string::npos);
+    auto args = chunkdb::server_bench::Args{
+        .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
+        .host = "127.0.0.1",
+        .port = 0,
+        .clients = 2,
+        .pipeline = 4,
+        .requests = 120,
+        .tests = {chunkdb::server_bench::Scenario::kPing, chunkdb::server_bench::Scenario::kSet},
+        .keyspace = 64,
+        .seed = 29,
+        .output_mode = chunkdb::server_bench::OutputMode::kJson,
+        .log_level = chunkdb::LogLevel::kWarn,
+    };
+    args.idle_connections = 32U;
+    const auto report = chunkdb::server_bench::Run(args);
+    assert(report.idle_connections == 32U && report.results.size() == 2U);
+    for (const auto& result : report.results) assert(result.completed_requests == 120U);
+    assert(chunkdb::server_bench::RenderJsonReport(report).find("\"idle_connections\":32,") != std::string::npos);
+    assert(chunkdb::server_bench::RenderHumanReport(report).find("idle_connections=32\n") != std::string::npos);
+    assert(chunkdb::server_bench::RenderJsonReport(chunkdb::server_bench::BenchmarkReport{}).find("idle_connections") ==
+           std::string::npos);
 }
 
 void TestParseArgsGridScenariosAndDurability() {
@@ -811,7 +846,7 @@ void TestSpawnModeReportsDurability() {
     const auto report = chunkdb::server_bench::Run(chunkdb::server_bench::Args{
         .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
         .host = "127.0.0.1",
-        .port = chunkdb::test::PickListenerPort(),
+        .port = 0,
         .clients = 2,
         .pipeline = 1,
         .requests = 120,
@@ -852,8 +887,19 @@ void TestWatchCountAndSlots() {
         assert(threw);
     }
 
+    {
+        // Clients cannot reach port 0 of an external server.
+        bool threw = false;
+        try {
+            (void)chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--port", "0"});
+        } catch (const std::invalid_argument& error) {
+            threw = std::string(error.what()).find("--server-mode spawn") != std::string::npos;
+        }
+        assert(threw);
+    }
+
     auto run = chunkdb::server_bench::ParseArgs({
-        "chunkdb_server_bench", "--server-mode", "spawn", "--port", std::to_string(chunkdb::test::PickListenerPort()),
+        "chunkdb_server_bench", "--server-mode", "spawn", "--port", "0",
         "--clients", "2", "--requests", "300", "--tests", "canvas,simulation", "--keyspace", "64",
         "--log-level", "warn", "--watch", "default:3:slots",
     });
@@ -868,7 +914,7 @@ void TestWatchCountAndSlots() {
     for (const auto mode : {"ordinary", "progress", "filtered", "chunks"}) {
         auto args = chunkdb::server_bench::ParseArgs({"bench", "--watch", "default:2:slots", "--watch-mode", mode});
         args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
-        args.port = chunkdb::test::PickListenerPort(); args.clients = 1; args.requests = 10; args.keyspace = 16;
+        args.port = 0; args.clients = 1; args.requests = 10; args.keyspace = 16;
         args.tests = {chunkdb::server_bench::Scenario::kSimulation};
         args.log_level = chunkdb::LogLevel::kWarn;
         const auto slots = chunkdb::server_bench::Run(args);
@@ -904,7 +950,7 @@ void TestWatchDeliveryMeasure() {
         auto args = chunkdb::server_bench::ParseArgs({"bench", "--watch", slots ? "default:2:slots" : "default:3",
             "--watch-delivery", "measure"});
         args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
-        args.port = chunkdb::test::PickListenerPort(); args.clients = 2; args.requests = 200; args.keyspace = 64;
+        args.port = 0; args.clients = 2; args.requests = 200; args.keyspace = 64;
         args.tests = {chunkdb::server_bench::Scenario::kCanvas, chunkdb::server_bench::Scenario::kSimulation};
         args.log_level = chunkdb::LogLevel::kWarn;
         const auto report = chunkdb::server_bench::Run(args);
@@ -932,7 +978,7 @@ void TestWatchDeliveryMeasure() {
 
     auto plain = chunkdb::server_bench::ParseArgs({"bench", "--watch", "default"});
     plain.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
-    plain.port = chunkdb::test::PickListenerPort(); plain.clients = 1; plain.requests = 20; plain.keyspace = 16;
+    plain.port = 0; plain.clients = 1; plain.requests = 20; plain.keyspace = 16;
     plain.tests = {chunkdb::server_bench::Scenario::kSimulation};
     plain.log_level = chunkdb::LogLevel::kWarn;
     const auto report = chunkdb::server_bench::Run(plain);
@@ -960,7 +1006,7 @@ void TestWatchAboveFdSetSize() {
     assert(!fillers.empty() && fillers.back() >= FD_SETSIZE);
     auto args = chunkdb::server_bench::ParseArgs({"bench", "--watch", "default:2"});
     args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
-    args.port = chunkdb::test::PickListenerPort(); args.clients = 1; args.requests = 20; args.keyspace = 16;
+    args.port = 0; args.clients = 1; args.requests = 20; args.keyspace = 16;
     args.tests = {chunkdb::server_bench::Scenario::kSimulation};
     args.log_level = chunkdb::LogLevel::kWarn;
     const auto report = chunkdb::server_bench::Run(args);
@@ -987,7 +1033,7 @@ void TestEveryScenario() {
 
     auto run = args;
     run.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
-    run.port = chunkdb::test::PickListenerPort();
+    run.port = 0;
     run.clients = 2;
     run.pipeline = 4;
     run.requests = 300;
@@ -1007,7 +1053,7 @@ void TestEnabledBenchmarkOptions() {
         auto args = chunkdb::server_bench::ParseArgs({"bench", "--with", metadata,
             "--tests", "world,canvas,simulation"});
         args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
-        args.port = chunkdb::test::PickListenerPort(); args.clients = 1; args.requests = 20; args.keyspace = 16;
+        args.port = 0; args.clients = 1; args.requests = 20; args.keyspace = 16;
         args.log_level = chunkdb::LogLevel::kWarn;
         const auto report = chunkdb::server_bench::Run(args);
         assert(report.results.size() == 3U);
@@ -1020,7 +1066,7 @@ void TestEnabledBenchmarkOptions() {
     for (const auto mode : {"ordinary", "progress", "filtered", "chunks"}) {
         auto args = chunkdb::server_bench::ParseArgs({"bench", "--watch", "default", "--watch-mode", mode});
         args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
-        args.port = chunkdb::test::PickListenerPort(); args.clients = 1; args.requests = 10; args.keyspace = 16;
+        args.port = 0; args.clients = 1; args.requests = 10; args.keyspace = 16;
         args.tests = {chunkdb::server_bench::Scenario::kSimulation};
         args.log_level = chunkdb::LogLevel::kWarn;
         const auto report = chunkdb::server_bench::Run(args);
@@ -1033,14 +1079,14 @@ void TestEnabledBenchmarkOptions() {
     }
     auto args = chunkdb::server_bench::ParseArgs({"bench", "--clients", "1", "--tests", "takeover"});
     args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
-    args.port = chunkdb::test::PickListenerPort(); args.requests = 3; args.log_level = chunkdb::LogLevel::kWarn;
+    args.port = 0; args.requests = 3; args.log_level = chunkdb::LogLevel::kWarn;
     const auto report = chunkdb::server_bench::Run(args);
     const auto& result = report.results.front();
     assert(result.ownership_cycles == 3U && result.completed_requests == 6U);
     assert(result.completed_blocks == 0U && result.response_bytes > 0U);
     assert(result.request_mix == (std::vector<std::pair<std::string, std::size_t>>{{"hello", 3}, {"watch_takeover", 3}}));
     assert(chunkdb::server_bench::RenderJsonReport(report).find("ownership_cycles_s") != std::string::npos);
-    args.user = "bench"; args.password = "test-password"; args.port = chunkdb::test::PickListenerPort(); args.requests = 1;
+    args.user = "bench"; args.password = "test-password"; args.port = 0; args.requests = 1;
     const auto authenticated = chunkdb::server_bench::Run(args);
     assert(authenticated.results.front().ownership_cycles == 1U && authenticated.results.front().completed_requests == 3U);
     assert(authenticated.results.front().request_mix.back() == (std::pair<std::string, std::size_t>{"auth", 1U}));
@@ -1067,13 +1113,15 @@ std::optional<chunkdb::server_bench::BenchmarkReport> TestScriptedWatch(
                        const std::string& slow_phase = "", const std::string& delivery = "strict") {
     ScopedSocketPlatform platform;
     (void)platform;
-    const auto port = chunkdb::test::PickListenerPort();
     struct Owner { SocketHandle fd; ~Owner() { CloseSocket(fd); } } listener{socket(AF_INET, SOCK_STREAM, 0)};
     assert(listener.fd != kInvalidSocket);
     sockaddr_in address{}; address.sin_family = AF_INET; address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    address.sin_port = htons(port);
+    address.sin_port = 0;  // A free port the system picks.
     assert(bind(listener.fd, reinterpret_cast<const sockaddr*>(&address), sizeof(address)) == 0);
     assert(listen(listener.fd, 4) == 0);
+    socklen_t length = sizeof(address);
+    assert(getsockname(listener.fd, reinterpret_cast<sockaddr*>(&address), &length) == 0);
+    const std::uint16_t port = ntohs(address.sin_port);
     auto accept_peer = [&] {
         fd_set ready; FD_ZERO(&ready); FD_SET(listener.fd, &ready);
         timeval guard{3, 0};
@@ -1316,6 +1364,7 @@ int main(int argc, char** argv) {
     TestSpawnModeStartsAndStops();
     TestOutputContainsPercentilesAndJsonFields();
     TestIdleClientsNoteWhenRequestsLessThanClients();
+    TestIdleConnections();
     TestParseArgsGridScenariosAndDurability();
     TestGridScenariosAgainstPaddedGeometry();
     TestChunkFormsRetainDescribedStableColumnId();

@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <cassert>
+#include <clocale>
 #include <cmath>
 #include <cstdint>
 #include <cstdio>
@@ -184,6 +185,75 @@ void TestConditionalObjects() {
     ExpectError("DROP TABLE IF NOT EXISTS t", "expected EXISTS");
     const auto migration = Get<cql::Migrate>("MIGRATE 'init' CREATE TABLE IF NOT EXISTS t (a u8) CHUNK 4 x 4");
     assert(std::get<cql::CreateTable>(migration.statement).if_not_exists);
+    ExpectError("CREATE TABLE IF EXISTS t (a u8) CHUNK 4 x 4", "expected NOT, got 'EXISTS'");
+}
+
+// IF starts IF [NOT] EXISTS only when NOT or EXISTS follows, so `if` is a
+// name everywhere else.
+void TestIfAsName() {
+    const auto table = Get<cql::CreateTable>("CREATE TABLE if (if u8) CHUNK 4 x 4");
+    assert(table.table == "if" && !table.if_not_exists && table.columns.at(0).name == "if");
+    const auto guarded = Get<cql::CreateTable>("CREATE TABLE IF NOT EXISTS if (a u8) CHUNK 4 x 4");
+    assert(guarded.table == "if" && guarded.if_not_exists);
+    const auto drop = Get<cql::DropTable>("DROP TABLE if");
+    assert(drop.table == "if" && !drop.if_exists);
+    const auto dropped = Get<cql::DropTable>("DROP TABLE IF EXISTS if");
+    assert(dropped.table == "if" && dropped.if_exists);
+    const auto alter = Get<cql::AlterTable>("ALTER TABLE if DROP COLUMN if");
+    assert(alter.table == "if");
+    const auto& column = std::get<cql::DropColumn>(alter.change);
+    assert(column.column == "if" && !column.if_exists);
+    const auto guarded_column = std::get<cql::DropColumn>(Get<cql::AlterTable>("ALTER TABLE t DROP COLUMN IF EXISTS if").change);
+    assert(guarded_column.column == "if" && guarded_column.if_exists);
+    const auto added = std::get<cql::AddColumn>(Get<cql::AlterTable>("ALTER TABLE t ADD COLUMN if u8").change);
+    assert(added.column.name == "if" && !added.if_not_exists);
+    const auto check = std::get<cql::DropCheck>(Get<cql::AlterTable>("ALTER TABLE t DROP CHECK if").change);
+    assert(check.name == "if" && !check.if_exists);
+    assert(std::get<cql::DropCheck>(Get<cql::AlterTable>("ALTER TABLE t DROP CHECK IF EXISTS if").change).if_exists);
+    const auto user = Get<cql::CreateUser>("CREATE USER if VERIFIER $1", 1);
+    assert(user.user == "if" && !user.if_not_exists);
+    const auto drop_user = Get<cql::DropUser>("DROP USER if");
+    assert(drop_user.user == "if" && !drop_user.if_exists);
+    assert(Get<cql::DropUser>("DROP USER IF EXISTS if").if_exists);
+    ExpectError("DROP TABLE if if", "expected the end of the statement, got 'if'");
+}
+
+// Trailing options in any order, each at most once.
+void TestOptionOrder() {
+    const auto block = Get<cql::GetBlock>("GET BLOCK 0 0 FROM t WITH VERSION COLUMNS a, b WITH SCHEMA");
+    assert(block.with_version && block.with_schema && block.columns == (std::vector<std::string>{"a", "b"}));
+    const auto schema_first = Get<cql::GetBlock>("GET BLOCK 0 0 FROM t WITH SCHEMA COLUMNS a");
+    assert(schema_first.with_schema && !schema_first.with_version && schema_first.columns == std::vector<std::string>{"a"});
+    ExpectError("GET BLOCK 0 0 FROM t COLUMNS a WITH VERSION COLUMNS b", "COLUMNS is given twice");
+    ExpectError("GET BLOCK 0 0 FROM t WITH VERSION COLUMNS a WITH VERSION", "WITH VERSION is given twice");
+
+    const auto area = Get<cql::GetArea>("GET AREA 0 0 TO 2 2 FROM t LIMIT 3 COLUMNS a WITH SCHEMA AFTER 1 1");
+    assert(area.limit == 3U && area.with_schema && area.after.has_value() && area.columns == std::vector<std::string>{"a"});
+    const auto around = Get<cql::GetArea>("GET AREA AROUND 0 0 RADIUS 1 FROM t SCALE 2 USING MAX COLUMNS a, b");
+    assert(around.scale.has_value() && around.columns == (std::vector<std::string>{"a", "b"}));
+    ExpectError("GET AREA 0 0 TO 2 2 FROM t COLUMNS a LIMIT 1 COLUMNS b", "COLUMNS is given twice");
+
+    const auto slots = Get<cql::ShowSlots>("SHOW SLOTS PREFIX 'feed_' ON t");
+    assert(slots.table == std::optional<std::string>("t") && slots.prefix == std::optional<std::string>("feed_"));
+    const auto on = Get<cql::ShowSlots>("SHOW SLOTS ON t PREFIX 'feed_'");
+    assert(on.table == std::optional<std::string>("t") && on.prefix == std::optional<std::string>("feed_"));
+    ExpectError("SHOW SLOTS ON t ON u", "ON is given twice");
+    ExpectError("SHOW SLOTS PREFIX 'a' ON t PREFIX 'b'", "PREFIX is given twice");
+
+    const auto user = Get<cql::CreateUser>("CREATE USER bot VERIFIER $1 REQUIRE CHANNEL BINDING MANAGES USERS", 1);
+    assert(user.manages_users && user.requires_channel_binding);
+    ExpectError("CREATE USER bot VERIFIER $1 MANAGES USERS REQUIRE CHANNEL BINDING MANAGES USERS", "MANAGES USERS is given twice");
+    ExpectError("CREATE USER bot VERIFIER $1 REQUIRE CHANNEL BINDING REQUIRE CHANNEL BINDING", "REQUIRE CHANNEL BINDING is given twice");
+}
+
+// Error text stays ASCII: control bytes and bytes of 0x80 and above are
+// escaped.
+void TestErrorTextEscapes() {
+    ExpectError("GET BLOCK 0 0 FROM t \xc3\xa9", "column 22: unexpected '\\xc3'");
+    ExpectError("GET BLOCK 0 0 FROM t \xff", "unexpected '\\xff'");
+    ExpectError("GET BLOCK 0 0 FROM t \x7f", "unexpected '\\x7f'");
+    ExpectError("GET BLOCK 0 0 FROM 'caf\xc3\xa9'", "got 'caf\\xc3\\xa9'");
+    ExpectError("GET BLOCK 0 0 FROM t~", "unexpected '~'");
 }
 
 void TestDefaultChunkGeometry() {
@@ -297,6 +367,20 @@ void TestChunkAndAreaStatements() {
     ExpectError("GET AREA 0 0 TO 2 2 FROM t LIMIT -1", "a limit must be between 0");
 }
 
+// Float literals read '.' whatever the process locale.
+void TestFloatLocale() {
+    const char* previous = std::setlocale(LC_NUMERIC, nullptr);
+    const std::string saved = previous != nullptr ? previous : "C";
+    for (const char* name : {"de_DE.UTF-8", "de_DE.utf8", "fr_FR.UTF-8", "ru_RU.UTF-8"}) {
+        if (std::setlocale(LC_NUMERIC, name) != nullptr) break;
+    }
+    const cql::Literal half = ValueOf("1.5");
+    const cql::Literal small = ValueOf("-2.5e-310");
+    std::setlocale(LC_NUMERIC, saved.c_str());
+    assert(half == cql::Literal(1.5));
+    assert(small == cql::Literal(-2.5e-310));
+}
+
 void TestLiterals() {
     assert(ValueOf("-12") == cql::Literal(cql::Integer{.negative = true, .magnitude = 12}));
     assert(ValueOf("-0") == cql::Literal(cql::Integer{.negative = false, .magnitude = 0}));
@@ -311,7 +395,15 @@ void TestLiterals() {
     assert(ValueOf("-INF") == cql::Literal(-std::numeric_limits<double>::infinity()));
     assert(std::isnan(std::get<double>(ValueOf("NaN"))));
     ExpectError("SET BLOCK 0 0 IN t a = 1.2.3", "is not a number");
-    ExpectError("SET BLOCK 0 0 IN t a = 1e999", "is not a number");
+    ExpectError("SET BLOCK 0 0 IN t a = 1e999", "1e999 is beyond the f64 range");
+    ExpectError("SET BLOCK 0 0 IN t a = -1e999", "column 25: 1e999 is beyond the f64 range");
+    // The nearest f64: subnormal values are kept, and smaller ones are zero.
+    assert(ValueOf("1e-310") == cql::Literal(1e-310));
+    assert(ValueOf("4.9406564584124654e-324") == cql::Literal(std::numeric_limits<double>::denorm_min()));
+    assert(ValueOf("2.2250738585072014e-308") == cql::Literal(std::numeric_limits<double>::min()));
+    assert(ValueOf("1.7976931348623157e308") == cql::Literal(std::numeric_limits<double>::max()));
+    assert(ValueOf("1e-400") == cql::Literal(0.0));
+    assert(ValueOf("-1e-400") == cql::Literal(0.0));
 
     assert(ValueOf("TRUE") == cql::Literal(true));
     assert(ValueOf("false") == cql::Literal(false));
@@ -593,7 +685,7 @@ void TestWatch() {
     ExpectError("SHOW SLOTS ON world extra", "expected the end");
     ExpectError("SHOW SLOTS PREFIX con", "quoted slot name");
     ExpectError("SHOW SLOTS PREFIX ''", "slot names must match");
-    ExpectError("SHOW SLOTS PREFIX 'con' ON world", "expected the end");
+    assert(Get<cql::ShowSlots>("SHOW SLOTS PREFIX 'con' ON world").table == std::optional<std::string>("world"));
     ExpectError("UNWATCH extra", "expected the end");
 }
 // CHECK in CREATE TABLE (a column's and the table's), ADD CHECK and DROP
@@ -837,12 +929,16 @@ int main() {
     TestUnorderedOptions();
     TestStatementSuggestions();
     TestConditionalObjects();
+    TestIfAsName();
+    TestOptionOrder();
+    TestErrorTextEscapes();
     TestBlockStatements();
     TestBlockExpressions();
     TestBlockReturning();
     TestChunkAndAreaStatements();
     TestAggregate();
     TestLiterals();
+    TestFloatLocale();
     TestParameters();
     TestCreateTable();
     TestAlterAndOtherStatements();

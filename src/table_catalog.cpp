@@ -738,6 +738,14 @@ Table::FeedCounts Table::CountFeeds(const Lease& lease) const {
     return FeedCounts{.slots = lease.store().feed_slots_->size(), .watches = feed_subscriptions_};
 }
 
+bool Table::SlotFrontierFrozen(const Lease& lease) const {
+    if (lease.table_ != this) throw std::logic_error("slot frontier state needs a lease of its table");
+    // FeedSlots::SyncImpl refuses a fail-closed store, and the slot worker stops.
+    const auto& store = lease.store();
+    return store.feed_slots_active_.load(std::memory_order_acquire) &&
+           store.durability_poisoned_.load(std::memory_order_acquire);
+}
+
 std::vector<std::uint32_t> Table::ResolveFeedColumns(const std::vector<std::string>& names) {
     auto lease = Acquire();
     if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
@@ -1333,7 +1341,10 @@ void TableCatalog::RemoveInterruptedOperations(std::string_view table) {
         const std::filesystem::directory_iterator end;
         std::vector<std::filesystem::path> leftovers;
         for (; !ec && it != end; it.increment(ec)) {
-            if (it->path().filename().string().starts_with(prefix)) leftovers.push_back(it->path());
+            const auto name = it->path().filename().string();
+            // A RESTORE TABLE still copying into this name keeps its staging.
+            if (dir == StagingDir() && restore_staging_.contains(name)) continue;
+            if (name.starts_with(prefix)) leftovers.push_back(it->path());
         }
         if (ec) {
             throw std::runtime_error("cannot list " + dir.string() + ": " + ec.message());
@@ -1367,6 +1378,10 @@ struct TableCatalog::FoundTable {
     std::filesystem::path dir;
     StoreManifest manifest;
     TableOptions options;
+    // A narrowing or ADD CHECK a crash interrupted, dropped from `manifest`
+    // and published by PublishDroppedPending.
+    bool dropped_pending = false;
+    bool dropped_check = false;
 };
 
 void TableCatalog::OpenExistingTables() {
@@ -1406,33 +1421,43 @@ void TableCatalog::OpenExistingTables() {
     }
     if (!mismatches.empty()) throw std::runtime_error(OptionMismatchMessage(mismatches));
 
+    for (const auto& table : tables) PublishDroppedPending(table);
     for (auto& table : tables) tables_.emplace(table.name, OpenFoundTable(table));
 }
 
 TableCatalog::FoundTable TableCatalog::ReadTableToOpen(const std::string& name, const std::filesystem::path& dir) {
     auto manifest = ReadOpenableManifest(dir);
     const TableOptions options = DecodeTableOptions(manifest.options);
+    bool dropped_pending = false;
+    bool dropped_check = false;
     if (manifest.schema.pending.has_value() && config_.access_mode == AccessMode::kReadWrite) {
         // A narrowing or ADD CHECK a crash interrupted: the schema stays as
         // it was.
-        const bool check = manifest.schema.pending->check.has_value();
+        dropped_pending = true;
+        dropped_check = manifest.schema.pending->check.has_value();
         manifest.schema = WithoutPendingNarrowing(manifest.schema);
-        AtomicWrite(
-            StoreManifestPath(dir), SerializeStoreManifest(manifest), /*fsync_file=*/true,
-            /*fsync_directory=*/true, nullptr, nullptr, /*enable_generic_failpoints=*/false);
-        LogMessage(
-            LogLevel::kWarn,
-            LogComponent::kStore,
-            check ? "dropped an ADD CHECK that did not finish; the table keeps its checks"
-                  : "dropped a column narrowing that did not finish; the table keeps its columns",
-            {{"table", name}});
     }
     return FoundTable{
         .name = name,
         .dir = dir,
         .manifest = std::move(manifest),
         .options = options,
+        .dropped_pending = dropped_pending,
+        .dropped_check = dropped_check,
     };
+}
+
+void TableCatalog::PublishDroppedPending(const FoundTable& table) {
+    if (!table.dropped_pending) return;
+    AtomicWrite(
+        StoreManifestPath(table.dir), SerializeStoreManifest(table.manifest), /*fsync_file=*/true,
+        /*fsync_directory=*/true, nullptr, nullptr, /*enable_generic_failpoints=*/false);
+    LogMessage(
+        LogLevel::kWarn,
+        LogComponent::kStore,
+        table.dropped_check ? "dropped an ADD CHECK that did not finish; the table keeps its checks"
+                            : "dropped a column narrowing that did not finish; the table keeps its columns",
+        {{"table", table.name}});
 }
 
 std::shared_ptr<Table> TableCatalog::OpenFoundTable(FoundTable& table) {
@@ -1704,6 +1729,7 @@ void TableCatalog::RecoverTable(std::string_view name, std::stop_token cancelled
         if (IsDirectory(dir)) {
             auto found = ReadTableToOpen(table_name, dir);
             RequireRecoverableOptions(table_name, found.manifest);
+            PublishDroppedPending(found);
             recovered = OpenFoundTable(found);
         }
     } catch (const std::exception& error) {
@@ -1981,6 +2007,11 @@ void TableCatalog::Drop(std::string_view name, bool if_exists) {
 void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exists) {
     RequireWritable("DROP TABLE");
     auto metadata = LockFeatureMetadataShared();
+    // As RENAME TO: backup metadata capture and pinning exclude a drop, so a
+    // backup holds the table with its grants, or neither.
+    if (!backup_metadata_gate_.lock_shared(StatementStopToken())) CheckStatementCancellation();
+    std::shared_lock backup_metadata(backup_metadata_gate_, std::adopt_lock);
+    CheckStatementCancellation();
     auto table = Find(name);
     if (!table && if_exists) {
         RequireValidTableName(name);

@@ -48,12 +48,12 @@ Lines read before login use a separate 16777216-byte line reserve, so unfinished
 Before login a line and a kept frame take at most 8192 bytes, so each unfinished login holds at most 12288 bytes of line credit and under 10 KiB of frame credit: the reserves hold more than a thousand unfinished logins.
 An idle connection on the I/O owner holds no line credit: a read that buffers nothing returns the credit it took, and a writable reply is not taken for input.
 Replies charge their retained immutable state and encoded buffers against 2147483648 bytes of shared output credit.
-Authentication and control replies use a separate 16777216-byte output reserve.
+Authentication, error and control replies use a separate 16777216-byte output reserve, and SHOW CONNECTIONS listings another of the same size, so slow readers of listings cannot hold the reserve that logins and refusals are answered from.
 Execution reserves a checked conservative state, schema and encoding bound before collecting a large result snapshot.
 Every statement reserves its bounded ordinary reply before execution and may upgrade that reservation before large snapshot capture or backup publication.
 Credit refusal before execution returns BUSY; a reply lost after an irreversible decision closes the connection as an ambiguous outcome instead of claiming a retryable refusal.
 The connection retains that reservation through the final encoded buffer even when the continuation has already finished.
-SHOW CONNECTIONS reserves its complete response ceiling before enumeration and refuses a listing exceeding that ceiling.
+SHOW CONNECTIONS builds its listing on the I/O owner, one at a time and within its response ceiling, then reserves the listing's encoded size from the listing reserve for its write; a listing that reserve cannot hold receives `BUSY reason=reply_budget` instead.
 An ordinary result that cannot obtain output credit refuses snapshot capture and returns BUSY before any response byte.
 Unclassified and reserved control line limits grow only when a larger configured per-line limit requires it.
 

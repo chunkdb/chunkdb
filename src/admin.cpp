@@ -34,6 +34,9 @@ void ResetPassword(const std::filesystem::path& data_dir, const std::string& use
     // Format admission precedes writer-lock and recovery bookkeeping.
     (void)ReadUsersFile(data_dir);
     const auto lock = AcquireWriterLock(data_dir, AccessMode::kReadWrite, /*allow_multiple_processes=*/false);
+    // The reset writes where a read-write open writes, so it admits only what
+    // such an open admits, before recovery changes anything.
+    if (const auto root = ReadDataDirManifest(data_dir)) RequireOpenableFeatures(root->features, AccessMode::kReadWrite);
     // Recovery must precede any verifier change: pending users images must
     // still match their prepared before/after states. The writer lock covers
     // both recovery and the password publication.

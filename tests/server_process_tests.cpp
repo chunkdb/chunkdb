@@ -539,7 +539,7 @@ void TestTlsReloadsOnHangup(const std::string& binary) {
     };
     install("first", "first");
     const auto log = dir.path() / "server.log";
-    ServerProcess server(binary, dir.path() / "data", {"--auth", "none", "--listen-uri", "chunks://127.0.0.1/", "--port", "0",
+    ServerProcess server(binary, dir.path() / "data", {"--auth", "none", "--listen-uri", "chunks://127.0.0.1:0/",
         "--tls-cert", cert.string(), "--tls-key", key.string(), "--log-level", "info"}, log);
     const auto served = [&] {
         return Output("openssl s_client -connect 127.0.0.1:" + std::to_string(server.port()) +

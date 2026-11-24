@@ -9,6 +9,7 @@
 #include <optional>
 
 #include "chunkdb/table_catalog.hpp"
+#include "feed_protocol.hpp"
 
 namespace chunkdb {
 class ChunkServer;
@@ -53,6 +54,8 @@ struct FeedDeliveryTestAccess {
     static std::optional<std::pair<long, long>> SocketTimeouts(ChunkServer& server, std::uint64_t id);
     static void WakeTransport(ChunkServer& server);
     static std::shared_ptr<void> ReserveReplyCredit(ChunkServer& server, std::size_t bytes);
+    // Holds `bytes` of the SHOW CONNECTIONS output reserve.
+    static std::shared_ptr<void> ReserveListingReplyCredit(ChunkServer& server, std::size_t bytes);
     // For a connection the I/O thread holds idle; nullopt when it is gone.
     static std::optional<std::size_t> RequestLineCapacity(ChunkServer& server, std::uint64_t id);
   private:
@@ -156,8 +159,15 @@ class SlotWatch {
     void Finish(std::optional<Output> control);
     bool Work();
     bool FlushAck(bool force);
-    // True when it published a progress frame.
+    // True when it published a progress frame, or the merged pushes before it.
     bool Progress(const FeedSlot& slot);
+    // Publishes or merges `pending_`, which the archive reader already
+    // filtered when `filtered`; false when it waits for room.
+    bool Deliver(bool filtered);
+    // Publishes the merged pushes once no output is unsent; true when none wait.
+    bool FlushMerge();
+    [[nodiscard]] bool Merging() const noexcept { return merged_ != nullptr || !merge_.empty(); }
+    [[nodiscard]] bool Lagging() const { std::lock_guard lock(mutex_); return unsent_ != 0U; }
     void SentAt(std::uint64_t revision, std::chrono::steady_clock::time_point now);
     bool ExpireAckDeadline(std::chrono::steady_clock::time_point now);
     bool AckDeadlineExpiredLocked(std::chrono::steady_clock::time_point now);
@@ -222,6 +232,12 @@ class SlotWatch {
     std::unique_ptr<FeedSubscription> live_;
     std::optional<FeedArchiveReader> archive_;
     std::shared_ptr<const FeedEntry> pending_;
+    // `pending_` holds the chunks push this watch sends.
+    bool projected_ = false;
+    // While output is unsent, a CHUNKS slot merges its pushes here. `merged_`
+    // is their push taken for publication; the merge is then empty.
+    FeedChunksMerge merge_;
+    std::shared_ptr<const FeedEntry> merged_;
     std::optional<Prepared> prepared_;
     std::chrono::steady_clock::time_point next_progress_;
 };
