@@ -1,4 +1,5 @@
 #include "docs_check.hpp"
+#include "listener_port_test_utils.hpp"
 
 #include <algorithm>
 #include <array>
@@ -1143,24 +1144,6 @@ class Shell {
     Reader reader_;
 };
 
-int ReservePort() {
-    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
-    if (fd < 0) throw std::runtime_error(std::string("socket: ") + std::strerror(errno));
-    sockaddr_in address{};
-    address.sin_family = AF_INET;
-    address.sin_port = 0;
-    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    socklen_t length = sizeof(address);
-    if (::bind(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0 ||
-        ::getsockname(fd, reinterpret_cast<sockaddr*>(&address), &length) != 0) {
-        const int error = errno;
-        ::close(fd);
-        throw std::runtime_error(std::string("bind: ") + std::strerror(error));
-    }
-    ::close(fd);
-    return ntohs(address.sin_port);
-}
-
 // TMPDIR, TEMP or TMP, else /tmp.
 std::string TempRoot() {
     for (const char* name : {"TMPDIR", "TEMP", "TMP"}) {
@@ -1200,7 +1183,7 @@ class Fixture {
   public:
     Fixture(const fs::path& server, const fs::path& cli, const std::string& directory)
         : cli_(cli), env_(CurrentEnvironment()) {
-        const std::string port = std::to_string(ReservePort());
+        const std::string port = std::to_string(chunkdb::test::PickListenerPort());
         env_["CHUNKDB_ADMIN_USER"] = "admin";
         env_["CHUNKDB_ADMIN_PASSWORD"] = "docs-fixture-private-password";
         env_["CHUNKDB_PASSWORD"] = env_["CHUNKDB_ADMIN_PASSWORD"];

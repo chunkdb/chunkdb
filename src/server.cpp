@@ -220,6 +220,11 @@ void ChunkServer::JoinWorkers() {
 
 void ChunkServer::Run() {
     const auto run_started = std::chrono::steady_clock::now();
+    const auto note_run_failed = [this] {
+        { std::lock_guard lock(lifecycle_mutex_); run_failed_ = true; }
+        listening_cv_.notify_all();
+    };
+    { std::lock_guard lock(lifecycle_mutex_); run_failed_ = false; }
 #ifndef _WIN32
     // A write to a connection the peer has reset raises SIGPIPE, whose
     // default action ends the process; TLS writes go through OpenSSL's
@@ -238,6 +243,7 @@ void ChunkServer::Run() {
             LogComponent::kServer,
             "server runtime initialization failed",
             {{"error", "WSAStartup failed"}});
+        note_run_failed();
         throw std::runtime_error("WSAStartup failed");
     }
 #endif
@@ -249,6 +255,7 @@ void ChunkServer::Run() {
             listen_socket_ = static_cast<decltype(listen_socket_)>(listen_socket);
             backup_stop_ = std::stop_source{};
         }
+        listening_cv_.notify_all();
         running_.store(true);
 
         StartWorkers();
@@ -400,6 +407,7 @@ void ChunkServer::Run() {
             LogComponent::kServer,
             "server run loop failed",
             {{"error", e.what()}});
+        note_run_failed();
         (void)StopRunning();
         RequestBackupStop();
         (void)ShutdownActiveClients();
@@ -434,6 +442,12 @@ std::size_t ChunkServer::HandshakesInProgressForTests(const std::string& source)
     std::lock_guard lock(handshakes_mutex_);
     const auto it = handshakes_.find(source);
     return it == handshakes_.end() ? 0U : it->second;
+}
+
+bool ChunkServer::WaitListeningForTests(std::chrono::milliseconds timeout) {
+    std::unique_lock lock(lifecycle_mutex_);
+    (void)listening_cv_.wait_for(lock, timeout, [&] { return run_failed_ || listen_socket_ != kInvalidSocket; });
+    return !run_failed_ && listen_socket_ != kInvalidSocket;
 }
 
 void ChunkServer::ReleaseHandshake(const std::string& source) noexcept {
