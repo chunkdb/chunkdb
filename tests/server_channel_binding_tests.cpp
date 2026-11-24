@@ -49,7 +49,7 @@ void ExpectLoggedIn(const Reply& reply) {
 // A TLS server with the user admin (password secret).
 class Server {
   public:
-    std::uint16_t port = FreePort();
+    std::uint16_t port = test::PickListenerPort();
 
     explicit Server(bool require_channel_binding = false) {
         catalog_ = std::make_shared<TableCatalog>(feed_test::Config(std::filesystem::canonical(directory_.path())));
@@ -72,26 +72,28 @@ class Server {
         server_config.tls_cert_path = cert.string();
         server_config.tls_key_path = key.string();
         server_ = std::make_unique<ChunkServer>(server_config, engine_);
-        thread_ = std::thread([this] { server_->Run(); });
-        // The listener is up once a TLS handshake completes.
-        const auto deadline = Clock::now() + 10s;
-        while (true) {
-            try {
-                Client probe(port, true);
-                break;
-            } catch (const std::runtime_error&) {
-                if (Clock::now() >= deadline) {
-                    server_->Stop();
-                    thread_.join();
-                    throw;
-                }
-                std::this_thread::sleep_for(10ms);
-            }
+        thread_ = std::thread([this] {
+            try { server_->Run(); }
+            catch (const std::exception&) { error_ = std::current_exception(); }
+        });
+        // Run reports its own listener, so the probe never reaches another
+        // socket on this port; a failed Run ends the wait at once.
+        try {
+            if (!server_->WaitListeningForTests(10s)) throw std::runtime_error("server did not start listening in time");
+            // The server is ready once a TLS handshake completes.
+            Client probe(port, true);
+        } catch (const std::exception&) {
+            server_->Stop();
+            thread_.join();
+            // Report the server's own error, such as a port already in use.
+            if (error_) std::rethrow_exception(error_);
+            throw;
         }
     }
     ~Server() {
         server_->Stop();
         thread_.join();
+        assert(!error_ && "the server Run failed after startup");
     }
 
     // Lets a client try `password` for admin: the test login derives keys
@@ -115,6 +117,8 @@ class Server {
     std::shared_ptr<CommandEngine> engine_;
     std::unique_ptr<ChunkServer> server_;
     std::thread thread_;
+    // Set by the server thread, read after it is joined.
+    std::exception_ptr error_;
 };
 
 // Ends the TLS connections it accepts with a certificate of its own and

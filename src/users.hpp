@@ -35,7 +35,13 @@ enum class Right : std::uint8_t {
 inline constexpr const char* kEveryTable = "*";
 
 struct User {
+    // The older verifier while the user has two.
     scram::Verifier verifier;
+    // A verifier added by ALTER USER ... ADD VERIFIER: the user logs in with
+    // either until DROP OLD VERIFIER makes it the only one. It shares the salt
+    // and iteration count of `verifier`, which the server sends before the
+    // client proves its password.
+    std::optional<scram::Verifier> added_verifier{};
     bool manages_users = false;
     // Only logins bound to their TLS connection are accepted for this user.
     bool requires_channel_binding = false;
@@ -68,9 +74,16 @@ void RequireValidGrantTable(std::string_view table);
 // The same from grants alone.
 [[nodiscard]] std::optional<Right> RightOn(const std::map<std::string, Right>& grants, const std::string& table);
 
+// Whether `verifier` is one of the verifiers of `user`.
+[[nodiscard]] bool HoldsVerifier(const User& user, const scram::Verifier& verifier) noexcept;
+// Throws std::invalid_argument unless `added` can be added to a user whose
+// verifier is `verifier`: the same salt and iteration count, and other keys.
+void RequireAddableVerifier(const scram::Verifier& verifier, const scram::Verifier& added);
+
 // Throws std::invalid_argument for a field that does not fit the file: a
-// verifier salt outside scram::kMinSaltBytes..scram::kMaxSaltBytes, a name
-// over 65535 bytes, or a count over 2^32 - 1.
+// verifier salt outside scram::kMinSaltBytes..scram::kMaxSaltBytes, an added
+// verifier with another salt or iteration count, a name over 65535 bytes, or
+// a count over 2^32 - 1.
 [[nodiscard]] std::vector<std::uint8_t> EncodeUsers(const Users& users);
 // Throws std::invalid_argument naming the defect: a damaged, truncated or
 // unknown file, or a user name, grant table name, iteration count or salt

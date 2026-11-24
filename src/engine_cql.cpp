@@ -23,6 +23,7 @@
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunk_form.hpp"
+#include "chunk_scale.hpp"
 #include "typed_chunk_form.hpp"
 #include "area_cursor.hpp"
 #include "sectioned_chunk_form.hpp"
@@ -768,6 +769,13 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
                 info.verb = "ALTER USER";
                 info.audit_event = "alter_user";
                 info.target_user = alter.user;
+                // The same order as the statement runs its forms.
+                info.change = alter.verifier ? "verifier"
+                    : alter.added_verifier ? "add_verifier"
+                    : alter.drop_old_verifier ? "drop_old_verifier"
+                    : alter.max_connections || alter.statements_per_sec ? "limit"
+                    : alter.requires_channel_binding ? "requires_channel_binding"
+                    : "manages_users";
             },
             [&](const cql::DropUser& drop) {
                 info.verb = "DROP USER";
@@ -1625,6 +1633,11 @@ std::string CommandEngine::ExecuteStatement(
                     RequireDimensions(store.geometry(), get.dims);
                     const auto& layout = store.geometry().layout();
                     const auto columns = ColumnsOf(layout, get.columns);
+                    // A downsampled read checks its factor and column types before any chunk is read.
+                    const std::optional<Geometry> scaled = get.scale
+                        ? std::optional<Geometry>(ScaledGeometry(store.geometry(), *get.scale, columns)) : std::nullopt;
+                    const Geometry& form_geometry = scaled ? *scaled : store.geometry();
+                    const ChunkFormScale* scale = get.scale ? &*get.scale : nullptr;
                     const ChunkAreaSelector selector{.dims = get.dims, .first = {get.x0, get.y0, get.z0},
                         .last = {get.x1, get.y1, get.z1}, .around = get.around, .radius = get.radius};
                     const bool paged = get.limit.has_value() || get.after.has_value();
@@ -1682,10 +1695,11 @@ std::string CommandEngine::ExecuteStatement(
                                 Protocol::AppendInteger(row.text, coord.y);
                                 if (get.dims == 3U) Protocol::AppendInteger(row.text, coord.z);
                                 const bool private_state = session.transaction != nullptr && session.transaction->writes.contains(coord);
-                                const ChunkState state{.version = entry->version, .payload = std::move(entry->payload),
+                                ChunkState state{.version = entry->version, .payload = std::move(entry->payload),
                                     .presence_bitmap = std::move(entry->presence_bitmap), .vars = std::move(entry->vars), .written = true,
                                     .commit_time_ms = entry->commit_time_ms, .chunk_columns = std::move(entry->chunk_columns)};
-                                const auto form_size = SectionedChunkStateBytes(store.geometry(), state, kVarMaxChunkBytesLimit, columns);
+                                if (scaled) state = ScaleChunkState(store.geometry(), *scaled, *scale, columns, state);
+                                const auto form_size = SectionedChunkStateBytes(form_geometry, state, kVarMaxChunkBytesLimit, columns, scale);
                                 const auto bulk_overhead = 5U + std::to_string(form_size).size();
                                 if (row.text.size() + bulk_overhead > row_budget ||
                                     form_size > row_budget - row.text.size() - bulk_overhead) {
@@ -1694,8 +1708,8 @@ std::string CommandEngine::ExecuteStatement(
                                         single_prefix.size() + next_suffix.size() + row.text.size() + bulk_overhead + form_size);
                                 }
                                 const auto form_bound = row_budget - row.text.size();
-                                row.body = EncodeSectionedChunkState(store.geometry(), state, kVarMaxChunkBytesLimit,
-                                    columns, private_state, form_bound);
+                                row.body = EncodeSectionedChunkState(form_geometry, state, kVarMaxChunkBytesLimit,
+                                    columns, private_state, form_bound, scale);
                                 row_bytes = row.text.size() + 5U + std::to_string(row.body.size()).size() + row.body.size();
                                 if (row_bytes > row_budget) throw too_large();
                             }
@@ -2189,22 +2203,28 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::AlterUser& alter) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
-                    if (alter.verifier.has_value()) {
+                    if (alter.verifier.has_value() || alter.added_verifier.has_value() || alter.drop_old_verifier) {
+                        const auto verifier = [&] {
+                            return VerifierFrom(alter.verifier ? *alter.verifier : *alter.added_verifier, parameters);
+                        };
                         // A user may change their own password: the incarnation
                         // it logged in as, not a user created again under its name.
                         if (config_.require_auth && alter.user == session.user) {
-                            if (!config_.users->SetOwnVerifier(alter.user, session.user_incarnation,
-                                    VerifierFrom(*alter.verifier, parameters))) {
+                            const std::uint64_t incarnation = session.user_incarnation;
+                            const bool current = alter.verifier
+                                ? config_.users->SetOwnVerifier(alter.user, incarnation, verifier())
+                                : alter.added_verifier ? config_.users->AddOwnVerifier(alter.user, incarnation, verifier())
+                                : config_.users->DropOwnOldVerifier(alter.user, incarnation);
+                            if (!current) {
                                 session.close_after_reply = true;
                                 throw UserDroppedError();
                             }
                             return Protocol::SimpleString("OK");
                         }
                         RequireManagesUsers(session);
-                        if (config_.users == nullptr) {
-                            throw std::invalid_argument("this server runs without users (--auth none)");
-                        }
-                        config_.users->SetVerifier(alter.user, VerifierFrom(*alter.verifier, parameters));
+                        if (alter.verifier) config_.users->SetVerifier(alter.user, verifier());
+                        else if (alter.added_verifier) config_.users->AddVerifier(alter.user, verifier());
+                        else config_.users->DropOldVerifier(alter.user);
                     } else if (alter.max_connections || alter.statements_per_sec) {
                         RequireManagesUsers(session);
                         config_.users->SetLimits(alter.user, alter.max_connections, alter.statements_per_sec);
@@ -2240,13 +2260,15 @@ std::string CommandEngine::ExecuteStatement(
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, users.users.size());
                     for (const auto& [name, user] : users.users) {
-                        Protocol::AppendMapHeader(reply, 4);
+                        Protocol::AppendMapHeader(reply, 5);
                         Protocol::AppendBulk(reply, "name");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "manages_users");
                         Protocol::AppendBoolean(reply, user.manages_users);
                         Protocol::AppendBulk(reply, "requires_channel_binding");
                         Protocol::AppendBoolean(reply, user.requires_channel_binding);
+                        Protocol::AppendBulk(reply, "verifiers");
+                        Protocol::AppendInteger(reply, std::uint64_t{user.added_verifier ? 2U : 1U});
                         Protocol::AppendBulk(reply, "grants");
                         Protocol::AppendMapHeader(reply, user.grants.size());
                         for (const auto& [table, right] : user.grants) {

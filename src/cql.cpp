@@ -923,6 +923,21 @@ class Parser {
                         if (Point(coord.x, coord.y, coord.z, true) != get.dims)
                             Fail(column, "AREA cursor has different dimensions");
                         get.after = coord;
+                    } else if (Accept("scale")) {
+                        if (get.scale) Fail(column, "SCALE is given twice");
+                        ChunkFormScale scale;
+                        const auto factor = Peek().column;
+                        scale.factor = static_cast<std::uint32_t>(Unsigned("a scale", std::numeric_limits<std::uint32_t>::max()));
+                        if (scale.factor == 0U) Fail(factor, "a scale must be positive");
+                        Expect("using");
+                        const auto reduction = Peek().column;
+                        if (Accept("max")) scale.reduction = ChunkFormReduction::kMax;
+                        else if (Accept("min")) scale.reduction = ChunkFormReduction::kMin;
+                        else if (Accept("mode")) scale.reduction = ChunkFormReduction::kMode;
+                        else if (Accept("first")) scale.reduction = ChunkFormReduction::kFirst;
+                        else if (Accept("any")) scale.reduction = ChunkFormReduction::kAny;
+                        else Fail(reduction, "expected MAX, MIN, MODE, FIRST or ANY, got " + Quote(Peek()));
+                        get.scale = scale;
                     } else break;
                 }
                 return get;
@@ -1063,6 +1078,13 @@ class Parser {
                 alter.user = Name("a user name");
                 if (Accept("verifier")) {
                     alter.verifier = Verifier();
+                } else if (Accept("add")) {
+                    Expect("verifier");
+                    alter.added_verifier = Verifier();
+                } else if (Accept("drop")) {
+                    Expect("old");
+                    Expect("verifier");
+                    alter.drop_old_verifier = true;
                 } else if (Accept("limit")) {
                     do {
                         const auto column = Peek().column;
