@@ -21,6 +21,7 @@
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunk_form.hpp"
+#include "chunk_scale.hpp"
 #include "typed_chunk_form.hpp"
 #include "area_cursor.hpp"
 #include "sectioned_chunk_form.hpp"
@@ -1581,6 +1582,11 @@ std::string CommandEngine::ExecuteStatement(
                     RequireDimensions(store.geometry(), get.dims);
                     const auto& layout = store.geometry().layout();
                     const auto columns = ColumnsOf(layout, get.columns);
+                    // A downsampled read checks its factor and column types before any chunk is read.
+                    const std::optional<Geometry> scaled = get.scale
+                        ? std::optional<Geometry>(ScaledGeometry(store.geometry(), *get.scale, columns)) : std::nullopt;
+                    const Geometry& form_geometry = scaled ? *scaled : store.geometry();
+                    const ChunkFormScale* scale = get.scale ? &*get.scale : nullptr;
                     const ChunkAreaSelector selector{.dims = get.dims, .first = {get.x0, get.y0, get.z0},
                         .last = {get.x1, get.y1, get.z1}, .around = get.around, .radius = get.radius};
                     const bool paged = get.limit.has_value() || get.after.has_value();
@@ -1638,10 +1644,11 @@ std::string CommandEngine::ExecuteStatement(
                                 Protocol::AppendInteger(row.text, coord.y);
                                 if (get.dims == 3U) Protocol::AppendInteger(row.text, coord.z);
                                 const bool private_state = session.transaction != nullptr && session.transaction->writes.contains(coord);
-                                const ChunkState state{.version = entry->version, .payload = std::move(entry->payload),
+                                ChunkState state{.version = entry->version, .payload = std::move(entry->payload),
                                     .presence_bitmap = std::move(entry->presence_bitmap), .vars = std::move(entry->vars), .written = true,
                                     .commit_time_ms = entry->commit_time_ms, .chunk_columns = std::move(entry->chunk_columns)};
-                                const auto form_size = SectionedChunkStateBytes(store.geometry(), state, kVarMaxChunkBytesLimit, columns);
+                                if (scaled) state = ScaleChunkState(store.geometry(), *scaled, *scale, columns, state);
+                                const auto form_size = SectionedChunkStateBytes(form_geometry, state, kVarMaxChunkBytesLimit, columns, scale);
                                 const auto bulk_overhead = 5U + std::to_string(form_size).size();
                                 if (row.text.size() + bulk_overhead > row_budget ||
                                     form_size > row_budget - row.text.size() - bulk_overhead) {
@@ -1650,8 +1657,8 @@ std::string CommandEngine::ExecuteStatement(
                                         single_prefix.size() + next_suffix.size() + row.text.size() + bulk_overhead + form_size);
                                 }
                                 const auto form_bound = row_budget - row.text.size();
-                                row.body = EncodeSectionedChunkState(store.geometry(), state, kVarMaxChunkBytesLimit,
-                                    columns, private_state, form_bound);
+                                row.body = EncodeSectionedChunkState(form_geometry, state, kVarMaxChunkBytesLimit,
+                                    columns, private_state, form_bound, scale);
                                 row_bytes = row.text.size() + 5U + std::to_string(row.body.size()).size() + row.body.size();
                                 if (row_bytes > row_budget) throw too_large();
                             }
