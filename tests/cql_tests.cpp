@@ -409,6 +409,28 @@ void TestAlterAndOtherStatements() {
     const auto cut = std::get<cql::AlterColumnType>(Get<cql::AlterTable>("ALTER TABLE t ALTER COLUMN s TYPE text(4) USING TRUNCATE").change);
     assert(cut.conversion == Conversion::kTruncate);
     ExpectError("ALTER TABLE t ALTER COLUMN a TYPE u4 USING ROUND", "expected CLAMP, DEFAULT or TRUNCATE");
+    using Change = cql::AlterColumnAttribute::Change;
+    const auto attribute = [](const std::string& line) { return std::get<cql::AlterColumnAttribute>(Get<cql::AlterTable>(line).change); };
+    const auto set_default = attribute("ALTER TABLE t ALTER COLUMN a SET DEFAULT 7");
+    assert(set_default.column == "a" && set_default.change == Change::kSetDefault &&
+           set_default.value == cql::Literal(cql::Integer{.negative = false, .magnitude = 7}));
+    assert(attribute("alter table t alter column s set default 'x'").value == cql::Literal(cql::Text{.value = "x"}));
+    assert(attribute("ALTER TABLE t ALTER COLUMN a DROP DEFAULT").change == Change::kDropDefault);
+    assert(!attribute("ALTER TABLE t ALTER COLUMN a DROP DEFAULT").value.has_value());
+    assert(attribute("ALTER TABLE t ALTER COLUMN a SET NULL").change == Change::kSetNull);
+    assert(attribute("ALTER TABLE t ALTER COLUMN a DROP NULL").change == Change::kDropNull);
+    assert(attribute("ALTER TABLE t ALTER COLUMN a SET REQUIRED").change == Change::kSetRequired);
+    assert(attribute("ALTER TABLE t ALTER COLUMN a DROP REQUIRED").change == Change::kDropRequired);
+    ExpectError("ALTER TABLE t ALTER COLUMN a SET DEFAULT $1", "parameters are values of SET BLOCK and SET CHUNK");
+    ExpectError("ALTER TABLE t ALTER COLUMN a SET UNIQUE", "expected DEFAULT, NULL or REQUIRED, got 'UNIQUE'");
+    ExpectError("ALTER TABLE t ALTER COLUMN a DROP NULL NOW", "expected the end of the statement");
+    ExpectError("ALTER TABLE t ALTER COLUMN a WIDEN", "expected TYPE, SET or DROP, got 'WIDEN'");
+    assert(std::get<cql::RenameTable>(Get<cql::AlterTable>("ALTER TABLE t RENAME TO t_old").change).new_name == "t_old");
+    ExpectError("ALTER TABLE t RENAME TO", "expected a table name");
+    ExpectError("ALTER TABLE t RENAME TO T", "names are lowercase: 'T'");
+    ExpectError("MIGRATE 'm1' ALTER TABLE t RENAME TO u", "MIGRATE cannot rename a table");
+    const auto migrated = Get<cql::Migrate>("MIGRATE 'm1' ALTER TABLE t ALTER COLUMN a DROP NULL");
+    assert(std::holds_alternative<cql::AlterColumnAttribute>(std::get<cql::AlterTable>(migrated.statement).change));
 
     const auto option = std::get<cql::SetOption>(Get<cql::AlterTable>("ALTER TABLE t SET cache_chunks = 64").change).option;
     assert(option.name == "cache_chunks" && option.value == cql::Literal(cql::Integer{.negative = false, .magnitude = 64}));
@@ -537,6 +559,10 @@ void TestWatch() {
     assert(drop.name == "consumer" && drop.table == "world");
     assert(!Get<cql::ShowSlots>("SHOW SLOTS").table);
     assert(Get<cql::ShowSlots>("SHOW SLOTS ON world").table == "world");
+    const auto prefixed = Get<cql::ShowSlots>("SHOW SLOTS ON world PREFIX 'con'");
+    assert(prefixed.table == "world" && prefixed.prefix == "con");
+    assert(!Get<cql::ShowSlots>("SHOW SLOTS PREFIX '_'").table && Get<cql::ShowSlots>("show slots prefix '_'").prefix == "_");
+    assert(!Get<cql::ShowSlots>("SHOW SLOTS ON world").prefix);
     for (const auto& name : std::vector<std::string>{"", "Upper", "1start", "hy-phen", "quote'", std::string(64, 'a')}) {
         std::string quoted;
         for (const char c : name) { quoted += c; if (c == '\'') quoted += c; }
@@ -549,6 +575,9 @@ void TestWatch() {
     ExpectError("CREATE SLOT consumer ON world", "quoted slot name");
     ExpectError("DROP SLOT $1 ON world", "quoted slot name");
     ExpectError("SHOW SLOTS ON world extra", "expected the end");
+    ExpectError("SHOW SLOTS PREFIX con", "quoted slot name");
+    ExpectError("SHOW SLOTS PREFIX ''", "slot names must match");
+    ExpectError("SHOW SLOTS PREFIX 'con' ON world", "expected the end");
     ExpectError("UNWATCH extra", "expected the end");
 }
 void TestBackup() {

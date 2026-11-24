@@ -54,6 +54,8 @@ ADMIN includes WRITE, and WRITE includes READ.
 Rights apply to whole tables, including grants naming tables not yet created.
 A wildcard grant on `*` applies to every table, including future tables.
 Dropping a table removes its specific grants.
+Renaming a table with ALTER TABLE ... RENAME TO moves its specific grants to the new name; a user with grants on both names keeps the higher right.
+GRANT and REVOKE wait for a running DROP TABLE or RENAME TO, so each applies before or after it.
 
 | Statement | Required right |
 | --- | --- |
@@ -62,6 +64,7 @@ Dropping a table removes its specific grants.
 | SET BLOCK, DELETE BLOCK, SET CHUNK | WRITE on the table |
 | ALTER TABLE, DROP TABLE, RECOVER TABLE, CREATE SLOT, DROP SLOT | ADMIN on the table |
 | SWAP TABLES | ADMIN on both tables |
+| ALTER TABLE ... RENAME TO | ADMIN on the table and on the new name |
 | CREATE TABLE, SHOW METRICS, RELOAD TLS | ADMIN on all tables |
 | FLUSH WAL | WRITE on at least one table |
 | SHOW TABLES, SHOW SLOTS | None; results include accessible tables only |

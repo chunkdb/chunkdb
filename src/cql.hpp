@@ -231,9 +231,22 @@ struct AlterColumnType {
 struct SetOption {
     Option option;
 };
+// ALTER COLUMN c SET DEFAULT v | DROP DEFAULT | SET NULL | DROP NULL |
+// SET REQUIRED | DROP REQUIRED.
+struct AlterColumnAttribute {
+    enum class Change : std::uint8_t { kSetDefault, kDropDefault, kSetNull, kDropNull, kSetRequired, kDropRequired };
+    std::string column;
+    Change change = Change::kSetDefault;
+    // kSetDefault only.
+    std::optional<Literal> value{};
+};
+// RENAME TO: the table's new name.
+struct RenameTable {
+    std::string new_name;
+};
 struct AlterTable {
     std::string table;
-    std::variant<AddColumn, DropColumn, RenameColumn, AlterColumnType, SetOption> change;
+    std::variant<AddColumn, DropColumn, RenameColumn, AlterColumnType, SetOption, AlterColumnAttribute, RenameTable> change;
 };
 struct DropTable {
     std::string table;
@@ -261,6 +274,8 @@ struct DropSlot {
 };
 struct ShowSlots {
     std::optional<std::string> table;
+    // Only slots whose names start with it.
+    std::optional<std::string> prefix{};
 };
 struct Describe {
     std::string table;

@@ -873,6 +873,9 @@ class Parser {
             }, statement);
             if (!allowed || !parameters_.empty())
                 Fail(start + 1U, "MIGRATE takes one schema statement without parameters");
+            if (const auto* alter = std::get_if<AlterTable>(&migration.statement);
+                alter != nullptr && std::holds_alternative<RenameTable>(alter->change))
+                Fail(start + 1U, "MIGRATE cannot rename a table; run ALTER TABLE ... RENAME TO on its own");
             const auto end = line_.find_last_not_of(" \t");
             migration.text = std::string(line_.substr(start, end == std::string_view::npos ? 0U : end + 1U - start));
             return migration;
@@ -1139,6 +1142,10 @@ class Parser {
                 const bool conditional = IfExists();
                 alter.change = DropColumn{.column = Name("a column name"), .if_exists = conditional, .chunk_column = chunk_column};
             } else if (Accept("rename")) {
+                if (Accept("to")) {
+                    alter.change = RenameTable{.new_name = Name("a table name")};
+                    return alter;
+                }
                 const bool chunk_column = Accept("chunk");
                 Expect("column");
                 RenameColumn rename;
@@ -1149,8 +1156,28 @@ class Parser {
                 alter.change = rename;
             } else if (Accept("alter")) {
                 Expect("column");
+                const auto column_name = Name("a column name");
+                const bool set = Accept("set");
+                if (set || Accept("drop")) {
+                    using Change = AlterColumnAttribute::Change;
+                    AlterColumnAttribute attribute;
+                    attribute.column = column_name;
+                    if (Accept("default")) {
+                        attribute.change = set ? Change::kSetDefault : Change::kDropDefault;
+                        if (set) attribute.value = Value(false);
+                    } else if (Accept("null")) {
+                        attribute.change = set ? Change::kSetNull : Change::kDropNull;
+                    } else if (Accept("required")) {
+                        attribute.change = set ? Change::kSetRequired : Change::kDropRequired;
+                    } else {
+                        Fail(Peek().column, "expected DEFAULT, NULL or REQUIRED, got " + Quote(Peek()));
+                    }
+                    alter.change = std::move(attribute);
+                    return alter;
+                }
                 AlterColumnType change;
-                change.column = Name("a column name");
+                change.column = column_name;
+                if (!IsKeyword(Peek(), "type")) Fail(Peek().column, "expected TYPE, SET or DROP, got " + Quote(Peek()));
                 Expect("type");
                 change.type = Type();
                 if (Accept("using")) {
@@ -1212,6 +1239,7 @@ class Parser {
             if (Accept("slots")) {
                 ShowSlots show;
                 if (Accept("on")) show.table = Name("a table name");
+                if (Accept("prefix")) show.prefix = SlotName();
                 return show;
             }
             if (Accept("users")) {

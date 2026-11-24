@@ -568,6 +568,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_narrowing_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME narrowing COMMAND chunkdb_narrowing_test)
 
+    add_executable(chunkdb_alter_column_test tests/alter_column_tests.cpp)
+    target_link_libraries(chunkdb_alter_column_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_alter_column_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME alter_column COMMAND chunkdb_alter_column_test)
+
     add_executable(chunkdb_cql_test tests/cql_tests.cpp)
     target_link_libraries(chunkdb_cql_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_cql_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1200,6 +1205,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_schema_versions_test
         chunkdb_column_types_test
         chunkdb_narrowing_test
+        chunkdb_alter_column_test
         chunkdb_cql_test
         chunkdb_expr_test
         chunkdb_cql_engine_test

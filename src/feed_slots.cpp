@@ -477,6 +477,10 @@ std::vector<FeedSlot> FeedSlots::List(bool include_lost) const {
     }
     return result;
 }
+std::size_t FeedSlots::size() const {
+    std::lock_guard lock(mutex_);
+    return records_.slots.size();
+}
 FeedSlot FeedSlots::Get(std::string_view name) const {
     store_.ThrowIfDurabilityPoisoned();
     std::lock_guard lock(mutex_);
