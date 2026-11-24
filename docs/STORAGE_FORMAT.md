@@ -142,7 +142,7 @@ Inactive z side lengths are 1, and inactive coordinates are zero.
 A complete empty `chunkdb.index` is durable before publishing the manifest or catalog name; a missing inventory is damage.
 Publication syncs a temporary file, uses no-replace rename or an exclusive hard link, and syncs the directory; replacements sync the new file and directory too.
 
-Schema/options changes and feed-feature activation replace the manifest atomically.
+Schema and option changes and feature activation replace the manifest atomically.
 Incorrect magic/version, reserved fields, sizes, checksum, geometry, identity, or schema refuse opening.
 
 Options use the same TLV layout as the root manifest:
@@ -165,7 +165,7 @@ Catalog tables repeat their directory's exact scope and require its admitted dir
 A standalone table uses role 1 with its own `store_id` as the scope's directory identity; opening an isolated catalog table does not infer standalone ownership.
 Scope is separate from mutable options and survives schema, option and lineage replacements.
 
-Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is retired and is not a known option.
+Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is not a known option.
 
 Types 10 and 11 belong to incompatibility feature `table_lineage` (`0x4`) and must appear together.
 The parent epoch differs from the table's current epoch; the fork revision preserves its exact unsigned value.
@@ -230,7 +230,6 @@ A step is `change_count:u32` (1–2048), then each change's `kind:u8` (1 add, 2 
 Kind 5 is an other-domain marker containing only its kind byte.
 Kinds 7 (add check) and 8 (drop check), block columns only, have `position:u32`, the index in the check list, and an encoded check instead of a column.
 A check is `name_length:u8`, a name under the column-name rule, `expression_length:u32` (at most 16384) and the condition's UTF-8 text.
-Builds without CHECK constraints refuse a schema area with these kinds or the tags 3 and 4 below.
 Both domains have the same revision; at every step exactly one domain changes columns and the other records that marker.
 
 The column is the added/dropped column or the post-rename/post-conversion column; position identifies its slot in the applicable column list.

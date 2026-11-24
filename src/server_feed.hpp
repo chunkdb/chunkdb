@@ -103,6 +103,10 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
         // last made write progress while holding them.
         std::size_t excess_frames = 0U;
         std::chrono::steady_clock::time_point excess_progress{};
+        // An ordinary CHUNKS watch with unsent output merges its next pushes
+        // here; `held` is a push read after them that waits for their frame.
+        FeedChunksMerge merge;
+        std::shared_ptr<const FeedEntry> held;
     };
     void Run();
     void WakeCatchUp() noexcept;
