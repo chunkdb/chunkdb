@@ -8,7 +8,7 @@ The server stores salt, iteration count and stored/server keys rather than passw
 A login over TLS can be bound to the connection with `tls-exporter` or `tls-server-end-point`; the server computes the binding data from its own TLS session and compares it before it checks the proof.
 The client speaks first and knows its TLS version, so it picks the type without a negotiation round; every protocol 3 server takes both, and `y,,` on TLS is refused as a downgrade.
 A binding mismatch is reported apart from a wrong password because it depends on neither the user nor the password; a user that requires binding is not, so the reply does not tell that the user exists.
-Unknown-user authentication uses a derived salt and the same failure message as an invalid password.
+Unknown-user authentication uses a derived salt and the same failure message as an invalid password; its iteration count and salt length are those of one existing user's verifier, chosen by the name, or 4096 and 16 bytes when there are no users, so the challenge looks like that of a user who exists.
 Passwords use UTF-8 bytes without SASLprep normalization.
 A user has at most two verifiers, so a password rotates without a moment in which no password logs in.
 The server sends one salt and iteration count before the client proves its password, so an added verifier must share them; the proof is checked against both verifiers.

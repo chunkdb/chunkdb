@@ -1,6 +1,7 @@
 #include "user_registry.hpp"
 #include "chunk_store_internal.hpp"
 
+#include <algorithm>
 #include <limits>
 #include <stdexcept>
 #include <utility>
@@ -95,6 +96,14 @@ UserPublication UserRegistry::PreparePublication(std::shared_ptr<const Users> ne
             .manages_users = user.manages_users, .server_rights = user.server_rights});
     }
     result.rights = std::move(rights);
+    auto shapes = std::make_shared<std::vector<scram::VerifierShape>>();
+    shapes->reserve(result.users->users.size());
+    for (const auto& [name, user] : result.users->users)
+        shapes->push_back({.iterations = user.verifier.iterations, .salt_bytes = user.verifier.salt.size()});
+    std::sort(shapes->begin(), shapes->end(), [](const scram::VerifierShape& a, const scram::VerifierShape& b) {
+        return a.iterations != b.iterations ? a.iterations < b.iterations : a.salt_bytes < b.salt_bytes;
+    });
+    result.shapes = std::move(shapes);
     return result;
 }
 
@@ -124,6 +133,7 @@ void UserRegistry::Publish(UserPublication next) noexcept {
         std::lock_guard lock(published_mutex_);
         published_.swap(next.users);
         admissions_.swap(next.admissions);
+        shapes_.swap(next.shapes);
     }
     // Installed before the caller moves the generation: a reader that sees
     // the new generation reads a view at least that new. The previous view

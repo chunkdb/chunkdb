@@ -56,6 +56,9 @@ class UserRegistry {
     [[nodiscard]] Users Snapshot() const;
     // The secret that derives the salts of unknown users.
     [[nodiscard]] std::array<std::uint8_t, 32> Secret() const;
+    // The verifier a login of unknown user `name` runs against: shaped like
+    // the verifier of a user that exists, so the reply does not stand out.
+    [[nodiscard]] scram::Verifier DecoyVerifier(std::string_view name) const;
     [[nodiscard]] std::optional<UserAuthenticationSnapshot> AuthenticationSnapshot(const std::string& name) const;
     [[nodiscard]] bool AuthenticationCurrent(const UserAuthenticationSnapshot& expected) const;
     [[nodiscard]] UserAdmissionResult AcquireConnection(const UserAuthenticationSnapshot& expected) const;
@@ -180,6 +183,7 @@ class UserRegistry {
     mutable std::mutex published_mutex_;
     std::shared_ptr<const Users> published_;
     std::shared_ptr<const UserAdmissionMap> admissions_;
+    std::shared_ptr<const std::vector<scram::VerifierShape>> shapes_;
     std::atomic<std::uint64_t> generation_{1};
     // Guards only the pointer: held for a copy, never across I/O or another lock.
     mutable std::mutex rights_mutex_;
