@@ -37,6 +37,8 @@ services:
       - "${CHUNKDB_DURABILITY:-relaxed}"
       - "--workers"
       - "${CHUNKDB_WORKERS:-4}"
+      - "--metrics-listen"
+      - "127.0.0.1:9100"
     restart: unless-stopped
 
   chunkdb-test:

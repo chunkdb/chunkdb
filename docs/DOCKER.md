@@ -89,6 +89,22 @@ docker inspect --format '{{.State.Health.Status}}' chunkdb
 healthy
 ```
 
+The image starts the server with `--metrics-listen 127.0.0.1:9100`, on the container's loopback only.
+The health probe reads `GET /metrics` from that address, so it needs no password.
+If your server arguments leave out `--metrics-listen`, the probe sends `HELLO 3` to port 4242 instead.
+
+To scrape metrics from the host, listen on every container address and publish the port on the host's loopback:
+
+```sh
+docker run -d --name chunkdb -p 127.0.0.1:4242:4242 -p 127.0.0.1:9100:9100 \
+  -v chunkdb-data:/var/lib/chunkdb ghcr.io/chunkdb/chunkdb:2 \
+  --listen-uri chunk://0.0.0.0:4242/ --data-dir /var/lib/chunkdb/data --backup-dir /var/lib/chunkdb/backups \
+  --metrics-listen 0.0.0.0:9100 --metrics-allow-remote
+curl -s http://127.0.0.1:9100/metrics | head -n 3
+```
+
+The endpoint has no authentication and shows table names; see [Server flags](SERVER_FLAGS.md#metrics).
+
 Removing a container retains the named volume; deleting the volume deletes the database and its backups.
 Keep the loopback binding for local use.
 For TLS, mount certificate/key files and use a chunks:// listen URI; see [Server flags](SERVER_FLAGS.md).
