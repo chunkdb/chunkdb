@@ -369,7 +369,7 @@ The final variable state must obey the VARS presence, type, ordering, UTF-8, and
 A writer replays a valid image, or an empty state when none exists, followed by committed frames from its live WAL.
 A failed header is recoverable only with the interrupted-creation shape: an expected header prefix followed by zero bytes.
 Feature-byte differences are ignored.
-Incomplete CRC bytes are allowed after the first 56 header bytes match.
+Incomplete CRC bytes are allowed after the first `44 + 8 * dims` header bytes, everything before the checksum, match.
 
 Other invalid headers are damage; interrupted creation contributes no frames and can be removed.
 A trailing incomplete/bad-checksum frame can be discarded only when no later checksum-valid frame header exists.
