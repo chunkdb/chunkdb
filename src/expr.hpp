@@ -139,6 +139,17 @@ struct Assignments {
     std::size_t parameters = 0;
 };
 
+// The expressions of one SET BLOCK or DELETE BLOCK (cql::SetBlock::expressions).
+struct WriteExpressions {
+    // IF <expr>.
+    std::optional<Expression> condition;
+    // SET BLOCK's values when one of them is more than a single value;
+    // cql::SetBlock::values is then empty.
+    std::vector<AssignmentExpression> assignments;
+    // IF VERSION $n: n, a u64 parameter; 0 without it.
+    std::size_t version_parameter = 0;
+};
+
 // The whole of `text` as a condition, or as `column = sum {, column = sum}`.
 // Throws ParseError.
 [[nodiscard]] Condition ParseCondition(std::string_view text, const Limits& limits = {});
@@ -199,6 +210,19 @@ class ColumnList final : public Schema {
     std::vector<Column> chunk_;
 };
 
+// ColumnList over columns it does not own, which must outlive it.
+class ColumnSpans final : public Schema {
+  public:
+    explicit ColumnSpans(std::span<const Column> block, std::span<const Column> chunk = {})
+        : block_(block), chunk_(chunk) {}
+    [[nodiscard]] std::optional<ColumnBinding> BlockColumn(std::string_view name) const override;
+    [[nodiscard]] std::optional<ColumnBinding> ChunkColumn(std::string_view name) const override;
+
+  private:
+    std::span<const Column> block_;
+    std::span<const Column> chunk_;
+};
+
 // The type a parameter takes: that of the column it is compared, combined
 // or assigned with. Its frame is decoded as a value of that type.
 struct ParameterType {
@@ -216,6 +240,10 @@ class ConditionPlan {
     explicit ConditionPlan(std::shared_ptr<const detail::Program> program) : program_(std::move(program)) {}
     // The parameters the condition uses, by index.
     [[nodiscard]] const std::vector<ParameterType>& parameters() const;
+    // Whether a node of the condition is `op` (kNow, kChunkColumn).
+    [[nodiscard]] bool Reads(Op op) const;
+    // The slots of the block columns it reads, ascending, each once.
+    [[nodiscard]] std::vector<std::size_t> BlockSlots() const;
     // Throws std::logic_error for a plan that was never made.
     [[nodiscard]] const detail::Program& program() const;
 
@@ -228,6 +256,10 @@ class AssignmentsPlan {
     AssignmentsPlan() = default;
     explicit AssignmentsPlan(std::shared_ptr<const detail::Program> program) : program_(std::move(program)) {}
     [[nodiscard]] const std::vector<ParameterType>& parameters() const;
+    // Whether a node of a value is `op` (kNow, kChunkColumn).
+    [[nodiscard]] bool Reads(Op op) const;
+    // The slots of the block columns the values read, ascending, each once.
+    [[nodiscard]] std::vector<std::size_t> BlockSlots() const;
     // The assigned columns, in the order of the assignments.
     [[nodiscard]] const std::vector<ColumnBinding>& targets() const;
     // Throws std::logic_error for a plan that was never made.

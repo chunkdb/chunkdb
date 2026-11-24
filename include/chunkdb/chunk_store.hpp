@@ -22,6 +22,7 @@
 #include <string_view>
 #include <system_error>
 #include <thread>
+#include <type_traits>
 #include <list>
 #include <unordered_map>
 #include <unordered_set>
@@ -475,11 +476,58 @@ struct ChunkBatchOp {
     std::string bits{};
 };
 
+// The block a computed write reads under its chunk's lock
+// (ChunkStore::WriteBlockDecided).
+struct BlockWriteView {
+    // The block's values in schema order, or null when the block is absent.
+    const std::vector<ColumnValue>* values = nullptr;
+    // The chunk columns in chunk-schema order, when asked for.
+    std::span<const ColumnValue> chunk_columns{};
+    // The chunk's version.
+    std::uint64_t version = 0;
+    // The commit time the write takes when it changes the chunk.
+    std::uint64_t commit_time_ms = 0;
+};
+
+// Decides a computed write from the block as it is: false changes nothing;
+// for a SET, it fills `values`. It refers to a callable that outlives the
+// call it is passed to, and never allocates.
+class BlockWriteDecision {
+  public:
+    template <class F>
+        requires(!std::is_same_v<std::remove_cvref_t<F>, BlockWriteDecision> &&
+                 std::is_invocable_r_v<bool, F&, const BlockWriteView&, std::vector<ColumnAssignment>&>)
+    BlockWriteDecision(F&& decide) noexcept  // NOLINT(google-explicit-constructor)
+        : object_(static_cast<const void*>(std::addressof(decide))),
+          call_([](const void* object, const BlockWriteView& block, std::vector<ColumnAssignment>& values) {
+              return static_cast<bool>(
+                  (*static_cast<std::remove_reference_t<F>*>(const_cast<void*>(object)))(block, values));
+          }) {}
+    bool operator()(const BlockWriteView& block, std::vector<ColumnAssignment>& values) const {
+        return call_(object_, block, values);
+    }
+
+  private:
+    const void* object_;
+    bool (*call_)(const void*, const BlockWriteView&, std::vector<ColumnAssignment>&);
+};
+
 struct ChunkMutationResult {
     bool ok = false;
     // On success: the chunk version after the mutation.
     // On version mismatch: the current chunk version.
     std::uint64_t version = 0;
+};
+
+// The IF <expr> of SET BLOCK or DELETE BLOCK is false or unknown: nothing
+// changed. `current` is the chunk's version (CONDITION_FAILED current=).
+class ConditionFailedError : public std::runtime_error {
+  public:
+    explicit ConditionFailedError(std::uint64_t current)
+        : std::runtime_error("the condition does not hold; nothing changed"), current_(current) {}
+    [[nodiscard]] std::uint64_t current() const noexcept { return current_; }
+  private:
+    std::uint64_t current_;
 };
 
 // A write failed after a point where it may already be applied, for
@@ -689,6 +737,19 @@ class ChunkStore {
     [[nodiscard]] ChunkMutationResult SetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z,
         const std::vector<ColumnAssignment>& values, std::optional<std::uint64_t> expected_version);
     [[nodiscard]] std::optional<std::vector<ColumnValue>> GetBlock3D(std::int64_t x, std::int64_t y, std::int64_t z);
+    // SET BLOCK (`remove` false) or DELETE BLOCK whose condition or values
+    // read the block (docs/design/EXPRESSIONS_DESIGN.md): `decide` runs
+    // under the chunk's lock, so no write comes between the read and the
+    // write. When it returns false nothing changes, and the result is not ok
+    // with the current version; otherwise as SetBlock and UnsetBlock. `z` is
+    // used by a three-dimensional table. `decide` sees the block columns at
+    // `block_slots` (schema indexes; the others are NULL), and the chunk
+    // columns when `read_chunk_columns`. What `decide` throws changes nothing.
+    [[nodiscard]] ChunkMutationResult WriteBlockDecided(std::int64_t x, std::int64_t y, std::int64_t z, bool remove,
+        std::span<const std::size_t> block_slots, bool read_chunk_columns, BlockWriteDecision decide);
+    // The chunk columns `state` holds (the defaults when null), in chunk-schema
+    // order; NULL for a column without a value.
+    [[nodiscard]] std::vector<ColumnValue> ChunkColumnValues(const ChunkColumnState* state) const;
     [[nodiscard]] BlockReadMetadata GetBlockWithVersion3D(std::int64_t x, std::int64_t y, std::int64_t z);
     // The first stored value of column `column_id` that `type` does not
     // hold, or with `refuse_null` the first NULL, as "block (x, y) holds
@@ -1868,22 +1929,28 @@ class ChunkStore {
     // This thread's buffer for bytes a write puts back.
     static std::vector<std::uint8_t>& ThreadSavedBytes();
     // Writes `write` and the block's presence as one WAL frame, or changes
-    // nothing when it throws. Called with the chunk's mutex held.
+    // nothing when it throws. Called with the chunk's mutex held. The write
+    // issues its commit time, or takes the one a computed write read as
+    // NOW() (WriteBlockDecided), given as the one value of `pinned`.
+    template <class... Pinned>
     void WriteBlockColumnsLocked(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& chunk,
         std::size_t block_index,
         BlockWrite& write,
-        bool present);
+        bool present,
+        Pinned... pinned_commit_time_ms);
     // Writes one block of a bit-string table (`present`) or removes it
     // (`bits` all zero), as one WAL frame. Called with the chunk's mutex
-    // held.
+    // held. The commit time as for WriteBlockColumnsLocked.
+    template <class... Pinned>
     void WriteBlockBitsLocked(
         const ChunkCoord& chunk_coord,
         const std::shared_ptr<RegularChunk>& regular_chunk,
         std::size_t block_index,
         std::string_view bits,
-        bool present);
+        bool present,
+        Pinned... pinned_commit_time_ms);
     // The bit-string commands need a table with one bits(N) column that is
     // not NULL.
     void RequireBitStringBlocks() const;

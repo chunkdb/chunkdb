@@ -312,7 +312,6 @@ void TestLiterals() {
     assert(std::isnan(std::get<double>(ValueOf("NaN"))));
     ExpectError("SET BLOCK 0 0 IN t a = 1.2.3", "is not a number");
     ExpectError("SET BLOCK 0 0 IN t a = 1e999", "is not a number");
-    ExpectError("SET BLOCK 0 0 IN t a = -abc", "expected a number after -");
 
     assert(ValueOf("TRUE") == cql::Literal(true));
     assert(ValueOf("false") == cql::Literal(false));
@@ -704,12 +703,62 @@ void TestErrors() {
     ExpectError("GET BLOCK 1 2 FROM t; DROP TABLE t", "column 21: unexpected ';'");
     ExpectError("SET BLOCK 0 0 IN t", "expected a column name");
     ExpectError("SET BLOCK 0 0 IN t a 1", "expected =, got '1'");
-    ExpectError("SET BLOCK 0 0 IN t a = b", "expected a value, got 'b'");
     ExpectError("SET BLOCK 0 0 IN t a = 1 IF VERSION -1", "a version must be between 0");
-    ExpectError("SET BLOCK 0 0 IN t a = 1 IF 3", "expected VERSION");
     ExpectError("DROP t", "expected TABLE");
     ExpectError("FLUSH", "expected WAL");
     ExpectError("SHOW GRANTS", "expected TABLES, METRICS, STATUS, CONNECTIONS, MIGRATIONS, USERS or SLOTS");
+}
+
+// IF <expr> and computed values of SET BLOCK and DELETE BLOCK (#145): a
+// statement with single values and no condition parses as before.
+void TestBlockExpressions() {
+    const auto plain = Get<cql::SetBlock>("SET BLOCK 0 0 IN t a = 1, b = $1", 1);
+    assert(plain.values.size() == 2U && !plain.expressions && !plain.if_version);
+    const auto versioned = Get<cql::SetBlock>("SET BLOCK 0 0 IN t a = 1 IF VERSION 3");
+    assert(versioned.if_version == 3U && !versioned.expressions);
+
+    const auto computed = Get<cql::SetBlock>("SET BLOCK 1 2 IN t coins = coins + $1", 1);
+    assert(computed.values.empty() && computed.expressions && !computed.expressions->condition);
+    assert(computed.expressions->assignments.size() == 1U && computed.expressions->assignments[0].column == "coins");
+    // One computed value makes every value an expression.
+    const auto mixed = Get<cql::SetBlock>("SET BLOCK 1 2 IN t a = $1, b = a * 2, c = (3)", 1);
+    assert(mixed.values.empty() && mixed.expressions->assignments.size() == 3U);
+    assert(Get<cql::SetBlock>("SET BLOCK 1 2 IN t a = 1 * 2").expressions->assignments.size() == 1U);
+    assert(Get<cql::SetBlock>("SET BLOCK 1 2 IN t a = -b").expressions);
+
+    const auto conditional = Get<cql::SetBlock>("SET BLOCK 1 2 3 IN t a = 1, b = $1 IF a < $2 AND EXISTS", 2);
+    assert(conditional.dims == 3U && conditional.values.size() == 2U && !conditional.if_version);
+    assert(conditional.expressions->condition && conditional.expressions->assignments.empty());
+    const auto both = Get<cql::SetBlock>("SET BLOCK 1 2 IN t hp = LEAST(hp + 5, max_hp) if hp > 0", 0);
+    assert(both.expressions->condition && both.expressions->assignments.size() == 1U);
+    // `version` is a column unless VERSION is followed by a number.
+    const auto column = Get<cql::SetBlock>("SET BLOCK 1 2 IN t a = 1 IF version = 3");
+    assert(!column.if_version && column.expressions->condition);
+    const auto counted = Get<cql::SetBlock>("SET BLOCK 1 2 IN t n = COALESCE(n, 0) + 1 IF VERSION 7");
+    assert(counted.if_version == 7U && counted.expressions && !counted.expressions->condition);
+
+    const auto removed = Get<cql::DeleteBlock>("DELETE BLOCK 1 2 FROM t IF EXISTS AND hp <= $1", 1);
+    assert(removed.expressions && removed.expressions->condition && !removed.if_version);
+    const auto removed3 = Get<cql::DeleteBlock>("delete block 1 2 3 from t if chunk.status = 2");
+    assert(removed3.dims == 3U && removed3.expressions->condition);
+    const auto unconditional = Get<cql::DeleteBlock>("DELETE BLOCK 1 2 FROM t IF VERSION 4");
+    assert(unconditional.if_version == 4U && !unconditional.expressions);
+    // IF VERSION $n reads the version from a parameter frame.
+    const auto versioned_parameter = Get<cql::SetBlock>("SET BLOCK 1 2 IN t a = $2 IF VERSION $1", 2);
+    assert(!versioned_parameter.if_version && versioned_parameter.values.size() == 1U);
+    assert(versioned_parameter.expressions->version_parameter == 1U && !versioned_parameter.expressions->condition);
+    const auto removed_parameter = Get<cql::DeleteBlock>("DELETE BLOCK 1 2 FROM t IF VERSION $1", 1);
+    assert(!removed_parameter.if_version && removed_parameter.expressions->version_parameter == 1U);
+    ExpectError("DELETE BLOCK 1 2 FROM t IF VERSION $1 AND a = 1", "expected the end of the statement");
+
+    ExpectError("SET BLOCK 0 0 IN t a = 1 IF VERSION 3 AND a = 1", "expected the end of the statement, got 'AND'");
+    ExpectError("SET BLOCK 0 0 IN t a = coins + $1 IF a > $1", "$1 is used twice");
+    ExpectError("SET BLOCK 0 0 IN t a = b + $2", "numbered $1 to $2 without gaps");
+    ExpectError("SET BLOCK 0 0 IN t a = b +", "column 27");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 IF", "column 28");
+    ExpectError("SET BLOCK 0 0 IN t a = 1 IF a > 1 extra", "expected the end of the statement, got 'extra'");
+    ExpectError("DELETE BLOCK 0 0 FROM t IF a +", "column 31");
+    ExpectError("DELETE BLOCK 0 0 FROM t IF VERSION 1.5", "expected a version");
 }
 
 }  // namespace
@@ -748,6 +797,7 @@ int main() {
     TestStatementSuggestions();
     TestConditionalObjects();
     TestBlockStatements();
+    TestBlockExpressions();
     TestChunkAndAreaStatements();
     TestAggregate();
     TestLiterals();

@@ -58,7 +58,7 @@ A snapshot is the table's state at that moment.
 | CONFLICT reason=table_changed | The table is altered or dropped. | ROLLBACK, refresh schema, and retry. |
 | CONFLICT reason=duration | Duration exceeds the configured limit. After the first table statement, the next statement the server runs past the limit answers it, PING and DESCRIBE too; HELLO and statements refused before they run do not. SHOW CONNECTIONS, CANCEL and KILL CONNECTION end it but return their own reply; the statement after them gets the conflict. | ROLLBACK and shorten the transaction. |
 | CONFLICT reason=history_limit | Earlier chunk states exceed the history budget. | ROLLBACK and retry promptly. |
-| INVALID_ARGUMENT | You use a prohibited statement, IF VERSION, another table, or exceed write/read limits. | Correct the statement or reduce the transaction. |
+| INVALID_ARGUMENT | You use a prohibited statement, IF VERSION, NOW() in a write, another table, or exceed write/read limits. | Correct the statement or reduce the transaction. |
 | INVALID_ARGUMENT | You run BEGIN on a server started with `--read-only`. | Run the transaction on a server started without `--read-only`. |
 | PERMISSION_DENIED | You lose a required right; COMMIT checks WRITE again. | Request access or ROLLBACK. |
 
@@ -66,6 +66,7 @@ A snapshot is the table's state at that moment.
 
 Allowed statements are GET BLOCK, GET CHUNK, GET AREA, AGGREGATE, SET BLOCK, DELETE BLOCK, SET CHUNK, DESCRIBE, PING, SHOW CONNECTIONS, CANCEL and KILL CONNECTION.
 Ordinary statement errors leave the transaction open without applying the failed statement.
+An IF condition of SET BLOCK or DELETE BLOCK, and a value computed from the block, read the transaction's view and count as a read of the chunk; CONDITION_FAILED also leaves the transaction open ([Expressions](EXPRESSIONS.md#in-writes)).
 A conflict ends its work and writes nothing.
 The connection keeps returning that conflict until ROLLBACK or COMMIT closes it; SHOW CONNECTIONS, CANCEL and KILL CONNECTION still return their own reply.
 

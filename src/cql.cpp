@@ -608,12 +608,55 @@ class Parser {
         return true;
     }
 
-    [[nodiscard]] std::optional<std::uint64_t> IfVersion() {
-        if (!Accept("if")) {
-            return std::nullopt;
+    // Drops the tokens read ahead of the next one and returns the offset
+    // where the next token starts, so an expression parser can take over.
+    std::size_t Rewind() {
+        if (next_ < tokens_.size()) {
+            at_ = tokens_[next_].column - 1U;
+            tokens_.resize(next_);
         }
-        Expect("version");
-        return Unsigned("a version", std::numeric_limits<std::uint64_t>::max());
+        return at_;
+    }
+
+    // SET BLOCK's values: single values followed by IF or the end, as
+    // before expressions; otherwise every value is an expression
+    // (docs/design/EXPRESSIONS_DESIGN.md), parsed into `*expressions`.
+    void BlockValues(std::vector<Assignment>* values, std::shared_ptr<expr::WriteExpressions>* expressions) {
+        const std::size_t start = Rewind();
+        const std::size_t mark = next_;
+        const std::set<std::size_t> before = parameters_;
+        try {
+            *values = Assignments();
+            if (Peek().kind == TokenKind::kEnd || IsKeyword(Peek(), "if")) return;
+        } catch (const ParseError&) {
+            // Not single values: read again as expressions below.
+        }
+        values->clear();
+        next_ = mark;
+        tokens_.resize(mark);
+        at_ = start;
+        parameters_ = before;
+        *expressions = std::make_shared<expr::WriteExpressions>();
+        (*expressions)->assignments = expr::ParseAssignmentsAt(line_, &at_, &parameters_);
+    }
+
+    // IF VERSION n, or IF <expr> into `*expressions`, or nothing.
+    void BlockCondition(std::optional<std::uint64_t>* if_version, std::shared_ptr<expr::WriteExpressions>* expressions) {
+        if (!Accept("if")) return;
+        const std::size_t after = Rewind();
+        if (expr::IsVersionClause(line_.substr(after))) {
+            Expect("version");
+            if (Peek().kind != TokenKind::kParameter) {
+                *if_version = Unsigned("a version", std::numeric_limits<std::uint64_t>::max());
+                return;
+            }
+            // IF VERSION $n: read where the parameter's frame is.
+            if (!*expressions) *expressions = std::make_shared<expr::WriteExpressions>();
+            (*expressions)->version_parameter = std::get<Parameter>(Value(true)).index;
+            return;
+        }
+        if (!*expressions) *expressions = std::make_shared<expr::WriteExpressions>();
+        (*expressions)->condition = expr::ParseConditionAt(line_, &at_, &parameters_);
     }
 
     [[nodiscard]] std::uint8_t Point(std::int64_t& x, std::int64_t& y, std::int64_t& z, bool chunk = false) {
@@ -1009,8 +1052,10 @@ class Parser {
                 set.dims = Point(set.x, set.y, set.z);
                 Expect("in");
                 set.table = Name("a table name");
-                set.values = Assignments();
-                set.if_version = IfVersion();
+                std::shared_ptr<expr::WriteExpressions> expressions;
+                BlockValues(&set.values, &expressions);
+                BlockCondition(&set.if_version, &expressions);
+                set.expressions = std::move(expressions);
                 return set;
             }
             if (Accept("chunk")) {
@@ -1046,7 +1091,9 @@ class Parser {
             del.dims = Point(del.x, del.y, del.z);
             Expect("from");
             del.table = Name("a table name");
-            del.if_version = IfVersion();
+            std::shared_ptr<expr::WriteExpressions> expressions;
+            BlockCondition(&del.if_version, &expressions);
+            del.expressions = std::move(expressions);
             return del;
         }
         if (Accept("create")) {
