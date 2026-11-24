@@ -15,8 +15,8 @@ BACKUP TO 'snapshot'
 OK
 1
 tables = 1
-files = 8
-bytes = 632
+files = 9
+bytes = 1232
 cuts:
   1) table = world, epoch = <epoch>, revision = 1
 ```

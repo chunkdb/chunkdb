@@ -649,6 +649,9 @@ void InactiveBackupRestore(const std::string& executable) {
         assert(LoadFile(backup / "chunkdb.groups.owner") == source_root);
         std::filesystem::remove_all(bad_copy);
     }
+#ifndef _WIN32
+    // POSIX only: Windows refuses to rename a directory while the restore holds
+    // handles inside it, so these substitutions cannot happen there.
     {
         const auto named = root / (".chunkdb.restore." + StoreIdHex(NewStoreId()));
         const auto held = root / "held-private-generation";
@@ -729,6 +732,7 @@ void InactiveBackupRestore(const std::string& executable) {
         assert(LoadFile(backup / "chunkdb.groups.owner") == source_root);
         std::filesystem::remove(substituted); std::filesystem::remove_all(held);
     }
+#endif
     const auto private_copy = root / (".chunkdb.restore." + StoreIdHex(NewStoreId()));
     std::filesystem::copy(backup, private_copy, std::filesystem::copy_options::recursive);
     Save(private_copy / kRestoreIncompleteName, Bytes{'C', 'K', 'R', 'I'});
