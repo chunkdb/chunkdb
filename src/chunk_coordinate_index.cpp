@@ -474,24 +474,27 @@ void ChunkCoordinateIndex::PublishReservation(CoordinateReservation& reservation
 }
 
 CoordinatePage ChunkCoordinateIndex::Page(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
-    std::optional<std::uint64_t> since) const {
+    std::optional<std::uint64_t> since, const ChunkCoord* until) const {
     Check();
     if (limit == 0U || limit > kMaxChunkScanLimit + 1U) throw std::invalid_argument("invalid coordinate scan limit");
     if (since && *since < retained_deletion_floor())
         throw std::invalid_argument("tombstone_history_lost: requested revision is below retained deletion floor");
     CoordinatePage page;
+    if (until != nullptr && has_cursor && !(cursor < *until)) return page;
     page.coords.reserve(limit);
     std::lock_guard lock(mutex_);
     if (since) {
         auto at = has_cursor ? coordinates_.upper_bound(cursor) : coordinates_.begin();
-        for (; at != coordinates_.end(); ++at) {
+        const auto stop = until != nullptr ? coordinates_.upper_bound(*until) : coordinates_.end();
+        for (; at != stop; ++at) {
             if (at->second.revision.load(std::memory_order_acquire) <= *since) continue;
             if (page.coords.size() == limit) { page.more = true; break; }
             page.coords.push_back(at->first);
         }
     } else {
         auto at = has_cursor ? populated_.upper_bound(cursor) : populated_.begin();
-        for (; at != populated_.end(); ++at) {
+        const auto stop = until != nullptr ? populated_.upper_bound(*until) : populated_.end();
+        for (; at != stop; ++at) {
             if (page.coords.size() == limit) { page.more = true; break; }
             page.coords.push_back(*at);
         }
@@ -504,10 +507,11 @@ void SetCoordinatePublicationTestHook(CoordinatePublicationTestHook* hook) noexc
 }
 
 CoordinatePage ChunkCoordinateIndex::SnapshotPage(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
-    std::uint64_t snapshot) const {
+    std::uint64_t snapshot, const ChunkCoord* until) const {
     Check();
     if (limit == 0U || limit > kMaxChunkScanLimit + 1U) throw std::invalid_argument("invalid coordinate scan limit");
     CoordinatePage page;
+    if (until != nullptr && has_cursor && !(cursor < *until)) return page;
     page.coords.reserve(limit);
     // Populated at the snapshot: populated now, or changed after it. Once
     // true for a fixed snapshot this stays true (revisions only grow), so
@@ -519,7 +523,8 @@ CoordinatePage ChunkCoordinateIndex::SnapshotPage(bool has_cursor, const ChunkCo
     for (;;) {
         std::lock_guard lock(mutex_);
         auto at = resume ? coordinates_.upper_bound(after) : coordinates_.begin();
-        for (std::size_t examined = 0U; at != coordinates_.end(); ++at, ++examined) {
+        const auto stop = until != nullptr ? coordinates_.upper_bound(*until) : coordinates_.end();
+        for (std::size_t examined = 0U; at != stop; ++at, ++examined) {
             if (examined == kBatchNodes) break;
             if (!at->second.populated.load(std::memory_order_relaxed) &&
                 at->second.revision.load(std::memory_order_acquire) <= snapshot)
@@ -527,10 +532,19 @@ CoordinatePage ChunkCoordinateIndex::SnapshotPage(bool has_cursor, const ChunkCo
             if (page.coords.size() == limit) { page.more = true; return page; }
             page.coords.push_back(at->first);
         }
-        if (at == coordinates_.end()) return page;
+        if (at == stop) return page;
         resume = true;
         after = std::prev(at)->first;
     }
+}
+
+bool ChunkCoordinateIndex::FirstCoordinateFrom(const ChunkCoord& from, ChunkCoord* found) const {
+    Check();
+    std::lock_guard lock(mutex_);
+    const auto at = coordinates_.lower_bound(from);
+    if (at == coordinates_.end()) return false;
+    *found = at->first;
+    return true;
 }
 
 std::optional<ChunkIndexRecord> ChunkCoordinateIndex::EmptyBoundary(const ChunkCoord& coord) const {

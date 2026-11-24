@@ -311,7 +311,7 @@ void TestHello() {
     assert(Contains(hello, "$16\r\nserver_signature\r\n$"));
     assert(Contains(hello, "$8\r\nfeatures\r\n*14\r\n$19\r\nprotocol_foundation\r\n"));
     assert(Contains(hello, "$12\r\nslot_filters\r\n$13\r\nslot_takeover\r\n$7\r\nlineage\r\n"));
-    assert(Contains(hello, "$19\r\nconnection_controls\r\n$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n$11\r\narea_paging\r\n$10\r\narea_scale\r\n$22\r\nread_only_transactions\r\n$9\r\nreturning\r\n"));
+    assert(Contains(hello, "$19\r\nconnection_controls\r\n$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n$11\r\narea_paging\r\n$10\r\narea_scale\r\n$22\r\nread_only_transactions\r\n$9\r\nreturning\r\n$9\r\nscan_area\r\n"));
     ExpectError(engine.Execute(session, "HELLO 3\r\n"), "PROTOCOL HELLO was already sent");
     ExpectReply(engine.Execute(session, "PING\r\n"), "+PONG\r\n");
     // Commands of the retired protocol 2 are not statements.
@@ -970,6 +970,14 @@ void TestScanChunks() {
     assert(rest.size() == 1 && rest[0] == all[2] && !rest_more);
     ExpectError(f.Run("SCAN CHUNKS FROM world LIMIT 0"), "LIMIT must be between 1 and 1024");
     ExpectError(f.Run("SCAN CHUNKS FROM world LIMIT 1025"), "LIMIT must be between 1 and 1024");
+    // An AREA or AREA AROUND keeps only the chunks inside it.
+    const auto [box, box_more] = ScanOf(f.Run("SCAN CHUNKS FROM world AREA 0 0 TO 1 1"));
+    assert((box == std::vector<std::pair<std::int64_t, std::int64_t>>{{0, 0}, {1, 0}}) && !box_more);
+    const auto [ball, ball_more] = ScanOf(f.Run("SCAN CHUNKS FROM world AREA AROUND -1 1 RADIUS 1"));
+    assert((ball == std::vector<std::pair<std::int64_t, std::int64_t>>{{-1, 2}}) && !ball_more);
+    const auto [paged, paged_more] = ScanOf(f.Run("SCAN CHUNKS FROM world AREA -1 0 TO 1 2 LIMIT 1 AFTER -1 2"));
+    assert((paged == std::vector<std::pair<std::int64_t, std::int64_t>>{{0, 0}}) && paged_more);
+    ExpectError(f.Run("SCAN CHUNKS FROM world AREA 0 0 0 TO 1 1 1"), "coordinate dimensions differ");
     ExpectError(f.Run("SCAN CHUNKS FROM nowhere"), "NO_TABLE");
 }
 

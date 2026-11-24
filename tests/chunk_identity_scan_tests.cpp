@@ -1,5 +1,9 @@
 #include <cassert>
+#include <chrono>
 #include <future>
+#include <set>
+
+#include "area_cursor.hpp"
 
 #include "chunkdb/file_layout.hpp"
 #include "test_utils.hpp"
@@ -108,9 +112,115 @@ void DataPagesBoundRetainedCopies() {
     catch (const std::out_of_range&) { refused = true; }
     assert(refused);
 }
+// SCAN CHUNKS with an AREA or AREA AROUND lists only the chunks inside it,
+// ascending, at every page size and from any cursor, for current, SINCE and
+// snapshot pages.
+void AreaPagesListOnlyTheirCells() {
+    for (const std::uint8_t dims : {std::uint8_t{2U}, std::uint8_t{3U}}) {
+        test::ScopedTempDir directory("chunkdb-scan-area");
+        auto config = txn_test::Config(directory.path(), DurabilityMode::kRelaxed, 8U);
+        config.background_maintenance = false;
+        config.max_loaded_chunks = 4096U;
+        if (dims == 3U) {
+            config.geometry.dims = 3U;
+            config.geometry.chunk_depth_blocks = 4U;
+            config.geometry.large_chunk_depth_chunks = 2U;
+        }
+        ChunkStore store(config);
+        const auto write = [&](const ChunkCoord& chunk, std::string_view bits) {
+            if (dims == 3U) store.SetBlockBits3D(chunk.x * 4, chunk.y * 4, chunk.z * 4, bits);
+            else store.SetBlockBits(chunk.x * 4, chunk.y * 4, bits);
+        };
+        const std::int64_t span = dims == 3U ? 4 : 9;
+        std::set<ChunkCoord> populated;
+        for (std::int64_t x = -span; x <= span; ++x)
+            for (std::int64_t y = -span; y <= span; ++y)
+                for (std::int64_t z = dims == 3U ? -span : 0; z <= (dims == 3U ? span : 0); ++z) {
+                    if (((x * 7 + y * 3 + z * 5) % 4 + 4) % 4 == 0) continue;
+                    write({x, y, z}, "10000000");
+                    populated.insert({x, y, z});
+                }
+        const std::int64_t depth = dims == 3U ? 1 : 0;
+        const std::vector<ChunkAreaSelector> areas{
+            {.dims = dims, .first = {-3, -2, -depth}, .last = {4, 5, 2 * depth}},
+            {.dims = dims, .first = {1, -1, depth}, .around = true, .radius = 3},
+            {.dims = dims, .first = {2, -span, -depth}, .last = {2, span, depth}},
+            {.dims = dims, .first = {100, 100, 0}, .last = {101, 101, 0}},
+        };
+        const auto inside = [](const ChunkAreaSelector& area, const std::set<ChunkCoord>& coords) {
+            const detail::AreaCursor cells(area);
+            std::vector<ChunkCoord> kept;
+            for (const auto& coord : coords)
+                if (cells.Contains(coord)) kept.push_back(coord);
+            return kept;
+        };
+        // Pages from `start` (or the beginning) until one says no more.
+        const auto collect = [&](const ChunkAreaSelector& area, std::size_t limit, const ChunkCoord* start,
+                                 std::optional<std::uint64_t> since, const TxnSnapshot* snapshot) {
+            std::vector<ChunkCoord> coords;
+            bool has_cursor = start != nullptr;
+            ChunkCoord cursor = start != nullptr ? *start : ChunkCoord{};
+            for (;;) {
+                const auto page = snapshot != nullptr
+                    ? store.ScanChunkIdentitiesAt(*snapshot, has_cursor, cursor, limit, false, nullptr, &area)
+                    : store.ScanChunkIdentities(has_cursor, cursor, limit, since, false, nullptr, &area);
+                for (const auto& entry : page.entries) coords.push_back(entry.coord);
+                if (!page.has_more) return coords;
+                has_cursor = true;
+                cursor = page.entries.back().coord;
+            }
+        };
+        const ChunkCoord before_all{-1000, 0, 0}, after_all{1000, 0, 0};
+        for (const auto& area : areas) {
+            const auto expected = inside(area, populated);
+            for (const std::size_t limit : {std::size_t{1U}, std::size_t{4U}, kMaxChunkScanLimit}) {
+                assert(collect(area, limit, nullptr, std::nullopt, nullptr) == expected);
+                assert(collect(area, limit, &before_all, std::nullopt, nullptr) == expected);
+            }
+            assert(collect(area, 4U, &after_all, std::nullopt, nullptr).empty());
+            if (!expected.empty()) {
+                const auto rest = collect(area, 3U, &expected.front(), std::nullopt, nullptr);
+                assert(std::equal(rest.begin(), rest.end(), expected.begin() + 1, expected.end()));
+            }
+        }
+
+        const auto position = store.ScanChunkIdentities(false, {}, 1U).position;
+        assert(position);
+        const auto snapshot = store.BeginTxnSnapshot(std::chrono::seconds(60));
+        std::set<ChunkCoord> changed;
+        for (const auto& coord : populated) {
+            if (((coord.x + coord.y + coord.z) % 3 + 3) % 3 != 0) continue;
+            write(coord, "01000000");
+            changed.insert(coord);
+        }
+        // A chunk emptied after the snapshot: SINCE lists its deletion, the
+        // snapshot still lists it, current pages no longer do.
+        const ChunkCoord emptied = inside(areas[0], populated).front();
+        if (dims == 3U) store.UnsetBlock3D(emptied.x * 4, emptied.y * 4, emptied.z * 4);
+        else store.UnsetBlock(emptied.x * 4, emptied.y * 4);
+        changed.insert(emptied);
+        auto now = populated;
+        now.erase(emptied);
+        for (const auto& area : areas) {
+            for (const std::size_t limit : {std::size_t{1U}, std::size_t{5U}, kMaxChunkScanLimit}) {
+                assert(collect(area, limit, nullptr, *position, nullptr) == inside(area, changed));
+                assert(collect(area, limit, nullptr, std::nullopt, snapshot.get()) == inside(area, populated));
+                assert(collect(area, limit, nullptr, std::nullopt, nullptr) == inside(area, now));
+            }
+        }
+        store.EndTxnSnapshot(*snapshot);
+
+        bool refused = false;
+        ChunkAreaSelector other{.dims = static_cast<std::uint8_t>(dims == 3U ? 2U : 3U)};
+        try { (void)store.ScanChunkIdentities(false, {}, 4U, {}, false, nullptr, &other); }
+        catch (const std::invalid_argument&) { refused = true; }
+        assert(refused);
+    }
+}
 }
 int main() {
     IdentityPagesIncludeRetainedDeletions();
     CandidateChangedDuringDiskRead();
     DataPagesBoundRetainedCopies();
+    AreaPagesListOnlyTheirCells();
 }

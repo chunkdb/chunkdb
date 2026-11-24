@@ -822,11 +822,12 @@ class ChunkStore {
         ChunkCoord cursor,
         std::size_t limit);
     // With `filter`, the page reads each identity's state, and every identity it
-    // visits counts toward `limit`, whether the filter keeps it or not.
+    // visits counts toward `limit`, whether the filter keeps it or not. With
+    // `area`, only identities inside it, still in ascending x, y, z order.
     [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentities(
         bool has_cursor, ChunkCoord cursor, std::size_t limit,
         std::optional<std::uint64_t> since = {}, bool with_data = false,
-        const ChunkScanFilter* filter = nullptr);
+        const ChunkScanFilter* filter = nullptr, const ChunkAreaSelector* area = nullptr);
     // ScanChunkIdentities as of a snapshot: the chunks populated at the
     // snapshot, with their state and version then, also those a later write
     // emptied; `position` is the snapshot's revision. It first waits for the
@@ -836,7 +837,7 @@ class ChunkStore {
     // another store's snapshot, and as the snapshot reads do.
     [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentitiesAt(const TxnSnapshot& snapshot,
         bool has_cursor, ChunkCoord cursor, std::size_t limit, bool with_data = false,
-        const ChunkScanFilter* filter = nullptr);
+        const ChunkScanFilter* filter = nullptr, const ChunkAreaSelector* area = nullptr);
     // With `with_vars`, each entry carries its text and bytes values, and
     // they count toward the response-byte limit.
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange(
@@ -1665,7 +1666,7 @@ class ChunkStore {
     // ScanChunkIdentities, or ScanChunkIdentitiesAt with `snapshot`.
     [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentitiesImpl(const TxnSnapshot* snapshot, bool has_cursor,
         ChunkCoord cursor, std::size_t limit, std::optional<std::uint64_t> since, bool with_data,
-        const ChunkScanFilter* filter);
+        const ChunkScanFilter* filter, const ChunkAreaSelector* area);
     // Waits until every write the snapshot includes has completed (see
     // ScanChunkIdentitiesAt).
     void WaitForTxnSnapshotWrites(const TxnSnapshot& snapshot);

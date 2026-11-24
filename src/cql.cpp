@@ -1488,6 +1488,22 @@ class Parser {
             Expect("from");
             ScanChunks scan;
             scan.table = Name("a table name");
+            if (Accept("area")) {
+                scan.has_area = true;
+                auto& area = scan.area;
+                area.around = Accept("around");
+                area.dims = Point(area.first.x, area.first.y, area.first.z, true);
+                if (area.around) {
+                    Expect("radius");
+                    area.radius = static_cast<std::int64_t>(Unsigned("a radius", std::numeric_limits<std::int64_t>::max()));
+                } else {
+                    Expect("to");
+                    if (Point(area.last.x, area.last.y, area.last.z, true) != area.dims)
+                        Fail(1, "AREA endpoints have different dimensions");
+                    if (area.first.x > area.last.x || area.first.y > area.last.y || area.first.z > area.last.z)
+                        Fail(1, "AREA bounds are reversed");
+                }
+            }
             while (true) {
                 const auto column = Peek().column;
                 if (Accept("after")) {

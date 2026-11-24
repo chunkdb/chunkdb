@@ -88,7 +88,8 @@ GET AREA cx0 cy0 [cz0] TO cx1 cy1 [cz1] FROM table [COLUMNS column, ...] [WITH S
     [SCALE k USING MAX | MIN | MODE | FIRST | ANY]
 GET AREA AROUND cx cy [cz] RADIUS radius FROM table [COLUMNS column, ...] [WITH SCHEMA] [LIMIT n] [AFTER cx cy [cz]]
     [SCALE k USING MAX | MIN | MODE | FIRST | ANY]
-SCAN CHUNKS FROM table [AFTER cx cy [cz]] [LIMIT count] [SINCE revision] [WHERE condition] [WITH DATA] [COLUMNS column, ...]
+SCAN CHUNKS FROM table [AREA cx0 cy0 [cz0] TO cx1 cy1 [cz1] | AREA AROUND cx cy [cz] RADIUS radius]
+    [AFTER cx cy [cz]] [LIMIT count] [SINCE revision] [WHERE condition] [WITH DATA] [COLUMNS column, ...]
 COMPACT TOMBSTONES table BEFORE revision
 SHOW TABLE STATS table
 ```
@@ -108,6 +109,7 @@ SHOW TABLE STATS table
 - `AFTER`: exclude this position and all earlier positions in coordinate order.
 - `LIMIT`: requested cells per area page, or maximum positions per scan page; scans default to at most 1024.
 - `SCALE k USING`: return each chunk downsampled by k with the named reduction; see [Downsampled areas](#downsampled-areas).
+- `AREA`: in SCAN CHUNKS, list only the chunks inside the range or ball, in the same order, without reading chunks outside it.
 - `SINCE`: include current identities with producing revisions greater than this value, including retained deletions.
 - `WHERE`: keep only blocks for which a [condition](../CQL.md#conditions) is true; see [Filter a scan](#filter-a-scan).
 - `WITH DATA`: append a complete form for populated chunks and null for deletions; required with scan COLUMNS.
@@ -259,6 +261,7 @@ As a page's first cell, or in a plain area, it is refused with `OUT_OF_RANGE rea
 `required` is the size of a reply holding only that chunk; read it with GET CHUNK or fewer COLUMNS, then continue AFTER its coordinate.
 A server started with `--max-area-response-bytes` of at least `required` returns that chunk in GET AREA.
 Independent pages can observe intervening writes; pages inside a transaction share its snapshot and private writes.
+A SCAN CHUNKS AFTER may lie outside its AREA; the page starts at the first chunk of the area after it.
 SCAN CHUNKS runs inside a [BEGIN READ ONLY](TRANSACTION_STATEMENTS.md) transaction without SINCE: its pages list the chunks populated at the snapshot and report the snapshot's revision as `position`.
 
 An empty page still provides a continuation when requested cells remain:

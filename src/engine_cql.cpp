@@ -2481,6 +2481,8 @@ std::string CommandEngine::ExecuteStatement(
                                                                       : AcquireNamedTable(session, scan.table);
                     const auto& geometry = lease.store().geometry();
                     if (scan.after) RequireDimensions(geometry, scan.dims);
+                    if (scan.has_area) RequireDimensions(geometry, scan.area.dims);
+                    const ChunkAreaSelector* area = scan.has_area ? &scan.area : nullptr;
                     if (!scan.with_data && !scan.columns.empty())
                         throw std::invalid_argument("SCAN COLUMNS requires WITH DATA");
                     const auto columns = ColumnsOf(geometry.layout(), scan.columns);
@@ -2518,10 +2520,10 @@ std::string CommandEngine::ExecuteStatement(
                         page = session.transaction != nullptr
                             ? lease.store().ScanChunkIdentitiesAt(*session.transaction->snapshot, scan.after.has_value(),
                                   cursor, static_cast<std::size_t>(limit), scan.with_data,
-                                  scan_filter ? &*scan_filter : nullptr)
+                                  scan_filter ? &*scan_filter : nullptr, area)
                             : lease.store().ScanChunkIdentities(scan.after.has_value(), cursor,
                                   static_cast<std::size_t>(limit), scan.since, scan.with_data,
-                                  scan_filter ? &*scan_filter : nullptr);
+                                  scan_filter ? &*scan_filter : nullptr, area);
                     } catch (const TombstoneHistoryLostError& error) {
                         const auto floor = std::to_string(error.retained_deletion_floor());
                         const auto epoch = StoreIdHex(lease.store().store_id());
