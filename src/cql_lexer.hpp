@@ -59,7 +59,8 @@ struct Token {
 [[nodiscard]] bool IsWordPart(char c) noexcept;
 [[nodiscard]] bool IsDigit(char c) noexcept;
 [[nodiscard]] std::string Lower(std::string_view text);
-// `text` with control bytes as \xHH, so an error reply stays one line.
+// `text` with control bytes and bytes of 0x80 and above as \xHH, so an
+// error reply stays one line of ASCII.
 [[nodiscard]] std::string Printable(std::string_view text);
 [[noreturn]] void Fail(std::size_t column, const std::string& message);
 // The token as an error message names it.
