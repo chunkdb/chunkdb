@@ -298,10 +298,17 @@ std::vector<std::uint8_t> EncodeUsers(const Users& users) {
         PutU64(&out, user.statements_per_sec);
     }
     PutU32(&out, Crc32(out));
+    if (out.size() > kMaxUsersFileBytes) {
+        throw std::invalid_argument("chunkdb.users would take " + std::to_string(out.size()) + " bytes, more than " +
+            std::to_string(kMaxUsersFileBytes));
+    }
     return out;
 }
 
 Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
+    if (bytes.size() > kMaxUsersFileBytes) {
+        throw std::invalid_argument("chunkdb.users is larger than " + std::to_string(kMaxUsersFileBytes) + " bytes");
+    }
     if (bytes.size() < kMagic.size() + 8U || !std::equal(kMagic.begin(), kMagic.end(), bytes.begin())) {
         throw std::invalid_argument("chunkdb.users is not a chunkdb users file");
     }
@@ -408,6 +415,10 @@ std::optional<Users> ReadUsersFile(const std::filesystem::path& data_dir) {
     const auto path = data_dir / kUsersFileName;
     if (!std::filesystem::exists(path)) {
         return std::nullopt;
+    }
+    // Checked before the file is read whole.
+    if (std::filesystem::file_size(path) > kMaxUsersFileBytes) {
+        throw std::invalid_argument("chunkdb.users is larger than " + std::to_string(kMaxUsersFileBytes) + " bytes");
     }
     return DecodeUsers(LoadFile(path));
 }

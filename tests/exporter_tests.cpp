@@ -1,13 +1,17 @@
 // chunkdb_exporter as a process against a chunkdb_server process: flags,
 // login with the MONITOR right, scrapes, refusals, a server restart and TLS.
 // Usage: chunkdb_exporter_test <chunkdb_exporter> <chunkdb_server>
+#include <algorithm>
 #include <cassert>
+#include <cerrno>
 #include <chrono>
 #include <cstdio>
+#include <cstring>
 #include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iterator>
+#include <stdexcept>
 #include <stop_token>
 #include <string>
 #include <string_view>
@@ -62,7 +66,9 @@ int Connect(int port) {
     address.sin_port = htons(static_cast<std::uint16_t>(port));
     address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     if (connect(fd, reinterpret_cast<sockaddr*>(&address), sizeof(address)) != 0) {
+        const int error = errno;  // For the caller's message.
         close(fd);
+        errno = error;
         return -1;
     }
     return fd;
@@ -71,12 +77,16 @@ int Connect(int port) {
 // A child process with its output in `log`.
 class Process {
   public:
-    Process(const std::string& binary, std::vector<std::string> arguments, const std::filesystem::path& log) {
+    Process(const std::string& binary, std::vector<std::string> arguments, const std::filesystem::path& log)
+        : log_(log) {
+        // Emptied before the fork: a restart that reuses `log` must not show the
+        // previous process's port to WaitListening.
+        const int out = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        assert(out >= 0);
         pid_ = fork();
         assert(pid_ >= 0);
         if (pid_ == 0) {
-            FILE* out = std::fopen(log.c_str(), "w");
-            if (out == nullptr || dup2(fileno(out), STDERR_FILENO) < 0 || dup2(fileno(out), STDOUT_FILENO) < 0) _exit(126);
+            if (dup2(out, STDERR_FILENO) < 0 || dup2(out, STDOUT_FILENO) < 0) _exit(126);
             arguments.insert(arguments.begin(), binary);
             std::vector<char*> argv;
             for (auto& argument : arguments) argv.push_back(argument.data());
@@ -84,8 +94,11 @@ class Process {
             execv(binary.c_str(), argv.data());
             _exit(127);
         }
+        close(out);
+        live_.push_back(this);
     }
     ~Process() {
+        live_.erase(std::remove(live_.begin(), live_.end(), this), live_.end());
         if (pid_ > 0) {
             kill(pid_, SIGKILL);
             (void)waitpid(pid_, nullptr, 0);
@@ -94,18 +107,14 @@ class Process {
     Process(const Process&) = delete;
     Process& operator=(const Process&) = delete;
 
-    // Waits until `port` accepts connections, failing if the process ends.
-    void WaitListening(int port) {
+    // The port in the `port` field of the log line `message`, which the process
+    // writes once it listens; fails if the process ends first.
+    int WaitListening(const std::string& message) {
         const auto deadline = Clock::now() + std::chrono::seconds(20);
         for (;;) {
-            const int fd = Connect(port);
-            if (fd >= 0) {
-                close(fd);
-                return;
-            }
-            int status = 0;
-            assert(waitpid(pid_, &status, WNOHANG) == 0);
-            assert(Clock::now() < deadline);
+            if (const auto port = chunkdb::test::LogLinePort(log_, message)) return *port;
+            if (!Running() || Clock::now() >= deadline)
+                throw std::runtime_error("no log line \"" + message + "\" within 20 s" + Describe());
             std::this_thread::sleep_for(std::chrono::milliseconds(20));
         }
     }
@@ -126,14 +135,48 @@ class Process {
         return WEXITSTATUS(status);
     }
 
+    // Each live child: pid, state and the end of its log, for a failure message.
+    static std::string DescribeAll() {
+        std::string out;
+        for (const auto* process : live_) out += process->Describe();
+        return out;
+    }
+
   private:
+    // Whether the child has not exited; it is not reaped, so Stop and Wait
+    // still see its status.
+    [[nodiscard]] bool Running() const {
+        if (pid_ <= 0) return false;
+        siginfo_t info{};
+        return waitid(P_PID, static_cast<id_t>(pid_), &info, WEXITED | WNOHANG | WNOWAIT) == 0 && info.si_pid == 0;
+    }
+    [[nodiscard]] std::string Describe() const {
+        std::string state = "reaped";
+        if (pid_ > 0) {
+            siginfo_t info{};
+            if (waitid(P_PID, static_cast<id_t>(pid_), &info, WEXITED | WNOHANG | WNOWAIT) != 0) state = "unknown";
+            else if (info.si_pid == 0) state = "running";
+            else state = (info.si_code == CLD_EXITED ? "exited " : "killed by signal ") + std::to_string(info.si_status);
+        }
+        std::ifstream in(log_, std::ios::binary);
+        const std::string text{std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>()};
+        return "\n--- pid=" + std::to_string(pid_) + " " + state + " log=" + log_.string() + "\n" +
+               text.substr(text.size() > 4000U ? text.size() - 4000U : 0U);
+    }
+
+    static inline std::vector<const Process*> live_;
+    std::filesystem::path log_;
     pid_t pid_ = -1;
 };
 
 // One HTTP exchange; the whole response.
 std::string Http(int port, const std::string& request) {
     const int fd = Connect(port);
-    assert(fd >= 0);
+    if (fd < 0) {
+        const int error = errno;
+        throw std::runtime_error("cannot connect to 127.0.0.1:" + std::to_string(port) + ": " +
+                                 std::strerror(error) + Process::DescribeAll());
+    }
     assert(send(fd, request.data(), request.size(), 0) == static_cast<ssize_t>(request.size()));
     std::string response;
     char buffer[4096];
@@ -160,19 +203,24 @@ struct Fixture {
     chunkdb::test::ScopedTempDir dir{"chunkdb-exporter"};
     std::string exporter;
     std::string server_binary;
-    int server_port = chunkdb::test::PickListenerPort();
+    // 0 until the first start, where the server picks it; restarts keep it.
+    int server_port = 0;
     std::filesystem::path admin_password = dir.path() / "admin.password";
     std::vector<std::string> server_tls;
     std::string idle_timeout_ms = "60000";
 
     std::unique_ptr<Process> StartServer(const std::string& log_name = "server.log") {
         std::vector<std::string> arguments = {
-            "--host", "127.0.0.1", "--port", std::to_string(server_port), "--data-dir", (dir.path() / "data").string(),
+            "--host", "127.0.0.1", "--data-dir", (dir.path() / "data").string(),
             "--auth", "scram", "--admin-user", "admin", "--admin-password-file", admin_password.string(),
-            "--log-level", "error", "--workers", "2", "--idle-connection-timeout-ms", idle_timeout_ms};
+            "--log-level", "info", "--workers", "2", "--idle-connection-timeout-ms", idle_timeout_ms};
         arguments.insert(arguments.end(), server_tls.begin(), server_tls.end());
+        // After a --listen-uri in server_tls, so this port is the one used.
+        arguments.insert(arguments.end(), {"--port", std::to_string(server_port)});
         auto server = std::make_unique<Process>(server_binary, arguments, dir.path() / log_name);
-        server->WaitListening(server_port);
+        const int port = server->WaitListening("ready to accept connections");
+        assert(server_port == 0 || port == server_port);
+        server_port = port;
         return server;
     }
 
@@ -210,17 +258,18 @@ struct Fixture {
         WriteFile(dir.path() / (name + ".password"), password + "\n");
     }
 
-    std::unique_ptr<Process> StartExporter(const std::string& user, int port, std::vector<std::string> extra = {}) {
+    // The exporter listens on a free port, which `port` receives.
+    std::unique_ptr<Process> StartExporter(const std::string& user, int& port, std::vector<std::string> extra = {}) {
         std::vector<std::string> arguments = {"--uri", Uri(user), "--password-file",
                                               (dir.path() / (user + ".password")).string(),
-                                              "--listen", "127.0.0.1:" + std::to_string(port), "--timeout-ms", "2000"};
+                                              "--listen", "127.0.0.1:0", "--timeout-ms", "2000"};
         if (!server_tls.empty()) {
             arguments.push_back("--tls-ca-file");
             arguments.push_back((dir.path() / "server.pem").string());
         }
         arguments.insert(arguments.end(), extra.begin(), extra.end());
         auto process = std::make_unique<Process>(exporter, arguments, dir.path() / ("exporter-" + user + ".log"));
-        process->WaitListening(port);
+        port = process->WaitListening("serving metrics");
         return process;
     }
 };
@@ -246,7 +295,7 @@ void TestFlags(const std::string& exporter) {
     refused({"--uri", "chunk://m@127.0.0.1:4242/", "--password-file", password.string(), "--timeout-ms", "0"}, 2,
             "--timeout-ms");
     refused({"--uri", "chunk://m@127.0.0.1:4242/", "--password-file", password.string(), "--listen",
-             "0.0.0.0:" + std::to_string(chunkdb::test::PickListenerPort())},
+             "0.0.0.0:0"},
             1, "--allow-remote");
     refused({"--bogus"}, 2, "unknown option --bogus");
     const auto shared = dir.path() / "shared.password";
@@ -262,7 +311,7 @@ void TestAgainstServer(Fixture& fixture) {
     fixture.CreateUser("plain", "plain-password");
     fixture.Admin({"GRANT MONITOR ON * TO monitor", "CREATE TABLE terrain (bits bits(16))"});
 
-    const int port = chunkdb::test::PickListenerPort();
+    int port = 0;
     auto exporter = fixture.StartExporter("monitor", port);
     auto response = Scrape(port);
     assert(StatusLine(response) == "HTTP/1.1 200 OK");
@@ -281,7 +330,7 @@ void TestAgainstServer(Fixture& fixture) {
     assert(StatusLine(Http(port, "nonsense\r\n\r\n")) == "HTTP/1.1 400 Bad Request");
 
     // A user without MONITOR: the server refuses SHOW METRICS.
-    const int plain_port = chunkdb::test::PickListenerPort();
+    int plain_port = 0;
     auto plain = fixture.StartExporter("plain", plain_port);
     const auto refused = Scrape(plain_port);
     assert(StatusLine(refused) == "HTTP/1.1 503 Service Unavailable");
@@ -359,13 +408,13 @@ void TestTls(const std::string& exporter, const std::string& server_binary) {
         std::puts("openssl cannot make a test certificate; chunks:// not tested");
         return;
     }
-    fixture.server_tls = {"--listen-uri", "chunks://127.0.0.1:" + std::to_string(fixture.server_port) + "/",
+    fixture.server_tls = {"--listen-uri", "chunks://127.0.0.1:0/",
                           "--tls-cert", base + ".pem", "--tls-key", base + ".key", "--auth-channel-binding", "require"};
     WriteFile(fixture.admin_password, "admin-password\n");
     auto server = fixture.StartServer();
     fixture.CreateUser("monitor", "monitor-password");
     fixture.Admin({"GRANT MONITOR ON * TO monitor"});
-    const int port = chunkdb::test::PickListenerPort();
+    int port = 0;
     {
         auto process = fixture.StartExporter("monitor", port);
         const auto response = Scrape(port);
@@ -380,9 +429,9 @@ void TestTls(const std::string& exporter, const std::string& server_binary) {
     // A certificate the exporter does not trust.
     {
         std::vector<std::string> arguments = {"--uri", fixture.Uri("monitor"), "--password-file",
-            (fixture.dir.path() / "monitor.password").string(), "--listen", "127.0.0.1:" + std::to_string(port)};
+            (fixture.dir.path() / "monitor.password").string(), "--listen", "127.0.0.1:0"};
         Process process(exporter, arguments, fixture.dir.path() / "exporter-untrusted.log");
-        process.WaitListening(port);
+        port = process.WaitListening("serving metrics");
         assert(StatusLine(Scrape(port)) == "HTTP/1.1 503 Service Unavailable");
     }
     assert(ReadFile(fixture.dir.path() / "exporter-untrusted.log").find("not trusted") != std::string::npos);
@@ -394,15 +443,21 @@ void TestTls(const std::string& exporter, const std::string& server_binary) {
 int main(int argc, char** argv) {
     assert(argc == 3);
     signal(SIGPIPE, SIG_IGN);
-    TestFlags(argv[1]);
-    {
-        Fixture fixture;
-        fixture.exporter = argv[1];
-        fixture.server_binary = argv[2];
-        fixture.idle_timeout_ms = "500";
-        TestAgainstServer(fixture);
+    // A caught failure unwinds, so each Process destructor kills its child.
+    try {
+        TestFlags(argv[1]);
+        {
+            Fixture fixture;
+            fixture.exporter = argv[1];
+            fixture.server_binary = argv[2];
+            fixture.idle_timeout_ms = "500";
+            TestAgainstServer(fixture);
+        }
+        TestTls(argv[1], argv[2]);
+    } catch (const std::exception& error) {
+        std::fprintf(stderr, "FAIL exporter: %s\n", error.what());
+        return 1;
     }
-    TestTls(argv[1], argv[2]);
     std::puts("exporter tests passed");
     return 0;
 }

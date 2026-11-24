@@ -99,6 +99,7 @@ An unauthenticated user or an idle statement is represented by NULL in its field
 `progress` is NULL unless the running statement reports progress; a running `RESTORE TABLE` reports a map of integers `files_done`, `files_total`, `bytes_done`, and `bytes_total` for its copy of the backup.
 The map appears when the copy starts; `progress` is NULL while the restore checks the backup before the copy and once the statement completes, including while its reply is written.
 The reply includes every authorized connection or fails with `OUT_OF_RANGE reason=response_limit`; it never truncates the listing.
+When the server's output reserve for listings is held by unread listings, it receives `BUSY reason=reply_budget`; logins and other replies do not draw from that reserve.
 Users control sessions belonging to their current user incarnation; ADMIN on `*` may control every session, and MONITOR may list every session.
 
 `CANCEL id` returns `{cancelled: bool}` and accepts cancellation only before the target statement enters its irreversible decision.
@@ -143,8 +144,8 @@ A bounded fixed-width value of the wrong length returns INVALID_ARGUMENT and pre
 
 ## Read metadata
 
-DESCRIBE adds `epoch`, `revision`, `dims`, and `chunk_columns` to its existing map.
-`version` remains the schema version; `revision` is the completed commit frontier within the 32-hex-digit table epoch.
+DESCRIBE returns `epoch`, `revision`, `dims`, and `chunk_columns` with the schema.
+`version` is the schema version; `revision` is the completed commit frontier within the 32-hex-digit table epoch.
 Read-only mode encodes an unknown frontier as null; read-write mode returns an unsigned integer.
 DESCRIBE of a fenced table adds `fenced` with its reason and encodes its frontier as null.
 The frontier includes terminal reservation gaps but never crosses an unfinished producer.
@@ -273,7 +274,7 @@ Slot progress cannot pass the durable frontier or changes not yet queued ahead o
 
 An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
 Slot pushes stop at the persisted durable frontier; see [durable slots](reference/FEED.md#notes) for ACK persistence and batching.
-SHOW SLOTS reports written `acked`, the durable `revision`, `lag_revisions`, retained bytes, `attached` and loss state.
+SHOW SLOTS reports written `acked`, the durable `revision`, `lag_revisions`, retained bytes, `attached`, the attached watch's `peer` and `last_ack_ms` (null without a watch), and loss state.
 CHUNKS pushes use `[chunks,epoch,revision,commit_time_ms,user,schema_version,chunks,tag,txn]`.
 Each chunk is `[cx,cy,version,form_or_null]` or `[cx,cy,cz,version,form_or_null]`; a null form represents deletion.
 Forms match GET CHUNK for that exact commit and projection; later writes cannot change queued bytes.

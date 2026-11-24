@@ -20,6 +20,7 @@
 
 #ifndef _WIN32
 #include <arpa/inet.h>
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <signal.h>
 #include <sys/socket.h>
@@ -204,22 +205,25 @@ class ServerProcess {
   private:
     bool Start(const std::string& binary, const std::filesystem::path& data_dir,
                const std::vector<std::string>& options) {
+        // Emptied before the fork: a server that reuses `log_` must not show an
+        // earlier server's ready line to the wait below.
+        const int out = open(log_.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        assert(out >= 0);
         pid_ = fork();
         assert(pid_ >= 0);
         if (pid_ == 0) {
             // A test runner may ignore SIGPIPE; the server must not rely on it.
             signal(SIGPIPE, SIG_DFL);
             const std::string dir = data_dir.string();
-            FILE* out = std::fopen(log_.c_str(), "w");
-            assert(out != nullptr);
-            assert(dup2(fileno(out), STDERR_FILENO) >= 0);
-            assert(dup2(fileno(out), STDOUT_FILENO) >= 0);
+            assert(dup2(out, STDERR_FILENO) >= 0);
+            assert(dup2(out, STDOUT_FILENO) >= 0);
             // The ready line naming the port is an INFO line.
             std::vector<std::string> arguments = {"--host", "127.0.0.1", "--port", "0", "--data-dir", dir,
                 "--log-level", "info", "--workers", "2", "--wal-group-commit-updates", "100"};
             arguments.insert(arguments.end(), options.begin(), options.end());
             ExecServer(binary, std::move(arguments));
         }
+        close(out);
         const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(20);
         for (;;) {
             if (!Alive()) {
@@ -539,7 +543,7 @@ void TestTlsReloadsOnHangup(const std::string& binary) {
     };
     install("first", "first");
     const auto log = dir.path() / "server.log";
-    ServerProcess server(binary, dir.path() / "data", {"--auth", "none", "--listen-uri", "chunks://127.0.0.1/", "--port", "0",
+    ServerProcess server(binary, dir.path() / "data", {"--auth", "none", "--listen-uri", "chunks://127.0.0.1:0/",
         "--tls-cert", cert.string(), "--tls-key", key.string(), "--log-level", "info"}, log);
     const auto served = [&] {
         return Output("openssl s_client -connect 127.0.0.1:" + std::to_string(server.port()) +

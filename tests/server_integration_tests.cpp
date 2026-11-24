@@ -149,6 +149,16 @@ bool IsWouldBlockError() {
 #endif
 }
 
+// Whether the last socket error says the peer closed or reset the connection.
+bool IsPeerClosedError() {
+#ifdef _WIN32
+    const int code = WSAGetLastError();
+    return code == WSAECONNRESET || code == WSAECONNABORTED || code == WSAESHUTDOWN;
+#else
+    return errno == EPIPE || errno == ECONNRESET;
+#endif
+}
+
 void ConfigureSocketNoSigPipe(SocketHandle socket) {
 #if defined(__APPLE__)
     const int enabled = 1;
@@ -412,7 +422,13 @@ class RawClient {
         }
     }
 
-    void SendBytes(const std::string& data) {
+    void SendBytes(const std::string& data) { (void)Send(data, false); }
+
+    // Sends `data`, or returns false when the server has already closed or
+    // reset the connection, as a request deadline may before the next byte.
+    [[nodiscard]] bool SendBytesUnlessClosed(const std::string& data) { return Send(data, true); }
+
+    bool Send(const std::string& data, bool closed_ok) {
         chunkdb::test::FeedPhaseWatchdog::Command("client: send", data);
         // Keep the verb only: AUTH and statements may carry credentials or data.
         last_request_ = data.substr(0, std::min(data.find_first_of(" \t\r\n"), std::size_t{32}));
@@ -447,11 +463,13 @@ class RawClient {
                     continue;
                 }
 #endif
+                if (closed_ok && written < 0 && IsPeerClosedError()) return false;
                 throw std::runtime_error("failed to send client bytes " + ReadContext() +
                     " sent=" + std::to_string(offset) + " of=" + std::to_string(data.size()));
             }
             offset += static_cast<std::size_t>(written);
         }
+        return true;
     }
 
     void Disconnect() {
@@ -4548,6 +4566,27 @@ void TestMaxAuthFailuresDisconnects() {
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
+// A delivery hook is refused before the server's transports exist, which it
+// would not reach; clearing one needs none.
+void TestDeliveryHookNeedsTransports() {
+    struct Unused : chunkdb::FeedDeliveryTestHook {
+        void Run(Point, std::size_t) override {}
+    } hook;
+    auto store_cfg = BaseStoreConfig();
+    store_cfg.data_dir = TempDataDir("hook-before-start");
+    {
+        auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(store_cfg));
+        auto engine = std::make_shared<chunkdb::CommandEngine>(chunkdb::EngineConfig{.require_auth = false}, catalog);
+        chunkdb::ChunkServer server(BaseServerConfig(), engine);
+        bool refused = false;
+        try { chunkdb::FeedDeliveryTestAccess::SetObserverHook(server, &hook); }
+        catch (const std::logic_error& error) { refused = std::string(error.what()).find("transports") != std::string::npos; }
+        assert(refused);
+        chunkdb::FeedDeliveryTestAccess::SetHook(server, nullptr);
+    }
+    RemoveAllWithRetry(store_cfg.data_dir);
+}
+
 // Calls Stop on the Run thread at one point of Run's startup.
 class StopAtStartupHook : public chunkdb::FeedDeliveryTestHook {
   public:
@@ -4613,7 +4652,8 @@ void TestStopDuringStartup() {
 }
 
 // While ALTER TABLE waits for a lease to drain, SHOW METRICS answers at once
-// without that table, and the server stops without waiting for either.
+// without that table's store samples, and the server stops without waiting
+// for either.
 void TestShowMetricsBusyTable() {
     ServerHarness harness("metrics-busy", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
                           BaseServerConfig());
@@ -4643,7 +4683,10 @@ void TestShowMetricsBusyTable() {
     stop.get();
     assert(scraped && stopped);
     const auto response = scrape.get();
-    assert(response.find("table=\"default\"") == std::string::npos);
+    // Only its chunkdb_table_fenced sample, which needs no lease.
+    const auto labelled = response.find("table=\"default\"");
+    assert(labelled != std::string::npos && response.find("table=\"default\"", labelled + 1U) == std::string::npos);
+    assert(response.find("\nchunkdb_table_fenced{table=\"default\"} 0\n") != std::string::npos);
     assert(response.find("chunkdb_commands_total") != std::string::npos);
 }
 
@@ -5291,14 +5334,16 @@ void TestSlowRequestDribbleDeadlineReleasesWorker() {
     RawClient stalled("127.0.0.1", harness.port);
     stalled.Hello();
     stalled.SendBytes("P");
+    // The 250 ms request deadline runs from "P". On a slow host it can close the
+    // connection before a later byte is sent; the test asserts that close below.
     std::this_thread::sleep_for(std::chrono::milliseconds(90));
-    stalled.SendBytes("I");
+    (void)stalled.SendBytesUnlessClosed("I");
     std::this_thread::sleep_for(std::chrono::milliseconds(90));
 
     RawClient fast("127.0.0.1", harness.port);
     fast.SendLine("HELLO 3");
 
-    stalled.SendBytes("N");
+    (void)stalled.SendBytesUnlessClosed("N");
 
     std::string response;
     assert(fast.ReadLineWithin(std::chrono::milliseconds(1500), &response));
@@ -5859,6 +5904,31 @@ class StatementTrackerHook : public chunkdb::FeedDeliveryTestHook {
     }
     std::atomic<std::size_t> last{0U}, maximum{0U};
 };
+// SHOW CONNECTIONS reserves the encoded size of its listing, from a reserve of
+// its own: with all but 64 KiB of it held a listing is answered, where the most
+// a listing could take was reserved before; with all of it held the listing is
+// refused with BUSY, and logins and other replies are answered.
+void TestListingReplyShare() {
+    ServerHarness harness("listing-reply-share", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
+        BaseServerConfig());
+    RawClient controller("127.0.0.1", harness.port); controller.SetReadDeadline(std::chrono::seconds(10)); controller.Hello();
+    constexpr std::size_t kReserve = 16777216U;
+    auto held = chunkdb::FeedDeliveryTestAccess::ReserveListingReplyCredit(*harness.server, kReserve - 65536U);
+    assert(held);
+    controller.SendLine("SHOW CONNECTIONS"); assert(controller.ReadReply().starts_with('*'));
+    // The answered PING follows the end of the listing's write, which returned its reservation.
+    controller.SendLine("PING"); assert(controller.ReadLine() == "+PONG\r\n");
+    held.reset();
+    held = chunkdb::FeedDeliveryTestAccess::ReserveListingReplyCredit(*harness.server, kReserve);
+    assert(held);
+    controller.SendLine("SHOW CONNECTIONS");
+    assert(controller.ReadLine().starts_with("-ERR BUSY reason=reply_budget "));
+    RawClient login("127.0.0.1", harness.port); login.SetReadDeadline(std::chrono::seconds(10));
+    login.SendLine("HELLO 3"); (void)ReadHelloReply(login);
+    login.SendLine("HELLO 3"); assert(login.ReadLine().starts_with("-ERR PROTOCOL"));
+    controller.SendLine("PING"); assert(controller.ReadLine() == "+PONG\r\n");
+}
+
 void TestReplyAdmissionPrecedesMutation() {
     StatementTrackerHook hook;
     ServerHarness harness("reply-credit-before-write", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
@@ -6261,10 +6331,10 @@ void TestServerHarnessStartupFailure() {
     // The same holds when another listener takes the port while the server
     // is stopped: Restart reports the listen failure instead of probing it.
     {
-        auto kept = BaseServerConfig();
-        kept.port = chunkdb::test::PickListenerPort();
         ServerHarness harness("harness-restart-taken-port", BaseStoreConfig(),
-            chunkdb::EngineConfig{.require_auth = false}, kept);
+            chunkdb::EngineConfig{.require_auth = false}, BaseServerConfig());
+        // Restart on the port the server picked, as a test-given port is kept.
+        harness.saved_server_config.port = harness.port;
         harness.server->Stop();
         harness.JoinStopped();
         const OccupiedPort taken(harness.port);
@@ -8740,6 +8810,7 @@ int main(int argc, char** argv) {
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
         run("TestShowMetricsBusyTable", TestShowMetricsBusyTable);
         run("TestStopDuringStartup", TestStopDuringStartup);
+        run("TestDeliveryHookNeedsTransports", TestDeliveryHookNeedsTransports);
         run("TestPortZeroReportsPickedPort", TestPortZeroReportsPickedPort);
         run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL
@@ -8777,6 +8848,7 @@ int main(int argc, char** argv) {
         run("TestServerDefaultStatementTimeout", TestServerDefaultStatementTimeout);
         run("TestWideNullableReadHasBoundedReplyAdmission", TestWideNullableReadHasBoundedReplyAdmission);
         run("TestReplyAdmissionPrecedesMutation", TestReplyAdmissionPrecedesMutation);
+        run("TestListingReplyShare", TestListingReplyShare);
         run("TestRemovingCreditHeadAdmitsNextWaiter", TestRemovingCreditHeadAdmitsNextWaiter);
         run("TestPayloadCreditWaitIsRefused", TestPayloadCreditWaitIsRefused);
         run("TestPayloadCreditGrantRestartsFrameDeadline", TestPayloadCreditGrantRestartsFrameDeadline);
