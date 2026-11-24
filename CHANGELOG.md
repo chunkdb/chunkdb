@@ -2,6 +2,7 @@
 
 ## Unreleased
 
+- `--listen-uri` takes port 0 as `--port` does; `chunkdb_exporter --listen host:0` listens on a free port, which the `port` field of its INFO line `serving metrics` names, now written at once; `chunkdb_server_bench --server-mode spawn --port 0` starts its server on a free port and reports that port (#130).
 - The SCRAM challenge for an unknown user takes its iteration count and salt length from the verifier of an existing user, chosen by the name, instead of always 4096 iterations and a 16-byte salt, so it looks like the challenge of a user who exists when users have other parameters (#287).
 - `chunkdb_verify` reports commit group owner files in a data directory or table, which this build never creates, as `group_owner_unclaimed` warnings instead of `unexpected_entry`, `foreign_entry` or no finding (#136).
 - A failed close of a file or directory descriptor after a sync or an atomic write is no longer retried or repeated: the descriptor is closed exactly once and the failure, an interrupted close included, is returned; before, a retried close could close a descriptor another thread had just opened (#282).
