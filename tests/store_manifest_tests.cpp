@@ -1024,7 +1024,7 @@ void TestNamedFeatureRegistry() {
     const chunkdb::FeatureFlags future{.incompat = bits | (1U << 30U), .ro_compat = 3, .compat = 7};
     const auto table = chunkdb::TableScopedFeatures(future);
     assert(table.incompat == chunkdb::kTableBaselineFeatures.incompat);
-    assert(table.incompat == 301U);
+    assert(table.incompat == 557U);
     assert(table.ro_compat == 0U && table.compat == 0U);
     assert(chunkdb::UnknownFeatures(future).incompat == (1U << 30U));
 }

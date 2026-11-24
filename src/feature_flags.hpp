@@ -32,7 +32,7 @@ inline constexpr std::uint32_t kFeatureCommitGroups = 64U;
 // MESSAGE WAL TLVs: application messages a write or transaction publishes
 // in its commit (docs/design/MESSAGES.md). Older writers must refuse: they
 // would read the TLV as damage.
-inline constexpr std::uint32_t kFeatureMessages = 256U;
+inline constexpr std::uint32_t kFeatureMessages = 512U;
 
 struct FeatureDefinition {
     std::string_view name;

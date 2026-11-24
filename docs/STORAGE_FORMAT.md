@@ -83,7 +83,7 @@ Unknown `incompat` bits refuse opening; unknown `ro_compat` bits permit only rea
 The server opens read-write and therefore refuses either of the first two unknown sets; with `--read-only` it refuses only unknown `incompat` bits.
 Table incompat bit 0 (`0x1`) enables durable feed slots, USER WAL metadata, and collection-frame flags; it remains set after slot removal.
 Directory and table incompat bit 5 (`0x20`), named `chunk_model`, owns dimensional geometry, both column domains, sectioned forms, and retained coordinate decisions.
-Directory and table incompat bit 8 (`0x100`), named `messages`, owns MESSAGE WAL TLVs.
+Directory and table incompat bit 9 (`0x200`), named `messages`, owns MESSAGE WAL TLVs.
 Directory and table incompat bit 6 (`0x40`) is reserved for commit groups, which this build does not provide: it never sets the bit, `ENABLE FEATURE` does not accept it, and a directory or table that records it is refused as an unknown feature.
 Envelopes of 1.x and of development builds of 2.0 are refused before any artifact changes; such a data directory must be recreated.
 

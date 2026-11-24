@@ -21,7 +21,7 @@ Without PUBLISH, an unchanged write commits nothing, as before.
 The message is WAL TLV type 5, MESSAGE: channel length `u8`, the channel, then the message bytes.
 It sits in the frame header's TLV area, so the header CRC covers it, and replay validates it with the rest of the frame before applying anything.
 A frame holds at most one MESSAGE; collection frames hold none.
-The TLV requires table incompat feature `messages` (`0x100`), so a build without it refuses the table instead of reading the TLV as damage.
+The TLV requires table incompat feature `messages` (`0x200`), so a build without it refuses the table instead of reading the TLV as damage.
 The largest MESSAGE takes 4 + 1 + 63 + 16384 = 16452 bytes of the 65535-byte TLV area, which leaves room for SCHEMA, USER, GROUP and a TAG.
 
 A single-chunk write carries the message on its one frame.
