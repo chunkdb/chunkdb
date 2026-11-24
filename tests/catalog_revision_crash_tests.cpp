@@ -17,6 +17,7 @@
 #include "../src/catalog_feed.hpp"
 #include "../src/catalog_revision.hpp"
 #include "../src/chunk_store_internal.hpp"
+#include "../src/slot_watch.hpp"
 #include "../src/store_manifest.hpp"
 #include "../src/verify.hpp"
 
@@ -74,13 +75,14 @@ void Case(const std::string& executable, const Point& point) {
 
     Engine e(dir.path(), true);
     assert((e.catalog->Find("crash_t") != nullptr) == point.table);
-    const auto started = *ReadCatalogRevision(dir.path());
-    // A mark that was not cleared moves the start to a new revision.
-    assert(started.epoch == before.epoch && !started.in_progress && started.revision == before.revision + 1U);
     // A consumer at the last revision recorded before the crash.
     const auto position = StoreIdHex(before.epoch) + " " + std::to_string(crashed.revision);
     const auto reply = e.Run("WATCH CATALOG AFTER " + position);
     assert(reply.rfind("%2\r\n", 0) == 0);
+    // The read recorded the revision it took: a mark that was not cleared
+    // moved the start to a new one.
+    const auto started = *ReadCatalogRevision(dir.path());
+    assert(started.epoch == before.epoch && !started.in_progress && started.revision == before.revision + 1U);
     const auto first = e.session.catalog_watch->Next();
     if (point.revision) {
         // Its revision names the catalog with the table: it continues.
@@ -116,9 +118,37 @@ void VerifyRecord() {
     const auto damaged_text = damaged.str();
     assert(found.errors == 0U && found.warnings == checked.warnings + 1U);
     assert(damaged_text.find("catalog_revision_invalid") != std::string::npos);
-    // The start replaces it with a new epoch.
-    const Engine e(dir.path(), true);
+    // The next catalog statement replaces it with a new epoch.
+    Engine e(dir.path(), true);
+    Reply(e.Run("CREATE TABLE later (n u8) CHUNK 4 x 4"), "+OK\r\n");
     assert(ReadCatalogRevision(dir.path()).has_value());
+}
+
+// Only an attach that records a slot's owner changes the catalog: it takes one
+// revision, and an attach that records nothing leaves the clock alone.
+void SlotOwnerRevision() {
+    test::ScopedTempDir dir("chunkdb-catalog-slot-owner");
+    {
+        // Without users a slot records no owner.
+        Engine open(dir.path(), false);
+        Reply(open.Run("CREATE TABLE realm (n u8) CHUNK 4 x 4"), "+OK\r\n");
+        Reply(open.Run("CREATE SLOT 'a' ON realm"), "+OK\r\n");
+        Reply(open.Run("CREATE SLOT 'b' ON realm"), "+OK\r\n");
+    }
+    Engine e(dir.path(), true);
+    e.users->Create("reader", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
+    e.users->Grant("reader", "realm", Right::kRead);
+    const auto revision = [&] { return ReadCatalogRevision(dir.path())->revision; };
+    const auto before = revision();
+    // ADMIN on * records nobody.
+    assert(e.Run("WATCH realm SLOT 'b'").rfind("%2\r\n", 0) == 0);
+    assert(revision() == before);
+    SessionState reader;
+    assert(test::LoginOnEngine(*e.engine, reader, "reader", "pw").rfind("%", 0) == 0);
+    assert(e.engine->Execute(reader, "WATCH realm SLOT 'a'\r\n").rfind("%2\r\n", 0) == 0);
+    assert(reader.slot_watch && reader.slot_watch->owner() == "reader");
+    assert(revision() == before + 1U);
+    assert(!ReadCatalogRevision(dir.path())->in_progress);
 }
 
 }  // namespace
@@ -127,5 +157,6 @@ int main(int argc, char** argv) {
     if (argc == 4 && std::string(argv[1]) == "--crash") return CrashChild(argv[2], argv[3]);
     for (const auto& point : kPoints) Case(argv[0], point);
     VerifyRecord();
+    SlotOwnerRevision();
     std::cout << "catalog revision crash cases: " << std::size(kPoints) << '\n';
 }

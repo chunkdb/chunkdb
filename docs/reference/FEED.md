@@ -198,6 +198,8 @@ With the directory feature `catalog_revision`, which new directories have, the e
 `AFTER epoch revision` continues from your last event or progress: with the current epoch and the current revision, or a revision the server still holds, it sends only later events.
 With another epoch or revision it sends `resync` and then the whole catalog; after a restart only the current revision continues.
 A start after a crash during a catalog statement moves to the next revision, and a restored backup starts a new epoch.
+AFTER resumes the view the watch had: after MANAGES USERS of its user changed, watch without AFTER, since the server cannot tell.
+A filesystem rollback or a cold copy of the data directory keeps the epoch: a consumer that was away from such a directory must watch without AFTER.
 `CATALOG` after WATCH is a keyword: new tables cannot be named `catalog`, and a table of that name made before cannot be watched.
 The watch ends when the user loses MONITOR and ADMIN on `*`, or MANAGES USERS when it shows users.
 Only UNWATCH is accepted while streaming.

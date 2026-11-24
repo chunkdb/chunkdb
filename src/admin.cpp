@@ -1,4 +1,5 @@
 #include "admin.hpp"
+#include "catalog_revision.hpp"
 
 #include <algorithm>
 #include <limits>
@@ -41,6 +42,9 @@ void ResetPassword(const std::filesystem::path& data_dir, const std::string& use
     if (!ReadUsersFile(data_dir).has_value()) {
         throw no_users();
     }
+    // The user's catalog record changes offline: the next start moves past the
+    // catalog revision a consumer may hold.
+    MarkCatalogRevision(data_dir);
     UserRegistry registry(data_dir, std::nullopt, {});
     registry.SetVerifier(user, scram::MakeVerifier(password, crypto::RandomBytes(16), scram::kMinIterations));
 }

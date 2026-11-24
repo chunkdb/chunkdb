@@ -132,6 +132,9 @@ void CatalogFeed::Refresh(const CatalogScope& scope, std::string_view user) noex
             CatalogScope read = scope;
             if (!read.all_tables) read.tables.insert(read.tables.end(), retry_.begin(), retry_.end());
             CatalogState state = reader_(read);
+            // Before anything is published under this revision: a start must not
+            // let a consumer resume where tables could not be read.
+            clock_->Hold(!state.unknown_tables.empty() || !state.unknown_slots.empty());
             std::lock_guard lock(mutex_);
             // The last subscription left while the state was read.
             if (!built_) return;
@@ -221,9 +224,12 @@ std::shared_ptr<CatalogSubscription> CatalogFeed::Subscribe(
         if (!built_) state.emplace();
     }
     if (state) {
-        // Taken before the read: a statement that ends after it takes a later one.
-        revision = clock_->Snapshot();
         *state = reader_(CatalogScope{.tables = {}, .all_tables = true});
+        clock_->Hold(!state->unknown_tables.empty() || !state->unknown_slots.empty());
+        // Taken after the read. A statement ends only under refresh_mutex_, so
+        // none ended during it; with none running the read saw the catalog of
+        // the current revision, else the clock gives a new one.
+        revision = clock_->Snapshot();
     }
     std::lock_guard lock(mutex_);
     if (state && !built_) {
@@ -235,8 +241,9 @@ std::shared_ptr<CatalogSubscription> CatalogFeed::Subscribe(
         built_ = true;
     }
     // A consumer at a revision of this epoch the history covers continues
-    // from it: every later change is still here.
-    const bool resume = after && after->epoch == clock_->epoch() && after->revision <= revision_ &&
+    // from it: every later change is still here. Revisions after revision_ up
+    // to known_ changed nothing.
+    const bool resume = after && after->epoch == clock_->epoch() && after->revision <= known_ &&
         after->revision >= dropped_through_;
     std::shared_ptr<CatalogSubscription> subscription(
         new CatalogSubscription(shared_from_this(), users, resume ? after->revision : revision_, std::move(notify)));

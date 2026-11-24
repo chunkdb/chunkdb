@@ -742,11 +742,6 @@ void AppendSlotFilters(std::string& reply, const FeedSlot& slot) {
         [&](const cql::SwapTables& swap) -> std::optional<CatalogScope> { return tables({swap.first, swap.second}); },
         [&](const cql::CreateSlot& create) -> std::optional<CatalogScope> { return tables({create.table}); },
         [&](const cql::DropSlot& drop) -> std::optional<CatalogScope> { return tables({drop.table}); },
-        // An attach can record the slot's owner.
-        [&](const cql::Watch& watch) -> std::optional<CatalogScope> {
-            if (!watch.slot) return std::nullopt;
-            return tables({watch.table});
-        },
         [&](const cql::Migrate&) -> std::optional<CatalogScope> { return CatalogScope{.tables = {}, .all_tables = true}; },
         [&](const cql::CreateUser&) -> std::optional<CatalogScope> { return CatalogScope{}; },
         [&](const cql::AlterUser&) -> std::optional<CatalogScope> { return CatalogScope{}; },
@@ -1758,7 +1753,23 @@ std::string CommandEngine::ExecuteStatement(
                             return Protocol::Error("BUSY", "maximum slot catch-up workers reached", {{"reason", "slot_worker_limit"}, {"table", watch.table}});
                         // A slot without an owner takes the user of its first
                         // granted attach; one by ADMIN on * records nobody.
-                        if (config_.require_auth && !admin_all && !state->owner()) state->BindOwner(session.user);
+                        if (config_.require_auth && !admin_all && !state->owner()) {
+                            // Recording the owner changes the slot's catalog record, so it
+                            // takes a revision; an attach that records nothing does not.
+                            struct OwnerRefresh {
+                                CatalogFeed& feed;
+                                const CatalogScope scope;
+                                std::string_view user;
+                                bool marked = false;
+                                ~OwnerRefresh() {
+                                    if (marked) feed.Refresh(scope, user);
+                                }
+                            } refresh{*catalog_feed_, CatalogScope{.tables = {watch.table}, .all_tables = false}, session.user, false};
+                            state->BindOwner(session.user, [&] {
+                                catalog_feed_->Begin();
+                                refresh.marked = true;
+                            });
+                        }
                         // A watch that ADMIN on * allows ends once that right is gone.
                         if (session.watch_right && state->owner() != session.user) session.watch_right->RequireEveryTableAdmin();
                         session.slot_watch = std::move(state);

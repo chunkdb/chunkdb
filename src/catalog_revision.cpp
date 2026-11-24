@@ -75,11 +75,27 @@ std::optional<CatalogRevisionRecord> ReadCatalogRevision(const std::filesystem::
     }
 }
 
+void MarkCatalogRevision(const std::filesystem::path& data_dir) {
+    std::optional<CatalogRevisionRecord> record;
+    try {
+        record = ReadCatalogRevision(data_dir);
+    } catch (const std::runtime_error&) {
+        return;  // The start replaces it with a new epoch.
+    }
+    if (!record || record->in_progress) return;
+    record->in_progress = true;
+    AtomicWrite(data_dir / std::string(kCatalogRevisionFileName), EncodeCatalogRevision(*record),
+        /*fsync_file=*/true, /*fsync_directory=*/true, /*out_replaced=*/nullptr, /*after_rename_failpoint=*/nullptr,
+        /*enable_generic_failpoints=*/false);
+}
+
 CatalogClock::CatalogClock(std::filesystem::path data_dir, Mode mode) : data_dir_(std::move(data_dir)), mode_(mode) {
     if (mode_ == Mode::kMemory) {
         epoch_ = NewStoreId();
         return;
     }
+    // A crash during an earlier replace can leave its temporary file.
+    (void)CleanupAtomicTmpArtifacts(data_dir_ / std::string(kCatalogRevisionFileName));
     std::optional<CatalogRevisionRecord> record;
     try {
         record = ReadCatalogRevision(data_dir_);
@@ -94,12 +110,14 @@ CatalogClock::CatalogClock(std::filesystem::path data_dir, Mode mode) : data_dir
         // A statement may have changed the catalog after the recorded
         // revision named it: the catalog as it is now gets a new one.
         revision_ = record->revision + (record->in_progress ? 1U : 0U);
+        // What the record says; the start writes nothing. The first mark or
+        // read records the revision before it is handed out.
+        recorded_ = record->revision;
+        marked_ = record->in_progress;
     } else {
         epoch_ = NewStoreId();
         revision_ = 0U;
     }
-    marked_ = mode_ == Mode::kShared;
-    Write(revision_, marked_);
 }
 
 std::uint64_t CatalogClock::revision() const {
@@ -108,22 +126,26 @@ std::uint64_t CatalogClock::revision() const {
 }
 
 void CatalogClock::Write(std::uint64_t revision, bool in_progress) {
+    // Unknown until the replace completes: a failure, even after the rename,
+    // may leave either record, so the next mark and revision are written again.
+    marked_ = false;
+    recorded_.reset();
     if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CATALOG_REVISION_WRITE_FAIL_ONCE"))
         throw std::runtime_error("injected catalog revision write failure");
     AtomicWrite(data_dir_ / std::string(kCatalogRevisionFileName),
         EncodeCatalogRevision(CatalogRevisionRecord{.epoch = epoch_, .revision = revision, .in_progress = in_progress}),
         /*fsync_file=*/true, /*fsync_directory=*/true, /*out_replaced=*/nullptr, /*after_rename_failpoint=*/nullptr,
         /*enable_generic_failpoints=*/false);
+    marked_ = in_progress;
+    recorded_ = revision;
     if (in_progress && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_CATALOG_AFTER_MARK_ONCE")) ExitAbruptly(86);
     if (!in_progress && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_CATALOG_AFTER_REVISION_ONCE")) ExitAbruptly(86);
 }
 
 void CatalogClock::Begin() {
     std::lock_guard lock(mutex_);
-    if (mode_ == Mode::kDurable && !marked_) {
-        Write(revision_, true);
-        marked_ = true;
-    }
+    // Shared: the first statement marks the record, and nothing clears it.
+    if (mode_ != Mode::kMemory && !marked_) Write(revision_, true);
     ++running_;
 }
 
@@ -133,23 +155,30 @@ std::uint64_t CatalogClock::End() {
     --running_;
     if (revision_ == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("catalog revisions are exhausted");
     ++revision_;
-    if (mode_ == Mode::kDurable) {
-        // On failure the record keeps the mark Begin wrote, so a start moves
-        // past every revision handed out.
-        Write(revision_, running_ != 0U);
-        marked_ = running_ != 0U;
-    }
+    // Recorded before it is returned; on failure it is never handed out.
+    if (mode_ == Mode::kDurable) Write(revision_, running_ != 0U || holding_);
     return revision_;
 }
 
 std::uint64_t CatalogClock::Snapshot() {
     std::lock_guard lock(mutex_);
-    if (running_ == 0U) return revision_;
+    if (running_ == 0U) {
+        // Recorded as it is before it is handed out: a failed write may have
+        // left an earlier revision or mark on disk.
+        if (mode_ == Mode::kDurable && (recorded_ != revision_ || marked_ != holding_)) Write(revision_, holding_);
+        return revision_;
+    }
     if (revision_ == std::numeric_limits<std::uint64_t>::max()) throw std::runtime_error("catalog revisions are exhausted");
     ++revision_;
     // Still marked: a statement runs.
     if (mode_ == Mode::kDurable) Write(revision_, true);
     return revision_;
+}
+
+void CatalogClock::Hold(bool hold) {
+    std::lock_guard lock(mutex_);
+    holding_ = hold;
+    if (mode_ == Mode::kDurable && hold && !marked_) Write(revision_, true);
 }
 
 }  // namespace chunkdb

@@ -7,6 +7,8 @@
 #include <fstream>
 #include <thread>
 #include <cassert>
+#include <cstdlib>
+#include <functional>
 #include <cstddef>
 #include <map>
 #include <set>
@@ -129,10 +131,13 @@ struct FakeCatalog {
     std::set<std::string, std::less<>> unknown;
     std::size_t reads = 0U;
     bool fail = false;
+    // Runs inside a whole-catalog read, as a statement running meanwhile would.
+    std::function<void()> during_whole_read;
 
     CatalogState Read(const CatalogScope& scope) {
         ++reads;
         if (fail) throw std::runtime_error("catalog read failed");
+        if (scope.all_tables && during_whole_read) during_whole_read();
         CatalogState state;
         state.unknown_tables = unknown;
         state.unknown_slots = unknown;
@@ -598,7 +603,8 @@ void TestDurableClock() {
         CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
         epoch = clock.epoch();
         assert(clock.revision() == 0U);
-        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 0U, .in_progress = false}));
+        // A start writes nothing: the first mark creates the record.
+        assert(!ReadCatalogRevision(dir.path()).has_value());
         clock.Begin();
         assert(ReadCatalogRevision(dir.path())->in_progress);
         assert(clock.End() == 1U);
@@ -616,9 +622,9 @@ void TestDurableClock() {
         // The catalog may have changed after revision 3: the start takes 4.
         CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
         assert(clock.epoch() == epoch && clock.revision() == 4U);
-        assert(!ReadCatalogRevision(dir.path())->in_progress);
-        // Without a statement running, a read keeps the revision.
+        // Without a statement running, a read keeps the revision and records it.
         assert(clock.Snapshot() == 4U);
+        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 4U, .in_progress = false}));
     }
     {
         // Unchanged after a clean stop.
@@ -656,7 +662,8 @@ void TestDurableClock() {
     {
         CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
         assert(clock.epoch() != epoch);
-        assert(ReadCatalogRevision(dir.path()).has_value());
+        (void)clock.Snapshot();
+        assert(ReadCatalogRevision(dir.path())->epoch == clock.epoch());
     }
 }
 
@@ -696,6 +703,119 @@ void TestDurableResume() {
     }
 }
 
+void ArmFailpoint(const char* name) {
+#ifdef _WIN32
+    (void)_putenv_s(name, "1");
+#else
+    (void)setenv(name, "1", 1);
+#endif
+}
+
+template <typename Fn> bool Throws(Fn&& fn) {
+    try {
+        fn();
+    } catch (const std::runtime_error&) {
+        return true;
+    }
+    return false;
+}
+
+void TestStatementDuringSubscribeRead() {
+    FakeCatalog catalog;
+    catalog.SetTable("t", "one");
+    auto feed = MakeFeed(catalog);
+    Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+    const auto epoch = feed->epoch();
+    // A CREATE TABLE begins while the first watch reads the catalog, and its
+    // table is already there when the read reaches it.
+    bool begun = false;
+    catalog.during_whole_read = [&] {
+        if (begun) return;
+        begun = true;
+        feed->Begin();
+        catalog.SetTable("t2", "new");
+    };
+    auto watch = feed->Subscribe(true, {}, At(epoch, 1U));
+    // The read is not the catalog of revision 1: the consumer rebuilds.
+    assert(watch->revision() == 2U);
+    assert(IsResync(NextBytes(*watch)));
+    const auto whole = CatalogPush(NextBytes(*watch));
+    assert(whole.revision == 2U);
+    assert(Render(whole.events) == "table create t . one|table create t2 . new");
+    // The statement ends: the read already showed its change.
+    feed->Refresh(CatalogScope{.tables = {"t2"}, .all_tables = false}, "admin");
+    assert(ProgressRevision(NextBytes(*watch)) == 3U);
+    assert(!watch->Next());
+}
+
+void TestFailedRecordWrites() {
+    test::ScopedTempDir dir("chunkdb-catalog-write-fail");
+    StoreId epoch{};
+    {
+        CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
+        epoch = clock.epoch();
+        // A mark that cannot be written refuses the statement.
+        ArmFailpoint("CHUNKDB_FAILPOINT_CATALOG_REVISION_WRITE_FAIL_ONCE");
+        assert(Throws([&] { clock.Begin(); }));
+        assert(!ReadCatalogRevision(dir.path()).has_value());
+        clock.Begin();
+        clock.Begin();
+        ArmFailpoint("CHUNKDB_FAILPOINT_CATALOG_REVISION_WRITE_FAIL_ONCE");
+        assert(Throws([&] { (void)clock.End(); }));
+        // The record is unknown after the failure: the next mark is written again.
+        clock.Begin();
+        const auto marked = *ReadCatalogRevision(dir.path());
+        assert(marked.in_progress && marked.revision == 1U);
+        // Stopped with statements running, as a crash stops them.
+    }
+    {
+        CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
+        assert(clock.epoch() == epoch && clock.revision() == 2U);
+        clock.Begin();
+        ArmFailpoint("CHUNKDB_FAILPOINT_CATALOG_REVISION_WRITE_FAIL_ONCE");
+        assert(Throws([&] { (void)clock.End(); }));
+        // Revision 3 was never handed out; a read records it first.
+        assert(clock.Snapshot() == 3U);
+        assert((*ReadCatalogRevision(dir.path()) == CatalogRevisionRecord{.epoch = epoch, .revision = 3U, .in_progress = false}));
+        // Held: marked even with nothing running.
+        clock.Hold(true);
+        assert(ReadCatalogRevision(dir.path())->in_progress);
+        assert(clock.Snapshot() == 3U);
+        assert(ReadCatalogRevision(dir.path())->in_progress);
+    }
+    {
+        CatalogClock clock(dir.path(), CatalogClock::Mode::kDurable);
+        assert(clock.revision() == 4U);
+    }
+}
+
+void TestUnreadTableKeepsMark() {
+    test::ScopedTempDir dir("chunkdb-catalog-unread");
+    FakeCatalog catalog;
+    catalog.SetTable("t", "one");
+    const auto feed_at = [&] {
+        return std::make_shared<CatalogFeed>([&catalog](const CatalogScope& scope) { return catalog.Read(scope); }, 1U << 20U,
+            std::make_unique<CatalogClock>(dir.path(), CatalogClock::Mode::kDurable));
+    };
+    FeedPosition seen;
+    {
+        auto feed = feed_at();
+        auto watch = feed->Subscribe(true, {});
+        (void)NextBytes(*watch);
+        catalog.unknown.insert("t");
+        Change(*feed, CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
+        seen = At(feed->epoch(), ProgressRevision(NextBytes(*watch)));
+        // Its slots may differ from the published records: the record stays marked.
+        assert(ReadCatalogRevision(dir.path())->in_progress);
+    }
+    catalog.unknown.clear();
+    {
+        auto feed = feed_at();
+        auto watch = feed->Subscribe(true, {}, seen);
+        assert(IsResync(NextBytes(*watch)));
+    }
+}
+
 }  // namespace
 
 int main() {
@@ -714,4 +834,7 @@ int main() {
     TestResumeAfter();
     TestDurableClock();
     TestDurableResume();
+    TestStatementDuringSubscribeRead();
+    TestFailedRecordWrites();
+    TestUnreadTableKeepsMark();
 }

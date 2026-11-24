@@ -17,17 +17,22 @@ The directory feature `catalog_revision` (incompat bit 7) owns the file, so a bu
 
 ## Clock
 
-A catalog statement is one CatalogScopeOf names: table, column, check, slot, user and grant statements, MIGRATE, RESTORE TABLE, SWAP TABLES, RECOVER TABLE and WATCH SLOT.
+A catalog statement is one CatalogScopeOf names: table, column, check, slot, user and grant statements, MIGRATE, RESTORE TABLE, SWAP TABLES, RECOVER TABLE, and a WATCH SLOT that records the slot's owner; an attach that records nothing does not touch the clock.
 Begin, before the statement runs: when no statement is marked, the record is written in progress. If that write fails, the statement does not run.
 End, after the statement finished or failed: the revision moves up by one and is written, still in progress while another statement runs, complete otherwise. Only then are its changes published under it.
 End runs under the feed's refresh mutex, so revisions are published in the order they are taken.
-A whole-catalog read takes the current revision while no statement runs, and a new one, written in progress, while one does: two reads at one revision cannot see different states.
+A whole-catalog read takes its revision after the read: the current one when no statement runs, since a statement ends only under the same mutex, and a new one, written in progress, when one does. Two reads at one revision cannot see different states.
 Every statement takes a revision, also one that changed nothing; watches then receive `[progress, epoch, revision]`, so their position reaches the current revision.
+
+Every revision is recorded before it is handed out. A failed write leaves the record unknown: the next Begin writes the mark again, and the next read or End writes its revision first.
+While a read could not read some tables, the record stays marked in progress, so a start does not let a consumer resume at a revision that misses them.
+`chunkdb_admin reset-password` changes a user without the server: it marks the record in progress first.
 
 ## Start
 
 A complete record: the clock continues at its revision. Nothing changed after it: every change is preceded by a mark.
-An in-progress record: the clock continues at its revision plus one, which no state was published under, and writes it complete.
+An in-progress record: the clock continues at its revision plus one, which no state was published under.
+The start writes nothing; the first mark or whole-catalog read records the revision before it is handed out.
 No record, or one that cannot be read: a new random epoch at revision 0. Consumers of the old epoch read the whole catalog again.
 
 ## Consumers
@@ -42,6 +47,8 @@ Without `catalog_revision` (an existing directory before ENABLE FEATURE) or on a
 ENABLE FEATURE 'catalog_revision' takes effect at the next start, which creates the record with a new epoch.
 With several processes on the directory the record stays in progress and the clock does not write it; WATCH CATALOG is refused there, and the next single-process start moves to a new revision.
 
+A filesystem rollback or a cold copy of the directory keeps the epoch: consumers that were away must watch without AFTER.
+
 ## Backup and restore
 
 Backups leave `chunkdb.catalog` out: a restored directory starts a new epoch, and an offline restore also gives it a new `data_dir_id`.
@@ -50,7 +57,7 @@ RESTORE TABLE and SWAP TABLES are catalog statements in the same directory and t
 ## Failures
 
 A failed Begin write refuses the statement before it changes anything.
-A failed End write leaves the record in progress at a lower revision; nothing is published under the new revision, the catalog watches end with INTERNAL, and a start moves past every revision handed out.
+A failed End write publishes nothing under the new revision and ends the catalog watches with INTERNAL; the record may hold the mark or a lower revision, and the next write, before any revision is handed out, records the current one.
 A crash at any point leaves a complete record whose revision names the state on disk, or an in-progress record that the start moves past.
 
 ## Cost
