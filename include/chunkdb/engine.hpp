@@ -25,6 +25,7 @@
 #include "chunkdb/metrics.hpp"
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/reply.hpp"
+#include "chunkdb/statement_mutex.hpp"
 #include "chunkdb/table_catalog.hpp"
 
 namespace chunkdb {
@@ -45,7 +46,8 @@ enum class Right : std::uint8_t;
 
 // Deterministic command interleavings, following the feed hooks.
 struct CommandEngineTestHook {
-    enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted, kBeforeTxnBudgetReclaim };
+    enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted, kBeforeTxnBudgetReclaim,
+        kAfterRestoreProgress };
     virtual ~CommandEngineTestHook() = default;
     virtual void Run(Point point, std::string_view table) = 0;
 };
@@ -208,6 +210,8 @@ struct SessionControlAccess {
 struct ConnectionInfo {
     std::uint64_t id = 0U;
     std::string user, peer, state, statement;
+    // What the running statement reported done; std::nullopt when it reports nothing.
+    std::optional<StatementProgress> progress{};
 };
 
 struct SessionControlCallbacks {

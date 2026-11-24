@@ -986,9 +986,12 @@ void TestSessionControls() {
     callbacks->enumerate = [&](const auto& access, const auto& visitor) {
         seen = access;
         visitor(chunkdb::ConnectionInfo{.id = UINT64_MAX, .user = "bot", .peer = "127.0.0.1", .state = "idle", .statement = ""});
-        visitor(chunkdb::ConnectionInfo{.id = 1U, .user = "", .peer = "local", .state = "running", .statement = "PING"});
+        visitor(chunkdb::ConnectionInfo{.id = 1U, .user = "", .peer = "local", .state = "running", .statement = "RESTORE",
+            .progress = chunkdb::StatementProgress{.files_done = 1U, .files_total = 3U, .bytes_done = 10U, .bytes_total = UINT64_MAX}});
     };
-    const std::string expected = "*2\r\n%5\r\n$2\r\nid\r\n(18446744073709551615\r\n$4\r\nuser\r\n$3\r\nbot\r\n$4\r\npeer\r\n$9\r\n127.0.0.1\r\n$5\r\nstate\r\n$4\r\nidle\r\n$9\r\nstatement\r\n_\r\n%5\r\n$2\r\nid\r\n:1\r\n$4\r\nuser\r\n_\r\n$4\r\npeer\r\n$5\r\nlocal\r\n$5\r\nstate\r\n$7\r\nrunning\r\n$9\r\nstatement\r\n$4\r\nPING\r\n";
+    const std::string expected = "*2\r\n%6\r\n$2\r\nid\r\n(18446744073709551615\r\n$4\r\nuser\r\n$3\r\nbot\r\n$4\r\npeer\r\n$9\r\n127.0.0.1\r\n$5\r\nstate\r\n$4\r\nidle\r\n$9\r\nstatement\r\n_\r\n$8\r\nprogress\r\n_\r\n"
+        "%6\r\n$2\r\nid\r\n:1\r\n$4\r\nuser\r\n_\r\n$4\r\npeer\r\n$5\r\nlocal\r\n$5\r\nstate\r\n$7\r\nrunning\r\n$9\r\nstatement\r\n$7\r\nRESTORE\r\n"
+        "$8\r\nprogress\r\n%4\r\n$10\r\nfiles_done\r\n:1\r\n$11\r\nfiles_total\r\n:3\r\n$10\r\nbytes_done\r\n:10\r\n$11\r\nbytes_total\r\n(18446744073709551615\r\n";
     callbacks->max_response_bytes = expected.size();
     ExpectReply(server.Run(admin, "SHOW CONNECTIONS"), expected);
     --callbacks->max_response_bytes;

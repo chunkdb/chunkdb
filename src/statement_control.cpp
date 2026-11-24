@@ -139,6 +139,8 @@ std::optional<StatementStopReason> StatementControl::Complete(bool* decision_ent
         if (reason_ != StatementStopReason::kNone) result = reason_;
         phase_ = Phase::kComplete;
     }
+    // A finished statement no longer runs, so a listing shows no progress.
+    { std::lock_guard lock(progress_mutex_); progress_.reset(); }
     stop.request_stop();
     return result;
 }
@@ -165,11 +167,23 @@ std::stop_token StatementControl::StopToken() {
     return stop.get_token();
 }
 
+void StatementControl::ReportProgress(const StatementProgress& progress) {
+    std::lock_guard lock(progress_mutex_);
+    progress_ = progress;
+}
+std::optional<StatementProgress> StatementControl::progress() const {
+    std::lock_guard lock(progress_mutex_);
+    return progress_;
+}
+
 ScopedStatementControl::ScopedStatementControl(StatementControl* current) noexcept
     : previous_(current_statement) { current_statement = current; }
 ScopedStatementControl::~ScopedStatementControl() { current_statement = previous_; }
 void CheckStatementCancellation() { if (current_statement) current_statement->Check(); }
 void EnterStatementDecision() { if (current_statement) current_statement->EnterDecision(); }
+void ReportStatementProgress(const StatementProgress& progress) {
+    if (current_statement) current_statement->ReportProgress(progress);
+}
 std::stop_token StatementStopToken() {
     return current_statement ? current_statement->StopToken() : std::stop_token{};
 }
