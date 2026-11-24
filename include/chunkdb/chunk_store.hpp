@@ -658,6 +658,9 @@ enum class TxnPausePoint {
     // The transaction released its chunk locks, before publishing any
     // uncertain outcome and completing its post-commit bookkeeping.
     kBeforePostCommitOutcome,
+    // The transaction ended its producer bound after its outcome was settled,
+    // before it removes its intent and runs its inline checkpoints.
+    kBeforePostCommitCheckpoints,
     kCount,
 };
 
