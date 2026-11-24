@@ -1,6 +1,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cerrno>
 #include <cstddef>
 #include <exception>
 #include <filesystem>
@@ -15,6 +16,7 @@
 #include <vector>
 
 #include "checkpoint.hpp"
+#include "durability_io.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/logging.hpp"
@@ -912,8 +914,22 @@ void ChunkStore::WalBarrier() {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE")) {
             throw std::runtime_error("injected barrier sync failure");
         }
+        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BARRIER_FSYNC_EIO_ONCE")) {
+            throw SyncFailedError(std::system_error(EIO, std::generic_category(), "injected barrier fsync failure"));
+        }
         SyncUnsynced(drained);
         if (drained.overflow) stats_wal_barrier_full_syncs_.fetch_add(1, std::memory_order_relaxed);
+    } catch (const SyncFailedError& error) {
+        // A failed sync may have dropped the dirty pages it was to write, and
+        // a retried sync can then succeed without them. Fail closed, so no
+        // later barrier reports those writes durable; recovery reads the
+        // files again.
+        PoisonDurability(std::string("a FLUSH WAL sync failed: ") + error.what());
+        RestoreUnsynced(std::move(drained));
+        throw WriteOutcomeUnknownError(
+            std::string("writes acknowledged before this barrier may or may not be durable: ") + error.what() +
+                "; the store is fail-closed until RECOVER TABLE or a restart",
+            WriteOutcomeUnknownError::Stage::kBarrierSync);
     } catch (...) {
         // Restore the drained bookkeeping so a retried barrier still covers
         // the artifacts this one failed to sync.

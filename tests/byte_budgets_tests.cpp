@@ -109,6 +109,40 @@ void CacheBytesBoundAllTables() {
     assert(loaded_a() == 40U);
 }
 
+// COMPACT TOMBSTONES checkpoints chunks that are not cached through temporary
+// copies outside the cache; they never count toward the cache bytes.
+void OffCacheCheckpointsLeaveCacheBytes() {
+    Fixture f;
+    f.Open();
+    assert(f.Run("CREATE TABLE t (n u32) CHUNK 4 x 4") == "+OK\r\n");
+    for (int i = 0; i < 30; ++i) Expect(f.Run("SET BLOCK " + std::to_string(i * 4) + " 0 IN t n=1"), ":");
+    for (int i = 0; i < 10; ++i) Expect(f.Run("DELETE BLOCK " + std::to_string(i * 4) + " 0 FROM t"), ":");
+    f.Reopen();
+    const auto before = f.catalog->resources()->CacheBytes();
+    Expect(f.Run("COMPACT TOMBSTONES t BEFORE 30"), ":");
+    assert(f.catalog->resources()->CacheBytes() == before);
+    assert(f.Run("GET BLOCK 40 0 FROM t") == "*1\r\n:1\r\n");
+}
+
+// A failed sync in FLUSH WAL leaves the table fail-closed: a retried sync
+// could succeed after the system dropped the data it was to write.
+void BarrierSyncFailureFailsClosed() {
+    Fixture f;
+    f.Open();
+    assert(f.Run("CREATE TABLE t (n u32) CHUNK 4 x 4") == "+OK\r\n");
+    Expect(f.Run("SET BLOCK 0 0 IN t n=1"), ":");
+    {
+        txn_test::ScopedEnv failed("CHUNKDB_FAILPOINT_BARRIER_FSYNC_EIO_ONCE", "1");
+        Expect(f.Run("FLUSH WAL"), "-ERR OUTCOME_UNKNOWN stage=barrier_sync ");
+    }
+    Expect(f.Run("FLUSH WAL"), "-ERR ");
+    Expect(f.Run("SET BLOCK 4 0 IN t n=2"), "-ERR ");
+    assert(f.Run("RECOVER TABLE t") == "+OK\r\n");
+    Expect(f.Run("SET BLOCK 4 0 IN t n=2"), ":");
+    assert(f.Run("FLUSH WAL") == "+OK\r\n");
+    assert(f.Run("GET BLOCK 4 0 FROM t") == "*1\r\n:2\r\n");
+}
+
 // Past the server-wide history total, a write that must keep a state ends
 // the oldest transactions of its own table; another table's transactions
 // keep their snapshots.
@@ -389,6 +423,8 @@ void TxnCommitNoSpace(DurabilityMode mode) {
 
 int main() {
     CacheBytesBoundAllTables();
+    OffCacheCheckpointsLeaveCacheBytes();
+    BarrierSyncFailureFailsClosed();
     TxnHistoryTotal();
     FeedTotal();
     DiskFloor();

@@ -204,7 +204,7 @@ With `--auth scram` the directory must already have users, because `--read-only`
 Watches release workers and have no idle timeout.
 The four area and chunk-count limits must be positive and are reported by HELLO.
 Past `--txn-history-total-bytes`, a write that must keep an earlier state ends the oldest transactions of its own table, whichever tables hold the bytes.
-Past `--feed-total-bytes`, a table's capture evicts that table's oldest live history; a change that still does not fit makes that table's watches resync.
+Past `--feed-total-bytes`, a table's capture evicts that table's oldest live history; a change that still does not fit makes that table's watches resync. One table holds at most its own `feed_buffer_bytes` of the total.
 See [Transactions](TRANSACTIONS.md) and [Change feed](CHANGE_FEED.md) for outcomes at limits.
 A table without an explicit feed/slot limit uses the server defaults each time it opens.
 An explicit table limit persists; change it with ALTER TABLE SET.

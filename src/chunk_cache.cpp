@@ -122,6 +122,7 @@ void ChunkStore::RegularChunkDeleter::operator()(RegularChunk* chunk) const noex
 }
 
 void ChunkStore::RechargeCacheLocked(RegularChunk& chunk) noexcept {
+    if (!chunk.cache_owned) return;
     const std::size_t charge = sizeof(RegularChunk) + chunk.payload.capacity() + chunk.presence_bitmap.capacity() +
         chunk.vars.encoded_size() + (chunk.chunk_columns ? chunk.chunk_columns->bytes.size() : 0U) +
         chunk.wal_batch.capacity();
@@ -243,6 +244,7 @@ std::shared_ptr<ChunkStore::RegularChunk> ChunkStore::GetOrLoadRegularChunk(cons
             selected->wal_header_written = loaded.wal_header_written;
             selected->wal_path = loaded.wal_path;
             selected->read_only_generation = loaded.read_only_generation;
+            selected->cache_owned = true;
             RechargeCacheLocked(*selected);
             const auto published = large_chunk->chunks.emplace(chunk_coord, selected).first;
             ScopeExit rollback_chunk([&] { large_chunk->chunks.erase(published); });

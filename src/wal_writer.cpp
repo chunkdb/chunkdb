@@ -900,11 +900,16 @@ void ChunkStore::FlushWalBatchForEviction(
                 TruncateWalTail(chunk_coord, chunk, pre_flush_size, force_sync);
                 snapshot_write.Finish();
             } catch (const std::exception& repair_error) {
-                PoisonDurability(
-                    "WAL append repair failed for chunk (" +
-                    std::to_string(chunk_coord.x) + "," +
-                    std::to_string(chunk_coord.y) + "): " + repair_error.what());
+                const std::string reason = "WAL append repair failed for chunk (" +
+                    std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) + "): " + repair_error.what();
+                PoisonDurability(reason);
                 chunk->wal_repair_failed = true;
+                // Not the original error: a DISK_FULL reply would invite a
+                // retry on a table that now refuses changes. The batch holds
+                // acknowledged writes only, so the statement itself applied
+                // nothing.
+                throw std::runtime_error(
+                    reason + "; the store is fail-closed until RECOVER TABLE or a restart");
             }
             throw;
         }

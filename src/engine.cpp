@@ -933,7 +933,7 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     }
     if (const auto* io = dynamic_cast<const std::system_error*>(&error);
         io != nullptr && io->code() == std::errc::no_space_on_device)
-        return Protocol::Error("DISK_FULL", "storage has no free space; free space before retrying");
+        return Protocol::Error("DISK_FULL", "storage has no free space; free space before retrying", {{"reason", "disk_full"}});
     LogMessage(
         LogLevel::kError,
         LogComponent::kStore,

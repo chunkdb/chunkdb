@@ -10,6 +10,14 @@
 
 namespace chunkdb {
 
+// A file or directory sync (fsync, fdatasync, F_FULLFSYNC, FlushFileBuffers)
+// that failed. The kernel may already have dropped the dirty pages, so a
+// later sync of the same file can succeed without making them durable.
+class SyncFailedError : public std::system_error {
+  public:
+    explicit SyncFailedError(const std::system_error& error) : std::system_error(error) {}
+};
+
 // Sync the already admitted native generation without reopening its path.
 // Labels are diagnostic and observer values, never I/O instructions.
 #ifdef _WIN32

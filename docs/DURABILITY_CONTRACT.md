@@ -13,7 +13,7 @@ Committed revisions keep their values; missing chunks after a later crash do not
 | --- | --- |
 | Ordinary write, relaxed | Applied in memory; power loss can lose acknowledged writes, and a process crash can lose those not yet written to the WAL, up to four checkpoint intervals per chunk while a background checkpoint syncs it. |
 | Ordinary write, fsync-wal | The WAL and required directory entries are synced before success. |
-| Ordinary write, fsync-checkpoint | Synced WAL acknowledgement and synced checkpoint publication. |
+| Ordinary write, fsync-checkpoint | Synced WAL acknowledgement; checkpoints are published synced, and a checkpoint that fails leaves the synced WAL in place ([Disk full](#disk-full)). |
 | FLUSH WAL, every mode | All writes acknowledged before its arrival are durable in every table. |
 | Transaction COMMIT, every mode | All changed chunks commit together durably, or none commit. |
 | RESTORE TABLE | The restored table is durable and complete under its name, or nothing is published. |
@@ -83,14 +83,16 @@ Its WAL is cut back to its length before the write, so no part of it stays in th
 
 | Mode | Writes acknowledged before it |
 | --- | --- |
-| relaxed | Kept in memory and in the WAL batch; the next batch flush, eviction or FLUSH WAL writes them again. FLUSH WAL answers DISK_FULL until it can, and a crash before then loses them. |
+| relaxed | Kept in memory and in the WAL batch; the next batch flush, eviction or FLUSH WAL writes them again. While writing the batch meets ENOSPC, FLUSH WAL answers DISK_FULL, and a crash before then loses them. |
 | fsync-wal, fsync-checkpoint | Already durable. |
 
 COMMIT whose WAL frames cannot be written answers DISK_FULL in every mode; its WALs are cut back and its intent removed, so no part of the transaction commits.
 A checkpoint image that cannot be written leaves the chunk's image and WAL as they were; the write that started the checkpoint stays acknowledged, in fsync-checkpoint mode too, the server log reports the failure, and a later write or eviction tries again.
 The WAL grows until a checkpoint succeeds.
 ENOSPC alone does not fence a table.
-Only when a WAL cannot be cut back after a failed write does the write answer OUTCOME_UNKNOWN and the table refuse changes until RECOVER TABLE or a restart.
+A WAL that a backup on the same file system hard-links is cut back by writing a shortened copy, which itself needs free space.
+When a WAL cannot be cut back, the table refuses changes until RECOVER TABLE or a restart: an ordinary write whose records may remain answers OUTCOME_UNKNOWN, a COMMIT answers INTERNAL and is not applied because recovery removes its records, and a statement whose cache eviction could not write earlier writes answers INTERNAL and applied nothing itself.
+A failed file or directory sync during FLUSH WAL answers `OUTCOME_UNKNOWN stage=barrier_sync` and leaves the table refusing changes until RECOVER TABLE or a restart, since a retried sync can succeed after the system dropped the unwritten data; recovery reads what the files hold.
 
 Set `--min-free-disk-bytes` to refuse writes before the disk fills, and the table option `max_disk_bytes` to bound one table; see [Server flags](SERVER_FLAGS.md#disk-space).
 

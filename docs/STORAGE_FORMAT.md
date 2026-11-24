@@ -154,7 +154,7 @@ Options use the same TLV layout as the root manifest:
 | 11 | completed fork revision `u64`, including zero | absent |
 | 12 | table file byte limit `u64`, positive | absent (no limit) |
 
-Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 12 is written only while the table sets a limit. Type 7 is retired and is not a known option.
+Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 12 is written only while the table sets a limit; a build without it refuses to open such a table until `ALTER TABLE ... SET max_disk_bytes = 0` removes it. Type 7 is retired and is not a known option.
 
 Types 10 and 11 belong to incompatibility feature `table_lineage` (`0x4`) and must appear together.
 The parent epoch differs from the table's current epoch; the fork revision preserves its exact unsigned value.

@@ -570,7 +570,7 @@ class ConditionFailedError : public std::runtime_error {
 // unknown (any other write error means "not applied").
 class WriteOutcomeUnknownError : public std::runtime_error {
   public:
-    enum class Stage { kPublication, kConditionalCommitSync, kWalAppendRepair, kTransactionCommitSync, kSlotRecords, kFeatureActivation };
+    enum class Stage { kPublication, kConditionalCommitSync, kWalAppendRepair, kTransactionCommitSync, kSlotRecords, kFeatureActivation, kBarrierSync };
     explicit WriteOutcomeUnknownError(std::string message, Stage stage = Stage::kPublication)
         : std::runtime_error(std::move(message)), stage_(stage) {}
     [[nodiscard]] std::string_view stage() const noexcept {
@@ -580,6 +580,7 @@ class WriteOutcomeUnknownError : public std::runtime_error {
             case Stage::kTransactionCommitSync: return "transaction_commit_sync";
             case Stage::kSlotRecords: return "slot_records";
             case Stage::kFeatureActivation: return "feature_activation";
+            case Stage::kBarrierSync: return "barrier_sync";
             case Stage::kPublication: return "write_publication";
         }
         return "write_publication";
@@ -1310,6 +1311,9 @@ class ChunkStore {
         // What the chunk counts toward StoreResources::CacheBytes; changed
         // under `mutex` (RechargeCacheLocked) and released by its deleter.
         std::size_t cache_charge = 0;
+        // Set before the cache publishes the chunk; a temporary off-cache
+        // copy (COMPACT TOMBSTONES, a slot baseline) is never charged.
+        bool cache_owned = false;
         mutable RegularChunkMutex mutex;
     };
 
