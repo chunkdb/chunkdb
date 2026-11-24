@@ -40,6 +40,12 @@ struct FeedSlot {
     bool resync = false;
     // Filled by a table listing: a watch holds the slot.
     bool attached = false;
+    // Filled by a table listing of an attached slot: the watch's user, the
+    // "[address]:port" of its client, empty when unknown, and when its last
+    // accepted ACK arrived, std::nullopt before its first.
+    std::string watch_user{};
+    std::string peer{};
+    std::optional<std::chrono::steady_clock::time_point> last_ack{};
 };
 
 class FeedSlotFiltersError : public std::invalid_argument {

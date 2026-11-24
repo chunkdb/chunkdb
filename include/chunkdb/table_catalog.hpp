@@ -8,6 +8,7 @@
 #include <exception>
 #include <functional>
 #include <map>
+#include <set>
 #include <memory>
 #include <mutex>
 #include <optional>
@@ -279,6 +280,11 @@ class Table : public std::enable_shared_from_this<Table> {
     // Durable slots, lost ones included, and open watches, slot watches
     // included, under `lease`, a lease of this table.
     [[nodiscard]] FeedCounts CountFeeds(const Lease& lease) const;
+    // Whether the durable frontier of this table's slots stopped advancing,
+    // under `lease`, a lease of this table: it has a slot that is not lost
+    // and its store is fail-closed after a durability failure, which stops
+    // slot passes until RECOVER TABLE or a restart.
+    [[nodiscard]] bool SlotFrontierFrozen(const Lease& lease) const;
     [[nodiscard]] std::vector<std::uint32_t> ResolveFeedColumns(const std::vector<std::string>& names);
     // Monotonic, in this epoch, and no higher than the durable frontier. The
     // streaming layer must additionally check its last revision sent.
@@ -298,7 +304,7 @@ class Table : public std::enable_shared_from_this<Table> {
     [[nodiscard]] std::unique_ptr<FeedSubscription> SubscribeFeed(const FeedOptions& options, bool slot);
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);
     [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name, const FeedOptions& options,
-        bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner);
+        bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner, std::string peer = {});
     [[nodiscard]] FeedSlot ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(const Lease& lease, bool include_lost);
     // Records `owner` for the claimed slot when it has none.
@@ -633,7 +639,8 @@ class TableCatalog {
     void OpenDataDirManifest();
     // Raises the data directory's version floor (chunkdb.manifest) durably.
     void RaiseVersionFloor(std::uint64_t floor);
-    // Every interrupted operation, or only those of `table`.
+    // Every interrupted operation, or only those of `table`; the staging
+    // directory of a running RESTORE TABLE is not interrupted.
     void RemoveInterruptedOperations(std::string_view table = {});
     void OpenExistingTables();
     struct FoundTable;
@@ -727,6 +734,9 @@ class TableCatalog {
     // The data directory's version floor (see DataDirVersionFloor); changed
     // under operations_mutex_.
     std::uint64_t version_floor_ = 0;
+    // Staging directory names of running RESTORE TABLE statements, which
+    // RECOVER TABLE leaves alone; changed under operations_mutex_.
+    std::set<std::string, std::less<>> restore_staging_;
     mutable std::shared_mutex tables_mutex_;
     std::map<std::string, std::shared_ptr<Table>, std::less<>> tables_;
     // Out of service until RecoverTable; disjoint from tables_, which
