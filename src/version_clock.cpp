@@ -1,12 +1,17 @@
 #include <algorithm>
 #include <array>
+#include <chrono>
 #include <cstdlib>
+#include <exception>
 #include <limits>
 #include <mutex>
 #include <random>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
+#include <system_error>
+#include <thread>
+#include <utility>
 #include <vector>
 
 #include "chunk_store_internal.hpp"
@@ -24,10 +29,20 @@ namespace chunkdb {
 
 namespace {
 
+[[nodiscard]] std::uint64_t MicrosecondsSince(std::chrono::steady_clock::time_point started) {
+    return static_cast<std::uint64_t>(
+        std::chrono::duration_cast<std::chrono::microseconds>(std::chrono::steady_clock::now() - started).count());
+}
+
 // Number of version tokens reserved (and durably persisted) per extension of
 // the version clock. Larger values amortize the persistence fsync over more
-// mutations at the cost of skipping at most this many tokens per restart.
-constexpr std::uint64_t kVersionClockReservationBatch = 16384;
+// mutations at the cost of skipping more tokens per restart.
+constexpr std::uint64_t kVersionClockReservationBatch = 65536;
+// When half a range of tokens is left below the ceiling, the next range is
+// written on the extension thread, so a writer waits for a clock write only
+// when it issues this many tokens faster than the record syncs. A restart
+// skips at most one and a half ranges.
+constexpr std::uint64_t kVersionClockExtensionLead = kVersionClockReservationBatch / 2U;
 
 // Persisted version-clock bookkeeping format (data_dir/chunkdb.version). The
 // record is exactly kVersionClockRecordSize bytes:
@@ -297,22 +312,14 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting, const std::error
     }
 }
 
-void ChunkStore::ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive) {
-    // Called under version_clock_mutex_. Persists a new ceiling above
-    // minimum_exclusive before it is used, so a crash can never leave issued
-    // tokens above the durable ceiling.
-    std::uint64_t new_ceiling = version_clock_ceiling_.load(std::memory_order_relaxed);
-    if (new_ceiling <= minimum_exclusive) {
-        if (minimum_exclusive >
-            std::numeric_limits<std::uint64_t>::max() - kVersionClockReservationBatch) {
-            throw std::overflow_error("chunk version clock exhausted");
-        }
-        new_ceiling = minimum_exclusive + kVersionClockReservationBatch;
-    }
-
+void ChunkStore::WriteVersionClockCeiling(std::uint64_t ceiling) {
+    // Persists the new ceiling before any token at or above the old one is
+    // issued, so a crash can never leave issued tokens above the durable
+    // ceiling.
+    if (version_clock_pause_armed_.load(std::memory_order_acquire)) PauseVersionClockExtensionIfArmed();
     AtomicWrite(
         version_clock_path_,
-        SerializeVersionClockRecord(new_ceiling),
+        SerializeVersionClockRecord(ceiling),
         /*fsync_file=*/true,
         /*fsync_directory=*/true,
         /*out_replaced=*/nullptr,
@@ -320,8 +327,142 @@ void ChunkStore::ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive
         // Clock bookkeeping must not consume the generic ATOMICWRITE
         // failpoints a test armed for a data-path write; the clock has
         // its own VERSION_RESERVE_FAIL_ONCE hook.
-        /*enable_generic_failpoints=*/false);
-    version_clock_ceiling_.store(new_ceiling, std::memory_order_release);
+        /*enable_generic_failpoints=*/false,
+        /*before_replace=*/[] {
+            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_VERSION_EXTENSION_BEFORE_REPLACE_ONCE")) ExitAbruptly(86);
+        });
+}
+
+void ChunkStore::AdvanceVersionClockCeilingLocked(std::unique_lock<std::mutex>& lock, std::uint64_t minimum) {
+    if (version_clock_extension_in_flight_) {
+        // One writer of the record at a time: wait for the one in flight.
+        version_clock_extended_.wait(lock, [this] { return !version_clock_extension_in_flight_; });
+        return;
+    }
+    if (minimum > std::numeric_limits<std::uint64_t>::max() - kVersionClockReservationBatch) {
+        throw std::overflow_error("chunk version clock exhausted");
+    }
+    const std::uint64_t ceiling = minimum + kVersionClockReservationBatch;
+    version_clock_extension_in_flight_ = true;
+    lock.unlock();
+    const auto started = std::chrono::steady_clock::now();
+    try {
+        WriteVersionClockCeiling(ceiling);
+    } catch (...) {
+        // The ceiling stays; the next writer at it writes the record again.
+        lock.lock();
+        version_clock_extension_in_flight_ = false;
+        version_clock_extended_.notify_all();
+        throw;
+    }
+    const auto elapsed_us = MicrosecondsSince(started);
+    lock.lock();
+    // Counted before the ceiling is published, so a reader of the ceiling
+    // sees the count.
+    stats_version_clock_extensions_.fetch_add(1U, std::memory_order_relaxed);
+    stats_version_clock_extension_us_.fetch_add(elapsed_us, std::memory_order_relaxed);
+    version_clock_ceiling_.store(ceiling, std::memory_order_release);
+    version_clock_extension_in_flight_ = false;
+    version_clock_extended_.notify_all();
+}
+
+void ChunkStore::StartVersionClockExtension(std::uint64_t ceiling) {
+    std::lock_guard lock(version_clock_mutex_);
+    StartVersionClockExtensionLocked(ceiling);
+}
+
+void ChunkStore::StartVersionClockExtensionLocked(std::uint64_t ceiling) {
+    if (!version_clock_early_extensions_ || version_clock_extension_in_flight_ ||
+        version_clock_ceiling_.load(std::memory_order_acquire) != ceiling ||
+        ceiling > std::numeric_limits<std::uint64_t>::max() - kVersionClockReservationBatch) {
+        return;
+    }
+    // The previous extension thread cleared the in-flight flag under this
+    // mutex as its last locked step, so joining it does not wait on the
+    // mutex held here.
+    if (version_clock_extender_.joinable()) version_clock_extender_.join();
+    version_clock_extension_in_flight_ = true;
+    try {
+        version_clock_extender_ = std::thread([this, ceiling] { RunVersionClockExtension(ceiling); });
+    } catch (const std::system_error&) {
+        // No thread: the writer that reaches the ceiling writes the record.
+        version_clock_extension_in_flight_ = false;
+    }
+}
+
+void ChunkStore::RunVersionClockExtension(std::uint64_t ceiling) noexcept {
+    const std::uint64_t next = ceiling + kVersionClockReservationBatch;
+    const auto started = std::chrono::steady_clock::now();
+    bool written = false;
+    try {
+        WriteVersionClockCeiling(next);
+        written = true;
+    } catch (const std::exception& error) {
+        // Nothing was issued from the next range. The writer that reaches
+        // the ceiling writes the record itself and gets its own error.
+        LogMessage(
+            LogLevel::kWarn, LogComponent::kStore, "version clock extension failed; writers at the ceiling retry it",
+            {{"data_dir", data_dir_.string()}, {"error", error.what()}});
+    }
+    const auto elapsed_us = MicrosecondsSince(started);
+    {
+        std::lock_guard lock(version_clock_mutex_);
+        if (written) {
+            stats_version_clock_extensions_.fetch_add(1U, std::memory_order_relaxed);
+            stats_version_clock_extension_us_.fetch_add(elapsed_us, std::memory_order_relaxed);
+            version_clock_ceiling_.store(next, std::memory_order_release);
+        }
+        version_clock_extension_in_flight_ = false;
+    }
+    version_clock_extended_.notify_all();
+}
+
+void ChunkStore::PauseVersionClockExtensionIfArmed() {
+    std::unique_lock lock(durability_hook_mutex_);
+    if (!version_clock_pause_armed_.exchange(false, std::memory_order_acq_rel)) return;
+    version_clock_pause_reached_ = true;
+    durability_hook_cv_.notify_all();
+    durability_hook_cv_.wait(lock, [this] { return version_clock_pause_resumed_; });
+    if (version_clock_pause_fail_) throw std::runtime_error("injected version clock extension failure");
+}
+
+void ChunkStore::ArmVersionClockExtensionPauseForTests() {
+    std::lock_guard lock(durability_hook_mutex_);
+    version_clock_pause_reached_ = false;
+    version_clock_pause_resumed_ = false;
+    version_clock_pause_fail_ = false;
+    version_clock_pause_armed_.store(true, std::memory_order_release);
+}
+
+bool ChunkStore::WaitForVersionClockExtensionPauseForTests() {
+    std::unique_lock lock(durability_hook_mutex_);
+    return durability_hook_cv_.wait_for(lock, std::chrono::seconds(10), [this] { return version_clock_pause_reached_; });
+}
+
+void ChunkStore::ResumeVersionClockExtensionForTests(bool fail) {
+    std::lock_guard lock(durability_hook_mutex_);
+    version_clock_pause_fail_ = fail;
+    version_clock_pause_resumed_ = true;
+    durability_hook_cv_.notify_all();
+}
+
+void ChunkStore::StopVersionClockExtension() noexcept {
+    std::thread extender;
+    {
+        std::lock_guard lock(version_clock_mutex_);
+        version_clock_early_extensions_ = false;
+        extender = std::move(version_clock_extender_);
+    }
+    {
+        // A held test pause must not keep shutdown waiting.
+        std::lock_guard lock(durability_hook_mutex_);
+        version_clock_pause_armed_.store(false, std::memory_order_release);
+        version_clock_pause_resumed_ = true;
+        durability_hook_cv_.notify_all();
+    }
+    // The write in flight finishes: the record holds its ceiling or the one
+    // before, both above every issued token.
+    if (extender.joinable()) extender.join();
 }
 
 std::uint64_t ChunkStore::NextChunkVersion() {
@@ -341,15 +482,23 @@ std::uint64_t ChunkStore::NextChunkVersion() {
     // reservation instead of issuing token zero or a reused token.
     std::uint64_t candidate = version_clock_.load(std::memory_order_seq_cst);
     while (true) {
-        if (candidate >= version_clock_ceiling_.load(std::memory_order_acquire)) {
-            // Reserved range exhausted: persist a higher ceiling before
-            // issuing any token at or above it. Throws, leaving the clock
-            // unchanged, when no higher ceiling exists.
-            std::lock_guard lock(version_clock_mutex_);
-            candidate = version_clock_.load(std::memory_order_seq_cst);
-            if (candidate >= version_clock_ceiling_.load(std::memory_order_acquire)) {
-                ExtendVersionClockCeilingLocked(candidate);
+        const std::uint64_t ceiling = version_clock_ceiling_.load(std::memory_order_acquire);
+        if (candidate >= ceiling) {
+            // Reserved range exhausted: wait for a higher durable ceiling
+            // before issuing any token at or above it. Throws, leaving the
+            // clock unchanged, when the write fails or no higher ceiling
+            // exists. The wait counts from here, so a writer blocked behind
+            // another writer's extension counts too.
+            const auto waiting = std::chrono::steady_clock::now();
+            {
+                std::unique_lock lock(version_clock_mutex_);
+                candidate = version_clock_.load(std::memory_order_seq_cst);
+                if (candidate >= version_clock_ceiling_.load(std::memory_order_acquire)) {
+                    AdvanceVersionClockCeilingLocked(lock, candidate);
+                    candidate = version_clock_.load(std::memory_order_seq_cst);
+                }
             }
+            stats_version_clock_wait_us_.fetch_add(MicrosecondsSince(waiting), std::memory_order_relaxed);
             continue;
         }
         // Sequentially consistent: a write loads the open-transaction count
@@ -358,6 +507,10 @@ std::uint64_t ChunkStore::NextChunkVersion() {
         // two always sees the other.
         if (version_clock_.compare_exchange_weak(
                 candidate, candidate + 1U, std::memory_order_seq_cst, std::memory_order_seq_cst)) {
+            // Exactly one writer takes the token half a range below this
+            // ceiling, and it starts writing the next range while the rest
+            // of this one is issued.
+            if (ceiling - candidate == kVersionClockExtensionLead) StartVersionClockExtension(ceiling);
             return candidate;
         }
     }
@@ -389,13 +542,14 @@ void ChunkStore::RaiseVersionClockAbove(std::uint64_t revision) {
     if (version_clock_.load(std::memory_order_relaxed) > revision) {
         return;
     }
-    std::lock_guard lock(version_clock_mutex_);
+    std::unique_lock lock(version_clock_mutex_);
+    const std::uint64_t next = revision + 1;
+    while (version_clock_.load(std::memory_order_relaxed) <= revision &&
+           next >= version_clock_ceiling_.load(std::memory_order_acquire)) {
+        AdvanceVersionClockCeilingLocked(lock, next);
+    }
     if (version_clock_.load(std::memory_order_relaxed) > revision) {
         return;
-    }
-    const std::uint64_t next = revision + 1;
-    if (next >= version_clock_ceiling_.load(std::memory_order_acquire)) {
-        ExtendVersionClockCeilingLocked(next);
     }
     // NextChunkVersion takes tokens without this mutex, so the clock may have
     // moved past `next` since the check: only ever raise it, or tokens
@@ -404,6 +558,9 @@ void ChunkStore::RaiseVersionClockAbove(std::uint64_t revision) {
     while (current < next &&
            !version_clock_.compare_exchange_weak(current, next, std::memory_order_relaxed, std::memory_order_relaxed)) {
     }
+    // The raise can pass the token that starts the next range's write.
+    const std::uint64_t ceiling = version_clock_ceiling_.load(std::memory_order_acquire);
+    if (ceiling - next <= kVersionClockExtensionLead) StartVersionClockExtensionLocked(ceiling);
 }
 
 std::uint64_t ChunkStore::ChunkCommitTimeForTests(std::int64_t chunk_x, std::int64_t chunk_y) {

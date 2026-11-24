@@ -538,6 +538,11 @@ ChunkStore::ChunkStore(StoreConfig config)
             throw;
         }
     }
+    if (access_mode_ != AccessMode::kReadOnly) {
+        // Last, so no extension thread outlives a constructor that throws.
+        std::lock_guard lock(version_clock_mutex_);
+        version_clock_early_extensions_ = true;
+    }
 }
 
 void ChunkStore::InitializeStoreManifest() {
@@ -661,6 +666,7 @@ ChunkStore::~ChunkStore() {
     // shuts down. Its chunks leave the shared cache with it.
     resources_->UnregisterStore(this);
     StopMaintenanceThread();
+    StopVersionClockExtension();
     FlushAllPendingWalBatches();
     SyncUnsyncedOnClose();
     // The stream pool is shared with other stores: give its slots back now
@@ -725,6 +731,9 @@ StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
         .txn_history_copies = txn_history_->CopiedStates(),
         .txn_history_copied_bytes = txn_history_->CopiedBytes(),
         .txn_history_bytes = txn_history_->KeptBytesCounter().load(std::memory_order_acquire),
+        .version_clock_extensions = stats_version_clock_extensions_.load(std::memory_order_relaxed),
+        .version_clock_extension_us = stats_version_clock_extension_us_.load(std::memory_order_relaxed),
+        .version_clock_wait_us = stats_version_clock_wait_us_.load(std::memory_order_relaxed),
     };
 }
 
