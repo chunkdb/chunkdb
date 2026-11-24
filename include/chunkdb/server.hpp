@@ -82,9 +82,9 @@ class ChunkServer {
     [[nodiscard]] std::size_t HandshakesInProgressForTests(const std::string& source);
 
     // Waits until Run has bound its listener (true), or until Run fails, Stop
-    // is called or `timeout` passes (false). A test harness checks this
-    // before it connects, so another socket on the same port is never taken
-    // for this server.
+    // is called or `timeout` passes (false). A test harness checks this before it
+    // connects, so another socket on the same port is never taken for this
+    // server.
     [[nodiscard]] bool WaitListeningForTests(std::chrono::milliseconds timeout);
 
   private:
