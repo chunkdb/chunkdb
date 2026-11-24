@@ -914,7 +914,8 @@ void TestWatchDeliveryMeasure() {
 
     for (const bool slots : {false, true}) {
         auto args = chunkdb::server_bench::ParseArgs({"bench", "--watch", slots ? "default:2:slots" : "default:3",
-            "--watch-delivery", "measure"});
+            "--watch-delivery", "measure", "--report-cpu"});
+        assert(args.report_cpu);
         args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
         args.port = 0; args.clients = 2; args.requests = 200; args.keyspace = 64;
         args.tests = {chunkdb::server_bench::Scenario::kCanvas, chunkdb::server_bench::Scenario::kSimulation};
@@ -938,6 +939,11 @@ void TestWatchDeliveryMeasure() {
         assert(json.find("\"watch_delivery\":\"measure\"") != std::string::npos);
         assert(json.find("\"watchers\":[{\"index\":0,\"slot\":" + std::string(slots ? "true" : "false")) != std::string::npos);
         assert(json.find("\"lag_revisions_at_end\":") != std::string::npos);
+        // Each run reports CPU seconds of the process, the clients and the watch readers.
+        for (const auto& result : report.results)
+            assert(result.cpu_s >= 0.0 && result.client_cpu_s >= 0.0 && result.watch_cpu_s >= 0.0);
+        assert(json.find(",\"client_cpu_s\":") != std::string::npos && json.find(",\"context_switches\":") != std::string::npos);
+        assert(chunkdb::server_bench::RenderHumanReport(report).find("CPU: process_s=") != std::string::npos);
         assert(chunkdb::server_bench::RenderHumanReport(report).find(slots ? "Watcher 1 slot: events=" : "Watcher 2: events=") !=
                std::string::npos);
     }
@@ -950,6 +956,7 @@ void TestWatchDeliveryMeasure() {
     const auto report = chunkdb::server_bench::Run(plain);
     const auto json = chunkdb::server_bench::RenderJsonReport(report);
     assert(json.find("watchers") == std::string::npos && json.find("watch_delivery") == std::string::npos);
+    assert(json.find("cpu_s") == std::string::npos);
     assert(chunkdb::server_bench::RenderHumanReport(report).find("Watcher") == std::string::npos);
 }
 

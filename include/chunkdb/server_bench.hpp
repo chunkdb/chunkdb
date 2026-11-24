@@ -70,6 +70,8 @@ struct Args {
     std::string watch_delivery = "strict";
     // measure: the longest wait for a CREATE SLOT reply.
     std::size_t slot_create_timeout_ms = 600000;
+    // Report-only: process, client and watch CPU time of each timed run.
+    bool report_cpu = false;
     // Clients that log in as `user` with a wrong password, one login after
     // another, from when every measured client has logged in until they all
     // finish; report-only.
@@ -118,6 +120,14 @@ struct ScenarioResult {
     double watch_duration_s = 0.0;
     // Failed-login and ban replies the --failed-logins clients received.
     std::size_t failed_logins = 0;
+    // --report-cpu: CPU seconds of this process from the first client start to
+    // the last client reply, of the measured client threads, and of the watch
+    // readers from WATCH to UNWATCH; context switches of the process in the
+    // timed window. Where a platform cannot say, a value stays 0.
+    double cpu_s = 0.0;
+    double client_cpu_s = 0.0;
+    double watch_cpu_s = 0.0;
+    std::uint64_t context_switches = 0;
     std::vector<WatcherResult> watchers;
     std::vector<std::pair<std::string, std::size_t>> request_mix;
     double latency_avg_ms = 0.0;
@@ -164,6 +174,7 @@ struct BenchmarkReport {
     std::string watch;
     // The --failed-logins value.
     std::size_t failed_login_clients = 0;
+    bool report_cpu = false;
     std::vector<ScenarioResult> results;
 };
 
