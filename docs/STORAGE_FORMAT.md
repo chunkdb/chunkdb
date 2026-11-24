@@ -372,7 +372,7 @@ The final variable state must obey the VARS presence, type, ordering, UTF-8, and
 A writer replays a valid image, or an empty state when none exists, followed by committed frames from its live WAL.
 A failed header is recoverable only with the interrupted-creation shape: an expected header prefix followed by zero bytes.
 Feature-byte differences are ignored.
-Incomplete CRC bytes are allowed after the first 56 header bytes match.
+Incomplete CRC bytes are allowed after the first `44 + 8 * dims` header bytes, everything before the checksum, match.
 
 Other invalid headers are damage; interrupted creation contributes no frames and can be removed.
 A trailing incomplete/bad-checksum frame can be discarded only when no later checksum-valid frame header exists.
@@ -549,6 +549,8 @@ Live-history readers capture completed byte boundaries and read only the prefix 
 4. After each user's grants: `max_connections:u64`, `statements_per_sec:u64`, little-endian. Zero disables a limit; the rate is at most 65536.
 5. CRC32 over all preceding bytes, including the limits.
 
+The file is at most 64 MiB: the writer refuses a larger one, and readers check the file size before they read it.
+
 Before serialization or file replacement, the writer checks u16 name widths, salt lengths, u32 user/grant counts, SCRAM iterations (4096–1000000), known rights, the rate limit, and an added verifier with another salt or iteration count than the user's verifier, or with its keys. Invalid input leaves the existing file and directory metadata unchanged and does not create a new store.
 Writer serialization orders users by name, then table grants by name, then prefix grants by prefix; decoding refuses duplicate users/grants/verifiers, more than one added verifier, unknown flags/rights/version, bad checksum, truncation, or trailing bytes.
 Version 2 files have no added verifier count, flag bits 2..4 or prefix grants: they are read as users with one verifier, decoding refuses those bits and prefix grants in them, and the next change writes version 3.
@@ -611,6 +613,8 @@ Completed copies use the same metadata/image/WAL formats and add `chunkdb.backup
 2. Each table: name length `u32` and name, epoch (16 bytes), completed revision cut `u64`.
 3. File count `u32`; each file: relative-path length `u32` and path, length `u64`, CRC32 `u32`.
 4. CRC32 over all preceding bytes.
+
+The record is at most 1 GiB: the writer refuses a larger one, and readers check the file size before they read it.
 
 Inventory paths use canonical `/` separators; absolute roots, drive names, backslashes, NUL, empty components, `.` and `..` are invalid before path conversion/access.
 The inventory includes root metadata, users/ledger when present, table definitions/history, and clocks above cuts.
