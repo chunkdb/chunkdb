@@ -88,6 +88,7 @@ add_library(chunkdb_core STATIC
     src/feed_slots.cpp
     src/slot_watch.cpp
     src/feed_archive.cpp
+    src/wal_archive.cpp
     src/feed_prefix.cpp
     src/chunk_ops.cpp
     src/chunk_scan.cpp
@@ -1106,6 +1107,12 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME feed_slots_crash COMMAND chunkdb_feed_slots_crash_test)
     set_tests_properties(feed_slots_crash PROPERTIES TIMEOUT 300)
 
+    add_executable(chunkdb_wal_archive_test tests/wal_archive_tests.cpp)
+    target_link_libraries(chunkdb_wal_archive_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_wal_archive_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME wal_archive COMMAND chunkdb_wal_archive_test)
+    set_tests_properties(wal_archive PROPERTIES TIMEOUT 300)
+
     add_executable(chunkdb_feed_slots_durability_test tests/feed_slots_durability_tests.cpp)
     target_link_libraries(chunkdb_feed_slots_durability_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_feed_slots_durability_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1154,6 +1161,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_feed_slots_test
         chunkdb_feed_slots_verify_test
         chunkdb_feed_slots_crash_test
+        chunkdb_wal_archive_test
         chunkdb_feed_slots_durability_test
         chunkdb_feed_order_test
         chunkdb_feed_watermark_test

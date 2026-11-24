@@ -58,6 +58,15 @@ On Windows, a write that checkpoints its chunk or undoes a failed WAL append wai
 Above 65,536 tracked files and directories, a table tracks its changed large-chunk directories (`L_<lx>_<ly>`) instead, and the barrier syncs every file in each of them.
 Above 65,536 changed large-chunk directories, the barrier syncs every file and directory of the table.
 
+## WAL archive
+
+With `--archive-dir` or `--archive-command`, every checkpoint keeps its WAL as a sealed segment, and checkpoints publish their images synced in every mode.
+Every `--archive-interval-ms` the server checkpoints each table's chunks that hold changes, ships the sealed segments and then publishes a seal record.
+A seal record's revision R for a table means: every change at or below R is in a shipped segment, and the segments were durable in the archive before the record.
+Changes after the newest seal record are not in the archive; a clean shutdown runs one more pass.
+A failed copy or command is retried every interval; until then the sealed segments stay in the data directory.
+A dropped table's changes after the last pass before DROP are not archived.
+
 ## Failures
 
 An ordinary rejected mutation changes nothing, except when its error explicitly reports an unknown write outcome.

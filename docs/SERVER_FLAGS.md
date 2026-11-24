@@ -135,6 +135,18 @@ The cache setting also bounds large-chunk containers shared by the tables, inclu
 A new cache miss that cannot fit returns `BUSY reason=large_chunk_cache_full` before applying a mutation; existing container hits remain usable.
 Raise `--max-loaded-chunks` to raise the associated container limit.
 
+## WAL archive
+
+| Flag | Default | Meaning |
+|---|---|---|
+| `--archive-dir` | unset | Copies every sealed WAL segment of every table to this directory, outside `--data-dir`; see [WAL archive](BACKUP.md#5-archive-the-wal). |
+| `--archive-command` | unset | Instead of `--archive-dir`, runs this shell command for each file: `%p` is its local path, `%f` its name in the archive, `%%` a `%`; exit status 0 means archived. |
+| `--archive-interval-ms` | `60000` | 100 to 86400000; how often every table is sealed and shipped. |
+| `--archive-retention-ms` | `0` | With `--archive-dir`, how long seal records and the segments only they need are kept; `0` keeps everything. |
+
+The two archive flags exclude each other, and `--read-only` refuses them.
+A table needs the `feed_slots` feature, which tables created by this version have; for an older table, start without the archive flags, run `ENABLE FEATURE 'feed_slots'`, and restart.
+
 ## Read-only
 
 `--read-only` serves a data directory, or a completed [backup](BACKUP.md#3-inspect-a-backup), without writing to its files.

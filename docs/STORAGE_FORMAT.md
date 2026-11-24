@@ -34,6 +34,7 @@ data_dir/
   .chunkdb.staging/                    table creation and restore staging
   .chunkdb.dropped/                    tables renamed out of the catalog
   .chunkdb.backups/                    temporary pinned backup files
+  .chunkdb.archive/                    WAL archive files waiting to be shipped
   tables/<name>/
     table.manifest                    identity, geometry, options, schema history
     chunkdb.version                   reserved revision ceiling
@@ -511,6 +512,26 @@ Retention preserves segments needed by persisted active-slot positions and pinne
 Active readers keep live rollover archival even if the last slot is dropped.
 
 Live-history readers capture completed byte boundaries and read only the prefix at or below the persisted frontier; a shortened accepted prefix is damage.
+
+## WAL archive
+
+With `--archive-dir` or `--archive-command`, each pass hard-links every sealed segment of `.chunkdb.feed/` and its `.base` descriptor into `data_dir/.chunkdb.archive/table.<epoch hex32>/`, syncs that directory, and only then lets slot retention remove the segment from `.chunkdb.feed/`.
+A new schema version's table manifest is staged there as `table.<schema version>.<CRC32 of its bytes, 8 hex digits>.manifest`.
+The pass ships every staged file to the same relative name in the archive, writes the seal record, ships it as `directory.<data-directory id hex32>/seal.<capture Unix ms, 20 digits>`, and then removes the staged files it lists.
+A writer start removes staged files whose names contain `.tmp.` and every staged entry that is not a `table.<epoch>` directory; staged table files are shipped again and listed by a later record.
+
+A seal record is at most one per pass:
+
+1. `CKAS`, format `1:u16`, zero `u16`, data-directory id (16 bytes), capture time in Unix ms `u64`, table count `u32`.
+2. Per table: flags `u8` (`0x1` sealed), name length `u8` and name, epoch (16 bytes), seal revision `u64` (zero without `0x1`), schema version `u64`, file count `u32`.
+3. Per file: name length `u16` and name, length `u64`, CRC32 of the whole file `u32`.
+4. CRC32 over all preceding bytes.
+
+A table appears at most once; a sealed table's revision is its seal point: every frame at or below it is in a listed segment of this or an earlier record.
+An unsealed entry lists files shipped without a seal point, such as those of a dropped table.
+File names are single path components that do not start with `.`.
+Archive files are written once: `--archive-dir` copies to a `.`-prefixed temporary name, syncs it, renames it without replacing and syncs the directory; an existing file must have equal length and CRC32.
+Retention removes a record older than the bound only when the newest older-than-bound record seals each of its tables above every listed segment's last revision, or lists the table in neither that record nor the newest one; it removes the record first, then its segments and descriptors, and keeps manifests.
 
 ## Users
 

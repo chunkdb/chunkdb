@@ -473,7 +473,8 @@ ChunkStore::ChunkStore(StoreConfig config)
         RecoverTransactionIntents();
         InitializeCoordinateIndex();
         FinishSnapshotGenerationRecovery();
-        feed_slots_ = std::make_shared<FeedSlots>(*this, config.slot_max_bytes, config.slot_sync_interval);
+        feed_slots_ = std::make_shared<FeedSlots>(*this, config.slot_max_bytes, config.slot_sync_interval,
+            config.wal_archive && access_mode_ == AccessMode::kReadWrite);
     } catch (...) {
         // AcquireProcessLock starts the metadata heartbeat. A throwing
         // constructor does not run ChunkStore's destructor, so release the

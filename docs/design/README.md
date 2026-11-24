@@ -11,6 +11,7 @@
 - [Table restore](RESTORE_TABLE.md): online RESTORE TABLE, SWAP TABLES, RENAME TO and feed resync.
 - [Tables](TABLES_DESIGN.md): catalog leases and directory publication.
 - [Transactions](TRANSACTIONS_DESIGN.md): snapshot history and durable decisions.
+- [WAL archive](WAL_ARCHIVE.md): sealed segments, seal records, retention and point-in-time restore.
 - [Users](USERS_DESIGN.md): SCRAM, rights and metadata recovery.
 
 - [Persistence design](PERSISTENCE.md) records checkpoint, rollback, publication, and platform sync details.

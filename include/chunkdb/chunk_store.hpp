@@ -340,6 +340,9 @@ struct StoreConfig {
     // Per durable change-feed slot, including archived base images.
     std::size_t slot_max_bytes = 1024ULL * 1024ULL * 1024ULL;
     std::chrono::milliseconds slot_sync_interval{100};
+    // Every checkpoint seals its WAL into the feed archive, which keeps each
+    // segment until the WAL archiver has staged it (docs/design/WAL_ARCHIVE.md).
+    bool wal_archive = false;
     // The chunk-column domain, sharing the block schema's revision history.
     std::optional<TableSchema> chunk_schema = std::nullopt;
     QueryLimits query_limits{};
@@ -1172,6 +1175,17 @@ class ChunkStore {
     friend struct BackupTestAccess;
     friend struct FeatureActivationTestAccess;
     friend struct UnsyncedTestAccess;
+    friend class WalArchiver;
+
+    // Seals every frame at or below the completed revision into archived WAL
+    // segments by checkpointing each chunk whose live WAL holds one, and
+    // returns that revision; std::nullopt when a running backup deferred a
+    // checkpoint (docs/design/WAL_ARCHIVE.md).
+    [[nodiscard]] std::optional<std::uint64_t> SealForArchive();
+    // Hard-links every archived segment and its base descriptor not staged
+    // yet into `directory`, syncs it, then lets slot retention remove what is
+    // staged. Returns how many segments it staged.
+    std::size_t StageForArchive(const std::filesystem::path& directory);
 
     // What a WAL barrier still has to sync (see unsynced_files_).
     struct UnsyncedArtifacts {
