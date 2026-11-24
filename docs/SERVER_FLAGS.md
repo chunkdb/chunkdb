@@ -17,7 +17,7 @@ Numeric values are decimal integers, with the bounds shown here.
 | `--statement-timeout-ms` | `0` | 0–86400000 ms from complete request admission through queue wait and cancellable execution; zero disables it and HELLO may override it. |
 | `--max-pending-clients` | `1024` | Complete statements queued for a worker; additional ready statements wait for queue credit while HELLO and session controls remain available. |
 | `--max-handshakes-per-ip` | `64` | Connections from an IPv4 address or IPv6 /64 before HELLO; exceeding the limit is refused. `0` disables the limit. |
-| `--max-line-bytes` | `65536` | Request line limit including terminator; parameter frames are bounded separately by column/chunk size. |
+| `--max-line-bytes` | `65536` | Request line limit including terminator; parameter frames are bounded separately by column/chunk size. Before authentication lines and kept frames take at most 8192 bytes, or this limit when smaller. |
 | `--max-unparsed-parameter-bytes` | `1048576` | Payload bytes drained after a statement cannot parse or its parameter types cannot resolve; excess closes with PROTOCOL. |
 | `--log-level` | `info` | `info`, `warn`, `error`. |
 | `--auth` | `scram` | `scram` or `none`; `none` grants all rights and is intended for local development. |

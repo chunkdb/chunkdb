@@ -788,7 +788,7 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
                 const auto* parameter = std::get_if<cql::Parameter>(&option.value);
                 if (parameter == nullptr) continue;
                 std::size_t limit = 0U;
-                if (option.name == "client_name") limit = config_.max_line_bytes;
+                if (option.name == "client_name") limit = std::min(config_.max_line_bytes, kMaxLoginLineBytes);
                 else if (option.name == "default_tag") limit = 256U;
                 else if (option.name == "statement_timeout_ms") limit = 8U;
                 else continue;

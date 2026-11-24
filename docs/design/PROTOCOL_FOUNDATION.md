@@ -39,7 +39,7 @@ It adds the following fields; the SCRAM intermediate exchange remains unchanged,
 | `idle_timeout_ms` | Effective configured idle timeout; current default 60000. |
 | `limits` | Map containing all seven limits below. |
 
-Known options are `client_name` (text), `statement_timeout_ms` (nonnegative milliseconds; zero disables), and `default_tag` (bytes, maximum 256).
+Known options are `client_name` (text, at most 8192 bytes or `--max-line-bytes` when smaller), `statement_timeout_ms` (nonnegative milliseconds; zero disables), and `default_tag` (bytes, maximum 256).
 Names are case-insensitive and normalized to lowercase; duplicate names are `INVALID_ARGUMENT reason=duplicate_option`.
 Invalid known values are `INVALID_ARGUMENT reason=option_value option=<name>`, not authentication failures.
 Unknown options are lexically parsed, accepted and reported as not applied; they never increment authentication-failure counters.

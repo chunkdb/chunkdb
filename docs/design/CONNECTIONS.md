@@ -45,6 +45,7 @@ A worker waiting for its connection's next request keeps that connection's data 
 Request-line buffers obey their negotiated line bound and a separate aggregate byte bound; reserved control capacity remains available while data framing is paused.
 Unclassified request lines use reserved line credit, so data-only credit cannot prevent receiving a new HELLO or control line.
 Lines read before login use a separate 16777216-byte line reserve, so unfinished logins cannot take the line credit of logged-in connections.
+Before login a line and a kept frame take at most 8192 bytes, so each unfinished login holds at most 12288 bytes of line credit and under 10 KiB of frame credit: the reserves hold more than a thousand unfinished logins.
 An idle connection on the I/O owner holds no line credit: a read that buffers nothing returns the credit it took, and a writable reply is not taken for input.
 Replies charge their retained immutable state and encoded buffers against 2147483648 bytes of shared output credit.
 Authentication and control replies use a separate 16777216-byte output reserve.

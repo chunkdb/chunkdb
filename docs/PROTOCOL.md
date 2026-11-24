@@ -9,6 +9,7 @@ WATCH changes that connection into a push stream.
 TCP uses `chunk://`; TLS uses `chunks://` with certificate validation in the client.
 Lines end with LF or CRLF; a line cut off at end of stream is never executed.
 The terminator counts toward `--max-line-bytes` (65536 by default); overflow sends BAD_REQUEST and closes.
+Before authentication a request line and a kept parameter frame each take at most 8192 bytes, or `--max-line-bytes` when smaller: a longer line receives PROTOCOL and closes, and a longer `client_name` value receives `INVALID_ARGUMENT reason=option_value`.
 Binary parameter frames do not count toward that line limit.
 A PROXY protocol v2 header and the TLS handshake each have their own `--client-io-timeout-ms`, in that order, before the HELLO deadline starts.
 Until authentication succeeds, HELLO, AUTH and all their parameter frames must arrive within `--client-io-timeout-ms` of that start; later ones receive PROTOCOL and close.

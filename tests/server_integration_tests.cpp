@@ -5701,22 +5701,18 @@ void TestRemovingCreditHeadAdmitsNextWaiter() {
 class LoginCreditHook : public chunkdb::FeedDeliveryTestHook {
   public:
     void Run(Point point, std::size_t) override {
-        if (point != Point::kAfterPayloadCreditGranted && point != Point::kAfterLineCreditRefused) return;
-        { std::lock_guard lock(mutex_); ++(point == Point::kAfterPayloadCreditGranted ? granted_ : refused_); }
+        if (point != Point::kAfterPayloadCreditGranted) return;
+        { std::lock_guard lock(mutex_); ++granted_; }
         changed_.notify_all();
     }
     void WaitGranted(std::size_t count) {
         std::unique_lock lock(mutex_);
         assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return granted_ >= count; }));
     }
-    void WaitRefused() {
-        std::unique_lock lock(mutex_);
-        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return refused_ != 0U; }));
-    }
   private:
     std::mutex mutex_;
     std::condition_variable changed_;
-    std::size_t granted_ = 0U, refused_ = 0U;
+    std::size_t granted_ = 0U;
 };
 
 // Before login a kept frame is charged the length its header gives, so many
@@ -5741,22 +5737,36 @@ void TestLoginFramesChargedByLength() {
     }
 }
 
-// Lines before login draw from their own credit: while unfinished login
-// lines hold all of it, a logged-in connection still reads its requests.
-void TestLoginLinesUseTheirOwnCredit() {
+// Before login a line and a kept frame take at most 8192 bytes, and the
+// login reserves hold more stalled logins than one source may open: 64
+// connections stopped inside a client_name frame at that limit leave a new
+// login and a logged-in connection's reads unaffected; charged the
+// --max-line-bytes of 1 MiB per line, 16 of them filled the line reserve.
+void TestStalledLoginsLeaveLoginsAndReads() {
     LoginCreditHook hook;
     auto config = BaseServerConfig(); config.client_io_timeout_ms = 30000; config.max_line_bytes = 1048576U;
-    ServerHarness harness("login-line-credit", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    config.max_handshakes_per_ip = 0U;
+    ServerHarness harness("login-stalled", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
     RawClient logged("127.0.0.1", harness.port); logged.SetReadDeadline(std::chrono::seconds(10)); logged.Hello();
     chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
-    // Each unfinished line holds max_line_bytes + 4096 bytes, so 16 of them need more than 16 MiB.
-    std::vector<std::unique_ptr<RawClient>> partial;
-    for (std::size_t i = 0U; i < 16U; ++i) {
-        partial.push_back(std::make_unique<RawClient>("127.0.0.1", harness.port));
-        partial.back()->SendBytes("HELLO");
+    std::vector<std::unique_ptr<RawClient>> stalled;
+    for (std::size_t i = 0U; i < 64U; ++i) {
+        stalled.push_back(std::make_unique<RawClient>("127.0.0.1", harness.port));
+        stalled.back()->SendBytes("HELLO 3 WITH client_name=$1\r\n$8192\r\n" + std::string(4000, 'a'));
+        hook.WaitGranted(i + 1U);
     }
-    hook.WaitRefused();
+    RawClient login("127.0.0.1", harness.port); login.SetReadDeadline(std::chrono::seconds(10));
+    login.SendBytes("HELLO 3 WITH client_name=$1\r\n$4\r\nname\r\n");
+    (void)ReadHelloReply(login);
     logged.SendLine("PING"); assert(logged.ReadLine() == "+PONG\r\n");
+    // Longer values and lines before login are refused.
+    RawClient long_name("127.0.0.1", harness.port); long_name.SetReadDeadline(std::chrono::seconds(10));
+    long_name.SendBytes("HELLO 3 WITH client_name=$1\r\n$8193\r\n" + std::string(8193, 'a') + "\r\n");
+    assert(long_name.ReadLine().starts_with("-ERR INVALID_ARGUMENT reason=option_value option=client_name "));
+    RawClient long_line("127.0.0.1", harness.port); long_line.SetReadDeadline(std::chrono::seconds(10));
+    long_line.SendBytes("HELLO 3 WITH client_name='" + std::string(8200, 'a') + "'\r\n");
+    assert(long_line.ReadLine().starts_with("-ERR PROTOCOL "));
+    assert(long_line.WaitForClose(std::chrono::seconds(5)));
 }
 
 // Time spent waiting for the server's input credit is not the client's
@@ -8597,7 +8607,7 @@ int main(int argc, char** argv) {
         run("TestReplyAdmissionPrecedesMutation", TestReplyAdmissionPrecedesMutation);
         run("TestRemovingCreditHeadAdmitsNextWaiter", TestRemovingCreditHeadAdmitsNextWaiter);
         run("TestLoginFramesChargedByLength", TestLoginFramesChargedByLength);
-        run("TestLoginLinesUseTheirOwnCredit", TestLoginLinesUseTheirOwnCredit);
+        run("TestStalledLoginsLeaveLoginsAndReads", TestStalledLoginsLeaveLoginsAndReads);
         run("TestPayloadCreditWaitIsRefused", TestPayloadCreditWaitIsRefused);
         run("TestPayloadCreditGrantRestartsFrameDeadline", TestPayloadCreditGrantRestartsFrameDeadline);
         run("TestKillIdleTransactionReleasesHistory", [] { TestKillIdleTransactionReleasesHistory<RawClient>(false); });

@@ -76,8 +76,10 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
     // Charges a request before login for the kept frame lengths its headers
     // gave so far; false when the login credit cannot hold them.
     bool ChargeLoginInput(ServerConnection& connection);
-    // The line credit a connection's reads draw from: before login its own.
-    server_detail::ConnectionByteBudget& LineCredit(const ServerConnection& connection) const;
+    // The longest line a connection may send: before login kMaxLoginLineBytes.
+    std::size_t LineBytes(const ServerConnection& connection) const noexcept;
+    // Line credit for one unfinished line, before login from its own reserve.
+    std::shared_ptr<server_detail::ConnectionByteBudget::Credit> TakeLineCredit(const ServerConnection& connection);
     void CheckStatements();
     ChunkServer& server_;
     server_detail::SocketPoller poller_;

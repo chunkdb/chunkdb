@@ -55,7 +55,7 @@ void IdleIo::Start() {
     // Requests before login have their own frame and line credit, so they
     // cannot take what logged-in connections read and control with.
     login_credit_ = std::make_shared<ConnectionByteBudget>(16777216U, wake);
-    login_line_credit_ = std::make_shared<ConnectionByteBudget>(std::max<std::size_t>(16777216U, line_bound), wake);
+    login_line_credit_ = std::make_shared<ConnectionByteBudget>(16777216U, wake);
     thread_ = std::thread([this] { Run(); });
 }
 void IdleIo::Stop() { Wake(); if (thread_.joinable()) thread_.join(); }
@@ -239,20 +239,19 @@ bool IdleIo::Initialize(ServerConnection& connection) {
 bool IdleIo::Read(ServerConnection& connection) {
     if (connection.waiting_credit) return true;
     // Credit taken for this read is returned if it brings nothing to buffer.
-    const bool acquired = !connection.line_credit;
+    // A connection that logged in with bytes still buffered reads on under
+    // logged-in line credit.
+    const bool acquired = !connection.line_credit ||
+        (connection.session.greeted && login_line_credit_->Owns(connection.line_credit));
     const auto unused = [&] {
         if (acquired && connection.pending.empty() && connection.request_line.empty()) connection.line_credit.reset();
     };
-    if (!connection.line_credit) {
+    if (acquired) {
         if (server_.config_.max_line_bytes > std::numeric_limits<std::size_t>::max() - 4096U)
             throw std::invalid_argument("request line byte bound overflows");
-        connection.line_credit = LineCredit(connection).TryAcquire(server_.config_.max_line_bytes + 4096U);
-        if (!connection.line_credit) {
-            connection.waiting_line_credit = true;
-            if (auto* hook = server_.delivery_test_hook_.load(std::memory_order_acquire))
-                hook->Run(FeedDeliveryTestHook::Point::kAfterLineCreditRefused, connection.session.connection_id);
-            return true;
-        }
+        auto credit = TakeLineCredit(connection);
+        if (!credit) { connection.waiting_line_credit = true; return true; }
+        connection.line_credit = std::move(credit);
     }
     std::array<char, 4096> buffer{};
     int read = 0;
@@ -315,6 +314,12 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
         connection.input_deadline = now() +
             std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
     if (connection.request_line.empty()) {
+        if (!connection.session.greeted) {
+            const auto& pending = connection.pending;
+            const auto end = pending.bytes.find('\n', pending.cursor);
+            if ((end == std::string::npos ? pending.unconsumed_size() : end - pending.cursor + 1U) > LineBytes(connection))
+                throw std::runtime_error("a request line before login takes at most " + std::to_string(LineBytes(connection)) + " bytes");
+        }
         connection.pending.enforce_partial_line_limit(server_.config_.max_line_bytes);
         if (!connection.pending.extract_line(&connection.request_line, server_.config_.max_line_bytes)) return true;
         // After authentication the line had its own deadline; the frames
@@ -395,7 +400,7 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
     if (connection.frames) {
         const auto pieces = connection.frames->pieces();
         const auto charged = [&] { return login ? connection.payload_credit_bytes : std::numeric_limits<std::size_t>::max(); };
-        bool complete = connection.frames->Consume(connection.pending, server_.config_.max_line_bytes, charged());
+        bool complete = connection.frames->Consume(connection.pending, LineBytes(connection), charged());
         while (!complete && login && connection.frames->kept_bytes() > connection.payload_credit_bytes) {
             if (!ChargeLoginInput(connection)) {
                 // Unread frames follow the line, so the refused request closes.
@@ -403,7 +408,7 @@ bool IdleIo::Parse(ServerConnection& connection, bool worker) {
                 Reply(connection, Protocol::Error("BUSY", "login input byte budget is full", {{"reason", "input_budget"}}));
                 return true;
             }
-            complete = connection.frames->Consume(connection.pending, server_.config_.max_line_bytes, charged());
+            complete = connection.frames->Consume(connection.pending, LineBytes(connection), charged());
         }
         // After authentication each frame header and each frame body (from
         // the end of its header) has the I/O timeout of its own.
@@ -531,8 +536,14 @@ bool IdleIo::ChargeLoginInput(ServerConnection& connection) {
     return true;
 }
 
-ConnectionByteBudget& IdleIo::LineCredit(const ServerConnection& connection) const {
-    return connection.session.greeted ? *line_credit_ : *login_line_credit_;
+std::size_t IdleIo::LineBytes(const ServerConnection& connection) const noexcept {
+    return connection.session.greeted ? server_.config_.max_line_bytes :
+        std::min(server_.config_.max_line_bytes, kMaxLoginLineBytes);
+}
+
+std::shared_ptr<ConnectionByteBudget::Credit> IdleIo::TakeLineCredit(const ServerConnection& connection) {
+    // A read appends at most 4096 bytes to an unfinished line.
+    return (connection.session.greeted ? line_credit_ : login_line_credit_)->TryAcquire(LineBytes(connection) + 4096U);
 }
 
 void IdleIo::PumpCredits() {
@@ -766,8 +777,9 @@ bool IdleIo::Progress(ServerConnection& connection) {
     if (connection.phase == Phase::kReply) return Write(connection);
     if (connection.phase != Phase::kInput) return true;
     if (connection.waiting_line_credit) {
-        connection.line_credit = LineCredit(connection).TryAcquire(server_.config_.max_line_bytes + 4096U);
-        if (!connection.line_credit) return true;
+        auto credit = TakeLineCredit(connection);
+        if (!credit) return true;
+        connection.line_credit = std::move(credit);
         connection.waiting_line_credit = false;
         connection.read_ready = true;
     }
