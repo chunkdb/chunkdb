@@ -51,6 +51,15 @@ std::map<Path, Bytes> Snapshot(const Path& root) {
     }
     return files;
 }
+// A path token as verify prints it: quoted, with backslashes and quotes escaped.
+std::string Quoted(const Path& path) {
+    std::string token = "\"";
+    for (const char ch : path.string()) {
+        if (ch == '\\' || ch == '"') token.push_back('\\');
+        token.push_back(ch);
+    }
+    return token + "\"";
+}
 std::size_t Count(const std::string& text, std::string_view needle) {
     std::size_t count = 0U;
     for (auto at = text.find(needle); at != std::string::npos; at = text.find(needle, at + 1U)) ++count;
@@ -215,7 +224,7 @@ void ActiveRecords() {
     std::filesystem::remove(owner.root / kObjects / Hex(next.journal_inventory.sha256));
     const auto object = VerifyOwner(owner.root);
     Expect(object, 1U, 0U, "group_journal_invalid");
-    assert(object.text.find(std::string("\"") + (owner.root / kObjects).string() + "\"") != std::string::npos);
+    assert(object.text.find(Quoted(owner.root / kObjects)) != std::string::npos);
 }
 void RetainedIds() {
     const Owner owner;
@@ -244,7 +253,7 @@ void Pending() {
 struct DataDirectory {
     test::ScopedTempDir directory{"chunkdb-group-verify-unclaimed"};
     Path root = directory.path();
-    Path table = root / "tables/t";
+    Path table = root / "tables" / "t";
     explicit DataDirectory(std::uint32_t extra = 0U) {
         DataDirManifest manifest{.data_dir_id = StoreId{9U}, .options = {}};
         manifest.features.incompat |= extra;
@@ -285,8 +294,8 @@ void Unclaimed() {
     assert(Count(result.text, "group_owner_unclaimed") == 6U);
     assert(result.text.find("unexpected_entry") == std::string::npos && result.text.find("foreign_entry") == std::string::npos);
     for (const auto* name : {kRoot, kObjects, kJournals}) {
-        assert(result.text.find((data.root / name).string() + "\"") != std::string::npos);
-        assert(result.text.find((data.table / name).string() + "\"") != std::string::npos);
+        assert(result.text.find(Quoted(data.root / name)) != std::string::npos);
+        assert(result.text.find(Quoted(data.table / name)) != std::string::npos);
     }
     assert(Count(result.text, "commit group owner state is not admitted by this build") == 6U);
     // A table checked directly reports the same names.

@@ -681,11 +681,15 @@ void JournalAppend() {
         (void)journal.Scan(EmptyInventory());
         auto damaged = clean;
         damaged[24] ^= 0x01U;
-        Save(leaf, damaged);
+        const auto rewrite = [&](std::uint8_t byte) {
+            std::fstream header(leaf, std::ios::binary | std::ios::in | std::ios::out);
+            header.seekp(24); header.put(static_cast<char>(byte)); header.close(); assert(!header.fail());
+        };
+        rewrite(damaged[24]);
         RejectWith("header", [&] { (void)journal.Scan(EmptyInventory()); });
         RejectWith("journal end is not admitted", [&] { (void)journal.Append(Decision(c)); });
         assert(LoadFile(leaf) == damaged);
-        Save(leaf, clean);
+        rewrite(clean[24]);
         (void)journal.Scan(EmptyInventory());
         assert(journal.Append(Decision(c)) == clean.size() + Decision(c).size());
     }
