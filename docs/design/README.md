@@ -7,6 +7,7 @@
 - [Connections](CONNECTIONS.md): socket ownership, sessions, cancellation and admission limits.
 - [Expressions](EXPRESSIONS_DESIGN.md): conditions and computed assignments, typing and evaluation.
 - [Extensible format](EXTENSIBLE_FORMAT_DESIGN.md): feature flags and typed extensions.
+- [Secondary indexes](INDEXES.md): keys, runs, write maintenance, recovery and GET BLOCKS.
 - [Revisions and frames](FORMAT_V2_DESIGN.md): persistent equality tokens and atomic mutations.
 - [Table restore](RESTORE_TABLE.md): online RESTORE TABLE, SWAP TABLES, RENAME TO and feed resync.
 - [Tables](TABLES_DESIGN.md): catalog leases and directory publication.
