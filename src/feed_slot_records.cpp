@@ -32,6 +32,16 @@ constexpr std::uint8_t kOwnerFlag = 64U;
 constexpr std::uint8_t kResyncFlag = 128U;
 constexpr unsigned kSlotFlags = 1U | 2U | 4U | 8U | 16U | 32U | kOwnerFlag | kResyncFlag;
 
+// The bytes one slot record takes in chunkdb.slots.
+std::size_t SlotRecordBytes(const FeedSlotRecord& slot, std::uint8_t dims, bool partition_format) {
+    return 12U + slot.name.size() + (slot.filters.area ? 16U * dims : 0U) +
+        (slot.filters.column_ids ? slot.filters.column_ids->size() * 4U : 0U) + (slot.owner ? 1U + slot.owner->size() : 0U) +
+        (partition_format ? 2U + 9U * slot.partitions.size() : 0U);
+}
+bool PartitionFormat(const FeedSlotRecords& records) {
+    return records.partition_format || std::any_of(records.slots.begin(), records.slots.end(),
+        [](const auto& slot) { return !slot.partitions.empty(); });
+}
 [[noreturn]] void BadRecords(const std::string& why) {
     throw std::runtime_error("invalid chunkdb.slots: " + why);
 }
@@ -40,8 +50,7 @@ void ValidateRecords(const FeedSlotRecords& records) {
     if (std::all_of(records.epoch.begin(), records.epoch.end(), [](auto b) { return b == 0U; }))
         BadRecords("zero epoch");
     if (records.slots.size() > kMaxSlots) BadRecords("too many slot records");
-    const bool partition_format = records.partition_format || std::any_of(records.slots.begin(), records.slots.end(),
-        [](const auto& slot) { return !slot.partitions.empty(); });
+    const bool partition_format = PartitionFormat(records);
     std::set<std::string> names;
     std::size_t encoded_size = kFixedBytes;
     for (const auto& slot : records.slots) {
@@ -77,9 +86,7 @@ void ValidateRecords(const FeedSlotRecords& records) {
             if (lowest != slot.written) BadRecords("slot position is not its lowest partition position");
             if (resync != slot.resync) BadRecords("slot resync differs from its partitions");
         }
-        encoded_size += 12U + slot.name.size() + (slot.filters.area ? 16U * records.dims : 0U) +
-            (slot.filters.column_ids ? slot.filters.column_ids->size() * 4U : 0U) + (slot.owner ? 1U + slot.owner->size() : 0U) +
-            (partition_format ? 2U + 9U * slot.partitions.size() : 0U);
+        encoded_size += SlotRecordBytes(slot, records.dims, partition_format);
         if (encoded_size > kMaxRecordsBytes) BadRecords("size");
     }
 }
@@ -92,6 +99,16 @@ void RequireValidFeedSlotName(std::string_view name) {
         if (c == '_' || (c >= 'a' && c <= 'z') || (i > 0U && c >= '0' && c <= '9')) continue;
         throw std::invalid_argument("slot names are 1 to 63 bytes: [a-z_][a-z0-9_]*");
     }
+}
+
+void RequireFeedSlotRoom(const FeedSlotRecords& records, const FeedSlotRecord& slot) {
+    if (records.slots.size() >= kMaxSlots) throw std::out_of_range("a table has at most 1024 slots");
+    const bool partition_format = PartitionFormat(records) || !slot.partitions.empty();
+    std::size_t bytes = kFixedBytes + SlotRecordBytes(slot, records.dims, partition_format);
+    for (const auto& existing : records.slots) bytes += SlotRecordBytes(existing, records.dims, partition_format);
+    if (bytes > kMaxRecordsBytes)
+        throw std::out_of_range("a table's slot records take at most 1048576 bytes, and this slot would need " +
+                                std::to_string(bytes) + "; a slot takes about 9 bytes per partition");
 }
 
 void RequireValidFeedSlotOwner(std::string_view owner) {
@@ -267,8 +284,11 @@ std::optional<FeedSlotRecords> ReadFeedSlotRecords(const std::filesystem::path& 
 }
 
 void WriteFeedSlotRecords(const std::filesystem::path& dir, const FeedSlotRecords& records, bool* published) {
-    AtomicWrite(dir / kFeedSlotsFileName, SerializeFeedSlotRecords(records), true, true, published, nullptr, true,
-        EnterStatementDecision);
+    const auto bytes = SerializeFeedSlotRecords(records);
+    // Crash tests stop a slot record change before and after its replace.
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_SLOT_RECORDS_BEFORE_REPLACE_ONCE")) ExitAbruptly(86);
+    AtomicWrite(dir / kFeedSlotsFileName, bytes, true, true, published, nullptr, true, EnterStatementDecision);
+    if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_SLOT_RECORDS_AFTER_REPLACE_ONCE")) ExitAbruptly(86);
 }
 
 }  // namespace chunkdb

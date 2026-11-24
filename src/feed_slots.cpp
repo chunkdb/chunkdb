@@ -362,12 +362,18 @@ FeedSlot FeedSlots::Create(std::string_view name, std::uint64_t completed, bool 
         if (if_not_exists) return existing(*found);
         throw std::invalid_argument("feed slot already exists: " + std::string(name));
     }
-    next.slots.push_back({std::string(name), completed, false, filters, false, owner});
-    if (partitions > 1U) next.slots.back().partitions.assign(partitions, FeedSlotPartition{completed, false});
+    FeedSlotRecord created{std::string(name), completed, false, filters, false, owner};
+    if (partitions > 1U) created.partitions.assign(partitions, FeedSlotPartition{completed, false});
+    RequireFeedSlotRoom(next, created);
+    next.slots.push_back(std::move(created));
     Persist(std::move(next));
     FeedSlot slot{std::string(name), {store_.store_id_, completed}, records_.durable_watermark, 0U, false, filters, false, std::move(owner)};
     slot.partitions = records_.slots.back().partitions;
     return slot;
+}
+void FeedSlots::RequireRoom(const FeedSlotRecord& slot) const {
+    std::lock_guard lock(mutex_);
+    RequireFeedSlotRoom(records_, slot);
 }
 void FeedSlots::Drop(std::string_view name, bool if_exists) {
     RequireValidFeedSlotName(name);

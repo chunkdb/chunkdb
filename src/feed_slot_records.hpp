@@ -42,6 +42,9 @@ struct FeedSlotRecords {
 };
 
 void RequireValidFeedSlotName(std::string_view name);
+// Throws std::out_of_range when `slot` added to `records` would exceed what
+// chunkdb.slots holds: 1024 slots in 1 MiB.
+void RequireFeedSlotRoom(const FeedSlotRecords& records, const FeedSlotRecord& slot);
 // Owners are user names; the user need not exist.
 void RequireValidFeedSlotOwner(std::string_view owner);
 [[nodiscard]] std::vector<std::uint8_t> SerializeFeedSlotRecords(const FeedSlotRecords& records);

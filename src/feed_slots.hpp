@@ -61,6 +61,8 @@ class FeedSlots {
     // `partitions` is 1 for a slot without partitions, or 2 to 256.
     [[nodiscard]] FeedSlot Create(std::string_view name, std::uint64_t completed, bool if_not_exists = false, const FeedSlotFilters& filters = {},
         std::optional<std::string> owner = std::nullopt, std::uint32_t partitions = 1U);
+    // Throws std::out_of_range when `slot` would not fit the records.
+    void RequireRoom(const FeedSlotRecord& slot) const;
     // Records `owner` for a slot that has none; a recorded owner never changes.
     void BindOwner(std::string_view name, const std::string& owner);
     void Drop(std::string_view name, bool if_exists = false);

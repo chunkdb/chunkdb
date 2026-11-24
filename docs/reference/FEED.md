@@ -194,9 +194,11 @@ A change that touches chunks of several partitions reaches each watch with only 
 Schema, progress and resync events go to every watch.
 Each partition keeps its own acknowledged position: `ACK r` saves r for every partition of the watch, and a watch starts at the lowest position of its partitions and skips each partition's changes at or below its position.
 SHOW SLOTS `acked` is the lowest partition position; history is retained from it, and `lag_revisions` and `retained_bytes` count from it.
+A partition that no watch acknowledges therefore holds history for the whole slot: once that history exceeds the slot's retained byte limit (`--slot-max-bytes`), the whole slot is lost.
 A partition is held by one watch at a time; TAKEOVER replaces the one watch holding the partitions it asks for, and answers SLOT_BUSY when they are held by several watches.
 A restore or SWAP TABLES marks every partition to resync; a watch starts with resync while any of its partitions has the mark.
 MIGRATE does not create partitioned slots.
+A table's slot records hold at most 1024 slots in 1 MiB, and a partition takes 9 bytes of them, so about 450 slots of 256 partitions fill them; CREATE SLOT beyond that answers OUT_OF_RANGE.
 
 ## WATCH CATALOG
 

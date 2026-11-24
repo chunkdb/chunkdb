@@ -20,7 +20,7 @@ Schema, progress and resync pushes go to every watch of the slot.
 
 ## Watches
 
-`WATCH t SLOT 's' PARTITION p[, p ...]` holds those partitions; a watch without PARTITION holds the slot's group share (below), which is every partition while it is the only member.
+`WATCH t SLOT 's' PARTITION p[, p ...]` holds those partitions; a watch without PARTITION holds every partition (with box 2, the slot's group share below, which is every partition while it is the only member).
 A watch whose partitions overlap another watch's gets SLOT_BUSY; TAKEOVER replaces the one watch holding them, after publishing its accepted ACK, and refuses when they are held by several watches.
 The watch starts at the lowest position of its partitions; for each partition it skips the changes at or below that partition's position.
 `ACK r` raises every partition of the watch to at least r: the watch was sent every change of its partitions through r.
@@ -29,6 +29,7 @@ A restore or SWAP TABLES marks every partition to resync; a watch starts with re
 
 ## Groups
 
+This section is #156 box 2 and is not built yet: until then a watch without PARTITION holds every partition, and a second one gets SLOT_BUSY.
 The partitions that no PARTITION watch holds are the group's; watches without PARTITION on the slot are its members.
 A member that joins takes partitions from the members holding the most, and the partitions of a member that leaves go to the members holding the fewest, so each member holds `floor(n/m)` or `ceil(n/m)` of the group's partitions and as few as possible move.
 A member whose partitions change writes its accepted ACKs, receives `[rebalance, epoch, revision]`, and its connection returns to statements; its next WATCH replies with its new `partitions`.
@@ -57,8 +58,10 @@ An ACK that a crash loses was never written: its changes repeat after restart, a
 CREATE SLOT publishes the slot with every partition at the creation revision in one replace; a crash leaves the slot absent or complete.
 A failure after the replace is visible returns `OUTCOME_UNKNOWN stage=slot_records` and fences the table, as before.
 Retention removes history only below the lowest partition position, after the record holding it is durable; a crash between the two keeps more history.
+A partition without a consumer therefore holds the history of the whole slot, and past the retained byte limit the whole slot is lost, as one slow consumer of an unpartitioned slot loses it.
 Backups keep every partition position at or below the cut; a restore sets every partition to the cut with resync.
 
 ## Limits
 
+The records hold 1024 slots in 1 MiB and a partition takes 9 bytes, so about 450 slots of 256 partitions fill them; CREATE SLOT checks the whole file and refuses a slot that does not fit with OUT_OF_RANGE.
 The catalog feed's slot record carries filters and owner, not the partition count.

@@ -608,6 +608,12 @@ FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const 
     const auto slots = store->feed_slots_->List();
     if (std::any_of(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; }))
         throw std::invalid_argument("feed slot already exists: " + std::string(name));
+    // Refuse a slot the records cannot hold before any baseline work.
+    {
+        FeedSlotRecord created{std::string(name), 0U, false, filters, false, owner};
+        if (partitions > 1U) created.partitions.assign(partitions, FeedSlotPartition{0U, false});
+        store->feed_slots_->RequireRoom(created);
+    }
     // Allocate before publishing a slot. Maintenance and cross-table eviction
     // do not take Table leases, so quiesce both before changing cached flags.
     if (!feed_) feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());

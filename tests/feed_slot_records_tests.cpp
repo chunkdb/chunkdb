@@ -1,6 +1,8 @@
 #include <algorithm>
 #include <cassert>
 #include <functional>
+#include <stdexcept>
+#include <string>
 
 #include "feed_slot_partitions.hpp"
 #include "feed_slot_records.hpp"
@@ -367,6 +369,25 @@ void Partitions() {
     assert(AdvanceFeedSlotRecord(slot, {2U}, 5U) && slot.written == 4U && slot.resync && !slot.partitions[2].resync);
     FeedSlotRecords updated{epoch, 20U, {slot}};
     assert(ParseFeedSlotRecords(SerializeFeedSlotRecords(updated), epoch).slots[0].partitions == slot.partitions);
+
+    // CREATE SLOT checks the whole file: slots of 256 partitions fill 1 MiB at about 450.
+    FeedSlotRecords full{epoch, 0U, {}};
+    for (std::size_t i = 0U;; ++i) {
+        FeedSlotRecord wide{"wide_" + std::to_string(i), 0U, false};
+        wide.partitions.assign(256U, {0U, false});
+        bool room = true;
+        try { RequireFeedSlotRoom(full, wide); } catch (const std::out_of_range&) { room = false; }
+        if (!room) break;
+        full.slots.push_back(std::move(wide));
+    }
+    assert(full.slots.size() > 400U && full.slots.size() < 460U);
+    assert(SerializeFeedSlotRecords(full).size() <= 1024U * 1024U);
+    RequireFeedSlotRoom(full, FeedSlotRecord{"narrow", 0U, false});
+    FeedSlotRecords many{epoch, 0U, {}};
+    many.slots.assign(1024U, FeedSlotRecord{"a", 0U, false});
+    bool counted = false;
+    try { RequireFeedSlotRoom(many, FeedSlotRecord{"b", 0U, false}); } catch (const std::out_of_range&) { counted = true; }
+    assert(counted);
 
     // The partition of a chunk is fixed by the storage format.
     assert(FeedSlotPartitionOf({0, 0, 0}, 256U) == 145U && FeedSlotPartitionOf({1, 0, 0}, 256U) == 195U);

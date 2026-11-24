@@ -727,6 +727,39 @@ void PersistentPartitions() {
     }
 }
 
+// History is kept from the lowest partition: one partition that nobody
+// acknowledges makes the whole slot lost past its retained byte limit.
+void LaggingPartitionLosesSlot() {
+    ScopedTempDir dir("chunkdb-feed-slot-lagging-partition");
+    auto config = SlotsConfig(dir.path());
+    config.slot_max_bytes = 1U;
+    TableCatalog catalog(config); auto table = CreateDefault(catalog);
+    const auto epoch = table->CreateFeedSlot("parts", false, {}, std::nullopt, false, 2U).position.epoch;
+    const auto archive = [&](unsigned value) {
+        {
+            auto lease = table->Acquire();
+            lease->store().SetBlockBits(0, 0, Bits(value));
+            lease->store().CheckpointForTests(0, 0);
+        }
+        FeedSlotTestAccess::Sync(*table);
+        return table->ListFeedSlots(true).front().durable_watermark;
+    };
+    const auto first = archive(1U);
+    assert(Archives(dir.path()) != 0U);
+    FeedSlotTestAccess::StageAck(*table, "parts", {epoch, first}, {0U, 1U});
+    (void)FeedSlotTestAccess::FlushAcks(*table, true, std::chrono::steady_clock::now());
+    FeedSlotTestAccess::Retain(*table);
+    auto slot = table->ListFeedSlots(true).front();
+    assert(!slot.lost && slot.position.revision == first && Archives(dir.path()) == 0U);
+    const auto second = archive(2U);
+    FeedSlotTestAccess::StageAck(*table, "parts", {epoch, second}, {0U});
+    (void)FeedSlotTestAccess::FlushAcks(*table, true, std::chrono::steady_clock::now());
+    FeedSlotTestAccess::Retain(*table);
+    slot = table->ListFeedSlots(true).front();
+    assert(slot.lost && slot.partitions[0].written == second && slot.partitions[1].written == first);
+    assert(!slot.resync && table->ListFeedSlots().empty());
+}
+
 // A slot record without an owner, as CREATE SLOT writes without
 // authentication, still opens. Claiming it records nothing; BindOwner, run
 // once an attach is granted, records its user, and the owner survives a restart.
@@ -793,6 +826,7 @@ int main() {
     UnownedSlotBindsAtFirstAttach();
     PersistentFilters();
     PersistentPartitions();
+    LaggingPartitionLosesSlot();
     ConditionalSlotChanges();
     ConcurrentConditionalSlots();
     ConditionalLostSlot();

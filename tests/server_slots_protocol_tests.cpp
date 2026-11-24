@@ -1497,6 +1497,8 @@ void SlotPartitions(bool tls) {
     assert(partitions.size() == 2U && Number(Field(partitions[1], "partition")) == 1U);
     assert(Number(Field(partitions[0], "acked")) == both && Number(Field(partitions[1], "acked")) == first);
     assert(Number(Field(slot, "acked")) == first && !Boolean(Field(slot, "attached")) && !Boolean(Field(partitions[0], "attached")));
+    // ALTER TABLE ... SET reopens the table, so the positions come back from the records.
+    writer->Ok("ALTER TABLE t SET feed_buffer_bytes = 16777216");
     // A watch of every partition starts at the lowest position and skips what each partition acknowledged.
     auto all = harness.Connect();
     assert(Start(all->Command("WATCH t SLOT 'workers'")).second == first);
@@ -1508,6 +1510,102 @@ void SlotPartitions(bool tls) {
     all->Line("ACK " + std::to_string(later)); Unwatch(*all);
     const auto acked = writer->Command("SHOW SLOTS ON t");
     for (const auto& partition : Field(Slot(acked, "t", "workers"), "partitions").items) assert(Number(Field(partition, "acked")) == later);
+}
+
+// TAKEOVER of a partition's holder publishes the holder's accepted ACK first;
+// the watch of the other partition goes on.
+void PartitionTakeover(bool tls) {
+    TakeoverSchedule schedule;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label text(128)) CHUNK 4 x 4");
+    writer->Ok("CREATE SLOT 'workers' ON t PARTITIONS 2");
+    auto table = harness.catalog->Find("t");
+    assert(FeedSlotPartitionOf({7, 0, 0}, 2U) == 0U); // Block 28.
+    auto old = harness.Connect(); (void)Start(old->Command("WATCH t SLOT 'workers' PARTITION 0"));
+    auto other = harness.Connect(); (void)Start(other->Command("WATCH t SLOT 'workers' PARTITION 1"));
+    const auto first = Set(*writer, 1, 28); FeedSlotTestAccess::Sync(*table);
+    assert(Change(NextChange(*old)) == first);
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &schedule);
+    Cleanup clear([&] { schedule.Release(); FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    old->Line("ACK " + std::to_string(first)); schedule.Wait(schedule.accepted, "accepted partition ACK");
+    const auto second = Set(*writer, 2, 28); FeedSlotTestAccess::Sync(*table);
+    assert(Change(NextChange(*old)) == second);
+    auto replacement = harness.Connect(); replacement->Line("WATCH t SLOT 'workers' PARTITION 0 TAKEOVER");
+    schedule.Wait(schedule.fenced, "partition holder fence");
+    schedule.Release();
+    const auto start = Start(replacement->Read());
+    schedule.Wait(schedule.closed, "partition holder close");
+    assert(start.second == first && Change(NextChange(*replacement)) == second);
+    for (;;) { const auto reply = old->Read(); if (reply.type == '-') { Error(reply, "KILLED"); break; } }
+    Closed(*old);
+    const auto listed = writer->Command("SHOW SLOTS ON t");
+    const auto& partitions = Field(Slot(listed, "t", "workers"), "partitions").items;
+    assert(Number(Field(partitions[0], "acked")) == first && Number(Field(partitions[1], "acked")) < first);
+    assert(Boolean(Field(partitions[0], "attached")) && Boolean(Field(partitions[1], "attached")));
+    assert(!other->Ready(100ms));
+    replacement->Line("ACK " + std::to_string(second)); Unwatch(*replacement); Unwatch(*other);
+    assert(Number(Field(Field(Slot(writer->Command("SHOW SLOTS ON t"), "t", "workers"), "partitions").items[0], "acked")) == second);
+}
+
+// Partitions apply after the slot's AREA, NO BEFORE and CHUNKS filters, live and from history.
+void PartitionFilters(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label text(128)) CHUNK 4 x 4");
+    (void)Set(*writer, 5, 0); // So that the later change of block 0 has a before row to leave out.
+    writer->Ok("CREATE SLOT 'blocks' ON t PARTITIONS 2 AREA 0 0 TO 7 0 NO BEFORE");
+    writer->Ok("CREATE SLOT 'forms' ON t PARTITIONS 2 CHUNKS");
+    auto table = harness.catalog->Find("t");
+    // Chunks (0, 0) and (9, 0) are in partition 1 and chunk (7, 0) in partition 0; the AREA leaves out (9, 0).
+    assert(FeedSlotPartitionOf({0, 0, 0}, 2U) == 1U && FeedSlotPartitionOf({9, 0, 0}, 2U) == 1U);
+    assert(FeedSlotPartitionOf({7, 0, 0}, 2U) == 0U);
+    auto blocks = harness.Connect(); (void)Start(blocks->Command("WATCH t SLOT 'blocks' PARTITION 1"));
+    auto forms = harness.Connect(); (void)Start(forms->Command("WATCH t SLOT 'forms' PARTITION 0"));
+    writer->Ok("BEGIN");
+    for (const auto x : {0, 28, 36}) assert(writer->Command("SET BLOCK " + std::to_string(x) + " 0 IN t n = 1").type == '_');
+    const auto group = Number(writer->Command("COMMIT"));
+    FeedSlotTestAccess::Sync(*table);
+    const auto change = NextChange(*blocks);
+    assert(Change(change) == group && change.items[6].items[0].items[0].value == "0" && change.items[6].items[0].items[2].type == '_');
+    const auto chunks = NextChunks(*forms);
+    assert(Number(chunks.items[2]) == group && chunks.items[6].items.size() == 1U && chunks.items[6].items[0].items[0].value == "7");
+    assert(!blocks->Ready(100ms) && !forms->Ready(100ms));
+    // Without an ACK, the next watch reads the same parts from history.
+    Unwatch(*blocks); Unwatch(*forms);
+    (void)Start(blocks->Command("WATCH t SLOT 'blocks' PARTITION 1"));
+    assert(NextChange(*blocks) == change);
+    (void)Start(forms->Command("WATCH t SLOT 'forms' PARTITION 0"));
+    assert(NextChunks(*forms) == chunks);
+    Unwatch(*blocks); Unwatch(*forms);
+}
+
+// A three-dimensional table routes chunks by all three coordinates.
+void PartitionDimensional(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8) CHUNK 2 x 2 x 2");
+    writer->Ok("CREATE SLOT 'space' ON t PARTITIONS 2");
+    auto table = harness.catalog->Find("t");
+    // Blocks (0, 0, 0) and (0, 0, 2) are in chunks (0, 0, 0) and (0, 0, 1), which only z tells apart.
+    assert(FeedSlotPartitionOf({0, 0, 0}, 2U) == 1U && FeedSlotPartitionOf({0, 0, 1}, 2U) == 0U);
+    const auto next = [](Client& client) {
+        auto reply = client.Read();
+        while (reply.type == '>' && !reply.items.empty() && reply.items[0].value == "schema") reply = client.Read();
+        assert(reply.type == '>' && reply.items.size() == 10U && reply.items[0].value == "change");
+        return reply;
+    };
+    auto zero = harness.Connect(); (void)Start(zero->Command("WATCH t SLOT 'space' PARTITION 0"));
+    auto one = harness.Connect(); (void)Start(one->Command("WATCH t SLOT 'space' PARTITION 1"));
+    const auto low = Number(writer->Command("SET BLOCK 0 0 0 IN t n = 1"));
+    const auto high = Number(writer->Command("SET BLOCK 0 0 2 IN t n = 2"));
+    FeedSlotTestAccess::Sync(*table);
+    const auto near = next(*one);
+    assert(Number(near.items[2]) == low && near.items[6].items.size() == 1U && near.items[6].items[0].items[2].value == "0");
+    const auto far = next(*zero);
+    assert(Number(far.items[2]) == high && far.items[6].items.size() == 1U && far.items[6].items[0].items[2].value == "2");
+    assert(!zero->Ready(100ms) && !one->Ready(100ms));
+    Unwatch(*zero); Unwatch(*one);
 }
 
 void HistoricalSchemas(bool tls) {
@@ -2814,7 +2912,8 @@ int main(int argc, char** argv) {
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);
         run("persistent-filters", PersistentFilterDelivery);
-        run("slot-partitions", SlotPartitions);
+        run("slot-partitions", SlotPartitions); run("partition-takeover", PartitionTakeover);
+        run("partition-filters", PartitionFilters); run("partition-dimensional", PartitionDimensional);
         run("historical-schema", HistoricalSchemas); run("historical-schema-dimensional", HistoricalSchemasDimensional); run("held-lease", ArchiveWhileLeaseHeld);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
         run("live-schema-ACK", LiveSchemaAcknowledgement);
