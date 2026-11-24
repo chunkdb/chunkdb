@@ -205,6 +205,25 @@ std::string MetricsRegistry::EscapeLabelValue(std::string_view value) {
     return escaped;
 }
 
+std::string MetricsRegistry::RenderTableStates(std::span<const TableState> tables) {
+    std::vector<std::string> labels;
+    labels.reserve(tables.size());
+    for (const auto& table : tables) labels.push_back("table=\"" + EscapeLabelValue(table.table) + "\"");
+    std::string out;
+    out += "# HELP chunkdb_table_fenced Whether the table is fenced until RECOVER TABLE or a restart.\n";
+    out += "# TYPE chunkdb_table_fenced gauge\n";
+    for (std::size_t i = 0; i < tables.size(); ++i)
+        AppendCounter(&out, "chunkdb_table_fenced", labels[i], tables[i].fenced ? 1U : 0U);
+    out += "# HELP chunkdb_slot_frontier_frozen Whether the durable frontier of the table's slots stopped "
+           "advancing after a durability failure.\n";
+    out += "# TYPE chunkdb_slot_frontier_frozen gauge\n";
+    for (std::size_t i = 0; i < tables.size(); ++i) {
+        if (tables[i].slot_frontier_frozen)
+            AppendCounter(&out, "chunkdb_slot_frontier_frozen", labels[i], *tables[i].slot_frontier_frozen ? 1U : 0U);
+    }
+    return out;
+}
+
 std::string MetricsRegistry::RenderPrometheus(
     std::span<const TableRuntimeStats> tables,
     std::size_t loaded_chunks, const StoreResources* resources) const {

@@ -859,7 +859,7 @@ if(CHUNKDB_BUILD_TESTS)
         endif()
         add_dependencies(chunkdb_exporter_test chunkdb_exporter chunkdb_server)
         add_test(NAME exporter COMMAND chunkdb_exporter_test $<TARGET_FILE:chunkdb_exporter> $<TARGET_FILE:chunkdb_server>)
-        set_tests_properties(exporter PROPERTIES TIMEOUT 300)
+        set_tests_properties(exporter PROPERTIES TIMEOUT 300 LABELS "smoke")
     endif()
 
     if(CHUNKDB_WITH_TLS AND OpenSSL_FOUND)
@@ -1499,11 +1499,17 @@ if(CHUNKDB_BUILD_TESTS)
         txn_kill
         txn_concurrency
         docs_check
+        alter_column
+        schema_check
+        txn_read_only
+        user_admission
+        maintenance_pool
+        admin_rebuild_version_clock
     )
     if(WIN32)
         add_test(
             NAME server_bench_cleanup_smoke
-            COMMAND chunkdb_server_bench --server-mode spawn --requests 200 --tests ping --clients 2 --port 4242
+            COMMAND chunkdb_server_bench --server-mode spawn --requests 200 --tests ping --clients 2 --port 0
         )
         list(APPEND CHUNKDB_SMOKE_TESTS server_bench_cleanup_smoke)
     endif()
@@ -1524,6 +1530,7 @@ if(CHUNKDB_BUILD_TESTS)
         table_tombstones_crash
         commit_owner_artifact_io_crash
         commit_group_coordinator_crash
+        recover_table
     )
 
     if(TARGET chunkdb_server_tls_error_queue_test)

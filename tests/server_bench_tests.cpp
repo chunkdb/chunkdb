@@ -627,6 +627,40 @@ void TestFailedLoginClients() {
     assert(plain.find("failed_login") == std::string::npos);
 }
 
+// Idle connections log in before each scenario and stay open beside the measured clients.
+void TestIdleConnections() {
+    assert(chunkdb::server_bench::ParseArgs({"chunkdb_server_bench", "--idle-connections", "7"}).idle_connections == 7U);
+    for (const std::vector<std::string>& refused : {
+             std::vector<std::string>{"chunkdb_server_bench", "--idle-connections", "0"},
+             std::vector<std::string>{"chunkdb_server_bench", "--idle-connections", "1", "--tests", "takeover", "--clients", "1"}}) {
+        bool threw = false;
+        try { (void)chunkdb::server_bench::ParseArgs(refused); } catch (const std::invalid_argument&) { threw = true; }
+        assert(threw);
+    }
+    assert(chunkdb::server_bench::UsageText().find("--idle-connections") != std::string::npos);
+    auto args = chunkdb::server_bench::Args{
+        .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
+        .host = "127.0.0.1",
+        .port = 0,
+        .clients = 2,
+        .pipeline = 4,
+        .requests = 120,
+        .tests = {chunkdb::server_bench::Scenario::kPing, chunkdb::server_bench::Scenario::kSet},
+        .keyspace = 64,
+        .seed = 29,
+        .output_mode = chunkdb::server_bench::OutputMode::kJson,
+        .log_level = chunkdb::LogLevel::kWarn,
+    };
+    args.idle_connections = 32U;
+    const auto report = chunkdb::server_bench::Run(args);
+    assert(report.idle_connections == 32U && report.results.size() == 2U);
+    for (const auto& result : report.results) assert(result.completed_requests == 120U);
+    assert(chunkdb::server_bench::RenderJsonReport(report).find("\"idle_connections\":32,") != std::string::npos);
+    assert(chunkdb::server_bench::RenderHumanReport(report).find("idle_connections=32\n") != std::string::npos);
+    assert(chunkdb::server_bench::RenderJsonReport(chunkdb::server_bench::BenchmarkReport{}).find("idle_connections") ==
+           std::string::npos);
+}
+
 void TestParseArgsGridScenariosAndDurability() {
     const auto args = chunkdb::server_bench::ParseArgs({
         "chunkdb_server_bench",
@@ -1381,6 +1415,7 @@ int main(int argc, char** argv) {
     TestSpawnModeStartsAndStops();
     TestOutputContainsPercentilesAndJsonFields();
     TestIdleClientsNoteWhenRequestsLessThanClients();
+    TestIdleConnections();
     TestParseArgsGridScenariosAndDurability();
     TestGridScenariosAgainstPaddedGeometry();
     TestChunkFormsRetainDescribedStableColumnId();

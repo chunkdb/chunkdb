@@ -78,6 +78,9 @@ struct Args {
     // Report-only: process, machine and engine counters of each measured
     // window (except takeover) and the spawned server's close time.
     bool system_stats = false;
+    // Connections that log in before each scenario and send nothing until it
+    // ends: the open connections the server carries beside the measured ones.
+    std::size_t idle_connections = 0;
     bool show_help = false;
 };
 
@@ -172,6 +175,8 @@ struct BenchmarkReport {
     std::size_t failed_login_clients = 0;
     // --system-stats in spawn mode: seconds from Stop until the store closed.
     std::optional<double> server_close_s;
+    // The --idle-connections value.
+    std::size_t idle_connections = 0;
     std::vector<ScenarioResult> results;
 };
 
