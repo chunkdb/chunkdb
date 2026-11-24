@@ -4641,6 +4641,49 @@ void TestMetricsRuntimeCounters() {
     assert(stats_second.eviction_forced_wal_flushes_empty_batch >= stats_first.eviction_forced_wal_flushes_empty_batch);
 }
 
+// Calls Stop on the Run thread at one point of Run's startup.
+class StopAtStartupHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    StopAtStartupHook(chunkdb::ChunkServer& server, Point point) : server_(server), point_(point) {}
+    void Run(Point point, std::size_t) override {
+        if (point == point_ && !fired.exchange(true)) server_.Stop();
+    }
+    std::atomic<bool> fired{false};
+
+  private:
+    chunkdb::ChunkServer& server_;
+    const Point point_;
+};
+
+// A Stop just before Run publishes its listener, or between the listener
+// and running_, ends Run; before, Run kept polling a closed socket and the
+// next Stop found nothing to stop.
+void TestStopDuringStartup() {
+    using Point = chunkdb::FeedDeliveryTestHook::Point;
+    for (const auto point : {Point::kBeforeListenerPublication, Point::kAfterListenerPublication}) {
+        auto store_cfg = BaseStoreConfig();
+        store_cfg.data_dir = TempDataDir("stop-during-startup");
+        {
+            auto server_cfg = BaseServerConfig();
+            server_cfg.port = chunkdb::test::PickListenerPort();
+            auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(store_cfg));
+            auto engine = std::make_shared<chunkdb::CommandEngine>(chunkdb::EngineConfig{.require_auth = false}, catalog);
+            chunkdb::ChunkServer server(server_cfg, engine);
+            StopAtStartupHook hook(server, point);
+            chunkdb::FeedDeliveryTestAccess::SetPendingObserverHook(server, &hook);
+            auto run = std::async(std::launch::async, [&server] { server.Run(); });
+            const bool ended = run.wait_for(std::chrono::seconds(10)) == std::future_status::ready;
+            if (!ended) server.Stop();
+            run.get();
+            assert(hook.fired.load());
+            assert(ended);
+            assert(!server.WaitListeningForTests(std::chrono::milliseconds(0)));
+            chunkdb::FeedDeliveryTestAccess::SetPendingObserverHook(server, nullptr);
+        }
+        RemoveAllWithRetry(store_cfg.data_dir);
+    }
+}
+
 void TestSlowClientTimeoutReleasesWorker() {
     auto store_cfg = BaseStoreConfig();
     auto engine_cfg = chunkdb::EngineConfig{
@@ -8454,6 +8497,7 @@ int main(int argc, char** argv) {
         run("TestPipelinedBadRequestDisconnectPolicy", TestPipelinedBadRequestDisconnectPolicy);
         run("TestMaxAuthFailuresDisconnects", TestMaxAuthFailuresDisconnects);
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
+        run("TestStopDuringStartup", TestStopDuringStartup);
         run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL
         run("TestTlsHandshakeDeadlineReleasesWorker", TestTlsHandshakeDeadlineReleasesWorker);
