@@ -55,6 +55,13 @@ struct Fixture {
 
 bool Contains(const std::string& text, std::string_view part) { return text.find(part) != std::string::npos; }
 
+// An integer parameter: eight bytes, little-endian, whatever the column width.
+std::string Le(std::uint64_t value) {
+    std::string out;
+    for (std::size_t i = 0; i < 8U; ++i) out.push_back(static_cast<char>((value >> (8U * i)) & 0xffU));
+    return out;
+}
+
 void Error(const std::string& reply, std::string_view part) {
     if (!reply.starts_with("-ERR ") || !Contains(reply, part)) {
         std::fprintf(stderr, "expected an error with '%s', got '%s'\n", std::string(part).c_str(), reply.c_str());
@@ -153,7 +160,7 @@ void TestGetBlocks() {
     assert(Rows(f, f.Run("GET BLOCKS 13 0 TO 15 3 FROM t"), "t").empty());
 
     // WHERE, with BLOCKS and with AREA; a parameter takes the column's type.
-    rows = Rows(f, f.Run("GET BLOCKS 0 0 TO 12 0 FROM t WHERE n >= $1", {std::string(1, '\x06')}), "t");
+    rows = Rows(f, f.Run("GET BLOCKS 0 0 TO 12 0 FROM t WHERE n >= $1", {Le(6U)}), "t");
     assert(rows.size() == 2U && (rows[0].blocks == std::set<std::size_t>{At(2, 0), At(3, 0)}));
     assert(rows[1].coord == (ChunkCoord{3, 0, 0}) && (rows[1].blocks == std::set<std::size_t>{At(0, 0)}));
     rows = Rows(f, f.Run("GET AREA 0 0 TO 3 0 FROM t WHERE n = 5 OR name = 'c'"), "t");
