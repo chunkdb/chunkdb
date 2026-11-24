@@ -655,6 +655,57 @@ void ReplaceWatchAreas() {
     assert(Next(*other) == second);
 }
 
+// Areas replaced while writes flow: the watch keeps the old area through the
+// answered revision and the new one after it, and another watch of the old
+// area, its former group, still receives every change of that area.
+void ReplaceWatchAreasWhileWriting() {
+    ScopedTempDir dir("chunkdb-feed-replace-areas-writes");
+    auto catalog = std::make_shared<TableCatalog>(Config(dir.path()));
+    CommandEngine engine({.require_auth = false}, catalog);
+    SessionState session;
+    (void)engine.Execute(session, "HELLO 3\r\n");
+    const auto run = [&](SessionState& on, const std::string& statement) {
+        const auto reply = engine.Execute(on, statement + "\r\n");
+        assert(reply[0] != '-');
+        return reply;
+    };
+    const auto revision = [](const std::string& reply) { return std::stoull(reply.substr(reply.rfind(':') + 1U)); };
+    run(session, "CREATE TABLE t (n u8) CHUNK 2 x 2");
+    auto table = catalog->Find("t");
+    const FeedArea low{{0, 0}, {0, 0}}, high{{2, 2}, {2, 2}};
+    auto peer = table->SubscribeFeed({.areas = {low}});
+    SessionState watching;
+    (void)engine.Execute(watching, "HELLO 3\r\n");
+    assert(engine.Execute(watching, "WATCH t AREA 0 0 TO 0 0\r\n")[0] == '%');
+    constexpr int kWrites = 200;
+    std::thread writer([&] {
+        SessionState writes;
+        (void)engine.Execute(writes, "HELLO 3\r\n");
+        // Each area's value changes on every write, so each write is one change.
+        for (int i = 0; i < kWrites; ++i)
+            (void)run(writes, std::string("SET BLOCK ") + (i % 2 == 0 ? "0 0" : "4 4") + " IN t n = " + std::to_string(i / 2 + 1));
+    });
+    std::vector<std::shared_ptr<const FeedEntry>> entries;
+    for (int i = 0; i < 10; ++i) entries.push_back(Next(*watching.watch));
+    const auto replaced = revision(engine.Execute(watching, "WATCH AREA 2 2 TO 2 2\r\n"));
+    writer.join();
+    const auto last_high = revision(run(session, "SET BLOCK 4 4 IN t n = 255"));
+    const auto last_low = revision(run(session, "SET BLOCK 0 0 IN t n = 255"));
+    while (entries.back()->position.revision < last_high) entries.push_back(Next(*watching.watch));
+    assert(entries.back()->position.revision == last_high);
+    for (const auto& entry : entries) {
+        assert(entry->kind == FeedEntry::Kind::kChange && entry->blocks.size() == 1U);
+        assert(entry->blocks[0].chunk == (entry->position.revision <= replaced ? low.first : high.first));
+    }
+    std::size_t low_changes = 0U;
+    for (auto entry = Next(*peer);; entry = Next(*peer)) {
+        assert(entry->kind == FeedEntry::Kind::kChange && entry->blocks.size() == 1U && entry->blocks[0].chunk == low.first);
+        ++low_changes;
+        if (entry->position.revision == last_low) break;
+    }
+    assert(low_changes == static_cast<std::size_t>(kWrites / 2 + 1));
+}
+
 // A projection group keeps an item only while another member must still read
 // it, within its share of the feed budget and above the ring floor; an item
 // that is the ring entry itself does not outlive the ring.
@@ -863,6 +914,7 @@ int main(int argc, char** argv) {
     AbsentBlockBytesAreCanonicalizedBeforeCommit();
     SeveralAreasShareOneProjection();
     ReplaceWatchAreas();
+    ReplaceWatchAreasWhileWriting();
     ProjectionGroupBounds();
     ProjectionGroupsShareTheBudget();
     ProjectionGroupFreesOutsideRing();

@@ -904,8 +904,11 @@ FeedPosition FeedSubscription::SetAreas(std::vector<FeedArea> areas) {
         }
     }
     SortAreas(areas);
-    // Items the old group keeps for this reader are freed outside every feed
-    // lock, with the group itself when this reader was its last member.
+    // Leave, as in the destructor and Track's Move, runs outside the ring
+    // mutex: it frees the items it pruned after releasing the group's own
+    // mutex, which serializes it with other readers' Find, Add and Trim.
+    // Writers and the sender never touch a group. The group itself goes with
+    // its last member, here outside every lock.
     if (group_) {
         group_->Leave(group_position_);
         group_.reset();
