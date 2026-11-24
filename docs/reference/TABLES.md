@@ -171,8 +171,10 @@ Types can change only within their family: integers, floats, text, bytes, or bit
 Narrowing without USING checks every stored value and refuses the first value that does not fit.
 DROP NULL checks every stored value the same way and refuses the first NULL with its block.
 While either check runs, writes that the change would refuse are refused already; a restart or RECOVER TABLE drops an interrupted check.
+A table restored from a backup taken during a check does not have the check, and keeps the column as it was before it.
 SET DEFAULT and DROP DEFAULT change only blocks created later; existing blocks keep their values.
 SET REQUIRED applies to new blocks only: existing blocks of a column that is not NULL always hold a value.
+The embedded bit-string calls (`ChunkStore::GetBlockBits` and the like) need a table whose one column is bits(N) and not NULL: SET NULL on that column, like ADD COLUMN, makes them refuse, and DROP NULL brings them back.
 You can add REQUIRED without DEFAULT only when no block is present.
 For chunk columns, adding REQUIRED without DEFAULT requires no written chunk identity, including retained tombstones.
 Block and chunk columns share the table's schema version; changing either domain advances it once.
@@ -198,8 +200,10 @@ It waits for running statements and backups on the table and makes their acknowl
 CANCEL, KILL CONNECTION or a statement timeout stops it only before the rename.
 Open transactions on the table answer CONFLICT, and watches end with INTERNAL `watched table was renamed; watch it again`.
 A consumer watches the new name and resumes in the same epoch; slots keep their positions.
+GRANT and REVOKE wait for a running RENAME TO, so each applies before or after it.
 A crash during RENAME TO leaves the table under one of the two names; the grants then may name both, and REVOKE removes those no longer wanted.
-A failure after the rename fences the new name until RECOVER TABLE.
+A failure to make the rename durable fences both names until RECOVER TABLE of each, and the grants may then name both too.
+A failure to open the renamed table fences the new name until RECOVER TABLE; the old name is free and keeps no grants.
 RENAME TO is not taken inside [MIGRATE](MIGRATIONS.md).
 
 A failure that leaves a table out of service fences it, while other tables keep serving.

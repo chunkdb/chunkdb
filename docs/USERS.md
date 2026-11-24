@@ -37,6 +37,7 @@ Rights apply to whole tables, including grants naming tables not yet created.
 A wildcard grant on `*` applies to every table, including future tables.
 Dropping a table removes its specific grants.
 Renaming a table with ALTER TABLE ... RENAME TO moves its specific grants to the new name; a user with grants on both names keeps the higher right.
+GRANT and REVOKE wait for a running DROP TABLE or RENAME TO, so each applies before or after it.
 
 | Statement | Required right |
 | --- | --- |

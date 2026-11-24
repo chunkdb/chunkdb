@@ -258,6 +258,7 @@ The slot claim is released before the terminal reply or connection closure for l
 A slot belongs to its owner; another user needs ADMIN on `*` to watch it, see [feed statements](reference/FEED.md#arguments).
 
 DROP TABLE ends watches with NO_TABLE; a fenced or recovered table ends them with INTERNAL, and a new WATCH resumes; watches have no idle timeout.
+SWAP TABLES and RENAME TO end watches with INTERNAL `watched table was swapped; watch it again` or `watched table was renamed; watch it again`; watch the table by its name from the saved position.
 Losing READ on the table ends a watch with a best-effort NO_TABLE, as losing ADMIN on `*` ends a watch of a slot its user does not own, and a dropped user with a best-effort `AUTH_REQUIRED reason=user_dropped`; the connection closes either way; see [users](USERS.md#rights).
 See [change feed](CHANGE_FEED.md) for catch-up, resync, retention and consumer recovery.
 

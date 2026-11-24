@@ -28,6 +28,7 @@ The 2.0 plan asked for new epochs on both tables; that would rewrite every file 
 The restore copies only the table's inventory files into a private directory under `.chunkdb.staging`, the place CREATE TABLE builds tables.
 Each copied file's length and CRC must match the backup inventory, and the table directory in the backup must hold exactly those files, all regular.
 The copy is then checked against its cut like a backup inventory check, rebound to the new identity with the offline restore's code, verified like `chunkdb_verify`, and synced.
+Rebinding drops a column narrowing or DROP NULL check that the backup caught running: it belonged to the backed-up table, and the restored schema is the one before it.
 Until publication the table is in no catalog listing and no statement can name it.
 Publication takes the catalog's table operations, checks the name again and renames the directory into `tables/` without replacing anything, then syncs both parents.
 The rename is the commit point; the store is opened and served afterwards, as CREATE TABLE does.
@@ -67,9 +68,12 @@ It needs ADMIN on both names, because the grants move with the table: each user'
 The name `u` must be free: no table, no fence, and no directory under `tables/`.
 It makes acknowledged writes durable with a WAL barrier and closes the store; CANCEL, KILL CONNECTION or a statement timeout stops it only before that.
 The grants are copied to `u` first, then one rename that cannot replace an entry moves `tables/t` to `tables/u`, and the parent directory is synced; the grants on `t` are removed last.
+GRANT and REVOKE take the catalog's table operations too, as DROP TABLE and MIGRATE change grants under them, so each runs before or after the whole rename.
 A crash leaves the directory under one of the names, complete; the grants never name neither, and at worst name both, as a crash during DROP TABLE can leave grants of a dropped name.
-A refused rename puts the copied grants back and reopens the table under `t`.
-A failure after the rename fences `u` until RECOVER TABLE or a restart.
+A refused rename puts the copied grants back and reopens the table under `t`; a grant copy whose outcome is unknown is put back the same way.
+A failure to sync the rename fences both names, as a failed swap does, because a crash could still undo it; the grants then stay on both names.
+A failure to open the renamed table fences `u`; the rename is durable, so the grants on `t` are removed.
+Each fence lasts until RECOVER TABLE of its name or a restart; RECOVER TABLE t then finds no directory and frees the name.
 The epoch, lineage, slots and their positions stay: a consumer resumes by the new name with its saved position, without resync, and the old name reaches nothing.
 Watches of the table end with INTERNAL `watched table was renamed; watch it again`, and open transactions end with CONFLICT.
 MIGRATE does not take RENAME TO: its redo journal has no directory rename.
@@ -91,7 +95,7 @@ A protocol test holds a restore after each progress report and checks SHOW CONNE
 Catalog tests restore into a new name, compare chunks, versions, tombstones and slots with the backup cut, and check the new epoch and lineage.
 Failure tests inject copy, verification and publication failures and show that no table or staging directory remains.
 Subprocess crash tests stop at every restore step and every swap step; the restarted catalog has the table completely or not at all, and both names or neither exchanged.
-Rename tests check epoch, data, tombstones and slots under the new name, the ended watch, the refusals and each injected failure; crash tests stop before the rename, after it and after its sync.
+Rename tests check epoch, data, tombstones and slots under the new name, the ended watch, the refusals and each injected failure, the grants after a failed copy or open, and a REVOKE that waits for the rename; crash tests stop before the rename, after it and after its sync.
 Feed tests watch a swapped name from the old epoch and receive resync, or continue from the exact fork revision.
 Slot tests watch restored and swapped slots without AFTER and receive resync until an acknowledgement, and check the marks after each swap crash point and a refused swap.
 `chunkdb_verify` needs no new checks: restore and swap create no new file kinds.
