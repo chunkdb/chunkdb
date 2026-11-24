@@ -1282,7 +1282,9 @@ Value MachineInfo() {
     data.Set("os_version", Value::Str(""));
 #else
     // platform.platform() on Linux: system-release-machine[-processor]-with-libc.
-    std::string processor = TextQuery({"uname", "-p"});
+    // A named command: GCC 15 at -O2 reports a false -Wfree-nonheap-object on a temporary one.
+    const std::vector<std::string> uname_processor{"uname", "-p"};
+    std::string processor = TextQuery(uname_processor);
     if (processor == "unavailable" || processor == "unknown") {
         processor.clear();
     }
