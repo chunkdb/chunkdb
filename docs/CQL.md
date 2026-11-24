@@ -44,6 +44,7 @@ Use IF VERSION for equality checks against the containing chunk, including chang
 ## Conditions
 
 AGGREGATE and SCAN CHUNKS take `WHERE condition` and keep only the present blocks for which the condition is true.
+A table's `CHECK (condition)` refuses every write that leaves a block for which it is false; see [Tables](reference/TABLES.md#checks).
 
 ```text
 condition := condition OR condition | condition AND condition | NOT condition | ( condition )
