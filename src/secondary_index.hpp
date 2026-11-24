@@ -38,7 +38,7 @@ void RequireIndexableColumn(const Column& column, std::uint32_t prefix);
 // entry, else the revision that removed it while a snapshot may still read
 // it.
 struct IndexEntry {
-    std::vector<std::uint8_t> key;
+    std::vector<std::uint8_t> key{};
     ChunkCoord coord{};
     std::uint32_t block = 0U;
     std::uint64_t removed = 0U;
@@ -85,7 +85,7 @@ struct IndexManifest {
     IndexIdentity identity{};
     IndexState state = IndexState::kBuilding;
     std::uint64_t generation = 0U;
-    std::vector<IndexRunRef> runs;
+    std::vector<IndexRunRef> runs{};
 };
 [[nodiscard]] std::vector<std::uint8_t> SerializeIndexManifest(const IndexManifest& manifest);
 // Throws std::runtime_error for any damage.
@@ -103,8 +103,8 @@ struct IndexRunChunk {
 // index lists, with its revision and whether it is populated, and the
 // current state of a chunk.
 struct IndexChunkSource {
-    std::function<void(const std::function<void(const ChunkCoord&, std::uint64_t, bool)>&)> for_each;
-    std::function<ChunkState(const ChunkCoord&)> read;
+    std::function<void(const std::function<void(const ChunkCoord&, std::uint64_t, bool)>&)> for_each{};
+    std::function<ChunkState(const ChunkCoord&)> read{};
 };
 
 // The layers of one index: an in-memory delta and up to kMaxIndexRuns runs

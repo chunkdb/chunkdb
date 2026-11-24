@@ -218,9 +218,9 @@ class RunReader {
             if (block_index_at_ - offset_ < 12U || body > block_index_at_ - offset_ - 12U)
                 throw std::runtime_error("index run block is truncated");
             auto block = ReadRange(input_, offset_, 8U + body + 4U, "index run block");
-            Reader crc(std::span(block).subspan(8U + body), "index run block");
+            Reader crc{std::span<const std::uint8_t>(block).subspan(8U + body), "index run block"};
             RequireCrc(std::span(block).first(8U + body), crc.U32(), "index run block");
-            Reader reader(std::span(block).subspan(8U, body), "index run block");
+            Reader reader{std::span<const std::uint8_t>(block).subspan(8U, body), "index run block"};
             pending_.clear();
             for (std::uint32_t i = 0U; i < count; ++i) pending_.push_back(ReadEntry(reader, dims_));
             if (!reader.done()) throw std::runtime_error("index run block has trailing bytes");
@@ -809,10 +809,10 @@ void SecondaryIndex::ForEach(const std::function<bool(const IndexEntry&)>& visit
     // One stream per layer: the delta's entries in order, then each run's.
     struct Stream {
         std::size_t layer = 0U;
-        std::unique_ptr<RunReader> run;
-        std::vector<const IndexEntry*> delta;
+        std::unique_ptr<RunReader> run{};
+        std::vector<const IndexEntry*> delta{};
         std::size_t next = 0U;
-        IndexEntry head;
+        IndexEntry head{};
     };
     std::vector<Stream> streams;
     {

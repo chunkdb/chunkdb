@@ -57,10 +57,10 @@ std::size_t ColumnIndex(const ChunkLayout& layout, std::string_view name) {
 // One block's values; a missing one is NULL (or absent text and bytes).
 struct Block {
     std::uint64_t u = 0U;
-    std::optional<std::int64_t> i;
+    std::optional<std::int64_t> i{};
     float f = 0.0F;
-    std::optional<std::string> t;
-    std::optional<std::string> b;
+    std::optional<std::string> t{};
+    std::optional<std::string> b{};
     bool flag = false;
 };
 
@@ -99,7 +99,7 @@ struct Model {
     struct Chunk {
         std::uint64_t revision = 0U;
         bool populated = false;
-        ChunkState state;
+        ChunkState state{};
     };
     std::map<ChunkCoord, Chunk> chunks;
     std::uint64_t clock = 0U;
