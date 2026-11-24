@@ -37,14 +37,17 @@ class BlockChecks {
     // and the block, when a check cannot be evaluated (division by zero, a
     // position past the 64-bit range). `overrides` are text and bytes values
     // that replace those of `vars` (a block write's changes).
+    // With `defer_commit_time`, a transaction statement's check: checks that
+    // read a DEFAULT COMMIT_TIME column, which COMMIT stamps, wait for
+    // COMMIT.
     void RequireBlock(const ChunkCoord& coord, std::span<const std::uint8_t> payload, const ChunkVars& vars,
-        std::size_t block, std::span<const VarChange> overrides = {}) const;
+        std::size_t block, std::span<const VarChange> overrides = {}, bool defer_commit_time = false) const;
     // The same for every present block of the state that `base` lacks or
     // holds other values of, evaluating each check only when a column it
     // reads changed or the block is new.
     void RequireChanged(const ChunkCoord& coord, std::span<const std::uint8_t> payload,
         std::span<const std::uint8_t> presence, const ChunkVars& vars, std::span<const std::uint8_t> base_payload,
-        std::span<const std::uint8_t> base_presence, const ChunkVars& base_vars) const;
+        std::span<const std::uint8_t> base_presence, const ChunkVars& base_vars, bool defer_commit_time = false) const;
     // The same for a chunk holding `base_vars` that `update` changes.
     void RequireChangedAfter(const ChunkCoord& coord, std::span<const std::uint8_t> payload,
         std::span<const std::uint8_t> presence, const VarUpdate& update, std::span<const std::uint8_t> base_payload,

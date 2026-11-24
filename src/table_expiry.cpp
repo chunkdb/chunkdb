@@ -1,6 +1,7 @@
 #include "table_expiry.hpp"
 
 #include <atomic>
+#include <chrono>
 #include <exception>
 #include <mutex>
 #include <stdexcept>
@@ -40,13 +41,21 @@ struct Table::ExpiryJob {
     std::atomic<std::uint64_t> frontier_ms;
     std::atomic<std::uint64_t> expired_blocks{0U};
     std::atomic<std::uint64_t> failed_passes{0U};
+    // Between RequestExpiry starting a sweep and its last turn; when it ended.
+    std::atomic<bool> sweeping{false};
+    std::atomic<std::chrono::steady_clock::rep> ended{0};
 };
 
 bool Table::ExpiryJob::Step() noexcept {
     std::lock_guard lock(mutex);
-    if (stopped) return false;
+    const auto end = [this] {
+        ended.store(std::chrono::steady_clock::now().time_since_epoch().count(), std::memory_order_relaxed);
+        sweeping.store(false, std::memory_order_release);
+        return false;
+    };
+    if (stopped) return end();
     const auto lease = table->TryAcquire();
-    if (!lease) return false;
+    if (!lease) return end();
     std::uint32_t current = 0U;
     {
         std::lock_guard options(table->mutex_);
@@ -58,7 +67,7 @@ bool Table::ExpiryJob::Step() noexcept {
         has_cursor = false;
         frontier_ms.store(now, std::memory_order_relaxed);
     }
-    if (column == 0U || Table::StoreFenceReason(lease->store()) != nullptr) return false;
+    if (column == 0U || Table::StoreFenceReason(lease->store()) != nullptr) return end();
     if (!has_cursor) sweep_started_ms = now;
     try {
         const ScopedWriteUser user(kExpiryWriteUser);
@@ -78,11 +87,11 @@ bool Table::ExpiryJob::Step() noexcept {
         } catch (const std::exception&) {
             // Counted above; logging under memory pressure is best effort.
         }
-        return false;
+        return end();
     }
     has_cursor = false;
     frontier_ms.store(sweep_started_ms, std::memory_order_relaxed);
-    return false;
+    return end();
 }
 
 std::optional<Table::Lease> Table::TryAcquire() {
@@ -96,13 +105,22 @@ std::optional<Table::Lease> Table::TryAcquire() {
     return std::nullopt;
 }
 
-void Table::RequestExpiry(const std::shared_ptr<MaintenancePool>& pool) {
-    {
-        std::lock_guard options(mutex_);
-        if (options_.expire_column == 0U) return;
-    }
+bool Table::HasExpireColumn() const {
+    std::lock_guard options(mutex_);
+    return options_.expire_column != 0U;
+}
+
+void Table::RequestExpiry(const std::shared_ptr<MaintenancePool>& pool, std::chrono::milliseconds interval, bool now) {
+    if (!HasExpireColumn()) return;
     std::lock_guard lock(expiry_mutex_);
     if (expiry_stopped_) return;
+    if (expiry_) {
+        // One sweep at a time, the next one interval after the last ended.
+        if (expiry_->sweeping.load(std::memory_order_acquire)) return;
+        const auto ended = std::chrono::steady_clock::time_point(
+            std::chrono::steady_clock::duration(expiry_->ended.load(std::memory_order_relaxed)));
+        if (!now && std::chrono::steady_clock::now() - ended < interval) return;
+    }
     if (!expiry_) {
         auto job = std::make_shared<ExpiryJob>(this, UnixMillisNow());
         // The job outlives every turn: StopExpiry waits for them.
@@ -110,7 +128,8 @@ void Table::RequestExpiry(const std::shared_ptr<MaintenancePool>& pool) {
         expiry_pool_ = pool;
         expiry_ = std::move(job);
     }
-    (void)expiry_pool_->Notify(expiry_task_);
+    expiry_->sweeping.store(true, std::memory_order_release);
+    if (!expiry_pool_->Notify(expiry_task_)) expiry_->sweeping.store(false, std::memory_order_release);
 }
 
 void Table::StopExpiry() noexcept {
@@ -162,8 +181,12 @@ void TableCatalog::StartExpiryTicker() {
                     tables.reserve(tables_.size());
                     for (const auto& [name, table] : tables_) tables.push_back(table);
                 }
-                const auto pool = resources_->MaintenanceWorkers();
-                for (const auto& table : tables) table->RequestExpiry(pool);
+                std::erase_if(tables, [](const std::shared_ptr<Table>& table) { return !table->HasExpireColumn(); });
+                // The pool starts only for a table with an expire_column.
+                if (!tables.empty()) {
+                    const auto pool = resources_->MaintenanceWorkers();
+                    for (const auto& table : tables) table->RequestExpiry(pool, config_.expiry_interval);
+                }
             } catch (const std::exception& error) {
                 try {
                     LogMessage(LogLevel::kError, LogComponent::kStore, "expiry sweeps could not start; the next tick retries",
@@ -189,7 +212,7 @@ void TableCatalog::StopExpiryTicker() noexcept {
 void ExpiryTestAccess::RunSweep(TableCatalog& catalog, std::string_view name) {
     const auto table = catalog.Find(name);
     if (!table) throw TableNotFoundError("no table " + std::string(name));
-    table->RequestExpiry(catalog.resources_->MaintenanceWorkers());
+    table->RequestExpiry(catalog.resources_->MaintenanceWorkers(), catalog.config_.expiry_interval, /*now=*/true);
     std::shared_ptr<MaintenancePool> pool;
     std::shared_ptr<MaintenanceTask> task;
     {

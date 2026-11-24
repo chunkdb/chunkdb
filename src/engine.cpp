@@ -1164,7 +1164,8 @@ std::string CommandEngine::HandleMetrics() const {
         if (table == nullptr) {
             continue;
         }
-        if (const auto status = table->Expiry(now)) {
+        // A read-only server runs no expiry.
+        if (const auto status = catalog_->access_mode() == AccessMode::kReadWrite ? table->Expiry(now) : std::nullopt) {
             expiry.push_back({.table = info.name, .lag_ms = status->lag_ms, .expired_blocks = status->expired_blocks,
                 .failed_passes = status->failed_passes});
         }

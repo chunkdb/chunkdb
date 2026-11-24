@@ -557,6 +557,22 @@ std::uint64_t ChunkStore::CommitTransaction(
         bool append_started = false;
         TxnKeep keep{};
     };
+    // One commit time for every chunk, taken under the locks. DEFAULT
+    // COMMIT_TIME columns of the blocks the transaction changes take it,
+    // unless it changes them itself, before the checks read them.
+    std::uint64_t commit_time_ms = 0;
+    for (const auto& target : targets) {
+        if (target.write != kNoWrite) commit_time_ms = NextCommitTimeMs(*target.chunk);
+    }
+    if (!geometry_.layout().commit_time_columns().empty()) [[unlikely]] {
+        for (const auto& target : targets) {
+            if (target.write == kNoWrite) continue;
+            auto& state = writes[target.write].state;
+            const auto& chunk = *target.chunk;
+            geometry_.layout().StampCommitTime(chunk.payload, chunk.presence_bitmap, state.presence_bitmap,
+                VarChangedBlocks(chunk.vars, state.vars, geometry_.layout().block_count()), commit_time_ms, &state.payload);
+        }
+    }
     std::vector<Change> changes;
     for (const auto& target : targets) {
         if (target.write == kNoWrite) {
@@ -605,25 +621,11 @@ std::uint64_t ChunkStore::CommitTransaction(
         }
     }
 
-    // One version and one commit time for every chunk. Taken after the
-    // chunks are locked and flushed, so it is above every frame in their WALs.
+    // One version for every chunk. Taken after the chunks are locked and
+    // flushed, so it is above every frame in their WALs.
     FeedWriteGuard feed(*this);
     const std::uint64_t version = NextChunkVersion();
     feed.Version(version);
-    std::uint64_t commit_time_ms = 0;
-    for (const auto& change : changes) {
-        commit_time_ms = NextCommitTimeMs(*change.target->chunk);
-    }
-    // DEFAULT COMMIT_TIME columns of the blocks the transaction changes take
-    // its commit time, unless it changes them itself.
-    if (!geometry_.layout().commit_time_columns().empty()) [[unlikely]] {
-        for (auto& change : changes) {
-            auto& state = change.write->state;
-            const auto& chunk = *change.target->chunk;
-            geometry_.layout().StampCommitTime(chunk.payload, chunk.presence_bitmap, state.presence_bitmap,
-                VarChangedBlocks(chunk.vars, state.vars, geometry_.layout().block_count()), commit_time_ms, &state.payload);
-        }
-    }
     // Loaded after the version was taken, as a plain write does.
     const bool keep_states = txn_history_->OpenCount() > 0U;
 

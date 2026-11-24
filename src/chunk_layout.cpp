@@ -109,17 +109,27 @@ void ChunkLayout::StampCommitTime(std::span<const std::uint8_t> before_payload,
     const auto stamped = [this](std::size_t fixed) {
         return std::find(commit_time_columns_.begin(), commit_time_columns_.end(), fixed) != commit_time_columns_.end();
     };
+    // A chunk without state reads as zero bytes.
+    std::vector<std::uint8_t> zero;
+    if (before_payload.size() < payload_bytes_) {
+        zero.assign(payload_bytes_, 0U);
+        before_payload = zero;
+    }
+    std::vector<std::uint8_t> was;
+    std::vector<std::uint8_t> now;
     for (std::size_t block = 0; block < block_count_; ++block) {
         if (!BitOrZero(presence, block)) continue;
-        const std::span<const std::uint8_t> after(*payload);
+        // Compares the value's bytes, as ReadValueBits gives them.
         const auto differs = [&](const FixedColumn& column) {
             if (column.validity != kNoValidity &&
-                BitOrZero(before_payload, column.validity * 8U + block) != BitOrZero(after, column.validity * 8U + block))
+                BitOrZero(before_payload, column.validity * 8U + block) != BitOrZero(*payload, column.validity * 8U + block))
                 return true;
             const std::size_t first = column.values * 8U + block * column.width;
-            for (std::size_t bit = first; bit < first + column.width; ++bit)
-                if (BitOrZero(before_payload, bit) != BitOrZero(after, bit)) return true;
-            return false;
+            was.resize((column.width + 7U) / 8U);
+            now.resize(was.size());
+            ReadValueBits(before_payload.data(), first, was.data(), column.width);
+            ReadValueBits(payload->data(), first, now.data(), column.width);
+            return was != now;
         };
         bool other = !BitOrZero(before_presence, block) || (block < var_changed.size() && var_changed[block]);
         for (std::size_t fixed = 0; !other && fixed < fixed_.size(); ++fixed)

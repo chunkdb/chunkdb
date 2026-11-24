@@ -372,10 +372,12 @@ class Table : public std::enable_shared_from_this<Table> {
     // A lease when the table serves now, without waiting for a reopen.
     [[nodiscard]] std::optional<Lease> TryAcquire();
     // Expiry passes run on `pool` (table_expiry.cpp). RequestExpiry starts a
-    // sweep unless one runs, and does nothing without an expire_column or
-    // after StopExpiry, which returns once no pass runs or can run.
+    // sweep unless one runs or, without `now`, the last one ended less than
+    // `interval` ago; it does nothing without an expire_column or after
+    // StopExpiry, which returns once no pass runs or can run.
     struct ExpiryJob;
-    void RequestExpiry(const std::shared_ptr<MaintenancePool>& pool);
+    [[nodiscard]] bool HasExpireColumn() const;
+    void RequestExpiry(const std::shared_ptr<MaintenancePool>& pool, std::chrono::milliseconds interval, bool now = false);
     void StopExpiry() noexcept;
     void QuarantineFeedLinger(const std::exception& error, std::shared_ptr<ChunkStore> store, bool admitted) noexcept;
     // Why a table in its catalog refuses commands; nullptr when it does not.

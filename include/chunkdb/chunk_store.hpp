@@ -367,11 +367,11 @@ struct ChunkScanPage {
 
 // One bounded expiry pass (ChunkStore::ExpireBlocks).
 struct ExpiryPass {
-    // Populated chunks the pass read.
+    // Chunk identities the pass visited, populated or not.
     std::size_t chunks = 0U;
     // Blocks it deleted.
     std::size_t deleted = 0U;
-    // Whether populated chunks remain after `next`, the last chunk read.
+    // Whether identities remain after `next`, the last one visited.
     bool more = false;
     ChunkCoord next{};
 };
@@ -825,14 +825,18 @@ class ChunkStore {
         bool has_cursor,
         ChunkCoord cursor,
         std::size_t limit);
-    // Expiry (docs/reference/TABLES.md#expiry): reads at most `max_chunks`
-    // populated chunks after `cursor` in coordinate order and deletes their
+    // Expiry (docs/reference/TABLES.md#expiry): visits at most `max_chunks`
+    // chunk identities after `cursor` in coordinate order and deletes their
     // present blocks whose u64 column `column_id` holds a time t with
     // 0 < t <= now_ms. Each chunk with such blocks is one ordinary commit of
     // the current write user, decided under its chunk lock; other chunks
     // are read without entering the cache.
     [[nodiscard]] ExpiryPass ExpireBlocks(std::uint32_t column_id, bool has_cursor, ChunkCoord cursor,
         std::size_t max_chunks, std::uint64_t now_ms);
+#ifdef CHUNKDB_FAILPOINTS
+    // Runs between a chunk's read without the cache and its chunk lock.
+    static void SetExpiryDecideHookForTests(void (*hook)()) noexcept;
+#endif
     // With `filter`, the page reads each identity's state, and every identity it
     // visits counts toward `limit`, whether the filter keeps it or not.
     [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentities(

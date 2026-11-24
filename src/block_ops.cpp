@@ -849,7 +849,10 @@ void ChunkStore::SetBlockInStateAtIndex(ChunkState& state, std::size_t block_ind
         };
         WriteEditsToPayload(state.payload, block_index, write);
         try {
-            geometry_.checks()->RequireBlock(*coord, state.payload, state.vars, block_index, write.var_changes);
+            // DEFAULT COMMIT_TIME columns take their value at COMMIT, which
+            // evaluates the checks that read them.
+            geometry_.checks()->RequireBlock(*coord, state.payload, state.vars, block_index, write.var_changes,
+                /*defer_commit_time=*/true);
         } catch (...) {
             restore();
             throw;

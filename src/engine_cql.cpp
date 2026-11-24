@@ -1846,7 +1846,7 @@ std::string CommandEngine::ExecuteStatement(
                             // A failing block refuses the statement; COMMIT checks again.
                             if (checks != nullptr)
                                 checks->RequireChanged(coord, state.payload, state.presence_bitmap, state.vars, payload,
-                                    presence, current_vars);
+                                    presence, current_vars, /*defer_commit_time=*/true);
                             state.written = true;
                         });
                         return NullReply();

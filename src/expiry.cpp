@@ -1,4 +1,5 @@
 #include <array>
+#include <atomic>
 #include <span>
 #include <stdexcept>
 #include <string>
@@ -7,6 +8,7 @@
 
 #include "chunk_store_internal.hpp"
 #include "chunkdb/chunk_store.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "statement_control.hpp"
 
 // Expiry by a table's expire_column (docs/reference/TABLES.md#expiry). The
@@ -36,7 +38,17 @@ namespace {
     return expired;
 }
 
+#ifdef CHUNKDB_FAILPOINTS
+std::atomic<void (*)()> expiry_decide_hook_for_tests{nullptr};
+#endif
+
 }  // namespace
+
+#ifdef CHUNKDB_FAILPOINTS
+void ChunkStore::SetExpiryDecideHookForTests(void (*hook)()) noexcept {
+    expiry_decide_hook_for_tests.store(hook, std::memory_order_release);
+}
+#endif
 
 ExpiryPass ChunkStore::ExpireBlocks(std::uint32_t column_id, bool has_cursor, ChunkCoord cursor,
     std::size_t max_chunks, std::uint64_t now_ms) {
@@ -47,13 +59,18 @@ ExpiryPass ChunkStore::ExpireBlocks(std::uint32_t column_id, bool has_cursor, Ch
     const auto* column = index == std::string_view::npos ? nullptr : layout.FixedColumnAt(index);
     if (column == nullptr || layout.schema().columns[index].type != ColumnType{.kind = ColumnKind::kUnsigned, .size = 64U})
         throw std::invalid_argument("the expire_column is not a u64 column of the table");
+    if (max_chunks == 0U) throw std::invalid_argument("an expiry pass reads at least one chunk");
     ExpiryPass pass;
-    const auto page = ScanPopulatedChunks(has_cursor, cursor, max_chunks);
+    // Taking the frontier acquires every covered producer's index publication;
+    // candidates are hints, each read once.
+    (void)CompletedRevision();
+    const auto page = CoordinateIndexForScan()->Page(has_cursor, cursor, max_chunks);
     for (const auto& coord : page.coords) {
+        CheckStatementCancellation();
         ++pass.chunks;
         pass.deleted += ExpireChunkBlocks(coord, *column, now_ms);
     }
-    pass.more = page.has_more;
+    pass.more = page.more;
     if (!page.coords.empty()) pass.next = page.coords.back();
     return pass;
 }
@@ -67,6 +84,9 @@ std::size_t ChunkStore::ExpireChunkBlocks(const ChunkCoord& coord, const ChunkLa
         if (!ReadPopulatedChunkStateNoCache(coord, &state, false)) return 0U;
         if (ExpiredBlocks(column, state.payload, state.presence_bitmap, blocks, now_ms).empty()) return 0U;
     }
+#ifdef CHUNKDB_FAILPOINTS
+    if (auto* hook = expiry_decide_hook_for_tests.load(std::memory_order_acquire)) hook();
+#endif
     const auto chunk = GetOrLoadRegularChunk(coord);
     auto lock = LockStatementChunk(chunk->mutex);
     AwaitChunkBacklogLocked(lock, *chunk);

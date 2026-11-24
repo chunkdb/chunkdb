@@ -1,7 +1,8 @@
 // DEFAULT COMMIT_TIME and expiry by expire_column (#145), with an injected
 // clock: the commit time on every write path, the schema and option rules,
-// bounded expiry passes, sweeps on the maintenance pool with their feed
-// events and lag, and a crash between passes.
+// checks that read the commit time, bounded expiry passes and their decision
+// under the chunk lock, sweeps on the maintenance pool with their feed events
+// and lag, and a crash between passes.
 
 #include <atomic>
 #include <cassert>
@@ -323,6 +324,77 @@ void TestSweepsFeedAndLag() {
     assert(!Contains(server.Run("SHOW METRICS"), "chunkdb_expiry_lag_seconds"));
 }
 
+// Checks that read a DEFAULT COMMIT_TIME column see the stamped value: a
+// plain write and SET CHUNK when they are evaluated, a transaction at COMMIT.
+void TestChecksReadCommitTime() {
+    ScopedTempDir dir("chunkdb-expiry-checks");
+    Server server(dir.path());
+    server.Ok("CREATE TABLE c (v u8, updated u64 DEFAULT COMMIT_TIME CHECK (updated > 0), expires u64 NULL) "
+              "CHUNK 4 x 4 CHECK fresh (expires > updated)");
+    g_now = 2'000U;
+    // Unstamped, the new block would fail updated_check first.
+    Expect(server.Run("SET BLOCK 0 0 IN c v = 1, expires = 1000"), "check=fresh");
+    server.Write("SET BLOCK 0 0 IN c v = 1, expires = 3000");
+    assert(server.Get("0 0", "c", "updated") == Int(2'000U));
+    g_now = 4'000U;
+    Expect(server.Run("SET BLOCK 0 0 IN c v = 2"), "check=fresh");
+    assert(server.Get("0 0", "c", "updated") == Int(2'000U));
+    {
+        auto lease = server.catalog->Find("c")->Acquire();
+        auto& store = lease->store();
+        const auto refused = [](const auto& write) {
+            try {
+                write();
+            } catch (const CheckFailedError& error) {
+                return error.check() == "fresh";
+            }
+            return false;
+        };
+        auto state = store.ReadChunkState(ChunkCoord{0, 0});
+        store.SetBlockInState(state, 1, 0, {{"v", std::uint64_t{1}}, {"expires", std::uint64_t{5'000}}});
+        (void)store.WriteChunkState(ChunkCoord{0, 0}, state, std::nullopt);
+        state = store.ReadChunkState(ChunkCoord{0, 0});
+        store.SetBlockInState(state, 2, 0, {{"v", std::uint64_t{1}}, {"expires", std::uint64_t{3'500}}});
+        assert(refused([&] { (void)store.WriteChunkState(ChunkCoord{0, 0}, state, std::nullopt); }));
+        assert(refused([&] {
+            (void)store.TransformChunkState(ChunkCoord{0, 0}, std::nullopt, false, [&](ChunkState& next) {
+                store.SetBlockInState(next, 2, 0, {{"v", std::uint64_t{1}}, {"expires", std::uint64_t{3'500}}});
+            });
+        }));
+    }
+    assert(server.Get("1 0", "c", "updated") == Int(4'000U) && server.Get("2 0", "c", "v") == "_\r\n");
+    // A statement defers the checks that read the time; COMMIT decides.
+    server.Ok("BEGIN");
+    Expect(server.Run("SET BLOCK 3 0 IN c v = 1, expires = 5000"), "_");
+    Expect(server.Run("COMMIT"), ":");
+    assert(server.Get("3 0", "c", "updated") == Int(4'000U));
+    server.Ok("BEGIN");
+    Expect(server.Run("SET BLOCK 3 1 IN c v = 1, expires = 4500"), "_");
+    g_now = 5'000U;
+    Expect(server.Run("COMMIT"), "check=fresh");
+    assert(server.Get("3 1", "c", "v") == "_\r\n");
+}
+
+Server* g_hook_server = nullptr;
+void MoveTimeAhead() { g_hook_server->Write("SET BLOCK 0 0 IN d until = 9000"); }
+
+// A write between a pass's read and its chunk lock keeps its block.
+void TestDecideAgainUnderLock() {
+    ScopedTempDir dir("chunkdb-expiry-decide");
+    Server server(dir.path());
+    server.Ok("CREATE TABLE d (v u8, until u64 NULL) CHUNK 2 x 2 WITH expire_column = until");
+    WriteChunks(server, "d", 1);
+    auto table = server.catalog->Find("d");
+    const auto column = table->Info().options.expire_column;
+    auto lease = table->Acquire();
+    g_hook_server = &server;
+    ChunkStore::SetExpiryDecideHookForTests(&MoveTimeAhead);
+    const auto pass = lease->store().ExpireBlocks(column, false, {}, 64U, 1'000U);
+    ChunkStore::SetExpiryDecideHookForTests(nullptr);
+    assert(pass.chunks == 1U && pass.deleted == 0U);
+    assert(server.Get("0 0", "d", "until") == Int(9'000U));
+}
+
 #ifndef _WIN32
 // A crash between the passes of a sweep: the committed deletions stay, and
 // the sweep after the restart takes the rest.
@@ -368,6 +440,8 @@ int main() {
     TestExpireColumnOption();
     TestBoundedPasses();
     TestSweepsFeedAndLag();
+    TestChecksReadCommitTime();
+    TestDecideAgainUnderLock();
     SetUnixMillisClockForTests(nullptr);
     return 0;
 }
