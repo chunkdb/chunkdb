@@ -645,6 +645,9 @@ class TableCatalog {
         const std::string& name,
         const TableOptions& stored) const;
     void RequireWritable(const char* operation) const;
+    // Migrate for a request with steps after it: every step of one table is
+    // applied under one migration decision, or none is.
+    [[nodiscard]] bool MigrateUnit(const MigrationRequest& request, UserRegistry* users);
     // Waits for the table's commands, writes its batched writes to their WALs,
     // replaces its manifest with `change` applied (atomically, synced) and
     // reopens it with `options`. Before the manifest is replaced a failure

@@ -210,17 +210,9 @@ bool ConditionalNoOp(const cql::Statement& statement) {
     return false;
 }
 
-void ValidateStructure(const MigrationJournal& journal) {
-    if (Zero(journal.data_dir_id)) Bad("zero data-directory identity");
-    ValidateRecord(journal.record);
-    if (journal.directory_action != MigrationDirectoryAction::kNone &&
-        journal.directory_action != MigrationDirectoryAction::kCreate &&
-        journal.directory_action != MigrationDirectoryAction::kDrop) Bad("directory action");
-    if (journal.table.empty()) {
-        if (!Zero(journal.table_id) || journal.directory_action != MigrationDirectoryAction::kNone) Bad("missing table identity");
-    } else if (!IsValidTableName(journal.table) || Zero(journal.table_id)) {
-        Bad("table name or identity");
-    }
+// The participants one recorded statement needs and may have.
+void ValidateStatement(const MigrationJournal& journal, bool no_op, std::set<std::string>* required,
+                       std::set<std::string>* allowed, bool* new_slots) {
     const auto parsed = cql::Parse(journal.record.statement);
     if (parsed.parameters != 0U ||
         !(std::holds_alternative<cql::CreateTable>(parsed.statement) ||
@@ -230,7 +222,6 @@ void ValidateStructure(const MigrationJournal& journal) {
           std::holds_alternative<cql::CreateSlot>(parsed.statement) ||
           std::holds_alternative<cql::DropSlot>(parsed.statement))) Bad("unsupported pending statement or parameters");
     const auto& statement = parsed.statement;
-    const bool no_op = LedgerOnly(journal);
     if (no_op) {
         if (!ConditionalNoOp(statement)) Bad("ledger-only statement is not conditional DDL");
         const auto table = std::visit([](const auto& inner) -> std::string {
@@ -260,6 +251,110 @@ void ValidateStructure(const MigrationJournal& journal) {
         }, statement);
         if (journal.table != table) Bad("statement table differs from participants");
     }
+    const std::string manifest_path = "tables/" + journal.table + "/" + std::string(kStoreManifestFileName);
+    const std::string slots_path = "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName);
+    const std::string index_path = "tables/" + journal.table + "/" + std::string(kChunkIndexFileName);
+    if (no_op) {
+        // Existing objects are validation-only: completion writes the ledger,
+        // never the manifest, slot records or an unchanged table directory.
+    } else if (std::holds_alternative<cql::CreateTable>(statement) || std::holds_alternative<cql::AlterTable>(statement)) {
+        required->insert(manifest_path);
+        if (std::holds_alternative<cql::CreateTable>(statement)) required->insert(index_path);
+    } else if (std::holds_alternative<cql::DropTable>(statement)) {
+        required->insert(std::string(kDataDirManifestFileName));
+        allowed->insert(kUsersFileName);
+    } else if (std::holds_alternative<cql::GrantRight>(statement)) {
+        required->insert(kUsersFileName);
+    } else if (std::holds_alternative<cql::CreateSlot>(statement)) {
+        required->insert(manifest_path); required->insert(slots_path);
+    } else if (std::holds_alternative<cql::DropSlot>(statement)) {
+        required->insert(slots_path);
+    }
+    *new_slots = std::holds_alternative<cql::CreateSlot>(statement);
+}
+
+// The table a step of a migration names; a grant's table for GRANT and REVOKE.
+std::string StepTable(const cql::Statement& step) {
+    return std::visit([](const auto& inner) -> std::string {
+        using T = std::decay_t<decltype(inner)>;
+        if constexpr (std::is_same_v<T, cql::CreateTable> || std::is_same_v<T, cql::AlterTable> || std::is_same_v<T, cql::GrantRight> ||
+                      std::is_same_v<T, cql::CreateSlot> || std::is_same_v<T, cql::DropSlot>)
+            return inner.table;
+        return {};
+    }, step);
+}
+
+// The participants a migration of several steps needs and may have: the
+// files of its one table and the users file, each changed by any step.
+void ValidateUnit(const MigrationJournal& journal, const std::vector<cql::Statement>& steps, bool no_op,
+                  std::set<std::string>* required, std::set<std::string>* allowed, bool* new_slots) {
+    const auto any = [&](auto predicate) { return std::any_of(steps.begin(), steps.end(), predicate); };
+    for (std::size_t i = 0; i < steps.size(); ++i) {
+        const auto& step = steps[i];
+        if (!(std::holds_alternative<cql::CreateTable>(step) || std::holds_alternative<cql::AlterTable>(step) ||
+              std::holds_alternative<cql::GrantRight>(step) || std::holds_alternative<cql::CreateSlot>(step) ||
+              std::holds_alternative<cql::DropSlot>(step))) Bad("unsupported pending migration step");
+        if (std::holds_alternative<cql::CreateTable>(step) && i != 0U) Bad("CREATE TABLE after the first migration step");
+        if (StepTable(step) != StepTable(steps.front())) Bad("migration steps name different tables");
+    }
+    const bool grants_only = !any([](const auto& step) { return !std::holds_alternative<cql::GrantRight>(step); });
+    if (grants_only) {
+        if (!journal.table.empty()) Bad("grant steps with a table participant");
+    } else if (journal.table != StepTable(steps.front()) || !IsValidTableName(journal.table)) {
+        Bad("migration steps table differs from participants");
+    }
+    if (journal.directory_action == MigrationDirectoryAction::kDrop ||
+        (journal.directory_action == MigrationDirectoryAction::kCreate && !std::holds_alternative<cql::CreateTable>(steps.front())))
+        Bad("unexpected directory action");
+    if (no_op) {
+        if (!std::all_of(steps.begin(), steps.end(), [](const auto& step) { return ConditionalNoOp(step); }))
+            Bad("ledger-only steps are not all conditional DDL");
+        return;
+    }
+    const std::string manifest_path = "tables/" + journal.table + "/" + std::string(kStoreManifestFileName);
+    const std::string slots_path = "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName);
+    const std::string index_path = "tables/" + journal.table + "/" + std::string(kChunkIndexFileName);
+    if (journal.directory_action == MigrationDirectoryAction::kCreate) {
+        required->insert(manifest_path);
+        required->insert(index_path);
+    } else if (!grants_only) {
+        allowed->insert(manifest_path);
+        if (any([](const auto& step) { return std::holds_alternative<cql::CreateSlot>(step) || std::holds_alternative<cql::DropSlot>(step); }))
+            allowed->insert(slots_path);
+        // Slot records change only beside the manifest, which binds redo to the table identity.
+        if (any([](const auto& step) { return std::holds_alternative<cql::CreateSlot>(step) || std::holds_alternative<cql::DropSlot>(step); }) &&
+            std::any_of(journal.files.begin(), journal.files.end(), [&](const auto& file) { return file.path == slots_path; }))
+            required->insert(manifest_path);
+    }
+    if (any([](const auto& step) { return std::holds_alternative<cql::GrantRight>(step); })) allowed->insert(kUsersFileName);
+    if (journal.files.size() < 2U) Bad("migration steps change no participant");
+    *new_slots = any([](const auto& step) { return std::holds_alternative<cql::CreateSlot>(step); });
+}
+
+void ValidateStructure(const MigrationJournal& journal) {
+    if (Zero(journal.data_dir_id)) Bad("zero data-directory identity");
+    ValidateRecord(journal.record);
+    if (journal.directory_action != MigrationDirectoryAction::kNone &&
+        journal.directory_action != MigrationDirectoryAction::kCreate &&
+        journal.directory_action != MigrationDirectoryAction::kDrop) Bad("directory action");
+    if (journal.table.empty()) {
+        if (!Zero(journal.table_id) || journal.directory_action != MigrationDirectoryAction::kNone) Bad("missing table identity");
+    } else if (!IsValidTableName(journal.table) || Zero(journal.table_id)) {
+        Bad("table name or identity");
+    }
+    const bool no_op = LedgerOnly(journal);
+    std::set<std::string> allowed{std::string(kMigrationsFileName)};
+    std::set<std::string> required = allowed;
+    // Whether the slot records may be new: CREATE SLOT may write the first.
+    bool new_slots = false;
+    std::vector<cql::Statement> steps;
+    try {
+        steps = cql::ParseMigrationSteps(journal.record.statement);
+    } catch (const cql::ParseError&) {
+        // Read as one statement below, which refuses it.
+    }
+    if (steps.size() > 1U) ValidateUnit(journal, steps, no_op, &required, &allowed, &new_slots);
+    else ValidateStatement(journal, no_op, &required, &allowed, &new_slots);
     if (journal.directory_action == MigrationDirectoryAction::kNone) {
         if (!journal.operation_name.empty()) Bad("unexpected operation name");
     } else {
@@ -283,33 +378,15 @@ void ValidateStructure(const MigrationJournal& journal) {
     const std::string manifest_path = "tables/" + journal.table + "/" + std::string(kStoreManifestFileName);
     const std::string slots_path = "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName);
     const std::string index_path = "tables/" + journal.table + "/" + std::string(kChunkIndexFileName);
-    std::set<std::string> allowed{std::string(kMigrationsFileName)};
-    std::set<std::string> required = allowed;
-    if (no_op) {
-        // Existing objects are validation-only: completion writes the ledger,
-        // never the manifest, slot records or an unchanged table directory.
-    } else if (std::holds_alternative<cql::CreateTable>(statement) || std::holds_alternative<cql::AlterTable>(statement)) {
-        required.insert(manifest_path);
-        if (std::holds_alternative<cql::CreateTable>(statement)) required.insert(index_path);
-    } else if (std::holds_alternative<cql::DropTable>(statement)) {
-        required.insert(std::string(kDataDirManifestFileName));
-        allowed.insert(kUsersFileName);
-    } else if (std::holds_alternative<cql::GrantRight>(statement)) {
-        required.insert(kUsersFileName);
-    } else if (std::holds_alternative<cql::CreateSlot>(statement)) {
-        required.insert(manifest_path); required.insert(slots_path);
-    } else if (std::holds_alternative<cql::DropSlot>(statement)) {
-        required.insert(slots_path);
-    }
     allowed.insert(required.begin(), required.end());
     if (!std::includes(paths.begin(), paths.end(), required.begin(), required.end()) ||
         !std::includes(allowed.begin(), allowed.end(), paths.begin(), paths.end())) Bad("missing or unrelated operation participant");
     for (const auto& file : journal.files) {
         if (file.path == kMigrationsFileName) continue;
-        const bool newly_created = (journal.directory_action == MigrationDirectoryAction::kCreate &&
-                                       (file.path == manifest_path || file.path == index_path)) ||
-                                   (std::holds_alternative<cql::CreateSlot>(statement) && file.path == slots_path);
-        if (journal.directory_action == MigrationDirectoryAction::kCreate && file.before) Bad("new table has a before-image");
+        const bool created_file = journal.directory_action == MigrationDirectoryAction::kCreate &&
+                                  (file.path == manifest_path || file.path == index_path);
+        const bool newly_created = created_file || (new_slots && file.path == slots_path);
+        if (created_file && file.before) Bad("new table has a before-image");
         if (!newly_created && !file.before) Bad("existing participant has no before-image");
     }
     const auto& ledger = journal.files.back();
@@ -478,40 +555,47 @@ void ValidateMigrationJournal(const std::filesystem::path& root, const Migration
         }
     }
     if (LedgerOnly(journal)) {
-        const auto parsed = cql::Parse(journal.record.statement);
-        const auto& statement = parsed.statement;
-        if (const auto* drop = std::get_if<cql::DropTable>(&statement)) {
-            const auto target = "tables/" + drop->table;
-            SafePath(root, target);
-            if (Present(root / target)) Bad("conditional drop no-op table is present");
-        } else if (const auto* alter = std::get_if<cql::AlterTable>(&statement)) {
-            const auto table = ReadStoreManifest(root / "tables" / journal.table);
-            if (!table || table->store_id != journal.table_id) Bad("conditional no-op table identity");
-            const auto exists = [&](std::string_view name, bool chunks) {
-                const auto& schema = chunks ? *table->chunk_schema : table->schema;
-                return std::any_of(schema.columns.begin(), schema.columns.end(),
-                    [&](const auto& column) { return column.name == name; });
-            };
-            if (const auto* add = std::get_if<cql::AddColumn>(&alter->change)) {
-                if (!exists(add->column.name, add->chunk_column)) Bad("conditional add no-op column is absent");
-            } else if (const auto* drop = std::get_if<cql::DropColumn>(&alter->change)) {
-                if (exists(drop->column, drop->chunk_column)) Bad("conditional drop no-op column is present");
-            } else if (const auto* drop = std::get_if<cql::DropCheck>(&alter->change)) {
-                if (HasCheck(table->schema, drop->name)) Bad("conditional drop no-op check is present");
+        // Every step of a migration of several steps is a conditional no-op.
+        std::vector<cql::Statement> statements;
+        try {
+            statements = cql::ParseMigrationSteps(journal.record.statement);
+        } catch (const cql::ParseError&) {
+            statements = {cql::Parse(journal.record.statement).statement};
+        }
+        for (const auto& statement : statements) {
+            if (const auto* drop = std::get_if<cql::DropTable>(&statement)) {
+                const auto target = "tables/" + drop->table;
+                SafePath(root, target);
+                if (Present(root / target)) Bad("conditional drop no-op table is present");
+            } else if (const auto* alter = std::get_if<cql::AlterTable>(&statement)) {
+                const auto table = ReadStoreManifest(root / "tables" / journal.table);
+                if (!table || table->store_id != journal.table_id) Bad("conditional no-op table identity");
+                const auto exists = [&](std::string_view name, bool chunks) {
+                    const auto& schema = chunks ? *table->chunk_schema : table->schema;
+                    return std::any_of(schema.columns.begin(), schema.columns.end(),
+                        [&](const auto& column) { return column.name == name; });
+                };
+                if (const auto* add = std::get_if<cql::AddColumn>(&alter->change)) {
+                    if (!exists(add->column.name, add->chunk_column)) Bad("conditional add no-op column is absent");
+                } else if (const auto* drop = std::get_if<cql::DropColumn>(&alter->change)) {
+                    if (exists(drop->column, drop->chunk_column)) Bad("conditional drop no-op column is present");
+                } else if (const auto* drop = std::get_if<cql::DropCheck>(&alter->change)) {
+                    if (HasCheck(table->schema, drop->name)) Bad("conditional drop no-op check is present");
+                }
+            } else if (std::holds_alternative<cql::CreateSlot>(statement) || std::holds_alternative<cql::DropSlot>(statement)) {
+                const auto relative = "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName);
+                SafePath(root, relative);
+                const auto image = ReadBytes(root / relative, kMaxMigrationRecordsBytes);
+                const auto table = ReadStoreManifest(root / "tables" / journal.table);
+                if (!table || table->store_id != journal.table_id) Bad("conditional slot no-op table identity");
+                const auto slots = image ? std::optional<FeedSlotRecords>(ParseFeedSlotRecords(*image, journal.table_id,
+                    table->geometry.dims)) : std::nullopt;
+                const bool create = std::holds_alternative<cql::CreateSlot>(statement);
+                const auto& name = create ? std::get<cql::CreateSlot>(statement).name : std::get<cql::DropSlot>(statement).name;
+                const bool exists = slots && std::any_of(slots->slots.begin(), slots->slots.end(),
+                    [&](const auto& slot) { return slot.name == name; });
+                if (create != exists) Bad("conditional slot no-op existence differs");
             }
-        } else if (std::holds_alternative<cql::CreateSlot>(statement) || std::holds_alternative<cql::DropSlot>(statement)) {
-            const auto relative = "tables/" + journal.table + "/" + std::string(kFeedSlotsFileName);
-            SafePath(root, relative);
-            const auto image = ReadBytes(root / relative, kMaxMigrationRecordsBytes);
-            const auto table = ReadStoreManifest(root / "tables" / journal.table);
-            if (!table || table->store_id != journal.table_id) Bad("conditional slot no-op table identity");
-            const auto slots = image ? std::optional<FeedSlotRecords>(ParseFeedSlotRecords(*image, journal.table_id,
-                table->geometry.dims)) : std::nullopt;
-            const bool create = std::holds_alternative<cql::CreateSlot>(statement);
-            const auto& name = create ? std::get<cql::CreateSlot>(statement).name : std::get<cql::DropSlot>(statement).name;
-            const bool exists = slots && std::any_of(slots->slots.begin(), slots->slots.end(),
-                [&](const auto& slot) { return slot.name == name; });
-            if (create != exists) Bad("conditional slot no-op existence differs");
         }
     }
 }

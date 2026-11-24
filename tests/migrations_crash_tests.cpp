@@ -1,5 +1,7 @@
+#include <algorithm>
 #include <cassert>
 #include <cstdlib>
+#include <cstring>
 #include <iostream>
 #include <string>
 #include <vector>
@@ -38,7 +40,18 @@ const Operation kOperations[] = {
     {"create_slot_owner", "CREATE SLOT 'second' ON realm OWNER limited", 3U, false},
     {"create_slot_space", "CREATE SLOT 'second' ON space AREA 0 0 -1 TO 1 1 1 CHUNKS OWNER limited", 3U, false},
     {"drop_slot", "DROP SLOT 'second' ON realm", 2U, false},
+    // Migrations of several steps on one table, decided as one unit.
+    {"noop_unit", "ALTER TABLE realm ADD COLUMN IF NOT EXISTS v u8; DROP SLOT IF EXISTS 'absent' ON realm", 1U, false},
+    {"unit_alter", "ALTER TABLE realm ADD COLUMN a u8 NULL; ALTER TABLE realm RENAME COLUMN v TO renamed; ALTER TABLE realm SET checkpoint_updates = 64", 2U, false},
+    {"unit_narrow", "ALTER TABLE realm ALTER COLUMN v TYPE u8; ALTER TABLE realm ADD COLUMN a u8 NULL", 2U, false},
+    {"unit_slot", "ALTER TABLE realm ADD COLUMN a u8 NULL; CREATE SLOT 'second' ON realm COLUMNS (a); GRANT WRITE ON realm TO limited", 4U, false},
+    {"unit_create", "CREATE TABLE realm (v u16 REQUIRED) CHUNK 2 x 2 LARGE 1 x 1; ALTER TABLE realm ADD COLUMN a u8 NULL; GRANT WRITE ON realm TO limited", 4U, true},
 };
+
+// The number of steps of a migration statement.
+std::size_t Steps(const Operation& operation) {
+    return 1U + static_cast<std::size_t>(std::count(operation.statement, operation.statement + std::strlen(operation.statement), ';'));
+}
 
 const Operation& Find(const std::string& name) {
     for (const auto& op : kOperations) if (op.name == name) return op;
@@ -76,7 +89,7 @@ StoreId Seed(const std::filesystem::path& root, const Operation& operation) {
     e.users->Create("limited", scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations), false);
     e.users->Grant("limited", "realm", Right::kRead);
     if (std::string(operation.name) == "noop_drop") e.users->Grant("limited", "absent", Right::kRead);
-    if (std::string(operation.name) == "create") return {};
+    if (std::string(operation.name) == "create" || std::string(operation.name) == "unit_create") return {};
     Reply(e.Run(kCreate), "+OK\r\n");
     assert(e.Run(std::string("SET BLOCK 0 0 IN realm v=") + (std::string(operation.name) == "clamp" ? "300" : "7")).front() == ':');
     Reply(e.Run("FLUSH WAL"), "+OK\r\n");
@@ -122,6 +135,42 @@ void Check(const std::filesystem::path& root, const Operation& operation, const 
         return;
     }
     const auto table = e.catalog->Find("realm");
+    if (name == "unit_create") {
+        // Every step or none: the table, its added column and the grant.
+        assert(static_cast<bool>(table) == applied);
+        assert(e.users->Find("limited")->grants.at("realm") == (applied ? Right::kWrite : Right::kRead));
+        if (applied) {
+            const auto info = table->Info();
+            assert(info.schema.version == 2U && info.schema.columns.size() == 2U && info.schema.columns[1].name == "a");
+            const auto image = ReadStoreManifest(root / "tables" / "realm");
+            assert(image && image->store_id == table->store_id() && image->schema == info.schema);
+        }
+        return;
+    }
+    if (name.starts_with("unit_")) {
+        assert(table && table->store_id() == before);
+        const auto info = table->Info();
+        assert(!info.schema.pending && !ReadStoreManifest(root / "tables" / "realm")->schema.pending);
+        assert(info.schema.columns.size() == (applied ? 2U : 1U));
+        if (applied) assert(info.schema.columns[1].name == "a");
+        if (name == "unit_alter") {
+            assert(info.schema.columns.front().name == (applied ? "renamed" : "v"));
+            assert(info.options.checkpoint_update_interval == (applied ? 64U : Config(root).default_options.checkpoint_update_interval));
+        }
+        if (name == "unit_narrow") assert(info.schema.columns.front().type.size == (applied ? 8U : 16U));
+        if (name == "unit_slot") {
+            const auto slots = table->ListFeedSlots();
+            assert(slots.size() == (applied ? 2U : 1U) && slots[0].name == "first");
+            if (applied) {
+                assert(slots[1].name == "second" && slots[1].filters.column_ids && slots[1].filters.column_ids->size() == 1U);
+                assert(slots[1].filters.column_ids->front() == info.schema.columns[1].id);
+            }
+            assert(e.users->Find("limited")->grants.at("realm") == (applied ? Right::kWrite : Right::kRead));
+        }
+        const auto read = e.Run(name == "unit_alter" && applied ? "GET BLOCK 0 0 FROM realm COLUMNS renamed" : "GET BLOCK 0 0 FROM realm COLUMNS v");
+        assert(read.find(":7\r\n") != std::string::npos);
+        return;
+    }
     if (name == "create") {
         assert(static_cast<bool>(table) == applied);
         if (applied) {
@@ -201,6 +250,10 @@ void Matrix(const std::string& executable) {
             points.push_back("CHUNKDB_FAILPOINT_CRASH_MIGRATION_DIRECTORY_BEFORE_PUBLISH_ONCE");
             points.push_back("CHUNKDB_FAILPOINT_CRASH_MIGRATION_DIRECTORY_AFTER_PUBLISH_ONCE");
         }
+        // A crash after any step before the decision applies none of them.
+        if (Steps(operation) > 1U)
+            for (std::size_t step = 1U; step <= Steps(operation); ++step)
+                points.push_back("CHUNKDB_FAILPOINT_CRASH_MIGRATION_UNIT_STEP_" + std::to_string(step) + "_ONCE");
         for (const auto& point : points) {
             test::ScopedTempDir dir("chunkdb-migration-crash");
             const auto before = Seed(dir.path(), operation);
@@ -211,7 +264,8 @@ void Matrix(const std::string& executable) {
                 LoadFile(dir.path() / "tables/realm/chunkdb.slots") : std::vector<std::uint8_t>{};
             std::cout << operation.name << ' ' << point << '\n' << std::flush;
             assert(RunChild(executable, {"--crash", dir.path().string(), operation.name, point}) == 86);
-            const bool applied = point != "CHUNKDB_FAILPOINT_CRASH_MIGRATION_BEFORE_DECISION_ONCE";
+            const bool applied = point != "CHUNKDB_FAILPOINT_CRASH_MIGRATION_BEFORE_DECISION_ONCE" &&
+                                 point.find("_MIGRATION_UNIT_STEP_") == std::string::npos;
             std::optional<StoreId> planned_id;
             if (const auto pending = ReadMigrationJournal(dir.path())) planned_id = pending->table_id;
             Check(dir.path(), operation, before, applied);
@@ -222,7 +276,7 @@ void Matrix(const std::string& executable) {
             }
             const auto first_image = ReadStoreManifest(dir.path() / "tables" / "realm");
             Check(dir.path(), operation, before, applied);
-            if (std::string(operation.name) == "create" && applied) {
+            if ((std::string(operation.name) == "create" || std::string(operation.name) == "unit_create") && applied) {
                 const auto second_image = ReadStoreManifest(dir.path() / "tables" / "realm");
                 assert(first_image && second_image && first_image->store_id == second_image->store_id);
                 if (planned_id) assert(first_image->store_id == *planned_id);

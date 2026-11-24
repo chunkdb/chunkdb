@@ -908,11 +908,112 @@ void UsersProgressDuringDropLeaseDrain() {
     assert(e.catalog->Migrations().size() == 1U);
 }
 
+// A migration of several steps on one table applies every step or none, and
+// records one ledger entry for the whole text.
+void UnitsAllOrNothing() {
+    test::ScopedTempDir dir("chunkdb-migrations-units");
+    const std::string unit =
+        "ALTER TABLE realm ADD COLUMN a u8 NULL; ALTER TABLE realm ADD COLUMN b u8 NULL; CREATE SLOT 's' ON realm COLUMNS (a)";
+    {
+        Engine e(dir.path());
+        Reply(e.Run(kCreate), "+OK\r\n");
+        const auto table = e.catalog->Find("realm");
+        const auto unchanged = [&](std::uint64_t version, std::size_t slots, std::size_t records) {
+            assert(e.catalog->Find("realm") != nullptr && e.catalog->Find("realm")->Info().schema.version == version);
+            assert(e.catalog->Find("realm")->ListFeedSlots().size() == slots && e.catalog->Migrations().size() == records);
+            assert(!ReadMigrationJournal(dir.path()));
+        };
+        // A later step that fails leaves the earlier steps unapplied.
+        for (const auto* broken : {"ALTER TABLE realm ADD COLUMN a u8 NULL; ALTER TABLE realm DROP COLUMN absent",
+                                   "ALTER TABLE realm ADD COLUMN a u8 NULL; CREATE SLOT 's' ON realm COLUMNS (absent)",
+                                   "ALTER TABLE realm ADD COLUMN a u8 NULL; GRANT READ ON realm TO nobody"}) {
+            const auto reply = e.Run(std::string("MIGRATE 'broken' ") + broken);
+            assert(reply.rfind("-ERR ", 0U) == 0U);
+            unchanged(1U, 0U, 0U);
+        }
+        for (std::size_t step = 1U; step <= 3U; ++step) {
+            const std::string point = "CHUNKDB_FAILPOINT_MIGRATION_UNIT_STEP_" + std::to_string(step) + "_FAIL_ONCE";
+            txn_test::ScopedEnv fail(point.c_str(), "1");
+            Error(e.Run("MIGRATE 'unit' " + unit), "INTERNAL");
+            unchanged(1U, 0U, 0U);
+        }
+        // The shape of a migration is checked before any step runs.
+        Reply(e.Run("CREATE TABLE other (v u8) CHUNK 2 x 2"), "+OK\r\n");
+        for (const auto* refused : {"ALTER TABLE realm ADD COLUMN c u8 NULL; ALTER TABLE other ADD COLUMN c u8 NULL",
+                                    "ALTER TABLE realm ADD COLUMN c u8 NULL; DROP TABLE realm",
+                                    "ALTER TABLE realm ADD COLUMN c u8 NULL; CREATE TABLE realm (v u8) CHUNK 2 x 2",
+                                    "ALTER TABLE realm ADD COLUMN c u8 NULL; ALTER TABLE realm ADD CHECK (v < 100)",
+                                    "ALTER TABLE realm ADD COLUMN c u8 NULL; ALTER TABLE realm ALTER COLUMN v TYPE u8",
+                                    "CREATE TABLE fresh (v u8) CHUNK 2 x 2; CREATE SLOT 'f' ON fresh"}) {
+            Error(e.Run(std::string("MIGRATE 'shape' ") + refused), "INVALID_ARGUMENT");
+            unchanged(1U, 0U, 0U);
+            assert(!e.catalog->Find("fresh"));
+        }
+        Reply(e.Run("MIGRATE 'unit' " + unit), "+applied\r\n");
+        assert(e.catalog->Find("realm") == table);
+        unchanged(3U, 1U, 1U);
+        const auto info = table->Info();
+        assert(info.schema.columns.size() == 3U && info.schema.columns[1].name == "a" && info.schema.columns[2].name == "b");
+        const auto slots = table->ListFeedSlots();
+        assert(slots[0].name == "s" && slots[0].filters.column_ids && slots[0].filters.column_ids->size() == 1U);
+        assert(slots[0].filters.column_ids->front() == info.schema.columns[1].id);
+        const auto records = e.catalog->Migrations();
+        assert(records[0].name == "unit" && records[0].statement == unit);
+        Reply(e.Run("MIGRATE 'unit' " + unit), "+skipped\r\n");
+        Error(e.Run("MIGRATE 'unit' ALTER TABLE realm ADD COLUMN a u8 NULL"), "MIGRATION_MISMATCH");
+        // A unit whose every condition holds records its name and changes nothing.
+        const auto manifest = LoadFile(dir.path() / "tables/realm/table.manifest");
+        Reply(e.Run("MIGRATE 'noop' ALTER TABLE realm ADD COLUMN IF NOT EXISTS a u8; DROP SLOT IF EXISTS 'absent' ON realm"),
+              "+applied\r\n");
+        assert(LoadFile(dir.path() / "tables/realm/table.manifest") == manifest);
+        unchanged(3U, 1U, 2U);
+        // CREATE TABLE as the first step: the table is created with every step.
+        Reply(e.Run("MIGRATE 'fresh' CREATE TABLE fresh (v u8) CHUNK 2 x 2; ALTER TABLE fresh ADD COLUMN w u8 NULL"), "+applied\r\n");
+        const auto fresh = e.catalog->Find("fresh");
+        assert(fresh && fresh->Info().schema.version == 2U && fresh->Info().schema.columns.size() == 2U);
+        // CREATE TABLE IF NOT EXISTS of a table that exists applies the other steps to it.
+        Reply(e.Run("MIGRATE 'again' CREATE TABLE IF NOT EXISTS fresh (v u8) CHUNK 2 x 2; ALTER TABLE fresh ADD COLUMN x u8 NULL"),
+              "+applied\r\n");
+        assert(e.catalog->Find("fresh") == fresh && fresh->Info().schema.version == 3U);
+    }
+    Engine e(dir.path());
+    assert(e.catalog->Find("realm")->Info().schema.version == 3U && e.catalog->Find("realm")->ListFeedSlots().size() == 1U);
+    assert(e.catalog->Find("fresh")->Info().schema.version == 3U && e.catalog->Migrations().size() == 4U);
+    Reply(e.Run("MIGRATE 'unit' " + unit), "+skipped\r\n");
+}
+
+// A recorded migration of several steps is within a user's rights only when
+// every step is.
+void UnitRecordsFollowRights() {
+    test::ScopedTempDir dir("chunkdb-migrations-unit-rights");
+    Engine e(dir.path(), true);
+    const auto verifier = scram::MakeVerifier("pw", crypto::RandomBytes(16), scram::kMinIterations);
+    e.users->Create("owner", verifier, false);
+    e.users->Create("keeper", verifier, true);
+    e.users->Grant("owner", "realm", Right::kAdmin);
+    e.users->Grant("keeper", "realm", Right::kAdmin);
+    Reply(e.Run(kCreate), "+OK\r\n");
+    const std::string both = "ALTER TABLE realm ADD COLUMN a u8 NULL; GRANT READ ON realm TO owner";
+    SessionState owner, keeper;
+    assert(test::LoginOnEngine(*e.engine, owner, "owner", "pw").front() == '%');
+    assert(test::LoginOnEngine(*e.engine, keeper, "keeper", "pw").front() == '%');
+    const auto as = [&](SessionState& session, const std::string& text) { return e.engine->Execute(session, text); };
+    // Each step checks its own right: the GRANT step needs MANAGES USERS.
+    Error(as(owner, "MIGRATE 'both' " + both), "PERMISSION_DENIED");
+    assert(e.catalog->Find("realm")->Info().schema.version == 1U && e.catalog->Migrations().empty());
+    Reply(as(keeper, "MIGRATE 'both' " + both), "+applied\r\n");
+    assert(e.catalog->Find("realm")->Info().schema.version == 2U && e.users->Find("owner")->grants.at("realm") == Right::kAdmin);
+    Error(as(owner, "MIGRATE 'both' " + both), "PERMISSION_DENIED");
+    Reply(as(keeper, "MIGRATE 'both' " + both), "+skipped\r\n");
+    Reply(as(owner, "SHOW MIGRATIONS"), "*0\r\n");
+    assert(as(keeper, "SHOW MIGRATIONS").find("$4\r\nboth\r\n") != std::string::npos);
+}
+
 }  // namespace
 int main(int argc, char** argv) {
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-records") { LedgerLimit(false); return 0; }
     if (argc == 2 && std::string(argv[1]) == "--ledger-limit-bytes") { LedgerLimit(true); return 0; }
     ConditionalDdl(); ConditionalColumnsRefusePoisonedStore(); ConditionalJournalValidationAndRecovery();
-    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); SlotOwnersInMigrations(); NarrowingScanOutsideCatalogAdmission(); NarrowingRefusalLeavesNoTrace(); NarrowingEndFailureFences(); RightsAndDrop(); RecordedNamesFollowRights(); UnparseableRecordNeedsEveryTable(); ListingWithoutAdminSkipsLedger(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RightCheckDuringUserMigration(); PingDuringUserMigration(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery();
+    UsersProgressDuringDropLeaseDrain(); GrammarAndRecords(); NarrowingAndSlots(); SlotOwnersInMigrations(); NarrowingScanOutsideCatalogAdmission(); NarrowingRefusalLeavesNoTrace(); NarrowingEndFailureFences(); RightsAndDrop(); RecordedNamesFollowRights(); UnparseableRecordNeedsEveryTable(); ListingWithoutAdminSkipsLedger(); ConcurrentNameAndDdl(); UserAndSlotFencing(); OrdinaryDropGrantFencing(); RightCheckDuringUserMigration(); PingDuringUserMigration(); RebindRecoveredUsers(); PreparationRestoreFailure(); DropUnderNoAuthAndExplicitReplacement(); UnboundMetadataRefused(); FailedDecisionAndRecovery(); UnitsAllOrNothing(); UnitRecordsFollowRights();
     LedgerLimit(false); LedgerLimit(true);
 }

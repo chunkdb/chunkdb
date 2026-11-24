@@ -402,9 +402,22 @@ class Parser {
     // line is the one reported. A deque keeps earlier tokens in place.
     [[nodiscard]] const Token& Peek() {
         if (next_ == tokens_.size()) {
-            tokens_.push_back(Lex(line_, &at_));
+            tokens_.push_back(Next());
         }
         return tokens_[next_];
+    }
+    // The next token. Between the steps of MIGRATE a `;` ends a step: it reads
+    // as the end, with the text ";". Elsewhere the lexer refuses `;`.
+    [[nodiscard]] Token Next() {
+        if (steps_) {
+            std::size_t at = at_;
+            while (at < line_.size() && (line_[at] == ' ' || line_[at] == '\t')) ++at;
+            if (at < line_.size() && line_[at] == ';') {
+                at_ = at + 1U;
+                return Token{.kind = TokenKind::kEnd, .text = ";", .column = at + 1U};
+            }
+        }
+        return Lex(line_, &at_);
     }
     // The token after the next one; the end when the next one is the end.
     [[nodiscard]] const Token& PeekSecond() {
@@ -412,7 +425,7 @@ class Parser {
             return tokens_[next_];
         }
         if (next_ + 1U == tokens_.size()) {
-            tokens_.push_back(Lex(line_, &at_));
+            tokens_.push_back(Next());
         }
         return tokens_[next_ + 1U];
     }
@@ -999,24 +1012,39 @@ class Parser {
             Migrate migration;
             migration.name = SlotName();
             const auto start = Peek().column - 1U;
-            if (IsKeyword(Peek(), "migrate"))
-                Fail(start + 1U, "MIGRATE cannot contain another MIGRATE");
-            auto statement = ParseStatement();
-            bool allowed = false;
-            std::visit([&](auto&& value) {
-                using T = std::decay_t<decltype(value)>;
-                if constexpr (std::is_same_v<T, CreateTable> || std::is_same_v<T, AlterTable> ||
-                              std::is_same_v<T, DropTable> || std::is_same_v<T, GrantRight> ||
-                              std::is_same_v<T, CreateSlot> || std::is_same_v<T, DropSlot>) {
-                    migration.statement = std::move(value);
-                    allowed = true;
-                }
-            }, statement);
-            if (!allowed || !parameters_.empty())
-                Fail(start + 1U, "MIGRATE takes one schema statement without parameters");
-            if (const auto* alter = std::get_if<AlterTable>(&migration.statement);
-                alter != nullptr && std::holds_alternative<RenameTable>(alter->change))
-                Fail(start + 1U, "MIGRATE cannot rename a table; run ALTER TABLE ... RENAME TO on its own");
+            // Steps are separated by `;`; a single statement is one step.
+            steps_ = true;
+            for (std::size_t step = 1U;; ++step) {
+                const auto column = Peek().column;
+                if (IsKeyword(Peek(), "migrate"))
+                    Fail(column, "MIGRATE cannot contain another MIGRATE");
+                if (step > 1U && Peek().kind == TokenKind::kEnd)
+                    Fail(column, "a MIGRATE step is empty; separate statements with one ';' and end the last one without it");
+                auto statement = ParseStatement();
+                MigrationStatement* target = step == 1U ? &migration.statement : &migration.then.emplace_back();
+                bool allowed = false;
+                std::visit([&](auto&& value) {
+                    using T = std::decay_t<decltype(value)>;
+                    if constexpr (std::is_same_v<T, CreateTable> || std::is_same_v<T, AlterTable> ||
+                                  std::is_same_v<T, DropTable> || std::is_same_v<T, GrantRight> ||
+                                  std::is_same_v<T, CreateSlot> || std::is_same_v<T, DropSlot>) {
+                        *target = std::move(value);
+                        allowed = true;
+                    }
+                }, statement);
+                if (!allowed || !parameters_.empty())
+                    Fail(column, step == 1U ? "MIGRATE takes one schema statement without parameters"
+                                            : "each MIGRATE step is one schema statement without parameters");
+                if (const auto* alter = std::get_if<AlterTable>(target);
+                    alter != nullptr && std::holds_alternative<RenameTable>(alter->change))
+                    Fail(column, "MIGRATE cannot rename a table; run ALTER TABLE ... RENAME TO on its own");
+                if (Peek().kind != TokenKind::kEnd || Peek().text != ";") break;
+                if (step == kMaxMigrationSteps)
+                    Fail(Peek().column, "a migration has at most " + std::to_string(kMaxMigrationSteps) + " steps");
+                // Past the `;`, which Take keeps as the end.
+                ++next_;
+            }
+            steps_ = false;
             const auto end = line_.find_last_not_of(" \t");
             migration.text = std::string(line_.substr(start, end == std::string_view::npos ? 0U : end + 1U - start));
             return migration;
@@ -1586,6 +1614,8 @@ class Parser {
     std::deque<Token> tokens_;
     std::size_t next_ = 0;
     std::set<std::size_t> parameters_;
+    // While MIGRATE reads its steps.
+    bool steps_ = false;
 };
 
 }  // namespace
@@ -1616,6 +1646,19 @@ std::size_t CountParameterTokens(std::string_view line) noexcept {
 
 Parsed Parse(std::string_view line) {
     return Parser(line).Statement();
+}
+
+std::vector<Statement> ParseMigrationSteps(std::string_view text) {
+    const std::string line = "MIGRATE 'steps' " + std::string(text);
+    const auto parsed = Parse(line);
+    const auto& migrate = std::get<Migrate>(parsed.statement);
+    std::vector<Statement> steps;
+    const auto add = [&](const MigrationStatement& step) {
+        std::visit([&](const auto& inner) { steps.emplace_back(inner); }, step);
+    };
+    add(migrate.statement);
+    for (const auto& step : migrate.then) add(step);
+    return steps;
 }
 
 std::string AggregateFunctionName(const AggregateFunction& function) {
