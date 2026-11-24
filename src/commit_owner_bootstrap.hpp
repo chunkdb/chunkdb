@@ -106,6 +106,11 @@ class CommitOwnerDirectoryContext : public std::enable_shared_from_this<CommitOw
     std::shared_ptr<CommitOwnerArtifactIo> root_;
 };
 
+// The absolute directory owner admission names: its canonical form, or an
+// extended-length Windows path as given, which is already absolute and which
+// the runtime cannot canonicalize.
+[[nodiscard]] std::filesystem::path CommitOwnerPath(const std::filesystem::path& directory);
+
 class CommitOwnerBootstrap {
   public:
     [[nodiscard]] static std::optional<CommitOwnerBootstrapDecision> ReadPending(const std::filesystem::path& directory);

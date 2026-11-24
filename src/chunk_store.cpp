@@ -1,4 +1,14 @@
-#include "chunkdb/chunk_store.hpp"
+        (!ReadStoreManifest(data_dir_) || CommitOwnerBootstrap::ReadPending(data_dir_))) {
+        try {
+            bootstrap_lock = std::make_unique<ProcessLock>(data_dir_);
+            bootstrap_owner = bootstrap_lock.get();
+        } catch (const std::runtime_error&) {
+            // Another writer, such as one of a shared-writer store, holds the
+            // lock while it creates the store: open what it published, as an
+            // initialization that lost the race did before owners existed.
+            if (!ReadStoreManifest(data_dir_) || CommitOwnerBootstrap::ReadPending(data_dir_)) throw;
+        }
+    }#include "chunkdb/chunk_store.hpp"
 #include "feed_slots.hpp"
 #include "change_feed.hpp"
 
@@ -458,8 +468,15 @@ ChunkStore::ChunkStore(StoreConfig config)
     const auto* bootstrap_owner = process_lock_ ? process_lock_.get() : config.bootstrap_process_lock;
     if (access_mode_ == AccessMode::kReadWrite && !owner_admission_ && !bootstrap_owner &&
         (!ReadStoreManifest(data_dir_) || CommitOwnerBootstrap::ReadPending(data_dir_))) {
-        bootstrap_lock = std::make_unique<ProcessLock>(data_dir_);
-        bootstrap_owner = bootstrap_lock.get();
+        try {
+            bootstrap_lock = std::make_unique<ProcessLock>(data_dir_);
+            bootstrap_owner = bootstrap_lock.get();
+        } catch (const std::runtime_error&) {
+            // Another writer, such as one of a shared-writer store, holds the
+            // lock while it creates the store: open what it published, as an
+            // initialization that lost the race did before owners existed.
+            if (!ReadStoreManifest(data_dir_) || CommitOwnerBootstrap::ReadPending(data_dir_)) throw;
+        }
     }
     try {
         // Coordination locks live in the existing lock namespace, excluded

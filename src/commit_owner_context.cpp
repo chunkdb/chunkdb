@@ -1,11 +1,14 @@
 #include "commit_owner_bootstrap.hpp"
 
 #include <array>
+#include <optional>
 #include <set>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <utility>
 
+#include "backup.hpp"
 #include "chunkdb/table_catalog.hpp"
 
 namespace chunkdb {
@@ -101,27 +104,39 @@ StoreManifest CommitOwnerStoreAdmission::ReadCurrentManifest() const {
 }
 
 void CommitOwnerStoreAdmission::Validate(const std::filesystem::path& directory) {
-    if (!table_->MatchesDirectory(std::filesystem::weakly_canonical(directory))) Bad("store directory generation differs from its admission");
+    if (!table_->MatchesDirectory(CommitOwnerPath(directory))) Bad("store directory generation differs from its admission");
     manifest_ = ReadCurrentManifest();
 }
 
 std::shared_ptr<const CommitOwnerDirectoryContext> CommitOwnerBootstrap::AdmitDirectory(const std::filesystem::path& directory,
     AccessMode access_mode) {
-    const auto path = std::filesystem::weakly_canonical(directory);
+    const auto path = CommitOwnerPath(directory);
     const auto initial = ReadDataDirManifest(path);
     if (!initial) Bad("catalog manifest is missing");
     RequireOpenableFeatures(initial->features, access_mode);
     if (!Grouped(initial->features)) {
         if (std::filesystem::symlink_status(path / "chunkdb.groups.owner").type() != std::filesystem::file_type::not_found)
             Bad("unclaimed canonical owner exists");
-        const auto view = CommitOwnerArtifactIo::OpenBootstrapDirectory(path);
+        // An ungrouped catalog keeps the pathname rules it had before owners:
+        // an entry of tables/ that is not a plain directory, or that has no
+        // manifest, is left for table opening, which skips it with a warning.
         std::set<StoreId> epochs;
-        for (const auto& name : view->CatalogTableNames()) {
-            const std::array<std::string, 2U> components{"tables", name};
-            const auto table = view->PinDirectories(components);
-            const auto bytes = table->ReadManifestBytes(false);
-            if (!bytes) Bad("managed table manifest is missing");
-            const auto manifest = ParseStoreManifest(*bytes);
+        std::error_code listed;
+        for (const auto& entry : std::filesystem::directory_iterator(path / "tables", listed)) {
+            const auto name = entry.path().filename().string();
+            std::error_code inspected;
+            if (!IsValidTableName(name) || std::filesystem::symlink_status(entry.path(), inspected).type() !=
+                    std::filesystem::file_type::directory) continue;
+            std::optional<StoreManifest> read;
+            try {
+                read = ReadStoreManifest(entry.path());
+            } catch (const std::invalid_argument&) {
+                continue;  // Table opening reports the damaged manifest.
+            } catch (const std::runtime_error&) {
+                continue;
+            }
+            if (!read) continue;
+            const auto& manifest = *read;
             if (Grouped(manifest.features)) Bad("table claims an owner absent from its directory");
             if (!epochs.insert(manifest.store_id).second) Bad("duplicate table epoch in catalog inventory");
             RequireTableFeatures(name, manifest.features, access_mode);
@@ -151,7 +166,7 @@ std::shared_ptr<const CommitOwnerDirectoryContext> CommitOwnerBootstrap::AdmitDi
 }
 
 void CommitOwnerBootstrap::ValidateManagedDirectories(const std::filesystem::path& directory) {
-    const auto view = CommitOwnerArtifactIo::OpenBootstrapDirectory(std::filesystem::weakly_canonical(directory));
+    const auto view = CommitOwnerArtifactIo::OpenBootstrapDirectory(CommitOwnerPath(directory));
     (void)view->CatalogTableNames();
 }
 
@@ -192,7 +207,10 @@ std::vector<std::uint8_t> CommitOwnerBootstrap::ReadInactiveRoot(const std::file
 
 std::unique_ptr<CommitOwnerStoreAdmission> CommitOwnerBootstrap::BeginStoreAdmission(const StoreConfig& config) {
     if (config.data_dir.empty()) throw std::invalid_argument("data_dir must not be empty");
-    const auto path = std::filesystem::weakly_canonical(config.data_dir);
+    // A backup or an incomplete restore is refused before any owner admission,
+    // as store opening refused it before owners existed.
+    RequireNotBackupDirectory(config.data_dir, config.access_mode);
+    const auto path = CommitOwnerPath(config.data_dir);
     if (config.commit_owner_context) return config.commit_owner_context->Consume(path);
     const auto initial = ReadStoreManifest(path);
     if (!initial) {

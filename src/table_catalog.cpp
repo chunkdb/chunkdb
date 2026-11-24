@@ -1260,8 +1260,19 @@ void TableCatalog::OpenDataDirManifest() {
         }
         std::unique_ptr<ProcessLock> bootstrap;
         const auto* owner = process_lock_.get();
-        if (!owner) { bootstrap = std::make_unique<ProcessLock>(data_dir); owner = bootstrap.get(); }
-        manifest = CommitOwnerBootstrap::InitializeDirectory(data_dir, *owner);
+        if (!owner) {
+            try {
+                bootstrap = std::make_unique<ProcessLock>(data_dir);
+                owner = bootstrap.get();
+            } catch (const std::runtime_error&) {
+                // Another writer holds the lock while it creates the directory:
+                // open what it published, as an initialization that lost the
+                // race did before owners existed.
+                manifest = ReadDataDirManifest(data_dir);
+                if (!manifest || CommitOwnerBootstrap::ReadPending(data_dir)) throw;
+            }
+        }
+        if (owner) manifest = CommitOwnerBootstrap::InitializeDirectory(data_dir, *owner);
     }
     try {
         RequireOpenableFeatures(manifest->features, config_.access_mode);

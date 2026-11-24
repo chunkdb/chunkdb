@@ -48,6 +48,7 @@ Bytes Crc(Bytes bytes) {
 }
 StoreManifest StandaloneManifest() {
     StoreManifest manifest;
+    manifest.features.incompat |= kFeatureCommitGroups;
     manifest.geometry = {1U, 1U, 2U, 2U, 8U}; manifest.store_id = {11U};
     manifest.schema = SingleBitsColumnSchema(8U);
     manifest.commit_owner = CommitOwnerScope{manifest.store_id, {12U}, CommitOwnerRole::kStandalone};
@@ -121,6 +122,19 @@ void BorrowedAndShortBootstrapOwnership() {
     shared.background_maintenance = false;
     { ChunkStore store(shared); assert(ReadStoreManifest(shared_root)->commit_owner); }
     { ProcessLock available_after_constructor(shared_root); }
+    // Fresh creation while another holder has the lock and lends none refuses
+    // without artifacts; once the holder published the store, it opens.
+    const auto held_root = temporary.path() / "held";
+    std::filesystem::create_directory(held_root);
+    ProcessLock holder(held_root);
+    StoreConfig unlent; unlent.data_dir = held_root; unlent.acquire_process_lock = false;
+    unlent.background_maintenance = false;
+    Reject([&] { ChunkStore refused(unlent); });
+    for (const auto* name : {"table.manifest", "chunkdb.groups.owner", "chunkdb.bootstrap.pending"})
+        assert(!std::filesystem::exists(held_root / name));
+    auto lent = unlent; lent.bootstrap_process_lock = &holder;
+    { ChunkStore created(lent); }
+    { ChunkStore reopened(unlent); assert(ReadStoreManifest(held_root)->commit_owner); }
 }
 
 void CatalogContextsAndSingleUse() {

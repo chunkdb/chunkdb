@@ -64,7 +64,7 @@ void ManifestDomainsAndAdmission() {
         status.type = {ColumnKind::kUnsigned, 8};
         chunks = AddChunkColumn(chunks, status);
         blocks = AdvanceOtherDomain(blocks, ColumnDomain::kBlock);
-        const StoreManifest manifest{.features = kFeatures, .geometry = geometry.config(), .store_id = kEpoch, .options = {},
+        const StoreManifest manifest{.geometry = geometry.config(), .store_id = kEpoch, .options = {},
             .schema = blocks, .chunk_schema = chunks};
         const auto bytes = SerializeStoreManifest(manifest);
         assert(ReadLe16(bytes, 4U) == 5 && bytes[20] == dims);
@@ -96,8 +96,7 @@ void ManifestDomainsAndAdmission() {
         misaligned.chunk_schema = TableSchema{};
         Reject([&] { (void)SerializeStoreManifest(misaligned); }, "revisions differ");
     }
-    const DataDirManifest directory{.data_dir_id = kEpoch, .options = {},
-        .commit_owner = CommitOwnerScope{kEpoch, {2U}, CommitOwnerRole::kCatalog}};
+    const DataDirManifest directory{.data_dir_id = kEpoch, .options = {}};
     auto bytes = SerializeDataDirManifest(directory);
     assert(ReadLe16(bytes, 4U) == 2U && ReadLe32(bytes, 8U) == kChunkModelFormatBit);
     assert(ParseDataDirManifest(bytes).data_dir_id == kEpoch);
@@ -162,7 +161,7 @@ void ImageAndWalRuntimeReaders() {
 void EarlierManifestLeavesDirectoryUntouched() {
     test::ScopedTempDir directory("chunkdb-earlier-manifest");
     const auto geometry = Shape(2);
-    auto bytes = SerializeStoreManifest(StoreManifest{.features = kFeatures, .geometry = geometry.config(), .store_id = kEpoch, .options = {},
+    auto bytes = SerializeStoreManifest(StoreManifest{.geometry = geometry.config(), .store_id = kEpoch, .options = {},
         .schema = geometry.layout().schema()});
     At(&bytes, 4U, 4U, 2U);
     Save(StoreManifestPath(directory.path()), bytes);

@@ -53,6 +53,8 @@ A reader or writer must support every recorded incompatibility bit, even when it
 To use a binary lacking a feature, restore the whole consistent backup identified above.
 Use a restore tool that supports that backup's recorded features; current restore requires `table_lineage` in its source tables.
 Dropping records or manually clearing masks does not establish a supported rollback.
+In a directory with `commit_groups`, an entry of `tables/` with a table name that is a symlink or junction refuses opening; a directory without the feature still skips it with a warning.
+A directory or standalone store that has no manifest and holds `chunkdb.manifest.tmp.*`, `table.manifest.tmp.*` or `chunkdb.index.tmp.*` files without a creation decision, such as those left by a crash of an earlier build, refuses opening and keeps them; remove them, or the whole directory, to create it again.
 New directories already enable these initial features; an older binary must support their masks to open them.
 
 Restore records the immediate parent epoch and completed backup cut, preserving committed revision values within a new epoch.

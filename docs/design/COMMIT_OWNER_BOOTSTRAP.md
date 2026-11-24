@@ -7,7 +7,7 @@ ACTIVE and PENDING publication, complete reference-tree authorization and groupe
 ## Manifest ownership
 
 The existing table and directory manifest envelopes retain their tags because the `commit_groups` incompatibility bit owns the added fields.
-A table adds option TLV 12 and a directory adds option TLV 2, each containing the exact checked 40-byte [owner scope](COMMIT_GROUP_OWNER_FORMAT.md).
+A table adds option TLV 16 and a directory adds option TLV 2, each containing the exact checked 40-byte [owner scope](COMMIT_GROUP_OWNER_FORMAT.md).
 Each option occurs once and is mandatory exactly when bit 64 is present; a known scope without its feature, duplicate scope, wrong length, zero identity or invalid role refuses.
 Unknown compatible features cannot exempt these known-field checks.
 The parsed scope is owned separately from mutable options, so option, schema, lineage and version-floor rewrites preserve it without duplicating its TLV.
@@ -160,7 +160,7 @@ The exact copied source-root generation is admitted and file-synced through the 
 That outcome owns bounded diagnostic bytes and has nonallocating, noexcept construction, copy and `what`, so allocation failure while establishing or formatting native identity cannot restore pathname cleanup authority.
 Other restore failures keep the existing native cleanup policy, and this boundary does not claim protection against arbitrary same-user namespace changes throughout ordinary restore I/O.
 ACTIVE/PENDING restore, grouped history, IDs, tags, split decisions and owner-reference rewriting require the separate complete recovery/restore owner and are explicitly refused by this INACTIVE-only component.
-Offline verification checks directory/root/table context before chunk replay, rejects isolated catalog-table verification without directory context and never initializes a missing owner.
+Offline verification checks directory, root and table context before chunk replay and never initializes a missing owner; a table verified without its directory, as RESTORE TABLE does for its staged copy, is checked against its own manifest scope only.
 
 ## Failure checks
 

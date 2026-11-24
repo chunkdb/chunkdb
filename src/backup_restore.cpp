@@ -9,6 +9,7 @@
 #include <system_error>
 
 #include "checkpoint.hpp"
+#include "chunkdb/logging.hpp"
 #include "file_permissions.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "feature_flags.hpp"
@@ -307,6 +308,13 @@ void RestoreBackup(const std::filesystem::path& source, const std::filesystem::p
     } catch (const CommitOwnerRestoreOwnershipError&) {
         // The detected replacement is not our private tree to clean up.
         // Retain the guard/name and preserve the original ownership failure.
+        try {
+            LogMessage(LogLevel::kWarn, LogComponent::kStore,
+                "restore kept its private copy because the copy no longer admits its name",
+                {{"path", temporary.string()}});
+        } catch (const std::exception&) {
+            // The log line is best effort; the ownership failure is reported.
+        }
         throw;
     } catch (const std::exception& failure) {
         if (!moved) {

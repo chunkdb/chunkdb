@@ -351,7 +351,12 @@ struct StoreConfig {
     QueryLimits query_limits{};
     // Opaque catalog admission; never a caller-supplied scope value.
     std::shared_ptr<const CommitOwnerContext> commit_owner_context{};
-    // Borrowed only during fresh standalone initialization when locking is delegated.
+    // Borrowed only during fresh standalone initialization when locking is
+    // delegated. Without it, a store opened with acquire_process_lock=false or
+    // allow_multiple_processes takes a short exclusive lock to create a new
+    // directory; when another holder has that lock, the store opens what the
+    // holder has published, and refuses while its creation is unfinished, so a
+    // caller that holds its own lock passes it here.
     const ProcessLock* bootstrap_process_lock = nullptr;
 };
 

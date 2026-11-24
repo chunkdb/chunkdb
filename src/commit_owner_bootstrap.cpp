@@ -1,9 +1,29 @@
+    const auto name = private_copy.filename().string();
+    constexpr std::string_view prefix = ".chunkdb.restore.";
+    if (!name.starts_with(prefix) || name.size() != prefix.size() + 32U ||
+        !std::all_of(name.begin() + static_cast<std::ptrdiff_t>(prefix.size()), name.end(), [](char byte) {
+            return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+        })) throw CommitOwnerRestoreOwnershipError("restore copy has no private operation name");
+    std::shared_ptr<CommitOwnerArtifactIo> pinned;
+    try {
+        pinned = CommitOwnerArtifactIo::OpenBootstrapDirectory(private_copy);
+    } catch (const std::exception& error) {
+        // Only a name that no longer reaches a plain directory is an ownership
+        // failure; any other error, such as a descriptor limit, takes the
+        // ordinary restore cleanup.
+        std::error_code inspected;
+        const auto status = std::filesystem::symlink_status(private_copy, inspected);
+        if (!inspected && status.type() == std::filesystem::file_type::directory) throw;
+        throw CommitOwnerRestoreOwnershipError(error.what());
+    }
 #include "commit_owner_bootstrap.hpp"
 
 #include <algorithm>
 #include <cstdlib>
 #include <sstream>
 #include <stdexcept>
+#include <string_view>
+#include <system_error>
 
 #include "checkpoint.hpp"
 #include "backup.hpp"
@@ -69,8 +89,15 @@ void RequireInitialRoot(const std::optional<CommitOwnerRootArtifact>& selected, 
 }
 }  // namespace
 
+std::filesystem::path CommitOwnerPath(const std::filesystem::path& directory) {
+#ifdef _WIN32
+    if (directory.native().starts_with(L"\\\\?\\")) return directory;
+#endif
+    return std::filesystem::weakly_canonical(directory);
+}
+
 std::optional<CommitOwnerBootstrapDecision> CommitOwnerBootstrap::ReadPending(const std::filesystem::path& directory) {
-    const auto path = std::filesystem::weakly_canonical(directory);
+    const auto path = CommitOwnerPath(directory);
     const auto status = std::filesystem::symlink_status(path);
     if (status.type() == std::filesystem::file_type::not_found) return {};
     const auto view = CommitOwnerArtifactIo::OpenBootstrapDirectory(path);
@@ -133,7 +160,7 @@ StoreManifest CommitOwnerBootstrap::InitializeStandalone(const std::filesystem::
 
 std::optional<StoreId> CommitOwnerBootstrap::UnpublishedEmptyIdentity(const std::filesystem::path& directory,
     std::uint8_t dims) {
-    const auto path = std::filesystem::weakly_canonical(directory);
+    const auto path = CommitOwnerPath(directory);
     if (std::filesystem::symlink_status(path).type() == std::filesystem::file_type::not_found) return {};
     auto view = CommitOwnerArtifactIo::OpenBootstrapDirectory(path);
     const auto bytes = view->ReadEmptyInventoryBytes();
@@ -200,16 +227,24 @@ void CommitOwnerBootstrap::CompleteFeatureOwner(const std::filesystem::path& dir
 
 DataDirManifest CommitOwnerBootstrap::RewriteInactiveRestore(const std::filesystem::path& private_copy,
     const BackupRecord& admitted_backup) {
+    const auto name = private_copy.filename().string();
+    constexpr std::string_view prefix = ".chunkdb.restore.";
+    if (!name.starts_with(prefix) || name.size() != prefix.size() + 32U ||
+        !std::all_of(name.begin() + static_cast<std::ptrdiff_t>(prefix.size()), name.end(), [](char byte) {
+            return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
+        })) throw CommitOwnerRestoreOwnershipError("restore copy has no private operation name");
     std::shared_ptr<CommitOwnerArtifactIo> pinned;
     try {
-        const auto name = private_copy.filename().string();
-        constexpr std::string_view prefix = ".chunkdb.restore.";
-        if (!name.starts_with(prefix) || name.size() != prefix.size() + 32U ||
-            !std::all_of(name.begin() + static_cast<std::ptrdiff_t>(prefix.size()), name.end(), [](char byte) {
-                return (byte >= '0' && byte <= '9') || (byte >= 'a' && byte <= 'f');
-            })) Bad("restore copy has no private operation name");
         pinned = CommitOwnerArtifactIo::OpenBootstrapDirectory(private_copy);
-    } catch (const std::exception& error) { throw CommitOwnerRestoreOwnershipError(error.what()); }
+    } catch (const std::exception& error) {
+        // Only a name that no longer reaches a plain directory is an ownership
+        // failure; any other error, such as a descriptor limit, takes the
+        // ordinary restore cleanup.
+        std::error_code inspected;
+        const auto status = std::filesystem::symlink_status(private_copy, inspected);
+        if (!inspected && status.type() == std::filesystem::file_type::directory) throw;
+        throw CommitOwnerRestoreOwnershipError(error.what());
+    }
     pinned->RequireRestoreGuard();
     ValidateBackupContents(private_copy, admitted_backup);
     const auto bytes = pinned->ReadManifestBytes(true);

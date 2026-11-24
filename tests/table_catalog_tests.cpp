@@ -103,6 +103,36 @@ std::string ReadBits(TableCatalog& catalog, const std::string& table, std::int64
     return lease->store().GetBlockBits(x, y);
 }
 
+// An entry of tables/ with a table name that is a symlink is skipped with a
+// warning in a catalog without commit_groups, as before owners existed, and
+// refuses opening in a catalog with them.
+void TestSymlinkedTableEntry() {
+#ifndef _WIN32
+    chunkdb::test::ScopedTempDir ungrouped("chunkdb-catalog-link-ungrouped");
+    const auto plain = std::filesystem::canonical(ungrouped.path());
+    chunkdb::DataDirManifest manifest{.data_dir_id = chunkdb::NewStoreId(), .options = {}};
+    {
+        const auto bytes = chunkdb::SerializeDataDirManifest(manifest);
+        std::ofstream out(chunkdb::DataDirManifestPath(plain), std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    std::filesystem::create_directories(plain / "tables");
+    std::filesystem::create_directories(plain / "elsewhere");
+    std::filesystem::create_directory_symlink(plain / "elsewhere", plain / "tables" / "linked");
+    {
+        TableCatalog catalog(Config(plain));
+        assert(catalog.Find("linked") == nullptr);
+    }
+    chunkdb::test::ScopedTempDir grouped("chunkdb-catalog-link-grouped");
+    const auto owned = std::filesystem::canonical(grouped.path());
+    { TableCatalog catalog(Config(owned)); }
+    assert((chunkdb::ReadDataDirManifest(owned)->features.incompat & chunkdb::kFeatureCommitGroups) != 0U);
+    std::filesystem::create_directories(owned / "elsewhere");
+    std::filesystem::create_directory_symlink(owned / "elsewhere", owned / "tables" / "linked");
+    assert(Contains(ErrorOf([&] { TableCatalog catalog(Config(owned)); }), "redirected managed table directory"));
+#endif
+}
+
 void TestNewDataDirectoryStartsEmpty() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-new");
     {
@@ -1348,6 +1378,7 @@ int main(int argc, char** argv) {
     chunkdb::SetLogLevel(chunkdb::LogLevel::kWarn);
     TestConditionalCatalogOperations();
     TestNewDataDirectoryStartsEmpty();
+    TestSymlinkedTableEntry();
     TestTablesWithDifferentGeometry();
     TestTableNames();
     TestCreateUndoneWhenNotDurable();

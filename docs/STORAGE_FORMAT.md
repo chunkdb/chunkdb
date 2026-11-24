@@ -159,7 +159,7 @@ Options use the same TLV layout as the root manifest:
 | 9 | retained byte limit per durable slot `u64`, positive | current catalog/server default (1073741824 unless configured) |
 | 10 | immediate restore parent epoch, 16 nonzero bytes | absent |
 | 11 | completed fork revision `u64`, including zero | absent |
-| 12 | immutable 40-byte commit-owner scope | required exactly with `commit_groups` |
+| 16 | immutable 40-byte commit-owner scope | required exactly with `commit_groups` |
 
 Catalog tables repeat their directory's exact scope and require its admitted directory context when opened.
 A standalone table uses role 1 with its own `store_id` as the scope's directory identity; opening an isolated catalog table does not infer standalone ownership.
