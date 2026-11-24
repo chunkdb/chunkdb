@@ -776,6 +776,8 @@ bool IdleIo::Progress(ServerConnection& connection) {
     }
     if (connection.phase == Phase::kReply) return Write(connection);
     if (connection.phase != Phase::kInput) return true;
+    // Lines read with WATCH belong to the watch stream: Serve hands them to the feed reader.
+    if (connection.session.watch || connection.session.slot_watch) return true;
     if (connection.waiting_line_credit) {
         auto credit = TakeLineCredit(connection);
         if (!credit) return true;

@@ -240,6 +240,10 @@ class Table : public std::enable_shared_from_this<Table> {
     // Waits while the table is being reopened. std::nullopt once it was
     // dropped: a table of the same name created later is another table.
     [[nodiscard]] std::optional<Lease> Acquire();
+    // Never waits: std::nullopt while the table is not open, as while an
+    // exclusive statement holds or waits for it, after a failure, or once it
+    // was dropped.
+    [[nodiscard]] std::optional<Lease> TryAcquire();
 
     [[nodiscard]] std::unique_ptr<FeedSubscription> SubscribeFeed(const FeedOptions& options = {});
     [[nodiscard]] std::size_t FeedBufferBytes() const noexcept { return effective_feed_buffer_bytes_.load(std::memory_order_acquire); }
