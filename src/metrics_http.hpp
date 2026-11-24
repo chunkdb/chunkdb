@@ -61,7 +61,8 @@ struct MetricsRequest {
 // time, and requests that arrive while a scrape runs share its result. A
 // request head must arrive within `timeout_ms` of the connection and fit
 // kMetricsMaxRequestBytes, its scrape must finish within `timeout_ms` (503
-// otherwise), and the response must be written within `timeout_ms`.
+// with `timeout_body` otherwise), and the response must be written within
+// `timeout_ms`.
 class MetricsHttpListener {
   public:
     // Binds and starts serving; throws std::runtime_error when the address
@@ -71,7 +72,8 @@ class MetricsHttpListener {
         std::uint16_t port,
         bool allow_remote,
         std::size_t timeout_ms,
-        MetricsRender render);
+        MetricsRender render,
+        std::string timeout_body = {});
     // Closes every connection, stops the render and joins both threads
     // without waiting for clients.
     ~MetricsHttpListener();
@@ -94,6 +96,7 @@ class MetricsHttpListener {
 
     std::size_t timeout_ms_;
     MetricsRender render_;
+    std::string timeout_body_;
     SocketHandle listen_socket_ = kInvalidSocket;
     std::uint16_t port_ = 0;
     std::unique_ptr<SocketPoller> poller_;

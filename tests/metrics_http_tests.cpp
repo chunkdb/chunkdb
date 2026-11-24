@@ -274,7 +274,7 @@ void TestSlowRender() {
         std::unique_lock lock(mutex);
         (void)released_cv.wait(lock, stop, [&] { return released; });
         return MetricsScrape{.available = true, .body = kBody};
-    });
+    }, "chunkdb_up 0\n");
     const auto port = listener->port();
     std::vector<std::unique_ptr<Client>> waiting;
     for (int i = 0; i < 3; ++i) {
@@ -300,7 +300,9 @@ void TestSlowRender() {
         released = false;
     }
     const auto started = Clock::now();
-    assert(StatusLine(Exchange(port, "GET /metrics HTTP/1.1\r\n\r\n")) == "HTTP/1.1 503 Service Unavailable");
+    const auto timed_out = Exchange(port, "GET /metrics HTTP/1.1\r\n\r\n");
+    assert(StatusLine(timed_out) == "HTTP/1.1 503 Service Unavailable");
+    assert(BodyOf(timed_out) == "chunkdb_up 0\n");
     assert(Clock::now() - started >= std::chrono::milliseconds(1900));
     // Still running: stopping requests its stop and does not wait for a release.
     Client pending(port);

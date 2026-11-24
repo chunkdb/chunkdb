@@ -14,6 +14,10 @@
 #include "scram.hpp"
 #include "server_socket.hpp"
 
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
+
 #ifdef CHUNKDB_WITH_OPENSSL
 #include <openssl/err.h>
 #include <openssl/ssl.h>
@@ -63,6 +67,14 @@ struct Value {
 std::string ReadPasswordFile(const std::string& path) {
     std::ifstream input(path, std::ios::binary);
     if (!input) throw std::runtime_error("cannot open the password file " + path);
+#ifndef _WIN32
+    struct stat status {};
+    if (::stat(path.c_str(), &status) != 0) throw std::runtime_error("cannot read the mode of the password file " + path);
+    if ((status.st_mode & 077) != 0) {
+        throw std::runtime_error("the password file " + path +
+                                 " is accessible by group or others; make it readable by its owner only (chmod 600)");
+    }
+#endif
     std::string password;
     std::getline(input, password);
     if (!password.empty() && password.back() == '\r') password.pop_back();
@@ -335,6 +347,14 @@ struct ChunkConnection::State {
         }
     }
 
+    // Frees the input buffer after a large reply once it is all read.
+    void Compact() {
+        if (consumed != input.size()) return;
+        consumed = 0;
+        if (input.capacity() > (1U << 20U)) std::string().swap(input);
+        else input.clear();
+    }
+
     std::string ReadLine() {
         for (;;) {
             const auto end = input.find("\r\n", consumed);
@@ -477,6 +497,7 @@ std::string ChunkConnection::Query(std::string_view statement, Clock::time_point
     state_->Send(std::string(statement) + "\r\n");
     const auto reply = state_->Read();
     if (reply.type != '$' && reply.type != '+') Refused(reply, std::string(statement) + " refused");
+    state_->Compact();
     return reply.text;
 }
 
@@ -484,30 +505,65 @@ Exporter::Exporter(ExporterOptions options) : options_(std::move(options)) {}
 
 Exporter::~Exporter() = default;
 
+namespace {
+
+// After a failed connect or login: the first wait before the next, doubled
+// after each failure up to the last.
+constexpr std::chrono::milliseconds kFirstBackoff{1000};
+constexpr std::chrono::milliseconds kMaxBackoff{30000};
+
+constexpr std::string_view kUpHeader =
+    "# HELP chunkdb_up Whether chunkdb_exporter read the server's metrics in this scrape.\n"
+    "# TYPE chunkdb_up gauge\n";
+
+}  // namespace
+
+std::string DownBody() {
+    return std::string(kUpHeader) + "chunkdb_up 0\n";
+}
+
 server_detail::MetricsScrape Exporter::Scrape(std::stop_token stop) {
-    constexpr std::string_view kUpHeader =
-        "# HELP chunkdb_up Whether chunkdb_exporter read the server's metrics in this scrape.\n"
-        "# TYPE chunkdb_up gauge\n";
     const auto deadline = Clock::now() + options_.timeout;
-    try {
-        if (connection_ == nullptr) connection_ = std::make_unique<ChunkConnection>(options_, deadline, stop);
-        auto body = connection_->Query("SHOW METRICS", deadline, stop);
-        if (!up_) LogMessage(LogLevel::kInfo, LogComponent::kServer, "reading the server's metrics again");
-        up_ = true;
-        if (!body.empty() && body.back() != '\n') body += '\n';
-        body += kUpHeader;
-        body += "chunkdb_up 1\n";
-        return {.available = true, .body = std::move(body)};
-    } catch (const std::exception& error) {
-        // An error reply leaves the connection usable; anything else ends it.
-        if (dynamic_cast<const ServerReplyError*>(&error) == nullptr) connection_.reset();
-        if (up_) {
-            LogMessage(LogLevel::kWarn, LogComponent::kServer, "cannot read the server's metrics",
-                       {{"error", error.what()}});
+    const server_detail::MetricsScrape down{.available = false, .body = DownBody()};
+    // After a failed connect or login, none again before retry_at_.
+    if (connection_ == nullptr && Clock::now() < retry_at_) return down;
+    std::string failure;
+    for (int attempt = 0; attempt < 2; ++attempt) {
+        const bool reused = connection_ != nullptr;
+        try {
+            if (!reused) {
+                try {
+                    connection_ = std::make_unique<ChunkConnection>(options_, deadline, stop);
+                } catch (...) {
+                    backoff_ = backoff_.count() == 0 ? kFirstBackoff : std::min(backoff_ * 2, kMaxBackoff);
+                    retry_at_ = Clock::now() + backoff_;
+                    throw;
+                }
+            }
+            auto body = connection_->Query("SHOW METRICS", deadline, stop);
+            backoff_ = std::chrono::milliseconds::zero();
+            if (!up_) LogMessage(LogLevel::kInfo, LogComponent::kServer, "reading the server's metrics again");
+            up_ = true;
+            if (!body.empty() && body.back() != '\n') body += '\n';
+            body += kUpHeader;
+            body += "chunkdb_up 1\n";
+            return {.available = true, .body = std::move(body)};
+        } catch (const ServerReplyError& error) {
+            // A refused statement leaves the connection usable.
+            failure = error.what();
+            break;
+        } catch (const std::exception& error) {
+            failure = error.what();
+            connection_.reset();
+            // A kept connection may have been closed by the server's idle
+            // timeout or a restart: one fresh connection, in the same time.
+            if (reused && !stop.stop_requested() && Clock::now() < deadline) continue;
+            break;
         }
-        up_ = false;
-        return {.available = false, .body = std::string(kUpHeader) + "chunkdb_up 0\n"};
     }
+    if (up_) LogMessage(LogLevel::kWarn, LogComponent::kServer, "cannot read the server's metrics", {{"error", failure}});
+    up_ = false;
+    return down;
 }
 
 }  // namespace chunkdb::exporter

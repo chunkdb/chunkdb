@@ -1,4 +1,4 @@
-# Export metrics to Prometheus
+| `--password-file` | required with a user | A file whose first line is the user's password, readable by its owner only (mode 0600); it is read again at each login. |# Export metrics to Prometheus
 
 The server serves no HTTP.
 `chunkdb_exporter` logs in to a server, reads [SHOW METRICS](reference/SERVER.md) on each scrape and serves the text at `GET /metrics` for Prometheus.
@@ -10,6 +10,7 @@ Create a user with the MONITOR right, which reads metrics and status and nothing
 
 ```sh
 chunk-cli --uri "$CHUNKDB_URI" --new-password-file monitor.password "CREATE USER monitor PASSWORD"
+chmod 600 monitor.password
 chunk-cli --uri "$CHUNKDB_URI" "GRANT MONITOR ON * TO monitor"
 ```
 
@@ -50,11 +51,14 @@ SIGTERM or SIGINT stops the exporter.
 
 ## Scrapes
 
-The exporter keeps one connection and logs in again after it fails, so a server restart needs no action.
+The exporter keeps one connection between scrapes.
+When a kept connection fails, as after the server's `--idle-connection-timeout-ms` or a restart, the same scrape opens a new one.
+After a failed connect or login the exporter does not try again for 1 second, doubled after each failure up to 30 seconds, and answers scrapes meanwhile with `chunkdb_up 0`.
 Each response appends `chunkdb_up`: 1 with the server's metrics, or 0 alone with status `503` when the server cannot be reached, refuses the login or refuses SHOW METRICS.
 The exporter logs the reason when scrapes start failing and when they work again.
 Scrapes that arrive while one runs share its result.
-SHOW METRICS leaves out a table that an exclusive statement such as ALTER TABLE holds or waits for, and a fenced table.
+SHOW METRICS leaves out a table that is not serving at that moment: one that an exclusive statement such as ALTER TABLE holds or waits for, one whose change feed cleanup failed until RECOVER TABLE, or one being dropped.
+Resolving the URI's host does not observe `--timeout-ms`: a scrape that waits on DNS answers `503` with `chunkdb_up 0` when the timeout passes, and stopping the exporter waits for that lookup.
 
 `HEAD /metrics` returns the headers of `GET /metrics`.
 Other paths get `404`, other methods `405` with `Allow: GET, HEAD`, and a malformed request `400`.
@@ -65,9 +69,11 @@ The listener holds at most 16 connections; a slow client delays no other one.
 
 The HTTP endpoint has no authentication and no TLS: anyone who reaches it reads the metrics, table names included.
 It listens on loopback by default; with `--allow-remote`, bind it to a private address or put a TLS proxy in front of it.
-Keep the password file readable only by the exporter's user.
+On Linux and macOS the exporter refuses a password file that its group or others can access.
 
 ## Docker
+
+The container runs as the image's `chunkdb` user, which must own the password file with mode 0600; find its IDs with `docker run --rm --entrypoint id ghcr.io/chunkdb/chunkdb:2`.
 
 ```sh
 docker run -d --name chunkdb-exporter --network host \

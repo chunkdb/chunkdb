@@ -170,7 +170,7 @@ int main(int argc, char** argv) {
         // bare timeout.
         chunkdb::server_detail::MetricsHttpListener listener(
             host, port, allow_remote, static_cast<std::size_t>(timeout.count()) + 1000U,
-            [&exporter](std::stop_token stop) { return exporter.Scrape(stop); });
+            [&exporter](std::stop_token stop) { return exporter.Scrape(stop); }, chunkdb::exporter::DownBody());
         chunkdb::LogMessage(chunkdb::LogLevel::kInfo, chunkdb::LogComponent::kServer, "serving metrics",
                             {{"listen", listen}});
 #ifdef _WIN32

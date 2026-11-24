@@ -120,6 +120,10 @@ bool IsAbortedAccept(int code) {
 #endif
 }
 
+std::shared_ptr<const std::string> Shared(std::string response) {
+    return std::make_shared<const std::string>(std::move(response));
+}
+
 // Whether a failed nonblocking call only has to wait for readiness again.
 bool ShouldRetry(int code) {
 #ifdef _WIN32
@@ -140,7 +144,8 @@ struct MetricsHttpListener::Connection {
     // The end of the current phase.
     Clock::time_point deadline;
     std::string head;
-    std::string response;
+    // Shared by the connections that wait for the same scrape.
+    std::shared_ptr<const std::string> response;
     std::size_t written = 0;
     bool head_only = false;
     std::uint64_t generation = 0;
@@ -193,8 +198,9 @@ MetricsHttpListener::MetricsHttpListener(
     std::uint16_t port,
     bool allow_remote,
     std::size_t timeout_ms,
-    MetricsRender render)
-    : timeout_ms_(timeout_ms), render_(std::move(render)) {
+    MetricsRender render,
+    std::string timeout_body)
+    : timeout_ms_(timeout_ms), render_(std::move(render)), timeout_body_(std::move(timeout_body)) {
     listen_socket_ = CreateListenSocket(host, port);
     try {
         sockaddr_storage bound{};
@@ -285,7 +291,7 @@ void MetricsHttpListener::Loop() {
     auto accept_paused_until = Clock::time_point::min();
     bool accept_failing = false;
     std::string failure;
-    const auto respond = [&](Connection* connection, std::string response) {
+    const auto respond = [&](Connection* connection, std::shared_ptr<const std::string> response) {
         connection->response = std::move(response);
         connection->written = 0;
         connection->phase = Connection::Phase::kWrite;
@@ -318,10 +324,13 @@ void MetricsHttpListener::Loop() {
                     done = render_done_;
                     result = render_result_;
                 }
+                std::shared_ptr<const std::string> full;
+                std::shared_ptr<const std::string> head;
                 for (auto& connection : connections) {
-                    if (connection.phase == Connection::Phase::kRender && connection.generation <= done) {
-                        respond(&connection, MetricsResponse(*result, connection.head_only));
-                    }
+                    if (connection.phase != Connection::Phase::kRender || connection.generation > done) continue;
+                    auto& shared = connection.head_only ? head : full;
+                    if (!shared) shared = Shared(MetricsResponse(*result, connection.head_only));
+                    respond(&connection, shared);
                 }
             }
 
@@ -334,9 +343,10 @@ void MetricsHttpListener::Loop() {
                 auto& connection = connections[i];
                 if (now < connection.deadline) continue;
                 if (connection.phase == Connection::Phase::kRead) {
-                    respond(&connection, ErrorResponse("408 Request Timeout"));
+                    respond(&connection, Shared(ErrorResponse("408 Request Timeout")));
                 } else if (connection.phase == Connection::Phase::kRender) {
-                    respond(&connection, ErrorResponse("503 Service Unavailable"));
+                    respond(&connection, Shared(MetricsResponse(
+                        MetricsScrape{.available = false, .body = timeout_body_}, connection.head_only)));
                 } else {
                     keep[i] = false;
                 }
@@ -449,7 +459,7 @@ bool MetricsHttpListener::Advance(Connection* connection) {
             if (received == 0) {
                 // A client that closes before sending anything gets nothing.
                 if (connection->head.empty()) return false;
-                connection->response = ErrorResponse("400 Bad Request");
+                connection->response = Shared(ErrorResponse("400 Bad Request"));
             } else {
                 connection->head.append(buffer, static_cast<std::size_t>(received));
                 if (const auto end = HeadEnd(connection->head); end != std::string::npos) {
@@ -463,9 +473,9 @@ bool MetricsHttpListener::Advance(Connection* connection) {
                         connection->deadline = Clock::now() + std::chrono::milliseconds(timeout_ms_);
                         return true;
                     }
-                    connection->response = std::move(*request.refusal);
+                    connection->response = Shared(std::move(*request.refusal));
                 } else if (connection->head.size() >= kMetricsMaxRequestBytes) {
-                    connection->response = ErrorResponse("431 Request Header Fields Too Large");
+                    connection->response = Shared(ErrorResponse("431 Request Header Fields Too Large"));
                 } else {
                     return true;
                 }
@@ -478,16 +488,16 @@ bool MetricsHttpListener::Advance(Connection* connection) {
         }
         case Connection::Phase::kWrite: {
             const auto sent = Send(
-                connection->socket, connection->response.data() + connection->written,
-                connection->response.size() - connection->written);
+                connection->socket, connection->response->data() + connection->written,
+                connection->response->size() - connection->written);
             if (sent < 0) return ShouldRetry(CurrentSocketErrorCode());
             connection->written += static_cast<std::size_t>(sent);
-            if (connection->written < connection->response.size()) return true;
+            if (connection->written < connection->response->size()) return true;
             // Reads what the client still sends until it closes, so that
             // unread input does not make the close reset the connection and
             // discard the response.
             ShutdownSend(connection->socket);
-            connection->response = {};
+            connection->response.reset();
             connection->phase = Connection::Phase::kDrain;
             connection->deadline = Clock::now() + std::chrono::milliseconds(timeout_ms_);
             return true;

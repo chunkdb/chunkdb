@@ -33,10 +33,13 @@ using Clock = std::chrono::steady_clock;
 using chunkdb::exporter::ChunkConnection;
 using chunkdb::exporter::ExporterOptions;
 
+// Owner-only, as the exporter requires of a password file.
 void WriteFile(const std::filesystem::path& path, const std::string& bytes) {
     std::ofstream out(path, std::ios::binary);
     out << bytes;
     assert(out.good());
+    out.close();
+    std::filesystem::permissions(path, std::filesystem::perms::owner_read | std::filesystem::perms::owner_write);
 }
 
 std::string ReadFile(const std::filesystem::path& path) {
@@ -153,12 +156,13 @@ struct Fixture {
     int server_port = chunkdb::test::PickListenerPort();
     std::filesystem::path admin_password = dir.path() / "admin.password";
     std::vector<std::string> server_tls;
+    std::string idle_timeout_ms = "60000";
 
     std::unique_ptr<Process> StartServer(const std::string& log_name = "server.log") {
         std::vector<std::string> arguments = {
             "--host", "127.0.0.1", "--port", std::to_string(server_port), "--data-dir", (dir.path() / "data").string(),
             "--auth", "scram", "--admin-user", "admin", "--admin-password-file", admin_password.string(),
-            "--log-level", "error", "--workers", "2"};
+            "--log-level", "error", "--workers", "2", "--idle-connection-timeout-ms", idle_timeout_ms};
         arguments.insert(arguments.end(), server_tls.begin(), server_tls.end());
         auto server = std::make_unique<Process>(server_binary, arguments, dir.path() / log_name);
         server->WaitListening(server_port);
@@ -170,15 +174,26 @@ struct Fixture {
                std::to_string(server_port) + "/";
     }
 
-    // Runs `statements` as the administrator.
-    void Admin(const std::vector<std::string>& statements) {
+    // Runs `statements` as the administrator; the reply of the last.
+    std::string Admin(const std::vector<std::string>& statements) {
         ExporterOptions options;
         options.uri = chunkdb::ParseConnectionUri(Uri("admin"));
         options.password_file = admin_password.string();
         options.tls_ca_file = server_tls.empty() ? std::string() : (dir.path() / "server.pem").string();
         const auto deadline = Clock::now() + std::chrono::seconds(10);
         ChunkConnection admin(options, deadline, {});
-        for (const auto& statement : statements) (void)admin.Query(statement, deadline, {});
+        std::string reply;
+        for (const auto& statement : statements) reply = admin.Query(statement, deadline, {});
+        return reply;
+    }
+
+    // chunkdb_auth_failures_total of the server.
+    std::uint64_t AuthFailures() {
+        const auto metrics = Admin({"SHOW METRICS"});
+        constexpr std::string_view kName = "\nchunkdb_auth_failures_total ";
+        const auto at = metrics.find(kName);
+        assert(at != std::string::npos);
+        return std::stoull(metrics.substr(at + kName.size()));
     }
 
     void CreateUser(const std::string& name, const std::string& password) {
@@ -227,6 +242,10 @@ void TestFlags(const std::string& exporter) {
              "0.0.0.0:" + std::to_string(chunkdb::test::PickListenerPort())},
             1, "--allow-remote");
     refused({"--bogus"}, 2, "unknown option --bogus");
+    const auto shared = dir.path() / "shared.password";
+    WriteFile(shared, "secret\n");
+    std::filesystem::permissions(shared, std::filesystem::perms::group_read, std::filesystem::perm_options::add);
+    refused({"--uri", "chunk://m@127.0.0.1:4242/", "--password-file", shared.string()}, 2, "accessible by group or others");
 }
 
 void TestAgainstServer(Fixture& fixture) {
@@ -266,21 +285,45 @@ void TestAgainstServer(Fixture& fixture) {
 
     // A wrong password: the login fails.
     WriteFile(fixture.dir.path() / "plain.password", "wrong\n");
+    const auto failures_before = fixture.AuthFailures();
     auto wrong = fixture.StartExporter("plain", plain_port);
-    assert(StatusLine(Scrape(plain_port)) == "HTTP/1.1 503 Service Unavailable");
+    // A burst of scrapes after a failed login tries no new login until the
+    // backoff ends; logins at every scrape would also get the source banned.
+    for (int i = 0; i < 10; ++i) {
+        const auto response = Scrape(plain_port);
+        assert(StatusLine(response) == "HTTP/1.1 503 Service Unavailable");
+        assert(Body(response).find("\nchunkdb_up 0\n") != std::string::npos);
+    }
+    assert(fixture.AuthFailures() - failures_before <= 2U);
     wrong.reset();
     assert(ReadFile(fixture.dir.path() / "exporter-plain.log").find("login refused") != std::string::npos);
 
-    // The server stops: 503; it starts again: the exporter logs in again.
-    const int server_status = server->Stop();
+    // A kept connection the server closed as idle: the scrape opens a new one.
+    assert(StatusLine(Scrape(port)) == "HTTP/1.1 200 OK");
+    std::this_thread::sleep_for(std::chrono::milliseconds(1500));
+    assert(StatusLine(Scrape(port)) == "HTTP/1.1 200 OK");
+
+    // A restart between two scrapes: the second opens a new connection.
+    int server_status = server->Stop();
+    assert(WIFEXITED(server_status));
+    server = fixture.StartServer("server-between-scrapes.log");
+    assert(StatusLine(Scrape(port)) == "HTTP/1.1 200 OK");
+    assert(ReadFile(fixture.dir.path() / "exporter-monitor.log").find("cannot read") == std::string::npos);
+
+    // The server stops: 503; it starts again: the exporter logs in again
+    // once its backoff ends.
+    server_status = server->Stop();
     assert(WIFEXITED(server_status));
     response = Scrape(port);
     assert(StatusLine(response) == "HTTP/1.1 503 Service Unavailable");
     assert(Body(response) == std::string("# HELP chunkdb_up Whether chunkdb_exporter read the server's metrics in this "
                                          "scrape.\n# TYPE chunkdb_up gauge\nchunkdb_up 0\n"));
     server = fixture.StartServer("server-restarted.log");
-    response = Scrape(port);
-    assert(StatusLine(response) == "HTTP/1.1 200 OK");
+    const auto restarted_deadline = Clock::now() + std::chrono::seconds(10);
+    for (response = Scrape(port); StatusLine(response) != "HTTP/1.1 200 OK"; response = Scrape(port)) {
+        assert(Clock::now() < restarted_deadline);
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    }
     assert(Body(response).find("\nchunkdb_up 1\n") != std::string::npos);
 
     // SIGTERM ends the exporter.
@@ -347,6 +390,7 @@ int main(int argc, char** argv) {
         Fixture fixture;
         fixture.exporter = argv[1];
         fixture.server_binary = argv[2];
+        fixture.idle_timeout_ms = "500";
         TestAgainstServer(fixture);
     }
     TestTls(argv[1], argv[2]);

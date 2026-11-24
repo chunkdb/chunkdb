@@ -59,9 +59,14 @@ class ChunkConnection {
     std::unique_ptr<State> state_;
 };
 
+// The body of a scrape that could not read the server: chunkdb_up 0.
+[[nodiscard]] std::string DownBody();
+
 // SHOW METRICS with chunkdb_up appended: 1 and the server's samples when the
-// scrape worked, 0 alone (served with 503) when it did not. The connection
-// is kept between scrapes and opened again after it fails.
+// scrape worked, DownBody (served with 503) when it did not. The connection
+// is kept between scrapes; when a kept one fails, a new one is opened once
+// in the same scrape. After a failed connect or login no new one is tried
+// for 1 second, doubled after each failure up to 30 seconds.
 class Exporter {
   public:
     explicit Exporter(ExporterOptions options);
@@ -73,6 +78,8 @@ class Exporter {
     std::unique_ptr<ChunkConnection> connection_;
     // Whether the last scrape worked, so that a change is logged once.
     bool up_ = true;
+    std::chrono::milliseconds backoff_{0};
+    std::chrono::steady_clock::time_point retry_at_{};
 };
 
 }  // namespace chunkdb::exporter
