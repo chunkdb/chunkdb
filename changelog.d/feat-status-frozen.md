@@ -1,0 +1,1 @@
+- SHOW STATUS reports a table `state` of `frozen` for a fenced table with a slot that is not lost whose store failed closed after a durability failure, so that its slots' durable revision stays until RECOVER TABLE or a restart; its `reason` says so and names the fence reason, and `chunkdb_slot_frontier_frozen` is 1 for it. Such a table was reported `fenced` (#149).

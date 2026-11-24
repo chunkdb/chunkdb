@@ -461,12 +461,23 @@ void AppliedMigrationWhileFenced() {
 }
 
 // A table with a slot whose store fails closed has a frozen slot frontier
-// until RECOVER TABLE; a table without a slot never has one.
+// until RECOVER TABLE, in SHOW STATUS and SHOW METRICS; a table without a
+// slot never has one.
 void FrozenSlotFrontier() {
+    const auto state = [](Engine& e, const std::string& table) {
+        const auto status = e.Run("SHOW STATUS");
+        const auto name = "$4\r\nname\r\n$" + std::to_string(table.size()) + "\r\n" + table + "\r\n$5\r\nstate\r\n";
+        const auto at = status.find(name);
+        assert(at != std::string::npos);
+        // The state and the reason, as bulk strings or null.
+        auto rest = status.substr(at + name.size());
+        return rest.substr(0, rest.find("$7\r\nenabled\r\n"));
+    };
     test::ScopedTempDir dir("chunkdb-recover-table-frozen-frontier");
     Engine e(dir.path(), true);
     Seed(e, "durability");
     Reply(e.Run("CREATE SLOT 'consumer' ON realm"), "+OK\r\n");
+    Reply(state(e, "realm"), "$2\r\nok\r\n$6\r\nreason\r\n_\r\n");
     Reply(Metric(e, "chunkdb_slot_frontier_frozen{table=\"realm\"}"), "0");
     {
         // The write, or a slot pass that takes the failpoint first, fails the store closed.
@@ -478,8 +489,12 @@ void FrozenSlotFrontier() {
     Reply(Metric(e, "chunkdb_slot_frontier_frozen{table=\"realm\"}"), "1");
     Reply(Metric(e, "chunkdb_table_fenced{table=\"realm\"}"), "1");
     Reply(Metric(e, "chunkdb_slot_frontier_frozen{table=\"other\"}"), "0");
+    const std::string reason = "its slots' durable frontier stopped because its store is fail-closed after a durability failure";
+    Reply(state(e, "realm"), "$6\r\nfrozen\r\n$6\r\nreason\r\n$" + std::to_string(reason.size()) + "\r\n" + reason + "\r\n");
+    Reply(state(e, "other"), "$2\r\nok\r\n$6\r\nreason\r\n_\r\n");
     Reply(e.Run("RECOVER TABLE realm"), "+OK\r\n");
     Reply(Metric(e, "chunkdb_slot_frontier_frozen{table=\"realm\"}"), "0");
+    Reply(state(e, "realm"), "$2\r\nok\r\n$6\r\nreason\r\n_\r\n");
     Reply(Metric(e, "chunkdb_table_fenced{table=\"realm\"}"), "0");
 }
 

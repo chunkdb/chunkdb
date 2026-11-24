@@ -2651,14 +2651,15 @@ CatalogFeatureStatus TableCatalog::FeatureStatus() {
         for (const auto& [_, table] : tables_) tables.push_back(table);
         // Out of the inventory until RecoverTable: no store is open.
         for (const auto& [name, fenced] : fenced_)
-            status.tables.push_back({.name = name, .features = std::nullopt, .fence = std::string(fenced.reason)});
+            status.tables.push_back({.name = name, .features = std::nullopt, .fence = std::string(fenced.reason), .frontier_frozen = false});
     }
     for (const auto& table : tables) {
-        CatalogTableStatus entry{.name = table->name(), .features = std::nullopt, .fence = std::nullopt};
+        CatalogTableStatus entry{.name = table->name(), .features = std::nullopt, .fence = std::nullopt, .frontier_frozen = false};
         try {
             const auto lease = table->Acquire();
             if (!lease) throw TableNotFoundError("table disappeared while reading feature status");
             entry.features = lease->store().features();
+            entry.frontier_frozen = table->SlotFrontierFrozen(*lease);
         } catch (const FeedRecoveryRequiredError&) {
             // Its feed cleanup failed, which fences it without a lease.
             entry.fence = kFenceFeed;
