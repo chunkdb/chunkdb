@@ -146,6 +146,11 @@ void TestChunkModelScan() {
     assert(compact.table == "t" && compact.before == std::numeric_limits<std::uint64_t>::max());
     assert(Get<cql::CompactTombstones>("COMPACT TOMBSTONES t BEFORE 0").before == 0U);
     assert(Get<cql::ShowTableStats>("SHOW TABLE STATS t").table == "t");
+    assert(Get<cql::Apply>("APPLY $1", 1U).push.index == 1U);
+    assert(cql::Parse("apply $1").parameters == 1U);
+    ExpectError("APPLY 'push'", "the push is sent as a parameter ($1)");
+    ExpectError("APPLY $1 $2", "expected the end of the statement");
+    ExpectError("MIGRATE 'apply' APPLY $1", "one schema statement");
     ExpectError("COMPACT TOMBSTONES t BEFORE -1", "a revision must be between 0");
     ExpectError("MIGRATE 'compact' COMPACT TOMBSTONES t BEFORE 1", "one schema statement");
 }

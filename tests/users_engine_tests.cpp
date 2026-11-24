@@ -442,10 +442,16 @@ void TestServerRights() {
     ExpectError(server.Run(mon, "RESTORE TABLE world FROM 'b1' AS world_other"),
                 "PERMISSION_DENIED BACKUP, MANAGES USERS or ADMIN on *");
 
-    // REPLICATION is kept and shown; no statement needs it yet.
+    // REPLICATION: APPLY and follower tables, without table rights.
     ExpectError(server.Run(rep, "SHOW METRICS"), "PERMISSION_DENIED");
     ExpectError(server.Run(rep, "BACKUP TO 'b2'"), "PERMISSION_DENIED");
     ExpectError(server.Run(rep, "GET BLOCK 0 0 FROM world"), "NO_TABLE");
+    for (auto* session : {&admin, &mon, &bk})
+        ExpectError(server.Run(*session, "APPLY $1", {std::string("_\r\n")}), "PERMISSION_DENIED REPLICATION");
+    ExpectError(server.Run(rep, "APPLY $1", {std::string("_\r\n")}), "INVALID_ARGUMENT");
+    const std::string follower = "CREATE TABLE copy (bits bits(4)) CHUNK 4 x 4 WITH follower = '" + std::string(32U, 'b') + "'";
+    ExpectError(server.Run(admin, follower), "PERMISSION_DENIED REPLICATION");
+    ExpectError(server.Run(rep, follower), "PERMISSION_DENIED ADMIN on copy");
     const auto users = server.Run(admin, "SHOW USERS");
     assert(Contains(users, "$13\r\nserver_rights\r\n*1\r\n$7\r\nMONITOR\r\n"));
     assert(Contains(users, "$13\r\nserver_rights\r\n*1\r\n$6\r\nBACKUP\r\n"));

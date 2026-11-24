@@ -1465,6 +1465,12 @@ class Parser {
             swap.second = Name("a table name");
             return swap;
         }
+        if (Accept("apply")) {
+            const std::size_t column = Peek().column;
+            const Literal push = Value(true);
+            if (!std::holds_alternative<Parameter>(push)) Fail(column, "the push is sent as a parameter ($1)");
+            return Apply{.push = std::get<Parameter>(push)};
+        }
         if (Accept("compact")) {
             Expect("tombstones");
             CompactTombstones compact{.table = Name("a table name")};

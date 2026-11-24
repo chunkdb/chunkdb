@@ -63,7 +63,7 @@ MONITOR, BACKUP and REPLICATION are server rights, granted with `ON *`, for exam
 They give no table rights and no user management.
 MONITOR reads server status: SHOW METRICS, SHOW STATUS, SHOW CONNECTIONS of every user, SHOW TABLE STATS and SHOW SLOTS on every table, and WATCH CATALOG.
 BACKUP runs BACKUP TO, and RESTORE TABLE under a name the user has ADMIN on; the backup may hold any table, and the restored table falls under the grants that match its new name.
-REPLICATION is stored and shown by SHOW USERS; no statement requires it yet.
+REPLICATION runs [APPLY](reference/FEED.md#apply) into every follower table and creates follower tables with CREATE TABLE ... WITH follower, together with the right CREATE TABLE needs.
 
 | Statement | Required right |
 | --- | --- |
@@ -72,7 +72,8 @@ REPLICATION is stored and shown by SHOW USERS; no statement requires it yet.
 | WATCH SLOT on a slot another user owns | READ on the table and ADMIN on all tables |
 | SET BLOCK, DELETE BLOCK, SET CHUNK | WRITE on the table |
 | ALTER TABLE, DROP TABLE, RECOVER TABLE, CREATE SLOT, DROP SLOT | ADMIN on the table |
-| CREATE TABLE | ADMIN on the name, on a matching prefix, or on all tables |
+| CREATE TABLE | ADMIN on the name, on a matching prefix, or on all tables; WITH follower also needs REPLICATION |
+| APPLY | REPLICATION |
 | SWAP TABLES | ADMIN on both tables |
 | ALTER TABLE ... RENAME TO | ADMIN on the table, and on the new name, a matching prefix, or all tables |
 | SHOW METRICS, SHOW STATUS | MONITOR, or ADMIN on all tables |

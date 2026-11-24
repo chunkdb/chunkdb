@@ -699,6 +699,8 @@ class ChunkStore {
     }
     [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
     [[nodiscard]] const std::optional<TableLineage>& lineage() const noexcept { return lineage_; }
+    // A follower table changes only through APPLY (docs/design/REPLICATION_APPLY.md).
+    [[nodiscard]] bool follower() const noexcept { return follower_base_.has_value(); }
     [[nodiscard]] const FeatureFlags& features() const noexcept { return features_; }
     [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
     [[nodiscard]] DurabilityMode durability_mode() const noexcept { return durability_mode_; }
@@ -1019,6 +1021,17 @@ class ChunkStore {
         TxnSnapshot& snapshot,
         const std::vector<ChunkCoord>& read_set,
         std::vector<TxnChunkWrite> writes);
+    // Follower tables only: APPLY of a primary's commit or progress. The
+    // caller holds LockReplicationApply() across reading the chunks it
+    // replaces and applying, and sets the commit's user (ScopedWriteUser).
+    // A commit writes every chunk in `writes` at `revision` and
+    // `commit_time_ms`, also an unchanged one, whole or not at all, and is
+    // durable when this returns, as CommitTransaction. Both return false,
+    // changing nothing, when `revision` is not above CompletedRevision().
+    [[nodiscard]] std::unique_lock<std::mutex> LockReplicationApply();
+    [[nodiscard]] bool ApplyReplicatedCommit(
+        std::uint64_t revision, std::uint64_t commit_time_ms, std::vector<TxnChunkWrite> writes);
+    [[nodiscard]] bool ApplyReplicatedProgress(std::uint64_t revision);
     // A transaction's writes go to its private copy of a chunk: SET BLOCK and
     // DELETE BLOCK applied to `state`, the chunk holding the block, with the
     // checks SetBlock and UnsetBlock make. Throw std::invalid_argument and
@@ -1377,6 +1390,10 @@ class ChunkStore {
     std::filesystem::path snapshot_generation_path_;
     StoreId store_id_{};
     std::optional<TableLineage> lineage_;
+    // The follower option's base revision; std::nullopt for an ordinary table.
+    std::optional<std::uint64_t> follower_base_;
+    // Serializes APPLY on a follower.
+    std::mutex replication_apply_mutex_;
     FeatureFlags features_{};
     std::uint64_t snapshot_generation_ = 0;
     // The generation record existed when the store opened (a writer never
@@ -1763,6 +1780,15 @@ class ChunkStore {
     // tokens issued from now on are above every revision the store holds even
     // when the clock bookkeeping was lost and restarted low.
     void RaiseVersionClockAbove(std::uint64_t revision);
+    // A follower's clock starts just above the revision its data holds.
+    void StartFollowerClock();
+    // The commit identity APPLY gives CommitTransactionImpl.
+    struct ReplicatedIdentity {
+        std::uint64_t revision = 0U;
+        std::uint64_t commit_time_ms = 0U;
+    };
+    std::uint64_t CommitTransactionImpl(TxnSnapshot& snapshot, const std::vector<ChunkCoord>& read_set,
+        std::vector<TxnChunkWrite> writes, const ReplicatedIdentity* replicated);
     void RecoverConditionalRollbackIntents(bool validate_only = false);
     // Creates the manifest of a new store, or confirms the existing one
     // still records the geometry this store opened with.

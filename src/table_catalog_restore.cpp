@@ -106,6 +106,7 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         result.epoch = RebindRestoredTable(staging, copy.cut, copy.files, request.cancelled);
         manifest.store_id = result.epoch;
         manifest.lineage = TableLineage{result.parent_epoch, result.fork_revision};
+        manifest.follower.reset();
         std::ostringstream findings;
         if (VerifyTableDirectory(staging, findings).errors != 0U)
             throw std::runtime_error("restored table failed verification: " + findings.str());

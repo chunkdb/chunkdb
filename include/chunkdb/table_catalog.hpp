@@ -18,6 +18,7 @@
 #include <string>
 #include <string_view>
 #include <thread>
+#include <utility>
 #include <vector>
 
 #include "chunkdb/chunk_store.hpp"
@@ -149,6 +150,8 @@ struct TableInfo {
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::size_t slot_max_bytes = kDefaultSlotMaxBytes;
     TableSchema chunk_schema{};
+    // A follower table (docs/design/REPLICATION_APPLY.md); false while its store is closed.
+    bool follower = false;
 };
 
 struct CatalogTableStatus {
@@ -172,6 +175,18 @@ struct TableDefinition {
     TableOptions options;
     std::optional<TableSchema> schema;
     std::optional<TableSchema> chunk_schema{};
+    // A follower of this epoch at revision 0 (docs/design/REPLICATION_APPLY.md).
+    std::optional<StoreId> follower_epoch{};
+};
+
+// A table refused for a reason a client can test: INVALID_ARGUMENT reason=...
+class TableArgumentError : public std::invalid_argument {
+  public:
+    TableArgumentError(std::string reason, const std::string& message)
+        : std::invalid_argument(message), reason_(std::move(reason)) {}
+    [[nodiscard]] const std::string& reason() const noexcept { return reason_; }
+  private:
+    std::string reason_;
 };
 
 // RESTORE TABLE (docs/design/RESTORE_TABLE.md).
@@ -466,6 +481,8 @@ class TableCatalog {
 
     // nullptr when there is no such table.
     [[nodiscard]] std::shared_ptr<Table> Find(std::string_view name) const;
+    // The serving table whose epoch (store id) is `epoch`, or null.
+    [[nodiscard]] std::shared_ptr<Table> FindByEpoch(const StoreId& epoch) const;
     // Captures one common directory boundary before the first transaction
     // statement. Callers hold no table lease; later reads use these original
     // snapshots even when they first touch a table in a later statement.

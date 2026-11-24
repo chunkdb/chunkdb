@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
+#include <limits>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -367,6 +368,42 @@ std::uint64_t ChunkStore::CommitTransaction(
     TxnSnapshot& snapshot,
     const std::vector<ChunkCoord>& read_set,
     std::vector<TxnChunkWrite> writes) {
+    return CommitTransactionImpl(snapshot, read_set, std::move(writes), nullptr);
+}
+
+std::unique_lock<std::mutex> ChunkStore::LockReplicationApply() {
+    return std::unique_lock<std::mutex>(replication_apply_mutex_);
+}
+
+bool ChunkStore::ApplyReplicatedCommit(
+    std::uint64_t revision, std::uint64_t commit_time_ms, std::vector<TxnChunkWrite> writes) {
+    if (!follower_base_) throw std::logic_error("APPLY into a table that is not a follower");
+    if (access_mode_ == AccessMode::kReadOnly) throw std::invalid_argument("store is read-only");
+    if (revision == 0U || revision == std::numeric_limits<std::uint64_t>::max())
+        throw std::invalid_argument("the push's revision is out of range");
+    if (revision < version_clock_.load(std::memory_order_acquire)) return false;
+    if (writes.empty()) return ApplyReplicatedProgress(revision);
+    auto snapshot = BeginTxnSnapshot(std::chrono::hours(24));
+    const ReplicatedIdentity identity{.revision = revision, .commit_time_ms = commit_time_ms};
+    (void)CommitTransactionImpl(*snapshot, {}, std::move(writes), &identity);
+    return true;
+}
+
+bool ChunkStore::ApplyReplicatedProgress(std::uint64_t revision) {
+    if (!follower_base_) throw std::logic_error("APPLY into a table that is not a follower");
+    if (access_mode_ == AccessMode::kReadOnly) throw std::invalid_argument("store is read-only");
+    if (revision == std::numeric_limits<std::uint64_t>::max())
+        throw std::invalid_argument("the push's revision is out of range");
+    if (revision < version_clock_.load(std::memory_order_acquire)) return false;
+    RaiseVersionClockAbove(revision);
+    return true;
+}
+
+std::uint64_t ChunkStore::CommitTransactionImpl(
+    TxnSnapshot& snapshot,
+    const std::vector<ChunkCoord>& read_set,
+    std::vector<TxnChunkWrite> writes,
+    const ReplicatedIdentity* replicated) {
     RequireOwnTxnSnapshot(snapshot);
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
@@ -567,8 +604,10 @@ std::uint64_t ChunkStore::CommitTransaction(
         const auto& chunk = *target.chunk;
         const bool same_metadata = write.state.chunk_columns ? chunk.chunk_columns &&
             write.state.chunk_columns->bytes == chunk.chunk_columns->bytes : !chunk.chunk_columns;
-        if (write.state.payload == chunk.payload && write.state.presence_bitmap == chunk.presence_bitmap &&
-            write.state.vars == chunk.vars && same_metadata && (!write.state.written || chunk.written)) {
+        // APPLY writes every chunk of the primary's commit: each took its revision.
+        if (replicated == nullptr && write.state.payload == chunk.payload &&
+            write.state.presence_bitmap == chunk.presence_bitmap && write.state.vars == chunk.vars &&
+            same_metadata && (!write.state.written || chunk.written)) {
             continue;
         }
         // Under the locks, against the chunk the transaction read: only the
@@ -612,11 +651,25 @@ std::uint64_t ChunkStore::CommitTransaction(
     // before the intent removal and the inline checkpoints below.
     std::optional<FeedWriteGuard> feed;
     feed.emplace(*this);
-    const std::uint64_t version = NextChunkVersion();
+    std::uint64_t version = 0U;
+    if (replicated != nullptr) {
+        // The producer bound was taken above at or below the clock, so the
+        // frontier stays below the revision until this commit is published.
+        if (replicated->revision < version_clock_.load(std::memory_order_seq_cst))
+            throw std::invalid_argument("the push's revision is not above the follower's revision");
+        RaiseVersionClockAbove(replicated->revision);
+        version = replicated->revision;
+    } else {
+        version = NextChunkVersion();
+    }
     feed->Version(version);
     std::uint64_t commit_time_ms = 0;
-    for (const auto& change : changes) {
-        commit_time_ms = NextCommitTimeMs(*change.target->chunk);
+    if (replicated != nullptr) {
+        commit_time_ms = replicated->commit_time_ms;
+    } else {
+        for (const auto& change : changes) {
+            commit_time_ms = NextCommitTimeMs(*change.target->chunk);
+        }
     }
     // Loaded after the version was taken, as a plain write does.
     const bool keep_states = txn_history_->OpenCount() > 0U;

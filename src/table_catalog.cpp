@@ -924,6 +924,7 @@ TableInfo Table::Info() const {
         .feed_buffer_bytes = FeedBufferBytes(),
         .slot_max_bytes = slot_max_bytes_,
         .chunk_schema = geometry_.chunk_schema(),
+        .follower = store_ != nullptr && store_->follower(),
     };
 }
 
@@ -1541,6 +1542,15 @@ std::shared_ptr<Table> TableCatalog::Find(std::string_view name) const {
     return it != tables_.end() ? it->second : nullptr;
 }
 
+std::shared_ptr<Table> TableCatalog::FindByEpoch(const StoreId& epoch) const {
+    std::shared_lock lock(tables_mutex_);
+    for (const auto& [_, table] : tables_)
+        if (table->store_id() == epoch) return table;
+    for (const auto& [_, fenced] : fenced_)
+        if (fenced.table != nullptr && fenced.table->store_id() == epoch) return fenced.table;
+    return nullptr;
+}
+
 std::vector<TableInfo> TableCatalog::List() const {
     std::vector<std::shared_ptr<Table>> tables;
     {
@@ -1819,6 +1829,10 @@ std::shared_ptr<Table> TableCatalog::Create(
     if (existing != nullptr) {
         throw TableExistsError("table '" + table_name + "' already exists; use another name, CREATE TABLE IF NOT EXISTS, or DROP TABLE " + table_name + " first");
     }
+    // One table of an epoch per data directory: APPLY finds a follower by it.
+    if (prepared.follower_epoch && FindByEpoch(*prepared.follower_epoch) != nullptr)
+        throw TableArgumentError("epoch_in_use", "epoch " + StoreIdHex(*prepared.follower_epoch) +
+            " is already the epoch of a table of this server; a follower and its primary are on different servers");
     const auto target = TablesDir() / table_name;
     // Made now, so that neither serving the table nor fencing it after a
     // failed undo allocates once it is in tables/.
@@ -1836,9 +1850,10 @@ std::shared_ptr<Table> TableCatalog::Create(
     const StoreManifest manifest{
         .features = TableScopedFeatures(directory_manifest->features),
         .geometry = geometry,
-        .store_id = NewStoreId(),
+        .store_id = prepared.follower_epoch.value_or(NewStoreId()),
         .options = EncodeTableOptions(options),
         .schema = table_schema,
+        .follower = prepared.follower_epoch ? std::optional<std::uint64_t>(0U) : std::nullopt,
         .chunk_schema = table_geometry.chunk_schema(),
     };
     try {

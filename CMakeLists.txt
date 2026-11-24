@@ -127,6 +127,7 @@ add_library(chunkdb_core STATIC
     src/protocol.cpp
     src/request_framing.cpp
     src/reply_stream.cpp
+    src/replication_push.cpp
     src/returning.cpp
     src/snapshot_generation.cpp
     src/shared_file_input.cpp
@@ -1177,6 +1178,11 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_table_feed_limits_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME table_feed_limits COMMAND chunkdb_table_feed_limits_test)
 
+    add_executable(chunkdb_replication_apply_test tests/replication_apply_tests.cpp)
+    target_link_libraries(chunkdb_replication_apply_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_replication_apply_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME replication_apply COMMAND chunkdb_replication_apply_test)
+
     # Documentation checks (scripts/test/docker-quickstart.sh and the CI docs job).
     add_library(chunkdb_docs_check_lib STATIC tests/docs_check.cpp)
     target_include_directories(chunkdb_docs_check_lib PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/tests)
@@ -1211,6 +1217,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_feed_watermark_test
         chunkdb_feed_lifecycle_test
         chunkdb_table_feed_limits_test
+        chunkdb_replication_apply_test
         chunkdb_geometry_bit_test
         chunkdb_sectioned_chunk_form_test
         chunkdb_txn_intent_format_test
@@ -1404,6 +1411,7 @@ if(CHUNKDB_BUILD_TESTS)
         feed_watermark
         feed_lifecycle
         table_feed_limits
+        replication_apply
         geometry_bit
         sectioned_chunk_form
         txn_intent_format

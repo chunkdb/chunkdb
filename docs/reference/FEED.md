@@ -94,6 +94,7 @@ WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1 [, AREA cx0 cy0 TO cx1 cy1 ..
 WATCH CATALOG
 ACK revision
 UNWATCH
+APPLY $1
 ```
 
 ## Arguments
@@ -196,6 +197,33 @@ The catalog revision is not stored: after a server restart the epoch changes and
 `CATALOG` after WATCH is a keyword: new tables cannot be named `catalog`, and a table of that name made before cannot be watched.
 The watch ends when the user loses MONITOR and ADMIN on `*`, or MANAGES USERS when it shows users.
 Only UNWATCH is accepted while streaming.
+
+## APPLY
+
+`APPLY $1` writes one replication push into the follower table whose epoch the push names, so the follower keeps the primary's epoch, revision, chunk versions, commit times and users.
+It needs REPLICATION, and is refused inside a transaction and on a `--read-only` server.
+`$1` is the push as the server sent it, its RESP3 bytes, at most `--feed-buffer-bytes`.
+A `replication` push is `[replication, epoch, revision, commit_time_ms, user, schema_version, chunks, null, null]`; each chunk is `[cx, cy(, cz), version, kind, data]` with `version` equal to `revision`.
+Kind `form` carries the chunk's form after the commit, or null when the commit left it empty; kind `rows` carries `[blocks, chunk_row]`, each block `[x, y(, z), row]` with the row's values in column order as bulk strings in their [parameter encoding](../PROTOCOL.md#parameters), null for NULL, or null for a deleted block, and `chunk_row` the chunk columns the same way, or null when unchanged.
+A `progress` push, `[progress, epoch, revision]`, raises the follower's revision.
+The reply is `applied`, or `skipped` when the follower's revision is already at or above the push's.
+Every chunk of a push commits at its revision, whole or not at all, and is durable when APPLY answers, in every durability mode.
+After a restart the follower's revision is its last applied commit; progress applied since is not kept.
+
+A follower is made with `CREATE TABLE f (...) WITH follower = 'epoch'`, the primary table's epoch, for a primary table without commits or schema changes.
+It refuses SET BLOCK, DELETE BLOCK, SET CHUNK, ALTER TABLE column and check changes, COMPACT TOMBSTONES, CREATE SLOT and MIGRATE with `INVALID_ARGUMENT reason=follower`; reads, WATCH, DROP TABLE, RENAME TO and ALTER TABLE SET of options work.
+A data directory holds one table per epoch, so a follower and its primary are on different servers; a second table of an epoch is refused with `INVALID_ARGUMENT reason=epoch_in_use`.
+
+| Error | When |
+| --- | --- |
+| NO_TABLE | No table has the push's epoch. |
+| INVALID_ARGUMENT `reason=not_follower` | The table of that epoch is not a follower. |
+| INVALID_ARGUMENT `reason=apply` | A chunk's version is not the push's revision, a form does not carry its revision and commit time, a row has the wrong number of values, or a block lies in another chunk. |
+| INVALID_ARGUMENT | The push is malformed, NULL, or of a kind APPLY does not take, such as `resync` or `schema`. |
+| SCHEMA_MISMATCH | The push or a form has another schema version than the follower. |
+| PERMISSION_DENIED | You lack REPLICATION. |
+
+A refused push changes nothing.
 
 ## Limits
 

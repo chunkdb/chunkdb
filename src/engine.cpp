@@ -873,6 +873,8 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (const auto* failed = dynamic_cast<const CheckFailedError*>(&error); failed != nullptr) {
         return Protocol::Error("CHECK_FAILED", error.what(), {{"check", failed->check()}});
     }
+    if (const auto* table = dynamic_cast<const TableArgumentError*>(&error); table != nullptr)
+        return Protocol::Error("INVALID_ARGUMENT", error.what(), {{"reason", table->reason()}});
     if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr) {
         if (std::string_view(error.what()).starts_with("the table has no column "))
             return Protocol::Error("INVALID_ARGUMENT", std::string(error.what()) + "; use DESCRIBE <table> to check column names");
@@ -1086,7 +1088,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 15);
+    Protocol::AppendArrayHeader(reply, 16);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -1102,6 +1104,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "read_only_transactions");
     Protocol::AppendBulk(reply, "returning");
     Protocol::AppendBulk(reply, "watch_catalog");
+    Protocol::AppendBulk(reply, "replication_apply");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 2U : 1U);
     entry("statement_timeout_ms", session.hello_options.statement_timeout_ms.value_or(session.default_statement_timeout_ms));

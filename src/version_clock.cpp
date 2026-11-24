@@ -406,6 +406,22 @@ void ChunkStore::RaiseVersionClockAbove(std::uint64_t revision) {
     }
 }
 
+void ChunkStore::StartFollowerClock() {
+    if (!follower_base_ || access_mode_ == AccessMode::kReadOnly) return;
+    // A follower takes its versions from the primary: its revision is the
+    // highest one its data holds (every applied commit, collection and
+    // compaction left one in the coordinate index) or its base. Progress
+    // applied before the start is not kept. The clock may start below its
+    // persisted ceiling, which only bounds tokens; the directory's version
+    // floor does not apply.
+    const std::uint64_t position = std::max(*follower_base_, coordinate_index_->maximum_recovered_revision());
+    if (position >= std::numeric_limits<std::uint64_t>::max() - 1U)
+        throw std::runtime_error("follower revision is out of range");
+    RaiseVersionClockAbove(position);
+    std::lock_guard lock(version_clock_mutex_);
+    version_clock_.store(position + 1U, std::memory_order_seq_cst);
+}
+
 std::uint64_t ChunkStore::ChunkCommitTimeForTests(std::int64_t chunk_x, std::int64_t chunk_y) {
     const auto regular_chunk = GetOrLoadRegularChunk(ChunkCoord{chunk_x, chunk_y});
     std::shared_lock lock(regular_chunk->mutex);

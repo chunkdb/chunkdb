@@ -481,6 +481,7 @@ class CommandEngine {
     // Whether the session's user holds `right`; every right without auth.
     [[nodiscard]] bool HasServerRight(SessionState& session, ServerRight right) const;
     // MONITOR, or ADMIN on `*`, which includes what MONITOR allows.
+    void RequireReplication(SessionState& session) const;
     void RequireMonitor(SessionState& session) const;
     // CREATE TABLE: ADMIN on the name, on a prefix of it, or on `*`.
     void RequireCreateRight(SessionState& session, const std::string& table) const;

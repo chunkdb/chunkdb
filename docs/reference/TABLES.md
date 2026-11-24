@@ -131,6 +131,7 @@ CREATE TABLE, ALTER TABLE ... RENAME TO and RESTORE TABLE also refuse the name `
 | `var_max_chunk_bytes` | Encoded text and bytes per chunk; default 1048576 bytes. |
 | `feed_buffer_bytes` | Live feed history and output; default 67108864 bytes. |
 | `slot_max_bytes` | Retained history per durable slot; default 1073741824 bytes. |
+| `follower` | CREATE TABLE only: the primary table's epoch, 32 hex digits; the table changes only through [APPLY](FEED.md#apply). Needs REPLICATION. |
 
 Feed and slot limits must be positive.
 Unset limits inherit server defaults each time the table opens; explicit table values persist across restarts.
@@ -144,7 +145,7 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 - SWAP TABLES: `OK` once each name serves the other table.
 - RENAME TO: `OK` once the new name serves the table.
 - SHOW TABLES: accessible table names, fenced tables included.
-- DESCRIBE: schema version, column definitions, geometry, options, table epoch, completed revision, dimensions, and chunk columns; a table with checks adds `checks`, a list of maps with `name` and `expression`; a fenced table adds `fenced` with its reason.
+- DESCRIBE: schema version, column definitions, geometry, options, table epoch, completed revision, dimensions, and chunk columns; a table with checks adds `checks`, a list of maps with `name` and `expression`; a fenced table adds `fenced` with its reason; a follower table adds `follower: true` to `options`.
 - SHOW STATUS: `version`, the `server_version` HELLO reports, `uptime_ms` since the server started, `read_only`, `directory` features, `tables`, `fenced`, and `activation_pending`; each `tables` entry has `name`, `state`, `reason`, `enabled`, `compat`, `ro_compat`, and `incompat`, and each `fenced` entry has `name` and `reason`.
 
 The `version` field describes the schema; `revision` describes the completed commit frontier within `epoch`.
@@ -167,6 +168,8 @@ The `chunk_columns` list uses the same column-description maps as `columns`.
 | INTERNAL | A migration with an unknown outcome fences every table. | Restart the server; see [Migrations](MIGRATIONS.md#errors). |
 | INVALID_ARGUMENT | You run CREATE, ALTER, DROP, RECOVER TABLE, SWAP TABLES or ENABLE FEATURE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | INVALID_ARGUMENT | SWAP TABLES names one table twice. | Name two tables. |
+| INVALID_ARGUMENT `reason=follower` | A write, a column or check change, COMPACT TOMBSTONES, CREATE SLOT or MIGRATE on a follower table. | Change the primary; the follower follows through [APPLY](FEED.md#apply). |
+| INVALID_ARGUMENT `reason=epoch_in_use` | CREATE TABLE ... WITH follower names the epoch of a table of this server. | Create the follower on another server. |
 | INVALID_ARGUMENT | DROP NULL finds a NULL: `column c cannot drop NULL: block (x, y) holds NULL`. | Set a value in that block, then run DROP NULL again. |
 | INVALID_ARGUMENT | An ALTER COLUMN change leaves the column as it is, or makes it both NULL and REQUIRED. | Drop the other attribute first. |
 | CHECK_FAILED | A write leaves a block for which a check is false, or ADD CHECK finds a stored one: `block (x, y) fails CHECK name (condition)`, with `check=name`. | Change the values, or drop the check. |

@@ -35,7 +35,7 @@ constexpr std::size_t kDataDirOptionsOffset = 40U;
 
 [[nodiscard]] bool IsKnownTableManifestType(std::uint16_t type) noexcept {
     return IsKnownTableOptionType(type) || type == kOptionParentEpoch ||
-           type == kOptionForkRevision;
+           type == kOptionForkRevision || type == kOptionFollower;
 }
 
 void RequireValidLineage(const StoreManifest& manifest) {
@@ -83,6 +83,27 @@ void DecodeLineage(StoreManifest* manifest) {
         if (type != kOptionParentEpoch && type != kOptionForkRevision)
             options.insert(options.end(), manifest->options.begin() + static_cast<std::ptrdiff_t>(at),
                 manifest->options.begin() + static_cast<std::ptrdiff_t>(next));
+        at = next;
+    }
+    manifest->options = std::move(options);
+}
+
+// Moves the owned follower TLV out of the options area.
+void DecodeFollower(StoreManifest* manifest) {
+    std::vector<std::uint8_t> options;
+    options.reserve(manifest->options.size());
+    for (std::size_t at = 0; at < manifest->options.size();) {
+        const auto type = ReadLe16(manifest->options, at);
+        const auto length = ReadLe16(manifest->options, at + 2U);
+        const auto next = at + kOptionEntryHeaderSize + length;
+        if (type == kOptionFollower) {
+            if (manifest->follower) throw std::runtime_error("follower option appears twice");
+            if (length != 8U) throw std::runtime_error("follower option has invalid length");
+            manifest->follower = ReadLe64(manifest->options, at + 4U);
+        } else {
+            options.insert(options.end(), manifest->options.begin() + static_cast<std::ptrdiff_t>(at),
+                manifest->options.begin() + static_cast<std::ptrdiff_t>(next));
+        }
         at = next;
     }
     manifest->options = std::move(options);
@@ -231,7 +252,7 @@ std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) 
     (void)Geometry(manifest.geometry, manifest.schema, chunk_schema);
     const auto schema = EncodeTableSchema(manifest.schema);
     const auto encoded_chunk_schema = EncodeChunkSchema(chunk_schema);
-    const auto lineage_bytes = manifest.lineage ? 32U : 0U;
+    const auto lineage_bytes = (manifest.lineage ? 32U : 0U) + (manifest.follower ? 12U : 0U);
     if (manifest.options.size() > kStoreManifestMaxSize - lineage_bytes)
         throw std::invalid_argument("store manifest options and schema are too large");
     const auto options_size = manifest.options.size() + lineage_bytes;
@@ -266,6 +287,7 @@ std::vector<std::uint8_t> SerializeStoreManifest(const StoreManifest& manifest) 
         bytes.insert(bytes.end(), manifest.lineage->parent_epoch.begin(), manifest.lineage->parent_epoch.end());
         AppendOption(bytes, kOptionForkRevision, manifest.lineage->fork_revision);
     }
+    if (manifest.follower) AppendOption(bytes, kOptionFollower, *manifest.follower);
     WriteLe32(bytes, static_cast<std::uint32_t>(schema.size()));
     bytes.insert(bytes.end(), schema.begin(), schema.end());
     WriteLe32(bytes, static_cast<std::uint32_t>(encoded_chunk_schema.size()));
@@ -365,6 +387,7 @@ StoreManifest ParseStoreManifest(const std::vector<std::uint8_t>& bytes) {
         bytes.begin() + static_cast<std::ptrdiff_t>(schema_size_offset));
     ValidateOptions(manifest.options, manifest.features, IsKnownTableManifestType);
     DecodeLineage(&manifest);
+    DecodeFollower(&manifest);
     (void)DecodeTableOptions(manifest.options);
     return manifest;
 }
