@@ -184,7 +184,12 @@ void DirectoryArchive() {
             return AddColumn(schema, {.id = 0U, .name = "note", .type = {ColumnKind::kBytes, 16U},
                 .nullable = true, .default_value = {}});
         });
-        Write(*table, 0, 0, 3U);
+        {
+            // Bit-string writes need a table with one bits column; this one now has two.
+            auto lease = table->Acquire();
+            assert(lease);
+            lease->store().SetBlock(0, 0, {{"note", std::monostate{}}});
+        }
         const auto second = Completed(*table);
         catalog.RunArchivePass();
         const auto latest = Records(archive, directory);
