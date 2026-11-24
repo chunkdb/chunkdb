@@ -383,8 +383,12 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
 
 template<class Statement>
 FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement& statement) {
-    if (statement.area) RequireDimensions(table->geometry(), statement.area->dims);
-    FeedSlotFilters filters{.area = statement.area, .no_before = statement.no_before, .chunks = statement.chunks};
+    std::optional<FeedArea> area;
+    if constexpr (requires { statement.areas; }) {
+        for (const auto& each : statement.areas) RequireDimensions(table->geometry(), each.dims);
+    } else area = statement.area;
+    if (area) RequireDimensions(table->geometry(), area->dims);
+    FeedSlotFilters filters{.area = area, .no_before = statement.no_before, .chunks = statement.chunks};
     if (statement.columns) filters.column_ids = table->ResolveFeedColumns(*statement.columns);
     return filters;
 }
@@ -1185,7 +1189,7 @@ std::string CommandEngine::ExecuteStatement(
                     const auto filters = SlotFilters(table, watch);
                     FeedOptions options{
                         .after = watch.after,
-                        .area = filters.area,
+                        .areas = watch.areas,
                         .column_ids = filters.column_ids,
                         .no_before = filters.no_before,
                         .chunks = filters.chunks,

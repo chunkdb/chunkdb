@@ -1,5 +1,6 @@
 #pragma once
 #include <bit>
+#include <span>
 #include <type_traits>
 #include "chunkdb/change_feed.hpp"
 #include "chunkdb/chunk_vars.hpp"
@@ -24,10 +25,10 @@ std::string EncodeChunkForm(const ChunkLayout& layout, std::uint64_t version,
     const std::vector<std::uint8_t>& payload, const std::vector<std::uint8_t>& presence,
     const ChunkVars& vars, const std::vector<std::size_t>& columns);
 std::shared_ptr<const FeedEntry> ChunkFeedEntry(const std::shared_ptr<const FeedEntry>& entry,
-    const Geometry& geometry, const std::optional<FeedArea>& area,
+    const Geometry& geometry, std::span<const FeedArea> areas,
     const std::optional<std::vector<std::uint32_t>>& ids);
 std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const FeedEntry>& entry,
-    const std::optional<FeedArea>& area, const std::optional<std::vector<std::uint32_t>>& ids,
+    std::span<const FeedArea> areas, const std::optional<std::vector<std::uint32_t>>& ids,
     bool no_before, const std::vector<Column>& columns);
 std::string EncodeFeedEntry(const FeedEntry& entry);
 std::size_t FeedEntryRetainedBytes(const FeedEntry& entry);
@@ -38,8 +39,12 @@ std::size_t FeedRowMinimumEncodedBytes(const std::optional<std::vector<ColumnVal
 std::size_t FeedChangeItemMinimumEncodedBytes(std::uint8_t dims,
     const std::optional<std::vector<ColumnValue>>& before, const std::optional<std::vector<ColumnValue>>& after);
 std::size_t FeedChunkFormMinimumEncodedBytes(std::uint8_t dims, const std::shared_ptr<const std::string>& form);
-// True when `area` is unset or holds chunk `coord`.
-bool FeedAreaHolds(const std::optional<FeedArea>& area, std::uint8_t dims, ChunkCoord coord);
+// A slot filter area as a list: empty or one area.
+inline std::span<const FeedArea> FeedAreas(const std::optional<FeedArea>& area) noexcept {
+    return area ? std::span<const FeedArea>(&*area, 1U) : std::span<const FeedArea>{};
+}
+// True when `areas` is empty or one of them holds chunk `coord`.
+bool FeedAreaHolds(std::span<const FeedArea> areas, std::uint8_t dims, ChunkCoord coord);
 // The indexes in `columns` of the projected column `ids`, in their order, as FilterFeedEntry and ChunkFeedEntry
 // project them; throws when one was dropped or repeats.
 std::vector<std::size_t> FeedProjectionIndexes(const std::vector<Column>& columns, const std::vector<std::uint32_t>& ids);

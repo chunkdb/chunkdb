@@ -15,18 +15,21 @@ namespace {
 void ValidateDims(std::uint8_t dims) {
     if (dims != 2U && dims != 3U) throw std::logic_error("feed entry has invalid dimensions");
 }
-void ValidateArea(std::uint8_t dims, const std::optional<FeedArea>& area) {
+void ValidateArea(std::uint8_t dims, std::span<const FeedArea> areas) {
     ValidateDims(dims);
-    if (!area) return;
-    if (area->dims != dims || (dims == 2U && (area->first.z != 0 || area->last.z != 0)))
-        throw std::invalid_argument("feed area dimensions differ from entry");
-    if (area->first.x > area->last.x || area->first.y > area->last.y ||
-        (dims == 3U && area->first.z > area->last.z)) throw std::invalid_argument("feed area is reversed");
+    for (const auto& area : areas) {
+        if (area.dims != dims || (dims == 2U && (area.first.z != 0 || area.last.z != 0)))
+            throw std::invalid_argument("feed area dimensions differ from entry");
+        if (area.first.x > area.last.x || area.first.y > area.last.y ||
+            (dims == 3U && area.first.z > area.last.z)) throw std::invalid_argument("feed area is reversed");
+    }
 }
-bool InArea(ChunkCoord coord, std::uint8_t dims, const std::optional<FeedArea>& area) {
-    return !area || (coord.x >= area->first.x && coord.x <= area->last.x &&
-        coord.y >= area->first.y && coord.y <= area->last.y &&
-        (dims != 3U || (coord.z >= area->first.z && coord.z <= area->last.z)));
+bool InArea(ChunkCoord coord, std::uint8_t dims, std::span<const FeedArea> areas) {
+    return areas.empty() || std::any_of(areas.begin(), areas.end(), [&](const FeedArea& area) {
+        return coord.x >= area.first.x && coord.x <= area.last.x &&
+            coord.y >= area.first.y && coord.y <= area.last.y &&
+            (dims != 3U || (coord.z >= area.first.z && coord.z <= area.last.z));
+    });
 }
 void ValidateCoord(ChunkCoord coord, std::uint8_t dims) {
     if (dims == 2U && coord.z != 0) throw std::logic_error("feed entry has an inactive chunk coordinate");
@@ -175,10 +178,10 @@ std::string EncodeChunkForm(
 }
 
 std::shared_ptr<const FeedEntry> ChunkFeedEntry(const std::shared_ptr<const FeedEntry>& entry,
-    const Geometry& geometry, const std::optional<FeedArea>& area,
+    const Geometry& geometry, std::span<const FeedArea> areas,
     const std::optional<std::vector<std::uint32_t>>& ids) {
     if (entry->kind != FeedEntry::Kind::kChange && entry->kind != FeedEntry::Kind::kChunks) return entry;
-    ValidateArea(entry->dims, area);
+    ValidateArea(entry->dims, areas);
     if (entry->dims != geometry.dims()) throw std::logic_error("feed entry dimensions differ from table");
     if (ids && ids->empty()) throw std::invalid_argument("feed projection must not be empty");
     if (!entry->chunk_forms_complete) throw std::logic_error("chunk feed requires a complete preimage");
@@ -194,7 +197,7 @@ std::shared_ptr<const FeedEntry> ChunkFeedEntry(const std::shared_ptr<const Feed
     std::optional<Geometry> historical;
     for (auto chunk : entry->chunk_forms) {
         ValidateCoord(chunk.chunk, entry->dims);
-        if (!InArea(chunk.chunk, entry->dims, area)) continue;
+        if (!InArea(chunk.chunk, entry->dims, areas)) continue;
         if (ids && chunk.form) {
             const auto& form = *chunk.form;
             if (!historical) {
@@ -215,22 +218,24 @@ std::shared_ptr<const FeedEntry> ChunkFeedEntry(const std::shared_ptr<const Feed
         }
         result->chunk_forms.push_back(std::move(chunk));
     }
-    return result->chunk_forms.empty() ? nullptr : result;
+    if (result->chunk_forms.empty()) return nullptr;
+    result->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*result));
+    return result;
 }
 
 std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const FeedEntry>& entry,
-    const std::optional<FeedArea>& area, const std::optional<std::vector<std::uint32_t>>& ids,
+    std::span<const FeedArea> areas, const std::optional<std::vector<std::uint32_t>>& ids,
     bool no_before, const std::vector<Column>& columns) {
     if (entry->kind != FeedEntry::Kind::kChange && entry->kind != FeedEntry::Kind::kSchema) return entry;
-    ValidateArea(entry->dims, area);
+    ValidateArea(entry->dims, areas);
     if (ids && ids->empty()) throw std::invalid_argument("feed projection must not be empty");
-    if (!area && !ids && !no_before) return entry;
+    if (areas.empty() && !ids && !no_before) return entry;
     if (entry->kind == FeedEntry::Kind::kSchema && !ids) return entry;
-    if (entry->kind == FeedEntry::Kind::kChange && area && !ids && !no_before &&
+    if (entry->kind == FeedEntry::Kind::kChange && !areas.empty() && !ids && !no_before &&
         std::all_of(entry->blocks.begin(), entry->blocks.end(), [&](const auto& block) {
-            return InArea(block.chunk, entry->dims, area);
+            return InArea(block.chunk, entry->dims, areas);
         }) && std::all_of(entry->chunk_changes.begin(), entry->chunk_changes.end(), [&](const auto& change) {
-            return InArea(change.chunk, entry->dims, area);
+            return InArea(change.chunk, entry->dims, areas);
         })) return entry->blocks.empty() && entry->chunk_changes.empty() ? nullptr : entry;
     std::vector<std::size_t> selected;
     if (ids) selected = FeedProjectionIndexes(columns, *ids);
@@ -241,13 +246,14 @@ std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const Fee
             filtered->columns.clear();
             for (const auto index : selected) filtered->columns.push_back(columns[index]);
         }
+        filtered->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*filtered));
         return filtered;
     }
-    if (area) std::erase_if(filtered->blocks, [&](const auto& block) {
-        return !InArea(block.chunk, entry->dims, area);
+    if (!areas.empty()) std::erase_if(filtered->blocks, [&](const auto& block) {
+        return !InArea(block.chunk, entry->dims, areas);
     });
-    if (area) std::erase_if(filtered->chunk_changes, [&](const auto& change) {
-        return !InArea(change.chunk, entry->dims, area);
+    if (!areas.empty()) std::erase_if(filtered->chunk_changes, [&](const auto& change) {
+        return !InArea(change.chunk, entry->dims, areas);
     });
     if (filtered->blocks.empty() && filtered->chunk_changes.empty()) return nullptr;
     const auto project = [&](auto& row) {
@@ -262,6 +268,7 @@ std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const Fee
         project(block.after);
     }
     if (no_before) for (auto& change : filtered->chunk_changes) change.before.reset();
+    filtered->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*filtered));
     return filtered;
 }
 
@@ -399,8 +406,8 @@ std::size_t FeedChunkFormMinimumEncodedBytes(std::uint8_t dims, const std::share
     // The array header, the coordinates and version, then the form as a bulk string or a null.
     return 4U + 3U * (static_cast<std::size_t>(dims) + 1U) + (form ? form->size() + 5U : 3U);
 }
-bool FeedAreaHolds(const std::optional<FeedArea>& area, std::uint8_t dims, ChunkCoord coord) {
-    return InArea(coord, dims, area);
+bool FeedAreaHolds(std::span<const FeedArea> areas, std::uint8_t dims, ChunkCoord coord) {
+    return InArea(coord, dims, areas);
 }
 std::vector<std::size_t> FeedProjectionIndexes(const std::vector<Column>& columns, const std::vector<std::uint32_t>& ids) {
     if (ids.empty()) throw std::invalid_argument("feed projection must not be empty");
