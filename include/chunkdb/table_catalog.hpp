@@ -167,7 +167,8 @@ struct TableRestoreRequest {
     std::string name;
     // Ends the restore before publication; nothing is published then.
     std::stop_token cancelled{};
-    // Called after each copied file: files and bytes copied, and their totals.
+    // Called before the first and after each copied file: files and bytes
+    // copied, and their totals.
     std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t)> progress{};
 };
 struct TableRestoreResult {

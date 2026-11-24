@@ -16,17 +16,20 @@ void RestoresIntoNewName() {
         StoreId restored{};
         {
             TableCatalog catalog(source.Config());
-            std::uint64_t reported_files = 0U, reported_bytes = 0U, total_files = 0U, total_bytes = 0U;
+            std::uint64_t reported_files = 0U, reported_bytes = 0U, total_files = 0U, total_bytes = 0U, calls = 0U;
             auto request = source.Request();
             request.progress = [&](std::uint64_t files, std::uint64_t bytes, std::uint64_t all_files, std::uint64_t all_bytes) {
-                assert(files > reported_files && bytes >= reported_bytes && files <= all_files && bytes <= all_bytes);
+                // The totals come first, before any file is copied.
+                if (calls++ == 0U) assert(files == 0U && bytes == 0U && all_files > 0U && all_bytes > 0U);
+                else assert(files > reported_files && bytes >= reported_bytes);
+                assert(files <= all_files && bytes <= all_bytes);
                 // Not visible until the restore publishes it.
                 assert(catalog.Find("t_restored") == nullptr && !std::filesystem::exists(source.data / "tables/t_restored"));
                 reported_files = files; reported_bytes = bytes; total_files = all_files; total_bytes = all_bytes;
             };
             const auto result = catalog.RestoreTable(request);
             assert(result.name == "t_restored" && result.parent_epoch == source.epoch && result.fork_revision == source.cut);
-            assert(result.files == total_files && reported_files == total_files);
+            assert(result.files == total_files && reported_files == total_files && calls == total_files + 1U);
             assert(result.bytes == total_bytes && reported_bytes == total_bytes && total_bytes > 0U);
             restored = result.epoch;
             source.CheckRestored(catalog, "t_restored", restored);
@@ -194,7 +197,18 @@ void Cancellation() {
     std::stop_source stop;
     auto request = source.Request();
     request.cancelled = stop.get_token();
-    request.progress = [&](std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t) { stop.request_stop(); };
+    // A stop after the first file leaves copied files in staging, which the refusal removes.
+    request.progress = [&](std::uint64_t files, std::uint64_t, std::uint64_t all_files, std::uint64_t) {
+        if (files == 0U) return;
+        assert(files == 1U && all_files > 1U && Entries(source.data / ".chunkdb.staging") > 0U);
+        stop.request_stop();
+    };
+    assert(Throws([&] { (void)catalog.RestoreTable(request); }).find("cancelled") != std::string::npos);
+    LeavesNothingAfterRefusal(source, catalog);
+    // A stop at the totals, before any file is copied.
+    std::stop_source first;
+    request.cancelled = first.get_token();
+    request.progress = [&](std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t) { first.request_stop(); };
     assert(Throws([&] { (void)catalog.RestoreTable(request); }).find("cancelled") != std::string::npos);
     LeavesNothingAfterRefusal(source, catalog);
     std::stop_source before;
