@@ -61,6 +61,7 @@ struct UserRightsView {
     struct Entry {
         std::uint64_t incarnation = 0;
         std::map<std::string, Right> grants;
+        std::map<std::string, Right> prefix_grants = {};
     };
     std::map<std::string, Entry> users;
 };

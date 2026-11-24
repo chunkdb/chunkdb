@@ -63,7 +63,7 @@ KILL CONNECTION id
 
 | Error | When | What to do |
 | --- | --- | --- |
-| PERMISSION_DENIED | FLUSH lacks WRITE on a table, metrics or RELOAD TLS lacks wildcard ADMIN, backup lacks MANAGES USERS, or RESTORE TABLE lacks both wildcard ADMIN and MANAGES USERS. | Request access. |
+| PERMISSION_DENIED | FLUSH lacks WRITE on a table, metrics lack MONITOR and wildcard ADMIN, RELOAD TLS lacks wildcard ADMIN, backup lacks BACKUP and MANAGES USERS, or RESTORE TABLE lacks MANAGES USERS and wildcard ADMIN, and BACKUP or ADMIN on the new name. | Request access. |
 | TABLE_EXISTS | RESTORE TABLE names a table that exists. | Restore under another name with AS. |
 | BUSY | Another backup is running. | Wait for it to finish. |
 | INVALID_ARGUMENT | Backup configuration, destination or source is invalid, the backup has no such table, or its features or stored options differ from what this server serves. | Follow [Backup and restore](../BACKUP.md). |
@@ -89,7 +89,7 @@ RELOAD TLS replaces the certificate for new connections only; open connections k
 Replace the certificate and key files first, then run it; SIGHUP does the same on Linux and macOS.
 
 Connection identifiers are exact unsigned integers scoped to the server process.
-A user may list and control connections of the same live user incarnation; ADMIN on `*` permits access to all connections.
+A user may list and control connections of the same live user incarnation; ADMIN on `*` permits access to all connections, and MONITOR lists all connections without controlling them.
 Dropping and recreating a user does not grant the replacement user access to the previous user's connections.
 An empty user or statement is null in SHOW CONNECTIONS, and `statement` contains only the statement verb.
 `progress` is null unless the running statement reports progress; only RESTORE TABLE does.

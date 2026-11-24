@@ -43,11 +43,12 @@ struct User;
 class ReadRightCheck;
 struct PendingLogin;
 enum class Right : std::uint8_t;
+enum class ServerRight : std::uint8_t;
 
 // Deterministic command interleavings, following the feed hooks.
 struct CommandEngineTestHook {
     enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted, kBeforeTxnBudgetReclaim,
-        kAfterRestoreProgress, kBeforeTableStatsListing };
+        kAfterRestoreProgress, kAfterRestoreUserRead, kBeforeTableStatsListing };
     virtual ~CommandEngineTestHook() = default;
     virtual void Run(Point point, std::string_view table) = 0;
 };
@@ -208,6 +209,8 @@ struct SessionControlAccess {
     std::uint64_t requester_connection_id = 0U;
     std::uint64_t user_incarnation = 0U;
     bool admin_all = false;
+    // Lists every connection without controlling it: ADMIN on `*` or MONITOR.
+    bool list_all = false;
 };
 
 struct ConnectionInfo {
@@ -447,6 +450,12 @@ class CommandEngine {
     [[nodiscard]] std::optional<Right> RightOnTable(SessionState& session, const std::string& table) const;
     void RequireRight(SessionState& session, const std::string& table, Right needed) const;
     void RequireRightOnEveryTable(SessionState& session, Right needed) const;
+    // Whether the session's user holds `right`; every right without auth.
+    [[nodiscard]] bool HasServerRight(SessionState& session, ServerRight right) const;
+    // MONITOR, or ADMIN on `*`, which includes what MONITOR allows.
+    void RequireMonitor(SessionState& session) const;
+    // CREATE TABLE: ADMIN on the name, on a prefix of it, or on `*`.
+    void RequireCreateRight(SessionState& session, const std::string& table) const;
     void RequireManagesUsers(SessionState& session) const;
     // Records a reply in the command metrics.
     void ObserveReply(
