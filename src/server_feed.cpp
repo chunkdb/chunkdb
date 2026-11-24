@@ -10,6 +10,7 @@
 #include <climits>
 #include <limits>
 #include <unordered_map>
+#include <utility>
 #ifndef _WIN32
 #include <sys/uio.h>
 #endif
@@ -126,8 +127,14 @@ std::optional<std::size_t> FeedDeliveryTestAccess::RequestLineCapacity(ChunkServ
     return connection->request_line.capacity();
 }
 void FeedDeliveryTestAccess::InstallHook(ChunkServer& server, FeedDeliveryTestHook* hook, bool wake) {
+    // The feed I/O exists from when Run starts its transports, after the
+    // listener is published, until Stop; a hook installed outside that window
+    // would not reach it. Clearing a hook needs no transports.
     auto io = server.FeedIoHandle();
+    if (!io && hook != nullptr)
+        throw std::logic_error("a delivery hook needs the server's transports: install it once a request has been answered");
     server.delivery_test_hook_.store(hook, std::memory_order_release);
+    if (!io) return;
     {
         std::lock_guard lock(io->catchup_mutex_);
         io->hook_.store(hook, std::memory_order_release);
@@ -339,6 +346,7 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
         return;
     }
     const auto resync = [&] {
+        watch.merge.Clear(); watch.held.reset();
         // Finish an in-progress frame, preserving SSL_write's exact retry.
         const bool pinned = !watch.output.empty() && (watch.offset != 0U || watch.write_size != 0);
         if (pinned) {
@@ -349,9 +357,20 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
         }
         Queue(watch, std::make_shared<const std::string>(watch.connection->session.watch->ResyncFrame()));
     };
+    // A CHUNKS watch lags while its socket has not taken earlier output. Its
+    // pushes then merge, and their frame is queued once that output is sent.
+    bool lagging = !watch.output.empty();
+    if (!lagging && !watch.merge.empty()) {
+        auto bytes = Frame(watch.merge.Take());
+        if (bytes->size() > share) { resync(); return; }
+        Queue(watch, std::move(bytes));
+        lagging = true;
+    }
     for (std::size_t i = 0; i < 64U; ++i) {
-        auto entry = watch.connection->session.watch->Next();
+        auto entry = watch.held ? std::exchange(watch.held, nullptr) : watch.connection->session.watch->Next();
         if (!entry) {
+            // The subscription has passed the merged pushes; no progress before their frame.
+            if (!watch.merge.empty()) return;
             const auto now = std::chrono::steady_clock::now();
             if (now < watch.next_progress) return;
             watch.next_progress = now + std::chrono::milliseconds(server_.config_.feed_progress_ms);
@@ -365,6 +384,20 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
         }
         if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks)
             watch.next_progress = std::chrono::steady_clock::now() + std::chrono::milliseconds(server_.config_.feed_progress_ms);
+        if (entry->kind == FeedEntry::Kind::kResync) watch.merge.Clear(); // It replaces the merged pushes.
+        else if (entry->kind == FeedEntry::Kind::kChunks) {
+            const auto size = entry->protocol_frame ? entry->protocol_frame->size() : FeedChunksEncodedBytes(*entry);
+            const bool fits = size <= share && watch.bytes <= share - size;
+            if (lagging || !watch.merge.empty() || (!fits && !watch.output.empty())) {
+                if (watch.merge.Add(entry, share)) continue;
+                // Another schema version or a full merge: it waits for the merged frame.
+                if (!watch.merge.empty()) { watch.held = std::move(entry); return; }
+                // A push larger than the share alone resyncs below.
+            }
+        } else if (entry->kind != FeedEntry::Kind::kEnd && !watch.merge.empty()) {
+            watch.held = std::move(entry); // A schema push follows the merged changes.
+            return;
+        }
         auto bytes = Frame(entry);
         if (entry->kind == FeedEntry::Kind::kEnd) {
             watch.close = true;
@@ -438,6 +471,7 @@ void FeedIo::Read(Watch& watch) {
                 // UNWATCH. Queued frames own their bytes and still precede OK.
                 connection.session.watch.reset();
                 connection.session.catalog_watch.reset();
+                watch.merge.Clear(); watch.held.reset();
                 watch.return_ready = true;
                 Queue(watch, std::make_shared<const std::string>(Protocol::SimpleString("OK")));
             }
@@ -687,7 +721,11 @@ void FeedIo::Run() {
                     const auto timeout = remaining < 0 ? 0 : static_cast<int>(std::min<std::int64_t>(remaining + 1, INT_MAX));
                     if (progress_timeout < 0 || timeout < progress_timeout) progress_timeout = timeout;
                 };
-                if (!watch.connection->session.slot_watch && !watch.connection->session.catalog_watch && !watch.unwatch && !watch.close && !watch.dead) wait_until(watch.next_progress);
+                if (!watch.connection->session.slot_watch && !watch.connection->session.catalog_watch && !watch.unwatch && !watch.close && !watch.dead) {
+                    wait_until(watch.next_progress);
+                    // Merged pushes whose earlier output was sent are queued in the next round.
+                    if (watch.output.empty() && (!watch.merge.empty() || watch.held)) wait_until(now);
+                }
                 if (watch.excess_frames != 0U && !watch.dead) wait_until(watch.excess_progress + std::chrono::milliseconds(server_.config_.client_io_timeout_ms));
 #ifdef CHUNKDB_WITH_OPENSSL
                 if (watch.write_size == 0 && !watch.unwatch && !watch.close && !watch.read_paused && watch.connection->tls &&

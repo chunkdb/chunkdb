@@ -8,6 +8,7 @@
 #include <cassert>
 #include <chrono>
 #include <clocale>
+#include <cstdio>
 #include <filesystem>
 #include <cstdlib>
 #include <limits>
@@ -1316,6 +1317,126 @@ void TestMetricsNumberFormat() {
     assert(text.find("le=\"0,") == std::string::npos);
 }
 
+// Every listed table has chunkdb_table_fenced; one with a known frontier has
+// chunkdb_slot_frontier_frozen, both labelled with its escaped name.
+void TestMetricsTableStates() {
+    using State = chunkdb::MetricsRegistry::TableState;
+    const std::vector<State> states = {
+        {.table = "busy", .fenced = false, .slot_frontier_frozen = std::nullopt},
+        {.table = "failed\"x", .fenced = true, .slot_frontier_frozen = true},
+        {.table = "retired", .fenced = true, .slot_frontier_frozen = std::nullopt},
+        {.table = "terrain", .fenced = false, .slot_frontier_frozen = false},
+    };
+    const auto text = chunkdb::MetricsRegistry::RenderTableStates(states);
+    assert(text.find("# TYPE chunkdb_table_fenced gauge\n") != std::string::npos);
+    assert(text.find("# TYPE chunkdb_slot_frontier_frozen gauge\n") != std::string::npos);
+    assert(text.find("\nchunkdb_table_fenced{table=\"busy\"} 0\n") != std::string::npos);
+    assert(text.find("\nchunkdb_table_fenced{table=\"failed\\\"x\"} 1\n") != std::string::npos);
+    assert(text.find("\nchunkdb_table_fenced{table=\"retired\"} 1\n") != std::string::npos);
+    assert(text.find("\nchunkdb_table_fenced{table=\"terrain\"} 0\n") != std::string::npos);
+    assert(text.find("\nchunkdb_slot_frontier_frozen{table=\"failed\\\"x\"} 1\n") != std::string::npos);
+    assert(text.find("\nchunkdb_slot_frontier_frozen{table=\"terrain\"} 0\n") != std::string::npos);
+    assert(text.find("chunkdb_slot_frontier_frozen{table=\"busy\"}") == std::string::npos);
+    assert(text.find("chunkdb_slot_frontier_frozen{table=\"retired\"}") == std::string::npos);
+    AssertPrometheusText(chunkdb::MetricsRegistry().RenderPrometheus({}, 0) + text);
+
+    // Without tables the families have no samples.
+    const auto empty = chunkdb::MetricsRegistry::RenderTableStates({});
+    assert(empty.find('{') == std::string::npos);
+    AssertPrometheusText(empty);
+}
+
+// Metric names, types and label names are fixed for 2.x (docs/EXPORTER.md):
+// a release may add a metric, but renames or removes none.
+void TestMetricNamesFixed() {
+    std::vector<chunkdb::TableRuntimeStats> tables(1);
+    tables[0].table = "t";
+    const std::vector<chunkdb::MetricsRegistry::TableState> states = {
+        {.table = "t", .fenced = false, .slot_frontier_frozen = false}};
+    const auto text =
+        chunkdb::MetricsRegistry().RenderPrometheus(tables, 0) + chunkdb::MetricsRegistry::RenderTableStates(states);
+    // Each family: its type and its label names, `le` of histogram buckets aside.
+    std::map<std::string, std::pair<std::string, std::set<std::string>>> actual;
+    std::size_t begin = 0;
+    while (begin < text.size()) {
+        const auto end = text.find('\n', begin);
+        const std::string line = text.substr(begin, end - begin);
+        begin = end + 1U;
+        if (line.rfind("# HELP ", 0) == 0) continue;
+        if (line.rfind("# TYPE ", 0) == 0) {
+            const auto space = line.find(' ', 7U);
+            actual[line.substr(7U, space - 7U)].first = line.substr(space + 1U);
+            continue;
+        }
+        auto name = line.substr(0, line.find_first_of("{ "));
+        for (const char* suffix : {"_bucket", "_sum", "_count"}) {
+            const std::string_view s(suffix);
+            if (!actual.contains(name) && name.ends_with(s)) name.resize(name.size() - s.size());
+        }
+        auto& labels = actual.at(name).second;
+        auto at = line.find('{');
+        if (at == std::string::npos) continue;
+        // These label values hold no escaped quote.
+        while (line[at] != '}') {
+            const auto equals = line.find('=', at + 1U);
+            const auto label = line.substr(at + 1U, equals - at - 1U);
+            if (label != "le") labels.insert(label);
+            at = line.find('"', equals + 2U) + 1U;
+        }
+    }
+    const std::map<std::string, std::pair<std::string, std::set<std::string>>> expected = {
+        {"chunkdb_commands_total", {"counter", {"class", "outcome"}}},
+        {"chunkdb_errors_total", {"counter", {"code"}}},
+        {"chunkdb_auth_failures_total", {"counter", {}}},
+        {"chunkdb_command_duration_seconds", {"histogram", {"class"}}},
+        {"chunkdb_loaded_chunks", {"gauge", {}}},
+        {"chunkdb_large_chunk_containers", {"gauge", {}}},
+        {"chunkdb_large_chunk_container_limit", {"gauge", {}}},
+        {"chunkdb_large_chunk_refusals_total", {"counter", {}}},
+        {"chunkdb_active_connections", {"gauge", {}}},
+        {"chunkdb_pending_connections", {"gauge", {}}},
+        {"chunkdb_connections_rejected_total", {"counter", {}}},
+        {"chunkdb_malformed_requests_total", {"counter", {}}},
+        {"chunkdb_open_wal_streams", {"gauge", {"table"}}},
+        {"chunkdb_background_queue_depth", {"gauge", {"table"}}},
+        {"chunkdb_wal_barrier_full_syncs_total", {"counter", {"table"}}},
+        {"chunkdb_compressed_checkpoint_images_total", {"counter", {"table"}}},
+        {"chunkdb_evictions_total", {"counter", {"table"}}},
+        {"chunkdb_eviction_recency_skips_total", {"counter", {"table"}}},
+        {"chunkdb_eviction_snapshot_builds_total", {"counter", {"table"}}},
+        {"chunkdb_eviction_probes_total", {"counter", {"table"}}},
+        {"chunkdb_eviction_no_progress_cycles_total", {"counter", {"table"}}},
+        {"chunkdb_eviction_forced_wal_flushes_with_data_total", {"counter", {"table"}}},
+        {"chunkdb_eviction_forced_wal_flushes_empty_batch_total", {"counter", {"table"}}},
+        {"chunkdb_checkpoints_total", {"counter", {"table"}}},
+        {"chunkdb_background_checkpoints_total", {"counter", {"table"}}},
+        {"chunkdb_background_checkpoint_failures_total", {"counter", {"table"}}},
+        {"chunkdb_background_queue_full_inline_total", {"counter", {"table"}}},
+        {"chunkdb_wal_batch_flushes_total", {"counter", {"table"}}},
+        {"chunkdb_wal_barriers_total", {"counter", {"table"}}},
+        {"chunkdb_empty_chunk_gcs_total", {"counter", {"table"}}},
+        {"chunkdb_unique_loaded_chunks_total", {"counter", {"table"}}},
+        {"chunkdb_txn_history_bytes", {"gauge", {"table"}}},
+        {"chunkdb_txn_history_copies_total", {"counter", {"table"}}},
+        {"chunkdb_txn_history_copied_bytes_total", {"counter", {"table"}}},
+        {"chunkdb_table_fenced", {"gauge", {"table"}}},
+        {"chunkdb_slot_frontier_frozen", {"gauge", {"table"}}},
+    };
+    for (const auto& [name, family] : expected) {
+        const auto found = actual.find(name);
+        if (found == actual.end() || found->second != family) {
+            std::fprintf(stderr, "metric %s changed its name, type or labels\n", name.c_str());
+            std::abort();
+        }
+    }
+    for (const auto& [name, family] : actual) {
+        if (!expected.contains(name)) {
+            std::fprintf(stderr, "metric %s is not in the fixed list of docs/EXPORTER.md\n", name.c_str());
+            std::abort();
+        }
+    }
+}
+
 using Parameters = std::vector<std::optional<std::string>>;
 
 // ":<n>\r\n" -> n.
@@ -1621,6 +1742,8 @@ int main() {
     TestMetricsRegistry();
     TestMetricsTableLabels();
     TestMetricsNumberFormat();
+    TestMetricsTableStates();
+    TestMetricNamesFixed();
     TestEngineCommands();
     TestEngineAreaReadsMatchChunkGet();
     TestEngineChunkPutIfRequiresZeroPadding();
