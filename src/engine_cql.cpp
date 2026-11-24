@@ -2,12 +2,14 @@
 // (docs/CQL.md).
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
 #include <limits>
+#include <map>
 #include <optional>
 #include <set>
 #include <stdexcept>
@@ -953,6 +955,13 @@ bool HasColumn(const TableSchema& schema, std::string_view name) {
                        [name](const Column& column) { return column.name == name; });
 }
 
+// ADMIN on `*`, from that grant alone.
+[[nodiscard]] bool HasAdminOnEveryTable(const User* user) {
+    if (user == nullptr) return false;
+    const auto found = user->grants.find(kEveryTable);
+    return found != user->grants.end() && found->second >= Right::kAdmin;
+}
+
 // A recorded migration belongs to what its statement changes: ADMIN on the
 // table it names, or MANAGES USERS for GRANT and REVOKE. Only a caller with
 // that right sees the record or learns whether its name skips or conflicts.
@@ -1010,6 +1019,25 @@ void CommandEngine::RequireRightOnEveryTable(SessionState& session, Right needed
     const auto found = user != nullptr ? user->grants.find(kEveryTable) : decltype(user->grants.end()){};
     if (user == nullptr || found == user->grants.end() || found->second < needed) {
         throw PermissionDeniedError(std::string(RightName(needed)) + " on *");
+    }
+}
+
+bool CommandEngine::HasServerRight(SessionState& session, ServerRight right) const {
+    if (!config_.require_auth) return true;
+    const User* user = CurrentUser(session);
+    return user != nullptr && chunkdb::HasServerRight(*user, right);
+}
+
+void CommandEngine::RequireMonitor(SessionState& session) const {
+    if (!HasServerRight(session, ServerRight::kMonitor) && !HasAdminOnEveryTable(CurrentUser(session))) {
+        throw PermissionDeniedError("MONITOR or ADMIN on *");
+    }
+}
+
+void CommandEngine::RequireCreateRight(SessionState& session, const std::string& table) const {
+    // Checked before the name is looked up: the reply does not tell whether it exists.
+    if (const auto right = RightOnTable(session, table); !right.has_value() || *right < Right::kAdmin) {
+        throw PermissionDeniedError("ADMIN on " + table);
     }
 }
 
@@ -1276,7 +1304,7 @@ std::string CommandEngine::ExecuteStatement(
                     request.record = {migration.name, 0U, config_.require_auth ? session.user : std::string{}, migration.text};
                     std::visit(Overloaded{
                         [&](const cql::CreateTable& create) {
-                            RequireRightOnEveryTable(session, Right::kAdmin);
+                            RequireCreateRight(session, create.table);
                             request.kind = MigrationRequest::Kind::kCreate;
                             request.table = create.table;
                             request.if_not_exists = create.if_not_exists;
@@ -1346,7 +1374,7 @@ std::string CommandEngine::ExecuteStatement(
                             RequireManagesUsers(session);
                             request.kind = MigrationRequest::Kind::kGrant;
                             request.user = grant.user; request.table = grant.table;
-                            request.right = grant.right; request.revoke = grant.revoke;
+                            request.right = grant.right; request.server_rights = grant.server_rights; request.revoke = grant.revoke;
                         },
                         [&](const cql::CreateSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
@@ -1374,8 +1402,7 @@ std::string CommandEngine::ExecuteStatement(
                     const User* user = CurrentUser(session);
                     // Without MANAGES USERS or an ADMIN grant no record is within the
                     // caller's rights: the ledger is not read.
-                    if (config_.require_auth && (user == nullptr || (!user->manages_users &&
-                            std::none_of(user->grants.begin(), user->grants.end(), [](const auto& grant) { return grant.second >= Right::kAdmin; })))) {
+                    if (config_.require_auth && (user == nullptr || (!user->manages_users && !HasAnyGrant(*user, Right::kAdmin)))) {
                         std::string empty;
                         Protocol::AppendArrayHeader(empty, 0U);
                         return empty;
@@ -1475,15 +1502,17 @@ std::string CommandEngine::ExecuteStatement(
                         for (auto& slot : table->ListFeedSlots(true))
                             if (!show.prefix || slot.name.starts_with(*show.prefix)) slots.emplace_back(name, std::move(slot));
                     };
+                    // MONITOR lists the slots of every table; owners stay hidden.
+                    const bool monitor = HasServerRight(session, ServerRight::kMonitor);
                     if (show.table) {
-                        RequireRight(session, *show.table, Right::kRead);
+                        if (!monitor) RequireRight(session, *show.table, Right::kRead);
                         append(*show.table);
                     } else {
                         const auto tables = catalog_->List();
                         if (auto* hook = hook_.load(std::memory_order_acquire))
                             hook->Run(CommandEngineTestHook::Point::kAfterSlotTablesListed, {});
                         for (const auto& info : tables) {
-                            if (!RightOnTable(session, info.name)) continue;
+                            if (!monitor && !RightOnTable(session, info.name)) continue;
                             try {
                                 append(info.name);
                             } catch (const TableNotFoundError&) {
@@ -1993,7 +2022,7 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::CreateTable& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
-                    RequireRightOnEveryTable(session, Right::kAdmin);
+                    RequireCreateRight(session, create.table);
                     (void)catalog_->Create(create.table,
                         [&] { return DefinitionFrom(create, catalog_->default_options()); }, create.if_not_exists);
                     return Protocol::SimpleString("OK");
@@ -2077,10 +2106,9 @@ std::string CommandEngine::ExecuteStatement(
                                 });
                             },
                             [&](const cql::RenameTable& rename) {
-                                // Grants move with the table: the new name must be one the user administers.
-                                const auto right = RightOnTable(session, rename.new_name);
-                                if (!right.has_value() || *right < Right::kAdmin)
-                                    throw PermissionDeniedError(std::string(RightName(Right::kAdmin)) + " on " + rename.new_name);
+                                // Grants move with the table: the new name must be one the user
+                                // administers, through its name, a matching prefix or `*`.
+                                RequireCreateRight(session, rename.new_name);
                                 std::stop_source cancelled;
                                 const auto request_stop = [&] { cancelled.request_stop(); };
                                 std::stop_callback shutdown(session.backup_cancelled, request_stop);
@@ -2116,7 +2144,8 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::ShowTableStats& stats) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
-                    RequireRight(session, stats.table, Right::kRead);
+                    // MONITOR sees every table, as SHOW STATUS lists them.
+                    if (!HasServerRight(session, ServerRight::kMonitor)) RequireRight(session, stats.table, Right::kRead);
                     std::string reply;
                     std::filesystem::path dir;
                     Table::FeedCounts feeds;
@@ -2195,10 +2224,7 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::FlushWal&) {
                     command_class = MetricsRegistry::CommandClass::kBarrier;
                     if (const User* user = CurrentUser(session); config_.require_auth &&
-                        (user == nullptr ||
-                         std::none_of(user->grants.begin(), user->grants.end(), [](const auto& grant) {
-                             return grant.second >= Right::kWrite;
-                         }))) {
+                        (user == nullptr || !HasAnyGrant(*user, Right::kWrite))) {
                         throw PermissionDeniedError("WRITE on a table");
                     }
                     // Every table: a connection may have written to several.
@@ -2211,7 +2237,10 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::Backup& backup) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
-                    if (config_.require_auth) RequireManagesUsers(session);
+                    if (config_.require_auth && !HasServerRight(session, ServerRight::kBackup)) {
+                        if (const User* user = CurrentUser(session); user == nullptr || !user->manages_users)
+                            throw PermissionDeniedError("BACKUP or MANAGES USERS");
+                    }
                     if (config_.backup_dir.empty())
                         throw std::invalid_argument("BACKUP is disabled: set --backup-dir <path>");
                     const auto target = ResolveBackupTarget(config_.backup_dir, backup.path);
@@ -2259,9 +2288,20 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::RestoreTable& restore) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
-                    // The right CREATE TABLE needs, or the one BACKUP needs.
-                    if (const User* user = CurrentUser(session); config_.require_auth && (user == nullptr || !user->manages_users))
-                        RequireRightOnEveryTable(session, Right::kAdmin);
+                    // MANAGES USERS or ADMIN on `*`: the backup may hold any table. BACKUP,
+                    // the right BACKUP TO also takes, needs ADMIN on the new name as
+                    // CREATE TABLE does: the restored table falls under its grants.
+                    // Every check reads this one user: another CurrentUser call
+                    // replaces it after a user change and frees it.
+                    const User* user = CurrentUser(session);
+                    if (auto* hook = hook_.load(std::memory_order_acquire))
+                        hook->Run(CommandEngineTestHook::Point::kAfterRestoreUserRead, restore.name);
+                    if (config_.require_auth && (user == nullptr || !user->manages_users) && !HasAdminOnEveryTable(user)) {
+                        if (user == nullptr || !chunkdb::HasServerRight(*user, ServerRight::kBackup))
+                            throw PermissionDeniedError("BACKUP, MANAGES USERS or ADMIN on *");
+                        if (const auto right = RightOn(*user, restore.name); !right.has_value() || *right < Right::kAdmin)
+                            throw PermissionDeniedError("ADMIN on " + restore.name);
+                    }
                     if (config_.backup_dir.empty())
                         throw std::invalid_argument("RESTORE TABLE is disabled: set --backup-dir <path>");
                     TableRestoreRequest request;
@@ -2482,9 +2522,9 @@ std::string CommandEngine::ExecuteStatement(
                     // table's grants sees this change before or after it.
                     catalog_->ChangeGrants([&] {
                         if (grant.revoke) {
-                            config_.users->Revoke(grant.user, grant.table, grant.right);
+                            config_.users->Revoke(grant.user, grant.table, grant.right, grant.server_rights);
                         } else {
-                            config_.users->Grant(grant.user, grant.table, grant.right);
+                            config_.users->Grant(grant.user, grant.table, grant.right, grant.server_rights);
                         }
                     });
                     return Protocol::SimpleString("OK");
@@ -2496,7 +2536,7 @@ std::string CommandEngine::ExecuteStatement(
                     std::string reply;
                     Protocol::AppendArrayHeader(reply, users.users.size());
                     for (const auto& [name, user] : users.users) {
-                        Protocol::AppendMapHeader(reply, 5);
+                        Protocol::AppendMapHeader(reply, 6);
                         Protocol::AppendBulk(reply, "name");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "manages_users");
@@ -2505,12 +2545,24 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendBoolean(reply, user.requires_channel_binding);
                         Protocol::AppendBulk(reply, "verifiers");
                         Protocol::AppendInteger(reply, std::uint64_t{user.added_verifier ? 2U : 1U});
+                        // Prefix grants as written: `p*`, in name order with the others.
+                        std::map<std::string, Right> grants = user.grants;
+                        for (const auto& [prefix, right] : user.prefix_grants) grants.emplace(prefix + "*", right);
                         Protocol::AppendBulk(reply, "grants");
-                        Protocol::AppendMapHeader(reply, user.grants.size());
-                        for (const auto& [table, right] : user.grants) {
+                        Protocol::AppendMapHeader(reply, grants.size());
+                        for (const auto& [table, right] : grants) {
                             Protocol::AppendBulk(reply, table);
                             Protocol::AppendBulk(reply, RightName(right));
                         }
+                        constexpr std::array<std::pair<ServerRight, const char*>, 3> kServerRightNames{{
+                            {ServerRight::kMonitor, "MONITOR"}, {ServerRight::kBackup, "BACKUP"},
+                            {ServerRight::kReplication, "REPLICATION"}}};
+                        std::size_t held = 0U;
+                        for (const auto& [right, _] : kServerRightNames) held += chunkdb::HasServerRight(user, right) ? 1U : 0U;
+                        Protocol::AppendBulk(reply, "server_rights");
+                        Protocol::AppendArrayHeader(reply, held);
+                        for (const auto& [right, label] : kServerRightNames)
+                            if (chunkdb::HasServerRight(user, right)) Protocol::AppendBulk(reply, label);
                     }
                     return reply;
                 },
@@ -2522,7 +2574,7 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::ShowStatus&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
-                    RequireRightOnEveryTable(session, Right::kAdmin);
+                    RequireMonitor(session);
                     std::string reply;
                     const auto uptime = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_);
                     const auto status = catalog_->FeatureStatus();
@@ -2569,7 +2621,7 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::ShowMetrics&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
-                    RequireRightOnEveryTable(session, Right::kAdmin);
+                    RequireMonitor(session);
                     return HandleMetrics();
                 },
                 [&](const cql::ReloadTls&) {

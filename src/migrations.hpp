@@ -25,7 +25,8 @@ struct MigrationRequest {
     // ALTER COLUMN ... DROP NULL of this column, checked as a narrowing is.
     std::optional<std::string> drop_null{};
     std::string user;
-    Right right = Right::kRead;
+    std::optional<Right> right;
+    std::uint8_t server_rights = 0U;
     bool revoke = false;
     std::string slot;
     FeedSlotFilters slot_filters{};

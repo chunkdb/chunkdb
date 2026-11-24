@@ -288,7 +288,7 @@ After that decision an incomplete publication returns OUTCOME_UNKNOWN stage=feat
 Each manifest uses the established atomic checked publication and directory-sync rules; no unsynced shortcut or fallback is allowed.
 The journal is cleared only after all affected manifests and directories are durable; replay is idempotent across every publication crash point.
 
-SHOW STATUS requires ADMIN on `*` and returns `{directory,tables,activation_pending}`.
+SHOW STATUS requires MONITOR or ADMIN on `*` and returns `{directory,tables,activation_pending}`.
 The directory map is `{enabled,compat,ro_compat,incompat}`; table maps add `name` and appear in the `tables` array.
 `enabled` is `[bulk_feature_name,…]`, containing known feature names.
 The raw masks are checked unsigned u64 values, preserving unsupported bits explicitly.
