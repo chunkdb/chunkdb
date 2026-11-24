@@ -728,6 +728,16 @@ struct Type {
     return out;
 }
 
+// A float literal compared with an f32 operand: the nearest f32. A finite
+// value beyond f32 keeps its value, so it still compares beyond every f32
+// instead of as an infinity.
+[[nodiscard]] double NearestF32(double value) {
+    if (std::isfinite(value) && std::fabs(value) > static_cast<double>(std::numeric_limits<float>::max())) {
+        return value;
+    }
+    return static_cast<double>(static_cast<float>(value));
+}
+
 // The one type of COALESCE's arguments.
 [[nodiscard]] Type MergeAny(const Type& a, const Type& b, const Node& node) {
     if (IsOpen(a.category) || IsOpen(b.category) || (IsNumber(a.category) && IsNumber(b.category))) {
@@ -857,6 +867,7 @@ class Planner {
         types_.resize(nodes.size());
         bindings_.resize(nodes.size());
         declared_.resize(nodes.size());
+        to_f32_.resize(nodes.size());
     }
 
     // Plans a condition, or an assignment's value for a column of `target`.
@@ -1024,8 +1035,10 @@ class Planner {
     // parameters and NULL) takes `context`, the type its parent passes down:
     // the other side of a comparison, the value an IN list or BETWEEN
     // tests, the assigned column, or the type of an enclosing typed
-    // operation. Literals keep the value they are written with; only an
-    // assignment rounds to the assigned column's type.
+    // operation. In a condition, a float literal that takes f32 this way
+    // is rounded to f32, as a parameter in its place would be; in an
+    // assignment, literals keep the value they are written with and only
+    // the result is rounded to the assigned column's type.
     void Bind(const std::optional<Type>& target) {
         const auto& nodes = expression_.nodes;
         std::vector<std::optional<Type>> context(nodes.size());
@@ -1040,6 +1053,10 @@ class Planner {
             const Type own = !types_[i].typed && context[i] ? *context[i] : types_[i];
             const std::optional<Type> down = own.typed ? std::optional<Type>(own) : std::nullopt;
             switch (node.op) {
+                case Op::kLiteral:
+                    to_f32_[i] = !target && own.typed && own.repr.kind == ColumnKind::kFloat32 &&
+                                 std::holds_alternative<double>(node.literal);
+                    break;
                 case Op::kParameter:
                     if (!own.typed) {
                         TypeError(
@@ -1115,7 +1132,7 @@ class Planner {
                     const auto magnitude = static_cast<detail::Int>(literal.magnitude);
                     value.integer = literal.negative ? -magnitude : magnitude;
                 } else if constexpr (std::is_same_v<T, double>) {
-                    value.number = literal;
+                    value.number = to_f32_[index] ? NearestF32(literal) : literal;
                 } else if constexpr (std::is_same_v<T, bool>) {
                     value.boolean = literal;
                 } else if constexpr (std::is_same_v<T, cql::Text>) {
@@ -1166,6 +1183,8 @@ class Planner {
     std::vector<Type> types_;
     std::vector<std::optional<ColumnBinding>> bindings_;
     std::vector<std::optional<ColumnType>> declared_;
+    // Float literals of a condition compared with an f32 operand.
+    std::vector<bool> to_f32_;
 };
 
 void SortParameters(Program* program) {
