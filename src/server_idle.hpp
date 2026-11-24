@@ -73,6 +73,11 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
     void Serve(std::shared_ptr<ServerConnection>& connection);
     void Abandon(std::shared_ptr<ServerConnection>& connection, const std::exception& error);
     void PumpCredits();
+    // Charges a request before login for the kept frame lengths its headers
+    // gave so far; false when the login credit cannot hold them.
+    bool ChargeLoginInput(ServerConnection& connection);
+    // The line credit a connection's reads draw from: before login its own.
+    server_detail::ConnectionByteBudget& LineCredit(const ServerConnection& connection) const;
     void CheckStatements();
     ChunkServer& server_;
     server_detail::SocketPoller poller_;
@@ -81,6 +86,7 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
     std::thread thread_;
     std::shared_ptr<server_detail::ConnectionByteBudget> data_credit_, control_credit_, line_credit_, data_line_credit_;
     std::shared_ptr<server_detail::ConnectionByteBudget> data_output_credit_, control_output_credit_;
+    std::shared_ptr<server_detail::ConnectionByteBudget> login_credit_, login_line_credit_;
     std::deque<std::weak_ptr<ServerConnection>> data_waiters_, control_waiters_;
     std::atomic<std::size_t> data_waiter_count_{0U};
     struct TrackedStatement {

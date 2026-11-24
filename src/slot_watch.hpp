@@ -27,7 +27,7 @@ struct FeedDeliveryTestHook {
         kBeforeQueuedStopScan, kAfterQueuedStopClaim, kBeforeStatementStart, kAfterStatementStartRefused,
         kAfterStatementQueued, kAfterFeedReplyQueue, kFeedInputBackpressure, kAfterRunningStopPublication,
         kBeforeReplyBufferWrite, kAfterReplyBufferWrite, kAfterBlockedReplyWrite, kAfterAuthReplyScheduled,
-        kAfterPayloadCreditQueued, kAfterPayloadCreditGranted, kAfterStatementTrackerScan,
+        kAfterPayloadCreditQueued, kAfterPayloadCreditGranted, kAfterLineCreditRefused, kAfterStatementTrackerScan,
         kBeforeBufferedStatementPublication, kBeforeTakeoverReservation, kBeforeWorkerIdleWait, kBeforeWorkerReceive,
         kAfterSlotCancel, kAfterSlotSocketClose,
         kBeforeListenerPublication, kAfterListenerPublication,

@@ -5698,6 +5698,67 @@ void TestRemovingCreditHeadAdmitsNextWaiter() {
     hook.Wait(small_id, true);
 }
 
+class LoginCreditHook : public chunkdb::FeedDeliveryTestHook {
+  public:
+    void Run(Point point, std::size_t) override {
+        if (point != Point::kAfterPayloadCreditGranted && point != Point::kAfterLineCreditRefused) return;
+        { std::lock_guard lock(mutex_); ++(point == Point::kAfterPayloadCreditGranted ? granted_ : refused_); }
+        changed_.notify_all();
+    }
+    void WaitGranted(std::size_t count) {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return granted_ >= count; }));
+    }
+    void WaitRefused() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, std::chrono::seconds(10), [&] { return refused_ != 0U; }));
+    }
+  private:
+    std::mutex mutex_;
+    std::condition_variable changed_;
+    std::size_t granted_ = 0U, refused_ = 0U;
+};
+
+// Before login a kept frame is charged the length its header gives, so many
+// logins with an unfinished client_name frame hold only those bytes; charged
+// the most such a HELLO could keep and drain, 15 of them filled the reserve.
+void TestLoginFramesChargedByLength() {
+    LoginCreditHook hook;
+    auto config = BaseServerConfig(); config.client_io_timeout_ms = 30000;
+    ServerHarness harness("login-frame-credit", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    std::vector<std::unique_ptr<RawClient>> logins;
+    for (std::size_t i = 0U; i < 24U; ++i) {
+        auto client = std::make_unique<RawClient>("127.0.0.1", harness.port);
+        client->SetReadDeadline(std::chrono::seconds(10));
+        client->SendBytes("HELLO 3 WITH client_name=$1\r\n$4\r\n");
+        hook.WaitGranted(i + 1U);
+        logins.push_back(std::move(client));
+    }
+    for (auto& client : logins) {
+        client->SendBytes("name\r\n");
+        (void)ReadHelloReply(*client);
+    }
+}
+
+// Lines before login draw from their own credit: while unfinished login
+// lines hold all of it, a logged-in connection still reads its requests.
+void TestLoginLinesUseTheirOwnCredit() {
+    LoginCreditHook hook;
+    auto config = BaseServerConfig(); config.client_io_timeout_ms = 30000; config.max_line_bytes = 1048576U;
+    ServerHarness harness("login-line-credit", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false}, config);
+    RawClient logged("127.0.0.1", harness.port); logged.SetReadDeadline(std::chrono::seconds(10)); logged.Hello();
+    chunkdb::FeedDeliveryTestAccess::SetObserverHook(*harness.server, &hook);
+    // Each unfinished line holds max_line_bytes + 4096 bytes, so 16 of them need more than 16 MiB.
+    std::vector<std::unique_ptr<RawClient>> partial;
+    for (std::size_t i = 0U; i < 16U; ++i) {
+        partial.push_back(std::make_unique<RawClient>("127.0.0.1", harness.port));
+        partial.back()->SendBytes("HELLO");
+    }
+    hook.WaitRefused();
+    logged.SendLine("PING"); assert(logged.ReadLine() == "+PONG\r\n");
+}
+
 // Time spent waiting for the server's input credit is not the client's
 // lateness: the frame deadline starts when the credit is granted, and a
 // wait longer than the I/O timeout is refused with BUSY.
@@ -8535,6 +8596,8 @@ int main(int argc, char** argv) {
         run("TestWideNullableReadHasBoundedReplyAdmission", TestWideNullableReadHasBoundedReplyAdmission);
         run("TestReplyAdmissionPrecedesMutation", TestReplyAdmissionPrecedesMutation);
         run("TestRemovingCreditHeadAdmitsNextWaiter", TestRemovingCreditHeadAdmitsNextWaiter);
+        run("TestLoginFramesChargedByLength", TestLoginFramesChargedByLength);
+        run("TestLoginLinesUseTheirOwnCredit", TestLoginLinesUseTheirOwnCredit);
         run("TestPayloadCreditWaitIsRefused", TestPayloadCreditWaitIsRefused);
         run("TestPayloadCreditGrantRestartsFrameDeadline", TestPayloadCreditGrantRestartsFrameDeadline);
         run("TestKillIdleTransactionReleasesHistory", [] { TestKillIdleTransactionReleasesHistory<RawClient>(false); });
