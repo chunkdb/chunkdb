@@ -243,6 +243,25 @@ void TestInventory() {
         const Bytes shortened(good.begin(), good.begin() + static_cast<std::ptrdiff_t>(length));
         Reject([&] { (void)ReadInventory(shortened, shape); }, "index");
     }
+    // No entry reaches the caller before the checksum and the end of the
+    // file are checked.
+    for (const auto& damaged : {[&] { auto changed = good; changed.back() ^= 1; return changed; }(),
+             [&] { auto changed = good; changed.push_back(0); return changed; }()}) {
+        std::size_t seen = 0;
+        const std::string text(damaged.begin(), damaged.end());
+        std::istringstream input(text);
+        Reject([&] { (void)chunkdb::ReadIndexInventory(input, good.size(), shape, kTable,
+            [&](const chunkdb::IndexInventoryEntry&) { ++seen; }); }, "index inventory");
+        assert(seen == 0U);
+    }
+    {
+        std::size_t seen = 0;
+        const std::string text(good.begin(), good.end());
+        std::istringstream input(text);
+        (void)chunkdb::ReadIndexInventory(input, good.size(), shape, kTable,
+            [&](const chunkdb::IndexInventoryEntry&) { ++seen; });
+        assert(seen == 2U);
+    }
     auto extra = good; extra.push_back(0);
     Reject([&] { (void)ReadInventory(extra, shape); }, "length");
     Reject([&] { (void)ReadInventory(extra, shape, good.size()); }, "after index inventory");
@@ -271,6 +290,22 @@ void TestInventory() {
     } buffer(std::string(bytes.begin(), bytes.end()));
     std::istream input(&buffer);
     assert(chunkdb::ReadIndexInventory(input, bytes.size(), shape, kTable).count == 10000);
+    {
+        // Every entry reaches a callback in order, from a second pass.
+        const std::string text(bytes.begin(), bytes.end());
+        std::istringstream seekable(text);
+        std::int64_t next = 0;
+        assert(chunkdb::ReadIndexInventory(seekable, bytes.size(), shape, kTable,
+            [&](const chunkdb::IndexInventoryEntry& entry) { assert(entry.coord.z == next); ++next; }).count == 10000);
+        assert(next == 10000);
+        // A callback needs a stream that can be read twice.
+        NonSeekingBuffer once(text);
+        std::istream unseekable(&once);
+        std::size_t seen = 0;
+        Reject([&] { (void)chunkdb::ReadIndexInventory(unseekable, bytes.size(), shape, kTable,
+            [&](const chunkdb::IndexInventoryEntry&) { ++seen; }); }, "read twice");
+        assert(seen == 0U);
+    }
     std::istringstream throwing(std::string(good.begin(), good.end()));
     throwing.exceptions(std::ios_base::badbit | std::ios_base::failbit);
     assert(chunkdb::ReadIndexInventory(throwing, good.size(), shape, kTable).count == 2);
