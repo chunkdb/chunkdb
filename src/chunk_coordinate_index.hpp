@@ -91,6 +91,11 @@ class ChunkCoordinateIndex {
     [[nodiscard]] CoordinateReservation Prepare(const ChunkCoord& coord, ChunkCoordinateNode** cache_slot);
     [[nodiscard]] CoordinatePage Page(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
         std::optional<std::uint64_t> since = {}) const;
+    // The coordinates populated at revision `snapshot`, with every write up to
+    // it published: those populated now and those changed after it. A reader
+    // checks each one against the snapshot.
+    [[nodiscard]] CoordinatePage SnapshotPage(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
+        std::uint64_t snapshot) const;
     // Exclusive current-state preparation does not make a history promise.
     [[nodiscard]] CoordinatePage CurrentPage(bool has_cursor, const ChunkCoord& cursor, std::size_t limit) const;
     [[nodiscard]] std::optional<ChunkIndexRecord> EmptyBoundary(const ChunkCoord& coord) const;

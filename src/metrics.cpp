@@ -278,6 +278,10 @@ std::string MetricsRegistry::RenderPrometheus(
     out += "# TYPE chunkdb_background_queue_depth gauge\n";
     AppendCounter(&out, "chunkdb_background_queue_depth", "", store_stats.background_queue_depth);
 
+    out += "# HELP chunkdb_txn_history_bytes Bytes of the chunk states kept for open transaction snapshots.\n";
+    out += "# TYPE chunkdb_txn_history_bytes gauge\n";
+    AppendCounter(&out, "chunkdb_txn_history_bytes", "", store_stats.txn_history_bytes);
+
     const auto render_signed_gauge =
         [&out](std::string_view name, std::string_view help, std::int64_t value) {
             out += "# HELP ";
@@ -365,6 +369,12 @@ std::string MetricsRegistry::RenderPrometheus(
          store_stats.empty_chunk_gcs},
         {"chunkdb_unique_loaded_chunks_total", "Chunk loads into the cache.",
          store_stats.unique_loaded_chunks},
+        {"chunkdb_txn_history_copies_total",
+         "Chunk states writes copied to keep open transaction snapshots.",
+         store_stats.txn_history_copies},
+        {"chunkdb_txn_history_copied_bytes_total",
+         "Bytes of the chunk states writes copied to keep open transaction snapshots.",
+         store_stats.txn_history_copied_bytes},
     };
     for (const auto& counter : counters) {
         out += "# HELP ";

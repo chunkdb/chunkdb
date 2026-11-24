@@ -194,6 +194,11 @@ struct StoreRuntimeStats {
     std::uint64_t background_queue_full_inline = 0;
     std::uint64_t background_queue_depth = 0;
     std::uint64_t compressed_checkpoint_images = 0;
+    // Chunk states writes copied for open transaction snapshots, their bytes,
+    // and the bytes of the states kept now (--txn-history-bytes).
+    std::uint64_t txn_history_copies = 0;
+    std::uint64_t txn_history_copied_bytes = 0;
+    std::uint64_t txn_history_bytes = 0;
 };
 
 // Random identity of a data directory, recorded in its manifest.
@@ -745,6 +750,14 @@ class ChunkStore {
         bool has_cursor, ChunkCoord cursor, std::size_t limit,
         std::optional<std::uint64_t> since = {}, bool with_data = false,
         const ChunkScanFilter* filter = nullptr);
+    // ScanChunkIdentities as of a snapshot from BeginCompletedTxnSnapshot:
+    // the chunks populated at the snapshot, with their state and version
+    // then, also those a later write emptied; `position` is the snapshot's
+    // revision. Throws std::invalid_argument for another store's snapshot or
+    // one whose writes have not all completed, and as the snapshot reads do.
+    [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentitiesAt(const TxnSnapshot& snapshot,
+        bool has_cursor, ChunkCoord cursor, std::size_t limit, bool with_data = false,
+        const ChunkScanFilter* filter = nullptr);
     // With `with_vars`, each entry carries its text and bytes values, and
     // they count toward the response-byte limit.
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange(
@@ -860,6 +873,12 @@ class ChunkStore {
     // opened with allow_multiple_processes: its history would not see every
     // write.
     [[nodiscard]] std::unique_ptr<TxnSnapshot> BeginTxnSnapshot(std::chrono::milliseconds max_duration);
+    // A snapshot as BeginTxnSnapshot takes it, returned once every write it
+    // includes has completed, so the coordinate index lists the chunks those
+    // writes populated (ScanChunkIdentitiesAt). It waits for such writes as a
+    // backup cut does; past `max_duration` it throws TransactionConflictError,
+    // and a cancelled statement stops the wait.
+    [[nodiscard]] std::unique_ptr<TxnSnapshot> BeginCompletedTxnSnapshot(std::chrono::milliseconds max_duration);
     // Whether the snapshot was taken of this store: a table altered or
     // dropped since has another.
     [[nodiscard]] bool OwnsTxnSnapshot(const TxnSnapshot& snapshot) const noexcept;
@@ -1568,6 +1587,10 @@ class ChunkStore {
     void PrepareCoordinateIndex();
     void InitializeCoordinateIndex();
     [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> CoordinateIndexForScan();
+    // ScanChunkIdentities, or ScanChunkIdentitiesAt with `snapshot`.
+    [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentitiesImpl(const TxnSnapshot* snapshot, bool has_cursor,
+        ChunkCoord cursor, std::size_t limit, std::optional<std::uint64_t> since, bool with_data,
+        const ChunkScanFilter* filter);
     [[nodiscard]] std::optional<ChunkIndexRecord> RetainedEmptyBoundaryForArchive(const ChunkCoord& coord);
     [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> RetainedIndexForSnapshot();
     // Before a loaded chunk can append, drops what replay could not use: the

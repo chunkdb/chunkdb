@@ -235,6 +235,9 @@ void AddRuntimeStats(StoreRuntimeStats* total, const StoreRuntimeStats& add) {
     total->background_queue_full_inline += add.background_queue_full_inline;
     total->background_queue_depth += add.background_queue_depth;
     total->compressed_checkpoint_images += add.compressed_checkpoint_images;
+    total->txn_history_copies += add.txn_history_copies;
+    total->txn_history_copied_bytes += add.txn_history_copied_bytes;
+    total->txn_history_bytes += add.txn_history_bytes;
 }
 
 }  // namespace
@@ -1091,7 +1094,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 12);
+    Protocol::AppendArrayHeader(reply, 13);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -1104,6 +1107,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "channel_binding");
     Protocol::AppendBulk(reply, "area_paging");
     Protocol::AppendBulk(reply, "area_scale");
+    Protocol::AppendBulk(reply, "read_only_transactions");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 2U : 1U);
     entry("statement_timeout_ms", session.hello_options.statement_timeout_ms.value_or(session.default_statement_timeout_ms));

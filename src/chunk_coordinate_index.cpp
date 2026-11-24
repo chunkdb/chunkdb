@@ -452,6 +452,10 @@ void ChunkCoordinateIndex::PublishReservation(CoordinateReservation& reservation
     const auto previous_revision = reservation.node_->revision.load(std::memory_order_relaxed);
     if (revision <= previous_revision) std::terminate();
     const bool previous = reservation.node_->populated.load(std::memory_order_relaxed);
+    // The revision goes first: a snapshot page that finds a coordinate no
+    // longer populated under the index lock also finds the revision that
+    // emptied it (SnapshotPage).
+    reservation.node_->revision.store(revision, std::memory_order_release);
     if (previous != populated) {
         std::lock_guard lock(mutex_);
         if (populated) {
@@ -460,7 +464,6 @@ void ChunkCoordinateIndex::PublishReservation(CoordinateReservation& reservation
         } else populated_.erase(reservation.coord_);
         reservation.node_->populated.store(populated, std::memory_order_relaxed);
     }
-    reservation.node_->revision.store(revision, std::memory_order_release);
     if (previous_revision == 0U) any_written_.store(true, std::memory_order_release);
 }
 
@@ -486,6 +489,25 @@ CoordinatePage ChunkCoordinateIndex::Page(bool has_cursor, const ChunkCoord& cur
             if (page.coords.size() == limit) { page.more = true; break; }
             page.coords.push_back(*at);
         }
+    }
+    return page;
+}
+
+CoordinatePage ChunkCoordinateIndex::SnapshotPage(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
+    std::uint64_t snapshot) const {
+    Check();
+    if (limit == 0U || limit > kMaxChunkScanLimit + 1U) throw std::invalid_argument("invalid coordinate scan limit");
+    CoordinatePage page;
+    page.coords.reserve(limit);
+    std::lock_guard lock(mutex_);
+    auto at = has_cursor ? coordinates_.upper_bound(cursor) : coordinates_.begin();
+    for (; at != coordinates_.end(); ++at) {
+        // Populated at the snapshot: populated now, or changed after it.
+        if (!at->second.populated.load(std::memory_order_relaxed) &&
+            at->second.revision.load(std::memory_order_acquire) <= snapshot)
+            continue;
+        if (page.coords.size() == limit) { page.more = true; break; }
+        page.coords.push_back(at->first);
     }
     return page;
 }

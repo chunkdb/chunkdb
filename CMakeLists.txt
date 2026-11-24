@@ -658,6 +658,9 @@ if(CHUNKDB_BUILD_TESTS)
     add_executable(chunkdb_txn_engine_test tests/txn_engine_tests.cpp)
     target_link_libraries(chunkdb_txn_engine_test PRIVATE chunkdb_core)
     add_test(NAME txn_engine COMMAND chunkdb_txn_engine_test)
+    add_executable(chunkdb_txn_read_only_test tests/txn_read_only_tests.cpp)
+    target_link_libraries(chunkdb_txn_read_only_test PRIVATE chunkdb_core)
+    add_test(NAME txn_read_only COMMAND chunkdb_txn_read_only_test)
 
     add_executable(chunkdb_chunk_write_memory_test tests/chunk_write_memory_tests.cpp)
     target_link_libraries(chunkdb_chunk_write_memory_test PRIVATE chunkdb_core)
@@ -1215,6 +1218,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_migrations_records_test
         chunkdb_feature_activation_records_test
         chunkdb_txn_engine_test
+        chunkdb_txn_read_only_test
         chunkdb_chunk_write_memory_test
         chunkdb_crypto_test
         chunkdb_scram_test

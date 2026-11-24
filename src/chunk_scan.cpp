@@ -8,12 +8,27 @@ namespace chunkdb {
 ChunkIdentityScanPage ChunkStore::ScanChunkIdentities(bool has_cursor, ChunkCoord cursor,
     std::size_t limit, std::optional<std::uint64_t> since, bool with_data,
     const ChunkScanFilter* filter) {
+    return ScanChunkIdentitiesImpl(nullptr, has_cursor, cursor, limit, since, with_data, filter);
+}
+
+ChunkIdentityScanPage ChunkStore::ScanChunkIdentitiesAt(const TxnSnapshot& snapshot, bool has_cursor,
+    ChunkCoord cursor, std::size_t limit, bool with_data, const ChunkScanFilter* filter) {
+    RequireOwnTxnSnapshot(snapshot);
+    return ScanChunkIdentitiesImpl(&snapshot, has_cursor, cursor, limit, std::nullopt, with_data, filter);
+}
+
+ChunkIdentityScanPage ChunkStore::ScanChunkIdentitiesImpl(const TxnSnapshot* snapshot, bool has_cursor,
+    ChunkCoord cursor, std::size_t limit, std::optional<std::uint64_t> since, bool with_data,
+    const ChunkScanFilter* filter) {
     if (limit == 0U || limit > kMaxChunkScanLimit)
         throw std::invalid_argument("scan limit must be between 1 and " + std::to_string(kMaxChunkScanLimit));
     if (has_cursor) (void)geometry_.ChunkToLarge(cursor);
     ChunkIdentityScanPage page;
-    page.position = CompletedRevision();
-    const auto index = CoordinateIndexForScan();
+    // As of a snapshot the index must list every chunk its writes populated
+    // (BeginCompletedTxnSnapshot); the page is then that revision's.
+    const auto index = snapshot != nullptr ? CoordinateIndexForArea(snapshot) : CoordinateIndexForScan();
+    if (index == nullptr) throw std::invalid_argument("the snapshot includes writes that have not completed");
+    page.position = snapshot != nullptr ? std::optional(snapshot->version()) : CompletedRevision();
     page.retained_deletion_floor = index->retained_deletion_floor();
     const auto require_history = [&](std::uint64_t floor) {
         if (since && *since < floor) throw TombstoneHistoryLostError(floor, page.position);
@@ -59,11 +74,16 @@ ChunkIdentityScanPage ChunkStore::ScanChunkIdentities(bool has_cursor, ChunkCoor
         return finish();
     };
     while (visited <= limit) {
-        const auto candidates = index->Page(pass_has_cursor, pass_cursor, limit + 1U - visited, since);
+        const auto candidates = snapshot != nullptr
+            ? index->SnapshotPage(pass_has_cursor, pass_cursor, limit + 1U - visited, snapshot->version())
+            : index->Page(pass_has_cursor, pass_cursor, limit + 1U - visited, since);
         for (const auto& coord : candidates.coords) {
             CheckStatementCancellation();
             ChunkRangeEntry state;
-            if (!ReadPopulatedChunkStateNoCache(coord, &state, with_vars, nullptr, since.has_value(), identity_only)) continue;
+            const bool populated = snapshot != nullptr
+                ? ReadPopulatedChunkStateNoCache(coord, &state, with_vars, snapshot)
+                : ReadPopulatedChunkStateNoCache(coord, &state, with_vars, nullptr, since.has_value(), identity_only);
+            if (!populated) continue;
             if (since && state.version <= *since) continue;
             if (visited == limit) return more();
             if (filter != nullptr && !filter->keep(coord, state)) {

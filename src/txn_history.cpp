@@ -126,9 +126,11 @@ void TxnHistory::Publish(Reservation& reservation) noexcept {
     if (reservation.empty()) {
         return;
     }
+    TxnKeptState& state = reservation.mapped();
+    copied_states_.fetch_add(1U, std::memory_order_relaxed);
+    copied_bytes_.fetch_add(state.bytes, std::memory_order_relaxed);
     std::lock_guard lock(mutex_);
     ExpireLocked(std::chrono::steady_clock::now());
-    TxnKeptState& state = reservation.mapped();
     const auto needed = [&]() {
         // Some registered snapshot is older than the write, and no kept
         // state of the chunk is already tagged above the newest snapshot

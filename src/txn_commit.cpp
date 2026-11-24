@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -135,6 +136,24 @@ std::unique_ptr<TxnSnapshot> ChunkStore::BeginTxnSnapshot(std::chrono::milliseco
     const auto duration =
         std::min(max_duration, std::chrono::duration_cast<std::chrono::milliseconds>(kTxnMaxDurationCap));
     return txn_history_->Register(txn_history_, version_clock_, std::chrono::steady_clock::now() + duration);
+}
+
+std::unique_ptr<TxnSnapshot> ChunkStore::BeginCompletedTxnSnapshot(std::chrono::milliseconds max_duration) {
+    auto snapshot = BeginTxnSnapshot(max_duration);
+    const auto deadline = std::chrono::steady_clock::now() +
+        std::min(max_duration, std::chrono::duration_cast<std::chrono::milliseconds>(kTxnMaxDurationCap));
+    // A write that took a version at or below the snapshot publishes its
+    // coordinate before it completes. Wait for those writes as a backup cut
+    // does: a write only clears its own bound, without locks or wakeups.
+    while (CompletedRevision().value_or(0U) < snapshot->version()) {
+        CheckStatementCancellation();
+        if (std::chrono::steady_clock::now() >= deadline) {
+            throw TransactionConflictError(
+                TxnConflictReason::kDuration, "the transaction's duration limit passed while its snapshot waited for writes");
+        }
+        std::this_thread::yield();
+    }
+    return snapshot;
 }
 
 void ChunkStore::EndTxnSnapshot(TxnSnapshot& snapshot) noexcept {
