@@ -195,6 +195,11 @@ struct StoreRuntimeStats {
     std::uint64_t background_queue_full_inline = 0;
     std::uint64_t background_queue_depth = 0;
     std::uint64_t compressed_checkpoint_images = 0;
+    // Chunk states writes copied for open transaction snapshots, their bytes,
+    // and the bytes of the states kept now (--txn-history-bytes).
+    std::uint64_t txn_history_copies = 0;
+    std::uint64_t txn_history_copied_bytes = 0;
+    std::uint64_t txn_history_bytes = 0;
 };
 
 // Random identity of a data directory, recorded in its manifest.
@@ -624,6 +629,8 @@ class TxnSnapshot {
 
     std::shared_ptr<TxnHistory> history_;
     std::uint64_t version_ = 0;
+    // When the snapshot's duration ends; set once at registration.
+    std::chrono::steady_clock::time_point deadline_{};
     // Guarded by the history's lock.
     bool registered_ = false;
     // Set when a limit unregistered the snapshot.
@@ -827,6 +834,16 @@ class ChunkStore {
     [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentities(
         bool has_cursor, ChunkCoord cursor, std::size_t limit,
         std::optional<std::uint64_t> since = {}, bool with_data = false,
+        const ChunkScanFilter* filter = nullptr);
+    // ScanChunkIdentities as of a snapshot: the chunks populated at the
+    // snapshot, with their state and version then, also those a later write
+    // emptied; `position` is the snapshot's revision. It first waits for the
+    // writes the snapshot includes, so the coordinate index lists their
+    // chunks: past the snapshot's duration it throws TransactionConflictError,
+    // and a stopped statement ends the wait. Throws std::invalid_argument for
+    // another store's snapshot, and as the snapshot reads do.
+    [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentitiesAt(const TxnSnapshot& snapshot,
+        bool has_cursor, ChunkCoord cursor, std::size_t limit, bool with_data = false,
         const ChunkScanFilter* filter = nullptr);
     // With `with_vars`, each entry carries its text and bytes values, and
     // they count toward the response-byte limit.
@@ -1651,6 +1668,13 @@ class ChunkStore {
     void PrepareCoordinateIndex();
     void InitializeCoordinateIndex();
     [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> CoordinateIndexForScan();
+    // ScanChunkIdentities, or ScanChunkIdentitiesAt with `snapshot`.
+    [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentitiesImpl(const TxnSnapshot* snapshot, bool has_cursor,
+        ChunkCoord cursor, std::size_t limit, std::optional<std::uint64_t> since, bool with_data,
+        const ChunkScanFilter* filter);
+    // Waits until every write the snapshot includes has completed (see
+    // ScanChunkIdentitiesAt).
+    void WaitForTxnSnapshotWrites(const TxnSnapshot& snapshot);
     [[nodiscard]] std::optional<ChunkIndexRecord> RetainedEmptyBoundaryForArchive(const ChunkCoord& coord);
     [[nodiscard]] std::shared_ptr<ChunkCoordinateIndex> RetainedIndexForSnapshot();
     // Before a loaded chunk can append, drops what replay could not use: the
@@ -2015,7 +2039,7 @@ class ChunkStore {
         const TxnSnapshot& snapshot,
         const ChunkCoord& chunk_coord,
         bool with_vars,
-        ChunkRangeEntry* entry);
+        ChunkRangeEntry* entry, bool with_payload = true);
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkAreaEntriesImpl(
         const ChunkAreaSelector& selector, bool with_vars,
         const TxnSnapshot* snapshot, const TxnAreaRead* txn_read);

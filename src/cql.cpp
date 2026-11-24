@@ -1372,7 +1372,12 @@ class Parser {
             return Ping{};
         }
         if (Accept("begin")) {
-            return Begin{};
+            Begin begin;
+            if (Accept("read")) {
+                Expect("only");
+                begin.read_only = true;
+            }
+            return begin;
         }
         if (Accept("commit")) {
             return Commit{};

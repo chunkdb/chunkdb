@@ -179,6 +179,24 @@ bool FeedProducerRegistry::Completed(std::atomic<std::uint64_t>& clock, std::uin
     }
     return true;
 }
+bool FeedProducerRegistry::WaitCompleted(std::atomic<std::uint64_t>& clock, std::uint64_t through,
+    std::chrono::steady_clock::time_point deadline, std::stop_token stopped) {
+    // Counted before the first check: a producer that clears its bound after
+    // that check then loads the count and wakes this wait (both SC).
+    completion_waiters_.fetch_add(1U, std::memory_order_seq_cst);
+    struct Leave {
+        std::atomic<std::uint32_t>& waiters;
+        ~Leave() { waiters.fetch_sub(1U, std::memory_order_seq_cst); }
+    } leave{completion_waiters_};
+    std::unique_lock lock(completion_mutex_);
+    return completion_cv_.wait_until(lock, stopped, deadline, [&] { return Completed(clock, through); });
+}
+void FeedProducerRegistry::NotifyCompletionWaiters() noexcept {
+    if (completion_waiters_.load(std::memory_order_seq_cst) == 0U) return;
+    // Taking the mutex orders this wake after a waiter's check or into its wait.
+    { std::lock_guard lock(completion_mutex_); }
+    completion_cv_.notify_all();
+}
 std::uint64_t FeedProducerRegistry::CompletedFrontier(const std::atomic<std::uint64_t>& clock) const {
     // A producer publishes its bound before reserving a version. Sample
     // clock first, so a producer missed by the registry scan cannot later
@@ -944,6 +962,7 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Next(FeedSubscription& sub, std::ch
 }
 
 FeedWriteGuard::FeedWriteGuard(ChunkStore& store) {
+    registry_ = store.write_producers_.get();
     producer_ = &store.write_producers_->ThreadProducer();
     if (producer_->context.active || producer_->bound.load(std::memory_order_seq_cst) != 0U)
         throw std::logic_error("nested write on one thread");
@@ -957,7 +976,11 @@ FeedWriteGuard::FeedWriteGuard(ChunkStore& store) {
         }
     } catch (...) {
         if (state_ != nullptr) Finish();
-        else { producer_->context.active = false; producer_->bound.store(0U, std::memory_order_seq_cst); }
+        else {
+            producer_->context.active = false;
+            producer_->bound.store(0U, std::memory_order_seq_cst);
+            registry_->NotifyCompletionWaiters();
+        }
         throw;
     }
 }
@@ -966,6 +989,7 @@ FeedWriteGuard::~FeedWriteGuard() {
     else {
         producer_->bound.store(0U, std::memory_order_seq_cst);
         producer_->context.active = false;
+        registry_->NotifyCompletionWaiters();
     }
 }
 
@@ -1116,6 +1140,7 @@ void FeedWriteGuard::Finish() noexcept {
     }
     state_->producer->bound.store(0U, std::memory_order_seq_cst);
     state_->active = false;
+    registry_->NotifyCompletionWaiters();
     // A true SC sample follows this producer's cleared SC bound. Either it
     // precedes the sender's SC clear (and its next watermark includes us),
     // or another writer has already signalled the next scan. Avoid a shared

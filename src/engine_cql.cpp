@@ -755,12 +755,16 @@ void ForEachExpressionParameter(const BlockWritePlan& plan, Use&& use) {
            std::holds_alternative<cql::Cancel>(statement) || std::holds_alternative<cql::KillConnection>(statement);
 }
 
-[[nodiscard]] bool AllowedInTransaction(const cql::Statement& statement) {
+// A READ ONLY transaction runs no write and may scan: it keeps no read set,
+// so COMMIT has nothing to check.
+[[nodiscard]] bool AllowedInTransaction(const cql::Statement& statement, bool read_only) {
     if (SessionControl(statement)) return true;
-    return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::SetBlock>(statement) ||
-           std::holds_alternative<cql::DeleteBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
-           std::holds_alternative<cql::SetChunk>(statement) || std::holds_alternative<cql::GetArea>(statement) ||
-           std::holds_alternative<cql::Aggregate>(statement) ||
+    if (std::holds_alternative<cql::SetBlock>(statement) || std::holds_alternative<cql::DeleteBlock>(statement) ||
+        std::holds_alternative<cql::SetChunk>(statement))
+        return !read_only;
+    if (std::holds_alternative<cql::ScanChunks>(statement)) return read_only;
+    return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
+           std::holds_alternative<cql::GetArea>(statement) || std::holds_alternative<cql::Aggregate>(statement) ||
            std::holds_alternative<cql::Describe>(statement) || std::holds_alternative<cql::Ping>(statement) ||
            std::holds_alternative<cql::Begin>(statement) ||
            std::holds_alternative<cql::Commit>(statement) || std::holds_alternative<cql::Rollback>(statement);
@@ -1301,10 +1305,15 @@ std::string CommandEngine::ExecuteStatement(
             }
             return reply;
         }
-        if (session.transaction != nullptr && !AllowedInTransaction(parsed.statement)) {
+        if (session.transaction != nullptr &&
+            !AllowedInTransaction(parsed.statement, session.transaction->read_only)) {
             return Protocol::Error(
                 "INVALID_ARGUMENT",
-                "inside a transaction only GET, SET and DELETE statements, AGGREGATE, DESCRIBE, PING, COMMIT and ROLLBACK run");
+                session.transaction->read_only
+                    ? "inside a READ ONLY transaction only GET statements, SCAN CHUNKS, AGGREGATE, DESCRIBE, PING, "
+                      "COMMIT and ROLLBACK run"
+                    : "inside a transaction only GET, SET and DELETE statements, AGGREGATE, DESCRIBE, PING, COMMIT and "
+                      "ROLLBACK run");
         }
         return std::visit(
             Overloaded{
@@ -2377,7 +2386,7 @@ std::string CommandEngine::ExecuteStatement(
                     catalog_->SwapTables(swap.first, swap.second, cancelled.get_token());
                     return Protocol::SimpleString("OK");
                 },
-                [&](const cql::Begin&) { return TxnBegin(session); },
+                [&](const cql::Begin& begin) { return TxnBegin(session, begin.read_only); },
                 [&](const cql::Commit&) {
                     command_class = MetricsRegistry::CommandClass::kConditional;
                     if (info != nullptr && session.transaction != nullptr) {
@@ -2399,7 +2408,12 @@ std::string CommandEngine::ExecuteStatement(
                         throw std::invalid_argument(
                             "LIMIT must be between 1 and " + std::to_string(kMaxChunkScanLimit));
                     }
-                    const auto lease = AcquireNamedTable(session, scan.table);
+                    // Inside a transaction (only READ ONLY runs SCAN) the page
+                    // reads the snapshot; SINCE follows the current changes.
+                    if (session.transaction != nullptr && scan.since)
+                        throw std::invalid_argument("SCAN CHUNKS SINCE does not run inside a transaction");
+                    const auto lease = session.transaction != nullptr ? TxnLease(session, scan.table)
+                                                                      : AcquireNamedTable(session, scan.table);
                     const auto& geometry = lease.store().geometry();
                     if (scan.after) RequireDimensions(geometry, scan.dims);
                     if (!scan.with_data && !scan.columns.empty())
@@ -2436,9 +2450,13 @@ std::string CommandEngine::ExecuteStatement(
                     }
                     ChunkIdentityScanPage page;
                     try {
-                        page = lease.store().ScanChunkIdentities(scan.after.has_value(), cursor,
-                            static_cast<std::size_t>(limit), scan.since, scan.with_data,
-                            scan_filter ? &*scan_filter : nullptr);
+                        page = session.transaction != nullptr
+                            ? lease.store().ScanChunkIdentitiesAt(*session.transaction->snapshot, scan.after.has_value(),
+                                  cursor, static_cast<std::size_t>(limit), scan.with_data,
+                                  scan_filter ? &*scan_filter : nullptr)
+                            : lease.store().ScanChunkIdentities(scan.after.has_value(), cursor,
+                                  static_cast<std::size_t>(limit), scan.since, scan.with_data,
+                                  scan_filter ? &*scan_filter : nullptr);
                     } catch (const TombstoneHistoryLostError& error) {
                         const auto floor = std::to_string(error.retained_deletion_floor());
                         const auto epoch = StoreIdHex(lease.store().store_id());
@@ -2752,11 +2770,12 @@ void CommandEngine::EndExpiredTransactions() {
     }
 }
 
-std::string CommandEngine::TxnBegin(SessionState& session) {
+std::string CommandEngine::TxnBegin(SessionState& session, bool read_only) {
     if (session.transaction != nullptr) {
         throw std::invalid_argument("a transaction is already open; COMMIT or ROLLBACK it first");
     }
     auto transaction = std::make_unique<SessionTransaction>(&txn_budget_, std::chrono::steady_clock::now());
+    transaction->read_only = read_only;
     EnterStatementDecision();
     session.transaction = std::move(transaction);
     return Protocol::SimpleString("OK");
@@ -2795,6 +2814,9 @@ Table::Lease CommandEngine::TxnLease(SessionState& session, const std::string& t
 }
 
 void CommandEngine::TxnRead(SessionTransaction& txn, std::span<const ChunkCoord> coords) const {
+    // COMMIT of a READ ONLY transaction checks no chunk: no read set, no
+    // read limit.
+    if (txn.read_only) return;
     const auto limit = catalog_->query_limits().txn_max_read_chunks;
     const auto too_many = [&] {
         throw std::invalid_argument(
@@ -3058,7 +3080,9 @@ std::string CommandEngine::TxnCommit(SessionState& session) {
     }
     // COMMIT ends the transaction whatever it answers.
     const std::unique_ptr<SessionTransaction> txn = std::move(session.transaction);
-    if (txn->snapshot == nullptr) {
+    // Every read of a READ ONLY transaction was consistent when it answered:
+    // COMMIT only ends it, as ROLLBACK does.
+    if (txn->snapshot == nullptr || txn->read_only) {
         return NullReply();
     }
     if (!txn->writes.empty()) {
