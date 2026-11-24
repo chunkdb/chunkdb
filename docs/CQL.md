@@ -29,12 +29,15 @@ Generated passwords, epochs, and timestamps appear as named placeholders.
 See [Tables](reference/TABLES.md#arguments) for column types, identifiers, defaults, and limits.
 Use integers such as `-12`, floats such as `1.5` or `2e-3`, booleans, or `NULL`.
 Float values also accept `inf` and `nan`.
+A float literal reads as the nearest f64, subnormal values such as `1e-310` included; one beyond the f64 range, such as `1e999`, is refused with SYNTAX.
 
 Quote text with single quotes and double an embedded quote: `'it''s'`.
 Bytes use hexadecimal literals such as `x'0a0bff'`.
 Bits use literals such as `b'1010'`, with the first digit representing the lowest bit.
 
 Trailing keyword options can appear in any order, each at most once.
+A repeated option is refused with SYNTAX.
+`IF` starts `IF [NOT] EXISTS` only when NOT or EXISTS follows it, so a table, column, user or check named `if` can be named where that clause may appear, as in `DROP TABLE if`.
 Client APIs supply binary `$n` parameters in these places: SET BLOCK values, expressions and conditions, DELETE BLOCK conditions, values in the WHERE of AGGREGATE and SCAN CHUNKS, the SET CHUNK form or META values, `VERIFIER $1` in CREATE USER and ALTER USER (also `ADD VERIFIER $1`), HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
 See [Protocol](PROTOCOL.md#parameters) for encoding.
 
@@ -63,13 +66,14 @@ op        := = | <> | < | <= | > | >=
 - `column` is a block column and `chunk.column` a chunk column of the same chunk; quote a column named like a keyword: `"exists"`.
 - `POS_X`, `POS_Y` and `POS_Z` are the block's coordinates; `NOW()`, in milliseconds since the Unix epoch, is the time the statement starts in reads and the commit time in writes.
 - A literal or `$n` takes the type of the column it is compared or combined with; a parameter with no column beside it, as in `$1 < $2`, is refused.
+- A float literal compared with an f32 value is rounded to the nearest f32, as an f32 `$n` would be: with an f32 column `f` holding 0.1, `f = 0.1` is true; arithmetic with a float literal computes in f64, and a finite literal beyond f32, such as `1e39`, keeps its value.
 - Integers compute exactly; a result beyond 128 bits is `OUT_OF_RANGE`, and dividing an integer by zero is `INVALID_ARGUMENT`; `/` truncates toward zero and `%` takes the sign of the dividend.
 - An integer with a float computes in f64, but comparisons between them are exact; NaN equals nothing, and -0 equals 0.
 - Text and bytes compare bytewise; bits and bool support `=` and `<>`.
 - Arithmetic with NULL is NULL; a comparison with NULL is unknown, AND, OR and NOT follow three-valued logic, and an unknown condition is false.
 - LEAST and GREATEST ignore NULL arguments; COALESCE returns its first argument that is not NULL.
 - For an absent block, EXISTS is false and every block column is NULL; chunk columns keep their values.
-- Comparisons and arithmetic do not chain without parentheses: write `(a < b) AND (b < c)`, not `a < b < c`.
+- Arithmetic chains from left to right, so `a - b - c` is `(a - b) - c`; comparisons do not chain: write `(a < b) AND (b < c)`, not `a < b < c`.
 - A condition has at most 256 values, columns, operators and list items, reported as `max_expression_nodes` by HELLO, and at most 32 levels.
 
 ## Related data

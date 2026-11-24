@@ -40,7 +40,7 @@ scrape_configs:
 |---|---|---|
 | `--uri` | required | `chunk://user@host:port/`, or `chunks://` for TLS. A password in the URI is refused. |
 | `--password-file` | required with a user | A file whose first line is the user's password; it is read again at each login. |
-| `--listen` | `127.0.0.1:14242` | `host:port` of the HTTP listener, with an IPv6 host in brackets such as `[::1]:14242`. |
+| `--listen` | `127.0.0.1:14242` | `host:port` of the HTTP listener, with an IPv6 host in brackets such as `[::1]:14242`; port 0 picks a free port, which the `port` field of the INFO line `serving metrics` names. |
 | `--allow-remote` | off | Allow `--listen` on an address that is not loopback. |
 | `--tls-ca-file` | system certificates | Certificates that verify a `chunks://` server; the certificate must name the URI's host. |
 | `--no-channel-binding` | off | Do not bind the login to its TLS connection; needed only when something between the exporter and the server ends TLS. |

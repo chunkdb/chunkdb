@@ -35,9 +35,19 @@ std::string PercentDecode(const std::string& text) {
     return out;
 }
 
+std::uint16_t ParsePort(const std::string& text, UriUse use) {
+    std::size_t consumed = 0;
+    const int value = std::stoi(text, &consumed, 10);
+    const int lowest = use == UriUse::kListen ? 0 : 1;
+    if (consumed != text.size() || value < lowest || value > 65535) {
+        throw std::invalid_argument("invalid port: " + text);
+    }
+    return static_cast<std::uint16_t>(value);
+}
+
 }  // namespace
 
-ConnectionUri ParseConnectionUri(const std::string& uri) {
+ConnectionUri ParseConnectionUri(const std::string& uri, UriUse use) {
     const std::string scheme_delimiter = "://";
     const auto scheme_pos = uri.find(scheme_delimiter);
     if (scheme_pos == std::string::npos) {
@@ -96,13 +106,7 @@ ConnectionUri ParseConnectionUri(const std::string& uri) {
         if (after_bracket.front() != ':' || after_bracket.size() < 2) {
             throw std::invalid_argument("invalid character after IPv6 address in URI");
         }
-        const std::string port_text = after_bracket.substr(1);
-        std::size_t consumed = 0;
-        const int port_value = std::stoi(port_text, &consumed, 10);
-        if (consumed != port_text.size() || port_value <= 0 || port_value > 65535) {
-            throw std::invalid_argument("invalid port: " + port_text);
-        }
-        parsed.port = static_cast<std::uint16_t>(port_value);
+        parsed.port = ParsePort(after_bracket.substr(1), use);
         return parsed;
     }
 
@@ -118,12 +122,7 @@ ConnectionUri ParseConnectionUri(const std::string& uri) {
         throw std::invalid_argument("invalid host:port section");
     }
 
-    std::size_t consumed = 0;
-    const int port_value = std::stoi(port_text, &consumed, 10);
-    if (consumed != port_text.size() || port_value <= 0 || port_value > 65535) {
-        throw std::invalid_argument("invalid port: " + port_text);
-    }
-    parsed.port = static_cast<std::uint16_t>(port_value);
+    parsed.port = ParsePort(port_text, use);
     return parsed;
 }
 
