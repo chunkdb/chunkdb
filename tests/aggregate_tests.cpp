@@ -7,12 +7,14 @@
 #include <cstdio>
 #include <limits>
 #include <memory>
+#include <optional>
 #include <string>
 #include <string_view>
 #include <utility>
 #include <vector>
 
 #include "aggregate.hpp"
+#include "block_filter.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/table_catalog.hpp"
@@ -180,7 +182,6 @@ void Refusals() {
     Error(missing, "INVALID_ARGUMENT", "the table has no column tag; use DESCRIBE <table> to check column names\r\n");
     assert(missing.find("DESCRIBE") == missing.rfind("DESCRIBE"));
     Error(f.Run("AGGREGATE CHUNK 0 0 FROM missing COUNT(*)"), "NO_TABLE");
-    Error(f.Run("AGGREGATE CHUNK 0 0 FROM t COUNT(*) WHERE v > 1"), "SYNTAX", "AGGREGATE does not take WHERE");
     Error(f.Run("AGGREGATE AREA 1 0 TO 0 0 FROM t COUNT(*)"), "INVALID_ARGUMENT");
 }
 
@@ -288,6 +289,138 @@ void Cancellation() {
     assert(stopped && aggregator.blocks() == 3U);
 }
 
+std::string U64Frame(std::uint64_t value) {
+    std::string frame(8U, '\0');
+    for (std::size_t i = 0U; i < 8U; ++i) frame[i] = static_cast<char>((value >> (8U * i)) & 0xFFU);
+    return frame;
+}
+
+// WHERE aggregates only the present blocks for which it is TRUE; NULL and
+// false skip a block. It reads block and chunk columns, positions, EXISTS
+// and NOW().
+void Where() {
+    Fixture f;
+    CreateIntegers(f);
+    f.Ok("SET BLOCK 1 0 IN t name = 'b'");
+    f.Ok("SET BLOCK 2 1 IN t v = 8, name = 'c'");
+    f.Ok("SET CHUNK 1 0 IN t META tag = 3");
+    const std::string area = "AGGREGATE AREA 0 0 TO 1 0 FROM t COUNT(*), SUM(v)";
+    Same(f.Run(area + " WHERE v >= 2"), Map({{"count(*)", UInt(3U)}, {"sum(v)", Int(14)}}));
+    Same(f.Run(area + " WHERE v >= 2 BY CHUNK"), Rows({{Int(0), Int(0), UInt(1U), Int(2)}, {Int(1), Int(0), UInt(2U), Int(12)}}));
+    // s is NULL in two blocks: s > 0 is unknown there, NOT (s > 0) too.
+    Same(f.Run(area + " WHERE s > 0"), Map({{"count(*)", UInt(1U)}, {"sum(v)", Int(4)}}));
+    Same(f.Run(area + " WHERE NOT (s > 0)"), Map({{"count(*)", UInt(1U)}, {"sum(v)", Int(1)}}));
+    Same(f.Run(area + " WHERE s IS NULL"), Map({{"count(*)", UInt(2U)}, {"sum(v)", Int(10)}}));
+    Same(f.Run(area + " WHERE s > 0 OR s IS NULL"), Map({{"count(*)", UInt(3U)}, {"sum(v)", Int(14)}}));
+    // Text values come with the chunk only when WHERE reads them.
+    Same(f.Run(area + " WHERE name >= 'b'"), Map({{"count(*)", UInt(2U)}, {"sum(v)", Int(10)}}));
+    Same(f.Run(area + " WHERE chunk.tag = 3"), Map({{"count(*)", UInt(2U)}, {"sum(v)", Int(12)}}));
+    Same(f.Run(area + " WHERE chunk.tag = 7 AND POS_X = 1 AND POS_Y = 0"), Map({{"count(*)", UInt(1U)}, {"sum(v)", Int(2)}}));
+    Same(f.Run(area + " WHERE EXISTS AND NOW() > 0"), Map({{"count(*)", UInt(4U)}, {"sum(v)", Int(15)}}));
+    // Chunks without a matching block have no row and no value.
+    Same(f.Run(area + " WHERE v > 100 BY CHUNK"), Rows({}));
+    Same(f.Run(area + " WHERE v > 100"), Map({{"count(*)", UInt(0U)}, {"sum(v)", Null()}}));
+    Same(f.Run("AGGREGATE AREA 0 0 TO 1 0 FROM t MIN(s), AVG(v) WHERE v / 2 = 1"),
+        Map({{"min(s)", Null()}, {"avg(v)", Double(2.0)}}));
+    // A parameter takes the type of the column it meets, as an 8-byte
+    // integer; a NULL frame makes every comparison unknown.
+    const std::vector<std::optional<std::string>> two{U64Frame(2U)};
+    Same(f.engine->Execute(f.session, area + " WHERE v > $1\r\n", two), Map({{"count(*)", UInt(2U)}, {"sum(v)", Int(12)}}));
+    const std::vector<std::optional<std::string>> null{std::nullopt};
+    Same(f.engine->Execute(f.session, area + " WHERE v > $1\r\n", null), Map({{"count(*)", UInt(0U)}, {"sum(v)", Null()}}));
+    const std::vector<std::optional<std::string>> text{std::string("c")};
+    Same(f.engine->Execute(f.session, area + " WHERE name = $1\r\n", text), Map({{"count(*)", UInt(1U)}, {"sum(v)", Int(8)}}));
+    const auto plan = f.engine->PlanPayload(f.session, area + " WHERE v > $1 AND name < $2\r\n");
+    assert(plan.plan == CommandEngine::PayloadPlan::kParameters);
+    assert((plan.parameter_limits == std::vector<std::size_t>{8U, 8U}));
+
+    f.Ok("CREATE TABLE cube (v i8) CHUNK 2 x 2 x 2");
+    f.Ok("SET BLOCK 0 0 0 IN cube v = -3");
+    f.Ok("SET BLOCK 3 0 1 IN cube v = 5");
+    Same(f.Run("AGGREGATE AREA 0 0 0 TO 1 0 0 FROM cube SUM(v) WHERE POS_Z = 1 AND POS_X = 3"), Map({{"sum(v)", Int(5)}}));
+}
+
+// Each refusal of WHERE, before any chunk is read or as it is evaluated.
+void WhereRefusals() {
+    Fixture f;
+    CreateIntegers(f);
+    const std::string head = "AGGREGATE AREA 0 0 TO 1 0 FROM t COUNT(*) WHERE ";
+    const auto missing = f.Run(head + "w > 1");
+    Error(missing, "INVALID_ARGUMENT", "the table has no column w");
+    assert(missing.find("DESCRIBE") != std::string::npos);
+    Error(f.Run(head + "chunk.v = 1"), "INVALID_ARGUMENT", "the table has no chunk column v");
+    Error(f.Run(head + "name > 1"), "INVALID_ARGUMENT");
+    Error(f.Run(head + "v + 1"), "INVALID_ARGUMENT");
+    Error(f.Run(head + "v > 1 WHERE v < 3"), "SYNTAX", "WHERE is given twice");
+    Error(f.Run(head + "v >"), "SYNTAX");
+    // Evaluation: division by zero and integers beyond 128 bits.
+    Error(f.Run(head + "v / 0 = 1"), "INVALID_ARGUMENT");
+    Error(f.Run(head + "big * big * big > 0"), "OUT_OF_RANGE");
+    // A parameter needs a column to take its type from, and its frame must
+    // have that type's size.
+    const auto untyped = f.engine->PlanPayload(f.session, head + "$1 < $2\r\n");
+    assert(untyped.plan == CommandEngine::PayloadPlan::kDiscard);
+    assert(untyped.reject_response.starts_with("-ERR INVALID_ARGUMENT "));
+    const std::vector<std::optional<std::string>> frames{std::string("a"), std::string("b")};
+    Error(f.engine->Execute(f.session, head + "$1 < $2\r\n", frames), "INVALID_ARGUMENT");
+    const std::vector<std::optional<std::string>> short_frame{std::string("ab")};
+    Error(f.engine->Execute(f.session, head + "v = $1\r\n", short_frame), "INVALID_ARGUMENT", "must be 8 bytes");
+    const auto unknown = f.engine->PlanPayload(f.session, head + "w = $1\r\n");
+    assert(unknown.plan == CommandEngine::PayloadPlan::kDiscard);
+    Error(unknown.reject_response, "INVALID_ARGUMENT", "the table has no column w");
+    const auto absent = f.engine->PlanPayload(f.session, "AGGREGATE CHUNK 0 0 FROM missing COUNT(*) WHERE v = $1\r\n");
+    assert(absent.plan == CommandEngine::PayloadPlan::kDiscard && absent.reject_response.starts_with("-ERR NO_TABLE "));
+}
+
+// In a transaction WHERE reads the snapshot and private writes; every
+// requested cell joins the read set, also when no block matches, since a
+// write to any block could change the result.
+void WhereTransactions() {
+    Fixture f;
+    CreateIntegers(f);
+    f.Ok("BEGIN");
+    Same(f.Run("AGGREGATE AREA 0 0 TO 1 0 FROM t COUNT(*) WHERE v > 100"), Map({{"count(*)", UInt(0U)}}));
+    assert(f.session.transaction->read_set.size() == 2U);
+    assert(f.Run("SET BLOCK 0 1 IN t v = 200") == "_\r\n");
+    Same(f.Run("AGGREGATE AREA 0 0 TO 1 0 FROM t COUNT(*), SUM(v) WHERE v > 100"), Map({{"count(*)", UInt(1U)}, {"sum(v)", Int(200)}}));
+    assert(f.RunOther("SET BLOCK 3 1 IN t v = 150").starts_with(":"));
+    Same(f.Run("AGGREGATE AREA 0 0 TO 1 0 FROM t COUNT(*), SUM(v) WHERE v > 100"), Map({{"count(*)", UInt(1U)}, {"sum(v)", Int(200)}}));
+    Error(f.Run("COMMIT"), "CONFLICT");
+    // A refused WHERE adds nothing to the read set.
+    f.Ok("BEGIN");
+    Error(f.Run("AGGREGATE AREA 0 0 TO 1 0 FROM t COUNT(*) WHERE v / 0 = 1"), "INVALID_ARGUMENT");
+    Error(f.Run("AGGREGATE AREA 0 0 TO 1 0 FROM t COUNT(*) WHERE w = 1"), "INVALID_ARGUMENT");
+    assert(f.session.transaction->read_set.empty());
+    f.Ok("ROLLBACK");
+}
+
+// The block loop of WHERE stops a cancelled statement.
+void WhereCancellation() {
+    TableSchema schema;
+    schema.columns = {Column{.id = 1U, .name = "v", .type = {ColumnKind::kSigned, 8U}, .nullable = false,
+        .default_value = {}}};
+    schema.next_column_id = 2U;
+    GeometryConfig config;
+    config.chunk_width_blocks = config.chunk_height_blocks = 2U;
+    config.block_bits = 8U;
+    const Geometry geometry(config, schema);
+    const auto where = expr::ParseCondition("v >= 0").expression;
+    BlockFilter filter(geometry, where);
+    filter.Bind({}, 0U);
+    std::vector<std::uint8_t> payload(geometry.layout().payload_bytes(), 0U);
+    payload[1] = 0xFF;
+    std::vector<std::uint8_t> presence{0x0F};
+    assert(filter.Apply(ChunkCoord{}, payload, presence, ChunkVars{}, nullptr) == 3U && presence[0] == 0x0D);
+    StatementControl control(StatementControl::Clock::now(), 0U);
+    assert(control.Start());
+    ScopedStatementControl context(&control);
+    assert(control.RequestStop(StatementStopReason::kCancelled));
+    bool stopped = false;
+    try { (void)filter.Apply(ChunkCoord{}, payload, presence, ChunkVars{}, nullptr); }
+    catch (const StatementStoppedError&) { stopped = true; }
+    assert(stopped);
+}
+
 }  // namespace
 
 int main() {
@@ -299,5 +432,9 @@ int main() {
     Transactions();
     MetaOnlyChunk();
     Cancellation();
+    Where();
+    WhereRefusals();
+    WhereTransactions();
+    WhereCancellation();
     return 0;
 }

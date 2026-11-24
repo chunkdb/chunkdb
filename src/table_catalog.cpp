@@ -1942,6 +1942,11 @@ void TableCatalog::RetireTable(Table& table, const TableOptions& options) {
     table.EndExclusive(nullptr, options);
 }
 
+void TableCatalog::ChangeGrants(const std::function<void()>& change) {
+    std::lock_guard operations(operations_mutex_);
+    change();
+}
+
 void TableCatalog::Drop(std::string_view name) {
     Drop(name, nullptr);
 }
@@ -2156,7 +2161,7 @@ std::optional<std::string> TableCatalog::ScanNarrowing(Table& table) {
     if (!lease.has_value()) {
         throw TableNotFoundError("table '" + table.name_ + "' is unavailable");
     }
-    return lease->store().FindValueNotFitting(pending->column_id, pending->type);
+    return lease->store().FindValueNotFitting(pending->column_id, pending->type, pending->not_null);
 }
 
 void TableCatalog::EndNarrowing(Table& table, const TableOptions& options, const std::function<void(StoreManifest*)>& change) {
@@ -2197,16 +2202,17 @@ void TableCatalog::EndNarrowing(Table& table, const TableOptions& options, const
     }
 }
 
-void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
+void TableCatalog::CheckColumnValues(std::string_view name, const std::function<TableSchema(const TableSchema&)>& start,
+    const std::function<TableSchema(const TableSchema&)>& finish, const std::function<std::string(const std::string&)>& refusal) {
     RequireWritable("ALTER TABLE");
     auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
     const TableOptions options = table->Info().options;
-    // 1. Every write to the column must fit `type` from here on.
+    // 1. Every write to the column must pass the check from here on.
     RewriteManifest(
         *table, options,
-        [&](StoreManifest* manifest) { manifest->schema = WithPendingNarrowing(manifest->schema, column, type); },
+        [&](StoreManifest* manifest) { manifest->schema = start(manifest->schema); },
         "CHUNKDB_FAILPOINT_NARROW_PENDING_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
     // 2. Every value already stored.
     std::optional<std::string> misfit;
@@ -2217,10 +2223,10 @@ void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, 
         scan_failure = std::current_exception();
     }
     // 3. The new version, or the schema as it was.
-    const bool narrow = scan_failure == nullptr && !misfit.has_value();
-    if (narrow) {
+    const bool change = scan_failure == nullptr && !misfit.has_value();
+    if (change) {
         EndNarrowing(*table, options, [&](StoreManifest* manifest) {
-            manifest->schema = NarrowColumnType(manifest->schema, column, type);
+            manifest->schema = finish(manifest->schema);
             manifest->geometry.block_bits = FixedBitsPerBlock(manifest->schema);
         });
     } else {
@@ -2235,14 +2241,37 @@ void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, 
         std::rethrow_exception(scan_failure);
     }
     if (misfit.has_value()) {
-        throw std::invalid_argument(
-            "column " + std::string(column) + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit + "; " + ColumnTypeRange(type));
+        throw std::invalid_argument(refusal(*misfit));
     }
+}
+
+void TableCatalog::NarrowColumn(std::string_view name, std::string_view column, ColumnType type) {
+    CheckColumnValues(
+        name, [&](const TableSchema& schema) { return WithPendingNarrowing(schema, column, type); },
+        [&](const TableSchema& schema) { return NarrowColumnType(schema, column, type); },
+        [&](const std::string& misfit) {
+            return "column " + std::string(column) + " cannot be narrowed to " + ColumnTypeName(type) + ": " + misfit + "; " +
+                   ColumnTypeRange(type);
+        });
     LogMessage(
         LogLevel::kInfo,
         LogComponent::kStore,
         "table column narrowed",
-        {{"table", table->name_}, {"column", std::string(column)}, {"type", ColumnTypeName(type)}});
+        {{"table", std::string(name)}, {"column", std::string(column)}, {"type", ColumnTypeName(type)}});
+}
+
+void TableCatalog::DropColumnNull(std::string_view name, std::string_view column) {
+    CheckColumnValues(
+        name, [&](const TableSchema& schema) { return WithPendingNotNull(schema, column); },
+        [&](const TableSchema& schema) { return chunkdb::DropColumnNull(schema, column); },
+        [&](const std::string& misfit) {
+            return "column " + std::string(column) + " cannot drop NULL: " + misfit + "; set a value there first";
+        });
+    LogMessage(
+        LogLevel::kInfo,
+        LogComponent::kStore,
+        "table column no longer takes NULL",
+        {{"table", std::string(name)}, {"column", std::string(column)}});
 }
 
 void TableCatalog::RequireCompatibleColumnAdditions(

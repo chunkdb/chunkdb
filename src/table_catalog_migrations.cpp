@@ -180,24 +180,33 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                         throw FeedSlotFiltersError("feed slot owner differs from existing slot");
                     no_op = request.kind == MigrationRequest::Kind::kCreateSlot ? exists : !exists;
                 }
-                if (!no_op && request.kind == MigrationRequest::Kind::kAlter && request.narrowing) {
-                    const auto& [column_name, type] = *request.narrowing;
+                if (!no_op && request.kind == MigrationRequest::Kind::kAlter && (request.narrowing || request.drop_null)) {
+                    // A narrowing or a DROP NULL check.
+                    const std::string column_name = request.narrowing ? request.narrowing->first : *request.drop_null;
                     const auto schema = table->Info().schema;
                     const auto at = std::find_if(schema.columns.begin(), schema.columns.end(),
                         [&](const auto& column) { return column.name == column_name; });
                     if (at == schema.columns.end()) throw std::invalid_argument("the table has no column " + column_name);
-                    if (!HoldsEveryValue(at->type, type)) {
+                    if (!request.narrowing || !HoldsEveryValue(at->type, request.narrowing->second)) {
                         operations.lock();
                         if (already_applied()) return false;
                         operations.unlock();
                         narrowing_recorded = !schema.pending.has_value();
                         RewriteManifest(
                             *table, previous,
-                            [&](StoreManifest* manifest) { manifest->schema = WithPendingNarrowing(manifest->schema, column_name, type); },
+                            [&](StoreManifest* manifest) {
+                                manifest->schema = request.narrowing
+                                    ? WithPendingNarrowing(manifest->schema, column_name, request.narrowing->second)
+                                    : WithPendingNotNull(manifest->schema, column_name);
+                            },
                             "CHUNKDB_FAILPOINT_NARROW_PENDING_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE");
                         scanned_schema = table->Info().schema;
-                        if (const auto misfit = ScanNarrowing(*table))
+                        if (const auto misfit = ScanNarrowing(*table)) {
+                            if (!request.narrowing)
+                                throw std::invalid_argument("column " + column_name + " cannot drop NULL: " + *misfit + "; set a value there first");
+                            const auto& type = request.narrowing->second;
                             throw std::invalid_argument("column " + column_name + " cannot be narrowed to " + ColumnTypeName(type) + ": " + *misfit + "; " + ColumnTypeRange(type));
+                        }
                     }
                 }
                 if (!no_op) {
@@ -318,6 +327,11 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                             throw std::runtime_error("table '" + request.table + "' changed before the narrowing check");
                         manifest->schema = ChangeColumnType(manifest->schema, column_name, type, Conversion::kExact);
                     }
+                } else if (request.drop_null) {
+                    // The scan checked the values of this schema only.
+                    if (!narrowing_recorded || manifest->schema != scanned_schema)
+                        throw std::runtime_error("table '" + request.table + "' changed during the DROP NULL check");
+                    manifest->schema = chunkdb::DropColumnNull(manifest->schema, *request.drop_null);
                 } else request.alter(*manifest);
                 AlignManifestSchemaDomains(&*manifest, previous_schema, previous_chunk_schema);
                 RequireCompatibleColumnAdditions(previous_schema, manifest->schema, *store);

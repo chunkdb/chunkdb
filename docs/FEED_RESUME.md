@@ -45,6 +45,7 @@ Pages do not share a snapshot, so retain each returned chunk version and skip ol
 A first watch can resume at the retained floor even when no earlier watcher existed; a lost prefix still requires resync and a new baseline.
 A write committed between the first page and a first WATCH makes that watch resync; open another watch on the table before the first page and keep it open until WATCH AFTER starts to retain those writes, with CHUNKS when you resume with CHUNKS.
 Read-only scans return null for position and cannot establish this writer frontier.
+A scan with WHERE follows the same steps; see [Filter a scan](reference/CHUNKS.md#filter-a-scan) for the conditions that converge.
 
 ## If it fails
 

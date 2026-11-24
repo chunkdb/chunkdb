@@ -483,7 +483,7 @@ ChunkMutationResult ChunkStore::UnsetBlockAtAddress(const ChunkCoord& chunk_coor
 
 void ChunkStore::RequireBitStringBlocks() const {
     if (!geometry_.layout().bit_string_blocks()) {
-        throw std::invalid_argument("bit strings need a table with one bits(N) column; this table has columns");
+        throw std::invalid_argument("bit strings need a table with one bits(N) column that is not NULL");
     }
 }
 
@@ -561,10 +561,12 @@ ChunkStore::BlockWrite& ChunkStore::PrepareSetBlockWrite(
         const auto* fixed = layout.FixedColumnAt(index);
         const bool null = std::holds_alternative<std::monostate>(assignment.value);
         if (const auto& pending = layout.schema().pending;
-            pending.has_value() && pending->column_id == column.id && !ValueFits(pending->type, assignment.value)) {
+            pending.has_value() && pending->column_id == column.id &&
+            (null ? pending->not_null : !ValueFits(pending->type, assignment.value))) {
             throw std::invalid_argument(
-                "column " + column.name + " is being narrowed to " + ColumnTypeName(pending->type) +
-                ", which does not hold this value");
+                pending->not_null ? "column " + column.name + " cannot be NULL while DROP NULL checks its values"
+                                  : "column " + column.name + " is being narrowed to " + ColumnTypeName(pending->type) +
+                                        ", which does not hold this value");
         }
         if (null && !column.nullable) {
             throw std::invalid_argument("column " + column.name + " cannot be NULL");
@@ -606,6 +608,14 @@ void ChunkStore::AddNewBlockColumns(BlockWrite& write, std::size_t block_index) 
         const auto& column = columns[index];
         if (column.required) {
             throw std::invalid_argument("column " + column.name + " is REQUIRED: a new block must give it");
+        }
+        if (column.nullable && !column.has_default) {
+            // The column takes NULL, which a DROP NULL check refuses.
+            if (const auto& pending = layout.schema().pending;
+                pending.has_value() && pending->not_null && pending->column_id == column.id) {
+                throw std::invalid_argument(
+                    "column " + column.name + ": a new block must give it while DROP NULL checks its values");
+            }
         }
         const auto* fixed = layout.FixedColumnAt(index);
         if (fixed == nullptr) {
@@ -1075,30 +1085,64 @@ void ChunkStore::RequirePendingFits(
     const std::size_t index = layout.IndexOfId(pending->column_id);
     const auto* fixed = layout.FixedColumnAt(index);
     const Column& column = layout.schema().columns[index];
+    const auto refuse = [&](std::size_t block) {
+        return std::invalid_argument(
+            pending->not_null ? "column " + column.name + " cannot be NULL while DROP NULL checks its values, as block index " +
+                                    std::to_string(block) + " is"
+                              : "column " + column.name + " is being narrowed to " + ColumnTypeName(pending->type) +
+                                    ", which does not hold the value of block index " + std::to_string(block));
+    };
     if (fixed == nullptr) {
         if (vars == nullptr) {
             return;  // the write keeps the chunk's text and bytes values
         }
+        if (pending->not_null) {
+            RequirePendingNotNullKept(*vars, presence);
+            return;
+        }
         for (const auto entry : *vars) {
             if (entry.key.column_id == column.id && !ValueFits(pending->type, DecodeVarValue(column, entry.value))) {
-                throw std::invalid_argument(
-                    "column " + column.name + " is being narrowed to " + ColumnTypeName(pending->type) +
-                    ", which does not hold the value of block index " + std::to_string(entry.key.block_index));
+                throw refuse(entry.key.block_index);
             }
         }
         return;
     }
     std::vector<std::uint8_t> bytes((fixed->width + 7U) / 8U);
     for (std::size_t block = 0; block < layout.block_count(); ++block) {
-        if (!BlockPresent(presence, block) ||
-            (fixed->validity != ChunkLayout::kNoValidity && ((payload[fixed->validity + block / 8U] >> (block % 8U)) & 1U) == 0U)) {
+        if (!BlockPresent(presence, block)) {
+            continue;
+        }
+        if (fixed->validity != ChunkLayout::kNoValidity && ((payload[fixed->validity + block / 8U] >> (block % 8U)) & 1U) == 0U) {
+            if (pending->not_null) throw refuse(block);
             continue;
         }
         ReadValueBits(payload.data(), fixed->values * 8U + block * fixed->width, bytes.data(), fixed->width);
         if (!ValueFits(pending->type, DecodeColumnValue(column, bytes.data()))) {
+            throw refuse(block);
+        }
+    }
+}
+
+void ChunkStore::RequirePendingNotNullKept(const ChunkVars& vars, const std::vector<std::uint8_t>& presence) const {
+    const auto& layout = geometry_.layout();
+    const auto& pending = layout.schema().pending;
+    if (!pending.has_value() || !pending->not_null) {
+        return;
+    }
+    const std::size_t index = layout.IndexOfId(pending->column_id);
+    if (layout.FixedColumnAt(index) != nullptr) {
+        return;  // RequirePendingFits reads its validity bits
+    }
+    // No entry of a NULL text or bytes column is NULL.
+    std::vector<bool> stored(layout.block_count(), false);
+    for (const auto entry : vars) {
+        if (entry.key.column_id == pending->column_id) stored[entry.key.block_index] = true;
+    }
+    for (std::size_t block = 0; block < layout.block_count(); ++block) {
+        if (!stored[block] && BlockPresent(presence, block)) {
             throw std::invalid_argument(
-                "column " + column.name + " is being narrowed to " + ColumnTypeName(pending->type) +
-                ", which does not hold the value of block index " + std::to_string(block));
+                "column " + layout.schema().columns[index].name +
+                " cannot be NULL while DROP NULL checks its values, as block index " + std::to_string(block) + " is");
         }
     }
 }
@@ -1130,7 +1174,8 @@ namespace {
 
 }  // namespace
 
-std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_id, const ColumnType& type) {
+std::optional<std::string> ChunkStore::FindValueNotFitting(
+    std::uint32_t column_id, const ColumnType& type, bool refuse_null) {
     const auto& layout = geometry_.layout();
     const std::size_t index = layout.IndexOfId(column_id);
     if (index == std::string_view::npos) {
@@ -1169,21 +1214,32 @@ std::optional<std::string> ChunkStore::FindValueNotFitting(std::uint32_t column_
             const auto chunk = GetOrLoadRegularChunk(coord);
             auto lock = LockStatementChunkShared(chunk->mutex);
             if (fixed == nullptr) {
+                // A present block without an entry holds NULL.
+                std::vector<bool> stored(refuse_null ? layout.block_count() : 0U, false);
                 for (const auto entry : chunk->vars) {
                     if (entry.key.column_id != column_id) {
                         continue;
                     }
+                    if (refuse_null) stored[entry.key.block_index] = true;
                     const ColumnValue value = DecodeVarValue(column, entry.value);
                     if (!ValueFits(type, value)) {
                         return describe(coord, entry.key.block_index, value);
                     }
                 }
+                for (std::size_t block = 0; block < stored.size(); ++block) {
+                    if (!stored[block] && BlockPresent(chunk->presence_bitmap, block)) {
+                        return describe(coord, block, std::monostate{});
+                    }
+                }
                 continue;
             }
             for (std::size_t block = 0; block < layout.block_count(); ++block) {
-                if (!BlockPresent(chunk->presence_bitmap, block) ||
-                    (fixed->validity != ChunkLayout::kNoValidity &&
-                     ((chunk->payload[fixed->validity + block / 8U] >> (block % 8U)) & 1U) == 0U)) {
+                if (!BlockPresent(chunk->presence_bitmap, block)) {
+                    continue;
+                }
+                if (fixed->validity != ChunkLayout::kNoValidity &&
+                    ((chunk->payload[fixed->validity + block / 8U] >> (block % 8U)) & 1U) == 0U) {
+                    if (refuse_null) return describe(coord, block, std::monostate{});
                     continue;
                 }
                 ReadValueBits(chunk->payload.data(), fixed->values * 8U + block * fixed->width, bytes.data(), fixed->width);
@@ -1311,6 +1367,7 @@ std::uint64_t ChunkStore::ApplyChunkState(
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     auto lock = LockStatementChunk(regular_chunk->mutex);
     AwaitChunkBacklogLocked(lock, *regular_chunk);
+    RequirePendingNotNullKept(regular_chunk->vars, presence_bitmap);
     // Values of blocks the state makes absent go.
     auto var_update = VarUpdateForState(regular_chunk->vars, presence_bitmap);
     return ApplyChunkStateLocked(

@@ -6,7 +6,8 @@
 namespace chunkdb {
 
 ChunkIdentityScanPage ChunkStore::ScanChunkIdentities(bool has_cursor, ChunkCoord cursor,
-    std::size_t limit, std::optional<std::uint64_t> since, bool with_data) {
+    std::size_t limit, std::optional<std::uint64_t> since, bool with_data,
+    const ChunkScanFilter* filter) {
     if (limit == 0U || limit > kMaxChunkScanLimit)
         throw std::invalid_argument("scan limit must be between 1 and " + std::to_string(kMaxChunkScanLimit));
     if (has_cursor) (void)geometry_.ChunkToLarge(cursor);
@@ -47,19 +48,32 @@ ChunkIdentityScanPage ChunkStore::ScanChunkIdentities(bool has_cursor, ChunkCoor
     };
     bool pass_has_cursor = has_cursor;
     auto pass_cursor = cursor;
-    while (page.entries.size() <= limit) {
-        const auto candidates = index->Page(pass_has_cursor, pass_cursor,
-            limit + 1U - page.entries.size(), since);
+    // Identities visited; without a filter, the entries.
+    std::size_t visited = 0U;
+    std::optional<ChunkCoord> last;
+    const bool with_vars = with_data || (filter != nullptr && filter->needs_vars);
+    const bool identity_only = !with_data && filter == nullptr;
+    const auto more = [&]() {
+        page.has_more = true;
+        page.after = last;
+        return finish();
+    };
+    while (visited <= limit) {
+        const auto candidates = index->Page(pass_has_cursor, pass_cursor, limit + 1U - visited, since);
         for (const auto& coord : candidates.coords) {
             CheckStatementCancellation();
             ChunkRangeEntry state;
-            if (!ReadPopulatedChunkStateNoCache(coord, &state, with_data, nullptr, since.has_value(), !with_data)) continue;
+            if (!ReadPopulatedChunkStateNoCache(coord, &state, with_vars, nullptr, since.has_value(), identity_only)) continue;
             if (since && state.version <= *since) continue;
-            if (page.entries.size() == limit) { page.has_more = true; return finish(); }
+            if (visited == limit) return more();
+            if (filter != nullptr && !filter->keep(coord, state)) {
+                ++visited;
+                last = coord;
+                continue;
+            }
             if (!charge(state)) {
-                if (page.entries.empty()) throw std::out_of_range("SCAN CHUNKS data exceeds the response byte limit");
-                page.has_more = true;
-                return finish();
+                if (visited == 0U) throw std::out_of_range("SCAN CHUNKS data exceeds the response byte limit");
+                return more();
             }
             ChunkIdentityScanEntry entry{.coord = coord, .version = state.version,
                 .commit_time_ms = state.commit_time_ms};
@@ -68,6 +82,8 @@ ChunkIdentityScanPage ChunkStore::ScanChunkIdentities(bool has_cursor, ChunkCoor
                     .presence_bitmap = std::move(state.presence_bitmap), .vars = std::move(state.vars),
                     .written = true, .commit_time_ms = state.commit_time_ms, .chunk_columns = std::move(state.chunk_columns)};
             page.entries.push_back(std::move(entry));
+            ++visited;
+            last = coord;
         }
         if (!candidates.more) break;
         pass_has_cursor = true;

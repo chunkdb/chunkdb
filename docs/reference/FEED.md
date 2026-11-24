@@ -138,6 +138,7 @@ UNWATCH
 | NO_TABLE | The table is absent, inaccessible, or dropped, or while watching you lost READ on it, or ADMIN on `*` that your watch of a slot you do not own needs (sent best-effort before the connection closes). | Check the table and access. |
 | AUTH_REQUIRED reason=user_dropped | Your user was dropped while watching; sent best-effort, and the connection closes. | Log in again as an existing user. |
 | INTERNAL | The watched table was fenced or recovered. | Watch it again after [RECOVER TABLE](TABLES.md#notes), from your saved position. |
+| INTERNAL | `watched table was swapped; watch it again` or `watched table was renamed; watch it again`. | Watch the table by its name after [SWAP TABLES or RENAME TO](TABLES.md#notes), from your saved position. |
 
 ## Notes
 
