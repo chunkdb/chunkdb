@@ -22,6 +22,8 @@ struct MigrationRequest {
     TableSchema schema;
     std::function<void(StoreManifest&)> alter;
     std::optional<std::pair<std::string, ColumnType>> narrowing;
+    // ALTER COLUMN ... DROP NULL of this column, checked as a narrowing is.
+    std::optional<std::string> drop_null{};
     std::string user;
     std::optional<Right> right;
     std::uint8_t server_rights = 0U;

@@ -14,9 +14,11 @@ DESCRIBE schema_demo
 ALTER TABLE schema_demo ADD COLUMN light u4 DEFAULT 15
 ALTER TABLE schema_demo RENAME COLUMN name TO label
 ALTER TABLE schema_demo ALTER COLUMN kind TYPE u16
+ALTER TABLE schema_demo ALTER COLUMN label SET DEFAULT 'none'
 ALTER TABLE schema_demo SET var_max_chunk_bytes = 2097152
 ALTER TABLE schema_demo DROP COLUMN light
-DROP TABLE schema_demo
+ALTER TABLE schema_demo RENAME TO schema_renamed
+DROP TABLE schema_renamed
 ```
 
 ```output
@@ -47,6 +49,8 @@ OK
 OK
 OK
 OK
+OK
+OK
 ```
 
 SHOW TABLES also lists any other tables you have created.
@@ -64,7 +68,10 @@ ALTER TABLE table ADD CHUNK COLUMN [IF NOT EXISTS] column type [NULL] [REQUIRED]
 ALTER TABLE table DROP CHUNK COLUMN [IF EXISTS] column
 ALTER TABLE table RENAME CHUNK COLUMN column TO name
 ALTER TABLE table ALTER COLUMN column TYPE type [USING CLAMP | DEFAULT | TRUNCATE]
+ALTER TABLE table ALTER COLUMN column SET DEFAULT value | DROP DEFAULT
+ALTER TABLE table ALTER COLUMN column SET NULL | DROP NULL | SET REQUIRED | DROP REQUIRED
 ALTER TABLE table SET option = value
+ALTER TABLE table RENAME TO name
 DROP TABLE [IF EXISTS] table
 RECOVER TABLE table
 SWAP TABLES table, table
@@ -88,6 +95,10 @@ ENABLE FEATURE 'name'
 - `USING CLAMP`: narrow numeric values to the nearest supported value.
 - `USING DEFAULT`: replace values that do not fit with the column's default.
 - `USING TRUNCATE`: shorten text, bytes, or bits to the new bound.
+- `SET DEFAULT` and `DROP DEFAULT`: change the value new blocks take for an omitted column; `SET DEFAULT NULL` drops the DEFAULT of a NULL column.
+- `SET NULL` and `DROP NULL`: let the column hold NULL, or no longer; DROP NULL first checks every stored value.
+- `SET REQUIRED` and `DROP REQUIRED`: whether new blocks must give the column.
+- `RENAME TO`: the table's new name, under the same rules as `table`.
 
 | Type | Values |
 | --- | --- |
@@ -123,6 +134,7 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 - CREATE, ALTER, and DROP: `OK`, including authorized conditional no-ops.
 - RECOVER TABLE: `OK` once the table serves again, or is gone because its directory is.
 - SWAP TABLES: `OK` once each name serves the other table.
+- RENAME TO: `OK` once the new name serves the table.
 - SHOW TABLES: accessible table names, fenced tables included.
 - DESCRIBE: schema version, column definitions, geometry, options, table epoch, completed revision, dimensions, and chunk columns; a fenced table adds `fenced` with its reason.
 - SHOW STATUS: `version`, the `server_version` HELLO reports, `uptime_ms` since the server started, `read_only`, `directory` features, `tables`, `fenced`, and `activation_pending`; each `tables` entry has `name`, `state`, `reason`, `enabled`, `compat`, `ro_compat`, and `incompat`, and each `fenced` entry has `name` and `reason`.
@@ -140,13 +152,16 @@ The `chunk_columns` list uses the same column-description maps as `columns`.
 | --- | --- | --- |
 | TABLE_EXISTS | A table already exists. | Use another name, IF NOT EXISTS, [MIGRATE](MIGRATIONS.md), or DROP TABLE. |
 | NO_TABLE | A table is absent or inaccessible. | Check its name and rights. |
-| PERMISSION_DENIED | You lack ADMIN on the table, on both tables for SWAP, or for CREATE on the new name, a matching prefix, or all tables. | Request access. |
+| PERMISSION_DENIED | You lack ADMIN on the table, on both tables for SWAP, or for CREATE and RENAME TO on the new name, a matching prefix, or all tables. | Request access. |
 | INVALID_ARGUMENT | A name, type, default, conversion, or option is invalid, or RECOVER TABLE names a table that is not fenced. | Correct the reported argument. |
 | INTERNAL | The table is fenced: `table 'name' is fenced: reason; run RECOVER TABLE name`. | Run RECOVER TABLE. |
 | INVALID_ARGUMENT | RECOVER TABLE finds stored options that differ from the server's option flags. | Restart the server without those flags, or with the stored values. |
 | INTERNAL | A migration with an unknown outcome fences every table. | Restart the server; see [Migrations](MIGRATIONS.md#errors). |
 | INVALID_ARGUMENT | You run CREATE, ALTER, DROP, RECOVER TABLE, SWAP TABLES or ENABLE FEATURE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | INVALID_ARGUMENT | SWAP TABLES names one table twice. | Name two tables. |
+| INVALID_ARGUMENT | DROP NULL finds a NULL: `column c cannot drop NULL: block (x, y) holds NULL`. | Set a value in that block, then run DROP NULL again. |
+| INVALID_ARGUMENT | An ALTER COLUMN change leaves the column as it is, or makes it both NULL and REQUIRED. | Drop the other attribute first. |
+| TABLE_EXISTS | RENAME TO names a table that exists, or a directory under `tables/` that no table of this server uses. | Use another name, or DROP TABLE that table first. |
 | INTERNAL | SWAP TABLES on Windows or a file system without an atomic directory exchange; both tables keep their names. | Swap on Linux or macOS, or restore under the live name after DROP TABLE. |
 | CONFLICT | An active transaction sees a schema change. | Retry from BEGIN. |
 
@@ -155,6 +170,12 @@ The `chunk_columns` list uses the same column-description maps as `columns`.
 Changing columns immediately publishes a new schema version; older chunks convert when loaded.
 Types can change only within their family: integers, floats, text, bytes, or bits.
 Narrowing without USING checks every stored value and refuses the first value that does not fit.
+DROP NULL checks every stored value the same way and refuses the first NULL with its block.
+While either check runs, writes that the change would refuse are refused already; a restart or RECOVER TABLE drops an interrupted check.
+A table restored from a backup taken during a check does not have the check, and keeps the column as it was before it.
+SET DEFAULT and DROP DEFAULT change only blocks created later; existing blocks keep their values.
+SET REQUIRED applies to new blocks only: existing blocks of a column that is not NULL always hold a value.
+The embedded bit-string calls (`ChunkStore::GetBlockBits` and the like) need a table whose one column is bits(N) and not NULL: SET NULL on that column, like ADD COLUMN, makes them refuse, and DROP NULL brings them back.
 You can add REQUIRED without DEFAULT only when no block is present.
 For chunk columns, adding REQUIRED without DEFAULT requires no written chunk identity, including retained tombstones.
 Block and chunk columns share the table's schema version; changing either domain advances it once.
@@ -173,6 +194,18 @@ Open transactions on either table answer CONFLICT, and watches of either table e
 A consumer that watches the name again sees another epoch, so it resumes by [lineage](../CHANGE_FEED.md) or rebuilds.
 Each slot of either table is then reached by another name, so its next watch without AFTER starts with resync.
 A failure after the exchange fences the names it leaves unserved until RECOVER TABLE.
+
+RENAME TO gives a table a new name in one atomic step; data, epoch, lineage and durable slots stay with the table, and the grants on its name move to the new name; prefix and `*` grants stay as they are.
+A user with grants on both names keeps the higher right; the old name keeps no grants and is free for a new table.
+It waits for running statements and backups on the table and makes their acknowledged writes durable first.
+CANCEL, KILL CONNECTION or a statement timeout stops it only before the rename.
+Open transactions on the table answer CONFLICT, and watches end with INTERNAL `watched table was renamed; watch it again`.
+A consumer watches the new name and resumes in the same epoch; slots keep their positions.
+GRANT and REVOKE wait for a running RENAME TO, so each applies before or after it.
+A crash during RENAME TO leaves the table under one of the two names; the grants then may name both, and REVOKE removes those no longer wanted.
+A failure to make the rename durable fences both names until RECOVER TABLE of each, and the grants may then name both too.
+A failure to open the renamed table fences the new name until RECOVER TABLE; the old name is free and keeps no grants.
+RENAME TO is not taken inside [MIGRATE](MIGRATIONS.md).
 
 A failure that leaves a table out of service fences it, while other tables keep serving.
 Statements on that table return INTERNAL with the fenced message and its reason.

@@ -4,6 +4,10 @@
 #include <algorithm>
 #include <cassert>
 #include <array>
+#include <atomic>
+#include <chrono>
+#include <functional>
+#include <future>
 #include <barrier>
 #include <thread>
 #include <cstdio>
@@ -500,6 +504,115 @@ void TestPrefixGrants() {
     assert(watcher.watch_right->Check() == chunkdb::ReadRightCheck::State::kNoRight);
     ExpectError(server.Run(t1, "GET BLOCK 0 0 FROM tenant1_"), "NO_TABLE");
     assert(server.Run(t1, "GET BLOCK 1 1 FROM tenant1_world").rfind("-ERR", 0) != 0);
+}
+
+// ALTER TABLE ... RENAME TO needs ADMIN on both names and moves the grants
+// with the table: each user keeps the higher right where both names had one,
+// and the old name keeps none.
+void TestRenameTableGrants() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE TABLE logs (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE TABLE other (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    for (const auto* user : {"bot", "carol", "dave"})
+        ExpectReply(server.Run(admin, std::string("CREATE USER ") + user + " VERIFIER $1", Parameters{VerifierText("pw")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT WRITE ON logs TO bot"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT ADMIN ON logs TO carol"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON archive TO carol"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON archive TO dave"), "+OK\r\n");
+    SessionState bot = server.LoggedIn("bot", "pw");
+    SessionState carol = server.LoggedIn("carol", "pw");
+    ExpectError(server.Run(bot, "ALTER TABLE logs RENAME TO archive"), "PERMISSION_DENIED ADMIN on logs");
+    ExpectError(server.Run(carol, "ALTER TABLE logs RENAME TO archive"), "PERMISSION_DENIED ADMIN on archive");
+    ExpectError(server.Run(admin, "ALTER TABLE logs RENAME TO other"), "TABLE_EXISTS");
+    ExpectReply(server.Run(admin, "ALTER TABLE logs RENAME TO archive"), "+OK\r\n");
+    const auto grants = [&](const std::string& user) { return server.users->Find(user)->grants; };
+    assert(!grants("bot").contains("logs") && grants("bot").at("archive") == chunkdb::Right::kWrite);
+    assert(!grants("carol").contains("logs") && grants("carol").at("archive") == chunkdb::Right::kAdmin);
+    assert(grants("dave").at("archive") == chunkdb::Right::kRead);
+    // A session already logged in follows the moved grants.
+    assert(server.Run(bot, "SET BLOCK 0 0 IN archive bits = b'1010'").rfind(":", 0) == 0);
+    ExpectError(server.Run(bot, "GET BLOCK 0 0 FROM logs"), "NO_TABLE");
+    ExpectError(server.Run(carol, "ALTER TABLE archive RENAME TO logs"), "PERMISSION_DENIED ADMIN on logs");
+}
+
+// Runs `at_forget` on the second users change of this thread's rename: the
+// removal of the old name's grants, after they were copied to the new name.
+struct PauseRenameGrants final : chunkdb::MigrationTestHook {
+    std::atomic<int> calls{0};
+    std::function<void()> at_forget;
+    void Run(Point point, std::string_view) override {
+        if (point == Point::kBeforeUserUpdate && ++calls == 2) at_forget();
+    }
+};
+
+// RENAME TO takes back grants whose copy has an unknown outcome, leaves no
+// grants on the old name of a table it renamed but could not open, and a
+// REVOKE waits for the whole rename.
+void TestRenameGrantFailures() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    SessionState other_admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE TABLE logs (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{VerifierText("pw")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT WRITE ON logs TO bot"), "+OK\r\n");
+    const auto grants = [&] { return server.users->Find("bot")->grants; };
+    {
+        chunkdb::txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
+        ExpectError(server.Run(admin, "ALTER TABLE logs RENAME TO archive"), "OUTCOME_UNKNOWN");
+    }
+    assert(server.catalog->Find("logs") != nullptr && server.catalog->Find("archive") == nullptr);
+    assert(grants().at("logs") == chunkdb::Right::kWrite && !grants().contains("archive"));
+    {
+        chunkdb::txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_RENAME_TABLE_OPEN_FAIL_ONCE", "1");
+        ExpectError(server.Run(admin, "ALTER TABLE logs RENAME TO archive"), "INTERNAL");
+    }
+    assert(!grants().contains("logs") && grants().at("archive") == chunkdb::Right::kWrite);
+    ExpectReply(server.Run(admin, "RECOVER TABLE archive"), "+OK\r\n");
+
+    PauseRenameGrants hook;
+    bool revoked_inside = false;
+    std::future<std::string> revoke;
+    hook.at_forget = [&] {
+        revoke = std::async(std::launch::async, [&] { return server.Run(other_admin, "REVOKE WRITE ON archive FROM bot"); });
+        revoked_inside = revoke.wait_for(std::chrono::milliseconds(300)) == std::future_status::ready;
+    };
+    server.users->SetMigrationTestHook(&hook);
+    ExpectReply(server.Run(admin, "ALTER TABLE archive RENAME TO store"), "+OK\r\n");
+    ExpectReply(revoke.get(), "+OK\r\n");
+    server.users->SetMigrationTestHook(nullptr);
+    assert(!revoked_inside);
+    // The REVOKE came after the rename, when the old name had no grants.
+    assert(grants().size() == 1U && grants().at("store") == chunkdb::Right::kWrite);
+}
+
+// A rename moves only the grants on the table's own name: prefix grants
+// neither follow it nor are lost, and the new name needs ADMIN through its
+// name, a matching prefix or `*`.
+void TestRenamePrefixGrants() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    ExpectReply(server.Run(admin, "CREATE USER t1 VERIFIER $1", Parameters{VerifierText("pw")}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT ADMIN ON tenant1_* TO t1"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT READ ON other_* TO t1"), "+OK\r\n");
+    SessionState t1 = server.LoggedIn("t1", "pw");
+    ExpectReply(server.Run(t1, "CREATE TABLE tenant1_logs (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
+    ExpectReply(server.Run(admin, "GRANT WRITE ON tenant1_logs TO t1"), "+OK\r\n");
+    ExpectError(server.Run(t1, "ALTER TABLE tenant1_logs RENAME TO other_logs"), "PERMISSION_DENIED ADMIN on other_logs");
+    ExpectReply(server.Run(t1, "ALTER TABLE tenant1_logs RENAME TO tenant1_archive"), "+OK\r\n");
+    const auto prefixes = [&] { return server.users->Find("t1")->prefix_grants; };
+    const auto grants = [&] { return server.users->Find("t1")->grants; };
+    const std::map<std::string, chunkdb::Right> kept{{"other_", chunkdb::Right::kRead}, {"tenant1_", chunkdb::Right::kAdmin}};
+    assert(prefixes() == kept);
+    assert(grants().size() == 1U && grants().at("tenant1_archive") == chunkdb::Right::kWrite);
+    // Out of the prefix: the exact grant moves, the prefix grant stays behind.
+    ExpectReply(server.Run(admin, "ALTER TABLE tenant1_archive RENAME TO other_archive"), "+OK\r\n");
+    assert(prefixes() == kept);
+    assert(grants().size() == 1U && grants().at("other_archive") == chunkdb::Right::kWrite);
+    ExpectError(server.Run(t1, "ALTER TABLE other_archive RENAME TO tenant1_back"), "PERMISSION_DENIED ADMIN on other_archive");
+    assert(server.Run(t1, "SET BLOCK 0 0 IN other_archive bits = b'1010'").rfind(":", 0) == 0);
+    // The old name is free and covered by the prefix grant alone.
+    ExpectReply(server.Run(t1, "CREATE TABLE tenant1_archive (bits bits(4)) CHUNK 4 x 4"), "+OK\r\n");
 }
 
 void TestRecreatedUser() {
@@ -1222,6 +1335,9 @@ int main(int argc, char** argv) {
     TestRights();
     TestServerRights();
     TestPrefixGrants();
+    TestRenameTableGrants();
+    TestRenameGrantFailures();
+    TestRenamePrefixGrants();
     TestRecreatedUser();
     TestConditionalUsers();
     TestConcurrentConditionalUsers();

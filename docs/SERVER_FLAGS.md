@@ -88,7 +88,7 @@ These events are recorded:
 | `event` | When |
 |---|---|
 | `login` | A login succeeds or fails. |
-| `create_table`, `alter_table`, `drop_table`, `recover_table` | Schema statements and RECOVER TABLE. |
+| `create_table`, `alter_table`, `drop_table`, `recover_table` | Schema statements and RECOVER TABLE; ALTER TABLE ... RENAME TO names both tables as `a,b`. |
 | `create_user`, `alter_user`, `drop_user`, `grant`, `revoke` | User and right statements. |
 | `backup` | BACKUP. |
 | `restore_table`, `swap_tables` | RESTORE TABLE, with the new table, and SWAP TABLES, with both tables as `a,b`. |

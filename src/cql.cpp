@@ -1,5 +1,6 @@
 #include "cql.hpp"
 #include "cql_lexer.hpp"
+#include "expr.hpp"
 
 #include <algorithm>
 #include <array>
@@ -626,8 +627,17 @@ class Parser {
         return 2;
     }
 
+    // After WHERE: the condition (expr.hpp), up to the first token that
+    // cannot continue it. Its parameters join the statement's.
+    [[nodiscard]] std::shared_ptr<const expr::Expression> Where() {
+        // The expression lexes from the end of the last token read, so no
+        // token after WHERE may have been read yet.
+        if (next_ != tokens_.size()) throw std::logic_error("WHERE was parsed after a lookahead");
+        return std::make_shared<const expr::Expression>(expr::ParseConditionAt(line_, &at_, &parameters_));
+    }
+
     // After AGGREGATE: CHUNK c | AREA a TO b | AREA AROUND c RADIUS r, then
-    // FROM t, the functions and BY CHUNK.
+    // FROM t, the functions, WHERE and BY CHUNK.
     [[nodiscard]] Aggregate AggregateStatement() {
         Aggregate aggregate;
         if (Accept("chunk")) {
@@ -680,8 +690,9 @@ class Parser {
                 if (aggregate.by_chunk) Fail(column, "BY CHUNK is given twice");
                 Expect("chunk");
                 aggregate.by_chunk = true;
-            } else if (IsKeyword(Peek(), "where")) {
-                Fail(column, "AGGREGATE does not take WHERE; it aggregates every present block of the selector");
+            } else if (Accept("where")) {
+                if (aggregate.where) Fail(column, "WHERE is given twice");
+                aggregate.where = Where();
             } else {
                 break;
             }
@@ -874,6 +885,9 @@ class Parser {
             }, statement);
             if (!allowed || !parameters_.empty())
                 Fail(start + 1U, "MIGRATE takes one schema statement without parameters");
+            if (const auto* alter = std::get_if<AlterTable>(&migration.statement);
+                alter != nullptr && std::holds_alternative<RenameTable>(alter->change))
+                Fail(start + 1U, "MIGRATE cannot rename a table; run ALTER TABLE ... RENAME TO on its own");
             const auto end = line_.find_last_not_of(" \t");
             migration.text = std::string(line_.substr(start, end == std::string_view::npos ? 0U : end + 1U - start));
             return migration;
@@ -1140,6 +1154,10 @@ class Parser {
                 const bool conditional = IfExists();
                 alter.change = DropColumn{.column = Name("a column name"), .if_exists = conditional, .chunk_column = chunk_column};
             } else if (Accept("rename")) {
+                if (Accept("to")) {
+                    alter.change = RenameTable{.new_name = Name("a table name")};
+                    return alter;
+                }
                 const bool chunk_column = Accept("chunk");
                 Expect("column");
                 RenameColumn rename;
@@ -1150,8 +1168,28 @@ class Parser {
                 alter.change = rename;
             } else if (Accept("alter")) {
                 Expect("column");
+                const auto column_name = Name("a column name");
+                const bool set = Accept("set");
+                if (set || Accept("drop")) {
+                    using Change = AlterColumnAttribute::Change;
+                    AlterColumnAttribute attribute;
+                    attribute.column = column_name;
+                    if (Accept("default")) {
+                        attribute.change = set ? Change::kSetDefault : Change::kDropDefault;
+                        if (set) attribute.value = Value(false);
+                    } else if (Accept("null")) {
+                        attribute.change = set ? Change::kSetNull : Change::kDropNull;
+                    } else if (Accept("required")) {
+                        attribute.change = set ? Change::kSetRequired : Change::kDropRequired;
+                    } else {
+                        Fail(Peek().column, "expected DEFAULT, NULL or REQUIRED, got " + Quote(Peek()));
+                    }
+                    alter.change = std::move(attribute);
+                    return alter;
+                }
                 AlterColumnType change;
-                change.column = Name("a column name");
+                change.column = column_name;
+                if (!IsKeyword(Peek(), "type")) Fail(Peek().column, "expected TYPE, SET or DROP, got " + Quote(Peek()));
                 Expect("type");
                 change.type = Type();
                 if (Accept("using")) {
@@ -1351,10 +1389,12 @@ class Parser {
                     if (!scan.columns.empty()) Fail(column, "COLUMNS is given twice");
                     scan.columns = FeedColumns();
                 } else if (Accept("where")) {
-                    Fail(column, "SCAN CHUNKS does not support WHERE");
+                    if (scan.where) Fail(column, "WHERE is given twice");
+                    scan.where = Where();
                 } else break;
             }
             if (!scan.columns.empty() && !scan.with_data) Fail(1, "COLUMNS requires WITH DATA");
+            if (scan.where && scan.since && !scan.with_data) Fail(1, "WHERE with SINCE requires WITH DATA");
             return scan;
         }
         throw UnknownCommandError("column " + std::to_string(first.column) + ": unknown statement " +

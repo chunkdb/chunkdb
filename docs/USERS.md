@@ -56,6 +56,8 @@ A wildcard grant on `*` applies to every table, including future tables.
 A prefix grant such as `GRANT ADMIN ON tenant1_* TO t1` applies to every table whose name starts with `tenant1_`, including `tenant1_` itself and future tables.
 A user gets the highest right of its grants on the name, on matching prefixes and on `*`.
 Dropping a table removes its specific grants; prefix and wildcard grants remain.
+Renaming a table with ALTER TABLE ... RENAME TO moves its specific grants to the new name; a user with grants on both names keeps the higher right; prefix and wildcard grants stay as they are.
+GRANT and REVOKE wait for a running DROP TABLE or RENAME TO, so each applies before or after it.
 
 MONITOR, BACKUP and REPLICATION are server rights, granted with `ON *`, for example `GRANT MONITOR ON * TO metrics`.
 They give no table rights and no user management.
@@ -72,6 +74,7 @@ REPLICATION is stored and shown by SHOW USERS; no statement requires it yet.
 | ALTER TABLE, DROP TABLE, RECOVER TABLE, CREATE SLOT, DROP SLOT | ADMIN on the table |
 | CREATE TABLE | ADMIN on the name, on a matching prefix, or on all tables |
 | SWAP TABLES | ADMIN on both tables |
+| ALTER TABLE ... RENAME TO | ADMIN on the table, and on the new name, a matching prefix, or all tables |
 | SHOW METRICS, SHOW STATUS | MONITOR, or ADMIN on all tables |
 | RELOAD TLS | ADMIN on all tables |
 | FLUSH WAL | WRITE on at least one table or prefix |

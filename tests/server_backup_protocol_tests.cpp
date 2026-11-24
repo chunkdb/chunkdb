@@ -474,12 +474,53 @@ void SwapStatement() {
     user.Ok("SWAP TABLES t_restored, t");
     assert(Field(admin->Command("DESCRIBE t"), "epoch").value == live);
 }
+// ALTER TABLE ... RENAME TO keeps the epoch and the slot position under the
+// new name; open transactions end with CONFLICT and the old name is gone.
+void RenameStatement() {
+    test::ScopedTempDir destinations("chunkdb-rename-table-protocol");
+    Harness harness(false, true, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
+    auto admin = harness.Connect();
+    admin->Ok("CREATE TABLE r (n u8) CHUNK 2 x 2");
+    admin->Ok("CREATE SLOT 'consumer' ON r");
+    const auto epoch = StoreIdHex(harness.catalog->Find("r")->store_id());
+    auto watcher = harness.Connect();
+    (void)Start(watcher->Command("WATCH r SLOT 'consumer'"));
+    const auto acked = Number(admin->Command("SET BLOCK 1 1 IN r n = 3"));
+    while (Change(NextChange(*watcher)) < acked) {}
+    watcher->Line("ACK " + std::to_string(acked));
+    Unwatch(*watcher);
+    WaitAck(*admin, "r", "consumer", acked);
+
+    auto txn = harness.Connect();
+    txn->Ok("BEGIN");
+    assert(Number(txn->Command("GET BLOCK 1 1 FROM r").items.at(0)) == 3U);
+    admin->Ok("ALTER TABLE r RENAME TO r_old");
+    Error(txn->Command("SET BLOCK 0 0 IN r n = 9"), "CONFLICT");
+    txn->Ok("ROLLBACK");
+    Error(admin->Command("DESCRIBE r"), "NO_TABLE");
+    assert(Field(admin->Command("DESCRIBE r_old"), "epoch").value == epoch);
+    assert(Number(admin->Command("GET BLOCK 1 1 FROM r_old").items.at(0)) == 3U);
+    // The slot is reached by its new name at its saved position, without resync.
+    assert(Start(watcher->Command("WATCH r_old SLOT 'consumer'")) == std::make_pair(epoch, acked));
+    const auto after = Number(admin->Command("SET BLOCK 1 1 IN r_old n = 4"));
+    assert(Change(NextChange(*watcher)) == after);
+    Unwatch(*watcher);
+
+    Error(admin->Command("ALTER TABLE r_old RENAME TO r_old"), "INVALID_ARGUMENT");
+    Error(admin->Command("ALTER TABLE r RENAME TO r_new"), "NO_TABLE");
+    admin->Ok("CREATE TABLE r (n u8) CHUNK 2 x 2");
+    Error(admin->Command("ALTER TABLE r_old RENAME TO r"), "TABLE_EXISTS");
+    admin->Ok("BEGIN");
+    Error(admin->Command("ALTER TABLE r_old RENAME TO r_new"), "INVALID_ARGUMENT");
+    admin->Ok("ROLLBACK");
+}
 } // namespace
 int main() {
     RestoreStatement();
     RestoreProgress();
     SwapStatement();
-    std::cout << "restore and swap protocol groups passed\n";
+    RenameStatement();
+    std::cout << "restore, swap and rename protocol groups passed\n";
     for (const bool tls : {false, true}) {
 #ifndef CHUNKDB_WITH_OPENSSL
         if (tls) continue;
