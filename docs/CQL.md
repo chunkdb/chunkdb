@@ -6,7 +6,7 @@ Reads and deletes name a table after `FROM`; writes use `IN`.
 
 The examples use the [chunk-cli shell](QUICK_START.md#2-connect-the-shell).
 Input and output appear in separate blocks; shell prompts are omitted.
-Examples are recorded against the current source build and checked in CI.
+The examples show the output of this version of the server.
 Generated passwords, epochs, and timestamps appear as named placeholders.
 
 ## Statements
