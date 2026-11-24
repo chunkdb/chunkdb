@@ -112,6 +112,11 @@ std::optional<std::string_view> ChunkStore::SlotWriteUser() const noexcept {
     if (!feed_slots_active_.load(std::memory_order_acquire)) return std::nullopt;
     return CurrentWriteUser();
 }
+const FeedMessage* ChunkStore::WriteMessage() const {
+    const auto* message = CurrentWriteMessage();
+    if (message != nullptr) RequireFeature(features_, *FindFeature("messages"));
+    return message;
+}
 
 FeedArchiveReader FeedSlotTestAccess::CompletedPrefix(Table& table, std::string_view name, FeedPosition after) {
     auto lease = table.Acquire();

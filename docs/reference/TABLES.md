@@ -277,7 +277,7 @@ See [Server flags](../SERVER_FLAGS.md#table-geometry).
 Its protected snapshot refuses unhealthy serving state instead of guessing whether activation completed.
 `ENABLE FEATURE 'name'` requires ADMIN on `*` and returns OK for an already enabled feature.
 
-New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, `feature_activation`, and `chunk_model`.
+New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, `feature_activation`, `chunk_model`, and `messages`.
 Existing directories retain their recorded bits; enable `feature_activation` before another missing feature.
 Activation validates every table before recording its durable decision, then updates only that feature's registered owners.
 A fenced table refuses activation with its fenced message until RECOVER TABLE.

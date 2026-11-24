@@ -83,6 +83,7 @@ Unknown `incompat` bits refuse opening; unknown `ro_compat` bits permit only rea
 The server opens read-write and therefore refuses either of the first two unknown sets; with `--read-only` it refuses only unknown `incompat` bits.
 Table incompat bit 0 (`0x1`) enables durable feed slots, USER WAL metadata, and collection-frame flags; it remains set after slot removal.
 Directory and table incompat bit 5 (`0x20`), named `chunk_model`, owns dimensional geometry, both column domains, sectioned forms, and retained coordinate decisions.
+Directory and table incompat bit 8 (`0x100`), named `messages`, owns MESSAGE WAL TLVs.
 Directory and table incompat bit 6 (`0x40`) is reserved for commit groups, which this build does not provide: it never sets the bit, `ENABLE FEATURE` does not accept it, and a directory or table that records it is refused as an unknown feature.
 Earlier development envelopes are refused before artifact mutation; they require recreating the data directory.
 
@@ -333,9 +334,13 @@ TLVs fill their declared area exactly; each known type appears at most once:
 | 2 SCHEMA | schema version `u64`; absent means version 1 |
 | 3 USER | nonempty writer-identity bytes, requiring the feed-slots feature; absent for anonymous writes |
 | 4 GROUP | reserved for commit groups: nonzero 16-byte group identity, `u64` member count, `u64` member ordinal; this build refuses a frame that carries it |
+| 5 MESSAGE | channel length `u8` (1–63), the channel (`[a-z_][a-z0-9_.]*`), then 0–16384 message bytes, requiring the `messages` feature; never in a collection frame |
 
 All TLVs including their four-byte headers must fit the 65535-byte area; TAG's usable size therefore depends on other metadata in the frame.
 GROUP is exactly 32 bytes, its count is positive and its ordinal is below that count.
+A commit's MESSAGE is on one frame only: a single-chunk write's frame, or a transaction's first frame in coordinate order; see [Messages](design/MESSAGES.md).
+An unchanged write that publishes a message still logs a record, its unchanged presence or state, which replay applies without effect.
+Replay validates MESSAGE with the frame and does not apply it to chunk state.
 Collection frames have no TAG and zero spans for the full payload/presence.
 They have an empty VAR_REPLACE when the schema has variable columns.
 Archives apply them without an extra user change.

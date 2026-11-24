@@ -39,6 +39,7 @@ void EqualEntry(const FeedEntry& expected, const FeedEntry& actual) {
     assert(expected.kind == actual.kind && expected.position == actual.position);
     assert(expected.commit_time_ms == actual.commit_time_ms && expected.schema_version == actual.schema_version);
     assert(expected.user == actual.user);
+    assert(expected.messages == actual.messages);
     EqualBlocks(expected.blocks, actual.blocks);
 }
 void ConditionalSlotChanges() {
@@ -220,6 +221,72 @@ void AllMutationsAndRelease() {
     table->DropFeedSlot("slow");
     table->DropFeedSlot("fast");
     assert(table->ListFeedSlots().empty());
+}
+
+// A slot replays each message from the WAL frame its commit wrote, also after
+// a checkpoint archived that WAL and the server restarted.
+void MessagesInSlotHistory() {
+    ScopedTempDir dir("chunkdb-feed-slots-messages");
+    const auto config = SlotsConfig(dir.path());
+    const FeedMessage paid{"orders", "paid"}, cas{"orders", "cas"};
+    const FeedMessage both{"orders.moved", std::string("\0\1", 2U)}, same{"audit", ""};
+    FeedPosition start;
+    std::vector<std::shared_ptr<const FeedEntry>> live;
+    {
+        TableCatalog catalog(config);
+        auto table = feed_test::CreateDefault(catalog);
+        start = table->CreateFeedSlot("consumer").position;
+        auto feed = table->SubscribeFeed();
+        {
+            auto lease = table->Acquire();
+            auto& store = lease->store();
+            {
+                ScopedWriteMessage publishing(&paid);
+                store.SetBlockBits(0, 0, Bits(1U));
+            }
+            live.push_back(Next(*feed));
+            store.CheckpointForTests(0, 0);
+            {
+                ScopedWriteMessage publishing(&cas);
+                auto state = store.ReadChunkState(0, 0);
+                txn_test::SetCounter(&state, 2U);
+                assert(store.WriteChunkState(0, 0, std::move(state), store.GetChunkVersion(0, 0)).ok);
+            }
+            live.push_back(Next(*feed));
+            {
+                ScopedWriteMessage publishing(&both);
+                auto snapshot = store.BeginTxnSnapshot(txn_test::kTxnDuration);
+                auto a = store.ReadChunkStateAt(*snapshot, 0, 0);
+                auto b = store.ReadChunkStateAt(*snapshot, 1, 0);
+                txn_test::SetCounter(&a, 3U);
+                txn_test::SetCounter(&b, 4U);
+                assert(store.CommitTransaction(*snapshot, {}, {{{0, 0}, std::move(a)}, {{1, 0}, std::move(b)}}) != 0U);
+            }
+            live.push_back(Next(*feed));
+            {
+                // An unchanged state commits only because it publishes.
+                ScopedWriteMessage publishing(&same);
+                const auto state = store.ReadChunkState(1, 0);
+                (void)store.SetChunkStateBytes(1, 0, state.payload, state.presence_bitmap);
+            }
+            live.push_back(Next(*feed));
+            store.CheckpointForTests(0, 0);
+            store.CheckpointForTests(1, 0);
+        }
+        assert(live[0]->messages == std::vector<FeedMessage>{paid} && live[1]->messages == std::vector<FeedMessage>{cas});
+        assert(live[2]->messages == std::vector<FeedMessage>{both} && live[2]->blocks.size() == 2U);
+        assert(live[3]->messages == std::vector<FeedMessage>{same} && live[3]->blocks.empty());
+        FeedSlotTestAccess::Sync(*table);
+    }
+    TableCatalog catalog(config);
+    auto table = catalog.Find("default");
+    auto reader = table->ReadFeedArchive(start);
+    for (const auto& change : live) {
+        const auto entry = reader.Next();
+        assert(entry);
+        EqualEntry(*change, *entry);
+    }
+    assert(!reader.Next());
 }
 
 void RestartAndPins() {
@@ -730,6 +797,7 @@ int main() {
     ConditionalLostSlot();
     AllMutationsAndRelease();
     RestartAndPins();
+    MessagesInSlotHistory();
     ActivationBaseline();
     UnloadedActivation();
     AliasRecovery();

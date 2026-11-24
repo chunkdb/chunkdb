@@ -14,6 +14,9 @@
 #include "scram.hpp"
 #include "feed_test_utils.hpp"
 #include "feed_protocol.hpp"
+#include "feature_flags.hpp"
+#include "wal_replay.hpp"
+#include "wal_writer.hpp"
 #include "user_registry.hpp"
 
 namespace {
@@ -308,6 +311,118 @@ void WritingUser(bool authenticated) {
         lease->store().SetBlockBits(8, 0, Bits(3));
     }
     assert(!Next(*feed)->user);
+}
+
+std::uint64_t VersionReply(const std::string& reply) {
+    assert(reply.size() > 3U && reply.front() == ':');
+    return std::stoull(reply.substr(1U));
+}
+
+// A message rides the commit of its write or transaction, with that commit's
+// data (docs/design/MESSAGES.md).
+void MessagesRideTheirCommit() {
+    ScopedTempDir dir("chunkdb-feed-messages");
+    auto catalog = std::make_shared<TableCatalog>(Config(dir.path()));
+    CommandEngine engine({.require_auth = false}, catalog);
+    SessionState session;
+    (void)engine.Execute(session, "HELLO 3\r\n");
+    assert(engine.Execute(session, "CREATE TABLE notes (kind u8) CHUNK 2 x 2\r\n") == "+OK\r\n");
+    auto feed = catalog->Find("notes")->SubscribeFeed();
+
+    const auto first = VersionReply(engine.Execute(session, "SET BLOCK 0 0 IN notes kind = 1 PUBLISH 'orders.paid' 'order 7'\r\n"));
+    auto entry = Next(*feed);
+    assert(entry->position.revision == first && entry->blocks.size() == 1U);
+    assert(entry->messages == (std::vector<FeedMessage>{{"orders.paid", "order 7"}}));
+    assert(entry->protocol_frame->starts_with(">11\r\n$6\r\nchange\r\n"));
+    assert(entry->protocol_frame->ends_with("*1\r\n*2\r\n$11\r\norders.paid\r\n$7\r\norder 7\r\n"));
+
+    // A write that publishes commits even when it changes nothing.
+    const auto second = VersionReply(engine.Execute(session, "SET BLOCK 0 0 IN notes kind = 1 PUBLISH 'orders' x'00ff'\r\n"));
+    assert(second > first);
+    entry = Next(*feed);
+    assert(entry->position.revision == second && entry->blocks.empty());
+    assert(entry->messages == (std::vector<FeedMessage>{{"orders", std::string("\0\xff", 2U)}}));
+    // Without a message it commits nothing; the next change is the DELETE.
+    assert(VersionReply(engine.Execute(session, "SET BLOCK 0 0 IN notes kind = 1\r\n")) == second);
+    const std::vector<std::optional<std::string>> payload{std::string("\0\1", 2U)};
+    const auto third = VersionReply(engine.Execute(session, "DELETE BLOCK 0 0 FROM notes PUBLISH 'orders' $1\r\n", payload));
+    entry = Next(*feed);
+    assert(entry->position.revision == third && entry->blocks.size() == 1U && !entry->blocks[0].after);
+    assert(entry->messages.size() == 1U && entry->messages[0].payload == *payload[0]);
+    const std::vector<std::optional<std::string>> null{std::nullopt};
+    assert(engine.Execute(session, "SET BLOCK 1 1 IN notes kind = 4 PUBLISH 'orders' $1\r\n", null).starts_with("-ERR INVALID_ARGUMENT"));
+    assert(engine.Execute(session, "SET BLOCK 1 1 IN notes kind = 4 IF kind = 9 PUBLISH 'orders' 'no'\r\n").starts_with("-ERR CONDITION_FAILED"));
+    const auto conditional = VersionReply(engine.Execute(session, "SET BLOCK 1 1 IN notes kind = 4 IF kind IS NULL PUBLISH 'orders' 'expr'\r\n"));
+    entry = Next(*feed);
+    assert(entry->position.revision == conditional && entry->messages.size() == 1U && entry->messages[0].payload == "expr");
+
+    // One transaction is one change with its message, from any statement.
+    assert(engine.Execute(session, "BEGIN\r\n") == "+OK\r\n");
+    assert(engine.Execute(session, "SET BLOCK 0 0 IN notes kind = 2\r\n") == "_\r\n");
+    assert(engine.Execute(session, "SET BLOCK 2 2 IN notes kind = 3 PUBLISH 'orders' 'both'\r\n") == "_\r\n");
+    assert(engine.Execute(session, "SET BLOCK 3 3 IN notes kind = 3 PUBLISH 'orders' 'again'\r\n").starts_with("-ERR INVALID_ARGUMENT"));
+    const auto committed = VersionReply(engine.Execute(session, "COMMIT\r\n"));
+    entry = Next(*feed);
+    assert(entry->position.revision == committed && entry->blocks.size() == 2U);
+    assert(entry->messages == (std::vector<FeedMessage>{{"orders", "both"}}));
+    // A transaction that publishes commits even when it changes nothing.
+    assert(engine.Execute(session, "BEGIN\r\n") == "+OK\r\n");
+    assert(engine.Execute(session, "SET BLOCK 2 2 IN notes kind = 3 PUBLISH 'audit' 'same'\r\n") == "_\r\n");
+    const auto unchanged = VersionReply(engine.Execute(session, "COMMIT\r\n"));
+    entry = Next(*feed);
+    assert(entry->position.revision == unchanged && entry->blocks.empty());
+    assert(entry->messages == (std::vector<FeedMessage>{{"audit", "same"}}));
+}
+
+// Only AREA drops a change, with its messages; the wire form adds the
+// messages element only to a change that carries one.
+void MessagesFollowAreaFilters() {
+    auto entry = std::make_shared<FeedEntry>();
+    entry->messages.push_back({"orders", std::string("\0\r\n", 3U)});
+    const std::vector<FeedArea> elsewhere{FeedArea{.first = {5, 5, 0}, .last = {6, 6, 0}, .dims = 2U}};
+    assert(!FilterFeedEntry(entry, elsewhere, std::nullopt, false, {}));
+    const auto kept = FilterFeedEntry(entry, {}, std::nullopt, true, {});
+    assert(kept && kept->messages == entry->messages);
+    const auto tail = std::string("_\r\n_\r\n*0\r\n*1\r\n*2\r\n$6\r\norders\r\n$3\r\n") + std::string("\0\r\n", 3U) + "\r\n";
+    assert(kept->protocol_frame->starts_with(">11\r\n$6\r\nchange\r\n") && kept->protocol_frame->ends_with(tail));
+    FeedEntry chunks = *entry;
+    chunks.kind = FeedEntry::Kind::kChunks;
+    const auto encoded = EncodeFeedEntry(chunks);
+    assert(encoded.starts_with(">10\r\n$6\r\nchunks\r\n"));
+    assert(encoded.ends_with(std::string("*0\r\n_\r\n_\r\n*1\r\n*2\r\n$6\r\norders\r\n$3\r\n") + std::string("\0\r\n", 3U) + "\r\n"));
+}
+
+// The MESSAGE TLV belongs to the `messages` feature and is bounded.
+void MessageFrames() {
+    ScopedTempDir dir("chunkdb-feed-message-frames");
+    TableCatalog catalog(Config(dir.path()));
+    const auto geometry = CreateDefault(catalog)->geometry();
+    const FeedMessage message{"orders", std::string(kMaxFeedMessageBytes, 'm')};
+    std::vector<std::uint8_t> frame;
+    WalFrameBuilder builder(&frame, 1U, {}, std::nullopt, false, &message);
+    const std::uint8_t presence = 0U;
+    builder.AppendSpan(static_cast<std::uint32_t>(geometry.ChunkPayloadBytes()), &presence, 1U);
+    (void)builder.Finish(3U, 30U);
+    assert(InspectFeedFrame(frame, geometry, {.incompat = kFeatureMessages}).message == message);
+    bool refused = false;
+    try {
+        (void)InspectFeedFrame(frame, geometry, {});
+    } catch (const std::runtime_error& error) {
+        refused = std::string_view(error.what()).find("tlv_message_without_feature") != std::string_view::npos;
+    }
+    assert(refused);
+    for (const auto& invalid : {FeedMessage{"Orders", ""}, FeedMessage{"", "x"}, FeedMessage{"9th", ""},
+             FeedMessage{std::string(kMaxFeedChannelBytes + 1U, 'c'), ""},
+             FeedMessage{"orders", std::string(kMaxFeedMessageBytes + 1U, 'm')}}) {
+        std::vector<std::uint8_t> bytes;
+        bool threw = false;
+        try {
+            WalFrameBuilder invalid_builder(&bytes, 1U, {}, std::nullopt, false, &invalid);
+        } catch (const std::invalid_argument&) {
+            threw = true;
+        }
+        assert(threw && bytes.empty());
+    }
 }
 
 void PositionsAndLag() {
@@ -820,6 +935,9 @@ int main(int argc, char** argv) {
     ExtremeBlockCoordinates();
     DecodedEntryOverBudget();
     UnchangedNaNIsNotAnotherBlockChange();
+    MessagesRideTheirCommit();
+    MessagesFollowAreaFilters();
+    MessageFrames();
     FailedSchemaPublicationEndsFeedWithoutBlockingTable();
     FailedSchemaPublicationEndsFeedWithoutBlockingTable(true);
     ChunkCoordinatesBeyondAbsoluteBlockDomain();

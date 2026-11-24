@@ -82,8 +82,8 @@ The metadata write populates the chunk before any block exists.
 
 ```text
 GET CHUNK cx cy [cz] FROM table [COLUMNS column, ...]
-SET CHUNK cx cy [cz] IN table [COLUMNS column, ...] $1 [IF VERSION version | IF ABSENT]
-SET CHUNK cx cy [cz] IN table META column = value [, ...] [IF VERSION version | IF ABSENT]
+SET CHUNK cx cy [cz] IN table [COLUMNS column, ...] $1 [IF VERSION version | IF ABSENT] [PUBLISH 'channel' message]
+SET CHUNK cx cy [cz] IN table META column = value [, ...] [IF VERSION version | IF ABSENT] [PUBLISH 'channel' message]
 GET AREA cx0 cy0 [cz0] TO cx1 cy1 [cz1] FROM table [COLUMNS column, ...] [WITH SCHEMA] [LIMIT n] [AFTER cx cy [cz]]
     [SCALE k USING MAX | MIN | MODE | FIRST | ANY]
 GET AREA AROUND cx cy [cz] RADIUS radius FROM table [COLUMNS column, ...] [WITH SCHEMA] [LIMIT n] [AFTER cx cy [cz]]
@@ -105,6 +105,7 @@ SHOW TABLE STATS table
 - `IF VERSION`: an equality check against the destination chunk's current version.
 - `IF ABSENT`: require an unpopulated destination, including a retained empty chunk; conditions are unavailable inside transactions.
 - `META`: update named chunk columns atomically, preserving blocks and unnamed metadata.
+- `PUBLISH`: publish a message in the write's commit, as for [blocks](BLOCKS.md#publish); a message parameter follows the chunk form, as `$2`.
 - `AFTER`: exclude this position and all earlier positions in coordinate order.
 - `LIMIT`: requested cells per area page, or maximum positions per scan page; scans default to at most 1024.
 - `SCALE k USING`: return each chunk downsampled by k with the named reduction; see [Downsampled areas](#downsampled-areas).

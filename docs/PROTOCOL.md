@@ -59,7 +59,7 @@ A second HELLO receives PROTOCOL.
 | `options` | Map of applied options and effective values. |
 | `not_applied` | Map of requested option names to maps containing `reason`. |
 | `idle_timeout_ms` | Configured idle timeout in milliseconds. |
-| `limits` | Map of area, transaction, watch, returning and expression ceilings. |
+| `limits` | Map of area, transaction, watch, returning, expression and message ceilings. |
 
 An idle authenticated connection keeps its session and open transaction until its next request or until it closes.
 
@@ -71,13 +71,14 @@ Before authentication HELLO takes at most 12 parameters; a HELLO with more recei
 
 `client_name` and `statement_timeout_ms` apply; `default_tag` is stored with `reason=implementation_pending`.
 The effective statement timeout appears in `options`, including the server default when HELLO omits it.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, `read_only_transactions`, `returning`, and `watch_catalog`.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, `read_only_transactions`, `returning`, `watch_catalog`, and `messages`.
 Options become visible only after authentication succeeds.
 The `returning` feature permits [RETURNING](#returning) on SET BLOCK and DELETE BLOCK; `limits.max_returning_rows` bounds its rows and `limits.max_expression_nodes` each expression.
 The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
 The `area_scale` feature permits GET AREA SCALE and its downsampled forms.
 The `read_only_transactions` feature permits BEGIN READ ONLY and SCAN CHUNKS inside it.
 The `watch_catalog` feature permits WATCH CATALOG and its `catalog` events.
+The `messages` feature permits [PUBLISH](#messages) on writes and the `messages` element of change and chunks pushes; `limits.max_message_bytes` bounds a message.
 A chunk too large for an empty page ends the page before it and is then refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=... required=... limit=...`; see [chunks](reference/CHUNKS.md#limits).
 The configured positive area bounds appear as both `max_area_chunks`/`max_response_bytes` and `limits.max_area_chunks`/`limits.max_area_response_bytes`.
 `limits.txn_max_written_chunks` and `limits.txn_max_read_chunks` are the configured transaction chunk-count bounds.
@@ -128,9 +129,10 @@ A parameter in a WHERE condition is encoded as the type of the column it is comp
 | SET CHUNK | Chunk form defined by [Chunk form](#chunk-form). |
 | Expression | The type of the column operand it meets ([Conditions](CQL.md#conditions)). |
 | IF VERSION $n | 8-byte little-endian u64. |
+| PUBLISH $n | The message bytes, at most `limits.max_message_bytes`. |
 
 The server bounds a frame before reading its body where the statement's schema permits it.
-For SET BLOCK and DELETE BLOCK, it also bounds the sum of actual declared frame lengths at 67117056 bytes. Each header is checked before allocating or reading its payload; small values remain accepted when their columns allow larger maxima. NULL frames add no payload bytes. SET CHUNK retains its separate chunk-form bound.
+For SET BLOCK and DELETE BLOCK, it also bounds the sum of actual declared frame lengths at 67117056 bytes, plus `limits.max_message_bytes` for a PUBLISH parameter. Each header is checked before allocating or reading its payload; small values remain accepted when their columns allow larger maxima. NULL frames add no payload bytes. SET CHUNK retains its separate chunk-form bound.
 An oversized typed frame or aggregate closes the connection after its error.
 Invalid statements, missing tables and unknown parameter columns drain their frames under `--max-unparsed-parameter-bytes`, default 1048576 payload bytes.
 Before HELLO, a non-handshake statement or wrong protocol version receives PROTOCOL and closes without waiting for advertised frames.
@@ -185,6 +187,13 @@ A reply holds at most `limits.max_returning_rows` rows in at most `max_response_
 The rows are read under the write's lock and the reply is written after that lock is released, row by row under the reply progress deadline.
 A connection that closes after the commit point and before the whole reply arrives leaves the outcome unknown to the client: the write may be applied.
 A write has no idempotency key yet, so resending it is not safe; read the block again to learn its state.
+
+## Messages
+
+`PUBLISH 'channel' message` at the end of SET BLOCK, DELETE BLOCK or SET CHUNK publishes a message in the write's commit; see [Blocks](reference/BLOCKS.md#publish).
+The reply is the write's usual reply; a write that publishes always commits, even when its data are unchanged.
+Inside a transaction the write stages the message and COMMIT publishes it; a transaction publishes at most one.
+The change of that commit carries the message, see [WATCH](#watch-and-durable-slots), and a slot replays it from retained history.
 
 ## Chunk form
 
@@ -250,6 +259,7 @@ Epoch is the 32-hex-digit table identity.
 The following list notation describes push elements, rather than literal wire bytes:
 
 - `[change, epoch, revision, commit_time_ms, user, schema_version, blocks, tag, txn, chunk_changes]`, with each block `[x, y, before, after]` or `[x, y, z, before, after]`.
+- `[change, ..., chunk_changes, messages]` when the commit published a message: `messages` is an array of `[channel, message]` bulk pairs.
 - `[schema, {epoch, revision, schema_version, dims, columns, chunk_columns}]`, using DESCRIBE column maps.
 - `[resync, epoch, revision, parent_epoch, fork_revision]`, requesting consumer state reconstruction.
 - `[progress, epoch, revision]`, marking a sender-drained cut during idle or filtered periods.
@@ -261,6 +271,7 @@ Resync lineage fields are null when no parent lineage is recorded.
 Rows are in schema order and use the reply types above; null denotes absent rows or NULL values and an anonymous user.
 Coordinates beyond int64 absolute range are represented as `[chunk_coordinate, local_block_offset]` on that axis.
 One transaction forms one change; AREA clips it by inclusive chunk coordinates.
+AREA drops a change that keeps no data in its areas, with its message; other filters never drop a change that carries a message, even one with no blocks.
 Revisions have gaps and define order; timestamps do not.
 AFTER can resume at a progress revision within the retained prefix, including a gap without a change frame.
 
@@ -275,6 +286,7 @@ An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
 Slot pushes stop at the persisted durable frontier; see [durable slots](reference/FEED.md#notes) for ACK persistence and batching.
 SHOW SLOTS reports written `acked`, the durable `revision`, `lag_revisions`, retained bytes, `attached` and loss state.
 CHUNKS pushes use `[chunks,epoch,revision,commit_time_ms,user,schema_version,chunks,tag,txn]`.
+A CHUNKS push of a commit that published a message appends `messages` after `txn`.
 Each chunk is `[cx,cy,version,form_or_null]` or `[cx,cy,cz,version,form_or_null]`; a null form represents deletion.
 Forms match GET CHUNK for that exact commit and projection; later writes cannot change queued bytes.
 Every nonnull form retains that chunk's producing version and time, which can precede the enclosing feed entry.

@@ -313,7 +313,9 @@ void ChunkStore::WriteBlockBitsLocked(
 
     const bool payload_changed = next_bytes != previous_bytes;
     const bool presence_changed = previous_presence_byte != next_presence_byte;
-    if (!payload_changed && !presence_changed) {
+    // A write that publishes a message commits even when it changes nothing.
+    const FeedMessage* const message = WriteMessage();
+    if (!payload_changed && !presence_changed && message == nullptr) {
         return;
     }
     if (const auto* checks = geometry_.checks(); checks != nullptr && present) {
@@ -355,14 +357,16 @@ void ChunkStore::WriteBlockBitsLocked(
         if constexpr (sizeof...(Pinned) == 0U) commit_time_ms = NextCommitTimeMs(*regular_chunk);
         else commit_time_ms = (pinned_commit_time_ms, ...);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
-        WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
+        WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser(),
+            false, message);
         if (payload_changed) {
             frame.AppendSpan(
                 static_cast<std::uint32_t>(begin_byte),
                 regular_chunk->payload.data() + begin_byte,
                 touched_bytes);
         }
-        if (presence_changed) {
+        // An unchanged write keeps its presence byte as the frame's record.
+        if (presence_changed || !payload_changed) {
             frame.AppendSpan(
                 static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes() + presence_byte_index),
                 &regular_chunk->presence_bitmap[presence_byte_index],
@@ -1079,7 +1083,10 @@ void ChunkStore::WriteBlockColumnsLocked(
             after.begin() + static_cast<std::ptrdiff_t>(range.saved));
     };
     const bool presence_changed = previous_presence_byte != next_presence_byte;
-    if (!presence_changed && var_update.empty() && std::none_of(ranges.begin(), ranges.end(), changed)) {
+    // A write that publishes a message commits even when it changes nothing.
+    const FeedMessage* const message = WriteMessage();
+    if (!presence_changed && var_update.empty() && std::none_of(ranges.begin(), ranges.end(), changed) &&
+        message == nullptr) {
         return;
     }
     if (const auto* checks = geometry_.checks(); checks != nullptr && present) {
@@ -1128,7 +1135,8 @@ void ChunkStore::WriteBlockColumnsLocked(
         if constexpr (sizeof...(Pinned) == 0U) commit_time_ms = NextCommitTimeMs(*chunk);
         else commit_time_ms = (pinned_commit_time_ms, ...);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
-        WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
+        WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser(),
+            false, message);
         for (const auto& range : ranges) {
             if (changed(range)) {
                 frame.AppendSpan(
@@ -1142,6 +1150,14 @@ void ChunkStore::WriteBlockColumnsLocked(
                 1U);
         }
         frame.AppendVarUpdate(chunk->vars, var_undo);
+        // An unchanged write that publishes a message keeps its presence
+        // byte as the frame's record.
+        if (frame.record_count() == 0U) {
+            frame.AppendSpan(
+                static_cast<std::uint32_t>(geometry_.ChunkPayloadBytes() + presence_byte_index),
+                &chunk->presence_bitmap[presence_byte_index],
+                1U);
+        }
         const std::size_t appended_bytes = frame.Finish(reserved_version, commit_time_ms);
         feed.Capture(chunk->wal_batch, appended_bytes);
 
@@ -1499,7 +1515,10 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
     // and logs the whole state, as the conditional path does: a frame needs
     // a record.
     const bool first_write = force_write && !regular_chunk->written;
-    if (!payload_changed && !presence_changed && var_update.empty() && !metadata_changed && !first_write) {
+    // A write that publishes a message commits even an unchanged state.
+    const FeedMessage* const message = WriteMessage();
+    const bool unchanged = !payload_changed && !presence_changed && var_update.empty() && !metadata_changed && !first_write;
+    if (unchanged && message == nullptr) {
         return regular_chunk->version;
     }
     if (const auto* checks = geometry_.checks())
@@ -1538,9 +1557,11 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
         const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
         // A full-chunk replace can span several records; the frame makes the
         // whole replace atomic across crash recovery.
-        WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
+        WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser(),
+            false, message);
         const bool log_payload = payload_changed || first_write;
-        const bool log_presence = presence_changed || first_write;
+        // An unchanged state keeps its presence as the frame's record.
+        const bool log_presence = presence_changed || first_write || unchanged;
         // Sized once, so a large state is not copied again as the batch grows.
         frame.Reserve(
             (log_payload ? WalFrameBuilder::SpanRecordBytes(regular_chunk->payload.size()) : 0U) +

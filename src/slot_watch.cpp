@@ -258,7 +258,7 @@ void SlotWatch::Build(Prepared& prepared) const {
     if (prepared.filtered && mutation) {
         // The archive reader kept only what this watch sends; a change that
         // keeps nothing is not sent.
-        const bool kept = !original->blocks.empty() || !original->chunk_changes.empty() || !original->chunk_forms.empty();
+        const bool kept = FeedEntryKept(*original, !options_.areas.empty());
         prepared.entry = kept ? original : nullptr;
     } else {
         prepared.entry = options_.chunks && mutation

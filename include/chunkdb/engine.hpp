@@ -175,6 +175,9 @@ struct SessionTransaction {
     std::map<ChunkCoord, ChunkState, ChunkCoordLess> writes{};
     // The bytes of `writes`, also counted in budget->bytes.
     std::size_t bytes = 0;
+    // The message a write's PUBLISH gave, which COMMIT publishes; at most
+    // kMaxFeedMessageBytes, outside `bytes`.
+    std::optional<FeedMessage> message{};
     // Set when a statement got CONFLICT: the snapshot and the writes are
     // gone, and every statement but COMMIT and ROLLBACK answers this reply,
     // so a statement sent after the conflict never runs outside the

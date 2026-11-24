@@ -653,6 +653,14 @@ struct FeedArchiveReader::Impl {
             entry->commit_time_ms = info.commit_time_ms;
             entry->user = info.user;
             entry->dims = geometry.dims();
+            if (info.message) {
+                // One frame of a commit carries its message.
+                if (!entry->messages.empty()) throw std::runtime_error("an archived feed change carries more than one message");
+                const auto bytes = 7U + info.message->channel.size() + 5U + info.message->payload.size() + 5U;
+                if (bytes > entry_budget - *frame_bytes) throw std::length_error("archived change exceeds the table feed buffer");
+                *frame_bytes += bytes;
+                entry->messages.push_back(*info.message);
+            }
             const auto& layout = geometry.LayoutAt(info.schema_version);
             std::optional<Geometry> historical_geometry;
             if (info.schema_version != geometry.layout().schema().version) {
@@ -754,7 +762,7 @@ struct FeedArchiveReader::Impl {
             }
             if (filter && chunk_forms) entry->kind = FeedEntry::Kind::kChunks;
             // A filtered watch sends nothing of a change that keeps nothing.
-            const bool sent = !filter || !entry->blocks.empty() || !entry->chunk_changes.empty() || !entry->chunk_forms.empty();
+            const bool sent = !filter || FeedEntryKept(*entry, filter->area.has_value());
             if ((!chunk_forms || filter) && sent) {
                 entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*entry));
                 if (entry->protocol_frame->size() > entry_budget) throw std::length_error("archived change exceeds the table feed buffer");

@@ -8,6 +8,7 @@
 - [Expressions](EXPRESSIONS_DESIGN.md): conditions and computed assignments, typing and evaluation.
 - [Extensible format](EXTENSIBLE_FORMAT_DESIGN.md): feature flags and typed extensions.
 - [Secondary indexes](INDEXES.md): keys, runs, write maintenance, recovery and GET BLOCKS.
+- [Messages](MESSAGES.md): application messages in a commit, their WAL TLV and channel filters.
 - [Revisions and frames](FORMAT_V2_DESIGN.md): persistent equality tokens and atomic mutations.
 - [Table restore](RESTORE_TABLE.md): online RESTORE TABLE, SWAP TABLES, RENAME TO and feed resync.
 - [Tables](TABLES_DESIGN.md): catalog leases and directory publication.

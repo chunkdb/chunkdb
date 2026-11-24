@@ -17,6 +17,7 @@
 #include <vector>
 
 #include "checkpoint.hpp"
+#include "chunkdb/change_feed.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
@@ -85,7 +86,8 @@ WalFrameBuilder::WalFrameBuilder(
     std::uint64_t schema_version,
     const std::vector<std::uint8_t>& tag,
     std::optional<std::string_view> user,
-    bool gc)
+    bool gc,
+    const FeedMessage* message)
     : batch_(batch), header_index_(batch == nullptr ? 0 : batch->size()), records_begin_(0),
       frame_flags_(gc ? kWalFrameGc : 0U) {
     if (batch_ == nullptr) {
@@ -99,9 +101,15 @@ WalFrameBuilder::WalFrameBuilder(
     if (user_size > std::numeric_limits<std::uint16_t>::max()) {
         throw std::invalid_argument("WAL frame user is too long");
     }
+    if (message != nullptr && (gc || !IsValidFeedChannel(message->channel) ||
+            message->payload.size() > kMaxFeedMessageBytes)) {
+        throw std::invalid_argument("WAL frame message is invalid");
+    }
+    const std::size_t message_size = message == nullptr ? 0U : 1U + message->channel.size() + message->payload.size();
     const std::size_t tlv_bytes = (tag.empty() ? 0U : kWalTlvHeaderSize + tag.size()) +
         (schema_version > 1U ? kWalTlvHeaderSize + 8U : 0U) +
-        (user_size == 0U ? 0U : kWalTlvHeaderSize + user_size);
+        (user_size == 0U ? 0U : kWalTlvHeaderSize + user_size) +
+        (message == nullptr ? 0U : kWalTlvHeaderSize + message_size);
     if (tlv_bytes > std::numeric_limits<std::uint16_t>::max()) {
         throw std::invalid_argument("WAL frame TLV area is too long");
     }
@@ -124,6 +132,14 @@ WalFrameBuilder::WalFrameBuilder(
         WriteLe16(*batch_, static_cast<std::uint16_t>(user_size));
         batch_->insert(batch_->end(), user->begin(), user->end());
         tlv_size_ = static_cast<std::uint16_t>(tlv_size_ + kWalTlvHeaderSize + user_size);
+    }
+    if (message != nullptr) {
+        WriteLe16(*batch_, kWalTlvMessage);
+        WriteLe16(*batch_, static_cast<std::uint16_t>(message_size));
+        batch_->push_back(static_cast<std::uint8_t>(message->channel.size()));
+        batch_->insert(batch_->end(), message->channel.begin(), message->channel.end());
+        batch_->insert(batch_->end(), message->payload.begin(), message->payload.end());
+        tlv_size_ = static_cast<std::uint16_t>(tlv_size_ + kWalTlvHeaderSize + message_size);
     }
     // The header CRC slot follows the TLV area.
     batch_->resize(batch_->size() + kWalFrameHeaderCrcSize, 0U);

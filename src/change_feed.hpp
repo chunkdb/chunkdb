@@ -18,6 +18,8 @@ namespace chunkdb {
 
 // The current write scope's identity; an empty view denotes anonymity.
 [[nodiscard]] std::string_view CurrentWriteUser() noexcept;
+// The current write scope's message (ScopedWriteMessage); null for none.
+[[nodiscard]] const FeedMessage* CurrentWriteMessage() noexcept;
 
 // Isolated deterministic hook, like the transaction pause points. Tests must
 // install it before starting writers and retain it until the feed stops.

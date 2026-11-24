@@ -31,7 +31,9 @@ NULL
 ```text
 GET BLOCK x y [z] FROM table [COLUMNS column, ...] [WITH VERSION] [WITH SCHEMA]
 SET BLOCK x y [z] IN table column = expression [, ...] [IF VERSION version | IF condition] [RETURNING [OLD | NEW] (* | column, ...)]
+    [PUBLISH 'channel' message]
 DELETE BLOCK x y [z] FROM table [IF VERSION version | IF condition] [RETURNING [OLD] (* | column, ...)]
+    [PUBLISH 'channel' message]
 ```
 
 ## Arguments
@@ -48,6 +50,7 @@ DELETE BLOCK x y [z] FROM table [IF VERSION version | IF condition] [RETURNING [
 - IF VERSION and IF condition exclude each other; `IF version = 3` tests a column named `version`.
 - `RETURNING`: return the block with the write; `NEW`, SET's default, is the block after the write, and `OLD`, DELETE's default and only form, the block before it.
 - RETURNING `*` returns every column in schema order, a list the named columns in your order; OLD or NEW right after RETURNING is the keyword, so `RETURNING NEW old` returns a column named `old`.
+- `PUBLISH`: publish a message in the write's commit, see [Publish](#publish); `channel` is 1 to 63 bytes of `[a-z_][a-z0-9_.]*`, `message` a text or bytes value or a `$n` parameter.
 
 ## Returns
 
@@ -84,6 +87,9 @@ Other refusals, such as an unknown column or a value out of range, are errors as
 | CONDITION_FAILED | Without RETURNING: the IF condition is false or unknown; `current` is the chunk's version. | Read the block again and decide again. |
 | OUT_OF_RANGE | A computed value does not fit its column, such as `coins - 3` below zero in a u16 column. | Change the expression or add a condition. |
 | OUT_OF_RANGE reason=returning_limit | The RETURNING rows exceed a bound; nothing changed. | Return fewer columns. |
+| INVALID_ARGUMENT reason=feature_disabled | PUBLISH on a table without the `messages` feature. | Run `ENABLE FEATURE 'messages'`, see [Tables](TABLES.md#feature-activation). |
+| INVALID_ARGUMENT | A second PUBLISH in one transaction, or a NULL message. | Publish one message per transaction. |
+| OUT_OF_RANGE | The message exceeds `max_message_bytes`. | Send a shorter message. |
 | CONFLICT | Your transaction loses its snapshot. | Follow [Retry a transaction](../TRANSACTION_RETRY.md). |
 
 ## Notes
@@ -102,8 +108,23 @@ An absent chunk supplies no token, and zero does not mean create-if-absent.
 A condition and computed values read the block with the write, so no other write comes between; see [Expressions in writes](EXPRESSIONS.md#in-writes).
 RETURNING reads the block the same way, so it needs WRITE, which includes READ.
 
+## Publish
+
+PUBLISH adds an application message to the write's commit, and the [change feed](../CHANGE_FEED.md) delivers it in that commit's change.
+
+```text
+SET BLOCK 4 2 IN orders status = 2 PUBLISH 'orders.paid' $1
+```
+
+- The reply is the write's usual reply.
+- A write that publishes always commits: when the block already holds these values, it still takes a new version, and its change has no blocks.
+- A refused IF VERSION or IF condition publishes nothing.
+- Inside a transaction the write stages the message and COMMIT publishes it with the transaction's one change; a transaction publishes at most one message.
+- A watch with AREA receives the message only when it receives the change, that is when the change keeps a block or chunk change in its areas.
+
 ## Limits
 
 Value bounds follow the table's column types and `var_max_chunk_bytes`.
 RETURNING returns at most `max_returning_rows` (65536) rows in a reply of at most `max_response_bytes`, both reported by HELLO; over either bound the write is refused with `OUT_OF_RANGE reason=returning_limit` and changes nothing.
+A message has at most `max_message_bytes` (16384) bytes, reported by HELLO.
 See [Transactions](../TRANSACTIONS.md#limits) for transaction bounds and [Protocol](../PROTOCOL.md#parameters) for parameter bounds.

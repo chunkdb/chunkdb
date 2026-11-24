@@ -43,6 +43,13 @@ std::size_t FeedChunkFormMinimumEncodedBytes(std::uint8_t dims, const std::share
 inline std::span<const FeedArea> FeedAreas(const std::optional<FeedArea>& area) noexcept {
     return area ? std::span<const FeedArea>(&*area, 1U) : std::span<const FeedArea>{};
 }
+// Whether a filtered change that kept this of its commit is sent: AREA drops
+// a change that keeps no data, with its messages; a change that carries a
+// message is otherwise sent even without data.
+inline bool FeedEntryKept(const FeedEntry& entry, bool area_filtered) noexcept {
+    return !entry.blocks.empty() || !entry.chunk_changes.empty() || !entry.chunk_forms.empty() ||
+        (!area_filtered && !entry.messages.empty());
+}
 // True when `areas` is empty or one of them holds chunk `coord`.
 bool FeedAreaHolds(std::span<const FeedArea> areas, std::uint8_t dims, ChunkCoord coord);
 // The indexes in `columns` of the projected column `ids`, in their order, as FilterFeedEntry and ChunkFeedEntry

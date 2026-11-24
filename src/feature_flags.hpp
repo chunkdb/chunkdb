@@ -29,6 +29,10 @@ inline constexpr std::uint32_t kFeatureChunkModel = 32U;
 // an unknown incompat feature. The WAL format code takes it as an explicit
 // flag (InspectFeedFrame, ReplayFeedFrame).
 inline constexpr std::uint32_t kFeatureCommitGroups = 64U;
+// MESSAGE WAL TLVs: application messages a write or transaction publishes
+// in its commit (docs/design/MESSAGES.md). Older writers must refuse: they
+// would read the TLV as damage.
+inline constexpr std::uint32_t kFeatureMessages = 256U;
 
 struct FeatureDefinition {
     std::string_view name;
@@ -36,16 +40,17 @@ struct FeatureDefinition {
     bool table_scoped;
     std::string_view ownership;
 };
-inline constexpr std::array<FeatureDefinition, 6> kFeatureRegistry{{
+inline constexpr std::array<FeatureDefinition, 7> kFeatureRegistry{{
     {"feed_slots", kFeatureFeedSlots, true, "slot records, feed archive and USER WAL metadata"},
     {"migrations", kFeatureMigrations, false, "migration ledger and redo decisions"},
     {"table_lineage", kFeatureTableLineage, true, "table parent-epoch and fork-revision TLVs"},
     {"slot_filters", kFeatureSlotFilters, true, "slot filter records and stable projection IDs"},
     {"feature_activation", kFeatureActivation, false, "directory feature activation decisions"},
     {"chunk_model", kFeatureChunkModel, true, "dimension-aware chunks, chunk metadata and coordinate indexes"},
+    {"messages", kFeatureMessages, true, "MESSAGE WAL metadata of published application messages"},
 }};
 inline constexpr FeatureFlags kKnownFeatures{.incompat = kFeatureFeedSlots | kFeatureMigrations |
-    kFeatureTableLineage | kFeatureSlotFilters | kFeatureActivation | kFeatureChunkModel};
+    kFeatureTableLineage | kFeatureSlotFilters | kFeatureActivation | kFeatureChunkModel | kFeatureMessages};
 [[nodiscard]] constexpr FeatureFlags RegisteredTableFeatures() noexcept {
     FeatureFlags flags;
     for (const auto& feature : kFeatureRegistry) {
