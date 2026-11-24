@@ -3,36 +3,45 @@
 #include "server_slots_test_utils.hpp"
 #ifndef _WIN32
 #include <csignal>
+#include <fcntl.h>
 #include <sys/wait.h>
+#include <unistd.h>
 
 namespace {
 using namespace chunkdb::slot_socket_test;
 class Process {
   public:
-    std::uint16_t port = chunkdb::test::PickListenerPort();
-    Process(const std::string& binary, const std::filesystem::path& directory, const std::string& mode) {
-        const std::string port_string = std::to_string(port);
-        const std::string path = directory.string();
-        pid_ = fork(); assert(pid_ >= 0);
+    std::uint16_t port = 0; // The port the server picked, from its ready line.
+    // The data directory is `root`/data; each start writes its output to a new
+    // log file in `root`.
+    Process(const std::string& binary, const std::filesystem::path& root, const std::string& mode) {
+        static int starts = 0;
+        const auto log = root / ("server-" + std::to_string(++starts) + ".log");
+        const std::string path = (root / "data").string();
+        std::filesystem::create_directories(root / "data");
+        const int output = open(log.c_str(), O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+        if (output < 0) throw std::runtime_error("cannot create server log " + log.string());
+        pid_ = fork();
+        if (pid_ < 0) { close(output); throw std::runtime_error("cannot fork the server"); }
         if (pid_ == 0) {
             signal(SIGPIPE, SIG_DFL);
-            execl(binary.c_str(), binary.c_str(), "--host", "127.0.0.1", "--port", port_string.c_str(),
-                "--auth", "none", "--data-dir", path.c_str(), "--log-level", "error", "--workers", "4",
+            if (dup2(output, STDOUT_FILENO) < 0 || dup2(output, STDERR_FILENO) < 0) _exit(126);
+            execl(binary.c_str(), binary.c_str(), "--host", "127.0.0.1", "--port", "0",
+                "--auth", "none", "--data-dir", path.c_str(), "--log-level", "info", "--workers", "4",
                 "--durability", mode.c_str(), "--checkpoint-updates", "2", "--checkpoint-wal-bytes", "1048576",
                 "--wal-group-commit-updates", "1000", "--slot-sync-ms", "100", static_cast<char*>(nullptr));
             _exit(127);
         }
+        close(output);
         const auto deadline = Clock::now() + 20s;
         for (;;) {
             int status = 0;
             if (waitpid(pid_, &status, WNOHANG) == pid_) {
                 pid_ = -1; throw std::runtime_error("server exited before listening: " + std::to_string(status));
             }
-            try { Client probe(port); probe.Hello(); break; }
-            catch (const std::runtime_error&) {
-                if (Clock::now() >= deadline) { Kill(); throw; }
-                std::this_thread::sleep_for(10ms); // Listener startup only.
-            }
+            if (const auto ready = chunkdb::test::ReadyLinePort(log)) { port = *ready; break; }
+            if (Clock::now() >= deadline) { Kill(); throw std::runtime_error("server did not report listening in 20 s"); }
+            std::this_thread::sleep_for(10ms); // Server startup only.
         }
     }
     ~Process() { if (pid_ > 0) Kill(); }

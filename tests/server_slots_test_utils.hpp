@@ -398,7 +398,7 @@ class Harness {
   public:
     test::ScopedTempDir directory{"chunkdb-slots-socket"};
     std::shared_ptr<TableCatalog> catalog;
-    std::uint16_t port = test::PickListenerPort();
+    std::uint16_t port = 0; // The port the server picked; set once it listens.
     bool tls;
     bool auth;
     Harness(bool use_tls, bool use_auth = false, std::size_t max_bytes = kDefaultSlotMaxBytes,
@@ -419,7 +419,7 @@ class Harness {
         if (auth) engine_config.users = test::MakeUsers(directory.path(), "admin", "secret");
         engine_ = std::make_shared<CommandEngine>(engine_config, catalog);
         ServerConfig server_config;
-        server_config.port = port;
+        server_config.port = 0;
         server_config.worker_threads = 4;
         // Software SCRAM in Debug/sanitizer builds needs a bounded functional
         // login budget; these fixtures do not test handshake deadlines.
@@ -443,13 +443,11 @@ class Harness {
         Start();
     }
     // Another process may have bound the old port since Stop; no caller needs
-    // the same port, so the server restarts on a newly chosen one.
+    // the same port, so the server restarts on one the system picks again.
     void Restart() {
         test::FeedPhaseWatchdog::Phase("harness: restart Stop"); server_->Stop();
         test::FeedPhaseWatchdog::Phase("harness: restart join"); thread_.join();
         { std::lock_guard lock(error_mutex_); if (error_) std::rethrow_exception(error_); }
-        port = test::PickListenerPort();
-        server_config_.port = port;
         server_ = std::make_unique<ChunkServer>(server_config_, engine_);
         Start();
     }
@@ -479,6 +477,7 @@ class Harness {
             // Run reports its own listener, so the probe never reaches another
             // socket on this port; a failed Run ends the wait at once.
             if (!server_->WaitListeningForTests(10s)) throw std::runtime_error("server did not start listening in time");
+            port = server_->port();
             const auto probe = std::make_unique<Client>(port, tls);
             // TCP can connect while Run is still constructing its feed I/O.
             // A completed handshake proves workers are ready before installing

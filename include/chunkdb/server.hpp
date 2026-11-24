@@ -34,6 +34,7 @@ enum class TlsMinVersion { k1_2, k1_3 };
 
 struct ServerConfig {
     std::string host = "127.0.0.1";
+    // 0 listens on a free port the system picks; ChunkServer::port() names it.
     std::uint16_t port = 4242;
     std::size_t max_line_bytes = 65536;
     std::size_t max_unparsed_parameter_bytes = 1048576;
@@ -87,6 +88,10 @@ class ChunkServer {
     // server.
     [[nodiscard]] bool WaitListeningForTests(std::chrono::milliseconds timeout);
 
+    // The port Run listens on: the configured one, or the one the system
+    // picked for port 0. It is 0 until Run has bound its listener.
+    [[nodiscard]] std::uint16_t port() const noexcept { return bound_port_.load(std::memory_order_acquire); }
+
   private:
     friend class FeedIo;
     friend class IdleIo;
@@ -105,6 +110,7 @@ class ChunkServer {
     ServerConfig config_;
     std::shared_ptr<CommandEngine> engine_;
     std::atomic<bool> running_;
+    std::atomic<std::uint16_t> bound_port_{0U};
     // Isolated schedule observer; installed hooks outlive server shutdown.
     std::atomic<FeedDeliveryTestHook*> delivery_test_hook_{nullptr};
     std::stop_source backup_stop_;
