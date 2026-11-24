@@ -887,6 +887,9 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
     if (const auto* conflict = dynamic_cast<const TransactionConflictError*>(&error); conflict != nullptr) {
         return Protocol::Error("CONFLICT", error.what(), {{"reason", TxnConflictReasonName(conflict->reason())}});
     }
+    if (const auto* failed = dynamic_cast<const CheckFailedError*>(&error); failed != nullptr) {
+        return Protocol::Error("CHECK_FAILED", error.what(), {{"check", failed->check()}});
+    }
     if (dynamic_cast<const std::invalid_argument*>(&error) != nullptr) {
         if (std::string_view(error.what()).starts_with("the table has no column "))
             return Protocol::Error("INVALID_ARGUMENT", std::string(error.what()) + "; use DESCRIBE <table> to check column names");

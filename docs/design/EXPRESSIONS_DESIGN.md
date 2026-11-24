@@ -109,3 +109,12 @@ A chunk without chunk-column values reads the columns' defaults.
 AGGREGATE adds every requested cell to a transaction's read set, as without WHERE: any block's write can change which blocks match.
 SCAN CHUNKS without SINCE omits chunks with no match; with SINCE it lists every changed identity, with null data when no block matches, so a filtered copy converges; SINCE with WHERE needs WITH DATA, since the rows would otherwise ignore WHERE.
 LIMIT counts visited identities, so the page's reads stay bounded; the reply adds `after`, the last visited identity, because the last row need not be.
+
+## CHECK constraints
+
+A table's checks (docs/reference/TABLES.md) are conditions stored as text in the schema and planned once per schema version against its block columns.
+A block fails a check only when the condition is false (`EvaluatesFalse`): unknown passes, as in SQL, where IF and WHERE treat it as false.
+Checks refuse parameters, chunk columns, NOW() and EXISTS, so a block's result depends only on its own values and position.
+RENAME COLUMN rewrites the column's name in the text (`RenameColumnIn`), keeping a quoted name quoted and quoting a keyword; undoing the step renames it back.
+A table's checks are planned at the first write that needs them; a geometry that is only read never plans them.
+A write evaluates a check only for a block it adds, or whose columns read by the check it changes; a single-block write is evaluated before it reserves a version, and COMMIT evaluates under the commit locks against the chunks as the transaction read them.

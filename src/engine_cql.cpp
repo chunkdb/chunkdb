@@ -23,6 +23,7 @@
 #include "chunkdb/engine.hpp"
 #include "chunkdb/protocol.hpp"
 #include "aggregate.hpp"
+#include "block_checks.hpp"
 #include "block_filter.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
@@ -463,6 +464,16 @@ void SetDefault(Column& column, const cql::Literal& literal) {
     return column;
 }
 
+// The check `definition` makes in `schema`; an unnamed one takes a name
+// from `column` (a column's own CHECK) or from the first column it reads.
+[[nodiscard]] CheckConstraint CheckFrom(
+    const cql::CheckDefinition& definition, const TableSchema& schema, std::string_view column = {}) {
+    CheckConstraint check{.name = definition.name.value_or(std::string{}), .expression = definition.expression};
+    if (!definition.name.has_value()) check.name = NewCheckName(schema, definition.expression, column);
+    else if (HasCheck(schema, check.name)) throw std::invalid_argument("the table already has a CHECK named " + check.name);
+    return check;
+}
+
 // The NULL, REQUIRED and DEFAULT column `attribute.column` of `schema` takes
 // after ALTER COLUMN (chunkdb::ChangeColumnAttributes checks the result).
 [[nodiscard]] Column AttributesFrom(const TableSchema& schema, const cql::AlterColumnAttribute& attribute) {
@@ -562,7 +573,8 @@ struct FileUsage {
         Protocol::AppendInteger(reply, second);
         if (info.geometry.dims == 3U) Protocol::AppendInteger(reply, third);
     };
-    Protocol::AppendMapHeader(reply, fenced != nullptr ? 11 : 10);
+    const auto& checks = info.schema.checks;
+    Protocol::AppendMapHeader(reply, 10U + (fenced != nullptr ? 1U : 0U) + (checks.empty() ? 0U : 1U));
     key("table");
     Protocol::AppendBulk(reply, info.name);
     key("version");
@@ -602,6 +614,17 @@ struct FileUsage {
     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(info.geometry.dims));
     key("chunk_columns");
     Protocol::AppendColumns(reply, info.chunk_schema.columns);
+    if (!checks.empty()) {
+        key("checks");
+        Protocol::AppendArrayHeader(reply, checks.size());
+        for (const auto& check : checks) {
+            Protocol::AppendMapHeader(reply, 2);
+            key("name");
+            Protocol::AppendBulk(reply, check.name);
+            key("expression");
+            Protocol::AppendBulk(reply, check.expression);
+        }
+    }
     if (fenced != nullptr) {
         key("fenced");
         Protocol::AppendBulk(reply, *fenced);
@@ -936,6 +959,13 @@ TableDefinition DefinitionFrom(const cql::CreateTable& create, const TableOption
     };
     for (std::size_t i = 0; i < create.columns.size(); ++i)
         schema.columns.push_back(ColumnFrom(create.columns[i], static_cast<std::uint32_t>(i + 1U)));
+    // Column CHECKs in column order, then the table's; ValidateTableSchema
+    // checks each against the columns.
+    for (const auto& column : create.columns)
+        for (const auto& check : column.checks) schema.checks.push_back(CheckFrom(check, schema, column.name));
+    for (const auto& check : create.checks) schema.checks.push_back(CheckFrom(check, schema));
+    if (schema.checks.size() > kMaxChecksPerTable)
+        throw std::invalid_argument("a table has at most " + std::to_string(kMaxChecksPerTable) + " CHECK constraints");
     GeometryConfig geometry;
     geometry.chunk_width_blocks = create.chunk_width;
     geometry.chunk_height_blocks = create.chunk_height;
@@ -1372,6 +1402,14 @@ std::string CommandEngine::ExecuteStatement(
                                 [&](const cql::RenameTable&) {
                                     // The parser refuses it inside MIGRATE.
                                     throw std::invalid_argument("MIGRATE cannot rename a table");
+                                },
+                                [&](const cql::AddCheck& add) {
+                                    request.add_check = [&add](const TableSchema& schema) { return CheckFrom(add.check, schema); };
+                                },
+                                [&](const cql::DropCheck& drop) {
+                                    if (drop.if_exists)
+                                        request.columns_if_needed = [&drop](const TableSchema& schema) { return HasCheck(schema, drop.name); };
+                                    request.alter = [&drop](StoreManifest& m) { m.schema = chunkdb::DropCheck(m.schema, drop.name); };
                                 }
                             }, alter.change);
                         },
@@ -1768,8 +1806,20 @@ std::string CommandEngine::ExecuteStatement(
                             const auto current_metadata = !state.written && geometry.chunk_columns_require_initialization()
                                 ? nullptr : state.chunk_columns;
                             if (!state.written && geometry.chunk_columns_require_initialization()) state.chunk_columns.reset();
+                            const auto* checks = geometry.checks();
+                            // The blocks before the statement, kept only to evaluate the changed ones.
+                            std::vector<std::uint8_t> payload;
+                            std::vector<std::uint8_t> presence;
+                            if (checks != nullptr) {
+                                payload = state.payload;
+                                presence = state.presence_bitmap;
+                            }
                             transform(state);
                             store.PrepareTxnChunkState(state, current_vars, current_metadata.get());
+                            // A failing block refuses the statement; COMMIT checks again.
+                            if (checks != nullptr)
+                                checks->RequireChanged(coord, state.payload, state.presence_bitmap, state.vars, payload,
+                                    presence, current_vars);
                             state.written = true;
                         });
                         return NullReply();
@@ -2123,6 +2173,16 @@ std::string CommandEngine::ExecuteStatement(
                                 std::stop_callback shutdown(session.backup_cancelled, request_stop);
                                 std::stop_callback statement(StatementStopToken(), request_stop);
                                 catalog_->RenameTable(alter.table, rename.new_name, config_.users.get(), cancelled.get_token());
+                            },
+                            [&](const cql::AddCheck& add) {
+                                // Only after evaluating it for every stored block.
+                                catalog_->AddCheck(alter.table, [&add](const TableSchema& current) { return CheckFrom(add.check, current); });
+                            },
+                            [&](const cql::DropCheck& drop) {
+                                (void)catalog_->ChangeColumnsIfNeeded(alter.table, [&drop](const TableSchema& current) -> std::optional<TableSchema> {
+                                    if (drop.if_exists && !HasCheck(current, drop.name)) return std::nullopt;
+                                    return chunkdb::DropCheck(current, drop.name);
+                                });
                             },
                         },
                         alter.change);

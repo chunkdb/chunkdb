@@ -592,6 +592,38 @@ void TestWatch() {
     ExpectError("SHOW SLOTS PREFIX 'con' ON world", "expected the end");
     ExpectError("UNWATCH extra", "expected the end");
 }
+// CHECK in CREATE TABLE (a column's and the table's), ADD CHECK and DROP
+// CHECK; the condition's text is kept as written.
+void TestChecks() {
+    const auto create = Get<cql::CreateTable>(
+        "CREATE TABLE t (hp i32 CHECK (hp >= 0) CHECK hp_max ( hp <= max_hp ), max_hp i32 NULL) CHUNK 4 x 4 "
+        "CHECK (pos_z = 0 OR hp > 1) CHECK named (\"max_hp\" IS NULL)");
+    assert(create.columns[0].checks.size() == 2U && create.columns[1].checks.empty());
+    assert(!create.columns[0].checks[0].name && create.columns[0].checks[0].expression == "hp >= 0");
+    assert(create.columns[0].checks[1].name == "hp_max" && create.columns[0].checks[1].expression == "hp <= max_hp");
+    assert(create.chunk_width == 4U && create.checks.size() == 2U);
+    assert(create.checks[0].expression == "pos_z = 0 OR hp > 1" && create.checks[1].name == "named");
+    assert(create.checks[1].expression == "\"max_hp\" IS NULL");
+    // A column named check is still a column.
+    assert(Get<cql::CreateTable>("CREATE TABLE t (check u8, b bits(4) CHECK (b <> b'0000'))").columns.size() == 2U);
+    const auto add = std::get<cql::AddCheck>(Get<cql::AlterTable>("ALTER TABLE t ADD CHECK (a + b < 10)").change);
+    assert(!add.check.name && add.check.expression == "a + b < 10");
+    assert(std::get<cql::AddCheck>(Get<cql::AlterTable>("alter table t add check ab ((a) < b)").change).check.name == "ab");
+    const auto drop = std::get<cql::DropCheck>(Get<cql::AlterTable>("ALTER TABLE t DROP CHECK IF EXISTS ab").change);
+    assert(drop.name == "ab" && drop.if_exists);
+    assert(!std::get<cql::DropCheck>(Get<cql::AlterTable>("ALTER TABLE t DROP CHECK ab").change).if_exists);
+    const auto migrated = Get<cql::Migrate>("MIGRATE 'm1' ALTER TABLE t ADD CHECK (a > 0)");
+    assert(std::holds_alternative<cql::AddCheck>(std::get<cql::AlterTable>(migrated.statement).change));
+    ExpectError("ALTER TABLE t ADD CHECK (a > $1)", "CHECK takes no parameters");
+    ExpectError("ALTER TABLE t ADD CHECK a = 0", "expected (, got '='");
+    ExpectError("ALTER TABLE t ADD CHECK (a > 0", "expected )");
+    ExpectError("ALTER TABLE t ADD CHECK (a >)", "expected a value");
+    ExpectError("ALTER TABLE t ADD CHECK Named (a > 0)", "names are lowercase");
+    ExpectError("ALTER TABLE t ADD COLUMN c u8 CHECK (c > 0)", "ADD COLUMN takes no CHECK; add the column, then ALTER TABLE ... ADD CHECK");
+    ExpectError("CREATE TABLE t (a u8) CHUNK COLUMNS (b u8 CHECK (b > 0))", "CHUNK COLUMNS takes no CHECK");
+    ExpectError("ALTER TABLE t DROP CHECK", "expected a check name");
+}
+
 void TestBackup() {
     assert(Get<cql::Backup>("BACKUP TO '/backups/snapshot'").path == "/backups/snapshot");
     assert(Get<cql::Backup>("backup to '/backups/it''s'").path == "/backups/it's");
@@ -774,6 +806,7 @@ int main() {
     TestAlterAndOtherStatements();
     TestWatch();
     TestBackup();
+    TestChecks();
     TestErrors();
     return 0;
 }

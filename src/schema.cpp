@@ -12,6 +12,7 @@
 #include <unordered_set>
 
 #include "chunk_store_internal.hpp"
+#include "expr.hpp"
 
 namespace chunkdb {
 
@@ -43,7 +44,99 @@ constexpr std::uint8_t kKnownFlags = kFlagNullable | kFlagRequired | kFlagHasDef
     return true;
 }
 
+// The parsed condition of `check`; a ParseError becomes
+// std::invalid_argument naming the check.
+[[nodiscard]] expr::Condition ParseCheck(const CheckConstraint& check) {
+    try {
+        return expr::ParseCondition(check.expression);
+    } catch (const cql::ParseError& error) {
+        throw std::invalid_argument("CHECK " + check.name + ": " + error.what());
+    }
+}
+
+[[nodiscard]] bool ReadsColumn(const CheckConstraint& check, std::string_view column) {
+    const auto names = CheckColumnNames(check);
+    return std::find(names.begin(), names.end(), column) != names.end();
+}
+
+// Throws std::invalid_argument for a CHECK list `schema` cannot have. With
+// `plan`, each condition is also parsed and planned against the columns;
+// earlier versions are checked without it, as each check was planned
+// against its own version when it was added and a rename rewrites it.
+void ValidateChecks(const TableSchema& schema, ColumnDomain domain, bool plan) {
+    if (schema.checks.empty()) return;
+    if (domain != ColumnDomain::kBlock) throw std::invalid_argument("chunk columns cannot have CHECK constraints");
+    if (schema.checks.size() > kMaxChecksPerTable)
+        throw std::invalid_argument("a table has at most " + std::to_string(kMaxChecksPerTable) + " CHECK constraints");
+    std::unordered_set<std::string> names;
+    for (const auto& check : schema.checks) {
+        if (!names.insert(check.name).second) throw std::invalid_argument("CHECK " + check.name + " appears twice");
+        if (plan) {
+            ValidateCheck(check, schema.columns);
+        } else if (!IsValidName(check.name) || check.expression.empty() ||
+                   check.expression.size() > kMaxCheckExpressionBytes) {
+            throw std::invalid_argument("schema history has a malformed CHECK " + check.name);
+        }
+    }
+}
+
 }  // namespace
+
+void ValidateCheck(const CheckConstraint& check, const std::vector<Column>& columns) {
+    if (!IsValidName(check.name)) {
+        throw std::invalid_argument(
+            "CHECK name '" + check.name + "' must be 1 to " + std::to_string(kMaxColumnNameBytes) +
+            " characters: a-z, 0-9 and _, not starting with a digit");
+    }
+    if (check.expression.size() > kMaxCheckExpressionBytes) {
+        throw std::invalid_argument(
+            "CHECK " + check.name + " has more than " + std::to_string(kMaxCheckExpressionBytes) + " bytes");
+    }
+    const auto condition = ParseCheck(check);
+    if (condition.parameters != 0U) throw std::invalid_argument("CHECK " + check.name + " cannot use parameters");
+    for (const auto& node : condition.expression.nodes) {
+        const char* refused = node.op == expr::Op::kChunkColumn ? "chunk columns"
+                            : node.op == expr::Op::kNow        ? "NOW()"
+                            : node.op == expr::Op::kExists     ? "EXISTS"
+                                                               : nullptr;
+        if (refused != nullptr)
+            throw std::invalid_argument("CHECK " + check.name + " reads only the block's columns and position, not " + refused);
+    }
+    try {
+        (void)expr::PlanCondition(condition.expression, expr::ColumnList(columns));
+    } catch (const std::invalid_argument& error) {
+        throw std::invalid_argument("CHECK " + check.name + ": " + error.what());
+    } catch (const std::out_of_range& error) {
+        throw std::invalid_argument("CHECK " + check.name + ": " + error.what());
+    }
+}
+
+std::vector<std::string> CheckColumnNames(const CheckConstraint& check) {
+    std::vector<std::string> names;
+    for (const auto& node : ParseCheck(check).expression.nodes) {
+        if (node.op == expr::Op::kColumn && std::find(names.begin(), names.end(), node.name) == names.end())
+            names.push_back(node.name);
+    }
+    return names;
+}
+
+std::string NewCheckName(const TableSchema& schema, const std::string& expression, std::string_view column) {
+    auto columns = column.empty() ? CheckColumnNames(CheckConstraint{.name = "check", .expression = expression})
+                                  : std::vector<std::string>{std::string(column)};
+    constexpr std::string_view kSuffix = "_check";
+    // Room for the suffix and a number of up to three digits.
+    const std::size_t room = kMaxColumnNameBytes - kSuffix.size() - 4U;
+    const std::string base = columns.empty() ? std::string("check") : columns.front().substr(0, room) + std::string(kSuffix);
+    for (std::size_t n = 1U;; ++n) {
+        const std::string name = n == 1U ? base : base + "_" + std::to_string(n);
+        if (!HasCheck(schema, name)) return name;
+    }
+}
+
+bool HasCheck(const TableSchema& schema, std::string_view name) noexcept {
+    return std::any_of(
+        schema.checks.begin(), schema.checks.end(), [name](const CheckConstraint& check) { return check.name == name; });
+}
 
 void ValidateColumnType(const Column& column) {
     const auto& type = column.type;
@@ -306,6 +399,7 @@ void UndoLastStep(TableSchema* schema) {
     // A narrowing in progress belongs to the current version.
     schema->pending.reset();
     auto& columns = schema->columns;
+    auto& checks = schema->checks;
     for (auto change = step.changes.rbegin(); change != step.changes.rend(); ++change) {
         const std::size_t at = change->position;
         const auto mismatch = [&] {
@@ -332,6 +426,14 @@ void UndoLastStep(TableSchema* schema) {
                     throw mismatch();
                 }
                 columns[at].name = change->old_name;
+                // The checks named the column by its new name.
+                for (auto& check : checks) {
+                    try {
+                        check.expression = expr::RenameColumnIn(check.expression, change->column.name, change->old_name);
+                    } catch (const cql::ParseError&) {
+                        throw mismatch();
+                    }
+                }
                 break;
             case SchemaChange::Kind::kChangeType:
                 if (at >= columns.size() || columns[at] != change->column || change->previous.id != change->column.id) {
@@ -345,6 +447,20 @@ void UndoLastStep(TableSchema* schema) {
                     throw mismatch();
                 }
                 columns[at] = change->previous;
+                break;
+            case SchemaChange::Kind::kAddCheck:
+                // Compared by name: a later rename may have rewritten a
+                // column name of the text.
+                if (at >= checks.size() || checks[at].name != change->check.name) {
+                    throw mismatch();
+                }
+                checks.erase(checks.begin() + static_cast<std::ptrdiff_t>(at));
+                break;
+            case SchemaChange::Kind::kDropCheck:
+                if (at > checks.size()) {
+                    throw mismatch();
+                }
+                checks.insert(checks.begin() + static_cast<std::ptrdiff_t>(at), change->check);
                 break;
             case SchemaChange::Kind::kOtherDomain:
                 break;
@@ -377,6 +493,7 @@ void ValidateSchema(const TableSchema& schema, ColumnDomain domain) {
         throw std::invalid_argument("schema version must be at least 1");
     }
     ValidateColumns(schema, domain);
+    ValidateChecks(schema, domain, /*plan=*/true);
     if (schema.version - 1U > kMaxSchemaVersions) {
         throw std::invalid_argument("a table has at most " + std::to_string(kMaxSchemaVersions + 1U) + " schema versions");
     }
@@ -393,11 +510,17 @@ void ValidateSchema(const TableSchema& schema, ColumnDomain domain) {
             throw std::invalid_argument("schema history step for version " + std::to_string(step.version) + " is malformed");
         }
         for (const auto& change : step.changes) {
-            if (change.kind < SchemaChange::Kind::kAddColumn || change.kind > SchemaChange::Kind::kChangeAttributes)
+            if (change.kind < SchemaChange::Kind::kAddColumn || change.kind > SchemaChange::Kind::kDropCheck)
                 throw std::invalid_argument("unknown schema change");
-            // Chunk columns have no ALTER COLUMN attribute changes.
+            // Chunk columns have no ALTER COLUMN attribute changes or checks.
             if (change.kind == SchemaChange::Kind::kChangeAttributes && domain != ColumnDomain::kBlock)
                 throw std::invalid_argument("chunk columns cannot record an attribute change");
+            const bool check_change =
+                change.kind == SchemaChange::Kind::kAddCheck || change.kind == SchemaChange::Kind::kDropCheck;
+            if (check_change && (domain != ColumnDomain::kBlock || change.column != Column{}))
+                throw std::invalid_argument("schema CHECK change is malformed");
+            if (!check_change && change.check != CheckConstraint{})
+                throw std::invalid_argument("schema change carries a CHECK it does not make");
             if (change.kind != SchemaChange::Kind::kOtherDomain) continue;
             if (!IsOtherDomainStep(step) || change.position != 0 || change.column != Column{} ||
                 !change.old_name.empty() || change.previous != Column{} || change.conversion != Conversion::kExact)
@@ -405,6 +528,7 @@ void ValidateSchema(const TableSchema& schema, ColumnDomain domain) {
         }
         UndoLastStep(&earlier);
         ValidateColumns(earlier, domain);
+        ValidateChecks(earlier, domain, /*plan=*/false);
     }
     ValidatePending(schema);
 }
@@ -497,6 +621,10 @@ TableSchema AddDomainColumn(
 
 TableSchema DropDomainColumn(const TableSchema& schema, std::string_view name, ColumnDomain domain) {
     const std::size_t at = ColumnIndex(schema, name);
+    for (const auto& check : schema.checks) {
+        if (ReadsColumn(check, name))
+            throw std::invalid_argument("column " + std::string(name) + " is read by CHECK " + check.name + "; drop the check first");
+    }
     TableSchema next = schema;
     Column dropped = next.columns[at];
     next.columns.erase(next.columns.begin() + static_cast<std::ptrdiff_t>(at));
@@ -517,6 +645,8 @@ TableSchema RenameDomainColumn(
     const std::size_t at = ColumnIndex(schema, name);
     TableSchema next = schema;
     next.columns[at].name = std::move(new_name);
+    // Checks read the column by its new name.
+    for (auto& check : next.checks) check.expression = expr::RenameColumnIn(check.expression, name, next.columns[at].name);
     SchemaChange change{
         .kind = SchemaChange::Kind::kRenameColumn,
         .position = static_cast<std::uint32_t>(at),
@@ -756,8 +886,35 @@ void EncodeColumn(std::vector<std::uint8_t>& out, const Column& column) {
 
 [[nodiscard]] bool IsKnownChange(std::uint8_t kind) noexcept {
     return kind >= static_cast<std::uint8_t>(SchemaChange::Kind::kAddColumn) &&
-           kind <= static_cast<std::uint8_t>(SchemaChange::Kind::kChangeAttributes);
+           kind <= static_cast<std::uint8_t>(SchemaChange::Kind::kDropCheck);
 }
+
+// A check: name length `u8`, name, expression length `u32`, expression.
+void EncodeCheck(std::vector<std::uint8_t>& out, const CheckConstraint& check) {
+    out.push_back(static_cast<std::uint8_t>(check.name.size()));
+    out.insert(out.end(), check.name.begin(), check.name.end());
+    WriteLe32(out, static_cast<std::uint32_t>(check.expression.size()));
+    out.insert(out.end(), check.expression.begin(), check.expression.end());
+}
+
+[[nodiscard]] CheckConstraint DecodeCheck(Reader& in) {
+    CheckConstraint check;
+    const auto name = in.Bytes(static_cast<std::size_t>(in.Le(1)));
+    check.name.assign(name.begin(), name.end());
+    const auto length = static_cast<std::size_t>(in.Le(4));
+    if (length > kMaxCheckExpressionBytes) {
+        throw std::runtime_error("CHECK expression of " + std::to_string(length) + " bytes");
+    }
+    const auto expression = in.Bytes(length);
+    check.expression.assign(expression.begin(), expression.end());
+    return check;
+}
+
+// Tags of the sections after the history.
+constexpr std::uint8_t kTagNarrowing = 1U;
+constexpr std::uint8_t kTagDropNull = 2U;
+constexpr std::uint8_t kTagAddCheck = 3U;
+constexpr std::uint8_t kTagChecks = 4U;
 
 }  // namespace
 
@@ -778,6 +935,10 @@ std::vector<std::uint8_t> EncodeSchema(const TableSchema& schema, ColumnDomain d
             out.push_back(static_cast<std::uint8_t>(change.kind));
             if (change.kind == SchemaChange::Kind::kOtherDomain) continue;
             WriteLe32(out, change.position);
+            if (change.kind == SchemaChange::Kind::kAddCheck || change.kind == SchemaChange::Kind::kDropCheck) {
+                EncodeCheck(out, change.check);
+                continue;
+            }
             EncodeColumn(out, change.column);
             if (change.kind == SchemaChange::Kind::kRenameColumn) {
                 out.push_back(static_cast<std::uint8_t>(change.old_name.size()));
@@ -792,9 +953,16 @@ std::vector<std::uint8_t> EncodeSchema(const TableSchema& schema, ColumnDomain d
             }
         }
     }
-    if (schema.pending.has_value()) {
-        // 1 a narrowing, 2 a DROP NULL check.
-        out.push_back(schema.pending->not_null ? 2U : 1U);
+    if (!schema.checks.empty()) {
+        out.push_back(kTagChecks);
+        WriteLe32(out, static_cast<std::uint32_t>(schema.checks.size()));
+        for (const auto& check : schema.checks) EncodeCheck(out, check);
+    }
+    if (schema.pending.has_value() && schema.pending->check.has_value()) {
+        out.push_back(kTagAddCheck);
+        EncodeCheck(out, *schema.pending->check);
+    } else if (schema.pending.has_value()) {
+        out.push_back(schema.pending->not_null ? kTagDropNull : kTagNarrowing);
         WriteLe32(out, schema.pending->column_id);
         out.push_back(static_cast<std::uint8_t>(schema.pending->type.kind));
         WriteLe32(out, schema.pending->type.size);
@@ -837,6 +1005,11 @@ TableSchema DecodeSchema(const std::uint8_t* data, std::size_t size, ColumnDomai
                 continue;
             }
             change.position = static_cast<std::uint32_t>(in.Le(4));
+            if (change.kind == SchemaChange::Kind::kAddCheck || change.kind == SchemaChange::Kind::kDropCheck) {
+                change.check = DecodeCheck(in);
+                step.changes.push_back(std::move(change));
+                continue;
+            }
             change.column = DecodeColumn(in);
             if (change.kind == SchemaChange::Kind::kRenameColumn) {
                 const auto name = in.Bytes(static_cast<std::size_t>(in.Le(1)));
@@ -857,14 +1030,26 @@ TableSchema DecodeSchema(const std::uint8_t* data, std::size_t size, ColumnDomai
         }
         schema.history.push_back(std::move(step));
     }
-    if (!in.AtEnd()) {
-        // A narrowing or a DROP NULL check in progress.
-        const auto tag = in.Le(1);
-        if (tag != 1U && tag != 2U) {
+    // The checks, then a narrowing, DROP NULL check or ADD CHECK in progress.
+    // kNoTag: the area ends.
+    constexpr std::uint64_t kNoTag = 256U;
+    std::uint64_t tag = in.AtEnd() ? kNoTag : in.Le(1);
+    if (tag == kTagChecks) {
+        const auto checks = static_cast<std::uint32_t>(in.Le(4));
+        if (checks == 0U || checks > kMaxChecksPerTable) {
+            throw std::runtime_error("schema area declares " + std::to_string(checks) + " CHECK constraints");
+        }
+        for (std::uint32_t i = 0; i < checks; ++i) schema.checks.push_back(DecodeCheck(in));
+        tag = in.AtEnd() ? kNoTag : in.Le(1);
+    }
+    if (tag == kTagAddCheck) {
+        schema.pending = PendingNarrowing{.check = DecodeCheck(in)};
+    } else if (tag != kNoTag) {
+        if (tag != kTagNarrowing && tag != kTagDropNull) {
             throw std::runtime_error("schema area has trailing bytes");
         }
         PendingNarrowing pending;
-        pending.not_null = tag == 2U;
+        pending.not_null = tag == kTagDropNull;
         pending.column_id = static_cast<std::uint32_t>(in.Le(4));
         const auto kind = static_cast<std::uint8_t>(in.Le(1));
         if (!IsKnownKind(kind)) {
@@ -1157,8 +1342,31 @@ namespace {
 
 // The next version with column `at` of `type`; the default follows by
 // `conversion`. The caller has checked the change is allowed.
+// Throws std::invalid_argument when column `at` cannot take `type` by
+// `conversion` under the table's checks: a conversion that may change the
+// values a check reads, or a check that does not plan with the new type.
+void RequireChecksTakeType(const TableSchema& schema, std::size_t at, const ColumnType& type, Conversion conversion) {
+    if (schema.checks.empty()) return;
+    auto columns = schema.columns;
+    columns[at].type = type;
+    const auto& name = columns[at].name;
+    for (const auto& check : schema.checks) {
+        if (!ReadsColumn(check, name)) continue;
+        if (conversion != Conversion::kExact)
+            throw std::invalid_argument(
+                "column " + name + " is read by CHECK " + check.name + ", which converted values could fail; drop the check first");
+        try {
+            ValidateCheck(check, columns);
+        } catch (const std::invalid_argument& error) {
+            throw std::invalid_argument(
+                "column " + name + " cannot become " + ColumnTypeName(type) + ": " + error.what() + "; drop the check first");
+        }
+    }
+}
+
 [[nodiscard]] TableSchema ChangeTypeAt(const TableSchema& schema, std::size_t at, ColumnType type, Conversion conversion) {
     const Column& before = schema.columns[at];
+    RequireChecksTakeType(schema, at, type, conversion);
     TableSchema next = schema;
     Column& after = next.columns[at];
     after.type = type;
@@ -1229,6 +1437,16 @@ void ValidatePending(const TableSchema& schema) {
         return;
     }
     const auto& pending = *schema.pending;
+    if (pending.check.has_value()) {
+        if (pending.column_id != 0U || pending.type != ColumnType{} || pending.not_null)
+            throw std::invalid_argument("the CHECK in progress also names a column");
+        if (HasCheck(schema, pending.check->name))
+            throw std::invalid_argument("the table already has a CHECK named " + pending.check->name);
+        if (schema.checks.size() >= kMaxChecksPerTable)
+            throw std::invalid_argument("a table has at most " + std::to_string(kMaxChecksPerTable) + " CHECK constraints");
+        ValidateCheck(*pending.check, schema.columns);
+        return;
+    }
     const auto column = std::find_if(schema.columns.begin(), schema.columns.end(), [&](const Column& c) {
         return c.id == pending.column_id;
     });
@@ -1299,8 +1517,10 @@ TableSchema WithPendingNarrowing(const TableSchema& schema, std::string_view nam
     if (schema.pending.has_value()) {
         throw std::invalid_argument("another narrowing of this table is in progress");
     }
+    const std::size_t at = ColumnIndex(schema, name);
+    RequireChecksTakeType(schema, at, type, Conversion::kExact);
     TableSchema next = schema;
-    next.pending = PendingNarrowing{.column_id = schema.columns[ColumnIndex(schema, name)].id, .type = type};
+    next.pending = PendingNarrowing{.column_id = schema.columns[at].id, .type = type};
     ValidateTableSchema(next);
     return next;
 }
@@ -1385,6 +1605,47 @@ TableSchema DropColumnNull(const TableSchema& schema, std::string_view name) {
     Column after = schema.columns[at];
     after.nullable = false;
     return ChangeAttributesAt(WithoutPendingNarrowing(schema), at, after);
+}
+
+TableSchema WithPendingCheck(const TableSchema& schema, CheckConstraint check) {
+    if (schema.pending.has_value()) {
+        throw std::invalid_argument("another narrowing or CHECK of this table is in progress");
+    }
+    TableSchema next = schema;
+    next.pending = PendingNarrowing{.column_id = 0U, .type = {}, .not_null = false, .check = std::move(check)};
+    ValidateTableSchema(next);
+    return next;
+}
+
+TableSchema AddPendingCheck(const TableSchema& schema) {
+    if (!schema.pending.has_value() || !schema.pending->check.has_value()) {
+        throw std::invalid_argument("the table has no CHECK in progress");
+    }
+    TableSchema next = WithoutPendingNarrowing(schema);
+    next.checks.push_back(*schema.pending->check);
+    SchemaChange change{
+        .kind = SchemaChange::Kind::kAddCheck,
+        .position = static_cast<std::uint32_t>(next.checks.size() - 1U),
+        .check = next.checks.back(),
+    };
+    return NextVersion(WithoutPendingNarrowing(schema), std::move(change), std::move(next));
+}
+
+TableSchema DropCheck(const TableSchema& schema, std::string_view name) {
+    const auto at = std::find_if(
+        schema.checks.begin(), schema.checks.end(), [name](const CheckConstraint& check) { return check.name == name; });
+    if (at == schema.checks.end()) {
+        throw std::invalid_argument("the table has no CHECK " + std::string(name));
+    }
+    const auto position = static_cast<std::size_t>(at - schema.checks.begin());
+    TableSchema next = schema;
+    next.checks.erase(next.checks.begin() + static_cast<std::ptrdiff_t>(position));
+    SchemaChange change{
+        .kind = SchemaChange::Kind::kDropCheck,
+        .position = static_cast<std::uint32_t>(position),
+        .check = *at,
+    };
+    return NextVersion(schema, std::move(change), std::move(next));
 }
 
 }  // namespace chunkdb
