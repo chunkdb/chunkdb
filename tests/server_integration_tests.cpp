@@ -29,6 +29,7 @@
 #include "catalog_test_utils.hpp"
 #include "login_helpers.hpp"
 #include "feed_phase_watchdog.hpp"
+#include "listener_port_test_utils.hpp"
 #include "../src/audit_log.hpp"
 #include "../src/change_feed.hpp"
 #include "../src/proxy_protocol.hpp"
@@ -218,43 +219,14 @@ WinsockRuntime& EnsureWinsockRuntime() {
 }
 #endif
 
-std::uint16_t PickFreePort() {
-#ifdef _WIN32
-    (void)EnsureWinsockRuntime();
-#endif
-    const SocketHandle s = socket(AF_INET, SOCK_STREAM, 0);
-    if (s == kInvalidSocket) {
-        throw std::runtime_error("failed to create socket for free-port probe");
-    }
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-    addr.sin_port = 0;
-
-    if (bind(s, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0) {
-        CloseSocket(s);
-        throw std::runtime_error("failed to bind free-port probe socket");
-    }
-
-    SocketLen len = static_cast<SocketLen>(sizeof(addr));
-    if (getsockname(s, reinterpret_cast<sockaddr*>(&addr), &len) != 0) {
-        CloseSocket(s);
-        throw std::runtime_error("failed to read free-port probe socket name");
-    }
-
-    const std::uint16_t port = ntohs(addr.sin_port);
-    CloseSocket(s);
-    return port;
-}
-
 // A loopback port held by a listening socket for the lifetime of the object,
 // so a server configured for it deterministically fails to listen. Unlike an
 // unresolvable host name this does not depend on DNS: resolvers with a
-// `localhost` search domain turn any name into 127.0.0.1.
+// `localhost` search domain turn any name into 127.0.0.1. Port 0 holds a port
+// the kernel picks.
 class OccupiedPort {
   public:
-    OccupiedPort() {
+    explicit OccupiedPort(std::uint16_t port = 0) {
 #ifdef _WIN32
         (void)EnsureWinsockRuntime();
 #endif
@@ -272,11 +244,19 @@ class OccupiedPort {
             CloseSocket(socket_);
             throw std::runtime_error("failed to set SO_EXCLUSIVEADDRUSE");
         }
+#else
+        // A port a stopped server just closed may still have connections in
+        // TIME_WAIT; this still refuses a second listener.
+        int reuse = 1;
+        if (port != 0 && setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse)) != 0) {
+            CloseSocket(socket_);
+            throw std::runtime_error("failed to set SO_REUSEADDR");
+        }
 #endif
         sockaddr_in addr{};
         addr.sin_family = AF_INET;
         addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        addr.sin_port = 0;
+        addr.sin_port = htons(port);
         SocketLen len = static_cast<SocketLen>(sizeof(addr));
         if (bind(socket_, reinterpret_cast<const sockaddr*>(&addr), sizeof(addr)) != 0 ||
             listen(socket_, 1) != 0 ||
@@ -294,6 +274,19 @@ class OccupiedPort {
 
     [[nodiscard]] std::uint16_t port() const noexcept { return port_; }
     [[nodiscard]] SocketHandle listening_socket() const noexcept { return socket_; }
+
+    // A connection waits to be accepted, as a startup probe would leave one.
+    [[nodiscard]] bool HasPendingConnection() const {
+        fd_set ready;
+        FD_ZERO(&ready);
+        FD_SET(socket_, &ready);
+        timeval none{0, 0};
+#ifdef _WIN32
+        return select(0, &ready, nullptr, nullptr, &none) == 1;
+#else
+        return select(socket_ + 1, &ready, nullptr, nullptr, &none) == 1;
+#endif
+    }
 
   private:
     SocketHandle socket_ = kInvalidSocket;
@@ -1545,6 +1538,8 @@ struct ServerHarness {
     std::unique_ptr<chunkdb::ChunkServer> server;
     std::thread thread;
     std::uint16_t port = 0;
+    // The harness chose `port`; a test-given port is kept across Restart.
+    bool picked_port = false;
     bool tls_enabled = false;
     chunkdb::StoreConfig saved_store_config;
     chunkdb::ServerConfig saved_server_config;
@@ -1576,6 +1571,12 @@ struct ServerHarness {
         RethrowRunError();
         chunkdb::test::FeedPhaseWatchdog::Phase("harness: reset server/engine/catalog for restart");
         server.reset(); engine.reset(); catalog.reset();
+        // Another process may have bound the old port since Stop; no caller
+        // needs the same port, so a port the harness chose is chosen again.
+        if (picked_port) {
+            port = chunkdb::test::PickListenerPort();
+            saved_server_config.port = port;
+        }
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(saved_store_config);
         catalog_config.feed_linger = std::chrono::milliseconds(saved_server_config.feed_linger_ms);
         catalog = std::make_shared<chunkdb::TableCatalog>(catalog_config);
@@ -1598,7 +1599,8 @@ struct ServerHarness {
         chunkdb::EngineConfig engine_config,
         chunkdb::ServerConfig server_config)
         : data_dir(TempDataDir(std::move(name))),
-          port(server_config.port == 0 ? PickFreePort() : server_config.port) {
+          port(server_config.port == 0 ? chunkdb::test::PickListenerPort() : server_config.port),
+          picked_port(server_config.port == 0) {
         chunkdb::test::FeedPhaseWatchdog::Phase("harness: constructor");
         store_config.data_dir = data_dir;
         server_config.host = "127.0.0.1";
@@ -1709,31 +1711,23 @@ struct ServerHarness {
     }
 
     void WaitUntilListening() {
-        const auto deadline = Clock::now() + std::chrono::seconds(3);
-
-        while (Clock::now() < deadline) {
-            RethrowRunError();
-
-            try {
-#ifdef CHUNKDB_WITH_OPENSSL
-                // With PROXY headers a TLS handshake needs one first; a
-                // connection alone shows the listener is up.
-                if (tls_enabled && !saved_server_config.proxy_protocol_v2) {
-                    TlsClient probe("127.0.0.1", port);
-                } else {
-                    RawClient probe("127.0.0.1", port);
-                }
-#else
-                RawClient probe("127.0.0.1", port);
-#endif
-                return;
-            } catch (const std::runtime_error&) {
-                // Listener startup only; tests do not use this for ordering.
-                std::this_thread::sleep_for(std::chrono::milliseconds(20));
-            }
+        // Run reports its own listener, so the probe never reaches another
+        // socket on this port; a failed Run ends the wait at once and
+        // StartAndWait reports its error.
+        if (!server->WaitListeningForTests(std::chrono::seconds(3))) {
+            throw std::runtime_error("server did not start listening in time");
         }
-
-        throw std::runtime_error("server did not start listening in time");
+#ifdef CHUNKDB_WITH_OPENSSL
+        // With PROXY headers a TLS handshake needs one first; a connection
+        // alone reaches the listener.
+        if (tls_enabled && !saved_server_config.proxy_protocol_v2) {
+            TlsClient probe("127.0.0.1", port);
+        } else {
+            RawClient probe("127.0.0.1", port);
+        }
+#else
+        RawClient probe("127.0.0.1", port);
+#endif
     }
 };
 
@@ -6158,19 +6152,41 @@ void TestServerHarnessStartupFailure() {
     config.port = occupied.port();
     bool failed = false;
     try {
-        {
-            ServerHarness harness("harness-startup-failure", BaseStoreConfig(),
-                chunkdb::EngineConfig{.require_auth = false}, config);
-        }
-        // The occupied listener can accept the probe before Run reports the
-        // bind failure. Teardown must preserve that error too.
-        RethrowBackgroundServerError();
+        ServerHarness harness("harness-startup-failure", BaseStoreConfig(),
+            chunkdb::EngineConfig{.require_auth = false}, config);
     } catch (const std::runtime_error& error) {
         const std::string_view message(error.what());
         failed = message.find("port is already in use") != std::string_view::npos &&
             message.find(std::to_string(occupied.port())) != std::string_view::npos;
     }
-    assert(failed && "a failed startup must report its server error after joining the thread");
+    assert(failed && "a failed startup must report its server error from the constructor");
+    // The harness waits for its own listener and never probes the occupied one.
+    assert(!occupied.HasPendingConnection());
+    RethrowBackgroundServerError();
+    // The same holds when another listener takes the port while the server
+    // is stopped: Restart reports the listen failure instead of probing it.
+    {
+        auto kept = BaseServerConfig();
+        kept.port = chunkdb::test::PickListenerPort();
+        ServerHarness harness("harness-restart-taken-port", BaseStoreConfig(),
+            chunkdb::EngineConfig{.require_auth = false}, kept);
+        harness.server->Stop();
+        harness.JoinStopped();
+        const OccupiedPort taken(harness.port);
+        const auto restarted = Clock::now();
+        std::string reported;
+        try {
+            harness.Restart();
+        } catch (const std::runtime_error& error) {
+            reported = error.what();
+        }
+        assert(reported.find("port is already in use") != std::string::npos &&
+            reported.find(std::to_string(harness.port)) != std::string::npos);
+        // Reported by Run, not after the 3 s listener wait.
+        assert(Clock::now() - restarted < std::chrono::seconds(3));
+        assert(!taken.HasPendingConnection());
+        harness.JoinFailed(reported);
+    }
     RethrowBackgroundServerError();
     // A caught startup failure must not poison the next server lifetime.
     TestPing();
@@ -6338,7 +6354,7 @@ void TestStartupLogOrder() {
     auto server_cfg = BaseServerConfig();
     const std::filesystem::path data_dir = TempDataDir("log-order");
     store_cfg.data_dir = data_dir;
-    server_cfg.port = PickFreePort();
+    server_cfg.port = chunkdb::test::PickListenerPort();
 
     chunkdb::LogServerStartupContext(
         "test-version",

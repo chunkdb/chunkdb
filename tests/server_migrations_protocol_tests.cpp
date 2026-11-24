@@ -197,7 +197,7 @@ class PersistentServer {
         catalog_ = std::make_shared<TableCatalog>(feed_test::Config(directory_));
         EngineConfig engine; engine.require_auth = true; engine.users = test::MakeUsers(directory_, "admin", "secret");
         engine_ = std::make_shared<CommandEngine>(engine, catalog_);
-        ServerConfig config; config.port = port_ = FreePort(); config.worker_threads = 4; config.tls_enabled = tls_;
+        ServerConfig config; config.port = port_ = test::PickListenerPort(); config.worker_threads = 4; config.tls_enabled = tls_;
         // Match the bounded functional SCRAM budget of the shared harness.
         config.client_io_timeout_ms = 30000;
 #ifdef CHUNKDB_WITH_OPENSSL
@@ -213,13 +213,16 @@ class PersistentServer {
             catch (const std::exception&) { std::lock_guard lock(error_mutex_); error_ = std::current_exception(); }
         });
         try {
-            const auto deadline = Clock::now() + 10s;
-            for (;;) {
-                { std::lock_guard lock(error_mutex_); if (error_) std::rethrow_exception(error_); }
-                try { Client probe(port_, tls_); break; }
-                catch (const std::runtime_error&) { if (Clock::now() >= deadline) throw; std::this_thread::yield(); }
-            }
-        } catch (const std::exception&) { Stop(); throw; }
+            // Run reports its own listener, so the probe never reaches another
+            // socket on this port; a failed Run ends the wait at once.
+            if (!server_->WaitListeningForTests(10s)) throw std::runtime_error("server did not start listening in time");
+            Client probe(port_, tls_);
+        } catch (const std::exception&) {
+            Stop();
+            // Report the server's own error, such as a port already in use.
+            { std::lock_guard lock(error_mutex_); if (auto error = std::exchange(error_, {})) std::rethrow_exception(error); }
+            throw;
+        }
     }
     void Stop() {
         if (server_) server_->Stop();

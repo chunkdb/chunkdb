@@ -1213,6 +1213,7 @@ class Parser {
             if (Accept("slots")) {
                 ShowSlots show;
                 if (Accept("on")) show.table = Name("a table name");
+                if (Accept("prefix")) show.prefix = SlotName();
                 return show;
             }
             if (Accept("users")) {

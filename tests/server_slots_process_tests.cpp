@@ -9,7 +9,7 @@ namespace {
 using namespace chunkdb::slot_socket_test;
 class Process {
   public:
-    std::uint16_t port = FreePort();
+    std::uint16_t port = chunkdb::test::PickListenerPort();
     Process(const std::string& binary, const std::filesystem::path& directory, const std::string& mode) {
         const std::string port_string = std::to_string(port);
         const std::string path = directory.string();

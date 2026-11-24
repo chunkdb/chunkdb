@@ -6,6 +6,7 @@
 #include <bit>
 #include <cmath>
 #include <cstdint>
+#include <filesystem>
 #include <limits>
 #include <map>
 #include <optional>
@@ -13,6 +14,7 @@
 #include <stdexcept>
 #include <string>
 #include <string_view>
+#include <system_error>
 #include <type_traits>
 #include <variant>
 #include <vector>
@@ -449,6 +451,47 @@ std::optional<std::string> SlotOwner(const cql::CreateSlot& create, bool require
         ApplyTableOption(&update, option.name, text);
     }
     return update;
+}
+
+struct FileUsage {
+    std::uint64_t files = 0U;
+    std::uint64_t bytes = 0U;
+};
+
+// SHOW TABLE STATS: the regular files under table `table`'s directory and
+// their sizes, listed without a lease, so that no statement on the table
+// waits for it. A file or directory removed during the walk is not counted,
+// and a table directory removed before it is a dropped table; any other
+// error fails the statement. It stops when the statement is stopped.
+[[nodiscard]] FileUsage DirectoryUsage(const std::filesystem::path& root, const std::string& table) {
+    namespace fs = std::filesystem;
+    const auto gone = [](const std::error_code& error) { return error == std::errc::no_such_file_or_directory; };
+    FileUsage usage;
+    std::vector<fs::path> pending{root};
+    while (!pending.empty()) {
+        const fs::path dir = std::move(pending.back());
+        pending.pop_back();
+        std::error_code error;
+        fs::directory_iterator it(dir, error);
+        if (error && dir == root && gone(error)) throw TableNotFoundError("table '" + table + "' does not exist");
+        if (error && !gone(error)) throw fs::filesystem_error("cannot list table files", dir, error);
+        for (const fs::directory_iterator end{}; !error && it != end; it.increment(error)) {
+            CheckStatementCancellation();
+            const auto status = it->symlink_status(error);
+            if (!error && fs::is_directory(status)) pending.push_back(it->path());
+            if (!error && fs::is_regular_file(status)) {
+                const auto size = fs::file_size(it->path(), error);
+                if (!error) {
+                    ++usage.files;
+                    usage.bytes += size;
+                }
+            }
+            if (error && !gone(error)) throw fs::filesystem_error("cannot read table files", it->path(), error);
+            error.clear();
+        }
+        if (error && !gone(error)) throw fs::filesystem_error("cannot list table files", dir, error);
+    }
+    return usage;
 }
 
 // The value a column's encoded DEFAULT holds.
@@ -1287,7 +1330,8 @@ std::string CommandEngine::ExecuteStatement(
                         const auto table = catalog_->Require(name);
                         if (auto* hook = hook_.load(std::memory_order_acquire))
                             hook->Run(CommandEngineTestHook::Point::kBeforeSlotTableList, name);
-                        for (auto& slot : table->ListFeedSlots(true)) slots.emplace_back(name, std::move(slot));
+                        for (auto& slot : table->ListFeedSlots(true))
+                            if (!show.prefix || slot.name.starts_with(*show.prefix)) slots.emplace_back(name, std::move(slot));
                     };
                     // MONITOR lists the slots of every table; owners stay hidden.
                     const bool monitor = HasServerRight(session, ServerRight::kMonitor);
@@ -1316,7 +1360,7 @@ std::string CommandEngine::ExecuteStatement(
                     const bool show_owners = !config_.require_auth || (viewer != nullptr && viewer->manages_users);
                     Protocol::AppendArrayHeader(reply, slots.size());
                     for (const auto& [name, slot] : slots) {
-                        Protocol::AppendMapHeader(reply, 9);
+                        Protocol::AppendMapHeader(reply, 12);
                         Protocol::AppendBulk(reply, "table");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "name");
@@ -1325,8 +1369,15 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendBulk(reply, StoreIdHex(slot.position.epoch));
                         Protocol::AppendBulk(reply, "acked");
                         Protocol::AppendInteger(reply, slot.position.revision);
+                        // A slot delivers up to the durable revision its records hold.
+                        Protocol::AppendBulk(reply, "revision");
+                        Protocol::AppendInteger(reply, slot.durable_watermark);
+                        Protocol::AppendBulk(reply, "lag_revisions");
+                        Protocol::AppendInteger(reply, slot.durable_watermark > slot.position.revision ? slot.durable_watermark - slot.position.revision : 0U);
                         Protocol::AppendBulk(reply, "retained_bytes");
                         Protocol::AppendInteger(reply, slot.retained_bytes);
+                        Protocol::AppendBulk(reply, "attached");
+                        Protocol::AppendBoolean(reply, slot.attached);
                         Protocol::AppendBulk(reply, "lost");
                         reply += slot.lost ? "#t\r\n" : "#f\r\n";
                         Protocol::AppendBulk(reply, "lost_reason");
@@ -1900,21 +1951,44 @@ std::string CommandEngine::ExecuteStatement(
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     // MONITOR sees every table, as SHOW STATUS lists them.
                     if (!HasServerRight(session, ServerRight::kMonitor)) RequireRight(session, stats.table, Right::kRead);
-                    const auto lease = AcquireNamedTable(session, stats.table);
-                    auto& store = lease.store();
                     std::string reply;
-                    Protocol::AppendMapHeader(reply, 5U);
-                    Protocol::AppendBulk(reply, "epoch");
-                    Protocol::AppendBulk(reply, StoreIdHex(store.store_id()));
-                    Protocol::AppendBulk(reply, "revision");
-                    if (const auto revision = store.CompletedRevision()) Protocol::AppendInteger(reply, *revision);
-                    else Protocol::AppendNull(reply);
-                    Protocol::AppendBulk(reply, "dims");
-                    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(store.geometry().dims()));
-                    Protocol::AppendBulk(reply, "tombstones");
-                    Protocol::AppendInteger(reply, store.RetainedTombstoneCount());
-                    Protocol::AppendBulk(reply, "retained_deletion_floor");
-                    Protocol::AppendInteger(reply, store.RetainedDeletionFloor());
+                    std::filesystem::path dir;
+                    Table::FeedCounts feeds;
+                    // The directory is listed after the lease ends: an exclusive section
+                    // waiting for the lease would stop every statement on the table.
+                    {
+                        const auto lease = AcquireNamedTable(session, stats.table);
+                        auto& store = lease.store();
+                        feeds = session.table->CountFeeds(lease);
+                        dir = store.data_dir();
+                        Protocol::AppendMapHeader(reply, 11U);
+                        Protocol::AppendBulk(reply, "epoch");
+                        Protocol::AppendBulk(reply, StoreIdHex(store.store_id()));
+                        Protocol::AppendBulk(reply, "revision");
+                        if (const auto revision = store.CompletedRevision()) Protocol::AppendInteger(reply, *revision);
+                        else Protocol::AppendNull(reply);
+                        Protocol::AppendBulk(reply, "dims");
+                        Protocol::AppendInteger(reply, static_cast<std::uint64_t>(store.geometry().dims()));
+                        Protocol::AppendBulk(reply, "chunks");
+                        Protocol::AppendInteger(reply, store.PopulatedChunkCount());
+                        Protocol::AppendBulk(reply, "tombstones");
+                        Protocol::AppendInteger(reply, store.RetainedTombstoneCount());
+                        Protocol::AppendBulk(reply, "retained_deletion_floor");
+                        Protocol::AppendInteger(reply, store.RetainedDeletionFloor());
+                        Protocol::AppendBulk(reply, "loaded_chunks");
+                        Protocol::AppendInteger(reply, static_cast<std::uint64_t>(store.ApproxLoadedChunkCount()));
+                    }
+                    if (auto* hook = hook_.load(std::memory_order_acquire))
+                        hook->Run(CommandEngineTestHook::Point::kBeforeTableStatsListing, stats.table);
+                    const auto files = DirectoryUsage(dir, stats.table);
+                    Protocol::AppendBulk(reply, "files");
+                    Protocol::AppendInteger(reply, files.files);
+                    Protocol::AppendBulk(reply, "disk_bytes");
+                    Protocol::AppendInteger(reply, files.bytes);
+                    Protocol::AppendBulk(reply, "slots");
+                    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(feeds.slots));
+                    Protocol::AppendBulk(reply, "watches");
+                    Protocol::AppendInteger(reply, static_cast<std::uint64_t>(feeds.watches));
                     return reply;
                 },
                 [&](const cql::ShowTables&) {
@@ -2266,8 +2340,9 @@ std::string CommandEngine::ExecuteStatement(
                 [&](const cql::ShowStatus&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     RequireMonitor(session);
-                    const auto status = catalog_->FeatureStatus();
                     std::string reply;
+                    const auto uptime = std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started_);
+                    const auto status = catalog_->FeatureStatus();
                     const auto flags = [&](const FeatureFlags& value) {
                         Protocol::AppendBulk(reply, "enabled");
                         std::size_t count = 0U;
@@ -2280,12 +2355,31 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendBulk(reply, "ro_compat"); Protocol::AppendInteger(reply, static_cast<std::uint64_t>(value.ro_compat));
                         Protocol::AppendBulk(reply, "incompat"); Protocol::AppendInteger(reply, static_cast<std::uint64_t>(value.incompat));
                     };
-                    Protocol::AppendMapHeader(reply, 3U);
+                    const auto readable = static_cast<std::size_t>(std::count_if(status.tables.begin(), status.tables.end(),
+                        [](const auto& table) { return table.features.has_value(); }));
+                    Protocol::AppendMapHeader(reply, 7U);
+                    Protocol::AppendBulk(reply, "version"); Protocol::AppendBulk(reply, config_.server_version);
+                    Protocol::AppendBulk(reply, "uptime_ms"); Protocol::AppendInteger(reply, static_cast<std::uint64_t>(uptime.count()));
+                    Protocol::AppendBulk(reply, "read_only"); Protocol::AppendBoolean(reply, catalog_->access_mode() == AccessMode::kReadOnly);
                     Protocol::AppendBulk(reply, "directory"); Protocol::AppendMapHeader(reply, 4U); flags(status.directory);
-                    Protocol::AppendBulk(reply, "tables"); Protocol::AppendArrayHeader(reply, status.tables.size());
-                    for (const auto& [name, features] : status.tables) {
-                        Protocol::AppendMapHeader(reply, 5U);
-                        Protocol::AppendBulk(reply, "name"); Protocol::AppendBulk(reply, name); flags(features);
+                    // Tables whose features can be read; `fenced` lists the others.
+                    Protocol::AppendBulk(reply, "tables"); Protocol::AppendArrayHeader(reply, readable);
+                    for (const auto& table : status.tables) {
+                        if (!table.features) continue;
+                        Protocol::AppendMapHeader(reply, 7U);
+                        Protocol::AppendBulk(reply, "name"); Protocol::AppendBulk(reply, table.name);
+                        Protocol::AppendBulk(reply, "state"); Protocol::AppendBulk(reply, table.fence ? "fenced" : "ok");
+                        Protocol::AppendBulk(reply, "reason");
+                        if (table.fence) Protocol::AppendBulk(reply, *table.fence); else Protocol::AppendNull(reply);
+                        flags(*table.features);
+                    }
+                    Protocol::AppendBulk(reply, "fenced"); Protocol::AppendArrayHeader(reply, status.tables.size() - readable);
+                    for (const auto& table : status.tables) {
+                        if (table.features) continue;
+                        if (!table.fence) throw std::logic_error("a table without features must be fenced");
+                        Protocol::AppendMapHeader(reply, 2U);
+                        Protocol::AppendBulk(reply, "name"); Protocol::AppendBulk(reply, table.name);
+                        Protocol::AppendBulk(reply, "reason"); Protocol::AppendBulk(reply, *table.fence);
                     }
                     Protocol::AppendBulk(reply, "activation_pending"); Protocol::AppendBoolean(reply, status.activation_pending);
                     return reply;

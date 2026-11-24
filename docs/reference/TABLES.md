@@ -125,6 +125,7 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 - SWAP TABLES: `OK` once each name serves the other table.
 - SHOW TABLES: accessible table names, fenced tables included.
 - DESCRIBE: schema version, column definitions, geometry, options, table epoch, completed revision, dimensions, and chunk columns; a fenced table adds `fenced` with its reason.
+- SHOW STATUS: `version`, the `server_version` HELLO reports, `uptime_ms` since the server started, `read_only`, `directory` features, `tables`, `fenced`, and `activation_pending`; each `tables` entry has `name`, `state`, `reason`, `enabled`, `compat`, `ro_compat`, and `incompat`, and each `fenced` entry has `name` and `reason`.
 
 The `version` field describes the schema; `revision` describes the completed commit frontier within `epoch`.
 The frontier can include terminal gaps from abandoned reservations and recovery.
@@ -202,6 +203,8 @@ See [Server flags](../SERVER_FLAGS.md#table-geometry).
 ## Feature activation
 
 `SHOW STATUS` requires MONITOR or ADMIN on `*` and reports recorded directory and table features.
+`tables` lists the tables whose features can be read; a table's `state` is `ok`, or `fenced` with the fence reason.
+`fenced` lists, with the fence reason, the fenced tables whose features cannot be read: those whose store is not open or whose feed cleanup failed.
 Its protected snapshot refuses unhealthy serving state instead of guessing whether activation completed.
 `ENABLE FEATURE 'name'` requires ADMIN on `*` and returns OK for an already enabled feature.
 

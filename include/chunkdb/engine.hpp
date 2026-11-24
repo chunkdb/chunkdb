@@ -48,7 +48,7 @@ enum class ServerRight : std::uint8_t;
 // Deterministic command interleavings, following the feed hooks.
 struct CommandEngineTestHook {
     enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted, kBeforeTxnBudgetReclaim,
-        kAfterRestoreProgress, kAfterRestoreUserRead };
+        kAfterRestoreProgress, kAfterRestoreUserRead, kBeforeTableStatsListing };
     virtual ~CommandEngineTestHook() = default;
     virtual void Run(Point point, std::string_view table) = 0;
 };
@@ -366,6 +366,8 @@ class CommandEngine {
     EngineConfig config_;
     std::shared_ptr<TableCatalog> catalog_;
     std::shared_ptr<MetricsRegistry> metrics_;
+    // SHOW STATUS reports the time since.
+    const std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
     std::mutex auth_failures_mutex_;
     std::unordered_map<std::string, IpAuthFailureState> auth_failures_by_ip_;
     // The open transactions and their bytes.
