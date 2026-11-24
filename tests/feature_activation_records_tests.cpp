@@ -104,8 +104,8 @@ void RuntimeActivation() {
         const auto status = catalog.FeatureStatus();
         assert(!status.activation_pending && status.tables.size() == 2U);
         assert((status.directory.incompat & kFeatureSlotFilters) != 0U);
-        for (const auto& [name, features, fence] : status.tables) {
-            assert(features && !fence);
+        for (const auto& [name, features, fence, frozen] : status.tables) {
+            assert(features && !fence && !frozen);
             const auto& flags = *features;
             assert((flags.incompat & kFeatureSlotFilters) != 0U);
             assert((flags.compat & (1U << 29U)) != 0U);
