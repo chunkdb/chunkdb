@@ -117,6 +117,75 @@ void RenameRefusesStaleVersions() {
     RefusesStaleVersion(catalog, "u", old_name_stale);
 }
 
+// Writes block (8, 0) of `name` until chunk (4, 0) has `version`; the clock
+// gives one version per write.
+void WriteToVersion(TableCatalog& catalog, std::string_view name, std::uint64_t version) {
+    auto lease = catalog.Require(name)->Acquire();
+    auto& store = lease->store();
+    while (store.GetChunkVersion(4, 0) < version) store.SetBlockBits(8, 0, "01010101");
+    assert(store.GetChunkVersion(4, 0) == version);
+}
+
+// Creates `u`, an unrelated table whose chunk (4, 0) has the version that a
+// client read from chunk (4, 0) of `t`, with other data; returns that version.
+std::uint64_t SameVersionOtherData(TableCatalog& catalog) {
+    const auto version = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
+    (void)catalog.Create("u", SourceGeometry(), catalog.default_options());
+    WriteToVersion(catalog, "u", version);
+    assert(catalog.Require("u")->Acquire()->store().GetBlockBits(8, 0) !=
+           catalog.Require("t")->Acquire()->store().GetBlockBits(8, 0));
+    return version;
+}
+
+// A write conditioned on `stale`, a version a client read under `name` from
+// the table that held the name before, is refused by the table that holds it
+// now, also where one of its existing chunks carries the same number.
+void RefusesExistingStaleVersion(TableCatalog& catalog, std::string_view name, std::uint64_t stale) {
+    auto lease = catalog.Require(name)->Acquire();
+    auto& store = lease->store();
+    const auto bits = store.GetBlockBits(8, 0);
+    assert(!store.UnsetBlock(8, 0, stale).ok);
+    assert(store.GetBlockBits(8, 0) == bits);
+}
+
+// The backup of `u` at `source.root / "other"`, restored under `name`.
+TableRestoreRequest OtherRequest(const Source& source, std::string name) {
+    return TableRestoreRequest{.backup = source.root / "other", .table = "u", .name = std::move(name)};
+}
+
+// RESTORE ... AS u_restored and SWAP TABLES t, u_restored: `t` then reaches a
+// table whose chunk (4, 0) has the version a client read from `t`.
+void SwapRefusesExistingStaleVersion() {
+    Source source;
+    TableCatalog catalog(source.Config());
+    const auto stale = SameVersionOtherData(catalog);
+    (void)catalog.BackupTo(source.root / "other", {});
+    (void)catalog.RestoreTable(OtherRequest(source, "u_restored"));
+    catalog.SwapTables("t", "u_restored");
+    RefusesExistingStaleVersion(catalog, "t", stale);
+}
+
+// DROP TABLE t and RESTORE ... AS t from a backup of another table.
+void RestoreAfterDropRefusesExistingStaleVersion() {
+    Source source;
+    TableCatalog catalog(source.Config());
+    const auto stale = SameVersionOtherData(catalog);
+    (void)catalog.BackupTo(source.root / "other", {});
+    catalog.Drop("t");
+    (void)catalog.RestoreTable(OtherRequest(source, "t"));
+    RefusesExistingStaleVersion(catalog, "t", stale);
+}
+
+// DROP TABLE t and ALTER TABLE u RENAME TO t.
+void RenameOntoDroppedRefusesExistingStaleVersion() {
+    Source source;
+    TableCatalog catalog(source.Config());
+    const auto stale = SameVersionOtherData(catalog);
+    catalog.Drop("t");
+    catalog.RenameTable("u", "t", nullptr);
+    RefusesExistingStaleVersion(catalog, "t", stale);
+}
+
 void LeavesNothingAfterRefusal(const Source& source, TableCatalog& catalog) {
     assert(Entries(source.data / ".chunkdb.staging") == 0U);
     assert(Entries(source.data / "tables") == 1U && catalog.TableCount() == 1U);
@@ -701,5 +770,9 @@ int main() {
     } else {
         SwapRefusedOnWindows();
     }
+    // Existing chunks of the table that takes a name keep their versions.
+    RestoreAfterDropRefusesExistingStaleVersion();
+    RenameOntoDroppedRefusesExistingStaleVersion();
+    if (kAtomicExchange) SwapRefusesExistingStaleVersion();
     std::cout << "restore table tests passed\n";
 }
