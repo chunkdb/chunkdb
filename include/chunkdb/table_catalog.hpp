@@ -293,7 +293,7 @@ class Table : public std::enable_shared_from_this<Table> {
     [[nodiscard]] std::unique_ptr<FeedSubscription> SubscribeFeed(const FeedOptions& options, bool slot);
     void ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed);
     [[nodiscard]] std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> ClaimFeedSlot(std::string_view name, const FeedOptions& options,
-        bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner);
+        bool takeover, std::string user, const std::function<void(std::string_view)>& authorize_owner, std::string peer = {});
     [[nodiscard]] FeedSlot ReadClaimedFeedSlot(const std::shared_ptr<FeedSlotClaim>& claim);
     [[nodiscard]] std::vector<FeedSlot> ListFeedSlots(const Lease& lease, bool include_lost);
     // Records `owner` for the claimed slot when it has none.

@@ -1,4 +1,7 @@
-#include "docs_check.hpp"
+|| !s.Literal("  attached = ") ||
+        !(s.Literal("true") || s.Literal("false")) || !s.Newline() || !s.Literal("  peer = ") || !s.RestOfLine() ||
+        !s.Newline() || !s.Literal("  last_ack_ms = ") || !(s.Digits() || s.Literal("NULL")) || !s.Newline() ||
+        !s.Literal("  lost = ") ||#include "docs_check.hpp"
 #include "listener_port_test_utils.hpp"
 
 #include <algorithm>
@@ -313,7 +316,9 @@ Span SlotEpoch(const std::string& text, std::size_t line) {
     if (!s.Newline() || !s.Literal("  acked = ") || !s.Digits() || !s.Newline() || !s.Literal("  revision = ") ||
         !s.Digits() || !s.Newline() || !s.Literal("  lag_revisions = ") || !s.Digits() || !s.Newline() ||
         !s.Literal("  retained_bytes = ") || !s.Digits() || !s.Newline() || !s.Literal("  attached = ") ||
-        !(s.Literal("true") || s.Literal("false")) || !s.Newline() || !s.Literal("  lost = ") ||
+        !(s.Literal("true") || s.Literal("false")) || !s.Newline() || !s.Literal("  peer = ") || !s.RestOfLine() ||
+        !s.Newline() || !s.Literal("  last_ack_ms = ") || !(s.Digits() || s.Literal("NULL")) || !s.Newline() ||
+        !s.Literal("  lost = ") ||
         !(s.Literal("true") || s.Literal("false")) || !s.Newline() || !s.Literal("  lost_reason = ") ||
         !s.RestOfLine() || !s.Newline() || !s.Literal("  filters:") || !s.Newline()) {
         return std::nullopt;

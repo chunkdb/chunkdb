@@ -527,6 +527,17 @@ void TakeoverRights(bool tls) {
     Client old(harness.port, tls); old.Login("one", "pw");
     (void)Start(old.Command("WATCH t SLOT 'consumer'"));
     Client other(harness.port, tls); other.Login("two", "pw");
+    // SHOW SLOTS names the watch's client to its user and to ADMIN on *, as SHOW CONNECTIONS does.
+    const auto peer = [](Client& viewer) {
+        const auto listed = viewer.Command("SHOW SLOTS ON t");
+        return Field(Slot(listed, "t", "consumer"), "peer");
+    };
+    const auto old_peer = "[127.0.0.1]:" + std::to_string(old.LocalPort());
+    assert(peer(other).type == '_' && peer(*admin).value == old_peer);
+    {
+        Client mine(harness.port, tls); mine.Login("one", "pw");
+        assert(peer(mine).value == old_peer);
+    }
     Error(other.Command("WATCH t SLOT 'consumer' TAKEOVER"), "PERMISSION_DENIED");
     admin->Ok("GRANT ADMIN ON t TO two"); // Table ADMIN is deliberately insufficient.
     Error(other.Command("WATCH t SLOT 'consumer' TAKEOVER"), "PERMISSION_DENIED");
@@ -547,9 +558,12 @@ void Lifecycle(bool tls) {
     const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
     auto listed = writer->Command("SHOW SLOTS ON t");
     const auto& slot = Slot(listed, "t", "consumer");
-    assert(slot.items.size() == 24U && Field(slot, "epoch").value == initial.first);
+    assert(slot.items.size() == 28U && Field(slot, "epoch").value == initial.first);
     assert(Number(Field(slot, "acked")) == initial.second && !Boolean(Field(slot, "lost")));
     assert(Boolean(Field(slot, "attached")));
+    // The watch's client, which has acknowledged nothing yet.
+    assert(Field(slot, "peer").type == '$' && Field(slot, "peer").value == "[127.0.0.1]:" + std::to_string(watch->LocalPort()));
+    assert(Field(slot, "last_ack_ms").type == '_');
     assert(Number(Field(slot, "lag_revisions")) == Number(Field(slot, "revision")) - initial.second);
     auto second = harness.Connect();
     Error(second->Command("WATCH t SLOT 'consumer'"), "SLOT_BUSY");
@@ -561,10 +575,18 @@ void Lifecycle(bool tls) {
     assert(Change(NextChange(*watch)) == next); // Invalid ACK does not close the stream.
     watch->Line("ACK " + std::to_string(next));
     WaitAck(*writer, "t", "consumer", next); // No subsequent traffic on the watch.
+    const auto acked_list = writer->Command("SHOW SLOTS ON t");
+    const auto& acked = Slot(acked_list, "t", "consumer");
+    assert(Field(acked, "last_ack_ms").type == ':' && Number(Field(acked, "last_ack_ms")) < 60'000U);
     assert(!watch->Ready(150ms)); // Successful ACK has no reply.
     watch->Send("UNWATCH\r\nPING\r\n");
     const auto unwatch = watch->Read(); assert(unwatch.type == '+' && unwatch.value == "OK");
     const auto pong = watch->Read(); assert(pong.type == '+' && pong.value == "PONG");
+    // Without a watch the slot has neither.
+    const auto detached_list = writer->Command("SHOW SLOTS ON t");
+    const auto& detached = Slot(detached_list, "t", "consumer");
+    assert(!Boolean(Field(detached, "attached")) && Field(detached, "peer").type == '_' &&
+        Field(detached, "last_ack_ms").type == '_');
     assert(Start(second->Command("WATCH t SLOT 'consumer'")) == std::make_pair(initial.first, next));
     const auto third = Set(*writer, 9);
     assert(Change(NextChange(*second)) == third);

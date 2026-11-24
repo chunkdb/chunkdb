@@ -21,7 +21,7 @@ bool Charge(std::atomic<std::size_t>& counter, std::size_t bytes, std::size_t li
 }  // namespace
 std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     std::string name, FeedOptions options, bool takeover, std::string user,
-    const std::function<void(std::string_view)>& authorize_owner) {
+    const std::function<void(std::string_view)>& authorize_owner, std::string peer) {
     if (options.areas.size() > kMaxFeedAreas) throw std::invalid_argument("a watch takes at most 64 areas");
     for (const auto& area : options.areas) {
         if (area.first.x > area.last.x || area.first.y > area.last.y)
@@ -35,7 +35,7 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     if (options.ack_timeout_ms && *options.ack_timeout_ms == 0U)
         throw std::invalid_argument("ACK TIMEOUT must be positive");
     if (options.buffer_bytes && *options.buffer_bytes == 0U) throw std::invalid_argument("feed buffer must be positive");
-    auto [slot, claim] = table->ClaimFeedSlot(name, options, takeover, std::move(user), authorize_owner);
+    auto [slot, claim] = table->ClaimFeedSlot(name, options, takeover, std::move(user), authorize_owner, std::move(peer));
     options.areas.clear();
     if (slot.filters.area) options.areas.push_back(*slot.filters.area);
     options.column_ids = slot.filters.column_ids;
@@ -146,13 +146,16 @@ SlotWatch::AckResult SlotWatch::Ack(std::uint64_t revision) {
     std::lock_guard lock(mutex_);
     if (takeover_ || ack_expired_ || (finished_ && !cancelled_ && !unwatch_)) return AckResult::kTerminal;
     if (finished_ || cancelled_ || unwatch_) throw std::invalid_argument("slot watch has ended");
-    if (AckDeadlineExpiredLocked(std::chrono::steady_clock::now())) return AckResult::kTerminal;
+    const auto now = std::chrono::steady_clock::now();
+    if (AckDeadlineExpiredLocked(now)) return AckResult::kTerminal;
     if (revision > sent_ || revision < acknowledged_) throw std::invalid_argument("ACK decreases or exceeds the last revision sent");
     for (const auto& receipt : receipts_) {
         if (receipt.revision > revision) break;
         if (!receipt.sent) throw std::logic_error("ACK crossed an unsent mutation receipt");
     }
     acknowledged_ = revision;
+    // Finish resets claim_ outside mutex_; generation_ stays.
+    if (const auto claim = generation_.lock()) claim->last_ack.store(now.time_since_epoch().count(), std::memory_order_release);
     while (!receipts_.empty() && receipts_.front().revision <= revision) {
         receipts_.pop_front();
         table_bytes_->fetch_sub(kReceiptBytes, std::memory_order_acq_rel);
