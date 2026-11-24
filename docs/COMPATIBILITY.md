@@ -33,6 +33,7 @@ An older binary is not required to open data that uses a newer feature it does n
 
 Upgrade the binary before enabling such a feature.
 Use `ENABLE FEATURE '<name>'` with ADMIN on `*`; activation never clears existing bits.
+ENABLE FEATURE refuses any other feature while the directory lacks `feature_activation`; every directory a 2.0 build creates has it.
 A durable activation decision finishes during writer startup; read-only opening refuses a pending decision.
 An uncertain activation publication returns OUTCOME_UNKNOWN and fences serving until recovery.
 `SHOW STATUS` reports recorded directory and table masks, known enabled names, and protected activation state.
@@ -49,7 +50,7 @@ Later 2.x servers still open valid 2.0 data.
 
 A reader or writer must support every recorded incompatibility bit, even when its owned records are absent.
 To use a binary lacking a feature, restore the whole consistent backup identified above.
-Use a restore tool that supports that backup's recorded features.
+Use a restore tool that supports that backup's recorded features; restore refuses backed-up tables without `table_lineage`, which every table a 2.0 build creates has.
 Dropping records or manually clearing masks does not establish a supported rollback.
 New directories already enable these initial features; an older binary must support their masks to open them.
 
