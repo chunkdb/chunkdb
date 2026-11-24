@@ -77,6 +77,9 @@ A scan at a READ ONLY snapshot first waits for the completed revision to cover t
 Ordinary writes update membership only on population transitions, with no index I/O for updates to an already populated chunk.
 A new coordinate reserves its in-memory map node before the write can commit, and ordinary writes publish no persistent live hint before their commit decision.
 Each stable coordinate node carries atomic producing identity and population state; writes to an existing node publish those fields before completing their producer bound without taking the ordered-map mutex.
+The index groups consecutive coordinates into runs of up to 64, each with an upper bound of its revisions; a write raises its run's bound after storing its revision, with one compare-and-swap and no lock.
+A page of changes SINCE a revision and a page at a READ ONLY snapshot skip each run whose bound is not above that revision, so a page visits its own rows, the coordinates of changed runs it crosses, and one step per unchanged run.
+A split that moves a coordinate to a new run stores the move before it reads the revision, and a write stores its revision before it reads its run, both sequentially consistent, so the new run's bound covers every completed write.
 These atomics are candidate hints, not a coherent returned chunk image; forms, producing revision and time are revalidated together under the chunk lock or obtained from a checked retained tombstone.
 `SCAN SINCE` uses only the node's acquire-loaded producing revision for its lower-bound prefilter and never excludes an entry because of its population flag or a revision above the captured completed frontier.
 The completed-frontier capture acquires the publication ordering of every producer it covers, so a node revision at or below the promised position cannot remain unpublished to that scan.

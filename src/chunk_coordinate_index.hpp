@@ -1,6 +1,7 @@
 #pragma once
 
 #include <atomic>
+#include <deque>
 #include <filesystem>
 #include <functional>
 #include <map>
@@ -31,11 +32,24 @@ class CoordinatePublicationTestHook {
 };
 void SetCoordinatePublicationTestHook(CoordinatePublicationTestHook* hook) noexcept;
 
+// Consecutive coordinates of the index with an upper bound of their
+// revisions, so a page of changes after a revision skips an unchanged run
+// whole instead of visiting each coordinate in it.
+struct CoordinateRun {
+    std::atomic<std::uint64_t> maximum_revision{0U};
+    // The owning index mutex protects the boundary and the count.
+    ChunkCoord first{};
+    std::size_t nodes = 0U;
+};
+
 struct ChunkCoordinateNode {
     std::atomic<std::uint64_t> revision{0U};
     std::atomic<bool> populated{false};
     // The owning index mutex protects this independently checked boundary.
     std::optional<ChunkIndexRecord> retained_empty;
+    // Set and moved under the owning index mutex; a writer reads it after
+    // storing the revision (sequentially consistent on both sides).
+    std::atomic<CoordinateRun*> run{nullptr};
 };
 
 class ChunkCoordinateIndex;
@@ -125,7 +139,24 @@ class ChunkCoordinateIndex {
         std::uint64_t observed_bytes = 0U;
         bool installed_replacement = false;
     };
+    using Coordinates = std::map<ChunkCoord, ChunkCoordinateNode>;
+    using Runs = std::map<ChunkCoord, CoordinateRun*>;
     void Check() const;
+    // Run upkeep, under mutex_ once requests may use the index. A run splits
+    // above kRunNodes; ReserveRunSplits makes the next `splits` splits
+    // allocation-free, so attaching a node never throws.
+    void ReserveRunSplits(std::size_t splits);
+    void AttachRun(Coordinates::iterator at) noexcept;
+    void DetachRun(ChunkCoordinateNode& node) noexcept;
+    void SplitRun(Runs::iterator run) noexcept;
+    // Under mutex_: visits in order, from `from` (inclusive) or the start, each
+    // coordinate whose revision exceeds `since`, skipping runs whose maximum
+    // does not. Stops before a coordinate `visit` refuses, or once `budget`
+    // runs and coordinates are examined, returning where to resume
+    // (inclusive); returns nothing at the end.
+    template <class Visit>
+    std::optional<ChunkCoord> WalkChanged(const std::optional<ChunkCoord>& from, bool inclusive,
+        std::uint64_t since, std::size_t budget, Visit&& visit) const;
     void ReleaseReservation(CoordinateReservation& reservation) noexcept;
     void PublishReservation(CoordinateReservation& reservation, bool populated, std::uint64_t revision) noexcept;
     void PublishInventory(const IndexInventoryHeader& header, std::span<const IndexInventoryEntry> entries);
@@ -138,8 +169,15 @@ class ChunkCoordinateIndex {
     StoreId table_id_;
     bool read_only_;
     mutable std::mutex mutex_;
-    std::map<ChunkCoord, ChunkCoordinateNode> coordinates_;
+    Coordinates coordinates_;
     std::set<ChunkCoord> populated_;
+    // Lower boundary -> run; the first run starts at the lowest coordinate
+    // and is never removed. Runs are reused, not freed: a writer may still
+    // raise the maximum of a run its node just left, which only widens it.
+    Runs runs_;
+    std::deque<CoordinateRun> run_storage_;
+    std::vector<CoordinateRun*> free_runs_;
+    std::vector<Runs::node_type> spare_run_entries_;
     std::mutex publication_mutex_;
     IndexInventoryHeader inventory_;
     std::map<LargeChunkCoord, Shard> shards_;

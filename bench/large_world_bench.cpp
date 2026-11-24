@@ -34,6 +34,12 @@
 // cache merge became large-chunk-scoped, a warm cache made every page slower
 // than a cold one (issue #26).
 //
+// `--scenario scan-pages` times each SCAN CHUNKS page instead of the whole
+// walk: the current chunks, the chunks changed SINCE a position after about
+// one chunk in `--changed-every` was rewritten, the chunks WITH DATA, and the
+// chunks as of a READ ONLY snapshot. Run it at two world sizes; a page's cost
+// follows the page when the per-page and per-entry figures stay flat.
+//
 // A third scenario (`--scenario evict-load`) measures cold loads of chunks
 // while background maintenance evicts and checkpoints other chunks of the
 // same large chunks, and reports the load latency percentiles (issue #143).
@@ -60,6 +66,7 @@
 #include <iostream>
 #include <memory>
 #include <numeric>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -256,12 +263,13 @@ SyncProbe ProbeDurableSync(const std::filesystem::path& dir) {
 // Arguments.
 // ---------------------------------------------------------------------------
 
-enum class Scenario { kSparseWrites, kChunkScan, kEvictLoad, kFlush };
+enum class Scenario { kSparseWrites, kChunkScan, kScanPages, kEvictLoad, kFlush };
 
 struct Args {
     Scenario scenario = Scenario::kSparseWrites;
     std::string scenario_name = "sparse-writes";
     std::size_t scan_limit = 1024;
+    std::size_t changed_every = 64;
     std::int64_t grid_width = 1024;
     std::size_t chunks = 5000;
     std::size_t cache = 16384;
@@ -278,14 +286,18 @@ struct Args {
 
 constexpr char kUsage[] =
     "Usage: chunkdb_large_world_bench [options]\n"
-    "  --scenario S     sparse-writes | chunkscan | evict-load | flush (default sparse-writes)\n"
+    "  --scenario S     sparse-writes | chunkscan | scan-pages | evict-load | flush\n"
+    "                   (default sparse-writes)\n"
     "  --chunks N       sparse-writes: fresh chunks written inside the measured window\n"
-    "                   chunkscan: chunks the scanned world holds (default 5000)\n"
+    "                   chunkscan, scan-pages: chunks the scanned world holds\n"
+    "                   (default 5000)\n"
     "                   evict-load: chunks the world holds, rounded up to whole\n"
     "                   large chunks; half are evicted, half are loaded\n"
     "                   flush: dirty chunks the barrier and the close sync; keep\n"
     "                   --cache at least N so they stay resident\n"
-    "  --scan-limit N   chunkscan: page size, 1..1024 (default 1024)\n"
+    "  --scan-limit N   chunkscan, scan-pages: page size, 1..1024 (default 1024)\n"
+    "  --changed-every N scan-pages: rewrite about one chunk in N before the\n"
+    "                   SINCE pass (default 64)\n"
     "  --grid-width N   chunks per world row; use a value <= large_chunk_width_chunks\n"
     "                   (8) to measure a world that is one large-chunk column wide\n"
     "                   (default 1024)\n"
@@ -329,6 +341,8 @@ Args ParseArgs(int argc, char** argv) {
                 args.scenario = Scenario::kSparseWrites;
             } else if (value == "chunkscan") {
                 args.scenario = Scenario::kChunkScan;
+            } else if (value == "scan-pages") {
+                args.scenario = Scenario::kScanPages;
             } else if (value == "evict-load") {
                 args.scenario = Scenario::kEvictLoad;
             } else if (value == "flush") {
@@ -342,6 +356,8 @@ Args ParseArgs(int argc, char** argv) {
             if (args.scan_limit > 1024) {
                 throw std::invalid_argument("--scan-limit must be between 1 and 1024");
             }
+        } else if (arg == "--changed-every") {
+            args.changed_every = parse_size(require_value("--changed-every"), "--changed-every");
         } else if (arg == "--grid-width") {
             args.grid_width =
                 static_cast<std::int64_t>(parse_size(require_value("--grid-width"), "--grid-width"));
@@ -593,6 +609,45 @@ struct ScanRepeatResult {
     double warm_over_cold = 0.0;
 };
 
+// Builds the world and puts all of it on disk, so a measurement after
+// reopening really starts from an empty cache. Populating is setup, not a
+// measured quantity: it runs on `--threads` writers and writes
+// `wal_group_commit_updates` blocks per chunk so each chunk's WAL batch is
+// flushed while the writers can still share one snapshot-generation
+// bracket. Doing it single-threaded with one block per chunk pays a
+// separate ~12 ms bracket per chunk at the closing barrier (issue #18) and
+// makes a large world take hours to build.
+double PopulateWorld(const Args& args, const chunkdb::StoreConfig& config) {
+    const std::string bits = "1111000011110000";
+    chunkdb::ChunkStore store(config);
+    const auto populate_started = Clock::now();
+    std::atomic<std::size_t> next_index{0};
+    {
+        std::vector<std::thread> pool;
+        const unsigned writers = args.threads == 0 ? 1U : args.threads;
+        pool.reserve(writers);
+        for (unsigned t = 0; t < writers; ++t) {
+            pool.emplace_back([&]() {
+                for (;;) {
+                    const std::size_t i = next_index.fetch_add(1, std::memory_order_relaxed);
+                    if (i >= args.chunks) {
+                        return;
+                    }
+                    const auto [cx, cy] = ChunkOf(i, args.grid_width);
+                    for (std::int64_t block = 0; block < 8; ++block) {
+                        store.SetBlockBits(cx * 16 + block, cy * 16, bits);
+                    }
+                }
+            });
+        }
+        for (auto& thread : pool) {
+            thread.join();
+        }
+    }
+    store.WalBarrier();
+    return Secs(populate_started, Clock::now());
+}
+
 ScanRepeatResult RunScanRepeat(const Args& args, std::size_t run_index) {
     const std::filesystem::path dir =
         args.data_dir / ("scan-" + std::to_string(run_index));
@@ -604,46 +659,9 @@ ScanRepeatResult RunScanRepeat(const Args& args, std::size_t run_index) {
     ScanRepeatResult result;
     result.run = run_index;
 
-    const std::string bits = "1111000011110000";
     const auto config = BuildStoreConfig(dir, args.cache, args.durability);
 
-    // Build the world and put all of it on disk, so the cold measurement
-    // really starts from an empty cache. Populating is setup, not a measured
-    // quantity: it runs on `--threads` writers and writes
-    // `wal_group_commit_updates` blocks per chunk so each chunk's WAL batch is
-    // flushed while the writers can still share one snapshot-generation
-    // bracket. Doing it single-threaded with one block per chunk pays a
-    // separate ~12 ms bracket per chunk at the closing barrier (issue #18) and
-    // makes a large world take hours to build.
-    {
-        chunkdb::ChunkStore store(config);
-        const auto populate_started = Clock::now();
-        std::atomic<std::size_t> next_index{0};
-        {
-            std::vector<std::thread> pool;
-            const unsigned writers = args.threads == 0 ? 1U : args.threads;
-            pool.reserve(writers);
-            for (unsigned t = 0; t < writers; ++t) {
-                pool.emplace_back([&]() {
-                    for (;;) {
-                        const std::size_t i = next_index.fetch_add(1, std::memory_order_relaxed);
-                        if (i >= args.chunks) {
-                            return;
-                        }
-                        const auto [cx, cy] = ChunkOf(i, args.grid_width);
-                        for (std::int64_t block = 0; block < 8; ++block) {
-                            store.SetBlockBits(cx * 16 + block, cy * 16, bits);
-                        }
-                    }
-                });
-            }
-            for (auto& thread : pool) {
-                thread.join();
-            }
-        }
-        store.WalBarrier();
-        result.populate_seconds = Secs(populate_started, Clock::now());
-    }
+    result.populate_seconds = PopulateWorld(args, config);
 
     chunkdb::ChunkStore store(config);
     // CHUNKSCAN never inserts chunks into the cache, so this stays cold.
@@ -694,6 +712,115 @@ double PercentileUs(const std::vector<double>& sorted, double fraction) {
     }
     const auto rank = static_cast<std::size_t>(std::ceil(fraction * static_cast<double>(sorted.size())));
     return sorted[std::clamp<std::size_t>(rank, 1, sorted.size()) - 1];
+}
+
+// ---------------------------------------------------------------------------
+// Scenario: the latency of each SCAN CHUNKS page (issue #26). A page's cost
+// should follow the page, not the world: the per-page and per-entry figures
+// stay flat from a small world to a large one.
+// ---------------------------------------------------------------------------
+
+struct PagePass {
+    std::string name;
+    std::size_t pages = 0;
+    std::size_t entries = 0;
+    double seconds = 0.0;
+    double first_ms = 0.0;
+    double p50_ms = 0.0;
+    double p99_ms = 0.0;
+    double max_ms = 0.0;
+    double us_per_entry = 0.0;
+};
+
+// Walks every page with the cursor contract (`after`), timing each call.
+template <class NextPage>
+PagePass TimePages(std::string name, NextPage&& next_page) {
+    PagePass pass;
+    pass.name = std::move(name);
+    std::vector<double> page_ms;
+    bool has_cursor = false;
+    chunkdb::ChunkCoord cursor{};
+    for (;;) {
+        const auto started = Clock::now();
+        const chunkdb::ChunkIdentityScanPage page = next_page(has_cursor, cursor);
+        page_ms.push_back(Secs(started, Clock::now()) * 1000.0);
+        pass.entries += page.entries.size();
+        if (!page.has_more) {
+            break;
+        }
+        has_cursor = true;
+        cursor = *page.after;
+    }
+    pass.pages = page_ms.size();
+    pass.seconds = std::accumulate(page_ms.begin(), page_ms.end(), 0.0) / 1000.0;
+    pass.first_ms = page_ms.front();
+    std::sort(page_ms.begin(), page_ms.end());
+    pass.p50_ms = PercentileUs(page_ms, 0.50);
+    pass.p99_ms = PercentileUs(page_ms, 0.99);
+    pass.max_ms = page_ms.back();
+    pass.us_per_entry = pass.entries == 0 ? 0.0 : pass.seconds * 1e6 / static_cast<double>(pass.entries);
+    return pass;
+}
+
+struct ScanPagesResult {
+    std::size_t run = 0;
+    double populate_seconds = 0.0;
+    std::size_t changed = 0;
+    std::vector<PagePass> passes;
+};
+
+// Passes, in order on one store reopened after populating:
+//   current   the populated chunks, cold cache;
+//   since     after rewriting about one chunk in --changed-every, spread over
+//             the world: only those (SINCE the position before the rewrites);
+//   with-data the populated chunks with their data;
+//   snapshot  the populated chunks as of a read-only transaction snapshot.
+ScanPagesResult RunScanPagesRepeat(const Args& args, std::size_t run_index) {
+    const std::filesystem::path dir = args.data_dir / ("scan-pages-" + std::to_string(run_index));
+    std::error_code ec;
+    std::filesystem::remove_all(dir, ec);
+    std::filesystem::create_directories(dir, ec);
+
+    ScanPagesResult result;
+    result.run = run_index;
+    const auto config = BuildStoreConfig(dir, args.cache, args.durability);
+    result.populate_seconds = PopulateWorld(args, config);
+
+    chunkdb::ChunkStore store(config);
+    const auto limit = args.scan_limit;
+    result.passes.push_back(TimePages("current", [&](bool has_cursor, chunkdb::ChunkCoord cursor) {
+        return store.ScanChunkIdentities(has_cursor, cursor, limit);
+    }));
+
+    const auto position = store.ScanChunkIdentities(false, {}, 1).position;
+    if (!position) {
+        throw std::runtime_error("scan returned no position");
+    }
+    const std::string bits = "0000111100001111";
+    for (std::size_t i = 0; i < args.chunks; ++i) {
+        if (chunkdb::detail::MixCoordinateWord(i) % args.changed_every != 0) {
+            continue;
+        }
+        const auto [cx, cy] = ChunkOf(i, args.grid_width);
+        store.SetBlockBits(cx * 16 + 8, cy * 16, bits);
+        ++result.changed;
+    }
+    result.passes.push_back(TimePages("since", [&](bool has_cursor, chunkdb::ChunkCoord cursor) {
+        return store.ScanChunkIdentities(has_cursor, cursor, limit, *position);
+    }));
+    result.passes.push_back(TimePages("with-data", [&](bool has_cursor, chunkdb::ChunkCoord cursor) {
+        return store.ScanChunkIdentities(has_cursor, cursor, limit, std::nullopt, true);
+    }));
+    const auto snapshot = store.BeginTxnSnapshot(std::chrono::hours(1));
+    result.passes.push_back(TimePages("snapshot", [&](bool has_cursor, chunkdb::ChunkCoord cursor) {
+        return store.ScanChunkIdentitiesAt(*snapshot, has_cursor, cursor, limit);
+    }));
+    store.EndTxnSnapshot(*snapshot);
+
+    if (!args.keep_data) {
+        std::filesystem::remove_all(dir, ec);
+    }
+    return result;
 }
 
 struct EvictLoadResult {
@@ -1146,6 +1273,79 @@ int main(int argc, char** argv) {
                           << " avg_close_s=" << std::setprecision(3) << Mean(close_values)
                           << " stddev_close_s=" << std::setprecision(3) << StdDev(close_values)
                           << '\n' << std::flush;
+            }
+            if (!args.keep_data) {
+                std::filesystem::remove_all(args.data_dir, ec);
+            }
+            return 0;
+        }
+
+        if (args.scenario == Scenario::kScanPages) {
+            if (!args.csv) {
+                std::cout << "profile scenario=scan-pages"
+                          << " geometry=8x8x16x16x16"
+                          << " durability=" << args.durability_name
+                          << " max_loaded_chunks=" << args.cache
+                          << " world_chunks=" << args.chunks
+                          << " grid_width=" << args.grid_width
+                          << " scan_limit=" << args.scan_limit
+                          << " changed_every=" << args.changed_every
+                          << " repeats=" << args.repeats
+                          << '\n'
+                          << "host data_dir=" << args.data_dir
+                          << " fs=" << fs_name
+                          << " durable_sync=" << sync_probe.kind
+                          << '\n' << std::flush;
+            } else {
+                std::cout << "run,scenario,world_chunks,scan_limit,changed,pass,pages,entries,total_s,"
+                             "first_page_ms,p50_page_ms,p99_page_ms,max_page_ms,us_per_entry,fs\n"
+                          << std::flush;
+            }
+            std::vector<std::string> names;
+            std::vector<std::vector<double>> p50s, p99s, per_entry;
+            for (std::size_t run = 1; run <= args.repeats; ++run) {
+                const ScanPagesResult r = RunScanPagesRepeat(args, run);
+                if (!args.csv) {
+                    std::cout << "run=" << r.run << " populate_s=" << std::fixed << std::setprecision(2)
+                              << r.populate_seconds << " changed=" << r.changed << '\n';
+                }
+                for (std::size_t at = 0; at < r.passes.size(); ++at) {
+                    const auto& pass = r.passes[at];
+                    if (names.size() <= at) {
+                        names.push_back(pass.name);
+                        p50s.emplace_back();
+                        p99s.emplace_back();
+                        per_entry.emplace_back();
+                    }
+                    p50s[at].push_back(pass.p50_ms);
+                    p99s[at].push_back(pass.p99_ms);
+                    per_entry[at].push_back(pass.us_per_entry);
+                    if (args.csv) {
+                        std::cout << r.run << ',' << args.scenario_name << ',' << args.chunks << ','
+                                  << args.scan_limit << ',' << r.changed << ',' << pass.name << ','
+                                  << pass.pages << ',' << pass.entries << ',' << std::fixed
+                                  << std::setprecision(4) << pass.seconds << ',' << std::setprecision(3)
+                                  << pass.first_ms << ',' << pass.p50_ms << ',' << pass.p99_ms << ','
+                                  << pass.max_ms << ',' << pass.us_per_entry << ',' << fs_name << '\n';
+                    } else {
+                        std::cout << "  pass=" << pass.name << " pages=" << pass.pages
+                                  << " entries=" << pass.entries << " total_s=" << std::fixed
+                                  << std::setprecision(3) << pass.seconds << " first_page_ms="
+                                  << pass.first_ms << " p50_page_ms=" << pass.p50_ms
+                                  << " p99_page_ms=" << pass.p99_ms << " max_page_ms=" << pass.max_ms
+                                  << " us_per_entry=" << pass.us_per_entry << '\n';
+                    }
+                }
+                std::cout << std::flush;
+            }
+            if (!args.csv) {
+                for (std::size_t at = 0; at < names.size(); ++at) {
+                    std::cout << "summary scenario=scan-pages pass=" << names[at] << " runs=" << args.repeats
+                              << " avg_p50_page_ms=" << std::fixed << std::setprecision(3) << Mean(p50s[at])
+                              << " avg_p99_page_ms=" << Mean(p99s[at])
+                              << " avg_us_per_entry=" << Mean(per_entry[at]) << '\n';
+                }
+                std::cout << std::flush;
             }
             if (!args.keep_data) {
                 std::filesystem::remove_all(args.data_dir, ec);
