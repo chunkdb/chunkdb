@@ -17,6 +17,7 @@
 
 #include "chunkdb/engine.hpp"
 #include "chunkdb/protocol.hpp"
+#include "aggregate.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunk_form.hpp"
@@ -292,6 +293,29 @@ std::string AreaReplyPrefix(bool with_schema, std::uint64_t schema, bool paged, 
     return prefix;
 }
 
+// The cells `selector` requests, at most `bound`, which is positive.
+[[nodiscard]] std::size_t AreaCellBound(const ChunkAreaSelector& selector, std::size_t bound) {
+    const auto extent = [bound](std::int64_t first, std::int64_t last) {
+        if (last < first) return bound;
+        const auto delta = static_cast<std::uint64_t>(last) - static_cast<std::uint64_t>(first);
+        return delta >= bound ? bound : static_cast<std::size_t>(delta + 1U);
+    };
+    // Each axis multiplies the count, which never exceeds the bound.
+    const auto times = [bound](std::size_t count, std::size_t axis) {
+        return axis > bound / count ? bound : count * axis;
+    };
+    auto count = bound;
+    if (!selector.around) {
+        count = times(extent(selector.first.x, selector.last.x), extent(selector.first.y, selector.last.y));
+        if (selector.dims == 3U) count = times(count, extent(selector.first.z, selector.last.z));
+    } else if (selector.radius >= 0 && static_cast<std::uint64_t>(selector.radius) < bound / 2U) {
+        const auto diameter = static_cast<std::size_t>(selector.radius) * 2U + 1U;
+        count = times(diameter, diameter);
+        if (selector.dims == 3U) count = times(count, diameter);
+    }
+    return count;
+}
+
 std::string AreaReplySuffix(bool paged, bool more, const ChunkCoord& coord, std::uint8_t dims) {
     std::string suffix;
     if (!paged) return suffix;
@@ -548,6 +572,7 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
     return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::SetBlock>(statement) ||
            std::holds_alternative<cql::DeleteBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
            std::holds_alternative<cql::SetChunk>(statement) || std::holds_alternative<cql::GetArea>(statement) ||
+           std::holds_alternative<cql::Aggregate>(statement) ||
            std::holds_alternative<cql::Describe>(statement) || std::holds_alternative<cql::Ping>(statement) ||
            std::holds_alternative<cql::Begin>(statement) ||
            std::holds_alternative<cql::Commit>(statement) || std::holds_alternative<cql::Rollback>(statement);
@@ -560,6 +585,7 @@ void RequireNoVersionInTxn(const SessionState& session, const std::optional<std:
     if (SessionControl(statement)) return true;
     return std::holds_alternative<cql::GetBlock>(statement) || std::holds_alternative<cql::GetChunk>(statement) ||
            std::holds_alternative<cql::GetArea>(statement) || std::holds_alternative<cql::ScanChunks>(statement) ||
+           std::holds_alternative<cql::Aggregate>(statement) ||
            std::holds_alternative<cql::ShowTableStats>(statement) ||
            std::holds_alternative<cql::ShowTables>(statement) || std::holds_alternative<cql::Describe>(statement) ||
            std::holds_alternative<cql::ShowUsers>(statement) || std::holds_alternative<cql::ShowSlots>(statement) ||
@@ -652,6 +678,7 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::GetChunk& get) { info.verb = "GET CHUNK"; info.table = get.table; info.chunks = 1U; },
             [&](const cql::SetChunk& set) { info.verb = "SET CHUNK"; info.table = set.table; info.chunks = 1U; },
             [&](const cql::GetArea& get) { info.verb = "GET AREA"; info.table = get.table; },
+            [&](const cql::Aggregate& aggregate) { info.verb = "AGGREGATE"; info.table = aggregate.table; },
             [&](const cql::ScanChunks& scan) { info.verb = "SCAN CHUNKS"; info.table = scan.table; },
             [&](const cql::CreateTable& create) { table_change(create, "CREATE TABLE", "create_table"); },
             [&](const cql::AlterTable& alter) { table_change(alter, "ALTER TABLE", "alter_table"); },
@@ -1018,7 +1045,7 @@ std::string CommandEngine::ExecuteStatement(
         if (session.transaction != nullptr && !AllowedInTransaction(parsed.statement)) {
             return Protocol::Error(
                 "INVALID_ARGUMENT",
-                "inside a transaction only GET, SET and DELETE statements, DESCRIBE, PING, COMMIT and ROLLBACK run");
+                "inside a transaction only GET, SET and DELETE statements, AGGREGATE, DESCRIBE, PING, COMMIT and ROLLBACK run");
         }
         return std::visit(
             Overloaded{
@@ -1565,26 +1592,8 @@ std::string CommandEngine::ExecuteStatement(
                             "-byte limit; request fewer chunks");
                     };
                     if (reserve_reply) {
-                        const auto bound = static_cast<std::size_t>(limit);
-                        const auto extent = [bound](std::int64_t first, std::int64_t last) {
-                            if (last < first) return bound;
-                            const auto delta = static_cast<std::uint64_t>(last) - static_cast<std::uint64_t>(first);
-                            return delta >= bound ? bound : static_cast<std::size_t>(delta + 1U);
-                        };
-                        // Each axis multiplies the count, which never exceeds
-                        // the chunks one reply may return.
-                        const auto times = [bound](std::size_t count, std::size_t axis) {
-                            return axis > bound / count ? bound : count * axis;
-                        };
-                        auto count = bound;
-                        if (!get.around) {
-                            count = times(extent(get.x0, get.x1), extent(get.y0, get.y1));
-                            if (get.dims == 3U) count = times(count, extent(get.z0, get.z1));
-                        } else if (get.radius >= 0 && static_cast<std::uint64_t>(get.radius) < bound / 2U) {
-                            const auto diameter = static_cast<std::size_t>(get.radius) * 2U + 1U;
-                            count = times(diameter, diameter);
-                            if (get.dims == 3U) count = times(count, diameter);
-                        }
+                        // The chunks one reply may return.
+                        const auto count = AreaCellBound(selector, static_cast<std::size_t>(limit));
                         (*reserve_reply)(ChunkReplyCaptureBound(layout,
                             ChunkReplyStateBytes(store.geometry(), count, 96U, budget)));
                     }
@@ -1666,6 +1675,84 @@ std::string CommandEngine::ExecuteStatement(
                     }
                     reply.text() += suffix;
                     return FinishReply(std::move(reply), continuation);
+                },
+                [&](const cql::Aggregate& aggregate) {
+                    command_class = MetricsRegistry::CommandClass::kRange;
+                    RequireRight(session, aggregate.table, Right::kRead);
+                    const auto lease = session.transaction != nullptr ? TxnLease(session, aggregate.table)
+                                                                      : AcquireNamedTable(session, aggregate.table);
+                    ChunkStore& store = lease.store();
+                    RequireDimensions(store.geometry(), aggregate.dims);
+                    Aggregator aggregator(store.geometry().layout(), aggregate.functions);
+                    const ChunkAreaSelector selector{.dims = aggregate.dims,
+                        .first = {aggregate.x0, aggregate.y0, aggregate.z0},
+                        .last = {aggregate.x1, aggregate.y1, aggregate.z1},
+                        .around = aggregate.around, .radius = aggregate.radius};
+                    const auto& limits = store.query_limits();
+                    const auto max_chunks = limits.max_area_chunks;
+                    if (detail::AreaRequestedExceeds(selector, max_chunks))
+                        throw std::invalid_argument("AGGREGATE covers at most " + std::to_string(max_chunks) +
+                            " chunks; aggregate smaller areas and combine their results");
+                    const auto budget = limits.max_area_response_bytes;
+                    const auto too_large = [budget] {
+                        return std::out_of_range("aggregate response exceeds the " + std::to_string(budget) +
+                            "-byte limit; aggregate a smaller area or fewer functions");
+                    };
+                    // A row is its header, its coordinates and the results;
+                    // a map entry is the function's name and its result.
+                    const std::size_t row_bytes = 8U + 23U * aggregate.dims + aggregator.ResultBytesBound();
+                    std::size_t map_bytes = 8U + aggregator.ResultBytesBound();
+                    for (const auto& function : aggregate.functions)
+                        map_bytes += cql::AggregateFunctionName(function).size() + 8U;
+                    if (reserve_reply) {
+                        const auto rows = AreaCellBound(selector, max_chunks);
+                        (*reserve_reply)(std::min(budget, !aggregate.by_chunk ? map_bytes
+                            : rows > budget / row_bytes ? budget : 8U + rows * row_bytes));
+                    }
+                    std::vector<ChunkCoord> covered;
+                    TxnAreaRead read;
+                    if (session.transaction != nullptr) {
+                        read.overlay = [&session](const ChunkCoord& coord) -> const ChunkState* {
+                            const auto own = session.transaction->writes.find(coord);
+                            return own == session.transaction->writes.end() ? nullptr : &own->second;
+                        };
+                        read.covered = &covered;
+                    }
+                    std::string rows;
+                    std::size_t row_count = 0U;
+                    std::size_t chunks = 0U;
+                    const auto page = store.VisitChunkArea(selector, std::nullopt, max_chunks,
+                        [&](const ChunkCoord& coord, std::optional<ChunkRangeEntry>&& entry, bool) {
+                            if (!entry) return true;
+                            ++chunks;
+                            if (aggregate.by_chunk) aggregator.Reset();
+                            aggregator.Add(entry->payload, entry->presence_bitmap);
+                            if (!aggregate.by_chunk || aggregator.blocks() == 0U) return true;
+                            Protocol::AppendArrayHeader(rows, aggregate.dims + aggregator.functions());
+                            Protocol::AppendInteger(rows, coord.x);
+                            Protocol::AppendInteger(rows, coord.y);
+                            if (aggregate.dims == 3U) Protocol::AppendInteger(rows, coord.z);
+                            aggregator.AppendResults(rows);
+                            ++row_count;
+                            if (rows.size() > budget) throw too_large();
+                            return true;
+                        }, false, session.transaction ? &*session.transaction->snapshot : nullptr, read);
+                    if (page.has_more) throw std::logic_error("AGGREGATE left cells of its selector unvisited");
+                    if (info != nullptr) info->chunks = chunks;
+                    std::string reply;
+                    if (aggregate.by_chunk) {
+                        Protocol::AppendArrayHeader(reply, row_count);
+                        reply += rows;
+                    } else {
+                        Protocol::AppendMapHeader(reply, aggregator.functions());
+                        for (std::size_t index = 0U; index < aggregator.functions(); ++index) {
+                            Protocol::AppendBulk(reply, cql::AggregateFunctionName(aggregate.functions[index]));
+                            aggregator.AppendResult(reply, index);
+                        }
+                    }
+                    if (reply.size() > budget) throw too_large();
+                    if (session.transaction != nullptr) TxnRead(*session.transaction, covered);
+                    return reply;
                 },
                 [&](const cql::CreateTable& create) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;

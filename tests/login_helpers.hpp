@@ -162,18 +162,23 @@ inline std::string LoginOnEngine(
     SessionState& session,
     const std::string& user,
     const std::optional<std::string>& password) {
-    using Parameters = std::vector<std::optional<std::string>>;
+    // One parameter frame, passed without a temporary vector: GCC 15 at -O2 reports a false
+    // -Wfree-nonheap-object on one.
+    const auto execute = [&](std::string_view line, std::string parameter) {
+        const std::optional<std::string> frame(std::move(parameter));
+        return engine.Execute(session, line, std::span(&frame, 1U));
+    };
     const auto login = scram::StartClientLogin(user, scram::NewNonce());
-    const std::string first_reply = engine.Execute(session, HelloUserLine(user) + "\r\n", Parameters{login.first});
+    const std::string first_reply = execute(HelloUserLine(user) + "\r\n", login.first);
     if (first_reply.rfind("+SCRAM ", 0) != 0) {
         return first_reply;
     }
     const std::string server_first = ServerFirstOf(first_reply);
     if (!password.has_value()) {
-        return engine.Execute(session, "AUTH $1\r\n", Parameters{WrongProofFinal(server_first)});
+        return execute("AUTH $1\r\n", WrongProofFinal(server_first));
     }
     const auto client_final = scram::FinishClientLogin(login, *password, server_first);
-    std::string reply = engine.Execute(session, "AUTH $1\r\n", Parameters{client_final.message});
+    std::string reply = execute("AUTH $1\r\n", client_final.message);
     if (reply.rfind("%14\r\n", 0) == 0) {
         const std::string signature_entry = "$16\r\nserver_signature\r\n$" +
                                             std::to_string(client_final.server_signature.size()) + "\r\n" +

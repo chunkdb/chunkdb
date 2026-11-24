@@ -141,7 +141,7 @@ Raise `--max-loaded-chunks` to raise the associated container limit.
 It takes no writer lock, so it can run next to the server that writes the directory.
 It runs no recovery, checkpoints or maintenance, and reserves no revisions.
 It leaves the users file and its permissions as they are, and logs a warning when the file is not owner-only.
-GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, DESCRIBE, the SHOW statements, PING and RELOAD TLS work.
+GET BLOCK, GET CHUNK, GET AREA, SCAN CHUNKS, AGGREGATE, DESCRIBE, the SHOW statements, PING and RELOAD TLS work.
 COMMIT, ROLLBACK, UNWATCH and ACK answer as they do when nothing is open, because no transaction or watch can start.
 Every other statement answers `INVALID_ARGUMENT reason=invalid_argument <statement> is not available: the server opened its data directory read-only`, including WATCH, BEGIN, FLUSH WAL and BACKUP.
 
@@ -165,8 +165,8 @@ With `--auth scram` the directory must already have users, because `--read-only`
 | Flag | Default | Meaning |
 |---|---|---|
 | `--txn-max-duration-ms` | `5000` | Transaction lifetime from BEGIN; expiry ends it with CONFLICT and releases its private bytes. |
-| `--max-area-chunks` | `4096` | Requested chunk cells per GET AREA or area page, including empty cells. |
-| `--max-area-response-bytes` | `67108864` | Complete encoded GET AREA reply, including page headers and cursor. |
+| `--max-area-chunks` | `4096` | Requested chunk cells per GET AREA, area page or AGGREGATE, including empty cells. |
+| `--max-area-response-bytes` | `67108864` | Complete encoded GET AREA or AGGREGATE reply, including page headers and cursor. |
 | `--txn-max-written-chunks` | `1024` | Distinct chunks written by one transaction. |
 | `--txn-max-read-chunks` | `8192` | Distinct chunks read by one transaction. |
 | `--txn-max-bytes` | `16777216` | Private written-chunk bytes for one transaction. |

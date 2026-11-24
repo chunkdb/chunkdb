@@ -235,6 +235,9 @@ enum class ConditionalIntentState {
     std::uint64_t* out_committed_wal_size);
 [[nodiscard]] bool IsValidInitializedStoreMarker(
     const std::vector<std::uint8_t>& bytes);
+// `.chunkdb.initialized`: magic "CKID", little-endian u64 1, then CRC32 over
+// the preceding 12 bytes (16 bytes total).
+[[nodiscard]] std::vector<std::uint8_t> SerializeInitializedStoreMarker();
 
 // Conditional-intent artifacts live in one dedicated shallow directory so
 // startup recovery scans O(pending intents) files instead of recursively
