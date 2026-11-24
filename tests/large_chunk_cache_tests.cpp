@@ -4,6 +4,7 @@
 #include <cstdlib>
 #include <fstream>
 #include <future>
+#include <iostream>
 #include <limits>
 #include <memory>
 #include <optional>
@@ -206,6 +207,17 @@ void CompactionAtCapacity() {
     }
     CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
     SessionState session;
+    // Names the step that fails and the container counts at that moment.
+    const auto step = [&](const char* name, const auto& run) {
+        try { run(); }
+        catch (const std::exception& error) {
+            std::cerr << "CompactionAtCapacity: " << name << " failed: " << error.what()
+                      << " containers=" << resources->LargeChunkCount() << '/' << resources->max_large_chunks()
+                      << " refusals=" << resources->LargeChunkRefusals()
+                      << " loaded=" << resources->LoadedChunkCount() << std::endl;
+            throw;
+        }
+    };
     assert(engine.Execute(session, "HELLO 3").starts_with("%"));
     for (const auto name : {"a", "b", "c"})
         assert(engine.Execute(session, "CREATE TABLE " + std::string(name) +
@@ -217,16 +229,20 @@ void CompactionAtCapacity() {
     PausedRead third(c->store(), CachePausePoint::kLargeChunkAfterReservation); third.Wait();
     ReleaseReads release{{&first, &second, &third}};
     assert(resources->LargeChunkCount() == resources->max_large_chunks());
-    assert(catalog->CompactTombstones("t", deleted + 1U) == deleted);
+    step("COMPACT TOMBSTONES", [&] { assert(catalog->CompactTombstones("t", deleted + 1U) == deleted); });
     assert(resources->LargeChunkCount() == resources->max_large_chunks() && resources->LargeChunkRefusals() == 0U);
     first.Release(); second.Release(); third.Release();
-    (void)first.Get(); (void)second.Get(); (void)third.Get();
+    step("first read", [&] { (void)first.Get(); });
+    step("second read", [&] { (void)second.Get(); });
+    step("third read", [&] { (void)third.Get(); });
     auto lease = catalog->Require("t")->Acquire();
-    const auto actual = lease->store().ReadChunkState(ChunkCoord{1, 0});
+    ChunkState actual;
+    step("read of t", [&] { actual = lease->store().ReadChunkState(ChunkCoord{1, 0}); });
     assert(actual.written && actual.version == expected.version && actual.commit_time_ms == expected.commit_time_ms);
     assert(actual.payload == expected.payload && actual.presence_bitmap == expected.presence_bitmap);
     assert(actual.chunk_columns && expected.chunk_columns && actual.chunk_columns->bytes == expected.chunk_columns->bytes);
-    const auto forgotten = lease->store().ReadChunkState(ChunkCoord{0, 0});
+    ChunkState forgotten;
+    step("read of the forgotten chunk", [&] { forgotten = lease->store().ReadChunkState(ChunkCoord{0, 0}); });
     assert(!forgotten.written);
     assert(forgotten.version == 0U);
     assert(lease->store().CompletedRevision() == completed);
