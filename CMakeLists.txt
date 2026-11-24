@@ -660,6 +660,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME txn_engine COMMAND chunkdb_txn_engine_test)
     add_executable(chunkdb_txn_read_only_test tests/txn_read_only_tests.cpp)
     target_link_libraries(chunkdb_txn_read_only_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_txn_read_only_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME txn_read_only COMMAND chunkdb_txn_read_only_test)
 
     add_executable(chunkdb_chunk_write_memory_test tests/chunk_write_memory_tests.cpp)

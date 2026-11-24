@@ -9,10 +9,10 @@ Plain writers retain previous chunk states while registered snapshots need them.
 History registration and checks are serialized, and the history lock is innermost: no chunk loading or locking occurs under it.
 Expiry, history pressure, table generation changes and conflicting chunk revisions terminate a transaction with CONFLICT.
 The aborted state remains on the connection until COMMIT or ROLLBACK so pipelined statements cannot run outside it.
-A READ ONLY snapshot is returned only once every write it includes has completed, as a backup cut waits, so the coordinate index lists every chunk those writes populated.
-Its SCAN CHUNKS pages take the coordinates populated now or changed after the snapshot and read each at the snapshot; a write publishes the revision before it removes a coordinate from the populated set.
+A scan at a READ ONLY snapshot first waits until every write the snapshot includes has completed, so the coordinate index lists every chunk those writes populated; writers wake it as they clear their producer bounds, only while a waiter is counted, and the snapshot deadline and statement stop end the wait. Point and area reads need no wait.
+Its SCAN CHUNKS pages take the coordinates populated now or changed after the snapshot, releasing the index lock between batches, and read each at the snapshot; a write publishes the revision before it removes a coordinate from the populated set.
 It keeps no read set, and its COMMIT only unregisters the snapshot.
-Writes count the states they copy for open snapshots, and their bytes, outside the history lock; with no snapshot registered they copy nothing.
+Writes count the states they copy for open snapshots, and their bytes, under the history lock; with no snapshot registered they copy nothing.
 
 ## Durable commit
 

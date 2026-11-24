@@ -5,6 +5,7 @@
 #include <cassert>
 #include <cstdlib>
 #include <fstream>
+#include <iterator>
 #include <limits>
 #include <ostream>
 #include <sstream>
@@ -21,6 +22,8 @@
 
 namespace chunkdb {
 namespace {
+
+std::atomic<CoordinatePublicationTestHook*> publication_hook{nullptr};
 
 class SinkBuffer final : public std::streambuf {
   public:
@@ -464,6 +467,9 @@ void ChunkCoordinateIndex::PublishReservation(CoordinateReservation& reservation
         } else populated_.erase(reservation.coord_);
         reservation.node_->populated.store(populated, std::memory_order_relaxed);
     }
+    if (previous != populated) {
+        if (auto* hook = publication_hook.load(std::memory_order_acquire)) hook->AfterPopulationChange(reservation.coord_);
+    }
     if (previous_revision == 0U) any_written_.store(true, std::memory_order_release);
 }
 
@@ -493,23 +499,38 @@ CoordinatePage ChunkCoordinateIndex::Page(bool has_cursor, const ChunkCoord& cur
     return page;
 }
 
+void SetCoordinatePublicationTestHook(CoordinatePublicationTestHook* hook) noexcept {
+    publication_hook.store(hook, std::memory_order_release);
+}
+
 CoordinatePage ChunkCoordinateIndex::SnapshotPage(bool has_cursor, const ChunkCoord& cursor, std::size_t limit,
     std::uint64_t snapshot) const {
     Check();
     if (limit == 0U || limit > kMaxChunkScanLimit + 1U) throw std::invalid_argument("invalid coordinate scan limit");
     CoordinatePage page;
     page.coords.reserve(limit);
-    std::lock_guard lock(mutex_);
-    auto at = has_cursor ? coordinates_.upper_bound(cursor) : coordinates_.begin();
-    for (; at != coordinates_.end(); ++at) {
-        // Populated at the snapshot: populated now, or changed after it.
-        if (!at->second.populated.load(std::memory_order_relaxed) &&
-            at->second.revision.load(std::memory_order_acquire) <= snapshot)
-            continue;
-        if (page.coords.size() == limit) { page.more = true; break; }
-        page.coords.push_back(at->first);
+    // Populated at the snapshot: populated now, or changed after it. Once
+    // true for a fixed snapshot this stays true (revisions only grow), so
+    // the walk can release the lock between batches, letting writers publish,
+    // and resume after the last key it examined.
+    constexpr std::size_t kBatchNodes = 256U;
+    bool resume = has_cursor;
+    ChunkCoord after = cursor;
+    for (;;) {
+        std::lock_guard lock(mutex_);
+        auto at = resume ? coordinates_.upper_bound(after) : coordinates_.begin();
+        for (std::size_t examined = 0U; at != coordinates_.end(); ++at, ++examined) {
+            if (examined == kBatchNodes) break;
+            if (!at->second.populated.load(std::memory_order_relaxed) &&
+                at->second.revision.load(std::memory_order_acquire) <= snapshot)
+                continue;
+            if (page.coords.size() == limit) { page.more = true; return page; }
+            page.coords.push_back(at->first);
+        }
+        if (at == coordinates_.end()) return page;
+        resume = true;
+        after = std::prev(at)->first;
     }
-    return page;
 }
 
 std::optional<ChunkIndexRecord> ChunkCoordinateIndex::EmptyBoundary(const ChunkCoord& coord) const {

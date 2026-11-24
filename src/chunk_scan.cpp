@@ -24,8 +24,9 @@ ChunkIdentityScanPage ChunkStore::ScanChunkIdentitiesImpl(const TxnSnapshot* sna
         throw std::invalid_argument("scan limit must be between 1 and " + std::to_string(kMaxChunkScanLimit));
     if (has_cursor) (void)geometry_.ChunkToLarge(cursor);
     ChunkIdentityScanPage page;
-    // As of a snapshot the index must list every chunk its writes populated
-    // (BeginCompletedTxnSnapshot); the page is then that revision's.
+    // As of a snapshot the index must list every chunk its writes populated;
+    // the page is then that revision's.
+    if (snapshot != nullptr) WaitForTxnSnapshotWrites(*snapshot);
     const auto index = snapshot != nullptr ? CoordinateIndexForArea(snapshot) : CoordinateIndexForScan();
     if (index == nullptr) throw std::invalid_argument("the snapshot includes writes that have not completed");
     page.position = snapshot != nullptr ? std::optional(snapshot->version()) : CompletedRevision();
@@ -81,7 +82,7 @@ ChunkIdentityScanPage ChunkStore::ScanChunkIdentitiesImpl(const TxnSnapshot* sna
             CheckStatementCancellation();
             ChunkRangeEntry state;
             const bool populated = snapshot != nullptr
-                ? ReadPopulatedChunkStateNoCache(coord, &state, with_vars, snapshot)
+                ? ReadPopulatedChunkStateNoCache(coord, &state, with_vars, snapshot, false, identity_only)
                 : ReadPopulatedChunkStateNoCache(coord, &state, with_vars, nullptr, since.has_value(), identity_only);
             if (!populated) continue;
             if (since && state.version <= *since) continue;

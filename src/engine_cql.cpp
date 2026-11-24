@@ -2635,10 +2635,7 @@ Table::Lease CommandEngine::TxnLease(SessionState& session, const std::string& t
     }
     if (txn.snapshot == nullptr) {
         auto lease = AcquireNamedTable(session, table);
-        // A READ ONLY snapshot waits for the writes it includes, so SCAN
-        // CHUNKS finds their chunks in the coordinate index.
-        txn.snapshot = txn.read_only ? lease.store().BeginCompletedTxnSnapshot(config_.txn_max_duration - elapsed)
-                                     : lease.store().BeginTxnSnapshot(config_.txn_max_duration - elapsed);
+        txn.snapshot = lease.store().BeginTxnSnapshot(config_.txn_max_duration - elapsed);
         txn.table = table;
         return lease;
     }

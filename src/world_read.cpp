@@ -82,11 +82,14 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
     const auto copy_cached = [&, with_vars](const RegularChunk& chunk, ChunkRangeEntry* entry) {
         entry->version = chunk.version;
         entry->commit_time_ms = chunk.commit_time_ms;
-        if (identity_only || (include_empty && !ChunkPopulated(geometry_, chunk.presence_bitmap, chunk.chunk_columns.get()))) {
+        if ((identity_only && snapshot == nullptr) ||
+            (include_empty && !ChunkPopulated(geometry_, chunk.presence_bitmap, chunk.chunk_columns.get()))) {
             entry->payload.clear(); entry->presence_bitmap.clear(); entry->vars = {}; entry->chunk_columns.reset();
             return;
         }
-        entry->payload = chunk.payload;
+        // An identity read as of a snapshot keeps what decides populated-ness.
+        if (identity_only) entry->payload.clear();
+        else entry->payload = chunk.payload;
         entry->presence_bitmap = chunk.presence_bitmap;
         entry->chunk_columns = chunk.chunk_columns;
         if (with_vars) {
@@ -113,11 +116,12 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
         return true;
     }
     // As of a snapshot the state is read whole, current state first and the
-    // history after it, before populated-ness is known.
+    // history after it, before populated-ness is known; an identity read
+    // leaves out the payload.
     ChunkRangeEntry snapshot_entry;
     ChunkRangeEntry* const target = snapshot != nullptr && out == nullptr ? &snapshot_entry : out;
     const auto finish_snapshot_read = [&]() {
-        ApplyTxnHistory(*snapshot, chunk_coord, with_vars, target);
+        ApplyTxnHistory(*snapshot, chunk_coord, with_vars && !identity_only, target, !identity_only);
         return ChunkPopulated(geometry_, target->presence_bitmap, target->chunk_columns.get());
     };
     // Per-chunk consistency protocol: a cached chunk is authoritative (its
@@ -173,7 +177,8 @@ bool ChunkStore::ReadPopulatedChunkStateNoCache(
             target->version = 0;
             target->vars = ChunkVars{};
         }
-        const bool populated = ReadPopulatedChunkStateFromDisk(chunk_coord, target, with_vars, &vars_problem, include_empty, identity_only);
+        const bool populated = ReadPopulatedChunkStateFromDisk(chunk_coord, target, with_vars, &vars_problem, include_empty,
+            identity_only && snapshot == nullptr);
         if (TryGetLoadedChunk(chunk_coord) == nullptr &&
             eviction_removals_.load(std::memory_order_acquire) == eviction_removals_before) {
             if (!vars_problem.empty()) {

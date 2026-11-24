@@ -33,7 +33,7 @@ OK
 
 Plain GET AREA reads chunks separately and can see a partially observed multi-chunk commit.
 Use a transaction when those chunks must share one consistent view.
-A read-only transaction can commit while its snapshot remains valid.
+A transaction that only reads can commit while its snapshot remains valid.
 
 ## Read-only transactions
 
@@ -43,7 +43,7 @@ It keeps no read set, so `--txn-max-read-chunks` does not bound it and COMMIT, l
 
 While a snapshot is open, a write copies the state of the chunk it changes and keeps the copy while an older open snapshot needs it.
 Without an open snapshot writes copy nothing.
-`chunkdb_txn_history_copies_total` and `chunkdb_txn_history_copied_bytes_total` in SHOW METRICS count these copies and their bytes; `chunkdb_txn_history_bytes` is what is kept now.
+`chunkdb_txn_history_copies_total` and `chunkdb_txn_history_copied_bytes_total` in SHOW METRICS count these copies and their bytes, bookkeeping included; `chunkdb_txn_history_bytes` is what is kept now.
 A long scan beside heavy writes therefore costs memory up to `--txn-history-bytes` per table, after which the oldest transaction ends with CONFLICT reason=history_limit.
 
 ## Limits

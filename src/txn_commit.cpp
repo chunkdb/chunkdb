@@ -10,7 +10,6 @@
 #include <stdexcept>
 #include <string>
 #include <system_error>
-#include <thread>
 #include <utility>
 #include <vector>
 
@@ -138,22 +137,19 @@ std::unique_ptr<TxnSnapshot> ChunkStore::BeginTxnSnapshot(std::chrono::milliseco
     return txn_history_->Register(txn_history_, version_clock_, std::chrono::steady_clock::now() + duration);
 }
 
-std::unique_ptr<TxnSnapshot> ChunkStore::BeginCompletedTxnSnapshot(std::chrono::milliseconds max_duration) {
-    auto snapshot = BeginTxnSnapshot(max_duration);
-    const auto deadline = std::chrono::steady_clock::now() +
-        std::min(max_duration, std::chrono::duration_cast<std::chrono::milliseconds>(kTxnMaxDurationCap));
+void ChunkStore::WaitForTxnSnapshotWrites(const TxnSnapshot& snapshot) {
     // A write that took a version at or below the snapshot publishes its
-    // coordinate before it completes. Wait for those writes as a backup cut
-    // does: a write only clears its own bound, without locks or wakeups.
-    while (CompletedRevision().value_or(0U) < snapshot->version()) {
+    // coordinate before it completes; the waiting reader is woken as such
+    // writes clear their bounds.
+    if (write_producers_->Completed(version_clock_, snapshot.version())) return;
+    const auto stopped = StatementStopToken();
+    if (write_producers_->WaitCompleted(version_clock_, snapshot.version(), snapshot.deadline_, stopped)) return;
+    if (stopped.stop_requested()) {
         CheckStatementCancellation();
-        if (std::chrono::steady_clock::now() >= deadline) {
-            throw TransactionConflictError(
-                TxnConflictReason::kDuration, "the transaction's duration limit passed while its snapshot waited for writes");
-        }
-        std::this_thread::yield();
+        throw std::runtime_error("the statement stopped while its snapshot waited for writes");
     }
-    return snapshot;
+    throw TransactionConflictError(
+        TxnConflictReason::kDuration, "the transaction's duration limit passed while its snapshot waited for writes");
 }
 
 void ChunkStore::EndTxnSnapshot(TxnSnapshot& snapshot) noexcept {
@@ -176,10 +172,11 @@ void ChunkStore::ApplyTxnHistory(
     const TxnSnapshot& snapshot,
     const ChunkCoord& chunk_coord,
     bool with_vars,
-    ChunkRangeEntry* entry) {
+    ChunkRangeEntry* entry, bool with_payload) {
     (void)txn_history_->VisitAt(snapshot, chunk_coord, [&](const TxnKeptState& kept) {
         const auto state = kept.View();
-        entry->payload.assign(state.payload.begin(), state.payload.end());
+        if (with_payload) entry->payload.assign(state.payload.begin(), state.payload.end());
+        else entry->payload.clear();
         entry->presence_bitmap.assign(state.presence_bitmap.begin(), state.presence_bitmap.end());
         entry->version = state.version;
         entry->commit_time_ms = state.commit_time_ms;

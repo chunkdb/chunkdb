@@ -19,6 +19,7 @@
 
 #include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "statement_control.hpp"
 #include "txn_test_utils.hpp"
 
 namespace {
@@ -83,7 +84,8 @@ struct Fixture {
     SessionState a;
     SessionState b;
 
-    explicit Fixture(chunkdb::QueryLimits limits = {}, std::size_t history_bytes = chunkdb::kDefaultTxnHistoryBytes) {
+    explicit Fixture(chunkdb::QueryLimits limits = {}, std::size_t history_bytes = chunkdb::kDefaultTxnHistoryBytes,
+        std::chrono::milliseconds duration = chunkdb::EngineConfig{}.txn_max_duration) {
         chunkdb::CatalogConfig catalog_config;
         catalog_config.data_dir = dir.path();
         catalog_config.background_maintenance = false;
@@ -94,6 +96,7 @@ struct Fixture {
         chunkdb::EngineConfig config;
         config.require_auth = false;
         config.server_version = "test";
+        config.txn_max_duration = duration;
         engine = std::make_unique<CommandEngine>(config, catalog);
         Hello(a);
         Hello(b);
@@ -312,50 +315,97 @@ void TestCopyCostMetrics() {
     assert(Metric(f.Metrics(), "chunkdb_txn_history_copies_total") == 3U);
 }
 
-// A write that took its version before the snapshot and has not published
-// its chunk yet: the first statement waits for it, so SCAN lists the chunk.
-void TestSnapshotWaitsForIncludedWrites() {
-    Fixture f;
+// A write of chunk (10, 10) held after it took its version and before it
+// published the chunk, while an ordinary snapshot is open.
+struct PausedWrite {
+    Fixture& f;
     SessionState holder;
-    SessionState reader;
-    f.Hello(holder);
-    f.Hello(reader);
-    // An open ordinary snapshot makes the write stop at its pause point.
-    ExpectReply(f.Run(holder, "BEGIN"), "+OK\r\n");
-    ExpectReply(f.Run(holder, "GET BLOCK 0 0 FROM t"), "_\r\n");
-    {
-        const auto lease = f.catalog->Find("t")->Acquire();
-        lease->store().ArmTxnPauseForTests(chunkdb::TxnPausePoint::kWriteAfterOpenCount);
-    }
     std::string written;
-    std::thread writer([&] { written = f.Run(f.b, "SET BLOCK 40 40 IN t n = 7"); });
-    {
-        const auto lease = f.catalog->Find("t")->Acquire();
-        assert(lease->store().WaitForTxnPauseForTests(chunkdb::TxnPausePoint::kWriteAfterOpenCount));
+    std::thread writer;
+
+    explicit PausedWrite(Fixture& fixture) : f(fixture) {
+        f.Hello(holder);
+        ExpectReply(f.Run(holder, "BEGIN"), "+OK\r\n");
+        ExpectReply(f.Run(holder, "GET BLOCK 0 0 FROM t"), Value(1));
+        Store().ArmTxnPauseForTests(chunkdb::TxnPausePoint::kWriteAfterOpenCount);
+        // A new value each time: a write that changes nothing keeps nothing.
+        static int value = 0;
+        writer = std::thread([this, n = ++value] { written = f.Run(f.b, "SET BLOCK 40 40 IN t n = " + std::to_string(n)); });
+        assert(Store().WaitForTxnPauseForTests(chunkdb::TxnPausePoint::kWriteAfterOpenCount));
     }
+    chunkdb::ChunkStore& Store() { return f.catalog->Find("t")->Acquire()->store(); }
+    // Waits until `count` snapshots are registered.
+    void AwaitSnapshots(std::size_t count) {
+        const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
+        while (f.RegisteredSnapshots() != count) {
+            assert(std::chrono::steady_clock::now() < deadline);
+            std::this_thread::yield();
+        }
+    }
+    std::uint64_t Finish() {
+        Store().ResumeTxnForTests(chunkdb::TxnPausePoint::kWriteAfterOpenCount);
+        writer.join();
+        (void)f.Run(holder, "ROLLBACK");
+        return VersionOf(written);
+    }
+};
+
+// Point and area reads do not wait for a write the snapshot includes; SCAN
+// CHUNKS waits for it, so it lists the chunk.
+void TestScanWaitsForIncludedWrites() {
+    Fixture f;
+    const auto first = VersionOf(f.Run(f.b, "SET BLOCK 0 0 IN t n = 1"));
+    PausedWrite paused(f);
+    SessionState reader;
+    f.Hello(reader);
+    ExpectReply(f.Run(reader, "BEGIN READ ONLY"), "+OK\r\n");
+    ExpectReply(f.Run(reader, "GET BLOCK 0 0 FROM t"), Value(1));
+    ExpectContains(f.Run(reader, "AGGREGATE AREA 0 0 TO 1 1 FROM t SUM(n)"), "$6\r\nsum(n)\r\n:1\r\n");
     std::string scanned;
-    std::thread scanner([&] {
-        ExpectReply(f.Run(reader, "BEGIN READ ONLY"), "+OK\r\n");
-        scanned = f.Run(reader, "SCAN CHUNKS FROM t");
-    });
-    // The reader registered its snapshot and waits for the paused write.
-    const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(30);
-    while (f.RegisteredSnapshots() != 2U) {
-        assert(std::chrono::steady_clock::now() < deadline);
-        std::this_thread::yield();
-    }
+    std::thread scanner([&] { scanned = f.Run(reader, "SCAN CHUNKS FROM t"); });
+    // A scan cannot answer before the write completes.
+    paused.AwaitSnapshots(2U);
     assert(scanned.empty());
-    {
-        const auto lease = f.catalog->Find("t")->Acquire();
-        lease->store().ResumeTxnForTests(chunkdb::TxnPausePoint::kWriteAfterOpenCount);
-    }
-    writer.join();
+    const auto version = paused.Finish();
     scanner.join();
-    const auto version = VersionOf(written);
-    ExpectContains(scanned, "*1\r\n" + Row(10, 10, version));
+    ExpectContains(scanned, "*2\r\n" + Row(0, 0, first) + Row(10, 10, version));
     ExpectContains(scanned, "$8\r\nposition\r\n:" + std::to_string(version) + "\r\n");
     ExpectReply(f.Run(reader, "COMMIT"), "_\r\n");
-    ExpectReply(f.Run(holder, "ROLLBACK"), "+OK\r\n");
+}
+
+// The transaction's duration and a stopped statement end the scan's wait.
+void TestScanWaitEnds() {
+    Fixture f({}, chunkdb::kDefaultTxnHistoryBytes, std::chrono::milliseconds(300));
+    (void)VersionOf(f.Run(f.b, "SET BLOCK 0 0 IN t n = 1"));
+    {
+        PausedWrite paused(f);
+        SessionState reader;
+        f.Hello(reader);
+        ExpectReply(f.Run(reader, "BEGIN READ ONLY"), "+OK\r\n");
+        ExpectError(f.Run(reader, "SCAN CHUNKS FROM t"), "CONFLICT reason=duration");
+        ExpectReply(f.Run(reader, "ROLLBACK"), "+OK\r\n");
+        (void)paused.Finish();
+    }
+    PausedWrite paused(f);
+    auto& store = paused.Store();
+    const auto snapshot = store.BeginTxnSnapshot(std::chrono::seconds(60));
+    chunkdb::StatementControl control(std::chrono::steady_clock::now(), 0U);
+    assert(control.Start());
+    bool stopped = false;
+    std::thread scanner([&] {
+        chunkdb::ScopedStatementControl scope(&control);
+        try {
+            (void)store.ScanChunkIdentitiesAt(*snapshot, false, {}, 10U);
+        } catch (const chunkdb::StatementStoppedError& error) {
+            stopped = error.reason() == chunkdb::StatementStopReason::kCancelled;
+        }
+    });
+    assert(control.RequestStop(chunkdb::StatementStopReason::kCancelled));
+    scanner.join();
+    assert(stopped);
+    (void)paused.Finish();
+    // Once the write completed, the same snapshot scans without waiting.
+    assert(store.ScanChunkIdentitiesAt(*snapshot, false, {}, 10U).entries.size() == 2U);
 }
 
 // Ordinary transactions move units between chunks while plain writes add
@@ -448,7 +498,8 @@ int main() {
     TestDurationLimit();
     TestHistoryLimit();
     TestCopyCostMetrics();
-    TestSnapshotWaitsForIncludedWrites();
+    TestScanWaitsForIncludedWrites();
+    TestScanWaitEnds();
     TestReadersBesideWriters();
     std::puts("txn read-only tests passed");
     return 0;

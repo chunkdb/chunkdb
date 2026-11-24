@@ -91,7 +91,7 @@ A snapshot is the table's state at that moment.
 Allowed statements are GET BLOCK, GET CHUNK, GET AREA, AGGREGATE, SET BLOCK, DELETE BLOCK, SET CHUNK, DESCRIBE, PING, SHOW CONNECTIONS, CANCEL and KILL CONNECTION.
 A READ ONLY transaction refuses SET BLOCK, DELETE BLOCK and SET CHUNK and also allows SCAN CHUNKS without SINCE.
 Its SCAN CHUNKS pages, with or without WHERE and WITH DATA, list the chunks populated at the snapshot, also those emptied since, and report the snapshot's revision as `position`.
-Its first table statement waits for the writes its snapshot includes to finish.
+Its SCAN CHUNKS first waits for the writes its snapshot includes to finish; CANCEL, a statement timeout or the duration limit ends that wait.
 Its reads are not checked again: COMMIT and ROLLBACK only end it, and `--txn-max-read-chunks` does not apply.
 Ordinary statement errors leave the transaction open without applying the failed statement.
 CANCEL and a statement timeout stop the running statement; the transaction stays open.

@@ -73,7 +73,7 @@ An area read at a transaction snapshot uses the index once the completed revisio
 An unlisted cell can then hold a populated snapshot state only when a later write emptied it, and that write keeps the replaced state in the transaction history.
 The writer publishes membership and then the kept state under its exclusive chunk lock, and eviction cannot remove a chunk a writer holds, so the reader takes the shared lock of a cached chunk before it checks the history.
 A cell with no populated state at the snapshot is skipped without reading its files; the transaction's own writes are checked first, and every covered cell stays in its conflict set.
-A scan at a READ ONLY snapshot needs the completed revision to cover the snapshot; it lists the coordinates populated now or written after the snapshot and reads each at the snapshot.
+A scan at a READ ONLY snapshot first waits for the completed revision to cover the snapshot; it lists the coordinates populated now or written after the snapshot and reads each at the snapshot.
 Ordinary writes update membership only on population transitions, with no index I/O for updates to an already populated chunk.
 A new coordinate reserves its in-memory map node before the write can commit, and ordinary writes publish no persistent live hint before their commit decision.
 Each stable coordinate node carries atomic producing identity and population state; writes to an existing node publish those fields before completing their producer bound without taking the ordered-map mutex.

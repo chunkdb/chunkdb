@@ -22,6 +22,15 @@ class CoordinateArtifactTestHook {
 };
 void SetCoordinateArtifactTestHook(CoordinateArtifactTestHook* hook) noexcept;
 
+class CoordinatePublicationTestHook {
+  public:
+    virtual ~CoordinatePublicationTestHook() = default;
+    // A write published a population change of `coord`: its revision and
+    // then its populated flag.
+    virtual void AfterPopulationChange(const ChunkCoord& coord) noexcept = 0;
+};
+void SetCoordinatePublicationTestHook(CoordinatePublicationTestHook* hook) noexcept;
+
 struct ChunkCoordinateNode {
     std::atomic<std::uint64_t> revision{0U};
     std::atomic<bool> populated{false};
