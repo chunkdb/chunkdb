@@ -83,4 +83,4 @@ The migration ledger holds at most 16384 records and 16777216 bytes.
 Existing names remain retryable when the ledger is full.
 Migrations require the server's data-directory writer lock.
 
-MIGRATE requires the recorded `migrations` feature; [enable missing features](TABLES.md#feature-activation) before submitting a named step.
+MIGRATE requires the recorded `migrations` feature, which every directory a 2.0 build creates has; see [Feature activation](TABLES.md#feature-activation).

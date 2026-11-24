@@ -1755,7 +1755,7 @@ std::string CommandEngine::ExecuteStatement(
                             config_.require_auth ? session.user : std::string{}, [&](std::string_view old_user) {
                                 if (config_.require_auth && old_user != session.user && !admin_all)
                                     throw PermissionDeniedError("ADMIN on *");
-                            });
+                            }, session.remote_endpoint);
                         if (session.register_slot_watch && !session.register_slot_watch(state))
                             return Protocol::Error("BUSY", "maximum slot catch-up workers reached", {{"reason", "slot_worker_limit"}, {"table", watch.table}});
                         // A slot without an owner takes the user of its first
@@ -1828,8 +1828,10 @@ std::string CommandEngine::ExecuteStatement(
                     const auto* viewer = CurrentUser(session);
                     const bool show_owners = !config_.require_auth || (viewer != nullptr && viewer->manages_users);
                     Protocol::AppendArrayHeader(reply, slots.size());
+                    const bool show_peers = ControlAccess(session).list_all;
+                    const auto now = std::chrono::steady_clock::now();
                     for (const auto& [name, slot] : slots) {
-                        Protocol::AppendMapHeader(reply, 12);
+                        Protocol::AppendMapHeader(reply, 14);
                         Protocol::AppendBulk(reply, "table");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "name");
@@ -1847,6 +1849,16 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendInteger(reply, slot.retained_bytes);
                         Protocol::AppendBulk(reply, "attached");
                         Protocol::AppendBoolean(reply, slot.attached);
+                        // The watch holding the slot: its client, listed as SHOW CONNECTIONS
+                        // lists it, and the time since its last accepted ACK.
+                        Protocol::AppendBulk(reply, "peer");
+                        if (!slot.peer.empty() && (show_peers || slot.watch_user == session.user)) Protocol::AppendBulk(reply, slot.peer);
+                        else Protocol::AppendNull(reply);
+                        Protocol::AppendBulk(reply, "last_ack_ms");
+                        if (slot.last_ack) {
+                            Protocol::AppendInteger(reply, static_cast<std::uint64_t>(std::max<std::int64_t>(0,
+                                std::chrono::duration_cast<std::chrono::milliseconds>(now - *slot.last_ack).count())));
+                        } else Protocol::AppendNull(reply);
                         Protocol::AppendBulk(reply, "lost");
                         reply += slot.lost ? "#t\r\n" : "#f\r\n";
                         Protocol::AppendBulk(reply, "lost_reason");
