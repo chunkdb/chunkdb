@@ -75,7 +75,8 @@ ChunkState State(const ChunkLayout& layout, std::uint64_t revision, const std::m
     const auto put = [&](std::size_t index, std::uint32_t block, const ColumnValue& value) {
         const auto* fixed = layout.FixedColumnAt(index);
         const auto bytes = EncodeColumnValue(columns[index], value);
-        WriteValueBits(state.payload.data(), fixed->values * 8U + block * fixed->width, bytes.data(), fixed->width);
+        WriteValueBits(state.payload.data(), fixed->values * 8U + static_cast<std::size_t>(block) * fixed->width, bytes.data(),
+            fixed->width);
         if (fixed->validity != ChunkLayout::kNoValidity)
             state.payload[fixed->validity + block / 8U] |= static_cast<std::uint8_t>(1U << (block % 8U));
     };
@@ -198,7 +199,7 @@ void KeysKeepValueOrder() {
     std::vector<Bytes> keys;
     for (const std::uint64_t value : {0ULL, 1ULL, 255ULL, 256ULL, 65535ULL}) keys.push_back(FixedKey(u16, value));
     assert(std::is_sorted(keys.begin(), keys.end()) && std::adjacent_find(keys.begin(), keys.end()) == keys.end());
-    for (const std::uint32_t width : {2U, 8U, 13U, 64U}) {
+    for (const std::uint32_t width : {3U, 8U, 13U, 64U}) {
         const auto column = Make(2U, "i", ColumnKind::kSigned, width);
         const auto low = width == 64U ? std::numeric_limits<std::int64_t>::min() : -(std::int64_t{1} << (width - 1U));
         const auto high = width == 64U ? std::numeric_limits<std::int64_t>::max() : (std::int64_t{1} << (width - 1U)) - 1;
@@ -224,6 +225,17 @@ void KeysKeepValueOrder() {
     assert(!AppendFixedIndexKey(f64, nan64.data(), &none) && none.empty());
     const auto flag = Make(6U, "flag", ColumnKind::kBool, 1U);
     assert(FixedKey(flag, false) < FixedKey(flag, true));
+    // A NaN with its sign bit set has no entry either.
+    const std::uint8_t negative_nan32[]{0x01U, 0x00U, 0xC0U, 0xFFU};
+    const std::uint8_t negative_nan64[]{0x01U, 0U, 0U, 0U, 0U, 0U, 0xF8U, 0xFFU};
+    assert(!AppendFixedIndexKey(f32, negative_nan32, &none) && !AppendFixedIndexKey(f64, negative_nan64, &none) && none.empty());
+    // bits(N) keys are their packed bytes, equal exactly for equal values.
+    const auto bits = Make(7U, "bits", ColumnKind::kBits, 12U);
+    const std::uint8_t first_bits[]{0xABU, 0x0CU}, second_bits[]{0xABU, 0x0DU};
+    Bytes first_key, again_key, second_key;
+    assert(AppendFixedIndexKey(bits, first_bits, &first_key) && AppendFixedIndexKey(bits, first_bits, &again_key));
+    assert(AppendFixedIndexKey(bits, second_bits, &second_key));
+    assert((first_key == Bytes{0xABU, 0x0CU}) && first_key == again_key && first_key != second_key);
 
     // Shorter values first, and a zero byte inside a value keeps its order.
     const std::vector<std::string> texts{"", std::string(1, '\0'), std::string(2, '\0'), "a", std::string("a\0", 2),
@@ -295,6 +307,15 @@ void ManifestRoundTripAndDamage() {
     bool refused = false;
     try { (void)ParseIndexManifest(std::span(bytes).first(bytes.size() - 1U)); } catch (const std::runtime_error&) { refused = true; }
     assert(refused);
+    // No manifest lists more than kMaxIndexRuns runs.
+    manifest.runs.clear();
+    for (std::uint64_t generation = kMaxIndexRuns + 1U; generation > 0U; --generation)
+        manifest.runs.push_back({.generation = generation, .bytes = 1U});
+    refused = false;
+    try { (void)ParseIndexManifest(SerializeIndexManifest(manifest)); } catch (const std::runtime_error&) { refused = true; }
+    assert(refused);
+    manifest.runs.pop_back();
+    assert(ParseIndexManifest(SerializeIndexManifest(manifest)).runs.size() == kMaxIndexRuns);
 }
 
 std::vector<std::filesystem::path> Files(const std::filesystem::path& directory) {
@@ -406,14 +427,52 @@ void LayersFollowChunkState() {
                 auto [index, report] = open(identity);
                 assert(!report.rebuilt.empty() && index->Verify(model.Source()).empty());
             }
-            // An entry block is checked by verify, which reports the run.
+            // A flipped entry byte fails the run's digest at open, which rebuilds;
+            // flushes and merges then keep working.
             FlipByte(run(), std::filesystem::file_size(run()) / 2U);
             {
-                auto index = std::make_unique<SecondaryIndex>(path, layout, column, identity);
-                const auto report = index->Open(model.Source());
-                assert(report.rebuilt.empty() && !index->Verify(model.Source()).empty());
-                index->Rebuild(model.Source());
+                auto [index, report] = open(identity);
+                assert(!report.rebuilt.empty());
+                for (std::size_t round = 0U; round < kMaxIndexRuns + 2U; ++round) {
+                    const auto& coord = coords[round];
+                    model.Write(layout, coord);
+                    const auto& chunk = model.chunks.at(coord);
+                    if (chunk.populated)
+                        index->Replace(coord, chunk.revision, ChunkIndexEntries(layout, column, prefix, coord,
+                            chunk.state.presence_bitmap, chunk.state.payload, chunk.state.vars));
+                    else index->Forget(coord);
+                    index->Flush();
+                }
+                assert(Same(Effective(*index), Expected(layout, column, prefix, model)));
                 assert(index->Verify(model.Source()).empty());
+            }
+            // A read-only index writes and removes nothing, and recomputes in memory.
+            { std::ofstream(path / "run-999998") << "x"; }
+            {
+                const auto before = Files(path);
+                SecondaryIndex reader(path, layout, column, identity, true);
+                const auto report = reader.Open(model.Source());
+                assert(report.rebuilt.empty() && Files(path) == before);
+                assert(Same(Effective(reader), Expected(layout, column, prefix, model)));
+                bool refused = false;
+                try { reader.Flush(); } catch (const std::logic_error&) { refused = true; }
+                assert(refused);
+                std::filesystem::rename(SecondaryIndex::ManifestPath(path), path / "kept");
+                SecondaryIndex fresh(path, layout, column, identity, true);
+                assert(!fresh.Open(model.Source()).rebuilt.empty());
+                assert(!std::filesystem::exists(SecondaryIndex::ManifestPath(path)));
+                assert(Same(Effective(fresh), Expected(layout, column, prefix, model)));
+                std::filesystem::rename(path / "kept", SecondaryIndex::ManifestPath(path));
+            }
+            // A manifest larger than any manifest is refused before it is read.
+            {
+                const auto saved = path / "saved";
+                std::filesystem::copy_file(SecondaryIndex::ManifestPath(path), saved);
+                std::ofstream(SecondaryIndex::ManifestPath(path), std::ios::binary | std::ios::trunc)
+                    << std::string(1000U, 'x');
+                auto [index, report] = open(identity);
+                assert(!report.rebuilt.empty() && index->Verify(model.Source()).empty());
+                std::filesystem::remove(saved);
             }
             // Another table epoch, or a missing manifest, rebuilds.
             {
@@ -428,6 +487,45 @@ void LayersFollowChunkState() {
             }
         }
     }
+}
+
+// An entry removed at revision R stays while a snapshot older than R is open
+// and goes with the first flush or merge after; verify compares only current
+// entries.
+void RemovedEntriesFollowSnapshots() {
+    test::ScopedTempDir directory("chunkdb-secondary-index-removed");
+    const ChunkLayout layout(Schema(), kBlocks, 1U << 20U);
+    const auto column = ColumnIndex(layout, "u");
+    Model model;
+    for (std::int64_t x = 0; x < 12; ++x) model.Write(layout, {x, 0, 0});
+    SecondaryIndex index(directory.path(), layout, column, Identity(1U));
+    (void)index.Open(model.Source());
+    const auto removed_at = model.clock + 1U;
+    const auto mark = [&](const ChunkCoord& coord) {
+        const auto& chunk = model.chunks.at(coord);
+        auto entries = ChunkIndexEntries(layout, column, 0U, coord, chunk.state.presence_bitmap, chunk.state.payload,
+            chunk.state.vars);
+        entries.push_back(IndexEntry{.key = {0xFFU, 0xFFU}, .coord = coord, .block = 0U, .removed = removed_at});
+        std::sort(entries.begin(), entries.end(), IndexEntryLess);
+        index.Replace(coord, chunk.revision, std::move(entries));
+    };
+    const auto marked = [&] {
+        std::size_t count = 0U;
+        for (const auto& entry : Effective(index)) count += entry.removed == removed_at ? 1U : 0U;
+        return count;
+    };
+    mark({0, 0, 0});
+    index.Flush(removed_at - 1U);
+    assert(marked() == 1U && index.Verify(model.Source()).empty());
+    mark({1, 0, 0});
+    index.Merge(removed_at - 1U);
+    assert(marked() == 2U && index.runs() == 1U && index.Verify(model.Source()).empty());
+    mark({2, 0, 0});
+    index.Merge(removed_at);
+    assert(marked() == 0U && index.Verify(model.Source()).empty());
+    mark({3, 0, 0});
+    index.Flush();
+    assert(marked() == 0U);
 }
 
 // The deterministic chunk state of the crash scenario at each step.
@@ -447,7 +545,16 @@ int CrashChildBody(const std::filesystem::path& root, const char* point) {
     Model model;
     CrashModel(layout, model, 0);
     SecondaryIndex index(root, layout, column, Identity(1U));
+    const bool during_rebuild = std::string_view(point).find("REBUILD") != std::string_view::npos;
+    if (during_rebuild) {
+#ifdef _WIN32
+        _putenv_s(point, "1");
+#else
+        setenv(point, "1", 1);
+#endif
+    }
     (void)index.Open(model.Source());
+    if (during_rebuild) return 1;
     Model changed;
     CrashModel(layout, changed, 1);
     for (const auto& [coord, chunk] : changed.chunks) {
@@ -495,7 +602,9 @@ int CrashChild(const char* executable, const std::filesystem::path& root, const 
 void CrashBoundaries(const char* executable) {
     if (!kFailpointsCompiled) return;
     for (const auto* point : {"CHUNKDB_FAILPOINT_CRASH_INDEX_RUN_AFTER_RENAME_ONCE",
-             "CHUNKDB_FAILPOINT_CRASH_INDEX_MERGE_AFTER_MANIFEST_ONCE"}) {
+             "CHUNKDB_FAILPOINT_CRASH_INDEX_MANIFEST_BEFORE_RENAME_ONCE",
+             "CHUNKDB_FAILPOINT_CRASH_INDEX_MERGE_AFTER_MANIFEST_ONCE",
+             "CHUNKDB_FAILPOINT_CRASH_INDEX_REBUILD_BEFORE_READY_ONCE"}) {
         test::ScopedTempDir directory("chunkdb-secondary-index-crash");
         const auto root = directory.path() / "index";
         assert(CrashChild(executable, root, point) == 86);
@@ -505,7 +614,8 @@ void CrashBoundaries(const char* executable) {
         CrashModel(layout, model, 1);
         SecondaryIndex index(root, layout, column, Identity(1U));
         const auto report = index.Open(model.Source());
-        assert(report.rebuilt.empty());
+        // An index that crashed before it was ready builds again.
+        assert(report.rebuilt.empty() == (std::string_view(point).find("REBUILD") == std::string_view::npos));
         assert(Same(Effective(index), Expected(layout, column, 0U, model)));
         assert(index.Verify(model.Source()).empty());
         std::size_t runs = 0U;
@@ -529,4 +639,5 @@ int main(int argc, char** argv) {
     EntriesSkipNullNanAndAbsentBlocks();
     ManifestRoundTripAndDamage();
     LayersFollowChunkState();
+    RemovedEntriesFollowSnapshots();
 }

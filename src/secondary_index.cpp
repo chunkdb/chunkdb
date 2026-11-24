@@ -8,6 +8,7 @@
 #include <set>
 #include <stdexcept>
 #include <string_view>
+#include <system_error>
 #include <utility>
 
 #include "checkpoint.hpp"
@@ -240,12 +241,30 @@ class RunReader {
         Reader reader(bytes, "index run block index");
         const auto count = reader.U32();
         if (count != block_count_) throw std::runtime_error("index run block index has another number of blocks");
+        // Each listed block must start where the previous one ends and begin
+        // with the entry the index names.
+        std::uint64_t block_at = blocks_at_;
         for (std::uint32_t i = 0U; i < count; ++i) {
             const auto offset = reader.U64();
-            (void)reader.U32();
-            (void)ReadEntry(reader, dims_);
-            if (offset < blocks_at_ || offset >= block_index_at_) throw std::runtime_error("index run block index points outside its blocks");
+            if (reader.U32() != 0U) throw std::runtime_error("index run block index has reserved bits set");
+            const auto first = ReadEntry(reader, dims_);
+            if (offset != block_at || block_index_at_ - block_at < 12U)
+                throw std::runtime_error("index run block index does not match its blocks");
+            const auto head = ReadRange(input_, block_at, 8U, "index run block");
+            Reader sizes(head, "index run block");
+            const auto entries = sizes.U32();
+            const auto body = sizes.U32();
+            if (entries == 0U || body > block_index_at_ - block_at - 12U)
+                throw std::runtime_error("index run block index does not match its blocks");
+            const auto block = ReadRange(input_, block_at + 8U, body, "index run block");
+            Reader entry_reader(block, "index run block");
+            const auto actual = ReadEntry(entry_reader, dims_);
+            if (actual.key != first.key || !(actual.coord == first.coord) || actual.block != first.block ||
+                actual.removed != first.removed)
+                throw std::runtime_error("index run block index names another first entry");
+            block_at += 8U + body + 4U;
         }
+        if (block_at != block_index_at_) throw std::runtime_error("index run block index does not cover its blocks");
         const auto crc_at = reader.offset();
         RequireCrc(std::span(bytes).first(crc_at), reader.U32(), "index run block index");
         if (!reader.done()) throw std::runtime_error("index run block index has trailing bytes");
@@ -270,10 +289,30 @@ class RunReader {
     std::uint32_t blocks_read_ = 0U;
 };
 
+// The largest manifest: its fixed fields, kMaxIndexRuns runs and the CRC.
+constexpr std::uint64_t kMaxManifestBytes = 60U + kMaxIndexRuns * 48U + 4U;
+
 std::vector<std::uint8_t> LoadWhole(const std::filesystem::path& path) {
     SharedFileInput input(path);
     if (!input) throw std::runtime_error("index manifest cannot be opened");
-    return ReadRange(input, 0U, FileBytes(input), "index manifest");
+    const auto size = FileBytes(input);
+    if (size > kMaxManifestBytes) throw std::runtime_error("index manifest is larger than any manifest");
+    return ReadRange(input, 0U, size, "index manifest");
+}
+
+// The SHA-256 and size of a whole file.
+crypto::Sha256Digest FileDigest(const std::filesystem::path& path, std::uint64_t* bytes) {
+    SharedFileInput input(path);
+    if (!input) throw std::runtime_error("cannot be opened");
+    crypto::Sha256 digest;
+    std::array<char, 64U * 1024U> buffer{};
+    *bytes = 0U;
+    while (input.read(buffer.data(), static_cast<std::streamsize>(buffer.size())) || input.gcount() > 0) {
+        const auto count = static_cast<std::size_t>(input.gcount());
+        digest.Update(std::span(reinterpret_cast<const std::uint8_t*>(buffer.data()), count));
+        *bytes += count;
+    }
+    return digest.Finish();
 }
 
 bool RunGeneration(const std::filesystem::path& path, std::uint64_t* generation) {
@@ -459,7 +498,7 @@ IndexManifest ParseIndexManifest(std::span<const std::uint8_t> bytes) {
     manifest.identity.schema_version = reader.U64();
     manifest.generation = reader.U64();
     const auto runs = reader.U32();
-    if (runs > kMaxIndexRuns + 1U) throw std::runtime_error("index manifest lists too many runs");
+    if (runs > kMaxIndexRuns) throw std::runtime_error("index manifest lists too many runs");
     for (std::uint32_t i = 0U; i < runs; ++i) {
         IndexRunRef run;
         run.generation = reader.U64();
@@ -476,8 +515,9 @@ IndexManifest ParseIndexManifest(std::span<const std::uint8_t> bytes) {
 }
 
 SecondaryIndex::SecondaryIndex(std::filesystem::path directory, const ChunkLayout& layout, std::size_t column_index,
-    IndexIdentity identity)
-    : directory_(std::move(directory)), layout_(layout), column_index_(column_index), identity_(identity) {
+    IndexIdentity identity, bool read_only)
+    : directory_(std::move(directory)), layout_(layout), column_index_(column_index), identity_(identity),
+      read_only_(read_only) {
     RequireIndexableColumn(layout_.schema().columns.at(column_index_), identity_.prefix);
     if (layout_.schema().columns.at(column_index_).id != identity_.column_id)
         throw std::invalid_argument("index column id does not match its layout");
@@ -490,6 +530,10 @@ std::filesystem::path SecondaryIndex::ManifestPath(const std::filesystem::path& 
 
 std::filesystem::path SecondaryIndex::RunPath(const std::filesystem::path& directory, std::uint64_t generation) {
     return directory / (std::string(kRunPrefix) + std::to_string(generation));
+}
+
+void SecondaryIndex::RequireWriter() const {
+    if (read_only_) throw std::logic_error("a read-only index writes no file");
 }
 
 void SecondaryIndex::Clear() noexcept {
@@ -510,7 +554,12 @@ void SecondaryIndex::LoadOrThrow() {
         throw std::runtime_error("the index belongs to another table epoch, column or prefix");
     for (std::size_t layer = 0U; layer < manifest.runs.size(); ++layer) {
         const auto& run = manifest.runs[layer];
-        RunReader reader(RunPath(directory_, run.generation), identity_, run.generation, run.bytes);
+        const auto path = RunPath(directory_, run.generation);
+        RunReader reader(path, identity_, run.generation, run.bytes);
+        // A flipped byte anywhere in a run is found here, not by a later read.
+        std::uint64_t bytes = 0U;
+        if (FileDigest(path, &bytes) != run.sha256 || bytes != run.bytes)
+            throw std::runtime_error("index run does not match the digest its manifest lists");
         // Runs are newest first, so the first layer to cover a chunk wins.
         for (const auto& chunk : reader.chunks()) covers_.try_emplace(chunk.coord, Cover{layer, chunk.revision});
         run_entries_.push_back(reader.entry_count());
@@ -545,10 +594,11 @@ SecondaryIndex::OpenReport SecondaryIndex::Open(const IndexChunkSource& source) 
         report.rebuilt = error.what();
     }
     if (!report.rebuilt.empty()) {
-        Rebuild(source);
+        if (read_only_) RebuildInMemory(source);
+        else Rebuild(source);
         return report;
     }
-    RemoveUnlisted();
+    if (!read_only_) RemoveUnlisted();
     RefreshCovers(source, &report);
     return report;
 }
@@ -584,7 +634,18 @@ void SecondaryIndex::RefreshCovers(const IndexChunkSource& source, OpenReport* r
     }
 }
 
+void SecondaryIndex::RebuildInMemory(const IndexChunkSource& source) {
+    Clear();
+    manifest_ = IndexManifest{.identity = identity_, .state = IndexState::kReady};
+    source.for_each([&](const ChunkCoord& coord, std::uint64_t, bool populated) {
+        if (!populated) return;
+        const auto state = source.read(coord);
+        if (!state.presence_bitmap.empty()) Replace(coord, state.version, EntriesOf(state, coord));
+    });
+}
+
 void SecondaryIndex::Rebuild(const IndexChunkSource& source) {
+    RequireWriter();
     std::uint64_t generation = manifest_.generation;
     std::error_code ec;
     std::filesystem::create_directories(directory_);
@@ -600,6 +661,7 @@ void SecondaryIndex::Rebuild(const IndexChunkSource& source) {
         if (!state.presence_bitmap.empty()) Replace(coord, state.version, EntriesOf(state, coord));
     });
     Merge();
+    Crash("CHUNKDB_FAILPOINT_CRASH_INDEX_REBUILD_BEFORE_READY_ONCE");
     SetState(IndexState::kReady);
     RemoveUnlisted();
 }
@@ -725,9 +787,19 @@ IndexRunRef SecondaryIndex::WriteRun(std::uint64_t generation, const std::vector
 }
 
 void SecondaryIndex::PublishManifest(IndexManifest next) {
+    RequireWriter();
     next.identity = identity_;
     std::filesystem::create_directories(directory_);
-    AtomicWrite(ManifestPath(directory_), SerializeIndexManifest(next), true, true);
+    // A synced temporary manifest replaces the old one atomically; a crash
+    // before the rename leaves the old one and a file open removes.
+    const auto path = ManifestPath(directory_);
+    auto temporary = path;
+    temporary += ".tmp";
+    WriteAtomicTempFile(temporary, SerializeIndexManifest(next), true, true);
+    Crash("CHUNKDB_FAILPOINT_CRASH_INDEX_MANIFEST_BEFORE_RENAME_ONCE");
+    if (const auto error = ReplacePathAtomically(temporary, path); error)
+        throw std::system_error(error, "failed to publish index manifest " + path.string());
+    SyncDirectoryPath(directory_);
     manifest_ = std::move(next);
 }
 
@@ -738,15 +810,34 @@ void SecondaryIndex::SetState(IndexState state) {
     PublishManifest(std::move(next));
 }
 
-void SecondaryIndex::Flush() {
+namespace {
+// An entry a snapshot may still read: current, or removed after the oldest
+// open snapshot.
+bool Kept(const IndexEntry& entry, std::uint64_t oldest_snapshot) noexcept {
+    return entry.removed == 0U || entry.removed > oldest_snapshot;
+}
+}  // namespace
+
+void SecondaryIndex::Flush(std::uint64_t oldest_snapshot) {
+    RequireWriter();
     if (delta_.empty()) return;
+    // One more run would exceed what a manifest lists: merge instead.
+    if (manifest_.runs.size() >= kMaxIndexRuns) {
+        Merge(oldest_snapshot);
+        return;
+    }
     const auto generation = manifest_.generation + 1U;
     std::vector<IndexRunChunk> chunks;
     chunks.reserve(delta_.size());
     std::vector<const IndexEntry*> ordered;
     for (const auto& [coord, chunk] : delta_) {
-        chunks.push_back({coord, chunk.revision, static_cast<std::uint32_t>(chunk.entries.size())});
-        for (const auto& entry : chunk.entries) ordered.push_back(&entry);
+        std::uint32_t kept = 0U;
+        for (const auto& entry : chunk.entries) {
+            if (!Kept(entry, oldest_snapshot)) continue;
+            ordered.push_back(&entry);
+            ++kept;
+        }
+        chunks.push_back({coord, chunk.revision, kept});
     }
     std::sort(ordered.begin(), ordered.end(), [](const IndexEntry* a, const IndexEntry* b) { return IndexEntryLess(*a, *b); });
     const auto ref = WriteRun(generation, chunks, [&](const std::function<void(const IndexEntry&)>& emit) {
@@ -763,10 +854,11 @@ void SecondaryIndex::Flush() {
     }
     delta_.clear();
     const bool large = run_entries_.size() > 1U && run_entries_.front() * 4U >= run_entries_.back();
-    if (manifest_.runs.size() > kMaxIndexRuns || large) Merge();
+    if (large) Merge(oldest_snapshot);
 }
 
-void SecondaryIndex::Merge() {
+void SecondaryIndex::Merge(std::uint64_t oldest_snapshot) {
+    RequireWriter();
     if (manifest_.runs.size() <= 1U && delta_.empty()) return;
     const auto previous = manifest_.runs;
     const auto generation = manifest_.generation + 1U;
@@ -774,7 +866,7 @@ void SecondaryIndex::Merge() {
     for (const auto& [coord, cover] : covers_)
         if (cover.revision != 0U) counts.emplace(coord, 0U);
     ForEach([&](const IndexEntry& entry) {
-        ++counts[entry.coord];
+        if (Kept(entry, oldest_snapshot)) ++counts[entry.coord];
         return true;
     });
     std::vector<IndexRunChunk> chunks;
@@ -786,7 +878,7 @@ void SecondaryIndex::Merge() {
     }
     const auto ref = WriteRun(generation, chunks, [&](const std::function<void(const IndexEntry&)>& emit) {
         ForEach([&](const IndexEntry& entry) {
-            emit(entry);
+            if (Kept(entry, oldest_snapshot)) emit(entry);
             return true;
         });
     });
@@ -862,17 +954,8 @@ std::vector<std::string> SecondaryIndex::Verify(const IndexChunkSource& source) 
         const auto path = RunPath(directory_, run.generation);
         const auto name = path.filename().string();
         try {
-            SharedFileInput input(path);
-            if (!input) throw std::runtime_error("cannot be opened");
-            crypto::Sha256 digest;
-            std::array<char, 64U * 1024U> buffer{};
             std::uint64_t bytes = 0U;
-            while (input.read(buffer.data(), buffer.size()) || input.gcount() > 0) {
-                const auto count = static_cast<std::size_t>(input.gcount());
-                digest.Update(std::span(reinterpret_cast<const std::uint8_t*>(buffer.data()), count));
-                bytes += count;
-            }
-            if (bytes != run.bytes || digest.Finish() != run.sha256)
+            if (FileDigest(path, &bytes) != run.sha256 || bytes != run.bytes)
                 throw std::runtime_error("does not match the digest its manifest lists");
             RunReader reader(path, identity_, run.generation, run.bytes);
             reader.CheckBlockIndex();
@@ -898,8 +981,10 @@ std::vector<std::string> SecondaryIndex::Verify(const IndexChunkSource& source) 
     }
     if (!problems.empty()) return problems;
     std::map<ChunkCoord, std::vector<IndexEntry>> actual;
+    // Only current entries follow from chunk state; removal-marked ones are
+    // kept for snapshots.
     ForEach([&](const IndexEntry& entry) {
-        actual[entry.coord].push_back(entry);
+        if (entry.removed == 0U) actual[entry.coord].push_back(entry);
         return true;
     });
     const auto same = [](const std::vector<IndexEntry>& a, const std::vector<IndexEntry>& b) {

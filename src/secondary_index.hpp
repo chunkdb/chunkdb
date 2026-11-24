@@ -27,6 +27,8 @@ inline constexpr std::string_view kIndexesDirectoryName = "indexes";
 inline constexpr std::uint32_t kMaxIndexKeyBytes = 256U;
 // Runs above this many are merged into one.
 inline constexpr std::size_t kMaxIndexRuns = 8U;
+// No open snapshot: entries removed at any revision can be dropped.
+inline constexpr std::uint64_t kNoOpenSnapshot = static_cast<std::uint64_t>(-1);
 
 // Throws std::invalid_argument unless `column` can be indexed with `prefix`
 // (0 for none): a fixed-width column of at most kMaxIndexKeyBytes, or a text
@@ -113,9 +115,10 @@ struct IndexChunkSource {
 class SecondaryIndex {
   public:
     // `directory` is the index's own directory; `column_index` the place of
-    // the indexed column in the layout.
+    // the indexed column in the layout. A read-only index never writes or
+    // removes a file: what it cannot trust it recomputes in memory.
     SecondaryIndex(std::filesystem::path directory, const ChunkLayout& layout, std::size_t column_index,
-        IndexIdentity identity);
+        IndexIdentity identity, bool read_only = false);
 
     struct OpenReport {
         // Why the index was rebuilt from chunk state; empty when it was not.
@@ -123,10 +126,11 @@ class SecondaryIndex {
         // Chunks recomputed because their covering layer was stale.
         std::size_t recomputed = 0U;
     };
-    // Loads the manifest and the runs' chunk tables, removes files the
-    // manifest does not list, and brings every chunk of `source` up to date
-    // in the delta. A missing, damaged or foreign manifest or run, or an
-    // index still building, is rebuilt from `source` and flushed.
+    // Loads the manifest and the runs' chunk tables, checks each listed run's
+    // digest, removes files the manifest does not list, and brings every
+    // chunk of `source` up to date in the delta. A missing, damaged or foreign
+    // manifest or run, or an index still building, is rebuilt from `source`
+    // and flushed, or in memory when read-only.
     OpenReport Open(const IndexChunkSource& source);
     // Recomputes every chunk of `source` and replaces the runs with one.
     void Rebuild(const IndexChunkSource& source);
@@ -136,11 +140,14 @@ class SecondaryIndex {
     // The delta covers `coord` with no populated state.
     void Forget(const ChunkCoord& coord);
     // Writes the delta as the newest run and publishes a manifest that lists
-    // it; merges every run into one once there are more than kMaxIndexRuns,
-    // or when the delta reached a quarter of the oldest run's entries.
-    void Flush();
-    // Writes every effective entry as one run and publishes it.
-    void Merge();
+    // it; merges instead when kMaxIndexRuns runs exist, and afterwards when
+    // the delta reached a quarter of the oldest run's entries. Entries
+    // removed at or before `oldest_snapshot`, the oldest open snapshot's
+    // revision, are dropped.
+    void Flush(std::uint64_t oldest_snapshot = kNoOpenSnapshot);
+    // Writes every effective entry as one run and publishes it, dropping
+    // entries removed at or before `oldest_snapshot`.
+    void Merge(std::uint64_t oldest_snapshot = kNoOpenSnapshot);
     // Publishes `state` in a new manifest.
     void SetState(IndexState state);
 
@@ -150,9 +157,10 @@ class SecondaryIndex {
     // The revision that covers `coord`, and whether any layer does.
     [[nodiscard]] bool Covered(const ChunkCoord& coord, std::uint64_t* revision) const;
 
-    // Checks every run's digest, block checksums and order, and that each
-    // chunk of `source` has exactly the entries its state gives. Returns one
-    // line per problem.
+    // Checks every run's digest, block checksums, block index and order, and
+    // that each chunk of `source` has exactly the current entries its state
+    // gives; removal-marked entries are not compared. Returns one line per
+    // problem.
     [[nodiscard]] std::vector<std::string> Verify(const IndexChunkSource& source) const;
 
     [[nodiscard]] IndexState state() const noexcept { return manifest_.state; }
@@ -176,6 +184,8 @@ class SecondaryIndex {
     static constexpr std::size_t kDelta = static_cast<std::size_t>(-1);
 
     void LoadOrThrow();
+    void RebuildInMemory(const IndexChunkSource& source);
+    void RequireWriter() const;
     void RemoveUnlisted() const;
     void Clear() noexcept;
     void PublishManifest(IndexManifest next);
@@ -189,6 +199,7 @@ class SecondaryIndex {
     const ChunkLayout& layout_;
     std::size_t column_index_;
     IndexIdentity identity_;
+    bool read_only_;
     IndexManifest manifest_{};
     std::vector<std::uint64_t> run_entries_;
     std::map<ChunkCoord, DeltaChunk> delta_;

@@ -466,7 +466,7 @@ Integers are little-endian; coordinates are the table's active axes as two's-com
 
 | File | Encoding |
 | --- | --- |
-| `manifest` | `CKXM`, version `1:u16`, reserved zero `u16`, table epoch (16 bytes), dims `u8`, state `u8` (1 building, 2 ready), reserved zero `u16`, index id `u32`, column id `u32`, prefix `u32`, schema version `u64`, generation `u64`, run count `u32` (at most 9), per run newest first its generation `u64`, bytes `u64` and SHA-256 (32 bytes), CRC32 over everything before it |
+| `manifest` | `CKXM`, version `1:u16`, reserved zero `u16`, table epoch (16 bytes), dims `u8`, state `u8` (1 building, 2 ready), reserved zero `u16`, index id `u32`, column id `u32`, prefix `u32`, schema version `u64`, generation `u64`, run count `u32` (at most 8), per run newest first its generation `u64`, bytes `u64` and SHA-256 (32 bytes), CRC32 over everything before it |
 | `run-<generation>` header | `CKXR`, version `1:u16`, reserved zero `u16`, table epoch, dims `u8`, reserved zero `u8` and `u16`, index id, column id and prefix `u32`, schema version `u64`, generation `u64`, chunk count `u64`, CRC32 of the 64 bytes before it |
 | chunk table | per chunk in ascending coordinates: coordinates, revision `u64` (0 for no populated state), entry count `u32`; CRC32 of the table |
 | entry blocks | per block: entry count `u32`, body bytes `u32`, body, CRC32 of the block before it; at most 512 entries or about 64 KiB each |
@@ -474,8 +474,9 @@ Integers are little-endian; coordinates are the table's active axes as two's-com
 | block index | block count `u32`, per block its file offset `u64`, reserved zero `u32` and first entry, CRC32 |
 | footer | chunk table, entry blocks and block index offsets `u64`, entry count `u64`, block count `u32`, `CKXE`, CRC32 of the 40 bytes before it |
 
-A manifest whose epoch, dims, index id, column id or prefix differ from the table's, an index still building, or a listed run whose size, header, footer or chunk table does not check is rebuilt; verification also checks each run's SHA-256, block checksums and order, and every chunk's entries against its state.
-A run is written under a temporary name, synced, renamed and its directory synced before the manifest that lists it replaces the previous one the same way; files the manifest does not list are removed when the index opens.
+A manifest larger than 448 bytes or whose epoch, dims, index id, column id or prefix differ from the table's, an index still building, or a listed run whose size, SHA-256, header, footer or chunk table does not check is rebuilt; the recorded schema version does not decide this. Verification also checks each run's block checksums, block index and order, and every chunk's current entries against its state.
+A run is written under a temporary name, synced, renamed and its directory synced before the manifest that lists it replaces the previous one the same way; files the manifest does not list are removed when a writer opens the index, and a read-only process writes and removes nothing.
+A flush that would make more than 8 runs merges instead; flushes and merges drop entries removed at or before the oldest open snapshot's revision.
 
 ## Conditional and transaction intents
 

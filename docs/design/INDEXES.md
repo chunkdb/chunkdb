@@ -75,7 +75,7 @@ Opening a table loads the index manifest and the runs' chunk tables after chunk 
 Each chunk the coordinate index lists is compared with its covering layer: a missing chunk, a different revision or a covered chunk that is no longer populated has its entries recomputed from its recovered state into the delta.
 This is the WAL replay of the index: chunk recovery already applied every durable frame after the run, and the comparison finds every chunk it changed.
 The comparison walks the coordinate index once and reads only the changed chunks.
-A missing, unreadable or mismatched manifest, a run whose checksum, header, table identity, index identity or schema version does not match, or an index in state `building` is rebuilt from the chunk images.
+A missing, unreadable or mismatched manifest, a run whose digest, header, table identity or index identity does not match, or an index in state `building` is rebuilt from the chunk images; the schema version a run records does not decide this (see Build and drop).
 A rebuild sets the index to `building`, and GET BLOCKS that would use it returns `INDEX_BUILDING name=...` until it is ready, or scans with ALLOW SCAN.
 Every rebuild and every chunk recomputed at open is logged with the index name.
 
@@ -93,7 +93,7 @@ ALTER TABLE that drops, renames or changes the type of an indexed column is refu
 An index page seeks the chosen key ranges after `AFTER`, merges the layers in key order, skips entries of chunks a newer layer covers, and checks each candidate.
 A page costs its rows and the candidates it discards, each a seek in up to 9 layers and a block read; it does not grow with the table.
 Inside a transaction, a page reads candidates from the index and checks them at the snapshot; entries removed after the snapshot are kept with their removal revision in the delta and in the runs written from it (see Structure), within `--txn-history-bytes`; a snapshot that outlives that bound ends with CONFLICT reason=history_limit as other snapshot reads do.
-A read-only process loads the runs, recomputes stale chunks into its own delta at open, and recomputes the chunks the writer reports in `chunkdb.snapshot.changes` before a page, as it does for the coordinate index.
+A read-only process never writes or removes an index file: it loads the runs, recomputes stale chunks into its own delta at open, rebuilds in memory an index it cannot trust, and recomputes the chunks the writer reports in `chunkdb.snapshot.changes` before a page, as it does for the coordinate index.
 
 ## Commit groups
 
