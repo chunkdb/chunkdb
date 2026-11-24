@@ -56,6 +56,8 @@ struct FeedOptions {
     // Publication/control wake notification: must not block, throw or re-enter.
     // Runs on the sender or exclusive table control, never ordinary writers.
     std::function<void()> notify{};
+    // A slot watch's partitions of a partitioned slot; empty for every partition.
+    std::vector<std::uint16_t> partitions{};
 };
 
 struct FeedBlockChange {

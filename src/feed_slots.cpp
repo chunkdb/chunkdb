@@ -13,6 +13,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
 #include "feed_archive.hpp"
+#include "feed_slot_partitions.hpp"
 #include "wal_replay.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "shared_file_input.hpp"
@@ -129,10 +130,11 @@ void FeedSlotTestAccess::Retain(Table& table) {
     if (!lease) throw TableNotFoundError("table was dropped");
     lease->store().feed_slots_->Retain();
 }
-void FeedSlotTestAccess::StageAck(Table& table, std::string_view name, FeedPosition position) {
+void FeedSlotTestAccess::StageAck(Table& table, std::string_view name, FeedPosition position,
+    const std::vector<std::uint16_t>& partitions) {
     auto lease = table.Acquire();
     if (!lease) throw TableNotFoundError("table was dropped");
-    lease->store().feed_slots_->StageAck(name, position);
+    lease->store().feed_slots_->StageAck(name, position, partitions);
 }
 bool FeedSlotTestAccess::FlushAcks(Table& table, bool force, std::chrono::steady_clock::time_point now) {
     auto lease = table.Acquire();
@@ -167,6 +169,8 @@ FeedSlots::FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::mill
         throw std::runtime_error("chunkdb.slots filters require the slot filters storage feature");
     if (!records_.slots.empty() && (store.features_.incompat & kFeatureFeedSlots) == 0U)
         throw std::runtime_error("chunkdb.slots requires the feed slots storage feature");
+    if (records_.partition_format && (store.features_.incompat & kFeatureSlotPartitions) == 0U)
+        throw std::runtime_error("chunkdb.slots partitions require the slot partitions storage feature");
     const bool originally_enabled = std::any_of(records_.slots.begin(), records_.slots.end(), [](const auto& slot) { return !slot.lost; });
     if (originally_enabled && store.allow_multiple_processes_)
         throw std::invalid_argument("feed slots require a single-process table");
@@ -176,7 +180,7 @@ FeedSlots::FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::mill
         const auto& columns = store.geometry_.layout().schema().columns;
         if (std::any_of(slot.filters.column_ids->begin(), slot.filters.column_ids->end(), [&](const auto id) {
             return std::none_of(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
-        })) { slot.lost = true; slot.schema_filter_lost = true; slot.resync = false; changed = true; }
+        })) { MarkFeedSlotRecordLost(slot); slot.schema_filter_lost = true; changed = true; }
     }
     if (changed && store.access_mode_ == AccessMode::kReadWrite) WriteFeedSlotRecords(store.data_dir_, records_);
     const bool enabled = std::any_of(records_.slots.begin(), records_.slots.end(), [](const auto& slot) { return !slot.lost; });
@@ -311,6 +315,8 @@ void FeedSlots::Run() {
 void FeedSlots::Persist(FeedSlotRecords next) {
     next.filter_format = next.filter_format || std::any_of(next.slots.begin(), next.slots.end(),
         [](const auto& slot) { return !slot.filters.empty() || slot.schema_filter_lost; });
+    next.partition_format = next.partition_format || std::any_of(next.slots.begin(), next.slots.end(),
+        [](const auto& slot) { return !slot.partitions.empty(); });
     bool published = false;
     try { WriteFeedSlotRecords(store_.data_dir_, next, &published); }
     catch (const std::exception& error) {
@@ -330,32 +336,38 @@ void FeedSlots::Persist(FeedSlotRecords next) {
         std::memory_order_release);
 }
 FeedSlot FeedSlots::Create(std::string_view name, std::uint64_t completed, bool if_not_exists, const FeedSlotFilters& filters,
-    std::optional<std::string> owner) {
+    std::optional<std::string> owner, std::uint32_t partitions) {
     RequireValidFeedSlotName(name);
+    if (partitions == 0U || partitions > kMaxFeedSlotPartitions) throw std::invalid_argument("PARTITIONS must be between 1 and 256");
     store_.ThrowIfDurabilityPoisoned();
+    const auto existing = [&](const FeedSlotRecord& found) {
+        if (found.filters != filters) throw FeedSlotFiltersError("feed slot filters differ from existing slot");
+        if (FeedSlotPartitionCount(found.partitions) != partitions) throw FeedSlotFiltersError("feed slot partitions differ from existing slot");
+        FeedSlot slot{found.name, {records_.epoch, found.written}, records_.durable_watermark, 0U, found.lost, found.filters, found.schema_filter_lost, found.owner};
+        slot.resync = found.resync;
+        slot.partitions = found.partitions;
+        return slot;
+    };
     if (if_not_exists) {
         std::lock_guard lock(mutex_);
         const auto found = std::find_if(records_.slots.begin(), records_.slots.end(),
             [&](const auto& slot) { return slot.name == name; });
-        if (found != records_.slots.end()) {
-            if (found->filters != filters) throw FeedSlotFiltersError("feed slot filters differ from existing slot");
-            return {found->name, {records_.epoch, found->written}, records_.durable_watermark, 0U, found->lost, found->filters, found->schema_filter_lost, found->owner};
-        }
+        if (found != records_.slots.end()) return existing(*found);
     }
     Sync(completed);
     std::lock_guard lock(mutex_);
     auto next = records_;
     const auto found = std::find_if(next.slots.begin(), next.slots.end(), [&](const auto& slot) { return slot.name == name; });
     if (found != next.slots.end()) {
-        if (if_not_exists) {
-            if (found->filters != filters) throw FeedSlotFiltersError("feed slot filters differ from existing slot");
-            return {found->name, {records_.epoch, found->written}, records_.durable_watermark, 0U, found->lost, found->filters, found->schema_filter_lost, found->owner};
-        }
+        if (if_not_exists) return existing(*found);
         throw std::invalid_argument("feed slot already exists: " + std::string(name));
     }
     next.slots.push_back({std::string(name), completed, false, filters, false, owner});
+    if (partitions > 1U) next.slots.back().partitions.assign(partitions, FeedSlotPartition{completed, false});
     Persist(std::move(next));
-    return {std::string(name), {store_.store_id_, completed}, records_.durable_watermark, 0U, false, filters, false, std::move(owner)};
+    FeedSlot slot{std::string(name), {store_.store_id_, completed}, records_.durable_watermark, 0U, false, filters, false, std::move(owner)};
+    slot.partitions = records_.slots.back().partitions;
+    return slot;
 }
 void FeedSlots::Drop(std::string_view name, bool if_exists) {
     RequireValidFeedSlotName(name);
@@ -366,10 +378,9 @@ void FeedSlots::Drop(std::string_view name, bool if_exists) {
         if (if_exists) return;
         throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
     }
-    const auto pending = acknowledgements_->pending.find(std::string(name));
     next.slots.erase(it);
     Persist(std::move(next));
-    if (pending != acknowledgements_->pending.end()) acknowledgements_->pending.erase(pending);
+    acknowledgements_->Erase(std::string(name));
 }
 void FeedSlots::BindOwner(std::string_view name, const std::string& owner) {
     RequireValidFeedSlotOwner(owner);
@@ -393,11 +404,11 @@ void FeedSlots::Advance(std::string_view name, FeedPosition position) {
         it->schema_filter_lost ? "schema_filter" : "retention_limit");
     if (position.epoch != next.epoch || position.revision < it->written || position.revision > next.durable_watermark)
         throw std::invalid_argument("feed slot position has wrong epoch, decreases or exceeds durable watermark");
-    if (position.revision == it->written) return;
-    it->written = position.revision;
+    // Every partition moves to at least the position; resync stays.
+    if (!AdvanceFeedSlotRecord(*it, {}, position.revision, false)) return;
     Persist(std::move(next));
 }
-void FeedSlots::StageAck(std::string_view name, FeedPosition position) {
+void FeedSlots::StageAck(std::string_view name, FeedPosition position, const std::vector<std::uint16_t>& partitions) {
     store_.ThrowIfDurabilityPoisoned();
     std::lock_guard lock(mutex_);
     const auto slot = std::find_if(records_.slots.begin(), records_.slots.end(),
@@ -407,21 +418,41 @@ void FeedSlots::StageAck(std::string_view name, FeedPosition position) {
             slot->schema_filter_lost ? "schema_filter" : "retention_limit");
     if (position.epoch != records_.epoch) throw std::invalid_argument("ACK belongs to another epoch");
     if (position.revision <= slot->written) return;
-    auto& pending = acknowledgements_->pending[std::string(name)];
-    pending = std::max(pending, position.revision);
+    if (slot->partitions.empty()) {
+        auto& pending = acknowledgements_->pending[std::string(name)];
+        pending = std::max(pending, position.revision);
+        return;
+    }
+    for (std::size_t i = 0U; i < slot->partitions.size(); ++i) {
+        const auto partition = static_cast<std::uint16_t>(i);
+        if (!partitions.empty() && !std::binary_search(partitions.begin(), partitions.end(), partition)) continue;
+        if (position.revision <= slot->partitions[i].written) continue;
+        auto& pending = acknowledgements_->partition_pending[{std::string(name), partition}];
+        pending = std::max(pending, position.revision);
+    }
 }
 bool FeedSlots::FlushAcks(bool force, std::chrono::steady_clock::time_point now) {
     store_.ThrowIfDurabilityPoisoned();
     std::lock_guard lock(mutex_);
-    if (acknowledgements_->pending.empty()) return false;
+    if (acknowledgements_->empty()) return false;
     if (!force && now - acknowledgements_->flushed < std::chrono::milliseconds(100)) return false;
     auto next = records_;
     bool changed = false;
     for (auto& slot : next.slots) {
-        const auto pending = acknowledgements_->pending.find(slot.name);
-        if (slot.lost || pending == acknowledgements_->pending.end() || pending->second > next.durable_watermark) continue;
+        if (slot.lost) continue;
         // An acknowledgement past the position follows the resync a watch sent first.
-        if (pending->second > slot.written) { slot.written = pending->second; slot.resync = false; changed = true; }
+        if (slot.partitions.empty()) {
+            const auto pending = acknowledgements_->pending.find(slot.name);
+            if (pending == acknowledgements_->pending.end() || pending->second > next.durable_watermark) continue;
+            changed = AdvanceFeedSlotRecord(slot, {}, pending->second) || changed;
+            continue;
+        }
+        for (std::size_t i = 0U; i < slot.partitions.size(); ++i) {
+            const auto partition = static_cast<std::uint16_t>(i);
+            const auto pending = acknowledgements_->partition_pending.find({slot.name, partition});
+            if (pending == acknowledgements_->partition_pending.end() || pending->second > next.durable_watermark) continue;
+            changed = AdvanceFeedSlotRecord(slot, {partition}, pending->second) || changed;
+        }
     }
     if (changed) {
         Persist(std::move(next));
@@ -432,6 +463,12 @@ bool FeedSlots::FlushAcks(bool force, std::chrono::steady_clock::time_point now)
         const auto slot = std::find_if(records_.slots.begin(), records_.slots.end(),
             [&](const auto& record) { return record.name == pending.first; });
         return slot == records_.slots.end() || slot->lost || pending.second <= slot->written;
+    });
+    std::erase_if(acknowledgements_->partition_pending, [&](const auto& pending) {
+        const auto slot = std::find_if(records_.slots.begin(), records_.slots.end(),
+            [&](const auto& record) { return record.name == pending.first.first; });
+        return slot == records_.slots.end() || slot->lost || pending.first.second >= slot->partitions.size() ||
+            pending.second <= slot->partitions[pending.first.second].written;
     });
     return changed;
 }
@@ -474,6 +511,7 @@ std::vector<FeedSlot> FeedSlots::List(bool include_lost) const {
         if (slot.lost && !include_lost) continue;
         result.push_back({slot.name, {records_.epoch, slot.written}, records_.durable_watermark, retained[result.size()], slot.lost, slot.filters, slot.schema_filter_lost, slot.owner});
         result.back().resync = slot.resync;
+        result.back().partitions = slot.partitions;
     }
     return result;
 }
@@ -489,6 +527,7 @@ FeedSlot FeedSlots::Get(std::string_view name) const {
     if (it == records_.slots.end()) throw FeedSlotNotFoundError("unknown feed slot: " + std::string(name));
     FeedSlot slot{it->name, {records_.epoch, it->written}, records_.durable_watermark, 0U, it->lost, it->filters, it->schema_filter_lost, it->owner};
     slot.resync = it->resync;
+    slot.partitions = it->partitions;
     return slot;
 }
 FeedArchiveReader FeedSlots::Reader(FeedPosition after) {
@@ -644,13 +683,13 @@ void FeedSlots::Retain() {
     for (auto& slot : next.slots) {
         if (!slot.lost && retained[live++] > max_bytes_) {
             // A lost slot refuses its watches, so it has no resync to give.
-            slot.lost = true; slot.resync = false;
+            MarkFeedSlotRecordLost(slot);
             lost.push_back(slot.name);
         }
     }
     if (!lost.empty()) {
         Persist(std::move(next));
-        for (const auto& name : lost) acknowledgements_->pending.erase(name);
+        for (const auto& name : lost) acknowledgements_->Erase(name);
     }
     for (const auto& name : lost)
         LogMessage(LogLevel::kWarn, LogComponent::kStore, "feed slot lost: retention limit exceeded", {{"slot", name}});

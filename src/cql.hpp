@@ -302,6 +302,8 @@ struct CreateSlot {
     bool no_before = false;
     bool chunks = false;
     std::optional<std::string> owner{};
+    // PARTITIONS n, 1 to 256.
+    std::optional<std::uint32_t> partitions{};
 };
 struct DropSlot {
     std::string name;
@@ -355,6 +357,8 @@ struct Watch {
     std::optional<FeedPosition> after{};
     std::optional<std::uint64_t> ack_timeout_ms{};
     bool takeover = false;
+    // PARTITION p, ...: the partitions of a partitioned slot; empty for the slot's share.
+    std::vector<std::uint16_t> partitions{};
 };
 struct Unwatch {};
 struct Ack {

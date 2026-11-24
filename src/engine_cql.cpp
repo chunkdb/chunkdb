@@ -1645,6 +1645,8 @@ std::string CommandEngine::ExecuteStatement(
                         },
                         [&](const cql::CreateSlot& slot) {
                             RequireRight(session, slot.table, Right::kAdmin);
+                            // A migration's slot request has no partition count.
+                            if (slot.partitions) throw std::invalid_argument("MIGRATE does not take PARTITIONS; create a partitioned slot outside a migration");
                             request.kind = MigrationRequest::Kind::kCreateSlot; request.table = slot.table; request.slot = slot.name; request.if_not_exists = slot.if_not_exists;
                             request.slot_filters = {.area = slot.area, .no_before = slot.no_before, .chunks = slot.chunks};
                             request.slot_columns = slot.columns;
@@ -1738,6 +1740,7 @@ std::string CommandEngine::ExecuteStatement(
                         .progress_interval = session.watch_options.progress_interval,
                         .ack_timeout_ms = watch.ack_timeout_ms,
                         .notify = session.watch_options.notify,
+                        .partitions = watch.partitions,
                     };
                     if (watch.slot) {
                         const auto* user = config_.require_auth ? CurrentUser(session) : nullptr;
@@ -1776,7 +1779,7 @@ std::string CommandEngine::ExecuteStatement(
                     RequireRight(session, create.table, Right::kAdmin);
                     const auto table = catalog_->Require(create.table);
                     (void)table->CreateFeedSlot(create.name, create.if_not_exists, SlotFilters(table, create),
-                        SlotOwner(create, config_.require_auth, session.user), create.owner.has_value());
+                        SlotOwner(create, config_.require_auth, session.user), create.owner.has_value(), create.partitions.value_or(1U));
                     return Protocol::SimpleString("OK");
                 },
                 [&](const cql::DropSlot& drop) {
@@ -1823,7 +1826,7 @@ std::string CommandEngine::ExecuteStatement(
                     const bool show_owners = !config_.require_auth || (viewer != nullptr && viewer->manages_users);
                     Protocol::AppendArrayHeader(reply, slots.size());
                     for (const auto& [name, slot] : slots) {
-                        Protocol::AppendMapHeader(reply, 12);
+                        Protocol::AppendMapHeader(reply, 13);
                         Protocol::AppendBulk(reply, "table");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "name");
@@ -1850,6 +1853,18 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendBulk(reply, "owner");
                         if (slot.owner && (show_owners || (viewer != nullptr && *slot.owner == session.user))) Protocol::AppendBulk(reply, *slot.owner);
                         else Protocol::AppendNull(reply);
+                        // One entry per partition; a slot without partitions has one.
+                        Protocol::AppendBulk(reply, "partitions");
+                        Protocol::AppendArrayHeader(reply, slot.partitions_attached.size());
+                        for (std::size_t i = 0U; i < slot.partitions_attached.size(); ++i) {
+                            Protocol::AppendMapHeader(reply, 3U);
+                            Protocol::AppendBulk(reply, "partition");
+                            Protocol::AppendInteger(reply, static_cast<std::uint64_t>(i));
+                            Protocol::AppendBulk(reply, "acked");
+                            Protocol::AppendInteger(reply, slot.partitions.empty() ? slot.position.revision : slot.partitions[i].written);
+                            Protocol::AppendBulk(reply, "attached");
+                            Protocol::AppendBoolean(reply, slot.partitions_attached[i]);
+                        }
                     }
                     return reply;
                 },

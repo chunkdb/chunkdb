@@ -25,15 +25,23 @@ struct FeedSlotTestAccess {
     static void Filter(FeedArchiveReader& reader, const FeedSlotFilters& filters);
     static void Retain(Table& table);
     static void SetHook(Table& table, FeedSlotTestHook* hook);
-    static void StageAck(Table& table, std::string_view name, FeedPosition position);
+    static void StageAck(Table& table, std::string_view name, FeedPosition position, const std::vector<std::uint16_t>& partitions = {});
     static bool FlushAcks(Table& table, bool force, std::chrono::steady_clock::time_point now);
 };
 
 // The Table owns this state across store replacements. The current manager's
 // records mutex protects it; replacement drains leases and stops that manager.
 struct FeedSlotAckState {
+    // Slots without partitions, by name.
     std::map<std::string, std::uint64_t> pending;
+    // Partitioned slots, by name and partition.
+    std::map<std::pair<std::string, std::uint16_t>, std::uint64_t> partition_pending;
     std::chrono::steady_clock::time_point flushed = std::chrono::steady_clock::now();
+    [[nodiscard]] bool empty() const noexcept { return pending.empty() && partition_pending.empty(); }
+    void Erase(const std::string& name) {
+        pending.erase(name);
+        std::erase_if(partition_pending, [&](const auto& item) { return item.first.first == name; });
+    }
 };
 
 // Store-owned state. The table stops its worker before pausing/replacing the
@@ -50,14 +58,16 @@ class FeedSlots {
     [[nodiscard]] bool active() const noexcept;
     [[nodiscard]] std::size_t max_bytes() const noexcept { return max_bytes_; }
     [[nodiscard]] bool ArchiveRequired() const noexcept;
+    // `partitions` is 1 for a slot without partitions, or 2 to 256.
     [[nodiscard]] FeedSlot Create(std::string_view name, std::uint64_t completed, bool if_not_exists = false, const FeedSlotFilters& filters = {},
-        std::optional<std::string> owner = std::nullopt);
+        std::optional<std::string> owner = std::nullopt, std::uint32_t partitions = 1U);
     // Records `owner` for a slot that has none; a recorded owner never changes.
     void BindOwner(std::string_view name, const std::string& owner);
     void Drop(std::string_view name, bool if_exists = false);
     void Advance(std::string_view name, FeedPosition position);
     void UseAckState(const std::shared_ptr<FeedSlotAckState>& state) noexcept { acknowledgements_ = state; }
-    void StageAck(std::string_view name, FeedPosition position);
+    // For the given partitions of a partitioned slot; empty for all of them.
+    void StageAck(std::string_view name, FeedPosition position, const std::vector<std::uint16_t>& partitions = {});
     bool FlushAcks(bool force, std::chrono::steady_clock::time_point now = std::chrono::steady_clock::now());
     [[nodiscard]] std::vector<FeedSlot> List(bool include_lost = false) const;
     [[nodiscard]] FeedSlot Get(std::string_view name) const;

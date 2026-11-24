@@ -1079,14 +1079,26 @@ void TestSlotStatements() {
     ExpectReply(f.Run("CREATE SLOT 'consumer' ON world"), "+OK\r\n");
     ExpectReply(f.Run("CREATE SLOT 'other' ON plain"), "+OK\r\n");
     const auto world = f.catalog->Find("world")->ListFeedSlots().front();
-    std::string expected = "*1\r\n%12\r\n$5\r\ntable\r\n$5\r\nworld\r\n$4\r\nname\r\n$8\r\nconsumer\r\n$5\r\nepoch\r\n$32\r\n";
+    std::string expected = "*1\r\n%13\r\n$5\r\ntable\r\n$5\r\nworld\r\n$4\r\nname\r\n$8\r\nconsumer\r\n$5\r\nepoch\r\n$32\r\n";
     expected += chunkdb::StoreIdHex(world.position.epoch);
     expected += "\r\n$5\r\nacked\r\n:" + std::to_string(world.position.revision);
     expected += "\r\n$8\r\nrevision\r\n:" + std::to_string(world.durable_watermark);
     expected += "\r\n$13\r\nlag_revisions\r\n:" + std::to_string(world.durable_watermark - world.position.revision);
     expected += "\r\n$14\r\nretained_bytes\r\n:0\r\n$8\r\nattached\r\n#f\r\n$4\r\nlost\r\n#f\r\n";
     expected += "$11\r\nlost_reason\r\n_\r\n$7\r\nfilters\r\n%5\r\n$4\r\narea\r\n_\r\n$10\r\ncolumn_ids\r\n_\r\n$7\r\ncolumns\r\n_\r\n$9\r\nno_before\r\n#f\r\n$6\r\nchunks\r\n#f\r\n$5\r\nowner\r\n_\r\n";
+    // A slot without partitions lists its one partition.
+    expected += "$10\r\npartitions\r\n*1\r\n%3\r\n$9\r\npartition\r\n:0\r\n$5\r\nacked\r\n:" + std::to_string(world.position.revision);
+    expected += "\r\n$8\r\nattached\r\n#f\r\n";
     ExpectReply(f.Run("SHOW SLOTS ON world"), expected); // No user records no owner.
+    ExpectReply(f.Run("CREATE SLOT 'parts' ON world PARTITIONS 3"), "+OK\r\n");
+    ExpectReply(f.Run("CREATE SLOT IF NOT EXISTS 'parts' ON world PARTITIONS 3"), "+OK\r\n");
+    ExpectError(f.Run("CREATE SLOT IF NOT EXISTS 'parts' ON world"), "INVALID_ARGUMENT reason=slot_filters");
+    ExpectError(f.Run("CREATE SLOT IF NOT EXISTS 'consumer' ON world PARTITIONS 2"), "INVALID_ARGUMENT reason=slot_filters");
+    ExpectError(f.Run("MIGRATE 'partitioned' CREATE SLOT 'migrated' ON world PARTITIONS 2"), "INVALID_ARGUMENT");
+    const auto parts = f.Run("SHOW SLOTS ON world PREFIX 'parts'");
+    assert(Contains(parts, "$10\r\npartitions\r\n*3\r\n%3\r\n$9\r\npartition\r\n:0\r\n"));
+    assert(Contains(parts, "%3\r\n$9\r\npartition\r\n:2\r\n$5\r\nacked\r\n:"));
+    ExpectReply(f.Run("DROP SLOT 'parts' ON world"), "+OK\r\n");
     ExpectReply(f.Run("CREATE SLOT 'owned' ON plain OWNER bot NO BEFORE"), "+OK\r\n");
     assert(f.Run("SHOW SLOTS ON plain").find("$5\r\nowner\r\n$3\r\nbot\r\n") != std::string::npos);
     ExpectError(f.Run("CREATE SLOT 'twice' ON plain OWNER bot OWNER bot"), "SYNTAX");

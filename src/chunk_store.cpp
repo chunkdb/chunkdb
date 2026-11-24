@@ -467,6 +467,8 @@ ChunkStore::ChunkStore(StoreConfig config)
             throw std::runtime_error("chunkdb.slots requires the feed slots storage feature");
         if (slots && slots->filter_format && (features_.incompat & kFeatureSlotFilters) == 0U)
             throw std::runtime_error("chunkdb.slots filters require the slot filters storage feature");
+        if (slots && slots->partition_format && (features_.incompat & kFeatureSlotPartitions) == 0U)
+            throw std::runtime_error("chunkdb.slots partitions require the slot partitions storage feature");
         if (config.allow_multiple_processes && slots &&
             std::any_of(slots->slots.begin(), slots->slots.end(), [](const auto& slot) { return !slot.lost; }))
             throw std::invalid_argument("feed slots require a single-process table");

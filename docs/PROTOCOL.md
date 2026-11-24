@@ -273,7 +273,7 @@ Slot progress cannot pass the durable frontier or changes not yet queued ahead o
 
 An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
 Slot pushes stop at the persisted durable frontier; see [durable slots](reference/FEED.md#notes) for ACK persistence and batching.
-SHOW SLOTS reports written `acked`, the durable `revision`, `lag_revisions`, retained bytes, `attached` and loss state.
+SHOW SLOTS reports written `acked`, the durable `revision`, `lag_revisions`, retained bytes, `attached`, loss state, and `partitions` with each partition's `acked` and `attached`.
 CHUNKS pushes use `[chunks,epoch,revision,commit_time_ms,user,schema_version,chunks,tag,txn]`.
 Each chunk is `[cx,cy,version,form_or_null]` or `[cx,cy,cz,version,form_or_null]`; a null form represents deletion.
 Forms match GET CHUNK for that exact commit and projection; later writes cannot change queued bytes.
@@ -283,7 +283,8 @@ A null before row means no prior written identity, and NO BEFORE removes both bl
 Block projections preserve all metadata columns; empty metadata domains emit no metadata-change rows.
 Tag and txn are null until their metadata is present.
 
-A slot permits one watch at a time; a competing watch receives SLOT_BUSY and a lost slot receives SLOT_LOST.
+A slot permits one watch per partition; a slot created without PARTITIONS has one, and `WATCH ... SLOT 's' PARTITION p, ...` holds some partitions of a partitioned slot, see [partitions](reference/FEED.md#partitions).
+A watch asking for a partition another watch holds receives SLOT_BUSY, and a lost slot receives SLOT_LOST.
 The slot claim is released before the terminal reply or connection closure for lost access, an ACK timeout, or an output deadline, so a new WATCH can claim it immediately.
 A slot belongs to its owner; another user needs ADMIN on `*` to watch it, see [feed statements](reference/FEED.md#arguments).
 

@@ -1,5 +1,6 @@
 #include "chunkdb/table_catalog.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cstdlib>
 #include <sstream>
@@ -10,6 +11,7 @@
 #include "chunkdb/logging.hpp"
 #include "durability_io.hpp"
 #include "feature_flags.hpp"
+#include "feed_slot_partitions.hpp"
 #include "feed_slot_records.hpp"
 #include "file_permissions.hpp"
 #include "statement_control.hpp"
@@ -224,8 +226,10 @@ std::optional<FeedSlotRecords> RequireSlotResync(const std::filesystem::path& di
     auto marked = *records;
     bool changed = false;
     for (auto& slot : marked.slots) {
-        if (slot.lost || slot.resync) continue;
-        slot.resync = true;
+        // Every partition of a partitioned slot is marked.
+        if (slot.lost || (slot.resync && std::all_of(slot.partitions.begin(), slot.partitions.end(),
+            [](const auto& partition) { return partition.resync; }))) continue;
+        MarkFeedSlotRecordResync(slot);
         changed = true;
     }
     if (!changed) return std::nullopt;

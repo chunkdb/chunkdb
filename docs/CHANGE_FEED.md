@@ -65,6 +65,7 @@ A slot is a named consumer that retains changes until its saved acknowledgement 
 A restore or SWAP TABLES moves a slot away from its consumer's position, so its next watch without AFTER starts with resync until an acknowledgement passes it; a watch with AFTER follows the epoch and lineage rules above.
 Create it with fixed AREA, COLUMNS, NO BEFORE, or CHUNKS filters when a consumer needs a restricted stream.
 WATCH inherits these filters; changing them requires a different slot.
+`PARTITIONS n` splits a slot by chunk so that several consumers share it, each with its own partitions and positions; see [partitions](reference/FEED.md#partitions).
 Projection IDs survive renames, but dropping a projected column makes its slot lost with `reason=schema_filter`.
 Acknowledgements alone cannot make writes to another system atomic.
 Store your applied position together with your output, and ignore repeated positions after a crash.

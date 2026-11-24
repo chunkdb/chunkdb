@@ -1,4 +1,5 @@
 #include <cassert>
+#include <algorithm>
 #include <array>
 #include <barrier>
 #include <condition_variable>
@@ -660,6 +661,72 @@ void PersistentFilters() {
     }
 }
 
+// A partitioned slot keeps one position per partition across restarts; its
+// position is the lowest of them, and its records need slot_partitions.
+void PersistentPartitions() {
+    ScopedTempDir dir("chunkdb-feed-slot-partitions");
+    const auto config = SlotsConfig(dir.path());
+    const auto root = dir.path() / "tables" / "default";
+    const auto named = [](const std::vector<FeedSlot>& slots, std::string_view name) {
+        const auto found = std::find_if(slots.begin(), slots.end(), [&](const auto& slot) { return slot.name == name; });
+        assert(found != slots.end());
+        return *found;
+    };
+    std::uint64_t start = 0U, acked = 0U;
+    {
+        TableCatalog catalog(config); auto table = CreateDefault(catalog);
+        const auto slot = table->CreateFeedSlot("parts", false, {}, std::nullopt, false, 4U);
+        start = slot.position.revision;
+        assert(slot.partitions.size() == 4U);
+        for (const auto& partition : slot.partitions) assert(partition.written == start && !partition.resync);
+        assert(table->CreateFeedSlot("parts", true, {}, std::nullopt, false, 4U).partitions.size() == 4U);
+        assert(txn_test::Throws([&] { (void)table->CreateFeedSlot("parts", true); }));
+        assert(txn_test::Throws([&] { (void)table->CreateFeedSlot("none", false, {}, std::nullopt, false, 0U); }));
+        assert(txn_test::Throws([&] { (void)table->CreateFeedSlot("many", false, {}, std::nullopt, false, 257U); }));
+        (void)table->CreateFeedSlot("single");
+        {
+            auto lease = table->Acquire();
+            lease->store().SetBlockBits(0, 0, Bits(1U));
+        }
+        FeedSlotTestAccess::Sync(*table);
+        acked = table->ListFeedSlots().front().durable_watermark;
+        assert(acked > start);
+        FeedSlotTestAccess::StageAck(*table, "parts", {slot.position.epoch, acked}, {1U, 3U});
+        assert(FeedSlotTestAccess::FlushAcks(*table, true, std::chrono::steady_clock::now()));
+        const auto slots = table->ListFeedSlots();
+        const auto parts = named(slots, "parts");
+        assert(parts.position.revision == start && parts.partitions[0].written == start && parts.partitions[2].written == start);
+        assert(parts.partitions[1].written == acked && parts.partitions[3].written == acked);
+        assert(!parts.attached && parts.partitions_attached == std::vector<bool>(4U, false));
+        const auto single = named(slots, "single");
+        assert(single.partitions.empty() && single.partitions_attached.size() == 1U);
+        const auto records = ReadFeedSlotRecords(root, table->Info().store_id);
+        assert(records && records->partition_format);
+    }
+    {
+        TableCatalog catalog(config); auto table = catalog.Find("default");
+        auto parts = named(table->ListFeedSlots(), "parts");
+        assert(parts.position.revision == start && parts.partitions[1].written == acked && parts.partitions[2].written == start);
+        table->AdvanceFeedSlot("parts", {parts.position.epoch, acked});
+        parts = named(table->ListFeedSlots(), "parts");
+        assert(parts.position.revision == acked);
+        for (const auto& partition : parts.partitions) assert(partition.written == acked);
+        table->DropFeedSlot("parts");
+        const auto records = ReadFeedSlotRecords(root, table->Info().store_id);
+        assert(records && records->partition_format && records->slots.size() == 1U);
+    }
+    {
+        // The partition format stays recorded, so the table needs the feature.
+        const auto manifest_bytes = LoadFile(StoreManifestPath(root));
+        auto manifest = *ReadStoreManifest(root); manifest.features.incompat &= ~kFeatureSlotPartitions;
+        AtomicWrite(StoreManifestPath(root), SerializeStoreManifest(manifest), true, true);
+        assert(txn_test::Throws([&] { TableCatalog refused(config); }));
+        AtomicWrite(StoreManifestPath(root), manifest_bytes, true, true);
+        TableCatalog catalog(config);
+        assert(named(catalog.Find("default")->ListFeedSlots(), "single").partitions.empty());
+    }
+}
+
 // A slot record without an owner, as CREATE SLOT writes without
 // authentication, still opens. Claiming it records nothing; BindOwner, run
 // once an attach is granted, records its user, and the owner survives a restart.
@@ -725,6 +792,7 @@ void UnownedSlotBindsAtFirstAttach() {
 int main() {
     UnownedSlotBindsAtFirstAttach();
     PersistentFilters();
+    PersistentPartitions();
     ConditionalSlotChanges();
     ConcurrentConditionalSlots();
     ConditionalLostSlot();

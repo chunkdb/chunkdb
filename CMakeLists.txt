@@ -87,6 +87,7 @@ add_library(chunkdb_core STATIC
     src/feed_protocol.cpp
     src/change_feed.cpp
     src/catalog_feed.cpp
+    src/feed_slot_partitions.cpp
     src/feed_slot_records.cpp
     src/feed_slots.cpp
     src/slot_watch.cpp

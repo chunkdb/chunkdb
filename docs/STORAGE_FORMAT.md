@@ -84,6 +84,7 @@ The server opens read-write and therefore refuses either of the first two unknow
 Table incompat bit 0 (`0x1`) enables durable feed slots, USER WAL metadata, and collection-frame flags; it remains set after slot removal.
 Directory and table incompat bit 5 (`0x20`), named `chunk_model`, owns dimensional geometry, both column domains, sectioned forms, and retained coordinate decisions.
 Directory and table incompat bit 6 (`0x40`) is reserved for commit groups, which this build does not provide: it never sets the bit, `ENABLE FEATURE` does not accept it, and a directory or table that records it is refused as an unknown feature.
+Directory and table incompat bit 8 (`0x100`), named `slot_partitions`, owns the partition format of `chunkdb.slots`.
 Earlier development envelopes are refused before artifact mutation; they require recreating the data directory.
 
 Data-directory incompat bit 1 (`0x2`) enables named migrations.
@@ -504,11 +505,15 @@ Details are in [artifact I/O](design/COMMIT_OWNER_ARTIFACT_IO.md).
 
 1. `CKSL`, format tag `4:u16`, dimensions `u8`, header flags `u8`, table epoch (16 bytes).
 2. Durable watermark `u64`, slot count `u32` (at most 1024).
-3. Per slot: name length `u8`, slot flags `u8`, projection count `u16`, written revision `u64`, name bytes, then the parts its flags select: area coordinates (`i64` each), projection IDs (`u32` each), and owner length `u8` with owner bytes.
+3. Per slot: name length `u8`, slot flags `u8`, projection count `u16`, written revision `u64`, name bytes, then the parts its flags select: area coordinates (`i64` each), projection IDs (`u32` each), and owner length `u8` with owner bytes; with header flag `0x2`, last the partition count `u16` and, for a count of 2 or more, per partition its position `u64` and flags `u8`.
 4. CRC32 over all preceding bytes.
 
 Slot flags are `0x1` lost, `0x2` area, `0x4` projection, `0x8` NO BEFORE, `0x10` CHUNKS, `0x20` lost by a dropped projected column, `0x40` owner, and `0x80` resync, set by a restore or SWAP TABLES and never with `0x1`; the projection count is nonzero exactly with `0x4`.
-The only header flag, `0x1`, is the filter format; it permits the filter flags `0x2` through `0x20`, requires `slot_filters`, and stays set once written.
+Header flag `0x1` is the filter format; it permits the filter flags `0x2` through `0x20`, requires `slot_filters`, and stays set once written.
+Header flag `0x2` is the partition format; it requires `slot_partitions` and stays set once written.
+A partition count is 1 (no positions follow) through 256; partition flag `0x1` is resync and the other bits are zero.
+A partitioned slot's written revision is the lowest partition position and its resync flag is set exactly when a partition's is; every position is at or below the watermark.
+Chunk `(x, y, z)` (z is 0 in a two-dimensional table) is in partition `h % count`, where `h = m(m(m(x) ^ y) ^ z)` over the coordinates as `u64`, and `m(v)` is the SplitMix64 step: `v += 0x9e3779b97f4a7c15`, `v = (v ^ (v >> 30)) * 0xbf58476d1ce4e5b9`, `v = (v ^ (v >> 27)) * 0x94d049bb133111eb`, `v ^ (v >> 31)`, modulo 2^64.
 The owner flag needs no header flag or feature bit.
 The dimensions byte is 2 or 3 and must match the owning table.
 AREA stores the first active signed coordinates followed by the last active coordinates (x, y and, in a three-dimensional table, z); endpoints must be ordered.

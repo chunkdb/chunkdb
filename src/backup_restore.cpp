@@ -12,6 +12,7 @@
 #include "file_permissions.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "feature_flags.hpp"
+#include "feed_slot_partitions.hpp"
 #include "feed_slot_records.hpp"
 #include "store_manifest.hpp"
 #include "verify.hpp"
@@ -197,7 +198,9 @@ StoreId RebindRestoredTable(const std::filesystem::path& directory, const Backup
         slots->epoch = new_epoch; slots->durable_watermark = cut.revision;
         // A consumer's position is not the cut: its next watch resyncs.
         for (auto& slot : slots->slots) {
-            slot.written = cut.revision; slot.lost = slot.schema_filter_lost; slot.resync = !slot.lost;
+            SetFeedSlotRecordPosition(slot, cut.revision);
+            if (slot.schema_filter_lost) MarkFeedSlotRecordLost(slot);
+            else { slot.lost = false; MarkFeedSlotRecordResync(slot); }
         }
         WriteFeedSlotRecords(directory, *slots);
     }

@@ -9,6 +9,7 @@
 #include "feed_slots.hpp"
 #include "slot_watch.hpp"
 #include "server_feed.hpp"
+#include "feed_slot_partitions.hpp"
 #include "feed_slot_records.hpp"
 #include "statement_control.hpp"
 #ifdef CHUNKDB_WITH_OPENSSL
@@ -1456,6 +1457,59 @@ void PersistentFilterDelivery(bool tls) {
     Error(writer->Command("MIGRATE 'filtered_conflict' CREATE SLOT IF NOT EXISTS 'migration_slot' ON t COLUMNS n"), "INVALID_ARGUMENT");
 }
 
+// Watches of a partitioned slot share it by chunk: each receives the changes
+// of its partitions' chunks, and each partition keeps its own position.
+void SlotPartitions(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label text(128)) CHUNK 4 x 4");
+    writer->Ok("CREATE SLOT 'workers' ON t PARTITIONS 2");
+    auto table = harness.catalog->Find("t");
+    // Blocks 0 and 28 are in chunks (0, 0) and (7, 0), of partitions 1 and 0.
+    assert(FeedSlotPartitionOf({0, 0, 0}, 2U) == 1U && FeedSlotPartitionOf({7, 0, 0}, 2U) == 0U);
+    auto zero = harness.Connect(); (void)Start(zero->Command("WATCH t SLOT 'workers' PARTITION 0"));
+    auto one = harness.Connect(); (void)Start(one->Command("WATCH t SLOT 'workers' PARTITION 1"));
+    auto other = harness.Connect();
+    Error(other->Command("WATCH t SLOT 'workers' PARTITION 1, 0"), "SLOT_BUSY");
+    Error(other->Command("WATCH t SLOT 'workers'"), "SLOT_BUSY");
+    Error(other->Command("WATCH t SLOT 'workers' TAKEOVER"), "SLOT_BUSY"); // Held by two watches.
+    Error(other->Command("WATCH t SLOT 'workers' PARTITION 2"), "INVALID_ARGUMENT");
+    const auto attached = writer->Command("SHOW SLOTS ON t");
+    for (const auto& partition : Field(Slot(attached, "t", "workers"), "partitions").items) assert(Boolean(Field(partition, "attached")));
+    const auto first = Set(*writer, 7, 0);
+    writer->Ok("BEGIN");
+    assert(writer->Command("SET BLOCK 0 0 IN t n = 8").type == '_');
+    assert(writer->Command("SET BLOCK 28 0 IN t n = 9").type == '_');
+    const auto both = Number(writer->Command("COMMIT"));
+    FeedSlotTestAccess::Sync(*table);
+    assert(Change(NextChange(*one)) == first);
+    // One commit reaches each watch with the blocks of its partition.
+    const auto left = NextChange(*one);
+    assert(Change(left) == both && left.items[6].items[0].items[0].value == "0");
+    const auto right = NextChange(*zero);
+    assert(Change(right) == both && right.items[6].items[0].items[0].value == "28");
+    assert(!zero->Ready(100ms));
+    zero->Line("ACK " + std::to_string(both)); Unwatch(*zero);
+    one->Line("ACK " + std::to_string(first)); Unwatch(*one);
+    const auto listed = writer->Command("SHOW SLOTS ON t");
+    const auto& slot = Slot(listed, "t", "workers");
+    const auto& partitions = Field(slot, "partitions").items;
+    assert(partitions.size() == 2U && Number(Field(partitions[1], "partition")) == 1U);
+    assert(Number(Field(partitions[0], "acked")) == both && Number(Field(partitions[1], "acked")) == first);
+    assert(Number(Field(slot, "acked")) == first && !Boolean(Field(slot, "attached")) && !Boolean(Field(partitions[0], "attached")));
+    // A watch of every partition starts at the lowest position and skips what each partition acknowledged.
+    auto all = harness.Connect();
+    assert(Start(all->Command("WATCH t SLOT 'workers'")).second == first);
+    const auto replay = NextChange(*all);
+    assert(Change(replay) == both && replay.items[6].items[0].items[0].value == "0");
+    const auto later = Set(*writer, 10, 28); FeedSlotTestAccess::Sync(*table);
+    assert(Change(NextChange(*all)) == later);
+    Error(other->Command("WATCH t SLOT 'workers' PARTITION 0"), "SLOT_BUSY");
+    all->Line("ACK " + std::to_string(later)); Unwatch(*all);
+    const auto acked = writer->Command("SHOW SLOTS ON t");
+    for (const auto& partition : Field(Slot(acked, "t", "workers"), "partitions").items) assert(Number(Field(partition, "acked")) == later);
+}
+
 void HistoricalSchemas(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect(); Create(*writer);
@@ -2760,6 +2814,7 @@ int main(int argc, char** argv) {
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);
         run("persistent-filters", PersistentFilterDelivery);
+        run("slot-partitions", SlotPartitions);
         run("historical-schema", HistoricalSchemas); run("historical-schema-dimensional", HistoricalSchemasDimensional); run("held-lease", ArchiveWhileLeaseHeld);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
         run("live-schema-ACK", LiveSchemaAcknowledgement);

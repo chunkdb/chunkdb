@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "feed_protocol.hpp"
+#include "feed_slot_partitions.hpp"
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/logging.hpp"
 
@@ -49,7 +50,9 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
         ? options.after->epoch != start.epoch || options.after->revision > claim->completed
         : slot.resync;
     if (options.after && !resync) start.revision = std::max(start.revision, options.after->revision);
+    auto floors = FeedSlotPartitionFloors(slot, claim->partitions);
     auto result = std::shared_ptr<SlotWatch>(new SlotWatch(std::move(table), std::move(claim), start, std::move(options), resync));
+    result->partition_floors_ = std::move(floors);
     result->slot_owner_ = slot.owner;
     result->acknowledged_ = slot.position.revision;
     result->written_ = slot.position.revision;
@@ -265,6 +268,8 @@ void SlotWatch::Build(Prepared& prepared) const {
             ? ChunkFeedEntry(original, table_->geometry(), options_.areas, options_.column_ids)
             : FilterFeedEntry(original, options_.areas, options_.column_ids, options_.no_before, columns);
     }
+    // A partitioned slot's watch sends the chunks of its partitions.
+    if (mutation && !partition_floors_.empty()) prepared.entry = PartitionFeedEntry(prepared.entry, partition_floors_);
     prepared.built = true;
     const auto& entry = prepared.entry;
     prepared.send = entry != nullptr;
