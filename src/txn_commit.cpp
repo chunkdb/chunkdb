@@ -386,8 +386,6 @@ std::uint64_t ChunkStore::CommitTransaction(
         CanonicalizeAbsentBlocks(geometry_, state.presence_bitmap, &state.payload);
         geometry_.layout().RequireValidVars(state.vars, state.presence_bitmap);
         RequirePendingFits(state.payload, state.presence_bitmap, &state.vars);
-        if (const auto* checks = geometry_.checks())
-            checks->RequireChunk(writes[i].coord, state.payload, state.presence_bitmap, state.vars);
         if (state.chunk_columns) {
             const auto variable_bytes = ValidateChunkColumns(geometry_.chunk_schema(), state.chunk_columns->bytes);
             if (state.chunk_columns->variable_bytes != variable_bytes)
@@ -556,6 +554,11 @@ std::uint64_t ChunkStore::CommitTransaction(
             write.state.vars == chunk.vars && same_metadata && (!write.state.written || chunk.written)) {
             continue;
         }
+        // Under the locks, against the chunk the transaction read: only the
+        // blocks it changed are evaluated, and nothing is written yet.
+        if (const auto* checks = geometry_.checks())
+            checks->RequireChanged(target.coord, write.state.payload, write.state.presence_bitmap, write.state.vars,
+                chunk.payload, chunk.presence_bitmap, chunk.vars);
         changes.push_back(Change{.target = &target, .write = &write});
     }
     if (changes.empty()) {

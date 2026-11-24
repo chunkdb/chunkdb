@@ -312,6 +312,19 @@ void ChunkStore::WriteBlockBitsLocked(
     if (!payload_changed && !presence_changed) {
         return;
     }
+    if (const auto* checks = geometry_.checks(); checks != nullptr && present) {
+        // Evaluated on the block as written before a version is reserved;
+        // the chunk holds its own bytes again either way.
+        auto* const touched = regular_chunk->payload.data() + begin_byte;
+        std::copy(next_bytes.begin(), next_bytes.end(), touched);
+        try {
+            checks->RequireBlock(chunk_coord, regular_chunk->payload, regular_chunk->vars, block_index);
+        } catch (...) {
+            std::copy(previous_bytes.begin(), previous_bytes.end(), touched);
+            throw;
+        }
+        std::copy(previous_bytes.begin(), previous_bytes.end(), touched);
+    }
 
     // Snapshot every component needed for a full rollback, mirroring the
     // conditional path: a rejected mutation must leave memory, the staged
@@ -334,9 +347,6 @@ void ChunkStore::WriteBlockBitsLocked(
             next_bytes.end(),
             regular_chunk->payload.begin() + static_cast<std::ptrdiff_t>(begin_byte));
         regular_chunk->presence_bitmap[presence_byte_index] = next_presence_byte;
-        // Checked on the block as written; the catch below takes it back.
-        if (const auto* checks = geometry_.checks(); checks != nullptr && present)
-            checks->RequireBlock(chunk_coord, regular_chunk->payload, regular_chunk->vars, block_index);
         const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
         WalFrameBuilder frame(&regular_chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
@@ -791,31 +801,78 @@ void ChunkStore::SetBlockInState(
     const std::vector<ColumnAssignment>& values) const {
     const auto [local_x, local_y] = geometry_.BlockToLocal(block_x, block_y);
     const std::size_t block_index = geometry_.LocalBlockIndex(local_x, local_y);
-    SetBlockInStateAtIndex(state, geometry_.BlockToChunk(block_x, block_y), block_index, values);
+    SetBlockInStateAtIndex(state, block_index, values,
+        geometry_.checks() != nullptr ? std::optional(geometry_.BlockToChunk(block_x, block_y)) : std::nullopt);
 }
 
 void ChunkStore::SetBlockInState3D(ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z,
     const std::vector<ColumnAssignment>& values) const {
     const auto local = geometry_.BlockToLocal(x, y, z);
-    SetBlockInStateAtIndex(state, geometry_.BlockToChunk(x, y, z), geometry_.LocalBlockIndex(local[0], local[1], local[2]), values);
+    SetBlockInStateAtIndex(state, geometry_.LocalBlockIndex(local[0], local[1], local[2]), values,
+        geometry_.checks() != nullptr ? std::optional(geometry_.BlockToChunk(x, y, z)) : std::nullopt);
 }
 
-void ChunkStore::SetBlockInStateAtIndex(ChunkState& state, const ChunkCoord& coord, std::size_t block_index,
-    const std::vector<ColumnAssignment>& values) const {
+void ChunkStore::SetBlockInStateAtIndex(ChunkState& state, std::size_t block_index,
+    const std::vector<ColumnAssignment>& values, const std::optional<ChunkCoord>& coord) const {
     auto& write = PrepareSetBlockWrite(values, block_index);
     if (!BlockPresent(state.presence_bitmap, block_index)) {
         AddNewBlockColumns(write, block_index);
     }
-    const auto* checks = geometry_.checks();
-    if (checks == nullptr) {
-        ApplyBlockWriteToState(state, block_index, write, true);
-        return;
+    if (coord.has_value()) {
+        // Evaluated before the state changes: the block's bytes in place for
+        // the call, its text and bytes values as overrides; `state` holds
+        // its own bytes again either way.
+        auto& saved = ThreadSavedBytes();
+        saved.clear();
+        const auto keep = [&](std::size_t begin, std::size_t size) {
+            for (std::size_t at = begin; at < begin + size; ++at) saved.push_back(state.payload[at]);
+        };
+        for (const auto& edit : write.edits) {
+            const std::size_t bit = edit.fixed->values * 8U + block_index * edit.fixed->width;
+            keep(bit / 8U, (bit + edit.fixed->width - 1U) / 8U - bit / 8U + 1U);
+            if (edit.fixed->validity != ChunkLayout::kNoValidity) keep(edit.fixed->validity + block_index / 8U, 1U);
+        }
+        const auto restore = [&] {
+            std::size_t next = 0U;
+            for (const auto& edit : write.edits) {
+                const std::size_t bit = edit.fixed->values * 8U + block_index * edit.fixed->width;
+                for (std::size_t at = bit / 8U; at <= (bit + edit.fixed->width - 1U) / 8U; ++at) state.payload[at] = saved[next++];
+                if (edit.fixed->validity != ChunkLayout::kNoValidity)
+                    state.payload[edit.fixed->validity + block_index / 8U] = saved[next++];
+            }
+        };
+        WriteEditsToPayload(state.payload, block_index, write);
+        try {
+            geometry_.checks()->RequireBlock(*coord, state.payload, state.vars, block_index, write.var_changes);
+        } catch (...) {
+            restore();
+            throw;
+        }
+        restore();
     }
-    // Checked on a copy, so a block that fails leaves `state` as it was.
-    ChunkState next = state;
-    ApplyBlockWriteToState(next, block_index, write, true);
-    checks->RequireBlock(coord, next.payload, next.vars, block_index);
-    state = std::move(next);
+    ApplyBlockWriteToState(state, block_index, write, true);
+}
+
+void ChunkStore::WriteEditsToPayload(std::vector<std::uint8_t>& payload, std::size_t block_index, const BlockWrite& write) {
+    for (const auto& edit : write.edits) {
+        WriteValueBits(
+            payload.data(),
+            edit.fixed->values * 8U + block_index * edit.fixed->width,
+            write.values.data() + edit.value,
+            edit.fixed->width);
+        if (edit.fixed->validity != ChunkLayout::kNoValidity) {
+            auto& byte = payload[edit.fixed->validity + block_index / 8U];
+            const auto mask = static_cast<std::uint8_t>(1U << (block_index % 8U));
+            byte = edit.null ? static_cast<std::uint8_t>(byte & ~mask) : static_cast<std::uint8_t>(byte | mask);
+        }
+    }
+}
+
+std::vector<std::uint8_t>& ChunkStore::ThreadSavedBytes() {
+    // One per thread and reused, so a checked write allocates nothing once
+    // it has grown.
+    thread_local std::vector<std::uint8_t> saved;
+    return saved;
 }
 
 void ChunkStore::UnsetBlockInState(ChunkState& state, std::int64_t block_x, std::int64_t block_y) const {
@@ -866,18 +923,7 @@ void ChunkStore::ApplyBlockWriteToState(
     RequireVarWrite(state.vars, var_update, metadata ? metadata->variable_bytes : 0U,
         state.written && metadata ? metadata->variable_bytes : 0U);
 
-    for (const auto& edit : write.edits) {
-        WriteValueBits(
-            state.payload.data(),
-            edit.fixed->values * 8U + block_index * edit.fixed->width,
-            write.values.data() + edit.value,
-            edit.fixed->width);
-        if (edit.fixed->validity != ChunkLayout::kNoValidity) {
-            auto& byte = state.payload[edit.fixed->validity + block_index / 8U];
-            const auto mask = static_cast<std::uint8_t>(1U << (block_index % 8U));
-            byte = edit.null ? static_cast<std::uint8_t>(byte & ~mask) : static_cast<std::uint8_t>(byte | mask);
-        }
-    }
+    WriteEditsToPayload(state.payload, block_index, write);
     SetBlockPresent(&state.presence_bitmap, block_index, present);
     if (!var_update.changes.empty()) {
         (void)ApplyVarUpdate(&state.vars, std::move(var_update));
@@ -1027,6 +1073,22 @@ void ChunkStore::WriteBlockColumnsLocked(
     if (!presence_changed && var_update.empty() && std::none_of(ranges.begin(), ranges.end(), changed)) {
         return;
     }
+    if (const auto* checks = geometry_.checks(); checks != nullptr && present) {
+        // Evaluated on the block as written before a version is reserved:
+        // its bytes in place for the call, its text and bytes values as
+        // overrides; the chunk holds its own bytes again either way.
+        for (const auto& range : ranges) {
+            std::copy_n(after.begin() + static_cast<std::ptrdiff_t>(range.saved), static_cast<std::ptrdiff_t>(range.size),
+                chunk->payload.begin() + static_cast<std::ptrdiff_t>(range.begin));
+        }
+        try {
+            checks->RequireBlock(chunk_coord, chunk->payload, chunk->vars, block_index, var_update.changes);
+        } catch (...) {
+            restore();
+            throw;
+        }
+        restore();
+    }
 
     // Snapshot every component needed for a full rollback, as SetBlockBits
     // does: a rejected mutation must leave memory, the staged batch, the
@@ -1053,9 +1115,6 @@ void ChunkStore::WriteBlockColumnsLocked(
         if (!var_update.empty()) {
             var_undo = ApplyVarUpdate(&chunk->vars, std::move(var_update));
         }
-        // Checked on the block as written; the catch below takes it back.
-        if (const auto* checks = geometry_.checks(); checks != nullptr && present)
-            checks->RequireBlock(chunk_coord, chunk->payload, chunk->vars, block_index);
         const std::uint64_t commit_time_ms = NextCommitTimeMs(*chunk);
         // One mutation is one WAL frame, applied all-or-nothing on replay.
         WalFrameBuilder frame(&chunk->wal_batch, geometry_.layout().schema().version, {}, SlotWriteUser());
@@ -1433,7 +1492,8 @@ std::uint64_t ChunkStore::ApplyChunkStateLocked(
         return regular_chunk->version;
     }
     if (const auto* checks = geometry_.checks())
-        checks->RequireChunkAfter(chunk_coord, payload, presence_bitmap, regular_chunk->vars, var_update);
+        checks->RequireChangedAfter(chunk_coord, payload, presence_bitmap, var_update, regular_chunk->payload,
+            regular_chunk->presence_bitmap, regular_chunk->vars);
 
     // Reserve the version token before the chunk changes, so a version-clock
     // failure is a clean pre-WAL error and an open transaction can keep the

@@ -458,6 +458,74 @@ void TestWritesDuringScan() {
     ExpectRow((*catalog.Find("w")->Acquire()).store(), 1, 0, Row{std::int64_t{4}, std::monostate{}, std::monostate{}});
 }
 
+// Chunk writes and COMMIT evaluate only the blocks they change: while ADD
+// CHECK scans, a stored block can still fail the check in progress, and a
+// write to another block of its chunk, or to its chunk columns only, goes
+// through; the scan then refuses the check.
+void TestChangedBlocksOnly() {
+    ScopedTempDir dir("chunkdb-check-changed");
+    chunkdb::CatalogConfig config;
+    config.data_dir = dir.path();
+    chunkdb::TableCatalog catalog(config);
+    (void)catalog.Create("w", GeometryFor(Plain()), chunkdb::TableOptions{}, Plain());
+    (*catalog.Find("w")->Acquire()).store().SetBlock(0, 0, {{"hp", std::int64_t{-1}}});
+    AtScan hook;
+    hook.run = [&] {
+        auto lease = *catalog.Find("w")->Acquire();
+        auto& store = lease.store();
+        auto state = store.ReadChunkState(0, 0);
+        store.SetBlockInState(state, 1, 1, {{"hp", std::int64_t{2}}});
+        Expect(store.WriteChunkState(0, 0, state, std::nullopt).ok, "other block");
+        Expect(store.WriteChunkState(0, 0, state, store.GetChunkVersion(0, 0)).ok, "unchanged state");
+        auto failing = state;
+        store.SetBlockInState(failing, 2, 2, {{"hp", std::int64_t{3}}});
+        failing.payload[0] = 0xFEU;  // block (0, 0) changes, still failing
+        ExpectThrow<CheckFailedError>([&] { (void)store.WriteChunkState(0, 0, failing, std::nullopt); },
+            "block (0, 0) fails CHECK hp_check");
+        {
+            auto snapshot = store.BeginTxnSnapshot(std::chrono::seconds(30));
+            auto next = store.ReadChunkStateAt(*snapshot, chunkdb::ChunkCoord{0, 0});
+            store.SetBlockInState(next, 3, 3, {{"hp", std::int64_t{4}}});
+            Expect(store.CommitTransaction(*snapshot, {}, {{{0, 0}, next}}) != 0U, "commit other block");
+        }
+        {
+            auto snapshot = store.BeginTxnSnapshot(std::chrono::seconds(30));
+            auto next = store.ReadChunkStateAt(*snapshot, chunkdb::ChunkCoord{0, 0});
+            next.payload[0] = 0xFEU;
+            ExpectThrow<CheckFailedError>(
+                [&] { (void)store.CommitTransaction(*snapshot, {}, {{{0, 0}, next}}); }, "block (0, 0) fails CHECK");
+        }
+        ExpectRow(store, 0, 0, Row{std::int64_t{-1}, std::monostate{}, std::monostate{}});
+        ExpectRow(store, 3, 3, Row{std::int64_t{4}, std::monostate{}, std::monostate{}});
+    };
+    catalog.SetMigrationTestHook(&hook);
+    ExpectThrow<CheckFailedError>(
+        [&] {
+            catalog.AddCheck("w", [](const TableSchema& schema) {
+                return CheckConstraint{.name = chunkdb::NewCheckName(schema, "hp >= 0"), .expression = "hp >= 0"};
+            });
+        },
+        "cannot add CHECK hp_check: block (0, 0) fails it");
+    catalog.SetMigrationTestHook(nullptr);
+    Expect(!hook.run && catalog.Find("w")->Info().schema == Plain(), "refused");
+}
+
+// A refused write reserves no version: the next write takes the one after
+// the last write's.
+void TestRefusedWritesReserveNothing() {
+    ScopedTempDir dir("chunkdb-check-versions");
+    chunkdb::ChunkStore store(StoreConfigFor(dir.path(), Checked()));
+    const auto first = store.SetBlock(0, 0, {{"hp", std::int64_t{1}}}, std::nullopt).version;
+    ExpectThrow<CheckFailedError>([&] { (void)store.SetBlock(1, 0, {{"hp", std::int64_t{-1}}}, std::nullopt); }, "hp_check");
+    ExpectThrow<CheckFailedError>([&] { (void)store.SetBlock(0, 0, {{"tag", std::string("bad")}}, std::nullopt); }, "tag_check");
+    const auto second = store.SetBlock(1, 0, {{"hp", std::int64_t{2}}}, std::nullopt).version;
+    if (second != first + 1U) {
+        std::fprintf(stderr, "versions %llu then %llu\n", static_cast<unsigned long long>(first),
+            static_cast<unsigned long long>(second));
+        std::abort();
+    }
+}
+
 // What a crash during the scan leaves: the next start drops the check in
 // progress and the table keeps the checks it had.
 void TestInterruptedAddCheck() {
@@ -494,6 +562,8 @@ int main() {
     TestStatements();
     TestAddCheck();
     TestWritesDuringScan();
+    TestChangedBlocksOnly();
+    TestRefusedWritesReserveNothing();
     TestInterruptedAddCheck();
     return 0;
 }

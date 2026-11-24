@@ -28,22 +28,30 @@ class BlockChecks {
     // when it has neither. Throws as expr::PlanCondition.
     [[nodiscard]] static std::shared_ptr<const BlockChecks> Make(
         const GeometryConfig& config, std::shared_ptr<const ChunkLayout> layout);
+    // Whether `schema` has checks or an ADD CHECK in progress, so Make
+    // returns a BlockChecks.
+    [[nodiscard]] static bool Needed(const TableSchema& schema) noexcept;
 
-    // Throws CheckFailedError for the first check present block `block` of
-    // the state fails, and std::invalid_argument or std::out_of_range,
-    // naming the check and the block, when a check cannot be evaluated
-    // (division by zero, a position past the 64-bit range).
-    void RequireBlock(
-        const ChunkCoord& coord, std::span<const std::uint8_t> payload, const ChunkVars& vars, std::size_t block) const;
-    // The same for every present block of the state.
-    void RequireChunk(const ChunkCoord& coord, std::span<const std::uint8_t> payload,
-        std::span<const std::uint8_t> presence, const ChunkVars& vars) const;
-    // The same for a chunk holding `current` before `update`.
-    void RequireChunkAfter(const ChunkCoord& coord, std::span<const std::uint8_t> payload,
-        std::span<const std::uint8_t> presence, const ChunkVars& current, const VarUpdate& update) const;
+    // Throws CheckFailedError for the first check block `block` of the state
+    // fails, and std::invalid_argument or std::out_of_range, naming the check
+    // and the block, when a check cannot be evaluated (division by zero, a
+    // position past the 64-bit range). `overrides` are text and bytes values
+    // that replace those of `vars` (a block write's changes).
+    void RequireBlock(const ChunkCoord& coord, std::span<const std::uint8_t> payload, const ChunkVars& vars,
+        std::size_t block, std::span<const VarChange> overrides = {}) const;
+    // The same for every present block of the state that `base` lacks or
+    // holds other values of, evaluating each check only when a column it
+    // reads changed or the block is new.
+    void RequireChanged(const ChunkCoord& coord, std::span<const std::uint8_t> payload,
+        std::span<const std::uint8_t> presence, const ChunkVars& vars, std::span<const std::uint8_t> base_payload,
+        std::span<const std::uint8_t> base_presence, const ChunkVars& base_vars) const;
+    // The same for a chunk holding `base_vars` that `update` changes.
+    void RequireChangedAfter(const ChunkCoord& coord, std::span<const std::uint8_t> payload,
+        std::span<const std::uint8_t> presence, const VarUpdate& update, std::span<const std::uint8_t> base_payload,
+        std::span<const std::uint8_t> base_presence, const ChunkVars& base_vars) const;
     // For the ADD CHECK scan: the first present block of the state the check
-    // in progress refuses, as "block (x, y) fails it" or "block (x, y)
-    // cannot evaluate it: <reason>"; std::nullopt when none does.
+    // in progress refuses, as "block (x, y) fails it" or "CHECK name cannot
+    // be evaluated for block (x, y): <reason>"; std::nullopt when none does.
     [[nodiscard]] std::optional<std::string> FindPendingFailure(const ChunkCoord& coord,
         std::span<const std::uint8_t> payload, std::span<const std::uint8_t> presence, const ChunkVars& vars) const;
 
@@ -54,12 +62,29 @@ class BlockChecks {
     BlockChecks& operator=(const BlockChecks&) = delete;
 
   private:
+    // Where a block's values are read from.
+    struct Source {
+        std::span<const std::uint8_t> payload;
+        const ChunkVars* vars = nullptr;
+        std::span<const VarChange> overrides{};
+    };
+    // Reused buffers of one evaluation.
+    struct Scratch {
+        std::vector<ColumnValue> values;
+        std::vector<std::uint8_t> bytes;
+        std::vector<std::uint8_t> other;
+    };
+
     // Whether check `check` is false for block `block`; throws as
     // RequireBlock when it cannot be evaluated.
-    [[nodiscard]] bool Fails(const Planned& check, const ChunkCoord& coord, std::span<const std::uint8_t> payload,
-        const ChunkVars& vars, std::size_t block, std::vector<ColumnValue>& values) const;
-    void RequireBlockWith(const ChunkCoord& coord, std::span<const std::uint8_t> payload, const ChunkVars& vars,
-        std::size_t block, std::vector<ColumnValue>& values) const;
+    [[nodiscard]] bool Fails(
+        const Planned& check, const ChunkCoord& coord, const Source& source, std::size_t block, Scratch& scratch) const;
+    // Throws CheckFailedError when `check` fails for `block`.
+    void Require(
+        const Planned& check, const ChunkCoord& coord, const Source& source, std::size_t block, Scratch& scratch) const;
+    // Whether column `index` of `block` differs between the two states.
+    [[nodiscard]] bool Differs(std::size_t index, std::size_t block, const Source& state, const Source& base,
+        Scratch& scratch) const;
     // "block (x, y)", "block (x, y, z)"; an axis past int64 as [chunk, local].
     [[nodiscard]] std::string DescribeBlock(const ChunkCoord& coord, std::size_t block) const;
 

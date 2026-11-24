@@ -94,7 +94,7 @@ Geometry::Geometry(GeometryConfig config, TableSchema schema, TableSchema chunk_
     }
     layout_ = std::make_shared<const ChunkLayout>(
         std::move(schema), static_cast<std::size_t>(active_blocks), kMaxChunkPayloadBytes);
-    checks_ = BlockChecks::Make(config_, layout_);
+    if (BlockChecks::Needed(layout_->schema())) checks_ = std::make_shared<LazyChecks>();
     has_chunk_column_history_ = !chunk_schema_.columns.empty() ||
         std::any_of(chunk_schema_.history.begin(), chunk_schema_.history.end(), [](const SchemaStep& step) {
             return std::any_of(step.changes.begin(), step.changes.end(), [](const SchemaChange& change) {
@@ -109,6 +109,11 @@ Geometry::Geometry(GeometryConfig config, TableSchema schema, TableSchema chunk_
         chunk_columns_require_initialization_ = std::any_of(chunk_schema_.columns.begin(), chunk_schema_.columns.end(),
             [](const Column& column) { return column.required && !column.has_default; });
     }
+}
+
+const BlockChecks* Geometry::PlannedChecks() const {
+    std::call_once(checks_->once, [this] { checks_->planned = BlockChecks::Make(config_, layout_); });
+    return checks_->planned.get();
 }
 
 const ChunkLayout& Geometry::LayoutAt(std::uint64_t version) const {

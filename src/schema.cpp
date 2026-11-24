@@ -59,8 +59,11 @@ constexpr std::uint8_t kKnownFlags = kFlagNullable | kFlagRequired | kFlagHasDef
     return std::find(names.begin(), names.end(), column) != names.end();
 }
 
-// Throws std::invalid_argument for a CHECK list `schema` cannot have.
-void ValidateChecks(const TableSchema& schema, ColumnDomain domain) {
+// Throws std::invalid_argument for a CHECK list `schema` cannot have. With
+// `plan`, each condition is also parsed and planned against the columns;
+// earlier versions are checked without it, as each check was planned
+// against its own version when it was added and a rename rewrites it.
+void ValidateChecks(const TableSchema& schema, ColumnDomain domain, bool plan) {
     if (schema.checks.empty()) return;
     if (domain != ColumnDomain::kBlock) throw std::invalid_argument("chunk columns cannot have CHECK constraints");
     if (schema.checks.size() > kMaxChecksPerTable)
@@ -68,7 +71,12 @@ void ValidateChecks(const TableSchema& schema, ColumnDomain domain) {
     std::unordered_set<std::string> names;
     for (const auto& check : schema.checks) {
         if (!names.insert(check.name).second) throw std::invalid_argument("CHECK " + check.name + " appears twice");
-        ValidateCheck(check, schema.columns);
+        if (plan) {
+            ValidateCheck(check, schema.columns);
+        } else if (!IsValidName(check.name) || check.expression.empty() ||
+                   check.expression.size() > kMaxCheckExpressionBytes) {
+            throw std::invalid_argument("schema history has a malformed CHECK " + check.name);
+        }
     }
 }
 
@@ -485,7 +493,7 @@ void ValidateSchema(const TableSchema& schema, ColumnDomain domain) {
         throw std::invalid_argument("schema version must be at least 1");
     }
     ValidateColumns(schema, domain);
-    ValidateChecks(schema, domain);
+    ValidateChecks(schema, domain, /*plan=*/true);
     if (schema.version - 1U > kMaxSchemaVersions) {
         throw std::invalid_argument("a table has at most " + std::to_string(kMaxSchemaVersions + 1U) + " schema versions");
     }
@@ -520,7 +528,7 @@ void ValidateSchema(const TableSchema& schema, ColumnDomain domain) {
         }
         UndoLastStep(&earlier);
         ValidateColumns(earlier, domain);
-        ValidateChecks(earlier, domain);
+        ValidateChecks(earlier, domain, /*plan=*/false);
     }
     ValidatePending(schema);
 }

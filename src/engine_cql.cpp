@@ -1689,11 +1689,20 @@ std::string CommandEngine::ExecuteStatement(
                             const auto current_metadata = !state.written && geometry.chunk_columns_require_initialization()
                                 ? nullptr : state.chunk_columns;
                             if (!state.written && geometry.chunk_columns_require_initialization()) state.chunk_columns.reset();
+                            const auto* checks = geometry.checks();
+                            // The blocks before the statement, kept only to evaluate the changed ones.
+                            std::vector<std::uint8_t> payload;
+                            std::vector<std::uint8_t> presence;
+                            if (checks != nullptr) {
+                                payload = state.payload;
+                                presence = state.presence_bitmap;
+                            }
                             transform(state);
                             store.PrepareTxnChunkState(state, current_vars, current_metadata.get());
                             // A failing block refuses the statement; COMMIT checks again.
-                            if (const auto* checks = geometry.checks())
-                                checks->RequireChunk(coord, state.payload, state.presence_bitmap, state.vars);
+                            if (checks != nullptr)
+                                checks->RequireChanged(coord, state.payload, state.presence_bitmap, state.vars, payload,
+                                    presence, current_vars);
                             state.written = true;
                         });
                         return NullReply();
