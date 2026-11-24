@@ -34,7 +34,7 @@
 
 namespace chunkdb {
 namespace {
-void Crash(const char* point) noexcept { if (ConsumeFailpointEnv(point)) std::_Exit(86); }
+void Crash(const char* point) noexcept { if (ConsumeFailpointEnv(point)) ExitAbruptly(86); }
 void ExclusiveMove(const std::filesystem::path& from, const std::filesystem::path& to) {
 #ifdef _WIN32
     if (MoveFileExW(from.wstring().c_str(), to.wstring().c_str(), MOVEFILE_WRITE_THROUGH) == 0)

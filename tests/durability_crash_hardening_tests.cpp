@@ -17,6 +17,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
 #include "checkpoint.hpp"
+#include "chunk_store_internal.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "populated_index_format.hpp"
 #include "store_manifest.hpp"
@@ -934,7 +935,7 @@ int RunPostRecoveryWriteCrashChild(
     chunkdb::ChunkStore store(config);
     store.SetBlockBits(1, 1, "00110011");
     store.WalBarrier();
-    std::_Exit(87);
+    chunkdb::ExitAbruptly(87);
 }
 
 // Opens a new store with the failpoint armed; the store's initialization ends

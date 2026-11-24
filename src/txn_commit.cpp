@@ -6,6 +6,7 @@
 #include <filesystem>
 #include <fstream>
 #include <mutex>
+#include <optional>
 #include <shared_mutex>
 #include <stdexcept>
 #include <string>
@@ -41,7 +42,7 @@ constexpr auto kTxnMaxDurationCap = std::chrono::hours(24 * 365);
 
 void CrashAtTxnFailpoint(const char* key) {
     if (ConsumeFailpointEnv(key)) {
-        std::_Exit(86);
+        ExitAbruptly(86);
     }
 }
 
@@ -607,9 +608,12 @@ std::uint64_t ChunkStore::CommitTransaction(
 
     // One version and one commit time for every chunk. Taken after the
     // chunks are locked and flushed, so it is above every frame in their WALs.
-    FeedWriteGuard feed(*this);
+    // Optional so that its producer bound ends once the outcome is settled,
+    // before the intent removal and the inline checkpoints below.
+    std::optional<FeedWriteGuard> feed;
+    feed.emplace(*this);
     const std::uint64_t version = NextChunkVersion();
-    feed.Version(version);
+    feed->Version(version);
     std::uint64_t commit_time_ms = 0;
     for (const auto& change : changes) {
         commit_time_ms = NextCommitTimeMs(*change.target->chunk);
@@ -627,7 +631,7 @@ std::uint64_t ChunkStore::CommitTransaction(
         if (change.new_wal) {
             change.bytes = BuildWalHeader(change.target->coord, store_id_, features_, geometry_.dims());
         }
-        feed.Before(change.target->coord, chunk.payload, chunk.presence_bitmap, chunk.vars, chunk.chunk_columns.get(), chunk.written);
+        feed->Before(change.target->coord, chunk.payload, chunk.presence_bitmap, chunk.vars, chunk.chunk_columns.get(), chunk.written);
         WalFrameBuilder frame(&change.bytes, geometry_.layout().schema().version, {}, SlotWriteUser());
         AppendDiffSpans(&frame, 0U, chunk.payload, state.payload);
         AppendDiffSpans(&frame, geometry_.ChunkPayloadBytes(), chunk.presence_bitmap, state.presence_bitmap);
@@ -641,7 +645,7 @@ std::uint64_t ChunkStore::CommitTransaction(
         if (feed_slots_ && feed_slots_->ArchiveRequired())
             change.prefix.emplace(feed_slots_->prefix_index().Prepare(change.target->coord, change.boundary,
                 change.bytes, geometry_.dims()));
-        feed.Capture(change.bytes, frame_bytes);
+        feed->Capture(change.bytes, frame_bytes);
         if (keep_states) {
             change.keep.node = TxnHistory::Reserve(change.target->coord, version, ChunkState{});
         }
@@ -709,7 +713,7 @@ std::uint64_t ChunkStore::CommitTransaction(
                     " transaction frames");
             }
             if (ConsumeFailpointAt("CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_FRAMES", i)) {
-                std::_Exit(86);
+                ExitAbruptly(86);
             }
             if (i == changes.size()) {
                 break;
@@ -841,7 +845,7 @@ std::uint64_t ChunkStore::CommitTransaction(
             txn_history_->Publish(change.keep.node);
         }
     }
-    feed.Commit();
+    feed->Commit();
     locks.Release();
     txn_history_->PauseForTests(TxnPausePoint::kBeforePostCommitOutcome);
 
@@ -881,6 +885,10 @@ std::uint64_t ChunkStore::CommitTransaction(
             throw unknown_outcome;
         }
     }
+    // The outcome is settled and published: a snapshot that includes this
+    // commit, and a backup cut, need not wait for the cleanup below.
+    feed.reset();
+    txn_history_->PauseForTests(TxnPausePoint::kBeforePostCommitCheckpoints);
 
     CrashAtTxnFailpoint("CHUNKDB_FAILPOINT_CRASH_TXN_BEFORE_INTENT_UNLINK_ONCE");
     try {

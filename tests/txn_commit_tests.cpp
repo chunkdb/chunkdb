@@ -15,6 +15,7 @@
 #include <functional>
 #include <future>
 #include <memory>
+#include <mutex>
 #include <optional>
 #include <sstream>
 #include <stdexcept>
@@ -26,6 +27,7 @@
 #include "chunkdb/chunk_store.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "checkpoint.hpp"
 #include "txn_history.hpp"
 #include "store_manifest.hpp"
 #include "txn_test_utils.hpp"
@@ -587,8 +589,14 @@ void TestRelaxedBoundaryMakesImageDurable() {
         auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
         assert(store.CommitTransaction(*snapshot, {kA}, Writes(store, *snapshot, {{kA, 3}})) > 0U);
         assert(store.UnsyncedTrackedCountForTests() == 0U);
-
-        // The conditional write path, on another chunk.
+    }
+    // The conditional write path, in a new store: the commit above makes
+    // every later checkpoint of its store sync, as does reopening it.
+    ScopedTempDir conditional_dir("chunkdb-txn-commit-relaxed-image-cas");
+    auto conditional_config = config;
+    conditional_config.data_dir = conditional_dir.path();
+    {
+        ChunkStore store(conditional_config);
         WriteCounter(store, kB, 1);
         store.CheckpointForTests(kB.x, kB.y);
         WriteCounter(store, kB, 2);
@@ -602,7 +610,64 @@ void TestRelaxedBoundaryMakesImageDurable() {
         assert(store.UnsyncedTrackedCountForTests() == 1U);
     }
     ChunkStore reopened(config);
-    assert(ReadCounter(reopened, kA) == 3U && ReadCounter(reopened, kB) == 3U);
+    assert(ReadCounter(reopened, kA) == 3U);
+    ChunkStore conditional_reopened(conditional_config);
+    assert(ReadCounter(conditional_reopened, kB) == 3U);
+}
+
+// A table created in this process, in relaxed mode, has seen no barrier.
+// A committed transaction is durable in every mode, and a conditional write
+// syncs its WAL for its rollback, so a later checkpoint of the chunk syncs
+// the image and its directory before it removes the WAL that holds the
+// commit, as after a barrier or a reopen.
+void TestRelaxedCommitSetsDurabilityFloor() {
+    const auto run = [](const char* name, const std::function<void(ChunkStore&)>& commit) {
+        ScopedTempDir dir(name);
+        auto config = Config(dir.path(), chunkdb::DurabilityMode::kRelaxed);
+        config.checkpoint_update_interval = 1000;
+        config.checkpoint_wal_bytes = 1U << 20U;
+        config.wal_group_commit_updates = 1;
+        {
+            ChunkStore store(config);
+            // Directory syncs of a chunk's large-chunk directory while it is
+            // checkpointed.
+            const auto checkpoint_dir_syncs = [&](const ChunkCoord& coord) {
+                const auto large_dir = chunkdb::ChunkDataPath(store.data_dir(), store.geometry(), coord).parent_path();
+                std::mutex mutex;
+                std::size_t syncs = 0;
+                chunkdb::SetDirectorySyncObserverForTests([&](const std::filesystem::path& path) {
+                    std::error_code ec;
+                    if (std::filesystem::equivalent(path, large_dir, ec) && !ec) {
+                        std::lock_guard lock(mutex);
+                        ++syncs;
+                    }
+                });
+                store.CheckpointForTests(coord.x, coord.y);
+                chunkdb::SetDirectorySyncObserverForTests({});
+                assert(std::filesystem::exists(chunkdb::ChunkDataPath(store.data_dir(), store.geometry(), coord)));
+                assert(!std::filesystem::exists(WalOf(store, coord)));
+                return syncs;
+            };
+            // Before the commit a relaxed checkpoint syncs nothing.
+            WriteCounter(store, kC, 1);
+            assert(checkpoint_dir_syncs(kC) == 0U);
+
+            commit(store);
+            assert(checkpoint_dir_syncs(kA) > 0U);
+        }
+        ChunkStore reopened(config);
+        assert(ReadCounter(reopened, kA) == 7U && ReadCounter(reopened, kC) == 1U);
+    };
+    run("chunkdb-txn-commit-relaxed-floor", [](ChunkStore& store) {
+        auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+        assert(store.CommitTransaction(*snapshot, {}, Writes(store, *snapshot, {{kA, 7}})) > 0U);
+    });
+    run("chunkdb-txn-commit-relaxed-floor-cas", [](ChunkStore& store) {
+        WriteCounter(store, kA, 1);
+        auto state = store.ReadChunkState(kA.x, kA.y);
+        SetCounter(&state, 7);
+        assert(store.CasChunkStateBytes(kA.x, kA.y, state.version, state.payload, state.presence_bitmap).ok);
+    });
 }
 
 // Few WAL streams, all held by chunks the commit only reads: the commit
@@ -846,7 +911,8 @@ void TestPauseSlots() {
         chunkdb::TxnPausePoint::kRegisterBeforePublish,
         chunkdb::TxnPausePoint::kWriteAfterOpenCount,
         chunkdb::TxnPausePoint::kWriteAfterMembership,
-        chunkdb::TxnPausePoint::kBeforePostCommitOutcome};
+        chunkdb::TxnPausePoint::kBeforePostCommitOutcome,
+        chunkdb::TxnPausePoint::kBeforePostCommitCheckpoints};
     static_assert(points.size() + 1U == static_cast<std::size_t>(chunkdb::TxnPausePoint::kCount));
     for (unsigned round = 0; round < 2U; ++round) {
         std::array<std::atomic<bool>, points.size()> completed{};
@@ -901,11 +967,40 @@ void TestPostCommitPause() {
     assert(ReadCounter(reopened, kA) == 4U && ReadCounter(reopened, kB) == 3U);
 }
 
+// A settled commit ends its producer bound before its intent removal and inline
+// checkpoints, so a scan at a snapshot that includes it does not wait for them.
+void TestScanDoesNotWaitForPostCommitWork() {
+    ScopedTempDir dir("chunkdb-txn-commit-bound");
+    const auto config = Config(dir.path());
+    ChunkStore store(config);
+    WriteCounter(store, kA, 1U);
+    auto snapshot = store.BeginTxnSnapshot(kTxnDuration);
+    auto writes = Writes(store, *snapshot, {{kA, 2U}, {kB, 3U}});
+    constexpr auto point = chunkdb::TxnPausePoint::kBeforePostCommitCheckpoints;
+    store.ArmTxnPauseForTests(point);
+    auto commit = std::async(std::launch::async, [&] {
+        return store.CommitTransaction(*snapshot, {}, std::move(writes));
+    });
+    assert(store.WaitForTxnPauseForTests(point));
+    assert(commit.wait_for(std::chrono::seconds(0)) == std::future_status::timeout);
+    const auto committed = store.GetChunkVersion(kA.x, kA.y);
+    // A short duration: a scan still waiting for the paused commit would end
+    // with CONFLICT reason=duration instead of returning.
+    auto reader = store.BeginTxnSnapshot(std::chrono::milliseconds(2000));
+    const auto page = store.ScanChunkIdentitiesAt(*reader, false, ChunkCoord{}, 16U);
+    assert(page.entries.size() == 2U && page.position.has_value() && *page.position >= committed);
+    store.EndTxnSnapshot(*reader);
+    store.ResumeTxnForTests(point);
+    assert(commit.get() == committed);
+    assert(ReadCounter(store, kA) == 2U && ReadCounter(store, kB) == 3U);
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
     TestPauseSlots();
     TestPostCommitPause();
+    TestScanDoesNotWaitForPostCommitWork();
     if (argc == 2 && std::string_view(argv[1]) == "--pause-regressions") return 0;
     assert(argc == 1);
     for (const auto mode : {chunkdb::DurabilityMode::kRelaxed, chunkdb::DurabilityMode::kFsyncWal,
@@ -924,6 +1019,7 @@ int main(int argc, char** argv) {
     TestCommitRecordNotDurable();
     TestIntentsOnDisk();
     TestRelaxedBoundaryMakesImageDurable();
+    TestRelaxedCommitSetsDurabilityFloor();
     TestFewWalStreams();
     TestFailureAfterCommitPoint();
     return 0;

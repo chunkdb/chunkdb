@@ -70,7 +70,7 @@ release.
 
 `release-binaries.yml` runs only on a pushed `v*` tag and attaches archives and
 SHA256 sidecars to that tag's GitHub release after all four builds succeed.
-Each archive contains `chunkdb_server`, `chunkdb_verify`, `chunkdb_restore`, `chunkdb_admin`, the
+Each archive contains `chunkdb_server`, `chunkdb_verify`, `chunkdb_restore`, `chunkdb_admin`, `chunkdb_exporter`, the
 license and server help; Windows files have `.exe` suffixes.
 The targets are Linux x86-64/arm64 (Ubuntu 22.04 or later), macOS arm64 (macOS 14
 or later) and Windows x86-64 (MSYS2 UCRT64, Windows 10 or later).

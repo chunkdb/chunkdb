@@ -15,6 +15,7 @@
 #include "feed_prefix.hpp"
 #include "feed_protocol.hpp"
 #include "feed_slots.hpp"
+#include "chunk_store_internal.hpp"
 #include "feed_test_utils.hpp"
 #include "slot_watch.hpp"
 #include "wal_replay.hpp"
@@ -345,7 +346,7 @@ int CrashTail(const std::filesystem::path& path, DurabilityMode mode, bool heade
     assert(wal.size() > valid_size + kWalFrameFixedHeaderSize);
     wal[header ? valid_size + 4U : wal.size() - 5U] ^= 1U;
     Save(wal_path, wal);
-    std::_Exit(kCrashExit); // Preserve the WAL and durable watermark without destructor recovery/checkpoint.
+    ExitAbruptly(kCrashExit); // Preserve the WAL and durable watermark without destructor recovery/checkpoint.
 }
 constexpr std::int64_t kColdChunks = 24;
 int CrashCold(const std::filesystem::path& path) {
@@ -366,7 +367,7 @@ int CrashCold(const std::filesystem::path& path) {
             txn_test::WriteCounter(lease->store(), {x, 0}, static_cast<std::uint32_t>(20 + x));
     }
     FeedSlotTestAccess::Sync(*table);
-    std::_Exit(kCrashExit);
+    ExitAbruptly(kCrashExit);
 }
 void MakeCold(const std::string& executable, const std::filesystem::path& path) {
     std::string command = "\"" + executable + "\" --crash-cold \"" + path.string() + "\"";
