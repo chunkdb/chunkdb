@@ -719,13 +719,13 @@ struct BlockWritePlan {
 
 // The reply of a single write with RETURNING before its rows:
 // {applied, version, rows} (docs/PROTOCOL.md).
-[[nodiscard]] std::string ReturningPrefix(bool applied, std::optional<std::uint64_t> version) {
+[[nodiscard]] std::string ReturningPrefix(bool applied, bool has_version, std::uint64_t version) {
     std::string prefix;
     Protocol::AppendMapHeader(prefix, 3U);
     Protocol::AppendBulk(prefix, "applied");
     Protocol::AppendBoolean(prefix, applied);
     Protocol::AppendBulk(prefix, "version");
-    if (version) Protocol::AppendInteger(prefix, *version);
+    if (has_version) Protocol::AppendInteger(prefix, version);
     else Protocol::AppendNull(prefix);
     Protocol::AppendBulk(prefix, "rows");
     return prefix;
@@ -2982,7 +2982,7 @@ std::string CommandEngine::BlockWriteWithExpressions(
         // Admitted before the write, so a refusal changes nothing.
         if (reserve_reply) (*reserve_reply)(BlockReplyCaptureBound(layout, returned));
         rows.emplace(geometry.dims(), kMaxReturningRows, store.query_limits().max_area_response_bytes,
-            ReturningPrefix(false, std::numeric_limits<std::uint64_t>::max()).size());
+            ReturningPrefix(false, true, std::numeric_limits<std::uint64_t>::max()).size());
     }
     // Single values with IF <expr> are decoded as without it.
     std::vector<ColumnAssignment> single;
@@ -3062,9 +3062,8 @@ std::string CommandEngine::BlockWriteWithExpressions(
         // never-written chunk has no version, as for GET BLOCK WITH VERSION.
         if (rows) {
             if (!result.ok) session.refused_write = refused();
-            const std::optional<std::uint64_t> version =
-                result.ok || chunk_written ? std::optional<std::uint64_t>(result.version) : std::nullopt;
-            return std::move(*rows).Reply(ReturningPrefix(result.ok, version), {}, continuation);
+            return std::move(*rows).Reply(
+                ReturningPrefix(result.ok, result.ok || chunk_written, result.version), {}, continuation);
         }
         if (version_mismatch) return Protocol::Error("VERSION_MISMATCH", "", {{"current", std::to_string(result.version)}});
         if (!result.ok) return ErrorReply(ConditionFailedError(result.version));
@@ -3108,7 +3107,7 @@ std::string CommandEngine::BlockWriteWithExpressions(
     if (!decide(view, assignments)) {
         if (rows) {
             session.refused_write = refused();
-            return std::move(*rows).Reply(ReturningPrefix(false, visible_version), {}, continuation);
+            return std::move(*rows).Reply(ReturningPrefix(false, visible_version.has_value(), visible_version.value_or(0U)), {}, continuation);
         }
         return ErrorReply(ConditionFailedError(version));
     }
@@ -3123,7 +3122,7 @@ std::string CommandEngine::BlockWriteWithExpressions(
         }
     });
     // The chunk is the transaction's own until COMMIT: no version yet.
-    if (rows) return std::move(*rows).Reply(ReturningPrefix(true, std::nullopt), {}, continuation);
+    if (rows) return std::move(*rows).Reply(ReturningPrefix(true, false, 0U), {}, continuation);
     return NullReply();
 }
 
