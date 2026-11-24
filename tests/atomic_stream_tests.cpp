@@ -1,14 +1,21 @@
 #include <cassert>
 #include <cstdlib>
 #include <filesystem>
+#include <fstream>
 #include <functional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <vector>
 
 #include "checkpoint.hpp"
 #include "file_permissions.hpp"
 #include "test_utils.hpp"
+
+#ifndef _WIN32
+#include <fcntl.h>
+#include <unistd.h>
+#endif
 
 namespace {
 using namespace chunkdb;
@@ -82,9 +89,55 @@ void IoFailureRetainsThePublicationBoundary() {
     assert(failed && replaced && LoadFile(path) == next);
     assert(FileIsOwnerOnly(path));
 }
+
+#ifndef _WIN32
+// A failed close is never repeated: the descriptor may be released already
+// and its number taken by another open, here a sentinel opened in that
+// number right after the close.
+void FailedCloseIsNotRepeated() {
+    if (!kFailpointsCompiled) return;
+    test::ScopedTempDir directory("chunkdb-close-once");
+    const auto path = directory.path() / "index";
+    const auto sentinel_path = directory.path() / "sentinel";
+    const Bytes previous{1, 2, 3};
+    AtomicWrite(path, previous, true, true);
+    { std::ofstream(sentinel_path) << "sentinel"; }
+    const std::vector<std::function<void()>> steps{
+        [&] { AtomicWrite(path, Bytes{4, 5, 6}, true, true); },  // the temporary file
+        [&] { SyncFilePath(path); },
+        [&] { SyncDirectoryPath(directory.path()); },
+    };
+    for (const auto& step : steps) {
+        int sentinel = -1;
+        SetDescriptorCloseObserverForTests([&](int closed) {
+            if (sentinel >= 0) return;
+            const int opened = ::open(sentinel_path.c_str(), O_RDONLY);
+            assert(opened >= 0);
+            if (opened != closed) {
+                assert(::dup2(opened, closed) == closed);
+                (void)::close(opened);
+            }
+            sentinel = closed;
+        });
+        Env("CHUNKDB_FAILPOINT_CLOSE_INTERRUPTED_ONCE", "1");
+        bool failed = false;
+        try { step(); } catch (const std::system_error&) { failed = true; }
+        Env("CHUNKDB_FAILPOINT_CLOSE_INTERRUPTED_ONCE", "");
+        SetDescriptorCloseObserverForTests({});
+        assert(failed && sentinel >= 0);
+        // Still open: nothing closed the number again.
+        assert(::fcntl(sentinel, F_GETFD) != -1);
+        (void)::close(sentinel);
+    }
+    assert(LoadFile(path) == previous);
+}
+#endif
 }
 
 int main() {
     ProducerFailureDoesNotPublish();
     IoFailureRetainsThePublicationBoundary();
+#ifndef _WIN32
+    FailedCloseIsNotRepeated();
+#endif
 }
