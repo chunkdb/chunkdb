@@ -45,6 +45,7 @@ Use IF VERSION for equality checks against the containing chunk, including chang
 
 chunkdb has no query planner and does not join tables.
 Each statement reads or writes one table at the coordinates you name.
+Lookup by value needs secondary indexes, which chunkdb does not have yet; see [Known limitations](KNOWN_LIMITATIONS.md) and keep a derived table keyed by the value instead.
 
 ### Keep data read together in one table
 
@@ -61,6 +62,29 @@ OK
 1
 kind = 1
 height = 12
+```
+
+Values that belong to the whole chunk rather than to one block go in [chunk columns](reference/CHUNKS.md), which every GET CHUNK returns with the chunk's blocks:
+
+```cql docs-check session=main
+CREATE TABLE region (kind u8) CHUNK 2 x 2 CHUNK COLUMNS (biome u8 DEFAULT 0)
+SET CHUNK 0 0 IN region META biome = 3
+SET BLOCK 0 0 IN region kind = 1
+--blocks GET CHUNK 0 0 FROM region
+```
+
+```output
+OK
+1
+2
+version = 2
+schema_version = 1
+commit_time_ms = <time-ms>
+present = 1 of 4 blocks
+chunk_columns:
+  biome = 3
+block 0 0
+  kind = 1
 ```
 
 ### Read tables that share coordinates
@@ -83,6 +107,29 @@ level = 9
 ```
 
 The two reads do not share a snapshot, so a write between them can make the results disagree.
+
+A transaction covers one table, so it cannot read both tables; its first table statement fixes the table and a statement on another table is refused:
+
+```cql docs-check session=main
+BEGIN
+GET BLOCK 0 0 FROM terrain COLUMNS height
+GET BLOCK 0 0 FROM light
+ROLLBACK
+```
+
+```output
+OK
+height = 12
+error: INVALID_ARGUMENT reason=invalid_argument a transaction covers one table: this one covers terrain
+OK
+```
+
+To detect a write between the two reads, read the chunk of each table with GET CHUNK and note its `version`, then read both again.
+If neither `version` changed, nothing wrote to either chunk between the passes and the first reads match one state of both tables.
+Otherwise repeat the reads.
+This holds only while each table keeps its epoch: SWAP TABLES, RESTORE TABLE, or DROP and CREATE start a new epoch, so also compare the `epoch` from DESCRIBE before the first pass and after the second.
+A chunk that GET CHUNK returns as (null) has no version, so the check holds only for chunks present in both passes.
+Rows read together from a transaction on one table are always consistent, so use one table when that matters.
 
 ### Keep a derived table up to date
 
