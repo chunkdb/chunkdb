@@ -2314,6 +2314,42 @@ void TestConnectionListingTrimsStatementWhitespace() {
     assert(worker.ReadLine() == "+PONG\r\n" && target.ReadLine() == "+PONG\r\n");
 }
 
+// MONITOR lists every user's connections and controls none of them; a user
+// without it lists only its own.
+void TestMonitorListsConnectionsWithoutControl() {
+    ServerHarness harness("monitor-connections", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = true}, BaseServerConfig());
+    RawClient admin("127.0.0.1", harness.port); admin.SetReadDeadline(std::chrono::seconds(15)); admin.Login();
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    for (const std::string name : {"mon", "bot"}) {
+        admin.SendLine("CREATE USER " + name + " VERIFIER '" + verifier + "'");
+        assert(admin.ReadLine() == "+OK\r\n");
+    }
+    admin.SendLine("GRANT MONITOR ON * TO mon");
+    assert(admin.ReadLine() == "+OK\r\n");
+    RawClient bot("127.0.0.1", harness.port); bot.SetReadDeadline(std::chrono::seconds(15));
+    std::uint64_t bot_id = 0U;
+    assert(LoginReply(bot, "bot", "pw", &bot_id) == "%14\r\n" && bot_id != 0U);
+    RawClient mon("127.0.0.1", harness.port); mon.SetReadDeadline(std::chrono::seconds(15));
+    std::uint64_t mon_id = 0U;
+    assert(LoginReply(mon, "mon", "pw", &mon_id) == "%14\r\n" && mon_id != 0U);
+    const auto entry = [](std::uint64_t id) { return "$2\r\nid\r\n:" + std::to_string(id) + "\r\n"; };
+
+    mon.SendLine("SHOW CONNECTIONS");
+    const auto listing = mon.ReadReply();
+    assert(listing.find(entry(bot_id)) != std::string::npos && listing.find(entry(mon_id)) != std::string::npos);
+    bot.SendLine("SHOW CONNECTIONS");
+    const auto own = bot.ReadReply();
+    assert(own.find(entry(bot_id)) != std::string::npos && own.find(entry(mon_id)) == std::string::npos);
+
+    mon.SendLine("CANCEL " + std::to_string(bot_id));
+    assert(mon.ReadReply() == "%1\r\n$9\r\ncancelled\r\n#f\r\n");
+    mon.SendLine("KILL CONNECTION " + std::to_string(bot_id));
+    assert(mon.ReadReply() == "%1\r\n$6\r\nkilled\r\n#f\r\n");
+    bot.SendLine("PING");
+    assert(bot.ReadLine() == "+PONG\r\n");
+}
+
 class ShutdownPublicationHook : public RateQueueHook {
   public:
     void Run(Point point, std::size_t value) override {
@@ -8509,6 +8545,7 @@ int main(int argc, char** argv) {
         run("TestRefusedDispatchWakesAfterPop", TestRefusedDispatchWakesAfterPop);
         run("TestQueuedCancellationConsumesUserRate", TestQueuedCancellationConsumesUserRate);
         run("TestConnectionListingTrimsStatementWhitespace", TestConnectionListingTrimsStatementWhitespace);
+        run("TestMonitorListsConnectionsWithoutControl", TestMonitorListsConnectionsWithoutControl);
         run("TestStopPublicationGapClosesQueuedOwner", TestStopPublicationGapClosesQueuedOwner);
         run("TestOrdinaryWatchRateRepliesAreBounded", TestOrdinaryWatchRateRepliesAreBounded);
         run("TestExpiredQueueRetainsTransportOwner", TestExpiredQueueRetainsTransportOwner);

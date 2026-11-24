@@ -1,7 +1,7 @@
 # CREATE USER, ALTER USER, DROP USER, GRANT, REVOKE, SHOW USERS
 
 You create login identities and grant access to tables.
-A right permits reading, writing, or administering a table.
+A right permits reading, writing, or administering tables, or reading server status and taking backups.
 
 ## Examples
 
@@ -44,6 +44,7 @@ OK
   verifiers = 1
   grants:
     * = ADMIN
+  server_rights = []
 2)
   name = bot
   manages_users = false
@@ -51,6 +52,7 @@ OK
   verifiers = 1
   grants:
     world = READ
+  server_rights = []
 OK
 ```
 
@@ -67,8 +69,8 @@ ALTER USER user LIMIT statements_per_sec = n
 ALTER USER user [NO] REQUIRE CHANNEL BINDING
 DROP USER [IF EXISTS] user
 SHOW USERS
-GRANT right [, right ...] ON table | * TO user
-REVOKE right [, right ...] ON table | * FROM user
+GRANT right [, right ...] ON table | prefix* | * TO user
+REVOKE right [, right ...] ON table | prefix* | * FROM user
 ```
 
 The CLI accepts PASSWORD in place of VERIFIER and prompts twice unless you provide `--new-password-file`.
@@ -97,8 +99,10 @@ See [Protocol](../PROTOCOL.md) for authentication encoding.
 
 - `user`: `[a-z_][a-z0-9_]*`, from 1 through 63 bytes.
 - `verifier`: `SCRAM-SHA-256$<iterations>:<salt>$<StoredKey>:<ServerKey>` with base64 parts, 4096 through 1000000 iterations, a salt of 16 through 256 bytes, and at most 512 bytes in all.
-- `right`: READ, WRITE, or ADMIN; ADMIN includes WRITE, and WRITE includes READ.
+- `right`: READ, WRITE, or ADMIN on tables; ADMIN includes WRITE, and WRITE includes READ.
+- `right` can also be MONITOR, BACKUP, or REPLICATION, server rights granted ON * only; see [Rights](../USERS.md#rights).
 - `table`: a valid table name, including one not yet created.
+- `prefix*`: every table whose name starts with `prefix`, written without a space before `*`, including tables created later; `prefix` is `[a-z][a-z0-9_]*`, from 1 through 64 bytes.
 - `*`: all tables, including tables created later.
 - `MANAGES USERS`: permission to manage users, rights, and backups, and to list GRANT and REVOKE migrations.
 - `REQUIRE CHANNEL BINDING`: the user logs in only with a login bound to its TLS connection; see [Channel binding](../USERS.md#channel-binding).
@@ -107,15 +111,16 @@ See [Protocol](../PROTOCOL.md) for authentication encoding.
 ## Returns
 
 - CREATE, ALTER, DROP, GRANT, and REVOKE: `OK`.
-- SHOW USERS: user names, MANAGES USERS state, REQUIRE CHANNEL BINDING state, the number of verifiers (1, or 2 after ADD VERIFIER), and grants.
+- SHOW USERS: user names, MANAGES USERS state, REQUIRE CHANNEL BINDING state, the number of verifiers (1, or 2 after ADD VERIFIER), grants by table, `prefix*` or `*`, and `server_rights`, the list of MONITOR, BACKUP and REPLICATION the user holds.
 
 ## Errors
 
 | Error | When | What to do |
 | --- | --- | --- |
 | PERMISSION_DENIED | You lack MANAGES USERS or change another user's password without it. | Request access. |
-| INVALID_ARGUMENT | The name, verifier, rights, or final manager removal is invalid. | Correct the reported argument. |
+| INVALID_ARGUMENT | The name, prefix, verifier, rights, or final manager removal is invalid. | Correct the reported argument. |
 | INVALID_ARGUMENT | ADD VERIFIER names a user with two verifiers, or a verifier with another salt or iteration count. | Run DROP OLD VERIFIER first, or compute the verifier with the user's salt and iteration count. |
+| SYNTAX | MONITOR, BACKUP or REPLICATION is granted on a table or prefix rather than `*`. | Grant it ON *. |
 | INVALID_ARGUMENT | You change a user or a right on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | RATE_LIMITED | Repeated failures temporarily ban the source address. | Wait for the returned retry_after_ms. |
 | AUTH_FAILED | Login credentials are incorrect. | Check the password or use [Reset a forgotten password](../PASSWORD_RESET.md). |
@@ -129,7 +134,7 @@ Passwords use their exact UTF-8 bytes, without normalization.
 
 GRANT and REVOKE apply comma-separated lists atomically.
 REVOKE removes the named right and every higher right; revoking WRITE from ADMIN leaves READ.
-Dropping a table removes its table-specific grants, while wildcard grants remain.
+Dropping a table removes its table-specific grants, while prefix and wildcard grants remain.
 
 ## Limits
 
