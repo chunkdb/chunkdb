@@ -1084,9 +1084,15 @@ std::vector<std::uint8_t> SerializeBackupRecord(const BackupRecord& record) {
     for (const auto& table : record.tables) { PutString(bytes, table.name); bytes.insert(bytes.end(), table.epoch.begin(), table.epoch.end()); WriteLe64(bytes, table.revision); }
     WriteLe32(bytes, static_cast<std::uint32_t>(record.files.size()));
     for (const auto& file : record.files) { PutString(bytes, file.relative_path.generic_string()); WriteLe64(bytes, file.size); WriteLe32(bytes, file.crc32); }
-    WriteLe32(bytes, Crc32(bytes)); return bytes;
+    WriteLe32(bytes, Crc32(bytes));
+    if (bytes.size() > kMaxBackupRecordBytes)
+        throw std::length_error("the backup record would take " + std::to_string(bytes.size()) + " bytes, more than " +
+            std::to_string(kMaxBackupRecordBytes));
+    return bytes;
 }
 BackupRecord ParseBackupRecord(const std::vector<std::uint8_t>& bytes) {
+    if (bytes.size() > kMaxBackupRecordBytes)
+        throw std::runtime_error("backup marker is larger than " + std::to_string(kMaxBackupRecordBytes) + " bytes");
     if (bytes.size() < 28U || !std::equal(kMagic.begin(), kMagic.end(), bytes.begin()) ||
         ReadLe32(bytes, bytes.size() - 4U) != Crc32(bytes.data(), bytes.size() - 4U)) throw std::runtime_error("invalid backup marker or checksum");
     Reader reader(bytes, bytes.size() - 4U); if (reader.U16() != 1U || reader.U16() != 0U) throw std::runtime_error("unsupported backup marker version");
@@ -1100,7 +1106,11 @@ BackupRecord ParseBackupRecord(const std::vector<std::uint8_t>& bytes) {
     return record;
 }
 BackupRecord ReadBackupRecord(const std::filesystem::path& root) {
-    RequireRegular(root / kBackupMarkerName); return ParseBackupRecord(LoadFile(root / kBackupMarkerName));
+    RequireRegular(root / kBackupMarkerName);
+    // Checked before the file is read whole.
+    if (std::filesystem::file_size(root / kBackupMarkerName) > kMaxBackupRecordBytes)
+        throw std::runtime_error("backup marker is larger than " + std::to_string(kMaxBackupRecordBytes) + " bytes");
+    return ParseBackupRecord(LoadFile(root / kBackupMarkerName));
 }
 BackupTableCopy CopyBackupTable(const std::filesystem::path& backup, std::string_view table,
     const std::filesystem::path& directory, const BackupCancel& cancelled, const BackupCopyProgress& progress) {

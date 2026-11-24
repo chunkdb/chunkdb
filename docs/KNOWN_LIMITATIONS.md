@@ -35,7 +35,7 @@
 ## What chunkdb does not do
 
 - **No secondary indexes or lookup by value:** statements address blocks and chunks by coordinates; to find blocks by a value, keep your own index, such as a second table keyed by that value, updated from a change feed slot.
-- **No query planner or joins:** each statement reads or writes one table at the coordinates you name; see [Related data](CQL.md#related-data) for keeping data together, reading tables that share coordinates, and derived tables.
+- **No query planner or joins:** each statement reads or writes one table at the coordinates you name; see [Related data](RELATED_DATA.md) for keeping data together, reading related chunks of two tables, and derived tables.
 - **Aggregates by chunk only:** [AGGREGATE](reference/AGGREGATE.md) groups only BY CHUNK and covers at most `--max-area-chunks` chunks per statement; combine the results of several areas in your client, or keep running totals updated from a change feed slot.
 - **No replication:** durability across machines and distributed transactions are unavailable; keep copies with [Backup and restore](BACKUP.md), or copy changes to another system from a change feed slot.
 
