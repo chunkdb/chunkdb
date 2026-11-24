@@ -202,4 +202,9 @@ void LogMessage(
     }
 }
 
+void FlushLog() {
+    std::lock_guard lock(g_sink_mutex);
+    if (!g_sink) std::cout.flush();
+}
+
 }  // namespace chunkdb

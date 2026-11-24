@@ -46,4 +46,9 @@ void LogMessage(
     std::string_view message,
     std::initializer_list<LogField> fields = {});
 
+// Writes buffered log output now. INFO lines are not flushed one by one; a
+// line a reader waits for, such as the server's ready line, is followed by
+// this call.
+void FlushLog();
+
 }  // namespace chunkdb
