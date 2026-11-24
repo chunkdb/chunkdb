@@ -736,7 +736,8 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
         if (slot.owner && authorize_owner) authorize_owner(*slot.owner);
         if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
             slot.schema_filter_lost ? "schema_filter" : "retention_limit");
-        if ((!options.areas.empty() && (options.areas.size() != 1U || options.areas.front() != slot.filters.area)) ||
+        // Repeated areas keep the same chunks, as for a watch without SLOT.
+        if (std::any_of(options.areas.begin(), options.areas.end(), [&](const FeedArea& area) { return area != slot.filters.area; }) ||
             (options.column_ids && options.column_ids != slot.filters.column_ids) ||
             (options.no_before && !slot.filters.no_before) || (options.chunks && !slot.filters.chunks))
             throw FeedSlotFiltersError("feed slot filters differ from WATCH filters");
