@@ -98,6 +98,7 @@ An unauthenticated user or an idle statement is represented by NULL in its field
 `progress` is NULL unless the running statement reports progress; a running `RESTORE TABLE` reports a map of integers `files_done`, `files_total`, `bytes_done`, and `bytes_total` for its copy of the backup.
 The map appears when the copy starts; `progress` is NULL while the restore checks the backup before the copy and once the statement completes, including while its reply is written.
 The reply includes every authorized connection or fails with `OUT_OF_RANGE reason=response_limit`; it never truncates the listing.
+When the server's output reserve for listings is held by unread listings, it receives `BUSY reason=reply_budget`; logins and other replies do not draw from that reserve.
 Users control sessions belonging to their current user incarnation; ADMIN on `*` may control every session, and MONITOR may list every session.
 
 `CANCEL id` returns `{cancelled: bool}` and accepts cancellation only before the target statement enters its irreversible decision.
