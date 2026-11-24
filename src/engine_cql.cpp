@@ -1914,11 +1914,20 @@ std::string CommandEngine::ExecuteStatement(
                 },
                 [&](const cql::RestoreTable& restore) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
-                    // BACKUP, the right BACKUP TO also takes, or ADMIN on `*`: the backup
-                    // may hold any table.
-                    if (const User* user = CurrentUser(session); config_.require_auth && !HasServerRight(session, ServerRight::kBackup) &&
-                            (user == nullptr || !user->manages_users) && !HasAdminOnEveryTable(user))
-                        throw PermissionDeniedError("BACKUP, MANAGES USERS or ADMIN on *");
+                    // MANAGES USERS or ADMIN on `*`: the backup may hold any table. BACKUP,
+                    // the right BACKUP TO also takes, needs ADMIN on the new name as
+                    // CREATE TABLE does: the restored table falls under its grants.
+                    // Every check reads this one user: another CurrentUser call
+                    // replaces it after a user change and frees it.
+                    const User* user = CurrentUser(session);
+                    if (auto* hook = hook_.load(std::memory_order_acquire))
+                        hook->Run(CommandEngineTestHook::Point::kAfterRestoreUserRead, restore.name);
+                    if (config_.require_auth && (user == nullptr || !user->manages_users) && !HasAdminOnEveryTable(user)) {
+                        if (user == nullptr || !chunkdb::HasServerRight(*user, ServerRight::kBackup))
+                            throw PermissionDeniedError("BACKUP, MANAGES USERS or ADMIN on *");
+                        if (const auto right = RightOn(*user, restore.name); !right.has_value() || *right < Right::kAdmin)
+                            throw PermissionDeniedError("ADMIN on " + restore.name);
+                    }
                     if (config_.backup_dir.empty())
                         throw std::invalid_argument("RESTORE TABLE is disabled: set --backup-dir <path>");
                     TableRestoreRequest request;

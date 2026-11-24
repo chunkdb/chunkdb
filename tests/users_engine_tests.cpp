@@ -388,8 +388,33 @@ void TestServerRights() {
     // BACKUP: BACKUP TO and RESTORE TABLE without MANAGES USERS.
     const auto backup = server.Run(bk, "BACKUP TO 'b1'");
     assert(backup.starts_with("%4\r\n") && Contains(backup, "cuts"));
-    assert(server.Run(bk, "RESTORE TABLE world FROM 'b1' AS world_copy").starts_with("%6\r\n"));
-    ExpectError(server.Run(bk, "GET BLOCK 0 0 FROM world_copy"), "NO_TABLE");
+    // RESTORE TABLE needs ADMIN on the new name too, as CREATE TABLE does.
+    ExpectError(server.Run(bk, "RESTORE TABLE world FROM 'b1' AS world_copy"), "PERMISSION_DENIED ADMIN on world_copy");
+    ExpectReply(server.Run(admin, "GRANT READ ON world_copy TO bk"), "+OK\r\n");
+    ExpectError(server.Run(bk, "RESTORE TABLE world FROM 'b1' AS world_copy"), "PERMISSION_DENIED ADMIN on world_copy");
+    ExpectReply(server.Run(admin, "GRANT ADMIN ON bk_* TO bk"), "+OK\r\n");
+    assert(server.Run(bk, "RESTORE TABLE world FROM 'b1' AS bk_world").starts_with("%6\r\n"));
+    ExpectReply(server.Run(bk, "GET BLOCK 0 0 FROM bk_world"), "_\r\n");
+    ExpectError(server.Run(bk, "GET BLOCK 0 0 FROM world"), "NO_TABLE");
+    ExpectError(server.Run(admin, "GET BLOCK 0 0 FROM world_copy"), "NO_TABLE");
+    // A user change once RESTORE TABLE has read the user: the checks keep
+    // reading that user, not one read again and the first freed.
+    struct RevokeBackup final : chunkdb::CommandEngineTestHook {
+        chunkdb::UserRegistry* users = nullptr;
+        bool revoked = false;
+        void Run(Point point, std::string_view table) override {
+            if (point != Point::kAfterRestoreUserRead || table != "bk_again" || revoked) return;
+            users->Revoke("bk", "*", std::nullopt, static_cast<std::uint8_t>(chunkdb::ServerRight::kBackup));
+            revoked = true;
+        }
+    } revoke_backup;
+    revoke_backup.users = server.users.get();
+    server.engine->SetHookForTests(&revoke_backup);
+    assert(server.Run(bk, "RESTORE TABLE world FROM 'b1' AS bk_again").starts_with("%6\r\n"));
+    server.engine->SetHookForTests(nullptr);
+    assert(revoke_backup.revoked);
+    ExpectError(server.Run(bk, "RESTORE TABLE world FROM 'b1' AS bk_third"), "PERMISSION_DENIED BACKUP, MANAGES USERS or ADMIN on *");
+    ExpectReply(server.Run(admin, "GRANT BACKUP ON * TO bk"), "+OK\r\n");
     ExpectError(server.Run(bk, "SHOW METRICS"), "PERMISSION_DENIED");
     ExpectError(server.Run(bk, "CREATE USER eve VERIFIER $1", {VerifierText("x")}), "PERMISSION_DENIED MANAGES USERS");
     ExpectError(server.Run(mon, "RESTORE TABLE world FROM 'b1' AS world_other"),

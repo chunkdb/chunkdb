@@ -92,7 +92,7 @@ See [Protocol](../PROTOCOL.md) for authentication encoding.
 - `right`: READ, WRITE, or ADMIN on tables; ADMIN includes WRITE, and WRITE includes READ.
 - `right` can also be MONITOR, BACKUP, or REPLICATION, server rights granted ON * only; see [Rights](../USERS.md#rights).
 - `table`: a valid table name, including one not yet created.
-- `prefix*`: every table whose name starts with `prefix`, written without a space before `*`, including tables created later; `prefix` has 1 through 64 characters a table name may hold and starts with a letter or digit.
+- `prefix*`: every table whose name starts with `prefix`, written without a space before `*`, including tables created later; `prefix` is `[a-z][a-z0-9_]*`, from 1 through 64 bytes.
 - `*`: all tables, including tables created later.
 - `MANAGES USERS`: permission to manage users, rights, and backups, and to list GRANT and REVOKE migrations.
 - `REQUIRE CHANNEL BINDING`: the user logs in only with a login bound to its TLS connection; see [Channel binding](../USERS.md#channel-binding).

@@ -9,7 +9,7 @@ The [backup design](BACKUP_DESIGN.md) defines backups, cuts and lineage; the [ta
 The backup path is resolved like `BACKUP TO`: relative to `--backup-dir`, with no `..`, rooted path, backslash or link below the resolved directory.
 `t` names a table cut in the backup; without `AS` the restored table keeps that name.
 The new name must not exist, be fenced, or be published by another statement before the restore publishes.
-RESTORE TABLE needs ADMIN on `*`, the right CREATE TABLE needs, or MANAGES USERS, the right BACKUP needs.
+RESTORE TABLE needs MANAGES USERS, ADMIN on `*`, or BACKUP together with ADMIN on the new name, the right CREATE TABLE needs; the backup may hold any table, and the restored table falls under the grants that match its new name.
 SWAP TABLES needs ADMIN on both names; grants stay with names, so each grant applies to the table now under its name.
 Both statements are refused inside a transaction and on a `--read-only` server.
 

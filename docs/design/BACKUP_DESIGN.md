@@ -3,7 +3,7 @@
 `BACKUP TO 'snapshot'` creates a server-filesystem backup (#66) under the resolved `--backup-dir`.
 The destination is absent or empty and outside the live source; absolute paths, `..` and symlinks below the resolved backup root are refused.
 Root aliases, data paths, staging paths and verify/restore inputs may use symlinked ancestors.
-MANAGES USERS is required; auth none uses the same bounded destination policy.
+BACKUP or MANAGES USERS is required; auth none uses the same bounded destination policy.
 Only a single-process read-write catalog supports backup, since another process could change files outside these holds.
 One backup owns a nonblocking catalog-wide backup guard; another receives BUSY.
 The reply contains per-table epoch/revision cuts and table/file/byte counts.

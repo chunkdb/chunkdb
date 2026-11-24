@@ -105,7 +105,7 @@ A request that arrives in several reads, waits on the poller or uses TLS reads t
 
 `SHOW CONNECTIONS` returns bounded entries with exact connection ids, user, peer, state and statement verb.
 The listing either returns every authorized entry within the response bound or returns an explicit limit error before output; it never silently truncates.
-A user sees and controls only sessions from the same live user incarnation; ADMIN on `*` may inspect and control all sessions.
+A user sees and controls only sessions from the same live user incarnation; MONITOR may inspect all sessions, and ADMIN on `*` may inspect and control all sessions.
 Names alone do not identify an incarnation after DROP and CREATE.
 Authorization uses currently published rights at control admission.
 `CANCEL id` returns `{cancelled: bool}`; missing, idle and decision-entered targets return false.

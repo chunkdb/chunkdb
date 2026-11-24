@@ -42,7 +42,7 @@ Dropping a table removes its specific grants; prefix and wildcard grants remain.
 MONITOR, BACKUP and REPLICATION are server rights, granted with `ON *`, for example `GRANT MONITOR ON * TO metrics`.
 They give no table rights and no user management.
 MONITOR reads server status: SHOW METRICS, SHOW STATUS, SHOW CONNECTIONS of every user, SHOW TABLE STATS and SHOW SLOTS on every table.
-BACKUP runs BACKUP TO and RESTORE TABLE.
+BACKUP runs BACKUP TO, and RESTORE TABLE under a name the user has ADMIN on; the backup may hold any table, and the restored table falls under the grants that match its new name.
 REPLICATION is stored and shown by SHOW USERS; no statement requires it yet.
 
 | Statement | Required right |
@@ -65,7 +65,7 @@ REPLICATION is stored and shown by SHOW USERS; no statement requires it yet.
 | PING | None |
 | User management, GRANT, REVOKE | MANAGES USERS |
 | BACKUP TO | BACKUP, or MANAGES USERS |
-| RESTORE TABLE | BACKUP, MANAGES USERS, or ADMIN on all tables |
+| RESTORE TABLE | MANAGES USERS, ADMIN on all tables, or BACKUP and ADMIN on the new name |
 | MIGRATE | The inner statement's rights |
 
 Changing your own password is the exception to the user-management requirement.

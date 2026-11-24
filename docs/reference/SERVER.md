@@ -63,7 +63,7 @@ KILL CONNECTION id
 
 | Error | When | What to do |
 | --- | --- | --- |
-| PERMISSION_DENIED | FLUSH lacks WRITE on a table, metrics lack MONITOR and wildcard ADMIN, RELOAD TLS lacks wildcard ADMIN, backup lacks BACKUP and MANAGES USERS, or RESTORE TABLE lacks BACKUP, MANAGES USERS and wildcard ADMIN. | Request access. |
+| PERMISSION_DENIED | FLUSH lacks WRITE on a table, metrics lack MONITOR and wildcard ADMIN, RELOAD TLS lacks wildcard ADMIN, backup lacks BACKUP and MANAGES USERS, or RESTORE TABLE lacks MANAGES USERS and wildcard ADMIN, and BACKUP or ADMIN on the new name. | Request access. |
 | TABLE_EXISTS | RESTORE TABLE names a table that exists. | Restore under another name with AS. |
 | BUSY | Another backup is running. | Wait for it to finish. |
 | INVALID_ARGUMENT | Backup configuration, destination or source is invalid, the backup has no such table, or its features or stored options differ from what this server serves. | Follow [Backup and restore](../BACKUP.md). |
