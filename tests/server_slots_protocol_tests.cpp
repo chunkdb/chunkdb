@@ -2341,7 +2341,8 @@ void ChunkSlotLiveReader(bool tls) {
 void AckDeadlineWireMode(bool tls, bool chunks) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, kDefaultFeedBufferBytes, {}, 100ms);
     auto writer = harness.Connect(); Create(*writer, chunks ? " AREA 0 0 TO 0 0 CHUNKS" : " AREA 0 0 TO 0 0");
-    const auto mutation = [&](Client& client) { return chunks ? Number(NextChunks(client).items[2]) : Change(NextChange(client)); };
+    // The 100 ms progress interval can push progress before any change.
+    const auto mutation = [&](Client& client) { return chunks ? Number(NextChunks(client).items[2]) : Change(NextChangeAfterProgress(client)); };
     auto watch = harness.Connect();
     const auto initial = Start(watch->Command("WATCH t SLOT 'consumer' AREA 0 0 TO 0 0 ACK TIMEOUT 50"));
     const auto outside = Set(*writer, 1, 4);
