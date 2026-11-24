@@ -176,6 +176,26 @@ void GrantCoherence() {
     assert(ReadUsersFile(target.path())->users.at("admin").grants.at("realm") == Right::kRead);
 }
 
+// DROP TABLE waits for a backup that has pinned the table and has not yet
+// saved the users: the backup holds the table with its grants, and the drop
+// then removes both.
+void DropWaitsForBackupMetadata() {
+    test::ScopedTempDir source("chunkdb-backup-migrations-drop"), target("chunkdb-backup-migrations-drop-copy");
+    Engine e(source.path(), true); Reply(e.Run(kCreate), "+OK\r\n");
+    Reply(e.Run("GRANT READ ON realm TO admin"), "+OK\r\n");
+    BackupPause pin(BackupTestHook::Point::kAfterPin, "realm"); e.catalog->SetBackupHookForTests(&pin);
+    auto backup = std::async(std::launch::async, [&] { return e.catalog->BackupTo(std::filesystem::canonical(target.path()), {}); }); pin.Wait();
+    auto drop = std::async(std::launch::async, [&] { e.catalog->Drop("realm", e.users.get(), false); });
+    BackupTestAccess::WaitMetadata(*e.catalog, true);
+    assert(e.catalog->Find("realm") != nullptr);
+    pin.Release(); Ready(backup); (void)backup.get(); Ready(drop); drop.get();
+    e.catalog->SetBackupHookForTests(nullptr); Validate(target.path());
+    assert(ReadStoreManifest(target.path() / "tables/realm"));
+    assert(ReadUsersFile(target.path())->users.at("admin").grants.at("realm") == Right::kRead);
+    assert(e.catalog->Find("realm") == nullptr);
+    assert(!ReadUsersFile(source.path())->users.at("admin").grants.contains("realm"));
+}
+
 void CancelAdmission() {
     test::ScopedTempDir source("chunkdb-backup-migrations-cancel"), target("chunkdb-backup-migrations-cancel-copy");
     Engine e(source.path()); Reply(e.Run(kCreate), "+OK\r\n");
@@ -445,6 +465,6 @@ int main(int argc, char** argv) {
         return 0;
     }
     assert(argc == 1);
-    RestoreHistory(); MetadataCutAndCopyProgress(); GrantCoherence(); CancelAdmission(); InvalidLedgerAndFencedBackup(); PoisonWhileOrdinaryDdlWaits(); OrdinaryDdlAndMigration(); ReleaseDropsStore();
-    std::puts("backup migrations: 9 groups passed");
+    RestoreHistory(); MetadataCutAndCopyProgress(); GrantCoherence(); DropWaitsForBackupMetadata(); CancelAdmission(); InvalidLedgerAndFencedBackup(); PoisonWhileOrdinaryDdlWaits(); OrdinaryDdlAndMigration(); ReleaseDropsStore();
+    std::puts("backup migrations: 10 groups passed");
 }

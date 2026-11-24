@@ -4566,6 +4566,27 @@ void TestMaxAuthFailuresDisconnects() {
     assert(client.WaitForClose(std::chrono::seconds(2)));
 }
 
+// A delivery hook is refused before the server's transports exist, which it
+// would not reach; clearing one needs none.
+void TestDeliveryHookNeedsTransports() {
+    struct Unused : chunkdb::FeedDeliveryTestHook {
+        void Run(Point, std::size_t) override {}
+    } hook;
+    auto store_cfg = BaseStoreConfig();
+    store_cfg.data_dir = TempDataDir("hook-before-start");
+    {
+        auto catalog = std::make_shared<chunkdb::TableCatalog>(chunkdb::CatalogConfigFromStoreConfig(store_cfg));
+        auto engine = std::make_shared<chunkdb::CommandEngine>(chunkdb::EngineConfig{.require_auth = false}, catalog);
+        chunkdb::ChunkServer server(BaseServerConfig(), engine);
+        bool refused = false;
+        try { chunkdb::FeedDeliveryTestAccess::SetObserverHook(server, &hook); }
+        catch (const std::logic_error& error) { refused = std::string(error.what()).find("transports") != std::string::npos; }
+        assert(refused);
+        chunkdb::FeedDeliveryTestAccess::SetHook(server, nullptr);
+    }
+    RemoveAllWithRetry(store_cfg.data_dir);
+}
+
 // Calls Stop on the Run thread at one point of Run's startup.
 class StopAtStartupHook : public chunkdb::FeedDeliveryTestHook {
   public:
@@ -4631,7 +4652,8 @@ void TestStopDuringStartup() {
 }
 
 // While ALTER TABLE waits for a lease to drain, SHOW METRICS answers at once
-// without that table, and the server stops without waiting for either.
+// without that table's store samples, and the server stops without waiting
+// for either.
 void TestShowMetricsBusyTable() {
     ServerHarness harness("metrics-busy", BaseStoreConfig(), chunkdb::EngineConfig{.require_auth = false},
                           BaseServerConfig());
@@ -4661,7 +4683,10 @@ void TestShowMetricsBusyTable() {
     stop.get();
     assert(scraped && stopped);
     const auto response = scrape.get();
-    assert(response.find("table=\"default\"") == std::string::npos);
+    // Only its chunkdb_table_fenced sample, which needs no lease.
+    const auto labelled = response.find("table=\"default\"");
+    assert(labelled != std::string::npos && response.find("table=\"default\"", labelled + 1U) == std::string::npos);
+    assert(response.find("\nchunkdb_table_fenced{table=\"default\"} 0\n") != std::string::npos);
     assert(response.find("chunkdb_commands_total") != std::string::npos);
 }
 
@@ -8825,6 +8850,7 @@ int main(int argc, char** argv) {
         run("TestMetricsRuntimeCounters", TestMetricsRuntimeCounters);
         run("TestShowMetricsBusyTable", TestShowMetricsBusyTable);
         run("TestStopDuringStartup", TestStopDuringStartup);
+        run("TestDeliveryHookNeedsTransports", TestDeliveryHookNeedsTransports);
         run("TestPortZeroReportsPickedPort", TestPortZeroReportsPickedPort);
         run("TestSlowClientTimeoutReleasesWorker", TestSlowClientTimeoutReleasesWorker);
 #ifdef CHUNKDB_WITH_OPENSSL
