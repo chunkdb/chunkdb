@@ -94,8 +94,10 @@ struct IndexInventoryEntry {
 // coordinate list. The stream must start at its header. Callers retain their
 // existing stable-generation/immutable-file ownership while rereading entries;
 // no recovery mutation or candidate publication is authorized before success.
-// The optional callback may populate only private candidate state; its entries
-// remain untrusted until this function returns after checking the final CRC.
+// With the optional callback the stream must be seekable: a first pass checks
+// every entry, the final CRC and the end of the file, and a second hands the
+// entries to the callback, so memory stays constant and no entry of a damaged
+// inventory reaches it.
 [[nodiscard]] IndexInventoryHeader ReadIndexInventory(
     std::istream& input, std::uint64_t file_bytes, const Geometry& geometry, const StoreId& table_id,
     const std::function<void(const IndexInventoryEntry&)>& candidate = {});
