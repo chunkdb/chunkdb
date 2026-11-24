@@ -2,6 +2,7 @@
 #include <condition_variable>
 #include <iostream>
 #include <limits>
+#include <functional>
 #include <future>
 #include <map>
 
@@ -37,6 +38,8 @@ struct SlotAckDeadlineTestAccess {
     }
     static void Hook(SlotWatch& watch, FeedDeliveryTestHook* hook) { watch.hook_.store(hook, std::memory_order_release); }
     static std::uint64_t Acked(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.acknowledged_; }
+    // Worker-only: read it between WorkStep calls on the worker's thread.
+    static std::uint64_t Cursor(const SlotWatch& watch) { return watch.cursor_.revision; }
 };
 struct AckDeadlineIoTestAccess {
     static void PendingClose(ChunkServer& server, const std::shared_ptr<SlotWatch>& state, bool partial, bool tls_retry) {
@@ -83,6 +86,51 @@ struct AckDeadlineIoTestAccess {
         io.ReleaseOutput(watch, holder); // As the close path does.
         assert(SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
         assert(SlotAckDeadlineTestAccess::Publish(*waiter, entry));
+    }
+    // An ordinary CHUNKS watch whose socket has not taken its output merges
+    // the next pushes into one frame. `write(value, x)` commits
+    // `SET BLOCK x 0 IN t n = value` and returns its revision.
+    static void LaggingChunks(ChunkServer& server, Table& table, const std::function<std::uint64_t(unsigned, int)>& write) {
+        constexpr std::size_t share = 1024U * 1024U;
+        FeedIo io(server);
+        FeedIo::Watch watch;
+        watch.connection = std::make_shared<ServerConnection>();
+        watch.connection->session.watch = table.SubscribeFeed({.chunks = true});
+        watch.next_progress = std::chrono::steady_clock::now() + std::chrono::hours(1);
+        auto reference = table.SubscribeFeed({.chunks = true});
+        const auto pull_until = [&](const auto& done) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            for (;;) {
+                io.Pull(watch, share);
+                if (done()) return;
+                if (std::chrono::steady_clock::now() > deadline) throw std::runtime_error("the CHUNKS watch did not pull its pushes");
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        };
+        const auto first = write(1U, 0);
+        pull_until([&] { return !watch.output.empty(); });
+        const auto first_entry = feed_test::Next(*reference);
+        assert(first_entry->position.revision == first && watch.output.size() == 1U);
+        assert(*watch.output.front().bytes == *first_entry->protocol_frame);
+        // The socket has not taken that frame: two pushes of chunk (0,0) and one of (1,0) merge.
+        const auto a = write(2U, 0), b = write(3U, 4), last = write(4U, 1);
+        pull_until([&] { return watch.connection->session.watch->position().revision == last; });
+        assert(watch.output.size() == 1U && !watch.merge.empty() && !watch.held);
+        const auto at_a = feed_test::Next(*reference), at_b = feed_test::Next(*reference), at_last = feed_test::Next(*reference);
+        assert(at_a->position.revision == a && at_b->position.revision == b && at_last->position.revision == last);
+        FeedEntry expected = *at_a;
+        expected.position = at_last->position; expected.commit_time_ms = at_last->commit_time_ms; expected.user = at_last->user;
+        expected.chunk_forms = {at_last->chunk_forms.at(0), at_b->chunk_forms.at(0)};
+        io.Advance(watch, watch.bytes); // The socket took the first frame.
+        io.Pull(watch, share);
+        assert(watch.output.size() == 1U && watch.merge.empty());
+        assert(*watch.output.front().bytes == EncodeFeedEntry(expected));
+        // A watch whose socket keeps up receives each push.
+        io.Advance(watch, watch.bytes);
+        const auto next = write(5U, 0);
+        pull_until([&] { return !watch.output.empty(); });
+        const auto own = feed_test::Next(*reference);
+        assert(own->position.revision == next && watch.output.size() == 1U && *watch.output.front().bytes == *own->protocol_frame);
     }
 #ifdef CHUNKDB_WITH_OPENSSL
     // A server TLS session whose peer is a memory pipe smaller than one record,
@@ -527,6 +575,17 @@ void TakeoverRights(bool tls) {
     Client old(harness.port, tls); old.Login("one", "pw");
     (void)Start(old.Command("WATCH t SLOT 'consumer'"));
     Client other(harness.port, tls); other.Login("two", "pw");
+    // SHOW SLOTS names the watch's client to its user and to ADMIN on *, as SHOW CONNECTIONS does.
+    const auto peer = [](Client& viewer) {
+        const auto listed = viewer.Command("SHOW SLOTS ON t");
+        return Field(Slot(listed, "t", "consumer"), "peer");
+    };
+    const auto old_peer = "[127.0.0.1]:" + std::to_string(old.LocalPort());
+    assert(peer(other).type == '_' && peer(*admin).value == old_peer);
+    {
+        Client mine(harness.port, tls); mine.Login("one", "pw");
+        assert(peer(mine).value == old_peer);
+    }
     Error(other.Command("WATCH t SLOT 'consumer' TAKEOVER"), "PERMISSION_DENIED");
     admin->Ok("GRANT ADMIN ON t TO two"); // Table ADMIN is deliberately insufficient.
     Error(other.Command("WATCH t SLOT 'consumer' TAKEOVER"), "PERMISSION_DENIED");
@@ -547,9 +606,12 @@ void Lifecycle(bool tls) {
     const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
     auto listed = writer->Command("SHOW SLOTS ON t");
     const auto& slot = Slot(listed, "t", "consumer");
-    assert(slot.items.size() == 24U && Field(slot, "epoch").value == initial.first);
+    assert(slot.items.size() == 28U && Field(slot, "epoch").value == initial.first);
     assert(Number(Field(slot, "acked")) == initial.second && !Boolean(Field(slot, "lost")));
     assert(Boolean(Field(slot, "attached")));
+    // The watch's client, which has acknowledged nothing yet.
+    assert(Field(slot, "peer").type == '$' && Field(slot, "peer").value == "[127.0.0.1]:" + std::to_string(watch->LocalPort()));
+    assert(Field(slot, "last_ack_ms").type == '_');
     assert(Number(Field(slot, "lag_revisions")) == Number(Field(slot, "revision")) - initial.second);
     auto second = harness.Connect();
     Error(second->Command("WATCH t SLOT 'consumer'"), "SLOT_BUSY");
@@ -561,10 +623,18 @@ void Lifecycle(bool tls) {
     assert(Change(NextChange(*watch)) == next); // Invalid ACK does not close the stream.
     watch->Line("ACK " + std::to_string(next));
     WaitAck(*writer, "t", "consumer", next); // No subsequent traffic on the watch.
+    const auto acked_list = writer->Command("SHOW SLOTS ON t");
+    const auto& acked = Slot(acked_list, "t", "consumer");
+    assert(Field(acked, "last_ack_ms").type == ':' && Number(Field(acked, "last_ack_ms")) < 60'000U);
     assert(!watch->Ready(150ms)); // Successful ACK has no reply.
     watch->Send("UNWATCH\r\nPING\r\n");
     const auto unwatch = watch->Read(); assert(unwatch.type == '+' && unwatch.value == "OK");
     const auto pong = watch->Read(); assert(pong.type == '+' && pong.value == "PONG");
+    // Without a watch the slot has neither.
+    const auto detached_list = writer->Command("SHOW SLOTS ON t");
+    const auto& detached = Slot(detached_list, "t", "consumer");
+    assert(!Boolean(Field(detached, "attached")) && Field(detached, "peer").type == '_' &&
+        Field(detached, "last_ack_ms").type == '_');
     assert(Start(second->Command("WATCH t SLOT 'consumer'")) == std::make_pair(initial.first, next));
     const auto third = Set(*writer, 9);
     assert(Change(NextChange(*second)) == third);
@@ -2353,6 +2423,70 @@ void ChunkSlotLiveReader(bool tls) {
     state->Cancel(); state->WorkStep();
 }
 
+void LaggingChunksWatch(bool tls) {
+    Harness harness(tls);
+    auto writer = harness.Connect(); Create(*writer);
+    AckDeadlineIoTestAccess::LaggingChunks(harness.server(), *harness.catalog->Find("t"),
+        [&](unsigned value, int x) { return Set(*writer, value, x); });
+}
+
+// A CHUNKS slot whose output is unsent merges its next pushes into one push at
+// the newest revision; acknowledging that revision covers every merged change.
+void LaggingChunksSlot(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect(); Create(*writer, " CHUNKS");
+    auto table = harness.catalog->Find("t");
+    auto reference = table->SubscribeFeed({.chunks = true});
+    auto state = SlotWatch::Create(table, "consumer", {});
+    state->Activate();
+    const auto step_until = [&](const auto& done) {
+        const auto deadline = Clock::now() + 10s;
+        for (;;) {
+            (void)state->WorkStep();
+            if (done()) return;
+            if (Clock::now() > deadline) throw std::runtime_error("the CHUNKS slot did not reach the expected state");
+            std::this_thread::sleep_for(1ms);
+        }
+    };
+    // Output taken by the socket stays unsent until `send` reports it written.
+    std::size_t taken = 0U;
+    std::vector<std::uint64_t> revisions;
+    const auto take = [&]() -> std::optional<SlotWatch::Output> {
+        while (auto output = state->Take(std::numeric_limits<std::size_t>::max())) {
+            taken += output->bytes->size();
+            if (output->revision) revisions.push_back(*output->revision);
+            if (output->bytes->starts_with(">9\r\n$6\r\nchunks\r\n")) return output;
+        }
+        return std::nullopt;
+    };
+    const auto send = [&] {
+        state->Consumed(std::exchange(taken, 0U));
+        for (const auto revision : revisions) state->Sent(revision);
+        revisions.clear();
+    };
+    std::optional<SlotWatch::Output> frame;
+    const auto first = Set(*writer, 1); FeedSlotTestAccess::Sync(*table);
+    step_until([&] { return (frame = take()).has_value(); });
+    assert(frame->revision == first && *frame->bytes == *feed_test::Next(*reference)->protocol_frame);
+    const auto a = Set(*writer, 2), b = Set(*writer, 3, 4), last = Set(*writer, 4, 1);
+    FeedSlotTestAccess::Sync(*table);
+    step_until([&] { return SlotAckDeadlineTestAccess::Cursor(*state) == last; });
+    assert(!take()); // Nothing is published while the first frame is unsent.
+    const auto at_a = feed_test::Next(*reference), at_b = feed_test::Next(*reference), at_last = feed_test::Next(*reference);
+    assert(at_a->position.revision == a && at_b->position.revision == b && at_last->position.revision == last);
+    FeedEntry expected = *at_a;
+    expected.position = at_last->position; expected.commit_time_ms = at_last->commit_time_ms; expected.user = at_last->user;
+    expected.chunk_forms = {at_last->chunk_forms.at(0), at_b->chunk_forms.at(0)};
+    send();
+    step_until([&] { return (frame = take()).has_value(); });
+    assert(frame->revision == last && *frame->bytes == EncodeFeedEntry(expected));
+    send();
+    // Any revision up to the merged one is accepted.
+    assert(state->Ack(a) == SlotWatch::AckResult::kAccepted && state->Ack(last) == SlotWatch::AckResult::kAccepted);
+    assert(SlotAckDeadlineTestAccess::Acked(*state) == last);
+    state->Cancel(); state->WorkStep();
+}
+
 void AckDeadlineWireMode(bool tls, bool chunks) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, kDefaultFeedBufferBytes, {}, 100ms);
     auto writer = harness.Connect(); Create(*writer, chunks ? " AREA 0 0 TO 0 0 CHUNKS" : " AREA 0 0 TO 0 0");
@@ -2785,6 +2919,7 @@ int main(int argc, char** argv) {
         run("ACK-deadline-ledger", AckDeadlineLedger);
         run("CHUNKS-ACK-deadline-ledger", ChunksDeadlineLedger);
         run("CHUNKS-slot-live-reader", ChunkSlotLiveReader);
+        run("CHUNKS-lagging-watch", LaggingChunksWatch); run("CHUNKS-lagging-slot", LaggingChunksSlot);
         run("ACK-deadline-wire", AckDeadlineWire);
         run("CHUNKS-ACK-deadline-wire", ChunksDeadlineWire);
         run("ACK-deadline-stalled-socket", AckDeadlineStalledSocket);
