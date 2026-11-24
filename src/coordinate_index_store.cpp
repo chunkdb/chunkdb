@@ -188,6 +188,10 @@ std::optional<ChunkIndexRecord> ChunkStore::RetainedEmptyBoundaryForArchive(cons
     return std::nullopt;
 }
 
+std::uint64_t ChunkStore::PopulatedChunkCount() {
+    return CoordinateIndexForScan()->populated_count();
+}
+
 std::uint64_t ChunkStore::RetainedTombstoneCount() {
     return CoordinateIndexForScan()->tombstone_count();
 }

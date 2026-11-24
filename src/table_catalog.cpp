@@ -700,13 +700,23 @@ std::vector<FeedSlot> Table::ListFeedSlots(bool include_lost) {
     if (!lease) throw TableNotFoundError("table '" + name_ + "' was dropped");
     auto slots = lease->store().feed_slots_->List(include_lost);
     const auto& columns = lease->store().geometry().layout().schema().columns;
-    for (auto& slot : slots) if (slot.filters.column_ids) {
+    for (auto& slot : slots) {
+        // ClaimFeedSlot refuses a second watch by the same rule.
+        if (const auto claimed = slot_claims_.find(slot.name); claimed != slot_claims_.end())
+            if (const auto claim = claimed->second.lock()) slot.attached = claim->valid.load(std::memory_order_acquire);
+        if (!slot.filters.column_ids) continue;
         for (const auto id : *slot.filters.column_ids) {
             const auto at = std::find_if(columns.begin(), columns.end(), [&](const auto& column) { return column.id == id; });
             slot.column_names.push_back(at == columns.end() ? std::nullopt : std::optional<std::string>(at->name));
         }
     }
     return slots;
+}
+
+Table::FeedCounts Table::CountFeeds(const Lease& lease) const {
+    if (lease.table_ != this) throw std::logic_error("feed counts need a lease of their table");
+    // Subscriptions change only in exclusive sections, which wait for leases.
+    return FeedCounts{.slots = lease.store().feed_slots_->size(), .watches = feed_subscriptions_};
 }
 
 std::vector<std::uint32_t> Table::ResolveFeedColumns(const std::vector<std::string>& names) {
@@ -957,7 +967,15 @@ void Table::ReleaseLease() noexcept {
 
 Table::BackupPin::BackupPin(BackupPin&& other) noexcept
     : table_(std::move(other.table_)), store_(std::move(other.store_)) {}
-Table::BackupPin::~BackupPin() { if (table_) table_->ReleaseBackupPin(); }
+Table::BackupPin::~BackupPin() {
+    if (!table_) return;
+    // The store goes first: the exclusive section the release admits may
+    // close the store and open its table again, which needs it closed.
+    store_.reset();
+    table_->ReleaseBackupPin();
+    if (auto* hook = table_->migration_health_->hook.load(std::memory_order_acquire))
+        hook->Run(MigrationTestHook::Point::kAfterBackupPinRelease, table_->name_);
+}
 Table::BackupPin Table::PinForBackup(std::stop_token cancelled) {
     std::unique_lock lock(mutex_);
     ++backup_pin_waiters_;
@@ -2541,16 +2559,30 @@ CatalogFeatureStatus TableCatalog::FeatureStatus() {
     auto metadata = LockFeatureMetadata();
     migration_health_->Check();
     std::vector<std::shared_ptr<Table>> tables;
+    CatalogFeatureStatus status;
     {
         std::shared_lock lock(tables_mutex_);
         for (const auto& [_, table] : tables_) tables.push_back(table);
+        // Out of the inventory until RecoverTable: no store is open.
+        for (const auto& [name, fenced] : fenced_)
+            status.tables.push_back({.name = name, .features = std::nullopt, .fence = std::string(fenced.reason)});
     }
-    CatalogFeatureStatus status;
     for (const auto& table : tables) {
-        const auto lease = table->Acquire();
-        if (!lease) throw TableNotFoundError("table disappeared while reading feature status");
-        status.tables.emplace_back(table->name(), lease->store().features());
+        CatalogTableStatus entry{.name = table->name(), .features = std::nullopt, .fence = std::nullopt};
+        try {
+            const auto lease = table->Acquire();
+            if (!lease) throw TableNotFoundError("table disappeared while reading feature status");
+            entry.features = lease->store().features();
+        } catch (const FeedRecoveryRequiredError&) {
+            // Its feed cleanup failed, which fences it without a lease.
+            entry.fence = kFenceFeed;
+        }
+        if (!entry.fence) {
+            if (const char* reason = table->FenceReason()) entry.fence = reason;
+        }
+        status.tables.push_back(std::move(entry));
     }
+    std::sort(status.tables.begin(), status.tables.end(), [](const auto& a, const auto& b) { return a.name < b.name; });
     std::lock_guard operations(operations_mutex_);
     migration_health_->Check();
     const auto directory = ReadDataDirManifest(config_.data_dir);

@@ -47,7 +47,7 @@ enum class Right : std::uint8_t;
 // Deterministic command interleavings, following the feed hooks.
 struct CommandEngineTestHook {
     enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted, kBeforeTxnBudgetReclaim,
-        kAfterRestoreProgress };
+        kAfterRestoreProgress, kBeforeTableStatsListing };
     virtual ~CommandEngineTestHook() = default;
     virtual void Run(Point point, std::string_view table) = 0;
 };
@@ -103,6 +103,8 @@ struct StatementLogInfo {
     const char* verb = nullptr;
     // The audit event, null for statements the audit log leaves out.
     const char* audit_event = nullptr;
+    // Which ALTER USER form ran, e.g. "add_verifier"; null for other statements.
+    const char* change = nullptr;
     std::string table;
     std::string target_user;
     std::string slot;
@@ -361,6 +363,8 @@ class CommandEngine {
     EngineConfig config_;
     std::shared_ptr<TableCatalog> catalog_;
     std::shared_ptr<MetricsRegistry> metrics_;
+    // SHOW STATUS reports the time since.
+    const std::chrono::steady_clock::time_point started_ = std::chrono::steady_clock::now();
     std::mutex auth_failures_mutex_;
     std::unordered_map<std::string, IpAuthFailureState> auth_failures_by_ip_;
     // The open transactions and their bytes.

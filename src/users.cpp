@@ -16,7 +16,10 @@ namespace chunkdb {
 namespace {
 
 constexpr std::array<std::uint8_t, 4> kMagic = {'C', 'K', 'D', 'U'};
-constexpr std::uint32_t kVersion = 2;
+// Version 3 adds the added verifier of a user; version 2 files, which have
+// none, are still read.
+constexpr std::uint32_t kVersion = 3;
+constexpr std::uint32_t kVersionWithoutAddedVerifier = 2;
 
 void PutU16(std::vector<std::uint8_t>* out, std::uint16_t value) {
     out->push_back(static_cast<std::uint8_t>(value));
@@ -76,6 +79,9 @@ void ValidateUsers(const Users& users) {
             throw std::invalid_argument(
                 "user " + name + " has a " + std::to_string(user.verifier.salt.size()) +
                 "-byte verifier salt; chunkdb.users takes " + SaltBounds() + " bytes");
+        }
+        if (user.added_verifier.has_value()) {
+            RequireAddableVerifier(user.verifier, *user.added_verifier);
         }
         if (user.grants.size() > std::numeric_limits<std::uint32_t>::max()) {
             throw std::invalid_argument("chunkdb.users has more than 4294967295 grants for user " + name);
@@ -159,6 +165,21 @@ void RequireValidGrantTable(std::string_view table) {
     }
 }
 
+bool HoldsVerifier(const User& user, const scram::Verifier& verifier) noexcept {
+    return user.verifier == verifier || user.added_verifier == verifier;
+}
+
+void RequireAddableVerifier(const scram::Verifier& verifier, const scram::Verifier& added) {
+    if (added.salt != verifier.salt || added.iterations != verifier.iterations) {
+        throw std::invalid_argument(
+            "an added verifier must use the salt and iteration count of the user's verifier, which a login as "
+            "the user receives in the SCRAM server-first message");
+    }
+    if (added == verifier) {
+        throw std::invalid_argument("an added verifier must differ from the user's verifier");
+    }
+}
+
 std::optional<Right> RightOn(const User& user, const std::string& table) {
     return RightOn(user.grants, table);
 }
@@ -189,6 +210,11 @@ std::vector<std::uint8_t> EncodeUsers(const Users& users) {
         PutBytes(&out, user.verifier.salt.data(), user.verifier.salt.size());
         PutBytes(&out, user.verifier.stored_key.data(), user.verifier.stored_key.size());
         PutBytes(&out, user.verifier.server_key.data(), user.verifier.server_key.size());
+        out.push_back(user.added_verifier.has_value() ? 1U : 0U);
+        if (user.added_verifier.has_value()) {
+            PutBytes(&out, user.added_verifier->stored_key.data(), user.added_verifier->stored_key.size());
+            PutBytes(&out, user.added_verifier->server_key.data(), user.added_verifier->server_key.size());
+        }
         PutCount(&out, user.grants.size());
         for (const auto& [table, right] : user.grants) {
             PutShortString(&out, table);
@@ -215,8 +241,9 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
     }
     Reader reader(bytes, body);
     (void)reader.Take(kMagic.size());
-    if (const std::uint32_t version = reader.U32(); version != kVersion) {
-        if (version < kVersion) {
+    const std::uint32_t version = reader.U32();
+    if (version != kVersion && version != kVersionWithoutAddedVerifier) {
+        if (version < kVersionWithoutAddedVerifier) {
             throw std::invalid_argument(
                 "chunkdb.users was created by an earlier development build of 2.0; recreate it");
         }
@@ -254,6 +281,22 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
         user.verifier.salt.assign(salt, salt + salt_size);
         std::copy_n(reader.Take(32), 32, user.verifier.stored_key.begin());
         std::copy_n(reader.Take(32), 32, user.verifier.server_key.begin());
+        if (version >= kVersion) {
+            const std::uint8_t added = reader.U8();
+            if (added > 1U) {
+                throw std::invalid_argument("chunkdb.users gives user " + name + " more than two verifiers");
+            }
+            if (added == 1U) {
+                scram::Verifier verifier{.iterations = user.verifier.iterations, .salt = user.verifier.salt,
+                    .stored_key = {}, .server_key = {}};
+                std::copy_n(reader.Take(32), 32, verifier.stored_key.begin());
+                std::copy_n(reader.Take(32), 32, verifier.server_key.begin());
+                if (verifier == user.verifier) {
+                    throw std::invalid_argument("chunkdb.users repeats a verifier of user " + name);
+                }
+                user.added_verifier = std::move(verifier);
+            }
+        }
         const std::uint32_t grants = reader.U32();
         for (std::uint32_t g = 0; g < grants; ++g) {
             std::string table = reader.ShortString();

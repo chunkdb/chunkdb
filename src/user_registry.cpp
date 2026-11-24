@@ -41,6 +41,33 @@ void RequireName(const std::string& name) {
     return found->second;
 }
 
+// The user logs in with `verifier` alone.
+void ReplaceVerifiers(User& user, scram::Verifier verifier) {
+    user.verifier = std::move(verifier);
+    user.added_verifier.reset();
+}
+
+// Adds `verifier` as the second verifier of `user`; false, changing nothing,
+// for a verifier the user already has, so a retry succeeds.
+[[nodiscard]] bool AddTo(User& user, const std::string& name, scram::Verifier verifier) {
+    if (HoldsVerifier(user, verifier)) return false;
+    if (user.added_verifier.has_value()) {
+        throw std::invalid_argument("user " + name + " already has two verifiers; DROP OLD VERIFIER first");
+    }
+    RequireAddableVerifier(user.verifier, verifier);
+    user.added_verifier = std::move(verifier);
+    return true;
+}
+
+// Makes the added verifier of `user` its only one; false, changing nothing,
+// for a user with one verifier, so a retry succeeds.
+[[nodiscard]] bool DropOld(User& user) {
+    if (!user.added_verifier.has_value()) return false;
+    user.verifier = std::move(*user.added_verifier);
+    user.added_verifier.reset();
+    return true;
+}
+
 void RequireUserManager(const Users& users) {
     if (std::none_of(users.users.begin(), users.users.end(), [](const auto& entry) { return entry.second.manages_users; })) {
         throw std::invalid_argument("the last user who manages users cannot be dropped or lose that right");
@@ -249,11 +276,8 @@ void UserRegistry::Create(const std::string& name, const std::function<scram::Ve
     });
 }
 
-void UserRegistry::SetVerifier(const std::string& name, scram::Verifier verifier) {
-    Update([&](Users& users) { Existing(users, name).verifier = std::move(verifier); });
-}
-
-bool UserRegistry::SetOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier) {
+template <typename Change>
+bool UserRegistry::UpdateOwn(const std::string& name, std::uint64_t incarnation, Change&& change) {
     bool current = false;
     UpdateIf([&](Users& users) {
         {
@@ -262,10 +286,36 @@ bool UserRegistry::SetOwnVerifier(const std::string& name, std::uint64_t incarna
             const auto found = admissions_->find(name);
             current = found != admissions_->end() && found->second.state->incarnation == incarnation;
         }
-        if (current) Existing(users, name).verifier = std::move(verifier);
-        return current;
+        return current && change(Existing(users, name));
     });
     return current;
+}
+
+void UserRegistry::SetVerifier(const std::string& name, scram::Verifier verifier) {
+    Update([&](Users& users) { ReplaceVerifiers(Existing(users, name), std::move(verifier)); });
+}
+
+bool UserRegistry::SetOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier) {
+    return UpdateOwn(name, incarnation, [&](User& user) {
+        ReplaceVerifiers(user, std::move(verifier));
+        return true;
+    });
+}
+
+void UserRegistry::AddVerifier(const std::string& name, scram::Verifier verifier) {
+    UpdateIf([&](Users& users) { return AddTo(Existing(users, name), name, std::move(verifier)); });
+}
+
+bool UserRegistry::AddOwnVerifier(const std::string& name, std::uint64_t incarnation, scram::Verifier verifier) {
+    return UpdateOwn(name, incarnation, [&](User& user) { return AddTo(user, name, std::move(verifier)); });
+}
+
+void UserRegistry::DropOldVerifier(const std::string& name) {
+    UpdateIf([&](Users& users) { return DropOld(Existing(users, name)); });
+}
+
+bool UserRegistry::DropOwnOldVerifier(const std::string& name, std::uint64_t incarnation) {
+    return UpdateOwn(name, incarnation, [](User& user) { return DropOld(user); });
 }
 
 void UserRegistry::SetLimits(const std::string& name, std::optional<std::uint64_t> max_connections,

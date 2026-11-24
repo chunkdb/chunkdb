@@ -777,6 +777,119 @@ void TestCredentialsChangedDuringLogin() {
     (void)server.LoggedIn("bot", "hunter2");
 }
 
+// The verifier text of `password` with `salt`.
+std::string SaltedVerifier(const std::string& password, const std::vector<std::uint8_t>& salt,
+    std::uint32_t iterations = chunkdb::scram::kMinIterations) {
+    return chunkdb::scram::FormatVerifier(chunkdb::scram::MakeVerifier(password, salt, iterations));
+}
+
+// ALTER USER ... ADD VERIFIER and DROP OLD VERIFIER rotate a password with
+// both passwords logging in between: at most two, with one salt and
+// iteration count, kept across a restart; a new password replaces both.
+void TestTwoVerifiers() {
+    Server server;
+    SessionState admin = server.LoggedIn("admin", "secret");
+    const std::vector<std::uint8_t> salt(16U, 9U);
+    ExpectReply(server.Run(admin, "CREATE USER bot VERIFIER $1", Parameters{SaltedVerifier("old", salt)}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("new", salt)}), "+OK\r\n");
+    SessionState bot_old = server.LoggedIn("bot", "old");
+    (void)server.LoggedIn("bot", "new");
+    SessionState wrong;
+    ExpectReply(server.Login(wrong, "bot", "other"), kWrongLogin);
+
+    // A verifier the user has changes nothing; a third one, or one with
+    // another salt or iteration count, is refused.
+    ExpectReply(server.Run(admin, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("new", salt)}), "+OK\r\n");
+    ExpectReply(server.Run(admin, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("old", salt)}), "+OK\r\n");
+    ExpectError(server.Run(admin, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("third", salt)}),
+        "INVALID_ARGUMENT user bot already has two verifiers; DROP OLD VERIFIER first");
+    const auto both = server.users->Find("bot");
+    assert(both && both->added_verifier.has_value());
+    // SHOW USERS tells a user with two verifiers from one with one.
+    const std::string users = server.Run(admin, "SHOW USERS");
+    assert(Contains(users, "$5\r\nadmin\r\n$13\r\nmanages_users\r\n#t\r\n$24\r\nrequires_channel_binding\r\n#f\r\n"
+                           "$9\r\nverifiers\r\n:1\r\n"));
+    assert(Contains(users, "$3\r\nbot\r\n$13\r\nmanages_users\r\n#f\r\n$24\r\nrequires_channel_binding\r\n#f\r\n"
+                           "$9\r\nverifiers\r\n:2\r\n"));
+    {
+        const chunkdb::UserRegistry restarted(server.dir.path(), std::nullopt, std::array<std::uint8_t, 32>{7}, true);
+        assert(restarted.Find("bot") == both);
+    }
+
+    ExpectReply(server.Run(admin, "ALTER USER bot DROP OLD VERIFIER"), "+OK\r\n");
+    assert(Contains(server.Run(admin, "SHOW USERS"), "$3\r\nbot\r\n$13\r\nmanages_users\r\n#f\r\n$24\r\nrequires_channel_binding\r\n#f\r\n"
+                                                     "$9\r\nverifiers\r\n:1\r\n"));
+    SessionState dropped;
+    ExpectReply(server.Login(dropped, "bot", "old"), kWrongLogin);
+    (void)server.LoggedIn("bot", "new");
+    // A connection logged in with the dropped password stays open.
+    ExpectReply(server.Run(bot_old, "PING"), "+PONG\r\n");
+    ExpectReply(server.Run(admin, "ALTER USER bot DROP OLD VERIFIER"), "+OK\r\n");
+    (void)server.LoggedIn("bot", "new");
+    ExpectError(server.Run(admin, "ALTER USER bot ADD VERIFIER $1",
+                    Parameters{SaltedVerifier("next", std::vector<std::uint8_t>(16U, 10U))}),
+        "INVALID_ARGUMENT an added verifier must use the salt and iteration count of the user's verifier");
+    ExpectError(server.Run(admin, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("next", salt, 8192U)}),
+        "INVALID_ARGUMENT an added verifier must use the salt and iteration count");
+    ExpectError(server.Run(admin, "ALTER USER ghost ADD VERIFIER $1", Parameters{SaltedVerifier("next", salt)}),
+        "INVALID_ARGUMENT user ghost does not exist");
+    ExpectError(server.Run(admin, "ALTER USER ghost DROP OLD VERIFIER"), "INVALID_ARGUMENT user ghost does not exist");
+
+    // A user rotates its own password without MANAGES USERS, but not another's.
+    SessionState bot = server.LoggedIn("bot", "new");
+    ExpectReply(server.Run(bot, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("own", salt)}), "+OK\r\n");
+    (void)server.LoggedIn("bot", "own");
+    ExpectError(server.Run(bot, "ALTER USER admin ADD VERIFIER $1", Parameters{SaltedVerifier("own", salt)}),
+        "PERMISSION_DENIED MANAGES USERS");
+    ExpectError(server.Run(bot, "ALTER USER admin DROP OLD VERIFIER"), "PERMISSION_DENIED MANAGES USERS");
+    ExpectReply(server.Run(bot, "ALTER USER bot DROP OLD VERIFIER"), "+OK\r\n");
+    SessionState replaced;
+    ExpectReply(server.Login(replaced, "bot", "new"), kWrongLogin);
+    (void)server.LoggedIn("bot", "own");
+
+    // A new password, also the user's own, leaves one verifier.
+    ExpectReply(server.Run(admin, "ALTER USER bot ADD VERIFIER $1", Parameters{SaltedVerifier("second", salt)}), "+OK\r\n");
+    ExpectReply(server.Run(bot, "ALTER USER bot VERIFIER $1", Parameters{VerifierText("reset")}), "+OK\r\n");
+    assert(!server.users->Find("bot")->added_verifier.has_value());
+    SessionState second;
+    ExpectReply(server.Login(second, "bot", "second"), kWrongLogin);
+    (void)server.LoggedIn("bot", "reset");
+}
+
+// A login between HELLO and AUTH while the verifiers change: one started
+// before ADD VERIFIER finishes, one whose verifier DROP OLD VERIFIER removes
+// fails like a wrong password, and one with the kept verifier is stale.
+void TestTwoVerifiersDuringLogin() {
+    Server server;
+    const std::vector<std::uint8_t> salt(16U, 9U);
+    const auto verifier = [&salt](const std::string& password) {
+        return chunkdb::scram::MakeVerifier(password, salt, chunkdb::scram::kMinIterations);
+    };
+    server.users->Create("bot", verifier("old"), false);
+    // HELLO, then `change`, then AUTH: the reply and the failures counted.
+    const auto login_around = [&server](const std::string& password, const auto& change) {
+        SessionState session;
+        const auto login = chunkdb::scram::StartClientLogin("bot", chunkdb::scram::NewNonce());
+        const std::string first = server.Run(session, "HELLO 3 USER bot $1", Parameters{login.first});
+        assert(first.rfind("+SCRAM ", 0) == 0);
+        change();
+        const auto final_message = chunkdb::scram::FinishClientLogin(login, password, first.substr(7, first.size() - 9));
+        const std::string reply = server.Run(session, "AUTH $1", Parameters{final_message.message});
+        assert(session.greeted == (reply.rfind("%14\r\n", 0) == 0));
+        return std::make_pair(reply, session.failed_auth_attempts);
+    };
+    const auto added = login_around("old", [&] { server.users->AddVerifier("bot", verifier("new")); });
+    assert(added.first.rfind("%14\r\n", 0) == 0 && added.second == 0U);
+    const auto removed = login_around("old", [&] { server.users->DropOldVerifier("bot"); });
+    ExpectReply(removed.first, kWrongLogin);
+    assert(removed.second == 1U);
+    server.users->AddVerifier("bot", verifier("next"));
+    const auto kept = login_around("next", [&] { server.users->DropOldVerifier("bot"); });
+    ExpectError(kept.first, "AUTH_FAILED reason=stale_login");
+    assert(kept.second == 0U);
+    (void)server.LoggedIn("bot", "next");
+}
+
 // --auth none: no users, every right.
 void TestWithoutUsers() {
     Server server(false);
@@ -1028,6 +1141,8 @@ int main(int argc, char** argv) {
     TestRequiredChannelBinding();
     TestStaleLoginAfterBindingRequirementChange();
     TestCredentialsChangedDuringLogin();
+    TestTwoVerifiers();
+    TestTwoVerifiersDuringLogin();
     TestWithoutUsers();
     TestReadOnly();
     return 0;
