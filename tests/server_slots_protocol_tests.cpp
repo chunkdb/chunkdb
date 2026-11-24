@@ -548,7 +548,7 @@ void Lifecycle(bool tls) {
     const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
     auto listed = writer->Command("SHOW SLOTS ON t");
     const auto& slot = Slot(listed, "t", "consumer");
-    assert(slot.items.size() == 24U && Field(slot, "epoch").value == initial.first);
+    assert(slot.items.size() == 26U && Field(slot, "epoch").value == initial.first); // 13 keys, partitions included.
     assert(Number(Field(slot, "acked")) == initial.second && !Boolean(Field(slot, "lost")));
     assert(Boolean(Field(slot, "attached")));
     assert(Number(Field(slot, "lag_revisions")) == Number(Field(slot, "revision")) - initial.second);
