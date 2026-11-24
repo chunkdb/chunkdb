@@ -111,25 +111,6 @@ void TestShardHeadersAndRecords() {
     }
     for (std::size_t length = 0; length < good.size(); ++length)
         Reject([&] { (void)chunkdb::ParseChunkIndexHeader(std::span(good).first(length), geometry, kTable, large); }, "length");
-    // No entry reaches the caller before the checksum and the end of the
-    // file are checked.
-    for (const auto& damaged : {[&] { auto changed = good; changed.back() ^= 1; return changed; }(),
-             [&] { auto changed = good; changed.push_back(0); return changed; }()}) {
-        std::size_t seen = 0;
-        const std::string text(damaged.begin(), damaged.end());
-        std::istringstream input(text);
-        Reject([&] { (void)chunkdb::ReadIndexInventory(input, good.size(), shape, kTable,
-            [&](const chunkdb::IndexInventoryEntry&) { ++seen; }); }, "index inventory");
-        assert(seen == 0U);
-    }
-    {
-        std::size_t seen = 0;
-        const std::string text(good.begin(), good.end());
-        std::istringstream input(text);
-        (void)chunkdb::ReadIndexInventory(input, good.size(), shape, kTable,
-            [&](const chunkdb::IndexInventoryEntry&) { ++seen; });
-        assert(seen == 2U);
-    }
     auto extra = good; extra.push_back(0);
     Reject([&] { (void)chunkdb::ParseChunkIndexHeader(extra, geometry, kTable, large); }, "length");
     Reject([&] { (void)chunkdb::SerializeChunkIndexHeader({kTable, 4, {}}); }, "dimensions");
@@ -261,6 +242,25 @@ void TestInventory() {
     for (std::size_t length = 0; length < good.size(); ++length) {
         const Bytes shortened(good.begin(), good.begin() + static_cast<std::ptrdiff_t>(length));
         Reject([&] { (void)ReadInventory(shortened, shape); }, "index");
+    }
+    // No entry reaches the caller before the checksum and the end of the
+    // file are checked.
+    for (const auto& damaged : {[&] { auto changed = good; changed.back() ^= 1; return changed; }(),
+             [&] { auto changed = good; changed.push_back(0); return changed; }()}) {
+        std::size_t seen = 0;
+        const std::string text(damaged.begin(), damaged.end());
+        std::istringstream input(text);
+        Reject([&] { (void)chunkdb::ReadIndexInventory(input, good.size(), shape, kTable,
+            [&](const chunkdb::IndexInventoryEntry&) { ++seen; }); }, "index inventory");
+        assert(seen == 0U);
+    }
+    {
+        std::size_t seen = 0;
+        const std::string text(good.begin(), good.end());
+        std::istringstream input(text);
+        (void)chunkdb::ReadIndexInventory(input, good.size(), shape, kTable,
+            [&](const chunkdb::IndexInventoryEntry&) { ++seen; });
+        assert(seen == 2U);
     }
     auto extra = good; extra.push_back(0);
     Reject([&] { (void)ReadInventory(extra, shape); }, "length");
