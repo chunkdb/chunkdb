@@ -4,6 +4,8 @@
 #include <condition_variable>
 #include <deque>
 #include <mutex>
+#include <optional>
+#include <set>
 #include <span>
 #include <thread>
 
@@ -28,6 +30,8 @@ struct FeedTestAccess {
     static void SetWriteHook(Table& table, FeedTestHook* hook);
     static std::uint64_t Watermark(Table& table);
     static std::size_t BufferedBytes(Table& table);
+    // The ring mutex, for tests that check whether a free happens under it.
+    static std::mutex& RingMutex(Table& table);
     static bool WaitLingerExpired(Table& table, std::chrono::milliseconds timeout);
     static bool Capturing(Table& table);
     static void ExpireLinger(Table& table);
@@ -36,6 +40,57 @@ struct FeedTestAccess {
 };
 
 class FeedProducerRegistry;
+
+// Subscriptions with the same filters share one projected entry, with its
+// frame, per ring entry. Only their readers use it; writers and the sender
+// never do. Items stay until every member has read past them or the ring
+// floor passes them, within the group's share of the feed budget. Items are
+// freed outside the group's mutex, and callers holding the ring mutex free
+// the ones they collect after releasing it.
+class FeedProjectionGroup {
+    struct Item {
+        std::uint64_t revision = 0;
+        std::weak_ptr<const FeedEntry> source;
+        // Null when `source` itself is the projection: the ring holds and charges it.
+        std::shared_ptr<const FeedEntry> result;
+        bool identity = false;
+        std::size_t bytes = 0;
+    };
+
+  public:
+    // Removed items, which the caller destroys once it holds no feed lock.
+    using Released = std::vector<Item>;
+    struct Key {
+        std::vector<FeedArea> areas;
+        std::optional<std::vector<std::uint32_t>> column_ids;
+        bool no_before = false;
+        bool chunks = false;
+        friend bool operator==(const Key&, const Key&) = default;
+    };
+    explicit FeedProjectionGroup(Key key) : key_(std::move(key)) {}
+    [[nodiscard]] const Key& key() const noexcept { return key_; }
+    // The shared projection of `source`, which may be null for one that keeps nothing.
+    [[nodiscard]] std::optional<std::shared_ptr<const FeedEntry>> Find(
+        const std::shared_ptr<const FeedEntry>& source, std::uint64_t floor, Released& released);
+    // The share is `budget` divided by the current group count, read under the group's mutex.
+    void Add(const std::shared_ptr<const FeedEntry>& source, std::shared_ptr<const FeedEntry> result,
+             std::size_t budget, const std::atomic<std::size_t>& groups);
+    // Drops items through `floor` and the oldest beyond `limit`, after a new group shrank the share.
+    void Trim(std::size_t limit, std::uint64_t floor, Released& released);
+    void Join(std::uint64_t position);
+    void Move(std::uint64_t from, std::uint64_t to);
+    void Leave(std::uint64_t position) noexcept;
+
+  private:
+    // Move the oldest items to `released`; without memory for that, they are freed in place.
+    void Prune(std::uint64_t through, Released& released) noexcept;
+    void Pop(std::size_t count, Released& released) noexcept;
+    const Key key_;
+    std::mutex mutex_;
+    std::deque<Item> items_;                 // Ascending revisions.
+    std::multiset<std::uint64_t> positions_; // Each member's last read revision.
+    std::size_t bytes_ = 0;
+};
 
 class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
   public:
@@ -52,7 +107,9 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     [[nodiscard]] std::size_t budget() const noexcept { return budget_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t CompletedWatermark() const;
     void NotifyDurableWatermark();
-    [[nodiscard]] std::unique_ptr<FeedSubscription> Subscribe(std::weak_ptr<Table> table, const FeedOptions& options);
+    // A slot watch's live reader (`slot`) receives ring entries unprojected and
+    // joins no projection group: the watch projects each entry itself.
+    [[nodiscard]] std::unique_ptr<FeedSubscription> Subscribe(std::weak_ptr<Table> table, const FeedOptions& options, bool slot = false);
 
   private:
     friend class FeedWriteGuard;
@@ -168,6 +225,9 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     mutable ChunkState before_scratch_, after_scratch_;
     mutable std::vector<std::uint8_t> value_scratch_;
     std::vector<std::weak_ptr<const std::function<void()>>> notifications_;
+    // Under mutex_; the count bounds each group's share of the budget.
+    std::vector<std::weak_ptr<FeedProjectionGroup>> groups_;
+    std::atomic<std::size_t> group_count_{0U};
     void Notify();
 };
 

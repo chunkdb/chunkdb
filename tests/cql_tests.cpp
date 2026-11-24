@@ -75,7 +75,7 @@ void TestChunkModelCoordinates() {
     const auto ball = Get<cql::GetArea>("GET AREA AROUND 1 2 3 RADIUS 4 FROM t");
     assert(ball.dims == 3U && ball.around && ball.z0 == 3 && ball.radius == 4);
     const auto watch = Get<cql::Watch>("WATCH t AREA -1 -2 -3 TO 4 5 6");
-    assert(watch.area && watch.area->dims == 3U && watch.area->first.z == -3 && watch.area->last.z == 6);
+    assert(watch.areas.size() == 1U && watch.areas[0].dims == 3U && watch.areas[0].first.z == -3 && watch.areas[0].last.z == 6);
     const auto slot = Get<cql::CreateSlot>("CREATE SLOT 's' ON t AREA 1 2 0 TO 3 4 0");
     assert(slot.area && slot.area->dims == 3U && slot.area->first.z == 0);
     ExpectError("GET BLOCK 1 2 9223372036854775808 FROM t", "z is out of range");
@@ -212,7 +212,7 @@ void TestUnorderedOptions() {
     std::vector<std::string> options{"AFTER 0123456789abcdef0123456789abcdef 42", "AREA -1 0 TO 1 2", "SLOT 'consumer'"};
     do {
         const auto watch = Get<cql::Watch>("WATCH t " + options[0] + " " + options[1] + " " + options[2]);
-        assert(watch.slot == "consumer" && watch.area->first.x == -1 && watch.area->last.y == 2);
+        assert(watch.slot == "consumer" && watch.areas.at(0).first.x == -1 && watch.areas.at(0).last.y == 2);
         assert(watch.after->revision == 42 && watch.after->epoch[0] == 1);
     } while (std::next_permutation(options.begin(), options.end()));
     for (const auto* option : {"AREA 0 0 TO 1 1", "SLOT 'consumer'", "AFTER 00000000000000000000000000000000 0"})
@@ -488,7 +488,7 @@ void TestWatch() {
     }
 
     const auto watch = Get<cql::Watch>("WATCH world AREA -2 3 TO 4 5 AFTER 1234567890abcdefABCDEF0123456789 18446744073709551615");
-    assert(watch.table == "world" && watch.area->first.x == -2 && watch.area->last.y == 5);
+    assert(watch.table == "world" && watch.areas.at(0).first.x == -2 && watch.areas.at(0).last.y == 5);
     assert(watch.after->epoch[0] == 0x12 && watch.after->epoch[15] == 0x89);
     assert(watch.after->revision == UINT64_MAX);
     assert(Get<cql::Watch>("watch world after 00000000000000000000000000000000 0").after->revision == 0);
@@ -508,7 +508,17 @@ void TestWatch() {
     ExpectError("WATCH world AFTER z0000000000000000000000000000000 0", "32 hex digits");
     ExpectError("WATCH world AFTER 00000000000000000000000000000000 -1", "revision must be between 0");
     const auto slot = Get<cql::Watch>("WATCH world SLOT 'consumer_1' AREA 0 0 TO 1 1 AFTER 00000000000000000000000000000000 4");
-    assert(slot.slot == "consumer_1" && slot.after->revision == 4 && slot.area->last.x == 1);
+    assert(slot.slot == "consumer_1" && slot.after->revision == 4 && slot.areas.at(0).last.x == 1);
+    const auto several = Get<cql::Watch>("WATCH world AREA 0 0 TO 1 1, AREA -4 -4 TO -3 -3,area 9 9 TO 9 9 COLUMNS a");
+    assert(several.areas.size() == 3U && several.areas[1].first.x == -4 && several.areas[2].last.y == 9 && several.columns->size() == 1U);
+    ExpectError("WATCH world AREA 0 0 TO 1 1 AREA 2 2 TO 3 3", "AREA is given twice");
+    ExpectError("WATCH world AREA 0 0 TO 1 1, COLUMNS a", "expected AREA");
+    ExpectError("WATCH world AREA 0 0 TO 1 1, AREA 0 0 0 TO 1 1 1", "AREA dimensions differ");
+    ExpectError("CREATE SLOT 's' ON world AREA 0 0 TO 1 1, AREA 2 2 TO 3 3", "a slot takes one AREA");
+    std::string many = "WATCH world AREA 0 0 TO 0 0";
+    for (std::size_t i = 1U; i < chunkdb::kMaxFeedAreas; ++i) many += ", AREA 0 0 TO 0 0";
+    assert(Get<cql::Watch>(many).areas.size() == chunkdb::kMaxFeedAreas);
+    ExpectError(many + ", AREA 0 0 TO 0 0", "at most 64 areas");
     assert(Get<cql::Ack>("ACK 18446744073709551615").revision == UINT64_MAX);
     ExpectError("ACK -1", "revision must be between 0");
     ExpectError("ACK 18446744073709551616", "not a 64-bit integer");

@@ -55,7 +55,7 @@ Unset options use server defaults; explicit per-statement TAG overrides `default
 | `txn_max_read_chunks` | Configured statement/commit admission, default 8192. |
 | `max_watches` | Effective server configuration; current default 64. |
 | `max_returning_rows` | 65536, the declared ceiling from E3; RETURNING remains unavailable until task 55. |
-| `max_expression_nodes` | 256, the declared ceiling from E1; expressions remain unavailable until task 55. |
+| `max_expression_nodes` | 256, the declared ceiling from E1; AGGREGATE and SCAN CHUNKS WHERE use expressions. |
 
 Unavailable capabilities do not become supported merely because their numeric ceilings appear in HELLO.
 The initial capability names are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, and `lineage`.
@@ -190,7 +190,7 @@ WATCH omitting filters inherits them; explicitly supplied filters must match exa
 Column projections persist stable column ids in declared order; equivalent area bounds normalize identically, independent of spelling.
 A dropped projected column makes the slot lost with reason=schema_filter; it never silently broadens or changes the projection.
 Changing filters requires creating a different slot; IF NOT EXISTS must compare filters rather than silently accept incompatible existing state.
-Task 51 implements these fixed filters, including a CHUNKS event for each relevant committed chunk; task 56 adds lagging-consumer coalescing and multiple areas.
+Task 51 implements these fixed filters, including a CHUNKS event for each relevant committed chunk; task 56 adds lagging-consumer coalescing; ordinary watches take several areas, and a slot keeps one.
 The chunk push prefix is selected by dims and does not depend on the form format.
 
 CREATE SLOT accepts each AREA, COLUMNS, NO BEFORE, CHUNKS and OWNER suffix once, in any order after `ON table`.

@@ -665,7 +665,7 @@ struct FeedArchiveReader::Impl {
             const auto dims = geometry.dims();
             // A filtered watch receives nothing of a chunk outside its area,
             // and only the projected columns of its blocks.
-            const bool kept = !filter || FeedAreaHolds(filter->area, dims, cursor.coord);
+            const bool kept = !filter || FeedAreaHolds(FeedAreas(filter->area), dims, cursor.coord);
             const bool no_before = filter && filter->no_before;
             std::vector<std::size_t> selected;
             if (filter && filter->column_ids) selected = FeedProjectionIndexes(layout.schema().columns, *filter->column_ids);
