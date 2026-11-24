@@ -155,13 +155,13 @@ Options use the same TLV layout as the root manifest:
 | 9 | retained byte limit per durable slot `u64`, positive | current catalog/server default (1073741824 unless configured) |
 | 10 | immediate restore parent epoch, 16 nonzero bytes | absent |
 | 11 | completed fork revision `u64`, including zero | absent |
-| 12 | name floor `u64`, positive | absent |
+| 15 | name floor `u64`, positive | absent |
 
 Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is retired and is not a known option.
 
-Type 12 is the name floor: SWAP TABLES, ALTER TABLE ... RENAME TO and RESTORE TABLE write the directory version floor there, synced before the name changes, when it is higher than the table's name floor.
+Type 15 is the name floor: SWAP TABLES, ALTER TABLE ... RENAME TO and RESTORE TABLE write the directory version floor there, synced before the name changes, when it is higher than the table's name floor.
 A written chunk whose stored revision is below it reports the name floor as its version to clients and to IF VERSION; its stored revision keeps its value, and the table's clock opens strictly above the name floor.
-A build that does not know type 12 refuses the manifest.
+A build that does not know type 15 refuses the manifest.
 Types 10 and 11 belong to incompatibility feature `table_lineage` (`0x4`) and must appear together.
 The parent epoch differs from the table's current epoch; the fork revision preserves its exact unsigned value.
 New tables omit both fields.

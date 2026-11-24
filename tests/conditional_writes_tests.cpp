@@ -499,9 +499,11 @@ void TestNameFloorVersions() {
     assert(reply.starts_with("%3\r\n$7\r\napplied\r\n#f\r\n") && Contains(reply, "$7\r\nversion\r\n:" + s(floor) + "\r\n"));
     reply = f.Run("SET BLOCK 12 0 IN bank coins = 4 IF VERSION " + s(floor) + " RETURNING coins");
     assert(reply.starts_with("%3\r\n$7\r\napplied\r\n#t\r\n"));
-    // GET CHUNK's form carries the floor; SET CHUNK ... IF VERSION.
-    const auto form = FirstForm(f.Run("GET CHUNK 4 0 FROM bank"));
-    assert(FormVersion(form) == floor);
+    // GET CHUNK's form carries the floor; SET CHUNK ... IF VERSION, with the
+    // form of chunk 0, which the writes above changed, so the write changes
+    // chunk 4 and takes a new version.
+    assert(FormVersion(FirstForm(f.Run("GET CHUNK 4 0 FROM bank"))) == floor);
+    const auto form = FirstForm(f.Run("GET CHUNK 0 0 FROM bank"));
     ExpectError(f.Run("SET CHUNK 4 0 IN bank $1 IF VERSION " + s(stale[4]), Parameters{form}), mismatch);
     assert(VersionOf(f.Run("SET CHUNK 4 0 IN bank $1 IF VERSION " + s(floor), Parameters{form})) > floor);
     // SET CHUNK ... META ... IF VERSION.

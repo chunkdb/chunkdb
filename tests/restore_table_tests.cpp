@@ -122,7 +122,9 @@ void RenameRefusesStaleVersions() {
 void WriteToVersion(TableCatalog& catalog, std::string_view name, std::uint64_t version) {
     auto lease = catalog.Require(name)->Acquire();
     auto& store = lease->store();
-    while (store.GetChunkVersion(4, 0) < version) store.SetBlockBits(8, 0, "01010101");
+    // Each write changes the block, so each takes a version.
+    for (std::uint64_t i = 0U; store.GetChunkVersion(4, 0) < version; ++i)
+        store.SetBlockBits(8, 0, i % 2U == 0U ? "01010101" : "01010100");
     assert(store.GetChunkVersion(4, 0) == version);
 }
 

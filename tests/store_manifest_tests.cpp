@@ -1008,7 +1008,7 @@ void TestLineageManifestCodec() {
     assert(Contains(ExpectRefused([&] { (void)chunkdb::SerializeStoreManifest(disabled); }), "requires table_lineage"));
 }
 
-// Option 12, the name floor, round-trips with and without lineage, survives
+// Option 15, the name floor, round-trips with and without lineage, survives
 // option replacement, and refuses a zero, repeated or wrongly sized entry.
 void TestNameFloorManifestCodec() {
     chunkdb::StoreManifest manifest{

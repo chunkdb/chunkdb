@@ -61,7 +61,7 @@ inline constexpr std::uint16_t kOptionParentEpoch = 10;            // 16-byte st
 inline constexpr std::uint16_t kOptionForkRevision = 11;           // u64, including zero
 // The name floor of a table that took its name by SWAP TABLES, RENAME TO or
 // RESTORE TABLE (ChunkStore::ReportedVersion); absent when zero.
-inline constexpr std::uint16_t kOptionNameFloor = 12;              // u64, > 0
+inline constexpr std::uint16_t kOptionNameFloor = 15;              // u64, > 0
 
 struct StoreManifest {
     FeatureFlags features{.incompat = kFeatureChunkModel};
