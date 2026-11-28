@@ -10,6 +10,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <utility>
 #include <thread>
 #include <vector>
@@ -23,6 +24,7 @@
 #include "listener_port_test_utils.hpp"
 #include "login_helpers.hpp"
 #include "sectioned_chunk_form.hpp"
+#include "server_bench_geometry.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -194,6 +196,68 @@ void TestParseArgsNewFlags() {
     assert(args.tests[0] == chunkdb::server_bench::Scenario::kPing);
     assert(args.tests[1] == chunkdb::server_bench::Scenario::kSet);
     assert(args.tests[2] == chunkdb::server_bench::Scenario::kGet);
+}
+
+void TestSpawnGeometryFlagValidation() {
+    using chunkdb::server_bench::ParseArgs;
+    using chunkdb::server_bench::SpawnGeometry;
+    const auto geometry = SpawnGeometry(ParseArgs({"bench", "--server-mode", "spawn"}));
+    assert(geometry.large_chunk_width_chunks == 8U && geometry.large_chunk_height_chunks == 8U);
+    assert(geometry.chunk_width_blocks == 16U && geometry.chunk_height_blocks == 16U && geometry.block_bits == 16U);
+    assert(geometry.dims == 2U && geometry.chunk_depth_blocks == 1U && geometry.large_chunk_depth_chunks == 1U);
+
+    for (const char* mode : {"external", "spawn"}) {
+        const auto expect_range_error = [mode](const char* flag, const char* value, const char* maximum) {
+            const auto expected = std::string(flag) + " must be between 1 and " + maximum;
+            bool refused = false;
+            try {
+                (void)ParseArgs({"bench", "--server-mode", mode, flag, value});
+            } catch (const std::invalid_argument& error) {
+                refused = std::string_view(error.what()) == expected;
+            }
+            assert(refused);
+        };
+        expect_range_error("--block-bits", "0", "65535");
+        expect_range_error("--block-bits", "abc", "65535");
+        expect_range_error("--block-bits", "70000", "65535");
+        expect_range_error("--chunk-blocks", "2000", "1024");
+    }
+
+    for (const char* flag : {"--chunk-blocks", "--block-bits"}) {
+        bool refused = false;
+        try {
+            (void)ParseArgs({"bench", flag, "16", "--server-mode", "external"});
+        } catch (const std::invalid_argument& error) {
+            refused = std::string_view(error.what()).find("require --server-mode spawn") != std::string_view::npos;
+        }
+        assert(refused);
+    }
+
+    const auto boundary = ParseArgs({"bench", "--server-mode", "spawn", "--chunk-blocks", "1024", "--block-bits", "512"});
+    assert(boundary.chunk_blocks == 1024U && boundary.block_bits == 512U);
+    bool refused = false;
+    try {
+        (void)ParseArgs({"bench", "--server-mode", "spawn", "--chunk-blocks", "1024", "--block-bits", "513"});
+    } catch (const std::invalid_argument& error) {
+        refused = std::string_view(error.what()).starts_with("chunk payload must be <= ");
+    }
+    assert(refused);
+}
+
+void TestSpawnGeometryWithWideBlockWrites() {
+    using chunkdb::server_bench::ParseArgs;
+    using chunkdb::server_bench::Run;
+    const auto args = ParseArgs({"bench", "--chunk-blocks", "3", "--block-bits", "65535", "--server-mode", "spawn",
+        "--port", "0", "--tests", "set,simulation", "--clients", "1", "--pipeline", "2", "--requests", "4", "--keyspace", "3",
+        "--log-level", "warn"});
+    assert(args.chunk_blocks == 3U && args.block_bits == 65535U);
+    const auto report = Run(args);
+    assert(report.spawned_server && report.chunk_width_blocks == 3U && report.chunk_height_blocks == 3U);
+    assert(report.results.size() == 2U);
+    assert(report.results[0].name == "set" && report.results[0].completed_requests == 4U);
+    assert(report.results[1].name == "simulation" && report.results[1].completed_requests == 4U);
+    assert(report.results[1].completed_blocks == 36U);
+    assert(report.results[1].payload_bytes == (9U * 65535U + 7U) / 8U + 2U);
 }
 
 void TestIoTimeoutValidation() {
@@ -1351,6 +1415,8 @@ int main(int argc, char** argv) {
         return 0;
     }
     TestParseArgsNewFlags();
+    TestSpawnGeometryFlagValidation();
+    TestSpawnGeometryWithWideBlockWrites();
     TestIoTimeoutValidation();
     TestBenchmarkReceiveTimeout();
     TestParseArgsInvalidCombination();

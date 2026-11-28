@@ -3,7 +3,9 @@
 `chunkdb_server_bench --help` lists workload and connection options; the additions below produce report-only data.
 Default workloads and JSON fields stay unchanged when these additions are unused.
 
-- In spawn mode `--chunk-blocks N` (default 16) and `--block-bits N` (default 16) shape the `default` table: chunks of N x N blocks with one bits(N) column; chunk reads and writes copy whole chunks, so larger chunks show those costs.
+- With `--server-mode spawn`, `--chunk-blocks N` (1–1024, default 16) sets both chunk dimensions of `default`, and `--block-bits M` (1–65535, default 16) sets the width of its single `bits(M)` column.
+- The fixed chunk payload, `ceil(N * N * M / 8)` bytes, must fit in 64 MiB.
+- In spawn mode, a `SET BLOCK` write uses a packed binary parameter when the inline bits literal would exceed the request-line limit.
 - `--with none|version|schema|both` defaults to `none`; GET BLOCK gets selected metadata, GET AREA gets schema metadata with `schema` or `both`, and GET CHUNK stays unchanged.
 - `--watch <table>[:N][:slots]` starts N subscriptions (default 1) after each untimed grid fill and consumes pushes through UNWATCH completion; with `slots`, each owns a durable slot with the watch mode's filters, acknowledges what it reads, counts its initial schema push in `watch_other`, and drops the slot afterwards.
 - `--watch-mode ordinary|progress|filtered|chunks` defaults to `ordinary`; other modes require `--watch default`.
