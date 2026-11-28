@@ -3,6 +3,7 @@
 #include <condition_variable>
 #include <fstream>
 #include <future>
+#include <ios>
 #include <mutex>
 #include <optional>
 #include <thread>
@@ -20,6 +21,14 @@ namespace {
 using namespace chunkdb;
 using namespace chunkdb::feed_test;
 using chunkdb::test::ScopedTempDir;
+
+class DiagnosticSink {
+  public:
+    explicit DiagnosticSink(LogSink sink) { SetLogSinkForTests(std::move(sink)); }
+    ~DiagnosticSink() { ResetLogSinkForTests(); }
+    DiagnosticSink(const DiagnosticSink&) = delete;
+    DiagnosticSink& operator=(const DiagnosticSink&) = delete;
+};
 
 CatalogConfig Configuration(const std::filesystem::path& path) {
     auto config = Config(path);
@@ -64,6 +73,20 @@ class SyncPause : public FeedSlotTestHook {
     std::condition_variable cv_;
     bool entered_ = false, released_ = false;
     std::uint64_t captured_ = 0U;
+};
+
+class SlotDiagnosticClock : public FeedSlotTestHook {
+  public:
+    void Run(Point point, std::uint64_t) override {
+        if (point == Point::kBeforeFlush || point == Point::kBeforeSync) time_ += 300ms;
+        if (point == Point::kBeforePersist) time_ += persist;
+    }
+    std::chrono::steady_clock::time_point SyncTime(std::chrono::steady_clock::time_point) const noexcept override {
+        return time_;
+    }
+    std::chrono::milliseconds persist{400};
+  private:
+    std::chrono::steady_clock::time_point time_{};
 };
 
 void UnfinishedWriterHoldsDurableFrontier() {
@@ -143,7 +166,11 @@ void WritesDuringSyncWaitForNextPass() {
 class SyncLog {
   public:
     SyncLog() {
-        SetFileSyncObserverForTests([this](const std::filesystem::path& path) { Add(path); });
+        SetFileSyncObserverForTests([this](const std::filesystem::path& path) {
+            std::lock_guard lock(mutex_);
+            paths_.push_back(path);
+            ++files_;
+        });
         SetDirectorySyncObserverForTests([this](const std::filesystem::path& path) { Add(path); });
     }
     ~SyncLog() {
@@ -158,10 +185,15 @@ class SyncLog {
         return std::any_of(paths_.begin(), paths_.end(),
             [&](const auto& synced) { return std::filesystem::weakly_canonical(synced) == wanted; });
     }
+    [[nodiscard]] std::size_t FileCount() const {
+        std::lock_guard lock(mutex_);
+        return files_;
+    }
   private:
     void Add(const std::filesystem::path& path) { std::lock_guard lock(mutex_); paths_.push_back(path); }
     mutable std::mutex mutex_;
     std::vector<std::filesystem::path> paths_;
+    std::size_t files_ = 0U;
 };
 // Every large-chunk directory and WAL of the table, and the archive directory.
 std::vector<std::filesystem::path> StoreArtifacts(const std::filesystem::path& root) {
@@ -200,11 +232,118 @@ void FirstPassSyncsEveryFile() {
         { auto lease = table->Acquire(); lease->store().CheckpointForTests(0, 0); }
         SetBlocks(*table, {{0, 0}, {40, 40}}, 2U);
     }
+    SlotDiagnosticClock clock;
     TableCatalog catalog(Configuration(directory.path()));
     auto table = catalog.Find("default");
+    FeedSlotTestAccess::SetHook(*table, &clock);
     const SyncLog synced;
+    std::string warning;
+    const auto caller = std::this_thread::get_id();
+    const DiagnosticSink sink([&](const std::string& line) {
+        if (std::this_thread::get_id() == caller && line.find("feed slot pass was slow") != std::string::npos) warning = line;
+    });
     FeedSlotTestAccess::Sync(*table);
-    for (const auto& path : StoreArtifacts(directory.path())) assert(synced.Contains(path));
+    const auto artifacts = StoreArtifacts(directory.path());
+    for (const auto& path : artifacts) assert(synced.Contains(path));
+    const auto files = [](const std::string& line) {
+        const auto at = line.find(" files=");
+        assert(at != std::string::npos);
+        return std::stoull(line.substr(at + 7U));
+    };
+    assert(warning.find("first_pass=true") != std::string::npos);
+    const auto wals = std::count_if(artifacts.begin(), artifacts.end(), [](const auto& path) { return path.extension() == ".wal"; });
+    assert(files(warning) >= static_cast<std::size_t>(wals));
+
+    // No frontier advance or pending writes: only the overflow sweep syncs files.
+    { auto lease = table->Acquire(); lease->store().ForceUnsyncedOverflowForTests(); }
+    const auto before = synced.FileCount();
+    warning.clear();
+    FeedSlotTestAccess::Sync(*table);
+    assert(warning.find("first_pass=false") != std::string::npos && warning.find("whole_directory=true") != std::string::npos);
+    assert(synced.FileCount() > before && files(warning) == synced.FileCount() - before);
+    FeedSlotTestAccess::SetHook(*table, nullptr);
+}
+
+void SlowSlotPassWarnsAfterPublishing() {
+    ScopedTempDir directory("chunkdb-feed-slots-warning");
+    SlotDiagnosticClock clock;
+    TableCatalog catalog(Configuration(directory.path()));
+    (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    (void)table->CreateFeedSlot("consumer");
+    bool notified = false;
+    const auto caller = std::this_thread::get_id();
+    auto witness = table->SubscribeFeed({.notify = [&] {
+        if (std::this_thread::get_id() == caller) notified = true;
+    }});
+    FeedSlotTestAccess::SetHook(*table, &clock);
+    std::string warning;
+    std::future<std::uint64_t> durable;
+    bool notified_before_warning = false, could_take_locks = false;
+    const DiagnosticSink sink([&](const std::string& line) {
+        if (std::this_thread::get_id() != caller || line.find("feed slot pass was slow") == std::string::npos) return;
+        warning = line;
+        notified_before_warning = notified;
+        durable = std::async(std::launch::async, [&] {
+            const auto watermark = table->ListFeedSlots().front().durable_watermark;
+            auto lease = table->Acquire();
+            lease->store().WalBarrier();
+            return watermark;
+        });
+        could_take_locks = durable.wait_for(10s) == std::future_status::ready;
+        throw std::ios_base::failure("injected slot diagnostic output failure");
+    });
+    SetBlocks(*table, {{0, 0}}, 1U);
+    clock.persist = 399ms;
+    FeedSlotTestAccess::Sync(*table);
+    assert(warning.empty());
+
+    SetBlocks(*table, {{0, 0}}, 2U);
+    std::uint64_t revision;
+    { auto lease = table->Acquire(); revision = lease->store().GetChunkVersion(0, 0); }
+    clock.persist = 400ms;
+    notified = false;
+    FeedSlotTestAccess::Sync(*table);
+    FeedSlotTestAccess::SetHook(*table, nullptr);
+    assert(warning.find(" WARN store ") != std::string::npos);
+    assert(warning.find("total_ms=1000 flush_ms=300 sync_ms=300 persist_ms=400") != std::string::npos);
+    assert(warning.find(" chunks=1 ") != std::string::npos);
+    assert(notified_before_warning && could_take_locks && durable.get() == revision);
+    SetBlocks(*table, {{0, 0}}, 3U); // The diagnostic failure did not fence the store.
+}
+
+void SlowSlotWorkerWarnsAfterRetention() {
+    struct SlowAck : FeedSlotTestHook {
+        void Run(Point point, std::uint64_t) override {
+            if (point == Point::kAfterAckPersist) persisted = true;
+            if (point == Point::kAfterRetention) retained = std::exchange(persisted, false);
+        }
+        std::chrono::steady_clock::duration AckRetentionElapsed(std::chrono::steady_clock::duration) noexcept override {
+            return std::exchange(retained, false) ? 1s : 0s;
+        }
+        bool persisted = false, retained = false;
+    } hook;
+    ScopedTempDir directory("chunkdb-feed-slots-ack-warning");
+    TableCatalog catalog(Configuration(directory.path()));
+    (void)feed_test::CreateDefault(catalog);
+    auto table = catalog.Find("default");
+    const auto start = table->CreateFeedSlot("consumer").position;
+    SetBlocks(*table, {{0, 0}}, 1U);
+    FeedSlotTestAccess::Sync(*table);
+    const auto frontier = table->ListFeedSlots().front().durable_watermark;
+    assert(frontier > start.revision);
+    std::promise<std::string> logged;
+    auto warning = logged.get_future();
+    const DiagnosticSink sink([&](const std::string& line) {
+        if (line.find("feed slot acknowledgement and retention step was slow") != std::string::npos) logged.set_value(line);
+    });
+    FeedSlotTestAccess::SetHook(*table, &hook);
+    FeedSlotTestAccess::StageAck(*table, "consumer", {start.epoch, frontier});
+    assert(warning.wait_for(10s) == std::future_status::ready);
+    const auto line = warning.get();
+    assert(line.find(" WARN store ") != std::string::npos && line.ends_with(" total_ms=1000 slots=1"));
+    assert(table->ListFeedSlots().front().position.revision == frontier);
+    FeedSlotTestAccess::SetHook(*table, nullptr);
 }
 
 // After the first pass, a pass syncs what was written since the previous one:
@@ -606,6 +745,8 @@ int main() {
     UnfinishedWriterHoldsDurableFrontier();
     WritesDuringSyncWaitForNextPass();
     FirstPassSyncsEveryFile();
+    SlowSlotPassWarnsAfterPublishing();
+    SlowSlotWorkerWarnsAfterRetention();
     LaterPassSyncsNewWal();
     PassCoversPausedBoundary();
     CheckpointDoesNotWaitForPassSyncs();

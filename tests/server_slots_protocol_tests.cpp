@@ -6,6 +6,7 @@
 #include <future>
 #include <map>
 
+#include "chunkdb/logging.hpp"
 #include "server_slots_test_utils.hpp"
 #include "feed_slots.hpp"
 #include "slot_watch.hpp"
@@ -1694,6 +1695,54 @@ void ArchiveWhileLeaseHeld(bool tls) {
     FeedTestAccess::SetHook(*table, nullptr); witness.reset(); Unwatch(*watch);
 }
 
+void ArchiveLogsAfterOpening(bool tls) {
+    feed_test::Pause pause(FeedTestHook::Point::kBeforeMerge);
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, 4096);
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    auto watch = SlotWatch::Create(table, "consumer", {});
+    watch->Activate();
+    auto witness = table->SubscribeFeed();
+
+    FeedTestAccess::SetHook(*table, &pause);
+    Cleanup clear_pause([&] { pause.Release(); FeedTestAccess::SetHook(*table, nullptr); });
+    (void)pause.Wait();
+    std::uint64_t live = 0U;
+    for (unsigned value = 1; value <= 100; ++value) live = Set(*writer, value);
+    pause.Release();
+    const auto reset = witness->Next(10s);
+    assert(reset && reset->kind == FeedEntry::Kind::kResync && reset->position.revision == live);
+
+    struct SlowOpen : FeedDeliveryTestHook {
+        void Run(Point, std::size_t) override {}
+        Clock::duration ArchiveOpenElapsed(Clock::duration) const noexcept override { return 1s; }
+    } slow_open;
+    SlotAckDeadlineTestAccess::Hook(*watch, &slow_open);
+    std::vector<std::string> lines;
+    const auto caller = std::this_thread::get_id();
+    SetLogSinkForTests([&](const std::string& line) {
+        if (std::this_thread::get_id() != caller) return;
+        if (line.find("slot archive reader was slow to open") != std::string::npos ||
+            line.find("slot watch reads the archive") != std::string::npos) lines.push_back(line);
+    });
+    Cleanup clear_log([] { ResetLogSinkForTests(); });
+    const auto cursor = watch->position().revision;
+    assert(table->ListFeedSlots().front().durable_watermark == cursor);
+    assert(watch->WorkStep()); // Observes the reset but cannot open the archive.
+    (void)watch->WorkStep();
+    assert(lines.empty());
+
+    FeedSlotTestAccess::Sync(*table);
+    assert(watch->WorkStep());
+    assert(lines.size() == 2U);
+    assert(lines[0].find(" INFO server ") != std::string::npos);
+    assert(lines[0].ends_with(" slot=consumer cursor=" + std::to_string(cursor) + " live=" + std::to_string(live) +
+        " durable=" + std::to_string(live)));
+    assert(lines[1].find(" WARN server ") != std::string::npos);
+    assert(lines[1].ends_with("slot archive reader was slow to open slot=consumer ms=1000"));
+    SlotAckDeadlineTestAccess::Hook(*watch, nullptr);
+}
+
 void AfterWaitsForDurable(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect(); Create(*writer);
@@ -2950,6 +2999,7 @@ int main(int argc, char** argv) {
         run("persistent-filters", PersistentFilterDelivery);
         run("several-area-slot", SeveralAreaSlot);
         run("historical-schema", HistoricalSchemas); run("historical-schema-dimensional", HistoricalSchemasDimensional); run("held-lease", ArchiveWhileLeaseHeld);
+        run("archive-diagnostics", ArchiveLogsAfterOpening);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
         run("live-schema-ACK", LiveSchemaAcknowledgement);
         run("filtered-idle-progress", FilteredAndIdleProgress);

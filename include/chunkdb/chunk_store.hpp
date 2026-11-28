@@ -1240,7 +1240,8 @@ class ChunkStore {
     // of rollback boundaries still in flight. An overflowed set syncs the
     // whole data directory.
     [[nodiscard]] UnsyncedArtifacts TakeUnsynced();
-    void SyncUnsynced(const UnsyncedArtifacts& drained);
+    // Returns the number of file sync attempts, including files found by sweeps.
+    [[nodiscard]] std::size_t SyncUnsynced(const UnsyncedArtifacts& drained);
 
     class SnapshotGenerationWriteGuard {
       public:
