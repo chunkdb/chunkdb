@@ -276,10 +276,15 @@ bool ChunkStore::TryEvictCandidate(
             return false;
         }
         const bool had_pending_wal = !regular_chunk->wal_batch.empty();
-        FlushWalBatchForEviction(
-            candidate.chunk_coord,
-            regular_chunk,
-            durability_mode_ != DurabilityMode::kRelaxed);
+        try {
+            FlushWalBatchForEviction(candidate.chunk_coord, regular_chunk,
+                durability_mode_ != DurabilityMode::kRelaxed);
+        } catch (const WriteOutcomeUnknownError& error) {
+            if (error.stage() != "wal_append_repair") throw;
+            // The batch belongs to earlier writes. The statement that
+            // triggered eviction has yet to make any change.
+            throw std::runtime_error("eviction could not repair its WAL: " + std::string(error.what()));
+        }
         // A poisoned store refuses checkpoints (CheckpointChunk); its chunks
         // are still evicted, keeping their WAL for the next load.
         if (regular_chunk->deferred_wal_compaction && IsCheckpointDue(regular_chunk) &&
@@ -424,8 +429,8 @@ void ChunkStore::MaybeEvictChunks() {
         return max_bytes != 0U && resources.cache_bytes_->load(std::memory_order_relaxed) > bytes_target;
     };
     std::size_t bytes_estimate = 0;
-    if (bytes_over()) {
-        const auto bytes = resources.cache_bytes_->load(std::memory_order_relaxed);
+    const auto bytes = max_bytes == 0U ? 0U : resources.cache_bytes_->load(std::memory_order_relaxed);
+    if (bytes > bytes_target) {
         const auto average = std::max<std::uint64_t>(bytes / std::max<std::uint64_t>(loaded_hint, 1U), 1U);
         bytes_estimate = static_cast<std::size_t>((bytes - bytes_target) / average) + 1U;
     }

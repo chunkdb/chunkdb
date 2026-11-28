@@ -16,8 +16,8 @@ namespace chunkdb {
 
 namespace {
 
-// The bytes of the regular files below `root`. Files removed during the walk
-// are not counted; std::nullopt when `root` cannot be listed.
+// The bytes of the regular files below `root`. An entry removed during the
+// walk is skipped. An error that could hide files invalidates the sample.
 [[nodiscard]] std::optional<std::uint64_t> TreeFileBytes(const std::filesystem::path& root) {
     namespace fs = std::filesystem;
     std::uint64_t bytes = 0U;
@@ -28,19 +28,23 @@ namespace {
         std::error_code error;
         fs::directory_iterator it(dir, error);
         if (error) {
-            if (dir == root) return std::nullopt;
-            continue;
+            if (dir != root && error == std::errc::no_such_file_or_directory) continue;
+            return std::nullopt;
         }
         for (const fs::directory_iterator end{}; !error && it != end; it.increment(error)) {
             std::error_code entry_error;
             const auto status = it->symlink_status(entry_error);
-            if (entry_error) continue;
+            if (entry_error == std::errc::no_such_file_or_directory) continue;
+            if (entry_error) return std::nullopt;
             if (fs::is_directory(status)) pending.push_back(it->path());
             else if (fs::is_regular_file(status)) {
                 const auto size = fs::file_size(it->path(), entry_error);
-                if (!entry_error) bytes += size;
+                if (entry_error == std::errc::no_such_file_or_directory) continue;
+                if (entry_error) return std::nullopt;
+                bytes += size;
             }
         }
+        if (error) return std::nullopt;
     }
     return bytes;
 }
@@ -102,7 +106,7 @@ void TableCatalog::SampleDisk() {
             table->disk_limit_reached_.store(false, std::memory_order_relaxed);
             continue;
         }
-        // A table directory that cannot be listed keeps its last result.
+        // An incomplete scan keeps the last result.
         if (const auto used = TreeFileBytes(table->dir_)) {
             const bool reached = *used >= *limit;
             table->disk_used_bytes_.store(*used, std::memory_order_relaxed);

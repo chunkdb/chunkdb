@@ -141,8 +141,9 @@ Raise `--max-loaded-chunks` to raise the associated container limit.
 
 `--cache-max-bytes` counts each cached chunk's values, presence bits, variable values, chunk columns and pending WAL batch.
 A chunk is measured when it loads and at each of its checkpoints, so writes that grow variable values between checkpoints are counted late.
-A load that passes the byte limit evicts the coldest chunks of all tables, as one past `--max-loaded-chunks` does, until the cache holds at most fifteen sixteenths of the byte limit.
-Chunks in use and chunks whose WAL could not be repaired are not evicted, so the cache can exceed the limit briefly.
+A cache miss above the byte limit starts eviction of the coldest chunks across all tables, aiming to reduce measured use to roughly fifteen sixteenths of the limit.
+Growth measured at a checkpoint can leave the cache above its limit until a later miss.
+Chunks in use and chunks with an unrepaired WAL are skipped during eviction.
 
 ## Disk space
 
@@ -151,8 +152,10 @@ Reads, DROP TABLE, ALTER TABLE, FLUSH WAL and the statements of an open transact
 The table option `max_disk_bytes` does the same for one table: once its files take at least that many bytes, its SET BLOCK, DELETE BLOCK, SET CHUNK and COMMIT answer `DISK_FULL reason=max_disk_bytes`; see [Tables](reference/TABLES.md#options).
 Writes check the result of the last sample, taken at startup and every `--disk-check-ms` by one background thread, so writes between two samples can pass the floor or the limit.
 A sample lists the files of each table with `max_disk_bytes`, so it reads more with more files; raise `--disk-check-ms` for tables with many chunks.
-Refusals end at the first sample after space is freed or the limit is raised; ALTER TABLE ... SET max_disk_bytes starts a sample at once.
+Refusals end when a successful sample shows sufficient free space or table use below its limit.
+ALTER TABLE ... SET max_disk_bytes requests a sample immediately.
 If free space cannot be queried, the last result stands and the server log reports it.
+An incomplete table scan keeps that table's last result.
 See [Durability](DURABILITY_CONTRACT.md#disk-full) for writes that meet a full disk.
 
 ## Read-only

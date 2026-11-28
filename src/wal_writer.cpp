@@ -20,6 +20,7 @@
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
+#include "durability_io.hpp"
 #include "wal_stream_pool.hpp"
 #include "feed_slots.hpp"
 #include "feed_prefix.hpp"
@@ -575,6 +576,12 @@ void ChunkStore::FlushWalBatch(
             chunk->wal_boundary_durable = false;
         }
         if (force_sync) {
+            if constexpr (kFailpointsCompiled) {
+                if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BATCH_FSYNC_EIO_ONCE")) {
+                    throw SyncFailedError(std::system_error(EIO, std::generic_category(),
+                        "injected WAL batch fsync failure"));
+                }
+            }
             SyncFilePath(chunk->wal_path);
             if (first_create) {
                 if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_AFTER_FILE_SYNC_BEFORE_DIR_SYNC_ONCE")) {

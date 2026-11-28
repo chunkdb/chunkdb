@@ -78,21 +78,26 @@ Read-only inspection remains available and reports an unknown completed revision
 
 ## Disk full
 
-A write that meets a full disk (ENOSPC) answers `DISK_FULL reason=disk_full` and is not applied, in every mode.
-Its WAL is cut back to its length before the write, so no part of it stays in the file.
+An ordinary block or chunk write that answers `DISK_FULL reason=disk_full` is unapplied in every mode.
+If its failed append reached the WAL, the WAL is cut back to its prior length before this reply.
 
 | Mode | Writes acknowledged before it |
 | --- | --- |
 | relaxed | Kept in memory and in the WAL batch; the next batch flush, eviction or FLUSH WAL writes them again. While writing the batch meets ENOSPC, FLUSH WAL answers DISK_FULL, and a crash before then loses them. |
 | fsync-wal, fsync-checkpoint | Already durable. |
 
-COMMIT whose WAL frames cannot be written answers DISK_FULL in every mode; its WALs are cut back and its intent removed, so no part of the transaction commits.
+If writing or closing a COMMIT WAL frame reports ENOSPC and rollback succeeds, COMMIT answers `DISK_FULL reason=disk_full` in every mode and leaves the transaction unapplied.
 A checkpoint image that cannot be written leaves the chunk's image and WAL as they were; the write that started the checkpoint stays acknowledged, in fsync-checkpoint mode too, the server log reports the failure, and a later write or eviction tries again.
 The WAL grows until a checkpoint succeeds.
-ENOSPC alone does not fence a table.
+A recoverable ENOSPC during WAL append or checkpoint image creation leaves the table serving.
 A WAL that a backup on the same file system hard-links is cut back by writing a shortened copy, which itself needs free space.
-When a WAL cannot be cut back, the table refuses changes until RECOVER TABLE or a restart: an ordinary write whose records may remain answers OUTCOME_UNKNOWN, a COMMIT answers INTERNAL and is not applied because recovery removes its records, and a statement whose cache eviction could not write earlier writes answers INTERNAL and applied nothing itself.
-A failed file or directory sync during FLUSH WAL answers `OUTCOME_UNKNOWN stage=barrier_sync` and leaves the table refusing changes until RECOVER TABLE or a restart, since a retried sync can succeed after the system dropped the unwritten data; recovery reads what the files hold.
+When a WAL cannot be cut back, the table refuses changes until RECOVER TABLE or a restart.
+An ordinary write whose records may remain answers OUTCOME_UNKNOWN.
+A COMMIT answers INTERNAL and is unapplied because recovery removes its records.
+A statement whose eviction of a chunk from its own table could not cut back the WAL answers INTERNAL and is also unapplied.
+A failed file or directory sync during FLUSH WAL leaves the table refusing changes until RECOVER TABLE or a restart, since a retried sync can succeed after the system dropped the unwritten data.
+The table's error is `OUTCOME_UNKNOWN stage=barrier_sync`, or `OUTCOME_UNKNOWN stage=wal_append_repair` if the WAL cutback also fails.
+FLUSH WAL waits for barriers on all serving tables and reports one error if several tables fail.
 
 Set `--min-free-disk-bytes` to refuse writes before the disk fills, and the table option `max_disk_bytes` to bound one table; see [Server flags](SERVER_FLAGS.md#disk-space).
 

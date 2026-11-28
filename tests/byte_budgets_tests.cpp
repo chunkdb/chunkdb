@@ -5,15 +5,26 @@
 #include <cassert>
 #include <chrono>
 #include <cstdlib>
+#include <filesystem>
+#include <fstream>
+#include <functional>
+#include <future>
 #include <iostream>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <string>
+#include <string_view>
 #include <vector>
+
+#ifndef _WIN32
+#include <unistd.h>
+#endif
 
 #include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "change_feed.hpp"
+#include "chunk_store_internal.hpp"
 #include "store_manifest.hpp"
 #include "txn_test_utils.hpp"
 
@@ -25,10 +36,11 @@ using Parameters = std::vector<std::optional<std::string>>;
 struct Fixture {
     test::ScopedTempDir directory{"chunkdb-byte-budgets"};
     CatalogConfig config;
+    std::filesystem::path backup_dir{};
+    std::optional<std::uint64_t> available;
     std::shared_ptr<TableCatalog> catalog;
     std::unique_ptr<CommandEngine> engine;
     SessionState session;
-    std::optional<std::uint64_t> available;
 
     explicit Fixture(DurabilityMode mode = DurabilityMode::kRelaxed) {
         config.data_dir = directory.path();
@@ -43,7 +55,7 @@ struct Fixture {
     void Open() {
         catalog = std::make_shared<TableCatalog>(config);
         catalog->SetDiskSpaceProbeForTests([this](const std::filesystem::path&) { return available; });
-        engine = std::make_unique<CommandEngine>(EngineConfig{.require_auth = false}, catalog);
+        engine = std::make_unique<CommandEngine>(EngineConfig{.require_auth = false, .backup_dir = backup_dir}, catalog);
         session = {};
         assert(Run("HELLO 3").starts_with("%"));
     }
@@ -141,6 +153,81 @@ void BarrierSyncFailureFailsClosed() {
     Expect(f.Run("SET BLOCK 4 0 IN t n=2"), ":");
     assert(f.Run("FLUSH WAL") == "+OK\r\n");
     assert(f.Run("GET BLOCK 4 0 FROM t") == "*1\r\n:2\r\n");
+}
+
+void QueuedBarrierObservesSyncFailure() {
+    Fixture f;
+    f.Open();
+    assert(f.Run("CREATE TABLE t (n u32) CHUNK 4 x 4") == "+OK\r\n");
+    Expect(f.Run("SET BLOCK 0 0 IN t n=1"), ":");
+    auto lease = f.catalog->Require("t")->Acquire();
+    auto& store = lease->store();
+    store.ArmBarrierBeforeSyncPauseForTests();
+    txn_test::ScopedEnv failed("CHUNKDB_FAILPOINT_BARRIER_FSYNC_EIO_ONCE", "1");
+    auto first = std::async(std::launch::async, [&] {
+        try {
+            store.WalBarrier();
+        } catch (const WriteOutcomeUnknownError& error) {
+            return error.stage() == "barrier_sync";
+        }
+        return false;
+    });
+    assert(store.WaitForBarrierBeforeSyncForTests());
+    std::promise<void> arrived;
+    auto before_lock = arrived.get_future();
+    const std::function<void()> hook = [&] { arrived.set_value(); };
+    SetBarrierBeforeLockHookForTests(&hook);
+    auto second = std::async(std::launch::async, [&] {
+        try {
+            store.WalBarrier();
+        } catch (const std::runtime_error& error) {
+            return std::string_view(error.what()).starts_with("store is fail-closed");
+        }
+        return false;
+    });
+    assert(before_lock.wait_for(5s) == std::future_status::ready);
+    store.ResumeBarrierBeforeSyncForTests();
+    assert(first.get());
+    assert(second.get());
+    SetBarrierBeforeLockHookForTests(nullptr);
+}
+
+void BarrierBatchSyncFailureFailsClosed() {
+    Fixture f;
+    f.config.default_options.wal_group_commit_updates = 8U;
+    f.Open();
+    assert(f.Run("CREATE TABLE t (n u32) CHUNK 4 x 4") == "+OK\r\n");
+    assert(f.Run("BEGIN") == "+OK\r\n");
+    Expect(f.Run("SET BLOCK 0 0 IN t n=1"), "_");
+    Expect(f.Run("COMMIT"), ":");
+    // COMMIT left a durable boundary. The next relaxed write stays in a
+    // batch, which this barrier syncs in its first phase.
+    Expect(f.Run("SET BLOCK 1 0 IN t n=2"), ":");
+    {
+        txn_test::ScopedEnv failed("CHUNKDB_FAILPOINT_WAL_BATCH_FSYNC_EIO_ONCE", "1");
+        Expect(f.Run("FLUSH WAL"), "-ERR OUTCOME_UNKNOWN stage=barrier_sync ");
+    }
+    Expect(f.Run("FLUSH WAL"), "-ERR INTERNAL ");
+    Expect(f.Run("SET BLOCK 2 0 IN t n=3"), "-ERR INTERNAL ");
+}
+
+void EvictionOpenStreamRepairFailureIsInternal() {
+    Fixture f;
+    f.config.max_loaded_chunks = 1U;
+    f.config.default_options.wal_group_commit_updates = 2U;
+    f.Open();
+    assert(f.Run("CREATE TABLE t (n u32) CHUNK 4 x 4") == "+OK\r\n");
+    Expect(f.Run("SET BLOCK 0 0 IN t n=1"), ":");
+    Expect(f.Run("SET BLOCK 1 0 IN t n=2"), ":");
+    assert(f.catalog->resources()->OpenWalStreamCount() == 1U);
+    Expect(f.Run("SET BLOCK 2 0 IN t n=3"), ":");
+    {
+        txn_test::ScopedEnv full("CHUNKDB_FAILPOINT_WAL_APPEND_ENOSPC_ONCE", "1");
+        txn_test::ScopedEnv repair("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1");
+        Expect(f.Run("SET BLOCK 4 0 IN t n=4"), "-ERR INTERNAL ");
+    }
+    assert(f.Run("GET BLOCK 4 0 FROM t") == "_\r\n");
+    Expect(f.Run("SET BLOCK 4 0 IN t n=4"), "-ERR INTERNAL ");
 }
 
 // Past the server-wide history total, a write that must keep a state ends
@@ -247,14 +334,17 @@ void FeedTotal() {
 // RESTORE TABLE and MIGRATE are refused; reads, DDL that frees or limits
 // space, and FLUSH WAL run.
 void DiskFloor() {
+    test::ScopedTempDir backups{"chunkdb-byte-budgets-backups"};
     Fixture f;
+    f.backup_dir = backups.path();
     f.config.min_free_disk_bytes = 1000U;
     f.available = 5000U;
     f.Open();
     f.catalog->SampleDisk();
-    assert(f.Run("CREATE TABLE t (n u32) CHUNK 4 x 4") == "+OK\r\n");
+    assert(f.Run("CREATE TABLE t (n u32) CHUNK 4 x 4 CHUNK COLUMNS (owner u8 DEFAULT 0)") == "+OK\r\n");
     assert(f.Run("CREATE TABLE spare (n u32) CHUNK 4 x 4") == "+OK\r\n");
     Expect(f.Run("SET BLOCK 0 0 IN t n=1"), ":");
+    Expect(f.Run("BACKUP TO 'snapshot'"), "%");
     auto txn = f.NewSession();
     assert(f.Run(txn, "BEGIN") == "+OK\r\n");
     Expect(f.Run(txn, "SET BLOCK 4 4 IN t n=7"), "_");
@@ -264,9 +354,12 @@ void DiskFloor() {
     const std::string refused = "-ERR DISK_FULL reason=min_free_disk available=999 limit=1000 ";
     Expect(f.Run("SET BLOCK 0 0 IN t n=2"), refused);
     Expect(f.Run("DELETE BLOCK 0 0 FROM t"), refused);
+    Expect(f.Run("SET CHUNK 0 0 IN t META owner=7"), refused);
     Expect(f.Run("SET BLOCK 0 0 IN t n = n + 1 IF n = 1"), refused);
     Expect(f.Run("CREATE TABLE other (n u8)"), refused);
     Expect(f.Run("MIGRATE 'm1' CREATE TABLE other (n u8)"), refused);
+    Expect(f.Run("RESTORE TABLE t FROM 'snapshot' AS restored"), refused);
+    assert(!f.catalog->Find("restored"));
     // A transaction stages privately; its COMMIT is refused and ends it.
     Expect(f.Run(txn, "SET BLOCK 8 8 IN t n=8"), "_");
     Expect(f.Run(txn, "COMMIT"), refused);
@@ -284,6 +377,8 @@ void DiskFloor() {
     f.catalog->SampleDisk();
     Expect(f.Run("SET BLOCK 0 0 IN t n=2"), ":");
     assert(f.Run("GET BLOCK 0 0 FROM t") == "*1\r\n:2\r\n");
+    Expect(f.Run("RESTORE TABLE t FROM 'snapshot' AS restored"), "%");
+    assert(f.Run("GET BLOCK 0 0 FROM restored") == "*1\r\n:1\r\n");
 
     // A server that starts below the floor refuses from its first write.
     f.available = 10U;
@@ -305,8 +400,10 @@ void DiskFloor() {
 // table's data writes only, and zero removes it.
 void TableMaxDiskBytes() {
     Fixture f;
+    f.config.min_free_disk_bytes = 1U;
+    f.available = 5000U;
     f.Open();
-    assert(f.Run("CREATE TABLE t (n u32) CHUNK 4 x 4 WITH max_disk_bytes = 1") == "+OK\r\n");
+    assert(f.Run("CREATE TABLE t (n u32) CHUNK 4 x 4 CHUNK COLUMNS (owner u8 DEFAULT 0) WITH max_disk_bytes = 1") == "+OK\r\n");
     assert(f.Run("CREATE TABLE u (n u32) CHUNK 4 x 4") == "+OK\r\n");
     assert(f.Run("DESCRIBE t").find("$14\r\nmax_disk_bytes\r\n:1\r\n") != std::string::npos);
     assert(f.Run("DESCRIBE u").find("max_disk_bytes") == std::string::npos);
@@ -316,28 +413,69 @@ void TableMaxDiskBytes() {
     f.catalog->SampleDisk();
     Expect(f.Run("SET BLOCK 0 0 IN t n=2"), "-ERR DISK_FULL reason=max_disk_bytes table=t used=");
     Expect(f.Run("SET BLOCK 0 0 IN u n=2"), ":");
+    Expect(f.Run("DELETE BLOCK 0 0 FROM t"), "-ERR DISK_FULL reason=max_disk_bytes table=t ");
+    Expect(f.Run("SET CHUNK 0 0 IN t META owner=7"), "-ERR DISK_FULL reason=max_disk_bytes table=t ");
+    assert(f.Run("BEGIN") == "+OK\r\n");
+    Expect(f.Run("SET BLOCK 0 0 IN t n=3"), "_");
+    Expect(f.Run("COMMIT"), "-ERR DISK_FULL reason=max_disk_bytes table=t ");
     assert(f.Run("GET BLOCK 0 0 FROM t") == "*1\r\n:1\r\n");
     // The option survives a restart.
     f.Reopen();
     assert(f.Run("DESCRIBE t").find("$14\r\nmax_disk_bytes\r\n:1\r\n") != std::string::npos);
     Expect(f.Run("SET BLOCK 0 0 IN t n=2"), "-ERR DISK_FULL reason=max_disk_bytes table=t ");
-    // Raising it or setting zero (no limit) accepts writes after a sample.
-    assert(f.Run("ALTER TABLE t SET max_disk_bytes = 1073741824") == "+OK\r\n");
-    f.catalog->SampleDisk();
+    // The ALTER itself wakes the sampler, whose periodic interval is one hour.
+    const auto alter_and_wait = [&](const char* value) {
+        std::promise<void> probed;
+        auto sample = probed.get_future();
+        f.catalog->SetDiskSpaceProbeForTests([&](const std::filesystem::path&) -> std::optional<std::uint64_t> {
+            probed.set_value();
+            return 5000U;
+        });
+        assert(f.Run(std::string("ALTER TABLE t SET max_disk_bytes = ") + value) == "+OK\r\n");
+        assert(sample.wait_for(5s) == std::future_status::ready);
+        // Replacing the probe takes the sample mutex after the table scan.
+        f.catalog->SetDiskSpaceProbeForTests({});
+    };
+    alter_and_wait("1073741824");
     Expect(f.Run("SET BLOCK 0 0 IN t n=3"), ":");
     assert(f.Run("DESCRIBE t").find("max_disk_bytes\r\n:1073741824\r\n") != std::string::npos);
-    assert(f.Run("ALTER TABLE t SET max_disk_bytes = 1") == "+OK\r\n");
-    f.catalog->SampleDisk();
+    alter_and_wait("1");
     Expect(f.Run("SET BLOCK 0 0 IN t n=4"), "-ERR DISK_FULL reason=max_disk_bytes ");
-    assert(f.Run("ALTER TABLE t SET max_disk_bytes = 0") == "+OK\r\n");
+    alter_and_wait("0");
     assert(f.Run("DESCRIBE t").find("max_disk_bytes") == std::string::npos);
-    f.catalog->SampleDisk();
     Expect(f.Run("SET BLOCK 0 0 IN t n=4"), ":");
 
     TableOptions options;
     options.max_disk_bytes = 4096U;
     assert(DecodeTableOptions(EncodeTableOptions(options)).max_disk_bytes == 4096U);
     assert(!DecodeTableOptions(EncodeTableOptions(TableOptions{})).max_disk_bytes);
+}
+
+void IncompleteDiskScanKeepsRefusal() {
+#ifndef _WIN32
+    if (::geteuid() == 0) return;  // Root can list mode-000 directories.
+    namespace fs = std::filesystem;
+    Fixture f;
+    f.Open();
+    assert(f.Run("CREATE TABLE t (n u32) CHUNK 4 x 4 WITH max_disk_bytes = 1048576") == "+OK\r\n");
+    const auto table_dir = f.catalog->Require("t")->Acquire()->store().data_dir();
+    const auto sentinel = table_dir / "sample-size";
+    const auto nested = table_dir / "unreadable";
+    std::ofstream(sentinel).close();
+    fs::resize_file(sentinel, 1048576U);
+    assert(fs::create_directory(nested));
+    f.catalog->SampleDisk();
+    const auto write = "SET BLOCK 0 0 IN t n=1";
+    const auto refused = "-ERR DISK_FULL reason=max_disk_bytes table=t ";
+    Expect(f.Run(write), refused);
+    assert(fs::remove(sentinel));
+    fs::permissions(nested, fs::perms::none);
+    f.catalog->SampleDisk();
+    fs::permissions(nested, fs::perms::owner_all);
+    Expect(f.Run(write), refused);
+    f.catalog->SampleDisk();
+    Expect(f.Run(write), ":");
+#endif
 }
 
 // ENOSPC appending a WAL batch: the write that hit it answers DISK_FULL and
@@ -397,9 +535,9 @@ void CheckpointNoSpace(DurabilityMode mode) {
     assert(f.Run("GET BLOCK 1 0 FROM t") == "*1\r\n:2\r\n");
 }
 
-// ENOSPC appending a transaction frame: COMMIT answers DISK_FULL, nothing
-// commits, and the table keeps serving.
-void TxnCommitNoSpace(DurabilityMode mode) {
+// ENOSPC writing or closing a transaction frame: COMMIT answers DISK_FULL,
+// nothing commits, and the table keeps serving.
+void TxnCommitNoSpace(DurabilityMode mode, const char* failpoint) {
     Fixture f(mode);
     f.Open();
     assert(f.Run("CREATE TABLE t (n u32) CHUNK 4 x 4") == "+OK\r\n");
@@ -408,7 +546,7 @@ void TxnCommitNoSpace(DurabilityMode mode) {
     Expect(f.Run("SET BLOCK 0 0 IN t n=2"), "_");
     Expect(f.Run("SET BLOCK 4 0 IN t n=3"), "_");
     {
-        txn_test::ScopedEnv full("CHUNKDB_FAILPOINT_TXN_APPEND_ENOSPC_ONCE", "1");
+        txn_test::ScopedEnv full(failpoint, "1");
         Expect(f.Run("COMMIT"), "-ERR DISK_FULL reason=disk_full ");
     }
     assert(f.Run("GET BLOCK 0 0 FROM t") == "*1\r\n:1\r\n");
@@ -425,14 +563,19 @@ int main() {
     CacheBytesBoundAllTables();
     OffCacheCheckpointsLeaveCacheBytes();
     BarrierSyncFailureFailsClosed();
+    QueuedBarrierObservesSyncFailure();
+    BarrierBatchSyncFailureFailsClosed();
+    EvictionOpenStreamRepairFailureIsInternal();
     TxnHistoryTotal();
     FeedTotal();
     DiskFloor();
     TableMaxDiskBytes();
+    IncompleteDiskScanKeepsRefusal();
     for (const auto mode : {DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint}) {
         WalAppendNoSpace(mode);
         CheckpointNoSpace(mode);
-        TxnCommitNoSpace(mode);
+        TxnCommitNoSpace(mode, "CHUNKDB_FAILPOINT_TXN_APPEND_ENOSPC_ONCE");
+        TxnCommitNoSpace(mode, "CHUNKDB_FAILPOINT_TXN_APPEND_CLOSE_ENOSPC_ONCE");
     }
     std::cout << "byte budget tests passed\n";
 }
