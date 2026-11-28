@@ -76,6 +76,13 @@ It leaves revision and recovery records unchanged; restore a consistent backup, 
 A missing or malformed clock beside a valid initialized marker, or a malformed marker, is also refused and has the same remedies.
 Read-only inspection remains available and reports an unknown completed revision as null.
 
+## Replication watch
+
+WATCH REPLICATION delivers commits at the live completed frontier, with the same durability as the producing operation.
+Collection and compaction pushes follow publication of their coordinate-index decisions and have separate live revisions for resuming with AFTER.
+Replication history is in memory. When the requested position has left the live ring or predates capture, the watch sends `resync` and the mirror must be rebuilt from a copy.
+Durable slot delivery applies to ordinary watches. A replication watch adds no cross-machine durability guarantee.
+
 ## Platforms and scope
 
 - Linux uses fdatasync where applicable, with fsync fallback and directory fsync.
@@ -83,7 +90,6 @@ Read-only inspection remains available and reports an unknown completed revision
 - Windows requires FlushFileBuffers and the directory-sync capability used by publication and snapshot bookkeeping.
 - Required atomic publication or sync failures return errors, including required Windows bookkeeping in relaxed mode.
 - SWAP TABLES needs an atomic directory exchange (Linux `renameat2`, macOS `renamex_np`); Windows and file systems without one refuse it.
-- Replication and durability across machines are unavailable.
 
 `chunkdb_verify` inspects files without modifying them; the server always opens its data directory for writing.
 See [Storage format](STORAGE_FORMAT.md), [Backup and restore](BACKUP.md), and [Limitations](KNOWN_LIMITATIONS.md).

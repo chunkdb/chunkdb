@@ -42,6 +42,7 @@ struct FeedTestAccess {
 };
 
 class FeedProducerRegistry;
+struct ChunkIndexRecord;
 
 // Subscriptions with the same filters share one projected entry, with its
 // frame, per ring entry. Only their readers use it; writers and the sender
@@ -112,6 +113,16 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     // A slot watch's live reader (`slot`) receives ring entries unprojected and
     // joins no projection group: the watch projects each entry itself.
     [[nodiscard]] std::unique_ptr<FeedSubscription> Subscribe(std::weak_ptr<Table> table, const FeedOptions& options, bool slot = false);
+    // Control only, with the table closed to writers and checkpoint publication locked.
+    void EnableReplication(ChunkStore& store);
+    void DisableReplication() noexcept { replication_capture_.store(false, std::memory_order_release); }
+    [[nodiscard]] bool capturing_replication() const noexcept { return replication_capture_.load(std::memory_order_acquire); }
+    [[nodiscard]] bool has_replication_watchers() const noexcept {
+        return replication_watchers_.load(std::memory_order_acquire) != 0U;
+    }
+    // Called under checkpoint publication after the index decision is visible.
+    void RecordCollection(ChunkStore& store, const ChunkIndexRecord& record);
+    void RecordCompaction(ChunkStore& store, std::uint64_t before);
 
   private:
     friend class FeedWriteGuard;
@@ -167,11 +178,17 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     struct Retained {
         std::shared_ptr<const FeedEntry> entry;
         std::size_t bytes;
+        std::shared_ptr<const FeedEntry> replication{};
+    };
+    struct Decoded {
+        std::shared_ptr<const FeedEntry> entry{};
+        std::shared_ptr<const FeedEntry> replication{};
     };
     Producer& ThreadProducer();
     bool Reserve(std::size_t bytes) noexcept;
     // Writers: Reserve, evicting the oldest retained entries before refusing a capture.
     bool ReserveCapture(std::size_t bytes) noexcept;
+    bool ReserveWithEviction(std::size_t bytes) noexcept; // under mutex_
     void Release(std::size_t bytes) noexcept;
     void Lost(std::uint64_t revision) noexcept;
     void Wake() noexcept;
@@ -185,13 +202,16 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     void Send();
     void Merge(std::uint64_t watermark);
     void Append(std::shared_ptr<const FeedEntry> entry, std::size_t bytes, RawWrite* consumed = nullptr,
-                bool notify = true);
+                bool notify = true, std::shared_ptr<const FeedEntry> replication = {});
+    // Insert queued maintenance at the same ordered cut as writes. Caller holds mutex_.
+    bool DrainMaintenance(std::uint64_t through, bool discard = false);
+    void RecordMaintenance(ChunkStore& store, const ChunkIndexRecord* collected, std::uint64_t before);
     bool ReclaimSpare(std::size_t needed) noexcept;
     void DiscardBuffers(RawWrite& write) noexcept;
     void Recycle(Producer& producer, RawWrite* write) noexcept;
     void ClearRing();
     std::shared_ptr<const FeedEntry> Next(FeedSubscription& subscription, std::chrono::milliseconds timeout);
-    std::shared_ptr<const FeedEntry> Decode(const RawWrite& write) const;
+    Decoded Decode(const RawWrite& write) const;
     void RunHook(FeedTestHook::Point point, std::uint64_t version) const;
 
     const StoreId epoch_;
@@ -204,6 +224,9 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     std::atomic<bool> wake_{false};
     std::atomic<bool> stopping_{false};
     std::atomic<std::size_t> chunk_watchers_{0U};
+    std::atomic<std::size_t> replication_watchers_{0U};
+    // Set by exclusive table control with checkpoint publication locked.
+    std::atomic<bool> replication_capture_{false};
     std::atomic<FeedTestHook*> hook_{nullptr};
     std::thread sender_;
     // Sender sees a stable store/geometry between Resume and Pause. Readers
@@ -217,6 +240,9 @@ class ChangeFeed : public std::enable_shared_from_this<ChangeFeed> {
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::deque<Retained> ring_;
+    std::deque<Retained> maintenance_;
+    std::uint64_t replication_floor_ = 0U;
+    bool replication_started_empty_ = false;
     std::uint64_t floor_ = 0;
     std::uint64_t watermark_ = 0;
     std::uint64_t drained_watermark_ = 0;

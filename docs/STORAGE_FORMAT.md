@@ -499,6 +499,10 @@ Details are in [artifact I/O](design/COMMIT_OWNER_ARTIFACT_IO.md).
 
 ## Feed slots and archives
 
+WATCH REPLICATION uses the in-memory feed ring and the existing WAL captures, schema history and coordinate-index decisions.
+Starting capture on a table with existing history, collection and compaction use the existing version clock for live resume positions. The coordinate index still stores the collecting chunk's producing revision and time and the existing deletion floor.
+The replication stream adds no on-disk records or flags, and slot archives contain the existing ordinary feed history.
+
 `chunkdb.slots` is at most 1 MiB, atomically replaced and file/directory synced in every durability mode:
 
 1. `CKSL`, format tag `4:u16`, dimensions `u8`, header flags `u8`, table epoch (16 bytes).

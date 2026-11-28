@@ -367,6 +367,7 @@ class CommandEngine {
     // `*`, or MANAGES USERS when the watch shows users: PERMISSION_DENIED, or
     // AUTH_REQUIRED once the user was dropped.
     [[nodiscard]] static std::string LostCatalogWatchReply(bool user_dropped);
+    [[nodiscard]] static std::string LostReplicationWatchReply(bool user_dropped);
     [[nodiscard]] const std::shared_ptr<MetricsRegistry>& metrics() const noexcept {
         return metrics_;
     }

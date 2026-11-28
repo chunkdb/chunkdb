@@ -161,7 +161,10 @@ A naked map would be indistinguishable from an ordinary reply, so it is not the 
 | `progress` | `[progress,epoch,revision]`. |
 | `resync` | `[resync,epoch,revision,parent_epoch,fork_revision]`. |
 | `chunks` | `[chunks,epoch,revision,commit_time_ms,user,schema_version,chunks,tag,txn]`. |
-| `catalog` | `[catalog,epoch,revision,commit_time_ms,user,events,txn]`. |
+| `catalog` | `[catalog,epoch,revision,commit_time_ms,user,events,txn,whole]`. |
+| `replication` | `[replication,epoch,revision,commit_time_ms,user,schema_version,chunks,tag,txn,txn_tables]`. |
+| `collect` | `[collect,epoch,revision,chunks]`. |
+| `compact` | `[compact,epoch,revision,before]`. |
 
 `columns` and `chunk_columns` use the existing column-description maps; unknown map keys and type names follow A1.
 Block entries are `[x,y,before,after]` in 2D or `[x,y,z,before,after]` in 3D.

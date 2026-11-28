@@ -703,7 +703,7 @@ CoordinatePage ChunkCoordinateIndex::CurrentPage(bool has_cursor, const ChunkCoo
     return page;
 }
 
-void ChunkCoordinateIndex::PublishTombstone(const ChunkIndexRecord& record) {
+bool ChunkCoordinateIndex::PublishTombstone(const ChunkIndexRecord& record) {
     Check();
     if (read_only_ || record.kind != ChunkIndexKind::kDeleted)
         throw std::invalid_argument("only a writer may retain an empty chunk boundary");
@@ -725,7 +725,7 @@ void ChunkCoordinateIndex::PublishTombstone(const ChunkIndexRecord& record) {
             if (old.revision > record.revision || (old.revision == record.revision &&
                 old.commit_time_ms != record.commit_time_ms))
                 throw std::runtime_error("collection boundary conflicts with its retained identity");
-            if (old.kind == ChunkIndexKind::kDeleted && old.revision == record.revision) return;
+            if (old.kind == ChunkIndexKind::kDeleted && old.revision == record.revision) return false;
         }
     }
     auto next = shards_;
@@ -776,6 +776,7 @@ void ChunkCoordinateIndex::PublishTombstone(const ChunkIndexRecord& record) {
             node->retained_empty = record;
         }
     } catch (const std::exception&) { failed_.store(true, std::memory_order_release); throw; }
+    return true;
 }
 
 void ChunkCoordinateIndex::Compact(std::uint64_t before, std::uint64_t completed_frontier) {

@@ -272,27 +272,195 @@ std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const Fee
     return filtered;
 }
 
+namespace {
+void AppendSchema(std::string& out, const FeedEntry& entry, std::size_t extra_fields) {
+    out = ">2\r\n";
+    Protocol::AppendBulk(out, "schema");
+    Protocol::AppendMapHeader(out, 6U + extra_fields);
+    Protocol::AppendBulk(out, "epoch");
+    Protocol::AppendBulk(out, StoreIdHex(entry.position.epoch));
+    Protocol::AppendBulk(out, "revision");
+    Number(out, ':', entry.position.revision);
+    Protocol::AppendBulk(out, "schema_version");
+    Number(out, ':', entry.schema_version);
+    Protocol::AppendBulk(out, "dims");
+    Number(out, ':', entry.dims);
+    Protocol::AppendBulk(out, "columns");
+    Protocol::AppendColumns(out, entry.columns);
+    Protocol::AppendBulk(out, "chunk_columns");
+    Protocol::AppendColumns(out, entry.chunk_columns);
+}
+
+void AppendPosition(std::string& out, FeedPosition position) {
+    Protocol::AppendBulk(out, StoreIdHex(position.epoch));
+    Number(out, ':', position.revision);
+}
+
+void AppendCoordinates(std::string& out, ChunkCoord coord, std::uint8_t dims) {
+    Number(out, ':', coord.x);
+    Number(out, ':', coord.y);
+    if (dims == 3U) Number(out, ':', coord.z);
+}
+
+void AppendParameter(std::string& out, const ColumnValue& value) {
+    std::visit([&](const auto& v) {
+        using T = std::decay_t<decltype(v)>;
+        const auto little = [&](std::uint64_t bits, std::size_t length) {
+            char bytes[8];
+            for (std::size_t i = 0; i < length; ++i) bytes[i] = static_cast<char>((bits >> (i * 8U)) & 0xffU);
+            Protocol::AppendBulk(out, std::string_view(bytes, length));
+        };
+        if constexpr (std::is_same_v<T, std::uint64_t> || std::is_same_v<T, std::int64_t>)
+            little(static_cast<std::uint64_t>(v), 8U);
+        else if constexpr (std::is_same_v<T, bool>) little(v ? 1U : 0U, 1U);
+        else if constexpr (std::is_same_v<T, float>) little(std::bit_cast<std::uint32_t>(v), 4U);
+        else if constexpr (std::is_same_v<T, double>) little(std::bit_cast<std::uint64_t>(v), 8U);
+        else Value(out, value); // The remaining feed value encodings are bulk strings or NULL.
+    }, value);
+}
+
+void AppendParameterRow(std::string& out, const std::optional<std::vector<ColumnValue>>& row) {
+    if (!row) { Protocol::AppendNull(out); return; }
+    Protocol::AppendArrayHeader(out, row->size());
+    for (const auto& value : *row) AppendParameter(out, value);
+}
+
+void AppendReplicationChunk(std::string& out, const FeedEntry& entry, ChunkCoord coord, std::string_view kind) {
+    ValidateCoord(coord, entry.dims);
+    Protocol::AppendArrayHeader(out, static_cast<std::size_t>(entry.dims) + 3U);
+    AppendCoordinates(out, coord, entry.dims);
+    Number(out, ':', entry.position.revision);
+    Protocol::AppendBulk(out, kind);
+}
+
+std::string_view StepName(SchemaChange::Kind kind) {
+    switch (kind) {
+        case SchemaChange::Kind::kAddColumn: return "add";
+        case SchemaChange::Kind::kDropColumn: return "drop";
+        case SchemaChange::Kind::kRenameColumn: return "rename";
+        case SchemaChange::Kind::kChangeType: return "retype";
+        case SchemaChange::Kind::kChangeAttributes: return "attributes";
+        case SchemaChange::Kind::kAddCheck: return "add_check";
+        case SchemaChange::Kind::kDropCheck: return "drop_check";
+        case SchemaChange::Kind::kOtherDomain: break;
+    }
+    throw std::logic_error("unknown replication schema operation");
+}
+
+void AppendCheck(std::string& out, const CheckConstraint& check) {
+    Protocol::AppendMapHeader(out, 2U);
+    Protocol::AppendBulk(out, "name"); Protocol::AppendBulk(out, check.name);
+    Protocol::AppendBulk(out, "expression"); Protocol::AppendBulk(out, check.expression);
+}
+}  // namespace
+
+std::string BeginReplicationCommit(const FeedEntry& entry, std::size_t chunks) {
+    ValidateDims(entry.dims);
+    std::string out = ">10\r\n";
+    Protocol::AppendBulk(out, "replication");
+    AppendPosition(out, entry.position);
+    Number(out, ':', entry.commit_time_ms);
+    if (entry.user) Protocol::AppendBulk(out, *entry.user); else Protocol::AppendNull(out);
+    Number(out, ':', entry.schema_version);
+    Protocol::AppendArrayHeader(out, chunks);
+    return out;
+}
+
+void AppendReplicationForm(std::string& out, const FeedEntry& entry, ChunkCoord coord,
+    std::optional<std::string_view> form) {
+    AppendReplicationChunk(out, entry, coord, "form");
+    if (form) Protocol::AppendBulk(out, *form); else Protocol::AppendNull(out);
+}
+
+void AppendReplicationBlock(std::string& out, const FeedEntry& entry, ChunkCoord coord,
+    std::int64_t x, std::int64_t y, std::int64_t z,
+    const std::optional<std::vector<ColumnValue>>& after,
+    const std::optional<std::vector<ColumnValue>>& chunk_row) {
+    AppendReplicationChunk(out, entry, coord, "rows");
+    out += "*2\r\n*1\r\n";
+    Protocol::AppendArrayHeader(out, static_cast<std::size_t>(entry.dims) + 1U);
+    Number(out, ':', x); Number(out, ':', y);
+    if (entry.dims == 3U) Number(out, ':', z);
+    AppendParameterRow(out, after);
+    AppendParameterRow(out, chunk_row);
+}
+
+std::string EncodeReplicationSchema(const FeedEntry& entry, const TableSchema& blocks, const TableSchema& chunks) {
+    std::string out;
+    AppendSchema(out, entry, 2U);
+    Protocol::AppendBulk(out, "checks");
+    Protocol::AppendArrayHeader(out, blocks.checks.size());
+    for (const auto& check : blocks.checks) AppendCheck(out, check);
+    Protocol::AppendBulk(out, "step");
+    const auto& block_changes = blocks.history.back().changes;
+    const auto& chunk_changes = chunks.history.back().changes;
+    const auto count = [](const auto& changes) {
+        return static_cast<std::size_t>(std::count_if(changes.begin(), changes.end(), [](const SchemaChange& change) {
+            return change.kind != SchemaChange::Kind::kOtherDomain;
+        }));
+    };
+    Protocol::AppendArrayHeader(out, count(block_changes) + count(chunk_changes));
+    const auto append = [&](const auto& changes, bool chunk) {
+        for (const auto& change : changes) {
+            using Kind = SchemaChange::Kind;
+            if (change.kind == Kind::kOtherDomain) continue;
+            const bool check = change.kind == Kind::kAddCheck || change.kind == Kind::kDropCheck;
+            Protocol::AppendMapHeader(out, check ? 2U : 3U + (change.kind == Kind::kChangeType ? 1U : 0U));
+            Protocol::AppendBulk(out, "kind");
+            const auto kind = StepName(change.kind);
+            Protocol::AppendBulk(out, chunk ? "chunk_" + std::string(kind) : std::string(kind));
+            if (check) {
+                Protocol::AppendBulk(out, "check"); AppendCheck(out, change.check);
+                continue;
+            }
+            Protocol::AppendBulk(out, "column_id"); Number(out, ':', change.column.id);
+            Protocol::AppendBulk(out, "default");
+            const auto& column = change.column;
+            if (!column.has_default) Protocol::AppendNull(out);
+            else AppendParameter(out, IsFixedWidth(column.type.kind)
+                ? DecodeColumnValue(column, column.default_value.data()) : DecodeVarValue(column, column.default_value));
+            if (change.kind == Kind::kChangeType) {
+                Protocol::AppendBulk(out, "conversion");
+                constexpr std::string_view conversions[]{"exact", "clamp", "default", "truncate"};
+                Protocol::AppendBulk(out, conversions[static_cast<std::size_t>(change.conversion)]);
+            }
+        }
+    };
+    append(block_changes, false);
+    append(chunk_changes, true);
+    return out;
+}
+
+std::string EncodeReplicationCollect(const FeedEntry& entry, ChunkCoord coord, std::uint64_t version,
+    std::uint64_t commit_time_ms) {
+    ValidateDims(entry.dims);
+    ValidateCoord(coord, entry.dims);
+    std::string out = ">4\r\n";
+    Protocol::AppendBulk(out, "collect");
+    AppendPosition(out, entry.position);
+    Protocol::AppendArrayHeader(out, 1U);
+    Protocol::AppendArrayHeader(out, static_cast<std::size_t>(entry.dims) + 2U);
+    AppendCoordinates(out, coord, entry.dims);
+    Number(out, ':', version);
+    Number(out, ':', commit_time_ms);
+    return out;
+}
+
+std::string EncodeReplicationCompact(FeedPosition position, std::uint64_t before) {
+    std::string out = ">4\r\n";
+    Protocol::AppendBulk(out, "compact");
+    AppendPosition(out, position);
+    Number(out, ':', before);
+    return out;
+}
+
 std::string EncodeFeedEntry(const FeedEntry& entry) {
     if (entry.kind == FeedEntry::Kind::kEnd) return Protocol::Error("NO_TABLE", "watched table was dropped");
     if (entry.kind == FeedEntry::Kind::kResync) return EncodeFeedResync(entry.position, std::nullopt);
     if (entry.kind != FeedEntry::Kind::kProgress) ValidateDims(entry.dims);
     std::string out;
     if (entry.kind == FeedEntry::Kind::kSchema) {
-        out = ">2\r\n";
-        Protocol::AppendBulk(out, "schema");
-        Protocol::AppendMapHeader(out, 6U);
-        Protocol::AppendBulk(out, "epoch");
-        Protocol::AppendBulk(out, StoreIdHex(entry.position.epoch));
-        Protocol::AppendBulk(out, "revision");
-        Number(out, ':', entry.position.revision);
-        Protocol::AppendBulk(out, "schema_version");
-        Number(out, ':', entry.schema_version);
-        Protocol::AppendBulk(out, "dims");
-        Number(out, ':', entry.dims);
-        Protocol::AppendBulk(out, "columns");
-        Protocol::AppendColumns(out, entry.columns);
-        Protocol::AppendBulk(out, "chunk_columns");
-        Protocol::AppendColumns(out, entry.chunk_columns);
+        AppendSchema(out, entry, 0U);
         return out;
     }
     if (entry.kind == FeedEntry::Kind::kProgress) {

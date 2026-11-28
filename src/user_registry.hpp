@@ -192,16 +192,15 @@ class UserRegistry {
     std::vector<std::weak_ptr<const std::function<void()>>> listeners_;
 };
 
-// Whether one logged-in user still has READ on one table, and ADMIN on `*`
-// when the watch needs it, for a watch that outlives the statement that
-// checked it. While the users are unchanged a
+// Whether one logged-in user still has the rights for a table, replication,
+// or catalog watch. While the users are unchanged a
 // check is one atomic load and compare; after a change it looks up that
 // user and table in the published rights view, without the registry lock.
 // A lost right or user stays lost. One thread checks.
 class ReadRightCheck {
   public:
     enum class State : std::uint8_t { kHeld, kNoRight, kNoUser };
-    // `generation` is the registry generation at which READ was confirmed.
+    // `generation` is the registry generation at which the right was confirmed.
     ReadRightCheck(std::shared_ptr<const UserRegistry> users, std::string user, std::uint64_t incarnation,
         std::string table, std::uint64_t generation) noexcept
         : users_(std::move(users)), user_(std::move(user)), table_(std::move(table)),
@@ -219,6 +218,8 @@ class ReadRightCheck {
     // MANAGES USERS too when `manages_users`. The table is empty.
     void RequireCatalog(bool manages_users) noexcept { catalog_ = true; catalog_users_ = manages_users; }
     [[nodiscard]] bool catalog() const noexcept { return catalog_; }
+    void RequireReplication() noexcept { replication_ = true; }
+    [[nodiscard]] bool replication() const noexcept { return replication_; }
 
   private:
     State Recheck(std::uint64_t generation);
@@ -231,6 +232,7 @@ class ReadRightCheck {
     bool every_table_admin_ = false;
     bool catalog_ = false;
     bool catalog_users_ = false;
+    bool replication_ = false;
 };
 
 }  // namespace chunkdb

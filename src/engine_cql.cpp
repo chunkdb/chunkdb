@@ -1720,12 +1720,16 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendInteger(reply, session.catalog_watch->revision());
                         return reply;
                     }
-                    RequireRight(session, watch.table, Right::kRead);
+                    if (watch.replication) {
+                        if (!HasServerRight(session, ServerRight::kReplication))
+                            throw PermissionDeniedError("REPLICATION on *");
+                    } else RequireRight(session, watch.table, Right::kRead);
                     // The feed ends the watch once the right or user is gone,
-                    // checking from the generation READ was confirmed at. Set
+                    // checking from the generation the right was confirmed at. Set
                     // before subscribing: no watch exists without its check.
                     session.watch_right = config_.require_auth ? std::make_shared<ReadRightCheck>(config_.users,
                         session.user, session.user_incarnation, watch.table, session.user_generation) : nullptr;
+                    if (session.watch_right && watch.replication) session.watch_right->RequireReplication();
                     auto table = catalog_->Require(watch.table);
                     const auto filters = SlotFilters(table, watch);
                     FeedOptions options{
@@ -1738,6 +1742,7 @@ std::string CommandEngine::ExecuteStatement(
                         .progress_interval = session.watch_options.progress_interval,
                         .ack_timeout_ms = watch.ack_timeout_ms,
                         .notify = session.watch_options.notify,
+                        .replication = watch.replication,
                     };
                     if (watch.slot) {
                         const auto* user = config_.require_auth ? CurrentUser(session) : nullptr;

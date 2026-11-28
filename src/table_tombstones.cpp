@@ -1,6 +1,8 @@
 #include "chunkdb/table_catalog.hpp"
 
+#include <algorithm>
 #include "chunk_coordinate_index.hpp"
+#include "change_feed.hpp"
 #include "chunk_store_internal.hpp"
 #include "statement_control.hpp"
 #include "chunkdb/file_layout.hpp"
@@ -107,6 +109,8 @@ std::uint64_t TableCatalog::CompactTombstones(std::string_view name, std::uint64
             std::unique_lock publication(store->checkpoint_publish_mutex_);
             ChunkStore::SnapshotGenerationWriteGuard snapshot(store.get());
             store->coordinate_index_->Compact(before, *completed);
+            if (store->replication_checkpoint_feed_)
+                store->replication_checkpoint_feed_->RecordCompaction(*store, std::min(before - 1U, *completed) + 1U);
             snapshot.Finish();
         }
         store.reset();

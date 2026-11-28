@@ -73,13 +73,14 @@ Before authentication HELLO takes at most 12 parameters; a HELLO with more recei
 
 `client_name` and `statement_timeout_ms` apply; `default_tag` is stored with `reason=implementation_pending`.
 The effective statement timeout appears in `options`, including the server default when HELLO omits it.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, `read_only_transactions`, `returning`, and `watch_catalog`.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, `read_only_transactions`, `returning`, `watch_catalog`, and `replication_watch`.
 Options become visible only after authentication succeeds.
 The `returning` feature permits [RETURNING](#returning) on SET BLOCK and DELETE BLOCK; `limits.max_returning_rows` bounds its rows and `limits.max_expression_nodes` each expression.
 The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
 The `area_scale` feature permits GET AREA SCALE and its downsampled forms.
 The `read_only_transactions` feature permits BEGIN READ ONLY and SCAN CHUNKS inside it.
 The `watch_catalog` feature permits WATCH CATALOG and its `catalog` events.
+The `replication_watch` feature permits WATCH table REPLICATION and its single-table replication stream.
 A chunk too large for an empty page ends the page before it and is then refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=... required=... limit=...`; see [chunks](reference/CHUNKS.md#limits).
 The configured positive area bounds appear as both `max_area_chunks`/`max_response_bytes` and `limits.max_area_chunks`/`limits.max_area_response_bytes`.
 `limits.txn_max_written_chunks` and `limits.txn_max_read_chunks` are the configured transaction chunk-count bounds.
@@ -255,13 +256,15 @@ The following list notation describes push elements, rather than literal wire by
 - `[schema, {epoch, revision, schema_version, dims, columns, chunk_columns}]`, using DESCRIBE column maps.
 - `[resync, epoch, revision, parent_epoch, fork_revision]`, requesting consumer state reconstruction.
 - `[progress, epoch, revision]`, marking a sender-drained cut during idle or filtered periods.
-- `[catalog, epoch, revision, commit_time_ms, user, events, txn]`, from WATCH CATALOG, with a catalog epoch and revision; each event is a map of `kind`, `action`, `name`, `table` and `data`, see [WATCH CATALOG](reference/FEED.md#watch-catalog).
+- `[catalog, epoch, revision, commit_time_ms, user, events, txn, whole]`, from WATCH CATALOG. Each event is a map of `kind`, `action`, `name`, `table` and `data`. `whole` is a boolean set on whole-catalog pushes. See [WATCH CATALOG](reference/FEED.md#watch-catalog).
+- `[replication, epoch, revision, commit_time_ms, user, schema_version, chunks, tag, txn, txn_tables]`, from WATCH table REPLICATION, with null `tag`, `txn` and `txn_tables`. Each chunk is `[cx, cy(, cz), version, kind, data]`. `kind` is `form` for a complete chunk form or null, or `rows` for `[blocks, chunk_row]`. Row values are bulk strings in parameter encoding or null.
+- Replication watches extend `schema` with `checks` and `step` and receive `[collect, epoch, revision, chunks]` and `[compact, epoch, revision, before]`. See [WATCH REPLICATION](reference/FEED.md#watch-replication) for their fields and resume rules.
 
 Current change frames reserve `tag=null` and `txn=null`; a schema map gives the table's `dims`, the watched block columns, and all chunk columns of its `schema_version`.
 Resync lineage fields are null when no parent lineage is recorded.
 
-Rows are in schema order and use the reply types above; null denotes absent rows or NULL values and an anonymous user.
-Coordinates beyond int64 absolute range are represented as `[chunk_coordinate, local_block_offset]` on that axis.
+Rows are in schema order. Ordinary change row values use the reply types above. Null denotes absent rows or NULL values and an anonymous user.
+In ordinary changes, coordinates beyond int64 absolute range are represented as `[chunk_coordinate, local_block_offset]` on that axis.
 One transaction forms one change; AREA clips it by inclusive chunk coordinates.
 Revisions have gaps and define order; timestamps do not.
 AFTER can resume at a progress revision within the retained prefix, including a gap without a change frame.

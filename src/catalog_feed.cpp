@@ -31,8 +31,8 @@ namespace {
 CatalogFeed::CatalogFeed(Reader reader, std::size_t buffer_bytes)
     : reader_(std::move(reader)), buffer_bytes_(buffer_bytes), epoch_(NewStoreId()) {}
 
-std::string CatalogFeed::Push(std::uint64_t revision, std::string_view user, const std::vector<Event>& events) const {
-    std::string out = ">7\r\n";
+std::string CatalogFeed::Push(std::uint64_t revision, std::string_view user, const std::vector<Event>& events, bool whole) const {
+    std::string out = ">8\r\n";
     Protocol::AppendBulk(out, "catalog");
     Protocol::AppendBulk(out, StoreIdHex(epoch_));
     Protocol::AppendInteger(out, revision);
@@ -57,6 +57,7 @@ std::string CatalogFeed::Push(std::uint64_t revision, std::string_view user, con
     }
     // Catalog changes belong to no transaction.
     Protocol::AppendNull(out);
+    Protocol::AppendBoolean(out, whole);
     return out;
 }
 
@@ -67,8 +68,8 @@ std::shared_ptr<const std::string> CatalogFeed::Whole(bool users) {
             full.push_back(Event{.key = &key, .action = "create", .data = &value.full});
             if (value.limited) limited.push_back(Event{.key = &key, .action = "create", .data = &*value.limited});
         }
-        whole_full_ = std::make_shared<const std::string>(Push(revision_, {}, full));
-        whole_limited_ = std::make_shared<const std::string>(Push(revision_, {}, limited));
+        whole_full_ = std::make_shared<const std::string>(Push(revision_, {}, full, true));
+        whole_limited_ = std::make_shared<const std::string>(Push(revision_, {}, limited, true));
         whole_revision_ = revision_;
     }
     return users ? whole_full_ : whole_limited_;

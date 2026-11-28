@@ -424,6 +424,10 @@ ReadRightCheck::State ReadRightCheck::Recheck(std::uint64_t generation) {
     const auto rights = users_->Rights();
     const auto found = rights->users.find(user_);
     if (found == rights->users.end() || found->second.incarnation != incarnation_) state_ = State::kNoUser;
+    else if (replication_) {
+        if ((found->second.server_rights & static_cast<std::uint8_t>(ServerRight::kReplication)) == 0U)
+            state_ = State::kNoRight;
+    }
     else if (catalog_) {
         const auto& user = found->second;
         const auto every = user.grants.find(kEveryTable);

@@ -102,7 +102,8 @@ class CatalogFeed : public std::enable_shared_from_this<CatalogFeed> {
         // Null for a drop.
         const std::string* data = nullptr;
     };
-    [[nodiscard]] std::string Push(std::uint64_t revision, std::string_view user, const std::vector<Event>& events) const;
+    [[nodiscard]] std::string Push(std::uint64_t revision, std::string_view user, const std::vector<Event>& events,
+        bool whole = false) const;
     // The whole catalog at revision_; cached until the next push. Under mutex_.
     [[nodiscard]] std::shared_ptr<const std::string> Whole(bool users);
     // Drops the published records and the history; under mutex_.

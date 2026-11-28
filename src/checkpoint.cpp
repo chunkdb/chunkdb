@@ -27,6 +27,7 @@
 #include "wal_stream_pool.hpp"
 #include "wal_writer.hpp"
 #include "chunk_coordinate_index.hpp"
+#include "change_feed.hpp"
 #include "statement_control.hpp"
 
 #ifdef _WIN32
@@ -283,9 +284,11 @@ bool ChunkStore::CheckpointChunk(
         if (!chunk_populated) {
             if (chunk->version != 0U) {
                 if (std::filesystem::exists(wal_path)) SyncFilePath(wal_path);
-                coordinate_index_->PublishTombstone({.kind = ChunkIndexKind::kDeleted, .coord = chunk_coord,
+                const ChunkIndexRecord record{.kind = ChunkIndexKind::kDeleted, .coord = chunk_coord,
                     .revision = chunk->version, .commit_time_ms = chunk->commit_time_ms,
-                    .schema_version = geometry_.chunk_schema().version});
+                    .schema_version = geometry_.chunk_schema().version};
+                if (coordinate_index_->PublishTombstone(record) && replication_checkpoint_feed_)
+                    replication_checkpoint_feed_->RecordCollection(*this, record);
                 // The tombstone is durable; the image and WAL still hold the same empty state.
                 if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_EMPTY_GC_AFTER_TOMBSTONE_ONCE")) ExitAbruptly(86);
             }

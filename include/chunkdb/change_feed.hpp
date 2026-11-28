@@ -56,6 +56,7 @@ struct FeedOptions {
     // Publication/control wake notification: must not block, throw or re-enter.
     // Runs on the sender or exclusive table control, never ordinary writers.
     std::function<void()> notify{};
+    bool replication = false;
 };
 
 struct FeedBlockChange {
@@ -86,7 +87,7 @@ struct FeedChunkChange {
 };
 
 struct FeedEntry {
-    enum class Kind { kChange, kChunks, kSchema, kResync, kProgress, kEnd };
+    enum class Kind { kChange, kChunks, kSchema, kResync, kProgress, kEnd, kReplication, kCollect, kCompact };
     Kind kind = Kind::kChange;
     FeedPosition position;
     std::uint64_t commit_time_ms = 0;
@@ -138,6 +139,7 @@ class FeedSubscription {
     bool chunks_ = false;
     // A slot watch's live reader, which projects each entry itself.
     bool slot_ = false;
+    bool replication_ = false;
     std::uint64_t reset_ = 0;
     bool invalid_ = false;
     bool ended_ = false;

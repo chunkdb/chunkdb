@@ -442,10 +442,12 @@ void TestServerRights() {
     ExpectError(server.Run(mon, "RESTORE TABLE world FROM 'b1' AS world_other"),
                 "PERMISSION_DENIED BACKUP, MANAGES USERS or ADMIN on *");
 
-    // REPLICATION is kept and shown; no statement needs it yet.
+    // REPLICATION allows the mirror feed without READ on the table.
     ExpectError(server.Run(rep, "SHOW METRICS"), "PERMISSION_DENIED");
     ExpectError(server.Run(rep, "BACKUP TO 'b2'"), "PERMISSION_DENIED");
     ExpectError(server.Run(rep, "GET BLOCK 0 0 FROM world"), "NO_TABLE");
+    assert(server.Run(rep, "WATCH world REPLICATION").starts_with("%2\r\n"));
+    assert(rep.watch_right && rep.watch_right->Check() == chunkdb::ReadRightCheck::State::kHeld);
     const auto users = server.Run(admin, "SHOW USERS");
     assert(Contains(users, "$13\r\nserver_rights\r\n*1\r\n$7\r\nMONITOR\r\n"));
     assert(Contains(users, "$13\r\nserver_rights\r\n*1\r\n$6\r\nBACKUP\r\n"));
@@ -461,6 +463,8 @@ void TestServerRights() {
     ExpectError(server.Run(mon, "SHOW TABLE STATS world"), "NO_TABLE");
     ExpectReply(server.Run(mon, "SHOW SLOTS"), "*0\r\n");
     assert(chunkdb::ReadUsersFile(server.dir.path())->users.at("mon").server_rights == 0U);
+    ExpectReply(server.Run(admin, "REVOKE REPLICATION ON * FROM rep"), "+OK\r\n");
+    assert(rep.watch_right->Check() == chunkdb::ReadRightCheck::State::kNoRight);
 }
 
 // GRANT ... ON prefix*: every table whose name starts with the prefix, also

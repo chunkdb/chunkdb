@@ -1512,6 +1512,9 @@ class Parser {
                 if (Accept("slot")) {
                     if (watch.slot) Fail(column, "SLOT is given twice");
                     watch.slot = SlotName();
+                } else if (Accept("replication")) {
+                    if (watch.replication) Fail(column, "REPLICATION is given twice");
+                    watch.replication = true;
                 } else if (FeedFilter(watch)) {
                 } else if (Accept("takeover")) {
                     if (watch.takeover) Fail(column, "TAKEOVER is given twice");
@@ -1539,6 +1542,9 @@ class Parser {
                     watch.after = position;
                 } else break;
             }
+            if (watch.replication && (watch.slot || !watch.areas.empty() || watch.columns || watch.no_before ||
+                    watch.chunks || watch.takeover || watch.ack_timeout_ms))
+                Fail(1, "WATCH REPLICATION takes only AFTER");
             if (watch.ack_timeout_ms && !watch.slot) Fail(1, "ACK TIMEOUT requires SLOT");
             if (watch.takeover && !watch.slot) Fail(1, "TAKEOVER requires SLOT");
             return watch;

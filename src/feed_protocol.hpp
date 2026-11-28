@@ -32,6 +32,17 @@ std::shared_ptr<const FeedEntry> FilterFeedEntry(const std::shared_ptr<const Fee
     std::span<const FeedArea> areas, const std::optional<std::vector<std::uint32_t>>& ids,
     bool no_before, const std::vector<Column>& columns);
 std::string EncodeFeedEntry(const FeedEntry& entry);
+std::string BeginReplicationCommit(const FeedEntry& entry, std::size_t chunks);
+void AppendReplicationForm(std::string& out, const FeedEntry& entry, ChunkCoord coord,
+    std::optional<std::string_view> form);
+void AppendReplicationBlock(std::string& out, const FeedEntry& entry, ChunkCoord coord,
+    std::int64_t x, std::int64_t y, std::int64_t z,
+    const std::optional<std::vector<ColumnValue>>& after,
+    const std::optional<std::vector<ColumnValue>>& chunk_row);
+std::string EncodeReplicationSchema(const FeedEntry& entry, const TableSchema& blocks, const TableSchema& chunks);
+std::string EncodeReplicationCollect(const FeedEntry& entry, ChunkCoord coord, std::uint64_t version,
+    std::uint64_t commit_time_ms);
+std::string EncodeReplicationCompact(FeedPosition position, std::uint64_t before);
 std::size_t FeedEntryRetainedBytes(const FeedEntry& entry);
 std::size_t FeedRowRetainedBytes(const std::optional<std::vector<ColumnValue>>& row);
 // Lower bounds of the bytes EncodeFeedEntry writes for one row, for one block or chunk change, and for one chunk

@@ -130,7 +130,8 @@ class ChunkCoordinateIndex {
     [[nodiscard]] std::uint64_t inventory_generation() const noexcept { return inventory_generation_.load(std::memory_order_acquire); }
     [[nodiscard]] std::uint64_t tombstone_count() const;
     [[nodiscard]] std::uint64_t populated_count() const;
-    void PublishTombstone(const ChunkIndexRecord& record);
+    // True if this call installed a new deletion boundary.
+    bool PublishTombstone(const ChunkIndexRecord& record);
     void Compact(std::uint64_t before, std::uint64_t completed_frontier);
 
   private:

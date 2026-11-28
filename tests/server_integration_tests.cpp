@@ -7025,9 +7025,33 @@ void TestWatchPositionsAndRights() {
     RawClient multi("127.0.0.1", harness.port); multi.SetReadDeadline(std::chrono::seconds(15)); multi.Login();
     multi.SendLine("WATCH default"); assert(multi.ReadLine().rfind("-ERR INVALID_ARGUMENT", 0) == 0);
 }
+void TestWatchReplication() {
+    auto config = AuthenticatedFeedServerConfig();
+    config.feed_progress_ms = 60000U;
+    ServerHarness harness("watch-replication", BaseStoreConfig(), chunkdb::EngineConfig{}, config);
+    RawClient admin("127.0.0.1", harness.port); admin.SetReadDeadline(std::chrono::seconds(15)); admin.Login();
+    const std::array<std::uint8_t, 16> salt{};
+    const auto verifier = chunkdb::scram::FormatVerifier(chunkdb::test::PrepareLoginVerifier("pw", salt, chunkdb::scram::kMinIterations));
+    admin.SendLine("CREATE USER mirror VERIFIER '" + verifier + "'"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("GRANT READ ON default TO mirror"); assert(admin.ReadLine() == "+OK\r\n");
+    RawClient mirror("127.0.0.1", harness.port); mirror.SetReadDeadline(std::chrono::seconds(15)); mirror.Login("mirror", "pw");
+    mirror.SendLine("WATCH default REPLICATION"); assert(mirror.ReadLine().starts_with("-ERR PERMISSION_DENIED"));
+    admin.SendLine("REVOKE READ ON default FROM mirror"); assert(admin.ReadLine() == "+OK\r\n");
+    admin.SendLine("GRANT REPLICATION ON * TO mirror"); assert(admin.ReadLine() == "+OK\r\n");
+    mirror.SendLine("WATCH default REPLICATION"); assert(!FeedStart(ReadFeedReply(mirror)).empty());
+    admin.SendLine("SET BLOCK 0 0 IN default bits = b'1000'");
+    const auto revision = ReadVersion(admin);
+    const auto push = ReadFeedReply(mirror);
+    assert(push.type == '>' && push.items.size() == 10U && push.items[0].value == "replication");
+    assert(push.items[2].value == std::to_string(revision) && push.items[9].type == '_');
+    admin.SendLine("REVOKE REPLICATION ON * FROM mirror"); assert(admin.ReadLine() == "+OK\r\n");
+    assert(mirror.ReadLine().starts_with("-ERR PERMISSION_DENIED reason=permission_denied REPLICATION on *"));
+    assert(mirror.WaitForClose(std::chrono::seconds(5)));
+}
+
 // The event of a catalog push for `kind` and `name`, or null.
 const FeedReply* CatalogEvent(const FeedReply& push, std::string_view kind, std::string_view name) {
-    assert(push.type == '>' && push.items.size() == 7U && push.items[0].value == "catalog");
+    assert(push.type == '>' && push.items.size() == 8U && push.items[0].value == "catalog");
     assert(push.items[3].type == ':' && push.items[5].type == '*' && push.items[6].type == '_');
     for (const auto& event : push.items[5].items)
         if (FeedMap(event, "kind").value == kind && FeedMap(event, "name").value == name) return &event;
@@ -7112,6 +7136,7 @@ void TestWatchCatalog() {
     const auto epoch = FeedStart(start).substr(0, 32U);
     const auto whole = ReadFeedReply(full);
     assert(whole.items[1].value == epoch && whole.items[4].type == '_');
+    assert(whole.items[7].type == '#' && whole.items[7].value == "t");
     const auto* table = CatalogEvent(whole, "table", "default");
     assert(table != nullptr && FeedMap(*table, "action").value == "create" && FeedMap(*table, "table").type == '_');
     assert(CatalogEvent(whole, "user", kAdminUser) != nullptr && CatalogEvent(whole, "user", "mon") != nullptr);
@@ -7124,6 +7149,7 @@ void TestWatchCatalog() {
     admin.SendLine("CREATE TABLE cat_t (n u8) CHUNK 4 x 4"); assert(admin.ReadLine() == "+OK\r\n");
     const auto created = ReadFeedReply(full);
     assert(created.items[1].value == epoch && created.items[4].value == kAdminUser);
+    assert(created.items[7].type == '#' && created.items[7].value == "f");
     const auto created_revision = std::stoull(created.items[2].value);
     table = CatalogEvent(created, "table", "cat_t");
     assert(table != nullptr && FeedMap(*table, "action").value == "create");
@@ -8189,6 +8215,7 @@ void TestFeedWatch() {
     run("TestWatchNoIdle<RawClient>(false)", [] { TestWatchNoIdle<RawClient>(false); });
     run("TestWatchPositionsAndRights()", [] { TestWatchPositionsAndRights(); });
     run("TestWatchCatalog()", [] { TestWatchCatalog(); });
+    run("TestWatchReplication()", [] { TestWatchReplication(); });
     run("TestWatchCatalogRights()", [] { TestWatchCatalogRights(); });
     run("TestWatchSlowReader<RawClient>(false)", [] { TestWatchSlowReader<RawClient>(false); });
 #ifdef CHUNKDB_WITH_OPENSSL

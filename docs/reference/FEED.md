@@ -93,6 +93,7 @@ CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a
 DROP SLOT [IF EXISTS] 'name' ON table
 SHOW SLOTS [ON table] [PREFIX 'name']
 WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1 [, AREA cx0 cy0 TO cx1 cy1 ...]] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [AFTER epoch revision] [ACK TIMEOUT ms] [TAKEOVER]
+WATCH table REPLICATION [AFTER epoch revision]
 WATCH CATALOG
 ACK revision
 UNWATCH
@@ -185,6 +186,40 @@ Applying a merged push gives the same table state as applying each change, and i
 A merged push stays within the watch's share and never spans a schema event; a watch that keeps up receives one push per change.
 For a slot, ACK of the merged revision acknowledges every merged change; after a reconnect from an earlier ACK, the slot sends those changes again.
 
+## WATCH REPLICATION
+
+`WATCH t REPLICATION [AFTER epoch revision]` streams one table in commit order with the bytes and identities needed by a mirror.
+The watch requires REPLICATION on `*`, independent of table rights. Revoking REPLICATION ends the watch.
+HELLO advertises `replication_watch`. The only option is AFTER. Replication uses live history and the configured watch linger interval.
+
+The reply is `{epoch, revision}`. AFTER resumes after a retained position. AFTER at revision 0 in the same epoch also works when capture started before the table's first commit or schema change, including tables created above revision 0.
+Start the watch before BACKUP to retain the live history around its cut. Resume the seeded mirror with that epoch and cut.
+A position outside retained replication history produces `resync`. Rebuild the mirror from a new copy.
+Starting a new replication capture on an existing table establishes a fresh cut, including when ordinary watches kept their own history.
+
+| Push | Payload |
+| --- | --- |
+| `[replication, epoch, revision, commit_time_ms, user, schema_version, chunks, tag, txn, txn_tables]` | Every commit that took a revision, including one with no value changes. `tag`, `txn` and `txn_tables` are null for these single-table commits. |
+| `[schema, map]` | The ordinary schema map plus `checks` and `step`, before commits at that schema version. |
+| `[collect, epoch, revision, chunks]` | The empty chunk boundary recorded by checkpoint collection. Each item is `[cx, cy, version, commit_time_ms]` in 2D and `[cx, cy, cz, version, commit_time_ms]` in 3D. |
+| `[compact, epoch, revision, before]` | Tombstone compaction's effective exclusive version bound. |
+| `[progress, epoch, revision]` and `[resync, epoch, revision, parent_epoch, fork_revision]` | Standard WATCH progress and resync. |
+
+Each commit chunk is `[cx, cy, version, kind, data]` in 2D and `[cx, cy, cz, version, kind, data]` in 3D. Its version equals the commit revision.
+`form` carries the complete GET CHUNK form for writes captured with a whole-chunk preimage, including transactions. A null form means the write left the chunk empty.
+`rows` carries `[blocks, chunk_row]` for writes captured with a one-row preimage. Each block is `[x, y, after]` or `[x, y, z, after]`, with signed absolute coordinates and a full row or null on deletion.
+`chunk_row` is the full chunk-column row on change, including initialization, or null when unchanged.
+Each value in a row is a bulk string in [parameter encoding](../PROTOCOL.md#parameters), or RESP3 null. Rows follow schema order.
+
+`checks` lists the current check names and expressions. `step` is the array of changes that produced this version, in history order within each column domain.
+Column changes carry `kind`, `column_id` and `default`. The default uses parameter bytes when present and null otherwise. `retype` also carries `conversion` (`exact`, `clamp`, `default` or `truncate`).
+Kinds are `add`, `drop`, `rename`, `retype`, `attributes`, `add_check`, `drop_check`, and the chunk-column forms of column changes prefixed with `chunk_`.
+Check changes carry `kind` and a `check` map with `name` and `expression`.
+
+Collection and compaction have their own ordered feed revisions. The collected chunk's `version` and `commit_time_ms` remain those of the write that emptied it.
+Collection is visible when the durable deletion boundary is published. The `compact` bound is clamped to at most one past the completed revision sampled for the compaction.
+Replication commit pushes are delivered individually. Ring retention and connection output share the table's watch limits, so a watch that exceeds its available history or output budget may receive `resync`.
+
 ## WATCH CATALOG
 
 WATCH CATALOG streams changes to tables, columns, users, grants and slots.
@@ -192,7 +227,8 @@ It needs MONITOR or ADMIN on `*`; users, grants and slot owners appear only with
 The reply is `{epoch, revision}`: the catalog epoch identifies the server process, and the catalog revision orders catalog events within it.
 The first event holds the whole catalog: one `create` for each table, user and slot, at the revision of that event; each read of the whole catalog takes a new revision, so one revision names one catalog state.
 Each later event carries what a statement changed, with the next catalog revision; it can also carry changes of statements that ended at the same time, and a change the watch cannot see leaves a gap.
-An event is `[catalog, epoch, revision, commit_time_ms, user, events, txn]`, with `txn` null; `user` names the user whose statement sent the event, and is null in the whole-catalog event and for watches without MANAGES USERS.
+An event is `[catalog, epoch, revision, commit_time_ms, user, events, txn, whole]`, with `txn` null and `whole` true for the whole-catalog event only.
+`user` names the user whose statement sent the event, and is null in the whole-catalog event and for watches without MANAGES USERS.
 Each entry of `events` is a map of `kind` (`table`, `user` or `slot`), `action` (`create`, `alter` or `drop`), `name`, `table` (the table of a slot, null otherwise) and `data`, the object after the change, null for `drop`.
 A table's `data` is its DESCRIBE map without `revision`, so columns, CHECK constraints and options changes appear as `alter`.
 A user's `data` is its SHOW USERS map, so GRANT and REVOKE appear as `alter` of the user; a table rename or drop also changes the users whose grants follow it.

@@ -41,6 +41,7 @@
 
 namespace chunkdb {
 
+class ChangeFeed;
 class SnapshotGenerationMapping;
 class ChunkCoordinateIndex;
 struct ChunkCoordinateNode;
@@ -1454,6 +1455,9 @@ class ChunkStore {
     // unsynced artifacts before the drain or sees the durability floor the
     // barrier sets with it and publishes durably.
     mutable std::mutex checkpoint_publish_mutex_;
+    // Checkpoints can run while table admission and its regular feed are paused.
+    // Protected by checkpoint_publish_mutex_; kept while the sender is paused.
+    std::shared_ptr<ChangeFeed> replication_checkpoint_feed_{};
 
     // Files/directories written without an fsync in relaxed paths. The WAL
     // barrier drains this set. Above unsynced_limit_ entries the files of

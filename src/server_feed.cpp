@@ -290,6 +290,7 @@ bool FeedIo::Permitted(Watch& watch) {
     watch.output.clear(); watch.bytes = 0U; watch.excess_frames = 0U;
     Queue(watch, std::make_shared<const std::string>(
         right->catalog() ? CommandEngine::LostCatalogWatchReply(state == ReadRightCheck::State::kNoUser)
+            : right->replication() ? CommandEngine::LostReplicationWatchReply(state == ReadRightCheck::State::kNoUser)
             : CommandEngine::LostWatchReply(state == ReadRightCheck::State::kNoUser, right->table())));
     watch.close = true;
     watch.close_immediate = true; // One best-effort nonblocking terminal write, then close.
@@ -382,7 +383,9 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
             if (frame->size() <= share && watch.bytes <= share - frame->size()) Queue(watch, std::move(frame));
             return;
         }
-        if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks)
+        if (entry->kind == FeedEntry::Kind::kChange || entry->kind == FeedEntry::Kind::kChunks ||
+            entry->kind == FeedEntry::Kind::kReplication || entry->kind == FeedEntry::Kind::kCollect ||
+            entry->kind == FeedEntry::Kind::kCompact)
             watch.next_progress = std::chrono::steady_clock::now() + std::chrono::milliseconds(server_.config_.feed_progress_ms);
         if (entry->kind == FeedEntry::Kind::kResync) watch.merge.Clear(); // It replaces the merged pushes.
         else if (entry->kind == FeedEntry::Kind::kChunks) {

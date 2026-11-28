@@ -12,6 +12,7 @@
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "chunk_store_internal.hpp"
+#include "populated_index_format.hpp"
 #include "wal_replay.hpp"
 #include "feed_protocol.hpp"
 #include "typed_chunk_form.hpp"
@@ -29,6 +30,17 @@ std::size_t BlockValuesBytes(const Change& block) {
 }
 std::size_t EntryBytes(const FeedEntry& entry) {
     return FeedEntryRetainedBytes(entry);
+}
+
+std::shared_ptr<const FeedEntry> ReplicationEntry(const FeedEntry& source, FeedEntry::Kind kind, std::string frame) {
+    auto entry = std::make_shared<FeedEntry>();
+    entry->kind = kind;
+    entry->position = source.position;
+    entry->dims = source.dims;
+    entry->schema_version = source.schema_version;
+    entry->commit_time_ms = source.commit_time_ms;
+    entry->protocol_frame = std::make_shared<const std::string>(std::move(frame));
+    return entry;
 }
 
 bool SameValues(const std::optional<std::vector<ColumnValue>>& a,
@@ -240,6 +252,9 @@ bool ChangeFeed::ReserveCapture(std::size_t bytes) noexcept {
     // for every reader. Evict the oldest entries as Append does, so only
     // readers below the new floor resync.
     std::lock_guard lock(mutex_);
+    return ReserveWithEviction(bytes);
+}
+bool ChangeFeed::ReserveWithEviction(std::size_t bytes) noexcept {
     bool reserved = Reserve(bytes);
     bool evicted = false;
     while (!reserved && !ring_.empty()) {
@@ -317,27 +332,45 @@ void ChangeFeed::ResumeImpl(ChunkStore& store) {
         producers_ = store.write_producers_;
     }
     const auto clock = store.version_clock_.load(std::memory_order_seq_cst);
+    // Exclusive control stopped writers and drained the old sender. Any
+    // checkpoint that ran while paused precedes this reopen's schema step.
+    if (lost_until_.load(std::memory_order_seq_cst) == 0U) DrainMaintenance(clock - 1U);
     ceiling_ = store.version_clock_ceiling_.load(std::memory_order_acquire);
     if (!geometry_) {
-        floor_ = clock - 1U;
+        floor_ = capturing_replication() ? replication_floor_ : clock - 1U;
         watermark_ = floor_;
         drained_watermark_ = floor_;
         lineage_ = store.lineage();
     } else if (geometry_->layout().schema().version != store.geometry().layout().schema().version) {
-        auto schema = std::make_shared<FeedEntry>();
-        schema->kind = FeedEntry::Kind::kSchema;
-        schema->position = {epoch_, clock};
-        schema->schema_version = store.geometry().layout().schema().version;
-        schema->columns = store.geometry().layout().schema().columns;
-        schema->chunk_columns = store.geometry().chunk_schema().columns;
-        schema->dims = store.geometry().dims();
-        schema->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*schema));
-        const auto bytes = EntryBytes(*schema);
-        // Reserve its revision before serving any lease of the reopened store.
-        const auto revision = store.NextChunkVersion();
-        if (revision != clock) throw std::logic_error("reopened feed clock changed without a lease");
-        Append(std::move(schema), bytes);
-        watermark_ = revision;
+        const auto& blocks = store.geometry().layout().schema();
+        const auto& chunks = store.geometry().chunk_schema();
+        const bool replicate = capturing_replication();
+        if (replicate && blocks.version < geometry_->layout().schema().version)
+            throw std::logic_error("replication feed schema version went backwards");
+        const auto first = replicate ? geometry_->layout().schema().version + 1U : blocks.version;
+        for (auto version = first; version <= blocks.version; ++version) {
+            const bool current = version == blocks.version;
+            const auto historical_blocks = current ? std::optional<TableSchema>{} : SchemaAtVersion(blocks, version);
+            const auto historical_chunks = current ? std::optional<TableSchema>{} : SchemaAtVersion(chunks, version);
+            const auto& block_schema = historical_blocks ? *historical_blocks : blocks;
+            const auto& chunk_schema = historical_chunks ? *historical_chunks : chunks;
+            auto schema = std::make_shared<FeedEntry>();
+            schema->kind = FeedEntry::Kind::kSchema;
+            // Reserve its revision before serving any lease of the reopened store.
+            schema->position = {epoch_, store.NextChunkVersion()};
+            schema->schema_version = version;
+            schema->columns = block_schema.columns;
+            schema->chunk_columns = chunk_schema.columns;
+            schema->dims = store.geometry().dims();
+            std::shared_ptr<const FeedEntry> replication;
+            if (replicate) replication = ReplicationEntry(*schema, FeedEntry::Kind::kSchema,
+                EncodeReplicationSchema(*schema, block_schema, chunk_schema));
+            if (current) schema->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*schema));
+            watermark_ = schema->position.revision;
+            const auto bytes = current ? EntryBytes(*schema) : EntryBytes(*replication);
+            std::shared_ptr<const FeedEntry> retained = current ? std::move(schema) : replication;
+            Append(std::move(retained), bytes, nullptr, true, std::move(replication));
+        }
     }
     geometry_ = store.geometry();
     features_ = store.features();
@@ -366,6 +399,9 @@ void ChangeFeed::ResizeBudget(std::size_t budget) {
     std::lock_guard lock(mutex_);
     if (clock_ != nullptr || sender_.joinable())
         throw std::logic_error("resizing a feed requires exclusive paused control");
+    // Checkpoints may have published after Pause. Include those entries in
+    // the cut that is trimmed to the new budget.
+    DrainMaintenance(std::numeric_limits<std::uint64_t>::max(), lost_until_.load(std::memory_order_seq_cst) != 0U);
     // Pause drained every producer; their idle capacity need not pin a larger
     // old budget. Keep retained entries that fit and preserve subscriptions.
     ClearProducerBuffers();
@@ -388,6 +424,7 @@ void ChangeFeed::End(const char* ended) {
     closed_ = true;
     if (ended != nullptr) ended_ = ended;
     ClearRing();
+    DrainMaintenance(std::numeric_limits<std::uint64_t>::max(), true);
     // End runs after the exclusive lease drained and the sender joined.
     ClearProducerBuffers();
     producers_.reset();
@@ -399,8 +436,14 @@ void ChangeFeed::ClearRing() {
     for (const auto& entry : ring_) Release(entry.bytes);
     ring_.clear();
 }
-void ChangeFeed::Append(std::shared_ptr<const FeedEntry> entry, std::size_t bytes, RawWrite* consumed, bool notify) {
+void ChangeFeed::Append(std::shared_ptr<const FeedEntry> entry, std::size_t bytes, RawWrite* consumed, bool notify,
+                        std::shared_ptr<const FeedEntry> replication) {
     // Sender/exclusive control only, with mutex_. Writers evict only through ReserveCapture.
+    if (replication && replication != entry) {
+        const auto extra = EntryBytes(*replication);
+        if (bytes <= budget() && extra <= budget() - bytes) bytes += extra;
+        else replication.reset();
+    }
     while (!Reserve(bytes)) {
         if (ring_.empty()) {
             if (consumed != nullptr && consumed->bytes != 0U) {
@@ -416,15 +459,105 @@ void ChangeFeed::Append(std::shared_ptr<const FeedEntry> entry, std::size_t byte
         ring_.pop_front();
     }
     try {
-        ring_.push_back({std::move(entry), bytes});
+        ring_.push_back({std::move(entry), bytes, std::move(replication)});
     } catch (const std::bad_alloc&) {
         Release(bytes);
         throw;
     }
     if (notify) { cv_.notify_all(); Notify(); }
 }
-std::shared_ptr<const FeedEntry> ChangeFeed::Decode(const RawWrite& write) const {
+
+void ChangeFeed::EnableReplication(ChunkStore& store) {
+    std::lock_guard lock(mutex_);
+    if (capturing_replication()) return;
+    replication_started_empty_ = !store.lineage() && store.geometry().layout().schema().version == 1U &&
+        !store.HasWrittenChunkIdentities() && store.RetainedDeletionFloor() == 0U;
+    // When capture was off, a checkpoint could collect at the last data
+    // revision. Only a new cut proves the consumer starts after that gap.
+    replication_floor_ = replication_started_empty_ ? store.version_clock_.load(std::memory_order_seq_cst) - 1U
+        : store.NextChunkVersion();
+    replication_capture_.store(true, std::memory_order_release);
+}
+
+void ChangeFeed::RecordCollection(ChunkStore& store, const ChunkIndexRecord& record) {
+    RecordMaintenance(store, &record, 0U);
+}
+
+void ChangeFeed::RecordCompaction(ChunkStore& store, std::uint64_t before) {
+    RecordMaintenance(store, nullptr, before);
+}
+
+void ChangeFeed::RecordMaintenance(ChunkStore& store, const ChunkIndexRecord* collected, std::uint64_t before) {
+    std::lock_guard lock(mutex_);
+    if (closed_ || error_) return;
+    // Assign a separate cursor so AFTER can distinguish a delivered write
+    // from the collection that follows it, even if the table goes idle.
+    // Holding mutex_ here orders enqueue with the sender's drain of this cut.
+    std::uint64_t revision;
+    const auto fail_cursor = [&] {
+        // The index decision already exists. A cursor failure must end this
+        // feed rather than let a mirror continue across the missing record.
+        error_ = std::current_exception();
+        cv_.notify_all();
+        Notify();
+    };
+    try {
+        revision = store.NextChunkVersion();
+    } catch (const std::runtime_error&) {
+        fail_cursor();
+        return;
+    } catch (const std::bad_alloc&) {
+        fail_cursor();
+        return;
+    }
+    try {
+        FeedEntry header;
+        header.position = {epoch_, revision};
+        header.dims = store.geometry().dims();
+        const auto entry = collected ? ReplicationEntry(header, FeedEntry::Kind::kCollect,
+            EncodeReplicationCollect(header, collected->coord, collected->revision, collected->commit_time_ms))
+            : ReplicationEntry(header, FeedEntry::Kind::kCompact, EncodeReplicationCompact(header.position, before));
+        const auto bytes = EntryBytes(*entry);
+        if (bytes > budget() || !ReserveWithEviction(bytes)) { Lost(revision); return; }
+        try {
+            maintenance_.push_back({entry, bytes, entry});
+        } catch (const std::bad_alloc&) {
+            Release(bytes);
+            throw;
+        }
+    } catch (const std::bad_alloc&) {
+        Lost(revision);
+        return;
+    }
+    Wake();
+}
+
+bool ChangeFeed::DrainMaintenance(std::uint64_t through, bool discard) {
+    bool drained = false;
+    while (!maintenance_.empty() && maintenance_.front().entry->position.revision <= through) {
+        auto event = std::move(maintenance_.front());
+        maintenance_.pop_front();
+        if (discard) { Release(event.bytes); continue; }
+        const auto revision = event.entry->position.revision;
+        const auto bytes = event.bytes;
+        if (!ring_.empty() && revision <= ring_.back().entry->position.revision) {
+            Release(bytes);
+            throw std::logic_error("feed maintenance revisions are out of order");
+        }
+        try {
+            ring_.push_back(std::move(event));
+            drained = true;
+        } catch (const std::bad_alloc&) {
+            Release(bytes);
+            Lost(revision);
+        }
+    }
+    return drained;
+}
+
+ChangeFeed::Decoded ChangeFeed::Decode(const RawWrite& write) const {
     auto entry = std::make_shared<FeedEntry>();
+    std::optional<std::string> replication;
     entry->position = {epoch_, write.revision};
     if (!write.user.empty()) entry->user = std::string(write.user.begin(), write.user.end());
     const auto& geometry = *geometry_;
@@ -474,7 +607,10 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Decode(const RawWrite& write) const
         }
         entry->schema_version = frame.schema_version;
         entry->commit_time_ms = frame.commit_time_ms;
+        if (f == 0U && capturing_replication()) replication = BeginReplicationCommit(*entry, write.used);
         const auto& layout = geometry.LayoutAt(frame.schema_version);
+        const std::optional<std::vector<ColumnValue>> unchanged_chunk_row;
+        const auto* replicated_chunk_row = &unchanged_chunk_row;
         if (!geometry.chunk_schema().columns.empty()) {
             FeedChunkChange change{.chunk = raw.coord, .before = {}, .after = {}};
             if (before.written) change.before = DecodeChunkColumns(geometry.chunk_schema(), before.chunk_columns->bytes);
@@ -482,28 +618,50 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Decode(const RawWrite& write) const
             if (!SameValues(change.before, change.after)) {
                 value_bytes += BlockValuesBytes(change);
                 entry->chunk_changes.push_back(std::move(change));
-                if (EntryBytes(*entry) > budget_) return nullptr;
+                if (replication && raw.block) replicated_chunk_row = &entry->chunk_changes.back().after;
+                if (EntryBytes(*entry) > budget_) return {};
             }
         }
-        if (entry->chunk_forms_complete) {
+        if (entry->chunk_forms_complete || (replication && !raw.block)) {
             const bool populated = ChunkPopulated(geometry, after.presence_bitmap, after.chunk_columns.get());
             const auto estimate = populated ? 256U + layout.fixed_columns().size() * 64U + after.presence_bitmap.size() +
                 after.payload.size() + after.vars.encoded_size() + (after.chunk_columns ? after.chunk_columns->bytes.size() : 0U) : 128U;
             const auto held = EntryBytes(*entry);
-            if (estimate > budget_ || held > budget_ - estimate) return nullptr;
+            if (replication && (estimate > budget() || replication->size() > budget() - estimate)) replication.reset();
+            if (entry->chunk_forms_complete && (estimate > budget() || held > budget() - estimate)) return {};
             FeedChunkForm chunk{raw.coord, frame.revision, {}};
-            if (populated) {
+            if (populated && (replication || entry->chunk_forms_complete)) {
                 const auto form = EncodeSectionedChunkState(geometry, after, kVarMaxChunkBytesLimit);
-                chunk.form = std::make_shared<const std::string>(form.begin(), form.end());
+                if (replication) AppendReplicationForm(*replication, *entry, raw.coord,
+                    std::string_view(reinterpret_cast<const char*>(form.data()), form.size()));
+                if (entry->chunk_forms_complete) chunk.form = std::make_shared<const std::string>(form.begin(), form.end());
+            } else if (replication) AppendReplicationForm(*replication, *entry, raw.coord, std::nullopt);
+            if (entry->chunk_forms_complete) {
+                const auto previous = std::find_if(entry->chunk_forms.begin(), entry->chunk_forms.end(), [&](const auto& item) { return item.chunk == raw.coord; });
+                if (previous == entry->chunk_forms.end()) entry->chunk_forms.push_back(std::move(chunk));
+                else *previous = std::move(chunk);
+                const auto used = EntryBytes(*entry);
+                if (used > budget_) return {};
+                value_bytes = used - base_bytes - entry->blocks.capacity() * sizeof(FeedBlockChange) -
+                    entry->chunk_changes.capacity() * sizeof(FeedChunkChange);
             }
-            const auto previous = std::find_if(entry->chunk_forms.begin(), entry->chunk_forms.end(), [&](const auto& item) { return item.chunk == raw.coord; });
-            if (previous == entry->chunk_forms.end()) entry->chunk_forms.push_back(std::move(chunk));
-            else *previous = std::move(chunk);
-            const auto used = EntryBytes(*entry);
-            if (used > budget_) return nullptr;
-            value_bytes = used - base_bytes - entry->blocks.capacity() * sizeof(FeedBlockChange) -
-                entry->chunk_changes.capacity() * sizeof(FeedChunkChange);
         }
+        std::optional<std::vector<ColumnValue>> replicated_after;
+        const bool replicated_block = replication && raw.block;
+        if (replicated_block) {
+            const auto b = *raw.block;
+            if ((after.presence_bitmap[b / 8U] & (1U << (b % 8U))) != 0U)
+                replicated_after = DecodeBlockColumns(layout, after.payload, after.vars, b, &value_scratch_);
+            const auto& config = geometry.config();
+            const auto width = config.chunk_width_blocks, height = config.chunk_height_blocks;
+            const auto x = BlockCoordinate(raw.coord.x, width, b % width);
+            const auto y = BlockCoordinate(raw.coord.y, height, (b / width) % height);
+            const auto z = geometry.dims() == 3U ? BlockCoordinate(raw.coord.z, config.chunk_depth_blocks,
+                b / (static_cast<std::size_t>(width) * height)) : std::optional<std::int64_t>(0);
+            if (!x || !y || !z) throw std::logic_error("a captured block write has no absolute coordinates");
+            AppendReplicationBlock(*replication, *entry, raw.coord, *x, *y, *z, replicated_after, *replicated_chunk_row);
+        }
+        if (replication && replication->size() > budget()) replication.reset();
         const bool same_vars = before.vars.Encode() == after.vars.Encode();
         // Full fixed-width chunks often repeat a row. Keep owned value vectors,
         // but decode that row only once; raw equality also preserves float bits.
@@ -553,7 +711,8 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Decode(const RawWrite& write) const
             std::optional<std::vector<ColumnValue>> values_after;
             if ((before.presence_bitmap[b / 8U] & (1U << (b % 8U))) != 0U)
                 values_before = values(before, b, before_memo, true);
-            if ((after.presence_bitmap[b / 8U] & (1U << (b % 8U))) != 0U)
+            if (replicated_block) values_after = std::move(replicated_after);
+            else if ((after.presence_bitmap[b / 8U] & (1U << (b % 8U))) != 0U)
                 values_after = values(after, b, after_memo, false);
             if (SameValues(values_before, values_after)) continue;
             const auto width = geometry.config().chunk_width_blocks;
@@ -569,7 +728,7 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Decode(const RawWrite& write) const
                 static_cast<std::uint32_t>(local_z)};
             value_bytes += BlockValuesBytes(block);
             if (base_bytes + value_bytes + (entry->blocks.size() + 1U) * sizeof(FeedBlockChange) +
-                entry->chunk_changes.capacity() * sizeof(FeedChunkChange) > budget_) return nullptr;
+                entry->chunk_changes.capacity() * sizeof(FeedChunkChange) > budget_) return {};
             entry->blocks.push_back(std::move(block));
             if (memo_rows) {
                 const auto index = entry->blocks.size() - 1U;
@@ -577,11 +736,16 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Decode(const RawWrite& write) const
                 if (now) after_memo = {true, b, index};
             }
             if (base_bytes + value_bytes + entry->blocks.capacity() * sizeof(FeedBlockChange) +
-                entry->chunk_changes.capacity() * sizeof(FeedChunkChange) > budget_) return nullptr;
+                entry->chunk_changes.capacity() * sizeof(FeedChunkChange) > budget_) return {};
         }
     }
     entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*entry));
-    return entry;
+    std::shared_ptr<const FeedEntry> replica;
+    if (replication) {
+        *replication += "_\r\n_\r\n_\r\n"; // tag, txn and txn_tables
+        replica = ReplicationEntry(*entry, FeedEntry::Kind::kReplication, std::move(*replication));
+    }
+    return {std::move(entry), std::move(replica)};
 }
 void ChangeFeed::Merge(std::uint64_t watermark) {
     {
@@ -608,15 +772,16 @@ void ChangeFeed::Merge(std::uint64_t watermark) {
         bool notify_batch = false;
         try {
             if (!reset) {
-                auto entry = Decode(*write);
-                if (!entry) Lost(write->revision);
+                auto decoded = Decode(*write);
+                if (!decoded.entry) Lost(write->revision);
                 else {
-                    const auto bytes = EntryBytes(*entry);
+                    const auto bytes = EntryBytes(*decoded.entry);
                     std::lock_guard lock(mutex_);
-                    if (!ring_.empty() && entry->position.revision <= ring_.back().entry->position.revision) {
+                    DrainMaintenance(write->revision - 1U);
+                    if (!ring_.empty() && write->revision <= ring_.back().entry->position.revision) {
                         throw std::logic_error("feed queue revisions are out of order");
                     }
-                    Append(std::move(entry), bytes, write, false);
+                    Append(std::move(decoded.entry), bytes, write, false, std::move(decoded.replication));
                     // A reader can start its next write as soon as mutex_ is
                     // released. Return this capacity before publishing it.
                     Recycle(*selected, write);
@@ -642,6 +807,7 @@ void ChangeFeed::Merge(std::uint64_t watermark) {
         }
     }
     std::lock_guard lock(mutex_);
+    const bool maintenance = DrainMaintenance(watermark, reset);
     if (reset) {
         // Drain the discarded prefix before readers can resume at its end.
         // Idle headers and buffers must not keep a small feed full forever.
@@ -657,7 +823,7 @@ void ChangeFeed::Merge(std::uint64_t watermark) {
     // A scan that published nothing changes no reader's readiness. Writers
     // finishing together can wake the sender for such a scan; waking every
     // subscription for it would cost each of them a pass over nothing.
-    if (!reset && queued_since_notify == 0U) return;
+    if (!reset && !maintenance && queued_since_notify == 0U) return;
     cv_.notify_all();
     Notify();
 }
@@ -825,6 +991,7 @@ FeedSubscription::~FeedSubscription() {
         feed_->group_count_.store(feed_->groups_.size(), std::memory_order_relaxed);
     }
     if (chunks_) feed_->chunk_watchers_.fetch_sub(1U, std::memory_order_acq_rel);
+    if (replication_) feed_->replication_watchers_.fetch_sub(1U, std::memory_order_acq_rel);
     if (auto table = table_.lock()) table->ReleaseFeed(feed_);
 }
 std::optional<FeedPosition> FeedSubscription::Progress() {
@@ -851,9 +1018,12 @@ std::unique_ptr<FeedSubscription> ChangeFeed::Subscribe(std::weak_ptr<Table> tab
     result->position_ = options.after.value_or(FeedPosition{epoch_, Watermark()});
     if (lineage_ && result->position_.epoch == lineage_->parent_epoch &&
         result->position_.revision <= lineage_->fork_revision) result->position_.epoch = epoch_;
+    if (options.replication && replication_started_empty_ && result->position_ == FeedPosition{epoch_, 0U})
+        result->position_.revision = replication_floor_;
     result->reset_ = reset_;
     result->invalid_ = result->position_.epoch != epoch_ || result->position_.revision >= ceiling_clock_->load(std::memory_order_acquire) ||
-        result->position_.revision < floor_ || result->position_.revision > Watermark();
+        result->position_.revision < floor_ || (options.replication && result->position_.revision < replication_floor_) ||
+        result->position_.revision > Watermark();
     if (options.notify) {
         result->notify_ = std::make_shared<const std::function<void()>>(options.notify);
         notifications_.push_back(result->notify_);
@@ -882,7 +1052,9 @@ std::unique_ptr<FeedSubscription> ChangeFeed::Subscribe(std::weak_ptr<Table> tab
     }
     result->chunks_ = options.chunks;
     result->slot_ = slot;
+    result->replication_ = options.replication;
     if (options.chunks) chunk_watchers_.fetch_add(1U, std::memory_order_acq_rel);
+    if (options.replication) replication_watchers_.fetch_add(1U, std::memory_order_acq_rel);
     result->table_ = std::move(table);
     return result;
 }
@@ -929,6 +1101,20 @@ std::shared_ptr<const FeedEntry> ChangeFeed::Next(FeedSubscription& sub, std::ch
             });
         if (next == ring_.end()) return nullptr;
         auto entry = next->entry;
+        if (sub.replication_) {
+            if (!next->replication) {
+                sub.invalid_ = true;
+                continue;
+            }
+            sub.position_ = entry->position;
+            return next->replication;
+        }
+        if (entry == next->replication) {
+            lock.unlock();
+            sub.Track(entry->position.revision);
+            sub.position_ = entry->position;
+            continue;
+        }
         if (sub.chunks_ && entry->kind == FeedEntry::Kind::kChange && !entry->chunk_forms_complete) {
             // Earlier ordinary-only captures contain one row, not a whole chunk.
             // Force a truthful rebuild instead of inventing the missing image.

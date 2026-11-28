@@ -436,6 +436,8 @@ void Table::QuarantineFeedLinger(const std::exception& error, std::shared_ptr<Ch
 std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& options) { return SubscribeFeed(options, false); }
 std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& options, bool slot) {
     if (options.ack_timeout_ms) throw std::invalid_argument("ACK TIMEOUT requires a slot watch");
+    if (options.replication && (slot || !options.areas.empty() || options.column_ids || options.no_before || options.chunks))
+        throw std::invalid_argument("WATCH REPLICATION takes only AFTER");
     if (options.areas.size() > kMaxFeedAreas) throw std::invalid_argument("a watch takes at most 64 areas");
     for (const auto& area : options.areas)
         if (area.first.x > area.last.x || area.first.y > area.last.y) throw std::invalid_argument("feed area bounds are reversed");
@@ -486,12 +488,27 @@ std::unique_ptr<FeedSubscription> Table::SubscribeFeed(const FeedOptions& option
     { std::lock_guard timer_lock(feed_timer_mutex_); feed_linger_deadline_.reset(); }
     feed_timer_cv_.notify_all();
     if (feed_linger_.count() > 0 && !feed_linger_timer_.joinable()) StartFeedLingerTimer();
+    SetReplicationCapture(*store, options.replication || feed_->has_replication_watchers());
     feed_->Resume(*store);
     auto subscription = feed_->Subscribe(weak_from_this(), options, slot);
     ++feed_subscriptions_;
     store->feed_watchers_active_.store(true, std::memory_order_release);
     unused_feed.Dismiss();
     return subscription;
+}
+
+void Table::SetReplicationCapture(ChunkStore& store, bool enabled) {
+    // Ordinary table controls and watches do not take the checkpoint lock here.
+    if (!enabled && !store.replication_checkpoint_feed_ && !(feed_ && feed_->capturing_replication())) return;
+    if (enabled && store.replication_checkpoint_feed_ == feed_) return;
+    std::lock_guard publication(store.checkpoint_publish_mutex_);
+    if (enabled) {
+        feed_->EnableReplication(store);
+        store.replication_checkpoint_feed_ = feed_;
+    } else {
+        if (feed_) feed_->DisableReplication();
+        store.replication_checkpoint_feed_.reset();
+    }
 }
 
 void Table::ReleaseFeed(const std::shared_ptr<ChangeFeed>& feed) {
@@ -1107,6 +1124,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
     }
     if (store && (feed_cleanup_failed_.load(std::memory_order_acquire) ||
         migration_health_->failed.load(std::memory_order_acquire))) {
+        SetReplicationCapture(*store, false);
         store->feed_.store(nullptr, std::memory_order_seq_cst);
         store->feed_watchers_active_.store(false, std::memory_order_release);
         store->feed_slots_->Stop();
@@ -1127,6 +1145,8 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
     }
     if (store && store->feed_slots_->active() && store->access_mode_ == AccessMode::kReadWrite && !feed_)
         feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
+    if (store) SetReplicationCapture(*store, feed_ && (feed_->has_replication_watchers() ||
+        (feed_->capturing_replication() && feed_subscriptions_ == 0U && RetainIdleFeed())));
     if (feed_) {
         if (store == nullptr) feed_->End(ended_.load(std::memory_order_acquire));
         else if (!feed_->attached()) feed_->Resume(*store);

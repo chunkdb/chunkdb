@@ -447,6 +447,11 @@ std::string CommandEngine::LostCatalogWatchReply(bool user_dropped) {
     return ErrorReply(PermissionDeniedError("MONITOR or ADMIN on *, and MANAGES USERS for a watch that shows users"));
 }
 
+std::string CommandEngine::LostReplicationWatchReply(bool user_dropped) {
+    if (user_dropped) return ErrorReply(UserDroppedError());
+    return ErrorReply(PermissionDeniedError("REPLICATION on *"));
+}
+
 std::string CommandEngine::LostUserReply(SessionState& session) const {
     if (!config_.require_auth || !session.greeted) return {};
     // One atomic load while the users are unchanged; after a change, the
@@ -1086,7 +1091,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 15);
+    Protocol::AppendArrayHeader(reply, 16);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -1102,6 +1107,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "read_only_transactions");
     Protocol::AppendBulk(reply, "returning");
     Protocol::AppendBulk(reply, "watch_catalog");
+    Protocol::AppendBulk(reply, "replication_watch");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 2U : 1U);
     entry("statement_timeout_ms", session.hello_options.statement_timeout_ms.value_or(session.default_statement_timeout_ms));

@@ -78,15 +78,18 @@ struct Push {
     bool user_null = true;
     std::string user;
     std::vector<Event> events;
+    bool whole = false;
 };
 
 Push CatalogPush(const std::string& bytes) {
     const auto reply = Parse(bytes);
-    assert(reply.type == '>' && reply.items.size() == 7U && reply.items[0].value == "catalog");
+    assert(reply.type == '>' && reply.items.size() == 8U && reply.items[0].value == "catalog");
     assert(reply.items[1].type == '$' && reply.items[1].value.size() == 32U);
     assert(reply.items[3].type == ':');
     assert(reply.items[6].type == '_');
-    Push push{reply.items[1].value, std::stoull(reply.items[2].value), reply.items[4].type == '_', reply.items[4].value, {}};
+    assert(reply.items[7].type == '#' && (reply.items[7].value == "t" || reply.items[7].value == "f"));
+    Push push{reply.items[1].value, std::stoull(reply.items[2].value), reply.items[4].type == '_', reply.items[4].value,
+        {}, reply.items[7].value == "t"};
     for (const auto& item : reply.items[5].items) {
         const auto& table = Field(item, "table");
         const auto& data = Field(item, "data");
@@ -207,6 +210,7 @@ void TestWholeCatalogThenChanges() {
     feed->Refresh(CatalogScope{.tables = {"t"}, .all_tables = false}, "admin");
     assert(notified == 1U);
     const auto change = CatalogPush(NextBytes(*watch));
+    assert(whole.whole && !change.whole);
     assert(change.epoch == whole.epoch && change.revision == 2U && !change.user_null && change.user == "admin");
     assert(Render(change.events) == "user drop u . .|table alter t . two|slot create s2 t owner u");
     assert(!watch->Next());

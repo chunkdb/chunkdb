@@ -1,0 +1,2 @@
+- Add WATCH table REPLICATION for live, ordered single-table commit, schema and tombstone events with exact row and chunk bytes (#146)
+- Mark whole-catalog WATCH CATALOG pushes with a trailing boolean (#146)
