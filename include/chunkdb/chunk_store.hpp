@@ -1053,6 +1053,15 @@ class ChunkStore {
         const ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z) const;
 
     [[nodiscard]] std::size_t ApproxLoadedChunkCount() const;
+    // Estimates loaded chunk memory from the chunk objects and their payload,
+    // presence, variable values, chunk columns, WAL and scratch buffers.
+    // Visits one chunk at a time with a cancellable read lock.
+    [[nodiscard]] std::uint64_t LoadedChunkBytes() const;
+    // The bytes of the chunk states kept for open transactions, and the
+    // transactions with a snapshot of this store (BeginTxnSnapshot) that
+    // neither ended nor were ended by a limit.
+    [[nodiscard]] std::size_t TxnHistoryBytes() const noexcept;
+    [[nodiscard]] std::size_t OpenTransactionCount() const;
     [[nodiscard]] StoreRuntimeStats RuntimeStats() const noexcept;
     // Commit time (Unix ms) of the chunk's last mutation, as loaded or set.
     [[nodiscard]] std::uint64_t ChunkCommitTimeForTests(std::int64_t chunk_x, std::int64_t chunk_y);
