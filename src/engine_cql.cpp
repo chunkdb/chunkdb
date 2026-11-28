@@ -2889,9 +2889,14 @@ std::string CommandEngine::ExecuteStatement(
                         if (!table.features) continue;
                         Protocol::AppendMapHeader(reply, 7U);
                         Protocol::AppendBulk(reply, "name"); Protocol::AppendBulk(reply, table.name);
-                        Protocol::AppendBulk(reply, "state"); Protocol::AppendBulk(reply, table.fence ? "fenced" : "ok");
+                        // A frozen table is fenced too; its slots' durable frontier stopped with it.
+                        const bool frozen = table.frontier_frozen && table.fence;
+                        Protocol::AppendBulk(reply, "state");
+                        Protocol::AppendBulk(reply, frozen ? "frozen" : table.fence ? "fenced" : "ok");
                         Protocol::AppendBulk(reply, "reason");
-                        if (table.fence) Protocol::AppendBulk(reply, *table.fence); else Protocol::AppendNull(reply);
+                        if (frozen) Protocol::AppendBulk(reply, "its slots' durable frontier stopped because " + *table.fence);
+                        else if (table.fence) Protocol::AppendBulk(reply, *table.fence);
+                        else Protocol::AppendNull(reply);
                         flags(*table.features);
                     }
                     Protocol::AppendBulk(reply, "fenced"); Protocol::AppendArrayHeader(reply, status.tables.size() - readable);
