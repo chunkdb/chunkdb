@@ -1,0 +1,1 @@
+- GET AREA measures the reply framing of each cell it visits instead of building three strings for it, empty cells included, and builds the framing once for the cells it returns; AGGREGATE reads each block value in place instead of copying its bits one at a time and decoding it into a value. Replies are unchanged (#138).
