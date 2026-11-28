@@ -62,7 +62,7 @@ GRANT and REVOKE wait for a running DROP TABLE or RENAME TO, so each applies bef
 MONITOR, BACKUP and REPLICATION are server rights, granted with `ON *`, for example `GRANT MONITOR ON * TO metrics`.
 They give no table rights and no user management.
 MONITOR reads server status: SHOW METRICS, SHOW STATUS, SHOW CONNECTIONS of every user, SHOW TABLE STATS and SHOW SLOTS on every table, and WATCH CATALOG.
-BACKUP runs BACKUP TO, and RESTORE TABLE under a name the user has ADMIN on; the backup may hold any table, and the restored table falls under the grants that match its new name.
+BACKUP runs BACKUP TO and BACKUP STREAM, and can restore a table under a name the user has ADMIN on. A backup may hold any table, and the restored table falls under the grants that match its new name.
 REPLICATION is stored and shown by SHOW USERS; no statement requires it yet.
 
 | Statement | Required right |
@@ -87,7 +87,7 @@ REPLICATION is stored and shown by SHOW USERS; no statement requires it yet.
 | ACK | An open slot watch |
 | PING | None |
 | User management, SHOW USERS, GRANT, REVOKE | MANAGES USERS |
-| BACKUP TO | BACKUP, or MANAGES USERS |
+| BACKUP TO, BACKUP STREAM | BACKUP, or MANAGES USERS |
 | RESTORE TABLE | MANAGES USERS, ADMIN on all tables, or BACKUP and ADMIN on the new name |
 | MIGRATE | The inner statement's rights |
 

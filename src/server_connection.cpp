@@ -61,6 +61,15 @@ bool ChunkServer::HandleClient(
             }
             {
                 ScopedStatementControl context(control.get());
+                bool close_on_stream_error = false;
+                const auto stream_backup = [&](const auto& produce) {
+                    io->StreamBackup(*connection, wait, control, produce, close_on_stream_error);
+                };
+                struct Transport final : BackupStreamTransport {
+                    explicit Transport(const decltype(stream_backup)& stream) : stream(stream) {}
+                    void Run(const std::function<void(const BackupStreamWrite&)>& produce) override { stream(produce); }
+                    const decltype(stream_backup)& stream;
+                } transport(stream_backup);
                 const std::function<void(std::size_t)> reserve_reply = [&](std::size_t bytes) {
                     if (!io->ReserveReply(*connection, bytes, false))
                         throw ReplyAdmissionError("reply capture budget is full");
@@ -71,7 +80,8 @@ bool ChunkServer::HandleClient(
                     !connection->payload_rejection.empty() ? engine_->RejectPayload(session, connection->request_line,
                         std::move(connection->payload_rejection)) :
                     engine_->Execute(session, connection->request_line, connection->parameters,
-                        &connection->reply_continuation, &reserve_reply);
+                        &connection->reply_continuation, &reserve_reply, &transport);
+                if (close_on_stream_error) return false;
                 bool decision_entered = false;
                 if (const auto stopped = control->Complete(&decision_entered)) {
                     connection->reply_continuation.reset();

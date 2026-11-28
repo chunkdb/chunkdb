@@ -590,16 +590,7 @@ void IdleIo::PumpCredits() {
     pump(data_waiters_, data_credit_, true);
 }
 
-bool IdleIo::Write(ServerConnection& connection, bool keep, std::optional<std::chrono::steady_clock::time_point> now) {
-    const auto clock = [&now] { return now ? *now : std::chrono::steady_clock::now(); };
-    // Only a held-back login reply has a time before which it is not written.
-    if (connection.session.reply_not_before != std::chrono::steady_clock::time_point{} &&
-        clock() < connection.session.reply_not_before) return true;
-    if (connection.response_offset == connection.response.size() && connection.reply_continuation) {
-        connection.response = connection.reply_continuation->Next(65536U);
-        connection.response_offset = 0U;
-        if (connection.reply_continuation->done()) connection.reply_continuation.reset();
-    }
+bool IdleIo::WriteBuffer(ServerConnection& connection) {
     const auto remaining = connection.response.size() - connection.response_offset;
     if (remaining != 0U) {
         if (!connection.reply_credit) throw std::logic_error("reply write requires reserved output credit");
@@ -643,12 +634,134 @@ bool IdleIo::Write(ServerConnection& connection, bool keep, std::optional<std::c
         if (auto* hook = server_.delivery_test_hook_.load(std::memory_order_acquire))
             hook->Run(FeedDeliveryTestHook::Point::kAfterReplyBufferWrite, connection.response_offset);
         connection.io_wait = POLLOUT;
-        // Progress restarts the deadline of a reply that is still being written.
-        if (connection.response_offset != connection.response.size() || connection.reply_continuation) {
+    }
+    return true;
+}
+
+void IdleIo::StreamBackup(ServerConnection& connection, WorkerWait& wait,
+    const std::shared_ptr<StatementControl>& control,
+    const std::function<void(const BackupStreamWrite&)>& produce, bool& close_on_error) {
+    bool has_input = !connection.pending.empty();
+#ifdef CHUNKDB_WITH_OPENSSL
+    if (connection.tls && SSL_pending(connection.tls) > 0) has_input = true;
+#endif
+    if (has_input) {
+        connection.session.close_after_reply = true;
+        throw std::invalid_argument("BACKUP STREAM requires a connection without pipelined input");
+    }
+    if (connection.worker_blocking) {
+        std::string error;
+        if (!SetSocketNonBlocking(connection.socket, true, &error))
+            throw std::runtime_error("cannot configure backup stream socket: " + error);
+        connection.worker_blocking = false;
+    }
+    const auto input = std::make_shared<BackupInput>(connection.socket, control);
+    {
+        std::lock_guard lock(mutex_);
+        if (!server_.running_.load()) throw std::runtime_error("server is stopping");
+        incoming_backup_inputs_.push_back(input);
+    }
+    Wake();
+    struct Registration {
+        IdleIo& owner;
+        BackupInput& input;
+        bool& close_on_error;
+        bool started = false;
+        bool finished = false;
+        bool released = false;
+        bool peer_input = false;
+        void Release() {
+            if (released) return;
+            peer_input = input.state.exchange(BackupInput::kReleased) == BackupInput::kPeerInput;
+            owner.Wake();
+            released = true;
+        }
+        ~Registration() {
+            Release();
+            close_on_error = peer_input || (started && !finished);
+        }
+    } registration{*this, *input, close_on_error};
+    const auto wake_worker = [&] { wait.poller.Wake(); };
+    const auto stopped = control->StopToken();
+    std::stop_callback statement(stopped, wake_worker);
+    std::stop_callback shutdown(connection.session.backup_cancelled, wake_worker);
+    const auto check = [&] {
+        control->Check();
+        if (!server_.running_.load() || connection.record->killed.load() ||
+            input->state.load() == BackupInput::kPeerInput)
+            throw std::runtime_error("backup stream connection closed");
+    };
+    const auto interval = std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
+    const auto check_deadline = [&] {
+        if (std::chrono::steady_clock::now() >= *connection.output_deadline) {
+            LogConnectionTermination(MakePhaseDeadlineTermination("write", "reply progress deadline exceeded"));
+            throw std::runtime_error("backup stream output deadline exceeded");
+        }
+    };
+    produce([&](std::span<const std::uint8_t> bytes, bool last) {
+        check();
+        if (!registration.started) {
+            connection.response.reserve(65536U);
+            connection.response.assign("+BACKUP STREAM\r\n");
+            connection.output_deadline = std::chrono::steady_clock::now() + interval;
+            std::lock_guard lock(connection.record->mutex);
+            connection.record->state = "writing";
+        } else connection.response.clear();
+        Protocol::AppendBulk(connection.response,
+            std::string_view(reinterpret_cast<const char*>(bytes.data()), bytes.size()));
+        if (last) Protocol::AppendBulk(connection.response, "");
+        connection.response_offset = 0U;
+        connection.io_wait = POLLOUT;
+        if (connection.response.size() > connection.reply_credit_bytes)
+            throw std::logic_error("backup stream frame exceeds reserved output credit");
+        if (last) {
+            // The terminal frame commits the result. A following request
+            // may arrive as soon as the client has read its terminator.
+            registration.Release();
+            if (registration.peer_input) throw std::runtime_error("backup stream connection closed");
+            control->EnterDecision();
+        }
+        registration.started = true;
+        while (connection.response_offset != connection.response.size()) {
+            check();
+            check_deadline();
+            const auto offset = connection.response_offset;
+            if (!WriteBuffer(connection)) throw std::runtime_error("backup stream write failed");
+            if (connection.response_offset != offset) {
+                connection.output_deadline = std::chrono::steady_clock::now() + interval;
+                continue;
+            }
+            wait.poller.DrainWake();
+            check(); // Observe any stop published before the drain.
+            const auto remaining = std::chrono::ceil<std::chrono::milliseconds>(
+                *connection.output_deadline - std::chrono::steady_clock::now()).count();
+            SocketInterest interest{connection.socket, connection.io_wait, 0};
+            (void)wait.poller.Wait(std::span(&interest, 1U),
+                static_cast<int>(std::clamp<std::int64_t>(remaining, 0, INT_MAX)));
+            if ((interest.ready & (POLLERR | POLLHUP | POLLNVAL)) != 0)
+                throw std::runtime_error("backup stream connection closed");
+        }
+    });
+    registration.finished = true;
+}
+
+bool IdleIo::Write(ServerConnection& connection, bool keep, std::optional<std::chrono::steady_clock::time_point> now) {
+    const auto clock = [&now] { return now ? *now : std::chrono::steady_clock::now(); };
+    // Only a held-back login reply has a time before which it is not written.
+    if (connection.session.reply_not_before != std::chrono::steady_clock::time_point{} &&
+        clock() < connection.session.reply_not_before) return true;
+    if (connection.response_offset == connection.response.size() && connection.reply_continuation) {
+        connection.response = connection.reply_continuation->Next(65536U);
+        connection.response_offset = 0U;
+        if (connection.reply_continuation->done()) connection.reply_continuation.reset();
+    }
+    const auto offset = connection.response_offset;
+    if (!WriteBuffer(connection)) return false;
+    if (connection.response_offset != connection.response.size() || connection.reply_continuation) {
+        if (connection.response_offset != offset)
             connection.output_deadline = std::chrono::steady_clock::now() +
                 std::chrono::milliseconds(server_.config_.client_io_timeout_ms);
-            return true;
-        }
+        return true;
     }
     ++connection.completed_replies;
     std::string{}.swap(connection.response);
@@ -904,6 +1017,7 @@ void IdleIo::Abandon(std::shared_ptr<ServerConnection>& connection, const std::e
 void IdleIo::Run() {
     std::vector<std::shared_ptr<ServerConnection>> clients;
     std::vector<SocketInterest> interests;
+    std::vector<std::shared_ptr<BackupInput>> backup_inputs;
     const auto fail = [&](const std::exception& error) {
         LogMessage(LogLevel::kError, LogComponent::kServer,
             "connection transport terminated", {{"error", error.what()}});
@@ -920,6 +1034,9 @@ void IdleIo::Run() {
                 statements_.insert(statements_.end(), std::make_move_iterator(incoming_statements_.begin()),
                     std::make_move_iterator(incoming_statements_.end()));
                 incoming_statements_.clear();
+                backup_inputs.insert(backup_inputs.end(), std::make_move_iterator(incoming_backup_inputs_.begin()),
+                    std::make_move_iterator(incoming_backup_inputs_.end()));
+                incoming_backup_inputs_.clear();
             }
             CheckStatements();
             clients.insert(clients.end(), std::make_move_iterator(clients_returned_.begin()),
@@ -961,12 +1078,21 @@ void IdleIo::Run() {
             }
             for (const auto& tracked : statements_)
                 if (const auto deadline = tracked.statement->deadline(); deadline && *deadline > now) wait_until(*deadline);
+            std::erase_if(backup_inputs, [](const auto& input) { return input->state.load() != BackupInput::kWatching; });
+            for (const auto& input : backup_inputs) interests.push_back({input->socket, POLLIN, 0});
             if (!server_.running_.load()) break;
             (void)poller_.Wait(interests, timeout);
             // A writable reply is not input: Write runs in its phase regardless.
             for (std::size_t i = 0U; i < clients.size(); ++i)
                 if (interests[i].ready != 0 && clients[i]->phase != ServerConnection::Phase::kReply)
                     clients[i]->read_ready = true;
+            for (std::size_t i = 0U; i < backup_inputs.size(); ++i) {
+                if (interests[clients.size() + i].ready == 0) continue;
+                const auto& input = backup_inputs[i];
+                auto watching = BackupInput::kWatching;
+                if (input->state.compare_exchange_strong(watching, BackupInput::kPeerInput))
+                    (void)input->control->RequestStop(StatementStopReason::kKilled);
+            }
         }
     } catch (const std::exception& error) {
         // Only the poller, wake-ups and the scan itself fail here.

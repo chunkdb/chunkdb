@@ -4,6 +4,7 @@
 #include <filesystem>
 #include <functional>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <stop_token>
 #include <string>
@@ -42,6 +43,15 @@ struct BackupResult {
     std::uint64_t files_count = 0;
     std::uint64_t bytes = 0;
 };
+// Each call supplies one bounded container fragment; the last is its trailer.
+using BackupStreamWrite = std::function<void(std::span<const std::uint8_t>, bool last)>;
+class BackupStreamTransport {
+  public:
+    virtual ~BackupStreamTransport() = default;
+    virtual void Run(const std::function<void(const BackupStreamWrite&)>& produce) = 0;
+};
+using BackupCopyProgress = std::function<void(std::uint64_t copied_files, std::uint64_t copied_bytes,
+    std::uint64_t total_files, std::uint64_t total_bytes)>;
 // Deterministic pin/copy boundaries, following the storage test-hook pattern.
 struct BackupTestHook {
     enum class Point { kBeforeTargetCreate, kBeforeCopyCreate, kBeforeStagingCreate, kAfterTargetGuard, kBeforeTablePin, kBeforeLargeChunkPin, kBeforeMaintenanceWait, kAfterCut, kWaitingForCompletion, kAfterFlush, kAfterPin, kBeforeCopy, kAfterCopy, kBeforePublish, kBeforeWalReplayRead, kAfterTargetValidation, kBeforeSourceDirectoryOpen };
@@ -56,6 +66,11 @@ struct BackupOptions {
     std::function<void(const BackupResult&)> before_publish{};
     // The configured --backup-dir the target lies under; see PrepareBackupTarget.
     std::filesystem::path backup_directory{};
+};
+struct BackupStreamRequest {
+    BackupCancel cancelled{};
+    BackupStreamWrite write{};
+    BackupCopyProgress progress{};
 };
 class BackupBusyError : public std::runtime_error {
   public:
@@ -114,13 +129,16 @@ void RequireNotBackupDirectory(const std::filesystem::path& path, AccessMode acc
 // The writer refuses a larger backup record and the reader refuses one before
 // reading it.
 inline constexpr std::uint64_t kMaxBackupRecordBytes = std::uint64_t{1} << 30U;
+// Leaves room for bulk framing in the server's 64 KiB output buffer.
+inline constexpr std::size_t kBackupStreamBlockBytes = 65536U - 128U;
 [[nodiscard]] std::vector<std::uint8_t> SerializeBackupRecord(const BackupRecord& record);
 [[nodiscard]] BackupRecord ParseBackupRecord(const std::vector<std::uint8_t>& bytes);
 [[nodiscard]] BackupRecord ReadBackupRecord(const std::filesystem::path& root);
 // Checks an exact, safe inventory plus every advertised table cut and its
 // metadata. Throws on incomplete guards, unexpected entries or damage.
 // Internal check while the publisher still owns its incomplete guard.
-void ValidateBackupContents(const std::filesystem::path& root, const BackupRecord& record);
+void ValidateBackupContents(const std::filesystem::path& root, const BackupRecord& record,
+    const BackupCancel& cancelled = {});
 void ValidateBackupInventory(const std::filesystem::path& root, const BackupRecord& record);
 // Syncs the contents/marker and removes the guard last. A failed completion
 // sync durably restores the guard, or reports an unknown publication outcome.
@@ -129,7 +147,13 @@ void CompleteBackup(const std::filesystem::path& root, const BackupRecord& recor
 // Internal publication helpers shared by backup creation and restore.
 void SyncBackupTree(const std::filesystem::path& root, const BackupCancel& cancelled = {});
 void CompleteBackupGuard(const std::filesystem::path& root, std::string_view guard, std::string_view phase);
+// A directory is a BACKUP TO result; a regular file is a BACKUP STREAM container.
 void RestoreBackup(const std::filesystem::path& backup, const std::filesystem::path& target);
+// Offline extraction helper; the caller already checked the destination.
+void RestoreBackupStream(const std::filesystem::path& stream, const std::filesystem::path& target);
+// The source is a private, validated copy with exactly this inventory.
+void WriteBackupStream(const std::filesystem::path& root, const BackupRecord& record,
+    const BackupCancel& cancelled, const BackupStreamWrite& write, const BackupCopyProgress& progress);
 
 // The completed backup a RESTORE TABLE statement names, resolved under the
 // configured --backup-dir with the BACKUP TO path rules.
@@ -142,8 +166,6 @@ struct BackupTableCopy {
     std::vector<std::filesystem::path> files;
     std::uint64_t bytes = 0;
 };
-using BackupCopyProgress = std::function<void(std::uint64_t copied_files, std::uint64_t copied_bytes,
-    std::uint64_t total_files, std::uint64_t total_bytes)>;
 // Copies table `table` of the completed backup `backup` into the existing
 // empty `directory`. The backup's table directory must hold exactly its
 // inventory files, all regular; every copied length and CRC must match the

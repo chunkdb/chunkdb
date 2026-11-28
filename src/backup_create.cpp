@@ -59,6 +59,15 @@ struct RetainedBackupIndex {
 }
 
 BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const BackupOptions& options) {
+    return CreateBackup(target, options, nullptr);
+}
+
+void TableCatalog::BackupStream(const BackupStreamRequest& request) {
+    (void)CreateBackup({}, BackupOptions{.cancelled = request.cancelled}, &request);
+}
+
+BackupResult TableCatalog::CreateBackup(const std::filesystem::path& target, const BackupOptions& options,
+    const BackupStreamRequest* stream) {
     RequireWritable("backup");
     if (!feature_metadata_gate_.lock_shared(options.cancelled)) throw std::runtime_error("backup cancelled");
     std::shared_lock feature_metadata(feature_metadata_gate_, std::adopt_lock);
@@ -68,14 +77,16 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     std::unique_lock backup_lock(backup_mutex_, std::try_to_lock);
     if (!backup_lock.owns_lock()) throw BackupBusyError("another backup is running");
     CheckCancelled(options.cancelled);
-    PrepareBackupTarget(config_.data_dir, target, backup_hook_.load(std::memory_order_acquire), options.backup_directory);
-    EnsureBackupDirectory(target / "tables");
     const auto hook = [&](BackupTestHook::Point point, std::string_view table = {}, std::uint64_t revision = 0) {
         if (auto* current = backup_hook_.load(std::memory_order_acquire)) current->Run(point, table, revision);
         CheckCancelled(options.cancelled);
     };
-    hook(BackupTestHook::Point::kAfterTargetGuard);
-    Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_TARGET_GUARD_ONCE");
+    if (!stream) {
+        PrepareBackupTarget(config_.data_dir, target, backup_hook_.load(std::memory_order_acquire), options.backup_directory);
+        EnsureBackupDirectory(target / "tables");
+        hook(BackupTestHook::Point::kAfterTargetGuard);
+        Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_TARGET_GUARD_ONCE");
+    }
     const auto source_manifest = ReadDataDirManifest(config_.data_dir);
     if (!source_manifest) throw std::runtime_error("backup source catalog manifest disappeared");
     // The writer lock and backup guard exclude every other backup of this
@@ -95,19 +106,20 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_STAGING_CREATE_ONCE");
     WriteBackupStagingOwner(staging.path, source_manifest->data_dir_id);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_STAGING_OWNER_ONCE");
+    const auto capture = stream ? staging.path / "capture" : staging.path;
     std::vector<PinnedFile> files;
     BackupRecord record;
     record.created_at_ms = UnixMillisNow();
     const auto save = [&](const std::filesystem::path& relative, const std::vector<std::uint8_t>& bytes) {
-        Save(staging.path / relative, bytes);
+        Save(capture / relative, bytes);
         files.push_back({relative, bytes.size(), bytes.size()});
     };
     const auto link = [&](const std::filesystem::path& source, const std::filesystem::path& relative,
                           std::uint64_t required, std::uint64_t observed) {
         if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(source)))
             throw std::runtime_error("backup source is not a regular file: " + source.string());
-        EnsureDirectoryPathExists((staging.path / relative).parent_path(), false);
-        std::filesystem::create_hard_link(source, staging.path / relative);
+        EnsureDirectoryPathExists((capture / relative).parent_path(), false);
+        std::filesystem::create_hard_link(source, capture / relative);
         files.push_back({relative, required, observed});
     };
     {
@@ -174,7 +186,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             const auto inventory_path = store.data_dir_ / kChunkIndexFileName;
             const auto inventory_bytes = std::filesystem::file_size(inventory_path);
             link(inventory_path, table_root / kChunkIndexFileName, inventory_bytes, inventory_bytes);
-            SharedFileInput inventory(staging.path / table_root / kChunkIndexFileName);
+            SharedFileInput inventory(capture / table_root / kChunkIndexFileName);
             if (!inventory) throw std::runtime_error("failed to read pinned coordinate inventory");
             const auto index_header = ReadIndexInventory(inventory, inventory_bytes, store.geometry_, store.store_id_,
                 [&](const IndexInventoryEntry& entry) {
@@ -275,13 +287,15 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
     }
     hook(BackupTestHook::Point::kBeforeCopy);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_BEFORE_COPY_ONCE");
+    const auto copy_target = stream ? staging.path / "copy" : target;
+    if (stream) EnsureBackupDirectory(copy_target / "tables");
     std::map<std::string, std::unique_ptr<RetainedBackupIndex>> retained_indexes;
     for (auto& file : files) {
         CheckCancelled(options.cancelled);
         if (file.relative.extension() == ".wal") {
             const auto table_name = std::next(file.relative.begin())->string();
             const auto table_cut = std::find_if(record.tables.begin(), record.tables.end(), [&](const auto& cut) { return cut.name == table_name; });
-            const auto table_dir = staging.path / "tables" / table_name;
+            const auto table_dir = capture / "tables" / table_name;
             const auto manifest = *ReadStoreManifest(table_dir);
             const Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
             ChunkCoord coord;
@@ -307,7 +321,7 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             if (boundary)
                 (void)ApplyRetainedEmptyBase(geometry, *boundary, base, time, schema,
                     payload, presence, vars, chunk_columns);
-            SharedFileInput input(staging.path / file.relative);
+            SharedFileInput input(capture / file.relative);
             if (!input) throw std::runtime_error("failed to read pinned backup WAL");
             std::vector<WalFrameBoundary> boundaries;
             const auto replay = ReplayWalStream(input, file.observed, geometry, coord, manifest.store_id, manifest.features,
@@ -329,12 +343,15 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
             }
         }
         if (file.required > file.observed) throw std::logic_error("backup prefix exceeds its captured bound");
-        record.files.push_back(CopyBackupFile(staging.path / file.relative, target, file.relative, file.required, options.cancelled, backup_hook_.load(std::memory_order_acquire)));
+        record.files.push_back(CopyBackupFile(capture / file.relative, copy_target, file.relative, file.required,
+            options.cancelled, backup_hook_.load(std::memory_order_acquire)));
     }
     hook(BackupTestHook::Point::kAfterCopy);
     Crash("CHUNKDB_FAILPOINT_CRASH_BACKUP_AFTER_COPY_ONCE");
-    RemoveBackupStaging(staging.path);
-    staging.path.clear();
+    if (!stream) {
+        RemoveBackupStaging(staging.path);
+        staging.path.clear();
+    }
     BackupResult result{record.tables, record.files.size(), 0U};
     for (const auto& file : record.files) {
         if (file.size > std::numeric_limits<std::uint64_t>::max() - result.bytes)
@@ -342,6 +359,13 @@ BackupResult TableCatalog::BackupTo(const std::filesystem::path& target, const B
         result.bytes += file.size;
     }
     hook(BackupTestHook::Point::kBeforePublish);
+    if (stream) {
+        feature_metadata.unlock();
+        RemoveBackupStaging(capture);
+        ValidateBackupContents(copy_target, record, options.cancelled);
+        WriteBackupStream(copy_target, record, options.cancelled, stream->write, stream->progress);
+        return result;
+    }
     if (options.before_publish) options.before_publish(result);
     CheckCancelled(options.cancelled);
     CompleteBackup(target, record, options.cancelled);

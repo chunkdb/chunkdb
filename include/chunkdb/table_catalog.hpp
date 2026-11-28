@@ -34,6 +34,7 @@ struct StoreManifest;
 struct BackupOptions;
 struct BackupResult;
 struct BackupTestHook;
+struct BackupStreamRequest;
 struct MigrationRequest;
 struct MigrationRecord;
 class UserRegistry;
@@ -599,6 +600,7 @@ class TableCatalog {
     [[nodiscard]] CatalogFeatureStatus FeatureStatus();
     void WalBarrier();
     [[nodiscard]] BackupResult BackupTo(const std::filesystem::path& target, const BackupOptions& options);
+    void BackupStream(const BackupStreamRequest& request);
     // Copies one table of a completed backup into a private directory, gives
     // it a new epoch whose lineage is the backup cut, and publishes it under
     // request.name with one rename. Crash-atomic like Create: afterwards the
@@ -621,6 +623,8 @@ class TableCatalog {
 
   private:
     [[nodiscard]] std::filesystem::path TablesDir() const;
+    [[nodiscard]] BackupResult CreateBackup(const std::filesystem::path& target, const BackupOptions& options,
+        const BackupStreamRequest* stream);
     friend struct BackupTestAccess;
     friend struct FeatureActivationTestAccess;
     [[nodiscard]] std::filesystem::path StagingDir() const;

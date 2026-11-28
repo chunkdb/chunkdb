@@ -16,6 +16,7 @@ Committed revisions keep their values; missing chunks after a later crash do not
 | Ordinary write, fsync-checkpoint | The same as fsync-wal. |
 | FLUSH WAL, every mode | All writes acknowledged before its arrival are durable in every table. |
 | Transaction COMMIT, every mode | All changed chunks commit together durably, or none commit. |
+| BACKUP STREAM | A complete stream contains the same cut and inventory as BACKUP TO. Durability of the received file depends on the receiver syncing it and its parent directory. |
 | RESTORE TABLE | The restored table is durable and complete under its name, or nothing is published. |
 | SWAP TABLES | Writes acknowledged before it are durable, and both names are exchanged durably. |
 | ALTER TABLE ... RENAME TO | Writes acknowledged before it are durable, and the table is renamed durably; after a crash it has one of the two names. |
@@ -59,6 +60,8 @@ Above 65,536 tracked files and directories, a table tracks its changed large-chu
 Above 65,536 changed large-chunk directories, the barrier syncs every file and directory of the table.
 
 ## Failures
+
+An interrupted BACKUP STREAM without its complete trailer is unusable for restore. A complete input is validated before offline restore publishes its guarded destination.
 
 An ordinary rejected mutation changes nothing, except when its error explicitly reports an unknown write outcome.
 An unknown outcome means the durable decision could not be confirmed.

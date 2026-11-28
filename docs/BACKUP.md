@@ -1,7 +1,7 @@
 # Back up and restore data
 
 You copy a running server and restore its data into a new directory.
-Use a connection with BACKUP or MANAGES USERS and a server configured with `--backup-dir`.
+Use a connection with BACKUP or MANAGES USERS. Set `--backup-dir` for BACKUP TO or to restore a table online.
 
 ## 1. Create the backup
 
@@ -32,6 +32,18 @@ Writes continue during copying.
 Each table has its own cut, a revision through which all its committed changes are included.
 Transactions are included whole, but table cuts need not share one instant.
 Tables created after capture or dropped before capture completes can be omitted.
+
+### Download a backup
+
+Run `BACKUP STREAM` on a connection whose client implements the [stream reply](PROTOCOL.md#backup-stream). It sends the full catalog and uses the same per-table cuts and inventory as BACKUP TO.
+Write the nonempty bulk payloads in order to a private file, validate the container, and only publish the file after receiving the empty terminator. Protect the file as you would a directory backup.
+
+```sh
+chunkdb_restore snapshot.ckstream /var/lib/chunkdb/restored
+```
+
+`chunkdb_restore` checks a stream file and unpacks it to a private sibling of the restore destination before running the usual restore. Allow space for both the unpacked backup and the temporary restore copy. The server needs room in its data directory for a private validated copy during transfer.
+Use SHOW CONNECTIONS from another connection to see the file and byte counts. A cancelled transfer or one that loses its connection is incomplete and must be taken again.
 
 ## 2. Verify and restore
 
@@ -110,7 +122,7 @@ The server logs a warning for anything it cannot remove.
 ## If it fails
 
 - `BUSY`: wait for the existing backup to finish.
-- Missing configuration: set `--backup-dir` before starting the server.
+- Missing directory backup configuration. Set `--backup-dir` before starting the server to use BACKUP TO or RESTORE TABLE.
 - Unsafe or nonempty destination: choose an empty path under the backup directory.
 - Backup directory not owned by the server user or root, or writable by group or others: the error names it; remove group and other write access, for example `chmod 755`, or choose another path.
 - Incomplete backup: remove that failed destination before retrying; it cannot be restored.
@@ -120,5 +132,5 @@ The server logs a warning for anything it cannot remove.
 - RESTORE TABLE `TABLE_EXISTS`: restore under another name with AS.
 - RESTORE TABLE refusing features or options: restore offline with `chunkdb_restore`, or enable the feature on this server first.
 
-Stopping the server aborts unfinished copying; client disconnect leaves the backup running.
+Stopping the server aborts unfinished backups. BACKUP TO continues after a client disconnect.
 See [Server statements](reference/SERVER.md), [Storage format](STORAGE_FORMAT.md), and [Durability](DURABILITY_CONTRACT.md).

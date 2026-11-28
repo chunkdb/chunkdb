@@ -1,5 +1,6 @@
 #pragma once
 
+#include "backup.hpp"
 #include "server_poller.hpp"
 #include "server_credit.hpp"
 
@@ -63,6 +64,10 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
     // time and the idle deadline of a finished reply.
     bool Write(ServerConnection& connection, bool keep = false,
         std::optional<std::chrono::steady_clock::time_point> now = std::nullopt);
+    bool WriteBuffer(ServerConnection& connection);
+    void StreamBackup(ServerConnection& connection, WorkerWait& wait,
+        const std::shared_ptr<StatementControl>& control,
+        const std::function<void(const BackupStreamWrite&)>& produce, bool& close_on_error);
     // Returns what Write kept once no reply or line is in progress.
     void ReleaseKept(ServerConnection& connection);
     // listing: a SHOW CONNECTIONS reply, charged to the listing reserve.
@@ -101,5 +106,16 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
     std::vector<TrackedStatement> statements_;
     std::vector<TrackedStatement> incoming_statements_;
     std::vector<std::shared_ptr<ServerConnection>> clients_returned_;
+    // A worker owns all reads/writes and the statement. The I/O owner only
+    // reports socket activity while that worker can be blocked on the cut.
+    struct BackupInput {
+        enum State { kWatching, kPeerInput, kReleased };
+        BackupInput(server_detail::SocketHandle socket, std::shared_ptr<StatementControl> control)
+            : socket(socket), control(std::move(control)) {}
+        const server_detail::SocketHandle socket;
+        const std::shared_ptr<StatementControl> control;
+        std::atomic<State> state{kWatching};
+    };
+    std::vector<std::shared_ptr<BackupInput>> incoming_backup_inputs_;
 };
 }  // namespace chunkdb
