@@ -9,11 +9,13 @@ WATCH changes that connection into a push stream.
 TCP uses `chunk://`; TLS uses `chunks://` with certificate validation in the client.
 Lines end with LF or CRLF; a line cut off at end of stream is never executed.
 The terminator counts toward `--max-line-bytes` (65536 by default); overflow sends BAD_REQUEST and closes.
+Before authentication a request line and a kept parameter frame each take at most 8192 bytes, or `--max-line-bytes` when smaller: a longer line receives PROTOCOL and closes, and a longer `client_name` value receives `INVALID_ARGUMENT reason=option_value`.
 Binary parameter frames do not count toward that line limit.
 A PROXY protocol v2 header and the TLS handshake each have their own `--client-io-timeout-ms`, in that order, before the HELLO deadline starts.
 Until authentication succeeds, HELLO, AUTH and all their parameter frames must arrive within `--client-io-timeout-ms` of that start; later ones receive PROTOCOL and close.
 After authentication, each request line must arrive within `--client-io-timeout-ms` of its first byte, each frame header within it of the end of the line or of the previous frame, and each frame body, kept or drained, within it of the end of its header; a frame that misses its deadline receives `PROTOCOL incomplete parameter frame` and the connection closes.
 Waiting for the server's input credit does not count: a request's frame deadline starts again when the credit is granted, and a wait longer than `--client-io-timeout-ms` receives `BUSY reason=input_budget` and the connection closes.
+Before authentication a request does not wait for input credit: each kept frame is charged the length its header gives when the header arrives, and a frame the server's login input credit cannot hold receives `BUSY reason=input_budget` and the connection closes.
 
 The first line must be HELLO 3; a different version or statement receives PROTOCOL and closes without execution.
 `HELLO 3` alone is accepted only under `--auth none`; otherwise it receives AUTH_REQUIRED.
