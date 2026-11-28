@@ -760,7 +760,12 @@ void SyncOwnerDirectoryHandle(void* handle, const std::filesystem::path& label) 
         error = GetLastError();
     }
     if (error != ERROR_SUCCESS) {
-        throw BuildWin32Error("strict durability requires owner directory sync capability", label, error);
+        // The same capability rule, log line and refusal as every other
+        // directory sync of a store.
+        if (error != ERROR_ACCESS_DENIED && error != ERROR_INVALID_HANDLE && error != ERROR_INVALID_FUNCTION)
+            throw BuildWin32Error("failed to sync owner directory", label, error);
+        LogWindowsDirectorySyncUnavailableOnce(label, error, std::system_category().message(static_cast<int>(error)));
+        throw BuildWin32Error("strict durability requires Windows directory sync capability", label, error);
     }
     NoteDirectorySynced(label);
 }

@@ -206,6 +206,12 @@ inline constexpr bool kFailpointsCompiled = false;
 #endif
 [[nodiscard]] bool ConsumeFailpointEnv(const char* key);
 [[nodiscard]] std::chrono::milliseconds ConsumeFailpointDelayMs(const char* key);
+struct VersionClockWaitTestHook {
+    enum class Point { kBeforeWait, kCeilingPublished };
+    virtual ~VersionClockWaitTestHook() = default;
+    // kBeforeWait runs under the clock mutex; kCeilingPublished can pause outside it.
+    virtual void Run(Point point) = 0;
+};
 // Ends the process at once with `code`, as a crash does: no destructors,
 // exit handlers, stream flushes or, on Windows, DLL detach notifications.
 // Crash failpoints and crash test children end through it while other

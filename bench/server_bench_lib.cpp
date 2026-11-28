@@ -1,5 +1,6 @@
 #include "chunkdb/server_bench.hpp"
 #include "chunkdb/bench_build.hpp"
+#include "server_bench_geometry.hpp"
 
 #include <algorithm>
 #include <array>
@@ -60,6 +61,8 @@ namespace chunkdb::server_bench {
 namespace {
 
 using Clock = std::chrono::steady_clock;
+constexpr std::size_t kSpawnMaxLineBytes = 65536U;
+constexpr std::size_t kMaxSquareChunkSide = 1024U;
 
 #ifdef _WIN32
 using SocketHandle = SOCKET;
@@ -184,6 +187,19 @@ constexpr std::array<double, 8> kPercentiles{
         throw std::invalid_argument("invalid value for " + std::string(arg_name) + ": " + std::string(text));
     }
     return static_cast<std::size_t>(value);
+}
+
+void RequireGeometrySize(std::size_t value, const char* flag, std::size_t maximum) {
+    if (value == 0U || value > maximum)
+        throw std::invalid_argument(std::string(flag) + " must be between 1 and " + std::to_string(maximum));
+}
+
+[[nodiscard]] std::size_t ParseGeometrySize(std::string_view text, const char* flag, std::size_t maximum) {
+    std::size_t value = 0U;
+    const auto parsed = std::from_chars(text.data(), text.data() + text.size(), value);
+    if (parsed.ec != std::errc{} || parsed.ptr != text.data() + text.size()) value = 0U;
+    RequireGeometrySize(value, flag, maximum);
+    return value;
 }
 
 [[nodiscard]] std::uint32_t ParseU32(std::string_view text, const char* arg_name) {
@@ -615,6 +631,8 @@ struct GeometryInfo {
     // The schema version a chunk form must be encoded for.
     std::uint64_t schema_version = 1;
     std::uint32_t column_id = 1U;
+    // The line limit of the server this benchmark spawned, when known.
+    std::size_t block_write_line_limit = std::numeric_limits<std::size_t>::max();
 };
 
 void ReadReplyScalars(Client& client, std::vector<std::string>* out);
@@ -1054,6 +1072,7 @@ class WatchingClient {
     geometry.chunk_bytes = CeilDiv(geometry.chunk_bits, static_cast<std::size_t>(8));
     geometry.presence_bytes = CeilDiv(
         geometry.chunk_width_blocks * geometry.chunk_height_blocks, static_cast<std::size_t>(8));
+    if (args.server_mode == ServerMode::kSpawn) geometry.block_write_line_limit = kSpawnMaxLineBytes;
     return geometry;
 }
 
@@ -1197,13 +1216,27 @@ struct ScenarioRegion {
 }
 
 [[nodiscard]] RequestPlan BlockSetPlan(std::int64_t x, std::int64_t y, const GeometryInfo& geometry, std::size_t request_index) {
-    return RequestPlan{
-        .command = "SET BLOCK " + std::to_string(x) + " " + std::to_string(y) + " IN default bits = b'" +
-                   AlternatingBits(geometry.block_bits, (request_index % 2) == 0) + "'",
+    RequestPlan plan{
+        .command = "SET BLOCK " + std::to_string(x) + " " + std::to_string(y) + " IN default bits = b'",
         .payload = {},
         .expected = IntegerExpected(),
         .kind = RequestKind::kSetBlock,
     };
+    const bool first_one = request_index % 2U == 0U;
+    constexpr std::size_t literal_end_bytes = std::string_view("'\r\n").size();
+    if (plan.command.size() + geometry.block_bits + literal_end_bytes <= geometry.block_write_line_limit) {
+        plan.command = std::move(plan.command) + AlternatingBits(geometry.block_bits, first_one) + "'";
+    } else {
+        plan.command.replace(plan.command.size() - 2U, 2U, "$1");
+        const auto bytes = CeilDiv(geometry.block_bits, 8U);
+        // A binary bits parameter packs the first digit into the low bit.
+        const unsigned pattern = first_one ? 0x55U : 0xAAU;
+        plan.payload = "$" + std::to_string(bytes) + "\r\n";
+        plan.payload.append(bytes, static_cast<char>(pattern));
+        const auto tail = geometry.block_bits % 8U;
+        if (tail != 0U) plan.payload.back() = static_cast<char>(pattern & ((1U << tail) - 1U));
+    }
+    return plan;
 }
 
 [[nodiscard]] RequestPlan BlockGetPlan(std::int64_t x, std::int64_t y, const GeometryInfo& geometry) {
@@ -2020,9 +2053,11 @@ bool TakeoverTerminal(std::string_view line) {
     return result;
 }
 
-void ValidateEnabledArgs(const Args& args) {
+void ValidateEnabledArgs(const Args& args, bool geometry_flags_supplied = false) {
     if (args.port == 0 && args.server_mode != ServerMode::kSpawn)
         throw std::invalid_argument("--port 0 requires --server-mode spawn");
+    if (args.server_mode != ServerMode::kSpawn && (geometry_flags_supplied || args.chunk_blocks != 16U || args.block_bits != 16U))
+        throw std::invalid_argument("--chunk-blocks and --block-bits require --server-mode spawn");
     if (args.with_metadata != "none" && args.with_metadata != "version" &&
         args.with_metadata != "schema" && args.with_metadata != "both") throw std::invalid_argument("invalid --with value");
     if (args.watch_mode != "ordinary" && args.watch_mode != "progress" &&
@@ -2065,6 +2100,23 @@ void WaitForServerReady(const Args& args) {
 }
 
 }  // namespace
+
+GeometryConfig SpawnGeometry(const Args& args) {
+    RequireGeometrySize(args.chunk_blocks, "--chunk-blocks", kMaxSquareChunkSide);
+    RequireGeometrySize(args.block_bits, "--block-bits", kMaxFixedBitsPerBlock);
+    const GeometryConfig config{
+        .large_chunk_width_chunks = 8U,
+        .large_chunk_height_chunks = 8U,
+        .chunk_width_blocks = static_cast<std::uint32_t>(args.chunk_blocks),
+        .chunk_height_blocks = static_cast<std::uint32_t>(args.chunk_blocks),
+        .block_bits = static_cast<std::uint32_t>(args.block_bits),
+        .dims = 2U,
+        .chunk_depth_blocks = 1U,
+        .large_chunk_depth_chunks = 1U,
+    };
+    (void)Geometry(config);
+    return config;
+}
 
 const char* ServerModeName(ServerMode mode) noexcept {
     switch (mode) {
@@ -2151,6 +2203,9 @@ std::string UsageText() {
         << "  --tests takeover                report-only idle ownership cycles; clients/pipeline must be 1\n"
         << "  --server-workers <N>             spawn mode: server worker threads (default: 4); a\n"
         << "                                   connection holds one, so use at least --clients\n"
+        << "  --chunk-blocks <N>               spawn mode: N x N blocks (1..1024, default: 16)\n"
+        << "  --block-bits <N>                 spawn mode: bits(N) blocks (1..65535, default: 16)\n"
+        << "                                   Combined chunk payload must fit in 64 MiB.\n"
         << "  --failed-logins <N>              report-only: N clients log in with a wrong password\n"
         << "                                   beside the measured clients; requires --user\n"
         << "  --idle-connections <N>           N more connections log in before each scenario and stay\n"
@@ -2179,6 +2234,7 @@ Args ParseArgs(const std::vector<std::string>& argv) {
     bool host_overridden = false;
     bool port_overridden = false;
     bool user_overridden = false;
+    bool geometry_flags_supplied = false;
 
     for (std::size_t i = 1; i < argv.size(); ++i) {
         const std::string& arg = argv[i];
@@ -2308,6 +2364,14 @@ Args ParseArgs(const std::vector<std::string>& argv) {
             args.server_workers = ParsePositiveSize(require_value("--server-workers"), "--server-workers");
             continue;
         }
+        if (arg == "--chunk-blocks" || arg == "--block-bits") {
+            const bool chunk_blocks = arg == "--chunk-blocks";
+            const auto value = require_value(arg.c_str());
+            auto& width = chunk_blocks ? args.chunk_blocks : args.block_bits;
+            width = ParseGeometrySize(value, arg.c_str(), chunk_blocks ? kMaxSquareChunkSide : kMaxFixedBitsPerBlock);
+            geometry_flags_supplied = true;
+            continue;
+        }
         if (arg == "--failed-logins") {
             args.failed_logins = ParsePositiveSize(require_value("--failed-logins"), "--failed-logins");
             continue;
@@ -2379,12 +2443,14 @@ Args ParseArgs(const std::vector<std::string>& argv) {
     if (args.keyspace == 0) {
         throw std::invalid_argument("--keyspace must be > 0");
     }
-    ValidateEnabledArgs(args);
+    ValidateEnabledArgs(args, geometry_flags_supplied);
+    if (args.server_mode == ServerMode::kSpawn) (void)SpawnGeometry(args);
     return args;
 }
 
 BenchmarkReport Run(const Args& requested) {
     ValidateEnabledArgs(requested);
+    const auto spawn_geometry = requested.server_mode == ServerMode::kSpawn ? SpawnGeometry(requested) : GeometryConfig{};
     // A spawned server on port 0 sets the port the clients use.
     Args args = requested;
     if (args.io_timeout_ms == 0 || args.io_timeout_ms > 86400000) {
@@ -2450,13 +2516,7 @@ BenchmarkReport Run(const Args& requested) {
     std::thread server_thread;
     try {
         const StoreConfig store_config{
-            .geometry = {
-                .large_chunk_width_chunks = 8,
-                .large_chunk_height_chunks = 8,
-                .chunk_width_blocks = 16,
-                .chunk_height_blocks = 16,
-                .block_bits = 16,
-            },
+            .geometry = spawn_geometry,
             .data_dir = data_dir,
             .durability_mode = ParseDurabilityMode(args.durability_mode),
             .checkpoint_update_interval = 512,
@@ -2495,7 +2555,7 @@ BenchmarkReport Run(const Args& requested) {
             ServerConfig{
                 .host = args.host,
                 .port = args.port,
-                .max_line_bytes = 65536,
+                .max_line_bytes = kSpawnMaxLineBytes,
                 .worker_threads = args.server_workers,
                 .client_io_timeout_ms = args.io_timeout_ms,
                 // Idle connections stay open for the whole run.

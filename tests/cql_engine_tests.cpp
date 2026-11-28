@@ -3,6 +3,7 @@
 // and how parameter frames are planned.
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <barrier>
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <future>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -23,6 +25,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
 #include "../src/chunk_store_internal.hpp"
+#include "../src/feed_slot_records.hpp"
 #include "../src/store_manifest.hpp"
 #include "../src/sectioned_chunk_form.hpp"
 #include "../src/statement_control.hpp"
@@ -130,9 +133,10 @@ struct Fixture {
     std::unique_ptr<CommandEngine> engine;
     chunkdb::SessionState session;
 
-    Fixture() {
+    explicit Fixture(std::chrono::milliseconds slot_sync_interval = chunkdb::kDefaultSlotSyncInterval) {
         chunkdb::CatalogConfig config;
         config.data_dir = dir.path();
+        config.slot_sync_interval = slot_sync_interval;
         catalog = std::make_shared<chunkdb::TableCatalog>(config);
         (void)catalog->Create("world", kWorldGeometry, chunkdb::TableOptions{}, World());
         (void)catalog->Create("plain", kPlainGeometry, chunkdb::TableOptions{});
@@ -309,13 +313,16 @@ void TestHello() {
     assert(session.greeted);
     assert(Contains(hello, "$14\r\nmax_scan_limit\r\n:1024\r\n"));
     assert(Contains(hello, "$16\r\nserver_signature\r\n$"));
-    assert(Contains(hello, "$8\r\nfeatures\r\n*15\r\n$19\r\nprotocol_foundation\r\n"));
+    assert(Contains(hello, "$8\r\nfeatures\r\n*19\r\n$19\r\nprotocol_foundation\r\n"));
     assert(Contains(hello, "$12\r\nslot_filters\r\n$13\r\nslot_takeover\r\n$7\r\nlineage\r\n"));
-    assert(Contains(hello, "$19\r\nconnection_controls\r\n$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n$11\r\narea_paging\r\n$10\r\narea_scale\r\n$22\r\nread_only_transactions\r\n$9\r\nreturning\r\n$13\r\nwatch_catalog\r\n"));
+    assert(Contains(hello, "$19\r\nconnection_controls\r\n$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n"
+        "$11\r\narea_paging\r\n$10\r\narea_scale\r\n$22\r\nread_only_transactions\r\n$9\r\nreturning\r\n"
+        "$13\r\nwatch_catalog\r\n$10\r\nslot_areas\r\n$9\r\nscan_area\r\n$18\r\nwatch_area_replace\r\n"
+        "$15\r\nblock_selection\r\n"));
     ExpectError(engine.Execute(session, "HELLO 3\r\n"), "PROTOCOL HELLO was already sent");
     ExpectReply(engine.Execute(session, "PING\r\n"), "+PONG\r\n");
     // Commands of the retired protocol 2 are not statements.
-    ExpectError(engine.Execute(session, "GET 0 0\r\n"), "SYNTAX column 5: expected BLOCK, CHUNK or AREA, got '0'");
+    ExpectError(engine.Execute(session, "GET 0 0\r\n"), "SYNTAX column 5: expected BLOCK, BLOCKS, CHUNK or AREA, got '0'");
     ExpectError(engine.Execute(session, "CHUNKGET 0 0\r\n"), "UNKNOWN_COMMAND column 1: unknown statement 'CHUNKGET'");
 }
 
@@ -971,6 +978,14 @@ void TestScanChunks() {
     assert(rest.size() == 1 && rest[0] == all[2] && !rest_more);
     ExpectError(f.Run("SCAN CHUNKS FROM world LIMIT 0"), "LIMIT must be between 1 and 1024");
     ExpectError(f.Run("SCAN CHUNKS FROM world LIMIT 1025"), "LIMIT must be between 1 and 1024");
+    // An AREA or AREA AROUND keeps only the chunks inside it.
+    const auto [box, box_more] = ScanOf(f.Run("SCAN CHUNKS FROM world AREA 0 0 TO 1 1"));
+    assert((box == std::vector<std::pair<std::int64_t, std::int64_t>>{{0, 0}, {1, 0}}) && !box_more);
+    const auto [ball, ball_more] = ScanOf(f.Run("SCAN CHUNKS FROM world AREA AROUND -1 1 RADIUS 1"));
+    assert((ball == std::vector<std::pair<std::int64_t, std::int64_t>>{{-1, 2}}) && !ball_more);
+    const auto [paged, paged_more] = ScanOf(f.Run("SCAN CHUNKS FROM world AREA 0 0 TO 1 1 LIMIT 1 AFTER -1 1"));
+    assert((paged == std::vector<std::pair<std::int64_t, std::int64_t>>{{0, 0}}) && paged_more);
+    ExpectError(f.Run("SCAN CHUNKS FROM world AREA 0 0 0 TO 1 1 1"), "coordinate dimensions differ");
     ExpectError(f.Run("SCAN CHUNKS FROM nowhere"), "NO_TABLE");
 }
 
@@ -1011,9 +1026,16 @@ std::uint64_t MapInteger(const std::string& reply, const std::string& key) {
 void TestTableStats() {
     Fixture f;
     const auto empty = f.Run("SHOW TABLE STATS plain");
-    assert(empty.starts_with("%11\r\n") && MapInteger(empty, "chunks") == 0U && MapInteger(empty, "loaded_chunks") == 0U);
+    assert(empty.starts_with("%19\r\n") && MapInteger(empty, "chunks") == 0U && MapInteger(empty, "loaded_chunks") == 0U);
     assert(MapInteger(empty, "slots") == 0U && MapInteger(empty, "watches") == 0U);
     assert(MapInteger(empty, "files") >= 1U && MapInteger(empty, "disk_bytes") > 0U); // Its manifest at least.
+    // No image, WAL, cached chunk, feed or transaction yet; the coordinate
+    // index inventory exists from creation.
+    assert(MapInteger(empty, "image_bytes") == 0U && MapInteger(empty, "wal_bytes") == 0U &&
+        MapInteger(empty, "archive_bytes") == 0U);
+    assert(MapInteger(empty, "index_bytes") > 0U && MapInteger(empty, "cache_bytes") == 0U);
+    assert(MapInteger(empty, "feed_bytes") == 0U && MapInteger(empty, "history_bytes") == 0U);
+    assert(MapInteger(empty, "open_transactions") == 0U);
     (void)VersionOf(f.Run("SET BLOCK 0 0 IN plain bits = b'000000000001'"));
     (void)VersionOf(f.Run("SET BLOCK 5 5 IN plain bits = b'000000000001'"));
     ExpectReply(f.Run("CREATE SLOT 'consumer' ON plain"), "+OK\r\n");
@@ -1022,8 +1044,24 @@ void TestTableStats() {
     assert(MapInteger(written, "chunks") == 2U && MapInteger(written, "loaded_chunks") == 2U);
     assert(MapInteger(written, "slots") == 1U && MapInteger(written, "watches") == 1U);
     assert(MapInteger(written, "files") > MapInteger(empty, "files") && MapInteger(written, "disk_bytes") > MapInteger(empty, "disk_bytes"));
+    assert(MapInteger(written, "cache_bytes") > 0U);
+    // The live feed holds a change once its reader has it.
+    (void)VersionOf(f.Run("SET BLOCK 1 1 IN plain bits = b'000000000001'"));
+    assert(subscription->Next(std::chrono::seconds(10)) != nullptr);
+    assert(MapInteger(f.Run("SHOW TABLE STATS plain"), "feed_bytes") > 0U);
     subscription.reset();
     assert(MapInteger(f.Run("SHOW TABLE STATS plain"), "watches") == 0U);
+    // A transaction counts once it reads the table, and a write keeps for its
+    // snapshot the state it replaces.
+    chunkdb::SessionState reader;
+    ExpectReply(f.engine->Execute(reader, "HELLO 3\r\n").substr(0, 5), "%14\r\n");
+    ExpectReply(f.engine->Execute(reader, "BEGIN\r\n"), "+OK\r\n");
+    (void)f.engine->Execute(reader, "GET BLOCK 0 0 FROM plain\r\n");
+    assert(MapInteger(f.Run("SHOW TABLE STATS plain"), "open_transactions") == 1U);
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN plain bits = b'000000000011'"));
+    assert(MapInteger(f.Run("SHOW TABLE STATS plain"), "history_bytes") > 0U);
+    ExpectReply(f.engine->Execute(reader, "ROLLBACK\r\n"), "+OK\r\n");
+    assert(MapInteger(f.Run("SHOW TABLE STATS plain"), "open_transactions") == 0U);
     assert(MapInteger(f.Run("SHOW TABLE STATS world"), "chunks") == 0U);
     ExpectError(f.Run("SHOW TABLE STATS absent"), "NO_TABLE");
     // The listing stops when its statement is stopped.
@@ -1063,6 +1101,71 @@ void TestTableStats() {
     f.engine->SetHookForTests(nullptr);
 }
 
+void TestTableStatsFileBytes() {
+    namespace fs = std::filesystem;
+    Fixture f(std::chrono::hours(1));
+    const auto table = f.catalog->Require("plain");
+    const auto root = f.dir.path() / "tables" / "plain";
+    const auto geometry = table->geometry();
+    // Make a retained deletion in a different shard so both kinds of index
+    // file exist before the slot starts retaining WALs.
+    {
+        auto lease = table->Acquire();
+        auto& store = lease->store();
+        store.SetBlockBits(0, 8, "000000000001");
+        (void)store.UnsetBlock(0, 8);
+        store.CheckpointForTests(0, 2);
+    }
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN plain bits = b'000000000001'"));
+    ExpectReply(f.Run("CREATE SLOT 'consumer' ON plain"), "+OK\r\n");
+    const auto archived = VersionOf(f.Run("SET BLOCK 0 0 IN plain bits = b'000000000011'"));
+    (void)VersionOf(f.Run("SET BLOCK 4 0 IN plain bits = b'000000000001'"));
+    {
+        auto lease = table->Acquire();
+        auto& store = lease->store();
+        store.CheckpointForTests(0, 0);
+        store.WalBarrier();
+    }
+    const auto archive = root / chunkdb::kFeedArchiveDirName;
+    const auto revision = std::to_string(archived);
+    const auto base = "C_0_0." + revision;
+    const auto live_image = chunkdb::ChunkDataPath(root, geometry, {0, 0});
+    const auto live_wal = chunkdb::ChunkWalPath(root, geometry, {1, 0});
+    const auto images = fs::file_size(live_image);
+    const auto wals = fs::file_size(live_wal);
+    const auto archives = fs::file_size(archive / (base + "-" + revision + ".wal")) +
+        fs::file_size(archive / (base + ".chk")) + fs::file_size(archive / (base + ".base"));
+    const auto indexes = fs::file_size(root / "chunkdb.index") + fs::file_size(root / "L_0_1" / "chunkdb.index");
+    const auto check_buckets = [&](const std::string& stats) {
+        assert(MapInteger(stats, "image_bytes") == images);
+        assert(MapInteger(stats, "wal_bytes") == wals);
+        assert(MapInteger(stats, "archive_bytes") == archives);
+        assert(MapInteger(stats, "index_bytes") == indexes);
+    };
+    const auto before = f.Run("SHOW TABLE STATS plain");
+    check_buckets(before);
+
+    // A valid chunk name under the wrong shard, a noncanonical shard,
+    // a non-coordinate stem, and an unrelated index directory are plain files.
+    const std::array unrelated{
+        root / "L_0_0" / "C_2_0.wal",
+        root / "L_misc" / "C_0_0.chk",
+        root / "L_0_0" / u8"notes-\u00e9.chk",
+        root / "indexes" / "other.index",
+    };
+    for (const auto& path : unrelated) {
+        fs::create_directories(path.parent_path());
+        std::ofstream output(path, std::ios::binary);
+        output.put('x');
+        output.close();
+        assert(output);
+    }
+    const auto after = f.Run("SHOW TABLE STATS plain");
+    check_buckets(after);
+    assert(MapInteger(after, "files") == MapInteger(before, "files") + unrelated.size());
+    assert(MapInteger(after, "disk_bytes") == MapInteger(before, "disk_bytes") + unrelated.size());
+}
+
 void TestShowStatus() {
     Fixture f;
     const auto status = f.Run("SHOW STATUS");
@@ -1085,7 +1188,7 @@ void TestSlotStatements() {
     expected += "\r\n$8\r\nrevision\r\n:" + std::to_string(world.durable_watermark);
     expected += "\r\n$13\r\nlag_revisions\r\n:" + std::to_string(world.durable_watermark - world.position.revision);
     expected += "\r\n$14\r\nretained_bytes\r\n:0\r\n$8\r\nattached\r\n#f\r\n$4\r\npeer\r\n_\r\n$11\r\nlast_ack_ms\r\n_\r\n$4\r\nlost\r\n#f\r\n";
-    expected += "$11\r\nlost_reason\r\n_\r\n$7\r\nfilters\r\n%5\r\n$4\r\narea\r\n_\r\n$10\r\ncolumn_ids\r\n_\r\n$7\r\ncolumns\r\n_\r\n$9\r\nno_before\r\n#f\r\n$6\r\nchunks\r\n#f\r\n$5\r\nowner\r\n_\r\n";
+    expected += "$11\r\nlost_reason\r\n_\r\n$7\r\nfilters\r\n%6\r\n$4\r\narea\r\n_\r\n$5\r\nareas\r\n_\r\n$10\r\ncolumn_ids\r\n_\r\n$7\r\ncolumns\r\n_\r\n$9\r\nno_before\r\n#f\r\n$6\r\nchunks\r\n#f\r\n$5\r\nowner\r\n_\r\n";
     ExpectReply(f.Run("SHOW SLOTS ON world"), expected); // No user records no owner.
     ExpectReply(f.Run("CREATE SLOT 'owned' ON plain OWNER bot NO BEFORE"), "+OK\r\n");
     assert(f.Run("SHOW SLOTS ON plain").find("$5\r\nowner\r\n$3\r\nbot\r\n") != std::string::npos);
@@ -1237,6 +1340,7 @@ int main(int argc, char** argv) {
     TestConcurrentConditionalCreate();
     TestScanChunks();
     TestTableStats();
+    TestTableStatsFileBytes();
     TestShowStatus();
     TestSlotStatements();
     TestReadOnlySlotWithoutOwner();

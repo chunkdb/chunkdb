@@ -274,12 +274,13 @@ See [Server flags](../SERVER_FLAGS.md#table-geometry).
 ## Feature activation
 
 `SHOW STATUS` requires MONITOR or ADMIN on `*` and reports recorded directory and table features.
-`tables` lists the tables whose features can be read; a table's `state` is `ok`, or `fenced` with the fence reason.
+`tables` lists the tables whose features can be read; a table's `state` is `ok`, `fenced` with the fence reason, or `frozen`.
+A `frozen` table is fenced and has a slot that is not lost: its store failed closed after a durability failure, so its slots' durable `revision` stays until RECOVER TABLE or a restart; its `reason` says so and names the fence reason.
 `fenced` lists, with the fence reason, the fenced tables whose features cannot be read: those whose store is not open or whose feed cleanup failed.
 Its protected snapshot refuses unhealthy serving state instead of guessing whether activation completed.
 `ENABLE FEATURE 'name'` requires ADMIN on `*` and returns OK for an already enabled feature.
 
-New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, `feature_activation`, and `chunk_model`.
+New directories enable `feed_slots`, `migrations`, `table_lineage`, `slot_filters`, `feature_activation`, `chunk_model`, and `commit_groups`.
 A directory keeps its recorded bits; only ENABLE FEATURE adds one, and it refuses any other feature while the directory lacks `feature_activation`.
 Activation validates every table before recording its durable decision, then updates only that feature's registered owners.
 A fenced table refuses activation with its fenced message until RECOVER TABLE.

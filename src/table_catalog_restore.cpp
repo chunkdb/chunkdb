@@ -6,6 +6,7 @@
 
 #include "backup.hpp"
 #include "checkpoint.hpp"
+#include "commit_owner_bootstrap.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/logging.hpp"
 #include "durability_io.hpp"
@@ -100,15 +101,6 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
     TableRestoreResult result;
     result.name = request.name;
     StoreManifest manifest;
-    // The table must have the table-owned features the directory gives its tables.
-    const auto require_features = [&] {
-        const auto directory_manifest = ReadDataDirManifest(config_.data_dir);
-        if (!directory_manifest) throw std::runtime_error("data directory manifest disappeared");
-        const auto served = TableScopedFeatures(directory_manifest->features);
-        if (TableScopedFeatures(manifest.features).incompat != served.incompat)
-            throw std::invalid_argument("the backed-up table has features " + DescribeFeatures(TableScopedFeatures(manifest.features)) +
-                " but this data directory gives its tables " + DescribeFeatures(served));
-    };
     std::shared_lock<BackupMaintenanceGate> metadata;
     std::unique_lock operations(operations_mutex_, std::defer_lock);
     try {
@@ -121,15 +113,32 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         if ((manifest.features.incompat & kFeatureTableLineage) == 0U)
             throw FeatureAdmissionError("feature_disabled", "table_lineage",
                 "restore requires table_lineage on the backed-up table; enable it on the source and create another backup");
-        require_features();
+        // Keep the destination owner stable from the staged rewrite through publication.
+        if (!feature_metadata_gate_.lock_shared(request.cancelled)) throw std::runtime_error("backup cancelled");
+        metadata = std::shared_lock(feature_metadata_gate_, std::adopt_lock);
+        const auto directory_manifest = ReadDataDirManifest(config_.data_dir);
+        if (!directory_manifest) throw std::runtime_error("data directory manifest disappeared");
+        // commit_groups follows the directory's owner: the rebind sets or clears it.
+        auto served = TableScopedFeatures(directory_manifest->features);
+        served.incompat &= ~kFeatureCommitGroups;
+        auto restored = TableScopedFeatures(manifest.features);
+        restored.incompat &= ~kFeatureCommitGroups;
+        if (restored.incompat != served.incompat)
+            throw std::invalid_argument("the backed-up table has features " + DescribeFeatures(TableScopedFeatures(manifest.features)) +
+                " but this data directory gives its tables " + DescribeFeatures(served));
         RequireValidTableOptions(DecodeTableOptions(manifest.options));
         RequireRecoverableOptions(request.name, manifest);
         result.parent_epoch = copy.cut.epoch;
         result.fork_revision = copy.cut.revision;
         result.files = copy.files.size();
         result.bytes = copy.bytes;
-        result.epoch = RebindRestoredTable(staging, copy.cut, copy.files, request.cancelled);
+        const auto owner = commit_owner_context_ ? std::optional(commit_owner_context_->scope()) : std::nullopt;
+        if (owner != directory_manifest->commit_owner) throw std::runtime_error("destination commit owner scope changed");
+        result.epoch = RebindRestoredTable(staging, copy.cut, copy.files, owner, request.cancelled);
         manifest.store_id = result.epoch;
+        manifest.commit_owner = owner;
+        if (owner) manifest.features.incompat |= kFeatureCommitGroups;
+        else manifest.features.incompat &= ~kFeatureCommitGroups;
         manifest.lineage = TableLineage{result.parent_epoch, result.fork_revision};
         std::ostringstream findings;
         if (VerifyTableDirectory(staging, findings).errors != 0U)
@@ -137,11 +146,6 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         SyncBackupTree(staging, request.cancelled);
         if (request.cancelled.stop_requested()) throw std::runtime_error("backup cancelled");
         CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_BEFORE_PUBLISH_ONCE");
-        // ENABLE FEATURE cannot change the directory's features from this
-        // check until the table serves.
-        if (!feature_metadata_gate_.lock_shared(request.cancelled)) throw std::runtime_error("backup cancelled");
-        metadata = std::shared_lock(feature_metadata_gate_, std::adopt_lock);
-        require_features();
         operations.lock();
         require_name();
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RESTORE_TABLE_PUBLISH_FAIL_ONCE"))

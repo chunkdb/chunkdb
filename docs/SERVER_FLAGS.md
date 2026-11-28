@@ -139,7 +139,7 @@ The cache setting also bounds large-chunk containers shared by the tables, inclu
 A new cache miss that cannot fit returns `BUSY reason=large_chunk_cache_full` before applying a mutation; existing container hits remain usable.
 Raise `--max-loaded-chunks` to raise the associated container limit.
 
-`--cache-max-bytes` counts each cached chunk's values, presence bits, variable values, chunk columns and pending WAL batch.
+`--cache-max-bytes` uses the same per-chunk memory estimate as [SHOW TABLE STATS](reference/CHUNKS.md#table-stats), including the chunk object and its retained value, presence, variable value and offset, chunk-column, WAL batch and write scratch storage.
 A chunk is measured when it loads and at each of its checkpoints, so writes that grow variable values between checkpoints are counted late.
 A cache miss above the byte limit starts eviction of the coldest chunks across all tables, aiming to reduce measured use to roughly fifteen sixteenths of the limit.
 Checkpoint growth queues a bounded eviction pass on the maintenance pool even when background checkpoints are off, and overshoot has no fixed byte or time bound if eviction falls behind or a pass cannot free enough eligible chunks.

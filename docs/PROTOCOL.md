@@ -73,13 +73,17 @@ Before authentication HELLO takes at most 12 parameters; a HELLO with more recei
 
 `client_name` and `statement_timeout_ms` apply; `default_tag` is stored with `reason=implementation_pending`.
 The effective statement timeout appears in `options`, including the server default when HELLO omits it.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, `read_only_transactions`, `returning`, and `watch_catalog`.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, `read_only_transactions`, `returning`, `watch_catalog`, `slot_areas`, `scan_area`, `watch_area_replace`, and `block_selection`.
 Options become visible only after authentication succeeds.
 The `returning` feature permits [RETURNING](#returning) on SET BLOCK and DELETE BLOCK; `limits.max_returning_rows` bounds its rows and `limits.max_expression_nodes` each expression.
 The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
 The `area_scale` feature permits GET AREA SCALE and its downsampled forms.
 The `read_only_transactions` feature permits BEGIN READ ONLY and SCAN CHUNKS inside it.
 The `watch_catalog` feature permits WATCH CATALOG and its `catalog` events.
+The `slot_areas` feature permits several areas in CREATE SLOT and adds `areas` to the SHOW SLOTS filters.
+The `scan_area` feature permits SCAN CHUNKS with AREA or AREA AROUND.
+The `watch_area_replace` feature permits WATCH AREA on a streaming table watch without SLOT.
+The `block_selection` feature permits the BLOCKS selection in GET, AGGREGATE and SCAN CHUNKS and WHERE in GET AREA and GET BLOCKS.
 A chunk too large for an empty page ends the page before it and is then refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=... required=... limit=...`; see [chunks](reference/CHUNKS.md#limits).
 The configured positive area bounds appear as both `max_area_chunks`/`max_response_bytes` and `limits.max_area_chunks`/`limits.max_area_response_bytes`.
 `limits.txn_max_written_chunks` and `limits.txn_max_read_chunks` are the configured transaction chunk-count bounds.
@@ -167,10 +171,12 @@ Never-written chunks and identities forgotten by tombstone compaction have null 
 Schema versions remain known for absent rows and empty areas; area consistency otherwise remains unchanged.
 Coordinate tuples contain exactly `dims` signed values: x and y, then z only in a three-dimensional table.
 SCAN CHUNKS returns a map with `chunks`, `more`, `epoch`, nullable completed `position`, and `retained_deletion_floor`.
-With WHERE, the map adds `after` after `more`: the coordinates of the last chunk the page visited, or null when `more` is false.
+With WHERE or BLOCKS, the map adds `after` after `more` with the last chunk coordinate counted toward the page limit, or null when `more` is false.
+With BLOCKS this cursor can lie outside the selected region because the limit also counts excluded candidates within its chunk x range.
 Its rows are `[coordinates..., chunk_version]`, with a form-or-null appended under WITH DATA.
 Rows ascend by cx, then cy, then cz.
 SINCE includes retained deletions and refuses a revision below the deletion floor with `RESYNC_REQUIRED reason=history_lost floor=... epoch=...`, adding `current` when known.
+A SCAN CHUNKS with SINCE requires WITH DATA when it uses WHERE or BLOCKS.
 AGGREGATE returns a map from each function's lowercase name, such as `count(*)` or `sum(a)`, to its result, in statement order.
 With BY CHUNK it returns an array of rows `[coordinates..., results...]`, one per chunk with a present block that matches WHERE, in coordinate order.
 COUNT(*) is an integer; SUM, MIN and MAX of integer columns are integers or big numbers; AVG and float SUM are doubles; float MIN and MAX are doubles that keep the column value, so an f32 prints at f32 precision; a function over no value is null.
@@ -266,7 +272,10 @@ One transaction forms one change; AREA clips it by inclusive chunk coordinates.
 Revisions have gaps and define order; timestamps do not.
 AFTER can resume at a progress revision within the retained prefix, including a gap without a change frame.
 
-Only UNWATCH, plus ACK on a slot watch, is accepted while streaming; another statement receives PROTOCOL and closes.
+Only UNWATCH, WATCH AREA, and ACK on a slot watch are accepted while streaming; another statement receives PROTOCOL and closes.
+WATCH AREA replaces the areas of a table watch without SLOT and replies `{epoch, revision}` after the pushes sent with the old areas, including buffered CHUNKS pushes.
+Later pushes carry changes after that revision in the new areas, as described in [feed statements](reference/FEED.md#returns).
+If the watch needs to resync while draining the old areas, the reply precedes the resync.
 Lines sent after WATCH before its reply are read by the stream the same way.
 UNWATCH replies OK after the last push, then ordinary statements resume. An ordinary subscription is removed and its configured linger policy takes effect before OK.
 ACK has no success reply and cannot exceed the last fully sent change, progress push or accepted start position.
@@ -328,11 +337,15 @@ SLOT_BUSY identifies an attached slot; SLOT_LOST identifies unavailable retained
 A catalog change can report `reason=disk_full` after publication, such as when a rename completes but its directory sync fails, so inspect the catalog state before retrying.
 `reason=schema_filter` identifies a lost stable-ID projection; `reason=retention_limit` identifies retained-history overflow.
 SHOW SLOTS adds `lost_reason` (null while healthy), a `filters` map, and `owner` (shown to that user and to MANAGES USERS; null otherwise or for a slot without a recorded owner).
-Its keys are `area`, `columns`, `column_ids`, `no_before`, and `chunks`.
+The six keys in the `filters` map are `area`, `areas`, `column_ids`, `columns`, `no_before`, and `chunks`.
 
-Unfiltered area and projection fields are null; projected names and IDs are aligned arrays in declared order.
+`area` holds the bounds when there is exactly one area and is null otherwise.
+`areas` lists the distinct area bounds sorted by first coordinate and then by last coordinate, and is null when there is no area filter.
+Projected names and IDs are aligned arrays in declared order.
+Both fields are null when there is no projection.
 A dropped column keeps its ID and has a null display name.
-Area bounds are signed `[x0,y0,x1,y1]` with inclusive endpoints; both flags are booleans.
+Area bounds are signed `[x0,y0,x1,y1]` in 2D or `[x0,y0,z0,x1,y1,z1]` in 3D, with inclusive endpoints.
+Both flags are booleans.
 VERSION_MISMATCH, CONDITION_FAILED and SCHEMA_MISMATCH include `current`, the chunk or schema version; schema rejection also includes `actual` and `table`.
 RATE_LIMITED authentication bans include remaining `retry_after_ms`.
 OUTCOME_UNKNOWN includes `stage` and requires writer recovery before retrying ([durability](DURABILITY_CONTRACT.md)).

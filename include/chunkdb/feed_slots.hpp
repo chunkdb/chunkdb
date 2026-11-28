@@ -16,12 +16,15 @@ inline constexpr std::chrono::milliseconds kDefaultSlotSyncInterval{100};
 
 // Stable IDs survive column renames and determine projection identity.
 struct FeedSlotFilters {
-    std::optional<FeedArea> area{};
+    // Empty for the whole table; a slot keeps a chunk inside any of them. A
+    // slot records them in order, without repeats (SortFeedAreas), at most
+    // kMaxFeedAreas.
+    std::vector<FeedArea> areas{};
     std::optional<std::vector<std::uint32_t>> column_ids{};
     bool no_before = false;
     bool chunks = false;
     friend bool operator==(const FeedSlotFilters&, const FeedSlotFilters&) = default;
-    [[nodiscard]] bool empty() const noexcept { return !area && !column_ids && !no_before && !chunks; }
+    [[nodiscard]] bool empty() const noexcept { return areas.empty() && !column_ids && !no_before && !chunks; }
 };
 
 struct FeedSlot {

@@ -48,6 +48,9 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
     void Stop();
     void Wake() noexcept;
     bool Add(std::shared_ptr<ServerConnection> connection);
+    // Makes the I/O thread serve `connection` if it owns it, after another
+    // thread changed what the connection waits for.
+    void Touch(const std::shared_ptr<ServerConnection>& connection);
 
   private:
     friend class ChunkServer;
@@ -84,9 +87,11 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
     std::shared_ptr<server_detail::ConnectionByteBudget::Credit> TakeLineCredit(const ServerConnection& connection);
     void CheckStatements();
     ChunkServer& server_;
-    server_detail::SocketPoller poller_;
+    server_detail::ReadinessPoller poller_;
     std::mutex mutex_;
     std::vector<std::shared_ptr<ServerConnection>> incoming_;
+    // Connections another thread changed, such as by KILL, for the next pass to serve.
+    std::vector<std::weak_ptr<ServerConnection>> touched_incoming_;
     std::thread thread_;
     std::shared_ptr<server_detail::ConnectionByteBudget> data_credit_, control_credit_, line_credit_, data_line_credit_;
     std::shared_ptr<server_detail::ConnectionByteBudget> data_output_credit_, control_output_credit_, listing_output_credit_;
@@ -101,5 +106,8 @@ class IdleIo : public std::enable_shared_from_this<IdleIo> {
     std::vector<TrackedStatement> statements_;
     std::vector<TrackedStatement> incoming_statements_;
     std::vector<std::shared_ptr<ServerConnection>> clients_returned_;
+    // This thread only: connections that PumpCredits granted credit, and
+    // those CheckStatements answered without returning them, to be served.
+    std::vector<std::shared_ptr<ServerConnection>> granted_, touched_;
 };
 }  // namespace chunkdb

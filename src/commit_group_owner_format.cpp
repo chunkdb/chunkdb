@@ -1,4 +1,5 @@
 #include "commit_group_owner_format.hpp"
+#include "commit_owner_value_format.hpp"
 
 #include <algorithm>
 #include <bit>
@@ -76,7 +77,7 @@ void Ref(const CommitOwnerObjectRef& ref) {
         if (ref.bytes != 0U || !Zero(ref.sha256)) Bad("absent reference");
         return;
     }
-    if (kind > 10U || Zero(ref.sha256)) Bad("reference kind or digest");
+    if (kind > 11U || Zero(ref.sha256)) Bad("reference kind or digest");
     std::uint64_t low = 68U, high = kMaxCommitOwnerPageBytes;
     switch (ref.kind) {
         case CommitOwnerObjectKind::kRoot: low = high = kCommitOwnerRootBytes; break;
@@ -145,6 +146,8 @@ std::size_t Width(CommitOwnerTreeKind tree) {
         case CommitOwnerTreeKind::kCoverage: return 41U;
         case CommitOwnerTreeKind::kGroups: return 16U;
         case CommitOwnerTreeKind::kMembers: return 24U;
+        case CommitOwnerTreeKind::kOwnerEdges: return kCommitOwnerEdgeKeyBytes;
+        case CommitOwnerTreeKind::kObservations: return 24U;
     }
     Bad("tree kind");
 }
@@ -153,11 +156,18 @@ CommitOwnerObjectKind ValueKind(CommitOwnerTreeKind tree) {
         case CommitOwnerTreeKind::kCoverage: return CommitOwnerObjectKind::kCoverageValue;
         case CommitOwnerTreeKind::kGroups: return CommitOwnerObjectKind::kGroupValue;
         case CommitOwnerTreeKind::kMembers: return CommitOwnerObjectKind::kMemberValue;
+        case CommitOwnerTreeKind::kOwnerEdges: return CommitOwnerObjectKind::kOwnerEdge;
+        case CommitOwnerTreeKind::kObservations: return CommitOwnerObjectKind::kObservation;
     }
     Bad("tree kind");
 }
 void Prefix(CommitOwnerTreeKind tree, Bytes prefix) {
     const auto width = Width(tree); if (prefix.size() > width) Bad("key prefix length");
+    if (tree == CommitOwnerTreeKind::kOwnerEdges) {
+        if (!prefix.empty() && (prefix.front() < 1U || prefix.front() > 6U)) Bad("owner edge key class");
+        if (prefix.size() == width) ValidateCommitOwnerEdgeKey(prefix);
+        return;
+    }
     if (prefix.size() >= 16U && std::all_of(prefix.begin(), prefix.begin() + 16, [](auto b) { return b == 0U; }))
         Bad("zero key identity");
     if (tree == CommitOwnerTreeKind::kCoverage && prefix.size() >= 17U) {
@@ -193,7 +203,9 @@ std::size_t Page(const CommitOwnerPage& page) {
     if (size > kMaxCommitOwnerPageBytes) Bad("page byte ceiling");
     owned = Add(owned, size);
     if (keys != page.subtree_keys || owned != page.subtree_bytes) Bad("subtree totals");
-    if (page.tree == CommitOwnerTreeKind::kMembers && owned > kMaxCommitCoveredTreeBytes) Bad("covered metadata ceiling");
+    if ((page.tree == CommitOwnerTreeKind::kMembers || page.tree == CommitOwnerTreeKind::kOwnerEdges ||
+            page.tree == CommitOwnerTreeKind::kObservations) && owned > kMaxCommitCoveredTreeBytes)
+        Bad("covered metadata ceiling");
     return size;
 }
 CommitOwnerObjectRef Object(CommitOwnerObjectKind kind, Bytes bytes) {
@@ -273,6 +285,9 @@ CommitOwnerHeader InspectCommitOwnerHeader(Bytes bytes, const CommitOwnerScope& 
         if (header.bytes < kCommitOwnerEmptyPageBytes || header.bytes > kMaxCommitOwnerPageBytes) Bad("page extent");
     } else if (header.kind == CommitOwnerObjectKind::kMemberValue) {
         if (header.bytes != kCommitOwnerMemberBytes) Bad("covered member extent");
+    } else if (header.kind == CommitOwnerObjectKind::kCoverageValue || header.kind == CommitOwnerObjectKind::kGroupValue ||
+        header.kind == CommitOwnerObjectKind::kObservation || header.kind == CommitOwnerObjectKind::kOwnerEdge) {
+        if (header.bytes < 68U || header.bytes > kMaxCommitOwnerPageBytes) Bad("owner value extent");
     } else Bad("unsupported owner envelope kind");
     return header;
 }
@@ -386,7 +401,8 @@ CommitOwnerPage ParseCommitOwnerPage(Bytes bytes, const CommitOwnerScope& expect
 void ValidateCommitOwnerRootPage(const CommitOwnerRoot& root, CommitOwnerTreeKind tree, const CommitOwnerPage& page,
     const CommitOwnerObjectRef& checked_object) {
     Root(root); (void)Page(page);
-    if (root.state == CommitOwnerState::kInactive || tree == CommitOwnerTreeKind::kMembers) Bad("root tree selection");
+    if (root.state == CommitOwnerState::kInactive ||
+        (tree != CommitOwnerTreeKind::kCoverage && tree != CommitOwnerTreeKind::kGroups)) Bad("root tree selection");
     const auto& selected = tree == CommitOwnerTreeKind::kCoverage ? root.coverage_tree : root.group_tree;
     if (page.scope != root.scope || page.tree != tree || page.generation > root.generation || checked_object != selected ||
         checked_object != Object(CommitOwnerObjectKind::kPage, SerializeCommitOwnerPage(page))) Bad("selected tree binding");

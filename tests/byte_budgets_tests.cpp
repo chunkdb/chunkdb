@@ -180,7 +180,11 @@ void CheckpointGrowthQueuesEviction(bool fence_before_eviction) {
     Expect(f.Run("SET BLOCK 0 0 IN t note='" + std::string(16384U, 'x') + "'"), ":");
     assert(resources.CacheBytes() > resources.max_cache_bytes());
     const auto table = f.catalog->Require("t");
-    assert(table->Acquire()->store().RuntimeStats().checkpoints == 1U);
+    {
+        const auto lease = table->Acquire();
+        assert(lease->store().RuntimeStats().checkpoints == 1U);
+        assert(lease->store().LoadedChunkBytes() == resources.CacheBytes());
+    }
     if (fence_before_eviction) {
         // Run this barrier directly while the pool worker is still parked.
         txn_test::ScopedEnv failed("CHUNKDB_FAILPOINT_BARRIER_FSYNC_EIO_ONCE", "1");

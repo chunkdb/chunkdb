@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <charconv>
+#include <chrono>
 #include <limits>
 #include <map>
 
@@ -13,6 +14,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "feature_flags.hpp"
 #include "feed_archive.hpp"
+#include "feed_slot_logging.hpp"
 #include "wal_replay.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "shared_file_input.hpp"
@@ -292,8 +294,20 @@ void FeedSlots::Run() {
                 Sync(feed_->CompletedWatermark());
                 next_sync = std::chrono::steady_clock::now() + interval_;
             }
+            const auto acks = std::chrono::steady_clock::now();
             const bool acknowledged = FlushAcks(false);
             if (sync_due || acknowledged || !active()) Retain();
+            // The next pass waits for these steps on this thread.
+            auto elapsed = std::chrono::steady_clock::now() - acks;
+            if (auto* hook = hook_.load(std::memory_order_acquire)) elapsed = hook->AckRetentionElapsed(elapsed);
+            if (elapsed >= kSlowFeedSlotOperation) {
+                const auto slots = size();
+                LogFeedSlotDiagnostic([&] {
+                    LogMessage(LogLevel::kWarn, LogComponent::kStore, "feed slot acknowledgement and retention step was slow",
+                        {{"total_ms", std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count())},
+                         {"slots", std::to_string(slots)}});
+                });
+            }
             if (!active() && !store_.feed_watchers_active_.load(std::memory_order_acquire)) {
                 store_.feed_.store(nullptr, std::memory_order_seq_cst);
                 if (auto* hook = hook_.load(std::memory_order_acquire))
@@ -544,20 +558,44 @@ FeedArchiveReader FeedSlots::ReaderCompletedPrefix(std::string_view slot_name, F
     return FeedArchiveAccess::CreateCompletedPrefix(store_.data_dir_, store_.geometry_, epoch,
         after, through, std::move(pin), prefixes, store_.features_);
 }
+struct FeedSlots::SyncTiming {
+    std::chrono::steady_clock::duration flush{}, sync{}, persist{};
+    std::size_t chunks = 0U, files = 0U, swept_dirs = 0U;
+    bool first_pass = false, whole_directory = false;
+};
+
 void FeedSlots::Sync(std::uint64_t completed) {
+    SyncTiming timing;
     bool advanced;
-    try { advanced = SyncImpl(completed); }
+    try { advanced = SyncImpl(completed, timing); }
     catch (const std::exception& error) {
         store_.PoisonDurability("feed slot synchronization failed: " + std::string(error.what()));
         throw;
     }
-    // SyncImpl has released the WAL, checkpoint and records locks before
-    // callbacks can wake readers of the newly persisted durable frontier.
+    // Notify readers after releasing the locks and before writing diagnostics.
     if (advanced && feed_) feed_->NotifyDurableWatermark();
+    const auto total = timing.flush + timing.sync + timing.persist;
+    if (total < kSlowFeedSlotOperation) return;
+    LogFeedSlotDiagnostic([&] {
+        const auto ms = [](auto elapsed) {
+            return std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+        };
+        LogMessage(LogLevel::kWarn, LogComponent::kStore, "feed slot pass was slow",
+            {{"total_ms", ms(total)}, {"flush_ms", ms(timing.flush)}, {"sync_ms", ms(timing.sync)},
+             {"persist_ms", ms(timing.persist)}, {"chunks", std::to_string(timing.chunks)}, {"files", std::to_string(timing.files)},
+             {"first_pass", timing.first_pass ? "true" : "false"}, {"swept_dirs", std::to_string(timing.swept_dirs)},
+             {"whole_directory", timing.whole_directory ? "true" : "false"}});
+    });
 }
-bool FeedSlots::SyncImpl(std::uint64_t completed) {
+bool FeedSlots::SyncImpl(std::uint64_t completed, SyncTiming& timing) {
     store_.ThrowIfDurabilityPoisoned();
+    const auto now = [hook = hook_.load(std::memory_order_acquire)] {
+        const auto time = std::chrono::steady_clock::now();
+        return hook ? hook->SyncTime(time) : time;
+    };
+    const auto began = now();
     std::unique_lock barrier_lock(store_.wal_barrier_mutex_);
+    store_.ThrowIfDurabilityPoisoned();
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kBeforeFlush, completed);
     std::vector<std::shared_ptr<ChunkStore::LargeChunk>> large_chunks;
     {
@@ -575,7 +613,10 @@ bool FeedSlots::SyncImpl(std::uint64_t completed) {
             store_.AwaitChunkFilesLocked(lock, *chunk);
             store_.FlushWalBatch(coord, chunk, false);
         }
+        timing.chunks += chunks.size();
     }
+    const auto flushed = now();
+    timing.flush = flushed - began;
     // Fsync is outside chunk locks. The drain follows WalBarrier: it runs
     // under the publish lock and sets the durability floor, so a step that
     // replaces an image or WAL either finished before the drain, which hands
@@ -593,6 +634,9 @@ bool FeedSlots::SyncImpl(std::uint64_t completed) {
     // have left unsynced; it lists the directories, so it keeps the lock.
     store_.barrier_durability_floor_.store(true, std::memory_order_release);
     auto drained = store_.TakeUnsynced();
+    timing.first_pass = !synced_;
+    timing.whole_directory = drained.overflow;
+    timing.swept_dirs = drained.swept_dirs.size();
     struct SyncPhase {
         std::atomic<bool>& syncing;
         ~SyncPhase() { syncing.store(false, std::memory_order_release); }
@@ -600,15 +644,18 @@ bool FeedSlots::SyncImpl(std::uint64_t completed) {
     store_.barrier_syncing_.store(true, std::memory_order_release);
     const SyncPhase sync_phase{store_.barrier_syncing_};
     try {
-        if (!synced_) {
+        if (timing.first_pass) {
             std::vector<std::filesystem::path> dirs{store_.data_dir_};
             for (const auto& directory : std::filesystem::directory_iterator(store_.data_dir_)) {
                 const auto name = directory.path().filename().string();
                 if (!directory.is_directory() || (name.rfind("L_", 0U) != 0U && name != kFeedArchiveDirName)) continue;
                 dirs.push_back(directory.path());
-                for (const auto& entry : std::filesystem::directory_iterator(directory.path()))
-                    if (entry.is_regular_file() && (entry.path().extension() == ".wal" || entry.path().extension() == ".chk"))
+                for (const auto& entry : std::filesystem::directory_iterator(directory.path())) {
+                    if (entry.is_regular_file() && (entry.path().extension() == ".wal" || entry.path().extension() == ".chk")) {
                         SyncFilePath(entry.path());
+                        ++timing.files;
+                    }
+                }
             }
             for (auto it = dirs.rbegin(); it != dirs.rend(); ++it) SyncDirectoryPath(*it);
         }
@@ -616,20 +663,25 @@ bool FeedSlots::SyncImpl(std::uint64_t completed) {
         publish_lock.unlock();
 #endif
         if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kAfterDrain, completed);
-        store_.SyncUnsynced(drained);
+        timing.files += store_.SyncUnsynced(drained);
     } catch (const std::exception&) {
         store_.RestoreUnsynced(std::move(drained));
         throw;
     }
     synced_ = true;
+    const auto synced = now();
+    timing.sync = synced - flushed;
     store_.ThrowIfDurabilityPoisoned();
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kBeforePersist, completed);
     std::lock_guard lock(mutex_);
-    if (completed <= records_.durable_watermark) return false;
-    auto next = records_;
-    next.durable_watermark = completed;
-    if (next.slots.empty()) records_ = std::move(next); else Persist(std::move(next));
-    return true;
+    const bool advanced = completed > records_.durable_watermark;
+    if (advanced) {
+        auto next = records_;
+        next.durable_watermark = completed;
+        if (next.slots.empty()) records_ = std::move(next); else Persist(std::move(next));
+    }
+    timing.persist = now() - synced;
+    return advanced;
 }
 void FeedSlots::Retain() {
     store_.ThrowIfDurabilityPoisoned();

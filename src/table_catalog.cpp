@@ -29,6 +29,7 @@
 #include "snapshot_generation.hpp"
 #include "process_lock.hpp"
 #include "store_manifest.hpp"
+#include "commit_owner_bootstrap.hpp"
 #include "migrations_records.hpp"
 #include "user_registry.hpp"
 #include "maintenance_pool.hpp"
@@ -564,9 +565,13 @@ void Table::StopFeed() {
         feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes(), store->resources_->feed_budget());
 }
 
-FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const FeedSlotFilters& filters,
+FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const FeedSlotFilters& given,
     std::optional<std::string> owner, bool owner_given) {
     RequireValidFeedSlotName(name);
+    // A slot records its areas in one order, so equal sets compare equal.
+    auto filters = given;
+    SortFeedAreas(filters.areas);
+    if (filters.areas.size() > kMaxFeedAreas) throw std::invalid_argument("a slot takes at most 64 areas");
     if (owner) RequireValidFeedSlotOwner(*owner);
     std::lock_guard ddl(ddl_mutex_);
     if (if_not_exists) {
@@ -748,8 +753,10 @@ std::vector<FeedSlot> Table::ListFeedSlots(const Lease& lease, bool include_lost
 
 Table::FeedCounts Table::CountFeeds(const Lease& lease) const {
     if (lease.table_ != this) throw std::logic_error("feed counts need a lease of their table");
-    // Subscriptions change only in exclusive sections, which wait for leases.
-    return FeedCounts{.slots = lease.store().feed_slots_->size(), .watches = feed_subscriptions_};
+    // Subscriptions and the feed change only in exclusive sections, which wait
+    // for leases.
+    return FeedCounts{.slots = lease.store().feed_slots_->size(), .watches = feed_subscriptions_,
+        .feed_bytes = feed_ ? feed_->bytes_.load(std::memory_order_relaxed) : 0U};
 }
 
 bool Table::SlotFrontierFrozen(const Lease& lease) const {
@@ -787,8 +794,11 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
         if (slot.owner && authorize_owner) authorize_owner(*slot.owner);
         if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
             slot.schema_filter_lost ? "schema_filter" : "retention_limit");
-        // Repeated areas keep the same chunks, as for a watch without SLOT.
-        if (std::any_of(options.areas.begin(), options.areas.end(), [&](const FeedArea& area) { return area != slot.filters.area; }) ||
+        // The same areas in any order or repeated keep the same chunks, as for
+        // a watch without SLOT.
+        auto areas = options.areas;
+        SortFeedAreas(areas);
+        if ((!areas.empty() && areas != slot.filters.areas) ||
             (options.column_ids && options.column_ids != slot.filters.column_ids) ||
             (options.no_before && !slot.filters.no_before) || (options.chunks && !slot.filters.chunks))
             throw FeedSlotFiltersError("feed slot filters differ from WATCH filters");
@@ -1202,7 +1212,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
     }
     // Refuse an unconverted directory before the writer lock touches it.
     // OpenDataDirManifest repeats the check under the lock.
-    if (!std::filesystem::exists(DataDirManifestPath(config_.data_dir))) {
+    if (!std::filesystem::exists(DataDirManifestPath(config_.data_dir)) && !CommitOwnerBootstrap::ReadPending(config_.data_dir)) {
         if (const auto entry = FindDataDirEntry(config_.data_dir)) {
             ThrowUnconvertedDataDir(config_.data_dir, *entry);
         }
@@ -1218,8 +1228,11 @@ TableCatalog::TableCatalog(CatalogConfig config)
         throw std::runtime_error("pending feature activation requires the exclusive writer lock");
     // Validate conflicting decisions before either recovery can publish files.
     if (activation) ValidateFeatureActivationJournal(config_.data_dir, *activation);
-    RecoverFeatureActivation(config_.data_dir, config_.access_mode);
+    RecoverFeatureActivation(config_.data_dir, config_.access_mode, process_lock_.get());
+    CommitOwnerBootstrap::ValidateDirectoryScopes(config_.data_dir, config_.access_mode);
     RecoverMigrations(config_.data_dir, config_.access_mode);
+    commit_owner_context_ = CommitOwnerBootstrap::AdmitDirectory(config_.data_dir, config_.access_mode);
+    if (writable) CleanupAtomicTmpArtifacts(DataDirManifestPath(config_.data_dir));
     version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
     if (writable) {
         EnsureDirectoryPathExists(TablesDir(), /*durable_sync=*/true);
@@ -1278,47 +1291,30 @@ std::filesystem::path TableCatalog::DroppedDir() const {
 
 void TableCatalog::OpenDataDirManifest() {
     const auto& data_dir = config_.data_dir;
-    const auto path = DataDirManifestPath(data_dir);
     auto manifest = ReadDataDirManifest(data_dir);
-    if (!manifest.has_value()) {
-        if (const auto entry = FindDataDirEntry(data_dir)) {
-            ThrowUnconvertedDataDir(data_dir, *entry);
-        }
+    const auto pending = CommitOwnerBootstrap::ReadPending(data_dir);
+    if (!manifest.has_value() || pending) {
         if (config_.access_mode == AccessMode::kReadOnly) {
             throw std::runtime_error(
                 "data directory " + data_dir.string() + " has no " +
                 std::string(kDataDirManifestFileName) +
                 "; read-only mode opens only an initialized data directory");
         }
-        CleanupAtomicTmpArtifacts(path);
-        const DataDirManifest created{
-            .features = kKnownFeatures,
-            .data_dir_id = NewStoreId(),
-            .options = {},
-        };
-        if (PublishNewFile(
-                path,
-                SerializeDataDirManifest(created),
-                "CHUNKDB_FAILPOINT_CRASH_DATA_DIR_MANIFEST_BEFORE_PUBLISH_ONCE",
-                "CHUNKDB_FAILPOINT_CRASH_DATA_DIR_MANIFEST_AFTER_PUBLISH_ONCE")) {
-            LogMessage(
-                LogLevel::kInfo,
-                LogComponent::kStore,
-                "created data directory manifest",
-                {
-                    {"path", path.string()},
-                    {"data_dir_id", StoreIdHex(created.data_dir_id)},
-                });
-            return;
+        std::unique_ptr<ProcessLock> bootstrap;
+        const auto* owner = process_lock_.get();
+        if (!owner) {
+            try {
+                bootstrap = std::make_unique<ProcessLock>(data_dir);
+                owner = bootstrap.get();
+            } catch (const std::runtime_error&) {
+                // Another writer holds the lock while it creates the directory:
+                // open what it published, as an initialization that lost the
+                // race did before owners existed.
+                manifest = ReadDataDirManifest(data_dir);
+                if (!manifest || CommitOwnerBootstrap::ReadPending(data_dir)) throw;
+            }
         }
-        // Published by another process first (only possible without the
-        // writer lock); open what it created.
-        manifest = ReadDataDirManifest(data_dir);
-        if (!manifest.has_value()) {
-            throw std::runtime_error(
-                "data directory manifest " + path.string() +
-                " disappeared while the data directory was being initialized");
-        }
+        if (owner) manifest = CommitOwnerBootstrap::InitializeDirectory(data_dir, *owner);
     }
     try {
         RequireOpenableFeatures(manifest->features, config_.access_mode);
@@ -1326,10 +1322,6 @@ void TableCatalog::OpenDataDirManifest() {
         throw std::runtime_error("data directory " + data_dir.string() + ": " + e.what());
     }
     version_floor_ = DataDirVersionFloor(*manifest);
-    if (config_.access_mode != AccessMode::kReadOnly) {
-        // A crash while TABLEDROP raised the version floor leaves a temp file.
-        CleanupAtomicTmpArtifacts(path);
-    }
 }
 
 void TableCatalog::RaiseVersionFloor(std::uint64_t floor) {
@@ -1505,7 +1497,8 @@ std::shared_ptr<ChunkStore> TableCatalog::OpenStore(
     const std::filesystem::path& dir,
     const GeometryConfig& geometry,
     std::uint32_t geometry_fields,
-    const TableOptions& options) {
+    const TableOptions& options,
+    std::shared_ptr<const CommitOwnerContext> owner_admission) {
     StoreConfig store_config;
     store_config.query_limits = config_.query_limits;
     store_config.geometry = geometry;
@@ -1527,6 +1520,8 @@ std::shared_ptr<ChunkStore> TableCatalog::OpenStore(
     store_config.resources = resources_;
     store_config.acquire_process_lock = false;
     store_config.initial_version_floor = version_floor_;
+    store_config.commit_owner_context = owner_admission ? std::move(owner_admission) :
+        (commit_owner_context_ ? commit_owner_context_->ForTable(name) : nullptr);
     try {
         return std::make_shared<ChunkStore>(std::move(store_config));
     } catch (const std::exception& e) {
@@ -1876,13 +1871,21 @@ std::shared_ptr<Table> TableCatalog::Create(
         .options = EncodeTableOptions(options),
         .schema = table_schema,
         .chunk_schema = table_geometry.chunk_schema(),
+        .commit_owner = directory_manifest->commit_owner,
     };
+    std::shared_ptr<const CommitOwnerContext> owner_admission;
     try {
+        {
+            std::shared_lock lock(tables_mutex_);
+            for (const auto& [_, current] : tables_)
+                if (current->store_id() == manifest.store_id) throw std::runtime_error("new table epoch collides with an existing table");
+        }
         if (!ChunkCoordinateIndex::InitializeEmpty(staging, table_geometry, manifest.store_id))
             throw std::runtime_error("coordinate inventory appeared in table staging");
         if (!PublishNewFile(StoreManifestPath(staging), SerializeStoreManifest(manifest))) {
             throw std::runtime_error("table manifest appeared in " + staging.string());
         }
+        if (commit_owner_context_) owner_admission = commit_owner_context_->ForStagedTable(staging.filename().string(), manifest.store_id);
         CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_TABLE_CREATE_BEFORE_PUBLISH_ONCE");
         EnterStatementDecision();
         const auto moved = MoveDirectoryNoReplace(staging, target);
@@ -1913,7 +1916,7 @@ std::shared_ptr<Table> TableCatalog::Create(
         }
         SyncDirectoryPath(TablesDir());
         SyncDirectoryPath(StagingDir());
-        store = OpenStore(table_name, target, geometry, kAllGeometryFields, options);
+        store = OpenStore(table_name, target, geometry, kAllGeometryFields, options, std::move(owner_admission));
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_TABLE_CREATE_SERVE_ALLOC_FAIL_ONCE")) throw std::bad_alloc();
         Geometry opened_geometry = store->geometry();
         table = std::shared_ptr<Table>(new Table(
@@ -2618,7 +2621,11 @@ bool TableCatalog::EnableFeature(std::string_view name) {
     }
     ValidateFeatureInventory(config_.data_dir, directory->data_dir_id, targets);
     // A no-op never pauses an existing feed or maintenance worker.
-    if (already_enabled) return false;
+    if (already_enabled) {
+        if (feature->incompat == kFeatureCommitGroups)
+            (void)CommitOwnerBootstrap::AdmitDirectory(config_.data_dir, config_.access_mode);
+        return false;
+    }
     struct Participant { std::shared_ptr<Table> table; TableOptions options; std::shared_ptr<ChunkStore> store; };
     std::vector<Participant> participants;
     participants.reserve(tables.size());
@@ -2645,6 +2652,8 @@ bool TableCatalog::EnableFeature(std::string_view name) {
     std::unique_lock eviction(resources_->stores_mutex_);
     migration_health_->Check();
     FeatureActivationJournal journal{directory->data_dir_id, feature->incompat, {}};
+    if (feature->incompat == kFeatureCommitGroups)
+        journal.commit_owner = CommitOwnerScope{directory->data_dir_id, NewStoreId(), CommitOwnerRole::kCatalog};
     bool enabled = (directory->features.incompat & feature->incompat) != 0U;
     for (const auto& participant : participants) {
         journal.tables.push_back({participant.table->name(), participant.table->store_id()});
@@ -2663,7 +2672,11 @@ bool TableCatalog::EnableFeature(std::string_view name) {
             CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_FEATURE_ACTIVATION_AFTER_PUBLISH_ONCE");
         } else {
             WriteFeatureActivationJournal(config_.data_dir, journal, &published);
-            CompleteFeatureActivationJournal(config_.data_dir, journal);
+            CompleteFeatureActivationJournal(config_.data_dir, journal, process_lock_.get());
+            if (feature->incompat == kFeatureCommitGroups) {
+                commit_owner_context_ = CommitOwnerBootstrap::AdmitDirectory(config_.data_dir, config_.access_mode);
+                for (auto& participant : participants) participant.store->commit_owner_context_ = commit_owner_context_;
+            }
             if (feature->table_scoped)
                 for (auto& participant : participants) participant.store->features_.incompat |= feature->incompat;
         }
@@ -2690,14 +2703,15 @@ CatalogFeatureStatus TableCatalog::FeatureStatus() {
         for (const auto& [_, table] : tables_) tables.push_back(table);
         // Out of the inventory until RecoverTable: no store is open.
         for (const auto& [name, fenced] : fenced_)
-            status.tables.push_back({.name = name, .features = std::nullopt, .fence = std::string(fenced.reason)});
+            status.tables.push_back({.name = name, .features = std::nullopt, .fence = std::string(fenced.reason), .frontier_frozen = false});
     }
     for (const auto& table : tables) {
-        CatalogTableStatus entry{.name = table->name(), .features = std::nullopt, .fence = std::nullopt};
+        CatalogTableStatus entry{.name = table->name(), .features = std::nullopt, .fence = std::nullopt, .frontier_frozen = false};
         try {
             const auto lease = table->Acquire();
             if (!lease) throw TableNotFoundError("table disappeared while reading feature status");
             entry.features = lease->store().features();
+            entry.frontier_frozen = table->SlotFrontierFrozen(*lease);
         } catch (const FeedRecoveryRequiredError&) {
             // Its feed cleanup failed, which fences it without a lease.
             entry.fence = kFenceFeed;

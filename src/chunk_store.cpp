@@ -8,7 +8,9 @@
 #include "eviction.hpp"
 #include "process_lock.hpp"
 #include "snapshot_generation.hpp"
+#include "statement_control.hpp"
 #include "store_manifest.hpp"
+#include "commit_owner_bootstrap.hpp"
 #include "backup.hpp"
 #include "txn_history.hpp"
 #include "wal_replay.hpp"
@@ -123,6 +125,7 @@ std::optional<StoreManifest> ReadManifestOrRequireNewStore(
     const std::filesystem::path& data_dir,
     AccessMode access_mode, std::uint8_t dims) {
     auto manifest = ReadStoreManifest(data_dir);
+    if (const auto pending = CommitOwnerBootstrap::PendingStandaloneManifest(data_dir, access_mode)) return pending;
     if (manifest.has_value()) {
         return manifest;
     }
@@ -139,7 +142,7 @@ std::optional<StoreManifest> ReadManifestOrRequireNewStore(
         if (manifest.has_value()) {
             return manifest;
         }
-        if (ChunkCoordinateIndex::UnpublishedEmptyIdentity(data_dir, dims)) return {};
+        if (CommitOwnerBootstrap::UnpublishedEmptyIdentity(data_dir, dims)) return {};
         throw std::runtime_error(
             "store directory " + data_dir.string() + " has no " +
             std::string(kStoreManifestFileName) + " but holds chunkdb data (found '" +
@@ -152,12 +155,13 @@ std::optional<StoreManifest> ReadManifestOrRequireNewStore(
 // Chooses the geometry a store opens with before anything on disk is touched,
 // so a refused open leaves the data directory exactly as it was. The writer
 // lock is not held yet; InitializeStoreManifest repeats the check under it.
-Geometry OpenStoreGeometry(const StoreConfig& config) {
+Geometry OpenStoreGeometry(const StoreConfig& config, const CommitOwnerStoreAdmission* admission) {
     if (config.data_dir.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
     }
     RequireNotBackupDirectory(config.data_dir, config.access_mode);
-    const auto manifest = ReadManifestOrRequireNewStore(config.data_dir, config.access_mode, config.geometry.dims);
+    const auto manifest = admission ? std::optional<StoreManifest>(admission->manifest()) :
+        ReadManifestOrRequireNewStore(config.data_dir, config.access_mode, config.geometry.dims);
     if (!manifest.has_value()) {
         const auto schema = config.schema ? *config.schema : SingleBitsColumnSchema(config.geometry.block_bits);
         if (const auto reason = UnsupportedSchemaReason(schema); !reason.empty()) {
@@ -364,7 +368,8 @@ const char* CheckpointCompressionName(CheckpointCompression compression) noexcep
 
 ChunkStore::ChunkStore(StoreConfig config)
     : query_limits_(config.query_limits),
-      geometry_(OpenStoreGeometry(config)),
+      owner_admission_(CommitOwnerBootstrap::BeginStoreAdmission(config)),
+      geometry_(OpenStoreGeometry(config, owner_admission_.get())),
       data_dir_(std::move(config.data_dir)),
       durability_mode_(config.durability_mode),
       access_mode_(config.access_mode),
@@ -452,6 +457,20 @@ ChunkStore::ChunkStore(StoreConfig config)
         }
     }
     AcquireProcessLock(config.allow_multiple_processes);
+    std::unique_ptr<ProcessLock> bootstrap_lock;
+    const auto* bootstrap_owner = process_lock_ ? process_lock_.get() : config.bootstrap_process_lock;
+    if (access_mode_ == AccessMode::kReadWrite && !owner_admission_ && !bootstrap_owner &&
+        (!ReadStoreManifest(data_dir_) || CommitOwnerBootstrap::ReadPending(data_dir_))) {
+        try {
+            bootstrap_lock = std::make_unique<ProcessLock>(data_dir_);
+            bootstrap_owner = bootstrap_lock.get();
+        } catch (const std::runtime_error&) {
+            // Another writer, such as one of a shared-writer store, holds the
+            // lock while it creates the store: open what it published, as an
+            // initialization that lost the race did before owners existed.
+            if (!ReadStoreManifest(data_dir_) || CommitOwnerBootstrap::ReadPending(data_dir_)) throw;
+        }
+    }
     try {
         // Coordination locks live in the existing lock namespace, excluded
         // from legacy artifact detection. Own the table before manifest temp
@@ -461,7 +480,17 @@ ChunkStore::ChunkStore(StoreConfig config)
                 std::make_unique<SnapshotGenerationMapping>(data_dir_);
         }
         // Initialize the checked inventory and manifest before chunk data.
-        InitializeStoreManifest();
+        InitializeStoreManifest(bootstrap_owner);
+        if (owner_admission_) {
+            commit_owner_context_ = owner_admission_->owner();
+        } else if ((features_.incompat & kFeatureCommitGroups) != 0U) {
+            StoreConfig owner_config;
+            owner_config.data_dir = data_dir_; owner_config.access_mode = access_mode_;
+            owner_admission_ = CommitOwnerBootstrap::BeginStoreAdmission(owner_config);
+            commit_owner_context_ = owner_admission_->owner();
+        }
+        if (access_mode_ != AccessMode::kReadOnly)
+            CleanupAtomicTmpArtifacts(StoreManifestPath(data_dir_));
         // Slots refuse multi-process writers before recovery can change any
         // artifact. Read-only opening only inspects their checked metadata.
         const auto slots = ReadFeedSlotRecords(data_dir_, store_id_, geometry_.dims());
@@ -530,6 +559,7 @@ ChunkStore::ChunkStore(StoreConfig config)
             {"background_maintenance", background_maintenance_ ? "on" : "off"},
         });
 
+    owner_admission_.reset();
     resources_->RegisterStore(this);
     if ((background_maintenance_ || resources_->max_cache_bytes() != 0U) && access_mode_ != AccessMode::kReadOnly) {
         try {
@@ -540,19 +570,22 @@ ChunkStore::ChunkStore(StoreConfig config)
             throw;
         }
     }
+    if (access_mode_ != AccessMode::kReadOnly) {
+        // Last, so no extension thread outlives a constructor that throws.
+        std::lock_guard lock(version_clock_mutex_);
+        version_clock_early_extensions_ = true;
+    }
 }
 
-void ChunkStore::InitializeStoreManifest() {
+void ChunkStore::InitializeStoreManifest(const ProcessLock* bootstrap_owner) {
     const auto manifest_path = StoreManifestPath(data_dir_);
-    auto manifest = ReadManifestOrRequireNewStore(data_dir_, access_mode_, geometry_.dims());
-    if (access_mode_ != AccessMode::kReadOnly) {
-        // Stale temp files of an initialization that crashed before
-        // publishing (or, on POSIX, before dropping the temp name).
-        CleanupAtomicTmpArtifacts(manifest_path);
-    }
-    if (!manifest.has_value()) {
-        CleanupAtomicTmpArtifacts(data_dir_ / kChunkIndexFileName);
-        const auto unpublished_id = ChunkCoordinateIndex::UnpublishedEmptyIdentity(data_dir_, geometry_.dims());
+    const auto pending = CommitOwnerBootstrap::ReadPending(data_dir_);
+    auto manifest = owner_admission_ ? std::optional<StoreManifest>(owner_admission_->ReadCurrentManifest()) :
+        ReadManifestOrRequireNewStore(data_dir_, access_mode_, geometry_.dims());
+    if (!manifest.has_value() || pending) {
+        if (!bootstrap_owner) throw std::runtime_error("initial owner creation requires its exclusive bootstrap lock");
+        const auto unpublished_id = pending ? std::optional<StoreId>{} :
+            CommitOwnerBootstrap::UnpublishedEmptyIdentity(data_dir_, geometry_.dims());
         const TableOptions options{
             .durability_mode = durability_mode_,
             .checkpoint_update_interval = checkpoint_update_interval_,
@@ -564,39 +597,12 @@ void ChunkStore::InitializeStoreManifest() {
         const StoreManifest created{
             .features = kTableBaselineFeatures,
             .geometry = geometry_.config(),
-            .store_id = unpublished_id ? *unpublished_id : NewStoreId(),
+            .store_id = pending ? manifest->store_id : (unpublished_id ? *unpublished_id : NewStoreId()),
             .options = EncodeTableOptions(options),
             .schema = geometry_.layout().schema(),
             .chunk_schema = geometry_.chunk_schema(),
         };
-        if (!unpublished_id && !ChunkCoordinateIndex::InitializeEmpty(data_dir_, geometry_, created.store_id))
-            throw std::runtime_error("coordinate inventory appeared while initializing the table");
-        if (PublishNewFile(
-                manifest_path,
-                SerializeStoreManifest(created),
-                "CHUNKDB_FAILPOINT_CRASH_MANIFEST_BEFORE_PUBLISH_ONCE",
-                "CHUNKDB_FAILPOINT_CRASH_MANIFEST_AFTER_PUBLISH_ONCE")) {
-            store_id_ = created.store_id;
-            features_ = created.features;
-            LogMessage(
-                LogLevel::kInfo,
-                LogComponent::kStore,
-                "created store manifest",
-                {
-                    {"path", manifest_path.string()},
-                    {"store_id", StoreIdHex(store_id_)},
-                    {"geometry", DescribeGeometry(created.geometry)},
-                });
-            return;
-        }
-        // Another process initialized the directory first (only possible
-        // without the writer lock); open what it created.
-        manifest = ReadStoreManifest(data_dir_);
-        if (!manifest.has_value()) {
-            throw std::runtime_error(
-                "store manifest " + manifest_path.string() +
-                " disappeared while the store was being initialized");
-        }
+        manifest = CommitOwnerBootstrap::InitializeStandalone(data_dir_, created, geometry_, *bootstrap_owner);
     }
     RequireOpenableFeatures(manifest->features, access_mode_);
     if (!SameGeometry(manifest->geometry, geometry_.config())) {
@@ -664,6 +670,7 @@ ChunkStore::~ChunkStore() {
     // shuts down. Its chunks leave the shared cache with it.
     resources_->UnregisterStore(this);
     StopMaintenanceThread();
+    StopVersionClockExtension();
     FlushAllPendingWalBatches();
     SyncUnsyncedOnClose();
     // The stream pool is shared with other stores: give its slots back now
@@ -692,6 +699,40 @@ std::size_t ChunkStore::ApproxLoadedChunkCount() const {
         loaded += large_chunk->chunks.size();
     }
     return loaded;
+}
+
+std::uint64_t ChunkStore::LoadedChunkBytes() const {
+    // One lock at a time, and one chunk referenced at a time: eviction skips a
+    // chunk someone else references.
+    std::vector<std::shared_ptr<LargeChunk>> large_chunks;
+    {
+        std::lock_guard global_lock(large_chunks_mutex_);
+        large_chunks.reserve(large_chunks_.size());
+        for (const auto& [_, large_chunk] : large_chunks_) large_chunks.push_back(large_chunk);
+    }
+    std::uint64_t bytes = 0U;
+    std::vector<ChunkCoord> coords;
+    for (const auto& large_chunk : large_chunks) {
+        CheckStatementCancellation();
+        coords.clear();
+        {
+            std::lock_guard chunk_lock(large_chunk->mutex);
+            coords.reserve(large_chunk->chunks.size());
+            for (const auto& [coord, _] : large_chunk->chunks) coords.push_back(coord);
+        }
+        for (const auto& coord : coords) {
+            std::shared_ptr<RegularChunk> chunk;
+            {
+                std::lock_guard chunk_lock(large_chunk->mutex);
+                const auto it = large_chunk->chunks.find(coord);
+                if (it == large_chunk->chunks.end()) continue;
+                chunk = it->second;
+            }
+            auto lock = LockStatementChunkShared(chunk->mutex);
+            bytes += ChunkCacheAllocationBytes(*chunk);
+        }
+    }
+    return bytes;
 }
 
 StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
@@ -728,6 +769,9 @@ StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
         .txn_history_copies = txn_history_->CopiedStates(),
         .txn_history_copied_bytes = txn_history_->CopiedBytes(),
         .txn_history_bytes = txn_history_->KeptBytesCounter().load(std::memory_order_acquire),
+        .version_clock_extensions = stats_version_clock_extensions_.load(std::memory_order_relaxed),
+        .version_clock_extension_us = stats_version_clock_extension_us_.load(std::memory_order_relaxed),
+        .version_clock_wait_us = stats_version_clock_wait_us_.load(std::memory_order_relaxed),
     };
 }
 

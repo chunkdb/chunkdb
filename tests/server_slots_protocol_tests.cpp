@@ -6,6 +6,7 @@
 #include <future>
 #include <map>
 
+#include "chunkdb/logging.hpp"
 #include "server_slots_test_utils.hpp"
 #include "feed_slots.hpp"
 #include "slot_watch.hpp"
@@ -131,6 +132,86 @@ struct AckDeadlineIoTestAccess {
         pull_until([&] { return !watch.output.empty(); });
         const auto own = feed_test::Next(*reference);
         assert(own->position.revision == next && watch.output.size() == 1U && *watch.output.front().bytes == *own->protocol_frame);
+    }
+    static void WatchAreaAfterBufferedChunks(ChunkServer& server, Table& table, bool shrink_share,
+        const std::function<std::uint64_t(unsigned, int)>& write) {
+        FeedIo io(server);
+        FeedIo::Watch watch;
+        watch.connection = std::make_shared<ServerConnection>();
+        watch.connection->session.watch = table.SubscribeFeed({.areas = {{{0, 0}, {1, 0}}}, .chunks = true});
+        watch.share = 1024U * 1024U;
+        watch.next_progress = std::chrono::steady_clock::now() + std::chrono::hours(1);
+        auto reference = table.SubscribeFeed({.chunks = true});
+        const auto commit = [&](unsigned value, int x) {
+            const auto revision = write(value, x);
+            auto entry = feed_test::Next(*reference);
+            assert(entry->position.revision == revision && entry->protocol_frame);
+            return entry;
+        };
+        const auto queued = commit(1U, 0);
+        io.Pull(watch, watch.share);
+        assert(watch.output.size() == 1U && *watch.output.front().bytes == *queued->protocol_frame);
+
+        (void)commit(2U, 0);
+        const auto merged = commit(3U, 0);
+        const auto held = commit(4U, 4);
+        // Each push fits alone, but there is no room to coalesce both chunks.
+        io.Pull(watch, std::max(merged->protocol_frame->size(), held->protocol_frame->size()));
+        assert(!watch.merge.empty() && watch.held && watch.held->position == held->position);
+        constexpr std::string_view lines = "WATCH AREA 2 0 TO 2 0\r\nUNWATCH\r\n";
+        watch.connection->pending.append(lines.data(), lines.size());
+        io.Read(watch);
+        assert(watch.output.size() == 1U && !watch.unwatch);
+        const auto next = commit(5U, 8);
+        const auto check_reply = [&] {
+            assert(watch.output.front().bytes->starts_with("%2\r\n"));
+            assert(watch.output.front().bytes->ends_with("$8\r\nrevision\r\n:" + std::to_string(held->position.revision) + "\r\n"));
+        };
+
+        io.Advance(watch, watch.bytes);
+        io.Read(watch); // The pipelined UNWATCH still waits behind the replacement.
+        io.Pull(watch, watch.share);
+        assert(watch.output.size() == 1U && *watch.output.front().bytes == *merged->protocol_frame);
+        io.Advance(watch, watch.bytes);
+        if (shrink_share) {
+            // The held old-area push no longer fits after another watch joins.
+            io.Pull(watch, held->protocol_frame->size() - 1U);
+            assert(watch.output.size() == 2U);
+            check_reply();
+            assert(watch.output.back().bytes->starts_with(">5\r\n$6\r\nresync\r\n"));
+            return;
+        }
+        io.Pull(watch, watch.share);
+        assert(watch.output.size() == 1U && *watch.output.front().bytes == *held->protocol_frame);
+        io.Advance(watch, watch.bytes);
+        io.Pull(watch, watch.share);
+        assert(watch.output.size() == 1U);
+        check_reply();
+        io.Advance(watch, watch.bytes);
+        io.Pull(watch, watch.share);
+        assert(watch.output.size() == 1U && *watch.output.front().bytes == *next->protocol_frame);
+        io.Read(watch);
+        assert(watch.unwatch && watch.output.size() == 2U && *watch.output.back().bytes == "+OK\r\n");
+    }
+    static void WatchAreaReplySurvivesResync(ChunkServer& server, Table& table, const std::function<std::uint64_t()>& write) {
+        FeedIo io(server);
+        FeedIo::Watch watch;
+        watch.connection = std::make_shared<ServerConnection>();
+        watch.connection->session.watch = table.SubscribeFeed();
+        watch.share = 128U; // Accept one control, then pause reads until its reply drains.
+        auto reference = table.SubscribeFeed();
+        constexpr std::string_view line = "WATCH AREA 0 0 TO 0 0\r\n";
+        watch.connection->pending.append(line.data(), line.size());
+        io.Read(watch);
+        assert(watch.output.size() == 1U && watch.output.front().bytes->starts_with("%2\r\n"));
+        const auto reply = watch.output.front().bytes;
+
+        const auto revision = write();
+        const auto entry = feed_test::Next(*reference);
+        assert(entry->position.revision == revision && EncodeFeedEntry(*entry).size() > watch.share);
+        io.Pull(watch, watch.share);
+        assert(watch.output.size() == 2U && watch.output.front().bytes == reply);
+        assert(watch.output.back().bytes->starts_with(">5\r\n$6\r\nresync\r\n"));
     }
 #ifdef CHUNKDB_WITH_OPENSSL
     // A server TLS session whose peer is a memory pipe smaller than one record,
@@ -1462,6 +1543,60 @@ void ChunkForms(bool tls) {
     assert(NextChunks(*slot) == partial && NextChunks(*slot) == removed); Unwatch(*slot);
 }
 
+// A slot keeps several areas: CREATE SLOT records them in order without
+// repeats, SHOW SLOTS lists them, WATCH SLOT accepts the same set in any order,
+// and live delivery and the replay after a reconnect keep only their chunks.
+void SeveralAreaSlot(bool tls) {
+    struct CloseObserver final : FeedDeliveryTestHook {
+        std::mutex mutex;
+        std::condition_variable changed;
+        bool closed = false;
+        void Run(Point point, std::size_t) override {
+            if (point != Point::kAfterSlotSocketClose) return;
+            { std::lock_guard lock(mutex); closed = true; }
+            changed.notify_all();
+        }
+        void WaitClosed() {
+            test::FeedPhaseWatchdog::Phase("disconnected slot socket close");
+            std::unique_lock lock(mutex);
+            if (!changed.wait_for(lock, 10s, [&] { return closed; }))
+                throw std::runtime_error("server did not close the disconnected slot socket");
+        }
+    } observer; // Outlives the harness and its callbacks.
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8) CHUNK 4 x 4");
+    writer->Ok("CREATE SLOT 'several' ON t AREA 2 2 TO 2 2, AREA 0 0 TO 0 0, AREA 0 0 TO 0 0");
+    writer->Ok("CREATE SLOT IF NOT EXISTS 'several' ON t AREA 0 0 TO 0 0, AREA 2 2 TO 2 2");
+    const auto fewer = writer->Command("CREATE SLOT IF NOT EXISTS 'several' ON t AREA 0 0 TO 0 0");
+    Error(fewer, "INVALID_ARGUMENT"); assert(fewer.value.find("reason=slot_filters") != std::string::npos);
+    const auto shown = writer->Command("SHOW SLOTS ON t");
+    const auto& filters = Field(Slot(shown, "t", "several"), "filters");
+    assert(Field(filters, "area").type == '_');
+    const auto& areas = Field(filters, "areas").items;
+    assert(areas.size() == 2U && areas[0].items.size() == 4U && Number(areas[0].items[0]) == 0U && Number(areas[1].items[3]) == 2U);
+    auto watch = harness.Connect();
+    const auto one = watch->Command("WATCH t SLOT 'several' AREA 0 0 TO 0 0");
+    Error(one, "INVALID_ARGUMENT"); assert(one.value.find("reason=slot_filters") != std::string::npos);
+    const auto initial = Start(watch->Command("WATCH t SLOT 'several' AREA 2 2 TO 2 2, AREA 0 0 TO 0 0, AREA 2 2 TO 2 2"));
+    (void)Number(writer->Command("SET BLOCK 4 4 IN t n = 1")); // Chunk 1 1 is outside both areas.
+    const auto low = Number(writer->Command("SET BLOCK 0 0 IN t n = 2"));
+    const auto high = Number(writer->Command("SET BLOCK 8 8 IN t n = 3"));
+    FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
+    assert(Change(NextChange(*watch)) == low && Change(NextChange(*watch)) == high);
+    {
+        FeedDeliveryTestAccess::SetObserverHook(harness.server(), &observer);
+        Cleanup clear([&] { FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+        watch->Close(); // Disconnect with both revisions unacknowledged.
+        observer.WaitClosed();
+    }
+    auto replacement = harness.Connect();
+    const auto resumed = Start(replacement->Command("WATCH t SLOT 'several'"));
+    assert(resumed == initial);
+    assert(Change(NextChange(*replacement)) == low && Change(NextChange(*replacement)) == high);
+    Unwatch(*replacement);
+}
+
 void PersistentFilterDelivery(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect();
@@ -1478,7 +1613,7 @@ void PersistentFilterDelivery(bool tls) {
     auto watch = harness.Connect();
     const auto wrong = watch->Command("WATCH t SLOT 'filtered' COLUMNS n,label");
     Error(wrong, "INVALID_ARGUMENT"); assert(wrong.value.find("reason=slot_filters") != std::string::npos);
-    // A slot keeps one area, so different ones never match its filters; repeats of it do.
+    // Areas other than the slot's never match its filters; repeats of them do.
     const auto areas = watch->Command("WATCH t SLOT 'filtered' AREA 0 0 TO 0 0, AREA 1 1 TO 1 1");
     Error(areas, "INVALID_ARGUMENT"); assert(areas.value.find("reason=slot_filters") != std::string::npos);
     (void)Start(watch->Command("WATCH t SLOT 'filtered' AREA 0 0 TO 0 0, AREA 0 0 TO 0 0"));
@@ -1496,6 +1631,9 @@ void PersistentFilterDelivery(bool tls) {
     const auto entry = NextChange(*watch); assert(Change(entry) == first);
     const auto& block = entry.items[6].items[0];
     assert(block.items[2].type == '_' && block.items[3].items[0].value == "one" && Number(block.items[3].items[1]) == 7U);
+    // A slot watch keeps the areas of its slot; the refusal leaves it open.
+    const auto replace = watch->Command("WATCH AREA 1 1 TO 1 1");
+    Error(replace, "INVALID_ARGUMENT"); assert(replace.value.find("reason=slot_filters") != std::string::npos);
     Unwatch(*watch); // No ACK: reopen must replay the same projected historical schema.
     writer->Ok("ALTER TABLE t RENAME COLUMN label TO renamed");
     const auto second = Number(writer->Command("SET BLOCK 0 0 IN t n=8,renamed='two'"));
@@ -1638,6 +1776,54 @@ void ArchiveWhileLeaseHeld(bool tls) {
     assert(!watch->Ready(100ms));
     held_lease.reset(); // Reader progress above must not have needed an exclusive table lease.
     FeedTestAccess::SetHook(*table, nullptr); witness.reset(); Unwatch(*watch);
+}
+
+void ArchiveLogsAfterOpening(bool tls) {
+    feed_test::Pause pause(FeedTestHook::Point::kBeforeMerge);
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, 4096);
+    auto writer = harness.Connect(); Create(*writer);
+    auto table = harness.catalog->Find("t");
+    auto watch = SlotWatch::Create(table, "consumer", {});
+    watch->Activate();
+    auto witness = table->SubscribeFeed();
+
+    FeedTestAccess::SetHook(*table, &pause);
+    Cleanup clear_pause([&] { pause.Release(); FeedTestAccess::SetHook(*table, nullptr); });
+    (void)pause.Wait();
+    std::uint64_t live = 0U;
+    for (unsigned value = 1; value <= 100; ++value) live = Set(*writer, value);
+    pause.Release();
+    const auto reset = witness->Next(10s);
+    assert(reset && reset->kind == FeedEntry::Kind::kResync && reset->position.revision == live);
+
+    struct SlowOpen : FeedDeliveryTestHook {
+        void Run(Point, std::size_t) override {}
+        Clock::duration ArchiveOpenElapsed(Clock::duration) const noexcept override { return 1s; }
+    } slow_open;
+    SlotAckDeadlineTestAccess::Hook(*watch, &slow_open);
+    std::vector<std::string> lines;
+    const auto caller = std::this_thread::get_id();
+    SetLogSinkForTests([&](const std::string& line) {
+        if (std::this_thread::get_id() != caller) return;
+        if (line.find("slot archive reader was slow to open") != std::string::npos ||
+            line.find("slot watch reads the archive") != std::string::npos) lines.push_back(line);
+    });
+    Cleanup clear_log([] { ResetLogSinkForTests(); });
+    const auto cursor = watch->position().revision;
+    assert(table->ListFeedSlots().front().durable_watermark == cursor);
+    assert(watch->WorkStep()); // Observes the reset but cannot open the archive.
+    (void)watch->WorkStep();
+    assert(lines.empty());
+
+    FeedSlotTestAccess::Sync(*table);
+    assert(watch->WorkStep());
+    assert(lines.size() == 2U);
+    assert(lines[0].find(" INFO server ") != std::string::npos);
+    assert(lines[0].ends_with(" slot=consumer cursor=" + std::to_string(cursor) + " live=" + std::to_string(live) +
+        " durable=" + std::to_string(live)));
+    assert(lines[1].find(" WARN server ") != std::string::npos);
+    assert(lines[1].ends_with("slot archive reader was slow to open slot=consumer ms=1000"));
+    SlotAckDeadlineTestAccess::Hook(*watch, nullptr);
 }
 
 void AfterWaitsForDurable(bool tls) {
@@ -2415,6 +2601,23 @@ void LaggingChunksWatch(bool tls) {
         [&](unsigned value, int x) { return Set(*writer, value, x); });
 }
 
+void WatchAreaAfterBufferedChunks(bool tls) {
+    for (const bool shrink_share : {false, true}) {
+        Harness harness(tls);
+        auto writer = harness.Connect(); Create(*writer);
+        AckDeadlineIoTestAccess::WatchAreaAfterBufferedChunks(harness.server(), *harness.catalog->Find("t"), shrink_share,
+            [&](unsigned value, int x) { return Set(*writer, value, x); });
+    }
+}
+
+void WatchAreaReplySurvivesResync(bool tls) {
+    Harness harness(tls);
+    auto writer = harness.Connect(); Create(*writer);
+    AckDeadlineIoTestAccess::WatchAreaReplySurvivesResync(harness.server(), *harness.catalog->Find("t"), [&] {
+        return Number(writer->Command("SET BLOCK 0 0 IN t n = 1, label = '" + std::string(120U, 'x') + "'"));
+    });
+}
+
 // A CHUNKS slot whose output is unsent merges its next pushes into one push at
 // the newest revision; acknowledging that revision covers every merged change.
 void LaggingChunksSlot(bool tls) {
@@ -2894,7 +3097,9 @@ int main(int argc, char** argv) {
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);
         run("persistent-filters", PersistentFilterDelivery);
+        run("several-area-slot", SeveralAreaSlot);
         run("historical-schema", HistoricalSchemas); run("historical-schema-dimensional", HistoricalSchemasDimensional); run("held-lease", ArchiveWhileLeaseHeld);
+        run("archive-diagnostics", ArchiveLogsAfterOpening);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
         run("live-schema-ACK", LiveSchemaAcknowledgement);
         run("filtered-idle-progress", FilteredAndIdleProgress);
@@ -2909,6 +3114,8 @@ int main(int argc, char** argv) {
         run("ACK-deadline-stalled-socket", AckDeadlineStalledSocket);
         run("CHUNKS-ACK-deadline-stalled-socket", ChunksDeadlineStalledSocket);
         run("many-subscribers", ManySubscribers);
+        run("WATCH-AREA-buffered-CHUNKS", WatchAreaAfterBufferedChunks);
+        run("WATCH-AREA-reply-resync", WatchAreaReplySurvivesResync);
         std::cout << (tls ? "TLS" : "plain") << ": " << passed << "/" << executed << " slot protocol groups passed\n";
     }
     if (total == 0U) { std::cerr << "no matching test group\n"; return 2; }

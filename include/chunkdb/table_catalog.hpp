@@ -39,6 +39,8 @@ struct MigrationRecord;
 class UserRegistry;
 
 class ProcessLock;
+class CommitOwnerDirectoryContext;
+class CommitOwnerContext;
 class SlotWatch;
 struct FeedSlotClaim;
 struct FeedExcessPool;
@@ -169,6 +171,9 @@ struct CatalogTableStatus {
     std::optional<FeatureFlags> features;
     // Why the table is fenced; std::nullopt while it serves.
     std::optional<std::string> fence;
+    // Table::SlotFrontierFrozen: fenced, and its slots' durable frontier
+    // stopped advancing.
+    bool frontier_frozen = false;
 };
 
 struct CatalogFeatureStatus {
@@ -281,9 +286,11 @@ class Table : public std::enable_shared_from_this<Table> {
     struct FeedCounts {
         std::size_t slots = 0U;
         std::size_t watches = 0U;
+        std::size_t feed_bytes = 0U;
     };
-    // Durable slots, lost ones included, and open watches, slot watches
-    // included, under `lease`, a lease of this table.
+    // Durable slots, lost ones included, open watches, slot watches included,
+    // and the bytes the live feed buffers, under `lease`, a lease of this
+    // table.
     [[nodiscard]] FeedCounts CountFeeds(const Lease& lease) const;
     // Whether the durable frontier of this table's slots stopped advancing,
     // under `lease`, a lease of this table: it has a slot that is not lost
@@ -684,7 +691,8 @@ class TableCatalog {
         const std::filesystem::path& dir,
         const GeometryConfig& geometry,
         std::uint32_t geometry_fields,
-        const TableOptions& options);
+        const TableOptions& options,
+        std::shared_ptr<const CommitOwnerContext> owner_admission = {});
     // " --flag value (table 'name' stores value)" for every option named in
     // default_option_fields that differs from `stored`; empty when none.
     [[nodiscard]] std::string OptionFlagMismatches(
@@ -743,6 +751,7 @@ class TableCatalog {
     CatalogConfig config_;
     std::shared_ptr<StoreResources> resources_;
     std::unique_ptr<ProcessLock> process_lock_;
+    std::shared_ptr<const CommitOwnerDirectoryContext> commit_owner_context_;
     // Serializes Create, Drop and SetOptions.
     mutable Table::DdlMutex operations_mutex_;
     [[nodiscard]] std::shared_lock<BackupMaintenanceGate> LockFeatureMetadataShared();

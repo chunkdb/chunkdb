@@ -61,6 +61,7 @@ add_library(chunkdb_core STATIC
     src/bit_codec.cpp
     src/block_checks.cpp
     src/block_filter.cpp
+    src/block_selection.cpp
     src/block_ops.cpp
     src/checkpoint.cpp
     src/chunk_cache.cpp
@@ -81,8 +82,12 @@ add_library(chunkdb_core STATIC
     src/commit_group_journal.cpp
     src/commit_group_coordinator.cpp
     src/commit_group_owner_format.cpp
+    src/commit_owner_value_format.cpp
     src/commit_owner_artifact_io.cpp
     src/commit_owner_artifact_identity.cpp
+    src/commit_owner_bootstrap_format.cpp
+    src/commit_owner_bootstrap.cpp
+    src/commit_owner_context.cpp
     src/chunk_file_header.cpp
     src/feed_protocol.cpp
     src/change_feed.cpp
@@ -143,7 +148,6 @@ add_library(chunkdb_core STATIC
     src/catalog_txn_snapshot.cpp
     src/table_chunk_columns.cpp
     src/table_tombstones.cpp
-    src/table_disk_guard.cpp
     src/table_catalog_migrations.cpp
     src/table_catalog_restore.cpp
     src/migrations_records.cpp
@@ -169,6 +173,7 @@ add_library(chunkdb_core STATIC
     src/world_read.cpp
     src/world_read_3d.cpp
     src/zrle.cpp
+    src/table_disk_guard.cpp
 )
 
 target_include_directories(chunkdb_core
@@ -412,7 +417,7 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME coordinate_hash_seed_failure COMMAND chunkdb_coordinate_hash_seed_test --failure)
     set_tests_properties(coordinate_hash_seed_failure PROPERTIES TIMEOUT 60 LABELS "smoke")
 
-    foreach(format IN ITEMS area_cursor byte_budgets sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_group_journal commit_group_coordinator commit_group_owner_format commit_owner_artifact_io commit_request_fingerprint wal_group_frame catalog_txn_snapshot ordinary_write_failure chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input wal_durability_pin chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol wal_barrier_memory chunk_column_expressions read_only_index_refresh)
+    foreach(format IN ITEMS area_cursor sectioned_chunk_form txn_intent_format populated_index_format archive_base_format commit_group_identity commit_group_format commit_group_journal commit_group_coordinator commit_group_owner_format commit_owner_value_format commit_owner_artifact_io commit_owner_bootstrap commit_request_fingerprint wal_group_frame catalog_txn_snapshot ordinary_write_failure chunk_file_header chunk_identity chunk_schema chunk_storage_format chunk_columns chunk_metadata_runtime typed_chunk_form atomic_stream block_coordinates wal_prefix wal_stream_replay shared_file_input wal_durability_pin chunk_coordinate_index table_chunk_columns world_coordinates_3d feed_archive_base feed_alias_recovery chunk_mutation_model chunk_identity_scan rollback_preflight table_tombstones cql_chunk_model feed_chunk_model feed_chunk_protocol wal_barrier_memory chunk_column_expressions read_only_index_refresh byte_budgets)
         add_executable(chunkdb_${format}_test tests/${format}_tests.cpp)
         target_link_libraries(chunkdb_${format}_test PRIVATE chunkdb_core)
         target_include_directories(chunkdb_${format}_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -420,9 +425,12 @@ if(CHUNKDB_BUILD_TESTS)
         set_tests_properties(${format} PROPERTIES TIMEOUT 60 LABELS "smoke")
     endforeach()
 
+    target_link_libraries(chunkdb_commit_owner_bootstrap_test PRIVATE chunkdb_tools)
     if(MINGW)
         target_link_options(chunkdb_commit_owner_artifact_io_test PRIVATE -static-libstdc++ -static-libgcc)
         target_link_options(chunkdb_commit_group_journal_test PRIVATE -static-libstdc++ -static-libgcc)
+        target_link_options(chunkdb_commit_owner_bootstrap_test PRIVATE -static-libstdc++ -static-libgcc)
+        target_link_options(chunkdb_commit_owner_value_format_test PRIVATE -static-libstdc++ -static-libgcc)
     endif()
     # The crash children of the owner artifacts and the coordinator run in the crash label.
     add_test(NAME commit_owner_artifact_io_crash COMMAND chunkdb_commit_owner_artifact_io_test --case crash)
@@ -774,6 +782,18 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_world_ops_regression_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME world_ops_regression COMMAND chunkdb_world_ops_regression_test)
 
+    add_executable(chunkdb_version_clock_test tests/version_clock_tests.cpp)
+    target_link_libraries(chunkdb_version_clock_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_version_clock_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME version_clock COMMAND chunkdb_version_clock_test)
+    add_test(NAME version_clock_crash COMMAND chunkdb_version_clock_test --crash-boundaries)
+    set_tests_properties(version_clock_crash PROPERTIES TIMEOUT 300)
+
+    add_executable(chunkdb_block_selection_test tests/block_selection_tests.cpp)
+    target_link_libraries(chunkdb_block_selection_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_block_selection_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME block_selection COMMAND chunkdb_block_selection_test)
+
     add_executable(
         chunkdb_read_only_intent_replay_test
         tests/read_only_intent_replay_tests.cpp
@@ -1011,7 +1031,9 @@ if(CHUNKDB_BUILD_TESTS)
 
     add_executable(chunkdb_server_bench_test tests/server_bench_tests.cpp)
     target_link_libraries(chunkdb_server_bench_test PRIVATE chunkdb_server_bench_lib)
-    target_include_directories(chunkdb_server_bench_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    target_include_directories(chunkdb_server_bench_test PRIVATE
+        ${CMAKE_CURRENT_SOURCE_DIR}/src
+        ${CMAKE_CURRENT_SOURCE_DIR}/bench)
     if(WIN32)
         target_link_libraries(chunkdb_server_bench_test PRIVATE ws2_32)
     endif()
@@ -1223,12 +1245,13 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_wal_group_frame_test
         chunkdb_catalog_txn_snapshot_test
         chunkdb_ordinary_write_failure_test
-        chunkdb_byte_budgets_test
         chunkdb_commit_group_journal_test
         chunkdb_commit_group_coordinator_test
         chunkdb_commit_group_verify_test
         chunkdb_commit_group_owner_format_test
+        chunkdb_commit_owner_value_format_test
         chunkdb_commit_owner_artifact_io_test
+        chunkdb_commit_owner_bootstrap_test
         chunkdb_chunk_file_header_test
         chunkdb_chunk_identity_test
         chunkdb_chunk_schema_test
@@ -1318,6 +1341,8 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_wal_checkpoint_cycle_test
         chunkdb_world_ops_test
         chunkdb_world_ops_regression_test
+        chunkdb_version_clock_test
+        chunkdb_block_selection_test
         chunkdb_read_only_intent_replay_test
         chunkdb_wal_group_commit_test
         chunkdb_security_regression_test
@@ -1351,6 +1376,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_txn_kill_test
         chunkdb_txn_concurrency_test
         chunkdb_docs_check_test
+        chunkdb_byte_budgets_test
     )
     if(TARGET chunkdb_server_tls_error_queue_test)
         list(APPEND CHUNKDB_TEST_TARGETS chunkdb_server_tls_error_queue_test)
@@ -1411,6 +1437,7 @@ if(CHUNKDB_BUILD_TESTS)
         txn_intent_format
         populated_index_format
         archive_base_format
+        commit_owner_value_format
         chunk_file_header
         chunk_identity
         chunk_schema
@@ -1483,6 +1510,8 @@ if(CHUNKDB_BUILD_TESTS)
         wal_group_commit
         world_ops
         world_ops_regression
+        version_clock
+        block_selection
         read_only_intent_replay
         security_regression
         server_integration
@@ -1532,6 +1561,7 @@ if(CHUNKDB_BUILD_TESTS)
         commit_owner_artifact_io_crash
         commit_group_coordinator_crash
         recover_table
+        version_clock_crash
     )
 
     if(TARGET chunkdb_server_tls_error_queue_test)

@@ -2,6 +2,7 @@
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
+#include "chunk_vars_storage.hpp"
 #include "statement_control.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "eviction.hpp"
@@ -30,6 +31,7 @@
 #include <vector>
 
 #include "chunkdb/bit_codec.hpp"
+#include "chunkdb/chunk_columns.hpp"
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
@@ -121,11 +123,18 @@ void ChunkStore::RegularChunkDeleter::operator()(RegularChunk* chunk) const noex
     delete chunk;
 }
 
+std::size_t ChunkStore::ChunkCacheAllocationBytes(const RegularChunk& chunk) noexcept {
+    std::size_t bytes = sizeof(RegularChunk) + chunk.payload.capacity() + chunk.presence_bitmap.capacity() +
+        detail::ChunkVarsStorageAccess::BufferAllocationBytes(chunk.vars) +
+        chunk.wal_batch.capacity() + chunk.scratch_before.capacity();
+    if (chunk.chunk_columns)
+        bytes += sizeof(ChunkColumnState) + chunk.chunk_columns->bytes.capacity();
+    return bytes;
+}
+
 void ChunkStore::RechargeCacheLocked(RegularChunk& chunk) noexcept {
     if (!chunk.cache_owned) return;
-    const std::size_t charge = sizeof(RegularChunk) + chunk.payload.capacity() + chunk.presence_bitmap.capacity() +
-        chunk.vars.encoded_size() + (chunk.chunk_columns ? chunk.chunk_columns->bytes.size() : 0U) +
-        chunk.wal_batch.capacity();
+    const std::size_t charge = ChunkCacheAllocationBytes(chunk);
     if (charge == chunk.cache_charge) return;
     auto& bytes = *resources_->cache_bytes_;
     if (charge > chunk.cache_charge) bytes.fetch_add(charge - chunk.cache_charge, std::memory_order_relaxed);

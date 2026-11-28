@@ -13,19 +13,19 @@ Each immutable object has exactly the lowercase 64-character hexadecimal encodin
 Temporary names use a reserved private prefix and one generated nonce, with exclusive creation and no overwrite or retry loop on collision.
 Only the checked root, page, journal-inventory and ID-inventory kinds are supported by this foundation; other reference kinds refuse rather than becoming opaque admitted payloads.
 
-Read-only opening pins the actual root directory and refuses a symbolic link or reparse point at that leaf.
+Read-only opening follows a link at the root path itself once and pins the directory it reaches; every later component is opened relative to that pin without following links.
 A writer additionally borrows an existing exclusive ProcessLock for its entire lifetime and verifies its admitted canonical directory, the pinned native root generation and the native identity of `root/.chunkdb.lock/writer.lock` against that lock.
 The fixed `.chunkdb.lock` directory is itself opened relative to the pinned root with no-follow directory admission; matching a lock-file hard link under a different root is insufficient.
 A lock for another directory, a missing lock, read-only access or an incompatible shared-writer context cannot create an artifact writer.
-A ProcessLock acquired for artifact staging retains an actual root-directory native owner, captured from the path as given before the lock directory is created; inode numbers without a retained owner cannot protect against directory deletion and reuse.
-An ordinary writer lock takes no root owner, so an artifact writer refuses it, and a refused root leaves no lock directory.
+Every ProcessLock retains an actual root-directory native owner, opened through the path as given, following a link at the root itself once, before the lock directory is created; inode numbers without a retained owner cannot protect against directory deletion and reuse.
+A root that cannot be opened as a directory leaves no lock directory.
 Post-acquisition artifact admission binds the fixed lock child under that pinned root to the acquired native lock before an initialized artifact lease is reported.
-The root owner is close-on-exec or noninheritable, receives failure cleanup and outlives artifact borrowers; ordinary writer starts and request paths do not take it, and it makes no claim about existing heartbeat pathname races.
+The root owner is close-on-exec or noninheritable, receives failure cleanup and outlives artifact borrowers; request paths do not use it, and it makes no claim about existing heartbeat pathname races.
 The caller retains the real lock until all artifact writers are destroyed; the foundation neither takes over nor releases that lock.
 
 POSIX operations use pinned directory descriptors, `openat` with no-follow and close-on-exec flags, `fstat` regular-file checks and relative native publication names.
 Root and object-directory opens require actual directories and refuse redirected child components.
-Windows root opening uses OPEN_REPARSE_POINT and BACKUP_SEMANTICS and refuses reparse attributes.
+Windows root opening uses BACKUP_SEMANTICS without OPEN_REPARSE_POINT, so a symlink, junction or mount point at the root is followed once, and refuses a result that is not a directory or still has reparse attributes.
 Child directory and file opens use NtCreateFile with the pinned directory as RootDirectory, one fixed or digest-derived relative leaf and native no-reparse/type admission.
 Object-directory handles deny delete sharing while a view uses them, and all publication remains relative to those exact native directory objects.
 Child file handles allow read, write and delete sharing and validate the opened native regular-file object before reading.
@@ -142,7 +142,7 @@ The root name becomes durable only after the root-directory sync.
 This initial API exposes native I/O facts and durable private artifacts only.
 It has no generic canonical-root write or compare-and-swap method accepting an arbitrary parsed CommitOwnerRoot.
 Canonical INACTIVE installation must join the checked creation or ENABLE FEATURE decision, including its real manifest claim and exclusive writer ownership.
-The fixed-bytes, no-replace INACTIVE installer is the primitive that creation and ENABLE FEATURE will call; it has no production caller in this build, and calling it outside that decision is forbidden by the [recovery owner rules](COMMIT_GROUP_RECOVERY.md).
+The fixed-bytes, no-replace INACTIVE installer is the primitive that creation and ENABLE FEATURE call through the [bootstrap](COMMIT_OWNER_BOOTSTRAP.md), after their decision is durable and before their manifest claims the feature; calling it outside that decision is forbidden by the [recovery owner rules](COMMIT_GROUP_RECOVERY.md).
 ACTIVE or PENDING publication additionally requires fully admitted typed values, exact selected reference closure and complete replacement-plan authorization.
 Canonical publication APIs cannot use an optional callback that declares an unchecked root safe.
 Canonical publication requires the existing owner-transition and lifecycle ordering rules.
