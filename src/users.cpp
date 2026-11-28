@@ -355,11 +355,13 @@ Users ParseUsers(const std::vector<std::uint8_t>& bytes, bool materialize) {
     const std::uint32_t count = reader.U32();
     constexpr std::size_t kLimitsBytes = 16U;
     constexpr std::size_t kMinUserBytes = 3U + 1U + 4U + 2U + scram::kMinSaltBytes + 64U + 4U + kLimitsBytes;
-    if (count > reader.Remaining() / kMinUserBytes) throw std::invalid_argument("chunkdb.users is truncated");
+    // Minimum valid record sizes bound the scratch space. Check fields in
+    // order so a short but fully encoded invalid name still gets its own error.
+    const auto user_slots = materialize ? 0U : std::min<std::size_t>(count, reader.Remaining() / kMinUserBytes);
     std::vector<std::uint32_t> user_names;
-    if (!materialize) user_names.reserve(count);
+    if (!materialize) user_names.reserve(user_slots);
     for (std::uint32_t i = 0; i < count; ++i) {
-        if (!materialize) user_names.push_back(reader.Offset());
+        const auto user_offset = reader.Offset();
         const std::string name(reader.ShortString());
         if (!IsValidUserName(name)) {
             throw std::invalid_argument("chunkdb.users has an invalid user name");
@@ -410,17 +412,17 @@ Users ParseUsers(const std::vector<std::uint8_t>& bytes, bool materialize) {
             }
         }
         const std::uint32_t grants = reader.U32();
-        constexpr std::size_t kMinGrantBytes = 4U; // length, one name byte and right
-        // Reserve only space that can belong to this user's grants. This
-        // keeps the two offset arrays together within the input image size.
-        const auto remaining_users_bytes = (count - i - 1U) * kMinUserBytes + kLimitsBytes;
-        if (reader.Remaining() < remaining_users_bytes ||
-            grants > (reader.Remaining() - remaining_users_bytes) / kMinGrantBytes)
-            throw std::invalid_argument("chunkdb.users is truncated");
+        std::size_t grant_slots = 0U;
         std::vector<std::uint32_t> grant_names;
-        if (!materialize) grant_names.reserve(grants);
+        if (!materialize) {
+            constexpr std::size_t kMinGrantBytes = 4U; // length, one name byte and right
+            // Both offset arrays together use at most the input image size.
+            const auto remaining_slots = bytes.size() / sizeof(std::uint32_t) - user_slots;
+            grant_slots = std::min<std::size_t>({grants, reader.Remaining() / kMinGrantBytes, remaining_slots});
+            grant_names.reserve(grant_slots);
+        }
         for (std::uint32_t g = 0; g < grants; ++g) {
-            if (!materialize) grant_names.push_back(reader.Offset());
+            const auto grant_offset = reader.Offset();
             auto table = reader.ShortString();
             if (!IsValidGrantTable(table) || (version < kVersion && IsPrefixGrant(table))) {
                 throw std::invalid_argument(
@@ -435,14 +437,21 @@ Users ParseUsers(const std::vector<std::uint8_t>& bytes, bool materialize) {
                 if (prefix) table.remove_suffix(1U);
                 if (!(prefix ? user.prefix_grants : user.grants).emplace(table, static_cast<Right>(right)).second)
                     throw std::invalid_argument("chunkdb.users repeats a grant of user " + name);
+            } else {
+                if (grant_names.size() == grant_slots) throw std::invalid_argument("chunkdb.users is truncated");
+                grant_names.push_back(grant_offset);
             }
         }
         if (!materialize && !grant_names.empty()) RequireUniqueNames(bytes, grant_names, "a grant of user " + name);
         user.max_connections = reader.U64();
         user.statements_per_sec = reader.U64();
         ValidateLimits(user);
-        if (materialize && !users.users.emplace(name, std::move(user)).second) {
-            throw std::invalid_argument("chunkdb.users repeats user " + name);
+        if (materialize) {
+            if (!users.users.emplace(name, std::move(user)).second)
+                throw std::invalid_argument("chunkdb.users repeats user " + name);
+        } else {
+            // A complete valid record accounts for one reserved user slot.
+            user_names.push_back(user_offset);
         }
     }
     if (!reader.AtEnd()) {

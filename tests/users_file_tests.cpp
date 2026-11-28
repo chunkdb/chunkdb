@@ -441,6 +441,7 @@ struct RawUser {
     std::uint32_t version = 3;
     std::uint8_t added_verifiers = 0;
     std::uint8_t added_key = 0x22;
+    bool has_grant = true;
 };
 
 std::vector<std::uint8_t> RawUsersFile(const RawUser& raw) {
@@ -471,9 +472,11 @@ std::vector<std::uint8_t> RawUsersFile(const RawUser& raw) {
         out.push_back(raw.added_verifiers);
         for (std::uint8_t i = 0; i < raw.added_verifiers; ++i) out.insert(out.end(), 64, static_cast<std::uint8_t>(raw.added_key + i));
     }
-    u32(1);
-    text(raw.table);
-    out.push_back(static_cast<std::uint8_t>(Right::kRead));
+    u32(raw.has_grant ? 1U : 0U);
+    if (raw.has_grant) {
+        text(raw.table);
+        out.push_back(static_cast<std::uint8_t>(Right::kRead));
+    }
     out.insert(out.end(), 16, 0x00); // max_connections and statements_per_sec
     u32(chunkdb::Crc32(out));
     return out;
@@ -557,6 +560,20 @@ void TestFieldBounds() {
     ExpectInvalid([&] { (void)chunkdb::EncodeUsers(long_table); }, "longer than 65535 bytes");
 }
 
+void TestDiagnosticsAtMinimumRecordSize() {
+    const auto check = [](const std::vector<std::uint8_t>& image, const std::string& reason) {
+        ExpectInvalid([&] { (void)chunkdb::DecodeUsers(image); }, reason);
+        ExpectInvalid([&] { chunkdb::ValidateUsersImage(image); }, reason);
+    };
+    check(RawUsersFile({.table = ""}), "invalid table name");
+    check(RawUsersFile({.name = "", .version = 2, .has_grant = false}), "invalid user name");
+    check(RawUsersFile({.name = "a", .salt_bytes = 0, .version = 2, .has_grant = false}), "0-byte verifier salt");
+    auto truncated = RawUsersFile({});
+    truncated.erase(truncated.end() - 5); // Last byte of the mandatory rate limit.
+    RefreshChecksum(truncated);
+    check(truncated, "truncated");
+}
+
 void TestValidationChecksUnorderedDuplicates() {
     const auto first = RawUsersFile({.name = "zeta"});
     const auto second = RawUsersFile({.name = "alpha"});
@@ -597,6 +614,7 @@ int main() {
     TestLimitsAndMandatoryFields();
     TestDevelopmentAdmissionIsReadOnly();
     TestFieldBounds();
+    TestDiagnosticsAtMinimumRecordSize();
     TestValidationChecksUnorderedDuplicates();
     return 0;
 }
