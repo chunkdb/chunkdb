@@ -503,14 +503,15 @@ Details are in [artifact I/O](design/COMMIT_OWNER_ARTIFACT_IO.md).
 
 1. `CKSL`, format tag `4:u16`, dimensions `u8`, header flags `u8`, table epoch (16 bytes).
 2. Durable watermark `u64`, slot count `u32` (at most 1024).
-3. Per slot: name length `u8`, slot flags `u8`, projection count `u16`, written revision `u64`, name bytes, then the parts its flags select: area coordinates (`i64` each), projection IDs (`u32` each), and owner length `u8` with owner bytes.
+3. Per slot: name length `u8`, slot flags `u8`, projection count `u16`, written revision `u64`, name bytes, then the parts its flags select: areas, each as its coordinates (`i64` each), preceded by their count `u8` (1 to 64) when header flag `0x2` is set, projection IDs (`u32` each), and owner length `u8` with owner bytes.
 4. CRC32 over all preceding bytes.
 
 Slot flags are `0x1` lost, `0x2` area, `0x4` projection, `0x8` NO BEFORE, `0x10` CHUNKS, `0x20` lost by a dropped projected column, `0x40` owner, and `0x80` resync, set by a restore or SWAP TABLES and never with `0x1`; the projection count is nonzero exactly with `0x4`.
-The only header flag, `0x1`, is the filter format; it permits the filter flags `0x2` through `0x20`, requires `slot_filters`, and stays set once written.
+Header flag `0x1` is the filter format; it permits the filter flags `0x2` through `0x20`, requires `slot_filters`, and stays set once written.
+Header flag `0x2` gives each slot's count of areas and requires `0x1`; a writer sets it only when a slot has several areas, so without it the area flag means one area.
 The owner flag needs no header flag or feature bit.
 The dimensions byte is 2 or 3 and must match the owning table.
-AREA stores the first active signed coordinates followed by the last active coordinates (x, y and, in a three-dimensional table, z); endpoints must be ordered.
+Each area stores the first active signed coordinates followed by the last active coordinates (x, y and, in a three-dimensional table, z); endpoints must be ordered, and a slot's areas are distinct and ordered by their first and then their last coordinates, x before y before z.
 Other format tags are refused; a writer writes only tag 4.
 
 Names are unique, 1–63 bytes matching `[a-z_][a-z0-9_]*`; every written revision is at or below the watermark, and epoch matches the table StoreId.

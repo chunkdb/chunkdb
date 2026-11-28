@@ -240,9 +240,9 @@ void ArchiveFilterMatchesTheWatchFilter() {
     const auto n = geometry.layout().schema().columns[0].id, label = geometry.layout().schema().columns[1].id;
     const FeedArea area{{0, 0}, {0, 0}};
     const std::vector<FeedSlotFilters> cases{
-        {.area = area}, {.column_ids = std::vector<std::uint32_t>{n}}, {.column_ids = std::vector<std::uint32_t>{label, n}},
-        {.no_before = true}, {.area = area, .column_ids = std::vector<std::uint32_t>{label}, .no_before = true},
-        {.chunks = true}, {.area = area, .chunks = true}, {.area = area, .column_ids = std::vector<std::uint32_t>{n}, .chunks = true}};
+        {.areas = {area}}, {.column_ids = std::vector<std::uint32_t>{n}}, {.column_ids = std::vector<std::uint32_t>{label, n}},
+        {.no_before = true}, {.areas = {area}, .column_ids = std::vector<std::uint32_t>{label}, .no_before = true},
+        {.chunks = true}, {.areas = {area}, .chunks = true}, {.areas = {area}, .column_ids = std::vector<std::uint32_t>{n}, .chunks = true}};
     for (const auto& filters : cases) {
         auto whole = table->ReadFeedArchive(slot.position);
         if (filters.chunks) FeedSlotTestAccess::EnableChunkForms(whole, kDefaultFeedBufferBytes);
@@ -251,8 +251,8 @@ void ArchiveFilterMatchesTheWatchFilter() {
         std::size_t sent = 0U, skipped = 0U;
         for (auto change = whole.Next(); change; change = whole.Next()) {
             const auto columns = geometry.LayoutAt(change->schema_version).schema().columns;
-            const auto expected = filters.chunks ? ChunkFeedEntry(change, geometry, FeedAreas(filters.area), filters.column_ids)
-                : FilterFeedEntry(change, FeedAreas(filters.area), filters.column_ids, filters.no_before, columns);
+            const auto expected = filters.chunks ? ChunkFeedEntry(change, geometry, filters.areas, filters.column_ids)
+                : FilterFeedEntry(change, filters.areas, filters.column_ids, filters.no_before, columns);
             const auto got = filtered.Next();
             assert(got && got->position == change->position);
             if (!expected) {
@@ -263,7 +263,7 @@ void ArchiveFilterMatchesTheWatchFilter() {
             assert(got->protocol_frame && *got->protocol_frame == EncodeFeedEntry(*expected));
             ++sent;
         }
-        assert(!filtered.Next() && sent != 0U && (skipped != 0U) == filters.area.has_value());
+        assert(!filtered.Next() && sent != 0U && (skipped != 0U) == !filters.areas.empty());
     }
 }
 // Each lower bound stays at or below the bytes the encoder writes.

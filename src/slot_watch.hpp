@@ -161,10 +161,6 @@ class SlotWatch {
     [[nodiscard]] bool Filtered() const noexcept {
         return !options_.areas.empty() || options_.column_ids || options_.no_before || options_.chunks;
     }
-    // A slot keeps at most one area.
-    [[nodiscard]] std::optional<FeedArea> SlotArea() const {
-        return options_.areas.empty() ? std::nullopt : std::optional<FeedArea>(options_.areas.front());
-    }
     void Finish(std::optional<Output> control);
     bool Work();
     bool FlushAck(bool force);

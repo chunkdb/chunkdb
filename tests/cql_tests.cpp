@@ -78,7 +78,7 @@ void TestChunkModelCoordinates() {
     const auto watch = Get<cql::Watch>("WATCH t AREA -1 -2 -3 TO 4 5 6");
     assert(watch.areas.size() == 1U && watch.areas[0].dims == 3U && watch.areas[0].first.z == -3 && watch.areas[0].last.z == 6);
     const auto slot = Get<cql::CreateSlot>("CREATE SLOT 's' ON t AREA 1 2 0 TO 3 4 0");
-    assert(slot.area && slot.area->dims == 3U && slot.area->first.z == 0);
+    assert(slot.areas.size() == 1U && slot.areas[0].dims == 3U && slot.areas[0].first.z == 0);
     ExpectError("GET BLOCK 1 2 9223372036854775808 FROM t", "z is out of range");
     ExpectError("GET CHUNK 1 2 3 4 FROM t", "expected FROM");
     ExpectError("GET AREA 1 2 TO 3 4 5 FROM t", "different dimensions");
@@ -606,7 +606,7 @@ void TestAlterAndOtherStatements() {
 
 void TestWatch() {
     const auto filtered_create = Get<cql::CreateSlot>("CREATE SLOT IF NOT EXISTS 's' ON t CHUNKS COLUMNS (b,a) NO BEFORE AREA -4 -3 TO 2 9");
-    assert(filtered_create.if_not_exists && filtered_create.chunks && filtered_create.no_before && filtered_create.columns->at(0) == "b" && filtered_create.area->first.x == -4);
+    assert(filtered_create.if_not_exists && filtered_create.chunks && filtered_create.no_before && filtered_create.columns->at(0) == "b" && filtered_create.areas.at(0).first.x == -4);
     assert(!filtered_create.owner);
     const auto owned = Get<cql::CreateSlot>("CREATE SLOT 's' ON t CHUNKS OWNER bot NO BEFORE");
     assert(owned.owner == "bot" && owned.chunks && owned.no_before);
@@ -652,7 +652,7 @@ void TestWatch() {
     ExpectError("WATCH world AREA 0 0 TO 1 1 AREA 2 2 TO 3 3", "AREA is given twice");
     ExpectError("WATCH world AREA 0 0 TO 1 1, COLUMNS a", "expected AREA");
     ExpectError("WATCH world AREA 0 0 TO 1 1, AREA 0 0 0 TO 1 1 1", "AREA dimensions differ");
-    ExpectError("CREATE SLOT 's' ON world AREA 0 0 TO 1 1, AREA 2 2 TO 3 3", "a slot takes one AREA");
+    assert(Get<cql::CreateSlot>("CREATE SLOT 's' ON world AREA 0 0 TO 1 1, AREA 2 2 TO 3 3").areas.size() == 2U);
     std::string many = "WATCH world AREA 0 0 TO 0 0";
     for (std::size_t i = 1U; i < chunkdb::kMaxFeedAreas; ++i) many += ", AREA 0 0 TO 0 0";
     assert(Get<cql::Watch>(many).areas.size() == chunkdb::kMaxFeedAreas);
