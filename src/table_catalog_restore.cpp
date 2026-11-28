@@ -457,6 +457,10 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     store->WalBarrier();
     const std::filesystem::path old_dir = table->dir_;
     const std::filesystem::path new_dir = TablesDir() / to;
+    const auto destination_exists = [&] {
+        return TableExistsError("cannot rename table '" + from + "': " + new_dir.string() +
+            " exists but is not a table this server opened");
+    };
     // Made now, so that fencing and publishing do not allocate.
     auto fence = PrepareFence(table, to, kFenceRenameUnknown);
     auto old_fence = PrepareFence(table, from, kFenceRenameRefusedReopen);
@@ -480,6 +484,7 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
             else existing->second = std::max(existing->second, right);
         }
     });
+    if (grants && std::filesystem::exists(std::filesystem::symlink_status(new_dir))) throw destination_exists();
     // A stop accepted until here leaves the table serving under its name;
     // after it the statement reports its real outcome.
     EnterStatementDecision();
@@ -516,9 +521,7 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
                 {{"table", from}, {"error", error.what()}});
             FenceTable(*table, options, std::move(old_fence));
         }
-        if (moved == std::errc::file_exists)
-            throw TableExistsError("cannot rename table '" + from + "': " + new_dir.string() +
-                " exists but is not a table this server opened");
+        if (moved == std::errc::file_exists) throw destination_exists();
         throw std::runtime_error("cannot rename table '" + from + "' to '" + to + "': " + moved.message());
     }
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_RENAME_ONCE");
@@ -531,9 +534,6 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
         // swap, neither name serves until a recovery opens what its
         // directory holds. A grant journal waits for the restart that decides
         // it by the directory, and the catalog refuses statements until then.
-        LogMessage(LogLevel::kError, LogComponent::kStore,
-            "renamed table could not be made durable; both names are fenced until RECOVER TABLE or a restart",
-            {{"table", from}, {"name", to}, {"error", error.what()}});
         if (grants) migration_health_->failed.store(true, std::memory_order_release);
         table->ended_.store(kWatchRenamed, std::memory_order_release);
         old_fence.mapped().reason = kFenceRenameUnknown;
@@ -543,6 +543,10 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
             fenced_.insert(std::move(old_fence));
         }
         FenceTable(*table, options, std::move(fence));
+        LogMessage(LogLevel::kError, LogComponent::kStore,
+            grants ? "renamed table could not be made durable; the catalog refuses statements until a restart"
+                   : "renamed table could not be made durable; both names are fenced until RECOVER TABLE or a restart",
+            {{"table", from}, {"name", to}, {"error", error.what()}});
         throw;
     }
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_SYNC_ONCE");
@@ -550,11 +554,11 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
         try {
             CompleteGrantJournal(*grants);
         } catch (const std::exception& error) {
+            table->ended_.store(kWatchRenamed, std::memory_order_release);
+            FenceTable(*table, options, std::move(fence));
             LogMessage(LogLevel::kError, LogComponent::kStore,
                 "the grants of a renamed table could not be written; the catalog refuses statements until a restart",
                 {{"table", from}, {"name", to}, {"error", error.what()}});
-            table->ended_.store(kWatchRenamed, std::memory_order_release);
-            FenceTable(*table, options, std::move(fence));
             throw;
         }
     }

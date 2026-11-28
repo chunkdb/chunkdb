@@ -695,8 +695,8 @@ class TableCatalog {
     // directory move that commits it (docs/STORAGE_FORMAT.md, pending
     // migration decision version 2).
     struct GrantJournal;
-    // Under operations_mutex_: locks `users`, and returns the journal of the
-    // change `change` makes to the grants in their file for moving `table`
+    // Under operations_mutex_: locks `users` when present and returns the journal
+    // of the change `change` makes to the grants in their file for moving `table`
     // to `.chunkdb.dropped/<operation>`, or with `rename` to
     // `tables/<operation>`; nullptr, and nothing locked, when there is no
     // users file or the change changes nothing.
@@ -707,7 +707,7 @@ class TableCatalog {
     // After a move that did not happen: removes the journal. A failure
     // fences the catalog until a restart removes it.
     void DiscardGrantJournal(GrantJournal& journal) noexcept;
-    // After the move is durable: publishes the users and writes their file.
+    // After the move is durable: publishes the users when present and writes their file.
     // A failure fences the catalog until a restart completes the journal.
     void CompleteGrantJournal(GrantJournal& journal);
     void RemoveDroppedTree(const std::filesystem::path& dropped) noexcept;

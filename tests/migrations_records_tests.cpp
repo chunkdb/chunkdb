@@ -6,6 +6,7 @@
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/engine.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "feature_flags.hpp"
 #include "feed_slot_records.hpp"
@@ -496,11 +497,26 @@ void CatalogOperationJournal() {
     // A read-only open refuses a pending one.
     WriteMigrationJournal(fixture.root, journal);
     Reject([&] { RecoverMigrations(fixture.root, AccessMode::kReadOnly); });
+    const auto tables = fixture.root / "tables";
+    const auto dropped = fixture.root / ".chunkdb.dropped";
+    const auto recover_moved = [&](const Bytes& before, const std::filesystem::path& target_parent) {
+        bool tables_synced = false;
+        bool target_synced = false;
+        struct ResetObserver { ~ResetObserver() { SetDirectorySyncObserverForTests({}); } } reset;
+        SetDirectorySyncObserverForTests([&](const std::filesystem::path& path) {
+            if (path == tables || path == target_parent)
+                assert(LoadFile(fixture.root / kUsersFileName) == before);
+            if (path == tables) tables_synced = true;
+            if (path == target_parent) target_synced = true;
+        });
+        RecoverMigrations(fixture.root, AccessMode::kReadWrite);
+        assert(tables_synced && target_synced);
+    };
     // The move happened: the start writes the users and removes the journal.
-    std::filesystem::create_directories(fixture.root / ".chunkdb.dropped");
-    std::filesystem::rename(fixture.root / "tables/default", fixture.root / ".chunkdb.dropped" / journal.operation_name);
+    std::filesystem::create_directories(dropped);
+    std::filesystem::rename(fixture.root / "tables/default", dropped / journal.operation_name);
     assert(CatalogOperationMoved(fixture.root, journal));
-    RecoverMigrations(fixture.root, AccessMode::kReadWrite);
+    recover_moved(users_before, dropped);
     assert(!ReadMigrationJournal(fixture.root));
     assert(LoadFile(fixture.root / std::string(kUsersFileName)) == users_after);
 
@@ -512,7 +528,7 @@ void CatalogOperationJournal() {
     rename.files = {{std::string(kUsersFileName), users_after, users_before}};
     WriteMigrationJournal(fixture.root, rename);
     std::filesystem::rename(fixture.root / "tables/default", fixture.root / "tables/renamed");
-    RecoverMigrations(fixture.root, AccessMode::kReadWrite);
+    recover_moved(users_after, tables);
     assert(!ReadMigrationJournal(fixture.root));
     assert(LoadFile(fixture.root / std::string(kUsersFileName)) == users_before);
 

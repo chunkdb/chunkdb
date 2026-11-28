@@ -1986,23 +1986,29 @@ struct TableCatalog::GrantJournal {
 
 std::shared_ptr<TableCatalog::GrantJournal> TableCatalog::PrepareGrantJournal(UserRegistry* users, const Table& table,
     bool rename, const std::string& operation, const std::function<void(Users&)>& change) {
-    if (users == nullptr) return nullptr;
-    if (!std::filesystem::equivalent(users->data_dir_, config_.data_dir))
-        throw std::invalid_argument("the users belong to another data directory");
-    auto prepared = std::make_shared<GrantJournal>(users);
-    // As MIGRATE: the registry's users, made equal to their file, stay
-    // locked until the change is published or dropped.
-    prepared->lock = std::unique_lock(users->mutex_);
-    if (users->migration_health_) users->migration_health_->Check();
-    users->ConfirmPublication();
-    users->migration_health_ = migration_health_;
-    const auto disk = ReadUsersFile(config_.data_dir);
-    if (!disk) return nullptr;
-    if (users->users_ != *disk)
-        users->CommitPublication(*disk, users->PreparePublication(std::make_shared<const Users>(*disk)), prepared->wakes);
-    prepared->next = users->users_;
-    change(prepared->next);
-    if (prepared->next == users->users_) return nullptr;
+    std::shared_ptr<GrantJournal> prepared;
+    if (users) {
+        if (!std::filesystem::equivalent(users->data_dir_, config_.data_dir))
+            throw std::invalid_argument("the users belong to another data directory");
+        prepared = std::make_shared<GrantJournal>(users);
+        // As MIGRATE, keep the registry locked until publication or refusal.
+        prepared->lock = std::unique_lock(users->mutex_);
+        if (users->migration_health_) users->migration_health_->Check();
+        users->ConfirmPublication();
+        users->migration_health_ = migration_health_;
+    }
+    // The on-disk grants still follow their tables while authentication is disabled.
+    auto before = ReadUsersFileImage(config_.data_dir);
+    if (!before) return nullptr;
+    const auto disk = DecodeUsers(*before);
+    if (users && users->users_ != disk)
+        users->CommitPublication(disk, users->PreparePublication(std::make_shared<const Users>(disk)), prepared->wakes);
+    auto next = disk;
+    change(next);
+    if (next == disk) return nullptr;
+    if (config_.allow_multiple_processes)
+        throw std::invalid_argument("changing table grants requires a single-process catalog");
+    if (!prepared) prepared = std::make_shared<GrantJournal>(nullptr);
     const auto root = ReadDataDirManifest(config_.data_dir);
     if (!root) throw std::runtime_error("data directory manifest disappeared");
     auto& journal = prepared->journal;
@@ -2012,23 +2018,26 @@ std::shared_ptr<TableCatalog::GrantJournal> TableCatalog::PrepareGrantJournal(Us
     journal.table = table.name_;
     journal.table_id = table.store_id_;
     journal.operation_name = operation;
-    journal.files.push_back({std::string(kUsersFileName), LoadFile(config_.data_dir / std::string(kUsersFileName)),
-        EncodeUsers(prepared->next)});
-    // Built before the move, so publishing the users cannot fail after it.
-    prepared->publication = users->PreparePublication(std::make_shared<const Users>(prepared->next));
+    journal.files.push_back({std::string(kUsersFileName), std::move(before), EncodeUsers(next)});
+    if (users) {
+        // Built before the move, so publishing the users cannot fail after it.
+        prepared->publication = users->PreparePublication(std::make_shared<const Users>(next));
+        prepared->next = std::move(next);
+    }
     return prepared;
 }
 
 void TableCatalog::WriteGrantJournal(GrantJournal& prepared) {
+    ValidateMigrationJournal(config_.data_dir, prepared.journal);
+    bool published = false;
     try {
-        ValidateMigrationJournal(config_.data_dir, prepared.journal);
-        WriteMigrationJournal(config_.data_dir, prepared.journal);
-    } catch (...) {
-        DiscardGrantJournal(prepared);
+        WriteMigrationJournal(config_.data_dir, prepared.journal, &published);
+        if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
+            hook->Run(MigrationTestHook::Point::kPrepared, prepared.journal.table);
+    } catch (const std::exception&) {
+        if (published) DiscardGrantJournal(prepared);
         throw;
     }
-    if (auto* hook = migration_health_->hook.load(std::memory_order_acquire))
-        hook->Run(MigrationTestHook::Point::kPrepared, prepared.journal.table);
 }
 
 void TableCatalog::DiscardGrantJournal(GrantJournal& prepared) noexcept {
@@ -2053,7 +2062,8 @@ void TableCatalog::DiscardGrantJournal(GrantJournal& prepared) noexcept {
 void TableCatalog::CompleteGrantJournal(GrantJournal& prepared) {
     // The move is durable and the journal holds the change: memory follows
     // it now, so no statement sees the grants of the old name again.
-    prepared.users->CommitPublication(std::move(prepared.next), std::move(prepared.publication), prepared.wakes);
+    if (prepared.users)
+        prepared.users->CommitPublication(std::move(prepared.next), std::move(prepared.publication), prepared.wakes);
     try {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CATALOG_GRANTS_WRITE_FAIL_ONCE"))
             throw std::runtime_error("injected failure writing the grants of a dropped or renamed table");
@@ -2166,6 +2176,7 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
     // commands on it would wait forever. Unless it is served again or gone,
     // it is fenced, with a fence made now, while a failure still serves it.
     auto fence = PrepareFence(table, table->name_, kFenceDropUnknown);
+    const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     // A table created later under this name must not issue this table's
     // tokens again: the data directory keeps a floor above all of them,
     // durably before the drop. Failing here fails the drop.
@@ -2187,7 +2198,6 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
         if (gone) RetireTable(*table, options);
         else FenceTable(*table, options, std::move(fence));
     });
-    const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
     try {

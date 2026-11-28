@@ -1138,6 +1138,26 @@ void TestWithoutUsers() {
     ExpectError(server.Run(named, "HELLO 3 USER bot $1", Parameters{std::string("n,,n=bot,r=abc")}), "runs without users");
 }
 
+void TestTableGrantsWithAuthenticationDisabled() {
+    Server server(false);
+    {
+        chunkdb::UserRegistry users(server.dir.path(),
+            std::make_pair(std::string("admin"), chunkdb::scram::ParseVerifier(VerifierText("secret"))),
+            std::array<std::uint8_t, 32>{7});
+        users.Grant("admin", "default", chunkdb::Right::kWrite);
+    }
+    SessionState session;
+    assert(server.Run(session, "HELLO 3").starts_with("%"));
+    ExpectError(server.Run(session, "SHOW USERS"), "runs without users");
+    ExpectReply(server.Run(session, "ALTER TABLE default RENAME TO renamed"), "+OK\r\n");
+    const auto renamed = chunkdb::ReadUsersFile(server.dir.path());
+    assert(renamed && !renamed->users.at("admin").grants.contains("default"));
+    assert(renamed->users.at("admin").grants.at("renamed") == chunkdb::Right::kWrite);
+    ExpectReply(server.Run(session, "DROP TABLE renamed"), "+OK\r\n");
+    const auto dropped = chunkdb::ReadUsersFile(server.dir.path());
+    assert(dropped && !dropped->users.at("admin").grants.contains("renamed"));
+}
+
 // A data directory opened read-only: user and right statements are refused
 // before any right is checked, SHOW USERS still answers, and chunkdb.users
 // is not written.
@@ -1384,6 +1404,7 @@ int main(int argc, char** argv) {
     TestTwoVerifiers();
     TestTwoVerifiersDuringLogin();
     TestWithoutUsers();
+    TestTableGrantsWithAuthenticationDisabled();
     TestReadOnly();
     return 0;
 }

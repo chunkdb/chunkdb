@@ -92,8 +92,18 @@ void RecoverMigrations(const std::filesystem::path& root, AccessMode access_mode
                 "be finishing it, so try again, and with no writer running open it read-write once to recover it");
         // A catalog operation whose directory move did not happen changed
         // nothing: its table keeps its name and grants.
-        if (journal->catalog_operation && !CatalogOperationMoved(root, *journal)) DiscardCatalogOperation(root);
-        else CompleteMigrationJournal(root, *journal);
+        if (journal->catalog_operation && !CatalogOperationMoved(root, *journal)) {
+            DiscardCatalogOperation(root);
+        } else {
+            if (journal->catalog_operation) {
+                // A process restart can see a move that was never synced.
+                // Make it durable before writing the grants or removing the journal.
+                SyncDirectoryPath(root / "tables");
+                if (journal->directory_action == MigrationDirectoryAction::kDrop)
+                    SyncDirectoryPath(root / ".chunkdb.dropped");
+            }
+            CompleteMigrationJournal(root, *journal);
+        }
     }
     if (access_mode == AccessMode::kReadWrite) {
         CleanupAtomicTmpArtifacts(root / kMigrationPendingFileName);

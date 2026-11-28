@@ -411,7 +411,7 @@ Users DecodeUsers(const std::vector<std::uint8_t>& bytes) {
     return users;
 }
 
-std::optional<Users> ReadUsersFile(const std::filesystem::path& data_dir) {
+std::optional<std::vector<std::uint8_t>> ReadUsersFileImage(const std::filesystem::path& data_dir) {
     const auto path = data_dir / kUsersFileName;
     if (!std::filesystem::exists(path)) {
         return std::nullopt;
@@ -420,7 +420,13 @@ std::optional<Users> ReadUsersFile(const std::filesystem::path& data_dir) {
     if (std::filesystem::file_size(path) > kMaxUsersFileBytes) {
         throw std::invalid_argument("chunkdb.users is larger than " + std::to_string(kMaxUsersFileBytes) + " bytes");
     }
-    return DecodeUsers(LoadFile(path));
+    return LoadFile(path);
+}
+
+std::optional<Users> ReadUsersFile(const std::filesystem::path& data_dir) {
+    const auto image = ReadUsersFileImage(data_dir);
+    if (!image) return std::nullopt;
+    return DecodeUsers(*image);
 }
 
 void WriteUsersFile(const std::filesystem::path& data_dir, const Users& users, bool* out_replaced) {
