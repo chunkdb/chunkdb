@@ -910,6 +910,39 @@ void TestHelloOptions() {
     }
 }
 
+void TestMigrationSteps() {
+    // Steps separated by `;` are one migration; the text keeps every step.
+    const std::string text = "ALTER TABLE t ADD COLUMN a u8 NULL;ALTER TABLE t ADD CHECK (a < 9) ;  CREATE SLOT 's' ON t COLUMNS (a)";
+    const auto migration = Get<cql::Migrate>("MIGRATE 'steps' " + text + "  ");
+    assert(migration.text == text && migration.then.size() == 2U);
+    assert(std::get<cql::AlterTable>(migration.statement).table == "t");
+    assert(std::holds_alternative<cql::AddCheck>(std::get<cql::AlterTable>(migration.then[0]).change));
+    assert(std::get<cql::CreateSlot>(migration.then[1]).name == "s");
+    assert(Get<cql::Migrate>("MIGRATE 'one' DROP TABLE t").then.empty());
+    const auto steps = cql::ParseMigrationSteps(text);
+    assert(steps.size() == 3U && std::holds_alternative<cql::CreateSlot>(steps[2]));
+    assert(cql::ParseMigrationSteps("DROP TABLE t").size() == 1U);
+    ExpectError("MIGRATE 's' DROP TABLE t;", "a MIGRATE step is empty");
+    ExpectError("MIGRATE 's' DROP TABLE t; ; DROP TABLE u", "column 27: a MIGRATE step is empty");
+    ExpectError("MIGRATE 's' DROP TABLE t; MIGRATE 'u' DROP TABLE u", "column 27: MIGRATE cannot contain another MIGRATE");
+    ExpectError("MIGRATE 's' DROP TABLE t; SET BLOCK 0 0 IN t a=1", "each MIGRATE step is one schema statement");
+    ExpectError("MIGRATE 's' DROP TABLE t; ALTER TABLE t RENAME TO u", "MIGRATE cannot rename a table");
+    ExpectError("MIGRATE 's' DROP TABLE t DROP TABLE u; DROP TABLE v", "expected the end of the statement");
+    // A `;` inside a quoted value or a CHECK condition belongs to its step.
+    const auto quoted = Get<cql::Migrate>(
+        "MIGRATE 'quoted' ALTER TABLE t ADD COLUMN s text(8) DEFAULT 'a;b'; ALTER TABLE t ADD CHECK (s <> 'x;y')");
+    assert(quoted.then.size() == 1U);
+    const auto& added = std::get<cql::AddColumn>(std::get<cql::AlterTable>(quoted.statement).change);
+    assert(added.column.default_value == cql::Literal(cql::Text{.value = "a;b"}));
+    assert(std::get<cql::AddCheck>(std::get<cql::AlterTable>(quoted.then[0]).change).check.expression == "s <> 'x;y'");
+    // `;` separates steps of MIGRATE only.
+    ExpectError("DROP TABLE t; DROP TABLE u", "column 13: unexpected ';'");
+    std::string many = "MIGRATE 'many' DROP TABLE t0";
+    for (std::size_t i = 1U; i < cql::kMaxMigrationSteps; ++i) many += "; DROP TABLE t" + std::to_string(i);
+    assert(Get<cql::Migrate>(many).then.size() == cql::kMaxMigrationSteps - 1U);
+    ExpectError(many + "; DROP TABLE extra", "a migration has at most 64 steps");
+}
+
 int main() {
     assert(Get<cql::Cancel>("CANCEL 18446744073709551615").id == UINT64_MAX);
     assert(Get<cql::KillConnection>("KILL CONNECTION 0").id == 0U);
@@ -926,6 +959,7 @@ int main() {
     TestHelloOptions();
     TestDefaultChunkGeometry();
     TestRightsLists();
+    TestMigrationSteps();
     TestUnorderedOptions();
     TestStatementSuggestions();
     TestConditionalObjects();

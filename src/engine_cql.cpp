@@ -1143,23 +1143,26 @@ bool HasColumn(const TableSchema& schema, std::string_view name) {
 bool MayReplayMigration(bool require_auth, const User* user, const MigrationRecord& record) {
     if (!require_auth) return true;
     if (user == nullptr) return false;
-    cql::Parsed parsed;
+    std::vector<cql::Statement> steps;
     try {
-        parsed = cql::Parse(record.statement);
+        steps = cql::ParseMigrationSteps(record.statement);
     } catch (const cql::ParseError&) {
         const auto right = RightOn(*user, std::string(kEveryTable));
         return right.has_value() && *right >= Right::kAdmin;
     }
-    if (std::holds_alternative<cql::GrantRight>(parsed.statement)) return user->manages_users;
-    const auto table = std::visit([](const auto& inner) -> std::string {
-        using T = std::decay_t<decltype(inner)>;
-        if constexpr (std::is_same_v<T, cql::CreateTable> || std::is_same_v<T, cql::AlterTable> || std::is_same_v<T, cql::DropTable> ||
-                      std::is_same_v<T, cql::CreateSlot> || std::is_same_v<T, cql::DropSlot>)
-            return inner.table;
-        return {};
-    }, parsed.statement);
-    const auto right = table.empty() ? std::nullopt : RightOn(*user, table);
-    return right.has_value() && *right >= Right::kAdmin;
+    // A migration of several steps is within the rights of every step.
+    return std::all_of(steps.begin(), steps.end(), [&](const cql::Statement& statement) {
+        if (std::holds_alternative<cql::GrantRight>(statement)) return user->manages_users;
+        const auto table = std::visit([](const auto& inner) -> std::string {
+            using T = std::decay_t<decltype(inner)>;
+            if constexpr (std::is_same_v<T, cql::CreateTable> || std::is_same_v<T, cql::AlterTable> || std::is_same_v<T, cql::DropTable> ||
+                          std::is_same_v<T, cql::CreateSlot> || std::is_same_v<T, cql::DropSlot>)
+                return inner.table;
+            return {};
+        }, statement);
+        const auto right = table.empty() ? std::nullopt : RightOn(*user, table);
+        return right.has_value() && *right >= Right::kAdmin;
+    });
 }
 
 }  // namespace
@@ -1561,101 +1564,107 @@ std::string CommandEngine::ExecuteStatement(
                     std::stop_callback statement(StatementStopToken(), request_stop);
                     request.cancelled = cancelled.get_token();
                     request.record = {migration.name, 0U, config_.require_auth ? session.user : std::string{}, migration.text};
-                    std::visit(Overloaded{
-                        [&](const cql::CreateTable& create) {
-                            RequireCreateRight(session, create.table);
-                            request.kind = MigrationRequest::Kind::kCreate;
-                            request.table = create.table;
-                            request.if_not_exists = create.if_not_exists;
-                            request.definition = [&] { return DefinitionFrom(create, catalog_->default_options()); };
-                        },
-                        [&](const cql::AlterTable& alter) {
-                            RequireRight(session, alter.table, Right::kAdmin);
-                            request.kind = MigrationRequest::Kind::kAlter;
-                            request.table = alter.table;
-                            std::visit(Overloaded{
-                                [&](const cql::AddColumn& add) {
-                                    request.chunk_column = add.chunk_column;
-                                    if (add.if_not_exists)
-                                        request.columns_if_needed = [&add](const TableSchema& schema) { return !HasColumn(schema, add.column.name); };
-                                    request.alter = [&add](StoreManifest& m) {
-                                        if (add.chunk_column) *m.chunk_schema = AddChunkColumn(*m.chunk_schema,
-                                            ColumnFrom(add.column, m.chunk_schema->next_column_id), true);
-                                        else m.schema = AddColumn(m.schema, ColumnFrom(add.column, m.schema.next_column_id), true);
-                                    };
-                                },
-                                [&](const cql::DropColumn& drop) {
-                                    request.chunk_column = drop.chunk_column;
-                                    if (drop.if_exists)
-                                        request.columns_if_needed = [&drop](const TableSchema& schema) { return HasColumn(schema, drop.column); };
-                                    request.alter = [&drop](StoreManifest& m) {
-                                        if (drop.chunk_column) *m.chunk_schema = DropChunkColumn(*m.chunk_schema, drop.column);
-                                        else m.schema = DropColumn(m.schema, drop.column);
-                                    };
-                                },
-                                [&](const cql::RenameColumn& rename) {
-                                    request.chunk_column = rename.chunk_column;
-                                    request.alter = [&rename](StoreManifest& m) {
-                                        if (rename.chunk_column) *m.chunk_schema = RenameChunkColumn(*m.chunk_schema, rename.column, rename.new_name);
-                                        else m.schema = RenameColumn(m.schema, rename.column, rename.new_name);
-                                    };
-                                },
-                                [&](const cql::AlterColumnType& change) {
-                                    if (change.conversion) {
-                                        request.alter = [&change](StoreManifest& m) { m.schema = ChangeColumnType(m.schema, change.column, change.type, *change.conversion); };
-                                    } else request.narrowing = std::make_pair(change.column, change.type);
-                                },
-                                [&](const cql::SetOption& set) {
-                                    request.alter = [&set](StoreManifest& m) {
-                                        ReplaceTableOptions(&m, OptionsFrom({set.option}).ApplyTo(DecodeTableOptions(m.options)));
-                                    };
-                                },
-                                [&](const cql::AlterColumnAttribute& attribute) {
-                                    if (attribute.change == cql::AlterColumnAttribute::Change::kDropNull) {
-                                        request.drop_null = attribute.column;
-                                        return;
+                    // Each step checks its own rights and becomes one request.
+                    const auto fill = [&](const cql::MigrationStatement& migration_step, MigrationRequest& step) {
+                        std::visit(Overloaded{
+                            [&](const cql::CreateTable& create) {
+                                RequireCreateRight(session, create.table);
+                                step.kind = MigrationRequest::Kind::kCreate;
+                                step.table = create.table;
+                                step.if_not_exists = create.if_not_exists;
+                                step.definition = [&] { return DefinitionFrom(create, catalog_->default_options()); };
+                            },
+                            [&](const cql::AlterTable& alter) {
+                                RequireRight(session, alter.table, Right::kAdmin);
+                                step.kind = MigrationRequest::Kind::kAlter;
+                                step.table = alter.table;
+                                std::visit(Overloaded{
+                                    [&](const cql::AddColumn& add) {
+                                        step.chunk_column = add.chunk_column;
+                                        if (add.if_not_exists)
+                                            step.columns_if_needed = [&add](const TableSchema& schema) { return !HasColumn(schema, add.column.name); };
+                                        step.alter = [&add](StoreManifest& m) {
+                                            if (add.chunk_column) *m.chunk_schema = AddChunkColumn(*m.chunk_schema,
+                                                ColumnFrom(add.column, m.chunk_schema->next_column_id), true);
+                                            else m.schema = AddColumn(m.schema, ColumnFrom(add.column, m.schema.next_column_id), true);
+                                        };
+                                    },
+                                    [&](const cql::DropColumn& drop) {
+                                        step.chunk_column = drop.chunk_column;
+                                        if (drop.if_exists)
+                                            step.columns_if_needed = [&drop](const TableSchema& schema) { return HasColumn(schema, drop.column); };
+                                        step.alter = [&drop](StoreManifest& m) {
+                                            if (drop.chunk_column) *m.chunk_schema = DropChunkColumn(*m.chunk_schema, drop.column);
+                                            else m.schema = DropColumn(m.schema, drop.column);
+                                        };
+                                    },
+                                    [&](const cql::RenameColumn& rename) {
+                                        step.chunk_column = rename.chunk_column;
+                                        step.alter = [&rename](StoreManifest& m) {
+                                            if (rename.chunk_column) *m.chunk_schema = RenameChunkColumn(*m.chunk_schema, rename.column, rename.new_name);
+                                            else m.schema = RenameColumn(m.schema, rename.column, rename.new_name);
+                                        };
+                                    },
+                                    [&](const cql::AlterColumnType& change) {
+                                        if (change.conversion) {
+                                            step.alter = [&change](StoreManifest& m) { m.schema = ChangeColumnType(m.schema, change.column, change.type, *change.conversion); };
+                                        } else step.narrowing = std::make_pair(change.column, change.type);
+                                    },
+                                    [&](const cql::SetOption& set) {
+                                        step.alter = [&set](StoreManifest& m) {
+                                            ReplaceTableOptions(&m, OptionsFrom({set.option}).ApplyTo(DecodeTableOptions(m.options)));
+                                        };
+                                    },
+                                    [&](const cql::AlterColumnAttribute& attribute) {
+                                        if (attribute.change == cql::AlterColumnAttribute::Change::kDropNull) {
+                                            step.drop_null = attribute.column;
+                                            return;
+                                        }
+                                        step.alter = [&attribute](StoreManifest& m) {
+                                            m.schema = ChangeColumnAttributes(m.schema, attribute.column, AttributesFrom(m.schema, attribute));
+                                        };
+                                    },
+                                    [&](const cql::RenameTable&) {
+                                        // The parser refuses it inside MIGRATE.
+                                        throw std::invalid_argument("MIGRATE cannot rename a table");
+                                    },
+                                    [&](const cql::AddCheck& add) {
+                                        step.add_check = [&add](const TableSchema& schema) { return CheckFrom(add.check, schema); };
+                                    },
+                                    [&](const cql::DropCheck& drop) {
+                                        if (drop.if_exists)
+                                            step.columns_if_needed = [&drop](const TableSchema& schema) { return HasCheck(schema, drop.name); };
+                                        step.alter = [&drop](StoreManifest& m) { m.schema = chunkdb::DropCheck(m.schema, drop.name); };
                                     }
-                                    request.alter = [&attribute](StoreManifest& m) {
-                                        m.schema = ChangeColumnAttributes(m.schema, attribute.column, AttributesFrom(m.schema, attribute));
-                                    };
-                                },
-                                [&](const cql::RenameTable&) {
-                                    // The parser refuses it inside MIGRATE.
-                                    throw std::invalid_argument("MIGRATE cannot rename a table");
-                                },
-                                [&](const cql::AddCheck& add) {
-                                    request.add_check = [&add](const TableSchema& schema) { return CheckFrom(add.check, schema); };
-                                },
-                                [&](const cql::DropCheck& drop) {
-                                    if (drop.if_exists)
-                                        request.columns_if_needed = [&drop](const TableSchema& schema) { return HasCheck(schema, drop.name); };
-                                    request.alter = [&drop](StoreManifest& m) { m.schema = chunkdb::DropCheck(m.schema, drop.name); };
-                                }
-                            }, alter.change);
-                        },
-                        [&](const cql::DropTable& drop) {
-                            RequireRight(session, drop.table, Right::kAdmin);
-                            request.kind = MigrationRequest::Kind::kDrop; request.table = drop.table; request.if_exists = drop.if_exists;
-                        },
-                        [&](const cql::GrantRight& grant) {
-                            RequireManagesUsers(session);
-                            request.kind = MigrationRequest::Kind::kGrant;
-                            request.user = grant.user; request.table = grant.table;
-                            request.right = grant.right; request.server_rights = grant.server_rights; request.revoke = grant.revoke;
-                        },
-                        [&](const cql::CreateSlot& slot) {
-                            RequireRight(session, slot.table, Right::kAdmin);
-                            request.kind = MigrationRequest::Kind::kCreateSlot; request.table = slot.table; request.slot = slot.name; request.if_not_exists = slot.if_not_exists;
-                            request.slot_filters = {.area = slot.area, .no_before = slot.no_before, .chunks = slot.chunks};
-                            request.slot_columns = slot.columns;
-                            request.slot_owner = SlotOwner(slot, config_.require_auth, session.user);
-                            request.slot_owner_given = slot.owner.has_value();
-                        },
-                        [&](const cql::DropSlot& slot) {
-                            RequireRight(session, slot.table, Right::kAdmin);
-                            request.kind = MigrationRequest::Kind::kDropSlot; request.table = slot.table; request.slot = slot.name; request.if_exists = slot.if_exists;
-                        }
-                    }, migration.statement);
+                                }, alter.change);
+                            },
+                            [&](const cql::DropTable& drop) {
+                                RequireRight(session, drop.table, Right::kAdmin);
+                                step.kind = MigrationRequest::Kind::kDrop; step.table = drop.table; step.if_exists = drop.if_exists;
+                            },
+                            [&](const cql::GrantRight& grant) {
+                                RequireManagesUsers(session);
+                                step.kind = MigrationRequest::Kind::kGrant;
+                                step.user = grant.user; step.table = grant.table;
+                                step.right = grant.right; step.server_rights = grant.server_rights; step.revoke = grant.revoke;
+                            },
+                            [&](const cql::CreateSlot& slot) {
+                                RequireRight(session, slot.table, Right::kAdmin);
+                                step.kind = MigrationRequest::Kind::kCreateSlot; step.table = slot.table; step.slot = slot.name; step.if_not_exists = slot.if_not_exists;
+                                step.slot_filters = {.area = slot.area, .no_before = slot.no_before, .chunks = slot.chunks};
+                                step.slot_columns = slot.columns;
+                                step.slot_owner = SlotOwner(slot, config_.require_auth, session.user);
+                                step.slot_owner_given = slot.owner.has_value();
+                            },
+                            [&](const cql::DropSlot& slot) {
+                                RequireRight(session, slot.table, Right::kAdmin);
+                                step.kind = MigrationRequest::Kind::kDropSlot; step.table = slot.table; step.slot = slot.name; step.if_exists = slot.if_exists;
+                            }
+                        }, migration_step);
+                    };
+                    fill(migration.statement, request);
+                    request.then.reserve(migration.then.size());
+                    for (const auto& migration_step : migration.then) fill(migration_step, request.then.emplace_back());
                     // The rights just checked, so the lookup reads no user state.
                     (void)CurrentUser(session);
                     request.require_recorded_access = [require_auth = config_.require_auth, user = session.user_rights](const MigrationRecord& record) {

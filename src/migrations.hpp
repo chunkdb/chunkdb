@@ -3,6 +3,7 @@
 #include <functional>
 #include <optional>
 #include <string>
+#include <vector>
 
 #include "chunkdb/table_catalog.hpp"
 #include "migrations_records.hpp"
@@ -45,6 +46,10 @@ struct MigrationRequest {
     // Throws when the caller may not learn whether a recorded name is skipped
     // or conflicts; runs before a recorded name is compared.
     std::function<void(const MigrationRecord&)> require_recorded_access;
+    // The steps after this one in a migration of several steps, which apply
+    // with it as one unit; `record`, `cancelled` and `require_recorded_access`
+    // are this request's.
+    std::vector<MigrationRequest> then{};
 };
 
 }  // namespace chunkdb

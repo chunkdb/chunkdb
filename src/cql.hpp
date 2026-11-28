@@ -423,7 +423,10 @@ struct ScanChunks {
 };
 
 using MigrationStatement = std::variant<CreateTable, AlterTable, DropTable, GrantRight, CreateSlot, DropSlot>;
-struct Migrate { std::string name; std::string text; MigrationStatement statement; };
+// A migration of several steps is one unit (docs/reference/MIGRATIONS.md):
+// `statement` is its first step and `then` the steps after it, in order.
+inline constexpr std::size_t kMaxMigrationSteps = 64U;
+struct Migrate { std::string name; std::string text; MigrationStatement statement; std::vector<MigrationStatement> then; };
 struct ShowMigrations {};
 struct CompactTombstones {
     std::string table;
@@ -492,6 +495,9 @@ struct Parsed {
 // Parses one statement (docs/CQL.md). Throws ParseError naming the
 // first token that does not fit, with its 1-based column.
 [[nodiscard]] Parsed Parse(std::string_view line);
+// The steps of a recorded MIGRATE statement: one statement, or several
+// separated by `;`. Throws ParseError as MIGRATE does.
+[[nodiscard]] std::vector<Statement> ParseMigrationSteps(std::string_view text);
 // How AGGREGATE names `function` in its reply and errors: `count(*)`,
 // `sum(a)`, `min(a)`, `max(a)` or `avg(a)`.
 [[nodiscard]] std::string AggregateFunctionName(const AggregateFunction& function);

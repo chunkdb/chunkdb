@@ -569,7 +569,7 @@ The file is admitted independently of the catalog manifest, including standalone
 Names are unique identifiers matching `[a-z_][a-z0-9_]*`, 1–63 bytes; users are empty for auth none or valid user names of at most 63 bytes.
 Times are positive and fit a signed protocol integer; record order is append order regardless of clock changes.
 Statements are nonempty UTF-8, at most 65536 bytes, without CR/LF/NUL; completed-ledger decoding validates bytes without reparsing them as current CQL.
-MIGRATE preserves keyword case and interior whitespace after trimming its separator and trailing spaces/tabs, and requires one supported schema statement without parameter frames.
+MIGRATE preserves keyword case and interior whitespace after trimming its separator and trailing spaces/tabs, and requires one supported schema statement without parameter frames, or 2 to 64 of them separated by `;`, which are one migration and one record.
 
 `data_dir/chunkdb.migration.pending` is the durable redo decision, at most 64 MiB:
 
@@ -587,6 +587,8 @@ Required participants depend on the operation:
 - GRANT/REVOKE: users.
 - CREATE SLOT: table manifest and slots.
 - DROP SLOT: slots.
+- Several steps: a manifest for ALTER TABLE, slot records and the table manifest for slot changes, users for GRANT or REVOKE, and a manifest and index for table creation.
+- A manifest or slot records file can be omitted when every conditional step that could change it is a no-op; recovery checks those conditions against the unchanged state on disk.
 
 Every operation includes the ledger and rejects unrelated participants.
 CREATE prepares its exact manifest under `.chunkdb.staging/<table>.<16 lowercase hex digits>/`; DROP uses the corresponding `.chunkdb.dropped/` operation name.
