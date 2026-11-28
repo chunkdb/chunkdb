@@ -45,6 +45,7 @@ constexpr std::array<const char*, 4U> kPoints{
     "CHUNKDB_FAILPOINT_CRASH_FEED_AFTER_WAL_RENAME_ONCE"};
 constexpr std::array<DurabilityMode, 3U> kModes{
     DurabilityMode::kRelaxed, DurabilityMode::kFsyncWal, DurabilityMode::kFsyncCheckpoint};
+const FeedMessage kTransactionMessage{"orders.paid", std::string("\0\xff", 2U)};
 
 CatalogConfig CrashConfig(const std::filesystem::path& path, DurabilityMode mode) {
     auto config = Config(path);
@@ -247,6 +248,21 @@ int Crash(const std::filesystem::path& path, DurabilityMode mode, const char* po
     return 3;  // Reaching here means the claimed crash point was not reached.
 }
 
+int CrashPublishingTransaction(const std::filesystem::path& path, DurabilityMode mode, const char* point) {
+    TableCatalog catalog(CrashConfig(path, mode));
+    auto lease = catalog.Find("default")->Acquire();
+    auto& store = lease->store();
+    auto snapshot = store.BeginTxnSnapshot(txn_test::kTxnDuration);
+    auto first = store.ReadChunkStateAt(*snapshot, 0, 0);
+    auto second = store.ReadChunkStateAt(*snapshot, 1, 0);
+    txn_test::SetCounter(&first, 11U);
+    txn_test::SetCounter(&second, 22U);
+    ScopedWriteMessage publishing(&kTransactionMessage);
+    txn_test::ScopedEnv armed(point, "1");
+    (void)store.CommitTransaction(*snapshot, {}, {{{0, 0}, std::move(first)}, {{1, 0}, std::move(second)}});
+    return 3;
+}
+
 using Row = std::pair<std::optional<std::uint32_t>, std::optional<std::uint32_t>>;
 
 void Value(const std::optional<std::vector<ColumnValue>>& actual, std::optional<std::uint32_t> value) {
@@ -350,6 +366,56 @@ void Case(const std::string& executable, DurabilityMode mode, bool base, bool em
         assert(txn_test::CounterOf(lease->store().ReadChunkState(0, 0)) == 33U);
     }
 }
+
+void TransactionMessageFollowsCommitPoint(const std::string& executable) {
+    for (const auto mode : kModes) for (const bool committed : {false, true}) {
+        const auto* point = committed ? "CHUNKDB_FAILPOINT_CRASH_TXN_AFTER_COMMIT_PUBLISH_ONCE" :
+            "CHUNKDB_FAILPOINT_CRASH_TXN_BEFORE_COMMIT_PUBLISH_ONCE";
+        test::ScopedTempDir directory("chunkdb-feed-message-commit-crash");
+        const auto config = CrashConfig(directory.path(), mode);
+        FeedPosition start;
+        {
+            TableCatalog catalog(config);
+            start = CreateDefault(catalog)->CreateFeedSlot("consumer").position;
+        }
+        const auto exit_code = RunChild(executable, {"--crash-publish", directory.path().string(), DurabilityModeName(mode), point});
+        if (exit_code != kCrashExit)
+            throw std::runtime_error("message crash child did not reach " + std::string(point) + " mode=" +
+                DurabilityModeName(mode) + " exit=" + std::to_string(exit_code));
+
+        TableCatalog catalog(config);
+        const auto table = catalog.Find("default");
+        std::uint64_t revision = 0U, following_revision = 0U;
+        {
+            const auto lease = table->Acquire();
+            auto& store = lease->store();
+            const auto first = store.ReadChunkState(0, 0);
+            const auto second = store.ReadChunkState(1, 0);
+            assert(BlockPresent(first.presence_bitmap, 0U) == committed);
+            assert(BlockPresent(second.presence_bitmap, 0U) == committed);
+            assert(txn_test::CounterOf(first) == (committed ? 11U : 0U));
+            assert(txn_test::CounterOf(second) == (committed ? 22U : 0U));
+            assert(first.version == second.version);
+            revision = first.version;
+            // Advance the durable frontier beyond the crashed transaction
+            // so replay would expose any frames that escaped rollback.
+            store.SetBlockBits(8, 0, Bits(33U));
+            following_revision = store.GetChunkVersion(2, 0);
+        }
+        FeedSlotTestAccess::Sync(*table);
+        auto reader = table->ReadFeedArchive(start);
+        if (committed) {
+            const auto entry = reader.Next();
+            assert(entry && entry->position.revision == revision && revision > start.revision);
+            assert(entry->blocks.size() == 2U && entry->messages.size() == 1U);
+            assert(entry->messages.front() == kTransactionMessage);
+        }
+        const auto following = reader.Next();
+        assert(following && following->position.revision == following_revision);
+        assert(following->blocks.size() == 1U && following->messages.empty());
+        assert(!reader.Next());
+    }
+}
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -366,6 +432,8 @@ int main(int argc, char** argv) {
     try {
         if (argc == 6 && std::string_view(argv[1]) == "--crash")
             return Crash(argv[2], ParseDurabilityMode(argv[3]), argv[4], std::string_view(argv[5]) == "empty");
+        if (argc == 5 && std::string_view(argv[1]) == "--crash-publish")
+            return CrashPublishingTransaction(argv[2], ParseDurabilityMode(argv[3]), argv[4]);
         assert(argc == 1);
         ChildDeadline(std::filesystem::absolute(argv[0]).string());
         ExitWhileBusyEnds(std::filesystem::absolute(argv[0]).string());
@@ -376,6 +444,7 @@ int main(int argc, char** argv) {
                 ++count;
             }
         std::cout << count << " archive crash scenarios passed\n";
+        TransactionMessageFollowsCommitPoint(std::filesystem::absolute(argv[0]).string());
     } catch (const std::exception& error) {
         std::cerr << "FAIL feed_slots_crash: " << error.what() << '\n';
         return 1;

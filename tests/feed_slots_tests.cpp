@@ -3,6 +3,7 @@
 #include <barrier>
 #include <condition_variable>
 #include <fstream>
+#include <stdexcept>
 #include <thread>
 
 #include "feed_slots.hpp"
@@ -290,6 +291,55 @@ void MessagesInSlotHistory() {
         EqualEntry(*change, *entry);
     }
     assert(!reader.Next());
+}
+
+void AreaReplayBudgetsOnlyDeliveredMessages() {
+    ScopedTempDir dir("chunkdb-feed-area-message-budget");
+    TableCatalog catalog(SlotsConfig(dir.path()));
+    const auto table = CreateDefault(catalog);
+    const auto start = table->CreateFeedSlot("consumer").position;
+    constexpr std::size_t budget = 512U;
+    const FeedMessage large{"audit", std::string(budget, 'm')};
+    const FeedMessage kept{"audit", "two chunks"};
+    std::uint64_t outside_revision = 0U, mixed_revision = 0U;
+    {
+        auto lease = table->Acquire();
+        auto& store = lease->store();
+        {
+            ScopedWriteMessage publishing(&large);
+            store.SetBlockBits(0, 0, Bits(1U));
+            outside_revision = store.GetChunkVersion(0, 0);
+        }
+        {
+            ScopedWriteMessage publishing(&kept);
+            auto snapshot = store.BeginTxnSnapshot(txn_test::kTxnDuration);
+            auto outside = store.ReadChunkStateAt(*snapshot, 0, 0);
+            auto inside = store.ReadChunkStateAt(*snapshot, 1, 0);
+            txn_test::SetCounter(&outside, 2U);
+            txn_test::SetCounter(&inside, 3U);
+            mixed_revision = store.CommitTransaction(*snapshot, {}, {{{0, 0}, std::move(outside)}, {{1, 0}, std::move(inside)}});
+        }
+        store.CheckpointForTests(0, 0);
+        store.CheckpointForTests(1, 0);
+    }
+    FeedSlotTestAccess::Sync(*table);
+
+    auto reader = FeedSlotTestAccess::CompletedPrefix(*table, "consumer", start);
+    FeedSlotTestAccess::Filter(reader, {.area = FeedArea{.first = {1, 0}, .last = {1, 0}, .dims = 2U}});
+    FeedSlotTestAccess::SetEntryBudget(reader, budget);
+    const auto skipped = reader.Next();
+    assert(skipped && skipped->position.revision == outside_revision && skipped->blocks.empty());
+    assert(skipped->messages.empty() && !skipped->protocol_frame);
+    const auto delivered = reader.Next();
+    assert(delivered && delivered->position.revision == mixed_revision && delivered->blocks.size() == 1U);
+    assert((delivered->blocks.front().chunk == ChunkCoord{1, 0}));
+    assert(OnlyMessage(*delivered, kept) && delivered->protocol_frame && !reader.Next());
+
+    auto unfiltered = FeedSlotTestAccess::CompletedPrefix(*table, "consumer", start);
+    FeedSlotTestAccess::SetEntryBudget(unfiltered, budget);
+    bool refused = false;
+    try { (void)unfiltered.Next(); } catch (const std::length_error&) { refused = true; }
+    assert(refused);
 }
 
 void RestartAndPins() {
@@ -801,6 +851,7 @@ int main() {
     AllMutationsAndRelease();
     RestartAndPins();
     MessagesInSlotHistory();
+    AreaReplayBudgetsOnlyDeliveredMessages();
     ActivationBaseline();
     UnloadedActivation();
     AliasRecovery();

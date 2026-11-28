@@ -47,9 +47,9 @@ inline std::span<const FeedArea> FeedAreas(const std::optional<FeedArea>& area) 
 // Whether a filtered change that kept this of its commit is sent: AREA drops
 // a change that keeps no data, with its messages; a change that carries a
 // message is otherwise sent even without data.
-inline bool FeedEntryKept(const FeedEntry& entry, bool area_filtered) noexcept {
+inline bool FeedEntryKept(const FeedEntry& entry, bool area_filtered, bool has_message) noexcept {
     return !entry.blocks.empty() || !entry.chunk_changes.empty() || !entry.chunk_forms.empty() ||
-        (!area_filtered && !entry.messages.empty());
+        (!area_filtered && has_message);
 }
 // True when `areas` is empty or one of them holds chunk `coord`.
 bool FeedAreaHolds(std::span<const FeedArea> areas, std::uint8_t dims, ChunkCoord coord);

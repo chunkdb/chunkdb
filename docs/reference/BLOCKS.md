@@ -89,7 +89,8 @@ Other refusals, such as an unknown column or a value out of range, are errors as
 | OUT_OF_RANGE reason=returning_limit | The RETURNING rows exceed a bound; nothing changed. | Return fewer columns. |
 | INVALID_ARGUMENT reason=feature_disabled | PUBLISH on a table without the `messages` feature. | Run `ENABLE FEATURE 'messages'`, see [Tables](TABLES.md#feature-activation). |
 | INVALID_ARGUMENT | A second PUBLISH in one transaction, or a NULL message. | Publish one message per transaction. |
-| OUT_OF_RANGE | The message exceeds `max_message_bytes`. | Send a shorter message. |
+| SYNTAX | A message literal exceeds `max_message_bytes`. | Send a shorter message. |
+| PROTOCOL | A message parameter frame exceeds `max_message_bytes` and the server closes the connection. | Reconnect and send a shorter message. |
 | CONFLICT | Your transaction loses its snapshot. | Follow [Retry a transaction](../TRANSACTION_RETRY.md). |
 
 ## Notes

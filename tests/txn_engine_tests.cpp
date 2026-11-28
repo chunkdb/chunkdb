@@ -384,6 +384,23 @@ void TestExpiredTransactionReleasesBudget() {
     ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), "_\r\n");
 }
 
+void TestExpiredTransactionReleasesMessage() {
+    constexpr std::chrono::seconds duration{60};
+    Fixture f(OneCopyBudget(duration));
+    ExpectReply(f.Run(f.a, "BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run(f.a, "SET BLOCK 0 0 IN t n = 1 PUBLISH 'audit' 'staged'"), "_\r\n");
+    assert(f.a.transaction && f.a.transaction->message);
+    f.a.transaction->started -= duration;
+
+    // The other session's write needs the private chunk budget and expires a.
+    ExpectReply(f.Run(f.b, "BEGIN"), "+OK\r\n");
+    ExpectReply(f.Run(f.b, "SET BLOCK 4 0 IN t n = 2"), "_\r\n");
+    assert(f.a.transaction && f.a.transaction->aborted && !f.a.transaction->message);
+    ExpectError(f.Run(f.a, "COMMIT"), "CONFLICT reason=duration");
+    ExpectReply(f.Run(f.b, "ROLLBACK"), "+OK\r\n");
+    ExpectReply(f.Run(f.b, "GET BLOCK 0 0 FROM t"), "_\r\n");
+}
+
 // Chunk metadata and block writes of a three-dimensional table count toward
 // --txn-total-bytes, and a transaction past its duration releases them too.
 void TestExpiredDimensionalTransactionReleasesBudget() {
@@ -547,6 +564,7 @@ int main() {
     TestDurationLimit();
     TestUnexpiredTransactionKeepsBudget();
     TestExpiredTransactionReleasesBudget();
+    TestExpiredTransactionReleasesMessage();
     TestExpiredDimensionalTransactionReleasesBudget();
     TestExpiredTransactionEndsDuringSessionClose();
     TestByteAndChunkLimits();
