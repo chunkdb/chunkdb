@@ -19,6 +19,7 @@
 #include "chunkdb/crc32.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "crypto.hpp"
 #include "durability_io.hpp"
 #include "migrations_records.hpp"
 #include "shared_file_input.hpp"
@@ -112,21 +113,36 @@ std::uint64_t UnixMs() {
         std::chrono::system_clock::now().time_since_epoch()).count());
 }
 
-// Size and CRC32 of a whole file.
-WalArchiveFile Inspect(const std::filesystem::path& path) {
+class ArchiveConflictError : public std::runtime_error {
+  public:
+    using std::runtime_error::runtime_error;
+};
+
+// Size and CRC32 of a whole file, optionally checking an existing copy.
+WalArchiveFile Inspect(const std::filesystem::path& path, const std::filesystem::path* copy = nullptr) {
     SharedFileInput input(path);
     if (!input) throw std::runtime_error("cannot open WAL archive file: " + path.string());
+    std::optional<SharedFileInput> existing;
+    if (copy != nullptr && !existing.emplace(*copy))
+        throw std::runtime_error("cannot open WAL archive file: " + copy->string());
     std::array<char, 65536> buffer{};
+    std::array<char, 65536> compared{};
     WalArchiveFile file{path.filename().string(), 0U, 0U};
     for (;;) {
         input.read(buffer.data(), static_cast<std::streamsize>(buffer.size()));
         const auto count = input.gcount();
+        if (input.bad()) throw std::runtime_error("cannot read WAL archive file: " + path.string());
+        if (existing) {
+            existing->read(compared.data(), static_cast<std::streamsize>(compared.size()));
+            if (existing->bad()) throw std::runtime_error("cannot read WAL archive file: " + copy->string());
+            if (existing->gcount() != count || !std::equal(buffer.data(), buffer.data() + count, compared.data()))
+                throw ArchiveConflictError("the archive already holds a different " + copy->string());
+        }
         if (count <= 0) break;
         file.crc32 = Crc32Extend(file.crc32, reinterpret_cast<const std::uint8_t*>(buffer.data()), static_cast<std::size_t>(count));
         file.size += static_cast<std::uint64_t>(count);
         if (!input) break;
     }
-    if (input.bad()) throw std::runtime_error("cannot read WAL archive file: " + path.string());
     return file;
 }
 
@@ -254,12 +270,6 @@ namespace {
 constexpr std::array<std::uint8_t, 4> kChainMagic{'C', 'K', 'A', 'C'};
 constexpr std::uint16_t kChainFormat = 1U;
 constexpr std::size_t kChainBytes = 36U;
-
-// The archive holds a different file under the name being shipped.
-class ArchiveConflictError : public std::runtime_error {
-  public:
-    using std::runtime_error::runtime_error;
-};
 
 // Stops the process at a deterministic archive step for crash tests.
 void Crash(const char* point) {
@@ -438,9 +448,16 @@ std::optional<std::uint64_t> WalArchiveSegmentLast(std::string_view name) {
 }
 
 std::string WalArchiveContentName(std::string_view prefix, const std::vector<std::uint8_t>& bytes) {
-    std::array<char, 16> crc{};
-    std::snprintf(crc.data(), crc.size(), "%08x", static_cast<unsigned>(Crc32(bytes)));
-    return std::string(prefix) + "." + crc.data();
+    constexpr char digits[] = "0123456789abcdef";
+    const auto digest = crypto::Sha256Of(bytes);
+    std::string name(prefix);
+    name.reserve(prefix.size() + 1U + 2U * digest.size());
+    name.push_back('.');
+    for (const auto byte : digest) {
+        name.push_back(digits[byte >> 4U]);
+        name.push_back(digits[byte & 15U]);
+    }
+    return name;
 }
 
 void RemoveWalArchiveStaging(const std::filesystem::path& data_dir) {
@@ -605,6 +622,9 @@ void WalArchiver::FinishStagedRecords() {
         if (!ParseWalArchiveRecordName(name)) continue;
         const auto record = ParseWalArchiveRecord(LoadFile(path));
         if (record.directory != directory_id_) throw std::runtime_error("staged WAL archive seal record belongs to another data directory");
+        // An earlier attempt may have published the intent's name before
+        // its directory sync failed. Make it durable before shipping it.
+        SyncDirectoryPath(path.parent_path());
         // Equal bytes count as shipped, so a record shipped before a crash
         // ships again unchanged. A different record under its name, of an
         // older chain, means this one was never published: it is dropped,
@@ -630,33 +650,26 @@ WalArchiver::CatalogCapture WalArchiver::CaptureCatalog(std::stop_token cancel) 
     auto& gate = catalog_.backup_metadata_gate_;
     if (!gate.lock(cancel)) throw std::runtime_error("WAL archive pass stopped");
     std::unique_lock metadata(gate, std::adopt_lock);
+    catalog_.migration_health_->Check();
     CatalogCapture capture;
     std::vector<std::shared_ptr<Table>> tables;
     {
         std::shared_lock lock(catalog_.tables_mutex_);
+        if (!catalog_.fenced_.empty())
+            throw std::runtime_error("cannot capture WAL archive metadata for fenced table '" + catalog_.fenced_.begin()->first + "'");
         for (const auto& [_, table] : catalog_.tables_) tables.push_back(table);
     }
     for (const auto& table : tables) {
-        CatalogCapture::TableCapture entry{table, 0U, {}};
-        // Never waits under the gate: a table an exclusive statement holds
-        // keeps the manifest shipped last.
-        if (auto lease = table->TryAcquire()) {
-            const auto bytes = LoadFile(StoreManifestPath(lease->store().data_dir()));
-            entry.schema_version = ParseStoreManifest(bytes).schema.version;
-            entry.manifest = WalArchiveContentName("table." + std::to_string(entry.schema_version), bytes) + ".manifest";
-            if (shipped_manifests_[table->store_id()] != entry.manifest)
-                StageBytes(staging_ / WalArchiveTableDirName(table->store_id()), entry.manifest, bytes);
-        } else if (const auto shipped = shipped_manifests_.find(table->store_id());
-                   shipped != shipped_manifests_.end() && !shipped->second.empty()) {
-            entry.manifest = shipped->second;
-            std::uint64_t version = 0U;
-            const auto first_dot = entry.manifest.find('.');
-            const auto second_dot = entry.manifest.find('.', first_dot + 1U);
-            if (Digits(std::string_view(entry.manifest).substr(first_dot + 1U, second_dot - first_dot - 1U), &version))
-                entry.schema_version = version;
-        } else {
-            continue;
-        }
+        // An exclusive operation may need the metadata gate to finish. If
+        // its table cannot be captured now, leave the last record in place.
+        const auto lease = table->TryAcquire();
+        if (!lease) throw std::runtime_error("cannot capture WAL archive metadata for busy table '" + table->name() + "'");
+        const auto bytes = LoadFile(StoreManifestPath(lease->store().data_dir()));
+        const auto version = ParseStoreManifest(bytes).schema.version;
+        CatalogCapture::TableCapture entry{table, version,
+            WalArchiveContentName("table." + std::to_string(version), bytes) + ".manifest"};
+        if (shipped_manifests_[table->store_id()] != entry.manifest)
+            StageBytes(staging_ / WalArchiveTableDirName(table->store_id()), entry.manifest, bytes);
         capture.tables.push_back(std::move(entry));
     }
     const auto root = staging_ / WalArchiveDirectoryDirName(directory_id_);
@@ -677,9 +690,13 @@ WalArchiver::CatalogCapture WalArchiver::CaptureCatalog(std::stop_token cancel) 
 void WalArchiver::StageBytes(const std::filesystem::path& directory, const std::string& name,
     const std::vector<std::uint8_t>& bytes) {
     RequireFileName(name);
-    (void)EnsureDirectoryPathExists(directory, true);
+    if (!EnsureDirectoryPathExists(directory, true)) SyncParentDirectory(directory);
     const auto path = directory / name;
-    if (std::filesystem::exists(path)) return;
+    if (std::filesystem::exists(path)) {
+        if (LoadFile(path) != bytes) throw std::runtime_error("staged WAL archive file has different bytes: " + path.string());
+        SyncDirectoryPath(directory);
+        return;
+    }
     AtomicWrite(path, bytes, true, true);
 }
 
@@ -687,22 +704,15 @@ void WalArchiver::StageTable(const CatalogCapture::TableCapture& capture, std::m
     auto lease = capture.table->Acquire();
     if (!lease) return;
     auto& store = lease->store();
+    // The table may have reopened after the metadata gate was released.
+    // Seal it only against the manifest this record names.
+    const auto bytes = LoadFile(StoreManifestPath(store.data_dir()));
+    if (WalArchiveContentName("table." + std::to_string(capture.schema_version), bytes) + ".manifest" != capture.manifest)
+        return;
     const auto seal = store.SealForArchive();
     (void)store.StageForArchive(staging_ / WalArchiveTableDirName(capture.table->store_id()));
-    auto& entry = entries[capture.table->store_id()];
-    // ALTER TABLE does not take the metadata gate: frames this pass sealed
-    // may use a newer schema than the captured manifest, which then ships
-    // in this pass too.
-    const auto bytes = LoadFile(StoreManifestPath(store.data_dir()));
-    const auto version = ParseStoreManifest(bytes).schema.version;
-    const auto manifest = WalArchiveContentName("table." + std::to_string(version), bytes) + ".manifest";
-    if (manifest != entry.manifest) {
-        if (shipped_manifests_[capture.table->store_id()] != manifest)
-            StageBytes(staging_ / WalArchiveTableDirName(capture.table->store_id()), manifest, bytes);
-        entry.manifest = manifest;
-        entry.schema_version = version;
-    }
     if (seal) {
+        auto& entry = entries.at(capture.table->store_id());
         entry.revision = seal->revision;
         entry.time_bound_ms = seal->time_bound_ms;
     }
@@ -747,14 +757,16 @@ WalArchiveFile WalArchiver::Ship(const std::filesystem::path& source, const std:
     const auto parent = config_.directory / relative_dir;
     const auto target = parent / name;
     (void)EnsureDirectoryPathExists(parent, true);
-    const auto compare = [&](WalArchiveFile shipped) {
-        const auto existing = Inspect(target);
-        if (existing.size != shipped.size || existing.crc32 != shipped.crc32)
-            throw ArchiveConflictError("the archive already holds a different " + target.string());
+    const auto finish_existing = [&] {
+        auto shipped = Inspect(source, &target);
+        // A previous publication may have made the name visible before its
+        // directory sync succeeded. Repay that sync before recording the file.
+        SyncFilePath(target);
+        SyncDirectoryPath(parent);
         shipped.name = name;
         return shipped;
     };
-    if (std::filesystem::exists(target)) return compare(Inspect(source));
+    if (std::filesystem::exists(target)) return finish_existing();
     // A copy a crash interrupted is replaced by this one.
     const auto temporary = parent / ("." + name + ".copy");
     std::filesystem::remove(temporary);
@@ -762,7 +774,7 @@ WalArchiveFile WalArchiver::Ship(const std::filesystem::path& source, const std:
     const auto ec = MovePathNoReplace(temporary, target);
     if (ec == std::errc::file_exists) {
         std::filesystem::remove(temporary);
-        return compare(copied);
+        return finish_existing();
     }
     if (ec) throw std::system_error(ec, "cannot publish archive file " + target.string());
     SyncDirectoryPath(parent);
@@ -774,7 +786,7 @@ void WalArchiver::PublishRecord(const WalArchiveRecord& record) {
     const auto directory_name = WalArchiveDirectoryDirName(directory_id_);
     const auto name = WalArchiveRecordName(record.captured_ms);
     const auto local = staging_ / directory_name / name;
-    (void)EnsureDirectoryPathExists(local.parent_path(), true);
+    if (!EnsureDirectoryPathExists(local.parent_path(), true)) SyncParentDirectory(local.parent_path());
     // The staged record is the intent: a start that finds it ships it again
     // and makes it the chain's last before any newer record.
     AtomicWrite(local, SerializeWalArchiveRecord(record), true, true);
@@ -844,9 +856,10 @@ void WalArchiver::RetainArchive(std::uint64_t now_ms) {
     const auto listed = [](const WalArchiveRecord& in, const StoreId& epoch) {
         return std::any_of(in.tables.begin(), in.tables.end(), [&](const auto& table) { return table.epoch == epoch; });
     };
-    std::set<std::filesystem::path> touched;
-    for (std::size_t j = 0U; j < boundary; ++j) {
-        const auto record = ParseWalArchiveRecord(LoadFile(records[j].second));
+    std::set<std::filesystem::path> obsolete;
+    std::size_t first_kept = 0U;
+    for (; first_kept < boundary; ++first_kept) {
+        const auto record = ParseWalArchiveRecord(LoadFile(records[first_kept].second));
         bool removable = true;
         for (const auto& table : record.tables) {
             if (const auto revision = sealed(kept, table.epoch)) {
@@ -860,19 +873,31 @@ void WalArchiver::RetainArchive(std::uint64_t now_ms) {
             }
         }
         if (!removable) break;
-        // The record goes first: a crash then leaves only files no record lists.
-        std::filesystem::remove(records[j].second);
-        SyncDirectoryPath(records_dir);
-        Crash("CHUNKDB_FAILPOINT_CRASH_ARCHIVE_RETENTION_AFTER_RECORD_ONCE");
         for (const auto& table : record.tables) {
             const auto directory = config_.directory / WalArchiveTableDirName(table.epoch);
             for (const auto& file : table.files) {
                 // Manifests stay: a later record can name the same one again.
-                if (file.name.ends_with(".manifest")) continue;
-                std::filesystem::remove(directory / file.name);
-                touched.insert(directory);
+                if (!file.name.ends_with(".manifest")) obsolete.insert(directory / file.name);
             }
         }
+    }
+    for (std::size_t j = first_kept; j < records.size() && !obsolete.empty(); ++j) {
+        const auto record = ParseWalArchiveRecord(LoadFile(records[j].second));
+        for (const auto& table : record.tables) {
+            const auto directory = config_.directory / WalArchiveTableDirName(table.epoch);
+            for (const auto& file : table.files) obsolete.erase(directory / file.name);
+        }
+    }
+    // Remove every pruned record durably before unlinking any of its files.
+    for (std::size_t j = 0U; j < first_kept; ++j) {
+        std::filesystem::remove(records[j].second);
+        SyncDirectoryPath(records_dir);
+        Crash("CHUNKDB_FAILPOINT_CRASH_ARCHIVE_RETENTION_AFTER_RECORD_ONCE");
+    }
+    std::set<std::filesystem::path> touched;
+    for (const auto& path : obsolete) {
+        std::filesystem::remove(path);
+        touched.insert(path.parent_path());
     }
     for (const auto& directory : touched) SyncDirectoryPath(directory);
 }

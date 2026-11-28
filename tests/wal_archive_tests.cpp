@@ -9,10 +9,13 @@
 #include <vector>
 
 #include "chunkdb/crc32.hpp"
+#include "chunkdb/engine.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "feed_test_utils.hpp"
+#include "migrations_records.hpp"
 #include "store_manifest.hpp"
 #include "feed_slot_records.hpp"
 #include "users.hpp"
@@ -115,7 +118,7 @@ void RecordFormat() {
     auto damaged_chain = chain;
     damaged_chain[24] ^= 1U;
     Throws([&] { (void)ParseWalArchiveChain(damaged_chain, directory); });
-    assert(WalArchiveContentName("users", {1U, 2U}).starts_with("users.") && WalArchiveContentName("users", {1U, 2U}).size() == 14U);
+    assert(WalArchiveContentName("users", {1U, 2U}).starts_with("users.") && WalArchiveContentName("users", {1U, 2U}).size() == 70U);
 
     assert(WalArchiveRecordName(42U) == "seal.00000000000000000042");
     assert(ParseWalArchiveRecordName("seal.00000000000000000042") == 42U);
@@ -154,6 +157,7 @@ void DirectoryArchive() {
     StoreId epoch{}, directory{};
     {
         TableCatalog catalog(ArchiveConfig(data, archive));
+        AwaitFirstPass(catalog);
         const auto table = CreateDefault(catalog);
         epoch = table->store_id();
         directory = ReadDataDirManifest(data)->data_dir_id;
@@ -188,9 +192,10 @@ void DirectoryArchive() {
             // Bit-string writes need a table with one bits column; this one now has two.
             auto lease = table->Acquire();
             assert(lease);
-            lease->store().SetBlock(0, 0, {{"note", std::monostate{}}});
+            lease->store().SetBlock(0, 0, {{"note", BytesValue{{1U}}}});
         }
         const auto second = Completed(*table);
+        assert(second > first);
         catalog.RunArchivePass();
         const auto latest = Records(archive, directory);
         entry = Entry(latest.back(), epoch);
@@ -216,6 +221,149 @@ void DirectoryArchive() {
         assert(!catalog.ArchiveStatus()->error);
     }
     assert(Records(archive, directory).size() > before);
+}
+
+void ChangedMetadata() {
+    test::ScopedTempDir temporary("chunkdb-wal-archive-metadata");
+    const auto root = std::filesystem::canonical(temporary.path());
+    const auto data = root / "data", archive = root / "archive";
+    TableCatalog catalog(ArchiveConfig(data, archive));
+    AwaitFirstPass(catalog);
+    const auto table = CreateDefault(catalog);
+    const auto directory = ReadDataDirManifest(data)->data_dir_id;
+    const auto records_dir = archive / WalArchiveDirectoryDirName(directory);
+    const auto table_dir = archive / WalArchiveTableDirName(table->store_id());
+    Users users;
+    users.secret.fill(7U);
+    WriteUsersFile(data, users);
+    const auto ledger_path = data / std::string(kMigrationsFileName);
+    std::vector<MigrationRecord> migrations{{"create_default", 1U, "", "CREATE TABLE default"}};
+    AtomicWrite(ledger_path, EncodeMigrationRecords(directory, migrations), true, true);
+    catalog.RunArchivePass();
+    const auto first = Records(archive, directory).back();
+
+    users.secret.fill(8U);
+    WriteUsersFile(data, users);
+    migrations[0].applied_ms = 2U;
+    const auto ledger = EncodeMigrationRecords(directory, migrations);
+    AtomicWrite(ledger_path, ledger, true, true);
+    TableOptionsUpdate options;
+    options.checkpoint_update_interval = 200U;
+    catalog.SetOptions("default", options);
+    catalog.RunArchivePass();
+    const auto second = Records(archive, directory).back();
+    assert(first.users != second.users && first.ledger != second.ledger);
+    assert(LoadFile(records_dir / second.users) == EncodeUsers(users));
+    assert(LoadFile(records_dir / second.ledger) == ledger);
+    const auto* before = Entry(first, table->store_id());
+    const auto* after = Entry(second, table->store_id());
+    assert(before && after && before->schema_version == after->schema_version && before->manifest != after->manifest);
+    assert(LoadFile(table_dir / after->manifest) == LoadFile(StoreManifestPath(data / "tables/default")));
+}
+
+void ExistingArchiveFileMustMatch() {
+    test::ScopedTempDir temporary("chunkdb-wal-archive-existing-file");
+    const auto root = std::filesystem::canonical(temporary.path());
+    const auto data = root / "data", archive = root / "archive";
+    StoreId directory{};
+    Users users;
+    users.secret.fill(7U);
+    {
+        TableCatalog catalog(Config(data));
+        directory = ReadDataDirManifest(data)->data_dir_id;
+        WriteUsersFile(data, users);
+    }
+    const auto expected = EncodeUsers(users);
+    users.secret.fill(8U);
+    const auto different = EncodeUsers(users);
+    assert(expected != different && expected.size() == different.size() && Crc32(expected) == Crc32(different));
+    const auto target = archive / WalArchiveDirectoryDirName(directory) / WalArchiveContentName("users", expected);
+    AtomicWrite(target, different, true, true);
+    TableCatalog catalog(ArchiveConfig(data, archive));
+    AwaitFirstPass(catalog);
+    Throws([&] { catalog.RunArchivePass(); });
+    assert(Records(archive, directory).empty() && LoadFile(target) == different);
+}
+
+void RetrySyncsExistingArchiveFiles() {
+    test::ScopedTempDir temporary("chunkdb-wal-archive-retry-sync");
+    const auto root = std::filesystem::canonical(temporary.path());
+    const auto data = root / "data", archive = root / "archive";
+    TableCatalog catalog(ArchiveConfig(data, archive));
+    AwaitFirstPass(catalog);
+    const auto table = CreateDefault(catalog);
+    catalog.RunArchivePass();
+    const auto last = catalog.ArchiveStatus()->last_seal_ms;
+    const auto target = archive / WalArchiveTableDirName(table->store_id());
+    Write(*table, 0, 0, 1U);
+    bool interrupted = false;
+    bool resynced = false;
+    SetDirectorySyncObserverForTests([&](const auto& directory) {
+        if (directory != target || Files(target, ".wal").empty() || Files(target, ".base").empty()) return;
+        if (!interrupted) {
+            interrupted = true;
+            throw std::runtime_error("interrupt archive publication after its final file rename");
+        }
+        resynced = true;
+    });
+    Throws([&] { catalog.RunArchivePass(); });
+    assert(interrupted && catalog.ArchiveStatus()->last_seal_ms == last);
+    catalog.RunArchivePass();
+    SetDirectorySyncObserverForTests({});
+    assert(resynced && catalog.ArchiveStatus()->last_seal_ms > last && !catalog.ArchiveStatus()->error);
+}
+
+void BusyTableDefersCatalogCapture() {
+    test::ScopedTempDir temporary("chunkdb-wal-archive-busy-table");
+    const auto root = std::filesystem::canonical(temporary.path());
+    TableCatalog catalog(ArchiveConfig(root / "data", root / "archive"));
+    AwaitFirstPass(catalog);
+    const auto table = CreateDefault(catalog);
+    const auto last = catalog.ArchiveStatus()->last_seal_ms;
+    struct CaptureWhileBusy : MigrationTestHook {
+        explicit CaptureWhileBusy(TableCatalog& catalog_in) : catalog(catalog_in) {}
+        void Run(Point point, std::string_view name) override {
+            if (point != Point::kBeforeCatalogAdmission) return;
+            assert(name == "default");
+            Throws([&] { catalog.RunArchivePass(); });
+            const auto status = catalog.ArchiveStatus();
+            assert(status->error && status->error->find("busy table 'default'") != std::string::npos);
+            ran = true;
+        }
+        TableCatalog& catalog;
+        bool ran = false;
+    } hook(catalog);
+    catalog.SetMigrationTestHook(&hook);
+    TableOptionsUpdate options;
+    options.checkpoint_update_interval = 200U;
+    catalog.SetOptions("default", options);
+    catalog.SetMigrationTestHook(nullptr);
+    assert(hook.ran && catalog.ArchiveStatus()->last_seal_ms == last);
+
+    catalog.RunArchivePass();
+    const auto status = catalog.ArchiveStatus();
+    assert(status->last_seal_ms > last && !status->error);
+    assert(status->tables.size() == 1U && status->tables[0].name == table->name());
+}
+
+void ArchiveShowStatus() {
+    test::ScopedTempDir temporary("chunkdb-wal-archive-show-status");
+    const auto root = std::filesystem::canonical(temporary.path());
+    const auto catalog = std::make_shared<TableCatalog>(ArchiveConfig(root / "data", root / "archive"));
+    CommandEngine engine(EngineConfig{.require_auth = false}, catalog);
+    SessionState session;
+    (void)engine.Execute(session, "HELLO 3\r\n");
+    AwaitFirstPass(*catalog);
+    const auto table = CreateDefault(*catalog);
+    Write(*table, 0, 0, 1U);
+    catalog->RunArchivePass();
+    const auto status = catalog->ArchiveStatus();
+    const auto reply = engine.Execute(session, "SHOW STATUS\r\n");
+    assert(reply.starts_with("%8\r\n"));
+    assert(reply.ends_with("$7\r\narchive\r\n%5\r\n$4\r\nmode\r\n$3\r\ndir\r\n$12\r\nlast_seal_ms\r\n:" +
+        std::to_string(status->last_seal_ms) + "\r\n$5\r\nerror\r\n_\r\n$12\r\nstaged_bytes\r\n:0\r\n" +
+        "$6\r\ntables\r\n*1\r\n%2\r\n$4\r\nname\r\n$7\r\ndefault\r\n$8\r\nrevision\r\n:" +
+        std::to_string(Completed(*table)) + "\r\n"));
 }
 
 // Records of one chain, oldest first: each names the previous one, and only
@@ -324,6 +472,43 @@ void Retention() {
     assert(Files(files, ".wal").size() == 1U);
 }
 
+void RetentionPreservesRepeatedFiles() {
+    test::ScopedTempDir temporary("chunkdb-wal-archive-repeated-files");
+    const auto root = std::filesystem::canonical(temporary.path());
+    const auto data = root / "data", archive = root / "archive";
+    StoreId epoch{}, directory{};
+    {
+        TableCatalog catalog(Config(data));
+        epoch = CreateDefault(catalog)->store_id();
+        directory = ReadDataDirManifest(data)->data_dir_id;
+    }
+    const auto records_dir = archive / WalArchiveDirectoryDirName(directory);
+    const auto table_dir = archive / WalArchiveTableDirName(epoch);
+    const std::vector<std::uint8_t> bytes{1U};
+    const WalArchiveFile duplicate{"C_0_0.1-1.wal", 1U, Crc32(bytes)};
+    const WalArchiveFile descriptor{"C_0_0.1.base", 1U, Crc32(bytes)};
+    const WalArchiveFile obsolete{"C_1_0.2-2.wal", 1U, Crc32(bytes)};
+    for (const auto& file : {duplicate, descriptor, obsolete}) AtomicWrite(table_dir / file.name, bytes, true, true);
+    // Age the records deterministically. The kept record re-lists the same
+    // segment and descriptor, as staging can do after a restart.
+    const WalArchiveRecord first{directory, 1U, 0U, "", "",
+        {{"default", epoch, 2U, 1U, 1U, "", {duplicate, descriptor, obsolete}}}};
+    const WalArchiveRecord kept{directory, 2U, 1U, "", "",
+        {{"default", epoch, 2U, 2U, 1U, "", {duplicate, descriptor}}}};
+    for (const auto& record : {first, kept})
+        AtomicWrite(records_dir / WalArchiveRecordName(record.captured_ms), SerializeWalArchiveRecord(record), true, true);
+    AtomicWrite(data / kWalArchiveStagingName / kWalArchiveChainName, SerializeWalArchiveChain(directory, kept.captured_ms), true, true);
+    auto config = ArchiveConfig(data, archive);
+    config.wal_archive.retention = std::chrono::hours(1);
+    TableCatalog catalog(config);
+    AwaitFirstPass(catalog);
+    assert(!catalog.ArchiveStatus()->error);
+    assert(!std::filesystem::exists(records_dir / WalArchiveRecordName(first.captured_ms)));
+    assert(std::filesystem::exists(records_dir / WalArchiveRecordName(kept.captured_ms)));
+    assert(LoadFile(table_dir / duplicate.name) == bytes && LoadFile(table_dir / descriptor.name) == bytes);
+    assert(!std::filesystem::exists(table_dir / obsolete.name));
+}
+
 void SlotsKeepTheirSegments() {
     test::ScopedTempDir temporary("chunkdb-wal-archive-slot");
     const auto root = std::filesystem::canonical(temporary.path());
@@ -345,7 +530,7 @@ void SlotsKeepTheirSegments() {
 void CommandArchive() {
     test::ScopedTempDir temporary("chunkdb-wal-archive-command");
     const auto root = std::filesystem::canonical(temporary.path());
-    const auto data = root / "data", copies = root / "copies";
+    const auto data = root / "data with spaces", copies = root / "copies";
     auto config = Config(data);
     config.wal_archive.interval = std::chrono::hours(24);
     config.wal_archive.command = "exit 7 # %p";
@@ -362,7 +547,7 @@ void CommandArchive() {
         assert(Files(data / std::string(kWalArchiveStagingName) / WalArchiveTableDirName(epoch), ".wal").size() == 1U);
         assert(Files(data / "tables/default" / kFeedArchiveDirName, ".wal").empty());
     }
-    config.wal_archive.command = "mkdir -p \"" + copies.string() + "/$(dirname '%f')\" && cp '%p' \"" +
+    config.wal_archive.command = "mkdir -p \"" + copies.string() + "/$(dirname '%f')\" && cp \"%p\" \"" +
         copies.string() + "/%f\"";
     {
         TableCatalog catalog(config);
@@ -388,8 +573,14 @@ int main() {
     RecordFormat();
     Configuration();
     DirectoryArchive();
+    ChangedMetadata();
+    ExistingArchiveFileMustMatch();
+    RetrySyncsExistingArchiveFiles();
+    BusyTableDefersCatalogCapture();
+    ArchiveShowStatus();
     ChainAndTimeBound();
     Retention();
+    RetentionPreservesRepeatedFiles();
     SlotsKeepTheirSegments();
 #ifndef _WIN32
     CommandArchive();

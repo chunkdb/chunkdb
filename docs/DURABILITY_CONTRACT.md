@@ -61,7 +61,8 @@ Above 65,536 changed large-chunk directories, the barrier syncs every file and d
 ## WAL archive
 
 With `--archive-dir` or `--archive-command`, every checkpoint keeps its WAL as a sealed segment, and checkpoints publish their images synced in every mode.
-Every `--archive-interval-ms`, at start and at clean shutdown, the server seals each table: it samples a revision S as backup does, syncs the WALs and checkpoints every chunk whose live WAL holds a change at or below S.
+Every `--archive-interval-ms`, at start and at clean shutdown, the server attempts to seal each table: it samples a revision S as backup does, syncs the WALs and checkpoints every chunk whose live WAL holds a change at or below S.
+If it cannot capture the manifest of every catalog table, the pass leaves the previous seal record in place and reports the error in SHOW STATUS.
 It ships the sealed segments, then publishes a seal record; a record's revision S for a table means that every change at or below S is in a segment the record or an earlier one of its chain lists, durable in the archive before the record.
 The record also holds a time bound taken before S: a change above S has a commit time at or above it, unless it is a conditional or expression write that took its commit time before its revision and was in flight while S was sampled.
 Changes after the newest record are not in the archive yet.

@@ -44,7 +44,7 @@ struct WalArchiveTableEntry {
     // seal point was sampled.
     std::uint64_t time_bound_ms = 0;
     std::uint64_t schema_version = 0;
-    // `table.<schema version>.<CRC32>.manifest`; empty for a dropped table.
+    // `table.<schema version>.<SHA-256>.manifest`; empty for a dropped table.
     std::string manifest;
     // Shipped since the predecessor, in `table.<epoch>/`.
     std::vector<WalArchiveFile> files;
@@ -56,7 +56,7 @@ struct WalArchiveRecord {
     std::uint64_t captured_ms = 0;
     // The capture time of the previous record of the chain; zero at a chain start.
     std::uint64_t predecessor_ms = 0;
-    // `users.<CRC32>` and `migrations.<CRC32>` in `directory.<id>/`; empty
+    // `users.<SHA-256>` and `migrations.<SHA-256>` in `directory.<id>/`; empty
     // when the data directory has no such file.
     std::string users;
     std::string ledger;
@@ -77,7 +77,7 @@ struct WalArchiveRecord {
 [[nodiscard]] std::string WalArchiveDirectoryDirName(const StoreId& directory);
 // `seal.<capture time in Unix ms, 20 digits>`.
 [[nodiscard]] std::string WalArchiveRecordName(std::uint64_t captured_ms);
-// `<prefix>.<CRC32 of bytes, 8 hex digits>`, named by content.
+// `<prefix>.<SHA-256 of bytes, 64 lowercase hex digits>`, named by content.
 [[nodiscard]] std::string WalArchiveContentName(std::string_view prefix, const std::vector<std::uint8_t>& bytes);
 // The capture time a seal record name holds; std::nullopt for another name.
 [[nodiscard]] std::optional<std::uint64_t> ParseWalArchiveRecordName(std::string_view name);

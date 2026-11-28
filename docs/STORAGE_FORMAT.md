@@ -536,8 +536,9 @@ Live-history readers capture completed byte boundaries and read only the prefix 
 
 With `--archive-dir` or `--archive-command`, `data_dir/.chunkdb.archive/` holds the files waiting to be shipped and the chain file; see the [design](design/WAL_ARCHIVE.md).
 Each pass hard-links every sealed segment of `.chunkdb.feed/` and its `.base` descriptor into `table.<epoch hex32>/` and syncs it before slot retention may remove the `.chunkdb.feed/` names.
-A changed table manifest is staged there as `table.<schema version>.<CRC32 of its bytes, 8 hex digits>.manifest`; a changed users file and migrations ledger are staged in `directory.<data-directory id hex32>/` as `users.<CRC32>` and `migrations.<CRC32>`.
-Archive files keep the same relative names, are written once and are never changed: `--archive-dir` copies to `.<name>.copy`, syncs it, renames it without replacing and syncs the directory; an existing file of equal length and CRC32 counts as shipped.
+A changed table manifest is staged there as `table.<schema version>.<SHA-256>.manifest`; a changed users file and migrations ledger are staged in `directory.<data-directory id hex32>/` as `users.<SHA-256>` and `migrations.<SHA-256>`, with each digest encoded as 64 lowercase hex digits.
+Archive files keep the same relative names and are written once: `--archive-dir` copies to `.<name>.copy`, syncs it, renames it without replacing and syncs the directory.
+An existing file counts as shipped after a byte-for-byte comparison and a sync of the file and its directory.
 
 After shipping a pass's files, the pass writes its seal record `directory.<id>/seal.<capture Unix ms, 20 digits>` to staging with file and directory sync, ships it, atomically replaces `chain`, and then removes the staged record and the staged files it lists.
 A writer start with archiving first ships a staged record again, points `chain` at it and removes it; a writer start without archiving removes `.chunkdb.archive/` before tables open.
@@ -556,7 +557,7 @@ A sealed table's revision S means every frame at or below it is in a segment lis
 `chain` is exactly 36 bytes: `CKAC`, format `1:u16`, zero `u16`, data-directory id, the last published record's capture time `u64` (nonzero), CRC32 over the first 32 bytes.
 
 Retention takes k, the newest record captured before now minus `--archive-retention-ms`, and removes older records oldest first while each of their tables is sealed in k above every listed segment's last revision, or is listed in neither k nor the newest record.
-It removes the record first, then its segments and descriptors; manifests, users and ledger files stay.
+It durably removes the pruned records before removing any segments and descriptors that no kept record lists; manifests, users and ledger files stay.
 
 ## Users
 

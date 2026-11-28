@@ -31,6 +31,8 @@ One archiver thread serves the server and runs a pass at start, every `--archive
 
 A checkpoint deferred by a running backup leaves the table without a seal point in this pass; its staged files still ship.
 The catalog part of a record (names, epochs, manifests, users file, migrations ledger) is captured under the backup metadata gate, so names, schemas and grants agree; the gate is held only for that capture.
+If a busy or fenced table prevents a complete catalog capture, the pass fails before publishing a new record.
+If a table's manifest changes between capture and sealing, the record keeps the captured manifest and leaves the table unsealed for this pass.
 The lease is released before shipping, so a slow archive never delays DDL; staged links survive DROP TABLE.
 
 ## Shipping and seal records
@@ -38,11 +40,11 @@ The lease is released before shipping, so a slow archive never delays DDL; stage
 The pass ships every staged file, then publishes its seal record, then removes the staged files the record lists.
 Publication has four steps: write the record to `.chunkdb.archive/directory.<id>/` and sync it, ship it, atomically replace `.chunkdb.archive/chain` with its name and sync, then remove the staged record and the files it lists.
 The staged record is the intent: a writer start that finds one ships the same bytes again (equal bytes count as shipped), points `chain` at it and removes it before its first pass, so a record published before a crash stays the predecessor of the next one.
-`--archive-dir` copies to a `.`-prefixed temporary name, syncs it, renames it without replacing and syncs the directory; an existing file of equal length and CRC32 counts as shipped, a different one fails the pass.
+`--archive-dir` copies to a `.`-prefixed temporary name, syncs it, renames it without replacing and syncs the directory; an existing file is compared byte for byte and synced along with its directory before it counts as shipped.
 `--archive-command` runs through the system shell with `%p` the local path, `%f` the archive-relative name and `%%` a `%`; exit status 0 means shipped, and the command must accept a file it already shipped with equal bytes.
 A failed pass is retried every interval; staged files stay in the data directory meanwhile, and SHOW STATUS shows `archive` with the error and the staged bytes.
 
-Layout: `table.<epoch>/` holds segments, descriptors and manifests `table.<schema version>.<CRC32>.manifest`; `directory.<data-directory id>/` holds `seal.<capture Unix ms, 20 digits>`, `users.<CRC32>` and `migrations.<CRC32>`.
+Layout: `table.<epoch>/` holds segments, descriptors and manifests `table.<schema version>.<SHA-256>.manifest`; `directory.<data-directory id>/` holds `seal.<capture Unix ms, 20 digits>`, `users.<SHA-256>` and `migrations.<SHA-256>`.
 A seal record holds the data-directory id, its capture time, its predecessor's capture time (zero at a chain start), the users and ledger file names, and per table: name, epoch, seal point and time bound (absent when unsealed), schema version, manifest name, and the files shipped since the predecessor with length and CRC32.
 Every table of the catalog appears in every record, so an idle table gets a new seal point each pass.
 A record is published only after every file it names is durable in the archive.
@@ -52,7 +54,8 @@ Two records naming the same predecessor are a fork, which only two writers of on
 ## Retention
 
 `--archive-retention-ms` (0, keep all) applies to `--archive-dir`; a command's destination keeps its own retention.
-A pass takes k, the newest record captured before now minus the bound, and removes older records oldest first; it removes a record before the files only it lists.
+A pass takes k, the newest record captured before now minus the bound, and removes older records oldest first; it removes the pruned records before unlinking any segments or descriptors they list.
+A segment or descriptor listed again by a kept record stays in the archive.
 A segment listed only by removed records has its last revision at or below k's seal point of its table, so no state at or after k needs it.
 Files of tables absent from k go with the last record listing them; manifests, users and ledger files are small and stay, since a later record can name one again.
 A backup created after k's capture time rolls forward; an older one cannot, and restore says so.
