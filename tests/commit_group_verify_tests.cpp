@@ -12,6 +12,7 @@
 #include <vector>
 
 #include "checkpoint.hpp"
+#include "chunkdb/table_catalog.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "commit_group_coordinator.hpp"
@@ -277,8 +278,8 @@ struct DataDirectory {
         assert(Snapshot(root) == before);
         return result;
     }
-    void Populate(const Path& at) const {
-        Save(at / kRoot, Bytes(512U, 0U));
+    void Populate(const Path& at, bool with_root = true) const {
+        if (with_root) Save(at / kRoot, Bytes(512U, 0U));
         std::filesystem::create_directories(at / kObjects);
         std::filesystem::create_directories(at / kJournals);
         Save(at / kJournals / "x", Bytes{'j'});
@@ -287,29 +288,59 @@ struct DataDirectory {
 void Unclaimed() {
     const DataDirectory data;
     Expect(data.Check(), 0U, 0U);
-    data.Populate(data.root);
+    data.Populate(data.root, false);
     data.Populate(data.table);
     const auto result = data.Check();
-    Expect(result, 0U, 6U, "VERIFY warning group_owner_unclaimed");
-    assert(Count(result.text, "group_owner_unclaimed") == 6U);
+    Expect(result, 0U, 5U, "VERIFY warning group_owner_unclaimed");
+    assert(Count(result.text, "group_owner_unclaimed") == 5U);
     assert(result.text.find("unexpected_entry") == std::string::npos && result.text.find("foreign_entry") == std::string::npos);
-    for (const auto* name : {kRoot, kObjects, kJournals}) {
-        assert(result.text.find(Quoted(data.root / name)) != std::string::npos);
-        assert(result.text.find(Quoted(data.table / name)) != std::string::npos);
-    }
-    assert(Count(result.text, "commit group owner state is not admitted by this build") == 6U);
+    for (const auto* name : {kObjects, kJournals}) assert(result.text.find(Quoted(data.root / name)) != std::string::npos);
+    for (const auto* name : {kRoot, kObjects, kJournals}) assert(result.text.find(Quoted(data.table / name)) != std::string::npos);
+    assert(Count(result.text, "commit group owner state is not admitted by this build") == 5U);
+    // A canonical root in a directory whose manifest does not claim commit_groups is damage.
+    Save(data.root / kRoot, Bytes(512U, 0U));
+    const auto damaged = data.Check();
+    if (damaged.counters.errors != 1U) std::cerr << damaged.text;
+    assert(damaged.counters.errors == 1U && damaged.text.find("unclaimed canonical commit owner exists") != std::string::npos);
+    std::filesystem::remove(data.root / kRoot);
     // A table checked directly reports the same names.
     std::ostringstream table;
     const auto counters = VerifyTableDirectory(data.table, table);
     assert(counters.errors == 0U && counters.warnings == 3U && Count(table.str(), "group_owner_unclaimed") == 3U);
 }
-void UnclaimedWithFeatureBit() {
-    // A manifest that records the reserved bit is refused, and the owner files stay unadmitted.
-    const DataDirectory data(kFeatureCommitGroups);
-    data.Populate(data.root);
-    const auto result = data.Check();
-    Expect(result, 1U, 3U, "data_dir_manifest_unknown_features");
-    assert(Count(result.text, "commit group owner state is not admitted by this build") == 3U);
+// A directory created by this build claims commit_groups and its INACTIVE root;
+// object and journal directories stay unclaimed, and a lost root is damage.
+void ClaimedOwner() {
+    test::ScopedTempDir directory("chunkdb-group-verify-claimed");
+    const Path root = directory.path();
+    {
+        CatalogConfig config; config.data_dir = root;
+        TableCatalog catalog(config);
+        (void)catalog.Create("t", {2U, 2U, 2U, 2U, 8U}, config.default_options);
+    }
+    const auto manifest = *ReadDataDirManifest(root);
+    assert((manifest.features.incompat & kFeatureCommitGroups) != 0U && manifest.commit_owner);
+    assert(manifest.commit_owner->role == CommitOwnerRole::kCatalog);
+    assert(ReadStoreManifest(root / "tables" / "t")->commit_owner == manifest.commit_owner);
+    const auto check = [&] {
+        const auto before = Snapshot(root);
+        std::ostringstream output;
+        Result result{VerifyDataDirectory(root, output), {}};
+        result.text = output.str();
+        assert(Snapshot(root) == before);
+        return result;
+    };
+    Expect(check(), 0U, 0U);
+    std::filesystem::create_directories(root / kObjects);
+    std::filesystem::create_directories(root / "tables" / "t" / kJournals);
+    Expect(check(), 0U, 2U, "VERIFY warning group_owner_unclaimed");
+    std::filesystem::remove_all(root / kObjects);
+    std::filesystem::remove_all(root / "tables" / "t" / kJournals);
+    const auto owner = LoadFile(root / kRoot);
+    std::filesystem::remove(root / kRoot);
+    Expect(check(), 1U, 0U, "data_dir_manifest_invalid");
+    Save(root / kRoot, owner);
+    Expect(check(), 0U, 0U);
 }
 }  // namespace
 
@@ -317,7 +348,7 @@ int main(int argc, char** argv) {
     using Case = std::pair<std::string_view, void (*)()>;
     const std::array cases{Case{"missing", Missing}, Case{"inactive", Inactive}, Case{"owner-invalid", OwnerInvalid},
         Case{"active-empty", ActiveEmpty}, Case{"active-records", ActiveRecords}, Case{"retained-ids", RetainedIds},
-        Case{"pending", Pending}, Case{"unclaimed", Unclaimed}, Case{"unclaimed-feature-bit", UnclaimedWithFeatureBit}};
+        Case{"pending", Pending}, Case{"unclaimed", Unclaimed}, Case{"claimed-owner", ClaimedOwner}};
     if (argc == 3 && std::string_view(argv[1]) == "--case") {
         for (const auto& [name, run] : cases) if (name == argv[2]) { run(); return 0; }
         return 2;

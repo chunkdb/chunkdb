@@ -25,6 +25,7 @@
 #include "populated_index_format.hpp"
 #include "feature_flags.hpp"
 #include "chunk_store_internal.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "test_utils.hpp"
 #include "catalog_test_utils.hpp"
 #include "maintenance_pool.hpp"
@@ -102,6 +103,36 @@ std::string ReadBits(TableCatalog& catalog, const std::string& table, std::int64
     return lease->store().GetBlockBits(x, y);
 }
 
+// An entry of tables/ with a table name that is a symlink is skipped with a
+// warning in a catalog without commit_groups, as before owners existed, and
+// refuses opening in a catalog with them.
+void TestSymlinkedTableEntry() {
+#ifndef _WIN32
+    chunkdb::test::ScopedTempDir ungrouped("chunkdb-catalog-link-ungrouped");
+    const auto plain = std::filesystem::canonical(ungrouped.path());
+    chunkdb::DataDirManifest manifest{.data_dir_id = chunkdb::NewStoreId(), .options = {}};
+    {
+        const auto bytes = chunkdb::SerializeDataDirManifest(manifest);
+        std::ofstream out(chunkdb::DataDirManifestPath(plain), std::ios::binary);
+        out.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    }
+    std::filesystem::create_directories(plain / "tables");
+    std::filesystem::create_directories(plain / "elsewhere");
+    std::filesystem::create_directory_symlink(plain / "elsewhere", plain / "tables" / "linked");
+    {
+        TableCatalog catalog(Config(plain));
+        assert(catalog.Find("linked") == nullptr);
+    }
+    chunkdb::test::ScopedTempDir grouped("chunkdb-catalog-link-grouped");
+    const auto owned = std::filesystem::canonical(grouped.path());
+    { TableCatalog catalog(Config(owned)); }
+    assert((chunkdb::ReadDataDirManifest(owned)->features.incompat & chunkdb::kFeatureCommitGroups) != 0U);
+    std::filesystem::create_directories(owned / "elsewhere");
+    std::filesystem::create_directory_symlink(owned / "elsewhere", owned / "tables" / "linked");
+    assert(Contains(ErrorOf([&] { TableCatalog catalog(Config(owned)); }), "redirected managed table directory"));
+#endif
+}
+
 void TestNewDataDirectoryStartsEmpty() {
     chunkdb::test::ScopedTempDir dir("chunkdb-catalog-new");
     {
@@ -114,9 +145,13 @@ void TestNewDataDirectoryStartsEmpty() {
     assert(Names(dir.path() / "tables").empty());
     for (const auto& name : Names(dir.path())) {
         assert(name == "chunkdb.manifest" || name == "tables" || name == ".chunkdb.lock" ||
-               name == ".chunkdb.staging");
+               name == ".chunkdb.staging" || name == "chunkdb.groups.owner");
     }
-    assert(chunkdb::ReadDataDirManifest(dir.path()).has_value());
+    const auto manifest = chunkdb::ReadDataDirManifest(dir.path());
+    assert(manifest && manifest->commit_owner);
+    chunkdb::CommitOwnerRoot inactive; inactive.scope = *manifest->commit_owner;
+    assert(chunkdb::ParseCommitOwnerRoot(chunkdb::LoadFile(dir.path() / "chunkdb.groups.owner"),
+        *manifest->commit_owner) == inactive);
     { TableCatalog reopened(Config(dir.path())); assert(reopened.TableCount() == 0U); }
     auto read_only = Config(dir.path());
     read_only.access_mode = chunkdb::AccessMode::kReadOnly;
@@ -684,7 +719,7 @@ void TestDirectoryRules() {
         // only ever published complete.
         std::filesystem::create_directories(dir.path() / "tables" / "orphan");
         const auto error = ErrorOf([&] { TableCatalog catalog(Config(dir.path())); });
-        assert(Contains(error, "has no table.manifest"));
+        assert(Contains(error, "managed table manifest is missing"));
         assert(std::filesystem::is_directory(dir.path() / "tables" / "orphan"));
     }
 }
@@ -749,13 +784,15 @@ void TestSingleWriter() {
     // process writer lock. Each table keeps only its snapshot ownership lock.
     assert(!std::filesystem::exists(dir.path() / "tables" / "default" / ".chunkdb.lock" / "writer.lock"));
     assert(std::filesystem::exists(dir.path() / "tables" / "default" / ".chunkdb.lock" / "snapshot.writer"));
-    // A store opened directly on a table takes the data directory's lock, so
-    // it cannot write beside the catalog that owns it.
+    // An isolated catalog table has no checked directory admission, even if
+    // its path or an alias resolves to the existing writer's table.
     chunkdb::StoreConfig store_config;
     store_config.geometry = kDefaultGeometry;
     store_config.data_dir = dir.path() / "tables" / "default";
+    const auto manifest = chunkdb::LoadFile(chunkdb::StoreManifestPath(store_config.data_dir));
+    const auto inventory = chunkdb::LoadFile(store_config.data_dir / chunkdb::kChunkIndexFileName);
     assert(Contains(ErrorOf([&] { chunkdb::ChunkStore store(store_config); }),
-                    "already has an active writer"));
+                    "catalog-owned table requires its checked directory admission"));
     // The same through other names for that directory.
     std::vector<std::filesystem::path> aliases = {dir.path() / "tables" / "." / "default"};
     if (std::filesystem::exists(dir.path() / "TABLES")) {  // case-insensitive file system
@@ -768,7 +805,10 @@ void TestSingleWriter() {
     for (const auto& alias : aliases) {
         store_config.data_dir = alias;
         assert(Contains(ErrorOf([&] { chunkdb::ChunkStore store(store_config); }),
-                        "already has an active writer"));
+                        "catalog-owned table requires its checked directory admission"));
+        assert(chunkdb::LoadFile(chunkdb::StoreManifestPath(store_config.data_dir)) == manifest);
+        assert(chunkdb::LoadFile(store_config.data_dir / chunkdb::kChunkIndexFileName) == inventory);
+        assert(!std::filesystem::exists(store_config.data_dir / ".chunkdb.lock/writer.lock"));
     }
 }
 
@@ -1338,6 +1378,7 @@ int main(int argc, char** argv) {
     chunkdb::SetLogLevel(chunkdb::LogLevel::kWarn);
     TestConditionalCatalogOperations();
     TestNewDataDirectoryStartsEmpty();
+    TestSymlinkedTableEntry();
     TestTablesWithDifferentGeometry();
     TestTableNames();
     TestCreateUndoneWhenNotDurable();

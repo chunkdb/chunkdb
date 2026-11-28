@@ -455,6 +455,29 @@ void ExpectChangedPages(const ChunkCoordinateIndex& owner, const Model& model, s
             at_snapshot);
         assert(Collect([&](bool has, const ChunkCoord& at) { return owner.Page(has, at, limit); }) == populated);
     }
+    // An inclusive bound ends the pages there, inside or between runs.
+    std::vector<ChunkCoord> keys;
+    for (const auto& [coord, entry] : model)
+        if (entry.revision != 0U) keys.push_back(coord);
+    if (keys.empty()) return;
+    const auto up_to = [](const std::vector<ChunkCoord>& coords, const ChunkCoord& bound) {
+        std::vector<ChunkCoord> kept;
+        for (const auto& coord : coords)
+            if (!(bound < coord)) kept.push_back(coord);
+        return kept;
+    };
+    for (const auto& bound : {keys[keys.size() / 3U], keys[keys.size() * 2U / 3U], ChunkCoord{0, 0, 0}, keys.back()}) {
+        for (const std::size_t limit : {std::size_t{7}, kMaxChunkScanLimit + 1U}) {
+            assert(Collect([&](bool has, const ChunkCoord& at) { return owner.Page(has, at, limit, since, &bound); }) ==
+                up_to(changed, bound));
+            assert(Collect([&](bool has, const ChunkCoord& at) {
+                return owner.SnapshotPage(has, at, limit, since, &bound);
+            }) == up_to(at_snapshot, bound));
+            assert(Collect([&](bool has, const ChunkCoord& at) { return owner.Page(has, at, limit, {}, &bound); }) ==
+                up_to(populated, bound));
+        }
+        assert(owner.Page(true, bound, 4U, since, &bound).coords.empty());
+    }
 }
 
 void ChangedPagesSkipUnchangedRuns() {

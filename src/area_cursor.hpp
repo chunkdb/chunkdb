@@ -129,7 +129,50 @@ class AreaCursor {
         return current;
     }
 
+    // The first cell after `key` in ascending x, y, z order, or the first
+    // cell without `has_key`; false when the area has none.
+    [[nodiscard]] bool FirstAfter(bool has_key, const ChunkCoord& key, ChunkCoord* cell) const noexcept {
+        if (!has_key || key.x < min_x_) {
+            *cell = First();
+            return true;
+        }
+        if (key.x > max_x_) return false;
+        const auto [y_first, y_last] = YBounds(key.x);
+        if (key.y < y_first) return StartColumn(key.x, y_first, cell);
+        if (key.y <= y_last) {
+            if (selector_.dims == 3U) {
+                const auto [z_first, z_last] = ZBounds(key.x, key.y);
+                if (key.z < z_first) {
+                    *cell = {key.x, key.y, z_first};
+                    return true;
+                }
+                if (key.z < z_last) {
+                    *cell = {key.x, key.y, key.z + 1};
+                    return true;
+                }
+            } else if (key.z < 0) {
+                *cell = {key.x, key.y, 0};
+                return true;
+            }
+            if (key.y < y_last) return StartColumn(key.x, key.y + 1, cell);
+        }
+        if (key.x == max_x_) return false;
+        return StartColumn(key.x + 1, YBounds(key.x + 1).first, cell);
+    }
+
+    // The last cell of the run of consecutive cells `cell` starts or is in:
+    // the end of its y column in two dimensions, of its z column in three.
+    [[nodiscard]] ChunkCoord SegmentEnd(const ChunkCoord& cell) const noexcept {
+        if (selector_.dims == 3U) return {cell.x, cell.y, ZBounds(cell.x, cell.y).second};
+        return {cell.x, YBounds(cell.x).second, 0};
+    }
+
   private:
+    [[nodiscard]] bool StartColumn(std::int64_t x, std::int64_t y, ChunkCoord* cell) const noexcept {
+        *cell = {x, y, selector_.dims == 3U ? ZBounds(x, y).first : 0};
+        return true;
+    }
+
     [[nodiscard]] std::pair<std::int64_t, std::int64_t> YBounds(std::int64_t x) const noexcept {
         if (!selector_.around) return {selector_.first.y, selector_.last.y};
         const auto remaining = AreaSubtract(radius_squared_, AreaSquare(AreaDistance(x, selector_.first.x)));

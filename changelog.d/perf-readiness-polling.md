@@ -1,0 +1,1 @@
+- The connection I/O thread keeps its sockets registered with epoll on Linux and kqueue on macOS and FreeBSD, and serves connections that are ready, due or changed without scanning every idle socket on those platforms. It tracks at most one deadline per connection, and Windows reuses its WSAPoll array between waits (#138).

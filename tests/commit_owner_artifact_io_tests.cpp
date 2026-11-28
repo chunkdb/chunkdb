@@ -331,7 +331,9 @@ void ReparseAdmission() {
     const auto alias_path = f.root / "root-alias";
     {
         test::ScopedDirectoryAlias alias(f.root, alias_path);
-        Reject([&] { CommitOwnerArtifactIo reader(alias_path, kScope); });
+        // A link at the root itself is followed once to the directory it reaches.
+        const CommitOwnerArtifactIo reader(alias_path, kScope);
+        assert(reader.ReadCanonicalRoot().has_value());
     }
     f.Unchanged();
 }
@@ -889,22 +891,30 @@ void CrashBoundaries(const std::filesystem::path& executable) {
 }
 // Only a lock that pinned its root may stage, and the pin refuses a symlinked
 // root before the lock directory is created.
+// Every lock pins its root, following a link at the root itself once: a writer
+// stages through a lock taken without the explicit overload, and a lock and a
+// writer opened through a symlinked alias reach the target directory.
 void ExplicitRootPin() {
     test::ScopedTempDir temporary("chunkdb-owner-explicit-pin");
     const auto root = std::filesystem::canonical(temporary.path());
-    {
-        ProcessLock lock(root);
-        Reject([&] { CommitOwnerArtifactIo writer(root, kScope, lock, false); });
-        assert(!std::filesystem::exists(root / kObjects));
-    }
     const auto target = root / "target";
-    const auto alias = root / "alias";
     std::filesystem::create_directory(target);
+    {
+        ProcessLock lock(target);
+        CommitOwnerArtifactIo writer(target, kScope, lock, false);
+        (void)writer.StagePage(Page());
+    }
+    const auto alias = root / "alias";
     std::error_code error;
     std::filesystem::create_directory_symlink(target, alias, error);
     if (error) return;  // Symlink creation may be blocked by policy.
-    Reject([&] { ProcessLock pinned(alias, ProcessLock::PinRootForArtifacts{}); });
-    assert(!std::filesystem::exists(target / ".chunkdb.lock"));
+    {
+        ProcessLock pinned(alias, ProcessLock::PinRootForArtifacts{});
+        CommitOwnerArtifactIo writer(alias, kScope, pinned, false);
+        const auto staged = writer.StagePage(Page(3U));
+        assert(std::filesystem::exists(target / kObjects / Hex(staged.reference.sha256)));
+    }
+    assert(std::filesystem::is_symlink(alias));
     std::filesystem::remove(alias);
 }
 }  // namespace

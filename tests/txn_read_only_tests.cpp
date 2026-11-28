@@ -171,6 +171,9 @@ void TestSnapshotScanAndAggregate() {
     ExpectContains(page, "*1\r\n" + Row(0, 0, v0) + "$4\r\nmore\r\n#t\r\n");
     ExpectContains(f.Run(f.a, "SCAN CHUNKS FROM t AFTER 0 0"), "*1\r\n" + Row(1, 0, v1) + "$4\r\nmore\r\n#f\r\n");
     ExpectContains(f.Run(f.a, "SCAN CHUNKS FROM t WHERE n = 2"), "*1\r\n" + Row(1, 0, v1));
+    const auto area = f.Run(f.a, "SCAN CHUNKS FROM t AREA AROUND 1 0 RADIUS 0");
+    ExpectContains(area, "$6\r\nchunks\r\n*1\r\n" + Row(1, 0, v1) + "$4\r\nmore\r\n#f\r\n");
+    ExpectContains(area, "$8\r\nposition\r\n:" + std::to_string(v1) + "\r\n");
     ExpectReply(f.Run(f.a, "GET BLOCK 0 0 FROM t"), Value(1));
     ExpectReply(f.Run(f.a, "GET BLOCK 4 0 FROM t"), Value(2));
     ExpectReply(f.Run(f.a, "GET BLOCK 8 0 FROM t"), "_\r\n");

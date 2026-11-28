@@ -114,8 +114,8 @@ void Check(const std::filesystem::path& root, const Operation& operation, const 
         assert(ReadLe16(LoadFile(root / "tables/space" / kFeedSlotsFileName), 4U) == 4U);
         if (applied) {
             const auto& filters = slots[1].filters;
-            assert(slots[1].owner == "limited" && filters.chunks && filters.area && filters.area->dims == 3U);
-            assert(filters.area->first.z == -1 && filters.area->last.z == 1);
+            assert(slots[1].owner == "limited" && filters.chunks && filters.areas.size() == 1U && filters.areas[0].dims == 3U);
+            assert(filters.areas[0].first.z == -1 && filters.areas[0].last.z == 1);
         }
         auto lease = space->Acquire();
         assert(lease && lease->store().ReadChunkState(ChunkCoord{0, 0, -1}).written);

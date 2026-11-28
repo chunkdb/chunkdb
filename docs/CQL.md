@@ -15,7 +15,7 @@ Generated passwords, epochs, and timestamps appear as named placeholders.
 | --- | --- |
 | [Blocks](reference/BLOCKS.md) | GET BLOCK, SET BLOCK, DELETE BLOCK |
 | [Expressions](reference/EXPRESSIONS.md) | Computed values and IF conditions of SET BLOCK and DELETE BLOCK |
-| [Chunks and areas](reference/CHUNKS.md) | GET CHUNK, SET CHUNK, GET AREA, SCAN CHUNKS, COMPACT TOMBSTONES, SHOW TABLE STATS |
+| [Chunks and areas](reference/CHUNKS.md) | GET CHUNK, SET CHUNK, GET AREA, GET BLOCKS, SCAN CHUNKS, COMPACT TOMBSTONES, SHOW TABLE STATS |
 | [Aggregates](reference/AGGREGATE.md) | AGGREGATE |
 | [Tables](reference/TABLES.md) | CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SWAP TABLES, SHOW TABLES, DESCRIBE, SHOW STATUS, ENABLE FEATURE |
 | [Migrations](reference/MIGRATIONS.md) | MIGRATE, SHOW MIGRATIONS |
@@ -38,7 +38,7 @@ Bits use literals such as `b'1010'`, with the first digit representing the lowes
 Trailing keyword options can appear in any order, each at most once.
 A repeated option is refused with SYNTAX.
 `IF` starts `IF [NOT] EXISTS` only when NOT or EXISTS follows it, so a table, column, user or check named `if` can be named where that clause may appear, as in `DROP TABLE if`.
-Client APIs supply binary `$n` parameters in these places: SET BLOCK values, expressions and conditions, DELETE BLOCK conditions, values in the WHERE of AGGREGATE and SCAN CHUNKS, the SET CHUNK form or META values, `VERIFIER $1` in CREATE USER and ALTER USER (also `ADD VERIFIER $1`), HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
+Client APIs supply binary `$n` parameters in these places: SET BLOCK values, expressions and conditions, DELETE BLOCK conditions, values in the WHERE of GET AREA, GET BLOCKS, AGGREGATE and SCAN CHUNKS, the SET CHUNK form or META values, `VERIFIER $1` in CREATE USER and ALTER USER (also `ADD VERIFIER $1`), HELLO WITH option values, and the SCRAM messages of `HELLO 3 USER <name> $1` and `AUTH $1`.
 See [Protocol](PROTOCOL.md#parameters) for encoding.
 
 Committed chunk versions are producing commit revisions, ordered only within the table epoch returned by DESCRIBE.
@@ -49,7 +49,7 @@ Add RETURNING to SET BLOCK or DELETE BLOCK to receive the block before or after 
 
 ## Conditions
 
-AGGREGATE and SCAN CHUNKS take `WHERE condition` and keep only the present blocks for which the condition is true.
+GET AREA, GET BLOCKS, AGGREGATE and SCAN CHUNKS take `WHERE condition` and keep only the present blocks for which the condition is true.
 SET BLOCK and DELETE BLOCK take `IF condition`, and SET BLOCK values may be computed from the block; see [Expressions](reference/EXPRESSIONS.md).
 A table's `CHECK (condition)` refuses every write that leaves a block for which it is false; see [Tables](reference/TABLES.md#checks).
 

@@ -45,6 +45,7 @@ class SnapshotGenerationMapping;
 class ChunkCoordinateIndex;
 struct ChunkCoordinateNode;
 struct ChunkIndexRecord;
+struct VersionClockWaitTestHook;
 
 #if defined(__MINGW32__) && \
     (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
@@ -203,6 +204,11 @@ struct StoreRuntimeStats {
     std::uint64_t txn_history_copies = 0;
     std::uint64_t txn_history_copied_bytes = 0;
     std::uint64_t txn_history_bytes = 0;
+    // Durable writes of the version clock ceiling and their total time, and
+    // each writer's time spent obtaining a ceiling, including failed attempts.
+    std::uint64_t version_clock_extensions = 0;
+    std::uint64_t version_clock_extension_us = 0;
+    std::uint64_t version_clock_wait_us = 0;
 };
 
 // Random identity of a data directory, recorded in its manifest.
@@ -269,6 +275,9 @@ class ChunkCacheFullError : public std::runtime_error {
     ChunkCacheFullError() : std::runtime_error("large-chunk cache capacity reached") {}
 };
 class ProcessLock;
+class CommitOwnerContext;
+class CommitOwnerDirectoryContext;
+class CommitOwnerStoreAdmission;
 
 // Default limit of the chunk states a store keeps for open transactions.
 inline constexpr std::size_t kDefaultTxnHistoryBytes = 64ULL * 1024ULL * 1024ULL;
@@ -349,6 +358,15 @@ struct StoreConfig {
     // The chunk-column domain, sharing the block schema's revision history.
     std::optional<TableSchema> chunk_schema = std::nullopt;
     QueryLimits query_limits{};
+    // Opaque catalog admission; never a caller-supplied scope value.
+    std::shared_ptr<const CommitOwnerContext> commit_owner_context{};
+    // Borrowed only during fresh standalone initialization when locking is
+    // delegated. Without it, a store opened with acquire_process_lock=false or
+    // allow_multiple_processes takes a short exclusive lock to create a new
+    // directory; when another holder has that lock, the store opens what the
+    // holder has published, and refuses while its creation is unfinished, so a
+    // caller that holds its own lock passes it here.
+    const ProcessLock* bootstrap_process_lock = nullptr;
 };
 
 // Defaults for world-oriented reads; request admission uses QueryLimits.
@@ -467,9 +485,15 @@ struct ChunkIdentityScanPage {
 // Which identities a scan keeps (SCAN CHUNKS WHERE). `keep` may change the
 // state it is given and returns false to leave the identity out of the page.
 struct ChunkScanFilter {
+    // When set, decides each identity from its state, which it may change.
     std::function<bool(const ChunkCoord&, ChunkRangeEntry&)> keep;
     // Whether `keep` reads text and bytes values.
     bool needs_vars = false;
+    // When set, only identities with an x from `x_range.first` to
+    // `x_range.second` are visited, and of them only those `covers` accepts
+    // reach `keep`; both are checked before the state is read.
+    std::optional<std::pair<std::int64_t, std::int64_t>> x_range{};
+    std::function<bool(const ChunkCoord&)> covers{};
 };
 
 class TombstoneHistoryLostError : public std::invalid_argument {
@@ -844,6 +868,23 @@ class ChunkStore {
         bool has_cursor,
         ChunkCoord cursor,
         std::size_t limit);
+    // With `filter`, every candidate visited counts toward `limit`, including
+    // those it rejects before reading their state. With `area`, only identities
+    // inside it are visited, still in ascending x, y, z order.
+    [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentities(
+        bool has_cursor, ChunkCoord cursor, std::size_t limit,
+        std::optional<std::uint64_t> since = {}, bool with_data = false,
+        const ChunkScanFilter* filter = nullptr, const ChunkAreaSelector* area = nullptr);
+    // ScanChunkIdentities as of a snapshot: the chunks populated at the
+    // snapshot, with their state and version then, also those a later write
+    // emptied; `position` is the snapshot's revision. It first waits for the
+    // writes the snapshot includes, so the coordinate index lists their
+    // chunks: past the snapshot's duration it throws TransactionConflictError,
+    // and a stopped statement ends the wait. Throws std::invalid_argument for
+    // another store's snapshot, and as the snapshot reads do.
+    [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentitiesAt(const TxnSnapshot& snapshot,
+        bool has_cursor, ChunkCoord cursor, std::size_t limit, bool with_data = false,
+        const ChunkScanFilter* filter = nullptr, const ChunkAreaSelector* area = nullptr);
     // Expiry (docs/reference/TABLES.md#expiry): visits at most `max_chunks`
     // chunk identities after `cursor` in coordinate order and deletes their
     // present blocks whose u64 column `column_id` holds a time t with
@@ -857,22 +898,6 @@ class ChunkStore {
     // Runs between a chunk's read without the cache and its chunk lock.
     static void SetExpiryDecideHookForTests(void (*hook)()) noexcept;
 #endif
-    // With `filter`, the page reads each identity's state, and every identity it
-    // visits counts toward `limit`, whether the filter keeps it or not.
-    [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentities(
-        bool has_cursor, ChunkCoord cursor, std::size_t limit,
-        std::optional<std::uint64_t> since = {}, bool with_data = false,
-        const ChunkScanFilter* filter = nullptr);
-    // ScanChunkIdentities as of a snapshot: the chunks populated at the
-    // snapshot, with their state and version then, also those a later write
-    // emptied; `position` is the snapshot's revision. It first waits for the
-    // writes the snapshot includes, so the coordinate index lists their
-    // chunks: past the snapshot's duration it throws TransactionConflictError,
-    // and a stopped statement ends the wait. Throws std::invalid_argument for
-    // another store's snapshot, and as the snapshot reads do.
-    [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentitiesAt(const TxnSnapshot& snapshot,
-        bool has_cursor, ChunkCoord cursor, std::size_t limit, bool with_data = false,
-        const ChunkScanFilter* filter = nullptr);
     // With `with_vars`, each entry carries its text and bytes values, and
     // they count toward the response-byte limit.
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange(
@@ -1077,6 +1102,15 @@ class ChunkStore {
         const ChunkState& state, std::int64_t x, std::int64_t y, std::int64_t z) const;
 
     [[nodiscard]] std::size_t ApproxLoadedChunkCount() const;
+    // Estimates loaded chunk memory from the chunk objects and their payload,
+    // presence, variable values, chunk columns, WAL and scratch buffers.
+    // Visits one chunk at a time with a cancellable read lock.
+    [[nodiscard]] std::uint64_t LoadedChunkBytes() const;
+    // The bytes of the chunk states kept for open transactions, and the
+    // transactions with a snapshot of this store (BeginTxnSnapshot) that
+    // neither ended nor were ended by a limit.
+    [[nodiscard]] std::size_t TxnHistoryBytes() const noexcept;
+    [[nodiscard]] std::size_t OpenTransactionCount() const;
     [[nodiscard]] StoreRuntimeStats RuntimeStats() const noexcept;
     // Commit time (Unix ms) of the chunk's last mutation, as loaded or set.
     [[nodiscard]] std::uint64_t ChunkCommitTimeForTests(std::int64_t chunk_x, std::int64_t chunk_y);
@@ -1135,6 +1169,22 @@ class ChunkStore {
     void ArmWalOpenPauseForTests(const ChunkCoord& chunk);
     [[nodiscard]] bool WaitForWalOpenPauseForTests();
     void ResumeWalOpenForTests();
+    // Pauses the next write of the version clock ceiling, by the extension
+    // thread or by a writer, before it writes; resuming with `fail` makes
+    // that write fail.
+    void ArmVersionClockExtensionPauseForTests();
+    [[nodiscard]] bool WaitForVersionClockExtensionPauseForTests();
+    void ResumeVersionClockExtensionForTests(bool fail);
+    // Install while no clock waiters are running and keep it alive until they finish.
+    void SetVersionClockWaitHookForTests(VersionClockWaitTestHook* hook) noexcept {
+        version_clock_wait_hook_.store(hook, std::memory_order_release);
+    }
+    // Takes the next version token, as a mutation does.
+    [[nodiscard]] std::uint64_t ReserveChunkVersionForTests() { return NextChunkVersion(); }
+    // The durable ceiling no issued token reaches.
+    [[nodiscard]] std::uint64_t VersionClockCeilingForTests() const noexcept {
+        return version_clock_ceiling_.load(std::memory_order_acquire);
+    }
     // Pauses the next thread that reaches `point` for `chunk`. Points are
     // armed independently.
     void ArmCachePauseForTests(CachePausePoint point, const ChunkCoord& chunk);
@@ -1248,7 +1298,8 @@ class ChunkStore {
     // of rollback boundaries still in flight. An overflowed set syncs the
     // whole data directory.
     [[nodiscard]] UnsyncedArtifacts TakeUnsynced();
-    void SyncUnsynced(const UnsyncedArtifacts& drained);
+    // Returns the number of file sync attempts, including files found by sweeps.
+    [[nodiscard]] std::size_t SyncUnsynced(const UnsyncedArtifacts& drained);
 
     class SnapshotGenerationWriteGuard {
       public:
@@ -1376,6 +1427,7 @@ class ChunkStore {
     };
 
     const QueryLimits query_limits_;
+    std::unique_ptr<CommitOwnerStoreAdmission> owner_admission_;
     Geometry geometry_;
     // Declared before the cache so borrowed node pointers outlive cached chunks.
     std::shared_ptr<ChunkCoordinateIndex> coordinate_index_;
@@ -1403,6 +1455,7 @@ class ChunkStore {
 
     // Held while the store is open, unless the directory's owner holds it.
     std::unique_ptr<ProcessLock> process_lock_;
+    std::shared_ptr<const CommitOwnerDirectoryContext> commit_owner_context_;
 
     std::filesystem::path snapshot_generation_path_;
     StoreId store_id_{};
@@ -1451,6 +1504,9 @@ class ChunkStore {
     std::atomic<std::uint64_t> stats_background_eviction_failures_{0};
     std::atomic<std::uint64_t> stats_background_queue_full_inline_{0};
     std::atomic<std::uint64_t> stats_compressed_checkpoint_images_{0};
+    std::atomic<std::uint64_t> stats_version_clock_extensions_{0};
+    std::atomic<std::uint64_t> stats_version_clock_extension_us_{0};
+    std::atomic<std::uint64_t> stats_version_clock_wait_us_{0};
 
     // Also exists without a feed. Its per-thread nodes remain stable through
     // postcommit durability work and feed subscription recreation.
@@ -1469,7 +1525,19 @@ class ChunkStore {
     std::atomic<std::uint64_t> version_clock_ceiling_{0};
     // Latest commit time this store instance issued (Unix ms).
     std::atomic<std::uint64_t> last_commit_time_ms_{0};
+    // Guards the extension state below; no ceiling write happens under it.
     std::mutex version_clock_mutex_;
+    // Notified when the ceiling write in flight ends.
+    std::condition_variable version_clock_extended_;
+    // At most one ceiling write at a time, on the extension thread or by a
+    // writer at the ceiling.
+    bool version_clock_extension_in_flight_ = false;
+    // Set at the end of construction and cleared at shutdown: extensions
+    // ahead of the ceiling start only in between.
+    bool version_clock_early_extensions_ = false;
+    // Writes the next ceiling while writers below the current one go on;
+    // joined before the next one starts and at shutdown.
+    std::thread version_clock_extender_;
     std::filesystem::path version_clock_path_;
 
     // Set when a durability/rollback step could not be completed. Once set the
@@ -1524,6 +1592,12 @@ class ChunkStore {
     bool checkpoint_before_wal_remove_reached_ = false;
     bool checkpoint_before_wal_remove_resumed_ = false;
     bool checkpoint_publish_attempt_armed_ = false;
+    // Under durability_hook_mutex_, except the armed flag.
+    std::atomic<bool> version_clock_pause_armed_{false};
+    bool version_clock_pause_reached_ = false;
+    bool version_clock_pause_resumed_ = false;
+    bool version_clock_pause_fail_ = false;
+    std::atomic<VersionClockWaitTestHook*> version_clock_wait_hook_{nullptr};
     std::atomic<bool> wal_open_pause_armed_{false};
     std::atomic<bool> wal_dir_prepare_pause_armed_{false};
     bool wal_dir_prepare_pause_reached_ = false;
@@ -1701,7 +1775,7 @@ class ChunkStore {
     // ScanChunkIdentities, or ScanChunkIdentitiesAt with `snapshot`.
     [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentitiesImpl(const TxnSnapshot* snapshot, bool has_cursor,
         ChunkCoord cursor, std::size_t limit, std::optional<std::uint64_t> since, bool with_data,
-        const ChunkScanFilter* filter);
+        const ChunkScanFilter* filter, const ChunkAreaSelector* area);
     // Waits until every write the snapshot includes has completed (see
     // ScanChunkIdentitiesAt).
     void WaitForTxnSnapshotWrites(const TxnSnapshot& snapshot);
@@ -1791,7 +1865,21 @@ class ChunkStore {
     // missing clock can be reported; only the checked initialized marker
     // proves that this store previously exposed deterministic version tokens.
     void InitializeVersionClock(bool store_preexisting, const std::error_code& inventory_error);
-    void ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive);
+    // One step toward a durable ceiling above `minimum`, under `lock` on
+    // version_clock_mutex_: waits for the ceiling write in flight, or writes
+    // one with the mutex released. The caller checks the ceiling again.
+    void AdvanceVersionClockCeilingLocked(std::unique_lock<std::mutex>& lock, std::uint64_t minimum);
+    // Starts writing the range after `ceiling` on the extension thread,
+    // unless a write is in flight, the ceiling moved, no range is left or
+    // the store is not open for it.
+    void StartVersionClockExtension(std::uint64_t ceiling);
+    void StartVersionClockExtensionLocked(std::uint64_t ceiling);
+    void RunVersionClockExtension(std::uint64_t ceiling) noexcept;
+    // Durably writes `ceiling` to the clock record.
+    void WriteVersionClockCeiling(std::uint64_t ceiling);
+    void PauseVersionClockExtensionIfArmed();
+    // Waits for the extension in flight and starts no other.
+    void StopVersionClockExtension() noexcept;
     // Moves the clock past a persisted chunk revision seen at load time, so
     // tokens issued from now on are above every revision the store holds even
     // when the clock bookkeeping was lost and restarted low.
@@ -1799,7 +1887,7 @@ class ChunkStore {
     void RecoverConditionalRollbackIntents(bool validate_only = false);
     // Creates the manifest of a new store, or confirms the existing one
     // still records the geometry this store opened with.
-    void InitializeStoreManifest();
+    void InitializeStoreManifest(const ProcessLock* bootstrap_owner);
     void InitializeSnapshotGeneration(bool store_preexisting);
     void FinishSnapshotGenerationRecovery();
     void BeginSnapshotGenerationWrite();

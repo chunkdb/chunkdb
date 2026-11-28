@@ -15,6 +15,7 @@
 #include "slot_watch.hpp"
 #include "user_registry.hpp"
 #include "chunk_coordinate_index.hpp"
+#include "commit_owner_bootstrap.hpp"
 
 namespace chunkdb {
 namespace {
@@ -30,11 +31,13 @@ void CrashAtFailpoint(const char* key) {
 
 FeedSlotFilters MigrationSlotFilters(const MigrationRequest& request, const Geometry& geometry) {
     auto filters = request.slot_filters;
-    if (filters.area && filters.area->dims != geometry.dims())
-        throw std::invalid_argument("coordinate dimensions differ from the table: the table has " +
-                                    std::to_string(geometry.dims()) + " and the slot area " +
-                                    std::to_string(filters.area->dims) +
-                                    "; give one coordinate per table dimension (DESCRIBE shows dims)");
+    for (const auto& area : filters.areas)
+        if (area.dims != geometry.dims())
+            throw std::invalid_argument("coordinate dimensions differ from the table: the table has " +
+                                        std::to_string(geometry.dims()) + " and the slot area " +
+                                        std::to_string(area.dims) +
+                                        "; give one coordinate per table dimension (DESCRIBE shows dims)");
+    SortFeedAreas(filters.areas);
     const auto& schema = geometry.layout().schema();
     if (request.slot_columns) {
         filters.column_ids.emplace();
@@ -282,6 +285,7 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             journal.files.push_back({relative.generic_string(), FileImage(config_.data_dir / relative), std::move(after)});
         };
         std::optional<Users> next_users;
+        std::shared_ptr<const CommitOwnerContext> creation_admission;
         if (no_op) {
             // Conditional DDL already holds: only the named ledger append is
             // journaled. Existing table identity is still validated on replay.
@@ -304,11 +308,13 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
             staging_owned = true;
             StoreManifest manifest{.features = TableScopedFeatures(root->features), .geometry = definition.geometry, .store_id = journal.table_id,
                                    .options = EncodeTableOptions(definition.options), .schema = block_schema,
-                                   .chunk_schema = geometry.chunk_schema()};
+                                   .chunk_schema = geometry.chunk_schema(), .commit_owner = root->commit_owner};
             if (!ChunkCoordinateIndex::InitializeEmpty(staging, geometry, journal.table_id))
                 throw std::runtime_error("coordinate inventory appeared in migration staging");
             const auto bytes = SerializeStoreManifest(manifest);
             if (!PublishNewFile(StoreManifestPath(staging), bytes)) throw std::runtime_error("migration stage manifest already exists");
+            if (commit_owner_context_)
+                creation_admission = commit_owner_context_->ForStagedTable(journal.operation_name, journal.table_id);
             SyncDirectoryPath(StagingDir());
             journal.files.push_back({"tables/" + request.table + "/" + std::string(kStoreManifestFileName), std::nullopt, bytes});
             journal.files.push_back({"tables/" + request.table + "/" + std::string(kChunkIndexFileName),
@@ -463,7 +469,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
         version_floor_ = DataDirVersionFloor(*ReadDataDirManifest(config_.data_dir));
         if (user_lock.owns_lock()) user_lock.unlock();
         if (!no_op && request.kind == MigrationRequest::Kind::kCreate) {
-            auto opened = OpenStore(request.table, TablesDir() / request.table, definition.geometry, kAllGeometryFields, definition.options);
+            auto opened = OpenStore(request.table, TablesDir() / request.table, definition.geometry, kAllGeometryFields,
+                definition.options, std::move(creation_admission));
             auto geometry = opened->geometry();
             auto created = std::shared_ptr<Table>(new Table(request.table, TablesDir() / request.table, journal.table_id,
                 std::move(geometry), definition.options, std::move(opened), config_.feed_buffer_bytes, migration_health_, config_.feed_linger));

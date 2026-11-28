@@ -4,6 +4,7 @@
 #include <utility>
 
 #include "feed_protocol.hpp"
+#include "feed_slot_logging.hpp"
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/logging.hpp"
 
@@ -36,8 +37,7 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
         throw std::invalid_argument("ACK TIMEOUT must be positive");
     if (options.buffer_bytes && *options.buffer_bytes == 0U) throw std::invalid_argument("feed buffer must be positive");
     auto [slot, claim] = table->ClaimFeedSlot(name, options, takeover, std::move(user), authorize_owner, std::move(peer));
-    options.areas.clear();
-    if (slot.filters.area) options.areas.push_back(*slot.filters.area);
+    options.areas = slot.filters.areas;
     options.column_ids = slot.filters.column_ids;
     options.no_before = slot.filters.no_before; options.chunks = slot.filters.chunks;
     if (options.after && table->lineage() && options.after->epoch == table->lineage()->parent_epoch &&
@@ -470,10 +470,26 @@ bool SlotWatch::Work() {
     if (!joined_) {
         if (!archive_) {
             if (slot.durable_watermark <= cursor_.revision) return Progress(slot) || changed;
+            const auto opening = std::chrono::steady_clock::now();
             archive_.emplace(table_->ReadClaimedFeedArchive(claim_, cursor_));
+            auto elapsed = std::chrono::steady_clock::now() - opening;
+            if (const auto* hook = hook_.load(std::memory_order_acquire)) elapsed = hook->ArchiveOpenElapsed(elapsed);
+            if (std::exchange(archive_after_live_resync_, false)) {
+                LogFeedSlotDiagnostic([&] {
+                    LogMessage(LogLevel::kInfo, LogComponent::kServer, "slot watch reads the archive",
+                        {{"slot", claim_->name}, {"cursor", std::to_string(cursor_.revision)},
+                         {"live", std::to_string(join_)}, {"durable", std::to_string(archive_->through().revision)}});
+                });
+            }
+            if (elapsed >= kSlowFeedSlotOperation) {
+                LogFeedSlotDiagnostic([&] {
+                    LogMessage(LogLevel::kWarn, LogComponent::kServer, "slot archive reader was slow to open",
+                        {{"slot", claim_->name}, {"ms", std::to_string(std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count())}});
+                });
+            }
             // The reader keeps only what this watch sends, so its budget
             // counts the frames this watch sends.
-            if (Filtered()) archive_->Filter({SlotArea(), options_.column_ids, options_.no_before, options_.chunks});
+            if (Filtered()) archive_->Filter({options_.areas, options_.column_ids, options_.no_before, options_.chunks});
             changed = true;
         }
         if (!pending_) {
@@ -494,6 +510,7 @@ bool SlotWatch::Work() {
     if (pending_->kind == FeedEntry::Kind::kResync) {
         join_ = pending_->position.revision;
         joined_ = false;
+        archive_after_live_resync_ = true;
         pending_.reset();
         return true;
     }
