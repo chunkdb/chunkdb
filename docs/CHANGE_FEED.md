@@ -93,8 +93,8 @@ Reducing a table's limits can also trigger resync or mark existing slots lost.
 ## Slots watched with AREA
 
 ACK accepts at most the last change, chunks or progress revision delivered to your application.
-A slot watch with AREA filters mutations, while progress can advance its ACK through completed writes outside that area.
-Writes outside the area still add to the slot's retained history until acknowledged, which can exceed `slot_max_bytes` and mark the slot lost.
+A slot watch with AREA filters mutations, while progress can advance its ACK through completed writes outside its areas.
+Writes outside its areas still add to the slot's retained history until acknowledged, which can exceed `slot_max_bytes` and mark the slot lost.
 Consume and acknowledge progress as well as mutations, or raise `slot_max_bytes` to cover the writes between acknowledgements.
 SHOW SLOTS reports each slot's retained bytes.
 
@@ -118,6 +118,7 @@ Omitting this option disables the mutation deadline.
 CHUNKS delivers exact post-commit whole-chunk forms, including unchanged blocks; a null form denotes deletion.
 COLUMNS projects each form in its declared column order, matching GET CHUNK with the same projection.
 Queued forms retain their commit's values even when later writes change the chunk.
+A lagging ordinary CHUNKS watch or CHUNKS watch of an unpartitioned slot merges its next pushes, so each chunk arrives with its newest form. A partitioned slot sends each change in order. See [Feed statements](reference/FEED.md#notes).
 An ordinary resume over earlier row-only history requires resync; a slot can use its retained archive prefix.
 
 `WATCH table SLOT 'consumer' TAKEOVER` replaces the slot's watching connection.

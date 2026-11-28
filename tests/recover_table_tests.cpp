@@ -41,6 +41,15 @@ bool Retired(const std::string& state) { return state != "durability" && state !
 
 constexpr const char* kFenced = "-ERR INTERNAL reason=internal table 'realm' is fenced: ";
 
+// The value of one SHOW METRICS series; empty when it has no sample.
+std::string Metric(Engine& e, const std::string& series) {
+    const auto text = e.Run("SHOW METRICS");
+    const auto at = text.find("\n" + series + " ");
+    if (at == std::string::npos) return {};
+    const auto begin = at + series.size() + 2U;
+    return text.substr(begin, text.find('\n', begin) - begin);
+}
+
 class FeedCleanupFailure final : public FeedTestHook {
   public:
     void Arm() { armed_.store(true, std::memory_order_release); }
@@ -141,6 +150,9 @@ void WhileFenced(Engine& e, const std::string& state) {
     if (open) assert(status.find("$6\r\nfenced\r\n*0\r\n") != std::string::npos);
     else assert(status.find("$6\r\ntables\r\n*1\r\n") != std::string::npos &&
         status.find("$6\r\nfenced\r\n*1\r\n%2\r\n$4\r\nname\r\n$5\r\nrealm\r\n$6\r\nreason\r\n$") != std::string::npos);
+    // So does its chunkdb_table_fenced gauge, out of service or not.
+    Reply(Metric(e, "chunkdb_table_fenced{table=\"realm\"}"), "1");
+    Reply(Metric(e, "chunkdb_table_fenced{table=\"other\"}"), "0");
     const auto describe = e.Run("DESCRIBE realm");
     if (state == "create") assert(describe.rfind(fenced, 0U) == 0U);
     else {
@@ -448,6 +460,48 @@ void AppliedMigrationWhileFenced() {
     assert(e.Run("MIGRATE 'next' ALTER TABLE realm ADD COLUMN next u8 NULL").rfind(kFenced, 0U) == 0U);
 }
 
+// A table with a slot whose store fails closed has a frozen slot frontier
+// until RECOVER TABLE, in SHOW STATUS and SHOW METRICS; a table without a
+// slot never has one.
+void FrozenSlotFrontier() {
+    const auto state = [](Engine& e, const std::string& table) {
+        const auto status = e.Run("SHOW STATUS");
+        const auto name = "$4\r\nname\r\n$" + std::to_string(table.size()) + "\r\n" + table + "\r\n$5\r\nstate\r\n";
+        const auto at = status.find(name);
+        assert(at != std::string::npos);
+        // The state and the reason, as bulk strings or null.
+        auto rest = status.substr(at + name.size());
+        return rest.substr(0, rest.find("$7\r\nenabled\r\n"));
+    };
+    test::ScopedTempDir dir("chunkdb-recover-table-frozen-frontier");
+    Engine e(dir.path(), true);
+    Seed(e, "durability");
+    Reply(e.Run("CREATE SLOT 'consumer' ON realm"), "+OK\r\n");
+    Reply(state(e, "realm"), "$2\r\nok\r\n$6\r\nreason\r\n_\r\n");
+    Reply(Metric(e, "chunkdb_slot_frontier_frozen{table=\"realm\"}"), "0");
+    // CREATE SLOT checkpoints the chunk and removes its WAL, and a failed
+    // first append to an empty WAL rolls back by removing it, which leaves the
+    // store serving. A committed write first makes the failed append truncate
+    // the WAL, whose failure fails the store closed.
+    assert(e.Run("SET BLOCK 1 1 IN realm v=9").front() == ':');
+    {
+        txn_test::ScopedEnv sync("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+        txn_test::ScopedEnv rollback("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1");
+        Error(e.Run("SET BLOCK 0 0 IN realm v=2"), "OUTCOME_UNKNOWN stage=wal_append_repair");
+    }
+    assert(e.catalog->Fence("realm"));
+    Reply(Metric(e, "chunkdb_slot_frontier_frozen{table=\"realm\"}"), "1");
+    Reply(Metric(e, "chunkdb_table_fenced{table=\"realm\"}"), "1");
+    Reply(Metric(e, "chunkdb_slot_frontier_frozen{table=\"other\"}"), "0");
+    const std::string reason = "its slots' durable frontier stopped because its store is fail-closed after a durability failure";
+    Reply(state(e, "realm"), "$6\r\nfrozen\r\n$6\r\nreason\r\n$" + std::to_string(reason.size()) + "\r\n" + reason + "\r\n");
+    Reply(state(e, "other"), "$2\r\nok\r\n$6\r\nreason\r\n_\r\n");
+    Reply(e.Run("RECOVER TABLE realm"), "+OK\r\n");
+    Reply(Metric(e, "chunkdb_slot_frontier_frozen{table=\"realm\"}"), "0");
+    Reply(state(e, "realm"), "$2\r\nok\r\n$6\r\nreason\r\n_\r\n");
+    Reply(Metric(e, "chunkdb_table_fenced{table=\"realm\"}"), "0");
+}
+
 void FailedRecoveryStaysFenced() {
     test::ScopedTempDir dir("chunkdb-recover-table-failure");
     Engine e(dir.path(), true);
@@ -550,7 +604,8 @@ int main(int argc, char** argv) {
              {"excludes commands", ExcludesCommands}, {"concurrent recovery", ConcurrentRecovery},
              {"option mismatch", OptionMismatchKeepsStore}, {"backup during recovery", BackupDuringRecovery},
              {"watches end", WatchesEnd}, {"leftover filter", LeftoverFilter},
-             {"applied migration", AppliedMigrationWhileFenced}, {"failed recovery", FailedRecoveryStaysFenced},
+             {"applied migration", AppliedMigrationWhileFenced}, {"frozen slot frontier", FrozenSlotFrontier},
+             {"failed recovery", FailedRecoveryStaysFenced},
              {"refused recovery", RefusedRecovery}, {"audited", Audited}}) {
         if (!only.empty() && only != name) continue;
         std::cout << name << '\n' << std::flush;

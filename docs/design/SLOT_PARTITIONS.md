@@ -1,7 +1,6 @@
 # Slot partitions and consumer groups
 
-A slot has one consumer at a time (#156).
-This note lets several consumers share one slot: the slot is split into a fixed number of partitions by chunk key, and each partition has its own acknowledged position.
+Several consumers can share one slot (#156). The slot has a fixed number of partitions by chunk key, and each partition has its own acknowledged position.
 
 ## Rule
 
@@ -15,7 +14,7 @@ A partition's position is the revision through which its consumer acknowledged e
 The count never changes: to partition an existing consumer differently, create another slot.
 A chunk's partition is `SplitMix64` of its coordinates modulo n (exact steps in STORAGE_FORMAT.md), the same in every build and every process.
 One change can touch chunks of several partitions; each watch receives the part of the change for its partitions, with the change's revision, time, user, tag and txn.
-A change that keeps no block, chunk change or chunk form for a watch is not sent to it, as for an AREA filter.
+A watch receives a change only if it keeps a block, chunk change or chunk form. When the slot specifies areas, each kept chunk must also fall inside at least one area. A partitioned CHUNKS watch sends every kept change under its own revision.
 Schema, progress and resync pushes go to every watch of the slot.
 
 ## Watches
@@ -41,12 +40,12 @@ The group's assignment lives in memory: after a restart the members join again.
 
 `chunkdb.slots` keeps format tag 4; header flag `0x4` marks the partition format, and then every slot record ends with its partition count `u16`, followed, for a count of 2 or more, by each partition's position `u64` and flags `u8` (`0x1` resync).
 The slot's written revision is the lowest partition position and its resync flag is set when any partition has resync; a record that disagrees is damage.
-The flag stays set once written, like the filter format flag.
+The flag stays set once written, like the filter format flag. The partition section follows all filter and owner fields, including the counted area section when header flag `0x2` is also set. See [Storage format](../STORAGE_FORMAT.md#feed-slots-and-archives).
 The table feature `slot_partitions` (incompat bit 8, `0x100`) owns the partition format: CREATE SLOT with PARTITIONS 2 or more requires it, and a table whose records carry the flag without the feature is refused.
 
 ## Upgrade
 
-Existing slots have one partition and keep their records byte for byte; nothing converts them.
+Existing unpartitioned slots keep their layout until the first partitioned slot is created in the table. Then their records store a partition count of one, and their existing written revision and resync flag still apply.
 New directories enable `slot_partitions`; an existing directory runs `ENABLE FEATURE 'slot_partitions'` (after `feature_activation`) before its first partitioned slot.
 A build without the feature refuses a table that has it, so it never reads a partitioned record as an ordinary one; rollback restores a backup made before the bit was enabled.
 MIGRATE does not take PARTITIONS: a migration's slot request has no partition count, and the statement is refused instead of creating an unpartitioned slot.

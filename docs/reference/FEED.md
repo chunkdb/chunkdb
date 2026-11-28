@@ -25,10 +25,13 @@ OK
   lag_revisions = 0
   retained_bytes = 0
   attached = false
+  peer = NULL
+  last_ack_ms = NULL
   lost = false
   lost_reason = NULL
   filters:
     area = NULL
+    areas = NULL
     column_ids = NULL
     columns = NULL
     no_before = false
@@ -89,7 +92,7 @@ OK
 ## Syntax
 
 ```text
-CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [OWNER user] [PARTITIONS n]
+CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1 [, AREA cx0 cy0 TO cx1 cy1 ...]] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [OWNER user] [PARTITIONS n]
 DROP SLOT [IF EXISTS] 'name' ON table
 SHOW SLOTS [ON table] [PREFIX 'name']
 WATCH table [SLOT 'name'] [PARTITION p [, p ...]] [AREA cx0 cy0 TO cx1 cy1 [, AREA cx0 cy0 TO cx1 cy1 ...]] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [AFTER epoch revision] [ACK TIMEOUT ms] [TAKEOVER]
@@ -102,10 +105,10 @@ UNWATCH
 
 - `name`: quoted `[a-z_][a-z0-9_]*`, 1 through 63 bytes.
 - `AREA`: inclusive chunk-coordinate rectangle or cuboid with exactly the table's active axes; transactions are clipped to it.
-- `AREA ..., AREA ...`: WATCH without SLOT takes up to 64 areas with the same axes and keeps a chunk inside any of them; a slot keeps one AREA, and WATCH SLOT accepts several only when each repeats it.
+- `AREA ..., AREA ...`: WATCH and CREATE SLOT take up to 64 areas with the same axes and keep a chunk inside any of them; WATCH SLOT accepts areas only when they are the slot's areas, in any order and with repeats.
 - `COLUMNS`: project block values in declared order; column IDs preserve the projection across renames, and chunk metadata remains complete.
 - `NO BEFORE`: omit previous block and chunk-metadata rows from mutation events.
-- `CHUNKS`: receive each relevant committed chunk's version and whole form instead of block changes.
+- `CHUNKS`: receive each relevant committed chunk's version and whole form instead of block changes; while an ordinary watch or a watch of an unpartitioned slot lags, repeated changes of a chunk merge (see [Notes](#notes)).
 - `OWNER`: the user the slot belongs to; it defaults to the user running CREATE SLOT, and the user need not exist yet.
 - `PARTITIONS`: split the slot into 1 through 256 partitions by chunk, fixed at creation; see [Partitions](#partitions). Without it a slot has one partition.
 - `PARTITION`: with SLOT, the partitions, numbered from 0, that this watch holds; without it the watch holds every partition of the slot.
@@ -116,13 +119,16 @@ UNWATCH
 - `TAKEOVER`: replace the slot's watcher after publishing its accepted ACK and closing its connection.
   The owner replacing its own watch needs READ; replacing another user additionally needs ADMIN on `*`.
 - `ACK TIMEOUT`: positive milliseconds for a slot watch; closes the connection when its oldest fully sent, unacknowledged mutation expires.
-- `SLOT`: retain history for this named consumer across restarts; only one watcher can hold a slot at a time. After RESTORE TABLE, an offline restore or SWAP TABLES, its next watch without AFTER starts with resync until you acknowledge a later revision.
+- `SLOT`: retain history for this named consumer across restarts; only one watcher can hold each partition at a time. After RESTORE TABLE, an offline restore or SWAP TABLES, its next watch without AFTER starts with resync until you acknowledge a later revision.
   Its owner needs READ; another user also needs ADMIN on `*`, with or without AFTER or TAKEOVER, for as long as the watch lasts.
 
 ## Returns
 
 - CREATE and DROP SLOT: `OK`, including authorized conditional no-ops.
-- SHOW SLOTS: visible table (every table with MONITOR), name, epoch, saved `acked` revision, `revision`, `lag_revisions`, retained bytes, `attached`, lost state, loss reason, filters, owner, and `partitions`, one `{partition, acked, attached}` map per partition; the owner is shown to that user and to MANAGES USERS, and is null otherwise; a table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
+- SHOW SLOTS: visible table (every table with MONITOR), name, epoch, saved `acked` revision, `revision`, `lag_revisions`, retained bytes, `attached`, `peer`, `last_ack_ms`, lost state, loss reason, filters, owner, and `partitions`.
+  `filters.areas` lists the areas in coordinate order, or is null for the whole table. `filters.area` gives the only area, or is null with none or several.
+  `owner` is shown to that user and to MANAGES USERS, and is null otherwise. A table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
+  `partitions` lists one `{partition, acked, attached}` map per partition, including partition 0 for a slot created without PARTITIONS.
 - WATCH: start position, followed by change or chunks, schema, progress, or resync events.
 - WATCH CATALOG: the catalog epoch and revision, followed by catalog events; see [WATCH CATALOG](#watch-catalog).
 - ACK: no success reply; it is accepted only inside a slot watch.
@@ -152,19 +158,21 @@ UNWATCH
 
 ## Notes
 
-CREATE SLOT accepts AREA, COLUMNS, NO BEFORE, CHUNKS, and OWNER once each, in any order after ON.
+CREATE SLOT accepts an AREA list, COLUMNS, NO BEFORE, CHUNKS, OWNER, and PARTITIONS once each, in any order after ON.
 COLUMNS also accepts parentheses around its names.
 Under `--auth none`, CREATE SLOT without OWNER records no owner.
 A slot without a recorded owner takes the user of its first granted attach without ADMIN on `*`, saved before that watch starts; an attach with ADMIN on `*` records nobody.
 
-Conditional slot creation preserves an existing position, owner and lost state when its filters match, and its OWNER when given.
+Conditional slot creation preserves an existing position, owner and lost state when its filters and partition count match, and its OWNER when given.
 WATCH inherits omitted slot filters and rejects supplied filters that differ.
 A dropped projected column makes the slot lost with `reason=schema_filter`.
 SHOW SLOTS preserves its IDs and uses null for names that no longer exist.
 SHOW SLOTS `revision` is the durable revision recorded for the table's slots, which slot delivery never passes; it advances with each durable frontier pass (`--slot-sync-ms`).
 `lag_revisions` is how far `acked` is below `revision`, counted in revision numbers, gaps included.
 `retained_bytes` is the history the slot keeps after `acked`: how many bytes its consumer is behind.
-`attached` is true while a watch holds the slot or one of its partitions; another WATCH ... SLOT of a held partition then answers SLOT_BUSY unless it uses TAKEOVER.
+`attached` is true while any watch holds the slot or one of its partitions; a WATCH asking for a held partition answers SLOT_BUSY unless it uses TAKEOVER.
+`peer` gives the sole attached watch's client as `[address]:port`, as SHOW CONNECTIONS names it. It is visible to that user, ADMIN on `*`, and MONITOR. It is null for other viewers, when the address is unknown, or when zero or several watches are attached.
+`last_ack_ms` is the elapsed time in milliseconds since the most recent accepted ACK among the attached watches, or null until one of them has acknowledged.
 
 Conditional removal still checks rights and requires an existing table.
 Change events contain complete before and after metadata rows when chunk columns change.
@@ -180,6 +188,12 @@ When a slot watch ends after losing access or exceeding an ACK or output deadlin
 After a crash, changes can repeat.
 Store the applied position atomically with your own output to prevent duplicate effects.
 
+An ordinary CHUNKS watch or a CHUNKS watch of an unpartitioned slot lags while the server has output for it that its connection has not taken yet.
+Its next pushes then merge into one `chunks` push, sent once that output is written: each chunk keeps its newest version and form, and the push takes the revision, `commit_time_ms` and `user` of the newest merged change.
+Applying a merged push gives the same table state as applying each change, and its revision covers all of them.
+A merged push stays within the watch's share and never spans a schema event; a watch that keeps up receives one push per change.
+For a slot, ACK of the merged revision acknowledges every merged change; after a reconnect from an earlier ACK, the slot sends those changes again.
+
 ## Partitions
 
 ```text
@@ -190,7 +204,7 @@ WATCH feed_demo SLOT 'workers' PARTITION 2, 3
 
 A partitioned slot lets several consumers share one slot: each change of a chunk goes to the watch holding the chunk's partition, in revision order.
 A chunk's partition never changes; it is a fixed hash of the chunk coordinates, given in [Storage format](../STORAGE_FORMAT.md#feed-slots-and-archives).
-A change that touches chunks of several partitions reaches each watch with only that watch's chunks, under the same revision; a watch whose partitions it does not touch does not receive it.
+A change that touches chunks of several partitions reaches each watch with only its partitions' chunks, under the same revision. When the slot has areas, a chunk must also fall inside any one of them. A watch receives only changes with at least one matching chunk.
 Schema, progress and resync events go to every watch.
 Each partition keeps its own acknowledged position: `ACK r` saves r for every partition of the watch, and a watch starts at the lowest position of its partitions and skips each partition's changes at or below its position.
 SHOW SLOTS `acked` is the lowest partition position; history is retained from it, and `lag_revisions` and `retained_bytes` count from it.
@@ -241,5 +255,5 @@ A partial frame or pinned TLS retry closes without injecting an error inside the
 A failure after slot metadata replacement returns `OUTCOME_UNKNOWN stage=slot_records`.
 Recover the table before retrying; its ACK or slot change may already be published.
 
-CREATE SLOT requires `feed_slots`; persisted filters also require `slot_filters`, and PARTITIONS of 2 or more requires `slot_partitions`.
-[Enable missing features](TABLES.md#feature-activation) before creating a slot; these commands never activate features implicitly.
+CREATE SLOT requires `feed_slots`, persisted filters require `slot_filters`, and two or more partitions require `slot_partitions`.
+[Enable missing features](TABLES.md#feature-activation) before creating a slot. These commands never enable features implicitly.

@@ -2,6 +2,7 @@
 
 #include <cstdint>
 #include <memory>
+#include <span>
 #include <vector>
 
 #include "chunkdb/feed_slots.hpp"
@@ -34,6 +35,10 @@ namespace chunkdb {
 // has the partition's changes: its position when held, the maximum
 // otherwise. Empty for a slot without partitions.
 [[nodiscard]] std::vector<std::uint64_t> FeedSlotPartitionFloors(const FeedSlot& slot, const std::vector<std::uint16_t>& held);
+
+// Whether this watch still needs the chunk's change at revision.
+[[nodiscard]] bool FeedSlotPartitionIncludes(std::span<const std::uint64_t> floors, const ChunkCoord& chunk,
+    std::uint64_t revision) noexcept;
 
 // Keeps of a change or chunks entry the blocks, chunk changes and chunk forms
 // of the chunks whose partition floor is below the entry's revision; nullptr

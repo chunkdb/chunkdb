@@ -157,6 +157,59 @@ void RetainedMetadataBudget() {
     assert(FeedRowRetainedBytes({}) == 0U);
 }
 
+std::shared_ptr<const FeedEntry> Chunks(std::uint64_t revision, std::optional<std::string> user,
+    std::vector<FeedChunkForm> forms, std::uint8_t dims = 2U, std::uint64_t schema = 1U) {
+    auto entry = std::make_shared<FeedEntry>();
+    entry->kind = FeedEntry::Kind::kChunks; entry->position = {kEpoch, revision};
+    entry->commit_time_ms = 1000U + revision; entry->user = std::move(user);
+    entry->schema_version = schema; entry->dims = dims; entry->chunk_forms_complete = true;
+    entry->chunk_forms = std::move(forms);
+    entry->protocol_frame = std::make_shared<const std::string>(EncodeFeedEntry(*entry));
+    return entry;
+}
+std::shared_ptr<const std::string> Form(std::string bytes) { return std::make_shared<const std::string>(std::move(bytes)); }
+
+// The size of a chunks frame is known before it is encoded, and merged pushes
+// keep each chunk's newest form in first-seen order at the newest position.
+void ChunksMerge() {
+    const auto a1 = Form("a1"), a2 = Form(std::string(300U, 'a')), c = Form("c");
+    const auto first = Chunks(7U, "alice", {{{0, 0, 0}, 7U, a1}, {{-3, 9, 0}, 7U, nullptr}});
+    const auto second = Chunks(9U, "bob", {{{0, 0, 0}, 9U, a2}});
+    const auto third = Chunks(12U, std::nullopt, {{{5, -5, 0}, 12U, c}});
+    const auto deep = Chunks(std::numeric_limits<std::uint64_t>::max(), std::string(130U, 'u'),
+        {{{INT64_MIN, INT64_MAX, -1}, std::numeric_limits<std::uint64_t>::max(), nullptr}, {{1, 2, 3}, 10U, Form("")}}, 3U);
+    for (const auto& entry : {first, second, third, deep}) assert(FeedChunksEncodedBytes(*entry) == entry->protocol_frame->size());
+
+    FeedChunksMerge merge;
+    assert(merge.empty() && merge.Add(first, first->protocol_frame->size()));
+    assert(merge.Take() == first && merge.empty()); // One push is sent as it was captured.
+
+    FeedEntry expected = *first;
+    expected.position = third->position; expected.commit_time_ms = third->commit_time_ms; expected.user.reset();
+    expected.chunk_forms = {{{0, 0, 0}, 9U, a2}, {{-3, 9, 0}, 7U, nullptr}, {{5, -5, 0}, 12U, c}};
+    const auto merged_size = FeedChunksEncodedBytes(expected);
+    assert(merge.Add(first, 1U << 20U) && merge.Add(second, 1U << 20U));
+    // The limit counts the merged frame, not the pushes it replaces.
+    assert(!merge.Add(third, merged_size - 1U));
+    assert(merge.Add(third, merged_size));
+    const auto merged = merge.Take();
+    assert(merge.empty() && merged->kind == FeedEntry::Kind::kChunks && merged->position == third->position);
+    assert(merged->commit_time_ms == third->commit_time_ms && !merged->user && merged->schema_version == 1U);
+    assert(*merged->protocol_frame == EncodeFeedEntry(expected) && merged->protocol_frame->size() == merged_size);
+    assert(merged_size < first->protocol_frame->size() + second->protocol_frame->size() + third->protocol_frame->size());
+
+    // A refused push changes nothing.
+    assert(merge.Add(first, 1U << 20U));
+    assert(!merge.Add(Chunks(8U, "carol", {{{1, 1, 0}, 8U, c}}, 2U, 2U), 1U << 20U)); // Another schema version.
+    assert(!merge.Add(second, first->protocol_frame->size()));
+    assert(merge.Take() == first);
+    assert(!merge.Add(second, second->protocol_frame->size() - 1U) && merge.empty());
+    assert(merge.Add(second, 1U << 20U));
+    Refuse([&] { (void)merge.Add(first, 1U << 20U); }); // Positions only increase.
+    merge.Clear();
+    assert(merge.empty());
+}
+
 void EmptyMetadataProjection() {
     const TableSchema blocks{.version = 1U, .next_column_id = 2U, .columns = {Scalar(1U, "a")}};
     GeometryConfig config;
@@ -190,5 +243,5 @@ int main(int argc, char** argv) {
     if (argc == 2 && std::string_view(argv[1]) == "--empty-domain") { EmptyMetadataProjection(); return 0; }
     assert(argc == 1);
     DimensionalFrames(); OverflowCoordinates(); FiltersRetainMetadata(); CheckedHistoricalProjection(); RetainedMetadataBudget();
-    EmptyMetadataProjection();
+    EmptyMetadataProjection(); ChunksMerge();
 }

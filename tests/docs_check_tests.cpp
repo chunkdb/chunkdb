@@ -127,16 +127,20 @@ void MultilineSlotEpochPreservesFields() {
     const std::string source =
         "OK\nOK\n1)\n  table = feed_demo\n  name = consumer\n"
         "  epoch = " + epoch + "\n  acked = 0\n  revision = 0\n  lag_revisions = 0\n  retained_bytes = 0\n"
-        "  attached = false\n  lost = false\n  lost_reason = NULL\n  filters:\n"
-        "    area = NULL\n    column_ids = NULL\n    columns = NULL\n"
-        "    no_before = false\n    chunks = false\n";
+        "  attached = false\n  peer = NULL\n  last_ack_ms = NULL\n  lost = false\n  lost_reason = NULL\n  filters:\n"
+        "    area = NULL\n    areas = NULL\n    column_ids = NULL\n    columns = NULL\n"
+        "    no_before = false\n    chunks = false\n  owner = admin\n  partitions:\n"
+        "    1) partition = 0, acked = 0, attached = false\n";
     for (const std::string& changed :
          {source, Replace(source, "acked = 0", "acked = 37"),
           Replace(source, "revision = 0", "revision = 40"), Replace(source, "lag_revisions = 0", "lag_revisions = 3"),
           Replace(source, "attached = false", "attached = true"),
+          Replace(source, "peer = NULL", "peer = [127.0.0.1]:51234"), Replace(source, "last_ack_ms = NULL", "last_ack_ms = 12"),
           Replace(source, "retained_bytes = 0", "retained_bytes = 4096"), Replace(source, "lost = false", "lost = true"),
           Replace(source, "lost_reason = NULL", "lost_reason = schema_filter"),
           Replace(source, "area = NULL", "area = [-2, 0, 3, 4]"),
+          Replace(source, "areas = NULL", "areas:\n      1) [-2, 0, 3, 4]"),
+          Replace(source, "partition = 0, acked = 0", "partition = 0, acked = 37"),
           Replace(source, "columns = NULL", "columns = ['" + epoch + "']"),
           Replace(source, "no_before = false", "no_before = true"), Replace(source, "chunks = false", "chunks = true")}) {
         for (const std::string ending : {"\n", "\r\n"}) {

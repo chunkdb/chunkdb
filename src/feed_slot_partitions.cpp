@@ -82,13 +82,17 @@ std::vector<std::uint64_t> FeedSlotPartitionFloors(const FeedSlot& slot, const s
     return floors;
 }
 
+bool FeedSlotPartitionIncludes(std::span<const std::uint64_t> floors, const ChunkCoord& chunk,
+    std::uint64_t revision) noexcept {
+    return floors.empty() || floors[FeedSlotPartitionOf(chunk, static_cast<std::uint32_t>(floors.size()))] < revision;
+}
+
 std::shared_ptr<const FeedEntry> PartitionFeedEntry(const std::shared_ptr<const FeedEntry>& entry,
     const std::vector<std::uint64_t>& floors) {
     if (floors.empty() || !entry) return entry;
     if (entry->kind != FeedEntry::Kind::kChange && entry->kind != FeedEntry::Kind::kChunks) return entry;
-    const auto count = static_cast<std::uint32_t>(floors.size());
     const auto revision = entry->position.revision;
-    const auto keep = [&](const ChunkCoord& chunk) { return floors[FeedSlotPartitionOf(chunk, count)] < revision; };
+    const auto keep = [&](const ChunkCoord& chunk) { return FeedSlotPartitionIncludes(floors, chunk, revision); };
     const bool all = std::all_of(entry->blocks.begin(), entry->blocks.end(), [&](const auto& block) { return keep(block.chunk); }) &&
         std::all_of(entry->chunk_changes.begin(), entry->chunk_changes.end(), [&](const auto& change) { return keep(change.chunk); }) &&
         std::all_of(entry->chunk_forms.begin(), entry->chunk_forms.end(), [&](const auto& form) { return keep(form.chunk); });

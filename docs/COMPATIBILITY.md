@@ -44,12 +44,14 @@ Later 2.x servers still open valid 2.0 data.
 | `feed_slots` | Tables: slots, archive, writer identity and collection records. | Before bit `0x1` was enabled. |
 | `migrations` | Directory: migration ledger and redo decisions. | Before bit `0x2` was enabled. |
 | `table_lineage` | Tables: parent epoch and fork revision. | Before bit `0x4` was enabled. |
-| `slot_filters` | Tables: stable projection IDs and persisted filters. | Before bit `0x8` was enabled. |
+| `slot_filters` | Tables: stable projection IDs and persisted filters. | Before bit `0x8` was enabled for a binary without `slot_filters`, or before any multi-area slots were created for a binary that lacks multi-area slot support. |
 | `feature_activation` | Directory: checked activation decisions. | Before bit `0x10` was enabled. |
 | `chunk_model` | Directory and tables: dimensional geometry, both column domains, sectioned forms, and retained coordinate decisions. | No conversion to an earlier development layout. |
-| `slot_partitions` | Tables: partitioned slot records and per-partition positions. | Before bit `0x100` was enabled. |
+| `slot_partitions` | Tables: partitioned slot records and per-partition positions (slot header flag `0x4`). | Before bit `0x100` was enabled. |
 
 A reader or writer must support every recorded incompatibility bit, even when its owned records are absent.
+A binary with `slot_filters` also needs multi-area slot support to open tables whose [`chunkdb.slots`](STORAGE_FORMAT.md#feed-slots-and-archives) header carries flag `0x2`.
+A binary needs partitioned slot support to open a slot record file with header flag `0x4`, independently of the area-count flag. A reader that recognizes only one of these flags refuses files carrying the other flag.
 To use a binary lacking a feature, restore the whole consistent backup identified above.
 Use a restore tool that supports that backup's recorded features; restore refuses backed-up tables without `table_lineage`, which every table a 2.0 build creates has.
 Dropping records or manually clearing masks does not establish a supported rollback.
@@ -80,7 +82,8 @@ Native Windows TLS uses MSYS2 UCRT64 and its OpenSSL package.
 MSVC and other Windows TLS distributions are outside the validated toolchain boundary.
 Filesystem and device sync semantics remain prerequisites for durability.
 
-Internal C++ symbols, diagnostic log text, metric names and benchmark results are not protocol or storage compatibility guarantees.
+Metric names, types and label names are fixed for 2.x; see [Metrics](EXPORTER.md#metrics).
+Internal C++ symbols, diagnostic log text and benchmark results are not protocol or storage compatibility guarantees.
 Only one server writes a data directory.
 Replication and shared multi-writer operation are unavailable.
 See [known limitations](KNOWN_LIMITATIONS.md) before selecting runtime options.

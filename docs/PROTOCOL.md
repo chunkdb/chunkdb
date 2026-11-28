@@ -9,11 +9,13 @@ WATCH changes that connection into a push stream.
 TCP uses `chunk://`; TLS uses `chunks://` with certificate validation in the client.
 Lines end with LF or CRLF; a line cut off at end of stream is never executed.
 The terminator counts toward `--max-line-bytes` (65536 by default); overflow sends BAD_REQUEST and closes.
+Before authentication a request line and a kept parameter frame each take at most 8192 bytes, or `--max-line-bytes` when smaller: a longer line receives PROTOCOL and closes, and a longer `client_name` value receives `INVALID_ARGUMENT reason=option_value`.
 Binary parameter frames do not count toward that line limit.
 A PROXY protocol v2 header and the TLS handshake each have their own `--client-io-timeout-ms`, in that order, before the HELLO deadline starts.
 Until authentication succeeds, HELLO, AUTH and all their parameter frames must arrive within `--client-io-timeout-ms` of that start; later ones receive PROTOCOL and close.
 After authentication, each request line must arrive within `--client-io-timeout-ms` of its first byte, each frame header within it of the end of the line or of the previous frame, and each frame body, kept or drained, within it of the end of its header; a frame that misses its deadline receives `PROTOCOL incomplete parameter frame` and the connection closes.
 Waiting for the server's input credit does not count: a request's frame deadline starts again when the credit is granted, and a wait longer than `--client-io-timeout-ms` receives `BUSY reason=input_budget` and the connection closes.
+Before authentication a request does not wait for input credit: each kept frame is charged the length its header gives when the header arrives, and a frame the server's login input credit cannot hold receives `BUSY reason=input_budget` and the connection closes.
 
 The first line must be HELLO 3; a different version or statement receives PROTOCOL and closes without execution.
 `HELLO 3` alone is accepted only under `--auth none`; otherwise it receives AUTH_REQUIRED.
@@ -71,13 +73,15 @@ Before authentication HELLO takes at most 12 parameters; a HELLO with more recei
 
 `client_name` and `statement_timeout_ms` apply; `default_tag` is stored with `reason=implementation_pending`.
 The effective statement timeout appears in `options`, including the server default when HELLO omits it.
-The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, `read_only_transactions`, `returning`, and `watch_catalog`.
+The implemented capabilities are `protocol_foundation`, `ordered_versions`, `read_metadata`, `feed_progress`, `slot_filters`, `slot_takeover`, `lineage`, `connection_controls`, `statement_timeout`, `channel_binding`, `area_paging`, `area_scale`, `read_only_transactions`, `returning`, `watch_catalog`, `slot_areas`, and `slot_partitions`.
 Options become visible only after authentication succeeds.
 The `returning` feature permits [RETURNING](#returning) on SET BLOCK and DELETE BLOCK; `limits.max_returning_rows` bounds its rows and `limits.max_expression_nodes` each expression.
 The `area_paging` feature permits GET AREA LIMIT and AFTER and its `chunks`, `more`, `after` page map.
 The `area_scale` feature permits GET AREA SCALE and its downsampled forms.
 The `read_only_transactions` feature permits BEGIN READ ONLY and SCAN CHUNKS inside it.
 The `watch_catalog` feature permits WATCH CATALOG and its `catalog` events.
+The `slot_areas` feature permits several areas in CREATE SLOT and adds `areas` to the SHOW SLOTS filters.
+The `slot_partitions` feature advertises CREATE SLOT PARTITIONS, WATCH SLOT PARTITION, and the SHOW SLOTS `partitions` array.
 A chunk too large for an empty page ends the page before it and is then refused with `OUT_OF_RANGE reason=area_entry_too_large chunk=... required=... limit=...`; see [chunks](reference/CHUNKS.md#limits).
 The configured positive area bounds appear as both `max_area_chunks`/`max_response_bytes` and `limits.max_area_chunks`/`limits.max_area_response_bytes`.
 `limits.txn_max_written_chunks` and `limits.txn_max_read_chunks` are the configured transaction chunk-count bounds.
@@ -260,7 +264,7 @@ Resync lineage fields are null when no parent lineage is recorded.
 
 Rows are in schema order and use the reply types above; null denotes absent rows or NULL values and an anonymous user.
 Coordinates beyond int64 absolute range are represented as `[chunk_coordinate, local_block_offset]` on that axis.
-One transaction forms one change; AREA clips it by inclusive chunk coordinates.
+One transaction forms one change. AREA keeps chunks inside any listed area, and a partitioned watch keeps only chunks of the partitions it holds.
 Revisions have gaps and define order; timestamps do not.
 AFTER can resume at a progress revision within the retained prefix, including a gap without a change frame.
 
@@ -273,7 +277,10 @@ Slot progress cannot pass the durable frontier or changes not yet queued ahead o
 
 An excessive ACK receives INVALID_ARGUMENT and leaves the watch open.
 Slot pushes stop at the persisted durable frontier; see [durable slots](reference/FEED.md#notes) for ACK persistence and batching.
-SHOW SLOTS reports written `acked`, the durable `revision`, `lag_revisions`, retained bytes, `attached`, loss state, and `partitions` with each partition's `acked` and `attached`.
+SHOW SLOTS reports the saved `acked` revision, the durable `revision`, lag, retained bytes, attachment, peer address, ACK age, loss state, filters, and owner.
+The `partitions` array follows `owner` and contains one `{partition, acked, attached}` map per partition, in partition number order.
+The slot's `acked` is the lowest partition position.
+See [SHOW SLOTS](reference/FEED.md#returns) and its [notes](reference/FEED.md#notes) for when `peer`, `last_ack_ms` and `filters.areas` are null.
 CHUNKS pushes use `[chunks,epoch,revision,commit_time_ms,user,schema_version,chunks,tag,txn]`.
 Each chunk is `[cx,cy,version,form_or_null]` or `[cx,cy,cz,version,form_or_null]`; a null form represents deletion.
 Forms match GET CHUNK for that exact commit and projection; later writes cannot change queued bytes.
@@ -319,15 +326,16 @@ Clients classify errors by code, never diagnostic text, and preserve unknown key
 
 MIGRATION_MISMATCH identifies different text under a recorded migration name.
 CHECK_FAILED includes `check`, the CHECK constraint a write or ADD CHECK found false; nothing changes.
-SLOT_BUSY identifies an attached slot; SLOT_LOST identifies unavailable retained history or a dropped projected column.
+SLOT_BUSY identifies a requested slot partition that is already attached; SLOT_LOST identifies unavailable retained history or a dropped projected column.
 `BUSY reason=large_chunk_cache_full` means a new large-chunk cache container could not fit in the shared pool; the request applied no mutation.
 `reason=schema_filter` identifies a lost stable-ID projection; `reason=retention_limit` identifies retained-history overflow.
 SHOW SLOTS adds `lost_reason` (null while healthy), a `filters` map, and `owner` (shown to that user and to MANAGES USERS; null otherwise or for a slot without a recorded owner).
-Its keys are `area`, `columns`, `column_ids`, `no_before`, and `chunks`.
+The filter keys are `area`, `areas`, `column_ids`, `columns`, `no_before`, and `chunks`, in that order.
 
-Unfiltered area and projection fields are null; projected names and IDs are aligned arrays in declared order.
+The `areas` key is null for the whole table and otherwise lists all areas. The `area` key gives the sole area when there is exactly one and is null otherwise.
+Projection fields are null for all columns. Projected names and IDs are aligned arrays in declared order.
 A dropped column keeps its ID and has a null display name.
-Area bounds are signed `[x0,y0,x1,y1]` with inclusive endpoints; both flags are booleans.
+Area bounds are signed with inclusive endpoints, `[x0,y0,x1,y1]` in 2D and `[x0,y0,z0,x1,y1,z1]` in 3D. Both filter flags are booleans.
 VERSION_MISMATCH, CONDITION_FAILED and SCHEMA_MISMATCH include `current`, the chunk or schema version; schema rejection also includes `actual` and `table`.
 RATE_LIMITED authentication bans include remaining `retry_after_ms`.
 OUTCOME_UNKNOWN includes `stage` and requires writer recovery before retrying ([durability](DURABILITY_CONTRACT.md)).

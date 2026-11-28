@@ -767,7 +767,7 @@ CommandEngine::PayloadRequest CommandEngine::PlanPayload(
                 const auto* parameter = std::get_if<cql::Parameter>(&option.value);
                 if (parameter == nullptr) continue;
                 std::size_t limit = 0U;
-                if (option.name == "client_name") limit = config_.max_line_bytes;
+                if (option.name == "client_name") limit = std::min(config_.max_line_bytes, kMaxLoginLineBytes);
                 else if (option.name == "default_tag") limit = 256U;
                 else if (option.name == "statement_timeout_ms") limit = 8U;
                 else continue;
@@ -1086,7 +1086,7 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     }
     entry("connection_id", session.connection_id);
     Protocol::AppendBulk(reply, "features");
-    Protocol::AppendArrayHeader(reply, 15);
+    Protocol::AppendArrayHeader(reply, 17);
     Protocol::AppendBulk(reply, "protocol_foundation");
     Protocol::AppendBulk(reply, "ordered_versions");
     Protocol::AppendBulk(reply, "read_metadata");
@@ -1102,6 +1102,8 @@ std::string CommandEngine::HelloReply(const SessionState& session, std::string_v
     Protocol::AppendBulk(reply, "read_only_transactions");
     Protocol::AppendBulk(reply, "returning");
     Protocol::AppendBulk(reply, "watch_catalog");
+    Protocol::AppendBulk(reply, "slot_areas");
+    Protocol::AppendBulk(reply, "slot_partitions");
     Protocol::AppendBulk(reply, "options");
     Protocol::AppendMapHeader(reply, session.hello_options.client_name ? 2U : 1U);
     entry("statement_timeout_ms", session.hello_options.statement_timeout_ms.value_or(session.default_statement_timeout_ms));
@@ -1147,19 +1149,31 @@ std::string CommandEngine::RenderMetrics() const {
     // not open, such as one an exclusive statement holds or waits for, or one
     // that failed, is left out rather than waited for.
     std::vector<TableRuntimeStats> tables;
+    // The state gauges list every table by name, fenced ones out of service too.
+    std::vector<MetricsRegistry::TableState> states;
     for (const auto& info : catalog_->List()) {
         const auto table = catalog_->Find(info.name);
         if (table == nullptr) {
             continue;
         }
+        auto& state = states.emplace_back(MetricsRegistry::TableState{.table = info.name, .fenced = false, .slot_frontier_frozen = std::nullopt});
         const auto lease = table->TryAcquire();
         if (!lease.has_value()) {
             continue;
         }
         tables.push_back(TableRuntimeStats{.table = info.name, .stats = lease->store().RuntimeStats()});
+        state.slot_frontier_frozen = table->SlotFrontierFrozen(*lease);
+    }
+    // Fences waits for no table.
+    for (const auto& fence : catalog_->Fences()) {
+        const auto at = std::lower_bound(states.begin(), states.end(), fence.table,
+            [](const MetricsRegistry::TableState& state, const std::string& name) { return state.table < name; });
+        if (at != states.end() && at->table == fence.table) at->fenced = true;
+        else states.insert(at, MetricsRegistry::TableState{.table = fence.table, .fenced = true, .slot_frontier_frozen = std::nullopt});
     }
     return metrics_->RenderPrometheus(
-        tables, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get());
+        tables, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get()) +
+        MetricsRegistry::RenderTableStates(states);
 }
 
 

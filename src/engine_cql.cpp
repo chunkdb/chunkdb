@@ -31,6 +31,7 @@
 #include "chunk_scale.hpp"
 #include "typed_chunk_form.hpp"
 #include "area_cursor.hpp"
+#include "area_reply.hpp"
 #include "sectioned_chunk_form.hpp"
 #include "chunkdb/chunk_columns.hpp"
 #include "cql.hpp"
@@ -311,19 +312,11 @@ void AppendChunkState(ReplyParts& reply, const Geometry& geometry, const ChunkSt
     return std::string{};
 }
 
-std::string AreaReplyPrefix(bool with_schema, std::uint64_t schema, bool paged, std::size_t count) {
-    std::string prefix;
-    if (with_schema) {
-        Protocol::AppendArrayHeader(prefix, 2U);
-        Protocol::AppendInteger(prefix, schema);
-    }
-    if (paged) {
-        Protocol::AppendMapHeader(prefix, 3U);
-        Protocol::AppendBulk(prefix, "chunks");
-    }
-    Protocol::AppendArrayHeader(prefix, count);
-    return prefix;
-}
+using detail::AreaReplyPrefix;
+using detail::AreaReplyPrefixBytes;
+using detail::AreaReplySuffix;
+using detail::AreaReplySuffixBytes;
+using detail::RespUnsignedBytes;
 
 // The cells `selector` requests, at most `bound`, which is positive.
 [[nodiscard]] std::size_t AreaCellBound(const ChunkAreaSelector& selector, std::size_t bound) {
@@ -346,22 +339,6 @@ std::string AreaReplyPrefix(bool with_schema, std::uint64_t schema, bool paged, 
         if (selector.dims == 3U) count = times(count, diameter);
     }
     return count;
-}
-
-std::string AreaReplySuffix(bool paged, bool more, const ChunkCoord& coord, std::uint8_t dims) {
-    std::string suffix;
-    if (!paged) return suffix;
-    Protocol::AppendBulk(suffix, "more");
-    Protocol::AppendBoolean(suffix, more);
-    Protocol::AppendBulk(suffix, "after");
-    if (!more) Protocol::AppendNull(suffix);
-    else {
-        Protocol::AppendArrayHeader(suffix, dims);
-        Protocol::AppendInteger(suffix, coord.x);
-        Protocol::AppendInteger(suffix, coord.y);
-        if (dims == 3U) Protocol::AppendInteger(suffix, coord.z);
-    }
-    return suffix;
 }
 
 // Bound admitted wire storage independently of a lowered write quota; the
@@ -415,12 +392,9 @@ std::vector<std::size_t> ColumnsOf(const ChunkLayout& layout, const std::vector<
 
 template<class Statement>
 FeedSlotFilters SlotFilters(const std::shared_ptr<Table>& table, const Statement& statement) {
-    std::optional<FeedArea> area;
-    if constexpr (requires { statement.areas; }) {
-        for (const auto& each : statement.areas) RequireDimensions(table->geometry(), each.dims);
-    } else area = statement.area;
-    if (area) RequireDimensions(table->geometry(), area->dims);
-    FeedSlotFilters filters{.area = area, .no_before = statement.no_before, .chunks = statement.chunks};
+    for (const auto& area : statement.areas) RequireDimensions(table->geometry(), area.dims);
+    FeedSlotFilters filters{.areas = statement.areas, .no_before = statement.no_before, .chunks = statement.chunks};
+    SortFeedAreas(filters.areas);
     if (statement.columns) filters.column_ids = table->ResolveFeedColumns(*statement.columns);
     return filters;
 }
@@ -685,10 +659,7 @@ void AppendUserMap(std::string& reply, const std::string& name, const User& user
 
 // The `filters` key and map of SHOW SLOTS and catalog slot records.
 void AppendSlotFilters(std::string& reply, const FeedSlot& slot) {
-    Protocol::AppendBulk(reply, "filters"); Protocol::AppendMapHeader(reply, 5U);
-    Protocol::AppendBulk(reply, "area");
-    if (slot.filters.area) {
-        const auto& area = *slot.filters.area;
+    const auto append_area = [&](const FeedArea& area) {
         Protocol::AppendArrayHeader(reply, static_cast<std::size_t>(area.dims) * 2U);
         Protocol::AppendInteger(reply, area.first.x);
         Protocol::AppendInteger(reply, area.first.y);
@@ -696,6 +667,17 @@ void AppendSlotFilters(std::string& reply, const FeedSlot& slot) {
         Protocol::AppendInteger(reply, area.last.x);
         Protocol::AppendInteger(reply, area.last.y);
         if (area.dims == 3U) Protocol::AppendInteger(reply, area.last.z);
+    };
+    const auto& areas = slot.filters.areas;
+    Protocol::AppendBulk(reply, "filters"); Protocol::AppendMapHeader(reply, 6U);
+    // `area` is the only area, null for none or several; `areas` lists them all, null for none.
+    Protocol::AppendBulk(reply, "area");
+    if (areas.size() == 1U) append_area(areas.front());
+    else Protocol::AppendNull(reply);
+    Protocol::AppendBulk(reply, "areas");
+    if (!areas.empty()) {
+        Protocol::AppendArrayHeader(reply, areas.size());
+        for (const auto& area : areas) append_area(area);
     } else Protocol::AppendNull(reply);
     Protocol::AppendBulk(reply, "column_ids");
     if (slot.filters.column_ids) {
@@ -1648,7 +1630,7 @@ std::string CommandEngine::ExecuteStatement(
                             // A migration's slot request has no partition count.
                             if (slot.partitions) throw std::invalid_argument("MIGRATE does not take PARTITIONS; create a partitioned slot outside a migration");
                             request.kind = MigrationRequest::Kind::kCreateSlot; request.table = slot.table; request.slot = slot.name; request.if_not_exists = slot.if_not_exists;
-                            request.slot_filters = {.area = slot.area, .no_before = slot.no_before, .chunks = slot.chunks};
+                            request.slot_filters = {.areas = slot.areas, .no_before = slot.no_before, .chunks = slot.chunks};
                             request.slot_columns = slot.columns;
                             request.slot_owner = SlotOwner(slot, config_.require_auth, session.user);
                             request.slot_owner_given = slot.owner.has_value();
@@ -1752,7 +1734,7 @@ std::string CommandEngine::ExecuteStatement(
                             config_.require_auth ? session.user : std::string{}, [&](std::string_view old_user) {
                                 if (config_.require_auth && old_user != session.user && !admin_all)
                                     throw PermissionDeniedError("ADMIN on *");
-                            });
+                            }, session.remote_endpoint);
                         if (session.register_slot_watch && !session.register_slot_watch(state))
                             return Protocol::Error("BUSY", "maximum slot catch-up workers reached", {{"reason", "slot_worker_limit"}, {"table", watch.table}});
                         // A slot without an owner takes the user of its first
@@ -1825,8 +1807,10 @@ std::string CommandEngine::ExecuteStatement(
                     const auto* viewer = CurrentUser(session);
                     const bool show_owners = !config_.require_auth || (viewer != nullptr && viewer->manages_users);
                     Protocol::AppendArrayHeader(reply, slots.size());
+                    const bool show_peers = ControlAccess(session).list_all;
+                    const auto now = std::chrono::steady_clock::now();
                     for (const auto& [name, slot] : slots) {
-                        Protocol::AppendMapHeader(reply, 13);
+                        Protocol::AppendMapHeader(reply, 15);
                         Protocol::AppendBulk(reply, "table");
                         Protocol::AppendBulk(reply, name);
                         Protocol::AppendBulk(reply, "name");
@@ -1844,6 +1828,15 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendInteger(reply, slot.retained_bytes);
                         Protocol::AppendBulk(reply, "attached");
                         Protocol::AppendBoolean(reply, slot.attached);
+                        // A sole watch's client and the time since the latest ACK of any attached watch.
+                        Protocol::AppendBulk(reply, "peer");
+                        if (!slot.peer.empty() && (show_peers || slot.watch_user == session.user)) Protocol::AppendBulk(reply, slot.peer);
+                        else Protocol::AppendNull(reply);
+                        Protocol::AppendBulk(reply, "last_ack_ms");
+                        if (slot.last_ack) {
+                            Protocol::AppendInteger(reply, static_cast<std::uint64_t>(std::max<std::int64_t>(0,
+                                std::chrono::duration_cast<std::chrono::milliseconds>(now - *slot.last_ack).count())));
+                        } else Protocol::AppendNull(reply);
                         Protocol::AppendBulk(reply, "lost");
                         reply += slot.lost ? "#t\r\n" : "#f\r\n";
                         Protocol::AppendBulk(reply, "lost_reason");
@@ -2169,9 +2162,17 @@ std::string CommandEngine::ExecuteStatement(
                     std::vector<ReplyParts::Piece> rows;
                     std::size_t count = 0U;
                     std::size_t body_bytes = 0U;
-                    auto prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged, count);
-                    auto suffix = AreaReplySuffix(paged, false, {}, get.dims);
-                    if (prefix.size() > budget || suffix.size() > budget - prefix.size()) throw too_large();
+                    // The framing around the rows is measured at every cell and
+                    // built once, for the cells the page admitted.
+                    const auto schema_version = layout.schema().version;
+                    const auto prefix_bytes = [&](std::size_t cells) {
+                        return AreaReplyPrefixBytes(get.with_schema, schema_version, paged, cells);
+                    };
+                    std::size_t prefix_size = prefix_bytes(count);
+                    std::size_t suffix_size = AreaReplySuffixBytes(paged, false, {}, get.dims);
+                    ChunkCoord last_coord{};
+                    bool last_more = false;
+                    if (prefix_size > budget || suffix_size > budget - prefix_size) throw too_large();
                     // An entry that cannot fit an otherwise empty page ends a
                     // page that already admitted a cell, so the next page starts
                     // at it; as the first cell it is refused with its coordinate.
@@ -2179,12 +2180,11 @@ std::string CommandEngine::ExecuteStatement(
                     (void)store.VisitChunkArea(selector, get.after, static_cast<std::size_t>(limit),
                         [&](const ChunkCoord& coord, std::optional<ChunkRangeEntry>&& entry, bool more) {
                             const auto next_count = count + static_cast<std::size_t>(entry.has_value());
-                            auto next_prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged, next_count);
-                            auto next_suffix = AreaReplySuffix(paged, more, coord, get.dims);
-                            const auto single_prefix = AreaReplyPrefix(get.with_schema, layout.schema().version, paged,
-                                static_cast<std::size_t>(entry.has_value()));
-                            if (single_prefix.size() > budget || next_suffix.size() > budget - single_prefix.size()) throw too_large();
-                            const auto row_budget = budget - single_prefix.size() - next_suffix.size();
+                            const auto next_prefix = prefix_bytes(next_count);
+                            const auto next_suffix = AreaReplySuffixBytes(paged, more, coord, get.dims);
+                            const auto single_prefix = prefix_bytes(static_cast<std::size_t>(entry.has_value()));
+                            if (single_prefix > budget || next_suffix > budget - single_prefix) throw too_large();
+                            const auto row_budget = budget - single_prefix - next_suffix;
                             ReplyParts::Piece row;
                             std::size_t row_bytes = 0U;
                             if (entry) {
@@ -2198,22 +2198,22 @@ std::string CommandEngine::ExecuteStatement(
                                     .commit_time_ms = entry->commit_time_ms, .chunk_columns = std::move(entry->chunk_columns)};
                                 if (scaled) state = ScaleChunkState(store.geometry(), *scaled, *scale, columns, state);
                                 const auto form_size = SectionedChunkStateBytes(form_geometry, state, kVarMaxChunkBytesLimit, columns, scale);
-                                const auto bulk_overhead = 5U + std::to_string(form_size).size();
+                                const auto bulk_overhead = RespUnsignedBytes(form_size) + 2U;
                                 if (row.text.size() + bulk_overhead > row_budget ||
                                     form_size > row_budget - row.text.size() - bulk_overhead) {
                                     if (paged && !first_cell) return false;
                                     throw AreaEntryTooLargeError(coord, get.dims, budget,
-                                        single_prefix.size() + next_suffix.size() + row.text.size() + bulk_overhead + form_size);
+                                        single_prefix + next_suffix + row.text.size() + bulk_overhead + form_size);
                                 }
                                 const auto form_bound = row_budget - row.text.size();
                                 row.body = EncodeSectionedChunkState(form_geometry, state, kVarMaxChunkBytesLimit,
                                     columns, private_state, form_bound, scale);
-                                row_bytes = row.text.size() + 5U + std::to_string(row.body.size()).size() + row.body.size();
+                                row_bytes = row.text.size() + RespUnsignedBytes(row.body.size()) + 2U + row.body.size();
                                 if (row_bytes > row_budget) throw too_large();
                             }
-                            if (next_prefix.size() > budget || next_suffix.size() > budget - next_prefix.size() ||
-                                body_bytes > budget - next_prefix.size() - next_suffix.size() ||
-                                row_bytes > budget - next_prefix.size() - next_suffix.size() - body_bytes) {
+                            if (next_prefix > budget || next_suffix > budget - next_prefix ||
+                                body_bytes > budget - next_prefix - next_suffix ||
+                                row_bytes > budget - next_prefix - next_suffix - body_bytes) {
                                 if (!paged) throw too_large();
                                 return false;
                             }
@@ -2221,12 +2221,19 @@ std::string CommandEngine::ExecuteStatement(
                             body_bytes += row_bytes;
                             first_cell = false;
                             count = next_count;
-                            prefix = std::move(next_prefix);
-                            suffix = std::move(next_suffix);
+                            prefix_size = next_prefix;
+                            suffix_size = next_suffix;
+                            last_coord = coord;
+                            last_more = more;
                             return true;
                         }, true, session.transaction ? &*session.transaction->snapshot : nullptr, read);
                     if (session.transaction != nullptr) TxnRead(*session.transaction, covered);
                     if (info != nullptr) info->chunks = count;
+                    auto prefix = AreaReplyPrefix(get.with_schema, schema_version, paged, count);
+                    const auto suffix = AreaReplySuffix(paged, last_more, last_coord, get.dims);
+                    // The page was admitted by these sizes.
+                    if (prefix.size() != prefix_size || suffix.size() != suffix_size)
+                        throw std::logic_error("area reply framing differs from its measured size");
                     ReplyParts reply;
                     reply.text() = std::move(prefix);
                     for (auto& row : rows) {
@@ -2892,9 +2899,14 @@ std::string CommandEngine::ExecuteStatement(
                         if (!table.features) continue;
                         Protocol::AppendMapHeader(reply, 7U);
                         Protocol::AppendBulk(reply, "name"); Protocol::AppendBulk(reply, table.name);
-                        Protocol::AppendBulk(reply, "state"); Protocol::AppendBulk(reply, table.fence ? "fenced" : "ok");
+                        // A frozen table is fenced too; its slots' durable frontier stopped with it.
+                        const bool frozen = table.frontier_frozen && table.fence;
+                        Protocol::AppendBulk(reply, "state");
+                        Protocol::AppendBulk(reply, frozen ? "frozen" : table.fence ? "fenced" : "ok");
                         Protocol::AppendBulk(reply, "reason");
-                        if (table.fence) Protocol::AppendBulk(reply, *table.fence); else Protocol::AppendNull(reply);
+                        if (frozen) Protocol::AppendBulk(reply, "its slots' durable frontier stopped because " + *table.fence);
+                        else if (table.fence) Protocol::AppendBulk(reply, *table.fence);
+                        else Protocol::AppendNull(reply);
                         flags(*table.features);
                     }
                     Protocol::AppendBulk(reply, "fenced"); Protocol::AppendArrayHeader(reply, status.tables.size() - readable);

@@ -22,7 +22,7 @@ bool Charge(std::atomic<std::size_t>& counter, std::size_t bytes, std::size_t li
 }  // namespace
 std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     std::string name, FeedOptions options, bool takeover, std::string user,
-    const std::function<void(std::string_view)>& authorize_owner) {
+    const std::function<void(std::string_view)>& authorize_owner, std::string peer) {
     if (options.areas.size() > kMaxFeedAreas) throw std::invalid_argument("a watch takes at most 64 areas");
     for (const auto& area : options.areas) {
         if (area.first.x > area.last.x || area.first.y > area.last.y)
@@ -36,9 +36,8 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
     if (options.ack_timeout_ms && *options.ack_timeout_ms == 0U)
         throw std::invalid_argument("ACK TIMEOUT must be positive");
     if (options.buffer_bytes && *options.buffer_bytes == 0U) throw std::invalid_argument("feed buffer must be positive");
-    auto [slot, claim] = table->ClaimFeedSlot(name, options, takeover, std::move(user), authorize_owner);
-    options.areas.clear();
-    if (slot.filters.area) options.areas.push_back(*slot.filters.area);
+    auto [slot, claim] = table->ClaimFeedSlot(name, options, takeover, std::move(user), authorize_owner, std::move(peer));
+    options.areas = slot.filters.areas;
     options.column_ids = slot.filters.column_ids;
     options.no_before = slot.filters.no_before; options.chunks = slot.filters.chunks;
     if (options.after && table->lineage() && options.after->epoch == table->lineage()->parent_epoch &&
@@ -51,8 +50,8 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
         : slot.resync;
     if (options.after && !resync) start.revision = std::max(start.revision, options.after->revision);
     auto floors = FeedSlotPartitionFloors(slot, claim->partitions);
-    auto result = std::shared_ptr<SlotWatch>(new SlotWatch(std::move(table), std::move(claim), start, std::move(options), resync));
-    result->partition_floors_ = std::move(floors);
+    auto result = std::shared_ptr<SlotWatch>(new SlotWatch(std::move(table), std::move(claim), start,
+        std::move(options), resync, std::move(floors)));
     result->slot_owner_ = slot.owner;
     result->acknowledged_ = slot.position.revision;
     result->written_ = slot.position.revision;
@@ -80,8 +79,9 @@ void SlotWatch::BindOwner(const std::string& user) {
     slot_owner_ = user;
 }
 SlotWatch::SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim> claim,
-    FeedPosition start, FeedOptions options, bool resync)
+    FeedPosition start, FeedOptions options, bool resync, std::vector<std::uint64_t> partition_floors)
     : table_(std::move(table)), claim_(std::move(claim)), generation_(claim_), table_bytes_(claim_->output_bytes), pool_(claim_->excess), start_(start), options_(std::move(options)),
+      partition_floors_(std::move(partition_floors)),
       quota_(budget()), sent_(start.revision), acknowledged_(start.revision), written_(start.revision), resync_(resync), cursor_(start), next_progress_(std::chrono::steady_clock::now() + options_.progress_interval) {}
 SlotWatch::~SlotWatch() {
     (void)LeaveExcessQueue();
@@ -149,13 +149,16 @@ SlotWatch::AckResult SlotWatch::Ack(std::uint64_t revision) {
     std::lock_guard lock(mutex_);
     if (takeover_ || ack_expired_ || (finished_ && !cancelled_ && !unwatch_)) return AckResult::kTerminal;
     if (finished_ || cancelled_ || unwatch_) throw std::invalid_argument("slot watch has ended");
-    if (AckDeadlineExpiredLocked(std::chrono::steady_clock::now())) return AckResult::kTerminal;
+    const auto now = std::chrono::steady_clock::now();
+    if (AckDeadlineExpiredLocked(now)) return AckResult::kTerminal;
     if (revision > sent_ || revision < acknowledged_) throw std::invalid_argument("ACK decreases or exceeds the last revision sent");
     for (const auto& receipt : receipts_) {
         if (receipt.revision > revision) break;
         if (!receipt.sent) throw std::logic_error("ACK crossed an unsent mutation receipt");
     }
     acknowledged_ = revision;
+    // Finish resets claim_ outside mutex_; generation_ stays.
+    if (const auto claim = generation_.lock()) claim->last_ack.store(now.time_since_epoch().count(), std::memory_order_release);
     while (!receipts_.empty() && receipts_.front().revision <= revision) {
         receipts_.pop_front();
         table_bytes_->fetch_sub(kReceiptBytes, std::memory_order_acq_rel);
@@ -209,6 +212,9 @@ void SlotWatch::Finish(std::optional<Output> control) {
     // Archive/subscription destruction can enter table control; never do it
     // on the socket thread or while holding its queue lock.
     pending_.reset();
+    projected_ = false;
+    merge_.Clear();
+    merged_.reset();
     prepared_.reset();
     (void)LeaveExcessQueue();  // Finish wakes the worker for the next waiter.
     archive_.reset();
@@ -259,17 +265,16 @@ void SlotWatch::Build(Prepared& prepared) const {
     else if (mutation && (options_.column_ids || prepared.schema != original->schema_version))
         columns = table_->geometry().LayoutAt(original->schema_version).schema().columns;
     if (prepared.filtered && mutation) {
-        // The archive reader kept only what this watch sends; a change that
-        // keeps nothing is not sent.
+        // The archive reader or CHUNKS projection already selected the items.
         const bool kept = !original->blocks.empty() || !original->chunk_changes.empty() || !original->chunk_forms.empty();
         prepared.entry = kept ? original : nullptr;
     } else {
-        prepared.entry = options_.chunks && mutation
-            ? ChunkFeedEntry(original, table_->geometry(), options_.areas, options_.column_ids)
-            : FilterFeedEntry(original, options_.areas, options_.column_ids, options_.no_before, columns);
+        const auto selected = mutation ? PartitionFeedEntry(original, partition_floors_) : original;
+        if (!selected) prepared.entry.reset();
+        else if (options_.chunks && mutation)
+            prepared.entry = ChunkFeedEntry(selected, table_->geometry(), options_.areas, options_.column_ids);
+        else prepared.entry = FilterFeedEntry(selected, options_.areas, options_.column_ids, options_.no_before, columns);
     }
-    // A partitioned slot's watch sends the chunks of its partitions.
-    if (mutation && !partition_floors_.empty()) prepared.entry = PartitionFeedEntry(prepared.entry, partition_floors_);
     prepared.built = true;
     const auto& entry = prepared.entry;
     prepared.send = entry != nullptr;
@@ -363,7 +368,7 @@ SlotWatch::Admission SlotWatch::Admit(Prepared& prepared, bool& left_head) {
 }
 bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original, bool filtered) {
     { std::lock_guard lock(mutex_); if (!output_.empty()) return false; }
-    if (!prepared_ || prepared_->original != original || prepared_->schema != schema_) {
+    if (!prepared_ || prepared_->original != original || prepared_->schema != schema_ || prepared_->filtered != filtered) {
         // A different entry gives up this watch's place in the pool queue.
         if (LeaveExcessQueue() && options_.notify) options_.notify();
         prepared_.emplace();
@@ -399,6 +404,8 @@ bool SlotWatch::Publish(const std::shared_ptr<const FeedEntry>& original, bool f
     return true;
 }
 bool SlotWatch::Progress(const FeedSlot& slot) {
+    // The cursor has passed the merged pushes; no progress before their frame.
+    if (Merging()) return FlushMerge();
     const auto now = std::chrono::steady_clock::now();
     if (now < next_progress_) return false;
     next_progress_ = now + options_.progress_interval;
@@ -470,7 +477,8 @@ bool SlotWatch::Work() {
             archive_.emplace(table_->ReadClaimedFeedArchive(claim_, cursor_));
             // The reader keeps only what this watch sends, so its budget
             // counts the frames this watch sends.
-            if (Filtered()) archive_->Filter({SlotArea(), options_.column_ids, options_.no_before, options_.chunks});
+            if (Filtered())
+                archive_->Filter({options_.areas, options_.column_ids, options_.no_before, options_.chunks}, partition_floors_);
             changed = true;
         }
         if (!pending_) {
@@ -479,12 +487,7 @@ bool SlotWatch::Work() {
             archive_->SetEntryBudget(budget());
             pending_ = archive_->Next();
         }
-        if (pending_) {
-            if (!Publish(pending_, Filtered())) return changed;
-            cursor_ = pending_->position;
-            pending_.reset();
-            return true;
-        }
+        if (pending_) return Deliver(Filtered()) || changed;
         cursor_ = archive_->through();
         archive_.reset();
         joined_ = cursor_.revision >= join_;
@@ -499,11 +502,50 @@ bool SlotWatch::Work() {
         pending_.reset();
         return true;
     }
-    if (pending_->position.revision <= cursor_.revision) { pending_.reset(); return true; }
-    if (pending_->position.revision > slot.durable_watermark) return changed;
-    if (!Publish(pending_)) return changed;
-    cursor_ = pending_->position;
-    pending_.reset();
+    if (pending_->position.revision <= cursor_.revision) { pending_.reset(); projected_ = false; return true; }
+    if (pending_->position.revision > slot.durable_watermark) {
+        // Merged pushes below the durable frontier need not wait for it.
+        const bool flushed = Merging() && FlushMerge();
+        return flushed || changed;
+    }
+    return Deliver(false) || changed;
+}
+bool SlotWatch::Deliver(bool filtered) {
+    // Partitioned slots deliver each change under its own revision.
+    const bool coalesce = options_.chunks && partition_floors_.empty();
+    const bool mutation = pending_->kind == FeedEntry::Kind::kChange || pending_->kind == FeedEntry::Kind::kChunks;
+    if (coalesce && mutation && !filtered && !projected_) {
+        // Projected once, so a waiting push keeps its built frame and its place in the pool queue.
+        auto projected = ChunkFeedEntry(pending_, table_->geometry(), options_.areas, options_.column_ids);
+        if (!projected) { cursor_ = pending_->position; pending_.reset(); return true; }
+        pending_ = std::move(projected);
+        projected_ = true;
+    }
+    // While earlier output is unsent, chunks pushes merge.
+    if (coalesce && pending_->kind == FeedEntry::Kind::kChunks && (Merging() || Lagging())) {
+        std::size_t quota;
+        { std::lock_guard lock(mutex_); quota = quota_; }
+        if (!merged_ && merge_.Add(pending_, quota)) {
+            cursor_ = pending_->position; pending_.reset(); projected_ = false;
+            return true;
+        }
+        // Another schema version or a full merge waits for the merged frame.
+        // An empty merge cannot take a push above the share; it is published alone.
+        if (Merging()) return FlushMerge();
+    }
+    if (!FlushMerge()) return false;
+    if (!Publish(pending_, filtered || projected_)) return false;
+    cursor_ = pending_->position; pending_.reset(); projected_ = false;
+    return true;
+}
+bool SlotWatch::FlushMerge() {
+    if (!merged_) {
+        if (merge_.empty()) return true;
+        if (Lagging()) return false;
+        merged_ = merge_.Take();
+    }
+    if (!Publish(merged_, true)) return false;
+    merged_.reset();
     return true;
 }
 bool SlotWatch::WorkStep() {

@@ -18,12 +18,15 @@ inline constexpr std::uint32_t kMaxFeedSlotPartitions = 256U;
 
 // Stable IDs survive column renames and determine projection identity.
 struct FeedSlotFilters {
-    std::optional<FeedArea> area{};
+    // Empty for the whole table; a slot keeps a chunk inside any of them. A
+    // slot records them in order, without repeats (SortFeedAreas), at most
+    // kMaxFeedAreas.
+    std::vector<FeedArea> areas{};
     std::optional<std::vector<std::uint32_t>> column_ids{};
     bool no_before = false;
     bool chunks = false;
     friend bool operator==(const FeedSlotFilters&, const FeedSlotFilters&) = default;
-    [[nodiscard]] bool empty() const noexcept { return !area && !column_ids && !no_before && !chunks; }
+    [[nodiscard]] bool empty() const noexcept { return areas.empty() && !column_ids && !no_before && !chunks; }
 };
 
 // One partition of a partitioned slot (docs/design/SLOT_PARTITIONS.md).
@@ -51,6 +54,11 @@ struct FeedSlot {
     bool resync = false;
     // Filled by a table listing: a watch holds the slot.
     bool attached = false;
+    // A sole attached watch's user and client address, empty when unknown.
+    std::string watch_user{};
+    std::string peer{};
+    // Most recent accepted ACK among the attached watches (if any).
+    std::optional<std::chrono::steady_clock::time_point> last_ack{};
     // Empty for a slot without partitions; otherwise one per partition, and
     // `position` and `resync` are the lowest of them and any of them.
     std::vector<FeedSlotPartition> partitions{};
@@ -114,9 +122,9 @@ class FeedArchiveReader {
     struct Impl;
     explicit FeedArchiveReader(std::unique_ptr<Impl> impl);
     void EnableChunkForms(std::size_t budget);
-    // Keeps of each change only what a slot watch with `filters` sends,
+    // Keeps of each change only what a slot watch with these filters and partition floors sends,
     // before the budget counts it; Next then returns the frames it sends.
-    void Filter(const FeedSlotFilters& filters);
+    void Filter(const FeedSlotFilters& filters, const std::vector<std::uint64_t>& partition_floors = {});
     // Applies to the changes read after it.
     void SetEntryBudget(std::size_t budget);
     std::unique_ptr<Impl> impl_;

@@ -30,11 +30,13 @@ void CrashAtFailpoint(const char* key) {
 
 FeedSlotFilters MigrationSlotFilters(const MigrationRequest& request, const Geometry& geometry) {
     auto filters = request.slot_filters;
-    if (filters.area && filters.area->dims != geometry.dims())
-        throw std::invalid_argument("coordinate dimensions differ from the table: the table has " +
-                                    std::to_string(geometry.dims()) + " and the slot area " +
-                                    std::to_string(filters.area->dims) +
-                                    "; give one coordinate per table dimension (DESCRIBE shows dims)");
+    for (const auto& area : filters.areas)
+        if (area.dims != geometry.dims())
+            throw std::invalid_argument("coordinate dimensions differ from the table: the table has " +
+                                        std::to_string(geometry.dims()) + " and the slot area " +
+                                        std::to_string(area.dims) +
+                                        "; give one coordinate per table dimension (DESCRIBE shows dims)");
+    SortFeedAreas(filters.areas);
     const auto& schema = geometry.layout().schema();
     if (request.slot_columns) {
         filters.column_ids.emplace();
@@ -391,8 +393,10 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     const auto filters = MigrationSlotFilters(request, store->geometry());
                     // Validate every field before syncing a baseline or preparing publication.
                     if (request.slot_owner) RequireValidFeedSlotOwner(*request.slot_owner);
+                    FeedSlotRecord created{request.slot, 0U, false, filters, false, request.slot_owner};
                     (void)SerializeFeedSlotRecords(FeedSlotRecords{.epoch = journal.table_id, .durable_watermark = 0U,
-                        .slots = {{request.slot, 0U, false, filters, false, request.slot_owner}}, .dims = dims});
+                        .slots = {created}, .dims = dims});
+                    RequireFeedSlotRoom(slots, created);
                     RequireFeature(store->features(), *FindFeature("feed_slots"));
                     if (!filters.empty()) RequireFeature(store->features(), *FindFeature("slot_filters"));
                     table->PrepareFeedSlotBaseline(*store);
@@ -400,7 +404,8 @@ bool TableCatalog::Migrate(const MigrationRequest& request, UserRegistry* users)
                     store->feed_slots_->Sync(completed);
                     slots = ReadFeedSlotRecords(table->dir_, journal.table_id, dims).value_or(
                         FeedSlotRecords{.epoch = journal.table_id, .durable_watermark = completed, .slots = {}, .dims = dims});
-                    slots.slots.push_back({request.slot, completed, false, filters, false, request.slot_owner});
+                    created.written = completed;
+                    slots.slots.push_back(std::move(created));
                     slots.filter_format = slots.filter_format || !filters.empty();
                     // The unchanged manifest image binds redo to the participant
                     // identity; slot creation must not enable missing bits.

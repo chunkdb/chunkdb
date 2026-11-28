@@ -139,7 +139,7 @@ Inactive z side lengths are 1, and inactive coordinates are zero.
 A complete empty `chunkdb.index` is durable before publishing the manifest or catalog name; a missing inventory is damage.
 Publication syncs a temporary file, uses no-replace rename or an exclusive hard link, and syncs the directory; replacements sync the new file and directory too.
 
-Schema/options changes and feed-feature activation replace the manifest atomically.
+Schema and option changes and feature activation replace the manifest atomically.
 Incorrect magic/version, reserved fields, sizes, checksum, geometry, identity, or schema refuse opening.
 
 Options use the same TLV layout as the root manifest:
@@ -157,7 +157,7 @@ Options use the same TLV layout as the root manifest:
 | 10 | immediate restore parent epoch, 16 nonzero bytes | absent |
 | 11 | completed fork revision `u64`, including zero | absent |
 
-Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is retired and is not a known option.
+Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is not a known option.
 
 Types 10 and 11 belong to incompatibility feature `table_lineage` (`0x4`) and must appear together.
 The parent epoch differs from the table's current epoch; the fork revision preserves its exact unsigned value.
@@ -213,7 +213,6 @@ A step is `change_count:u32` (1–2048), then each change's `kind:u8` (1 add, 2 
 Kind 5 is an other-domain marker containing only its kind byte.
 Kinds 7 (add check) and 8 (drop check), block columns only, have `position:u32`, the index in the check list, and an encoded check instead of a column.
 A check is `name_length:u8`, a name under the column-name rule, `expression_length:u32` (at most 16384) and the condition's UTF-8 text.
-Builds without CHECK constraints refuse a schema area with these kinds or the tags 3 and 4 below.
 Both domains have the same revision; at every step exactly one domain changes columns and the other records that marker.
 
 The column is the added/dropped column or the post-rename/post-conversion column; position identifies its slot in the applicable column list.
@@ -505,20 +504,27 @@ Details are in [artifact I/O](design/COMMIT_OWNER_ARTIFACT_IO.md).
 
 1. `CKSL`, format tag `4:u16`, dimensions `u8`, header flags `u8`, table epoch (16 bytes).
 2. Durable watermark `u64`, slot count `u32` (at most 1024).
-3. Per slot: name length `u8`, slot flags `u8`, projection count `u16`, written revision `u64`, name bytes, then the parts its flags select: area coordinates (`i64` each), projection IDs (`u32` each), and owner length `u8` with owner bytes; with header flag `0x4`, last the partition count `u16` and, for a count of 2 or more, per partition its position `u64` and flags `u8`.
+3. Per slot, in order:
+   - Name length `u8` (1 to 63), slot flags `u8`, projection count `u16` (0 to 1024), written revision `u64`, and name bytes.
+   - If the slot's area flag is set, area count `u8` (1 to 64) when header flag `0x2` is set, followed by the areas (one area when the count is omitted), with each coordinate an `i64`.
+   - Projection IDs (`u32` each), using the count in the slot prefix.
+   - If the slot's owner flag is set, owner length `u8` (1 to 63) and owner bytes.
+   - If header flag `0x4` is set, partition count `u16` (1 to 256), followed for counts of 2 or more by each partition's position `u64` and flags `u8`, in partition number order.
 4. CRC32 over all preceding bytes.
 
 Slot flags are `0x1` lost, `0x2` area, `0x4` projection, `0x8` NO BEFORE, `0x10` CHUNKS, `0x20` lost by a dropped projected column, `0x40` owner, and `0x80` resync, set by a restore or SWAP TABLES and never with `0x1`; the projection count is nonzero exactly with `0x4`.
 Header flag `0x1` is the filter format; it permits the filter flags `0x2` through `0x20`, requires `slot_filters`, and stays set once written.
+Header flag `0x2` requires `0x1`; a writer sets it only when a slot has several areas.
 Header flag `0x4` is the partition format; it requires `slot_partitions` and stays set once written.
-A partition count is 1 (no positions follow) through 256; partition flag `0x1` is resync and the other bits are zero.
+With both flags set, the area count stays with the area section and the partition section still follows the owner at the end of every slot.
+A partition count of 1 stores no positions in the partition section; partition flag `0x1` is resync and the other bits are zero.
 CREATE SLOT refuses, with OUT_OF_RANGE, a slot that would take the file past 1024 slots or 1 MiB.
 A partitioned slot's written revision is the lowest partition position and its resync flag is set exactly when a partition's is; every position is at or below the watermark.
 Chunk `(x, y, z)` (z is 0 in a two-dimensional table) is in partition `h % count`, where `h = m(m(m(x) ^ y) ^ z)` over the coordinates as `u64`, and `m(v)` is the SplitMix64 step: `v += 0x9e3779b97f4a7c15`, `v = (v ^ (v >> 30)) * 0xbf58476d1ce4e5b9`, `v = (v ^ (v >> 27)) * 0x94d049bb133111eb`, `v ^ (v >> 31)`, modulo 2^64.
 The owner flag needs no header flag or feature bit.
 The dimensions byte is 2 or 3 and must match the owning table.
-AREA stores the first active signed coordinates followed by the last active coordinates (x, y and, in a three-dimensional table, z); endpoints must be ordered.
-Other format tags are refused; a writer writes only tag 4.
+Each area stores the first active signed coordinates followed by the last active coordinates (x, y and, in a three-dimensional table, z); endpoints must be ordered, and a slot's areas are distinct and ordered by their first and then their last coordinates, x before y before z.
+Readers refuse other format tags and any header flags they do not recognize. Writers use tag 4.
 
 Names are unique, 1–63 bytes matching `[a-z_][a-z0-9_]*`; every written revision is at or below the watermark, and epoch matches the table StoreId.
 Owners are user names with the same rule; a slot without an owner records the user of its first granted attach without ADMIN on `*`.

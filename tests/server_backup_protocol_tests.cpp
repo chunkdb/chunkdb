@@ -237,20 +237,24 @@ void TargetPolicy(bool tls) {
     const auto error = disabled.Execute(session, Backup("disabled"));
     assert(error.starts_with("-ERR INVALID_ARGUMENT") && error.find("--backup-dir") != std::string::npos);
 }
-void DroppedBetweenListingAndPin(bool tls) {
+// DROP TABLE sent while a backup lists and pins its tables waits for it: the
+// backup holds the table, and the drop then removes it.
+void DropDuringListingAndPin(bool tls) {
     CopyPause pause(BackupTestHook::Point::kBeforeTablePin);
     test::ScopedTempDir destinations("chunkdb-backup-dropped-protocol");
     Harness harness(tls, false, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
     auto writer = harness.Connect(); writer->Ok("CREATE TABLE a (n u8) CHUNK 2 x 2");
     auto backup = harness.Connect(); harness.catalog->SetBackupHookForTests(&pause);
     backup->Line(Backup("snapshot")); pause.Wait();
-    writer->Ok("DROP TABLE a"); pause.Release();
+    writer->Line("DROP TABLE a"); pause.Release();
     const auto response = backup->Read(); harness.catalog->SetBackupHookForTests(nullptr);
+    const auto dropped = writer->Read();
+    assert(dropped.type == '+' && dropped.value == "OK");
+    assert(harness.catalog->Find("a") == nullptr);
     const auto record = ReadBackupRecord(destinations.path() / "snapshot");
-    assert(Number(Field(response, "tables")) == 1U && record.tables.size() == 1U);
-    const auto& cuts = Field(response, "cuts"); assert(cuts.items.size() == 1U);
-    assert(Field(cuts.items[0], "table").value == "default" && record.tables[0].name == "default");
-    assert(!std::filesystem::exists(destinations.path() / "snapshot/tables/a"));
+    assert(Number(Field(response, "tables")) == 2U && record.tables.size() == 2U);
+    assert(Field(response, "cuts").items.size() == 2U);
+    assert(std::filesystem::exists(destinations.path() / "snapshot/tables/a"));
     Verify(destinations.path() / "snapshot");
 }
 std::string Quoted(const std::string& text) {
@@ -525,7 +529,7 @@ int main() {
 #ifndef CHUNKDB_WITH_OPENSSL
         if (tls) continue;
 #endif
-        CopyAndResync(tls); Rights(tls); Disconnect(tls); Shutdown(tls); TargetPolicy(tls); DroppedBetweenListingAndPin(tls);
+        CopyAndResync(tls); Rights(tls); Disconnect(tls); Shutdown(tls); TargetPolicy(tls); DropDuringListingAndPin(tls);
         if (!tls) Disconnect(false, false, true);
 #ifdef CHUNKDB_WITH_OPENSSL
         if (tls) Disconnect(true, true);

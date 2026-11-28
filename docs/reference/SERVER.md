@@ -1,6 +1,6 @@
-# PING, FLUSH WAL, SHOW METRICS, BACKUP TO, RESTORE TABLE, RELOAD TLS
+# PING, FLUSH WAL, SHOW METRICS, BACKUP TO, RESTORE TABLE, RELOAD TLS, SHOW CONNECTIONS, CANCEL, KILL CONNECTION
 
-You check connectivity, make earlier writes durable, inspect metrics, copy the running server, restore one table from a backup, or load a renewed TLS certificate.
+You check connectivity, make earlier writes durable, inspect metrics, copy the running server, restore one table from a backup, load a renewed TLS certificate, or list, cancel and close connections.
 
 ## Examples
 
@@ -52,7 +52,8 @@ KILL CONNECTION id
 - PING: `PONG`.
 - FLUSH WAL: `OK` after every write acknowledged before its arrival is durable.
 - SHOW METRICS: Prometheus text, obtained through an authenticated connection with MONITOR or ADMIN on all tables; [chunkdb_exporter](../EXPORTER.md) serves it to Prometheus over HTTP.
-- In SHOW METRICS, the table storage metrics have one sample per table with a `table` label: `chunkdb_open_wal_streams`, `chunkdb_wal_*`, `chunkdb_evictions_total`, `chunkdb_eviction_*`, `chunkdb_checkpoints_total`, `chunkdb_background_*`, `chunkdb_compressed_checkpoint_images_total`, `chunkdb_empty_chunk_gcs_total`, `chunkdb_unique_loaded_chunks_total` and `chunkdb_txn_history_*`; the other metrics are server-wide and have no `table` label. SHOW METRICS does not wait for a table that is not serving at that moment: one that an exclusive statement such as ALTER TABLE holds or waits for, one whose change feed cleanup failed until RECOVER TABLE, or one being dropped has no samples in that reply.
+- In SHOW METRICS, the table metrics have one sample per table with a `table` label: `chunkdb_open_wal_streams`, `chunkdb_wal_*`, `chunkdb_evictions_total`, `chunkdb_eviction_*`, `chunkdb_checkpoints_total`, `chunkdb_background_*`, `chunkdb_compressed_checkpoint_images_total`, `chunkdb_empty_chunk_gcs_total`, `chunkdb_unique_loaded_chunks_total`, `chunkdb_txn_history_*`, `chunkdb_table_fenced` and `chunkdb_slot_frontier_frozen`; the other metrics are server-wide and have no `table` label. SHOW METRICS does not wait for a table that is not serving at that moment: one that an exclusive statement such as ALTER TABLE holds or waits for, one whose change feed cleanup failed until RECOVER TABLE, or one being dropped has only its `chunkdb_table_fenced` sample in that reply.
+- `chunkdb_table_fenced` is 1 for each table that SHOW STATUS reports fenced or frozen, also one out of service, and 0 for each other table. `chunkdb_slot_frontier_frozen` is 1 for each table that SHOW STATUS reports frozen, one with a slot that is not lost whose store failed closed after a durability failure: slot passes stop and the slots' durable `revision` stays until RECOVER TABLE or a restart; it is 0 for each other table that is serving. The [metric names](../EXPORTER.md#metrics) are fixed for 2.x.
 - BACKUP: table count, inventoried files and bytes, and per-table epoch/revision cuts.
 - RESTORE TABLE: the new `table`, its `epoch`, its `parent_epoch` and `fork_revision` (the backed-up epoch and cut), and the `files` and `bytes` copied.
 - RELOAD TLS: `OK` once connections that start from then on use the certificate and key read again from the `--tls-cert` and `--tls-key` files.

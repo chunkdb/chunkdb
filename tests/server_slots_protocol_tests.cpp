@@ -2,6 +2,7 @@
 #include <condition_variable>
 #include <iostream>
 #include <limits>
+#include <functional>
 #include <future>
 #include <map>
 
@@ -38,6 +39,8 @@ struct SlotAckDeadlineTestAccess {
     }
     static void Hook(SlotWatch& watch, FeedDeliveryTestHook* hook) { watch.hook_.store(hook, std::memory_order_release); }
     static std::uint64_t Acked(const SlotWatch& watch) { std::lock_guard lock(watch.mutex_); return watch.acknowledged_; }
+    // Worker-only: read it between WorkStep calls on the worker's thread.
+    static std::uint64_t Cursor(const SlotWatch& watch) { return watch.cursor_.revision; }
 };
 struct AckDeadlineIoTestAccess {
     static void PendingClose(ChunkServer& server, const std::shared_ptr<SlotWatch>& state, bool partial, bool tls_retry) {
@@ -84,6 +87,51 @@ struct AckDeadlineIoTestAccess {
         io.ReleaseOutput(watch, holder); // As the close path does.
         assert(SlotAckDeadlineTestAccess::Excess(*holder) == 0U);
         assert(SlotAckDeadlineTestAccess::Publish(*waiter, entry));
+    }
+    // An ordinary CHUNKS watch whose socket has not taken its output merges
+    // the next pushes into one frame. `write(value, x)` commits
+    // `SET BLOCK x 0 IN t n = value` and returns its revision.
+    static void LaggingChunks(ChunkServer& server, Table& table, const std::function<std::uint64_t(unsigned, int)>& write) {
+        constexpr std::size_t share = 1024U * 1024U;
+        FeedIo io(server);
+        FeedIo::Watch watch;
+        watch.connection = std::make_shared<ServerConnection>();
+        watch.connection->session.watch = table.SubscribeFeed({.chunks = true});
+        watch.next_progress = std::chrono::steady_clock::now() + std::chrono::hours(1);
+        auto reference = table.SubscribeFeed({.chunks = true});
+        const auto pull_until = [&](const auto& done) {
+            const auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds(10);
+            for (;;) {
+                io.Pull(watch, share);
+                if (done()) return;
+                if (std::chrono::steady_clock::now() > deadline) throw std::runtime_error("the CHUNKS watch did not pull its pushes");
+                std::this_thread::sleep_for(std::chrono::milliseconds(1));
+            }
+        };
+        const auto first = write(1U, 0);
+        pull_until([&] { return !watch.output.empty(); });
+        const auto first_entry = feed_test::Next(*reference);
+        assert(first_entry->position.revision == first && watch.output.size() == 1U);
+        assert(*watch.output.front().bytes == *first_entry->protocol_frame);
+        // The socket has not taken that frame: two pushes of chunk (0,0) and one of (1,0) merge.
+        const auto a = write(2U, 0), b = write(3U, 4), last = write(4U, 1);
+        pull_until([&] { return watch.connection->session.watch->position().revision == last; });
+        assert(watch.output.size() == 1U && !watch.merge.empty() && !watch.held);
+        const auto at_a = feed_test::Next(*reference), at_b = feed_test::Next(*reference), at_last = feed_test::Next(*reference);
+        assert(at_a->position.revision == a && at_b->position.revision == b && at_last->position.revision == last);
+        FeedEntry expected = *at_a;
+        expected.position = at_last->position; expected.commit_time_ms = at_last->commit_time_ms; expected.user = at_last->user;
+        expected.chunk_forms = {at_last->chunk_forms.at(0), at_b->chunk_forms.at(0)};
+        io.Advance(watch, watch.bytes); // The socket took the first frame.
+        io.Pull(watch, share);
+        assert(watch.output.size() == 1U && watch.merge.empty());
+        assert(*watch.output.front().bytes == EncodeFeedEntry(expected));
+        // A watch whose socket keeps up receives each push.
+        io.Advance(watch, watch.bytes);
+        const auto next = write(5U, 0);
+        pull_until([&] { return !watch.output.empty(); });
+        const auto own = feed_test::Next(*reference);
+        assert(own->position.revision == next && watch.output.size() == 1U && *watch.output.front().bytes == *own->protocol_frame);
     }
 #ifdef CHUNKDB_WITH_OPENSSL
     // A server TLS session whose peer is a memory pipe smaller than one record,
@@ -528,6 +576,17 @@ void TakeoverRights(bool tls) {
     Client old(harness.port, tls); old.Login("one", "pw");
     (void)Start(old.Command("WATCH t SLOT 'consumer'"));
     Client other(harness.port, tls); other.Login("two", "pw");
+    // SHOW SLOTS names the watch's client to its user and to ADMIN on *, as SHOW CONNECTIONS does.
+    const auto peer = [](Client& viewer) {
+        const auto listed = viewer.Command("SHOW SLOTS ON t");
+        return Field(Slot(listed, "t", "consumer"), "peer");
+    };
+    const auto old_peer = "[127.0.0.1]:" + std::to_string(old.LocalPort());
+    assert(peer(other).type == '_' && peer(*admin).value == old_peer);
+    {
+        Client mine(harness.port, tls); mine.Login("one", "pw");
+        assert(peer(mine).value == old_peer);
+    }
     Error(other.Command("WATCH t SLOT 'consumer' TAKEOVER"), "PERMISSION_DENIED");
     admin->Ok("GRANT ADMIN ON t TO two"); // Table ADMIN is deliberately insufficient.
     Error(other.Command("WATCH t SLOT 'consumer' TAKEOVER"), "PERMISSION_DENIED");
@@ -548,9 +607,12 @@ void Lifecycle(bool tls) {
     const auto initial = Start(watch->Command("WATCH t SLOT 'consumer'"));
     auto listed = writer->Command("SHOW SLOTS ON t");
     const auto& slot = Slot(listed, "t", "consumer");
-    assert(slot.items.size() == 26U && Field(slot, "epoch").value == initial.first); // 13 keys, partitions included.
+    assert(slot.items.size() == 30U && Field(slot, "epoch").value == initial.first);
     assert(Number(Field(slot, "acked")) == initial.second && !Boolean(Field(slot, "lost")));
     assert(Boolean(Field(slot, "attached")));
+    // The watch's client, which has acknowledged nothing yet.
+    assert(Field(slot, "peer").type == '$' && Field(slot, "peer").value == "[127.0.0.1]:" + std::to_string(watch->LocalPort()));
+    assert(Field(slot, "last_ack_ms").type == '_');
     assert(Number(Field(slot, "lag_revisions")) == Number(Field(slot, "revision")) - initial.second);
     auto second = harness.Connect();
     Error(second->Command("WATCH t SLOT 'consumer'"), "SLOT_BUSY");
@@ -562,10 +624,18 @@ void Lifecycle(bool tls) {
     assert(Change(NextChange(*watch)) == next); // Invalid ACK does not close the stream.
     watch->Line("ACK " + std::to_string(next));
     WaitAck(*writer, "t", "consumer", next); // No subsequent traffic on the watch.
+    const auto acked_list = writer->Command("SHOW SLOTS ON t");
+    const auto& acked = Slot(acked_list, "t", "consumer");
+    assert(Field(acked, "last_ack_ms").type == ':' && Number(Field(acked, "last_ack_ms")) < 60'000U);
     assert(!watch->Ready(150ms)); // Successful ACK has no reply.
     watch->Send("UNWATCH\r\nPING\r\n");
     const auto unwatch = watch->Read(); assert(unwatch.type == '+' && unwatch.value == "OK");
     const auto pong = watch->Read(); assert(pong.type == '+' && pong.value == "PONG");
+    // Without a watch the slot has neither.
+    const auto detached_list = writer->Command("SHOW SLOTS ON t");
+    const auto& detached = Slot(detached_list, "t", "consumer");
+    assert(!Boolean(Field(detached, "attached")) && Field(detached, "peer").type == '_' &&
+        Field(detached, "last_ack_ms").type == '_');
     assert(Start(second->Command("WATCH t SLOT 'consumer'")) == std::make_pair(initial.first, next));
     const auto third = Set(*writer, 9);
     assert(Change(NextChange(*second)) == third);
@@ -1393,6 +1463,67 @@ void ChunkForms(bool tls) {
     assert(NextChunks(*slot) == partial && NextChunks(*slot) == removed); Unwatch(*slot);
 }
 
+struct SlotCloseObserver final : FeedDeliveryTestHook {
+    std::mutex mutex;
+    std::condition_variable changed;
+    bool closed = false;
+    std::size_t finished = 0U;
+    void Run(Point point, std::size_t) override {
+        if (point != Point::kAfterSlotSocketClose && point != Point::kAfterSlotFinish) return;
+        {
+            std::lock_guard lock(mutex);
+            if (point == Point::kAfterSlotSocketClose) closed = true;
+            else ++finished;
+        }
+        changed.notify_all();
+    }
+    void WaitClosed(std::size_t expected_finishes) {
+        test::FeedPhaseWatchdog::Phase("disconnected slot socket close and claim release");
+        std::unique_lock lock(mutex);
+        if (!changed.wait_for(lock, 10s, [&] { return closed && finished >= expected_finishes; }))
+            throw std::runtime_error("server did not close the slot socket and finish its watch");
+    }
+};
+
+// A slot keeps several areas: CREATE SLOT records them in order without
+// repeats, SHOW SLOTS lists them, WATCH SLOT accepts the same set in any order,
+// and live delivery and the replay after a reconnect keep only their chunks.
+void SeveralAreaSlot(bool tls) {
+    SlotCloseObserver observer; // Outlives the harness and its callbacks.
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8) CHUNK 4 x 4");
+    writer->Ok("CREATE SLOT 'several' ON t AREA 2 2 TO 2 2, AREA 0 0 TO 0 0, AREA 0 0 TO 0 0");
+    writer->Ok("CREATE SLOT IF NOT EXISTS 'several' ON t AREA 0 0 TO 0 0, AREA 2 2 TO 2 2");
+    const auto fewer = writer->Command("CREATE SLOT IF NOT EXISTS 'several' ON t AREA 0 0 TO 0 0");
+    Error(fewer, "INVALID_ARGUMENT"); assert(fewer.value.find("reason=slot_filters") != std::string::npos);
+    const auto shown = writer->Command("SHOW SLOTS ON t");
+    const auto& filters = Field(Slot(shown, "t", "several"), "filters");
+    assert(Field(filters, "area").type == '_');
+    const auto& areas = Field(filters, "areas").items;
+    assert(areas.size() == 2U && areas[0].items.size() == 4U && Number(areas[0].items[0]) == 0U && Number(areas[1].items[3]) == 2U);
+    auto watch = harness.Connect();
+    const auto one = watch->Command("WATCH t SLOT 'several' AREA 0 0 TO 0 0");
+    Error(one, "INVALID_ARGUMENT"); assert(one.value.find("reason=slot_filters") != std::string::npos);
+    const auto initial = Start(watch->Command("WATCH t SLOT 'several' AREA 2 2 TO 2 2, AREA 0 0 TO 0 0, AREA 2 2 TO 2 2"));
+    (void)Number(writer->Command("SET BLOCK 4 4 IN t n = 1")); // Chunk 1 1 is outside both areas.
+    const auto low = Number(writer->Command("SET BLOCK 0 0 IN t n = 2"));
+    const auto high = Number(writer->Command("SET BLOCK 8 8 IN t n = 3"));
+    FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
+    assert(Change(NextChange(*watch)) == low && Change(NextChange(*watch)) == high);
+    {
+        FeedDeliveryTestAccess::SetObserverHook(harness.server(), &observer);
+        Cleanup clear([&] { FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+        watch->Close(); // Disconnect with both revisions unacknowledged.
+        observer.WaitClosed(1U);
+    }
+    auto replacement = harness.Connect();
+    const auto resumed = Start(replacement->Command("WATCH t SLOT 'several'"));
+    assert(resumed == initial);
+    assert(Change(NextChange(*replacement)) == low && Change(NextChange(*replacement)) == high);
+    Unwatch(*replacement);
+}
+
 void PersistentFilterDelivery(bool tls) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
     auto writer = harness.Connect();
@@ -1409,7 +1540,7 @@ void PersistentFilterDelivery(bool tls) {
     auto watch = harness.Connect();
     const auto wrong = watch->Command("WATCH t SLOT 'filtered' COLUMNS n,label");
     Error(wrong, "INVALID_ARGUMENT"); assert(wrong.value.find("reason=slot_filters") != std::string::npos);
-    // A slot keeps one area, so different ones never match its filters; repeats of it do.
+    // Areas other than the slot's never match its filters; repeats of them do.
     const auto areas = watch->Command("WATCH t SLOT 'filtered' AREA 0 0 TO 0 0, AREA 1 1 TO 1 1");
     Error(areas, "INVALID_ARGUMENT"); assert(areas.value.find("reason=slot_filters") != std::string::npos);
     (void)Start(watch->Command("WATCH t SLOT 'filtered' AREA 0 0 TO 0 0, AREA 0 0 TO 0 0"));
@@ -1510,6 +1641,76 @@ void SlotPartitions(bool tls) {
     all->Line("ACK " + std::to_string(later)); Unwatch(*all);
     const auto acked = writer->Command("SHOW SLOTS ON t");
     for (const auto& partition : Field(Slot(acked, "t", "workers"), "partitions").items) assert(Number(Field(partition, "acked")) == later);
+}
+
+void PartitionedSeveralAreas(bool tls) {
+    SlotCloseObserver observer;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect();
+    Create(*writer, " AREA 7 0 TO 7 0, AREA 0 0 TO 0 0 PARTITIONS 2");
+    writer->Ok("CREATE SLOT IF NOT EXISTS 'consumer' ON t PARTITIONS 2 AREA 0 0 TO 0 0, AREA 7 0 TO 7 0");
+    auto table = harness.catalog->Find("t");
+    // Chunks 0 and 9 hash to partition 1, and chunk 7 hashes to 0. Area excludes 9.
+    assert(FeedSlotPartitionOf({0, 0, 0}, 2U) == 1U && FeedSlotPartitionOf({9, 0, 0}, 2U) == 1U);
+    assert(FeedSlotPartitionOf({7, 0, 0}, 2U) == 0U);
+    auto zero = harness.Connect();
+    const auto initial = Start(zero->Command("WATCH t SLOT 'consumer' PARTITION 0"));
+    auto one = harness.Connect();
+    assert(Start(one->Command("WATCH t SLOT 'consumer' AREA 7 0 TO 7 0, AREA 0 0 TO 0 0 PARTITION 1")) == initial);
+
+    const auto listed = writer->Command("SHOW SLOTS ON t");
+    const auto& slot = Slot(listed, "t", "consumer");
+    assert(slot.items.size() == 30U && Boolean(Field(slot, "attached")));
+    assert(Field(slot, "peer").type == '_' && Field(slot, "last_ack_ms").type == '_');
+    const auto& filters = Field(slot, "filters");
+    const auto& areas = Field(filters, "areas").items;
+    assert(Field(filters, "area").type == '_' && areas.size() == 2U);
+    assert(areas[0].items.size() == 4U && Number(areas[0].items[0]) == 0U);
+    assert(areas[1].items.size() == 4U && Number(areas[1].items[0]) == 7U);
+    const auto& attached = Field(slot, "partitions").items;
+    assert(attached.size() == 2U && Boolean(Field(attached[0], "attached")) && Boolean(Field(attached[1], "attached")));
+
+    FeedDeliveryTestAccess::SetObserverHook(harness.server(), &observer);
+    Cleanup clear([&] { FeedDeliveryTestAccess::SetObserverHook(harness.server(), nullptr); });
+    const auto first = Set(*writer, 1U);
+    FeedSlotTestAccess::Sync(*table);
+    assert(Change(NextChange(*one)) == first);
+    one->Line("ACK " + std::to_string(first));
+    Unwatch(*one);
+    assert(Start(one->Command("WATCH t SLOT 'consumer' PARTITION 1")).second == first);
+
+    writer->Ok("BEGIN");
+    for (const auto x : {0, 28, 36})
+        assert(writer->Command("SET BLOCK " + std::to_string(x) + " 0 IN t n = 2").type == '_');
+    const auto both = Number(writer->Command("COMMIT"));
+    FeedSlotTestAccess::Sync(*table);
+    const auto right = NextChange(*zero);
+    assert(Change(right) == both && Number(right.items[6].items[0].items[0]) == 28U);
+    const auto left = NextChange(*one);
+    assert(Change(left) == both && Number(left.items[6].items[0].items[0]) == 0U);
+    zero->Line("ACK " + std::to_string(both));
+    Unwatch(*zero);
+    const auto saved = writer->Command("SHOW SLOTS ON t");
+    const auto& saved_slot = Slot(saved, "t", "consumer");
+    const auto& saved_partitions = Field(saved_slot, "partitions").items;
+    assert(Number(Field(saved_slot, "acked")) == first);
+    assert(Field(saved_slot, "peer").value == "[127.0.0.1]:" + std::to_string(one->LocalPort()));
+    assert(Number(Field(saved_partitions[0], "partition")) == 0U && Number(Field(saved_partitions[0], "acked")) == both);
+    assert(Number(Field(saved_partitions[1], "partition")) == 1U && Number(Field(saved_partitions[1], "acked")) == first);
+    assert(!Boolean(Field(saved_partitions[0], "attached")) && Boolean(Field(saved_partitions[1], "attached")));
+
+    one->Close();
+    observer.WaitClosed(3U); // Two UNWATCHs and the disconnected watch.
+    auto resumed = harness.Connect();
+    // A watch of both partitions skips chunk 7 at its ACK floor and chunk 9
+    // outside both areas. The unacknowledged change of chunk 0 replays.
+    assert(Start(resumed->Command("WATCH t SLOT 'consumer'")).second == first);
+    assert(NextChange(*resumed) == left);
+    resumed->Line("ACK " + std::to_string(both));
+    Unwatch(*resumed);
+    const auto caught_up = writer->Command("SHOW SLOTS ON t");
+    for (const auto& partition : Field(Slot(caught_up, "t", "consumer"), "partitions").items)
+        assert(Number(Field(partition, "acked")) == both && !Boolean(Field(partition, "attached")));
 }
 
 // TAKEOVER of a partition's holder publishes the holder's accepted ACK first;
@@ -1904,6 +2105,29 @@ void FilteredArchiveChunks(bool tls) {
         assert(Number(chunks.items[6].items[0].items[0]) == 0 && Number(chunks.items[6].items[0].items[1]) == 0);
     });
 }
+
+void FilteredArchivePartitions(bool tls) {
+    constexpr std::size_t budget = 4096U;
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, label text(8192)) CHUNK 4 x 4");
+    writer->Ok("CREATE SLOT 'consumer' ON t AREA 0 0 TO 0 0, AREA 7 0 TO 7 0 PARTITIONS 2");
+    writer->Ok("BEGIN");
+    // Each excluded row alone exceeds the watch's entire buffer: chunk 7
+    // belongs to partition 0, and chunk 9 is outside the two areas.
+    for (const auto x : {28, 36})
+        assert(writer->Command("SET BLOCK " + std::to_string(x) + " 0 IN t n = 2, label = '" + std::string(5000U, 'x') + "'").type == '_');
+    assert(writer->Command("SET BLOCK 0 0 IN t n = 1").type == '_');
+    const auto transaction = Number(writer->Command("COMMIT"));
+    FeedSlotTestAccess::Sync(*harness.catalog->Find("t"));
+
+    auto watch = harness.Connect();
+    (void)Start(watch->Command("WATCH t SLOT 'consumer' PARTITION 1"));
+    const auto change = NextChange(*watch);
+    assert(Change(change) == transaction && Number(change.items[6].items[0].items[0]) == 0U);
+    Unwatch(*watch);
+}
+
 void ExcessPoolBound(bool tls) {
     constexpr std::size_t budget = 4096U, share = 1024U;
     Harness harness(tls, false, kDefaultSlotMaxBytes, 1h, budget);
@@ -2491,6 +2715,70 @@ void ChunkSlotLiveReader(bool tls) {
     state->Cancel(); state->WorkStep();
 }
 
+void LaggingChunksWatch(bool tls) {
+    Harness harness(tls);
+    auto writer = harness.Connect(); Create(*writer);
+    AckDeadlineIoTestAccess::LaggingChunks(harness.server(), *harness.catalog->Find("t"),
+        [&](unsigned value, int x) { return Set(*writer, value, x); });
+}
+
+// A CHUNKS slot whose output is unsent merges its next pushes into one push at
+// the newest revision; acknowledging that revision covers every merged change.
+void LaggingChunksSlot(bool tls) {
+    Harness harness(tls, false, kDefaultSlotMaxBytes, 1h);
+    auto writer = harness.Connect(); Create(*writer, " CHUNKS");
+    auto table = harness.catalog->Find("t");
+    auto reference = table->SubscribeFeed({.chunks = true});
+    auto state = SlotWatch::Create(table, "consumer", {});
+    state->Activate();
+    const auto step_until = [&](const auto& done) {
+        const auto deadline = Clock::now() + 10s;
+        for (;;) {
+            (void)state->WorkStep();
+            if (done()) return;
+            if (Clock::now() > deadline) throw std::runtime_error("the CHUNKS slot did not reach the expected state");
+            std::this_thread::sleep_for(1ms);
+        }
+    };
+    // Output taken by the socket stays unsent until `send` reports it written.
+    std::size_t taken = 0U;
+    std::vector<std::uint64_t> revisions;
+    const auto take = [&]() -> std::optional<SlotWatch::Output> {
+        while (auto output = state->Take(std::numeric_limits<std::size_t>::max())) {
+            taken += output->bytes->size();
+            if (output->revision) revisions.push_back(*output->revision);
+            if (output->bytes->starts_with(">9\r\n$6\r\nchunks\r\n")) return output;
+        }
+        return std::nullopt;
+    };
+    const auto send = [&] {
+        state->Consumed(std::exchange(taken, 0U));
+        for (const auto revision : revisions) state->Sent(revision);
+        revisions.clear();
+    };
+    std::optional<SlotWatch::Output> frame;
+    const auto first = Set(*writer, 1); FeedSlotTestAccess::Sync(*table);
+    step_until([&] { return (frame = take()).has_value(); });
+    assert(frame->revision == first && *frame->bytes == *feed_test::Next(*reference)->protocol_frame);
+    const auto a = Set(*writer, 2), b = Set(*writer, 3, 4), last = Set(*writer, 4, 1);
+    FeedSlotTestAccess::Sync(*table);
+    step_until([&] { return SlotAckDeadlineTestAccess::Cursor(*state) == last; });
+    assert(!take()); // Nothing is published while the first frame is unsent.
+    const auto at_a = feed_test::Next(*reference), at_b = feed_test::Next(*reference), at_last = feed_test::Next(*reference);
+    assert(at_a->position.revision == a && at_b->position.revision == b && at_last->position.revision == last);
+    FeedEntry expected = *at_a;
+    expected.position = at_last->position; expected.commit_time_ms = at_last->commit_time_ms; expected.user = at_last->user;
+    expected.chunk_forms = {at_last->chunk_forms.at(0), at_b->chunk_forms.at(0)};
+    send();
+    step_until([&] { return (frame = take()).has_value(); });
+    assert(frame->revision == last && *frame->bytes == EncodeFeedEntry(expected));
+    send();
+    // Any revision up to the merged one is accepted.
+    assert(state->Ack(a) == SlotWatch::AckResult::kAccepted && state->Ack(last) == SlotWatch::AckResult::kAccepted);
+    assert(SlotAckDeadlineTestAccess::Acked(*state) == last);
+    state->Cancel(); state->WorkStep();
+}
+
 void AckDeadlineWireMode(bool tls, bool chunks) {
     Harness harness(tls, false, kDefaultSlotMaxBytes, 10ms, kDefaultFeedBufferBytes, {}, 100ms);
     auto writer = harness.Connect(); Create(*writer, chunks ? " AREA 0 0 TO 0 0 CHUNKS" : " AREA 0 0 TO 0 0");
@@ -2888,6 +3176,7 @@ int main(int argc, char** argv) {
             run("share-independent-delivery", ShareIndependentDelivery); run("share-metadata-delivery", ShareMetadataDelivery); run("table-budget-terminates", TableBudgetStillTerminates);
             run("filtered-archive-area", FilteredArchiveArea); run("filtered-archive-columns", FilteredArchiveColumns);
             run("filtered-archive-chunks", FilteredArchiveChunks);
+            run("filtered-archive-partitions", FilteredArchivePartitions);
             run("excess-pool-bound", ExcessPoolBound); run("excess-pool-receipts", ExcessPoolReceipts);
             run("excess-stalled-holder", ExcessStalledHolder); run("TLS-write-cap", TlsWriteCap);
             run("closing-output-deadline", ClosingOutputDeadline);
@@ -2913,7 +3202,9 @@ int main(int argc, char** argv) {
         run("terminal-ACK", TerminalErrorBeforeAck);
         run("chunk-forms", ChunkForms);
         run("persistent-filters", PersistentFilterDelivery);
+        run("several-area-slot", SeveralAreaSlot);
         run("slot-partitions", SlotPartitions); run("partition-takeover", PartitionTakeover);
+        run("partitioned-several-areas", PartitionedSeveralAreas);
         run("partition-filters", PartitionFilters); run("partition-dimensional", PartitionDimensional);
         run("historical-schema", HistoricalSchemas); run("historical-schema-dimensional", HistoricalSchemasDimensional); run("held-lease", ArchiveWhileLeaseHeld);
         run("AFTER-durable", AfterWaitsForDurable); run("tiny-budget", TinyBudgetTerminates);
@@ -2924,6 +3215,7 @@ int main(int argc, char** argv) {
         run("ACK-deadline-ledger", AckDeadlineLedger);
         run("CHUNKS-ACK-deadline-ledger", ChunksDeadlineLedger);
         run("CHUNKS-slot-live-reader", ChunkSlotLiveReader);
+        run("CHUNKS-lagging-watch", LaggingChunksWatch); run("CHUNKS-lagging-slot", LaggingChunksSlot);
         run("ACK-deadline-wire", AckDeadlineWire);
         run("CHUNKS-ACK-deadline-wire", ChunksDeadlineWire);
         run("ACK-deadline-stalled-socket", AckDeadlineStalledSocket);

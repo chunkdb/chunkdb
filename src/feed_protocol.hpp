@@ -2,6 +2,7 @@
 #include <bit>
 #include <span>
 #include <type_traits>
+#include <unordered_map>
 #include "chunkdb/change_feed.hpp"
 #include "chunkdb/chunk_vars.hpp"
 namespace chunkdb {
@@ -39,14 +40,34 @@ std::size_t FeedRowMinimumEncodedBytes(const std::optional<std::vector<ColumnVal
 std::size_t FeedChangeItemMinimumEncodedBytes(std::uint8_t dims,
     const std::optional<std::vector<ColumnValue>>& before, const std::optional<std::vector<ColumnValue>>& after);
 std::size_t FeedChunkFormMinimumEncodedBytes(std::uint8_t dims, const std::shared_ptr<const std::string>& form);
-// A slot filter area as a list: empty or one area.
-inline std::span<const FeedArea> FeedAreas(const std::optional<FeedArea>& area) noexcept {
-    return area ? std::span<const FeedArea>(&*area, 1U) : std::span<const FeedArea>{};
-}
 // True when `areas` is empty or one of them holds chunk `coord`.
 bool FeedAreaHolds(std::span<const FeedArea> areas, std::uint8_t dims, ChunkCoord coord);
 // The indexes in `columns` of the projected column `ids`, in their order, as FilterFeedEntry and ChunkFeedEntry
 // project them; throws when one was dropped or repeats.
 std::vector<std::size_t> FeedProjectionIndexes(const std::vector<Column>& columns, const std::vector<std::uint32_t>& ids);
 std::string EncodeFeedResync(FeedPosition position, const std::optional<TableLineage>& lineage);
+// The exact size of EncodeFeedEntry for a chunks entry.
+std::size_t FeedChunksEncodedBytes(const FeedEntry& entry);
+
+// Merges consecutive chunks pushes of a lagging watch into one push. Each chunk
+// keeps its newest version and form, in the order chunks first appear; the push
+// takes the position, commit time and user of the newest merged push.
+class FeedChunksMerge {
+  public:
+    // Adds a chunks push above the merged ones. Returns false and changes
+    // nothing when its schema version differs from theirs or the merged push
+    // would encode to more than `limit` bytes.
+    bool Add(const std::shared_ptr<const FeedEntry>& entry, std::size_t limit);
+    [[nodiscard]] bool empty() const noexcept { return newest_ == nullptr; }
+    // The merged push with its frame, or the only push as it was added; empties the merge.
+    [[nodiscard]] std::shared_ptr<const FeedEntry> Take();
+    void Clear() noexcept;
+
+  private:
+    struct Item { std::size_t index; std::size_t bytes; };
+    std::shared_ptr<const FeedEntry> newest_;
+    std::shared_ptr<FeedEntry> merged_;  // Set from the second push on.
+    std::unordered_map<ChunkCoord, Item, ChunkCoordHash> items_;
+    std::size_t item_bytes_ = 0U;
+};
 }

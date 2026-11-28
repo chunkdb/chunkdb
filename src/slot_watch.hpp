@@ -1,14 +1,17 @@
 #pragma once
 
 #include <atomic>
+#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <exception>
+#include <limits>
 #include <list>
 #include <mutex>
 #include <optional>
 
 #include "chunkdb/table_catalog.hpp"
+#include "feed_protocol.hpp"
 
 namespace chunkdb {
 class ChunkServer;
@@ -81,13 +84,19 @@ struct FeedSlotClaim {
     // receipts, and output above a share. Each stays within the table budget.
     const std::shared_ptr<std::atomic<std::size_t>> output_bytes;
     const std::shared_ptr<FeedExcessPool> excess;
+    // The "[address]:port" of the watch's client; empty when unknown.
+    const std::string peer;
+    // When the watch's last accepted ACK arrived, as steady_clock ticks since
+    // its epoch; kNoAck before the first.
+    static constexpr std::chrono::steady_clock::rep kNoAck = std::numeric_limits<std::chrono::steady_clock::rep>::min();
+    std::atomic<std::chrono::steady_clock::rep> last_ack{kNoAck};
     // The partitions held, sorted; empty for the whole slot. Set before the
     // claim is published.
     std::vector<std::uint16_t> partitions{};
     FeedSlotClaim(std::string value, std::uint64_t revision, std::shared_ptr<std::atomic<std::size_t>> bytes,
-        std::shared_ptr<FeedExcessPool> pool, std::string owner_user)
+        std::shared_ptr<FeedExcessPool> pool, std::string owner_user, std::string client = {})
         : name(std::move(value)), user(std::move(owner_user)), completed(revision), output_bytes(std::move(bytes)),
-          excess(std::move(pool)) {}
+          excess(std::move(pool)), peer(std::move(client)) {}
 };
 
 // Socket operations only touch the bounded queue and control fields. A single
@@ -105,10 +114,11 @@ class SlotWatch {
     };
     // `authorize_owner` throws to refuse a user name: the slot's recorded
     // owner, and on takeover the user of the replaced watch. `user` is the
-    // claim's user; claiming never records an owner.
+    // claim's user; claiming never records an owner. `peer` is the
+    // "[address]:port" of the watch's client, which SHOW SLOTS reports.
     static std::shared_ptr<SlotWatch> Create(std::shared_ptr<Table> table,
         std::string name, FeedOptions options, bool takeover = false, std::string user = {},
-        const std::function<void(std::string_view)>& authorize_owner = {});
+        const std::function<void(std::string_view)>& authorize_owner = {}, std::string peer = {});
     ~SlotWatch();
     [[nodiscard]] FeedPosition position() const noexcept { return start_; }
     // The slot's owner when it was claimed, or as BindOwner recorded it.
@@ -147,22 +157,26 @@ class SlotWatch {
     std::atomic<FeedDeliveryTestHook*> hook_{nullptr};
     std::atomic<bool> io_ready_{false};
     SlotWatch(std::shared_ptr<Table> table, std::shared_ptr<FeedSlotClaim> claim,
-        FeedPosition start, FeedOptions options, bool resync);
-    // `filtered`: the archive reader already kept only what this watch sends.
+        FeedPosition start, FeedOptions options, bool resync, std::vector<std::uint64_t> partition_floors);
+    // `filtered`: the source already contains only what this watch sends.
     bool Publish(const std::shared_ptr<const FeedEntry>& entry, bool filtered = false);
-    // True when the slot has filters (FeedSlotFilters::empty).
+    // True when replay needs to restrict entries before budgeting.
     [[nodiscard]] bool Filtered() const noexcept {
-        return !options_.areas.empty() || options_.column_ids || options_.no_before || options_.chunks;
-    }
-    // A slot keeps at most one area.
-    [[nodiscard]] std::optional<FeedArea> SlotArea() const {
-        return options_.areas.empty() ? std::nullopt : std::optional<FeedArea>(options_.areas.front());
+        return !options_.areas.empty() || options_.column_ids || options_.no_before || options_.chunks ||
+            !partition_floors_.empty();
     }
     void Finish(std::optional<Output> control);
     bool Work();
     bool FlushAck(bool force);
-    // True when it published a progress frame.
+    // True when it published a progress frame, or the merged pushes before it.
     bool Progress(const FeedSlot& slot);
+    // Publishes or merges `pending_`, which the archive reader already
+    // filtered when `filtered`; false when it waits for room.
+    bool Deliver(bool filtered);
+    // Publishes the merged pushes once no output is unsent; true when none wait.
+    bool FlushMerge();
+    [[nodiscard]] bool Merging() const noexcept { return merged_ != nullptr || !merge_.empty(); }
+    [[nodiscard]] bool Lagging() const { std::lock_guard lock(mutex_); return unsent_ != 0U; }
     void SentAt(std::uint64_t revision, std::chrono::steady_clock::time_point now);
     bool ExpireAckDeadline(std::chrono::steady_clock::time_point now);
     bool AckDeadlineExpiredLocked(std::chrono::steady_clock::time_point now);
@@ -205,9 +219,10 @@ class SlotWatch {
     const std::shared_ptr<FeedExcessPool> pool_;
     const FeedPosition start_;
     const FeedOptions options_;
-    // A partitioned slot's floors (FeedSlotPartitionFloors); set before the
-    // watch is published and empty without partitions.
-    std::vector<std::uint64_t> partition_floors_;
+    // Together with options_, these scope the prepared-frame cache to this
+    // watch's area set, projection and partition floors. Slot watches do
+    // not join the live feed's shared projection cache.
+    const std::vector<std::uint64_t> partition_floors_{};
     mutable std::mutex mutex_;
     std::condition_variable closed_cv_;
     std::exception_ptr takeover_error_;
@@ -230,6 +245,12 @@ class SlotWatch {
     std::unique_ptr<FeedSubscription> live_;
     std::optional<FeedArchiveReader> archive_;
     std::shared_ptr<const FeedEntry> pending_;
+    // `pending_` holds the chunks push this watch sends.
+    bool projected_ = false;
+    // While output is unsent, a CHUNKS slot merges its pushes here. `merged_`
+    // is their push taken for publication; the merge is then empty.
+    FeedChunksMerge merge_;
+    std::shared_ptr<const FeedEntry> merged_;
     std::optional<Prepared> prepared_;
     std::chrono::steady_clock::time_point next_progress_;
 };

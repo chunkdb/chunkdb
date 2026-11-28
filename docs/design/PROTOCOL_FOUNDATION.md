@@ -39,7 +39,7 @@ It adds the following fields; the SCRAM intermediate exchange remains unchanged,
 | `idle_timeout_ms` | Effective configured idle timeout; current default 60000. |
 | `limits` | Map containing all seven limits below. |
 
-Known options are `client_name` (text), `statement_timeout_ms` (nonnegative milliseconds; zero disables), and `default_tag` (bytes, maximum 256).
+Known options are `client_name` (text, at most 8192 bytes or `--max-line-bytes` when smaller), `statement_timeout_ms` (nonnegative milliseconds; zero disables), and `default_tag` (bytes, maximum 256).
 Names are case-insensitive and normalized to lowercase; duplicate names are `INVALID_ARGUMENT reason=duplicate_option`.
 Invalid known values are `INVALID_ARGUMENT reason=option_value option=<name>`, not authentication failures.
 Unknown options are lexically parsed, accepted and reported as not applied; they never increment authentication-failure counters.
@@ -190,28 +190,31 @@ WATCH omitting filters inherits them; explicitly supplied filters must match exa
 Column projections persist stable column ids in declared order; equivalent area bounds normalize identically, independent of spelling.
 A dropped projected column makes the slot lost with reason=schema_filter; it never silently broadens or changes the projection.
 Changing filters requires creating a different slot; IF NOT EXISTS must compare filters rather than silently accept incompatible existing state.
-Task 51 implements these fixed filters, including a CHUNKS event for each relevant committed chunk; task 56 adds lagging-consumer coalescing; ordinary watches take several areas, and a slot keeps one.
+Task 51 implements these fixed filters, including CHUNKS forms for relevant committed chunks. Task 56 adds lagging-consumer coalescing for ordinary watches and unpartitioned slots. Watches and slots take several areas.
 The chunk push prefix is selected by dims and does not depend on the form format.
 
-CREATE SLOT accepts each AREA, COLUMNS, NO BEFORE, CHUNKS and OWNER suffix once, in any order after `ON table`.
+CREATE SLOT accepts an AREA list, COLUMNS, NO BEFORE, CHUNKS, OWNER and PARTITIONS, each once in any order after `ON table`.
 OWNER names the user the slot belongs to, by default the user running CREATE SLOT; IF NOT EXISTS with OWNER also requires an existing slot to have that owner, or returns INVALID_ARGUMENT reason=slot_filters.
+PARTITIONS fixes the count at creation. A WATCH SLOT can hold a subset, and ACK advances each partition it holds. See [Slot partitions](SLOT_PARTITIONS.md).
 SHOW SLOTS retains `table`, `name`, `epoch`, `acked`, `retained_bytes` and `lost`, adding the following keys.
 
 | Key | Shape |
 | --- | --- |
-| `filters` | Map `{area,columns,column_ids,no_before,chunks}`. |
-| `filters.area` | Null for no area; otherwise `[lower_axis_0,…,lower_axis_d-1,upper_axis_0,…,upper_axis_d-1]`, with signed coordinates and inclusive bounds. |
+| `filters` | Map `{area,areas,column_ids,columns,no_before,chunks}`. |
+| `filters.area` | The sole area, or null for none or several. |
+| `filters.areas` | Null for the whole table. Otherwise, the list of areas, each with signed lower and upper coordinates and inclusive bounds. |
 | `filters.columns` | Null for all columns; otherwise `[bulk_name_or_null,…]`, aligned with `column_ids`. |
 | `filters.column_ids` | Null for all columns; otherwise `[unsigned_column_id,…]`, containing persisted stable IDs in projection order. |
 | `filters.no_before` | Boolean; false by default. |
 | `filters.chunks` | Boolean; false by default. |
 | `lost_reason` | Null for a live slot; `retention_limit` or `schema_filter` for a persisted loss. |
 | `owner` | Bulk user name, shown to that user and to MANAGES USERS; null otherwise or for a slot without a recorded owner. |
+| `partitions` | Array after `owner` containing one `{partition, acked, attached}` map per partition. The slot's top-level `acked` is the lowest partition position. |
 
 Area arrays contain `2*d` values: `[x0,y0,x1,y1]` in 2D and `[x0,y0,z0,x1,y1,z1]` in 3D, and clients do not hard-code four entries.
 A rename changes only the display name; a dropped ID retains its position with a null display name.
 Persisted IDs determine WATCH and IF NOT EXISTS identity, rather than names that can change.
-Checked slot records use format 4, with the table dimensionality and a filter-format header flag owned by incompatibility bit 8.
+Checked slot records use format 4, with table dimensionality and header flags for the filter format, counted areas and partitions. The partition format is owned by incompatibility bit `0x100`. See [Storage format](../STORAGE_FORMAT.md#feed-slots-and-archives).
 Their flags store loss, AREA, COLUMNS, NO BEFORE, CHUNKS, schema-filter loss and an owner; projection IDs retain declared order.
 The filter-format flag never clears after filtering metadata was recorded.
 The owner needs no feature bit; earlier development formats 1 to 3 are refused.
@@ -232,7 +235,7 @@ TAKEOVER serializes with old-claim ACK validation, revokes that claim, stops its
 It publishes only the last actually received and validated ACK, including a pending durable publication, before attaching the new owner.
 It never automatically ACKs merely sent/delivered changes, chunks or progress; unacknowledged revisions remain replayable.
 The replacement starts at the persisted ACK; crash before persistence can replay events, never lose acknowledged durable progress.
-A claim generation fences late old ACKs; no two valid claims can send or update the same slot concurrently.
+A claim generation fences late old ACKs. Valid claims can send and acknowledge concurrently when they hold disjoint partitions.
 Lock ordering never waits for socket drainage or worker shutdown while holding table/catalog locks.
 Concurrent ownership handoffs return SLOT_BUSY reason=takeover_pending rather than create a second owner.
 An ordinary attach needs READ; a slot another user owns, or one without a recorded owner attached by ADMIN on `*`, additionally needs ADMIN on `*` for as long as the watch lasts.

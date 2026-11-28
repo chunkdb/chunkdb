@@ -25,6 +25,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "feed_protocol.hpp"
 #include "feed_prefix.hpp"
+#include "feed_slot_partitions.hpp"
 #include "feed_slot_records.hpp"
 #include "feature_flags.hpp"
 #include "snapshot_generation.hpp"
@@ -283,6 +284,7 @@ struct FeedArchiveReader::Impl {
     // A slot watch's filters: each change keeps only what the watch sends
     // (FilterFeedEntry, ChunkFeedEntry), and frames carry what it sends.
     std::optional<FeedSlotFilters> filter;
+    std::vector<std::uint64_t> partition_floors{};
     // A slot watch refuses a change whose frame would exceed its table
     // budget; other readers keep every change.
     std::size_t entry_budget = std::numeric_limits<std::size_t>::max();
@@ -663,9 +665,9 @@ struct FeedArchiveReader::Impl {
             const auto& frame_geometry = historical_geometry ? *historical_geometry : geometry;
             const auto& chunk_schema = frame_geometry.chunk_schema();
             const auto dims = geometry.dims();
-            // A filtered watch receives nothing of a chunk outside its area,
-            // and only the projected columns of its blocks.
-            const bool kept = !filter || FeedAreaHolds(FeedAreas(filter->area), dims, cursor.coord);
+            // Only items this watch can send count toward its frame budget.
+            const bool kept = (!filter || FeedAreaHolds(filter->areas, dims, cursor.coord)) &&
+                FeedSlotPartitionIncludes(partition_floors, cursor.coord, info.revision);
             const bool no_before = filter && filter->no_before;
             std::vector<std::size_t> selected;
             if (filter && filter->column_ids) selected = FeedProjectionIndexes(layout.schema().columns, *filter->column_ids);
@@ -785,9 +787,10 @@ void FeedArchiveReader::EnableChunkForms(std::size_t budget) {
     impl_->chunk_forms = true;
     impl_->entry_budget = budget;
 }
-void FeedArchiveReader::Filter(const FeedSlotFilters& filters) {
+void FeedArchiveReader::Filter(const FeedSlotFilters& filters, const std::vector<std::uint64_t>& partition_floors) {
     if (!impl_ || impl_->started) throw std::logic_error("feed filters must be set before archive reading");
     impl_->filter = filters;
+    impl_->partition_floors = partition_floors;
     if (filters.chunks) impl_->chunk_forms = true;
 }
 void FeedArchiveReader::SetEntryBudget(std::size_t budget) {
