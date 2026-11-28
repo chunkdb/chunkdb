@@ -418,7 +418,7 @@ void TestCatalogChangeFailures() {
             catalog.ChangeColumns(
                 "world", [](const TableSchema& schema) { return chunkdb::RenameColumn(schema, "lamp", "light"); });
         },
-        "injected directory sync failure");
+        "directory");
     SetFailpoint("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE", "");
     assert(catalog.Fence("world") && !catalog.Find("world"));
     catalog.RecoverTable("world");

@@ -994,6 +994,10 @@ void ChunkStore::CloseSnapshotGeneration() noexcept {
     if (!snapshot_generation_mapping_ ||
         (snapshot_generation_mapping_->Load() & (kGenerationOdd | kGenerationFailed | kGenerationCountMask)) != 0U) return;
     try {
+        // A coherent session can still be closed after WAL durability
+        // failed. The close record only certifies read-only coherence.
+        const ScopedDurabilitySync sync_scope(
+            durability_poisoned_.load(std::memory_order_acquire) ? nullptr : durability_sync_state_.get());
         AtomicWrite(snapshot_generation_path_,
             SerializeSnapshotGenerationRecord(snapshot_generation_ + 1U),
             /*fsync_file=*/true, /*fsync_directory=*/true,

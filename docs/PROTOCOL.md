@@ -332,7 +332,7 @@ Area bounds are signed `[x0,y0,x1,y1]` with inclusive endpoints; both flags are 
 VERSION_MISMATCH, CONDITION_FAILED and SCHEMA_MISMATCH include `current`, the chunk or schema version; schema rejection also includes `actual` and `table`.
 RATE_LIMITED authentication bans include remaining `retry_after_ms`.
 OUTCOME_UNKNOWN includes `stage` and requires writer recovery before retrying ([durability](DURABILITY_CONTRACT.md)).
-FLUSH WAL reports an error while a table is fenced after a failed sync. The server still attempts the other tables. SHOW STATUS and DESCRIBE expose the fence, and RECOVER TABLE or a writer restart runs recovery before another barrier can succeed.
+A failed barrier sync reports OUTCOME_UNKNOWN with `stage=barrier_sync` and the affected `table`. FLUSH WAL attempts all serving tables and returns an unknown outcome before a definite error. SHOW STATUS and DESCRIBE expose the fence, and RECOVER TABLE or a writer restart runs recovery before another barrier can succeed.
 INTERNAL reports other operational failures without exposing internal diagnostics.
 
 ```text

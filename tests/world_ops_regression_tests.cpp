@@ -1310,12 +1310,12 @@ void TestBarrierSyncFailureFencesStore() {
         store.SetBlockBits(0, 0, "10101");
         if (overflow) store.ForceUnsyncedOverflowForTests();
         {
-            ScopedEnv fp("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE", "1");
+            ScopedEnv fp("CHUNKDB_FAILPOINT_BARRIER_FSYNC_EIO_ONCE", "1");
             try {
                 store.WalBarrier();
                 assert(false);
-            } catch (const std::runtime_error& error) {
-                assert(std::string_view(error.what()).find("injected barrier sync failure") != std::string_view::npos);
+            } catch (const chunkdb::WriteOutcomeUnknownError& error) {
+                assert(error.stage() == "barrier_sync");
             }
         }
         AssertBarrierFenced(store);
@@ -1328,6 +1328,24 @@ void TestBarrierSyncFailureFencesStore() {
             assert(std::string_view(error.what()).find("fail-closed") != std::string_view::npos);
         }
     }
+}
+
+void TestBarrierInterruptedBeforeSyncCanRetry() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-reg-barrier-interrupted");
+    chunkdb::ChunkStore store(BaseConfig(dir.path()));
+    store.SetBlockBits(0, 0, "10101");
+    {
+        ScopedEnv failure("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE", "1");
+        try {
+            store.WalBarrier();
+            assert(false);
+        } catch (const std::runtime_error& error) {
+            assert(std::string_view(error.what()).find("injected barrier sync failure") != std::string_view::npos);
+        }
+    }
+    assert(store.UnsyncedTrackedCountForTests() > 0U);
+    store.WalBarrier();
+    assert(store.UnsyncedTrackedCountForTests() == 0U);
 }
 
 void RunBarrierCheckpointReplacementCase(bool overflow) {
@@ -1562,8 +1580,8 @@ void TestBarrierParallelSyncFailureFencesStore() {
         ScopedEnv fp("CHUNKDB_FAILPOINT_BARRIER_FILE_SYNC_FAIL_ONCE", "1");
         try {
             store.WalBarrier();
-        } catch (const std::exception&) {
-            threw = true;
+        } catch (const chunkdb::WriteOutcomeUnknownError& error) {
+            threw = error.stage() == "barrier_sync";
         }
     }
     assert(threw);
@@ -1587,11 +1605,11 @@ void TestBarrierSyncsPendingBatchesInItsSyncStep() {
         // sync step. A failure there fences the store.
         bool threw = false;
         {
-            ScopedEnv fp("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE", "1");
+            ScopedEnv fp("CHUNKDB_FAILPOINT_BARRIER_FSYNC_EIO_ONCE", "1");
             try {
                 store.WalBarrier();
-            } catch (const std::exception&) {
-                threw = true;
+            } catch (const chunkdb::WriteOutcomeUnknownError& error) {
+                threw = error.stage() == "barrier_sync";
             }
         }
         assert(threw);
@@ -2459,6 +2477,7 @@ int main() {
     TestConditionalCommittedNonStdFailuresKeepTheCommit();
     TestBarrierOverflowFallbackSucceeds();
     TestBarrierSyncFailureFencesStore();
+    TestBarrierInterruptedBeforeSyncCanRetry();
     TestBarrierCoversConcurrentCheckpointReplacement();
     TestBarrierAfterDrainReplacementCannotDowngradeDurability();
     TestBarrierCoversConcurrentEmptyChunkGc();

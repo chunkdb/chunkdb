@@ -14,6 +14,7 @@
 #include <string>
 #include <thread>
 #include <unordered_set>
+#include <utility>
 #include <vector>
 
 #include "checkpoint.hpp"
@@ -452,11 +453,12 @@ void ChunkStore::TruncateWalTail(
         }
         chunk->wal_header_written = false;
         if (force_sync) {
-            if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE")) {
-                throw std::runtime_error(
-                    "injected WAL rollback sync failure: " + chunk->wal_path.string());
-            }
+#ifdef CHUNKDB_FAILPOINTS
+            SyncDirectoryPath(chunk->wal_path.parent_path(),
+                ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE"));
+#else
             SyncDirectoryPath(chunk->wal_path.parent_path());
+#endif
         } else {
             NoteUnsyncedDir(chunk->wal_path.parent_path());
         }
@@ -484,11 +486,11 @@ void ChunkStore::TruncateWalTail(
     }
     chunk->wal_header_written = committed_size >= ChunkWalHeaderBytes(geometry_.dims());
     if (force_sync) {
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE")) {
-            throw std::runtime_error(
-                "injected WAL rollback sync failure: " + chunk->wal_path.string());
-        }
+#ifdef CHUNKDB_FAILPOINTS
+        SyncFilePath(chunk->wal_path, ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_ROLLBACK_SYNC_FAIL_ONCE"));
+#else
         SyncFilePath(chunk->wal_path);
+#endif
     } else {
         NoteUnsyncedFile(chunk->wal_path);
     }
@@ -522,7 +524,7 @@ void ChunkStore::FlushWalBatch(
     bool first_create = false;
     bool stream_artifact_touched = false;
     bool batch_write_started = false;
-    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
+    const ScopedDurabilitySync sync_scope(durability_sync_state_.get());
     try {
         EnsureWalAppendStream(
             chunk_coord,
@@ -559,9 +561,8 @@ void ChunkStore::FlushWalBatch(
         }
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CRASH_WAL_BATCH_BEFORE_SYNC_ONCE")) ExitAbruptly(86);
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE")) {
-            // In relaxed mode this hook simulates an append failure: there
-            // is no file sync to fail.
-            if (force_sync) ScopedDurabilitySync::Fail();
+            // This hook interrupts the append before its durability step.
+            // WAL_BATCH_FSYNC_EIO_ONCE exercises the native sync failure.
             throw std::runtime_error(
                 "injected WAL batch sync failure: " + chunk->wal_path.string());
         }
@@ -572,10 +573,13 @@ void ChunkStore::FlushWalBatch(
             chunk->wal_boundary_durable = false;
         }
         if (force_sync) {
+#ifdef CHUNKDB_FAILPOINTS
+            SyncFilePath(chunk->wal_path, ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BATCH_FSYNC_EIO_ONCE"));
+#else
             SyncFilePath(chunk->wal_path);
+#endif
             if (first_create) {
                 if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_AFTER_FILE_SYNC_BEFORE_DIR_SYNC_ONCE")) {
-                    ScopedDurabilitySync::Fail();
                     throw std::runtime_error(
                         "injected WAL sync failure after file sync before directory sync: " + chunk->wal_path.string());
                 }
@@ -606,7 +610,7 @@ void ChunkStore::FlushWalBatch(
             // only persists the removal of the rejected tail. It neither
             // clears the fence nor credits any earlier bytes as durable.
             const ScopedDurabilitySync rollback_sync(
-                durability_poisoned_.load(std::memory_order_acquire) ? nullptr : &durability_poisoned_);
+                durability_poisoned_.load(std::memory_order_acquire) ? nullptr : durability_sync_state_.get());
             TruncateWalTail(chunk_coord, chunk, pre_flush_size, force_sync);
             snapshot_write.Finish();
         } catch (const std::exception& repair_error) {
@@ -723,7 +727,7 @@ void ChunkStore::MakeWalBoundaryDurableLocked(
     const std::shared_ptr<RegularChunk>& chunk,
     bool own_stream) {
     ThrowIfDurabilityPoisoned();
-    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
+    const ScopedDurabilitySync sync_scope(durability_sync_state_.get());
     // A boundary starts a commit that syncs what it writes: a transaction,
     // durable in every mode, or a conditional write, whose rollback relies
     // on the synced WAL. From here on a checkpoint must not replace a WAL
@@ -772,10 +776,9 @@ void ChunkStore::MakeWalBoundaryDurableLocked(
     const auto forgotten = ForgetUnsynced({image_path, wal_path}, {directory, data_dir_});
     try {
         PauseWalBoundarySyncForTests();
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BOUNDARY_SYNC_FAIL_ONCE")) {
-            ScopedDurabilitySync::Fail();
-            throw std::runtime_error("injected rollback boundary sync failure: " + wal_path.string());
-        }
+#ifdef CHUNKDB_FAILPOINTS
+        bool inject_failure = ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_BOUNDARY_SYNC_FAIL_ONCE");
+#endif
         const auto exists = [](const std::filesystem::path& path) {
             std::error_code ec;
             const bool present = std::filesystem::exists(path, ec);
@@ -786,15 +789,27 @@ void ChunkStore::MakeWalBoundaryDurableLocked(
             return present;
         };
         if (exists(image_path)) {
+#ifdef CHUNKDB_FAILPOINTS
+            SyncFilePath(image_path, std::exchange(inject_failure, false));
+#else
             SyncFilePath(image_path);
+#endif
         }
         if (exists(wal_path)) {
+#ifdef CHUNKDB_FAILPOINTS
+            SyncFilePath(wal_path, std::exchange(inject_failure, false));
+#else
             SyncFilePath(wal_path);
+#endif
         }
         if (exists(directory)) {
             SyncDirectoryPath(directory);
         }
+#ifdef CHUNKDB_FAILPOINTS
+        SyncDirectoryPath(data_dir_, inject_failure);
+#else
         SyncDirectoryPath(data_dir_);
+#endif
         ThrowIfDurabilityPoisoned();
     } catch (const std::exception&) {
         try {
@@ -838,7 +853,7 @@ void ChunkStore::FlushWalBatchForEviction(
             prefix.emplace(feed_slots_->prefix_index().Prepare(chunk_coord, pre_flush_size, chunk->wal_batch, geometry_.dims()));
         SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
         bool file_write_started = false;
-        const ScopedDurabilitySync sync_scope(&durability_poisoned_);
+        const ScopedDurabilitySync sync_scope(durability_sync_state_.get());
         try {
             const auto wal_parent_path = chunk->wal_path.parent_path();
             EnsureWalParentDirectoryCached(
@@ -894,7 +909,6 @@ void ChunkStore::FlushWalBatchForEviction(
                 SyncFilePath(chunk->wal_path);
                 if (needs_header) {
                     if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WAL_AFTER_FILE_SYNC_BEFORE_DIR_SYNC_ONCE")) {
-                        ScopedDurabilitySync::Fail();
                         throw std::runtime_error(
                             "injected WAL sync failure after file sync before directory sync: " +
                             chunk->wal_path.string());
@@ -916,15 +930,17 @@ void ChunkStore::FlushWalBatchForEviction(
             // must never be re-appended behind partial bytes.
             try {
                 const ScopedDurabilitySync rollback_sync(
-                    durability_poisoned_.load(std::memory_order_acquire) ? nullptr : &durability_poisoned_);
+                    durability_poisoned_.load(std::memory_order_acquire) ? nullptr : durability_sync_state_.get());
                 TruncateWalTail(chunk_coord, chunk, pre_flush_size, force_sync);
                 snapshot_write.Finish();
             } catch (const std::exception& repair_error) {
-                PoisonDurability(
-                    "WAL append repair failed for chunk (" +
-                    std::to_string(chunk_coord.x) + "," +
-                    std::to_string(chunk_coord.y) + "): " + repair_error.what());
+                const std::string reason = "WAL append repair failed for chunk (" +
+                    std::to_string(chunk_coord.x) + "," + std::to_string(chunk_coord.y) + "): " + repair_error.what();
+                PoisonDurability(reason);
                 chunk->wal_repair_failed = true;
+                // The batch holds acknowledged writes only. Refuse a retry
+                // of this statement on a table that now requires recovery.
+                throw std::runtime_error(reason + "; the store is fail-closed until RECOVER TABLE or a restart");
             }
             throw;
         }

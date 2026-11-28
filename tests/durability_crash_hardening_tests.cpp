@@ -693,11 +693,11 @@ void TestRejectedWriteAfterWalSyncFailureDoesNotResurrect() {
 
         bool threw = false;
         {
-            ScopedEnv fp("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
+            ScopedEnv fp("CHUNKDB_FAILPOINT_WAL_BATCH_FSYNC_EIO_ONCE", "1");
             try {
                 store.SetBlockBits(0, 0, "00001111");
-            } catch (const std::exception&) {
-                threw = true;
+            } catch (const chunkdb::SyncFailedError& error) {
+                threw = error.fenced_table();
             }
         }
         assert(threw);
@@ -730,8 +730,13 @@ void TestVersionClockDirectorySyncFailureFencesStore() {
             try {
                 store.SetBlockBits(0, 0, "11110000");
                 assert(false);
-            } catch (const std::runtime_error& error) {
-                assert(std::string(error.what()).find("injected directory sync failure") != std::string::npos);
+            } catch (const chunkdb::SyncFailedError& error) {
+                assert(error.fenced_table());
+#ifdef _WIN32
+                assert(error.code() == std::error_code(ERROR_IO_DEVICE, std::system_category()));
+#else
+                assert(error.code() == std::errc::io_error);
+#endif
             }
         }
         assert(store.GetChunkVersion(0, 0) == 0U);

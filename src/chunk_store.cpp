@@ -10,6 +10,7 @@
 #include "snapshot_generation.hpp"
 #include "store_manifest.hpp"
 #include "backup.hpp"
+#include "durability_io.hpp"
 #include "txn_history.hpp"
 #include "wal_replay.hpp"
 #include "wal_stream_pool.hpp"
@@ -384,6 +385,8 @@ ChunkStore::ChunkStore(StoreConfig config)
       background_maintenance_(config.background_maintenance),
       background_checkpoint_queue_limit_(config.background_checkpoint_queue_limit) {
     RequireValidQueryLimits(query_limits_);
+    if (access_mode_ == AccessMode::kReadWrite)
+        durability_sync_state_ = std::make_unique<DurabilitySyncState>(durability_poisoned_);
     write_producers_ = std::make_shared<FeedProducerRegistry>();
     if (data_dir_.empty()) {
         throw std::invalid_argument("data_dir must not be empty");
@@ -667,6 +670,7 @@ ChunkStore::~ChunkStore() {
     // instead of when the chunks are destroyed.
     CloseAllWalStreams();
     resources_->ForgetWalStreams(this);
+    CloseSnapshotGeneration();
     {
         std::lock_guard lock(unsynced_mutex_);
         if (unsynced_handover_ != nullptr) {
@@ -677,7 +681,6 @@ ChunkStore::~ChunkStore() {
             unsynced_handover_->durability_failed_on_close = durability_poisoned_.load(std::memory_order_acquire);
         }
     }
-    CloseSnapshotGeneration();
     snapshot_generation_mapping_.reset();
     ReleaseProcessLock();
 }

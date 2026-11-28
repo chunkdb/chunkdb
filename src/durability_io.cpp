@@ -1,7 +1,6 @@
 #include "checkpoint.hpp"
 
 #include <algorithm>
-#include <array>
 #include <atomic>
 #include <chrono>
 #include <cerrno>
@@ -12,7 +11,6 @@
 #include <mutex>
 #include <stdexcept>
 #include <string>
-#include <string_view>
 #include <system_error>
 #include <thread>
 #include <unordered_set>
@@ -23,6 +21,7 @@
 #include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/zrle.hpp"
+#include "commit_owner_artifact_identity.hpp"
 #include "durability_io.hpp"
 #include "file_permissions.hpp"
 #include "wal_stream_pool.hpp"
@@ -44,73 +43,27 @@
 namespace chunkdb {
 
 namespace {
-thread_local std::atomic<bool>* current_sync_fence = nullptr;
-
-// A live chunk and its feed archive links have the same file name prefix
-// (before the first dot). Use that prefix for files so a sync through a link
-// or renamed WAL also observes a failed sync through the live name.
-std::array<std::mutex, 64> sync_stripes;
-
-std::size_t SyncStripe(const std::filesystem::path& path, bool directory) {
-    std::size_t hash;
-    if (directory) {
-        hash = std::filesystem::hash_value(path);
-    } else {
-        using Char = std::filesystem::path::value_type;
-        const std::basic_string_view<Char> native(path.native());
-        auto separator = native.find_last_of(static_cast<Char>('/'));
-#ifdef _WIN32
-        const auto backslash = native.find_last_of(static_cast<Char>('\\'));
-        if (backslash != native.npos && (separator == native.npos || backslash > separator)) separator = backslash;
-#endif
-        auto leaf = native.substr(separator == native.npos ? 0U : separator + 1U);
-        if (!leaf.empty() && leaf.front() != static_cast<Char>('.'))
-            leaf = leaf.substr(0U, leaf.find(static_cast<Char>('.')));
-        hash = std::hash<std::basic_string_view<Char>>{}(leaf);
-    }
-    return (hash ^ std::hash<const void*>{}(current_sync_fence)) % sync_stripes.size();
-}
-
-template <class Sync>
-bool SyncWithFence(const std::filesystem::path& path, bool missing_ok, bool directory, Sync sync) {
-    std::unique_lock<std::mutex> lock;
-    if (current_sync_fence) lock = std::unique_lock(sync_stripes[SyncStripe(path, directory)]);
-    ScopedDurabilitySync::Check();
-    try {
-#ifdef CHUNKDB_FAILPOINTS
-        if (directory && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE"))
-            throw std::runtime_error("injected directory sync failure: " + path.string());
-#ifndef __APPLE__
-        if (!directory && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE"))
-            throw std::runtime_error("injected file sync failure: " + path.string());
-#endif
-#endif
-        return sync(path, missing_ok);
-    } catch (const std::exception&) {
-        ScopedDurabilitySync::Fail();
-        throw;
-    }
-}
+thread_local DurabilitySyncState* current_sync_state = nullptr;
 }  // namespace
 
-ScopedDurabilitySync::ScopedDurabilitySync(std::atomic<bool>* fence) noexcept
-    : previous_(std::exchange(current_sync_fence, fence)) {}
+ScopedDurabilitySync::ScopedDurabilitySync(DurabilitySyncState* state) noexcept
+    : previous_(std::exchange(current_sync_state, state)) {}
 
 ScopedDurabilitySync::~ScopedDurabilitySync() {
-    current_sync_fence = previous_;
+    current_sync_state = previous_;
 }
 
-std::atomic<bool>* ScopedDurabilitySync::Current() noexcept {
-    return current_sync_fence;
+DurabilitySyncState* ScopedDurabilitySync::Current() noexcept {
+    return current_sync_state;
 }
 
 void ScopedDurabilitySync::Check() {
-    if (current_sync_fence && current_sync_fence->load(std::memory_order_acquire))
+    if (current_sync_state && current_sync_state->fence_.load(std::memory_order_acquire))
         throw std::runtime_error("store is fail-closed after a durability failure; run RECOVER TABLE or restart");
 }
 
 void ScopedDurabilitySync::Fail() noexcept {
-    if (current_sync_fence) current_sync_fence->store(true, std::memory_order_release);
+    if (current_sync_state) current_sync_state->fence_.store(true, std::memory_order_release);
 }
 
 void WriteAtomicTempFile(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes,
@@ -223,20 +176,96 @@ void LogWindowsDirectorySyncUnavailableOnce(
         ", msg='" + std::system_category().message(static_cast<int>(code)) + "')");
 }
 #endif
+// Entries live on the sync caller's stack. The store mutex protects only
+// registration, so a different inode never waits for this one's I/O.
+// Compare the open handles' identities to cover archive links and to avoid
+// serializing distinct generations published under the same path.
+class DurabilitySyncState::Active {
+  public:
+#ifdef _WIN32
+    Active(HANDLE handle, const std::filesystem::path&)
+        : state_(ScopedDurabilitySync::Current()) {
+        if (!state_) return;
+        identity_ = ReadCommitOwnerNativeIdentity(handle);
+        Enter();
+    }
+#else
+    Active(int fd, const std::filesystem::path& path)
+        : state_(ScopedDurabilitySync::Current()) {
+        if (!state_) return;
+        struct stat info {};
+        if (::fstat(fd, &info) != 0)
+            throw BuildErrnoError("failed to identify artifact for durability sync", path, errno);
+        identity_ = {info.st_dev, info.st_ino};
+        Enter();
+    }
+#endif
+
+    Active(const Active&) = delete;
+    Active& operator=(const Active&) = delete;
+
+    ~Active() {
+        if (!state_) return;
+        bool notify;
+        {
+            std::lock_guard lock(state_->mutex_);
+            Active** entry = &state_->active_;
+            while (*entry != this) entry = &(*entry)->next_;
+            *entry = next_;
+            notify = state_->waiters_ != 0U;
+        }
+        if (notify) state_->completed_.notify_all();
+    }
+
+  private:
+    void Enter() {
+        std::unique_lock lock(state_->mutex_);
+        const auto idle = [this] {
+            for (auto* entry = state_->active_; entry != nullptr; entry = entry->next_)
+                if (entry->identity_ == identity_) return false;
+            return true;
+        };
+        if (!idle()) {
+            struct Waiter {
+                std::size_t& count;
+                explicit Waiter(std::size_t& waiters) : count(waiters) { ++count; }
+                ~Waiter() { --count; }
+            } waiter(state_->waiters_);
+            state_->completed_.wait(lock, idle);
+        }
+        ScopedDurabilitySync::Check();
+        next_ = std::exchange(state_->active_, this);
+    }
+
+    DurabilitySyncState* state_;
+    Active* next_ = nullptr;
+#ifdef _WIN32
+    CommitOwnerNativeIdentity identity_;
+#else
+    struct Identity {
+        dev_t device = 0;
+        ino_t inode = 0;
+        bool operator==(const Identity&) const = default;
+    } identity_;
+#endif
+};
+
 #ifdef _WIN32
 // Closes `handle` once and marks it closed, also when CloseHandle fails, so
 // no caller closes it again.
-void CloseHandleChecked(HANDLE& handle, const std::filesystem::path& path, const std::string& action) {
+void CloseHandleChecked(HANDLE& handle, const std::filesystem::path& path, const char* action) {
     const HANDLE closing = std::exchange(handle, INVALID_HANDLE_VALUE);
     if (CloseHandle(closing) == 0) {
         throw BuildWin32Error(action, path, GetLastError());
     }
 }
 
-void FlushHandleChecked(HANDLE handle, const std::filesystem::path& path, const std::string& action) {
-    if (FlushFileBuffers(handle) == 0) {
-        throw BuildWin32Error(action, path, GetLastError());
-    }
+void FlushHandleChecked(HANDLE handle, const std::filesystem::path& path, const char* action,
+    bool live = false, bool inject_failure = false) {
+    if (!inject_failure && FlushFileBuffers(handle) != 0) return;
+    const DWORD error = inject_failure ? ERROR_IO_DEVICE : GetLastError();
+    if (live) ScopedDurabilitySync::Fail();
+    throw SyncFailedError(BuildWin32Error(action, path, error), live && ScopedDurabilitySync::Current());
 }
 
 void WriteAtomicTempFile(
@@ -287,12 +316,8 @@ void WriteAtomicTempFile(
         });
 
         if (durable_sync) {
-            if (enable_generic_failpoints &&
-                ConsumeFailpointEnv("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_SYNC_FAIL_ONCE")) {
-                throw std::runtime_error(
-                    "injected temporary file sync failure: " + tmp_path.string());
-            }
-            FlushHandleChecked(handle, tmp_path, "failed to flush temporary file");
+            FlushHandleChecked(handle, tmp_path, "failed to flush temporary file", false,
+                enable_generic_failpoints && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_SYNC_FAIL_ONCE"));
         }
 
         if (enable_generic_failpoints &&
@@ -426,7 +451,7 @@ std::error_code ExchangeDirectories(const std::filesystem::path&, const std::fil
 
 namespace {
 // Returns false, without syncing, when `missing_ok` and `path` does not exist.
-bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
+bool SyncFileAt(const std::filesystem::path& path, bool missing_ok, bool inject_failure) {
     HANDLE handle = CreateFileW(path.c_str(), GENERIC_READ | GENERIC_WRITE,
         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
         OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
@@ -437,20 +462,23 @@ bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
         }
         throw BuildWin32Error("failed to open file for durability sync", path, open_error);
     }
-    const BOOL synced = FlushFileBuffers(handle);
-    const DWORD sync_error = synced != 0 ? ERROR_SUCCESS : GetLastError();
-    const BOOL closed = CloseHandle(handle);
-    const DWORD close_error = closed != 0 ? ERROR_SUCCESS : GetLastError();
-    if (synced == 0) {
-        throw BuildWin32Error("failed to sync file", path, sync_error);
-    }
-    if (closed == 0) {
-        throw BuildWin32Error("failed to close synced file", path, close_error);
+    try {
+        {
+            const DurabilitySyncState::Active sync(handle, path);
+#ifdef CHUNKDB_FAILPOINTS
+            inject_failure = inject_failure || ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE");
+#endif
+            FlushHandleChecked(handle, path, "failed to sync file", true, inject_failure);
+        }
+        CloseHandleChecked(handle, path, "failed to close synced file");
+    } catch (const std::exception&) {
+        if (handle != INVALID_HANDLE_VALUE) (void)CloseHandle(handle);
+        throw;
     }
     return true;
 }
 
-bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
+bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok, bool inject_failure) {
     const std::wstring path_w = path.wstring();
     HANDLE handle = CreateFileW(
         path_w.c_str(),
@@ -468,31 +496,41 @@ bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
         throw BuildWin32Error("failed to open directory for durability sync", path, open_error);
     }
     try {
-        DWORD flush_error = ERROR_SUCCESS;
-        bool flush_failed = false;
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WINDOWS_DIRECTORY_SYNC_CAPABILITY_ERROR_ONCE")) {
-            flush_failed = true;
-            flush_error = ERROR_INVALID_FUNCTION;
-        } else if (FlushFileBuffers(handle) == 0) {
-            flush_failed = true;
-            flush_error = GetLastError();
-        }
-        if (flush_failed) {
-            // Some Windows filesystems/runtimes do not allow directory handle flush.
-            // In strict durability paths, this means the configured contract cannot be honored.
-            if (flush_error != ERROR_ACCESS_DENIED &&
-                flush_error != ERROR_INVALID_HANDLE &&
-                flush_error != ERROR_INVALID_FUNCTION) {
-                throw BuildWin32Error("failed to sync directory", path, flush_error);
+        {
+            const DurabilitySyncState::Active sync(handle, path);
+            DWORD flush_error = ERROR_SUCCESS;
+            bool flush_failed = false;
+#ifdef CHUNKDB_FAILPOINTS
+            inject_failure = inject_failure || ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE");
+#endif
+            if (inject_failure) {
+                flush_failed = true;
+                flush_error = ERROR_IO_DEVICE;
             }
-            LogWindowsDirectorySyncUnavailableOnce(
-                path,
-                flush_error,
-                std::system_category().message(static_cast<int>(flush_error)));
-            throw BuildWin32Error(
-                "strict durability requires Windows directory sync capability",
-                path,
-                flush_error);
+#ifdef CHUNKDB_FAILPOINTS
+            else if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_WINDOWS_DIRECTORY_SYNC_CAPABILITY_ERROR_ONCE")) {
+                flush_failed = true;
+                flush_error = ERROR_INVALID_FUNCTION;
+            }
+#endif
+            else if (FlushFileBuffers(handle) == 0) {
+                flush_failed = true;
+                flush_error = GetLastError();
+            }
+            if (flush_failed) {
+                ScopedDurabilitySync::Fail();
+                if (flush_error != ERROR_ACCESS_DENIED &&
+                    flush_error != ERROR_INVALID_HANDLE &&
+                    flush_error != ERROR_INVALID_FUNCTION) {
+                    throw SyncFailedError(BuildWin32Error("failed to sync directory", path, flush_error),
+                        ScopedDurabilitySync::Current() != nullptr);
+                }
+                LogWindowsDirectorySyncUnavailableOnce(
+                    path, flush_error, std::system_category().message(static_cast<int>(flush_error)));
+                throw SyncFailedError(BuildWin32Error(
+                    "strict durability requires Windows directory sync capability", path, flush_error),
+                    ScopedDurabilitySync::Current() != nullptr);
+            }
         }
         CloseHandleChecked(handle, path, "failed to close synced directory");
     } catch (...) {
@@ -527,37 +565,33 @@ void CloseFdChecked(int& fd, const std::filesystem::path& path, const std::strin
     }
 }
 
-void SyncFdDurably(int fd, const std::filesystem::path& path, bool full_sync) {
-#if defined(__APPLE__)
-    if (full_sync) {
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE")) {
-            throw BuildErrnoError("failed to F_FULLFSYNC file", path, EIO);
-        }
-        if (::fcntl(fd, F_FULLFSYNC, 0) == 0) {
-            return;
-        }
-        const int fullsync_error = errno;
-        // F_FULLFSYNC can be unsupported on some macOS filesystems/devices.
-        // Fall back to fsync while surfacing non-capability errors.
-        if (fullsync_error != EINVAL && fullsync_error != ENOTSUP && fullsync_error != ENOTTY) {
-            throw BuildErrnoError("failed to F_FULLFSYNC file", path, fullsync_error);
-        }
-    }
-    if (::fsync(fd) != 0) {
-        throw BuildErrnoError("failed to fsync file", path, errno);
-    }
+[[noreturn]] void ThrowFdSyncError(const char* action, const std::filesystem::path& path, int error, bool live) {
+    if (live) ScopedDurabilitySync::Fail();
+    throw SyncFailedError(BuildErrnoError(action, path, error), live && ScopedDurabilitySync::Current());
+}
+
+void SyncFdDurably(int fd, const std::filesystem::path& path, bool live = false, bool inject_failure = false) {
+#ifdef CHUNKDB_FAILPOINTS
+    // The existing macOS hook also covers temporary-file syncs. On other
+    // platforms FULL_SYNC_FILE targets a live path; temporary files have
+    // their own injection point.
+#ifdef __APPLE__
+    inject_failure = inject_failure || ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE");
 #else
-    (void)full_sync;
-    if (::fdatasync(fd) != 0) {
-        const int data_sync_error = errno;
-        if (data_sync_error == EINVAL) {
-            if (::fsync(fd) != 0) {
-                throw BuildErrnoError("failed to fsync file", path, errno);
-            }
-            return;
-        }
-        throw BuildErrnoError("failed to fdatasync file", path, data_sync_error);
-    }
+    inject_failure = inject_failure || (live && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_FILE_FAIL_ONCE"));
+#endif
+#endif
+#if defined(__APPLE__)
+    const int fullsync_error = inject_failure ? EIO : (::fcntl(fd, F_FULLFSYNC, 0) == 0 ? 0 : errno);
+    if (fullsync_error == 0) return;
+    if (fullsync_error != EINVAL && fullsync_error != ENOTSUP && fullsync_error != ENOTTY)
+        ThrowFdSyncError("failed to F_FULLFSYNC file", path, fullsync_error, live);
+    if (::fsync(fd) != 0) ThrowFdSyncError("failed to fsync file", path, errno, live);
+#else
+    const int data_sync_error = inject_failure ? EIO : (::fdatasync(fd) == 0 ? 0 : errno);
+    if (data_sync_error == 0) return;
+    if (data_sync_error != EINVAL) ThrowFdSyncError("failed to fdatasync file", path, data_sync_error, live);
+    if (::fsync(fd) != 0) ThrowFdSyncError("failed to fsync file", path, errno, live);
 #endif
 }
 
@@ -604,12 +638,8 @@ void WriteAtomicTempFile(
         });
 
         if (durable_sync) {
-            if (enable_generic_failpoints &&
-                ConsumeFailpointEnv("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_SYNC_FAIL_ONCE")) {
-                throw std::runtime_error(
-                    "injected temporary file sync failure: " + tmp_path.string());
-            }
-            SyncFdDurably(fd, tmp_path, true);
+            SyncFdDurably(fd, tmp_path, false,
+                enable_generic_failpoints && ConsumeFailpointEnv("CHUNKDB_FAILPOINT_ATOMICWRITE_TEMP_SYNC_FAIL_ONCE"));
         }
 
         if (enable_generic_failpoints &&
@@ -752,7 +782,7 @@ std::error_code ExchangeDirectories(
 // drive to flush its cache as well (F_FULLFSYNC); plain fsync does not.
 namespace {
 // Returns false, without syncing, when `missing_ok` and `path` does not exist.
-bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
+bool SyncFileAt(const std::filesystem::path& path, bool missing_ok, bool inject_failure) {
     int fd = ::open(path.c_str(), O_RDONLY);
     if (fd < 0) {
         const int open_error = errno;
@@ -762,7 +792,10 @@ bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
         throw BuildErrnoError("failed to open file for durability sync", path, open_error);
     }
     try {
-        SyncFdDurably(fd, path, true);
+        {
+            const DurabilitySyncState::Active sync(fd, path);
+            SyncFdDurably(fd, path, true, inject_failure);
+        }
         CloseFdChecked(fd, path, "failed to close synced file");
     } catch (...) {
         if (fd >= 0) {
@@ -773,7 +806,7 @@ bool SyncFileAt(const std::filesystem::path& path, bool missing_ok) {
     return true;
 }
 
-bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
+bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok, bool inject_failure) {
     int fd = ::open(path.c_str(), O_RDONLY | O_DIRECTORY);
     if (fd < 0) {
         const int open_error = errno;
@@ -783,23 +816,24 @@ bool SyncDirectoryAt(const std::filesystem::path& path, bool missing_ok) {
         throw BuildErrnoError("failed to open directory for durability sync", path, open_error);
     }
     try {
-#if defined(__APPLE__)
-        // As for files: a directory entry is durable only once the drive's
-        // cache is flushed too.
-        if (::fcntl(fd, F_FULLFSYNC, 0) != 0) {
-            const int fullsync_error = errno;
-            if (fullsync_error != EINVAL && fullsync_error != ENOTSUP && fullsync_error != ENOTTY) {
-                throw BuildErrnoError("failed to F_FULLFSYNC directory", path, fullsync_error);
-            }
-            if (::fsync(fd) != 0) {
-                throw BuildErrnoError("failed to sync directory", path, errno);
-            }
-        }
-#else
-        if (::fsync(fd) != 0) {
-            throw BuildErrnoError("failed to sync directory", path, errno);
-        }
+        {
+            const DurabilitySyncState::Active sync(fd, path);
+#ifdef CHUNKDB_FAILPOINTS
+            inject_failure = inject_failure || ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE");
 #endif
+#if defined(__APPLE__)
+            // As for files, flush the drive cache before publishing directory entries.
+            const int fullsync_error = inject_failure ? EIO : (::fcntl(fd, F_FULLFSYNC, 0) == 0 ? 0 : errno);
+            if (fullsync_error != 0) {
+                if (fullsync_error != EINVAL && fullsync_error != ENOTSUP && fullsync_error != ENOTTY)
+                    ThrowFdSyncError("failed to F_FULLFSYNC directory", path, fullsync_error, true);
+                if (::fsync(fd) != 0) ThrowFdSyncError("failed to sync directory", path, errno, true);
+            }
+#else
+            const int error = inject_failure ? EIO : (::fsync(fd) == 0 ? 0 : errno);
+            if (error != 0) ThrowFdSyncError("failed to sync directory", path, error, true);
+#endif
+        }
         CloseFdChecked(fd, path, "failed to close synced directory");
     } catch (...) {
         if (fd >= 0) {
@@ -825,53 +859,69 @@ void SyncOwnerDirectoryHandle(void* handle, const std::filesystem::path& label) 
         error = GetLastError();
     }
     if (error != ERROR_SUCCESS) {
-        throw BuildWin32Error("strict durability requires owner directory sync capability", label, error);
+        throw SyncFailedError(BuildWin32Error("strict durability requires owner directory sync capability", label, error));
     }
     NoteDirectorySynced(label);
 }
 #else
 void SyncOwnerFileDescriptor(int fd, const std::filesystem::path& label) {
-    SyncFdDurably(fd, label, true);
+    SyncFdDurably(fd, label);
     NoteFileSynced(label);
 }
 void SyncOwnerDirectoryDescriptor(int fd, const std::filesystem::path& label) {
 #if defined(__APPLE__)
     if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE")) {
-        throw BuildErrnoError("failed to F_FULLFSYNC owner directory", label, EIO);
+        throw SyncFailedError(BuildErrnoError("failed to F_FULLFSYNC owner directory", label, EIO));
     }
     if (::fcntl(fd, F_FULLFSYNC, 0) != 0) {
         const int error = errno;
         if (error != EINVAL && error != ENOTSUP && error != ENOTTY) {
-            throw BuildErrnoError("failed to F_FULLFSYNC owner directory", label, error);
+            throw SyncFailedError(BuildErrnoError("failed to F_FULLFSYNC owner directory", label, error));
         }
-        if (::fsync(fd) != 0) throw BuildErrnoError("failed to sync owner directory", label, errno);
+        if (::fsync(fd) != 0) throw SyncFailedError(BuildErrnoError("failed to sync owner directory", label, errno));
     }
 #else
-    if (::fsync(fd) != 0) throw BuildErrnoError("failed to sync owner directory", label, errno);
+    if (::fsync(fd) != 0) throw SyncFailedError(BuildErrnoError("failed to sync owner directory", label, errno));
 #endif
     NoteDirectorySynced(label);
 }
 #endif
 
 void SyncFilePath(const std::filesystem::path& path) {
-    if (SyncWithFence(path, false, false, SyncFileAt)) NoteFileSynced(path);
+    if (SyncFileAt(path, false, false)) NoteFileSynced(path);
 }
 
 bool SyncFilePathIfPresent(const std::filesystem::path& path) {
-    if (!SyncWithFence(path, true, false, SyncFileAt)) return false;
+    if (!SyncFileAt(path, true, false)) return false;
     NoteFileSynced(path);
     return true;
 }
 
 void SyncDirectoryPath(const std::filesystem::path& path) {
-    if (SyncWithFence(path, false, true, SyncDirectoryAt)) NoteDirectorySynced(path);
+    if (SyncDirectoryAt(path, false, false)) NoteDirectorySynced(path);
 }
 
 bool SyncDirectoryPathIfPresent(const std::filesystem::path& path) {
-    if (!SyncWithFence(path, true, true, SyncDirectoryAt)) return false;
+    if (!SyncDirectoryAt(path, true, false)) return false;
     NoteDirectorySynced(path);
     return true;
 }
+
+#ifdef CHUNKDB_FAILPOINTS
+void SyncFilePath(const std::filesystem::path& path, bool inject_failure) {
+    if (SyncFileAt(path, false, inject_failure)) NoteFileSynced(path);
+}
+
+bool SyncFilePathIfPresent(const std::filesystem::path& path, bool inject_failure) {
+    if (!SyncFileAt(path, true, inject_failure)) return false;
+    NoteFileSynced(path);
+    return true;
+}
+
+void SyncDirectoryPath(const std::filesystem::path& path, bool inject_failure) {
+    if (SyncDirectoryAt(path, false, inject_failure)) NoteDirectorySynced(path);
+}
+#endif
 
 void SyncParentDirectory(const std::filesystem::path& path) {
     std::filesystem::path parent = path.parent_path();

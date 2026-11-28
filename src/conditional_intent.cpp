@@ -508,17 +508,14 @@ void ChunkStore::ClearCommittedConditionalIntent(
     }
     PauseConditionalMutationForTests(
         ConditionalMutationPausePoint::kAfterCommitIntentUnlink);
-    if (ConsumeFailpointEnv(
-            "CHUNKDB_FAILPOINT_CONDITIONAL_INTENT_AFTER_UNLINK_BEFORE_DIR_SYNC_ONCE")) {
-        ScopedDurabilitySync::Fail();
-        throw std::runtime_error(
-            "injected conditional intent cleanup failure after unlink before "
-            "directory sync: " +
-            intent_path.string());
-    }
     CrashAtFailpoint(
         "CHUNKDB_FAILPOINT_CRASH_CONDITIONAL_AFTER_INTENT_UNLINK_ONCE");
+#ifdef CHUNKDB_FAILPOINTS
+    SyncDirectoryPath(intent_path.parent_path(),
+        ConsumeFailpointEnv("CHUNKDB_FAILPOINT_CONDITIONAL_INTENT_AFTER_UNLINK_BEFORE_DIR_SYNC_ONCE"));
+#else
     SyncDirectoryPath(intent_path.parent_path());
+#endif
 }
 
 void ChunkStore::PoisonDurability(std::string reason) noexcept {

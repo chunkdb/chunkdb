@@ -1,9 +1,12 @@
 #pragma once
 
 #include <atomic>
+#include <condition_variable>
+#include <cstddef>
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <mutex>
 #include <span>
 #include <string>
 #include <system_error>
@@ -11,21 +14,50 @@
 
 namespace chunkdb {
 
-// Binds path syncs (including the directory step of AtomicWrite) to the
-// open store. A barrier passes the same fence to its sync workers.
+// A file or directory sync (fsync, fdatasync, F_FULLFSYNC, FlushFileBuffers)
+// that failed. The kernel may already have dropped the dirty pages, so a
+// later sync of the same file can succeed without making them durable.
+class SyncFailedError : public std::system_error {
+  public:
+    explicit SyncFailedError(const std::system_error& error, bool fenced_table = false)
+        : std::system_error(error), fenced_table_(fenced_table) {}
+    [[nodiscard]] bool fenced_table() const noexcept { return fenced_table_; }
+
+  private:
+    bool fenced_table_;
+};
+
+// Owned by one writable store (or one closed SWAP participant). Only
+// concurrent attempts on the same native object wait for the device sync.
+class DurabilitySyncState {
+  public:
+    explicit DurabilitySyncState(std::atomic<bool>& fence) : fence_(fence) {}
+
+    class Active;
+
+  private:
+    friend class ScopedDurabilitySync;
+    std::atomic<bool>& fence_;
+    std::mutex mutex_;
+    std::condition_variable completed_;
+    Active* active_ = nullptr;
+    std::size_t waiters_ = 0U;
+};
+
+// Binds path syncs to their open store. Barrier workers inherit the scope.
 class ScopedDurabilitySync {
   public:
-    explicit ScopedDurabilitySync(std::atomic<bool>* fence) noexcept;
+    explicit ScopedDurabilitySync(DurabilitySyncState* state) noexcept;
     ~ScopedDurabilitySync();
     ScopedDurabilitySync(const ScopedDurabilitySync&) = delete;
     ScopedDurabilitySync& operator=(const ScopedDurabilitySync&) = delete;
 
-    static std::atomic<bool>* Current() noexcept;
+    static DurabilitySyncState* Current() noexcept;
     static void Check();
     static void Fail() noexcept;
 
   private:
-    std::atomic<bool>* previous_;
+    DurabilitySyncState* previous_;
 };
 
 // Sync the already admitted native generation without reopening its path.

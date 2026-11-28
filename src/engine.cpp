@@ -2,6 +2,7 @@
 #include "audit_log.hpp"
 #include "backup.hpp"
 #include "catalog_feed.hpp"
+#include "durability_io.hpp"
 #include "source_address.hpp"
 
 #include <algorithm>
@@ -904,13 +905,16 @@ std::string CommandEngine::ErrorReply(const std::exception& error) {
             LogComponent::kStore,
             "command execution error; outcome unknown",
             {{"error", error.what()}});
-        return Protocol::Error(
-            "OUTCOME_UNKNOWN",
+        constexpr std::string_view message =
             "write outcome unknown: it may or may not be applied; the table is fail-closed until "
-            "RECOVER TABLE or a server restart", {{"stage", outcome->stage()}});
+            "RECOVER TABLE or a server restart";
+        if (!outcome->table().empty())
+            return Protocol::Error("OUTCOME_UNKNOWN", message, {{"stage", outcome->stage()}, {"table", outcome->table()}});
+        return Protocol::Error("OUTCOME_UNKNOWN", message, {{"stage", outcome->stage()}});
     }
+    const auto* sync = dynamic_cast<const SyncFailedError*>(&error);
     if (const auto* io = dynamic_cast<const std::system_error*>(&error);
-        io != nullptr && io->code() == std::errc::no_space_on_device)
+        io != nullptr && io->code() == std::errc::no_space_on_device && (!sync || !sync->fenced_table()))
         return Protocol::Error("DISK_FULL", "storage has no free space; free space before retrying");
     LogMessage(
         LogLevel::kError,

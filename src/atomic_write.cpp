@@ -214,6 +214,7 @@ void AtomicWriteImpl(
     }
 
     if (fsync_directory) {
+#ifdef CHUNKDB_FAILPOINTS
         const bool generic_failure =
             enable_generic_failpoints &&
             ConsumeFailpointEnv(
@@ -221,12 +222,17 @@ void AtomicWriteImpl(
         const bool targeted_failure =
             after_rename_failpoint != nullptr &&
             ConsumeFailpointEnv(after_rename_failpoint);
-        if (generic_failure || targeted_failure) {
-            if (generic_failure) ScopedDurabilitySync::Fail();
+        // Targeted hooks can interrupt publication before the first sync.
+        // The generic hook injects a native failure at the sync itself.
+        if (targeted_failure && !generic_failure) {
             throw std::runtime_error(
                 "injected atomic write failure after replace before directory sync: " + path.string());
         }
+        SyncDirectoryPath(parent, generic_failure);
+#else
+        (void)after_rename_failpoint;
         SyncDirectoryPath(parent);
+#endif
     }
 }
 

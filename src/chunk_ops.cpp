@@ -67,7 +67,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     // WAL can be gone after a power loss, leaving an intent that cannot be
     // applied. A relaxed write, or a process that crashed, may also have
     // left the image this frame's value records apply over without a sync.
-    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
+    const ScopedDurabilitySync sync_scope(durability_sync_state_.get());
     MakeWalBoundaryDurableLocked(chunk_coord, chunk, /*own_stream=*/false);
 
     // Reserve the version token before anything about this mutation can become

@@ -45,6 +45,7 @@ class SnapshotGenerationMapping;
 class ChunkCoordinateIndex;
 struct ChunkCoordinateNode;
 struct ChunkIndexRecord;
+class DurabilitySyncState;
 
 #if defined(__MINGW32__) && \
     (!defined(CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS) || CHUNKDB_MINGW_SERIAL_CHUNK_LOCKS)
@@ -547,9 +548,12 @@ class ConditionFailedError : public std::runtime_error {
 // unknown (any other write error means "not applied").
 class WriteOutcomeUnknownError : public std::runtime_error {
   public:
-    enum class Stage { kPublication, kConditionalCommitSync, kWalAppendRepair, kTransactionCommitSync, kSlotRecords, kFeatureActivation };
+    enum class Stage { kPublication, kConditionalCommitSync, kWalAppendRepair, kTransactionCommitSync, kSlotRecords, kFeatureActivation, kBarrierSync };
     explicit WriteOutcomeUnknownError(std::string message, Stage stage = Stage::kPublication)
         : std::runtime_error(std::move(message)), stage_(stage) {}
+    WriteOutcomeUnknownError(const WriteOutcomeUnknownError& error, std::shared_ptr<const std::string> table) noexcept
+        : std::runtime_error(error), stage_(error.stage_), table_(std::move(table)) {}
+    [[nodiscard]] std::string_view table() const noexcept { return table_ ? std::string_view(*table_) : std::string_view{}; }
     [[nodiscard]] std::string_view stage() const noexcept {
         switch (stage_) {
             case Stage::kConditionalCommitSync: return "conditional_commit_sync";
@@ -557,12 +561,15 @@ class WriteOutcomeUnknownError : public std::runtime_error {
             case Stage::kTransactionCommitSync: return "transaction_commit_sync";
             case Stage::kSlotRecords: return "slot_records";
             case Stage::kFeatureActivation: return "feature_activation";
+            case Stage::kBarrierSync: return "barrier_sync";
             case Stage::kPublication: return "write_publication";
         }
         return "write_publication";
     }
   private:
     Stage stage_;
+    // Copies of a prepared outcome error after publication must never allocate.
+    std::shared_ptr<const std::string> table_{};
 };
 
 // Transactions (docs/design/TRANSACTIONS_DESIGN.md).
@@ -1447,6 +1454,7 @@ class ChunkStore {
     // store refuses further mutations and barriers (fail-closed); the reason is
     // preserved for the error surfaced to callers.
     std::atomic<bool> durability_poisoned_{false};
+    std::unique_ptr<DurabilitySyncState> durability_sync_state_;
     mutable std::mutex poison_mutex_;
     std::string poison_reason_;
 

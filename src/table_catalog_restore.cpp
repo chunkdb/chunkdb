@@ -284,7 +284,13 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
             throw TableFencedError("table '" + names[i] + "' is fenced: " + reason + "; run RECOVER TABLE " + names[i]);
     }
     // Everything acknowledged becomes durable under the old names first.
-    for (auto& store : stores) store->WalBarrier();
+    for (std::size_t i = 0U; i < stores.size(); ++i) {
+        try {
+            stores[i]->WalBarrier();
+        } catch (const WriteOutcomeUnknownError& error) {
+            throw WriteOutcomeUnknownError(error, {tables[i], &tables[i]->name()});
+        }
+    }
     const std::array<std::filesystem::path, 2U> dirs{tables[0]->dir_, tables[1]->dir_};
     // Made now, so that fencing does not allocate.
     std::array<FenceNode, 2U> fences{PrepareFence(tables[0], names[0], kFenceSwapUnknown),
@@ -296,6 +302,9 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
     // A stop accepted until here leaves both tables serving as they were;
     // after it the statement reports its real outcome.
     EnterStatementDecision();
+    std::array<std::atomic<bool>, 2U> slot_sync_failed{};
+    std::array<DurabilitySyncState, 2U> slot_sync_states{
+        DurabilitySyncState(slot_sync_failed[0]), DurabilitySyncState(slot_sync_failed[1])};
     serving.Dismiss();
     for (std::size_t i = 0; i < stores.size(); ++i) {
         stores[i]->HandOverUnsyncedOnClose(unsynced[i]);
@@ -323,7 +332,6 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
     // consumer must resync. The marks are durable before the exchange, so no
     // crash loses them; a crash before it leaves only an extra resync.
     std::array<std::optional<FeedSlotRecords>, 2U> slot_records;
-    std::array<std::atomic<bool>, 2U> slot_sync_failed{};
     std::error_code exchanged;
     std::exception_ptr failure;
     try {
@@ -331,7 +339,7 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
             if (pending->durability_failed_on_close)
                 throw std::runtime_error("table durability failed during SWAP TABLES; run RECOVER TABLE or restart");
         for (std::size_t i = 0; i < dirs.size(); ++i) {
-            const ScopedDurabilitySync sync_scope(&slot_sync_failed[i]);
+            const ScopedDurabilitySync sync_scope(&slot_sync_states[i]);
             slot_records[i] = RequireSlotResync(dirs[i], tables[i]->store_id(), tables[i]->geometry().dims());
         }
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SWAP_TABLES_SLOT_MARK_FAIL_ONCE"))
@@ -353,7 +361,7 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
             }
             if (slot_records[i]) {
                 try {
-                    const ScopedDurabilitySync sync_scope(&slot_sync_failed[i]);
+                    const ScopedDurabilitySync sync_scope(&slot_sync_states[i]);
                     WriteFeedSlotRecords(dirs[i], *slot_records[i]);
                 } catch (const std::exception& error) {
                     LogMessage(LogLevel::kWarn, LogComponent::kStore,
@@ -383,9 +391,11 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
     }
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_EXCHANGE_ONCE");
     try {
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SWAP_TABLES_SYNC_FAIL_ONCE"))
-            throw std::runtime_error("injected directory sync failure after exchanging tables");
+#ifdef CHUNKDB_FAILPOINTS
+        SyncDirectoryPath(TablesDir(), ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SWAP_TABLES_SYNC_FAIL_ONCE"));
+#else
         SyncDirectoryPath(TablesDir());
+#endif
     } catch (const std::exception& error) {
         // Exchanged now, but a crash could still undo it: neither name serves
         // until a recovery opens what its directory holds.
@@ -473,7 +483,11 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     if (Find(to) != nullptr)
         throw TableExistsError("table '" + to + "' already exists; use another name, or DROP TABLE " + to + " first");
     // Everything acknowledged becomes durable under the old name first.
-    store->WalBarrier();
+    try {
+        store->WalBarrier();
+    } catch (const WriteOutcomeUnknownError& error) {
+        throw WriteOutcomeUnknownError(error, {table, &table->name()});
+    }
     const std::filesystem::path old_dir = table->dir_;
     const std::filesystem::path new_dir = TablesDir() / to;
     // Made now, so that fencing and publishing do not allocate.
@@ -538,9 +552,11 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     }
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_RENAME_ONCE");
     try {
-        if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_TABLE_SYNC_FAIL_ONCE"))
-            throw std::runtime_error("injected directory sync failure after renaming a table");
+#ifdef CHUNKDB_FAILPOINTS
+        SyncDirectoryPath(TablesDir(), ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_TABLE_SYNC_FAIL_ONCE"));
+#else
         SyncDirectoryPath(TablesDir());
+#endif
     } catch (const std::exception& error) {
         // Renamed now, but a crash could still undo it: as after a failed
         // swap, neither name serves until a recovery opens what its

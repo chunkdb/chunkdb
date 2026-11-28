@@ -300,7 +300,7 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting, const std::error
 
 void ChunkStore::ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive) {
     ThrowIfDurabilityPoisoned();
-    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
+    const ScopedDurabilitySync sync_scope(durability_sync_state_.get());
     // Called under version_clock_mutex_. Persists a new ceiling above
     // minimum_exclusive before it is used, so a crash can never leave issued
     // tokens above the durable ceiling.

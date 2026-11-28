@@ -494,7 +494,10 @@ void RetriedFlushWalRequiresRecovery() {
     assert(e.Run("SET BLOCK 0 0 IN other v=5").front() == ':');
     {
         txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_BARRIER_FILE_SYNC_FAIL_ONCE", "1");
-        Error(e.Run("FLUSH WAL"), "INTERNAL");
+        const auto failed = e.Run("FLUSH WAL");
+        Error(failed, "OUTCOME_UNKNOWN");
+        assert(failed.find("stage=barrier_sync") != std::string::npos);
+        assert(failed.find("table=other") != std::string::npos);
     }
     Error(e.Run("FLUSH WAL"), "INTERNAL");
     assert(e.catalog->Fence("other"));

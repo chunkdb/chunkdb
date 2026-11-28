@@ -311,7 +311,7 @@ void FeedSlots::Run() {
 }
 void FeedSlots::Persist(FeedSlotRecords next) {
     store_.ThrowIfDurabilityPoisoned();
-    const ScopedDurabilitySync sync_scope(&store_.durability_poisoned_);
+    const ScopedDurabilitySync sync_scope(store_.durability_sync_state_.get());
     next.filter_format = next.filter_format || std::any_of(next.slots.begin(), next.slots.end(),
         [](const auto& slot) { return !slot.filters.empty() || slot.schema_filter_lost; });
     bool published = false;
@@ -561,7 +561,7 @@ void FeedSlots::Sync(std::uint64_t completed) {
 bool FeedSlots::SyncImpl(std::uint64_t completed) {
     std::unique_lock barrier_lock(store_.wal_barrier_mutex_);
     store_.ThrowIfDurabilityPoisoned();
-    const ScopedDurabilitySync sync_scope(&store_.durability_poisoned_);
+    const ScopedDurabilitySync sync_scope(store_.durability_sync_state_.get());
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kBeforeFlush, completed);
     std::vector<std::shared_ptr<ChunkStore::LargeChunk>> large_chunks;
     {
@@ -638,7 +638,7 @@ bool FeedSlots::SyncImpl(std::uint64_t completed) {
 }
 void FeedSlots::Retain() {
     store_.ThrowIfDurabilityPoisoned();
-    const ScopedDurabilitySync sync_scope(&store_.durability_poisoned_);
+    const ScopedDurabilitySync sync_scope(store_.durability_sync_state_.get());
     std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
     std::lock_guard lock(mutex_);
     auto next = records_;

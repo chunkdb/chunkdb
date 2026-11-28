@@ -410,7 +410,7 @@ void SwapSlotSyncFailureFencesParticipant() {
     {
         // Fails publication of the source slot's resync mark, before any exchange.
         txn_test::ScopedEnv failure("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
-        assert(Throws([&] { catalog.SwapTables("t", "t_restored"); }).find("before directory sync") != std::string::npos);
+        assert(Throws([&] { catalog.SwapTables("t", "t_restored"); }).find("directory") != std::string::npos);
     }
     assert(catalog.Fence("t") && !catalog.Fence("t_restored"));
     Throws<TableFencedError>([&] { catalog.SwapTables("t", "t_restored"); });

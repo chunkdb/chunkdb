@@ -263,18 +263,14 @@ void FailedFirstWriteStaysNeverWritten() {
         // The refused frame left nothing a restart could replay.
         assert(!std::filesystem::exists(ChunkWalPath(store.data_dir(), store.geometry(), {0, 0})));
     };
-    for (const bool transform : {false, true}) {
+    {
         ChunkStore store(config);
         auto state = store.ReadChunkState(0, 0);
         state.payload[0] = 7U;
         state.presence_bitmap[0] = 1U;
         state.chunk_columns = Owner(store, 5U);
-        refused(store, [&] {
-            if (transform)
-                (void)store.TransformChunkState({0, 0}, {}, false, [&](ChunkState& target) { target = state; });
-            else
-                (void)store.WriteChunkState({0, 0}, state, {});
-        });
+        refused(store, [&] { (void)store.WriteChunkState({0, 0}, state, {}); });
+        refused(store, [&] { (void)store.TransformChunkState({0, 0}, {}, false, [&](ChunkState& target) { target = state; }); });
     }
     std::uint64_t version = 0U;
     {

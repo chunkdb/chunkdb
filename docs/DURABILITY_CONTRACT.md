@@ -71,9 +71,21 @@ An unpublished temporary file can be discarded and written again to a fresh file
 If a conditional or transaction commit marker becomes visible before its directory sync fails, the operation reports an unknown outcome and leaves the marker for recovery.
 If the decision was already durable when an intent cleanup or checkpoint sync failed, the operation still reports the committed result. The failure fences subsequent writes.
 
-Named migrations use a durable decision containing their metadata change and completion record.
-After an unknown migration outcome, restart and retry the same name and text.
-A failed backup or restore sync fails the operation. Retrying a copy requires fresh files. A restore that still has its incomplete guard is treated as interrupted.
+A failed sync during FLUSH WAL reports `OUTCOME_UNKNOWN stage=barrier_sync` with the affected table.
+The server finishes the other tables' barriers before returning. A failure before the sync can be retried while the table is healthy.
+
+### Syncs outside an open table
+
+| Context | Failure and recovery |
+| --- | --- |
+| Users file | An unpublished replacement can be retried with a fresh file. A visible replacement with an unconfirmed directory sync reports `OUTCOME_UNKNOWN stage=users_record`. The registry keeps the visible users state and writes it to a fresh file before another users change can succeed. A sync failure opening the registry refuses startup. |
+| Named migration and feature activation records | A failed private preparation can be discarded. After a decision becomes visible, a sync failure fences the catalog until writer restart, which checks and completes any retained decision. Named migrations can then be retried by the same name and text. |
+| Data directory manifest | A sync failure during first publication refuses startup. A failed version-floor update stops DROP before it moves the table. A later attempt writes a fresh manifest and only a successful publication advances the in-memory floor. Feature activation follows the catalog fence above. |
+| Backup and restore staging | A failed sync aborts the copy or its publication. A fresh attempt writes fresh output files, and a copy that still has its incomplete guard is treated as interrupted. A failed destination sync leaves the source tables' admission unchanged. |
+| Table directory publication | CREATE and RESTORE TABLE attempt to retire a failed publication and fence the name if they cannot. A failed sync after DROP moves a table reserves the name until recovery. A failed sync after a swap or rename fences the affected names. |
+| Slot records and version clock | Startup initialization and recovery refuse table opening on a sync failure. A failure in a private restored copy aborts that copy. SWAP uses a fence for each closed participant while writing its slot marks. A live slot record or clock publication uses its open table's fence. A failed offline clock rebuild returns an error to the operator. |
+| Recovery and rollback | Failed startup repairs refuse writer opening. An already fenced table can still repair a rejected WAL tail or publish a fresh snapshot close record where read-only replay is coherent. Those operations leave the durability fence in force. |
+
 Malformed WAL headers and interior frames are refused; only crash-shaped incomplete tails are repaired during writer recovery.
 
 Keep `chunkdb.version` and `.chunkdb.initialized` with every table's artifacts.
@@ -86,7 +98,7 @@ Read-only inspection remains available and reports an unknown completed revision
 
 - Linux uses fdatasync where applicable, with fsync fallback and directory fsync.
 - macOS requests F_FULLFSYNC and falls back to fsync for unsupported operations.
-- Windows requires FlushFileBuffers and the directory-sync capability used by publication and snapshot bookkeeping.
+- Windows requires FlushFileBuffers, native file IDs for scoped live-artifact syncs, and the directory-sync capability used by publication and snapshot bookkeeping.
 - Required atomic publication or sync failures return errors, including required Windows bookkeeping in relaxed mode.
 - SWAP TABLES needs an atomic directory exchange (Linux `renameat2`, macOS `renamex_np`); Windows and file systems without one refuse it.
 - Replication and durability across machines are unavailable.

@@ -218,7 +218,7 @@ void UnknownReplacementPublishesWholeImage() {
     UserRegistry users(dir.path(), std::make_pair(std::string("admin"), Verifier()), {});
     const auto before = users.Snapshot();
     {
-        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_ATOMICWRITE_AFTER_RENAME_BEFORE_DIR_SYNC_ONCE", "1");
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE", "1");
         bool unknown = false;
         try { users.SetLimits("admin", 1U, 7U); }
         catch (const UsersOutcomeUnknownError&) { unknown = true; }

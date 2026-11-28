@@ -695,7 +695,7 @@ ChunkStore::LoadedChunkPayload ChunkStore::LoadChunkPayload(const ChunkCoord& ch
 }
 
 void ChunkStore::TrimWalForAppend(const ChunkCoord& chunk_coord, const std::filesystem::path& wal_path, std::size_t keep_bytes) {
-    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
+    const ScopedDurabilitySync sync_scope(durability_sync_state_.get());
     SnapshotGenerationWriteGuard snapshot_write(this, chunk_coord);
     std::lock_guard publish_lock(checkpoint_publish_mutex_);
     const bool strict =

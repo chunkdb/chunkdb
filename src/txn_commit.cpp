@@ -584,7 +584,7 @@ std::uint64_t ChunkStore::CommitTransaction(
         return 0;
     }
 
-    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
+    const ScopedDurabilitySync sync_scope(durability_sync_state_.get());
     // Each WAL's size becomes a durable boundary the transaction can go back
     // to.
     for (std::size_t i = 0; i < changes.size(); ++i) {

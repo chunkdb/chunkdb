@@ -201,6 +201,9 @@ inline constexpr bool kFailpointsCompiled = true;
 #else
 inline constexpr bool kFailpointsCompiled = false;
 #endif
+#ifdef CHUNKDB_FAILPOINTS
+void SetBarrierBeforeLockHookForTests(const std::function<void()>* hook) noexcept;
+#endif
 [[nodiscard]] bool ConsumeFailpointEnv(const char* key);
 [[nodiscard]] std::chrono::milliseconds ConsumeFailpointDelayMs(const char* key);
 // Ends the process at once with `code`, as a crash does: no destructors,

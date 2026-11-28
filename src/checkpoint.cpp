@@ -205,7 +205,7 @@ bool ChunkStore::CheckpointChunk(
     // rollback intent still needs at the next start; replacing that WAL with
     // an image would make the store unopenable.
     ThrowIfDurabilityPoisoned();
-    const ScopedDurabilitySync sync_scope(&durability_poisoned_);
+    const ScopedDurabilitySync sync_scope(durability_sync_state_.get());
     // The image and the WAL change, in relaxed mode without a sync.
     chunk->wal_boundary_durable = false;
     if (!ChunkPopulated(geometry_, chunk->presence_bitmap, chunk->chunk_columns.get())) {

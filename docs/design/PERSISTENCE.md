@@ -38,8 +38,8 @@ A publication before the drain left its unsynced artifacts in the drained set.
 A later one sees the floor and syncs its replacement before removing or replacing a WAL.
 A conditional write or transaction that syncs its chunk's files itself leaves them in every drain until its syncs end.
 Writes acknowledged after it started may require the next barrier.
-A failed sync fences the table. The barrier's drained tracking set is eligible for retry only if an error interrupted the work without a sync failure.
-File and directory path syncs serialize overlapping attempts on the same artifact so later attempts observe the fence. The barrier still syncs independent files in parallel.
+A failed sync fences the table and reports an unknown barrier outcome. An error before the sync leaves the tracking set eligible for retry while the table is healthy.
+File and directory path syncs identify the opened object by its native file ID, including through archive links. Each table tracks active syncs under a short mutex and waits for a device sync only when the native ID matches. The barrier still syncs independent files in parallel.
 A clean shutdown attempts barrier work on writable tables and logs failure.
 After a crash, a new process's barrier cannot recover acknowledged writes already lost by that crash.
 

@@ -1,1 +1,1 @@
-- Fence affected tables after a failed durability sync until recovery. Retried FLUSH WAL reports the fence, and pending commit intents remain available for recovery. (#282)
+- Fence affected tables after a failed durability sync until recovery. FLUSH WAL reports an unknown outcome for the failed sync and refuses a retry while the table is fenced. Syncs of independent files can proceed concurrently. (#282)

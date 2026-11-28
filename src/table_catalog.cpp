@@ -2406,7 +2406,7 @@ void TableCatalog::RewriteManifest(
     bool replaced = false;
     std::exception_ptr write_failure;
     try {
-        const ScopedDurabilitySync sync_scope(&store->durability_poisoned_);
+        const ScopedDurabilitySync sync_scope(store->durability_sync_state_.get());
         auto manifest = ReadStoreManifest(table.dir_);
         if (!manifest.has_value()) {
             throw std::runtime_error("table manifest of '" + table.name_ + "' disappeared");
@@ -2532,9 +2532,20 @@ void TableCatalog::WalBarrier() {
         auto failure = pool->Wait(barriers[i]);
         if (!failures[i]) failures[i] = failure;
     }
-    for (const auto& failure : failures) {
-        if (failure) std::rethrow_exception(failure);
+    // Clients must see an ambiguous outcome before deciding whether it is
+    // safe to retry. Keep table order for failures of the same priority.
+    std::exception_ptr definite_failure;
+    for (std::size_t i = 0U; i < failures.size(); ++i) {
+        if (!failures[i]) continue;
+        try {
+            std::rethrow_exception(failures[i]);
+        } catch (const WriteOutcomeUnknownError& error) {
+            throw WriteOutcomeUnknownError(error, {tables[i], &tables[i]->name()});
+        } catch (const std::exception&) {
+            if (!definite_failure) definite_failure = failures[i];
+        }
     }
+    if (definite_failure) std::rethrow_exception(definite_failure);
     if (!fenced.empty()) ThrowIfFenced(fenced);
     migration_health_->Check();
 }

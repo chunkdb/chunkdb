@@ -19,6 +19,7 @@
 
 #include "change_feed.hpp"
 #include "chunkdb/chunk_store.hpp"
+#include "checkpoint.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "store_manifest.hpp"
@@ -1074,10 +1075,10 @@ void TestParallelBarrierFailureStillFlushesOtherTables() {
     auto second = catalog.Create("beta", kDefaultGeometry, {});
     WriteBits(catalog, "alpha", 0, 0, "1111");
     WriteBits(catalog, "beta", 0, 0, "1001");
-    SetFailpoint("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE");
+    SetFailpoint("CHUNKDB_FAILPOINT_BARRIER_FSYNC_EIO_ONCE");
     const auto error = ErrorOf([&] { catalog.WalBarrier(); });
-    ClearFailpoint("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE");
-    assert(Contains(error, "injected barrier sync failure"));
+    ClearFailpoint("CHUNKDB_FAILPOINT_BARRIER_FSYNC_EIO_ONCE");
+    assert(Contains(error, "injected barrier fsync failure"));
     const auto barriers = [&] {
         return first->Acquire()->store().RuntimeStats().wal_barriers +
             second->Acquire()->store().RuntimeStats().wal_barriers;
@@ -1248,15 +1249,40 @@ void TestFailedDropCannotReopenAfterSyncError() {
     options.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
     (void)catalog.Create("p", kDefaultGeometry, options);
     WriteBits(catalog, "p", 0, 0, "0001");
-    SetFailpoint("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
+    SetFailpoint("CHUNKDB_FAILPOINT_WAL_BATCH_FSYNC_EIO_ONCE");
     assert(!ErrorOf([&] { WriteBits(catalog, "p", 0, 0, "0010"); }).empty());
-    ClearFailpoint("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE");
+    ClearFailpoint("CHUNKDB_FAILPOINT_WAL_BATCH_FSYNC_EIO_ONCE");
     SetFailpoint("CHUNKDB_FAILPOINT_TABLE_DROP_RENAME_FAIL_ONCE");
     assert(!ErrorOf([&] { catalog.Drop("p"); }).empty());
     ClearFailpoint("CHUNKDB_FAILPOINT_TABLE_DROP_RENAME_FAIL_ONCE");
     assert(catalog.Fence("p") && !catalog.Find("p"));
     catalog.RecoverTable("p");
     assert(ReadBits(catalog, "p", 0, 0) == "0001");
+}
+
+void TestSnapshotCloseSyncFailureFencesManifestReopen() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-catalog-close-sync");
+    TableCatalog catalog(Config(dir.path()));
+    (void)catalog.Create("p", kDefaultGeometry, {});
+    const auto table_dir = std::filesystem::weakly_canonical(dir.path() / "tables" / "p");
+    bool armed = false;
+    chunkdb::SetDirectorySyncObserverForTests([&](const auto& path) {
+        if (path == table_dir && !armed) {
+            // The new manifest is already durable. Fail the directory sync
+            // of the outgoing store's snapshot session record.
+            armed = true;
+            SetFailpoint("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE");
+        }
+    });
+    chunkdb::TableOptionsUpdate update;
+    update.checkpoint_update_interval = 50;
+    const auto failure = ErrorOf([&] { catalog.SetOptions("p", update); });
+    chunkdb::SetDirectorySyncObserverForTests({});
+    ClearFailpoint("CHUNKDB_FAILPOINT_FULL_SYNC_DIRECTORY_FAIL_ONCE");
+    assert(armed && Contains(failure, "fail-closed"));
+    assert(catalog.Fence("p") && !catalog.Find("p"));
+    catalog.RecoverTable("p");
+    assert(catalog.Find("p")->Info().options.checkpoint_update_interval == 50U);
 }
 
 std::uint64_t ChunkVersion(TableCatalog& catalog, const std::string& table) {
@@ -1388,6 +1414,7 @@ int main(int argc, char** argv) {
     TestReopenKeepsAcknowledgedWrites();
     TestSetOptionsRefusesFailClosedTable();
     TestFailedDropCannotReopenAfterSyncError();
+    TestSnapshotCloseSyncFailureFencesManifestReopen();
     TestRecreatedTableNeverReusesVersionTokens();
     TestCrashBoundaries(argv[0]);
     std::cout << "table catalog tests passed\n";

@@ -712,26 +712,26 @@ void TestFailedWriteRollsBack() {
     ScopedTempDir dir("chunkdb-vars-rollback");
     auto config = Config(dir.path());
     config.durability_mode = chunkdb::DurabilityMode::kFsyncWal;
-    const std::vector<std::function<void(chunkdb::ChunkStore&)>> writes = {
-        [](chunkdb::ChunkStore& store) { store.SetBlock(0, 0, {{"sign", std::string("gone")}, {"blob", BytesValue{.bytes = {1}}}}); },
-        [](chunkdb::ChunkStore& store) { store.SetBlock(0, 0, {{"sign", std::monostate{}}}); },
-        [](chunkdb::ChunkStore& store) { store.SetBlock(0, 0, {{"sign", std::string("longer!")}}); },
-        [](chunkdb::ChunkStore& store) { store.UnsetBlock(0, 0); },
-        [](chunkdb::ChunkStore& store) { (void)store.SetChunkStateBytes(0, 0, store.GetChunkPayloadBytes(0, 0), Bytes{0x00, 0x00}); },
-        [](chunkdb::ChunkStore& store) {
+    chunkdb::ChunkStore store(config);
+    store.SetBlock(0, 0, {{"id", std::uint64_t{7}}, {"sign", std::string("keep")}});
+    const auto before = store.GetBlock(0, 0);
+    const auto version = store.GetChunkVersion(0, 0);
+    const std::vector<std::function<void()>> writes = {
+        [&] { store.SetBlock(0, 0, {{"sign", std::string("gone")}, {"blob", BytesValue{.bytes = {1}}}}); },
+        [&] { store.SetBlock(0, 0, {{"sign", std::monostate{}}}); },
+        [&] { store.SetBlock(0, 0, {{"sign", std::string("longer!")}}); },
+        [&] { store.UnsetBlock(0, 0); },
+        [&] { (void)store.SetChunkStateBytes(0, 0, store.GetChunkPayloadBytes(0, 0), Bytes{0x00, 0x00}); },
+        [&] {
             (void)store.CasChunkStateBytes(
                 0, 0, store.GetChunkVersion(0, 0), store.GetChunkPayloadBytes(0, 0), Bytes{0x00, 0x00});
         },
     };
     for (const auto& write : writes) {
-        chunkdb::ChunkStore store(config);
-        store.SetBlock(0, 0, {{"id", std::uint64_t{7}}, {"sign", std::string("keep")}});
-        const auto before = store.GetBlock(0, 0);
-        const auto version = store.GetChunkVersion(0, 0);
         SetEnvVar("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
         bool threw = false;
         try {
-            write(store);
+            write();
         } catch (const std::exception&) {
             threw = true;
         }
