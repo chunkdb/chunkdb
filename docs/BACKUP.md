@@ -76,6 +76,7 @@ chunkdb_restore /backups/snapshot /var/lib/chunkdb/restored --archive /backups/a
 Restore rolls each sealed table forward to the revision recorded for it and prints a diagnostic for every busy, fenced or otherwise unsealed table it omits.
 The diagnostic gives the table's last sealed revision when known and its fence reason when present.
 Point the tools at a complete local copy if you shipped the archive with `--archive-command`.
+The archive path you specify may be a symlink; restore and verification refuse symlinks and reparse points in the archive paths they open below that root.
 
 ## 3. Inspect a backup
 

@@ -1229,20 +1229,21 @@ chunkdb::VerifyCounters chunkdb::VerifyDataDirectory(
     return counters;
 }
 
-chunkdb::VerifyCounters chunkdb::VerifyWalArchive(const std::filesystem::path& archive, std::ostream& out) {
+chunkdb::VerifyCounters chunkdb::VerifyWalArchive(const std::filesystem::path& source, std::ostream& out) {
     ::VerifyCounters counters;
     counters.out = &out;
-    for (const auto& directory : backup_detail::DirectoryEntries(archive)) {
-        const auto directory_name = directory.path().filename().string();
+    const auto archive = CanonicalBackupPath(source);
+    for (const auto& name : ListBackupSourceDirectory(archive)) {
+        const auto directory_name = name.string();
         if (!directory_name.starts_with("directory.")) continue;
-        if (!std::filesystem::is_directory(directory.symlink_status())) {
-            Report(&counters, true, "wal_archive_directory_invalid", directory.path(), "expected a directory");
-            continue;
-        }
+        const auto directory = archive / name;
         std::map<std::uint64_t, std::filesystem::path> seals;
-        for (const auto& file : backup_detail::DirectoryEntries(directory.path())) {
-            if (const auto capture = ParseWalArchiveRecordName(file.path().filename().string()))
-                seals.emplace(*capture, file.path());
+        try {
+            for (const auto& file : ListBackupSourceDirectory(directory))
+                if (const auto capture = ParseWalArchiveRecordName(file.string())) seals.emplace(*capture, directory / file);
+        } catch (const std::exception& error) {
+            Report(&counters, true, "wal_archive_directory_invalid", directory, error.what());
+            continue;
         }
         std::optional<std::uint64_t> previous;
         std::map<std::filesystem::path, WalArchiveFile> files;
@@ -1256,17 +1257,18 @@ chunkdb::VerifyCounters chunkdb::VerifyWalArchive(const std::filesystem::path& a
                     (previous && seal.predecessor_ms != 0U && seal.predecessor_ms != *previous))
                     throw std::runtime_error("seal identity or predecessor does not match the archive inventory");
                 if (!seal.users.empty()) {
-                    const auto users = directory.path() / seal.users;
+                    const auto users = directory / seal.users;
                     if (!metadata.contains(users)) {
-                        (void)DecodeUsers(ReadWalArchiveMetadata(users, "users", "", kMaxUsersFileBytes));
+                        (void)DecodeUsers(ReadWalArchiveMetadata(directory, seal.users, "users", "", kMaxUsersFileBytes));
                         metadata.insert(users);
                         ++counters.checked;
                     }
                 }
                 if (!seal.ledger.empty()) {
-                    const auto ledger = directory.path() / seal.ledger;
+                    const auto ledger = directory / seal.ledger;
                     if (!metadata.contains(ledger)) {
-                        (void)DecodeMigrationRecords(ReadWalArchiveMetadata(ledger, "migrations", "", kMaxMigrationRecordsBytes), seal.directory);
+                        (void)DecodeMigrationRecords(ReadWalArchiveMetadata(directory, seal.ledger,
+                            "migrations", "", kMaxMigrationRecordsBytes), seal.directory);
                         metadata.insert(ledger);
                         ++counters.checked;
                     }
@@ -1274,13 +1276,11 @@ chunkdb::VerifyCounters chunkdb::VerifyWalArchive(const std::filesystem::path& a
                 for (const auto& table : seal.tables) {
                     if (table.manifest.empty() && table.files.empty()) continue;
                     const auto parent = archive / WalArchiveTableDirName(table.epoch);
-                    if (!std::filesystem::is_directory(std::filesystem::symlink_status(parent)))
-                        throw std::runtime_error("archive table directory is missing: " + parent.string());
                     if (!table.manifest.empty()) {
                         const auto manifest = parent / table.manifest;
                         auto known = manifests.find(manifest);
                         if (known == manifests.end()) {
-                            const auto decoded = ParseStoreManifest(ReadWalArchiveMetadata(manifest,
+                            const auto decoded = ParseStoreManifest(ReadWalArchiveMetadata(parent, table.manifest,
                                 "table." + std::to_string(table.schema_version), ".manifest", kStoreManifestMaxSize));
                             known = manifests.emplace(manifest, std::pair{decoded.store_id, decoded.schema.version}).first;
                             ++counters.checked;
@@ -1301,7 +1301,7 @@ chunkdb::VerifyCounters chunkdb::VerifyWalArchive(const std::filesystem::path& a
         }
         for (const auto& [path, entry] : files) {
             ++counters.checked;
-            try { VerifyWalArchiveFile(path, entry); }
+            try { (void)OpenWalArchiveInventoryFile(path.parent_path(), entry); }
             catch (const std::exception& error) { Report(&counters, true, "wal_archive_file_invalid", path, error.what()); }
         }
     }

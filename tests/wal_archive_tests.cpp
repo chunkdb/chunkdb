@@ -3,6 +3,7 @@
 #include <chrono>
 #include <filesystem>
 #include <iostream>
+#include <map>
 #include <sstream>
 #include <stdexcept>
 #include <string>
@@ -101,13 +102,14 @@ std::uint64_t Completed(Table& table) {
 }
 
 void RecordFormat() {
-    WalArchiveRecord record{{1U, 2U}, 42U, 41U, "users.0000abcd", "", {}};
-    record.tables.push_back({"world", {3U}, 9U, 40U, 2U, "table.2.00001234.manifest",
-        {{"C_0_0.5-9.wal", 100U, 7U}, {"C_0_0.5.base", 80U, 8U}, {"table.2.00001234.manifest", 10U, 9U}},
+    WalArchiveRecord record{{1U, 2U}, 42U, 41U, WalArchiveContentName("users", {1U}), "", {}};
+    const auto manifest = WalArchiveContentName("table.2", {2U}) + ".manifest";
+    record.tables.push_back({"world", {3U}, 9U, 40U, 2U, manifest,
+        {{"C_0_0.5-9.wal", 100U, 7U}, {"C_0_0.5.base", 80U, 8U}, {manifest, 10U, 9U}},
         WalArchiveTableState::kSealed});
     record.tables.push_back({"", {4U}, std::nullopt, 0U, 0U, "", {{"C_1_0.3-4.wal", 10U, 9U}},
         WalArchiveTableState::kDetached});
-    record.tables.push_back({"frozen", {5U}, 5U, 32U, 1U, "table.1.example.manifest", {},
+    record.tables.push_back({"frozen", {5U}, 5U, 32U, 1U, WalArchiveContentName("table.1", {3U}) + ".manifest", {},
         WalArchiveTableState::kFenced, "lost durability"});
     record.tables.push_back({"busy", {6U}, std::nullopt, 0U, 0U, "", {}, WalArchiveTableState::kBusy});
     const auto bytes = SerializeWalArchiveRecord(record);
@@ -154,6 +156,175 @@ void RecordFormat() {
     assert(WalArchiveSegmentLast("C_-1_2.5-9.wal") == 9U && WalArchiveSegmentLast("C_-1_-2_3.15-27.wal") == 27U);
     assert(!WalArchiveSegmentLast("C_0_0.5.base") && !WalArchiveSegmentLast("table.1.0000abcd.manifest"));
     assert(ExpandWalArchiveCommand("cp %p dest/%f 100%%", "a b", "t/c") == "cp a b dest/t/c 100%");
+}
+
+using ArchiveTree = std::map<std::filesystem::path, std::pair<std::filesystem::file_type, std::vector<std::uint8_t>>>;
+
+ArchiveTree SnapshotTree(const std::filesystem::path& root) {
+    ArchiveTree result;
+    for (const auto& entry : std::filesystem::recursive_directory_iterator(root)) {
+        const auto type = entry.symlink_status().type();
+        std::vector<std::uint8_t> bytes;
+        if (type == std::filesystem::file_type::regular) bytes = LoadFile(entry.path());
+        if (type == std::filesystem::file_type::symlink) {
+            const auto target = std::filesystem::read_symlink(entry.path()).generic_string();
+            bytes.assign(target.begin(), target.end());
+        }
+        result.emplace(entry.path().lexically_relative(root), std::pair{type, std::move(bytes)});
+    }
+    return result;
+}
+
+std::vector<std::uint8_t> SealField(std::string_view value, std::size_t width) {
+    assert(value.size() <= 255U && (width == 1U || width == 2U));
+    std::vector<std::uint8_t> bytes{static_cast<std::uint8_t>(value.size())};
+    if (width == 2U) bytes.push_back(0U);
+    bytes.insert(bytes.end(), value.begin(), value.end());
+    return bytes;
+}
+
+std::size_t FindSealField(const std::vector<std::uint8_t>& bytes, std::string_view value, std::size_t width) {
+    const auto field = SealField(value, width);
+    const auto found = std::search(bytes.begin(), bytes.end(), field.begin(), field.end());
+    assert(found != bytes.end());
+    return static_cast<std::size_t>(found - bytes.begin());
+}
+
+void ReplaceSealField(std::vector<std::uint8_t>& bytes, std::string_view before, std::string_view after, std::size_t width = 1U) {
+    const auto offset = FindSealField(bytes, before, width);
+    const auto start = bytes.begin() + static_cast<std::ptrdiff_t>(offset);
+    const auto field = SealField(after, width);
+    const auto at = bytes.erase(start, start + static_cast<std::ptrdiff_t>(width + before.size()));
+    bytes.insert(at, field.begin(), field.end());
+}
+
+void RejectMalformedArchiveSources() {
+    test::ScopedTempDir temporary("chunkdb-wal-archive-input");
+    const auto root = std::filesystem::canonical(temporary.path());
+    const auto data = root / "data", archive = root / "archive", backup = root / "backup", target = root / "restored";
+    const auto outside = root / "outside";
+    EnsureDirectoryPathExists(outside, true);
+    const std::vector<std::uint8_t> sentinel{1U, 2U, 3U};
+    AtomicWrite(outside / "sentinel", sentinel, true, true);
+    StoreId directory{};
+    std::uint64_t capture = 0U;
+    Users users;
+    users.secret.fill(7U);
+    {
+        TableCatalog catalog(ArchiveConfig(data, archive));
+        AwaitFirstPass(catalog);
+        const auto table = CreateDefault(catalog);
+        (void)catalog.Create("another", table->geometry().config(), catalog.default_options());
+        directory = ReadDataDirManifest(data)->data_dir_id;
+        WriteUsersFile(data, users);
+        AtomicWrite(data / kMigrationsFileName, EncodeMigrationRecords(directory, {{"example", 1U, "", "CREATE TABLE default"}}), true, true);
+        catalog.RunArchivePass();
+        (void)catalog.BackupTo(backup, {});
+        WalArchiveTestAccess::AgeSeals(catalog, std::chrono::seconds(1));
+        Write(*table, 0, 0, 8U);
+        catalog.RunArchivePass();
+        capture = catalog.ArchiveStatus()->last_seal_ms;
+    }
+    const auto records = archive / WalArchiveDirectoryDirName(directory);
+    const auto seal_path = records / WalArchiveRecordName(capture);
+    const auto valid = LoadFile(seal_path);
+    const auto seal = ParseWalArchiveRecord(valid);
+    assert(seal.tables.size() == 2U && !seal.users.empty() && !seal.ledger.empty());
+    const auto& table = seal.tables.back();
+    const auto reject = [&](std::string_view message) {
+        const auto before = SnapshotTree(root);
+        std::string refusal;
+        try { (void)RestoreArchiveSeal(backup, target, archive, capture); }
+        catch (const std::exception& error) { refusal = error.what(); }
+        assert(refusal.find(message) != std::string::npos);
+        std::ostringstream findings;
+        assert(VerifyWalArchive(archive, findings).errors != 0U);
+        assert(findings.str().find(message) != std::string::npos);
+        assert(!std::filesystem::exists(target) && LoadFile(outside / "sentinel") == sentinel);
+        assert(SnapshotTree(root) == before);
+    };
+    const auto reject_record = [&](std::string_view message, const auto& change) {
+        auto forged = valid;
+        change(forged);
+        forged.resize(forged.size() - 4U);
+        WriteLe32(forged, Crc32(forged));
+        AtomicWrite(seal_path, forged, true, true);
+        reject(message);
+        AtomicWrite(seal_path, valid, true, true);
+    };
+
+    reject_record("invalid WAL archive table name", [&](auto& bytes) { ReplaceSealField(bytes, table.name, "../x"); });
+    reject_record("invalid WAL archive file name", [&](auto& bytes) { ReplaceSealField(bytes, table.manifest, "/absolute"); });
+    reject_record("invalid WAL archive file name", [&](auto& bytes) { ReplaceSealField(bytes, seal.users, "outside/users"); });
+    reject_record("invalid WAL archive file name", [&](auto& bytes) { ReplaceSealField(bytes, seal.ledger, "outside\\ledger"); });
+    reject_record("invalid WAL archive metadata name", [&](auto& bytes) { ReplaceSealField(bytes, table.manifest, "table.01." + table.manifest.substr(8U)); });
+    reject_record("repeats a table name", [&](auto& bytes) { ReplaceSealField(bytes, table.name, seal.tables.front().name); });
+    reject_record("repeats a table epoch", [&](auto& bytes) {
+        const auto offset = FindSealField(bytes, table.name, 1U) + 1U + table.name.size();
+        std::copy(seal.tables.front().epoch.begin(), seal.tables.front().epoch.end(), bytes.begin() + static_cast<std::ptrdiff_t>(offset));
+    });
+    const auto segment = std::find_if(table.files.begin(), table.files.end(), [](const auto& file) { return file.name.ends_with(".wal"); });
+    const auto descriptor = std::find_if(table.files.begin(), table.files.end(), [](const auto& file) { return file.name.ends_with(".base"); });
+    assert(segment != table.files.end() && descriptor != table.files.end());
+    reject_record("unknown or noncanonical WAL archive inventory name", [&](auto& bytes) {
+        ReplaceSealField(bytes, segment->name, "unrecognized.txt", 2U);
+    });
+    reject_record("unknown or noncanonical WAL archive inventory name", [&](auto& bytes) {
+        ReplaceSealField(bytes, descriptor->name, "C_00" + descriptor->name.substr(3U), 2U);
+    });
+    reject_record("table count exceeds remaining record bytes", [&](auto& bytes) {
+        bytes.at(40U + 1U + seal.users.size() + 1U + seal.ledger.size()) = 255U;
+    });
+    reject_record("file count exceeds remaining record bytes", [&](auto& bytes) {
+        const auto offset = FindSealField(bytes, table.name, 1U) + 1U + table.name.size() + 16U + 24U
+            + 1U + table.manifest.size() + 1U + table.reason.size();
+        bytes.at(offset) = 255U;
+    });
+
+    const auto users_path = records / seal.users;
+    const auto encoded = EncodeUsers(users);
+    users.secret.fill(8U);
+    AtomicWrite(users_path, EncodeUsers(users), true, true);
+    reject("WAL archive metadata digest does not match");
+    AtomicWrite(users_path, encoded, true, true);
+
+#ifndef _WIN32
+    const auto moved_users = outside / "users";
+    std::filesystem::rename(users_path, moved_users);
+    std::filesystem::create_symlink(moved_users, users_path);
+    reject("invalid backup source file");
+    std::filesystem::remove(users_path);
+    std::filesystem::rename(moved_users, users_path);
+
+    const auto table_dir = archive / WalArchiveTableDirName(table.epoch);
+    const auto wal_path = table_dir / segment->name;
+    const auto moved_wal = outside / "wal";
+    std::filesystem::rename(wal_path, moved_wal);
+    std::filesystem::create_symlink(moved_wal, wal_path);
+    reject("invalid backup source file");
+    std::filesystem::remove(wal_path);
+    std::filesystem::rename(moved_wal, wal_path);
+
+    const auto moved_table = outside / "table";
+    std::filesystem::rename(table_dir, moved_table);
+    std::filesystem::create_directory_symlink(moved_table, table_dir);
+    reject("not a safe directory");
+    std::filesystem::remove(table_dir);
+    std::filesystem::rename(moved_table, table_dir);
+
+    const auto moved_records = outside / "records";
+    std::filesystem::rename(records, moved_records);
+    std::filesystem::create_directory_symlink(moved_records, records);
+    reject("not a safe directory");
+    std::filesystem::remove(records);
+    std::filesystem::rename(moved_records, records);
+
+    const auto alias = root / "archive-alias";
+    std::filesystem::create_directory_symlink(archive, alias);
+    std::ostringstream findings;
+    assert(VerifyWalArchive(alias, findings).errors == 0U);
+    assert(RestoreArchiveSeal(backup, target, alias, capture).empty());
+#endif
 }
 
 void Configuration() {
@@ -659,10 +830,11 @@ void RetentionPreservesRepeatedFiles() {
     for (const auto& file : {duplicate, descriptor, obsolete}) AtomicWrite(table_dir / file.name, bytes, true, true);
     // Age the records deterministically. The kept record re-lists the same
     // segment and descriptor, as staging can do after a restart.
+    const auto manifest = WalArchiveContentName("table.1", bytes) + ".manifest";
     const WalArchiveRecord first{directory, 1U, 0U, "", "",
-        {{"default", epoch, 2U, 1U, 1U, "table.1.fixture.manifest", {duplicate, descriptor, obsolete}, WalArchiveTableState::kSealed}}};
+        {{"default", epoch, 2U, 1U, 1U, manifest, {duplicate, descriptor, obsolete}, WalArchiveTableState::kSealed}}};
     const WalArchiveRecord kept{directory, 2U, 1U, "", "",
-        {{"default", epoch, 2U, 2U, 1U, "table.1.fixture.manifest", {duplicate, descriptor}, WalArchiveTableState::kSealed}}};
+        {{"default", epoch, 2U, 2U, 1U, manifest, {duplicate, descriptor}, WalArchiveTableState::kSealed}}};
     for (const auto& record : {first, kept})
         AtomicWrite(records_dir / WalArchiveRecordName(record.captured_ms), SerializeWalArchiveRecord(record), true, true);
     AtomicWrite(data / kWalArchiveStagingName / kWalArchiveChainName, SerializeWalArchiveChain(directory, kept.captured_ms), true, true);
@@ -739,6 +911,7 @@ void CommandArchive() {
 
 int main() {
     RecordFormat();
+    RejectMalformedArchiveSources();
     Configuration();
     DirectoryArchive();
     ChangedMetadata();

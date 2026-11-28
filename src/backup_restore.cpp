@@ -3,7 +3,6 @@
 
 #include <algorithm>
 #include <array>
-#include <charconv>
 #include <fstream>
 #include <iterator>
 #include <limits>
@@ -234,6 +233,8 @@ struct ArchiveRestorePlan {
     std::map<StoreId, std::map<std::string, WalArchiveFile>> files{};
     std::map<std::string, std::string> source_names{};
     std::vector<std::string> skipped{};
+    std::vector<std::uint8_t> users{};
+    std::vector<std::uint8_t> ledger{};
 };
 
 ArchiveRestorePlan ReadArchivePlan(const std::filesystem::path& archive, const StoreId& directory,
@@ -241,15 +242,15 @@ ArchiveRestorePlan ReadArchivePlan(const std::filesystem::path& archive, const S
     if (captured_ms < backup.created_at_ms) throw std::runtime_error("the archive seal predates the backup");
     ArchiveRestorePlan plan;
     const auto root = archive / WalArchiveDirectoryDirName(directory);
-    if (!std::filesystem::is_directory(std::filesystem::symlink_status(root)))
-        throw std::runtime_error("the archive has no records for the backup's data directory");
+    std::set<std::uint64_t> seals;
     std::set<std::uint64_t> predecessors;
-    for (const auto& item : backup_detail::DirectoryEntries(root)) {
-        const auto stamp = ParseWalArchiveRecordName(item.path().filename().string());
+    for (const auto& name : ListBackupSourceDirectory(root)) {
+        const auto stamp = ParseWalArchiveRecordName(name.string());
         if (!stamp) continue;
-        const auto record = ReadWalArchiveRecord(item.path());
+        const auto record = ReadWalArchiveRecord(root / name);
         if (record.directory != directory || record.captured_ms != *stamp)
             throw std::runtime_error("WAL archive seal does not match its path");
+        seals.insert(*stamp);
         if (record.predecessor_ms != 0U && !predecessors.insert(record.predecessor_ms).second)
             throw std::runtime_error("WAL archive seal chain has a fork");
     }
@@ -257,7 +258,7 @@ ArchiveRestorePlan ReadArchivePlan(const std::filesystem::path& archive, const S
     std::set<StoreId> boundary_epochs;
     while (next != 0U) {
         const auto path = root / WalArchiveRecordName(next);
-        if (!std::filesystem::exists(path)) throw std::runtime_error("WAL archive chain is missing " + path.string());
+        if (!seals.contains(next)) throw std::runtime_error("WAL archive chain is missing " + path.string());
         auto record = ReadWalArchiveRecord(path);
         if (record.directory != directory || record.captured_ms != next)
             throw std::runtime_error("WAL archive seal does not match its path");
@@ -276,6 +277,10 @@ ArchiveRestorePlan ReadArchivePlan(const std::filesystem::path& archive, const S
             throw std::runtime_error("the WAL archive chain starts after this backup");
         if (record.captured_ms == captured_ms) plan.seal = std::move(record);
     }
+    if (!plan.seal.users.empty())
+        plan.users = ReadWalArchiveMetadata(root, plan.seal.users, "users", "", kMaxUsersFileBytes);
+    if (!plan.seal.ledger.empty())
+        plan.ledger = ReadWalArchiveMetadata(root, plan.seal.ledger, "migrations", "", kMaxMigrationRecordsBytes);
     for (const auto& entry : plan.seal.tables) {
         if (entry.state == WalArchiveTableState::kDetached) continue;
         if (entry.state != WalArchiveTableState::kSealed) {
@@ -294,6 +299,11 @@ ArchiveRestorePlan ReadArchivePlan(const std::filesystem::path& archive, const S
             plan.source_names.emplace(base->name, entry.name);
         } else if (boundary_epochs.contains(entry.epoch))
             throw std::runtime_error("the backup does not contain the existing epoch of '" + entry.name + "'");
+        (void)OpenBackupSourceFile(archive / WalArchiveTableDirName(entry.epoch) / entry.manifest);
+    }
+    for (const auto& [epoch, files] : plan.files) {
+        const auto table_dir = archive / WalArchiveTableDirName(epoch);
+        for (const auto& [name, _] : files) (void)OpenBackupSourceFile(table_dir / name);
     }
     return plan;
 }
@@ -307,7 +317,7 @@ struct ArchivedSegment {
 void RollForwardTable(const std::filesystem::path& copy, const std::filesystem::path& archive,
     const WalArchiveTableEntry& table, const std::map<std::string, WalArchiveFile>& inventory, std::uint64_t base_cut) {
     const auto prefix = "table." + std::to_string(table.schema_version);
-    const auto bytes = ReadWalArchiveMetadata(archive / table.manifest, prefix, ".manifest", kStoreManifestMaxSize);
+    const auto bytes = ReadWalArchiveMetadata(archive, table.manifest, prefix, ".manifest", kStoreManifestMaxSize);
     const auto manifest = ParseStoreManifest(bytes);
     if (manifest.store_id != table.epoch || manifest.schema.version != table.schema_version)
         throw std::runtime_error("WAL archive manifest has the wrong identity for '" + table.name + "'");
@@ -327,19 +337,21 @@ void RollForwardTable(const std::filesystem::path& copy, const std::filesystem::
     const ChunkCoordinateIndex retained(copy, geometry, table.epoch, true);
     std::map<ChunkCoord, std::vector<ArchivedSegment>> chunks;
     for (const auto& [name, file] : inventory) {
-        if (!name.ends_with(".wal")) continue;
-        const auto last = WalArchiveSegmentLast(name);
-        const auto dot = name.find('.');
-        const auto dash = name.find('-', dot);
-        std::uint64_t first = 0U;
-        ChunkCoord coord;
-        if (!last || dash == std::string::npos || !ParseChunkFileStem(std::string_view(name).substr(0, dot), geometry.dims(), &coord))
-            throw std::runtime_error("invalid archived WAL name " + name);
-        const auto [end, error] = std::from_chars(name.data() + dot + 1U, name.data() + dash, first);
-        if (error != std::errc{} || end != name.data() + dash || first == 0U || first > *last ||
-            ChunkFileStem(coord, geometry.dims()) + "." + std::to_string(first) + "-" + std::to_string(*last) + ".wal" != name)
-            throw std::runtime_error("invalid archived WAL range " + name);
-        if (*last > base_cut && first <= *table.revision) chunks[coord].push_back({&file, first, *last});
+        // The seal parser has checked every inventory kind. Only WALs and
+        // descriptors additionally need to match this table's dimensions.
+        if (name.ends_with(".manifest")) continue;
+        if (name.ends_with(".base")) {
+            ChunkCoord coord{};
+            std::uint64_t first = 0U;
+            if (!ParseArchiveBaseFileName(name, geometry.dims(), &coord, &first) ||
+                ArchiveBaseFileName(coord, geometry.dims(), first) != name)
+                throw std::runtime_error("invalid archived WAL descriptor name " + name);
+            continue;
+        }
+        const auto segment = ParseWalArchiveSegmentName(name, geometry.dims());
+        if (!segment) throw std::runtime_error("invalid archived WAL name " + name);
+        if (segment->last > base_cut && segment->first <= *table.revision)
+            chunks[segment->coord].push_back({&file, segment->first, segment->last});
     }
     for (auto& [coord, segments] : chunks) {
         std::sort(segments.begin(), segments.end(), [](const auto& left, const auto& right) { return left.first < right.first; });
@@ -354,25 +366,30 @@ void RollForwardTable(const std::filesystem::path& copy, const std::filesystem::
                 const auto descriptor_name = ArchiveBaseFileName(coord, geometry.dims(), segment.first);
                 const auto listed = inventory.find(descriptor_name);
                 if (listed == inventory.end()) throw std::runtime_error("WAL archive does not list " + descriptor_name);
-                const auto descriptor_path = archive / descriptor_name;
-                VerifyWalArchiveFile(descriptor_path, listed->second);
-                const auto descriptor = ReadFeedArchiveBaseDescriptor(descriptor_path, geometry, table.epoch, coord, segment.first);
-                if (!descriptor || descriptor->base_revision > latest || (!first_segment && descriptor->base_revision != latest))
+                if (listed->second.size != ArchiveBaseDescriptorBytes(geometry.dims()))
+                    throw std::runtime_error("invalid archived WAL descriptor size: " + descriptor_name);
+                const auto descriptor_input = OpenWalArchiveInventoryFile(archive, listed->second);
+                std::vector<std::uint8_t> descriptor_bytes(ArchiveBaseDescriptorBytes(geometry.dims()));
+                descriptor_input->read(reinterpret_cast<char*>(descriptor_bytes.data()),
+                    static_cast<std::streamsize>(descriptor_bytes.size()));
+                if (!*descriptor_input) throw std::runtime_error("cannot read archived WAL descriptor: " + descriptor_name);
+                const auto descriptor = ParseArchiveBaseDescriptor(descriptor_bytes, geometry.dims(), table.epoch,
+                    coord, segment.first, kMaxChunkImageFileBytes);
+                (void)geometry.LayoutAt(descriptor.base_schema);
+                if (descriptor.base_revision > latest || (!first_segment && descriptor.base_revision != latest))
                     throw std::runtime_error("WAL archive chunk chain has a gap before " + segment.file->name);
-                const auto path = archive / segment.file->name;
-                VerifyWalArchiveFile(path, *segment.file);
-                SharedFileInput input(path);
-                const auto inspected = VisitWalStream(input, segment.file->size, geometry, coord, table.epoch, manifest.features,
+                const auto input = OpenWalArchiveInventoryFile(archive, *segment.file);
+                const auto inspected = VisitWalStream(*input, segment.file->size, geometry, coord, table.epoch, manifest.features,
                     [&](const FeedFrameInfo& frame, std::span<const std::uint8_t> raw) {
                         if (frame.revision <= base_cut && frame.revision > latest)
-                            throw std::runtime_error("backup is missing a frame at its cut: " + path.string());
+                            throw std::runtime_error("backup is missing a frame at its cut: " + segment.file->name);
                         if (frame.revision <= base_cut || frame.revision > *table.revision) return;
-                        if (frame.revision <= latest) throw std::runtime_error("overlapping WAL archive segments: " + path.string());
+                        if (frame.revision <= latest) throw std::runtime_error("overlapping WAL archive segments: " + segment.file->name);
                         sink(raw);
                         latest = frame.revision;
                     });
                 if (inspected.first != segment.first || inspected.last != segment.last)
-                    throw std::runtime_error("archive WAL range differs from its name: " + path.string());
+                    throw std::runtime_error("archive WAL range differs from its name: " + segment.file->name);
                 first_segment = false;
             }
         }, true, true);
@@ -446,19 +463,14 @@ std::vector<std::string> RestoreBackupImpl(const std::filesystem::path& source, 
         const auto old_directory_id = directory_manifest.data_dir_id;
         if (archive_plan) {
             const auto& seal = archive_plan->seal;
-            const auto archive_directory = archive / WalArchiveDirectoryDirName(seal.directory);
             if (seal.users.empty()) std::filesystem::remove(temporary / kUsersFileName);
-            else AtomicWrite(temporary / kUsersFileName,
-                ReadWalArchiveMetadata(archive_directory / seal.users, "users", "", kMaxUsersFileBytes), true, true);
+            else AtomicWrite(temporary / kUsersFileName, archive_plan->users, true, true);
             if (seal.ledger.empty()) std::filesystem::remove(temporary / kMigrationsFileName);
-            else AtomicWrite(temporary / kMigrationsFileName,
-                ReadWalArchiveMetadata(archive_directory / seal.ledger, "migrations", "", kMaxMigrationRecordsBytes), true, true);
+            else AtomicWrite(temporary / kMigrationsFileName, archive_plan->ledger, true, true);
             record.tables.clear();
             for (const auto& entry : seal.tables) {
                 if (entry.state != WalArchiveTableState::kSealed) continue;
                 const auto archived_table = archive / WalArchiveTableDirName(entry.epoch);
-                if (!std::filesystem::is_directory(std::filesystem::symlink_status(archived_table)))
-                    throw std::runtime_error("archive table directory is missing: " + archived_table.string());
                 const auto base = std::find_if(source_record.tables.begin(), source_record.tables.end(), [&](const auto& table) {
                     return table.epoch == entry.epoch;
                 });

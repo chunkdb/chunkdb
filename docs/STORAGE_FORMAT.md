@@ -552,7 +552,8 @@ A seal record:
 4. Per file: name length `u16` and name, length `u64`, CRC32 of the whole file `u32`.
 5. CRC32 over all preceding bytes.
 
-A table name appears at most once; a failed rename can leave two fenced names for one epoch, which share at most one file list.
+A table name and a known epoch each appear at most once; after a failed rename, a second fenced name for the same epoch carries no epoch, position or file list.
+Metadata names use their exact writer spelling and bind to the file bytes by SHA-256; a table inventory accepts only canonical WAL segment names, base descriptor names and content-named table manifests.
 The fence reason is present only for fenced tables and may not contain NUL, CR or LF; an unknown epoch is all zero and is allowed only for a fenced name with no manifest or files.
 A missing manifest has schema version zero and no position; a sealed table always has a position, while an unsealed, busy or fenced table may carry its last published position and the manifest for that position.
 A sealed table's revision S means every frame at or below it is in a segment listed by this record or an earlier one of its chain; retention can also re-list an older segment in a later record, and the time bound was issued before S was sampled.

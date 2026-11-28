@@ -20,6 +20,7 @@ namespace chunkdb {
 
 class TableCatalog;
 class Table;
+class SharedFileInput;
 
 // Sealed segments, base descriptors, manifests, users and ledger files and
 // the seal record waiting to be shipped, as hard links or private copies,
@@ -73,9 +74,11 @@ struct WalArchiveRecord {
 [[nodiscard]] std::vector<std::uint8_t> SerializeWalArchiveRecord(const WalArchiveRecord& record);
 [[nodiscard]] WalArchiveRecord ParseWalArchiveRecord(const std::vector<std::uint8_t>& bytes);
 [[nodiscard]] WalArchiveRecord ReadWalArchiveRecord(const std::filesystem::path& path);
-void VerifyWalArchiveFile(const std::filesystem::path& path, const WalArchiveFile& expected);
-[[nodiscard]] std::vector<std::uint8_t> ReadWalArchiveMetadata(const std::filesystem::path& path,
-    std::string_view prefix, std::string_view suffix, std::uint64_t limit);
+// Returns a verified, rewound file opened without following descendant links.
+[[nodiscard]] std::unique_ptr<SharedFileInput> OpenWalArchiveInventoryFile(const std::filesystem::path& directory,
+    const WalArchiveFile& expected);
+[[nodiscard]] std::vector<std::uint8_t> ReadWalArchiveMetadata(const std::filesystem::path& directory,
+    const std::string& name, std::string_view prefix, std::string_view suffix, std::uint64_t limit);
 // The chain file: the data-directory id and the capture time of the last
 // published record.
 [[nodiscard]] std::vector<std::uint8_t> SerializeWalArchiveChain(const StoreId& directory, std::uint64_t captured_ms);
@@ -93,6 +96,12 @@ void VerifyWalArchiveFile(const std::filesystem::path& path, const WalArchiveFil
 [[nodiscard]] std::optional<std::uint64_t> ParseWalArchiveRecordName(std::string_view name);
 // The epoch a `table.<epoch>` name holds; std::nullopt for another name.
 [[nodiscard]] std::optional<StoreId> ParseWalArchiveTableDirName(std::string_view name);
+struct WalArchiveSegmentName {
+    ChunkCoord coord{};
+    std::uint64_t first = 0U;
+    std::uint64_t last = 0U;
+};
+[[nodiscard]] std::optional<WalArchiveSegmentName> ParseWalArchiveSegmentName(std::string_view name, std::uint8_t dims);
 // The last revision of a sealed segment name `C_<coordinates>.<first>-<last>.wal`.
 [[nodiscard]] std::optional<std::uint64_t> WalArchiveSegmentLast(std::string_view name);
 // Also refuses an archive directory that contains the data directory or lies in it.

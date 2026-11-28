@@ -12,6 +12,10 @@ namespace chunkdb {
 class SharedFileInput final : public std::istream {
   public:
     explicit SharedFileInput(const std::filesystem::path& path);
+#ifndef _WIN32
+    // Open the leaf relative to an already admitted directory descriptor.
+    SharedFileInput(const std::filesystem::path& path, int parent_fd);
+#endif
     ~SharedFileInput() override;
     SharedFileInput(const SharedFileInput&) = delete;
     SharedFileInput& operator=(const SharedFileInput&) = delete;

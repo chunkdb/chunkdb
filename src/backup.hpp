@@ -3,6 +3,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <functional>
+#include <memory>
 #include <optional>
 #include <stdexcept>
 #include <stop_token>
@@ -15,6 +16,8 @@
 #include "users.hpp"
 
 namespace chunkdb {
+
+class SharedFileInput;
 
 inline constexpr std::string_view kBackupMarkerName = "chunkdb.backup";
 inline constexpr std::string_view kBackupIncompleteName = ".chunkdb.backup.incomplete";
@@ -86,6 +89,11 @@ void RemoveOrphanedBackupStaging(const std::filesystem::path& data_dir, const St
 // establish its incomplete guard before any backup contents are copied.
 // Resolve configured aliases at the boundary; descendant walks stay no-follow.
 [[nodiscard]] std::filesystem::path CanonicalBackupPath(const std::filesystem::path& path);
+// Callers canonicalize the operator-selected root before constructing these
+// paths. All components below that boundary are opened without following links.
+[[nodiscard]] std::unique_ptr<SharedFileInput> OpenBackupSourceFile(const std::filesystem::path& path);
+[[nodiscard]] std::vector<std::filesystem::path> ListBackupSourceDirectory(const std::filesystem::path& path);
+void RemoveBackupSourceFiles(const std::filesystem::path& directory, const std::vector<std::filesystem::path>& names);
 [[nodiscard]] std::filesystem::path ResolveBackupTarget(const std::filesystem::path& backup_directory,
     const std::filesystem::path& requested, BackupTestHook* hook = nullptr);
 void RequireBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target);

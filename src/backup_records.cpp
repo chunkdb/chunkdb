@@ -353,12 +353,15 @@ class SafeDirectory {
             throw std::runtime_error("cannot publish safe backup file");
 #endif
     }
-    void Remove(std::string_view name) const {
+    void Remove(std::string_view name, bool missing_ok = false) const {
 #ifdef _WIN32
-        if (!DeleteFileW((path_ / name).wstring().c_str())) throw std::runtime_error("cannot remove publication guard");
+        if (DeleteFileW((path_ / name).wstring().c_str())) return;
+        if (missing_ok && GetLastError() == ERROR_FILE_NOT_FOUND) return;
 #else
-        if (::unlinkat(fd_, std::string(name).c_str(), 0) != 0) throw std::runtime_error("cannot remove publication guard");
+        if (::unlinkat(fd_, std::string(name).c_str(), 0) == 0) return;
+        if (missing_ok && errno == ENOENT) return;
 #endif
+        throw std::runtime_error(missing_ok ? "cannot remove archived file" : "cannot remove publication guard");
     }
     const std::filesystem::path& path() const { return path_; }
 #ifdef _WIN32
@@ -979,6 +982,65 @@ void RequireBackupTarget(const std::filesystem::path& source, const std::filesys
             !std::filesystem::is_empty(target)))
 #endif
         throw std::invalid_argument("backup destination must be absent or empty");
+}
+
+std::unique_ptr<SharedFileInput> OpenBackupSourceFile(const std::filesystem::path& path) {
+    RequirePath(path);
+    SafeDirectory parent;
+    parent.Open(path.parent_path(), false);
+    try {
+#ifdef _WIN32
+        return std::make_unique<SharedFileInput>(parent.path() / path.filename());
+#else
+        return std::make_unique<SharedFileInput>(path, parent.fd());
+#endif
+    } catch (const std::runtime_error& error) {
+        throw std::runtime_error("invalid backup source file " + path.string() + ": " + error.what());
+    }
+}
+
+std::vector<std::filesystem::path> ListBackupSourceDirectory(const std::filesystem::path& path) {
+    RequirePath(path);
+    SafeDirectory directory;
+    directory.Open(path, false);
+    std::vector<std::filesystem::path> names;
+#ifdef _WIN32
+    for (const auto& entry : backup_detail::OpenDirectory(directory.path(), true))
+        names.push_back(entry.path().filename());
+#else
+    const int fd = ::dup(directory.fd());
+    if (fd < 0) throw std::runtime_error("cannot enumerate backup source directory: " + path.string());
+    DIR* entries = ::fdopendir(fd);
+    if (!entries) {
+        ::close(fd);
+        throw std::runtime_error("cannot enumerate backup source directory: " + path.string());
+    }
+    const auto close = [](DIR* stream) { (void)::closedir(stream); };
+    const std::unique_ptr<DIR, decltype(close)> owned(entries, close);
+    for (;;) {
+        errno = 0;
+        const auto* entry = ::readdir(owned.get());
+        if (entry == nullptr) {
+            if (errno != 0) throw std::runtime_error("cannot enumerate backup source directory: " + path.string());
+            break;
+        }
+        const std::string_view name(entry->d_name);
+        if (name != "." && name != "..") names.emplace_back(name);
+    }
+#endif
+    return names;
+}
+
+void RemoveBackupSourceFiles(const std::filesystem::path& path, const std::vector<std::filesystem::path>& names) {
+    for (const auto& name : names) {
+        RequireRelative(name);
+        if (name.has_parent_path()) throw std::invalid_argument("archive removal requires a file name");
+    }
+    RequirePath(path);
+    SafeDirectory directory;
+    directory.Open(path, false);
+    for (const auto& name : names) directory.Remove(name.string(), true);
+    directory.Sync();
 }
 void PrepareBackupTarget(const std::filesystem::path& source, const std::filesystem::path& target, BackupTestHook* hook,
     const std::filesystem::path& backup_directory) {

@@ -13,13 +13,16 @@
 #include <mutex>
 #include <set>
 #include <shared_mutex>
+#include <span>
 #include <stdexcept>
 #include <system_error>
 
+#include "archive_base_format.hpp"
 #include "backup.hpp"
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
 #include "chunkdb/crc32.hpp"
+#include "chunkdb/file_layout.hpp"
 #include "chunkdb/logging.hpp"
 #include "chunkdb/table_catalog.hpp"
 #include "crypto.hpp"
@@ -49,10 +52,16 @@ constexpr std::uint64_t kMaxSealBytes = std::uint64_t{1} << 30U;
 // A record names at most this many tables and files per table.
 constexpr std::uint32_t kMaxRecordTables = 1U << 20U;
 constexpr std::uint32_t kMaxRecordFiles = 1U << 24U;
+// A table entry can omit its strings; a file entry needs at least one name byte.
+constexpr std::size_t kMinTableEntryBytes = 49U;
+constexpr std::size_t kMinFileEntryBytes = 15U;
+constexpr std::size_t kMaxFileNameBytes = 255U;
+constexpr std::size_t kMaxFenceReasonBytes = 255U;
+constexpr auto kMaxInventoryFileBytes = static_cast<std::uint64_t>(std::numeric_limits<std::streamoff>::max());
 
 class RecordReader {
   public:
-    explicit RecordReader(const std::vector<std::uint8_t>& bytes) : bytes_(bytes) {}
+    explicit RecordReader(std::span<const std::uint8_t> bytes) : bytes_(bytes) {}
     void Need(std::size_t count) const {
         if (count > bytes_.size() - at_) throw std::runtime_error("WAL archive seal record is truncated");
     }
@@ -70,6 +79,11 @@ class RecordReader {
         at_ += count;
         return text;
     }
+    std::string Field(std::size_t width, std::size_t maximum, std::string_view field) {
+        const auto count = static_cast<std::size_t>(Le(width));
+        if (count > maximum) throw std::runtime_error("WAL archive " + std::string(field) + " length exceeds its limit");
+        return Text(count);
+    }
     StoreId Id() {
         Need(16U);
         StoreId id{};
@@ -78,9 +92,10 @@ class RecordReader {
         return id;
     }
     [[nodiscard]] std::size_t at() const noexcept { return at_; }
+    [[nodiscard]] std::size_t remaining() const noexcept { return bytes_.size() - at_; }
 
   private:
-    const std::vector<std::uint8_t>& bytes_;
+    std::span<const std::uint8_t> bytes_;
     std::size_t at_ = 0U;
 };
 
@@ -108,9 +123,47 @@ std::optional<StoreId> ParseHexId(std::string_view text) {
 
 // A name the archive and its staging use for a file; never a path.
 void RequireFileName(const std::string& name) {
-    if (name.empty() || name.size() > 255U || name.front() == '.' ||
+    if (name.empty() || name.size() > kMaxFileNameBytes || name.front() == '.' ||
         name.find_first_of("/\\:") != std::string::npos || name.find('\0') != std::string::npos)
         throw std::runtime_error("invalid WAL archive file name: " + name);
+}
+
+bool IsMetadataName(std::string_view name, std::string_view prefix, std::string_view suffix) {
+    if (name.size() != prefix.size() + 1U + 64U + suffix.size() || !name.starts_with(prefix) ||
+        name[prefix.size()] != '.' || !name.ends_with(suffix)) return false;
+    const auto digest = name.substr(prefix.size() + 1U, 64U);
+    return std::all_of(digest.begin(), digest.end(), [](const char digit) {
+        return (digit >= '0' && digit <= '9') || (digit >= 'a' && digit <= 'f');
+    });
+}
+
+void RequireMetadataName(const std::string& name, std::string_view prefix, std::string_view suffix) {
+    RequireFileName(name);
+    if (!IsMetadataName(name, prefix, suffix))
+        throw std::runtime_error("invalid WAL archive metadata name: " + name);
+}
+
+std::optional<std::uint64_t> ArchiveManifestVersion(std::string_view name) {
+    constexpr std::string_view prefix = "table.";
+    if (!name.starts_with(prefix)) return std::nullopt;
+    const auto end = name.find('.', prefix.size());
+    std::uint64_t version = 0U;
+    if (end == std::string_view::npos || !Digits(name.substr(prefix.size(), end - prefix.size()), &version) ||
+        version == 0U || name[prefix.size()] == '0' || !IsMetadataName(name, name.substr(0U, end), ".manifest"))
+        return std::nullopt;
+    return version;
+}
+
+void RequireInventoryName(const std::string& name) {
+    RequireFileName(name);
+    if (ArchiveManifestVersion(name)) return;
+    for (const std::uint8_t dims : {std::uint8_t{2U}, std::uint8_t{3U}}) {
+        if (ParseWalArchiveSegmentName(name, dims)) return;
+        ChunkCoord coord{};
+        std::uint64_t first = 0U;
+        if (ParseArchiveBaseFileName(name, dims, &coord, &first) && ArchiveBaseFileName(coord, dims, first) == name) return;
+    }
+    throw std::runtime_error("unknown or noncanonical WAL archive inventory name: " + name);
 }
 
 std::uint64_t UnixMs() {
@@ -290,16 +343,17 @@ void AppendShortName(std::vector<std::uint8_t>& bytes, const std::string& name, 
 }
 
 std::string ReadShortName(RecordReader& reader, bool optional) {
-    auto name = reader.Text(static_cast<std::size_t>(reader.Le(1U)));
+    auto name = reader.Field(1U, kMaxFileNameBytes, "file name");
     if (!(name.empty() && optional)) RequireFileName(name);
     return name;
 }
 
 void RequireTableState(const WalArchiveTableEntry& table) {
     using State = WalArchiveTableState;
+    if (!table.name.empty() && !IsValidTableName(table.name))
+        throw std::runtime_error("invalid WAL archive table name: " + table.name);
     if (table.state > State::kDetached || (table.state == State::kDetached) != table.name.empty() ||
-        (!table.name.empty() && !IsValidTableName(table.name)) ||
-        (table.state == State::kFenced) != !table.reason.empty() || table.reason.size() > 255U ||
+        (table.state == State::kFenced) != !table.reason.empty() || table.reason.size() > kMaxFenceReasonBytes ||
         table.reason.find_first_of(std::string_view("\0\r\n", 3U)) != std::string::npos)
         throw std::runtime_error("invalid WAL archive table state");
     if ((table.epoch == StoreId{} && (table.state != State::kFenced || !table.manifest.empty() || !table.files.empty())) ||
@@ -307,6 +361,35 @@ void RequireTableState(const WalArchiveTableEntry& table) {
         (table.state == State::kSealed && !table.revision) || (table.revision && table.manifest.empty()) ||
         (!table.revision && table.time_bound_ms != 0U) || (table.manifest.empty() != (table.schema_version == 0U)))
         throw std::runtime_error("invalid WAL archive table position or manifest");
+    if (!table.manifest.empty()) RequireMetadataName(table.manifest, "table." + std::to_string(table.schema_version), ".manifest");
+}
+
+void RequireUniqueTable(const WalArchiveTableEntry& table, std::set<std::string>& names, std::set<StoreId>& epochs) {
+    if (!table.name.empty() && !names.insert(table.name).second)
+        throw std::runtime_error("WAL archive seal record repeats a table name: " + table.name);
+    if (table.epoch != StoreId{} && !epochs.insert(table.epoch).second)
+        throw std::runtime_error("WAL archive seal record repeats a table epoch");
+}
+
+std::uint64_t ArchiveInputSize(SharedFileInput& input, const std::filesystem::path& path) {
+    input.seekg(0, std::ios::end);
+    const auto end = input.tellg();
+    if (end < 0) throw std::runtime_error("cannot measure WAL archive file: " + path.string());
+    input.seekg(0, std::ios::beg);
+    if (!input) throw std::runtime_error("cannot rewind WAL archive file: " + path.string());
+    return static_cast<std::uint64_t>(end);
+}
+
+std::vector<std::uint8_t> ReadArchiveBytes(SharedFileInput& input, const std::filesystem::path& path, std::uint64_t limit) {
+    const auto size = ArchiveInputSize(input, path);
+    if (size > limit || size > std::numeric_limits<std::size_t>::max() ||
+        size > static_cast<std::uint64_t>(std::numeric_limits<std::streamsize>::max()))
+        throw std::length_error("oversized WAL archive file: " + path.string());
+    std::vector<std::uint8_t> bytes(static_cast<std::size_t>(size));
+    input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    if (!input || input.peek() != std::char_traits<char>::eof() || input.bad())
+        throw std::runtime_error("WAL archive file changed while reading: " + path.string());
+    return bytes;
 }
 
 }  // namespace
@@ -332,12 +415,16 @@ std::vector<std::uint8_t> SerializeWalArchiveRecord(const WalArchiveRecord& reco
     AppendId(bytes, record.directory);
     WriteLe64(bytes, record.captured_ms);
     WriteLe64(bytes, record.predecessor_ms);
+    if (!record.users.empty()) RequireMetadataName(record.users, "users", "");
+    if (!record.ledger.empty()) RequireMetadataName(record.ledger, "migrations", "");
     AppendShortName(bytes, record.users, true);
     AppendShortName(bytes, record.ledger, true);
     WriteLe32(bytes, static_cast<std::uint32_t>(record.tables.size()));
+    std::set<std::string> names;
+    std::set<StoreId> epochs;
     for (const auto& table : record.tables) {
         RequireTableState(table);
-        if (table.name.size() > 255U) throw std::length_error("WAL archive table name is too long");
+        RequireUniqueTable(table, names, epochs);
         if (table.files.size() > kMaxRecordFiles) throw std::length_error("too many files in a WAL archive seal record");
         bytes.push_back(static_cast<std::uint8_t>(table.state));
         bytes.push_back(table.revision ? kEntryHasPosition : std::uint8_t{0U});
@@ -351,8 +438,11 @@ std::vector<std::uint8_t> SerializeWalArchiveRecord(const WalArchiveRecord& reco
         bytes.push_back(static_cast<std::uint8_t>(table.reason.size()));
         bytes.insert(bytes.end(), table.reason.begin(), table.reason.end());
         WriteLe32(bytes, static_cast<std::uint32_t>(table.files.size()));
+        std::set<std::string> file_names;
         for (const auto& file : table.files) {
-            RequireFileName(file.name);
+            RequireInventoryName(file.name);
+            if (!file_names.insert(file.name).second) throw std::runtime_error("WAL archive seal record repeats a file");
+            if (file.size > kMaxInventoryFileBytes) throw std::length_error("WAL archive inventory file size exceeds the stream limit");
             WriteLe16(bytes, static_cast<std::uint16_t>(file.name.size()));
             bytes.insert(bytes.end(), file.name.begin(), file.name.end());
             WriteLe64(bytes, file.size);
@@ -368,10 +458,8 @@ WalArchiveRecord ParseWalArchiveRecord(const std::vector<std::uint8_t>& bytes) {
     if (bytes.size() > kMaxSealBytes) throw std::length_error("WAL archive seal record is too large");
     if (bytes.size() < 4U + 4U || !std::equal(kRecordMagic.begin(), kRecordMagic.end(), bytes.begin()))
         throw std::runtime_error("not a WAL archive seal record");
-    const std::vector<std::uint8_t> body(bytes.begin(), bytes.end() - 4);
-    RecordReader crc(bytes);
-    (void)crc.Text(body.size());
-    if (static_cast<std::uint32_t>(crc.Le(4U)) != Crc32(body))
+    const auto body = std::span(bytes).first(bytes.size() - 4U);
+    if (ReadLe32(bytes, body.size()) != Crc32(body.data(), body.size()))
         throw std::runtime_error("WAL archive seal record checksum mismatch");
     RecordReader reader(body);
     (void)reader.Text(kRecordMagic.size());
@@ -385,10 +473,14 @@ WalArchiveRecord ParseWalArchiveRecord(const std::vector<std::uint8_t>& bytes) {
         throw std::runtime_error("WAL archive seal record does not follow its predecessor");
     record.users = ReadShortName(reader, true);
     record.ledger = ReadShortName(reader, true);
+    if (!record.users.empty()) RequireMetadataName(record.users, "users", "");
+    if (!record.ledger.empty()) RequireMetadataName(record.ledger, "migrations", "");
     const auto tables = reader.Le(4U);
     if (tables > kMaxRecordTables) throw std::runtime_error("too many tables in a WAL archive seal record");
+    if (tables > reader.remaining() / kMinTableEntryBytes)
+        throw std::runtime_error("WAL archive table count exceeds remaining record bytes");
     std::set<std::string> names;
-    std::set<StoreId> primary_epochs, file_epochs;
+    std::set<StoreId> epochs;
     for (std::uint64_t t = 0U; t < tables; ++t) {
         WalArchiveTableEntry table;
         const auto state = reader.Le(1U);
@@ -398,11 +490,8 @@ WalArchiveRecord ParseWalArchiveRecord(const std::vector<std::uint8_t>& bytes) {
         const auto flags = reader.Le(1U);
         if ((flags & ~static_cast<std::uint64_t>(kEntryHasPosition)) != 0U)
             throw std::runtime_error("unknown WAL archive seal record flags");
-        table.name = reader.Text(static_cast<std::size_t>(reader.Le(1U)));
+        table.name = reader.Field(1U, kMaxTableNameLength, "table name");
         table.epoch = reader.Id();
-        if ((!table.name.empty() && !names.insert(table.name).second) ||
-            (table.state != WalArchiveTableState::kFenced && !primary_epochs.insert(table.epoch).second))
-            throw std::runtime_error("WAL archive seal record repeats a table");
         const auto revision = reader.Le(8U);
         const auto time_bound = reader.Le(8U);
         if ((flags & kEntryHasPosition) != 0U) {
@@ -413,22 +502,26 @@ WalArchiveRecord ParseWalArchiveRecord(const std::vector<std::uint8_t>& bytes) {
         }
         table.schema_version = reader.Le(8U);
         table.manifest = ReadShortName(reader, true);
-        table.reason = reader.Text(static_cast<std::size_t>(reader.Le(1U)));
+        table.reason = reader.Field(1U, kMaxFenceReasonBytes, "fence reason");
         const auto files = reader.Le(4U);
         if (files > kMaxRecordFiles) throw std::runtime_error("too many files in a WAL archive seal record");
-        if (files != 0U && !file_epochs.insert(table.epoch).second)
-            throw std::runtime_error("WAL archive seal record repeats a table file list");
+        const auto remaining_tables = static_cast<std::size_t>(tables - t - 1U) * kMinTableEntryBytes;
+        if (remaining_tables > reader.remaining() || files > (reader.remaining() - remaining_tables) / kMinFileEntryBytes)
+            throw std::runtime_error("WAL archive file count exceeds remaining record bytes");
+        RequireTableState(table);
+        RequireUniqueTable(table, names, epochs);
+        if (files != 0U && table.epoch == StoreId{}) throw std::runtime_error("WAL archive file list has no table epoch");
         std::set<std::string> file_names;
         for (std::uint64_t f = 0U; f < files; ++f) {
             WalArchiveFile file;
-            file.name = reader.Text(static_cast<std::size_t>(reader.Le(2U)));
-            RequireFileName(file.name);
+            file.name = reader.Field(2U, kMaxFileNameBytes, "inventory name");
+            RequireInventoryName(file.name);
             if (!file_names.insert(file.name).second) throw std::runtime_error("WAL archive seal record repeats a file");
             file.size = reader.Le(8U);
+            if (file.size > kMaxInventoryFileBytes) throw std::length_error("WAL archive inventory file size exceeds the stream limit");
             file.crc32 = static_cast<std::uint32_t>(reader.Le(4U));
             table.files.push_back(std::move(file));
         }
-        RequireTableState(table);
         record.tables.push_back(std::move(table));
     }
     if (reader.at() != body.size()) throw std::runtime_error("WAL archive seal record has trailing bytes");
@@ -436,21 +529,49 @@ WalArchiveRecord ParseWalArchiveRecord(const std::vector<std::uint8_t>& bytes) {
 }
 
 WalArchiveRecord ReadWalArchiveRecord(const std::filesystem::path& path) {
-    const auto size = std::filesystem::file_size(path);
-    if (size > kMaxSealBytes) throw std::length_error("WAL archive seal record is too large");
-    return ParseWalArchiveRecord(ReadBackupFile(path, size));
+    const auto input = OpenBackupSourceFile(path);
+    return ParseWalArchiveRecord(ReadArchiveBytes(*input, path, kMaxSealBytes));
 }
 
-void VerifyWalArchiveFile(const std::filesystem::path& path, const WalArchiveFile& expected) {
-    if (Inspect(path) != expected) throw std::runtime_error("WAL archive file does not match its inventory: " + path.string());
+std::unique_ptr<SharedFileInput> OpenWalArchiveInventoryFile(const std::filesystem::path& directory,
+    const WalArchiveFile& expected) {
+    RequireInventoryName(expected.name);
+    const auto path = directory / expected.name;
+    auto input = OpenBackupSourceFile(path);
+    auto remaining = ArchiveInputSize(*input, path);
+    if (remaining != expected.size) throw std::runtime_error("WAL archive file length does not match its inventory: " + path.string());
+    std::uint32_t crc = 0U;
+    if (const auto version = ArchiveManifestVersion(expected.name)) {
+        const auto bytes = ReadArchiveBytes(*input, path, kStoreManifestMaxSize);
+        if (WalArchiveContentName("table." + std::to_string(*version), bytes) + ".manifest" != expected.name)
+            throw std::runtime_error("WAL archive metadata digest does not match " + path.string());
+        crc = Crc32(bytes);
+    } else {
+        std::array<std::uint8_t, 65536> buffer{};
+        while (remaining != 0U) {
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(buffer.size(), remaining));
+            input->read(reinterpret_cast<char*>(buffer.data()), static_cast<std::streamsize>(count));
+            if (!*input) throw std::runtime_error("WAL archive file changed while reading: " + path.string());
+            crc = Crc32Extend(crc, buffer.data(), count);
+            remaining -= count;
+        }
+        if (input->peek() != std::char_traits<char>::eof() || input->bad())
+            throw std::runtime_error("WAL archive file changed while reading: " + path.string());
+    }
+    if (crc != expected.crc32) throw std::runtime_error("WAL archive file checksum does not match its inventory: " + path.string());
+    input->clear();
+    input->seekg(0, std::ios::beg);
+    if (!*input) throw std::runtime_error("cannot rewind WAL archive file: " + path.string());
+    return input;
 }
 
-std::vector<std::uint8_t> ReadWalArchiveMetadata(const std::filesystem::path& path,
-    std::string_view prefix, std::string_view suffix, std::uint64_t limit) {
-    const auto size = std::filesystem::file_size(path);
-    if (size > limit) throw std::runtime_error("oversized WAL archive metadata " + path.string());
-    auto bytes = ReadBackupFile(path, size);
-    if (WalArchiveContentName(prefix, bytes) + std::string(suffix) != path.filename().string())
+std::vector<std::uint8_t> ReadWalArchiveMetadata(const std::filesystem::path& directory,
+    const std::string& name, std::string_view prefix, std::string_view suffix, std::uint64_t limit) {
+    RequireMetadataName(name, prefix, suffix);
+    const auto path = directory / name;
+    const auto input = OpenBackupSourceFile(path);
+    auto bytes = ReadArchiveBytes(*input, path, limit);
+    if (WalArchiveContentName(prefix, bytes) + std::string(suffix) != name)
         throw std::runtime_error("WAL archive metadata digest does not match " + path.string());
     return bytes;
 }
@@ -505,15 +626,25 @@ std::optional<StoreId> ParseWalArchiveTableDirName(std::string_view name) {
     return ParseHexId(name.substr(prefix.size()));
 }
 
-std::optional<std::uint64_t> WalArchiveSegmentLast(std::string_view name) {
+std::optional<WalArchiveSegmentName> ParseWalArchiveSegmentName(std::string_view name, std::uint8_t dims) {
     if (!name.ends_with(".wal")) return std::nullopt;
-    name.remove_suffix(4U);
     const auto dot = name.find('.');
-    const auto dash = name.rfind('-');
-    std::uint64_t last = 0U;
-    if (dot == std::string_view::npos || dash == std::string_view::npos || dash < dot || !Digits(name.substr(dash + 1U), &last))
+    const auto dash = name.find('-', dot);
+    WalArchiveSegmentName segment;
+    if (dot == std::string_view::npos || dash == std::string_view::npos ||
+        !ParseChunkFileStem(name.substr(0U, dot), dims, &segment.coord) ||
+        !Digits(name.substr(dot + 1U, dash - dot - 1U), &segment.first) ||
+        !Digits(name.substr(dash + 1U, name.size() - dash - 5U), &segment.last) ||
+        segment.first == 0U || segment.last < segment.first ||
+        ChunkFileStem(segment.coord, dims) + "." + std::to_string(segment.first) + "-" + std::to_string(segment.last) + ".wal" != name)
         return std::nullopt;
-    return last;
+    return segment;
+}
+
+std::optional<std::uint64_t> WalArchiveSegmentLast(std::string_view name) {
+    if (const auto segment = ParseWalArchiveSegmentName(name, 2U)) return segment->last;
+    if (const auto segment = ParseWalArchiveSegmentName(name, 3U)) return segment->last;
+    return std::nullopt;
 }
 
 std::string WalArchiveContentName(std::string_view prefix, const std::vector<std::uint8_t>& bytes) {
@@ -544,7 +675,7 @@ void RemoveWalArchiveStaging(const std::filesystem::path& data_dir) {
 WalArchiver::WalArchiver(TableCatalog& catalog, WalArchiveConfig config)
     : catalog_(catalog), config_(std::move(config)),
       directory_id_(ReadDataDirManifest(catalog.config_.data_dir).value().data_dir_id),
-      staging_(catalog.config_.data_dir / std::string(kWalArchiveStagingName)) {
+      staging_(CanonicalBackupPath(catalog.config_.data_dir) / kWalArchiveStagingName) {
     RequireWalArchiveOutside(config_, catalog.config_.data_dir);
     std::lock_guard lock(status_mutex_);
     status_.mode = config_.directory.empty() ? "command" : "dir";
@@ -737,17 +868,24 @@ WalArchiver::CatalogCapture WalArchiver::CaptureCatalog(std::stop_token cancel) 
     CatalogCapture capture;
     {
         std::shared_lock lock(catalog_.tables_mutex_);
+        std::set<StoreId> epochs;
         for (const auto& [name, table] : catalog_.tables_) {
             if (catalog_.fenced_.contains(name)) continue;
             auto& item = capture.tables.emplace_back();
             item.table = table;
             item.entry.name = name;
             item.entry.epoch = table->store_id();
+            epochs.insert(item.entry.epoch);
         }
         for (const auto& [name, fence] : catalog_.fenced_) {
             auto& entry = capture.tables.emplace_back().entry;
             entry.name = name;
-            if (fence.table) entry.epoch = fence.table->store_id();
+            // A failed rename can fence both names. Attach the epoch to
+            // its old name when that name is still fenced and list the
+            // other fence with no known epoch or position.
+            if (fence.table && (name == fence.table->name() || !catalog_.fenced_.contains(fence.table->name())) &&
+                epochs.insert(fence.table->store_id()).second)
+                entry.epoch = fence.table->store_id();
             entry.state = WalArchiveTableState::kFenced;
             entry.reason = fence.reason;
         }
@@ -987,10 +1125,13 @@ WalArchiver::RetentionPlan WalArchiver::PlanRetention(WalArchiveRecord& record) 
     const auto retention = static_cast<std::uint64_t>(config_.retention.count());
     if (record.captured_ms <= retention) return plan;
     const auto bound = record.captured_ms - retention;
-    const auto records_dir = config_.directory / WalArchiveDirectoryDirName(directory_id_);
+    const auto archive = CanonicalBackupPath(config_.directory);
+    const auto records_dir = archive / WalArchiveDirectoryDirName(directory_id_);
+    if (std::filesystem::symlink_status(records_dir).type() == std::filesystem::file_type::not_found) return plan;
     std::vector<std::pair<std::uint64_t, std::filesystem::path>> records;
-    for (const auto& path : SortedEntries(records_dir))
-        if (const auto captured = ParseWalArchiveRecordName(path.filename().string())) records.emplace_back(*captured, path);
+    for (const auto& name : ListBackupSourceDirectory(records_dir))
+        if (const auto captured = ParseWalArchiveRecordName(name.string())) records.emplace_back(*captured, records_dir / name);
+    std::sort(records.begin(), records.end());
     std::size_t boundary = 0U;
     while (boundary + 1U < records.size() && records[boundary + 1U].first < bound) ++boundary;
     if (boundary == 0U) return plan;
@@ -999,9 +1140,7 @@ WalArchiver::RetentionPlan WalArchiver::PlanRetention(WalArchiveRecord& record) 
     const auto catalog_positions = [](const WalArchiveRecord& seal) {
         std::map<StoreId, const WalArchiveTableEntry*> positions;
         for (const auto& table : seal.tables) {
-            if (table.state == WalArchiveTableState::kDetached) continue;
-            const auto [it, inserted] = positions.try_emplace(table.epoch, &table);
-            if (!inserted && table.state == WalArchiveTableState::kSealed) it->second = &table;
+            if (table.state != WalArchiveTableState::kDetached && table.epoch != StoreId{}) positions.emplace(table.epoch, &table);
         }
         return positions;
     };
@@ -1033,7 +1172,7 @@ WalArchiver::RetentionPlan WalArchiver::PlanRetention(WalArchiveRecord& record) 
                 (at_boundary != boundary_positions.end() && at_boundary->second->state != WalArchiveTableState::kSealed) ||
                 (now != newest_positions.end() && (now->second->state != WalArchiveTableState::kSealed ||
                     at_boundary == boundary_positions.end()));
-            const auto directory = config_.directory / WalArchiveTableDirName(table.epoch);
+            const auto directory = archive / WalArchiveTableDirName(table.epoch);
             for (const auto& file : table.files) {
                 if (file.name.ends_with(".manifest")) continue;
                 if (preserve) {
@@ -1049,7 +1188,7 @@ WalArchiver::RetentionPlan WalArchiver::PlanRetention(WalArchiveRecord& record) 
 
     const auto keep_files = [&](const WalArchiveRecord& seal) {
         for (const auto& table : seal.tables) {
-            const auto directory = config_.directory / WalArchiveTableDirName(table.epoch);
+            const auto directory = archive / WalArchiveTableDirName(table.epoch);
             for (const auto& file : table.files) {
                 plan.files.erase(directory / file.name);
                 if (const auto by_epoch = carried.find(table.epoch); by_epoch != carried.end()) {
@@ -1089,16 +1228,12 @@ WalArchiver::RetentionPlan WalArchiver::PlanRetention(WalArchiveRecord& record) 
 
 void WalArchiver::ApplyRetention(const RetentionPlan& plan) const {
     for (const auto& path : plan.records) {
-        std::filesystem::remove(path);
-        SyncDirectoryPath(path.parent_path());
+        RemoveBackupSourceFiles(path.parent_path(), {path.filename()});
         Crash("CHUNKDB_FAILPOINT_CRASH_ARCHIVE_RETENTION_AFTER_RECORD_ONCE");
     }
-    std::set<std::filesystem::path> touched;
-    for (const auto& path : plan.files) {
-        std::filesystem::remove(path);
-        touched.insert(path.parent_path());
-    }
-    for (const auto& directory : touched) SyncDirectoryPath(directory);
+    std::map<std::filesystem::path, std::vector<std::filesystem::path>> files;
+    for (const auto& path : plan.files) files[path.parent_path()].push_back(path.filename());
+    for (const auto& [directory, names] : files) RemoveBackupSourceFiles(directory, names);
 }
 
 }  // namespace chunkdb

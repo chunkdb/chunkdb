@@ -23,8 +23,8 @@ namespace chunkdb {
 
 class SharedFileInput::Buffer final : public std::streambuf {
   public:
-    explicit Buffer(const std::filesystem::path& path) : path_(path) {
 #ifdef _WIN32
+    explicit Buffer(const std::filesystem::path& path) : path_(path) {
         handle_ = CreateFileW(path.c_str(), GENERIC_READ,
             FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
             FILE_FLAG_OPEN_REPARSE_POINT | FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
@@ -35,26 +35,18 @@ class SharedFileInput::Buffer final : public std::streambuf {
             Close();
             Error(error, "inspect");
         }
-        const bool regular = GetFileType(handle_) == FILE_TYPE_DISK &&
-            (information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0U;
-#else
-        // Nonblocking admission also rejects FIFOs without waiting for a writer.
-        handle_ = ::open(path.c_str(), O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK);
-        if (handle_ < 0) Error(errno, "open");
-        struct stat information {};
-        if (fstat(handle_, &information) != 0) {
-            const auto error = errno;
-            Close();
-            Error(error, "inspect");
-        }
-        const bool regular = S_ISREG(information.st_mode);
-#endif
-        if (!regular) {
-            Close();
-            throw std::runtime_error("shared file input is not a plain regular file: " + path_.string());
-        }
-        Empty();
+        RequireRegular(GetFileType(handle_) == FILE_TYPE_DISK &&
+            (information.dwFileAttributes & (FILE_ATTRIBUTE_DIRECTORY | FILE_ATTRIBUTE_REPARSE_POINT)) == 0U);
     }
+#else
+    explicit Buffer(const std::filesystem::path& path) : path_(path), handle_(::open(path.c_str(), kOpenFlags)) {
+        AdmitPosixFile();
+    }
+    Buffer(const std::filesystem::path& path, int parent_fd)
+        : path_(path), handle_(::openat(parent_fd, path.filename().c_str(), kOpenFlags)) {
+        AdmitPosixFile();
+    }
+#endif
     ~Buffer() override { Close(); }
     [[nodiscard]] bool IsOpen() const noexcept {
 #ifdef _WIN32
@@ -77,6 +69,27 @@ class SharedFileInput::Buffer final : public std::streambuf {
     }
 
   private:
+#ifndef _WIN32
+    // Nonblocking admission also rejects FIFOs without waiting for a writer.
+    static constexpr int kOpenFlags = O_RDONLY | O_CLOEXEC | O_NOFOLLOW | O_NONBLOCK;
+    void AdmitPosixFile() {
+        if (handle_ < 0) Error(errno, "open");
+        struct stat information {};
+        if (fstat(handle_, &information) != 0) {
+            const auto error = errno;
+            Close();
+            Error(error, "inspect");
+        }
+        RequireRegular(S_ISREG(information.st_mode));
+    }
+#endif
+    void RequireRegular(bool regular) {
+        if (!regular) {
+            Close();
+            throw std::runtime_error("shared file input is not a plain regular file: " + path_.string());
+        }
+        Empty();
+    }
     [[noreturn]] void Error(int error, const char* operation) const {
 #ifdef _WIN32
         const auto& category = std::system_category();
@@ -169,6 +182,10 @@ class SharedFileInput::Buffer final : public std::streambuf {
 
 SharedFileInput::SharedFileInput(const std::filesystem::path& path)
     : std::istream(nullptr), buffer_(std::make_unique<Buffer>(path)) { rdbuf(buffer_.get()); }
+#ifndef _WIN32
+SharedFileInput::SharedFileInput(const std::filesystem::path& path, int parent_fd)
+    : std::istream(nullptr), buffer_(std::make_unique<Buffer>(path, parent_fd)) { rdbuf(buffer_.get()); }
+#endif
 SharedFileInput::~SharedFileInput() = default;
 bool SharedFileInput::is_open() const noexcept { return buffer_->IsOpen(); }
 void SharedFileInput::close() noexcept { buffer_->Close(); }
