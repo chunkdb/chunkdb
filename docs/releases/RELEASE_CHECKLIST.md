@@ -50,6 +50,7 @@ scripts/release/generate_checksums.sh build-release/packages
 
 ## 4) Documentation Consistency
 
+- [ ] `scripts/release/gather-changelog.sh` has moved every `changelog.d/` fragment into `CHANGELOG.md`, and the `## Unreleased` heading carries the version and date
 - [ ] CLI uses module `github.com/chunkdb/chunk-cli/v2` and tag `v2.0.0` exists before the server 2.0 release is announced
 
 - [ ] `README.md` support matrix matches current platform claims
