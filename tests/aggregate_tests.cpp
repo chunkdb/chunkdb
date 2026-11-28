@@ -386,6 +386,15 @@ void ValuesInPlace() {
     Same(out, expected);
 }
 
+void ValueSpansNineBytes() {
+    Fixture f;
+    f.Ok("CREATE TABLE t (v u63) CHUNK 2 x 2");
+    // Block 1 starts at bit 63, so bit 62 of its value is in the ninth byte read.
+    constexpr std::uint64_t kValue = std::uint64_t{1} << 62U;
+    f.Ok("SET BLOCK 1 0 IN t v = " + std::to_string(kValue));
+    Same(f.Run("AGGREGATE CHUNK 0 0 FROM t MAX(v)"), Map({{"max(v)", UInt(kValue)}}));
+}
+
 std::string U64Frame(std::uint64_t value) {
     std::string frame(8U, '\0');
     for (std::size_t i = 0U; i < 8U; ++i) frame[i] = static_cast<char>((value >> (8U * i)) & 0xFFU);
@@ -530,6 +539,7 @@ int main() {
     MetaOnlyChunk();
     Cancellation();
     ValuesInPlace();
+    ValueSpansNineBytes();
     Where();
     WhereRefusals();
     WhereTransactions();
