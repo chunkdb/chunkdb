@@ -36,8 +36,7 @@ std::shared_ptr<SlotWatch> SlotWatch::Create(std::shared_ptr<Table> table,
         throw std::invalid_argument("ACK TIMEOUT must be positive");
     if (options.buffer_bytes && *options.buffer_bytes == 0U) throw std::invalid_argument("feed buffer must be positive");
     auto [slot, claim] = table->ClaimFeedSlot(name, options, takeover, std::move(user), authorize_owner, std::move(peer));
-    options.areas.clear();
-    if (slot.filters.area) options.areas.push_back(*slot.filters.area);
+    options.areas = slot.filters.areas;
     options.column_ids = slot.filters.column_ids;
     options.no_before = slot.filters.no_before; options.chunks = slot.filters.chunks;
     if (options.after && table->lineage() && options.after->epoch == table->lineage()->parent_epoch &&
@@ -473,7 +472,7 @@ bool SlotWatch::Work() {
             archive_.emplace(table_->ReadClaimedFeedArchive(claim_, cursor_));
             // The reader keeps only what this watch sends, so its budget
             // counts the frames this watch sends.
-            if (Filtered()) archive_->Filter({SlotArea(), options_.column_ids, options_.no_before, options_.chunks});
+            if (Filtered()) archive_->Filter({options_.areas, options_.column_ids, options_.no_before, options_.chunks});
             changed = true;
         }
         if (!pending_) {

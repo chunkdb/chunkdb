@@ -556,9 +556,13 @@ void Table::StopFeed() {
         feed_ = std::make_shared<ChangeFeed>(store_id_, FeedBufferBytes());
 }
 
-FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const FeedSlotFilters& filters,
+FeedSlot Table::CreateFeedSlot(std::string_view name, bool if_not_exists, const FeedSlotFilters& given,
     std::optional<std::string> owner, bool owner_given) {
     RequireValidFeedSlotName(name);
+    // A slot records its areas in one order, so equal sets compare equal.
+    auto filters = given;
+    SortFeedAreas(filters.areas);
+    if (filters.areas.size() > kMaxFeedAreas) throw std::invalid_argument("a slot takes at most 64 areas");
     if (owner) RequireValidFeedSlotOwner(*owner);
     std::lock_guard ddl(ddl_mutex_);
     if (if_not_exists) {
@@ -780,8 +784,11 @@ std::pair<FeedSlot, std::shared_ptr<FeedSlotClaim>> Table::ClaimFeedSlot(std::st
         if (slot.owner && authorize_owner) authorize_owner(*slot.owner);
         if (slot.lost) throw FeedSlotLostError(slot.schema_filter_lost ? "feed slot projected column was dropped" : "feed slot exceeded its retention limit",
             slot.schema_filter_lost ? "schema_filter" : "retention_limit");
-        // Repeated areas keep the same chunks, as for a watch without SLOT.
-        if (std::any_of(options.areas.begin(), options.areas.end(), [&](const FeedArea& area) { return area != slot.filters.area; }) ||
+        // The same areas in any order or repeated keep the same chunks, as for
+        // a watch without SLOT.
+        auto areas = options.areas;
+        SortFeedAreas(areas);
+        if ((!areas.empty() && areas != slot.filters.areas) ||
             (options.column_ids && options.column_ids != slot.filters.column_ids) ||
             (options.no_before && !slot.filters.no_before) || (options.chunks && !slot.filters.chunks))
             throw FeedSlotFiltersError("feed slot filters differ from WATCH filters");
@@ -2658,14 +2665,15 @@ CatalogFeatureStatus TableCatalog::FeatureStatus() {
         for (const auto& [_, table] : tables_) tables.push_back(table);
         // Out of the inventory until RecoverTable: no store is open.
         for (const auto& [name, fenced] : fenced_)
-            status.tables.push_back({.name = name, .features = std::nullopt, .fence = std::string(fenced.reason)});
+            status.tables.push_back({.name = name, .features = std::nullopt, .fence = std::string(fenced.reason), .frontier_frozen = false});
     }
     for (const auto& table : tables) {
-        CatalogTableStatus entry{.name = table->name(), .features = std::nullopt, .fence = std::nullopt};
+        CatalogTableStatus entry{.name = table->name(), .features = std::nullopt, .fence = std::nullopt, .frontier_frozen = false};
         try {
             const auto lease = table->Acquire();
             if (!lease) throw TableNotFoundError("table disappeared while reading feature status");
             entry.features = lease->store().features();
+            entry.frontier_frozen = table->SlotFrontierFrozen(*lease);
         } catch (const FeedRecoveryRequiredError&) {
             // Its feed cleanup failed, which fences it without a lease.
             entry.fence = kFenceFeed;

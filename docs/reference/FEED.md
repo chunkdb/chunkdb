@@ -31,6 +31,7 @@ OK
   lost_reason = NULL
   filters:
     area = NULL
+    areas = NULL
     column_ids = NULL
     columns = NULL
     no_before = false
@@ -89,7 +90,7 @@ OK
 ## Syntax
 
 ```text
-CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [OWNER user]
+CREATE SLOT [IF NOT EXISTS] 'name' ON table [AREA cx0 cy0 TO cx1 cy1 [, AREA cx0 cy0 TO cx1 cy1 ...]] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [OWNER user]
 DROP SLOT [IF EXISTS] 'name' ON table
 SHOW SLOTS [ON table] [PREFIX 'name']
 WATCH table [SLOT 'name'] [AREA cx0 cy0 TO cx1 cy1 [, AREA cx0 cy0 TO cx1 cy1 ...]] [COLUMNS a,b] [NO BEFORE] [CHUNKS] [AFTER epoch revision] [ACK TIMEOUT ms] [TAKEOVER]
@@ -102,7 +103,7 @@ UNWATCH
 
 - `name`: quoted `[a-z_][a-z0-9_]*`, 1 through 63 bytes.
 - `AREA`: inclusive chunk-coordinate rectangle or cuboid with exactly the table's active axes; transactions are clipped to it.
-- `AREA ..., AREA ...`: WATCH without SLOT takes up to 64 areas with the same axes and keeps a chunk inside any of them; a slot keeps one AREA, and WATCH SLOT accepts several only when each repeats it.
+- `AREA ..., AREA ...`: WATCH and CREATE SLOT take up to 64 areas with the same axes and keep a chunk inside any of them; WATCH SLOT accepts areas only when they are the slot's areas, in any order and with repeats.
 - `COLUMNS`: project block values in declared order; column IDs preserve the projection across renames, and chunk metadata remains complete.
 - `NO BEFORE`: omit previous block and chunk-metadata rows from mutation events.
 - `CHUNKS`: receive each relevant committed chunk's version and whole form instead of block changes; while the watch lags, repeated changes of a chunk merge (see [Notes](#notes)).
@@ -120,7 +121,7 @@ UNWATCH
 ## Returns
 
 - CREATE and DROP SLOT: `OK`, including authorized conditional no-ops.
-- SHOW SLOTS: visible table (every table with MONITOR), name, epoch, saved `acked` revision, `revision`, `lag_revisions`, retained bytes, `attached`, `peer`, `last_ack_ms`, lost state, loss reason, filters, and owner; the owner is shown to that user and to MANAGES USERS, and is null otherwise; a table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
+- SHOW SLOTS: visible table (every table with MONITOR), name, epoch, saved `acked` revision, `revision`, `lag_revisions`, retained bytes, `attached`, `peer`, `last_ack_ms`, lost state, loss reason, filters, and owner; in filters, `areas` lists the slot's areas in coordinate order, or is null for the whole table, and `area` is the only area, or null with none or several; the owner is shown to that user and to MANAGES USERS, and is null otherwise; a table ADMIN can still test an owner name with CREATE SLOT IF NOT EXISTS ... OWNER, and SHOW MIGRATIONS shows statement text with its OWNER.
 - WATCH: start position, followed by change or chunks, schema, progress, or resync events.
 - WATCH CATALOG: the catalog epoch and revision, followed by catalog events; see [WATCH CATALOG](#watch-catalog).
 - ACK: no success reply; it is accepted only inside a slot watch.

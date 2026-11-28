@@ -309,9 +309,9 @@ void TestHello() {
     assert(session.greeted);
     assert(Contains(hello, "$14\r\nmax_scan_limit\r\n:1024\r\n"));
     assert(Contains(hello, "$16\r\nserver_signature\r\n$"));
-    assert(Contains(hello, "$8\r\nfeatures\r\n*15\r\n$19\r\nprotocol_foundation\r\n"));
+    assert(Contains(hello, "$8\r\nfeatures\r\n*16\r\n$19\r\nprotocol_foundation\r\n"));
     assert(Contains(hello, "$12\r\nslot_filters\r\n$13\r\nslot_takeover\r\n$7\r\nlineage\r\n"));
-    assert(Contains(hello, "$19\r\nconnection_controls\r\n$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n$11\r\narea_paging\r\n$10\r\narea_scale\r\n$22\r\nread_only_transactions\r\n$9\r\nreturning\r\n$13\r\nwatch_catalog\r\n"));
+    assert(Contains(hello, "$19\r\nconnection_controls\r\n$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n$11\r\narea_paging\r\n$10\r\narea_scale\r\n$22\r\nread_only_transactions\r\n$9\r\nreturning\r\n$13\r\nwatch_catalog\r\n$10\r\nslot_areas\r\n"));
     ExpectError(engine.Execute(session, "HELLO 3\r\n"), "PROTOCOL HELLO was already sent");
     ExpectReply(engine.Execute(session, "PING\r\n"), "+PONG\r\n");
     // Commands of the retired protocol 2 are not statements.
@@ -1085,7 +1085,7 @@ void TestSlotStatements() {
     expected += "\r\n$8\r\nrevision\r\n:" + std::to_string(world.durable_watermark);
     expected += "\r\n$13\r\nlag_revisions\r\n:" + std::to_string(world.durable_watermark - world.position.revision);
     expected += "\r\n$14\r\nretained_bytes\r\n:0\r\n$8\r\nattached\r\n#f\r\n$4\r\npeer\r\n_\r\n$11\r\nlast_ack_ms\r\n_\r\n$4\r\nlost\r\n#f\r\n";
-    expected += "$11\r\nlost_reason\r\n_\r\n$7\r\nfilters\r\n%5\r\n$4\r\narea\r\n_\r\n$10\r\ncolumn_ids\r\n_\r\n$7\r\ncolumns\r\n_\r\n$9\r\nno_before\r\n#f\r\n$6\r\nchunks\r\n#f\r\n$5\r\nowner\r\n_\r\n";
+    expected += "$11\r\nlost_reason\r\n_\r\n$7\r\nfilters\r\n%6\r\n$4\r\narea\r\n_\r\n$5\r\nareas\r\n_\r\n$10\r\ncolumn_ids\r\n_\r\n$7\r\ncolumns\r\n_\r\n$9\r\nno_before\r\n#f\r\n$6\r\nchunks\r\n#f\r\n$5\r\nowner\r\n_\r\n";
     ExpectReply(f.Run("SHOW SLOTS ON world"), expected); // No user records no owner.
     ExpectReply(f.Run("CREATE SLOT 'owned' ON plain OWNER bot NO BEFORE"), "+OK\r\n");
     assert(f.Run("SHOW SLOTS ON plain").find("$5\r\nowner\r\n$3\r\nbot\r\n") != std::string::npos);

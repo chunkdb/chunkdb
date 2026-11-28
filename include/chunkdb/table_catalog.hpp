@@ -160,6 +160,9 @@ struct CatalogTableStatus {
     std::optional<FeatureFlags> features;
     // Why the table is fenced; std::nullopt while it serves.
     std::optional<std::string> fence;
+    // Table::SlotFrontierFrozen: fenced, and its slots' durable frontier
+    // stopped advancing.
+    bool frontier_frozen = false;
 };
 
 struct CatalogFeatureStatus {
