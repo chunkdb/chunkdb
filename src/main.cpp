@@ -173,6 +173,14 @@ void PrintUsage() {
         << "      statements that change anything are refused.\n"
         << "  --backup-dir <path>\n"
         << "      BACKUP destinations must be relative to this directory; unset disables BACKUP.\n"
+        << "  --archive-dir <path>\n"
+        << "  --archive-command <command>\n"
+        << "      Copy every sealed WAL segment to this directory, or run the command for\n"
+        << "      each file with %p its local path and %f its archive name.\n"
+        << "  --archive-interval-ms <n>\n"
+        << "      How often every table is sealed and shipped (default 60000).\n"
+        << "  --archive-retention-ms <n>\n"
+        << "      How long --archive-dir keeps seal records and segments (default 0, all).\n"
         << "  --durability <relaxed|fsync-wal|fsync-checkpoint>\n"
         << "  --checkpoint-updates <n>\n"
         << "  --checkpoint-wal-bytes <n>\n"
@@ -201,6 +209,7 @@ int main(int argc, char** argv) {
     try {
         chunkdb::ServerConfig server_config;
         chunkdb::StoreConfig store_config;
+        chunkdb::WalArchiveConfig wal_archive;
         chunkdb::EngineConfig engine_config;
 
         store_config.data_dir = "data";
@@ -359,6 +368,18 @@ int main(int argc, char** argv) {
                 store_config.data_dir = require_value("--data-dir");
             } else if (arg == "--read-only") {
                 store_config.access_mode = chunkdb::AccessMode::kReadOnly;
+            } else if (arg == "--archive-dir") {
+                wal_archive.directory = require_value("--archive-dir");
+                if (wal_archive.directory.empty()) throw std::invalid_argument("--archive-dir must not be empty");
+            } else if (arg == "--archive-command") {
+                wal_archive.command = require_value("--archive-command");
+                if (wal_archive.command.empty()) throw std::invalid_argument("--archive-command must not be empty");
+            } else if (arg == "--archive-interval-ms") {
+                wal_archive.interval = std::chrono::milliseconds(
+                    ParseBounded(require_value("--archive-interval-ms"), "--archive-interval-ms", 100U, 86400000U));
+            } else if (arg == "--archive-retention-ms") {
+                wal_archive.retention = std::chrono::milliseconds(ParseBounded(require_value("--archive-retention-ms"),
+                    "--archive-retention-ms", 0U, static_cast<std::size_t>(std::numeric_limits<std::int64_t>::max())));
             } else if (arg == "--backup-dir") {
                 engine_config.backup_dir = require_value("--backup-dir");
                 if (engine_config.backup_dir.empty())
@@ -590,6 +611,7 @@ int main(int argc, char** argv) {
         auto catalog_config = chunkdb::CatalogConfigFromStoreConfig(store_config, option_fields);
         catalog_config.feed_buffer_bytes = server_config.feed_buffer_bytes;
         catalog_config.feed_linger = std::chrono::milliseconds(server_config.feed_linger_ms);
+        catalog_config.wal_archive = wal_archive;
         std::shared_ptr<chunkdb::TableCatalog> catalog;
         try {
             catalog = std::make_shared<chunkdb::TableCatalog>(std::move(catalog_config));

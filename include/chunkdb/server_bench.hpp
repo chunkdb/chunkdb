@@ -51,6 +51,10 @@ struct Args {
     std::string password{};
     // Durability mode of the server spawn mode starts.
     std::string durability_mode = "relaxed";
+    // Spawn mode: the server archives its sealed WAL segments to this
+    // directory every `archive_interval_ms` (docs/design/WAL_ARCHIVE.md).
+    std::string archive_dir{};
+    std::uint64_t archive_interval_ms = 1000;
     // Worker threads of the server spawn mode starts. A connection holds a
     // worker until it closes, so fewer workers than clients serialize them.
     std::size_t server_workers = 4;
@@ -150,6 +154,8 @@ struct BenchmarkReport {
     std::uint32_t seed = 0;
     // The spawned server's durability mode; empty against an external server.
     std::string durability_mode;
+    // The spawned server's archive directory; empty without archiving.
+    std::string archive_dir;
     // The chunk locks of the spawned server (this build); "unknown" against
     // an external one.
     std::string chunk_lock_mode = "unknown";

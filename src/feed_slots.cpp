@@ -1,6 +1,7 @@
 #include "feed_slots.hpp"
 
 #include <algorithm>
+#include <cerrno>
 #include <charconv>
 #include <limits>
 #include <map>
@@ -106,7 +107,68 @@ struct ReaderPin {
 void CrashPoint(const char* name) {
     if (ConsumeFailpointEnv(name)) ExitAbruptly(86);
 }
+// A second name of `source` at `target`; an existing `target` must already be one.
+void LinkStaged(const std::filesystem::path& source, const std::filesystem::path& target) {
+    std::error_code ec;
+    if (std::filesystem::exists(target, ec)) {
+        if (!std::filesystem::equivalent(source, target))
+            throw std::runtime_error("staged archive file is another file: " + target.string());
+        return;
+    }
+    if (ec) throw std::filesystem::filesystem_error("cannot inspect staged archive file", target, ec);
+#ifdef _WIN32
+    if (!CreateHardLinkW(target.c_str(), source.c_str(), nullptr))
+        throw std::system_error(static_cast<int>(GetLastError()), std::system_category(), "archive staging hard link");
+#else
+    if (::link(source.c_str(), target.c_str()) != 0)
+        throw std::system_error(errno, std::generic_category(), "archive staging hard link");
+#endif
+}
 }  // namespace
+
+std::optional<ChunkStore::ArchiveSeal> ChunkStore::SealForArchive() {
+    if (access_mode_ != AccessMode::kReadWrite || !feed_slots_) throw std::logic_error("only a writer archives its WAL");
+    ThrowIfDurabilityPoisoned();
+    // The bound is issued from the counter writes take their commit times
+    // from, before the cut is sampled: a write that reserves its revision
+    // after the sample and then takes its time takes one at or above it.
+    std::uint64_t time_bound = UnixMillisNow();
+    {
+        std::uint64_t last = last_commit_time_ms_.load(std::memory_order_relaxed);
+        while (!last_commit_time_ms_.compare_exchange_weak(
+            last, std::max(time_bound, last), std::memory_order_seq_cst, std::memory_order_relaxed)) {
+        }
+        time_bound = std::max(time_bound, last);
+    }
+    // The cut as backup samples it: every revision at or below it is complete.
+    const auto cut = version_clock_.load(std::memory_order_seq_cst) - 1U;
+    while (!write_producers_->Completed(version_clock_, cut)) std::this_thread::yield();
+    // Staged batches reach their WALs, and the WALs reach the disk.
+    feed_slots_->Sync(cut);
+    feed_slots_->prefix_index().SeedMissing(data_dir_, geometry_, store_id_, features_, checkpoint_publish_mutex_);
+    std::vector<FeedWalPrefix> prefixes;
+    {
+        std::lock_guard publish_lock(checkpoint_publish_mutex_);
+        prefixes = feed_slots_->prefix_index().Capture(cut);
+    }
+    for (const auto& prefix : prefixes) {
+        const auto chunk = GetOrLoadRegularChunk(prefix.coord);
+        std::unique_lock lock(chunk->mutex);
+        AwaitChunkFilesLocked(lock, *chunk);
+        // A checkpoint since the capture may have sealed it already.
+        if (!std::filesystem::exists(ChunkWalPath(data_dir_, geometry_, prefix.coord))) continue;
+        // A backup linking this table's files defers the checkpoint.
+        if (!CheckpointChunk(prefix.coord, chunk)) return std::nullopt;
+    }
+    return ArchiveSeal{cut, time_bound};
+}
+
+std::size_t ChunkStore::StageForArchive(const std::filesystem::path& directory) {
+    if (access_mode_ != AccessMode::kReadWrite || !feed_slots_) throw std::logic_error("only a writer archives its WAL");
+    const auto staged = feed_slots_->StageForArchive(directory);
+    feed_slots_->Retain();
+    return staged;
+}
 
 std::optional<std::string_view> ChunkStore::SlotWriteUser() const noexcept {
     if (!feed_slots_active_.load(std::memory_order_acquire)) return std::nullopt;
@@ -154,11 +216,15 @@ void FeedSlotTestAccess::SetHook(Table& table, FeedSlotTestHook* hook) {
     lease->store().feed_slots_->hook_.store(hook, std::memory_order_release);
 }
 
-FeedSlots::FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::milliseconds interval)
+FeedSlots::FeedSlots(ChunkStore& store, std::size_t max_bytes, std::chrono::milliseconds interval, bool wal_archive)
     : store_(store), max_bytes_(max_bytes), interval_(interval),
       records_(ReadFeedSlotRecords(store.data_dir_, store.store_id_, store.geometry_.dims()).value_or(
           FeedSlotRecords{store.store_id_, 0U, {}, false, store.geometry_.dims()})),
-      readers_(ReaderPins(store.store_id_)) {
+      readers_(ReaderPins(store.store_id_)), wal_archive_(wal_archive) {
+    if (wal_archive_ && (store.features_.incompat & kFeatureFeedSlots) == 0U)
+        throw std::runtime_error("WAL archiving requires the feed_slots table feature; run ENABLE FEATURE 'feed_slots'");
+    if (wal_archive_ && store.allow_multiple_processes_)
+        throw std::invalid_argument("WAL archiving requires a single-process table");
     if (max_bytes_ == 0U || interval_.count() <= 0)
         throw std::invalid_argument("slot limits and sync interval must be positive");
     const bool filtered = records_.filter_format || std::any_of(records_.slots.begin(), records_.slots.end(),
@@ -200,8 +266,11 @@ void FeedSlotTestAccess::Filter(FeedArchiveReader& reader, const FeedSlotFilters
 }
 FeedSlots::~FeedSlots() { Stop(); }
 bool FeedSlots::active() const noexcept { return store_.feed_slots_active_.load(std::memory_order_acquire); }
-bool FeedSlots::ArchiveRequired() const noexcept {
+bool FeedSlots::WorkerRequired() const noexcept {
     return active() || readers_->load(std::memory_order_acquire) != 0U;
+}
+bool FeedSlots::ArchiveRequired() const noexcept {
+    return wal_archive_ || WorkerRequired();
 }
 void FeedSlots::ValidateRecoveryAliases(const ChunkStore& store) {
     auto segments = Segments(store.data_dir(), store.geometry().dims());
@@ -259,7 +328,8 @@ void FeedSlots::RecoverAliases() {
     }
 }
 void FeedSlots::Start(std::shared_ptr<ChangeFeed> feed) {
-    if (!ArchiveRequired() || store_.access_mode_ == AccessMode::kReadOnly) return;
+    // The WAL archiver retains for a table that only archives.
+    if (!WorkerRequired() || store_.access_mode_ == AccessMode::kReadOnly) return;
     Stop();
     feed_ = std::move(feed);
     {
@@ -299,7 +369,7 @@ void FeedSlots::Run() {
                 if (auto* hook = hook_.load(std::memory_order_acquire))
                     hook->Run(FeedSlotTestHook::Point::kFeedDisabled, 0U);
             }
-            if (!ArchiveRequired()) return;
+            if (!WorkerRequired()) return;
         } catch (const std::exception& error) {
             store_.PoisonDurability("feed slot sync failed: " + std::string(error.what()));
             LogMessage(LogLevel::kError, LogComponent::kStore, "feed slot durability frozen", {{"error", error.what()}});
@@ -660,9 +730,13 @@ void FeedSlots::Retain() {
     bool removed = false;
     for (const auto& segment : Segments(store_.data_dir_, store_.geometry_.dims())) {
         if (segment.last > minimum) continue;
+        // An archived segment stays until the WAL archiver staged a link to it.
+        const auto name = segment.wal.filename().string();
+        if (wal_archive_ && !staged_.contains(name)) continue;
         std::filesystem::remove(segment.wal);
         std::filesystem::remove(segment.base);
         std::filesystem::remove(segment.descriptor);
+        staged_.erase(name);
         removed = true;
     }
     const auto directory = store_.data_dir_ / kFeedArchiveDirName;
@@ -684,6 +758,31 @@ void FeedSlots::Retain() {
     }
     if (removed) SyncDirectoryPath(store_.data_dir_ / kFeedArchiveDirName);
     if (auto* hook = hook_.load(std::memory_order_acquire)) hook->Run(FeedSlotTestHook::Point::kAfterRetention, minimum);
+}
+std::size_t FeedSlots::StageForArchive(const std::filesystem::path& directory) {
+    store_.ThrowIfDurabilityPoisoned();
+    std::vector<std::string> names;
+    {
+        std::lock_guard publish_lock(store_.checkpoint_publish_mutex_);
+        std::lock_guard lock(mutex_);
+        for (const auto& segment : Segments(store_.data_dir_, store_.geometry_.dims())) {
+            auto name = segment.wal.filename().string();
+            if (staged_.contains(name)) continue;
+            if (names.empty()) (void)EnsureDirectoryPathExists(directory, true);
+            if (std::filesystem::exists(segment.descriptor))
+                LinkStaged(segment.descriptor, directory / segment.descriptor.filename());
+            LinkStaged(segment.wal, directory / name);
+            names.push_back(std::move(name));
+        }
+    }
+    if (names.empty()) return 0U;
+    // Retention removes only names in staged_, so a staged segment keeps its
+    // archive name until its staged name is durable. The sync runs without
+    // the publish lock, so checkpoints do not wait for it.
+    SyncDirectoryPath(directory);
+    std::lock_guard lock(mutex_);
+    staged_.insert(names.begin(), names.end());
+    return names.size();
 }
 std::filesystem::path FeedSlots::PrepareArchive(ChunkCoord coord) {
     const auto wal_path = ChunkWalPath(store_.data_dir_, store_.geometry_, coord);

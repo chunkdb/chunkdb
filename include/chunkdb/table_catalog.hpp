@@ -27,8 +27,11 @@
 #include "chunkdb/migration_health.hpp"
 #include "chunkdb/geometry.hpp"
 #include "chunkdb/statement_mutex.hpp"
+#include "chunkdb/wal_archive.hpp"
 
 namespace chunkdb {
+
+class WalArchiver;
 
 struct StoreManifest;
 struct BackupOptions;
@@ -114,6 +117,8 @@ struct CatalogConfig {
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::chrono::milliseconds feed_linger{30000};
     QueryLimits query_limits{};
+    // Continuous WAL archiving; a writer only.
+    WalArchiveConfig wal_archive{};
 };
 
 // A catalog configuration whose new-table options and shared budgets come
@@ -293,6 +298,7 @@ class Table : public std::enable_shared_from_this<Table> {
     friend class SlotWatch;
     friend class TableCatalog;
     friend struct FeedSlotTestAccess;
+    friend class WalArchiver;
     friend class FeedSubscription;
     friend struct FeedTestAccess;
     friend struct BackupTestAccess;
@@ -329,6 +335,7 @@ class Table : public std::enable_shared_from_this<Table> {
     void EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& options,
                       bool check_feed_error = false);
     void ReleaseLease() noexcept;
+    [[nodiscard]] std::optional<Lease> TryAcquireForArchive(const char** fence_reason);
     // Snapshot capture drains ordinary admission without detaching the feed,
     // closing the store or changing its maintenance owner.
     class AdmissionPause {
@@ -621,9 +628,16 @@ class TableCatalog {
     // RecoverTable or a restart. `cancelled` ends the waits.
     void SwapTables(std::string_view first, std::string_view second, std::stop_token cancelled = {});
     void SetBackupHookForTests(BackupTestHook* hook) noexcept { backup_hook_.store(hook, std::memory_order_release); }
+    // std::nullopt without WAL archiving.
+    [[nodiscard]] std::optional<WalArchiveStatus> ArchiveStatus() const;
+    // Runs one archive pass now, as the archiver does every interval, and
+    // rethrows its failure.
+    void RunArchivePass();
 
   private:
+    friend class WalArchiver;
     [[nodiscard]] std::filesystem::path TablesDir() const;
+    friend struct WalArchiveTestAccess;
     friend struct BackupTestAccess;
     friend struct FeatureActivationTestAccess;
     [[nodiscard]] std::filesystem::path StagingDir() const;
@@ -734,6 +748,8 @@ class TableCatalog {
     // Out of service until RecoverTable; disjoint from tables_, which
     // tables_mutex_ guards with it.
     std::map<std::string, Fenced, std::less<>> fenced_;
+    // Started last when the catalog opens and stopped first when it closes.
+    std::unique_ptr<WalArchiver> archiver_;
 };
 
 }  // namespace chunkdb

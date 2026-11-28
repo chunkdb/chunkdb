@@ -58,6 +58,20 @@ On Windows, a write that checkpoints its chunk or undoes a failed WAL append wai
 Above 65,536 tracked files and directories, a table tracks its changed large-chunk directories (`L_<lx>_<ly>`) instead, and the barrier syncs every file in each of them.
 Above 65,536 changed large-chunk directories, the barrier syncs every file and directory of the table.
 
+## WAL archive
+
+With `--archive-dir` or `--archive-command`, every checkpoint keeps its WAL as a sealed segment, and checkpoints publish their images synced in every mode.
+Every `--archive-interval-ms`, at start and at clean shutdown, the server attempts to seal each table: it samples a revision S as backup does, syncs the WALs and checkpoints every chunk whose live WAL holds a change at or below S.
+The seal record names busy and fenced tables, carries their last published positions when available, and records new positions for tables that could be sealed.
+If the catalog requires journal recovery, an archive pass waits for the restart that completes it.
+It ships the sealed segments, then publishes a seal record; a record's revision S for a table means that every change at or below S is in a segment the record or an earlier one of its chain lists, durable in the archive before the record.
+The record also holds a time bound taken before S: a change above S has a commit time at or above it, unless it is a conditional or expression write that took its commit time before its revision and was in flight while S was sampled.
+Changes after the newest record are not in the archive yet.
+A failed copy or command is retried every interval; until then the files stay in the data directory.
+A record is written to the data directory before it ships and becomes the chain's last only after it shipped, so a crash at any step leaves a chain without a fork, and the next start ships what is left.
+A dropped table's changes after the last pass before DROP are not archived.
+A writer start without archiving ends the chain.
+
 ## Failures
 
 An ordinary rejected mutation changes nothing, except when its error explicitly reports an unknown write outcome.

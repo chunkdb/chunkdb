@@ -30,6 +30,9 @@ struct VerifyCounters {
     const std::filesystem::path& table_dir,
     std::ostream& out);
 
+// Checks sealed archive records and the files they reference without writing.
+[[nodiscard]] VerifyCounters VerifyWalArchive(const std::filesystem::path& archive, std::ostream& out);
+
 // Checks the commit group owner of a directory for an admitted scope without
 // changing it. Not called by VerifyDataDirectory: no manifest can claim commit
 // groups in this build, so the CLI reports owner files as group_owner_unclaimed.

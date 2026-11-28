@@ -2023,6 +2023,8 @@ bool TakeoverTerminal(std::string_view line) {
 void ValidateEnabledArgs(const Args& args) {
     if (args.port == 0 && args.server_mode != ServerMode::kSpawn)
         throw std::invalid_argument("--port 0 requires --server-mode spawn");
+    if (!args.archive_dir.empty() && args.server_mode != ServerMode::kSpawn)
+        throw std::invalid_argument("--archive-dir requires --server-mode spawn");
     if (args.with_metadata != "none" && args.with_metadata != "version" &&
         args.with_metadata != "schema" && args.with_metadata != "both") throw std::invalid_argument("invalid --with value");
     if (args.watch_mode != "ordinary" && args.watch_mode != "progress" &&
@@ -2140,6 +2142,8 @@ std::string UsageText() {
         << "  --keyspace <N>                   default: 512\n"
         << "  --seed <N>                       default: 1337\n"
         << "  --durability-mode <mode>         spawn mode: relaxed (default), fsync-wal, fsync-checkpoint\n"
+        << "  --archive-dir <path>             spawn mode: archive sealed WAL segments there\n"
+        << "  --archive-interval-ms <N>        spawn mode: archive pass interval (default: 1000)\n"
         << "  --watch <table>[:N][:slots]      N watches (default 1) read pushes after each scenario\n"
         << "                                   warmup; with slots, each owns a durable slot and ACKs\n"
         << "  --watch-mode <mode>              report-only: ordinary (default), progress, filtered, chunks\n"
@@ -2321,6 +2325,17 @@ Args ParseArgs(const std::vector<std::string>& argv) {
             (void)ParseDurabilityMode(args.durability_mode);
             continue;
         }
+        if (arg == "--archive-dir") {
+            args.archive_dir = require_value("--archive-dir");
+            if (args.archive_dir.empty()) throw std::invalid_argument("--archive-dir must not be empty");
+            continue;
+        }
+        if (arg == "--archive-interval-ms") {
+            args.archive_interval_ms = ParsePositiveSize(require_value("--archive-interval-ms"), "--archive-interval-ms");
+            if (args.archive_interval_ms < 100U || args.archive_interval_ms > 86400000U)
+                throw std::invalid_argument("--archive-interval-ms must be 100..86400000");
+            continue;
+        }
         if (arg == "--user") {
             args.user = require_value("--user");
             user_overridden = true;
@@ -2466,7 +2481,12 @@ BenchmarkReport Run(const Args& requested) {
             .max_open_wal_streams = 1024,
             .allow_multiple_processes = false,
         };
-        catalog = std::make_shared<TableCatalog>(CatalogConfigFromStoreConfig(store_config));
+        auto catalog_config = CatalogConfigFromStoreConfig(store_config);
+        if (!args.archive_dir.empty()) {
+            catalog_config.wal_archive.directory = args.archive_dir;
+            catalog_config.wal_archive.interval = std::chrono::milliseconds(args.archive_interval_ms);
+        }
+        catalog = std::make_shared<TableCatalog>(std::move(catalog_config));
         (void)catalog->Create("default", store_config.geometry, catalog->default_options());
 
         // With a user, the spawned server requires logins and that user is
@@ -2517,6 +2537,7 @@ BenchmarkReport Run(const Args& requested) {
         report.spawned_server = true;
         report.chunk_lock_mode = chunkdb::ChunkLockModeName();
         report.durability_mode = DurabilityModeName(ParseDurabilityMode(args.durability_mode));
+        report.archive_dir = args.archive_dir;
         run_against_endpoint();
 
         server->Stop();
@@ -2575,6 +2596,7 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
     if (!report.durability_mode.empty()) {
         out << "durability_mode=" << report.durability_mode << "\n";
     }
+    if (!report.archive_dir.empty()) out << "archive_dir=" << report.archive_dir << "\n";
     if (report.active_clients < report.requested_clients) {
         out << "some clients were idle due to requests distribution\n";
     }
