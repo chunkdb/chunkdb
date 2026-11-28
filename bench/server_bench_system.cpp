@@ -105,23 +105,48 @@ void ReadProcessIo(SystemSample* sample) {
     }
 }
 
-// schedstat: on-CPU and run-queue nanoseconds; stat field 42: block I/O
-// delay in clock ticks, counted only with delay accounting on.
+struct ThreadStat {
+    std::uint64_t start_ticks = 0U;
+    double blkio_s = 0.0;
+};
+
+std::optional<ThreadStat> ReadThreadStat(const std::filesystem::path& path, double ticks) {
+    const auto stat = ReadText(path);
+    if (!stat) return std::nullopt;
+    const auto paren = stat->rfind(')');
+    if (paren == std::string::npos) return std::nullopt;
+    const auto fields = Words(std::string_view(*stat).substr(paren + 1U));
+    // The remaining fields begin at field 3. Fields 22 and 42 are the
+    // thread's start time and block I/O delay, both in clock ticks.
+    if (fields.size() <= 19U) return std::nullopt;
+    const auto& start = fields[19];
+    ThreadStat result;
+    const auto parsed = std::from_chars(start.data(), start.data() + start.size(), result.start_ticks);
+    if (parsed.ec != std::errc{} || parsed.ptr != start.data() + start.size()) return std::nullopt;
+    if (fields.size() > 39U) result.blkio_s = Number(fields[39]) / ticks;
+    return result;
+}
+
 void ReadThreads(SystemSample* sample) {
     std::error_code ec;
     const double ticks = TicksPerSecond();
     for (std::filesystem::directory_iterator it("/proc/self/task", ec), end; !ec && it != end; it.increment(ec)) {
+        const auto stat_path = it->path() / "stat";
+        const auto before = ReadThreadStat(stat_path, ticks);
+        if (!before) continue;
+        // schedstat reports on-CPU and run-queue nanoseconds. Verify the
+        // thread's identity on both sides of that read in case its TID is reused.
         const auto schedstat = ReadText(it->path() / "schedstat");
-        const auto stat = ReadText(it->path() / "stat");
-        if (!schedstat || !stat) continue;
+        if (!schedstat) continue;
+        const auto after = ReadThreadStat(stat_path, ticks);
+        if (!after || before->start_ticks != after->start_ticks) continue;
         const auto times = Words(*schedstat);
-        const auto paren = stat->rfind(')');
-        if (times.size() < 2U || paren == std::string::npos) continue;
-        const auto fields = Words(std::string_view(*stat).substr(paren + 1U));
+        if (times.size() < 2U) continue;
         SystemSample::Thread thread{
             .cpu_s = Number(times[0]) / 1e9,
             .runqueue_s = Number(times[1]) / 1e9,
-            .blkio_s = fields.size() > 39U ? Number(fields[39]) / ticks : 0.0,
+            .blkio_s = after->blkio_s,
+            .start_ticks = after->start_ticks,
         };
         sample->threads.emplace_back(it->path().filename().string(), thread);
     }
@@ -249,16 +274,18 @@ SystemSample Read(const SystemWindow::EngineStats& engine) {
 
 }  // namespace
 
-SystemWindow::SystemWindow(EngineStats engine) : engine_(std::move(engine)), start_(Read(engine_)) {
-    sampler_ = std::thread([this] {
-        auto last = Clock::now();
+void SystemSamplerGaps::Observe(Clock::time_point at) {
+    const double gap_ms = std::chrono::duration<double, std::milli>(at - last_).count();
+    last_ = at;
+    max_gap_ms_ = std::max(max_gap_ms_, gap_ms);
+    if (gap_ms > 100.0) ++gaps_over_100ms_;
+}
+
+SystemWindow::SystemWindow(EngineStats engine) : engine_(std::move(engine)), start_(Read(engine_)), gaps_(start_.at) {
+    sampler_ = std::jthread([this] {
         std::unique_lock lock(mutex_);
         while (!stop_changed_.wait_for(lock, std::chrono::milliseconds(10), [this] { return stop_; })) {
-            const auto now = Clock::now();
-            const double gap_ms = std::chrono::duration<double, std::milli>(now - last).count();
-            last = now;
-            max_gap_ms_ = std::max(max_gap_ms_, gap_ms);
-            if (gap_ms > 100.0) ++gaps_over_100ms_;
+            gaps_.Observe(Clock::now());
         }
     });
 }
@@ -268,16 +295,25 @@ SystemWindow::~SystemWindow() { StopSampler(); }
 void SystemWindow::StopSampler() {
     {
         std::lock_guard lock(mutex_);
+        if (stop_) return;
+        // A stalled sampler may never have reached its last timer wake-up.
+        gaps_.Observe(Clock::now());
         stop_ = true;
     }
-    stop_changed_.notify_all();
-    if (sampler_.joinable()) sampler_.join();
+    stop_changed_.notify_one();
 }
 
 std::vector<std::pair<std::string, std::string>> SystemWindow::Finish() {
-    const SystemSample end = Read(engine_);
+    // StopSampler freezes the gap totals before the final snapshot.
     StopSampler();
-    const double window_s = std::chrono::duration<double>(end.at - start_.at).count();
+    auto out = SystemStatsBetween(start_, Read(engine_));
+    out.emplace_back("sampler_max_gap_ms", Format("sampler_max_gap_ms", gaps_.max_gap_ms()));
+    out.emplace_back("sampler_gaps_over_100ms", Format("sampler_gaps_over_100ms", static_cast<double>(gaps_.gaps_over_100ms())));
+    return out;
+}
+
+std::vector<std::pair<std::string, std::string>> SystemStatsBetween(const SystemSample& start, const SystemSample& end) {
+    const double window_s = std::chrono::duration<double>(end.at - start.at).count();
     std::vector<std::pair<std::string, std::string>> out;
     auto add = [&](const std::string& name, double value) { out.emplace_back(name, Format(name, value)); };
 
@@ -287,19 +323,19 @@ std::vector<std::pair<std::string, std::string>> SystemWindow::Finish() {
         const auto prefix = name.substr(0, name.find('_', 5U) + 1U);
         for (const auto& [other, value] : end.counters) {
             if (!other.starts_with(prefix)) continue;
-            const auto* before = Find(start_.counters, other);
+            const auto* before = Find(start.counters, other);
             if (before != nullptr && value != *before) return true;
         }
         return false;
     };
     for (const auto& [name, value] : end.counters) {
-        const auto* before = Find(start_.counters, name);
+        const auto* before = Find(start.counters, name);
         if (before == nullptr) continue;
         if (name.starts_with("disk_") && !disk_moved(name)) continue;
         add(name, value - *before);
     }
     for (const auto& [name, value] : end.levels) {
-        if (const auto* before = Find(start_.levels, name)) add(name + "_start", *before);
+        if (const auto* before = Find(start.levels, name)) add(name + "_start", *before);
         add(name + "_end", value);
     }
     if (!end.threads.empty()) {
@@ -307,17 +343,17 @@ std::vector<std::pair<std::string, std::string>> SystemWindow::Finish() {
         // idle waits for work as well as lock and I/O waits.
         std::size_t measured = 0;
         double cpu_s = 0.0, runqueue_s = 0.0, blkio_s = 0.0, off_cpu_s = 0.0;
-        for (const auto& thread : end.threads) {
-            const SystemSample::Thread* before = nullptr;
-            for (const auto& started : start_.threads)
-                if (started.first == thread.first) before = &started.second;
-            if (before == nullptr) continue;
+        for (const auto& [tid, thread] : end.threads) {
+            const auto before = std::find_if(start.threads.begin(), start.threads.end(), [&](const auto& entry) {
+                return entry.first == tid && entry.second.start_ticks == thread.start_ticks;
+            });
+            if (before == start.threads.end()) continue;
             ++measured;
-            const double cpu = thread.second.cpu_s - before->cpu_s;
-            const double runqueue = thread.second.runqueue_s - before->runqueue_s;
+            const double cpu = thread.cpu_s - before->second.cpu_s;
+            const double runqueue = thread.runqueue_s - before->second.runqueue_s;
             cpu_s += cpu;
             runqueue_s += runqueue;
-            blkio_s += thread.second.blkio_s - before->blkio_s;
+            blkio_s += thread.blkio_s - before->second.blkio_s;
             off_cpu_s += std::max(0.0, window_s - cpu - runqueue);
         }
         add("threads_measured", static_cast<double>(measured));
@@ -325,11 +361,6 @@ std::vector<std::pair<std::string, std::string>> SystemWindow::Finish() {
         add("threads_runqueue_s", runqueue_s);
         add("threads_off_cpu_s", off_cpu_s);
         add("threads_blkio_s", blkio_s);
-    }
-    {
-        std::lock_guard lock(mutex_);
-        add("sampler_max_gap_ms", max_gap_ms_);
-        add("sampler_gaps_over_100ms", static_cast<double>(gaps_over_100ms_));
     }
     return out;
 }

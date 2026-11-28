@@ -1623,6 +1623,11 @@ struct ThreadWork {
     return active;
 }
 
+void WriteSystemStats(std::ostream& out, const std::vector<std::pair<std::string, std::string>>& stats) {
+    out << "System:";
+    for (const auto& [name, value] : stats) out << " " << name << "=" << value;
+}
+
 [[nodiscard]] ScenarioResult RunScenario(
     Scenario scenario,
     const Args& args,
@@ -1827,20 +1832,26 @@ struct ThreadWork {
         }
     }
     const auto end = Clock::now();
-    auto system_stats = system_window ? system_window->Finish() : std::vector<std::pair<std::string, std::string>>{};
-    for (const auto& watch : watches) watch->SampleLag(write_frontier, end);
     {
         std::lock_guard lock(login_mutex);
         measured_done = true;
     }
     login_changed.notify_all();
+    auto system_stats = system_window ? system_window->Finish() : std::vector<std::pair<std::string, std::string>>{};
+    for (const auto& watch : watches) watch->SampleLag(write_frontier, end);
     for (auto& client : failing) client.join();
     if (!failing.empty() && !failed.load(std::memory_order_acquire)) AwaitLoginAfterBan(args);
 
     if (failed.load(std::memory_order_acquire)) {
-        throw std::runtime_error(
-            "scenario=" + std::string(ScenarioName(scenario)) +
-            " failed: " + (first_error.empty() ? std::string("unknown error") : first_error));
+        auto message = "scenario=" + std::string(ScenarioName(scenario)) +
+            " failed: " + (first_error.empty() ? std::string("unknown error") : first_error);
+        if (!system_stats.empty()) {
+            std::ostringstream details;
+            details << '\n';
+            WriteSystemStats(details, system_stats);
+            message += details.str();
+        }
+        throw std::runtime_error(message);
     }
     if (latencies_ms.size() != args.requests) {
         throw std::runtime_error(
@@ -2167,8 +2178,8 @@ std::string UsageText() {
         << "                                   connection holds one, so use at least --clients\n"
         << "  --failed-logins <N>              report-only: N clients log in with a wrong password\n"
         << "                                   beside the measured clients; requires --user\n"
-        << "  --system-stats                   report-only: process, machine and engine counters of\n"
-        << "                                   each measured window, and the spawned server's close time\n"
+        << "  --system-stats                   report-only: process and machine counters of each window\n"
+        << "                                   except takeover, plus engine counters and close time in spawn mode\n"
         << "  --idle-connections <N>           N more connections log in before each scenario and stay\n"
         << "                                   idle until it ends; an external server's\n"
         << "                                   --idle-connection-timeout-ms must outlast the run\n"
@@ -2654,8 +2665,7 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
         }
         if (report.failed_login_clients != 0U) out << "Failed logins: " << result.failed_logins << "\n";
         if (!result.system_stats.empty()) {
-            out << "System:";
-            for (const auto& [name, value] : result.system_stats) out << " " << name << "=" << value;
+            WriteSystemStats(out, result.system_stats);
             out << "\n";
         }
         out << "Throughput (req/s): " << std::fixed << std::setprecision(2) << result.throughput_req_s << "\n";
