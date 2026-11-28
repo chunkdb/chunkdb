@@ -349,14 +349,34 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
         watch.merge.Clear(); watch.held.reset();
         // Finish an in-progress frame, preserving SSL_write's exact retry.
         const bool pinned = !watch.output.empty() && (watch.offset != 0U || watch.write_size != 0);
-        if (pinned) {
-            while (watch.output.size() > 1U) watch.output.pop_back();
-            watch.bytes = watch.output.front().bytes->size() - watch.offset;
-        } else {
-            watch.output.clear(); watch.bytes = 0U;
-        }
+        // Only pushes are dropped: a reply to a line read on the stream, such
+        // as WATCH AREA, is still owed and keeps its place.
+        std::deque<Watch::Output> kept;
+        for (auto& output : watch.output)
+            if ((pinned && kept.empty()) || output.bytes->front() != '>') kept.push_back(std::move(output));
+        watch.output = std::move(kept);
+        watch.bytes = 0U;
+        for (const auto& output : watch.output) watch.bytes += output.bytes->size();
+        watch.bytes -= watch.offset;
         Queue(watch, std::make_shared<const std::string>(watch.connection->session.watch->ResyncFrame()));
     };
+    if (watch.area_reply) {
+        if (!watch.output.empty()) return;
+        // Finish the old area's buffered pushes without pulling from the
+        // subscription, which now uses the new areas.
+        bool overflow = false;
+        if (!watch.merge.empty() || watch.held) {
+            auto bytes = Frame(!watch.merge.empty() ? watch.merge.Take() : std::exchange(watch.held, nullptr));
+            if (bytes->size() <= share) {
+                Queue(watch, std::move(bytes));
+                return;
+            }
+            overflow = true;
+        }
+        Queue(watch, std::exchange(watch.area_reply, nullptr));
+        if (!watch.connection->pending.empty()) WakePoll();
+        if (overflow) { resync(); return; }
+    }
     // A CHUNKS watch lags while its socket has not taken earlier output. Its
     // pushes then merge, and their frame is queued once that output is sent.
     bool lagging = !watch.output.empty();
@@ -412,7 +432,7 @@ void FeedIo::Pull(Watch& watch, std::size_t share) {
     Wake(); // Fair batches; entries still in the ring must not be stranded.
 }
 void FeedIo::Read(Watch& watch) {
-    if (watch.unwatch || watch.close || watch.dead ||
+    if (watch.unwatch || watch.close || watch.dead || watch.area_reply ||
         (watch.connection->session.slot_watch && watch.connection->session.slot_watch->TakingOver())) return;
     auto& connection = *watch.connection;
     for (std::size_t i = 0; i < 64U; ++i) {
@@ -458,11 +478,22 @@ void FeedIo::Read(Watch& watch) {
                     Wake();
                     continue;
                 }
+                if (const auto* replace = std::get_if<cql::Watch>(&parsed.statement); replace && !replace->catalog && replace->table.empty()) {
+                    if (!Permitted(watch)) return;
+                    auto reply = std::make_shared<const std::string>(CommandEngine::ReplaceWatchAreas(connection.session, replace->areas));
+                    if (reply->front() == '%' && (!watch.merge.empty() || watch.held)) {
+                        watch.area_reply = std::move(reply);
+                        return;
+                    }
+                    Queue(watch, std::move(reply));
+                    Wake();
+                    continue;
+                }
                 if (!std::holds_alternative<cql::Unwatch>(parsed.statement)) {
-                    Reject(watch, "only UNWATCH is accepted while watching"); return;
+                    Reject(watch, "only UNWATCH, WATCH AREA and a slot's ACK are accepted while watching"); return;
                 }
             } catch (const cql::ParseError&) {
-                Reject(watch, "only UNWATCH is accepted while watching"); return;
+                Reject(watch, "only UNWATCH, WATCH AREA and a slot's ACK are accepted while watching"); return;
             }
             watch.unwatch = true;
             if (connection.session.slot_watch) { connection.session.slot_watch->Unwatch(); Wake(); }
@@ -709,7 +740,7 @@ void FeedIo::Run() {
                 // A closing socket may stay readable or report HUP. Only the
                 // worker's completion wake can advance it, not socket polling.
                 if (watch.closing) continue;
-                short events = (watch.unwatch || watch.close || watch.read_paused) ? 0 : watch.read_wait;
+                short events = (watch.unwatch || watch.close || watch.read_paused || watch.area_reply) ? 0 : watch.read_wait;
                 if (!watch.output.empty()) events |= watch.write_wait;
                 if (watch.connection->session.slot_watch && watch.connection->session.slot_watch->TakingOver()) events = 0;
                 if (watch.connection->tls && watch.write_size != 0 &&
@@ -722,13 +753,13 @@ void FeedIo::Run() {
                     if (progress_timeout < 0 || timeout < progress_timeout) progress_timeout = timeout;
                 };
                 if (!watch.connection->session.slot_watch && !watch.connection->session.catalog_watch && !watch.unwatch && !watch.close && !watch.dead) {
-                    wait_until(watch.next_progress);
-                    // Merged pushes whose earlier output was sent are queued in the next round.
-                    if (watch.output.empty() && (!watch.merge.empty() || watch.held)) wait_until(now);
+                    if (!watch.area_reply) wait_until(watch.next_progress);
+                    // Buffered pushes and a replacement reply can advance after earlier output drains.
+                    if (watch.output.empty() && (!watch.merge.empty() || watch.held || watch.area_reply)) wait_until(now);
                 }
                 if (watch.excess_frames != 0U && !watch.dead) wait_until(watch.excess_progress + std::chrono::milliseconds(server_.config_.client_io_timeout_ms));
 #ifdef CHUNKDB_WITH_OPENSSL
-                if (watch.write_size == 0 && !watch.unwatch && !watch.close && !watch.read_paused && watch.connection->tls &&
+                if (watch.write_size == 0 && !watch.unwatch && !watch.close && !watch.read_paused && !watch.area_reply && watch.connection->tls &&
                     SSL_pending(watch.connection->tls) > 0) buffered_tls = true;
 #endif
             }

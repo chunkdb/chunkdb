@@ -313,9 +313,9 @@ void TestHello() {
     assert(session.greeted);
     assert(Contains(hello, "$14\r\nmax_scan_limit\r\n:1024\r\n"));
     assert(Contains(hello, "$16\r\nserver_signature\r\n$"));
-    assert(Contains(hello, "$8\r\nfeatures\r\n*17\r\n$19\r\nprotocol_foundation\r\n"));
+    assert(Contains(hello, "$8\r\nfeatures\r\n*18\r\n$19\r\nprotocol_foundation\r\n"));
     assert(Contains(hello, "$12\r\nslot_filters\r\n$13\r\nslot_takeover\r\n$7\r\nlineage\r\n"));
-    assert(Contains(hello, "$19\r\nconnection_controls\r\n$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n$11\r\narea_paging\r\n$10\r\narea_scale\r\n$22\r\nread_only_transactions\r\n$9\r\nreturning\r\n$13\r\nwatch_catalog\r\n$10\r\nslot_areas\r\n$9\r\nscan_area\r\n"));
+    assert(Contains(hello, "$19\r\nconnection_controls\r\n$17\r\nstatement_timeout\r\n$15\r\nchannel_binding\r\n$11\r\narea_paging\r\n$10\r\narea_scale\r\n$22\r\nread_only_transactions\r\n$9\r\nreturning\r\n$13\r\nwatch_catalog\r\n$10\r\nslot_areas\r\n$9\r\nscan_area\r\n$18\r\nwatch_area_replace\r\n"));
     ExpectError(engine.Execute(session, "HELLO 3\r\n"), "PROTOCOL HELLO was already sent");
     ExpectReply(engine.Execute(session, "PING\r\n"), "+PONG\r\n");
     // Commands of the retired protocol 2 are not statements.

@@ -107,6 +107,8 @@ class FeedIo : public std::enable_shared_from_this<FeedIo> {
         // here; `held` is a push read after them that waits for their frame.
         FeedChunksMerge merge;
         std::shared_ptr<const FeedEntry> held;
+        // A successful WATCH AREA reply waiting behind these old-area pushes.
+        std::shared_ptr<const std::string> area_reply{};
     };
     void Run();
     void WakeCatchUp() noexcept;
