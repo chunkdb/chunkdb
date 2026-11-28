@@ -23,6 +23,7 @@
 #include "listener_port_test_utils.hpp"
 #include "login_helpers.hpp"
 #include "sectioned_chunk_form.hpp"
+#include "../bench/server_bench_system.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -409,6 +410,7 @@ void TestExternalModeDoesNotSpawn() {
         .seed = 7,
         .output_mode = chunkdb::server_bench::OutputMode::kHuman,
         .log_level = chunkdb::LogLevel::kWarn,
+        .system_stats = true,
     });
 
     assert(!report.spawned_server);
@@ -417,6 +419,11 @@ void TestExternalModeDoesNotSpawn() {
     assert(report.results.size() == 1);
     assert(report.results.front().name == "ping");
     assert(report.results.front().completed_requests == 120);
+    assert(!report.server_close_s);
+    const auto json = chunkdb::server_bench::RenderJsonReport(report);
+    assert(json.find("\"system\":{\"window_s\":") != std::string::npos);
+    assert(json.find("\"engine_") == std::string::npos);
+    assert(json.find("\"server_close_s\":") == std::string::npos);
 }
 
 void TestSpawnModeStartsAndStops() {
@@ -864,6 +871,91 @@ void TestSpawnModeReportsDurability() {
            std::string::npos);
 }
 
+void TestSystemSamplerGaps() {
+    using Clock = std::chrono::steady_clock;
+    using std::chrono::milliseconds;
+    const Clock::time_point started{};
+    chunkdb::server_bench::SystemSamplerGaps gaps(started);
+    gaps.Observe(started + milliseconds(120));  // Late first wake-up.
+    assert(gaps.max_gap_ms() == 120.0 && gaps.gaps_over_100ms() == 1U);
+    gaps.Observe(started + milliseconds(220));  // Exactly 100 ms.
+    assert(gaps.max_gap_ms() == 120.0 && gaps.gaps_over_100ms() == 1U);
+    gaps.Observe(started + milliseconds(470));  // Stop before the sampler wakes again.
+    assert(gaps.max_gap_ms() == 250.0 && gaps.gaps_over_100ms() == 2U);
+}
+
+void TestSystemStatsMatchThreadLifetimes() {
+    chunkdb::server_bench::SystemSample start;
+    chunkdb::server_bench::SystemSample end;
+    end.at = start.at + std::chrono::seconds(2);
+    start.threads = {
+        {"41", {.cpu_s = 4.0, .runqueue_s = 2.0, .blkio_s = 1.0, .start_ticks = 100U}},
+        {"42", {.cpu_s = 2.0, .runqueue_s = 1.0, .blkio_s = 1.0, .start_ticks = 110U}},
+    };
+    end.threads = {
+        {"41", {.cpu_s = 0.1, .start_ticks = 200U}},
+        {"42", {.cpu_s = 2.5, .runqueue_s = 1.25, .blkio_s = 1.25, .start_ticks = 110U}},
+        {"43", {.cpu_s = 0.1, .start_ticks = 200U}},
+    };
+    const auto stats = chunkdb::server_bench::SystemStatsBetween(start, end);
+    const std::vector<std::pair<std::string, std::string>> expected{
+        {"window_s", "2.000000"}, {"threads_measured", "1"}, {"threads_cpu_s", "0.500000"},
+        {"threads_runqueue_s", "0.250000"}, {"threads_off_cpu_s", "1.250000"}, {"threads_blkio_s", "0.250000"},
+    };
+    assert(stats == expected);
+}
+
+// --system-stats adds each window's counters and the spawned server's close
+// time; without it the report has neither.
+void TestSystemStats() {
+    assert(!chunkdb::server_bench::ParseArgs({"bench"}).system_stats);
+    assert(chunkdb::server_bench::ParseArgs({"bench", "--system-stats"}).system_stats);
+    chunkdb::server_bench::Args args{
+        .server_mode = chunkdb::server_bench::ServerMode::kSpawn,
+        .host = "127.0.0.1",
+        .port = 0,
+        .clients = 2,
+        .pipeline = 1,
+        .requests = 200,
+        .tests = {chunkdb::server_bench::Scenario::kWorld},
+        .keyspace = 64,
+        .seed = 3,
+        .output_mode = chunkdb::server_bench::OutputMode::kJson,
+        .log_level = chunkdb::LogLevel::kWarn,
+    };
+    args.system_stats = true;
+    const auto report = chunkdb::server_bench::Run(args);
+    assert(report.results.size() == 1U && report.server_close_s && *report.server_close_s >= 0.0);
+    const auto& stats = report.results[0].system_stats;
+    auto value = [&](const std::string& name) -> std::optional<std::string> {
+        for (const auto& [key, number] : stats)
+            if (key == name) return number;
+        return std::nullopt;
+    };
+    for (const char* name : {"window_s", "engine_checkpoints", "engine_version_clock_extensions",
+                             "engine_version_clock_wait_s", "sampler_max_gap_ms", "requests_over_100ms",
+                             "requests_over_100ms_s"})
+        assert(value(name));
+#ifndef _WIN32
+    assert(value("process_cpu_user_s") && value("process_voluntary_switches") && value("process_max_rss_kib_end"));
+#endif
+#ifdef __linux__
+    assert(value("machine_cpu_iowait_s") && value("threads_cpu_s") && value("threads_off_cpu_s"));
+#endif
+    for (const auto& [key, number] : stats) assert(!key.empty() && !number.empty() && number.find_first_not_of("-0123456789.") == std::string::npos);
+    const auto json = chunkdb::server_bench::RenderJsonReport(report);
+    assert(json.find("\"system\":{\"window_s\":") != std::string::npos);
+    assert(json.find("\"server_close_s\":") != std::string::npos);
+    const auto human = chunkdb::server_bench::RenderHumanReport(report);
+    assert(human.find("System: window_s=") != std::string::npos);
+    assert(human.find("report_only server_close_s=") != std::string::npos);
+
+    args.system_stats = false;
+    const auto plain = chunkdb::server_bench::Run(args);
+    assert(!plain.server_close_s && plain.results[0].system_stats.empty());
+    assert(chunkdb::server_bench::RenderJsonReport(plain).find("\"system\"") == std::string::npos);
+}
+
 }  // namespace
 
 // Every scenario runs against a spawned server; the retired protocol 2
@@ -1077,16 +1169,20 @@ void TestEnabledBenchmarkOptions() {
         else if (std::string(mode) == "chunks") assert(result.watch_chunks > 0U);
         else assert(result.watch_changes > 0U);
     }
-    auto args = chunkdb::server_bench::ParseArgs({"bench", "--clients", "1", "--tests", "takeover"});
+    auto args = chunkdb::server_bench::ParseArgs({"bench", "--clients", "1", "--tests", "takeover", "--system-stats"});
     args.server_mode = chunkdb::server_bench::ServerMode::kSpawn;
     args.port = 0; args.requests = 3; args.log_level = chunkdb::LogLevel::kWarn;
     const auto report = chunkdb::server_bench::Run(args);
     const auto& result = report.results.front();
     assert(result.ownership_cycles == 3U && result.completed_requests == 6U);
     assert(result.completed_blocks == 0U && result.response_bytes > 0U);
+    assert(result.system_stats.empty() && report.server_close_s);
     assert(result.request_mix == (std::vector<std::pair<std::string, std::size_t>>{{"hello", 3}, {"watch_takeover", 3}}));
-    assert(chunkdb::server_bench::RenderJsonReport(report).find("ownership_cycles_s") != std::string::npos);
+    const auto takeover_json = chunkdb::server_bench::RenderJsonReport(report);
+    assert(takeover_json.find("ownership_cycles_s") != std::string::npos);
+    assert(takeover_json.find("\"system\"") == std::string::npos);
     args.user = "bench"; args.password = "test-password"; args.port = 0; args.requests = 1;
+    args.system_stats = false;
     const auto authenticated = chunkdb::server_bench::Run(args);
     assert(authenticated.results.front().ownership_cycles == 1U && authenticated.results.front().completed_requests == 3U);
     assert(authenticated.results.front().request_mix.back() == (std::pair<std::string, std::size_t>{"auth", 1U}));
@@ -1189,11 +1285,21 @@ std::optional<chunkdb::server_bench::BenchmarkReport> TestScriptedWatch(
     };
     const std::string hello = "%4\r\n$8\r\nprotocol\r\n:3\r\n$14\r\nserver_version\r\n$4\r\ntest\r\n"
         "$16\r\nserver_signature\r\n_\r\n$7\r\nunknown\r\n*3\r\n*-1\r\n$-1\r\n(184467440737095516160000\r\n";
+    const bool hold_ping_reply = slow_phase == "ping";
     auto peer = std::async(std::launch::async, [&] {
         { Owner metadata{accept_peer()}; read(metadata.fd, "HELLO 3"); send_reply(metadata.fd, hello);
           read(metadata.fd, "DESCRIBE default"); send_reply(metadata.fd,
             "%3\r\n$7\r\nversion\r\n:1\r\n$5\r\nchunk\r\n*2\r\n:1\r\n:1\r\n$7\r\ncolumns\r\n*1\r\n"
             "%3\r\n$2\r\nid\r\n:1\r\n$4\r\nname\r\n$4\r\nbits\r\n$4\r\ntype\r\n$7\r\nbits(8)\r\n"); }
+        if (hold_ping_reply) {
+            Owner worker{accept_peer()};
+            read(worker.fd, "HELLO 3");
+            send_reply(worker.fd, hello);
+            read(worker.fd, "PING");
+            char byte;
+            if (recv(worker.fd, &byte, 1, 0) != 0) throw std::runtime_error("expected benchmark to close after PING timeout");
+            return;
+        }
         if (takeover) {
             const std::string epoch(32, 'a');
             const std::string initial = "%2\r\n$5\r\nepoch\r\n$32\r\n" + epoch + "\r\n$8\r\nrevision\r\n:0\r\n";
@@ -1235,9 +1341,14 @@ std::optional<chunkdb::server_bench::BenchmarkReport> TestScriptedWatch(
     });
     auto args = chunkdb::server_bench::Args{};
     args.port = port; args.clients = 1; args.requests = 1; args.tests = {chunkdb::server_bench::Scenario::kPing};
-    args.watch_table = takeover ? "" : "default"; args.log_level = chunkdb::LogLevel::kWarn;
+    args.watch_table = takeover || hold_ping_reply ? "" : "default"; args.log_level = chunkdb::LogLevel::kWarn;
     if (takeover) args.tests = {chunkdb::server_bench::Scenario::kTakeover};
-    if (!slow_phase.empty()) args.io_timeout_ms = 150;
+    if (hold_ping_reply) {
+        args.io_timeout_ms = 1000;
+        args.system_stats = true;
+    } else if (!slow_phase.empty()) {
+        args.io_timeout_ms = 150;
+    }
     args.watch_delivery = delivery;
     std::optional<chunkdb::server_bench::BenchmarkReport> result;
     bool failed = false; std::string failure;
@@ -1248,6 +1359,13 @@ std::optional<chunkdb::server_bench::BenchmarkReport> TestScriptedWatch(
     if (!expected_error.empty()) assert(failure.find(expected_error) != std::string::npos);
     return result;
 }
+
+void TestSystemStatsOnTimeout() {
+    // Complete metadata discovery and the worker's HELLO, then withhold its PING reply.
+    TestScriptedWatch("", false, true, false, "", "",
+        "scenario=ping failed: recv while reading line timed out\nSystem: window_s=", "ping");
+}
+
 void TestWatchCompletedWriteCut() {
     ExternalServerHarness harness("write-cut");
     auto args = chunkdb::server_bench::Args{};
@@ -1353,6 +1471,7 @@ int main(int argc, char** argv) {
     TestParseArgsNewFlags();
     TestIoTimeoutValidation();
     TestBenchmarkReceiveTimeout();
+    TestSystemStatsOnTimeout();
     TestParseArgsInvalidCombination();
     TestParseArgsUriPopulatesEndpointAndUser();
     TestParseArgsExplicitFlagsOverrideUri();
@@ -1370,6 +1489,9 @@ int main(int argc, char** argv) {
     TestChunkFormsRetainDescribedStableColumnId();
     TestChunkReadsCoverNullAndForms();
     TestSpawnModeReportsDurability();
+    TestSystemSamplerGaps();
+    TestSystemStatsMatchThreadLifetimes();
+    TestSystemStats();
     TestShortGridMixAndClippedAreas();
     TestEveryScenario();
     TestEnabledBenchmarkOptions();

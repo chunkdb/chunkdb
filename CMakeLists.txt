@@ -260,6 +260,7 @@ target_include_directories(chunkdb_exporter PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/
 
 add_library(chunkdb_server_bench_lib STATIC
     bench/server_bench_lib.cpp
+    bench/server_bench_system.cpp
     src/server.cpp
     src/server_socket.cpp
     src/server_io.cpp

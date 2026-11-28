@@ -369,6 +369,22 @@ void TestRetainedBoundaryRejectsEqualWalTimeConflict() {
 
 }  // namespace
 
+// A new store writes its first clock record directly; its first write extends
+// the ceiling once, and that writer's wait covers the extension.
+void TestVersionClockCountsCeilingWrites() {
+    chunkdb::test::ScopedTempDir dir("chunkdb-version-clock-stats");
+    chunkdb::ChunkStore store(Config(dir.path()));
+    assert(store.RuntimeStats().version_clock_extensions == 0U);
+    assert(store.RuntimeStats().version_clock_wait_us == 0U);
+    store.SetBlockBits(0, 0, "10101");
+    const auto stats = store.RuntimeStats();
+    assert(stats.version_clock_extensions == 1U);
+    assert(stats.version_clock_wait_us >= stats.version_clock_extension_us);
+    store.SetBlockBits(4, 0, "00011");
+    assert(store.RuntimeStats().version_clock_extensions == 1U);
+    assert(store.RuntimeStats().version_clock_wait_us == stats.version_clock_wait_us);
+}
+
 int main(int argc, char** argv) {
     const std::string_view selected = argc > 1 ? argv[1] : "all";
     if (selected == "all" || selected == "identity") TestNeverWrittenIdentity();
@@ -381,4 +397,5 @@ int main(int argc, char** argv) {
     if (selected == "all" || selected == "area-index") TestAreaSkipsMissingCoordinatesBeforeDiskReads();
     if (selected == "all" || selected == "index-reads") TestScansAndAreaReadOnlyIndexedCells();
     if (selected == "all" || selected == "retained-time") TestRetainedBoundaryRejectsEqualWalTimeConflict();
+    if (selected == "all" || selected == "clock-stats") TestVersionClockCountsCeilingWrites();
 }

@@ -725,6 +725,9 @@ StoreRuntimeStats ChunkStore::RuntimeStats() const noexcept {
         .txn_history_copies = txn_history_->CopiedStates(),
         .txn_history_copied_bytes = txn_history_->CopiedBytes(),
         .txn_history_bytes = txn_history_->KeptBytesCounter().load(std::memory_order_acquire),
+        .version_clock_extensions = stats_version_clock_extensions_.load(std::memory_order_relaxed),
+        .version_clock_extension_us = stats_version_clock_extension_us_.load(std::memory_order_relaxed),
+        .version_clock_wait_us = stats_version_clock_wait_us_.load(std::memory_order_relaxed),
     };
 }
 

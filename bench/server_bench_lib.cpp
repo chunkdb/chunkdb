@@ -41,6 +41,7 @@
 #include "scram.hpp"
 #include "user_registry.hpp"
 #include "sectioned_chunk_form.hpp"
+#include "server_bench_system.hpp"
 
 #ifdef _WIN32
 #include <winsock2.h>
@@ -1622,10 +1623,16 @@ struct ThreadWork {
     return active;
 }
 
+void WriteSystemStats(std::ostream& out, const std::vector<std::pair<std::string, std::string>>& stats) {
+    out << "System:";
+    for (const auto& [name, value] : stats) out << " " << name << "=" << value;
+}
+
 [[nodiscard]] ScenarioResult RunScenario(
     Scenario scenario,
     const Args& args,
-    const GeometryInfo& geometry) {
+    const GeometryInfo& geometry,
+    const SystemWindow::EngineStats& engine_stats) {
     const auto payload = ScenarioPayloadInfo(scenario, geometry);
     const auto work_split = BuildWorkSplit(args.requests, args.clients);
     if (IsGridScenario(scenario)) {
@@ -1666,6 +1673,8 @@ struct ThreadWork {
     bool measured_done = false;
     std::atomic<std::size_t> failed_logins{0};
 
+    std::optional<SystemWindow> system_window;
+    if (args.system_stats) system_window.emplace(engine_stats);
     const auto start = Clock::now();
     std::vector<std::thread> workers;
     workers.reserve(work_split.size());
@@ -1823,19 +1832,26 @@ struct ThreadWork {
         }
     }
     const auto end = Clock::now();
-    for (const auto& watch : watches) watch->SampleLag(write_frontier, end);
     {
         std::lock_guard lock(login_mutex);
         measured_done = true;
     }
     login_changed.notify_all();
+    auto system_stats = system_window ? system_window->Finish() : std::vector<std::pair<std::string, std::string>>{};
+    for (const auto& watch : watches) watch->SampleLag(write_frontier, end);
     for (auto& client : failing) client.join();
     if (!failing.empty() && !failed.load(std::memory_order_acquire)) AwaitLoginAfterBan(args);
 
     if (failed.load(std::memory_order_acquire)) {
-        throw std::runtime_error(
-            "scenario=" + std::string(ScenarioName(scenario)) +
-            " failed: " + (first_error.empty() ? std::string("unknown error") : first_error));
+        auto message = "scenario=" + std::string(ScenarioName(scenario)) +
+            " failed: " + (first_error.empty() ? std::string("unknown error") : first_error);
+        if (!system_stats.empty()) {
+            std::ostringstream details;
+            details << '\n';
+            WriteSystemStats(details, system_stats);
+            message += details.str();
+        }
+        throw std::runtime_error(message);
     }
     if (latencies_ms.size() != args.requests) {
         throw std::runtime_error(
@@ -1875,6 +1891,15 @@ struct ThreadWork {
     result.percentiles_ms.reserve(kPercentiles.size());
     for (const double p : kPercentiles) {
         result.percentiles_ms.push_back({p, PercentileFromSorted(latencies_ms, p)});
+    }
+    if (system_window) {
+        // Requests of 100 ms or more and their total time.
+        const auto slow = std::lower_bound(latencies_ms.begin(), latencies_ms.end(), 100.0);
+        system_stats.emplace_back("requests_over_100ms", std::to_string(latencies_ms.end() - slow));
+        std::ostringstream slow_s;
+        slow_s << std::fixed << std::setprecision(6) << std::accumulate(slow, latencies_ms.end(), 0.0) / 1000.0;
+        system_stats.emplace_back("requests_over_100ms_s", slow_s.str());
+        result.system_stats = std::move(system_stats);
     }
     result.payload_bytes = payload.bytes;
     result.payload_label = payload.label;
@@ -2153,6 +2178,8 @@ std::string UsageText() {
         << "                                   connection holds one, so use at least --clients\n"
         << "  --failed-logins <N>              report-only: N clients log in with a wrong password\n"
         << "                                   beside the measured clients; requires --user\n"
+        << "  --system-stats                   report-only: process and machine counters of each window\n"
+        << "                                   except takeover, plus engine counters and close time in spawn mode\n"
         << "  --idle-connections <N>           N more connections log in before each scenario and stay\n"
         << "                                   idle until it ends; an external server's\n"
         << "                                   --idle-connection-timeout-ms must outlast the run\n"
@@ -2312,6 +2339,10 @@ Args ParseArgs(const std::vector<std::string>& argv) {
             args.failed_logins = ParsePositiveSize(require_value("--failed-logins"), "--failed-logins");
             continue;
         }
+        if (arg == "--system-stats") {
+            args.system_stats = true;
+            continue;
+        }
         if (arg == "--idle-connections") {
             args.idle_connections = ParsePositiveSize(require_value("--idle-connections"), "--idle-connections");
             continue;
@@ -2422,6 +2453,16 @@ BenchmarkReport Run(const Args& requested) {
         if (args.watch_slots) report.watch += ":slots";
     }
 
+    // The spawned server's table, for the engine counters of --system-stats.
+    TableCatalog* stats_catalog = nullptr;
+    const SystemWindow::EngineStats engine_stats = [&]() -> std::optional<StoreRuntimeStats> {
+        if (stats_catalog == nullptr) return std::nullopt;
+        const auto table = stats_catalog->Find("default");
+        if (!table) return std::nullopt;
+        const auto lease = table->Acquire();
+        if (!lease) return std::nullopt;
+        return lease->store().RuntimeStats();
+    };
     auto run_against_endpoint = [&]() {
         const GeometryInfo geometry = LoadGeometryInfo(args);
         report.chunk_width_blocks = geometry.chunk_width_blocks;
@@ -2431,7 +2472,7 @@ BenchmarkReport Run(const Args& requested) {
         report.results.reserve(args.tests.size());
         for (const Scenario scenario : args.tests) {
             report.results.push_back(scenario == Scenario::kTakeover
-                ? RunTakeover(args) : RunScenario(scenario, args, geometry));
+                ? RunTakeover(args) : RunScenario(scenario, args, geometry, engine_stats));
         }
     };
 
@@ -2517,8 +2558,11 @@ BenchmarkReport Run(const Args& requested) {
         report.spawned_server = true;
         report.chunk_lock_mode = chunkdb::ChunkLockModeName();
         report.durability_mode = DurabilityModeName(ParseDurabilityMode(args.durability_mode));
+        stats_catalog = catalog.get();
         run_against_endpoint();
 
+        stats_catalog = nullptr;
+        const auto close_started = Clock::now();
         server->Stop();
         if (server_thread.joinable()) {
             server_thread.join();
@@ -2526,6 +2570,7 @@ BenchmarkReport Run(const Args& requested) {
         server.reset();
         engine.reset();
         catalog.reset();
+        if (args.system_stats) report.server_close_s = std::chrono::duration<double>(Clock::now() - close_started).count();
         RemoveDataDirForBenchmark(data_dir);
         return report;
     } catch (...) {
@@ -2587,6 +2632,7 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
                          << " watch_mode=" << report.watch_mode
                          << (report.watch_delivery == "measure" ? " watch_delivery=measure" : "") << "\n";
     if (report.failed_login_clients != 0U) out << "report_only failed_login_clients=" << report.failed_login_clients << "\n";
+    if (report.server_close_s) out << "report_only server_close_s=" << std::fixed << std::setprecision(4) << *report.server_close_s << "\n";
     if (report.idle_connections != 0U) out << "idle_connections=" << report.idle_connections << "\n";
 
     for (const auto& result : report.results) {
@@ -2618,6 +2664,10 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
                     << result.ownership_cycles / result.duration_s << " latency_unit=ownership_cycle ACKs=0\n";
         }
         if (report.failed_login_clients != 0U) out << "Failed logins: " << result.failed_logins << "\n";
+        if (!result.system_stats.empty()) {
+            WriteSystemStats(out, result.system_stats);
+            out << "\n";
+        }
         out << "Throughput (req/s): " << std::fixed << std::setprecision(2) << result.throughput_req_s << "\n";
         out << "Blocks: " << result.completed_blocks << "  Blocks/request: " << result.blocks_per_request
             << "  Blocks/s: " << result.throughput_blocks_s << "  Mix:";
@@ -2672,6 +2722,7 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
         << JsonEscape(report.watch_mode) << "\""
         << (report.watch_delivery == "measure" ? ",\"watch_delivery\":\"measure\"" : "") << "},";
     if (report.failed_login_clients != 0U) out << "\"failed_login_clients\":" << report.failed_login_clients << ",";
+    if (report.server_close_s) out << "\"server_close_s\":" << std::fixed << std::setprecision(6) << *report.server_close_s << ",";
     if (report.idle_connections != 0U) out << "\"idle_connections\":" << report.idle_connections << ",";
     out << "\"results\":[";
     for (std::size_t i = 0; i < report.results.size(); ++i) {
@@ -2689,6 +2740,12 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
         out << "\"throughput_blocks_s\":" << r.throughput_blocks_s << ",";
         out << "\"returned_area_chunks\":" << r.returned_area_chunks << ",";
         if (report.failed_login_clients != 0U) out << "\"failed_logins\":" << r.failed_logins << ",";
+        if (!r.system_stats.empty()) {
+            out << "\"system\":{";
+            for (std::size_t k = 0; k < r.system_stats.size(); ++k)
+                out << (k ? "," : "") << "\"" << JsonEscape(r.system_stats[k].first) << "\":" << r.system_stats[k].second;
+            out << "},";
+        }
         if (descriptive || r.ownership_cycles != 0U) {
             out << "\"response_bytes\":" << r.response_bytes << ",\"metadata_envelopes\":" << r.metadata_envelopes
                 << ",\"watch_bytes\":" << r.watch_bytes << ",\"watch_changes\":" << r.watch_changes

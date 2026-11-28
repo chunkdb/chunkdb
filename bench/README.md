@@ -31,6 +31,17 @@ A drain in `measure` mode waits while pushes arrive and fails after `--io-timeou
 Takeover adds `report_only`, `ownership_cycles`, `ownership_cycles_s`, `latency_unit="ownership_cycle"` and `acks_sent=0`; `throughput_req_s` counts HELLO/WATCH requests plus AUTH when logging in, and `throughput_blocks_s` is zero.
 Compare matching workload settings and retain absolute requests/s, blocks/s and p50/p99 with the run count and configuration.
 
+`--system-stats` adds `system` to each result except takeover, using snapshots taken before the measured client threads start and after they join.
+`window_s` is the elapsed time between completion of the two snapshots.
+A spawned run also reports `server_close_s`, the time from stopping the server until its store closes.
+If a measured client fails, the benchmark prints the collected system counters with the error on stderr and exits with status 1.
+`process_*` comes from `getrusage` on POSIX and includes byte counters from `/proc/self/io` on Linux.
+On Linux, `threads_*` sums the benchmark process's threads alive at both snapshots, with off-CPU time including idle waits and `threads_blkio_s` requiring `kernel.task_delayacct=1`.
+Process and thread counters include the server in spawn mode and cover the benchmark client process in external mode.
+On Linux, `machine_cpu_*`, `psi_*`, `vm_*`, `mem_*` and `disk_<device>_*` cover the host running the benchmark, with disk counters reported for devices with activity in the window.
+`engine_*` are the spawned store's checkpoints, evictions, WAL batch flushes and barriers, version clock ceiling writes with their time, and the time writers waited for a ceiling, each waiting writer counted; `requests_over_100ms` counts slow requests and `requests_over_100ms_s` sums their latencies.
+`sampler_max_gap_ms` is the longest interval between wakes of a 10 ms timer thread, including the intervals from the initial snapshot to its first wake and from its last wake to the end of sampling.
+
 See [artifact formats](artifacts/README.md) for stored results.
 
 ## Shared maintenance
