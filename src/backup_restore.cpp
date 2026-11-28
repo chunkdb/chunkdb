@@ -9,6 +9,7 @@
 #include <system_error>
 
 #include "checkpoint.hpp"
+#include "chunk_file_header.hpp"
 #include "file_permissions.hpp"
 #include "chunkdb/file_layout.hpp"
 #include "feature_flags.hpp"
@@ -56,8 +57,9 @@ ChunkCoord Coordinate(const std::filesystem::path& path, const Geometry& geometr
         throw std::runtime_error("invalid restored chunk name");
     return coord;
 }
-std::vector<std::uint8_t> RecoverWal(const std::filesystem::path& path, const Geometry& geometry,
-    ChunkCoord coord, const StoreId& epoch, FeatureFlags features, const ChunkCoordinateIndex& retained) {
+std::uint64_t RecoverWal(const std::filesystem::path& path, const Geometry& geometry,
+    ChunkCoord coord, const StoreId& epoch, FeatureFlags features, const ChunkCoordinateIndex& retained,
+    const std::function<void()>& check_cancelled) {
     std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U), presence(ChunkPresenceBitmapBytes(geometry), 0U);
     ChunkVars vars; std::uint64_t revision = 0U, schema = 0U, time = 0U;
     std::shared_ptr<const ChunkColumnState> chunk_columns;
@@ -73,15 +75,16 @@ std::vector<std::uint8_t> RecoverWal(const std::filesystem::path& path, const Ge
     if (boundary)
         (void)ApplyRetainedEmptyBase(geometry, *boundary, revision, time, schema,
             payload, presence, vars, chunk_columns);
-    auto bytes = LoadFile(path);
-    const auto replay = ReplayWal(bytes, geometry, coord, epoch, features, revision, schema,
-        &payload, &presence, &vars, nullptr, &chunk_columns, time,
+    SharedFileInput input(path);
+    if (!input) throw std::runtime_error("cannot open restored WAL");
+    const auto size = std::filesystem::file_size(path);
+    const auto replay = ReplayWalStream(input, size, geometry, coord, epoch, features, revision, schema,
+        &payload, &presence, &vars, nullptr, &chunk_columns, check_cancelled, time,
         boundary ? std::optional{WalKnownIdentity{boundary->revision, boundary->commit_time_ms}} : std::nullopt);
-    if (replay.torn_creation) return {};
+    if (replay.torn_creation) return 0U;
     if (!replay.replayable || (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty())
         throw std::runtime_error("restored WAL is damaged: " + path.string());
-    if (replay.tail_truncated_or_corrupt) bytes.resize(replay.valid_end);
-    return bytes;
+    return replay.tail_truncated_or_corrupt ? replay.valid_end : size;
 }
 
 class SinkBuffer final : public std::streambuf {
@@ -171,15 +174,31 @@ StoreId RebindRestoredTable(const std::filesystem::path& directory, const Backup
         if (!chunk_file(relative) || relative.extension() != ".wal") continue;
         const auto path = directory / relative;
         const auto coord = Coordinate(relative, geometry);
-        auto bytes = RecoverWal(path, geometry, coord, old_epoch, manifest.features, retained);
-        if (bytes.empty()) {
+        const auto size = RecoverWal(path, geometry, coord, old_epoch, manifest.features, retained, check_cancelled);
+        if (size == 0U) {
             std::filesystem::remove(path);
             if (backup_detail::DirectoryEntries(path.parent_path()) == backup_detail::DirectoryEntries{})
                 std::filesystem::remove(path.parent_path());
         } else {
-            bytes = RewriteWalStoreId(std::move(bytes), coord, old_epoch, new_epoch,
-                manifest.features, geometry.dims());
-            AtomicWrite(path, bytes, true, true);
+            AtomicWriteStream(path, [&](const AtomicFileSink& sink) {
+                SharedFileInput input(path);
+                if (!input) throw std::runtime_error("cannot reopen restored WAL");
+                std::vector<std::uint8_t> header(ChunkWalHeaderBytes(geometry.dims()));
+                if (size < header.size()) throw std::runtime_error("restored WAL is shorter than its header");
+                input.read(reinterpret_cast<char*>(header.data()), static_cast<std::streamsize>(header.size()));
+                if (!input) throw std::runtime_error("cannot read restored WAL header");
+                auto remaining = size - header.size();
+                sink(RewriteWalStoreId(std::move(header), coord, old_epoch, new_epoch, manifest.features, geometry.dims()));
+                std::array<std::uint8_t, 65536U> block{};
+                while (remaining != 0U) {
+                    check_cancelled();
+                    const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, block.size()));
+                    input.read(reinterpret_cast<char*>(block.data()), static_cast<std::streamsize>(count));
+                    if (!input) throw std::runtime_error("restored WAL shortened during identity rewrite");
+                    sink(std::span(block).first(count));
+                    remaining -= count;
+                }
+            }, true, true);
         }
     }
     for (const auto& relative : files) {
@@ -187,7 +206,9 @@ StoreId RebindRestoredTable(const std::filesystem::path& directory, const Backup
         if (!chunk_file(relative)) continue;
         const auto path = directory / relative;
         if (relative.extension() == ".chk") {
-            auto bytes = RewriteChunkImageStoreId(LoadFile(path), geometry, Coordinate(relative, geometry), old_epoch, new_epoch, manifest.features);
+            const auto coord = Coordinate(relative, geometry);
+            auto bytes = RewriteChunkImageStoreId(LoadChunkImageFile(path, geometry, coord, old_epoch, manifest.features),
+                geometry, coord, old_epoch, new_epoch, manifest.features);
             AtomicWrite(path, bytes, true, true);
         }
         Crash("CHUNKDB_FAILPOINT_CRASH_RESTORE_AFTER_REWRITE_FILE_ONCE");
@@ -217,6 +238,10 @@ StoreId RebindRestoredTable(const std::filesystem::path& directory, const Backup
 }
 void RestoreBackup(const std::filesystem::path& source, const std::filesystem::path& destination) {
     RequireBackupTarget(source, destination);
+    if (std::filesystem::is_regular_file(source)) {
+        RestoreBackupStream(source, destination);
+        return;
+    }
 #ifdef _WIN32
     const auto backup = CanonicalBackupPath(source);
 #else

@@ -2,6 +2,7 @@
 
 A connection sends one CQL statement per line and receives one reply per statement, in request order even when requests are pipelined.
 WATCH changes that connection into a push stream.
+BACKUP STREAM is a single reply with a sequence of bounded bulk frames.
 [CQL](CQL.md) defines statements; [users](USERS.md) defines rights.
 
 ## Transport and greeting
@@ -99,19 +100,31 @@ See [session negotiation](design/PROTOCOL_FOUNDATION.md#handshake-and-session-ow
 
 `SHOW CONNECTIONS` returns an array of maps containing `id`, `user`, `peer`, `state`, `statement`, and `progress`.
 An unauthenticated user or an idle statement is represented by NULL in its field.
-`progress` is NULL unless the running statement reports progress; a running `RESTORE TABLE` reports a map of integers `files_done`, `files_total`, `bytes_done`, and `bytes_total` for its copy of the backup.
-The map appears when the copy starts; `progress` is NULL while the restore checks the backup before the copy and once the statement completes, including while its reply is written.
+`progress` is NULL unless the active statement reports progress. RESTORE TABLE and BACKUP STREAM report integers `files_done`, `files_total`, `bytes_done`, and `bytes_total`.
+RESTORE TABLE reports files and bytes copied while the statement runs. BACKUP STREAM reports file contents sent to the transport, including while its state is `writing` and excluding headers, checksums and framing.
+Progress appears when copying or streaming begins and clears when the statement completes.
 The reply includes every authorized connection or fails with `OUT_OF_RANGE reason=response_limit`; it never truncates the listing.
 When the server's output reserve for listings is held by unread listings, it receives `BUSY reason=reply_budget`; logins and other replies do not draw from that reserve.
 Users control sessions belonging to their current user incarnation; ADMIN on `*` may control every session, and MONITOR may list every session.
 
 `CANCEL id` returns `{cancelled: bool}` and accepts cancellation only before the target statement enters its irreversible decision.
 Missing, idle, decision-entered and self targets return false.
-An accepted cancellation ends that statement with `CANCELLED applied=false` and leaves the connection available for its next request.
+An accepted cancellation normally ends that statement with `CANCELLED applied=false` and leaves the connection available for its next request. During a started BACKUP STREAM reply it closes the connection.
 `KILL CONNECTION id` returns `{killed: bool}` and closes the target after any decision-entered statement completes.
 Self-KILL sends its reply before closing.
 KILL closes a pending read-only reply immediately and releases its retained state.
 WATCH has completed its initiating statement, so CANCEL returns false and KILL releases its subscription and slot ownership.
+
+## Backup stream
+
+Send `BACKUP STREAM\r\n` on an authenticated session (or after HELLO 3 with auth none) and wait for the complete reply before sending another request.
+Admission and preparation failures use an ordinary error reply.
+A success starts with `+BACKUP STREAM\r\n`. One or more nonempty bulk frames follow, each encoded as `$<decimal length>\r\n<payload>\r\n` with at most 65408 payload bytes.
+The sequence ends with an empty bulk frame, `$0\r\n\r\n`. The nonempty payloads concatenate in order to form one [backup stream file](STORAGE_FORMAT.md#backup-stream-file).
+The client must receive the terminator and validate the container before treating it as complete. Once it receives the terminator it may send the next request.
+
+The statement timeout includes preparation and transfer up to admission of the terminal frame. CANCEL and statement timeout after the start line close the connection without a terminator. KILL, peer close and unexpected input can also stop the stream. A stalled transfer closes at the output progress deadline even after the terminal frame is admitted.
+Use a separate connection for SHOW CONNECTIONS, CANCEL and KILL.
 
 ## Parameters
 

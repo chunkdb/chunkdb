@@ -1,4 +1,4 @@
-# PING, FLUSH WAL, SHOW METRICS, BACKUP TO, RESTORE TABLE, RELOAD TLS, SHOW CONNECTIONS, CANCEL, KILL CONNECTION
+# PING, FLUSH WAL, SHOW METRICS, BACKUP TO, BACKUP STREAM, RESTORE TABLE, RELOAD TLS, SHOW CONNECTIONS, CANCEL, KILL CONNECTION
 
 You check connectivity, make earlier writes durable, inspect metrics, copy the running server, restore one table from a backup, load a renewed TLS certificate, or list, cancel and close connections.
 
@@ -14,7 +14,7 @@ PONG
 OK
 ```
 
-To take a backup or restore a table, configure `--backup-dir` and follow [Backup and restore](../BACKUP.md).
+For a server-directory backup or online table restore, configure `--backup-dir`. A streamed backup needs a client that reads the backup reply and can be restored offline. See [Backup and restore](../BACKUP.md).
 To inspect metrics:
 
 ```sh docs-check-shell
@@ -33,6 +33,7 @@ PING
 FLUSH WAL
 SHOW METRICS
 BACKUP TO 'destination'
+BACKUP STREAM
 RESTORE TABLE table FROM 'backup' [AS name]
 RELOAD TLS
 SHOW CONNECTIONS
@@ -54,7 +55,8 @@ KILL CONNECTION id
 - SHOW METRICS: Prometheus text, obtained through an authenticated connection with MONITOR or ADMIN on all tables; [chunkdb_exporter](../EXPORTER.md) serves it to Prometheus over HTTP.
 - In SHOW METRICS, the table metrics have one sample per table with a `table` label: `chunkdb_open_wal_streams`, `chunkdb_wal_*`, `chunkdb_evictions_total`, `chunkdb_eviction_*`, `chunkdb_checkpoints_total`, `chunkdb_background_*`, `chunkdb_compressed_checkpoint_images_total`, `chunkdb_empty_chunk_gcs_total`, `chunkdb_unique_loaded_chunks_total`, `chunkdb_txn_history_*`, `chunkdb_table_fenced` and `chunkdb_slot_frontier_frozen`; the other metrics are server-wide and have no `table` label. SHOW METRICS does not wait for a table that is not serving at that moment: one that an exclusive statement such as ALTER TABLE holds or waits for, one whose change feed cleanup failed until RECOVER TABLE, or one being dropped has only its `chunkdb_table_fenced` sample in that reply.
 - `chunkdb_table_fenced` is 1 for each table that SHOW STATUS reports fenced or frozen, also one out of service, and 0 for each other table. `chunkdb_slot_frontier_frozen` is 1 for each table that SHOW STATUS reports frozen, one with a slot that is not lost whose store failed closed after a durability failure: slot passes stop and the slots' durable `revision` stays until RECOVER TABLE or a restart; it is 0 for each other table that is serving. The [metric names](../EXPORTER.md#metrics) are fixed for 2.x.
-- BACKUP: table count, inventoried files and bytes, and per-table epoch/revision cuts.
+- BACKUP TO returns the table count, inventoried files and bytes, and per-table epoch/revision cuts.
+- BACKUP STREAM sends the complete backup over the connection. See [backup stream framing](../PROTOCOL.md#backup-stream).
 - RESTORE TABLE: the new `table`, its `epoch`, its `parent_epoch` and `fork_revision` (the backed-up epoch and cut), and the `files` and `bytes` copied.
 - RELOAD TLS: `OK` once connections that start from then on use the certificate and key read again from the `--tls-cert` and `--tls-key` files.
 - SHOW CONNECTIONS: an array of maps with `id`, `user`, `peer`, `state`, `statement`, and `progress`.
@@ -94,7 +96,7 @@ Connection identifiers are exact unsigned integers scoped to the server process.
 A user may list and control connections of the same live user incarnation; ADMIN on `*` permits access to all connections, and MONITOR lists all connections without controlling them.
 Dropping and recreating a user does not grant the replacement user access to the previous user's connections.
 An empty user or statement is null in SHOW CONNECTIONS, and `statement` contains only the statement verb.
-`progress` is null unless the running statement reports progress; only RESTORE TABLE does.
+`progress` is null unless RESTORE TABLE is copying or awaiting publication, or BACKUP STREAM is sending its file inventory and contents.
 A listing that exceeds the response limit returns OUT_OF_RANGE without a partial listing.
 Missing, idle, self-cancelled, and decision-entered statements return `cancelled: false`.
 Killing a connection preserves the real outcome of a statement that already entered its decision boundary.
@@ -103,5 +105,6 @@ These statements also run inside an open or aborted transaction and on a read-on
 
 ## Limits
 
-Backup requires the single-process writer lock and a configured backup directory.
-You need space for copied images and WAL prefixes; see [Backup and restore](../BACKUP.md).
+Both backup forms require BACKUP or MANAGES USERS, the single-process writer lock and a session outside a transaction. BACKUP TO also requires a configured backup directory.
+BACKUP STREAM uses a private copy in the data directory and keeps the backup guard until transfer ends. It reports files and file bytes sent in SHOW CONNECTIONS. CANCEL, KILL CONNECTION, a statement timeout or disconnection can stop it. An interrupted reply closes the connection.
+See [Backup and restore](../BACKUP.md) for space requirements.

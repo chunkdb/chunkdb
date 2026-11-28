@@ -403,7 +403,7 @@ class Harness {
     bool auth;
     Harness(bool use_tls, bool use_auth = false, std::size_t max_bytes = kDefaultSlotMaxBytes,
             std::chrono::milliseconds sync = 100ms, std::size_t feed_bytes = kDefaultFeedBufferBytes, std::filesystem::path backup_dir = {}, std::chrono::milliseconds progress = 60000ms,
-            std::chrono::milliseconds io_timeout = 0ms)
+            std::chrono::milliseconds io_timeout = 0ms, std::shared_ptr<AuditLog> audit = {})
         : tls(use_tls), auth(use_auth) {
         test::FeedPhaseWatchdog::Phase("harness: constructor");
         auto config = feed_test::Config(std::filesystem::canonical(directory.path()));
@@ -416,6 +416,7 @@ class Harness {
         EngineConfig engine_config;
         engine_config.require_auth = auth;
         engine_config.backup_dir = std::move(backup_dir);
+        engine_config.audit = std::move(audit);
         if (auth) engine_config.users = test::MakeUsers(directory.path(), "admin", "secret");
         engine_ = std::make_shared<CommandEngine>(engine_config, catalog);
         ServerConfig server_config;

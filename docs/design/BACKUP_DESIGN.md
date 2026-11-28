@@ -74,6 +74,13 @@ Server/store open refuses even a complete backup directory; verification checks 
 True WAL damage fails; ordinary crash tails can be normalized by restore.
 Verification also reports leftover `.chunkdb.backups` staging.
 
+## Streaming
+
+`BACKUP STREAM` shares the capture and copy phases with BACKUP TO.
+It uses a private validated copy under the source-owned staging entry, releases the capture links before transfer, and keeps the backup guard until the transfer ends.
+The statement worker reads and writes bounded blocks. The connection poller can signal peer input or close while capture waits, and cancellation wakes an output wait directly.
+The stream file uses the same cuts and inventory, and its trailer digests the descriptors. Offline restore extracts and validates a private guarded backup before ordinary restore publication.
+
 ## Restore and crashes
 
 Restore verifies the source and builds a sibling temporary directory under a durable restore guard.

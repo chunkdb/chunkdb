@@ -60,7 +60,7 @@ enum class ServerRight : std::uint8_t;
 
 // Deterministic command interleavings, following the feed hooks.
 struct CommandEngineTestHook {
-    enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted, kBeforeTxnBudgetReclaim,
+    enum class Point { kAfterSlotTablesListed, kBeforeSlotTableList, kAfterBackupAborted, kAfterBackupStreamProgress, kBeforeTxnBudgetReclaim,
         kAfterRestoreProgress, kAfterRestoreUserRead, kBeforeTableStatsListing,
         kBeforeCatalogRefresh };
     virtual ~CommandEngineTestHook() = default;
@@ -85,7 +85,7 @@ struct EngineConfig {
     // (--auth none, for local development), HELLO 3 logs in without a user,
     // with every right.
     bool require_auth = true;
-    // BACKUP destinations are relative to this directory; empty disables BACKUP.
+    // BACKUP TO destinations are relative to this directory; empty disables BACKUP TO.
     std::filesystem::path backup_dir{};
     std::shared_ptr<UserRegistry> users{};
     // Failed logins that close a connection; failed logins from one source
@@ -137,6 +137,7 @@ struct ChunkCoordLess {
 };
 
 struct SessionTransaction;
+class BackupStreamTransport;
 
 // An engine's open transactions and the bytes of their private copies.
 struct TxnBudget {
@@ -357,7 +358,8 @@ class CommandEngine {
         std::string_view line,
         std::span<const std::optional<std::string>> parameters = {},
         std::unique_ptr<ReplyContinuation>* continuation = nullptr,
-        const std::function<void(std::size_t)>* reserve_reply = nullptr);
+        const std::function<void(std::size_t)>* reserve_reply = nullptr,
+        BackupStreamTransport* backup_stream = nullptr);
     [[nodiscard]] std::string RejectPayload(SessionState& session, std::string_view line, std::string response);
     // The error that ends a watch whose user lost READ on `table`: NO_TABLE,
     // as a statement on a table the user cannot see gets, or AUTH_REQUIRED
@@ -425,7 +427,8 @@ class CommandEngine {
         MetricsRegistry::CommandClass& command_class,
         StatementLogInfo* info,
         std::unique_ptr<ReplyContinuation>* continuation,
-        const std::function<void(std::size_t)>* reserve_reply);
+        const std::function<void(std::size_t)>* reserve_reply,
+        BackupStreamTransport* backup_stream);
     // Writes the audit and slow-statement lines of a finished statement.
     void LogStatement(
         const SessionState& session,

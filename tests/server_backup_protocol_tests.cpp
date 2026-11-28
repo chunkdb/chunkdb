@@ -1,8 +1,13 @@
+#include <algorithm>
+#include <atomic>
 #include <condition_variable>
 #include <future>
 #include <iostream>
+#include "audit_log.hpp"
+#include "chunkdb/logging.hpp"
 #include "server_slots_test_utils.hpp"
 #include "backup.hpp"
+#include "statement_control.hpp"
 #include "store_manifest.hpp"
 #include "verify.hpp"
 #include "slot_watch.hpp"
@@ -76,6 +81,216 @@ void Verify(const std::filesystem::path& root) {
     if (counters.errors || counters.warnings) std::cerr << output.str();
     assert(counters.errors == 0 && counters.warnings == 0);
 }
+std::vector<std::string> ReadBackupStream(Client& client) {
+    const auto start = client.Read();
+    assert(start.type == '+' && start.value == "BACKUP STREAM");
+    std::vector<std::string> fragments;
+    for (;;) {
+        auto frame = client.Read();
+        assert(frame.type == '$' && frame.value.size() <= kBackupStreamBlockBytes);
+        if (frame.value.empty()) break;
+        fragments.push_back(std::move(frame.value));
+    }
+    assert(!fragments.empty() && fragments.front().starts_with("CKST") && fragments.back().starts_with("CKBE"));
+    return fragments;
+}
+
+void SaveStream(const std::filesystem::path& file, const std::vector<std::string>& fragments) {
+    std::ofstream out(file, std::ios::binary);
+    for (const auto& fragment : fragments) out.write(fragment.data(), static_cast<std::streamsize>(fragment.size()));
+    out.close();
+    assert(out);
+}
+
+void StreamRoundTrip(bool tls) {
+    CopyPause pause;
+    Harness harness(tls, false);
+    auto writer = harness.Connect();
+    writer->Ok("CREATE TABLE t (n u8, data bytes(131072)) CHUNK 2 x 2");
+    const std::string payload(131072U, '\xA1');
+    writer->Send("SET BLOCK 0 0 IN t n = 7, data = $1\r\n$" + std::to_string(payload.size()) + "\r\n" + payload + "\r\n");
+    const auto cut = Number(writer->Read());
+    writer->Ok("CREATE TABLE other (n u8) CHUNK 2 x 2");
+    (void)writer->Command("SET BLOCK -1 2 IN other n = 42");
+    auto reader = harness.Connect();
+    harness.catalog->SetBackupHookForTests(&pause);
+    reader->Line("BACKUP STREAM");
+    pause.Wait();
+    Error(writer->Command("BACKUP STREAM"), "BUSY");
+    const auto after = Number(writer->Command("SET BLOCK 0 0 IN t n = 8"));
+    assert(after > cut);
+    pause.Release();
+    const auto fragments = ReadBackupStream(*reader);
+    assert(reader->Command("PING").value == "PONG");
+    harness.catalog->SetBackupHookForTests(nullptr);
+    assert(std::any_of(fragments.begin(), fragments.end(), [](const auto& frame) {
+        return frame.size() == kBackupStreamBlockBytes;
+    }));
+    assert(std::filesystem::is_empty(harness.directory.path() / kBackupStagingName));
+
+    test::ScopedTempDir files("chunkdb-backup-stream");
+    const auto file = files.path() / "snapshot.ckstream";
+    const auto target = files.path() / "restored";
+    SaveStream(file, fragments);
+    RestoreBackup(file, target);
+    Verify(target);
+    {
+        TableCatalog catalog(feed_test::Config(target));
+        auto table = catalog.Find("t");
+        assert(table->lineage() && table->lineage()->fork_revision >= cut && table->lineage()->fork_revision < after);
+        auto lease = table->Acquire();
+        std::vector<ColumnValue> expected;
+        expected.reserve(2U);
+        expected.emplace_back(std::uint64_t{7U});
+        expected.emplace_back(BytesValue{std::vector<std::uint8_t>(payload.begin(), payload.end())});
+        assert(lease->store().GetBlock(0, 0) == expected);
+        auto other = catalog.Find("other")->Acquire();
+        std::vector<ColumnValue> expected_other;
+        expected_other.emplace_back(std::uint64_t{42U});
+        assert(other->store().GetBlock(-1, 2) == expected_other);
+    }
+
+    const auto rejected_target = files.path() / "rejected";
+    const auto reject = [&](const std::vector<std::string>& bad, std::string_view message) {
+        SaveStream(file, bad);
+        try {
+            RestoreBackup(file, rejected_target);
+            assert(false && "invalid backup stream restored");
+        } catch (const std::runtime_error& error) {
+            assert(std::string_view(error.what()).find(message) != std::string_view::npos);
+        }
+        assert(!std::filesystem::exists(rejected_target));
+        for (const auto& entry : std::filesystem::directory_iterator(files.path()))
+            assert(!entry.path().filename().string().starts_with(".chunkdb.backup-input."));
+    };
+    auto bad = fragments;
+    bad.back().pop_back();
+    reject(bad, "truncated backup stream");
+    bad = fragments;
+    bad.back().back() ^= 1;
+    reject(bad, "inventory digest mismatch");
+    bad = fragments;
+    // The first file descriptor follows the header and one descriptor per
+    // table. Its data starts in the next bulk, even for this small index.
+    const auto first_file = 1U + harness.catalog->TableCount();
+    bad.at(first_file + 1U).at(0) ^= 1;
+    reject(bad, "file checksum mismatch");
+    bad = fragments;
+    bad.at(first_file).at(4) = '/';
+    reject(bad, "invalid backup inventory path");
+    bad = fragments;
+    bad.push_back("x");
+    reject(bad, "trailing bytes");
+}
+
+class StreamPause : public CommandEngineTestHook {
+  public:
+    void Run(Point point, std::string_view text) override {
+        if (point == Point::kAfterBackupAborted) notice.Run(point, text);
+        if (point != Point::kAfterBackupStreamProgress || ++reports_ != 2U) return;
+        std::unique_lock lock(mutex_);
+        paused_ = true;
+        changed_.notify_all();
+        const auto stop = StatementStopToken();
+        (void)changed_.wait_for(lock, stop, 10s, [] { return false; });
+        assert(stop.stop_requested());
+    }
+    void Wait() {
+        std::unique_lock lock(mutex_);
+        assert(changed_.wait_for(lock, 10s, [&] { return paused_; }));
+    }
+    AbortNotice notice;
+  private:
+    std::mutex mutex_;
+    std::condition_variable_any changed_;
+    bool paused_ = false;
+    std::size_t reports_ = 0U;
+};
+
+enum class StopStream { kCancel, kKill, kDisconnect, kTimeout };
+void StreamStopped(bool tls, StopStream stop) {
+    StreamPause pause;
+    Harness harness(tls, false);
+    auto admin = harness.Connect();
+    admin->Ok("CREATE TABLE t (n u8) CHUNK 2 x 2");
+    (void)admin->Command("SET BLOCK 0 0 IN t n = 1");
+    Client reader(harness.port, tls);
+    const auto hello = reader.Command(stop == StopStream::kTimeout ?
+        "HELLO 3 WITH statement_timeout_ms=5000" : "HELLO 3");
+    assert(hello.type == '%');
+    const auto id = Field(hello, "connection_id").value;
+    harness.engine().SetHookForTests(&pause);
+    reader.Line("BACKUP STREAM");
+    assert(reader.Read().value == "BACKUP STREAM");
+    pause.Wait();
+    bool listed = false;
+    for (const auto& item : admin->Command("SHOW CONNECTIONS").items) {
+        if (Field(item, "id").value != id) continue;
+        listed = true;
+        assert(Field(item, "statement").value == "BACKUP" && Field(item, "state").value == "writing");
+        const auto& progress = Field(item, "progress");
+        assert(Number(Field(progress, "bytes_done")) > 0U);
+        assert(Number(Field(progress, "bytes_done")) < Number(Field(progress, "bytes_total")));
+        assert(Number(Field(progress, "files_done")) < Number(Field(progress, "files_total")));
+    }
+    assert(listed);
+    if (stop == StopStream::kCancel)
+        assert(Field(admin->Command("CANCEL " + id), "cancelled").value == "t");
+    if (stop == StopStream::kKill)
+        assert(Field(admin->Command("KILL CONNECTION " + id), "killed").value == "t");
+    if (stop == StopStream::kDisconnect) reader.Close();
+    pause.notice.Wait();
+    harness.engine().SetHookForTests(nullptr);
+    if (stop != StopStream::kDisconnect) {
+        try {
+            for (;;) {
+                const auto frame = reader.Read(2s);
+                assert(frame.type == '$' && !frame.value.empty() && !frame.value.starts_with("CKBE"));
+            }
+        } catch (const std::runtime_error& error) {
+            assert(std::string_view(error.what()).find("socket") != std::string_view::npos);
+        }
+    }
+    assert(std::filesystem::is_empty(harness.directory.path() / kBackupStagingName));
+    admin->Line("BACKUP STREAM");
+    (void)ReadBackupStream(*admin);
+}
+
+void StreamOutputDeadline() {
+    struct DeadlineLog {
+        DeadlineLog() {
+            SetLogLevel(LogLevel::kWarn);
+            SetLogSinkForTests([this](const std::string& line) {
+                if (line.find("reply progress deadline exceeded") != std::string::npos) seen.store(true);
+            });
+        }
+        ~DeadlineLog() { ResetLogSinkForTests(); SetLogLevel(previous); }
+        const LogLevel previous = GetLogLevel();
+        std::atomic<bool> seen{false};
+    } log;
+    AbortNotice notice;
+    Harness harness(false, false, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, {}, 60000ms, 1500ms);
+    auto admin = harness.Connect();
+    admin->Ok("CREATE TABLE t (n u8, data bytes(524288)) CHUNK 2 x 2");
+    {
+        auto lease = harness.catalog->Find("t")->Acquire();
+        std::vector<ColumnAssignment> value;
+        value.push_back({"data", BytesValue{std::vector<std::uint8_t>(524288U, 0xA1)}});
+        for (std::int64_t i = 0; i < 24; ++i) lease->store().SetBlock(2 * i, 0, value);
+    }
+    Client slow(harness.port, false);
+    slow.SetReceiveBuffer(1024);
+    slow.Hello();
+    harness.engine().SetHookForTests(&notice);
+    slow.Line("BACKUP STREAM");
+    assert(slow.Read().value == "BACKUP STREAM");
+    // Leave the peer open and do not drain its receive buffer.
+    notice.Wait();
+    harness.engine().SetHookForTests(nullptr);
+    assert(log.seen.load() && std::filesystem::is_empty(harness.directory.path() / kBackupStagingName));
+    assert(admin->Command("PING").value == "PONG");
+}
+
 void CopyAndResync(bool tls) {
     CopyPause pause;
     test::ScopedTempDir destinations("chunkdb-backup-protocol");
@@ -149,7 +364,8 @@ void CopyAndResync(bool tls) {
 }
 void Rights(bool tls) {
     test::ScopedTempDir destinations("chunkdb-backup-rights");
-    Harness harness(tls, true, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path());
+    const auto audit = std::make_shared<AuditLog>(destinations.path() / "audit.jsonl");
+    Harness harness(tls, true, kDefaultSlotMaxBytes, 100ms, kDefaultFeedBufferBytes, destinations.path(), 60000ms, 0ms, audit);
     auto admin = harness.Connect();
     admin->Ok("CREATE TABLE hidden (n u8) CHUNK 2 x 2");
     const std::array<std::uint8_t, 16> salt{};
@@ -158,6 +374,12 @@ void Rights(bool tls) {
     admin->Ok("GRANT ADMIN ON * TO reader");
     Client reader(harness.port, tls); reader.Login("reader", "pw");
     Error(reader.Command(Backup("denied")), "PERMISSION_DENIED");
+    Error(reader.Command("BACKUP STREAM"), "PERMISSION_DENIED");
+    admin->Ok("GRANT BACKUP ON * TO reader");
+    reader.Line("BACKUP STREAM");
+    (void)ReadBackupStream(reader);
+    assert(reader.Command("PING").value == "PONG");
+    admin->Ok("REVOKE BACKUP ON * FROM reader");
     assert(!std::filesystem::exists(std::filesystem::canonical(destinations.path()) / "denied"));
     admin->Ok("ALTER USER reader MANAGES USERS");
     const auto reply = reader.Command(Backup("allowed"));
@@ -165,7 +387,17 @@ void Rights(bool tls) {
     Verify(std::filesystem::canonical(destinations.path()) / "allowed");
     reader.Ok("BEGIN");
     Error(reader.Command(Backup("txn")), "INVALID_ARGUMENT");
+    Error(reader.Command("BACKUP STREAM"), "INVALID_ARGUMENT");
     reader.Ok("ROLLBACK");
+    std::ifstream events(audit->path());
+    bool succeeded = false, denied = false;
+    for (std::string line; std::getline(events, line);) {
+        if (line.find("\"event\":\"backup\"") == std::string::npos ||
+            line.find("\"change\":\"stream\"") == std::string::npos) continue;
+        succeeded |= line.find("\"ok\":true") != std::string::npos;
+        denied |= line.find("\"error_code\":\"PERMISSION_DENIED\"") != std::string::npos;
+    }
+    assert(succeeded && denied);
 }
 void Disconnect(bool tls, bool close_notify = false, bool half_close = false) {
     CopyPause pause;
@@ -525,15 +757,21 @@ int main() {
     SwapStatement();
     RenameStatement();
     std::cout << "restore, swap and rename protocol groups passed\n";
+    StreamStopped(false, StopStream::kTimeout);
+    StreamOutputDeadline();
     for (const bool tls : {false, true}) {
 #ifndef CHUNKDB_WITH_OPENSSL
         if (tls) continue;
 #endif
         CopyAndResync(tls); Rights(tls); Disconnect(tls); Shutdown(tls); TargetPolicy(tls); DropDuringListingAndPin(tls);
+        StreamRoundTrip(tls);
+        StreamStopped(tls, StopStream::kCancel);
+        StreamStopped(tls, StopStream::kKill);
+        StreamStopped(tls, StopStream::kDisconnect);
         if (!tls) Disconnect(false, false, true);
 #ifdef CHUNKDB_WITH_OPENSSL
         if (tls) Disconnect(true, true);
 #endif
-        std::cout << (tls ? "TLS: 7" : "plain: 7") << " backup protocol groups passed\n";
+        std::cout << (tls ? "TLS" : "plain") << " backup protocol groups passed\n";
     }
 }

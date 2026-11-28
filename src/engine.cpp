@@ -316,7 +316,8 @@ std::string CommandEngine::Execute(
     std::string_view line,
     std::span<const std::optional<std::string>> parameters,
     std::unique_ptr<ReplyContinuation>* continuation,
-    const std::function<void(std::size_t)>* reserve_reply) {
+    const std::function<void(std::size_t)>* reserve_reply,
+    BackupStreamTransport* backup_stream) {
     if (continuation) continuation->reset();
     if (!std::exchange(session.request_admitted, false))
         if (auto refused = AdmitUserStatement(session, line)) return std::move(*refused);
@@ -406,7 +407,7 @@ std::string CommandEngine::Execute(
             ~TxnStatement() { engine.TxnStatementDone(session, started); }
         } txn_statement{*this, session, TxnStatementStart(session)};
         response = ExecuteStatement(session, line, parameters, command_class, logged ? &info : nullptr,
-            continuation, reserve_reply);
+            continuation, reserve_reply, backup_stream);
     }
     ObserveReply(command_class, started, response, std::exchange(session.refused_write, std::string_view{}));
     if (logged && info.verb != nullptr) {

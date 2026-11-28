@@ -40,6 +40,9 @@
 namespace chunkdb {
 namespace {
 constexpr std::array<std::uint8_t, 4> kMagic{'C', 'K', 'B', 'P'};
+constexpr std::array<std::uint8_t, 4> kStreamMagic{'C', 'K', 'S', 'T'};
+constexpr std::array<std::uint8_t, 4> kStreamEnd{'C', 'K', 'B', 'E'};
+constexpr std::size_t kStreamPathBytes = 4096U;
 void Cancelled(const BackupCancel& cancelled) {
     if (cancelled.stop_requested()) throw std::runtime_error("backup cancelled");
 }
@@ -646,13 +649,15 @@ void ValidateTableCut(const std::filesystem::path& dir, const BackupTableCut& cu
             if (boundary)
                 (void)ApplyRetainedEmptyBase(geometry, *boundary, base, time, schema,
                     payload, presence, vars, chunk_columns);
-            std::vector<WalFrameBoundary> boundaries;
-            auto replay = ReplayWal(LoadFile(full), geometry, coord, cut.epoch, manifest->features, base, schema,
-                &payload, &presence, &vars, &boundaries, &chunk_columns, time,
+            SharedFileInput input(full);
+            if (!input) throw std::runtime_error("cannot read backup WAL");
+            const auto replay = ReplayWalStream(input, std::filesystem::file_size(full),
+                geometry, coord, cut.epoch, manifest->features, base, schema,
+                &payload, &presence, &vars, nullptr, &chunk_columns, [&] { Cancelled(cancelled); }, time,
                 boundary ? std::optional{WalKnownIdentity{boundary->revision, boundary->commit_time_ms}} : std::nullopt);
             if ((!replay.replayable && !replay.torn_creation) ||
                 (replay.tail_truncated_or_corrupt && !replay.stopped_at_crash_tail) || !replay.vars_problem.empty() ||
-                (!boundaries.empty() && boundaries.back().revision > cut.revision)) throw std::runtime_error("backup WAL is damaged or exceeds cut");
+                replay.revision > cut.revision) throw std::runtime_error("backup WAL is damaged or exceeds cut");
         } else throw std::runtime_error("unknown backup chunk artifact: " + relative);
     }
 }
@@ -1178,7 +1183,9 @@ BackupTableCopy CopyBackupTable(const std::filesystem::path& backup, std::string
     ValidateTableCut(directory, copy.cut, copy.files, cancelled);
     return copy;
 }
-void ValidateBackupContents(const std::filesystem::path& root, const BackupRecord& record) { ValidateInventory(root, record, true); }
+void ValidateBackupContents(const std::filesystem::path& root, const BackupRecord& record, const BackupCancel& cancelled) {
+    ValidateInventory(root, record, true, cancelled);
+}
 void ValidateBackupInventory(const std::filesystem::path& root, const BackupRecord& record) { ValidateInventory(root, record, false); }
 void SyncBackupTree(const std::filesystem::path& root, const BackupCancel& cancelled) { SyncTreeImpl(root, cancelled); }
 void CompleteBackupGuard(const std::filesystem::path& root, std::string_view guard, std::string_view phase) {
@@ -1220,5 +1227,211 @@ void CompleteBackup(const std::filesystem::path& root, const BackupRecord& recor
     Cancelled(cancelled);
     EnterStatementDecision();
     CompleteBackupGuard(root, kBackupIncompleteName, "BACKUP");
+}
+
+namespace {
+void ReadStreamBytes(SharedInput& input, std::span<std::uint8_t> bytes) {
+    while (!bytes.empty()) {
+        const auto count = input.Read(bytes.data(), bytes.size());
+        if (count == 0U) throw std::runtime_error("truncated backup stream");
+        bytes = bytes.subspan(count);
+    }
+}
+
+void CountStreamMetadata(std::uint64_t& total, std::size_t bytes) {
+    if (bytes > kMaxBackupRecordBytes - total) throw std::runtime_error("backup stream inventory is too large");
+    total += bytes;
+}
+
+std::vector<std::uint8_t> ReadStreamDescriptor(SharedInput& input, std::size_t max_name,
+    std::size_t suffix, std::uint64_t& metadata_bytes, std::uint32_t& digest) {
+    std::vector<std::uint8_t> bytes(4U);
+    ReadStreamBytes(input, bytes);
+    const auto length = ReadLe32(bytes, 0U);
+    if (length == 0U || length > max_name) throw std::runtime_error("invalid backup stream name length");
+    const auto size = bytes.size() + length + suffix;
+    CountStreamMetadata(metadata_bytes, size);
+    bytes.resize(size);
+    ReadStreamBytes(input, std::span(bytes).subspan(4U));
+    digest = Crc32Extend(digest, bytes.data(), bytes.size());
+    return bytes;
+}
+
+// Only names the backup writer can produce may reach the filesystem. This
+// also rules out Windows device names, streams and case aliases.
+std::filesystem::path StreamInventoryPath(const std::string& spelling, const std::set<std::string>& tables) {
+    const auto path = ParseInventoryPath(spelling);
+    if (spelling == "chunkdb.manifest" || spelling == kUsersFileName || spelling == kMigrationsFileName) return path;
+    auto it = path.begin();
+    if (*it++ == "tables" && it != path.end() && tables.contains((it++)->string()) && it != path.end()) {
+        const auto part = *it++;
+        if (it == path.end()) {
+            if (part == "table.manifest" || part == "chunkdb.version" || part == "chunkdb.snapshot" ||
+                part == ".chunkdb.initialized" || part == kFeedSlotsFileName || part == kChunkIndexFileName) return path;
+        } else if (std::next(it) == path.end()) {
+            const auto& name = *it;
+            for (const std::uint8_t dims : {std::uint8_t{2}, std::uint8_t{3}}) {
+                LargeChunkCoord large;
+                if (!ParseLargeChunkName(part.string(), dims, &large) || LargeChunkDirectory({}, large, dims) != part)
+                    continue;
+                ChunkCoord chunk;
+                if (name == kChunkIndexFileName ||
+                    ((name.extension() == ".chk" || name.extension() == ".wal") &&
+                     ParseChunkFileStem(name.stem().string(), dims, &chunk) &&
+                     ChunkFileStem(chunk, dims) == name.stem().string())) return path;
+            }
+        }
+    }
+    throw std::runtime_error("invalid backup stream inventory path");
+}
+
+void UnpackBackupStream(SharedInput& input, const std::filesystem::path& root) {
+    std::vector<std::uint8_t> header(24U);
+    ReadStreamBytes(input, header);
+    if (!std::equal(kStreamMagic.begin(), kStreamMagic.end(), header.begin()) ||
+        ReadLe16(header, 4U) != 1U || ReadLe16(header, 6U) != 0U)
+        throw std::runtime_error("unsupported backup stream header");
+    auto digest = Crc32(header);
+    std::uint64_t metadata_bytes = 28U; // fixed bytes of the equivalent backup marker
+    BackupRecord record;
+    record.created_at_ms = ReadLe64(header, 8U);
+    const auto table_count = ReadLe32(header, 16U), file_count = ReadLe32(header, 20U);
+    std::set<std::string> tables;
+    for (std::uint32_t i = 0U; i < table_count; ++i) {
+        const auto descriptor = ReadStreamDescriptor(input, kMaxTableNameLength, 24U, metadata_bytes, digest);
+        const auto length = ReadLe32(descriptor, 0U);
+        BackupTableCut cut;
+        cut.name.assign(reinterpret_cast<const char*>(descriptor.data() + 4U), length);
+        if (!IsValidTableName(cut.name) || !tables.insert(cut.name).second)
+            throw std::runtime_error("invalid or repeated backup stream table");
+        std::copy_n(descriptor.data() + 4U + length, cut.epoch.size(), cut.epoch.begin());
+        cut.revision = ReadLe64(descriptor, descriptor.size() - 8U);
+        record.tables.push_back(std::move(cut));
+    }
+    EnsureBackupDirectory(root / "tables");
+    std::set<std::string> paths;
+    std::array<std::uint8_t, kBackupStreamBlockBytes> buffer{};
+    for (std::uint32_t i = 0U; i < file_count; ++i) {
+        const auto descriptor = ReadStreamDescriptor(input, kStreamPathBytes, 12U, metadata_bytes, digest);
+        const auto length = ReadLe32(descriptor, 0U);
+        const std::string spelling(reinterpret_cast<const char*>(descriptor.data() + 4U), length);
+        const auto path = StreamInventoryPath(spelling, tables);
+        if (!paths.insert(spelling).second) throw std::runtime_error("repeated backup stream inventory path");
+        const auto size = ReadLe64(descriptor, descriptor.size() - 12U);
+        const auto expected = ReadLe32(descriptor, descriptor.size() - 4U);
+        SafeDirectory directory;
+        directory.Open((root / path).parent_path(), true);
+        ExclusiveOutput output(directory, path.filename());
+        std::uint32_t crc = 0U;
+        for (auto remaining = size; remaining != 0U;) {
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, buffer.size()));
+            ReadStreamBytes(input, std::span(buffer).first(count));
+            crc = Crc32Extend(crc, buffer.data(), count);
+            output.Write(buffer.data(), count);
+            remaining -= count;
+        }
+        if (crc != expected) throw std::runtime_error("backup stream file checksum mismatch: " + spelling);
+        output.Finish();
+        directory.Sync();
+        record.files.push_back({path, size, crc});
+    }
+    std::vector<std::uint8_t> trailer(8U);
+    ReadStreamBytes(input, trailer);
+    if (!std::equal(kStreamEnd.begin(), kStreamEnd.end(), trailer.begin()) || ReadLe32(trailer, 4U) != digest)
+        throw std::runtime_error("backup stream inventory digest mismatch");
+    if (input.Read(buffer.data(), 1U) != 0U) throw std::runtime_error("trailing bytes after backup stream");
+    CompleteBackup(root, record);
+}
+} // namespace
+
+void WriteBackupStream(const std::filesystem::path& root, const BackupRecord& record,
+    const BackupCancel& cancelled, const BackupStreamWrite& write, const BackupCopyProgress& progress) {
+    if (record.tables.size() > std::numeric_limits<std::uint32_t>::max() ||
+        record.files.size() > std::numeric_limits<std::uint32_t>::max())
+        throw std::length_error("too many backup stream inventory records");
+    std::uint64_t metadata_bytes = 28U, total_bytes = 0U;
+    for (const auto& table : record.tables) CountStreamMetadata(metadata_bytes, 28U + table.name.size());
+    for (const auto& file : record.files) {
+        Cancelled(cancelled);
+        const auto size = file.relative_path.generic_string().size();
+        if (size > kStreamPathBytes) throw std::length_error("backup stream path too long");
+        CountStreamMetadata(metadata_bytes, 16U + size);
+        if (file.size > std::numeric_limits<std::uint64_t>::max() - total_bytes)
+            throw std::length_error("backup stream byte count overflows");
+        total_bytes += file.size;
+    }
+    std::uint32_t digest = 0U;
+    const auto descriptor = [&](const std::vector<std::uint8_t>& bytes) {
+        Cancelled(cancelled);
+        digest = Crc32Extend(digest, bytes.data(), bytes.size());
+        write(bytes, false);
+    };
+    std::uint64_t files_done = 0U, bytes_done = 0U;
+    const auto report = [&] {
+        if (progress) progress(files_done, bytes_done, record.files.size(), total_bytes);
+    };
+    report();
+    std::vector<std::uint8_t> bytes(kStreamMagic.begin(), kStreamMagic.end());
+    WriteLe16(bytes, 1U);
+    WriteLe16(bytes, 0U);
+    WriteLe64(bytes, record.created_at_ms);
+    WriteLe32(bytes, static_cast<std::uint32_t>(record.tables.size()));
+    WriteLe32(bytes, static_cast<std::uint32_t>(record.files.size()));
+    descriptor(bytes);
+    for (const auto& table : record.tables) {
+        bytes.clear();
+        PutString(bytes, table.name);
+        bytes.insert(bytes.end(), table.epoch.begin(), table.epoch.end());
+        WriteLe64(bytes, table.revision);
+        descriptor(bytes);
+    }
+    std::array<std::uint8_t, kBackupStreamBlockBytes> buffer{};
+    for (const auto& file : record.files) {
+        bytes.clear();
+        PutString(bytes, file.relative_path.generic_string());
+        WriteLe64(bytes, file.size);
+        WriteLe32(bytes, file.crc32);
+        descriptor(bytes);
+        SharedInput input(root / file.relative_path);
+        std::uint32_t crc = 0U;
+        for (auto remaining = file.size; remaining != 0U;) {
+            Cancelled(cancelled);
+            const auto count = static_cast<std::size_t>(std::min<std::uint64_t>(remaining, buffer.size()));
+            const auto block = std::span(buffer).first(count);
+            ReadStreamBytes(input, block);
+            crc = Crc32Extend(crc, block.data(), block.size());
+            write(block, false);
+            remaining -= count;
+            bytes_done += count;
+            report();
+        }
+        if (crc != file.crc32 || input.Read(buffer.data(), 1U) != 0U)
+            throw std::runtime_error("private backup copy changed during streaming");
+        ++files_done;
+        report();
+    }
+    Cancelled(cancelled);
+    bytes.assign(kStreamEnd.begin(), kStreamEnd.end());
+    WriteLe32(bytes, digest);
+    write(bytes, true);
+}
+
+void RestoreBackupStream(const std::filesystem::path& stream, const std::filesystem::path& destination) {
+    const auto source = CanonicalBackupPath(stream);
+    RequireRegular(source);
+    const auto target = CanonicalBackupPath(destination);
+    EnsureDirectoryPathExists(target.parent_path(), true);
+    const auto unpacked = target.parent_path() / (".chunkdb.backup-input." + StoreIdHex(NewStoreId()));
+    if (!CreateOwnerOnlyDirectory(unpacked)) throw std::runtime_error("backup stream temporary directory already exists");
+    struct Cleanup {
+        const std::filesystem::path& path;
+        ~Cleanup() { RemoveBackupStaging(path); }
+    } cleanup{unpacked};
+    PrepareBackupTarget(source, unpacked);
+    {
+        SharedInput input(source);
+        UnpackBackupStream(input, unpacked);
+    }
+    RestoreBackup(unpacked, target);
 }
 } // namespace chunkdb

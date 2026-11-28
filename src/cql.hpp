@@ -320,7 +320,8 @@ struct Describe {
 };
 struct FlushWal {};
 struct Backup {
-    std::string path;
+    // A path selects BACKUP TO; no path selects BACKUP STREAM.
+    std::optional<std::string> path{};
 };
 // Restores table `table` of a completed backup as a new table `name`
 // (docs/design/RESTORE_TABLE.md); without AS, `name` is `table`.

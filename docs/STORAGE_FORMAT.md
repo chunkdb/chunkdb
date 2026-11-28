@@ -649,6 +649,17 @@ Retained slots start at their table’s cut in the fresh epoch, with a new basel
 Recoverable WAL tails are normalized before rewriting.
 Restore removes the backup marker and publishes the destination with its incomplete guard held until final durable completion.
 
+### Backup stream file
+
+The file is the concatenation of the nonempty [BACKUP STREAM bulk payloads](PROTOCOL.md#backup-stream), in order. Integers are little-endian.
+
+1. Header `CKST`, version `1:u16`, reserved zero `u16`, creation Unix milliseconds `u64`, table count `u32`, file count `u32`.
+2. One descriptor per table. Name length `u32`, name bytes, epoch (16 bytes), completed revision cut `u64`.
+3. One frame per file. Path length `u32`, canonical relative path bytes, file length `u64`, and file CRC32 `u32`, followed by exactly that many contents bytes. File paths have at most 4096 bytes and must name a backup inventory artifact.
+4. Trailer `CKBE` and a CRC32 `u32` over the header and all table and file descriptors in stream order. File contents have their own CRC32 and are omitted from the trailer digest. EOF follows the trailer.
+
+The table cuts and inventory use the same rules and 1 GiB equivalent marker limit as a directory backup. Restore validates the checksums, trailer, EOF, exact inventory and storage against the cuts before publishing the new catalog.
+
 ## Checkpoint and verification boundaries
 
 A checkpoint publishes a complete image through atomic temporary-file replacement before removing or archiving its WAL.

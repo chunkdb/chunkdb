@@ -983,6 +983,7 @@ class Parser {
     [[nodiscard]] cql::Statement ParseStatement() {
         const Token& first = Peek();
         if (Accept("backup")) {
+            if (Accept("stream")) return Backup{};
             Expect("to");
             const auto& path = Peek();
             if (path.kind != TokenKind::kText)

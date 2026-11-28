@@ -1038,7 +1038,11 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::ShowTables&) { info.verb = "SHOW TABLES"; },
             [&](const cql::Describe& describe) { info.verb = "DESCRIBE"; info.table = describe.table; },
             [&](const cql::FlushWal&) { info.verb = "FLUSH WAL"; },
-            [&](const cql::Backup&) { info.verb = "BACKUP"; info.audit_event = "backup"; },
+            [&](const cql::Backup& backup) {
+                info.verb = backup.path ? "BACKUP" : "BACKUP STREAM";
+                info.audit_event = "backup";
+                if (!backup.path) info.change = "stream";
+            },
             [&](const cql::RestoreTable& restore) {
                 info.verb = "RESTORE TABLE";
                 info.audit_event = "restore_table";
@@ -1489,7 +1493,8 @@ std::string CommandEngine::ExecuteStatement(
     MetricsRegistry::CommandClass& command_class,
     StatementLogInfo* info,
     std::unique_ptr<ReplyContinuation>* continuation,
-    const std::function<void(std::size_t)>* reserve_reply) {
+    const std::function<void(std::size_t)>* reserve_reply,
+    BackupStreamTransport* backup_stream) {
     try {
         CheckStatementCancellation();
         cql::Parsed parsed;
@@ -2595,50 +2600,68 @@ std::string CommandEngine::ExecuteStatement(
                         if (const User* user = CurrentUser(session); user == nullptr || !user->manages_users)
                             throw PermissionDeniedError("BACKUP or MANAGES USERS");
                     }
-                    if (config_.backup_dir.empty())
-                        throw std::invalid_argument("BACKUP is disabled: set --backup-dir <path>");
-                    const auto target = ResolveBackupTarget(config_.backup_dir, backup.path);
                     BackupOptions options;
                     std::stop_source cancelled;
                     const auto request_stop = [&] { cancelled.request_stop(); };
                     std::stop_callback shutdown(session.backup_cancelled, request_stop);
                     std::stop_callback statement(StatementStopToken(), request_stop);
                     options.cancelled = cancelled.get_token();
-                    options.backup_directory = config_.backup_dir;
-                    std::string reply;
-                    options.before_publish = [&](const BackupResult& result) {
-                        if (reserve_reply) {
-                            if (result.tables.size() > (std::numeric_limits<std::size_t>::max() - 1024U) / 512U)
-                                throw ReplyAdmissionError("backup reply bound overflows");
-                            (*reserve_reply)(1024U + 512U * result.tables.size());
-                        }
-                        Protocol::AppendMapHeader(reply, 4);
-                        Protocol::AppendBulk(reply, "tables");
-                        Protocol::AppendInteger(reply, static_cast<std::uint64_t>(result.tables.size()));
-                        Protocol::AppendBulk(reply, "files");
-                        Protocol::AppendInteger(reply, result.files_count);
-                        Protocol::AppendBulk(reply, "bytes");
-                        Protocol::AppendInteger(reply, result.bytes);
-                        Protocol::AppendBulk(reply, "cuts");
-                        Protocol::AppendArrayHeader(reply, result.tables.size());
-                        for (const auto& cut : result.tables) {
-                            Protocol::AppendMapHeader(reply, 3);
-                            Protocol::AppendBulk(reply, "table");
-                            Protocol::AppendBulk(reply, cut.name);
-                            Protocol::AppendBulk(reply, "epoch");
-                            Protocol::AppendBulk(reply, StoreIdHex(cut.epoch));
-                            Protocol::AppendBulk(reply, "revision");
-                            Protocol::AppendInteger(reply, cut.revision);
-                        }
-                    };
                     try {
+                        if (!backup.path) {
+                            if (!backup_stream) throw std::invalid_argument("BACKUP STREAM requires a streaming connection");
+                            backup_stream->Run([&](const BackupStreamWrite& write) {
+                                catalog_->BackupStream({
+                                    .cancelled = options.cancelled,
+                                    .write = write,
+                                    .progress = [&](std::uint64_t files, std::uint64_t bytes, std::uint64_t total_files,
+                                                    std::uint64_t total_bytes) {
+                                        ReportStatementProgress({.files_done = files, .files_total = total_files,
+                                            .bytes_done = bytes, .bytes_total = total_bytes});
+                                        if (auto* hook = hook_.load(std::memory_order_acquire))
+                                            hook->Run(CommandEngineTestHook::Point::kAfterBackupStreamProgress, {});
+                                    },
+                                });
+                            });
+                            return std::string{};
+                        }
+                        if (config_.backup_dir.empty())
+                            throw std::invalid_argument("BACKUP is disabled: set --backup-dir <path>");
+                        const auto target = ResolveBackupTarget(config_.backup_dir, *backup.path);
+                        options.backup_directory = config_.backup_dir;
+                        std::string reply;
+                        options.before_publish = [&](const BackupResult& result) {
+                            if (reserve_reply) {
+                                if (result.tables.size() > (std::numeric_limits<std::size_t>::max() - 1024U) / 512U)
+                                    throw ReplyAdmissionError("backup reply bound overflows");
+                                (*reserve_reply)(1024U + 512U * result.tables.size());
+                            }
+                            Protocol::AppendMapHeader(reply, 4);
+                            Protocol::AppendBulk(reply, "tables");
+                            Protocol::AppendInteger(reply, static_cast<std::uint64_t>(result.tables.size()));
+                            Protocol::AppendBulk(reply, "files");
+                            Protocol::AppendInteger(reply, result.files_count);
+                            Protocol::AppendBulk(reply, "bytes");
+                            Protocol::AppendInteger(reply, result.bytes);
+                            Protocol::AppendBulk(reply, "cuts");
+                            Protocol::AppendArrayHeader(reply, result.tables.size());
+                            for (const auto& cut : result.tables) {
+                                Protocol::AppendMapHeader(reply, 3);
+                                Protocol::AppendBulk(reply, "table");
+                                Protocol::AppendBulk(reply, cut.name);
+                                Protocol::AppendBulk(reply, "epoch");
+                                Protocol::AppendBulk(reply, StoreIdHex(cut.epoch));
+                                Protocol::AppendBulk(reply, "revision");
+                                Protocol::AppendInteger(reply, cut.revision);
+                            }
+                        };
                         (void)catalog_->BackupTo(target, options);
+                        return reply;
                     } catch (const std::exception&) {
                         if (auto* hook = hook_.load(std::memory_order_acquire))
                             hook->Run(CommandEngineTestHook::Point::kAfterBackupAborted, {});
+                        CheckStatementCancellation();
                         throw;
                     }
-                    return reply;
                 },
                 [&](const cql::RestoreTable& restore) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;

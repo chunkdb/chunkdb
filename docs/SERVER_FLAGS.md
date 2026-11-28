@@ -91,7 +91,7 @@ These events are recorded:
 | `login` | A login succeeds or fails. |
 | `create_table`, `alter_table`, `drop_table`, `recover_table` | Schema statements and RECOVER TABLE; ALTER TABLE ... RENAME TO names both tables as `a,b`. |
 | `create_user`, `alter_user`, `drop_user`, `grant`, `revoke` | User and right statements. |
-| `backup` | BACKUP. |
+| `backup` | BACKUP. BACKUP STREAM records `change="stream"`. |
 | `restore_table`, `swap_tables` | RESTORE TABLE, with the new table, and SWAP TABLES, with both tables as `a,b`. |
 | `reload_tls` | RELOAD TLS. |
 | `enable_feature` | ENABLE FEATURE. |
@@ -121,7 +121,7 @@ On Windows, rename the file and restart the server; until then it keeps writing 
 | Flag | Default | Meaning |
 |---|---|---|
 | `--data-dir` | `data` | Directory containing manifests, users and `tables/`; a fresh directory starts with no tables. |
-| `--backup-dir` | unset | Enables BACKUP and RESTORE TABLE; nonempty directory path, with safe relative destinations and sources below its resolved root. |
+| `--backup-dir` | unset | Enables BACKUP TO and RESTORE TABLE. Supply a directory path with safe relative destinations and sources below its resolved root. |
 | `--read-only` | off | Boolean switch serving the data directory, or a completed backup, without writing to it; see [Read-only](#read-only). |
 | `--max-loaded-chunks` | `65536` | Shared cache limit counted in chunks across all tables, rather than bytes; chunks in use are not evicted, so it can be exceeded briefly, and `chunkdb_eviction_no_progress_cycles_total` counts eviction passes that freed nothing. |
 | `--max-open-wal-streams` | `1024` | Shared append-stream limit; POSIX descriptor reserves may clamp it. |

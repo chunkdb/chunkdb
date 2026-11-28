@@ -1,0 +1,9 @@
+Compile gate (GCC 15, -Werror, Release, Linux), second attempt, still fails with one diagnostic. The earlier excerpt lacked the call site; here it is:
+
+    inlined from 'constexpr std::vector<_Tp, _Alloc>::vector(std::initializer_list<_Tp>, const allocator_type&) [with _Tp = std::variant<std::monostate, unsigned long, long, bool, float, double, chunkdb::BitsValue, std::string, chunkdb::BytesValue>; ...]'
+    inlined from 'void {anonymous}::StreamRoundTrip(bool)' at tests/server_backup_protocol_tests.cpp:146:9:
+    /usr/include/c++/15/bits/new_allocator.h:151:73: error: argument 1 value '18446744073709551574' exceeds maximum object size 9223372036854775807 [-Werror=alloc-size-larger-than=]
+
+So the diagnostic is in the test, StreamRoundTrip, at the vector of column values built from an initializer list at line 146 (a std::variant copy that reaches BytesValue's copy constructor). GCC 15 at -O3 reports this for vectors of this variant built from a braced list in a large function; it is the compiler's range analysis, not a real allocation. The resize you changed in src/backup_records.cpp in the previous turn was not the cause: decide whether that change is still wanted on its own merits and revert it if it only existed to chase this diagnostic.
+
+Fix in the test without disabling the warning: build the values so that no braced-list copy of the variant vector is needed in that function (for example reserve and emplace_back each value, or construct the BytesValue in a named variable first, or move the construction into a small helper function that returns the vector). Look at how other tests in tests/ build std::vector<ColumnValue> with a BytesValue element and follow a pattern that already compiles in CI under GCC -Werror.
