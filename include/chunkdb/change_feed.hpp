@@ -41,6 +41,8 @@ struct FeedArea {
     std::uint8_t dims = 2;
     friend bool operator==(const FeedArea&, const FeedArea&) = default;
 };
+// Orders `areas` and removes repeats: one set of areas has one order.
+void SortFeedAreas(std::vector<FeedArea>& areas);
 
 struct FeedOptions {
     std::optional<FeedPosition> after{};

@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <cassert>
 #include <functional>
 #include <limits>
@@ -242,6 +243,107 @@ void NullableProjectedFixedColumns() {
     // REQUIRED columns, rather than requiring an assignment for that name.
     assert(ReadFixed(geometry, merged, 2U, 2U) == ColumnValue(std::uint64_t{5}));
 }
+
+// The form as separate section bodies joined by SerializeChunkFormSections.
+Bytes ReferenceForm(const Geometry& geometry, const ChunkState& state, std::span<const std::size_t> projection,
+    bool private_state, const ChunkFormScale* scale) {
+    const auto& layout = geometry.layout();
+    const auto blocks = geometry.ChunkBlockCount();
+    const auto put32 = [](Bytes& bytes, std::uint32_t value) {
+        for (unsigned bit = 0U; bit < 32U; bit += 8U) bytes.push_back(static_cast<std::uint8_t>(value >> bit));
+    };
+    std::vector<std::size_t> indexes(projection.begin(), projection.end());
+    if (indexes.empty()) for (std::size_t index = 0U; index < layout.schema().columns.size(); ++index) indexes.push_back(index);
+    Bytes fixed, validity, vars, descriptors, scale_body;
+    std::vector<std::uint32_t> selected_vars;
+    std::uint32_t count = 0U;
+    Bytes spans;
+    for (const auto index : indexes) {
+        const auto& column = layout.schema().columns[index];
+        const auto* span = layout.FixedColumnAt(index);
+        if (span == nullptr) { selected_vars.push_back(column.id); continue; }
+        ++count;
+        const auto length = (blocks * span->width + 7U) / 8U;
+        put32(spans, column.id); put32(spans, span->width);
+        put32(spans, static_cast<std::uint32_t>(fixed.size())); put32(spans, static_cast<std::uint32_t>(length));
+        put32(spans, column.nullable ? static_cast<std::uint32_t>(validity.size()) : 0U);
+        put32(spans, column.nullable ? static_cast<std::uint32_t>(state.presence_bitmap.size()) : 0U);
+        fixed.insert(fixed.end(), state.payload.begin() + static_cast<std::ptrdiff_t>(span->values),
+            state.payload.begin() + static_cast<std::ptrdiff_t>(span->values + length));
+        if (column.nullable) validity.insert(validity.end(), state.payload.begin() + static_cast<std::ptrdiff_t>(span->validity),
+            state.payload.begin() + static_cast<std::ptrdiff_t>(span->validity + state.presence_bitmap.size()));
+    }
+    put32(descriptors, count);
+    descriptors.insert(descriptors.end(), spans.begin(), spans.end());
+    for (const auto entry : state.vars) {
+        if (std::find(selected_vars.begin(), selected_vars.end(), entry.key.column_id) == selected_vars.end()) continue;
+        put32(vars, entry.key.column_id); put32(vars, entry.key.block_index);
+        put32(vars, static_cast<std::uint32_t>(entry.value.size()));
+        vars.insert(vars.end(), entry.value.begin(), entry.value.end());
+    }
+    std::vector<ChunkFormSection> sections{{static_cast<std::uint16_t>(ChunkFormSectionKind::kPresence), state.presence_bitmap}};
+    const auto add = [&](ChunkFormSectionKind kind, std::span<const std::uint8_t> body) {
+        if (!body.empty()) sections.push_back({static_cast<std::uint16_t>(kind), body});
+    };
+    add(ChunkFormSectionKind::kFixedValues, fixed);
+    add(ChunkFormSectionKind::kNullBits, validity);
+    add(ChunkFormSectionKind::kVariableValues, vars);
+    if (state.chunk_columns) add(ChunkFormSectionKind::kChunkColumns, state.chunk_columns->bytes);
+    add(ChunkFormSectionKind::kBlockSpans, descriptors);
+    if (scale != nullptr) {
+        put32(scale_body, scale->factor);
+        put32(scale_body, static_cast<std::uint32_t>(scale->reduction));
+        add(ChunkFormSectionKind::kScale, scale_body);
+    }
+    ChunkFormHeader header;
+    header.flags = static_cast<std::uint16_t>((projection.empty() ? 0U : kChunkFormProjected) |
+        (private_state ? kChunkFormPrivate : 0U));
+    header.schema_version = layout.schema().version;
+    if (!private_state) { header.chunk_version = state.version; header.commit_time_ms = state.commit_time_ms; }
+    return SerializeChunkFormSections(header, sections, std::numeric_limits<std::uint32_t>::max());
+}
+
+// The encoder writes every body in place: its forms are byte for byte those
+// joined from separate section bodies, for each section kind.
+void InPlaceEncodingMatchesSections() {
+    const auto geometry = Shape(Schema({MakeColumn(1, "small", ColumnKind::kUnsigned, 3, true),
+        MakeColumn(2, "label", ColumnKind::kText, 16, true), MakeColumn(3, "wide", ColumnKind::kUnsigned, 9),
+        MakeColumn(4, "flag", ColumnKind::kUnsigned, 1, true), MakeColumn(5, "note", ColumnKind::kBytes, 16, true)}),
+        Schema({MakeColumn(8, "title", ColumnKind::kText, 16, true)}), 11U);
+    auto state = Empty(geometry);
+    state.version = 9U; state.commit_time_ms = 4U; state.written = true;
+    for (const std::size_t block : {0U, 3U, 8U, 10U}) {
+        Present(state, block);
+        Fixed(geometry, state, 0U, block, std::uint64_t{block % 8U});
+        Fixed(geometry, state, 2U, block, std::uint64_t{500U - block});
+        if (block != 3U) Fixed(geometry, state, 3U, block, std::uint64_t{1});
+    }
+    state.vars.Assign({2, 0}, Bytes{'h', 'i'});
+    state.vars.Assign({2, 10}, Bytes{'z'});
+    state.vars.Assign({5, 8}, Bytes{1, 2, 3});
+    state.chunk_columns = std::make_shared<const ChunkColumnState>(EncodeChunkColumns(geometry.chunk_schema(), {std::string("base")}));
+    const ChunkFormScale scale{.factor = 1U, .reduction = ChunkFormReduction::kMax};
+    const std::vector<std::vector<std::size_t>> projections{{}, {2U, 0U}, {4U, 3U, 1U}, {2U}, {0U}};
+    for (const auto& projection : projections) {
+        for (const bool private_state : {false, true}) {
+            for (const ChunkFormScale* with : {static_cast<const ChunkFormScale*>(nullptr), &scale}) {
+                const auto expected = ReferenceForm(geometry, state, projection, private_state, with);
+                const auto bytes = EncodeSectionedChunkState(geometry, state, kVarMaxChunkBytesLimit, projection,
+                    private_state, std::numeric_limits<std::uint32_t>::max(), with);
+                assert(bytes == expected);
+                assert(SectionedChunkStateBytes(geometry, state, kVarMaxChunkBytesLimit, projection, with) == bytes.size());
+                (void)EncodeSectionedChunkState(geometry, state, kVarMaxChunkBytesLimit, projection, private_state, bytes.size(), with);
+                Reject([&] { (void)EncodeSectionedChunkState(geometry, state, kVarMaxChunkBytesLimit, projection,
+                    private_state, bytes.size() - 1U, with); });
+            }
+        }
+    }
+    // Without chunk columns the form has no metadata section.
+    const auto plain = Shape(Schema({MakeColumn(1, "n", ColumnKind::kUnsigned, 8, true)}), {}, 9U);
+    auto bare = Empty(plain);
+    Present(bare, 4U); Fixed(plain, bare, 0U, 4U, std::uint64_t{200});
+    assert(EncodeSectionedChunkState(plain, bare, kVarMaxChunkBytesLimit) == ReferenceForm(plain, bare, {}, false, nullptr));
+}
 }  // namespace
 
 int main() {
@@ -250,4 +352,5 @@ int main() {
     PartialPresenceAndDefaults();
     LoweredQuotaAllowsShrinking();
     NullableProjectedFixedColumns();
+    InPlaceEncodingMatchesSections();
 }

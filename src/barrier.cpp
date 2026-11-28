@@ -190,7 +190,7 @@ bool ListDirectoryForSync(
 
 // The fallback when even directories are too many to track: every file and
 // directory the store owns in its data directory, files first.
-void SyncWholeDataDirectory(const std::filesystem::path& data_dir) {
+std::size_t SyncWholeDataDirectory(const std::filesystem::path& data_dir) {
     std::vector<std::filesystem::path> top_files;
     std::vector<std::filesystem::path> top_dirs;
     if (!ListDirectoryForSync(data_dir, &top_files, &top_dirs)) {
@@ -236,12 +236,13 @@ void SyncWholeDataDirectory(const std::filesystem::path& data_dir) {
     SyncFilesIfPresent(files);
     SyncDirsDeepestFirst(std::move(dirs));
     SyncDirIfPresent(data_dir);
+    return files.size();
 }
 
 // Syncs what a barrier drained: the tracked files and every file of each
 // swept directory first, so their contents are durable before the directory
 // entries that reference them, then the directories, then the data directory.
-void SyncTrackedArtifacts(
+std::size_t SyncTrackedArtifacts(
     const std::unordered_set<std::string>& files,
     const std::unordered_set<std::string>& dirs,
     const std::unordered_set<std::string>& swept_dirs,
@@ -276,6 +277,7 @@ void SyncTrackedArtifacts(
     // the data directory itself; sync it so those creations (and any GC
     // removals) are durable too.
     SyncDirIfPresent(data_dir);
+    return file_paths.size();
 }
 
 }  // namespace
@@ -912,7 +914,7 @@ void ChunkStore::WalBarrier() {
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_BARRIER_SYNC_FAIL_ONCE")) {
             throw std::runtime_error("injected barrier sync failure");
         }
-        SyncUnsynced(drained);
+        (void)SyncUnsynced(drained);
         if (drained.overflow) stats_wal_barrier_full_syncs_.fetch_add(1, std::memory_order_relaxed);
     } catch (...) {
         // Restore the drained bookkeeping so a retried barrier still covers
@@ -954,12 +956,11 @@ ChunkStore::UnsyncedArtifacts ChunkStore::TakeUnsynced() {
     return drained;
 }
 
-void ChunkStore::SyncUnsynced(const UnsyncedArtifacts& drained) {
+std::size_t ChunkStore::SyncUnsynced(const UnsyncedArtifacts& drained) {
     if (drained.overflow) {
-        SyncWholeDataDirectory(data_dir_);
-    } else {
-        SyncTrackedArtifacts(drained.files, drained.dirs, drained.swept_dirs, data_dir_);
+        return SyncWholeDataDirectory(data_dir_);
     }
+    return SyncTrackedArtifacts(drained.files, drained.dirs, drained.swept_dirs, data_dir_);
 }
 
 }  // namespace chunkdb
