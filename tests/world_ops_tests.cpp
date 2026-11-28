@@ -1290,6 +1290,15 @@ void TestMetricsTableLabels() {
     assert(text.find("\nchunkdb_checkpoints_total ") == std::string::npos);
     AssertPrometheusText(text);
 
+    // Expiry metrics take the same escaped label.
+    const std::vector<chunkdb::MetricsRegistry::TableExpiryMetrics> expiry{
+        {.table = "odd\"name\\x\n", .lag_ms = 1500U, .expired_blocks = 4U, .failed_passes = 1U}};
+    const auto expiring = registry.RenderPrometheus(tables, 0, nullptr, expiry);
+    assert(expiring.find("chunkdb_expiry_lag_seconds{table=\"odd\\\"name\\\\x\\n\"} 1.500000\n") != std::string::npos);
+    assert(expiring.find("chunkdb_expired_blocks_total{table=\"odd\\\"name\\\\x\\n\"} 4\n") != std::string::npos);
+    assert(expiring.find("chunkdb_expiry_failed_passes_total{table=\"odd\\\"name\\\\x\\n\"} 1\n") != std::string::npos);
+    AssertPrometheusText(expiring);
+
     // Without tables a store family has no samples.
     const auto empty = registry.RenderPrometheus({}, 0);
     assert(empty.find("# TYPE chunkdb_checkpoints_total counter\n") != std::string::npos);
@@ -1353,8 +1362,11 @@ void TestMetricNamesFixed() {
     tables[0].table = "t";
     const std::vector<chunkdb::MetricsRegistry::TableState> states = {
         {.table = "t", .fenced = false, .slot_frontier_frozen = false}};
-    const auto text =
-        chunkdb::MetricsRegistry().RenderPrometheus(tables, 0) + chunkdb::MetricsRegistry::RenderTableStates(states);
+    // The expiry metrics appear for a table with an expire_column.
+    const std::vector<chunkdb::MetricsRegistry::TableExpiryMetrics> expiry = {
+        {.table = "t", .lag_ms = 0U, .expired_blocks = 0U, .failed_passes = 0U}};
+    const auto text = chunkdb::MetricsRegistry().RenderPrometheus(tables, 0, nullptr, expiry) +
+        chunkdb::MetricsRegistry::RenderTableStates(states);
     // Each family: its type and its label names, `le` of histogram buckets aside.
     std::map<std::string, std::pair<std::string, std::set<std::string>>> actual;
     std::size_t begin = 0;
@@ -1421,6 +1433,9 @@ void TestMetricNamesFixed() {
         {"chunkdb_txn_history_copied_bytes_total", {"counter", {"table"}}},
         {"chunkdb_table_fenced", {"gauge", {"table"}}},
         {"chunkdb_slot_frontier_frozen", {"gauge", {"table"}}},
+        {"chunkdb_expiry_lag_seconds", {"gauge", {"table"}}},
+        {"chunkdb_expired_blocks_total", {"counter", {"table"}}},
+        {"chunkdb_expiry_failed_passes_total", {"counter", {"table"}}},
     };
     for (const auto& [name, family] : expected) {
         const auto found = actual.find(name);

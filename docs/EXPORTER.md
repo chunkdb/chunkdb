@@ -76,6 +76,7 @@ Metric names, types and label names are fixed for 2.x: a 2.x release may add a m
 - Server gauges: `chunkdb_active_connections`, `chunkdb_pending_connections`, `chunkdb_loaded_chunks`, `chunkdb_large_chunk_containers`, `chunkdb_large_chunk_container_limit`.
 - Table gauges by `table`: `chunkdb_open_wal_streams`, `chunkdb_background_queue_depth`, `chunkdb_txn_history_bytes`, `chunkdb_table_fenced`, `chunkdb_slot_frontier_frozen`.
 - Table counters by `table`: `chunkdb_checkpoints_total`, `chunkdb_background_checkpoints_total`, `chunkdb_background_checkpoint_failures_total`, `chunkdb_background_queue_full_inline_total`, `chunkdb_compressed_checkpoint_images_total`, `chunkdb_wal_batch_flushes_total`, `chunkdb_wal_barriers_total`, `chunkdb_wal_barrier_full_syncs_total`, `chunkdb_evictions_total`, `chunkdb_eviction_recency_skips_total`, `chunkdb_eviction_snapshot_builds_total`, `chunkdb_eviction_probes_total`, `chunkdb_eviction_no_progress_cycles_total`, `chunkdb_eviction_forced_wal_flushes_with_data_total`, `chunkdb_eviction_forced_wal_flushes_empty_batch_total`, `chunkdb_empty_chunk_gcs_total`, `chunkdb_unique_loaded_chunks_total`, `chunkdb_txn_history_copies_total`, `chunkdb_txn_history_copied_bytes_total`.
+- By `table`, for each table with an `expire_column`: the gauge `chunkdb_expiry_lag_seconds` and the counters `chunkdb_expired_blocks_total` and `chunkdb_expiry_failed_passes_total`.
 - From the exporter: the gauge `chunkdb_up`.
 
 ## Security

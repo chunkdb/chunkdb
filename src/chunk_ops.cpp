@@ -42,6 +42,12 @@ bool ChunkStore::ApplyFullChunkStateLocked(
         var_update.empty() && !metadata_changed && (!force_write || chunk->written)) {
         return false;
     }
+    std::optional<std::uint64_t> stamped_time;
+    if (!geometry_.layout().commit_time_columns().empty()) [[unlikely]] {
+        stamped_time = NextCommitTimeMs(*chunk);
+        geometry_.layout().StampCommitTime(chunk->payload, chunk->presence_bitmap, new_presence,
+            VarChangedBlocks(chunk->vars, var_update, geometry_.layout().block_count()), *stamped_time, &new_payload);
+    }
     RequireVarWrite(chunk->vars, var_update, chunk_columns ? chunk_columns->variable_bytes : 0U,
         chunk->written && chunk->chunk_columns ? chunk->chunk_columns->variable_bytes : 0U);
     RequirePendingFits(new_payload, new_presence);
@@ -78,7 +84,7 @@ bool ChunkStore::ApplyFullChunkStateLocked(
     feed.Before(chunk_coord, chunk->payload, chunk->presence_bitmap, chunk->vars, chunk->chunk_columns.get(), chunk->written);
     const std::uint64_t reserved_version = NextChunkVersion();
     feed.Version(reserved_version);
-    const std::uint64_t commit_time_ms = NextCommitTimeMs(*chunk);
+    const std::uint64_t commit_time_ms = stamped_time ? *stamped_time : NextCommitTimeMs(*chunk);
     // The state this write replaces, while a transaction is open.
     TxnKeep keep =
         PrepareTxnKeepLocked(chunk_coord, *chunk, reserved_version, supplied_chunk_columns, /*whole_chunk=*/true);

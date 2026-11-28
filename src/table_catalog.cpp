@@ -275,7 +275,8 @@ Table::Table(
       migration_health_(std::move(migration_health)),
       geometry_(std::move(geometry)),
       store_(std::move(store)),
-      options_(options) {
+      options_(options),
+      expiry_frontier_ms_(options.expire_column != 0U && store_->access_mode_ == AccessMode::kReadWrite ? UnixMillisNow() : 0U) {
     slot_excess_ = std::make_shared<FeedExcessPool>();
     slot_max_bytes_ = store_->feed_slots_->max_bytes();
     slot_ack_state_ = std::make_shared<FeedSlotAckState>();
@@ -289,6 +290,7 @@ Table::Table(
 }
 
 Table::~Table() {
+    StopExpiry();
     StopFeedLingerTimer();
     if (store_) store_->feed_slots_->Stop();
     if (feed_) {
@@ -1124,7 +1126,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
         {
             std::lock_guard lock(mutex_);
             store_ = std::move(store);
-            options_ = options;
+            SetOptionsLocked(options);
             slot_max_bytes_ = store_->feed_slots_->max_bytes();
             state_.store(State::kFailed, std::memory_order_seq_cst);
         }
@@ -1156,7 +1158,7 @@ void Table::EndExclusive(std::shared_ptr<ChunkStore> store, const TableOptions& 
             slot_max_bytes_ = store->feed_slots_->max_bytes();
         }
         store_ = std::move(store);
-        options_ = options;
+        SetOptionsLocked(options);
         state_.store(next, std::memory_order_seq_cst);
     }
     cv_.notify_all();
@@ -1241,9 +1243,11 @@ TableCatalog::TableCatalog(CatalogConfig config)
             {"max_loaded_chunks", std::to_string(resources_->max_loaded_chunks())},
             {"max_open_wal_streams", std::to_string(resources_->max_open_wal_streams())},
         });
+    StartExpiryTicker();
 }
 
 TableCatalog::~TableCatalog() {
+    StopExpiryTicker();
     // Close every store while the writer lock is still held.
     std::map<std::string, std::shared_ptr<Table>, std::less<>> tables;
     {
@@ -1588,7 +1592,7 @@ void TableCatalog::ThrowIfFenced(std::string_view name) const {
     if (const auto it = fenced_.find(name); it != fenced_.end()) throw TableFencedError(FencedMessage(name, it->second.reason));
 }
 
-std::vector<TableFence> TableCatalog::Fences() const {
+std::vector<TableFence> TableCatalog::Fences(std::optional<std::uint64_t> expiry_now_ms) const {
     std::vector<std::pair<std::string, Fenced>> candidates;
     {
         std::shared_lock lock(tables_mutex_);
@@ -1604,6 +1608,8 @@ std::vector<TableFence> TableCatalog::Fences() const {
             .table = name,
             .reason = reason,
             .info = fenced.table ? std::optional<TableInfo>(fenced.table->Info()) : std::nullopt,
+            .expiry = expiry_now_ms && fenced.reason != nullptr && fenced.table
+                ? fenced.table->Expiry(*expiry_now_ms) : std::nullopt,
         });
     }
     return fences;
@@ -2147,7 +2153,8 @@ void TableCatalog::SetOptions(std::string_view name, const TableOptionsUpdate& u
     auto metadata = LockFeatureMetadataShared();
     const auto table = Require(name);
     std::lock_guard ddl(table->ddl_mutex_);
-    const TableOptions options = update.ApplyTo(table->Info().options);
+    const auto info = table->Info();
+    const TableOptions options = update.ApplyTo(info.options, &info.schema);
     RequireValidTableOptions(options);
     RewriteManifest(
         *table, options, [&](StoreManifest* manifest) { ReplaceTableOptions(manifest, options); },
@@ -2532,10 +2539,23 @@ TableOptionsUpdate TableOptionsUpdate::From(const TableOptions& options) {
         .var_max_chunk_bytes = options.var_max_chunk_bytes,
         .feed_buffer_bytes = options.feed_buffer_bytes,
         .slot_max_bytes = options.slot_max_bytes,
+        .expire_column = options.expire_column,
+        .expire_column_name = std::nullopt,
     };
 }
 
-TableOptions TableOptionsUpdate::ApplyTo(TableOptions options) const {
+TableOptions TableOptionsUpdate::ApplyTo(TableOptions options, const TableSchema* schema) const {
+    if (expire_column) options.expire_column = *expire_column;
+    if (expire_column_name && expire_column_name->empty()) {
+        options.expire_column = 0U;
+    } else if (expire_column_name) {
+        if (schema == nullptr) throw std::invalid_argument("expire_column needs the table's columns");
+        const auto at = std::find_if(schema->columns.begin(), schema->columns.end(),
+            [&](const Column& column) { return column.name == *expire_column_name; });
+        if (at == schema->columns.end()) throw std::invalid_argument("the table has no column " + *expire_column_name);
+        options.expire_column = at->id;
+        RequireValidExpireColumn(options, *schema);
+    }
     options.durability_mode = durability_mode.value_or(options.durability_mode);
     options.checkpoint_update_interval =
         checkpoint_update_interval.value_or(options.checkpoint_update_interval);
@@ -2553,7 +2573,7 @@ TableOptions TableOptionsUpdate::ApplyTo(TableOptions options) const {
 bool TableOptionsUpdate::empty() const noexcept {
     return !durability_mode && !checkpoint_update_interval && !checkpoint_wal_bytes &&
            !wal_group_commit_updates && !checkpoint_compression && !var_max_chunk_bytes &&
-           !feed_buffer_bytes && !slot_max_bytes;
+           !feed_buffer_bytes && !slot_max_bytes && !expire_column && !expire_column_name;
 }
 
 bool TableCatalog::EnableFeature(std::string_view name) {

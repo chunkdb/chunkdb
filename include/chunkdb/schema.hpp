@@ -81,6 +81,11 @@ struct Column {
     // EncodeColumnValue does; only meaningful with has_default.
     bool has_default = false;
     std::vector<std::uint8_t> default_value;
+    // DEFAULT COMMIT_TIME, block u64 columns only: has_default with a zero
+    // default_value, and every commit that changes the block's other values
+    // or creates it, without changing this column, sets it to its commit
+    // time in Unix ms.
+    bool default_commit_time = false;
 
     friend bool operator==(const Column&, const Column&) = default;
 };

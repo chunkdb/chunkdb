@@ -116,6 +116,9 @@ struct CatalogConfig {
     std::size_t feed_buffer_bytes = kDefaultFeedBufferBytes;
     std::chrono::milliseconds feed_linger{30000};
     QueryLimits query_limits{};
+    // How often tables with an expire_column start an expiry sweep; zero
+    // starts none (tests run them through ExpiryTestAccess).
+    std::chrono::milliseconds expiry_interval{1000};
 };
 
 // A catalog configuration whose new-table options and shared budgets come
@@ -135,10 +138,16 @@ struct TableOptionsUpdate {
     std::optional<std::size_t> var_max_chunk_bytes;
     std::optional<std::size_t> feed_buffer_bytes;
     std::optional<std::size_t> slot_max_bytes;
+    // The expire_column by id (0 for none), or by name (empty for none),
+    // which ApplyTo looks up in its schema.
+    std::optional<std::uint32_t> expire_column;
+    std::optional<std::string> expire_column_name;
 
     // Every field set from `options`.
     [[nodiscard]] static TableOptionsUpdate From(const TableOptions& options);
-    [[nodiscard]] TableOptions ApplyTo(TableOptions options) const;
+    // Throws std::invalid_argument for an expire_column name that is not a
+    // u64 column of `schema`, or with no schema.
+    [[nodiscard]] TableOptions ApplyTo(TableOptions options, const TableSchema* schema = nullptr) const;
     [[nodiscard]] bool empty() const noexcept;
 };
 
@@ -201,17 +210,6 @@ struct TableRestoreResult {
     std::uint64_t fork_revision = 0;
     std::uint64_t files = 0;
     std::uint64_t bytes = 0;
-};
-
-// A table that refuses its commands until TableCatalog::RecoverTable or a
-// restart recovers it: after a failure that left it out of service, or while
-// its store is fail-closed after a durability failure or its feed cleanup
-// failed.
-struct TableFence {
-    std::string table;
-    std::string reason;
-    // What it served last; std::nullopt when it never served.
-    std::optional<TableInfo> info;
 };
 
 // One table of a catalog. A connection keeps a shared_ptr<Table> for the
@@ -293,7 +291,18 @@ class Table : public std::enable_shared_from_this<Table> {
     void AdvanceFeedSlot(std::string_view name, FeedPosition position);
     [[nodiscard]] FeedArchiveReader ReadFeedArchive(FeedPosition after);
 
+    // Expiry by the table's expire_column, while it has one.
+    struct ExpiryStatus {
+        // Time since the start of the last completed sweep, or since expiry
+        // started on the table before one completed.
+        std::uint64_t lag_ms = 0U;
+        std::uint64_t expired_blocks = 0U;
+        std::uint64_t failed_passes = 0U;
+    };
+    [[nodiscard]] std::optional<ExpiryStatus> Expiry(std::uint64_t now_ms) const;
+
   private:
+    friend struct ExpiryTestAccess;
     friend class SlotWatch;
     friend class TableCatalog;
     friend struct FeedSlotTestAccess;
@@ -375,6 +384,16 @@ class Table : public std::enable_shared_from_this<Table> {
     void StopFeedLingerTimer();
     void StartFeedLingerTimer();
     [[nodiscard]] bool ExpireFeedLinger(std::stop_token cancelled);
+    // Expiry passes run on `pool` (table_expiry.cpp). RequestExpiry starts a
+    // sweep unless one runs or, without `now`, the last one ended less than
+    // `interval` ago; it does nothing without an expire_column or after
+    // StopExpiry, which returns once no pass runs or can run.
+    struct ExpiryJob;
+    [[nodiscard]] bool HasExpireColumn() const;
+    void RequestExpiry(const std::shared_ptr<MaintenancePool>& pool, std::chrono::milliseconds interval, bool now = false);
+    void StopExpiry() noexcept;
+    // Publishes the reopened table's options under mutex_ after leases drain.
+    void SetOptionsLocked(const TableOptions& options);
     void QuarantineFeedLinger(const std::exception& error, std::shared_ptr<ChunkStore> store, bool admitted) noexcept;
     // Why a table in its catalog refuses commands; nullptr when it does not.
     [[nodiscard]] const char* FenceReason() const;
@@ -397,6 +416,12 @@ class Table : public std::enable_shared_from_this<Table> {
     std::optional<std::chrono::steady_clock::time_point> feed_linger_deadline_;
     std::jthread feed_linger_timer_;
     std::atomic<bool> feed_timer_finished_{true};
+    // Guards the expiry members; never held while a pass runs.
+    std::mutex expiry_mutex_;
+    bool expiry_stopped_ = false;
+    std::shared_ptr<ExpiryJob> expiry_;
+    std::shared_ptr<MaintenancePool> expiry_pool_;
+    std::shared_ptr<MaintenanceTask> expiry_task_;
     std::atomic<bool> feed_cleanup_failed_{false};
     // Why watches of a table that left service end, when not dropped: a static
     // text, set before the exclusive section that ends them.
@@ -421,6 +446,12 @@ class Table : public std::enable_shared_from_this<Table> {
     // Written only while state_ is kBusy and no lease is active.
     std::shared_ptr<ChunkStore> store_;
     TableOptions options_;
+    // Changes to expire_column reset these under mutex_ with no leases active.
+    // A sweep updates its counters and frontier while holding a lease.
+    std::uint64_t expiry_generation_ = 0U;
+    std::atomic<std::uint64_t> expiry_frontier_ms_{0U};
+    std::atomic<std::uint64_t> expired_blocks_{0U};
+    std::atomic<std::uint64_t> expiry_failed_passes_{0U};
     // Protected with options_ by mutex_.
     std::size_t slot_max_bytes_ = kDefaultSlotMaxBytes;
     std::shared_ptr<ChangeFeed> feed_;
@@ -429,6 +460,19 @@ class Table : public std::enable_shared_from_this<Table> {
     std::shared_ptr<FeedSlotAckState> slot_ack_state_;
     std::shared_ptr<std::atomic<std::size_t>> slot_output_bytes_ = std::make_shared<std::atomic<std::size_t>>(0U);
     std::shared_ptr<FeedExcessPool> slot_excess_;
+};
+
+// A table that refuses its commands until TableCatalog::RecoverTable or a
+// restart recovers it: after a failure that left it out of service, or while
+// its store is fail-closed after a durability failure or its feed cleanup
+// failed.
+struct TableFence {
+    std::string table;
+    std::string reason;
+    // What it served last; std::nullopt when it never served.
+    std::optional<TableInfo> info;
+    // Requested only by metrics, for a table outside the serving catalog.
+    std::optional<Table::ExpiryStatus> expiry{};
 };
 
 struct CatalogTxnSnapshot {
@@ -453,6 +497,7 @@ struct CatalogTxnLease {
 // all of them.
 class TableCatalog {
     friend struct CatalogTxnTestAccess;
+    friend struct ExpiryTestAccess;
   public:
     // Opens (a writer creates when new) the data directory and every table
     // in it; a writer that finds no table creates `default`.
@@ -497,8 +542,9 @@ class TableCatalog {
     // service, and TableNotFoundError when there is no such table.
     [[nodiscard]] std::shared_ptr<Table> Require(std::string_view name) const;
     // Fenced tables, sorted by name: those out of service, which Find does
-    // not return, and those it returns that refuse changes.
-    [[nodiscard]] std::vector<TableFence> Fences() const;
+    // not return, and those it returns that refuse changes. With a time,
+    // include expiry status for tables out of service that had expiry.
+    [[nodiscard]] std::vector<TableFence> Fences(std::optional<std::uint64_t> expiry_now_ms = std::nullopt) const;
     [[nodiscard]] std::optional<TableFence> Fence(std::string_view name) const;
     // Runs for one fenced table what opening the catalog runs for each table,
     // while other tables keep serving: waits for the commands running on it
@@ -740,6 +786,13 @@ class TableCatalog {
     // Out of service until RecoverTable; disjoint from tables_, which
     // tables_mutex_ guards with it.
     std::map<std::string, Fenced, std::less<>> fenced_;
+    // Every expiry_interval, requests an expiry sweep of each served table
+    // (table_expiry.cpp); declared last, so it stops first.
+    void StartExpiryTicker();
+    void StopExpiryTicker() noexcept;
+    std::mutex expiry_ticker_mutex_;
+    std::condition_variable_any expiry_ticker_cv_;
+    std::jthread expiry_ticker_;
 };
 
 }  // namespace chunkdb

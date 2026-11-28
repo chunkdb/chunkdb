@@ -261,6 +261,9 @@ struct TableOptions {
     // Absent limits inherit the catalog defaults when the table opens.
     std::optional<std::size_t> feed_buffer_bytes{};
     std::optional<std::size_t> slot_max_bytes{};
+    // Id of the u64 block column whose time, in Unix ms, deletes a block
+    // once it has passed (expiry); 0 for none.
+    std::uint32_t expire_column = 0U;
 };
 
 class StoreResources;
@@ -381,6 +384,17 @@ inline constexpr std::size_t kDefaultSnapshotGenerationLingerMaxBrackets = 512;
 struct ChunkScanPage {
     std::vector<ChunkCoord> coords;
     bool has_more = false;
+};
+
+// One bounded expiry pass (ChunkStore::ExpireBlocks).
+struct ExpiryPass {
+    // Chunk identities the pass visited, populated or not.
+    std::size_t chunks = 0U;
+    // Blocks it deleted.
+    std::size_t deleted = 0U;
+    // Whether identities remain after `next`, the last one visited.
+    bool more = false;
+    ChunkCoord next{};
 };
 
 struct ChunkRangeEntry {
@@ -793,10 +807,13 @@ class ChunkStore {
     // The values at `slots` (schema indexes; the others are NULL) of the
     // block a SET BLOCK of `values` leaves, as a later read decodes them:
     // given columns take their values, the others keep `before` or, for an
-    // absent block (`before` null), take what a new block takes. Throws for
-    // a value the column does not hold, as the write would.
+    // absent block (`before` null), take what a new block takes. DEFAULT
+    // COMMIT_TIME columns take `commit_time_ms` as the write stamps them; in
+    // a table with one, `before` holds the values of the given columns too.
+    // Throws for a value the column does not hold, as the write would.
     [[nodiscard]] std::vector<ColumnValue> BlockAfterSet(const std::vector<ColumnValue>* before,
-        const std::vector<ColumnAssignment>& values, std::span<const std::size_t> slots) const;
+        const std::vector<ColumnAssignment>& values, std::span<const std::size_t> slots,
+        std::uint64_t commit_time_ms) const;
     [[nodiscard]] BlockReadMetadata GetBlockWithVersion3D(std::int64_t x, std::int64_t y, std::int64_t z);
     // The first stored value of column `column_id` that `type` does not
     // hold, or with `refuse_null` the first NULL, as "block (x, y) holds
@@ -868,6 +885,19 @@ class ChunkStore {
     [[nodiscard]] ChunkIdentityScanPage ScanChunkIdentitiesAt(const TxnSnapshot& snapshot,
         bool has_cursor, ChunkCoord cursor, std::size_t limit, bool with_data = false,
         const ChunkScanFilter* filter = nullptr, const ChunkAreaSelector* area = nullptr);
+    // Expiry (docs/reference/TABLES.md#expiry): visits at most `max_chunks`
+    // chunk identities after `cursor` in coordinate order and deletes their
+    // present blocks whose u64 column `column_id` holds a time t with
+    // 0 < t <= now_ms. Each chunk with such blocks is one ordinary commit of
+    // the current write user, decided under its chunk lock; other chunks
+    // are read without entering the cache. When supplied, deleted_total
+    // counts each successful chunk even if a later chunk fails.
+    [[nodiscard]] ExpiryPass ExpireBlocks(std::uint32_t column_id, bool has_cursor, ChunkCoord cursor,
+        std::size_t max_chunks, std::uint64_t now_ms, std::atomic<std::uint64_t>* deleted_total = nullptr);
+#ifdef CHUNKDB_FAILPOINTS
+    // Runs between a chunk's read without the cache and its chunk lock.
+    static void SetExpiryDecideHookForTests(void (*hook)()) noexcept;
+#endif
     // With `with_vars`, each entry carries its text and bytes values, and
     // they count toward the response-byte limit.
     [[nodiscard]] std::vector<ChunkRangeEntry> ReadChunkRange(
@@ -1821,6 +1851,9 @@ class ChunkStore {
         const TxnSnapshot* snapshot,
         const TxnAreaRead* txn_read);
 
+    // ExpireBlocks for one chunk: the blocks it deleted.
+    [[nodiscard]] std::size_t ExpireChunkBlocks(const ChunkCoord& coord, const ChunkLayout::FixedColumn& column,
+        std::uint64_t now_ms);
     // Issues the next version token; requires a read-write store.
     [[nodiscard]] std::uint64_t NextChunkVersion();
     // Commit time for a mutation of `chunk`: the wall clock in Unix ms, never
@@ -2232,6 +2265,7 @@ class StoreResources {
     friend class ChunkStore;
     friend class Table;
     friend class TableCatalog;
+    friend struct ExpiryTestAccess;
 
     [[nodiscard]] std::shared_ptr<MaintenancePool> MaintenanceWorkers();
     const std::size_t maintenance_workers_;

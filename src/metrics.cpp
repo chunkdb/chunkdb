@@ -226,7 +226,7 @@ std::string MetricsRegistry::RenderTableStates(std::span<const TableState> table
 
 std::string MetricsRegistry::RenderPrometheus(
     std::span<const TableRuntimeStats> tables,
-    std::size_t loaded_chunks, const StoreResources* resources) const {
+    std::size_t loaded_chunks, const StoreResources* resources, std::span<const TableExpiryMetrics> expiry) const {
     std::string out;
     out.reserve(8192);
 
@@ -425,6 +425,30 @@ std::string MetricsRegistry::RenderPrometheus(
         for (std::size_t i = 0; i < tables.size(); ++i) {
             AppendCounter(&out, family.name, table_labels[i], tables[i].stats.*family.value);
         }
+    }
+
+    if (!expiry.empty()) {
+        std::vector<std::string> expiry_labels;
+        expiry_labels.reserve(expiry.size());
+        for (const auto& table : expiry) expiry_labels.push_back("table=\"" + EscapeLabelValue(table.table) + "\"");
+        out += "# HELP chunkdb_expiry_lag_seconds Time since the start of the last completed expiry sweep, "
+               "by table with an expire_column.\n";
+        out += "# TYPE chunkdb_expiry_lag_seconds gauge\n";
+        for (std::size_t i = 0; i < expiry.size(); ++i) {
+            out += "chunkdb_expiry_lag_seconds{";
+            out += expiry_labels[i];
+            out += "} ";
+            out += FormatMicrosAsSeconds(expiry[i].lag_ms * 1000U);
+            out += "\n";
+        }
+        out += "# HELP chunkdb_expired_blocks_total Blocks deleted by expiry, by table.\n";
+        out += "# TYPE chunkdb_expired_blocks_total counter\n";
+        for (std::size_t i = 0; i < expiry.size(); ++i)
+            AppendCounter(&out, "chunkdb_expired_blocks_total", expiry_labels[i], expiry[i].expired_blocks);
+        out += "# HELP chunkdb_expiry_failed_passes_total Expiry passes that failed, by table.\n";
+        out += "# TYPE chunkdb_expiry_failed_passes_total counter\n";
+        for (std::size_t i = 0; i < expiry.size(); ++i)
+            AppendCounter(&out, "chunkdb_expiry_failed_passes_total", expiry_labels[i], expiry[i].failed_passes);
     }
 
     return out;

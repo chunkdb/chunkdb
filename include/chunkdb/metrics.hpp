@@ -8,6 +8,7 @@
 #include <span>
 #include <string>
 #include <string_view>
+#include <vector>
 
 #include "chunkdb/chunk_store.hpp"
 
@@ -91,11 +92,21 @@ class MetricsRegistry {
     // `value` as a label value: backslash, double quote and line feed escaped.
     [[nodiscard]] static std::string EscapeLabelValue(std::string_view value);
 
+    // Expiry of one table with an expire_column (Table::Expiry), labelled
+    // `table` as the store counters are.
+    struct TableExpiryMetrics {
+        std::string table;
+        std::uint64_t lag_ms = 0U;
+        std::uint64_t expired_blocks = 0U;
+        std::uint64_t failed_passes = 0U;
+    };
+
     // Store counters come as one sample per table, labelled `table`, in the
-    // order of `tables`.
+    // order of `tables`; expiry metrics likewise for each table in `expiry`.
     [[nodiscard]] std::string RenderPrometheus(
         std::span<const TableRuntimeStats> tables,
-        std::size_t loaded_chunks, const StoreResources* resources = nullptr) const;
+        std::size_t loaded_chunks, const StoreResources* resources = nullptr,
+        std::span<const TableExpiryMetrics> expiry = {}) const;
 
   private:
     struct Histogram {

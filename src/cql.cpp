@@ -427,6 +427,11 @@ class Parser {
     [[nodiscard]] bool IsKeyword(const Token& token, std::string_view keyword) const {
         return token.kind == TokenKind::kWord && Lower(token.text) == keyword;
     }
+    // NULL, TRUE, FALSE, INF and NAN, which Value reads as values.
+    [[nodiscard]] static bool IsLiteralWord(const Token& token) {
+        const std::string word = Lower(token.text);
+        return word == "null" || word == "true" || word == "false" || word == "inf" || word == "nan";
+    }
     bool Accept(std::string_view keyword) {
         if (IsKeyword(Peek(), keyword)) {
             Take();
@@ -863,10 +868,11 @@ class Parser {
                 }
                 definition.required = true;
             } else if (Accept("default")) {
-                if (definition.default_value.has_value()) {
+                if (definition.default_value.has_value() || definition.default_commit_time) {
                     Fail(column, "DEFAULT is given twice");
                 }
-                definition.default_value = Value(false);
+                if (Accept("commit_time")) definition.default_commit_time = true;
+                else definition.default_value = Value(false);
             } else if (Accept("check")) {
                 definition.checks.push_back(Check());
             } else {
@@ -909,6 +915,11 @@ class Parser {
         Option option;
         option.name = Name("an option name");
         ExpectToken(TokenKind::kEquals, "=");
+        // A bare name, as in expire_column = expires_at, is text.
+        if (const auto& token = Peek(); token.kind == TokenKind::kWord && !IsLiteralWord(token)) {
+            option.value = Text{.value = Take().text};
+            return option;
+        }
         option.value = Value(false);
         return option;
     }
@@ -1337,7 +1348,7 @@ class Parser {
                     attribute.column = column_name;
                     if (Accept("default")) {
                         attribute.change = set ? Change::kSetDefault : Change::kDropDefault;
-                        if (set) attribute.value = Value(false);
+                        if (set && !Accept("commit_time")) attribute.value = Value(false);
                     } else if (Accept("null")) {
                         attribute.change = set ? Change::kSetNull : Change::kDropNull;
                     } else if (Accept("required")) {

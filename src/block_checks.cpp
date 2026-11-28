@@ -17,6 +17,8 @@ struct BlockChecks::Planned {
     // The block columns it reads, by index in the schema (their slots).
     std::vector<std::size_t> columns;
     bool reads_positions = false;
+    // It reads a DEFAULT COMMIT_TIME column.
+    bool reads_commit_time = false;
     // The ADD CHECK in progress.
     bool pending = false;
 };
@@ -39,6 +41,7 @@ namespace {
         if (at != schema.columns.end() &&
             std::find(planned.columns.begin(), planned.columns.end(), index) == planned.columns.end())
             planned.columns.push_back(index);
+        if (at != schema.columns.end() && at->default_commit_time) planned.reads_commit_time = true;
     }
     return planned;
 }
@@ -180,16 +183,19 @@ bool BlockChecks::Differs(
 }
 
 void BlockChecks::RequireBlock(const ChunkCoord& coord, std::span<const std::uint8_t> payload, const ChunkVars& vars,
-    std::size_t block, std::span<const VarChange> overrides) const {
+    std::size_t block, std::span<const VarChange> overrides, bool defer_commit_time) const {
     Scratch scratch;
     scratch.values.resize(layout_->schema().columns.size());
     const Source source{.payload = payload, .vars = &vars, .overrides = overrides};
-    for (const auto& check : checks_) Require(check, coord, source, block, scratch);
+    for (const auto& check : checks_) {
+        if (defer_commit_time && check.reads_commit_time) continue;
+        Require(check, coord, source, block, scratch);
+    }
 }
 
 void BlockChecks::RequireChanged(const ChunkCoord& coord, std::span<const std::uint8_t> payload,
     std::span<const std::uint8_t> presence, const ChunkVars& vars, std::span<const std::uint8_t> base_payload,
-    std::span<const std::uint8_t> base_presence, const ChunkVars& base_vars) const {
+    std::span<const std::uint8_t> base_presence, const ChunkVars& base_vars, bool defer_commit_time) const {
     Scratch scratch;
     scratch.values.resize(layout_->schema().columns.size());
     const Source state{.payload = payload, .vars = &vars};
@@ -198,6 +204,7 @@ void BlockChecks::RequireChanged(const ChunkCoord& coord, std::span<const std::u
         if (!BlockPresent(presence, block)) continue;
         const bool added = !BlockPresent(base_presence, block);
         for (const auto& check : checks_) {
+            if (defer_commit_time && check.reads_commit_time) continue;
             const bool changed = added || std::any_of(check.columns.begin(), check.columns.end(),
                 [&](std::size_t index) { return Differs(index, block, state, base, scratch); });
             if (changed) Require(check, coord, state, block, scratch);

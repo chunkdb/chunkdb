@@ -70,6 +70,7 @@ With RETURNING, `applied` is false when IF VERSION or the IF condition refuses t
 `version` is the chunk's version after the write, or its current version when refused, null for a never-written chunk; inside a transaction it is that of the transaction's view, null for a chunk the transaction wrote.
 Each row is `[x, y, values...]`, with `z` after `y` in a three-dimensional table.
 An OLD row exists only for a block present before the write; a NEW row holds the values a GET BLOCK reads after the write, including the defaults of a new block.
+A NEW row holds a [DEFAULT COMMIT_TIME](TABLES.md#commit-time) column as the write stamps it; inside a transaction, where that time is known only at COMMIT, RETURNING NEW of such a column is refused with INVALID_ARGUMENT.
 Other refusals, such as an unknown column or a value out of range, are errors as without RETURNING.
 
 ## Errors

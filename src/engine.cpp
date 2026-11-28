@@ -2,6 +2,7 @@
 #include "audit_log.hpp"
 #include "backup.hpp"
 #include "catalog_feed.hpp"
+#include "chunk_store_internal.hpp"
 #include "source_address.hpp"
 
 #include <algorithm>
@@ -206,6 +207,9 @@ void ApplyTableOption(TableOptionsUpdate* update, std::string_view key, std::str
         update->feed_buffer_bytes = ParsePositiveSize(key, value);
     } else if (KeyIs(key, "slot_max_bytes")) {
         update->slot_max_bytes = ParsePositiveSize(key, value);
+    } else if (KeyIs(key, "expire_column")) {
+        // Empty for none; the table's columns resolve the name.
+        update->expire_column_name = std::string(value);
     } else if (IsGeometryKey(key)) {
         throw std::invalid_argument(
             std::string(key) + " is part of the geometry, which is fixed when a table is "
@@ -1151,12 +1155,23 @@ std::string CommandEngine::RenderMetrics() const {
     // not open, such as one an exclusive statement holds or waits for, or one
     // that failed, is left out rather than waited for.
     std::vector<TableRuntimeStats> tables;
+    std::vector<MetricsRegistry::TableExpiryMetrics> expiry;
+    const auto expiry_now = catalog_->access_mode() == AccessMode::kReadWrite
+        ? std::optional<std::uint64_t>(UnixMillisNow()) : std::nullopt;
+    const auto expiry_sample = [](const std::string& name, const Table::ExpiryStatus& status) {
+        return MetricsRegistry::TableExpiryMetrics{.table = name, .lag_ms = status.lag_ms,
+            .expired_blocks = status.expired_blocks, .failed_passes = status.failed_passes};
+    };
     // The state gauges list every table by name, fenced ones out of service too.
     std::vector<MetricsRegistry::TableState> states;
     for (const auto& info : catalog_->List()) {
         const auto table = catalog_->Find(info.name);
         if (table == nullptr) {
             continue;
+        }
+        // A read-only server runs no expiry.
+        if (const auto status = expiry_now ? table->Expiry(*expiry_now) : std::nullopt) {
+            expiry.push_back(expiry_sample(info.name, *status));
         }
         auto& state = states.emplace_back(MetricsRegistry::TableState{.table = info.name, .fenced = false, .slot_frontier_frozen = std::nullopt});
         const auto lease = table->TryAcquire();
@@ -1167,14 +1182,21 @@ std::string CommandEngine::RenderMetrics() const {
         state.slot_frontier_frozen = table->SlotFrontierFrozen(*lease);
     }
     // Fences waits for no table.
-    for (const auto& fence : catalog_->Fences()) {
+    for (const auto& fence : catalog_->Fences(expiry_now)) {
+        if (fence.expiry) {
+            const auto at = std::lower_bound(expiry.begin(), expiry.end(), fence.table,
+                [](const MetricsRegistry::TableExpiryMetrics& sample, const std::string& name) { return sample.table < name; });
+            auto sample = expiry_sample(fence.table, *fence.expiry);
+            if (at != expiry.end() && at->table == fence.table) *at = std::move(sample);
+            else expiry.insert(at, std::move(sample));
+        }
         const auto at = std::lower_bound(states.begin(), states.end(), fence.table,
             [](const MetricsRegistry::TableState& state, const std::string& name) { return state.table < name; });
         if (at != states.end() && at->table == fence.table) at->fenced = true;
         else states.insert(at, MetricsRegistry::TableState{.table = fence.table, .fenced = true, .slot_frontier_frozen = std::nullopt});
     }
-    return metrics_->RenderPrometheus(
-        tables, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()), catalog_->resources().get()) +
+    return metrics_->RenderPrometheus(tables, static_cast<std::size_t>(catalog_->resources()->LoadedChunkCount()),
+               catalog_->resources().get(), expiry) +
         MetricsRegistry::RenderTableStates(states);
 }
 

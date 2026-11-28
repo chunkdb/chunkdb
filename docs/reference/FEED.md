@@ -173,6 +173,9 @@ SHOW SLOTS `revision` is the durable revision recorded for the table's slots, wh
 `peer` is the `[address]:port` of that watch's client, as SHOW CONNECTIONS names it, and `last_ack_ms` the milliseconds since that watch's last accepted ACK; both are null without a watch, and `last_ack_ms` also before the watch's first ACK.
 `peer` is shown to the watch's user and to ADMIN on `*` or MONITOR, as SHOW CONNECTIONS shows connections, and is null to others.
 
+Expiry deletions ([Expiry](TABLES.md#expiry)) are change events of user `@expire`, one per chunk, with the deleted blocks' before rows and no after rows; slots carry them like any other delete.
+No user name starts with `@`, so `@expire` never names a client.
+
 Conditional removal still checks rights and requires an existing table.
 Change events contain complete before and after metadata rows when chunk columns change.
 A null metadata before row means the chunk had never been written.

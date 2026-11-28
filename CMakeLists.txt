@@ -118,6 +118,7 @@ add_library(chunkdb_core STATIC
     src/engine_cql.cpp
     src/engine_sessions.cpp
     src/eviction.cpp
+    src/expiry.cpp
     src/chunk_vars.cpp
     src/feature_flags.cpp
     src/feature_activation_records.cpp
@@ -145,6 +146,7 @@ add_library(chunkdb_core STATIC
     src/schema.cpp
     src/store_resources.cpp
     src/table_catalog.cpp
+    src/table_expiry.cpp
     src/catalog_txn_snapshot.cpp
     src/table_chunk_columns.cpp
     src/table_tombstones.cpp
@@ -604,6 +606,15 @@ if(CHUNKDB_BUILD_TESTS)
     target_include_directories(chunkdb_alter_column_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
     add_test(NAME alter_column COMMAND chunkdb_alter_column_test)
 
+    add_executable(chunkdb_expiry_test tests/expiry_tests.cpp)
+    target_link_libraries(chunkdb_expiry_test PRIVATE chunkdb_core)
+    target_include_directories(chunkdb_expiry_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src ${CMAKE_CURRENT_SOURCE_DIR}/tests)
+    add_test(NAME expiry COMMAND chunkdb_expiry_test)
+    if(NOT WIN32)
+        add_test(NAME expiry_crash COMMAND chunkdb_expiry_test --crash)
+        set_tests_properties(expiry_crash PROPERTIES TIMEOUT 60)
+    endif()
+    set_tests_properties(expiry PROPERTIES TIMEOUT 60)
     add_executable(chunkdb_check_constraint_test tests/check_constraint_tests.cpp)
     target_link_libraries(chunkdb_check_constraint_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_check_constraint_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -1375,6 +1386,7 @@ if(CHUNKDB_BUILD_TESTS)
         chunkdb_txn_kill_test
         chunkdb_txn_concurrency_test
         chunkdb_docs_check_test
+        chunkdb_expiry_test
     )
     if(TARGET chunkdb_server_tls_error_queue_test)
         list(APPEND CHUNKDB_TEST_TARGETS chunkdb_server_tls_error_queue_test)
@@ -1533,6 +1545,7 @@ if(CHUNKDB_BUILD_TESTS)
         user_admission
         maintenance_pool
         admin_rebuild_version_clock
+        expiry
     )
     if(WIN32)
         add_test(
@@ -1561,6 +1574,9 @@ if(CHUNKDB_BUILD_TESTS)
         recover_table
         version_clock_crash
     )
+    if(NOT WIN32)
+        list(APPEND CHUNKDB_CRASH_TESTS expiry_crash)
+    endif()
 
     if(TARGET chunkdb_server_tls_error_queue_test)
         list(APPEND CHUNKDB_SMOKE_TESTS server_tls_error_queue)

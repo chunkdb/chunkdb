@@ -191,7 +191,17 @@ void SplitChunkStateBytes(
 
 [[nodiscard]] std::string CanonicalPathKey(const std::filesystem::path& path);
 [[nodiscard]] std::uint64_t CurrentProcessIdValue();
+// The wall clock in Unix ms: commit times and expiry decisions read it.
 [[nodiscard]] std::uint64_t UnixMillisNow();
+#ifdef CHUNKDB_FAILPOINTS
+// Replaces the wall clock of UnixMillisNow; nullptr restores it.
+void SetUnixMillisClockForTests(std::uint64_t (*clock)()) noexcept;
+#endif
+// Per block of a chunk of `blocks` blocks: whether a text or bytes value
+// of the block differs between `before` and `before` with `update`
+// applied, or `after`.
+[[nodiscard]] std::vector<bool> VarChangedBlocks(const ChunkVars& before, const VarUpdate& update, std::size_t blocks);
+[[nodiscard]] std::vector<bool> VarChangedBlocks(const ChunkVars& before, const ChunkVars& after, std::size_t blocks);
 [[nodiscard]] std::int64_t FloorDiv(std::int64_t value, std::int64_t divisor);
 // Whether failure injection is compiled in (CHUNKDB_FAILPOINTS, on in test
 // builds). Without it every failpoint reads as unset and the environment is
