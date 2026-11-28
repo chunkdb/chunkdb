@@ -32,7 +32,8 @@ Failed-login delays and ban replies use scheduled deadlines and never sleep on a
 Per-connection and aggregate input/output bounds stop reading before accepting unbounded pipelines.
 Framing plans inspect published schema and rights metadata without taking a table lease; execution revalidates them under its normal lease.
 Before retaining parameter bodies, a request reserves its complete checked maximum payload against a shared byte budget without allocating that maximum.
-Data framing has 2147483648 bytes of credit and authentication/session controls have a separate 16777216-byte reserve.
+Data framing has 2147483648 bytes of credit and session controls after login have a separate 16777216-byte reserve.
+Requests before login have their own 16777216-byte reserve: each kept frame is charged the length its header gives when the header arrives, a drained frame is not charged, and a header the reserve cannot hold receives `BUSY reason=input_budget` and closes instead of waiting.
 The reservation is the smaller of the sum of checked frame maxima and the statement-wide bound, with separately bounded opaque frames.
 Admission refuses an individual request exceeding its pool instead of waiting for credit it can never obtain.
 Ready requests wait in FIFO order for credit and reconsider admission on returned credit, a queue-head change or an absolute transport deadline.
@@ -43,6 +44,8 @@ Credits remain charged while a worker owns the parameters and are released once 
 A worker waiting for its connection's next request keeps that connection's data line credit and ordinary 65536-byte reply reservation, and returns both when it hands the connection back with no reply or line in progress.
 Request-line buffers obey their negotiated line bound and a separate aggregate byte bound; reserved control capacity remains available while data framing is paused.
 Unclassified request lines use reserved line credit, so data-only credit cannot prevent receiving a new HELLO or control line.
+Lines read before login use a separate 16777216-byte line reserve, so unfinished logins cannot take the line credit of logged-in connections.
+Before login a line and a kept frame take at most 8192 bytes, so each unfinished login holds at most 12288 bytes of line credit and under 10 KiB of frame credit: the reserves hold more than a thousand unfinished logins.
 An idle connection on the I/O owner holds no line credit: a read that buffers nothing returns the credit it took, and a writable reply is not taken for input.
 Replies charge their retained immutable state and encoded buffers against 2147483648 bytes of shared output credit.
 Authentication, error and control replies use a separate 16777216-byte output reserve, and SHOW CONNECTIONS listings another of the same size, so slow readers of listings cannot hold the reserve that logins and refusals are answered from.
