@@ -1,5 +1,6 @@
 #include "server_poller.hpp"
 
+#include <algorithm>
 #include <array>
 #include <cerrno>
 #include <limits>
@@ -237,12 +238,21 @@ void ReadinessPoller::Apply(std::uint64_t token, Registration& current, short ev
             }
             descriptors_.pop_back();
             tokens_.pop_back();
-            index_.erase(token);
+            index_.erase(found);
         }
     } else if (found == index_.end()) {
-        if (descriptors_.size() > std::numeric_limits<std::uint32_t>::max() - 1U)
+        constexpr auto limit = std::numeric_limits<std::uint32_t>::max();
+        const auto at = descriptors_.size();
+        if (at >= limit)
             throw std::invalid_argument("socket poller descriptor capacity exceeded");
-        index_.emplace(token, descriptors_.size());
+        // Grow both arrays before publishing an index. Allocation failure
+        // can change capacity, but must leave the active entries aligned.
+        if (at == descriptors_.capacity() || at == tokens_.capacity()) {
+            const auto capacity = at + std::min(at, static_cast<std::size_t>(limit) - at);
+            descriptors_.reserve(capacity);
+            tokens_.reserve(capacity);
+        }
+        index_.emplace(token, at);
         descriptors_.push_back({current.socket, events, 0});
         tokens_.push_back(token);
     } else {

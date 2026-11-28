@@ -1,18 +1,39 @@
+#include "server_deadlines.hpp"
 #include "server_poller.hpp"
 
-#include <algorithm>
 #include <array>
-#include <memory>
-#include <vector>
 #include <cassert>
 #include <cstdio>
+#include <cstdlib>
 #include <future>
 #include <limits>
+#include <memory>
+#include <new>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 #ifndef _WIN32
 #include <sys/resource.h>
+#endif
+
+#if !defined(CHUNKDB_POLLER_EPOLL) && !defined(CHUNKDB_POLLER_KQUEUE)
+// Fail one allocation on the calling thread, as in the WAL memory tests.
+namespace allocation { thread_local long fail_after = -1; }
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void* operator new(std::size_t bytes) {
+    if (allocation::fail_after == 0) { allocation::fail_after = -1; throw std::bad_alloc(); }
+    if (allocation::fail_after > 0) --allocation::fail_after;
+    if (auto* memory = std::malloc(bytes == 0U ? 1U : bytes)) return memory;
+    throw std::bad_alloc();
+}
+#if defined(__GNUC__)
+__attribute__((noinline))
+#endif
+void operator delete(void* memory) noexcept { std::free(memory); }
+void operator delete(void* memory, std::size_t) noexcept { ::operator delete(memory); }
 #endif
 
 namespace {
@@ -243,29 +264,85 @@ void RegisteredReadiness() {
     assert(refused);
 }
 
-// More ready sockets than one wait reports are reported by the next waits.
+// More ready sockets than one kernel batch are reported by the next waits.
 void ManyReady() {
-    constexpr std::size_t kCount = 40U;
+    constexpr std::size_t kCount = 257U; // epoll and kqueue take up to 256 events per wait.
     std::vector<std::unique_ptr<Loopback>> connections;
     ReadinessPoller poller;
     std::vector<ReadinessPoller::Ready> ready;
     for (std::size_t i = 0U; i < kCount; ++i) {
         connections.push_back(std::make_unique<Loopback>());
-        poller.Set(i + 1U, connections.back()->reader, POLLIN);
-        assert(send(connections.back()->writer, "m", 1, 0) == 1);
+        poller.Set(i + 1U, connections.back()->reader, POLLOUT);
     }
-    std::vector<bool> seen(kCount + 1U, false);
-    for (std::size_t round = 0U; round < 100U && std::count(seen.begin() + 1, seen.end(), true) < static_cast<std::ptrdiff_t>(kCount); ++round) {
-        (void)poller.Wait(1000, ready);
+    std::array<bool, kCount> seen{};
+    std::size_t reported = 0U;
+    while (reported < kCount) {
+        assert(poller.Wait(5000, ready) && !ready.empty());
+#if defined(CHUNKDB_POLLER_EPOLL) || defined(CHUNKDB_POLLER_KQUEUE)
+        if (reported == 0U) assert(ready.size() < kCount);
+#endif
         for (const auto& entry : ready) {
-            assert(entry.token >= 1U && entry.token <= kCount && (entry.events & POLLIN) != 0);
-            char byte = 0;
-            if (!seen[entry.token]) assert(recv(connections[entry.token - 1U]->reader, &byte, 1, 0) == 1);
-            seen[entry.token] = true;
+            assert(entry.token >= 1U && entry.token <= kCount && (entry.events & POLLOUT) != 0);
+            const auto index = static_cast<std::size_t>(entry.token - 1U);
+            assert(!seen[index]);
+            seen[index] = true;
+            ++reported;
+            poller.Remove(entry.token);
         }
     }
-    assert(std::count(seen.begin() + 1, seen.end(), true) == static_cast<std::ptrdiff_t>(kCount));
+    assert(poller.registered() == 0U);
 }
+
+void DeadlineUpdatesStayBounded() {
+    ConnectionDeadlines::Entry first{1U}, active{2U}, other{3U};
+    ConnectionDeadlines deadlines;
+    const auto base = Clock::time_point{};
+    using namespace std::chrono_literals;
+    deadlines.Set(first, base + 1ms);
+    deadlines.Set(other, base + 2ms);
+    for (int step = 3; step < 1000; ++step) {
+        deadlines.Set(active, base + std::chrono::milliseconds(step));
+        assert(deadlines.size() == 3U);
+        assert(deadlines.Next() == base + 1ms);
+    }
+
+    deadlines.Set(active, base);
+    assert(!deadlines.TakeDue(base - 1ms));
+    assert(deadlines.TakeDue(base) == 2U);
+    deadlines.Set(active, base);
+    deadlines.Set(active, base + 3ms);
+    assert(deadlines.TakeDue(base + 1ms) == 1U);
+    deadlines.Set(other, Clock::time_point::max());
+    assert(deadlines.Next() == base + 3ms);
+    deadlines.Remove(active);
+    assert(deadlines.size() == 0U && !deadlines.Next());
+}
+
+#if !defined(CHUNKDB_POLLER_EPOLL) && !defined(CHUNKDB_POLLER_KQUEUE)
+void RegistrationAllocationFailure() {
+    Loopback connection;
+    std::vector<ReadinessPoller::Ready> ready;
+    for (long fail_after = 0; fail_after < 16; ++fail_after) {
+        ReadinessPoller poller;
+        bool failed = false;
+        allocation::fail_after = fail_after;
+        try { poller.Set(1U, connection.reader, POLLOUT); }
+        catch (const std::bad_alloc&) { failed = true; }
+        allocation::fail_after = -1;
+        if (failed) {
+            poller.Forget(1U);
+            assert(poller.registered() == 0U && !poller.Wait(0, ready));
+            poller.Set(1U, connection.reader, POLLOUT);
+        }
+        assert(poller.Wait(5000, ready) && Reported(ready, 1U, POLLOUT));
+        if (!failed) {
+            assert(fail_after > 0);
+            return;
+        }
+    }
+    assert(false && "registration must succeed after all allocation sites are covered");
+}
+#endif
 
 void HighDescriptor() {
 #ifndef _WIN32
@@ -304,7 +381,11 @@ int main() {
     HighDescriptor();
     RegisteredReadiness();
     ManyReady();
-    std::puts("poller passed: bounded lists, coalesced publication, reported drains, readiness, close, ownership, high descriptors");
+    DeadlineUpdatesStayBounded();
+#if !defined(CHUNKDB_POLLER_EPOLL) && !defined(CHUNKDB_POLLER_KQUEUE)
+    RegistrationAllocationFailure();
+#endif
+    std::puts("poller passed: bounded lists, coalesced publication, reported drains, readiness, close, ownership, high descriptors, deadlines");
 #ifdef _WIN32
     WSACleanup();
 #endif

@@ -2,15 +2,14 @@
 
 #include "chunkdb/logging.hpp"
 #include "proxy_protocol.hpp"
+#include "server_deadlines.hpp"
 #include "server_feed.hpp"
 #include "server_tls.hpp"
 #include "source_address.hpp"
 
 #include <algorithm>
 #include <climits>
-#include <functional>
 #include <limits>
-#include <queue>
 #include <unordered_map>
 
 namespace chunkdb {
@@ -920,15 +919,16 @@ void IdleIo::Run() {
     using Clock = std::chrono::steady_clock;
     using Phase = ServerConnection::Phase;
     struct Owned {
+        Owned(std::shared_ptr<ServerConnection> client, std::uint64_t token)
+            : connection(std::move(client)), deadline(token) {}
         std::shared_ptr<ServerConnection> connection;
-        // The earliest deadline last queued for it; max while none is.
-        Clock::time_point due = Clock::time_point::max();
+        ConnectionDeadlines::Entry deadline;
     };
-    // The connections this thread owns, by poller token; a token is never reused.
+    // The connections this thread owns, by poller token. The map keeps timer
+    // entries at stable addresses even when it rehashes.
     std::unordered_map<std::uint64_t, Owned> clients;
+    ConnectionDeadlines deadlines;
     std::uint64_t next_token = 0U;
-    using Due = std::pair<Clock::time_point, std::uint64_t>;
-    std::priority_queue<Due, std::vector<Due>, std::greater<>> deadlines;
     // serve: this pass. waiting: a queue refusal or line credit, retried on
     // every pass. immediate: buffered input or granted credit, served by a
     // pass that does not wait.
@@ -944,7 +944,7 @@ void IdleIo::Run() {
     const auto own = [&](std::shared_ptr<ServerConnection> connection) {
         const auto token = ++next_token;
         connection->io_token = token;
-        clients.emplace(token, Owned{std::move(connection)});
+        clients.try_emplace(token, std::move(connection), token);
         serve.push_back(token);
     };
     const auto mark = [&](const std::shared_ptr<ServerConnection>& connection, std::vector<std::uint64_t>& into) {
@@ -966,8 +966,7 @@ void IdleIo::Run() {
         if (connection.output_deadline) until(*connection.output_deadline);
         if (connection.waiting_credit && connection.credit_deadline) until(*connection.credit_deadline);
         else if (connection.phase == Phase::kInput && !connection.input_deadline) until(connection.idle_deadline);
-        if (due != owned.due && due != Clock::time_point::max()) deadlines.push({due, token});
-        owned.due = due;
+        deadlines.Set(owned.deadline, due);
         if (parked) waiting.push_back(token);
         if (connection.read_ready && !connection.waiting_credit && connection.phase == Phase::kInput)
             immediate.push_back(token);
@@ -999,14 +998,8 @@ void IdleIo::Run() {
             waiting.clear();
             serve.insert(serve.end(), immediate.begin(), immediate.end());
             immediate.clear();
-            for (const auto now = Clock::now(); !deadlines.empty() && deadlines.top().first <= now;) {
-                const auto [at, token] = deadlines.top();
-                deadlines.pop();
-                const auto found = clients.find(token);
-                if (found == clients.end() || found->second.due != at) continue;
-                found->second.due = Clock::time_point::max();
-                serve.push_back(token);
-            }
+            const auto due_now = Clock::now();
+            while (const auto token = deadlines.TakeDue(due_now)) serve.push_back(*token);
             std::sort(serve.begin(), serve.end());
             serve.erase(std::unique(serve.begin(), serve.end()), serve.end());
             for (const auto token : serve) {
@@ -1026,6 +1019,7 @@ void IdleIo::Run() {
                 }
                 // Handed on, which Serve took out of the wait first, or closed.
                 poller_.Forget(token);
+                deadlines.Remove(found->second.deadline);
                 clients.erase(found);
             }
             serve.clear();
@@ -1039,13 +1033,7 @@ void IdleIo::Run() {
                 const auto bounded = static_cast<int>(std::clamp<std::int64_t>(remaining, 0, INT_MAX));
                 timeout = timeout < 0 ? bounded : std::min(timeout, bounded);
             };
-            // Entries a later step replaced are dropped on the way to the earliest current one.
-            while (!deadlines.empty()) {
-                const auto found = clients.find(deadlines.top().second);
-                if (found != clients.end() && found->second.due == deadlines.top().first) break;
-                deadlines.pop();
-            }
-            if (!deadlines.empty()) wait_until(deadlines.top().first);
+            if (const auto deadline = deadlines.Next()) wait_until(*deadline);
             for (const auto& tracked : statements_)
                 if (const auto deadline = tracked.statement->deadline(); deadline && *deadline > now) wait_until(*deadline);
             if (!immediate.empty()) timeout = 0;

@@ -8,8 +8,11 @@ The [concurrency rules](CONCURRENCY.md) and [durability contract](../DURABILITY_
 Each connection owns its socket, TLS state, input buffer, session and transaction independently of any worker stack.
 Exactly one owner may access its socket or TLS object at a time.
 An I/O owner handles idle sockets, partial input, TLS handshakes, authentication replies and output readiness.
-The I/O owner keeps each socket it owns registered with a readiness poller (epoll on Linux, kqueue on macOS and FreeBSD, one kept poll array elsewhere) while its interest is unchanged, and each pass serves only the connections reported ready, those whose earliest deadline is due, those another thread changed (KILL, a stopped statement, granted input credit) and those waiting for queue space or line credit; an idle connection costs nothing until one of these happens.
-A connection waiting for nothing on its socket (queued for a worker, waiting for credit, or holding a delayed login reply) leaves the poller until its interest returns, and one handed to a worker or the feed leaves it before the next wait.
+The I/O owner keeps socket interest registered with epoll on Linux and kqueue on macOS and FreeBSD, and reuses a poll array elsewhere.
+It serves connections with readiness events, due deadlines, buffered input or a state change, and retries connections waiting for queue space or line credit when it wakes.
+The heap holds only the earliest deadline for each connection, and the portable poll array is still scanned on each wait.
+A connection waiting for nothing on its socket (queued for a worker, waiting for credit, or holding a delayed login reply) leaves the poller until its interest returns.
+The socket is removed from the readiness poller before a handoff to a worker or the feed owner.
 A statement worker receives a fully framed request and returns the resulting output continuation.
 The worker that wrote a reply waits for that connection's next request while no queued request needs a worker; a queued request, KILL, shutdown and the idle deadline return or close the connection, and incomplete input returns it to the I/O owner.
 On a plain POSIX socket that wait starts with one blocking receive bounded by 2 ms, the single system call per request that main's worker makes; the socket stays blocking with 2 ms receive and send timeouts, set once, while the worker keeps the connection, and is nonblocking again before the I/O owner gets it back.
