@@ -1338,7 +1338,8 @@ void TableCatalog::RaiseVersionFloor(std::uint64_t floor) {
     version_floor_ = floor;
 }
 
-void TableCatalog::RecordNameFloor(const std::filesystem::path& dir) {
+void TableCatalog::RecordNameFloor(const std::filesystem::path& dir, bool* uncertain) {
+    if (uncertain) *uncertain = false;
     auto manifest = ReadOpenableManifest(dir);
     ChunkStore::RequireWritableNameFloor(std::max(version_floor_, manifest.name_floor));
     if (version_floor_ <= manifest.name_floor) {
@@ -1348,14 +1349,20 @@ void TableCatalog::RecordNameFloor(const std::filesystem::path& dir) {
     if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_NAME_FLOOR_WRITE_FAIL_ONCE")) {
         throw std::runtime_error("injected name floor write failure");
     }
-    AtomicWrite(
-        StoreManifestPath(dir),
-        SerializeStoreManifest(manifest),
-        /*fsync_file=*/true,
-        /*fsync_directory=*/true,
-        /*out_replaced=*/nullptr,
-        /*after_rename_failpoint=*/nullptr,
-        /*enable_generic_failpoints=*/false);
+    bool replaced = false;
+    try {
+        AtomicWrite(
+            StoreManifestPath(dir),
+            SerializeStoreManifest(manifest),
+            /*fsync_file=*/true,
+            /*fsync_directory=*/true,
+            &replaced,
+            /*after_rename_failpoint=*/nullptr,
+            /*enable_generic_failpoints=*/false);
+    } catch (const std::exception&) {
+        if (uncertain) *uncertain = replaced;
+        throw;
+    }
 }
 
 void TableCatalog::RemoveInterruptedOperations(std::string_view table) {

@@ -148,7 +148,8 @@ TableRestoreResult TableCatalog::RestoreTable(const TableRestoreRequest& request
         // The copied chunks keep their versions, which may equal versions a
         // table dropped or renamed away under this name gave: they report the
         // name floor, recorded in the copy under the catalog's table
-        // operations, which keep the version floor where it is.
+        // operations, which keep the version floor where it is. The copy is
+        // still private, and any store that serves it opens from its manifest.
         RecordNameFloor(staging);
         CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RESTORE_TABLE_AFTER_NAME_FLOOR_ONCE");
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RESTORE_TABLE_PUBLISH_FAIL_ONCE"))
@@ -220,6 +221,7 @@ namespace {
 constexpr const char* kFenceSwapUnknown = "a failed swap could not make its exchange durable";
 constexpr const char* kFenceSwapReopen = "a swap could not open it under its new name";
 constexpr const char* kFenceSwapRefusedReopen = "a refused swap could not reopen it";
+constexpr const char* kFenceNameFloorUnknown = "a name floor replacement could not be made durable";
 constexpr const char* kWatchSwapped = "watched table was swapped; watch it again";
 
 // `path` below `from`, moved below `to`; any other path unchanged.
@@ -293,20 +295,13 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
     for (auto& store : stores) store->WalBarrier();
     // Neither name may issue a token the other table issued: the version
     // floor rises above both clocks durably before the exchange, and each
-    // table opens at it under its new name. A failure here serves both
-    // tables as they were.
+    // table opens above it under its new name.
     const auto floor = std::max({version_floor_,
         stores[0]->version_clock_ceiling_.load(std::memory_order_acquire),
         stores[1]->version_clock_ceiling_.load(std::memory_order_acquire)});
     ChunkStore::RequireWritableNameFloor(floor);
     RaiseVersionFloor(floor);
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_VERSION_FLOOR_ONCE");
-    // Their existing chunks keep their versions, which may equal versions
-    // the other table gave under the name: each records the floor as its
-    // name floor, which those chunks then report. Neither store reads its
-    // manifest again before it opens under its new name.
-    for (const auto& table : tables) RecordNameFloor(table->dir_);
-    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_NAME_FLOOR_ONCE");
     const std::array<std::filesystem::path, 2U> dirs{tables[0]->dir_, tables[1]->dir_};
     // Made now, so that fencing does not allocate.
     std::array<FenceNode, 2U> fences{PrepareFence(tables[0], names[0], kFenceSwapUnknown),
@@ -324,8 +319,8 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
         const auto start = store.FeedStartClock(store.version_clock_.load(std::memory_order_seq_cst));
         if (store.lineage_ && store.lineage_->fork_revision == start - 1U) fork_starts[i] = start;
     }
-    // A stop accepted until here leaves both tables serving as they were;
-    // after it the statement reports its real outcome.
+    // Accept a stop before changing either table manifest. Once closed, any
+    // table served again reads its floor from disk even if the exchange fails.
     EnterStatementDecision();
     serving.Dismiss();
     for (std::size_t i = 0; i < stores.size(); ++i) {
@@ -355,9 +350,12 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
     // consumer must resync. The marks are durable before the exchange, so no
     // crash loses them; a crash before it leaves only an extra resync.
     std::array<std::optional<FeedSlotRecords>, 2U> slot_records;
+    std::array<bool, 2U> uncertain_floor{};
     std::error_code exchanged;
     std::exception_ptr failure;
     try {
+        for (std::size_t i = 0; i < dirs.size(); ++i) RecordNameFloor(dirs[i], &uncertain_floor[i]);
+        CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_SWAP_TABLES_AFTER_NAME_FLOOR_ONCE");
         for (std::size_t i = 0; i < dirs.size(); ++i)
             slot_records[i] = RequireSlotResync(dirs[i], tables[i]->store_id(), tables[i]->geometry().dims());
         if (ConsumeFailpointEnv("CHUNKDB_FAILPOINT_SWAP_TABLES_SLOT_MARK_FAIL_ONCE"))
@@ -369,8 +367,13 @@ void TableCatalog::SwapTables(std::string_view first, std::string_view second, s
         failure = std::current_exception();
     }
     if (exchanged || failure) {
-        // Nothing moved: both tables serve again as they were.
+        // Nothing moved. The old names reopen with any recorded floors.
         for (std::size_t i = 0; i < stores.size(); ++i) {
+            if (uncertain_floor[i]) {
+                fences[i].mapped().reason = kFenceNameFloorUnknown;
+                FenceTable(*tables[i], options[i], std::move(fences[i]));
+                continue;
+            }
             if (slot_records[i]) {
                 try {
                     WriteFeedSlotRecords(dirs[i], *slot_records[i]);
@@ -493,15 +496,11 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     // this table's tokens, and this table must not issue those of a table
     // dropped under the new name. The version floor rises above this clock
     // durably before the rename, and the table opens at it under its new
-    // name. A failure here serves the table unchanged.
+    // name.
     const auto floor = std::max(version_floor_, store->version_clock_ceiling_.load(std::memory_order_acquire));
     ChunkStore::RequireWritableNameFloor(floor);
     RaiseVersionFloor(floor);
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_VERSION_FLOOR_ONCE");
-    // Its existing chunks keep their versions, which may equal versions a
-    // table dropped under the new name gave: they report the name floor.
-    RecordNameFloor(table->dir_);
-    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_NAME_FLOOR_ONCE");
     const std::filesystem::path old_dir = table->dir_;
     const std::filesystem::path new_dir = TablesDir() / to;
     // Made now, so that fencing and publishing do not allocate.
@@ -510,8 +509,7 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     auto entry = PrepareServed(to);
     const auto unsynced = std::make_shared<ChunkStore::UnsyncedArtifacts>();
     const std::string store_dir = store->data_dir().string();
-    // A stop accepted until here leaves the table serving under its name;
-    // after it the statement reports its real outcome.
+    // Accept a stop before changing the grants or the table manifest.
     EnterStatementDecision();
     // The grants move first: a crash from here leaves them on both names,
     // never on neither. A failure here still serves the table unchanged.
@@ -537,12 +535,26 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     serving.Dismiss();
     store->HandOverUnsyncedOnClose(unsynced);
     store.reset();
-    CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_BEFORE_RENAME_ONCE");
-    const auto moved = ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_ONCE")
-        ? std::make_error_code(std::errc::io_error) : MoveDirectoryNoReplace(old_dir, new_dir);
-    if (moved) {
-        // Nothing moved: the table serves again under its name.
+    bool uncertain_floor = false;
+    std::error_code moved;
+    std::exception_ptr failure;
+    try {
+        RecordNameFloor(old_dir, &uncertain_floor);
+        CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_AFTER_NAME_FLOOR_ONCE");
+        CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_RENAME_TABLE_BEFORE_RENAME_ONCE");
+        moved = ConsumeFailpointEnv("CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_ONCE")
+            ? std::make_error_code(std::errc::io_error) : MoveDirectoryNoReplace(old_dir, new_dir);
+    } catch (const std::exception&) {
+        failure = std::current_exception();
+    }
+    if (moved || failure) {
+        // Nothing moved. The old name reopens with any recorded floor.
         if (users) take_back_grants();
+        if (uncertain_floor) {
+            old_fence.mapped().reason = kFenceNameFloorUnknown;
+            FenceTable(*table, options, std::move(old_fence));
+            std::rethrow_exception(failure);
+        }
         try {
             auto reopened = OpenStore(from, old_dir, table->geometry().config(), 0U, options);
             reopened->AdoptUnsynced(*unsynced);
@@ -553,6 +565,7 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
                 {{"table", from}, {"error", error.what()}});
             FenceTable(*table, options, std::move(old_fence));
         }
+        if (failure) std::rethrow_exception(failure);
         if (moved == std::errc::file_exists)
             throw TableExistsError("cannot rename table '" + from + "': " + new_dir.string() +
                 " exists but is not a table this server opened");

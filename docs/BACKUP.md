@@ -93,6 +93,7 @@ The backed-up table must have `table_lineage`, the table features this directory
 SWAP TABLES then exchanges the names atomically, and DROP TABLE removes the replaced data now under the other name.
 A consumer of `world` then sees the restored epoch and resumes by its [lineage](CHANGE_FEED.md) or receives resync.
 After the swap, `world` reports each unchanged chunk at a version above every version it gave before, so an IF VERSION write with a version read before the swap is refused; read the chunk again first.
+SWAP TABLES, ALTER TABLE ... RENAME TO or RESTORE TABLE can invalidate earlier versions even if the statement fails, so read the chunk again before retrying a conditional write.
 See [Tables](reference/TABLES.md) for SWAP TABLES.
 
 ## Contents and space

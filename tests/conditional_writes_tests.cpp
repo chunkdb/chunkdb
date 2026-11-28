@@ -4,6 +4,7 @@
 // concurrent writers.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -21,6 +22,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
 #include "test_utils.hpp"
+#include "txn_test_utils.hpp"
 #include "../src/sectioned_chunk_form.hpp"
 
 namespace {
@@ -80,15 +82,22 @@ struct Fixture {
     SessionState session;
 
     explicit Fixture(chunkdb::QueryLimits limits = {}) {
+        Open(limits);
+        ExpectReply(Run("CREATE TABLE bank (coins u16, bonus i8 NULL, rate f32 NULL, name text(8) NULL, a u8, b u8) "
+                        "CHUNK 4 x 4 CHUNK COLUMNS (status u8 DEFAULT 0)"),
+                    "+OK\r\n");
+    }
+
+    void Open(chunkdb::QueryLimits limits = {}) {
+        session = SessionState{};
+        engine.reset();
+        catalog.reset();
         chunkdb::CatalogConfig config;
         config.data_dir = dir.path();
         config.query_limits = limits;
         catalog = std::make_shared<chunkdb::TableCatalog>(config);
         engine = std::make_unique<CommandEngine>(chunkdb::EngineConfig{.require_auth = false, .server_version = "test"}, catalog);
         Hello(session);
-        ExpectReply(Run("CREATE TABLE bank (coins u16, bonus i8 NULL, rate f32 NULL, name text(8) NULL, a u8, b u8) "
-                        "CHUNK 4 x 4 CHUNK COLUMNS (status u8 DEFAULT 0)"),
-                    "+OK\r\n");
     }
 
     void Hello(SessionState& state) const {
@@ -547,6 +556,49 @@ void TestNameFloorScanSinceTombstone() {
     assert(caught_up.starts_with("%5\r\n$6\r\nchunks\r\n*0\r\n"));
 }
 
+// Use a different chunk after reopening so it still holds its original data.
+void TestFailedNameMoveVersions(bool swap, const char* point, bool raised) {
+    Fixture f;
+    if (swap) ExpectReply(f.Run("CREATE TABLE other (coins u16) CHUNK 4 x 4"), "+OK\r\n");
+    const std::array<std::string, 2U> names{"bank", "other"};
+    const std::array<std::string, 2U> coords{"0 0", "4 0"};
+    const std::size_t count = swap ? names.size() : 1U;
+    std::array<std::array<std::uint64_t, 2U>, 2U> saved{};
+    std::array<std::uint64_t, 2U> floors{};
+    for (std::size_t i = 0U; i < count; ++i) {
+        for (std::size_t j = 0U; j < coords.size(); ++j) {
+            (void)VersionOf(f.Run("SET BLOCK " + coords[j] + " IN " + names[i] + " coins = " + std::to_string(i + 1U)));
+            saved[i][j] = VersionOf(f.Run("GET BLOCK " + coords[j] + " FROM " + names[i] + " WITH VERSION").substr(4));
+        }
+    }
+    {
+        txn_test::ScopedEnv fail(point, "1");
+        ExpectError(f.Run(swap ? "SWAP TABLES bank, other" : "ALTER TABLE bank RENAME TO moved"), "INTERNAL");
+    }
+    for (std::size_t j = 0U; j < coords.size(); ++j) {
+        assert(f.catalog->Find("moved") == nullptr && f.catalog->Fences().empty());
+        for (std::size_t i = 0U; i < count; ++i) {
+            const auto get = "GET BLOCK " + coords[j] + " FROM " + names[i] + " COLUMNS coins";
+            const auto set = "SET BLOCK " + coords[j] + " IN " + names[i] + " coins = 5 IF VERSION ";
+            const auto before = saved[i][j];
+            const auto current = VersionOf(f.Run(get + " WITH VERSION").substr(4));
+            const auto unchanged = "*1\r\n:" + std::to_string(i + 1U) + "\r\n";
+            if (raised) {
+                assert(current > before);
+                if (j == 0U) floors[i] = current;
+                else assert(current == floors[i]);
+                ExpectError(f.Run(set + std::to_string(before)), "VERSION_MISMATCH current=" + std::to_string(current));
+            } else {
+                assert(current == before);
+            }
+            ExpectReply(f.Run(get), unchanged);
+            assert(VersionOf(f.Run(set + std::to_string(current))) > current);
+            ExpectReply(f.Run(get), "*1\r\n:5\r\n");
+        }
+        if (j + 1U < coords.size()) f.Open();
+    }
+}
+
 // Under the chunk's lock the store decodes only the columns the decision
 // reads.
 void TestDecisionDecodesItsColumns() {
@@ -579,6 +631,14 @@ int main() {
     TestDecisionDecodesItsColumns();
     TestNameFloorVersions();
     TestNameFloorScanSinceTombstone();
+    TestFailedNameMoveVersions(false, "CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_ONCE", true);
+    TestFailedNameMoveVersions(false, "CHUNKDB_FAILPOINT_NAME_FLOOR_WRITE_FAIL_ONCE", false);
+    TestFailedNameMoveVersions(false, "CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", false);
+#ifndef _WIN32
+    TestFailedNameMoveVersions(true, "CHUNKDB_FAILPOINT_SWAP_TABLES_EXCHANGE_UNSUPPORTED_ONCE", true);
+    TestFailedNameMoveVersions(true, "CHUNKDB_FAILPOINT_NAME_FLOOR_WRITE_FAIL_ONCE", false);
+    TestFailedNameMoveVersions(true, "CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", false);
+#endif
     std::puts("conditional writes tests passed");
     return 0;
 }

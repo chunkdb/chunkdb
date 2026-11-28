@@ -221,6 +221,8 @@ A failure to make the rename durable fences both names until RECOVER TABLE of ea
 A failure to open the renamed table fences the new name until RECOVER TABLE; the old name is free and keeps no grants.
 RENAME TO is not taken inside [MIGRATE](MIGRATIONS.md).
 
+SWAP TABLES, ALTER TABLE ... RENAME TO or RESTORE TABLE can invalidate earlier versions even if the statement fails, so read the chunk again before retrying a conditional write.
+
 A failure that leaves a table out of service fences it, while other tables keep serving.
 Statements on that table return INTERNAL with the fenced message and its reason.
 A store that is fail-closed after a durability failure or a failed snapshot generation fences its table too: it still serves reads, and changes return INTERNAL while the server log holds the reason.

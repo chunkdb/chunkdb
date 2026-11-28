@@ -324,6 +324,44 @@ void InjectedFailures() {
     Verified(source.data);
 }
 
+void FailedRestoreNameFloor() {
+    Source source;
+    std::uint64_t stale = 0U;
+    {
+        TableCatalog catalog(source.Config());
+        stale = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
+        catalog.Drop("t");
+        for (const char* point : {"CHUNKDB_FAILPOINT_NAME_FLOOR_WRITE_FAIL_ONCE",
+                 "CHUNKDB_FAILPOINT_RESTORE_TABLE_PUBLISH_FAIL_ONCE"}) {
+            txn_test::ScopedEnv fail(point, "1");
+            assert(Throws([&] { (void)catalog.RestoreTable(source.Request("t")); }).find("injected") != std::string::npos);
+            assert(catalog.Find("t") == nullptr && catalog.Fences().empty());
+            assert(Entries(source.data / ".chunkdb.staging") == 0U);
+        }
+        {
+            txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_RESTORE_TABLE_OPEN_FAIL_ONCE", "1");
+            txn_test::ScopedEnv undo("CHUNKDB_FAILPOINT_RESTORE_TABLE_UNDO_FAIL_ONCE", "1");
+            assert(Throws([&] { (void)catalog.RestoreTable(source.Request("t")); }).find("opening a restored table") != std::string::npos);
+        }
+        assert(catalog.Find("t") == nullptr && catalog.Fence("t").has_value());
+        catalog.RecoverTable("t");
+        auto lease = catalog.Require("t")->Acquire();
+        auto& store = lease->store();
+        const auto floor = ReadStoreManifest(source.data / "tables/t")->name_floor;
+        const auto result = store.UnsetBlock(8, 0, stale);
+        assert(!result.ok && result.version == floor && floor > stale);
+        assert(store.GetBlockBits(8, 0) == "00000011" && store.GetChunkVersion(4, 0) == floor);
+    }
+    TableCatalog catalog(source.Config());
+    auto lease = catalog.Require("t")->Acquire();
+    auto& store = lease->store();
+    const auto floor = ReadStoreManifest(source.data / "tables/t")->name_floor;
+    const auto rejected = store.UnsetBlock(8, 0, stale);
+    assert(!rejected.ok && rejected.version == floor && store.GetBlockBits(8, 0) == "00000011");
+    const auto accepted = store.UnsetBlock(8, 0, store.GetChunkVersion(4, 0));
+    assert(accepted.ok && accepted.version > floor && !store.BlockExists(8, 0));
+}
+
 // RECOVER TABLE of a fenced name leaves the private copy of a restore still
 // copying into that name; that restore then finds the recovered table and is
 // refused, removing its copy itself.
@@ -548,6 +586,7 @@ void SwapRefusals() {
     }
     assert(catalog.Fences().empty());
     swapped.Check(false);
+    const auto before_sync_failure = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
     {
         // An exchange that cannot be synced leaves both names fenced; a
         // recovery opens what each directory holds.
@@ -558,6 +597,13 @@ void SwapRefusals() {
     catalog.RecoverTable("t");
     catalog.RecoverTable("t_restored");
     swapped.Check(true);
+    {
+        auto lease = catalog.Require("t")->Acquire();
+        auto& store = lease->store();
+        const auto result = store.UnsetBlock(8, 0, before_sync_failure);
+        assert(!result.ok && result.version > before_sync_failure && result.version == store.GetChunkVersion(4, 0));
+        assert(store.GetBlockBits(8, 0) == "00000011");
+    }
     {
         // A name whose table cannot open is fenced; the other serves.
         txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_SWAP_TABLES_OPEN_FAIL_ONCE", "1");
@@ -799,6 +845,7 @@ void RenameRefusals() {
     }
     assert(catalog.Fences().empty() && catalog.Find("t_new") == nullptr);
     CheckLive(source, catalog, "t");
+    const auto before_sync_failure = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
     {
         // A rename that cannot be synced fences both names, since a crash
         // could still undo it; a recovery opens what each directory holds.
@@ -809,6 +856,13 @@ void RenameRefusals() {
     Throws<TableFencedError>([&] { (void)catalog.Create("t", geometry, catalog.default_options()); });
     catalog.RecoverTable("t_new");
     CheckLive(source, catalog, "t_new");
+    {
+        auto lease = catalog.Require("t_new")->Acquire();
+        auto& store = lease->store();
+        const auto result = store.UnsetBlock(8, 0, before_sync_failure);
+        assert(!result.ok && result.version > before_sync_failure && result.version == store.GetChunkVersion(4, 0));
+        assert(store.GetBlockBits(8, 0) == "11111111");
+    }
     assert(catalog.Fence("t"));
     catalog.RecoverTable("t");
     assert(catalog.Fences().empty() && catalog.Find("t") == nullptr && catalog.TableCount() == 2U);
@@ -854,6 +908,7 @@ int main() {
     Refusals();
     DamagedBackups();
     InjectedFailures();
+    FailedRestoreNameFloor();
     RecoverLeavesRunningRestore();
     Cancellation();
     StatementStops();
