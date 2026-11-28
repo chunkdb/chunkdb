@@ -571,7 +571,7 @@ Times are positive and fit a signed protocol integer; record order is append ord
 Statements are nonempty UTF-8, at most 65536 bytes, without CR/LF/NUL; completed-ledger decoding validates bytes without reparsing them as current CQL.
 MIGRATE preserves keyword case and interior whitespace after trimming its separator and trailing spaces/tabs, and requires one supported schema statement without parameter frames.
 
-`data_dir/chunkdb.migration.pending` is the durable redo decision, at most 64 MiB:
+`data_dir/chunkdb.migration.pending` stores the version-1 durable redo decision, at most 64 MiB:
 
 1. `CKMJ`, version `1:u16`, reserved zero `u16`, data-directory ID (16 bytes), one record encoded as above.
 2. Directory action `u8` (0 none, 1 create, 2 drop), table length `u32` and name, table StoreId (16 bytes), operation-name length `u32` and name.
@@ -605,10 +605,12 @@ DROP TABLE and ALTER TABLE ... RENAME TO outside MIGRATE use format version 2 fo
 
 1. `CKMJ`, version `2:u16`, reserved zero `u16`, data-directory ID (16 bytes); no record.
 2. Directory action `u8` (2 drop, 3 rename), table length `u32` and name, table StoreId (16 bytes), operation-name length `u32` and name: `<table>.<16 lowercase hex digits>` under `.chunkdb.dropped/` for a drop, the new table name for a rename.
-3. Participant count `u32` (0 or 1): only `chunkdb.users`, with its before-image, encoded as in version 1 with the same 16 MiB limit per image.
+3. Participant count `u32` (0 or 1): only `chunkdb.users`, with its before-image, encoded as in version 1 with each image bounded by the users-file limit of 64 MiB.
 4. CRC32 over all preceding bytes.
 
 It needs no `migrations` feature and has no ledger. A build that reads only version 1 refuses it and does not open the directory.
+The maximum version-2 record size is twice the users-file limit plus the maximum encoded record metadata, including the checksum.
+Readers check the version-specific file bound and reject image lengths that exceed the users-file limit or the remaining record bytes before allocating an image.
 The journal is synced before the directory move, and the move, not the journal, commits the operation; the table directory and the moved name must hold exactly one table of the journal's identity.
 After the move and its directory sync, the server publishes the grants to any live users registry, writes the users file and removes the journal.
 If the move was refused, the server removes the journal.

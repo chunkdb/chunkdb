@@ -1129,7 +1129,9 @@ void VerifyDataDirectoryImpl(const std::filesystem::path& data_dir, VerifyCounte
             try {
                 if (!std::filesystem::is_regular_file(entry.symlink_status()))
                     throw std::runtime_error("users record is not a regular file");
-                (void)chunkdb::DecodeUsers(chunkdb::LoadFile(entry.path()));
+                const auto image = chunkdb::ReadUsersFileImage(data_dir);
+                if (!image) throw std::runtime_error("users record disappeared");
+                chunkdb::ValidateUsersImage(*image);
             } catch (const std::exception& error) {
                 Report(counters, true, "users_invalid", entry.path(), error.what());
             }

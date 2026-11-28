@@ -543,6 +543,34 @@ void CatalogOperationJournal() {
     RecoverMigrations(fixture.root, AccessMode::kReadWrite);
     assert(!ReadMigrationJournal(fixture.root) && std::filesystem::exists(fixture.root / "tables/default"));
     assert(LoadFile(fixture.root / std::string(kUsersFileName)) == users_after);
+
+    // The decoder checks both length fields before allocating. A length can
+    // exceed the configured image limit or be within it and exceed the file.
+    const auto before_length = 8U + 16U + 1U + 4U + journal.table.size() + 16U +
+        4U + journal.operation_name.size() + 4U + 4U + journal.files.front().path.size() + 1U;
+    const auto after_length = before_length + 4U + users_before.size();
+    for (const auto length_at : {before_length, after_length}) {
+        for (const auto length : {kMaxUsersFileBytes + 1U, kMaxUsersFileBytes}) {
+            auto damaged = encoded;
+            for (std::size_t byte = 0; byte < 4U; ++byte)
+                damaged[length_at + byte] = static_cast<std::uint8_t>(length >> (8U * byte));
+            Checksum(damaged);
+            const auto pending = fixture.root / kMigrationPendingFileName;
+            Save(pending, damaged);
+            const std::string_view reason = length > kMaxUsersFileBytes ? "field size" : "truncated field";
+            std::string recovery_error;
+            try {
+                RecoverMigrations(fixture.root, AccessMode::kReadWrite);
+            } catch (const std::runtime_error& error) {
+                recovery_error = error.what();
+            }
+            assert(recovery_error.find(reason) != std::string::npos);
+            const auto [counters, findings] = fixture.Verify();
+            assert(counters.errors != 0U && findings.find("migration_pending_invalid") != std::string::npos &&
+                   findings.find(reason) != std::string::npos);
+            assert(LoadFile(pending) == damaged && LoadFile(fixture.root / kUsersFileName) == users_after);
+        }
+    }
 }
 }  // namespace
 

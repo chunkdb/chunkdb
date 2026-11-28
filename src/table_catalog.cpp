@@ -1160,7 +1160,7 @@ TableCatalog::TableCatalog(CatalogConfig config)
     }
     config_.data_dir = std::filesystem::weakly_canonical(config_.data_dir);
     // Read-only admission must precede any writer-lock or recovery records.
-    (void)ReadUsersFile(config_.data_dir);
+    if (const auto users = ReadUsersFileImage(config_.data_dir)) ValidateUsersImage(*users);
     if (config_.feed_buffer_bytes == 0U) throw std::invalid_argument("feed_buffer_bytes must be positive");
     if (config_.slot_max_bytes == 0U) throw std::invalid_argument("slot_max_bytes must be positive");
     if (config_.feed_linger.count() < 0 || config_.feed_linger.count() > std::numeric_limits<std::int32_t>::max())
@@ -1985,7 +1985,7 @@ struct TableCatalog::GrantJournal {
 };
 
 std::shared_ptr<TableCatalog::GrantJournal> TableCatalog::PrepareGrantJournal(UserRegistry* users, const Table& table,
-    bool rename, const std::string& operation, const std::function<void(Users&)>& change) {
+    bool rename, const std::string& operation, const std::function<bool(Users&)>& change) {
     std::shared_ptr<GrantJournal> prepared;
     if (users) {
         if (!std::filesystem::equivalent(users->data_dir_, config_.data_dir))
@@ -2000,12 +2000,10 @@ std::shared_ptr<TableCatalog::GrantJournal> TableCatalog::PrepareGrantJournal(Us
     // The on-disk grants still follow their tables while authentication is disabled.
     auto before = ReadUsersFileImage(config_.data_dir);
     if (!before) return nullptr;
-    const auto disk = DecodeUsers(*before);
-    if (users && users->users_ != disk)
-        users->CommitPublication(disk, users->PreparePublication(std::make_shared<const Users>(disk)), prepared->wakes);
-    auto next = disk;
-    change(next);
-    if (next == disk) return nullptr;
+    auto next = DecodeUsers(*before);
+    if (users && users->users_ != next)
+        users->CommitPublication(next, users->PreparePublication(std::make_shared<const Users>(next)), prepared->wakes);
+    if (!change(next)) return nullptr;
     if (config_.allow_multiple_processes)
         throw std::invalid_argument("changing table grants requires a single-process catalog");
     if (!prepared) prepared = std::make_shared<GrantJournal>(nullptr);
@@ -2188,7 +2186,11 @@ void TableCatalog::Drop(std::string_view name, UserRegistry* users, bool if_exis
     // name follows the whole drop.
     const auto operation = UniqueOperationName(table->name_);
     const auto grants = PrepareGrantJournal(users, *table, /*rename=*/false, operation, [&](Users& next) {
-        for (auto& [_, user] : next.users) user.grants.erase(table->name_);
+        bool changed = false;
+        for (auto& [_, user] : next.users) {
+            if (user.grants.erase(table->name_) != 0U) changed = true;
+        }
+        return changed;
     });
     if (grants) WriteGrantJournal(*grants);
     CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_TABLE_DROP_AFTER_JOURNAL_ONCE");

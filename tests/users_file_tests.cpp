@@ -557,6 +557,32 @@ void TestFieldBounds() {
     ExpectInvalid([&] { (void)chunkdb::EncodeUsers(long_table); }, "longer than 65535 bytes");
 }
 
+void TestValidationChecksUnorderedDuplicates() {
+    const auto first = RawUsersFile({.name = "zeta"});
+    const auto second = RawUsersFile({.name = "alpha"});
+    constexpr std::size_t header_bytes = 44U;
+    constexpr std::size_t checksum_bytes = 4U;
+    auto bytes = first;
+    bytes[header_bytes - 4U] = 2U;
+    bytes.insert(bytes.end() - checksum_bytes, second.begin() + header_bytes, second.end() - checksum_bytes);
+    RefreshChecksum(bytes);
+    chunkdb::ValidateUsersImage(bytes);
+    bytes[header_bytes - 4U] = 3U;
+    bytes.insert(bytes.end() - checksum_bytes, first.begin() + header_bytes, first.end() - checksum_bytes);
+    RefreshChecksum(bytes);
+    ExpectInvalid([&] { chunkdb::ValidateUsersImage(bytes); }, "repeats user");
+
+    auto grants = RawUsersFile({});
+    constexpr std::size_t grant_bytes = 2U + 5U + 1U; // length, "world", right
+    const auto grant_begin = grants.size() - checksum_bytes - 16U - grant_bytes;
+    const auto grant_end = grant_begin + grant_bytes;
+    const std::vector<std::uint8_t> same(grants.data() + grant_begin, grants.data() + grant_end);
+    grants.insert(grants.begin() + static_cast<std::ptrdiff_t>(grant_end), same.begin(), same.end());
+    grants[grant_begin - 4U] = 2U;
+    RefreshChecksum(grants);
+    ExpectInvalid([&] { chunkdb::ValidateUsersImage(grants); }, "repeats a grant");
+}
+
 }  // namespace
 
 int main() {
@@ -571,5 +597,6 @@ int main() {
     TestLimitsAndMandatoryFields();
     TestDevelopmentAdmissionIsReadOnly();
     TestFieldBounds();
+    TestValidationChecksUnorderedDuplicates();
     return 0;
 }

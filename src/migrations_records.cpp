@@ -5,6 +5,7 @@
 #include <fstream>
 #include <limits>
 #include <set>
+#include <span>
 #include <sstream>
 #include <stdexcept>
 #include <type_traits>
@@ -30,6 +31,25 @@ constexpr std::array<std::uint8_t, 4> kJournalMagic{'C', 'K', 'M', 'J'};
 constexpr std::size_t kMaxRecords = 16384U;
 constexpr std::size_t kMaxStatement = 65536U;
 constexpr std::size_t kMaxFiles = 5U;
+constexpr std::uint16_t kCatalogOperationJournalVersion = 2U;
+constexpr std::size_t kHeaderBytes = 8U;
+constexpr std::size_t kChecksumBytes = 4U;
+constexpr std::size_t kLengthBytes = 4U;
+constexpr std::size_t kDropNameSuffixBytes = 17U;
+constexpr std::size_t kCatalogOperationMetadataBytes =
+    kHeaderBytes + 2U * StoreId{}.size() + 1U + // identities and action
+    2U * (kLengthBytes + kMaxTableNameLength) + kDropNameSuffixBytes +
+    kLengthBytes + // participant count
+    kLengthBytes + std::string_view(kUsersFileName).size() + 1U + // path and before-image marker
+    2U * kLengthBytes + kChecksumBytes;
+constexpr std::size_t kMaxCatalogOperationImageBytes = static_cast<std::size_t>(kMaxUsersFileBytes);
+static_assert(kMaxUsersFileBytes <= std::numeric_limits<std::uint32_t>::max());
+static_assert(kMaxUsersFileBytes <= (std::numeric_limits<std::size_t>::max() - kCatalogOperationMetadataBytes) / 2U);
+constexpr std::size_t kMaxCatalogOperationJournalBytes = 2U * kMaxCatalogOperationImageBytes + kCatalogOperationMetadataBytes;
+
+std::size_t JournalLimit(bool catalog_operation) {
+    return catalog_operation ? kMaxCatalogOperationJournalBytes : kMaxMigrationJournalBytes;
+}
 
 [[noreturn]] void Bad(const std::string& why) { throw std::runtime_error("invalid migration metadata: " + why); }
 bool Zero(const StoreId& id) { return std::all_of(id.begin(), id.end(), [](auto b) { return b == 0U; }); }
@@ -54,11 +74,6 @@ void ValidateRecord(const MigrationRecord& record) {
         Bad("statement is not UTF-8");
 }
 
-void PutBytes(Bytes& out, const Bytes& bytes) {
-    if (bytes.size() > kMaxMigrationRecordsBytes) Bad("participant size");
-    WriteLe32(out, static_cast<std::uint32_t>(bytes.size()));
-    out.insert(out.end(), bytes.begin(), bytes.end());
-}
 void PutString(Bytes& out, std::string_view text) {
     WriteLe32(out, static_cast<std::uint32_t>(text.size()));
     out.insert(out.end(), text.begin(), text.end());
@@ -70,31 +85,51 @@ void PutRecord(Bytes& out, const MigrationRecord& record) {
     PutString(out, record.statement);
 }
 
+template <typename UInt>
+UInt LittleEndian(std::span<const std::uint8_t> bytes) {
+    std::uint64_t result = 0U;
+    for (std::size_t i = 0; i < bytes.size(); ++i) result |= std::uint64_t{bytes[i]} << (8U * i);
+    return static_cast<UInt>(result);
+}
+
+void CheckHeader(std::span<const std::uint8_t> header, const std::array<std::uint8_t, 4>& magic, std::uint16_t version) {
+    if (!std::equal(magic.begin(), magic.end(), header.begin()) ||
+        LittleEndian<std::uint16_t>(header.subspan(4U, 2U)) != version || header[6] != 0U || header[7] != 0U)
+        Bad("magic, version or reserved field");
+}
+
+void ReadExact(std::istream& input, std::span<std::uint8_t> output) {
+    if (!output.empty() && !input.read(reinterpret_cast<char*>(output.data()), static_cast<std::streamsize>(output.size())))
+        Bad("truncated field");
+}
+
 class Reader {
   public:
     Reader(const Bytes& bytes, const std::array<std::uint8_t, 4>& magic, std::size_t limit, std::uint16_t version = 1U)
         : bytes_(bytes) {
-        if (bytes.size() < 12U || bytes.size() > limit) Bad("file size");
-        end_ = bytes.size() - 4U;
-        if (!std::equal(magic.begin(), magic.end(), bytes.begin()) || ReadLe16(bytes, 4U) != version ||
-            ReadLe16(bytes, 6U) != 0U) Bad("magic, version or reserved field");
+        if (bytes.size() < kHeaderBytes + kChecksumBytes || bytes.size() > limit) Bad("file size");
+        end_ = bytes.size() - kChecksumBytes;
+        CheckHeader(bytes_, magic, version);
         if (ReadLe32(bytes, end_) != Crc32(bytes.data(), end_)) Bad("checksum");
     }
-    std::uint8_t Byte() { Need(1U); return bytes_[at_++]; }
-    std::uint32_t U32() { Need(4U); const auto n = ReadLe32(bytes_, at_); at_ += 4U; return n; }
-    std::uint64_t U64() { Need(8U); const auto n = ReadLe64(bytes_, at_); at_ += 8U; return n; }
+    // The caller sized the file and read and checked its header.
+    Reader(std::istream& input, std::size_t size, const std::array<std::uint8_t, kHeaderBytes>& header)
+        : input_(&input), end_(size - kChecksumBytes), crc_(Crc32(header.data(), header.size())) {}
+
+    std::uint8_t Byte() { return Number<std::uint8_t>(); }
+    std::uint32_t U32() { return Number<std::uint32_t>(); }
+    std::uint64_t U64() { return Number<std::uint64_t>(); }
     StoreId Id() {
-        Need(16U); StoreId id{};
-        std::copy_n(bytes_.begin() + static_cast<std::ptrdiff_t>(at_), 16U, id.begin()); at_ += 16U;
+        StoreId id{};
+        Take(id);
         return id;
     }
     Bytes Blob(std::size_t limit) {
         const auto size = U32();
         if (size > limit) Bad("field size");
         Need(size);
-        Bytes result(bytes_.begin() + static_cast<std::ptrdiff_t>(at_),
-                     bytes_.begin() + static_cast<std::ptrdiff_t>(at_ + size));
-        at_ += size;
+        Bytes result(size);
+        Take(result);
         return result;
     }
     std::string String(std::size_t limit) { const auto bytes = Blob(limit); return {bytes.begin(), bytes.end()}; }
@@ -104,12 +139,38 @@ class Reader {
         record.user = String(63U); record.statement = String(kMaxStatement);
         ValidateRecord(record); return record;
     }
-    void End() const { if (at_ != end_) Bad("trailing bytes"); }
+    void End() const {
+        if (at_ != end_) Bad("trailing bytes");
+        if (!input_) return;
+        std::array<std::uint8_t, kChecksumBytes> checksum{};
+        ReadExact(*input_, checksum);
+        if (LittleEndian<std::uint32_t>(checksum) != crc_) Bad("checksum");
+        if (input_->peek() != std::char_traits<char>::eof() || input_->bad()) Bad("journal changed while reading");
+    }
   private:
     void Need(std::size_t size) const { if (size > end_ - at_) Bad("truncated field"); }
-    const Bytes& bytes_;
-    std::size_t at_ = 8U;
+    void Take(std::span<std::uint8_t> output) {
+        if (output.empty()) return;
+        Need(output.size());
+        if (input_) {
+            ReadExact(*input_, output);
+            crc_ = Crc32Extend(crc_, output.data(), output.size());
+        } else {
+            std::copy_n(bytes_.data() + at_, output.size(), output.data());
+        }
+        at_ += output.size();
+    }
+    template <typename UInt>
+    UInt Number() {
+        std::array<std::uint8_t, sizeof(UInt)> bytes{};
+        Take(bytes);
+        return LittleEndian<UInt>(bytes);
+    }
+    std::span<const std::uint8_t> bytes_;
+    std::istream* input_ = nullptr;
+    std::size_t at_ = kHeaderBytes;
     std::size_t end_ = 0;
+    std::uint32_t crc_ = 0U;
 };
 
 Bytes Header(const std::array<std::uint8_t, 4>& magic, std::uint16_t version = 1U) {
@@ -120,19 +181,24 @@ void Finish(Bytes& bytes, std::size_t limit) {
     WriteLe32(bytes, Crc32(bytes));
 }
 
-std::optional<Bytes> ReadBytes(const std::filesystem::path& path, std::size_t limit) {
+std::optional<std::uintmax_t> RegularFileSize(const std::filesystem::path& path) {
     std::error_code error;
     const auto status = std::filesystem::symlink_status(path, error);
     if (error == std::errc::no_such_file_or_directory || (!error && status.type() == std::filesystem::file_type::not_found))
         return std::nullopt;
     if (error) throw std::filesystem::filesystem_error("cannot inspect migration metadata", path, error);
     if (status.type() != std::filesystem::file_type::regular) Bad("participant is not a regular file: " + path.string());
-    const auto size = std::filesystem::file_size(path);
-    if (size > limit) Bad("participant size: " + path.string());
+    return std::filesystem::file_size(path);
+}
+
+std::optional<Bytes> ReadBytes(const std::filesystem::path& path, std::size_t limit) {
+    const auto size = RegularFileSize(path);
+    if (!size) return std::nullopt;
+    if (*size > limit) Bad("participant size: " + path.string());
     std::ifstream input(path, std::ios::binary);
     if (!input) throw std::runtime_error("cannot read " + path.string());
-    Bytes bytes(static_cast<std::size_t>(size));
-    if (size != 0U) input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(size));
+    Bytes bytes(static_cast<std::size_t>(*size));
+    if (*size != 0U) input.read(reinterpret_cast<char*>(bytes.data()), static_cast<std::streamsize>(*size));
     if (!input || input.peek() != std::char_traits<char>::eof()) Bad("participant changed while reading: " + path.string());
     if (input.bad()) throw std::runtime_error("cannot read " + path.string());
     return bytes;
@@ -159,7 +225,7 @@ void ValidateImage(const MigrationJournal& journal, const std::string& path, con
             Bad("data-directory identity or migration feature");
         RequireOpenableFeatures(manifest.features, AccessMode::kReadWrite);
     } else if (path == kUsersFileName) {
-        (void)DecodeUsers(image);
+        ValidateUsersImage(image);
     } else if (path == "tables/" + journal.table + "/" + std::string(kStoreManifestFileName)) {
         const auto manifest = ParseStoreManifest(image);
         if (manifest.store_id != journal.table_id) Bad("table participant identity");
@@ -211,11 +277,9 @@ bool ConditionalNoOp(const cql::Statement& statement) {
     return false;
 }
 
-constexpr std::uint16_t kCatalogOperationJournalVersion = 2U;
-
 bool IsOperationName(const std::string& table, const std::string& name) {
     const auto prefix = table + ".";
-    return name.size() == prefix.size() + 16U && name.rfind(prefix, 0) == 0U &&
+    return name.size() == table.size() + kDropNameSuffixBytes && name.rfind(prefix, 0) == 0U &&
            std::all_of(name.begin() + static_cast<std::ptrdiff_t>(prefix.size()), name.end(),
                [](char c) { return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f'); });
 }
@@ -231,11 +295,10 @@ void ValidateCatalogOperation(const MigrationJournal& journal) {
             ? !IsOperationName(journal.table, journal.operation_name)
             : !IsValidTableName(journal.operation_name) || journal.operation_name == journal.table)
         Bad("operation name");
-    if (journal.files.size() > kMaxFiles) Bad("participant count");
-    std::set<std::string> paths;
+    if (journal.files.size() > 1U) Bad("participant count");
     for (const auto& file : journal.files) {
-        if (!paths.insert(file.path).second || file.path != kUsersFileName) Bad("duplicate or unrelated operation participant");
-        if (!file.before || file.before->size() > kMaxMigrationRecordsBytes || file.after.size() > kMaxMigrationRecordsBytes)
+        if (file.path != kUsersFileName) Bad("unrelated operation participant");
+        if (!file.before || file.before->size() > kMaxCatalogOperationImageBytes || file.after.size() > kMaxCatalogOperationImageBytes)
             Bad("users participant images");
         ValidateImage(journal, file.path, *file.before);
         ValidateImage(journal, file.path, file.after);
@@ -418,8 +481,19 @@ std::vector<MigrationRecord> ReadMigrationRecords(const std::filesystem::path& r
     return DecodeMigrationRecords(*bytes, manifest->data_dir_id);
 }
 
-Bytes EncodeMigrationJournal(const MigrationJournal& journal) {
-    ValidateStructure(journal);
+namespace {
+
+// Emit the same encoding to memory or to the atomic temporary file.
+void EmitJournal(const MigrationJournal& journal, const AtomicFileSink& sink) {
+    const auto body_limit = JournalLimit(journal.catalog_operation) - kChecksumBytes;
+    std::size_t size = 0U;
+    std::uint32_t crc = 0U;
+    const auto emit = [&](std::span<const std::uint8_t> bytes) {
+        if (bytes.size() > body_limit - size) Bad("journal size");
+        sink(bytes);
+        size += bytes.size();
+        crc = Crc32Extend(crc, bytes.data(), bytes.size());
+    };
     // A catalog operation has format version 2 and no record, so a build
     // that knows only version 1 refuses it instead of misreading it.
     auto bytes = Header(kJournalMagic, journal.catalog_operation ? kCatalogOperationJournalVersion : 1U);
@@ -430,46 +504,89 @@ Bytes EncodeMigrationJournal(const MigrationJournal& journal) {
     bytes.insert(bytes.end(), journal.table_id.begin(), journal.table_id.end());
     PutString(bytes, journal.operation_name);
     WriteLe32(bytes, static_cast<std::uint32_t>(journal.files.size()));
+    emit(bytes);
+    const auto emit_image = [&](const Bytes& image) {
+        bytes.clear();
+        WriteLe32(bytes, static_cast<std::uint32_t>(image.size()));
+        emit(bytes);
+        emit(image);
+    };
     for (const auto& file : journal.files) {
+        bytes.clear();
         PutString(bytes, file.path); bytes.push_back(file.before ? 1U : 0U);
-        if (file.before) PutBytes(bytes, *file.before);
-        PutBytes(bytes, file.after);
-        if (bytes.size() > kMaxMigrationJournalBytes - 4U) Bad("journal size");
+        emit(bytes);
+        if (file.before) emit_image(*file.before);
+        emit_image(file.after);
     }
-    Finish(bytes, kMaxMigrationJournalBytes); return bytes;
+    bytes.clear();
+    WriteLe32(bytes, crc);
+    sink(bytes);
 }
 
-MigrationJournal DecodeMigrationJournal(const Bytes& bytes) {
-    const bool catalog_operation = bytes.size() >= 6U && ReadLe16(bytes, 4U) == kCatalogOperationJournalVersion;
-    Reader reader(bytes, kJournalMagic, kMaxMigrationJournalBytes, catalog_operation ? kCatalogOperationJournalVersion : 1U);
+MigrationJournal ReadJournal(Reader& reader, bool catalog_operation) {
     MigrationJournal journal;
     journal.catalog_operation = catalog_operation;
     journal.data_dir_id = reader.Id();
     if (!catalog_operation) journal.record = reader.Record();
     journal.directory_action = static_cast<MigrationDirectoryAction>(reader.Byte());
     journal.table = reader.String(kMaxTableNameLength); journal.table_id = reader.Id();
-    journal.operation_name = reader.String(kMaxTableNameLength + 17U);
+    journal.operation_name = reader.String(kMaxTableNameLength + kDropNameSuffixBytes);
     const auto count = reader.U32();
-    if ((count == 0U && !catalog_operation) || count > kMaxFiles) Bad("participant count");
+    if (catalog_operation ? count > 1U : count == 0U || count > kMaxFiles) Bad("participant count");
+    const auto image_limit = catalog_operation ? kMaxCatalogOperationImageBytes : kMaxMigrationRecordsBytes;
     for (std::uint32_t i = 0; i < count; ++i) {
         MigrationFileChange file;
         file.path = reader.String(128U);
+        if (catalog_operation && file.path != kUsersFileName) Bad("unrelated operation participant");
         const auto present = reader.Byte();
-        if (present > 1U) Bad("before-image presence");
-        if (present != 0U) file.before = reader.Blob(kMaxMigrationRecordsBytes);
-        file.after = reader.Blob(kMaxMigrationRecordsBytes);
+        if (present > 1U || (catalog_operation && present == 0U)) Bad("before-image presence");
+        if (present != 0U) file.before = reader.Blob(image_limit);
+        file.after = reader.Blob(image_limit);
         journal.files.push_back(std::move(file));
     }
     reader.End(); ValidateStructure(journal); return journal;
 }
 
+}  // namespace
+
+Bytes EncodeMigrationJournal(const MigrationJournal& journal) {
+    ValidateStructure(journal);
+    Bytes bytes;
+    EmitJournal(journal, [&](std::span<const std::uint8_t> part) { bytes.insert(bytes.end(), part.begin(), part.end()); });
+    return bytes;
+}
+
+MigrationJournal DecodeMigrationJournal(const Bytes& bytes) {
+    const bool catalog_operation = bytes.size() >= 6U && ReadLe16(bytes, 4U) == kCatalogOperationJournalVersion;
+    Reader reader(bytes, kJournalMagic, JournalLimit(catalog_operation), catalog_operation ? kCatalogOperationJournalVersion : 1U);
+    return ReadJournal(reader, catalog_operation);
+}
+
 std::optional<MigrationJournal> ReadMigrationJournal(const std::filesystem::path& root) {
-    const auto bytes = ReadBytes(root / kMigrationPendingFileName, kMaxMigrationJournalBytes);
-    return bytes ? std::optional<MigrationJournal>(DecodeMigrationJournal(*bytes)) : std::nullopt;
+    const auto path = root / kMigrationPendingFileName;
+    const auto size = RegularFileSize(path);
+    if (!size) return std::nullopt;
+    if (*size < kHeaderBytes + kChecksumBytes) Bad("journal size");
+    std::ifstream input(path, std::ios::binary);
+    if (!input) throw std::runtime_error("cannot read " + path.string());
+    std::array<std::uint8_t, kHeaderBytes> header{};
+    ReadExact(input, header);
+    const bool catalog_operation = LittleEndian<std::uint16_t>(std::span(header).subspan(4U, 2U)) == kCatalogOperationJournalVersion;
+    CheckHeader(header, kJournalMagic, catalog_operation ? kCatalogOperationJournalVersion : 1U);
+    if (*size > JournalLimit(catalog_operation)) Bad("journal size");
+    Reader reader(input, static_cast<std::size_t>(*size), header);
+    return ReadJournal(reader, catalog_operation);
 }
 
 void WriteMigrationJournal(const std::filesystem::path& root, const MigrationJournal& journal, bool* published) {
-    AtomicWrite(root / kMigrationPendingFileName, EncodeMigrationJournal(journal), true, true, published,
+    if (!journal.catalog_operation) {
+        AtomicWrite(root / kMigrationPendingFileName, EncodeMigrationJournal(journal), true, true, published,
+                    "CHUNKDB_FAILPOINT_MIGRATION_DECISION_SYNC_FAIL_ONCE", false, EnterStatementDecision);
+        return;
+    }
+    ValidateStructure(journal);
+    AtomicWriteStream(root / kMigrationPendingFileName, [&](const AtomicFileSink& sink) { EmitJournal(journal, sink); },
+                true, true, published,
                 "CHUNKDB_FAILPOINT_MIGRATION_DECISION_SYNC_FAIL_ONCE", false, EnterStatementDecision);
 }
 
@@ -497,7 +614,7 @@ void ValidateCatalogOperationJournal(const std::filesystem::path& root, const Mi
     if (Present(root / kUsersFileName) && journal.files.empty()) Bad("catalog operation users participant is missing");
     for (const auto& file : journal.files) {
         SafePath(root, file.path);
-        const auto current = ReadBytes(root / file.path, kMaxMigrationRecordsBytes);
+        const auto current = ReadBytes(root / file.path, kMaxCatalogOperationImageBytes);
         if (current != file.before && (!current || *current != file.after)) Bad("participant differs from before and after: " + file.path);
     }
     const auto source = "tables/" + journal.table;

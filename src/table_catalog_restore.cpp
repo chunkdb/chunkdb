@@ -474,15 +474,18 @@ void TableCatalog::RenameTable(std::string_view name, std::string_view new_name,
     // catalog admission, so a statement creating or granting either name
     // follows the whole rename.
     const auto grants = PrepareGrantJournal(users, *table, /*rename=*/true, to, [&](Users& next) {
+        bool changed = false;
         for (auto& [_, user] : next.users) {
             const auto granted = user.grants.find(from);
             if (granted == user.grants.end()) continue;
+            changed = true;
             const auto right = granted->second;
             user.grants.erase(granted);
             const auto existing = user.grants.find(to);
             if (existing == user.grants.end()) user.grants.emplace(to, right);
             else existing->second = std::max(existing->second, right);
         }
+        return changed;
     });
     if (grants && std::filesystem::exists(std::filesystem::symlink_status(new_dir))) throw destination_exists();
     // A stop accepted until here leaves the table serving under its name;

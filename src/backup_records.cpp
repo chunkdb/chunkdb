@@ -663,9 +663,13 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
     if (!completing && (Present(root / kRestoreIncompleteName) || Present(root / kBackupIncompleteName)))
         throw std::runtime_error("backup publication is incomplete");
     std::set<std::string> expected_files, expected_dirs{"tables"};
+    std::set<std::string> allowed{"chunkdb.manifest", "chunkdb.users", std::string(kMigrationsFileName)};
     for (const auto& table : record.tables) expected_dirs.insert("tables/" + table.name);
     for (const auto& file : record.files) {
         const auto relative = file.relative_path.generic_string();
+        // Reject unrecognized root artifacts before opening any of them.
+        if (!file.relative_path.has_parent_path() && !allowed.contains(relative))
+            throw std::runtime_error("unknown backup inventory artifact: " + relative);
         expected_files.insert(relative);
         auto parent = file.relative_path.parent_path();
         while (!parent.empty()) { expected_dirs.insert(parent.generic_string()); parent = parent.parent_path(); }
@@ -694,9 +698,8 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
     if (!ReadDataDirManifest(root)) throw std::runtime_error("backup data-directory manifest is missing");
     const auto directory_manifest = *ReadDataDirManifest(root);
     RequireOpenableFeatures(directory_manifest.features, AccessMode::kReadOnly);
-    if (Present(root / kUsersFileName)) (void)DecodeUsers(LoadFile(root / kUsersFileName));
+    if (const auto users = ReadUsersFileImage(root)) ValidateUsersImage(*users);
     (void)ReadMigrationRecords(root);
-    std::set<std::string> allowed{"chunkdb.manifest", "chunkdb.users", std::string(kMigrationsFileName)};
     for (const auto& cut : record.tables) {
         Cancelled(cancelled);
         const auto prefix = std::filesystem::path("tables") / cut.name;

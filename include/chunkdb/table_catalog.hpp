@@ -699,9 +699,9 @@ class TableCatalog {
     // of the change `change` makes to the grants in their file for moving `table`
     // to `.chunkdb.dropped/<operation>`, or with `rename` to
     // `tables/<operation>`; nullptr, and nothing locked, when there is no
-    // users file or the change changes nothing.
+    // users file or change returns false after leaving the grants unchanged.
     [[nodiscard]] std::shared_ptr<GrantJournal> PrepareGrantJournal(UserRegistry* users, const Table& table, bool rename,
-        const std::string& operation, const std::function<void(Users&)>& change);
+        const std::string& operation, const std::function<bool(Users&)>& change);
     // Writes the journal before the move; a failure removes it and rethrows.
     void WriteGrantJournal(GrantJournal& journal);
     // After a move that did not happen: removes the journal. A failure

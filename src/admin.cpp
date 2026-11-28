@@ -32,7 +32,7 @@ void ResetPassword(const std::filesystem::path& data_dir, const std::string& use
         throw no_users();
     }
     // Format admission precedes writer-lock and recovery bookkeeping.
-    (void)ReadUsersFile(data_dir);
+    if (const auto users = ReadUsersFileImage(data_dir)) ValidateUsersImage(*users);
     const auto lock = AcquireWriterLock(data_dir, AccessMode::kReadWrite, /*allow_multiple_processes=*/false);
     // The reset writes where a read-write open writes, so it admits only what
     // such an open admits, before recovery changes anything.

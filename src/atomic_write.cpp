@@ -239,9 +239,9 @@ void AtomicWrite(const std::filesystem::path& path, const std::vector<std::uint8
 
 void AtomicWriteStream(const std::filesystem::path& path, const AtomicFileProducer& produce,
     bool fsync_file, bool fsync_directory, bool* out_replaced, const char* after_rename_failpoint,
-    bool enable_generic_failpoints) {
+    bool enable_generic_failpoints, void (*before_replace)()) {
     AtomicWriteImpl(path, produce, fsync_file, fsync_directory, out_replaced,
-        after_rename_failpoint, enable_generic_failpoints, nullptr);
+        after_rename_failpoint, enable_generic_failpoints, before_replace);
 }
 
 bool PublishNewFile(

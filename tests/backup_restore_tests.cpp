@@ -10,6 +10,7 @@
 #include "txn_test_utils.hpp"
 #include "directory_alias_test_utils.hpp"
 #include "backup_directory.hpp"
+#include "migrations_records.hpp"
 
 namespace {
 using namespace chunkdb;
@@ -184,6 +185,18 @@ void LineageContinuation() {
     assert(!std::filesystem::exists(refused));
 }
 void StrictInventory() {
+    {
+        Fixture fixture;
+        fixture.record.files.push_back({.relative_path = std::filesystem::path(kMigrationPendingFileName)});
+        Throws([&] {
+            try {
+                ValidateBackupInventory(fixture.backup, fixture.record);
+            } catch (const std::runtime_error& error) {
+                assert(std::string_view(error.what()).find("unknown backup inventory artifact") != std::string_view::npos);
+                throw;
+            }
+        });
+    }
     const auto check = [](auto mutation) {
         Fixture fixture; mutation(fixture); fixture.Remark();
         Throws([&] { ValidateBackupInventory(fixture.backup, fixture.record); });
