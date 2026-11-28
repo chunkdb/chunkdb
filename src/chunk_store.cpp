@@ -4,10 +4,12 @@
 
 #include "checkpoint.hpp"
 #include "chunk_store_internal.hpp"
+#include "chunk_vars_storage.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "eviction.hpp"
 #include "process_lock.hpp"
 #include "snapshot_generation.hpp"
+#include "statement_control.hpp"
 #include "store_manifest.hpp"
 #include "backup.hpp"
 #include "txn_history.hpp"
@@ -692,7 +694,7 @@ std::size_t ChunkStore::ApproxLoadedChunkCount() const {
     return loaded;
 }
 
-std::uint64_t ChunkStore::LoadedChunkBytes(const std::function<void()>& check) const {
+std::uint64_t ChunkStore::LoadedChunkBytes() const {
     // One lock at a time, and one chunk referenced at a time: eviction skips a
     // chunk someone else references.
     std::vector<std::shared_ptr<LargeChunk>> large_chunks;
@@ -704,6 +706,7 @@ std::uint64_t ChunkStore::LoadedChunkBytes(const std::function<void()>& check) c
     std::uint64_t bytes = 0U;
     std::vector<ChunkCoord> coords;
     for (const auto& large_chunk : large_chunks) {
+        CheckStatementCancellation();
         coords.clear();
         {
             std::lock_guard chunk_lock(large_chunk->mutex);
@@ -711,7 +714,6 @@ std::uint64_t ChunkStore::LoadedChunkBytes(const std::function<void()>& check) c
             for (const auto& [coord, _] : large_chunk->chunks) coords.push_back(coord);
         }
         for (const auto& coord : coords) {
-            if (check) check();
             std::shared_ptr<RegularChunk> chunk;
             {
                 std::lock_guard chunk_lock(large_chunk->mutex);
@@ -719,10 +721,12 @@ std::uint64_t ChunkStore::LoadedChunkBytes(const std::function<void()>& check) c
                 if (it == large_chunk->chunks.end()) continue;
                 chunk = it->second;
             }
-            std::shared_lock lock(chunk->mutex);
+            auto lock = LockStatementChunkShared(chunk->mutex);
             bytes += sizeof(RegularChunk) + chunk->payload.capacity() + chunk->presence_bitmap.capacity() +
-                chunk->vars.encoded_size() + (chunk->chunk_columns ? chunk->chunk_columns->bytes.size() : 0U) +
-                chunk->wal_batch.capacity();
+                detail::ChunkVarsStorageAccess::BufferAllocationBytes(chunk->vars) +
+                chunk->wal_batch.capacity() + chunk->scratch_before.capacity();
+            if (chunk->chunk_columns)
+                bytes += sizeof(ChunkColumnState) + chunk->chunk_columns->bytes.capacity();
         }
     }
     return bytes;

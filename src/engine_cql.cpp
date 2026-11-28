@@ -21,12 +21,14 @@
 #include <vector>
 
 #include "chunkdb/engine.hpp"
+#include "chunkdb/file_layout.hpp"
 #include "chunkdb/protocol.hpp"
 #include "aggregate.hpp"
 #include "block_checks.hpp"
 #include "block_filter.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunk_store_internal.hpp"
+#include "chunk_coordinate_index.hpp"
 #include "chunk_form.hpp"
 #include "chunk_scale.hpp"
 #include "typed_chunk_form.hpp"
@@ -526,8 +528,7 @@ struct FileUsage {
     std::uint64_t files = 0U;
     std::uint64_t bytes = 0U;
     // Parts of `bytes`: checkpoint images and live WALs of the large-chunk
-    // directories, the feed archive, and the coordinate index files with the
-    // secondary indexes under `indexes/`.
+    // directories, the feed archive, and the coordinate index files.
     std::uint64_t image_bytes = 0U;
     std::uint64_t wal_bytes = 0U;
     std::uint64_t archive_bytes = 0U;
@@ -539,27 +540,36 @@ struct FileUsage {
 // waits for it. A file or directory removed during the walk is not counted,
 // and a table directory removed before it is a dropped table; any other
 // error fails the statement. It stops when the statement is stopped.
-[[nodiscard]] FileUsage DirectoryUsage(const std::filesystem::path& root, const std::string& table) {
+[[nodiscard]] FileUsage DirectoryUsage(
+    const std::filesystem::path& root, const std::string& table, const Geometry& geometry) {
     namespace fs = std::filesystem;
     const auto gone = [](const std::error_code& error) { return error == std::errc::no_such_file_or_directory; };
-    // Where a directory is (docs/STORAGE_FORMAT.md#directory-layout).
-    enum class Place { kRoot, kLarge, kArchive, kIndex, kOther };
-    const auto child = [](Place parent, const std::string& name) {
-        if (parent != Place::kRoot) return parent == Place::kLarge ? Place::kOther : parent;
-        if (name == kFeedArchiveDirName) return Place::kArchive;
-        if (name == "indexes") return Place::kIndex;
-        return name.starts_with("L_") ? Place::kLarge : Place::kOther;
+    // Coordinate names are ASCII. Check the native spelling before narrowing
+    // it so unrelated Unicode filenames stay countable on Windows.
+    const auto ascii = [](const fs::path& name) {
+        return std::ranges::all_of(name.native(), [](auto ch) { return static_cast<unsigned int>(ch) <= 0x7fU; });
     };
-    const auto count = [](FileUsage& usage, Place place, const fs::path& file, std::uint64_t size) {
+    enum class Place { kRoot, kLarge, kArchive, kOther };
+    const auto child = [&](Place parent, const fs::path& path) {
+        if (parent != Place::kRoot) return parent == Place::kLarge ? Place::kOther : parent;
+        const auto name = path.filename();
+        if (name == kFeedArchiveDirName) return Place::kArchive;
+        LargeChunkCoord coord;
+        return ascii(name) && ParseLargeChunkName(name.string(), geometry.dims(), &coord) ? Place::kLarge : Place::kOther;
+    };
+    const auto count = [&](FileUsage& usage, Place place, const fs::path& file, std::uint64_t size) {
         ++usage.files;
         usage.bytes += size;
-        const auto extension = file.extension();
         if (place == Place::kArchive) usage.archive_bytes += size;
-        else if (place == Place::kIndex) usage.index_bytes += size;
-        else if ((place == Place::kRoot || place == Place::kLarge) && file.filename() == "chunkdb.index")
+        else if ((place == Place::kRoot || place == Place::kLarge) && file.filename() == kChunkIndexFileName)
             usage.index_bytes += size;
-        else if (place == Place::kLarge && extension == ".chk") usage.image_bytes += size;
-        else if (place == Place::kLarge && extension == ".wal") usage.wal_bytes += size;
+        else if (place == Place::kLarge) {
+            const auto extension = file.extension();
+            if (extension != ".chk" && extension != ".wal") return;
+            ChunkCoord coord;
+            if (!ascii(file.stem()) || !ParseChunkFilePath(file.lexically_relative(root), geometry, &coord)) return;
+            (extension == ".chk" ? usage.image_bytes : usage.wal_bytes) += size;
+        }
     };
     FileUsage usage;
     std::vector<std::pair<fs::path, Place>> pending{{root, Place::kRoot}};
@@ -574,7 +584,7 @@ struct FileUsage {
             CheckStatementCancellation();
             const auto status = it->symlink_status(error);
             if (!error && fs::is_directory(status))
-                pending.emplace_back(it->path(), child(place, it->path().filename().string()));
+                pending.emplace_back(it->path(), child(place, it->path()));
             if (!error && fs::is_regular_file(status)) {
                 const auto size = fs::file_size(it->path(), error);
                 if (!error) count(usage, place, it->path(), size);
@@ -2478,6 +2488,7 @@ std::string CommandEngine::ExecuteStatement(
                     if (!HasServerRight(session, ServerRight::kMonitor)) RequireRight(session, stats.table, Right::kRead);
                     std::string reply;
                     std::filesystem::path dir;
+                    std::optional<Geometry> geometry;
                     Table::FeedCounts feeds;
                     // The directory is listed after the lease ends: an exclusive section
                     // waiting for the lease would stop every statement on the table.
@@ -2486,6 +2497,7 @@ std::string CommandEngine::ExecuteStatement(
                         auto& store = lease.store();
                         feeds = session.table->CountFeeds(lease);
                         dir = store.data_dir();
+                        geometry.emplace(store.geometry());
                         Protocol::AppendMapHeader(reply, 19U);
                         Protocol::AppendBulk(reply, "epoch");
                         Protocol::AppendBulk(reply, StoreIdHex(store.store_id()));
@@ -2503,7 +2515,7 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendBulk(reply, "loaded_chunks");
                         Protocol::AppendInteger(reply, static_cast<std::uint64_t>(store.ApproxLoadedChunkCount()));
                         Protocol::AppendBulk(reply, "cache_bytes");
-                        Protocol::AppendInteger(reply, store.LoadedChunkBytes([] { CheckStatementCancellation(); }));
+                        Protocol::AppendInteger(reply, store.LoadedChunkBytes());
                         Protocol::AppendBulk(reply, "history_bytes");
                         Protocol::AppendInteger(reply, static_cast<std::uint64_t>(store.TxnHistoryBytes()));
                         Protocol::AppendBulk(reply, "open_transactions");
@@ -2511,7 +2523,7 @@ std::string CommandEngine::ExecuteStatement(
                     }
                     if (auto* hook = hook_.load(std::memory_order_acquire))
                         hook->Run(CommandEngineTestHook::Point::kBeforeTableStatsListing, stats.table);
-                    const auto files = DirectoryUsage(dir, stats.table);
+                    const auto files = DirectoryUsage(dir, stats.table, *geometry);
                     Protocol::AppendBulk(reply, "files");
                     Protocol::AppendInteger(reply, files.files);
                     Protocol::AppendBulk(reply, "disk_bytes");

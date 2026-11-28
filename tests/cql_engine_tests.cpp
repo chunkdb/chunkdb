@@ -3,6 +3,7 @@
 // and how parameter frames are planned.
 
 #include <algorithm>
+#include <array>
 #include <bit>
 #include <chrono>
 #include <barrier>
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <future>
 #include <filesystem>
+#include <fstream>
 #include <memory>
 #include <optional>
 #include <string>
@@ -23,6 +25,7 @@
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
 #include "../src/chunk_store_internal.hpp"
+#include "../src/feed_slot_records.hpp"
 #include "../src/store_manifest.hpp"
 #include "../src/sectioned_chunk_form.hpp"
 #include "../src/statement_control.hpp"
@@ -130,9 +133,10 @@ struct Fixture {
     std::unique_ptr<CommandEngine> engine;
     chunkdb::SessionState session;
 
-    Fixture() {
+    explicit Fixture(std::chrono::milliseconds slot_sync_interval = chunkdb::kDefaultSlotSyncInterval) {
         chunkdb::CatalogConfig config;
         config.data_dir = dir.path();
+        config.slot_sync_interval = slot_sync_interval;
         catalog = std::make_shared<chunkdb::TableCatalog>(config);
         (void)catalog->Create("world", kWorldGeometry, chunkdb::TableOptions{}, World());
         (void)catalog->Create("plain", kPlainGeometry, chunkdb::TableOptions{});
@@ -1016,7 +1020,8 @@ void TestTableStats() {
     assert(MapInteger(empty, "files") >= 1U && MapInteger(empty, "disk_bytes") > 0U); // Its manifest at least.
     // No image, WAL, cached chunk, feed or transaction yet; the coordinate
     // index inventory exists from creation.
-    assert(MapInteger(empty, "image_bytes") == 0U && MapInteger(empty, "wal_bytes") == 0U);
+    assert(MapInteger(empty, "image_bytes") == 0U && MapInteger(empty, "wal_bytes") == 0U &&
+        MapInteger(empty, "archive_bytes") == 0U);
     assert(MapInteger(empty, "index_bytes") > 0U && MapInteger(empty, "cache_bytes") == 0U);
     assert(MapInteger(empty, "feed_bytes") == 0U && MapInteger(empty, "history_bytes") == 0U);
     assert(MapInteger(empty, "open_transactions") == 0U);
@@ -1028,10 +1033,6 @@ void TestTableStats() {
     assert(MapInteger(written, "chunks") == 2U && MapInteger(written, "loaded_chunks") == 2U);
     assert(MapInteger(written, "slots") == 1U && MapInteger(written, "watches") == 1U);
     assert(MapInteger(written, "files") > MapInteger(empty, "files") && MapInteger(written, "disk_bytes") > MapInteger(empty, "disk_bytes"));
-    assert(MapInteger(written, "image_bytes") + MapInteger(written, "wal_bytes") > 0U);
-    assert(MapInteger(written, "image_bytes") + MapInteger(written, "wal_bytes") + MapInteger(written, "archive_bytes") +
-            MapInteger(written, "index_bytes") <=
-        MapInteger(written, "disk_bytes"));
     assert(MapInteger(written, "cache_bytes") > 0U);
     // The live feed holds a change once its reader has it.
     (void)VersionOf(f.Run("SET BLOCK 1 1 IN plain bits = b'000000000001'"));
@@ -1087,6 +1088,71 @@ void TestTableStats() {
     ExpectError(f.Run("SHOW TABLE STATS plain"), "NO_TABLE");
     assert(hook.dropped);
     f.engine->SetHookForTests(nullptr);
+}
+
+void TestTableStatsFileBytes() {
+    namespace fs = std::filesystem;
+    Fixture f(std::chrono::hours(1));
+    const auto table = f.catalog->Require("plain");
+    const auto root = f.dir.path() / "tables" / "plain";
+    const auto geometry = table->geometry();
+    // Make a retained deletion in a different shard so both kinds of index
+    // file exist before the slot starts retaining WALs.
+    {
+        auto lease = table->Acquire();
+        auto& store = lease->store();
+        store.SetBlockBits(0, 8, "000000000001");
+        (void)store.UnsetBlock(0, 8);
+        store.CheckpointForTests(0, 2);
+    }
+    (void)VersionOf(f.Run("SET BLOCK 0 0 IN plain bits = b'000000000001'"));
+    ExpectReply(f.Run("CREATE SLOT 'consumer' ON plain"), "+OK\r\n");
+    const auto archived = VersionOf(f.Run("SET BLOCK 0 0 IN plain bits = b'000000000011'"));
+    (void)VersionOf(f.Run("SET BLOCK 4 0 IN plain bits = b'000000000001'"));
+    {
+        auto lease = table->Acquire();
+        auto& store = lease->store();
+        store.CheckpointForTests(0, 0);
+        store.WalBarrier();
+    }
+    const auto archive = root / chunkdb::kFeedArchiveDirName;
+    const auto revision = std::to_string(archived);
+    const auto base = "C_0_0." + revision;
+    const auto live_image = chunkdb::ChunkDataPath(root, geometry, {0, 0});
+    const auto live_wal = chunkdb::ChunkWalPath(root, geometry, {1, 0});
+    const auto images = fs::file_size(live_image);
+    const auto wals = fs::file_size(live_wal);
+    const auto archives = fs::file_size(archive / (base + "-" + revision + ".wal")) +
+        fs::file_size(archive / (base + ".chk")) + fs::file_size(archive / (base + ".base"));
+    const auto indexes = fs::file_size(root / "chunkdb.index") + fs::file_size(root / "L_0_1" / "chunkdb.index");
+    const auto check_buckets = [&](const std::string& stats) {
+        assert(MapInteger(stats, "image_bytes") == images);
+        assert(MapInteger(stats, "wal_bytes") == wals);
+        assert(MapInteger(stats, "archive_bytes") == archives);
+        assert(MapInteger(stats, "index_bytes") == indexes);
+    };
+    const auto before = f.Run("SHOW TABLE STATS plain");
+    check_buckets(before);
+
+    // A valid chunk name under the wrong shard, a noncanonical shard,
+    // a non-coordinate stem, and an unrelated index directory are plain files.
+    const std::array unrelated{
+        root / "L_0_0" / "C_2_0.wal",
+        root / "L_misc" / "C_0_0.chk",
+        root / "L_0_0" / u8"notes-\u00e9.chk",
+        root / "indexes" / "other.index",
+    };
+    for (const auto& path : unrelated) {
+        fs::create_directories(path.parent_path());
+        std::ofstream output(path, std::ios::binary);
+        output.put('x');
+        output.close();
+        assert(output);
+    }
+    const auto after = f.Run("SHOW TABLE STATS plain");
+    check_buckets(after);
+    assert(MapInteger(after, "files") == MapInteger(before, "files") + unrelated.size());
+    assert(MapInteger(after, "disk_bytes") == MapInteger(before, "disk_bytes") + unrelated.size());
 }
 
 void TestShowStatus() {
@@ -1263,6 +1329,7 @@ int main(int argc, char** argv) {
     TestConcurrentConditionalCreate();
     TestScanChunks();
     TestTableStats();
+    TestTableStatsFileBytes();
     TestShowStatus();
     TestSlotStatements();
     TestReadOnlySlotWithoutOwner();

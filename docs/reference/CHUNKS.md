@@ -163,12 +163,16 @@ Use [Transactions](../TRANSACTIONS.md) when you need a consistent view of one ta
 
 SHOW TABLE STATS needs READ on the table, or MONITOR.
 `chunks` counts populated chunks, the ones SCAN CHUNKS lists; `loaded_chunks` counts the table's chunks held in the chunk cache.
-`cache_bytes` is the memory of those chunks: each one's payload, presence, text and bytes values, chunk columns and unflushed WAL batch, and its bookkeeping.
+`cache_bytes` estimates the memory of loaded chunk objects and their retained payload, presence, text and bytes values and offsets, chunk columns, WAL batch, and write scratch buffers.
+Shared chunk-column state is counted for each loaded chunk that references it.
 `history_bytes` counts the chunk states kept for open transactions; `open_transactions` counts the open transactions that have used the table; one that a limit ended no longer counts.
 `files` and `disk_bytes` count the regular files under the table's directory and their sizes, WAL, images, feed archive and index files included.
-Of `disk_bytes`, `image_bytes` counts checkpoint images, `wal_bytes` live WALs, `archive_bytes` the feed archive (the WALs and base images that durable slots keep, under `.chunkdb.feed/`), and `index_bytes` the coordinate index files; manifests, intents and other files count only in `disk_bytes`.
+Of `disk_bytes`, `image_bytes` and `wal_bytes` count live chunk images and WALs at their canonical coordinate paths.
+`archive_bytes` counts regular files under `.chunkdb.feed/`, including retained WALs, pinned base images, and base descriptors.
+`index_bytes` counts the coordinate inventory and shard logs.
 `slots` counts durable slots, lost ones included; `watches` counts open watches, slot watches included; `feed_bytes` counts the memory of the changes the live feed buffers for them.
 The counts come from memory, except `cache_bytes`, which visits the table's loaded chunks one at a time while the statement uses the table, and the file counts, which list the table's directory once: their cost grows with the number of loaded chunks and of files.
+Cancellation and statement timeouts interrupt a wait for a loaded chunk.
 The listing runs after the statement stops using the table, so no other statement waits for it, and a statement timeout stops it.
 A file written or removed during the listing may or may not be counted; a table dropped before it returns NO_TABLE, and a SWAP TABLES, or a DROP TABLE and CREATE TABLE of the same name, during it may count the other table's files.
 
