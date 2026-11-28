@@ -1,0 +1,1 @@
+- `chunkdb_server_bench --report-cpu` reports bench-process CPU seconds (`cpu_s`) and context switches (`context_switches`) during each timed scenario, measured-client CPU seconds (`client_cpu_s`), and watch-reader CPU seconds through UNWATCH completion (`watch_cpu_s`) (#140)

@@ -1,5 +1,6 @@
 #include "chunkdb/server_bench.hpp"
 #include "chunkdb/bench_build.hpp"
+#include "server_bench_cpu.hpp"
 
 #include <algorithm>
 #include <array>
@@ -52,6 +53,8 @@
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <sys/time.h>
+#include <sys/resource.h>
+#include <time.h>
 #include <poll.h>
 #include <unistd.h>
 #endif
@@ -68,6 +71,47 @@ constexpr SocketHandle kInvalidSocket = INVALID_SOCKET;
 using SocketHandle = int;
 constexpr SocketHandle kInvalidSocket = -1;
 #endif
+
+#ifdef _WIN32
+double FileTimeSeconds(const FILETIME& value) {
+    return static_cast<double>((static_cast<std::uint64_t>(value.dwHighDateTime) << 32U) | value.dwLowDateTime) / 1e7;
+}
+#endif
+// CPU seconds the calling thread has used, if the counter is available.
+std::optional<double> ThreadCpuSeconds() {
+#ifdef _WIN32
+    FILETIME creation{}, exited{}, kernel{}, user{};
+    if (!GetThreadTimes(GetCurrentThread(), &creation, &exited, &kernel, &user)) return std::nullopt;
+    return FileTimeSeconds(kernel) + FileTimeSeconds(user);
+#else
+    timespec now{};
+    if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &now) != 0) return std::nullopt;
+    return static_cast<double>(now.tv_sec) + static_cast<double>(now.tv_nsec) / 1e9;
+#endif
+}
+// CPU seconds and context switches of this process so far; switches stay 0 on Windows.
+struct ProcessUsage {
+    std::optional<double> cpu_s{};
+    std::optional<std::uint64_t> switches{};
+};
+ProcessUsage SampleProcessUsage() {
+#ifdef _WIN32
+    FILETIME creation{}, exited{}, kernel{}, user{};
+    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exited, &kernel, &user)) return {};
+    return {.cpu_s = FileTimeSeconds(kernel) + FileTimeSeconds(user)};
+#else
+    rusage usage{};
+    if (getrusage(RUSAGE_SELF, &usage) != 0) return {};
+    const auto seconds = [](const timeval& value) { return static_cast<double>(value.tv_sec) + static_cast<double>(value.tv_usec) / 1e6; };
+    return {seconds(usage.ru_utime) + seconds(usage.ru_stime),
+        static_cast<std::uint64_t>(usage.ru_nvcsw) + static_cast<std::uint64_t>(usage.ru_nivcsw)};
+#endif
+}
+
+void RecordProcessUsage(ScenarioResult& result, const ProcessUsage& start, const ProcessUsage& end) {
+    result.cpu_s = detail::CpuCounterDelta(start.cpu_s, end.cpu_s);
+    result.context_switches = detail::CpuCounterDelta(start.switches, end.switches);
+}
 
 constexpr std::array<double, 8> kPercentiles{
     50.0,
@@ -835,6 +879,7 @@ class WatchingClient {
                     if (value.type == '+' && value.text == "OK") {
                         if (stop_deadline_.load(std::memory_order_acquire) == 0)
                             throw std::runtime_error("unsolicited UNWATCH completion");
+                        if (args_.report_cpu) cpu_s_ = ThreadCpuSeconds().value_or(0.0);
                         return;
                     }
                     std::uint64_t read;
@@ -888,6 +933,7 @@ class WatchingClient {
     void Finish(ScenarioResult* result) {
         reader_.join();
         if (error_) std::rethrow_exception(error_);
+        if (args_.report_cpu) result->watch_cpu_s += cpu_s_;
         result->watch_bytes += client_.consumed_bytes() - initial_bytes_;
         result->watch_changes += changes_; result->watch_progress += progress_; result->watch_chunks += chunks_; result->watch_other += other_;
         result->watch_duration_s = std::max(result->watch_duration_s, std::chrono::duration<double>(Clock::now() - start_).count());
@@ -1012,6 +1058,7 @@ class WatchingClient {
     Clock::time_point advanced_{};
     Clock::time_point last_push_{};
     double slot_create_ms_ = 0.0;
+    double cpu_s_ = 0.0;
     // Only the reader writes the acknowledged revision; send_mutex_ orders ACK with UNWATCH.
     std::uint64_t acknowledged_ = 0;
     std::mutex send_mutex_;
@@ -1665,7 +1712,9 @@ struct ThreadWork {
     std::size_t logged_in = 0;
     bool measured_done = false;
     std::atomic<std::size_t> failed_logins{0};
+    double client_cpu_s = 0.0;
 
+    const auto usage_start = args.report_cpu ? SampleProcessUsage() : ProcessUsage{};
     const auto start = Clock::now();
     std::vector<std::thread> workers;
     workers.reserve(work_split.size());
@@ -1675,6 +1724,7 @@ struct ThreadWork {
             continue;
         }
         workers.emplace_back([&, work]() {
+            const auto cpu_start = args.report_cpu ? ThreadCpuSeconds() : std::nullopt;
             try {
                 Client client(args.host, args.port, args.io_timeout_ms);
                 Hello(client, args);
@@ -1761,6 +1811,7 @@ struct ThreadWork {
                 while (!pending.empty()) {
                     consume_one();
                 }
+                const double cpu_s = args.report_cpu ? detail::CpuCounterDelta(cpu_start, ThreadCpuSeconds()) : 0.0;
 
                 {
                     std::lock_guard lock(latencies_mutex);
@@ -1768,6 +1819,7 @@ struct ThreadWork {
                     returned_area_chunks += local_area_chunks;
                     response_bytes += local_response_bytes;
                     metadata_envelopes += local_metadata_envelopes;
+                    if (args.report_cpu) client_cpu_s += cpu_s;
                     if (local_write_frontier) write_frontier = std::max(write_frontier.value_or(0U), *local_write_frontier);
                     for (std::size_t i = 0; i < request_mix.size(); ++i) request_mix[i] += local_mix[i];
                     latencies_ms.insert(
@@ -1823,6 +1875,7 @@ struct ThreadWork {
         }
     }
     const auto end = Clock::now();
+    const auto usage_end = args.report_cpu ? SampleProcessUsage() : ProcessUsage{};
     for (const auto& watch : watches) watch->SampleLag(write_frontier, end);
     {
         std::lock_guard lock(login_mutex);
@@ -1854,6 +1907,10 @@ struct ThreadWork {
     result.response_bytes = response_bytes;
     result.metadata_envelopes = metadata_envelopes;
     result.failed_logins = failed_logins.load();
+    if (args.report_cpu) {
+        RecordProcessUsage(result, usage_start, usage_end);
+        result.client_cpu_s = client_cpu_s;
+    }
     result.blocks_per_request = static_cast<double>(completed_blocks) / result.completed_requests;
     for (std::size_t i = 0; i < request_mix.size(); ++i) result.request_mix.emplace_back(kRequestNames[i], request_mix[i]);
     result.duration_s = std::chrono::duration<double>(end - start).count();
@@ -1949,6 +2006,8 @@ bool TakeoverTerminal(std::string_view line) {
     latencies.reserve(args.requests);
     ScenarioResult result; result.name = "takeover"; result.max_in_flight = 1;
     result.payload_label = "ownership_cycles (connect+HELLO+WATCH TAKEOVER+old closure), ACKs=0";
+    const auto usage_start = args.report_cpu ? SampleProcessUsage() : ProcessUsage{};
+    const auto cpu_start = args.report_cpu ? ThreadCpuSeconds() : std::nullopt;
     const auto start = Clock::now();
     for (std::size_t i = 0; i < args.requests; ++i) {
         const auto cycle_start = Clock::now();
@@ -1989,6 +2048,11 @@ bool TakeoverTerminal(std::string_view line) {
         latencies.push_back(std::chrono::duration<double, std::milli>(Clock::now() - cycle_start).count());
     }
     const auto end = Clock::now();
+    if (args.report_cpu) {
+        const auto cpu_end = ThreadCpuSeconds();
+        RecordProcessUsage(result, usage_start, SampleProcessUsage());
+        result.client_cpu_s = detail::CpuCounterDelta(cpu_start, cpu_end);
+    }
     owner->SendLine("UNWATCH");
     const auto cleanup_deadline = Clock::now() + std::chrono::milliseconds(args.io_timeout_ms);
     const std::atomic<Clock::duration::rep> cleanup_read_deadline{cleanup_deadline.time_since_epoch().count()};
@@ -2147,6 +2211,7 @@ std::string UsageText() {
         << "                                   --io-timeout-ms fails; measure: counts resyncs, waits\n"
         << "                                   while pushes arrive, reports each watch\n"
         << "  --slot-create-timeout-ms <N>     measure: CREATE SLOT reply wait (default: 600000)\n"
+        << "  --report-cpu                     report-only: process, client and watch CPU seconds\n"
         << "  --with <none|version|schema|both> report-only metadata on applicable block/area reads\n"
         << "  --tests takeover                report-only idle ownership cycles; clients/pipeline must be 1\n"
         << "  --server-workers <N>             spawn mode: server worker threads (default: 4); a\n"
@@ -2337,6 +2402,10 @@ Args ParseArgs(const std::vector<std::string>& argv) {
             args.log_level = ParseLogLevel(require_value("--log-level"));
             continue;
         }
+        if (arg == "--report-cpu") {
+            args.report_cpu = true;
+            continue;
+        }
         if (arg == "--output") {
             args.output_mode = ParseOutputMode(require_value("--output"));
             continue;
@@ -2415,6 +2484,7 @@ BenchmarkReport Run(const Args& requested) {
     report.watch_delivery = args.watch_delivery;
     report.watch_table = args.watch_table;
     report.failed_login_clients = args.failed_logins;
+    report.report_cpu = args.report_cpu;
     report.idle_connections = args.idle_connections;
     if (!args.watch_table.empty()) {
         report.watch = args.watch_table;
@@ -2618,6 +2688,9 @@ std::string RenderHumanReport(const BenchmarkReport& report) {
                     << result.ownership_cycles / result.duration_s << " latency_unit=ownership_cycle ACKs=0\n";
         }
         if (report.failed_login_clients != 0U) out << "Failed logins: " << result.failed_logins << "\n";
+        if (report.report_cpu)
+            out << "CPU: process_s=" << result.cpu_s << " clients_s=" << result.client_cpu_s << " watchers_s=" << result.watch_cpu_s
+                << " context_switches=" << result.context_switches << "\n";
         out << "Throughput (req/s): " << std::fixed << std::setprecision(2) << result.throughput_req_s << "\n";
         out << "Blocks: " << result.completed_blocks << "  Blocks/request: " << result.blocks_per_request
             << "  Blocks/s: " << result.throughput_blocks_s << "  Mix:";
@@ -2689,6 +2762,9 @@ std::string RenderJsonReport(const BenchmarkReport& report) {
         out << "\"throughput_blocks_s\":" << r.throughput_blocks_s << ",";
         out << "\"returned_area_chunks\":" << r.returned_area_chunks << ",";
         if (report.failed_login_clients != 0U) out << "\"failed_logins\":" << r.failed_logins << ",";
+        if (report.report_cpu)
+            out << "\"cpu_s\":" << r.cpu_s << ",\"client_cpu_s\":" << r.client_cpu_s << ",\"watch_cpu_s\":" << r.watch_cpu_s
+                << ",\"context_switches\":" << r.context_switches << ",";
         if (descriptive || r.ownership_cycles != 0U) {
             out << "\"response_bytes\":" << r.response_bytes << ",\"metadata_envelopes\":" << r.metadata_envelopes
                 << ",\"watch_bytes\":" << r.watch_bytes << ",\"watch_changes\":" << r.watch_changes
