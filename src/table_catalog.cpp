@@ -1886,6 +1886,10 @@ std::shared_ptr<Table> TableCatalog::Create(
     // One table of an epoch per data directory: APPLY finds a follower by it.
     const auto epoch = prepared.follower_epoch ? *prepared.follower_epoch : NewStoreId();
     RequireUnusedEpoch(epoch);
+    const auto directory_manifest = ReadDataDirManifest(config_.data_dir);
+    if (!directory_manifest) throw std::runtime_error("data directory manifest disappeared");
+    const auto features = TableScopedFeatures(directory_manifest->features);
+    if (prepared.follower_epoch) RequireFeature(features, *FindFeature("feed_slots"));
     const auto target = TablesDir() / table_name;
     // Made now, so that neither serving the table nor fencing it after a
     // failed undo allocates once it is in tables/.
@@ -1898,10 +1902,8 @@ std::shared_ptr<Table> TableCatalog::Create(
     EnsureDirectoryPathExists(StagingDir(), /*durable_sync=*/true);
     const auto staging = StagingDir() / UniqueOperationName(table_name);
     if (!CreateOwnerOnlyDirectory(staging)) throw std::runtime_error("table staging directory already exists");
-    const auto directory_manifest = ReadDataDirManifest(config_.data_dir);
-    if (!directory_manifest) throw std::runtime_error("data directory manifest disappeared");
     const StoreManifest manifest{
-        .features = TableScopedFeatures(directory_manifest->features),
+        .features = features,
         .geometry = geometry,
         .store_id = epoch,
         .options = EncodeTableOptions(options),

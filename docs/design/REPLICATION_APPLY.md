@@ -11,6 +11,8 @@ A follower's store id is the primary's epoch, so DESCRIBE, GET CHUNK, SCAN CHUNK
 One data directory holds at most one table of an epoch, including tables that are fenced.
 `CREATE TABLE f (...) WITH follower = 'epoch'` creates an empty follower at revision 0 for a primary with no commits or schema changes.
 CREATE refuses an epoch already in use with INVALID_ARGUMENT `reason=epoch_in_use`.
+A follower requires the `feed_slots` table feature because its WAL frames use the existing USER metadata field.
+When the feature is disabled, CREATE refuses the follower with INVALID_ARGUMENT `reason=feature_disabled feature=feed_slots` and points to `ENABLE FEATURE 'feed_slots'`.
 
 Table manifest option TLV 14, `follower`, holds the u64 base revision, which is 0 after CREATE.
 A build that does not know the option refuses to open the table, so it never writes to a follower.
@@ -30,10 +32,11 @@ The target is the follower table whose epoch is the push's epoch; without one th
 The reply is `applied`, or `skipped` when the follower already holds the push.
 
 - A `replication` push commits `form` and `rows` chunks together at the supplied revision, commit time and schema version.
+- The optional tenth field `txn_tables` is null or a list containing only the name of the follower selected by epoch.
 - A `progress` push raises the follower's completed revision.
 - Other push kinds and non-null tag or transaction fields are refused with INVALID_ARGUMENT.
 
-Live WATCH emits the supplied user through the regular change feed.
+The WAL frames and live WATCH pushes carry the supplied user.
 The decoder bounds every length before allocating and refuses malformed pushes with INVALID_ARGUMENT.
 
 ## Planned sender requirements
@@ -43,7 +46,7 @@ The decoder bounds every length before allocating and refuses malformed pushes w
 - Every commit that took a revision, also one whose write changed no value, since its chunks took the revision as their version.
 - `AFTER epoch 0` continues on a table that has no commit and no schema change, whatever its revision: a new table's clock starts at the directory's version floor, so its revision can be above 0 before its first commit.
 - A seed from a backup resumes `AFTER epoch cut`, so a program starts the replication watch before BACKUP, which keeps the cut in the live history.
-- For APPLY GROUP: `txn` names the cross-table transaction and the number of tables it wrote, so a program knows when it holds every member.
+- For APPLY GROUP, `txn` identifies the cross-table transaction and `txn_tables` lists its members.
 
 ## Durability and position
 
@@ -63,6 +66,7 @@ A failure whose outcome is unknown answers OUTCOME_UNKNOWN, as for transactions;
 
 Planned single-table pushes will carry schema changes, checkpoint collection and tombstone compaction.
 Planned `RESTORE TABLE t FROM 'backup' AS f FOLLOWER` would seed a follower at the backup cut with the primary's epoch, lineage, chunks, versions, tombstones and schema history, with slots left out.
+That restore mode will also require the `feed_slots` table feature.
 
 ### APPLY GROUP (planned)
 

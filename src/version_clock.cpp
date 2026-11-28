@@ -325,14 +325,18 @@ void ChunkStore::ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive
 }
 
 void ChunkStore::ReserveReplicatedRevision(std::uint64_t revision) {
-    const auto next = revision + 1U;
-    if (next < version_clock_ceiling_.load(std::memory_order_acquire)) return;
+    // Like an ordinary reservation, the issued revision must be below the
+    // durable ceiling. Its successor can equal the ceiling but cannot wrap.
+    if (revision == std::numeric_limits<std::uint64_t>::max())
+        throw std::invalid_argument("the push's revision is out of range");
+    if (revision < version_clock_ceiling_.load(std::memory_order_acquire)) return;
     std::lock_guard lock(version_clock_mutex_);
-    if (next >= version_clock_ceiling_.load(std::memory_order_acquire))
-        ExtendVersionClockCeilingLocked(next);
+    if (revision >= version_clock_ceiling_.load(std::memory_order_acquire))
+        ExtendVersionClockCeilingLocked(revision);
 }
 
 std::uint64_t ChunkStore::NextChunkVersion() {
+    if (follower_base_) throw std::invalid_argument("a follower takes its revisions only through APPLY");
     if (access_mode_ == AccessMode::kReadOnly) {
         return NewChunkVersionToken();
     }
@@ -423,10 +427,7 @@ void ChunkStore::StartFollowerClock() {
     // persisted ceiling, which only bounds tokens; the directory's version
     // floor does not apply.
     const std::uint64_t position = std::max(*follower_base_, coordinate_index_->maximum_recovered_revision());
-    if (position >= std::numeric_limits<std::uint64_t>::max() - 1U)
-        throw std::runtime_error("follower revision is out of range");
-    RaiseVersionClockAbove(position);
-    std::lock_guard lock(version_clock_mutex_);
+    ReserveReplicatedRevision(position);
     version_clock_.store(position + 1U, std::memory_order_seq_cst);
 }
 

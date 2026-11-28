@@ -19,6 +19,11 @@ One push per commit, in commit order, with every chunk the commit changed:
 
 `[replication, epoch, revision, commit_time_ms, user, schema_version, chunks, tag, txn, txn_tables]`
 
+The sender uses ten fields, with `tag` and `txn` null for the current single-table APPLY.
+APPLY also accepts its original nine-field single-table form, which omits `txn_tables`.
+When present, `txn_tables` must be null or an array containing only the name of the follower selected by `epoch`.
+The sender uses null for single-table commits so they can apply to a follower with a different name.
+
 Every commit that took a revision is sent, also one whose writes changed no value: each chunk it wrote is listed, since the chunk took the revision as its version.
 Each chunk is `[cx, cy(, cz), version, kind, data]`:
 - `version` is the chunk's version after the commit, which equals `revision` (A6).
@@ -49,7 +54,8 @@ Schema entries already take a revision on the live ring; they gain `checks` and 
 
 ## What waits elsewhere
 
-- `txn` and `tag` stay null until #136 puts group ids and tags into WAL frames; the push already has their places. `txn` keeps the type PROTOCOL_FOUNDATION.md gives it in every push and reply (a nullable u64), and `txn_tables`, the number of tables the transaction wrote, follows it, so APPLY GROUP (REPLICATION_APPLY.md) knows when it holds every member; both are null without a group.
+- `txn` and `tag` stay null until #136 puts group ids and tags into WAL frames.
+- A future group push will carry a nullable u64 `txn` and a `txn_tables` list of member table names so APPLY GROUP can collect every member.
 - Deletes by expiry (E8, `expire_column`, #279) are ordinary commits of user `@expire` through the chunk path, so they arrive as `form` chunks with `user` `@expire`; a follower deletes nothing on its own and applies them.
 - `APPLY`, follower tables and their refusals are box 4.
 

@@ -69,8 +69,9 @@ struct ReplicationPush {
 // The kind and epoch of a decoded push, before the table is known. Throws
 // std::invalid_argument for a push APPLY does not take.
 [[nodiscard]] ReplicationPush ReadReplicationPushHeader(const ReplicationPushValue& push);
-// The whole push, for a table with `dims` axes.
-[[nodiscard]] ReplicationPush ReadReplicationPush(const ReplicationPushValue& push, std::uint8_t dims);
+// The whole push, including any table list, for the follower selected by epoch.
+[[nodiscard]] ReplicationPush ReadReplicationPush(const ReplicationPushValue& push, std::uint8_t dims,
+    std::string_view table);
 
 // 32 hex digits to an epoch; std::nullopt for anything else.
 [[nodiscard]] std::optional<StoreId> ParseEpochHex(std::string_view hex);

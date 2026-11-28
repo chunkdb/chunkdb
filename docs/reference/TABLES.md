@@ -131,8 +131,9 @@ CREATE TABLE, ALTER TABLE ... RENAME TO and RESTORE TABLE also refuse the name `
 | `var_max_chunk_bytes` | Encoded text and bytes per chunk; default 1048576 bytes. |
 | `feed_buffer_bytes` | Live feed history and output; default 67108864 bytes. |
 | `slot_max_bytes` | Retained history per durable slot; default 1073741824 bytes. |
-| `follower` | CREATE TABLE only: the primary table's epoch, 32 hex digits; the table changes only through [APPLY](FEED.md#apply). Needs REPLICATION. |
+| `follower` | CREATE TABLE only. Takes the primary table's epoch as 32 hex digits and requires REPLICATION and the `feed_slots` table feature. The table takes writes through [APPLY](FEED.md#apply). |
 
+On a directory where the feature is disabled, an administrator can run `ENABLE FEATURE 'feed_slots'` before creating a follower.
 Feed and slot limits must be positive.
 Unset limits inherit server defaults each time the table opens; explicit table values persist across restarts.
 DESCRIBE reports effective limits; changing another option preserves whether a limit inherits.
@@ -170,6 +171,7 @@ The `chunk_columns` list uses the same column-description maps as `columns`.
 | INVALID_ARGUMENT | SWAP TABLES names one table twice. | Name two tables. |
 | INVALID_ARGUMENT `reason=follower` | A write, a column or check change, COMPACT TOMBSTONES, CREATE SLOT, or a migration that alters the follower or creates a slot on it. | Change the primary and apply its data changes through [APPLY](FEED.md#apply). |
 | INVALID_ARGUMENT `reason=epoch_in_use` | CREATE TABLE ... WITH follower names the epoch of a table of this server. | Create the follower on another server. |
+| INVALID_ARGUMENT `reason=feature_disabled feature=feed_slots` | CREATE TABLE ... WITH follower requires the `feed_slots` table feature. | Run `ENABLE FEATURE 'feed_slots'`. |
 | INVALID_ARGUMENT | DROP NULL finds a NULL: `column c cannot drop NULL: block (x, y) holds NULL`. | Set a value in that block, then run DROP NULL again. |
 | INVALID_ARGUMENT | An ALTER COLUMN change leaves the column as it is, or makes it both NULL and REQUIRED. | Drop the other attribute first. |
 | CHECK_FAILED | A write leaves a block for which a check is false, or ADD CHECK finds a stored one: `block (x, y) fails CHECK name (condition)`, with `check=name`. | Change the values, or drop the check. |

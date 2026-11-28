@@ -171,7 +171,7 @@ ReplicationPush ReadReplicationPushHeader(const ReplicationPushValue& value) {
     ReplicationPush push;
     const auto kind = String(items[0], "the push kind");
     if (kind == "replication") {
-        if (items.size() != 9U) Bad("a replication push has 9 elements");
+        if (items.size() != 9U && items.size() != 10U) Bad("a replication push has 9 or 10 elements");
         push.kind = ReplicationPushKind::kReplication;
     } else if (kind == "progress") {
         if (items.size() != 3U) Bad("a progress push has 3 elements");
@@ -187,7 +187,7 @@ ReplicationPush ReadReplicationPushHeader(const ReplicationPushValue& value) {
     return push;
 }
 
-ReplicationPush ReadReplicationPush(const ReplicationPushValue& value, std::uint8_t dims) {
+ReplicationPush ReadReplicationPush(const ReplicationPushValue& value, std::uint8_t dims, std::string_view table) {
     auto push = ReadReplicationPushHeader(value);
     if (push.kind == ReplicationPushKind::kProgress) return push;
     if (dims != 2U && dims != 3U) throw std::logic_error("a table has 2 or 3 dimensions");
@@ -197,6 +197,15 @@ ReplicationPush ReadReplicationPush(const ReplicationPushValue& value, std::uint
     push.schema_version = Unsigned(items[5], "the schema version");
     if (!IsNull(items[7])) throw std::invalid_argument("APPLY does not take a push with a tag yet");
     if (!IsNull(items[8])) throw std::invalid_argument("a push of a cross-table transaction needs APPLY GROUP");
+    if (items.size() == 10U && !IsNull(items[9])) {
+        const auto& tables = items[9];
+        if (tables.type != '*' || tables.items.size() != 1U ||
+            (tables.items.front().type != '$' && tables.items.front().type != '+') ||
+            tables.items.front().text != table) {
+            throw std::invalid_argument("APPLY requires txn_tables to be null or a list naming only follower table '" +
+                std::string(table) + "'. Cross-table commits need APPLY GROUP");
+        }
+    }
     const auto& chunks = Array(items[6], "the chunks");
     push.chunks.reserve(chunks.size());
     for (const auto& entry : chunks) {

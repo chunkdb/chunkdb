@@ -4,7 +4,6 @@
 #include <cstdlib>
 #include <exception>
 #include <filesystem>
-#include <limits>
 #include <fstream>
 #include <mutex>
 #include <optional>
@@ -26,6 +25,7 @@
 #include "txn_block_rows.hpp"
 #include "wal_writer.hpp"
 #include "change_feed.hpp"
+#include "feature_flags.hpp"
 #include "feed_prefix.hpp"
 #include "feed_slots.hpp"
 
@@ -379,8 +379,8 @@ bool ChunkStore::ApplyReplicatedCommit(
     std::uint64_t revision, std::uint64_t commit_time_ms, std::vector<TxnChunkWrite> writes) {
     if (!follower_base_) throw std::logic_error("APPLY into a table that is not a follower");
     if (access_mode_ == AccessMode::kReadOnly) throw std::invalid_argument("store is read-only");
-    if (revision == 0U || revision == std::numeric_limits<std::uint64_t>::max())
-        throw std::invalid_argument("the push's revision is out of range");
+    RequireFeature(features_, *FindFeature("feed_slots"));
+    if (revision == 0U) throw std::invalid_argument("the push's revision is out of range");
     if (revision < version_clock_.load(std::memory_order_acquire)) return false;
     if (writes.empty()) return ApplyReplicatedProgress(revision);
     auto snapshot = BeginTxnSnapshot(std::chrono::hours(24));
@@ -392,10 +392,10 @@ bool ChunkStore::ApplyReplicatedCommit(
 bool ChunkStore::ApplyReplicatedProgress(std::uint64_t revision) {
     if (!follower_base_) throw std::logic_error("APPLY into a table that is not a follower");
     if (access_mode_ == AccessMode::kReadOnly) throw std::invalid_argument("store is read-only");
-    if (revision == std::numeric_limits<std::uint64_t>::max())
-        throw std::invalid_argument("the push's revision is out of range");
+    RequireFeature(features_, *FindFeature("feed_slots"));
     if (revision < version_clock_.load(std::memory_order_acquire)) return false;
-    RaiseVersionClockAbove(revision);
+    ReserveReplicatedRevision(revision);
+    version_clock_.store(revision + 1U, std::memory_order_seq_cst);
     return true;
 }
 
@@ -408,6 +408,12 @@ std::uint64_t ChunkStore::CommitTransactionImpl(
     if (access_mode_ == AccessMode::kReadOnly) {
         throw std::invalid_argument("store is read-only");
     }
+    // APPLY holds the per-store apply lock and its table lease. The lock
+    // serializes progress and commits, the lease excludes reopen, and a
+    // follower refuses local revision allocation. Cold loads validate their
+    // revisions against this clock without advancing it.
+    if (replicated != nullptr && replicated->revision < version_clock_.load(std::memory_order_seq_cst))
+        throw std::invalid_argument("the push's revision is not above the follower's revision");
 
     // Everything the caller passed is checked before any chunk is touched.
     // APPLY takes the primary's commit whatever this table's limit: a commit
@@ -625,6 +631,8 @@ std::uint64_t ChunkStore::CommitTransactionImpl(
         return 0;
     }
 
+    if (replicated != nullptr) ReserveReplicatedRevision(replicated->revision);
+
     // Each WAL's size becomes a durable boundary the transaction can go back
     // to.
     for (std::size_t i = 0; i < changes.size(); ++i) {
@@ -655,17 +663,7 @@ std::uint64_t ChunkStore::CommitTransactionImpl(
     // before the intent removal and the inline checkpoints below.
     std::optional<FeedWriteGuard> feed;
     feed.emplace(*this);
-    std::uint64_t version = 0U;
-    if (replicated != nullptr) {
-        // The producer bound was taken above at or below the clock, so the
-        // frontier stays below the revision until this commit is published.
-        if (replicated->revision < version_clock_.load(std::memory_order_seq_cst))
-            throw std::invalid_argument("the push's revision is not above the follower's revision");
-        ReserveReplicatedRevision(replicated->revision);
-        version = replicated->revision;
-    } else {
-        version = NextChunkVersion();
-    }
+    const std::uint64_t version = replicated != nullptr ? replicated->revision : NextChunkVersion();
     feed->Version(version);
     std::uint64_t commit_time_ms = 0;
     if (replicated != nullptr) {
@@ -690,7 +688,8 @@ std::uint64_t ChunkStore::CommitTransactionImpl(
             change.bytes = BuildWalHeader(change.target->coord, store_id_, features_, geometry_.dims());
         }
         feed->Before(change.target->coord, chunk.payload, chunk.presence_bitmap, chunk.vars, chunk.chunk_columns.get(), chunk.written);
-        WalFrameBuilder frame(&change.bytes, geometry_.layout().schema().version, {}, SlotWriteUser());
+        const auto user = replicated != nullptr ? std::optional{CurrentWriteUser()} : SlotWriteUser();
+        WalFrameBuilder frame(&change.bytes, geometry_.layout().schema().version, {}, user);
         AppendDiffSpans(&frame, 0U, chunk.payload, state.payload);
         AppendDiffSpans(&frame, geometry_.ChunkPayloadBytes(), chunk.presence_bitmap, state.presence_bitmap);
         AppendVarDiff(&frame, chunk.vars, state.vars);
@@ -875,9 +874,10 @@ std::uint64_t ChunkStore::CommitTransactionImpl(
     // write's commit point (FinishOrdinaryMutationLocked).
 
     if (replicated != nullptr) {
-        // APPLY serializes writes on a follower and still holds the producer
-        // bound. A snapshot opening after this store sees the new revision;
-        // an older one counted itself before reading the clock.
+        // The pre-WAL check and APPLY admission keep the live clock at or
+        // below version. The producer bound stays held while a new snapshot
+        // sees this revision, and an older one counted itself before reading
+        // the clock.
         version_clock_.store(version + 1U, std::memory_order_seq_cst);
         keep_states = txn_history_->OpenCount() > 0U;
     }

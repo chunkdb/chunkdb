@@ -19,11 +19,16 @@
 #include <vector>
 
 #include "chunkdb/engine.hpp"
+#include "chunkdb/file_layout.hpp"
 #include "chunkdb/protocol.hpp"
 #include "chunkdb/table_catalog.hpp"
+#include "chunk_store_internal.hpp"
+#include "feature_flags.hpp"
+#include "feed_archive.hpp"
 #include "replication_push.hpp"
 #include "store_manifest.hpp"
 #include "test_utils.hpp"
+#include "wal_replay.hpp"
 
 #ifndef _WIN32
 #include <sys/wait.h>
@@ -34,6 +39,7 @@ using namespace chunkdb;
 using Parameters = std::vector<std::optional<std::string>>;
 
 constexpr const char* kColumns = "(n u8, s text(8) NULL) CHUNK 2 x 2";
+constexpr std::string_view kPrimaryUser = "primary_writer";
 
 class ScopedEnv {
   public:
@@ -144,7 +150,20 @@ std::string Bulk(std::string_view text) {
     return out;
 }
 std::string Int(std::int64_t value) { return ":" + std::to_string(value) + "\r\n"; }
+std::string UInt(std::uint64_t value) {
+    std::string out;
+    Protocol::AppendInteger(out, value);
+    return out;
+}
 std::string Null() { return "_\r\n"; }
+
+void SaveBytes(const std::filesystem::path& path, const std::vector<std::uint8_t>& bytes) {
+    std::ofstream output(path, std::ios::binary | std::ios::trunc);
+    output.write(reinterpret_cast<const char*>(bytes.data()), static_cast<std::streamsize>(bytes.size()));
+    output.close();
+    assert(output);
+}
+
 std::string U64Parameter(std::uint64_t value) {
     std::string bytes(8U, '\0');
     for (std::size_t i = 0; i < 8U; ++i) bytes[i] = static_cast<char>((value >> (8U * i)) & 0xFFU);
@@ -177,17 +196,18 @@ Chunk RowsChunk(std::int64_t cx, std::int64_t cy, std::uint64_t version, const s
 }
 
 std::string CommitPush(const std::string& epoch, std::uint64_t revision, std::uint64_t time,
-    std::optional<std::string> user, std::uint64_t schema, const std::vector<Chunk>& chunks) {
-    std::string push = ">9\r\n" + Bulk("replication") + Bulk(epoch) + Int(static_cast<std::int64_t>(revision)) +
-        Int(static_cast<std::int64_t>(time)) + (user ? Bulk(*user) : Null()) + Int(static_cast<std::int64_t>(schema)) +
+    std::optional<std::string> user, std::uint64_t schema, const std::vector<Chunk>& chunks,
+    const std::optional<std::string>& txn_tables = std::nullopt) {
+    std::string push = (txn_tables ? ">10\r\n" : ">9\r\n") + Bulk("replication") + Bulk(epoch) + UInt(revision) +
+        UInt(time) + (user ? Bulk(*user) : Null()) + UInt(schema) +
         "*" + std::to_string(chunks.size()) + "\r\n";
     for (const auto& chunk : chunks)
-        push += "*5\r\n" + Int(chunk.cx) + Int(chunk.cy) + Int(static_cast<std::int64_t>(chunk.version)) + chunk.data;
-    return push + Null() + Null();
+        push += "*5\r\n" + Int(chunk.cx) + Int(chunk.cy) + UInt(chunk.version) + chunk.data;
+    return push + Null() + Null() + txn_tables.value_or(std::string{});
 }
 
 std::string ProgressPush(const std::string& epoch, std::uint64_t revision) {
-    return ">3\r\n" + Bulk("progress") + Bulk(epoch) + Int(static_cast<std::int64_t>(revision));
+    return ">3\r\n" + Bulk("progress") + Bulk(epoch) + UInt(revision);
 }
 
 // A primary with table t and a follower with table f of t's epoch.
@@ -236,6 +256,18 @@ void TestFollowerTable() {
     ExpectError(follower.Run("SET BLOCK 0 0 IN f n = 1"), "INVALID_ARGUMENT reason=follower ");
     ExpectError(follower.Run("SET BLOCK 0 0 IN f n = n + 1 IF n = 0"), "INVALID_ARGUMENT reason=follower ");
     ExpectError(follower.Run("DELETE BLOCK 0 0 FROM f"), "INVALID_ARGUMENT reason=follower ");
+    {
+        const auto table = follower.catalog->Require("f");
+        const auto lease = table->Acquire();
+        assert(lease);
+        bool refused = false;
+        try {
+            lease->store().SetBlock(0, 0, {ColumnAssignment{.column = "n", .value = std::uint64_t{1U}}});
+        } catch (const std::invalid_argument& error) {
+            refused = std::string_view(error.what()) == "a follower takes its revisions only through APPLY";
+        }
+        assert(refused && lease->store().CompletedRevision() == 0U);
+    }
     assert(pair.primary.Run("SET BLOCK 0 0 IN t n = 1").front() == ':');
     const auto form = Form(pair.primary.Run("GET CHUNK 0 0 FROM t"));
     ExpectError(follower.Run("SET CHUNK 0 0 IN f $1", Parameters{form}), "INVALID_ARGUMENT reason=follower ");
@@ -266,6 +298,23 @@ void TestFollowerTable() {
     follower.Restart();
     ExpectError(follower.Run("SET BLOCK 0 0 IN f n = 1"), "INVALID_ARGUMENT reason=follower ");
     assert(DescribeField(follower.Run("DESCRIBE f"), "epoch") == pair.epoch);
+}
+
+void TestFollowerRequiresFeedSlots() {
+    Server server("chunkdb-apply-feature");
+    server.Close();
+    auto manifest = ReadDataDirManifest(server.dir.path());
+    assert(manifest);
+    manifest->features.incompat &= ~(kFeatureFeedSlots | kFeatureSlotFilters);
+    SaveBytes(DataDirManifestPath(server.dir.path()), SerializeDataDirManifest(*manifest));
+    server.Open();
+    const auto create = std::string("CREATE TABLE f ") + kColumns + " WITH follower = '" + std::string(32U, 'a') + "'";
+    const auto refused = server.Run(create);
+    ExpectError(refused, "INVALID_ARGUMENT reason=feature_disabled feature=feed_slots ");
+    assert(refused.find("ENABLE FEATURE 'feed_slots'") != std::string::npos);
+    assert(!std::filesystem::exists(server.dir.path() / "tables" / "f"));
+    assert(server.Run("ENABLE FEATURE 'feed_slots'") == "+OK\r\n");
+    assert(server.Run(create) == "+OK\r\n");
 }
 
 void TestFencedFollowerReservesEpoch() {
@@ -332,6 +381,57 @@ void TestApplyForms() {
         {FormChunk(1, 0, FormVersion(empty), std::nullopt)})) == "+applied\r\n");
     pair.ExpectSameChunk(1, 0);
     pair.ExpectSameRevision();
+}
+
+void TestApplyTxnTables() {
+    Pair pair;
+    const auto push = [&](std::uint64_t revision, const std::optional<std::string>& tables) {
+        return CommitPush(pair.epoch, revision, 1U, std::nullopt, 1U,
+            {RowsChunk(0, 0, revision, {Row{0, 0, std::vector<std::optional<std::string>>{
+                U64Parameter(revision), std::nullopt}}})}, tables);
+    };
+    auto& follower = pair.follower;
+    assert(follower.Apply(push(1U, std::nullopt)) == "+applied\r\n");
+    assert(follower.Apply(push(2U, Null())) == "+applied\r\n");
+    assert(follower.Apply(push(3U, "*1\r\n" + Bulk("f"))) == "+applied\r\n");
+    const auto before = follower.Run("GET CHUNK 0 0 FROM f");
+    const auto another_table = push(4U, "*1\r\n" + Bulk("g"));
+    constexpr std::string_view wrong_tables = "INVALID_ARGUMENT reason=invalid_argument APPLY requires txn_tables";
+    ExpectError(follower.Apply(another_table), wrong_tables);
+    for (const auto& tables : {std::string("*0\r\n"), "*2\r\n" + Bulk("f") + Bulk("g"), Int(1), "*1\r\n" + Null()})
+        ExpectError(follower.Apply(push(4U, tables)), wrong_tables);
+    assert(follower.Run("GET CHUNK 0 0 FROM f") == before);
+    assert(DescribeField(follower.Run("DESCRIBE f"), "revision") == ":3");
+    assert(follower.Run("ALTER TABLE f RENAME TO g") == "+OK\r\n");
+    assert(follower.Apply(another_table) == "+applied\r\n");
+    assert(DescribeField(follower.Run("DESCRIBE g"), "revision") == ":4");
+}
+
+void TestFollowerRevisionCeiling() {
+    Pair pair;
+    auto& follower = pair.follower;
+    follower.Close();
+    const auto clock = follower.dir.path() / "tables" / "f" / "chunkdb.version";
+    SaveBytes(clock, SerializeVersionClockRecord(UINT64_MAX));
+    follower.Open();
+    const auto push = [&](std::uint64_t revision) {
+        return CommitPush(pair.epoch, revision, 1U, std::nullopt, 1U,
+            {RowsChunk(0, 0, revision, {Row{0, 0, std::vector<std::optional<std::string>>{
+                U64Parameter(7U), std::nullopt}}})});
+    };
+    constexpr std::string_view exhausted = "INVALID_ARGUMENT reason=invalid_argument the push's revision is out of range";
+    ExpectError(follower.Apply(push(UINT64_MAX)), exhausted);
+    {
+        const auto table = follower.catalog->Require("f");
+        assert(!std::filesystem::exists(ChunkWalPath(clock.parent_path(), table->geometry(), {0, 0})));
+    }
+    assert(follower.Run("GET CHUNK 0 0 FROM f") == "_\r\n");
+    assert(DescribeField(follower.Run("DESCRIBE f"), "revision") == ":0");
+    assert(follower.Apply(push(UINT64_MAX - 1U)) == "+applied\r\n");
+    ExpectError(follower.Apply(ProgressPush(pair.epoch, UINT64_MAX)), exhausted);
+    follower.Restart();
+    assert(DescribeField(follower.Run("DESCRIBE f"), "revision") == "(" + std::to_string(UINT64_MAX - 1U));
+    assert(FormVersion(Form(follower.Run("GET CHUNK 0 0 FROM f"))) == UINT64_MAX - 1U);
 }
 
 void TestApplyRows() {
@@ -514,7 +614,51 @@ std::string TwoChunkCommit(Pair& pair) {
         if (first.empty()) first = form;
         chunks.push_back(FormChunk(cx, cy, FormVersion(form), form));
     }
-    return CommitPush(pair.epoch, FormVersion(first), FormTime(first), std::nullopt, FormSchema(first), chunks);
+    return CommitPush(pair.epoch, FormVersion(first), FormTime(first), std::string(kPrimaryUser), FormSchema(first), chunks);
+}
+
+void ExpectReplayedCommit(const Pair& pair, const std::string& push, bool committed) {
+    const auto header = ReadReplicationPushHeader(DecodeReplicationValue(push));
+    auto lease = pair.follower.catalog->Require("f")->Acquire();
+    assert(lease);
+    const auto& store = lease->store();
+    for (const ChunkCoord coord : {ChunkCoord{0, 0}, ChunkCoord{1, 0}}) {
+        const auto path = ChunkWalPath(store.data_dir(), store.geometry(), coord);
+        if (!committed && !std::filesystem::exists(path)) continue;
+        std::ifstream input(path, std::ios::binary);
+        const auto frame = InspectFirstWalFrameStream(input, std::filesystem::file_size(path), store.geometry(), coord,
+            header.epoch, store.features());
+        if (committed) {
+            assert(frame && frame->revision == header.revision && frame->user && *frame->user == kPrimaryUser);
+        } else {
+            assert(!frame);
+        }
+    }
+    // Replay a stable WAL after recovery with the same reader that encodes
+    // catch-up change pushes. Followers do not create durable slots.
+    auto replay = FeedArchiveAccess::Create(store.data_dir(), store.geometry(), header.epoch,
+        FeedPosition{header.epoch, 0U}, header.revision, {}, store.features());
+    const auto event = replay.Next();
+    if (!committed) {
+        assert(!event);
+        return;
+    }
+    assert(event && event->kind == FeedEntry::Kind::kChange && event->position.revision == header.revision);
+    assert(event->user && *event->user == kPrimaryUser && event->protocol_frame);
+    const auto prefix = ">10\r\n" + Bulk("change") + Bulk(pair.epoch) + UInt(header.revision) +
+        UInt(event->commit_time_ms) + Bulk(kPrimaryUser);
+    assert(event->protocol_frame->starts_with(prefix));
+    assert(!replay.Next());
+}
+
+void TestAppliedAuthorSurvivesReopen() {
+    Pair pair;
+    const auto push = TwoChunkCommit(pair);
+    assert(pair.follower.Apply(push) == "+applied\r\n");
+    pair.follower.Restart();
+    pair.ExpectSameChunk(0, 0);
+    pair.ExpectSameChunk(1, 0);
+    ExpectReplayedCommit(pair, push, true);
 }
 
 // The follower after a failed APPLY of TwoChunkCommit: both chunks or
@@ -559,6 +703,7 @@ void TestOutcomeUnknownResend() {
     }
     pair.follower.Restart();
     ExpectWholeOrNothing(pair, push, true);
+    ExpectReplayedCommit(pair, push, true);
 }
 
 constexpr int kCrashExit = 86;
@@ -628,10 +773,12 @@ void TestCrashDuringApply(const std::string& executable, DurabilityMode mode) {
             assert(false);
         }
         pair.follower.Open();
+        ExpectReplayedCommit(pair, push, item.committed);
         ExpectWholeOrNothing(pair, push, item.committed);
         pair.follower.Restart();
         pair.ExpectSameChunk(0, 0);
         pair.ExpectSameRevision();
+        if (!item.committed) ExpectReplayedCommit(pair, push, true);
     }
 }
 
@@ -707,15 +854,19 @@ int main(int argc, char** argv) {
     TestManifestFollower();
     TestDecoder();
     TestFollowerTable();
+    TestFollowerRequiresFeedSlots();
     TestFencedFollowerReservesEpoch();
     TestDuplicateEpochRefusesStartup();
     TestApplyForms();
+    TestApplyTxnTables();
+    TestFollowerRevisionCeiling();
     TestApplyRows();
     TestApplyRefusals();
     TestProgressAndRestart();
     TestDdlRacingReopen();
     TestFollowerCheckpoint();
     TestApplyRollbackCanRetry();
+    TestAppliedAuthorSurvivesReopen();
     TestOutcomeUnknownResend();
     TestRestoreFollowerWritable();
     return 0;

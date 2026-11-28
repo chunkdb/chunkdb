@@ -1006,7 +1006,7 @@ void RequireLocalWrites(const ChunkStore& store, std::string_view table, std::st
     if (!store.follower())
         throw TableArgumentError("not_follower", "table '" + name + "' has the push's epoch but is not a follower");
     const Geometry& geometry = store.geometry();
-    const auto push = ReadReplicationPush(value, geometry.dims());
+    const auto push = ReadReplicationPush(value, geometry.dims(), name);
     const auto apply = store.LockReplicationApply();
     if (push.kind == ReplicationPushKind::kProgress) return ApplyReply(store.ApplyReplicatedProgress(push.revision));
     if (const auto completed = store.CompletedRevision(); completed && push.revision <= *completed) return ApplyReply(false);
