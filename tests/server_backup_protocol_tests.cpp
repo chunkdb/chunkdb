@@ -139,11 +139,15 @@ void StreamRoundTrip(bool tls) {
         auto table = catalog.Find("t");
         assert(table->lineage() && table->lineage()->fork_revision >= cut && table->lineage()->fork_revision < after);
         auto lease = table->Acquire();
-        const std::vector<ColumnValue> expected{std::uint64_t{7U},
-            BytesValue{std::vector<std::uint8_t>(payload.begin(), payload.end())}};
+        std::vector<ColumnValue> expected;
+        expected.reserve(2U);
+        expected.emplace_back(std::uint64_t{7U});
+        expected.emplace_back(BytesValue{std::vector<std::uint8_t>(payload.begin(), payload.end())});
         assert(lease->store().GetBlock(0, 0) == expected);
         auto other = catalog.Find("other")->Acquire();
-        assert(other->store().GetBlock(-1, 2) == std::vector<ColumnValue>{std::uint64_t{42U}});
+        std::vector<ColumnValue> expected_other;
+        expected_other.emplace_back(std::uint64_t{42U});
+        assert(other->store().GetBlock(-1, 2) == expected_other);
     }
 
     const auto rejected_target = files.path() / "rejected";
@@ -270,7 +274,8 @@ void StreamOutputDeadline() {
     admin->Ok("CREATE TABLE t (n u8, data bytes(524288)) CHUNK 2 x 2");
     {
         auto lease = harness.catalog->Find("t")->Acquire();
-        const std::vector<ColumnAssignment> value{{"data", BytesValue{std::vector<std::uint8_t>(524288U, 0xA1)}}};
+        std::vector<ColumnAssignment> value;
+        value.push_back({"data", BytesValue{std::vector<std::uint8_t>(524288U, 0xA1)}});
         for (std::int64_t i = 0; i < 24; ++i) lease->store().SetBlock(2 * i, 0, value);
     }
     Client slow(harness.port, false);

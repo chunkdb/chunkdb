@@ -2569,7 +2569,7 @@ std::string CommandEngine::ExecuteStatement(
                                     },
                                 });
                             });
-                            return {};
+                            return std::string{};
                         }
                         if (config_.backup_dir.empty())
                             throw std::invalid_argument("BACKUP is disabled: set --backup-dir <path>");
