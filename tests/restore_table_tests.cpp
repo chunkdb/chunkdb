@@ -1,7 +1,9 @@
 // RESTORE TABLE into a running catalog, SWAP TABLES and ALTER TABLE ... RENAME
 // TO (docs/design/RESTORE_TABLE.md).
+#include <limits>
 #include <stop_token>
 
+#include "chunk_store_internal.hpp"
 #include "feed_slots.hpp"
 #include "restore_table_test_utils.hpp"
 #include "statement_control.hpp"
@@ -57,12 +59,142 @@ void RestoresIntoNewName() {
 void KeepsTheBackedUpName() {
     Source source;
     TableCatalog catalog(source.Config());
+    // Read from the dropped table after the backup cut.
+    const auto stale = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
+    assert(stale > source.cut);
     catalog.Drop("t");
     auto request = source.Request("t");
     const auto result = catalog.RestoreTable(request);
     const auto table = catalog.Require("t");
     assert(table->store_id() == result.epoch && result.epoch != source.epoch);
     assert(table->Acquire()->store().GetBlockBits(8, 0) == "00000011");
+    // The restored clock starts above the dropped table's, not at the cut's successor.
+    RefusesStaleVersion(catalog, "t", stale);
+}
+
+// After RESTORE ... AS t_restored and SWAP TABLES, `t` reaches the restored
+// table, whose clock the restore started at the cut's successor; a version a
+// client read from the live `t` after the cut never matches it.
+void SwapRefusesStaleVersions() {
+    Source source;
+    std::uint64_t stale = 0U;
+    {
+        TableCatalog catalog(source.Config());
+        (void)catalog.RestoreTable(source.Request());
+        stale = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
+        assert(stale > source.cut);
+        catalog.SwapTables("t", "t_restored");
+        RefusesStaleVersion(catalog, "t", stale);
+    }
+    // The floor that keeps them apart is durable.
+    TableCatalog catalog(source.Config());
+    RefusesStaleVersion(catalog, "t", stale);
+}
+
+// RENAME TO onto the name of a dropped table starts the renamed table's clock
+// above the dropped table's, and a table created later under the old name
+// starts above the renamed table's.
+void RenameRefusesStaleVersions() {
+    Source source;
+    TableCatalog catalog(source.Config());
+    (void)catalog.Create("u", SourceGeometry(), catalog.default_options());
+    std::uint64_t old_name_stale = 0U;
+    {
+        auto lease = catalog.Require("u")->Acquire();
+        lease->store().SetBlockBits(8, 0, "00001111");
+        old_name_stale = lease->store().GetChunkVersion(4, 0);
+    }
+    // A version of `t` at or above every version `u` has reserved.
+    std::uint64_t stale = 0U;
+    {
+        auto lease = catalog.Require("t")->Acquire();
+        lease->store().SetBlockBits(8, 0, "00011111");
+        stale = lease->store().GetChunkVersion(4, 0);
+    }
+    assert(stale > old_name_stale);
+    catalog.Drop("t");
+    catalog.RenameTable("u", "t", nullptr);
+    RefusesStaleVersion(catalog, "t", stale);
+    (void)catalog.Create("u", SourceGeometry(), catalog.default_options());
+    RefusesStaleVersion(catalog, "u", old_name_stale);
+}
+
+// Writes block (8, 0) of `name` until chunk (4, 0) has `version`; the clock
+// gives one version per write.
+void WriteToVersion(TableCatalog& catalog, std::string_view name, std::uint64_t version) {
+    auto lease = catalog.Require(name)->Acquire();
+    auto& store = lease->store();
+    // Each write changes the block, so each takes a version.
+    for (std::uint64_t i = 0U; store.GetChunkVersion(4, 0) < version; ++i)
+        store.SetBlockBits(8, 0, i % 2U == 0U ? "01010101" : "01010100");
+    assert(store.GetChunkVersion(4, 0) == version);
+}
+
+// Creates `u`, an unrelated table whose chunk (4, 0) has the version that a
+// client read from chunk (4, 0) of `t`, with other data; returns that version.
+std::uint64_t SameVersionOtherData(TableCatalog& catalog) {
+    const auto version = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
+    (void)catalog.Create("u", SourceGeometry(), catalog.default_options());
+    WriteToVersion(catalog, "u", version);
+    assert(catalog.Require("u")->Acquire()->store().GetBlockBits(8, 0) !=
+           catalog.Require("t")->Acquire()->store().GetBlockBits(8, 0));
+    return version;
+}
+
+// A write conditioned on `stale`, a version a client read under `name` from
+// the table that held the name before, is refused by the table that holds it
+// now, also where one of its existing chunks carries the same number.
+void RefusesExistingStaleVersion(TableCatalog& catalog, std::string_view name, std::uint64_t stale) {
+    auto lease = catalog.Require(name)->Acquire();
+    auto& store = lease->store();
+    const auto bits = store.GetBlockBits(8, 0);
+    assert(!store.UnsetBlock(8, 0, stale).ok);
+    assert(store.GetBlockBits(8, 0) == bits);
+    auto current = store.ReadChunkState(4, 0);
+    const auto version = store.GetChunkVersion(4, 0);
+    assert(version == store.name_floor() && current.version == version);
+    assert(store.SetChunkStateBytes(4, 0, current.payload, current.presence_bitmap) == version);
+    store.UnsetBlockInState(current, 8, 0);
+    const auto result = store.WriteChunkState(4, 0, std::move(current), version);
+    assert(result.ok && result.version > version && !store.BlockExists(8, 0));
+}
+
+// The backup of `u` at `source.root / "other"`, restored under `name`.
+TableRestoreRequest OtherRequest(const Source& source, std::string name) {
+    return TableRestoreRequest{.backup = source.root / "other", .table = "u", .name = std::move(name)};
+}
+
+// RESTORE ... AS u_restored and SWAP TABLES t, u_restored: `t` then reaches a
+// table whose chunk (4, 0) has the version a client read from `t`.
+void SwapRefusesExistingStaleVersion() {
+    Source source;
+    TableCatalog catalog(source.Config());
+    const auto stale = SameVersionOtherData(catalog);
+    (void)catalog.BackupTo(source.root / "other", {});
+    (void)catalog.RestoreTable(OtherRequest(source, "u_restored"));
+    catalog.SwapTables("t", "u_restored");
+    RefusesExistingStaleVersion(catalog, "t", stale);
+}
+
+// DROP TABLE t and RESTORE ... AS t from a backup of another table.
+void RestoreAfterDropRefusesExistingStaleVersion() {
+    Source source;
+    TableCatalog catalog(source.Config());
+    const auto stale = SameVersionOtherData(catalog);
+    (void)catalog.BackupTo(source.root / "other", {});
+    catalog.Drop("t");
+    (void)catalog.RestoreTable(OtherRequest(source, "t"));
+    RefusesExistingStaleVersion(catalog, "t", stale);
+}
+
+// DROP TABLE t and ALTER TABLE u RENAME TO t.
+void RenameOntoDroppedRefusesExistingStaleVersion() {
+    Source source;
+    TableCatalog catalog(source.Config());
+    const auto stale = SameVersionOtherData(catalog);
+    catalog.Drop("t");
+    catalog.RenameTable("u", "t", nullptr);
+    RefusesExistingStaleVersion(catalog, "t", stale);
 }
 
 void LeavesNothingAfterRefusal(const Source& source, TableCatalog& catalog) {
@@ -192,6 +324,44 @@ void InjectedFailures() {
     Verified(source.data);
 }
 
+void FailedRestoreNameFloor() {
+    Source source;
+    std::uint64_t stale = 0U;
+    {
+        TableCatalog catalog(source.Config());
+        stale = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
+        catalog.Drop("t");
+        for (const char* point : {"CHUNKDB_FAILPOINT_NAME_FLOOR_WRITE_FAIL_ONCE",
+                 "CHUNKDB_FAILPOINT_RESTORE_TABLE_PUBLISH_FAIL_ONCE"}) {
+            txn_test::ScopedEnv fail(point, "1");
+            assert(Throws([&] { (void)catalog.RestoreTable(source.Request("t")); }).find("injected") != std::string::npos);
+            assert(catalog.Find("t") == nullptr && catalog.Fences().empty());
+            assert(Entries(source.data / ".chunkdb.staging") == 0U);
+        }
+        {
+            txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_RESTORE_TABLE_OPEN_FAIL_ONCE", "1");
+            txn_test::ScopedEnv undo("CHUNKDB_FAILPOINT_RESTORE_TABLE_UNDO_FAIL_ONCE", "1");
+            assert(Throws([&] { (void)catalog.RestoreTable(source.Request("t")); }).find("opening a restored table") != std::string::npos);
+        }
+        assert(catalog.Find("t") == nullptr && catalog.Fence("t").has_value());
+        catalog.RecoverTable("t");
+        auto lease = catalog.Require("t")->Acquire();
+        auto& store = lease->store();
+        const auto floor = ReadStoreManifest(source.data / "tables/t")->name_floor;
+        const auto result = store.UnsetBlock(8, 0, stale);
+        assert(!result.ok && result.version == floor && floor > stale);
+        assert(store.GetBlockBits(8, 0) == "00000011" && store.GetChunkVersion(4, 0) == floor);
+    }
+    TableCatalog catalog(source.Config());
+    auto lease = catalog.Require("t")->Acquire();
+    auto& store = lease->store();
+    const auto floor = ReadStoreManifest(source.data / "tables/t")->name_floor;
+    const auto rejected = store.UnsetBlock(8, 0, stale);
+    assert(!rejected.ok && rejected.version == floor && store.GetBlockBits(8, 0) == "00000011");
+    const auto accepted = store.UnsetBlock(8, 0, store.GetChunkVersion(4, 0));
+    assert(accepted.ok && accepted.version > floor && !store.BlockExists(8, 0));
+}
+
 // RECOVER TABLE of a fenced name leaves the private copy of a restore still
 // copying into that name; that restore then finds the recovered table and is
 // refused, removing its copy itself.
@@ -313,19 +483,41 @@ void SwapSurvivesRestart() {
 
 // A consumer of `t` resumes by name: the exact fork position continues on
 // the restored table, a later position of the old epoch resyncs.
-void FeedAfterSwap() {
-    Swapped swapped{Source()};
-    swapped.catalog.SwapTables("t", "t_restored");
-    const auto t = swapped.catalog.Require("t");
+void FeedAfterSwap(bool raised_floor, bool missed_write = false) {
+    Source source(DurabilityMode::kRelaxed, /*with_slot=*/!missed_write);
+    TableCatalog catalog(source.Config());
+    if (raised_floor) {
+        const auto table = catalog.Create("temporary", SourceGeometry(), catalog.default_options());
+        table->Acquire()->store().SetBlockBits(0, 0, "00100000");
+        catalog.Drop("temporary");
+        assert(DataDirVersionFloor(*ReadDataDirManifest(source.data)) > source.cut);
+    }
+    const auto restored = catalog.RestoreTable(source.Request()).epoch;
     FeedOptions exact;
-    exact.after = FeedPosition{swapped.source.epoch, swapped.source.cut};
+    exact.after = FeedPosition{source.epoch, source.cut};
+    if (missed_write) {
+        const auto copy = catalog.Require("t_restored");
+        // No slot or watch captured this change. A fresh watch must resync
+        // even though the rest of the jump from the fork was empty.
+        copy->Acquire()->store().SetBlockBits(0, 0, "00100000");
+        auto fresh = copy->SubscribeFeed(exact);
+        const auto resync = fresh->Next(std::chrono::seconds(5));
+        assert(resync && resync->kind == FeedEntry::Kind::kResync);
+    }
+    catalog.SwapTables("t", "t_restored");
+    const auto t = catalog.Require("t");
     auto continuing = t->SubscribeFeed(exact);
+    if (missed_write) {
+        const auto resync = continuing->Next(std::chrono::seconds(5));
+        assert(resync && resync->kind == FeedEntry::Kind::kResync);
+        return;
+    }
     FeedOptions later;
-    later.after = FeedPosition{swapped.source.epoch, swapped.source.cut + 1U};
+    later.after = FeedPosition{source.epoch, source.cut + 1U};
     auto resyncing = t->SubscribeFeed(later);
     const auto resync = resyncing->Next(std::chrono::seconds(5));
     assert(resync && resync->kind == FeedEntry::Kind::kResync);
-    assert(resync->protocol_frame && resync->protocol_frame->find(StoreIdHex(swapped.source.epoch)) != std::string::npos);
+    assert(resync->protocol_frame && resync->protocol_frame->find(StoreIdHex(source.epoch)) != std::string::npos);
     std::uint64_t written = 0U;
     {
         auto lease = t->Acquire();
@@ -334,7 +526,43 @@ void FeedAfterSwap() {
     }
     const auto change = continuing->Next(std::chrono::seconds(5));
     assert(change && change->kind == FeedEntry::Kind::kChange);
-    assert(change->position == (FeedPosition{swapped.restored, written}));
+    assert(change->position == (FeedPosition{restored, written}));
+}
+
+void ExhaustedNameFloor() {
+    Source source;
+    constexpr auto max = std::numeric_limits<std::uint64_t>::max();
+    {
+        TableCatalog catalog(source.Config());
+        (void)catalog.Create("exhausted", SourceGeometry(), catalog.default_options());
+    }
+    AtomicWrite(source.data / "tables/exhausted/chunkdb.version", SerializeVersionClockRecord(max), true, true);
+    {
+        TableCatalog catalog(source.Config());
+        assert(Throws<std::overflow_error>([&] { catalog.RenameTable("exhausted", "other", nullptr); })
+                   .find("version clock exhausted") != std::string::npos);
+#ifndef _WIN32
+        assert(Throws<std::overflow_error>([&] { catalog.SwapTables("exhausted", "t"); })
+                   .find("version clock exhausted") != std::string::npos);
+#endif
+        assert(catalog.Require("t")->store_id() == source.epoch && catalog.Find("other") == nullptr);
+        assert(catalog.Find("exhausted") && catalog.Fences().empty());
+        assert(DataDirVersionFloor(*ReadDataDirManifest(source.data)) == 0U);
+        catalog.Drop("exhausted");
+        assert(DataDirVersionFloor(*ReadDataDirManifest(source.data)) == max);
+    }
+    TableCatalog catalog(source.Config());
+    assert(Throws<std::overflow_error>([&] { (void)catalog.RestoreTable(source.Request()); })
+               .find("version clock exhausted") != std::string::npos);
+    assert(catalog.Find("t_restored") == nullptr && Entries(source.data / ".chunkdb.staging") == 0U);
+    std::uint64_t ceiling = 0U;
+    assert(TryParseVersionClockRecord(LoadFile(source.data / "tables/t/chunkdb.version"), &ceiling) && ceiling == max);
+    auto lease = catalog.Require("t")->Acquire();
+    auto& store = lease->store();
+    assert(store.GetBlockBits(8, 0) == "11111111");
+    assert(Throws<std::overflow_error>([&] { store.SetBlockBits(8, 0, "00100000"); })
+               .find("version clock exhausted") != std::string::npos);
+    assert(store.GetBlockBits(8, 0) == "11111111");
 }
 
 void SwapRefusals() {
@@ -344,12 +572,21 @@ void SwapRefusals() {
     Throws<TableNotFoundError>([&] { catalog.SwapTables("t", "absent"); });
     Throws<std::invalid_argument>([&] { catalog.SwapTables("t", "Bad.Name"); });
     {
+        // Without a version floor above both clocks nothing moves and both
+        // tables serve.
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_VERSION_FLOOR_WRITE_FAIL_ONCE", "1");
+        assert(Throws([&] { catalog.SwapTables("t", "t_restored"); }).find("version floor") != std::string::npos);
+    }
+    assert(catalog.Fences().empty());
+    swapped.Check(false);
+    {
         // Without an atomic exchange nothing moves and both tables serve.
         txn_test::ScopedEnv refuse("CHUNKDB_FAILPOINT_SWAP_TABLES_EXCHANGE_UNSUPPORTED_ONCE", "1");
         assert(Throws([&] { catalog.SwapTables("t", "t_restored"); }).find("atomic directory exchange") != std::string::npos);
     }
     assert(catalog.Fences().empty());
     swapped.Check(false);
+    const auto before_sync_failure = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
     {
         // An exchange that cannot be synced leaves both names fenced; a
         // recovery opens what each directory holds.
@@ -360,6 +597,13 @@ void SwapRefusals() {
     catalog.RecoverTable("t");
     catalog.RecoverTable("t_restored");
     swapped.Check(true);
+    {
+        auto lease = catalog.Require("t")->Acquire();
+        auto& store = lease->store();
+        const auto result = store.UnsetBlock(8, 0, before_sync_failure);
+        assert(!result.ok && result.version > before_sync_failure && result.version == store.GetChunkVersion(4, 0));
+        assert(store.GetBlockBits(8, 0) == "00000011");
+    }
     {
         // A name whose table cannot open is fenced; the other serves.
         txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_SWAP_TABLES_OPEN_FAIL_ONCE", "1");
@@ -508,7 +752,10 @@ void CheckLive(const Source& source, TableCatalog& catalog, std::string_view nam
         auto lease = table->Acquire();
         auto& store = lease->store();
         assert(store.GetBlockBits(8, 0) == "11111111");
-        assert(store.GetBlockBits(9, 3) == "00000101" && store.GetChunkVersion(4, 1) == source.wal_only);
+        assert(store.GetBlockBits(9, 3) == "00000101");
+        const auto page = store.ScanChunkIdentities(true, {4, 0}, 1U);
+        assert(page.entries.size() == 1U && page.entries.front().coord == (ChunkCoord{4, 1}) &&
+            page.entries.front().version == source.wal_only);
         assert(store.RetainedTombstoneCount() == 2U);
     }
     const auto slots = table->ListFeedSlots();
@@ -579,6 +826,13 @@ void RenameRefusals() {
     geometry.block_bits = 8U;
     (void)catalog.Create("taken", geometry, catalog.default_options());
     Throws<TableExistsError>([&] { catalog.RenameTable("t", "taken", nullptr); });
+    {
+        // Without a version floor above its clock the table serves unchanged.
+        txn_test::ScopedEnv fail("CHUNKDB_FAILPOINT_VERSION_FLOOR_WRITE_FAIL_ONCE", "1");
+        assert(Throws([&] { catalog.RenameTable("t", "t_new", nullptr); }).find("version floor") != std::string::npos);
+    }
+    assert(catalog.Fences().empty() && catalog.Find("t_new") == nullptr);
+    CheckLive(source, catalog, "t");
     // A directory no table of this server owns is not replaced.
     std::filesystem::create_directory(source.data / "tables" / "squatted");
     assert(Throws<TableExistsError>([&] { catalog.RenameTable("t", "squatted", nullptr); }).find("not a table this server opened") !=
@@ -591,6 +845,7 @@ void RenameRefusals() {
     }
     assert(catalog.Fences().empty() && catalog.Find("t_new") == nullptr);
     CheckLive(source, catalog, "t");
+    const auto before_sync_failure = catalog.Require("t")->Acquire()->store().GetChunkVersion(4, 0);
     {
         // A rename that cannot be synced fences both names, since a crash
         // could still undo it; a recovery opens what each directory holds.
@@ -601,6 +856,13 @@ void RenameRefusals() {
     Throws<TableFencedError>([&] { (void)catalog.Create("t", geometry, catalog.default_options()); });
     catalog.RecoverTable("t_new");
     CheckLive(source, catalog, "t_new");
+    {
+        auto lease = catalog.Require("t_new")->Acquire();
+        auto& store = lease->store();
+        const auto result = store.UnsetBlock(8, 0, before_sync_failure);
+        assert(!result.ok && result.version > before_sync_failure && result.version == store.GetChunkVersion(4, 0));
+        assert(store.GetBlockBits(8, 0) == "11111111");
+    }
     assert(catalog.Fence("t"));
     catalog.RecoverTable("t");
     assert(catalog.Fences().empty() && catalog.Find("t") == nullptr && catalog.TableCount() == 2U);
@@ -646,6 +908,7 @@ int main() {
     Refusals();
     DamagedBackups();
     InjectedFailures();
+    FailedRestoreNameFloor();
     RecoverLeavesRunningRestore();
     Cancellation();
     StatementStops();
@@ -653,15 +916,24 @@ int main() {
     RenamesTable();
     RenameRefusals();
     RenameStatementStops();
+    RenameRefusesStaleVersions();
+    ExhaustedNameFloor();
     if (kAtomicExchange) {
+        SwapRefusesStaleVersions();
         SwapsNames();
         SwapSurvivesRestart();
-        FeedAfterSwap();
+        FeedAfterSwap(false);
+        FeedAfterSwap(true);
+        FeedAfterSwap(true, /*missed_write=*/true);
         SwapRefusals();
         SwapMarksSlots();
         SwapMarksSurviveRestart();
     } else {
         SwapRefusedOnWindows();
     }
+    // Existing chunks refuse stale tokens and accept the version a fresh read returns.
+    RestoreAfterDropRefusesExistingStaleVersion();
+    RenameOntoDroppedRefusesExistingStaleVersion();
+    if (kAtomicExchange) SwapRefusesExistingStaleVersion();
     std::cout << "restore table tests passed\n";
 }

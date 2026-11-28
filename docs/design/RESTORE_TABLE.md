@@ -17,7 +17,9 @@ Both statements are refused inside a transaction and on a `--read-only` server.
 ## Identity
 
 The restored table gets a new epoch; its lineage records the backed-up epoch and the backup cut as parent epoch and fork revision.
-Its clock restarts at the cut's successor, and every chunk keeps its committed revision, commit time and deletion floor.
+Its clock restarts at the cut's successor, the data directory's version floor or one above the copy's name floor, whichever is highest.
+Under catalog admission just before publication, the copy raises its name floor to the directory floor as needed and refuses publication if a reservation above the resulting floor would exhaust the clock.
+Each chunk keeps its committed revision, commit time and deletion floor and reports the higher of its revision and the name floor to clients with a versioned read.
 Retained slots get the new epoch at the cut, with no archived history, exactly as the offline restore does.
 The table must have `table_lineage`, and its table-owned feature bits must equal the directory's; otherwise the copy is removed and nothing is published.
 SWAP keeps each table's epoch: identity travels with the data, and only the name that reaches it changes.
@@ -54,13 +56,13 @@ The reply names the table, epoch, parent epoch, fork revision, files and bytes.
 SWAP takes the feature and backup metadata gates shared, as RECOVER TABLE does, so no backup pins a table while a swap waits for it.
 It then takes the tables' DDL locks and exclusive access in name order, so two swaps of overlapping tables cannot deadlock, then the catalog's table operations.
 It waits for running statements on both tables, makes their acknowledged writes durable with a WAL barrier and closes both stores; files a closing store leaves unsynced are carried to the reopened store under the new path.
-CANCEL, KILL CONNECTION or a statement timeout stops the swap only before the exchange, and both tables then keep serving under their names.
+CANCEL, KILL CONNECTION or a statement timeout can stop the swap before it closes the stores and records their name floors, leaving both tables serving under their names.
 One atomic directory exchange then swaps `tables/t` and `tables/t_restored` (`renameat2(RENAME_EXCHANGE)` on Linux, `renamex_np(RENAME_SWAP)` on macOS).
-A file system without an atomic exchange refuses the swap and reopens both tables unchanged; Windows refuses it before closing either table; there is no non-atomic fallback.
+A file system without an atomic exchange refuses the swap and reopens both tables under their old names with their recorded name floors, and Windows refuses it before closing either table.
 The [swap guard design](SWAP_GUARD.md) replaces this refusal with three renames under one guard record.
 After the exchange the parent directory is synced and each store is reopened under its new name as a new table object.
 A crash at any point leaves both directories under their old names or both exchanged; each directory is a complete table.
-A failure after the exchange that leaves a name unserved fences that name until RECOVER TABLE or a restart.
+A name-floor replacement with an unconfirmed directory sync and a failure after the exchange that leaves a name unserved both fence the affected name until RECOVER TABLE or a restart.
 Open transactions on either table end with CONFLICT at their next statement, because their snapshot belongs to the closed store.
 
 ## Rename
@@ -69,10 +71,11 @@ Open transactions on either table end with CONFLICT at their next statement, bec
 It needs ADMIN on both names, because the grants move with the table: each user's grant on `t` goes to `u`, the higher right kept where a user has both, and `t` keeps none.
 The name `u` must be free: no table, no fence, and no directory under `tables/`.
 It makes acknowledged writes durable with a WAL barrier and closes the store; CANCEL, KILL CONNECTION or a statement timeout stops it only before that.
-The grants are copied to `u` first, then one rename that cannot replace an entry moves `tables/t` to `tables/u`, and the parent directory is synced; the grants on `t` are removed last.
+The grants are copied to `u` first, then the closed table's name floor is recorded, then one rename that cannot replace an entry moves `tables/t` to `tables/u`.
+The parent directory is synced before the renamed table opens, and the grants on `t` are removed last.
 GRANT and REVOKE take the catalog's table operations too, as DROP TABLE and MIGRATE change grants under them, so each runs before or after the whole rename.
 A crash leaves the directory under one of the names, complete; the grants never name neither, and at worst name both, as a crash during DROP TABLE can leave grants of a dropped name.
-A refused rename puts the copied grants back and reopens the table under `t`; a grant copy whose outcome is unknown is put back the same way.
+A refused rename puts the copied grants back and reopens the table under `t` with its recorded name floor, or fences `t` if the replacement's sync was unconfirmed.
 A failure to sync the rename fences both names, as a failed swap does, because a crash could still undo it; the grants then stay on both names.
 A failure to open the renamed table fences `u`; the rename is durable, so the grants on `t` are removed.
 Each fence lasts until RECOVER TABLE of its name or a restart; RECOVER TABLE t then finds no directory and frees the name.

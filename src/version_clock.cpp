@@ -28,6 +28,8 @@ namespace {
 // the version clock. Larger values amortize the persistence fsync over more
 // mutations at the cost of skipping at most this many tokens per restart.
 constexpr std::uint64_t kVersionClockReservationBatch = 16384;
+constexpr auto kLastVersionReservationStart =
+    std::numeric_limits<std::uint64_t>::max() - kVersionClockReservationBatch;
 
 // Persisted version-clock bookkeeping format (data_dir/chunkdb.version). The
 // record is exactly kVersionClockRecordSize bytes:
@@ -201,8 +203,7 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting, const std::error
         // store, or one whose initialization stopped after the manifest.
         // Persist the clock first and the marker second; a crash between them
         // is recognized by the valid clock on the next startup.
-        const std::uint64_t first =
-            std::max<std::uint64_t>(1U, std::min(initial_version_floor_, std::numeric_limits<std::uint64_t>::max() - 1U));
+        const auto first = std::max<std::uint64_t>(1U, initial_version_floor_);
         version_clock_.store(first, std::memory_order_relaxed);
         version_clock_ceiling_.store(first, std::memory_order_relaxed);
         AtomicWrite(
@@ -297,22 +298,61 @@ void ChunkStore::InitializeVersionClock(bool store_preexisting, const std::error
     }
 }
 
+void ChunkStore::RaiseVersionClockToFloor() {
+    if (access_mode_ == AccessMode::kReadOnly) {
+        return;
+    }
+    // The data directory's version floor is above every token a table that
+    // gave up a name issued (DROP TABLE, RENAME TO, SWAP TABLES). A table that
+    // takes such a name by RESTORE TABLE, SWAP TABLES or RENAME TO opens at
+    // it or above its own name floor, which its unchanged chunks report.
+    // A directory floor left by DROP can exhaust the clock. Persist the
+    // lower bound even if a batch no longer fits, so the table can open for reads.
+    constexpr auto max = std::numeric_limits<std::uint64_t>::max();
+    const auto above_name_floor = name_floor_ == max ? max : name_floor_ + 1U;
+    const auto floor = std::max(initial_version_floor_, above_name_floor);
+    opened_clock_ = version_clock_.load(std::memory_order_relaxed);
+    first_version_clock_ = std::max(opened_clock_, floor);
+    if (first_version_clock_ == opened_clock_) return;
+    if (first_version_clock_ <= kLastVersionReservationStart) {
+        RaiseVersionClockAbove(first_version_clock_ - 1U);
+        return;
+    }
+    if (first_version_clock_ > version_clock_ceiling_.load(std::memory_order_relaxed)) {
+        PersistVersionClockCeiling(first_version_clock_);
+    }
+    version_clock_.store(first_version_clock_, std::memory_order_relaxed);
+}
+
+std::uint64_t ChunkStore::FeedStartClock(std::uint64_t clock) const noexcept {
+    return clock == first_version_clock_ ? opened_clock_ : clock;
+}
+
+void ChunkStore::RequireWritableNameFloor(std::uint64_t name_floor) {
+    if (name_floor >= kLastVersionReservationStart) {
+        throw std::overflow_error("chunk version clock exhausted above name floor");
+    }
+}
+
 void ChunkStore::ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive) {
     // Called under version_clock_mutex_. Persists a new ceiling above
     // minimum_exclusive before it is used, so a crash can never leave issued
     // tokens above the durable ceiling.
     std::uint64_t new_ceiling = version_clock_ceiling_.load(std::memory_order_relaxed);
     if (new_ceiling <= minimum_exclusive) {
-        if (minimum_exclusive >
-            std::numeric_limits<std::uint64_t>::max() - kVersionClockReservationBatch) {
+        if (minimum_exclusive > kLastVersionReservationStart) {
             throw std::overflow_error("chunk version clock exhausted");
         }
         new_ceiling = minimum_exclusive + kVersionClockReservationBatch;
     }
 
+    PersistVersionClockCeiling(new_ceiling);
+}
+
+void ChunkStore::PersistVersionClockCeiling(std::uint64_t ceiling) {
     AtomicWrite(
         version_clock_path_,
-        SerializeVersionClockRecord(new_ceiling),
+        SerializeVersionClockRecord(ceiling),
         /*fsync_file=*/true,
         /*fsync_directory=*/true,
         /*out_replaced=*/nullptr,
@@ -321,7 +361,7 @@ void ChunkStore::ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive
         // failpoints a test armed for a data-path write; the clock has
         // its own VERSION_RESERVE_FAIL_ONCE hook.
         /*enable_generic_failpoints=*/false);
-    version_clock_ceiling_.store(new_ceiling, std::memory_order_release);
+    version_clock_ceiling_.store(ceiling, std::memory_order_release);
 }
 
 std::uint64_t ChunkStore::NextChunkVersion() {
@@ -417,7 +457,7 @@ std::uint64_t ChunkStore::GetChunkVersion(std::int64_t chunk_x, std::int64_t chu
     const ChunkCoord chunk_coord{chunk_x, chunk_y};
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     std::shared_lock lock(regular_chunk->mutex);
-    return regular_chunk->version;
+    return ReportedVersion(regular_chunk->version);
 }
 
 bool ChunkStore::HasWrittenChunkIdentities() const {

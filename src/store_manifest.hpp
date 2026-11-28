@@ -59,6 +59,9 @@ inline constexpr std::uint16_t kOptionFeedBufferBytes = 8;         // u64, > 0
 inline constexpr std::uint16_t kOptionSlotMaxBytes = 9;            // u64, > 0
 inline constexpr std::uint16_t kOptionParentEpoch = 10;            // 16-byte store id
 inline constexpr std::uint16_t kOptionForkRevision = 11;           // u64, including zero
+// The name floor of a table that took its name by SWAP TABLES, RENAME TO or
+// RESTORE TABLE (ChunkStore::ReportedVersion); absent when zero.
+inline constexpr std::uint16_t kOptionNameFloor = 15;              // u64, > 0
 
 struct StoreManifest {
     FeatureFlags features{.incompat = kFeatureChunkModel};
@@ -72,6 +75,8 @@ struct StoreManifest {
     // Owned metadata is separate from mutable options, so option replacements
     // cannot erase the restore relationship. Both TLVs are absent or present.
     std::optional<TableLineage> lineage{};
+    // Owned like the lineage: option replacements keep it. 0 when absent.
+    std::uint64_t name_floor = 0;
     // Omitted only by block-only construction APIs; the encoded envelope
     // always contains its complete companion domain and shared history.
     std::optional<TableSchema> chunk_schema{};
@@ -139,10 +144,11 @@ struct DataDirManifest {
     std::vector<std::uint8_t> options;
 };
 
-// Every version token a table of the directory issued is below the
-// version_floor option (raised when a table is dropped); a table's version
-// clock starts there, so a table dropped and created again under the same
-// name never reuses a token. 0 when the option is absent.
+// Every version token a table that gave up its name issued is below the
+// version_floor option (raised by DROP TABLE, RENAME TO and SWAP TABLES
+// before the name changes); every table's version clock opens at or above
+// it, so a table that takes a name never reuses a token of a table that
+// held it. 0 when the option is absent.
 inline constexpr std::uint16_t kDataDirOptionVersionFloor = 1;
 [[nodiscard]] std::uint64_t DataDirVersionFloor(const DataDirManifest& manifest);
 void SetDataDirVersionFloor(DataDirManifest* manifest, std::uint64_t floor);

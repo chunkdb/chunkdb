@@ -488,6 +488,8 @@ ChunkStore::ChunkStore(StoreConfig config)
         RecoverConditionalRollbackIntents();
         RecoverTransactionIntents();
         InitializeCoordinateIndex();
+        // After every recovered revision has raised the clock.
+        RaiseVersionClockToFloor();
         FinishSnapshotGenerationRecovery();
         feed_slots_ = std::make_shared<FeedSlots>(*this, config.slot_max_bytes, config.slot_sync_interval);
     } catch (...) {
@@ -610,6 +612,7 @@ void ChunkStore::InitializeStoreManifest() {
     }
     store_id_ = manifest->store_id;
     lineage_ = manifest->lineage;
+    name_floor_ = manifest->name_floor;
     features_ = manifest->features;
 }
 

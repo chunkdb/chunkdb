@@ -4,6 +4,7 @@
 // concurrent writers.
 
 #include <algorithm>
+#include <array>
 #include <atomic>
 #include <cassert>
 #include <chrono>
@@ -11,6 +12,7 @@
 #include <cstdio>
 #include <memory>
 #include <optional>
+#include <span>
 #include <string>
 #include <string_view>
 #include <thread>
@@ -20,6 +22,8 @@
 #include "chunkdb/table_catalog.hpp"
 #include "login_helpers.hpp"
 #include "test_utils.hpp"
+#include "txn_test_utils.hpp"
+#include "../src/sectioned_chunk_form.hpp"
 
 namespace {
 
@@ -78,15 +82,22 @@ struct Fixture {
     SessionState session;
 
     explicit Fixture(chunkdb::QueryLimits limits = {}) {
+        Open(limits);
+        ExpectReply(Run("CREATE TABLE bank (coins u16, bonus i8 NULL, rate f32 NULL, name text(8) NULL, a u8, b u8) "
+                        "CHUNK 4 x 4 CHUNK COLUMNS (status u8 DEFAULT 0)"),
+                    "+OK\r\n");
+    }
+
+    void Open(chunkdb::QueryLimits limits = {}) {
+        session = SessionState{};
+        engine.reset();
+        catalog.reset();
         chunkdb::CatalogConfig config;
         config.data_dir = dir.path();
         config.query_limits = limits;
         catalog = std::make_shared<chunkdb::TableCatalog>(config);
         engine = std::make_unique<CommandEngine>(chunkdb::EngineConfig{.require_auth = false, .server_version = "test"}, catalog);
         Hello(session);
-        ExpectReply(Run("CREATE TABLE bank (coins u16, bonus i8 NULL, rate f32 NULL, name text(8) NULL, a u8, b u8) "
-                        "CHUNK 4 x 4 CHUNK COLUMNS (status u8 DEFAULT 0)"),
-                    "+OK\r\n");
     }
 
     void Hello(SessionState& state) const {
@@ -442,6 +453,152 @@ void TestVersionParameter() {
     ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
 }
 
+// The first bulk string of `reply`: the chunk form of GET CHUNK, of a GET AREA
+// row or of a SCAN CHUNKS ... WITH DATA row.
+std::string FirstForm(const std::string& reply) {
+    const auto at = reply.find('$');
+    assert(at != std::string::npos);
+    const auto end = reply.find("\r\n", at);
+    const auto length = std::stoull(reply.substr(at + 1U, end - at - 1U));
+    return reply.substr(end + 2U, length);
+}
+
+// The version the chunk form header carries.
+std::uint64_t FormVersion(const std::string& form) {
+    const std::span<const std::uint8_t> bytes(reinterpret_cast<const std::uint8_t*>(form.data()), form.size());
+    return chunkdb::ParseChunkFormSections(bytes, bytes.size(), chunkdb::ChunkFormReadMode::kRead).header.chunk_version;
+}
+
+// RENAME TO onto the name of a dropped table: every chunk of the renamed
+// table had the version its chunk of the dropped table had, with other data.
+// Each surface reports the name floor for such a chunk, refuses a write
+// conditioned on the version a client read from the dropped table, and
+// takes one conditioned on the floor a fresh read shows (#306).
+void TestNameFloorVersions() {
+    Fixture f;
+    ExpectReply(f.Run("CREATE TABLE other (coins u16, bonus i8 NULL, rate f32 NULL, name text(8) NULL, a u8, b u8) "
+                      "CHUNK 4 x 4 CHUNK COLUMNS (status u8 DEFAULT 0)"),
+                "+OK\r\n");
+    constexpr int kChunks = 8;
+    std::vector<std::uint64_t> stale;
+    for (int k = 0; k < kChunks; ++k) {
+        const auto x = std::to_string(4 * k);
+        stale.push_back(VersionOf(f.Run("SET BLOCK " + x + " 0 IN bank coins = 1")));
+        assert(VersionOf(f.Run("SET BLOCK " + x + " 0 IN other coins = 2")) == stale.back());
+    }
+    ExpectReply(f.Run("DROP TABLE bank"), "+OK\r\n");
+    ExpectReply(f.Run("ALTER TABLE other RENAME TO bank"), "+OK\r\n");
+    const auto floor = f.catalog->Find("bank")->Acquire()->store().name_floor();
+    assert(floor > stale.back());
+    const auto s = [](std::uint64_t value) { return std::to_string(value); };
+    const auto mismatch = "VERSION_MISMATCH current=" + s(floor);
+
+    // GET BLOCK ... WITH VERSION, and SET BLOCK ... IF VERSION.
+    assert(VersionOf(f.Run("GET BLOCK 0 0 FROM bank WITH VERSION").substr(4)) == floor);
+    ExpectError(f.Run("SET BLOCK 0 0 IN bank coins = 3 IF VERSION " + s(stale[0])), mismatch);
+    assert(VersionOf(f.Run("SET BLOCK 0 0 IN bank coins = 3 IF VERSION " + s(floor))) > floor);
+    // DELETE BLOCK ... IF VERSION.
+    ExpectError(f.Run("DELETE BLOCK 4 0 FROM bank IF VERSION " + s(stale[1])), mismatch);
+    assert(VersionOf(f.Run("DELETE BLOCK 4 0 FROM bank IF VERSION " + s(floor))) > floor);
+    // A write with computed values decides IF VERSION under the chunk lock.
+    ExpectError(f.Run("SET BLOCK 8 0 IN bank coins = coins + 1 IF VERSION " + s(stale[2])), mismatch);
+    assert(VersionOf(f.Run("SET BLOCK 8 0 IN bank coins = coins + 1 IF VERSION " + s(floor))) > floor);
+    // RETURNING answers the version a refused write saw.
+    auto reply = f.Run("SET BLOCK 12 0 IN bank coins = 4 IF VERSION " + s(stale[3]) + " RETURNING coins");
+    assert(reply.starts_with("%3\r\n$7\r\napplied\r\n#f\r\n") && Contains(reply, "$7\r\nversion\r\n:" + s(floor) + "\r\n"));
+    reply = f.Run("SET BLOCK 12 0 IN bank coins = 4 IF VERSION " + s(floor) + " RETURNING coins");
+    assert(reply.starts_with("%3\r\n$7\r\napplied\r\n#t\r\n"));
+    // GET CHUNK's form carries the floor; SET CHUNK ... IF VERSION, with the
+    // form of chunk 0, which the writes above changed, so the write changes
+    // chunk 4 and takes a new version.
+    assert(FormVersion(FirstForm(f.Run("GET CHUNK 4 0 FROM bank"))) == floor);
+    const auto form = FirstForm(f.Run("GET CHUNK 0 0 FROM bank"));
+    ExpectError(f.Run("SET CHUNK 4 0 IN bank $1 IF VERSION " + s(stale[4]), Parameters{form}), mismatch);
+    assert(VersionOf(f.Run("SET CHUNK 4 0 IN bank $1 IF VERSION " + s(floor), Parameters{form})) > floor);
+    // SET CHUNK ... META ... IF VERSION.
+    ExpectError(f.Run("SET CHUNK 5 0 IN bank META status = 1 IF VERSION " + s(stale[5])), mismatch);
+    assert(VersionOf(f.Run("SET CHUNK 5 0 IN bank META status = 1 IF VERSION " + s(floor))) > floor);
+    // A GET AREA row's form carries the floor.
+    assert(FormVersion(FirstForm(f.Run("GET AREA 6 0 TO 6 0 FROM bank"))) == floor);
+    // SCAN CHUNKS rows and their WITH DATA forms carry the floor.
+    assert(Contains(f.Run("SCAN CHUNKS FROM bank AFTER 6 0 LIMIT 1"), "*3\r\n:7\r\n:0\r\n:" + s(floor) + "\r\n"));
+    const auto scan = f.Run("SCAN CHUNKS FROM bank AFTER 6 0 LIMIT 1 WITH DATA");
+    const auto row = "*4\r\n:7\r\n:0\r\n:" + s(floor) + "\r\n";
+    assert(scan.find(row) != std::string::npos);
+    assert(FormVersion(FirstForm(scan.substr(scan.find(row) + row.size()))) == floor);
+    // Inside a transaction: GET BLOCK ... WITH VERSION at the snapshot, and the
+    // version a refused condition answers.
+    ExpectReply(f.Run("BEGIN"), "+OK\r\n");
+    assert(VersionOf(f.Run("GET BLOCK 28 0 FROM bank WITH VERSION").substr(4)) == floor);
+    ExpectError(f.Run("SET BLOCK 28 0 IN bank coins = 5 IF coins > 100"), Failed(floor));
+    ExpectReply(f.Run("ROLLBACK"), "+OK\r\n");
+    // A chunk written after the rename shows its own version.
+    const auto written = VersionOf(f.Run("SET BLOCK 28 0 IN bank coins = 6"));
+    assert(written > floor && VersionOf(f.Run("GET BLOCK 28 0 FROM bank WITH VERSION").substr(4)) == written);
+}
+
+void TestNameFloorScanSinceTombstone() {
+    Fixture f;
+    const auto first = VersionOf(f.Run("SET BLOCK 0 0 IN bank coins = 1"));
+    const auto deleted = VersionOf(f.Run("DELETE BLOCK 0 0 FROM bank"));
+    {
+        auto lease = f.catalog->Require("bank")->Acquire();
+        lease->store().CheckpointForTests(0, 0);
+        assert(lease->store().RetainedTombstoneCount() == 1U);
+    }
+    ExpectReply(f.Run("ALTER TABLE bank RENAME TO other"), "+OK\r\n");
+    const auto floor = f.catalog->Require("other")->Acquire()->store().name_floor();
+    assert(floor > deleted);
+    const auto prefix = "SCAN CHUNKS FROM other SINCE ";
+    const auto scan = f.Run(prefix + std::to_string(first) + " WITH DATA");
+    assert(Contains(scan, "*4\r\n:0\r\n:0\r\n:" + std::to_string(floor) + "\r\n_\r\n"));
+    const auto caught_up = f.Run(prefix + std::to_string(deleted) + " WITH DATA");
+    assert(caught_up.starts_with("%5\r\n$6\r\nchunks\r\n*0\r\n"));
+}
+
+// Use a different chunk after reopening so it still holds its original data.
+void TestFailedNameMoveVersions(bool swap, const char* point, bool raised) {
+    Fixture f;
+    if (swap) ExpectReply(f.Run("CREATE TABLE other (coins u16) CHUNK 4 x 4"), "+OK\r\n");
+    const std::array<std::string, 2U> names{"bank", "other"};
+    const std::array<std::string, 2U> coords{"0 0", "4 0"};
+    const std::size_t count = swap ? names.size() : 1U;
+    std::array<std::array<std::uint64_t, 2U>, 2U> saved{};
+    std::array<std::uint64_t, 2U> floors{};
+    for (std::size_t i = 0U; i < count; ++i) {
+        for (std::size_t j = 0U; j < coords.size(); ++j) {
+            (void)VersionOf(f.Run("SET BLOCK " + coords[j] + " IN " + names[i] + " coins = " + std::to_string(i + 1U)));
+            saved[i][j] = VersionOf(f.Run("GET BLOCK " + coords[j] + " FROM " + names[i] + " WITH VERSION").substr(4));
+        }
+    }
+    {
+        txn_test::ScopedEnv fail(point, "1");
+        ExpectError(f.Run(swap ? "SWAP TABLES bank, other" : "ALTER TABLE bank RENAME TO moved"), "INTERNAL");
+    }
+    for (std::size_t j = 0U; j < coords.size(); ++j) {
+        assert(f.catalog->Find("moved") == nullptr && f.catalog->Fences().empty());
+        for (std::size_t i = 0U; i < count; ++i) {
+            const auto get = "GET BLOCK " + coords[j] + " FROM " + names[i] + " COLUMNS coins";
+            const auto set = "SET BLOCK " + coords[j] + " IN " + names[i] + " coins = 5 IF VERSION ";
+            const auto before = saved[i][j];
+            const auto current = VersionOf(f.Run(get + " WITH VERSION").substr(4));
+            const auto unchanged = "*1\r\n:" + std::to_string(i + 1U) + "\r\n";
+            if (raised) {
+                assert(current > before);
+                if (j == 0U) floors[i] = current;
+                else assert(current == floors[i]);
+                ExpectError(f.Run(set + std::to_string(before)), "VERSION_MISMATCH current=" + std::to_string(current));
+            } else {
+                assert(current == before);
+            }
+            ExpectReply(f.Run(get), unchanged);
+            assert(VersionOf(f.Run(set + std::to_string(current))) > current);
+            ExpectReply(f.Run(get), "*1\r\n:5\r\n");
+        }
+        if (j + 1U < coords.size()) f.Open();
+    }
+}
+
 // Under the chunk's lock the store decodes only the columns the decision
 // reads.
 void TestDecisionDecodesItsColumns() {
@@ -472,6 +629,16 @@ int main() {
     TestTransactionRefusalTakesNoWriteRoom();
     TestVersionParameter();
     TestDecisionDecodesItsColumns();
+    TestNameFloorVersions();
+    TestNameFloorScanSinceTombstone();
+    TestFailedNameMoveVersions(false, "CHUNKDB_FAILPOINT_RENAME_TABLE_MOVE_FAIL_ONCE", true);
+    TestFailedNameMoveVersions(false, "CHUNKDB_FAILPOINT_NAME_FLOOR_WRITE_FAIL_ONCE", false);
+    TestFailedNameMoveVersions(false, "CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", false);
+#ifndef _WIN32
+    TestFailedNameMoveVersions(true, "CHUNKDB_FAILPOINT_SWAP_TABLES_EXCHANGE_UNSUPPORTED_ONCE", true);
+    TestFailedNameMoveVersions(true, "CHUNKDB_FAILPOINT_NAME_FLOOR_WRITE_FAIL_ONCE", false);
+    TestFailedNameMoveVersions(true, "CHUNKDB_FAILPOINT_TABLE_FENCE_ALLOC_FAIL_ONCE", false);
+#endif
     std::puts("conditional writes tests passed");
     return 0;
 }

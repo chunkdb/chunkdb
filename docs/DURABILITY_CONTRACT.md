@@ -5,6 +5,9 @@ Each table records its durability mode.
 Your filesystem and device must honor the required sync and atomic publication operations.
 
 Restore publishes its checked successor clock and immediate-parent lineage inside a guarded private copy before exposing the new epoch.
+A table that takes a name by RESTORE TABLE, SWAP TABLES or RENAME TO records a name floor above every chunk version a table of that name gave before, synced before the name changes, and opens its version clock above it.
+Each written chunk reports the higher of its stored revision and the name floor, so IF VERSION refuses a version from an earlier table of the name and accepts the token from a fresh read until the chunk changes.
+Revisions used as positions keep their stored values: SCAN CHUNKS SINCE, feed and slot positions, the versions in feed entries, lineage fork revisions and the catalog revision.
 Committed revisions keep their values; missing chunks after a later crash do not prove that replay history remains available.
 
 ## Guarantees

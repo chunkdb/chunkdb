@@ -109,8 +109,9 @@ A `compat` extension can be discarded by a writer that does not understand it.
 | 5 | CRC32 of all preceding bytes (`u32`) |
 
 Options are consecutive `type:u16, length:u16, value:length` entries filling the declared area.
-Type 1 is `version_floor:u64`, the lower bound for a newly initialized table clock.
-DROP raises it to at least the dropped table’s reserved ceiling, preventing token reuse after recreation.
+Type 1 is `version_floor:u64`, the lower bound for every table clock a writer opens: a new clock starts there, and an existing clock below it is raised to it and synced before its first token.
+DROP TABLE raises it to at least the dropped table’s reserved ceiling, ALTER TABLE ... RENAME TO to at least the renamed table’s and SWAP TABLES to at least both tables’, each synced before the name changes, so a table that takes a name never reissues a token of a table that held it.
+An exhausted directory floor can still be persisted as a clock's ceiling, so tables remain readable and writes that require new revisions fail with clock exhaustion.
 Missing floor is zero; new clocks start at least at 1, and duplicate floor entries or a wrong length are invalid.
 
 A writer creates a missing root manifest only when no chunkdb-owned entries exist, except its lock and unpublished manifest temporary files.
@@ -155,14 +156,19 @@ Options use the same TLV layout as the root manifest:
 | 9 | retained byte limit per durable slot `u64`, positive | current catalog/server default (1073741824 unless configured) |
 | 10 | immediate restore parent epoch, 16 nonzero bytes | absent |
 | 11 | completed fork revision `u64`, including zero | absent |
+| 15 | name floor `u64`, positive | absent |
 
 Each known option appears at most once; absent options take defaults, and incorrect lengths or values are invalid. Types 8 and 9 are written only for explicit table overrides; leaving them absent preserves inheritance across restart and unrelated option changes. Type 7 is not a known option.
 
+Type 15 is the name floor: SWAP TABLES, ALTER TABLE ... RENAME TO and RESTORE TABLE write the directory version floor there, synced before the name changes, when it is higher than the table's name floor.
+A written chunk whose stored revision is below it reports the name floor as its version to clients and to IF VERSION; its stored revision keeps its value, and the table's clock opens strictly above the name floor.
+A build that does not know type 15 refuses the manifest.
+SWAP TABLES, ALTER TABLE ... RENAME TO and online RESTORE TABLE refuse an effective name floor that leaves too little space for a reservation above it before publishing the table under the new name.
 Types 10 and 11 belong to incompatibility feature `table_lineage` (`0x4`) and must appear together.
 The parent epoch differs from the table's current epoch; the fork revision preserves its exact unsigned value.
 New tables omit both fields.
-Schema and option replacements preserve lineage and unknown compatible option entries.
-Restore writes its checked fork-successor clock before publishing the new epoch and immediate-parent fields.
+Schema and option replacements preserve lineage, the name floor and unknown compatible option entries.
+Restore writes its checked fork-successor clock before publishing the new epoch and immediate-parent fields, and the restored table opens at least at the directory version floor and above its name floor.
 Committed image and WAL revisions retain their numeric values; reserved tokens belonging to the parent epoch do not set the restored frontier.
 
 ### Feature activation decision

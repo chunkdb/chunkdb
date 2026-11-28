@@ -482,11 +482,11 @@ ChunkMutationResult ChunkStore::UnsetBlockAtAddress(const ChunkCoord& chunk_coor
         const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
         auto lock = LockStatementChunk(regular_chunk->mutex);
         AwaitChunkBacklogLocked(lock, *regular_chunk);
-        if (expected_version.has_value() && regular_chunk->version != *expected_version) {
-            return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+        if (expected_version.has_value() && ReportedVersion(regular_chunk->version) != *expected_version) {
+            return ChunkMutationResult{.ok = false, .version = ReportedVersion(regular_chunk->version)};
         }
         WriteBlockColumnsLocked(chunk_coord, regular_chunk, block_index, write, false);
-        return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
+        return ChunkMutationResult{.ok = true, .version = ReportedVersion(regular_chunk->version)};
     }
 
     const std::string zero_bits(geometry_.config().block_bits, '0');
@@ -494,11 +494,11 @@ ChunkMutationResult ChunkStore::UnsetBlockAtAddress(const ChunkCoord& chunk_coor
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     auto lock = LockStatementChunk(regular_chunk->mutex);
     AwaitChunkBacklogLocked(lock, *regular_chunk);
-    if (expected_version.has_value() && regular_chunk->version != *expected_version) {
-        return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+    if (expected_version.has_value() && ReportedVersion(regular_chunk->version) != *expected_version) {
+        return ChunkMutationResult{.ok = false, .version = ReportedVersion(regular_chunk->version)};
     }
     WriteBlockBitsLocked(chunk_coord, regular_chunk, block_index, zero_bits, false);
-    return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
+    return ChunkMutationResult{.ok = true, .version = ReportedVersion(regular_chunk->version)};
 }
 
 void ChunkStore::RequireBitStringBlocks() const {
@@ -548,14 +548,14 @@ ChunkMutationResult ChunkStore::SetBlockAtAddress(const ChunkCoord& chunk_coord,
     const auto regular_chunk = GetOrLoadRegularChunk(chunk_coord);
     auto lock = LockStatementChunk(regular_chunk->mutex);
     AwaitChunkBacklogLocked(lock, *regular_chunk);
-    if (expected_version.has_value() && regular_chunk->version != *expected_version) {
-        return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+    if (expected_version.has_value() && ReportedVersion(regular_chunk->version) != *expected_version) {
+        return ChunkMutationResult{.ok = false, .version = ReportedVersion(regular_chunk->version)};
     }
     if (!BlockPresent(regular_chunk->presence_bitmap, block_index)) {
         AddNewBlockColumns(write, block_index);
     }
     WriteBlockColumnsLocked(chunk_coord, regular_chunk, block_index, write, true);
-    return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
+    return ChunkMutationResult{.ok = true, .version = ReportedVersion(regular_chunk->version)};
 }
 
 ChunkStore::BlockWrite& ChunkStore::PrepareSetBlockWrite(
@@ -755,7 +755,7 @@ BlockReadMetadata ChunkStore::GetBlockWithVersionAtAddress(const ChunkCoord& coo
     const auto chunk = GetOrLoadRegularChunk(coord);
     auto lock = LockStatementChunkShared(chunk->mutex);
     BlockReadMetadata result;
-    if (chunk->written) result.version = chunk->version;
+    if (chunk->written) result.version = ReportedVersion(chunk->version);
     if (BlockPresent(chunk->presence_bitmap, index))
         result.values = DecodeBlockColumns(geometry_.layout(), chunk->payload, chunk->vars, index);
     return result;
@@ -774,7 +774,7 @@ BlockReadMetadata ChunkStore::GetBlockWithVersion3DAt(
     const auto index = geometry_.LocalBlockIndex(local[0], local[1], local[2]);
     BlockReadMetadata result;
     const auto capture = [&](const auto& chunk) {
-        result.version = chunk.written ? std::optional<std::uint64_t>(chunk.version) : std::nullopt;
+        result.version = chunk.written ? std::optional<std::uint64_t>(ReportedVersion(chunk.version)) : std::nullopt;
         result.values = BlockPresent(chunk.presence_bitmap, index) ?
             std::optional(DecodeBlockColumns(geometry_.layout(), chunk.payload, chunk.vars, index)) : std::nullopt;
     };
@@ -1463,7 +1463,8 @@ std::uint64_t ChunkStore::SetChunkStateBytes(
     MaskUnusedPayloadBits(geometry_, &canonical_payload);
     auto canonical_presence = presence_bitmap;
     MaskUnusedPresenceBits(geometry_, &canonical_presence);
-    return ApplyChunkState({chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence));
+    const auto revision = ApplyChunkState({chunk_x, chunk_y}, std::move(canonical_payload), std::move(canonical_presence));
+    return ReportedVersion(revision);
 }
 
 std::uint64_t ChunkStore::ApplyChunkState(
@@ -1764,9 +1765,9 @@ ChunkMutationResult ChunkStore::WriteBlockDecided(std::int64_t x, std::int64_t y
     const std::uint64_t commit_time_ms = NextCommitTimeMs(*regular_chunk);
     std::vector<ColumnAssignment> assignments;
     const BlockWriteView view{.values = values ? &*values : nullptr, .chunk_columns = chunk_columns,
-        .version = regular_chunk->version, .commit_time_ms = commit_time_ms, .written = regular_chunk->written};
+        .version = ReportedVersion(regular_chunk->version), .commit_time_ms = commit_time_ms, .written = regular_chunk->written};
     if (!decide(view, assignments)) {
-        return ChunkMutationResult{.ok = false, .version = regular_chunk->version};
+        return ChunkMutationResult{.ok = false, .version = ReportedVersion(regular_chunk->version)};
     }
     if (!remove) {
         auto& write = PrepareSetBlockWrite(assignments, block_index);
@@ -1779,7 +1780,7 @@ ChunkMutationResult ChunkStore::WriteBlockDecided(std::int64_t x, std::int64_t y
         const std::string zero_bits(geometry_.config().block_bits, '0');
         WriteBlockBitsLocked(chunk_coord, regular_chunk, block_index, zero_bits, false, commit_time_ms);
     }
-    return ChunkMutationResult{.ok = true, .version = regular_chunk->version};
+    return ChunkMutationResult{.ok = true, .version = ReportedVersion(regular_chunk->version)};
 }
 
 }  // namespace chunkdb

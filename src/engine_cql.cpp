@@ -2013,6 +2013,7 @@ std::string CommandEngine::ExecuteStatement(
                         private_state = own != txn.writes.end();
                         state = own != txn.writes.end() ? own->second
                                                         : store.ReadChunkStateAt(*txn.snapshot, coord);
+                        state.version = store.ReportedVersion(state.version);
                     } else {
                         state = store.ReadChunkState(coord);
                     }
@@ -2190,7 +2191,7 @@ std::string CommandEngine::ExecuteStatement(
                                 Protocol::AppendInteger(row.text, coord.y);
                                 if (get.dims == 3U) Protocol::AppendInteger(row.text, coord.z);
                                 const bool private_state = session.transaction != nullptr && session.transaction->writes.contains(coord);
-                                ChunkState state{.version = entry->version, .payload = std::move(entry->payload),
+                                ChunkState state{.version = store.ReportedVersion(entry->version), .payload = std::move(entry->payload),
                                     .presence_bitmap = std::move(entry->presence_bitmap), .vars = std::move(entry->vars), .written = true,
                                     .commit_time_ms = entry->commit_time_ms, .chunk_columns = std::move(entry->chunk_columns)};
                                 if (scaled) state = ScaleChunkState(store.geometry(), *scaled, *scale, columns, state);
@@ -2748,9 +2749,13 @@ std::string CommandEngine::ExecuteStatement(
                         Protocol::AppendInteger(reply.text(), entry.coord.x);
                         Protocol::AppendInteger(reply.text(), entry.coord.y);
                         if (geometry.dims() == 3U) Protocol::AppendInteger(reply.text(), entry.coord.z);
-                        Protocol::AppendInteger(reply.text(), entry.version);
+                        Protocol::AppendInteger(reply.text(), lease.store().ReportedVersion(entry.version));
                         if (scan.with_data) {
-                            if (entry.data) AppendChunkState(reply, geometry, *entry.data, columns, false);
+                            if (entry.data) {
+                                auto data = *entry.data;
+                                data.version = lease.store().ReportedVersion(data.version);
+                                AppendChunkState(reply, geometry, data, columns, false);
+                            }
                             else Protocol::AppendNull(reply.text());
                         }
                         if (reply.size() > kMaxChunkRangeResponseBytes)
@@ -3354,7 +3359,7 @@ std::string CommandEngine::BlockWriteWithExpressions(
         const ChunkState& state = own->second;
         block = geometry.dims() == 3U ? store.BlockInState3D(state, x, y, z) : store.BlockInState(state, x, y);
         if (plan.reads_chunk_columns) chunk_columns = store.ChunkColumnValues(state.chunk_columns.get());
-        version = state.version;
+        version = store.ReportedVersion(state.version);
     } else {
         auto read = geometry.dims() == 3U ? store.GetBlockWithVersion3DAt(*txn.snapshot, x, y, z)
                                           : store.GetBlockWithVersionAt(*txn.snapshot, x, y);

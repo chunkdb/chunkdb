@@ -332,9 +332,10 @@ struct StoreConfig {
     // directory this store belongs to (a table of a data directory).
     bool acquire_process_lock = true;
     // A new version clock starts at this token instead of 1; an existing
-    // clock ignores it. The table catalog sets it to the data directory's
-    // version floor, so a table dropped and created again under the same
-    // name never reuses a token of the earlier table.
+    // clock below it is raised to it, durably, before its first token. The
+    // table catalog sets it to the data directory's version floor, so a table
+    // that takes a name another table held (CREATE after DROP, RESTORE TABLE,
+    // SWAP TABLES, RENAME TO) never reuses a token of the earlier table.
     std::uint64_t initial_version_floor = 0;
     // The most bytes of chunk states the store keeps for open transactions
     // (docs/design/TRANSACTIONS_DESIGN.md); past it the oldest transactions are
@@ -699,6 +700,16 @@ class ChunkStore {
     }
     [[nodiscard]] const StoreId& store_id() const noexcept { return store_id_; }
     [[nodiscard]] const std::optional<TableLineage>& lineage() const noexcept { return lineage_; }
+    // The chunk version clients see and conditional writes compare. A written
+    // chunk last changed before this table took its name by SWAP TABLES,
+    // RENAME TO or RESTORE TABLE shows the name floor recorded then: every
+    // version a table that held the name issued is below it, and this table's
+    // writes are above it, so a version read under the name before never
+    // matches. Stored revisions, which positions use, keep their values.
+    [[nodiscard]] std::uint64_t ReportedVersion(std::uint64_t stored) const noexcept {
+        return stored < name_floor_ && stored != 0U ? name_floor_ : stored;
+    }
+    [[nodiscard]] std::uint64_t name_floor() const noexcept { return name_floor_; }
     [[nodiscard]] const FeatureFlags& features() const noexcept { return features_; }
     [[nodiscard]] const std::filesystem::path& data_dir() const noexcept { return data_dir_; }
     [[nodiscard]] DurabilityMode durability_mode() const noexcept { return durability_mode_; }
@@ -890,9 +901,8 @@ class ChunkStore {
         std::int64_t cx, std::int64_t cy, std::int64_t cz,
         std::int64_t radius_chunks, bool with_vars = false, const TxnAreaRead& txn_read = {});
 
-    // The chunk's state read under one lock. A chunk without blocks has an
-    // empty presence bitmap and still a version, which a conditional write
-    // that creates it compares against.
+    // The chunk's state and conditional-write version read under one lock.
+    // A retained empty chunk has an empty presence bitmap and keeps a version.
     [[nodiscard]] ChunkState ReadChunkState(std::int64_t chunk_x, std::int64_t chunk_y);
     [[nodiscard]] ChunkState ReadChunkState(const ChunkCoord& chunk_coord);
     // Replaces the chunk's payload, presence and text and bytes values as
@@ -914,9 +924,8 @@ class ChunkStore {
         const ChunkCoord& chunk_coord, std::optional<std::uint64_t> expected_version,
         bool if_absent, const std::function<void(ChunkState&)>& transform);
 
-    // Committed chunk versions are producing commit revisions, ordered only
-    // within this store_id. Their reservation ceiling survives restart.
-    // GetChunkVersion returns zero for chunks without a producing commit.
+    // Returns the conditional-write version, or zero for a chunk without a
+    // producing commit. ScanChunkIdentities exposes stored revisions.
     [[nodiscard]] std::uint64_t GetChunkVersion(std::int64_t chunk_x, std::int64_t chunk_y);
     // Completed commit frontier, including terminal reservation gaps. A
     // read-only process cannot establish the writer's frontier and returns null.
@@ -1377,6 +1386,8 @@ class ChunkStore {
     std::filesystem::path snapshot_generation_path_;
     StoreId store_id_{};
     std::optional<TableLineage> lineage_;
+    // The table manifest's name floor (ReportedVersion); 0 when it has none.
+    std::uint64_t name_floor_ = 0;
     FeatureFlags features_{};
     std::uint64_t snapshot_generation_ = 0;
     // The generation record existed when the store opened (a writer never
@@ -1437,6 +1448,10 @@ class ChunkStore {
     // leave the clock unused and issue random epoch tokens instead.
     std::atomic<std::uint64_t> version_clock_{0};
     std::atomic<std::uint64_t> version_clock_ceiling_{0};
+    // This store opened with no changes in [opened_clock_, first_version_clock_).
+    // A fresh feed can use that interval while the clock is still untouched.
+    std::uint64_t opened_clock_ = 0U;
+    std::uint64_t first_version_clock_ = 0U;
     // Latest commit time this store instance issued (Unix ms).
     std::atomic<std::uint64_t> last_commit_time_ms_{0};
     std::mutex version_clock_mutex_;
@@ -1759,10 +1774,18 @@ class ChunkStore {
     // proves that this store previously exposed deterministic version tokens.
     void InitializeVersionClock(bool store_preexisting, const std::error_code& inventory_error);
     void ExtendVersionClockCeilingLocked(std::uint64_t minimum_exclusive);
+    // Called during open or with version_clock_mutex_ held.
+    void PersistVersionClockCeiling(std::uint64_t ceiling);
     // Moves the clock past a persisted chunk revision seen at load time, so
     // tokens issued from now on are above every revision the store holds even
     // when the clock bookkeeping was lost and restarted low.
     void RaiseVersionClockAbove(std::uint64_t revision);
+    // Raises the clock of a writer to its floors after recovery, durably
+    // before its first token, and records the opening interval for feeds.
+    void RaiseVersionClockToFloor();
+    [[nodiscard]] std::uint64_t FeedStartClock(std::uint64_t clock) const noexcept;
+    // A table taking a name needs room for a reservation above its name floor.
+    static void RequireWritableNameFloor(std::uint64_t name_floor);
     void RecoverConditionalRollbackIntents(bool validate_only = false);
     // Creates the manifest of a new store, or confirms the existing one
     // still records the geometry this store opened with.
