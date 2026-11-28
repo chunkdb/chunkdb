@@ -2,6 +2,9 @@
 // chunkdb_verify runs it (see verify.hpp for the output format).
 
 #include "verify.hpp"
+#include "chunk_check.hpp"
+#include "quarantine_record.hpp"
+#include "chunkdb/crc32.hpp"
 #include "backup.hpp"
 #include "backup_directory.hpp"
 
@@ -32,6 +35,7 @@
 #include "txn_history.hpp"
 #include "wal_replay.hpp"
 #include "populated_index_format.hpp"
+#include "statement_control.hpp"
 #include "chunk_coordinate_index.hpp"
 #include "archive_base_format.hpp"
 #include "txn_intent_format.hpp"
@@ -342,74 +346,21 @@ void ApplyBoundary(const chunkdb::Geometry& geometry, const chunkdb::ChunkIndexR
 void VerifyChunkArtifacts(const std::filesystem::path& root, const chunkdb::Geometry& geometry,
     const chunkdb::StoreManifest& manifest, const chunkdb::ChunkCoord& coord,
     CheckedIndex* index, VerifyCounters* counters) {
-    const auto image_path = chunkdb::ChunkDataPath(root, geometry, coord);
-    const auto wal_path = chunkdb::ChunkWalPath(root, geometry, coord);
-    std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U);
-    std::vector<std::uint8_t> presence(chunkdb::ChunkPresenceBitmapBytes(geometry), 0U);
-    chunkdb::ChunkVars vars;
-    std::shared_ptr<const chunkdb::ChunkColumnState> columns;
-    std::uint64_t revision = 0U, time = 0U, schema = 0U;
-    if (std::filesystem::exists(image_path)) {
-        ++counters->checked;
-        try {
-            auto image = chunkdb::ParseChunkImage(chunkdb::LoadChunkImageFile(image_path, geometry,
-                coord, manifest.store_id, manifest.features), geometry, coord, manifest.store_id, manifest.features);
-            payload = std::move(image.payload); presence = std::move(image.presence_bitmap);
-            vars = std::move(image.vars); columns = std::move(image.chunk_columns);
-            revision = image.revision; time = image.commit_time_ms; schema = image.schema_version;
-            ObserveRevision(counters, revision);
-        } catch (const std::exception& error) {
-            Report(counters, true, "chunk_image_invalid", image_path, error.what());
-            return; // An invalid image grants no empty replay base.
-        }
+    std::optional<chunkdb::ChunkIndexRecord> retained;
+    std::optional<std::uint64_t> wal_cut;
+    if (index != nullptr) {
+        if (const auto boundary = index->retained.find(coord); boundary != index->retained.end()) retained = boundary->second;
+        if (const auto cut = index->wal_cuts.find(coord); cut != index->wal_cuts.end()) wal_cut = cut->second;
     }
-    if (index == nullptr) return; // Retained-base admission failed independently.
-    try {
-        if (const auto boundary = index->retained.find(coord); boundary != index->retained.end())
-            ApplyBoundary(geometry, boundary->second, revision, time, schema, payload, presence, vars, columns);
-        if (std::filesystem::exists(wal_path)) {
-            ++counters->checked;
-            const auto cut = index->wal_cuts.find(coord);
-            RequirePlain(wal_path);
-            chunkdb::SharedFileInput input(wal_path);
-            const auto measured = Measure(input, wal_path);
-            const auto admitted = cut == index->wal_cuts.end() ? measured : cut->second;
-            if (admitted > measured) throw std::runtime_error("rollback WAL shortened before verification");
-            const auto retained = index->retained.find(coord);
-            if (admitted != 0U || cut == index->wal_cuts.end()) {
-                const auto replay = chunkdb::ReplayWalStream(input, admitted, geometry, coord, manifest.store_id, manifest.features,
-                    revision, schema, &payload, &presence, &vars, nullptr, &columns, {}, time, retained != index->retained.end() ?
-                        std::optional{chunkdb::WalKnownIdentity{retained->second.revision, retained->second.commit_time_ms}} : std::nullopt);
-                if (replay.torn_creation) {
-                    Report(counters, cut != index->wal_cuts.end(), cut == index->wal_cuts.end() ? "wal_torn_creation" : "wal_damaged",
-                        wal_path, "interrupted creation holds no mutation");
-                    if (cut != index->wal_cuts.end()) return;
-                } else if (!replay.replayable) {
-                    Report(counters, true, "wal_not_replayable", wal_path, replay.stop_reason);
-                    return;
-                } else if (replay.tail_truncated_or_corrupt) {
-                    Report(counters, !replay.stopped_at_crash_tail || cut != index->wal_cuts.end(),
-                        replay.stopped_at_crash_tail && cut == index->wal_cuts.end() ? "wal_tail_truncated" : "wal_damaged", wal_path,
-                        replay.stop_reason + " at byte " + std::to_string(replay.valid_end));
-                    if (!replay.stopped_at_crash_tail || cut != index->wal_cuts.end()) return;
-                }
-                if (!replay.vars_problem.empty()) {
-                    Report(counters, true, "wal_vars_inconsistent", wal_path, replay.vars_problem);
-                    return;
-                }
-                if (replay.applied_frames != 0U) {
-                    revision = replay.revision; time = replay.commit_time_ms;
-                    ObserveRevision(counters, revision);
-                }
-                if (revision != 0U) schema = geometry.layout().schema().version;
-            }
-        }
-        chunkdb::BringChunkColumnsToSchema(geometry, schema, geometry.chunk_schema().version, &columns);
-        if (index->unpublished.contains(coord)) index->artifacts.emplace(coord, CheckedIndex::Artifact{
-            revision, time, chunkdb::ChunkPopulated(geometry, presence, columns.get())});
-    } catch (const std::exception& error) {
-        Report(counters, true, "chunk_state_invalid", wal_path, error.what());
-    }
+    // Without an index, retained-base admission failed independently: only
+    // the image is checked.
+    const auto check = chunkdb::CheckChunkFiles(root, geometry, manifest.store_id, manifest.features, coord,
+        retained, wal_cut, index != nullptr);
+    counters->checked += check.files;
+    for (const auto revision : check.revisions) ObserveRevision(counters, revision);
+    for (const auto& finding : check.findings) Report(counters, finding.error, finding.code, finding.path, finding.detail);
+    if (index != nullptr && check.complete && index->unpublished.contains(coord))
+        index->artifacts.emplace(coord, CheckedIndex::Artifact{check.revision, check.commit_time_ms, check.populated});
 }
 
 template <typename T>
@@ -789,6 +740,40 @@ void VerifyTable(const std::filesystem::path& data_dir, VerifyCounters* counters
     std::set<chunkdb::ChunkCoord> checked_coords;
     for (const auto& entry : chunkdb::backup_detail::DirectoryEntries(data_dir)) {
         const auto name = entry.path().filename().string();
+
+        // chunkdb_admin quarantine set these chunk files aside; the table
+        // no longer reads them.
+        if (name == chunkdb::kQuarantineDirName && entry.is_directory()) {
+            for (const auto& quarantined : chunkdb::backup_detail::DirectoryEntries(entry.path())) {
+                const auto record_path = quarantined.path() / std::string(chunkdb::kQuarantineRecordName);
+                if (!std::filesystem::exists(record_path)) {
+                    Report(counters, false, "quarantine_interrupted", quarantined.path(),
+                        "no record; run chunkdb_admin quarantine for this chunk again before starting the server");
+                    continue;
+                }
+                try {
+                    const auto record = chunkdb::ParseQuarantineRecord(chunkdb::LoadFile(record_path));
+                    std::string files;
+                    for (const auto& file : record.files) files += (files.empty() ? "" : ", ") + file.name;
+                    ReportInfo(counters, "chunk_quarantined", quarantined.path(), files);
+                    // A live file the record holds: the tool stopped before it
+                    // removed it, and the table may still refuse to open.
+                    const bool own = store_geometry && store_manifest && record.table_epoch == store_manifest->store_id;
+                    for (const auto& file : own ? record.files : std::vector<chunkdb::QuarantineFile>{}) {
+                        const auto live = file.name.ends_with(".wal") ? chunkdb::ChunkWalPath(data_dir, *store_geometry, record.coord)
+                                                                       : chunkdb::ChunkDataPath(data_dir, *store_geometry, record.coord);
+                        if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(live))) continue;
+                        const auto bytes = chunkdb::LoadFile(live);
+                        if (bytes.size() == file.size && chunkdb::Crc32(bytes) == file.crc32)
+                            Report(counters, false, "quarantine_interrupted", live,
+                                "run chunkdb_admin quarantine for this chunk again before starting the server");
+                    }
+                } catch (const std::exception& error) {
+                    Report(counters, false, "quarantine_record_invalid", record_path, error.what());
+                }
+            }
+            continue;
+        }
 
         // Process-lock artifacts and OS metadata are not storage state.
         if (name.rfind(".chunkdb", 0) == 0 || name.rfind(".", 0) == 0) {
@@ -1218,10 +1203,21 @@ chunkdb::VerifyCounters chunkdb::VerifyDataDirectory(
     }
     if (present(data_dir / kBackupMarkerName)) {
         ++counters.checked;
-        try { ValidateBackupInventory(data_dir, ReadBackupRecord(data_dir)); }
-        catch (const std::exception& error) {
+        std::vector<BackupSkippedChunk> skipped;
+        try {
+            auto record = ReadBackupRecord(data_dir);
+            ValidateBackupInventory(data_dir, record);
+            skipped = std::move(record.skipped);
+        } catch (const std::exception& error) {
             Report(&counters, true, "backup_invalid", data_dir / kBackupMarkerName, error.what());
             return counters;
+        }
+        // BACKUP ... SKIP DAMAGED left these chunks out: the copy lacks them.
+        for (const auto& chunk : skipped) {
+            std::string coordinates = std::to_string(chunk.coord.x) + "," + std::to_string(chunk.coord.y);
+            if (chunk.dims == 3U) coordinates += "," + std::to_string(chunk.coord.z);
+            Report(&counters, false, "backup_chunk_skipped", data_dir / "tables" / chunk.table,
+                "chunk " + coordinates + " was left out as damaged: " + chunk.code);
         }
     }
     VerifyDataDirectoryImpl(data_dir, &counters);
@@ -1250,6 +1246,92 @@ chunkdb::VerifyCounters chunkdb::VerifyTableDirectory(
     counters.out = &out;
     VerifyTable(table_dir, &counters);
     return counters;
+}
+
+chunkdb::ChunkFileCheck chunkdb::CheckChunkFiles(const std::filesystem::path& root, const Geometry& geometry,
+    const StoreId& epoch, FeatureFlags features, const ChunkCoord& coord,
+    const std::optional<ChunkIndexRecord>& retained, std::optional<std::uint64_t> wal_cut, bool check_wal,
+    std::optional<std::uint64_t> wal_bytes, const std::function<void()>& read_checkpoint) {
+    ChunkFileCheck result;
+    const auto report = [&result](bool error, std::string code, const std::filesystem::path& path, std::string detail) {
+        result.findings.push_back({error, std::move(code), path, std::move(detail)});
+    };
+    const auto image_path = ChunkDataPath(root, geometry, coord);
+    const auto wal_path = ChunkWalPath(root, geometry, coord);
+    std::vector<std::uint8_t> payload(geometry.ChunkPayloadBytes(), 0U);
+    std::vector<std::uint8_t> presence(ChunkPresenceBitmapBytes(geometry), 0U);
+    ChunkVars vars;
+    std::shared_ptr<const ChunkColumnState> columns;
+    std::uint64_t revision = 0U, time = 0U, schema = 0U;
+    if (std::filesystem::exists(image_path)) {
+        ++result.files;
+        try {
+            auto image = ParseChunkImage(LoadChunkImageFile(image_path, geometry, coord, epoch, features),
+                geometry, coord, epoch, features);
+            payload = std::move(image.payload); presence = std::move(image.presence_bitmap);
+            vars = std::move(image.vars); columns = std::move(image.chunk_columns);
+            revision = image.revision; time = image.commit_time_ms; schema = image.schema_version;
+            result.revisions.push_back(revision);
+        } catch (const std::exception& error) {
+            report(true, "chunk_image_invalid", image_path, error.what());
+            return result; // An invalid image grants no empty replay base.
+        }
+    }
+    if (!check_wal) return result;
+    try {
+        if (retained) ApplyBoundary(geometry, *retained, revision, time, schema, payload, presence, vars, columns);
+        if (std::filesystem::exists(wal_path)) {
+            ++result.files;
+            RequirePlain(wal_path);
+            SharedFileInput input(wal_path);
+            auto measured = Measure(input, wal_path);
+            if (wal_bytes) {
+                if (*wal_bytes > measured) throw std::runtime_error("WAL shorter than its pinned prefix");
+                measured = *wal_bytes;
+            }
+            const auto admitted = wal_cut.value_or(measured);
+            if (admitted > measured) throw std::runtime_error("rollback WAL shortened before verification");
+            if (admitted != 0U || !wal_cut) {
+                const auto replay = ReplayWalStream(input, admitted, geometry, coord, epoch, features,
+                    revision, schema, &payload, &presence, &vars, nullptr, &columns, read_checkpoint, time, retained ?
+                        std::optional{WalKnownIdentity{retained->revision, retained->commit_time_ms}} : std::nullopt);
+                if (replay.torn_creation) {
+                    report(wal_cut.has_value(), wal_cut ? "wal_damaged" : "wal_torn_creation",
+                        wal_path, "interrupted creation holds no mutation");
+                    if (wal_cut) return result;
+                } else if (!replay.replayable) {
+                    report(true, "wal_not_replayable", wal_path, replay.stop_reason);
+                    return result;
+                } else if (replay.tail_truncated_or_corrupt) {
+                    const bool repairable = replay.stopped_at_crash_tail && !wal_cut;
+                    report(!repairable, repairable ? "wal_tail_truncated" : "wal_damaged", wal_path,
+                        replay.stop_reason + " at byte " + std::to_string(replay.valid_end));
+                    if (!repairable) return result;
+                }
+                if (!replay.vars_problem.empty()) {
+                    report(true, "wal_vars_inconsistent", wal_path, replay.vars_problem);
+                    return result;
+                }
+                if (replay.applied_frames != 0U) {
+                    revision = replay.revision; time = replay.commit_time_ms;
+                    result.revisions.push_back(revision);
+                }
+                if (revision != 0U) schema = geometry.layout().schema().version;
+            }
+        }
+        BringChunkColumnsToSchema(geometry, schema, geometry.chunk_schema().version, &columns);
+        result.complete = true;
+        result.revision = revision;
+        result.commit_time_ms = time;
+        result.populated = ChunkPopulated(geometry, presence, columns.get());
+    } catch (const StatementStoppedError&) {
+        throw;
+    } catch (const CheckTableShutdownError&) {
+        throw;
+    } catch (const std::exception& error) {
+        report(true, "chunk_state_invalid", wal_path, error.what());
+    }
+    return result;
 }
 
 chunkdb::VerifyCounters chunkdb::VerifyCommitGroupOwner(

@@ -106,6 +106,8 @@ add_library(chunkdb_core STATIC
     src/user_registry.cpp
     src/user_admission.cpp
     src/verify.cpp
+    src/chunk_check.cpp
+    src/quarantine_record.cpp
     src/durability_io.cpp
     src/file_permissions.cpp
     src/audit_log.cpp
@@ -396,6 +398,25 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME restore_table_crash COMMAND chunkdb_restore_table_crash_test)
     set_tests_properties(restore_table_crash PROPERTIES TIMEOUT 300 LABELS "crash")
 
+    add_executable(chunkdb_restore_table_area_test tests/restore_table_area_tests.cpp)
+    target_link_libraries(chunkdb_restore_table_area_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_restore_table_area_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_dependencies(chunkdb_restore_table_area_test chunkdb_restore)
+    add_test(NAME restore_table_area COMMAND chunkdb_restore_table_area_test $<TARGET_FILE:chunkdb_restore>)
+    set_tests_properties(restore_table_area PROPERTIES TIMEOUT 180 LABELS "crash")
+
+    add_executable(chunkdb_check_table_test tests/check_table_tests.cpp)
+    target_link_libraries(chunkdb_check_table_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_check_table_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME check_table COMMAND chunkdb_check_table_test)
+    set_tests_properties(check_table PROPERTIES TIMEOUT 120 LABELS "smoke")
+
+    add_executable(chunkdb_backup_skip_damaged_test tests/backup_skip_damaged_tests.cpp)
+    target_link_libraries(chunkdb_backup_skip_damaged_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_backup_skip_damaged_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_test(NAME backup_skip_damaged COMMAND chunkdb_backup_skip_damaged_test)
+    set_tests_properties(backup_skip_damaged PROPERTIES TIMEOUT 120 LABELS "smoke")
+
     add_executable(chunkdb_geometry_bit_test tests/geometry_bit_tests.cpp)
     target_link_libraries(chunkdb_geometry_bit_test PRIVATE chunkdb_core)
     target_include_directories(chunkdb_geometry_bit_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
@@ -643,6 +664,13 @@ if(CHUNKDB_BUILD_TESTS)
     # Runs the admin binary as a child process.
     add_dependencies(chunkdb_admin_rebuild_version_clock_test chunkdb_admin)
     add_test(NAME admin_rebuild_version_clock COMMAND chunkdb_admin_rebuild_version_clock_test $<TARGET_FILE:chunkdb_admin>)
+
+    add_executable(chunkdb_admin_quarantine_test tests/admin_quarantine_tests.cpp)
+    target_link_libraries(chunkdb_admin_quarantine_test PRIVATE chunkdb_tools)
+    target_include_directories(chunkdb_admin_quarantine_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/src)
+    add_dependencies(chunkdb_admin_quarantine_test chunkdb_admin)
+    add_test(NAME admin_quarantine COMMAND chunkdb_admin_quarantine_test $<TARGET_FILE:chunkdb_admin>)
+    set_tests_properties(admin_quarantine PROPERTIES TIMEOUT 120 LABELS "crash")
 
     add_executable(chunkdb_user_admission_test tests/user_admission_tests.cpp)
     target_link_libraries(chunkdb_user_admission_test PRIVATE chunkdb_core)
@@ -1187,6 +1215,10 @@ if(CHUNKDB_BUILD_TESTS)
     add_test(NAME docs_check COMMAND chunkdb_docs_check_test ${CMAKE_CURRENT_SOURCE_DIR})
 
     set(CHUNKDB_TEST_TARGETS
+        chunkdb_check_table_test
+        chunkdb_restore_table_area_test
+        chunkdb_admin_quarantine_test
+        chunkdb_backup_skip_damaged_test
         chunkdb_user_admission_test
         chunkdb_maintenance_pool_test
         chunkdb_coordinate_hash_test

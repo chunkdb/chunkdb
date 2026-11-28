@@ -190,6 +190,10 @@ struct TableRestoreRequest {
     // Called before the first and after each copied file: files and bytes
     // copied, and their totals.
     std::function<void(std::uint64_t, std::uint64_t, std::uint64_t, std::uint64_t)> progress{};
+    // Only the chunks this area selects (chunkdb_restore --area).
+    std::optional<ChunkAreaSelector> area{};
+    // Restore an area that splits commits (SelectRestoredArea).
+    bool allow_split = false;
 };
 struct TableRestoreResult {
     std::string name;
@@ -199,6 +203,9 @@ struct TableRestoreResult {
     std::uint64_t fork_revision = 0;
     std::uint64_t files = 0;
     std::uint64_t bytes = 0;
+    // With an area: its chunks, and the revisions of the commits it splits.
+    std::uint64_t chunks = 0;
+    std::vector<std::uint64_t> split_revisions{};
 };
 
 // A table that refuses its commands until TableCatalog::RecoverTable or a

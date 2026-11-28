@@ -32,15 +32,31 @@ struct BackupFileRecord {
     std::uint64_t size = 0;
     std::uint32_t crc32 = 0;
 };
+// A chunk BACKUP ... SKIP DAMAGED left out because its files failed the
+// chunkdb_verify checks: neither its image nor its WAL is in the backup.
+struct BackupSkippedChunk {
+    std::string table;
+    std::uint8_t dims = 2;
+    ChunkCoord coord{};
+    // The chunkdb_verify code of the damage.
+    std::string code;
+    // The damaged file relative to the table directory, and what is wrong;
+    // the reply has them, the completion record does not.
+    std::filesystem::path file{};
+    std::string detail{};
+};
 struct BackupRecord {
     std::uint64_t created_at_ms = 0;
     std::vector<BackupTableCut> tables;
     std::vector<BackupFileRecord> files;
+    // Version 2 of the record lists them; a record without them stays version 1.
+    std::vector<BackupSkippedChunk> skipped;
 };
 struct BackupResult {
     std::vector<BackupTableCut> tables;
     std::uint64_t files_count = 0;
     std::uint64_t bytes = 0;
+    std::vector<BackupSkippedChunk> skipped;
 };
 // Deterministic pin/copy boundaries, following the storage test-hook pattern.
 struct BackupTestHook {
@@ -56,6 +72,9 @@ struct BackupOptions {
     std::function<void(const BackupResult&)> before_publish{};
     // The configured --backup-dir the target lies under; see PrepareBackupTarget.
     std::filesystem::path backup_directory{};
+    // SKIP DAMAGED: leave out each chunk whose image or WAL fails the
+    // chunkdb_verify checks instead of failing the backup.
+    bool skip_damaged = false;
 };
 class BackupBusyError : public std::runtime_error {
   public:
@@ -130,6 +149,10 @@ void CompleteBackup(const std::filesystem::path& root, const BackupRecord& recor
 void SyncBackupTree(const std::filesystem::path& root, const BackupCancel& cancelled = {});
 void CompleteBackupGuard(const std::filesystem::path& root, std::string_view guard, std::string_view phase);
 void RestoreBackup(const std::filesystem::path& backup, const std::filesystem::path& target);
+struct TableRestoreRequest;
+struct TableRestoreResult;
+[[nodiscard]] TableRestoreResult RestoreTableOffline(const std::filesystem::path& data_dir,
+    const TableRestoreRequest& request);
 
 // The completed backup a RESTORE TABLE statement names, resolved under the
 // configured --backup-dir with the BACKUP TO path rules.
@@ -157,6 +180,24 @@ using BackupCopyProgress = std::function<void(std::uint64_t copied_files, std::u
 // rebound, the clock restarts at the cut's successor, and the manifest is
 // written last. `files` are the table's inventory files relative to it.
 // Returns the new epoch.
+// The chunks of a copied table an area selects.
+struct RestoredArea {
+    // The table's remaining files, relative to it.
+    std::vector<std::filesystem::path> files;
+    // Chunks with an image or a WAL in the area.
+    std::uint64_t chunks = 0;
+    // Revisions of commits that changed chunks both inside and outside the
+    // area, as the copied images and WAL frames hold them.
+    std::vector<std::uint64_t> split_revisions;
+};
+// Keeps only the chunks `area` selects in a table copied by CopyBackupTable,
+// before RebindRestoredTable: the images and WALs of the others are removed,
+// and so are their coordinate-index records, live or deleted. Without
+// `allow_split`, a split commit throws std::invalid_argument naming its
+// revisions before any file changes.
+[[nodiscard]] RestoredArea SelectRestoredArea(const std::filesystem::path& directory, const BackupTableCut& cut,
+    const std::vector<std::filesystem::path>& files, const ChunkAreaSelector& area, bool allow_split,
+    const BackupCancel& cancelled = {});
 [[nodiscard]] StoreId RebindRestoredTable(const std::filesystem::path& directory, const BackupTableCut& cut,
     const std::vector<std::filesystem::path>& files, const BackupCancel& cancelled = {});
 

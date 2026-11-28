@@ -95,7 +95,9 @@ int main(int argc, char** argv) {
         {std::string(kMigrationsFileName), std::nullopt, ledger}};
     Fixture("migrations", "journal", EncodeMigrationJournal(journal));
     Fixture("backup", "marker", SerializeBackupRecord({123U,
-        {{"default", fuzz::kId, 3U}}, {{"chunkdb.manifest", 44U, 0U}, {"chunkdb.users", 100U, 1U}}}));
+        {{"default", fuzz::kId, 3U}}, {{"chunkdb.manifest", 44U, 0U}, {"chunkdb.users", 100U, 1U}}, {}}));
+    Fixture("backup", "marker_skipped", SerializeBackupRecord({123U, {{"default", fuzz::kId, 3U}},
+        {{"chunkdb.manifest", 44U, 0U}}, {{"default", 3U, ChunkCoord{-1, 2, 3}, "wal_damaged", {}, {}}}}));
     // Request examples from the parser and server's framing/login fixtures.
     unsigned index = 0U;
     // Statements from the CQL reference pages and the parser tests.

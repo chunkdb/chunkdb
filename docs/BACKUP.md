@@ -94,6 +94,79 @@ SWAP TABLES then exchanges the names atomically, and DROP TABLE removes the repl
 A consumer of `world` then sees the restored epoch and resumes by its [lineage](CHANGE_FEED.md) or receives resync.
 See [Tables](reference/TABLES.md) for SWAP TABLES.
 
+## 5. Restore one table offline
+
+With the server stopped, `chunkdb_restore --table` adds one table of a backup to a data directory as a new table:
+
+```sh
+chunkdb_restore --table world --as world_restored /backups/snapshot /var/lib/chunkdb
+```
+
+The destination may be an existing data directory or an absent or empty directory that will hold only this table and no users.
+As with RESTORE TABLE, the table gets a new epoch with the backed-up epoch and cut as its lineage, requires the destination's table features, and appears only once complete.
+If the restore stops before publication in an existing data directory, the next writer start removes the staged table.
+For an absent or empty destination, restore prepares the data directory in a private sibling and publishes it only when complete.
+After a crash before publication, the destination has no restored table, and you can remove the unused `.chunkdb.restore-table.*` sibling once the restore has stopped.
+After a crash during or after publication, the destination may contain the complete restored table.
+Users, grants and migration records of the backup are not restored; the table falls under the grants that match its name.
+Opening the data directory opens each of its tables, so a table that does not open, such as one with a damaged chunk, stops the restore; quarantine that chunk first.
+
+`--area cx0 cy0 TO cx1 cy1` restores only the chunks in that range, with a third coordinate on each side for a three-dimensional table.
+The restored table has no data, tombstones or other chunk identities outside the area.
+A transaction commits all its chunks at one revision; an area that holds only some of them splits that commit, and restore refuses it and names the revisions.
+`--allow-split` restores such an area anyway and prints the split revisions.
+Restore finds them in the revisions the backed-up images and WAL frames still hold, so a commit an image has since absorbed is not found.
+Only a transaction commits several chunks at one revision; other writes and MIGRATE give each chunk its own, so they split nothing.
+A tombstone keeps the revision of the commit that emptied its chunk and counts too.
+A commit changes one table, so restoring a whole table splits none.
+
+## Repair damaged chunks
+
+CHECK TABLE finds damaged chunk files while the server keeps serving:
+
+```text
+CHECK TABLE world
+```
+
+It lists each damaged chunk with its coordinates, the damaged file and the `chunkdb_verify` code; see [Tables](reference/TABLES.md).
+It needs ADMIN on the table or MONITOR.
+
+A damaged chunk refuses BACKUP TO; SKIP DAMAGED backs up the other chunks:
+
+```text
+BACKUP TO 'without-damage' SKIP DAMAGED
+```
+
+The reply's `skipped` list and the backup's completion record name each chunk left out; `chunkdb_verify` reports each as warning `backup_chunk_skipped`.
+A restore of that backup has no data for those chunks.
+
+A damaged chunk can keep the server from starting.
+Stop the server and set the chunk aside:
+
+```sh
+chunkdb_admin --data-dir /var/lib/chunkdb quarantine --table world --chunk 3 -1
+```
+
+It moves the chunk's image and WAL into `tables/world/.chunkdb.quarantine/` with a record of them, so the table opens without the chunk.
+The chunk then reads as absent, or as its retained deletion, and takes new writes.
+Each slot of the table starts its next watch with resync.
+It refuses a chunk that passes the checks unless you add `--force`.
+It also refuses a chunk whose WAL a pending recovery needs, or whose deletion the coordinate inventory does not list yet, because opening the table needs its files; restore the table from a backup then.
+If it stops partway, run it again before starting the server; until then `chunkdb_verify` warns `quarantine_interrupted`.
+If a saved file is missing or differs from its quarantine record, the rerun refuses to remove any remaining live files.
+A run after a finished one reports the chunk as already quarantined.
+The moved files stay for inspection; `chunkdb_verify` lists them as `chunk_quarantined`, and you delete the entry when you no longer need it.
+
+To get the chunk's data back, restore it from a backup into a new table, start the server, and copy it with the [CLI](reference/CHUNKS.md) while both tables have the same columns:
+
+```sh
+chunkdb_restore --table world --as world_repair --area 3 -1 TO 3 -1 /backups/snapshot /var/lib/chunkdb
+chunk-cli --out chunk.bin 'GET CHUNK 3 -1 FROM world_repair'
+chunk-cli --in chunk.bin 'SET CHUNK 3 -1 IN world $1'
+```
+
+Then drop `world_repair`.
+
 ## Contents and space
 
 Backups include definitions, schema history, images, WAL prefixes, users, rights, slots, and completed migration records.
@@ -114,11 +187,13 @@ The server logs a warning for anything it cannot remove.
 - Unsafe or nonempty destination: choose an empty path under the backup directory.
 - Backup directory not owned by the server user or root, or writable by group or others: the error names it; remove group and other write access, for example `chmod 755`, or choose another path.
 - Incomplete backup: remove that failed destination before retrying; it cannot be restored.
+- A damaged chunk: see [Repair damaged chunks](#repair-damaged-chunks).
 - Unfinished migration recovery: restart the writer before taking another backup.
 - A fenced table: run RECOVER TABLE before taking another backup.
 - Unknown restore publication outcome: verify the destination before deciding whether to remove or use it.
 - RESTORE TABLE `TABLE_EXISTS`: restore under another name with AS.
 - RESTORE TABLE refusing features or options: restore offline with `chunkdb_restore`, or enable the feature on this server first.
+- `chunkdb_restore --area` naming split revisions: choose an area that holds every chunk of those commits, or add `--allow-split`.
 
 Stopping the server aborts unfinished copying; client disconnect leaves the backup running.
 See [Server statements](reference/SERVER.md), [Storage format](STORAGE_FORMAT.md), and [Durability](DURABILITY_CONTRACT.md).

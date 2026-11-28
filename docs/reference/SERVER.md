@@ -32,7 +32,7 @@ chunk-cli --uri "$CHUNKDB_URI" "SHOW METRICS" | sed -n '1,2p'
 PING
 FLUSH WAL
 SHOW METRICS
-BACKUP TO 'destination'
+BACKUP TO 'destination' [SKIP DAMAGED]
 RESTORE TABLE table FROM 'backup' [AS name]
 RELOAD TLS
 SHOW CONNECTIONS
@@ -46,6 +46,7 @@ KILL CONNECTION id
 - Use `/` separators; rooted paths, backslashes, `..` components, and symlinks below the resolved backup directory are refused.
 - `backup`: a completed backup under the configured backup directory, with the same path rules.
 - `table`: a table the backup holds; `name`: the new table, `table` when AS is omitted.
+- `SKIP DAMAGED`: leave out each chunk whose image or WAL fails the `chunkdb_verify` checks instead of refusing the backup.
 
 ## Returns
 
@@ -54,7 +55,7 @@ KILL CONNECTION id
 - SHOW METRICS: Prometheus text, obtained through an authenticated connection with MONITOR or ADMIN on all tables; [chunkdb_exporter](../EXPORTER.md) serves it to Prometheus over HTTP.
 - In SHOW METRICS, the table metrics have one sample per table with a `table` label: `chunkdb_open_wal_streams`, `chunkdb_wal_*`, `chunkdb_evictions_total`, `chunkdb_eviction_*`, `chunkdb_checkpoints_total`, `chunkdb_background_*`, `chunkdb_compressed_checkpoint_images_total`, `chunkdb_empty_chunk_gcs_total`, `chunkdb_unique_loaded_chunks_total`, `chunkdb_txn_history_*`, `chunkdb_table_fenced` and `chunkdb_slot_frontier_frozen`; the other metrics are server-wide and have no `table` label. SHOW METRICS does not wait for a table that is not serving at that moment: one that an exclusive statement such as ALTER TABLE holds or waits for, one whose change feed cleanup failed until RECOVER TABLE, or one being dropped has only its `chunkdb_table_fenced` sample in that reply.
 - `chunkdb_table_fenced` is 1 for each table that SHOW STATUS reports fenced or frozen, also one out of service, and 0 for each other table. `chunkdb_slot_frontier_frozen` is 1 for each table that SHOW STATUS reports frozen, one with a slot that is not lost whose store failed closed after a durability failure: slot passes stop and the slots' durable `revision` stays until RECOVER TABLE or a restart; it is 0 for each other table that is serving. The [metric names](../EXPORTER.md#metrics) are fixed for 2.x.
-- BACKUP: table count, inventoried files and bytes, and per-table epoch/revision cuts.
+- BACKUP: table count, inventoried files and bytes, and per-table epoch/revision cuts; with SKIP DAMAGED also `skipped`, one entry per left-out chunk with its `table`, `chunk` coordinates, damaged `file`, `code` and `detail`.
 - RESTORE TABLE: the new `table`, its `epoch`, its `parent_epoch` and `fork_revision` (the backed-up epoch and cut), and the `files` and `bytes` copied.
 - RELOAD TLS: `OK` once connections that start from then on use the certificate and key read again from the `--tls-cert` and `--tls-key` files.
 - SHOW CONNECTIONS: an array of maps with `id`, `user`, `peer`, `state`, `statement`, and `progress`.
@@ -71,7 +72,7 @@ KILL CONNECTION id
 | INVALID_ARGUMENT | Backup configuration, destination or source is invalid, the backup has no such table, or its features or stored options differ from what this server serves. | Follow [Backup and restore](../BACKUP.md). |
 | INVALID_ARGUMENT | You run FLUSH WAL, BACKUP or RESTORE TABLE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
 | INVALID_ARGUMENT | RELOAD TLS on a server without a `chunks://` listener, or the files hold no readable certificate and matching key. | Fix the files; the previous certificate stays in use. |
-| INTERNAL | Required persistence or copying fails, a restored backup is incomplete, damaged or changed, or the server stops during a restore. | Check the error and [Durability](../DURABILITY_CONTRACT.md). |
+| INTERNAL | Required persistence or copying fails, a backed-up chunk is damaged, a restored backup is incomplete, damaged or changed, or the server stops during a restore. | Check the error and [Durability](../DURABILITY_CONTRACT.md); for a damaged chunk, see [Repair damaged chunks](../BACKUP.md#repair-damaged-chunks). |
 
 ## Notes
 
@@ -94,7 +95,7 @@ Connection identifiers are exact unsigned integers scoped to the server process.
 A user may list and control connections of the same live user incarnation; ADMIN on `*` permits access to all connections, and MONITOR lists all connections without controlling them.
 Dropping and recreating a user does not grant the replacement user access to the previous user's connections.
 An empty user or statement is null in SHOW CONNECTIONS, and `statement` contains only the statement verb.
-`progress` is null unless the running statement reports progress; only RESTORE TABLE does.
+`progress` is null unless the running statement reports progress; RESTORE TABLE does, and CHECK TABLE reports its chunks as files.
 A listing that exceeds the response limit returns OUT_OF_RANGE without a partial listing.
 Missing, idle, self-cancelled, and decision-entered statements return `cancelled: false`.
 Killing a connection preserves the real outcome of a statement that already entered its decision boundary.

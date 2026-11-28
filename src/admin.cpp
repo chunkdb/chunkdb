@@ -2,6 +2,7 @@
 
 #include <algorithm>
 #include <limits>
+#include <sstream>
 #include <stdexcept>
 #include <system_error>
 
@@ -14,6 +15,18 @@
 #include "store_manifest.hpp"
 #include "user_registry.hpp"
 #include "verify.hpp"
+#include "chunk_check.hpp"
+#include "chunk_coordinate_index.hpp"
+#include "chunkdb/crc32.hpp"
+#include "chunkdb/file_layout.hpp"
+#include "chunkdb/table_catalog.hpp"
+#include "feed_slot_records.hpp"
+#include "file_permissions.hpp"
+#include "quarantine_record.hpp"
+#include "populated_index_format.hpp"
+#include "shared_file_input.hpp"
+#include "txn_history.hpp"
+#include "txn_intent_format.hpp"
 
 namespace chunkdb {
 
@@ -130,6 +143,214 @@ std::vector<RebuiltVersionClock> RebuildVersionClock(const std::filesystem::path
         if (result[i].marker_rewritten)
             PublishClockRecord(table_dir / ".chunkdb.initialized", SerializeInitializedStoreMarker());
     }
+    return result;
+}
+
+namespace {
+
+void CrashAtFailpoint(const char* point) {
+    if (ConsumeFailpointEnv(point)) std::_Exit(86);
+}
+
+struct FileSum {
+    std::uint64_t size = 0;
+    std::uint32_t crc32 = 0;
+};
+
+FileSum Sum(const std::filesystem::path& path) {
+    const auto bytes = LoadFile(path);
+    return {bytes.size(), Crc32(bytes)};
+}
+
+// Recovery truncates a WAL a pending rollback intent names to the length it
+// records, so such a chunk cannot lose its WAL.
+void RequireNoIntentFor(const std::filesystem::path& table_dir, const Geometry& geometry, const StoreId& epoch,
+    const ChunkCoord& coord) {
+    const auto directory = ConditionalIntentDirectory(table_dir);
+    std::error_code error;
+    if (!std::filesystem::exists(directory, error) && !error) return;
+    for (const auto& file : std::filesystem::directory_iterator(directory)) {
+        const auto name = file.path().filename().string();
+        if (name.find(".tmp.") != std::string::npos || file.path().extension() != ".rollback") continue;
+        bool names = false;
+        if (IsTxnIntentArtifactName(name)) {
+            TxnIntent intent;
+            if (!TryParseTxnIntent(LoadRecoveryTxnIntent(file.path(), geometry.dims(), epoch), &intent, geometry.dims(), epoch))
+                throw std::runtime_error("cannot read the recovery intent " + file.path().string());
+            names = std::any_of(intent.entries.begin(), intent.entries.end(),
+                [&](const TxnIntentEntry& entry) { return entry.coord == coord; });
+        } else {
+            ChunkCoord named;
+            if (!ParseConditionalIntentFileName(name, geometry, &named))
+                throw std::runtime_error("cannot read the recovery intent " + file.path().string());
+            names = named == coord;
+        }
+        if (names)
+            throw std::runtime_error("the recovery intent " + file.path().string() +
+                " needs this chunk's WAL; restore the table from a backup instead");
+    }
+}
+
+// Recovery needs the artifact of a deletion boundary that the coordinate
+// inventory does not list yet; without it the table does not open.
+void RequirePublishedBoundary(const std::filesystem::path& table_dir, const Geometry& geometry, const StoreId& epoch,
+    const ChunkCoord& coord) {
+    const auto large = geometry.ChunkToLarge(coord);
+    const auto log_path = LargeChunkDirectory(table_dir, large, geometry.dims()) / kChunkIndexFileName;
+    if (!std::filesystem::exists(log_path)) return;
+    bool listed = false;
+    {
+        const auto inventory_path = table_dir / kChunkIndexFileName;
+        SharedFileInput inventory(inventory_path);
+        if (!inventory) throw std::runtime_error("cannot read the coordinate inventory " + inventory_path.string());
+        (void)ReadIndexInventory(inventory, std::filesystem::file_size(inventory_path), geometry, epoch,
+            [&](const IndexInventoryEntry& entry) { listed = listed || entry.coord == large; });
+    }
+    if (listed) return;
+    SharedFileInput log(log_path);
+    if (!log) throw std::runtime_error("cannot read the coordinate log " + log_path.string());
+    if (ReadChunkIndexLog(log, std::filesystem::file_size(log_path), geometry, epoch, large).empty_boundaries.contains(coord))
+        throw std::runtime_error("the chunk has a deletion the coordinate inventory does not list yet, and opening the "
+            "table needs its files; restore the table from a backup instead");
+}
+
+// Marks every slot that is not lost so that its next watch starts with
+// resync; returns how many it marked.
+std::size_t RequireSlotResync(const std::filesystem::path& table_dir, const StoreId& epoch, std::uint8_t dims) {
+    auto records = ReadFeedSlotRecords(table_dir, epoch, dims);
+    if (!records) return 0U;
+    std::size_t marked = 0U;
+    for (auto& slot : records->slots) {
+        if (slot.lost || slot.resync) continue;
+        slot.resync = true;
+        ++marked;
+    }
+    if (marked != 0U) WriteFeedSlotRecords(table_dir, *records);
+    return marked;
+}
+
+}  // namespace
+
+QuarantinedChunk QuarantineChunk(const std::filesystem::path& data_dir, const std::string& table, std::uint8_t dims,
+    const ChunkCoord& coord, bool force, std::ostream& findings) {
+    RequireNotBackupDirectory(data_dir, AccessMode::kReadWrite);
+    RequireValidTableName(table);
+    if (!std::filesystem::exists(DataDirManifestPath(data_dir)))
+        throw std::invalid_argument("the directory " + data_dir.string() + " is not a chunkdb data directory");
+    const auto lock = AcquireWriterLock(data_dir, AccessMode::kReadWrite, /*allow_multiple_processes=*/false);
+    // A decided migration may still change the table's files.
+    RecoverMigrations(data_dir, AccessMode::kReadWrite);
+    const auto table_dir = data_dir / "tables" / table;
+    const auto manifest = ReadStoreManifest(table_dir);
+    if (!manifest) throw std::invalid_argument("the data directory has no table " + table);
+    RequireOpenableFeatures(manifest->features, AccessMode::kReadWrite);
+    const Geometry geometry(manifest->geometry, manifest->schema, *manifest->chunk_schema);
+    if (dims != geometry.dims())
+        throw std::invalid_argument("table " + table + " has " + std::to_string(geometry.dims()) +
+            " dimensions; give one coordinate for each");
+    const auto stem = ChunkFileStem(coord, dims);
+    const auto described = "chunk " + stem.substr(2U) + " of table " + table;
+    RequireNoIntentFor(table_dir, geometry, manifest->store_id, coord);
+    // The WAL first: removing it first never leaves WAL frames without the
+    // image they apply to.
+    std::vector<std::filesystem::path> present;
+    for (const auto& path : {ChunkWalPath(table_dir, geometry, coord), ChunkDataPath(table_dir, geometry, coord)}) {
+        const auto status = std::filesystem::symlink_status(path);
+        if (status.type() == std::filesystem::file_type::not_found) continue;
+        if (status.type() != std::filesystem::file_type::regular)
+            throw std::runtime_error(path.string() + " is not a regular file");
+        present.push_back(path);
+    }
+    QuarantinedChunk result;
+    const auto root = table_dir / kQuarantineDirName;
+    std::filesystem::path entry;
+    if (std::filesystem::exists(root)) {
+        for (const auto& candidate : std::filesystem::directory_iterator(root)) {
+            const auto name = candidate.path().filename().string();
+            if (!name.starts_with(stem + ".") || !std::filesystem::is_directory(candidate.symlink_status())) continue;
+            const auto record_path = candidate.path() / kQuarantineRecordName;
+            if (!std::filesystem::exists(record_path)) {
+                // Interrupted before its record: it holds only links to files
+                // still in place.
+                std::filesystem::remove_all(candidate.path());
+                SyncDirectoryPath(root);
+                continue;
+            }
+            const auto record = ParseQuarantineRecord(LoadFile(record_path));
+            if (record.table_epoch != manifest->store_id || record.dims != dims || record.coord != coord) continue;
+            // Interrupted after its record: every remaining file is in it.
+            const bool holds_all = std::all_of(present.begin(), present.end(), [&](const std::filesystem::path& path) {
+                const auto sum = Sum(path);
+                return std::any_of(record.files.begin(), record.files.end(), [&](const QuarantineFile& file) {
+                    return file.name == path.filename().string() && file.size == sum.size && file.crc32 == sum.crc32;
+                });
+            });
+            if (holds_all && !result.resumed) {
+                // The record authorizes removal only while the saved files
+                // still exist and match it, including a WAL already removed.
+                for (const auto& file : record.files) {
+                    const auto saved = candidate.path() / file.name;
+                    if (!std::filesystem::is_regular_file(std::filesystem::symlink_status(saved)))
+                        throw std::runtime_error("quarantined copy is missing or not a regular file: " + saved.string());
+                    const auto sum = Sum(saved);
+                    if (sum.size != file.size || sum.crc32 != file.crc32)
+                        throw std::runtime_error("quarantined copy differs from its record: " + saved.string());
+                    result.files.push_back(file.name);
+                }
+                entry = candidate.path();
+                result.resumed = true;
+            }
+        }
+    }
+    if (present.empty()) {
+        if (!result.resumed) throw std::invalid_argument(described + " has no image or WAL");
+        // An earlier run finished: nothing is left to move or to mark.
+        result.already_quarantined = true;
+        result.entry = entry.lexically_relative(data_dir);
+        return result;
+    }
+    if (!result.resumed) {
+        RequirePublishedBoundary(table_dir, geometry, manifest->store_id, coord);
+        const auto check = CheckChunkFiles(table_dir, geometry, manifest->store_id, manifest->features, coord,
+            ChunkCoordinateIndex(table_dir, geometry, manifest->store_id, true).EmptyBoundary(coord));
+        for (const auto& finding : check.findings)
+            findings << (finding.error ? "error " : "warning ") << finding.code << ' '
+                     << finding.path.lexically_relative(data_dir).generic_string() << ": " << finding.detail << '\n';
+        if (const auto* damage = check.damage()) result.damage = damage->code;
+        else if (!force)
+            throw std::invalid_argument("the chunkdb_verify checks find no damage in " + described +
+                "; give --force to quarantine it anyway");
+        EnsureDirectoryPathExists(root, /*durable_sync=*/true);
+        entry = root / (stem + "." + std::to_string(UnixMillisNow()) + "." + StoreIdHex(NewStoreId()).substr(0U, 8U));
+        if (!CreateOwnerOnlyDirectory(entry)) throw std::runtime_error("quarantine entry already exists: " + entry.string());
+        SyncDirectoryPath(root);
+        QuarantineRecord record{.table_epoch = manifest->store_id, .dims = dims, .coord = coord,
+            .quarantined_at_ms = UnixMillisNow(), .files = {}};
+        for (const auto& path : present) {
+            const auto name = path.filename().string();
+            std::filesystem::create_hard_link(path, entry / name);
+            SyncFilePath(entry / name);
+            const auto sum = Sum(entry / name);
+            record.files.push_back({name, sum.size, sum.crc32});
+            result.files.push_back(name);
+        }
+        SyncDirectoryPath(entry);
+        CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_QUARANTINE_BEFORE_RECORD_ONCE");
+        AtomicWrite(entry / kQuarantineRecordName, SerializeQuarantineRecord(record), /*fsync_file=*/true,
+            /*fsync_directory=*/true, nullptr, nullptr, /*enable_generic_failpoints=*/false);
+        CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_QUARANTINE_AFTER_RECORD_ONCE");
+    }
+    // Consumers saw changes of this chunk that its removal takes back.
+    result.slots_marked = RequireSlotResync(table_dir, manifest->store_id, dims);
+    for (const auto& path : present) {
+        std::filesystem::remove(path);
+        SyncDirectoryPath(path.parent_path());
+        CrashAtFailpoint("CHUNKDB_FAILPOINT_CRASH_QUARANTINE_AFTER_REMOVE_ONCE");
+    }
+    result.entry = entry.lexically_relative(data_dir);
+    std::ostringstream remaining;
+    result.table_errors = VerifyTableDirectory(table_dir, remaining).errors;
+    findings << remaining.str();
     return result;
 }
 

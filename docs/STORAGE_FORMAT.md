@@ -50,6 +50,7 @@ data_dir/
     chunkdb.slots                     persisted feed slots, when present
     chunkdb.index                     checked shard inventory and deletion floor
     .chunkdb.feed/                     archived WALs and base images
+    .chunkdb.quarantine/               chunk files chunkdb_admin quarantine set aside
     L_<lx>_<ly>/C_<cx>_<cy>.chk         checkpoint image
     L_<lx>_<ly>/C_<cx>_<cy>.wal         live delta log
     L_<lx>_<ly>/chunkdb.index          checked coordinate decisions, when listed
@@ -65,6 +66,7 @@ Entries in `tables/` with invalid names are ignored; a table directory with a va
 
 Creation prepares a complete table under `.chunkdb.staging/`, publishes it by a rename that cannot replace an existing table, then syncs both parents.
 RESTORE TABLE builds its table the same way: it copies the backed-up table under `.chunkdb.staging/`, rebinds it to a new epoch and syncs it before that rename.
+`chunkdb_restore --table` does the same offline; with `--area` it first removes from the copy the images, WALs and coordinate-index records of chunks outside the area, rewriting each changed log and the inventory with synced atomic replacement.
 SWAP TABLES syncs both tables' WALs, closes them, marks their slots to resync, exchanges `tables/<a>/` and `tables/<b>/` in one atomic directory exchange and syncs `tables/`; a crash leaves both names exchanged or neither.
 RENAME TO syncs the table's WAL, closes it, renames `tables/<a>/` to `tables/<b>/` without replacing an entry and syncs `tables/`; a crash leaves the table under one name, with its files unchanged.
 DROP raises and syncs the root version floor before moving the closed table into `.chunkdb.dropped/`.
@@ -607,10 +609,15 @@ Malformed, foreign, or inconsistent journal state refuses opening without partia
 
 Completed copies use the same metadata/image/WAL formats and add `chunkdb.backup`:
 
-1. `CKBP`, version `1:u16`, reserved zero `u16`, creation Unix milliseconds `u64`, table count `u32`.
+1. `CKBP`, version `u16` (1, or 2 when chunks were skipped), reserved zero `u16`, creation Unix milliseconds `u64`, table count `u32`.
 2. Each table: name length `u32` and name, epoch (16 bytes), completed revision cut `u64`.
 3. File count `u32`; each file: relative-path length `u32` and path, length `u64`, CRC32 `u32`.
-4. CRC32 over all preceding bytes.
+4. Version 2 only: skipped-chunk count `u32`, positive; each chunk: table-name length `u32` and name, dimensions `u8` (2 or 3), each active coordinate `i64`, and the `chunkdb_verify` code as length `u32` and text.
+5. CRC32 over all preceding bytes.
+
+BACKUP ... SKIP DAMAGED leaves out a chunk whose pinned image or WAL fails the `chunkdb_verify` checks: the inventory lists neither file, and the record names the chunk once.
+A table, coordinates and dimension count must be valid and unique; the coordinate index keeps its records for the chunk.
+Builds that know only version 1 refuse a version 2 record; a backup without skipped chunks keeps version 1.
 
 The record is at most 1 GiB: the writer refuses a larger one, and readers check the file size before they read it.
 
@@ -643,6 +650,23 @@ It rewrites image/WAL header identities/checksums and re-encodes the ledger for 
 Retained slots start at their table’s cut in the fresh epoch, with a new baseline and no historical archive transfer, marked to resync.
 Recoverable WAL tails are normalized before rewriting.
 Restore removes the backup marker and publishes the destination with its incomplete guard held until final durable completion.
+
+## Quarantined chunks
+
+`chunkdb_admin quarantine` sets a damaged chunk's files aside offline, under the writer lock.
+Each run makes an entry `.chunkdb.quarantine/<chunk stem>.<Unix ms>.<nonce hex8>/` in the table directory, such as `C_3_-1.1795529706868.1a2b3c4d`.
+It hard-links the chunk's WAL and image there under their own names, syncs them and the entry, then publishes `quarantine.record` by synced atomic replacement:
+
+1. `CKQR`, format `1:u16`, dimensions `u8`, zero `u8`, table identity (16 bytes).
+2. Each active chunk coordinate `i64`, quarantine Unix milliseconds `u64`, file count `u32` (1 or 2).
+3. Each file: name length `u32` and the chunk's `.chk` or `.wal` name, length `u64`, CRC32 `u32`.
+4. CRC32 over all preceding bytes.
+
+It then marks the table's slots to resync and removes the live WAL before the live image, syncing the large-chunk directory after each.
+A rerun removes this chunk's entries without a record and matches each remaining live file to a recorded name, length and CRC32.
+It verifies every saved file against the record before removing any remaining live files or reporting the chunk as already quarantined.
+It refuses a chunk whose deletion boundary sits in a log the inventory does not list, since recovery needs the chunk's files to admit it.
+Writers, backups and restores ignore `.chunkdb.quarantine/`; `chunkdb_verify` reports each entry as information, and as a warning a malformed record, an entry without a record, or a live file its record holds.
 
 ## Checkpoint and verification boundaries
 

@@ -1,6 +1,6 @@
-# CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, SWAP TABLES, SHOW TABLES, DESCRIBE, SHOW STATUS, ENABLE FEATURE
+# CREATE TABLE, ALTER TABLE, DROP TABLE, RECOVER TABLE, CHECK TABLE, SWAP TABLES, SHOW TABLES, DESCRIBE, SHOW STATUS, ENABLE FEATURE
 
-You define a table's columns, inspect its schema, and change or remove it.
+You define a table's columns, inspect its schema, check its files, and change or remove it.
 A schema defines the names, types, defaults, and nullability of its columns.
 
 ## Examples
@@ -20,6 +20,7 @@ ALTER TABLE schema_demo DROP CHECK kind_check
 ALTER TABLE schema_demo SET var_max_chunk_bytes = 2097152
 ALTER TABLE schema_demo DROP COLUMN light
 ALTER TABLE schema_demo RENAME TO schema_renamed
+CHECK TABLE schema_renamed
 DROP TABLE schema_renamed
 ```
 
@@ -54,6 +55,8 @@ OK
 OK
 OK
 OK
+chunks = 0
+damaged = []
 OK
 ```
 
@@ -80,6 +83,7 @@ ALTER TABLE table SET option = value
 ALTER TABLE table RENAME TO name
 DROP TABLE [IF EXISTS] table
 RECOVER TABLE table
+CHECK TABLE table [CHUNK cx cy | AREA cx0 cy0 TO cx1 cy1 | AREA AROUND cx cy RADIUS r]
 SWAP TABLES table, table
 SHOW TABLES
 DESCRIBE table
@@ -106,6 +110,7 @@ ENABLE FEATURE 'name'
 - `SET REQUIRED` and `DROP REQUIRED`: whether new blocks must give the column.
 - `RENAME TO`: the table's new name, under the same rules as `table`.
 - `CHECK`: a [condition](../CQL.md#conditions) every present block must not make false; `name` follows the `column` rules.
+- `CHUNK`, `AREA`: the chunks CHECK TABLE checks, every chunk when omitted; a three-dimensional table takes a third coordinate.
 
 | Type | Values |
 | --- | --- |
@@ -141,6 +146,7 @@ See [Server flags](../SERVER_FLAGS.md#persisted-table-options) for option defaul
 
 - CREATE, ALTER, and DROP: `OK`, including authorized conditional no-ops.
 - RECOVER TABLE: `OK` once the table serves again, or is gone because its directory is.
+- CHECK TABLE: `chunks`, the chunks with files it checked, and `damaged`, one entry per damaged chunk with its `chunk` coordinates, the damaged `file` relative to the table directory, and the `code` and `detail` that `chunkdb_verify` reports.
 - SWAP TABLES: `OK` once each name serves the other table.
 - RENAME TO: `OK` once the new name serves the table.
 - SHOW TABLES: accessible table names, fenced tables included.
@@ -160,12 +166,12 @@ The `chunk_columns` list uses the same column-description maps as `columns`.
 | --- | --- | --- |
 | TABLE_EXISTS | A table already exists. | Use another name, IF NOT EXISTS, [MIGRATE](MIGRATIONS.md), or DROP TABLE. |
 | NO_TABLE | A table is absent or inaccessible. | Check its name and rights. |
-| PERMISSION_DENIED | You lack ADMIN on the table, on both tables for SWAP, or for CREATE and RENAME TO on the new name, a matching prefix, or all tables. | Request access. |
+| PERMISSION_DENIED | You lack ADMIN on the table, on both tables for SWAP, or for CREATE and RENAME TO on the new name, a matching prefix, or all tables; CHECK TABLE also accepts MONITOR. | Request access. |
 | INVALID_ARGUMENT | A name, type, default, conversion, or option is invalid, or RECOVER TABLE names a table that is not fenced. | Correct the reported argument. |
 | INTERNAL | The table is fenced: `table 'name' is fenced: reason; run RECOVER TABLE name`. | Run RECOVER TABLE. |
 | INVALID_ARGUMENT | RECOVER TABLE finds stored options that differ from the server's option flags. | Restart the server without those flags, or with the stored values. |
 | INTERNAL | A migration with an unknown outcome fences every table. | Restart the server; see [Migrations](MIGRATIONS.md#errors). |
-| INVALID_ARGUMENT | You run CREATE, ALTER, DROP, RECOVER TABLE, SWAP TABLES or ENABLE FEATURE on a server started with `--read-only`. | Run it on a server started without `--read-only`. |
+| INVALID_ARGUMENT | You run CREATE, ALTER, DROP, RECOVER TABLE, CHECK TABLE, SWAP TABLES or ENABLE FEATURE on a server started with `--read-only`. | Run it on a server started without `--read-only`, or use `chunkdb_verify`. |
 | INVALID_ARGUMENT | SWAP TABLES names one table twice. | Name two tables. |
 | INVALID_ARGUMENT | DROP NULL finds a NULL: `column c cannot drop NULL: block (x, y) holds NULL`. | Set a value in that block, then run DROP NULL again. |
 | INVALID_ARGUMENT | An ALTER COLUMN change leaves the column as it is, or makes it both NULL and REQUIRED. | Drop the other attribute first. |
@@ -228,6 +234,15 @@ It waits for the table's running statements and running backups, closes it, remo
 Watches of a table that leaves service end with INTERNAL; watch it again after RECOVER TABLE to resume.
 A table whose recovery fails stays fenced and out of service; a restart also recovers it.
 A migration with an unknown outcome fences every table; RECOVER TABLE refuses it, and only a restart completes it.
+
+CHECK TABLE runs the `chunkdb_verify` checks on the image and WAL of each chunk with files, one chunk at a time, while the table serves.
+Statements on other chunks do not wait; a statement on a cached chunk waits while that chunk is checked.
+It checks the files, not memory: changes not yet written to the WAL are checked once they are.
+A WAL tail left by a crash is repaired when the chunk loads and is not damage.
+CANCEL, KILL CONNECTION, a statement timeout or server shutdown stops the check without a result, including during file listing or WAL replay.
+SHOW CONNECTIONS shows the chunks checked as `files_done` of `files_total`.
+A table replaced during the check, by SWAP TABLES or by DROP and CREATE, stops it with INTERNAL.
+To repair damaged chunks, see [Backup and restore](../BACKUP.md#repair-damaged-chunks).
 
 ## Checks
 

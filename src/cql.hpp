@@ -10,6 +10,7 @@
 #include <variant>
 #include <vector>
 
+#include "chunkdb/area_selector.hpp"
 #include "chunkdb/schema.hpp"
 #include "chunkdb/change_feed.hpp"
 #include "sectioned_chunk_form.hpp"
@@ -319,6 +320,8 @@ struct Describe {
 struct FlushWal {};
 struct Backup {
     std::string path;
+    // SKIP DAMAGED: leave out chunks whose files fail their checks.
+    bool skip_damaged = false;
 };
 // Restores table `table` of a completed backup as a new table `name`
 // (docs/design/RESTORE_TABLE.md); without AS, `name` is `table`.
@@ -430,6 +433,12 @@ struct CompactTombstones {
     std::uint64_t before = 0U;
 };
 struct ShowTableStats { std::string table; };
+// Checks the files of every chunk of `table`, or of those `area` selects, as
+// chunkdb_verify does, while the table serves.
+struct CheckTable {
+    std::string table;
+    std::optional<ChunkAreaSelector> area;
+};
 
 using Statement = std::variant<
     GetBlock,
@@ -475,7 +484,8 @@ using Statement = std::variant<
     Migrate,
     ShowMigrations,
     CompactTombstones,
-    ShowTableStats>;
+    ShowTableStats,
+    CheckTable>;
 
 struct Parsed {
     Statement statement;

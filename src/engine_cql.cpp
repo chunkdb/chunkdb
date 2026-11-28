@@ -8,6 +8,7 @@
 #include <cmath>
 #include <cstdint>
 #include <filesystem>
+#include <functional>
 #include <limits>
 #include <map>
 #include <optional>
@@ -38,6 +39,7 @@
 #include "feature_flags.hpp"
 #include "backup.hpp"
 #include "catalog_feed.hpp"
+#include "chunk_check.hpp"
 #include "slot_watch.hpp"
 #include "feed_protocol.hpp"
 #include "store_manifest.hpp"
@@ -1018,6 +1020,7 @@ void DescribeStatement(const cql::Statement& statement, StatementLogInfo& info) 
             [&](const cql::RecoverTable& recover) { table_change(recover, "RECOVER TABLE", "recover_table"); },
             [&](const cql::CompactTombstones& compact) { table_change(compact, "COMPACT TOMBSTONES", "compact_tombstones"); },
             [&](const cql::ShowTableStats& stats) { info.verb = "SHOW TABLE STATS"; info.table = stats.table; },
+            [&](const cql::CheckTable& check) { info.verb = "CHECK TABLE"; info.table = check.table; },
             [&](const cql::ShowTables&) { info.verb = "SHOW TABLES"; },
             [&](const cql::Describe& describe) { info.verb = "DESCRIBE"; info.table = describe.table; },
             [&](const cql::FlushWal&) { info.verb = "FLUSH WAL"; },
@@ -2491,6 +2494,77 @@ std::string CommandEngine::ExecuteStatement(
                     Protocol::AppendInteger(reply, static_cast<std::uint64_t>(feeds.watches));
                     return reply;
                 },
+                [&](const cql::CheckTable& check) {
+                    command_class = MetricsRegistry::CommandClass::kAdmin;
+                    if (!HasServerRight(session, ServerRight::kMonitor)) RequireRight(session, check.table, Right::kAdmin);
+                    // Before any listing: a read-only server leaves file checks to chunkdb_verify.
+                    if (catalog_->access_mode() == AccessMode::kReadOnly)
+                        throw std::invalid_argument("CHECK TABLE needs a server started without --read-only; use chunkdb_verify");
+                    const auto stop = [&] {
+                        if (session.backup_cancelled.stop_requested()) throw CheckTableShutdownError();
+                        CheckStatementCancellation();
+                    };
+                    const std::function<void()> checkpoint = std::cref(stop);
+                    StoreId epoch{};
+                    std::filesystem::path dir;
+                    std::optional<Geometry> geometry;
+                    std::optional<detail::AreaCursor> area;
+                    {
+                        const auto lease = AcquireNamedTable(session, check.table);
+                        auto& store = lease.store();
+                        if (check.area) {
+                            RequireDimensions(store.geometry(), check.area->dims);
+                            area.emplace(*check.area);
+                        }
+                        epoch = store.store_id();
+                        dir = store.data_dir();
+                        geometry.emplace(store.geometry());
+                    }
+                    // Listed and checked one chunk per lease: a lease held for the
+                    // whole table would make DDL, and every statement queued
+                    // behind it, wait for the check.
+                    auto coordinates = ChunkFileCoordinates(dir, *geometry, checkpoint);
+                    if (area) std::erase_if(coordinates, [&](const ChunkCoord& coord) {
+                        stop();
+                        return !area->Contains(coord);
+                    });
+                    std::vector<std::pair<ChunkCoord, ChunkStore::ChunkFileDamage>> damaged;
+                    std::uint64_t checked = 0U;
+                    for (const auto& coord : coordinates) {
+                        stop();
+                        ReportStatementProgress({.files_done = checked, .files_total = coordinates.size()});
+                        const auto lease = AcquireNamedTable(session, check.table);
+                        if (lease.store().store_id() != epoch)
+                            throw std::runtime_error("table '" + check.table + "' was replaced during CHECK TABLE; run it again");
+                        if (auto damage = lease.store().CheckChunkFiles(coord, checkpoint))
+                            damaged.emplace_back(coord, std::move(*damage));
+                        ++checked;
+                    }
+                    const auto dims = geometry->dims();
+                    std::string reply;
+                    Protocol::AppendMapHeader(reply, 2U);
+                    Protocol::AppendBulk(reply, "chunks");
+                    Protocol::AppendInteger(reply, checked);
+                    Protocol::AppendBulk(reply, "damaged");
+                    Protocol::AppendArrayHeader(reply, damaged.size());
+                    for (const auto& [coord, damage] : damaged) {
+                        stop();
+                        Protocol::AppendMapHeader(reply, 4U);
+                        Protocol::AppendBulk(reply, "chunk");
+                        Protocol::AppendArrayHeader(reply, dims);
+                        Protocol::AppendInteger(reply, coord.x);
+                        Protocol::AppendInteger(reply, coord.y);
+                        if (dims == 3U) Protocol::AppendInteger(reply, coord.z);
+                        Protocol::AppendBulk(reply, "file");
+                        Protocol::AppendBulk(reply, damage.path.generic_string());
+                        Protocol::AppendBulk(reply, "code");
+                        Protocol::AppendBulk(reply, damage.code);
+                        Protocol::AppendBulk(reply, "detail");
+                        Protocol::AppendBulk(reply, damage.detail);
+                    }
+                    stop();
+                    return reply;
+                },
                 [&](const cql::ShowTables&) {
                     command_class = MetricsRegistry::CommandClass::kAdmin;
                     // Only the tables the user has a right on, fenced ones too.
@@ -2556,14 +2630,18 @@ std::string CommandEngine::ExecuteStatement(
                     std::stop_callback statement(StatementStopToken(), request_stop);
                     options.cancelled = cancelled.get_token();
                     options.backup_directory = config_.backup_dir;
+                    options.skip_damaged = backup.skip_damaged;
                     std::string reply;
                     options.before_publish = [&](const BackupResult& result) {
                         if (reserve_reply) {
                             if (result.tables.size() > (std::numeric_limits<std::size_t>::max() - 1024U) / 512U)
                                 throw ReplyAdmissionError("backup reply bound overflows");
-                            (*reserve_reply)(1024U + 512U * result.tables.size());
+                            std::size_t skipped_bytes = 0U;
+                            for (const auto& chunk : result.skipped)
+                                skipped_bytes += 256U + chunk.table.size() + chunk.file.native().size() + chunk.code.size() + chunk.detail.size();
+                            (*reserve_reply)(1024U + 512U * result.tables.size() + skipped_bytes);
                         }
-                        Protocol::AppendMapHeader(reply, 4);
+                        Protocol::AppendMapHeader(reply, backup.skip_damaged ? 5U : 4U);
                         Protocol::AppendBulk(reply, "tables");
                         Protocol::AppendInteger(reply, static_cast<std::uint64_t>(result.tables.size()));
                         Protocol::AppendBulk(reply, "files");
@@ -2580,6 +2658,25 @@ std::string CommandEngine::ExecuteStatement(
                             Protocol::AppendBulk(reply, StoreIdHex(cut.epoch));
                             Protocol::AppendBulk(reply, "revision");
                             Protocol::AppendInteger(reply, cut.revision);
+                        }
+                        if (!backup.skip_damaged) return;
+                        Protocol::AppendBulk(reply, "skipped");
+                        Protocol::AppendArrayHeader(reply, result.skipped.size());
+                        for (const auto& chunk : result.skipped) {
+                            Protocol::AppendMapHeader(reply, 5U);
+                            Protocol::AppendBulk(reply, "table");
+                            Protocol::AppendBulk(reply, chunk.table);
+                            Protocol::AppendBulk(reply, "chunk");
+                            Protocol::AppendArrayHeader(reply, chunk.dims);
+                            Protocol::AppendInteger(reply, chunk.coord.x);
+                            Protocol::AppendInteger(reply, chunk.coord.y);
+                            if (chunk.dims == 3U) Protocol::AppendInteger(reply, chunk.coord.z);
+                            Protocol::AppendBulk(reply, "file");
+                            Protocol::AppendBulk(reply, chunk.file.generic_string());
+                            Protocol::AppendBulk(reply, "code");
+                            Protocol::AppendBulk(reply, chunk.code);
+                            Protocol::AppendBulk(reply, "detail");
+                            Protocol::AppendBulk(reply, chunk.detail);
                         }
                     };
                     try {

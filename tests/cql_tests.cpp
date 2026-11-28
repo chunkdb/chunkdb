@@ -146,6 +146,17 @@ void TestChunkModelScan() {
     assert(compact.table == "t" && compact.before == std::numeric_limits<std::uint64_t>::max());
     assert(Get<cql::CompactTombstones>("COMPACT TOMBSTONES t BEFORE 0").before == 0U);
     assert(Get<cql::ShowTableStats>("SHOW TABLE STATS t").table == "t");
+    const auto check = Get<cql::CheckTable>("CHECK TABLE t");
+    assert(check.table == "t" && !check.area);
+    const auto chunk = Get<cql::CheckTable>("check table t chunk -1 2").area;
+    assert(chunk && chunk->dims == 2U && chunk->first.x == -1 && chunk->last.y == 2 && !chunk->around);
+    const auto range = Get<cql::CheckTable>("CHECK TABLE t AREA 0 0 1 TO 3 4 5").area;
+    assert(range && range->dims == 3U && range->last.x == 3 && range->last.z == 5);
+    const auto ball = Get<cql::CheckTable>("CHECK TABLE t AREA AROUND 1 1 RADIUS 2").area;
+    assert(ball && ball->around && ball->radius == 2 && ball->first.y == 1);
+    ExpectError("CHECK TABLE t AREA 0 0 TO 1 1 1", "AREA endpoints have different dimensions");
+    ExpectError("CHECK TABLE t BLOCKS", "expected the end of the statement, got 'BLOCKS'");
+    ExpectError("CHECK t", "expected TABLE");
     ExpectError("COMPACT TOMBSTONES t BEFORE -1", "a revision must be between 0");
     ExpectError("MIGRATE 'compact' COMPACT TOMBSTONES t BEFORE 1", "one schema statement");
 }
@@ -723,6 +734,9 @@ void TestChecks() {
 void TestBackup() {
     assert(Get<cql::Backup>("BACKUP TO '/backups/snapshot'").path == "/backups/snapshot");
     assert(Get<cql::Backup>("backup to '/backups/it''s'").path == "/backups/it's");
+    assert(!Get<cql::Backup>("BACKUP TO 'b'").skip_damaged);
+    assert(Get<cql::Backup>("backup to 'b' skip damaged").skip_damaged);
+    ExpectError("BACKUP TO 'b' SKIP", "expected DAMAGED");
     ExpectError("BACKUP '/path'", "expected TO");
     ExpectError("BACKUP TO path", "expected a quoted backup path");
     ExpectError("BACKUP TO $1", "expected a quoted backup path");

@@ -21,6 +21,7 @@
 #include <limits>
 #include <map>
 #include <set>
+#include <tuple>
 #include <system_error>
 
 #include "checkpoint.hpp"
@@ -173,6 +174,12 @@ void ValidateRecord(const BackupRecord& record) {
             file.relative_path == kBackupIncompleteName || file.relative_path == kRestoreIncompleteName)
             throw std::runtime_error("invalid or repeated backup inventory file");
     }
+    std::set<std::tuple<std::string, std::int64_t, std::int64_t, std::int64_t>> chunks;
+    for (const auto& chunk : record.skipped) {
+        if (!names.contains(chunk.table) || (chunk.dims != 2U && chunk.dims != 3U) || (chunk.dims == 2U && chunk.coord.z != 0) ||
+            chunk.code.empty() || !chunks.emplace(chunk.table, chunk.coord.x, chunk.coord.y, chunk.coord.z).second)
+            throw std::runtime_error("invalid or repeated skipped backup chunk");
+    }
 }
 void PutString(std::vector<std::uint8_t>& out, const std::string& value) {
     if (value.size() > std::numeric_limits<std::uint32_t>::max()) throw std::length_error("backup record string too long");
@@ -182,6 +189,7 @@ void PutString(std::vector<std::uint8_t>& out, const std::string& value) {
 class Reader {
   public:
     Reader(const std::vector<std::uint8_t>& bytes, std::size_t end) : bytes_(bytes), end_(end) {}
+    std::uint8_t U8() { Need(1U); auto v = bytes_[at_]; at_ += 1U; return v; }
     std::uint16_t U16() { Need(2U); auto v = ReadLe16(bytes_, at_); at_ += 2U; return v; }
     std::uint32_t U32() { Need(4U); auto v = ReadLe32(bytes_, at_); at_ += 4U; return v; }
     std::uint64_t U64() { Need(8U); auto v = ReadLe64(bytes_, at_); at_ += 8U; return v; }
@@ -709,6 +717,19 @@ void ValidateInventory(const std::filesystem::path& root, const BackupRecord& re
             allowed.insert(relative);
         }
         ValidateTableCut(root / prefix, cut, files, cancelled);
+        // A skipped chunk has the table's dimensions and no file in the inventory.
+        if (std::any_of(record.skipped.begin(), record.skipped.end(), [&](const auto& chunk) { return chunk.table == cut.name; })) {
+            const auto manifest = *ReadStoreManifest(root / prefix);
+            const Geometry geometry(manifest.geometry, manifest.schema, *manifest.chunk_schema);
+            for (const auto& chunk : record.skipped) {
+                if (chunk.table != cut.name) continue;
+                if (chunk.dims != geometry.dims())
+                    throw std::runtime_error("skipped backup chunk has other dimensions than its table: " + cut.name);
+                for (const auto& path : {ChunkDataPath(prefix, geometry, chunk.coord), ChunkWalPath(prefix, geometry, chunk.coord)})
+                    if (allowed.contains(path.generic_string()))
+                        throw std::runtime_error("skipped backup chunk is in the inventory: " + path.generic_string());
+            }
+        }
     }
     for (const auto& file : record.files)
         if (!allowed.contains(file.relative_path.generic_string())) throw std::runtime_error("unknown backup inventory artifact");
@@ -1076,11 +1097,25 @@ std::vector<std::uint8_t> SerializeBackupRecord(const BackupRecord& record) {
     ValidateRecord(record);
     if (record.tables.size() > std::numeric_limits<std::uint32_t>::max() || record.files.size() > std::numeric_limits<std::uint32_t>::max())
         throw std::length_error("too many backup inventory records");
-    std::vector<std::uint8_t> bytes(kMagic.begin(), kMagic.end()); WriteLe16(bytes, 1U); WriteLe16(bytes, 0U);
+    // Version 2 only when chunks were skipped, so other backups stay readable by
+    // builds that know version 1 only.
+    std::vector<std::uint8_t> bytes(kMagic.begin(), kMagic.end()); WriteLe16(bytes, record.skipped.empty() ? 1U : 2U); WriteLe16(bytes, 0U);
     WriteLe64(bytes, record.created_at_ms); WriteLe32(bytes, static_cast<std::uint32_t>(record.tables.size()));
     for (const auto& table : record.tables) { PutString(bytes, table.name); bytes.insert(bytes.end(), table.epoch.begin(), table.epoch.end()); WriteLe64(bytes, table.revision); }
     WriteLe32(bytes, static_cast<std::uint32_t>(record.files.size()));
     for (const auto& file : record.files) { PutString(bytes, file.relative_path.generic_string()); WriteLe64(bytes, file.size); WriteLe32(bytes, file.crc32); }
+    if (!record.skipped.empty()) {
+        if (record.skipped.size() > std::numeric_limits<std::uint32_t>::max()) throw std::length_error("too many skipped backup chunks");
+        WriteLe32(bytes, static_cast<std::uint32_t>(record.skipped.size()));
+        for (const auto& chunk : record.skipped) {
+            PutString(bytes, chunk.table);
+            bytes.push_back(chunk.dims);
+            WriteLe64(bytes, static_cast<std::uint64_t>(chunk.coord.x));
+            WriteLe64(bytes, static_cast<std::uint64_t>(chunk.coord.y));
+            if (chunk.dims == 3U) WriteLe64(bytes, static_cast<std::uint64_t>(chunk.coord.z));
+            PutString(bytes, chunk.code);
+        }
+    }
     WriteLe32(bytes, Crc32(bytes));
     if (bytes.size() > kMaxBackupRecordBytes)
         throw std::length_error("the backup record would take " + std::to_string(bytes.size()) + " bytes, more than " +
@@ -1092,12 +1127,29 @@ BackupRecord ParseBackupRecord(const std::vector<std::uint8_t>& bytes) {
         throw std::runtime_error("backup marker is larger than " + std::to_string(kMaxBackupRecordBytes) + " bytes");
     if (bytes.size() < 28U || !std::equal(kMagic.begin(), kMagic.end(), bytes.begin()) ||
         ReadLe32(bytes, bytes.size() - 4U) != Crc32(bytes.data(), bytes.size() - 4U)) throw std::runtime_error("invalid backup marker or checksum");
-    Reader reader(bytes, bytes.size() - 4U); if (reader.U16() != 1U || reader.U16() != 0U) throw std::runtime_error("unsupported backup marker version");
+    Reader reader(bytes, bytes.size() - 4U);
+    const auto version = reader.U16();
+    if ((version != 1U && version != 2U) || reader.U16() != 0U) throw std::runtime_error("unsupported backup marker version");
     BackupRecord record; record.created_at_ms = reader.U64(); auto tables = reader.U32();
     if (tables > reader.left() / 28U) throw std::runtime_error("truncated backup tables");
     for (std::uint32_t i = 0; i < tables; ++i) { BackupTableCut cut; cut.name = reader.String(); cut.epoch = reader.Id(); cut.revision = reader.U64(); record.tables.push_back(std::move(cut)); }
     auto files = reader.U32(); if (files > reader.left() / 16U) throw std::runtime_error("truncated backup inventory");
     for (std::uint32_t i = 0; i < files; ++i) { BackupFileRecord file; file.relative_path = ParseInventoryPath(reader.String()); file.size = reader.U64(); file.crc32 = reader.U32(); record.files.push_back(std::move(file)); }
+    if (version == 2U) {
+        const auto skipped = reader.U32();
+        if (skipped == 0U || skipped > reader.left() / 25U) throw std::runtime_error("truncated skipped backup chunks");
+        for (std::uint32_t i = 0; i < skipped; ++i) {
+            BackupSkippedChunk chunk;
+            chunk.table = reader.String();
+            chunk.dims = reader.U8();
+            if (chunk.dims != 2U && chunk.dims != 3U) throw std::runtime_error("invalid skipped backup chunk dimensions");
+            chunk.coord.x = static_cast<std::int64_t>(reader.U64());
+            chunk.coord.y = static_cast<std::int64_t>(reader.U64());
+            if (chunk.dims == 3U) chunk.coord.z = static_cast<std::int64_t>(reader.U64());
+            chunk.code = reader.String();
+            record.skipped.push_back(std::move(chunk));
+        }
+    }
     if (reader.left() != 0U) throw std::runtime_error("backup marker has trailing bytes");
     ValidateRecord(record);
     return record;
