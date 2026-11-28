@@ -479,11 +479,15 @@ void FrozenSlotFrontier() {
     Reply(e.Run("CREATE SLOT 'consumer' ON realm"), "+OK\r\n");
     Reply(state(e, "realm"), "$2\r\nok\r\n$6\r\nreason\r\n_\r\n");
     Reply(Metric(e, "chunkdb_slot_frontier_frozen{table=\"realm\"}"), "0");
+    // CREATE SLOT checkpoints the chunk and removes its WAL, and a failed
+    // first append to an empty WAL rolls back by removing it, which leaves the
+    // store serving. A committed write first makes the failed append truncate
+    // the WAL, whose failure fails the store closed.
+    assert(e.Run("SET BLOCK 1 1 IN realm v=9").front() == ':');
     {
-        // The write, or a slot pass that takes the failpoint first, fails the store closed.
         txn_test::ScopedEnv sync("CHUNKDB_FAILPOINT_WAL_BATCH_SYNC_FAIL_ONCE", "1");
         txn_test::ScopedEnv rollback("CHUNKDB_FAILPOINT_WAL_RESIZE_FAIL_ONCE", "1");
-        assert(e.Run("SET BLOCK 0 0 IN realm v=2").rfind("-ERR ", 0U) == 0U);
+        Error(e.Run("SET BLOCK 0 0 IN realm v=2"), "OUTCOME_UNKNOWN stage=wal_append_repair");
     }
     assert(e.catalog->Fence("realm"));
     Reply(Metric(e, "chunkdb_slot_frontier_frozen{table=\"realm\"}"), "1");
